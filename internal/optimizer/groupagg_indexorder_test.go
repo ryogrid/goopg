@@ -21,8 +21,8 @@ func btgIndexOrderCatalog(t *testing.T) (catalog.Catalog, *catalog.Table, *catal
 	t.Helper()
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "btg"}, []catalog.Column{
-		{Name: "x", Type: catalog.Type{Name: "int4"}},
-		{Name: "y", Type: catalog.Type{Name: "int4"}},
+		{Name: "x", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "y", Type: catalog.Type{Name: "int4"}, NotNull: true},
 		{Name: "z", Type: catalog.Type{Name: "text"}},
 		{Name: "w", Type: catalog.Type{Name: "int4"}},
 	})

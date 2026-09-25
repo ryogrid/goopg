@@ -41,12 +41,12 @@ const rfjWidth = 2
 func rfjProblem(names []string, rows []int64, conjuncts []Expr) *joinlistProblem {
 	n := len(names)
 	prob := &joinlistProblem{
-		bindings:   make([]rangeBinding, n),
-		scans:      make([]Node, n),
-		relInfos:   make([]baseRelInfo, n),
-		conjuncts:  conjuncts,
-		cumOffsets: make([]int, n+1),
-		cp:         defaultCostParams(),
+		bindings:  make([]rangeBinding, n),
+		scans:     make([]Node, n),
+		relInfos:  make([]baseRelInfo, n),
+		conjuncts: conjuncts,
+		leafSpans: make([]leafSpan, n),
+		cp:        defaultCostParams(),
 	}
 	for i, name := range names {
 		schema := cpjSchema(name, rfjWidth)
@@ -64,9 +64,8 @@ func rfjProblem(names []string, rows []int64, conjuncts []Expr) *joinlistProblem
 			baseRows:     rows[i],
 			filteredRows: rows[i],
 		}
-		prob.cumOffsets[i] = i * rfjWidth
+		prob.leafSpans[i] = leafSpan{lo: i * rfjWidth, hi: (i + 1) * rfjWidth}
 	}
-	prob.cumOffsets[n] = n * rfjWidth
 	return prob
 }
 
@@ -118,6 +117,14 @@ func rfjLeafCount(n Node) int {
 	case *Filter:
 		return rfjLeafCount(t.Child)
 	case *Sort:
+		return rfjLeafCount(t.Child)
+	// R12 (plan-parity-fix-take2): K19's fourth walker. Without these a
+	// Gather inside a join's subtree counts as ONE leaf, so a 3-leaf side
+	// reads as 1 and the assertion reports a jointype preserving/extending
+	// the wrong hands — a correctness-shaped message from a correct plan.
+	case *Gather:
+		return rfjLeafCount(t.Child)
+	case *GatherMerge:
 		return rfjLeafCount(t.Child)
 	default:
 		return 1
@@ -171,6 +178,15 @@ func rfjJoins(n Node) []*Join {
 			walk(t.Child)
 		case *Sort:
 			walk(t.Child)
+		// R11 (plan-parity-fix-take2): descend through the parallel wrappers.
+		// Without these the walker STOPS AT THE ROOT once partial paths are
+		// enabled (a Gather sits above the join tree) and reports "0 joins",
+		// which reads as a catastrophic search regression when the search is
+		// in fact fine — it cost R10 a reverted round to tell the two apart.
+		case *Gather:
+			walk(t.Child)
+		case *GatherMerge:
+			walk(t.Child)
 		}
 	}
 	walk(n)
@@ -185,7 +201,7 @@ func TestPlanJoinlistSearchFlatProblemIsOneSearch(t *testing.T) {
 	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
 
-	n, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
+	n, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -213,7 +229,7 @@ func TestPlanJoinlistSearchPublishesBindingOrderWhateverTheSearchChose(t *testin
 	prob := rfjProblem(names, []int64{1_000_000, 500_000, 10},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
 
-	n, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
+	n, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -242,7 +258,7 @@ func TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch(t *testing.T) {
 	// whose own list is upstream's `list_make2(l, r)`.
 	jl := joinlist{leafItem(0), subItem(joinlist{leafItem(1), leafItem(2)})}
 
-	n, err := planJoinlistSearch(jl, prob)
+	n, _, err := planJoinlistSearch(jl, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -276,7 +292,7 @@ func TestPlanJoinlistSearchPinnedSubproblemIsItsOwnSearch(t *testing.T) {
 	// flat, must not choose b×c — it has no clause and both alternatives do.
 	free := rfjProblem(names, []int64{1_000_000, 10, 20},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 0, 2)})
-	freeTree, err := planJoinlistSearch(deconstructRangeVars(len(names)), free)
+	freeTree, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), free)
 	if err != nil {
 		t.Fatalf("control: planJoinlistSearch: %v", err)
 	}
@@ -295,7 +311,7 @@ func TestPlanJoinlistSearchSingleItemIsThePreSearchLeaf(t *testing.T) {
 	names := []string{"a"}
 	prob := rfjProblem(names, []int64{100}, nil)
 
-	n, err := planJoinlistSearch(joinlist{leafItem(0)}, prob)
+	n, _, err := planJoinlistSearch(joinlist{leafItem(0)}, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}
@@ -315,12 +331,12 @@ func TestPlanJoinlistSearchNestedPinUnwraps(t *testing.T) {
 		return rfjProblem(names, []int64{1000, 10}, []Expr{rfjEq(names, 0, 1)})
 	}
 
-	nested, err := planJoinlistSearch(
+	nested, _, err := planJoinlistSearch(
 		joinlist{subItem(joinlist{subItem(joinlist{leafItem(0)}), subItem(joinlist{leafItem(1)})})}, mk())
 	if err != nil {
 		t.Fatalf("nested: %v", err)
 	}
-	flat, err := planJoinlistSearch(joinlist{leafItem(0), leafItem(1)}, mk())
+	flat, _, err := planJoinlistSearch(joinlist{leafItem(0), leafItem(1)}, mk())
 	if err != nil {
 		t.Fatalf("flat: %v", err)
 	}
@@ -350,8 +366,8 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 		{"joinlist repeats a FROM item", joinlist{leafItem(0), leafItem(0)}, func(*joinlistProblem) {}},
 		{"leaves out of order", joinlist{leafItem(1), leafItem(0)}, func(*joinlistProblem) {}},
 		{"slices disagree", flat, func(p *joinlistProblem) { p.scans = p.scans[:1] }},
-		{"offsets not ascending", flat, func(p *joinlistProblem) { p.cumOffsets = []int{0, 0, 4} }},
-		{"missing terminating offset", flat, func(p *joinlistProblem) { p.cumOffsets = []int{0, 2} }},
+		{"invalid leaf span", flat, func(p *joinlistProblem) { p.leafSpans = []leafSpan{{0, 0}, {0, 4}} }},
+		{"leaf span count mismatch", flat, func(p *joinlistProblem) { p.leafSpans = []leafSpan{{0, 2}} }},
 		{"leaf without a node", flat, func(p *joinlistProblem) { p.scans[1] = nil }},
 	}
 	for _, tc := range cases {
@@ -361,7 +377,7 @@ func TestPlanJoinlistSearchRejectsMalformedInput(t *testing.T) {
 				prob = rfjProblem(names, []int64{100, 100}, nil)
 				tc.mut(prob)
 			}
-			if _, err := planJoinlistSearch(tc.jl, prob); err == nil {
+			if _, _, err := planJoinlistSearch(tc.jl, prob); err == nil {
 				t.Fatal("planJoinlistSearch accepted a malformed problem")
 			}
 		})
@@ -410,7 +426,7 @@ func TestDeconstructedJointreeFeedsTheRecursion(t *testing.T) {
 	jl := deconstructJointree(from, defaultCollapseLimits())
 	prob := rfjProblem(names, []int64{1_000_000, 10, 1000},
 		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-	n, err := planJoinlistSearch(jl, prob)
+	n, _, err := planJoinlistSearch(jl, prob)
 	if err != nil {
 		t.Fatalf("planJoinlistSearch: %v", err)
 	}

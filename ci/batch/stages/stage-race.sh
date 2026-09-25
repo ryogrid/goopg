@@ -13,7 +13,7 @@ GOOPG_CG_UNIT=goopg-nightly-race GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
 GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \
     "${REPO_ROOT}/scripts/goopg-test-run.sh" \
     env "GOFLAGS=-p=${NIGHTLY_GO_P:-4}" \
-    make -C "${REPO_ROOT}" race-gate RACE_TIMEOUT="${NIGHTLY_RACE_TIMEOUT:-45m}" \
+    make -C "${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}" race-gate RACE_TIMEOUT="${NIGHTLY_RACE_TIMEOUT:-45m}" \
     > "${RUN_DIR}/race/go-test.log" 2>&1 || rc=$?
 
 stop_scope goopg-nightly-race

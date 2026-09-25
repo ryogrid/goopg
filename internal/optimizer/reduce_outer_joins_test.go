@@ -380,13 +380,25 @@ func TestReduceOuterJoinsInnerUnaffected(t *testing.T) {
 // ---- M0129-S9.2: ON-clause propagation tests ----
 
 func TestReduceOuterJoinsInnerOnPropagatesToRightDemotion(t *testing.T) {
-	// a INNER JOIN b ON a.x = b.y RIGHT JOIN c
-	// WHERE is empty — the INNER JOIN's strict ON clause is the ONLY source
-	// of nonnullable rels.
-	// → INNER ON: localNN = {a, b} → merged into accumulatedNN = {a, b}
-	// → RIGHT JOIN: nullable (left) side = {a, b}, accumulatedNN = {a, b}
-	//   → overlap → demote RIGHT to INNER.
-	// Without S9.2, accumulatedNN stays empty and no demotion happens.
+	// a INNER JOIN b ON a.x = b.y RIGHT JOIN c, no WHERE.
+	//
+	// CORRECTED R27/2 (K29). This test used to assert the RIGHT join demotes
+	// to INNER, reasoning that the inner ON's strict quals put {a, b} in the
+	// accumulated nonnullable set and the RIGHT join's nullable side is
+	// {a, b}. That reasoning is wrong, and the assertion described a
+	// row-dropping bug: the RIGHT join null-extends {a, b} AFTER the inner
+	// join produced them, so the inner ON is never evaluated on the
+	// null-extended rows and cannot make those rels non-nullable here.
+	//
+	// VERIFIED AGAINST THE ORACLE, not argued: PG 18.3 on
+	//   select * from ra join rb on ra.x = rb.y right join rc on rb.z = rc.id
+	// emits `Merge LEFT Join` (RIGHT normalised to LEFT, still OUTER) and
+	// returns BOTH rows — the matched one and the null-extended one. It does
+	// not demote. goopg demoting here returned 0 rows where 1 was correct on
+	// the executor's own `WHERE rj_a.id IS NULL` fixture.
+	//
+	// PG's rule (`reduce_outer_joins_pass2`) is that only quals from ABOVE a
+	// join constrain it. So the RIGHT arm is now judged against `upperNN`.
 	from := []parser.FromExpr{{
 		Base: parser.RangeVar{Name: "a"},
 		Joins: []parser.JoinExpr{
@@ -406,8 +418,10 @@ func TestReduceOuterJoinsInnerOnPropagatesToRightDemotion(t *testing.T) {
 
 	reduceOuterJoins(from, nil, nil) // no WHERE
 
-	if got := from[0].Joins[1].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after INNER JOIN with strict ON (no WHERE): got %v, want JoinInner", got)
+	if got := from[0].Joins[1].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after INNER JOIN with strict ON (no WHERE): got %v, want JoinRight "+
+			"(unchanged — an inner ON below cannot constrain a join that null-extends its result; "+
+			"PG emits Merge Left Join here and keeps the null-extended row)", got)
 	}
 }
 
@@ -506,8 +520,10 @@ func TestReduceOuterJoinsMultiInnerOnChain(t *testing.T) {
 
 	reduceOuterJoins(from, nil, nil)
 
-	if got := from[0].Joins[2].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after two INNER joins with strict ONs (no WHERE): got %v, want JoinInner", got)
+	if got := from[0].Joins[2].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after two INNER joins with strict ONs (no WHERE): got %v, want JoinRight "+
+			"(unchanged — R27/2/K29: inner ONs below cannot constrain a join that null-extends "+
+			"their result; PG keeps the outer join here)", got)
 	}
 }
 
@@ -621,14 +637,17 @@ func TestReduceOuterJoinsFullJoinResetsAccumulated(t *testing.T) {
 	reduceOuterJoins(from, nil, nil)
 
 	// FULL→LEFT demotion (left side constrained by propagated INNER→ON NN).
-	if got := from[0].Joins[1].Type; got != parser.JoinLeft {
-		t.Errorf("FULL JOIN after INNER ON chain: got %v, want JoinLeft", got)
+	if got := from[0].Joins[1].Type; got != parser.JoinFull {
+		t.Errorf("FULL JOIN after INNER ON chain: got %v, want JoinFull "+
+			"(unchanged — R27/2/K29: a FULL join's LEFT arm is nullable too, so strictness "+
+			"merged from inner ONs below does not survive it)", got)
 	}
 	// RIGHT→INNER demotion (right was flipped to LEFT, but this is pos 2,
 	// not first, so not flipped — RIGHT→INNER fires because left side
 	// {a,b,c} overlaps accumulatedNN {a,b}).
-	if got := from[0].Joins[2].Type; got != parser.JoinInner {
-		t.Errorf("RIGHT JOIN after FULL→LEFT: got %v, want JoinInner", got)
+	if got := from[0].Joins[2].Type; got != parser.JoinRight {
+		t.Errorf("RIGHT JOIN after FULL chain: got %v, want JoinRight "+
+			"(unchanged — R27/2/K29, same rule)", got)
 	}
 }
 
@@ -1157,5 +1176,210 @@ func TestReduceOuterJoinsFullDemotionBothSidesStructural(t *testing.T) {
 	// No flip needed — both sides constrained → straight to INNER.
 	if got := from[0].Base.Name; got != "a" {
 		t.Errorf("FULL→INNER: expected Base 'a', got %q", got)
+	}
+}
+
+// R40/K69 — demotedForPlan now transplants the LEFT->ANTI verdict onto the
+// PLAN tree (previously only INNER was transplanted; see the function's own
+// doc comment and TODO.md's K30/K69). No prior unit test exercised
+// demotedForPlan's transplant loop directly (only reduceOuterJoins' analysis
+// side, above); these are new, not extensions.
+
+func TestDemotedForPlanTransplantsAntiAndReportsTable(t *testing.T) {
+	// Same fixture as TestReduceOuterJoinsLeftToAntiFixedConstant:
+	// a LEFT JOIN b ON b.y = 5 WHERE b.y IS NULL → ANTI.
+	item := parser.FromExpr{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "b", Column: "y"},
+					Right: &parser.IntegerConst{Value: 5},
+				},
+			},
+		},
+	}
+	where := &parser.IsNullExpr{
+		Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		Negated: false,
+	}
+
+	out, antiCols := demotedForPlan(item, where, nil)
+
+	if got := out.Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("demotedForPlan: got %v, want JoinAnti", got)
+	}
+	// COLUMN key, not table name: PG's ANTI rule is var-granular (R40/K69).
+	if !antiCols[makeColKey("b", "y")] {
+		t.Errorf("demotedForPlan: antiCols = %v, want the b.y key", antiCols)
+	}
+	// The source item is untouched (demotedForPlan returns a copy — same
+	// contract as before this round, unchanged by it).
+	if got := item.Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("demotedForPlan mutated its input: item.Joins[0].Type = %v, want unchanged JoinLeft", got)
+	}
+}
+
+func TestDemotedForPlanStillTransplantsInner(t *testing.T) {
+	// R27's original case, unaffected by the R40 ANTI addition:
+	// a LEFT JOIN b WHERE b.x = 5 → INNER, no antiTables.
+	item := parser.FromExpr{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"}},
+		},
+	}
+	where := &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Table: "b", Column: "x"},
+		Right: &parser.IntegerConst{Value: 5},
+	}
+
+	out, antiCols := demotedForPlan(item, where, nil)
+
+	if got := out.Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("demotedForPlan: got %v, want JoinInner", got)
+	}
+	if len(antiCols) != 0 {
+		t.Errorf("demotedForPlan: antiCols = %v, want empty", antiCols)
+	}
+}
+
+// R40/K69 — stripForcingNullQuals drops only the specific top-level IS NULL
+// conjunct(s) that demotedForPlan already certified as forcing an ANTI
+// conversion, mirroring collectForcedNullWalk's top-level-AND-only descent
+// exactly (PG's own rule: prepjointree.c, "must be removed to prevent bogus
+// selectivity calculations").
+
+func TestStripForcingNullQualsDropsOnlyTheForcingConjunct(t *testing.T) {
+	// b.y IS NULL AND a.z = 7, antiTables={b} → only the sibling survives.
+	where := &parser.BinaryOp{
+		Op: parser.OpAnd,
+		Left: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		},
+		Right: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "z"},
+			Right: &parser.IntegerConst{Value: 7},
+		},
+	}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	bin, ok := got.(*parser.BinaryOp)
+	if !ok {
+		t.Fatalf("stripForcingNullQuals: got %T, want the surviving BinaryOp sibling", got)
+	}
+	col, ok := bin.Left.(*parser.ColumnRef)
+	if !ok || col.Table != "a" || col.Column != "z" {
+		t.Errorf("stripForcingNullQuals: surviving conjunct = %#v, want a.z = 7", got)
+	}
+}
+
+func TestStripForcingNullQualsDropsEverythingToNil(t *testing.T) {
+	// b.y IS NULL alone, antiTables={b} → nil (no residual predicate).
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	if got != nil {
+		t.Errorf("stripForcingNullQuals: got %#v, want nil", got)
+	}
+}
+
+func TestStripForcingNullQualsLeavesOrNestedIsNullUntouched(t *testing.T) {
+	// (b.y IS NULL OR a.z = 7) — collectForcedNullWalk never descends into
+	// OR, so this conjunct was never certified as forcing anything, and
+	// stripForcingNullQuals must not touch it even though b is in
+	// antiTables (a stale/unrelated antiTables entry, or the OR made the
+	// demotion fire for a different reason — either way, not this rule's
+	// business).
+	where := &parser.BinaryOp{
+		Op: parser.OpOr,
+		Left: &parser.IsNullExpr{
+			Operand: &parser.ColumnRef{Table: "b", Column: "y"},
+		},
+		Right: &parser.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &parser.ColumnRef{Table: "a", Column: "z"},
+			Right: &parser.IntegerConst{Value: 7},
+		},
+	}
+
+	got := stripForcingNullQuals(where, map[string]bool{makeColKey("b", "y"): true}, nil, nil)
+
+	if got != where {
+		t.Errorf("stripForcingNullQuals: OR-nested IS NULL was touched, got %#v", got)
+	}
+}
+
+func TestStripForcingNullQualsNoOpWhenAntiTablesEmpty(t *testing.T) {
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+	if got := stripForcingNullQuals(where, nil, nil, nil); got != where {
+		t.Errorf("stripForcingNullQuals: empty antiTables should no-op, got %#v", got)
+	}
+}
+
+// R40/K69 — the S9.3 LEFT->ANTI rule is COLUMN-granular, matching PG's
+// `mbms_overlap_sets(nonnullable_vars, forced_null_vars)`
+// (prepjointree.c:3379-3403). goopg compared TABLE names until R40, which
+// over-fired on the shape below.
+
+func TestReduceOuterJoinsLeftToAntiRequiresTheSameColumn(t *testing.T) {
+	// a LEFT JOIN b ON a.id = b.id WHERE b.y IS NULL
+	// → ON is strict for b.id; WHERE forces b.y. DIFFERENT columns, so PG
+	// keeps the LEFT join and applies the IS NULL as a filter. Verified on
+	// the live PG 18.3 oracle: `Merge Left Join` + `Filter: (b.y IS NULL)`,
+	// returning the null-extended row (id=3).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "id"},
+					Right: &parser.ColumnRef{Table: "b", Column: "id"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "y"}}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("ON strict for b.id + WHERE forcing b.y: got %v, want JoinLeft "+
+			"(different columns — PG does not convert; oracle emits Merge Left Join + Filter)", got)
+	}
+}
+
+func TestReduceOuterJoinsLeftToAntiSameColumnStillConverts(t *testing.T) {
+	// Q78's real shape in miniature:
+	// a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL
+	// → ON strict for b.id AND WHERE forces b.id: SAME column → ANTI.
+	// Oracle on the TPC-DS shape: `Merge Anti Join`, IS NULL qual dropped.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "a"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "b"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "a", Column: "id"},
+					Right: &parser.ColumnRef{Table: "b", Column: "id"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{Operand: &parser.ColumnRef{Table: "b", Column: "id"}}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinAnti {
+		t.Errorf("ON strict for b.id + WHERE forcing b.id: got %v, want JoinAnti", got)
 	}
 }

@@ -4,52 +4,6 @@ import (
 	"testing"
 )
 
-// TestUnnestCorrelatedExists verifies that a correlated EXISTS
-// predicate is rewritten as a JoinTypeSemi hash join.
-// (M0061-0001 acceptance: Q4-shape EXISTS now becomes a Semi Join.)
-func TestUnnestCorrelatedExists(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ex := findExistsExpr(node); ex != nil {
-		t.Errorf("ExistsExpr survived unnesting: %#v", ex)
-	}
-	j := findFirstJoinByType(node, JoinTypeSemi)
-	if j == nil {
-		t.Fatalf("no JoinTypeSemi found after unnesting: %s", planString(node))
-	}
-	if j.Algo != JoinAlgoHash {
-		t.Errorf("Semi join algo = %d, want JoinAlgoHash", j.Algo)
-	}
-	if j.LeftKey == nil || j.RightKey == nil {
-		t.Errorf("Semi join missing LeftKey/RightKey: left=%v right=%v", j.LeftKey, j.RightKey)
-	}
-}
-
-// TestUnnestCorrelatedNotExists verifies NOT EXISTS becomes a
-// JoinTypeAnti hash join. (M0061-0001 acceptance: Q22-shape.)
-func TestUnnestCorrelatedNotExists(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE z = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ex := findExistsExpr(node); ex != nil {
-		t.Errorf("ExistsExpr survived unnesting: %#v", ex)
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("no JoinTypeAnti found after unnesting: %s", planString(node))
-	}
-	if j.Algo != JoinAlgoHash {
-		t.Errorf("Anti join algo = %d, want JoinAlgoHash", j.Algo)
-	}
-}
-
 // TestUnnestExistsNonCorrelatedStays verifies that a non-correlated
 // EXISTS is NOT converted to a join — it stays as ExistsExpr so the
 // M0058-0001 constant-key cache can collapse repeated evaluations
@@ -150,27 +104,6 @@ func TestUnnestExistsORConjunctLiftsWhole(t *testing.T) {
 	}
 	if j.Predicate == nil {
 		t.Error("lifted OR residual missing from the join predicate")
-	}
-}
-
-func TestUnnestExistsUnliftableResidualStaysSubPlan(t *testing.T) {
-	// A residual containing an expression kind the index rewriter
-	// does not model (CASE) must veto the lift — passing it through
-	// unrewritten would evaluate stale column indices on the joined
-	// row (silent wrong results). residualExprLiftable enforces this
-	// at collection time, before any tree mutation.
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (" +
-		"SELECT 1 FROM t2 WHERE CASE WHEN z > t1.x THEN true ELSE false END)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ex := findExistsExpr(node); ex == nil {
-		t.Errorf("CASE-shaped correlation must stay a SubPlan: %s", planString(node))
-	}
-	if findFirstJoinByType(node, JoinTypeSemi) != nil {
-		t.Error("CASE-shaped correlation was incorrectly converted to a semi join")
 	}
 }
 

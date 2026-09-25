@@ -1,9 +1,9 @@
 === Q11
-Sort  (cost=10675.82..10702.49 rows=10667 width=38)
+Sort  (cost=10676.42..10703.09 rows=10667 width=38)
   Sort Key: (sum((partsupp.ps_supplycost * partsupp.ps_availqty))) DESC
   InitPlan 1
-    ->  Aggregate  (cost=4701.07..4701.08 rows=1 width=32)
-          ->  Nested Loop  (cost=11.81..4541.07 rows=32000 width=11)
+    ->  Aggregate  (cost=4701.37..4701.38 rows=1 width=32)
+          ->  Nested Loop  (cost=11.81..4541.37 rows=32000 width=11)
                 ->  Nested Loop  (cost=11.38..252.34 rows=400 width=5)
                       ->  Seq Scan on nation nation_1  (cost=0.00..1.31 rows=1 width=4)
                             Filter: (n_name = 'GERMANY'::bpchar)
@@ -13,10 +13,10 @@ Sort  (cost=10675.82..10702.49 rows=10667 width=38)
                                   Index Cond: (s_nationkey = nation_1.n_nationkey)
                 ->  Index Scan using partsupp_supplier_fkidx on partsupp partsupp_1  (cost=0.42..9.92 rows=80 width=16)
                       Index Cond: (ps_suppkey = supplier_1.s_suppkey)
-  ->  HashAggregate  (cost=4781.07..5261.07 rows=10667 width=38)
+  ->  HashAggregate  (cost=4781.37..5261.37 rows=10667 width=38)
         Group Key: partsupp.ps_partkey
         Filter: (sum((partsupp.ps_supplycost * partsupp.ps_availqty)) > (InitPlan 1).col1)
-        ->  Nested Loop  (cost=11.81..4541.07 rows=32000 width=17)
+        ->  Nested Loop  (cost=11.81..4541.37 rows=32000 width=17)
               ->  Nested Loop  (cost=11.38..252.34 rows=400 width=5)
                     ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=4)
                           Filter: (n_name = 'GERMANY'::bpchar)

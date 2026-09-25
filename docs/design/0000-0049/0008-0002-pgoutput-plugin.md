@@ -151,7 +151,9 @@ lands; this loop ships only the encoder and its unit tests.
 - `'T'` TRUNCATE — milestone-out-of-scope.
 - `'Y'` TYPE — only needed when subscribers see a non-built-in
   type column; deferred.
-- `'M'` MESSAGE — operator-issued messages; deferred.
+- `'M'` MESSAGE — protocol-v1 wire encode/decode and subscriber-safe no-op
+  handling landed in M0122-0014. SQL `pg_logical_emit_message` WAL production
+  remains deferred because it needs durable RM_LOGICALMSG classification.
 - 2PC messages — milestone-out-of-scope.
 - Streaming (v2) framing — milestone-out-of-scope.
 - Replica identity beyond `d` (DEFAULT) — needs catalog support

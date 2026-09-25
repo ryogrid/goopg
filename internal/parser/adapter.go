@@ -535,9 +535,13 @@ func (l *lexerState) mapToken(i int) lexResult {
 		// 22003. Upstream's cutoff is int32 because its Iconst is int32;
 		// goopg's IntegerConst is int64, and the legacy lexer draws the line
 		// there too, so int64 is the boundary that keeps the two ASTs equal.
-		n, err := strconv.ParseInt(strings.ReplaceAll(t.Value, "_", ""), 10, 64)
+		n, err := parseIntLiteral(t.Value)
 		if err != nil {
-			return lexResult{term: termFCONST, str: t.Value, pos: t.Pos, text: t.Value}
+			// intLiteralOverflowText converts 0b/0o/0x-prefixed text to
+			// decimal — the FCONST/NumericConst path downstream only
+			// understands base 10 (M0097-0003 sibling fix: parseIntLiteral
+			// already knew the base, mapToken did not).
+			return lexResult{term: termFCONST, str: intLiteralOverflowText(t.Value), pos: t.Pos, text: t.Value}
 		}
 		return lexResult{term: termICONST, ival: int(n), str: t.Value, pos: t.Pos, text: t.Value}
 	case TokenNumericLit:

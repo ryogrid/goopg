@@ -10,7 +10,8 @@ import "testing"
 // Legacy is NARROWER than gram.y in five places and this grammar follows
 // legacy, not upstream:
 //
-//   - DISCARD ALL is rejected (only PLANS / SEQUENCES / TEMP / TEMPORARY).
+//   - DISCARD ALL is accepted, as gram.y does (it was rejected for legacy
+//     parity until 2026-09-24).
 //   - a cursor takes [NO] SCROLL only; BINARY / INSENSITIVE / ASENSITIVE are
 //     rejected before CURSOR.
 //   - CLUSTER has no parenthesised option list, only the bare VERBOSE word.
@@ -54,10 +55,12 @@ func TestUtilityStatements(t *testing.T) {
 	} {
 		assertParity(t, q)
 	}
-	// Both parsers must keep rejecting these: DISCARD ALL and the cursor
-	// sensitivity words are gram.y forms legacy does not implement, and
-	// accepting them here would silently widen the language.
-	assertBothReject(t, "DISCARD ALL")
+	// DISCARD ALL is gram.y's DiscardStmt target DISCARD_ALL; goopg now
+	// implements it (M-NIGHTLY command-tag sweep).
+	assertParity(t, "DISCARD ALL")
+	// Both parsers must keep rejecting these: the cursor sensitivity words
+	// are gram.y forms legacy does not implement, and accepting them here
+	// would silently widen the language.
 	assertBothReject(t, "DECLARE c BINARY CURSOR FOR SELECT 1")
 	assertBothReject(t, "DECLARE c INSENSITIVE CURSOR FOR SELECT 1")
 	assertBothReject(t, "DECLARE c ASENSITIVE CURSOR FOR SELECT 1")

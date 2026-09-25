@@ -146,7 +146,8 @@ func TestOpportunisticPruneEmitsCanonicalWAL(t *testing.T) {
 }
 
 // TestPageSetXmaxTracksPruneXID verifies that the pd_prune_xid bookkeeping
-// in PageSetHeapTupleXmax correctly tracks the max xmax seen.
+// in PageSetHeapTupleXmax keeps the OLDEST xmax, as PG's PageSetPrunable does
+// (M0145-0008x).
 func TestPageSetXmaxTracksPruneXID(t *testing.T) {
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
@@ -168,8 +169,8 @@ func TestPageSetXmaxTracksPruneXID(t *testing.T) {
 	if err := storage.PageSetHeapTupleXmax(page, 2, 3); err != nil {
 		t.Fatal(err)
 	}
-	// xmax=3 < current 5 → pd_prune_xid must remain 5.
-	if got := storage.TransactionID(storage.MustHeader(page).PruneXID()); got != 5 {
-		t.Errorf("pd_prune_xid should stay at 5 (not decrease to 3), got %d", got)
+	// xmax=3 precedes the current 5, so pd_prune_xid drops to 3.
+	if got := storage.TransactionID(storage.MustHeader(page).PruneXID()); got != 3 {
+		t.Errorf("pd_prune_xid should drop to the older 3, got %d", got)
 	}
 }

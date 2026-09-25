@@ -45,7 +45,7 @@ func TestExecTypeACLChangeStampsActingRoleAsGrantor(t *testing.T) {
 		t.Fatalf("execTypeACLChange: %v", err)
 	}
 
-	want := "{postgres=U/postgres,=U/postgres,charlie=U/bob}"
+	want := "{=U/postgres,postgres=U/postgres,charlie=U/bob}"
 	if got := cat.TypeACLText(et.OID); got != want {
 		t.Fatalf("typacl after impersonated GRANT = %q; want %q", got, want)
 	}
@@ -68,7 +68,7 @@ func TestExecDatabaseACLChangeStampsActingRoleAsGrantor(t *testing.T) {
 		t.Fatalf("execDatabaseACLChange: %v", err)
 	}
 
-	want := "{postgres=CTc/postgres,=Tc/postgres,charlie=c/bob}"
+	want := "{=Tc/postgres,postgres=CTc/postgres,charlie=c/bob}"
 	if got := cat.DatabaseACLText(dbOid); got != want {
 		t.Fatalf("datacl after impersonated GRANT = %q; want %q", got, want)
 	}
@@ -120,7 +120,7 @@ func TestExecACLChangeGrantedByCurrentUserIsNoop(t *testing.T) {
 	if err := op.execTypeACLChange(tc); err != nil {
 		t.Fatalf("execTypeACLChange with GRANTED BY bob (as bob): %v", err)
 	}
-	want := "{postgres=U/postgres,=U/postgres,charlie=U/bob}"
+	want := "{=U/postgres,postgres=U/postgres,charlie=U/bob}"
 	if got := cat.TypeACLText(et.OID); got != want {
 		t.Fatalf("typacl = %q; want %q", got, want)
 	}

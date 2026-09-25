@@ -1345,35 +1345,38 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 	// against upstream's own — a goopg pg_toast_2618 that is merely
 	// well-formed would still fail here.
 	//
-	// The byte counts are goopg's, and they are 3-4% BELOW upstream's for
-	// every value (measured, in the trailing comments): goopg's pglz encoder
-	// finds shorter output than PG's for the same input, so its TOAST heap is
-	// byte-divergent from upstream's even though the DETOASTED value is
-	// identical — which the pg_indexes read below proves end to end. It also
-	// costs pg_stats_ext one whole chunk (6 where upstream writes 7).
-	// Recorded rather than "fixed": nothing in PG's reader depends on the
-	// split, and matching upstream's exact pglz output would mean reproducing
-	// its match-search heuristics, not its format. Ledgered.
+	// The byte counts are goopg's, re-pinned 2026-09-19 after c11ff797a
+	// (review/260831 NB-17) replaced the compressor's brute-force match
+	// search with upstream's hash chain plus its good_match/good_drop
+	// bounds — exactly the "reproduce the match-search heuristics" step the
+	// previous pin's comment said byte parity would require, so this list
+	// is that comment's FAIL-WHEN-FIXED flip (ledger row M0131-S20.2b F24
+	// resolved). Every chunk count now equals upstream's own — including
+	// pg_stats_ext, check_constraints, columns and routines, the four
+	// values that used to come up one chunk short. Stored bytes sit within
+	// 18 B of upstream's for every value, 8 of 17 byte-exact; the residual
+	// delta is content-level (the detoasted trees are semantically but not
+	// byte-identical to upstream's), not the compressor's split.
 	wantChunks := []string{
-		"12047/5/8674",   // pg_indexes           (upstream: 5 chunks / 9002 B)
-		"12057/5/8985",   // pg_stats             (upstream: 5 / 9316)
-		"12062/6/11743",  // pg_stats_ext         (upstream: 7 / 12196)
-		"12067/6/11089",  // pg_stats_ext_exprs   (upstream: 6 / 11481) — M0131-S9.3g
-		"12103/18/34093", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
-		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
+		"12047/5/9003",   // pg_indexes           (upstream: 5 chunks / 9002 B)
+		"12057/5/9316",   // pg_stats             (upstream: 5 / 9316)
+		"12062/7/12197",  // pg_stats_ext         (upstream: 7 / 12196)
+		"12067/6/11481",  // pg_stats_ext_exprs   (upstream: 6 / 11481) — M0131-S9.3g
+		"12103/18/35379", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
+		"12178/6/10477",  // pg_statio_all_tables (upstream: 6 / 10475)
 		// M0133-S4 tranche 2 — the ten information_schema TOAST views.
-		"13315/7/13160",  // attributes           (upstream: 7 / 13608)
-		"13330/8/15510",  // check_constraints    (upstream: 9 / 16059)
-		"13355/6/10396",  // column_privileges    (upstream: 6 / 10776)
-		"13365/12/23386", // columns              (upstream: 13 / 24201)
-		"13370/5/8502",   // constraint_column_usage (upstream: 5 / 8878)
-		"13389/5/8110",   // domains              (upstream: 5 / 8356)
-		"13408/7/13086",  // referential_constraints (upstream: 7 / 13463)
-		"13446/5/9731",   // routines             (upstream: 6 / 10091)
-		"13499/10/18840", // transforms           (upstream: 10 / 19659)
-		"13523/10/18574", // usage_privileges     (upstream: 10 / 19211)
+		"13315/7/13611",  // attributes           (upstream: 7 / 13608)
+		"13330/9/16061",  // check_constraints    (upstream: 9 / 16059)
+		"13355/6/10776",  // column_privileges    (upstream: 6 / 10776)
+		"13365/13/24219", // columns              (upstream: 13 / 24201)
+		"13370/5/8878",   // constraint_column_usage (upstream: 5 / 8878)
+		"13389/5/8355",   // domains              (upstream: 5 / 8356)
+		"13408/7/13463",  // referential_constraints (upstream: 7 / 13463)
+		"13446/6/10093",  // routines             (upstream: 6 / 10091)
+		"13499/10/19659", // transforms           (upstream: 10 / 19659)
+		"13523/10/19217", // usage_privileges     (upstream: 10 / 19211)
 		// M0133-S4 tranche 4 — the view-on-view element_types (eleventh F33).
-		"13562/6/10541", // element_types         (upstream: 6 / 10956)
+		"13562/6/10956", // element_types         (upstream: 6 / 10956)
 	}
 	gotChunks := pgQueryColumn(t, pg,
 		"SELECT chunk_id::text || '/' || count(*)::text || '/' || sum(length(chunk_data))::text "+

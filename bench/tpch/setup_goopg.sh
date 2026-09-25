@@ -12,6 +12,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env_goopg.sh
 source "${SCRIPT_DIR}/env_goopg.sh"
+# :65433 serves a pinned binary so other lanes rebuilding tmp/goopg-bench-bin
+# cannot turn its executable into "(deleted)" (0917 audit H1c).
+GOOPG_BIN="${TPCH_REF_BIN:-${REPO_ROOT}/bench/tpch/runtime_goopg/goopg-bin}"
+if [[ -e "${PGDATA}.HOLD" ]]; then
+    echo "REFUSED: ${PGDATA}.HOLD exists (evidence hold): $(head -1 "${PGDATA}.HOLD")" >&2
+    exit 3
+fi
 
 reset_data=0
 for arg in "$@"; do
@@ -23,9 +30,13 @@ done
 
 # Build the goopg binary so a clean checkout can run the bench
 # without a prior `go build`. Cached re-builds are cheap.
-echo "Building goopg → ${GOOPG_BIN}"
-mkdir -p "$(dirname "${GOOPG_BIN}")"
-( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}" ./cmd/goopg )
+if "${GOOPG_BIN}" status -D "${PGDATA}" >/dev/null 2>&1; then
+    echo "Server running on ${PGDATA}; not rebuilding the binary it serves."
+else
+    echo "Building goopg → ${GOOPG_BIN}"
+    mkdir -p "$(dirname "${GOOPG_BIN}")"
+    ( cd "${REPO_ROOT}" && go build -o "${GOOPG_BIN}.new.$$" ./cmd/goopg && mv -f "${GOOPG_BIN}.new.$$" "${GOOPG_BIN}" )
+fi
 
 # Refuse silently if a goopg cluster is already running here.
 if [[ -f "${PGDATA}/postmaster.pid" ]]; then
@@ -60,6 +71,11 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         # (512MB / 4GB) — an 8x work_mem advantage to goopg, which made every
         # work_mem-sensitive cost comparison between the engines meaningless.
         #
+        # Measurement convention (owner decision 2026-09-24): both engines'
+        # measurement clusters carry work_mem = 512MB in postgresql.conf —
+        # written here, never overridden by a session SET. This supersedes
+        # the earlier 64MB alignment (conf line + capture-script SET pins).
+        #
         # Only meaningful since P2-01/P2-02: before those, work_mem reached the
         # EXECUTOR but not the planner, so setting it here would have made the
         # two disagree — the hazard cost_funcs.go's workMem comment names.
@@ -68,7 +84,7 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         # Go-heap object under GOMEMLIMIT (M0032-0001); shrinking it to PG's
         # 512MB would measure Go's GC behaviour, not the planner. It is recorded
         # as a permitted divergence rather than drift.
-        echo "work_mem = 64MB"
+        echo "work_mem = 512MB"
         echo "effective_cache_size = 2GB"
         # M0057-0002: suppress mid-benchmark checkpoints. 24-hour time
         # threshold and 1 TiB WAL threshold are both unreachable in a

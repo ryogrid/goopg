@@ -705,3 +705,36 @@ generation produces it yet, so no existing query changes.
    and the feature is inert.
    *Mitigation*: register `enable_bitmapscan` with `BootVal = true` from
    the start.
+
+## Update 2026-09-19 (M-NIGHTLY AI-20260917-004357-013): rowmark TID surfacing + per-tuple page RLock
+
+Two sibling changes, one enabling the other:
+
+1. **Rowmark participation.** The op now surfaces the heap TID of each
+   emitted tuple the same three ways `seqScanOp`/`indexScanOp` do:
+   `emitRow` appends a `(block,offset)` ctid datum for resjunk schema
+   slots (wired by the `*BitmapHeapScan` arm of
+   `wireRowMarkCtidColumns` — see `0129-0003` update) and stamps
+   `hasCTID`/`ctidBlock`/`ctidOff` on the slot; `currentTID()` implements
+   `currentTIDProvider` (`ok=false` once `releasePinned` runs at
+   EOF/Close, matching the seqScan contract so a build-side scan drained
+   at hash-join Open falls through to the slot stamp); and the lockRows
+   walkers recognise the leaf, including as an NLI inner. Without this,
+   `FOR UPDATE OF <rel>` over `LockRows -> <join> -> Bitmap Heap Scan`
+   silently skipped the row lock.
+
+2. **Per-tuple page RLock (M0100-0005e convention).** The scan previously
+   held `pinned.RLock()` across `Next()` yields until the page's offsets
+   were exhausted. `lockRowsOp.drainAndStamp` calls `stampLock` per row
+   mid-drain, and `stampLockInner` write-locks the same page — a
+   same-goroutine RLock→Lock self-deadlock (`LockRows -> NL(Values,
+   BitmapHeapScan inner)` in eval-plan-qual's `lockwithvalues` perm hung
+   the whole spec). The RLock is now scoped to each page access:
+   `fetchOneTuple` RLock/RUnlocks around item-id + HOT-chain + decode;
+   `nextLossyTuple` locks only its line-pointer probe; `fetchExact`
+   collapsed to `fetchOneTuple` + `o.Next()` recursion (the bodies were
+   duplicates) so no nested RLock is ever taken; the pin still persists
+   across yields and `releasePinned` only Unpins.
+
+`eval-plan-qual.spec` (the spec §"verification" names for this family)
+went from recorded-fail to byte-identical PASS.

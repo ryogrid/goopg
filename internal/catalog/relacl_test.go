@@ -885,8 +885,8 @@ func TestRevokeAllFromOwnerThenGrantGrantee(t *testing.T) {
 // through a full GRANT.
 func TestACLQuoteName(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"", ""},                      // PUBLIC pseudo-grantee
-		{"postgres", "postgres"},      // owner / common case
+		{"", ""},                 // PUBLIC pseudo-grantee
+		{"postgres", "postgres"}, // owner / common case
 		{"plain_role99", "plain_role99"},
 		{"weird-role", `"weird-role"`}, // hyphen
 		{"has space", `"has space"`},   // space
@@ -918,14 +918,10 @@ func TestProcACLText(t *testing.T) {
 	// GRANT EXECUTE … TO a grantee seeds the implicit PUBLIC default plus the
 	// grantee; the owner entry is rendered from the owner-default string. Grantees
 	// render in GRANT order (PUBLIC granted first, then grantee_fn) with the owner
-	// pulled to the head: "{postgres=X/postgres,=X/postgres,grantee_fn=X/postgres}".
-	// Real PG 18.3 stores "{=X/postgres,postgres=X/postgres,grantee_fn=X/postgres}"
-	// (owner/PUBLIC default ordering differs — a pre-existing owner-first rendering
-	// choice), but grantee_fn lands LAST in both, and pg_dump parses the array as a
-	// set so the round-trip is byte-identical. DU-002 slice 354.
+	// places the PUBLIC aclitem before the owner, then keeps grantee_fn last.
 	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
 	c.GrantTablePrivilege(procOID, "grantee_fn", "EXECUTE")
-	want := "{postgres=X/postgres,=X/postgres,grantee_fn=X/postgres}"
+	want := "{=X/postgres,postgres=X/postgres,grantee_fn=X/postgres}"
 	if got := c.ProcACLText(procOID); got != want {
 		t.Fatalf("proacl after GRANT EXECUTE TO grantee_fn = %q; want %q", got, want)
 	}
@@ -955,7 +951,7 @@ func TestProcACLGrantWithGrantOption(t *testing.T) {
 	// the owner at the head. DU-002 slice 354.
 	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
 	c.GrantTablePrivilegeWithGrantOption(procOID, "grantee_fn", "EXECUTE", true)
-	want := "{postgres=X/postgres,=X/postgres,grantee_fn=X*/postgres}"
+	want := "{=X/postgres,postgres=X/postgres,grantee_fn=X*/postgres}"
 	if got := c.ProcACLText(procOID); got != want {
 		t.Fatalf("proacl after GRANT EXECUTE WITH GRANT OPTION = %q; want %q", got, want)
 	}
@@ -1033,7 +1029,7 @@ func TestProcACLRevokeFromOwner(t *testing.T) {
 		c.RevokeTablePrivilege(procOID, "postgres", "EXECUTE") // {=X/postgres}
 		// A later owner-side GRANT clears relACLOwnerRevoked and restores the owner.
 		c.GrantTablePrivilege(procOID, "postgres", "EXECUTE")
-		if want, got := "{postgres=X/postgres,=X/postgres}", c.ProcACLText(procOID); got != want {
+		if want, got := "{=X/postgres,postgres=X/postgres}", c.ProcACLText(procOID); got != want {
 			t.Fatalf("proacl after re-GRANT to postgres = %q; want %q", got, want)
 		}
 	})
@@ -1058,12 +1054,11 @@ func TestTypeACLText(t *testing.T) {
 	}
 
 	// GRANT USAGE … TO a grantee seeds the implicit PUBLIC default plus the
-	// grantee; the owner entry is rendered from the owner-default string. Grantees
-	// render in GRANT order (PUBLIC granted first, then grantee_ty) with the owner
-	// pulled to the head, mirroring the proacl projection.
+	// grantee; PostgreSQL's acldefault array places PUBLIC before the owner, then
+	// named grantees retain GRANT order.
 	c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
 	c.GrantTablePrivilege(typeOID, "grantee_ty", "USAGE")
-	want := "{postgres=U/postgres,=U/postgres,grantee_ty=U/postgres}"
+	want := "{=U/postgres,postgres=U/postgres,grantee_ty=U/postgres}"
 	if got := c.TypeACLText(typeOID); got != want {
 		t.Fatalf("typacl after GRANT USAGE TO grantee_ty = %q; want %q", got, want)
 	}
@@ -1086,7 +1081,7 @@ func TestTypeACLGrantWithGrantOption(t *testing.T) {
 
 	c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
 	c.GrantTablePrivilegeWithGrantOption(typeOID, "grantee_ty", "USAGE", true)
-	want := "{postgres=U/postgres,=U/postgres,grantee_ty=U*/postgres}"
+	want := "{=U/postgres,postgres=U/postgres,grantee_ty=U*/postgres}"
 	if got := c.TypeACLText(typeOID); got != want {
 		t.Fatalf("typacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
 	}
@@ -1351,14 +1346,12 @@ func TestDatabaseACLText(t *testing.T) {
 	}
 
 	// GRANT CREATE … TO a grantee seeds the implicit PUBLIC TEMPORARY+CONNECT
-	// default plus the grantee's CREATE; the owner entry is rendered from the
-	// owner-default string "CTc". Grantees render in GRANT order (PUBLIC
-	// granted first, then grantee_db) with the owner pulled to the head,
-	// mirroring the typacl projection.
+	// default plus the grantee's CREATE; PostgreSQL's acldefault array puts the
+	// PUBLIC default before the owner entry, then named grantees in GRANT order.
 	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
 	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
 	c.GrantTablePrivilege(dbOID, "grantee_db", "CREATE")
-	want := "{postgres=CTc/postgres,=Tc/postgres,grantee_db=C/postgres}"
+	want := "{=Tc/postgres,postgres=CTc/postgres,grantee_db=C/postgres}"
 	if got := c.DatabaseACLText(dbOID); got != want {
 		t.Fatalf("datacl after GRANT CREATE TO grantee_db = %q; want %q", got, want)
 	}
@@ -1385,7 +1378,7 @@ func TestDatabaseACLRevokeFromOwner(t *testing.T) {
 	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
 	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
 	c.RevokeTablePrivilege(dbOID, "postgres", "CREATE")
-	want := "{postgres=Tc/postgres,=Tc/postgres}"
+	want := "{=Tc/postgres,postgres=Tc/postgres}"
 	if got := c.DatabaseACLText(dbOID); got != want {
 		t.Fatalf("datacl after REVOKE CREATE FROM postgres = %q; want %q", got, want)
 	}
@@ -1554,4 +1547,49 @@ func TestHasTablePrivilegeAclmaskGranteeMatching(t *testing.T) {
 	if c.HasTablePrivilege(relGroup, "member", "DELETE") {
 		t.Errorf("HasTablePrivilege(member, DELETE) = true; only SELECT was granted to grp")
 	}
+}
+
+// TestACLPublicItemPositionFollowsAcldefault pins WHERE the PUBLIC aclitem sits
+// in the rendered array, which is decided per object class by whether
+// `acldefault` has a non-zero world default
+// (postgres/src/backend/utils/adt/acl.c:804). PostgreSQL writes the world item
+// FIRST for the classes that have one, and `aclupdate` (same file) APPENDS every
+// other new grantee without sorting — so on a table a PUBLIC grant is an
+// ordinary grantee in grant order, while on a database or a type it leads.
+//
+// The two `want` strings below are not derived: they were captured from
+// PostgreSQL 18.3 on a private cluster running the same statement order
+// (2026-09-22, M0122-0008b).
+//
+//	table:    GRANT SELECT ON t2 TO bob; GRANT SELECT ON t2 TO PUBLIC;
+//	          -> {postgres=arwdDxtm/postgres,bob=r/postgres,=r/postgres}
+//	database: GRANT CONNECT ON DATABASE d1 TO bob;
+//	          -> {=Tc/postgres,postgres=CTc/postgres,bob=c/postgres}
+//
+// The pair is the point: one arm alone cannot tell "PUBLIC leads" from "PUBLIC
+// trails", and a rule that gets either arm wrong is a pg_dump-visible
+// divergence, because aclitem[] is compared as text.
+func TestACLPublicItemPositionFollowsAcldefault(t *testing.T) {
+	t.Run("table has no world default, so PUBLIC is appended in grant order", func(t *testing.T) {
+		c := NewInMemory()
+		const relOID = 16910
+		c.GrantTablePrivilege(relOID, "bob", "SELECT")
+		c.GrantTablePrivilege(relOID, "PUBLIC", "SELECT")
+		want := "{postgres=arwdDxtm/postgres,bob=r/postgres,=r/postgres}"
+		if got := relaclText(c, relOID); got != want {
+			t.Fatalf("relacl = %q; want %q (PG 18.3 capture)", got, want)
+		}
+	})
+
+	t.Run("database has a world default, so PUBLIC leads the array", func(t *testing.T) {
+		c := NewInMemory()
+		const dbOID = 16911
+		c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
+		c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
+		c.GrantTablePrivilege(dbOID, "bob", "CONNECT")
+		want := "{=Tc/postgres,postgres=CTc/postgres,bob=c/postgres}"
+		if got := c.DatabaseACLText(dbOID); got != want {
+			t.Fatalf("datacl = %q; want %q (PG 18.3 capture)", got, want)
+		}
+	})
 }

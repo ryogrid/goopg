@@ -228,6 +228,13 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
 		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
 	}
+	// M0141-S2b-16: the partial input is a prebuilt serial subtree, so its
+	// driving scan still carries serial rows; give it the per-worker figure,
+	// with the divisor the Gather path was priced with (gatherChildPlan's
+	// rule).
+	if built.PartialSource.Child != child {
+		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gather, partial))
+	}
 	return built, layout
 }
 
@@ -258,7 +265,24 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 	if p.Unique {
 		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
 	}
-	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema}, nil
+	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema, SortKeys: p.Distinct.SortKeys}, nil
+}
+
+// createUniquePlan is the PathUnique arm (M0142-0008c-1): emit a
+// `*DistinctOn` keyed by `p.UniqueKeyCols` over the built child — always
+// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice),
+// because `createUniquePath` never builds the HASHED candidate (see its own
+// doc comment for why). The child is `p.Children[0]`, the Sort
+// `createUniquePath` stacked over the SEMI RHS's cheapest-total path.
+func createUniquePlan(p *Path) (Node, outputLayout) {
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathUnique with %d children, want exactly 1", len(p.Children)))
+	}
+	child, _ := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathUnique over a child path that built no node")
+	}
+	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: p.UniqueKeyCols, schema: child.Output()}, nil
 }
 
 // createWindowPlan is the PathWindow arm (C-18): emit the path's window
@@ -287,8 +311,98 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathWindow over a child path that built no node")
 	}
 	out := *p.Window
+	// R6 (plan-parity-fix-take2): stack the Sort PG's
+	// `create_one_window_path` (planner.c:4620) stacks, instead of leaving
+	// the executor to sort privately. Three things this buys, in the order
+	// they matter to plan parity: the plan text gains the `Sort` PG shows;
+	// the whole-input materialisation `windowOp` performed goes away; and —
+	// the point of K12 — the ordering requirement becomes visible to the
+	// planner, so a node below can eventually be credited for satisfying it
+	// rather than every window silently paying for its own sort.
+	//
+	// `costWindow` already prices this sort (windowsetoppaths.go), so the
+	// node is made to EXIST for a cost that was already being charged; no
+	// new cost is introduced here. The window rel has a single candidate,
+	// so nothing is being re-selected either.
+	if keys := windowSortKeys(p.Window); len(keys) > 0 {
+		if childDeliversSortKeys(child, keys) {
+			// The order is already there. PG only stacks a Sort when the
+			// required pathkeys are not already satisfied
+			// (`create_one_window_path`), which is precisely the case of a
+			// window chain whose consecutive specs share an ordering: the
+			// lower WindowAgg emits its input's order untouched, so a second
+			// sort would be both a wasted node and a plan PG never prints.
+			out.Presorted = true
+		} else {
+			child = &Sort{Child: child, Keys: keys}
+			out.Presorted = true
+		}
+	}
 	out.Child = child
 	return &out, nil
+}
+
+// windowSortKeys is the ordering `nodeWindowAgg` requires: PARTITION BY
+// first, then ORDER BY, which is exactly the comparison order `windowOp`
+// applied internally (operators_window.go) and the order
+// `create_one_window_path` builds its pathkeys in. Partition columns carry
+// no direction of their own — PG sorts them ascending — so they are emitted
+// with the zero-value SortKey direction, matching what the executor's
+// comparator did for them.
+// childDeliversSortKeys reports whether `child` already emits rows in `keys`
+// order, so no Sort need be stacked (PG's "pathkeys already satisfied" test).
+//
+// Two shapes qualify, and deliberately no others — an unknown node is assumed
+// UNORDERED, which costs at most a redundant Sort and can never produce wrong
+// results:
+//
+//   - a `*Sort` on exactly these keys (the node this function's caller just
+//     built one level down);
+//   - a `*WindowAgg` that is itself ordered on exactly these keys — a
+//     WindowAgg appends columns and preserves its input's row order, so a
+//     chain of window specs sharing one ordering sorts once, as PG does.
+func childDeliversSortKeys(child Node, keys []SortKey) bool {
+	switch c := child.(type) {
+	case *Sort:
+		return sortKeysEqual(c.Keys, keys)
+	case *WindowAgg:
+		// Only if the lower window is itself known-ordered on those keys.
+		return c.Presorted && sortKeysEqual(windowSortKeys(c), keys)
+	}
+	return false
+}
+
+// sortKeysEqual compares two key lists by expression identity and direction.
+// Conservative: anything `exprEqual` cannot prove equal counts as different,
+// which fails toward stacking a Sort.
+func sortKeysEqual(a, b []SortKey) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Desc != b[i].Desc || a[i].NullsFirst != b[i].NullsFirst {
+			return false
+		}
+		if !exprEqual(a[i].Expr, b[i].Expr) {
+			return false
+		}
+	}
+	return true
+}
+
+func windowSortKeys(w *WindowAgg) []SortKey {
+	if w == nil {
+		return nil
+	}
+	if len(w.PartitionBy) == 0 && len(w.OrderBy) == 0 {
+		return nil
+	}
+	keys := make([]SortKey, 0, len(w.PartitionBy)+len(w.OrderBy))
+	for _, pe := range w.PartitionBy {
+		keys = append(keys, SortKey{Expr: pe})
+	}
+	keys = append(keys, w.OrderBy...)
+	return keys
 }
 
 // createSetOpPlan is the PathSetOp arm (C-18): emit the path's set-operation
@@ -297,9 +411,32 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 // the order the semantics depend on (EXCEPT is not commutative, and
 // `SetOp.Output()` reads the left branch's schema).
 //
-// The returned layout is nil for the same reason the other upper arms return
-// nil: a set operation has two children and therefore no single child layout
-// to pass through, and no caller above the seam reads one.
+// The returned layout is `baseRelLayout(p.Rel, out)` — nil for every
+// pre-M0145-0004 caller for the same reason the other upper arms return
+// nil: a set operation has two children and therefore no single child
+// layout to pass through, and an upper rel has no baseLeaf. The
+// appendrel hoist CHANGED that: a PathSetOp re-targeted onto a leaf rel
+// can sit as a join's input, where `joinInputsFor` panics on a nil child
+// layout — the emitted node is the leaf's own SetOp (same schema as
+// `rel.baseLeaf`), so the contiguous leaf layout is exact.
+//
+// M0140-0006c-3: a child that is a searched-path pick (either arm's
+// `PartialPathlist[0]` — anything that is not the branch's own
+// `PathPrebuilt` seed) emits the branch REL's subtree, which is what
+// `createPlanNode` produces — the searched emission, WITHOUT the boundary
+// wrappers (boundary `*Project`s, `Sort`, `Limit`, `Distinct`,
+// `Aggregate`, …) that sit between the branch node and that emission. A
+// wholesale `out.Left = built` would therefore emit the searched rel's
+// internal schema where the union declared the branch's — a wrong-arity,
+// wrong-rows plan whenever the projection is not an identity (`SELECT a`
+// over a two-column branch emits (a,b); a dropped `Limit`/`Filter` emits
+// rows the branch never produced). `spliceBranchEmission` rebuilds the
+// branch's wrapper chain over the substituted emission instead, so the
+// union branch keeps its declared output exactly as PG's Append child does.
+// The mixed arm's claimed-whole pick never needs the splice: it is a
+// `PathPrebuilt` seed over the branch node itself, which builds back to
+// that node pointer-identically — the `out.Left != p.SetOp.Left` check
+// below skips it.
 func createSetOpPlan(p *Path) (Node, outputLayout) {
 	if p.SetOp == nil {
 		panic("createPlan: PathSetOp with no set-op spec")
@@ -315,7 +452,100 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	out := *p.SetOp
 	out.Left = left
 	out.Right = right
-	return &out, nil
+	// The splice fires only on searched-emission picks — either arm's
+	// `PartialPathlist[0]`, which builds the branch REL's subtree and drops
+	// the boundary wrappers above it. A `PathPrebuilt` child is the
+	// claimed-whole seed: it IS a whole-branch plan (the branch node itself,
+	// or its StripGather serial form), never an emission to re-wrap.
+	if p.Children[0].Kind != PathPrebuilt && out.Left != p.SetOp.Left {
+		out.Left = spliceBranchEmission(p.SetOp.Left, left)
+	}
+	if p.Children[1].Kind != PathPrebuilt && out.Right != p.SetOp.Right {
+		out.Right = spliceBranchEmission(p.SetOp.Right, right)
+	}
+	// M0140-0006c-3: the claimed-whole branch markers travel on the PATH,
+	// not the shared *SetOp spec — the serial path and the partial paths
+	// all carry the same spec, so stamping it there would leak the mixed
+	// arm's marks into plans that never made the pick.
+	out.LeftNonPartial = p.SetOpLeftNonPartial
+	out.RightNonPartial = p.SetOpRightNonPartial
+	// M0145-0004a: the path's parallel_aware bit travels onto the node —
+	// PG's explain.c:1630 prints "Parallel Append" for a parallel-aware
+	// Append, and the label is what the plan-parity walk reads. Only a
+	// partial PathSetOp carries it; the serial path leaves it false.
+	out.ParallelAware = p.ParallelAware
+	return &out, baseRelLayout(p.Rel, &out)
+}
+
+// spliceBranchEmission rebuilds `branch` with the searched emission swapped
+// for `built`. It descends the single-child pass-through kinds
+// `boundaryWalkChildren` enumerates — the wrappers that can sit between a
+// statement's root and a spliced searched subtree — copying each, and swaps
+// the FIRST node that is not one: that node is what the branch rel's winning
+// path emitted, and `built` (a different path of the same rel) emits the
+// same schema, so the wrappers re-apply unchanged. Multi-child kinds
+// (`*Join`, `*SetOp`, `*NestedLoopIndexJoin`), leaf scans, and nodes the
+// walk cannot enumerate are all emission points — they are replaced whole.
+//
+// `*Gather`/`*GatherMerge` are descended rather than copied: a swapped-in
+// partial subtree cannot carry the serial winner's gather (a Gather inside
+// a worker is nested parallelism the executor does not model), but the
+// wrappers BELOW it — including a searched-root `*Project` — still delimit
+// the emission, so the substitution continues underneath while the gather
+// itself is dropped. A `*Memoize` cannot be descended at all — its Child is
+// typed `*IndexScan` (plan.go), not `Node` — so it is an emission point too:
+// replaced whole, losing a cache hint, never rows.
+func spliceBranchEmission(branch, built Node) Node {
+	switch x := branch.(type) {
+	case *Project:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Filter:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Sort:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Limit:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Distinct:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *DistinctOn:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *OrdinalityWrap:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *LockRows:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Aggregate:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *WindowAgg:
+		c := *x
+		c.Child = spliceBranchEmission(x.Child, built)
+		return &c
+	case *Gather:
+		// Descended, not copied: the substitution must reach the emission
+		// below the serial winner's gather while the gather itself is
+		// dropped — a partial subtree cannot carry one.
+		return spliceBranchEmission(x.Child, built)
+	case *GatherMerge:
+		return spliceBranchEmission(x.Child, built)
+	}
+	return built
 }
 
 func createSortPlan(p *Path) (Node, outputLayout) {
@@ -345,4 +575,49 @@ func createSortPlan(p *Path) (Node, outputLayout) {
 		keys[i] = SortKey{Expr: e, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
 	}
 	return &Sort{pos: child.Pos(), Child: child, Keys: keys}, childLayout
+}
+
+// createIncrementalSortPlan is the PathIncrementalSort arm (M0141-S7-exec-b):
+// `create_incrementalsort_plan` (createplan.c, over `make_incrementalsort`),
+// at goopg's fidelity. Structurally identical to createSortPlan — same
+// pathkey-to-SortKey translation, same coordinate remap through the child's
+// layout — plus the one field an Incremental Sort adds over a plain Sort:
+// `PresortedCount`, carried on the Path by `addIncrementalSortPaths`
+// (incrementalsortpaths.go) rather than re-derived here (see the Path
+// field's own doc comment, path.go, for why).
+func createIncrementalSortPlan(p *Path) (Node, outputLayout) {
+	if len(p.Children) != 1 {
+		panic(fmt.Sprintf("createPlan: PathIncrementalSort with %d children, want exactly 1", len(p.Children)))
+	}
+	if len(p.Pathkeys) == 0 {
+		panic("createPlan: PathIncrementalSort with no pathkeys; a sort that orders by nothing")
+	}
+	if p.PresortedCount <= 0 || p.PresortedCount >= len(p.Pathkeys) {
+		// IncrementalSort.PresortedCount's own contract (incrementalsort.go):
+		// 0 < PresortedCount < len(Keys). Outside that range the child is
+		// either not presorted at all (a plain Sort should have been chosen)
+		// or fully presorted (nothing to do) — either way a producer bug,
+		// not a case to silently coerce.
+		panic(fmt.Sprintf("createPlan: PathIncrementalSort with PresortedCount %d out of range for %d pathkeys", p.PresortedCount, len(p.Pathkeys)))
+	}
+	child, childLayout := createPlanNode(p.Children[0])
+	if child == nil {
+		panic("createPlan: PathIncrementalSort over a child path that built no node")
+	}
+	var index map[int]int
+	if childLayout != nil {
+		index = childLayout.bindingIndex()
+	}
+	keys := make([]SortKey, len(p.Pathkeys))
+	for i, pk := range p.Pathkeys {
+		if pk.Expr == nil {
+			panic(fmt.Sprintf("createPlan: PathIncrementalSort pathkey %d has no expression", i))
+		}
+		e := pk.Expr
+		if index != nil {
+			e = translateToLayout("sort key", e, childLayout, index)
+		}
+		keys[i] = SortKey{Expr: e, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
+	}
+	return &IncrementalSort{pos: child.Pos(), Child: child, Keys: keys, PresortedCount: p.PresortedCount}, childLayout
 }

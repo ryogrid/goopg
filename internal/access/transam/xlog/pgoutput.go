@@ -18,8 +18,10 @@
 //
 // `U` Update is deferred: v0's executor emits UPDATE as a paired
 // HeapDelete + HeapInsert and the reorder buffer doesn't yet
-// fold them. TRUNCATE / TYPE / MESSAGE / 2PC / streaming-mode
-// messages are out of scope for this milestone.
+// fold them. TRUNCATE / TYPE / 2PC / streaming-mode messages are
+// out of scope for this milestone. MESSAGE frame wire support is
+// available through Message; SQL-level logical-message WAL production
+// remains a separate continuation.
 
 package xlog
 
@@ -31,12 +33,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/utils/adt/array"
-	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/access/common/pglz"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // pgoutput message kinds. Mirror upstream's
@@ -50,6 +52,7 @@ const (
 	pgoDelete   = 'D'
 	pgoUpdate   = 'U'
 	pgoTruncate = 'T'
+	pgoMessage  = 'M'
 )
 
 // pgoutput TRUNCATE option-bit constants. Mirror upstream's
@@ -151,6 +154,30 @@ func (p *PgOutput) Commit(_ storage.TransactionID, commitLSN uint64) error {
 	buf = appendUint64(buf, commitLSN)
 	buf = appendUint64(buf, commitLSN) // end_lsn
 	buf = appendUint64(buf, pgoTimestamp(time.Now()))
+	_, err := p.w.Write(buf)
+	return err
+}
+
+// Message emits a protocol-v1 pgoutput MESSAGE frame. Logical messages carry
+// extension-defined bytes rather than a relation change, so they do not need a
+// catalog snapshot or relation descriptor. transactional controls bit zero of
+// the flags field; callers must preserve PostgreSQL's ordering rule by placing
+// transactional messages between their surrounding Begin and Commit frames.
+//
+// The shape mirrors logicalrep_write_message in PostgreSQL's proto.c:
+// 'M' | flags(1) | lsn(8) | prefix(NUL) | size(4) | payload.
+func (p *PgOutput) Message(transactional bool, lsn uint64, prefix string, payload []byte) error {
+	buf := make([]byte, 0, 14+len(prefix)+len(payload))
+	buf = append(buf, pgoMessage)
+	var flags byte
+	if transactional {
+		flags = 0x01 // MESSAGE_TRANSACTIONAL
+	}
+	buf = append(buf, flags)
+	buf = appendUint64(buf, lsn)
+	buf = appendCString(buf, prefix)
+	buf = appendUint32(buf, uint32(len(payload)))
+	buf = append(buf, payload...)
 	_, err := p.w.Write(buf)
 	return err
 }
@@ -571,12 +598,13 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uin
 	if err != nil {
 		return nil, 0, err
 	}
-	// A bpchar column's heap image is trimmed (executor's coerceTextLikeDatum),
-	// where upstream's is blank-padded to the declared width; a real PG
-	// publisher therefore emits all N characters in the change message and this
-	// one emitted only the significant ones. Same catalog.PadBpchar the DataRow
-	// and COPY renderers call, so the four boundaries cannot drift (Hard-won
-	// Rule #2). No-op for every other varlena type. M0119-0006 (57th slice).
+	// A real PG publisher emits all N characters of a bpchar in the change
+	// message. Since M0143-0007b goopg's own heap image is padded too, so this
+	// call is a no-op on newly written rows — but rows written BEFORE that
+	// change are trimmed on disk and still need the padding put back here, so
+	// the call stays. Same catalog.PadBpchar the DataRow and COPY renderers
+	// use, so the four boundaries cannot drift (Hard-won Rule #2). No-op for
+	// every other varlena type. M0119-0006 (57th slice).
 	return []byte(catalog.PadBpchar(t, string(payload))), n, nil
 }
 

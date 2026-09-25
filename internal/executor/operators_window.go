@@ -65,7 +65,13 @@ func (o *windowOp) Open(ctx *Context) error {
 		o.rows = append(o.rows, dup)
 	}
 
-	if len(o.plan.PartitionBy) > 0 || len(o.plan.OrderBy) > 0 {
+	// R6 (plan-parity-fix-take2): when the PLAN carries the Sort (PG's
+	// `create_one_window_path` shape), the input already arrives ordered by
+	// PARTITION BY ++ ORDER BY and sorting it again is pure duplicated work.
+	// Fail-closed on the zero value: a WindowAgg built without that Sort
+	// still sorts here, which is what keeps every pre-R6 construction and
+	// every hand-built node correct.
+	if !o.plan.Presorted && (len(o.plan.PartitionBy) > 0 || len(o.plan.OrderBy) > 0) {
 		// review/260831 EO2-2: the comparator used to call evalExpr twice per
 		// key per comparison, so a window over n rows evaluated the PARTITION
 		// BY / ORDER BY expressions O(n log n) times each instead of once per

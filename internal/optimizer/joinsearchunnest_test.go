@@ -87,9 +87,6 @@ func jsuCatalog(t *testing.T) catalog.Catalog {
 // jsuPlan plans one statement with `GOOPG_PGSHAPED_DP` forced on or off.
 func jsuPlan(t *testing.T, on bool) Node {
 	t.Helper()
-	saved := pgShapedDP
-	pgShapedDP = on
-	defer func() { pgShapedDP = saved }()
 
 	stmts, err := parser.Parse(jsuQ17SQL)
 	if err != nil {

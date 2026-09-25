@@ -62,10 +62,67 @@ type DDLUndoEntry struct {
 
 // DDLDropUndoEntry records a DROP TABLE performed inside an active savepoint
 // so that ROLLBACK TO SAVEPOINT can restore the catalog entries. M0097-0023.
+// Table is nil for an index-only entry (P0-E5/M0143-0008: ALTER TABLE DROP
+// CONSTRAINT on an index-backed PRIMARY KEY/UNIQUE/EXCLUDE constraint, which
+// removes the *catalog.Index from the name-keyed registries — the same
+// map-removal shape as DROP INDEX — without dropping the table itself).
 type DDLDropUndoEntry struct {
 	Table          *catalog.Table
 	Indexes        []*catalog.Index
 	SavepointDepth int // subxactStack depth at time of drop
+}
+
+// AlterIndexUndoEntry captures the pre-mutation field values of an existing
+// *catalog.Index mutated in place by ALTER TABLE ADD CONSTRAINT ...
+// {PRIMARY KEY|UNIQUE} USING INDEX (adoptExistingIndexAsConstraint), so
+// ROLLBACK can restore them (P0-E5/M0143-0008). Unlike DDLUndoEntry/
+// DDLDropUndoEntry, the Index object is never added to or removed from the
+// catalog's name-keyed maps here — only its fields (and, on a constraint
+// rename, its map key) change — so undo means writing the snapshotted
+// values back onto the SAME live pointer instead of re-registering a
+// different one.
+type AlterIndexUndoEntry struct {
+	Index             *catalog.Index
+	DBOid             uint32
+	OldName           string // idx.Name before this call (may equal the current name)
+	IsConstraint      bool
+	Primary           bool
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
+// NotNullUndoEntry captures one table's pre-mutation NOT NULL state — the
+// per-column flags and the NotNullConstraints list — before PRIMARY KEY
+// NOT-NULL synthesis (finishPrimaryKeyConstraint / cascadeNotNullToChildren)
+// mutates it in place, so ROLLBACK can restore it verbatim
+// (P0-E5/M0143-0008). One entry per table touched: the ALTER's own target,
+// or an inheritance/partition descendant reached by the cascade.
+type NotNullUndoEntry struct {
+	Table              *catalog.Table
+	ColNotNull         map[int]bool // column index -> value before the ALTER
+	NotNullConstraints []catalog.NamedNotNullConstraint
+}
+
+// DropConstraintUndoEntry captures one table's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint state — the CheckConstraints/NamedChecks/
+// ForeignKeys/NotNullConstraints slices and per-column NotNull flags —
+// wholesale, before `ALTER TABLE ... DROP CONSTRAINT` mutates any of them
+// in place (the CHECK, FOREIGN KEY, and NOT NULL branches of
+// execAlterTableDropConstraint), so ROLLBACK can restore the table's
+// constraint state verbatim (M0143-0008b). Unlike DDLDropUndoEntry (the
+// index-backed PK/UNIQUE/EXCLUDE forms P0-E5 already covered — pure
+// map-removal on the name-keyed index registries), these three forms
+// mutate fields/slices directly on a *catalog.Table pointer that stays live
+// and reachable throughout, so they need a wholesale snapshot-and-restore
+// instead — the DROP-direction sibling of NotNullUndoEntry/
+// snapshotNotNullState.
+type DropConstraintUndoEntry struct {
+	Table              *catalog.Table
+	CheckConstraints   []string
+	NamedChecks        []catalog.NamedCheckConstraint
+	ForeignKeys        []catalog.ForeignKey
+	NotNullConstraints []catalog.NamedNotNullConstraint
+	ColNotNull         map[int]bool
 }
 
 // PendingIndexDrop records a non-CONCURRENTLY DROP INDEX issued inside an
@@ -220,6 +277,9 @@ type BasicSession struct {
 	autocommitUndoScope bool                       // see NewAutocommitUndoSession / TracksDDLUndo (root-0024 residual, M0110-0001)
 	cmdCounter          CommandCounter             // per-transaction command counter (M0129-S8.3)
 	onCommitActions     []OnCommitAction           // ON COMMIT {DELETE ROWS|DROP} registrations (M0134-0072)
+	pendingAlterIndex   []AlterIndexUndoEntry      // ALTER TABLE ADD CONSTRAINT ... USING INDEX field mutations pending rollback (P0-E5/M0143-0008)
+	pendingNotNullAlter []NotNullUndoEntry         // PRIMARY KEY NOT-NULL synthesis pending rollback (P0-E5/M0143-0008)
+	pendingDropConstAlt []DropConstraintUndoEntry  // ALTER TABLE DROP CONSTRAINT (CHECK/FK/NOT NULL) field mutations pending rollback (M0143-0008b)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -789,6 +849,48 @@ func (s *BasicSession) RecordDDLCreate(e DDLUndoEntry) {
 func (s *BasicSession) TakePendingDDLCreates() []DDLUndoEntry {
 	p := append([]DDLUndoEntry(nil), s.pendingDDL...)
 	s.pendingDDL = nil
+	return p
+}
+
+// RecordAlterIndexUndo records one *catalog.Index field-mutation snapshot
+// for potential rollback (P0-E5/M0143-0008).
+func (s *BasicSession) RecordAlterIndexUndo(e AlterIndexUndoEntry) {
+	s.pendingAlterIndex = append(s.pendingAlterIndex, e)
+}
+
+// TakePendingAlterIndexUndos drains and returns the pending index-field undo
+// list (P0-E5/M0143-0008).
+func (s *BasicSession) TakePendingAlterIndexUndos() []AlterIndexUndoEntry {
+	p := append([]AlterIndexUndoEntry(nil), s.pendingAlterIndex...)
+	s.pendingAlterIndex = nil
+	return p
+}
+
+// RecordNotNullUndo records one table's pre-mutation NOT NULL snapshot for
+// potential rollback (P0-E5/M0143-0008).
+func (s *BasicSession) RecordNotNullUndo(e NotNullUndoEntry) {
+	s.pendingNotNullAlter = append(s.pendingNotNullAlter, e)
+}
+
+// TakePendingNotNullUndos drains and returns the pending NOT NULL undo list
+// (P0-E5/M0143-0008).
+func (s *BasicSession) TakePendingNotNullUndos() []NotNullUndoEntry {
+	p := append([]NotNullUndoEntry(nil), s.pendingNotNullAlter...)
+	s.pendingNotNullAlter = nil
+	return p
+}
+
+// RecordDropConstraintUndo records one table's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint snapshot for potential rollback (M0143-0008b).
+func (s *BasicSession) RecordDropConstraintUndo(e DropConstraintUndoEntry) {
+	s.pendingDropConstAlt = append(s.pendingDropConstAlt, e)
+}
+
+// TakePendingDropConstraintUndos drains and returns the pending DROP
+// CONSTRAINT undo list (M0143-0008b).
+func (s *BasicSession) TakePendingDropConstraintUndos() []DropConstraintUndoEntry {
+	p := append([]DropConstraintUndoEntry(nil), s.pendingDropConstAlt...)
+	s.pendingDropConstAlt = nil
 	return p
 }
 

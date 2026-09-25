@@ -1,0 +1,33 @@
+# M0145-0008 flip: TPC-H acceptance-arm wall times (serial, SF1, fresh capped server per run)
+# pre = tmp/m0145-0008a-arm.txt (legacy default, eb0e7d388 staged tree); flip = tmp/m0145-0008-flip-arm.txt
+label pre_s flip_s ratio
+Q1 5.75 5.28 0.92
+Q2 1.69 2.04 1.21
+Q3 3.84 3.93 1.02
+Q4 0.43 1.21 2.81
+Q5 0.95 0.76 0.80
+Q6 0.68 0.68 1.00
+Q7 1.38 1.15 0.83
+Q8 1.77 1.65 0.93
+Q9 3.33 3.40 1.02
+Q10 4.75 4.85 1.02
+Q11 0.16 0.17 1.06
+Q12 1.83 1.95 1.07
+Q13 4.51 4.49 1.00
+Q14 0.44 0.44 1.00
+Q15-CREATEVIEW 0.01 0.01 1.00
+Q15a-VIEWBODY 2.16 2.24 1.04
+Q15b-MAIN 12.06 12.31 1.02
+Q16 0.32 0.31 0.97
+Q17 0.42 0.43 1.02
+Q18 6.82 13.77 2.02
+Q19 1.69 1.69 1.00
+Q20 0.14 0.16 1.14
+Q21 2.80 2.15 0.77
+Q22 0.39 1.43 3.67
+TOTAL 58.32 66.50
+# isolated A/B, one binary, QUERIES=4,18,21,22,13: GOOPG_JOINTREE_PIPELINE=0 vs 1
+arm=0 Q4=1.67 Q18=12.31 Q21=2.83 Q22=0.48 Q13=4.46
+arm=1 Q4=1.89 Q18=20.19 Q21=2.15 Q22=1.52 Q13=4.51
+flip-without-estimator-fixes Q18=24.48 Q22=1.41
+flip-without-nullkey-guard Q18=23.14 Q22=1.42

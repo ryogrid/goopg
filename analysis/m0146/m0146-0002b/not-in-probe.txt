@@ -1,0 +1,41 @@
+# M0146-0002b NOT IN value probe, 2026-09-24
+# script: the SQL below; goopg = HEAD 9aa73d50c build on a throwaway cluster (:5533); PG 18.3 scratch (:5534)
+drop table if exists ni_o; drop table if exists ni_i; drop table if exists ni_e;
+create table ni_o (x int); create table ni_i (y int); create table ni_e (y int);
+insert into ni_o values (1),(2),(3),(null);
+insert into ni_i values (2),(null);
+select 'a', count(*) from ni_o where x not in (select y from ni_i);
+select 'b', count(*) from ni_o where x not in (select y from ni_i where y is not null);
+select 'c', count(*) from ni_o where x not in (select y from ni_e);
+select 'd', array_agg(x order by x) from ni_o where x not in (select y from ni_i where y is not null);
+select 'e', count(*) from ni_o where x not in (select y from ni_i where y > 100);
+select 'f', count(*) from ni_o o where o.x not in (select y from ni_i i where i.y is not null and i.y <> o.x);
+## goopg results
+a|0
+b|2
+c|4
+d|{1,3}
+e|4
+f|4
+## goopg plan (a)
+Aggregate
+  ->  Hash Anti Join
+        Hash Cond: (ni_o.x = ni_i.y)
+        ->  Seq Scan on ni_o
+        ->  Seq Scan on ni_i
+## pg results
+a|0
+b|2
+c|4
+d|{1,3}
+e|4
+f|4
+## pg plan (a)
+Aggregate
+  ->  Seq Scan on ni_o
+        Filter: (NOT (ANY (x = (hashed SubPlan 1).col1)))
+        SubPlan 1
+          ->  Seq Scan on ni_i
+## corpus census (anti joins in the slice-2 canonical captures)
+TPC-DS SF0.25: Q16 Q69 Q78 Q94 — all NOT EXISTS; no corpus query uses NOT IN
+TPC-H: Q16 (NOT IN), Q21 and Q22 (NOT EXISTS)

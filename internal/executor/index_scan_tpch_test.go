@@ -91,6 +91,7 @@ func newTpchTypeFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE part (p_partkey int, p_type varchar(25))"); err != nil {
 		t.Fatal(err)
@@ -113,7 +114,7 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT p_partkey FROM part WHERE p_type = 'PROMO BRUSHED STEEL'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	// Verify the planner chose IndexScan.
 	proj, ok := plan.(*optimizer.Project)
@@ -145,6 +146,7 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 func TestIndexScanCharEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE customer (c_custkey int, c_mktsegment char(10))"); err != nil {
 		t.Fatal(err)
@@ -166,7 +168,7 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT c_custkey FROM customer WHERE c_mktsegment = 'FURNITURE'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {
@@ -197,6 +199,7 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	if err := runDDL(t, ctx, "CREATE TABLE lineitem (l_linenumber int, l_shipdate timestamp)"); err != nil {
 		t.Fatal(err)
@@ -223,7 +226,7 @@ func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	}
 
 	sql := "SELECT l_linenumber FROM lineitem WHERE l_shipdate = timestamp '1995-09-15'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {

@@ -17,7 +17,7 @@ carries no LIMIT, so the NLI+Memoize shape that produces the aggregate
 over-estimates never arises.
 
 This tool closes all four gaps. It reads a real `EXPLAIN (ANALYZE)` capture
-over the TPC-DS SF0.5 corpus, so its truth is measured rather than estimated;
+over the TPC-DS fast-gate corpus, so its truth is measured rather than estimated;
 it scores base relations and joinrels alike; and its bar is PG-RELATIVE.
 
 WHY THE BAR MUST BE PG-RELATIVE, AND NOT ABSOLUTE. An absolute est-vs-actual
@@ -131,7 +131,7 @@ def strip_alias_suffix(rel):
     `<table>_2`. No TPC-DS table name ends in `_<digits>`, so stripping the
     suffix is unambiguous, and it is what lets a self-join's two instances key
     to the same relation on BOTH sides rather than matching nothing. Without
-    it 662 of 1131 nodes in the first SF0.5 capture had no PG counterpart and
+    it 662 of 1131 nodes in the first fast-gate capture had no PG counterpart and
     fell back to the absolute floor — which is the bar this tool exists to
     avoid using.
 
@@ -259,7 +259,7 @@ def measured_actual(n):
     with `(actual rows=0.00 loops=0)` even when the join above it emitted
     tens of thousands of rows — the side was drained by the build, not by the
     node's own executor loop, so no per-loop count was recorded. 220 of the
-    1131 nodes in the first SF0.5 capture were in this state, and scoring
+    1131 nodes in the first fast-gate capture were in this state, and scoring
     them treated a missing measurement as a measured zero: a base relation
     correctly estimated at 464,390 scored a q-error of 464,390 and headed the
     findings table. Treat it exactly like `never executed`.
@@ -267,6 +267,59 @@ def measured_actual(n):
     if n.arows is None or not n.loops:
         return None
     return n.arows
+
+
+def cte_scan_counts(roots):
+    """How many `CTE Scan on <label>` references this query's plan forest has,
+    per label — the goopg-side refcount for that CTE."""
+    counts = {}
+    for root in roots:
+        for n in walk(root):
+            if n.pseudo:
+                continue
+            m = CTE_SCAN.match(n.name)
+            if m:
+                label = strip_alias_suffix(m.group('rel'))
+                counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def single_ref_cte_labels(roots):
+    """CTE labels this query defines (a `CTE <label>` marker among `roots`)
+    that are scanned at most once elsewhere in the same plan forest.
+
+    PG 12+'s `inline_cte` (postgres/src/backend/optimizer/plan/subselect.c)
+    structurally removes a non-recursive, single-reference CTE's boundary
+    before join-order search runs, so PG's own capture never prints a `CTE`
+    marker for one and its body's relations carry no scope prefix. goopg's
+    `pushQualsThroughSingleRefCTEs` (internal/optimizer/cte_inline_pushdown.go)
+    only pushes predicates through the boundary without removing it, so
+    goopg's capture still prints the marker and `base_relation` scope-prefixes
+    the body's relation names (`ss.customer_address`) — a key that can never
+    textually match PG's un-prefixed one (`customer_address`) even when the
+    underlying node is identical (M0142-0016c). A CTE referenced MORE than
+    once (TPC-DS Q31's `ws3`, cited in cte_inline_pushdown.go's own doc
+    comment) is a real multi-use CTE that PG does not inline either, so it
+    must stay scoped — only the <=1 case is de-scoped here.
+    """
+    defined = {r.scope for r in roots if r.pseudo and r.name.startswith('CTE ')}
+    refs = cte_scan_counts(roots)
+    return {label for label in defined if refs.get(label, 0) <= 1}
+
+
+def descope(relset, single_ref):
+    """Strip a `<label>.` prefix from any relset member whose label is a
+    single-reference CTE (see `single_ref_cte_labels`), so a goopg node
+    strictly inside that CTE's body keys the same as PG's inlined
+    counterpart."""
+    out = set()
+    for r in relset:
+        label, dot, rest = r.partition('.')
+        if dot and label in single_ref:
+            out.add(rest)
+        else:
+            out.add(r)
+    return frozenset(out)
 
 
 def collect(roots, want_actual):
@@ -286,14 +339,19 @@ def collect(roots, want_actual):
     largest hid the matching 4 and reported PG-correct behaviour as a
     five-order defect. Q47/Q57/Q81/Q89 are exactly the cases the whole
     PG-relative design exists to pass.
+
+    Both sides' keys are additionally DE-SCOPED (see `descope`) for any
+    single-reference CTE, so a goopg-only `CTE <label>` marker (PG structurally
+    inlines these away) does not by itself block a match.
     """
     out = {}
+    single_ref = single_ref_cte_labels(roots)
     for root in roots:
         annotate_relsets(root)
         for n in walk(root):
             if n.pseudo or not n.relset:
                 continue
-            key = tuple(sorted(n.relset))
+            key = tuple(sorted(descope(n.relset, single_ref)))
             if not want_actual:
                 out.setdefault(key, []).append(n.erows)
                 continue

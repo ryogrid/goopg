@@ -1,0 +1,37 @@
+=== Q20
+Sort  (cost=16935.31..16935.38 rows=26 width=1074) (actual time=922.396..922.419 rows=101.00 loops=1)
+  Sort Key: supplier.s_name
+  Sort Method: quicksort  Memory: 14kB
+  ->  Hash Semi Join  (cost=1000.38..16934.44 rows=26 width=1074) (actual time=894.891..922.075 rows=101.00 loops=1)
+        Hash Cond: (supplier.s_suppkey = ps_suppkey)
+        Buckets: 1024  Batches: 1  Memory Usage: 232kB  Build Time: 894.047 ms
+        ->  Nested Loop  (cost=0.00..104.00 rows=400 width=1074) (actual time=0.398..28.289 rows=438.00 loops=1)
+              Filter: (nation.n_name = 'CANADA')
+              Rows Removed by Filter: 9562
+              ->  Seq Scan on supplier  (cost=0.00..100.00 rows=10000 width=584) (actual time=0.126..28.284 rows=10000.00 loops=1)
+              ->  Memoize  (cost=0.00..0.02 rows=1 width=490)
+                    Cache Key: supplier.s_nationkey
+                    Hits: 9975  Misses: 25  Evictions: 0  Overflows: 0
+                    ->  Index Scan using nation_pk on nation  (cost=0.00..0.01 rows=1 width=490)
+                          Index Cond: (n_nationkey = supplier.s_nationkey)
+        ->  Gather  (cost=1000.38..16823.45 rows=673 width=1092) (actual time=0.960..893.939 rows=2603.00 loops=1)
+              Workers Planned: 2
+              Rows Removed by Filter: 6185
+              Workers Launched: 2
+              ->  Nested Loop  (cost=0.38..14988.52 rows=3367 width=704)
+                    Worker 0:  actual time=0.295..686.345 rows=4352.00 loops=1
+                    Worker 1:  actual time=0.214..703.245 rows=4404.00 loops=1
+                    Worker 2:  actual time=0.319..893.927 rows=32.00 loops=1
+                    ->  Parallel Seq Scan on part  (cost=0.00..4850.67 rows=842 width=548)
+                          Filter: (p_name LIKE 'forest%')
+                          Worker 0:  actual time=0.063..686.321 rows=1088.00 loops=1
+                          Worker 1:  actual time=0.071..703.219 rows=1101.00 loops=1
+                          Worker 2:  actual time=0.088..893.490 rows=8.00 loops=1
+                    ->  Index Scan using partsupp_part_fkidx on partsupp  (cost=0.38..12.38 rows=4 width=544)
+                          Index Cond: (ps_partkey = p_partkey)
+                          Worker 0:  actual time=0.014..40.478 rows=4.00 loops=1088
+                          Worker 1:  actual time=0.022..38.882 rows=4.00 loops=1101
+                          Worker 2:  actual time=0.015..893.392 rows=4.00 loops=8
+Planning Time: 0.055 ms
+Execution Time: 922.452 ms
+

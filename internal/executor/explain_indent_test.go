@@ -50,6 +50,29 @@ func findIndentLine(t *testing.T, lines []string, sub string) string {
 // choice — the point under test is goopg's OWN indent arithmetic, which
 // the aggregates.out capture proves the raw-column deltas (0, 2, 8, 14, 20)
 // for.
+//
+// M0144-0011a (2026-09-20): the ORDER BY direction is now DESC. With an
+// ascending `ORDER BY 2` the outer Sort is no longer built at all — the
+// GroupAggregate's own emission order (its input Sort's `b` ASC, restricted
+// to distinct group values) satisfies the ORDER BY, so `create_ordered_paths`
+// takes the input path as-is exactly as PG does (`aggregateEmissionPathkeys`,
+// internal/optimizer/upperorderedinput.go). That is the redundant Sort the
+// slice removed, not a shape this fixture may keep asserting. `DESC` is a
+// genuine re-ordering the aggregate cannot deliver, so the 4-level shape the
+// indent arithmetic needs is restored WITHOUT re-introducing a redundant
+// node — and the root `Sort Key: b DESC` doubles as evidence that the new
+// arm carries direction rather than eliding any ORDER BY over a grouped
+// input.
+//
+// M0145-0008d (2026-09-24): `ORDER BY 2 DESC` stopped being a re-ordering.
+// The GROUP BY item b now copies ORDER BY's direction, as PG's
+// transformGroupClauseExpr does, so the aggregate's input is sorted b DESC
+// and the outer Sort is gone. PG goes further and reads the unique index
+// backward, with no Sort at all. The fixture now orders by the aggregate
+// (`ORDER BY 1`), a re-ordering no grouping order can deliver, which
+// restores the 4-level shape for the indent arithmetic. The upstream-exact
+// query (`GROUP BY` the primary key `ORDER BY 2`) crashes the planner
+// (M0145-0008h), so it cannot be the fixture yet.
 func deepSortFixture(t *testing.T) *Context {
 	t.Helper()
 	ctx, _, cleanup := newDDLFixture(t)
@@ -63,7 +86,7 @@ func deepSortFixture(t *testing.T) *Context {
 	return ctx
 }
 
-const deepSortSQL = "SELECT array_agg(a ORDER BY b), b FROM t WHERE b < 100 GROUP BY b ORDER BY 2"
+const deepSortSQL = "SELECT array_agg(a ORDER BY b), b FROM t WHERE b < 100 GROUP BY b ORDER BY 1"
 
 // TestExplainIndentDeepNesting pins the plain-EXPLAIN twin: raw "->  "
 // columns 0/2/8/14/20 and matching detail-line columns, verified against

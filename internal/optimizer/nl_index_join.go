@@ -148,7 +148,7 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 				jc.Predicate = andChainForNLI(crossEqs)
 				// A CROSS JOIN with an injected equi-conjunct is
 				// semantically an INNER join — flip the type so
-				// `tryBuildNLI` (which only accepts INNER/LEFT)
+				// `tryBuildNLI` (INNER/LEFT/SEMI/ANTI per :324)
 				// can fire.
 				if jc.Type == JoinTypeCross {
 					jc.Type = JoinTypeInner
@@ -323,6 +323,16 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// the hash / merge paths.
 	if j.Type != JoinTypeInner && j.Type != JoinTypeLeft &&
 		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		return nil, false
+	}
+	// R40/K69: an ANTI join produced by the LEFT->ANTI outer-join reduction
+	// is outside the population this file's SEMI/ANTI cost gate was
+	// calibrated on (see Join.FromOuterReduction for the measurements, both
+	// directions). Route it to the hash path, which is also the family PG
+	// picks for the shape (Merge/Hash Anti Join, never a nestloop). Existing
+	// unnest-sourced SEMI/ANTI joins are unmarked and reach the gate exactly
+	// as before, so no shipped decision moves.
+	if j.FromOuterReduction {
 		return nil, false
 	}
 	// S6 (D6.2): accept `Filter{SeqScan}` as the RIGHT inner side by
@@ -765,6 +775,21 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 
 	committed = true
+	// R48 Half 2 (plan-parity-fix-take2): lower inner-only semi/anti
+	// residuals onto the probe as IndexScan.Cond — PG's inner-`Filter:`
+	// placement (`distribute_restrictinfo_to_rels` MOVEs the qual, it
+	// does not copy it). Runs BEFORE indexOnlyNLIInner below so the IOS
+	// check sees Cond set and declines (it cannot carry a Cond); the
+	// reverse order would drop the qual silently. SEMI/ANTI only: LEFT
+	// keeps its residual unconditionally (a moved qual stops filtering
+	// null-extended rows), INNER is a later slice. For SEMI/ANTI
+	// pickInnerSide only admits j.Right as the inner, so the
+	// outer++inner frame the residual was rebound into is exactly the
+	// Left++Right frame — no frame hazard (that hazard exists only for
+	// INNER's swappable sides, gated out here).
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		residualPred = lowerSemiResidualToCond(residualPred, inner, len(outerNode.Output()))
+	}
 	// A SEMI or ANTI join never projects its inner — the joinedSchema branch
 	// above builds the OUTER's schema alone, "consumed only for matching, never
 	// projected". So when the residual reads no inner column either, the probe's
@@ -798,7 +823,44 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		Predicate: residualPred,
 		schema:    joinedSchema,
 	}
+	// M0145-0007 slice 2: this is the LEGACY route's only construction site.
+	noteNLIBuilt(nliRouteRewrite, nli.Type, nliProbeIndexName(nli.Inner))
 	return nli, true
+}
+
+// lowerSemiResidualToCond moves the inner-only conjuncts of a SEMI/ANTI
+// NLI residual onto the probe as IndexScan.Cond (leaf-local coords, via
+// cloneExprShiftIdx with the -outerWidth shift mirroring
+// planner.go:3281), returning the reduced residual (nil when nothing
+// remains). Conjuncts referencing the outer side, both sides, no column
+// at all, or out-of-scope refs (OuterColumnRef/subquery —
+// classifyConjunctSide's sideOutOfScope) stay on the join: fail closed.
+// A clone veto likewise keeps the conjunct. The whole move is declined
+// when inner already carries a Cond. The caller gates on SEMI/ANTI; LEFT
+// must never route here (null-extended-row semantics).
+func lowerSemiResidualToCond(residual Expr, inner *IndexScan, outerWidth int) Expr {
+	if residual == nil || inner == nil || inner.Cond != nil {
+		return residual
+	}
+	innerWidth := len(inner.Output())
+	var movers, keepers []Expr
+	for _, c := range splitAnd(residual) {
+		if classifyConjunctSide(c, outerWidth, outerWidth+innerWidth) != sideRight {
+			keepers = append(keepers, c)
+			continue
+		}
+		cl, ok := cloneExprShiftIdx(c, -outerWidth)
+		if !ok {
+			keepers = append(keepers, c)
+			continue
+		}
+		movers = append(movers, cl)
+	}
+	if len(movers) == 0 {
+		return residual
+	}
+	inner.Cond = combineAnd(movers)
+	return combineAnd(keepers)
 }
 
 // cloneExprShiftIdx deep-clones a conjunct hoisted out of a
@@ -1040,6 +1102,14 @@ func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, inn
 		if len(keys) == 0 {
 			// Leading column unbound: this index cannot start a scan for
 			// this parameterisation at all.
+			continue
+		}
+		// The columns after the bound prefix are unbound, and goopg stores
+		// no index entry whose key has a NULL column: a probe on the prefix
+		// would miss every inner row with a NULL there (`r.a = o.x` on
+		// (a, b) lost (10, NULL)). Only an index whose unbound key columns
+		// are all NOT NULL is complete for the probe.
+		if !indexUnboundKeysNotNull(tbl, idx, len(keys)) {
 			continue
 		}
 		// Prefer the probe that BINDS the most columns — more bound
@@ -1489,6 +1559,11 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 	if inner.LowOp == parser.OpGt || inner.HighOp == parser.OpLt {
 		return nil
 	}
+	// M0145-0029 slice 2b: IndexOnlyScan carries no RangePrefix; copying the
+	// bounds alone would re-aim them at the leading column (wrong rows).
+	if len(inner.RangePrefix) > 0 || len(inner.SAOPKeys) > 0 {
+		return nil
+	}
 	if residual != nil {
 		safe := true
 		walkColumnRefs(residual, func(i int) {
@@ -1533,4 +1608,18 @@ func indexOnlyNLIInner(inner *IndexScan, residual Expr, outerWidth int) *IndexOn
 		PrivilegeCheckRole:    inner.PrivilegeCheckRole,
 		PrivilegeCheckRoleSet: inner.PrivilegeCheckRoleSet,
 	}
+}
+
+// nliProbeIndexName names the index a rewrite-built NLI probes, for the
+// M0145-0007 census line. The probe is an `*IndexScan` in the ordinary case
+// and an `*IndexOnlyScan` when `indexOnlyNLIInner` promoted it; anything else
+// is reported as-is rather than guessed at.
+func nliProbeIndexName(inner Node) string {
+	switch x := inner.(type) {
+	case *IndexScan:
+		return x.Index.Name
+	case *IndexOnlyScan:
+		return x.Index.Name
+	}
+	return fmt.Sprintf("(%T)", inner)
 }

@@ -75,8 +75,22 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 //
 // Child convention: Children[0] is the probe (outer) side, Children[1] is the
 // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
-func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64) {
+func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
 	p, b := probe.CheapestTotal, build.CheapestTotal
+	// M0142-0008c-3c: `hash_inner_and_outer`'s own unique-ify substitution
+	// (joinpath.c:2301-2341) — JOIN_UNIQUE_OUTER replaces the probe with its
+	// unique-ified cheapest-total (one try, no cheap-startup variant, since
+	// goopg has no cheapest-startup-outer arm for hash to begin with);
+	// JOIN_UNIQUE_INNER replaces the build side the same way. `jt` has
+	// already been demoted to JoinInner by `addPathsToJoinrel` before this
+	// call (M0142-0008c-3a), exactly mirroring PG's own `jointype = JOIN_INNER`
+	// reassignment at the same two call sites.
+	switch uniq {
+	case uniqueSideOuter:
+		p = createUniquePath(probe, probe.CheapestTotal, sjinfo, cp)
+	case uniqueSideInner:
+		b = createUniquePath(build, build.CheapestTotal, sjinfo, cp)
+	}
 	if p == nil || b == nil {
 		return
 	}
@@ -91,6 +105,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		outputRows:      joinRel.Rows,
 		numHashClauses:  len(keys),
 		innerBucketSize: innerBucketSize,
+		final:           final,
+		outerWidth:      pathWidth(p),
+		innerWidth:      pathWidth(b),
 		// take2 P4-01: column counts come from the PATHS, falling back to the
 		// rels. The previous comment here read "Column counts come from the
 		// RELS, not the paths: a parameterised path returns fewer ROWS than
@@ -101,6 +118,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		outerCols: pathNCols(p), innerCols: pathNCols(b),
 		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
 	})
+	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
 	// `hashjointuples`, costsize.c:4432).
@@ -114,11 +132,15 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		// orthogonal: hash/merge/nestloop is the ALGORITHM, jointype is WHAT IS
 		// COMPUTED.
 		Jointype:      jt,
+		SJInfo:        sjinfo,
 		DisabledNodes: disabledNodesFor(!cp.enableHashJoin, p, b),
 		Rel:           joinRel,
 		Rows:          joinRel.Rows,
 		Cost:          cost,
 		Children:      []*Path{p, b},
+		// R53 slice 1: the partition, in Children order (probe, build).
+		OuterRelids:   probe.Relids,
+		InnerRelids:   build.Relids,
 		HashKeys:      keys,
 		Residual:      residual,
 		RequiredOuter: calcNonNestloopRequiredOuter(p, b),
@@ -139,8 +161,23 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
 // over-charges a rescan of a cheap inner, which biases against nested loops —
 // the safe direction.
-func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo) {
+//
+// M0142-0008c-3b: `uniq == uniqueSideInner` is PG's separate, narrower
+// `JOIN_UNIQUE_INNER` branch of `match_unsorted_outer` (joinpath.c, design
+// doc §19.2/§19.3) — it substitutes the inner's cheapest-total path with
+// `createUniquePath`'s result ONCE, before this function's own cost/build
+// logic runs, and never considers a parameterised (indexed) inner for this
+// case (PG's own `XXX` comment at `:1916` admits the omission is deliberate).
+// That asymmetry is why `addNLIPaths` does NOT also take a
+// `uniqueSideInner` arm: PG's `JOIN_UNIQUE_INNER` only ever calls
+// `try_nestloop_path` with the single substituted inner, this function's
+// domain. A nil substitution declines the whole path, matching
+// `create_unique_path`'s own "can't unique-ify, return NULL" contract.
+func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
+	if uniq == uniqueSideInner {
+		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
+	}
 	if o == nil || i == nil {
 		return
 	}
@@ -151,18 +188,30 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 	// take2 P2-06: goopg's nested loop always materialises its inner, so the
 	// rescan is a cache replay and the build is paid once.
 	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
-	cost := nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+	var cost Cost
+	if semi.apply {
+		// M0145-0008l: SEMI/ANTI stop at the first inner match
+		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
+		// is never "indexed", so an unmatched outer row scans it all.
+		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, len(quals))
+	} else {
+		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
+	}
 	cost.Total += matBuild
-	cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
 		Jointype:      jt, // C-03b; see addHashJoinPath.
+		SJInfo:        sjinfo,
 		DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, i),
 		Rel:           joinRel,
 		Rows:     joinRel.Rows,
 		Cost:     cost,
 		Children: []*Path{o, i},
-		Residual: quals,
+		// R53 slice 1: the partition, in Children order.
+		OuterRelids: outer.Relids,
+		InnerRelids: inner.Relids,
+		Residual:    quals,
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),
@@ -192,11 +241,13 @@ func generateHashJoinPaths(joinRel, outer, inner *RelOptInfo, cp costParams, jt 
 		}
 		return bucketFor(build.Relids)
 	}
-	// Orientation 1: build the inner side.
-	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner))
+	// Orientation 1: build the inner side. Test-only helper (no production
+	// caller — see doc comment): never a unique-ify candidate, so uniq/sjinfo
+	// are always the no-op values.
+	addHashJoinPath(joinRel, outer, inner, cp, jt, keys, residual, bucket(inner), hashJoinFinalCostInput{}, uniqueSideNone, nil)
 	// Orientation 2: build the outer side (swap the roles). The join output is
 	// the same; only which side is hashed differs.
-	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer))
+	addHashJoinPath(joinRel, inner, outer, cp, jt, keys, residual, bucket(outer), hashJoinFinalCostInput{}, uniqueSideNone, nil)
 }
 
 // The C1-era `generateNLIPath` used to live here. It was retired by

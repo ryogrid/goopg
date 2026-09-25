@@ -91,7 +91,14 @@ func VerifyBtreeUnique(src PageSource, indexName string, keyFmt nbtree.IndexForm
 		return nil, fmt.Errorf("amcheck: checkunique requires a heap visibility function")
 	}
 	if cmpKeys == nil {
-		cmpKeys = nbtree.CompareKeys
+		// Grouping equality, not ordering: two leaf entries carrying the same
+		// key at different heap rows are one group. Under the tuple format the
+		// heap TID lives inside the key bytes, so a bytewise (or full-`compare`)
+		// test never reports equality and the tier silently stops detecting
+		// duplicates; CompareKeyAttrs is the attrs-only comparator that answers
+		// the grouping question (byte-identical to CompareKeys under blob).
+		// M0119-0006bq.
+		cmpKeys = keyFmt.CompareKeyAttrs
 	}
 
 	metaPage, err := src(nbtree.MetaBlock)

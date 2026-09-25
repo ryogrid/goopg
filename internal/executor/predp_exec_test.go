@@ -1,9 +1,9 @@
 package executor
 
-// S5a (D3.1) end-to-end value check: with sublink pull-up running
-// BEFORE join-order search and bushy DP reordering the outer layout
-// beneath the pinned semi join, the query must still return the right
-// ROWS — the F8 hazard (stale pinned-join indices) is silent wrong
+// S5a (D3.1) end-to-end value check, kept on the jointree pipeline after the
+// S5a pre-DP route itself was deleted (M0145-0008): a correlated EXISTS over a
+// three-relation FROM the join search reorders must still return the right
+// ROWS — the F8 hazard (stale join indices after a reorder) is silent wrong
 // results, so a shape-level planner test alone is not enough.
 
 import (
@@ -11,13 +11,9 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestPreDPExistsValuesSurviveDPReorder(t *testing.T) {
-	optimizer.SetUnnestPreDPEnabled(true)
-	t.Cleanup(func() { optimizer.SetUnnestPreDPEnabled(true) })
-
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 	for _, stmt := range []string{
@@ -85,18 +81,4 @@ func TestPreDPExistsValuesSurviveDPReorder(t *testing.T) {
 		}
 	}
 
-	// Same query, legacy order: identical values.
-	optimizer.SetUnnestPreDPEnabled(false)
-	rows2, err := runQueryWithErr(ctx,
-		"SELECT b1_k FROM big1, big2, small3 "+
-			"WHERE b1_j = b2_j AND b2_j = s3_j "+
-			"AND EXISTS (SELECT 1 FROM inner_e WHERE e_k = big1.b1_k) "+
-			"ORDER BY b1_k")
-	optimizer.SetUnnestPreDPEnabled(true)
-	if err != nil {
-		t.Fatalf("legacy query: %v", err)
-	}
-	if len(rows2) != len(want) {
-		t.Fatalf("legacy path rows: got %d want %d", len(rows2), len(want))
-	}
 }

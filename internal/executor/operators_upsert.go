@@ -872,70 +872,77 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 			return false, err
 		}
 		slot.RLock()
-		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// The index entry references the update-chain ROOT — a committed
+		// HOT update leaves the root dead while the live tuple sits deeper
+		// in the chain, so the in-progress checks run per member in chain
+		// order (M0143-0010).
+		stop := false
+		eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, _ uint16) bool {
+			xmin := tuple.Header.Xmin
+			xmax := tuple.Header.Xmax
+			// Case 1: in-flight insert (xmin still active, not us). Use the live
+			// manager active-set (not the snapshot InProgress list) so we also
+			// catch XIDs that were materialised after this session's snapshot
+			// was taken (M0100-0002).
+			if xmin != storage.InvalidTransactionID && xmin != selfXID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
+				foundXID = xmin
+				case1 = true
+				stop = true
+				return false
+			}
+			// Case 2: visible-being-deleted. The tuple's xmin is already settled
+			// from this snapshot's view (committed or our own xact), and xmax is
+			// a non-lock-only in-flight non-self xact — i.e. someone is in the
+			// middle of deleting (or cross-partition-moving) what would otherwise
+			// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
+			// this xmax to determine whether the apparent conflict survives.
+			// For an updater-bearing multixact (IS_MULTI set, LOCK_ONLY clear)
+			// t_xmax is a MultiXactId — wait on its updater member, never on the
+			// raw MultiXactId.
+			if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+				effXmax := xmax
+				if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+					effXmax = multixactUpdaterXID(o.ctx.MultiXact, xmax)
+				}
+				xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
+				if effXmax != storage.InvalidTransactionID && effXmax != selfXID &&
+					xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(effXmax) {
+					foundXID = effXmax
+					case1 = false
+					stop = true
+					return false
+				}
+			}
+			// Case 3: lock-only xmax (SELECT FOR UPDATE/SHARE) from a live
+			// transaction. Upstream _bt_check_unique blocks via
+			// ConditionalLockTuple until the lock holder releases, then
+			// re-probes. The row is still live (xmin settled, xmax is only a
+			// lock stamp) — we must wait because the lock holder may
+			// subsequently UPDATE or DELETE the conflicting row before
+			// committing, changing the arbiter outcome. For a lock-only
+			// multixact t_xmax is a MultiXactId of lock holders — wait on one
+			// live holder (the re-probe loop drains the rest), never on the
+			// MultiXactId itself.
+			if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+				xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
+				if xminSettled && o.ctx.TxnMgr != nil {
+					waitXID := xmax
+					if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+						waitXID = multixactFirstActiveMember(o.ctx.MultiXact, o.ctx.TxnMgr, selfXID, xmax)
+					}
+					if waitXID != storage.InvalidTransactionID && o.ctx.TxnMgr.IsXIDActive(waitXID) {
+						foundXID = waitXID
+						case1 = false
+						stop = true
+						return false
+					}
+				}
+			}
+			return true // settled member — try the HOT successor
+		})
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
-		if err != nil {
-			return true, nil
-		}
-		xmin := tuple.Header.Xmin
-		xmax := tuple.Header.Xmax
-		// Case 1: in-flight insert (xmin still active, not us). Use the live
-		// manager active-set (not the snapshot InProgress list) so we also
-		// catch XIDs that were materialised after this session's snapshot
-		// was taken (M0100-0002).
-		if xmin != storage.InvalidTransactionID && xmin != selfXID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
-			foundXID = xmin
-			case1 = true
-			return false, nil
-		}
-		// Case 2: visible-being-deleted. The tuple's xmin is already settled
-		// from this snapshot's view (committed or our own xact), and xmax is
-		// a non-lock-only in-flight non-self xact — i.e. someone is in the
-		// middle of deleting (or cross-partition-moving) what would otherwise
-		// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
-		// this xmax to determine whether the apparent conflict survives.
-		// For an updater-bearing multixact (IS_MULTI set, LOCK_ONLY clear)
-		// t_xmax is a MultiXactId — wait on its updater member, never on the
-		// raw MultiXactId.
-		if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
-			effXmax := xmax
-			if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
-				effXmax = multixactUpdaterXID(o.ctx.MultiXact, xmax)
-			}
-			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
-			if effXmax != storage.InvalidTransactionID && effXmax != selfXID &&
-				xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(effXmax) {
-				foundXID = effXmax
-				case1 = false
-				return false, nil
-			}
-		}
-		// Case 3: lock-only xmax (SELECT FOR UPDATE/SHARE) from a live
-		// transaction. Upstream _bt_check_unique blocks via
-		// ConditionalLockTuple until the lock holder releases, then
-		// re-probes. The row is still live (xmin settled, xmax is only a
-		// lock stamp) — we must wait because the lock holder may
-		// subsequently UPDATE or DELETE the conflicting row before
-		// committing, changing the arbiter outcome. For a lock-only
-		// multixact t_xmax is a MultiXactId of lock holders — wait on one
-		// live holder (the re-probe loop drains the rest), never on the
-		// MultiXactId itself.
-		if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
-			xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
-			if xminSettled && o.ctx.TxnMgr != nil {
-				waitXID := xmax
-				if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
-					waitXID = multixactFirstActiveMember(o.ctx.MultiXact, o.ctx.TxnMgr, selfXID, xmax)
-				}
-				if waitXID != storage.InvalidTransactionID && o.ctx.TxnMgr.IsXIDActive(waitXID) {
-					foundXID = waitXID
-					case1 = false
-					return false, nil
-				}
-			}
-		}
-		return true, nil
+		return !stop, nil
 	})
 	return foundXID, case1, foundXID != 0
 }
@@ -1004,6 +1011,17 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 		if xid := o.ctx.Tx.XID; xid != storage.InvalidTransactionID {
 			globalSpecReg.RegisterSpec(xid, o.ctx.backendPID())
 		}
+	} else if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil &&
+		catalog.NullKeyedIndexEntries() && o.ctx.pgIndexKeyDesc(o.plan.OnConflict.ArbiterIndex) != nil {
+		// No Phase-B key: a NULL conflict-key column, which never conflicts,
+		// so there was nothing to probe. The row still gets its arbiter entry
+		// in a cluster with null_keyed_index_entries, as PG files every heap
+		// row in every index (the maintenance below skips the arbiter).
+		k, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, insertedParent, ptr, o.plan.Pos())
+		if err != nil {
+			return storage.ItemPointer{}, err
+		}
+		_ = o.maintainArbiter(k, ptr)
 	}
 	// Maintain all non-arbiter indexes. The arbiter was already handled above;
 	// skipping it here prevents double-insertion and expression re-evaluation.
@@ -1177,8 +1195,9 @@ func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
-// arbiter index. NULL keys (any conflict-key column is null) are skipped —
-// upstream's IS NULL doesn't participate in unique-constraint equality.
+// arbiter index. A nil key means no entry: a NULL conflict-key column in the
+// blob format or in a cluster without null_keyed_index_entries (with the
+// capability the entry key carries the NULLs and is filed).
 func (o *upsertOp) maintainArbiter(key []byte, ptr storage.ItemPointer) error {
 	if o.arbiterTree == nil {
 		return nil
@@ -1405,30 +1424,37 @@ func (o *upsertOp) probeSpeculativeConflict(rel storage.RelFileNode, cols []cata
 			return false, err
 		}
 		slot.RLock()
-		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// The index entry references the update-chain ROOT — a committed
+		// HOT update leaves the live version deeper in the chain, so the
+		// self/liveness checks run per member (M0143-0010).
+		stop := false
+		var memberErr error
+		eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, mslot uint16) bool {
+			// Skip our own speculatively-inserted row.
+			if selfXID != storage.InvalidTransactionID && tuple.Header.Xmin == selfXID {
+				return true
+			}
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+				return true // dead member — try the HOT successor
+			}
+			row, derr := DecodeHeapTupleRow(cols, tuple, nil)
+			if derr != nil {
+				memberErr = derr
+				stop = true
+				return false
+			}
+			foundPtr = storage.ItemPointer{Block: ptr.Block, Offset: mslot}
+			foundRow = row
+			found = true
+			stop = true
+			return false
+		})
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
-		if err != nil {
-			if errors.Is(err, storage.ErrUnsupportedItem) {
-				return true, nil
-			}
-			return false, err
+		if memberErr != nil {
+			return false, memberErr
 		}
-		// Skip our own speculatively-inserted row.
-		if selfXID != storage.InvalidTransactionID && tuple.Header.Xmin == selfXID {
-			return true, nil
-		}
-		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-			return true, nil
-		}
-		row, err := DecodeHeapTupleRow(cols, tuple, nil)
-		if err != nil {
-			return false, err
-		}
-		foundPtr = ptr
-		foundRow = row
-		found = true
-		return false, nil
+		return !stop, nil
 	})
 	if scanErr != nil {
 		return storage.ItemPointer{}, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: scanErr.Error()}

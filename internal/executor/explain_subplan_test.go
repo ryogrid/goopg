@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // Stage S0-1 (design bundle correlated-subquery-planning, ch.06 §6):
@@ -260,18 +261,29 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
 	}
 
-	// A non-correlated NOT IN unnests to a null-aware anti join, and
-	// the null-aware flag is surfaced so plan diffs can tell the two
-	// anti joins apart.
+	// NOT EXISTS pulls up to an anti join (PG's pull_up_sublinks converts
+	// EXISTS under a NOT); the label must name it.
 	anti, _ := joinedPlan(t, ctx,
-		"EXPLAIN SELECT * FROM t1 WHERE t1.a NOT IN (SELECT t2.a FROM t2)")
+		"EXPLAIN SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)")
 	if strings.Contains(anti, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", anti)
 	}
 	if !strings.Contains(anti, "Anti Join") {
-		t.Errorf("non-correlated NOT IN did not produce an Anti Join label:\n%s", anti)
+		t.Errorf("NOT EXISTS did not produce an Anti Join label:\n%s", anti)
 	}
 	assertNoOpaqueExpr(t, anti)
+
+	// M0146-0002c: NOT IN is `<> ALL`, which PG never pulls up — it stays a
+	// SubPlan filter (`NOT (ANY (a = (hashed SubPlan 1).col1))`), not a join.
+	notIn, _ := joinedPlan(t, ctx,
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a NOT IN (SELECT t2.a FROM t2)")
+	if strings.Contains(notIn, "Anti Join") {
+		t.Errorf("non-correlated NOT IN produced an Anti Join; PG keeps a SubPlan:\n%s", notIn)
+	}
+	if !strings.Contains(notIn, "SubPlan") {
+		t.Errorf("non-correlated NOT IN did not render as a SubPlan:\n%s", notIn)
+	}
+	assertNoOpaqueExpr(t, notIn)
 }
 
 // TestJoinTypeNameSemiAnti pins the label strings directly, so the
@@ -299,6 +311,91 @@ func TestJoinLabelPinsPGLabels(t *testing.T) {
 		if got := joinLabel(c.algo, c.typ); got != c.want {
 			t.Errorf("joinLabel(%q, %v) = %q, want %q", c.algo, c.typ, got, c.want)
 		}
+	}
+}
+
+// TestExplainAnalyzeSubPlanScopeObservation is the test-first probe
+// M-NIGHTLY-instrumentscope-race-fix prescribes for its open question:
+// does a SubPlan/EXISTS tree lazily built mid-Next() during a serial
+// (no Gather) EXPLAIN ANALYZE inherit the ambient instrumentation scope
+// and get instrumented? `withInstrumentation` sets the scope for the
+// duration of the top-level build ONLY — the inner plan's Open/Next run
+// after it returns — and acquireSubPlanOp (subplan.go) calls `Build`
+// (scope nil) from expression evaluators
+// (existsImpl/subqueryImpl/collectInValues) at row-evaluation time, so
+// the expectation is that SubPlan children are NOT instrumented today.
+// This test observes the real rendered output and pins it.
+//
+// Observed (2026-09-19): the SubPlan subtree executes (the header
+// renders `calls=N` from ctx.SubPlanStats, a separate channel from
+// nodeStatsTable instrumentation) yet its inner nodes carry NO
+// `(actual ...)` bracket — SubPlan children are never instrumented
+// today. Upstream PG's instrument.c does instrument them (its EXPLAIN
+// ANALYZE renders `(actual time=... rows=... loops=N)` on the subtree),
+// so this is both the answer to the task's open question — forcing nil
+// scope at acquireSubPlanOp's Build sites is a bug-for-bug-compatible
+// simplification — and a recorded PG-fidelity gap in its own right.
+func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
+	pinCorrelatedSubPlanPath(t)
+	ctx, cleanup := explainSubPlanFixture(t)
+	defer cleanup()
+
+	// Populate both tables so the correlated EXISTS actually evaluates
+	// (an empty outer would leave the SubPlan unexecuted and the
+	// observation ambiguous between "never ran" and "never instrumented").
+	for _, tc := range []struct {
+		name string
+		vals []int64
+	}{
+		{"t1", []int64{1, 2, 3}},
+		{"t2", []int64{2, 4, 6}},
+	} {
+		tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: tc.name})
+		rel := ctx.Catalog.RelFileNode(tbl)
+		for _, n := range tc.vals {
+			row := Row{{Kind: KindInt, Int: n}, {Kind: KindInt, Int: n * 10}}
+			if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
+				t.Fatalf("insert %s: %v", tc.name, err)
+			}
+		}
+	}
+
+	plan, lines := joinedPlan(t, ctx,
+		"EXPLAIN ANALYZE SELECT * FROM t1 WHERE t1.a = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)")
+	t.Logf("EXPLAIN ANALYZE output:\n%s", plan)
+
+	// Locate the "SubPlan 1 (...)" header — the header line carries the
+	// per-call counters — then require: (a) calls>=1 so the subtree truly
+	// executed, and (b) every subtree line below it is estimate-only, i.e.
+	// carries a `(cost=...)` but no `(actual ...)` bracket.
+	var headerIdx = -1
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "SubPlan 1") {
+			headerIdx = i
+		}
+	}
+	if headerIdx < 0 {
+		t.Fatalf("no `SubPlan 1` subtree header in ANALYZE output:\n%s", plan)
+	}
+	header := strings.TrimSpace(lines[headerIdx])
+	if !strings.Contains(header, "calls=") {
+		t.Fatalf("SubPlan header missing per-call counters (ctx.SubPlanStats): %q\n%s", header, plan)
+	}
+	if strings.Contains(header, "calls=0") {
+		t.Fatalf("SubPlan never executed — observation is vacuous:\n%s", plan)
+	}
+	var sawSubtree bool
+	for _, l := range lines[headerIdx+1:] {
+		if !strings.Contains(l, "->") {
+			break
+		}
+		sawSubtree = true
+		if strings.Contains(l, "(actual") {
+			t.Errorf("SubPlan child unexpectedly instrumented (a non-nil scope leaked into its lazy build?):\n%s", plan)
+		}
+	}
+	if !sawSubtree {
+		t.Fatalf("`SubPlan 1` header has no plan tree under it:\n%s", plan)
 	}
 }
 

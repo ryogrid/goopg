@@ -497,6 +497,24 @@ func (it *OpIterator) Schema() optimizer.Schema {
 }
 
 // RowsAffected implements RowCounter for DML operators.
+// DDLProcessed forwards the root DDL operator's DDLProcessedReporter through
+// the slab/tree wrapper (the postmaster's simple- and extended-query paths hold
+// an *OpIterator, never the bare ddlOp) — the sibling of RowsAffected's
+// OpAdapter arm.
+func (it *OpIterator) DDLProcessed() (int64, bool) {
+	if it.tree == nil {
+		return 0, false
+	}
+	n := &it.tree.ops[it.rootIdx]
+	if n.Kind != OpAdapter {
+		return 0, false
+	}
+	if r, ok := n.state.(*opAdapterState).op.(DDLProcessedReporter); ok {
+		return r.DDLProcessed()
+	}
+	return 0, false
+}
+
 func (it *OpIterator) RowsAffected() int64 {
 	if it.tree == nil {
 		return 0

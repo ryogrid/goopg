@@ -36,6 +36,15 @@ func upperOrderedInput(rows float64) *pricedNode {
 	return n
 }
 
+// searchedPricedNode is pricedNode plus the searchedTree tag, standing in for
+// a search root (`*SeqScan`/`*Join`/... in production) without dragging in
+// catalog.Table — M0141-S2b-2a's plumbing test needs `searchedRelOf` to
+// resolve on the input Node the way it does for a real searched subtree.
+type searchedPricedNode struct {
+	pricedNode
+	searchedTree
+}
+
 func upperOrderedKeys() []SortKey {
 	return []SortKey{
 		{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}, Desc: true},
@@ -52,7 +61,7 @@ func TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice(t *testing.T) 
 	keys := upperOrderedKeys()
 	u := newUpperRels()
 
-	got := createOrderedPaths(u, in, keys, 77, cp, 0, -1)
+	got := createOrderedPaths(u, in, keys, 77, cp, 0, -1, nil)
 
 	srt, ok := got.(*Sort)
 	if !ok {
@@ -117,7 +126,7 @@ func TestCreateOrderedPathsChargesTheSpillOfALargeSort(t *testing.T) {
 	rows := sortRowsFillingBudget(cp.workMem, probe.NCols, 3.0)
 	in := upperOrderedInput(rows)
 
-	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort)
+	srt := createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort)
 	pc, _ := srt.PlanCostInfo()
 
 	unsized := costSortRun(cp, rows, 0, 0, -1)
@@ -128,6 +137,111 @@ func TestCreateOrderedPathsChargesTheSpillOfALargeSort(t *testing.T) {
 	legacy := DeriveLegacyDisplayCost(srt, int64(rows))
 	if !(pc.StartupCost > legacy.StartupCost) {
 		t.Fatalf("cost_sort price %v is not above the legacy display price %v — the negative result DESIGN §5.7 names", pc.StartupCost, legacy.StartupCost)
+	}
+}
+
+// TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel is M0141-S2b-2a's
+// gate: `searchedRelOf(input)`'s Pathlist becomes reachable off the ORDERED
+// rel (`RelOptInfo.SearchCandidates`) once `input` is a searched-tree root —
+// and, per S2b-2's own scoping recon (design doc
+// m0141-s2b-scoping-decomposition.md §"S2b-2 result"), reaching it changes
+// NOTHING about the elected plan yet: `addOrderedPaths` still offers only the
+// one seed, so `ordered.Pathlist` stays exactly what a non-searched input
+// produces (TestCreateOrderedPathsEmitsTheRewritesSortWithCostSortsPrice).
+func TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+	u := newUpperRels()
+
+	searchRel := &RelOptInfo{}
+	cand1 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 10}}
+	cand2 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 20}}
+	searchRel.Pathlist = []*Path{cand1, cand2}
+
+	in := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	in.markFromJoinSearch()
+	in.setSearchRel(searchRel)
+
+	got := createOrderedPaths(u, in, keys, 0, cp, 0, -1, nil)
+	if _, ok := got.(*Sort); !ok {
+		t.Fatalf("got %T, want *Sort (the searched tag alone, with no searchPathkeys claimed, must still stack the Sort)", got)
+	}
+
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(ordered.SearchCandidates) != 2 || ordered.SearchCandidates[0] != cand1 || ordered.SearchCandidates[1] != cand2 {
+		t.Fatalf("ordered.SearchCandidates = %v, want the search rel's own 2-entry Pathlist by identity", ordered.SearchCandidates)
+	}
+	// Plumbing only: the tournament still offers exactly the one seed.
+	if len(ordered.Pathlist) != 1 {
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 — SearchCandidates must not be offered to the tournament yet", len(ordered.Pathlist))
+	}
+}
+
+// TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput pins the
+// negative case: a plain Node with no searched-tree tag leaves the new field
+// at its zero value, exactly like today (no field, no behavior).
+func TestCreateOrderedPathsLeavesSearchCandidatesNilForANonSearchedInput(t *testing.T) {
+	u := newUpperRels()
+	createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, defaultCostParams(), 0, -1, nil)
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if ordered.SearchCandidates != nil {
+		t.Fatalf("ordered.SearchCandidates = %v, want nil for a non-searched input", ordered.SearchCandidates)
+	}
+	if ordered.SearchCandidateKeys != nil {
+		t.Fatalf("ordered.SearchCandidateKeys = %v, want nil for a non-searched input", ordered.SearchCandidateKeys)
+	}
+}
+
+// TestCreateOrderedPathsValidatesSearchCandidatePathkeys is M0141-S2b-2b's
+// gate: every OTHER candidate in the search rel's Pathlist gets its own
+// Pathkeys re-earned against the ORDERED rel's published schema
+// (`ordered.SearchCandidateKeys`), the same truncation rule
+// `stampSearchPathkeys` already applies to the single winning path —
+// generalized to every candidate, parallel-indexed to SearchCandidates. Still
+// plumbing only: `ordered.Pathlist` stays at exactly 1 (the seed), same as
+// S2b-2a's own gate.
+func TestCreateOrderedPathsValidatesSearchCandidatePathkeys(t *testing.T) {
+	cp := defaultCostParams()
+	keys := upperOrderedKeys()
+	u := newUpperRels()
+
+	// cand1's one key ("k") fully validates against the input's schema.
+	kKey := PathKey{Expr: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}, SortAsc: true}
+	// cand2's first key ("v") validates; its second key addresses a column
+	// index the schema doesn't have, so validation truncates after the
+	// first — a shorter, not a wrong, ordering claim (file header rule 1).
+	vKey := PathKey{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}}
+	badKey := PathKey{Expr: &ColumnRef{Index: 99, Name: "bogus", Type: catalog.Type{Name: "int4"}}}
+	// cand3 carries no ordering claim at all.
+
+	searchRel := &RelOptInfo{}
+	cand1 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 10}, Pathkeys: []PathKey{kKey}}
+	cand2 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 20}, Pathkeys: []PathKey{vKey, badKey}}
+	cand3 := &Path{Kind: PathAgg, Rows: 5, Cost: Cost{Total: 30}}
+	searchRel.Pathlist = []*Path{cand1, cand2, cand3}
+
+	in := &searchedPricedNode{pricedNode: *upperOrderedInput(1000)}
+	in.markFromJoinSearch()
+	in.setSearchRel(searchRel)
+
+	createOrderedPaths(u, in, keys, 0, cp, 0, -1, nil)
+
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(ordered.SearchCandidateKeys) != 3 {
+		t.Fatalf("ordered.SearchCandidateKeys = %d entries, want 3 (parallel-indexed to SearchCandidates)", len(ordered.SearchCandidateKeys))
+	}
+	if len(ordered.SearchCandidateKeys[0]) != 1 || !pathKeyEqual(ordered.SearchCandidateKeys[0][0], kKey) {
+		t.Fatalf("cand1's validated keys = %v, want [%v] (fully validates)", ordered.SearchCandidateKeys[0], kKey)
+	}
+	if len(ordered.SearchCandidateKeys[1]) != 1 || !pathKeyEqual(ordered.SearchCandidateKeys[1][0], vKey) {
+		t.Fatalf("cand2's validated keys = %v, want [%v] (truncated after the bad second key)", ordered.SearchCandidateKeys[1], vKey)
+	}
+	if ordered.SearchCandidateKeys[2] != nil {
+		t.Fatalf("cand3's validated keys = %v, want nil (no Pathkeys claimed)", ordered.SearchCandidateKeys[2])
+	}
+	// Plumbing only: the tournament still offers exactly the one seed.
+	if len(ordered.Pathlist) != 1 {
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 — SearchCandidateKeys must not be offered to the tournament yet", len(ordered.Pathlist))
 	}
 }
 
@@ -145,6 +259,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	lines := captureTrace(t, func() {
 		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp, -1)
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedSortProducer+" relids=- ") || !strings.Contains(lines[0], "verdict=accepted") {
 		t.Fatalf("unordered input: trace = %q, want one accepted %s line at relids=-", lines, upperOrderedSortProducer)
 	}
@@ -159,6 +274,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	lines = captureTrace(t, func() {
 		addOrderedPaths(ordered, seed, keys, cp, -1)
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedInputProducer+" relids=- ") {
 		t.Fatalf("ordered input: trace = %q, want one %s line", lines, upperOrderedInputProducer)
 	}
@@ -175,13 +291,30 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 	cp.enableSort = false
 	u := newUpperRels()
 	lines := captureTrace(t, func() {
-		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
+		if _, ok := createOrderedPaths(u, upperOrderedInput(10), upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort); !ok {
 			t.Errorf("enable_sort=off must still emit the Sort")
 		}
 	})
+	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "disabled=1 ") {
 		t.Fatalf("trace = %q, want the sort path offered with disabled=1", lines)
 	}
+}
+
+// dppathLines keeps only tracePath's own record kind ("DPPATH path "/"DPPATH
+// partial ", formatPathLine's `list` field) — NOT the M0141-S7-cd-q64
+// diagnostic records `traceOrderedCandidatePopulation`/
+// `traceIncrementalSortCandidate` also emit under the DPPATH tag
+// (pathtrace.go's "candidates"/"candidate" record kinds), which every
+// existing caller of this helper predates and does not expect to see.
+func dppathLines(lines []string) []string {
+	out := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "DPPATH path ") || strings.HasPrefix(line, "DPPATH partial ") {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // TestCreateOrderedPathsNeverDropsTheSort: no keys hands the input back; no
@@ -190,10 +323,10 @@ func TestCreateOrderedPathsHonoursEnableSortAsAPreference(t *testing.T) {
 func TestCreateOrderedPathsNeverDropsTheSort(t *testing.T) {
 	cp := defaultCostParams()
 	in := upperOrderedInput(10)
-	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0, -1); got != Node(in) {
+	if got := createOrderedPaths(newUpperRels(), in, nil, 0, cp, 0, -1, nil); got != Node(in) {
 		t.Fatalf("no keys: got %T, want the input back", got)
 	}
-	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0, -1).(*Sort); !ok {
+	if _, ok := createOrderedPaths(nil, in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort); !ok {
 		t.Fatalf("no registry: the Sort was dropped")
 	}
 }
@@ -211,7 +344,7 @@ func TestC10cPreservedSideQualMovesThroughOrderedSortArm(t *testing.T) {
 	resid := &Filter{Child: j, Predicate: srcGt(0, "id", 1, 7)}
 	keys := []SortKey{{Expr: &ColumnRef{Index: 1, Name: "name", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1}}}
 
-	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0, -1).(*Sort)
+	srt, ok := createOrderedPaths(newUpperRels(), resid, keys, 0, defaultCostParams(), 0, -1, nil).(*Sort)
 	if !ok {
 		t.Fatalf("the ORDERED rel did not emit a *Sort")
 	}
@@ -264,12 +397,12 @@ func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
 	cp := defaultCostParams()
 	keys := upperOrderedKeys()
 
-	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1).(*Sort)
+	sorted, ok := createOrderedPaths(newUpperRels(), upperOrderedInput(10), keys, 0, cp, 0, -1, nil).(*Sort)
 	if !ok {
 		t.Fatal("the first call must emit a Sort (it is the unordered arm)")
 	}
 	// `sorted` delivers `keys` by construction. Hand it back as the CHILD.
-	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1)
+	again := createOrderedPaths(newUpperRels(), sorted, keys, 0, cp, 0, -1, nil)
 	if _, isSort := again.(*Sort); isSort && again != Node(sorted) {
 		t.Fatal("a second Sort was stacked over a child that already delivers the keys: " +
 			"the seam stopped carrying Pathkeys (upperorderedinput.go inputNodePathkeys)")
@@ -284,5 +417,453 @@ func TestCreateOrderedPathsInputArmIsReachableFromANode(t *testing.T) {
 	sizeUpperRelFromNode(rel, sorted)
 	if seed := newPrebuiltPath(rel, sorted); len(seed.Pathkeys) != 0 {
 		t.Fatalf("newPrebuiltPath must stay ordering-free, got %d pathkeys", len(seed.Pathkeys))
+	}
+}
+
+// TestOrderedDropsHashedSortForPresortedGrouping is the R47 (K101)
+// slice-2 TDD gate: with output-coordinate pathkeys on the sorted
+// candidate (the translation slice 2 provides), the ordered rel
+// must drop hashed+Sort via the existing startup+fuzz dominance —
+// no-sort offered, hashed dominated, sorted elected. Costs mirror
+// live PG Q4 (totals within fuzz, startup outside it).
+// Companion: TestOrderedStacksSortWithoutTranslatedPathkeys pins
+// today's impotence (input-coordinate keys never match), which is
+// what the translation fixes.
+func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
+	cp := defaultCostParams()
+	// Output-coordinate order key (shared object → pathKeyEqual TRUE).
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderKeys := []PathKey{{Expr: orderCol, SortAsc: true}}
+	u := newUpperRels()
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	ordered.NCols = 2
+	ordered.AvgVarBytes = 8
+	// Sorted grouping candidate, translated (output-coord) pathkeys.
+	sortedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 69094, Total: 70122}, Rows: 5,
+		Pathkeys: []PathKey{{Expr: orderCol, SortAsc: true}},
+		Rel: ordered, ParallelSafe: true,
+	}
+	// Hashed grouping candidate, unordered.
+	hashedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
+		Rel: ordered, ParallelSafe: true,
+	}
+	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	setCheapest(ordered)
+	best := getCheapestFractionalPath(ordered, 0)
+	if best == nil {
+		t.Fatal("ordered rel has no cheapest path")
+	}
+	if best.Kind == PathSort {
+		t.Fatalf("hashed+Sort won (cost=%.2f); want the no-sort sorted path — startup dominance did not drop it", best.Cost.Total)
+	}
+}
+
+func TestOrderedStacksSortWithoutTranslatedPathkeys(t *testing.T) {
+	cp := defaultCostParams()
+	// Input-coordinate group key: same column, different object and
+	// index → pathKeyEqual FALSE (positional identity, exprwalk.go).
+	// This is today's state: no-sort can never fire across the
+	// grouping boundary, so hashed+Sort wins and the test documents it.
+	groupCol := &ColumnRef{Index: 3, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	orderKeys := []PathKey{{Expr: orderCol, SortAsc: true}}
+	u := newUpperRels()
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	ordered.NCols = 2
+	ordered.AvgVarBytes = 8
+	sortedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 69094, Total: 70122}, Rows: 5,
+		Pathkeys: []PathKey{{Expr: groupCol, SortAsc: true}},
+		Rel: ordered, ParallelSafe: true,
+	}
+	hashedAgg := &Path{
+		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
+		Rel: ordered, ParallelSafe: true,
+	}
+	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	setCheapest(ordered)
+	best := getCheapestFractionalPath(ordered, 0)
+	if best == nil {
+		t.Fatal("ordered rel has no cheapest path")
+	}
+	if best.Kind != PathSort {
+		t.Fatalf("untranslated pathkeys unexpectedly elected no-sort (kind=%d); want hashed+Sort documenting today's gap", best.Kind)
+	}
+}
+
+// R47 slice 2 (K101) — grouping-emission translation pins. The two slice-1
+// tests above encode the gap (input-coordinate pathkeys never satisfy the
+// ORDERED check); these pin the helper that closes it for the group-keys
+// Sort variant, and every shape that must still decline. Fixtures are
+// Q4-shaped: one bpchar group column at input Index 3, aggregate output
+// [o_orderpriority | count], ORDER BY the output column.
+
+func r47slice2GroupFixture() (aggNode *Aggregate, groupCol *ColumnRef, outSchema Schema) {
+	groupCol = &ColumnRef{Index: 3, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	outSchema = Schema{
+		{Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "count", Type: catalog.Type{Name: "int8"}},
+	}
+	child := &pricedNode{sch: Schema{
+		{Name: "c0", Type: catalog.Type{Name: "int4"}},
+		{Name: "c1", Type: catalog.Type{Name: "int4"}},
+		{Name: "c2", Type: catalog.Type{Name: "int4"}},
+		{Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}},
+	}}
+	child.setPlanCost(PlanCost{StartupCost: 100, TotalCost: 68909, PlanRows: 57066, PlanWidth: 448})
+	aggNode = &Aggregate{Child: child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	return aggNode, groupCol, outSchema
+}
+
+func r47slice2SortedCand(spec *Aggregate, childKeys []PathKey, cost Cost) *Path {
+	// Hand-built seed: `newPrebuiltPath` dereferences the rel for Rows,
+	// and these fixtures run rel-free (the loop tests below file theirs
+	// on a real rel). `node` is set so the elect test's build has a
+	// wrapped node to return identically.
+	seed := &Path{Kind: PathPrebuilt, Rows: 57066, node: spec.Child}
+	return &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: cost,
+		// Production files the candidate with the sort input's
+		// (input-coordinate) pathkeys (`Pathkeys:
+		// sortedInput.Pathkeys`, groupingpaths.go) — load-bearing:
+		// without them the candidate looks unordered and hashed
+		// dominates it at the grouping rel.
+		Pathkeys: childKeys,
+		Children: []*Path{{Kind: PathSort, Pathkeys: childKeys, Rows: 57066, Children: []*Path{seed}}}}
+}
+
+// TestGroupingEmissionTranslatesGroupKeysSort: the group-keys Sort variant
+// translates to output-coordinate pathkeys that satisfy the ORDER BY check —
+// the hand-built input-coordinate key of
+// TestOrderedStacksSortWithoutTranslatedPathkeys becomes the passing shape of
+// TestOrderedDropsHashedSortForPresortedGrouping.
+func TestGroupingEmissionTranslatesGroupKeysSort(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec, []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("translated %d pathkeys, want 1", len(got))
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	if !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+		t.Fatalf("translated key %+v does not equal the ORDER BY key", got[0])
+	}
+	if !pathkeysContainedIn(got, []PathKey{{Expr: orderCol, SortAsc: true}}) {
+		t.Fatal("translated emission order does not satisfy the ORDER BY requirement")
+	}
+}
+
+// TestGroupingEmissionCarriesDirection: a descending group-keys Sort emits
+// descending — direction/nulls ride from the child PathKeys, never assumed.
+func TestGroupingEmissionCarriesDirection(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec,
+		[]PathKey{{Expr: groupCol, SortAsc: false, NullsFirst: true}}, Cost{Startup: 69094, Total: 70122})
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("translated %d pathkeys, want 1", len(got))
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("direction lost: got asc=%v nullsFirst=%v", got[0].SortAsc, got[0].NullsFirst)
+	}
+}
+
+// TestGroupingEmissionAcceptsTrailingKeys: a presorted-shaped Sort whose
+// leading run covers all groups in order still translates — extra trailing
+// keys cannot change group-emergence order, so accepting them is sound
+// (SLICE2 §1 step 3 subsumes the presorted variant here).
+func TestGroupingEmissionAcceptsTrailingKeys(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	extra := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := r47slice2SortedCand(spec,
+		[]PathKey{{Expr: groupCol, SortAsc: true}, {Expr: extra, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	if got := groupingEmissionPathkeys(aggNode, cand); len(got) != 1 {
+		t.Fatalf("group-prefixed presorted shape translated %d keys, want 1", len(got))
+	}
+}
+
+// TestGroupingEmissionDeclines: every untranslatable shape returns nil —
+// each row is a wrong-order vector if it ever translated.
+func TestGroupingEmissionDeclines(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	baseSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	baseCand := func(spec *Aggregate) *Path {
+		return r47slice2SortedCand(spec, []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	}
+	cases := map[string]func() *Path{
+		"hashed strategy": func() *Path {
+			c := baseCand(baseSpec())
+			c.AggStrategy = AggStrategyHashed
+			return c
+		},
+		"prebuilt child": func() *Path {
+			c := baseCand(baseSpec())
+			c.Children[0] = &Path{Kind: PathPrebuilt, Rows: 57066, node: aggNode.Child}
+			return c
+		},
+		"no child": func() *Path {
+			c := baseCand(baseSpec())
+			c.Children = nil
+			return c
+		},
+		"nil spec": func() *Path {
+			c := baseCand(baseSpec())
+			c.Agg = nil
+			return c
+		},
+		"grouping sets": func() *Path {
+			s := baseSpec()
+			s.GroupingSets = [][]int{{0}}
+			return baseCand(s)
+		},
+		"empty groups": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = nil
+			return baseCand(s)
+		},
+		"non-simple mode": func() *Path {
+			s := baseSpec()
+			s.Mode = AggModePartial
+			return baseCand(s)
+		},
+		"index order": func() *Path {
+			s := baseSpec()
+			s.GroupKeyOrder = []int{0}
+			return baseCand(s)
+		},
+		"expression group key": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = []Expr{&BinaryOp{Left: groupCol, Right: groupCol}}
+			return baseCand(s)
+		},
+		"leading key is not the group": func() *Path {
+			return r47slice2SortedCand(baseSpec(),
+				[]PathKey{{Expr: other, SortAsc: true}, {Expr: groupCol, SortAsc: true}}, Cost{})
+		},
+		"short run": func() *Path {
+			s := baseSpec()
+			s.GroupExprs = []Expr{groupCol, other}
+			return baseCand(s)
+		},
+	}
+	for name, build := range cases {
+		if got := groupingEmissionPathkeys(aggNode, build()); got != nil {
+			t.Errorf("%s: translated %d keys, want nil", name, len(got))
+		}
+	}
+	// Output-prefix mismatch: the layout is verified, never assumed.
+	renamed := *aggNode
+	renamedSchema := Schema{
+		{Name: "renamed", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "count", Type: catalog.Type{Name: "int8"}},
+	}
+	renamed.schema = renamedSchema
+	if got := groupingEmissionPathkeys(&renamed, baseCand(baseSpec())); got != nil {
+		t.Errorf("renamed output prefix: translated %d keys, want nil", len(got))
+	}
+	if got := groupingEmissionPathkeys(nil, baseCand(baseSpec())); got != nil {
+		t.Errorf("nil node: translated %d keys, want nil", len(got))
+	}
+	if got := groupingEmissionPathkeys(aggNode, nil); got != nil {
+		t.Errorf("nil candidate: translated %d keys, want nil", len(got))
+	}
+	notAgg := &Path{Kind: PathSort}
+	if got := groupingEmissionPathkeys(aggNode, notAgg); got != nil {
+		t.Errorf("non-agg path: translated %d keys, want nil", len(got))
+	}
+}
+
+// TestElectOrderedGroupingDeclinesPristine: a rel-level decline (here the
+// GroupKeyOrder index candidate, untranslatable at helper level, leaves <2
+// translatable... precisely: zero translate AND the Finalize-free count gate)
+// restores the ORDERED rel byte-identical — Pathlist length and cheapest
+// fields unchanged, so decline === the loop never ran.
+func TestElectOrderedGroupingDeclinesPristine(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	idxSpec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema, GroupKeyOrder: []int{0}}
+	idxSeed := newPrebuiltPath(grouped, aggNode.Child)
+	hashedSpec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	addPath(grouped, &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
+		Rows: 5, Cost: Cost{Startup: 69000, Total: 70000}, Rel: grouped, Children: []*Path{idxSeed}}, "test")
+	addPath(grouped, &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: hashedSpec,
+		Rows: 5, Cost: Cost{Startup: 68909, Total: 69911}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	beforeLen := len(ordered.Pathlist)
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
+		t.Fatalf("index+hashed rel elected (ok=%v); want decline", ok)
+	}
+	after := fetchUpperRel(u, UpperOrdered, 0, 0)
+	if len(after.Pathlist) != beforeLen || after.CheapestTotal != nil || after.CheapestStartup != nil {
+		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d cheapest=%v/%v",
+			beforeLen, len(after.Pathlist), after.CheapestTotal, after.CheapestStartup)
+	}
+}
+
+// TestElectOrderedGroupingElectsNoSortAtQ4Numbers: on a Q4-shaped rel the
+// loop elects the no-sort sorted candidate (the slice-1 pin's election,
+// end to end through build + copy-back): elected, bare *Aggregate winner,
+// winner spec (sorted strategy) copied back onto agg.node. The fixture's
+// pair is a genuine startup/total TRADE-OFF — under COSTS_EQUAL
+// (M0141-S2b-13) Q4's literal fuzzy tie now rejects the hashed candidate
+// upstream at the grouped rel (that is the tested behaviour in
+// groupingpaths_test.go); a surviving 2-candidate election needs a
+// COSTS_DIFFERENT pair, which is what a LIMIT-context rel (ConsiderStartup)
+// legitimately keeps.
+func TestElectOrderedGroupingElectsNoSortAtQ4Numbers(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	// Startup matters on this rel so the cheaper-startup/dearer-total
+	// hashed candidate is genuinely incomparable to the sorted one
+	// (costsDifferent) instead of dominated — both survive to the
+	// election, as they do under upstream add_path.
+	grouped.ConsiderStartup = true
+	mkSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	sorted := r47slice2SortedCand(mkSpec(), []PathKey{{Expr: groupCol, SortAsc: true}}, Cost{Startup: 69094, Total: 70122})
+	sorted.Rel = grouped
+	hashed := &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 50000, Total: 71000}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	addPath(grouped, sorted, "test")
+	addPath(grouped, hashed, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("Q4-shaped rel declined; want the no-sort election")
+	}
+	built, isAgg := got.(*Aggregate)
+	if !isAgg {
+		t.Fatalf("winner is %T; want bare *Aggregate (no-sort)", got)
+	}
+	_ = built
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want sorted", agg.node.Strategy)
+	}
+}
+
+// TestGroupingEmissionTranslatesGatherMergeChild: R56's
+// worker-sort-under-GatherMerge no-split arm delivers group-key order
+// through a `PathGatherMerge` child — a merge emits its inputs' order,
+// the same contract the Sort-child variant relies on — so it
+// translates identically (direction/nulls ride from the merge keys).
+// A merge on other keys declines exactly like a mis-sorted Sort:
+// translating it would elect a no-Sort plan emitting unordered groups.
+func TestGroupingEmissionTranslatesGatherMergeChild(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	mergeKeys := []PathKey{{Expr: groupCol, SortAsc: true}}
+	gmChild := &Path{Kind: PathGatherMerge, Pathkeys: mergeKeys, Rows: 57066,
+		Children: []*Path{{Kind: PathSort, Pathkeys: mergeKeys, Rows: 14266}}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	cand := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+		Pathkeys: mergeKeys, Children: []*Path{gmChild}}
+	got := groupingEmissionPathkeys(aggNode, cand)
+	if len(got) != 1 {
+		t.Fatalf("gathermerge child translated %d pathkeys, want 1", len(got))
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	if !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+		t.Fatalf("translated key %+v does not equal the ORDER BY key", got[0])
+	}
+	// Wrong merge keys decline: the merge does not deliver group order.
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	badKeys := []PathKey{{Expr: other, SortAsc: true}}
+	badGM := &Path{Kind: PathGatherMerge, Pathkeys: badKeys, Rows: 57066,
+		Children: []*Path{{Kind: PathSort, Pathkeys: badKeys, Rows: 14266}}}
+	bad := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+		Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+		Pathkeys: badKeys, Children: []*Path{badGM}}
+	if got := groupingEmissionPathkeys(aggNode, bad); got != nil {
+		t.Fatalf("gathermerge on other keys translated %d keys, want nil", len(got))
+	}
+}
+
+// TestElectOrderedGroupingOffersALoneCandidate is M0144-0011a-2: the loop's
+// candidate minimum is ONE, the way PG's is. `create_ordered_paths` iterates
+// `input_rel->pathlist` with no minimum at all
+// (`postgres/src/backend/optimizer/plan/planner.c:5337`), so a grouping rel
+// holding a single translatable `PathAgg` must still be offered on the ORDERED
+// rel — the `len(cands) < 2` form declined it.
+//
+// The fixture is the Q4-shaped rel with the hashed sibling REMOVED, so exactly
+// one candidate survives to the loop. The expected outcome is the no-sort
+// election: the lone sorted candidate already emits the ORDER BY order.
+//
+// Landing this removed a real divergence from PG, not a number — the corpus
+// census (`analysis/m0144/m0144-0011a-2-ordered-seam-census.md`) measured it
+// as SHAPE-inert on TPC-DS SF0.25 (37 `cands<2(1)` declines become 26
+// elections; 99/99 plan shapes byte-identical with costs stripped; parity
+// match, `missingnode` and all nine categories unchanged), because
+// `inputNodePathkeys` already derives the same claim from the finished node.
+// Ten queries do print a different ORDER BY `Sort` cost, now taken from
+// `addOrderedPaths` rather than the prebuilt seed's legacy display estimate.
+// This test is what keeps the gate from silently drifting back to a minimum
+// PG does not have.
+func TestElectOrderedGroupingOffersALoneCandidate(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sorted := r47slice2SortedCand(
+		&Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema},
+		[]PathKey{{Expr: groupCol, SortAsc: true}},
+		Cost{Startup: 69094, Total: 70122},
+	)
+	sorted.Rel = grouped
+	addPath(grouped, sorted, "test")
+	setCheapest(grouped)
+	if len(grouped.Pathlist) != 1 {
+		t.Fatalf("fixture must hold exactly one candidate, got %d", len(grouped.Pathlist))
+	}
+
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("a lone translatable candidate declined; PG offers it (planner.c:5337)")
+	}
+	if _, isAgg := got.(*Aggregate); !isAgg {
+		t.Fatalf("winner is %T; want the bare *Aggregate no-sort election", got)
+	}
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want sorted", agg.node.Strategy)
+	}
+}
+
+// TestElectOrderedGroupingStillDeclinesAnEmptyRel: lowering the minimum to one
+// is not lowering it to zero. A grouping rel with no `PathAgg` at all has
+// nothing to offer, and the decline must stay pre-mutation.
+func TestElectOrderedGroupingStillDeclinesAnEmptyRel(t *testing.T) {
+	aggNode, _, _ := r47slice2GroupFixture()
+	u := newUpperRels()
+	fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
+	beforeLen := len(ordered.Pathlist)
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
+		t.Fatalf("an empty grouping rel elected (ok=%v); want decline", ok)
+	}
+	if after := fetchUpperRel(u, UpperOrdered, 0, 0); len(after.Pathlist) != beforeLen {
+		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d", beforeLen, len(after.Pathlist))
 	}
 }

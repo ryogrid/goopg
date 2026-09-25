@@ -1,0 +1,282 @@
+diff --git a/internal/optimizer/createplanjoin.go b/internal/optimizer/createplanjoin.go
+index cc9e01335..bb6dafca8 100644
+--- a/internal/optimizer/createplanjoin.go
++++ b/internal/optimizer/createplanjoin.go
+@@ -598,6 +598,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
+ 	// record of it, which is what lets EXPLAIN print PG's "Parallel "
+ 	// prefix. Before this the fact died at plan construction.
+ 	j.ParallelAware = p.ParallelAware
++	hkProbeRecord(j)
+ 	assertParallelAwareJoinIsRunnable(p, j)
+ 	return j, in.publishedLayout(jt)
+ }
+@@ -740,6 +741,7 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
+ 		schema:    in.publishedSchema(jt),
+ 	}
+ 	assertPartialMergeJoinIsRunnable(p, j)
++	hkProbeRecord(j)
+ 	return j, in.publishedLayout(jt)
+ }
+ 
+diff --git a/internal/optimizer/join_hash_keys.go b/internal/optimizer/join_hash_keys.go
+index 06af11e70..cd0089eba 100644
+--- a/internal/optimizer/join_hash_keys.go
++++ b/internal/optimizer/join_hash_keys.go
+@@ -188,6 +188,8 @@ func fillJoinHashKeysNodes(n Node) {
+ // lesson): they otherwise alias the `Predicate` nodes, and a future pass
+ // that rebinds an index in the predicate would silently move a key.
+ func fillOneJoinHashKeys(j *Join) {
++	probeBefore := j.HashKeys
++	defer func() { hkProbeCompare(j, probeBefore, j.HashKeys) }()
+ 	j.HashKeys = nil
+ 	if j.Algo != JoinAlgoHash && j.Algo != JoinAlgoMerge {
+ 		return
+diff --git a/internal/optimizer/planner.go b/internal/optimizer/planner.go
+index af693d5b3..e373ead24 100644
+--- a/internal/optimizer/planner.go
++++ b/internal/optimizer/planner.go
+@@ -3997,6 +3997,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
+ 			schema:  appendSchema(root.Output(), itemNode.Output()),
+ 			Lateral: nodeReferencesOuter(itemNode),
+ 		}
++		hkProbeTag(root.(*Join), "planner.go:3992")
+ 		bindings = append(bindings, shifted...)
+ 	}
+ 	if root == nil {
+@@ -4067,6 +4068,7 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSe
+ 			schema:  appendSchema(root.Output(), n.Output()),
+ 			Lateral: nodeReferencesOuter(n),
+ 		}
++		hkProbeTag(root.(*Join), "planner.go:4062")
+ 		bindings = append(bindings, b)
+ 	}
+ 	if root == nil {
+@@ -4353,6 +4355,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
+ 			schema:    mergedSchema,
+ 			Lateral:   nodeReferencesOuter(rightNode),
+ 		}
++		hkProbeTag(jn, "planner.go:4347")
+ 		// R40 §4d / K69: Semi/Anti publish only the left (outer/probe)
+ 		// side — `Join.Output()` (plan.go) already special-cases this at
+ 		// read time, but the STORED `.schema` field here was still the
+diff --git a/internal/optimizer/pushdown.go b/internal/optimizer/pushdown.go
+index e16baf2d9..38b7fe084 100644
+--- a/internal/optimizer/pushdown.go
++++ b/internal/optimizer/pushdown.go
+@@ -316,6 +316,7 @@ func pushOneConjunct(node Node, c Expr) bool {
+ 			}
+ 		}
+ 		if okSplit {
++			hkProbeTag(j, "pushdown.go:promote")
+ 			j.LeftKey = lk
+ 			j.RightKey = rk
+ 			// The M0097-0058 hash-algorithm bailout for a
+diff --git a/internal/optimizer/unnest.go b/internal/optimizer/unnest.go
+index 35415e040..3ecdca839 100644
+--- a/internal/optimizer/unnest.go
++++ b/internal/optimizer/unnest.go
+@@ -2811,6 +2811,7 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
+ 		},
+ 		schema: mergedSchema,
+ 	}
++	hkProbeTag(join, "unnest.go:2777")
+ 	filter.Child = join
+ 	return outer, nil
+ }
+@@ -2994,6 +2995,7 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
+ 		},
+ 		schema: joinSchema,
+ 	}
++	hkProbeTag(join, "unnest.go:2971")
+ 
+ 	// Aggregate above the join: group by the preserved outer prefix
+ 	// plus the ordinal; the aggregate argument shifts into joined-row
+@@ -3559,6 +3561,7 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
+ 		schema:       append(Schema(nil), outerChild.Output()...),
+ 		FlattenedRHS: flattenedRHS,
+ 	}
++	hkProbeTag(join, "unnest.go:3549")
+ 	filter.Child = join
+ 	return outer, nil
+ }
+@@ -3750,6 +3753,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
+ 		schema:       append(Schema(nil), outerChild.Output()...),
+ 		FlattenedRHS: flattenedRHS,
+ 	}
++	hkProbeTag(join, "unnest.go:3739")
+ 	filter.Child = join
+ 	return outer, nil
+ }
+@@ -5044,6 +5048,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
+ 		SJInfo:       existsUnnestSJInfo(joinType, params, eup.Residuals, srcTableOffset),
+ 		FlattenedRHS: flattenedRHS,
+ 	}
++	hkProbeTag(join, "unnest.go:5036")
+ 	if outerKey != nil {
+ 		join.LeftKey = outerKey
+ 		join.RightKey = innerKey
+diff --git a/internal/optimizer/zz_hashkeyprobe.go b/internal/optimizer/zz_hashkeyprobe.go
+new file mode 100644
+index 000000000..250d97515
+--- /dev/null
++++ b/internal/optimizer/zz_hashkeyprobe.go
+@@ -0,0 +1,159 @@
++package optimizer
++
++// TEMPORARY PROBE (M0145-0007 slice 5 adjudication) — not for commit.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"strings"
++	"sync"
++)
++
++var hkProbeOn = os.Getenv("GOOPG_HASHKEY_PROBE") == "1"
++
++type hkProbeRec struct {
++	live []JoinKeyPair
++	snap string
++	pred string
++}
++
++var hkProbeMap sync.Map
++var hkFillMap sync.Map
++
++func hkExprStr(e Expr) string {
++	switch x := e.(type) {
++	case nil:
++		return "nil"
++	case *ColumnRef:
++		return fmt.Sprintf("c%d:%s", x.Index, x.Name)
++	case *OuterColumnRef:
++		return fmt.Sprintf("o%+v", *x)
++	default:
++		var b strings.Builder
++		hkDeep(&b, reflect.ValueOf(e), 0)
++		return b.String()
++	}
++}
++
++func hkDeep(b *strings.Builder, v reflect.Value, depth int) {
++	if depth > 30 {
++		b.WriteString("...")
++		return
++	}
++	switch v.Kind() {
++	case reflect.Invalid:
++		b.WriteString("nil")
++	case reflect.Ptr, reflect.Interface:
++		if v.IsNil() {
++			b.WriteString("nil")
++			return
++		}
++		hkDeep(b, v.Elem(), depth+1)
++	case reflect.Struct:
++		b.WriteString(v.Type().Name() + "{")
++		for i := 0; i < v.NumField(); i++ {
++			f := v.Type().Field(i)
++			if f.Name == "pos" {
++				continue
++			}
++			b.WriteString(f.Name + ":")
++			hkDeep(b, v.Field(i), depth+1)
++			b.WriteString(" ")
++		}
++		b.WriteString("}")
++	case reflect.Slice, reflect.Array:
++		b.WriteString("[")
++		for i := 0; i < v.Len(); i++ {
++			hkDeep(b, v.Index(i), depth+1)
++			b.WriteString(",")
++		}
++		b.WriteString("]")
++	case reflect.Map:
++		b.WriteString(fmt.Sprintf("map#%d", v.Len()))
++	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
++		b.WriteString(v.Kind().String())
++	default:
++		b.WriteString(fmt.Sprint(v.Interface()))
++	}
++}
++
++func hkPairsStr(ps []JoinKeyPair) string {
++	var b strings.Builder
++	for i, p := range ps {
++		if i > 0 {
++			b.WriteString(",")
++		}
++		b.WriteString(hkExprStr(p.Left) + "=" + hkExprStr(p.Right))
++	}
++	return b.String()
++}
++
++func hkProbeRecord(j *Join) {
++	if !hkProbeOn {
++		return
++	}
++	r := &hkProbeRec{live: j.HashKeys, snap: hkPairsStr(j.HashKeys)}
++	hkProbeMap.Store(j, r)
++	if len(j.HashKeys) > 0 {
++		hkProbeMap.Store(&j.HashKeys[0], r)
++	}
++}
++
++// hkProbeCompare runs inside fillOneJoinHashKeys BEFORE it overwrites.
++func hkProbeCompare(j *Join, before []JoinKeyPair, after []JoinKeyPair) {
++	if !hkProbeOn || (j.Algo != JoinAlgoHash && j.Algo != JoinAlgoMerge) {
++		return
++	}
++	v, ok := hkProbeMap.Load(j)
++	origin := "lowering"
++	if !ok && len(before) > 0 {
++		v, ok = hkProbeMap.Load(&before[0])
++		origin = "lowering-copied"
++	}
++	if !ok && len(before) > 0 {
++		if _, rv := hkFillMap.Load(&before[0]); rv {
++			origin = "revisit"
++			if len(after) > 0 {
++				hkFillMap.Store(&after[0], true)
++			}
++			fmt.Fprintf(os.Stderr, "HASHKEYPROBE origin=revisit algo=%d type=%d same=%v\n", j.Algo, j.Type, hkPairsStr(before) == hkPairsStr(after))
++			return
++		}
++	}
++	if len(after) > 0 {
++		hkFillMap.Store(&after[0], true)
++	}
++	if !ok {
++		fmt.Fprintf(os.Stderr, "HASHKEYPROBE origin=nonlowering algo=%d type=%d n=%d before=%d site=%v\n", j.Algo, j.Type, len(after), len(before), hkSite(j))
++		return
++	}
++	r := v.(*hkProbeRec)
++	liveNow := hkPairsStr(r.live)
++	fill := hkPairsStr(after)
++	mutated := liveNow != r.snap
++	verdict := "same"
++	if liveNow != fill {
++		verdict = "DIFF"
++		if len(r.live) != len(after) {
++			verdict = "DIFFLEN"
++		}
++	}
++	fmt.Fprintf(os.Stderr, "HASHKEYPROBE origin=%s algo=%d type=%d verdict=%s mutated=%v fold=[%s] fill=[%s] snap=[%s]\n",
++		origin, j.Algo, j.Type, verdict, mutated, liveNow, fill, r.snap)
++}
++
++var hkTagMap sync.Map
++
++func hkProbeTag(j *Join, site string) {
++	if hkProbeOn {
++		hkTagMap.Store(j, site)
++	}
++}
++
++func hkSite(j *Join) string {
++	if v, ok := hkTagMap.Load(j); ok {
++		return v.(string)
++	}
++	return "untagged"
++}

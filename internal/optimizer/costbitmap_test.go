@@ -151,7 +151,7 @@ func TestCostBitmapHeapScan_Components(t *testing.T) {
 	tuplesFetched := 500.0
 	T := 1000.0 // 1000-page table
 
-	cost := costBitmapHeapScan(cp, idxCost, pagesFetched, tuplesFetched, T)
+	cost := costBitmapHeapScan(cp, idxCost, pagesFetched, tuplesFetched, T, 0)
 
 	// Startup = indexCost.Total = 50.0
 	if math.Abs(cost.Startup-50.0) > 1e-9 {
@@ -197,11 +197,32 @@ func TestCostBitmapHeapScan_SmallFraction(t *testing.T) {
 	cp := defaultCostParams()
 	idxCost := Cost{Startup: 3.0, Total: 10.0}
 	// 1 page out of 1000 → almost all random page cost.
-	cost := costBitmapHeapScan(cp, idxCost, 1, 1, 1000)
+	cost := costBitmapHeapScan(cp, idxCost, 1, 1, 1000, 0)
 	// pageCost ≈ sqrt(0.001)*4 + (1-sqrt(0.001))*1 ≈ 0.0316*4 + 0.9684*1 = 0.1264 + 0.9684 = 1.0948
 	// runCost ≈ 1.0948*1 + 0.01*1 = 1.1048
 	// Total ≈ 10 + 1.1048 + 10 = 21.1048
 	if cost.Total <= cost.Startup {
 		t.Errorf("tiny fraction should have positive run cost")
+	}
+}
+
+// TestCostBitmapHeapScanQpqualCurrency (R1, plan-parity-fix-take2) pins
+// PG's bitmap rule: the heap side rechecks EVERY local conjunct
+// (`cost_bitmap_heap_scan`, assume-rechecked-always), so numQualOps is
+// the full local count — charged per heap tuple fetched at
+// cpu_operator_cost, the identical term costSeqscan charges per tuple
+// scanned. Zero keeps the pre-R1 price exactly.
+func TestCostBitmapHeapScanQpqualCurrency(t *testing.T) {
+	cp := defaultCostParams()
+	idxCost := Cost{Startup: 5.0, Total: 50.0}
+	base := costBitmapHeapScan(cp, idxCost, 100.0, 500.0, 1000.0, 0)
+	charged := costBitmapHeapScan(cp, idxCost, 100.0, 500.0, 1000.0, 4)
+	want := base.Total + 4*cp.cpuOperatorCost*500.0
+	if math.Abs(charged.Total-want) > 1e-9*math.Max(1, math.Abs(want)) {
+		t.Fatalf("4-conjunct bitmap heap = %v, want %v", charged.Total, want)
+	}
+	if charged.Startup != base.Startup {
+		t.Fatalf("startup moved %v -> %v; the R1 charge is per-tuple only",
+			base.Startup, charged.Startup)
 	}
 }

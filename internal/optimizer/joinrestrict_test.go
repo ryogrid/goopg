@@ -19,9 +19,10 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// riTestCols builds n single-column FROM items: cumOffsets over one column
-// each, and a ColumnRef per FROM position. Position i owns schema index i.
-func riTestCols(n int) ([]int, []*ColumnRef) {
+// riTestCols builds n single-column FROM items: a per-leaf span table over
+// one column each, and a ColumnRef per FROM position. Position i owns schema
+// index i.
+func riTestCols(n int) ([]leafSpan, []*ColumnRef) {
 	cum := make([]int, n+1)
 	refs := make([]*ColumnRef, n)
 	for i := 0; i < n; i++ {
@@ -33,7 +34,7 @@ func riTestCols(n int) ([]int, []*ColumnRef) {
 			SourceTableIdx: int16(i + 1),
 		}
 	}
-	return cum, refs
+	return spansFromCumulative(cum), refs
 }
 
 func riEq(l, r Expr) Expr  { return &BinaryOp{Op: parser.OpEq, Left: l, Right: r} }
@@ -209,7 +210,7 @@ func TestEquivClassChargedOncePerJoin(t *testing.T) {
 func TestSelectivityClausesKeepsDistinctRestrictions(t *testing.T) {
 	// Four FROM items, two columns each, so a relation can carry two
 	// independent join keys.
-	cum := []int{0, 2, 4}
+	cum := spansFromCumulative([]int{0, 2, 4})
 	col := func(idx int, name string) *ColumnRef {
 		return &ColumnRef{Name: name, Index: idx, Type: catalog.Type{Name: "int4"},
 			SourceTableIdx: int16(idx/2 + 1)}
@@ -263,7 +264,7 @@ func TestSelectivityClausesPrefersExplicitMember(t *testing.T) {
 // the selectivity, so an id derived from Go's randomised map order would make
 // the answer depend on the run. Same input, repeated, must give the same ids.
 func TestEquivClassIDsAreDeterministic(t *testing.T) {
-	cum := []int{0, 2, 4, 6}
+	cum := spansFromCumulative([]int{0, 2, 4, 6})
 	col := func(idx int, name string) *ColumnRef {
 		return &ColumnRef{Name: name, Index: idx, Type: catalog.Type{Name: "int4"},
 			SourceTableIdx: int16(idx/2 + 1)}

@@ -327,3 +327,24 @@ func (h *notifyHub) RemoveSession(sess *misc.SessionRegistry) {
 	}
 	delete(h.pending, sess)
 }
+
+// discardAllSessionState is the half of DISCARD ALL (discard.c DiscardAll)
+// that lives in the connection rather than the executor: it drops every
+// prepared statement (DropAllPreparedStatements), closes every cursor
+// (PortalHashTableDeleteAll) and unlistens every channel (Async_UnlistenAll).
+// The executor does the rest — session authorization, RESET ALL, advisory
+// locks, temp tables, sequence caches — and raises 25001 inside a
+// transaction block, which is why nothing is done here in that case: PG
+// rejects the statement before touching any state. prepStmts is nil on the
+// extended path, whose SQL-level prepared statements this layer cannot reach
+// (ledgered).
+func (s *Server) discardAllSessionState(connTx *connTxState, prepStmts *preparedStatements) {
+	if connTx == nil || connTx.InExplicit() {
+		return
+	}
+	if prepStmts != nil {
+		prepStmts.DeleteAll()
+	}
+	connTx.cursorClose("")
+	s.notify.UnlistenAll(connTx.NotifySession)
+}

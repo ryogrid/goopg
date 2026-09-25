@@ -1,6 +1,7 @@
 package postmaster
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -214,5 +215,24 @@ func TestTryRecordTableGrantResolvesSearchPath(t *testing.T) {
 	s.tryRecordTableRevoke(`REVOKE SELECT ON doc FROM bob`, []string{"sch", "public"})
 	if got := im.RelaclText(tbl.OID); got != "" {
 		t.Fatalf("relacl after on-path REVOKE = %q; want empty", got)
+	}
+}
+
+// The autocommit table/schema/function GRANT fast path refuses WITH GRANT
+// OPTION to PUBLIC (PostgreSQL 0LP01, aclchk.c:208) and records nothing — the
+// ACL store is not transactional, so a later grantee in the same list must not
+// have been written either.
+func TestTryRecordTableGrantRejectsGrantOptionToPublic(t *testing.T) {
+	s, im, oid := newGrantTestServer(t)
+	before := im.RelaclText(oid)
+	err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob, PUBLIC WITH GRANT OPTION`, "", nil)
+	if !errors.Is(err, errGrantOptionToPublic) {
+		t.Fatalf("err = %v, want errGrantOptionToPublic", err)
+	}
+	if got := im.RelaclText(oid); got != before {
+		t.Fatalf("relacl changed to %q after a refused GRANT (was %q)", got, before)
+	}
+	if err := s.tryRecordTableGrant(`GRANT SELECT ON TABLE t TO bob WITH GRANT OPTION`, "", nil); err != nil {
+		t.Fatalf("role grantee with grant option: %v", err)
 	}
 }

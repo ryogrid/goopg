@@ -89,6 +89,18 @@ func pushSingleSideQualsIntoInnerJoinInputs(n Node) Node {
 	if n == nil {
 		return nil
 	}
+	// M0145-0005 slice 5: a searched subtree is opaque to this pass, on
+	// the same contract pushOneConjunct and
+	// rewriteScanInputsWithSingleTablePredicates already keep (P5.9-b).
+	// The search's own clause distribution placed every restriction it
+	// admitted; a conjunct still above the searched root is one it
+	// deliberately held there (the nullable-side and unattributable
+	// guards), and planting it inside would either duplicate work the
+	// costed tree already does or re-place a qual below the node whose
+	// null-extension the hold exists to stay above.
+	if isSearchedTree(n) {
+		return n
+	}
 	switch x := n.(type) {
 	case *Filter:
 		newChild, dropSelf := pushInnerJoinInputQuals(x)
@@ -156,9 +168,17 @@ func pushInnerJoinInputQuals(f *Filter) (Node, bool) {
 		if _, _, pushable := joinRestrictionSides(child); !pushable {
 			return f.Child, false
 		}
+		// M0145-0005 slice 5: do not push INTO a searched subtree. Every
+		// conjunct in f.Predicate above a searched root is one the seam
+		// deliberately held there (the nullable-side or unattributable
+		// guard) — the searched tree's own clause distribution already
+		// placed what it admitted. The residual keeps all of them.
+		if isSearchedTree(child) {
+			return f.Child, false
+		}
 		var kept []Expr
 		for _, c := range splitAnd(f.Predicate) {
-			repl, ok, tr := pushConjunctIntoSubtreeTraced(child, c)
+			repl, ok, tr := pushConjunctIntoSubtreeTracedNoSearched(child, c, true)
 			if !ok {
 				kept = append(kept, c)
 				continue
@@ -322,6 +342,13 @@ func joinRestrictionSides(j *Join) (left, right, pushable bool) {
 type pushTrace struct {
 	proven  bool
 	planted bool
+	// noSearched marks the descent as statement-level: a searched
+	// subtree is then an opaque boundary the conjunct may not cross
+	// (M0145-0005 slice 5 — see pushConjunctTraced's entry check). The
+	// zero value keeps the CTE-inline caller permissive, because its
+	// pushes originate OUTSIDE the body's scope and deliberately cross
+	// the searched boundary (R42: the boundary Project arm).
+	noSearched bool
 }
 
 func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
@@ -329,16 +356,37 @@ func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
 	return repl, ok
 }
 
+func pushConjunctIntoSubtreeNoSearched(n Node, c Expr, noSearched bool) (Node, bool) {
+	repl, ok, _ := pushConjunctIntoSubtreeTracedNoSearched(n, c, noSearched)
+	return repl, ok
+}
+
 // pushConjunctIntoSubtreeTraced is pushConjunctIntoSubtree with the C-02c
 // move proof reported. Copy mechanics are byte-identical to legacy in
 // every case (declines, derivations, placements); only the report is new.
 func pushConjunctIntoSubtreeTraced(n Node, c Expr) (Node, bool, pushTrace) {
-	st := &pushTrace{proven: true}
+	return pushConjunctIntoSubtreeTracedNoSearched(n, c, false)
+}
+
+func pushConjunctIntoSubtreeTracedNoSearched(n Node, c Expr, noSearched bool) (Node, bool, pushTrace) {
+	st := &pushTrace{proven: true, noSearched: noSearched}
 	repl, ok := pushConjunctTraced(n, c, st)
 	return repl, ok, *st
 }
 
 func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
+	// M0145-0005 slice 5: a statement-level descent stops at a searched
+	// subtree — the search's own clause distribution already placed
+	// every qual it admitted inside, and a conjunct it held above is
+	// held for a reason (the nullable-side or unattributable guard) that
+	// planting it below would silently violate. The CTE-inline path
+	// calls with noSearched=false because its conjunct arrives from
+	// OUTSIDE the body's scope — the body's search never saw it — so
+	// crossing the boundary is the qual pushdown PG performs at parse
+	// level (R42's measured witness).
+	if st.noSearched && isSearchedTree(n) {
+		return n, false
+	}
 	switch x := n.(type) {
 	case *Filter:
 		// Descend past a Filter only when its child is a Join. If the
@@ -385,6 +433,92 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		x.Predicate = combineAnd([]Expr{x.Predicate, c})
 		return x, true
 
+	case *Project:
+		// R42/K76: the descent must be able to cross a projection, because
+		// the PG-shaped search's boundary republishes binding order through
+		// one. Before R41 every CTE body carrying this shape DECLINED the
+		// search, so the legacy tree it fell back to had no `Project`
+		// between a join and its scan and this arm was unreachable — the
+		// gap is old, not new. Measured when it became reachable: TPC-DS
+		// Q78's three `date_dim` scans lost `Filter: (d_year = 1998)`
+		// (rows 149 -> 73049), a qual-placement divergence from PG, whose
+		// own plan carries that restriction.
+		//
+		// Fail closed on the two shapes `remapConjunctThroughProjection`
+		// cannot judge, BEFORE calling it:
+		//
+		//   - IsolatedScope: these wrap an isolated subquery scope whose
+		//     targets are inner-indexed then outer-relabeled (plan.go), so
+		//     they must not be remapped against outer coordinates.
+		//     `upper_narrow_chain.go` refuses them verbatim for the same
+		//     reason. Today they are contained only by ACCIDENT — a
+		//     view-rename Project declines because the view and body column
+		//     names differ, which stops working the moment they match.
+		//   - a Targets/Output length disagreement, which would let the
+		//     remap's index checks pass against the wrong layout. The
+		//     sibling `*Aggregate` arm (cte_inline_pushdown.go) and
+		//     `upper_narrow_chain.go` both assert this.
+		if x.IsolatedScope || x.Child == nil || len(x.Output()) != len(x.Targets) {
+			return n, false
+		}
+		mapped, ok := remapConjunctThroughProjection(c, x.Output(), x.Targets, x.Child.Output())
+		if !ok {
+			return n, false
+		}
+		// R42 is PLACEMENT-ONLY, and this line is what makes it so.
+		//
+		// `st.proven` has exactly one consumer — `if tr.proven &&
+		// !tr.planted { continue }` in pushSingleSideQualsIntoInnerJoinInputs
+		// — which DELETES the conjunct from the residual Filter. Leaving
+		// `st` untouched here would be logically defensible (a projection
+		// crosses no outer join, so it cannot invalidate a delay proof) and
+		// operationally backwards: today this shape returns false and the
+		// qual is unconditionally KEPT, so an arm that returns true with
+		// `proven` intact would newly enable a residual-dropping MOVE on a
+		// whole class of trees.
+		//
+		// That move's soundness would rest entirely on the remap being
+		// exact, and the remap has two fail-OPEN seams: it skips the
+		// self-side name check for an UNNAMED ref (and unnamed refs do
+		// occur — innerJoinPushTarget records the same), and its index
+		// checks assume the layout the length guard above now enforces.
+		// The length seam is closed; the unnamed-ref seam is why the move
+		// stays off. Enabling it is a separate round with its own proof.
+		st.proven = false
+		repl, ok := pushConjunctTraced(x.Child, mapped, st)
+		if !ok {
+			return n, false
+		}
+		// In-place, exactly as the *Join arm below assigns x.Left/x.Right:
+		// "copies by default" in this pass means the CONJUNCT is duplicated
+		// (kept above AND planted below), never that nodes are copied. The
+		// real prerequisite is expression freshness, and
+		// remapConjunctThroughProjection supplies it by ending in
+		// cloneExprRefs — so what is planted below never aliases the
+		// residual's `c`. Passing `c` through unchanged would have aliased
+		// the caller's own expression on the CTE entry path, whose entry
+		// node is a *Filter rather than a *Join.
+		x.Child = repl
+		return x, true
+
+	case *Gather:
+		// O15 (M0137-0016): a Gather is a single-child pass-through — its
+		// Output() is exactly Child.Output() (NewGather), unlike *Join, so
+		// no coordinate shift and no side/preservation gate apply, and
+		// unlike *Project there is no remap to fail closed on. Without
+		// this arm the descent fell through to the terminal-target check
+		// below and declined at any Gather boundary, silently keeping a
+		// PG-placeable restriction as a post-parallel residual — the same
+		// defect class as R56's Q78 loss (three `Filter:` lines dropped
+		// with sweep checksums still green): a values-only gate cannot see
+		// a qual-placement divergence from PG.
+		repl, ok := pushConjunctTraced(x.Child, c, st)
+		if !ok {
+			return n, false
+		}
+		x.Child = repl
+		return x, true
+
 	case *Join:
 		leftOK, rightOK, pushable := joinRestrictionSides(x)
 		if !pushable {
@@ -409,7 +543,7 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		// join's own equality clauses (see deriveConstAcrossJoinEquality
 		// for why that is safe even on a nullable side this function
 		// would otherwise refuse to touch).
-		if deriveConstAcrossJoinEquality(x, c, side, leftWidth) {
+		if deriveConstAcrossJoinEquality(x, c, side, leftWidth, st.noSearched) {
 			st.planted = true
 		}
 		// C-02c/d: record the per-link move proof (conjunctive over the
@@ -643,7 +777,7 @@ func innerJoinPushTarget(c Expr, j *Join, leftWidth int) (joinSide, bool) {
 // Reports whether any derived copy was planted (C-02c: a planted
 // derivation vetoes dropping the original — the derivation's soundness
 // proof assumes the residual masks match→null-extension flips).
-func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int) (planted bool) {
+func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int, noSearched bool) (planted bool) {
 	if j.Predicate == nil {
 		return false
 	}
@@ -736,7 +870,7 @@ func deriveConstAcrossJoinEquality(j *Join, c Expr, side joinSide, leftWidth int
 		if !ok {
 			continue
 		}
-		if repl, ok := pushConjunctIntoSubtree(target, local); ok {
+		if repl, ok := pushConjunctIntoSubtreeNoSearched(target, local, noSearched); ok {
 			if otherOnLeft {
 				j.Left = repl
 			} else {

@@ -120,6 +120,13 @@ type lockRowsOp struct {
 	// instead of scanning the full inner table. M0100-0005.
 	maxDrain int
 
+	// junkPos is the set of resjunk (rowmark ctid) column positions in the
+	// child row — stripped before a row leaves the operator. Positions are
+	// read from the child schema's Resjunk marks; a ctid injected into a
+	// non-rightmost leaf sits mid-row, so the trailing-NumCtidCols trim is
+	// only a fallback for hand-built plans without marks. M0143-0009.
+	junkPos map[int]bool
+
 	// filterPred / filterCols: extracted from the child chain at Open time.
 	// When stampLock follows a committed-update CTID chain to a live successor
 	// (EPQ for SELECT FOR UPDATE), the filter predicate is re-evaluated against
@@ -146,6 +153,15 @@ type lockRowsOp struct {
 	// for our transaction to end. Design 0118-0117 (intra-grant-inplace perm 10).
 	pgClassRowMarkOID uint32
 	pgClassRowMarkXID uint32
+	// pgClassRelDropped is set in Open when the pending-DROP wait released into
+	// a committed drop — the pg_class tuple this rowmark locked is gone. PG
+	// resolves 'rel'::regclass once into the scan key before the LockTuple
+	// wait, so its scan just finds the tuple deleted and yields 0 rows; the
+	// child scan's lazy re-evaluation would instead raise 42P01. drainAndStamp
+	// skips the drain; the empty-pending arm retracts the mark. Sticky on
+	// purpose: the OID cannot come back, matching PG's bound scan key across
+	// rescans. Design 0118-0117 (intra-grant-inplace perm 10).
+	pgClassRelDropped bool
 }
 
 type pendingLockedRow struct {
@@ -165,7 +181,49 @@ type pendingLockedRow struct {
 }
 
 func newLockRowsOp(p *optimizer.LockRows, child Operator) *lockRowsOp {
-	return &lockRowsOp{plan: p, child: child}
+	return &lockRowsOp{plan: p, child: child, junkPos: resjunkPositions(p)}
+}
+
+// resjunkPositions computes the set of column positions in the LockRows
+// child's output that carry resjunk (rowmark ctid) datums — the positions to
+// strip before a row leaves the operator. The Resjunk schema mark handles
+// ctids anywhere in the row; when no marks are present the trailing
+// NumCtidCols positions are used (hand-built plans). M0143-0009.
+func resjunkPositions(p *optimizer.LockRows) map[int]bool {
+	schema := p.Child.Output()
+	var pos map[int]bool
+	for i, c := range schema {
+		if c.Resjunk {
+			if pos == nil {
+				pos = map[int]bool{}
+			}
+			pos[i] = true
+		}
+	}
+	if pos == nil && p.NumCtidCols > 0 {
+		pos = map[int]bool{}
+		for i := len(schema) - p.NumCtidCols; i < len(schema); i++ {
+			if i >= 0 {
+				pos[i] = true
+			}
+		}
+	}
+	return pos
+}
+
+// stripJunkCols returns row without the resjunk positions. len(junk)==0 is
+// the common path and returns the row unchanged.
+func stripJunkCols(row Row, junk map[int]bool) Row {
+	if len(junk) == 0 {
+		return row
+	}
+	out := make(Row, 0, len(row)-len(junk))
+	for i := range row {
+		if !junk[i] {
+			out = append(out, row[i])
+		}
+	}
+	return out
 }
 
 // findFilterPred walks the child chain past Project wrappers and returns the
@@ -322,6 +380,8 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			return v, nil
 		case *indexScanOp:
 			return v, nil
+		case *bitmapHeapScanOp:
+			return v, nil
 		// Pass-through operators — recurse through the single child.
 		case *projectOp:
 			op = v.child
@@ -366,6 +426,9 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			}
 			if outer != nil {
 				return outer, nil
+			}
+			if bs, ok := v.inner.(*bitmapHeapScanOp); ok {
+				return bs, nil
 			}
 			return nliInnerIndexScan(v.inner), nil
 		// Known non-TID terminals — legitimate, no error.
@@ -414,6 +477,68 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 	}
 }
 
+// disableFilterReadAhead pins every filterOp between a currentTID consumer and
+// its scan leaves to the per-row path.
+//
+// A currentTIDProvider reports the position of the row its scan leaf produced
+// MOST RECENTLY. Every consumer (LockRows, the streaming NL join's ctid capture,
+// the hash join's preserved build-side ctids, setOp's delegation) reads it right
+// after pulling a row, and relies on nothing having been pulled since. The
+// filterOp batch path (M0122-0012) breaks that: it pulls up to filterBatchSize
+// rows before emitting the first, so the leaf's position belongs to a later row
+// — for a partitioned table possibly in another partition. The witness is
+// isolation spec insert-conflict-do-update-4: `SELECT … FOR UPDATE` over a
+// partitioned table locked the wrong (relation, ctid) pair and failed with
+// "short read at block".
+//
+// The descent mirrors findScanLeaf/findScanLeafForRel (single-child spine,
+// both setOp branches, both join sides, the NLI outer) so every
+// filterOp either walker can pass through is covered. It clears batchEnabled
+// directly as well as setting the sticky flag, because consumers call it after
+// the child's Open (which already chose the path) but before its first Next.
+func disableFilterReadAhead(op Operator) {
+	for op != nil {
+		switch v := op.(type) {
+		case *filterOp:
+			v.noReadAhead = true
+			v.batchEnabled = false
+			op = v.child
+		case *projectOp:
+			op = v.child
+		case *sortOp:
+			op = v.child
+		case *limitOp:
+			op = v.child
+		case *distinctOp:
+			op = v.child
+		case *distinctOnOp:
+			op = v.child
+		case *ordinalityOp:
+			op = v.child
+		case *windowOp:
+			op = v.child
+		case *projectSetOp:
+			op = v.child
+		case *materializeOp:
+			op = v.child
+		case *instrumentedOp:
+			op = v.inner
+		case *setOp:
+			disableFilterReadAhead(v.left)
+			op = v.right
+		case *joinOp:
+			disableFilterReadAhead(v.left)
+			op = v.right
+		case *nestedLoopIndexJoinOp:
+			// The inner is an index probe (nliInner), not an operator tree —
+			// no filterOp can sit there.
+			op = v.outer
+		default:
+			return
+		}
+	}
+}
+
 // findScanLeafForRel finds the currentTIDProvider for a specific relation
 // (identified by its storage.RelFileNode), preferring the leftmost occurrence.
 // Called after o.child.Open so seqScanOp.rel and indexScanOp.ctx are set.
@@ -434,6 +559,11 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context
 			return nil, nil
 		case *indexScanOp:
 			if (v.ctx != nil && v.ctx.Catalog.RelFileNode(v.plan.Table) == targetRel) || (ctx != nil && ctx.Catalog.RelFileNode(v.plan.Table) == targetRel) {
+				return v, nil
+			}
+			return nil, nil
+		case *bitmapHeapScanOp:
+			if v.rel == targetRel || (v.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(v.tbl) == targetRel) {
 				return v, nil
 			}
 			return nil, nil
@@ -485,6 +615,10 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context
 			if is := nliInnerIndexScan(v.inner); is != nil && is.ctx != nil &&
 				is.ctx.Catalog.RelFileNode(is.plan.Table) == targetRel {
 				return is, nil
+			}
+			if bs, ok := v.inner.(*bitmapHeapScanOp); ok &&
+				(bs.rel == targetRel || (bs.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(bs.tbl) == targetRel)) {
+				return bs, nil
 			}
 			return nil, nil
 		// Known non-TID terminals — legitimate, no error.
@@ -588,11 +722,12 @@ func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) error {
 		}
 		return markJoinPreserveCTID(v.right, targetRel)
 	case *nestedLoopIndexJoinOp:
-		// Inner is always *indexScanOp or *memoizeOp (nliInner), neither
-		// of which can contain a joinOp — recurse outer only.
+		// Inner is an nliInner probe (*indexScanOp, *memoizeOp or
+		// *bitmapHeapScanOp), none of which can contain a joinOp —
+		// recurse outer only.
 		return markJoinPreserveCTID(v.outer, targetRel)
 	// Known terminals — no children, harmless no-op.
-	case *seqScanOp, *indexScanOp, *setOp,
+	case *seqScanOp, *indexScanOp, *bitmapHeapScanOp, *setOp,
 		*valuesOp, *cteScanOp, *workTableScanOp, *materializedCTEScanOp,
 		*indexOnlyScanOp, *scalarFuncScanOp, *fromUnnestOp, *generateSeriesOp,
 		*generateSubscriptsOp, *userSrfScanOp, *rowsFromOp, *fromRegexpMatchesOp,
@@ -734,6 +869,9 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
+	// This operator reads the scan leaf's currentTID after every row it
+	// pulls; no filter below may read ahead of it.
+	disableFilterReadAhead(o.child)
 	// Prefer the scan for the first physical locked relation so that
 	// the TID tracked by drainAndStamp comes from the right table.
 	// This matters when the locked table is not the leftmost scan leaf
@@ -805,6 +943,13 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 				if exprRefsColumnOrOuter(k) {
 					probeRowLocal = false
 					break
+				}
+			}
+			// M0145-0029: a SAOP probe's second-column bounds are folded
+			// by indexScanPredicate too, so they must be row-local as well.
+			for _, b := range []optimizer.Expr{ix.plan.LowKey, ix.plan.HighKey} {
+				if b != nil && exprRefsColumnOrOuter(b) {
+					probeRowLocal = false
 				}
 			}
 		}
@@ -907,7 +1052,17 @@ func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 	// lock waits on the pg_class delete xmax, then finds the tuple gone once the
 	// DROP commits. intra-grant-inplace perm 10 (sfu3 waits behind drop1). Design
 	// 0118-0117.
-	return waitTablePendingDrop(o.ctx, relOID)
+	if ee := waitTablePendingDrop(o.ctx, relOID); ee != nil {
+		return ee
+	}
+	// The wait released: if the DROP committed, the pg_class tuple this rowmark
+	// targets is gone and the drain below must yield 0 rows, not re-resolve
+	// 'rel'::regclass to a catalog miss (42P01). A surviving entry means the
+	// drop aborted — drain normally and the row is found. Design 0118-0117.
+	if _, _, found := im.LookupTableByOIDAllDBs(relOID); !found {
+		o.pgClassRelDropped = true
+	}
+	return nil
 }
 
 // pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in
@@ -979,7 +1134,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 				}
 				for i, v := range newLockedCols {
 					pos := lk.ColOffset + i
-					if pos < len(merged) {
+					if len(lk.ColPos) > i {
+						pos = lk.ColPos[i] // M0143-0009: resolved post-injection position
+					}
+					if pos >= 0 && pos < len(merged) {
 						merged[pos] = v
 					}
 				}
@@ -994,10 +1152,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 					}
 				}
 			}
-			// M0128-P6.1: trim ctid columns — the schema returned by
-			// o.Schema() (i.e. o.plan.Output()) already strips them,
-			// so the row must match.
-			merged = merged[:len(o.Schema())]
+			// M0128-P6.1 / M0143-0009: trim resjunk ctid columns at their
+			// real positions — the schema returned by o.Schema() (i.e.
+			// o.plan.Output()) already strips them, so the row must match.
+			merged = stripJunkCols(merged, o.junkPos)
 			ms := SlotFromRow(o.Schema(), merged)
 			ms.hasCTID = true
 			ms.ctidBlock = uint32(entry.newPtr.Block)
@@ -1005,13 +1163,10 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 			return ms, nil
 		}
 	}
-	// M0128-P6.1: trim ctid columns from the pending row so it matches
-	// the stripped schema (NumCtidCols is 0 when no ctid was wired, so
-	// this is a no-op for the pre-M0128 path).
-	row := entry.row
-	if n := o.plan.NumCtidCols; n > 0 && len(row) > n {
-		row = row[:len(row)-n]
-	}
+	// M0128-P6.1 / M0143-0009: trim resjunk ctid columns at their real
+	// positions so the pending row matches the stripped schema (no-op when
+	// no ctid was wired).
+	row := stripJunkCols(entry.row, o.junkPos)
 	ms := SlotFromRow(o.Schema(), row)
 	if entry.haveTID {
 		ms.hasCTID = true
@@ -1031,7 +1186,12 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
 	successCount := 0
-	for {
+	// pgClassRelDropped (set in Open when the pending DROP this rowmark waited
+	// on committed): the child scan's 'rel'::regclass constant would re-resolve
+	// to a catalog miss — 42P01 — where PG's already-bound scan key just finds
+	// the pg_class tuple deleted and yields 0 rows. Skip the drain; the
+	// empty-pending rowmark retract below still runs. Design 0118-0117.
+	for !o.pgClassRelDropped {
 		// Stop once we have acquired enough successfully locked rows.
 		if o.maxDrain > 0 && successCount >= o.maxDrain {
 			_ = o.child.Close()

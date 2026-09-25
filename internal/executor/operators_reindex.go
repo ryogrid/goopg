@@ -158,6 +158,7 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 		} else if err := o.rebuildTableIndexes(tbl, o.stmt.Pos()); err != nil {
 			return nil, err
 		}
+		o.noticeIfNothingReindexed(tbl, name.Name)
 	case "SCHEMA":
 		// REINDEX SCHEMA rebuilds every btree index on every table in the
 		// schema, one relation at a time: a plain reindex holds a ShareLock
@@ -250,6 +251,36 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 	defer release()
 	dop := &ddlOp{ctx: o.ctx}
 	return dop.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+}
+
+// noticeIfNothingReindexed is ReindexTable's NOTICE (indexcmds.c): when the
+// table has no index to rebuild, PG says so. reindex_relation counts the
+// TOAST table's index too (REINDEX_REL_PROCESS_TOAST), so a table with a TOAST
+// relation never gets the notice. The CONCURRENTLY form has its own wording,
+// except on a temporary table, which PG reindexes by the plain path.
+// relname is the name as written, without its schema (relation->relname).
+func (o *reindexOp) noticeIfNothingReindexed(tbl *catalog.Table, relname string) {
+	// A partitioned parent goes through ReindexPartitions, which never emits
+	// this notice (verified on PG 18.3, with and without index-less
+	// partitions).
+	if tbl.PartitionMethod != "" && tbl.PartitionParentOID == 0 {
+		return
+	}
+	// System catalogs are served virtually here, so IndexesOnTable knows
+	// none of their indexes; every PG catalog has them (upstream
+	// reindex_catalog: REINDEX TABLE pg_class is silent).
+	if catalog.IsSystemRelation(tbl.OID) {
+		return
+	}
+	if len(o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))) > 0 ||
+		catalog.TableHasToastRelation(tbl) {
+		return
+	}
+	if o.stmt.Concurrently && !tbl.Temp {
+		o.ctx.AddNotice(fmt.Sprintf("table %q has no indexes that can be reindexed concurrently", relname))
+		return
+	}
+	o.ctx.AddNotice(fmt.Sprintf("table %q has no indexes to reindex", relname))
 }
 
 // rebuildTableIndexes rebuilds every btree index on tbl. Used by plain

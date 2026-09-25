@@ -7,7 +7,6 @@ import "testing"
 // (8) so the joinlist nests a sub-problem. Without the per-problem SJI
 // remap the link came back INNER (Q72 100 -> 84 rows on the SF0.5 oracle).
 func TestLeftLinkSurvivesCollapseSplit(t *testing.T) {
-	withPGShapedDP(t)
 	for _, n := range []int{4, 8, 9, 10, 11} {
 		names := make([]string, n)
 		rows := make([]int64, n)

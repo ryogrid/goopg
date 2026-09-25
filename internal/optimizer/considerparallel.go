@@ -38,6 +38,7 @@ package optimizer
 // -plan-only) and `make plan-gate`.
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -80,7 +81,27 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 		rel.ConsiderParallel = false
 		if s.parallelModeOK && i < len(s.relInfos) {
 			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat)
+			// M0145-0004: an appendrel leaf's rtekind arm is opaque to
+			// relConsiderParallel — a *SetOp leaf reads as `other` and
+			// fails closed. PG computes the appendrel's safety by walking
+			// the member rels (is_parallel_safe over the subquery's
+			// jointree); the SETOP rel createSetOpPaths stamped on the
+			// leaf node already carries exactly that result — the AND of
+			// the member rels' ConsiderParallel — so the leaf inherits
+			// it. The mark is only ever set on the jointree arm for a
+			// simple-UNION-ALL-admissible subquery.
+			if s.relInfos[i].appendrel {
+				if carrier, ok := rel.baseLeaf.(setOpBranchRelNode); ok {
+					if setOpRel := carrier.setOpBranchRel(); setOpRel != nil {
+						rel.ConsiderParallel = setOpRel.ConsiderParallel
+					}
+				}
+			}
 		}
+		// R54 Step-0: the S1 leaf record. Same searchCtx that owns the
+		// trace (relfromjoinlist.go), so the line lands in the problem's
+		// own block; nil-safe when the gate is off.
+		s.trace.baseCP(rel.Relids, rel.baseLeaf, rel.ConsiderParallel)
 		// The prebuilt path predates the flag (see above). Every path on the
 		// rel at this point is a base-rel scan with no children, so the stamp
 		// is exact for all of them.
@@ -167,7 +188,8 @@ func relConsiderParallel(leaf Node, tbl *catalog.Table, cat catalog.Catalog) boo
 			return false
 		}
 		if !exprsParallelSafe(cat, x.Key, x.LowKey, x.HighKey) ||
-			!exprListParallelSafe(cat, x.Keys) || !exprListParallelSafe(cat, x.SAOPKeys) {
+			!exprListParallelSafe(cat, x.Keys) || !exprListParallelSafe(cat, x.SAOPKeys) ||
+			!exprListParallelSafe(cat, x.RangePrefix) {
 			return false
 		}
 	case *IndexOnlyScan:
@@ -380,12 +402,22 @@ func joinrelConsiderParallel(s *searchCtx, rel1, rel2 *RelOptInfo, clauses []*re
 	if s == nil || !s.parallelModeOK || !rel1.ConsiderParallel || !rel2.ConsiderParallel {
 		return false
 	}
-	for _, ri := range clauses {
-		if ri == nil || !isParallelSafeExpr(ri.clause, s.cat) {
-			return false
+	return firstParallelUnsafeClause(clauses, s.cat) < 0
+}
+
+// firstParallelUnsafeClause is the clause-walk half of
+// joinrelConsiderParallel, extracted so R54 Step-0's admission record names
+// the failing clause through the SAME predicate the verdict uses — a separate
+// walk here would be a second implementation that could disagree with the
+// flag. Returns the first failing index, or -1 when every clause is safe.
+// Behaviour of the caller is unchanged: the loop above is this predicate.
+func firstParallelUnsafeClause(clauses []*restrictInfo, cat catalog.Catalog) int {
+	for i, ri := range clauses {
+		if ri == nil || !isParallelSafeExpr(ri.clause, cat) {
+			return i
 		}
 	}
-	return true
+	return -1
 }
 
 // isParallelSafeExpr is `is_parallel_safe` (clauses.c:706) reduced to the
@@ -528,10 +560,31 @@ var parallelRestrictedBuiltins = map[string]bool{
 // two can disagree only in the worker count of a path nothing consumes.
 func (s *searchCtx) addBaseRelPartialPaths() {
 	if s == nil || !s.parallelModeOK || len(s.joinrels) < 2 {
+		sub := "nrels"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		}
+		tracePVetoCtx(s, "base", 0, 0, 0, "B1", "sub="+sub)
 		return
 	}
 	for i, rel := range s.joinrels[1] {
 		if !rel.ConsiderParallel || i >= len(s.relInfos) {
+			sub := "no-relinfo"
+			if rel != nil && !rel.ConsiderParallel {
+				sub = "cp"
+			}
+			// Leaf kind is available pre-sizing (workers= is not — sizing
+			// is what this veto precedes — so B2 carries sub+leaf while B1,
+			// which fires before the loop with no rel in scope, stays
+			// sub-only). The nil guard is structural: traceRelids above is
+			// nil-safe but a field read on a nil rel would not be.
+			leaf := "other"
+			if rel != nil {
+				leaf = traceLeafKind(rel.baseLeaf)
+			}
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B2", "sub="+sub+" leaf="+leaf)
 			continue
 		}
 		tbl := s.relInfos[i].table
@@ -540,6 +593,13 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 			// Only RTE_RELATION leaves get a plain partial path; an index or
 			// bitmap leaf is the legacy rule-based planner's choice standing
 			// in for the relation, and a subtree leaf is not a relation.
+			sub := "not-seq"
+			if ok && tbl == nil {
+				sub = "nil-tbl"
+			} else if ok {
+				sub = "nil-scan-table"
+			}
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B3", "sub="+sub+" leaf="+traceLeafKind(rel.baseLeaf))
 			continue
 		}
 		// WORKER COUNT is sized on `baserel->pages` proper — baseRelPages,
@@ -552,6 +612,7 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 		}
 		workers := computeParallelWorkerForRel(s.cp, baseRelPages(tbl, relTuples), tableParallelWorkersReloption(tbl))
 		if workers <= 0 {
+			tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "B4", "leaf="+traceLeafKind(rel.baseLeaf)+" workers="+strconv.Itoa(workers))
 			continue
 		}
 		// COST is priced on the SAME inputs the serial seq scan of this rel
@@ -566,6 +627,7 @@ func (s *searchCtx) addBaseRelPartialPaths() {
 		// `c19-baserel-scan-priced-on-output-rows`).
 		pages, tuples, numQualOps := baseSeqScanCostInputs(s.relInfos[i], rel.baseLeaf, rel.Rows, rel.Width)
 		addPartialSeqScanPath(rel, s.cp, pages, tuples, numQualOps, workers)
+		tracePVetoCtx(s, "base", traceRelids(rel), 0, 0, "admitted", "leaf="+traceLeafKind(rel.baseLeaf)+" workers="+strconv.Itoa(workers))
 	}
 }
 

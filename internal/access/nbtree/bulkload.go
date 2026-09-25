@@ -96,7 +96,7 @@ func BulkCreateWithXID(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 // All entries are stored as individual items even when keys repeat.
 // Used in tests and benchmarks to measure the space savings from dedup.
 func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: adaptPoolLogSplit(pool)}
+	bt := &BTree{pool: pool, rel: rel, logSplit: adaptPoolLogSplit(pool), sharedSplitMu: pool.BTreeStructuralLock(rel)}
 	metaSlot, metaBlk, err := pool.PinNew(rel)
 	if err != nil {
 		return nil, fmt.Errorf("btree bulk noDedup: alloc meta: %w", err)
@@ -191,7 +191,7 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 
 // BulkCreateWithOptions is BulkCreate with explicit Options.
 func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, sharedSplitMu: pool.BTreeStructuralLock(rel)}
 
 	// Ensure the relation file starts at block 0.  A previous failed
 	// bulk build or WAL replay (recovery after a crash that left WAL

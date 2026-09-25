@@ -112,6 +112,48 @@ func sizeDistinctRelFromNode(rel *RelOptInfo, distinctNode *Distinct) {
 	rel.AvgVarBytes = nodeAvgVarBytes(cols)
 }
 
+// distinctOutputSatisfiesOrder reports whether a DISTINCT node's output
+// already delivers a required ORDER BY, making the M0097-0046 outer Sort
+// redundant (R84). Sound iff ALL of the following hold:
+//
+//   - out is *Distinct (type-gate, fail-closed): its executor,
+//     distinctOp, hash-dedups then ALWAYS re-sorts ascending,
+//     NULLs last, over all columns — input order is destroyed,
+//     so the delivered order is exactly (c0 ASC NL, c1 ASC NL,
+//     …). *DistinctOn streams input order instead (different
+//     operator, different argument — out of scope here).
+//   - every required key is ASC with nulls-last (read from the
+//     effective SortKey entries — sortByNullsFirst already
+//     applied — never the raw parser flags).
+//   - the required keys are a positional prefix of the output:
+//     key i is a ColumnRef with Index == i, for positions
+//     0..n-1 in order. A full-row lexicographic ASC/NL order
+//     satisfies exactly its prefixes — ORDER BY (c1) alone is
+//     NOT satisfied by a (c0,c1) ordering.
+//
+// Anything else keeps the Sort. In particular DESC, explicit
+// NULLS FIRST, non-ColumnRef keys, and non-prefix keys all
+// decline — root-0036/DESC behavior is preserved by
+// construction.
+func distinctOutputSatisfiesOrder(out Node, outerKeys []SortKey) bool {
+	if _, ok := out.(*Distinct); !ok {
+		return false
+	}
+	if len(outerKeys) == 0 {
+		return false
+	}
+	for i, k := range outerKeys {
+		if k.Desc || k.NullsFirst {
+			return false
+		}
+		cr, ok := k.Expr.(*ColumnRef)
+		if !ok || cr.Index != i {
+			return false
+		}
+	}
+	return true
+}
+
 // distinctAllColKeys is one ascending SortKey per output column — the input
 // order a streaming dedup consumes (and the Sort the producer stacks when
 // the input does not deliver it).
@@ -124,6 +166,39 @@ func distinctAllColKeys(child Node) []SortKey {
 			Desc:       false,
 			NullsFirst: false,
 		})
+	}
+	return keys
+}
+
+// distinctClauseKeys is transformDistinctClause's distinct-clause order
+// (parse_clause.c) for SELECT DISTINCT with an ORDER BY: each ORDER BY item
+// first, keeping its direction and NULLS placement, then every output
+// column the ORDER BY did not name, ascending, in output order. PG requires
+// every SELECT DISTINCT sort key to be an output column (42P10 otherwise),
+// so an ORDER BY key that is not a plain output-column reference returns
+// nil — the caller keeps the all-columns-ascending default.
+func distinctClauseKeys(orderKeys []SortKey, cols Schema) []SortKey {
+	if len(orderKeys) == 0 {
+		return nil
+	}
+	seen := make([]bool, len(cols))
+	keys := make([]SortKey, 0, len(cols))
+	for _, k := range orderKeys {
+		cr, ok := k.Expr.(*ColumnRef)
+		if !ok || cr.Index < 0 || cr.Index >= len(cols) {
+			return nil
+		}
+		if seen[cr.Index] {
+			continue
+		}
+		seen[cr.Index] = true
+		c := cols[cr.Index]
+		keys = append(keys, SortKey{Expr: &ColumnRef{Index: cr.Index, Name: c.Name, Type: c.Type}, Desc: k.Desc, NullsFirst: k.NullsFirst})
+	}
+	for i, c := range cols {
+		if !seen[i] {
+			keys = append(keys, SortKey{Expr: &ColumnRef{Index: i, Name: c.Name, Type: c.Type}})
+		}
 	}
 	return keys
 }
@@ -156,21 +231,47 @@ func distinctCost(inputStartup, inputTotal, inputRows, outputRows float64, cp co
 // for goopg's one input: hashed always, unique-over-sorted always (over
 // the producer-stacked Sort — input order guaranteed by construction).
 // Single candidate per shape by construction.
+//
+// Insertion order is hashed first. PG's create_final_distinct_paths adds the
+// sorted (Unique) paths first, but in PG both survive add_path (the Unique
+// has pathkeys) and the choice is made after the ORDER BY stage has costed
+// its Sort. goopg elects ONE winner here, before ORDER BY, where addPath
+// keeps the first of two fuzzily-tied candidates — so PG's order alone elects
+// Unique on `SELECT DISTINCT a, b … ORDER BY a, b LIMIT 100`, where PG
+// elects HashAggregate + Sort. PG's order belongs with carrying both
+// candidates to the ordered rel (ledgered, M0141-S2b-4d).
 func addDistinctPaths(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+	hashed, unique := distinctCandidates(distinctRel, seed, distinctNode, child, cp, ps)
+	addPath(distinctRel, hashed, distinctHashedProducer)
+	addPath(distinctRel, unique, distinctUniqueProducer)
+}
+
+// addUnionDistinctPaths is the same pair for a UNION (distinct), in
+// generate_union_paths' order: the hashed aggregate first, then Sort ->
+// Unique (prepunion.c, `if (can_hash)` precedes `if (can_sort)`).
+func addUnionDistinctPaths(rel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+	hashed, unique := distinctCandidates(rel, seed, distinctNode, child, cp, ps)
+	addPath(rel, hashed, distinctHashedProducer)
+	addPath(rel, unique, distinctUniqueProducer)
+}
+
+// distinctCandidates builds the hashed and unique-over-sorted PathDistinct
+// candidates shared by addDistinctPaths and addUnionDistinctPaths.
+func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) (hashed, unique *Path) {
 	inputRows := seed.Rows
 	numDistinct := distinctRel.Rows
 
 	// HASHED: the executor hash-dedups the seed as-is (today's behavior).
 	// `enable_hashagg = off` marks it DisabledNodes (B-17a preference,
 	// never skip) instead of deleting it.
-	addPath(distinctRel, &Path{
+	hashed = &Path{
 		Kind: PathDistinct, Distinct: distinctNode,
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
 		Cost: costAgg(cp, AggStrategyHashed, inputRows, seed.Cost.Startup, seed.Cost.Total,
 			len(child.Output()), numDistinct, 0, 0, 0),
 		Children: []*Path{seed},
-	}, distinctHashedProducer)
+	}
 
 	// UNIQUE over the producer-stacked Sort (streaming adjacent dedup).
 	// This is the ONLY Sort-driven candidate: a "sorted Distinct" (hash
@@ -178,13 +279,27 @@ func addDistinctPaths(distinctRel *RelOptInfo, seed *Path, distinctNode *Distinc
 	// and be rejected as a duplicate by add_path — offering both would be
 	// noise, not choice. PG likewise builds Unique, not sorted-Agg, for
 	// the sorted DISTINCT shape.
-	sortInput := sortPathForBounded(seed, pathkeysForSortKeys(distinctAllColKeys(child)), cp, -1)
+	//
+	// With no output columns there is nothing to sort by: a zero-column UNION
+	// (SQL allows `SELECT FROM … UNION SELECT FROM …`; SELECT DISTINCT never
+	// reaches here without targets) takes the Unique straight over its input,
+	// as generate_union_paths does (`if (groupList != NIL) path =
+	// create_sort_path(...)`, prepunion.c) — M0141-S2b-4a.
+	sortInput := seed
+	keys := distinctAllColKeys(child)
+	if len(distinctNode.SortKeys) == len(keys) {
+		keys = distinctNode.SortKeys
+	}
+	if len(keys) > 0 {
+		sortInput = sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+	}
 	uniqueCost := distinctCost(sortInput.Cost.Startup, sortInput.Cost.Total, inputRows, numDistinct, cp)
-	addPath(distinctRel, &Path{
+	unique = &Path{
 		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: sortInput.DisabledNodes,
 		Cost:          uniqueCost,
 		Pathkeys:      sortInput.Pathkeys, Children: []*Path{sortInput},
-	}, distinctUniqueProducer)
+	}
+	return hashed, unique
 }

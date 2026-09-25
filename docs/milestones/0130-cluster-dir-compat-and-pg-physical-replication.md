@@ -8,9 +8,10 @@
 **Design of record:** `analysis/cluster-dir-level-compat/README.md` (2026-07-26 gap
 catalog; 15 gaps, 3 blockers / 7 significant / 5 non-blockers), deferral-ledger rows
 #27, #29, #50, #389–#393, #404, and the 2026-07-18 B5 feasibility row.
-**Prerequisites:** M-NIGHTLY is the standing filing obligation (highest priority,
-unconditional); **M0130 is the top-priority milestone after M-NIGHTLY** (user
-directive 2026-08-09). B4 is COMPLETE (B4.6 Stages 1–3b landed 2026-07-18 —
+**Prerequisites:** M-NIGHTLY is the standing filing obligation (unconditional).
+M0130 was the top-priority milestone after M-NIGHTLY by user directive of
+2026-08-09; **that ranking is historical — since 2026-09-14 the
+`## Current Priority` banner ranks the plan-parity group M0137–M0143 first.** B4 is COMPLETE (B4.6 Stages 1–3b landed 2026-07-18 —
 pg_database heap row, OID preservation, RM_DBASE + per-block FPIs, validated on a
 real PG 18.3 standby via `TestE2E_FailoverGoopgToPG`). M0113 (pg_index heap),
 M0102 (promotion / timeline history / slots), BASE_BACKUP, WalReceiver and the

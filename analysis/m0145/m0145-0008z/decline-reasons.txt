@@ -1,0 +1,12 @@
+# M0145-0008z: pull-up decline reasons (GOOPG_NLI_CENSUS=1 per query, HEAD 67abed075)
+## TPC-H Q18 (tpch-estimate-audit-arm --queries 18, PLAN_ONLY=1)
+      1 PULLUPCENSUS decline=any-body-not-simple
+      1 SUBLINKCENSUS route=jointree-posthoc
+## TPC-DS SF0.25 (private clone, per-query log offsets)
+== Q14
+      2 PULLUPCENSUS decline=SubqueryExpr@scalar
+      5 PULLUPCENSUS decline=any-body-leaf-(*optimizer.CTEScan)
+      5 SUBLINKCENSUS route=jointree-posthoc
+== Q23
+      8 PULLUPCENSUS decline=any-body-leaf-(*optimizer.CTEScan)
+      4 SUBLINKCENSUS route=jointree-posthoc

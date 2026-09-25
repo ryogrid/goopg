@@ -32,11 +32,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // ApplyWorker drives one subscription's apply loop. Construct
@@ -196,6 +196,12 @@ func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 		err = w.applyUpdate(m)
 	case 'T':
 		err = w.applyTruncate(m)
+	case 'M':
+		// MESSAGE is a logical-decoding plugin/extension channel, not a
+		// table mutation. PostgreSQL forwards it through pgoutput when the
+		// publisher enabled messages; accepting it here keeps an otherwise
+		// valid stream and its surrounding transaction intact.
+		err = nil
 	case 'C':
 		commitLSN = m.CommitLSN
 		err = w.applyCommit(m)

@@ -267,12 +267,59 @@ func (c *Cluster) Start() error {
 		}
 		select {
 		case <-exited:
-			return fmt.Errorf("start failed; process exited early (see %s)", c.logPath)
+			return fmt.Errorf("start failed; process exited early (see %s)%s",
+				c.logPath, c.startFailureLogTail())
 		default:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("start timeout after %s (see %s)", c.startupWait, c.logPath)
+	return fmt.Errorf("start timeout after %s (see %s)%s",
+		c.startupWait, c.logPath, c.startFailureLogTail())
+}
+
+// startFailureLogTailBytes is how much of cluster.log to inline into a start
+// failure. Enough to carry a bind error, a config rejection or a panic header;
+// small enough not to bury the assertion that reported it.
+const startFailureLogTailBytes = 4096
+
+// startFailureLogTail returns the tail of the cluster log, formatted for
+// appending to a start-failure error.
+//
+// WHY the log is INLINED rather than merely referenced: the error used to name
+// the cluster.log path and nothing else, and that path is inside a per-run
+// temporary tree. The nightly's testport stage runs in a throwaway worktree
+// under tmp/nightly-src-<run>/ which is deleted when the run finishes, so by
+// the time anyone read the failure the file it pointed at no longer existed.
+// TestPort_PgoutputInterop* failed with exactly this error on two consecutive
+// nights (AI-20260921-000212-008..-017, AI-20260922-004850-006..-015) and
+// neither night's root cause could be recovered, because the only evidence was
+// behind a deleted path. It does not reproduce on demand, so the realistic way
+// to learn the cause is to make the NEXT occurrence carry it.
+//
+// Best-effort by construction: a start failure is already the error being
+// reported, so a failure to read the log must never replace it. Any problem
+// here degrades to the bare path, which is what the caller had before.
+func (c *Cluster) startFailureLogTail() string {
+	if c.logPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(c.logPath)
+	if err != nil {
+		return fmt.Sprintf("\n--- cluster.log unreadable: %v ---", err)
+	}
+	if len(data) == 0 {
+		return "\n--- cluster.log is empty ---"
+	}
+	truncated := false
+	if len(data) > startFailureLogTailBytes {
+		data = data[len(data)-startFailureLogTailBytes:]
+		truncated = true
+	}
+	hdr := "--- cluster.log tail ---"
+	if truncated {
+		hdr = fmt.Sprintf("--- cluster.log tail (last %d bytes) ---", startFailureLogTailBytes)
+	}
+	return fmt.Sprintf("\n%s\n%s\n--- end cluster.log ---", hdr, string(data))
 }
 
 // Stop runs `goopg stop -D ...` with the requested shutdown mode.

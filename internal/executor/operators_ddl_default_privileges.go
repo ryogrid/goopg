@@ -45,6 +45,13 @@ func (o *ddlOp) execAlterDefaultPrivileges(s *parser.AlterDefaultPrivilegesStmt)
 			return &ExecError{Code: "0LP01", Pos: s.Pos(), Message: "cannot use IN SCHEMA clause when using GRANT/REVOKE ON LARGE OBJECTS"}
 		}
 	}
+	// ALTER DEFAULT PRIVILEGES … GRANT … TO PUBLIC WITH GRANT OPTION fails the
+	// same way a direct GRANT does: SetDefaultACL goes through
+	// merge_acl_with_grant (aclchk.c:208). Checked before the large-object
+	// early return, which PG does not have.
+	if err := checkGrantOptionToPublic(s.Revoke, s.WithGrantOption, s.Grantees); err != nil {
+		return err
+	}
 	// goopg has no pg_largeobject subsystem at all (no lo_create/lo_open/
 	// loread/lowrite/..., no heap-backed pg_largeobject(_metadata) storage —
 	// a separate, materially larger Effort-L feature per the deferral

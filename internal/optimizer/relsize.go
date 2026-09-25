@@ -169,11 +169,20 @@ func relSizeFallbackRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
 // Against the pre-filter stamping this replaces (both fields set to the raw
 // fallback), it differs in exactly one reachable state — an ANALYZEd relation
 // whose `RowCount` is 0 but whose per-column statistics are populated. In the
-// S-cold state the seam was built for, `Stats == nil` means
-// `columnStatsForChild` answers nil for every column, every clause reports
-// `reliable=false`, and `applyLocalFilterSelectivity` returns the fallback
-// unscaled — the two placements coincide, which is why this is a
-// re-derivation rather than a behaviour change (TestRelSizeFallback*Placement*).
+// S-cold state the seam was built for.
+//
+// R36 INVALIDATED the equivalence argument that stood here. It read: in the
+// S-cold state `Stats == nil` makes every clause report `reliable=false`, so
+// `applyLocalFilterSelectivity` returns the fallback UNSCALED and the two
+// placements coincide. That held only because of the reliability gate, and the
+// gate is gone — `set_baserel_size_estimates` multiplies unconditionally
+// (costsize.c:5348-5362), so a stats-less relation's block-derived `tuples` is
+// now scaled by whatever DEFAULT_* constant `clauselist_selectivity` punts to.
+// That is upstream's own cold behaviour (PG fills `rel->tuples` from
+// `estimate_rel_size`'s block arithmetic and then multiplies exactly as it
+// would with statistics), so the placement is still correct — but it is a
+// BEHAVIOUR CHANGE cold, not a re-derivation, and S-cold plans can move on it.
+// (TestRelSizeFallbackPlacementScalesWhenStatsAbsent pins the new answer.)
 func applyRelSizeFallback(info *baseRelInfo, binding rangeBinding, scan Node, local Expr, cat catalog.Catalog) {
 	if info == nil || info.filteredRows > 0 {
 		return

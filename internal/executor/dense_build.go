@@ -102,6 +102,7 @@ func (o *joinOp) ensureBuildCells(ctx *Context) {
 		return
 	}
 	o.buildCells = mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
+	o.buildCellsShared = false
 }
 
 // releaseBuildCells drops the stratum-D context. Always an owned (serial)
@@ -111,8 +112,14 @@ func (o *joinOp) releaseBuildCells() {
 	if o.buildCells == nil {
 		return
 	}
-	o.buildCells.Release()
+	// M0146-0002: a Parallel Hash participant donates its cells to the
+	// shared table other participants probe after it closes; statement end
+	// reclaims them through the parent chain.
+	if !o.buildCellsShared {
+		o.buildCells.Release()
+	}
 	o.buildCells = nil
+	o.buildCellsShared = false
 }
 
 // rowHasBuf reports whether any Datum in r carries a Go-heap Buf pointer.

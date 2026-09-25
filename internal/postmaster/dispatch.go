@@ -1049,6 +1049,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			}
 			return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", fs.CursorName))
 		}
+		// DISCARD ALL's session-layer half (the executor does the rest).
+		if ds, ok := stmt.(*parser.DiscardStmt); ok && ds.Mode == "ALL" {
+			s.discardAllSessionState(connTx, prepStmts)
+		}
 		// CLOSE cursor_name (M0097-0003).
 		if cs, ok := stmt.(*parser.CloseStmt); ok {
 			if connTx != nil {
@@ -1935,7 +1939,18 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("parallel_leader_participation", &ps.ParallelLeaderParticipation)
 	readBool("enable_gathermerge", &ps.EnableGatherMerge)
 
+	// M0145-0029 follow-up: the scan and sort toggles B-17a/B-17d count as
+	// Path.DisabledNodes (costsize.c:295, 560, 1023; enable_sort in
+	// cost_sort) were never read from the session, so `SET enable_seqscan =
+	// off` reached only the rule-based scan choice (catalog DisableSeqScan)
+	// and the cost-based search priced every path as enabled — measured on
+	// both pipelines with GOOPG_PGSHAPED_DP_TRACE: disabled=0 on every path.
+	readBool("enable_seqscan", &ps.EnableSeqScan)
+	readBool("enable_indexscan", &ps.EnableIndexScan)
+	readBool("enable_bitmapscan", &ps.EnableBitmapScan)
+	readBool("enable_sort", &ps.EnableSort)
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
+	readBool("enable_parallel_hash", &ps.EnableParallelHash)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
@@ -2049,6 +2064,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		float(ps.EffectiveCacheSize),
 		strconv.FormatInt(ps.WorkMem, 10),
 		bit(ps.EnableHashJoin),
+		bit(ps.EnableParallelHash),
 		bit(ps.EnableMergeJoin),
 		bit(ps.EnableNestLoop),
 		bit(ps.EnableSort),
@@ -3878,41 +3894,11 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
-	// Emit accumulated NOTICE messages before CommandComplete. M0097-0008.
-	for _, msg := range ctx.TakeNotices() {
-		if nerr := w.WriteNoticeResponse([]libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "NOTICE"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
-			{Code: libpq.FieldSQLState, Value: "00000"},
-			{Code: libpq.FieldMessage, Value: msg},
-		}); nerr != nil {
-			return nerr
-		}
-	}
-	// Emit NOTICE+DETAIL messages (e.g. DROP CASCADE cascade list). M0097-0020.
-	for _, n := range ctx.TakeNoticesWithDetail() {
-		fields := []libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "NOTICE"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
-			{Code: libpq.FieldSQLState, Value: "00000"},
-			{Code: libpq.FieldMessage, Value: n.Message},
-		}
-		if n.Detail != "" {
-			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: n.Detail})
-		}
+	// Emit the statement's queued NOTICE / WARNING messages before
+	// CommandComplete (M0097-0008/0020/0021); executorNoticeFrames is shared
+	// with the extended path.
+	for _, fields := range executorNoticeFrames(ctx) {
 		if nerr := w.WriteNoticeResponse(fields); nerr != nil {
-			return nerr
-		}
-	}
-
-	// Emit accumulated WARNING messages before CommandComplete. M0097-0021.
-	for _, msg := range ctx.TakeWarnings() {
-		if nerr := w.WriteNoticeResponse([]libpq.ErrorField{
-			{Code: libpq.FieldSeverity, Value: "WARNING"},
-			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
-			{Code: libpq.FieldSQLState, Value: "55000"},
-			{Code: libpq.FieldMessage, Value: msg},
-		}); nerr != nil {
 			return nerr
 		}
 	}
@@ -3967,6 +3953,13 @@ func planCacheInvalidatingStmt(node optimizer.Node) bool {
 func commandTagFor(node optimizer.Node, op executor.Operator, rowCount int64) string {
 	switch n := node.(type) {
 	case *optimizer.DDL:
+		// A populating CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED
+		// VIEW completes with `SELECT <n>` (createas.c:349, matview.c:389).
+		if r, ok := op.(executor.DDLProcessedReporter); ok {
+			if processed, ok := r.DDLProcessed(); ok {
+				return fmt.Sprintf("SELECT %d", processed)
+			}
+		}
 		return ddlTag(n.Stmt)
 	case *optimizer.Insert:
 		return fmt.Sprintf("INSERT 0 %d", rowsAffected(op))
@@ -4014,6 +4007,11 @@ func transactionTag(v optimizer.TransactionVerb) string {
 func ddlTag(stmt parser.Stmt) string {
 	switch v := stmt.(type) {
 	case *parser.CreateTableStmt:
+		// CREATE TABLE AS … WITH NO DATA (the populating form reports
+		// SELECT <n> through DDLProcessed before ddlTag is consulted).
+		if v.SelectSource != nil {
+			return "CREATE TABLE AS"
+		}
 		return "CREATE TABLE"
 	case *parser.CreateIndexStmt:
 		return "CREATE INDEX"
@@ -4091,6 +4089,9 @@ func ddlTag(stmt parser.Stmt) string {
 			return tag
 		}
 	}
+	if tag, ok := stmtCommandTag(stmt); ok {
+		return tag
+	}
 	return "OK"
 }
 
@@ -4145,9 +4146,96 @@ func utilityTag(stmt parser.Stmt) string {
 	case *parser.ResetStmt:
 		return "RESET"
 	case *parser.DiscardStmt:
+		// cmdtaglist.h tags each target: DISCARD ALL / PLANS / SEQUENCES /
+		// TEMP (TEMPORARY is parsed as TEMP).
+		if v, ok := stmt.(*parser.DiscardStmt); ok && v.Mode != "" {
+			return "DISCARD " + v.Mode
+		}
 		return "DISCARD"
 	}
+	if tag, ok := stmtCommandTag(stmt); ok {
+		return tag
+	}
 	return "OK"
+}
+
+// stmtCommandTag is the CommandComplete tag of statement kinds that reach the
+// generic DDL/utility dispatch without an arm of their own in ddlTag or
+// utilityTag — before it every one of them completed with the placeholder
+// "OK", which no PostgreSQL client ever sees. Tags are
+// ./postgres/src/include/tcop/cmdtaglist.h's.
+func stmtCommandTag(stmt parser.Stmt) (string, bool) {
+	switch v := stmt.(type) {
+	case *parser.CreateFunctionStmt:
+		return "CREATE FUNCTION", true
+	case *parser.CreateProcedureStmt:
+		return "CREATE PROCEDURE", true
+	case *parser.AlterFunctionStmt:
+		switch {
+		case v.IsRoutine:
+			return "ALTER ROUTINE", true
+		case v.IsProcedure:
+			return "ALTER PROCEDURE", true
+		}
+		return "ALTER FUNCTION", true
+	case *parser.DropFunctionStmt:
+		return "DROP FUNCTION", true
+	case *parser.DropProcedureStmt:
+		return "DROP PROCEDURE", true
+	case *parser.CreateTriggerStmt:
+		return "CREATE TRIGGER", true
+	case *parser.DropTriggerStmt:
+		return "DROP TRIGGER", true
+	case *parser.CreateEventTriggerStmt:
+		return "CREATE EVENT TRIGGER", true
+	case *parser.AlterEventTriggerStmt:
+		return "ALTER EVENT TRIGGER", true
+	case *parser.CreateSequenceStmt:
+		return "CREATE SEQUENCE", true
+	case *parser.AlterSequenceStmt:
+		return "ALTER SEQUENCE", true
+	case *parser.CreateRuleStmt:
+		return "CREATE RULE", true
+	case *parser.AlterRuleRenameStmt:
+		return "ALTER RULE", true
+	case *parser.DropRuleStmt:
+		return "DROP RULE", true
+	case *parser.CreatePolicyStmt:
+		return "CREATE POLICY", true
+	case *parser.DropPolicyStmt:
+		return "DROP POLICY", true
+	case *parser.CreateMatViewStmt:
+		// WITH NO DATA; a populating one reports SELECT <n> via
+		// DDLProcessed before ddlTag is consulted.
+		return "CREATE MATERIALIZED VIEW", true
+	case *parser.RefreshMatViewStmt:
+		return "REFRESH MATERIALIZED VIEW", true
+	case *parser.CreatePublicationStmt:
+		return "CREATE PUBLICATION", true
+	case *parser.AlterPublicationOwnerStmt:
+		return "ALTER PUBLICATION", true
+	case *parser.DropPublicationStmt:
+		return "DROP PUBLICATION", true
+	case *parser.CreateSubscriptionStmt:
+		return "CREATE SUBSCRIPTION", true
+	case *parser.AlterSubscriptionOwnerStmt:
+		return "ALTER SUBSCRIPTION", true
+	case *parser.DropSubscriptionStmt:
+		return "DROP SUBSCRIPTION", true
+	case *parser.CreateAccessMethodStmt:
+		return "CREATE ACCESS METHOD", true
+	case *parser.AlterOperatorSetStmt:
+		return "ALTER OPERATOR", true
+	case *parser.DoStmt:
+		return "DO", true
+	case *parser.ReindexStmt:
+		return "REINDEX", true
+	case *parser.ClusterStmt:
+		return "CLUSTER", true
+	case *parser.LockTableStmt:
+		return "LOCK TABLE", true
+	}
+	return "", false
 }
 
 func rowsAffected(op executor.Operator) int64 {
@@ -4593,19 +4681,17 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 
 	// Determine which rows to emit based on direction and position.
 	//
-	// Cursor position model (PostgreSQL semantics, M0097-0042, corrected by M0134-0056):
-	//   pos=0       = BOF (before first row)
-	//   pos=1..N    = AT row k; next FORWARD returns rows[k..], next BACKWARD returns rows[k-1]
-	//   pos=N+1     = EOF (past last row); FORWARD returns nothing
+	// Cursor position model (PostgreSQL semantics, M0097-0042; the BACKWARD
+	// side corrected 2026-09-18 — M0134-0056's "always exclude rows[pos-1]"
+	// formula was wrong, see the FETCH BACKWARD comment below for the fix):
+	//   cur.Pos     = PostgreSQL tuplestore's `current` (next array index to
+	//                 read forward)
+	//   cur.AtEnd   = PostgreSQL tuplestore's `eof_reached` (a forward fetch
+	//                 has run off the end; cleared by any BACKWARD fetch)
 	//
 	// FETCH FORWARD n from pos P: return rows[P..P+n-1] (0-indexed), new pos = min(P+n, N)
 	//   (where N = total rows; we use N not N+1 as EOF sentinel because len(cur.Rows) == N)
-	// FETCH BACKWARD n (finite) from pos P: the row at index P-1 is the CURRENT row (already
-	//   returned by the preceding fetch) and must NOT be re-returned. Return
-	//   rows[P-1-n..P-2] reversed (nearest-first), new pos = max(P-n, 1). Only BACKWARD ALL
-	//   includes the current row. M0134-0056.
-	// FETCH BACKWARD ALL from pos P: return rows[0..P-1] reversed (includes the current row),
-	//   new pos = 0 (BOF)
+	// FETCH BACKWARD [n|ALL]: see the tuplestore_gettuple port below.
 	// FETCH FORWARD ALL from pos P: return rows[P..N-1], new pos = N (EOF)
 	total := len(cur.Rows)
 	fetchAll := count < 0
@@ -4633,46 +4719,41 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 			// last row (M0134-0074).
 			cur.AtEnd = (len(rowsToSend) == 0)
 		}
-	} else if fetchAll {
-		// FETCH BACKWARD ALL: includes the current row (index cur.Pos-1).
-		end := cur.Pos // exclusive upper bound for 0-indexed slice
-		if end > total {
-			end = total
-		}
-		start := 0 // go all the way to BOF
-		// The rows from start..end-1 in reverse order.
-		n := end - start
-		rev := make([]executor.Row, n)
-		for i := 0; i < n; i++ {
-			rev[i] = cur.Rows[start+n-1-i]
-		}
-		rowsToSend = rev
-		cur.Pos = 0 // BOF
-		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 	} else {
-		// FETCH BACKWARD n (finite): exclude the current row (index cur.Pos-1) from the
-		// window — it was already returned by the preceding fetch. M0134-0056.
-		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
-		if cur.Pos == 0 {
-			// already at BOF, nothing precedes
-			rowsToSend = nil
-		} else {
-			end := cur.Pos - 1 // exclusive bound; excludes the current row
-			if end > total {
-				end = total
+		// FETCH BACKWARD [n|ALL]: a direct port of PostgreSQL's in-memory
+		// tuplestore_gettuple backward branch
+		// (postgres/src/backend/utils/sort/tuplestore.c), called once per
+		// row instead of goopg's previous closed-form (and incorrect)
+		// "exclude cur.Pos-1" formula (M0134-0056). The real algorithm's
+		// first call after AtEnd (PG's eof_reached) jumps current to total
+		// WITHOUT charging a decrement — every later call decrements first,
+		// then returns rows[current-1]. That one-decrement asymmetry is
+		// exactly what M0134-0056's uniform formula missed: it always
+		// excluded rows[cur.Pos-1], so the row returned right after
+		// reaching AtEnd (via FETCH ALL, or a finite fetch that ran off the
+		// end) was silently skipped. FETCH BACKWARD ALL must loop until BOF
+		// rather than stop after `total` iterations — capping at `total`
+		// under-runs by exactly one when the entry state is AtEnd, because
+		// its first iteration doesn't consume a decrement either.
+		current := cur.Pos
+		eofReached := cur.AtEnd
+		for i := 0; fetchAll || i < int(count); i++ {
+			if eofReached {
+				current = total
+				eofReached = false
+			} else {
+				if current <= 0 {
+					break
+				}
+				current--
 			}
-			start := end - int(count)
-			if start < 0 {
-				start = 0
+			if current <= 0 {
+				break
 			}
-			n := end - start
-			rev := make([]executor.Row, n)
-			for i := 0; i < n; i++ {
-				rev[i] = cur.Rows[start+n-1-i]
-			}
-			rowsToSend = rev
-			cur.Pos = start + 1
+			rowsToSend = append(rowsToSend, cur.Rows[current-1])
 		}
+		cur.Pos = current
+		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 	}
 
 	var rowCount int64
@@ -4858,4 +4939,62 @@ func isCurrentOfDML(stmt parser.Stmt) bool {
 		return d.CurrentOf != ""
 	}
 	return false
+}
+
+// executorNoticeFrames drains the executor Context's queued messages into
+// NoticeResponse field sets, in the order both wire paths emit them before
+// CommandComplete: plain NOTICEs, NOTICEs with a DETAIL, plain WARNINGs
+// (55000), then WARNINGs with their own SQLSTATE and a HINT. The simple-query
+// dispatcher and the extended protocol's Execute share it, so a message an
+// operator queues reaches the client whichever protocol ran the statement.
+func executorNoticeFrames(ctx *executor.Context) [][]libpq.ErrorField {
+	if ctx == nil {
+		return nil
+	}
+	var out [][]libpq.ErrorField
+	for _, msg := range ctx.TakeNotices() {
+		out = append(out, []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+	}
+	for _, n := range ctx.TakeNoticesWithDetail() {
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: n.Message},
+		}
+		if n.Detail != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: n.Detail})
+		}
+		out = append(out, fields)
+	}
+	for _, msg := range ctx.TakeWarnings() {
+		out = append(out, []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "WARNING"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: libpq.FieldSQLState, Value: "55000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+	}
+	for _, wh := range ctx.TakeWarningsWithHint() {
+		code := wh.Code
+		if code == "" {
+			code = "01000"
+		}
+		fields := []libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "WARNING"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: libpq.FieldSQLState, Value: code},
+			{Code: libpq.FieldMessage, Value: wh.Message},
+		}
+		if wh.Hint != "" {
+			fields = append(fields, libpq.ErrorField{Code: libpq.FieldHint, Value: wh.Hint})
+		}
+		out = append(out, fields)
+	}
+	return out
 }

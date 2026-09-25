@@ -111,3 +111,62 @@ matching `stats.spec` from L2704:
   stats 2PC rung, design 0118-0127).
 - Later: index-scan `tuples_fetched`, VACUUM-driven `vacuum_count` /
   live/dead recompute, and SLRU stats (`pg_stat_slru`).
+
+## Update 2026-09-19 (M-NIGHTLY AI-…-004/-007/-011): getter-source repair — `n_dead_tup` reads the tiered entry, not the trigger store
+
+The 2PC-abort permutations of `stats.spec` (`s1_rollback_prepared_a` and
+`s2_rollback_prepared_a`, both plain and truncate variants) regressed at
+L2704/L2771/L2897/L2943: `n_dead_tup` read 6 where PG reports 8, and 1 where PG
+reports 2. The tiered counters were never wrong — `applyXactToPending`'s abort
+arm (`deltaDead += restored ins + upd`, mirroring `AtEOXact_PgStat_Relations` /
+`pgstat_twophase_postabort`) already computed exactly 8 and 2, as the unit
+tests pinned. The divergence lived in `expr.go`'s getter arm: the
+`pg_stat_get_dead_tuples` / `_ins_since_vacuum` / `_mod_since_analyze` triple
+read `triggerSnapshot` — the **non-transactional** autovacuum-trigger store —
+which bumps `dead` per update/delete at DML time and is never reconciled at
+abort (so it accumulates `upd + del`, the commit formula, and loses the
+truncdrop restore). Upstream has exactly one `PgStat_StatTabEntry.dead_tuples`,
+fed only by `delta_dead_tuples` at `pgstat_relation_flush_cb`.
+
+Fix — one PG tabentry, one goopg source:
+
+- `pg_stat_get_dead_tuples` now reads `c.deltaDead` (clamped ≥0) from the
+  flushed shared entry, the same source `pg_stat_get_live_tuples` already used.
+  The abort-fold math this rung's successor (0118-0131) built is finally what
+  the SQL surface reports: spec byte-identical again.
+- `pg_stat_get_ins_since_vacuum` reads a new `insSinceVacuum` shared field fed
+  at flush by the pending entry's *attempted* `tuples_inserted` (aborted
+  inserts count — `pgstat_relation_flush_cb`'s own comment calls the extra
+  autovacuum triggers not worth a separate field), reset to zero by a
+  committed truncdrop or by `reportVacuum`.
+- `pg_stat_get_mod_since_analyze` reads a new `changedTuples` field fed by the
+  commit fold (`ins + upd + del`; an abort generates no change events —
+  `changed_tuples` is not reset by truncdrop) and zeroed by `reportAnalyze`.
+- `pg_stat_get_vacuum_count` reads a real `vacuumCount` bumped by
+  `reportVacuum` (was hardwired 0).
+- `reportVacuum(oid, live, dead)` mirrors `pgstat_report_vacuum`: writes the
+  shared entry directly — measured live survivors, ~0 remaining dead,
+  `ins_since_vacuum = 0`, `vacuum_count++` — wired next to the existing
+  `resetVacuumTriggers` call in `operators_vacuum.go`.
+  `reportAnalyze(oid)` mirrors the `mod_since_analyze = 0` half of
+  `pgstat_report_analyze`, wired at both `resetAnalyzeTriggers` sites in
+  `operators_analyze.go`. (The analyze-time live/dead measured-overwrite stays
+  deferred — goopg's analyze scan does not count dead tuples.)
+- `UserTableTriggerStatsFunc` (the `pg_stat_user_tables` /
+  `pg_stat_all_tables` view columns `n_dead_tup` / `n_mod_since_analyze` /
+  `n_ins_since_vacuum`) is repointed to the same flushed shared entry, so view
+  and function getters cannot disagree — upstream they are one tabentry.
+
+The `relTriggerCounters` store remains as designed (F4 in
+`vacuum-autovacuum-parity/03-design.md`): it exists solely so the autovacuum
+launcher sees fresh DML counts without a periodic flush, and is still the
+documented approximation — aborted-xact corrections still do not reach it
+(ledgered).
+
+Verified: `TestPort_IsolationStats` PASS (all permutations byte-identical);
+`pgstat_relations_test.go` extended — commit/abort/truncate-commit/2PC wants
+now pin `changedTuples` + `insSinceVacuum`, plus new
+`TestRelStatsTruncateAbortRestores` (the L2897 row `3|9|4|2|0|4|2|0`) and
+`TestRelStatsReportVacuumAnalyze`; sibling isolation tests (prepared-transactions
+{,-cic}, vacuum-{skip-locked,concurrent-drop,conflict,no-cleanup-lock},
+TwoPhaseCommitSameBackend) all PASS; `go test -race ./internal/executor/` clean.

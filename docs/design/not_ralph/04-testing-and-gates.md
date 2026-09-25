@@ -11,7 +11,7 @@
 | oracle-diff (`scripts/pg-oracle-diff.sh`) | targeted goopg-vs-PG18.3 probes | spot checks for the wave's statements |
 | units suite (`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`) | whole-module minus cluster-backed pkgs | pre-commit bar, every commit |
 | pgbench smoke | hook-enforced CI-parity workload | automatic on commit; never bypassed |
-| tpch-spotcheck / tpcds SF0.5 | canonical row counts / fast regression sweep | cutover (P7) and any wave that could plausibly affect plans (it shouldn't — same AST — but cheap insurance) |
+| tpch-spotcheck / tpcds SF0.25 | canonical row counts / fast regression sweep | cutover (P7) and any wave that could plausibly affect plans (it shouldn't — same AST — but cheap insurance) |
 
 ## 2. Differential harness design
 
@@ -77,7 +77,7 @@ Regression beyond 2x on any input class stops the flip for investigation.
 | P3 DML writes | required | green | green | ≥ baseline | ≤ baseline+2x | oracle-diff probes for ON CONFLICT/RETURNING |
 | P4/P5 DDL waves | required | green | green | ≥ baseline | ≤ baseline+2x | HammerDB DDL replay parses; **initdb bootstrap SQL replay** (21 importer files exercise it) |
 | P6 utility | required | green | green | ≥ baseline | ≤ baseline+2x | pgbench simple-update path exercises SET/BEGIN; initdb replay |
-| P7 cutover | full corpus | green | green | ≥ baseline | ≤ baseline+2x | tpch-spotcheck + tpcds SF0.5 + full regress sweep |
+| P7 cutover | full corpus | green | green | ≥ baseline | ≤ baseline+2x | tpch-spotcheck + tpcds SF0.25 + full regress sweep |
 
 Wrapper-routing invariant (from 03 §2) is asserted by a dispatch unit test
 so later edits cannot route an inner statement out of an unrouted wrapper.

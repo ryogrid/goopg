@@ -172,12 +172,23 @@ closed:
 |---|---|---|---|
 | `shared_buffers` | 2048MB | 2048MB | PG was **512MB** — goopg had 4x the buffer memory |
 | `autovacuum` | on | on | goopg was **off** — different maintenance policy |
-| `work_mem` | 64MB | 64MB | already matched |
+| `work_mem` | 512MB | 512MB | was 64MB/64MB (2026-09-06 alignment); raised to **512MB on both** by the 2026-09-24 measurement-convention change |
 | `effective_cache_size` | 2GB | 2GB | already matched |
 
 Verified live rather than by reading the files: both engines report
-`shared_buffers = 262144` 8 kB slots, `autovacuum = on`, `work_mem = 64MB`,
+`shared_buffers = 262144` 8 kB slots, `autovacuum = on`, `work_mem = 512MB`,
 `effective_cache_size = 2GB`.
+
+**Measurement convention (owner decision 2026-09-24):** every measurement
+cluster — goopg AND PostgreSQL — carries `work_mem = 512MB` in its
+`postgresql.conf`, and no session `SET` may override it afterwards (the
+capture scripts verify via `SHOW` and refuse to run otherwise). This
+supersedes the previous arrangement (64MB in conf plus `SET
+work_mem='64MB'` pins in `scripts/capture-*.sh`): the conf line is now the
+single alignment mechanism, so ad-hoc `psql` sessions and canonical
+captures measure the same configuration. PG's own default is 4MB and
+goopg's GUC BootVal is 512MB — the convention deliberately measures
+neither engine's out-of-the-box default.
 
 (The mirror-image defect on TPC-DS — goopg at the 128MB default against PG's
 2GB — is recorded in `bench/tpcds/README.md`.)

@@ -83,6 +83,9 @@ type costParams struct {
 	// means the method is enabled; a disabled method still PRODUCES its path
 	// and increments Path.DisabledNodes, as PG 18 does.
 	enableHashJoin  bool
+	// enableParallelHash: enable_parallel_hash, a generation gate for the
+	// `parallel_hash = true` partial hash join (M0146-0002).
+	enableParallelHash bool
 	enableMergeJoin bool
 	enableNestLoop  bool
 	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
@@ -143,6 +146,7 @@ func defaultCostParams() costParams {
 		// is what let the two drift apart in the first place.
 		workMem:         hashsize.HashMemLimit(hashsize.DefaultMemLimitBytes, hashsize.DefaultHashMemMultiplier),
 		enableHashJoin:  true,
+		enableParallelHash: true,
 		enableMergeJoin: true,
 		enableNestLoop:  true,
 		enableSort:      true,
@@ -287,6 +291,14 @@ func qualEvalCost(cp costParams, numQuals int, tuples float64) float64 {
 // hand in the rel's `AvgVarBytes`; zero stays a legitimate value ("no
 // ANALYZE, or every column fixed-width") and changes nothing.
 func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64) Cost {
+	return costSortRunWithWidth(cp, inputRows, ncols, avgVarBytes, limitTuples, 0, "direct")
+}
+
+// costSortRunWithWidth is costSortRun with the path-target width that PG's
+// relation_byte_size consumes. Width is planner-only: Goopg's EntryBytes stays
+// the executor and default-off costing currency.
+func costSortRunWithWidth(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64, width int, caller string) Cost {
+	rawInputRows := inputRows
 	// "We want to be sure the cost of a sort is never estimated as zero, even
 	// if passed-in tuple count is zero. Besides, mustn't do log(0)..."
 	// (costsize.c) — PG clamps rather than returning zero, and a zero here
@@ -304,11 +316,39 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 	}
 	startup := comparisonCost * tuples * math.Log2(tuples)
 
-	if ncols > 0 && cp.workMem > 0 {
-		inputBytes := tuples * hashsize.EntryBytes(ncols, avgVarBytes)
-		outputBytes := output * hashsize.EntryBytes(ncols, avgVarBytes)
-		sortMemBytes := float64(cp.workMem)
-		if outputBytes > sortMemBytes {
+	currency := "goopg"
+	goopgInputBytes, goopgOutputBytes := 0.0, 0.0
+	pgInputBytes, pgOutputBytes := 0.0, 0.0
+	goopgBranch, pgBranch := "unknown-width", "unknown-width"
+	if cp.workMem > 0 {
+		goopgValid := ncols > 0
+		if goopgValid {
+			goopgInputBytes = tuples * hashsize.EntryBytes(ncols, avgVarBytes)
+			goopgOutputBytes = output * hashsize.EntryBytes(ncols, avgVarBytes)
+		}
+		// cost_tuplesort computes input_bytes before clamping tuples to two,
+		// then either reuses that exact input volume or computes a bounded
+		// output volume after the clamp. Calculate it even with the switch off
+		// so the trace can expose both currencies; elect it only with the flag.
+		pgValid := false
+		if input, ok := pgRelationByteSize(rawInputRows, width); ok {
+			pgInputBytes = input
+			pgOutputBytes = input
+			if limitTuples > 0 && limitTuples < tuples {
+				pgOutputBytes, pgValid = pgRelationByteSize(output, width)
+			} else {
+				pgValid = true
+			}
+		}
+		goopgBranch = sortByteBranch(cp, tuples, output, goopgInputBytes, goopgOutputBytes, goopgValid)
+		pgBranch = sortByteBranch(cp, tuples, output, pgInputBytes, pgOutputBytes, pgValid)
+		inputBytes, branch := goopgInputBytes, goopgBranch
+		if pgSortRelationBytesCostEnabled() && pgValid {
+			inputBytes, branch = pgInputBytes, pgBranch
+			currency = "pg"
+		}
+		switch branch {
+		case "disk":
 			// Disk-based sort of all the tuples (costsize.c:1936): the
 			// page/run math still sizes the INPUT — every tuple is
 			// written and re-read — while the branch itself is chosen on
@@ -316,7 +356,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			// never spills. Without a bound output == tuples and this
 			// is the old condition exactly.
 			npages := math.Ceil(inputBytes / blockSizeBytes)
-			nruns := inputBytes / sortMemBytes
+			nruns := inputBytes / float64(cp.workMem)
 			mergeorder := tuplesortMergeOrder(cp.workMem)
 			logRuns := 1.0
 			if nruns > mergeorder {
@@ -325,7 +365,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			npageaccesses := 2.0 * npages * logRuns
 			// "Assume 3/4ths of accesses are sequential, 1/4th are not."
 			startup += npageaccesses * (cp.seqPageCost*0.75 + cp.randomPageCost*0.25)
-		} else if tuples > 2*output || inputBytes > sortMemBytes {
+		case "bounded":
 			// Bounded heap-sort keeping just K tuples in memory
 			// (costsize.c:1960): N log2 K comparisons with the slightly
 			// higher constant PG tweaks for curve continuity at the
@@ -336,11 +376,103 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 			startup = comparisonCost * tuples * math.Log2(2.0*output)
 		}
 	}
+	tracePGSortRelationBytes(caller, rawInputRows, tuples, output, limitTuples, width,
+		goopgInputBytes, goopgOutputBytes, pgInputBytes, pgOutputBytes, goopgBranch, pgBranch, currency)
 
 	// "a small amount (arbitrarily set equal to operator cost) per extracted
 	// tuple" — NOT cpu_tuple_cost, because a Sort does no qual-checking or
 	// projection.
 	return Cost{Startup: startup, Total: startup + cp.cpuOperatorCost*tuples}
+}
+
+func sortByteBranch(cp costParams, tuples, output, inputBytes, outputBytes float64, valid bool) string {
+	if !valid || cp.workMem <= 0 {
+		return "unknown-width"
+	}
+	sortMemBytes := float64(cp.workMem)
+	if outputBytes > sortMemBytes {
+		return "disk"
+	}
+	if tuples > 2*output || inputBytes > sortMemBytes {
+		return "bounded"
+	}
+	return "memory"
+}
+
+// costIncrementalSort is `cost_incremental_sort` (costsize.c:2000-2126): the
+// cost of sorting input that already arrives ordered by a leading prefix of
+// the requested pathkeys, one group per distinct value of that prefix. It
+// estimates the cost of fully sorting a single average-sized group with
+// `costSortRunWithWidth` (the same `cost_tuplesort` this package already
+// uses for a from-scratch Sort — `sortPathForBounded`'s producer), then
+// blends that per-group price across `inputGroups` groups plus two small
+// per-tuple/per-group bookkeeping terms PG itself charges for detecting
+// group boundaries and resetting the tuplesort between groups.
+//
+// `inputGroups` is `estimate_num_groups`'s result over the presorted-key
+// prefix (`costsize.c:2078`) — this composition takes it as a caller-
+// supplied number rather than computing it internally, the same split
+// `costSortRunWithWidth` already uses for `ncols`/`avgVarBytes`/`width`
+// (caller-computed, not re-derived here). That keeps this function callable
+// with synthetic numbers in a unit test today; the still-unbuilt wiring step
+// (Finding 3, table row 3 of the S7 design doc) is what will call goopg's
+// `estimateNumGroups` over the presorted key list and pass the result in —
+// this function itself has zero production callers, same groundwork posture
+// as `pathkeysCountContainedIn`.
+//
+// `comparisonCost` is always 0 at PG's own call site (`costsize.c:3701`,
+// the merge-join outer-sort case, the only real caller `cost_incremental_sort`
+// has upstream): `cost_tuplesort` adds its own `2*cpu_operator_cost` to a
+// *local copy* of the parameter, so the 0 that reaches this function's
+// per-tuple overhead term is not a simplification, it is what upstream
+// actually does. `costSortRunWithWidth` already encodes that same "always
+// 0, always +2*cpu_operator_cost internally" convention, so this function
+// follows it rather than exposing a comparisonCost parameter nothing would
+// ever set to nonzero.
+func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inputGroups float64, ncols int, avgVarBytes float64, limitTuples float64, width int) Cost {
+	if inputTuples < 2.0 {
+		inputTuples = 2.0
+	}
+	// Defensive clamp only: PG's own `input_groups` source
+	// (`estimate_num_groups`) already guarantees `1 <= input_groups <=
+	// input_tuples`; this composition re-asserts that invariant on its
+	// caller-supplied number rather than trusting it, since a bad group
+	// count would divide by (near) zero below.
+	if inputGroups < 1.0 {
+		inputGroups = 1.0
+	}
+	if inputGroups > inputTuples {
+		inputGroups = inputTuples
+	}
+
+	inputRunCost := inputCost.Total - inputCost.Startup
+	groupTuples := inputTuples / inputGroups
+	groupInputRunCost := inputRunCost / inputGroups
+
+	group := costSortRunWithWidth(cp, groupTuples, ncols, avgVarBytes, limitTuples, width, "incremental-sort-group")
+	groupStartupCost := group.Startup
+	groupRunCost := group.Total - group.Startup
+
+	// "Startup cost of incremental sort is the startup cost of its first
+	// group plus the cost of its input."
+	startup := groupStartupCost + inputCost.Startup + groupInputRunCost
+
+	// "After we started producing tuples from the first group, the cost of
+	// producing all the tuples is given by the cost to finish processing
+	// this group, plus the total cost to process the remaining groups, plus
+	// the remaining cost of input."
+	run := groupRunCost + (groupRunCost+groupStartupCost)*(inputGroups-1) + groupInputRunCost*(inputGroups-1)
+
+	// "Incremental sort adds some overhead by itself. Firstly, it has to
+	// detect the sort groups. This is roughly equal to one extra copy and
+	// comparison per tuple." (comparisonCost folded in as 0 — see doc above.)
+	run += cp.cpuTupleCost * inputTuples
+
+	// "Additionally, we charge double cpu_tuple_cost for each input group to
+	// account for the tuplesort_reset that's performed after each group."
+	run += 2.0 * cp.cpuTupleCost * inputGroups
+
+	return Cost{Startup: startup, Total: startup + run}
 }
 
 // costAgg is `cost_agg` (costsize.c:2682) for SORTED and HASHED — C-15's
@@ -363,10 +495,15 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 // and differ only in startup (streams vs blocking), so sorted-wins-iff-
 // input-ordered falls out without a special case (costsize.c:2720-2732).
 //
-// No spill arm exists (see the NO-spill note at the function tail):
-// `aggregateOp` performs grouped aggregation in memory with no spill path,
-// so there is nothing to charge. inNcols/inAvgVarBytes are its future
-// inputs, kept so the resume does not re-plumb callers.
+// A spill arm DOES exist at the function tail (added by R3). `aggregateOp`
+// still aggregates in memory with no spill path; the arm's purpose is not to
+// predict goopg I/O but to express "this hash table does not fit", which the
+// tail comment explains. Both inNcols and inAvgVarBytes are LIVE inputs
+// (M0141-S2a-fix2r): together, via `hashsize.EntryBytes`, they decide whether
+// the arm fires and price its full-row entry width — the same PG-faithful
+// currency correction R120 shipped and R124 §7 deleted for measuring
+// net-neutral is reinstated permanently by owner ruling (see the tail
+// comment).
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {
@@ -399,22 +536,187 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	}
 	total := startup + finalPerGroup*groups + cp.cpuTupleCost*groups
 
-	// NO spill arm — deliberately, not an omission. PG's arm charges
-	// batches the executor actually writes; goopg's `aggregateOp`
-	// "performs grouped aggregation in memory"
-	// (operators_join_agg.go:1973) with no spill path at all, so every
-	// spill page charged here would be I/O that never happens — and a
-	// fictional charge flips real plans (measured: it drove Q3/Q10/Q13/Q18
-	// to sorted, Q13 5.67 s → 8.71 s, all four away from PG's hash). A
-	// memory-blind model that picks hash for a 100M-group query risks the
-	// OOM instead, but that failure already exists today and a fake I/O
-	// number does not fix it. Resume WITH executor spill support, pricing
-	// the batches the executor really writes (the JOIN spill currency in
-	// `spillPages` is the template, not PG's depth loop — goopg has no
-	// recursive hash partitioning).
-	// (inNcols/inAvgVarBytes are the spill arm's future inputs — kept so
-	// the resume does not re-plumb every caller.)
+	// SPILL ARM (R3, plan-parity-fix-take2) — `cost_agg`'s AGG_HASHED tail
+	// (costsize.c:2783-2840). This arm used to be absent, and the comment
+	// that stood here explained why: goopg's `aggregateOp` aggregates in
+	// memory with no spill path, so the pages charged here are I/O that
+	// never happens.
+	//
+	// Reinstated because the charge's PURPOSE is not to predict goopg's
+	// I/O — it is to express "this hash table does not fit". That fact is
+	// true of goopg too, and more so: goopg cannot spill in response to
+	// it. Without the arm a 100-million-group hash table priced exactly
+	// like a ten-group one while the sorted rival always paid a full Sort,
+	// so hash won every large grouping by construction. Measured over
+	// TPC-DS SF0.5: goopg emitted `GroupAggregate` 1x / `HashAggregate`
+	// 133x where PG 18.3 emits 100x / 29x, with the sorted candidate
+	// present on both sides. The arm steers those to `GroupAggregate`,
+	// whose input Sort goopg CAN spill — it removes an OOM exposure
+	// rather than adding one.
+	//
+	// The prior objection also recorded a timing move (Q13 5.67 s ->
+	// 8.71 s). Under this workstream's rule a plan that matches PG is not
+	// a regression however slow, and the parity half of that objection was
+	// measured against references later shown to be invalid (a stale
+	// serial PG fixture; a 128x work_mem gap) — see
+	// docs/design/not_ralph/plan_parity_fix_take2/r3-hashagg-spill/DESIGN.md §2.
+	//
+	// Note the arm is INERT below the memory threshold: `hashAggSetLimits`
+	// returns early when the groups fit, which collapses nbatches to 1 and
+	// depth to 0, so a grouping that fits prices bit-identically to before.
+	// Byte currency of this arm (M0137-0009, reinstated M0141-S2a-fix2r):
+	// `hashAggEntrySize`'s parameter is a tuple WIDTH and the `pages` term
+	// below cites `relation_byte_size(input_tuples, input_width)`. PG hands
+	// one and the same `input_width` to both (costsize.c:2801-2802, :2824),
+	// and the SORTED rival is priced in that same currency on both sides —
+	// PG via `cost_tuplesort` (costsize.c:1903), Goopg via
+	// `hashsize.EntryBytes` (48*ncols + 24 + avgVar) in
+	// `costSortRunWithWidth`. `hashsize.EntryBytes(inNcols, inAvgVarBytes)`
+	// is that same full-row currency, substituted here so the hashed-vs-
+	// sorted spill contest is priced in ONE currency rather than the
+	// payload-only figure this arm used to hand `hashAggEntrySize` alone.
+	//
+	// History: R120 shipped this exact correction
+	// (`hashAggTupleWidth`/`hashsize.EntryBytes` keyed on `inNcols`) behind
+	// default-off `GOOPG_HASHAGG_WIDTH_CURRENCY`, on the hypothesis that it
+	// needed pairing with ncols narrowing (R124) to be net-positive on
+	// TPC-DS. R124 §7 ran the pair and measured it identical to R120's arm
+	// alone, so R124 deleted the flag (r124-nontable-leaf-widths/REPORT.md
+	// §7) rather than carry it another round. M0141-S2a-fix2 re-attempted the
+	// identical substitution after fix1 supplied a live-at-cost-time
+	// `inNcols` (M0141-S2a-fix1's `agg.InputTarget` preview), measured it a
+	// SECOND time (still net-neutral on TPC-H, a lateral 3-category swing on
+	// TPC-DS Q31 that exactly cancelled fix1's own gain — see
+	// m0141-s2a-fix2-hashaggentrysize-currency-attempt.md), and reverted the
+	// code pending an owner ruling on category-neutral-but-PG-faithful
+	// changes. **M0141-S2a-fix2r (owner Q4) re-applies it permanently**: a
+	// PG-faithful currency correction is not withdrawn because the category
+	// scoreboard does not move in its favour, only because it produces wrong
+	// rows (it does not — the arm only ever charges extra I/O cost, never
+	// changes which rows a plan returns). Any query whose categories worsen
+	// under this arm is tracked as its own `Parent: M0141-S2a-fix2r` task,
+	// not grounds to revert this one.
+	if strategy == AggStrategyHashed && (inNcols > 0 || inAvgVarBytes > 0) {
+		// hashAggEntrySize adds its own MAXALIGN(SizeofMinimalTupleHeader)
+		// exactly as PG's hash_agg_entry_size does (nodeAgg.c:1706-1707).
+		// The (0, 0) case (inNcols == 0 && inAvgVarBytes == 0) still declines
+		// — `addDistinctPaths` has no per-column width estimate to hand this
+		// call, and there is no PG-faithful width to substitute for "unknown".
+		width := hashsize.EntryBytes(inNcols, inAvgVarBytes)
+		entry := hashAggEntrySize(nAggs, width)
+		memLimit, ngroupsLimit, numPartitions := hashAggSetLimits(cp, entry, groups)
+		nbatches := math.Max(groups*entry/memLimit, groups/ngroupsLimit)
+		nbatches = math.Max(math.Ceil(nbatches), 1)
+		if numPartitions < 2 {
+			numPartitions = 2
+		}
+		depth := math.Ceil(math.Log(nbatches) / math.Log(float64(numPartitions)))
+		if depth > 0 {
+			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`, in
+			// the same full-row currency as `entry` above.
+			pages := tuples * width / float64(blockSizeBytes)
+			// "HashAgg has somewhat worse IO behavior than Sort on typical
+			// hardware/OS combinations" — PG's explicit generic penalty.
+			written := pages * depth * 2.0
+			read := pages * depth * 2.0
+			// Writes accrue to startup AND total; reads only to total.
+			spillCPU := depth * tuples * 2.0 * cp.cpuTupleCost
+			startup += written*cp.randomPageCost + spillCPU
+			total += written*cp.randomPageCost + read*cp.seqPageCost + spillCPU
+		}
+	}
+
 	return Cost{Startup: startup, Total: total}
+}
+
+// hashAggEntrySize is `hash_agg_entry_size` (nodeAgg.c:1701): the bytes one
+// group occupies in the aggregate's hash table.
+//
+// Known PG divergence (R120): PG also adds `TupleHashEntrySize()`
+// (`sizeof(TupleHashEntryData)`, nodeAgg.c:1726-1730, executor.h:165)
+// unconditionally. goopg omits it. That is a pre-existing UNDER-charge and is
+// immaterial beside the `48*ncols` term, but this function claims PG fidelity,
+// so the gap is recorded rather than left for the next reader to rediscover.
+//
+// transitionSpace is 0 — goopg
+// has no per-aggregate transition-space estimate, and PG's own expression
+// degrades to the same when it is 0. Getting it wrong can only UNDER-charge,
+// never invent a spill that PG would not see.
+func hashAggEntrySize(numTrans int, tupleWidth float64) float64 {
+	const (
+		sizeofMinimalTupleHeader = 16 // MAXALIGN(SizeofMinimalTupleHeader)
+		perGroupDataSize         = 16 // sizeof(AggStatePerGroupData)
+		maxAlign                 = 8
+	)
+	tupleSize := float64(sizeofMinimalTupleHeader) + tupleWidth
+	// MAXALIGN(tupleSize)
+	tupleChunk := math.Ceil(tupleSize/maxAlign) * maxAlign
+	return tupleChunk + float64(numTrans*perGroupDataSize)
+}
+
+// hashAggSetLimits is `hash_agg_set_limits` (nodeAgg.c:1809). `cp.workMem` is
+// already `get_hash_memory_limit()` — work_mem times hash_mem_multiplier, in
+// bytes — so it is used directly.
+//
+// The early return is load-bearing for R3: when the groups fit, the caller's
+// nbatches collapses to 1 and its depth to 0, so the spill arm charges exactly
+// nothing and no in-memory grouping can change plan.
+func hashAggSetLimits(cp costParams, entrySize, inputGroups float64) (memLimit, ngroupsLimit float64, numPartitions int) {
+	hashMemLimit := float64(cp.workMem)
+	if hashMemLimit <= 0 || entrySize <= 0 {
+		// No budget to reason about: behave as if everything fits, which is
+		// the pre-R3 price.
+		return math.MaxFloat64, math.MaxFloat64, 0
+	}
+	if inputGroups*entrySize <= hashMemLimit {
+		return hashMemLimit, hashMemLimit / entrySize, 0
+	}
+	npartitions := hashAggChooseNumPartitions(hashMemLimit, inputGroups, entrySize)
+	// HASHAGG_READ_BUFFER_SIZE + HASHAGG_WRITE_BUFFER_SIZE * npartitions,
+	// both BLCKSZ.
+	partitionMem := float64(blockSizeBytes) + float64(blockSizeBytes)*float64(npartitions)
+	// "Don't set the limit below 3/4 of hash_mem."
+	if hashMemLimit > 4*partitionMem {
+		memLimit = hashMemLimit - partitionMem
+	} else {
+		memLimit = hashMemLimit * 0.75
+	}
+	if memLimit > entrySize {
+		ngroupsLimit = memLimit / entrySize
+	} else {
+		ngroupsLimit = 1
+	}
+	return memLimit, ngroupsLimit, npartitions
+}
+
+// hashAggChooseNumPartitions is `hash_choose_num_partitions` (nodeAgg.c:412):
+// enough partitions that each is likely to fit, capped so the open partition
+// files cannot themselves eat more than a quarter of hash_mem, then rounded UP
+// to a power of two (PG derives the count from ceil(log2()) bits).
+func hashAggChooseNumPartitions(hashMemLimit, inputGroups, entrySize float64) int {
+	const (
+		partitionFactor = 1.50 // HASHAGG_PARTITION_FACTOR
+		minPartitions   = 4    // HASHAGG_MIN_PARTITIONS
+		maxPartitions   = 1024 // HASHAGG_MAX_PARTITIONS
+	)
+	partitionLimit := (hashMemLimit*0.25 - float64(blockSizeBytes)) / float64(blockSizeBytes)
+	memWanted := partitionFactor * inputGroups * entrySize
+	dpartitions := 1 + memWanted/hashMemLimit
+	if dpartitions > partitionLimit {
+		dpartitions = partitionLimit
+	}
+	if dpartitions < minPartitions {
+		dpartitions = minPartitions
+	}
+	if dpartitions > maxPartitions {
+		dpartitions = maxPartitions
+	}
+	// my_log2 is ceil(log2(n)); the count is then 1 << bits.
+	bits := int(math.Ceil(math.Log2(dpartitions)))
+	if bits < 0 {
+		bits = 0
+	}
+	return 1 << bits
 }
 
 // tuplesortMergeOrder is `tuplesort_merge_order` (tuplesort.c): how many input
@@ -484,9 +786,41 @@ type hashJoinInputs struct {
 	// statistic" and suppresses the bucket-walk term entirely. take2 P2-11.
 	innerBucketSize float64
 
+	// final carries the fail-closed INNER-only evidence that selects the
+	// inner-unique branch of final_cost_hashjoin. Its zero value preserves the
+	// existing non-unique bucket-walk result exactly.
+	final hashJoinFinalCostInput
+
+	// outerWidth / innerWidth are emitted PG-style byte widths. R91 feeds the
+	// inner one to planner-private virtual buckets. R108's default-off
+	// experiment additionally uses both only for PG's planner page-size spill
+	// price; neither field can affect Goopg executor map sizing.
+	outerWidth, innerWidth int
+
 	// `hashsize.Choose`. Populated from RelOptInfo.AvgVarBytes; zero when no
 	// ANALYZE stats exist (correct for fixed-width relations). M0128-P3.1.
 	outerAvgVarBytes, innerAvgVarBytes float64
+
+	// parallelHash is initial_cost_hashjoin's `parallel_hash` (costsize.c:4165):
+	// innerRows is then the PER-PARTICIPANT count of a partial inner, and only
+	// the table geometry uses the total (inner_path_rows_total = rows ×
+	// get_parallel_divisor, :4209-4210) under the combined budget
+	// (ExecChooseHashTableSize's try_combined_hash_mem: hash_mem ×
+	// (parallel_workers + 1), nodeHash.c:699-707). Every CPU term keeps the
+	// per-participant rows, as PG's does. M0146-0002.
+	parallelHash    bool
+	innerRowsTotal  float64
+	parallelWorkers int
+}
+
+// hashGeometryInputs returns the inner row count and memory budget the hash
+// table geometry is solved for: the path's own rows and hash_mem, or — for a
+// Parallel Hash — the total rows and the combined budget of every participant.
+func (in hashJoinInputs) hashGeometryInputs(cp costParams) (float64, int64) {
+	if !in.parallelHash {
+		return in.innerRows, cp.workMem
+	}
+	return in.innerRowsTotal, cp.workMem * int64(in.parallelWorkers+1)
 }
 
 // hashJoinCost reproduces initial_cost_hashjoin + final_cost_hashjoin
@@ -533,10 +867,47 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// innerBucketSize == 0 means "no usable statistic"; the term is then
 	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
 	// before this change.
-	if in.innerBucketSize > 0 {
+	if in.final.innerUnique {
+		// PG's rint() uses round-to-even. The factor was derived once in total
+		// relation coordinates; outerRows is this serial or partial candidate's
+		// path coordinate.
+		outerMatched := math.RoundToEven(in.outerRows * in.final.outerMatchFrac)
+		if in.innerBucketSize > 0 {
+			innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
+			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
+			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+				outerMatched * bucketTuples * 0.5
+		}
+
+		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
+		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
+		// existing cpuOperatorCost*numHashClauses remains this model's surrogate
+		// for hash_qual_cost.per_tuple; no general QualCost model is implied.
+		geoRows, geoMem := in.hashGeometryInputs(cp)
+		if geometry, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok {
+			unmatched := in.outerRows - outerMatched
+			if unmatched > 0 {
+				bucketTuples := clampRowEst(in.innerRows / float64(geometry.virtualBuckets))
+				run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+					unmatched * bucketTuples * 0.05
+			}
+		}
+	} else if in.innerBucketSize > 0 {
 		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
 		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
 			in.outerRows * bucketTuples * 0.5
+	}
+
+	// R108 is deliberately opt-in. PG decides hash-table batches using packed
+	// HashJoinTuple geometry, then prices its batch I/O through the distinct
+	// heap-tuple page_size formula. It must not become an executor claim: map
+	// capacity and actual spills remain hashsize.Choose below.
+	if geometry := pgHashTupleSpillGeometryFor(in, cp); geometry.usePG {
+		if geometry.hash.numBatches > 1 {
+			startup += cp.seqPageCost * geometry.innerPages
+			run += cp.seqPageCost * (geometry.innerPages + 2*geometry.outerPages)
+		}
+		return Cost{Startup: startup, Total: startup + run}
 	}
 
 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
@@ -609,21 +980,29 @@ func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerR
 	// accumulated: a zero path row count would otherwise zero the whole
 	// per-tuple charge.
 	ntuples := math.Max(outerRows, 1) * math.Max(innerRows, 1)
-	// take2 P2-07, cost_nestloop (costsize.c:3304-3327):
+	// take2 P2-07, cost_nestloop (costsize.c:3304-3327), plus the
+	// rescan-STARTUP term initial_cost_nestloop charges beside it
+	// (costsize.c:3299-3302):
 	//
 	//     inner_run_cost        = inner.total - inner.startup
 	//     inner_rescan_run_cost = rescan.total - rescan.startup
 	//     run_cost += inner_run_cost
 	//     if outer_path_rows > 1:
+	//         run_cost += (outer_path_rows - 1) * inner_rescan_start_cost
 	//         run_cost += (outer_path_rows - 1) * inner_rescan_run_cost
 	//
 	// The inner is scanned ONCE and rescanned outerRows-1 times, and both are
 	// RUN costs: the inner's startup is paid once, at the join's startup, and
-	// was previously being charged again on every outer row.
+	// was previously being charged again on every outer row. The rescan
+	// STARTUP (index descent, repaid per rescan) is the separate term below:
+	// folding it into innerRescanRun would subtract the descent from a
+	// descent-free run quantity (R69 slice (a) first cut did exactly that —
+	// caught by the optimizer suite before any gate ran).
 	innerRun := inner.Total - inner.Startup
 	innerRescanRun := innerRescanTotal - innerRescanStartup
 	run := (outer.Total - outer.Startup) + innerRun + cp.cpuTupleCost*ntuples
 	if outerRows > 1 {
+		run += (outerRows - 1) * innerRescanStartup
 		run += (outerRows - 1) * innerRescanRun
 	}
 	return Cost{Startup: startup, Total: startup + run}
@@ -753,13 +1132,17 @@ func indexProbeCost(cp costParams) float64 {
 }
 
 // indexProbeCostMultiplier scales indexProbeCost. PG's constants (multiplier 1)
-// under-cost goopg's NL-index probe — goopg materialises the whole TID list
-// eagerly per probe (ch. 06 §5), so an NL-probe of a large relation runs far
-// slower than PG's random_page_cost model predicts, and the cost-driven DP would
-// pick ruinous PG-shaped NL plans (measured: Q5/Q9 20-200x). This multiplier
-// recalibrates the probe cost toward goopg's in-memory reality so the DP prefers
-// a hash join over NL-probing a large outer. Overridable via
-// GOOPG_INDEX_PROBE_MULT for measurement.
+// under-cost goopg's NL-index probe. The original justification — that goopg
+// materialised the whole TID list eagerly per probe — was RETIRED by
+// M0142-0005b: the executor now streams leaf-grain batches through
+// nbtree.ScanCursor (index_getnext_tid's model), and the post-change two-arm
+// A/B reproduced B8 byte-for-byte (TPC-DS SF0.25 mult=1: scan-type 59→51,
+// join-order 91→88, qual-placement 20→24; TPC-H mult=1 still slides Q9/Q10/Q14
+// to NL+index probes where PG hashes). The residual is therefore a
+// cost-model gap — this scalar masks a real relative-pricing divergence
+// between goopg's per-probe formula and the hash-join alternative PG's
+// cost_index/cost_seqscan arithmetic produces — not executor speed. Filed as
+// M0142-0005c (recon). Overridable via GOOPG_INDEX_PROBE_MULT for measurement.
 //
 // **Calibrated to 2.0 on 2026-09-05** (C-20d). The knob had shipped at 1.0 —
 // exactly the value this comment says under-costs goopg's probes — because
@@ -778,8 +1161,8 @@ func indexProbeCost(cp costParams) float64 {
 // smaller departure from PG's constants that still buys the whole win —
 // raising it further is unjustified without evidence. Every other query moved
 // within the noise band. The multiplier stays a knob rather than becoming a
-// hard-coded 2 so the next recalibration (after the NL-probe execution work
-// this comment describes) can be measured the same way.
+// hard-coded 2 so the M0142-0005c cost-model recon can re-measure it the same
+// way — retirement to PG's 1.0 stays the goal once the residual is understood.
 var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
 
 // indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
@@ -797,6 +1180,19 @@ func indexProbeMultFromEnv(v string) float64 {
 		}
 	}
 	return indexProbeMultCalibrated
+}
+
+// SetIndexProbeCostMultiplier sets indexProbeCostMultiplier from a label an
+// operator would export as GOOPG_INDEX_PROBE_MULT, resolved through the SAME
+// indexProbeMultFromEnv production uses, and returns the restore. It exists
+// for executor tests that pin PG's index-vs-bitmap election, where PG prices
+// the two within 0.01 and the calibrated 2x would decide them (owner decision
+// 2026-09-24, M0145-0008 option (c)). Process-global, like SetGatherPathsMode:
+// the caller must run the returned restore.
+func SetIndexProbeCostMultiplier(label string) (restore func()) {
+	prev := indexProbeCostMultiplier
+	indexProbeCostMultiplier = indexProbeMultFromEnv(label)
+	return func() { indexProbeCostMultiplier = prev }
 }
 
 // indexProbeMultCalibrated is the validated default (see the block comment on

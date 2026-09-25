@@ -1,0 +1,8 @@
+# plan-diff: tmp/m0146-0005/s2/fireset-tpch/tpch/m0146-0005b-h-tpch-baseline.plans.txt -> tmp/m0146-0005/s2/fireset-tpch/tpch/m0146-0005b-h-tpch-candidate.plans.txt
+#   old: provenance not stamped
+#   new: provenance not stamped
+changed (7): Q2 Q3 Q5 Q7 Q9 Q18 Q20
+=== PLAN-SHAPE: queries=22 same=15 changed=7 added=0 removed=0 ===
+# join-method: Q9 hash+2 nestloop-2
+# join-method: Q18 hash+1 nestloop-1
+=== JOIN-METHOD-ELECTION: moved=2 into-nestloop=0 ===

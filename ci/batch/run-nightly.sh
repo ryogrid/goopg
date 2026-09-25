@@ -41,6 +41,42 @@ source "${BATCH_DIR}/lib/common.sh"
 
 want() { [[ ",${NIGHTLY_STAGES}," == *",$1,"* ]]; }
 
+# --- clean build+test source (METHODLOGY3 04-actions H1(d)) ----------------------
+# Go compilation used to run against the LIVE checkout, so a concurrent loop's
+# uncommitted WIP leaked into the nightly's binaries AND its test binaries —
+# mid-edit trees manufactured phantom "build broke mid-stage" action items
+# (AI-20260806-011323-002..-015, AI-20260914-235643-013/014,
+# AI-20260918-010720-001..005). Everything Go — `go build` and `go test`
+# alike — now runs from a detached worktree at the recorded HEAD (stages read
+# NIGHTLY_SRC_ROOT); scripts, data dirs, ports and logs stay under REPO_ROOT.
+# Untracked scratch (e.g. bak/) cannot leak in: the worktree carries only
+# tracked content.
+NIGHTLY_SRC_ROOT="${REPO_ROOT}/tmp/nightly-src-${RUN_ID}"
+remove_src_worktree() {
+    [[ -d "${NIGHTLY_SRC_ROOT}" ]] || return 0
+    git -C "${REPO_ROOT}" worktree remove --force "${NIGHTLY_SRC_ROOT}" >/dev/null 2>&1 || true
+}
+if ! git -C "${REPO_ROOT}" worktree add --detach "${NIGHTLY_SRC_ROOT}" HEAD \
+        > "${RUN_DIR}/src-worktree.log" 2>&1; then
+    progress "RUN" "ABORT: cannot create clean build worktree ${NIGHTLY_SRC_ROOT} — see src-worktree.log (refusing to build from the live tree)"
+    exit 4
+fi
+export NIGHTLY_SRC_ROOT
+# ./postgres is a submodule: the worktree carries only its (empty) gitlink
+# dir, but go-test stages running inside NIGHTLY_SRC_ROOT need the read-only
+# oracle fixtures (local_install tools, regress/isolation specs). Link the
+# real checkout in; `go list ./...` never follows the symlink, so no stray
+# packages appear.
+if [[ ! -e "${NIGHTLY_SRC_ROOT}/postgres/local_install" ]]; then
+    if [[ -d "${NIGHTLY_SRC_ROOT}/postgres" && ! -L "${NIGHTLY_SRC_ROOT}/postgres" ]]; then
+        rmdir "${NIGHTLY_SRC_ROOT}/postgres" 2>/dev/null || true
+    fi
+    if [[ ! -e "${NIGHTLY_SRC_ROOT}/postgres" ]]; then
+        ln -s "${REPO_ROOT}/postgres" "${NIGHTLY_SRC_ROOT}/postgres" 2>/dev/null \
+            || progress "RUN" "WARN: could not link postgres/ into ${NIGHTLY_SRC_ROOT} — testport fixture lookups will miss"
+    fi
+fi
+
 # --- meta.json ----------------------------------------------------------------
 sha="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 dirty="$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
@@ -93,6 +129,7 @@ kill_tree() {
 
 abort_cleanup() {
     local rc=$?
+    remove_src_worktree
     if [[ ${COMPLETED} -eq 0 ]]; then
         progress "RUN" "ABORTED (rc=${rc}) — killing lanes/stages and stopping nightly scopes"
         # Kill the lane subshells and any in-flight stage FIRST — otherwise a
@@ -167,11 +204,12 @@ commit_and_push_logs() {
 run_stage() {  # run_stage <name>  (records "<status> <elapsed>" in stages/<name>.status)
     local name="$1" t0=${SECONDS} rc=0 sp
     mkdir -p "${RUN_DIR}/${name}"
-    # Stamp the tree this stage is about to compile against. A stage whose fp
-    # differs from meta.json's `source_fp` ran on a DIFFERENT tree than
-    # preflight validated, so its failures are unattributable (see
-    # source_fingerprint in lib/common.sh). Written before the stage starts,
-    # so it survives a stage that dies.
+    # Stamp the LIVE tree's fingerprint at the stage boundary. Stages compile
+    # inside NIGHTLY_SRC_ROOT (the pinned sha), so drift no longer changes
+    # what a stage tests — the fp records that the live tree mutated mid-run
+    # for the summarizer's drift attribution (see source_fingerprint in
+    # lib/common.sh). Written before the stage starts, so it survives a
+    # stage that dies.
     source_fingerprint > "${RUN_DIR}/stages/${name}.fp" 2>/dev/null || true
     # Run the stage as a background child + wait: `wait` is interruptible, so
     # an INT/TERM to the orchestrator aborts promptly (mid-stage) instead of

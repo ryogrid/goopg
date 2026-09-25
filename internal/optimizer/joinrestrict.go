@@ -157,14 +157,14 @@ func relsSubset(sub, super RelSet) bool { return sub&^super == 0 }
 // buildRestrictInfos turns the DP's conjunct list into the search's clause
 // list. `conjuncts` and `inferredCount` are exactly what `buildJoinGraph`
 // receives (bushy.go:271): the last `inferredCount` entries are the ones
-// `inferAnchoredEqualities` synthesised. `cumOffsets` maps a ColumnRef's schema
+// `inferAnchoredEqualities` synthesised. `spans` maps a ColumnRef's schema
 // index to its FROM position, the same coordinate space `tableForCol` uses.
 //
 // A conjunct becomes a clause when it references two or more FROM items.
 // Single-rel and constant conjuncts are deliberately absent: they are already
 // inside the leaf nodes P5.1 wrapped, so admitting them here would let P5.6
 // charge their selectivity a second time.
-func buildRestrictInfos(conjuncts []Expr, inferredCount int, cumOffsets []int) *restrictInfoList {
+func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *restrictInfoList {
 	l := &restrictInfoList{}
 
 	// explicitEnd mirrors buildJoinGraph's split: conjuncts at or after it are
@@ -183,14 +183,14 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, cumOffsets []int) *
 	classKey := make([]*columnIdent, 0, len(conjuncts))
 
 	add := func(e Expr, inferred bool) {
-		relids, ok := relidsOfExpr(e, cumOffsets)
+		relids, ok := relidsOfExpr(e, spans)
 		if !ok || relLevel(relids) < 2 {
 			return
 		}
 		ri := &restrictInfo{clause: e, relids: relids, inferred: inferred, ecID: noEquivClass}
 		if bin, isBin := e.(*BinaryOp); isBin && bin.Op == parser.OpEq {
-			lr, lok := relidsOfExpr(bin.Left, cumOffsets)
-			rr, rok := relidsOfExpr(bin.Right, cumOffsets)
+			lr, lok := relidsOfExpr(bin.Left, spans)
+			rr, rok := relidsOfExpr(bin.Right, spans)
 			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) {
 				ri.isEquijoin = true
 				ri.leftKey, ri.rightKey = bin.Left, bin.Right
@@ -460,22 +460,53 @@ func (l *restrictInfoList) selectivityClauses(outer, inner RelSet) []*restrictIn
 	return oneClausePerEquivClass(l.clausesFor(outer, inner))
 }
 
+// leafSpan is one leaf's column-index range in the per-leaf table that
+// replaced the bare `cumOffsets []int` (M0142-0008a-3i-plumbing-b2 design
+// doc §25.3/§26): a REAL leaf's span is exactly what `ctx.bindings` already
+// assigned it; a SYNTHETIC (Semi/Anti RHS) leaf's span is appended after the
+// total real width instead of inline at its walk position, because the two
+// coordinate spaces (leaf/RelSet-bit "walk order" vs. column-index space)
+// stop coinciding the moment a synthetic leaf sits ahead of a real one in
+// walk order (§25.1's traced `qualAC` misattribution). Unlike the old
+// `cumOffsets`, a `[]leafSpan` need not be monotonic across leaves.
+type leafSpan struct {
+	lo, hi int
+}
+
+// spansFromCumulative adapts a plain monotonic prefix-sum array into the
+// `[]leafSpan` shape `relidsOfExpr`/`tableForCol` now share across both
+// layers. Its last production caller went away when P0-H11 made
+// `joinlistProblem` carry `[]leafSpan` directly (the bushy/joinlist layer's
+// own "flavor 2" coordinate space, §26.1, which has no synthetic leaves and
+// so was always contiguous); it survives as the test-fixture convenience the
+// per-leaf span tests build their contiguous tables with.
+func spansFromCumulative(cum []int) []leafSpan {
+	if len(cum) < 2 {
+		return nil
+	}
+	spans := make([]leafSpan, len(cum)-1)
+	for i := range spans {
+		spans[i] = leafSpan{lo: cum[i], hi: cum[i+1]}
+	}
+	return spans
+}
+
 // relidsOfExpr is the set of FROM positions an expression references, in the
-// coordinate space `cumOffsets` describes (the same one `tableForCol` reads).
+// coordinate space `spans` describes (the same one `tableForCol` reads).
 // ok is false when a referenced column falls outside every relation's slice of
 // the schema, which means the caller's offsets do not describe this expression
 // and any relset derived from it would be a guess. tableForCol collapses that
 // case and the multi-rel case into the same -1; a clause list cannot, since
 // spanning several relations is the normal state of a join clause.
-func relidsOfExpr(e Expr, cumOffsets []int) (RelSet, bool) {
-	if e == nil || len(cumOffsets) < 2 {
+func relidsOfExpr(e Expr, spans []leafSpan) (RelSet, bool) {
+	if e == nil || len(spans) < 1 {
 		return 0, false
 	}
 	var set RelSet
 	ok := true
 	visitColumnRefsForTable(e, func(colIdx int) {
-		for t := 0; t < len(cumOffsets)-1; t++ {
-			if colIdx >= cumOffsets[t] && colIdx < cumOffsets[t+1] {
+		for t, sp := range spans {
+			if colIdx >= sp.lo && colIdx < sp.hi {
 				if t >= maxSearchRels {
 					ok = false
 					return
@@ -572,11 +603,11 @@ func colRefIndexPairKey(a, b *ColumnRef) string {
 
 // tableForCol returns the FROM-table index that all ColumnRef nodes
 // in e belong to, or -1 if columns span multiple tables.
-func tableForCol(e Expr, cumOffsets []int) int {
+func tableForCol(e Expr, spans []leafSpan) int {
 	result := -1
 	visitColumnRefsForTable(e, func(colIdx int) {
-		for t := 0; t < len(cumOffsets)-1; t++ {
-			if colIdx >= cumOffsets[t] && colIdx < cumOffsets[t+1] {
+		for t, sp := range spans {
+			if colIdx >= sp.lo && colIdx < sp.hi {
 				if result == -1 {
 					result = t
 				} else if result != t {

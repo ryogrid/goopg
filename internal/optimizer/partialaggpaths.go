@@ -40,6 +40,7 @@ package optimizer
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -299,7 +300,9 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	// OUTPUT. `Rows` is upstream's `dNumGroups`, and it enters BOTH candidates
 	// through identical `costAgg` terms (`finalPerGroup*groups +
 	// cpuTupleCost*groups`), so it cancels in the comparison exactly as the
-	// input price does — which is why a blind `Rows` of 1 is harmless here.
+	// input price does. R61 sources the count from the search rel inside
+	// `sizeGroupingRelFromAgg`, so this rel carries the SAME group count as
+	// the serial rel — consistency, not blindness, is now the justification.
 	sizeGroupingRelFromAgg(grouped, agg)
 	finalGroups := grouped.Rows
 	if finalGroups < 1 {
@@ -332,7 +335,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 
 	nAggs := len(agg.Aggs)
 	nGroupCols := len(agg.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, agg)
 	strategy := agg.Strategy
 
 	t := &partialAggTournament{
@@ -447,6 +450,10 @@ func pathIsFiled(rel *RelOptInfo, p *Path) bool {
 // post-pass on any tree that already carries a costed Gather.
 func partialAggSplitPays(agg *Aggregate, workers int, leaderParticipates bool) bool {
 	if partialAggPathsMode == partialAggPathsOff {
+		// R54 Step-0: mode-off upper-gate record. The post-pass still answers
+		// (the pre-tournament rule) but the tournament never runs — a Q5 that
+		// never reaches even `split` bookkeeping is downstream of this line.
+		traceUpperGate("agg", "split-rule", "mode=off")
 		return splitAggregateIsProfitable(agg, workers, leaderParticipates)
 	}
 	// DefaultPlannerSettings, not the session's: `MaybeAddGather` carries
@@ -458,5 +465,19 @@ func partialAggSplitPays(agg *Aggregate, workers int, leaderParticipates bool) b
 	// records, ledger M0127-P5.7-a. C-19h closes it by wiring the parallel
 	// block into `plannerSettingsFrom`.
 	t := createPartialGroupingPaths(agg, workers, leaderParticipates, DefaultPlannerSettings().costParams())
-	return t.splitWins()
+	wins := t.splitWins()
+	// R54 Step-0: tournament verdict record. The verdict is what the consumer
+	// acts on — "split" means the post-pass built a split candidate on top of
+	// a costed Gather, "nosplit" that the serial shape won, "declined" that the
+	// tournament never reached a comparison (d<=1, nil child, groups refusal).
+	verdict := "nosplit"
+	switch {
+	case t == nil:
+		verdict = "declined"
+	case wins:
+		verdict = "split"
+	}
+	d := getParallelDivisor(workers, leaderParticipates)
+	traceUpperGate("agg", verdict, "workers="+strconv.Itoa(workers)+" divisor="+strconv.FormatFloat(d, 'g', -1, 64))
+	return wins
 }

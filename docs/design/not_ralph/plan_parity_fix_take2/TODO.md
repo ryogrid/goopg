@@ -1,0 +1,6421 @@
+# plan-parity-fix-take2 — TODO / progress ledger
+
+Goal: every currently-executable TPC-H and TPC-DS query produces the SAME
+plan as PG 18.3 — via the SAME statistics, the SAME costing, the SAME
+planning logic. Never by forcing shapes. Authoritative diagnosis:
+`plan-parity-root-causes.md` (rev 2) in this directory.
+
+Process per round (binding): Design Doc under this dir → agent review →
+reflect → `commit -n` + push → implement → English results report in this
+dir → `commit -n` + push. Investigation/review/implementation may be
+delegated to subagents; **all program execution is FOREGROUND** (a missed
+failure/hang in background wastes the session — goal instruction).
+
+## Policy notes (differ from the previous workstream — read first)
+
+- **Same plan ⇒ timing delta is NOT a regression.** Explicit goal rule.
+  Timing arms still run (to detect *unplanned* shape changes and to report),
+  but a slower identical plan never blocks a round.
+- **Values gates still bind every round**: TPC-H digest 24/24 MATCH,
+  TPC-DS SF0.5 sweep PASS=95 all-zero. A values break stops the round.
+- **Parity criterion** (revised by R2): `scripts/pg-plan-parity-diff.py`
+  on BOTH corpora, against a **live** PG capture taken with
+  `r2-instrument/capture-tpch.sh` / `capture-tpcds.sh` (GUCs pinned in
+  session). Verdicts: match / shapediff / unparsed / missingnode /
+  error. `scripts/tpcds-plan-diff.py` is byte-equality and is a
+  goopg-vs-goopg movement detector only — never a parity criterion.
+  **The goal's proof requires unparsed = 0** (else the tool is
+  declining to answer) and match = every planneable query.
+  Do NOT diff against `bench/tpch/plans-pg/` — it is stale and serial
+  (K9).
+- Never `git add -A` (foreign WIP lives in the main tree); stage by
+  explicit pathspec. Never `gofmt -w` wholesale (repo baseline go1.25).
+- `./postgres/` is a READ-ONLY oracle. Bench ports: PG TPC-H :65432,
+  goopg TPC-H :65433, goopg TPC-DS SF0.5 :65437, PG TPC-DS :65438.
+  Throwaway servers on 55xx; private data clones; cgroup cap via
+  `scripts/goopg-test-run.sh`; never `pkill -f goopg`.
+
+## Knowledge base (append as verified)
+
+- **K1 (verified 2026-09-08, in-tree + oracle).** The §3 thesis holds:
+  `costindex.go:229-247` charges `cpuTupleCost × tuplesFetched` with NO
+  qpqual term and says so itself (names the follow-up: own digest +
+  timing). PG: `cost_qual_eval(&qpqual_cost, qpquals)` →
+  `cpu_per_tuple = cpu_tuple_cost + qpqual.per_tuple` on `tuples_fetched`
+  + startup (`postgres/.../path/costsize.c:806-830`), `qpquals` = quals
+  not satisfied by the index. Seq rival: `costSeqscan` charges
+  `(cpuTupleCost + cpuOperatorCost × numQualOps) × relTuples`
+  (`cost_funcs.go:192-196`). Asymmetry favours index paths.
+- **K2 (verified 2026-09-08, in-tree).** `baseSeqScanCostInputs`
+  (`joinsearch.go:480`) returns `numQualOps = 0` for any non-`*SeqScan`
+  leaf — an index leaf is priced with no qual charge on post-restriction
+  rows (§3 second-order hole confirmed).
+- **K3 (tooling).** Parity: `scripts/pg-plan-parity-diff.py`,
+  `scripts/tpcds-plan-diff.py`, `make plan-gate`, pins in
+  `plan_snapshots/`. Prior reading: match=6/shapediff=14 over 20 TPC-H
+  queries (2026-09-08, on `fix-parallel-worker-bug` post-#114).
+- **K5 (measurement, verified 2026-09-08 the hard way).** `launch.sh`
+  decides readiness with `pg_isready`, which a SURVIVING older server on
+  the same port answers — the new instance never binds, the launcher
+  prints READY, and the arm silently measures the PREVIOUS binary. It
+  cost R1 one full pair of captures. **Every arm must use
+  `r1-qpqual-index/launch-verified.sh`**, which proves the listener's
+  `/proc/<pid>/exe` inode is the binary we built and refuses otherwise.
+  Never trust `ps aux | grep goopg` to tell you a port is free.
+- **K6 (verified 2026-09-08, instrumented).** The base-rel seed is a
+  `PathPrebuilt` wrapping the **pre-search leaf** (`joinsearch.go:434`),
+  priced by `costSeqscan` via `baseSeqScanCostInputs`. When the
+  pre-search planner already chose an index, that leaf is an
+  `*IndexScan` and gets `numQualOps = 0` + fallback pages (K2). Proof:
+  TPC-H Q12's inner `Index Scan ... (cost=0.00..60475.14)` printed
+  IDENTICALLY before and after R1 while the Merge Join above it rose by
+  exactly the qpqual charge — goopg displays one cost for that node and
+  costs the join with another. `cost=0.00` startup is impossible from
+  `costIndexScanCore` (it always charges a descent).
+- **K7 (verified 2026-09-08, counted).** `pg-plan-parity-diff.py` cannot
+  parse the node names both engines print: **56 of 62** TPC-DS
+  MISSING-NODE verdicts and **9 of 9** TPC-H ones cite `unknown node
+  kind` — `Finalize/Partial {Hash,Group,}Aggregate`, `WindowAgg`, `CTE`,
+  `SetOp`, `HashSetOp`, `Merge`. MISSING-NODE therefore does NOT mean
+  goopg omitted a node. **The instrument cannot currently prove the
+  goal's success condition**, so it is fixed first (R2). Teaching it
+  names both engines emit forces nothing to be equal.
+- **K8 (tooling gap closed 2026-09-08).** R0 verdicted TPC-DS by
+  BYTE equality (`tpcds-plan-diff.py`), which can never match across
+  engines because costs differ. The comparable channel is
+  `pg-plan-parity-diff.py` after normalising `===== Qn =====` to
+  `=== Qn`. Both R0 and R1 now have shape verdicts
+  (`r1-qpqual-index/tpcds-shape-diff*.txt`).
+- **K9 (verified 2026-09-08 — invalidates every R0/R1 parity number).**
+  The TPC-H parity target `bench/tpch/plans-pg/` is a **stale, SERIAL**
+  capture. Live PG on :65432 (`max_parallel_workers_per_gather=4`,
+  read from `pg_settings`) plans TPC-H in PARALLEL. All nine TPC-H
+  MISSING-NODE verdicts were this artefact; the true count is 0, and
+  Q6 is a clean MATCH. **Never use that fixture as a parity target** —
+  capture PG live with `r2-instrument/capture-tpch.sh`. R0 had a live
+  capture and diffed the fixture anyway.
+- **K10 (verified 2026-09-08, read from both engines).** The TPC-DS
+  pair was configured 128x apart: goopg SF0.5 clone `work_mem=512MB`,
+  PG :65438 `work_mem=4MB`. `work_mem` decides hash-vs-sort and
+  HashAggregate-vs-GroupAggregate, so that comparison measured
+  configuration, not planning. Both capture scripts now pin
+  `work_mem=64MB` + `max_parallel_workers_per_gather=4` IN SESSION.
+  **A comparison's REFERENCE needs the same provenance check as its
+  subject** (the K5 discipline, applied to data).
+- **K11 (adjudicated 2026-09-08, four systematic causes).** From
+  reading 10 plan pairs by hand:
+  (a) ~~goopg's planner never sets `AggStrategySorted`~~ **WRONG —
+  corrected by R3 §0.** The planner DOES set it, and
+  `addGroupingPaths` builds a plain Sort-then-GroupAggregate candidate
+  on every grouped query; the `operators_explain.go` comment saying
+  otherwise is stale. The real fact is a COSTING inversion: over
+  TPC-DS goopg emits `GroupAggregate` 1x / `HashAggregate` 133x where
+  PG emits 100x / 29x, because `costAgg` has **no spill arm** and so
+  prices the hash table as if memory were infinite (its own comment
+  says so). Cause, not symptom, is R3. **Error class: believing a
+  comment about what the code does instead of checking — same class as
+  the root-causes rev-1 error, see K4.**
+  (b) ~~worker count is not computed~~ **WRONG — corrected by R4 §0.**
+  goopg DOES implement `compute_parallel_worker`
+  (`considerparallel.go:588`). See K14 for the real cause. (Third
+  falsified claim of mine in this workstream, all one shape:
+  concluding about behaviour from reading instead of measuring.);
+  (c) **no parallel-aware hash join** — PG emits `Parallel Hash Join`
+  /`Parallel Hash`, goopg plain `Hash Join` under a Gather;
+  (d) **Sort/Group keys render as output aliases**, PG renders source
+  expressions — TPC-H Q9's tree MATCHES and fails on this alone.
+- **K12 (measured 2026-09-08 — the dominant aggregation cause).**
+  PG picks `GroupAggregate` mostly because it **delivers an ordering
+  something above needs**, not because the hash spills. Evidence: on
+  TPC-DS Q81 and Q12 the group counts are 146/351 and 4572/41 — all
+  fit trivially in 64MB, so NEITHER engine spills, yet PG sorts and
+  goopg hashes. Q12's shape shows the mechanism: PG runs
+  `WindowAgg -> Sort -> GroupAggregate` because the window's
+  `PARTITION BY` needs the order, so the Sort is owed anyway and the
+  sorted aggregate is nearly free. goopg emits `WindowAgg ->
+  HashAggregate` with NO Sort — its `WindowAgg` orders internally, so
+  the requirement never reaches the planner and no path is ever
+  credited for satisfying it. **goopg's upper planner does not model
+  ordering requirements**, which is why the sorted aggregate cannot win
+  a contest it should. This is the single largest lever left on TPC-DS
+  aggregation.
+- **K13 (limitation introduced by R3, filed not erased).**
+  `partialAggNotionalRows` substitutes a NOTIONAL row count when goopg
+  cannot see a real one; with a memory threshold in `costAgg` that
+  notional value can now land on the wrong side of it and flip a
+  verdict a real row count would not. Needs a real row count
+  (`TableStats.RowCount` is not restored at startup — ledger pq-P6),
+  not a cost tweak.
+- **K14 (measured 2026-09-08 — a parity floor OUTSIDE the planner).**
+  goopg's heap stores the same rows in a different number of pages than
+  PG. TPC-DS `store_sales`: identical `reltuples` (1,439,608) but
+  `relpages` **29,761 (goopg) vs 25,928 (PG)** — and PG's
+  `compute_parallel_worker` bands are [9216,27648) for 3 workers and
+  [27648,82944) for 4, so BOTH engines computed the worker count
+  correctly from the page count each was given. Systematic and
+  bidirectional, sorted by column type: `inventory` (all `integer`)
+  matches to **0.2%**, numeric-bearing tables run 1.05-1.15x LARGER in
+  goopg, and the two `character(N)` tables run 0.57-0.71x SMALLER.
+  **R5 resolved both hypotheses**: `character(N)` blank-padding is
+  CONFIRMED divergent (PG pads, goopg does not — explains `item` 0.573
+  and `customer` 0.712); `numeric` is FALSIFIED — it matches PG exactly
+  at one and five columns, with and without fractional digits, and with
+  NULLs. The fact-table 15% has NO representation explanation and is
+  reassigned to **heap page FILL on bulk load** (goopg's file is truly
+  29,761 pages; PG's truly 25,928 with 0 dead tuples).
+  **`relpages` is a planner INPUT** — every page-priced term, the
+  Mackert-Lohman estimate, and the parallel-worker thresholds — so a
+  15% page error separates otherwise-identical plans and **no planner
+  change can close it**. Part of this goal is therefore not planner
+  work; it is on-disk representation, and as such a PG-compat defect in
+  its own right. Detail: `r4-heap-density/FINDINGS.md`.
+- **K15 (investigated 2026-09-08 — the top TPC-H category, and it may
+  be a LABEL).** With the corpus now fully parsed, TPC-H's divergence
+  categories rank `parallelism=18`, `join-order=18`, `scan-type=14`,
+  `sort-strategy=13`, `join-method=12`. **Q14 differs on `parallelism`
+  and nothing else** — the closest query to a match after Q6/Q13.
+  PG prints `Parallel Hash Join`; goopg prints `Hash Join`. But goopg
+  is NOT missing the capability: `parallel_hash_build.go` implements a
+  cooperative parallel hash build and states that goopg needs neither
+  of PG's two schemes because goroutines share an address space, so the
+  table is built once and shared by pointer. The gap is that
+  **`optimizer.Join` carries no parallel-awareness field** — only
+  `Path.ParallelAware` has it (`joinpathsparallel.go:195`), and
+  `createplanjoin.go` merely ASSERTS on it — so the information is lost
+  at plan construction and EXPLAIN cannot print it.
+  NOT YET VERIFIED: whether Q14's chosen path is actually the
+  ParallelAware variant. Plumbing the flag is self-verifying — if the
+  label appears, the premise held; if it stays `Hash Join`, the path is
+  not parallel-aware and that is the finding. Do NOT assume it
+  (K11a/K11b/K14-numeric were all assumed and all wrong).
+- **K16 (measured 2026-09-08 — supersedes K15; a MECHANISM difference,
+  not a label).** After threading `Path.ParallelAware` onto
+  `optimizer.Join` and rendering PG's prefix, goopg still emits
+  `Parallel Hash Join` **0** times (PG: 9 TPC-H, 139 TPC-DS). The flag
+  is genuinely false for every hash join goopg plans — checked at the
+  right site (`createplanjoin.go:551`, the one holding
+  `assertParallelAwareJoinIsRunnable`; three Join construction sites
+  exist, so patching one of three would have faked this zero).
+  **goopg parallelises by STAMPING a Gather over a serial subtree
+  (`stampParallelScan`, `createplangather.go:112`, a copy-on-write walk
+  over an already-built tree); PG parallelises by building PARTIAL
+  PATHS and letting them win.** That is what `parallelism=18` on TPC-H
+  really is. Next step per
+  [[planner_verify_both_candidates_generated]]: instrument `addPath` to
+  learn whether `addPartialHashJoinPath` is never called, called and
+  declined, or called and outcompeted — three different fixes.
+- **K17 (measured 2026-09-08 — a real bug, found before flipping a
+  default).** `GOOPG_GATHER_PATHS=all` **crashes the server** on TPC-DS
+  Q5: `assertParallelAwareJoinIsRunnable` fires on a `2/1` =
+  `JoinTypeRight`/`JoinAlgoHash` join — "the workers' verdicts are not
+  row-local, so the join would silently drop or duplicate rows".
+  Cause: **`addPartialHashJoinPath` takes `jt parser.JoinType` and never
+  compares it to anything** — there is no jointype test anywhere in
+  `joinpathsparallel.go`, so it files whatever direction it is handed,
+  including RIGHT. The assertion's own comment claims the producer
+  "declines outright for SEMI/ANTI"; that describes code which does not
+  exist. Sixth stale-comment finding here, same class as K11a/K15.
+  The fail-closed assertion paid for itself the first time its
+  "unreachable" branch became reachable. Fix: derive the filter from
+  `hashJoinIsPartialCapable` rather than hand-listing, so predicate and
+  producer cannot drift again.
+- **K18 (measurement artefact, fixed at source 2026-09-08).** Two
+  BYTE-IDENTICAL TPC-DS captures diff every time: the three unplannable
+  queries (Q36/70/86) echo psql's ERROR text, which contains the
+  capture script's `mktemp` path. In R9 this briefly read as "plans
+  MOVED" and contradicted a design's central claim. Capture scripts now
+  use a fixed `parity-capture-$$.sql` name. **Anything that diffs two
+  captures — especially a plan PIN — must not reintroduce a random
+  path into the output.**
+- **K19 (2026-09-08).** Walkers that switch on node kind must handle
+  `*Gather`/`*GatherMerge` or they stop at the ROOT once partial paths
+  are admitted and report zero of whatever they count. This produced
+  messages like "searched tree has 0 joins" and "an ON qual was
+  dropped, which is a cross product" from a planner that was working
+  correctly — TPC-H values under the flip are 22/22 byte-identical.
+  Fixed in `rfjJoins`, `seamLeafLocalFilters` and **production**
+  `boundaryWalkChildren`. **Run the cheap decisive check (values)
+  before diagnosing an alarming message**; it is what separated a
+  walker gap from a search regression here. **FOUR walkers had it**:
+  `rfjJoins`, `seamLeafLocalFilters`, production `boundaryWalkChildren`
+  (R11) and `rfjLeafCount` (R12). Apply the rule to TRIAGE ORDER too —
+  the failure ranked "most likely a genuine defect" was this bug both
+  times it was ranked.
+- **K20 (2026-09-08).** `GOOPG_GATHER_PATHS` gates PARTIAL PATHS only,
+  **not parallelism**. The post-pass (`stampParallelScan` /
+  `MaybeAddGather`) produces a Gather regardless — verified via a test
+  whose control arm sets mode `off` explicitly and still got one. So
+  there is currently **no setting that yields a serial plan** for such
+  a fixture, which breaks any test wanting a serial baseline. Also:
+  `scripts/planner-flags.env` records what the default IS, so it must
+  be regenerated IN THE SAME COMMIT as a default change, never before.
+- **K21 (measured 2026-09-08) — ~~the flip costs a hash join PG
+  keeps~~ SUPERSEDED BY R17.** On REAL SF=1 data with the flip on,
+  goopg hash-joins the multi-key shape on both equalities with the
+  residual as a Join Filter — PG's exact structure, same worker count
+  (3), same outer. There is NO nested-loop fallback on the corpus; it
+  exists only at the TEST FIXTURE's synthetic cardinalities, which is a
+  fixture question, not a parity regression. Original (wrong) text:
+  PG hash-joins the multi-key shape on both equalities with the
+  residual as a Join Filter (verified on :65432, GUCs pinned). goopg
+  under `GOOPG_GATHER_PATHS=all` falls back to a nested loop, so the
+  flip **costs a hash join PG keeps** while buying the parallel-join
+  mechanism PG uses (R14's Q9). Both measured. R10 DESIGN §7's
+  acceptance rule — a category regression must be EXPLAINED, not
+  outweighed — applies directly, and this one is not yet explained.
+- **K22 (2026-09-08 — a NEW error variant, mine).** R16 wrote its own
+  caveat correctly ("the SHAPE question is settled; the THRESHOLD
+  question is not") and then, in the same document, asserted a headline
+  about the threshold case generalised to the corpus. **The check was
+  done; the conclusion outran it.** K4 covers concluding without
+  checking — this is concluding PAST a check you already performed.
+  Guard: when a report states a limitation, the headline and the ledger
+  entry must be re-read against that limitation before committing.
+- **K23 (measured 2026-09-08 — the flip's real blocker).** goopg's two
+  parallelism mechanisms are NOT interchangeable at the aggregate.
+  Under `GOOPG_GATHER_PATHS=all`, `generateUsefulGatherPaths` places
+  the Gather at the JOIN level and the aggregate is built above it as
+  an ordinary one — bypassing `partialaggpaths.go`, which the POST-PASS
+  Gather placement does reach. Result: the flip **loses** the
+  `Partial`/`Finalize` split goopg already had and PG emits. Q9: PG
+  `Partial HashAggregate`; goopg flip OFF the same (a MATCH on that
+  node); goopg flip ON plain `HashAggregate`. This is the entire
+  `aggregation-strategy` 10 -> 14 move, and it is a WIRING gap, not a
+  costing error.
+- **K24 (2026-09-08 — ONE root cause, two symptoms).** The upper
+  planner receives a **finished `Node`** from the join search, not the
+  join rel's paths. `partialaggupper.go`'s own header says it:
+  *"upstream seeds `partially_grouped_rel` from
+  `input_rel->partial_pathlist`, and the rel carrying `PartialPathlist`
+  DIES inside `planJoinlistSearch` before the aggregate stage runs"* —
+  the same seam `windowsetoppaths.go:19` names for pathkeys. So:
+  **K23** (no partial aggregation over the flip's Gather) needs the
+  join rel's `PartialPathlist`; **K12(B)** (sorted aggregate never wins
+  under a WindowAgg) needs its `Pathkeys`. Same fix, and they must NOT
+  be scheduled as independent rounds. This is the largest single item
+  in the workstream and the flip's true prerequisite.
+- **K25 (2026-09-09).** `searchedTree` now carries a `*RelOptInfo`, so
+  **any generic/reflective plan walker has a path into the entire
+  search path graph**. `planFingerprint` (deliberately reflective)
+  descended into it and panicked on `reflect.Value.Interface` for
+  unexported fields. Two rules, both matching precedent already in that
+  file: treat `*RelOptInfo` as a LEAF (as `*catalog.Table` already is —
+  "not plan structure, recursing walks the whole schema"), and guard
+  `Interface()` with `CanInterface()` (`searchRel` is the first
+  unexported POINTER such walks reach; `searchPathkeys` is a slice and
+  never took that branch). Copying, serialisation and deep-equal will
+  hit this too.
+- **K27 (verified 2026-09-09, live write+restart+read).** Correlation
+  PERSISTS across restart at HEAD — R23's stated blocker is stale.
+  `ANALYZE store_sales` on a private SF0.5 clone wrote slot 3
+  (`ss_sold_date_sk` 0.14367048); after stop+restart the same session
+  reads back byte-identical values. Write path
+  (`pg18_user_catalog_rows.go` slot-3 writer), decode
+  (`codec.go:DecodePGStatisticPhysicalRow` stanumbers3 arm) and restore
+  (`open.go` `Correlation: float64(sr.Correlation)`) all confirmed live,
+  not by reading. What is TRUE underneath: the bench heaps predate the
+  slot-3 writer, so their restored stats have no correlation slot
+  (TPC-DS `pg_stats.correlation` empty where n_distinct is present) —
+  an OPERATIONAL gap (re-ANALYZE), not a code gap.   NOT done here:
+  re-ANALYZEing shared bench clusters would mutate peer measurement
+  state. TPC-H lineitem.l_orderkey reads -0.0018 post-restore, which is
+  the computed value on unordered HammerDB input, not a defect signal.
+- **K27 (2026-09-09).** A `seam-decline` is a PARITY signal, not just a
+  perf one: a query the PG-shaped search declines falls to the legacy
+  path and **cannot converge on PG's plan by any amount of costing
+  work**. Watch `GOOPG_PGSHAPED_DP_TRACE=1 | grep seam-decline` when a
+  query looks unreachable. Concretely: an `OuterColumnRef` anywhere in
+  a CTE body made `planHasEscapingOuterRef` report an escaping ref for
+  the CTEScan LEAF, so `chainCarriesLateral` declined the whole
+  enclosing join (TPC-DS Q30: cross product instead of PG's index-scan
+  inners, 3s -> >300s). `walkPlanExprs` flattens, so depth increments
+  only for subquery-bearing EXPRESSIONS — never for a lateral join's
+  right side — which is why a ref BOUND inside a subtree reads as
+  escaping it.
+- **K28 (2026-09-09).** `reduceOuterJoins` runs AFTER `planFromClause`
+  builds the node tree, so its in-place demotion of `s.FromExprs`
+  reaches only the SJI deconstruction — **it has never driven a plan.**
+  Consequences: (a) the plan keeps `JoinTypeLeft` while
+  `join_info_list` says there is no outer join, which trips the
+  fail-closed `outerLinksHaveSJInfos` guard and declines the statement
+  (K27 — 7 of 13 TPC-DS declines); (b) PG's Q49 has NO outer join
+  (6 Nested Loop) where goopg has 3 `Hash Left Join`, a direct parity
+  divergence. **Moving the call is NOT the fix**: measured, it breaks
+  6 tests including 2 on VALUES (a WHERE qual on a RIGHT JOIN's
+  nullable arm lands below the join that produces the NULLs). The
+  demotion logic must be audited as a PLAN REWRITE against PG's
+  `reduce_outer_joins` first — classic "dead code is not a reference
+  implementation".
+- **K29 (2026-09-09 — the decline is LOAD-BEARING).** goopg's
+  `applyDemotion` produces WRONG verdicts, not merely unverified ones
+  (K28 understated it). `accumulatedNN` accumulates ON-clause
+  strictness from INNER joins BELOW an outer join, so the RIGHT arm
+  reads its own nullable side as non-nullable and demotes RIGHT->INNER
+  where PG does not — measured, it returns 0 rows where 1 is correct
+  (`WHERE rj_a.id IS NULL` over a RIGHT JOIN). PG's
+  `reduce_outer_joins_pass2` only lets quals from ABOVE constrain a
+  join. **The `outerLinksHaveSJInfos` decline is the only thing
+  containing this**: the bad verdict reaches `join_info_list` but not
+  the plan, and the resulting disagreement declines the statement.
+  ~~Retiring the decline without first fixing the propagation ships
+  wrong rows.~~ **STEP ONE DONE (R27 REPORT.md):** both the RIGHT and
+  FULL arms now judge their nullable side against `upperNN` (quals from
+  ABOVE), PG's rule. Oracle-verified: PG emits `Merge LEFT Join` and
+  returns BOTH rows for `ra join rb on … right join rc on …`; goopg had
+  demoted to INNER. Three optimizer tests pinned the bug and are
+  corrected. Gates: 5 executor VALUES tests now PASS, TPC-H values
+  byte-identical, sweep PASS=95 all-zero. **The decline no longer masks
+  anything**, so R27 §4a's ordering transplant can proceed on its own
+  merits. Remaining: the ordering, then the declines.
+- **K30 (2026-09-09).** goopg's **LEFT->ANTI demotion is not
+  plan-complete.** PG's conversion also DROPS the `IS NULL` qual that
+  forced it, because an anti-join's output has no nullable-side column
+  for that qual to test. goopg changes the join type and leaves the
+  qual, so `LEFT JOIN … WHERE p.y IS NULL` filters every surviving row
+  — measured, **0 rows where 1 is correct**. Only the INNER verdict is
+  therefore transplanted to the plan (`demotedForPlan`). Completing the
+  ANTI conversion (drop the forcing qual) is the prerequisite for
+  transplanting it. Same family as K29: a demotion path that never
+  drove a plan was never completed.
+- **K31 (2026-09-09).** goopg **materialises** CTEs where PG **inlines**
+  them. PG 12+ inlines a non-recursive CTE referenced once
+  (`inline_cte`, subselect.c; `NOT MATERIALIZED` is the default), so the
+  `CTE Scan` node does not exist and the underlying tables enter the
+  planner with real statistics. TPC-DS: **goopg 111 `CTE Scan` nodes,
+  PG 68.** goopg's `pushQualsThroughSingleRefCTEs` is explicitly the
+  QUAL-PUSHDOWN half of that composition — it carries the restriction
+  into the body and leaves the node. Consequences: the
+  `outer-over-derived` firewall fires on those derived inputs (3
+  declines); their rows are synthesised where PG has real stats (the
+  goal's "same statistics" premise); and the search sees one opaque rel
+  instead of the tables inside it. **CENSUS DONE**: of 63 CTE
+  declarations across 30 TPC-DS queries, **40 (63%) are
+  single-reference** and PG inlines them; 23 are multi-reference and PG
+  materialises those too. goopg materialises all 63. So the eligible
+  target is **40 declarations** (the 43-node figure counts SCAN NODES —
+  different unit, do not conflate).
+- **K4 (rev-1 error pattern, from §6).** Never conclude from a file
+  without checking its callers (`pathgen.go`/`generateScanPaths` is
+  test-only; production seed is `newPrebuiltPath`). Every design must
+  cite call sites, not files.
+
+## READ FIRST (0): HOW we measure
+
+`METHODOLOGY.md` — the measurement pipeline, the gates, the server
+traps, the diagnosis order, and why rounds are judged by CATEGORY
+rather than by match count. Working copies of every script it names are
+in `methodology/`. Read it before running anything; several of its
+rules exist because breaking them silently invalidated an arm (K5, K9,
+K10, K18).
+
+## READ FIRST (2): which queries are even ELIGIBLE
+
+`r26-seam-decline-audit/FINDINGS.md` (2026-09-09), acting on K27.
+A query the PG-shaped search DECLINES falls to the legacy path and
+**cannot converge on PG's plan by any costing work**.
+
+- **TPC-H: 0 declines.** Every query is admitted, so TPC-H's 2/22 is
+  ENTIRELY costing/candidates. Seam work cannot help TPC-H.
+- **TPC-DS: 9 declines across 5 queries** (was 13/7; R27 admitted
+  **Q49 and Q93**). Q51, Q68, Q77, Q78, Q97. Reasons now:
+  `outer-over-derived` 3 (Q77 x2, Q78), `outer-spine` 2 (Q51, Q97),
+  `outer-link-no-sjinfo` 1 (Q78), `lateral` 1 (Q68).
+  **The surviving `outer-link-no-sjinfo` is a DIFFERENT cause** from
+  Q49's — re-diagnose, do not extend R27.
+
+These 7 are a HARD FLOOR: unlike the other 92 they are not merely
+outcosted, they never enter the search. Sequencing therefore has two
+axes, not one — how many queries a category blocks, AND whether a query
+is eligible at all.
+
+## READ FIRST: what "all plans match" requires
+
+`ROADMAP-to-all-match.md` (2026-09-09). **It is a CONJUNCTION, not a
+sequence.** No query has a single divergence — every non-matching query
+differs from PG in 4-7 categories at once, and **zero** queries are
+blocked by join-order alone. So **no single fix flips any query to
+MATCH**, and the match count will stay near zero until nearly all
+category work is done. Judge a round by its CATEGORY, not the match
+count.
+
+Queries blocked, by category (TPC-DS of 99 / TPC-H of 22):
+join-order **95/17**, parallelism 89/16, aggregation-strategy 81/10,
+sort-strategy 79/13, join-method 72/12, scan-type 72/14,
+parameterisation 42/6, rendering 35/7, qual-placement 13/6.
+
+**K26 (2026-09-09): join-order's cause is now MEASURED** — see
+`K26-join-order-implied-equalities.md`. goopg's DP declines
+`{part}|{partsupp}` on TPC-H Q9 with `reason=no-join-clause` (20 such
+declines), because Q9's clauses all run through `lineitem` and those
+two rels share no DIRECT clause. PG joins them via an EQUIVALENCE
+CLASS: both are equated to `l_partkey`, so
+`generate_join_implied_equalities` (equivclass.c) synthesises
+`p_partkey = ps_partkey`. goopg HAS equivalence classes
+(`equiv_class.go`) but the seam gives the search only "the equivalence
+class's CONSTANTS", never derived JOIN CLAUSES — **deliberately, and
+measured**: the seam records that adding the transitive `a = c` "would
+hand the search new JOIN clauses and reshape plans broadly — measured:
+it broke the pinned-semi-join layout
+`TestPreDPPinnedSemiKeysResolveAfterDP` asserts ... That half stays on
+its legacy caller pending its own evaluation."
+    **OBSTACLE READ (K26 §6)**: that test is a **REMAP** test, not a
+    layout test — "every ColumnRef in the semi join's keys/predicate
+    must resolve ... in the post-DP outer schema" — and its fixture
+    (`b1_j = b2_j AND b2_j = s3_j`) is exactly an equivalence class
+    whose closure enables MORE reordering. So the derived equality is
+    not wrong; the pinned semi join's F8 REMAP is incomplete for the
+    wider layouts it makes reachable. **The round's work is in
+    `predp`'s remap, not in `equiv_class.go`.**
+    **MEASURED 2026-09-09 with the transitive half ENABLED (K26 §7)**:
+    it breaks **3 tests**, not a corpus — far smaller than the old
+    note's "reshapes plans broadly". And the named obstacle fails by
+    NIL-DEREF INSIDE ITS OWN HELPER (`findSpineSemi` returns nil at the
+    first non-semi Join; caller does not check) — a planner-shaped
+    symptom from a test walker, K19's fourth family. Descending joins
+    is NOT enough: the semi join is still not found, so it is not
+    merely relocated. **ANSWERED (K26 §8)**: the semi join is NOT lost — it changes FORM to
+    a `*NestedLoopIndexJoin` (still `JoinTypeSemi`, still on the spine).
+    The test handles the NLI branch; the nil-deref is ONE expression in
+    it — `nliIn(nli.Inner).Key`, where `nliIn` returns nil for the
+    inner shape implied equalities produce. **So the next step is: what
+    is `nli.Inner`, and should `nliIn` recognise it?** A bounded
+    question about one helper — NOT the F8 remap (§6's hypothesis is
+    dead) and NOT evidence that implied equalities are wrong. So the mechanism
+    EXISTS
+(re-wiring, not a port), the round's first obstacle is NAMED in
+advance, and the deferral's reason — "reshapes plans broadly" — is
+precisely what THIS goal's rule permits. That single gap makes
+goopg's reachable join orders a strict subset of PG's on any
+star-shaped query — most of TPC-H, essentially all of TPC-DS. It is
+CANDIDATE GENERATION, so no cost work can reach it.
+
+**join-order is the dominant blocker and is UNTOUCHED** — it is the
+join search reproducing PG's `join_search_one_level`, larger than
+anything attempted so far.
+
+## Rounds
+
+- [x] **R0 — baseline (captured 2026-09-08).** Evidence:
+  `r0-baseline/` (4 captures + 2 diff outputs).
+  - Method: private clones (`/tmp/parity-r0/{tpch,ds05}`, cp -a of the
+    bench clusters) + private binary `tmp/goopg-parity-r0` (built at
+    `9edf01adc`) on :5543/:5544 via `scripts/goopg-test-run.sh`
+    (GOOPG_ANALYZE_SEED=20260905, GOMEMLIMIT=12GiB, GOGC=off); the shared
+    :65433 server was left untouched (started 17:05 by an unknown peer —
+    displacing it is the documented collision hazard). Plain EXPLAIN, one
+    `===== Q<n> =====` section per query, per-statement EXPLAIN-prefix
+    split exactly as `sf05_capture_plans` does; TPC-H texts from
+    `internal/testutil/tpch/tpch.go` Queries() (Q15 = CREATE VIEW kept in
+    the raw capture, dropped for the diff; Q15a-VIEWBODY via
+    `Q15ViewBody()`), TPC-DS from `query1..99.sql`. PG references live on
+    :65432 (tpch) / :65438 (ryo@tpcds05). All foreground, per-query
+    `timeout 120`, failures recorded inline, none fatal.
+  - **TPC-H: MATCH=1 (Q13 only), SHAPE-DIFF=12, MISSING-NODE=9 over 22**
+    (`pg-plan-parity-diff.py` vs `bench/tpch/plans-pg/`; sections
+    Q1–Q14, Q15a-VIEWBODY, Q16–Q22 — the Q15 CREATE VIEW has no plan
+    shape and Q15b-MAIN has no PG fixture, so both are out of parity
+    scope on both sides). Caveat: 9 MISSING-NODE verdicts are partly
+    tool blindness — the comparator does not know `Finalize/Partial
+    HashAggregate` ("unknown node kind"), so MISSING-NODE ≠ proven real
+    divergence; adjudicate per query in later rounds. (Prior reading
+    match=6/14 was on another branch/commit.)
+  - **TPC-DS: byte-same=3/99, changed=96** (`tpcds-plan-diff.py`,
+    byte-for-byte so cost/rows drift counts). The 3 sames are the
+    Q36/70/86 error blocks — identical parse failures on BOTH engines
+    (the known PG_SKIP dsqgen artefacts) — so **0/96 real plan matches**.
+    Unplannable on both engines: 36, 70, 86 (out of scope for the proof
+    by definition: PG itself produces no plan).
+  - Servers left RUNNING (:5543 TPC-H, :5544 DS05) for R1+.
+- [x] **R1 — qpqual on the index path** (root-causes §7.1) — DONE
+  2026-09-08. Report: `r1-qpqual-index/REPORT.md`. Landed at all five
+  index-cost sites; a review of the implementation caught the
+  parameterised site SUBTRACTING a join-clause count from a
+  local-restriction count (disjoint populations; yields -1 and CREDITS
+  the index path) — fixed as `paramIndexQualOpCount`, pinned.
+  **Result: values green both corpora (TPC-H 22/22 identical; TPC-DS
+  PASS=95 all-zero), 1 TPC-H plan and 33 TPC-DS plans repriced, and
+  parity moved by ZERO on both** (TPC-H 1/12/9 unchanged; TPC-DS
+  0/34/62 unchanged). The charge is not inert — Q12 rose by exactly
+  5 x cpu_operator_cost x 6,001,255 — it just never changes which path
+  wins. Yielded K5/K6/K7/K8. First capture pair was discarded: it
+  measured the R0 binary (K5).
+  ORIGINAL SCOPE, for the record: Charge PG's
+  `(cpu_tuple_cost + qpqual) × tuples_fetched` (+ startup) for
+  non-index-satisfied quals at all five index-cost sites. Design must
+  define WHERE the qual list comes from per site (no new candidates).
+  Gates: optimizer/executor suites, values both suites, parity A/B both
+  corpora (expect Q12-class moves toward PG), timing table reported
+  (not adjudicated unless shapes move unexpectedly).
+- [x] **R2 — make the instrument able to prove the goal** (K7/K8) —
+  DONE 2026-09-08. Report: `r2-instrument/REPORT.md`. UNPARSED is now 0
+  on both corpora, and validating the instrument found the parity
+  TARGET was wrong twice over (K9 stale serial TPC-H fixture, K10
+  128x work_mem gap on TPC-DS). **Every R0/R1 parity number is
+  superseded.** Corrected baseline: **TPC-H match=2 shapediff=20
+  unparsed=0 missingnode=0**; **TPC-DS match=0 shapediff=72
+  unparsed=0 missingnode=24 error=3**. TPC-H Q6 had been planning
+  identically to PG for two rounds while filed as MISSING-NODE. The
+  design's advance prediction (reclassification goes to SHAPE-DIFF, not
+  MATCH) held exactly: zero queries moved to MATCH from the tool change.
+  Yielded K9/K10/K11. ORIGINAL SCOPE: Teach `pg-plan-parity-diff.py` the
+  node names both engines already emit (`Finalize/Partial` aggregates,
+  `WindowAgg`, `CTE`, `SetOp`/`HashSetOp`, `Merge`) and make the TPC-DS
+  corpus a first-class channel (section normalisation, not byte
+  equality). This changes NO plan: it can only reclassify a verdict the
+  tool was guessing at, and every reclassification must be adjudicated
+  by hand against the two plan texts before it is believed. Without it
+  the goal's success condition is unmeasurable. Gate: the tool's own
+  test (`scripts/pg-plan-parity-diff-test.py`) plus a hand-adjudicated
+  sample of at least 5 reclassified queries per corpus.
+- [x] **R3 — the memory-blind HashAggregate** — DONE 2026-09-08.
+  Report: `r3-hashagg-spill/REPORT.md`. PG's spill arm transcribed
+  faithfully; TPC-DS `GroupAggregate` 1 -> 13 (PG: 100), TPC-H
+  unmoved, parity verdicts unchanged on both, values green on both.
+  The old objection did NOT reproduce (TPC-H did not move at all).
+  **The arm is a minor contributor — see K12 for the dominant cause it
+  exposed.** Broke `TestPartialAggVerdictIsScaleFree` legitimately (a
+  memory threshold is not scale-free, and PG's model is not either);
+  bounded the property to the sub-threshold regime + added a companion
+  pin. ORIGINAL SCOPE:
+  design `r3-hashagg-spill/DESIGN.md`). `costAgg` has no spill arm, so
+  the hashed candidate is priced as if memory were infinite and beats
+  its sorted rival (which always pays a Sort) on every large grouping —
+  exactly the population where PG spills and picks `GroupAggregate`.
+  Transcribe PG's arm (`costsize.c:2783-2840`, `hash_agg_entry_size` /
+  `hash_agg_set_limits`). It is provably INERT below the memory
+  threshold, so small groupings cannot move. Re-opens a standing
+  objection whose timing leg the goal rule voids and whose parity leg
+  was measured against the invalid references (K9/K10).
+- [ ] **R4 — model the ordering requirement** (K12, NEW, largest
+  remaining lever). PG's upper planner selects the cheapest path that
+  SATISFIES a required ordering, so a sorted aggregate that delivers
+  the order a WindowAgg / ORDER BY / DISTINCT needs wins a contest the
+  hashed one cannot enter. goopg's WindowAgg orders internally, so the
+  requirement never reaches the planner. Oracle:
+  `create_grouping_paths` pathkey handling +
+  `get_cheapest_fractional_path_for_pathkeys`.
+- [x] **R4 — heap density** (was "compute the worker count"; premise
+  K11b falsified) — DONE 2026-09-08, findings only, no code change.
+  `r4-heap-density/FINDINGS.md`. goopg's worker rule is correct; it is
+  fed a page count 14.8% larger than PG's for identical rows. See K14.
+- [x] **R5 — per-type storage sizes** (K14 follow-up) — DONE
+  2026-09-08, findings only. `r5-per-type-density/FINDINGS.md`.
+  9 probe tables on both engines: everything matches EXCEPT
+  `character(N)`, which PG blank-pads and goopg does not. `numeric`
+  falsified. Fact-table gap reassigned to page fill.
+- [x] **R6 — the window's Sort belongs in the plan** (K12 slice A) —
+  DONE 2026-09-08. `r6-window-sort/REPORT.md`. Planner stacks PG's
+  `create_one_window_path` Sort; executor honours a fail-closed
+  `Presorted` flag. TPC-DS gains 13 Sorts below WindowAgg (PG has 6);
+  `GroupAggregate` unchanged at 13 and parity unchanged on both corpora
+  — **all four advance predictions held, including the negative one**.
+  Values green on both. The residual 13-vs-6 is now a MEASUREMENT of
+  what slice (B) is worth; it was unobservable before.
+- [x] **R7 — carry parallel-awareness onto the plan node** (K15) —
+  DONE 2026-09-08. `r7-parallel-aware-label/REPORT.md`. Plumbing landed
+  and is correct; **the premise was FALSIFIED by the measurement it was
+  designed to make** — goopg emits `Parallel Hash Join` ZERO times on
+  either corpus (PG: 9 on TPC-H, 139 on TPC-DS). No parity movement.
+  See K16 for what the category actually is. ORIGINAL SCOPE:
+  Add the field to `optimizer.Join`, set it from `Path.ParallelAware`
+  in `createplanjoin.go`, and render `Parallel Hash Join` as PG does.
+  Accurate rather than cosmetic — goopg really does build the hash
+  cooperatively. Cheapest identified round with a concrete target
+  (Q14 -> MATCH would be +1 on TPC-H) and it is self-verifying.
+  Same class as R2's `WindowAgg` label fix.
+- [x] **R8 — why no partial hash-join path ever wins** (K16) — DONE
+  2026-09-08, findings only. `r8-partial-path-admission/FINDINGS.md`.
+  Answer: the CONSUMER is off. `GOOPG_GATHER_PATHS` defaults to off, so
+  `generateUsefulGatherPaths` reads nothing and every partial path is
+  discarded. The knob was parked on a TIMING decision (D-05: -10..22%
+  TPC-H) that **this goal's rule voids**. Probed with `=all`:
+  `Parallel Hash Join` 0 -> 19 on TPC-H (PG 9) and 0 -> **132** on
+  TPC-DS (PG 139); TPC-H `parallelism` 18 -> 15, `join-method` 12 -> 11,
+  `qual-placement` 7 -> 5, but `aggregation-strategy` 10 -> 14, match
+  unchanged. **BLOCKED by K17.** Three
+  candidate causes, one instrumentation step to distinguish them. This
+  is TPC-H's joint-top divergence category and it is a mechanism gap,
+  not a label.
+- [x] **R9 — jointype filter on the partial hash-join producer** (K17)
+  — DONE 2026-09-08. `r9-partial-jointype-filter/REPORT.md`.
+  `partialHashJoinTypeOK` admits {INNER, LEFT, SEMI, ANTI}, pinned
+  BY TEST against `hashJoinIsPartialCapable` for all 7 jointypes (K17
+  was a class bug — a comment drifting from code — so a second
+  hand-written list would reproduce it). R8's crash reproduction now
+  plans. Default-off byte-identical on both corpora; values green both.
+  **R10 unblocked.** ORIGINAL SCOPE: Derive from `hashJoinIsPartialCapable`; unit pin per
+  jointype; correct the stale comment. Prerequisite for R10.
+- [~] **R10 — flip `GOOPG_GATHER_PATHS`** — ATTEMPTED AND REVERTED
+  2026-09-08, nothing shipped, tree green.
+  `r10-gather-paths-default/REPORT.md`. The one-line change is correct
+  and its justification stands (PG has no Gather post-pass), but the
+  flip fails **15 tests** pinning the pre-flip world
+  (`failing-tests-under-the-flip.txt`) in at least three distinct
+  classes — explicit stage pins, seam shape pins, and a generated
+  provenance artefact — including
+  `TestC19fPathModelGatherExecutesAsAParallelHashJoin`, the test written
+  FOR this mechanism. Bulk-updating them to make the change land is the
+  failure mode this workstream exists to avoid, so it was reverted.
+  ORIGINAL SCOPE: Full
+  values gates both corpora; adjudicate every moved plan; explain the
+  `aggregation-strategy` 10 -> 14 move before accepting.
+- [x] **R11 — adjudicate R10's 15 tests** — DONE 2026-09-08.
+  `r11-adjudicate-gather-walkers/REPORT.md`. **15 -> 8.** Seven were one
+  bug in three walkers that cannot descend a `Gather` — including
+  `boundaryWalkChildren`, which is PRODUCTION code whose own contract
+  says it enumerates "every kind that can sit between a statement's
+  root and a spliced searched subtree". Fixes landed and green at the
+  shipping default. R10's alarming messages ("0 joins", "an ON qual was
+  dropped, which is a cross product") were walker blindness: TPC-H
+  values under the flip are 22/22 byte-identical, which was checked
+  BEFORE diagnosing. 8 remain (2 stage pins, 1 generated artefact,
+  5 needing real judgement).
+- [x] **R12 — the remaining 8** — DONE 2026-09-08.
+  `r12-remaining-eight/REPORT.md`. **8 -> 7.** The one R11 called "the
+  most likely genuine defect" (outer-join null extension) was **K19 a
+  fourth time** — `rfjLeafCount` counted a Gather-containing 3-leaf side
+  as 1 leaf. Second round running where the alarming message was the
+  walker, and the second time I ranked it as the likeliest real bug.
+  Remaining 7: 2 stage pins + 1 generated artefact (all mechanical),
+  and **4 showing REAL plan movement** — the Slice3 pair changed
+  character once the walkers could see (now "unexpected/missing narrow
+  build", i.e. a different build side), plus
+  `TestSplitEqualityForHashMultiKey` and
+  `TestOwnedBuildPoisonPrebuiltBoundary`.
+- [x] **R13 — the mechanical three** — DONE 2026-09-08, findings only,
+  nothing committed as code (deliberately).
+  `r13-mechanical-and-postpass/FINDINGS.md`. The provenance artefact
+  regenerates to a one-line change but **must land WITH the flip** —
+  it records what the default IS, and committing `unset(all)` while the
+  default is `off` would make the stamp bench reports cite a lie.
+  `TestC19fPathModelGather...`'s control arm sets mode off EXPLICITLY
+  and still got a Gather: the post-pass (`stampParallelScan`) is not
+  gated by `GOOPG_GATHER_PATHS` at all (K16's two mechanisms), so no
+  setting gives that fixture a serial baseline. Its assertion is
+  load-bearing ("any row difference is a wrong answer"), so the fix may
+  be an off switch for the post-pass, not a weakened test — a design
+  question, not an edit.
+- [x] **R14 — adjudicate the first of the 4 against PG** — DONE
+  2026-09-08, findings only. `r14-adjudicate-against-pg/FINDINGS.md`.
+  Q9 compared three ways: **PG uses `Parallel Hash Join` twice; goopg
+  WITH the flip uses it three times; goopg WITHOUT it uses none.** So
+  the flip moves the parallel-join mechanism from absent to present —
+  the first EVIDENCE for R10's argument, which until now rested on
+  principle alone. Join ORDER is unchanged by the flip and still
+  differs from PG (that is `join-order`, the other joint-top category),
+  so Q9 does not become a MATCH — exactly as R10 DESIGN §6 predicted.
+  `TestSlice3LiveQ9ShapeDerivation`'s narrow-build failures are a
+  consequence of the new build sides, i.e. a justified re-baseline.
+- [x] **R15 — the multi-key item, narrowed** — DONE 2026-09-08,
+  findings only. `r15-multikey-adjudication/FINDINGS.md`. The failing
+  arm is the COST-driven enumerator, not the shape-capability one
+  (`splitEqualityForHash`'s own arm still passes), and the test's
+  header documents that a relation the planner cannot size floors at
+  one row where "a nested loop is genuinely the cheaper plan". So this
+  is **not a lost capability** — it is a cost movement, same family as
+  R14's narrow-build changes. NOT settled: whether the price is right,
+  which needs PG's answer for the same shape at the same cardinalities
+  (synthetic fixture -> run the SQL on :65432, do not read a capture).
+- [x] **R16 — PG's verdict on the multi-key shape** — DONE
+  2026-09-08, findings only. `r16-pg-multikey-verdict/FINDINGS.md`.
+  The fixture is TPC-H-shaped, so it ran on :65432 directly.
+  **PG HASH-JOINS on both equalities** (`Hash Cond: (ps_partkey =
+  l_partkey AND ps_suppkey = l_suppkey)`) with `ps_availqty > sum` as a
+  Join Filter. So goopg's nested-loop fallback under the flip is a
+  **confirmed divergence from PG**, not a justified re-baseline — the
+  opposite disposition from R14's Slice3 finding. **The flip is
+  therefore not unambiguously good**: it buys PG's parallel-join
+  mechanism (R14) and costs a hash join PG keeps. Caveat recorded: the
+  fixture's own row counts are synthetic and smaller; the SHAPE
+  question is settled, the THRESHOLD question is not.
+- [x] **R17 — the multi-key shape on REAL data** — DONE 2026-09-08.
+  `r17-multikey-on-real-data/FINDINGS.md`. **Corrects R16/K21.** Under
+  the flip goopg produces `Gather(3) -> Parallel Hash Join` with
+  `Hash Cond: (ps_partkey = l_partkey AND ps_suppkey = l_suppkey)` and
+  `Join Filter: (ps_availqty > s)` over `Parallel Seq Scan on partsupp`
+  — **PG's structure, four of seven rows identical including worker
+  count**. The closest goopg has come to a PG plan on a non-trivial
+  shape here. The nested loop exists only at the fixture's synthetic
+  counts. R16 stated this caveat and then reasoned past it in its own
+  headline — see K22.
+- [ ] **R18 — the fixture question**: does the synthetic multi-key
+  fixture still test what it means under the flip, or do its counts now
+  sit on the wrong side of the one-row floor? If the latter, fix the
+  FIXTURE, not the planner.
+- [x] **R19 — `aggregation-strategy` 10 -> 14 EXPLAINED** — DONE
+  2026-09-08. `r19-aggregation-strategy/FINDINGS.md`. Re-measured
+  post-R9 (survives unchanged). Exactly four queries gain it — Q5, Q9,
+  Q12, Q19 — and **every one also loses a category** (Q19 goes 5 -> 4,
+  strictly better); the raw count conceals a trade rather than a pure
+  regression. **Cause: under the flip goopg LOSES the Partial/Finalize
+  split it already had.** Q9: PG `Partial HashAggregate`, goopg flip
+  OFF `Partial HashAggregate` (matches!), goopg flip ON plain
+  `HashAggregate`. `generateUsefulGatherPaths` places the Gather at the
+  JOIN level and the aggregate is built above it, bypassing
+  `partialaggpaths.go` — which the post-pass shape does reach. So it is
+  a WIRING gap, not a costing error. R10 DESIGN §7's objection is
+  DISCHARGED; recommendation is to fix R20 first so the flip is
+  strictly toward PG.
+- [x] **R20 — located K23's cause exactly** — DONE 2026-09-08,
+  findings only. `r20-partial-agg-over-gather/FINDINGS.md`. One line:
+  `addPartialAggSplitPath` (`partialaggupper.go:92`) refuses when
+  `subtreeHasGather(child)` — a DELIBERATE coexistence guard (two
+  Gathers => every worker reads the whole relation, N+1 copies). Under
+  the flip the Gather is at the join level, so the guard fires. It
+  cannot simply be relaxed: PG never has a Gather below a partial
+  aggregate because it aggregates ON THE PARTIAL PATH first
+  (`planner.c:7351`) and gathers after (`:7704`); deleting the guard
+  would give a double-Gather, not PG's plan.
+  **K23 and K12(B) ARE THE SAME ROOT CAUSE** — see K24.
+- [~] **R21 — the upper-planner seam** (K24). Design `3b0322c11`.
+  **SLICE 1 LANDED 2026-09-08** (`r21-upper-planner-seam/REPORT-slice1.md`):
+  `joinlistRel` gains `rel *RelOptInfo`, set from the chosen path's
+  `p.Rel`; `planJoinlistSearch` returns it; `tryPGShapedJoinSearch`
+  discards it with an explicit `_` marking slices 2/3. Gate —
+  **byte-identical plans on BOTH corpora** — passes; suites green.
+  Nothing consumes it yet.
+  - [x] **Slice 2a (plumbing) LANDED** 2026-09-08/09
+    (`REPORT-slice2a.md`). **The §8 hop table was not needed**: the
+    codebase already solved this for `searchPathkeys` by carrying it on
+    the `searchedTree` TAG, with a comment saying threading would touch
+    fifteen signatures. `searchedTree` now carries
+    `searchRel *RelOptInfo`, stamped in `stampSearchPathkeys` (the one
+    site holding both the published root and its path). **Zero
+    signatures changed outside `searchedtree.go`/`createplanroot.go`.**
+    Gate: byte-identical plans BOTH corpora; suites green.
+    **K25**: a `*RelOptInfo` on a node is a gateway to the whole path
+    graph — every generic plan walker now needs a leaf rule for it.
+  - [ ] ~~Slice 2a (plumbing)~~ SUPERSEDED — was: thread the rel
+    `tryPGShapedJoinSearch` -> `tryJoinSearch` -> `planSelectWithSettings`
+    -> `createGroupingPaths` (which today takes NO rel) and on to
+    `addPartialAggSplitPath`. Route crosses `planner.go`; the full hop
+    table is in `r21-upper-planner-seam/DESIGN.md` §8. Gate: slice 1's
+    — byte-identical plans both corpora, since nothing consumes it.
+    `createWindowPaths` needs the same rel for slice 3, so do it once.
+  - [x] **Slice 2b PREREQUISITE landed** 2026-09-09
+    (`REPORT-slice2b-prereq.md`): `searchedRelOf` accessor, gated
+    byte-identical on TPC-H. **The naive version returns nil** — the
+    aggregate's child is a `*Project` WRAPPING the search root, caught
+    by probing rather than assumed; it now descends via
+    `boundaryWalkChildren` (same contract R11 taught about Gather).
+    **Measured under the flip: `rel=true partialPaths=1
+    hasGather=true`** — the partial path exists and is reachable, so
+    K23 is blocked on nothing unknown. The refusal site carries this
+    measurement in a comment.
+  - [~] **Slice 2b (K23 behaviour)** — WRITTEN, MEASURED, NOT ENABLED
+    2026-09-09 (`REPORT-slice2b.md`). **DESIGN §9's plan was wrong**:
+    no partial PATH is needed. This file's own blocker-1 note says the
+    partial plan IS the Gather's child subtree, so slice 2b is an
+    UNWRAP of an existing node — no `createPlanNode`, no coordinate
+    translation, no boundary-map hole. `gatherToUnwrapForPartialAgg`
+    is committed (narrow: boundary-chain Gather only, never
+    `*GatherMerge`, which carries an ordering) with its call site
+    COMMENTED OUT.
+    **Measured enabled: `aggregation-strategy` 14 -> 10 — K23's
+    success test MET** — but TPC-H Q9/Q13 crash:
+    `Aggregate input target [] drops group-input column "l_year"`.
+    **ATTEMPTS 2 AND 3 CORRECTED THIS, both measured — the guesses
+    below were wrong, read the outcome first.**
+    - Attempt 2 (clear the stale stamp on a copy of the agg spec):
+      SAME PANIC. The target is applied POST-HOC to the emitted node,
+      so a spec copy never reaches the assertion.
+    - Attempt 3: **`deriveAggregateInputKeep` was RIGHT.** It matches
+      child columns to group inputs BY NAME, and Q9 groups on
+      `l_year` — a COMPUTED column made by a `Project` ABOVE the
+      Gather. My helper walked to the Gather at any depth and returned
+      ITS CHILD, discarding that Project, so nothing matched by name.
+      The bug was mine, one frame up from where the panic pointed.
+    - Narrowed to an IMMEDIATE Gather: all 22 plans build, no crash —
+      but `aggregation-strategy` stays 14. **Sound but INERT**: the
+      search's Gather always sits behind a Project.
+    **ATTEMPT 4 (SPLICE) WORKS — K23 CLOSED.** Under the flip: all 22
+    TPC-H plans build (was 20), `unparsed` 2 -> 0,
+    `aggregation-strategy` 14 -> **10**, and Q9's aggregate is PG's
+    shape exactly (`Finalize HashAggregate -> Gather -> Partial
+    HashAggregate`). Values 22/22 byte-identical UNDER THE FLIP, and
+    default-off plans+values unchanged. Implementation:
+    **SPLICE the Gather out of the chain, keeping every
+    wrapper** — `Project(Gather(X))` -> `Project(X)`. A Gather is
+    schema-preserving, so the input row's columns (incl. `l_year`) are
+    unchanged, which is what the name-matched derivation needs. Needs
+    wrapper-cloning machinery. **Do not weaken the assertion** —
+    dropping a group-input column silently changes GROUP BY.
+    SUPERSEDED GUESS: re-derive the target against the unwrapped child.
+    Crash verified MINE, not the flip's (R19 captured all 22 under the
+    flip cleanly). ORIGINAL: see DESIGN §9.
+    Site: new arm in `addPartialAggSplitPath` before the guard. Seed
+    from `searchedRelOf(child).PartialPathlist[0]` (PG's
+    `cheapest_partial_path`, planner.c:7452) instead of
+    `newPrebuiltPath(partialRel, child)`; the rest of the shape
+    (`pseed` -> partial agg -> `nsGather` -> finalise) already exists.
+    **TRAP**: a partial path's `Rows` is ALREADY per-worker, so
+    `getParallelDivisor` must not be applied twice — that yields wrong
+    ROW COUNTS, not an error, which is why the values gates are
+    load-bearing for this slice. Was: add an arm BEFORE the guard —
+    when `searchedRelOf(child)` has a non-empty `PartialPathlist`,
+    build partial agg -> Gather -> finalise from it. Guard stays for
+    the post-pass route. Was: partial aggregation from
+    `rel.PartialPathlist`, built BELOW the Gather
+    (`create_partial_grouping_paths`, planner.c:7351). Success test:
+    `aggregation-strategy` 10 -> 14 under the flip disappears.
+  - [ ] **Slice 3 (K12 B)**: pathkeys for the ordering contest.
+  ORIGINAL SCOPE:
+  Give the grouping and window stages the join rel's PATHS
+  (`PartialPathlist`, `Pathkeys`) instead of a finished `Node`.
+  Unblocks K23 and K12(B) together. Oracle:
+  `create_partial_grouping_paths` + `gather_grouping_paths`
+  (`planner.c:7351`, `:7704`) and `create_grouping_paths`' pathkey
+  handling. Largest single item in this workstream; the flip stays
+  reverted until it lands. The
+  producer exists and is enabled; find why it does not fire under
+  `generateUsefulGatherPaths`' placement. Confirm the candidate is
+  GENERATED before theorising about cost
+  ([[planner_verify_both_candidates_generated]]). True prerequisite for
+  landing the flip. ORIGINAL R19 SCOPE: (R8's probe),
+  the last unexplained objection to landing the flip per R10 DESIGN §7.
+  ORIGINAL R17 SCOPE: why is the nested loop priced below the hash join under
+  the flip?** Instrument `addPath` to confirm the hash candidate is
+  generated before theorising about cost terms
+  ([[planner_verify_both_candidates_generated]]). Then adjudicate
+  `TestSlice3FilterColumnSurvivesNarrowing` and
+  `TestOwnedBuildPoisonPrebuiltBoundary`, and decide the flip: either
+  fix the nested-loop choice so the flip is strictly toward PG, or land
+  it with a named, measured, EXPLAINED regression per R10 DESIGN §7.
+  ORIGINAL R16 SCOPE: adjudicate
+  `TestSlice3FilterColumnSurvivesNarrowing` and
+  `TestOwnedBuildPoisonPrebuiltBoundary`, then land flip + provenance
+  (K20) + stage pin in ONE commit and run R10 DESIGN §5's gates.
+  ORIGINAL R15 SCOPE: the same way
+  (`TestSlice3FilterColumnSurvivesNarrowing`,
+  `TestSplitEqualityForHashMultiKey`,
+  `TestOwnedBuildPoisonPrebuiltBoundary`), then land flip + provenance
+  (K20) + stage pin in ONE commit and run R10 DESIGN §5's gates.
+  CAREFUL with `TestSplitEqualityForHashMultiKey` ("fell back to Nested
+  Loop") — losing a hash join is a shape regression unless PG declines
+  it too; it is synthetic, so PG's answer must be obtained by running
+  the equivalent SQL on :65432. ORIGINAL R14 SCOPE: (not against the
+  new output: the criterion is whether the flip's shape is PG's shape),
+  then the 2 stage pins + regenerate `scripts/planner-flags.env`, then
+  land the flip and run R10 DESIGN §5's gates. Known already: TPC-H
+  values identical under the flip; R8's counts quarantined. ORIGINAL
+  R12 SCOPE: start
+  with `TestSeamPlansARightLinkInsideOneSearchProblem` (outer-join
+  null-extension — the class where a wrong answer is silent). Then land
+  the flip and run R10 DESIGN §5's gates. NOTE: TPC-H values are
+  already known identical under the flip. ORIGINAL R11 SCOPE: reading
+  each expected tree against PG rather than against the new output.
+  Then land the flip and run R10 DESIGN §5's gates. Everything already
+  known is in R10's report so it need not be re-derived.
+- [ ] ~~R22 — slice (B)~~ **MERGED INTO R21** (K24). Was: (K12
+  remainder, LARGEST identified lever). Convert HashAggregate to
+  GroupAggregate where the order is owed anyway. Needs the upper
+  planner to compare paths by PATHKEYS; today `createWindowPaths` takes
+  a finished Node and `windowsetoppaths.go:19` records that above the
+  search seam inputs carry no pathkeys. Architectural.
+- [ ] **R22 — heap page fill on bulk load** (K14 remainder). goopg
+  leaves ~21.9 bytes/row of free space PG does not (~15% on
+  `store_sales`). Compare free space per page directly on both engines
+  — do NOT infer from totals again. On-disk question, not planner.
+- [ ] **R23 — `character(N)` blank-padding** (R5 §2.1). An on-disk
+  PG-compat defect in its own right; shifts `relpages` on every
+  `bpchar` table.
+- [x] **R21 — index-leaf repricing hole** (§7.2, `joinsearch.go:480`) —
+  **DECLINED 2026-09-09: no witness (census-measured).**
+  `r21-index-leaf-qpqual/REPORT.md`. Implemented, unit-pinned, A/B'd,
+  reverted: instrumented census counts 1282 leaf pricings across both
+  corpora with ZERO index leaves (TPC-H 100/100 SeqScan; TPC-DS
+  1107/51/17/7 Seq/CTE/Project/SetOp), and pre/post-R21 TPC-H captures
+  are byte-identical 22/22. Prebuilt leaves are bare SeqScans;
+  rule-based index choices carry absorbed bounds, not Filter chains
+  (`rewriteScanInputsWithSingleTablePredicates` + C-02c splice-out,
+  read). Follow-up filed: absorbed-leaf `index_qual_cost` needs its
+  own design (Filter-chain counting cannot reach it by construction).
+  ORIGINAL: Give index leaves their qual charge instead of
+  `numQualOps = 0`.
+- [x] **R22 — unconditional plain-index-scan arm** (§7.3) —
+  **DECLINED 2026-09-09: provably unwinnable (dominance proof +
+  production probe).** `r22-plain-index-arm/REPORT.md`. Implemented,
+  unit/driver-pinned, probed (145 offers / 0 survivals across TPC-H),
+  TPC-H A/B zero bytes, reverted in full. A full-fetch index scan is
+  strictly dominated by seq on both cost axes whenever a seq path
+  exists (always); PG's own comparator prunes the same way (live PG
+  shows zero cond-less index scans on TPC-H). The Q5/Q8 nation sites
+  are ordered-arm contests, not plain-arm (plus a width-model gap at
+  Q8 store: 676 vs 20). ORIGINAL: Drop/relax the `hasUsefulPathkeys`
+  gate so a plain index path is always a candidate.
+- [x] **R23 — persist correlation** (§7.4) — **STALE 2026-09-09, no
+  code change (K27).** Live-verified on a private SF0.5 clone:
+  `ANALYZE store_sales` writes slot 3, stop+restart restores
+  byte-identical correlation (`ss_sold_date_sk` 0.14367048). The
+  write/decode/restore chain is complete at HEAD; the row's premise
+  predates the slot-3 writer. What remains is operational (bench heaps
+  need re-ANALYZE — NOT done: shared measurement state) and out of
+  planner scope. ORIGINAL: Connection-scoped ANALYZE loses correlation
+  across restart → `corr = 0` → every index scan at `max_IO_cost`
+  (`costindex.go:407-420`).
+- [ ] **R24 — re-measure the ONEREL flip.** E-21 Cut 1b routes
+  single-table statements through the search behind `GOOPG_ONEREL_SEARCH`
+  (default OFF, deliberately — removing the rule chooser made plans
+  worse under the §3 asymmetry). After R1/R2 change the prices, re-run
+  the flip A/B (values + parallel-mode Gather capture + timing). The
+  diversion may become closable.
+- [~] **R25 — decompose the NLI node** (owner direction 2026-09-09).
+  Design `r25-nli-decompose/DESIGN.md` (this round's first deliverable):
+  replace `NestedLoopIndexJoin` (74 referencing files, PG has no such
+  node) with `Join{Algo:NestedLoop}` + parameterized IndexScan, unifying
+  tuple passing on OuterColumnRef + repointed slot (the lateral
+  dialect, PG's nestloop params). Slices: planner construction →
+  executor driver (keeps emit-once semantics, Memoize, deform bounds,
+  TID walks) → EXPLAIN Index Cond → deletion + cost/whitelist
+  migration (terminatesPartial entry goes; partial-NL execution stays
+  deferred — E-20 Cut 4's missing worker story, not removed by this).
+
+## Log
+
+- 2026-09-09 (CC) **K31 census done**: 63 CTE declarations across 30
+  TPC-DS queries; **40 (63%) single-reference** = the inlinable set;
+  23 multi-reference (PG materialises those too). Also corrected R28 §2:
+  Q77 is 4-of-6 single-reference, not 6-of-6 — I had inferred that from
+  PG's plan without checking the query. A first census said 22 because
+  the regex counted each CTE's own declaration as a reference.
+- 2026-09-09 (CC) **R28 finding — goopg MATERIALISES CTEs where PG
+  INLINES them** (`r28-cte-inlining/FINDINGS.md`). Diagnosing
+  `outer-over-derived` (a deliberate firewall, NOT a bug — resume
+  condition already written as "B-06 CTE-output stats") found the
+  structural cause underneath: **PG's Q77 has NO `CTE Scan` nodes** —
+  PG 12+ inlines single-reference non-recursive CTEs. Corpus-wide
+  TPC-DS: **goopg 111 `CTE Scan` vs PG 68**. goopg's
+  `pushQualsThroughSingleRefCTEs` reproduces `inline_cte`'s QUAL-PUSHDOWN
+  half and leaves the node standing; PG's replaces the reference. So
+  goopg matches the row counts, not the shape. **K31.**
+- 2026-09-09 (CC) **Decline re-audit** (`r26-seam-decline-audit/FINDINGS-3-reaudit.md`):
+  **13 declines / 7 queries -> 9 / 5.** Q49 and Q93 are now ADMITTED —
+  they moved from ineligible to eligible, the axis category counts
+  cannot see. Survivors: `outer-over-derived` 3 (largest, take first),
+  `outer-spine` 2, `outer-link-no-sjinfo` 1 (Q78 — DIFFERENT cause from
+  Q49's), `lateral` 1 (Q68 — check for another bound-ref-read-as-
+  escaping case first). TPC-H still 0.
+- 2026-09-09 (CC) **R27 §4a SHIPPED — the demotion reaches the plan.**
+  Q49: seam declines 3->0, `Hash Left Join` x3 -> gone (5 Nested Loop +
+  1 Merge Join vs PG's 6 Nested Loop) — it is ELIGIBLE again. TPC-DS
+  declines 13->9; join-method 74->73; scan-type 71->70; TPC-H values
+  byte-identical; sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=0. Match count unmoved, exactly as DESIGN §6 predicted.
+  **K30**: LEFT->ANTI is not plan-complete — PG's conversion also drops
+  the forcing `IS NULL` qual; goopg leaves it and filters every row
+  (0 where 1 is correct), so only INNER verdicts are transplanted.
+- 2026-09-09 (CC) **R27 SHIPPED — a row-dropping demotion fixed**
+  (`r27-outer-join-reduction/REPORT.md`). RIGHT/FULL joins judged their
+  NULLABLE arm against `accumulatedNN`, which carries ON-strictness
+  from INNER joins BELOW; those do not survive a join that
+  null-extends their result. Now judged against `upperNN` (PG's rule).
+  **Oracle-verified**: PG emits `Merge LEFT Join` + 2 rows where goopg
+  demoted to INNER (would return 1). Three optimizer tests pinned the
+  bug and were corrected with the PG result in their failure messages.
+  All 5 executor VALUES tests pass; TPC-H values byte-identical; sweep
+  PASS=95 all-zero; parity unchanged (neither corpus contains the
+  shape — which is why it survived).
+- 2026-09-09 (CC) **R27/2 — the demotion VERDICT is wrong, and the seam
+  decline is MASKING it** (`r27-outer-join-reduction/FINDINGS-demotion-is-wrong.md`).
+  §4a's transplant works structurally (optimizer suite green, flip
+  contract intact) but the 5 executor VALUES tests still fail.
+  Instrumented: `join[1] Right -> Inner` for
+  `rj_a JOIN rj_b ON … RIGHT JOIN rj_c ON … WHERE rj_a.id IS NULL` —
+  destroying the only rows the query returns. Cause: `accumulatedNN`
+  accumulates ON-clause strictness from INNER joins BELOW and the RIGHT
+  arm reads its own nullable side as non-nullable; PG only lets quals
+  from ABOVE constrain a join. **K29**: the fail-closed
+  `outerLinksHaveSJInfos` decline is LOAD-BEARING — it masks an
+  incorrect demotion, so removing it without fixing `applyDemotion`
+  SHIPS WRONG ROWS. Work order inverted: fix the strictness
+  propagation FIRST.
+- 2026-09-09 (CC) **R27 design REVISED (§4a) by implementation.** The
+  "analysis on a copy, write back verdicts" plan replaces
+  `reduceOuterJoins` and fails 8 tests — five of which PIN the S9.4
+  flip as observable (`...RightToLeftFlipFirstPosition`,
+  `...RightFlipThenAnti`, ...). So the `Base<->Right` swap reaching
+  `s.FromExprs` is CONTRACTUAL for the deconstruction, not an internal
+  detail. Revised: SUPPLEMENT rather than replace — collect verdicts
+  early from a COPY, apply join-TYPE only to the node tree, leave the
+  late `reduceOuterJoins` call exactly as-is. Price: threading verdicts
+  into `planFromItem`.
+- 2026-09-09 (CC) **R27 design** (`r27-outer-join-reduction/DESIGN.md`)
+  completes K28's audit. `applyDemotion` does TWO jobs in one mutation:
+  (A) join-type demotion — safe and wanted for the plan; (B) the S9.4
+  RIGHT->LEFT flip, which **swaps `Base<->Right`** and is only an
+  ANALYSIS normalisation. goopg's node builder is position-sensitive
+  (`SourceTableIdx`/binding offsets in FROM order), so (B) reaching it
+  re-points column refs — that is the `SELECT rj_c.id, rj_a.id, rj_b.id`
+  wrong-rows failure, not a moved plan. PG is immune because it
+  references by `Var`. Fix: run the analysis on a COPY, write back only
+  join-TYPE changes, then move the call to PG's position. Strictness
+  analysis deliberately untouched — least evidence behind it.
+- 2026-09-09 (CC) **R26/2** (`r26-seam-decline-audit/FINDINGS-2-outer-join-reduction.md`):
+  traced `outer-link-no-sjinfo` (7 of 13 declines) to an ORDERING bug —
+  `planFromClause` builds the node tree from the un-demoted `FromExpr`s
+  and only THEN calls `reduceOuterJoins`, which mutates them in place,
+  so the plan says `JoinTypeLeft` while `join_info_list` says there is
+  no outer join. Direct parity evidence: **PG's Q49 has 6 Nested Loop
+  and NO outer join; goopg has 3 Hash Left Join.**
+  **Moving the call (PG's position) is NOT the fix** — it broke 6 tests
+  incl. 2 on VALUES ("got 0 rows, want 1"; "a WHERE qual on a RIGHT
+  JOIN's nullable arm was evaluated below the join that produces the
+  NULLs"). **K28**: goopg's outer-join demotion has NEVER driven a
+  plan, so its correctness as a plan rewrite is unestablished — audit
+  `applyDemotion` against PG's `reduce_outer_joins` BEFORE moving it.
+- 2026-09-09 (CC) **Seam-decline audit** (R26): TPC-H **0 declines**
+  (so its 2/22 is purely costing); TPC-DS **13 across 7 queries**
+  (Q49/Q51/Q68/Q77/Q78/Q93/Q97), top reason `outer-link-no-sjinfo` (7).
+  That guard is fail-closed and correct — without SpecialJoinInfo the
+  search could emit INNER where the statement wrote OUTER. Next: find
+  why `joinInfoList` is unpopulated for those shapes
+  (`deconstructJointreeScopedSJI`), starting with Q49.
+- 2026-09-09 (CC) **Q30/Q81 CLOSED** (`r25-nli-decompose/REPORT-slice1-ctescan-fix.md`).
+  Cause was NOT costing (my §4a guess) and NOT the CTE cache (two
+  falsified hypotheses): slice 1's `OuterColumnRef` probe keys landed
+  in a CTE BODY, so `planHasEscapingOuterRef` walking the CTEScan leaf
+  reported an escaping ref, `chainCarriesLateral` fired, and **the seam
+  declined Q30's whole outer 3-way join** -> legacy path -> cross
+  product. Found with the existing `traceSeamDecline` channel in ONE
+  run. Fix: the walk stops at a `*CTEScan` (a plain WITH body cannot
+  reference the enclosing query). Q30 >300s -> 3.8s (PG 4.1s), Q81
+  ->5.1s (PG 14.7s); **sweep back to PASS=95 all-zero TIMEOUT=0**.
+  **K27**: a seam DECLINE is a parity signal in its own right — a
+  declined query cannot converge on PG's plan by any costing work.
+- 2026-09-09 (CC) **Corrected my own slice-1 conclusion.** Q30/Q81 are
+  a PLAN divergence (cross product vs PG's index-scan inners), not a
+  goal-sanctioned slowdown. Falsified two repair hypotheses by
+  measurement (lateral CTE seeding; CTE re-materialisation — exactly 1).
+  Sweep on committed slice 1: PASS=93 MISMATCH=0 CKMISMATCH=0 ERROR=0
+  TIMEOUT=2 SKIP=4 — execution correctness confirmed corpus-wide.
+- 2026-09-09 (CC) **R25 slice 1 LANDED** (`r25-nli-decompose/REPORT-slice1.md`).
+  Answered the handover's open question with a controlled A/B: the
+  Q30/Q81 TIMEOUTs **ARE** slice 1's (base 3s/5s -> both >300s), and
+  slice 1 is **not** plan-neutral as the handover recorded. Cause: base
+  DECORRELATED Q30's correlated subquery into a hash join; slice 1
+  leaves it a `SubPlan` per outer row. **PG emits the SubPlan too** —
+  so slice 1 moved Q30 TOWARD PG and the timeout is exactly the case
+  the goal rule sanctions. **Slice 2 must NOT "fix" it**; restoring the
+  decorrelation would move Q30 away from PG.
+  Gates: suites green; TPC-H values 22/22 byte-identical (Q12=2/Q13=34
+  as base); TPC-H parity unchanged (2/20); TPC-DS join-method 75->73,
+  scan-type 72->71, qual-placement 11->13, match 0->0.
+- 2026-09-09 K26 §9: obstacle CLEARED — it was a test helper pinning a
+  node kind its own file calls an optimisation (`nliIn` vs
+  `nliProbeKeys`); the named test now PASSES with implied equalities.
+  But **join-order does NOT fall** (18 -> 18), falsifying §4: the
+  clauses are necessary, not sufficient. Remaining join-order work is
+  COSTING. Test fix kept; seam reverted pending Slice3 adjudication.
+- 2026-09-09 K26 §8: open question ANSWERED by probe. Implied
+  equalities turn the pinned semi join into an NLI (legal, plausibly
+  better); the test's NLI branch nil-derefs at `nliIn(nli.Inner).Key`
+  because `nliIn` does not recognise the new inner shape. Obstacle
+  reframed three times by measurement: "breaks layouts" -> "breaks a
+  remap" -> "one helper misses one shape".
+- 2026-09-09 K26 §7: enabled the transitive half and measured — breaks
+  only 3 tests, and the named obstacle fails by nil-deref in its OWN
+  helper (K19's 4th walker family), not by an assertion. Descending
+  joins does not find the semi join, so it is not merely relocated.
+  Seam reverted to constants-only, suites green; walker fix kept.
+- 2026-09-09 K26 measured: join-order's dominant cause is that goopg
+  never synthesises implied join equalities from its equivalence
+  classes, so star-shaped queries can only be joined through the fact
+  table. Next round: port `generate_join_implied_equalities`.
+- 2026-09-09 Roadmap note added (`ROADMAP-to-all-match.md`): measured
+  that reaching ALL-match is a conjunction of 6 category programs plus
+  2 storage items. join-order blocks 95/99 TPC-DS and 17/22 TPC-H and
+  is untouched. Explains why R1/R3/R6/slice-2b were each correct and
+  each moved the match count by zero — that is arithmetic, not failure.
+  TPC-DS under the flip+splice: no crashes, parity unchanged.
+  Values gate green for the committed default state (PASS=95 all-zero).
+- 2026-09-09 **Slice 2b DONE (attempt 4, splice) — K23 CLOSED.** The
+  flip no longer costs the Partial/Finalize split: aggregation-strategy
+  14 -> 10, 22/22 plans build, Q9's aggregate matches PG exactly.
+  Values 22/22 identical under the flip. That was R10 DESIGN §7's last
+  documented objection to landing the flip.
+- 2026-09-09 Slice 2b attempt 3: diagnosis COMPLETE. The derivation was
+  correct; my helper discarded the Project computing the group key.
+  Narrow (immediate-Gather) form is sound but inert. Correct fix
+  identified: splice the Gather out of the chain rather than descend to
+  its child. Landed narrow+enabled (safe), gated byte-identical.
+- 2026-09-09 Slice 2b attempt 2 also failed, measured: clearing the
+  agg spec's stamp changes nothing because the target is stamped
+  POST-HOC on the emitted node. Question narrowed to why
+  `deriveAggregateInputKeep` returns empty-but-KNOWN. Next attempt
+  starts in group_input_target.go, not the producer.
+- 2026-09-09 Slice 2b written and measured, landed DISABLED. The unwrap
+  design supersedes DESIGN §9 (no partial Path needed — the partial
+  plan is the Gather's child). K23's success test MET
+  (aggregation-strategy 14 -> 10) but 2 queries crash on a stale
+  aggregate input target; fix named, assertion kept.
+- 2026-09-09 Slice 2b fully specified (DESIGN §9) but NOT implemented:
+  site, seed, existing shape to reuse, and the double-divisor trap all
+  recorded. Stopped short of the construction deliberately — a
+  mis-split parallel aggregate returns wrong rows rather than an error.
+- 2026-09-09 Slice 2b prerequisite landed: `searchedRelOf` accessor.
+  The naive implementation returns nil (the child is a Project wrapping
+  the search root) — caught by probing, which would otherwise have made
+  slice 2b look like a costing problem. Measured under the flip:
+  partialPaths=1, so K23's input is confirmed present.
+- 2026-09-09 R21 slice 2a LANDED, and cheaper than designed: the rel
+  rides the `searchedTree` tag (the pattern the codebase already uses
+  for `searchPathkeys`), so planner.go was never touched. Gate
+  byte-identical both corpora. Yielded K25 — a rel on a node is a
+  gateway to the path graph for every generic walker.
+- 2026-09-08 Slice 2 scoped, not started: the rel's route to the
+  consumer crosses `planner.go` (`createGroupingPaths` takes no rel
+  today). Hop table recorded in the design §8 and split into 2a
+  (plumbing, byte-identical gate) and 2b (behaviour), for the same
+  reason slice 1 was split — the invasive half gets an absolute gate.
+- 2026-09-08 R21 slice 1 LANDED: the search's RelOptInfo now leaves
+  `planJoinlistSearch` instead of dying there. Purely additive — gate is
+  byte-identical plans on both corpora, and it passes. First shipped
+  code toward K24. (The initial TPC-DS diff was K18's temp-path
+  artefact against a pre-R9 baseline, not plan movement.)
+- 2026-09-08 R20 done: K23's cause is one guard —
+  `subtreeHasGather(child)` in `addPartialAggSplitPath` — and it is
+  deliberate, not an oversight; relaxing it gives a double-Gather, not
+  PG's plan. Crucially, K23 and K12(B) turn out to be the SAME root
+  cause (K24): the upper planner gets a finished Node instead of the
+  join rel's paths. Two rounds merged into one seam item (R21).
+- 2026-09-08 R19 done: the last unexplained objection to the flip is
+  discharged. aggregation-strategy 10 -> 14 is four queries (Q5/Q9/Q12/
+  Q19), each also LOSING a category, and the cause is that the flip's
+  Gather placement bypasses the partial-aggregation producer — goopg
+  loses a Partial/Finalize split it already had and PG emits (K23).
+  Wiring gap, not costing. Fix R20 first so the flip is strictly toward PG.
+- 2026-09-08 R17 done: CORRECTS R16/K21. On real data the flip gives
+  goopg PG's multi-key structure (Parallel Hash Join, both hash keys,
+  same Join Filter, same worker count) — the nested loop is only at the
+  test fixture's synthetic counts. Ninth falsified claim, new variant
+  (K22): the caveat was written and then reasoned past.
+- 2026-09-08 R16 done (findings only): PG hash-joins the multi-key
+  shape, so goopg's nested-loop fallback under the flip is a CONFIRMED
+  divergence — reversing R15's provisional disposition. The flip now
+  has one measured gain (R14) and one measured loss (K21), and cannot
+  land on the mechanism argument alone.
+- 2026-09-08 R15 done (findings only): the multi-key "fell back to
+  Nested Loop" is the COST arm, not the capability arm — the test's own
+  header explains the one-row-floor mechanism. Narrowed from "possible
+  shape regression" to "cost adjudication pending"; PG measurement for
+  the synthetic shape still owed. 2 of R10's 7 now adjudicated, 1
+  narrowed.
+- 2026-09-08 R14 done (findings only): Q9 adjudicated against PG.
+  PG uses Parallel Hash Join twice; goopg with the flip uses it three
+  times; without it, none. First evidence (not just principle) that the
+  flip is the PG-faithful direction. Join order unaffected and still
+  wrong, so no MATCH — as predicted in advance.
+- 2026-09-08 R13 done (findings only, nothing committed as code): the
+  provenance artefact must land WITH the flip or the stamp lies; and
+  mode=off still produces a Gather because the post-pass is ungated
+  (K20), so that test's control arm cannot get a serial baseline at any
+  setting. R10's set stays at 7, now fully characterised.
+- 2026-09-08 R12 done: 8 -> 7. The outer-join null-extension failure —
+  R11's "most likely genuine defect" — was K19's fourth walker.
+  4 of the remaining 7 show REAL plan movement and need adjudicating
+  against PG; the other 3 are mechanical. Flip still reverted.
+- 2026-09-08 R11 done: R10's 15 failures triaged 15 -> 8. Seven were
+  one bug in three Gather-blind walkers, one of them production
+  (`boundaryWalkChildren`). Fixes landed, green at the shipping
+  default. Flip still reverted pending the 5 substantive claims among
+  the remaining 8.
+- 2026-09-08 R10 attempted and REVERTED: flipping GOOPG_GATHER_PATHS to
+  `all` fails 15 tests pinning the pre-flip world, in >=3 classes,
+  including the test written FOR this mechanism. Reverted rather than
+  bulk-updating expected outputs; tree green, nothing half-done, list
+  captured for R11.
+- 2026-09-08 R9 done: partial-producer jointype filter landed, pinned
+  by cross-predicate test rather than a second hand-written list.
+  R8's crash reproduction plans; default-off byte-identical both
+  corpora; values green both. R10 (the flip) unblocked. Also killed a
+  measurement artefact (K18) that made identical captures diff.
+- 2026-09-08 R8 done (findings only): the partial-path CONSUMER is off
+  by default, parked on a timing decision this goal's rule voids.
+  Probed `=all`: Parallel Hash Join 0 -> 132 on TPC-DS (PG 139).
+  Flipping it is BLOCKED by K17 — a real crash on TPC-DS Q5, because
+  addPartialHashJoinPath never filters its jointype and files RIGHT
+  hash joins as parallel-aware. Found by probing before flipping.
+- 2026-09-08 R7 done: parallel-awareness plumbed onto the plan node and
+  PG's generic prefix rendered. Premise FALSIFIED as the design said it
+  would be if the label did not appear — goopg emits Parallel Hash Join
+  0 times on either corpus. K15 corrected to K16: goopg parallelises by
+  STAMPING a Gather over a serial subtree, PG by building partial paths
+  and letting them win. No parity movement; values green both. Fifth
+  falsified hypothesis, and the second in a row killed by the check it
+  asked for rather than surviving as an assertion.
+- 2026-09-08 K15 recorded (investigation, no code): with the corpus
+  fully parsed, `parallelism` is TPC-H's top divergence category (18)
+  and Q14 differs on it ALONE. goopg has a cooperative parallel hash
+  build already; what is missing is that `optimizer.Join` carries no
+  parallel-awareness field, so the flag dies at plan construction and
+  EXPLAIN cannot print `Parallel Hash Join`. Queued as R7 — cheapest
+  round with a concrete target, and self-verifying.
+- 2026-09-08 R6 done: window Sort moved from executor into the plan
+  (PG's create_one_window_path shape) behind a fail-closed Presorted
+  flag. 13 Sorts appear below WindowAgg on TPC-DS (PG: 6);
+  GroupAggregate unchanged at 13, parity unchanged, values green both.
+  All four advance predictions held. An existing pointer-walk test
+  caught an over-eager first cut that sorted before EVERY window —
+  PG only sorts when the ordering is not already satisfied. The 13-vs-6
+  residual now quantifies slice (B), which becomes R7.
+- 2026-09-08 R5 done (findings only): 9 probe tables, both engines.
+  `character(N)` padding CONFIRMED divergent; `numeric` FALSIFIED
+  (matches exactly across column counts, digit counts, NULLs). The
+  fact-table 15% has no representation explanation and is reassigned to
+  heap page FILL. Fourth falsified hypothesis of mine — and the first
+  that was labelled a hypothesis in advance and killed by the check it
+  asked for, i.e. the process working.
+- 2026-09-08 R4 done (findings only): K11b falsified — goopg DOES
+  implement compute_parallel_worker. Real cause is HEAP DENSITY (K14):
+  identical reltuples, relpages 29,761 vs 25,928 on store_sales, which
+  straddles PG's 3/4-worker band boundary. Systematic by column type;
+  all-integer table matches to 0.2%. `relpages` is a planner input, so
+  **part of this goal is not planner work** — surfaced early on
+  purpose. Third falsified claim of mine, all the same shape.
+- 2026-09-08 R3 done: PG's hashagg spill arm landed; TPC-DS
+  GroupAggregate 1 -> 13 (PG 100), TPC-H unmoved, parity flat both
+  corpora, values green both. Prediction only partly held (called the
+  rise substantial; it closes ~12%% of the gap). The measurement then
+  exposed K12 — PG's sorted aggregate wins on ORDERING, not spill —
+  which becomes R4; later rounds renumbered. K13 filed.
+- 2026-09-08 R2 done: instrument fixed (UNPARSED 0/0) AND the parity
+  target corrected twice (K9 stale serial TPC-H fixture; K10 128x
+  work_mem gap on TPC-DS). All R0/R1 parity numbers superseded; the
+  honest baseline is TPC-H 2/20/0/0 and TPC-DS 0/72/0/24/3. Advance
+  prediction held. Hand-adjudicated 5 queries per corpus, yielding K11's
+  four systematic causes; R3 (sorted aggregation) and R4 (worker count)
+  inserted ahead of the remaining costing rounds, later rounds renumbered.
+- 2026-09-08 R1 done: implemented + gated + measured. Values green on
+  both corpora; parity unmoved on both. Caught and discarded a
+  contaminated capture pair (measured the R0 binary — K5) and a
+  sign/population defect in the parameterised site. New knowledge
+  K5-K8; R2 inserted (comparator vocabulary) and later rounds renumbered.
+- 2026-09-08 R0 done: baseline captured (TPC-H 1/12/8 over 21; TPC-DS
+  0/96 real matches; 36/70/86 unplannable on both). Subagent delegation
+  unavailable in this environment (Task call cancelled) — R0 executed
+  directly, all foreground. Servers :5543/:5544 left running.
+- 2026-09-08 R0 started: K1/K2 verified against tree + oracle; tooling
+  confirmed. Branch `plan-parity-with-pg-take2`.
+
+## R29 — binder-aware escaping-outer-reference guard (done)
+
+`r29-escape-guard-binders/`. Eligibility axis. `lateral` seam declines
+1 -> 0 (TPC-DS total 9 -> 8); TPC-H values byte-identical; SF0.5 sweep
+all-zero; parity scan-type 70 -> 71 (Q68 only, see K33).
+
+- **K32 (oracle-established, corrects K27).** `LATERAL` governs the
+  visibility of SIBLING FROM items only. An enclosing QUERY LEVEL is
+  visible from a CTE body and from a non-lateral derived table by
+  ordinary correlation — verified against PG 18.3 on :65438:
+  `SELECT 1 FROM store s WHERE EXISTS (WITH c AS (SELECT s.s_store_sk) SELECT 1 FROM c)`
+  is ACCEPTED, while `WITH c AS (SELECT s.s_store_sk) SELECT 1 FROM store s, c`
+  is REJECTED ("missing FROM-clause entry for table s").
+  Consequence: K27's `*CTEScan -> return false` was unsound (correct on
+  TPC-DS only because those CTEs are top-level) and is now deleted.
+  **No "this node kind is a scope boundary" shortcut is sound.** Bind
+  by binder, not by node kind.
+- **K33 (new, costing).** TPC-DS Q68 `customer`: goopg prices a
+  `Bitmap Heap Scan` below an `Index Scan using customer_pkey`; PG
+  takes the index. Isolated by R29 — the decline had been hiding it.
+  First clean bitmap-vs-index costing divergence in this workstream.
+- **Method note.** Decline censuses are only comparable at equal
+  timeouts: the "9" of R26-R28 was a 60 s reading. Re-measure BOTH
+  sides of any decline A/B in one protocol.
+- **Method note.** A fail-closed fallback in a partially-enumerated
+  walker can make things WORSE, silently: R29's first cut enumerated
+  six node kinds, missed `*Aggregate` (the shape of every TPC-DS CTE
+  body), and drove `lateral` declines 1 -> 4. Prefer a generic walk
+  over a hand-enumerated one whenever a sibling walker already owns
+  the inventory.
+
+## R30 — ANALYZE sample sorted into physical order (done)
+
+`r30-analyze-physical-order/`. Statistics axis. PG's `compare_rows`
+re-sort (analyze.c:1312-1322) was missing, so the correlation statistic
+collapsed toward 0 for every relation bigger than the sample cap.
+`customer.c_customer_sk` 0.0737 -> 1.0 (PG: 0.999908).
+
+- **K34 (new, top blocker).** join-method is the largest movable
+  category on both corpora (TPC-DS 79, TPC-H 14) and it GREW by 2 when
+  a scan-cost input was corrected — so the divergence is in
+  nestloop-vs-hash/merge pricing, not scan pricing. Next round.
+- **K35 (method, important).** A statistics change cannot be A/B'd
+  against stored stats: re-ANALYZE BOTH sides under a pinned
+  `GOOPG_ANALYZE_SEED`. Re-ANALYZing alone moved TPC-DS join-method
+  74 -> 77 with the binary fixed. A/A floor: category counts identical,
+  plans differ only in estimate digits on 5 queries.
+- **K36 (baseline changed).** Both parity clones were re-ANALYZEd in
+  R30. Under the fresh, seed-pinned protocol TPC-H reads match=1/22;
+  earlier rounds' 2/22 was against stale stored stats and is not
+  reproducible. Quote the fresh protocol from here on.
+- Statistics axis, still open: ANALYZE never visits indexes, so
+  `estimateIndexGeometry` synthesises relpages/reltuples/tree_height.
+
+## R31 — parallelism census + heap-density root cause (investigation)
+
+`r31-parallelism-and-heap-density/FINDINGS.md`. No code change; ends on
+an owner decision.
+
+- **K37 (largest structural axis).** 66 of 99 TPC-DS queries: PG plans
+  parallel, goopg serial; ZERO the other way. `Parallel Hash` goopg 0 vs
+  PG 314. This one divergence feeds join-method, scan-type,
+  aggregation-strategy and sort-strategy simultaneously — the four
+  biggest categories after join-order are largely ONE cause.
+- **K38.** The machinery exists behind `GOOPG_GATHER_PATHS` (default
+  off). At `all`: Gather 42->104, Parallel Hash 0->167. But parity does
+  not improve (parallelism stays 90, join-method 79->82). Flipping the
+  flag is NOT the win by itself.
+- **K39 (measurement integrity — affects every TPC-DS cost result to
+  date).** goopg plans 4 workers 49 times; PG never plans 4. Both
+  `compute_parallel_worker` transcriptions are faithful; the INPUT
+  diverges. goopg's on-disk `store_sales` is 29761 pages (48 tuples/page)
+  vs PG's 25928 (55-56). Refuted by measurement: tuple encoding (numeric
+  and int tables pack identically in both), fillfactor (100 both), COPY
+  (56 rows/page both), NULL density. Confirmed: re-inserting the rows
+  with the CURRENT binary gives 25830 pages — PG-faithful to 0.4%. The
+  bench data was loaded by an older binary and `VACUUM FULL` does not
+  rewrite the heap, so it is frozen in. `relpages` also drives
+  `cost_seqscan`, so every fact scan is priced ~15% high while
+  dimensions (`item` 736 vs 1284) are priced low — a non-cancelling
+  distortion under every TPC-DS cost A/B so far, R30 included.
+  **RESOLVED, and the priority was WRONG — see R31b below.**
+- **K40 (minor, found in passing).** `round(double precision, int)`
+  resolves on goopg but does not exist in PG 18.3.
+- **Open, unestablished.** goopg's `VACUUM FULL` accepted the command
+  and repacked nothing; defect vs documented no-op not determined.
+
+## R31b — private clone rebuilt; heap confound removed (done)
+
+`r31-parallelism-and-heap-density/REPORT-fresh-clone.md`. R31 called the
+reload an owner decision and treated it as blocking; that applied only
+to the SHARED cluster. The PRIVATE parity clone was rebuilt with the
+current binary (same TSVs, same schema — 25 tables / 24 indexes verified
+on all three clusters).
+
+- **K39 CLOSED.** Fact-table pages now PG-faithful to 0.4%
+  (`store_sales` 29761 -> 25866 vs PG 25928). 4-worker plans 19 -> 0,
+  matching PG, which plans none.
+- **K39a — the correction that matters.** Fixing it did NOT move parity:
+  every category identical except qual-placement 13 -> 12, `match=0`
+  unchanged. A 15% error in every fact table's `relpages` — a direct
+  `cost_seqscan` input — changed almost nothing about plan choice. The
+  remaining divergence is in the COST COMPUTATION and PLANNING LOGIC,
+  not in the statistics fed to them. R31's "re-baseline before
+  continuing" recommendation is withdrawn.
+- **K41 (new).** Dimension tables diverge the OTHER way and are still
+  unexplained: `customer` 1979 pages vs PG 2872, `item` 716 vs 1284.
+  goopg packs wide-varchar rows more tightly than PG. Was masked while
+  the fact tables erred in the opposite direction.
+- **Baseline.** Use the fresh clone for parity from here. R30's TPC-DS
+  numbers were measured on the inflated cluster and should be
+  re-measured before being built upon.
+
+## R32 — K37 campaign slice 1: targetlist subplan display (IMPLEMENTED, all gates pass)
+
+`r32-targetlist-subplan-display/` (`DESIGN.md` reviewed
+APPROVE-WITH-NOTES, notes applied; `REPORT.md`). Project-Targets
+visit in both EXPLAIN text walkers (TEXT only; JSON out of scope).
+Q9: 6 -> 66 lines, 0 -> 15 InitPlans (InitPlan 1..15, PG placement);
+newly visible serial Aggregates make K44 measurable. Test 2
+REFUTED/reclassified: Q1/Q32/Q81/Q92 sublinks are Filter/Join-Filter
+decorrelation-vs-SubPlan (planner strategy, referred onward).
+Gates: units pass; TPC-H spotcheck Q12/Q13 PASS; SF0.5 sweep PASS=95
+MISMATCH=0 (plan-shape: 98 same, changed=Q9); TPC-DS A/B only Q9
+changed; TPC-H A/B 22/22 identical.
+
+## R33 — K37 campaign slice 2: parallel pass into uncorrelated sublinks (IMPLEMENTED, all gates pass)
+
+`r33-subquery-parallel-pass/DESIGN.md` (reviewed 2026-09-09:
+REJECT -> revised -> REJECT -> revised -> APPROVE-WITH-NOTES, notes
+applied; design commit `b03657c39`). K44: Q9's 15 InitPlans serial
+(PG: Finalize->Gather->Partial->Parallel SeqScan, corpus-max 15).
+Layer forced by elimination: R32-binary all-mode capture
+(`/tmp/pp2/k37-ds-all-r32.plans.txt`) still 0 gathers in Q9 —
+one-rel shapes never enter the path search (C-19h), only the
+post-pass can reach them. Change: recurse `MaybeAddGather` into
+`IsNonCorrelated` sublink Plans via copy-on-write graft (expr +
+plan COW, Plan-pointer seen-set, fail-closed rebuilder), only on
+non-strip outcomes; safety descent pinned to `walkExprRefs`/
+`scopeDescend`; `MultiAssignSubqRow` out; Result/IndexCond/
+IndexOnlyScan walker arms + coverage test; correlated excluded.
+`r32-targetlist-subplan-display/DESIGN.md` (reviewed 2026-09-09,
+APPROVE-WITH-NOTES, notes applied). Fresh-clone census (pinned env):
+PG-live 180 Gather / 162 PHJ lines; goopg default 42 / 0; `all` 104 /
+162; ZERO goopg gathers where PG has none. MISS set partitions into
+four classes:
+
+- **K42 (this round, display).** Q9: PG 111 lines / 15 Init-Sub / 15
+  Gathers (all under InitPlans) vs goopg 6 / 0 / 0, yet Q9 executes
+  OK. Root cause is a named skip: `walkPlanFiltered:424-427`
+  (+ ANALYZE twin :1549-1552) recurses through `*optimizer.Project`
+  without visiting `p.Targets`; fix extends the `Result`-Targets
+  precedent (:622-635) to Project in BOTH text walkers, TEXT only
+  (JSON out of scope). Same-shape smaller deltas: Q1/Q32/Q81/Q92.
+  Unblocks measuring the real Q9 gap (K44).
+- **K43 (later slice).** Partial paths above Append: Q5 trace shows
+  base partials accepted, base Gathers dominated, zero partial paths
+  on join rels (no partial-Append producer). Narrow: PG uses Parallel
+  Append in 6 queries, only Q5+Q76 miss.
+- **K44 (later slice, unmeasurable until K42).** Partial aggregation
+  inside InitPlans — Q9's real gap once displayed.
+- **K45 (later slice, estimate side).** Date-range row inflation
+  (Q5: goopg 8116–12121 vs PG 8–14 on same `d_date` predicate);
+  attribution (estimate vs Gather-costing) before any fix, per K39a.
+- **Excluded:** Q6-class misses are join-order-downstream (K26 owns).
+
+## R33 result (2026-09-09)
+
+`r33-subquery-parallel-pass/REPORT.md`. Graft shipped with a
+priced-verdicts-only gate (found in implementation: first build
+over-admitted plain-scan Gathers on 31-row/1-row subplans, Q6/Q14 —
+outcome accepted only with a fresh split). Corpus effect, all
+PG-conformant: TPC-DS Q9 15 splits (9 s -> 2 s) + Q44 2 splits;
+TPC-H Q22 InitPlan 1 splits. Gates: units + optimizer/executor
+suites (8 new tests) + TPC-H spotcheck + SF0.5 sweep (PASS=95,
+MISMATCH=0) + A/B both corpora (only intended sections move).
+Follow-ups named, not owned: Sort-rooted merge verdicts,
+Agg-over-Gather and plain-scan sublink Gathers need the
+cost-comparison round (K45 family); nested-under-parallel-top stays
+serial (nesting rule).
+
+## R34 — parse-time coercion of unknown literals (IMPLEMENTED, all gates pass)
+
+`r34-const-fold-preprocess/` (DESIGN v2 after an agent REJECT of v1;
+REPORT.md). `resolveExpr` now resolves `cast('<lit>' as DATE/TIME-family)`
+to `TypedStringLit` (parse_coerce.c:232-250) instead of a runtime
+`CastExpr`, which `selectivity.go:717 isConstExpr` does not admit.
+
+- **K45 CLOSED (attribution + mechanism).** Cast bounds reached the
+  DEFAULT 0.3333 selectivity, never the histogram: `d_date between
+  cast(..) and cast(..)` estimated 8116 vs PG 14; TPC-H `l_shipdate <=
+  cast(..)` gave exactly 6,001,215/3. Now 13. It is a PARSE-ANALYSIS
+  gap, not a missing `eval_const_expressions` — PG's parser applies
+  typinput to an UNKNOWN Const, so PG never has the node.
+- **K46/K47 (successors, required for the corpus).** Every corpus date
+  predicate uses `+ INTERVAL`, where only the lower bound folds, so the
+  15 affected queries moved 8116 -> ~12121: still wrong and NUMERICALLY
+  FURTHER from PG's 14. Needs `estimate_expression_value` (folds STABLE
+  for estimation only; `date_in` is `provolatile='s'`, so an
+  immutable-only guard folds nothing) plus a type-aware histogram
+  comparison (`formatExprConstant` matches byte-equal, so a folded
+  timestamp cannot match a date histogram — measured 204 vs 14).
+- **K48.** Pre-existing `FoldConstants` defects, live today via
+  `foldPlanConstants` (planner.go:2136) and NOT introduced by R34:
+  numeric arithmetic via float64 (`1.10+2.20` -> `3.3`, PG `3.30`), no
+  int4-width overflow (`2e9+2e9` folds instead of raising 22003),
+  byte-wise string ordering ignoring collation.
+- **K49 — WITHDRAWN as proven; see R35 §1. The evidence was void.**
+  Three controlled experiments: R30 correlation (~14x), R31b relpages
+  (15%), R34 cardinality (580x on 15 queries). join-order stayed at
+  exactly 95/99 and 20/22 through all three; R34 moved NO category on
+  either corpus. Stop spending rounds on estimate inputs expecting join
+  order to follow. Target the SEARCH: enumeration order, `add_path`
+  dominance, and whether both candidates are generated at all.
+- **Correction to record.** My claim that `FoldConstants` was dead code
+  was FALSE (grep excluded `foldconst.go`, which holds the wrapper). It
+  runs at planner.go:2136 — but AFTER plan selection, so selectivity
+  never sees folded quals. Only the timing differs from PG.
+
+## R35 — metric blindness + join-cardinality divergence (investigation)
+
+`r35-join-cardinality-and-metric-blindness/FINDINGS.md`. No code change.
+
+- **K50 — MEASUREMENT ERROR, affects how every round is judged.**
+  `pg-plan-parity-diff.py:44-62` normalises estimates OUT of the
+  comparison: N1 strips `rows=`/`cost=`, N5 strips `::type`, N6 compares
+  quals by (columns, operator multiset) NOT literal values. **No
+  estimate change can ever move a parity verdict.** R34 is proof: 18
+  TPC-DS plans changed and every category was byte-identical.
+  Report `shape-delta.sh` counts ALONGSIDE category counts every round:
+  shape-changed=0 means the round moved no plan at all (category zero is
+  trivial); shape changes with no category movement means plans moved
+  SIDEWAYS, which is a different and more interesting result.
+- **K49 WITHDRAWN.** "join-order is not estimate-driven" was inferred
+  from R30/R31b/R34 showing no movement. Reason CORRECTED: two of the
+  three did change plan structure (6 and 10 queries), so they were not
+  incapable of moving the metric — but join-order stayed at exactly
+  95/99 across 16 structural changes. That is evidence join order
+  resists estimate corrections, NOT proof it is estimate-independent.
+  Do not cite it as proof.
+- **K51 — join cardinality drops whole clause classes.** EXPLAIN on
+  `orders ⋈ lineitem` shows Merge Join `rows=6001255` above an input
+  scan of `rows=2000418` — three different counts in one plan.
+  Constant comparisons propagate to the join estimate;
+  column-vs-column (`l_shipdate < l_commitdate`) and unfolded-interval
+  bounds are dropped at selectivity 1.0, though the SCAN applies
+  DEFAULT_INEQ_SEL correctly (goopg and PG both estimate 479,869 for
+  the equivalent TPC-DS predicate). Q12: goopg 6,001,255 vs PG 28,127.
+- **K52 — the open question, deliberately unanswered.** Those are
+  `EstimateRows` numbers (the plan-tree walker EXPLAIN reads), not
+  `calcJoinrelSize` (the `searchCtx` method the join search consumes).
+  Only the latter can affect join ORDER. Instrument it on TPC-H Q12 —
+  a TWO-relation join, so zero enumeration complexity — before
+  proposing any fix. Do not read the rendered number and assume the
+  search saw it.
+
+## R36 — baserel selectivity gate (LANDED, all gates pass)
+
+`r36-baserel-selectivity-reliable-gate/` (`DESIGN.md` reviewed
+APPROVE-WITH-NOTES; `STATUS.md` records where it stopped). Tree is green
+at HEAD — the implementation was reverted, not shipped.
+
+- **K52 ANSWERED: the join SEARCH shares the cardinality defect.**
+  `GOOPG_JRS_TRACE` on `calcJoinrelSize` for TPC-H `orders ⋈ lineitem
+  WHERE l_shipdate < l_commitdate`: `inner.Rows=6001255` (RAW), never
+  the restricted 2000418. So join ORDER is chosen against a 3x-wrong
+  cardinality. Source-reading suggested the opposite; only
+  instrumenting the consumed value found it.
+- **K53 — the naive fix is a 22x error.** Do NOT just delete
+  `if !sel.reliable { return baseRows }`. `sel.value` already carries
+  PG's DEFAULT_* constants; the defect is the AND COMPOSITION. The
+  `…WithSource` twin multiplies conjuncts pairwise
+  (selectivity.go:838-847); the plain `clauseSelectivity` twin routes
+  AND through `conjunctionSelectivity`, which ports PG's punt rule
+  (either bound at DEFAULT_INEQ_SEL -> DEFAULT_RANGE_INEQ_SEL,
+  rangequery.go:185-192 / clausesel.c:283-286). On `x>=a AND x<b`
+  without a histogram: naive = 1/3 x 1/3 = 0.111 vs PG 0.005.
+  **Consume `clauseSelectivity`.** That also makes the search agree
+  with the scan-level estimator, which already uses it.
+- **K54 — the blocker, and a likely harness bug worth its own look.**
+  Three executor tests fail under the fix
+  (`TestC19fPathModelGatherExecutesAsAParallelHashJoin`,
+  `TestC19fGatheredHashBuildRunsOnceAndIsShared`,
+  `TestSetOpJoinPromotesToHashJoin`). They pin MECHANISMS and must not
+  be re-tuned. Diagnostics were inconclusive: after inserting 4000 rows
+  the plan still showed `Seq Scan on sj_ws rows=1` with NO filter — the
+  inserted data never reaches `baseRows` in that harness. Find out why
+  (suspect in-memory catalog `RowCount` not refreshed by INSERT) BEFORE
+  judging those three tests.
+- **Three tests correctly re-derived already** (work is reproducible
+  from STATUS.md): two pinned the bug outright; the third
+  (`…PlacementIdenticalWhenStatsAbsent`) encoded an equivalence that
+  held only because of the gate, and `relsize.go:169-177`'s comment
+  becomes false with it — a cold-server behaviour change, matching PG.
+
+- **K55 — ANALYZE leaves `Stats.RowCount=0` in the executor test
+  harness.** Probed directly after loading the setop fixture and
+  ANALYZEing every table: `sj_ws Stats.RowCount=0 cols=4` (same for
+  `sj_item`, `sj_td`) — per-column statistics ARE populated, the row
+  count is NOT. With `RowCount==0`, `estimateBaseRelInfo` yields
+  `baseRows==0` and everything falls to `applyRelSizeFallback`'s
+  block-derived count, ~1 in this in-memory harness. That is why a
+  4000-row table rendered `Seq Scan on sj_ws rows=1` with no Filter,
+  and why both R36 diagnostics (add rows / add ANALYZE) were inert.
+  Related known shape: `internal/initdb/open.go` builds
+  `TableStats{Columns: ...}` with `RowCount` left zero on restore.
+  **Consequence:** the three blocked executor tests cannot be repaired
+  by data or ANALYZE; they currently measure the reliability gate, not
+  their own mechanisms (at HEAD `sj_item` keeps 5 rows and `sj_td` 11
+  ONLY because the gate discards the default). Fix/characterise
+  RowCount first, then seed those fixtures via `SetTableStats` at sizes
+  where the promoted plan is genuinely cheaper, then re-run R36.
+
+- **K56 — ANALYZE cannot see same-transaction rows (a PG divergence).**
+  Refines K55. `SELECT count(*) FROM sj_item` returns 3 while an
+  immediately following `ANALYZE sj_item` in the SAME `*Context` stamps
+  `RowCount=0 Pages=1 cols=4`. The sampling loop counts only tuples
+  passing `transam.TupleVisible` (`operators_analyze.go:873`) and
+  `SetTableStats` merely assigns (`catalog.go:13112`), so zero means the
+  per-tuple visibility test rejected everything; `Pages=1` proves the
+  pages were read. The four column entries come from the empty
+  reservoir — which is exactly why populated `Columns` appear beside a
+  zero `RowCount`. PG's ANALYZE uses the current snapshot and DOES see
+  same-transaction rows. Invisible on the live clusters because those
+  ANALYZE committed data in autocommit (`store_sales` reltuples reads
+  1,439,608 correctly).
+  **Consequence:** any test or tool that ANALYZEs inside a transaction
+  and then reasons about cardinality silently reads zeros, and it looks
+  healthy because the column stats are present.
+  **NOT a prerequisite for R36** — R36 should seed its three fixtures
+  with `SetTableStats` (as the optimizer-side tests do), which bypasses
+  ANALYZE entirely. K56 deserves its own round.
+
+## R36 LANDED (second attempt, after K56 unblocked it)
+
+`r36-baserel-selectivity-reliable-gate/REPORT.md`. Baserel sizing
+multiplies unconditionally via `clauseSelectivity` (NOT the
+`…WithSource` twin — K53's 22x trap).
+
+- Join estimate consistency fixed: TPC-H `orders ⋈ lineitem` Merge Join
+  6,001,255 -> 2,000,418, matching its input.
+- **24 plan SHAPES changed** on TPC-DS — the largest structural
+  movement of any round (R34: 0, R30: 6). Net category **−2** on
+  TPC-DS (parameterisation 44→41, parallelism 90→88,
+  aggregation-strategy 83→82; join-method +1, scan-type +1,
+  sort-strategy +2) and **−1** on TPC-H (join-method 14→13).
+- Gates: units 44 ok; TPC-H values byte-identical; SF0.5 sweep PASS=95
+  all-zero, verdict-changes=none, runtime −2.3%.
+- **K49's suspicion now has real evidence.** join-order held at exactly
+  95/99 and 20/22 through R30, R31b, R34 AND R36 — 40+ structural
+  changes, zero movement. Target enumeration and `add_path` dominance
+  next, not cost inputs.
+- **K57** `inferAnchoredEqualities` rule (2) is now vacuously true for
+  default-priced filters (both defaults < 1/2) — an ENUMERATION change
+  that caused the M0075/M0076 Q9 hang when it over-fired. Inert (no
+  non-test caller); commented at the site. Re-derive before wiring.
+- **K58** `scaleByFloat` truncates where `clamp_row_est` rounds.
+- **K59** goopg-only thresholds (`nliMaxOuterRowsHeuristic`,
+  `memoizeMinOuterRows`) are crossed far more often now; some shape
+  changes are heuristic-driven, not cost-driven.
+
+## R37 — two seq-scan cost models (investigation, no code change)
+
+`r37-two-cost-models/FINDINGS.md`.
+
+- **K60 — goopg prices seq scans two different ways, differing by the
+  ENTIRE page term.** `costSeqscan` (cost_funcs.go:192) is PG-faithful
+  and is called only from the path search; a one-relation statement
+  never enters the search (`makeRelFromJoinlist` returns at
+  `len(items)==1`) and is priced by a legacy model that omits
+  `seq_page_cost*relPages`. Measured: `lineitem` 196,405.55 (search,
+  = 136393 + 60012.55, PG's formula exactly) vs 60,012.55 (legacy).
+- **K61 — WITHDRAWN, see the R37 correction. WRONG.** R36's Q12 carries
+  `orders` at the search's 43,435.00 and `lineitem` at the legacy
+  60,299.79, where the search's formula would give ~271,421. The
+  largest relation is the one priced without pages, so `lineitem` looks
+  4.5x cheaper to scan than it is — the exact direction that makes
+  goopg hash `lineitem` where PG hashes `orders`. Candidate root cause
+  for join-method and the build-side half of join-order.
+- **Eliminated by probe, not argument:** Q12's build side does NOT flip
+  when the estimate is corrected (hand-folded bound gives 28,724 vs
+  PG's 28,127) nor when parallelism is disabled. So it is neither an
+  estimate nor a parallelism artefact.
+- **K62 ANSWERED — the search used the CORRECT cost.** Instrumented on
+  Q12's exact shape: `SEQCOST pages=136393 tuples=6001255 qualops=5 ->
+  total=271421.24`. Pages and all five quals included, PG's formula
+  exactly. EXPLAIN alone renders 60,299.79. K61's "both models in one
+  plan" claim described the RENDERING, not the decision, and is
+  withdrawn.
+- **Q12 build-side RESOLVED — see K64.** Four candidates eliminated: estimate (folded bound gives
+  28,724 vs PG 28,127, side does not flip), parallelism (disabling does
+  not flip it), page term (search had it). Next probe is the comparison
+  itself — instrument `add_path` for both hash-join orientations and
+  record both candidates' costs, or whether the PG-shaped one was
+  generated at all (`planner_verify_both_candidates_generated`).
+- **K63 — EXPLAIN reports a scan cost the planner did not use.**
+  60,299.79 rendered vs 271,421.24 consumed: a 4.5x understatement on
+  the corpus's largest relation. Does NOT affect plan choice, but it
+  corrupts every cost-based artefact read here — `plan-gate
+  MODE=semantic-cost`, estimate-audit tables, and any human reading an
+  EXPLAIN. The cost twin of the `EstimateRows`/`calcJoinrelSize` row
+  split. Reporting-integrity fix; do NOT expect categories to move.
+
+- **K64 — WITHDRAWN, WRONG (reverse-engineered from totals). See K65.** `GOOPG_HJ_TRACE` on `addHashJoinPath` for Q12, both
+  orientations as the search costed them:
+  `probe=orders(1.5M,43435) build=lineitem(28724,271421) -> 328627.53`
+  vs `probe=lineitem(28724,271421) build=orders(1.5M,43435) ->
+  534007.10`. PG's orientation WAS generated and `add_path` correctly
+  took the cheaper of the two numbers it was given — the numbers are
+  what is wrong. Scan inputs are identical either way (314,856), so the
+  whole difference is hash overhead: 13,771 building 28,724 rows vs
+  **219,151 building 1,500,000** = ~0.146 per build row, against PG's
+  ~`cpu_operator_cost` (0.0025). That term is why goopg always builds
+  the small side while PG hashes 1.5M `orders` to stream the expensive
+  `lineitem` scan once.
+  Fix: diff `hashJoinCost` (cost_funcs.go) term by term against
+  `initial_cost_hashjoin`/`final_cost_hashjoin` (costsize.c:4200-4450).
+  Squarely a cost-computation fix the parity metric CAN see; expect
+  `join-method` movement and possibly the build-side half of
+  join-order. Do NOT expect `match`.
+- **Chain of elimination, for the record** (each by measurement, not
+  argument): estimate -> parallelism -> page cost -> candidate
+  generation -> arithmetic. Both orientations ARE enumerated
+  (`makeJoinRel` calls `addPaths` twice, joinsearchlevel.go:658/661,
+  matching joinrels.c:916/919), so goopg's join search is structurally
+  PG-shaped here; only the pricing diverges.
+
+- **K65 — goopg has NO COLUMN PRUNING; rows are 20-32x too wide.
+  Replaces K64 and is the largest single divergence found this
+  session.** TPC-H Q12: goopg `orders` width=448 / `lineitem` width=550
+  against PG's 22 / 17, for a query reading one column from `orders`
+  and four from `lineitem`. At `work_mem=64MB` a 1.5M-row `orders`
+  build is 641 MB in goopg (multi-batch, ~200,000 of spill I/O) versus
+  31 MB in PG (single batch, no spill). THAT is the whole 205,380 gap
+  that made goopg refuse PG's build side — `hashJoinCost` is handed a
+  side 20-32x too wide and its spill arithmetic then behaves correctly.
+  Instrumented terms: bucket 71.81 / 9,375, build ~18,750 — none of
+  them the difference.
+  Existing note `goopg_optimizer_no_attr_needed_no_ios_path` records
+  the shape: inside a join tree there is no `Project` above the scan,
+  so there is nowhere to hang a narrowed target list.
+  **Blast radius:** width feeds hash geometry, every spill/batch
+  decision, Gather transfer costs, sort footprints and memory budgets —
+  so it perturbs join-method, parallelism AND sort-strategy at once,
+  three of the four largest remaining categories. Architectural change
+  is explicitly permitted for this goal.
+- **Method note (cost time twice this round).** K61 and K64 were both
+  inferred from rendered numbers / totals rather than instrumented
+  terms, and both were wrong. **Instrument the term, never infer it
+  from the sum.**
+
+## R38 — reltarget width (REJECTED on review, then refuted by measurement; NOT implemented)
+
+`r38-reltarget-width/DESIGN.md` + `STATUS.md`. Tree green; no code change.
+
+- **K66 — the design targeted the wrong field.** `pathNCols` /
+  `pathAvgVarBytes` (`path.go:634-658`) read `NCols`/`AvgVarBytes`,
+  never `Width`. The spill term is a function of COLUMN COUNT:
+  `EntryBytes = 48*ncols + 24 + avgVarBytes`
+  (`hashsize/hashsize.go:144-152`). 641 MB = `1.5M x (48x9 + 24)` from
+  `orders`' 9 COLUMNS, not from `width=448`. EXPLAIN's `width=` is
+  `TupleWidth(n.Output())` — a symptom, not the input. Correct target:
+  `RelOptInfo.NCols` + `AvgVarBytes`.
+- **K67 — and even then it would NOT fix Q12.** Narrowed to the single
+  needed column, goopg is 72 B/row -> 103 MB for 1.5M `orders` rows,
+  which STILL spills at `work_mem=64MB`; PG is 22 B/row -> 31 MB and
+  fits. Column pruning is a real 6.3x win (456 -> 72) and remains 3.3x
+  above PG. The residue is `DatumBytes=48` per column vs PG's ~22-byte
+  whole MinimalTuple — the existing
+  `docs/design/not_ralph/minimize_datum/` workstream. **K65 is
+  NECESSARY BUT NOT SUFFICIENT; it is blocked on that.**
+- Review findings kept: executor sizes from the RUNTIME schema
+  (`operators_join_agg.go:607-609`), so narrowing planner width cannot
+  under-size the real table (hazard refuted); nothing derives a schema
+  from `RelOptInfo.Width`, but `considerparallel.go:567` feeds it to
+  `estScanPages` as a PAGE count, which PG never does; the node-free
+  keep-set is `neededKeepSet` (`narrowoutput.go:789-806`), since
+  `joinKeepSet`/`buildKeepSet` need a built node; correct placement is
+  between `relfromjoinlist.go:699` and `:707` with the base path
+  re-costed; do NOT mutate `RelOptInfo.AvgVarBytes`/`ColVarBytes` —
+  `entrywidth.go:53-56` uses them as the executor's over-charge
+  fail-safe. PG order confirmed: `set_rel_size` (allpaths.c:322)
+  completes before `set_rel_pathlist` (:351).
+- **Why not implemented:** the design's own prediction ("the spill term
+  disappears") is now known false. Landing it alone would churn shapes
+  on both corpora while leaving the target query unmoved.
+
+## R39 — the 8 seam declines, triaged (investigation, no code change)
+
+`r39-seam-decline-triage/FINDINGS.md`. Census unchanged by R36. A
+declined query falls to the legacy planner and CANNOT match PG by any
+costing work, so these 5 queries are hard-blocked from `match`.
+
+- **K68 — `outer-over-derived` (3) is a DELIBERATE guard, blocked on
+  B-06.** `relfromjoinlist.go:665`. An outer join over a derived (CTE)
+  input has no statistics, so every path prices at rows=1; Q78 once
+  costed Nested Loop 3.07 vs Hash 3.09 on that lie and ran 15 s -> 327 s
+  TIMEOUT. Its resume note says "lift when B-06 wires CTE-output
+  stats". **Verified B-06 has NOT landed**: `cte_stats_synthesis.go` is
+  step 2 part 1 and its header says "nothing here is called from
+  production yet ... inert by construction"; no non-test caller exists.
+  DO NOT lift this decline first — it re-opens a measured 20x timeout.
+- **K69 — `outer-link-no-sjinfo` (3)**, `joinsearchseam.go:477`: outer
+  links with no matching SpecialJoinInfo (the fail-closed
+  `outerLinksHaveSJInfos` guard). R27 fixed the Q49 instance of this
+  class by making the PLAN and `join_info_list` agree on join TYPE;
+  these three are a different instance needing their own diagnosis.
+  Worked precedent exists.
+- **K70 — `outer-spine` (2)**, `joinsearchseam.go:253`, when
+  `splitOuterSpine` cannot peel the pinned spine. Already knowingly
+  deferred at `planner.go:1515` too. Deepest of the three.
+- Five of the eight sit on ONE problem
+  (`web_returns,date_dim,web_page`); the other three are one shape
+  across the three sales channels.
+- **Recommended order: B-06 wiring -> outer-link-no-sjinfo -> outer-spine.**
+
+### Cross-workstream dependencies (state plainly, do not re-investigate)
+
+Two of this session's blockers terminate in OTHER in-flight
+workstreams, and neither is a defect in this one's plan:
+
+- **K65** (column pruning) needs `minimize_datum` for `DatumBytes`;
+  pruning alone leaves 72 B/row vs PG's 22 and still spills (K67).
+- **K68** (3 declines) needs B-06's consumer wiring.
+
+## R40 — complete the LEFT->ANTI transplant (K69, DESIGN pre-review)
+
+`r40-left-anti-transplant/DESIGN.md`. Root-causes K69's three
+`outer-link-no-sjinfo` declines (all in Q78) by instrumenting
+`outerLinksHaveSJInfos` directly (temporary trace, reverted before
+commit) rather than inferring from code: all three fire on an identical
+mismatch, `want jt=1(LEFT) ... have jt=6(ANTI)` on the same relids. Each
+of Q78's three CTE bodies (`ws`/`cs`/`ss`) has
+`<channel>_sales LEFT JOIN <channel>_returns ON … WHERE
+<returns>.order_number IS NULL`; `reduceOuterJoins`'s real call
+(feeding `ctx.joinInfoList`) demotes this to ANTI via S9.3, but
+`demotedForPlan` — by K30's deliberate, correct-at-the-time decision —
+transplants only the INNER half of the verdicts to the plan tree,
+leaving the plan at LEFT. The two consumers disagree on Jointype and
+`outerLinksHaveSJInfos` fails closed.
+
+**Verified against the PG 18.3 oracle (`:65438`)**: this exact shape
+plans as `Merge Anti Join` with the `IS NULL` qual dropped from the
+rendered plan entirely (not a residual filter); row counts match
+(323532) between the LEFT+`IS NULL` form and an explicit `NOT EXISTS`
+rewrite. This is a real, currently-unrealized parity opportunity, not
+an eligibility technicality.
+
+**Confirmed why a bare Jointype transplant is unsafe** (locks down
+K30's one-line reason structurally): `Join.Output()` (`plan.go:1205`)
+and `joinPublishesInner` (`joinrelsize.go:136`) both drop the
+inner/nullable side's columns for Semi/Anti — transplanting ANTI without
+also removing `wr_order_number IS NULL` from WHERE would try to resolve
+a column that no longer exists in the join's output row. Separately,
+`mapJoinType` (`planner.go:6586`) has no `parser.JoinAnti` case and
+silently falls to `JoinTypeInner` — both gaps must close together.
+
+**Design proposes**: (a) `demotedForPlan` transplants ANTI too and
+reports which table(s) it demoted; (b) `mapJoinType` learns
+`parser.JoinAnti -> JoinTypeAnti` (not `JoinSemi` — `applyDemotion`
+never produces one, so mapping it would be speculative); (c) a new
+`stripForcingNullQuals`, mirroring `collectForcedNullTableNames`'s
+top-level-AND-only walk exactly (so it can only drop what the decision
+side already certified as forcing), removes the specific `IS NULL`
+conjunct from a LOCAL copy of the WHERE clause before it is resolved
+into the top Filter — `s.Where` itself is never mutated, same
+discipline `canonicalizeQual` already uses one line below it.
+
+**Adversarial review (subagent, full HEAD re-derivation) found a real
+gap and it is now closed in the design.** 15 factual claims verified
+against the real source, including both crux wiring questions (is
+`ctx` the same object across `planFromClause` and the WHERE arm? is
+`demotedForPlan`/`reduceOuterJoins` called with the same raw
+`s.Where` `stripForcingNullQuals` would walk?) — both yes. But review
+found (a)-(c) alone would be reachable-and-wrong for Q78 itself:
+`planFromItem`'s per-item schema-carry (`planner.go:3211,3346-3347`)
+does not narrow for Semi/Anti when a further join in the SAME
+`FromExpr` chains onto it — exactly Q78's `<channel>_sales
+LEFT JOIN(->ANTI) <channel>_returns ... JOIN date_dim` shape. Traced
+to a PREVIOUSLY SHIPPED bug of the identical class
+(`joinlayout.go`'s `reresolveJoinByName` doc: a stale merged
+Semi-join schema corrupted Q21's NOT-EXISTS to 0 rows instead of
+~411) and to an existing safe counter-pattern already in the codebase
+(`unnest.go:3315` stores a left-only schema at Semi/Anti construction
+rather than deferring to `Output()`). **Design now includes §4d**
+(mirror that pattern + gate the loop-carry on join type), traced
+end-to-end for Q78's exact shape, and §6's gate list now requires a
+3-relation VALUES regression (not just 2-relation) since only the
+3-relation shape exercises §4d. Full record in DESIGN.md §8.
+
+**LANDED** (`r40-left-anti-transplant/REPORT.md`). All gates green:
+sweep PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0, TPC-H values
+byte-identical AND plan structure identical across all 22, precommit
+units green.
+
+- **Match count did NOT move** (TPC-DS 0/99, TPC-H 1/22) and the decline
+  TOTAL did not move (8). `outer-link-no-sjinfo` 3 -> 0, replaced by
+  `leaf-count` 3. Say this plainly: the round bought a PG-faithful join
+  TYPE and a correctness fix, not a match.
+- **K71 — the round's most important outcome: goopg's S9.3 LEFT->ANTI
+  rule was OVER-FIRING and would have shipped wrong rows.** PG uses TWO
+  granularities deliberately (prepjointree.c:3340-3403): LEFT->INNER is
+  `find_nonnullable_RELS` (relation), LEFT->ANTI is
+  `find_nonnullable_VARS` + `mbms_overlap_sets` (COLUMN). goopg used
+  relation granularity for both. `a LEFT JOIN b ON a.id=b.id WHERE b.y
+  IS NULL` was demoted to ANTI though the ON is strict for a DIFFERENT
+  column than the WHERE forces; oracle: PG emits `Merge Left Join` +
+  `Filter`. The bug was already in `ctx.joinInfoList` (which
+  `reduceOuterJoins` populates today) — invisible only because K30
+  declined the transplant. Both shapes now match PG exactly on SF0.5
+  (323,532 same-column / 325,179 different-column — genuinely different
+  queries).
+- **K72 — the new blocker.** The 3 declines are now `leaf-count`, all
+  `nrels=2 nleaves=2`: an ANTI join's right side is not a search leaf
+  (it is a pinned sub-problem) but Q78's ANTI sits at the BOTTOM of its
+  chain with an INNER `date_dim` join above, so it is not a top-of-tree
+  spine either and `runJoinSearchBelowPinned` does not apply. Adjacent
+  to K70's `outer-spine` work; that is the next round.
+- **K73 — a measurement reversed a decision that had passed review.**
+  `nliCostGateAccepts`' SEMI/ANTI arm charges a B-tree descent as 1 unit
+  (same as a hash probe), so it accepted Q78's 1.44M-row outer by a hair
+  and ran it at 54s vs 16s. Capping the gate by outer size was tried and
+  REJECTED by measurement: it also caught unnest-sourced SEMI joins,
+  where the premise fails the other way — TPC-H Q4's EXISTS has a 385k
+  outer but a 6M-row `lineitem` inner, and the cap made it 1.5s -> 13.1s
+  (8.6x). One threshold cannot serve both populations. Landed instead:
+  `Join.FromOuterReduction` marks only the joins this round creates and
+  declines NLI for them; every existing decision is byte-identical and
+  Q78 ends at **14s, 2s FASTER than the 16s pre-R40 baseline**. Retire
+  the flag when the gate learns a real index-descent probe cost.
+- Also landed: `mapJoinType` learns `parser.JoinAnti` (it silently fell
+  to `JoinTypeInner`, which would have been wrong rows); per-item schema
+  narrowing for Semi/Anti in `planFromItem` (review-found, DESIGN §4d —
+  a chained join after the ANTI read offsets against the stale merged
+  width); `stripForcingNullQuals` dropping exactly the certified
+  conjuncts without mutating `s.Where`.
+- **Method:** the diagnosis came from instrumenting
+  `outerLinksHaveSJInfos` directly (temporary trace, reverted), per
+  R37's "instrument the term, never infer it from the sum". TWO
+  decisions this round were reversed by measurement after passing
+  review — the adversarial review caught the schema gap, but only the
+  A/B caught the NLI cap.
+
+
+## R41 — the ANTI leaf-count decline is a coordinate-space mismatch (DESIGN, pre-review)
+
+`r41-anti-leaf-coordinates/DESIGN.md`. Successor to R40's K72.
+
+- **K74 — R40 BROKE A DOCUMENTED INVARIANT; K72 is a defect this
+  workstream introduced, not a pre-existing mismatch.** Instrumented
+  (trace reverted before commit), same reading for all three Q78 CTEs:
+  `DPTRACE LEAFCOUNT nprefix=3 nscans=2 jl=2` alongside the standing
+  `nrels=2`. Three of the four numbers are 2; only `jl.nrels()` is 3.
+  R40's §4d narrowing correctly stopped emitting a `rangeBinding` for a
+  SEMI/ANTI nullable side (`planner.go:3466-3471` does not advance
+  `leftCtx`), but the joinlist deconstruction still allocates a LEAF
+  INDEX for it — so `len(ctx.bindings)=2` while `jl.nrels()=3`.
+  `fromItemRels` (`collapse.go:423`) states the violated invariant in
+  its own comment: *"Exactly the number of `rangeBinding`s
+  `planFromItem` appends for the same item … which is what keeps leaf
+  numbering and binding order in step."* **First design draft called
+  this an inherent "two coordinate spaces" condition and was refuted on
+  review** — `bindings`/`scans`/`cumOffsets`/`boundaryMap`/`leafRel` are
+  ALL already in collapsed space; only the joinlist and the SJI scope
+  are not. Our own trace had printed `nrels=2` all along and the draft
+  mis-attributed it.
+- **K75 — the `leaf-count` decline is currently preventing a PANIC, not
+  a wrong answer.** With `len(ctx.bindings)=2` and `nprefix=3`,
+  `ctx.bindings[:nprefix]` (`joinsearchseam.go:507`, `:538`) is
+  index-out-of-range. The seam panics before
+  `validateJoinlistProblem`'s second net can fire. So the one-line
+  "compare `len(jl)` instead of `nrels()`" fix converts a clean decline
+  into a crash.
+- **The fix is a RENUMBERING, not a remap** (design §4): `prob.scans[i]`
+  is already the opaque ANTI `*Join` node, so a joinlist LEAF naming it
+  resolves through the existing `leafRel` path with `lo,hi=i,i+1` and no
+  coordinate work. Four sites: `deconstructFromItemScoped`,
+  `fromItemRels`, `newSjiScope`, and dropping the ANTI's SJI from
+  `join_info_list`. Plus a new `len(ctx.bindings) == jl.nrels()`
+  assertion, because after the fix nothing else would catch a
+  desynchronisation between the plan tree's `demotedForPlan` verdict and
+  the joinlist's separate in-place `reduceOuterJoins` verdict.
+- **Do NOT generalise to FULL.** A pinned FULL item keeps BOTH bindings
+  (`planner.go:3470` skips only Semi/Anti), so collapsing it would make a
+  leaf span two binding coordinates — that is where the real
+  `boundaryMap` totality risk lives (`createplanroot.go:263` panics on an
+  unfillable hole). For SEMI/ANTI there is no hole, because the nullable
+  side has no binding coordinate at all.
+- **The one-line fix (compare `len(jl)` instead of `nrels()`) is WRONG.**
+  `nprefix` also feeds the preceding `leafRange()` equality and the
+  `cumOffsets` sizing, both of which consume FROM-item indices. Changing
+  its unit for the count alone would let the guard pass with the offsets
+  still wrong — converting a clean decline into silently mis-resolved
+  columns, this workstream's recurring failure mode (Q21's stale merged
+  Semi schema; R40 §4d).
+- `extractSearchLeaves` treating ANTI as opaque is FORCED, not an
+  oversight: `Join.Output()` returns `Left.Output()` for Semi/Anti, so
+  the right side's columns do not exist above the node.
+  `joinPinned(parser.JoinAnti)` is already `true`, and
+  `pinnedOverAPinnedSide`'s comment had already NAMED this exact hazard
+  ("the JOINLIST side flattens while the PLAN side stops at the link and
+  `extractSearchLeaves` returns one opaque leaf — the leaf count then
+  disagrees with the relation count"). R40 created a new instance of a
+  hazard the file predicted.
+- **Even if fixed, Q78 is not predicted to MATCH**: a 2-leaf search
+  cannot place `date_dim` below the anti pair the way PG's 3-leaf search
+  can. Eligibility is necessary, not sufficient — same relationship R27
+  §4a recorded for Q49.
+
+
+### R41 implementation: BUILT, MEASURED, then REVERTED — and why (K76)
+
+The design's 4-step fix was implemented in full (`antiCollapsedJoins` in
+`collapse.go` consumed by `deconstructFromItemScoped` / `fromItemRels` /
+`newSjiScope`, plus the `prefix-exceeds-bindings` fail-closed guard) and
+it WORKS on its own terms:
+
+- **`leaf-count` declines 3 -> 0; TPC-DS declines 8 -> 5**, no new class.
+- optimizer + executor suites green; **sweep PASS=95 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0**, Q78 checksum unchanged; TPC-H values
+  byte-identical AND plan structure identical across all 22.
+- Design §6's prediction CONFIRMED against the oracle: PG places
+  `date_dim` BELOW the anti join (`Nested Loop Anti Join` over
+  `Parallel Hash Join`); goopg's 2-leaf search can only build
+  `(sales anti returns) JOIN date_dim`. Eligibility gained, match not.
+
+**It was reverted anyway, because admitting the body to the search LOSES
+a qual placement PG has.** Q78's three `date_dim` scans went from
+`rows=149  Filter: (d_year = 1998)` to `rows=73049` with no filter, and
+runtime 14s -> 26s. That is a **qual-placement PARITY regression**, not
+merely a timing one, so the goal's "ignore execution-time degradation"
+clause does not cover it (it applies only when the plan IS PG-identical,
+and this one is not).
+
+- **K76 — root cause, instrumented (traces reverted).**
+  `pushQualsThroughSingleRefCTEs` runs from `Plan()`'s TAIL
+  (`planner.go:159`) on the FINAL tree, so it must descend whatever the
+  body was planned into. Probes: the conjunct maps through every
+  `*Project`/`*Aggregate` layer fine (`project remap ok=true`), then dies
+  in the join descent — `CTEPUSH join type=0 pushable=true
+  L=*optimizer.Join R=*optimizer.Project`. **The searched boundary wraps
+  the scan in a `*Project`, and `pushConjunctIntoSubtreeTraced`
+  (`inner_join_qual_pushdown.go:388`) has no `*Project` arm**, so the
+  descent stops. `joinRestrictionSides` refusing ANTI is NOT the cause —
+  no `pushable=false` was ever traced.
+  This is NOT anti-specific: any CTE body the search admits hits it. It
+  was simply unreachable while these bodies all declined.
+- **Next round is therefore K76, not K72**: give
+  `pushConjunctIntoSubtree` a `*Project` arm (mirroring the one
+  `pushConjunctIntoCTEBody` already has, via
+  `remapConjunctThroughProjection`). It is a shared pass, so it will
+  enable pushdowns in many other searched trees at once — real blast
+  radius, its own round and its own gates. **Land K76 FIRST, then R41's
+  implementation on top**; in that order the eligibility gain arrives
+  without the parity regression.
+- The R41 implementation is fully specified by `DESIGN.md` §4 and was
+  verified to build, pass every suite and pass the sweep, so redoing it
+  is mechanical.
+
+
+## R42 — the qual-pushdown descent cannot cross a Project (K76, DESIGN pre-review)
+
+`r42-pushdown-project-arm/DESIGN.md`. Prerequisite for R41's
+implementation.
+
+- `pushConjunctTraced` (`inner_join_qual_pushdown.go:341`) has arms for
+  `*Filter` and `*Join` only, then a terminal gated on
+  `innerJoinPushEligibleInput` (`:496`) that admits `*CTEScan`,
+  `*MaterializedCTEScan` or a base-relation leaf. A `*Project` is none
+  of those, so the descent declines. The PG-shaped search's boundary
+  republishes binding order through exactly such a `Project`, so EVERY
+  body the search admits meets it — the gap was always there, R41 only
+  made it reachable.
+- Fix: a `*Project` arm that remaps via the SAME
+  `remapConjunctThroughProjection` helper `pushConjunctIntoCTEBody`
+  already uses, then recurses — mirroring the `*Join` arm's
+  remap/recurse/assign shape. The helper is already fail-closed: it
+  vetoes `OuterColumnRef`/`FuncCall`, requires every referenced target
+  to be a plain `*ColumnRef` (so a computed or volatile projection
+  declines), and name-checks both schemas.
+- **Blast radius is the reason this is its own round.** The descent has
+  TWO production callers: the CTE path
+  (`cte_inline_pushdown.go:240,252`) and the general single-side
+  inner-join pushdown (`inner_join_qual_pushdown.go:161`, `:739`) which
+  runs for every statement. Movement is expected to IMPROVE
+  qual-placement parity (PG pushes restrictions to baserel level), but
+  that is a prediction to measure, not assume.
+- **K77 — review correction that changes the round's scope: `st.proven`
+  is NOT neutral.** Its ONLY consumer (`inner_join_qual_pushdown.go:167`,
+  `if tr.proven && !tr.planted { continue }`) **DELETES the conjunct from
+  the residual `Filter`**. Today a `Project` between a join and its input
+  makes the descent return false, so the qual is unconditionally KEPT; an
+  arm returning true with `proven` still true would newly REMOVE the qual
+  from above on a whole class of trees — a residual-dropping MOVE, not
+  the deeper placement this round is scoped to. Worse, the remap has two
+  fail-OPEN seams: it skips the self-side name check for an UNNAMED ref
+  (`remapConjunctThroughProjection:281`; unnamed refs demonstrably
+  occur), and it never checks `len(Output()) == len(Targets)`. So R42
+  sets `st.proven = false` and is deliberately COPY-ONLY. Enabling the
+  move is a separate round with its own proof.
+- Two more review corrections adopted: refuse `Project.IsolatedScope`
+  (verbatim precedent at `upper_narrow_chain.go:373-379`; today such
+  Projects are contained only by ACCIDENT — a view-rename Project
+  declines because the view and body column names differ, which fails as
+  soon as they match), and refuse an `Output()`/`Targets` length
+  mismatch (mirroring `cte_inline_pushdown.go:207-209`), which closes
+  the second fail-open seam.
+- "Copies by default" means the CONJUNCT is duplicated, not the node —
+  every arm already mutates in place. The real prerequisite is
+  EXPRESSION FRESHNESS, which `remapConjunctThroughProjection`'s closing
+  `cloneExprRefs` supplies. Passing `c` through unchanged instead would
+  have aliased the caller's own expression on the CTE entry path
+  (`cte_inline_pushdown.go:240/252`, where the entry node is a `*Filter`).
+- **Prediction recorded before implementing:** this round does NOT
+  change the decline census and is NOT expected to produce a match. Its
+  success criterion is narrower — the `qual-placement` parity category
+  must not worsen on either corpus and plan-shape movement must be
+  explainable query by query. Match count expected to stay 0/99 and
+  1/22.
+- Filed, not fixed: `deriveConstAcrossJoinEquality` (`:413`, planting at
+  `:739`) mutates the tree BEFORE the recursion and nothing unwinds it on
+  a failed descent, so a derived sibling copy can sit below un-priced
+  (the caller takes `kept = append(kept, c)` without `notePushedBelow`).
+  A `*Project` arm makes deep-then-fail descents more common, so it
+  WIDENS this pre-existing wart without creating it.
+
+
+### R42 LANDED (`r42-pushdown-project-arm/REPORT.md`)
+
+All gates green: precommit units, sweep **PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0 TIMEOUT=0**, TPC-DS verdicts+row counts byte-identical for all 99
+vs HEAD, TPC-H values byte-identical AND plan structure identical across
+all 22. TPC-DS total 838s -> 817s.
+
+- **Exactly 2 plans changed (Q47, Q57), both gaining a restriction PG also
+  applies at that level** — oracle-verified (`Filter: ((avg_monthly_sales
+  > '0'::numeric) AND (d_year = 2000) AND …)`). So the movement is TOWARD
+  PG on `qual-placement`, which was the round's stated success criterion.
+  Runtimes noise-level (5454->5487ms, 2592->2609ms).
+- Match count and decline census unmoved (0/99, 1/22; 8 declines) —
+  exactly as predicted before implementing. This round exists to unblock
+  R41, not to produce a match.
+- Landed with all three review guards: `st.proven = false` (K77,
+  placement-only), `IsolatedScope` refused, `Output()/Targets` length
+  mismatch refused.
+- **Baseline caution:** the sweep's own status-delta compared against
+  R41's run, which is NOT HEAD (R41 was reverted). Against R41 it reports
+  Q78 as changed; against the correct pre-R41 baseline
+  (`sweep-20260909-211945`) Q78 is UNCHANGED, which is right — R42 alone
+  does not admit Q78's CTE bodies. Always re-diff by hand after a revert.
+
+- **K78 — a Go filename trap that silently disables a whole test file.**
+  `pushdown_project_arm_test.go` never ran: Go reads a trailing `_arm` as
+  a **GOARCH filename constraint**, so the file lands in `IgnoredGoFiles`
+  and is excluded on amd64. `go test -run …` reports "no tests to run" —
+  and so does `-count=1` — which reads exactly like a filter typo. Caught
+  only by `go list -f '{{.IgnoredGoFiles}}'`. Any file ending in a GOARCH
+  or GOOS word (`_arm`, `_386`, `_linux`, `_windows`, …) is constrained.
+  Renamed to `pushdown_project_crossing_test.go`.
+
+- **Next: re-apply R41's implementation** (specified in
+  `r41-anti-leaf-coordinates/DESIGN.md` §4, already built and gate-verified
+  once). With K76 closed the `date_dim` restriction can now reach through
+  the searched boundary's `Project`, so the eligibility gain (`leaf-count`
+  3 -> 0, declines 8 -> 5) should arrive WITHOUT the qual-placement
+  regression that forced the revert. Q78 still will not match — that needs
+  Option B's 3-leaf search.
+
+
+### R41 LANDED on the second attempt (`r41-anti-leaf-coordinates/REPORT.md`)
+
+Re-applied unchanged on top of R42, which removed the blocker (K76) that
+forced the first attempt's revert. All gates green: sweep **PASS=95
+MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0**, Q78 checksum unchanged,
+TPC-H values byte-identical AND plan structure identical across all 22.
+
+- **`leaf-count` declines 3 -> 0; TPC-DS declines 8 -> 5, no new class.**
+  Census read BY CLASS, not by total — R40's lesson was that a class can
+  be converted rather than removed.
+- **The qual-placement regression is gone**: Q78's three `date_dim` scans
+  keep `Filter: (d_year = 1998)` and the query is back to 14s (it was 26s
+  when R41 landed without R42). Confirms R42 was the right prerequisite
+  and the revert-then-reland order was correct — landing R41 first would
+  have shipped a measured parity regression to buy an eligibility gain.
+- **What this bought is ELIGIBILITY ONLY.** The three admitted queries
+  come out SHAPE-IDENTICAL to the legacy fallback; only costs differ,
+  because the search now prices them instead of the rule-based path.
+  Match count unmoved (0/99, 1/22), exactly as DESIGN §6 predicted.
+- Q78 still cannot match: PG places `date_dim` BELOW the anti join
+  (`Nested Loop Anti Join` over `Parallel Hash Join`) because its DP
+  searches 3 leaves and can reorder into the anti pair; goopg's collapsed
+  2-leaf problem can only build `(sales anti returns) JOIN date_dim`.
+  That is DESIGN §6's **Option B** (teach the plan walk to descend into
+  ANTI), which needs an ANTI path producer — `pinnedUnsearchable` refuses
+  ANTI today — plus an "unpublished leaf" concept in the coordinate model.
+
+**Remaining declines: 5.** `outer-over-derived` 3 (K68, blocked on the
+separate B-06 CTE-stats workstream — lifting it re-opens a measured 20x
+timeout) and `outer-spine` 2 (K70).
+
+
+## R43 — `Parallel Hash` is the largest systematic gap left (K79, DESIGN pre-review)
+
+`r43-parallel-hash/DESIGN.md`. Found by ranking queries by NEAREST MISS
+instead of continuing the Q78 decline chain — a method change worth
+keeping.
+
+- **CORRECTION to a figure this workstream has been repeating: TPC-H is
+  `match=2`, not 1/22.** Q13 AND Q6 match at HEAD. The 1/22 came from the
+  R36 baseline and was carried into every later report without
+  re-measurement. Authoritative at HEAD (post-R41/R42):
+  `queries=22 match=2 shapediff=20`,
+  `join-order=18 join-method=12 scan-type=13 parameterisation=6
+  aggregation-strategy=10 sort-strategy=13 parallelism=18
+  qual-placement=7 rendering=7`.
+- **Q14 is ONE category from matching — `[parallelism]` and nothing
+  else.** Q1 is two away (`sort-strategy`, `parallelism`). Then a jump to
+  4-5 categories. Ranking by nearest-miss is how to pick rounds from
+  here.
+- **K79 — the gap is `Parallel Hash`, and it is the biggest systematic
+  divergence found this session.** PG uses it in **69/99 TPC-DS** (310
+  node occurrences) and **7/22 TPC-H** (Q3 Q9 Q10 Q14 Q16 Q18 Q21).
+  goopg emits it ZERO times, structurally: `joinpathsparallel.go`'s
+  header states `parallel_hash = true` is REFUSED because "no goopg
+  executor builds a hash table from a partial inner", and the refusal is
+  structural (the file never reads `inner.PartialPathlist`).
+- **But the executor capability appears to EXIST and be live.**
+  `parallel_hash_build.go` implements M0129-S4.1, a cooperative parallel
+  hash build (N producer goroutines scan+filter the build table, one
+  consumer owns the map), default ON (`coopJoinBuildOn`), reached from
+  `joinOp` via `parallelBuildEligible`, with measured wins (Q20
+  1.91->0.65s). Checked that it is not dead code.
+- **RESOLVED by review — TRUTHFUL.** `coopDrivingScan` IS applied to the
+  build plan (`parallel_hash_build.go:522-531`: `buildPlan := o.plan.Right`
+  / `.Left`), and its "probe side" widening only governs descent THROUGH a
+  nested join inside the build subtree. `:609` makes ONE shared
+  `newParallelScanState`, and `:663-680` has N producers rebuild the build
+  subtree with `attachParallelScan` wiring that shared atomic block
+  allocator into the driving `seqScanOp` — so **each producer claims a
+  disjoint block range of the build relation**, not a duplicate copy. The
+  leader pre-build and the coop build COMPOSE
+  (`operators_join_agg.go:666-668`), they do not compete. My earlier
+  speculation that it "may never partition a BUILD scan" is REFUTED. The
+  timing A/B that came back inside noise was inconclusive and should not
+  have been leaned on — the source answered it.
+- Two caveats: goopg parallelises the build SCAN+FILTER but insertion is
+  single-consumer (PG parallelises insertion too), and
+  `parallelBuildEligible` has NO parallel-mode gate, so it fires in
+  SERIAL queries too where PG shows a plain `Hash`. **Therefore the label
+  must follow the PATH MODEL, never observed executor behaviour.**
+
+- **K80 — the re-scope, and rev 1's biggest error.** `Parallel Hash Join`
+  needs NO `parallel_hash=true` work: `addPartialHashJoinPath` already
+  sets `ParallelAware: true` (`joinpathsparallel.go:205`). It is dead
+  solely because the partial-path machinery sits behind a **default-OFF**
+  knob — `gatherPathModeFromEnv`'s default arm returns `gatherPathsOff`
+  (`gatherpaths.go:70,82`) and every producer returns early at
+  `joinpathsparallel.go:89`. **R10 already measured the flip: TPC-H
+  `Parallel Hash Join` 0 -> 19, TPC-DS 0 -> 132, TPC-H `parallelism`
+  18 -> 15**, with no parallel-hash work at all. The flip is NOT landed,
+  and **R12 (adjudicate the 8 failures R11 left) is its hard
+  prerequisite**. As rev 1 was written its step 2 would have landed code
+  behind `if gatherPathsMode == gatherPathsOff { return }` — inert at the
+  shipping default and unmeasurable by the sweep it named as its binding
+  gate.
+- **Correct order: R12 + flip FIRST**, then the residual Q14 gap (one
+  node: `Seq Scan on part` -> `Parallel Seq Scan on part`) via
+  `try_partial_hashjoin_path(parallel_hash=true)`, and wire
+  `enable_parallel_hash` (declared at `catalog/catalog.go:12171`, default
+  on, **nothing reads it** — the known declared-but-unconsumed-GUC trap).
+- **Occurrence counts corrected: 9 (TPC-H) / 157 (TPC-DS) true `Parallel
+  Hash` BUILD nodes**, not 18/310 — a bare `grep -c "Parallel Hash"` also
+  matches `Parallel Hash Join`/`Semi Join`. Query counts (7/22, 69/99)
+  stand.
+- **Rendering a standalone `Parallel Hash` node buys NO parity**: the
+  differ splices PG's `Hash`/`Parallel Hash` nodes out
+  (`pg-plan-parity-diff.py:571-574`, N2) and excludes `Hash` from
+  MISSING-NODE. Q14 needs exactly two existing flags,
+  `Join.ParallelAware` + `SeqScan.Parallel`.
+- **K81 — inverse-misdescription risk.** If the path model emits
+  `parallel_hash=true` but `parallelBuildEligible` DECLINES at runtime
+  (build < 1024 blocks, `preserveCTIDRel` set, `coopDrivingScan` nil for
+  an Aggregate/Sort/index build side, or `GOOPG_COOP_JOIN_BUILD=off`),
+  the plan claims parallelism the executor does not perform — a new
+  misdescription in the opposite direction, i.e. exactly the "arbitrary"
+  outcome the goal forbids. The planner predicate must be a PINNED TWIN
+  of `parallelBuildEligible`.
+- **MATCH on this metric is SHAPE-ONLY.** Q14's row estimates stay ~300x
+  apart (goopg `Hash Join rows=6,001,255` vs PG `rows=18,444`; goopg's
+  `lineitem` scan does not apply the `l_shipdate` selectivity at all).
+  N1 pushes estimates to a side column so the differ never sees it. Any
+  report claiming Q14 as a match must say this.
+
+
+### R43 rev 3 — the flip MEASURED at HEAD; rev 2's sequencing claim REFUTED (K82)
+
+R43 rev 2 relied on R10's numbers, which are stale (R40/R41/R42 landed
+since). Re-measured at HEAD, TPC-H, `GOOPG_GATHER_PATHS=all` vs default:
+
+| category | off | on |
+|---|---|---|
+| join-method | 12 | **11** |
+| scan-type | 13 | **12** |
+| parallelism | 18 | **16** |
+| qual-placement | 7 | **6** |
+| aggregation-strategy | 10 | **11** |
+| **match** | **2** | **2** |
+
+Net **-4 / +1**. Worth landing on the category metric, but **no new
+match**, and R10's "parallelism 18 -> 15" is 18 -> 16 at HEAD.
+
+- **K82 — Q14 is BYTE-IDENTICAL under the flip.** Still `Hash Join` over
+  `Seq Scan on part`, still `SHAPE-DIFF [parallelism]`. Its `Gather`
+  already comes from the partial-aggregate path, not from this knob, so
+  the flip is ORTHOGONAL to Q14. **This refutes rev 2's central
+  sequencing claim** that the flip was the prerequisite: the two tracks
+  are INDEPENDENT, and `parallel_hash=true` (step 2) is the only thing
+  that can close Q14. Either may be done first.
+- **R13's scope re-measured at HEAD: 5 failing tests under the flip, not
+  R12's 7** (two fixed by intervening rounds).
+  `TestPartialPathIsNeverTheFinalPath` is a stage pin ("join rel 0x3 has
+  partial paths before C-19d"). The four REAL ones needing adjudication
+  AGAINST PG: `TestSplitEqualityForHashMultiKey/searched_enumerator`
+  ("fell back to Nested Loop"), `TestSlice3LiveQ9ShapeDerivation`
+  (different build sides narrowed on Q9),
+  `TestSlice3FilterColumnSurvivesNarrowing`, and
+  `TestOwnedBuildPoisonPrebuiltBoundary`.
+- **Method note:** R10's numbers were carried forward for several rounds
+  without re-measurement, exactly as the `match=1/22` figure was. Two
+  stale-number corrections in one session — **re-measure before relying
+  on any prior round's figures**, especially after intervening rounds
+  have landed.
+
+
+## R44 — `date + interval` never folds, so its selectivity is 1.0 (K83-K87, DESIGN rev 2)
+
+`r44-const-fold-before-selectivity/DESIGN.md`. **First round aimed at
+ESTIMATE parity rather than shape parity**, after five rounds closed shape
+categories without moving the match count and every blocker kept
+terminating in estimate-side work.
+
+- **K83 — measured, 11.9x estimate error from one missing fold.** On the
+  live TPC-H cluster:
+  `l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'`
+  gives `rows=78,680`; the same restriction written
+  `... < DATE '1995-09-01' + INTERVAL '1 month'` gives **rows=938,645** —
+  exactly the parallel-divided full table, i.e. **selectivity 1.0, the
+  conjunct contributes nothing**. PG folds it in `preprocess_expression`
+  -> `eval_const_expressions` and renders
+  `'1995-10-01 00:00:00'::timestamp`. `date_pl_interval` is
+  `provolatile='i'` — verified on the live oracle.
+- **Scale: 7 occurrences across Q4 Q5 Q6 Q10 Q12 Q14 Q20; PG has ZERO.**
+  Measured estimates: Q4 385,423 vs 14,974; Q12 1,500,000 vs 7,006;
+  Q14 938,645 vs 18,444; **Q6 2,412 vs 28,092 (UNDER-estimates)**.
+- **K84 — `tryFoldBinaryOp` DOES fold arithmetic.** My first design said
+  it handled only OpAnd/OpOr; **refuted on review**. Arithmetic, concat
+  and comparison all fold via `toLiteralValue` -> `evalLiteralBinary` ->
+  `evalArith`; the AND/OR arms are the short-circuit cases. The real gap
+  is a **type-domain** gap: `toLiteralValue` accepts Integer/String/
+  Numeric/Boolean consts but NOT `*TypedStringLit` / `*IntervalLit`,
+  which is what `DATE '...'` / `INTERVAL '...'` resolve to.
+- **K85 — the round is TWO independently measurable steps, not one.**
+  Because arithmetic folding already works, **moving the fold earlier
+  changes estimates on its own**, with or without the temporal arm. Q6's
+  `l_discount BETWEEN 0.05 - 0.01 AND 0.05 + 0.01` fails `isConstExpr`
+  today and falls to `defaultIneqSelectivity`. So: step A = move the fold
+  before the estimator; step B = add the temporal domain. Landing them
+  together makes movement unattributable.
+- **K86 — the fold must run on the RESOLVED `Expr` at `resolveExpr`, not
+  beside `canonicalizeQual`.** The latter is **WHERE-only**: ON-clause
+  join quals reach the estimator via `planJoinPredicate` -> `chainOnQual`
+  -> `joinsearchseam.go` and bypass it. `resolveExpr` is the single choke
+  point every qual passes (WHERE/ON/HAVING/USING), estimator entry points
+  are all typed on resolved `Expr`, and it builds a FRESH tree so the
+  deparsers' parse tree is untouched by construction. R34's
+  `TypedStringLit` coercion in `resolveExpr`'s `CastExpr` arm is the
+  shipped precedent.
+- **K87 — three pieces the design assumed existed and do NOT:**
+  1. **No volatility route.** `IsStrictProc`'s generated map has no
+     volatility index; no `IsImmutableProc`. `BuiltinProc.Volatile` covers
+     3 pg_dump fixture entries only. `initdb/pg_proc_seed_data.go` HAS
+     `Volatile:` but optimizer **cannot import initdb** (initdb ->
+     executor -> optimizer cycle). Must generate `pgProcVolatileByOID`
+     from `pg_proc.dat` (absent ⇒ `'i'` per `BKI_DEFAULT(i)`).
+  2. **No optimizer-side temporal evaluator, and the executor's is
+     un-importable** (executor imports optimizer in ~91 files). Must host
+     month/day/micro arithmetic in a LEAF package both can import, or
+     duplicate and pin — silent duplication is the known sibling-paths
+     failure mode.
+  3. **The folded literal's SPELLING is an unresolved trade-off that gates
+     the predicted number.** `date + interval` types as `timestamp`, but
+     `numericValue`'s `"date"` arm accepts ONLY `"2006-01-02"`; a
+     timestamp spelling fails to parse so `bucketFraction` returns a flat
+     **0.5** — the estimate lands within half a bucket, not on target
+     (bucket SELECTION still works, ISO-8601 sorts lexically). Either fold
+     to timestamp AND widen the date arm (PG text parity), or fold to a
+     date-spelled literal (histogram parity, diverges from PG's text).
+- **K88 — folding CAN change ANSWERS; my "estimates only" claim was
+  wrong.** `evalArith`'s numeric path is float64-based, so `0.05 + 0.01`
+  folds to `0.060000000000000005`, not `0.06`. Q6 survives only because
+  that perturbation LOOSENS an upper bound; a fold that tightened one
+  would drop rows. PG uses exact `numeric` — file as its own defect.
+- **Q6 is a NAMED GATE ITEM, not left to the sweep.** It is one of only
+  two matches goopg has and it is in the blast radius of BOTH steps
+  independently (a `date + interval` site AND `0.05 +/- 0.01` constant
+  arithmetic).
+
+
+### R44 step A LANDED (`r44-const-fold-before-selectivity/REPORT-stepA.md`)
+
+`foldQualConstants` applies the existing `FoldConstants` to a resolved qual
+at the point PG's `preprocess_expression` runs `eval_const_expressions` —
+before the estimator. Wired at three sites: both WHERE arms AND
+`planJoinPredicate`'s ON clause (the last is REQUIRED per K86, or the round
+is WHERE-only).
+
+**Result: net -6 TPC-DS parity categories** (join-method 71->69,
+parameterisation 39->37, aggregation-strategy 84->82), **31 plans
+changed**, TPC-DS runtime 811s->771s (-4.9%) with Q38 12s->2s, Q87
+11s->2s, Q99 5s->1s. Sweep **PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0** with all 99 verdicts and row counts identical. TPC-H
+byte-identical in both values and plan text. Match unmoved (0/99, 2/22).
+
+- **K89 — I reported "step A changed nothing" from TPC-H evidence alone,
+  and that was WRONG.** TPC-H really is byte-identical; TPC-DS moves 31
+  plans and -6 categories. This also settles K85 in the REVIEW's favour:
+  rev 1 called step A inert, review said the converse was false because
+  plain numeric arithmetic already folds, TPC-H made review look wrong,
+  TPC-DS showed it was right. **Two corpora can give opposite answers —
+  measure BOTH before characterising a change.**
+- **K88 confirmed in the wild.** Q6's filter now renders
+  `l_discount <= 0.060000000000000005` — `evalArith`'s numeric path is
+  float64 (`ParseFloat`/`FormatFloat`), where PG uses exact `numeric` and
+  renders `0.06`. Pre-existing (the late fold already rendered it), but
+  step A now feeds that string to the ESTIMATOR too. Answer-safe here only
+  because it LOOSENS an upper bound. **Filed as its own defect** and it is
+  also a live `rendering` divergence.
+- **Step B (the temporal domain, K83's 11.9x Q14 error) is NOT landed**,
+  and implementing step A confirmed the §5a blockers: the leaf
+  `internal/utils/adt/datetime` has formatting/normalisation/validation but
+  **no date+interval arithmetic** — that is `executor/expr.go`'s
+  `addDateTimeInt`, and executor imports optimizer in ~91 files so the
+  dependency cannot be reversed. Step B needs that arithmetic EXTRACTED
+  into the leaf package. Plus: still no reachable `provolatile` index, and
+  the folded-literal spelling (timestamp vs date) is still undecided.
+
+- **K90 — two operational traps hit this session.**
+  1. `/tmp/pp2` (private bench clone + ALL captures) did not survive the
+     session boundary; only git-tracked captures under `r0-baseline/` and
+     `r2-instrument/` did. **Anything needed across sessions must live in
+     the repo.**
+  2. The sweep writes plan sections as `===== Qn =====` while
+     `pg-plan-parity-diff.py` expects `=== Qn`. Feeding it the sweep file
+     directly returns `queries=0 match=0` — which reads exactly like a
+     clean run rather than a parse failure. Convert with
+     `sed -E 's/^===== (Q[0-9]+) =====$/=== \1/'` first.
+
+
+### R44 step B LANDED + a correction to step A (`REPORT-stepB.md`)
+
+Q14's 11.9x error is FIXED: `lineitem` 938,645 -> **78,680**, and the
+filter now renders `'1995-10-01 00:00:00'::timestamp` — PG's own spelling.
+**R44 total: -10 TPC-DS categories and -3 TPC-H categories** (TPC-DS
+join-method 71->66, parameterisation 39->35, aggregation-strategy 84->82;
+TPC-H parallelism 18->17, qual-placement 6->5, sort-strategy 13->12).
+Sweep PASS=95 all-zero, row counts identical, values identical. Match
+unmoved (0/99, 2/22).
+
+- **DESIGN §5a.2 RETRACTED — step B needed no executor extraction.** The
+  pieces were already importable: `parser.ParseIntervalBodyWithDefault`
+  for the interval body, `time.AddDate` for the month/day carry (the same
+  primitive `addTimeInterval` uses, so planner and executor cannot
+  disagree), and leaf `datetime.FormatTimestamp` for rendering. The
+  companion change widens `numericValue`'s `date` arm to accept timestamp
+  spellings (keeping the DAY scale), without which `bucketFraction` falls
+  back to a flat 0.5 and the fold lands half a bucket off.
+- Volatility still unresolved, so the fold is scoped to ONE
+  oracle-verified-immutable family (`date_pl_interval`, `provolatile='i'`)
+  with both operands literal. Broadening REQUIRES the volatility map.
+- **K88 hit for real.** The first version folded `interval 'infinity'`
+  arithmetically and returned `119521-07-18 06:23:01.689343` for
+  `timestamp '2020-01-01' + interval 'infinity'` — a WRONG ANSWER. The
+  executor implements ±infinity as sentinels. Caught by
+  TestTimestampIntervalInfinity / TestIsFiniteInfinity /
+  TestTimestampSubInfinity — by the SUITE, not by review. Fold now
+  declines on `parser.IntervalNoEnd*`/`IntervalNoBegin*`.
+
+- **K91 — MEASUREMENT-INTEGRITY FAILURE; `REPORT-stepA.md`'s "TPC-H
+  byte-identical" claim was WRONG and is now corrected in place.** Two
+  harness faults, both mine, both introduced after `/tmp` was cleared:
+  1. **`launch.sh` lost its serving-binary verification.** I rewrote it
+     from memory and dropped the inode check. `<bin> stop -D <dir>` fails
+     when `postmaster.pid` is gone or the binary differs, so a **stale
+     server kept serving** and every "A/B" ran one binary. One arm even
+     named `tmp/goopg-base`, which never existed.
+  2. **`capture-tpch.sh` reads `/tmp/parity-r0/queries/tpch`**, wiped with
+     `/tmp`. Every capture became a 4-line stub ending `(capture failed)`,
+     and **diffing two stubs reports "identical"**.
+  Both faults share one signature — **the null result and the broken
+  result are indistinguishable** — which is also K90's `queries=0 match=0`
+  parse failure. TPC-DS numbers were never affected
+  (`tpcds-sf05-regression.sh` fingerprints its own binary).
+  **Fixed:** `launch.sh` now kills the port holder by PID and REFUSES to
+  proceed unless `/proc/<pid>/exe` matches the requested binary's inode;
+  the TPC-H corpus was restored from `tmp/take4/`.
+  **Standing rule: a harness must fail loudly, and an A/B must prove which
+  binary answered. Where it cannot, the result is not evidence.**
+
+
+### K92 — R43's TRUTHFUL verdict NARROWED; Q14's last category needs a real feature
+
+After R44, **Q14 differs from PG on `parallelism` alone** (Q1 is next at
+`[sort-strategy, parallelism]`), so it is the cheapest candidate third
+match. Investigating that route produced a correction to R43.
+
+R43 rev 2 concluded "TRUTHFUL" because goopg's cooperative build
+partitions the BUILD relation's scan. That fact stands, but it does NOT
+license emitting PG's shape. `Parallel Hash` asserts a **partial inner
+path consumed by the Gather's own worker set** — and goopg explicitly
+does not do that. `parallel_scan.go`'s `joinOp` arm:
+
+> "P8. Only PROBE side partial: build side drained once by leader before
+> fan-out. Attaching allocator build side instead would give each worker
+> PARTITION build input, every worker's hash table missing most rows,
+> join would silently drop matches."
+
+`parallel.go`'s `stampParallelScan` mirrors it (probe side only, with a
+SIBLING WARNING that label walk / `drivingScan` / `attachParallelScan`
+must never disagree).
+
+| | who scans the build relation | when |
+|---|---|---|
+| PG `Parallel Hash` | the Gather's workers, into shared DSM | during the join, behind a barrier |
+| goopg | the LEADER's producer goroutines | in `gatherOp.Open`, BEFORE fan-out |
+
+Both parallelise the build scan; only PG's is a partial path under the
+Gather. **Stamping `Parallel Seq Scan on part` inside Q14's Gather subtree
+would claim the Gather's workers each read a partition of `part` — the
+exact arrangement the executor says "would silently drop matches". That is
+a misdescription, i.e. the arbitrary plan-forcing the goal forbids.**
+
+**So Q14's third match is NOT cheap.** It requires implementing PG's
+execution model (workers building a shared hash from a partial inner), not
+relabelling the leader-prebuild model. R43 §6 step 2 must not be
+implemented as a labelling change; DESIGN rev 4 §4a records this.
+
+
+### Post-R44 triage: three measured findings (K93-K95)
+
+Measured while looking for the next round after K92 closed the cheap Q14
+route. All three are negative or cautionary results — recorded so nobody
+spends a round rediscovering them.
+
+- **K93 — K88 (float64 fold) is a FIDELITY item, NOT a parity lever.**
+  Measured: the `0.060000000000000005` artifact occurs **once** in TPC-H
+  (Q6) and **once** in TPC-DS. PG's own plans contain **4** such long
+  decimals. It does not drive the `rendering` category (32 on TPC-DS), and
+  Q6 MATCHES despite carrying it, because the differ compares qual
+  literals by column+operator multiset (N6), not by value. Fix it for
+  correctness and answer-safety — it remains a real
+  planner-vs-PG-`numeric` divergence — but do NOT schedule it expecting
+  category movement.
+
+- **K94 — Q1's gap is a COSTING divergence, not a disabled capability.**
+  Q1 is the nearest miss after Q14 (`[sort-strategy, parallelism]`). PG
+  sorts INSIDE the workers and finalises ordered:
+  `Finalize GroupAggregate <- Gather Merge <- Sort <- Partial HashAggregate`.
+  goopg gathers unsorted and sorts at the top:
+  `Sort <- Finalize HashAggregate <- Gather <- Partial HashAggregate`.
+  `GatherMerge` EXISTS in the planner, and there is a knob for the
+  decision — but **`GOOPG_PARTIAL_SORT_PATHS=on` leaves Q1's plan
+  byte-identical**, so the priced tournament still picks goopg's arm. This
+  is a cost-model divergence to be won on cost, not a flag to flip.
+
+- **K95 — parallel row estimates diverge in BOTH directions; no single
+  convention explains it.** A tempting hypothesis (goopg renders TOTAL
+  rows on a Parallel Seq Scan where PG renders PER-WORKER) fits two data
+  points and is REFUTED by the third:
+
+  | query | goopg | PG | ratio |
+  |---|---|---|---|
+  | Q1 | 5,916,028 | 1,479,529 | **3.99** |
+  | Q14 | 78,680 | 18,444 | **4.26** |
+  | Q6 | 1,506 | 28,092 | **0.05** |
+
+  Q6 is ~19x LOW where the others are ~4x HIGH. So estimate parity has at
+  least two independent root causes on the SAME column of the SAME table,
+  and any "fix the parallel divisor" round would be chasing one of them
+  while the other stays. Instrument per query before generalising.
+
+- **Caveat on R44 that honesty requires recording: it improved shape
+  categories while moving at least one estimate FURTHER from PG.** Q6's
+  `lineitem` estimate went 2,412 -> 1,506 against PG's 28,092. Q6 still
+  MATCHES (shape is unaffected), but R44's stated aim was estimate parity,
+  and on this query it went the wrong way.
+
+
+## R45 — split aggregate + ordered gather cannot combine (K96, DESIGN pre-review)
+
+`r45-gather-merge-ordered-finalize/DESIGN.md`. Found by pursuing K94 (Q1's
+"costing" gap) to its structural cause — which turned out **not to be
+costing at all**.
+
+| node | goopg TPC-H | goopg TPC-DS | PG TPC-H | PG TPC-DS |
+|---|---|---|---|---|
+| `Finalize GroupAggregate` | **0** | **0** | 5 | 18 |
+| `Gather Merge` | **0** | 3 | 9 | **85** |
+
+- **K96 — the shape PG picks is UNREACHABLE, so no cost setting could
+  select it.** `rebuildWithGather` (`parallel.go`) switches on
+  *mutually exclusive* arms — `case tgt.mergeKeys != nil` (target is a
+  Sort) -> `NewGatherMerge`, versus `case tgt.splitAgg` (target is an
+  Aggregate) -> `splitAggregate`. And `splitAggregate` (`parallel.go:1059`)
+  **hardcodes `NewGather` at :1067** — never `NewGatherMerge` — and copies
+  the ORIGINAL aggregate's strategy to the Finalize. Two consequences,
+  both confirmed by the 0/0 measurement: a split aggregate always gets an
+  UNORDERED gather (so `Gather Merge` only arises from the other arm,
+  hence goopg's 3), and the Finalize inherits a hash strategy, so
+  **`Finalize GroupAggregate` is unreachable by construction**.
+- **This CORRECTS K94.** K94 said Q1's gap was "a costing divergence,
+  because `GOOPG_PARTIAL_SORT_PATHS=on` leaves the plan byte-identical".
+  The observation was right, the conclusion premature: the alternative
+  shape does not exist to be priced. K94's framing becomes true only
+  AFTER R45 makes the shape reachable.
+- PG's Q1 needs both arms at once:
+  `Finalize GroupAggregate <- Gather Merge <- Sort <- Partial HashAggregate`
+  (sort INSIDE the workers, merge order-preservingly, finalise ordered)
+  versus goopg's
+  `Sort <- Finalize HashAggregate <- Gather <- Partial HashAggregate`.
+- **Not a new executor feature** (unlike K92's Parallel Hash):
+  `operators_gather_merge.go` exists and the 3 TPC-DS occurrences exercise
+  it. The missing piece is the planner COMBINATION.
+- **Widest surface of any round this session** — it moves every parallel
+  aggregate in both corpora. `splitAggregate`'s own comment records that
+  this pass runs on plans "the process-wide cache may be handing to other
+  sessions right now", so the non-mutating shallow-copy discipline is
+  load-bearing.
+- Gate note carried forward from K91: the TPC-H A/B **must** verify the
+  serving binary by inode. That check's absence produced a false result
+  this session; it is not boilerplate.
+
+### R45 REJECTED on review — the fix is architecturally impossible (K97)
+
+Review VERIFIED §1's measurement and §2's structural cause, then refuted
+the FIX at its root. **K96's diagnosis stands; K96's proposed remedy does
+not.**
+
+- **goopg's Partial aggregate emits ZERO rows.** It publishes transition
+  states through a SIDE CHANNEL, not the plan tree —
+  `parallel_agg_split.go` says so in terms: *"They do not travel through
+  Gather at all."* `AggModePartial` merges into `aggPartialAccum` and sets
+  `o.rows = nil`; `AggModeFinal` rebuilds from `accum.order`, i.e.
+  **worker-arrival order**. So a `Sort` between Partial and Gather would
+  sort an EMPTY stream and `Gather Merge` would merge EMPTY streams — a
+  plan that RENDERS like PG's while executing today's semantics. That is
+  exactly the arbitrary plan-forcing the goal forbids.
+- **Worse than cosmetic: a wrong-answer hazard.** The only point of the
+  shape is to drop the top-level `Sort`, which needs pathkeys claimed on
+  the Finalize — whose order is `accum.order`. **Q1 would return unordered
+  rows.**
+- **A trap for whoever tries this next:** `aggregateOp` already sorts its
+  output by group-key columns for determinism, including on the Finalize
+  path, so Q1 might APPEAR correct after dropping the Sort. That sort uses
+  collation 0, fixed ASC, fixed NULL ordering — it cannot serve `DESC`,
+  `NULLS FIRST/LAST`, non-default collations, or ordering by aggregate
+  outputs. **Do not mistake incidental ordering for a pathkey.**
+- **`Finalize GroupAggregate` is unreachable for a SECOND, independent
+  reason**, and R45 §4's "not a new executor feature" was FALSE: sorted
+  aggregation is gated to `Mode == AggModeSimple`
+  (`operators_join_agg.go:2222`), so a Finalize marked `AggStrategySorted`
+  falls through to the HASH path. Marking it would print
+  `Finalize GroupAggregate` over a hash table — a label lie
+  `operators_explain.go`'s own comment exists to prevent.
+- Correction to K96's wording: the Finalize is hashed not because it
+  *copies* the strategy but because **the split arm never OFFERS
+  `AggStrategySorted`** (`partialaggupper.go`).
+- **Prior art R45 failed to find:** `partialaggupper.go:352-359` already
+  reasons that presortedness cannot survive goopg's Gather, and
+  `parallel_agg_split.go` records the rejected alternatives (a
+  pointer-bearing Datum kind; a side channel threaded through
+  `rowBatch`/`TupleSlot`). This ground was surveyed before. **Search prior
+  design notes for the MECHANISM, not just the symptom, before designing.**
+- **The real item** is PG's `AGGSPLIT_INITIAL_SERIAL` /
+  `FINAL_DESERIAL` — row-borne partial aggregate states with
+  per-aggregate serialize/deserialize, plus `openSorted` extended to
+  `AggModeFinal`. A multi-round EXECUTOR programme, comparable to or
+  larger than K92's Parallel Hash. Only after it can Q1's shape be PRICED
+  rather than rendered.
+
+## R46 — cost the legacy funnel's index-vs-seq choice (design approved, implementing)
+
+`r46-legacy-index-seq-competition/DESIGN.md` (reviewed 2026-09-10,
+APPROVE-WITH-NOTES, notes applied; design commit `ffab1708d`).
+Baseline at HEAD on canonical data (pinned env): TPC-H `match=1
+shapediff=19`, TPC-DS `match=0 shapediff=70`; R43's `match=2`/Q6-match
+unreproduced (recorded as discrepancy). Oracle note: TPC-H fixtures
+are all-serial (owner decision needed for re-capture).
+**K98:** `planIndexScanFromWhereShape` equality arm returns
+`IndexScan` unconditionally; TPC-DS Q9 differs on `scan-type` ALONE
+(`reason`, 1 page/35 rows) — nearest miss in either corpus. Change:
+equality-arm-only cost competition (`costIndexScanCore` vs
+`costSeqscan`, per-arm inputs table in DESIGN) with seq-wins
+decline; correlated/range/SAOP untouched. Tests: Q9→MATCH, zero
+EXTRA flips, unit pins both directions first.
+
+## R46 result (2026-09-10)
+
+`r46-legacy-index-seq-competition/REPORT.md`. IMPLEMENTED, all
+gates pass. Two producers gated (funnel equality arm + absorber
+`eqKey` rewrite — the second found live: funnel verdict=true yet
+EXPLAIN still indexed). **TPC-DS Q9 → MATCH** (first TPC-DS match
+of the programme); scan-type 74→73; TPC-H categories identical.
+Gates: units + suites (5 new pins) + spotcheck + SF0.5 sweep
+(PASS=95, MISMATCH=0; plan-shape only Q9) + A/B both corpora (only
+Q9 moves).
+- **K100 (new, executor).** Sequential reg*[] comparison broken
+  twice over (scalar-cast leak drops IsArray; OID-vs-name compare
+  without catalog) — R46 carve-out keeps the index there, dies
+  with K100. Corpus impact zero.
+- Anomaly on record: one build produced corpus-wide width shifts
+  (undetermined; clean rebuild reproducible — verify serving
+  behavior, not just inode); one test passed 4× then failed 20/20
+  on the same tree (suspected stale binary in stash-pop window).
+
+## R47 — Expose grouping candidates; measure at ordered level (rev 3 APPROVED-WITH-NOTES, implementing)
+
+`r47-q4-upper-rel/DESIGN.md`. Rev 1 REJECTED (11 findings); rev 2
+REJECTED (narrow); rev 3 APPROVED-WITH-NOTES 2026-09-10 (notes
+applied). Restructured per reviews: NO predicted flip, NO
+invented pick rule — safe plumbing (slice 1, byte-identical
+gate) + measurement (slice 2), corpus arbitrates. Step 0 closed:
+semi legacy-unstamped, 1141.32 = wrapper double-perRow (exact),
+width flip partially answered (verdict-neutral), five PG flips
+re-measured live and archived in `pg-flips/`. Firing micro-rule
+honestly unidentified (all constructed models predict hashed at
+least once); flips arbitrate, STOP binds. K9-compliant: no
+parity-verdict claim (fixture = movement detector only).
+Slices: (1) per-candidate Agg clone, Paths-not-Nodes,
+pointer-identical copy-back, Memoize census; (2) new
+ordered-level loop over survivors via existing addOrderedPaths
++ add_path/setCheapest (M0129-S1 + sort-disabled declared).
+Tests: slice gates, comparator-parity pins, dominance
+instrumentation, characterization flips (informative),
+pre-declared estimate/Memoize/inode pins, standard gates.
+Follow-ups: R48 (placement), firing-rule (hypothesis-eliminating
+census), K100, fixture re-capture (owner).
+
+## R47 slice 1 result (2026-09-10, verified on resume)
+
+Per-candidate Agg spec clones (`groupingpaths.go` 3 sites,
+`partialaggupper.go` 5 sites) + 2 dominance TDD pins. Re-verified
+on resume after handover: `go build` clean, both pins PASS, full
+`internal/optimizer` suite green, units gate green, pgbench smoke
+green (0 failed). Serving behavior (K91): fresh `:5554` launch of
+the current-tree binary on the TPC-H clone — full corpus capture
+byte-identical to the R46 baseline (`oc-tpch-r46c.txt`) on all 22
+queries (Q15a helper file absent at capture time; manual Q15a probe
+matches baseline exactly incl. costs/widths/filter rendering), and
+the peer's TPC-DS slice-1 capture differs from its baseline only in
+header + psql-PID noise. Q4 before-shape confirmed live (hashed:
+HashAggregate startup 1283.98, semi 1141.32/57066/width 448).
+Slice 2 (translation helper + ordered loop + copy-back) NOT started.
+
+*Rev history: rev 1 REJECTED (F1-F11: fuzz-site error, missing
+decision site, NLI misattribution, unestablished seed, missing
+rows, self-contradiction, K9 breach, open blast radius/guards);
+rev 2 REJECTED (narrow: slice-1 interface, unnamed loop,
+M0129-S1/sort-disabled disclosure, ungrounded flips, pins,
+K9 framing). All items closed in rev 3 per the two review
+verdicts; full text in the review reports summarized above —
+kept for the record, not repeated.*
+
+## R47 slice 2 plan (2026-09-10, code study complete — review then implement)
+
+New file `internal/optimizer/upperorderedgrouping.go` + pins in
+`upperordered_test.go`, per `r47-q4-upper-rel/SLICE2.md` (written
+2026-09-10 from live-tree code study; agent-reviewed before
+implementation commit). Translation helper (sorted-candidate
+emission order → output-coord pathkeys; executor guard mirrored;
+PathSort-child + full positional group run + name-verified group
+prefix required; hashed/index/presorted/expression-key fall out
+via the checks) + ordered loop at the planSelect normal ORDER BY
+arm only (gates pre-mutation: agg != nil, node == agg.node,
+selectSrfPending == nil, ≥2 PathAgg + 0 PathFinalizeAgg on the
+re-fetched GROUP_AGG rel; per-candidate shallow copy with
+translated pathkeys through existing addOrderedPaths +
+setCheapest/getCheapestFractionalPath; winner built via
+createPlanNode, copy-back descending through *Sort only +
+stampAggregateInputTarget re-run; existing orderSort stamp code
+reused (control flows through the shared block, no early return);
+loop elects ⇒ normal createOrderedPaths call skipped; decline ⇒
+snapshot/restore Pathlist+cheapest (review-adopted).
+Prediction sharpened on review: GROUPING still picks hashed, but
+the ORDERED election is EXPECTED to flip Q4 to no-sort sorted
+(the slice-1 pin elects it at Q4's numbers 70122-vs-69911 via
+fuzz+tie-break) IF production matches the pin — flip = stretch
+recorded, no flip = census must say where production diverged.
+Pass = gates + ZERO EXTRA flips + hypothesis-eliminating §3.3
+census.
+Recipe mapping notes (handover §3 mapped, not coded): "child must
+be Sort" = PathSort *Path* (losers stay unbuilt); presorted/index
+→ nil subsumed by child-kind + run checks (+ explicit
+GroupKeyOrder decline); DisabledNodes propagate via
+disabledNodesFor inheritance (verified); sizing from aggNode ≡
+normal call (verified).
+
+## R47 slice 2 result (2026-09-10, MEASURED — 16 flips toward PG, ZERO EXTRA)
+
+Slice-2 loop landed (`upperorderedgrouping.go` new + `planner.go`
+normal-arm loop-first + 6 TDD pins incl. post-decline byte-identity,
+all green). Full measurement in `r47-q4-upper-rel/REPORT.md`.
+
+- TPC-H (vs byte-identical slice-1): Q7 + Q8 flip `Sort →
+  HashAggregate` to `GroupAggregate → Sort(input)` (PG: GroupAggregate
+  both); Q4 does NOT flip — loop ran, hashed+Sort 1426.78 beats
+  no-sort sorted 6077.69 (dominance). Pin's near-tie numbers
+  (70122/69911) turned out PG-oracle-scale (PG Q4 Finalize
+  GroupAggregate 70094.27..70122.64, semi-out 3439 rows), NOT
+  goopg-scale production (57066 rows) — pin stays a unit probe.
+- TPC-DS SF0.5 (vs s1 ≡ r46c): 14 flips, all `Sort → HashAggregate`
+  to `GroupAggregate → Sort(input)`, PG uses (Finalize)
+  GroupAggregate/Group at every station (Q37/Q82: PG `Group` node —
+  goopg has no Group; GroupAggregate is the strategy match).
+- Q7/Q8 census: gathered-hashed+Sort vs gathered-sorted-as-is tie to
+  the penny on total; startup tie-break elects no-sort = PG's choice.
+  Split was dominance-pruned at grouping before the loop (moot gate).
+- Surfaced (not created) skew: `costAgg` charges per-row hashing,
+  `createAggPlan` display omits it — loop-elected Sorts price from
+  path cost while children keep node display (6+16 cost-only
+  Sort/Limit lines). Unification = separate R-item (filed, NOT
+  slice-2 scope). All loop elections path-vs-path, PG-faithful.
+- Gates: units + pre-commit green; spotcheck Q12=2/Q13=34 PASS;
+  SF0.5 sweep PASS=95 MISMATCH=0 SKIP=4, plan-diff channel exactly
+  the 30 adjudicated queries. Match count not a criterion; firing
+  micro-rule still UNIDENTIFIED (honesty preserved); Q4 gap localized
+  to row estimates below the agg (57066 vs PG 3439).
+
+## R48 — semi JoinQual placement + `Filter: (true)` drop (design; Step 0 closed 2026-09-10)
+
+`r48-semi-joinqual-placement/DESIGN.md` (agent-reviewed
+APPROVE-WITH-NOTES 2026-09-10; F1+F2 blockers + F3-F10 notes all
+closed in text). Named by R47 DESIGN §4 ("semi JoinQual placement
++ `Filter: (true)` drop"). Step-0 pair is TPC-H Q4, captured live
+2026-09-10 (PG :65432 vs s2 tree, GUCs pinned `work_mem='64MB'`,
+`max_parallel_workers_per_gather=4`), archived in-tree as
+`r48-semi-joinqual-placement/pg-q4.txt` +
+`goopg-q4-s2.txt` (R47 pg-flips/ precedent; review F1):
+
+- PG: `Nested Loop Semi Join` with NO join-level qual; the EXISTS
+  inner qual sits on the inner probe —
+  `Index Scan ... Index Cond: (l_orderkey = orders.o_orderkey)`
+  `Filter: (l_commitdate < l_receiptdate)`.
+- goopg s2: same join shape, but the qual stays at join level
+  (`Filter: (l_commitdate < l_receiptdate)`) under a
+  `*NestedLoopIndexJoin` whose inner `Index Scan` carries no
+  `Filter:` — plus a stray second line, `Filter: (true)`.
+
+Two independent halves (either order; Filter-half first, de-risks
+the census):
+
+1. **`Filter: (true)` drop (EXPLAIN-only).** Census on the s2
+   corpora: 6 TPC-H + 34 TPC-DS stray lines, every one an
+   attached-`Filter` (collapsed wrapper) with a trivially-true
+   predicate above a join/NLI — scaffolding the unnest passes
+   leave behind (`unnest.go:414` sets `BooleanConst{true}`
+   instead of removing the wrapper; `:1611`, `:3157`, `:3281`,
+   `:4309` keep `Filter`-wrapping-with-true so downstream
+   recursion "still finds the join"). `combineAnd([])` is nil,
+   so no `Filter: (true)` comes from an empty residual — all 40
+   are wrappers. Fix at the renderer (`walkPlanFiltered`: skip a
+   trivially-true `*Filter`, carry nothing down) — zero
+   executor/estimate impact; only the stray lines vanish (their
+   host lines re-price from the wrapper to the child, which is
+   the PG-faithful carrier).
+2. **Semi JoinQual placement (planner).** Q4's NLI residual
+   (`l_commitdate < l_receiptdate`, inner-only) belongs on the
+   inner probe as `IndexScan.Cond` — the channel the struct doc
+   (`plan.go`, `IndexScan.Cond`) built for exactly this ("Only
+   the NLI arm sets it"; evaluated per heap tuple the probe
+   returns; rendered as the scan's `Filter:`, PG-identical).
+   The legacy `*Join → NLI` rewrite (`tryBuildNLI`,
+   `nl_index_join.go:318`) hoists inner Filters into
+   `residualPred` instead of lowering inner-only conjuncts to
+   `is.Cond` (leaf-local shift, SEMI/ANTI only — LEFT keeps its
+   residual: a moved qual would stop filtering null-extended
+   rows). Converges legacy with the path arm (rule #2) and with
+   PG's `distribute_restrictinfo_to_rels` (MOVE, not goopg's
+   usual copy). Executor support already exists (fused arm
+   relies on per-probe Cond eval); values gates arbitrate.
+   Out of scope: INNER/LEFT NLI residuals, plain-`*Join`
+   residuals, `BitmapHeapScan.Cond` inner (same mechanism,
+   later slice if census implicates).
+
+Pass = stray-line census 40 → 0 with no other EXPLAIN line
+moving except host-line re-pricing + the NLI-residual lines
+that move onto inner scans (each adjudicated toward PG's
+placement); ZERO shape flips required, ZERO EXTRA allowed;
+values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.
+
+**Result — LANDED 2026-09-10** (report:
+`r48-semi-joinqual-placement/REPORT.md`). Half-1: `Filter:
+(true)` skip in BOTH Filter arms of `operators_explain.go`
+(plain + ANALYZE twin — the design named only the plain arm;
+the twin carries the same arm per the file's sibling-agreement
+doctrine). Half-2: `lowerSemiResidualToCond` in
+`nl_index_join.go`, SEMI/ANTI-gated, runs BEFORE
+`indexOnlyNLIInner` (F2 order pin — IOS sees `Cond` set and
+declines). Census: strays 6 → 0 TPC-H / 34 → 0 TPC-DS,
+normalized shape diffs empty (ZERO EXTRA flips); Half-2 moves
+= 9 TPC-H lines, all adjudicated (Q4 join-qual → inner probe
+`Filter:` = PG placement; Q21 outer Anti mixed residual splits
+— outer half stays on the join, inner half to the `l3` probe),
+TPC-DS byte-identical (strict no-op). Q4 semi core now
+placement-identical to `pg-q4.txt` (remaining gap = recorded
+F9 parallel-shape expectation). Values: digest 24/24 MATCH
+VERDICT PASS; SF0.5 sweep PASS=95 MISMATCH=0 CKMISMATCH=0
+ERROR=0; spotcheck Q12=2/Q13=34 PASS; optimizer+executor
+suites + pre-commit units green. Fossil-carrier finding
+(restated): the true-wrapper is fully costed, predicate
+swapped post-costing with stored PlanCost kept — Q2 host rows
+5 → 160000, PG-EXACT vs the live oracle. Pre-existing, not
+owned: `TestLeftJoinCrossRelationResidualReachesNLI` SKIP
+(identical at clean HEAD — R25 arm serves that shape first);
+`Join Filter: (true)` (`exists_to_any.go:355-367`) still
+corpus-zero, follow-up stands.
+
+## R49 — parameterize the bitmap-heap NLI probe (design LANDED 2cbc83f06; Slice A LANDED 521bc82 2026-09-10 — report `r49-bitmap-probe-param/SLICE-A.md`; Slice B IN PROGRESS (setup done 2026-09-10, worktree /tmp/wt-r49b). Step 0 closed 2026-09-10; agent review APPROVE-WITH-NOTES 2026-09-10, 1 merge blocker + 8 notes, all applied; impl LANDED a16db55 2026-09-10; pins LANDED 3639208 2026-09-10 (OP1-3 MOVE-contract + SEMI/keyless, deform widening, e2e doll-house: shape/lossy/NULL/composite/LEFT/cond+lookupBounds; executor+optimizer suites green). NEXT: Slice-B gates — DONE 2026-09-10, report f60d69bc1 (census moves-only TPC-H 14/DS 40, digest 24/24 Q12=2/Q13=34, SF0.5 95 PASS/0 mismatch, sibling audit clean). Slice B COMPLETE.)
+
+Named by R48 DESIGN §4 ("IOS/bitmap-Cond inners ... (their
+double-eval is a separate R)"). Census on the post-R48 corpora
+(`oc-tpch-r48h2.txt`, `oc-ds05-r48h2.txt`): every `Filter:` on a
+`Nested Loop` whose inner is a `Bitmap Heap Scan` is an NLI
+(`NestedLoopIndexJoin.Predicate` renders as `Filter:`, while
+plain-`*Join` renders `Join Filter:`) carrying the probe clause
+at the join, over an UNPARAMETERIZED bitmap (0/40 TPC-DS
+`Bitmap Index Scan`s carry an `Index Cond:`; TPC-H likewise) —
+TPC-H Q2(4)/Q5/Q8(2)/Q11(4)/Q20; TPC-DS Q3/Q19/Q21/Q30
+(ctr_customer_sk)/Q32/Q37/Q39(×2)/Q40/Q42/Q49(×2)/Q52/Q53/
+Q55/Q61(×2)/Q63/Q64/Q75(×2)/Q76(ws_item_sk)/Q80(×2)/Q81
+(ctr_customer_sk)/Q82/Q89/Q98 — 28 lines, inner-child mapping
+verified per line (inner = `Bitmap Index Scan on *_pkey`;
+mapping table archived with the Slice-A census). Non-bitmap
+`Filter:` lines (TPC-DS Q1/Q6/Q18/Q30a/Q34/Q44/Q46/Q54/Q68/
+Q71/Q72/Q73/Q76a/Q79/Q81a — CTE/Hash/Merge/Seq inners,
+SubPlan/InitPlan quals) are out of scope. Step-0 pair is
+TPC-DS Q3, captured live 2026-09-10
+(PG :65438/tpcds05 vs r48 corpus, GUCs pinned `work_mem='64MB'`,
+`max_parallel_workers_per_gather=4`), archived in-tree as
+`r49-bitmap-probe-param/pg-dsq3.txt` +
+`goopg-dsq3-r48.txt`, plus `pg-q5.txt` + `goopg-q5-r48.txt`
+as the shape-divergence witness (PG hash-joins supplier;
+goopg nestloops with a bitmap inner — parameterizing the
+probe is PG-ward but NOT PG-identical there):
+
+- PG: `Nested Loop` with NO join-level line; inner
+  `Bitmap Heap Scan ... Recheck Cond: (ss_item_sk =
+  item.i_item_sk)` + `Bitmap Index Scan ... Index Cond:
+  (ss_item_sk = item.i_item_sk)` (outer ref as parameter).
+- goopg r48: same join shape, but the probe clause stays at
+  join level (`Filter: (item.i_item_sk =
+  store_sales.ss_item_sk)`) over a key-less
+  `Bitmap Index Scan on store_sales_pkey` (no `Index Cond:`,
+  no `Recheck Cond:`).
+
+Mechanism (surveyed, not yet designed): the NLI-bitmap path
+arm (`createNestLoopBitmapJoinPlan`, `createplannl.go:454`)
+binds probe keys per outer row already (`bis.Key`, executor
+`BindOuter`/`Rescan` plumbing exists) but deliberately clears
+`BitmapQual` ("no leaf-local form of = <outer key>") and
+folds the probe clauses into the join Predicate (OP1-3 guard
+test pins this: lossy-page recheck rides the Predicate).
+Two slices; Slice A first (EXPLAIN-only, de-risks the census):
+(A) render bound probe keys as `Index Cond:` via
+`formatIndexCondParts` (NOT `bis.Pred` — SEARCH coordinates),
+(B) keep `BitmapQual` in merged outer++inner coords + retain
+the outer slot in the heap op for combined-row recheck eval,
+and DROP the folded clauses from the Predicate (MOVE, not
+copy — R48 doctrine) — trading always-recheck for PG's
+exact-probe + lossy-recheck model. Slice-B merge blocker:
+NULL probe keys currently full-scan (`lookupKey(s)` NULL →
+`(nil,nil,nil)` → open-ended `RangeScanWithPos`; sibling
+index arm returns `ok=false`) — Slice B must return an empty
+TBM, with NULL tests in both shapes (single-column full-key
++ composite prefix). Values gates arbitrate; lossy-page tests
+must prove the recheck still fires per outer row.
+
+Out of scope: plain-`*Join` `Join Filter:` residuals (Q7/Q13/
+Q14/Q15/Q17/Q25/... — separate R per R48 §4); semi/anti over
+non-scan inners (Q21, Q22 — PG comparison in DESIGN; likely
+already PG-shaped); Q17/Q6/Q30 SubPlan/InitPlan shapes;
+LEFT (Q72 — null-safety, same argument as R48); INNER
+non-bitmap NLI residuals (deferred per R48).
+
+Pass = every in-scope join-level probe `Filter:` moved onto
+its probe (`Recheck Cond:` + `Index Cond:`, no join line),
+each adjudicated toward its PG counterpart (Q5-class shape
+divergences recorded, not forced); ZERO EXTRA flips;
+values gates (TPC-H digest 24/24, SF0.5 sweep all-zero) bind.
+
+Slice-B setup 2026-09-10 (worktree /tmp/wt-r49b, probe
+`internal/executor/zz_probe_bitmap_test.go`, throwaway): live
+NLI-bitmap e2e recipe PROVEN — 20k-row inner / 4 keys + 4-row
+outer + WHERE (filterless INNER never reaches the search:
+`joinTreeHasOuterLink` false → legacy path) wins
+`Nested Loop` → `Bitmap Heap Scan` + `Bitmap Index Scan` on
+NATURAL costs (no toggles; bitmap probe 262 < index probe
+947) and executes 20000/20000 rows. Forcing notes: catalog
+wrapper + `EnableIndexScan=false` do NOT force it — the
+decomposed legacy shape ignores both, and the search joinrel
+ctor drops inner `DisabledNodes`; the base tournament drops a
+bitmap probe unless per-probe cost clears the full-seq
+prebuilt seed (2k rows: 33 vs 30 dropped; 20k: 262 vs 298
+kept — the index sibling survives via its pathkeys axis).
+Full mechanism notes → `SLICE-B.md` with the fix.
+
+Slice-B plan 2026-09-10 (`r49-bitmap-probe-param/SLICE-B.md`,
+agent review APPROVE-WITH-NOTES 2026-09-10, 9 notes, all applied):
+planner BitmapQual-from-pairs
+(inner-left, merged coords) + residual-only Predicate;
+heap-op outer-slot retention + combined-row evalBitmapQual
+branch (outerSlot==nil keeps legacy inner-row eval);
+NULL-key empty TBM via lookupBounds flag; all three in ONE
+commit (no safe intermediate); pins = OP1-3 update +
+lossy-per-outer-row + NULL both shapes + deform superset +
+planner e2e + Recheck render.
+
+## R50 — plain-`*Join` `Join Filter:` residuals (setup 2026-09-10; PG adjudication running)
+
+Named by R48 DESIGN §4 ("plain-`*Join` residuals") and R49
+DESIGN §4 ("Plain-`*Join` `Join Filter:` residuals ... —
+separate R per R48 §4"). Post-R49 census on the gate corpora
+(`oc-tpch-r49b.txt`, `oc-ds05-r49b.txt`; machine attribution —
+a qual line counts iff its nearest less-indented node is a
+join; ZERO orphans): TPC-H 2 `Join Filter:` keys (Q7
+`Nested Loop`, disjunctive n_name OR; Q19 `Hash Join`,
+brand/container/quantity OR) + 6 NLI-`Filter:` keys
+(Q2/Q17/Q20/Q21×2/Q22 — NOT this R, R48/R49 own the
+Predicate slot); TPC-DS 38 `Join Filter:` keys / 64 lines
+over 36 queries (Q4/Q11/Q13×2/Q14/Q15/Q16/Q17/Q19/Q24/
+Q25/Q29/Q31/Q37/Q45/Q46/Q47/Q48×2/Q50/Q54/Q56/Q57/Q58/
+Q59/Q60/Q64/Q65/Q68/Q72/Q74/Q75/Q80/Q82/Q83/Q85/Q94/Q95)
++ 12 NLI-`Filter:` keys (SubPlan/InitPlan/LEFT shapes,
+out unless the census implicates the same mechanism).
+Census-trap on record: the first attribution regex
+(`Hash (?:Left|...|Anti )?Join` — trailing space bound
+only to the LAST alternative) silently dropped the whole
+`Hash Semi Join` family from the key census (lines still
+visible in the unfiltered dump, which is what caught it);
+fixed pattern keeps the space outside the group, sanity
+prints all six join spellings, orphans must read 0.
+
+Step-0 TBD by adjudication: PG sweep running
+(`/tmp/pp2/capture-pg-r50.sh` — PG :65432/tpch Q7+Q19, PG
+:65438/tpcds05 all 38 affected DS queries, GUCs pinned
+`work_mem='64MB'`, `max_parallel_workers_per_gather=4`;
+baseline binary `/tmp/pp2/bin/goopg-r50` built from this
+worktree, byte-identical to the r49b gate image, `cmp`
+clean). Each goopg join-level line gets one PG verdict: (a)
+PG-identical Join Filter (no action), (b) PG places it as
+Hash/Merge Cond or a pushed-down Filter/Index Cond (MOVE
+candidate, R48 doctrine), (c) PG picks a different join
+(join-choice — different R, NEVER force the shape).
+Mechanism survey + slicing after adjudication; values gates
+(TPC-H digest 24/24, SF0.5 sweep all-zero) bind as usual.
+
+Adjudication DONE 2026-09-10 (PG sweep
+`/tmp/pp2/pg-r50/`: 2 TPCH + 42 DS plans, GUCs pinned).
+(a) PG-identical JF, no action: TPCH Q7 (OR stays JF even
+on PG's hash join — non-equi JF is PG-faithful), DS Q13N/
+Q48N (giant OR), Q15/Q45 (substr-ANY), Q46/Q68 (city<>),
+Q54 (county), Q64, Q85
+(PG keeps even equi as JF on NL), Q14 (PG also NL JF on
+the outer arms), Q72, Q31/Q75/Q65/Q92 (non-equi, same
+role), Q19 (substr<>), Q95 (warehouse<>, same role),
+Q16/Q94 (self-ref `x<>x`; PG shape differs entirely).
+(c) join-choice, different R: TPCH Q19 (PG NLI probe, no
+join line), DS Q17/Q25/Q29/Q50 (ss/sr-customer; PG hashes
+or index-probes elsewhere), Q37/Q82 (PG `Index Cond:
+(inv_item_sk = item.i_item_sk)` — index-probe R), Q80
+(PG HC on hash; goopg NL — join R, NL has no key slot).
+(b) SLICE A — hash-`Join Filter:` conjuncts already
+covered by the sibling `Hash Cond:` (redundant double-eval;
+PG never duplicates — PG Q56/Q59 show HC-only): Q56×3 +
+Q60×3 (JF textually == HC, `item_id`), Q47×2 + Q57×2 (JF
+category+brand pair ⊂ HC), Q59×1 (store_id ⊂ HC),
+Q58×2 (drop the `item_id` conjunct, keep ranges — PG:
+MC(item_id)+JF(ranges)), Q24×2 (zip dup exact; PG keeps
+JF-on-NL — adjudicated: doctrine over coincident text,
+query stays shapediff), Q4×5 + Q11×3 + Q74×3
+(customer_id dup/partial + CASE ratio stays; same note).
+26 lines / 10 queries. Step-0: DS-Q56 (exact-dup ×3;
+goopg HC+JF vs PG HC-only). Safety core: rows reaching JF
+eval already satisfy HC (INNER/SEMI), so HC-implied JF
+conjuncts are dead — drop is values-neutral by
+construction; ANTI explicitly out (no ANTI in scope).
+Follow-ups (not this slice): Q13H/Q48H (state/profit OR on
+hash — PG placement TBD from full Q13 text), plain-NL equi
+probe-ability (Q37-class). (Q83 was filed here as "JF-only
+`item_id`, extraction failure" but the Slice-A gate corpus proved
+that wrong — same-node HC+identical-JF over char-typed CTE outputs,
+PG Q83 zero-JF — so Q83×2 landed IN Slice A; DESIGN §3.)
+
+Slice-A mechanism SURVEYED + DESIGNED 2026-09-10 (design
+`r50-hash-joinfilter-dedup/DESIGN.md`, slice plan `SLICE-A.md`, review
+agent pending): the dup is pair ∈ HashKeys (HC renders ALL of them,
+`operators_explain.go:973`) but ∉ safe (`ExecHashKeyPlan`, Residual =
+Predicate minus safe-covered). Census of the discriminator: EVERY
+in-scope pair is bpchar-family — character(16) `i_item_id`/`s_store_id`,
+character(50) `i_category`/`i_brand`, character(10) `ca_zip`/`s_zip`
+(PG :65438 information_schema), or char-typed CTE outputs (Q4/Q11/Q74
+`customer_id`, Q47/Q57, Q58 `item_id`). Decisive control: Q47 keeps
+character category+brand while subtracting varchar(50)
+`s_store_name`/`s_company_name` + numeric `(rn-1)=rn` in the SAME join.
+Probe matrix (throwaway `zz_r50_probe_test.go`): char-base DUP,
+varchar-base CLEAN, char-CTE DUP, varchar-CTE CLEAN — CTE schemas
+propagate types (runtime `Type.Name` for `char(16)` DDL is `"char"`), so
+the discriminator is PURELY the whitelist name. Fix (ONE commit, no
+split-brain — single predicate feeds renderer residual + executor
+encoding): admit `"char"`/`"bpchar"`/`"character"` in
+`isHashSafeTypeName` (three spellings, one family — same as text/varchar
+and bool/boolean precedent). Safety: width-carrying bpchar stored
+TRIMMED (codec `coerceTextLikeDatum`, no padded Datum representation),
+so datumKey ≡ `=`; unbounded-verbatim keys differ-but-equal never meet
+(same miss as the residual gives today) and key-equal ⟹ byte-identical
+⟹ `=`-true; NULL keys never meet; INNER/SEMI only; float + arrays stay
+excluded. Non-lead-unsafe (Q47-brand) JOINS the composite key encoding
+on admission — no separate enforcement needed. Gates: 26-line census
+A/B (HC-extra fails), digest 24/24, SF0.5 all-zero, units green.
+
+## R51 — implied-equality seam switch (LANDED 2026-09-10, report `r51-implied-equalities-seam/REPORT.md`, slice plan `SLICE.md`)
+
+K26's candidate-generation half, landed. One-line switch (`joinsearchseam.go:458`
+constants→transitive closure) + 2 PG-adjudicated re-baselines. Blast radius exactly
+K26's prediction (pinned-semi PASSES via the kept `nliProbeKeys` fix; 2 Slice3
+keep-assertions re-baselined — Q9's new innermost join IS PG's `partsupp⋈part` on
+the synthesised clause, F4 pair-rule holds unchanged). Corpus: TPC-H join-method
+11→9 (Q5+Q9), agg +1 sideways; TPC-DS four +1 tag side-effects; **join-order
+95/18 UNMOVED** — K26 §9.2 confirmed, the costing half (`join_search_one_level`
+pricing) is the named next round. Values: digest 24/24, Q12=2/Q13=34, SF0.5
+95/0, suites + vet green. Reviewed APPROVE-WITH-NOTES, notes applied
+(REPORT.md §7 — C-04a ordering verified, re-baselines sound, executor
+risk low; carry-forward: name the 7 DS shape-changed + Q5 agg-sideways
+vs PG before the costing round; Q15a-splice / `.norm`-arm provenance
+stays attached).
+
+## R52 — R51 shape-movement adjudication (DONE 2026-09-10, report `r52-r51-shape-adjudication/REPORT.md`, docs-only, no code)
+
+R51 review item 1 CLOSED: all 11 headline/shape movers + 12
+text-only named vs PG (review APPROVE-WITH-NOTES, notes applied; first
+draft missed MISSING-NODE movers Q11/Q47/Q57 — re-derived over ALL
+verdicts). H: Q9 TOWARD (reaffirmed); Q5 MIXED (top cond = PG's 2
+clauses + implied 3rd + index-NLI below, toward; serial agg vs PG
+parallel, away-leaning — parallel-admission gap). DS: Q4 TOWARD
+strict (−qual; PG's top filter also carries customer_id — equality
+placement differs); Q11 TOWARD (−qual; bushy secyear-first pairing);
+Q84 MIXED (join-kind toward, top two levels text-identical modulo
+Parallel; parallelism concretely away — R50's Gather Merge matched PG,
+new shape serial); Q31 MIXED-leaning-toward (NL top = PG kind; +qual
+9 redundant equalities; +scan = genuine CTE re-pairing, redundant
+signal); Q47/Q57 NEUTRAL-TO-AWAY-cosmetic (+qual doubled conds; leg
+order away from PG's v1_lead-outer; dominant WindowAgg gap unchanged);
+Q25/Q64/Q72 tag-flat NEUTRAL-to-toward (transitive probe edges,
+PG-verbatim probe on Q64); text-only = duplicate conds (Q58-class,
+Q58 Limit 4.01..4.02→4.06..4.07), leg swap (Q83), ERROR-filename churn
+(Q36/Q70/Q86). Findings for costing half: redundant-clause eval cost
+visible (DP-minimisation = hypothesis, edge-admission unaudited);
+synth-opened orders lose parallel paths. Next: join-order costing half
+(`join_search_one_level` + parallel admission); nullable-side
+assertion still open.
+
+## R53 — join-order costing half, Step 0: measure Q9's divergence (IN PROGRESS 2026-09-10, report `r53-q9-costing-step0/REPORT.md`)
+
+Question: with candidates open (R51), at which DP level does goopg's
+pick first diverge from PG's Q9 order, and does the deciding term live
+in sizing (`sizeJoinRel`) or pricing (`addPaths`)? PG: ((((ps⋈p)⋈s)⋈n)
+⋈NL l)⋈o; goopg R51: ((((ps⋈p)⋈s)⋈NL l)⋈o)⋈n — shared through L3,
+diverge at L4 ({ps,p,s}+n vs {ps,p,s}+l). Instrument: `DPTRACE cost`
+line per relset (level, rows, pathlist length, cheapest kind + total)
+so every future costing slice gets L-numbers without re-instrumenting.
+Deliverables: Step-0 numbers + scoped pricing slice; review; commit;
+push. Nullable-side assertion (R51 item 3) rides a later round.
+
+Step-0 DONE 2026-09-10 (report written): PRICING at L6, hash arm, 2.5%
+margin (winner 616861.02 vs nearest hash rival 632364.99); sizing OUT (L5
+rows 303093=303093) and admission OUT (PG L6 partition offered phase 1,
+zero lev-6 declines); reqouter={} on all L4–L6 winners (no
+parameterisation dimension). Instrument carries reqouter + runner-up
+(second/secondtotal) beyond the line above. Gates green: full
+`internal/optimizer` + `testutil/estimateaudit` suites; Q12=2/Q13=34
+canonical on clone-tpch (trace-off production config). Agent review
+APPROVE-WITH-NOTES 2026-09-10, notes applied. LANDED f4f1bc058 2026-09-10,
+pushed to origin/plan-parity-with-pg-take2.
+
+Slice 1 DONE 2026-09-10 (report `r53-q9-costing-step0/SLICE1.md`):
+L6 hash-arm attribution. Instrument gap from Step-0 §3: DPPATH logs
+producer/kind/rows/startup/total/verdict per offered path but NOT the
+partition that produced it. Fix: `OuterRelids, InnerRelids RelSet` on Path
+(trace-only provenance, no planner reader), stamped in the 6 join
+constructors (serial hash/NL/merge, NLI, partial hash/merge), rendered as
+`outer={bits} inner={bits}` appended after `jointype` (existing readers
+split key=value; pathtrace tests don't pin the format; enumtrace ignores
+DPPATH). Then: read PG partition `{l+n+p+ps+s}|{o}`'s hash price at L6,
+decompose winner-vs-rival into arm terms (build/probe sides, widths,
+startup); standing hypothesis: outer-WIDTH term (L6 outer carries nation's
+vs orders' columns at identical rows 303093; M0076 trap: validate the SHAPE,
+not just the number). NOT in slice: sizing, enumeration/phases, parallel
+admission (R52 §4.2 half), merge/NL arms, any planner behaviour change.
+Deliverables: slice numbers + attribution verdict; review; commit; push.
+
+Slice-1 LANDED 8b77a905b 2026-09-10 (instrument + SLICE1.md; this TODO
+line follows separately): rival IS PG's partition `{o}|{l,n,p,ps,s}`
+(632364.99 probe-orders / 643216.79 flipped); margin 15503.97 = four
+exact arm terms (+200876 build-input / +94546 build-op / −569257
+probe-input / +289338 probe-ops); width hypothesis CONFIRMED in M0076
+form (build-op/row 0.312 vs 0.077 — spill pages ∝ ncols; ~378k spill
+charges ARE the margin); PG's price of the partition 44343.58..77747.55
+(no-spill: 6MB build fits 64MB vs goopg's 743MB column-count build).
+Agent review APPROVE-WITH-NOTES 2026-09-10 — one real catch applied
+(flipped build-op forgot outer startup: 0.082→0.077/row, 3.8×→4.0×).
+Gates: optimizer + estimateaudit suites green; Q9 plan byte-identical
+Step-0 vs slice-1 binary (trace-only proven); spotcheck SKIPs in
+worktree (no data dir). R53 pricing question CLOSED: pricing via spill,
+spill is a footprint-model consequence (R54 candidate). Pushed to
+origin/plan-parity-with-pg-take2.
+
+## R54 — parallel admission for synth-opened shapes, Step 0: death-level scope (SCOPED 2026-09-10, scope `r54-parallel-admission-step0/STEP0.md`)
+
+Question (R52 §4.2): H-Q5's Gather and DS-Q84's Gather Merge died under
+R51-new shapes — both NEW plans entirely serial, no Parallel anywhere.
+At which admission gate does parallelism die per query: session (S0),
+leaf (S1), join-clause walk (S2), upper/gather admission (S3), or
+path-level vetoes below green flags (S4)? Chain:
+`joinrelConsiderParallel` (considerparallel.go:379) → `joinrel.ConsiderParallel`
+(joinsearchlevel.go:652) → gather gate (gatherpaths.go:144) + partial arms
+(joinpathsparallel.go:104,238); walk input = `buildJoinRelRestrictList`
+(joinrestrict.go:357) taken at joinsearchlevel.go:589. Control: Q9's L4 NLI
+joinrel survives with a parallel plan, so NLI membership does not kill the
+ConsiderParallel *flag* (path-level RequiredOuter vetoes sit below — S4).
+Instrument: trace-only per-joinrel line (relset, CP, rel1.CP, rel2.CP,
+first failing clause kind) + base-rel CP line + gather-considered bit with
+partial-pathlist length + one upper-gate line, gate-held test,
+plan-identity Q5/Q84/Q9 pre/post. Then capped-clone measurement (Q5, Q84,
+Q9 control, PLAN-IDENTICAL ×2, identical GUCs with SHOW recorded);
+exit = named death gate per query, which conditions the pricing slice
+(S0 → config; S1 → leaf; S2 → clause-form; S3 → upper-rel; S4 →
+path-level; generated-but-loses → parallel-pricing round with candidacy
+numbers, pricing itself NOT Step-0). NOT in Step-0: sizing, arms,
+partial-path/gather pricing numbers, footprint model (SLICE1 §6
+candidate), R51 items 2–3, any planner behaviour change. Review
+APPROVE-WITH-NOTES 2026-09-10, notes applied (flag-level control scope;
+S0/S4 added; gather-considered + upper-gate lines; GUC pin).
+Step-0 DONE 2026-09-10 (instrument + report `r54-parallel-admission-step0/REPORT.md`,
+LANDED 442f90b5c; review APPROVE-WITH-NOTES, 5 notes, all applied):
+Q5 refused `gate=subtree` (NestedLoop capability refusal in `drivingScan`),
+Q84 double lock-out (`no-partials` ×50 + `terminatesPartial` at `Limit` top),
+Q9 splits via upper route only, Q1 control green; all plans byte-identical
+to baseline. Evidence tmp-only `/tmp/pp2/r54/`.
+Next: R54 Step-1 — S4 path-level vetoes in `joinpathsparallel.go` (zero
+partial paths under CP=true joinrels) + refine `gate=subtree` to name its
+disjunct (predict: no-driving-scan).
+Step-1 DONE 2026-09-10 (instrument + report
+`r54-parallel-admission-step0/REPORT-step1.md`, review
+APPROVE-WITH-NOTES, notes applied): off-run is 100% mode-gate (V0/M0,
+all `jt=INNER`); top-run veto census per query — hash collapses to
+V9-vs-V4 where every V4 outer is a starved-only set (B4 leaves:
+supplier/nation/region, customer_address/household_demographics/
+income_band; zero B3 — H1 dead, H2 confirmed), V6/V7/V8a/V8b zero lines
+(H3 absent), all 4 serial NL winners map to vetoes never silence (H4: no
+new-producer slice), merge sites fire M7/M3/M8/M3u/M2 but never M12 (H5:
+Gather-Merge not recoverable via current producers), Q5 subtree =
+`no-driving-scan` → split under top via the splice arm (H6). Step-2
+scoping: starved-LED (not containing) orientations, Q5 filed-not-won
+split pricing vs Q9's winning split, M12 needs ordered-partial producers.
+Evidence tmp-only `/tmp/pp2/r54s1/` (byte-identity off, Q5/Q9 Gather
+formation under top, Q1/Q84 identical).
+Next: R54 Step-2 — Q5 filed-not-won split pricing (scope
+`r54-parallel-admission-step0/STEP2.md`): PG oracle closes §6 slices 1+3
+by measurement (supplier serial hashed inner in PG Q5/Q9 → V4 deaths
+PG-faithful, no seeding; M12 needs ordered-partial producers/R50
+ruling), leaving the pricing question (Q5 split files but serial wins
+while Q9's identical split wins; PG parallelises Q5's upper via sorted
+GroupAggregate + Gather Merge(2)). Trace-only: per-leg upper costing
+lines Q5 vs Q9; exit = priced fix proposal, no constant moves.
+Scope reviewed APPROVE-WITH-NOTES 2026-09-10, 6 notes + 1 optional,
+all applied (§0 winner-shape softening + Q84 parked, within-query
+cardinality fix, join-below totals + width-per-leg + loser totals in
+§2, workers/algorithm creep seams closed in §5).
+Step-2 DONE 2026-09-10 (instrument + report
+`r54-parallel-admission-step0/REPORT-step2.md`, review
+APPROVE-WITH-NOTES, 5 notes, all applied): DPPATH gains `width` +
+`inputtotal` (trace-only, inert 4/4 at same mode; top plans
+byte-identical to Step-1); priced answer — Q5's split loses by 0.32
+(+0.28 Gather tuple 0.1×4 vs 0.1×~1.2, +0.03 Finalize vs serial agg,
++0.01 Partial) on a ~1.2-row upper seed from `EstimateRows(child)`
+while the join search prices the same relation 1834/7335 rows;
+Q9's wins by 2055.17 on the same three terms flipped (seed 40404
+rows). Fix round: size `seed.Rows` from the search joinrel rows
+(wider estimator reconciliation separately scoped). Evidence tmp-only
+`/tmp/pp2/r54s2/`.
+Next: R54 fix round — size upper `seed.Rows` from the search joinrel
+(scope `r54-parallel-admission-step0/FIX-SEED.md`): one fail-closed
+assignment in `createGroupingPaths` (new restricted
+`searchedJoinInputRelOf(child).Rows` — the existing `searchedRelOf`
+over-descends through agg/filter/limit, so wrong-scope rows need the
+narrower accessor), Rows-only (input price cancels across the live
+contest; Cost replacement separately scoped), grouped-rows sizing +
+idxSeed + STEP2 §5 seams excluded. Predicts Q5 split wins by ~180
+(~−750 if sr.Rows is the serial 7335), Q9 margin grows, Q84
+identical; Q1 identical IFF legacy seed ≈ search rows there (both
+numbers derived at measurement). Fix MEASURED 2026-09-10 (report
+`r54-parallel-admission-step0/REPORT-fix.md`, DS sweep + review +
+commit still pending): Q5→split by 750.20 (7335-case prediction to
+the decimal) ✓, Q9 split kept (margin 2055→29801) ✓, Q19 plain arm
+onto the gate pin (only live-vs-live move, rest 21/22 DIFFER both
+phases = pre-existing drift) ✓, Q1/Q84 identical + Q3/Q10 cost-only
+✓, values 8/8 identical — BUT Q7/Q8 move sorted→split in BOTH modes
+away from PG (which sorts both) ✗. Isolation: search rows are
+4.000× plan rows on every query (parallel-rows defect) and goopg's
+Q7 join is 91× PG's even in plan convention (estimator gap). Verdict:
+FAIL BACK TO DESIGN per FIX-SEED §5; redesign = search ÷degree, Q7
+selectivity scope, margin re-measure (+ Q8/serial predictions).
+Review APPROVE-WITH-NOTES (6 notes, all applied: Memoize/CTEScan/
+LockRows-cap scope comments, ordering-not-exactness test comment,
+gather-term prediction scoping, Q8+serial redesign predictions) +
+new capped-LockRows stop cases. DS SF0.5 sweep on fix binary exit 0:
+95 PASS / 0 mismatch (58 plan-shape diffs vs STALE R48 baseline,
+non-blocking channel, uninterpretable — no step2 DS sweep run).
+Report `r54-parallel-admission-step0/REPORT-fix.md`. Nothing lands:
+the code cut (accessor + assignment + 2 tests) is REVERTED, not
+committed — it regresses Q7/Q8 at HEAD, and the report's §7 fully
+specifies it for the redesign to re-derive. This commit carries the
+design artifacts only (REPORT-fix.md new, TODO.md verdict).
+Next: R54 redesign round — scope doc first (REDESIGN.md rev 1
+REJECTED on scope review 2026-09-10: the ÷degree prescription would
+double-divide the split, corrupt serial arms via the shared seed,
+and cannot name its divisor at the sourcing site; tournament
+verified single-divisor-disciplined, totals-sourcing
+convention-correct): (i) RE-LAND totals-sourcing (mechanical,
+reproduce failed-round figures to the decimal as baseline), (ii)
+Q7-class join selectivity (91× per-worker, estimator work, IN the
+round), (iii) margin re-measure with pre-stated predictions, (iv)
+split PER-ARM audit promoted co-equal (which arm over/under-prices,
+with a number), (v) PG Q8 harvest + serial judgment, (vi) a
+step2-binary TPC-DS SF0.5 sweep if DS tournaments are touched.
+Must-holds per FIX-SEED §5 incl. Q19 MATCH + Q5-split-wins
+(non-vacuous). Scope REDESIGN.md rev 2; needs second review.
+Redesign LANDED 2026-09-11 (report
+`r54-parallel-admission-step0/REPORT-redesign.md`, review
+APPROVE-WITH-NOTES, 5 notes, all applied): (i) re-land reproduces the
+failed round to the decimal (Q5 split +750.20, Q9 split +29801.70, Q19
+shape, Q1/Q84 identical, Q3/Q10 zero-move); (ii) OR-join estimator
+lands — Q7 top join 229626→1468 vs PG 2520 (0.58×), nation-cross 25→2
+(PG-exact), winner split→gathered HashAgg (PG sorts; Q7-sorted not
+required); (iv) audit with numbers — Q8's split is a 161-cost
+(0.10%) tie-break over an estimator-justified seed, owned by neither
+arm nor estimator (tie-break calibration ledgered); (v) PG Q8 harvest
+2004 totals vs goopg 2370 = 1.18× ⇒ justified; (vi) DS sweep NO-GO
+with rationale (decision-tree plan-diff + targeted sweep done:
+values 8/8, Q84 identical; estimate-only change). Q19 9125→133
+side-effect assessed toward-PG (PG anchor 47, approximate —
+different join shape), residual range/IN-default follow-up ledgered.
+Must-holds all green incl. structural Q19 MATCH (shape-identical) +
+Q5-split-wins; Q7 winner margin 32.82 (0.02%, both modes) recorded as
+fragility. Evidence tmp-only `/tmp/pp2/r54redesign/`.
+Next: R55 scoping — Q7's remaining sort gap (tie-break calibration
+may subsume it), Q19 range/IN-in-OR defaults, Q8 sorted-vs-split
+tie-break.
+R55 scope LANDED 2026-09-11 (`r55-sort-gap-or-defaults-tiebreak/
+SCOPE.md`, review APPROVE-WITH-NOTES, 6 notes, all applied): probe A
+NO-MECHANISM (`costSortRun` term-identical to PG `cost_tuplesort`,
+~80.9 both engines — sort-constant nudge REJECTED as overfitting;
+R56-candidate: `costAgg` sorted grouping-comparison term /
+Gather-Merge-IPC / input-rows lead); probe B WELL-DEFINED-CUT
+(inequality + const-IN-list arms into `orConjunctSelectivity` via
+stats-first cores; general ANY ledgered). R55 implementation = §2
+ONLY; tie-break calibration LEDGERED and ORDERED after the R56
+`cost_agg` audit. P1/P2 withdrawn; P3 live with numeric bar
+(133 → 24–94, Q7 pins bit-exact).
+Next: R55 implementation — §2 OR-conjunct inequality + IN-list arms.
+R55 implementation LANDED 2026-09-11 (`r55-sort-gap-or-defaults-tiebreak/
+REPORT.md`, review APPROVE-WITH-NOTES, 3 notes, all applied):
+`rangeOpSelectivityStats` extracted verbatim (stats-first core) +
+`orRangeSelectivity` / `orInListSelectivity` arms (general ANY
+declines as guesses, clamp stays armed; NaN policy mirrors
+`inListSelectivity` via `clampProbability`). P3 LANDS 133→26
+(inside 24–94, shape-identical, trace-attributed); Q7/Q8/Q5/Q1/Q3/
+Q9/Q10 plans byte-identical; values 8/8; Q12=2/Q13=34; q84-ds05
+byte-identical; DS SF0.5 sweep PASS=95 all-zero; parity-diff
+verdict unchanged, unparsed=0. Residual (26 vs ~47 anchor,
+general-ANY, Q8 tie-break) ledgered; §3 calibration still ordered
+after the R56 `costAgg` audit. Evidence tmp-only `/tmp/pp2/r55/`.
+Next: R56-candidate audit — `costAgg` sorted grouping-comparison
+term (SCOPE §1 lead) — needs its own scope round first.
+R56 scope LANDED 2026-09-11 (`r56-sort-placement-gathermerge/
+SCOPE.md`, review APPROVE-WITH-NOTES, 4 precision notes, all
+applied): probe C (i) costAgg terms NO-MECHANISM (grouping-cmp
+term identical to PG; F3 trans/final symmetric 58.75–58.77 on
+all four upper adds — owns zero of the margin; spill inert at
+1468 groups); (ii) margin equation closes to the cent (sorted
+− gathered = 382.40 = leader Sort at N=5874, term-faithful per
+probe A, at estimator-produced N); (iii) structural gap
+WELL-DEFINED-CUT (PG's GroupAgg→GatherMerge→Sort shape absent —
+zero keyed partials on the join input; goopg's pk=3 rival is
+GroupAgg→Sort→Gather). Authorised cut = third no-split upper
+arm (worker Sort via `costSortRun` + `gatherMergeCost` +
+`costAgg` SORTED arm, no new constant — upper-aggregate
+analogue of landed C-19e at the site it did not touch).
+Prediction: pk=3 rival → [149350,149550] (~149460, margin
+382→~190 DOWN, flip NOT promised — a flip at unfaithful N
+triggers re-audit, not celebration; either in-bar outcome
+promotes the join-rows N-lead with a number). §3 calibration
+still ledgered, still ordered after this audit.
+Next: R56 implementation — §2 worker-sort-under-GatherMerge arm.
+R56 implementation LANDED 2026-09-11 (`r56-sort-placement-gathermerge/
+REPORT.md`, review APPROVE-WITH-NOTES, 6 notes, all applied):
+third no-split upper arm (`GroupAgg → GatherMerge → Sort → pseed`,
+producer `upper.groupagg.gathermerge`; SCOPE Amendment A records
+the two companions the authorised site-b cut proved insufficient
+without — `upperorderedgrouping.go` GatherMerge translation,
+`parallel.go` Sort-through arms — plus the in-loop Q78 defect
+fix, `cte_inline_pushdown.go` GatherMerge passthrough).
+Prediction LANDS 149461.93 (inside [149350,149550], margin
+382→~193 DOWN, no flip — the scope-allowed outcome); Q7 winner
+immobile; Q7 root byte-identical; TPC-H values 8/8; Q3 flip
+(Sort→Gather 233350.75 → GatherMerge→Sort 216851.72, join
+subtree byte-identical, values MATCH) ACCEPTED with C-19e-q16
+precedent; DS SF0.5 sweep PASS=95 all-zero with 9 plan moves
+all toward-PG; Q78 fix restores `d_year = 1998` on all three
+`date_dim` scans (GroupAgg rows 269574→549 / 684176→1395 /
+1425140→2906, Limit 100→7, GM shape retained) with blast
+radius exactly Q78. Residuals ledgered, ordered after: join-rows
+N-lead (now with residual ~193 number), §3 tie-break
+calibration, F3 procost, AGG_MIXED, Q8 +25k gap, general-path
+Gather/GatherMerge crossing in `pushConjunctTraced`. Evidence
+tmp-only `/tmp/pp2/r56/` + `/tmp/q78-clone-{base,r56}.txt`.
+Next: join-rows N-lead follow-up (estimator territory, WITH a
+number) — needs its own scope round first.
+R57 scope LANDED 2026-09-11 (`r57-join-rows-nlead/SCOPE.md`,
+review APPROVE-WITH-NOTES, 11 notes, all applied): probe D
+closes the N-lead as a UNITS ERROR — 5874 is goopg's TOTAL,
+2520 PG's PER-LOOP (d=2.4 at 2 workers → 6048; GroupAgg above
+the GM shows 6047, self-proving). Normalized chain agrees
+≤3% at every level, both engines textbook (PK-FK defaults,
+1/25, OR 2/625 below / 0.5 above; one divisor applied once,
+in-trace). R56 math stands (pricing-level N untouched); only
+the residual-owner label changes. NO CUT authorised; residual
+~193 re-owned to worker-count selection (goopg 4 vs PG 2)
++ AGG_MIXED strategy preference, both ledgered.
+Next: worker-count sizing audit — needs its own scope round first.
+R58 scope LANDED 2026-09-11 (`r58-worker-count-sizing/SCOPE.md`,
+review APPROVE-WITH-NOTES, 2 blocking + 6 notes, all applied):
+probe E closes worker-count sizing as FAITHFUL — per-rel ladder,
+outer-takes-all partial joins, subpath-workers Gather, divisor
+all match the oracle; the 4-vs-2 is a SHAPE consequence (PG's
+2-worker index-NL chain vs goopg's 4-worker hash chain), not a
+sizing bug. goopg HAS the NL shapes: the customer→orders probe
+survives (@120221.91) but the lineitem extension dies dominated
+(@13.3M) on per-probe price — 9.20 vs PG 1.20 (11.5× run-cost),
+10.13 vs 1.54 (8.8× run-cost); rows agree within 2.5×, gap is
+cost. Partial-NL absence is NOT the blocker (hypothetical
+divisor-credited NL still 6-9× above the hash rivals).
+NO CUT authorised; residual re-owned to index-probe pricing
+(R59 candidate) WITH the C-20d tension quoted — the 2.0 knob
+buys measured wall-clock (Q7 15.72s→5.86s) by departing from
+PG constants, scales only the heap-I/O bounds, and stays 2.0
+until the executor-side NL-probe work lands; most of the gap
+is OPEN, no remainder treated as measured. Evidence tmp-only
+`/tmp/pp2/r56/` (same captures as R56/R57).
+Next: R59 index-probe pricing audit — needs its own scope round first.
+R59 scope LANDED 2026-09-11 (`r59-index-probe-loopcount/SCOPE.md`,
+review APPROVE-WITH-NOTES, 2 blocking + 5 notes, all applied):
+probe F decomposes the 9.20-vs-1.20 gap term-by-term — the
+missing index-side loop-count arm. `btreeIndexAMCostPages`
+never references `loopCount`: goopg charges numIndexPages×
+random×mult in full (8.0) where PG's `genericcostestimate`
+num_scans arm (selfuncs.c:7180-7210) ML-caps at the index
+size and pro-rates by num_outer_scans (≈0.05). Decomposition
+exact by subtraction: lineitem 0.38+8.02+0.75+0.05=9.20,
+orders 0.38+8.05+1.6+0.1=10.13. `loopCountFor` MATCHES
+`get_loop_count` (smallest outer base rows — orders 150000,
+lineitem 1.5M); heap-side loopCount inputs exonerated, descent
+exonerated (treeHeight 2 both; 0.05 startup gap = omitted
+P2-09b log2(N) term, named). Heap gap re-derived: lineitem
+0.75-vs-0.6 nearly closed, orders 1.6-vs-0.9 ≈ the 2.0 knob
+alone (deliberate) + width second. ONE CUT authorised: the
+num_scans>1 arm in `btreeIndexAMCostPages` only (mult applied
+to the pro-rated result, serial arm bit-identical, knob/
+widths/correlation untouched). Prediction: lineitem → [1.2,
+2.0] (central ≈1.3), orders → [2.0, 3.0] (central ≈2.4),
+{1,2} extension 13.3M→~1.5M still dominated by the 516k
+partial hash — Q7 winner immobile (lineitem-last order
+pro-rates nothing at loopCount 25 either). Pricing alone does
+NOT flip Q7; partial-NL (R60 surface) + executor NL-probe work
+still ledgered. Evidence tmp-only `/tmp/pp2/r56/`.
+Next: R59 implementation (pin-then-cut per §3 gates) — then R60 partial-NL producer scope.
+R59 implementation LANDED 2026-09-11 (report `r59-index-probe-loopcount/REPORT.md`):
+reproduction gate 9.2030/10.1302 exact, pins 1.2488 ∈ [1.2,2.0] /
+2.2051 ∈ [2.0,3.0], ONE cut in `btreeIndexAMCostPages` + NLI
+enable-gating fallout fix (`DisabledNodes`, costsize.c:3282). Gates:
+units green, vet clean, values 8/8 MATCH, Q19 MATCH, Q5 top identical
+(split-wins non-vacuous), Q84 tpch identical / ds05 toward-PG
+(run-stable), pp-diff unparsed=0 (match 5 vs 1), DS SF0.5 PASS=94 +
+Q72 TIMEOUT (solo-reproduced 317s; planner toward-oracle, ledgered
+executor NL-probe gap; status channel non-blocking precedent).
+Adjudications carried to review: §3 "Q7 immobile" FAILED → re-audited
+per §1.iii (non-NLI bit-identical, winner math coherent); FIX-SEED §5
+"Q9 split wins" + "Q84 identical" literally breached (priced mechanism,
+not drift); R56 q19/q5 baselines overwritten by driver reuse, recovered
+via R55 + REPORT line 35 (`/tmp/pp2/r59/run.sh` prevents recurrence).
+Evidence tmp-only `/tmp/pp2/r59/`.
+Next: R60 partial-NL producer scope (needs its own scope round first).
+R60 scope READY 2026-09-11 (`r60-partial-nestloop-producer/SCOPE.md`): probe G
+closes the last missing join arm — goopg has zero partial-NL references while
+PG's live Q7 wins through a partial ladder with an index-NL-chain outer.
+Hand-derivation from the R59 Q7 capture (divisors per-rel: d=2.4 workers-2,
+d=4.0 workers-4): {2,3,5} hyp ~129.5k LOSES to 46602.31 (2.78x);
+{1,2,3,5} hyp ~380146 WINS the partial ladder (531599.26→380146,
+Q-cancellation exact); Q7 top IMMOBILE (gather-vs-serial margin 195616 >
+max single-chain shed 151454). ONE cut authorised: `addPartialNestLoopPaths`
+in joinpathsnli.go (NLI sibling: shared residual+memoize pair expansion,
+PG consider_parallel_nestloop/try_partial_nestloop_path mirror) + call site
+beside addNLIPaths. Non-mirrors cited: matpath (no Material kind),
+precheck (CPU-only), UNIQUE_*/top_parent (vacuous), NL Pathkeys nil (shared
+gap), SEMI/ANTI jt-math (inherited helper). Executor OUT by inventory
+(terminatesPartial NLI+Memoize, stamp kinds, hashJoinIsPartialCapable) —
+P3 proves no R60 path wins on Q7. Predictions P0-P4 + WATCH W1/W2
+(too-close-to-call: {2,3,4,5} head ~500, final rung ~9k); any miss →
+DPTRACE A/B re-audit per R59 §1.iii rule. Evidence tmp-only `/tmp/pp2/r60/`.
+Next: review this scope, then R60 implementation per §5 gates.
+
+## R60 implementation (2026-09-11) — LANDED, reviewed APPROVE-WITH-NOTES, notes applied
+Cut as scoped (joinpathsnli.go:379 + joinpaths.go:385). Gates: 1 units/vet
+green; 2 Q7 top byte-identical (.1==.3==R59, run-stable); 3 A/B exactly
+closed (1695 = 1393+257+88-42-1; P0 lands; P1/P2 heads taken by unaudited
+plain arms but probe-rung math exact Δ0.28; P3 holds via Gather
+non-admission — PathNestLoop unadmittable, executor twin confirmed live);
+4 values 8/8 MATCH, Q5+Q10 serial-fallback moves → gate 4 letter-FAIL,
+accepted as amended scope change (parity-neutral, PG serial too); 5 pp
+5/15/0/2 exact (Q3 Δ-8.62 proven autovacuum drift 09:04→10:13); 6 DS SF0.5
+PASS=94 (same 57 ck) + Q72 TIMEOUT alone, verdict-changes=none, shapes 99/99.
+SCOPE wording fix (paramSrc unused, not reused). Follow-ups: executor
+NL-probe/Memoize-under-partial, add_partial_path_precheck CPU work, Q3
+autovacuum drift, plus ledgered width/correlation/probe-rows/AGG_MIXED/etc.
+Next: R61 scope from the ledgered follow-ups (executor NL-probe/Memoize
+completion is trigger-gated on a top ever moving — P3 holds, so optional).
+
+## R61 implementation (2026-09-11) — LANDED, reviewed APPROVE-WITH-NOTES, no blockers
+SCOPE `r61-groupcount-search-input/SCOPE.md` (+ §7 AMENDMENT A1, committed
+d90730b0b): Q11 rows=1 is a live estimator-defect chain, not fixture —
+group estimator fine (nd=201356 via pg_stats), input recompute floors to 1
+via NL-0.005 fallback + stale NLI outer-only + closing clamp; PG oracle
+32000×1/3=10667 verified live (no-HAVING→32000). Stamp-cut REFUTED live
+(stamp=1 at estimate time); P0-fires-but-no-display forced A1 (Aggregate
+carries no PlanCost, EXPLAIN recomputes via EstimateRows). Cut:
+`groupCountInputRows` helper (R54 `searchedJoinInputRelOf` gate verbatim,
+fail-closed), consumed by `sizeGroupingRelFromAgg` AND `estimateAggregate`;
+partialaggpaths comment-only (C-15 superseded by consistency). Gates: 1
+units/vet green; 2 values 8/8 MATCH vs r59 + q11 MATCH vs base, seed 32000,
+Q5 groups pinned 25; 3 dp A/B 11-modified/0-added (agg rows/costs only —
+Q11 1→80/26, Q5 1→25; joins bit-identical, verdicts unchanged),
+grouped-CTE-feeding-a-join cases identical both binaries; 4 pp 5/15/0/2
+exact (Q5 rows now 25=25 PG); 5 DS SF0.5 PASS=94 (57 ck-verified)
++ Q72 TIMEOUT alone (325s vs R60 318s), verdict-changes=none, total −1.1%,
+28 plan moves adjudicated (21 number-only incl. DS-Q3 1→15, + 7 cost-driven
+shape moves toward-oracle: Q39 HJ, Q40 GroupAgg, Q47/Q57 HJ, Q64 reorder,
+Q74 CTE-swap, Q79 GatherMerge). HAVING sel 1/3 VERIFIED empirically (was
+#3). Private DS lane (fresh `cp -a` clone :5534, tmp-only script copy;
+CKSUM SCRIPT_DIR fault caught on 2-query probe, fixed before sweep).
+Review APPROVE-WITH-NOTES, no blockers (DP + pp re-derived by reviewer);
+commit 09888fe69 (hook pgbench smoke PASS 138.7 tps), pushed.
+Evidence tmp-only `/tmp/pp2/r61/` (+`/tmp/pp2/clone-ds05-r61`).
+Follow-ups: #2 Yao-through-parameterized-probe (80→32000 groups, then
+10667 with verified 1/3), M1-display (single-table GROUP BY 200 vs
+201356), `estimateNLIndexJoin` staleness comment, (a) Materialize producer,
+(b) Q4 agg/sort strategy, NEW #4 CTE-body join tagging (arm never fires —
+walk-stop vs never-tagged), NEW #5 executor-refinement watch on
+toward-oracle shapes (Memoize/Gather gaps, cf. R59 Q72).
+Next: R62 scope from these follow-ups — #2 is the flagship (completes Q11
+to PG-exact 10667); re-triage (a)/(b) on the R61-moved Q4/Q5/Q11 numbers.
+R62 scope READY 2026-09-11 (`r62-yao-parameterized-probe/SCOPE.md`): probe G
+closes #2 — the `relFilteredRows` hit IS the parameterized probe
+(`IndexScan rows=80 Key=OuterColumnRef` ×8) and Yao crushes 201356→80 with
+tuples=800000 (log `/tmp/pp2/r62probe-start.log`; temp prints reverted, tree
+clean). PG resolves grouping vars to the UNPARAMETERIZED baserel (no
+discount), which goopg's estimate tree doesn't carry — so the faithful cut
+is to DECLINE per-probe evidence, not invent base rows. ONE cut authorised:
+found=false arm at `relFilteredRowsWalk` n==rel (`cardinality.go:1471`) when
+`*IndexScan` Key/Keys contains `OuterColumnRef` (via `exprChildSlots`,
+`exprwalk.go:109`); sole caller is the Yao site (:1318). Yao math, clamps,
+consumers, display, executor all UNCHANGED. Predictions P0-P4: Q11 groups
+80→EXACTLY 32000 (clamp min(201356,32000)); display 32000→10666 by
+truncation (`scaleByFloat`, NOT PG's 10667 — ±1 cosmetic, ledgered);
+values MATCH with **Q5 immobile at 25** (nation is the outer seq scan —
+sharp R61-vs-R62 discriminator); pp 5/15/0/2; DS 94+Q72 with the 28-plan
+set numbers-only toward-oracle (Q39 body 48→~7823, no new flips). WATCH
+DS-Q3/Q4/Q10. Corner R62-#1 ledgered (restricted+parameterized same rel
+over-counts; no live case). Re-triage: (a) unchanged, (b) NOT a rows defect
+(goopg Q4 shape cheaper; cost-model framing). Review APPROVE (probe lines,
+clamp path :1330-1334, truncation fn, Q5 plan, corner propagation all
+re-derived; 1 citation nit applied).
+Next: review this scope (done — APPROVE), then R62 implementation per §5 gates.
+R62 LANDED 2026-09-11 (`r62-yao-parameterized-probe/REPORT.md`): one arm +
+`indexProbeHasOuterRef` helper in `cardinality.go` (+24/−0, reuses sibling
+`exprHasOuterRef`/`exprHasOuterRefList` — SCOPE §2 amended for the walker
+substitution; Yao/clamps/consumers/display/executor UNCHANGED). Q11 search
+80→EXACTLY 32000 (clamp min(201356,32000)), display 26→10666 by truncation
+(PG 10667, ±1 cosmetic ledgered); Q5 immobile at 25; values 8/8+q11 MATCH;
+DP 3 modified lines only, joins bit-identical; pp 5/15/0/2 (only Q3+Q11 move
+— TPC-H Q3 HashAgg→GroupAgg+Sort, rows 12025→307640 vs PG 308817); DS sweep
+PASS=94 + Q72 alone (300s), verdicts unchanged, totals 1242→1227s; 19-plan
+set = 15 number-only + 4 strategy flips all toward-oracle (Q15/Q45 GroupAgg
+family, Q37/Q82 hash→sort-grouping). Two precision notes (Q39 body 48→3202
+not ~7823 = column-nd stats gap; flips vs "no new flip" phrasing) adjudicated
+non-blocking with full mechanistic account. Review APPROVE-WITH-NOTES (all
+numbers re-derived CONFIRM; 4 notes applied). Closes #2 — Q11 PG-exact at
+search. NEW #6 large-group strategy/stats framing (hash-cost-at-scale Q3;
+Q39 nd 3202 vs 7823). Evidence tmp-only `/tmp/pp2/r62/`
+(+`/tmp/pp2/clone-ds05-r62`); bins `goopg-r62`/`goopg-r62fresh` md5-identical.
+Next: R63 scope from the queue — (a) Materialize producer vs NEW #6 vs R61
+#4 (CTE-body tagging); (b) Q4 stays cost-model framing; R62-#1 watch.
+R63 SCOPE DRAFTED 2026-09-11 (`r63-resolver-ios-partialagg/SCOPE.md`):
+re-triage picks M1-display as flagship — (a) insufficient-alone (goopg has
+NO Materialize node by design, `joinpathsmergeouter.go:52`; Q5's HJ-vs-NL
+and HashAgg-vs-GroupAgg gaps are cost-driven and survive any Materialize
+cut); #6/(b) cost-model scope deferred 3×; R61 #4 fail-closed-correct.
+M1 LIVE at R62 HEAD: single-table GROUP BY partsupp displays rows=200
+(`defaultNumDistinct`) through Parallel Index Only Scan; search sizes
+201356, PG 203361. Temp-GOOPG_R63DBG probe (reverted, tree clean) chains
+both links: 9× fallback200 on `*IndexOnlyScan`-direct (Partial's child —
+`resolveBaseColumn` has SeqScan/IndexScan arms, NO IOS arm), 1× fallback200
+on `*Gather` (Finalize's child — NO `*Aggregate` arm; `groupUniqueNDistinct`
+refuses partials at `joinkeyproof.go:301`, principled). Search resolves via
+SeqScan ×2 no-fallback → defect is display-recompute-only; PG target is
+goopg's own nd 201356 (203361 gap = #6(ii) stats). Cut: `*IndexOnlyScan` arm
+(Covered→table-column remap) + partial-mode-ONLY `*Aggregate` arm (bare
+ColumnRef GroupExpr remap; partial-only is load-bearing — a general agg arm
+would SHADOW groupUnique's exact whole-agg answers); twin `*IndexOnlyScan`
+passthrough in `relFilteredRowsWalk` + `*Aggregate` EXEMPTION (groups, not
+base rows). P1: M1 display 200→201356; P2 Q11 32000/10666 + Q5 25 pinned;
+R63-#1 corner (partial-skew over-count, bounded by base nd).
+Next: review this scope, then R63 implementation per §5 gates.
+Review APPROVE-WITH-NOTES (all probe/code citations re-derived CONFIRM; 1
+blocking + 5 notes applied, no re-measurement): BLOCKING — draft's
+`passthrough(x.Child)` for IOS in `relFilteredRowsWalk` unimplementable
+(IOS is a leaf, no Child field) — corrected to NO twin-walker edit (n==rel
+identity covers leaves; leaf arms excluded from `descendingSwitchArms`);
+`Cond`-residual claim also corrected (`EstimateRows(IOS)` prices keys not
+Cond — conservative, M1 Cond-free). Notes: 4 line-citation fixes
+(joinpathsmergeouter :68, joinkeyproof :352, plan :1284/:1010);
+NEW R63-#2 `soleBaseScan` (+`IsSmallDimensionSide`, `outerScanRowCount`)
+lack IOS arms (conservative, ledgered); P1 assumes display/search
+inputRows parity (re-audit rule covers); P2 goopg-side Q11 shape deferred
+to gate-3 DPTRACE; createplannl wording (builder, not executor).
+Next: commit this scope, then R63 implementation per §5 gates.
+R63 LANDED 2026-09-11 (`7ccc0bff8`, `r63-resolver-ios-partialagg/REPORT.md`):
+resolver arms for IOS + partial-agg group-key identity — M1 display
+search-exact; gates 1–4 green, Q13 spotcheck FAIL ledgered as R63-#3
+(Memoize+RightJoin wrong-results row). Review APPROVE.
+R64 SCOPE + LANDED 2026-09-11 (`d48072405`, `r64-nli-right-decline/`):
+decline NLI when the probe side is the preserved (right) side — Q13
+33→34 toward-oracle, consumes R63-#3. Review APPROVE-WITH-NOTES.
+R65 SCOPE COMMITTED 2026-09-11 (`fdb1a6774`,
+`r65-q11-explain-render/SCOPE.md`): Q11 EXPLAIN-rendering round, flagship
+Q11 (structurally identical trees, 2 display-side categories). Two-arm
+renderer-only cut — Arm A Sort-key OUTER_VAR expansion through child agg
+targetlist; Arm B `(InitPlan N).col1` value-position deparse. P0–P4
+(Q11→MATCH, 6/14/0/2, values md5-identical, text-only explain moves, DS
+sweep PASS=96 SKIP=3). Review APPROVE-WITH-NOTES (8 notes applied).
+Next: R65 implementation per §5 gates.
+R65 IMPLEMENTATION IN PROGRESS (uncommitted): `operators_explain.go`
+(+151: `childAggregateThroughFilters` — Aggs-only, fail-closed on
+Star/Distinct/Filter/OrderBy/WithinGroup/nil-arg/coordinate doubt —
+`expandAggOutputRef(s)` clone-rewrite, Sort-arm call site reusing
+`keyExpr` for the S18 wrap, Aggregate Filter call site, SubqueryExpr
+Arm B `(InitPlan N).col1` gated on `IsNonCorrelated && InitPlan`
+prefix); `walk_export.go` (+39 `CloneExprReplacingColumnRefs`);
+`flaglabels_test.go` (1-line sf05→sf025 lane fix); pins
+`explain_agg_output_ref_test.go` (4 tests). Build ok, executor pins
+pass, optimizer cached-pass, vet clean. Gates 2–7 pending:
+spotcheck, TPC-H values A/B vs pre-round binary (clone
+`/tmp/pp2/clone-tpch-r65` :5533), explain A/B text-only, pp 6/14/0/2,
+DS SF0.25 sweep (private GOOPG_BIN), plan-gate DIFFER triage
+(Q11/Q3/Q5/Q10 expected → re-pin or opt-out). Then REPORT.md → review
+→ commit -n + push (explicit pathspec; SCOPE already committed).
+R65 REVIEW 2026-09-11 — APPROVE-WITH-NOTES, no blocking: mechanism
+fidelity confirmed at code level (Arm A Aggs-only with in-bounds proof
+via GroupingMaskColOffset; Arm B double-guarded for correlated SubPlan;
+BareVarKeysUnchanged unreachable; Group Key + Exists/In/Array arms
+untouched); all gate numbers re-derived green; flaglabels_test.go
+1-liner recorded as test-only fallout from e2a50de40. Notes adopted:
+pp verdict artifacts saved (`/tmp/pp2/r65/pp65-mine.txt` fixtures
+6/14/0/2, `pp65-mine-livepg.txt` live-PG 6/14/0/2 — review caught the
+missing files); "24/24 MATCH" = digest-equality wording (logs print
+OK); Q9-cost side-column swing confirmed verdict-neutral by
+re-derivation. Next: commit -n + push (explicit pathspec).
+R65 LANDED 2026-09-11 (`cdfe9ed32` code+pins+REPORT+TODO, pushed;
+errata `49b690d82` — 65433 attribution, clone state, pre/post delta
+numbers). P0–P4 all green: Q11→MATCH, pp 6/14/0/2 vs fixtures AND
+live PG, values 24/24 MATCH pre/post, DS SF0.25 PASS=96 SKIP=3,
+plan-gate opt-out (pre/post identical 20/22 verdict sets vs stale
+Sep-05 baseline). Rendering 7→5: Q3/Q5 shed, Q11 closed, Q10 partial
+(Group-Key FD-trim remainder), Q7/Q9/Q13/Q16 keep alias-vs-source
+lines (R65 SCOPE P1 named both residuals: Q13-key-2 transitive,
+Q16 pass-through).
+R66 SCOPE-INTENT (K11(d) alias→source Sort/Group keys — the last
+R65-ordered query-closing round before the (a) re-triage): PG
+renders key source expressions where goopg renders output aliases
+(Q7/Q9/Q13/Q16 = 4 of the 5 remaining `rendering` flags; Q10's is
+Group-Key FD-trim = planner work, explicitly out). Probe-first:
+dump key-expr node types + child kinds on small fixtures before
+theorising (K4/K11a-class error guard). Re-triage note for the
+SCOPE: (a) Materialize reconfirmed queued-behind-join-order —
+PG's Materialize in Q5/Q8 wraps 1-row region NL inners inside NL
+shapes goopg does not pick (goopg HJ+Memoize); a producer alone
+moves nothing (R63 triage stands, evidence `/tmp/pp2/r65/`
+r65mine vs r65pg Q5/Q8).
+R66 SCOPE READY 2026-09-11 (`r66-alias-source-keys/SCOPE.md`):
+probe-first (9 throwaway fixture shapes A–I, reverted, tree clean)
+— Sort keys bind output positions (table 0), GroupExprs source
+(table N); GROUP-BY-alias resolves through at unit level (F/I), so
+Q7/Q9's alias GroupExprs need the live agg-chain dump (K76 boundary
+candidate, unmeasured); Star/Distinct are the SOLE decline reasons
+for Q13-key1/Q16-key1 (FuncCall has Star, no Distinct, renderer
+neither); Q13-key2 transitive miniature is positional-only (c vs
+count name mismatch). Slice 1 = Arm S (group-section Sort keys
+render GroupExprs[idx], written order, R65 name guard kept) + Star
++ Distinct (additive FuncCall field, render-only precedent);
+predicts Q16 sheds `rendering`, Q13-key1 fixed, ZERO EXTRA flips.
+Slice 2 = G/T chase AFTER a Step-0 live dump (STEP0.md names the
+search knob or records the negative). Review APPROVE-WITH-NOTES
+(3 blocking: same-level name check, explicit 0<=idx, P3 reword +
+HAVING pre-flight — all applied; 8 advisory applied).
+Next: commit this scope, then Slice-1 implementation per §5 gates.
+R66 SLICE-1 LANDED 2026-09-11 (`r66-alias-source-keys/SLICE1-REPORT.md`):
+Arm S + Star + Distinct, renderer-only. P0–P5 all green: Q16 sheds
+`rendering` (sole per-query move; 6/14/0/2), Q13-key1 fixed, values
+24/24 MATCH, DS SF0.25 PASS=96 SKIP=3, plan-gate opt-out (identical
+20/22 verdict sets, 17-line Sort-Key-only diff). DS: 17 queries move,
+all confined (16 sortkey + Q23 `count(*) > 4` adjudicated to SQL text).
+Review APPROVE-WITH-NOTES (2 blocking: R65-header stale list fixed,
+e2e sublink pin added — plannable, no deviation; 4 advisory applied:
+Star wording, guard-walker residual documented, Star+Arg2 strict
+decline, DS pre-flight carried to Slice 2). Worktree trap: an empty
+`postgres/` dir in the worktree makes `ln -sfn` land INSIDE it —
+verify with ls before linking (K91 sibling). Spotcheck deferred (peer
+holds :65433; renderer-only + 24/24 digests cover it). Fresh-PG
+reference shows PG-side Q8 join-order drift (rendering-neutral).
+Next: Slice-2 Step 0 (live agg-chain dump; STEP0.md names the search
+knob or records the negative).
+R66 STEP-0 DONE 2026-09-11 (`r66-alias-source-keys/STEP0.md`, review
+APPROVE-WITH-NOTES, notes applied): (i)-negative recorded (search
+defaults ON — no separating knob; E/I already searched); (ii) live
+dump names all chase targets — Q7/Q9: narrowing Project Targets are
+the source (`n_name` base refs + ExtractExpr); Q13: preserving-Project
+rename → inner `count(o_orderkey)` positionally (probe-D rule live).
+Chase rule derived with per-query traces; table-0/Sort-preservation/
+Filter-hop premises flagged uncited for the arms SCOPE (K4 guard).
+Foreign `zz_probe_r66_test.go` (peer probe) left untouched. Next: arms
+SCOPE citing the three sites, then implementation.
+R66 SLICE-2 SCOPE READY 2026-09-11 (`r66-alias-source-keys/SLICE2-SCOPE.md`,
+rev 2 after review APPROVE-WITH-NOTES): B1 closed with covering sites
+(agg-output zero-value :7829/:7996/:8022 + carry + IsolatedScope
+exclusion; G-Probe IsolatedScope=false unit-measured), B2 entries bound
+(Sort-above-agg, Sort-over-Project with re-anchored guard, Group arm;
+Q8/Q22 named; GroupingSets carried), B3 Gate-0 EXECUTED (flattened→base
+text, MATERIALIZED→s.supp; transcript `/tmp/pp2/r66/gate0/`).
+Re-review APPROVE-WITH-NOTES (Gate-0 transcript saved to close it;
+IsolatedScope-false unevidenced but harmless — runtime guard governs;
+Q8/Q22 decline-reasons required in gate 4). Predictions: rendering
+{Q7,Q9,Q10,Q13}→{Q10}, pp unmoved, zero EXTRA. Next: Slice-2
+implementation per §6 gates (pins incl. Group Key text + G-shape
+sourced-text pin).
+R66 SLICE-2 STOPPED at P3 2026-09-11 — TPC-H fully green (rendering
+{Q10}, moves exactly Q7/Q9/Q13 shedding it; values 24/24; DS sweep
+PASS=96) BUT the DS census missed Q44+Q54 (section-splitter blind spot
+— verify censuses against raw grep counts, R50-trap family): Q44
+`rank_col`→`(avg(ss1.ss_net_profit))` vs PG `v1.rank_col`, Q54
+`c_customer_sk`→`my_customers.c_customer_sk` vs PG
+`customer.c_customer_sk` — both AWAY (boundary aliases PG keeps).
+Table-0 rule fixed Q49 (reverted) and contained Q51 (structure-faithful
+CASE, ref gap recorded). Fingerprint incident: an unattributed sweep
+into ds-sweep-s2b resolved by engine-sha to MY OWN binary
+(cbbebc17==s2b) — exonerated; lesson: trust the fingerprint, and census
+by grep not just by section-diff. Evidence `/tmp/pp2/r66/ds-pg/`
+(live-:65438 key lines Q21/39/44/49/51/54/91). Cut UNCOMMITTED.
+Next: dump Q44/Q54 chains (temp DBG on the SF0.25 lane) → boundary
+rule (naming-boundary stop) → implement → full re-gates.
+Q44 mechanism NARROWED 2026-09-11: Slice-1 binary on same data prints
+`rank_col` (key measured: `ColumnRef(rank_col,idx1,table1)` under a
+Project child — R65 declines) while s2b prints `(avg(...))`; a unit
+repro shows the same alias-vs-call split, so the entry path differs
+by key object, not by branch logic. PG keeps `Subquery Scan on
+v1/v2` (unflattenable: GROUP BY+HAVING+InitPlan inside) so PG prints
+`v1.rank_col`; goopg flattened it away and the chase cannot see PG's
+boundary. The live s2b key object is UNMEASURED (unit shape differs
+from live shape) — next is a Sort-anchored dump (keys + downward
+chain incl. Project Targets/IsolatedScope) for Q44's two Sorts + Q54,
+then the boundary rule from 7 chains (stop before Aggs synth, or a
+goopg-side flattening marker). TEMP traces reverted and verified zero
+(`grep R66DBG/Q44DBG` clean); s1 worktree removed.
+Sort-anchored dump DONE 2026-09-11 (server-dbg4.log, reverted clean,
+build green): Q44 path is Sort→Project[rename]→Filter→Agg[avg +
+sublink-HAVING] (PG keeps SubqueryScan v1 — GROUP BY+HAVING+InitPlan,
+unflattenable — prints `v1.rank_col`); Q54 path ends at a
+CTE-qualified stop (`my_customers.*`, PG flattened per K31 — prints
+`customer.*`). Boundary rule scoped: (1) stop-and-render ONLY at
+BASE-table refs — CTE-output refs decline (CTEScan carries
+Name/Alias/RTID, plan.go:1636/1677 — an RTE-kind set, e.g. on
+subPlanReg, is implementable); (2) decline Aggs-synth at aggs with
+sublink-HAVING (R-A: preserves Q13-inner (no HAVING) + Q16/Q21/Q91
+same-level; kills Q44; n=1 correlation honestly labeled). Q49 stays
+declined (table-0 rule), Q51 CASE kept (structure-faithful). TEMP
+SORTDUMP reverted and verified zero; :65437 stopped. Next: implement
+the two rules → full re-gates → SLICE2-REPORT.
+R66 SLICE-2 LANDED 2026-09-11 (`r66-alias-source-keys/SLICE2-REPORT.md`):
+chase + boundary rule (sublink-Filter + CTE-qualifier declines) +
+table-0-operand fail-closed. P0–P5 all green: rendering {Q7,Q9,Q10,Q13}
+→{Q10} (sole moves Q7/Q9/Q13 shedding it, both refs), values 24/24 at
+every binary step, DS PASS=96, plan-gate opt-out (identical 20/22).
+DS: Q21/Q39/Q91 kept, Q49/Q44/Q54 reverted, Q51 CASE kept — each
+PG-adjudicated (`:65438` transcripts in `/tmp/pp2/r66/ds-pg/`).
+Review APPROVE, no blocking (3 comment/hardening notes applied;
+locator-threading + synth-return guard ledgered as follow-ups).
+R66 CLOSED → next due: the (a) Materialize re-triage as a new round
+with its own scope.
+R67 TRIAGE DONE 2026-09-11 (`r67-materialize-retriage/TRIAGE.md`,
+review APPROVE, no blocking): (a) stays queued behind join-order/
+join-method costing on post-R66 numbers — sole live TPC-H use is Q5
+inside 5 category gaps (producer moves zero categories/matches);
+Q8's fixture use evaporated live; DS Q65 same pattern; no MATCHING
+query needs it; 36-site NL-inner census finds no coinciding site.
+Next major round: join-order costing (R53 lineage); #6/R61-#4/(b) stay
+deferred (re-derive, don't re-carry). Next: scope the join-order
+costing round.
+R70 SCOPE READY 2026-09-11 (`r70-hash-footprint/SCOPE.md`): hash
+footprint compute-then-route (planner pruning cut vs minimize_datum
+dependency). Review APPROVE-WITH-NOTES (per-offer ncols/avgVarBytes
+instrumentation not inference; pre-registered separation bar with
+Step-A sign-off enforcer; considerparallel citation corrected;
+pruned width from Q9's keep-set not K67's anchor — all applied).
+Next: Step-A decision table (+bar pass/fail recorded), then cut or
+close-out per the route rule.
+R70 STEP-A DONE 2026-09-11 (`r70-hash-footprint/STEP-A.md`, review
+APPROVE-WITH-NOTES as the required enforcer — one grid cell
+corrected, tie-row outer dims stated): BLOCKED with numbers —
+nominal 6-col win (+78k) degrades to a +4k tie at +10% rows (spill
+cliff ~9% away); real headroom needs DatumBytes or
+projection-pushdown (neither exists — verified). No cut. R70 CLOSED
+as a dependency statement; tree clean (temp reverted).
+R71 SCOPE rev 2 READY 2026-09-11 (`r71-q4-semi-selectivity/SCOPE.md`):
+Q4-theory diagnosis ONLY (rev 1 REJECTED: rows can't re-elect per
+costAgg arithmetic; Gate-0 mis-sited). Crossover probe (victim
+predicate + 13490/~30000/3439 points) + oracle read + R47
+confrontation; implementation explicitly off-table. Review
+APPROVE-WITH-NOTES (provenance + predicate + 4 precision notes — all
+applied). Next: Gate-0 diagnosis per §1, then close + scope follow-up.
+R71 GATE-0 PROBE DONE 2026-09-11 (uncommitted temp): Q4 semi forced
+to 13490/30000/3439 — rows move exactly, NEITHER election moves at
+any point (Sort→HashAggregate throughout; costs reprice 1426→337/
+750/86). Firings 14/14/14, all same victim (outer orders + inner
+lineitem — predicate held, idempotent passes). Rows theory DEAD per B1
+(third exit) — follow-up is the election/firing-rule program.
+Remaining: oracle read + R47 confrontation + DIAGNOSIS.md + review.
+R71 CLOSED 2026-09-11 (`r71-q4-semi-selectivity/DIAGNOSIS.md`,
+review APPROVE-WITH-NOTES — 14/14/14 counts corrected, rev-3
+predicate amendment, PG/goopg stats filed, 13489.53 cited): rows
+can't elect (probe) AND wouldn't match PG's rows anyway (0.78 vs
+0.23 — different stats, correct on both sides); PG's rule IS
+eqjoinsel_semi non-MCV (nd1=1.5M unscaled vs nd2=347537; inner qual
+not driving). Follow-up: election/firing-rule program (Q4-closing
+path). Tree clean (temp reverted, grep-proof, byte-identity
+re-verified).
+R72 SCOPE READY 2026-09-12 (`r72-election-step0/SCOPE.md`): election
+program Step-0 (Q4 grouping + ordered elections re-measured, PG rule
+cited, one scoped slice). Review APPROVE-WITH-NOTES (diverging
+qualifier, slice-menu exclusions recorded, (c)-exemption, grounds
+spot-check, punctuation — all applied). Next: Step-0 measurement
+per §1, then the scoped slice.
+R72 STEP-0 DONE 2026-09-12 (`r72-election-step0/STEP0.md`, review
+APPROVE after one REJECT remediated — PG cites added, ruling
+unified to pure (c)): Q4 grouping elects hashed outright (1426.71 vs
+sorted 6077.69, 4.26x — no tie); ordered loop elects Sort-over-hashed
+1426.78. PG serial winner GroupAggregate-no-sort 192222.42 while its
+own hashed+Sort is 0.5% cheaper (191263.38, enable_sort=off) — 1%
+fuzz tie broken by pathkeys (pathnode.c:50/:185, planner.c:3763/:5291
+cited). P2: semi selectivity 1.0 vs 0.2317, widths 20–28x, semi price
+570.66 vs 191195.81. R71 audit: 0.23 was selectivity misreported as
+cost; rows=3/1500 unlocated (canonical 13490/57066). Controls: Q6
+MATCH/quiet; Q13-inner diverges opposite (hashed arm absent —
+admission gap, Slice-2 MATCH claim stale, R69 suspect unproven);
+Q22-outer second Q4-family member. Ruling (c): no election-rule slice;
+follow-up program (semi-sel re-anchored, widths, semi-rescan). Tree
+clean (temp reverted, optimizer builds).
+R73 SCOPE READY 2026-09-12 (`r73-semi-price-audit/SCOPE.md`): NL-SEMI
+price audit (R72 program item 3 + display-seam suspect — Q4 SEMI
+570.66 < its own outer 15570.66 is impossible via nestloopCost AND
+via DeriveLegacyDisplayCost-default, so P0 attributes path-cost vs
+display-seam first). Fix iff mis-transcribed (R69 discipline); widths
+(R70) and selectivity (program item 1) explicitly out; Q22-ANTI
+read-only verification, no bundling. Next: review SCOPE, commit/push,
+then P0 attribution.
+R73 P0 DONE 2026-09-12 (`r73-semi-price-audit/ATTRIBUTION.md`, review
+APPROVE): display-seam verdict — NO SEMI path ever filed (R73PATH
+silence ×4, stderr proven live), NLI node carrier-UNSET, child walker
+lacks NLI arm so semi prices childless 0+0.01×57066=570.66; grouping
+seeds on the seam number (groupingpaths.go:77). NO cost fix per SCOPE
+P1 (no planning site exists); R72 P2 corrected; next program item is
+SEMI search-admission (producer scope, not a term fix). Tree clean
+(temp reverted, optimizer+executor build).
+R74 SCOPE READY 2026-09-12 (`r74-semi-admission/SCOPE.md`): SEMI
+search-admission Step-0 — locate the fork where Q4's EXISTS-SEMI
+bypasses the search (arm willing: addNLIPaths admits Semi/Anti,
+only Right refused; joinrelsize/specialjoin already semi-aware) via
+temp trace on tryBuildNLI + sjinfo path; P1 slices admission routes,
+implementation separate. Q22-ANTI read-only; widths/selectivity/
+elections out. Next: review SCOPE, commit/push, then P0 fork trace.
+R74 P0 DONE 2026-09-12 (`r74-semi-admission/FORK.md`, review APPROVE):
+fork named — `unnestExistsExpr` (unnest.go:4078/:4360) builds
+hash-SEMI Join pre-search (1.5M outer), tryBuildNLI rewrites to
+unpriced NLI (57k), collapse never builds semi sjinfo (not a
+FROM-join) so the search never sees the relset. P1 menu: (i) admit
+unnested SEMI joinrel to search (recommended) vs (ii) post-hoc NLI
+pricing; implementation separate; Q22 rides (i), Q13 separate. Tree
+clean (temp reverted, optimizer builds).
+R75 SCOPE READY 2026-09-12 (`r75-semi-admission-slice/SCOPE.md`):
+SEMI search-admission slice, route (i) — P0 spike in unit harness
+(semi sjinfo + parameterised inner through addPathsToJoinrel,
+assert priced SEMI NLI ≥ outer; precedent joinsearchunnest_test.go),
+P1 integration splice design (pinned-spine interplay in predp.go,
+createNestLoopPlan stamping), gates at slice commit (values/sweep/pp
+Q4/Q21/Q22). No selectivity/width/election changes. Next: review
+SCOPE, commit/push, then P0 spike.
+R75 P0 DONE 2026-09-12 (`r75-semi-admission-slice/SPIKE.md`, review
+APPROVE): PASS — keeper `semiadmission_test.go`
+(TestSemiAdmissionFilesPricedNLI): SEMI NLI filed rows=2300
+total=160675 ≥ outer 200 through existing arms, no new machinery,
+subset 17 green. P1 integration splice → R76 (relset/sjinfo
+construction + subtree splice via stampPlanCost; no cost terms).
+R76 SCOPE READY 2026-09-12 (`r76-nli-price-splice/SCOPE.md`): NLI
+price splice at the rewrite site — P0 probe (construct priced NLI
+path from planned children via existing arms + stamp through the
+funnel; PASS/BLOCKED both committable), P1 Q4 measurement + gates
+iff PASS, R77 implementation iff P1 clean. Single-SEMI-shape only
+(parameterised index probe); hash-SEMI untouched; no join-order or
+cost-term changes. Next: review SCOPE, commit/push, then P0 probe.
+R76 P0 DONE 2026-09-12 (`r76-nli-price-splice/PROBE.md`, review
+APPROVE): PASS — rewrite-site probe prices SEMI via production
+helpers at 490456.34 ≥ outer 15570.66 (×2 identical, PG 191195.81
+same order); caveats recorded (rows=5 per-probe, cp threading,
+numQualOps). P1 measurement+gates → next; R77 implementation iff P1
+clean. Tree clean (temp reverted, optimizer builds).
+R76 P1 DONE 2026-09-12 (`r76-nli-price-splice/P1.md`, review
+APPROVE): TEMP stamp prices Q4 SEMI at 490456.34 (shape unchanged,
+pp election story intact on real base); 19/22 byte-identical (Q4/
+Q21/Q22 costs-only + Q4 rows note + Q22 display-rows seam noted);
+subset 16 green; values/sweep DEFERRED to R77 (recorded deviation).
+R77 = production splice (cp threading, keeper, full gates).
+R77 SCOPE READY 2026-09-12 (`r77-production-splice/SCOPE.md`):
+production NLI price splice — P0 stamp-site check (in-tryBuildNLI
+vs end-of-pipeline post-pass; Q22 display-rows seam decides), P1
+implement (pricing func + stamp, cp from ps via post-pass to avoid
+tryBuildNLI signature churn across 9 test sites, keeper), full
+gates (values/sweep/pp + 19/22 byte-identity re-verify). Same
+bounds as R76. Next: review SCOPE, commit/push, then P0.
+R77 LANDED 2026-09-12 (`r77-production-splice/REPORT.md`, review
+APPROVE after one REJECT remediated — line pins + evidence paths
+corrected, splice file committed): production NLI price splice —
+dual call sites (:1646 feeds elections, :2417 end-of-pipeline
+catches rebuilds), Q4 coherent at 491312 (rows unmoved), keeper
+passes; gates green (values 24/24, sweep PASS=96, pp Q4 election
+story intact, 19/22 identical, optimizer 2863). DS 90-plan churn
+attributed (join-flips=R66/R69, agg-flips=expected downstream).
+Next: rows/width program (R72 items 1–2).
+R78 SCOPE READY 2026-09-12 (`r78-semi-selectivity/SCOPE.md`): SEMI
+selectivity Step-0 — P0 would-be probe (call eqJoinSelectivitySemi
+with node-derived stats at estimateNLIndexJoin, log only; PASS iff
+≈ PG 0.23), P1 slice (wire match fraction into the NLI estimator
+for Semi/Anti only) iff P0 reproduces. INNER NLI rows + widths
+(R70) explicitly out. Next: review SCOPE, commit/push, then P0.
+R78 P0 DONE 2026-09-12 (`r78-semi-selectivity/PROBE.md`, review
+APPROVE): BLOCKED per SCOPE bar — machinery faithful
+(frac=0.7825 stable) but goopg nd2 1.17M vs PG 347k (3.4×) keeps
+0.23 out of reach; named piece = ANALYZE ndistinct estimator.
+Re-scope input: nd2-estimator program (±widths); no wire-0.78
+without its own SCOPE. Tree clean (temp reverted, builds).
+R79 SCOPE READY 2026-09-12 (`r79-ndistinct-sampler/SCOPE.md`):
+ndistinct sampler Step-0 — P0 sampler mechanisms (goopg reservoir
+vs PG block-sampling, same 300×target size), P1 nd-vs-target
+curves on l_orderkey both engines (ANALYZE rounds, foreground),
+verdict replicate-vs-keep. Widths NOT paired (R70 CLOSED — needs
+DatumBytes/pushdown, neither exists). Next: review SCOPE,
+commit/push, then P0.
+R79 P0 DONE 2026-09-12 (`r79-ndistinct-sampler/P0.md`, review
+APPROVE): mechanism table — goopg uniform reservoir (all blocks)
+vs PG two-stage few-blocks+Vitter, same Duj1; most-likely diverger
+= block representation → f1 on insertion-ordered l_orderkey; MCV
+ruled out for this pair. Next: P1 nd-vs-target curves or BLOCKED
+on the ANALYZE gap.
+R79 P1 IN PROGRESS 2026-09-12 (opencode lane): nd-vs-target
+curves {10,100,1000} on l_orderkey both engines, foreground —
+PG :65432 (per-column SET STATISTICS, restore+re-ANALYZE after),
+private goopg clone :5556 (cp-a of clone-tpch-r65; peer :5533
+untouched). SCOPE already reviewed; P1.md + review to follow,
+then commit/push. Verdict (a) replicate-vs-(b) keep per SCOPE.
+R79 P1 DONE 2026-09-12 (`r79-ndistinct-sampler/P1.md`, review
+APPROVE-WITH-NOTES, notes applied): goopg flat ~1.2M at
+10/100/1000 (target=1 degenerate); PG 0.34M at 10/100,
+~1.22M at 1000 (by-design absolute→fraction switch) —
+converge at 1000 (~0.8%), consistent with P0 sampler story.
+Verdict (b) keep superior stats (closer to truth 1.5M at
+10/100, tied at 1000); nd2 ruled out as the lever within
+tested targets; follow-up program must source the semi
+fraction independently of nd2. Contamination episode handled
+(ALTER persists StatTarget — caught, reset, re-ran clean).
+PG restored+verified, goopg clone canonical. No code changed
+(R80 owns estimators).
+R68 SCOPE READY 2026-09-11 (`r68-joinorder-costing-step0/SCOPE.md`):
+join-order costing Step-0 (Q9 L-divergence re-measured, sizing vs
+pricing re-adjudicated — R53 numbers stale via R59/R64/R62/R57/R54).
+Review APPROVE-WITH-NOTES (sizing-IN slice (e) added — menu now
+exhaustive; Q9-first framed as lineage call; SHOW capture + Q9-match
+STOP + (d)-attribution + spotcheck-branch provenance required).
+Next: Step-0 measurement per §1, then the scoped pricing/sizing slice.
+R69 LANDED 2026-09-11 (`r69-nli-probe-audit/REPORT.md`): NLI
+rescan-startup term — Q9 L6 117k→246k, hash still 539k (width owns
+the flip). P0–P2 green (values 24/24, sweep PASS=96 all-zero;
+pp moves exactly Q5/Q7/Q9/Q18 verdict deltas + Q2 sideways; DS 24
+NL→hash moves adjudicated, 14 toward/4 neutral/6 owned residuals).
+Review APPROVE, no blocking (P0 table, double-subtraction catch,
+Gate-0 evidence, cost-only-noise correction applied; locator +
+synth-guard ledgered). Next: slice (b) width program.
+R68 STEP-0 DONE 2026-09-11 (`r68-joinorder-costing-step0/STEP0.md`,
+review APPROVE-WITH-NOTES, 4 blocking remediated): Q9 re-measured —
+L6 NLI-winner 117342.97 (true spine L2→L6 re-derived) vs
+PG-partition-hash 528k dominated; sizing/admission/parameterisation
+OUT, pricing IN two-sided; R53's hash-arm question SUPERSEDED (NLI
+took L3–L6). Slice (a): NLI 0.068/probe join-added audit at
+joinpathsnli.go + nestloopCost (no joinsearchnlicost.go exists).
+Evidence filed (trace/plan/PG/SHOW halves). Next: slice-(a)
+implementation per the STEP0 bar.
+R69 SCOPE READY 2026-09-11 (`r69-nli-probe-audit/SCOPE.md`): NLI
+0.068/probe join-added audit, PG-term-keyed table (rescan-startup
+included — all three call sites pass literal 0 today), fix iff
+mis-transcribed. Review APPROVE-WITH-NOTES (P0 bidirectionality,
+-n rationale recorded, ZERO-EXTRA supersession stated, ~410k bound,
+body-:723 cite, SEMI/ANTI+qual-startup+tlist non-owners listed,
+estimateaudit gate added — all applied). Next: phase-1 attribution
+(temp instrument, inertness gate), then phase-2 fix.
+R80 reserved per R79-verdict for the ndistinct estimator program.
+R81 SCOPE READY 2026-09-12 (`r81-q4-ordered-remeasure/SCOPE.md`,
+review APPROVE-WITH-NOTES, notes applied): Q4 ordered-election
+re-measurement with the post-R77 seed (scratch: hashed 490741.73
+vs sorted 495392.71, ratio 1.0095 < 1.01 fuzz — election may have
+moved; R72's 4.26x used the pre-R77 seed). Step-0: DPPATH harvest
+(grouping survivors incl. Finalize-decline gate, ordered
+candidates, exact comparator arm) on private :5556; predictions
+P1-P3 recorded; STOP/branch rules (no mechanism-only landing
+without named next step). Next: commit/push, then Step-0 measure.
+R81 STEP-0 DONE 2026-09-12 (`r81-q4-ordered-remeasure/STEP0.md`,
+review APPROVE-WITH-NOTES, notes applied): P1+P2 confirmed
+(both survive grouping; ordered offers no-sort + Sort-hashed);
+P3 outcome = hashed+Sort via M0129-S1 tie-break on double
+fuzz-equality (1.0095/1.0086); PG decides on startup (1.0118)
+because its sort-startup is ~202 on 3439 rows vs 5079 on
+57066 — comparator correct as designed, NO implementation
+(forcing). Q4-sort blocked on INPUTS: selectivity BLOCKED
+(R78/R79), widths BLOCKED (R70, DatumBytes/pushdown);
+deferral-ledger row filed with unblock conditions + re-measure
+gate. :5556 stopped; PG untouched; tree clean (no code).
+R82 IN PROGRESS 2026-09-12 (opencode lane): TPC-DS HEAD
+baseline (SF0.25, private clone :5557, peer :5533 untouched) —
+full 99-EXPLAIN capture + goopg-vs-PG-oracle adjudication +
+nearest-miss ranking. Last DS numbers are R46-era; TPC-H side
+re-baselined at R81. Measurement-only; no code. Next: capture,
+adjudicate, BASELINE.md + review, commit/push.
+R82 DONE 2026-09-12 (`r82-ds-head-baseline/BASELINE.md`,
+review APPROVE-WITH-NOTES, notes applied): DS HEAD
+`match=1 (Q9 holds) shapediff=68 missingnode=27 error=3`;
+cats join-order=95/parallelism=88/sort=80/agg=74/method=62/
+scan=58/param=49/rendering=22/qual=11. Nearest misses:
+Q25/26/28/29/Q7 (parallel family, deferred) + Q41
+(Limit/Unique/Sort placement + $0 display, SELECTED next)
++ Q91/Q96 (bigger machinery, not selected). :5557 stopped;
+clone retained; PG untouched; tree clean (no code).
+R83 LANDED 2026-09-12 (`r83-limit-above-distinct/REPORT.md`,
+review APPROVE-WITH-NOTES, no blocking): LIMIT above
+DISTINCT — deferred wrap past DISTINCT adoption, Limit at
+root (PG shape); decline on WithTies/DISTINCT ON/SRF/
+non-constant (IntegerConst allowlist, fail-closed). P2
+synthetic duplicates test (FAIL-before stash-verified,
+PASS-after). Q41 shape exact per P1
+(`Limit→Sort→Unique→Sort`); categories unchanged (top
+M0097-0046 Sort + `$0` remain — named follow-ups).
+Gates: units (pre-existing `bak/` debris excluded) +
+suites fresh + P2 + spotcheck + SF0.25 sweep (PASS=96,
+MISMATCH=0; plan-shape only Q41) + DS A/B (Q41 only;
+Q6/Q38/Q54 identical) + TPC-H A/B 22/22 vs TRUE HEAD
+worktree binary (stale tmp binary caused a false 18-query
+diff first — inode check insufficient, provenance
+required). Follow-ups: ParamRef allowlist, outer-Sort
+elimination, `$0` display.
+R84 LANDED 2026-09-12 (`r84-distinct-outer-sort-skip/REPORT.md`,
+review APPROVE-WITH-NOTES, no blocking): skip redundant
+M0097-0046 outer Sort over *Distinct (type-gate fail-closed;
+ASC+nulls-last positional-prefix rule — sound because
+distinctOp always re-sorts ASC/NL over all columns).
+Q41 3→1 cats (`Limit→Unique→Sort→SeqScan`, PG shape modulo
+`$0` display); corpus join-order 95→94, sort 80→79.
+Gates: units (bak debris excluded) + suites fresh (6 new
+pins: skip/keep shapes, NULL ordering both directions) +
+spotcheck + SF0.25 sweep (PASS=96, MISMATCH=0; plan-shape
+Q41-only) + DS A/B (Q41-only) + TPC-H A/B 22/22 vs TRUE
+HEAD worktree binary (stale tmp binary false alarm:
+inode check insufficient, provenance required). Follow-ups:
+`$0` display (Q41's last gap), ParamRef LIMIT allowlist,
+outer-Sort work beyond the skip (none needed).
+R85 LANDED 2026-09-12
+(`r85-execparam-display/REPORT.md`, final implementation review
+APPROVE with no blocking findings): correlated `ExecParamRef` display now
+uses the owning sublink's atomically validated `ParParam`/`Args`
+direct-ColumnRef source; every unproved case remains `$N`.
+Body-local maps shadow/restore for nested SubPlans. Qualification
+uses an owner-query-scope allowlist with explicit IsolatedScope /
+CTE / set / recursive / DML boundaries, no global `bySrc`
+fallback, RTID registration enforcement, node+RTID de-dup, and
+unknown-kind decline. Reviews caught forced qualification,
+malformed-map handling, query-level ID collisions, unsafe generic
+walking, missing RTID registration fallback, RTID de-dup, and the
+zero-ID pin before landing; all are closed and pinned. Q41 is now
+MATCH. Corpus A/B moves exactly H:{Q17,Q20}/DS:{Q6,Q41}; every
+expanded source agrees with fresh live PG. Gates green: suites,
+spotcheck, SF0.25 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+TIMEOUT=0` (plan movement Q6/Q41 only). Remaining deliberate
+debt: forwarded/non-Var PARAM_EXEC source expansion (none in the
+current executable TPC-H/TPC-DS census).
+R86 SCOPE READY 2026-09-12
+(`r86-q96-step0/SCOPE.md`): TPC-DS Q96 measurement-first audit.
+The visible `store_sales` row split is the first discriminator:
+goopg prints 719876 below a 3-worker Gather while fresh PG prints
+232218 and reports base reltuples=719876
+(`clamp_row_est(719876 / 3.1) = 232218`).
+Step-0 proves whether goopg has mismatched base statistics, loses the
+partial path's per-worker rows only at plan stamping, or actually
+prices the tournament with the wrong row unit; then traces the visible
+L2 structural split, decisive L3 prefix election, and the parameterised
+time_dim-pkey NLI's admission/election. No fix is authorized until
+exactly one branch is
+measured and separately scoped. Q14/K92, Q1/R81 inputs, the parallel
+family, Q91 Materialize, and corpus-zero ParamRef LIMIT debt remain
+deferred.
+R86 STEP-0 DONE 2026-09-12
+(`r86-q96-step0/STEP0.md`, measurement-only; implementation review pending):
+both engines have `store_sales=719876` and goopg's actual partial base path
+uses PG's `232218` per-worker rows. The printed 719876 is a serial
+`PathPrebuilt` carrier later stamped under Gather, not the partial tournament.
+Within the common `{ss,hd,store}` partial list, PG's `(ss⋈hd)⋈store` offer
+(`16615.81`) is evicted by `(ss⋈store)⋈hd` (`16562.60`): equal output
+rows/pathkeys/disabled count but a `53.21` lower total. The earliest input
+difference is its L2 selectivity/cardinality (store: 59990 / 19352 partial,
+about 1/12; hd: 71988 / 23222 partial, 1/10). The subsequent parameterised
+NLI and Gather refusal are real but downstream; that NLI's `inputtotal=16562.60`
+proves it uses the non-PG prefix. Primary branch F; A/B ruled out and D/E are
+not reached. No code changed. Required gates pass: optimizer/executor tests
+and vet, trace A/A, Q9/Q41/Q91/Q96 trace on/off controls, and Q96 PG value
+comparison. Next: review corrected report, then commit/push; only after that
+may a separately scoped R87 localise the L2 selectivity/cost input.
+R87 SCOPE READY 2026-09-12
+(`r87-q96-f-prefix-cost/SCOPE.md`): measure only the F-branch L2
+`ss⋈hd` versus `ss⋈store` selectivity/cardinality and partial Hash Join
+cost terms that create the 186.54 L2 / 53.21 L3 advantage for the non-PG
+prefix. No Gather/NLI execution support, GUC/default, estimator, or cost code
+is authorized. Next: agent review, commit/push SCOPE, then R87 measurement.
+R87 F-branch attribution DONE 2026-09-12
+(`r87-q96-f-prefix-cost/REPORT.md`, measurement-only; implementation review
+pending): outcome **F1**. Goopg's unique-index superkey shortcut consumes the
+L2 equality and charges `1/raw-key-rows`, so it misses the nullable
+`store_sales` key's PG `stanullfrac` (4.4066668% for `ss_hdemo_sk`, 4.38% for
+`ss_store_sk`). It consequently estimates partial `ss⋈hd` as 23222 rather
+than PG's 22198, and `ss⋈store` as 19352 rather than the PG-source-rule 18504.
+The 186.54 L2 advantage is not wholly the F1 effect: 147.8375 is faithful
+filtered-inner/hash startup, and the null-sensitive output-CPU portion is
+38.70 (the PG-null correction would reduce the gap by only about 1.76).
+No width/spill, partial-unit, or comparator defect is reached. Q96 values match (`266`),
+temporary tracing is gone, and Q9/Q41/Q91/Q96 trace controls are byte-identical.
+Next: review this report, commit/push it, then separately scope R88 to preserve
+unique-key fan-out bounds while applying PG's null-aware equality selectivity
+for non-FK joins in both estimator siblings.
+R88 SCOPE READY 2026-09-12
+(`r88-q96-unique-key-null/SCOPE.md`): split bare-unique evidence from declared
+FK selectivity in both cardinality coordinate spaces. A non-partial bare
+unique index may establish only a sound fan-out row bound; its equality remains
+in ordinary selectivity. R88 also fixes legacy non-MCV null complements,
+separates bound/FK-consumption state so unique cannot mask FK, and declines
+partial unique evidence fail-closed. Declared-FK SEMI/ANTI preservation is
+DP-only because completed `estimateJoin` has a separate semi path. The scope
+does not promise a Q96 flip: R87 measured that the null correction changes only
+about 1.76 of the 186.54 L2 gap. Next: agent review, reflect, commit -n/push
+scope, then implementation with mandatory Q96/Q9/full-corpus evidence.
+
+R88 DONE 2026-09-12 (`r88-q96-unique-key-null/REPORT.md`): implementation
+`0b98709ae` separates FK consumption from bare-unique row bounds in both
+estimators, retains null-aware no-MCV equality, and declines partial unique
+indexes. Review blockers on two-sided bound selection and FK-overlap test
+strength were fixed before approval. Q96 values match PG (`266`) and trace
+controls are byte-identical, but the natural tree remains the serial
+`(ss⋈store)⋈hd` prefix rather than PG's parallel `(ss⋈hd)⋈store` prefix. Global
+gates pass: TPC-H digest 24/24 and SF0.25 `PASS=96`, all-zero correctness
+failures; fresh live-PG census is `2/67/0/27/3/0` (not called unchanged versus
+R85 live’s `2/69/0/25/3/0`). Next: scope the measured same-relset Q96 partial
+prefix tournament (`ss⋈store` wins L2 by 184.79 and L3 by 50.81) before any
+conditional serial/parallel follow-up; do not undo the bare-unique/FK
+distinction.
+
+R89 SCOPE READY 2026-09-12 (`r89-q96-partial-prefix-cost/SCOPE.md`):
+measurement-only attribution of the post-R88 Q96 same-relset partial Hash Join
+tournament. The evidence boundary is the 184.79 L2 and 50.81 L3 cost advantage
+of the retained `ss⋈store` prefix, before downstream NLI/Gather behavior. No
+cost, selectivity, parallel, GUC, or query change is authorized until PG source
+terms and Goopg inputs are recomputed and a single C1–C4 outcome is reviewed.
+
+R89 DONE 2026-09-12 (`r89-q96-partial-prefix-cost/REPORT.md`): the temporary,
+default-off partial-cost trace was removed before the post-measurement build.
+Q96 natural/top and A/A plans are byte-identical, Q9/Q41/Q91/Q96 trace-on/off
+plans are byte-identical, and Q96 values match PG (`266`). Exact Goopg partial
+cost decomposition confirms the retained `ss⋈store` prefix leads by 184.7875
+at L2 and 50.80625 at L3. The live PG selected Hash Joins visibly use `Inner
+Unique: true` with a partial outer and complete inner. PG's common initial
+hash-cost component matches Goopg, but its final inner-unique branch requires
+an inner-unique proof, semifactors, PG MCV-frequency/QualCost, and pathtarget
+inputs that Goopg does not represent; outcome C2, not a guessed cost change.
+Next: scope the missing inner-unique final-cost inputs before implementation;
+do not infer unexposed rejected PG path state or promise a Q96 flip.
+
+R90 SCOPE READY 2026-09-12
+(`r90-inner-unique-hash-final-cost/SCOPE.md`): carry fail-closed, sole-base
+non-partial unique-inner evidence into serial and partial Hash Join final
+costing, with matched/unmatched probe factors derived only from fixed path
+cardinalities. It changes neither selectivity, Gather behavior, nor general
+PG MCV/QualCost/pathtarget modeling. It is INNER-only and shares the
+total-relation match fraction across serial/partial siblings; Goopg map
+geometry is not PG virtual-bucket geometry, so its executor-coordinate
+unmatched tuple-walk charge is zero rather than guessed from `NBuckets`.
+Next: agent review, correct if needed, commit -n/push the scope, then and only
+then implement with focused proof tests and the mandatory full parity gates.
+
+R90 DONE 2026-09-12 (`r90-inner-unique-hash-final-cost/REPORT.md`): production
+commit `b2b671e7f`, with direct partial-unique rejection test follow-up
+`3469163a6`, transports fail-closed INNER bare-unique evidence and one shared
+total-coordinate match fraction to serial/partial Hash Join final costing.
+Matched canonical-key probes are priced; unmatched map misses have zero tuple
+walk, explicitly not a guessed PG virtual-bucket cost. Q96 values remain `266`,
+natural/top and trace controls are byte-identical, and its non-PG prefix remains
+selected (top cost `25434.49` -> `24541.49`). Full gates pass: TPC-H digest
+24/24 MATCH, SF0.25 PASS=96 with zero correctness failures, and fresh live-PG
+census `2/67/0/27/3/0`. Next: separately scope any PG-compatible unmatched
+virtual-bucket/MCV/QualCost/pathtarget input; do not infer it from executor
+map geometry or force Q96's order.
+
+R91 SCOPE READY 2026-09-12
+(`r91-pg-virtual-bucket-unmatched/SCOPE.md`): reproduce PG18's packed-tuple
+virtual bucket count in an optimizer-private representation solely for the
+already-proved inner-unique unmatched Hash Join probe cost. It deliberately
+keeps Goopg executor map sizing, actual batching, and spill costs separate.
+It must carry a path's emitted byte width, decline unknown/unsupported
+geometry, and retain the existing matched bucket statistic. Next: agent
+review, revise if needed, commit -n/push scope, then and only then implement.
+
+R91 DONE 2026-09-12 (`r91-pg-virtual-bucket-unmatched/REPORT.md`): production
+commit `63c79406b` adds an optimizer-private PG18 packed-tuple virtual-bucket
+port for unmatched, already-proved INNER unique Hash Join probes. It preserves
+executor map geometry/spill costing and propagates exact emitted index-only
+widths through serial and partial candidates. Full gates pass: TPC-H 24/24
+value MATCH, SF0.25 PASS=96 with zero correctness failures, and fresh live-PG
+census `2/67/0/27/3/0`. Q96 remains value-correct and deterministic; its
+serial relation order now matches PG (`store_sales -> household_demographics
+-> store`), but PG's partial aggregate/Gather structural difference remains.
+Next: scope a separately evidenced parallelism/final-cost boundary; do not
+force a Gather or conflate PG virtual buckets with executor map sizing.
+
+R92 SCOPE READY 2026-09-12
+(`r92-q96-partial-aggregate-seed/SCOPE.md`): measurement-only attribution of
+Q96's upper partial-aggregate `no-driving-scan` refusal. R91 has an accepted
+final-relset partial NLI path, but the upper producer sees the rendered serial
+child. Trace only whether a throwaway node built from the partial path is a
+runnable, unparameterized worker subtree; construction must be copy-only and
+recoverable so trace-on cannot change query success. Do not alter costs,
+defaults, Gather policy, aggregate behavior, or Q96 selection. Next: agent
+review, commit -n/push the scope, then add/remove default-off diagnostics and
+report one separately scoped construction or barrier.
+
+R92 DONE 2026-09-12 (`r92-q96-partial-aggregate-seed/REPORT.md`):
+measurement-only, copy-safe trace proves the final-relset partial NLI is not
+an executable upper worker source through the current API. Its path contains a
+depth-three `PathPrebuilt` shared `*Filter`; rebuilding would stamp shared
+state, while the rendered serial child has no driving scan. Temporary code was
+removed; final optimizer diff is empty and test/vet/whitespace gates pass.
+Q96 trace stayed byte-identical. Next: separately scope a safe executable
+partial-path node representation; do not adjust costs or force Gather.
+
+R93 SCOPE READY 2026-09-12
+(`r93-isolated-partial-prebuilt/SCOPE.md`): add a fail-closed, fully isolated
+materialization route for a searched partial path whose `PathPrebuilt` leaves
+would otherwise be stamped in place by ordinary plan construction. The route
+is for upper partial-aggregate source selection only and must prove that every
+mutable node and expression it can reach is private before the existing
+constructor stamps costs. It also extends the aligned partial-NLI outer walks
+(three optimizer decisions and all three executor claim walkers) only
+after a focused serial-versus-parallel value proof. It must decline
+unsupported nodes, preserve the serial candidate, and never make a Gather win
+by force. Next: agent review, revise if needed, commit -n/push scope, then
+implement and run the mandatory correctness and parity gates.
+
+R93 DONE 2026-09-12 (`r93-isolated-partial-prebuilt/REPORT.md`): the
+copy-isolated construction probe succeeds without mutating the shared
+`PathPrebuilt` source, but Q96's first final-relset `PathNestLoop` builds an
+ordinary `*Join`, not `*NestedLoopIndexJoin`. It therefore has no approved
+worker spine and must remain serial; applying NLI outer-only claiming would
+have been a node-kind error. The temporary implementation and trace were
+removed. Optimizer/executor test and vet gates plus whitespace pass with an
+empty production diff. Next: separately scope ordinary nested-loop partial
+semantics (including worker identity and cost coordinates), or select a
+separately proven partial NLI candidate; do not infer either from `PathKind`.
+
+R94 SCOPE READY 2026-09-12
+(`r94-partial-plain-nestloop/SCOPE.md`): admit only the actually evidenced
+ordinary INNER nested-loop worker shape: each worker claims a disjoint outer
+scan partition and independently materializes the whole unparameterized inner.
+Thread that exact outer-only rule through the path classifier, optimizer
+stamping/driving walks, and every executor claim walker; prove values against
+serial before allowing Q96's partial aggregate source to use it. RIGHT/FULL,
+parameterized inners, NLI, Memoize, and cost/default changes remain refused.
+Next: agent review, revise if needed, commit -n/push scope, then implement.
+
+R94 SCOPE REVIEWED 2026-09-12 (APPROVE-WITH-NOTES, `0dccc34`): all 10
+review notes reflected (inner-memory proof-or-deferral, multi-bitmap
+guard, unstampParallelScan in matrix, Lateral exclusion, LEFT/SEMI/ANTI
+refusal as scope-minimization, literal-left rule, V5 outer checks,
+inner-no-claim assertions, R60 filing narrowing, -n kept per goal
+contract). Next: implement items 1–4, gates, REPORT.
+
+R94 PARTIAL 2026-09-12 (items 1–3 + tests): node twin
+`nestedLoopJoinIsPartialCapable` + four-walk agreement (unstamp needs
+no code change — both-side descent already covers NL, pinned by test);
+`partialPathDrivingKind` PathNestLoop arm (INNER-only, V5 outer checks,
+non-Memoize complete inner); R60 V1 filing narrowed to INNER (refused
+heads cannot starve siblings — head-only reader); executor literal-left
+arms on all three claim walkers + inner-bitmap refusal. Tests:
+optimizer agreement/classifier/filing pins; executor hand-Gathered
+identity (cross-join corpus — equi plans hash even disabled; Cross≡Inner
+for NL execution) incl. empty sides + large inner (memory deferral
+documented), inner-no-claim, refusal matrix. Full optimizer + executor
+suites green, vet clean. Next: item 4 (agg split source selection),
+full gates, REPORT.
+
+R94 DONE 2026-09-12 (`r94-partial-plain-nestloop/REPORT.md`, review
+APPROVE): items 1–3 landed in `08a6550` (twin + walks, classifier,
+filing, claims, tests); item 4 measured to a scope-invalidating
+finding — Q96's NL nodes are all Lateral=true (R25 decomposed
+parameterized probes), so the scoped ordinary shape never occurs
+and selection correctly stays empty (no Gather forced). Gates:
+suites + vet + whitespace clean; TPC-H digest 24/24 PASS; SF0.25
+PASS=94 with Q35/Q69 environmental (isolated A/B both binaries
+pass, byte-identical outputs); Q9/Q41/Q91/Q96 natural vs opt-in
+identical; census 2/69/0/25/3/0 with baseline-vs-R94 captures
+identical (delta vs R91 is clone drift). Next: separately scope
+lateral-probe worker semantics, or another evidenced mismatch.
+
+R95 SCOPE READY 2026-09-12 (`r95-lateral-probe-workers/SCOPE.md`):
+lateral-probe NL worker semantics — partition the outer, re-open the
+parameterized index probe per worker-local outer row (R25 decomposed
+shape, Q96's actual top NL). Probe-only (index probe bound by the
+outer); general lateral subtrees refused. Next: agent review, revise
+if needed, commit -n/push scope, then implement.
+
+R95 DONE 2026-09-12 (`r95-lateral-probe-workers/REPORT.md`, review
+APPROVE): implementation `2f3febf` (predicate + walks + classifier +
+claims + prebuild descent + tests). Q96 plans Finalize→Gather(3)→
+Partial by cost, value 266 in all three modes; census Q96 down to
+[join-order,scan-type,qual-placement]. Gates: suites + vet + WS
+clean; TPC-H 24/24 PASS; SF0.25 PASS=96 all-zero; Q9/Q41/Q91
+identical, Q96 differs by design. Next: Q96 join-order distance, or
+another evidenced mismatch (separate scope).
+
+R96 SCOPE READY 2026-09-12 (`r96-q96-join-order/SCOPE.md`): Q96
+join-order Step-0 — P0 candidate-cost attribution for
+(ss⨝store)⨝hdem vs (ss⨝hdem)⨝store (rows agree modulo divisor;
+order preference unexplained, width-driven hash cost suspect),
+P1 slice menu. Implementation separate. Next: agent review, revise
+if needed, commit -n/push scope, then P0.
+R96 P0 DONE 2026-09-12 (`r96-q96-join-order/PROBE.md`, review
+APPROVE after one REJECT remediated — stale line cites fixed,
+pre-existing-WIP provenance recorded; the REJECT's PG-numbers claim
+was the reviewer's error, verified verbatim from the live capture):
+ATTRIBUTED — 157.50 (0.68%) raw-min margin, both orders survive
+fuzz, exact-min election picks store-first; deciding term is
+build-side rows (720-vs-1) with rows/sizing ruled out. Hypotheses
+ranked: (1) build-cost transcription audit, (2) conditional fuzz
+tiebreak (needs PG loser price). No code changed. Next: P1 slice
+menu → R97+ implementation (separate).
+R96 P1 DONE 2026-09-12 (`r96-q96-join-order/SLICE.md`, review
+APPROVE): term audit names the bucket-walk skip-vs-charge asymmetry
+(goopg skips at innerBucketSize==0, PG never skips, default 1.0) as
+the lead decider (outer×inner scaling dwarfs the margin); slices
+(a) audit-first minimal fix with global gates, (b) conditional fuzz
+tiebreak, (c) ruled-out list. Implementation is R97+ (separate
+scope); step-1 bs measurement may run under R96's P0 bar.
+
+R97 STEP-1 RUNNING 2026-09-12 (scratch wiped by peer cleanup —
+rebuilding): innerBucketSize + walk-term measurement for the {0,1}
+/ {0,3} joins under R96's P0 bar (temp, foreground, byte-identity).
+Scratch moved to /tmp/r97goopg/ (away from the wiped /tmp/pp2/).
+Open question from the lost run: hdem-first filed total trails the
+hand-applied formula by 71.22 — relid-tagged per-call result logging
+will resolve which term differs. Next: measure, revert, STEP1 note,
+review, commit.
+R97 STEP-1 DONE 2026-09-12 (`r96-q96-join-order/STEP1.md`, review
+APPROVE): skip hypothesis FALSIFIED (bs valued); innerUnique branch
+active — walks ~13–15 not ~86; margin = oRun +127.44 / probe +28.64 /
+walk +1.43; per-row increments agree with PG (0.00353 vs 0.00356).
+Reframed slice (a): audit outerMatchFrac + virtualBuckets geometry;
+(b) further deprioritized. Temp reverted, tree clean. Next: R97+
+slice SCOPE citing STEP1, then implementation.
+
+R98 SCOPE READY 2026-09-13
+(`r98-q96-innerunique-inputs/SCOPE.md`): measurement-only attribution of
+Q96's R90/R91 inner-unique inputs. Log the semifactors shortcut,
+candidate-coordinate matched/unmatched terms, and PG virtual geometry for
+both competing orientations; reconcile each filed cost, then either identify
+a representable mismatch or decline without a guessed constant. No production
+cost, election, path, executor, or default change is authorized. Next: agent
+review, revise if needed, `git commit -n`/push scope, then instrument.
+
+R98 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): PG's
+private semifactors/virtual geometry must be called UNOBSERVABLE unless a
+lawful reproducible derivation is recorded; matching a final cost is not
+enough. The scope now also pins every Goopg term needed to reconcile a filed
+candidate. Next: commit -n/push scope, then temporary measurement.
+
+R98 DONE 2026-09-13 (`r98-q96-innerunique-inputs/REPORT.md`): the reverted
+Q96 diagnostic reconciles every Goopg R90/R91 input and filed cost exactly;
+the two first-level alternatives differ by 275.274375 and store-first remains
+cheaper. PG EXPLAIN/source does not expose its semifactors or virtual geometry,
+and no lawful derivation exists in the captured inputs: UNOBSERVABLE, not a
+cost-change license. Next: find a separately evidenced PG-visible input; do
+not tune inner-unique inputs or force Q96's order.
+
+R99 SCOPE READY 2026-09-13 (`r99-q96-pg-oracle/SCOPE.md`): a read-only native
+PG18.3 rerun found zero Q96 `pg_stats` rows and a radically different no-stats
+NL/Materialize plan, so the current clone is not a parity oracle. Provision a
+separate named native-PG copy, establish and record Q96 statistics, then
+capture repeatable JSON/text plans and values before pursuing any cost theory.
+Next: agent review, revise if needed, `git commit -n`/push scope, then create
+the private oracle; no Goopg production change is authorized.
+
+R99 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): source
+must be stopped or use PG-consistent backup/restore, never a live-dir copy;
+record immutable source/destination identity and process ownership. The scope
+also requires full Q96 relation/index and predicate/join-column statistics
+provenance, not only four key rows. Next: commit -n/push, then provision.
+
+R99 DONE 2026-09-13 (`r99-q96-pg-oracle/REPORT.md`): copied stopped Goopg
+data/catalog can start under native PG18.3 and ANALYZE, but is not an oracle:
+Q96 JSON plans remain NL/Materialize and its value run aborts at PG btree
+`_bt_check_natts`, forcing postmaster recovery; `pg_relation_size` is also an
+invalid SQL function body. The capture and its post-ANALYZE stats must not
+drive Goopg costs. Next: obtain a genuine native-PG SF0.25 restore proven
+value-safe before reopening PG-cost attribution.
+
+R100 SCOPE READY 2026-09-13 (`r100-native-pg-q96-oracle/SCOPE.md`):
+`bench/tpcds/runtime/pgdata` is a stopped PG18 native reference cluster, not
+the R99 Goopg data directory. Copy it only while verified stopped into one
+private destination; prove Q96 values and repeatable plans before any private
+ANALYZE, then establish or reject a genuine PG oracle without touching the
+reference source. Next: agent review, `git commit -n`/push, then copy.
+
+R100 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): accept
+the oracle before ANALYZE only with pinned `tpcds025/public`, query SHA and
+GUC command, SF0.25 relation witnesses, and Q96 value digest/direct witnesses
+matching the named historical baseline. Any failure is ORACLE INVALID and
+forbids ANALYZE/cost use. Next: commit -n/push, then private copy.
+
+R100 DONE 2026-09-13 (`r100-native-pg-q96-oracle/REPORT.md`): a private copy
+of the stopped native reference passes all oracle checks: query SHA/GUCs
+pinned, JSON EXPLAIN is repeatable and structurally matches the tracked PG
+Q96 plan, value is 266, and SF0.25 relation/stats/index witnesses are
+captured. Existing stats suffice; no ANALYZE ran and the source was untouched.
+Next: use this valid oracle in a separately reviewed Q96 cost/selectivity
+attribution scope; R99's Goopg-data copy remains invalid.
+
+R101 SCOPE READY 2026-09-13 (`r101-q96-forced-order-costs/SCOPE.md`): use
+R100's valid native PG oracle to price both explicit Q96 first-two-dimension
+orders, with collapse limits pinning each shape and values still 266; capture
+the same forms on isolated Goopg. This exposes PG's previously unobservable
+loser price without treating forced SQL order as a natural choice. Next:
+agent review, `git commit -n`/push, then measurement; no code change.
+
+R101 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): record
+full rewritten SQL plus per-form SHA, and assert the two intended join leaves
+and final `time_dim` parameterized probe in each EXPLAIN. Forced SQL order is
+measurement only, never natural-election evidence. Next: commit -n/push,
+then capture both engines.
+
+R101 DONE 2026-09-13 (`r101-q96-forced-order-costs/REPORT.md`): valid PG18
+oracle directly prices hdem-first 176.16 below store-first, proving no PG
+tie. Goopg rejects both equivalent parenthesized JOIN + final LATERAL forms
+with missing outer namespace `store_sales`, so it has no comparable forced
+cost/value; scope stop rule applied. Next: separately scope that namespace
+semantic gap or another safe Goopg-order measurement; do not target PG's
+forced margin with a cost change.
+
+R102 SCOPE READY 2026-09-13
+(`r102-lateral-joined-left-namespace/SCOPE.md`): repair only the analyzer's
+LATERAL visibility of an explicit joined left operand, subject to native PG18
+success/error probes and focused positive/negative semantic tests. A
+post-fix R101 rerun may measure the already-pinned forms, but cannot justify a
+cost/election change. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R102 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): the
+fault is the unaliased grouped-JOIN synthetic-range lowering, not ordinary
+JOIN-chain LATERAL scope. Scope now protects ordinary/non-LATERAL behavior,
+explicit join aliases, and duplicate/USING visibility, and stops if correlated
+execution needs planner/executor work. Next: commit -n/push scope, then
+implement only the confirmed analyzer fix.
+
+R102 DONE 2026-09-13 (`r102-lateral-joined-left-namespace/REPORT.md`): PG18
+confirms the required grouped-JOIN LATERAL namespace rules, including aliases,
+USING, and non-LATERAL failure. A temporary analyzer fix passed focused tests
+but Goopg then failed resolving the next Q96 join qualification, proving that
+planner range binding is also required; scope stop rule applied and code was
+reverted. Next: separately scope end-to-end grouped-JOIN source binding; do
+not use forced Q96 forms as cost/election evidence.
+
+R103 SCOPE READY 2026-09-13
+(`r103-grouped-join-source-binding/SCOPE.md`): thread only unaliased grouped
+JOIN source identity through parser/analyzer/planner binding to later ON and
+LATERAL contexts, with PG-proven alias/USING/non-LATERAL controls and actual
+value execution. R101 forms may be rerun only after semantic success; no cost
+change is authorized. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R103 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): parser
+changes must originate in `grammar/pg_grammar.y` and use `make gen-parser`;
+PG witnesses now require exact row values and SQLSTATE 42P01/42702 assertions,
+not generic comparison. R101 remains measurement only. Next: commit -n/push
+scope, then implement within the parser/analyzer/planner boundary.
+
+R103 DONE 2026-09-13 (`r103-grouped-join-source-binding/REPORT.md`): a
+temporary parser/analyzer/planner source map lets both unchanged R101 forms
+return 266 and retain their forced hash-join/time-probe shapes, but grouped
+JOIN USING fails inside the LATERAL child with 42703 instead of PG's qualified
+source semantics. Stop rule applied and all code reverted. Next: separately
+scope durable grouped-source-to-output binding across LATERAL re-resolution;
+do not ship a Q96-only partial map or change costs.
+
+R104 SCOPE READY 2026-09-13
+(`r104-grouped-join-using-lateral-output/SCOPE.md`): preserve the unaliased
+grouped JOIN's source-to-output map, including USING's qualified/merged/
+ambiguous rules, through LATERAL child planning and re-resolution. R101 may
+resume only after exact semantic controls and values pass; no cost/election
+change is authorized. Next: agent review, revise if needed, `git commit -n`/
+push scope, then implement.
+
+R104 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): report
+must preserve full reproducible PG18.3 and Goopg probes, binary/version,
+values, and SQLSTATEs. Both qualified USING names map to one merged physical
+slot, asserted in later ON and LATERAL contexts. Next: commit -n/push scope,
+then implement without changing layout or generic visibility.
+
+R104 DONE 2026-09-13 (`r104-grouped-join-using-lateral-output/REPORT.md`):
+unaliased grouped JOIN source bindings now map both qualified USING names to
+the shared merged physical slot through later ON and LATERAL planning. Exact
+PG controls and Goopg focused tests pass; both unchanged R101 forms return 266
+with the requested forced spines. Next: resume R101 repeated Goopg plan/cost
+measurement only; do not infer a natural-order cost change.
+
+R105 SCOPE READY 2026-09-13 (`r105-q96-goopg-forced-order-capture/SCOPE.md`):
+capture R101's exact forced Q96 forms on the post-R104 Goopg source twice for
+byte-identical EXPLAIN and once for value 266, recording costs and forced
+spines only. No code or cost/election conclusion is authorized. Next: agent
+review, `git commit -n`/push scope, then measurement.
+
+R105 SCOPE REVIEWED 2026-09-13 (APPROVE): retain immutable R101 SQL digests,
+private isolated execution, twice byte-identical EXPLAIN, value 266, forced
+spine/cost capture, and the no-code/no-election boundary. Next: `git commit
+-n`/push scope, then measurement.
+
+R105 DONE 2026-09-13 (`r105-q96-goopg-forced-order-capture/REPORT.md`):
+post-R104 Goopg makes both immutable forced forms repeatable and returns 266.
+hdem-first costs 27639.23 versus store-first 27641.15, a 1.92 forced-margin
+advantage versus PG18.3's 176.16. This is cost attribution input only, not
+natural-election evidence. Next: separately scope an attribution that can
+explain the forced-margin difference before considering any planner change.
+
+R106 SCOPE READY 2026-09-13 (`r106-q96-forced-margin-attribution/SCOPE.md`):
+compare the two immutable forced forms' observed PG/Goopg terms and an opt-in
+repeatable Goopg trace, then audit only reached cost/selectivity paths. No
+code or natural-election conclusion is authorized. Next: agent review,
+`git commit -n`/push scope, then measurement.
+
+R106 SCOPE REVIEWED 2026-09-13 (APPROVE after three BLOCK corrections):
+trace-on EXPLAIN must equal the R105 trace-off hash; all four joins require
+separate form/level ledger rows; and each trace artifact must be
+form/run-delimited and hashed. Next: `git commit -n`/push scope, then
+measurement.
+
+R106 DONE 2026-09-13 (`r106-q96-forced-margin-attribution/REPORT.md`): all
+four trace-on plans equal R105 trace-off plans and values retain 266, but the
+trace emits only upper paths and PG/Goopg base estimates differ materially.
+The forced-margin term attribution is unobservable; no cost/election change
+is authorized. Next: scope a common-data/stats oracle plus selected-Hash-Join
+component diagnostic before any cost work.
+
+R107 SCOPE READY 2026-09-13 (`r107-q96-common-data-oracle/SCOPE.md`): create
+fresh disposable PG18.3 and Goopg Q96 clusters from one SF0.25 input, prove
+relation/schema/index equivalence and record (not equate) engine-native
+statistics, then capture the immutable forced forms. No planner change is
+authorized. Next: agent review, `git commit -n`/push scope, then measurement.
+
+R107 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction): prove
+data/schema/index equivalence before ANALYZE, but record each engine's native
+statistics and controls rather than requiring their equality. Next: `git
+commit -n`/push scope, then measurement.
+
+R107 DONE 2026-09-13 (`r107-q96-common-data-oracle/REPORT.md`): identical
+TSVs and row counts yield matching Q96-only projections, but the full `store`
+relation COPY witness diverges on `char(n)` padding and numeric output. Stop
+rule applied; it is not a common-data cost oracle. Next: separately scope a
+type-normalized complete relation witness before R108 or cost attribution.
+
+R109 SCOPE READY 2026-09-13 (`r109-q96-normalized-relation-witness/SCOPE.md`):
+derive a DDL-type-constrained canonical full relation witness for the R107
+clusters, with positive and negative normalization controls. No data or
+planner change is authorized. Next: agent review, `git commit -n`/push scope,
+then measurement.
+
+R109 DONE 2026-09-13 (`r109-q96-normalized-relation-witness/REPORT.md`):
+allowed char/numeric normalization matches three Q96 relations, but `store`
+still differs because Goopg loses trailing whitespace in `varchar`. Stop rule
+applied; scope a data-fidelity repair before common-data cost attribution or
+R108.
+
+R110 SCOPE READY 2026-09-13 (`r110-varchar-trailing-space-fidelity/SCOPE.md`):
+repair only varchar typmod coercion so in-range trailing whitespace survives,
+while PG's excess-space truncation remains intact. Next: agent review,
+`git commit -n`/push scope, then implement; no cost/election change is
+authorized.
+
+R110 SCOPE REVIEWED 2026-09-13 (APPROVE after one BLOCK correction):
+assignment/COPY overlength values may drop only trailing spaces, while explicit
+overlength `::varchar(n)` casts retain PG arbitrary truncation. Next: `git
+commit -n`/push scope, then implement.
+
+R110 DONE 2026-09-13 (`r110-varchar-trailing-space-fidelity/REPORT.md`):
+in-range varchar whitespace now survives assignment/COPY storage; PG's
+assignment and explicit-cast typmod boundaries are preserved. A fresh R109
+store witness normalizes to PG exactly. Next: rescope/rerun R107 common-data
+evidence before R108 or any cost attribution.
+
+R111 SCOPE READY 2026-09-13 (`r111-q96-common-data-oracle-retry/SCOPE.md`):
+after R110, rebuild private PG18.3/Goopg Q96 clusters from R107's identical
+TSVs, prove full type-aware relation equality, then record native stats and
+forced forms. No cost/election change is authorized. Next: agent review,
+`git commit -n`/push scope, then measurement.
+
+R111 SCOPE REVIEWED 2026-09-13 (APPROVE after two BLOCK corrections): R108
+depends on successful R111 rather than invalid R107; schema/index equivalence
+is now a pre-ANALYZE gate alongside raw/canonical relation witnesses. Next:
+`git commit -n`/push scope, then measurement.
+
+R111 DONE 2026-09-13 (`r111-q96-common-data-oracle-retry/REPORT.md`): fresh
+clusters rebuilt from the immutable R107 inputs pass row-count, pre-ANALYZE
+schema/index, and full type-aware relation gates; both engines captured native
+statistics and repeatable forced forms returning 266. PG still prices
+hdem-first 175.91 lower while Goopg prices store-first 7.68 lower on this
+common input. This clears R108's dependency but authorizes no cost change.
+
+R108 PLANNED — PG hash-tuple sizing comparison, dependent on successful R111
+common-data oracle completion: only after R111 establishes common
+relation/schema/index inputs and records both engines' native statistics,
+scope and review an opt-in experiment that
+prices Hash Join planning geometry with PG18.3 packed Datum/HashJoinTuple
+sizes instead of Goopg's in-memory `[]Datum` footprint. It must capture the
+unchanged corpus's plan/value deltas, per-join PG-versus-Goopg geometry
+(`width`, entry bytes, buckets, batches, spill decision), and executor spill
+reality; it must not silently promote the experiment to a default. The task
+decides from evidence whether parity cost geometry and executor-capacity
+geometry must remain separate. Before any source change: Design Doc, agent
+review, `git commit -n`, and push. No cost/election change is authorized by
+this TODO entry.
+
+R108 SCOPE READY 2026-09-13 (`r108-pg-hash-tuple-sizing/DESIGN.md`): R111
+passed, so compare only an explicitly opt-in Hash Join spill-I/O price using
+PG18 packed HashJoinTuple geometry for batches and its separate heap-header
+page-size formula for I/O, while preserving Goopg map capacity and actual spill
+behavior. The switch is default-off, must expose both geometries in trace, and
+requires corpus/value/executor-spill evidence before any promotion decision.
+Next: agent review, correction if needed, `git commit -n` and push; no
+production edit is authorized first.
+
+R108 SCOPE REVIEWED 2026-09-13 (APPROVE after one formula correction): the
+experiment now separates packed HashJoinTuple batch geometry from PG's aligned
+HeapTupleHeader page-size I/O formula, with independent outer/inner width and
+PG-fit/Goopg-spill tests required. Next: `git commit -n`/push design, then
+implement the default-off experiment.
+
+R108 DONE 2026-09-13 (`r108-pg-hash-tuple-sizing/REPORT.md`): the opt-in PG
+packed HashJoinTuple batch/page spill-I/O price is trace-proven and leaves the
+fresh common-data Q96 forms, 99-query SF0.25 EXPLAIN capture, SF0.25 values,
+and live-PG structural census unchanged. The observed candidates fit in one
+PG batch, so no spill-I/O delta is due. Keep it default-off; executor map
+capacity remains intentionally separate from planner parity geometry.
+
+R112 PLANNED — whole-cost PG Datum-size election experiment, dependent on the
+R108 DONE report and its completed review: only after the current spill-term
+investigation establishes that its narrow PG HashJoinTuple substitution is
+inert, scope and review a default-off, planner-only experiment. Before any
+code, it must inventory every affected cost family and its exact PostgreSQL
+representation/formula, then justify an explicitly family-specific analogue;
+there is no universal PG Datum size. It must keep executor allocation/spill
+capacity on real Goopg Datum representation and capture per-query OFF/ON
+election and value deltas against live PG18.3. It must not silently alter
+estimates or promote any result to default. Before source change: Design Doc,
+agent review, `git commit -n`, and push.
+
+R112 SCOPE READY 2026-09-13 (`r112-pg-cost-family-inventory/DESIGN.md`):
+start with a no-code, per-cost-family PG18.3 representation inventory rather
+than assuming a universal Datum size. It must classify every reached width/
+byte reader, its exact PG formula and candidate reachability before authorizing
+one family-specific comparison. Next: agent review, correction if needed,
+`git commit -n`, and push; then inventory only.
+
+R112 DONE 2026-09-13 (`r112-pg-cost-family-inventory/REPORT.md`): source and
+fresh-plan inventory rejects a universal PG Datum-size substitution. Sort is
+the first evidence-backed candidate (`hashsize.EntryBytes` versus PG
+`relation_byte_size`), selected in 17/22 TPC-H and 89/99 TPC-DS plans; HashAgg
+and Memoize are separate candidates with different formulas. No source change
+was made. Next: scope a Sort-only comparison; do not combine it with HashAgg,
+Memoize, scan/index pages, or executor capacity.
+
+R113 PLANNED — PG relation-byte Sort-price comparison, dependent on R112 DONE:
+scope and review a default-off planner-only comparison of `costSortRun`'s
+external-sort byte model against PG18.3 `cost_tuplesort` / `relation_byte_size`
+using emitted path width and aligned heap-header representation. It must prove
+the width provenance at every Sort caller, preserve executor sort allocation
+and behaviour, distinguish selected from merely offered Sort paths, and record
+OFF/ON plan/value deltas against live PG18.3. Before source change: Design Doc,
+agent review, `git commit -n`, and push.
+
+R113 SCOPE READY 2026-09-13 (`r113-pg-sort-relation-bytes/DESIGN.md`): an
+opt-in Sort-price-only comparison will replace only `costSortRun`'s byte volume
+with PG18.3 `relation_byte_size(rows, PathTarget.width)`, threaded from each
+Sort caller's emitted width. It retains Goopg `hashsize.EntryBytes` for all
+executor allocation and all non-Sort costs, fails closed on unknown width, and
+requires focused provenance/boundary tests plus live-PG OFF/ON structural and
+value evidence before any default decision. Next: agent review, correction if
+needed, `git commit -n`, and push; no production edit is authorized first.
+
+R113 DONE 2026-09-13 (`r113-pg-sort-relation-bytes/REPORT.md`): the default-off
+PG18 relation-byte Sort pricing experiment is trace-proven, preserves values,
+and moves no selected TPC-H or TPC-DS SF0.25 plan. PG bytes do change reached
+disk/memory classifications, but no cost crossover occurs; fresh live-PG18.3
+TPC-DS census is identical OFF/ON. Keep the switch default-off. Do not fold
+the representation into HashAggregate, Memoize, or executor allocation.
+
+R114 PLANNED — HashAggregate PG representation/executor correspondence audit,
+dependent on R113 DONE: before any HashAggregate price experiment, scope and
+review the exact PG18.3 hash aggregate entry, partition, spill-page, and
+executor-spill correspondences. It must use R112's reached-candidate evidence,
+separate planner representation from Goopg aggregate execution capacity, and
+establish whether a default-off comparison can affect a live candidate. Before
+source change: Design Doc, agent review, `git commit -n`, and push.
+
+R114 DEFERRED 2026-09-13 by user direction: stop the Datum-size / cost-family
+investigation. Do not start the HashAggregate representation audit unless it
+is explicitly reprioritized after the unresolved Q96 plan breakdown.
+
+R115 DONE 2026-09-13 (`r115-q96-nonspill-forced-order/REPORT.md`): the
+reviewed, temporary `GOOPG_Q96_COST_TRACE=1` diagnostic was A/A inert on the
+two R111 forced forms, but neither form reached `addHashJoinPath` or
+`hashJoinCost`. A same-binary/server comma-join positive control emitted the
+expected cost/filed records, so this is a Q96 seam non-reachability result,
+not a trace-deployment failure. The final LATERAL chain declines the
+PG-shaped search and leaves the forced joins on the legacy/prebuilt route.
+No Datum, spill, Gather, statistic, or production-cost claim follows; all
+temporary source was removed. A successor must attribute that prebuilt route.
+
+R116 DONE 2026-09-13 (`r116-q96-legacy-join-attribution/REPORT.md`): R111
+common-input trace OFFx2/ON controls map both explicit forced-form joins to
+Hash/BuildRight in both forms. No CROSS-promotion mutation occurred; the
+final LATERAL nested-loop node is explicitly unmapped because it bypasses the
+explicit-join constructor. Thus `chooseInnerJoinAlgo`, BuildLeft, and the
+small-dimension override do not explain Goopg's 7.68 store-first margin.
+Next investigate cardinality/display-cost inputs within the equal legacy Hash
+Join shapes; no Datum, cost, statistics, Gather, search, executor, or
+production change was made.
+
+R117 DONE 2026-09-13 (`r117-q96-legacy-child-cost/REPORT.md`): R111's 7.68
+forced-form margin reconciles exactly as the upper explicit Hash Join's
+inherited child-total delta; its self term is equal. The first differing
+selected/root-lineage legacy Join ledger is the lower Hash Join's rows/width
+(hdem-first 688465/476 vs store-first 688081/1104); its direct right scans
+also differ by forced order, while shared `store_sales` scan pricing agrees.
+R117 makes no Datum inference. TEXT/JSON OFFx2/ONx2 controls and value 266
+were byte-identical, retained checksums/paths are in the report, and all
+temporary source was removed. Next:
+separately scope a measurement-only producer audit of `estimateJoin` inputs
+and required-column/schema construction; no production cost or Datum change
+is authorized by R117.
+
+R118 DONE 2026-09-13 (`r118-q96-lower-join-producers/REPORT.md`,
+implementation reviewed APPROVE-WITH-NOTES, all 9 remediated,
+measurement before removal): sidecar/census/frozen-report diagnostic
+attributed both lower Hash Joins to estimateJoin nd-branch nullfrac
+inputs (0.956366666 vs 0.955833334 from ss_hdemo_sk 4.363% vs
+ss_store_sk 4.417%, inner nullfracs 0) with single-writer
+mergedSchema lineage; no model gap at the pricing site; Datum stays
+closed. All temp source removed; tree diff is docs-only. Next: a
+successor may scope a production change only with a PG18.3
+comparison on these inputs.
+
+R119 SCOPE READY 2026-09-13 (`r119-pg-nullfrac-compare/SCOPE.md`):
+PG18.3 comparison on R118's nullfrac inputs — measurement-only, no
+source change: pg_stats nullfracs for the four key columns +
+forced-form lower-join estimated rows on live `:65438` (shared
+sampled data — model-level comparison only, not value-level vs
+R111 clean inputs). Decides whether a production change is
+justified: PG agrees → close, no change; PG disagrees → scope R120
+with the exact divergence. Datum investigation stays closed. Next:
+agent review, commit -n/push scope, then measure.
+R119 DONE 2026-09-13 (`r119-pg-nullfrac-compare/REPORT.md`, review
+APPROVE, measurement-only, no source change): PG uses the identical
+nullfrac-driven equi-selectivity model (values agree to 4 decimals);
+PG's own hdem-first lower is bigger yet cheaper — preference lives
+in cost terms (widths), not selectivity. Verdict (a): close, no
+production change. Datum stays closed. PG left running (found up).
+
+TIMING SURVEY DONE 2026-09-13 (`r97-timing-survey/REPORT.md`,
+measurement-only, no code change, no review — survey not a design
+doc): TPC-DS SF0.25 all 96 queries timed (3-run medians, values
+96/96 PASS vs oracle); totals goopg 170.2s vs PG 185.1s = 0.9x.
+Worst cliffs: Q61 70x, Q58 26x, Q55 23x, Q88 21x, Q24/Q80 ~20x;
+Q96 0.22–0.30s vs PG 0.044s (~5x, PG-shaped plan). Caveats in
+report (wall-clock vs server secs, shape verdicts not re-taken).
+
+R120 BASELINE RE-TAKEN 2026-09-14 (fresh live captures, both corpora,
+protocol-validated): **TPC-H 6/15/0/1/0** (match 6 = Q1 Q6 Q10 Q11 Q14
+Q15a; MISSING-NODE 1 = Q5, PG-only `Materialize`; unparsed 0) via
+`estimate-audit -plan-only` (single stats-warmed session, `-serial`,
+PG ref captured same protocol from :65432). **TPC-DS 2/69/0/25/3/0**
+(match Q9, Q41; ERROR 3 = Q36/Q70/Q86, unplannable BOTH engines;
+unparsed 0) via `r2-instrument/capture-tpcds.sh` on :65437 vs :65438 —
+**reproduces R94's census exactly**, so nothing drifted across
+R96–R119 (all measurement-only/reverted, as reported).
+Categories now — TPC-H: join-order 14, join-method 10,
+aggregation-strategy 10, scan-type 9, sort-strategy 9,
+parameterisation 5, qual-placement 3, rendering 1, parallelism 0
+(serial protocol). TPC-DS: join-order 89, parallelism 87,
+sort-strategy 76, aggregation-strategy 69, join-method 63,
+scan-type 57, parameterisation 48, rendering 20, qual-placement 16.
+
+METHODOLOGY TRAP RE-HIT AND RECORDED 2026-09-14 (cost ~1 capture pair,
+same trap as R65 §0): `r2-instrument/capture-tpch.sh` opens a FRESH
+psql session per query and never ANALYZEs, and goopg's ANALYZE stats
+are PER-CONNECTION (`cmd/estimate-audit/main.go:37-38,:286,:325`), so
+every goopg TPC-H plan it captures is planned on EMPTY stats. It
+scored 2/20/0/0 with tells like Q21 `cost=16.54` vs PG `268796`
+(default-estimate plans). The correct TPC-H protocol is
+`estimate-audit -plan-only` (warm-stats single session). TPC-DS is
+NOT affected — probed directly 2026-09-14 (query7 cold-session vs
+ANALYZE-warmed-session plans identical in shape, costs within 0.03%),
+so its cluster's stats are effectively persistent and
+`capture-tpcds.sh` remains valid there. Also: the PG side needs
+`PGPASSWORD` (:65432 postgres/postgres, :65433 tpch/tpch) and
+`postgres/local_install/bin` on PATH, else every query hangs 180s on
+a hidden password prompt and logs "(capture failed)".
+
+R120 SCOPE-INTENT 2026-09-14 — narrowed cost INPUTS (K65/K66 ncols),
+Step-0 counterfactual measurement, no production cost change.
+Rationale (convergence of two independent threads): R72 STEP-0
+attributed Q4's aggregation split to its INPUTS, not the election
+rule (widths 20-28x among them), and R119 closed the Q96 join-order
+thread pointing at the same place ("preference lives in cost terms
+(widths)", PG 4-8B vs goopg 428-1104B). K65 names the blast radius:
+width feeds hash geometry, spill/batch decisions, Gather transfer and
+sort footprints — "three of the four largest remaining categories".
+K66 fixes the target: the input is NOT `Width` (R38's error) but
+`NCols`/`AvgVarBytes` via `EntryBytes = 48*ncols + 24 + avgVarBytes`.
+The NEW and untested element: **R113 already swapped `costSortRun`'s
+byte FORMULA to PG `relation_byte_size` and nothing moved — because it
+threaded goopg's own inflated emitted width as the input.** Narrowing
+the input has never been measured. Q4 is the anchor: goopg sorts
+57066 rows x width 448 where PG sorts 13266 x 16 = 120x the byte
+volume (4.3x rows from the absent EXISTS reduction x 28x width), which
+is why its sorted arm (6077.69) loses to hashed (1426.71) at 4.26x
+where PG's sorted arm wins on pathkeys inside a 1% band.
+Bounds: Step-0 measures a counterfactual only (temporary, default-off,
+removed before commit); DatumBytes/`minimize_datum` stays CLOSED
+(R114 user-stop) — this round tests only the ncols lever, which is
+independent of it. Pre-registered decision bar and the corpus-wide
+election census go in the SCOPE. Next: Design Doc, agent review,
+`commit -n` + push, then Step-0 measurement only.
+
+R120 SCOPE READY 2026-09-14 (`r120-hashagg-width-currency/SCOPE.md`
+rev 2, review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs remediated + 6
+notes applied): `costAgg`'s hashed spill arm supplies
+**`inAvgVarBytes` (variable payload only) where a TUPLE WIDTH is
+meant** — `hashAggEntrySize(nAggs, inAvgVarBytes)` whose param is
+literally `tupleWidth` (`cost_funcs.go:483`,`:513`), and
+`pages := tuples * inAvgVarBytes / blockSizeBytes` under a comment
+claiming `relation_byte_size(input_tuples, input_width)` (`:493`),
+gated on `inAvgVarBytes > 0` (`:482`). PG passes ONE `input_width` to
+both (`costsize.c:2801-2802`, `:2824`) and its SORTED rival uses the
+same currency (`cost_tuplesort` `:1903`, `relation_byte_size`
+`:6452-6456`). goopg's sorted rival meanwhile pays full
+`EntryBytes = 48*ncols+24+avgVar`. **Same input rows, two currencies**
+— a 12.4x discount to hash on a 9-col row, infinite when avgVar==0.
+Because the under-statement makes `hashAggSetLimits` early-return, the
+arm goes INERT exactly where PG spills.
+Measured OFF census (corrects the pre-R3/SF0.5 `1x/133x` comment
+figure — R3 DID move it, "ratio never moved" WITHDRAWN): TPC-DS SF0.25
+goopg **22 GroupAgg / 129 HashAgg** vs PG **126 / 38** (+4 Mixed);
+TPC-H goopg 6/13 vs PG 8/10 — a 5.7x GroupAgg deficit, 3.4x HashAgg
+excess. Cut = 3 arms (pages currency, entry currency
+`W = 48*ncols+avgVar` per review-confirmed PG-faithful mapping, gate
+`inNcols>0`) behind default-off `GOOPG_HASHAGG_WIDTH_CURRENCY`.
+Recorded limits: the cut buys goopg-INTERNAL rival consistency, NOT PG
+alignment (48B/Datum leaves ~6-7x residue), so on WIDE inputs it can
+convert under-charge into OVER-charge — **Q10 is a named watch**
+(currently MATCHing; ON entry 2126B x 59038 groups = 119.7 MiB vs the
+128 MiB budget = 6.5% margin). "Currency fix alone overshoots, must be
+paired with K65/K66 ncols narrowing (R121)" is a PERMITTED reportable
+outcome, not a failure to tune away. work_mem pinning is mandatory in
+every arm (BootVal 512MB vs PG 4MB; TPC-DS SF0.25 conf has none and
+relies on the capture script's session SET). Datum/`minimize_datum`
+stays CLOSED (R114). Next: implement behind the flag, then gates.
+
+R120 DONE 2026-09-14 (`r120-hashagg-width-currency/REPORT.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs closed BY MEASUREMENT +
+notes applied): **NEGATIVE result, flag stays default-off.** The defect
+is real (confirmed both sides) and the correction is directionally
+right, but alone it is insufficient AND net-negative.
+Implemented `GOOPG_HASHAGG_WIDTH_CURRENCY` (strict `=="1"`, default-off,
+provenance-registered): Arm A `pages` uses
+`hashsize.EntryBytes(inNcols,inAvgVar)`, Arm B `hashAggEntrySize` gets
+the bare width `48*ncols+avgVar`, Arm C gate `inNcols>0`. 7 pins.
+Results vs pre-registered bars: P0 PASS (TPC-H OFF byte-identical, md5
+`19b1c9a1`; TPC-DS A/A identical bar header+psql PID) — **P1 FAIL**
+(TPC-DS GroupAgg 23->29, bar >=43; HashAgg 130->123 vs PG 126/38) —
+**P2 FAIL** (`aggregation-strategy` 69->**71**, WORSE) — **P3 FAIL**
+(TPC-H match **6->5**, Q10 lost) — P4 PASS (SF0.25 sweep stamped
+`GOOPG_HASHAGG_WIDTH_CURRENCY=1`: PASS=96 MISMATCH=0; Q10 result digest
+byte-identical OFF/ON) — P5 PASS (post-hoc; 57.8%-of-budget node
+unmoved; the 60-90% band is provably EMPTY on this corpus).
+**Q10 mechanism, MEASURED (not inferred — rev 1's arithmetic was
+self-refuting and the review caught it): `avgVar` is 2080, NOT the
+back-solved 334 (6.2x off).** entry 2112 -> 3888 B, groups x entry
+124,688,256 (92.9% of the 134,217,728 B budget) -> 229,539,744 (171%),
+so the arm newly fires and elects GroupAggregate where PG keeps
+HashAggregate (PG's entry for the same node ~224 B = **17x smaller**).
+The `48*ncols` term alone (1776 B) is what tips it. TPC-H over-budget
+nodes 4 -> 5: the correction newly tips exactly Q10.
+Finding: the correction **over-charges and under-reaches at once** —
+over-charges because `ncols` is still the full concatenated relation
+width (K65/K66), under-reaches because closing the GroupAgg gap needs
++103 nodes and currency buys +6. Inference (labelled as such): the
+~100-node residue is unlikely to be spill-driven and points at **K12**
+(sorted agg wins on ORDERING/pathkeys), evidenced directly only on Q4
+(R72 STEP-0).
+Hygiene traps recorded: a values sweep re-samples stats and opens a new
+EPOCH (two "worsenings" were drift, not the flag — all A/B numbers are
+same-epoch); A/A noise floor is 0; the ON sweep (01:52) postdates the
+A/B pair (01:38/01:39) so **R121 must re-take its OFF baseline**.
+`make plan-gate` not run — inapplicable (default-off + P0 bit-identity),
+recorded as a reasoned omission.
+**EXPIRY (do not let this rot):** `GOOPG_HASHAGG_WIDTH_CURRENCY` is the
+third default-off cost arm (with R108's and R113's). It is tied to R121
+— **promote or delete when ncols narrowing lands**; it must not outlive
+that decision. Recorded here rather than in `.ralph/deferral_ledger.md`
+because that file is a concurrent Ralph loop's state.
+Datum / `minimize_datum` stays CLOSED (R114).
+
+R121 CANDIDATE (the pairing, seam re-confirmed at HEAD): narrow the
+planner's `ncols`/`AvgVarBytes` COST inputs.
+`relfromjoinlist.go:699 stampNeededColsOnRels()` already lands
+`NeededCols` on the base rels BEFORE paths are costed at `:707-709`,
+while the existing narrowing machinery (`narrowoutput.go`;
+`deriveJoinKeeps` at `createplanroot.go:122`; `GOOPG_NARROW_BUILD`
+default ON) runs **entirely post-selection** at createPlan time and
+touches NO cost — so the planner costs joins at full concatenated width
+while the executor builds a narrowed hash table. `Path.NCols` narrows at
+exactly ONE production site (`pathindexonly.go:143-148`); join rels sum
+both inputs' FULL column counts (`joinsearchlevel.go:632-636`). For Q10
+that is 37 cols / avgVar 2080 against the ~7 cols / ~205 B PG carries.
+Narrowing removes R120's overshoot; only then is the currency correction
+safe to enable. R38's rejection is not a precedent against it — R38
+targeted `Width` (K66 says the input is `NCols`/`AvgVarBytes`).
+
+R121 SCOPE READY 2026-09-14 (`r121-narrow-cost-inputs/SCOPE.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**, 5 BLOCKs remediated + 10 notes):
+narrow the planner's COST inputs (`Path.NCols`/`AvgVarBytes`/
+`OutputWidth`) — **Slice A only**.
+Design fixed by recon: narrow on the **Path, never the rel** (rel
+`AvgVarBytes`/`ColVarBytes` are `buildAvgVarBytes`'s deliberate
+over-charge decline for the EXECUTOR's hash entry,
+`entrywidth.go:49-71` -> `createplanjoin.go:572`; and rels are
+per-relset singletons shared across candidates). `NeededCols` is a
+NAME set that deliberately OVER-states and abandons wholesale on any
+unenumerable shape, so narrowing can only keep too MANY columns
+(`joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet`).
+Cut: **A(i)** write the triple at every base-rel scan constructor
+(prebuilt back-fill after `:700`/before `:707`, partial seqscan,
+bitmap, parameterised index `pathparamindex.go:416`, index-ordered
+`pathindexordered.go:251`; index-only EXEMPT — its `covered` set is a
+genuinely narrower emitted schema); **A(ii)** single-child wrappers
+copy the child's triple (Gather, GatherMerge, Sort, Memoize) and
+`costMemoizeRescan` switches off its direct `relNCols` read
+(`joinpathsmemoize.go:252`); **A(iii)** all-or-none PER REL among the
+paths this round writes.
+Three findings that would have shipped blind without review:
+(1) rev 1's "producers pick it up naturally" was FALSE — partial
+seqscan/Gather/Sort build fresh Paths with no triple, and since goopg's
+TPC-H plans are ALL parallel a back-fill alone would have narrowed
+~nothing; (2) partial narrowing makes sibling paths for the same
+joinrel **incomparable inside `addPath`** — a systematic bias no values
+or category gate can see, hence A(iii) plus a declined/mixed census in
+P1; (3) rev 1's headline P5 was **structurally unsatisfiable** —
+`createPlanAtSearchRootRange` must publish the full concatenation
+(`createplanroot.go:100-140`) and `aggInputWidth` reads the built node
+(`groupingpaths.go:327-333`), so Q10's aggregate input is unreachable
+from `Path.NCols`; the pre-registered miss-verdict would have DELETED
+R120's correct PG-cited arm on an instrumentation artefact. P5
+withdrawn; **R120's promote-or-delete expiry re-pointed to Slice C**
+(recorded as a dated addendum, R120 REPORT §10 — landed REPORTs are
+evidence artefacts and are appended to, never rewritten).
+Deferred: Slice B (join-path propagation — needs narrowed children
+first; key on `jt`, note `JoinRight` publishes BOTH sides, outer-only
+is SEMI/ANTI), Slice C (upper/aggregate input coordinate).
+Flag `GOOPG_NARROW_COST_INPUTS`, strict `=="1"`, default-off — the
+FIRST narrowing flag to gate a cost input (the existing `GOOPG_NARROW_*`
+are opt-OUT and gate plan shape only); watch the three-flag interaction
+with `GOOPG_NARROW_BUILD=0`. Next: implement Slice A, then gates.
+
+R121 SLICE A DONE 2026-09-14 (`r121-narrow-cost-inputs/REPORT.md`,
+review **BLOCK -> APPROVE-WITH-NOTES**, 3 BLOCKs closed + 10 notes):
+**mechanically correct, PARITY-NEUTRAL; flag stays default-off.**
+Implemented `GOOPG_NARROW_COST_INPUTS` (strict `=="1"`, default-off,
+provenance-registered): A(i) one sweep over the base-rel level after
+every scan producer (`relfromjoinlist.go`, after `addBaseRelIndexPaths`,
+before `addBaseRelGatherPaths`) — a sweep, not five constructor edits,
+so it cannot miss a producer and A(iii) holds by construction;
+A(ii) `inheritNarrowedWidths` on Gather/GatherMerge/Sort/Memoize plus
+`costMemoizeRescan`'s direct `relNCols` read switched to `pathNCols`;
+A(iii) all-or-none per rel, index-only exempt. Narrowing is on the
+**Path**, never the rel. 15 pins.
+It FIRES and by a lot — TPC-H Q10's four base rels 37 -> 16 columns
+(lineitem 16->4, orders 9->3, customer 8->7, nation 4->2). And it moves
+NOTHING on parity: **TPC-H ON-vs-OFF plan text byte-identical including
+every cost** (6/15/0/1/0 unchanged); **TPC-DS 152 diff lines with real
+join-order changes but match=2 and EVERY category identical** — the
+queries whose shapes moved were already SHAPE-DIFF and stayed so with
+the same category set. Narrowing traded one non-PG join order for
+another. Values PASS both corpora (sweep stamped
+`GOOPG_NARROW_COST_INPUTS=1`, PASS=96 MISMATCH=0; spotcheck PASS).
+Why bounded, now measured: with Slice B deferred the join path's own
+width is untouched (`pathNCols` falls back to the full
+`relNCols(joinrel)` sum, `joinsearchlevel.go:632-643`), so only
+first-level joins see anything; and the aggregate is unreachable from a
+Path at all (search root must publish the full concatenation). R120's
+17x entry gap therefore survives intact at the aggregate.
+Three review catches worth carrying: (1) rev 1 CLAIMED the
+production-producer pin the SCOPE mandated while every pin built
+`searchCtx` by hand — deleting the call site would have left the suite
+green; the replacement end-to-end pin is **mutation-tested**; (2) P1 is
+**PARTIAL** not PASS — its per-corpus declined/mixed census was never
+run (unit tests cannot produce one); (3) a REAL leak: index-only paths
+carry `NCols` unconditionally, so A(ii) would have laundered that triple
+onto a Gather over a DECLINING rel while its sibling Gather carried
+none — A(iii) violated through the wrapper; `inheritNarrowedWidths` now
+refuses an index-only child.
+Also recorded: P3's `sort-strategy` clause passed TRIVIALLY (goopg's
+Sort does not project, so a narrowed scan under-charges it — deferred,
+not discharged); the TPC-H zero-movement explanation is INFERRED, not
+measured (no `hashsize.Choose` pair captured) and is the null hypothesis
+Slice B must beat; parity captures are not machine-stamped with their
+arm (only the sweep is) — `capture-tpc*.sh` should adopt the stamp.
+**Disposition:** keep, but R121 is NOT a cost arm like R108/R113/R120 —
+it is enabling infrastructure with no consumer. Its gate is: **if Slice
+B does not land in the next round-cluster, R121 is dead code and gets
+deleted.** Separately, four default-off arms is the norm limit; that
+belongs in the take2 charter, not a round REPORT.
+Next: Slice B — sum narrowed child triples into the join path's own
+NCols/AvgVarBytes/**OutputWidth** (all three, or it recreates R120's
+two-currency defect one level up); key on `jt` (`pathgen.go:78`,`:148`),
+`JoinRight` publishes BOTH sides so outer-only is SEMI/ANTI; and census
+the narrowed-vs-declined join pairs before reading its category deltas.
+
+R122 SCOPE READY 2026-09-14 (`r122-narrow-join-propagation/SCOPE.md`,
+review **BLOCK -> amended**): Slice B — join paths propagate narrowed
+widths. This is the round R121's own gate names ("if Slice B does not
+land in the next round-cluster, R121 is dead code").
+Cut: propagate in **`addPath`/`addPartialPath`** (`path.go:930`,`:977`),
+ONE choke point rather than seven constructors — verified the single
+funnel (Pathlist/PartialPathlist are written at exactly those two
+places; the semi-splice route goes through the same constructors; no
+join path is mutated after addPath). Timing is the subtle part and is
+correct: the constructor computes its own cost from its CHILDREN's
+widths before calling addPath, so stamping the join's own triple there
+is too late for its own cost — which is right, because that triple is
+consumed only when the path becomes a CHILD one level up.
+Rule: `NCols/AvgVarBytes/OutputWidth = outer + inner`, outer-only for
+`JoinSemi`/`JoinAnti` (verified against `joinPublishesInner`,
+`joinrelsize.go:127-133`; **`JoinRight` publishes BOTH**; `JoinFull`
+never produces a path but implement it as "both" so a future FULL
+executor cannot silently take the SEMI branch).
+Review caught, and the scope now carries: (1) **decline rule 4** —
+`NCols > 0` is NOT a proxy for "we narrowed it", because
+`pathindexonly.go:136-148` writes the whole triple UNCONDITIONALLY, so
+without the rule a declining rel's index-only path would launder its
+triple into a join sum while the NLI path for the SAME joinrel declined
+— R121's wrapper leak, one level up; (2) the Kind test must be an
+explicit **whitelist**, since `parser.JoinInner == 0` is the zero value
+and `PathSetOp` has exactly two children — "has 2 children" or "has a
+Jointype" both read a set-op as an inner join; (3) a mis-citation
+(`hashjoin_pgtuplesizing.go:57-58` is inside a trace function gated on
+`pathTraceEnabled` — justifying a decline rule with diagnostic-only code
+invites the next round to weaken it).
+Known scale, recorded BEFORE implementing: of the 100 TPC-DS query
+files **31 have a `WITH` and 28 a `FROM (`-subquery**; every such leaf
+has `ri.table == nil` -> nil `ColVarBytes` -> the rel declines -> under
+rule 1 every join above it declines. So narrowing dies partway up on
+roughly a third to a half of TPC-DS. The §2 census is therefore the
+round's actual deliverable and must be counted **per join and per
+pair** with the five decline arms broken out — R121's P1 went PARTIAL
+for skipping exactly this and it must not happen twice.
+No prediction claims a parity gain. If P3 holds flat again, the REPORT
+must explicitly ask whether the A+B+C chain is worth finishing rather
+than deferring a third time. Gates additionally require a
+`hashsize.Choose` geometry capture at both widths (R121 asked for it and
+the first draft dropped it) and merge-input-sort movement reported
+SEPARATELY from hash-geometry movement (`sortPathFor*` prices a merge
+input sort from the subpath triple, and with Slice B that subpath can be
+a JOIN — a join-METHOD lever, not a rounding difference).
+Next: implement, then gates.
+
+R122 SLICE B DONE 2026-09-14 (`r122-narrow-join-propagation/REPORT.md`,
+review **BLOCK -> both discharged by measurement**):
+**THE FIRST PARITY IMPROVEMENT OF THE SESSION.** TPC-H `join-method`
+10->9 and `scan-type` 9->8, match holds 6, nothing regressed, values
+byte-identical. Flag still default-off pending Slice D.
+Cut: `narrowJoinWidths` called from `addPath`/`addPartialPath` — the
+single funnel — publishing `NCols/AvgVarBytes/OutputWidth = outer+inner`,
+outer-only for SEMI/ANTI, with 5 decline rules (un-narrowed child;
+all-three-or-none; idempotent; **index-only child**; nil-safe) and an
+explicit Kind WHITELIST (because `parser.JoinInner` is the zero value
+and `PathSetOp` has two children). 25 pins.
+**Q3 is the win and it validates the whole R120->R121->R122 thesis.**
+It shed join-method AND scan-type, going 5 categories -> 3, and its join
+subtree is now **shape-identical to PG's**: `Hash Join(l_orderkey =
+o_orderkey)` over `Seq Scan on lineitem`, replacing a Nested Loop over
+an index probe. Its residual `join-order` entries are a POSITIONAL
+CASCADE from the extra Sort under GroupAggregate, not a real divergence
+— Q3 is now a pure aggregation-strategy case (Slice C / K12).
+**Mechanism MEASURED, not inferred** (SCOPE gate 7, dropped from the
+first draft and restored on review): `hashsize.Choose` geometry on Q3 —
+the 141,795-row build goes entry **1052 B -> 321 B**, taking **nbatch
+2 -> 1, i.e. SPILLING -> FITS**. That is why the hash join became
+affordable. **It also REFUTES R121's inferred story** that "nothing sits
+near a batch/spill boundary": things do; R121 just never reached a join
+because a join path published its full width. Artefact retained
+(`r122-geometry.txt`).
+**TPC-DS is live but parity-neutral** — and the first draft wrongly
+called it flat. 3 plans change STRUCTURE (Q6, Q64, Q75) + 1 cost-only
+(Q95); no category moves, no query regresses. NOTE Q36/Q70/Q86 differ
+only by the psql temp-file PID inside their ERROR text — the documented
+**K18 trap** resurfacing because `capture-tpcds.sh` uses `$$` (a review
+initially miscounted these as structural). Fix the script.
+**Census (P5, the round's deliverable):** TPC-H mixed-currency pairs
+**3/4364 = 0.07%** (so its category movement is real signal); TPC-DS
+**42,679/124,616 = 34.2%**. Per the SCOPE's pre-registered rule that
+means a TPC-DS category move could not have been ATTRIBUTED — but the
+measured null is still a result, not a void. Caveat the census cannot
+escape: the decline arms are **order-dependent** and
+`neededColumnNames` declines PER STATEMENT, so arm (a) collector-declined
+(144/176) MASKS arm (c) nil-ColVarBytes (32) — this round cannot say the
+SCOPE's CTE/subquery story was wrong, only that it fires one arm earlier.
+**Worth-finishing question ANSWERED (SCOPE required it, no third
+deferral):** YES for TPC-H on evidence. NOT PROVEN for TPC-DS, with a
+visible ceiling — its dominant categories are join-order (90) and
+parallelism (86), which this chain does not touch, so the realistic
+upside is a subset of join-method (62) + scan-type (57) AFTER Slice D.
+And the chain reaches no MATCH alone: even Q3 still needs Slice C.
+R121's dead-code gate is **discharged** — Slice B landed and R121 is
+now load-bearing.
+Next: **Slice D — reduce collector declines** (`neededColumnNames`
+declines the WHOLE statement on any unenumerable shape; making it
+per-relation would convert a large share of the 42,679 mixed pairs into
+uniform ones), re-measure the census per shape first. Then Slice C
+(aggregate coordinate), which still holds R120's promote-or-delete.
+
+R123 SCOPE READY 2026-09-14 (`r123-cost-needed-cols/SCOPE.md` rev 2,
+review **BLOCK -> APPROVE-WITH-NOTES**; rev 1's FIX WITHDRAWN wholesale,
+round is now MEASUREMENT-ONLY):
+Rev 1 proposed a cost-only needed-column set to stop the collector
+declining on WITH/set-op/window/grouping-sets. **Review refuted it with
+R122's own arithmetic and the refutation is correct.**
+`neededCols/neededColsKnown` is a SINGLE pair of fields on `searchCtx`
+(`joinsearch.go:195-196`) stamped uniformly onto every rel of a search,
+so a collector decline is **search-problem-uniform**: such a search has
+NO narrowed rel (index-only is excluded too — `pathindexonly.go:22`
+needs the set KNOWN), therefore contributes **ZERO mixed pairs**. All
+its joins land in "both un-narrowed" = **8,588/124,616 = 6.9%**, which
+BOUNDS the entire collector-decline population. The 42,679 mixed pairs
+(34.2%) come from searches the collector ACCEPTED. Worse, fixing
+declines moves joins out of both-un-narrowed into narrowed AND mixed —
+the share can only hold or RISE, so rev 1's own P3 ("34.2% -> under
+10%") was a bar the arithmetic already answered.
+Rev 1's error was methodological and worth remembering: it substituted a
+**static text grep over .sql files** for the RUNTIME AST measurement
+R122 explicitly asked for, then presented the agreement of "half the
+files" with "a third of comparisons" as confirmation. The grep was also
+wrong on its own terms — 100 files not 99, 45 gate-tripping not 48, and
+**0** queries trip `WindowClause` (the gate term is the named
+`WINDOW w AS (...)` clause; the 10 window queries decline at a different
+site, `collectExprColumnNames`'s `FuncCall.Over != nil` arm).
+New leading hypothesis (from the review, labelled as hypothesis):
+**non-whitelisted child kinds.** `narrowJoinWidths` whitelists only
+Hash/Merge/NL (`narrowcostinputs.go:227-231`) and
+`inheritNarrowedWidths` covers only Gather/GatherMerge/Sort/Memoize
+(`:287-315`), so every PathSetOp/Append/SubqueryScan/HashAgg/Unique in a
+spine publishes NCols==0 beside a narrowed sibling — a mixed pair at
+EVERY join above it. TPC-DS has 22 set-op queries and heavy Append/agg
+spines; TPC-H has neither. Fits 34.2%-vs-0.07% as the statement gate
+provably cannot.
+Three must-fixes applied before instrumenting: (1) the histogram must do
+**ROOT attribution** (stamp a reason on each non-publishing path and
+walk past `childCascade`) — keying on the immediate child's Kind would
+be swamped, since one leaf cause manufactures ~12 mixed pairs in a
+12-way spine, 11 reporting PathHashJoin; (2) the gate counter must
+separate **top-level from nested** calls — `collectStmtColumnNames` is
+re-entrant via the sublink arms and would double-count; (3) **there is
+no OFF baseline to take** — all four entry points are flag-gated, so the
+OFF census is 100% both-un-narrowed by construction; one ON census at a
+pinned epoch instead, with TPC-H's near-zero mixed share as a GATE on
+the counter's correctness.
+Decision table is falsifier-first: statement-gate declines appearing in
+the mixed histogram AT ALL means the instrumentation is wrong -> STOP.
+Thresholds demoted to a tiebreak in favour of reporting the
+distribution, the per-query spread, and the **decisive** (plan-evicting)
+share — the last being the only population where the currency bias could
+have moved a plan. A near-zero decisive share means TPC-DS's flat
+categories were a real null and R124 becomes a promotion-decision round.
+Carried forward for whichever lever wins: CTE `DMLBody` must decline
+(the "Stage A rejects" comment is STALE — parser/analyzer/optimizer all
+handle it); for `s.SetOp` the LEFT operand is `s` itself; grouping sets
+need the gate term DELETED and no walk (`prepareGroupingSets` already
+folded them into `s.GroupBy`); and **B4** — a cost-only set on a
+collector-declined statement INVERTS
+`joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet`, because
+`GOOPG_NARROW_BUILD` (default ON) inserts no Project there, so the
+executor builds full width while the planner prices narrow. Planner
+UNDER-pricing = R120's defect in reverse; any revival must name it and
+add a timing check.
+Next: instrument, measure, resolve the table.
+
+R123 DONE 2026-09-14 (`r123-cost-needed-cols/REPORT.md`, review
+**BLOCK -> discharged by measurement**, measurement-only, **ZERO Go
+changes ship** — proved by an empty `git diff` over internal/cmd/scripts,
+not a grep):
+**The 42,679 TPC-DS mixed-currency join pairs are ONE cause, 100%.**
+Root attribution: every one traces to a base-rel leaf that declined on
+**arm (c) nil `ColVarBytes`**. Identity MEASURED (the first draft
+asserted it and review rightly objected that arm (c) fires for three
+indistinguishable populations): **CTEScan 14, Project 9, SetOp 7,
+Filter 2 = 32 non-table leaves, and ZERO ordinary tables.** Just 32
+declining rels poison 42,679 comparisons because one un-narrowed leaf
+appears in a combinatorial number of DP pairings.
+**Pre-registered decision-table row 2 FIRES** → R124 = give non-table
+leaves a per-column width basis. Both hypotheses were wrong: rev 1's
+collector story was refuted by arithmetic BEFORE implementation and the
+census confirms it (the 144 arm-(a) declines are search-problem-uniform,
+so they land in BOTH-UNNARROWED=8,588 and contribute ZERO mixed pairs —
+the pre-registered falsifier did NOT fire); and the review's
+Append/SetOp/HashAgg-**wrapper** hypothesis finds **zero** instances.
+Counter validated two ways: TPC-H reproduces 4,257/3/98/65/4 (0.07%
+mixed) and TPC-DS reproduces R122's totals exactly.
+Admitted-on-arrival share **59.6%** (25,450/42,679) — but relabelled on
+review: this is `pathlistVerdict==accepted`, i.e. survived ON ARRIVAL,
+which is an **UPPER BOUND** on the pre-registered "evicted the other
+candidate" share, and an accepted path can still be evicted by a later
+insert. The true decisive share is unmeasured, in (0, 59.6%]. Direction
+still holds: the "confound never moved a plan" row does not fire.
+Corrections carried (all from review): TPC-H denominator is **4,358**,
+not R122's 4,364 — R123's counter never emitted the rule-4 index-only
+bucket, so the two censuses are NOT bucket-for-bucket identical and
+"reproduces exactly" was an overstatement; SCOPE §3.2's per-gate-term
+top-level-vs-nested counter was **never built** and is still
+outstanding; SCOPE §3.1's raw per-Kind histogram was not emitted, so the
+cascade is inferred not shown; per-query spread unmeasured, so
+concentration in q64/q14-class queries is unknown.
+Second, smaller mechanism found and worth not losing: **TPC-H's 3 mixed
+pairs root at `wrapperGap-indexOnlyChild`**, not at the TPC-DS cause —
+R124 must not assume one mechanism.
+Method note worth keeping: the first draft escaped the decision table by
+inventing a narrower R124, and that escape rested on a **taxonomy
+artefact of my own instrumentation** — `nonWhitelistedKind` tagged on a
+base-rel SCAN path is uninformative by construction (the whitelist is
+the JOIN whitelist), and it pre-empted the `relDeclineArmC` tag the
+SCOPE had defined for exactly that case. The narrower proposal would
+also have missed 66% of the population (the 14 CTEScans + 7 SetOps).
+Raw dumps are **committed** this time (`census-tpcds.raw.gz`,
+`census-tpch.raw`, `rel-identity.txt`) — R122's were not and its figures
+were consequently unreproducible.
+Sizing unchanged and still honest: fixing this makes TPC-DS's categories
+READABLE, nothing more. R122's ceiling stands — TPC-DS's dominant
+categories are join-order (90) and parallelism (86), which this chain
+does not touch, so the realistic upside is a subset of join-method (62)
++ scan-type (57), and no TPC-DS query is close to a MATCH.
+Next: R124 — per-column width basis for non-table leaves. For a
+sub-problem leaf the width is already known internally (its own search
+narrowed its own rels); for a CTEScan/SetOp it is NOT, and inventing one
+is forbidden — derive from the leaf Node's output schema plus whatever
+statistic the body supplies, or keep declining. Do not assume the
+sub-problem answer generalises to all 32.
+
+R124 SCOPE READY 2026-09-14 (`r124-nontable-leaf-widths/SCOPE.md`,
+review **APPROVE-WITH-NOTES**, no blocks, 3 mandatory amendments + 2
+applied): narrow the 32 non-table leaves R123 identified.
+**The cut is provably safe and changes exactly one number.** The arm-(c)
+decline exists to avoid contributing a silent zero where a real
+statistic is unattributable — but for these rels **there is no statistic
+to lose**: on a level-1 search rel `AvgVarBytes` and `ColVarBytes` are
+assigned together and only under the table guard
+(`joinsearch.go:403-411`), so a non-table leaf already has BOTH nil/0.
+Today's un-narrowed fallback is therefore already
+`ncols = len(baseLeaf.Output()), avgVar = 0`. Narrowing ncols while
+carrying `avgVar = 0` invents NO estimate — EntryBytes goes
+`48*full+24 -> 48*kept+24` in the model's own units. Guard: narrow on
+nil ColVarBytes ONLY when `AvgVarBytes == 0`.
+Review confirmed every link of that argument (all AvgVarBytes assignment
+sites enumerated; `pathAvgVarBytes` returns 0; the arithmetic; and that
+path fields never reach the executor — it reads `plan.AvgVarBytes` from
+`buildAvgVarBytes` over REL fields). It also confirmed the cut FIRES on
+all 32: `scanPathTarget` and the empty-keep-set check run BEFORE the
+ColVarBytes check, so a rel tagged arm=c already passed them — the
+renamed-CTE-column worry does not bite, and a mismatch would be a live
+wrong-answer bug today rather than a new risk.
+Three mandatory amendments, all applied:
+(1) **A statement of mine was FALSE**: "AvgVarBytes and ColVarBytes are
+always assigned together" — five UPPER-rel sites assign AvgVarBytes
+alone (`upperrel.go:187`, `groupingpaths.go:145`, `distinctpaths.go:112`,
+`windowsetoppaths.go:141`,`:323`). True only for LEVEL-1 rels, which is
+all `relNarrowedWidths` ever sees. So the guard is a LIVE trip-wire: any
+successor extending narrowing to upper rels will trip it on real rels.
+(2) **B4 is avoided in `ncols` but CREATED in `avgVar` one level up** —
+half my hazard claim was wrong. For a build side `{CTEScan, t}` the
+executor's `buildAvgVarBytes` declines to the whole-relation sum, and
+BEFORE this round the join path declined too, so planner and executor
+AGREED. After it the planner publishes `0 + kept-bytes(t)`, BELOW the
+executor's charge (~74 B/row at Q9 scale). Cost-only, nothing
+under-sized, but it is R120's defect in reverse by a different door —
+now named, with a pin required.
+(3) The predicate keys on the **statistic, not the leaf kind**, so it
+also admits un-ANALYZEd ordinary tables; P1's exact counts assume zero
+of those, true at this epoch only.
+Also: P2 now predicts the FULL bucket vector — BOTH-UNNARROWED must NOT
+rise, because R123 root-attributed only the MIXED bucket, so a pair
+whose other side declines for a different reason (rule-4 wrapper gap,
+R123's TPC-H mechanism) becomes MIXED after this cut and must be
+attributed rather than read as "R123 was wrong". And expect **no
+aggregation-strategy movement** from these 32: `costAgg`'s spill arm is
+gated `inAvgVarBytes > 0` (`cost_funcs.go:502`), false at avgVar=0 on
+both arms — that bounds what "readable" can reveal.
+Sizing unchanged: this makes TPC-DS categories READABLE, not matching.
+Next: implement, then gates.
+
+R124 DONE 2026-09-14 (`r124-nontable-leaf-widths/REPORT.md`, review
+**BLOCK -> both findings accepted; the round's conclusion CHANGED**):
+narrow the 32 non-table leaves. Cut fires on all 32; MIXED bucket
+42,679 -> 0; REL-NARROW 590 -> 622; arm (c) 32 -> 0; guard never fired;
+denominator conserved (116,271+0+8,345 = 124,616). Values PASS=96,
+TPC-H holds R122's gains (match 6, join-method 9, scan-type 8).
+**But the round changes NO plan and NO cost anywhere** — TPC-DS captures
+are identical to R122's modulo a header line and the K18 tempfile names;
+TPC-H byte-identical. My claim that this made TPC-DS's null "readable"
+where R122's was confounded is **WITHDRAWN**: the null is read off the
+same bytes R122 produced.
+Measured why (`kept` vs `full` over the 32): **22 are `kept == full`**,
+i.e. numerically inert — the cut only replaces the NCols zero-sentinel
+with the same count, so for those the "mixed currency" R122/R123 chased
+for two rounds was a **LABELLING artefact** whose two sides already
+carried identical numbers. **10 genuinely narrow** (CTEScan 9->8, 8->7,
+3->1; SetOp 4->3; and a **Project 144 -> 28**) — and that part is still
+UNEXPLAINED: a 116-column reduction that moves no cost. Do not read it
+as "narrowing doesn't matter"; those rels may sit in single-relation
+search problems with no join above them.
+**Second false claim of mine, retracted**: "join-order and parallelism
+are not width-driven". `joinpathsparallel.go:210-213` consumes the width
+triple directly, and the flag's own OFF/ON diff moves **Q6** (join order
++ Memoize key), **Q64** (84-line spine reorder) and **Q75** (Hash Left
+Join -> Nested Loop over Hash Right Join = a join-METHOD change), plus
+Q95 cost-only. I also failed to disclose those shape changes — R122 was
+forced to make exactly that disclosure one round earlier. Defensible
+claim: width DOES move TPC-DS join order/method, just not TOWARD PG.
+**R120's PAIRING HYPOTHESIS IS REFUTED** — the most valuable result
+here. R120 shipped as "NEGATIVE result, pair with ncols narrowing" and
+its promote-or-delete was re-pointed on that reasoning;
+`cost_funcs.go:502` even switches `armLive` to `inNcols > 0` under that
+flag, so R120's arm is *specifically* the consumer for R124's output.
+Run together on TPC-DS: GroupAgg 29 / HashAgg 123 / agg-strategy 71 —
+**identical to R120's arm alone**. Narrowing adds nothing; agg-strategy
+still worsens 69->71. **R120's flag should be DELETED**, not carried to
+another round: the condition it waited for arrived and changed nothing.
+Verdict on the chain for TPC-DS: **stop**, but for the corrected reason
+— not "narrowing can't touch these categories" (it can) but "with the
+chain complete and the confound bucket at zero, TPC-DS gains zero
+categories and zero matches while narrowing merely reshuffles its
+plans". Do NOT build the per-column width basis for CTE/SetOp outputs
+R123 floated: 22 of 32 rels were already at full-width parity and the 10
+real narrowings moved nothing.
+Also corrected: the accepted-divergence pin was a TAUTOLOGY (asserted
+`0+30==30`, already covered elsewhere; built no non-table leaf, never
+called `buildAvgVarBytes`) — it now calls `buildAvgVarBytes` and asserts
+the strict `planner < executor` inequality that IS the divergence; a
+stale pin name claimed subqueries/CTEs must decline, the opposite of
+what R124 ships; P4's TPC-H half is VACUOUS (zero eligible rels there);
+the values sweep ran on the INSTRUMENTED binary (plan-identical, but
+R123 stated this and R124 did not); and P2's zero-valued-arms clause was
+not met — the same omission R123 self-criticised.
+
+R125 SCOPE rev 2 READY 2026-09-14 (`r125-tpch-foreign-keys/SCOPE.md`,
+review **BLOCK on rev 1 -> re-scoped from the corpus to the ENGINE**).
+**A major corpus/engine finding, and it names a path to the first new
+MATCH.** TPC-H Q9 is the closest query in either corpus to matching —
+its ONLY category is `join-order` — and that divergence is entirely
+downstream of a cardinality bug: for `partsupp ⋈ part ⋈ lineitem`
+(`l_partkey=ps_partkey AND l_suppkey=ps_suppkey`) the **ground truth is
+318,748** (COUNT on live data), **PG estimates 363,341 (1.14x)** and
+**goopg estimates 116 — 2,748x UNDER**. With 116 believed, every join
+above looks free and goopg takes index nested loops all the way up.
+Cause: **PG's `tpch` declares 8 foreign keys; goopg's declares 0.** PG
+fires `get_foreign_key_join_selectivity`; goopg's faithful port of it,
+`superkeyJoinSelectivity` (`joinrelsize.go:312`), has no evidence.
+The FK path IS live — reviewer reproduced it end-to-end on a Q9-shaped
+fixture: adding the FK alone moved the estimate **rows=5 -> rows=1200,
+exactly ground truth**.
+Rev 1 proposed adding the 8 FKs to the bench DB. **BLOCKED, four
+findings, all correct and all worth keeping:**
+1. **goopg does NOT persist FK constraints across a restart** — proven
+   empirically (create -> pg_constraint shows it -> CHECKPOINT -> stop
+   -> start -> 0 rows, data intact). `catalog.Table.ForeignKeys`
+   (`catalog.go:641`) is the only store, `pg_constraint` is SYNTHESISED
+   from it (`:7248`), and startup has **no FK reload path**. Rev 1's
+   gates all cross a restart, so the cut was a no-op by measurement
+   time; "bake it into bench tooling" misdiagnosed it (per-restart, not
+   per-rebuild).
+2. **FK validation is O(child x parent) with no index path**
+   (`operators_ddl.go:9121` -> `validateFKConstraintExistingRows` ->
+   `scanRelForFKMatch`, full heap scan). Measured **32.17s for
+   40,000 x 8,000** -> `lineitem->partsupp` ~5.5 DAYS,
+   `lineitem->orders` ~10 days, **~2 weeks for the eight.** Rev 1 said
+   "may be slow" — five orders of magnitude off.
+3. **Rev 1's `NOT VALID` prohibition was FACTUALLY WRONG about PG.**
+   PG's planner never reads `convalidated`: `plancat.c:642-644` skips
+   only `!conenforced`, and `RelationGetFKeyList` (`relcache.c:4769`)
+   doesn't even carry `convalidated` into `ForeignKeyCacheInfo`. **PG
+   USES a NOT VALID FK for FK-join selectivity.** goopg does the
+   opposite (`joinrelsize.go:658`, `joinkeyproof.go:740` skip on
+   `fk.NotValid`) — a genuine, cheap, source-level parity defect.
+4. **Rev 1's causal story is refuted**: goopg ACCEPTED all 8 FKs at load
+   (HammerDB's CreateIndexes runs PKs, then FKs sql(9)-(16), then the 8
+   `*_fkidx` indexes, erroring on first failure — and goopg HAS all
+   eight `*_fkidx`). They were lost at a later restart; the ANALYZE
+   failure came afterwards and is unrelated. Validation was also a no-op
+   at that epoch (existing-row validation landed later, `0518b4a48`).
+**Rev 2 = the reviewer's step (a):** consume `NOT VALID` FKs as PG does.
+Smallest, PG-cited, and it UNBLOCKS the rest — with NOT VALID accepted,
+FK evidence becomes declarable in O(1) instead of O(child x parent).
+The one real design question the round must answer first: the two guard
+sites are NOT equivalent. `joinrelsize.go:658` feeds a SELECTIVITY (safe
+to relax, PG does), but the same struct carries `boundProven`/
+`rowsBound` — a "STRUCTURAL upper bound" — and `joinkeyproof.go:740` is
+a PROOF site. PG derives no such bound from `fkey_list`, so honouring an
+unvalidated FK there could be unsound where it is not in PG. **Enumerate
+every consumer before editing**; likely shape is relax the selectivity
+site, keep the guard on hard-bound/proof sites, documented at both.
+Dependency chain to Q9, accepted: (a) this round; (b) **persist FK
+constraints across restart** — the blocker for everything, and the
+reload must repopulate `catalog.Table.ForeignKeys`, not the synthesised
+view; (c) index path for FK validation (~2 weeks -> minutes);
+(d) then reload the corpus and measure Q9.
+Carried for (d): with the FK firing goopg's estimate is COMPUTABLE —
+`40,132 x 6,001,255 / 800,000 ~= 301,050`, NOT PG's 363,341 (PG's
+`partsupp ⋈ part` is 48,484 vs goopg's 40,132), so predict 301k;
+"moves toward 318,748" is unfalsifiable. And rev 1's "Q9 -> MATCH" was
+OVER-CONFIDENT: on the reviewer's reproduction the estimate corrected
+exactly while **the plan shape did not change at all**. Correcting
+cardinality != changing shape != matching PG's shape.
+Also noted: neither `tpch` DB is clean (both carry scratch tables — no
+FKs on them, but scope "like-for-like" to the 8 benchmark tables); one
+HammerDB FK is DEFERRABLE and seven are not, so a future catalog-match
+gate must not compare only `(conrelid,confrelid,conkey)`; and the TODO
+head's values gate still says "SF0.5 PASS=95" where CLAUDE.md and every
+round since R94 use SF0.25 PASS=96.
+
+R125 DONE 2026-09-14 (`r125-tpch-foreign-keys/REPORT.md`, review
+**APPROVE-WITH-NOTES**, no blocks): goopg now consumes `NOT VALID`
+foreign keys as planner evidence, matching PG. Step (a) of the four-step
+chain to Q9, and the step that makes the rest affordable.
+Defect: PG's planner **never** consults `convalidated` —
+`get_relation_foreign_keys` skips only `!conenforced`
+(`plancat.c:642-644`) and `RelationGetFKeyList` (`relcache.c:4769-4776`)
+doesn't carry `convalidated` into `ForeignKeyCacheInfo`; `grep
+convalidated` over `optimizer/` returns ZERO hits. goopg skipped on
+`fk.NotValid` at `joinrelsize.go:658` and `joinkeyproof.go:740`. Both
+now gate on `NotEnforced` alone.
+**The upstream omission is DELIBERATE** (review found this and it
+settles the argument): PG DOES filter `convalidated` where it means
+something — `CheckConstraintFetch` skips unvalidated CHECK constraints
+(`relcache.c:4635`) — and pointedly does not in the FK path.
+Gate 1 enumeration, done before the edit: `rowsBound` has exactly two
+consumers, both `rows = min(rows, …)` clamps (`cardinality.go:678`,
+`joinrelsize.go:250`); `boundProven` has one, gating whether a default
+selectivity is substituted (`cardinality.go:639`). Extended past the
+optimizer boundary on review: the joinrel `rows` reaches
+`operators_join_agg.go:786` (hash presize — `NBuckets` only, map still
+grows, `NBatch` ignored) and `subq_cache.go:106` (reconciled against the
+measured size, falls back to the always-correct rescan path). **No
+consumer is a guarantee**, so the SCOPE's hedge (relax selectivity, keep
+the proof site) was unnecessary — relax both.
+**A documented prior decision was REVERSED, deliberately and in the
+open.** `TestCalcJoinrelSizeInvalidFKIgnored` asserted the opposite,
+reasoning "a NOT VALID constraint proves nothing about the rows already
+in the table". Correct about PROOF, wrong about PG. The pin is renamed
+and inverted (`…InvalidFKHonouredLikePG`) with the citation and an
+explicit failure message naming the old behaviour; its surviving half is
+split into `…NotEnforcedFKIgnored`.
+**The strongest safety argument, which I missed and review supplied:**
+the concern is QUANTITATIVELY IDENTICAL to PG's. A NOT VALID FK is still
+ENFORCED against every new row in goopg exactly as in PG — runtime
+enforcement gates on `NotEnforced` only (`operators_fk.go:118`,`:170`),
+never `NotValid` — so the unchecked set is the pre-existing rows alone,
+and only until VALIDATE CONSTRAINT. This is not parity overriding
+safety; it is the same safety.
+Results: P0 PASS on **both** corpora (TPC-H byte-identical md5
+`19b1c9a1`; TPC-DS `ds-r125` bit-identical — the first draft reported
+PASS having captured only TPC-H, corrected on review). goopg `tpch` has
+NO constraints of any type and `tpcds025` has 0 FKs, so nothing could
+move. P1 PASS — new pin over the REAL planner on a Q9-shaped 2-column
+join: **noFK=8000, validFK=40000, notValidFK=40000**, i.e. the FK arm
+corrects a 5x under-estimate to exact, and NOT VALID now behaves as
+validated; **mutation-tested** (restoring the guard gives
+`notValid=8000 valid=40000`). Suites + vet green; spotcheck PASS.
+No flag, deliberately: a default-off flag would be DEAD CODE (no corpus
+declares an FK, so it could never be A/B'd — the 5-way-A/A trap R124
+fell into), and the FK declaration itself is step (d)'s A/B knob.
+TPC-DS SF0.25 values sweep NOT run — recorded as a judgement, not a
+pass: a change that provably cannot alter a plan cannot alter a value.
+**Q9 does not move and cannot yet.** TPC-H stays 6/22, TPC-DS 2/99.
+Remaining: **(b) persist FK constraints across restart** — the blocker;
+the reload must repopulate `catalog.Table.ForeignKeys`, not the
+synthesised `pg_constraint` view. **(c)** index path for FK validation —
+now OPTIONAL rather than blocking, because NOT VALID FKs can be declared
+in O(1) and still feed the estimator. **(d)** declare and measure Q9.
+Follow-up worth doing: rename `boundProven`/`rowsBound` — they promise a
+proof the FK arm never delivered (PG derives no bound from `fkey_list`).
+Caveat carried: §5's FK-persistence and 32.17s-validation figures came
+from a throwaway cluster and exist only as prose; (b)/(c) must re-measure
+and commit the artefact rather than cite this report.
+**SCOPING FACT for (d), from the review addendum and verified: the FK
+chain is TPC-H-ONLY.** The TPC-DS base DDL
+(`third-party/tpcds-postgres/.../tools/tpcds.sql`) declares **24 PRIMARY
+KEYs and ZERO FOREIGN KEYs**; TPC-DS's FKs live only in the separate
+`tools/tpcds_ri.sql`, which **nothing** under `bench/tpcds/`, `scripts/`
+or the `Makefile` references. So TPC-DS provably cannot carry an FK on
+the current build path, and (b)/(c)/(d) should be sized against TPC-H's
+14 join-order queries alone — not TPC-DS's 90 — unless someone
+deliberately wires `tpcds_ri.sql` into the load. (This also made P0's
+TPC-DS half zero-risk rather than merely low-risk; the capture was taken
+anyway and is bit-identical.)
+Values gate closed properly: the first draft substituted a judgement for
+the SF0.25 sweep; review flagged it, so it was RUN — PASS=96 MISMATCH=0
+(`sweep-20260914-053800.txt`).
+
+## R126 (scope) — persist FOREIGN KEY constraints across restart
+
+Step (b) of R125's chain, and the blocker for (d)/Q9. Scope:
+`r126-fk-persistence/SCOPE.md`.
+
+**The defect has two halves, both confirmed by source read.** Write:
+`syncTableToCatalogHeap` (`operators_ddl.go:18575`) streams pg_class,
+pg_attribute, pg_attrdef, pg_inherits and pg_rewrite rows but emits **no
+`contype='f'` pg_constraint row** — no `ForeignKeys`/`contype`/`2606`/`'f'`
+anywhere in its body. Read: startup DOES scan pg_constraint (2606, a real
+heap, created at initdb `initdb.go:1360-1369`) at
+`catalog_heap_reload.go:1338`, but only for **domain CHECK** constraints
+(filters `contypid >= FirstUserOID`). So `catalog.Table.ForeignKeys`
+(`catalog.go:641`) is the only store and `pg_constraint`'s FK rows are
+*synthesised* from it (`catalog.go:7237`).
+
+**Recon done BEFORE the scope was submitted; two answers changed the cut.**
+
+1. **The template exists and is exact** — `internal/executor/sys_pg_constraint.go`
+   (B2.1b), whose own header names this round's residual: "Table
+   constraints stay registry-only until B3". `02d §2` scopes pg_constraint
+   into B3, so this is a planned conversion, not a novel design.
+2. **`conkey`/`confkey` cannot round-trip today.** Every array column in
+   BOTH existing writers is `NullDatum`, so the encoding has never
+   executed — and it is broken in both directions:
+   `PGConstraintColumnsPG18()` declares `{Name:"int2[]"}` with `IsArray`
+   FALSE, so encode misses the `t.IsArray` branch and
+   `case "int2[]"` returns `emptyArrayTypeBytes(21)` (**a non-null conkey
+   would silently write an EMPTY array**), while decode's array path is
+   likewise `IsArray`-gated and the scalar switch has no `int2[]` case, so
+   it reads back as varlena text. Fix: declare them
+   `{Name:"int2", IsArray:true}` — the tested M0118-0002 user-array
+   convention — which is byte-inert for all extant (all-NULL) rows. P0
+   MEASURES that rather than arguing it.
+3. **Routing is the TPC-H-shaped trap.** `pgConstraintRel(ctx)` hardcodes
+   `catalog.DefaultDBOid`; FK rows must instead route per-database via
+   `tableCatalogHeapDBOid(ctx)` like the tables they hang off, and the
+   reload must mirror the per-DB sweep at `open.go:1563-1571`. TPC-H's
+   tables live in database `tpch`, so getting this wrong makes step (d)
+   measure nothing — R125 rev 1's failure mode exactly. Pinned as P1b.
+4. OID/Name are DDL-assigned; persisting them makes them stable across
+   restart, which they are not today. `confrelid` is stored as an OID and
+   resolved back to the table's CURRENT name on reload (so a rename no
+   longer silently breaks the name-keyed store); a missing parent drops
+   the FK with a warning rather than restoring it dangling.
+5. `RefColumns` empty ("use parent PK") is preserved VERBATIM, not
+   materialised — materialising would change `pg_get_constraintdef`
+   output, which is out of scope.
+
+Predictions: P0 no behaviour change + the measured byte-identity of
+existing heap rows; P1/P1b FK survives a restart AND still reaches
+`superkeyJoinSelectivity` (assert the estimate, not the synthesised
+view), including in a non-`postgres` DB; P2 per-field round-trip with
+mutation tests on the two that degrade silently (multi-column `conkey`,
+`conenforced`); P3 DROP removes it with no orphan; P4 values gates
+MANDATORY (this touches a DDL write path — no R125-style judgement);
+P5 do not regress PG-standby readability.
+
+**No parity prediction**: this round declares no FK, so TPC-H stays 6/22
+and TPC-DS 2/99. Its value is that step (d) becomes possible at all.
+Gates also re-measure and commit R125 §7's two prose-only figures.
+
+**Measured before the scope was reviewed** (`r126-fk-persistence/fk-loss-across-restart.md`,
+HEAD `14a11488f`) — discharges R125 §7's flag that the FK-persistence
+figure was prose-only and unreproducible. It also found MORE than R125
+reported, and the extra finding raises the round's stakes:
+
+- FK gone after CHECKPOINT+stop+start in db `postgres` AND in a
+  `CREATE DATABASE`d db (`fkdb`); table data intact (500/500, 50/50);
+  indexes (`parent_pkey`, `child_pkey`) survive.
+- **Referential integrity is SILENTLY UNENFORCED after the restart**: an
+  orphan `INSERT INTO child VALUES (99999, 99999, …)` is ACCEPTED.
+  Runtime enforcement reads the same `catalog.Table.ForeignKeys`
+  (`operators_fk.go:118`,`:170`) that no reload repopulates. So R126 is a
+  **correctness** fix that happens to unblock Q9 — not a planner nicety.
+  New prediction P1c: the orphan insert must FAIL after the fix, which
+  also guards against a reload that repopulates the synthesised view
+  instead of the planner/executor store.
+- PK uniqueness still holds (rides the index, not the constraint catalog).
+- **Separate gap, NOT this round**: `pg_constraint` returns 0 rows of ANY
+  contype post-restart, including the `'p'`/`'u'` rows the view
+  synthesises from indexes (`catalog.go:7143-7153`) even though those
+  indexes reloaded. A second reload gap suppresses the PK projection;
+  a successor round should chase it. Must not be conflated with the FK gap.
+
+Environment gotcha worth keeping: a data dir under the long scratchpad
+path makes `<datadir>/.goopg.ctl.sock` exceed the ~108-byte AF_UNIX limit
+and the server exits with `control listener: bind: invalid argument`
+AFTER logging "goopg listener bound" — it looks like a successful start.
+Use a short path (`/tmp/r126fk`) for throwaway clusters.
+
+**R126 scope rev 1 BLOCKed (4 disqualifying findings) — rev 2 written.**
+All four verified against source before accepting; two were positive
+claims *I* had made about the code, not omissions:
+
+1. **Write surface is FOUR sites, not one.** `ALTER TABLE … ADD FOREIGN
+   KEY` (`operators_ddl.go:9032-9125`) ends at `tbl.ForeignKeys =
+   append(…)` with **no catalog sync of any kind**, unlike its ADD
+   COLUMN/PK/UNIQUE siblings. HammerDB and step (d) both use the ALTER
+   form — so rev 1's `CREATE TABLE … REFERENCES` pin would have passed
+   green while the form that matters persisted nothing. P1/P1b now
+   REQUIRE the ALTER form.
+2. **My deletion citations were both wrong.** `syncConstraintCatalogRow`
+   (`:12859`) calls `deleteCatalogRowsForOID`, not
+   `deleteConstraintRowByOID`; the latter's only 3 call sites
+   (`:25628`,`:25753`,`:26105`) are ALTER/DROP DOMAIN. And
+   `deleteCatalogRowsForOID` (`:18095-18180`) stamps
+   1259/1249/2604/2611/2618 — **2606 absent**. Without stamping it every
+   delete-then-resync ALTER DUPLICATES the FK row; P3 (DROP-only) missed
+   it. Added an N-repeated-ALTERs check.
+3. **Reload main pass at `cat.DBOID()` was wrong** — both cited siblings
+   main at `DefaultDBOid`, and `loadStatisticsFromHeap`
+   (`open.go:3841-3854`) documents that `cat.DBOID()` left the default
+   DB's stats reload "DEAD in practice since M0112 … pg_class survives
+   that split only because DDL mirrors its pages to base/5". **2606
+   appears NOWHERE in `sys_catalog_postgres_db_mirror.go`.** Decision:
+   write via `tableCatalogHeapDBOid` + ADD 2606 to `mirroredCatalogOIDs`
+   + two-tier reload; flag the double-mirror check against the existing
+   explicit `mirrorConstraintCatalogFiles()` calls.
+4. **The descriptor swap would have corrupted the catalog.**
+   `PhysicalTypeIsVarlena` (`physical_align.go:85-107`) switches on
+   `t.Name` with **no `IsArray` arm**, so `{Name:"int2",IsArray:true}`
+   returns FALSE → `HEAP_HASVARWIDTH` unset on a row whose only varlena
+   is a non-null `conkey` → precisely the PG18 `nocachegetattr`
+   assert `codec.go:1550-1557` warns about by name. goopg's own
+   encode/decode both branch on `IsArray`, so they stay symmetric and a
+   round-trip pin passes while the infomask is wrong — **no rev-1 gate
+   could see it.** REVERSED to: keep the `int2[]`/`oid[]` names, write
+   pre-built ArrayType blobs via the **`KindBytes` passthrough that
+   already exists** (`codec.go:962-966` — my "would silently write an
+   EMPTY array" omitted it), add `int2[]`/`oid[]` decode arms. Decode is
+   the only genuine gap. `PhysicalTypeIsVarlena`'s missing `IsArray` arm
+   is a latent bug for ordinary user `int4[]` columns too — recorded,
+   NOT fixed here, deserves its own round + ledger row.
+
+Also corrected: rev 1's "2664-2667 stay bootstrap-empty" was copied from
+a stale in-code comment — M0133-S1 DOES bootstrap 2665/2666/2667
+(`initdb.go:1360-1372`); 2664 is unwritten; the real residual is no
+*runtime* index maintenance. And rev 1's P0 was known-true by
+construction (encode skips NULLs before alignment `codec.go:1591-1594`,
+decode on the bitmap `:1451-1455`, and every array value in both writers
+is `NullDatum`) — an md5 that cannot move is not a measurement. Replaced
+with an infomask + non-null-`conkey` round-trip check; old md5 demoted to
+a labelled regression guard.
+
+Two further findings folded in: a restored FK OID can be re-issued
+because startup's OID advance walks `cat.AllTables()` only
+(`open.go:1501-1506`) → new P6; and `condeferred` can only be tested via
+the CREATE form because the ALTER builder never sets `InitiallyDeferred`.
+
+**R126 scope rev 2 BLOCKed (3 findings) — rev 3 written.** All verified
+against source before accepting. Rev 2's defects were the same class as
+rev 1's, which is the notable part:
+
+A. **Rev 2 asserted a "verified" FOUR-site write surface; there are
+   SEVEN.** Missing: `execAlterTableAlterConstraint` (`:13436-13481`,
+   sets Deferrable/InitiallyDeferred/**NotEnforced**/**NotValid** then
+   `return nil`) — **the statement that sets `conenforced`**, the field
+   P2 says would re-break R125 if lost; `AlterTableValidateConstraint`
+   (`:9126-9175`, clears `NotValid`, no heap work) — a VALIDATEd FK would
+   silently revert to NOT VALID across restart; and
+   `AlterTableRenameConstraint`'s FK arm. **Fix is not a fifth/sixth/
+   seventh emit — it is the existing funnel**: `syncConstraintCatalogRow`
+   (`:12859-12872`) already stamps for every `tableCatalogDBOids(ctx)`
+   then re-syncs via `syncTableToCatalogHeap`, so once 2606 is stamped
+   and FK emission lands in the funnel, ONE call per mutator covers
+   ADD/DROP/ALTER/VALIDATE/RENAME uniformly. Enumeration was the wrong
+   technique — exactly the "sibling paths must agree" trap.
+B. **Rev 2's routing contradicted its own mandatory-ALTER-form rule.**
+   `mirrorTouchedCatalogsToPostgresDB` has ONE caller here —
+   `syncTableToCatalogHeap`, gated `heapDBOid == DefaultDBOid`
+   (`:18708-18713`) — which none of rev 2's bespoke write sites used. So
+   an ALTER-added FK would write base/1, never mirror, and a
+   `cat.DBOID()` main pass reading base/5 would find nothing: **the round
+   would have failed its own headline pin.** And the precedent rev 2
+   quoted refutes it — `pg_attrdef` IS in the mirror set (mirror line
+   203) yet `loadColumnDefaultsFromHeap` still mains at `DefaultDBOid`
+   (`catalog_heap_reload.go:222`). REVERSED: main at `DefaultDBOid` +
+   `ListDatabases` loop, reload NOT dependent on the mirror, 2606 in the
+   mirror set for standby readability only. Double-mirror checked and
+   harmless (`bytes.Equal` page skip, `:115-127`).
+C. **"A non-empty int2 ArrayType builder is needed" was false.**
+   `encodeArrayValuePGCtx` (`codec_array.go:61-110`) already builds it —
+   including the `construct_md_array` trailing-pad fidelity fix
+   (`:97-101`) that a hand-rolled builder would drop and that
+   `pg_column_size`/pg_amcheck can see. Rev 2 would have written a
+   second, worse transcription of the 24-byte layout. Also missed: a
+   naive `case "int2[]"` decode arm passes `elemName="int2[]"` to
+   `RenderTextStyled`, misses `ElemTypeInfo`, and **silently decodes
+   2-byte ints as varlena text** (`pgarray.go:277-280`) — the arm must
+   construct the ELEMENT-named type first.
+
+Also folded in: P0 could be masked if the FK builder copies the domain
+writer's `conbin = ""` convention (an empty text is a non-null varlena →
+`HEAP_HASVARWIDTH` set unconditionally → P0 passes whatever the
+descriptor says), so P0 now asserts `conbin = NullDatum` and covers
+single-column `conkey` too; P6 softened (the pg_control checkpoint
+advance runs earlier, so it is belt-and-braces not a demonstrated live
+bug); and `conpfeqop`/`conppeqop`/`conffeqop` staying NULL is recorded as
+a standby-visible divergence.
+
+Sizing: stays ONE round on the reviewer's condition that §3 collapse to
+the funnel, which rev 3 does. The codec work does not split out — two
+decode arms plus one call to an existing encoder, with no independent
+test surface (an FK row is the only producer).
+
+**R126 scope rev 3 APPROVE-WITH-NOTES.** Four notes folded in before cutting:
+
+1. **2606 stamp predicate specified**: decode via `PGConstraintColumnsPG18()`
+   and compare `decoded[8]`, NOT a hand-computed offset (`conrelid` is the
+   9th column behind a 64-byte `name`, offset ~80 — the existing
+   pg_attrdef `data[4:8]` / pg_inherits `data[0:4]` arms would tempt the
+   wrong style). And key on `conrelid` **AND `contype='f'`**: domain rows
+   carry `conrelid=0` so they are safe today, but **B3 adds `contype='c'`
+   table CHECK rows with a real `conrelid`**, and this funnel re-emits
+   only FK rows — a conrelid-only predicate would silently delete every
+   table CHECK row on the next ALTER the moment B3 lands.
+2. **VALIDATE CONSTRAINT is a deliberate exception to the funnel.** It
+   takes `ShareUpdateExclusiveLock` on purpose (`:9137`, citing PG's
+   `AlterTableGetLockLevel`) and does not conflict with concurrent DML;
+   the full funnel would delete+rewrite the table's whole catalog row set
+   AND re-insert index entries under that weak lock. So VALIDATE stamps
+   and re-emits only its own 2606 row. Sound because `convalidated` is
+   the only field it changes.
+3. **P5 given a mechanism**: `pg_amcheck` on 2606 after an FK is written
+   — this is the first non-null varlena ARRAY goopg will ever write into
+   a system catalog. (Was an unfalsifiable bound; the infomask half is
+   already carried by P0.)
+4. Two implementation checks + one free win: six `deleteCatalogRowsForOID`
+   call sites hardcode `DefaultDBOid` (`:24974`,`:25014`,`:25057`,
+   `:25104`,`:25349`,`:25401`) and become FK-stamping sites with fixed
+   routing once 2606 is in — confirm none reach a per-DB table; and
+   `operators_tx.go:376` cleans a rolled-back CREATE TABLE's FK row for
+   free once 2606 is in the set (name it so nobody "fixes" it later).
+
+Confirmed symmetric by review: `catalog.NamespaceDBOid` maps both 0 and
+`PostgresDBOid` to `DefaultDBOid` (`catalog.go:25095-25100`), so the
+funnel's write routing and the reload's main-pass+loop are the same
+function applied from both ends — a `postgres` connection writes base/1
+and the main pass reads base/1; a `CREATE DATABASE`d db writes
+base/<dbOid> and the `ListDatabases` loop reads the same. This is why
+rev 3's routing is sound where rev 2's was not.
+
+Also noted: renaming the PARENT table leaves the child's in-memory
+`fk.RefTable` stale (pre-existing `fkParentRel` bug) — the OID-keyed
+reload REPAIRS it at the next restart.
+
+## R126 (done) — FKs survive a restart, and so does enforcement
+
+Committed `fbf838c02`. Report: `r126-fk-persistence/REPORT.md`.
+**TPC-H 6/22 (measured this round), TPC-DS 2/99 — no plan moved and none
+was predicted.** Value: step (d) is now possible, and a silent
+correctness bug is gone.
+
+Gates: unit suites green; `go vet` clean; TPC-H spotcheck PASS (Q12=2,
+Q13=34); TPC-DS SF0.25 **PASS=96 MISMATCH=0**, plan-shape **99/99 same**;
+pg_constraint heap bytes identical on a fresh initdb; TPC-H parity
+`match=6 shapediff=14 unparsed=0 missingnode=2` (artefact
+`r126-tpch.plans.txt`). `make plan-gate` FAILS 20/22 **and fails
+identically on the R125 binary** — verified by re-running it against
+`goopg-r125` on the same data dir; it diffs goopg against PG, so it
+cannot pass until this workstream's goal is met.
+
+**The implementation review found two more instances of THIS ROUND'S OWN
+BUG**, both fixed and mutation-verified:
+- **ATTACH PARTITION** clones the parent's FKs onto the child *after* the
+  child's `syncTableToCatalogHeap` already ran (`operators_fk.go:615` vs
+  the sync ~15 lines earlier), so every attached partition silently lost
+  referential enforcement across a restart. The eighth mutator — the
+  scope had listed partition ATTACH as an implementation-time check.
+- **`resolveFKCatalogKeys` hardcoded `Schema:"public"`**, so an FK whose
+  parent lived in another schema was never persisted **while the
+  synthesised view kept displaying it**. Fixed with
+  `LookupTableByNameAnySchema`, which declines on cross-schema ambiguity
+  rather than guessing a parent.
+
+Also fixed: the `stamp-then-rewrite` idiom swallowed
+`MaterializeWriterXID` errors at BOTH `syncConstraintCatalogRow` and
+`resyncForeignKeyCatalogRow` — harmless while every rewritten row was
+keyed by table OID, but FK rows are APPENDED, so a skipped stamp
+duplicates them (the failure P3 exists to prevent, invisible to tests
+because the error never fires in the harness). Four silent `continue`s
+now `slog.Warn`, and an unresolvable `confdelsetcols` now declines on
+BOTH sides rather than widening `ON DELETE SET NULL (a)` to the whole key.
+
+**Seven restart pins** (`internal/initdb/fk_restart_test.go`), all in the
+ALTER form. This is the round's most durable artefact: the bug existed
+because nothing in the suite crossed an `Open→Close→Open` boundary with
+an FK declared, and a CREATE-form test would have passed against the
+broken code.
+
+### Carried into step (d) — read before scoping it
+
+1. **Why three FK-sensitivity fixtures all failed to move.**
+   `keysCovering` tries an **index** arm BEFORE the FK arm
+   (`joinrelsize.go:645-655`): any unique index whose columns are a
+   subset of the join columns already gives the exact clamp. Every
+   fixture gave the parent a PRIMARY KEY on the join columns, so the FK
+   arm was redundant *by construction*. A discriminating fixture needs a
+   parent with **no unique index on the referenced columns** — goopg's
+   ADD FOREIGN KEY does not require one, unlike PG. **This also means the
+   eight TPC-H FKs may move nothing: `lineitem→partsupp` references
+   `partsupp`'s PK, so the index arm already fires.** Size step (d)
+   against that before spending a load.
+2. **P1's "reaches the estimator" is composition, not measurement.** The
+   view iterates `tbl.ForeignKeys` so rendering proves the field is
+   populated; `keysCovering` reads the same field; R125 pinned that path.
+   But P1c (enforcement) is **not** an independent witness — it resolves
+   the parent with a normalising `im.LookupTable` while `fkParentRel`
+   does a raw case-sensitive byte compare (`joinrelsize.go:760`).
+3. **No in-process pin crosses a DATABASE boundary** — the harness's
+   parser rejects `CREATE DATABASE` (a dispatch-layer statement), so the
+   per-DB routing step (d) rides has manual psql evidence only.
+
+### Follow-ups this round created
+
+- `PhysicalTypeIsVarlena` has no `IsArray` arm — latent for ordinary user
+  `int4[]` columns, not just catalogs. Deserves its own round + ledger row.
+- `pg_constraint` returns 0 rows of ANY contype post-restart, including
+  `'p'`/`'u'` synthesised from indexes that demonstrably survive — a
+  SECOND, independent reload gap. Not conflated with the FK gap.
+- `catalog.ForeignKey` should carry the parent's OID, not an unschemed
+  name. Both sides already compute it; it retires the ambiguity decline,
+  `fkParentRel`'s fragile byte compare, and rename staleness at once.
+- An in-process per-DATABASE restart pin (blocked on the harness).
+- The six `deleteCatalogRowsForOID` sites that hardcode `DefaultDBOid`
+  are now FK-stamping sites with fixed routing; confirm none reach a
+  per-DB table.
+- Free win, named so nobody "fixes" it: `operators_tx.go:376` cleans a
+  rolled-back CREATE TABLE's FK row automatically now.
+- R125 §7's 32.17s FK-validation figure is STILL un-remeasured; it is the
+  input to "step (c) is optional", so step (c)'s scope inherits it.
+
+## Step (d) recon — THE FK CHAIN IS A NO-GO FOR PLAN PARITY
+
+Recon only (throwaway `cp -a` clone at /tmp/r127clone, port 5533,
+deleted; shared corpus untouched). Full writeup:
+`r126-fk-persistence/step-d-recon-fk-chain-is-a-no-go.md`.
+
+**Declaring all eight TPC-H FKs changes TPC-H parity NOT AT ALL:
+match=6 both with and without.** `join-order` stays 14 — the category the
+entire chain was aimed at. Three categories tick the WRONG way
+(join-method 10→11, scan-type 9→10, qual-placement 4→5).
+
+The machinery works: all 8 declared `NOT VALID` sub-second on the real
+SF=1 corpus, `conkey` arrays correct incl. the two-column `{8,5}` — R125
+(O(1) instead of ~2 weeks) + R126 (they persist) delivering end to end.
+
+**Q9, the target:**
+```
+no FKs : [join-order]                                    rows=122   cost=109733
+8 FKs  : [join-order,join-method,scan-type,qual-placement] rows=5000 cost=374413
+   PG  :                                                  rows=60125 cost=139669
+```
+The FK arm IS live and is **NOT** redundant with `keysCovering`'s index
+arm — the reviewer's hypothesis is REFUTED. `partsupp_pk` is unique on
+exactly the join columns and an instrumented `keysCovering` confirms the
+index arm sees it (`partsupp … indexes_default_dbOid=3`), yet the FK
+still moves the estimate 41x closer. The arms are not interchangeable:
+the index arm gives an upper BOUND, which cannot bind on an
+under-estimate; the FK arm gives the SELECTIVITY that raises it.
+
+**But the better cardinality makes the plan WORSE** — one divergent
+dimension becomes four, cost triples. R125's reviewer warned that a
+corrected cardinality need not change shape; it changed shape, away from
+PG.
+
+**Do not scope step (d) as a parity round.** R125/R126 stand on their own
+(R126 fixed a silent correctness bug), but the parity thesis behind them
+does not survive measurement. **The real lead is now the question this
+raises: why does a MORE accurate Q9 cardinality produce a LESS PG-like
+plan?** That points at the cost model or the join-order search, not at
+missing FK evidence — and `join-order` is TPC-H's largest category (14)
+and TPC-DS's (90).
+
+### NEW BUG found during the recon (pre-existing, not R126)
+
+`ALTER TABLE … DROP CONSTRAINT <fk>` **reports success and does nothing**
+on a non-default database:
+```
+ALTER TABLE nation DROP CONSTRAINT nation_region_fk;  --> ALTER TABLE
+SELECT count(*) ... WHERE contype='f';                --> 8   (unchanged)
+```
+`InMemory.DropForeignKeyConstraint` hardcodes
+`tableByOID(tableOID, DefaultDBOid)` (`catalog.go:22241`) and returns
+false when that misses; `execAlterTableDropConstraint` discards the
+result and returns nil (`operators_ddl.go:13275`). Same
+hardcoded-`DefaultDBOid` family as the bug R126's review caught in
+`resolveFKCatalogKeys`; `HasPrimaryKey` (`catalog.go:22261`) has it too.
+**Second per-DB defect in two rounds, and exactly the gap R126's reviewer
+named** (no in-process pin crosses a database boundary). R126 makes it
+worse in effect: an FK that cannot be dropped now also survives restarts.
+
+Because of this the same-epoch A/B could not be completed — the drop arm
+was void. **The match count (6) is robust** across every capture in this
+workstream; the per-category deltas and Q9's exact cost are INDICATIVE,
+not pinned. Re-measure after the DROP bug is fixed if they need to bear
+weight.
+
+## R127 — WITHDRAWN (premise refuted on disk six rounds earlier); replaced by FRONTIER.md
+
+FK chain closed as a no-go, so the next target is chosen from the parity
+data rather than from a thesis. Scope: `r127-semijoin-selectivity/SCOPE.md`.
+
+**Ranking the 22 TPC-H queries by divergent-category count** (from the
+committed `r126-tpch.plans.txt`):
+- 0: Q1 Q6 Q11 Q14 (+Q15a) — MATCH
+- 1: Q10 (rendering, already MATCH); **Q9 (join-order)**
+- 2: **Q4 (aggregation-strategy, sort-strategy)**
+- 3: Q12 Q13 Q17 Q22 — 4: Q16 Q19 Q2 Q21 Q5 Q7 — 5: Q18 Q20 Q3 — 7: Q8
+
+**Q9 is closest but is a documented no-go** (M0126: "cost-driven Q9 MHJ
+cannot be cost-forced", final no-go after the -0013 penalties broke Q5).
+Not reopened.
+
+**Q4 chosen.** Its two categories are ONE decision — hashed aggregation
+forces a Sort ABOVE, sorted aggregation puts the Sort BELOW — so fixing
+the choice clears both. The pair is also the broadest non-join lever:
+`aggregation-strategy` in 10 of 22 queries, `sort-strategy` in 9, nearly
+always together (Q3 Q4 Q5 Q12 Q13 Q18 Q21 Q22).
+
+Q4's difference is perfectly isolated — the join subtree is IDENTICAL
+(same Nested Loop Semi Join, same index, same Index Cond and Filter):
+```
+goopg:  Sort -> HashAggregate -> NL Semi Join
+PG:     GroupAggregate -> Sort -> NL Semi Join
+```
+
+**Checked before theorising** (the `planner_verify_both_candidates_generated`
+lesson): **both candidates ARE generated.** `groupingpaths.go` emits the
+hashed arms (`:367`,`:384`) AND a real sort-then-group arm —
+`sortPathForBounded(...)` then `addPath(AggStrategySorted, Children:
+[sortedInput])` (`:432-440`). So this is a COST problem, not a missing
+producer. (The index-ordered no-Sort arm at `:424` is separate.)
+
+**Hypothesis, to be killed or confirmed BEFORE any edit:**
+| | goopg | PG |
+|---|---|---|
+| Seq Scan orders | 57,057 | 57,554 |
+| NL Semi Join | **57,057** | **13,628** |
+| subtree cost | 490,258 | 192,514 |
+
+goopg's semi-join estimate EQUALS its outer scan's row count exactly —
+the EXISTS is estimated to filter nothing — so a 4.2x larger input makes
+the Sort look 4.2x dearer and the hashed arm wins.
+
+**Stated up front because it is uncomfortable: goopg's estimate is
+probably the MORE ACCURATE one** (TPC-H Q4 at SF=1 really passes ~52k of
+57k orders; PG's 13,628 is a big under-estimate). So the round is
+"reproduce PG's selectivity formula", not "fix a wrong number" — which is
+exactly what the goal asks for, since slower/worse-estimating plans are
+not regressions when the target is PG parity.
+
+**Two hypotheses were refuted by measurement in the previous hour** (the
+index-arm-dead theory and the FK-redundancy theory), so §5 makes the
+diagnosis a GATE: instrument the producer, record BOTH candidate costs,
+and prove arithmetically that PG's input rows would flip the winner —
+before writing any fix. If it would not flip, the scope is rewritten.
+
+No prediction that the other 9 aggregation-strategy queries improve: a
+shared category label is not a shared cause (R122/R123/R124 each found
+the opposite).
+
+### R127 WITHDRAWN — and the process failure that produced it
+
+Review BLOCKed the R127 scope on nine findings, three fatal. **The scope
+is withdrawn, not revised**: `r127-semijoin-selectivity/SCOPE-WITHDRAWN.md`.
+
+**My failure:** the goal says to read TODO.md *および同ディレクトリ配下の
+ドキュメント*. I read R120–R126 and recent commits, and scoped a Q4 round
+without opening ANY of the **eight prior Q4 rounds** (R71 R72 R73 R74 R77
+R78 R79 R81). This directory has **125 round directories**.
+
+Everything that killed the scope was already on disk:
+1. **R71 already ran R127's central experiment**, forcing Q4's semi rows
+   to 57,066 / 30,000 / 13,490 (PG) / 3,439 — "**NO election change at
+   any point. Rows theory DEAD.**" My P2 was a refuted hypothesis.
+2. **R78 already bounded the fix**: goopg HAS `eqJoinSelectivitySemi`
+   (`joinselectivity.go:764`); wiring it to Q4 gives `wouldBe=44654` —
+   **1.28x**, not the 4.2x my table assumed. R78 closed BLOCKED on it.
+3. **R81 located the real decision point**, which my scope would not have
+   instrumented: not the grouping producer but `electOrderedGrouping`
+   (`upperorderedgrouping.go:148`), where goopg's startup ratio 1.0086
+   sits INSIDE `stdFuzzFactor=1.01` → tie-break → hashed, while **PG's
+   1.0118 is outside → sorted wins**. The lever is a ratio crossing 1.01.
+4. My causal story was arithmetically impossible (`costAgg` gives both
+   strategies the same tail terms; they differ by exactly the Sort, so
+   scaling rows cannot flip the sign — only the fuzz ratio).
+5. **My M0126/Q9 citation was stale**: M0126 closed a default-off MHJ
+   fusion flag whose node was deleted by M0127-P6.2, NOT Q9 in the
+   default planner. I used it to exclude Q9 while citing the document
+   that names Q9 as "the real lead".
+
+## FRONTIER — the two closest queries share ONE blocker
+
+`r127-semijoin-selectivity/FRONTIER.md`. Read before scheduling anything.
+
+**Q4 and Q9 both block on widths, and on nothing else first:**
+- Q4 (R81): election decided by a startup ratio vs the 1.01 fuzz band;
+  **widths dominate rows** — semi output 448 vs PG's 16, "widths ratio
+  28x EXCEEDS the rows ratio 16.6x". R81's unblock condition (i) is
+  **DatumBytes/projection pushdown — "neither exists"**.
+- Q9 (R69 §6, after the NLI audit): "Slice (b) width/footprint — **now
+  the load-bearing half of Q9**". R77 closes: "Next: rows/width program".
+
+**And the width program was already attempted: R120–R124, measured
+parity-neutral** (R124: 22 of 32 narrowed rels produced zero cost
+movement). The distinction never crossed: R120–R124 narrowed what the
+COST MODEL IS TOLD; R81's blocker is narrowing what the EXECUTOR
+PRODUCES. Corroborated by `goopg_optimizer_no_attr_needed_no_ios_path`:
+"inside a join tree there is no Project above the scan at all" — there is
+nowhere to hang a projection today.
+
+**Every cheaper lever at these two queries is now measured and rejected:**
+rows-only on Q4 (R71), semi-selectivity wiring (R78, 1.28x),
+FK evidence on Q9 (this session, match=6 unchanged), cost-input
+narrowing corpus-wide (R124, parity-neutral).
+
+So the next scheduler chooses deliberately between:
+(a) **build projection pushdown / DatumBytes** — infrastructure, the
+    shared dependency, no parity prediction on its first slice; or
+(b) accept TPC-H parity is capped near 6–7/22 until it exists, and
+    redirect at categories that do not depend on it.
+
+Not by picking the next plausible-looking query.
+
+**Standing hazard for this directory:** 125 rounds. Before scoping round
+N, `ls` the directory and grep prior rounds for BOTH the target query and
+the target mechanism. Recent-commit context is demonstrably insufficient.
+
+## R128 (scope) — parity work already built, measured, and switched OFF for a cost this goal disclaims
+
+Scope: `r128-parity-over-throughput/SCOPE.md`. Found by following R38's
+resume point ("check whether minimize_datum has moved DatumBytes") into
+`docs/design/not_ralph/minimize_datum/TODO_ALL.md` — i.e. the interrupted
+work of another worker, which the goal instructs me to pick up.
+
+**The observation.** The goal states 実行時間が延びてしまうことは
+regressionとはとらえません. Several changes here were implemented,
+measured, shown to move plan parity TOWARD PG, and then reverted or
+defaulted OFF **explicitly and only because they cost throughput**. They
+were judged under a performance goal; under this goal that judgement
+inverts. This round re-adjudicates finished work against the correct
+objective rather than inventing anything.
+
+**Measured this round** (live TPC-H corpus, same binary, estimate-audit
++ pg-plan-parity-diff):
+
+| | match | join-method | scan-type |
+|---|---|---|---|
+| `GOOPG_NARROW_COST_INPUTS` OFF (HEAD default) | 6 | 10 | 9 |
+| **ON** | 6 | **9** | **8** |
+
+Two category-instances strictly toward PG; nothing rose; no query flips
+to MATCH, so the headline stays 6/22. Stated as progress along the goal's
+metric, NOT as a win.
+
+**The rest of the reverted bundle** (`minimize_datum/TODO_ALL.md`
+~2900-2990), all reverted on cost alone:
+- cost-side narrowing (`take3-D-05-costside-unnarrowed`): cost side
+  agrees with the executor (Q9 orders 530.3→120.0 B/row), values 24
+  MATCH, TPC-DS PASS=95, **"moves plan parity toward PG"** — **+10.3%**.
+- bucket charge `MapSlotBytes` 48→96: bucket heap 586.7→286.0 MB,
+  per-worker peak −34.5%, values 24/24 MATCH — **+10.4%**, Q14 flipped.
+- build-cost charge: **+22.3%**; and "They did not lose a build-side
+  choice — they lost PARALLELISM".
+
+Two ledger facts that matter: `MapSlotBytes = 48` is documented **"KNOWN
+2x LOW … a hand-derived guess, not a measurement"** (go1.25 swisstable
+measures 96.1 B) with "do not read 48 as validated"; and the coupling is
+already resolved — "with it applied, the bucket-charge patch no longer
+flips Q14 … prerequisite #2 is unblocked but free."
+
+**Cut, in dependency order:** (1) flip `GOOPG_NARROW_COST_INPUTS` default
+ON; (2) then evaluate `MapSlotBytes` 48→96 on top (ledger says unblocked
+and free once (1) is in; patch preserved at
+`tmp/d05p2-bucket-charge.patch`); (3) build-cost charge **NOT** in this
+round — it loses PARALLELISM, which is TPC-DS's second-largest category
+and needs its own measurement.
+
+Bars: P3 **values unchanged is the real gate** (correctness is NOT
+disclaimed by the goal); P2 TPC-DS must not regress (R124 recorded 3
+TPC-DS shape changes from this chain — re-adjudicate ON-by-default, do
+not carry); P4 the ~+10% throughput cost must be MEASURED AND REPORTED,
+not hidden. No prediction that match rises above 6 — §1 already measured
+that it does not.
+
+### R128 scope rev 1 BLOCKED (2 fatals) → rev 2 APPROVED
+
+**Fatal 1 — my framing was refuted by the document I quoted, and my own
+memory already held the refutation.** Rev 1 said the D-05 changes were
+reverted "explicitly and only because they cost throughput", so this
+goal's disclaimer inverts the judgement. `TODO_ALL.md:2886-2890` actually
+says "**the last three all failed on ONE mechanism: goopg's cost model
+has no parallel dimension**", and `:4724` "Q5/Q9/Q10 **lost
+PARALLELISM**, not a build side". A lost Gather is a plan-shape
+divergence — `parallelism` is a first-class category
+(`pg-plan-parity-diff.py:98,822-828`) — so the recorded cost was a
+**PARITY** cost, which this goal does NOT disclaim. Memory entry
+`goopg_costmodel_has_no_parallel_dimension` records exactly this; I had
+it and did not apply it. Bundle framing deleted, not repaired.
+
+**Fatal 2 — I conflated two implementations.** `take3-D-05-costside-
+unnarrowed` (`deferral_ledger.md:2105`) is the DEFERRAL; the measured
+artefact is `tmp/d05p3-costside-narrow.patch`; R121 is the successor
+implementation. My own numbers prove they differ: the D-05 patch flipped
+Q5/Q7/Q9/Q10 build sides and moved join-method 12→10, scan-type 11→10;
+the flag moves 10→9, 9→8 and raises nothing. So the "no longer flips
+Q14" coupling was measured with the OTHER patch underneath. **`MapSlotBytes`
+48→96 CUT to a follow-up**, and the "≈+10%" figure deleted — this flag's
+SF=1 throughput is UNMEASURED (only datum: `r124:233` SF0.25 +2.2%,
+confounded by census stderr).
+
+**The warrant I failed to cite in rev 1**: `r124/REPORT.md:177-184`
+already handed this decision forward — "Keep default-off … Promotion is
+therefore a judgement … and **it should be taken deliberately rather than
+as a side effect of this round**." R128 is that decision round.
+
+**Why cutting MapSlotBytes is decisive, not tidy** (review): bundling
+destroys attribution (both re-price corpus-wide), and the bundled failure
+mode is **losing a MATCH** — 48→96 flipped **Q14**, which is one of the
+current six. Worst case 6/22 → 5/22 in a round warranted by "+2
+categories, no match flip".
+
+**Artefacts committed** (R123's standing requirement, which rev 1 missed):
+`tpch-narrow-{OFF,ON}.plans.txt`, `parity-{OFF,ON}.txt`. Both read
+`parallelism=0` — the D-05 killer mechanism measured NOT to fire here.
+
+**FRONTIER.md corrected in the same commit** (:52-62, :81-84): it said the
+narrowing chain was "parity-neutral, R124". R124's INCREMENT was neutral;
+R122's two categories are real. The true half (no MATCH flip, so Q4/Q9
+stay blocked) is kept.
+
+Gates hardened per review: P2 needs a plan-TEXT diff (the category counter
+is "structurally incapable" of seeing Q6/Q64/Q75-class changes,
+`r124:101-116`); P3 adds an SF=1 execution pass (the accepted
+planner-below-executor divergence is the OOM direction, and Q21 has OOMed
+at SF=1 before); P5 is `make plan-gate`, whose R124 reasoned-omission is
+annihilated by the flip.
+
+## R128 (done) — `GOOPG_NARROW_COST_INPUTS` promoted to DEFAULT ON
+
+Report: `r128-parity-over-throughput/REPORT.md`. The promotion decision
+R124 handed forward by name, taken.
+
+**TPC-H `join-method` 10 → 9, `scan-type` 9 → 8.** match stays **6/22**,
+no query flips, `parallelism` stays 0 — predicted and confirmed.
+
+**The throughput cost is +0.2%, not the ~10% rev 1 assumed** (74.17s →
+74.33s over 24 SF=1 labels; Q19 −25.7%, Q3 +29.1%). The ~10% belonged to
+`tmp/d05p3-costside-narrow.patch`, a different implementation. The round
+was scoped to ACCEPT a 10% hit under the goal's runtime disclaimer and
+did not need to spend it.
+
+Cut: parser inverted `v == "1"` → `v != "0"` (`narrowcostinputs.go:51-53`),
+matching the `GOOPG_NARROW_*` opt-out family; the contract test inverted
+and RE-PINNED in both directions rather than deleted; `flaglabels.go`'s
+"this one is opt-IN" comment rewritten (it would otherwise contradict the
+code) while keeping the still-true distinction — it is the only flag in
+the family gating a planner COST input rather than executor SHAPE;
+`planner-flags.env` regenerated to `unset(on)`. **No planner logic
+changed** — only which arm runs by default.
+
+Gates: optimizer+executor suites green, `go vet` clean, flag-provenance
+test green; TPC-H spotcheck PASS (Q12=2, Q13=34); **SF=1 values 24/24
+MATCH** ("matched on values, not merely on row count", no OOM — required
+because this flag makes R124's planner-below-executor divergence the
+shipped default); TPC-DS SF0.25 PASS=96 MISMATCH=0; `make plan-gate`
+20/22 **unchanged** from the R125/R126 binaries on the same data dir.
+No pinned flag expectation in `ci/batch/` or the capture/sweep scripts.
+
+**P2 turned up a measurement trap worth reusing.** The raw TPC-DS SF=1
+diff showed SIX changed queries; **Q36/Q70/Q86 are spurious** — they are
+the three unplannable queries and `methodology/capture-tpcds.sh` embeds
+`$$` in its temp filename, so their ERROR TEXT carries the psql PID
+(`parity-capture-587413.sql` vs `…586757.sql`). **Strip the PID before
+reading any TPC-DS diff.** The three real changes — Q64 (Nested Loop
+subtree), Q75 (HashAggregate/HashSetOp/Hash Left Join), Q95 (**Hash Join
+→ Merge Join**, width **564 → 16**) — are all **parity-neutral**:
+same-epoch OFF vs ON gives identical match AND identical counts in all
+nine categories.
+
+Trade, recorded rather than sold as a free win: +2 TPC-H
+category-instances, against every plan pin re-baselined, 3 TPC-DS shapes
+moved for no TPC-DS gain, +0.2% runtime, and R124's accepted
+planner-below-executor divergence becoming **shipped default behaviour**
+(the SF=1 execution pass is evidence it does not bite today; the debt is
+assumed, not discharged).
+
+**NOT in this round, deliberately:** `MapSlotBytes` 48 → 96 ("KNOWN 2x
+LOW … do not read 48 as validated"). Its "no longer flips Q14" coupling
+was measured with the D-05 patch underneath, not this flag. Bundling
+would destroy attribution and its failure mode is **losing a MATCH** —
+48→96 flipped **Q14**, one of the current six. That round now has a clean
+baseline: flag default-ON as the floor, `tmp/d05p2-bucket-charge.patch`
+on top, one pre-registered prediction that Q14 holds MATCH.
+
+## R129 recon — the bucket charge is parity-INERT. Round NOT scoped.
+
+Recon only (one-line `MapSlotBytes` 48→96 probe, temp binary, reverted;
+tree clean). Writeup:
+`r128-parity-over-throughput/r129-bucket-charge-recon.md`.
+
+R128 cut this to a follow-up and left it a clean baseline. Measured on
+that baseline, it **moves no plan on TPC-H at all**: cost-stripped shapes
+IDENTICAL, every category unchanged, match 6/22.
+
+| | match | join-method | scan-type | Q14 |
+|---|---|---|---|---|
+| MapSlotBytes=48 (shipped) | 6 | 9 | 8 | MATCH |
+| MapSlotBytes=96 (corrected) | 6 | 9 | 8 | MATCH |
+
+Two things settled:
+1. **The historical blocker is gone**, confirmed on current code: the
+   ledger's "no longer flips Q14" coupling was measured against
+   `d05p3-costside-narrow.patch`, a different implementation — it now
+   reproduces against the shipped default. R128's cut-it-to-protect-Q14
+   argument was a correct precaution that does not fire in practice.
+2. **No parity reason to land it.** `MapSlotBytes = 48` IS wrong ("KNOWN
+   2x LOW", go1.25 measures 96.1 B) and correcting it is worth real
+   memory (bucket heap 586.7→286.0 MB, per-worker peak −34.5%) — but
+   that is memory accuracy, not plan parity, so it belongs to the
+   `minimize_datum` workstream that owns it.
+
+**Scoping fact if anyone does land it: the preserved patch is STALE and
+does NOT apply** (fails on `hashsize.go:51`, `join_batch.go:208`,
+`pathtarget_test.go:1350`). It is 197 lines across 5 files, not the
+one-constant edit its name suggests, and its `Choose`/`join_batch`/
+`entrywidth` parts have UNMEASURED interaction with R128's now-default
+narrowing.
+
+Measured-and-rejected levers at the two closest queries now number five:
+rows-only on Q4 (R71), semi-selectivity wiring (R78, 1.28x), FK evidence
+on Q9 (step-d recon), cost-input narrowing (R128 — real, +2 categories,
+no flip), and the bucket charge (inert, this recon). **The frontier is
+unchanged: Q4 and Q9 both block on projection pushdown / DatumBytes,
+which does not exist.**
+
+## R130 — WITHDRAWN at rev 3; the ground truth inverts the question
+
+Scope: `r130-q9-joinorder-remeasure/SCOPE.md`. **Measurement only**, R53 /
+R68 precedent; no planner, executor or costing change.
+
+**Why now: the last measurement is 5.7x stale.** Q9 is TPC-H's closest
+non-match — the ONLY query diverging on a single category
+(`join-order`); Q4 is next at two. R70 Step-A (2026-09-11) priced its
+hash-vs-NLI contest at **543,226.39** on a 41-col/461-varB build.
+Measured on the committed post-R128 capture, Q9 is now **94,913** and
+**NLI won throughout** — the orientation R70 priced is gone. PG's Q9 is
+139,669, so **goopg is now CHEAPER than PG on its own cost scale**, a
+different regime from the one every prior Q9 round reasoned in.
+
+**Both routes R70 pointed at are closed or unbuilt — checked, not
+assumed:**
+- **DatumBytes is not merely unbuilt, it is DECLINED.**
+  `unsafe.Sizeof(executor.Datum)` measures **48 bytes** today, so
+  `hashsize.DatumBytes = 48` is CORRECT, not a stale constant (I probed
+  it). And `minimize_datum/README.md` opens **"Status: NOT APPROVED TO
+  START"** — take3 declined `Datum` re-layout below 48 B, and the new row
+  representation has **"no stated re-proposal path at all"**.
+- **Projection pushdown does not exist** (R70: "no such machinery
+  exists — needs its own feature round"), corroborated by
+  `goopg_optimizer_no_attr_needed_no_ios_path`.
+
+So the two routes are one closed at project level and one unbuilt, while
+the thing R70 measured moved 5.7x. Re-measuring is the only action that
+distinguishes "still blocked on widths" from "the regime changed" — and
+that distinction decides whether the projection-pushdown programme is
+worth its (large) cost.
+
+**Correction carried:** M0126 does NOT cover Q9's current divergence. It
+closed `GOOPG_COST_DRIVEN_JOINORDER` MHJ *fusion*, a default-off flag
+whose node was deleted by M0127-P6.2 (`estimateMultiHashJoin` gone).
+Q9's `join-order` divergence today is in the DEFAULT planner. R127's
+scope was withdrawn partly for mis-citing this.
+
+Predictions: P1 locate the divergent level with both candidates' costs
+and the margin; P2 say explicitly whether it is SIZING or PRICING (R53's
+question); P3 answer **with a number** whether widths still dominate,
+rather than inheriting R70's cliff (avgVar≈48, measured before narrowing
+became the default); P4 instrument inert on >=4 queries. **No prediction
+that Q9 moves, and no code change** — a Step-0 that promises a fix is the
+failure R53/R68 were written to avoid.
+
+### R130 outcome — WITHDRAWN, and the finding is worth more than the round
+
+Three revisions, three blocks, and the third block's binding condition
+settled it. Writeup:
+`r130-q9-joinorder-remeasure/GROUND-TRUTH-INVERTS-THE-QUESTION.md`.
+
+**Q9's actual output is 175 rows** (`r128-.../sf1-values-{ON,OFF}.txt`,
+identical both arms). Against the estimates everyone has been reasoning
+about:
+
+| | estimate | vs actual 175 |
+|---|---|---|
+| goopg, no FKs | 122 | **1.4x low** |
+| goopg, current default | 97 | 1.8x low |
+| goopg, 8 FKs | 5,000 | 28.6x HIGH |
+| **PG 18.3** | **60,125** | **344x HIGH** |
+
+**"A more accurate Q9 cardinality produces a less PG-like plan" is
+FALSE.** The FK arm moved the estimate from 1.4x low to 28.6x high — 20x
+FURTHER from truth. A worse estimate produced a worse plan; there is no
+paradox. R126's recon said "41x closer to PG" and rev 3 read that as "41x
+more accurate". **Closer to PG is not more accurate when PG is 344x out.**
+Same subterm-vs-total family as rev 1's error: an estimate compared to
+another estimate instead of to ground truth. (R125's "ground truth
+318,748" is a DIFFERENT node — the contested join, not the top node.)
+
+**The reframing, which is bigger than Q9:** on this query goopg's
+estimator is dramatically BETTER than PG's (1.4x vs 344x). So Q9's
+join-order divergence is partly goopg estimating *well* where PG
+estimates catastrophically, and correctly choosing differently.
+**Matching PG's plan on Q9 may require reproducing a 344x PG estimation
+error.** The goal accepts slower plans; it says nothing about adopting
+PG's mistakes. That is a question for the goal's owner, recorded not
+resolved.
+
+**Three process rules this round earned:**
+1. **Read the whole document.** Rev 2 quoted `TODO_ALL.md:2837` and
+   missed `:2895`, which refutes it 58 lines below — these trackers
+   self-correct in place.
+2. **`git log -S` the mechanism before scoping a cut from a dated
+   finding.** Rev 2's cut had landed 642 commits earlier (`2e15b8ca3`),
+   whose message says "AND IT BUYS NOTHING" and whose file carries a
+   comment headed "WHAT THIS DOES NOT BUY".
+3. **Never compare an estimate to another estimate.** State the actual.
+   Three documents here reasoned about goopg-vs-PG estimate gaps without
+   one.
+
+Also carried from review, unused but true: the FK knob is not a clean
+cardinality knob — `joinrelsize.go:25-27` says a declared FK **removes
+its covered clauses**, so `qual-placement` has a direct non-cardinality
+explanation; and the isolated knob would be a forced-rows SWEEP (>=4
+values, R71's design) at the joinrel in `joinrelsize.go` with FKs OFF,
+not `cardinality.go:239` (that is the NLI arm, which Q9's contested hash
+join never reaches).

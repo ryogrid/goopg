@@ -26,7 +26,7 @@ func makeColRefBinding(name string, cumIdx int, srcIdx int16) *ColumnRef {
 func TestPartitionConjunctsSplitsByBinding(t *testing.T) {
 	// Two bindings: t0 has 3 cols (offsets 0..2); t1 has 2 cols
 	// (offsets 3..4). cumOffsets = [0, 3, 5].
-	cumOffsets := []int{0, 3, 5}
+	cumOffsets := spansFromCumulative([]int{0, 3, 5})
 	t0col0 := makeColRefBinding("a", 0, 1) // t0.a
 	t0col1 := makeColRefBinding("b", 1, 1) // t0.b
 	t1col0 := makeColRefBinding("x", 3, 2) // t1.x
@@ -51,16 +51,18 @@ func TestPartitionConjunctsSplitsByBinding(t *testing.T) {
 }
 
 // TestPartitionConjunctsSubqueryStaysJoinSide pins
-// design 01 §3.1.3: predicates with SubqueryExpr /
-// ExistsExpr / OuterColumnRef / InExpr-with-Plan are
-// INELIGIBLE for local attachment.
+// design 01 §3.1.3: predicates with a CORRELATED SubqueryExpr /
+// ExistsExpr / InExpr-with-Plan, or an OuterColumnRef, are
+// INELIGIBLE for local attachment (an uncorrelated sublink is a
+// base restriction since M0146-0002e — see
+// TestPartitionConjunctsUncorrelatedSublinkIsLocal).
 func TestPartitionConjunctsSubqueryStaysJoinSide(t *testing.T) {
-	cumOffsets := []int{0, 3}
+	cumOffsets := spansFromCumulative([]int{0, 3})
 	col := makeColRefBinding("a", 0, 1)
-	// `a IN (subquery)` — InExpr with Plan != nil.
+	// `a IN (correlated subquery)` — InExpr with Plan != nil.
 	subq := &InExpr{
 		Operand: col,
-		Plan:    &SeqScan{Table: &catalog.Table{Name: "x"}},
+		Plan:    correlatedPlan(),
 	}
 	conjuncts := []Expr{subq}
 	jc, locals := partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
@@ -82,10 +84,46 @@ func TestConjunctIsLocalEligibleNestedSubquery(t *testing.T) {
 	expr := &BinaryOp{
 		Op:    parser.OpGt,
 		Left:  col,
-		Right: &SubqueryExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}},
+		Right: &SubqueryExpr{Plan: correlatedPlan()},
 	}
 	if conjunctIsLocalEligible(expr) {
-		t.Error("BinaryOp wrapping a SubqueryExpr should be ineligible for local attachment")
+		t.Error("BinaryOp wrapping a correlated SubqueryExpr should be ineligible for local attachment")
+	}
+}
+
+// TestPartitionConjunctsUncorrelatedSublinkIsLocal pins M0146-0002e:
+// PG distributes a restriction by the relids of its Vars
+// (distribute_qual_to_rels), and an uncorrelated SubPlan adds none, so
+// `t1.c NOT IN (SELECT …)` is a base restriction of t1 — TPC-H Q16's
+// `ps_suppkey NOT IN (…)` on partsupp. The conjunct moves to that
+// binding's locals, and localizeExprToLeaf rebases the IN operand while
+// sharing the inner plan untouched.
+func TestPartitionConjunctsUncorrelatedSublinkIsLocal(t *testing.T) {
+	cumOffsets := spansFromCumulative([]int{0, 3, 6})
+	plan := uncorrelatedPlan()
+	// Column 4 is binding 1's second column (leaf-local index 1).
+	notIn := &InExpr{Operand: makeColRefBinding("c", 4, 1), Negated: true, Plan: plan}
+	jc, locals := partitionConjunctsForJoinPlanning([]Expr{notIn}, cumOffsets)
+	if len(jc) != 0 {
+		t.Fatalf("uncorrelated NOT IN must not stay join-side, got jc=%v", jc)
+	}
+	got := locals.byBinding[1]
+	if len(got) != 1 || got[0] != notIn {
+		t.Fatalf("uncorrelated NOT IN must be binding 1's local, got %v", locals.byBinding)
+	}
+	out, ok := localizeExprToLeaf(notIn, rangeBinding{offset: 3, sourceIdx: 1}).(*InExpr)
+	if !ok {
+		t.Fatalf("localizeExprToLeaf returned %T, want *InExpr", out)
+	}
+	if cr := out.Operand.(*ColumnRef); cr.Index != 1 {
+		t.Errorf("operand Index = %d after rebase, want 1 (4 - offset 3)", cr.Index)
+	}
+	if out.Plan != plan || !out.Negated {
+		t.Errorf("rebase must keep the inner plan and the negation: plan shared=%v negated=%v",
+			out.Plan == plan, out.Negated)
+	}
+	if notIn.Operand.(*ColumnRef).Index != 4 {
+		t.Error("input conjunct mutated by the rebase")
 	}
 }
 
@@ -223,5 +261,30 @@ func TestPlanQ5AttachesLeafLocalFilters(t *testing.T) {
 	}
 	if !foundOrdersLeafLocal {
 		t.Error("Q5 should attach a LeafLocal Filter wrapper above orders")
+	}
+}
+
+// TestPartitionConjunctsBareAnySublinkStaysJoinSide pins the other half of
+// M0146-0002e: a top-level `x IN (SELECT …)` is not a restriction in PG —
+// pull_up_sublinks converts it into a semi join (convert_ANY_sublink_to_join)
+// — so even uncorrelated it stays in the join residual, where goopg's
+// semi-join producers (jointree ANY pull-up, legacy unnest) consume it.
+// Admitting it as a leaf filter bypassed that route on TPC-DS Q95 and timed
+// out at SF1. The same sublink under NOT is PG's SubPlan restriction.
+func TestPartitionConjunctsBareAnySublinkStaysJoinSide(t *testing.T) {
+	cumOffsets := spansFromCumulative([]int{0, 3, 6})
+	in := &InExpr{Operand: makeColRefBinding("c", 4, 1), Plan: uncorrelatedPlan()}
+	jc, locals := partitionConjunctsForJoinPlanning([]Expr{in}, cumOffsets)
+	if len(jc) != 1 || jc[0] != in || len(locals.byBinding) != 0 {
+		t.Fatalf("bare uncorrelated IN must stay join-side: jc=%v locals=%v", jc, locals.byBinding)
+	}
+	notIn := &UnaryOp{Op: parser.OpNot, Operand: &InExpr{Operand: makeColRefBinding("c", 4, 1), Plan: uncorrelatedPlan()}}
+	jc, locals = partitionConjunctsForJoinPlanning([]Expr{notIn}, cumOffsets)
+	if len(jc) != 0 || len(locals.byBinding[1]) != 1 {
+		t.Fatalf("NOT (x IN (uncorrelated)) must be binding 1's local: jc=%v locals=%v", jc, locals.byBinding)
+	}
+	allOp := &InExpr{Operand: makeColRefBinding("c", 4, 1), Plan: uncorrelatedPlan(), AllOp: true, AnyOp: parser.OpGt}
+	if !conjunctIsLocalEligible(allOp) {
+		t.Error("x > ALL (uncorrelated) is an ALL_SUBLINK PG keeps as a restriction; it must be eligible")
 	}
 }

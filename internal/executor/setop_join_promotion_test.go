@@ -69,15 +69,31 @@ const setopJoinQ71 = `select i_brand_id, i_brand, t_hour, t_minute, sum(ext_pric
 func TestSetOpJoinPromotesToHashJoin(t *testing.T) {
 	ctx := setopJoinFixture(t)
 	plan := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+setopJoinQ71), "\n")
-	if strings.Contains(plan, "Nested Loop") {
-		// A cross join renders as a bare `Nested Loop` (PG folds CROSS
-		// to INNER; explain.c 1754-1758), so any Nested Loop here is the
-		// unpromoted Cartesian product over the Append — all joins in the
-		// promoted plan are hash joins (see below).
-		t.Fatalf("equi-join across the set operation was not promoted:\n%s", plan)
-	}
-	if !strings.Contains(plan, "Hash Join") {
-		t.Fatalf("expected a Hash Join over the Append, got:\n%s", plan)
+	// A cross join renders as a BARE `Nested Loop` — no `Join Filter` line
+	// under it (PG folds CROSS to INNER; explain.c 1754-1758). That bare node
+	// is the unpromoted Cartesian product this test exists to catch.
+	//
+	// R36 re-derived this check. It used to reject ANY `Nested Loop` and
+	// require a `Hash Join`, using the join METHOD as a proxy for the
+	// promotion. That proxy stopped holding once baserel sizing began
+	// multiplying by `clauselist_selectivity` unconditionally, as
+	// `set_baserel_size_estimates` does: on this fixture's 2-3 row tables a
+	// nested loop is genuinely the cheaper plan and PG would choose one too.
+	// The promotion still happens — the equi-joins render as `Join Filter`
+	// conditions rather than residual `Filter` conjuncts — so the assertion
+	// now reads the thing it actually cares about.
+	//
+	// The fixture is deliberately NOT enlarged to restore the hash join:
+	// TestSetOpJoinAnswerUnchanged hand-derives the expected rows from exactly
+	// these 3 items / 2 dates / 3 times, and adding rows breaks that.
+	for _, line := range strings.Split(plan, "\n") {
+		if !strings.Contains(line, "Nested Loop") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if !nestedLoopHasJoinCondition(plan, line, indent) {
+			t.Fatalf("bare Nested Loop (Cartesian product) — equi-join across the set operation was not promoted:\n%s", plan)
+		}
 	}
 	// The residual Filter must keep only the genuinely single-sided
 	// restrictions; both equi-joins are now join conditions.
@@ -179,4 +195,39 @@ func TestIntersectJoinPromotesToHashJoin(t *testing.T) {
 	if got := rows[0][1].Int; got != 5 {
 		t.Errorf("ss_amt = %d, want 5", got)
 	}
+}
+
+// nestedLoopHasJoinCondition reports whether the `Nested Loop` rendered at
+// `line` carries a `Join Filter`, i.e. whether it is an equi-join rather than
+// the bare Cartesian product TestSetOpJoinPromotesToHashJoin rejects.
+//
+// EXPLAIN prints a node's own qual lines immediately below it, indented one
+// level further, before any child node. So the condition belongs to this
+// Nested Loop exactly while the scan stays strictly deeper-indented and has
+// not yet reached the next node line at this depth or shallower.
+func nestedLoopHasJoinCondition(plan, line string, indent int) bool {
+	lines := strings.Split(plan, "\n")
+	seen := false
+	for _, l := range lines {
+		if !seen {
+			if l == line {
+				seen = true
+			}
+			continue
+		}
+		d := len(l) - len(strings.TrimLeft(l, " "))
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if d <= indent {
+			return false // next sibling/ancestor node; no Join Filter found
+		}
+		if strings.Contains(l, "Join Filter:") {
+			return true
+		}
+		if strings.Contains(l, "->") {
+			return false // reached a child node first
+		}
+	}
+	return false
 }

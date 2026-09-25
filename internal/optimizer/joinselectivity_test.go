@@ -541,3 +541,237 @@ func TestJoinClauseSelectivityExtConstantArmsAreDefaults(t *testing.T) {
 		t.Fatal("an equality between two analysed columns was reported as a default")
 	}
 }
+
+// jsNationCtx is a two-relation search over two aliases of one 25-row,
+// 25-distinct `nation`-shaped table — the Q7 nation-cross fixture. Unlike
+// `jsCtx` it stamps `sourceIdx`, the identity `orConjunctSelectivity`
+// attributes single-side conjuncts by.
+func jsNationCtx(t *testing.T) (*searchCtx, *catalog.Table, *catalog.Table) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	mk := func(name string) *catalog.Table {
+		return jsTable(t, c, name, []catalog.Column{
+			{Name: "n_name", Type: catalog.Type{Name: "bpchar"}},
+		}, 25, catalog.ColumnStats{NDistinct: 25})
+	}
+	n1, n2 := mk("n1"), mk("n2")
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: n1, baseRows: 25, sourceIdx: 1},
+		{table: n2, baseRows: 25, sourceIdx: 2},
+	}
+	return s, n1, n2
+}
+
+// jsNameEq is one `n_name = <val>` conjunct on the given source, as the search
+// carries it: a named ColumnRef with the FROM item's identity stamped.
+func jsNameEq(src int16, val int64) *BinaryOp {
+	return &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: src},
+		Right: &IntegerConst{Value: val}}
+}
+
+// TestOrJoinSelectivityMeasuredArms: R54 (ii) — a whole-OR join clause over
+// single-side equalities is estimated arm-by-arm (PG's
+// `clauselist_selectivity_or`), not charged the unhandled-clause 0.5. The
+// clause is Q7's nation-cross OR in miniature: `(n1 = A AND n2 = B) OR
+// (n1 = C AND n2 = D)` over 25-distinct columns, so each conjunct is 1/25,
+// each arm 1/625, and the OR folds to just over 1/312. The expectation is
+// composed from `eqSelectivityForColumn` rather than hard-coded, so this pins
+// the attribution and the fold — not today's ndistinct arithmetic.
+func TestOrJoinSelectivityMeasuredArms(t *testing.T) {
+	s, n1, _ := jsNationCtx(t)
+	or := &BinaryOp{Op: parser.OpOr,
+		Left:  &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 1), Right: jsNameEq(2, 2)},
+		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: jsNameEq(2, 4)}}
+	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
+
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	arm := e * e
+	want := arm + arm - arm*arm
+	sel, isDefault := s.joinClauseSelectivityExt(ri)
+	if isDefault {
+		t.Fatal("OR over analysed single-side equalities was reported as a default")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (inclusion-exclusion over two %v arms)", sel, want, arm)
+	}
+	if sel >= defaultUnhandledClauseSel {
+		t.Fatalf("sel=%v; not below the old whole-OR default %v", sel, defaultUnhandledClauseSel)
+	}
+}
+
+// TestOrJoinSelectivityGuessedConjunctMarksTheOr: one unattributable conjunct
+// (no source identity — a CTE/subquery side, or a column the search never
+// bound) keeps its 0.5 contribution AND marks the whole OR a guess, so
+// `calcJoinrelSize`'s all-default clamp stays on for the join. The measured
+// arm composes with the defaulted one; neither swallows the other.
+func TestOrJoinSelectivityGuessedConjunctMarksTheOr(t *testing.T) {
+	s, n1, _ := jsNationCtx(t)
+	lost := jsNameEq(0, 9) // SourceTableIdx 0: no recorded identity.
+	or := &BinaryOp{Op: parser.OpOr,
+		Left:  &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 1), Right: jsNameEq(2, 2)},
+		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: lost}}
+	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
+
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	measuredArm := e * e
+	guessedArm := e * defaultUnhandledClauseSel
+	want := measuredArm + guessedArm - measuredArm*guessedArm
+	sel, isDefault := s.joinClauseSelectivityExt(ri)
+	if !isDefault {
+		t.Fatal("OR with an unattributable conjunct was reported as measured; the fallback clamp would switch off on a guess")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (measured arm composed with a 0.5 default)", sel, want)
+	}
+}
+
+// jsQtyCtx is a two-relation search over two aliases of one 300-row table
+// with an analysed int4 quantity column (histogram + one MCV value) — the
+// R55 inequality/IN-list fixture. Like `jsNationCtx` it stamps
+// `sourceIdx`, the identity the OR-conjunct arms attribute by.
+func jsQtyCtx(t *testing.T) *searchCtx {
+	t.Helper()
+	c := catalog.NewInMemory()
+	mk := func(name string) *catalog.Table {
+		return jsTable(t, c, name, []catalog.Column{
+			{Name: "q", Type: catalog.Type{Name: "int4"}},
+		}, 300, catalog.ColumnStats{NDistinct: 30,
+			Histogram: []string{"1", "10", "20", "30"},
+			MCV:       []catalog.MCVEntry{{Value: "25", Frequency: 0.1}}})
+	}
+	q1, q2 := mk("q1"), mk("q2")
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.relInfos = []baseRelInfo{
+		{table: q1, baseRows: 300, sourceIdx: 1},
+		{table: q2, baseRows: 300, sourceIdx: 2},
+	}
+	return s
+}
+
+// jsQtyGe is one `q >= <val>` conjunct on the given source, as the search
+// carries it: a named ColumnRef with the FROM item's identity stamped.
+func jsQtyGe(src int16, val int64) *BinaryOp {
+	return &BinaryOp{Op: parser.OpGe,
+		Left:  &ColumnRef{Index: 0, Name: "q", Type: catalog.Type{Name: "int4"}, SourceTableIdx: src},
+		Right: &IntegerConst{Value: val}}
+}
+
+// TestOrRangeSelectivityMeasured: R55 §2 — a single-side inequality
+// conjunct is priced through `rangeOpSelectivityStats` (PG's
+// `scalarineqsel`), not charged the whole-OR 0.5. The expectation is
+// composed from the stats-first core rather than hard-coded, so this
+// pins the attribution and the dispatch — not today's histogram
+// arithmetic. The swapped-operand form (`const <= col`) must price
+// identically, since the restriction path flips the operator there.
+func TestOrRangeSelectivityMeasured(t *testing.T) {
+	s := jsQtyCtx(t)
+	stats := columnStatsByName(s.relInfos[0].table, "q")
+	col := jsQtyGe(1, 15).Left.(*ColumnRef)
+	want, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 15}, stats)
+	if !measured {
+		t.Fatal("fixture carries no measurement; the test would pass vacuously")
+	}
+	sel, isDefault := s.orConjunctSelectivity(jsQtyGe(1, 15))
+	if isDefault {
+		t.Fatal("OR-arm inequality over an analysed column was reported as a default")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (the restriction-path core)", sel, want)
+	}
+	// No "below the old 0.5" assertion here: unlike the 1/625 equality
+	// arms, a range selectivity is data-dependent and may honestly
+	// exceed the old default (this fixture's does, at 0.55). What this
+	// pins is attribution + dispatch, not a direction.
+	// Swapped form prices identically.
+	swapped := &BinaryOp{Op: parser.OpLe,
+		Left:  &IntegerConst{Value: 15},
+		Right: &ColumnRef{Index: 0, Name: "q", Type: catalog.Type{Name: "int4"}, SourceTableIdx: 1}}
+	ifssel, _ := s.orConjunctSelectivity(swapped)
+	if math.Abs(ifssel-want) > 1e-15 {
+		t.Fatalf("swapped sel=%v; want %v (operator flip must reproduce the core)", ifssel, want)
+	}
+}
+
+// TestOrRangeSelectivityDeclinesWithoutHistogram: statistics without a
+// histogram carry no range measurement (the core declines), so the
+// conjunct keeps its 0.5 contribution AND marks the OR a guess —
+// zero move from R54, by construction rather than by accident.
+func TestOrRangeSelectivityDeclinesWithoutHistogram(t *testing.T) {
+	s, _, _ := jsNationCtx(t)
+	c := &BinaryOp{Op: parser.OpGe,
+		Left:  &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: 1},
+		Right: &IntegerConst{Value: 5}}
+	sel, isDefault := s.orConjunctSelectivity(c)
+	if !isDefault {
+		t.Fatal("inequality over histogram-less statistics was reported as measured")
+	}
+	if sel != defaultUnhandledClauseSel {
+		t.Fatalf("sel=%v; want the unchanged whole-OR default %v", sel, defaultUnhandledClauseSel)
+	}
+}
+
+// TestOrInListSelectivityMeasured: R55 §2 — a single-side const IN-list
+// is priced element-by-element (PG's `scalararraysel`), not charged the
+// whole-OR 0.5. Four non-MCV values over a 25-distinct column compose to
+// the disjoint sum 4/25; the expectation is built from
+// `eqSelectivityForColumn` per element, pinning the attribution and the
+// OR-merge — not today's ndistinct arithmetic.
+func TestOrInListSelectivityMeasured(t *testing.T) {
+	s, n1, _ := jsNationCtx(t)
+	mkConst := func(v string) Expr { return &StringConst{Value: v} }
+	in := &InExpr{
+		Operand: &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: 1},
+		List:    []Expr{mkConst("a"), mkConst("b"), mkConst("c"), mkConst("d")},
+	}
+	stats := columnStatsByName(n1, "n_name")
+	var want float64
+	for _, elem := range in.List {
+		e := eqSelectivityForColumn(stats, elem, 25)
+		want += e
+	}
+	sel, isDefault := s.orConjunctSelectivity(in)
+	if isDefault {
+		t.Fatal("OR-arm const IN-list over an analysed column was reported as a default")
+	}
+	if math.Abs(sel-want) > 1e-15 {
+		t.Fatalf("sel=%v; want %v (disjoint sum over four 1/25 elements)", sel, want)
+	}
+	if sel >= defaultUnhandledClauseSel {
+		t.Fatalf("sel=%v; not below the old whole-OR default %v", sel, defaultUnhandledClauseSel)
+	}
+}
+
+// TestOrInListSelectivityDeclinesGeneralAny: the ledgered hard shapes —
+// subquery `Plan` RHS, `!= ANY`, and a non-constant element — keep the
+// 0.5 contribution as a guess. Each is a shape PG's `scalararraysel`
+// case 3 punts on, and declining the whole conjunct (rather than
+// pricing around the hole) is what keeps the fallback clamp honest.
+func TestOrInListSelectivityDeclinesGeneralAny(t *testing.T) {
+	s, _, _ := jsNationCtx(t)
+	operand := &ColumnRef{Index: 0, Name: "n_name", Type: catalog.Type{Name: "bpchar"}, SourceTableIdx: 1}
+	consts := []Expr{&StringConst{Value: "a"}, &StringConst{Value: "b"}}
+	cases := map[string]*InExpr{
+		"subquery-plan": {Operand: operand, List: consts, Plan: &SeqScan{}},
+		"not-equal-any": {Operand: operand, List: consts, NotEqualAny: true},
+		"all-op":        {Operand: operand, List: consts, AnyOp: parser.OpEq, AllOp: true},
+		"nonconst-elem": {Operand: operand, List: []Expr{&StringConst{Value: "a"}, operand}},
+		"negated":       {Operand: operand, List: consts, Negated: true},
+	}
+	for name, in := range cases {
+		sel, isDefault := s.orConjunctSelectivity(in)
+		if !isDefault {
+			t.Errorf("%s: reported as measured; the general-ANY shape must stay a guess", name)
+		}
+		if sel != defaultUnhandledClauseSel {
+			t.Errorf("%s: sel=%v; want the unchanged whole-OR default %v", name, sel, defaultUnhandledClauseSel)
+		}
+	}
+}

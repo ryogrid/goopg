@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"github.com/goopg/goopg/internal/catalog"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser" //nolint:revive
@@ -12,7 +13,19 @@ func newVMFixture(t testing.TB) (*Context, func()) {
 	t.Helper()
 	ctx, cleanup := newFSMFixture(t)
 	ctx.VM = storage.NewVisibilityMap()
-	return ctx, cleanup
+	// The hook initdb's cluster open installs (internal/initdb/open.go): the
+	// planner's allvisfrac and pg_class.relallvisible read the VM through it.
+	// Without it a VACUUMed fixture table still priced every index-only scan
+	// with all its heap fetches — the M0145-0029 slice 5 finding.
+	vm := ctx.VM
+	prevVis := catalog.RelAllVisibleFunc
+	catalog.RelAllVisibleFunc = func(dbOid, relOid uint32) int32 {
+		return vm.CountAllVisible(storage.RelFileNode{DBOid: dbOid, RelOid: relOid})
+	}
+	return ctx, func() {
+		catalog.RelAllVisibleFunc = prevVis
+		cleanup()
+	}
 }
 
 // TestIndexOnlyScanAfterVacuum is the DoD test for M0046-0004.

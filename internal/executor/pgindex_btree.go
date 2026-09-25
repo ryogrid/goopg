@@ -262,20 +262,27 @@ func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart)
 // is an ERROR rather than a fallback, for the reason B2-c-iii gives: the tree is
 // tuple-shaped, so emitting a blob key would address the wrong place.
 func (ctx *Context) indexEntryKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer) ([]byte, error) {
-	return ctx.indexRowKey(idx, cols, row, tid)
+	// An entry keeps its NULL key values in a cluster with
+	// null_keyed_index_entries (tuple format only; see indexRowKey).
+	return ctx.indexRowKey(idx, cols, row, tid, catalog.NullKeyedIndexEntries())
 }
 
-// indexRowProbeKey — see indexEntryKey.
+// indexRowProbeKey — see indexEntryKey. A probe never keeps NULLs: a NULL
+// key value matches nothing, so there is no probe.
 func (ctx *Context) indexRowProbeKey(idx *catalog.Index, cols []catalog.Column, row Row) ([]byte, error) {
-	return ctx.indexRowKey(idx, cols, row, storage.ItemPointer{})
+	return ctx.indexRowKey(idx, cols, row, storage.ItemPointer{}, false)
 }
 
-func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer) ([]byte, error) {
+func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer, keepNull bool) ([]byte, error) {
 	desc := ctx.pgIndexKeyDesc(idx)
 	if desc == nil {
 		return encodeIndexKeyFromCols(ctx, idx, cols, row, ctx.Catalog)
 	}
-	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, ctx.Catalog)
+	project := indexRowKeyValues
+	if keepNull {
+		project = indexRowKeyValuesKeepNull
+	}
+	keyCols, vals, ok := project(idx, cols, row, ctx.Catalog)
 	if !ok {
 		return nil, nil
 	}
@@ -316,13 +323,14 @@ func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row R
 //     heap TID, which is also `BulkEntry.Ptr` — the same fact in the two places
 //     the two formats each need it.
 //
-// hasNullKey keeps `encodeCompositeBTreeKeyWithExprs`'s meaning in both: a NULL
-// value key column means the row has no entry in this index, and the caller
-// skips it (NULLS DISTINCT) or dedups it against other null-bearing rows
-// (NULLS NOT DISTINCT). That is a goopg divergence under the tuple format —
-// PG's index tuples have a null bitmap and DO store NULL-keyed rows — but it is
-// the pre-existing one, unchanged here and recorded in the deferral ledger;
-// changing it is not a key-encoding question.
+// hasNullKey reports a NULL value key column. In the blob format, and in a
+// cluster without the null_keyed_index_entries capability, the key is nil
+// and the row has no entry in this index: the caller skips it (NULLS
+// DISTINCT) or dedups it against other null-bearing rows (NULLS NOT
+// DISTINCT). In a tuple-format index of a capable cluster the key is the
+// full NULL-bearing image, as PG's index_form_tuple stores it, and the
+// caller files it — keeping it out of uniqueness checks, where NULL never
+// equals NULL. Design m-nightly-store-null-keyed-index-entries.
 //
 // keyExprs (an expression index's resolved key expressions) is only ever
 // non-nil on the blob path: an expression key column has no
@@ -358,7 +366,10 @@ func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Colum
 		}
 		v := row[col.Ordinal]
 		if v.IsNull() {
-			return nil, true, nil
+			if !catalog.NullKeyedIndexEntries() {
+				return nil, true, nil
+			}
+			hasNullKey = true
 		}
 		vals[i] = v
 	}
@@ -369,7 +380,7 @@ func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Colum
 		return nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
 			"indexBuildEntryKey: index %q: %v", idx.Name, encErr)}
 	}
-	return k, false, nil
+	return k, hasNullKey, nil
 }
 
 // arbiterProbeKey builds the key an ON CONFLICT arbiter probe POSITIONS with:
@@ -409,15 +420,18 @@ func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Colum
 // indexes `buildPGIndexKeyDesc` refuses, which resolve to a nil descriptor and
 // keep the blob path whole.
 func (ctx *Context) arbiterProbeKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
-	return ctx.arbiterKey(oc, tbl, row, storage.ItemPointer{}, pos)
+	return ctx.arbiterKey(oc, tbl, row, storage.ItemPointer{}, pos, false)
 }
 
 // arbiterEntryKey — see arbiterProbeKey.
 func (ctx *Context) arbiterEntryKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
-	return ctx.arbiterKey(oc, tbl, row, tid, pos)
+	// An arbiter ENTRY keeps NULL conflict-key values in a cluster with
+	// null_keyed_index_entries (tuple format; the probe above never does —
+	// NULL never conflicts).
+	return ctx.arbiterKey(oc, tbl, row, tid, pos, catalog.NullKeyedIndexEntries())
 }
 
-func (ctx *Context) arbiterKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
+func (ctx *Context) arbiterKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int, keepNull bool) ([]byte, error) {
 	if oc == nil || oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
@@ -449,7 +463,7 @@ func (ctx *Context) arbiterKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table,
 				idx.Name, i+1, tbl.Columns[ord].Name, i+1, keyCols[i].Name)}
 		}
 		v := row[ord]
-		if v.IsNull() {
+		if v.IsNull() && !keepNull {
 			return nil, nil
 		}
 		vals[i] = v
@@ -584,4 +598,69 @@ func bulkCreateIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFi
 	opts := indexBTreeOptions(ctx, idx)
 	opts.CreateXID = ctx.Tx.XID
 	return nbtree.BulkCreateWithOptions(ctx.Pool, idxRel, entries, opts)
+}
+
+// nullStopRangeBound builds the bound that keeps a range scan with an OPEN
+// end out of the NULL-keyed entries a cluster with null_keyed_index_entries
+// stores. PostgreSQL does the same with the scan key's NULL handling in
+// _bt_checkkeys: `a > 5` is strict, so a NULL never satisfies it, and the scan
+// stops where the bounded column turns NULL.
+//
+// The bound is a pivot over the prefix's attributes plus the bounded column
+// set to NULL, and the caller makes it EXCLUSIVE:
+//   - ASC NULLS LAST (the default) files the NULLs after every value, so the
+//     pivot is the upper bound (atHigh): an entry equal on the named
+//     attributes — i.e. NULL in the bounded column — compares 0 under
+//     compareHigh and stops the scan; any value sorts below it.
+//   - ASC NULLS FIRST files them before every value, so the pivot is the lower
+//     bound: the exclusive low test skips the whole NULL group.
+//
+// The caller works in INDEX order, so a DESC column (whose NULLs come first by
+// default) is handled by the same rule: the NULL group is at the low end when
+// NULLS FIRST, at the high end otherwise.
+//
+// stop=false (no bound to add) for the blob format, which stores no NULL-keyed
+// entries, and for a cluster without the capability (nothing to stop at).
+func (ctx *Context) nullStopRangeBound(idx *catalog.Index, prefix []indexProbeKeyPart, col *catalog.Column, colIdx int) (key []byte, atHigh, stop bool, err error) {
+	if !catalog.NullKeyedIndexEntries() || idx == nil || col == nil || ctx.pgIndexKeyDesc(idx) == nil {
+		return nil, false, false, nil
+	}
+	// NULLS FIRST / LAST is the NULLs' position in INDEX order, whatever the
+	// column's direction (SK_BT_NULLS_FIRST), and the caller already speaks
+	// index order (rangeColumnReversed swaps a DESC column's value bounds).
+	nullsFirst := colIdx < len(idx.ColNullsFirst) && idx.ColNullsFirst[colIdx]
+	parts := make([]indexProbeKeyPart, 0, len(prefix)+1)
+	parts = append(parts, prefix...)
+	parts = append(parts, indexProbeKeyPart{col: col, val: NullDatum})
+	k, perr := ctx.indexProbeKey(idx, parts)
+	if perr != nil {
+		return nil, false, false, perr
+	}
+	return k, !nullsFirst, true, nil
+}
+
+// rangeColumnReversed reports whether idx orders its key column colIdx in
+// DESCENDING order in the tree itself, so a range scan's value bounds must
+// swap ends to become index-order bounds: `col > v` is everything before v.
+// Only the tuple format honours DESC (its comparator applies SK_BT_DESC); a
+// blob-format key is an ascending byte encoding whatever the column option.
+func rangeColumnReversed(ctx *Context, idx *catalog.Index, colIdx int) bool {
+	if idx == nil || colIdx >= len(idx.ColDescending) || !idx.ColDescending[colIdx] {
+		return false
+	}
+	return ctx.pgIndexKeyDesc(idx) != nil
+}
+
+// init registers the tuple-format test with catalog, so the optimizer's
+// NULL-key guard can tell which indexes hold NULL-keyed entries
+// (catalog.IndexHasNullKeyedEntries). The same predicate pgIndexKeyDesc uses:
+// buildPGIndexKeyDesc accepts the index and the tuple format is on.
+func init() {
+	catalog.SetIndexFormatStoresNullKeysFunc(func(idx *catalog.Index) bool {
+		if !pgIndexTupleKeys || idx == nil {
+			return false
+		}
+		_, err := buildPGIndexKeyDesc(idx)
+		return err == nil
+	})
 }

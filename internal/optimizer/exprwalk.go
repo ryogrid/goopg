@@ -391,63 +391,6 @@ type exprRewriter struct {
 	OnUnknown func(Expr)
 }
 
-// rewriteExprRefsInPlace rewrites the tree rooted at *e IN PLACE, mutating
-// the existing nodes.
-//
-// Use this only when the tree is uniquely owned. Planner expression
-// nodes are shared far more often than they look — remapByPosMap's
-// ColumnRef arm copies the node before changing Index for exactly that
-// reason — so cloneExprRefs is the safer default.
-//
-// Takes **Expr** (not Expr) so the root itself is replaceable; that also
-// makes it impossible to call by accident where walkExprRefs was
-// meant.
-//
-// A note on the name: this package already contains walkExpr (over
-// parser.Expr), walkExprTree, walkExprTreeDeep, walkPlanExprs and
-// walkPlanExprsDeep. The `BySlots` suffix is not decoration — it is the
-// only thing distinguishing this family from five near-homonyms, three
-// of which take a bare callback and would compile if confused for one
-// another at a call site.
-func rewriteExprRefsInPlace(e *Expr, pol scopePolicy, r exprRewriter) bool {
-	if e == nil || *e == nil {
-		return true
-	}
-	slots, ok := exprChildSlots(*e)
-	if !ok {
-		if r.OnUnknown != nil {
-			r.OnUnknown(*e)
-		}
-		return false
-	}
-	for _, s := range slots {
-		switch s.kind {
-		case slotSameScope:
-			if !rewriteExprRefsInPlace(s.expr, pol, r) {
-				return false
-			}
-		case slotInnerPlan:
-			if !scopeVisit(*s.plan, pol, r.OnScope) {
-				return false
-			}
-		case slotSubqRow:
-			row := *s.row
-			if row == nil {
-				continue
-			}
-			// Never rewritten through: shared across every elem of
-			// the assignment and used as an executor cache key.
-			if !scopeVisit(row.Plan, pol, r.OnScope) {
-				return false
-			}
-		}
-	}
-	if r.Rewrite != nil {
-		*e = r.Rewrite(*e)
-	}
-	return true
-}
-
 // cloneExprRefs returns a NEW tree, leaving e untouched.
 //
 // Returns (nil, false) when the rewrite was aborted (scopeVeto or an

@@ -1,0 +1,540 @@
+diff --git a/internal/optimizer/flaglabels.go b/internal/optimizer/flaglabels.go
+index bcd4ab7af..e49d5a15f 100644
+--- a/internal/optimizer/flaglabels.go
++++ b/internal/optimizer/flaglabels.go
+@@ -171,13 +171,6 @@ var flagResolvedState = map[string]func(string) string{
+ 	"GOOPG_INCREMENTAL_SORT": func(v string) string {
+ 		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
+ 	},
+-	// M0145-0011 scope (c) (jointreepullup.go): admits a `*CTEScan` leaf into
+-	// the pulled body's flat splice. Default OFF, and plan-SHAPING, so it is
+-	// registered here rather than exempted. (It joined paired with
+-	// GOOPG_DERIVED_FIREWALL=off — a pulled CTE leaf was otherwise declined
+-	// by the `outer-over-derived` firewall. M0145-0018 removed the firewall,
+-	// so the flag now stands alone.)
+-	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
+ }
+ 
+ // flagProvenanceOrder is the order the flags are stamped in. The first six are
+@@ -260,10 +253,9 @@ var flagProvenanceOrder = []string{
+ 	// (relfromjoinlist.go). Retired at M0145-0018 — see
+ 	// flagProvenanceRetired below.
+ 	"GOOPG_DERIVED_FIREWALL",
+-	// Joined at M0145-0011 scope (c): admits `*CTEScan` leaves into the
+-	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING;
+-	// it joined paired with GOOPG_DERIVED_FIREWALL=off and stands alone
+-	// since M0145-0018 removed the firewall.
++	// Joined at M0145-0011 scope (c): admitted `*CTEScan` leaves into the
++	// pulled-body splice (jointreepullup.go). Retired at M0145-0008aa — see
++	// flagProvenanceRetired below.
+ 	"GOOPG_PULLUP_CTE_LEAF",
+ 	// Joined at M0145-0012: gates the goopg-only `rows<=1` CTE fallback in
+ 	// `initialRelRows` (joinsearch.go). Retired at M0145-0012 — see
+@@ -342,6 +334,13 @@ var flagProvenanceRetired = map[string]string{
+ 	// arm itself for plan parity (PG's set_cte_size_estimates keeps the
+ 	// collapsed estimate), so nothing reads the variable.
+ 	"GOOPG_CTE_ROWS_FALLBACK": "M0145-0012",
++	// M0145-0011 scope (c)'s `*CTEScan` pulled-leaf admission, default off
++	// while the seam could not price the leaf. M0145-0013 built the seam
++	// arm and M0145-0018 removed the firewall behind it; M0145-0008aa
++	// resolved the flag's promote-or-delete to PROMOTE — PG pulls a CTE
++	// reference in a sublink body up like any other base rel — so the
++	// admission is unconditional and nothing reads the variable.
++	"GOOPG_PULLUP_CTE_LEAF": "M0145-0008aa",
+ }
+ 
+ // FlagProvenanceTable is the authoritative list of planner env flags that a
+diff --git a/internal/optimizer/joinsearchseam.go b/internal/optimizer/joinsearchseam.go
+index 431c43820..810935272 100644
+--- a/internal/optimizer/joinsearchseam.go
++++ b/internal/optimizer/joinsearchseam.go
+@@ -906,13 +906,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
+ 	// shape to price).
+ 	//
+ 	// M0145-0011 scope (c) measured the OTHER reading of "anything else":
+-	// with `GOOPG_PULLUP_CTE_LEAF=on` the producer admits `*CTEScan`
+-	// leaves and every one of them dies HERE instead, so the two sites
+-	// are one invariant and must be relaxed together. Whoever relaxes the
+-	// producer owns this loop too: a derived leaf has no `ss.Table` or
+-	// `ss.Alias` to build the `rangeBinding` from, and no catalog
+-	// statistics for `estimateBaseRelInfo`/`applyRelSizeFallback` below.
+-	// Filed as M0145-0013 (owner directive 2026-09-21).
++	// a producer admitting `*CTEScan` leaves made every one of them die
++	// HERE instead, so the two sites are one invariant and are relaxed
++	// together in `seamLeafBinding` (M0145-0013): a `*CTEScan` leaf, or a
++	// derived ANY body's single leaf (M0145-0008aa), binds with no catalog
++	// table and prices from its plan. M0145-0008aa made the CTE admission
++	// unconditional.
+ 	//
+ 	// M0145-0005 slice 6: the non-emitting band is TWO populations —
+ 	// deferred chain semi/anti leaves at [nReal, pulledBase) and pulled
+@@ -2716,7 +2715,15 @@ func seamLeafBinding(scan Node, offset int, pullCtx *resolveContext, k int) (ran
+ 			b.alias = x.Alias
+ 		}
+ 	default:
+-		return rangeBinding{}, false
++		// M0145-0008aa: a pulled ANY body that is not simple is ONE leaf
++		// holding the body's whole plan — PG's un-flattened subquery RTE.
++		// The body binding carries the derived table's synthetic
++		// `*catalog.Table` (column names only, no statistics); drop it so
++		// the leaf prices from its plan like a CTE leaf does.
++		if pullCtx == nil || !pulledLeafIsDerived(pullCtx, k) {
++			return rangeBinding{}, false
++		}
++		b.table = nil
+ 	}
+ 	return b, true
+ }
+@@ -2737,6 +2744,22 @@ func pulledBodyBinding(ctx *resolveContext, k int) (rangeBinding, bool) {
+ 	return rangeBinding{}, false
+ }
+ 
++// pulledLeafIsDerived reports whether the k-th pulled leaf (the same body-order
++// count `pulledBodyBinding` uses) is a derived body's single opaque leaf.
++func pulledLeafIsDerived(ctx *resolveContext, k int) bool {
++	pu := ctx.jtPullup
++	if pu == nil || k < 0 {
++		return false
++	}
++	for _, body := range pu.bodies {
++		if k < len(body.bodyBindings) {
++			return body.derived
++		}
++		k -= len(body.bodyBindings)
++	}
++	return false
++}
++
+ // seamLeafRelInfo prices a spliced seam leaf, routing on whether the binding
+ // names a real catalog relation.
+ //
+diff --git a/internal/optimizer/jointreepullup.go b/internal/optimizer/jointreepullup.go
+index a311bfadd..f575cd405 100644
+--- a/internal/optimizer/jointreepullup.go
++++ b/internal/optimizer/jointreepullup.go
+@@ -1,7 +1,6 @@
+ package optimizer
+ 
+ import (
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/goopg/goopg/internal/catalog"
+@@ -149,6 +148,11 @@ type jtPulledBody struct {
+ 	// the parent column from. `TestJointreePullupDeclineParity/nested-exists`
+ 	// is the witness for exactly that plan.
+ 	subtreeLeaves int
++	// derived marks a body pulled as ONE opaque leaf — the whole body's
++	// plan, PG's un-flattened subquery RTE (M0145-0008aa) — rather than as
++	// its own base-relation leaves. The seam admits that leaf without a
++	// catalog table and prices it from its plan (`seamLeafBinding`).
++	derived bool
+ }
+ 
+ // maxPulledSublinkDepth bounds the nested pull-up recursion. PG has no
+@@ -287,12 +291,28 @@ func assignPulledSourceOffsets(bodies []*jtPulledBody, ctx *resolveContext) bool
+ 			}
+ 		}
+ 		pb.srcOffset = next
+-		for i, leaf := range pb.leafScans {
+-			shifted, err := remapSourceTableIdx(leaf, next)
+-			if err != nil || shifted == nil {
+-				return false
++		if pb.derived {
++			// M0145-0008aa: a derived leaf is a whole planned body, and
++			// remapSourceTableIdx covers only the node kinds the legacy
++			// unnest met (no Distinct, no set operations). The shift is
++			// EXPLAIN-naming hygiene, not a value dependency — the leaf is its
++			// own scope and the link qual reads it by position — so a body
++			// the remap cannot walk keeps its own numbering (offset 0), which
++			// is what the post-hoc route does with the same plan.
++			if shifted, err := remapSourceTableIdx(pb.leafScans[0], next); err == nil && shifted != nil {
++				pb.leafScans[0] = shifted
++			} else {
++				pb.srcOffset = 0
++				continue
++			}
++		} else {
++			for i, leaf := range pb.leafScans {
++				shifted, err := remapSourceTableIdx(leaf, next)
++				if err != nil || shifted == nil {
++					return false
++				}
++				pb.leafScans[i] = shifted
+ 			}
+-			pb.leafScans[i] = shifted
+ 		}
+ 		for i := range pb.bodyBindings {
+ 			if pb.bodyBindings[i].sourceIdx != 0 {
+@@ -471,51 +491,6 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
+ 	return bodyCtx, leafScans, widths, onQuals, "", true
+ }
+ 
+-// pullupCTELeafEnabled gates M0145-0011 scope (c) / E2: admitting a
+-// `*CTEScan` leaf into the flat splice `flattenPulledBodyTree` performs,
+-// instead of declining the whole body with `body-leaf-(*optimizer.CTEScan)`.
+-//
+-// Default OFF. It is knob-arm measurement apparatus, not a relaxation:
+-// M0145-0011 lands none, and the default arm must stay byte-identical.
+-//
+-// At landing it was useless on its own and had to be paired with
+-// `GOOPG_DERIVED_FIREWALL=off`: a pulled ANY/EXISTS body becomes a
+-// JoinSemi/JoinAnti SpecialJoinInfo, and the `outer-over-derived` firewall's
+-// jointype switch covered Semi/Anti, so a body admitted here declined one
+-// step later at the firewall. M0145-0018 removed that firewall, so the
+-// pairing requirement is gone and this flag stands alone.
+-//
+-// Why a CTE leaf is the interesting case: the baseline census over TPC-DS
+-// makes `any-body-leaf-(*optimizer.CTEScan)` the largest non-`(pulled)`
+-// decline class (30 fires), and every one of those is an ANY sublink whose
+-// body FROM is a WITH reference — a derived input with no catalog statistics,
+-// which is exactly the population M0145-0011 exists to re-measure rather than
+-// argue about.
+-//
+-// MEASURED RESULT, and it is the reason this flag must not be read as a
+-// relaxation that works (E2, loop 41, TPC-DS SF0.25, both flags on):
+-//
+-//	pull-up census   any-body-leaf-(*optimizer.CTEScan) 30 -> 0, (pulled) 42 -> 72
+-//	seam census      leaf-count -> pulled-leaf-not-scan, same statements
+-//
+-// Every body this gate admits is declined ONE STEP LATER by the seam's own
+-// leaf-kind check (`pulled-leaf-not-scan`, joinsearchseam.go), whose comment
+-// names THIS function as its guarantor. The bare-`*SeqScan` rule is a
+-// TWO-SITE invariant — a producer and a consumer — so relaxing it here alone
+-// cannot put a CTE leaf into the DP. What it does instead is let `pulled`
+-// suppress the legacy pre-DP arm while the seam still declines, which is the
+-// exact shape that cost TPC-H Q4 a 10x regression; Q14/Q23/Q95 moved plans
+-// for that reason and not because the search found anything (values
+-// byte-identical, runtimes flat-to-slightly-worse at 13.1->14.5 s,
+-// 15.0->15.5 s, 3.0->3.2 s, against ESTIMATED costs that fell 1.4x-2.4x).
+-//
+-// So the resume point for scope (c) is the seam, not this line: the pulled
+-// leaf binding at joinsearchseam.go needs a `rangeBinding` for a leaf with no
+-// `Table`/`Alias`, plus an `estimateBaseRelInfo`/`applyRelSizeFallback` arm
+-// for a statistics-less leaf. That is a real piece of work, not a gate flip —
+-// filed as M0145-0013 (owner directive 2026-09-21).
+-var pullupCTELeafEnabled = os.Getenv("GOOPG_PULLUP_CTE_LEAF") == "on"
+-
+ // flattenPulledBodyTree decomposes the body's provisional jointree into
+ // its leaf scans plus the conjuncts of its inner-join ON clauses. Any
+ // non-inner link, any leaf that is not a bare *SeqScan (a demoted outer
+@@ -555,10 +530,12 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, string, b
+ 		if _, isScan := l.(*SeqScan); isScan {
+ 			continue
+ 		}
+-		if pullupCTELeafEnabled {
+-			if _, isCTE := l.(*CTEScan); isCTE {
+-				continue
+-			}
++		// A `*CTEScan` is a base rel of the pulled jointree, as PG's CTE
++		// RTE is: `seamLeafBinding` admits it and prices it from its body
++		// (M0145-0013). M0145-0011 scope (c) measured it behind a default-off
++		// knob; M0145-0008aa promoted it.
++		if _, isCTE := l.(*CTEScan); isCTE {
++			continue
+ 		}
+ 		// The leaf kind is named because it decides the remedy: a
+ 		// *Filter over a scan needs unwrapping, a derived item needs
+@@ -1332,12 +1309,6 @@ func anyPullupConjunct(c Expr) (*InExpr, bool) {
+ // needs exactly one body column to bind to.
+ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) (*jtPulledBody, string, bool) {
+ 	sub := in.Subquery
+-	if !sublinkBodyIsSimple(sub) {
+-		return nil, "any-body-not-simple", false
+-	}
+-	if len(sub.Targets) != 1 || sub.Targets[0].Expr == nil {
+-		return nil, "any-target-not-single", false
+-	}
+ 	// `contain_volatile_functions(sublink->testexpr)` (subselect.c:1385):
+ 	// once the testexpr becomes a join clause its evaluation count is the
+ 	// join's, not once per outer row.
+@@ -1349,6 +1320,17 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
+ 	if exprHasSublinkPlan(in.Operand) {
+ 		return nil, "any-nested-sublink-operand", false
+ 	}
++	// M0145-0008aa: PG does not ask whether the body is simple here —
++	// convert_ANY_sublink_to_join makes ANY sub-select a subquery RTE, and
++	// only pull_up_subqueries later decides whether to flatten it. A body
++	// goopg cannot flatten therefore enters the search as that subquery RTE:
++	// one derived leaf.
++	if !sublinkBodyIsSimple(sub) {
++		return pullUpAnyDerivedBody(in, parent, cat, ps)
++	}
++	if len(sub.Targets) != 1 || sub.Targets[0].Expr == nil {
++		return nil, "any-target-not-single", false
++	}
+ 	bodyCtx, leafScans, leafWidths, onQuals, why, ok := bindPulledBodyScope(sub, parent, cat, ps)
+ 	if !ok {
+ 		return nil, "any-" + why, false
+@@ -1395,6 +1377,70 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
+ 	}, "", true
+ }
+ 
++// anyDerivedAlias is the range-table alias PG gives the subquery RTE it
++// builds for a pulled-up ANY sublink (`makeAlias("ANY_subquery", NIL)`,
++// postgres/src/backend/optimizer/plan/subselect.c:1395).
++const anyDerivedAlias = "ANY_subquery"
++
++// pullUpAnyDerivedBody is the half of `convert_ANY_sublink_to_join` that
++// `pullUpAnyBody`'s flat splice cannot express: a body that is not simple
++// (grouped, HAVING, DISTINCT, set operations, LIMIT, its own WITH) becomes
++// ONE semi-side leaf carrying the body's whole plan — the subquery RTE PG
++// appends to the parent's range table
++// (postgres/src/backend/optimizer/plan/subselect.c:1390-1401), which
++// `pull_up_subqueries` then leaves in place because `is_simple_subquery`
++// refuses it (postgres/src/backend/optimizer/prep/prepjointree.c:1143).
++//
++// The body is planned exactly as a FROM-clause subquery is — goopg's
++// subquery RTE — through `planFromClause` over a one-item FROM list
++// `(<body>) AS ANY_subquery`. The testexpr becomes `operand =
++// ANY_subquery.col0`, synthesised the same way the flat arm does, so the
++// seam files it as the link predicate and the search may unique-ify the
++// leaf into an inner join (`create_unique_path`).
++//
++// One of PG's cases is refused: a CORRELATED body. PG marks that RTE
++// LATERAL (`use_lateral`, subselect.c:1357) and the search then needs a
++// parameterised path for it, which goopg's search does not build for a
++// derived leaf (the M0145-0010 family). The statement keeps the post-hoc
++// route instead, exactly as before this arm existed.
++func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps PlannerSettings) (*jtPulledBody, string, bool) {
++	wrap := &parser.SelectStmt{FromExprs: []parser.FromExpr{{
++		Base: parser.RangeVar{Subquery: in.Subquery, Alias: anyDerivedAlias},
++	}}}
++	node, bodyCtx, err := planFromClause(wrap, cat, ps, parent.rtScope)
++	if err != nil || bodyCtx == nil || len(bodyCtx.bindings) != 1 {
++		return nil, "any-derived-not-plannable", false
++	}
++	if _, isJoin := node.(*Join); isJoin {
++		return nil, "any-derived-not-one-leaf", false
++	}
++	out := node.Output()
++	if len(out) != 1 {
++		return nil, "any-target-not-single", false
++	}
++	if planHasEscapingOuterRef(node, 1) {
++		return nil, "any-derived-body-correlated", false
++	}
++	bodyCtx.cat = cat
++	bodyCtx.parent = parent
++	bodyCtx.settings = ps
++	outer, okOuter := outerOperandAsLevel1(in.Operand)
++	if !okOuter {
++		return nil, "any-operand-not-outer-columns", false
++	}
++	target := &ColumnRef{Index: 0, Name: out[0].Name, Type: out[0].Type, SourceTableIdx: out[0].SourceTableIdx}
++	link := &BinaryOp{Op: parser.OpEq, Left: outer, Right: target}
++	return &jtPulledBody{
++		expr:         in,
++		jointype:     parser.JoinSemi,
++		leafScans:    []Node{node},
++		leafWidths:   []int{len(out)},
++		bodyBindings: bodyCtx.bindings,
++		quals:        []Expr{link},
++		derived:      true,
++	}, "", true
++}
++
+ // outerOperandAsLevel1 re-expresses an outer-scope operand in the body's
+ // reference space: every `*ColumnRef` becomes `*OuterColumnRef{Level: 1}`,
+ // which is what a correlated body WHERE would have contained if the user had
+diff --git a/internal/optimizer/pullup_any_derived_test.go b/internal/optimizer/pullup_any_derived_test.go
+new file mode 100644
+index 000000000..014adb8b3
+--- /dev/null
++++ b/internal/optimizer/pullup_any_derived_test.go
+@@ -0,0 +1,104 @@
++package optimizer
++
++// M0145-0008aa — an ANY sublink whose body is not simple is pulled up as ONE
++// derived semi-side leaf, PG's un-flattened `ANY_subquery` RTE
++// (convert_ANY_sublink_to_join, postgres/src/backend/optimizer/plan/
++// subselect.c:1333). Before this arm the pull-up declined the body with
++// `any-body-not-simple` and the statement took the post-hoc route.
++
++import (
++	"testing"
++
++	"github.com/goopg/goopg/internal/parser"
++)
++
++// TestPullUpAnyDerivedBody pins the derived arm at the pull-up itself: the
++// body becomes a single leaf holding the body's own plan, marked derived, with
++// the testexpr synthesised as its one link qual.
++func TestPullUpAnyDerivedBody(t *testing.T) {
++	cases := map[string]string{
++		"group-having": `select tag from jtp_o where k in (select j from jtp_i group by j having sum(v) > 3)`,
++		"distinct":     `select tag from jtp_o where k in (select distinct j from jtp_i)`,
++		"limit":        `select tag from jtp_o where k in (select j from jtp_i order by j limit 5)`,
++		"union":        `select tag from jtp_o where k in (select j from jtp_i union select j2 from jtp_i2)`,
++	}
++	for name, sql := range cases {
++		t.Run(name, func(t *testing.T) {
++			cat := jtpCatalog(t)
++			delete(sublinkRouteCounts, spineRoutePosthoc)
++			delete(sublinkRouteCounts, spineRouteJointree)
++			node := planOnPipeline(t, sql, cat)
++			if n := sublinkRouteCounts[spineRouteJointree]; n != 1 {
++				t.Fatalf("jointree pull-up engaged %d times, want 1; tree: %s", n, describePlanTree(node))
++			}
++			j := findSemiOrAntiJoin(node)
++			if j == nil || j.Type != JoinTypeSemi {
++				t.Fatalf("no searched semi join over the derived leaf; tree: %s", describePlanTree(node))
++			}
++		})
++	}
++}
++
++// TestPullUpAnyDerivedBodyDeclines pins the one PG case the arm refuses: a
++// correlated body, which PG pulls up as a LATERAL subquery RTE and goopg's
++// search cannot parameterise. It must keep the post-hoc route (and so its
++// values), not enter the search with an unbound outer reference.
++func TestPullUpAnyDerivedBodyDeclines(t *testing.T) {
++	cat := jtpCatalog(t)
++	delete(sublinkRouteCounts, spineRoutePosthoc)
++	delete(sublinkRouteCounts, spineRouteJointree)
++	sql := `select tag from jtp_o where k in (select max(j) from jtp_i where v = k group by v)`
++	if planOnPipeline(t, sql, cat) == nil {
++		t.Fatal("declined pull-up returned a nil plan")
++	}
++	if n := sublinkRouteCounts[spineRouteJointree]; n != 0 {
++		t.Errorf("pull-up engaged %d times on a correlated derived body", n)
++	}
++}
++
++// TestPullUpAnyDerivedBodyRecord checks the record the pull-up hands the seam:
++// one leaf, flagged derived, whose one qual is `outer = leaf.col0`.
++func TestPullUpAnyDerivedBodyRecord(t *testing.T) {
++	cat := jtpCatalog(t)
++	stmt := parseOne(t, `select tag from jtp_o where k in (select j from jtp_i group by j having count(*) > 1)`)
++	sel, ok := stmt.(*parser.SelectStmt)
++	if !ok {
++		t.Fatalf("parsed %T, want *parser.SelectStmt", stmt)
++	}
++	outer, ctx, err := planFromClause(sel, cat, PlannerSettings{}, nil)
++	if err != nil || outer == nil {
++		t.Fatalf("planFromClause: %v", err)
++	}
++	ctx.cat = cat
++	pred, err := resolveExpr(sel.Where, ctx)
++	if err != nil {
++		t.Fatalf("resolve WHERE: %v", err)
++	}
++	in, okIn := anyPullupConjunct(pred)
++	if !okIn {
++		t.Fatalf("WHERE is not an ANY pull-up conjunct: %T", pred)
++	}
++	pb, why, ok := pullUpAnyBody(in, ctx, cat, PlannerSettings{}, 0)
++	if !ok {
++		t.Fatalf("derived body declined: %s", why)
++	}
++	if !pb.derived || len(pb.leafScans) != 1 || len(pb.bodyBindings) != 1 {
++		t.Fatalf("derived=%v leaves=%d bindings=%d, want true/1/1", pb.derived, len(pb.leafScans), len(pb.bodyBindings))
++	}
++	if pb.bodyBindings[0].alias != anyDerivedAlias {
++		t.Errorf("leaf alias = %q, want %q", pb.bodyBindings[0].alias, anyDerivedAlias)
++	}
++	if len(pb.quals) != 1 {
++		t.Fatalf("quals = %d, want the single synthesised link", len(pb.quals))
++	}
++	link, ok := pb.quals[0].(*BinaryOp)
++	if !ok {
++		t.Fatalf("link qual is %T, want *BinaryOp", pb.quals[0])
++	}
++	if _, isOuter := link.Left.(*OuterColumnRef); !isOuter {
++		t.Errorf("link LHS is %T, want the operand as *OuterColumnRef", link.Left)
++	}
++	if cr, isCol := link.Right.(*ColumnRef); !isCol || cr.Index != 0 {
++		t.Errorf("link RHS = %#v, want the derived leaf's column 0", link.Right)
++	}
++}
+diff --git a/internal/optimizer/pullup_cte_leaf_test.go b/internal/optimizer/pullup_cte_leaf_test.go
+index dda760382..117e2ea19 100644
+--- a/internal/optimizer/pullup_cte_leaf_test.go
++++ b/internal/optimizer/pullup_cte_leaf_test.go
+@@ -7,18 +7,12 @@ import (
+ 	"github.com/goopg/goopg/internal/parser"
+ )
+ 
+-// TestFlattenPulledBodyTreeCTELeafGate pins M0145-0011 scope (c): the pulled
+-// body's flat splice declines a `*CTEScan` leaf by default and admits it only
+-// under `GOOPG_PULLUP_CTE_LEAF=on`.
+-//
+-// The DEFAULT arm is what this test mainly protects. The scope-(c) relaxation
+-// is knob-arm measurement apparatus — M0145-0011 lands no relaxation — so a
+-// future edit that makes the admission unconditional has to fail a test rather
+-// than merely change a plan somewhere in a sweep. The decline REASON is pinned
+-// too, because the census counts the reason string: the loop-41 baseline read
+-// `any-body-leaf-(*optimizer.CTEScan)` 30 times over TPC-DS, and a silent
+-// rename of that string would report the relaxation as a no-op.
+-func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
++// TestFlattenPulledBodyTreeAdmitsCTELeaf pins M0145-0008aa's promotion of
++// M0145-0011 scope (c): the pulled body's flat splice admits a `*CTEScan` leaf
++// unconditionally, as PG treats a CTE reference in a sublink body as a base rel
++// of the pulled-up jointree. The splice must carry the CTE leaf itself — the
++// seam (`seamLeafBinding`) prices it from its body.
++func TestFlattenPulledBodyTreeAdmitsCTELeaf(t *testing.T) {
+ 	cat := catalog.NewInMemory()
+ 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "pcl_t"}, []catalog.Column{
+ 		{Name: "a", Type: catalog.Type{Name: "int4"}},
+@@ -31,20 +25,9 @@ func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
+ 	cte := &CTEScan{Name: "c", Alias: "c", Child: cteBody, schema: tableSchema(tbl)}
+ 	body := &Join{Type: JoinTypeInner, Left: scan, Right: cte}
+ 
+-	restore := pullupCTELeafEnabled
+-	defer func() { pullupCTELeafEnabled = restore }()
+-
+-	pullupCTELeafEnabled = false
+-	if _, _, why, ok := flattenPulledBodyTree(body, 2); ok {
+-		t.Fatalf("default arm admitted a *CTEScan leaf; GOOPG_PULLUP_CTE_LEAF defaults off and the gate must decline")
+-	} else if why != "body-leaf-(*optimizer.CTEScan)" {
+-		t.Fatalf("decline reason = %q, want body-leaf-(*optimizer.CTEScan) — the census counts this string", why)
+-	}
+-
+-	pullupCTELeafEnabled = true
+ 	leaves, _, why, ok := flattenPulledBodyTree(body, 2)
+ 	if !ok {
+-		t.Fatalf("knob arm declined a *CTEScan leaf: why=%q", why)
++		t.Fatalf("flat splice declined a *CTEScan leaf: why=%q", why)
+ 	}
+ 	if len(leaves) != 2 {
+ 		t.Fatalf("leaves = %d, want 2", len(leaves))
+@@ -55,9 +38,9 @@ func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
+ }
+ 
+ // TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines pins the NARROWNESS of
+-// scope (c): the flag admits `*CTEScan` and nothing else. A `*Filter` over a
++// the flat splice: it admits `*SeqScan` and `*CTEScan` and nothing else. A `*Filter` over a
+ // scan (the "needs unwrapping" case the decline comment names) must still
+-// decline even with the knob on, because the splice's qual rebase assumes the
++// decline, because the splice's qual rebase assumes the
+ // leaf emits exactly its own Output() and a Filter changes the row count
+ // without changing the schema.
+ func TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines(t *testing.T) {
+@@ -72,12 +55,8 @@ func TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines(t *testing.T) {
+ 	filtered := &Filter{Child: &SeqScan{Table: tbl, schema: tableSchema(tbl)}}
+ 	body := &Join{Type: JoinTypeInner, Left: scan, Right: filtered}
+ 
+-	restore := pullupCTELeafEnabled
+-	defer func() { pullupCTELeafEnabled = restore }()
+-	pullupCTELeafEnabled = true
+-
+ 	if _, _, why, ok := flattenPulledBodyTree(body, 2); ok {
+-		t.Fatalf("knob arm admitted a *Filter leaf; scope (c) covers *CTEScan only")
++		t.Fatalf("flat splice admitted a *Filter leaf; it covers *SeqScan and *CTEScan only")
+ 	} else if why != "body-leaf-(*optimizer.Filter)" {
+ 		t.Fatalf("decline reason = %q, want body-leaf-(*optimizer.Filter)", why)
+ 	}
+diff --git a/scripts/planner-flags.env b/scripts/planner-flags.env
+index 66e18b9f7..af305c09e 100644
+--- a/scripts/planner-flags.env
++++ b/scripts/planner-flags.env
+@@ -47,7 +47,8 @@ GOOPG_PLANNER_FLAG_RETIRED_GOOPG_HASHAGG_WIDTH_CURRENCY=1
+ GOOPG_PLANNER_FLAG_LABEL_GOOPG_INCREMENTAL_SORT='unset(off)'
+ GOOPG_PLANNER_FLAG_LABEL_GOOPG_DERIVED_FIREWALL='retired(M0145-0018)'
+ GOOPG_PLANNER_FLAG_RETIRED_GOOPG_DERIVED_FIREWALL=1
+-GOOPG_PLANNER_FLAG_LABEL_GOOPG_PULLUP_CTE_LEAF='unset(off)'
++GOOPG_PLANNER_FLAG_LABEL_GOOPG_PULLUP_CTE_LEAF='retired(M0145-0008aa)'
++GOOPG_PLANNER_FLAG_RETIRED_GOOPG_PULLUP_CTE_LEAF=1
+ GOOPG_PLANNER_FLAG_LABEL_GOOPG_CTE_ROWS_FALLBACK='retired(M0145-0012)'
+ GOOPG_PLANNER_FLAG_RETIRED_GOOPG_CTE_ROWS_FALLBACK=1
+ GOOPG_PLANNER_FLAG_LABEL_GOOPG_JOINTREE_PIPELINE='retired(M0145-0008)'

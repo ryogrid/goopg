@@ -51,7 +51,7 @@ func TestPartialIndexNotChosenForUnprovenQual(t *testing.T) {
 	idx.HasPredicate = true
 	idx.PredicateString = "((unique1 < 20) OR (unique1 > 980))"
 
-	if got := findBTreeIndexForColumn(cat, tbl, "unique1", nil); got != nil {
+	if got := findBTreeIndexForColumn(cat, tbl, "unique1", nil, nil); got != nil {
 		t.Fatalf("findBTreeIndexForColumn returned partial index %q; a partial index "+
 			"whose predicate is not proven from the quals must be declined "+
 			"(it silently drops the rows the predicate excludes)", got.Name)
@@ -82,7 +82,7 @@ func TestNonPartialIndexStillChosen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := findBTreeIndexForColumn(cat, tbl, "unique1", nil)
+	got := findBTreeIndexForColumn(cat, tbl, "unique1", nil, nil)
 	if got == nil {
 		t.Fatal("findBTreeIndexForColumn declined a plain (non-partial) index")
 	}
@@ -119,7 +119,7 @@ func TestPlainIndexPreferredOverPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := findBTreeIndexForColumn(cat, tbl, "unique1", nil)
+	got := findBTreeIndexForColumn(cat, tbl, "unique1", nil, nil)
 	if got == nil {
 		t.Fatal("no index chosen; the plain index onek2_u1 is usable")
 	}
@@ -233,7 +233,7 @@ func TestPartialIndexNotChosenForNonImpliedQual(t *testing.T) {
 	// Plan-level assertion: findBTreeIndexForColumn must decline the index,
 	// so the query still falls through to a SeqScan/Filter (today's
 	// behavior), never an IndexScan on onek2_u1_prtl.
-	got := findBTreeIndexForColumn(cat, tbl, "unique1", queryClause)
+	got := findBTreeIndexForColumn(cat, tbl, "unique1", queryClause, nil)
 	if got != nil {
 		t.Fatalf("findBTreeIndexForColumn returned partial index %q for unique1 = 50 against predicate %q — would silently drop rows",
 			got.Name, idx.PredicateString)

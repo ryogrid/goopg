@@ -117,6 +117,12 @@ type Pool struct {
 	arena *arena
 	slots []Slot
 	wal   WALFlusher
+	// btreeStructureLocks serialises structural B-tree changes per relation
+	// across every BTree handle opened from this pool. A backend constructs its
+	// own handle, so a mutex stored only on BTree cannot protect a split from a
+	// concurrent split or vacuum unlink issued by another connection.
+	btreeStructureMu    sync.Mutex
+	btreeStructureLocks map[RelFileNode]*sync.Mutex
 	// logFPI emits a full-page-image WAL record and returns the
 	// record's end LSN. nil disables FPI emission.
 	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
@@ -151,6 +157,8 @@ type Pool struct {
 	logHeapUpdate LogHeapUpdateFunc
 	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
+	// logHeapVacuumCleanup emits VACUUM's second-heap-pass record.
+	logHeapVacuumCleanup LogHeapVacuumCleanupFunc
 	// logSmgrTruncateTo emits the truncate-to-N WAL record (parity E2).
 	logSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
 	// logSmgrCreate emits a relation-file creation WAL record. A9: carries the
@@ -669,6 +677,9 @@ type PoolConfig struct {
 	LogHeapUpdate            LogHeapUpdateFunc
 	LogHeapPruneOpt          LogHeapPruneOptFunc
 	LogSmgrCreate            func(rel RelFileNode, xid TransactionID) error
+	// LogHeapVacuumCleanup emits VACUUM's second-heap-pass record
+	// (M0145-0008v). nil falls back to MarkDirty.
+	LogHeapVacuumCleanup LogHeapVacuumCleanupFunc
 	// LogSmgrTruncateTo emits the truncate-to-N WAL record BEFORE the
 	// physical file shrink (WAL-first, upstream XLOG_SMGR_TRUNCATE order).
 	LogSmgrTruncateTo func(rel RelFileNode, keep BlockNumber) error
@@ -817,8 +828,13 @@ type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlo
 // new version lands at (newBlk, newSlot); oldBlk may equal newBlk.
 type LogHeapUpdateFunc func(rel RelFileNode, oldBlk BlockNumber, oldSlot uint16, newBlk BlockNumber, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
-// LogHeapPruneOptFunc emits one opportunistic page-pruning redo record.
-type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)
+// LogHeapPruneOptFunc emits one page-pruning redo record: the redirected, the
+// now-LP_DEAD and the now-unused line pointers (PruneResult's three lists).
+type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, dead, unused []uint16) (LSN, error)
+
+// LogHeapVacuumCleanupFunc emits one VACUUM second-heap-pass record: the
+// LP_DEAD items set LP_UNUSED once their index entries were removed.
+type LogHeapVacuumCleanupFunc func(rel RelFileNode, blk BlockNumber, unused []uint16) (LSN, error)
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
 // Go-heap arena.
@@ -838,6 +854,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		mgr:                      mgr,
 		arena:                    a,
 		slots:                    make([]Slot, cfg.Slots),
+		btreeStructureLocks:      make(map[RelFileNode]*sync.Mutex),
 		wal:                      cfg.WAL,
 		logFPI:                   cfg.LogPageImage,
 		logBtreeSplit:            cfg.LogBtreeSplit,
@@ -855,6 +872,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
 		logHeapUpdate:            cfg.LogHeapUpdate,
 		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+		logHeapVacuumCleanup:     cfg.LogHeapVacuumCleanup,
 		logSmgrTruncateTo:        cfg.LogSmgrTruncateTo,
 		logSmgrCreate:            cfg.LogSmgrCreate,
 		logChangeRecord:          cfg.LogChangeRecord,
@@ -877,6 +895,21 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		p.slots[i].idx = int32(i)
 	}
 	return p, nil
+}
+
+// BTreeStructuralLock returns the pool-owned mutex for rel's structural B-tree
+// updates. It is intentionally relation-scoped: unrelated indexes may split
+// concurrently, while independently opened handles for the same index share
+// one protocol gate.
+func (p *Pool) BTreeStructuralLock(rel RelFileNode) *sync.Mutex {
+	p.btreeStructureMu.Lock()
+	defer p.btreeStructureMu.Unlock()
+	if mu := p.btreeStructureLocks[rel]; mu != nil {
+		return mu
+	}
+	mu := new(sync.Mutex)
+	p.btreeStructureLocks[rel] = mu
+	return mu
 }
 
 // LogBtreeSplit returns the configured atomic split-record hook.
@@ -966,6 +999,9 @@ func (p *Pool) LogHeapUpdate() LogHeapUpdateFunc { return p.logHeapUpdate }
 
 // LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
+
+// LogHeapVacuumCleanup returns the VACUUM second-heap-pass record hook.
+func (p *Pool) LogHeapVacuumCleanup() LogHeapVacuumCleanupFunc { return p.logHeapVacuumCleanup }
 
 // BtreeRecycleHorizonFunc reports the two FullTransactionIds b-tree page
 // deletion needs (M0130-S11.5d-3c):
@@ -2130,6 +2166,65 @@ func (p *Pool) SlotPinCount(tag BufferTag) int32 {
 		return 0
 	}
 	return int32(statePin(st))
+}
+
+// Cleanup locks (M0145-0008q). PG moves tuple bytes on a heap page (prune,
+// vacuum repack) only under a cleanup lock: the exclusive content lock, held
+// while the caller's pin is the page's only pin (bufmgr.c
+// LockBufferForCleanup / ConditionalLockBufferForCleanup /
+// IsBufferCleanupOK). A backend that holds a pin may then keep reading a
+// tuple after it drops the content lock, because nothing can compact the page
+// under it. A new pin taken while the cleanup lock is held is harmless: the
+// new pinner reads nothing until it gets the content lock.
+//
+// goopg has no per-backend private refcount, so "only pin" is the shared pin
+// count equal to 1. A caller that holds two pins on the same page itself
+// (a scan's plus an updater's) therefore never gets the cleanup lock, which
+// PG's conditional variant also refuses.
+
+// IsCleanupOK reports whether a caller that already holds s's exclusive
+// content lock and one pin holds the page's only pin (PG IsBufferCleanupOK).
+func (p *Pool) IsCleanupOK(s *Slot) bool {
+	return statePin(s.state.Load()) == 1
+}
+
+// ConditionalLockForCleanup takes s's cleanup lock without waiting (PG
+// ConditionalLockBufferForCleanup). It returns false, holding no content
+// lock, when the content lock is busy or another pin exists. The caller
+// holds one pin.
+func (p *Pool) ConditionalLockForCleanup(s *Slot) bool {
+	if !s.contentMu.TryLock() {
+		return false
+	}
+	if p.IsCleanupOK(s) {
+		return true
+	}
+	s.contentMu.Unlock()
+	return false
+}
+
+// cleanupLockMaxBackoff caps the wait between LockForCleanup retries.
+const cleanupLockMaxBackoff = 10 * time.Millisecond
+
+// LockForCleanup takes s's cleanup lock, waiting until the caller's pin is
+// the only one (PG LockBufferForCleanup). PG sleeps until the last other
+// unpinner signals it (BM_PIN_COUNT_WAITER); this retries with a capped
+// backoff instead, dropping the content lock between attempts so the other
+// pinners can finish their page. The caller holds one pin and must not hold
+// a second pin on s, or this never returns.
+func (p *Pool) LockForCleanup(s *Slot) {
+	backoff := 50 * time.Microsecond
+	for {
+		s.contentMu.Lock()
+		if p.IsCleanupOK(s) {
+			return
+		}
+		s.contentMu.Unlock()
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > cleanupLockMaxBackoff {
+			backoff = cleanupLockMaxBackoff
+		}
+	}
 }
 
 // Unpin decrements the slot's pin count via CAS.

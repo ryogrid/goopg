@@ -135,7 +135,15 @@ func stripeAppendBuiltEmitted(
 	// publication freezes.
 	defer insertTracker.setInsertingAt(stripe, lsnIdle)
 
-	start, prev, total, leading = posTracker.reserveEmittedAndPublish(recordLen, stripe, insertTracker)
+	var reserved bool
+	start, prev, total, leading, reserved = posTracker.reserveEmittedAndPublish(recordLen, stripe, insertTracker)
+	if !reserved {
+		// The reservation was refused because its emitted range would exceed
+		// the walBuffer's live window (head+cap) — nothing was committed to
+		// curr, so the caller can drain and retry. walBufferCapacityExceeded
+		// is the same signal tryReserve returns for the overflow case.
+		return 0, 0, 0, 0, walBufferCapacityExceeded
+	}
 
 	out, berr := build(start, prev, total, leading)
 	if berr != nil {
@@ -157,9 +165,17 @@ func stripeAppendBuiltEmitted(
 		// has already set head = tail - cap, leaving the window boundary at tail
 		// which excludes the next write's start LSN.
 		memRing.AdvanceWindow(end)
-		if merr := memRing.WriteReserved(int64(start), out); merr != nil {
-			return start, prev, total, leading, merr
-		}
+		// A failed mirror write is NOT an append failure: the memRing is a
+		// walsender read cache whose misses fall back to the segment file.
+		// AdvanceWindow above is not atomic with WriteReserved, so a peer
+		// stripe's own AdvanceWindow can slide head past start while this
+		// write is in flight (errMemRingReservedOutOfRange). Treating that as
+		// an append error was fatal: the caller released the walBuf capacity
+		// claim while curr stayed advanced, leaving an uncounted LSN hole
+		// (curr - tail > reservedBytes) that let later reservations overshoot
+		// the ring window — TestPort_IsolationSuite writeReserved cascade,
+		// 2026-09-19.
+		_ = memRing.WriteReserved(int64(start), out)
 	}
 	return start, prev, total, leading, nil
 }

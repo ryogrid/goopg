@@ -111,15 +111,17 @@ task done with a note "already fixed / stale item" instead of investigating.
 >   `ci/logs/action-items.md` and files each new `## AI-` subject as a task under
 >   the M-NIGHTLY milestone. The batch → log → agent → fix_plan flow is untouched.
 > - **Selection no longer preempts.** Rule 2's "these PREEMPT all other
->   milestones" is suspended while `.ralph/fix_plan.md`'s `## Current Priority`
->   banner parks M-NIGHTLY — today beneath **M0124** (TPC-DS round-2 closeout
->   measurement) and **M0125**. Filed items stay unchecked until both close.
+>   milestones" is suspended whenever `.ralph/fix_plan.md`'s `## Current Priority`
+>   banner parks M-NIGHTLY. **Current parking (2026-09-14, user directive): the
+>   plan-parity milestone group M0137–M0143 is selected ahead of M-NIGHTLY's own
+>   items.** (The original 2026-07-28(b) parking named M0124/M0125; both are long
+>   closed, and that text is superseded.) Filed items stay unchecked meanwhile.
 > - **Two carve-outs may still be worked immediately**, because the parked
 >   milestones cannot be measured without them: an item that breaks the build, and
 >   an item that breaks a gate they depend on (`scripts/tpch-spotcheck.sh`, the
->   TPC-DS SF0.5 gate, `make plan-diff`, a bench cluster).
+>   TPC-DS SF0.25 gate, `make plan-gate`, a bench cluster).
 > - **Reversion is automatic**, not a further edit: the charter's original rule 2
->   applies again as soon as the banner stops naming M0124/M0125. The mechanism is
+>   applies again as soon as the banner stops parking M-NIGHTLY. The mechanism is
 >   the one §B already relies on — fix_plan.md's own "unless the Current Priority
 >   banner forces another order" convention — so this amendment changes which
 >   order the banner forces, not who decides.
@@ -130,6 +132,14 @@ task done with a note "already fixed / stale item" instead of investigating.
 > header + charter rule 2) and `.ralph/PROMPT.md` objective 2, which also gained a
 > precedence rule: the banner outranks `.ralph/working_set.md`'s "NEXT LOOP" note.
 
+> **SUPERSEDED 2026-09-14.** M0124, M0125 and M0126 are all closed, so the
+> amendment below no longer names the live parking set and its
+> automatic-reversion clause must NOT be read as firing. The parking set is now
+> the plan-parity group **M0137–M0143** per the 07-28(b) amendment as revised
+> above; the reversion clause keys on that group, not on M0124/M0125/M0126.
+> Filing stays unconditional; the two carve-outs are unchanged. The reference to
+> `.ralph/AGENT.md` below is also wrong — the file is `AGENT.md` at the repo root.
+>
 > **AMENDMENT 2026-07-31 — the parking set gains M0126.** The USER filed
 > **M0126** (cost-driven planning made production-viable,
 > `docs/milestones/0126-cost-driven-planning-production-viability.md`) directly
@@ -197,11 +207,17 @@ Notes on the mechanics:
   header rule is "pick the topmost unchecked item **unless the Current
   Priority banner forces another order**" — so implementation does BOTH:
   place M-NIGHTLY at the top of the milestone list AND add one line to the
-  `## Current Priority` banner: *"Standing exception: M-NIGHTLY triage items
-  (from ci/logs/action-items.md) preempt everything below."* Plus the
-  PROMPT.md line (§C). No driver change is needed. (`.ralph/AGENT.md`
-  carries a variant of the pick-topmost rule *without* the banner clause —
-  topmost placement satisfies that copy too, so both formulations agree.)
+  `## Current Priority` banner naming M-NIGHTLY's standing. Plus the
+  PROMPT.md line (§C). No driver change is needed. (`AGENT.md` — repo root, not
+  `.ralph/AGENT.md` — carries its own copy of the pick-topmost rule, and it
+  **does** include the banner clause; both formulations agree because both
+  defer to the banner. Since 2026-09-14 the banner's preemption clause is
+  parked: filing stays unconditional, selection ranks M0137–M0143 first.)
+  **Updated 2026-09-24:** task-selection rules consolidated — authority is
+  `.ralph/PROMPT.md` (procedure) + the banner's "Selection rules"
+  subsection (rank); this whole bullet is design history, not the live
+  rule (AGENT.md's pick-topmost copy is also gone — replaced by a pointer
+  to the same two authorities).
 
 ## C. One-line hook in `.ralph/PROMPT.md` (implementation edit)
 

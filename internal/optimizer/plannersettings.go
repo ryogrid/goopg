@@ -64,6 +64,11 @@ type PlannerSettings struct {
 	EnableMergeJoin bool
 	EnableNestLoop  bool
 
+	// EnableParallelHash is PG's `enable_parallel_hash` (joinpath.c:2437):
+	// unlike the method toggles above it IS a generation gate — PG files no
+	// `parallel_hash = true` path when it is off. M0146-0002.
+	EnableParallelHash bool
+
 	// EnableSort is PG's `enable_sort` (B-17a): cost_sort's own flag on top of
 	// the input's disabled_nodes count (costsize.c:2144). The producer
 	// (sortPathFor) still builds the Sort path when off, so a query whose
@@ -185,6 +190,23 @@ type PlannerSettings struct {
 	// the transaction's isolation level above all — cannot be known here at
 	// all, and are enforced POST-cache by `StripGather` (parallel.go).
 	ParallelStatementOK bool
+
+	// appendrelMember is the M0145-0004 member-scope flag: set on the
+	// PlannerSettings handed to a UNION ALL subquery's scope when the
+	// subquery passed the is_simple_union_all port on the jointree
+	// pipeline (planSubqueryRangeVar). The union scope itself never reads
+	// it — a set-operation statement is never isSimpleSingle — but the
+	// fold threads the same settings into each member's
+	// planSelectWithSettings call, where it lifts the `isSimpleSingle`
+	// bypass exactly once: the member is a leaf of an appendrel, so its
+	// search must run to produce the searched rel whose PartialPathlist
+	// the SETOP rel's partial arms pick from (allpaths.c:1412-1453's
+	// per-child choice needs the child's partial_pathlist, which the
+	// rule-based single-table chooser never builds). planSelectImpl
+	// clears it after the read, bounding the lift to the member scope —
+	// the member's own nested subqueries plan exactly as they did.
+	// Unexported like the scope it describes: not a session boundary.
+	appendrelMember bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no
@@ -199,6 +221,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableHashJoin:  true,
 		EnableMergeJoin: true,
 		EnableNestLoop:  true,
+		EnableParallelHash: true,
 		EnableSort:      true,
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
@@ -262,6 +285,7 @@ func (ps PlannerSettings) costParams() costParams {
 		// method toggles ride along with the cost inputs they are weighed
 		// against.
 		enableHashJoin:  ps.EnableHashJoin,
+		enableParallelHash: ps.EnableParallelHash,
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
 		enableSort:      ps.EnableSort,

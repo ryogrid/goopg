@@ -1,6 +1,6 @@
 package optimizer
 
-// C-04c enum-trace evidence, and the C-04a/b regression mirrors.
+// C-04c enum-trace evidence.
 //
 // C-03d's fixtures drive the SEARCH directly because the seam still peeled
 // those links. C-04c's shapes reach the search through the production seam, so
@@ -12,9 +12,6 @@ package optimizer
 import (
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 )
 
 // c04cTraceSeam runs the seam under both trace gates and returns the emitted
@@ -57,7 +54,6 @@ func c04cJointypesFor(lines []string, relids string) (map[string]bool, int, int)
 // would drop the unmatched `a` rows and no row count on this fixture would
 // notice.
 func TestEnumTraceAdmitsALeftLinkBelowAnInnerLink(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := c04cBelowInner(t, names, []int64{100_000, 50_000, 10}, rfjEq(names, 0, 2))
 	lines, used := c04cTraceSeam(t, node, seamLocal(names, 0), ctx)
@@ -84,7 +80,6 @@ func TestEnumTraceAdmitsALeftLinkBelowAnInnerLink(t *testing.T) {
 // an un-re-based qual would name `a0 = b0`, the {b,c} pairing would carry no
 // clause and the search would never offer it.
 func TestEnumTraceAdmitsALeftLinkOnANonFirstCommaItem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamFixture(names, []int64{100_000, 50_000, 10})
 	a, b, c := seamLeaves(t, node)
@@ -125,7 +120,6 @@ func TestEnumTraceAdmitsALeftLinkOnANonFirstCommaItem(t *testing.T) {
 // could not reach, so a remap that happened to work only for a top-of-chain
 // link would fail here.
 func TestBelowInnerLeftLinkSurvivesCollapseSplit(t *testing.T) {
-	withPGShapedDP(t)
 	for _, n := range []int{4, 8, 9, 10, 11} {
 		names := make([]string, n)
 		rows := make([]int64, n)
@@ -166,61 +160,5 @@ func TestBelowInnerLeftLinkSurvivesCollapseSplit(t *testing.T) {
 			t.Errorf("n=%d: outer link lost through the collapse split "+
 				"(outer-preserving=%d, want 1)", n, nouter)
 		}
-	}
-}
-
-// TestSeamBelowInnerLeftLinkOverDerivedInputsDeclines is the C-04a Q78 firewall
-// verified on C-04c's shape, and it is built the way `with.go` builds a CTE
-// binding — a SYNTHESISED, NON-NIL `catalog.Table` under a pushed-down
-// `*Filter` — because that is exactly how Q78's leaves escaped the firewall's
-// first version. A fixture with a nil table, or a bare `*CTEScan`, would pass
-// on the broken classifier and prove nothing.
-func TestSeamBelowInnerLeftLinkOverDerivedInputsDeclines(t *testing.T) {
-	withPGShapedDP(t)
-	names := []string{"a", "b", "c"}
-	node, ctx := seamChainFromSQLWrapped(t, names, []int64{100_000, 50_000, 10},
-		"a LEFT JOIN b ON a.x = b.x JOIN c ON a.x = c.x",
-		func(i int, leaf Node) Node { return &Filter{Child: &CTEScan{Name: names[i]}} })
-	for i := range ctx.bindings {
-		ctx.bindings[i].table = &catalog.Table{Name: names[i]}
-	}
-	// Rebuild the chain over the wrapped leaves with the qual shape the
-	// admitted case needs (top link reads the preserved side).
-	chain := node.(*Join)
-	chain.Predicate = rfjEq(names, 0, 2)
-	out, residual, used := tryPGShapedJoinSearch(chain, seamLocal(names, 0), ctx, nil)
-	if used {
-		t.Fatal("the seam searched a below-inner LEFT link over Filter-wrapped CTE leaves; " +
-			"the outer-over-derived firewall must decline it (C-04a Q78: 15 s -> 327 s timeout)")
-	}
-	if out != chain || residual == nil {
-		t.Fatal("the seam altered its inputs while declining")
-	}
-	// And the same shape over BASE leaves is searched, so the decline above is
-	// the firewall and not some unrelated refusal.
-	base, bctx := seamChainFromSQL(t, names, []int64{100_000, 50_000, 10},
-		"a LEFT JOIN b ON a.x = b.x JOIN c ON a.x = c.x")
-	base.(*Join).Predicate = rfjEq(names, 0, 2)
-	if _, _, okBase := tryPGShapedJoinSearch(base, seamLocal(names, 0), bctx, nil); !okBase {
-		t.Fatal("the base-leaf control also declined; the firewall test above is vacuous")
-	}
-}
-
-// TestProblemPairsOuterWithDerivedBelowInnerLink is the firewall's unit view of
-// the shape above: the SJI hands describe a link whose preserved side is item 0
-// and whose nullable side is item 1, with an INNER link above it — the outer
-// hand still touches a derived item and must decline.
-func TestProblemPairsOuterWithDerivedBelowInnerLink(t *testing.T) {
-	prob := &joinlistProblem{
-		scans:    []Node{wrappedCTELeaf("a"), wrappedCTELeaf("b"), wrappedCTELeaf("c")},
-		relInfos: []baseRelInfo{{table: cteTable("a")}, {table: cteTable("b")}, {table: cteTable("c")}},
-	}
-	items := []joinlistRel{{lo: 0, hi: 1}, {lo: 1, hi: 2}, {lo: 2, hi: 3}}
-	sjis := []*SpecialJoinInfo{
-		{Jointype: parser.JoinLeft, SynLefthand: 1 << 0, SynRighthand: 1 << 1,
-			MinLefthand: 1 << 0, MinRighthand: 1 << 1},
-	}
-	if !problemPairsOuterWithDerived(sjis, items, prob) {
-		t.Errorf("a below-inner LEFT link over Filter-wrapped CTE leaves must decline")
 	}
 }

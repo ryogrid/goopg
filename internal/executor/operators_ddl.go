@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/big"
 	"net"
@@ -42,6 +43,10 @@ type ddlOp struct {
 	plan *optimizer.DDL
 	ctx  *Context
 	done bool
+	// buildHeapTuples is the live heap-tuple count the latest btree build's
+	// heap scan saw — heapam_index_build_range_scan's return value, which
+	// index_update_stats publishes as the heap's reltuples.
+	buildHeapTuples float64
 	// pendingDropShadow carries the table a CREATE displaced by overwriting a
 	// same-transaction deferred-DROP's still-present catalog slot
 	// (M0134-0023). Set by execCreateTable right after
@@ -51,7 +56,25 @@ type ddlOp struct {
 	// can (a) use CreateTableReplacingPendingDrop instead of the guarded
 	// CreateTable, and (b) stash it on the DDLUndoEntry for ROLLBACK restore.
 	pendingDropShadow *catalog.Table
+	// processed counts the rows a populating CREATE TABLE AS / SELECT INTO /
+	// CREATE MATERIALIZED VIEW wrote; reportProcessed says the statement's
+	// CommandComplete tag is PostgreSQL's `SELECT <n>` (createas.c:349,
+	// matview.c:389 — SetQueryCompletion(qc, CMDTAG_SELECT, es_processed)).
+	// REFRESH shares materializeView (so it counts too) but leaves
+	// reportProcessed false: its tag is plain REFRESH MATERIALIZED VIEW.
+	processed       int64
+	reportProcessed bool
 }
+
+// DDLProcessedReporter is implemented by the DDL operator: ok is true when the
+// statement completes with PostgreSQL's `SELECT <n>` tag instead of its DDL
+// tag (a populating CREATE TABLE AS, SELECT INTO or CREATE MATERIALIZED VIEW).
+type DDLProcessedReporter interface {
+	DDLProcessed() (n int64, ok bool)
+}
+
+// DDLProcessed implements DDLProcessedReporter.
+func (o *ddlOp) DDLProcessed() (int64, bool) { return o.processed, o.reportProcessed }
 
 func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
 
@@ -265,14 +288,24 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists); err != nil {
+	created, err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists)
+	if err != nil {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if !created {
+		// IF NOT EXISTS on an installed extension: upstream CreateExtension
+		// (commands/extension.c) returns before any catalog insert after
+		// ereport(NOTICE, "extension \"%s\" already exists, skipping").
+		// Skipping also keeps a duplicate row out of the pg_extension heap.
+		// M0119-0006bs.
+		o.ctx.AddNotice(fmt.Sprintf("extension %q already exists, skipping", s.Name))
+		return nil
 	}
 	// M0130-S3: journal the extension as a real pg_extension heap row
 	// so it survives restart and is visible on a PG standby.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		extOID := im.ExtensionOID(s.Name)
+		extOID := im.ExtensionOID(s.Name, o.ctx.CurrentDatabase)
 		nsOID := im.SchemaOID(schema)
 		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
 			return fmt.Errorf("pg_extension journal: %w", err)
@@ -1162,6 +1195,14 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	if err := writePublicationMemberRows(o.ctx, pub); err != nil {
 		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
+	// CreatePublication (publicationcmds.c): a publication is created anyway,
+	// but below wal_level = logical nothing can be decoded from it.
+	if o.ctx.GetSetting != nil {
+		if lvl, ok := o.ctx.GetSetting("wal_level"); ok && !strings.EqualFold(lvl, "logical") {
+			o.ctx.AddWarningWithHint("55000", `"wal_level" is insufficient to publish logical changes`,
+				`Set "wal_level" to "logical" before creating subscriptions.`)
+		}
+	}
 	return nil
 }
 
@@ -1735,6 +1776,13 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 	// Advance the command counter so the DO body sees the caller's writes,
 	// mirroring executePLpgSQLRoutine. M-NIGHTLY AI-20260809-020705-019.
 	routineCommandCounterIncrement(o.ctx, r)
+	// The DO body is not top-level (PG runs it through the inline handler's
+	// SPI connection), so e.g. LOCK TABLE inside it needs no transaction block.
+	leave, derr := enterRoutineBody(o.ctx, s.Pos())
+	if derr != nil {
+		return derr
+	}
+	defer leave()
 	_, flow, execErr := executePLpgSQLStmtList(block.Statements, r, frame, o.ctx)
 	if execErr != nil {
 		return execErr
@@ -4255,6 +4303,14 @@ afterExistsCheck:
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
+		// M0143-0003f: unlike every sibling UNIQUE-index path (inline column,
+		// table-level, named, PK auto-index), this clone never marked the
+		// resulting index as constraint-backed, so it never appeared in
+		// pg_constraint even before any restart. tableHasUniqueConstraintIndex
+		// below (M0143-0003c) picks this up automatically once set.
+		if newIdx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			newIdx.IsConstraint = true
+		}
 	}
 	// Create btree indexes for LIKE INCLUDING INDEXES non-unique plain indexes.
 	// PostgreSQL copies all non-partial non-PK non-exclusion indexes; non-unique
@@ -4730,7 +4786,27 @@ afterExistsCheck:
 	// (namedPKCreated, index lookups, inherited-parent columns) that isn't
 	// available until after the table/columns are fully constructed and the
 	// initial sync has already run. M0134-0005y.
-	if notNullHeapDirty && catalogHeapSyncAvailable(o.ctx) {
+	//
+	// M0143-0003b: the CHECK constraint registration blocks above (column,
+	// table-level, named, LIKE-sourced, INHERITS-merged) sit in the exact
+	// same trap — they all run after the early sync too, so
+	// len(tbl.NamedChecks) > 0 joins the resync trigger alongside
+	// notNullHeapDirty. Harmless when both are false (a table with neither
+	// pays nothing extra) and idempotent when a check exists but nothing
+	// downstream actually changed it.
+	//
+	// M0143-0003c: the inline/table-level/named UNIQUE constraint blocks above
+	// (:4076/:4176/:4200) are the same story — a constraint-backed UNIQUE
+	// index created by any of them also postdates the early sync, so
+	// tableHasUniqueConstraintIndex joins the same trigger.
+	//
+	// M0143-0003e: the named EXCLUDE constraint block above (:4042, both the
+	// btree-equality and stub-index arms) sets idx.IsExclusion after the same
+	// early sync — tableHasExclusionConstraintIndex joins the trigger too.
+	if (notNullHeapDirty || len(tbl.NamedChecks) > 0 ||
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx)) ||
+		tableHasExclusionConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
 			for _, dbOid := range tableCatalogDBOids(o.ctx) {
@@ -5158,10 +5234,12 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// WITH NO DATA: create table structure only, skip row insertion.
+	// WITH NO DATA: create table structure only, skip row insertion. The tag
+	// stays CREATE TABLE AS (createas.c reports SELECT only when it ran).
 	if s.WithNoData {
 		return nil
 	}
+	o.reportProcessed = true
 	// Execute the SELECT and insert all rows.
 	op, buildErr := Build(selectNode)
 	if buildErr != nil {
@@ -5185,6 +5263,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		if err := writeHeapRow(o.ctx, rel, tbl.Columns, row); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.processed++
 	}
 	return nil
 }
@@ -5486,6 +5565,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false, nil, nil); err != nil {
 			return err
 		}
+		// M0143-0003f: mark constraint-backed like every sibling UNIQUE path
+		// (inline column, table-level, named, PK auto-index) — the
+		// tableHasUniqueConstraintIndex resync trigger a few hundred lines
+		// below (M0143-0003c) picks this up automatically once set.
+		if childIdx, ok := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+			childIdx.IsConstraint = true
+		}
 	}
 	// Inherit regular (non-PK, non-unique) btree indexes from parent onto the
 	// partition child. PostgreSQL automatically creates matching indexes on each
@@ -5638,6 +5724,39 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if s.OnCommit != "" && s.Temporary {
 		if sess, ok := o.ctx.Session.(*BasicSession); ok {
 			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
+		}
+	}
+	// M0143-0003b/0003d: the CHECK-inheritance/PARTITION-OF-column-list blocks
+	// above (parent-inherited + explicit poc.CheckConstraints) mutate
+	// tbl.NamedChecks, and the named-NOT-NULL block just above mutates
+	// tbl.NotNullConstraints via AddNotNull — both AFTER the single
+	// syncTableToCatalogHeap call near the top of this function, the identical
+	// trap CREATE TABLE's own comment documents a few hundred lines up (there
+	// tracked by notNullHeapDirty; this function has no such per-mutation flag,
+	// so the length checks stand in for it). Re-sync only when the child
+	// actually carries a check or a named NOT NULL constraint, so the common
+	// plain-partition case pays nothing extra.
+	//
+	// M0143-0003c: the parent-PK/UNIQUE-index clone loop above also runs
+	// before this same early sync and can produce a constraint-backed UNIQUE
+	// index (IsConstraint forwarded from the parent's own index), so
+	// tableHasUniqueConstraintIndex joins the same trigger.
+	//
+	// M0143-0003e: an EXCLUDE constraint cloned from the parent (IsExclusion
+	// forwarded the same way) is the identical story, so
+	// tableHasExclusionConstraintIndex joins the trigger too.
+	if (len(tbl.NamedChecks) > 0 || len(tbl.NotNullConstraints) > 0 ||
+		tableHasUniqueConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx)) ||
+		tableHasExclusionConstraintIndex(o.ctx, tbl, tableCatalogHeapDBOid(o.ctx))) &&
+		catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil
@@ -6053,6 +6172,19 @@ func defaultExprToSQL(e parser.Expr) string {
 			op = " IS NOT "
 		}
 		return defaultExprToSQL(v.Operand) + op + target
+	case *parser.CollateExpr:
+		// get_rule_expr T_CollateExpr (ruleutils.c): `(arg COLLATE name)`, the
+		// name through generate_collation_name → quote_identifier, so "C" and
+		// "POSIX" keep their quotes. Without this arm the node fell to the
+		// %v fallback and pg_get_indexdef printed a Go struct
+		// (`&{105 0xc000… C}`) for upstream create_index's
+		// `WHERE (c1::text > 500000000::text COLLATE "C")`. Keep in sync with
+		// the catalog twin catalog.formatExprForAttrdef.
+		parts := strings.Split(v.CollationName, ".")
+		for i, p := range parts {
+			parts[i] = pgQuoteIdent(p)
+		}
+		return "(" + defaultExprToSQL(v.Operand) + " COLLATE " + strings.Join(parts, ".") + ")"
 	case *parser.IsDistinctFromExpr:
 		// `DEFAULT (1 IS DISTINCT FROM 2)`. Mirror the catalog twin (DU-002 slice 181).
 		// PG's pg_get_expr deparses a DistinctExpr as `<left> IS [NOT] DISTINCT FROM <right>`.
@@ -9123,6 +9255,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
+			// R126: persist it. Before this, ADD FOREIGN KEY was the ONE FK
+			// path with no catalog-heap sync at all — unlike the ADD COLUMN /
+			// ADD PRIMARY KEY / ADD UNIQUE siblings above — so an FK declared
+			// this way (the form HammerDB's TPC-H load and pg_dump restore
+			// both use) vanished at the next restart, taking runtime
+			// enforcement with it.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
+			}
 		case parser.AlterTableValidateConstraint:
 			// VALIDATE CONSTRAINT name — validate a constraint added with
 			// NOT VALID. PostgreSQL's AlterTableGetLockLevel maps
@@ -9169,6 +9310,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 							return err
 						}
 						tbl.ForeignKeys[i].NotValid = false
+						// R126: persist convalidated 'f'→'t', or the FK reverts
+						// to NOT VALID at the next restart.
+						//
+						// This is the ONE FK mutator that deliberately does NOT
+						// use syncConstraintCatalogRow. VALIDATE holds only
+						// ShareUpdateExclusiveLock (see the lock comment at the
+						// top of this case, mirroring PG's
+						// AlterTableGetLockLevel), so it does not conflict with
+						// concurrent INSERT/UPDATE/DELETE. The full funnel would
+						// delete and rewrite the table's ENTIRE catalog row set
+						// — pg_class, pg_attribute, pg_attrdef, pg_inherits,
+						// pg_rewrite — and re-insert index entries, all while
+						// that DML proceeds. Rewriting just this constraint's
+						// own row is sound precisely because convalidated is the
+						// only field that changed.
+						if err := o.resyncForeignKeyCatalogRow(tbl, tbl.ForeignKeys[i]); err != nil {
+							return err
+						}
 					}
 					found = true
 					break
@@ -9344,6 +9503,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if err := o.cascadeCheckToChildren(tbl, conName, act.CheckExpr, act.NotValid, act.CheckNotEnforced, act.NoInherit); err != nil {
 					return err
 				}
+				// M0143-0003b: persist the new CHECK (delete-old-then-rewrite,
+				// same helper the DROP/cascade paths already use below).
+				if err := o.syncConstraintCatalogRow(tbl); err != nil {
+					return err
+				}
 			}
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
@@ -9478,6 +9642,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// as `<waiting ...>` and the eventual 23503 surfaces during the ALTER,
 			// exactly as upstream. No-op unless the parent has FKs. (fk-partitioned-1)
 			if err := cloneAndValidateAttachPartitionFKs(o.ctx, tbl, childTbl); err != nil {
+				return err
+			}
+			// R126: re-sync AFTER the clone. The child's catalog rows were
+			// written ~15 lines above, BEFORE cloneAndValidateAttachPartitionFKs
+			// appended the parent's FKs to childTbl.ForeignKeys
+			// (operators_fk.go:615) — so without this the cloned FKs are never
+			// journalled and the attached partition loses both its planner
+			// evidence and its referential ENFORCEMENT at the next restart.
+			// That is precisely the bug R126 exists to fix, reproduced for
+			// partitions.
+			//
+			// This is REDUNDANT with the hand-inlined delete-and-resync above
+			// (nothing between them mutates childTbl's catalog-visible state
+			// except the clone itself), and it is kept as the unconditional
+			// one because the clone is a no-op for FK-less parents while this
+			// is the only sync that can see the cloned FKs. Collapsing the two
+			// is a tidy-up, not a fix — do not "optimise" by deleting THIS one.
+			if err := o.syncConstraintCatalogRow(childTbl); err != nil {
 				return err
 			}
 			// Set partition metadata on the child.
@@ -10248,6 +10430,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
 				}
 				tbl.ForeignKeys[i].Name = newName
+				// R126: persist the new conname. The heap row is keyed by the
+				// constraint's OID, which a rename leaves stable, so the funnel
+				// stamps the old row and re-emits with the new name — heap and
+				// registry stay in agreement rather than drifting.
+				if err := o.syncConstraintCatalogRow(tbl); err != nil {
+					return err
+				}
 				return nil
 			}
 
@@ -12197,6 +12386,19 @@ func (o *ddlOp) execAlterTableAddPrimaryKeyUsingIndex(tbl *catalog.Table, act pa
 // and the ATPrepAddPrimaryKey column-list path. Extracted from
 // execAlterTableAddPrimaryKey by M0134-0005x (previously inline).
 func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterTableAction, idx *catalog.Index) error {
+	// P0-E5/M0143-0008: snapshot every table this call might mutate — tbl
+	// itself plus the full inheritance/partition-child closure
+	// cascadeNotNullToChildren can reach below — BEFORE any NOT NULL
+	// synthesis, so ROLLBACK can restore them verbatim. Cheap when there is
+	// no cascade (the common case: the closure is empty).
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordNotNullUndo(snapshotNotNullState(tbl))
+		if im, isIM := o.ctx.Catalog.(*catalog.InMemory); isIM {
+			for _, child := range collectNotNullCascadeClosure(im, tbl) {
+				sess.RecordNotNullUndo(snapshotNotNullState(child))
+			}
+		}
+	}
 	if idx != nil {
 		idx.IsConstraint = true
 		// USING INDEX carries no INCLUDE (…) clause of its own — only
@@ -12264,6 +12466,67 @@ func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterT
 	return nil
 }
 
+// snapshotNotNullState captures tbl's pre-mutation per-column NOT NULL
+// flags and NotNullConstraints list into a NotNullUndoEntry
+// (P0-E5/M0143-0008).
+func snapshotNotNullState(tbl *catalog.Table) NotNullUndoEntry {
+	colNotNull := make(map[int]bool, len(tbl.Columns))
+	for i := range tbl.Columns {
+		colNotNull[i] = tbl.Columns[i].NotNull
+	}
+	return NotNullUndoEntry{
+		Table:              tbl,
+		ColNotNull:         colNotNull,
+		NotNullConstraints: append([]catalog.NamedNotNullConstraint(nil), tbl.NotNullConstraints...),
+	}
+}
+
+// snapshotDropConstraintState captures tbl's pre-mutation CHECK/FOREIGN
+// KEY/NOT NULL constraint state wholesale into a DropConstraintUndoEntry,
+// for `ALTER TABLE ... DROP CONSTRAINT`'s CHECK, FOREIGN KEY, and NOT NULL
+// branches (M0143-0008b) — the DROP-direction sibling of
+// snapshotNotNullState.
+func snapshotDropConstraintState(tbl *catalog.Table) DropConstraintUndoEntry {
+	colNotNull := make(map[int]bool, len(tbl.Columns))
+	for i := range tbl.Columns {
+		colNotNull[i] = tbl.Columns[i].NotNull
+	}
+	return DropConstraintUndoEntry{
+		Table:              tbl,
+		CheckConstraints:   append([]string(nil), tbl.CheckConstraints...),
+		NamedChecks:        append([]catalog.NamedCheckConstraint(nil), tbl.NamedChecks...),
+		ForeignKeys:        append([]catalog.ForeignKey(nil), tbl.ForeignKeys...),
+		NotNullConstraints: append([]catalog.NamedNotNullConstraint(nil), tbl.NotNullConstraints...),
+		ColNotNull:         colNotNull,
+	}
+}
+
+// collectNotNullCascadeClosure enumerates every inheritance/partition
+// descendant cascadeNotNullToChildren could reach from tbl — transitively,
+// depth-bounded (maxNotNullCascadeDepth) and OID-deduped like the cascade
+// itself. A pure read-only walk, run BEFORE the cascade so its result is a
+// safe superset of whatever the cascade actually touches (P0-E5/M0143-0008).
+func collectNotNullCascadeClosure(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+	var out []*catalog.Table
+	visited := map[uint32]bool{tbl.OID: true}
+	frontier := []*catalog.Table{tbl}
+	for depth := 0; depth < maxNotNullCascadeDepth && len(frontier) > 0; depth++ {
+		var next []*catalog.Table
+		for _, t := range frontier {
+			for _, child := range collectInheritanceAndPartitionChildren(im, t) {
+				if visited[child.OID] {
+					continue
+				}
+				visited[child.OID] = true
+				out = append(out, child)
+				next = append(next, child)
+			}
+		}
+		frontier = next
+	}
+	return out
+}
+
 // adoptExistingIndexAsConstraint locates the index named by `USING INDEX
 // idxname` on tbl, validates it per PG's transformIndexConstraint
 // (parse_utilcmd.c:2391-2492) and ATExecAddIndexConstraint
@@ -12311,6 +12574,23 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 			Message: fmt.Sprintf("%q is a partial index", idx.Name),
 			Detail:  "Cannot create a primary key or unique constraint using such an index."}
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	// P0-E5/M0143-0008: snapshot idx's pre-mutation fields (including its
+	// current name, in case this call renames it below) BEFORE any
+	// mutation, so ROLLBACK can restore them — this function mutates idx in
+	// place rather than registering/unregistering it, so the DDLUndoEntry
+	// create/drop pattern does not apply.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordAlterIndexUndo(AlterIndexUndoEntry{
+			Index:             idx,
+			DBOid:             dbOid,
+			OldName:           idx.Name,
+			IsConstraint:      idx.IsConstraint,
+			Primary:           idx.Primary,
+			Deferrable:        idx.Deferrable,
+			InitiallyDeferred: idx.InitiallyDeferred,
+		})
+	}
 	// Constraint name defaults to the index's own name; an explicit name
 	// that differs renames the index (and emits PG's NOTICE).
 	// tablecmds.c:9739-9755.
@@ -12324,7 +12604,7 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 		}
 		oldObjName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
 		newObjName := parser.ObjectName{Schema: idx.Schema, Name: constraintName}
-		if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+		if err := im.RenameIndex(oldObjName, newObjName, dbOid); err != nil {
 			return nil, &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
 		}
 		if catalogHeapSyncAvailable(o.ctx) {
@@ -12339,6 +12619,15 @@ func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.Al
 	idx.InitiallyDeferred = act.InitiallyDeferred
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := resyncIndexHeapRow(o.ctx, idx); syncErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+		}
+	}
+	// M0143-0003c: a non-PRIMARY adoption (ADD CONSTRAINT ... UNIQUE USING
+	// INDEX) needs a durable pg_constraint row so the new IsConstraint=true
+	// survives a restart — PRIMARY KEY adoption needs none (indisprimary
+	// already carries the signal via M0143-0003a).
+	if !primary {
+		if syncErr := o.syncConstraintCatalogRow(tbl); syncErr != nil {
 			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
 		}
 	}
@@ -12630,6 +12919,13 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		// pg_constraint re-emit the clause on dump. DU-002.
 		idx.Deferrable = act.Deferrable
 		idx.InitiallyDeferred = act.InitiallyDeferred
+		// M0143-0003c: a durable pg_constraint row so IsConstraint=true (and
+		// Deferrable/InitiallyDeferred) survive a restart — see
+		// adoptExistingIndexAsConstraint's identical call for the USING INDEX
+		// branch above.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -12669,6 +12965,12 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 			idx.Deferrable = act.Deferrable
 			idx.InitiallyDeferred = act.InitiallyDeferred
 			applyExclusionPredicate(idx, act.ExclusionWhere)
+			// M0143-0003e: a durable pg_constraint row so IsExclusion (and
+			// ExclusionOp/Deferrable/InitiallyDeferred) survive a restart —
+			// see execAlterTableAddUnique's identical call.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -12684,6 +12986,13 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 			ExclusionWhere:   act.ExclusionWhere,
 		}
 		if err := o.createExclusionIndexStub(act.Pos(), idxName, tbl, ec); err != nil {
+			return err
+		}
+		// M0143-0003e: createExclusionIndexStub's own sync
+		// (syncIndexToCatalogHeap) only writes pg_class/pg_index/pg_attribute
+		// for the index relation — the durable pg_constraint 'x' row needs
+		// the table-level funnel, same as the btree-equality branch above.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
 			return err
 		}
 	}
@@ -12860,11 +13169,20 @@ func (o *ddlOp) syncConstraintCatalogRow(tbl *catalog.Table) error {
 	if !catalogHeapSyncAvailable(o.ctx) {
 		return nil
 	}
-	if err := o.ctx.MaterializeWriterXID(); err == nil {
-		xmax := o.ctx.Tx.XID
-		for _, dbOid := range tableCatalogDBOids(o.ctx) {
-			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
-		}
+	// R126: the stamp must SUCCEED, not merely be attempted. This used to
+	// swallow the MaterializeWriterXID error and re-sync anyway, which was
+	// tolerable while every row this funnel rewrites was keyed by the table's
+	// OID and therefore overwritten wholesale. FK rows changed that: they are
+	// APPENDED, so a skipped stamp leaves the old row live and the reload
+	// rebuilds duplicate ForeignKeys entries — the exact failure R126's P3
+	// exists to prevent, and one no test can see because the error never
+	// fires in the harness.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return fmt.Errorf("DDL catalog sync: materialize writer XID: %w", err)
+	}
+	xmax := o.ctx.Tx.XID
+	for _, dbOid := range tableCatalogDBOids(o.ctx) {
+		deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 	}
 	if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 		return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -12951,6 +13269,13 @@ func (o *ddlOp) cascadeCheckToChildrenAt(im *catalog.InMemory, tbl *catalog.Tabl
 		}
 		if !merged {
 			child.AddCheckInherited(name, expr, im.AllocOID(), notValid, notEnforced)
+		}
+		// M0143-0003b: both branches above mutate child.NamedChecks (a fresh
+		// inherited row, or IsLocal/InhCount metadata on an existing one) and
+		// must reach the heap — the merge branch is not a no-op for
+		// persistence purposes even though it adds no new entry.
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
 		}
 
 		if err := o.cascadeCheckToChildrenAt(im, child, name, expr, notValid, notEnforced, visited, depth+1); err != nil {
@@ -13214,6 +13539,19 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
+		// M0143-0008b: snapshot tbl plus its full cascade-reachable
+		// inheritance/partition-child closure BEFORE the CHECK removal (and
+		// the coninhcount/conislocal bookkeeping cascadeCheckDropToChildren
+		// applies below), so ROLLBACK can restore the whole constraint set
+		// verbatim.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+			if isIM {
+				for _, child := range collectNotNullCascadeClosure(im, tbl) {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(child))
+				}
+			}
+		}
 		// Drop from this table (keep CheckConstraints and NamedChecks in sync).
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
@@ -13229,6 +13567,13 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 				return err
 			}
 		}
+		// M0143-0003b: tbl's own NamedChecks was truncated above but never
+		// re-synced — the cascade calls above only touch CHILDREN's rows via
+		// their own syncConstraintCatalogRow. Without this the dropped
+		// constraint's row survives in the heap and a restart resurrects it.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -13238,7 +13583,23 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	for _, fk := range tbl.ForeignKeys {
 		if strings.EqualFold(fk.Name, act.ConstraintName) {
 			if isIM {
-				im.DropForeignKeyConstraint(tbl.OID, act.ConstraintName)
+				// M0143-0008b: FKs aren't inherited, so no cascade closure
+				// to snapshot — just tbl.ForeignKeys itself.
+				if sess, ok := o.ctx.Session.(*BasicSession); ok {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+				}
+				// M0143-0002: pass tbl directly (see catalog.go doc comment) —
+				// the old tbl.OID-keyed lookup was scoped to DefaultDBOid and
+				// silently no-opped for a table in any other database.
+				im.DropForeignKeyConstraint(tbl, act.ConstraintName)
+			}
+			// R126: drop the heap row too, or the FK comes BACK at the next
+			// restart — a resurrected constraint being strictly worse than a
+			// lost one, since it would reject legitimate DML. The funnel
+			// stamps every contype='f' row for this table and re-emits from
+			// the (now shorter) in-memory slice.
+			if err := o.syncConstraintCatalogRow(tbl); err != nil {
+				return err
 			}
 			return nil
 		}
@@ -13256,7 +13617,14 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	if uqIdx != nil {
 		if isIM {
-			im.DropUniqueConstraint(tbl.OID, act.ConstraintName)
+			// P0-E5/M0143-0008: DropUniqueConstraint only unregisters uqIdx
+			// from the name-keyed index maps (like DROP INDEX) — it does not
+			// mutate the *catalog.Index itself — so the existing DROP-inside-
+			// savepoint restore mechanism (RestoreIndex) undoes it verbatim.
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{uqIdx}, SavepointDepth: sess.SavepointDepth()})
+			}
+			im.DropUniqueConstraint(tbl, act.ConstraintName)
 		}
 		return nil
 	}
@@ -13275,7 +13643,12 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	if exclIdx != nil {
 		if isIM {
-			im.DropExclusionConstraint(tbl.OID, act.ConstraintName)
+			// P0-E5/M0143-0008: see the UNIQUE branch above — same
+			// map-removal-only shape, same RestoreIndex undo path.
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{exclIdx}, SavepointDepth: sess.SavepointDepth()})
+			}
+			im.DropExclusionConstraint(tbl, act.ConstraintName)
 		}
 		return nil
 	}
@@ -13352,6 +13725,18 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			}
 		}
 		colName := nc.ColName
+		// M0143-0008b: snapshot tbl plus its full cascade-reachable
+		// inheritance/partition-child closure BEFORE clearNotNullConstraint
+		// (and cascadeNotNullDropToChildren's own bookkeeping below), so
+		// ROLLBACK can restore the whole constraint set verbatim.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDropConstraintUndo(snapshotDropConstraintState(tbl))
+			if isIM {
+				for _, child := range collectNotNullCascadeClosure(im, tbl) {
+					sess.RecordDropConstraintUndo(snapshotDropConstraintState(child))
+				}
+			}
+		}
 		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
 			return err
 		}
@@ -13408,7 +13793,12 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		}
 	}
 	if isIM {
-		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
+		// P0-E5/M0143-0008: see the UNIQUE branch above — same
+		// map-removal-only shape, same RestoreIndex undo path.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RecordDDLDrop(DDLDropUndoEntry{Indexes: []*catalog.Index{pkIdx}, SavepointDepth: sess.SavepointDepth()})
+		}
+		im.DropPrimaryKeyConstraint(tbl, act.ConstraintName)
 	}
 	return nil
 }
@@ -13476,6 +13866,13 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 				tbl.ForeignKeys[i].NotEnforced = !act.AlterConstraintEnforced
 				tbl.ForeignKeys[i].NotValid = !act.AlterConstraintEnforced
 			}
+		}
+		// R126: this is the statement that sets conenforced/condeferrable, so
+		// without persisting here those fields silently revert at the next
+		// restart — and a reverted conenforced would undo R125's work, since
+		// the planner's FK arm gates on exactly that field.
+		if err := o.syncConstraintCatalogRow(tbl); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -14361,6 +14758,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}
+	o.indexUpdateHeapStats(tbl, o.buildHeapTuples)
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -14374,6 +14772,57 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// entry from both at startup. A real PG standby replays the same heap
 	// inserts (no rmid-128 record).
 	return nil
+}
+
+// indexUpdateHeapStats is the heap half of index_update_stats
+// (postgres/src/backend/catalog/index.c:2809): after an index build, the
+// heap's pg_class reltuples/relpages become the build scan's live-tuple count
+// and the heap's block count, which ends the never-vacuumed 10-page floor
+// (table_block_relation_estimate_size, tableam.c:696) for a table indexed
+// after it was loaded. PG's guards, in order:
+//
+//   - an EMPTY heap whose reltuples is still "never measured" (-1) stays so,
+//     so CREATE TABLE … PRIMARY KEY does not make a table look vacuumed;
+//   - nothing is written unless autovacuum is active (AutoVacuumingActive:
+//     the autovacuum GUC and track_counts) and the table's
+//     autovacuum_enabled reloption is not false — a dump restore may have
+//     loaded statistics the user expects to keep.
+//
+// relallvisible needs no write: goopg reads it live from the VM. Published
+// and persisted exactly as VACUUM does (UpdateRelStats + persistRelSize);
+// a failed size write is non-fatal, as there.
+func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
+	if tbl == nil || tbl.PartitionMethod != "" {
+		return
+	}
+	if reltuples == 0 && (tbl.Stats == nil || !tbl.Stats.Analyzed) {
+		return
+	}
+	if !autoVacuumingActive(o.ctx) || (tbl.AutovacuumEnabledSet && !tbl.AutovacuumEnabled) {
+		return
+	}
+	nBlocks, err := o.ctx.Pool.NBlocks(o.ctx.Catalog.RelFileNode(tbl))
+	if err != nil {
+		return
+	}
+	o.ctx.Catalog.UpdateRelStats(tbl, int(nBlocks), int64(reltuples))
+	_ = persistRelSize(o.ctx, tbl, int64(reltuples), int(nBlocks))
+}
+
+// autoVacuumingActive is PG's AutoVacuumingActive(): the autovacuum GUC and
+// track_counts both on. Unset or unreadable settings take PG's boot values
+// (both on).
+func autoVacuumingActive(ctx *Context) bool {
+	if !shouldTrackCounts(ctx) {
+		return false
+	}
+	if ctx == nil || ctx.GetSetting == nil {
+		return true
+	}
+	if v, ok := ctx.GetSetting("autovacuum"); ok && v == "off" {
+		return false
+	}
+	return true
 }
 
 // bulkBuildBTreeFull collects all heap entries into memory, then calls
@@ -14455,10 +14904,16 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	var entries []nbtree.BulkEntry
+	o.buildHeapTuples = 0
 	// seenNull dedups null-bearing rows for a NULLS NOT DISTINCT unique index
 	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
 	// builds are byte-for-byte unchanged.
 	var seenNull map[string]struct{}
+	// nullEntries are the NULL-keyed entries of a tuple-format index in a
+	// cluster with null_keyed_index_entries: filed, but kept out of the
+	// duplicate walk below (BulkCreate sorts its input, so they are simply
+	// appended afterwards).
+	var nullEntries []nbtree.BulkEntry
 	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Reset on page advance; Release on return.
@@ -14497,6 +14952,9 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
+			// Counted before any predicate or decode skip: PG's reltuples is
+			// the heap's live-tuple count, not the index's entry count.
+			o.buildHeapTuples++
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
 			// avoid the per-row `make(Row, len(tbl.Columns))` that
 			// the M0054-0004 idx-window pprof showed at 39 % cum.
@@ -14550,10 +15008,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				return nil, encErr
 			}
 			if hasNullKey {
-				// A NULL value key column: not storable in the byte-key btree
-				// (no null bitmap), matching the runtime maintain path. For a
-				// default (NULLS DISTINCT) index multiple NULLs are allowed, so
-				// skip. For a NULLS NOT DISTINCT unique index NULLs collide, so
+				// A NULL value key column. Without an image (blob format, or a
+				// cluster without null_keyed_index_entries) the row has no
+				// entry, matching the runtime maintain path; with one (a
+				// tuple-format index in a capable cluster) it is filed below,
+				// outside the duplicate walk — NULL never equals NULL for
+				// uniqueness, but two NULL images compare equal in index order.
+				// For a default (NULLS DISTINCT) index multiple NULLs are
+				// allowed. For a NULLS NOT DISTINCT unique index NULLs collide, so
 				// dedup null-bearing rows among themselves and raise 23505 on a
 				// duplicate NULL pattern (PG rejects building such an index over
 				// pre-existing duplicate-NULL data). Design 0119-0004 sub (b).
@@ -14577,6 +15039,9 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 							Detail:  btreeBuildKeyDescription(idx, cols, row, true) + " is duplicated."}
 					}
 					seenNull[string(ndk)] = struct{}{}
+				}
+				if key != nil {
+					nullEntries = append(nullEntries, nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 				}
 				continue
 			}
@@ -14643,7 +15108,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				Detail:  entries[di].KeyDesc + " is duplicated."}
 		}
 	}
-	return entries, nil
+	return append(entries, nullEntries...), nil
 }
 
 // `sortBulkEntriesByKey` (M0055-0006 Phase E, sort by `string(key)`) and
@@ -18028,6 +18493,20 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 // deleteCatalogRowsForOID to physically mark rolled-back catalog rows as
 // deleted so the startup scan in loadUserTablesFromHeap skips them.
 func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(data []byte) bool) {
+	stampCatalogRowsTuple(ctx, rel, xmax, func(ht storage.HeapTuple) bool { return match(ht.Data) })
+}
+
+// stampCatalogRowsTuple is stampCatalogRows with the whole HeapTuple handed to
+// the predicate.
+//
+// R126: the data-only form cannot decode a row that contains NULLs — it
+// exposes neither the null bitmap nor the stored attribute count, so
+// DecodeRowIntoMctxPGTuple would misparse. That is fine for pg_attrdef and
+// pg_inherits, whose predicates read a fixed leading offset, but a
+// pg_constraint FK row is NULL-bearing by construction (conbin, conpfeqop,
+// conppeqop, conffeqop, conexclop) and its conrelid sits behind a 64-byte
+// name, so it must be decoded properly.
+func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(storage.HeapTuple) bool) {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil || nBlocks == 0 {
 		return
@@ -18052,7 +18531,7 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if ht.Header.Xmax != storage.InvalidTransactionID {
 					continue
 				}
-				if !match(ht.Data) {
+				if !match(ht) {
 					continue
 				}
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
@@ -18165,6 +18644,29 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
 	// loadViewsFromHeap.
 	stampViewRewriteRows(ctx, dbOid, relOID, xmax)
+	// R126: stamp this relation's FOREIGN KEY rows so an ALTER re-sync, a DROP,
+	// or a rolled-back CREATE leaves no stale or DUPLICATE FK visible to
+	// loadForeignKeysFromHeap. Without this, every re-sync would append a
+	// second copy and the reload would rebuild N identical ForeignKeys entries.
+	stampForeignKeyConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003b: stamp this relation's table-level CHECK constraint rows too
+	// (contype='c', conrelid=relOID), for the identical reason — a re-sync or
+	// DROP must not leave stale/duplicate rows for loadCheckConstraintsFromHeap
+	// to rebuild.
+	stampCheckConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003d: stamp this relation's named NOT NULL constraint rows too
+	// (contype='n', conrelid=relOID), same reason.
+	stampNotNullConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003c: stamp this relation's UNIQUE-constraint-backed index rows
+	// too (contype='u', conrelid=relOID), same reason.
+	stampUniqueConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0143-0003e: stamp this relation's EXCLUDE-constraint-backed index rows
+	// too (contype='x', conrelid=relOID), same reason.
+	stampExclusionConstraintRows(ctx, dbOid, relOID, xmax)
+	// M0122-0015: and this relation's pg_foreign_table row, for the same
+	// reason — a DROP FOREIGN TABLE or an ALTER re-sync must not leave a stale
+	// ftrelid row behind.
+	stampForeignTableRows(ctx, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -18209,7 +18711,7 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 // its index entries by construction.
 func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.TypeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18254,7 +18756,7 @@ func updateTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 		return writeTypeHeapRowWithIndexes(ctx, row)
 	}
 	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.TypeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18300,7 +18802,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	// re-emit `CREATE TYPE x AS (...)`. Index entries mirror syncTableToCatalogHeap
 	// so the rows are reachable by OID / relname-nsp lookups too. DU-002 slice 243.
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18316,7 +18818,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	}
 
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -18563,6 +19065,37 @@ func CatalogHeapSyncAvailable(ctx *Context) bool {
 	return catalogHeapSyncAvailable(ctx)
 }
 
+// tableHasUniqueConstraintIndex reports whether tbl carries at least one
+// UNIQUE (non-PRIMARY-KEY) constraint-backed index — the same predicate
+// syncTableToCatalogHeap's own write loop uses (M0143-0003c). Unlike
+// NamedChecks/NotNullConstraints, a table has no list field for this; the
+// constraint objects ARE the table's indexes, so the resync-dirty gates in
+// execCreateTable/execCreatePartitionChild scan IndexesOnTable directly
+// instead of checking a length.
+func tableHasUniqueConstraintIndex(ctx *Context, tbl *catalog.Table, dbOid uint32) bool {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, dbOid) {
+		if idx != nil && idx.Unique && !idx.Primary && idx.IsConstraint {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHasExclusionConstraintIndex reports whether tbl carries at least one
+// EXCLUDE-constraint-backed index (M0143-0003e). Sibling of
+// tableHasUniqueConstraintIndex, gated on idx.IsExclusion alone — unlike
+// UNIQUE, the non-btree-equality EXCLUDE arm (createExclusionIndexStub) never
+// sets idx.IsConstraint, yet still needs a durable pg_constraint row (see
+// syncTableToCatalogHeap's EXCLUDE loop for why).
+func tableHasExclusionConstraintIndex(ctx *Context, tbl *catalog.Table, dbOid uint32) bool {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, dbOid) {
+		if idx != nil && idx.IsExclusion {
+			return true
+		}
+	}
+	return false
+}
+
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
 //
@@ -18600,6 +19133,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
+	}
+	// M0122-0015: the pg_foreign_table row for a foreign table. This is the
+	// single funnel every table-persisting DDL path passes through, so the
+	// ALTER paths re-stamp and re-write it alongside pg_class. No-op for an
+	// ordinary relation.
+	if err := writeForeignTableCatalogRow(ctx, tbl); err != nil {
+		return fmt.Errorf("pg_foreign_table: %w", err)
 	}
 	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
 	// B0.3 (doc 02a §4): index entries route to the SAME database as the
@@ -18670,6 +19210,120 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 		if err := writeInheritsRow(ctx, tbl.OID, parentOID, int32(i+1)); err != nil {
 			return fmt.Errorf("pg_inherits parent %d: %w", parentOID, err)
+		}
+	}
+
+	// R126: FOREIGN KEY persistence via real pg_constraint HEAP rows
+	// (base/<dbOid>/2606, contype='f'). Before this, catalog.Table.ForeignKeys
+	// was the ONLY store and pg_constraint's FK rows were synthesised from it
+	// (catalog.go:7237), so a restart lost every FK — not merely as planner
+	// evidence (superkeyJoinSelectivity's FK arm) but as ENFORCEMENT: the
+	// runtime checks read the same field (operators_fk.go:118, :170), so an
+	// orphan row was silently accepted after a restart. Emitted from this
+	// single funnel keeps CREATE and every later re-sync in step; the caller
+	// stamps the old rows first (deleteCatalogRowsForOID, which now covers
+	// 2606). loadForeignKeysFromHeap re-reads them.
+	for _, fk := range tbl.ForeignKeys {
+		// Match the synthesised view's skip rule (catalog.go:7249): an FK
+		// without a name/OID predates constraint-catalog tracking.
+		if fk.Name == "" || fk.OID == 0 {
+			continue
+		}
+		confrelid, conkey, confkey, setCols, ok := resolveFKCatalogKeys(ctx, tbl, fk)
+		if !ok {
+			// Declining here means the FK is NOT persisted while the
+			// synthesised view still shows it — the exact silent shape this
+			// round exists to eliminate, so it must never be quiet.
+			slog.Warn("pg_constraint FK sync: cannot resolve referenced table or columns; "+
+				"constraint will NOT survive a restart",
+				"constraint", fk.Name, "table", tbl.Name, "reftable", fk.RefTable)
+			continue
+		}
+		if err := writeForeignKeyConstraintRow(ctx, fk, tbl.OID, confrelid, conkey, confkey, setCols); err != nil {
+			return fmt.Errorf("pg_constraint fk %q: %w", fk.Name, err)
+		}
+	}
+
+	// M0143-0003b: table-level CHECK constraint persistence via real
+	// pg_constraint HEAP rows (contype='c'), same funnel and the same
+	// stamp-old-then-rewrite-current contract as the FK loop directly above.
+	// Before this, catalog.Table.CheckConstraints/NamedChecks was the ONLY
+	// store and nothing reloaded it, so every CHECK constraint on every table
+	// silently stopped being ENFORCED (not just displayed) after any restart —
+	// copy.go/operators_fk.go/operators_storage.go all gate CHECK enforcement
+	// on len(tbl.CheckConstraints) > 0.
+	for _, nc := range tbl.NamedChecks {
+		// Matches the synthesised view's own skip rule (catalog.go
+		// PGConstraintRowsForDBOid, table-CHECK block): an anonymous /
+		// pre-tracking CHECK has no catalog-visible row either way.
+		if nc.Name == "" || nc.OID == 0 {
+			continue
+		}
+		if err := writeCheckConstraintRow(ctx, tbl, nc); err != nil {
+			return fmt.Errorf("pg_constraint check %q: %w", nc.Name, err)
+		}
+	}
+
+	// M0143-0003d: named NOT NULL constraint persistence via real pg_constraint
+	// HEAP rows (contype='n'), same funnel as the CHECK loop directly above.
+	// Column.NotNull (the actual attnotnull ENFORCEMENT bit) already reloads
+	// correctly via pg_attribute — this loop only restores the named-
+	// constraint METADATA (pg_constraint's 'n' rows: conname, conislocal,
+	// coninhcount, connoinherit, convalidated), which before this pass was
+	// rebuilt by nothing and so vanished from pg_constraint/pg_dump after
+	// every restart even though the NOT NULL enforcement itself survived.
+	for _, nc := range tbl.NotNullConstraints {
+		// Matches the synthesised view's own skip rule (catalog.go
+		// PGConstraintRowsForDBOid, NOT NULL block): an unnamed/pre-tracking
+		// entry has no catalog-visible row either way.
+		if nc.Name == "" || nc.OID == 0 {
+			continue
+		}
+		if err := writeNotNullConstraintRow(ctx, tbl, nc); err != nil {
+			return fmt.Errorf("pg_constraint not-null %q: %w", nc.Name, err)
+		}
+	}
+
+	// M0143-0003c: UNIQUE (non-PRIMARY-KEY) constraint-backed index
+	// persistence via real pg_constraint HEAP rows (contype='u',
+	// conindid=<index OID>), same funnel as CHECK/NOT NULL above. Real PG
+	// distinguishes an ADD CONSTRAINT ... UNIQUE index from a bare
+	// CREATE UNIQUE INDEX via a pg_constraint row whose conindid points back
+	// at the index — indisunique alone is identical for both. Before this,
+	// catalog.Index.IsConstraint was the ONLY signal and nothing reloaded it,
+	// so every UNIQUE constraint (but not a bare unique index) silently
+	// reverted to looking like a bare index after a restart, vanishing from
+	// pg_constraint/pg_dump and failing RENAME CONSTRAINT's
+	// `!Primary && Unique && IsConstraint` guard. PRIMARY KEY needs no new row
+	// here — indisprimary already survives via pg_index (M0143-0003a).
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, heapDBOid) {
+		if idx == nil || !idx.Unique || idx.Primary || !idx.IsConstraint || idx.Name == "" || idx.OID == 0 {
+			continue
+		}
+		if err := writeUniqueConstraintRow(ctx, tbl, idx); err != nil {
+			return fmt.Errorf("pg_constraint unique %q: %w", idx.Name, err)
+		}
+	}
+
+	// M0143-0003e: EXCLUDE constraint persistence via real pg_constraint HEAP
+	// rows (contype='x', conindid=<index OID>), same funnel and stamp-old-
+	// then-rewrite-current contract as the UNIQUE loop directly above.
+	// Unlike UNIQUE, the gate is idx.IsExclusion alone (not idx.IsConstraint):
+	// the non-btree-equality EXCLUDE path (createExclusionIndexStub, e.g.
+	// `EXCLUDE USING gist (c WITH &&)`) never sets IsConstraint, yet real PG
+	// always creates a pg_constraint row for ANY EXCLUDE constraint — the
+	// synthesised view already emits it on that same OR condition
+	// (catalog.go's PGConstraintRowsForDBOid: `!idx.IsConstraint &&
+	// !idx.IsExclusion`). Before this, catalog.Index.IsExclusion was the ONLY
+	// signal and nothing reloaded it, so every EXCLUDE constraint silently
+	// stopped being ENFORCED (checkExclusionConstraintsForInsert gates on
+	// idx.IsExclusion) after a restart, not merely lost from pg_dump.
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, heapDBOid) {
+		if idx == nil || !idx.IsExclusion || idx.Name == "" || idx.OID == 0 {
+			continue
+		}
+		if err := writeExclusionConstraintRow(ctx, tbl, idx); err != nil {
+			return fmt.Errorf("pg_constraint exclude %q: %w", idx.Name, err)
 		}
 	}
 
@@ -19297,8 +19951,8 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 	return nil
 }
 
-// execDropRule handles DROP RULE. Rules are not implemented; always reports
-// "rule does not exist".
+// execDropRule handles DROP RULE: the rule exists when its `name@table` key is
+// in the compat-object registry (every CREATE RULE form registers it).
 func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 	_, tblOk := o.lookupTableWithSearch(s.Table)
 	if !tblOk {
@@ -19321,11 +19975,10 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
-	if s.IfExists {
-		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
-		return nil
-	}
 	// Check compat registry: if the rule was registered via CREATE RULE (noop), succeed silently.
+	// IF EXISTS is decided AFTER the lookup: before 2026-09-23 it short-
+	// circuited here, so DROP RULE IF EXISTS on an EXISTING rule emitted the
+	// "does not exist, skipping" notice and dropped nothing.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		key := s.Name + "@" + s.Table.String()
 		if im.DropCompatObject("rule", key) {
@@ -19346,23 +19999,34 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 			return nil
 		}
 	}
+	if s.IfExists {
+		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
+		return nil
+	}
 	return &ExecError{Code: "42704", Pos: s.Pos(),
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
 
-// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`.
-// Only the DO-NOTHING rule form goopg reifies into catalog.RuleInfo
-// (tbl.Rules — see execCreateRule) is renameable; any rule that fell to the
-// CompatNoopStmt path (a real DO INSTEAD/DO ALSO action) is not in tbl.Rules
-// and correctly reports "does not exist" here, matching this slice's scope
-// boundary. Mirrors postgres/src/backend/rewrite/rewriteDefine.c:793
-// RenameRewriteRule (including the reserved-name check for "_RETURN", the
-// view SELECT rule, and the duplicate-name collision check). M0134-0065.
+// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`,
+// mirroring postgres/src/backend/rewrite/rewriteDefine.c:793
+// RenameRewriteRule (the reserved-name check for "_RETURN", the view SELECT
+// rule, and the duplicate-name collision check). M0134-0065.
+//
+// goopg tracks a rule's existence in two places: the DO-NOTHING form is
+// reified as a catalog.RuleInfo on the table (tbl.Rules, what pg_rewrite and
+// pg_get_ruledef read), and EVERY rule — including the DO INSTEAD/ALSO action
+// forms that stay CompatNoop — is registered in the compat-object registry
+// under `name@table`, which is what DROP RULE consults. The rename must move
+// both: renaming only tbl.Rules left DROP RULE newname failing "does not
+// exist" and DROP RULE oldname succeeding (2026-09-23, found live).
 func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
 	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	oldKey := s.Name + "@" + s.Table.String()
+	newKey := s.NewName + "@" + s.Table.String()
 	idx := -1
 	for i := range tbl.Rules {
 		if tbl.Rules[i].Name == s.Name {
@@ -19370,27 +20034,34 @@ func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
 			break
 		}
 	}
-	if idx == -1 {
+	registered := im != nil && im.HasCompatObject("rule", oldKey)
+	if idx == -1 && !registered {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, tbl.Name)}
 	}
 	// RenameRewriteRule disallows renaming a view's ON SELECT rule (which PG
 	// always names "_RETURN"), since that would break the invariant that a
-	// view's rewrite rule is discoverable by that fixed name. goopg does not
-	// model view rules in tbl.Rules (only the DO-NOTHING form reaches here),
-	// so this is effectively unreachable today but guarded for fidelity
-	// should that change.
+	// view's rewrite rule is discoverable by that fixed name.
 	if strings.EqualFold(s.Name, "_RETURN") {
 		return &ExecError{Code: "42939", Pos: s.Pos(),
 			Message: "renaming an ON SELECT rule is not allowed"}
 	}
+	collides := im != nil && s.NewName != s.Name && im.HasCompatObject("rule", newKey)
 	for i := range tbl.Rules {
 		if i != idx && tbl.Rules[i].Name == s.NewName {
-			return &ExecError{Code: "42710", Pos: s.Pos(),
-				Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+			collides = true
 		}
 	}
-	tbl.Rules[idx].Name = s.NewName
+	if collides {
+		return &ExecError{Code: "42710", Pos: s.Pos(),
+			Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+	}
+	if idx >= 0 {
+		tbl.Rules[idx].Name = s.NewName
+	}
+	if registered {
+		im.RenameCompatObject("rule", oldKey, newKey)
+	}
 	return nil
 }
 
@@ -20006,8 +20677,10 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// Populate immediately unless WITH NO DATA.
+	// Populate immediately unless WITH NO DATA (whose tag stays
+	// CREATE MATERIALIZED VIEW, matview.c:389's else-arm).
 	if !s.WithNoData {
+		o.reportProcessed = true
 		if err := o.materializeView(tbl, selectPlan); err != nil {
 			return err
 		}
@@ -20044,6 +20717,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) e
 		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
 			return werr
 		}
+		o.processed++
 	}
 	// Rebuild all btree indexes on the matview after population.
 	// This also detects unique constraint violations (duplicate rows). M0097-0025.
@@ -21219,7 +21893,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// heap row so the drop survives restart.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
-				extOID := im.ExtensionOID(name)
+				extOID := im.ExtensionOID(name, o.ctx.CurrentDatabase)
 				if extOID == 0 {
 					if s.IfExists {
 						o.ctx.AddNotice(fmt.Sprintf("extension %q does not exist, skipping", name))
@@ -21227,9 +21901,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("extension %q does not exist", name)}
 				}
-				im.DropExtension(name)
+				// The row's recorded scope names the heap that holds it
+				// (pg_extension is per-database; M0119-0006bs).
+				_, scopeDB, _ := im.DropExtension(name, o.ctx.CurrentDatabase)
 				if catalogHeapSyncAvailable(o.ctx) {
-					deleteExtensionCatalogRow(o.ctx, extOID)
+					deleteExtensionCatalogRow(o.ctx, extOID, extensionScopeHeapDBOid(im, scopeDB))
 				}
 				return nil
 			}
@@ -21356,18 +22032,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	return nil
 }
 
-// castTypeOIDMatch compares two type names for CREATE CAST's argument/return
-// and same-type checks. im is the live catalog (nil in unit tests exercising
-// only builtin types); it is consulted first via resolveUserTypeOID so a
-// user-defined type (CREATE TYPE, including the base/"shell" form) resolves
-// to its own OID instead of falling through catalog.TypeNameToOID's "unknown
-// name" default (OIDText), which previously made every user type falsely
-// compare equal to `text`. M0134-0110. Beyond OID identity, this also accepts
-// an existing WITHOUT FUNCTION/WITH INOUT user cast between a and b as a
-// match — mirroring PG's IsBinaryCoercibleWithCast (cast.c), which lets a
-// WITH FUNCTION cast's argument/return type be merely binary-coercible to
-// (not identical to) the declared source/target, closing the slice-398
-// deferral ledger row's binary-coercibility gap.
+// castTypeOIDMatch reports whether b is binary-coercible FROM a for CREATE
+// CAST's argument/return checks — mirroring PG's IsBinaryCoercibleWithCast
+// (parse_coerce.c), which lets a WITH FUNCTION cast's argument/return type be
+// merely binary-coercible to (not identical to) the declared source/target,
+// closing the slice-398 deferral ledger row's binary-coercibility gap.
+// Callers pass a and b in PG's operand order: (source, argtype) for the arg
+// check and (rettype, target) for the return check — the test is DIRECTIONAL
+// because pg_cast entries aren't symmetric (parse_coerce.c: "the order of the
+// operands is now significant"). im is the live catalog (nil in unit tests
+// exercising only builtin types); it is consulted first via
+// resolveUserTypeOID so a user-defined type (CREATE TYPE, including the
+// base/"shell" form) resolves to its own OID instead of falling through
+// catalog.TypeNameToOID's "unknown name" default (OIDText), which previously
+// made every user type falsely compare equal to `text`. M0134-0110.
 func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
 	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
 	if oa != 0 && ob != 0 {
@@ -21380,25 +22058,35 @@ func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
 	return castUserBinaryCoercible(im, a, b)
 }
 
+// castSameTypeOID reports whether a and b name the same type for CREATE
+// CAST's same-type check — mirroring PG's `sourcetypeid == targettypeid`
+// (functioncmds.c CreateCast), which is strict OID identity only and does NOT
+// consult pg_cast (a registered binary cast between distinct types must not
+// satisfy it). Unresolvable names fall back to spelling equality, matching
+// castTypeOIDMatch's unknown-name convention. M0134-0110.
+func castSameTypeOID(im *catalog.InMemory, a, b string) bool {
+	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
+	if oa != 0 && ob != 0 {
+		return oa == ob
+	}
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
 // castUserBinaryCoercible reports whether a registered user CREATE CAST …
-// WITHOUT FUNCTION (pg_cast.castmethod 'b') links a and b in either
-// direction — mirroring PG's IsBinaryCoercible, which only a real binary
-// cast satisfies (a WITH INOUT cast still runs the type's own I/O functions,
-// so it is not binary-coercible). PG additionally special-cases domains and
-// a handful of hard-wired pairs (anyarray, etc.); those are out of scope
-// here — only the explicit-cast-registry form CREATE CAST test cases
-// exercise.
+// WITHOUT FUNCTION (pg_cast.castmethod 'b') casts a to b — directional, since
+// pg_cast entries aren't symmetric (PG's IsBinaryCoercibleWithCast looks up
+// CASTSOURCETARGET(srctype, targettype) only; "the order of the operands is
+// now significant"). Only a real binary cast satisfies this (a WITH INOUT
+// cast still runs the type's own I/O functions, so it is not
+// binary-coercible). PG additionally special-cases domains and a handful of
+// hard-wired pairs (anyarray, etc.); those are out of scope here — only the
+// explicit-cast-registry form CREATE CAST test cases exercise.
 func castUserBinaryCoercible(im *catalog.InMemory, a, b string) bool {
 	if im == nil {
 		return false
 	}
-	if cs := im.CastByTypes(a, b); cs != nil && cs.Method == "b" {
-		return true
-	}
-	if cs := im.CastByTypes(b, a); cs != nil && cs.Method == "b" {
-		return true
-	}
-	return false
+	cs := im.CastByTypes(a, b)
+	return cs != nil && cs.Method == "b"
 }
 
 // castResolveTypeOID resolves a CREATE CAST source/target/argument type name
@@ -21582,7 +22270,10 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *
 	}
 	// Allow source and target types to be the same only for length-coercion
 	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
-	if castTypeOIDMatch(im, source, target) && nargs < 2 {
+	// The comparison is strict OID identity (sourcetypeid == targettypeid) —
+	// not binary-coercibility — so a registered binary cast between two
+	// distinct types does not trip it.
+	if castSameTypeOID(im, source, target) && nargs < 2 {
 		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
 	}
 	return nil
@@ -23138,6 +23829,19 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 // server/grant_ddl.go's identically-behaved errGrantorMustBeCurrentUser check
 // for the table-ACL path, since the executor package cannot import server (it
 // would create an import cycle). M0119-0004-ACLHEAP.
+// checkGrantOptionToPublic rejects GRANT … TO PUBLIC WITH GRANT OPTION with
+// PostgreSQL's 0LP01 (merge_acl_with_grant, aclchk.c:208 — shared by every
+// object class and by ALTER DEFAULT PRIVILEGES). It runs before any ACL entry
+// is written: goopg's ACL store is not transactional, so a mid-loop failure
+// would leave the earlier grantees recorded where PG's rollback leaves none.
+// REVOKE never trips it.
+func checkGrantOptionToPublic(revoke, withGrantOption bool, grantees []string) error {
+	if revoke || !catalog.GrantOptionToPublic(withGrantOption, grantees) {
+		return nil
+	}
+	return &ExecError{Code: "0LP01", Message: catalog.GrantOptionToPublicMessage}
+}
+
 func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
 	if grantedBy == "" {
 		return nil
@@ -23167,6 +23871,9 @@ func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
 // grant_ddl.go's table-ACL check. M0119-0004-ACLHEAP.
 func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, tc.GrantedBy); err != nil {
+		return err
+	}
+	if err := checkGrantOptionToPublic(tc.Revoke, tc.WithGrantOption, tc.Grantees); err != nil {
 		return err
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
@@ -23266,7 +23973,7 @@ func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind user
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
+	deleteTypeFromCatalogHeap(ctx, tableCatalogHeapDBOid(ctx), oid, ctx.Tx.XID)
 	if err := writeTypeHeapRowWithIndexes(ctx, row); err != nil {
 		return err
 	}
@@ -23322,6 +24029,9 @@ func columnAttNum(tbl *catalog.Table, colName string) int16 {
 // database/parameter check. M0119-0004-ACLHEAP (attacl grantor half).
 func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, ac.GrantedBy); err != nil {
+		return err
+	}
+	if err := checkGrantOptionToPublic(ac.Revoke, ac.WithGrantOption, ac.Grantees); err != nil {
 		return err
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
@@ -23396,9 +24106,9 @@ func (o *ddlOp) resyncAttrACLHeapRow(im *catalog.InMemory, tbl *catalog.Table, c
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	deleteAttributeFromCatalogHeap(ctx, catalog.DefaultDBOid, tbl.OID, attNum, ctx.Tx.XID)
+	deleteAttributeFromCatalogHeap(ctx, tableCatalogHeapDBOid(ctx), tbl.OID, attNum, ctx.Tx.XID)
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -23563,7 +24273,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// keys the comment lookup on the extension's catalogId
 		// (tableoid=pg_extension=3079) and objsubid 0, then re-emits
 		// `COMMENT ON EXTENSION <name> IS '...'`. DU-002 slice 388.
-		oid := im.ExtensionOID(s.ObjName.Name)
+		oid := im.ExtensionOID(s.ObjName.Name, o.ctx.CurrentDatabase)
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("extension %q does not exist", s.ObjName.Name)}
@@ -24969,9 +25679,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		// implicit pg_class relation + its pg_attribute field rows) before the
 		// re-sync re-writes them, mirroring execDropType's composite branch.
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25009,9 +25719,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		copy(newFields, ct.Fields)
 		newFields[idx].Name = s.RenameAttrNew
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25052,9 +25762,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		newFields = append(newFields, ct.Fields[:idx]...)
 		newFields = append(newFields, ct.Fields[idx+1:]...)
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25099,9 +25809,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		// present (DU-002 slice 259), else reset to the new type's default (empty).
 		newFields[idx].Collation = s.AlterAttrCollation
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25344,9 +26054,9 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
 	// single-subcommand branches for the per-relation rationale).
 	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
-		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
-		deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
+		deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25373,9 +26083,9 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
 		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), et.ArrayOID, o.ctx.Tx.XID)
 				// B2.1d: the enum's pg_enum label rows die with it.
 				deleteEnumLabelRowsByTypid(o.ctx, et.OID, o.ctx.Tx.XID)
 				// Mirror pg_type + pg_enum to postgres db so the xmax stamps
@@ -25393,12 +26103,12 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// slice 242 — mirrors the enum branch above.
 		if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
 				// Stamp xmax on the implicit pg_class relation + its pg_attribute
 				// field rows so the dropped composite type leaves no orphan rows
 				// for pg_dump's getTypes/dumpCompositeType. DU-002 slice 243.
-				deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+				deleteCatalogRowsForOID(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.RelOID, o.ctx.Tx.XID)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
@@ -25413,10 +26123,10 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// branches above. DU-002 (M0110-0001).
 		if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.MultirangeOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), rt.MultirangeArrayOID, o.ctx.Tx.XID)
 				// B2.1c: the pg_range row dies with the type.
 				deleteRangeCatalogRow(o.ctx, rt.OID, o.ctx.Tx.XID)
 				mirrorTypeCatalogFiles(o.ctx)
@@ -26095,10 +26805,10 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
 		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row. DU-002 slice 251.
 				if d.ArrayOID != 0 {
-					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
+					deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.ArrayOID, o.ctx.Tx.XID)
 				}
 				// B2.1b: the domain's pg_constraint rows die with it.
 				for _, chk := range d.Checks {
@@ -26663,6 +27373,17 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 // locking a view also locks its underlying tables/views recursively. M0097.
 // The locks are released when the session's transaction ends (execCommit/execRollback).
 func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
+	// RequireTransactionBlock(isTopLevel, "LOCK TABLE")
+	// (postgres/src/backend/tcop/utility.c:936) runs before the relations are
+	// even resolved: a top-level LOCK outside a transaction block would release
+	// its lock immediately, so PG presumes user error. Inside a routine (a
+	// PL/pgSQL body, a DO block) the statement is not top-level and is allowed —
+	// goopg's isTopLevel is RoutineDepth == 0. A nil Session is an embedded
+	// context with no transaction-block notion, so it is left alone.
+	if o.ctx.RoutineDepth == 0 && o.ctx.Session != nil && !o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25P01", Pos: s.Pos(),
+			Message: "LOCK TABLE can only be used in transaction blocks"}
+	}
 	sess := o.ctx.Session
 	if sess == nil {
 		return nil

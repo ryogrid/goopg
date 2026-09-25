@@ -1,0 +1,12 @@
+# stats-epoch: 00a872b0f60648fb
+=== PLAN-ONLY RUN — §4 clause 6 channel only (09 §5 and the §4 parity ratchet are NOT measured)
+  Queries were EXPLAINed, not EXPLAIN ANALYZEd. Both the §5 estimate audit
+  and the §4 parity ratchet score an estimate against an ACTUAL row count,
+  which this run does not have, so both sections are omitted rather than
+  printed empty, and --fail-on-violation is off. Do not cite this artifact
+  as a §5 or §4 result.
+  What IS measured: the join-spine pairing diff and, with --enum-trace, the
+  clause-6 enumeration provenance. Both are properties of PLANNING, decided
+  before a single tuple moves, so a plan-only run answers clause 6 exactly
+  as a full audit would — in seconds instead of a power run, and without
+  timing content that a co-resident workload could contaminate.

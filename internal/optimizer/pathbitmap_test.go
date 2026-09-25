@@ -14,8 +14,8 @@ func testCatWithIdx(t *testing.T) (catalog.Catalog, *catalog.Table, *catalog.Ind
 	t.Helper()
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "a", Type: catalog.Type{Name: "int4"}},
-		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "a", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatalf("CreateTable: %v", err)
@@ -192,7 +192,7 @@ func TestBitmapPathCost_Positive(t *testing.T) {
 	tuplesFetched := clampRowEst(in.selectivity * relTuples)
 	idxCost := costBitmapIndexScan(s.cp, in)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, s.totalTablePages(), s.cp.effectiveCacheSize, maxEntries)
-	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T)
+	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, 0)
 
 	// Verify cost components are positive and ordered.
 	if idxCost.Total <= 0 {

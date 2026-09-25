@@ -1,0 +1,101 @@
+=== Q18
+Sort  (cost=313370.78..314718.18 rows=538958 width=204) (actual time=9943.959..9943.962 rows=11.00 loops=1)
+  Sort Key: orders.o_totalprice DESC, orders.o_orderdate
+  Sort Method: quicksort  Memory: 4kB
+  ->  HashAggregate  (cost=248588.53..253978.11 rows=538958 width=204) (actual time=9943.946..9943.954 rows=11.00 loops=1)
+        Group Key: customer.c_name, customer.c_custkey, orders.o_orderkey, orders.o_orderdate, orders.o_totalprice
+        ->  Gather  (cost=88870.00..247241.14 rows=538958 width=1622) (actual time=8260.900..9943.928 rows=77.00 loops=1)
+              Workers Planned: 4
+              Workers Launched: 4
+              ->  Hash Semi Join  (cost=87870.00..500381.77 rows=538958 width=1622)
+                    Hash Cond: (orders.o_orderkey = l_orderkey)
+                    Worker 0:  actual time=2607.511..2620.367 rows=14.00 loops=1
+                    Worker 1:  actual time=425.593..2002.284 rows=29.00 loops=1
+                    Worker 2:  actual time=257.596..289.055 rows=14.00 loops=1
+                    Worker 3:  actual time=1707.585..1707.609 rows=7.00 loops=1
+                    Worker 4:  actual time=989.757..2082.656 rows=13.00 loops=1
+                    Buckets: 262144  Batches: 1  Memory Usage: 12289kB  Build Time: 6022.687 ms
+                    ->  Hash Join  (cost=87870.00..353212.70 rows=6001988 width=268)
+                          Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                          Worker 0:  actual time=0.026..2672.545 rows=1216440.00 loops=1
+                          Worker 1:  actual time=0.025..2672.601 rows=1208217.00 loops=1
+                          Worker 2:  actual time=0.020..2672.587 rows=1230248.00 loops=1
+                          Worker 3:  actual time=0.034..2672.529 rows=1195626.00 loops=1
+                          Worker 4:  actual time=0.056..2672.643 rows=1151195.00 loops=1
+                          Buckets: 2097152  Batches: 1  Memory Usage: 581703kB  Build Time: 1173.045 ms
+                          ->  Parallel Seq Scan on lineitem  (cost=0.00..175312.88 rows=1500497 width=550)
+                                Worker 0:  actual time=0.023..2672.543 rows=1216440.00 loops=1
+                                Worker 1:  actual time=0.022..2672.599 rows=1208217.00 loops=1
+                                Worker 2:  actual time=0.016..2672.585 rows=1230248.00 loops=1
+                                Worker 3:  actual time=0.026..2672.527 rows=1195626.00 loops=1
+                                Worker 4:  actual time=0.053..2672.641 rows=1151195.00 loops=1
+                          ->  Hash Join  (cost=6950.00..69120.00 rows=1500000 width=204)
+                                Hash Cond: (orders.o_custkey = customer.c_custkey)
+                                Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Buckets: 262144  Batches: 1  Memory Usage: 32503kB  Build Time: 75.066 ms
+                                ->  Seq Scan on orders  (cost=0.00..41545.00 rows=1500000 width=448)
+                                      Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                                ->  Seq Scan on customer  (cost=0.00..5075.00 rows=150000 width=624)
+                                      Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                    ->  GroupAggregate  (cost=75024.85..80412.66 rows=134695 width=64)
+                          Group Key: l_orderkey
+                          Filter: (sum(l_quantity) > 313)
+                          Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                          Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                          Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                          Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                          Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+                          ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..60019.88 rows=6001988 width=550)
+                                Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 4:  actual time=0.000..0.000 rows=0.00 loops=0
+Planning Time: 0.012 ms
+Execution Time: 9943.985 ms
+
+=== Q22
+Sort  (cost=265859.45..265859.95 rows=200 width=72) (actual time=509.440..509.442 rows=7.00 loops=1)
+  Sort Key: cntrycode
+  Sort Method: quicksort  Memory: 1kB
+  ->  Finalize HashAggregate  (cost=265849.80..265851.80 rows=200 width=72) (actual time=509.431..509.436 rows=7.00 loops=1)
+        Group Key: cntrycode
+        ->  Gather  (cost=265844.80..265848.80 rows=200 width=72) (actual time=0.000..0.000 rows=0.00 loops=1)
+              Workers Planned: 2
+              Workers Launched: 2
+              ->  Partial HashAggregate  (cost=265844.80..265846.80 rows=200 width=72)
+                    Group Key: substr(customer.c_phone, 1, 2)
+                    Worker 0:  actual time=0.000..0.000 rows=0.00 loops=1
+                    Worker 1:  actual time=0.000..0.000 rows=0.00 loops=1
+                    Worker 2:  actual time=0.000..0.000 rows=0.00 loops=1
+                    ->  Nested Loop Anti Join  (cost=0.38..265719.81 rows=8333 width=624)
+                          Filter: (customer.c_acctbal > (InitPlan 1).col1)
+                          Worker 0:  actual time=86.374..509.178 rows=1245.00 loops=1
+                          Worker 1:  actual time=85.881..509.010 rows=1216.00 loops=1
+                          Worker 2:  actual time=86.387..509.115 rows=1354.00 loops=1
+                          InitPlan 1 (calls=1354 rebuilds=1 rescans=0 hits=1353 misses=1)
+                            ->  Aggregate  (cost=2068.03..2068.04 rows=1 width=32)
+                                  ->  Seq Scan on customer_1  (cost=0.00..1954.42 rows=45442 width=624)
+                                        Filter: ((c_acctbal > 0.00) AND (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')))
+                          ->  Parallel Seq Scan on customer  (cost=0.00..2000.00 rows=50000 width=624)
+                                Filter: (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17'))
+                                Worker 0:  actual time=85.370..509.197 rows=3805.00 loops=1
+                                Worker 1:  actual time=85.408..509.000 rows=3782.00 loops=1
+                                Worker 2:  actual time=85.314..509.145 rows=4104.00 loops=1
+                          ->  Index Only Scan using order_customer_fkidx on orders  (cost=0.38..5.11 rows=16 width=32)
+                                Index Cond: (o_custkey = customer.c_custkey)
+Planning Time: 0.006 ms
+Execution Time: 509.678 ms
+

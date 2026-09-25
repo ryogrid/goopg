@@ -91,12 +91,14 @@ func TestInputNodePathkeysStaysInTheInputsOwnCoordinates(t *testing.T) {
 	if got := inputNodePathkeys(&Limit{Child: &Filter{Child: srt}}); len(got) != len(keys) {
 		t.Fatalf("the walk must descend through Filter and Limit: got %d keys", len(got))
 	}
-	// A Project is where coordinates are re-assigned. Even one that happens to
-	// publish an agreeing schema is refused: admitting it would put the walk
-	// back in the translation business the file header rules out.
+	// A Project is where coordinates are re-assigned. One that publishes an
+	// agreeing schema but states no targets is still refused: M0144-0011a-2
+	// admits a Project only on POSITIVE evidence that it re-assigns nothing
+	// (`projectIsPositionalIdentity`), never on the absence of evidence that
+	// it does.
 	proj := &Project{Child: srt, schema: srt.Output()}
 	if got := inputNodePathkeys(proj); got != nil {
-		t.Fatalf("a Project must stop the walk, got %d keys", len(got))
+		t.Fatalf("a Project with no stated targets must stop the walk, got %d keys", len(got))
 	}
 	if got := inputNodePathkeys(upperOrderedInput(10)); got != nil {
 		t.Fatalf("a node that claims no order must claim none, got %d keys", len(got))
@@ -277,5 +279,233 @@ func TestBuildJoinPathkeysDropsFullAndRightOrderings(t *testing.T) {
 		if got := buildJoinPathkeys(jt, keys); len(got) != 1 {
 			t.Fatalf("jointype %v streams the outer in order and must keep its keys, got %v", jt, got)
 		}
+	}
+}
+
+// upperOrderedSortedAgg builds the shape M0144-0011a's arm exists for: a
+// sorted `*Aggregate` over a `*Sort` whose leading keys ARE the group keys,
+// publishing the group-prefix output layout (`[groups|aggs|…]`). This is the
+// finished-Node form of the Q8 slice's winning `PathAgg`
+// (`analysis/m0144/m0144-0011-q8-slice-trace.md`).
+func upperOrderedSortedAgg() *Aggregate {
+	group := &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}
+	return &Aggregate{
+		Child: &Sort{
+			Child: upperOrderedInput(10),
+			Keys:  []SortKey{{Expr: group, Desc: true, NullsFirst: true}},
+		},
+		GroupExprs: []Expr{group},
+		Strategy:   AggStrategySorted,
+		schema: Schema{
+			{Name: "k", Type: catalog.Type{Name: "int4"}},
+			{Name: "count", Type: catalog.Type{Name: "int8"}},
+		},
+	}
+}
+
+// TestInputNodePathkeysReadsASortedAggregatesEmissionOrder is M0144-0011a:
+// PG's `create_agg_path` copies the subpath's pathkeys onto an AGG_SORTED
+// `AggPath` (pathnode.c:3412-3416) and `create_ordered_paths` reads them
+// (planner.c:5337, :5344-5348), so a GroupAggregate already emitting the
+// ORDER BY order is taken as-is. goopg's seam publishes a Node, and the walk's
+// `default: nil` used to swallow `*Aggregate` — re-seeding the ORDERED step
+// with keys=0 and forcing the redundant Sort the Q8 trace measured.
+//
+// The claim must come back in the aggregate's OUTPUT coordinates (position 0,
+// named by the group key) and must carry the child sort's direction, not a
+// default one.
+func TestInputNodePathkeysReadsASortedAggregatesEmissionOrder(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+
+	got := inputNodePathkeys(agg)
+	if len(got) != 1 {
+		t.Fatalf("a sorted aggregate emits its group-key order: got %d keys, want 1", len(got))
+	}
+	cr, ok := got[0].Expr.(*ColumnRef)
+	if !ok || cr.Index != 0 || cr.Name != "k" {
+		t.Fatalf("the claim must be in OUTPUT coordinates, got %#v", got[0].Expr)
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("the child sort's direction must be carried, got %+v", got[0])
+	}
+	// ...and still through the schema-preserving wrappers (a HAVING Filter is
+	// exactly what sits over the aggregate in production).
+	if got := inputNodePathkeys(&Limit{Child: &Filter{Child: agg}}); len(got) != 1 {
+		t.Fatalf("the walk must reach the aggregate below Filter/Limit, got %d keys", len(got))
+	}
+}
+
+// TestAggregateEmissionPathkeysDeclinesTheSameShapesAsItsPathTwin pins the
+// sibling-agreement rule: `aggregateEmissionPathkeys` (Node) and
+// `groupingEmissionPathkeys` (Path) must refuse the same shapes, or the
+// ORDERED step would claim an order on one route that the other denies.
+// Every case is a shape whose emission order is either absent or unnameable
+// in output coordinates, and the answer is always "no claim" — never a
+// repaired or partial one.
+func TestAggregateEmissionPathkeysDeclinesTheSameShapesAsItsPathTwin(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Aggregate)
+	}{
+		{"hashed strategy emits no order", func(a *Aggregate) { a.Strategy = AggStrategyHashed }},
+		{"a partial/finalize stage is not the simple mode", func(a *Aggregate) { a.Mode = AggModePartial }},
+		{"grouping sets run the hashed executor arm", func(a *Aggregate) { a.GroupingSets = [][]int{{0}} }},
+		{"no group keys is no order", func(a *Aggregate) { a.GroupExprs = nil }},
+		{"the index-remapped permutation is not the written order", func(a *Aggregate) { a.GroupKeyOrder = []int{0} }},
+		{"a child that states no order states none", func(a *Aggregate) { a.Child = upperOrderedInput(10) }},
+		{"the child sorts on something else", func(a *Aggregate) {
+			a.Child = &Sort{Child: upperOrderedInput(10), Keys: []SortKey{
+				{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}},
+			}}
+		}},
+		{"a non-ColumnRef group expression cannot be named", func(a *Aggregate) {
+			a.GroupExprs = []Expr{&BinaryOp{}}
+		}},
+		{"the output position does not carry the group key's name", func(a *Aggregate) {
+			a.schema = Schema{
+				{Name: "other", Type: catalog.Type{Name: "int4"}},
+				{Name: "count", Type: catalog.Type{Name: "int8"}},
+			}
+		}},
+	}
+	for _, c := range cases {
+		agg := upperOrderedSortedAgg()
+		c.mutate(agg)
+		if got := inputNodePathkeys(agg); got != nil {
+			t.Fatalf("%s: got %d keys, want no claim", c.name, len(got))
+		}
+	}
+	if got := aggregateEmissionPathkeys(nil); got != nil {
+		t.Fatal("nil aggregate must claim nothing")
+	}
+}
+
+// TestAggregateEmissionPathkeysReadsAGatherMergeChild: R56's no-split arm
+// delivers group-key order through a `*GatherMerge`, not a `*Sort` — a merge
+// emits the merged order of its sorted inputs, the same delivery contract
+// `groupingEmissionPathkeys` already accepts for a `PathGatherMerge` child.
+func TestAggregateEmissionPathkeysReadsAGatherMergeChild(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	srt := agg.Child.(*Sort)
+	agg.Child = &GatherMerge{Child: srt, WorkersPlanned: 2, Keys: srt.Keys, schema: srt.Output()}
+
+	if got := inputNodePathkeys(agg); len(got) != 1 {
+		t.Fatalf("a Gather Merge child delivers its merged order: got %d keys, want 1", len(got))
+	}
+}
+
+// identityProject builds the shape M0144-0011a-2 admits: target `j` is the
+// child's column `j` for every `j`, so the projection can only RENAME. `names`
+// is the published output vocabulary, which is what makes the case
+// interesting — it deliberately differs from the child's.
+func identityProject(child Node, names ...string) *Project {
+	childOut := child.Output()
+	targets := make([]Expr, len(childOut))
+	sch := make(Schema, len(childOut))
+	for j, c := range childOut {
+		targets[j] = &ColumnRef{Index: j, Name: c.Name, Type: c.Type}
+		sch[j] = SchemaColumn{Name: names[j], Type: c.Type}
+	}
+	return &Project{Child: child, Targets: targets, schema: sch}
+}
+
+// TestInputNodePathkeysCrossesAPositionalIdentityProject is M0144-0011a-2, and
+// it is the shape TPC-DS SF0.25 Q21 actually reaches the ORDERED step with:
+// `Project{Aggregate}` whose only job is to rename the two aggregate outputs
+// (`sum` -> `inv_before`/`inv_after`). Before this cut the walk stopped at the
+// Project, the `*Aggregate` arm was never consulted, and a redundant Sort
+// survived M0144-0011a.
+//
+// PG needs no special case (`create_projection_path` copies `subpath->pathkeys`
+// for ANY projection — pathnode.c:2936-2937) because a PG pathkey names an
+// EquivalenceClass; goopg's names a position, so only the identity case ports.
+// The delivered claim must come back in the PROJECT's vocabulary, at the same
+// index.
+func TestInputNodePathkeysCrossesAPositionalIdentityProject(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	proj := identityProject(agg, "renamed_k", "n")
+
+	got := inputNodePathkeys(proj)
+	if len(got) != 1 {
+		t.Fatalf("a pure rename must not destroy the claim below it: got %d keys, want 1", len(got))
+	}
+	cr, ok := got[0].Expr.(*ColumnRef)
+	if !ok || cr.Index != 0 {
+		t.Fatalf("the index must not move across a rename, got %#v", got[0].Expr)
+	}
+	if cr.Name != "renamed_k" {
+		t.Fatalf("the claim must be spelled in the published vocabulary, got %q want %q", cr.Name, "renamed_k")
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("direction must survive the rename, got %+v", got[0])
+	}
+
+	// The same relabelling applies to the *Sort top and to a searched root,
+	// and the walk still reaches them below the order-preserving wrappers.
+	srt := &Sort{Child: upperOrderedInput(10), Keys: upperOrderedKeys()}
+	overSort := identityProject(srt, "kk", "vv", "ww")
+	if got := inputNodePathkeys(&Filter{Child: overSort}); len(got) != 2 {
+		t.Fatalf("a Sort's keys must survive a rename below a Filter, got %d keys", len(got))
+	}
+}
+
+// TestProjectIsPositionalIdentityRefusesEverythingElse pins the arm's
+// admission rule: a Project is crossed on POSITIVE evidence that it
+// re-assigns no position, never because nothing proves it does. Each case is a
+// Project that can move, drop, compute or re-index a column.
+func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+
+	cases := []struct {
+		name   string
+		mutate func(*Project)
+	}{
+		{"a permutation needs a position map", func(p *Project) {
+			p.Targets[0] = &ColumnRef{Index: 1, Name: "count"}
+			p.Targets[1] = &ColumnRef{Index: 0, Name: "k"}
+		}},
+		{"a computed column is a new value", func(p *Project) {
+			p.Targets[0] = &BinaryOp{}
+		}},
+		{"an isolated scope indexes its targets in another space", func(p *Project) {
+			p.IsolatedScope = true
+		}},
+		{"a narrowing projection is not yet expressible", func(p *Project) {
+			p.Targets = p.Targets[:1]
+			p.schema = p.schema[:1]
+		}},
+		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }},
+	}
+	for _, c := range cases {
+		p := identityProject(agg, "renamed_k", "n")
+		c.mutate(p)
+		if projectIsPositionalIdentity(p) {
+			t.Fatalf("%s: admitted, want refused", c.name)
+		}
+		if got := inputNodePathkeys(p); got != nil {
+			t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+		}
+	}
+}
+
+// TestRelabelPathkeysToTruncatesRatherThanGuessing: the relabel obeys the same
+// rule validatedSearchPathkeys does — an unusable key ends the list instead of
+// being skipped, because an ordering by (a, b, c) whose b is unusable delivers
+// (a), never (a, c).
+func TestRelabelPathkeysToTruncatesRatherThanGuessing(t *testing.T) {
+	out := Schema{{Name: "x"}, {Name: ""}}
+	keys := []PathKey{
+		{Expr: &ColumnRef{Index: 0, Name: "a"}, SortAsc: true},
+		{Expr: &ColumnRef{Index: 1, Name: "b"}, SortAsc: true},
+	}
+	got := relabelPathkeysTo(keys, out)
+	if len(got) != 1 || got[0].Expr.(*ColumnRef).Name != "x" {
+		t.Fatalf("an unnameable column must truncate the claim, got %v", got)
+	}
+	if got := relabelPathkeysTo([]PathKey{{Expr: &ColumnRef{Index: 9, Name: "a"}}}, out); got != nil {
+		t.Fatal("an out-of-range index must claim nothing")
+	}
+	if got := relabelPathkeysTo(nil, out); got != nil {
+		t.Fatal("no claim must stay no claim")
 	}
 }

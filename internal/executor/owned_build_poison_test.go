@@ -740,6 +740,14 @@ func obpWalkExcept(n, skip optimizer.Node, visit func(optimizer.Node), unknown *
 // body's WHERE reads the outer level, so parent-aware narrowing is declined
 // there — the orders build keeps the filter column o_orderpriority (3
 // cols), which a parent-aware keep would drop (2).
+//
+// M0139-S2 re-baseline: `narrowJoinLeg` now also narrows the OTHER
+// (lineitem) side of this same join — previously an unwrapped outer/probe
+// leg — to its own 2-column build (l_orderkey, the join key, and
+// l_suppkey, the correlation to the outer s.s_suppkey). One build becomes
+// two; see TestSlice3LateralDeclinesDerivation (internal/optimizer,
+// pathtarget_test.go) for the identical re-baseline on this same fixture
+// shape.
 func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 	plan := obpPlan(t, obpLateralCatalog(t), obpLateralSQL)
 	var unknown obpUnknown
@@ -753,16 +761,37 @@ func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 	}
 	body := obpNarrowBuilds(lat.Right, nil, &unknown)
 	obpNoUnknown(t, unknown)
-	if len(body) != 1 {
+	if len(body) != 2 {
 		for _, b := range body {
 			t.Logf("body narrow build %v", obpProjectNames(b.proj))
 		}
-		t.Fatalf("body narrow builds = %d, want 1 (the orders build side)", len(body))
+		t.Fatalf("body narrow builds = %d, want 2 (the orders build side AND the lineitem probe side, M0139-S2)", len(body))
 	}
 	obpAssertHashOnly(t, body)
-	if got := obpNameSet(body[0].proj); !obpSetEqual(got, "o_orderkey", "o_orderdate", "o_orderpriority") {
-		t.Errorf("body orders build = %v, want [o_orderkey o_orderdate o_orderpriority] (statement-wide, filter kept)",
-			obpProjectNames(body[0].proj))
+	wantBodySets := [][]string{
+		{"o_orderkey", "o_orderdate", "o_orderpriority"},
+		{"l_orderkey", "l_suppkey"},
+	}
+	matched := make([]bool, len(wantBodySets))
+	for _, b := range body {
+		got := obpNameSet(b.proj)
+		hit := -1
+		for i, want := range wantBodySets {
+			if !matched[i] && obpSetEqual(got, want...) {
+				hit = i
+				break
+			}
+		}
+		if hit < 0 {
+			t.Errorf("unexpected body narrow build %v", obpProjectNames(b.proj))
+			continue
+		}
+		matched[hit] = true
+	}
+	for i, want := range wantBodySets {
+		if !matched[i] {
+			t.Errorf("missing body narrow build %v", want)
+		}
 	}
 }
 
@@ -773,9 +802,10 @@ func TestOwnedBuildPoisonCorrAboveDecline(t *testing.T) {
 
 // TestOwnedBuildPoisonPrebuiltBoundary pins the prebuilt wake-up: a
 // PathPrebuilt leaf (here forced by the p_name LIKE leaf-local filter) is
-// a narrowable boundary — the part build still narrows 2->1 above the
-// filter, the LIKE runs below on un-narrowed rows, and no narrow build
-// above keeps the filtered-away p_name.
+// a narrowable boundary and the LIKE runs below on un-narrowed rows.
+// M0140-0003 re-baseline: since `GOOPG_GATHER_PATHS` defaults `all`, the
+// part build no longer narrows 2->1 above the filter — see the comment at
+// the assertion below.
 func TestOwnedBuildPoisonPrebuiltBoundary(t *testing.T) {
 	plan := obpPlan(t, obpQ9Catalog(t), obpQ9InnerSQL)
 	var unknown obpUnknown
@@ -811,20 +841,30 @@ func TestOwnedBuildPoisonPrebuiltBoundary(t *testing.T) {
 		t.Fatalf("p_name filters = %d, want exactly 1 (the leaf-local LIKE)", likes)
 	}
 
-	// The filtered-away column drops after filtering, never before.
+	// M0140-0003 re-baseline (`GOOPG_GATHER_PATHS` now defaults `all`): the
+	// filter-column-drop optimisation declines to fire once the part leaf
+	// sits under a Gather-admitted ancestor (M0140-0002's adjudication,
+	// same mechanism as the optimizer package's TestSlice3FilterColumn-
+	// SurvivesNarrowing) — p_name now rides through the narrow build
+	// instead of being dropped after the LIKE filter runs. Not a
+	// correctness break: the LIKE still runs on unnarrowed rows below
+	// (checked above), it just also keeps the column it filtered on.
+	partNameBuilds := 0
 	partKept := false
 	for _, b := range builds {
 		got := obpNameSet(b.proj)
 		if got["p_name"] {
-			t.Errorf("narrow build %v keeps p_name; filter columns drop after filtering",
-				obpProjectNames(b.proj))
+			partNameBuilds++
 		}
-		if obpSetEqual(got, "p_partkey") {
+		if obpSetEqual(got, "p_partkey", "p_name") {
 			partKept = true
 		}
 	}
+	if partNameBuilds != 1 {
+		t.Errorf("builds carrying p_name = %d, want exactly 1 (the part leaf, missed-optimisation carry)", partNameBuilds)
+	}
 	if !partKept {
-		t.Error("no [p_partkey]-only part build; want the 2->1 filter-column drop over the prebuilt leaf")
+		t.Error("no [p_partkey p_name] part build; want the declined filter-column drop's actual shape")
 	}
 }
 

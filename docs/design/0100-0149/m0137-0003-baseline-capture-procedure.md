@@ -1,0 +1,320 @@
+# M0137-0003 — the canonical baseline-capture procedure
+
+Status: accepted (landed 2026-09-15)
+
+## Context
+
+`AGENT.md` §"Plan-parity harness" and the M0137 milestone doc's scope line
+both name this task's job in one sentence: "write down the canonical
+baseline-capture procedure — including the fact that **TPC-H baselines come
+from `estimate-audit -plan-only`, not `capture-tpch.sh`**... and that
+`-serial` defaults **true**". Two things made this task necessary rather than
+a formality:
+
+1. **AGENT.md's own procedural home for this information no longer exists.**
+   Commit `baf40efcb` deleted a 167-line "plan-parity-take2 work appendix"
+   (bootstrap PATH exports, the port/db/user/password table, server
+   lifecycle, "where things live") in the same commit that filed M0137-0003
+   to replace it — but the pointer text at AGENT.md's "Bootstrap first" and
+   "Canonical captures" bullets still says "read its §0 and §1" and "use the
+   appendix's commands directly". Both now point at nothing. This task is the
+   promised replacement.
+2. **The TPC-H mistake has been made twice on record, three weeks apart.**
+   `docs/design/not_ralph/plan_parity_fix_take2/TODO.md:4861-4875` (path named
+   directly in this task's own milestone-doc line, so citable per the
+   plan-parity harness's round-directory access rule) records "METHODOLOGY
+   TRAP RE-HIT AND RECORDED 2026-09-14 (cost ~1 capture pair, same trap as R65
+   §0)": `r2-instrument/capture-tpch.sh` opens a fresh `psql` session per
+   query and never `ANALYZE`s; goopg's ANALYZE statistics are per-connection
+   (`cmd/estimate-audit/main.go:37-38,:286,:325`); so every goopg TPC-H plan
+   it captured that round was planned on **empty** stats — Q21 alone scored
+   `cost=16.54` against PG's `268796`, a default-estimate tell. **The same
+   entry also settles the TPC-DS side of this task**: "TPC-DS is NOT
+   affected — probed directly 2026-09-14 (query7 cold-session vs
+   ANALYZE-warmed-session plans identical in shape, costs within 0.03%), so
+   its cluster's stats are effectively persistent and `capture-tpcds.sh`
+   remains valid there." That is the one piece of live verification this
+   procedure rests on for the TPC-DS half; this task does not re-derive it,
+   only writes it down where a script's own header and a Ralph loop's search
+   order (METHODOLOGY3 → milestone doc → task line, never a bare round-dir
+   grep) will actually find it before the mistake gets made a third time.
+
+Also deferred here and now resolved: the M0137-0001 ledger row on
+`TPCH_QUERY_DIR`'s untracked `/tmp` default (`.ralph/deferral_ledger.md`,
+task-id M0137-0001) named this task as its resume point. §5 below records the
+decision and the small guard-rail fix that closes the harm without a larger
+scope increase.
+
+## Decision — the procedure
+
+### 0. Bootstrap (every fresh shell)
+
+```bash
+cd /home/ryo/work/goopg/goopg   # $REPO_ROOT; every path below is relative to it
+export PATH="$PWD/postgres/local_install/bin:$PATH"
+export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:${LD_LIBRARY_PATH:-}"
+which psql pg_isready   # must both resolve
+```
+
+`psql`/`pg_isready`/`pg_ctl`/`pgbench` live **only** under
+`postgres/local_install/bin/` (the read-only PG 18.3 oracle submodule), never
+on a default `PATH`. Without this, `make plan-gate`'s `pg_isready` probe fails
+as *command not found* and the gate misreports the server as unreachable —
+the same trap AGENT.md's Measurement section already names.
+
+**Set `PGPASSWORD` before touching either cluster.** `docs/design/.../TODO.md:4872-4875`
+records the concrete cost of skipping this: without it, `psql -U <user>` (as
+both capture scripts and a manual session invoke it) blocks on a **hidden**
+password prompt, every query silently eats a 180 s timeout, and the capture
+just logs `(capture failed)` with no further explanation.
+
+### 1. Cluster map + auth
+
+| port | engine | db | user | password | data dir |
+|---|---|---|---|---|---|
+| 65432 | PG 18.3 TPC-H reference | `tpch` | `postgres` | `postgres` | `bench/tpch/runtime/pgdata` |
+| 65433 | goopg TPC-H bench (SF=1, HammerDB load) | `tpch` | `tpch` | `tpch` | `bench/tpch/runtime_goopg/data` |
+| 65436 | goopg TPC-DS SF=1 | (loopback) | `postgres` | trust | `bench/tpcds/runtime_goopg/data` |
+| 65437 | goopg TPC-DS SF=0.25 gate | (loopback) | `postgres` | trust | `bench/tpcds/runtime_goopg/data-sf025` |
+| 65438 | PG 18.3 TPC-DS reference | `tpcds` / `tpcds025` | `ryo` | peer/trust | `bench/tpcds/runtime/pgdata` |
+
+Full detail and lifecycle scripts: `CLAUDE.md`'s benchmark-clusters table,
+`bench/tpch/README.md`, `bench/tpcds/README.md`. 65434/65435 are reserved
+nightly `ci/batch` clone lanes — never use them for interactive work.
+`:6543x` is a **shared** block: verify a reference is up, never restart it;
+throwaway/manual work uses a private clone on a `55xx` port instead (see
+AGENT.md's "Server traps").
+
+### 2. TPC-H baseline: `estimate-audit -plan-only`, not `capture-tpch.sh`
+
+```bash
+go build -o /tmp/estimate-audit ./cmd/estimate-audit
+# goopg side: PRIVATE clone on a 55xx port (R1; see the two-invocation note
+# below — e.g. PLAN_ONLY=1 scripts/tpch-estimate-audit-arm.sh <label>
+# -serial=false -out analysis/m0144)
+PGPASSWORD=tpch /tmp/estimate-audit -plan-only -serial=false \
+  -label <descriptive-label> -out analysis/m0137 \
+  -port <55xx-private-clone> -db tpch -user tpch -password tpch
+# PG side: SECOND invocation, -port (not -ref-port), no warm-stats
+/tmp/estimate-audit -plan-only -serial=false -warm-stats=false \
+  -label <label>.pg -out analysis/m0137 \
+  -port 65432 -db tpch -user postgres -password postgres
+```
+
+**R1 correction (recorded in `p0-e7-bulk-re-measurement.md`, applied here
+2026-09-20):** the one-invocation `-ref-port 65432` form this section
+originally documented issues `ANALYZE <table>` against the read-only PG
+reference on every run (`session.ensure`'s warm-stats loop runs on the
+reference connection too) — forbidden since R1's 2026-09-17 hardening. Use
+two invocations as shown: the goopg half warm-stats against a **private
+clone** (never the shared `:65433`), the PG half with `-warm-stats=false`
+(PG stats are global/persistent; `-plan-only` keeps the reference session
+to bare `EXPLAIN`s).
+
+- **Canonical mode is `-serial=false` (parallel) since 2026-09-20** (owner
+  decision; `AGENT.md` §Goal floor is the parallel-mode match count), and
+  `-serial` has defaulted `false` since M0144-0001 landed the flip
+  (`cmd/estimate-audit/main.go`) — passing `-serial=false` explicitly is
+  still harmless and keeps a command line self-describing. `-serial=true`
+  sets `max_parallel_workers_per_gather = 0` on **both** engines
+  (`session.ensure`, same file) — serial captures remain a diagnostic
+  variant, and it is what the executed §5 estimate-audit arm
+  (`tpch-estimate-audit-arm.sh`) pins. Historical note: serial-mode captures
+  are why TPC-H `parallelism` read 0 in pre-2026-09-20 category tables — the
+  category was measured **out** of the corpus, not solved.
+- **`-plan-only` still warms stats.** `session.ensure`'s `ANALYZE <table>`
+  loop over `tpch.Tables()` runs regardless of `-plan-only` (only
+  `EXPLAIN ANALYZE` vs plain `EXPLAIN` and the §5/§4 report sections are
+  gated on it) — "the stats decide which plan is CHOSEN, so a plan-only run
+  without them would measure the spine of the no-stats planner"
+  (`main.go`'s own `prefix()` comment). This is the property `capture-tpch.sh`
+  does not have and the reason this tool is canonical for TPC-H: one
+  connection, opened once, `ANALYZE`s every table before the first `EXPLAIN`,
+  so the result never depends on whether some other session already warmed
+  the cluster.
+- **GUCs are NOT pinned by the tool itself** beyond the one `-serial` `SET`
+  above — no `work_mem`, no `effective_cache_size`. Both must already match
+  between the two clusters' `postgresql.conf`; verify against
+  `bench/tpch/README.md`'s "Cross-engine fairness" table
+  (`shared_buffers=2048MB`, `autovacuum=on`, `work_mem=512MB`,
+  `effective_cache_size=2GB` on both sides — the 512MB measurement
+  convention, owner decision 2026-09-24, superseding the 64MB alignment of
+  2026-09-06) before trusting a capture — a drifted cluster measures
+  configuration, not planning (K10).
+- **`<label>.txt` opens with a `# stats-epoch: <hash>` line (M0137-0006)** —
+  the same `sha256(relname|n_live_tup)`, first-16-hex-chars fingerprint
+  `scripts/lib/capture-stamp.sh` writes for `capture-tpch.sh`/
+  `capture-tpcds.sh`, computed here from the tool's own already-open
+  connection instead of a second `psql` round trip. Run
+  `scripts/check-stats-epoch.sh <off>.txt <on>.txt` on a flag-OFF/flag-ON
+  pair before trusting a diff between them — see §4a.
+- Output: `<out>/<label>.txt` (the §4/§5 report — empty of those sections in
+  `-plan-only` mode), `<out>/<label>.plans.txt` (goopg `=== Qn` sections),
+  `<out>/<label>.pg.plans.txt` (the PG reference, captured by the **same**
+  function with the same `-serial`/warm-stats treatment — "the reference has
+  to be measured the same way… or the comparison is between two protocols
+  rather than two planners", `main.go`'s `capture` doc comment). Root-cause
+  work (the 09 §5 tripwire this tool was originally built for) still defaults
+  to `analysis/leftdeep-joins/`; **M0137-series baseline captures use
+  `-out analysis/m0137/`** instead, per AGENT.md's "Way of working" rule that
+  new raw artefacts for this milestone group do not go into `rNNN-*`
+  directories or the tool's legacy default.
+- `capture-tpch.sh` is **not** the TPC-H baseline tool. It is demoted to an
+  ad-hoc raw-EXPLAIN convenience capture for an **already stats-warm,
+  long-running** cluster (e.g. eyeballing a structural diff on the live
+  `:65433` bench cluster mid-session, where autovacuum has already analyzed
+  everything) — it does not `ANALYZE` anything itself, so pointing it at a
+  cold cluster silently reproduces the exact defect this section exists to
+  head off.
+
+### 3. TPC-DS baseline: `scripts/capture-tpcds.sh`
+
+```bash
+scripts/capture-tpcds.sh 65437 postgres postgres \
+  analysis/m0137/<label>-tpcds-goopg.txt "<label> goopg SF0.25" \
+  bench/tpcds/runtime_goopg/data-sf025
+scripts/capture-tpcds.sh 65438 tpcds025 ryo \
+  analysis/m0137/<label>-tpcds-pg.txt "<label> PG18.3 SF0.25 reference"
+```
+
+- Unlike TPC-H, a fresh `psql` session per query is **safe** here — see the
+  Context section's citation: TPC-DS's cluster stats were probed directly
+  (query7, cold session vs an ANALYZE-warmed session) and found
+  shape-identical with costs within 0.03%, because the SF=1/SF0.25 load
+  procedure ANALYZEs every table once at load time
+  (`bench/tpcds/README.md` "3. ANALYZE each table") and that result is
+  durable across new connections on this cluster. Do not generalise this to
+  TPC-H — the two corpora are asymmetric here for a stated, verified reason,
+  not a default assumption.
+- GUCs are **no longer pinned in-session** — the 2026-09-24 measurement
+  convention (owner decision) removed the `SET work_mem='64MB'` /
+  `SET max_parallel_workers_per_gather=4` pins from both capture scripts.
+  Both engines' clusters carry `work_mem=512MB` /
+  `max_parallel_workers_per_gather=4` in `postgresql.conf` and the script
+  verifies them via `SHOW` before capturing (`want_guc`), failing loudly on
+  drift. The earlier statement that pinning made cluster-config alignment
+  unnecessary is superseded: the conf IS the alignment mechanism now.
+- **`GOOPG_ANALYZE_SEED` is pinned by `bench/tpcds/env_tpcds.sh`** (default
+  `20260905`, M0137-0020), not by `capture-tpcds.sh` itself — the script only
+  opens client `psql` sessions and never runs `ANALYZE`, so it has no seam to
+  pin the sampler through; the pin has to land before the server process
+  starts (package-level var, read once). M0138-0008 measured the consequence
+  of an unpinned seed directly: four unpinned before/after captures at two
+  FIXED commits moved `join-order`/`qual-placement`/`join-method`/`scan-type`/
+  `aggregation-strategy`/`parallelism` category counts from reservoir-sampler
+  variance alone (`docs/design/0100-0149/m0138-0008-category-shift-bisect.md`).
+  The **shared** `:65436`/`:65437` clusters were loaded before this pin
+  landed, so their existing statistics remain wall-clock-seeded until their
+  next reload; only servers started (or reloaded) after this change get the
+  reproducible sample. A fresh private clone (same recipe as M0138-0008 used)
+  is required for reproducibility whenever the shared clusters cannot be
+  reloaded.
+- **Which reference is canonical is now settled — M0137-0004.** Live PG
+  `:65438` via `scripts/capture-tpcds.sh` (the worked example above) is
+  canonical; the committed `bench/tpcds/plans-pg` fixture is a corroborating
+  secondary reference, not co-canonical — see
+  `docs/design/0100-0149/m0137-0004-tpcds-match-reference-reconciliation.md`
+  for the measurement (both references agreed `match=2` as of 2026-09-15;
+  the `match=1` reading some earlier round reports quote did not reproduce).
+  AGENT.md's "Success criterion" floor is TPC-DS `match >= 2`.
+
+### 4a. Check the stats epoch BEFORE trusting an A/B (M0137-0006)
+
+```bash
+scripts/check-stats-epoch.sh <off-arm-artefact>.txt <on-arm-artefact>.txt
+```
+
+Run this on any pair of same-corpus artefacts you are about to diff against
+each other (a flag-OFF/flag-ON pair, or an OFF baseline re-taken after a
+values sweep against the one it is meant to replace). Exit 0 means both
+carry the identical `# stats-epoch:` fingerprint — the statistics an
+estimate or a cost was computed against did not move between the two
+captures. Exit 1 means either the epochs differ (statistics were
+re-sampled in between — R120 §6's drift) or one side is
+`UNKNOWN(reason)` (the fingerprint probe itself failed, so equality cannot
+be asserted either way); the message names which file and prints both
+values. Exit 2 is an operational failure (missing file, or a file that
+predates M0137-0002/-0006 and carries no stamp at all).
+
+This does **not** apply to the goopg-vs-PG comparison in §4 below — the two
+engines' `# stats-epoch:` values are never expected to match (different
+software, different `pg_stat_user_tables` population), and `pg-plan-parity-diff.py`
+does not read the field. It applies to a same-corpus, same-engine,
+different-arm-or-time comparison: exactly the "did the OFF baseline drift"
+question R120 could only answer by hand.
+
+### 4. Compare (goopg vs PG)
+
+```bash
+python3 scripts/pg-plan-parity-diff.py <goopg>.plans.txt <pg>.plans.txt [--verbose]
+```
+
+Verdicts: `MATCH / SHAPE-DIFF / UNPARSED / MISSING-NODE / ERROR / TIMEOUT`.
+`UNPARSED` must be 0 for any parity claim (AGENT.md's "What the parity
+verdict is blind to (K50)" and `METHODOLOGY.md` §4.3 cover the rest of this
+tool's behaviour and are not repeated here).
+
+### 5. `capture-tpch.sh`'s `TPCH_QUERY_DIR` — decision and guard-rail
+
+The M0137-0001 deferral (`.ralph/deferral_ledger.md`) posed two options:
+(a) add a durable git-tracked query-dump step, or (b) treat
+`estimate-audit`'s Go-embedded `tpch.Queries()` as the more-authoritative
+path and let the script's `/tmp` dependency stand. §2 above already answers
+this: **(b)** — `capture-tpch.sh` is no longer on the TPC-H baseline critical
+path, so its query corpus's volatility is no longer safety-critical. What was
+still worth fixing directly: the deferral's stated harm was that a missing
+`/tmp` seed "silently breaks the canonical script with no error surfaced
+beyond per-query 'MISSING QUERY FILE' lines" — a capture that reads as 22
+genuine per-query planning failures rather than one clear setup error.
+`scripts/capture-tpch.sh` now checks both `TPCH_QUERY_DIR` and
+`TPCH_Q15A_FILE` exist before doing any work and exits 1 with a pointer to
+this document instead. Relocating the corpus into git tracking (option (a))
+remains optional future polish.
+
+## What was not done (scope boundary)
+
+- **The TPC-DS `match=2` vs `match=1` reference question** is named, not
+  resolved — M0137-0004.
+- ~~The stats-epoch declaration is not yet a checked/enforced step~~ — landed
+  by M0137-0006 (`scripts/check-stats-epoch.sh`, §4a above); `estimate-audit`
+  now also stamps `# stats-epoch:` into `<label>.txt`, using the same
+  fingerprint formula as `capture-stamp.sh` so the two tools' artefacts are
+  directly comparable.
+- **`TPCH_QUERY_DIR`'s corpus is not relocated into git tracking** — accepted
+  as optional polish now that it is off the baseline critical path (§5).
+- **No production planner/executor/catalog code was touched.** This is a
+  documentation-and-instrument task per the M0137 charter; the two script
+  edits (both `scripts/capture-tpch.sh`, a fail-fast guard) are the harness
+  itself, the explicit subject of this milestone.
+
+## Verification
+
+- `bash -n scripts/capture-tpch.sh` — syntax check, clean.
+- `python3 scripts/capture-idempotent-test.py -v` — 2/2 test methods pass
+  (each exercises the idempotency assertion and the `_run_with_datadir`
+  stamp assertion; both already pass `TPCH_QUERY_DIR`/`TPCH_Q15A_FILE`
+  through their fixture env, so the new guard is exercised on its
+  success path by every existing run).
+- **Live, scratch (not committed) end-to-end run of the exact §2 command
+  shape**: a throwaway private goopg server (`/tmp/pp2-audit-probe`, port
+  5539, started/stopped through `scripts/goopg-test-run.sh`, never a shared
+  `:6543x` cluster) loaded with `tpch.DDL()` + `tpch.SampleInserts()`, then
+  `estimate-audit -plan-only -queries 1,6` against it. Confirmed: the binary
+  builds, the flags parse, the warm-stats `ANALYZE` loop runs without error
+  against a freshly created schema, `<label>.plans.txt` sections read
+  `=== Q1` / `=== Q6` (matching `pg-plan-parity-diff.py`'s `SECTION_RE` and
+  `capture-tpch.sh`/`capture-tpcds.sh`'s own section format), and the
+  `-plan-only` banner replaces the §5/§4 sections as documented. Server
+  stopped and all scratch files removed after the check; nothing from this
+  run is committed, per the same precedent M0137-0002 set for its own manual
+  failure-mode checks.
+- Guard-rail regression check: manually unset `TPCH_QUERY_DIR`/pointed it at
+  a nonexistent directory and confirmed `capture-tpch.sh` exits 1 with the
+  new message instead of writing 22 `MISSING QUERY FILE` sections; restored
+  the fixture env and reran `capture-idempotent-test.py` green.
+- No live run against the real TPC-H (`:65433`) or TPC-DS (`:65436`/`:65437`)
+  bench clusters was performed for this task — both were down at task start
+  (`pg_isready` "no response") and standing them up (a 12-minute HammerDB
+  load, or the TPC-DS SF=1/SF0.25 load procedure) is out of proportion to a
+  documentation task whose commands were already validated end-to-end on a
+  throwaway server with the identical code path.

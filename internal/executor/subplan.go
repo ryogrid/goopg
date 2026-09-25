@@ -204,6 +204,14 @@ func classifySubPlan(n optimizer.Node, ctx *Context) (kind int, cacheable bool) 
 				kind = rescanCloseOpen
 			}
 			walk(x.Child)
+		case *optimizer.IncrementalSort:
+			// M0141-S7-exec-b: same classification as Sort — its own oracle
+			// (operators_incremental_sort.go) — not audited for bare re-Open
+			// safety, so treated identically until it is.
+			if kind == rescanReOpen {
+				kind = rescanCloseOpen
+			}
+			walk(x.Child)
 		case *optimizer.Distinct:
 			// Re-Open-safe since the Stage-9 reset in distinctOp.Open
 			// (rows/idx cleared, child re-drained); the tree's kind is

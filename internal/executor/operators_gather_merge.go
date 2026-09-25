@@ -47,7 +47,7 @@ type gatherMergeOp struct {
 	plan       *optimizer.GatherMerge
 	ctx        *Context
 	schema     optimizer.Schema
-	buildChild func() (Operator, error)
+	buildChild func(scope *instrumenter) (Operator, error)
 
 	group   *ParallelGroup
 	chans   []chan rowBatch
@@ -74,6 +74,9 @@ type gatherMergeOp struct {
 
 	// ownsSharedBuilds — see gatherOp; P8 hash tables published on ctx.
 	ownsSharedBuilds bool
+	// ownsParallelHash records that this Gather published Parallel Hash
+	// build states on ctx (M0146-0002) and must retract them at Close.
+	ownsParallelHash bool
 
 	// EX0-03b (new): scope is the instrumenter active on this op's own
 	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
@@ -88,30 +91,31 @@ type gatherMergeOp struct {
 // EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
 // storing the scope live at this op's own Build() time. Only the timing
 // bool is ever inherited from it — each execution site mints its own
-// fresh table via buildUnderFreshScope, so the stored table is never
-// reused.
+// fresh instrumenter, so the stored table is never reused.
 func (o *gatherMergeOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 // EX0-03b (new): buildChildForSlot builds one child tree for the given
-// execution slot. Instrumented sites (workers, leader) mint a FRESH table
-// under the mutex and file it into the pre-sized slot; uninstrumented
-// builds (no stored scope) still serialize through an explicit NIL scope
-// so a concurrent site's fresh table cannot leak into this tree.
+// execution slot. Instrumented sites (workers, leader) mint a FRESH
+// instrumenter inheriting only the timing flag and file its table into
+// the pre-sized slot; uninstrumented builds (no stored scope) pass an
+// explicit nil. The scope travels as an argument — no package-global
+// handoff, no mutex (M-NIGHTLY-instrumentscope-race-fix).
 func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
 	if o.scope == nil {
-		return buildUnderNilScope(o.buildChild)
+		return o.buildChild(nil)
 	}
-	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	fresh := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
+	op, err := o.buildChild(fresh)
 	if err != nil {
 		return nil, err
 	}
 	if slot >= 0 && slot < len(o.workerTables) {
-		o.workerTables[slot] = tab
+		o.workerTables[slot] = fresh.table
 	}
 	return op, nil
 }
 
-func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
+func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func(scope *instrumenter) (Operator, error)) *gatherMergeOp {
 	return &gatherMergeOp{plan: p, schema: p.Output(), buildChild: buildChild, keys: p.Keys}
 }
 
@@ -137,6 +141,11 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 
 	o.group = NewParallelGroup(ctx.Ctx)
 	o.parallelClaimSet = newParallelClaimSet()
+
+	// M0146-0002: Parallel Hash build states, one per join, published before
+	// any worker context exists (NewWorkerContext copies the reference) so
+	// every participant reaches the same barrier.
+	o.ownsParallelHash = registerParallelHashBuilds(ctx, o.plan.Child, o.group.Context().Done())
 
 	// P8: build shared hash tables once, before fan-out. Same ordering
 	// requirement as gatherOp — before worker contexts, before goroutines.
@@ -369,7 +378,17 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 // advance). Comparison errors are captured rather than returned so the
 // comparator stays a strict weak ordering, matching sortOp's own discipline.
 func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
-	for i, k := range o.keys {
+	return mergeKeysLess(o.keys, a, b, &o.sortErr)
+}
+
+// mergeKeysLess orders two rows by their PRECOMPUTED sort-key values. It is
+// the one comparator every ordered merge shares — gatherMergeOp's heap and
+// the ordered-merge setOp (Merge Append, M0141-S2b-4c) — and it must agree
+// with sortOp.lessRows, because each merge orders streams those Sorts
+// produced. Comparison errors are recorded in *errp (first one wins) rather
+// than returned, so the comparator stays a strict weak ordering.
+func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
+	for i, k := range keys {
 		av, bv := a[i], b[i]
 		// NULL placement is `k.NullsFirst`, NOT `k.Desc`. The two coincide
 		// only for PG's DEFAULTS (NULLS LAST for ASC, NULLS FIRST for DESC,
@@ -386,10 +405,6 @@ func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
 		//   select nullif(l_linenumber,1) from lineitem
 		//     order by 1 asc nulls first
 		//   -> a NULL surfaced at row 1183498, AFTER non-NULLs (PG: correct)
-		//
-		// This comparator and `sortOp.lessRows` are one rule read twice: the
-		// merge orders the streams the worker sorts produced, so any
-		// disagreement between them is unordered output by construction.
 		if av.IsNull() && !bv.IsNull() {
 			return k.NullsFirst
 		}
@@ -401,8 +416,8 @@ func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
 		}
 		cmp, err := compareDatum(av, bv, 0)
 		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
+			if *errp == nil {
+				*errp = err
 			}
 			return false
 		}
@@ -464,7 +479,15 @@ func (o *gatherMergeOp) Close() error {
 	}
 
 	// Same ordering as gatherOp.Close, and for the same reason: cancel, then
-	// DRAIN so a worker blocked mid-send can observe it, then join.
+	// DRAIN so a worker blocked mid-send can observe it, then join. The
+	// group==nil guard is gatherOp.Close's: a Merge that was never Opened
+	// (e.g. a child of a shared hash build's build side, Closed but never
+	// Opened by a cooperative producer) launched nothing, and cancelling a
+	// nil group is a nil-pointer panic that then cancels sibling producers
+	// mid-scan — silently dropping rows.
+	if o.group == nil {
+		return nil
+	}
 	o.selfCancelled = true
 	o.group.Cancel()
 	for _, ch := range o.chans {
@@ -485,6 +508,11 @@ func (o *gatherMergeOp) Close() error {
 		a.Release()
 	}
 	o.workers, o.arenas = nil, nil
+	if o.ownsParallelHash && o.ctx != nil {
+		// Retract after the join: no participant can still be reading.
+		o.ctx.ParallelHashBuilds = nil
+		o.ownsParallelHash = false
+	}
 	if o.ownsSharedBuilds && o.ctx != nil {
 		// E-09a: retract and unlink the batch files after the join.
 		releaseSharedHashBuilds(o.ctx)

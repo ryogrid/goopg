@@ -4,8 +4,10 @@ package executor
 // docs/design/0119-0006-array-index-key-decodability.md).
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestArrayIndexOnlyScanReadsHeapForRefusedElement reproduces the defect this
@@ -187,7 +189,20 @@ func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
 				"INSERT INTO arr_iosk VALUES ('"+c.insert+"')",
 				"INSERT INTO arr_iosk VALUES ('"+c.probe+"')",
 			)
-			vacuumThen(t, ctx, "arr_iosk")
+			// R46/K98: scalar cases get scale + selectivity (2000
+			// distinct values + ANALYZE) so the probe keeps the
+			// index under the same cost comparison PG runs. The
+			// reg* cases are covered by the carve-out (tiny
+			// fixtures keep the index; see seqWinsEqualityProbe).
+			if stmts := arrBulkInserts(c.name); len(stmts) > 0 {
+				for _, stmt := range stmts {
+					runComposite(t, ctx, stmt)
+				}
+				vacuumThen(t, ctx, "arr_iosk")
+				runDDL(t, ctx, "ANALYZE arr_iosk")
+			} else {
+				vacuumThen(t, ctx, "arr_iosk")
+			}
 
 			q := "SELECT a FROM arr_iosk WHERE a = '" + c.probe + "'"
 			if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
@@ -202,4 +217,55 @@ func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+// arrBulkInserts builds scale + selectivity for the scalar array
+// cases: 2000 distinct values (avoiding the seeded insert/probe
+// pair, keeping the 1-row assertions) so the probe keeps the index
+// under costing. Returns nil for the reg* cases, which the R46
+// carve-out keeps on the index at tiny scale instead.
+func arrBulkInserts(name string) []string {
+	const n = 2000
+	vals := make([]string, 0, n)
+	switch name {
+	case "date":
+		base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+		for i := 0; i < n; i++ {
+			vals = append(vals, "'{"+base.AddDate(0, 0, i).Format("2006-01-02")+"}'")
+		}
+	case "time":
+		for i := 0; i < n; i++ {
+			sec := 1 + 43*i
+			vals = append(vals, fmt.Sprintf("'{%02d:%02d:%02d}'", sec/3600, (sec/60)%60, sec%60))
+		}
+	case "timestamp":
+		base := time.Date(2020, 1, 2, 4, 4, 5, 0, time.UTC)
+		for i := 0; i < n; i++ {
+			vals = append(vals, "'{"+base.Add(time.Duration(i)*time.Hour).Format("2006-01-02 15:04:05")+"}'")
+		}
+	case "timestamptz":
+		base := time.Date(2020, 1, 2, 4, 4, 5, 0, time.UTC)
+		for i := 0; i < n; i++ {
+			vals = append(vals, "'{"+base.Add(time.Duration(i)*time.Hour).Format("2006-01-02 15:04:05+00")+"}'")
+		}
+	case "bytea":
+		for i := 0; i < n; i++ {
+			vals = append(vals, fmt.Sprintf("'{\\x%04x}'", 0x1000+i))
+		}
+	default:
+		return nil
+	}
+	stmts := make([]string, 0, n/200)
+	for b := 0; b < n; b += 200 {
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO arr_iosk VALUES ")
+		for i := b; i < b+200; i++ {
+			if i > b {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("(" + vals[i] + ")")
+		}
+		stmts = append(stmts, sb.String())
+	}
+	return stmts
 }

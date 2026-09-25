@@ -350,32 +350,38 @@ func (l *lexer) next() (Token, error) {
 			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
 			return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 		}
-		// Optional fractional part. We commit to a decimal literal when we see a dot
-		// that is NOT immediately followed by an identifier (qualified-name form `a.b`).
-		// A trailing `.` (e.g. `1000.` or `1_000.`) without following digits or exponent
-		// is a valid float literal in PostgreSQL. M0097-0003.
+		// Optional fractional part. A token that starts with a digit can never
+		// be upstream's qualified-name form (`a.b` starts with an identifier,
+		// not a digit) — PG's scan.l has no such carve-out for {decinteger}'.'
+		// either, so any dot here begins a numeric literal. The exception is
+		// `..` (range syntax, e.g. `1..10`): PG's {numericfail} throws that
+		// back as two dots plus a plain integer. A trailing `.` (e.g. `1000.`
+		// or `1_000.`) without following digits or exponent is a valid float
+		// literal in PostgreSQL. M0097-0003.
 		isNumeric := false
 		if l.pos < len(l.src) && l.src[l.pos] == '.' {
 			nextAfterDot := byte(0)
 			if l.pos+1 < len(l.src) {
 				nextAfterDot = l.src[l.pos+1]
 			}
-			// Commit to numeric if: next char after '.' is a digit, whitespace, semicolon,
-			// comma, closing paren, end of input, or other non-ident non-dot char.
-			// Also commit if next is 'e'/'E' followed by '+', '-', or a digit (scientific notation
-			// like "4664.E+5" or "1.E-10"). Do NOT commit if followed by a plain identifier.
-			isExponentStart := (nextAfterDot == 'e' || nextAfterDot == 'E') &&
-				l.pos+2 < len(l.src) && (l.src[l.pos+2] == '+' || l.src[l.pos+2] == '-' || isDigit(l.src[l.pos+2]))
-			if isExponentStart || (!isIdentStart(nextAfterDot) && nextAfterDot != '.') {
+			if nextAfterDot != '.' {
 				l.pos++ // consume '.'
 				fracStart := l.pos
-				for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
-					l.pos++
-				}
-				// Trailing/double underscore in fractional part → error.
-				if checkUnderscoreJunk(fracStart, l.pos) {
-					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
-					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+				// The fraction only matches {decinteger} (must START with a
+				// digit — underscores are separators, never a leading digit
+				// substitute). `1_000._5` therefore has an EMPTY fraction
+				// per PG's grammar, leaving "_5" as trailing junk for the
+				// post-number identStart check below to catch, instead of
+				// being swallowed here as if "_5" were valid frac digits.
+				if l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+					for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
+						l.pos++
+					}
+					// Trailing/double underscore in fractional part → error.
+					if checkUnderscoreJunk(fracStart, l.pos) {
+						for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+						return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+					}
 				}
 				isNumeric = true
 			}

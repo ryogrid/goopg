@@ -141,3 +141,66 @@ func repoRoot(t *testing.T) string {
 		cur = next
 	}
 }
+
+// TestStartFailureLogTailIsInlined pins that a start failure carries the
+// cluster log's CONTENT, not merely its path.
+//
+// The error used to name the cluster.log path and stop there. That path lives
+// inside a per-run temporary tree, and the nightly's testport stage runs in a
+// throwaway worktree under tmp/nightly-src-<run>/ that is deleted when the run
+// finishes — so by the time anyone read the failure, the file it pointed at was
+// gone. TestPort_PgoutputInterop* failed with exactly that error on two
+// consecutive nights and neither root cause could be recovered, because the
+// only evidence was behind a deleted path. The failure does not reproduce on
+// demand, so the practical way to learn its cause is to make the next
+// occurrence carry it.
+//
+// The three cases below are the three states the log can be in when a start
+// fails, and each must degrade to something readable rather than to a panic or
+// to an error that replaces the start failure itself.
+func TestStartFailureLogTailIsInlined(t *testing.T) {
+	t.Run("content is inlined", func(t *testing.T) {
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "cluster.log")
+		const needle = "FATAL: could not bind IPv4 address"
+		if err := os.WriteFile(logPath, []byte("starting\n"+needle+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := &Cluster{logPath: logPath}
+		got := c.startFailureLogTail()
+		if !strings.Contains(got, needle) {
+			t.Errorf("tail = %q, want it to contain %q — a start failure must carry "+
+				"the log's content, because the path is deleted with the run", got, needle)
+		}
+	})
+
+	t.Run("oversized log is truncated to the tail", func(t *testing.T) {
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "cluster.log")
+		// The interesting lines are always the LAST ones, so a large log must
+		// keep its end, not its beginning.
+		const needle = "THE-ACTUAL-FAILURE"
+		body := strings.Repeat("noise\n", 4096) + needle + "\n"
+		if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := &Cluster{logPath: logPath}
+		got := c.startFailureLogTail()
+		if !strings.Contains(got, needle) {
+			t.Errorf("tail dropped the final line; a truncated tail must keep the END of the log")
+		}
+		if len(got) > startFailureLogTailBytes+256 {
+			t.Errorf("tail is %d bytes, want it bounded near %d — an unbounded dump "+
+				"buries the assertion that reported it", len(got), startFailureLogTailBytes)
+		}
+	})
+
+	t.Run("unreadable log degrades instead of masking the start failure", func(t *testing.T) {
+		c := &Cluster{logPath: filepath.Join(t.TempDir(), "definitely-absent.log")}
+		got := c.startFailureLogTail()
+		if got == "" || !strings.Contains(got, "unreadable") {
+			t.Errorf("tail = %q, want a readable note — reading the log is best-effort "+
+				"and must never replace the start failure being reported", got)
+		}
+	})
+}

@@ -163,9 +163,13 @@ func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gap
 	if memRing != nil {
 		// Advance ring window to accommodate the pad at [gapStart, boundary).
 		memRing.AdvanceWindow(int64(boundary))
-		if err := memRing.WriteReserved(int64(gapStart), out); err != nil {
-			return 0, false, err
-		}
+		// A failed mirror write is not a pad failure: the memRing is a
+		// walsender read cache whose misses fall back to the segment file,
+		// and a peer stripe's AdvanceWindow can slide head past gapStart
+		// between the advance and the write (errMemRingReservedOutOfRange).
+		// Propagating it turned a harmless cache miss into a panic via the
+		// onCrossSegment closure — see stripeAppendBuiltEmitted.
+		_ = memRing.WriteReserved(int64(gapStart), out)
 	}
 	return leading, padded, nil
 }

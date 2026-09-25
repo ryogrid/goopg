@@ -54,8 +54,27 @@ import (
 )
 
 // planned returns a subquery-bearing node with a real inner Plan.
+// Since M0146-0002e an UNCORRELATED sublink is leaf-eligible (PG
+// distributes it by the relids of its testexpr), so the decline pins
+// use a CORRELATED plan — one that reads the enclosing scope.
 func plannedSubq() *SubqueryExpr {
-	return &SubqueryExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}}
+	return &SubqueryExpr{Plan: correlatedPlan()}
+}
+
+// correlatedPlan is an inner plan whose Filter reads the enclosing
+// scope's column 0 (`WHERE x.b = outer.a`), so planHasOuterRef is true.
+func correlatedPlan() Node {
+	return &Filter{
+		Child: &SeqScan{Table: &catalog.Table{Name: "x"}},
+		Predicate: &BinaryOp{Op: parser.OpEq,
+			Left:  &ColumnRef{Index: 0, Name: "b"},
+			Right: &OuterColumnRef{Level: 1, Index: 0, Name: "a"}},
+	}
+}
+
+// uncorrelatedPlan is an inner plan that reads nothing from outside.
+func uncorrelatedPlan() Node {
+	return &SeqScan{Table: &catalog.Table{Name: "x"}}
 }
 
 // ---------------------------------------------------------------------
@@ -91,11 +110,11 @@ func TestConjunctEligible_DisqualifierUnderNewlyWalkedContainer(t *testing.T) {
 	// through a container.
 	disq := map[string]func() Expr{
 		"SubqueryExpr":   func() Expr { return plannedSubq() },
-		"ExistsExpr":     func() Expr { return &ExistsExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}} },
+		"ExistsExpr":     func() Expr { return &ExistsExpr{Plan: correlatedPlan()} },
 		"OuterColumnRef": func() Expr { return &OuterColumnRef{} },
 		"InExpr+Plan": func() Expr {
 			return &InExpr{Operand: &ColumnRef{Index: 0, Name: "a"},
-				Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}}
+				Plan: correlatedPlan()}
 		},
 	}
 
@@ -174,8 +193,9 @@ func TestConjunctEligible_PreservedArms(t *testing.T) {
 	declined := map[string]Expr{
 		"OuterColumnRef":        &OuterColumnRef{},
 		"SubqueryExpr":          plannedSubq(),
-		"ExistsExpr":            &ExistsExpr{Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}},
-		"InExpr with Plan":      &InExpr{Operand: col(), Plan: &SeqScan{Table: &catalog.Table{Name: "x"}}},
+		"ExistsExpr":            &ExistsExpr{Plan: correlatedPlan()},
+		"InExpr with Plan":      &InExpr{Operand: col(), Plan: correlatedPlan()},
+		"InExpr lowered (Args)": &InExpr{Operand: col(), Plan: uncorrelatedPlan(), Args: []Expr{col()}, ParParam: []int{0}},
 		"BinaryOp/nested subq":  &BinaryOp{Op: parser.OpGt, Left: col(), Right: plannedSubq()},
 		"FuncCall/nested outer": &FuncCall{Name: "abs", Args: []Expr{&OuterColumnRef{}}},
 	}
@@ -382,9 +402,19 @@ func TestLeafLocalPairAgreesOnEveryExprKind(t *testing.T) {
 		// forms take opposite decisions and only one of them is a scope
 		// crossing.
 		"InExpr/list":         {&InExpr{Operand: col(), List: []Expr{&IntegerConst{Value: 1}}}, true},
-		"InExpr/plan":         {&InExpr{Operand: col(), Plan: plan}, false},
-		"ExistsExpr":          {&ExistsExpr{Plan: plan}, false},
-		"SubqueryExpr":        {&SubqueryExpr{Plan: plan}, false},
+		// M0146-0002e: a correlated sublink declines; an uncorrelated one
+		// is admitted and only its same-scope operand is rebased.
+		"InExpr/plan":         {&InExpr{Operand: col(), Plan: correlatedPlan()}, false},
+		"InExpr/plan/uncorr":  {&InExpr{Operand: col(), Plan: plan, Negated: true}, true},
+		// A bare `x IN (SELECT …)` is PG's pull-up candidate and stays on
+		// the semi-join route whether or not it is correlated.
+		"InExpr/plan/uncorr/bare-any": {&InExpr{Operand: col(), Plan: plan}, false},
+		"ExistsExpr":          {&ExistsExpr{Plan: correlatedPlan()}, false},
+		"ExistsExpr/uncorr": {&BinaryOp{Op: parser.OpOr,
+			Left: &ExistsExpr{Plan: plan}, Right: &IsNullExpr{Operand: col()}}, true},
+		"SubqueryExpr":        {&SubqueryExpr{Plan: correlatedPlan()}, false},
+		"SubqueryExpr/uncorr": {&BinaryOp{Op: parser.OpGt,
+			Left: col(), Right: &SubqueryExpr{Plan: plan}}, true},
 		"ArraySubqueryExpr":   {&ArraySubqueryExpr{Plan: plan}, false},
 		"MultiAssignSubqRow":  {row, false},
 		"MultiAssignSubqElem": {&MultiAssignSubqElem{Row: row}, false},

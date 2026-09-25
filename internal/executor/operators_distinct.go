@@ -19,10 +19,23 @@ type distinctOp struct {
 	rows   []Row
 	idx    int
 	schema optimizer.Schema
+	// junkPos marks resjunk (rowmark ctid) positions excluded from the
+	// dedup key — a unique ctid datum would otherwise make every row
+	// distinct. M0143-0009.
+	junkPos map[int]bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
-	return &distinctOp{plan: p, child: child, schema: p.Output()}
+	var junk map[int]bool
+	for i, c := range p.Output() {
+		if c.Resjunk {
+			if junk == nil {
+				junk = map[int]bool{}
+			}
+			junk[i] = true
+		}
+	}
+	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk}
 }
 
 func (o *distinctOp) Schema() optimizer.Schema { return o.schema }
@@ -69,7 +82,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 		row := slot.Row()
 		// Clone the row so we own the data (child slot is reused).
 		ownedRow := cloneRow(row)
-		k := rowKey(ownedRow)
+		k := rowKeyExcluding(ownedRow, o.junkPos)
 		if _, dup := seen[k]; dup {
 			continue
 		}

@@ -1,0 +1,335 @@
+# K26 — join-order's dominant cause: no implied join equalities
+
+*Investigated 2026-09-09, measured on TPC-H Q9. This is the input for
+the join-order round, which the roadmap ranks as the largest blocker
+(95/99 TPC-DS, 17/22 TPC-H).*
+
+## 1. Measured
+
+`GOOPG_PGSHAPED_DP_TRACE=1` on TPC-H Q9. Every pair the DP enumerates
+contains `lineitem`:
+
+```
+{lineitem}|{part}   {lineitem}|{supplier}   {nation}|{supplier}
+{lineitem}|{partsupp}   {lineitem}|{orders}   {lineitem+part}|{supplier} ...
+```
+
+and there are **20 declines, every one `reason=no-join-clause`**.
+
+`{part}|{partsupp}` is **never enumerated**.
+
+## 2. Why, and why PG does not have the problem
+
+Q9's join clauses all run through `lineitem`:
+
+```
+p_partkey = l_partkey
+ps_partkey = l_partkey AND ps_suppkey = l_suppkey
+s_suppkey = l_suppkey
+o_orderkey = l_orderkey
+s_nationkey = n_nationkey
+```
+
+So `part` and `partsupp` have **no direct join clause** — they are
+connected only via `lineitem`. goopg therefore declines the pair, and
+`partsupp ⋈ part` is not a join order it can reach at any cost.
+
+PG reaches it. Both `p_partkey` and `ps_partkey` are equated to
+`l_partkey`, so they are in one **equivalence class**, and
+`generate_join_implied_equalities` (`equivclass.c`) SYNTHESISES
+`p_partkey = ps_partkey` as a join clause. PG's own Q9 plan uses it —
+its innermost join is `partsupp` with `part`.
+
+## 3. goopg has equivalence classes, but not this consequence
+
+`equiv_class.go` exists (M0075-0001, "equivalence-class inference for
+transitive …") and is used from `joinrestrict.go:180`. The seam's
+comment says what it supplies: *"take2 P1-20: give the SEARCH the
+equivalence class's CONSTANTS."*
+
+**Constants, not derived join clauses.** goopg infers `a = 5` from
+`a = b AND b = 5`. It does not infer `a = c` from `a = b AND b = c` and
+hand it to the join search as a join clause.
+
+That single gap is what makes the DP's reachable join orders a strict
+subset of PG's, on every query whose joins are star-shaped around one
+fact table — which is most of TPC-H and essentially all of TPC-DS.
+
+## 3a. CORRECTION — it was deliberate, and it has a known first obstacle
+
+§3 implied the transitive half was simply absent. **It was considered,
+measured, and deferred**, and the seam says so six lines below the
+comment quoted above:
+
+> *"CONSTANTS ONLY, deliberately. Propagating `a = 42` across a class
+> only adds restrictions and re-opens no join order. Adding the
+> transitive `a = c` would hand the search new JOIN clauses and reshape
+> plans broadly — **measured: it broke the pinned-semi-join layout
+> `TestPreDPPinnedSemiKeysResolveAfterDP` asserts**, on a query
+> containing no constants at all. That half stays on its legacy caller
+> pending its own evaluation."*
+
+Three things follow, all of which make the round easier rather than
+harder:
+
+1. **The mechanism already exists** on a legacy caller — this is an
+   evaluation and a re-wiring, not a port from scratch.
+2. **The round's first obstacle is named in advance**:
+   `TestPreDPPinnedSemiKeysResolveAfterDP`. Exactly as slice 2b's
+   assertion was, and that one took four attempts precisely because it
+   was met blind.
+3. **"Pending its own evaluation" is the round this workstream is for.**
+   The deferral's stated reason is that it "reshapes plans broadly" —
+   under the previous policy that was a risk; under this goal's rule a
+   plan that matches PG is not a regression however it reshapes.
+
+Reading the deferral before writing the design is what turns a
+"missing feature" into a scoped task with its blocker known. Both of my
+previous roads into unfamiliar code (K11a's stale comment, slice 2b's
+assertion) went wrong by not doing this first.
+
+## 4. Why this is the right next round
+
+- It is the **dominant** category (95/99, 17/22) and untouched.
+- The cause is now specific: a missing PG mechanism with a named oracle
+  function, not a costing difference. Recall root-causes' central
+  finding was that goopg's problems were mostly costing, not missing
+  candidates — **join-order is the exception**, and this is the
+  evidence.
+- It is *candidate generation*, so it cannot be reached by any amount
+  of cost work. The 20 `no-join-clause` declines on Q9 are pairs the
+  cost model never sees.
+
+## 5. What the round must do
+
+Re-wire the EXISTING transitive-equality half (§3a) from its legacy
+caller into the seam, so the DP receives the derived join clauses —
+PG's `generate_join_implied_equalities` (`equivclass.c`) shape: for
+each equivalence class, the join clauses between members on different
+relations.
+
+**Read `TestPreDPPinnedSemiKeysResolveAfterDP` first — done, §6.**
+
+**Verify first, per this workstream's repeated lesson**: instrument that
+the synthesised clause reaches the DP and that `{part}|{partsupp}` is
+enumerated, *before* judging any plan change. Four attempts at slice 2b
+were each wrong until the input was measured rather than assumed.
+
+**Expect no match-count movement** (`ROADMAP-to-all-match.md`): Q9 also
+differs in join-method, scan-type, parallelism and rendering. The
+round's success test is `join-order` falling on both corpora, not a
+match.
+
+
+## 6. The named obstacle, read (2026-09-09)
+
+Doing what §5 prescribes, before writing any code. The test's own
+comment:
+
+> *"the mandatory F8 remap test: DP reorders the outer layout below the
+> pinned semi join; every `ColumnRef` in the semi join's keys/predicate
+> must resolve to the column of the same name in the post-DP outer
+> schema."*
+
+and its fixture:
+
+```sql
+SELECT b1_k FROM big1, big2, small3, small4
+WHERE b1_j = b2_j AND b2_j = s3_j AND s3_k = s4_k
+  AND EXISTS (SELECT 1 FROM inner_e WHERE e_k = big1.b1_k)
+```
+
+`b1_j = b2_j AND b2_j = s3_j` is an equivalence class over
+{b1_j, b2_j, s3_j}, whose transitive closure hands the DP `b1_j = s3_j`
+— a join clause that lets it reorder the outer layout in ways it
+otherwise could not.
+
+**So the test is a REMAP test, not a layout-correctness test.** It does
+not assert that some particular join order is right. It asserts that
+after the DP reorders, the pinned semi join's column references still
+resolve by name in the new outer schema.
+
+That reframes the obstacle, and favourably:
+
+- The derived equality is **not wrong**. The reorderings it enables are
+  legitimate — they are the ones PG has and goopg lacks (§2).
+- What breaks is the **pinned semi join's remap**, which is incomplete
+  for the wider set of layouts the new clauses make reachable.
+- So the round is: derive the equalities, then extend the F8 remap to
+  survive the reorderings they enable. That is a bounded, named piece
+  of work on a mechanism that already exists — not a re-litigation of
+  whether transitive equalities belong in the search.
+
+The seam's deferral note said the transitive half "broke the
+pinned-semi-join layout the test asserts". Read closely, the test
+asserts a **remap invariant**, and a remap that cannot follow a legal
+reordering is a gap in the remap. Recording the distinction because it
+decides where the next round spends its effort: in `predp`'s remap, not
+in `equiv_class.go`.
+
+
+## 7. Measured with the transitive half ENABLED (2026-09-09)
+
+Switched the seam from `inferEquivClassConstants` to
+`inferTransitiveEqualities` and ran the suites. The deferral note said
+this "reshapes plans broadly". Measured today, it breaks **three
+tests**, not a corpus:
+
+1. `TestPreDPPinnedSemiKeysResolveAfterDP`
+2. `TestSlice3LiveQ9ShapeDerivation`
+3. `TestSlice3SelfJoinInDerivedTable`
+
+That is a materially smaller blast radius than the note implies, and
+worth re-measuring precisely because the note is old and the tree has
+moved a long way since.
+
+### 7.1 The named obstacle fails INSIDE THE TEST
+
+`TestPreDPPinnedSemiKeysResolveAfterDP` does not fail an assertion. It
+**nil-dereferences in its own helper**: `findSpineSemi` walks
+`Filter`/`Project`/`Sort` and returns `(nil, nil)` at the first `*Join`
+that is not Semi/Anti, and the caller dereferences the result without
+checking.
+
+So the failure presents as a segfault that looks like a planner crash
+and is not one — the fourth time this session a test-side walker has
+produced a planner-shaped symptom (K19).
+
+Extending the walker to descend a non-semi join's children (committed —
+it is strictly more correct regardless) is **not sufficient**: the semi
+join is still not found. So it is not merely relocated above/below an
+inner join; with implied equalities the EXISTS is unnested to a
+different shape entirely, or the pinned semi join is gone.
+
+**That is the open question, and it is now a specific one**: where does
+the pinned semi join go when the DP is given implied join equalities?
+Answer it before touching the remap — the F8 remap may not even be the
+thing that needs changing, and §6's conclusion that it is should be
+treated as a hypothesis, not a finding.
+
+### 7.2 The other two
+
+`TestSlice3LiveQ9ShapeDerivation` and `TestSlice3SelfJoinInDerivedTable`
+are narrow-build/keep assertions of the same family R14 adjudicated as
+justified re-baselines when the join shape legitimately moves. They
+should be adjudicated against PG the same way, not assumed.
+
+### 7.3 State
+
+The seam is REVERTED to constants-only; suites green. The walker fix is
+kept. Nothing about the default behaviour changed.
+
+
+## 8. The open question, ANSWERED (2026-09-09)
+
+§7 asked: where does the pinned semi join go when the DP is given
+implied join equalities? Probed by planning the fixture with the
+transitive half on and dumping the tree:
+
+```
+*Project
+  *Filter
+    *NLI type=5          <-- JoinTypeSemi. Still there.
+      *Project
+        *Join type=0 algo=1
+          ...
+```
+
+**The semi join is not lost. It changes FORM** — from the hash-shaped
+`*Join` to a `*NestedLoopIndexJoin`, still `JoinTypeSemi`, still on the
+spine directly under `Project → Filter`.
+
+And the test handles that: it switches on `semi != nil` / `nli != nil`
+with a `default: t.Fatalf("no pinned semi join found")`. The Fatalf
+never fires — the NLI branch is taken.
+
+**The nil-deref is one expression inside that branch:**
+
+```go
+leftKey = nliIn(nli.Inner).Key
+```
+
+`nliIn(nli.Inner)` returns nil for the inner shape the implied
+equalities produce, and `.Key` dereferences it.
+
+So the whole chain, end to end:
+
+1. implied equalities open join orders goopg cannot otherwise reach;
+2. on this fixture the DP's chosen order makes the pinned semi join an
+   NLI rather than a hash join — a legal, plausibly better plan;
+3. the NLI's inner is a shape `nliIn` does not recognise;
+4. the test dereferences `nliIn`'s nil result;
+5. that reads as a segfault, which read as "the transitive half breaks
+   the pinned-semi-join layout", which is why the half was deferred.
+
+**Nothing in that chain is evidence that implied equalities are wrong.**
+The next step is to look at what `nli.Inner` actually is and whether
+`nliIn` should recognise it — a bounded question about one helper, not
+a planner redesign, and emphatically not the F8 remap §6 hypothesised.
+
+That is three successive reframings of the same obstacle, each from
+measurement: "breaks plan layouts" → "breaks a remap" → "one helper
+does not recognise one inner shape". Each was cheaper to answer than
+the last, and none required trusting the previous framing.
+
+
+## 9. Obstacle CLEARED, and the hypothesis FALSIFIED (2026-09-09)
+
+### 9.1 The blocker was a type-pinning test helper
+
+§8's bounded question — what is `nli.Inner`, should `nliIn` recognise
+it — is answered six lines below `nliIn` in its own file:
+
+```go
+func nliIn(n Node) *IndexScan { is, _ := n.(*IndexScan); return is }
+```
+
+and immediately after it, `nliProbeKeys`:
+
+> *"A semi/anti inner is promoted to an `*IndexOnlyScan` when nothing
+> reads its columns (`indexOnlyNLIInner`), so a test that asserts on
+> the PROBE **must not also pin the node TYPE** — the probe is the
+> invariant, the node kind is an optimisation."*
+
+Implied equalities make that promotion happen. The test used the
+type-pinning accessor against the codebase's own written rule; switching
+it to `nliProbeKeys` makes **`TestPreDPPinnedSemiKeysResolveAfterDP`
+pass with implied equalities enabled**.
+
+The obstacle that deferred the transitive half was a test helper
+pinning a node kind its own file says is an optimisation. Failures drop
+from 3 to 2, and the two left are the Slice3 keep assertions R14
+already established are justified re-baselines when join shape moves.
+
+### 9.2 But join-order does NOT fall — the round's real finding
+
+Measured on TPC-H with implied equalities on:
+
+| category | before | after |
+|---|---|---|
+| **join-order** | **18** | **18** |
+| join-method | 12 | **10** |
+| aggregation-strategy | 10 | 11 |
+| everything else | — | unchanged |
+| match | 2 | 2 |
+
+**`join-order` is unmoved.**
+
+That falsifies §4's claim, which said: *"It is candidate generation, so
+it cannot be reached by any amount of cost work."* Half right. The
+missing clauses were **necessary** — goopg could not reach PG's orders
+at all — but they are **not sufficient**: given the clauses, goopg's
+cost model still chooses different orders.
+
+So join-order is candidate generation **and** costing, and the
+candidate half is now known to be a small, safe change. What remains is
+the DP choosing PG's order from the same candidate set — which is the
+`join_search_one_level` costing work, and is squarely in the territory
+root-causes' original thesis described.
+
+### 9.3 State
+
+Seam reverted to constants-only (the two Slice3 assertions need
+adjudicating against PG before it lands). **The test fix is KEPT** — it
+is correct independently of the flag, and it removes a trap that cost
+this workstream a deferral and three rounds of misdiagnosis.

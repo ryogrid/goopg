@@ -198,13 +198,23 @@ func recheckDeferredExclusionEq(ctx *Context, tbl *catalog.Table, idx *catalog.I
 			return true, nil
 		}
 		slot.RLock()
-		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// The index entry references the update-chain ROOT — a committed
+		// HOT update leaves the live member deeper in the chain
+		// (M0143-0010). A chain is ONE logical row: count it once when any
+		// member is live, never once per member (an in-flight update can
+		// leave both the still-live root and its in-flight successor
+		// live-for-check, which would double-count a single row).
+		anyLive := false
+		eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, _ uint16) bool {
+			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+				anyLive = true
+				return false
+			}
+			return true // dead member — try the HOT successor
+		})
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
-		if terr != nil {
-			return true, nil
-		}
-		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+		if anyLive {
 			seen[ptr] = struct{}{}
 			live++
 		}

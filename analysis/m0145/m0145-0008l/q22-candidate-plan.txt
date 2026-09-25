@@ -1,0 +1,19 @@
+GroupAggregate  (cost=28043.65..28045.65 rows=200 width=72)
+  Group Key: (substr(customer.c_phone, 1, 2))
+  ->  Sort  (cost=28042.00..28043.65 rows=658 width=64)
+        Sort Key: (substr(customer.c_phone, 1, 2))
+        ->  Nested Loop Anti Join  (cost=8.46..28011.18 rows=658 width=624)
+              ->  Seq Scan on customer  (cost=0.00..5825.00 rows=1750 width=624)
+                    Filter: ((substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')) AND (c_acctbal > (InitPlan 1).col1))
+                    InitPlan 1
+                      ->  Finalize Aggregate  (cost=5836.95..5836.96 rows=1 width=32)
+                            ->  Gather  (cost=5836.93..5836.95 rows=1 width=32)
+                                  Workers Planned: 2
+                                  ->  Partial Aggregate  (cost=5836.93..5836.94 rows=1 width=32)
+                                        ->  Parallel Seq Scan on customer_1  (cost=0.00..5825.00 rows=4771 width=624)
+                                              Filter: ((c_acctbal > 0.00) AND (substr(c_phone, 1, 2) = ANY ('13', '31', '23', '29', '30', '18', '17')))
+              ->  Bitmap Heap Scan on orders  (cost=8.46..51.95 rows=16 width=448)
+                    Recheck Cond: (o_custkey = c_custkey)
+                    ->  Bitmap Index Scan on order_customer_fkidx  (cost=0.38..8.46 rows=16 width=448)
+                          Index Cond: (o_custkey = customer.c_custkey)
+

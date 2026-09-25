@@ -1,0 +1,450 @@
+=== TPC-DS SF0.25 Q56 — instrumented PG 18.3 OPTIMIZER_DEBUG survivor pathlists (db tpcds025, private clone :5560) ===
+REL 1 relids=(b 1) rows=719876 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=44 cost=0.425..4.640553282580099 dis=0 pw=0 req_outer=(b 4) indexoid=16560 pathkeys
+    SeqScan rows=719876 cost=0..20134.760000000002 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=719876 cost=0.425..72818.3939906692 dis=0 pw=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    SeqScan rows=232218 cost=0..15258.18064516129 dis=0 pw=3
+    INDEXPATH rows=232218 cost=0.425..67941.8146358305 dis=0 pw=3 indexoid=16560 pathkeys
+  cheapest_total_path: SeqScan cost=0..20134.760000000002
+REL 2 relids=(b 2) rows=30 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2925..0.3240348893420533 dis=0 pw=0 req_outer=(b 1) indexoid=16406 pathkeys
+    SeqScan rows=30 cost=0..2519.7349999999997 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=30 cost=0.2925..3696.2724999999996 dis=0 pw=0 indexoid=16406 pathkeys
+  partial_pathlist:
+    SeqScan rows=18 cost=0..2068.55 dis=0 pw=1
+    INDEXPATH rows=18 cost=0.2925..3245.0875 dis=0 pw=1 indexoid=16406 pathkeys
+  cheapest_total_path: SeqScan cost=0..2519.7349999999997
+REL 3 relids=(b 3) rows=21922 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.29..0.3170845534508721 dis=0 pw=0 req_outer=(b 1) indexoid=16393 pathkeys
+    SeqScan rows=21922 cost=0..1761 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=21922 cost=0.29..2570.29 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    SeqScan rows=12895 cost=0..1503.6470588235295 dis=0 pw=1
+    INDEXPATH rows=12895 cost=0.29..2312.9370588235292 dis=0 pw=1 indexoid=16393 pathkeys
+  cheapest_total_path: SeqScan cost=0..1761
+REL 4 relids=(b 4) rows=18000 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2875..0.31242350071401187 dis=0 pw=0 req_outer=(b 1) indexoid=16449 pathkeys
+    SeqScan rows=18000 cost=0..1464 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=18000 cost=0.2875..1786.375113253037 dis=0 pw=0 indexoid=16449 pathkeys
+    GATHERMERGEPATH rows=18000 cost=3097.707695805663..5149.1776958056635 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=10588 cost=0..1389.8823529411766 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1464
+REL 5 relids=(b 7) rows=879 consider_parallel=true
+  pathlist:
+    SeqScan rows=879 cost=0..1531.5 dis=0 pw=0 *cheapest*
+    GATHERMERGEPATH rows=879 cost=2452.8994782098816..2553.079478209882 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=517 cost=0..1429.5882352941176 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1531.5
+REL 6 relids=(b 1 2) rows=283 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=283 cost=3068.775..18964.86127016129 dis=0 pw=0 *cheapest*
+    HASHPATH rows=283 cost=2520.1099999999997..24544.644625 dis=0 pw=0 jointype=0
+    GATHERMERGEPATH rows=283 cost=1000.7674999999999..75371.22240553795 dis=0 pw=0 indexoid=16560 pathkeys
+    NESTPATH rows=283 cost=0.7275..91405.87681150073 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    HASHPATH rows=91 cost=2068.775..17936.56127016129 dis=0 pw=3 jointype=0
+    NESTPATH rows=91 cost=0.7275..74337.92990553795 dis=0 pw=3 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: GATHERPATH cost=3068.775..18964.86127016129
+REL 7 relids=(b 1 3) rows=301619 consider_parallel=true
+  pathlist:
+    HASHPATH rows=301619 cost=2035.025..24059.615250000003 dis=0 pw=0 jointype=0 *cheapest*
+    NESTPATH rows=301619 cost=0.725..100233.0956908703 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    HASHPATH rows=97296 cost=1664.8345588235295..17532.63195398482 dis=0 pw=3 jointype=0
+    NESTPATH rows=97296 cost=0.725..83165.190637012 dis=0 pw=3 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: HASHPATH cost=2035.025..24059.615250000003
+REL 8 relids=(b 1 4) rows=719876 consider_parallel=true
+  pathlist:
+    HASHPATH rows=719876 cost=1689..23713.879500000003 dis=0 pw=0 jointype=0 *cheapest*
+    NESTPATH rows=719876 cost=3098.1326958056634..96599.13678224744 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    HASHPATH rows=232218 cost=1522.2323529411765..17390.129873102465 dis=0 pw=3 jointype=0
+  cheapest_total_path: HASHPATH cost=1689..23713.879500000003
+REL 9 relids=(b 4 7) rows=1763 consider_parallel=true
+  pathlist:
+    HASHPATH rows=1763 cost=1542.4875..3077.758375 dis=0 pw=0 jointype=4 *cheapest*
+    GATHERMERGEPATH rows=1763 cost=3918.5138311624405..4119.443831162441 dis=0 pw=0 pathkeys
+    MERGEPATH rows=1763 cost=4310.695702315252..4422.720702315251 dis=0 pw=0 jointype=4 pathkeys
+    NESTPATH rows=1763 cost=0.2875..240650.07261325305 dis=0 pw=0 jointype=4 indexoid=16449 pathkeys
+  partial_pathlist:
+    HASHPATH rows=1037 cost=1436.0507352941177..2866.559463235294 dis=0 pw=1 jointype=4
+    MERGEPATH rows=1037 cost=3672.179562371519..3739.8845623715188 dis=0 pw=1 jointype=4 pathkeys
+  cheapest_total_path: HASHPATH cost=1542.4875..3077.758375
+REL 10 relids=(b 1 2 3) rows=119 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=119 cost=3069.065..18977.3159669962 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=119 cost=1001.0575..75380.80710237288 dis=0 pw=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    NESTPATH rows=38 cost=2069.065..17965.415966996203 dis=0 pw=3 jointype=0 indexoid=16393
+    NESTPATH rows=38 cost=1.0175..74366.78460237288 dis=0 pw=3 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: GATHERPATH cost=3069.065..18977.3159669962
+REL 11 relids=(b 1 2 4) rows=283 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=283 cost=3069.0625..18993.29181149539 dis=0 pw=0 indexoid=16449 *cheapest*
+    GATHERMERGEPATH rows=283 cost=18967.99285805668..19001.47285805668 dis=0 pw=0 indexoid=16449 pathkeys
+  partial_pathlist:
+    NESTPATH rows=91 cost=2069.0625..17964.99181149539 dis=0 pw=3 jointype=0 indexoid=16449
+  cheapest_total_path: GATHERPATH cost=3069.0625..18993.29181149539
+REL 12 relids=(b 1 3 4) rows=301619 consider_parallel=true
+  pathlist:
+    HASHPATH rows=301619 cost=3724.025..26540.554250000005 dis=0 pw=0 jointype=0 *cheapest*
+    GATHERMERGEPATH rows=301619 cost=30702.380713361006..66385.85321336101 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    HASHPATH rows=97296 cost=3187.066911764706..19310.321931925995 dis=0 pw=3 jointype=0
+  cheapest_total_path: HASHPATH cost=3724.025..26540.554250000005
+REL 13 relids=(b 1 4 7) rows=70505 consider_parallel=true
+  pathlist:
+    NESTPATH rows=70505 cost=1542.9125..12034.773812188714 dis=0 pw=0 jointype=0 indexoid=16560 *cheapest*
+    NESTPATH rows=70505 cost=3918.9388311624407..13076.459268351155 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+    NESTPATH rows=70505 cost=4311.120702315252..13379.736139503966 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    NESTPATH rows=41474 cost=1436.4757352941176..8135.093217270856 dis=0 pw=1 jointype=0 indexoid=16560
+    NESTPATH rows=41474 cost=3672.604562371519..9008.418316407082 dis=0 pw=1 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: NESTPATH cost=1542.9125..12034.773812188714
+REL 14 relids=(b 1 2 3 4) rows=119 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=119 cost=3069.3525..18989.18806279246 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=119 cost=18978.325169020016..18992.402669020015 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    NESTPATH rows=38 cost=2069.3525..17977.28806279246 dis=0 pw=3 jointype=0 indexoid=16393
+  cheapest_total_path: GATHERPATH cost=3069.3525..18989.18806279246
+REL 15 relids=(b 1 2 4 7) rows=28 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=28 cost=2436.7782352941176..10765.424257076782 dis=0 pw=0 indexoid=16560 *cheapest*
+    GATHERMERGEPATH rows=28 cost=10762.954257076783..10766.144257076783 dis=0 pw=0 indexoid=16560 pathkeys
+    NESTPATH rows=28 cost=1543.215..14388.086247093683 dis=0 pw=0 jointype=0 indexoid=16560
+    NESTPATH rows=28 cost=4311.423202315252..15733.048574408935 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    NESTPATH rows=16 cost=1436.7782352941176..9762.624257076783 dis=0 pw=1 jointype=0 indexoid=16560
+    NESTPATH rows=16 cost=3672.907062371519..10635.949356213008 dis=0 pw=1 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: GATHERPATH cost=2436.7782352941176..10765.424257076782
+REL 16 relids=(b 1 3 4 7) rows=29541 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=29541 cost=4101.310294117648..13862.908151094387 dis=0 pw=0 indexoid=16560 *cheapest*
+    HASHPATH rows=29541 cost=3577.9375..14254.885562188714 dis=0 pw=0 jointype=0 indexoid=16560
+    GATHERMERGEPATH rows=29541 cost=12132.58394155154..15499.38894155154 dis=0 pw=0 indexoid=16560 pathkeys
+    NESTPATH rows=29541 cost=4311.420702315252..24560.24156352215 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    HASHPATH rows=17377 cost=3101.310294117647..9908.808151094387 dis=0 pw=1 jointype=0 indexoid=16560
+    NESTPATH rows=17377 cost=3672.904562371519..19463.047254458266 dis=0 pw=1 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: GATHERPATH cost=4101.310294117648..13862.908151094387
+REL 17 relids=(b 1 2 3 4 7) rows=12 consider_parallel=true
+  pathlist:
+    NESTPATH rows=12 cost=2437.0682352941176..10774.302627044286 dis=0 pw=0 jointype=0 indexoid=16560 *cheapest*
+    NESTPATH rows=12 cost=10763.244257076783..10775.022627044289 dis=0 pw=0 jointype=0 indexoid=16560 pathkeys
+  partial_pathlist:
+    NESTPATH rows=7 cost=1437.0682352941176..9767.697612402877 dis=0 pw=1 jointype=0 indexoid=16560
+    NESTPATH rows=7 cost=3673.1970623715188..10641.022711539103 dis=0 pw=1 jointype=0 indexoid=16560 pathkeys
+  cheapest_total_path: NESTPATH cost=2437.0682352941176..10774.302627044286
+REL 18 relids=(b 1) rows=360397 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=22 cost=0.4225..3.177721630153007 dis=0 pw=0 req_outer=(b 4) indexoid=16553 pathkeys
+    SeqScan rows=360397 cost=0..13019.970000000001 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=360397 cost=0.4225..48070.02253076696 dis=0 pw=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    SeqScan rows=116257 cost=0..10578.570967741936 dis=0 pw=3
+    INDEXPATH rows=116257 cost=0.4225..45628.623498508896 dis=0 pw=3 indexoid=16553 pathkeys
+  cheapest_total_path: SeqScan cost=0..13019.970000000001
+REL 19 relids=(b 2) rows=30 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2925..0.33304676509515896 dis=0 pw=0 req_outer=(b 1) indexoid=16406 pathkeys
+    SeqScan rows=30 cost=0..2519.7349999999997 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=30 cost=0.2925..3696.2724999999996 dis=0 pw=0 indexoid=16406 pathkeys
+  partial_pathlist:
+    SeqScan rows=18 cost=0..2068.55 dis=0 pw=1
+    INDEXPATH rows=18 cost=0.2925..3245.0875 dis=0 pw=1 indexoid=16406 pathkeys
+  cheapest_total_path: SeqScan cost=0..2519.7349999999997
+REL 20 relids=(b 3) rows=21922 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.29..0.3241510611908534 dis=0 pw=0 req_outer=(b 1) indexoid=16393 pathkeys
+    SeqScan rows=21922 cost=0..1761 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=21922 cost=0.29..2570.29 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    SeqScan rows=12895 cost=0..1503.6470588235295 dis=0 pw=1
+    INDEXPATH rows=12895 cost=0.29..2312.9370588235292 dis=0 pw=1 indexoid=16393 pathkeys
+  cheapest_total_path: SeqScan cost=0..1761
+REL 21 relids=(b 4) rows=18000 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2875..0.3198280923537099 dis=0 pw=0 req_outer=(b 1) indexoid=16449 pathkeys
+    SeqScan rows=18000 cost=0..1464 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=18000 cost=0.2875..1786.375113253037 dis=0 pw=0 indexoid=16449 pathkeys
+    GATHERMERGEPATH rows=18000 cost=3097.707695805663..5149.1776958056635 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=10588 cost=0..1389.8823529411766 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1464
+REL 22 relids=(b 7) rows=879 consider_parallel=true
+  pathlist:
+    SeqScan rows=879 cost=0..1531.5 dis=0 pw=0 *cheapest*
+    GATHERMERGEPATH rows=879 cost=2452.8994782098816..2553.079478209882 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=517 cost=0..1429.5882352941176 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1531.5
+REL 23 relids=(b 1 2) rows=147 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=147 cost=3068.775..13967.242842741938 dis=0 pw=0 *cheapest*
+    HASHPATH rows=147 cost=2520.1099999999997..16486.177750000003 dis=0 pw=0 jointype=0
+    GATHERMERGEPATH rows=147 cost=1000.765..50162.13012425907 dis=0 pw=0 indexoid=16553 pathkeys
+    NESTPATH rows=147 cost=0.725..57689.67834222943 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    HASHPATH rows=47 cost=2068.775..12952.542842741937 dis=0 pw=3 jointype=0
+    NESTPATH rows=47 cost=0.725..49144.81762425907 dis=0 pw=3 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: GATHERPATH cost=3068.775..13967.242842741938
+REL 24 relids=(b 1 3) rows=157149 consider_parallel=true
+  pathlist:
+    HASHPATH rows=157149 cost=2035.025..16001.115000000002 dis=0 pw=0 jointype=0 *cheapest*
+    NESTPATH rows=157149 cost=0.7224999999999999..64768.98779598607 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    HASHPATH rows=50693 cost=1664.8345588235295..12548.602401565468 dis=0 pw=3 jointype=0
+    NESTPATH rows=50693 cost=0.7224999999999999..56224.12075251773 dis=0 pw=3 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: HASHPATH cost=2035.025..16001.115000000002
+REL 25 relids=(b 1 4) rows=360397 consider_parallel=true
+  pathlist:
+    HASHPATH rows=360397 cost=1689..15655.234625000001 dis=0 pw=0 jointype=0 *cheapest*
+    NESTPATH rows=360397 cost=3098.1301958056633..66308.1670385598 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    HASHPATH rows=116257 cost=1522.2323529411765..12406.044695683113 dis=0 pw=3 jointype=0
+  cheapest_total_path: HASHPATH cost=1689..15655.234625000001
+REL 26 relids=(b 4 7) rows=1763 consider_parallel=true
+  pathlist:
+    HASHPATH rows=1763 cost=1542.4875..3077.758375 dis=0 pw=0 jointype=4 *cheapest*
+    GATHERMERGEPATH rows=1763 cost=3918.5138311624405..4119.443831162441 dis=0 pw=0 pathkeys
+    MERGEPATH rows=1763 cost=4310.695702315252..4422.720702315251 dis=0 pw=0 jointype=4 pathkeys
+    NESTPATH rows=1763 cost=0.2875..240650.07261325305 dis=0 pw=0 jointype=4 indexoid=16449 pathkeys
+  partial_pathlist:
+    HASHPATH rows=1037 cost=1436.0507352941177..2866.559463235294 dis=0 pw=1 jointype=4
+    MERGEPATH rows=1037 cost=3672.179562371519..3739.8845623715188 dis=0 pw=1 jointype=4 pathkeys
+  cheapest_total_path: HASHPATH cost=1542.4875..3077.758375
+REL 27 relids=(b 1 2 3) rows=64 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=64 cost=3069.065..13974.177945733454 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=64 cost=1001.055..50167.61272725058 dis=0 pw=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    NESTPATH rows=21 cost=2069.065..12967.777945733455 dis=0 pw=3 jointype=0 indexoid=16393
+    NESTPATH rows=21 cost=1.015..49160.05272725058 dis=0 pw=3 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: GATHERPATH cost=3069.065..13974.177945733454
+REL 28 relids=(b 1 2 4) rows=147 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=147 cost=3069.0625..13982.274766674374 dis=0 pw=0 indexoid=16449 *cheapest*
+    GATHERMERGEPATH rows=147 cost=13968.920095054516..13986.310095054518 dis=0 pw=0 indexoid=16449 pathkeys
+  partial_pathlist:
+    NESTPATH rows=47 cost=2069.0625..12967.574766674374 dis=0 pw=3 jointype=0 indexoid=16449
+  cheapest_total_path: GATHERPATH cost=3069.0625..13982.274766674374
+REL 29 relids=(b 1 3 4) rows=157149 consider_parallel=true
+  pathlist:
+    HASHPATH rows=157149 cost=3724.025..18102.73125 dis=0 pw=0 jointype=0 *cheapest*
+    GATHERMERGEPATH rows=157149 cost=19165.508199369982..37757.24819936998 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    HASHPATH rows=50693 cost=3187.066911764706..14203.937254506645 dis=0 pw=3 jointype=0
+  cheapest_total_path: HASHPATH cost=3724.025..18102.73125
+REL 30 relids=(b 1 4 7) rows=35298 consider_parallel=true
+  pathlist:
+    NESTPATH rows=35298 cost=1542.9099999999999..9067.94160895975 dis=0 pw=0 jointype=0 indexoid=16553 *cheapest*
+    NESTPATH rows=35298 cost=3918.9363311624406..10109.627065122191 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+    NESTPATH rows=35298 cost=4311.118202315251..10412.903936275 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    NESTPATH rows=20764 cost=1436.4732352941176..6389.996793703963 dis=0 pw=1 jointype=0 indexoid=16553
+    NESTPATH rows=20764 cost=3672.602062371519..7263.3218928401875 dis=0 pw=1 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: NESTPATH cost=1542.9099999999999..9067.94160895975
+REL 31 relids=(b 1 2 3 4) rows=64 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=64 cost=3069.3525..13980.89433926469 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=64 cost=13974.995532594083..13982.568032594083 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    NESTPATH rows=21 cost=2069.3525..12974.494339264693 dis=0 pw=3 jointype=0 indexoid=16393
+  cheapest_total_path: GATHERPATH cost=3069.3525..13980.89433926469
+REL 32 relids=(b 1 2 4 7) rows=14 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=14 cost=2436.7757352941176..8520.27106808019 dis=0 pw=0 indexoid=16553 *cheapest*
+    GATHERMERGEPATH rows=14 cost=8519.00106808019..8520.59606808019 dis=0 pw=0 indexoid=16553 pathkeys
+    NESTPATH rows=14 cost=1543.2124999999999..10560.177969273538 dis=0 pw=0 jointype=0 indexoid=16553
+    NESTPATH rows=14 cost=4311.420702315251..11905.14029658879 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    NESTPATH rows=8 cost=1436.7757352941176..7518.8710680801905 dis=0 pw=1 jointype=0 indexoid=16553
+    NESTPATH rows=8 cost=3672.9045623715188..8392.196167216414 dis=0 pw=1 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: GATHERPATH cost=2436.7757352941176..8520.27106808019
+REL 33 relids=(b 1 3 4 7) rows=15391 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=15391 cost=4101.307794117647..10648.436852527493 dis=0 pw=0 indexoid=16553 *cheapest*
+    HASHPATH rows=15391 cost=3577.935..11195.634983959751 dis=0 pw=0 jointype=0 indexoid=16553
+    GATHERMERGEPATH rows=15391 cost=9704.391105823282..11458.513605823282 dis=0 pw=0 indexoid=16553 pathkeys
+    NESTPATH rows=15391 cost=4311.418202315252..18984.280485817646 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    HASHPATH rows=9054 cost=3101.307794117647..8109.336852527493 dis=0 pw=1 jointype=0 indexoid=16553
+    NESTPATH rows=9054 cost=3672.892062371519..13993.994530522614 dis=0 pw=1 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: GATHERPATH cost=4101.307794117647..10648.436852527493
+REL 34 relids=(b 1 2 3 4 7) rows=6 consider_parallel=true
+  pathlist:
+    NESTPATH rows=6 cost=2437.0657352941175..8524.80918605241 dis=0 pw=0 jointype=0 indexoid=16553 *cheapest*
+    NESTPATH rows=6 cost=8519.29106808019..8525.13418605241 dis=0 pw=0 jointype=0 indexoid=16553 pathkeys
+  partial_pathlist:
+    NESTPATH rows=4 cost=1437.0657352941175..7521.464279685264 dis=0 pw=1 jointype=0 indexoid=16553
+    NESTPATH rows=4 cost=3673.1945623715187..8394.789378821486 dis=0 pw=1 jointype=0 indexoid=16553 pathkeys
+  cheapest_total_path: NESTPATH cost=2437.0657352941175..8524.80918605241
+REL 35 relids=(b 1) rows=179956 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=11 cost=0.42..1.799611111111111 dis=0 pw=0 req_outer=(b 4) indexoid=16546 pathkeys
+    SeqScan rows=179956 cost=0..6543.5599999999995 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=179956 cost=0.42..24067.746296426976 dis=0 pw=0 indexoid=16546 pathkeys
+  partial_pathlist:
+    SeqScan rows=74982 cost=0..5493.816666666667 dis=0 pw=2
+    INDEXPATH rows=74982 cost=0.42..23018.00296309364 dis=0 pw=2 indexoid=16546 pathkeys
+  cheapest_total_path: SeqScan cost=0..6543.5599999999995
+REL 36 relids=(b 2) rows=30 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2925..0.351142168085532 dis=0 pw=0 req_outer=(b 1) indexoid=16406 pathkeys
+    SeqScan rows=30 cost=0..2519.7349999999997 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=30 cost=0.2925..3696.2724999999996 dis=0 pw=0 indexoid=16406 pathkeys
+  partial_pathlist:
+    SeqScan rows=18 cost=0..2068.55 dis=0 pw=1
+    INDEXPATH rows=18 cost=0.2925..3245.0875 dis=0 pw=1 indexoid=16406 pathkeys
+  cheapest_total_path: SeqScan cost=0..2519.7349999999997
+REL 37 relids=(b 3) rows=21922 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.29..0.33834026095267733 dis=0 pw=0 req_outer=(b 1) indexoid=16393 pathkeys
+    SeqScan rows=21922 cost=0..1761 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=21922 cost=0.29..2570.29 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    SeqScan rows=12895 cost=0..1503.6470588235295 dis=0 pw=1
+    INDEXPATH rows=12895 cost=0.29..2312.9370588235292 dis=0 pw=1 indexoid=16393 pathkeys
+  cheapest_total_path: SeqScan cost=0..1761
+REL 38 relids=(b 4) rows=18000 consider_parallel=true
+  pathlist:
+    INDEXPATH rows=1 cost=0.2875..0.334696147947276 dis=0 pw=0 req_outer=(b 1) indexoid=16449 pathkeys
+    SeqScan rows=18000 cost=0..1464 dis=0 pw=0 *cheapest*
+    INDEXPATH rows=18000 cost=0.2875..1786.375113253037 dis=0 pw=0 indexoid=16449 pathkeys
+    GATHERMERGEPATH rows=18000 cost=3097.707695805663..5149.1776958056635 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=10588 cost=0..1389.8823529411766 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1464
+REL 39 relids=(b 7) rows=879 consider_parallel=true
+  pathlist:
+    SeqScan rows=879 cost=0..1531.5 dis=0 pw=0 *cheapest*
+    GATHERMERGEPATH rows=879 cost=2452.8994782098816..2553.079478209882 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    SeqScan rows=517 cost=0..1429.5882352941176 dis=0 pw=1
+  cheapest_total_path: SeqScan cost=0..1531.5
+REL 40 relids=(b 1 2) rows=74 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=74 cost=3068.775..8766.830541666666 dis=0 pw=0 *cheapest*
+    HASHPATH rows=74 cost=2520.1099999999997..9536.07675 dis=0 pw=0 jointype=0
+    GATHERMERGEPATH rows=74 cost=1000.7462744375108..26535.60326027862 dis=0 pw=0 indexoid=16546 pathkeys
+    NESTPATH rows=74 cost=0.7224999999999999..29201.122504551102 dis=0 pw=0 jointype=0 indexoid=16546 pathkeys
+  partial_pathlist:
+    HASHPATH rows=31 cost=2068.775..7759.430541666667 dis=0 pw=2 jointype=0
+    NESTPATH rows=31 cost=0.7224999999999999..25527.038049715844 dis=0 pw=2 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: GATHERPATH cost=3068.775..8766.830541666666
+REL 41 relids=(b 1 3) rows=78895 consider_parallel=true
+  pathlist:
+    HASHPATH rows=78895 cost=2035.025..9051.014 dis=0 pw=0 jointype=0 *cheapest*
+    NESTPATH rows=78895 cost=0.72..32813.0528378873 dis=0 pw=0 jointype=0 indexoid=16546 pathkeys
+  partial_pathlist:
+    HASHPATH rows=32873 cost=1664.8345588235295..7355.490100490197 dis=0 pw=2 jointype=0
+    NESTPATH rows=32873 cost=0.72..29138.97686034376 dis=0 pw=2 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: HASHPATH cost=2035.025..9051.014
+REL 42 relids=(b 1 4) rows=179956 consider_parallel=true
+  pathlist:
+    HASHPATH rows=179956 cost=1689..8705.05575 dis=0 pw=0 jointype=0 *cheapest*
+    GATHERMERGEPATH rows=179956 cost=16079.833818490504..37038.67637738939 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    HASHPATH rows=74982 cost=1522.2323529411765..7212.921269607843 dis=0 pw=2 jointype=0
+  cheapest_total_path: HASHPATH cost=1689..8705.05575
+REL 43 relids=(b 4 7) rows=1763 consider_parallel=true
+  pathlist:
+    HASHPATH rows=1763 cost=1542.4875..3077.758375 dis=0 pw=0 jointype=4 *cheapest*
+    GATHERMERGEPATH rows=1763 cost=3918.5138311624405..4119.443831162441 dis=0 pw=0 pathkeys
+    MERGEPATH rows=1763 cost=4310.695702315252..4422.720702315251 dis=0 pw=0 jointype=4 pathkeys
+    NESTPATH rows=1763 cost=0.2875..240650.07261325305 dis=0 pw=0 jointype=4 indexoid=16449 pathkeys
+  partial_pathlist:
+    HASHPATH rows=1037 cost=1436.0507352941177..2866.559463235294 dis=0 pw=1 jointype=4
+    MERGEPATH rows=1037 cost=3672.179562371519..3739.8845623715188 dis=0 pw=1 jointype=4 pathkeys
+  cheapest_total_path: HASHPATH cost=1542.4875..3077.758375
+REL 44 relids=(b 1 2 3) rows=32 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=32 cost=3069.065..8773.119094166203 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=32 cost=1001.0362744375109..26541.24397065301 dis=0 pw=0 indexoid=16546 pathkeys
+  partial_pathlist:
+    NESTPATH rows=13 cost=2069.065..7769.919094166204 dis=0 pw=2 jointype=0 indexoid=16393
+    NESTPATH rows=13 cost=1.0125..25537.526602215385 dis=0 pw=2 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: GATHERPATH cost=3069.065..8773.119094166203
+REL 45 relids=(b 1 2 4) rows=74 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=74 cost=3069.0625..8777.206127496756 dis=0 pw=0 indexoid=16449 *cheapest*
+    GATHERMERGEPATH rows=74 cost=8770.59780236238..8779.216738487645 dis=0 pw=0 indexoid=16449 pathkeys
+    NESTPATH rows=74 cost=1689..92204.22381451612 dis=0 pw=0 jointype=0
+  partial_pathlist:
+    NESTPATH rows=31 cost=2069.0625..7769.806127496758 dis=0 pw=2 jointype=0 indexoid=16449
+  cheapest_total_path: GATHERPATH cost=3069.0625..8777.206127496756
+REL 46 relids=(b 1 3 4) rows=78895 consider_parallel=true
+  pathlist:
+    HASHPATH rows=78895 cost=3724.025..10947.157875 dis=0 pw=0 jointype=0 *cheapest*
+    GATHERMERGEPATH rows=78895 cost=12430.29372998084..21618.916812452822 dis=0 pw=0 pathkeys
+  partial_pathlist:
+    HASHPATH rows=32873 cost=3187.066911764706..8964.036328431373 dis=0 pw=2 jointype=0
+  cheapest_total_path: HASHPATH cost=3724.025..10947.157875
+REL 47 relids=(b 1 4 7) rows=17625 consider_parallel=true
+  pathlist:
+    NESTPATH rows=17625 cost=1542.9075..6444.402763888889 dis=0 pw=0 jointype=0 indexoid=16546 *cheapest*
+    NESTPATH rows=17625 cost=3918.9338311624406..7486.08822005133 dis=0 pw=0 jointype=0 indexoid=16546 pathkeys
+    MERGEPATH rows=17625 cost=30295.753225121265..31376.178225121264 dis=0 pw=0 jointype=4 pathkeys
+  partial_pathlist:
+    NESTPATH rows=10368 cost=1436.4707352941177..4846.826185457516 dis=0 pw=1 jointype=0 indexoid=16546
+    NESTPATH rows=10368 cost=3672.599562371519..5720.151284593741 dis=0 pw=1 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: NESTPATH cost=1542.9075..6444.402763888889
+REL 48 relids=(b 1 2 3 4) rows=32 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=32 cost=3069.3525..8777.470149333243 dis=0 pw=0 indexoid=16393 *cheapest*
+    GATHERMERGEPATH rows=32 cost=8774.534452352433..8778.260546352549 dis=0 pw=0 indexoid=16393 pathkeys
+  partial_pathlist:
+    NESTPATH rows=13 cost=2069.3525..7774.270149333242 dis=0 pw=2 jointype=0 indexoid=16393
+  cheapest_total_path: GATHERPATH cost=3069.3525..8777.470149333243
+REL 49 relids=(b 1 2 4 7) rows=7 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=7 cost=2436.7732352941175..6741.173917798839 dis=0 pw=0 indexoid=16546 *cheapest*
+    GATHERMERGEPATH rows=7 cost=6740.52391779884..6741.321417798839 dis=0 pw=0 indexoid=16546 pathkeys
+    NESTPATH rows=7 cost=1543.21..7519.500680753882 dis=0 pw=0 jointype=0 indexoid=16546
+  partial_pathlist:
+    NESTPATH rows=4 cost=1436.7732352941177..5740.4739177988395 dis=0 pw=1 jointype=0 indexoid=16546
+    NESTPATH rows=4 cost=3672.9020623715187..6613.799016935065 dis=0 pw=1 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: GATHERPATH cost=2436.7732352941175..6741.173917798839
+REL 50 relids=(b 1 3 4 7) rows=7727 consider_parallel=true
+  pathlist:
+    GATHERPATH rows=7727 cost=4101.3052941176475..8311.576744281047 dis=0 pw=0 indexoid=16546 *cheapest*
+    HASHPATH rows=7727 cost=3577.9325000000003..8525.693388888889 dis=0 pw=0 jointype=0 indexoid=16546
+    GATHERMERGEPATH rows=7727 cost=7814.996961840672..8695.646961840672 dis=0 pw=0 indexoid=16546 pathkeys
+    MERGEPATH rows=7727 cost=20828.819496567125..21304.959496567124 dis=0 pw=0 jointype=4 pathkeys
+  partial_pathlist:
+    HASHPATH rows=4545 cost=3101.3052941176475..6538.876744281046 dis=0 pw=1 jointype=0 indexoid=16546
+    NESTPATH rows=4545 cost=3672.889562371519..9228.063114561104 dis=0 pw=1 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: GATHERPATH cost=4101.3052941176475..8311.576744281047
+REL 51 relids=(b 1 2 3 4 7) rows=3 consider_parallel=true
+  pathlist:
+    NESTPATH rows=3 cost=2437.0632352941175..6743.542304035512 dis=0 pw=0 jointype=0 indexoid=16546 *cheapest*
+    NESTPATH rows=3 cost=6740.81391779884..6743.689804035512 dis=0 pw=0 jointype=0 indexoid=16546 pathkeys
+  partial_pathlist:
+    NESTPATH rows=2 cost=1437.0632352941177..5741.8272832526545 dis=0 pw=1 jointype=0 indexoid=16546
+    NESTPATH rows=2 cost=3673.1920623715187..6615.15238238888 dis=0 pw=1 jointype=0 indexoid=16546 pathkeys
+  cheapest_total_path: NESTPATH cost=2437.0632352941175..6743.542304035512
+REL 52 relids=(b 6) rows=12 consider_parallel=true
+  pathlist:
+    SUBQUERYSCANPATH rows=12 cost=10769.112710152922..10769.352710152925 dis=0 pw=0 indexoid=16560 pathkeys *cheapest*
+  cheapest_total_path: SUBQUERYSCANPATH cost=10769.112710152922..10769.352710152925
+REL 53 relids=(b 7) rows=6 consider_parallel=true
+  pathlist:
+    SUBQUERYSCANPATH rows=6 cost=8522.141828560287..8522.261828560284 dis=0 pw=0 indexoid=16553 pathkeys *cheapest*
+  cheapest_total_path: SUBQUERYSCANPATH cost=8522.141828560287..8522.261828560284
+REL 54 relids=(b 8) rows=3 consider_parallel=true
+  pathlist:
+    SUBQUERYSCANPATH rows=3 cost=6742.1510576901655..6742.211057690164 dis=0 pw=0 indexoid=16546 pathkeys *cheapest*
+  cheapest_total_path: SUBQUERYSCANPATH cost=6742.1510576901655..6742.211057690164
+REL 55 relids=(b 1) rows=21 consider_parallel=true
+  pathlist:
+    APPENDPATH rows=21 cost=10769.112710152922..26033.930596403374 dis=0 pw=0 indexoid=16560 *cheapest*
+    MERGEAPPENDPATH rows=21 cost=26033.429370840888..26034.12079190346 dis=0 pw=0 indexoid=16560 pathkeys
+  cheapest_total_path: APPENDPATH cost=10769.112710152922..26033.930596403374

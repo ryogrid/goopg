@@ -267,15 +267,58 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 // `Rows: joinRel.Rows` unconditionally without a `ppi_rows` of their own —
 // both read `CheapestTotal`-only inputs, which a parameterised path can
 // never win (03 §9 rule 1), so the merge exception cannot reach them.
-func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet) {
-	o := outer.CheapestTotal
-	if o == nil || o.RequiredOuter != 0 {
+// M0142-0008c-3b: `uniq == uniqueSideOuter` is PG's `JOIN_UNIQUE_OUTER`
+// branch of `match_unsorted_outer` (joinpath.c, design doc §19.2/§19.3). PG
+// restricts that branch's outer loop to `outerrel->cheapest_total_path`
+// only, substitutes it via `create_unique_path`, demotes the jointype once,
+// then falls through into this SAME generic `cheapest_parameterized_paths`
+// loop ordinary nested loop and NLI share — which is why goopg's addNLIPaths
+// (already reduced to a single `outer.CheapestTotal` candidate, no pathlist
+// loop) is where the substitution belongs, before the loop below runs. A nil
+// substitution declines the whole call, matching `create_unique_path`'s own
+// "can't unique-ify, return NULL" contract.
+func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, paramSrc RelSet, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
+	// R64 (ledger R63-#3): decline when the inner is the preserved side. A
+	// RIGHT join preserves its inner child, which in this arm is a
+	// parameterized probe — unmatched preserved rows surface from no probe
+	// execution, so no driver (fused NLI, decomposed lateral, bitmap) can
+	// emit them (Q13 dropped its 50,000 zero-order customers, 34→33 rows).
+	// The admitted set mirrors partialHashJoinTypeOK (Inner/Left/Semi/Anti);
+	// FULL never reaches here (jointypeForDirection declines it). The Right
+	// direction itself stays legal for hash/merge/plain-NL — only this arm
+	// declines, and addNestLoopPath must keep admitting Right (a complete
+	// inner is sweepable by the generic driver).
+	if jt == parser.JoinRight {
+		noteNLIPathGate(jt, "jointype-right")
 		return
 	}
+	o := outer.CheapestTotal
+	if uniq == uniqueSideOuter {
+		o = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
+	}
+	if o == nil || o.RequiredOuter != 0 {
+		noteNLIPathGate(jt, "outer-unusable")
+		return
+	}
+	// M0145-0007's reframed question: count whether a parameterised inner
+	// exists at all before counting what happens to it.
+	filed := false
+	sawParamInner := false
+	defer func() {
+		switch {
+		case filed:
+			noteNLIPathGate(jt, "filed")
+		case !sawParamInner:
+			noteNLIPathGate(jt, "no-parameterised-inner")
+		default:
+			noteNLIPathGate(jt, "inner-rejected")
+		}
+	}()
 	for _, i := range inner.CheapestParameterized {
 		if i == nil || i.RequiredOuter == 0 {
 			continue
 		}
+		sawParamInner = true
 		req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
 		// try_nestloop_path's test, verbatim (joinpath.c:882-889),
 		// over this joinrel's param_source_rels (C-08 derivation,
@@ -318,10 +361,8 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// parameterised index probe, so its "cache" is per-probe and the
 			// Memoize arm of nestLoopInnerRescanCost is the one that fires
 			// when a Memoize sits between.
-			matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-			cost := nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
-			cost.Total += matBuild
-			cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+			cost := nliNestLoopCost(cp, o, in, residual, semi)
+			filed = true
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
 				Jointype: jt, // C-03b; see addHashJoinPath.
@@ -329,14 +370,244 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				Rows:     joinrel.Rows,
 				Cost:     cost,
 				Children: []*Path{o, in},
-				Residual: residual,
+				// R53 slice 1: the partition, in Children order.
+				OuterRelids: outer.Relids,
+				InnerRelids: inner.Relids,
+				Residual:    residual,
 				// Empty by the test above. Carried through the constructor
 				// rather than hard-coded so the star-schema case is a one-line
 				// relaxation once P5.6's sizer exists.
 				RequiredOuter: req,
 				// create_nestloop_path (pathnode.c:2590). C-19a.
 				ParallelSafe: parallelSafeWith(joinrel, o, in),
+				// initial_cost_nestloop (costsize.c:3282-3284): enable_nestloop
+				// counts on EVERY nestloop path, parameterised inner or not —
+				// PG has no separate index-nestloop switch — plus the inner
+				// and outer inputs' own counts. The plain-NL arm (pathgen.go)
+				// always had this; the NLI arm did not, which R59's probe
+				// repricing exposed: with nestloop disabled the NLI path
+				// priced below the merge join and stole a contest the test
+				// fixture had closed to every nestloop.
+				DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
 			}, "nestloop.index")
 		}
 	}
+}
+
+// addPartialNestLoopPaths is `consider_parallel_nestloop` +
+// `try_partial_nestloop_path` (joinpath.c:2107-2214, :945-1010): the last
+// missing join arm — a partial path joining a PARTIAL outer to a COMPLETE
+// inner, rescanned once per per-worker outer row. R60 (plan-parity-fix
+// take2).
+//
+// It is the NLI arm's sibling deliberately: the residual comes from the
+// same `nestloopResidualClauses`, the pair expansion is the same bare +
+// `getMemoizePath` shape, and the four costing lines are identical. What
+// differs is the outer (every member of `outer.PartialPathlist`, not the
+// cheapest total), the inner list (the WHOLE `CheapestParameterized`,
+// unparameterised member included — PG iterates the same
+// `cheapest_parameterized_paths` with the cheapest total prepended), and
+// the filing (`addPartialPath`, not `addPath`).
+//
+// Two PG admission tests do NOT cross over, one by vacuity and one by
+// structure: `try_nestloop_path`'s param_source_rels / star-schema test
+// (:882-889) belongs to the serial arm — a partial result must be FULLY
+// unparameterised ("Parameterized partial paths are not supported",
+// :959), so `req != 0` is a refusal here, not a deferral; and the lateral
+// check has nothing to read — no LATERAL shape reaches path generation
+// (C-08 invariant, cited the same way the two landed partial producers
+// cite it: by comment, with no field to test).
+func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors) {
+	// V0: the reader-only gate, shared with both landed partial producers
+	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
+	// and the next level's own partial producer reads a partial path.
+	if gatherPathsMode == gatherPathsOff {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// The dispatch gate (joinpath.c:2022-2031), minus the vacuous:
+	// UNIQUE_OUTER has no goopg jointype, so the set collapses to exactly
+	// `partialHashJoinTypeOK` ({INNER, LEFT, SEMI, ANTI}).
+	if !partialHashJoinTypeOK(jt) {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// R94 (plan-parity-fix-take2), widened to SEMI by M0137-0019b: file only
+	// the shapes with an admitted consumer end to end. A filed path whose
+	// classifier or node twin refuses it would be costed-but-never-runnable
+	// noise, and one filed at PartialPathlist[0] would starve admittable
+	// hash/merge siblings since makeGatherPath reads the head only — so the
+	// FILING is narrowed rather than the classifier, and the three gates
+	// (here, partialPathDrivingKind, nestedLoopJoinIsPartialCapable) are
+	// widened together or not at all.
+	//
+	// SEMI is admitted because its verdict is per-outer-row and worker-local:
+	// one qualifying inner tuple decides the outer tuple and the inner scan
+	// breaks (`finishOuter`, join_nl_stream.go), the joined row is never
+	// emitted, and the inner-matched bitmap RIGHT/FULL would need is not
+	// touched. Partitioning the outer is therefore transparent. PG admits
+	// {INNER, LEFT, SEMI, ANTI} at the same dispatch gate
+	// (joinpath.c:2022-2031).
+	//
+	// LEFT and ANTI stay refused — worker-local by the same argument, but
+	// M0137-0019b's named consumer (TPC-H Q4) is SEMI, and widening them in
+	// the same change would make its parity movement unattributable. Ledger
+	// row `m0137-0019b-partial-nl-left-anti-still-refused`.
+	if jt != parser.JoinInner && jt != parser.JoinSemi {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1-nl-inner", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// `joinrel->consider_parallel` (already propagated by
+	// joinrelConsiderParallel), as the partial-hash producer reads it.
+	if s == nil || !s.parallelModeOK || joinrel == nil || !joinrel.ConsiderParallel {
+		sub := "cp"
+		if s == nil {
+			sub = "s-nil"
+		} else if !s.parallelModeOK {
+			sub = "mode"
+		} else if joinrel == nil {
+			sub = "nil-joinrel"
+		}
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V2", "sub="+sub+" jt="+traceJoinTypeName(jt))
+		return
+	}
+	// `outerrel->partial_pathlist != NIL`.
+	if len(outer.PartialPathlist) == 0 {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V4", "jt="+traceJoinTypeName(jt))
+		return
+	}
+	// PG's `foreach` over the whole partial_pathlist — NOT the head. The
+	// orderings that motivate it upstream do not exist yet (NL paths carry
+	// no pathkeys, §2.iii), but rows-per-worker differ by outer (a dearer
+	// outer on more workers rescans less), so a non-head outer is not
+	// strictly dominated. Lists are tiny; faithfulness is cheap.
+	for _, o := range outer.PartialPathlist {
+		if o == nil || o.ParallelWorkers <= 0 || o.RequiredOuter != 0 {
+			// PG *asserts* the outer unparameterised
+			// (`bms_is_empty(PATH_REQ_OUTER(outer_path))`, :967) — refused,
+			// not asserted, per `addPartialPath`'s fail-closed convention.
+			sub := "unsafe"
+			if o == nil {
+				sub = "head-nil"
+			} else if o.ParallelWorkers <= 0 {
+				sub = "workers"
+			} else {
+				sub = "outer-param"
+			}
+			tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V5", "sub="+sub+" jt="+traceJoinTypeName(jt))
+			continue
+		}
+		// `innerrel->cheapest_parameterized_paths`, prepended unparameterised
+		// member included (`setCheapest`, path.go:1193) — so the
+		// unparameterised inner (partial PLAIN nestloop) and the
+		// parameterised probes (partial INDEX nestloop) ride one loop, as
+		// they do in PG. UNIQUE_INNER is vacuous (no such jointype, hence no
+		// `create_unique_path` to call). The materialised-inner tail is
+		// deliberately absent: goopg builds no Material path anywhere
+		// (`plannersettings.go:72`), a pre-existing all-join-types gap.
+		for _, i := range inner.CheapestParameterized {
+			if i == nil || !i.ParallelSafe {
+				// "Can't join to an inner path that is not parallel-safe."
+				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
+				continue
+			}
+			// The subset test (joinpath.c:968-990): the inner's
+			// parameterisation must be fully satisfiable by the outer. The
+			// top_parent branch is vacuous (no top parents in goopg);
+			// `calcNestloopRequiredOuter` with an unparameterised outer IS
+			// the subset test, and a nonzero remainder is refused (V8) —
+			// there is no star-schema exception here, because unlike the
+			// serial arm the result may not stay parameterised.
+			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
+			if req != 0 {
+				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8", "jt="+traceJoinTypeName(jt))
+				continue
+			}
+			residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
+			// The reparameterizability check
+			// (`path_is_reparameterizable_by_child`) has no goopg
+			// machinery to mirror — and nothing to check: with `req == 0`
+			// and an unparameterised outer there is no parameterisation
+			// left to translate. Stated, not skipped silently.
+			for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+				if in == nil {
+					continue
+				}
+				// `initial_cost_nestloop` performs no worker division, and
+				// none is wanted: the outer input arrives already
+				// per-worker-divided (cost AND rows), so the four lines are
+				// the NLI arm's verbatim — the partial-ness lives in the
+				// inputs, exactly as the partial-hash producer documents.
+				// (`add_partial_path_precheck` is CPU-only — bail before
+				// creating the path — and the post-costing domination
+				// decides identically, so it is not mirrored.)
+				// M0146-0005: the same arithmetic as the serial NLI arm, through
+				// the same helper. This arm used to repeat it inline with the
+				// rescan STARTUP passed as a literal 0, so a parameterised inner
+				// re-paid only its run half and never its index descent —
+				// TPC-H Q9's partial nested loop into orders_pk cost 0.066 per
+				// probe instead of ~0.43.
+				cost := nliNestLoopCost(cp, o, in, residual, semi)
+				// `final_cost_nestloop` (costsize.c:4307-4314-twin): "For
+				// partial paths, scale row estimate." One divisor, applied
+				// here and undone by `computeGatherRows` — not two.
+				divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
+				addPartialPath(joinrel, &Path{
+					Kind:     PathNestLoop,
+					Jointype: jt, // C-03b; see addHashJoinPath.
+					Rel:      joinrel,
+					Rows:     clampRowEst(joinrel.Rows / divisor),
+					Cost:     cost,
+					Children: []*Path{o, in},
+					// R53 slice 1: the partition, in Children order.
+					OuterRelids: outer.Relids,
+					InnerRelids: inner.Relids,
+					Residual:    residual,
+					// Empty by the V8 refusal above. Carried through the
+					// constructor rather than hard-coded, as the NLI arm does.
+					RequiredOuter: req,
+					// create_nestloop_path gets `outer_path->parallel_workers`
+					// ("a foolish way to estimate parallel_workers, but for
+					// now…", pathnode.c:2733); parallel_aware stays false —
+					// there is no shared NL build.
+					ParallelSafe:    parallelSafeWith(joinrel, o, in),
+					ParallelWorkers: o.ParallelWorkers,
+					ParallelAware:   false,
+					// The R59 rule (costsize.c:3282): enable_nestloop counts
+					// on EVERY nestloop path, partial ones included.
+					DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
+				}, "join.nestloop.partial")
+			}
+		}
+	}
+}
+
+// nliNestLoopCost is `initial_cost_nestloop` + `final_cost_nestloop`
+// (postgres/src/backend/optimizer/path/costsize.c:3260-3420) for a nested loop
+// over a parameterised (or memoized) inner, shared by the serial NLI arm and
+// the partial-nestloop arm so the two cannot price the same pair differently
+// (M0146-0005 found the partial arm dropping the rescan startup).
+//
+// The inner is rescanned `outer_rows - 1` times, and each rescan re-pays
+// `inner_rescan_start_cost` (the index descent — `cost_rescan`'s default arm)
+// on top of its run cost. `nestloopCost` subtracts the startup back out of the
+// rescan total it is handed, so the total passed in includes it. The outer is
+// read as given: a partial outer arrives with per-worker rows and costs, and
+// `initial_cost_nestloop` applies no worker division of its own.
+func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi semiAntiJoinFactors) Cost {
+	matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
+	rsStart := nestLoopInnerRescanStartup(in)
+	var cost Cost
+	if semi.apply {
+		// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch. A
+		// parameterised index probe that enforces every join clause makes an
+		// unmatched outer row an empty probe (has_indexed_join_quals).
+		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
+			semi, hasIndexedJoinQuals(in, residual), len(residual))
+	} else {
+		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+		cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+	}
+	cost.Total += matBuild
+	return cost
 }

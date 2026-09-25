@@ -18,12 +18,18 @@ package optimizer
 //
 // Design: docs/design/planner-c19d-gather-paths/DESIGN.md.
 //
-// ADMISSION IS OFF BY DEFAULT (`GOOPG_GATHER_PATHS`, §5 of that doc). Partial
-// paths exist on BASE rels only until C-19f gives a joinrel its own, so a
-// Gather chosen here sits BELOW every join and the joins run serially in the
-// leader — while the post-pass puts one Gather ABOVE the whole hash-join
-// subtree. Flipping the default is a measured decision (TPC-H A/B, timing per
-// moved plan) and this slice does not take it.
+// ADMISSION IS `all` BY DEFAULT SINCE M0140-0003 (`GOOPG_GATHER_PATHS`, §5 of
+// that doc). Partial paths exist on BASE rels only until C-19f gives a
+// joinrel its own, so a Gather chosen here can sit BELOW a join and the joins
+// above it run serially in the leader — while the post-pass instead puts one
+// Gather ABOVE the whole hash-join subtree. The measured decision this
+// comment used to defer (TPC-H A/B, timing per moved plan) is M0140-0003
+// (docs/design/0100-0149/m0140-0003-gather-paths-flip-lands-default-on.md):
+// pre-registered "no match flip" per R43 rev 3 / K38 — the category-movement
+// criterion the plan-parity harness holds this milestone to, not a match-
+// count rise — and TPC-H/TPC-DS values gates held at the baseline arm.
+// `GOOPG_GATHER_PATHS=off` still reproduces the pre-M0140-0003 serial-search
+// control arm exactly, for any future A/B that needs it.
 //
 // A BASE rel's Gather is WINNABLE since 2026-09-07 (ledger
 // `c19-baserel-scan-priced-on-output-rows`). It was not before: goopg priced a
@@ -45,18 +51,22 @@ package optimizer
 import (
 	"os"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // gatherPathMode is the admission rule for the paths this file produces.
 //
 //   - off  — produce none. The search is unchanged by construction, which is
-//     this slice's serial-control-arm argument.
+//     this slice's serial-control-arm argument, and reproduces goopg's
+//     pre-M0140-0003 behaviour exactly.
 //   - top  — produce them only at the search's FINAL rel: the node the
 //     post-pass targets today. Inert on any multi-rel statement until C-19f
 //     populates a joinrel's partial list, and live the moment it does.
 //   - all  — PG-faithful: every rel with partial paths, base rels included.
-//     This is the arm that carries the ordering trap (take2 07 §3.2) and the
-//     one a measurement must clear before it can become the default.
+//     This is the arm that carries the ordering trap (take2 07 §3.2), and
+//     the DEFAULT since M0140-0003 measured it clear (category movement, no
+//     match-count regression, values gates held).
 type gatherPathMode int
 
 const (
@@ -69,11 +79,17 @@ const (
 // knob in this package, so a plan cannot change shape mid-statement.
 var gatherPathsMode = gatherPathModeFromEnv(os.Getenv("GOOPG_GATHER_PATHS"))
 
-// gatherPathModeFromEnv resolves the knob. Anything unrecognised is `off`:
-// this is a fail-closed switch, and a typo must not silently enable a plan
-// shape whose measurement has not been run.
+// gatherPathModeFromEnv resolves the knob. An unset/empty environment
+// resolves to `all` — M0140-0003's landed default. An explicit,
+// unrecognised value (a typo, or the empty string spelled some other way)
+// resolves to `off` rather than falling through to the new default: this
+// stays a fail-closed switch for anyone deliberately typing an opt-out
+// string, on the same reasoning the pre-M0140-0003 version of this function
+// applied to the (then unmeasured) `all` arm.
 func gatherPathModeFromEnv(v string) gatherPathMode {
 	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return gatherPathsAll
 	case "top":
 		return gatherPathsTop
 	case "all", "on":
@@ -137,31 +153,51 @@ func SetGatherPathsMode(label string) (restore func()) {
 // `standard_join_search` calls it (allpaths.c:3503-3517) and where
 // `merge_clump` calls it in the GEQO arm (geqo_eval.c). A rel with no partial
 // paths returns at the first line, as upstream does.
-func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
+func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool) {
 	if s == nil || rel == nil || len(rel.PartialPathlist) == 0 {
+		// R54 Step-0: S4's "never generated" arm. Reachable with s and rel
+		// non-nil (empty partial list); the nil cases have no relset to name.
+		if s != nil && rel != nil {
+			s.trace.gather(rel.Relids, 0, "no-partials")
+		}
 		return
 	}
-	if !s.parallelModeOK || !rel.ConsiderParallel {
+	// R54 Step-0: the S0/S1 split. Upstream's single gate is two verdicts
+	// here with identical behaviour — both arms still refuse — so the trace
+	// can tell "session closed" from "this rel closed".
+	if !s.parallelModeOK {
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "no-parallel-mode")
+		return
+	}
+	if !rel.ConsiderParallel {
 		// Belt-and-braces: `addPartialPath` already refuses to file a path on a
 		// rel that does not consider parallel, so an entry here means the flag
 		// was cleared afterwards. Refusing fails closed.
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "no-cp")
 		return
 	}
 	switch gatherPathsMode {
 	case gatherPathsOff:
+		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
 		return
 	case gatherPathsTop:
 		if relLevel(rel.Relids) != s.nrels {
+			s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
 			return
 		}
 	}
+	// Gates passed: "admitted" means candidacy, not victory — whether a Gather
+	// path was filed and won reads off the `cost` line's cheapest kind. This
+	// separation is what makes S4's "generated but lost" distinguishable from
+	// "never generated".
+	s.trace.gather(rel.Relids, len(rel.PartialPathlist), "admitted")
 
 	// "The output of Gather is always unsorted, so there's only one partial
 	// path of interest: the cheapest one. That will be the one at the front of
 	// partial_pathlist because of the way add_partial_path works."
 	// (allpaths.c:3116-3119; goopg's addToPartialPathlist keeps the same
 	// ascending-total-cost order.)
-	if g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp); g != nil {
+	if g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp, overrideRows); g != nil {
 		addPath(rel, g, "gather")
 	}
 
@@ -171,10 +207,52 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 		if len(sub.Pathkeys) == 0 {
 			continue
 		}
-		if gm := makeGatherMergePath(rel, sub, s.cp); gm != nil {
+		if gm := makeGatherMergePath(rel, sub, s.cp, overrideRows); gm != nil {
 			addPath(rel, gm, "gather.merge")
 		}
 	}
+}
+
+// generateUpperRelGatherPaths is M0140-0006b-2's upper-rel entry point for
+// generateUsefulGatherPaths (allpaths.c:3236's upper-rel callers —
+// `create_grouping_paths`, `create_window_paths`, `create_setop_paths` —
+// each call `generate_gather_paths` on their own rel; goopg's Phase-4
+// producers never did, so no upper rel's PartialPathlist ever had a reader).
+//
+// The method needs a *searchCtx, but everything it actually reads off the
+// context is available without one: `parallelModeOK(cp)` is a pure function
+// of the cost currency (considerparallel.go:61), `cp` is already in scope at
+// every upper-rel producer, `trace` is nil-safe (nothing traces an upper-rel
+// Gather decision today), and `nrels` only feeds the `top`-mode final-rel
+// check. So this builds the minimal context and delegates to the one body —
+// no twin to keep in step (Hard-won Rule #2) — rather than re-stating the
+// gates.
+//
+// The one policy this states rather than delegates is `top`: that mode
+// admits only the search's FINAL rel ("the node the post-pass targets
+// today"), and an upper rel is never a member of any search level, so it is
+// refused here, fail-closed. `all` (the default since M0140-0003) admits
+// every rel with partial paths, upper rels included; `off` is refused inside
+// the delegated call, same as for a search rel.
+//
+// Only the SETOP rel can have partial paths today (addPartialSetOpPath,
+// M0140-0006b is the sole upper-rel partial producer); every other upper rel
+// returns at the first line, so wiring this into WINDOW/ORDERED/GROUP_AGG is
+// provably inert until a producer files there. Callers run this after all
+// other candidates are offered and before setCheapest, mirroring
+// addBaseRelGatherPaths' own placement.
+func generateUpperRelGatherPaths(rel *RelOptInfo, cp costParams) {
+	if rel == nil || len(rel.PartialPathlist) == 0 {
+		return
+	}
+	if gatherPathsMode == gatherPathsTop {
+		return
+	}
+	s := &searchCtx{parallelModeOK: parallelModeOK(cp), cp: cp}
+	// Upper rels take upstream's override_rows=true arm (planner.c:5022,
+	// gather_grouping_paths planner.c:7721): the stamp stays
+	// computeGatherRows.
+	s.generateUsefulGatherPaths(rel, true)
 }
 
 // makeGatherPath is `create_gather_path` (pathnode.c:1974) + `cost_gather`.
@@ -191,12 +269,25 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo) {
 // subpath is `Children[0]`, in scope at every reader. Two fields that can
 // disagree about a worker count is the bug class `Path.Rows`' own comment
 // warns about.
-func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
+func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams, overrideRows bool) *Path {
 	if !gatherSubpathIsRunnable(sub) {
 		return nil
 	}
-	rows := computeGatherRows(sub, cp)
-	return &Path{
+	// cost_gather's row stamp (costsize.c:455-458): `rows` when the caller
+	// overrides, else `param_info->ppi_rows` or `rel->rows`. Upstream's
+	// override is always `compute_gather_rows(subpath)`; every scan/join-rel
+	// call site passes override_rows=false (allpaths.c:557, :3518,
+	// geqo_eval.c:277, planner.c:7880) so the Gather carries the relation's
+	// own total, and only the grouped/partially-grouped and partial-distinct
+	// upper rels pass true (planner.c:5022, gather_grouping_paths
+	// planner.c:7721). The param_info arm has no counterpart: parameterized
+	// subpaths are refused above and goopg's RelOptInfo is per-relid-set, so
+	// rel.Rows is the only estimate a gather rel carries.
+	rows := rel.Rows
+	if overrideRows {
+		rows = computeGatherRows(sub, cp)
+	}
+	g := &Path{
 		Kind:     PathGather,
 		Rel:      rel,
 		Rows:     rows,
@@ -210,18 +301,27 @@ func makeGatherPath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		DisabledNodes:   sub.DisabledNodes,
 		Children:        []*Path{sub},
 	}
+	// R121 Slice A(ii): a Gather projects nothing, so it emits its child's row.
+	inheritNarrowedWidths(g, sub)
+	return g
 }
 
 // makeGatherMergePath is `create_gather_merge_path` (pathnode.c:2020) +
 // `cost_gather_merge`. nil when the subpath is not one `gatherMergeOp` can
 // actually drive (see gatherMergeSubpathIsRunnable) or has no ordering to
 // preserve (upstream asserts `pathkeys`).
-func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
+func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams, overrideRows bool) *Path {
 	if !gatherMergeSubpathIsRunnable(sub) || len(sub.Pathkeys) == 0 {
 		return nil
 	}
-	rows := computeGatherRows(sub, cp)
-	return &Path{
+	// cost_gather_merge stamps rows exactly as cost_gather does
+	// (costsize.c:493-496): the caller's override (always
+	// `compute_gather_rows`) or the rel's own estimate — see makeGatherPath.
+	rows := rel.Rows
+	if overrideRows {
+		rows = computeGatherRows(sub, cp)
+	}
+	gm := &Path{
 		Kind: PathGatherMerge,
 		Rel:  rel,
 		Rows: rows,
@@ -239,6 +339,9 @@ func makeGatherMergePath(rel *RelOptInfo, sub *Path, cp costParams) *Path {
 		DisabledNodes: sub.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
 		Children:      []*Path{sub},
 	}
+	// R121 Slice A(ii): GatherMerge reorders rows, it does not project them.
+	inheritNarrowedWidths(gm, sub)
+	return gm
 }
 
 // gatherSubpathIsRunnable is the fail-closed admission test for a partial path
@@ -318,6 +421,32 @@ func partialPathShapeIsGatherable(p *Path) bool {
 //
 // Today's producers only ever offer a bare scan, so the walk is one step; the
 // wrapper arms exist because C-19e/f will add Sort and join shapes and the
+// partialNestLoopJointype is the ONE jointype set the ordinary partial
+// nested-loop family admits, shared by `partialPathDrivingKind`'s PathNestLoop
+// arm and its spine mirror so the two cannot drift.
+//
+// They had drifted: the mirror's comment claimed to follow the arm
+// "guard-for-guard" while testing `!= JoinInner` against the arm's
+// {INNER, SEMI}. That was a refusal, hence harmless, but a documented
+// invariant that is only true in prose is the same shape of defect as the
+// 2026-09-21 SEMI wrong answer — which was a divergence between gates whose
+// comments also said they must agree. Sharing the predicate makes the claim
+// structural.
+//
+// The set is PG's nestloop dispatch set (`joinpath.c:1842-1846`) minus RIGHT
+// and FULL, which need the cross-worker inner-match reduction this family does
+// not model. The executor twin `ordinaryInnerNestedLoopPartial`
+// (internal/executor/parallel_scan.go) and the node gate
+// `nestedLoopJoinIsPartialCapable` carry the same set; all four move together
+// or not at all.
+func partialNestLoopJointype(t parser.JoinType) bool {
+	switch t {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
+	}
+	return false
+}
+
 // refusal must be visible where it is decided, not implicit in a missing case.
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
@@ -343,6 +472,50 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// offers a partial bitmap path yet; the arm is here so that when one
 		// does, it is admitted by a decision rather than by a default.
 		return PathBitmapHeapScan
+	case PathSetOp:
+		// M0140-0006c. Unlike a join (partial through ONE side, the other
+		// prebuilt/shared once), a partial SetOp streams BOTH branches
+		// (addPartialSetOpPath, M0140-0006b) — each needs its OWN driving
+		// scan the executor's *setOp arm of attachAll can claim
+		// independently (parallel_scan.go), so this recurses into BOTH
+		// children rather than the single Children[0]/[1] pick the join
+		// arms make.
+		//
+		// Widened past a bare scan on each side by M0140-0006c-2: a
+		// hash-join-driven branch partial through its probe side, a
+		// merge-join-driven branch partial through its outer side, a
+		// nested-loop-driven branch partial through its outer side, and
+		// a bitmap-driven branch (slice C) whose heap scan attaches the
+		// branch's own leaf claim set — prebuildBitmap now publishes the
+		// prebuilt TIDBitmap per branch (cs.setOpLeft/setOpRight.pbm)
+		// instead of only to the top-level claim set. The bitmap arm is
+		// dormant for the same reason the top-level one is: no producer
+		// files a partial bitmap path today.
+		//
+		// M0140-0006c-3: a branch marked claimed-whole
+		// (SetOpLeftNonPartial/SetOpRightNonPartial — PG's
+		// pa_nonpartial_subpaths) needs NO driving-kind check at all: one
+		// participant CAS-claims and drains it serially, so any
+		// parallel-safe serial plan qualifies, matching PG which puts
+		// `nppath` in regardless of its driving shape. The ParallelSafe
+		// re-check below is this file's standing posture — re-verify the
+		// producer's pick rather than trust it.
+		if len(p.Children) != 2 {
+			return PathPrebuilt
+		}
+		nonPartial := [2]bool{p.SetOpLeftNonPartial, p.SetOpRightNonPartial}
+		for i, c := range p.Children {
+			if nonPartial[i] {
+				if c == nil || !c.ParallelSafe {
+					return PathPrebuilt
+				}
+				continue
+			}
+			if !setOpBranchDrivingKindIsSupported(c) {
+				return PathPrebuilt
+			}
+		}
+		return PathSetOp
 	case PathHashJoin:
 		// C-19f. A hash join is partial through its PROBE side only: the build
 		// is drained ONCE by the leader before fan-out
@@ -364,6 +537,16 @@ func partialPathDrivingKind(p *Path) PathKind {
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return PathPrebuilt
 		}
+		// M0146-0002: a Parallel Hash join's BUILD side is partial too, and
+		// the executor claims it through the join's own claim set
+		// (attachParallelHashBuildSides). Only a partial seq scan is admitted
+		// there: a bitmap build would find no prebuilt bitmap in that set,
+		// and any other shape is one this slice never proved — an unclaimed
+		// build side means every participant builds the whole relation into
+		// the shared table, N copies of every inner row.
+		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+			return PathPrebuilt
+		}
 		return partialPathDrivingKind(p.Children[0])
 	case PathMergeJoin:
 		// E-20 Cut 3 (`try_partial_mergejoin_path`, joinpath.c:1145). A
@@ -382,10 +565,276 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
+	case PathNestLoop:
+		// R94 (plan-parity-fix-take2). An ordinary nested loop is partial
+		// through its OUTER side only: each worker joins its outer
+		// partition against the WHOLE inner, which it materializes and
+		// replays itself. Admit ONLY the evidenced INNER shape — the
+		// node twin (nestedLoopJoinIsPartialCapable) agrees, and no path
+		// is admitted by PathKind alone.
+		//
+		// R95 extends the arm to the lateral-probe inner (parameterized
+		// index probe re-opened per worker-local outer row): the node
+		// twin is lateralProbeJoinIsPartialCapable, and the subset test
+		// below is re-checked rather than trusted.
+		//
+		// Only a path R60's producer built can appear here, and R60 files
+		// INNER and (since M0137-0019b) SEMI only — its V1 gate refuses
+		// every other jointype for this arm, since a refused head would
+		// starve admittable siblings (makeGatherPath reads
+		// PartialPathlist[0] only). The jointype test below re-asserts it
+		// rather than trusting the caller, for the reason
+		// createPartialGroupingPaths states: a producer that trusts a
+		// caller's gate is one refactor away from a hole.
+		//
+		// SEMI joins the set for M0137-0019b: its per-outer-row verdict is
+		// worker-local (`finishOuter`, join_nl_stream.go — one qualifying
+		// inner tuple decides the outer tuple, the joined row is never
+		// emitted, and the inner-matched bitmap RIGHT/FULL would need is
+		// never touched), so a partitioned outer is transparent.
+		//
+		// LEFT and ANTI join it for M0145-0010 scope (c), on the same
+		// rationale the producer already recorded for them, and widened in
+		// ONE change with the producer, the spine mirror below and the
+		// executor twin — the discipline the 2026-09-21 SEMI defect teaches.
+		// PG admits {INNER, LEFT, SEMI, ANTI} at the same dispatch gate
+		// (`joinpath.c:1842-1846`). RIGHT and FULL stay out: they need the
+		// cross-worker inner-match reduction no gate here models.
+		if !partialNestLoopJointype(p.Jointype) {
+			return PathPrebuilt
+		}
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return PathPrebuilt
+		}
+		o, in := p.Children[0], p.Children[1]
+		// The V5-class check every landed producer repeats: a 0-worker or
+		// parallel-unsafe outer breaks the ParallelWorkers convention.
+		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		if in == nil {
+			return PathPrebuilt
+		}
+		if in.RequiredOuter == 0 {
+			// The inner is read WHOLE by every worker: it must be complete
+			// (unparameterised) and must not be a Memoize cache — the
+			// probe's parameter is what justifies caching (getMemoizePath
+			// only wraps a probe carrying RequiredOuter), so a
+			// whole-inner PathMemoize here means a producer changed.
+			if in.Kind == PathMemoize {
+				return PathPrebuilt
+			}
+			return partialPathDrivingKind(o)
+		}
+		// R95 (plan-parity-fix-take2): the lateral-probe inner. A
+		// parameterized probe re-opened per worker-local outer row needs
+		// no outer claim and no whole-inner materialization — but only
+		// when the parameter is satisfiable by THIS outer: re-check the
+		// V8 subset test here rather than trusting the filing site (a
+		// producer that trusts a caller's gate is one refactor away from
+		// a hole). The probe shape itself (bare index equality probe) is
+		// proven at the node twin; here the kinds that can only be probes
+		// are admitted — a parameterized PathIndexScan from R60's
+		// producer carrying index clauses, or (M0142-0005a) that probe's
+		// Memoize-wrapped twin: every worker already builds a private
+		// memoizeOp/kvcache over the shared read-only plan (executor.go's
+		// "each worker builds its OWN operator tree"), matching PG's
+		// per-worker MemoizeState whose DSM shuttles only
+		// instrumentation counters (nodeMemoize.c:1190-1260) — the
+		// wrapper adds no claim and no shared state, so it unwraps once
+		// (Children[0] is always the wrapped probe, getMemoizePath
+		// joinpathsmemoize.go:292-303) and the bare-probe check runs on
+		// the child. RequiredOuter propagates, so in.RequiredOuter below
+		// reads the same value the child carries. Anything else
+		// parameterized is refused: no worker can supply its parameter.
+		if p.Jointype != parser.JoinInner {
+			return PathPrebuilt
+		}
+		probe := in
+		if in.Kind == PathMemoize {
+			if len(in.Children) != 1 {
+				return PathPrebuilt
+			}
+			probe = in.Children[0]
+		}
+		if probe == nil || probe.Kind != PathIndexScan || len(probe.IndexClauses) == 0 {
+			return PathPrebuilt
+		}
+		if p.OuterRelids == 0 || p.InnerRelids == 0 {
+			// Unpartitioned path: satisfiability is unprovable.
+			return PathPrebuilt
+		}
+		if req := calcNestloopRequiredOuter(p.OuterRelids, o.RequiredOuter, p.InnerRelids, in.RequiredOuter); req != 0 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(o)
 	default:
 		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.
 		return PathPrebuilt
+	}
+}
+
+// setOpBranchDrivingKindIsSupported is the PathSetOp arm's own, narrower
+// admission test for one branch — a bare seq or (unparameterised) index
+// scan, a bitmap heap scan, a hash join partial through its probe side, a
+// merge join partial through its outer side, a nested loop partial through
+// its outer side (M0140-0006c-2, slices hash + A + B + C), or — M0145-0004a
+// — a nested partial SetOp: the inner link of a right-leaning UNION ALL
+// chain, which is exactly the shape the whole-chain appendrel candidate
+// carries. It still does NOT delegate to partialPathDrivingKind's general
+// recursion: the branch's nested shapes must be ones the SetOp claim-set
+// story models — each join arm re-verifies its own guards rather than
+// trusting a caller's, and no other kind (Sort, Memoize, Aggregate) has a
+// branch-local executor twin. The SetOp arm is admitted because the
+// executor's claim tree now nests with it: attachAll hands each branch a
+// lazily grown leaf claim set (parallel_scan.go's setOpBranch), so an
+// N-link chain materialises N-1 levels of branch state and every member
+// scan gets its own independent block claim.
+func setOpBranchDrivingKindIsSupported(p *Path) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Kind {
+	case PathSeqScan:
+		return true
+	case PathIndexScan:
+		return p.RequiredOuter == 0
+	case PathBitmapHeapScan:
+		// M0140-0006c-2 (slice C). Mirrors the top-level arm's
+		// unconditional admit: the branch's bitmap heap op attaches
+		// through its own LEAF claim set — attachAll hands each branch
+		// cs.setOpLeft/setOpRight, whose pbm prebuildBitmap now publishes
+		// per branch. Dormant until a producer files a partial bitmap
+		// path (none does today — the top-level arm is dormant for the
+		// same reason); admitted by a decision, not by a default.
+		return true
+	case PathHashJoin:
+		// M0140-0006c-2. Partial through the PROBE side only: Children[0]
+		// by this package's child convention (pathgen.go), the same side
+		// partialPathDrivingKind's PathHashJoin arm, stampParallelScan and
+		// the executor's attach walk all descend. The build side is drained
+		// once by the leader via prebuildSharedHashJoins, which now sees
+		// through a *setOp (collectShareableJoins and HasShareableHashJoin
+		// both descend). The RequiredOuter/len guards mirror the
+		// PathHashJoin arm; the jointype trust is the producer's
+		// (addPartialHashJoinPath files only partial-capable jointypes),
+		// re-checked at runtime by hashJoinIsPartialCapable on the node
+		// twin. A merge join on the spine is admitted (slice B) but a
+		// hash below a merge outer is never COLLECTED for prebuild — the
+		// branch's workers each private-build its inner, correct and Nx
+		// the memory, the same E-20 deferral the top level already carries.
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		// M0146-0002: no Parallel Hash inside a partial SetOp branch — the
+		// branch claim sets carry no per-join build state.
+		if p.ParallelHash {
+			return false
+		}
+		return setOpBranchDrivingKindIsSupported(p.Children[0])
+	case PathMergeJoin:
+		// M0140-0006c-2 (slice B). Mirrors partialPathDrivingKind's own
+		// PathMergeJoin arm guard-for-guard (E-20 Cut 3): a merge join is
+		// partial through its OUTER side only — each worker merge-joins
+		// its partition of the outer against the WHOLE inner, which it
+		// sorts and reads itself. No shared build exists for merge, so
+		// unlike the hash arm nothing here needs a collector: a hash
+		// below this merge's outer is simply built privately by every
+		// worker (correct, Nx the memory — the same E-20 deferral the
+		// top-level arm already carries). Children[0] is the outer by
+		// this package's child convention — the same side
+		// createMergeJoinPlan leaves as Join.Left and the three
+		// executor attach walks descend (each now names
+		// JoinAlgoMerge -> left literally rather than answering from
+		// BuildLeft, which a merge join leaves false by construction).
+		// Recursion stays through THIS test so each kind on the spine is
+		// admitted by its own arm's decision, not the general one's. The
+		// jointype trust is the producer's — the
+		// same stance the top-level arm takes — re-checked at runtime
+		// by mergeJoinIsPartialCapable on the node twin (INNER/SEMI/
+		// ANTI/LEFT; FULL/RIGHT refuse).
+		if p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		return setOpBranchDrivingKindIsSupported(p.Children[0])
+	case PathNestLoop:
+		// M0140-0006c-2 (slice A). Mirrors partialPathDrivingKind's
+		// PathNestLoop arm guard-for-guard (R94's ordinary whole-inner,
+		// R95's lateral index-probe inner), recursing through THIS test so
+		// each kind on the spine is admitted by its own arm's decision
+		// (hash-, merge-, NL-, and bitmap-driven outers all admit through
+		// their own arms). The executor side
+		// needed nothing new: attachAll's *setOp arm hands each branch its
+		// own leaf claim set, and attachParallelScan/
+		// attachParallelBitmapScan/attachParallelIndexScan each already
+		// carry the JoinAlgoNestedLoop arm (parallel_scan.go) — the inner
+		// takes no claim in either shape (whole-inners are materialised
+		// per worker, parameterized probes re-open per worker-local outer
+		// row). The Jointype guard subsumes the general arm's second
+		// identical re-check: the field cannot change between the two.
+		if !partialNestLoopJointype(p.Jointype) || p.RequiredOuter != 0 || len(p.Children) != 2 {
+			return false
+		}
+		o, in := p.Children[0], p.Children[1]
+		if o == nil || o.ParallelWorkers <= 0 || !o.ParallelSafe || o.RequiredOuter != 0 {
+			return false
+		}
+		if in == nil {
+			return false
+		}
+		if in.RequiredOuter == 0 {
+			// Whole-inner PathMemoize is refused for the same reason the
+			// general arm states: the probe's parameter is what justifies
+			// caching, so a parameterless memoize means a producer
+			// changed.
+			if in.Kind == PathMemoize {
+				return false
+			}
+		} else {
+			// R95 probe shape: a parameterized inner must be a bare index
+			// probe whose requirement THIS outer can satisfy — re-checked
+			// here rather than trusted from the filing site.
+			// M0142-0005a: the probe's Memoize-wrapped twin is admitted by
+			// the same unwrap the general arm performs — the cache is
+			// per-worker-local under a branch exactly as under a top-level
+			// Gather (attachAll hands the branch op tree to the same
+			// attachParallel* walks, whose nestedLoopIndexJoinOp arm
+			// descends the outer and never touches the probe).
+			probe := in
+			if in.Kind == PathMemoize {
+				if len(in.Children) != 1 {
+					return false
+				}
+				probe = in.Children[0]
+			}
+			if probe == nil || probe.Kind != PathIndexScan || len(probe.IndexClauses) == 0 {
+				return false
+			}
+			if p.OuterRelids == 0 || p.InnerRelids == 0 {
+				return false
+			}
+			if calcNestloopRequiredOuter(p.OuterRelids, o.RequiredOuter, p.InnerRelids, in.RequiredOuter) != 0 {
+				return false
+			}
+		}
+		return setOpBranchDrivingKindIsSupported(o)
+	case PathSetOp:
+		// M0145-0004a: a nested streaming UNION ALL link as a branch. The
+		// admission contract is the parent's own PathSetOp arm applied one
+		// level down — two children, each either claimed-whole
+		// (ParallelSafe, no driving kind needed) or itself a supported
+		// branch — so the check delegates back to partialPathDrivingKind
+		// rather than restating it. The recursion is bounded by the chain
+		// length: each level peels one link off the right-leaning chain.
+		// What makes this safe is the executor twin, not the shape:
+		// parallelClaimSet grows a fresh pair of leaf claim sets per level
+		// (setOpBranch), so a nested link's member scans claim
+		// independently of the outer link's — the N-copies defect the
+		// previous `default: refuse` was protecting against.
+		return partialPathDrivingKind(p) == PathSetOp
+	default:
+		return false
 	}
 }
 
@@ -406,7 +855,9 @@ func (s *searchCtx) addBaseRelGatherPaths() {
 		if rel == nil || len(rel.PartialPathlist) == 0 {
 			continue
 		}
-		s.generateUsefulGatherPaths(rel)
+		// Scan rels take upstream's override_rows=false arm
+		// (allpaths.c:557): the stamp is the rel's own estimate.
+		s.generateUsefulGatherPaths(rel, false)
 		// Unconditional rather than "only if a path was accepted": setCheapest
 		// is idempotent and a length comparison is not a verdict (addPath can
 		// accept a path that evicts two incumbents, leaving the list SHORTER —

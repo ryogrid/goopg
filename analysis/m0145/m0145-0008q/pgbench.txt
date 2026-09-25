@@ -1,0 +1,8 @@
+# M0145-0008q pgbench TPC-B A/B (scale 2, -c 8 -j 4 -T 30, fresh cluster per arm, :5534).
+# HEAD b1f93fb81+0008p (0cda5c573) vs candidate. 'pages:' = max heap block in ctid after the run.
+head number of failed transactions: 0 (0.000%) tps = 625.862831 (without initial connection time)  pages: 
+cand number of failed transactions: 0 (0.000%) tps = 623.601541 (without initial connection time)  pages: 
+head number of failed transactions: 0 (0.000%) tps = 624.420354 (without initial connection time)  pages: 
+cand number of failed transactions: 0 (0.000%) tps = 621.128690 (without initial connection time)  pages: 
+head number of failed transactions: 0 (0.000%) tps = 630.397724 (without initial connection time)  pages: pgbench_branches|83 pgbench_tellers|84 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 626.105897 (without initial connection time)  pages: pgbench_branches|83 pgbench_tellers|90 pgbench_accounts|3335 

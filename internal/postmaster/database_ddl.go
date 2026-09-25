@@ -837,6 +837,32 @@ func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
 	return initdb.CreatePerDatabaseScaffolding(dataDir, oid)
 }
 
+// registerSystemCatalogsForNewDB registers pg_type/pg_attribute (M0143-0002e,
+// read side of the per-database type-catalog fix,
+// docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md) into the
+// new database's own catalog namespace, so a SeqScan against either relation
+// under this database resolves to base/<oid>/1247|1249 instead of the
+// process-wide default. The physical files already exist —
+// createDatabasePhysicalDirectory's scaffolding (copyBootstrapCatalogImage)
+// copies them from template0 for every CREATE DATABASE — so this call is
+// registration-only. A nil Pool/non-InMemory catalog is a silent no-op,
+// mirroring createDatabasePhysicalDirectory's own convention for
+// test/embedded contexts.
+func (s *Server) registerSystemCatalogsForNewDB(oid uint32) error {
+	if s.cfg.Pool == nil {
+		return nil
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	dataDir := s.cfg.Pool.Manager().DataDir()
+	if dataDir == "" {
+		return nil
+	}
+	return initdb.RegisterSystemCatalogsForDB(dataDir, im, oid)
+}
+
 // walLogRelmapForNewDatabase emits the XLOG_RELMAP_UPDATE record for a
 // just-created database's pg_filenode.map (B0.4, doc 02a §5): read the image
 // the template0 copy placed in base/<oid>/ and journal it verbatim with
@@ -1575,6 +1601,18 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			_ = cat.DropDatabase(name)
 			return true, "", err
 		}
+		// M0143-0002e step 3: register pg_type/pg_attribute into the new
+		// database's own catalog namespace right after its scaffolding
+		// exists (createDatabasePhysicalDirectory above already copied
+		// base/<oid>/1247|1249 from template0 — copyBootstrapCatalogImage —
+		// so this is registration-only). Unconditional on tmplTables: every
+		// database gets its own pg_type/pg_attribute files regardless of
+		// whether the CREATE has a template with user tables to copy.
+		if err := s.registerSystemCatalogsForNewDB(oid); err != nil {
+			_ = cat.DropDatabase(name)
+			s.removeDatabasePhysicalDirectory(oid)
+			return true, "", err
+		}
 		// B4.6 Stage 3: journal the RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record
 		// FIRST (a standby creates base/<oid> from it before any block is
 		// written into it), then Stage 3b lays down the template0 catalog image
@@ -1916,6 +1954,14 @@ type databaseConfigRegistry interface {
 // M0119-0006 (AC-002 residual #1).
 type databaseConnLimitRegistry interface {
 	DatabaseConnLimit(name string) int32
+}
+
+// databaseAllowConnRegistry is the subset of catalog.Catalog the connect-time
+// datallowconn gate needs. Optional, like every registry interface here, so an
+// embedded or test catalog that does not implement it keeps the prior
+// behaviour rather than failing closed on every connection.
+type databaseAllowConnRegistry interface {
+	DatabaseAllowsConnections(name string) bool
 }
 
 // databaseEncodingRegistry is the subset of catalog.Catalog the CREATE

@@ -1,6 +1,9 @@
 # B-06 (P1-27) — CTE-output statistics synthesis
 
-Status: accepted (design only — step 1 of the ledger's 4-step resume).
+Status: **COMPLETE 2026-09-22** — all four ledger steps discharged (design,
+consumers wired across five slices, measured, guard/firewall untouched). The
+closing census is §"Closing census (2026-09-22)" at the end of this document.
+Movement: none.
 Implements TODO_ALL.md B-06 (DEFERRED-OPEN → design stage). Ledger
 `take3-B-06-deferred` (guard load-bearing: removal reverts Q74 to 99s;
 PG has no answer either — single-key uniqueness only, Q74 groups by 4).
@@ -14,7 +17,7 @@ statistics, so `filterSelectivity` charges `defaultEqSelectivity`
 (0.005) per conjunct: 4 conjuncts over 2-valued columns →
 `0.005⁴×17977 ≈ 0.000011`, collapsing to 1 row and making nested
 loops look free. The `rows<=1` guard
-(`internal/optimizer/joinsearch.go:470-476`) falls back to the
+(`internal/optimizer/joinsearch.go:520-526`, `initialRelRows`'s `rows<=1` arm) falls back to the
 unfiltered `EstimateRows(cte.Child)` — load-bearing, removal reverts
 the win.
 
@@ -142,3 +145,419 @@ Review only (this file). Implementation gates (steps 2–4, for the
 record): unit (synthesis rules incl. miss→nil; identity collisions);
 EA ratchet on year_total shapes; TPC-DS sweep `CKMISMATCH=0`; guard
 removal with before/after on Q74.
+
+
+## Step 2 slice 1 — the ndistinct consumer, and what it measured (2026-09-21)
+
+Step 1's synthesis landed inert. This slice gives it a consumer, and the
+measurement it produced re-scopes the rest of step 2.
+
+### What landed
+
+- **Identity and lifetime, realised without a map.** The design specifies a
+  registry keyed by `DeclKey()` (`declPos:name`) on the planning context. In
+  the tree, `CTEScan.cte` already points at the `*plannedCTE`, and
+  `synthesizeCTEStats` takes exactly that. The entry POINTER is a strictly
+  stronger identity than the key, with precisely the lifetime the design asks
+  for — per-`Plan()` call, dangling never, because the body is planned inside
+  the same call. So the synthesis is memoized on the entry
+  (`plannedCTE.outputStats()`) and no registry is needed: the thing the key
+  would look up is already in hand. The design's constraints are kept —
+  one synthesis per CTE, so both references of a multi-reference CTE agree by
+  construction, and a miss yields today's defaults rather than a guess.
+  (Recorded as a deliberate, documented divergence, not a silent one.)
+- **The consumer**: `cteSynthNDistinct` walks the index-preserving wrappers
+  down to a `*CTEScan` and returns that output column's synthesized ndistinct,
+  clamped to the body's row estimate. It is wired as the LAST arm of
+  `columnNDistinctForChild`, after `resolveBaseColumn` and
+  `groupUniqueNDistinct`, so a real catalog resolution always wins. Every step
+  is fail-closed: unrecognised wrapper, out-of-range index, unpopulated entry,
+  computed `Project` target, or an `unknown` column all decline. The path can
+  only ever REPLACE a default with a derived number; it can never invent one.
+
+### What it measured — the slice is INERT on the corpus, and why
+
+TPC-DS SF0.25, default arm: **99/99 plans identical**, `MISMATCH=0`. That is
+not "safe and therefore fine" — it needed explaining, so the consumer was
+instrumented:
+
+| observation | count per corpus run |
+|---|---|
+| `outputStats()` computed | 23 |
+| consumer reached a `*CTEScan` and asked for a column | **852** |
+| … the column was **unknown** (body shape unclassified) | **648** |
+| … the column was a **group key** (classified, not numbered) | **204** |
+| … the column was an **agg output** | **0** |
+| … the column was a **union literal** | **0** |
+
+So the consumer is live and exercised 852 times, and declines every time for a
+correct reason. The decisive finding is the last two rows: **the two column
+kinds the landed synthesis can actually number are never requested.** The
+agg-output FD bound (gap G3) — which is what step 1 delivers — has no consumer
+at all in the ndistinct channel on this corpus.
+
+### Consequence for the rest of step 2
+
+The value is entirely in the columns consumers do ask about:
+
+1. **Group keys — 204 asks, classified but unnumbered.** These need the
+   group-combo rule: per-column ndistinct from the group combo clamped by
+   output rows (gap G2, and the synthesis's own step 3). This is the next
+   slice and it is where any plan movement on the `year_total` shapes will
+   come from.
+2. **Unknown — 648 asks.** The synthesis does not classify these body shapes
+   at all. Before widening it, census WHICH shapes they are; 648 is large
+   enough that guessing would be expensive.
+
+Neither was attempted here. Wiring the group-combo rule blind — without the
+consumer path proven and without knowing which kinds are actually requested —
+is how a statistics change moves default-arm plans on an unmeasured mechanism.
+That path is now proven, and the target is now named.
+
+
+## Step 2 slice 2 — the group-combo rule (gap G2), and the census that preceded it
+
+### The 648 `unknown` asks, censused first
+
+Slice 1 left 648 asks per corpus run landing on body shapes the synthesis does
+not classify. The task's own ordering said census before widening, and the
+census changed what "widening" should mean:
+
+| CTE body shape | unknown asks / run |
+|---|---|
+| `Project(WindowAgg)` | **366** |
+| `Project(Filter)` | 158 |
+| `SetOp` (bare) | 59 |
+| `Project(SetOp)` | 41 |
+| `DistinctOn` | 24 |
+
+Two of these are worth recording as findings rather than just counts. Window
+functions are 56% of the unknown population and the synthesis has no
+`WindowAgg` rule at all. And `Project(Filter)` — a plain filtered select —
+appears 158 times, which this document's own G1 note says should not happen
+("plain bodies need no synthesis: the existing resolver already recurses into
+CTE bodies for those shapes"); the consumer is reached only when
+`resolveBaseColumn` FAILS, so for those 158 the resolver is not doing what G1
+assumes. Both are unresolved and ledgered.
+
+### The rule
+
+A grouping column's distinctness in the aggregate's OUTPUT is bounded twice:
+by its INPUT distinctness (grouping emits a subset of values it already had)
+and by the GROUP COUNT (one output row per group). The rule is the minimum —
+**and it applies only when the input ndistinct is known**.
+
+### Why the group count is NOT a usable fallback (measured, not reasoned)
+
+The first version of this rule used the group count when the input was
+unknown. Sound as a *bound*; wrong as an *estimate*. For one key of a
+multi-key grouping, a low-cardinality column gets priced at the whole group
+count — TPC-DS `d_week_seq` (a few hundred weeks) grouped alongside a store
+key is priced in the tens of thousands. That inflates the key's ndistinct,
+which deflates the join selectivity that divides by it.
+
+The default-arm sweep caught it immediately:
+
+```
+Q59  before:  Hash Join   (cost=4460.71..6983.92 rows=43)
+     after:   Nested Loop (cost=1925.94..6878.78 rows=1)   <- estimate collapsed
+```
+
+Values stayed correct (`MISMATCH=0`), so only the PLAN channel could see it —
+a concrete instance of why this task gates the default arm and reports plan
+movement explicitly. Requiring a known input makes the rule strictly a
+tightening of a value the estimator already had.
+
+### Result: correct, exercised, and plan-neutral
+
+Against the TRUE pre-change baseline (not the intermediate buggy capture — the
+baseline-drift trap this document records): **99/99 plans identical**,
+`PASS=96 MISMATCH=0`, TPC-H acceptance arm 24/24.
+
+The rule is not inert in the sense slice 1 was. It **fires 18 times per corpus
+run**, and where it fires the correction is large:
+
+```
+in=4      groups=655237   -> nd=4        (vs defaultNumDistinct 200)
+in=6      groups=356      -> nd=6
+in=39504  groups=3256     -> nd=3256     (group-count bound wins)
+```
+
+So 18 columns now carry a derived ndistinct instead of a default, several of
+them 50x tighter — and no corpus plan at SF0.25 depends on those columns
+today. That is a safe landing, not a valuable one: the value is banked for the
+residuals this task exists to unblock, which can now be re-evaluated against
+derived rather than default estimates.
+
+### Not done here
+
+A formal EA (estimate-audit) ratchet on the `year_total` shapes was NOT run;
+the evidence above is the plan channel plus the fire census. Since plans are
+byte-identical the *chosen* plans are unchanged, but estimate QUALITY on those
+18 columns did change and is unmeasured by q-error. Ledgered.
+
+
+## Step 2 slice 3 — the WindowAgg arm, and the finding that redirects this task
+
+### The arm
+
+`Project(WindowAgg)` was 366 of the 648 unclassified asks (56%), so it was the
+next slice by size. The rule is stronger than the group-key one: a `WindowAgg`
+is ROW-PRESERVING — one output row per input row, publishing
+`child row ++ func outputs` — so a column it hands through does not merely
+inherit a BOUND from its input, it has the input's distinctness exactly. No
+clamp is correct. Window-function outputs themselves stay unknown.
+
+Landed with three pins (pass-through with reordered targets, fail-closed on a
+computed target and on unanalysed input, and a dispatch-order pin that the
+window arm never overwrites an earlier rule's record). Gates green: TPC-DS
+SF0.25 default arm `PASS=96 MISMATCH=0`, **plans 99/99 identical**, TPC-H
+acceptance arm 24/24, spotcheck Q12=2 Q13=33.
+
+### It fires ZERO times — and the reason redirects the task
+
+Instrumenting the arm across a corpus run:
+
+```
+synthWindowOutputs calls           23
+  declined at the map stage        19   <- 15 Project(non-window), 3 SetOp, 1 DistinctOn
+  entered                           4   <- the real window bodies
+per-column outcome inside those 4:
+  decline=nd (input unresolvable)  19
+  decline=pos (window func output)  4
+  succeeded                         0
+```
+
+The 19 map-stage declines are correct: those bodies are not window bodies at
+all. Only **four** CTE bodies in the corpus are genuinely
+`Project(WindowAgg)`-shaped, and they generate all 366 asks between them.
+
+For those four, every pass-through column declines for one reason: the input
+ndistinct is unresolvable. The `WindowAgg`'s child is always a `*Sort` (R6
+stacks it for presorted input), and beneath that Sort:
+
+```
+15  *optimizer.WindowAgg     <- stacked OVER clauses
+ 4  *optimizer.Aggregate
+```
+
+So `columnNDistinctForChild` cannot cross a `WindowAgg` or an `Aggregate` to
+reach the base statistics — **which is gap G1 itself**, one level below the CTE
+boundary rather than at it.
+
+### What this means for the remaining work
+
+This is the third consecutive slice to land correct, pinned, safe and INERT,
+and the census now explains the pattern. The blocker is NOT a shortage of
+synthesis rules at the CTE boundary. It is that the resolver beneath the
+boundary stops at `Aggregate`/`WindowAgg`, so whatever rule is added at the
+boundary asks for a number that cannot be produced.
+
+Upstream has no equivalent problem: `examine_simple_variable`
+(`postgres/src/backend/utils/adt/selfuncs.c`) resolves a subquery-output Var to
+the underlying relation's `pg_statistic` row regardless of the nodes in
+between, which is why PG needs no per-shape synthesis at all.
+
+**The next slice should therefore be G1 proper** — teach `resolveBaseColumn`
+(`internal/optimizer/joinkeyproof.go`) to cross an `*Aggregate` (a group key
+resolves to its input column; an agg output does not resolve) and a
+`*WindowAgg` (a pass-through column resolves to its input column; a func output
+does not) — not another boundary rule. The boundary rules already landed are
+the consumers that G1 will finally feed; adding a fourth before G1 lands would
+be a fourth inert slice.
+
+
+## Step 2 slice 4 — G1 proper, and the conclusion that closes the "add rules" direction
+
+### The baton's plan was half wrong, and the code said so
+
+Slice 3 concluded "add `*Aggregate` and `*WindowAgg` arms to
+`resolveBaseColumn`". Reading the function first showed an **`*Aggregate` arm
+already exists**, deliberately restricted to `AggModePartial`, with the
+rationale immediately below it: M0127-P5.6-g-ii filed exactly that widening,
+**MEASURED it worse, and restricted it because upstream does not have it**.
+The sanctioned path for a grouped-subquery column is `groupUniqueNDistinct`,
+whose doc calls the single-grouping-column restriction "upstream's and
+load-bearing, not conservatism".
+
+So only the `*WindowAgg` arm was genuinely missing, and only that was added.
+
+### The arm, and the third walker
+
+A `*WindowAgg` publishes `child row ++ func outputs` and is ROW-PRESERVING, so
+a pass-through coordinate describes exactly the child's column — everything
+`baseColumnRef` carries survives the crossing. That is precisely what an
+`*Aggregate` cannot claim, its output rows being GROUPS.
+
+`TestResolverFamilyArmListsAgree` then caught a THIRD family member the plan
+had not accounted for: `relFilteredRowsWalk` (cardinality.go). The arm was
+added there too (a row-preserving node still describes its child's relation,
+so `passthrough` is right) — note that walker has no `*Aggregate` arm either,
+for the mirror-image reason.
+
+### The measurement: the arm works, and the remaining unknowns are PG's too
+
+The arm is correct and the chain now gets PAST the window nodes, which it could
+not before. It still converts zero of the 366 asks, and tracing where each
+chain terminates says why:
+
+```
+8  Sort>WindowAgg>Sort>Aggregate>[groupExprs=6]
+7  Sort>WindowAgg>Sort>Aggregate>[groupExprs=5]
+4  Sort>Aggregate>[groupExprs=2]
+```
+
+Every TPC-DS window CTE is a window over a MULTI-KEY aggregate. The resolution
+reaches the Aggregate and stops there — correctly, and for upstream's reason:
+with two or more grouping columns none is unique on its own, so
+`get_variable_numdistinct`'s `isunique` counting argument does not exist.
+
+**These are columns PostgreSQL itself would not resolve.** The conclusion is
+therefore not "add another rule" but that the B-06 gap is far smaller than the
+648-unknown figure suggested: most of that population is unresolvable within
+upstream's own rules, and closing it would mean inventing estimates PG does
+not make.
+
+### What this means for M0145-0009
+
+The three residuals this task exists to unblock cannot be unblocked by more
+CTE-output statistics, because the statistics they want do not exist upstream
+either. The task's remaining honest scope is:
+
+- the `SetOp` population (100 asks) — `synthUnionLiterals` is reached but does
+  not match; diagnose before widening, as it may be a real rule gap;
+- the G1 contradiction (`Project(Filter)` bodies reaching the consumer 158×/run
+  although the design says the resolver handles them) — still unexplained and
+  the most likely place a REAL gap is hiding;
+- an EA/q-error ratchet, which is now clearly premature.
+
+Everything else should be escalated as a scoping question rather than pursued:
+if the residuals need estimates PG cannot produce, the residuals' own
+unblock conditions — not the statistics — are what need revisiting.
+
+
+## Step 2 slice 5 — the census completed, and a retraction
+
+This slice added no rule. It finished the census, and what it found closes the
+task's "add more rules" scope and **retracts a claim two earlier slices
+recorded**.
+
+### RETRACTION: the G1 note is NOT contradicted
+
+Slices 2 and 3 recorded that this document's G1 claim ("plain bodies need no
+synthesis: the existing resolver already recurses into CTE bodies for those
+shapes") was contradicted by measurement, because `Project(Filter)` bodies
+reached the consumer 158 times per run and the consumer is reached only when
+`resolveBaseColumn` FAILS. That reading was **wrong, and the error was mine**:
+the census classified bodies by looking one level below the `Project`, so a
+`Filter` was read as a plain WHERE. Looking one level further:
+
+```
+142  Project>Filter>Aggregate
+ 16  Project>Filter>Project>Aggregate
+```
+
+Every one of those `Filter`s is a **HAVING clause over an aggregate**, which is
+precisely the shape `groupUniqueNDistinct`'s own doc describes ("Q18's inner is
+`lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 313`, whose HAVING is a
+`*Filter` above the `*Aggregate`"). These are not plain bodies at all. G1's
+claim stands; the ledger rows and task notes asserting otherwise are corrected
+by this section.
+
+### The whole unknown population, finally classified
+
+With the terminal node and grouping arity recorded for each ask:
+
+| population | asks/run | terminal shape | resolvable upstream? |
+|---|---|---|---|
+| `Project(Filter(Aggregate))` | 158 | group keys of **3-key** (142) and **4-key** (16) aggregates | **no** |
+| `Project(WindowAgg(...))` | 366 | windows over **6-key** (8), **5-key** (7), **2-key** (4) aggregates | **no** |
+| `SetOp` / `Project(SetOp)` | 100 | `UNION ALL` whose branches project data columns, not literals | **no** |
+| `DistinctOn` | 24 | — | not examined |
+
+The first two are the same class: a group-key column of a MULTI-key aggregate.
+Upstream's `get_variable_numdistinct` `isunique` branch
+(`postgres/src/backend/utils/adt/selfuncs.c:6338`) applies only when the
+grouping is over a single column, because that is what makes the counting
+argument exact — with two or more keys none is unique on its own. The third is
+a set-op subquery output, for which upstream has no `pg_statistic` row either;
+numbering it would require combining branch statistics, which PG does not do.
+
+**So the entire 648-unknown population is columns PostgreSQL itself would not
+resolve.** The `synthUnionLiterals` decline is likewise correct — those columns
+are data, not the literal tags the rule exists for.
+
+### Conclusion for M0145-0009
+
+There is no remaining synthesis work that is PG-faithful. Five slices have now
+landed (consumer, group-combo rule, WindowAgg synthesis arm, WindowAgg resolver
+arm, this census); the first four are correct, pinned and safe, and inert for
+the reason this census finally states in upstream's terms.
+
+The task's premise — that CTE-output statistics would unblock three M0145
+residuals — does not survive the measurement: the statistics those residuals
+want do not exist upstream either. **That is an owner scoping decision, not a
+loop decision**, and it is escalated in `fix_plan.md`. What the loop can say is
+that continuing to add boundary rules would be inventing estimates PG does not
+make, which is the opposite of this project's goal.
+
+
+---
+
+# Closing census (2026-09-22) — M0145-0009 step "re-run the census afterwards"
+
+M0145-0009's completion step asks for the pull-up/seam decline census to be
+re-run "so the residual buckets reflect the new state" after M0145-0013 landed.
+Run here on the TPC-DS SF0.25 private lane, knob arm
+(`GOOPG_JOINTREE_PIPELINE=1`, `GOOPG_NLI_CENSUS=1`), all 99 queries, via
+`scripts/jointree-parity-capture.sh tpcds-sf025`.
+
+## The result: the `*CTEScan` class is not a residual — it is a default-off arm
+
+| decline class | `GOOPG_PULLUP_CTE_LEAF` off (default) | on |
+|---|---|---|
+| `(pulled)` | 27 | **42** |
+| `any-body-leaf-(*optimizer.CTEScan)` | 15 | **0** |
+| `SubqueryExpr@scalar` | 15 | 15 |
+| `ExistsExpr@or` | 2 | 2 |
+| `InExpr@or` | 1 | 1 |
+
+27 + 15 = 42. The class does not shrink, relocate or partially convert: with
+M0145-0013's admission enabled **every** member becomes a pull-up, and no other
+class moves. So the bucket that three of this milestone's residuals were
+described as waiting on is fully addressed in code already, and what remains is
+the arm's promote-or-delete decision (C5), not more synthesis.
+
+The two `@or` classes and `SubqueryExpr@scalar` are unchanged, as M0145-0015
+predicted: those are declines PostgreSQL makes too
+(`prepjointree.c:877`'s `/* Stop if not an AND */`, and EXPR sublinks never
+being jointree citizens).
+
+## The arm is not free, and that is the decision it needs
+
+Turning it on moved plans — 302 diff lines across the two goopg captures — and
+`CATEGORIES-EXCL-MATCH` `qual-placement` went **28 → 29** while `match` stayed
+at 1. That is inside the ±3 noise band, so it is not a measured regression, but
+it is also not the "no plan change" a free admission would show. Whoever takes
+M0145-0013's promote-or-delete decision should re-measure with a repeat capture
+to separate the +1 from capture variance rather than reading it off this run.
+
+## A measurement caveat worth more than the numbers
+
+M0145-0015's census (2026-09-21, nominally the same recipe) reported
+`(pulled)` 54, `*CTEScan` 30, `SubqueryExpr@scalar` 29, `ExistsExpr@or` 4,
+`InExpr@or` 2 — close to **twice** every figure above, across five independent
+classes at once, with the proportions essentially unchanged.
+
+Five independent halvings are far less likely than one capture-recipe
+difference (for instance an earlier capture planning each query twice). This is
+not resolved here, and the honest consequence is a rule rather than a number:
+**absolute census totals are comparable only within an identical capture
+recipe; the class PROPORTIONS are what carries across captures.** The
+conclusion above rests on a within-capture A/B — both arms from this loop, same
+recipe, same binary sha — which is why it holds regardless of which explanation
+is right. A later loop that needs the absolute figures should first re-run
+M0145-0015's exact command and see which number it reproduces.
+
+Artifacts: `tmp/m0145-0009-census/` (plans, diffs, per-stage class reports) and
+`tmp/m0145-0009-{recensus,cteleaf}-tpcds-sf025.server.log` (the census lines).

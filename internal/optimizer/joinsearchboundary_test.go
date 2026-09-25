@@ -61,9 +61,6 @@ func jsbCatalog(t *testing.T) catalog.Catalog {
 // jsbPlan plans one statement with `GOOPG_PGSHAPED_DP` forced to `on`.
 func jsbPlan(t *testing.T, sql string, on bool) Node {
 	t.Helper()
-	saved := pgShapedDP
-	pgShapedDP = on
-	defer func() { pgShapedDP = saved }()
 
 	stmts, err := parser.Parse(sql)
 	if err != nil {

@@ -81,7 +81,13 @@ type indexScanInputs struct {
 	// loopCount is `cost_index`'s parameter of the same name: how many times
 	// this scan is expected to be RE-executed, which for a parameterised path
 	// is the row count of the outer relations supplying its parameter
-	// (`get_loop_count`, indxpath.c:3266). 0 or 1 means a single execution.
+	// (`get_loop_count`, indxpath.c:3266). 0 or 1 means a single execution —
+	// with one R59-noted exception: at numSAScans > 1, 0 keeps the legacy
+	// serial page cost (numScans = 0) while 1 takes the Mackert-Lohman arm,
+	// so the two are NOT interchangeable there. No producer sets numSAScans
+	// > 1 yet (P2-09b owns it); unifying the 0-convention belongs to that
+	// round, which can adjudicate it against PG's SAOP pessimism with a real
+	// producer in hand.
 	//
 	// It exists so the returned cost stays "one execution": PG pro-rates the
 	// amortised total back down by `loopCount` for exactly that reason, which
@@ -96,6 +102,17 @@ type indexScanInputs struct {
 	indexOnly  bool
 	allVisFrac float64
 
+	// numQualOps is `cost_index`'s qpqual count: restriction conjuncts NOT
+	// satisfied as index quals, charged per heap tuple fetched
+	// (`cpu_tuple_cost + qpqual`, costsize.c:822-830). The seq-scan rival
+	// charges the identical term per tuple scanned (`costSeqscan`), so the
+	// two sides of one addPath comparison use one currency for the qual.
+	// Ordered/index-only producers pass every local conjunct (selectivity
+	// 1.0: no clause is an index qual there); bitmap/parameterised
+	// producers pass local conjuncts minus index-satisfied ones. 0 keeps
+	// the pre-R1 price exactly. R1 (plan-parity-fix-take2).
+	numQualOps float64
+
 	// numSAScans is PG's `num_sa_scans`: the number of index descents a
 	// ScalarArrayOp (`col = ANY (consts)`) scan performs — the product of
 	// the array lengths over the scan's SAOP quals (`genericcostestimate`,
@@ -108,6 +125,48 @@ type indexScanInputs struct {
 	// is exercised by unit tests (the pipeline SAOP arm is rule-based,
 	// like its `col = const` sibling, and prices nothing).
 	numSAScans float64
+}
+
+// localQualOpCount counts the rel's local restriction conjuncts from the
+// pre-search leaf's Filter chain — the qpqual population for an index path
+// over this rel (R1, plan-parity-fix-take2). These are the same conjuncts
+// estimateBaseRelInfo stores as localFilter and baseSeqScanCostInputs
+// counts for the seq rival (`len(splitConjuncts(ri.localFilter, nil))`), so
+// the two rivals agree on the number by construction even as filters move:
+// the leaf IS Filter{scan, combineAnd(localized)} over the same predicate
+// list (joinsearchseam.go).
+func localQualOpCount(leaf Node) float64 {
+	return float64(len(extractFilterConjuncts(leaf)))
+}
+
+// relQualOpCount counts the rel's local restriction conjuncts for qpqual
+// pricing at sites that hold the rel but not its leaf (R1,
+// plan-parity-fix-take2). Nil-safe: an unknown leaf counts 0, the same
+// zero the seq rival's counter yields without a filter.
+func relQualOpCount(rel *RelOptInfo) float64 {
+	if rel == nil {
+		return 0
+	}
+	return localQualOpCount(rel.baseLeaf)
+}
+
+// paramIndexQualOpCount is the qpqual count for a PARAMETERISED index path
+// (R1, plan-parity-fix-take2). PG's qpquals are the clauses evaluated on the
+// heap tuple: `baserestrictinfo + ppi_clauses` minus the index quals
+// (costsize.c:806-820). Here that is every local conjunct (none is an index
+// qual on this path — the index quals come from the join clauses) plus the
+// movable join clauses the probe does not bind (`nBound - nIndexQuals`).
+//
+// The two populations are ADDED, never subtracted from one another:
+// `nIndexQuals` is drawn from the `nBound` set, so the second term cannot go
+// negative. The floor is belt-and-braces — a negative count would CREDIT the
+// index path, i.e. re-create the asymmetry R1 exists to remove.
+func paramIndexQualOpCount(leaf Node, nBound, nIndexQuals int) float64 {
+	unbound := nBound - nIndexQuals
+	if unbound < 0 {
+		unbound = 0
+	}
+	return localQualOpCount(leaf) + float64(unbound)
 }
 
 // costIndexScan is `cost_index` (costsize.c:520) for a single, non-parallel,
@@ -223,24 +282,16 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 	csquared := in.correlation * in.correlation
 	runCost += maxIOCost + csquared*(minIOCost-maxIOCost)
 
-	// CPU: `cpu_tuple_cost` per tuple actually fetched from the heap. The
-	// qpqual per-tuple term PG adds here is still zero for goopg's search.
-	//
-	// The justification it used to carry — "the same reason `buildInitialRels`
-	// passes numQualOps = 0" — EXPIRED on 2026-09-07: the seq-scan rival now
-	// charges `cpu_operator_cost x conjuncts` on every tuple SCANNED, because
-	// that is what `cost_seqscan` does and it is what gives a base-rel Gather
-	// its crossover (ledger `c19-baserel-scan-priced-on-output-rows`,
-	// `baseSeqScanCostInputs`). So the two rivals in one `addPath` comparison
-	// no longer use one currency for the qual: the index path pays
-	// `cpu_tuple_cost x tuples_fetched` where PG pays
-	// `(cpu_tuple_cost + qpqual) x tuples_fetched` (costsize.c:822-830).
-	//
-	// The asymmetry FAVOURS the index path, and it is small in absolute terms
-	// precisely where index paths win (a selective scan fetches few tuples),
-	// so it is left standing rather than folded into that measurement: adding
-	// it moves plans again and needs its own TPC-H digest + timing table.
-	cpuRunCost := cp.cpuTupleCost * tuplesFetched
+	// CPU: `cpu_tuple_cost + qpqual` per tuple actually fetched from the
+	// heap (costsize.c:822-830), where qpqual is `cpu_operator_cost` per
+	// non-index-satisfied restriction conjunct (`in.numQualOps`). This is
+	// the identical term the seq-scan rival charges per tuple scanned
+	// (`costSeqscan`), so the two rivals in one `addPath` comparison use
+	// one currency for the qual. R1 (plan-parity-fix-take2): the asymmetry
+	// documented below — index paths priced with no qual charge at all
+	// while the seq rival charges every conjunct — favoured index paths
+	// by the size of the qual (notably TPC-H Q12).
+	cpuRunCost := (cp.cpuTupleCost + cp.cpuOperatorCost*in.numQualOps) * tuplesFetched
 
 	// "Adjust costing for parallelism, if used" (costsize.c:257-266): the
 	// CPU cost is divided among all the workers; the I/O above is not.
@@ -296,10 +347,44 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 		numIndexPages = math.Ceil(numIndexTuples * in.indexPages / in.indexTuples)
 	}
 
-	// Index pages are random fetches, so they carry goopg's probe calibration
-	// (see the file header). With the default multiplier of 1.0 this is PG's
-	// own arithmetic exactly.
-	total = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+	// num_sa_scans, clamped to at most a third of the index's pages
+	// (`btcostestimate`, selfuncs.c:7718-7719: descents cannot exceed leaf
+	// pages, with headroom for the btree's leaf-level continuation) and at
+	// least 1. PG clamps BEFORE genericcostestimate, so the descent charge
+	// below and the repeated-scan arm here both read the clamped value;
+	// numSAScans <= 1 reproduces the pre-existing single charge exactly.
+	numSA := in.numSAScans
+	if numSA < 1 {
+		numSA = 1
+	}
+	if numSA > 1 {
+		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
+		numSA = math.Max(numSA, 1)
+	}
+
+	// The repeated-scan arm (`genericcostestimate`, selfuncs.c:7180-7204).
+	// A scan repeated loopCount times — a parameterised path inside a
+	// nestloop — with numSA descents per execution touches numIndexPages ×
+	// numScans pages in total, but the second execution largely re-reads the
+	// first's pages. So PG runs Mackert-Lohman over the TOTAL touches (N =
+	// T = index size, "as if there were one tuple per page") and pro-rates
+	// the cost back to ONE execution by num_outer_scans = loopCount — never
+	// by numScans, since ScalarArrayOp repeats are internal to the scan.
+	// Index pages are random fetches, so the pro-rated cost carries goopg's
+	// probe calibration (see the file header) exactly as the heap bounds do.
+	// Gated on numScans, not loopCount, since numSA > 1 repeats scans at
+	// loopCount 1; the numScans <= 1 branch is the pre-existing arithmetic
+	// bit-identically. R59 (plan-parity-fix-take2).
+	numScans := numSA * in.loopCount
+	var indexPageCost float64
+	if numScans > 1 {
+		pagesFetched := indexPagesFetched(numIndexPages*numScans, int64(in.indexPages), in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
+		indexPageCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+	} else {
+		// A single index scan: spc_random_page_cost per page touched.
+		indexPageCost = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+	}
+	total = indexPageCost
 	total += numIndexTuples * cp.cpuIndexTupleCost
 
 	// The B-tree descent (selfuncs.c:7780): tree height plus the leaf page,
@@ -310,20 +395,8 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	//
 	// With SAOP quals the descent is charged once per estimated descent
 	// (`btcostestimate`, selfuncs.c:7762-7782): once to startup, num_sa_scans
-	// times to total. The count itself is clamped to at most a third of the
-	// index's pages (:7718-7719: descents cannot exceed leaf pages, with
-	// headroom for the btree's leaf-level continuation) and at least 1.
-	// numSAScans <= 1 reproduces the pre-existing single-descent charge
-	// exactly. P2-09b's remainder (the numIndexTuples/rint adjustment and
-	// the log2(N) descent term) stays out.
-	numSA := in.numSAScans
-	if numSA < 1 {
-		numSA = 1
-	}
-	if numSA > 1 {
-		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
-		numSA = math.Max(numSA, 1)
-	}
+	// times to total. P2-09b's remainder (the numIndexTuples/rint adjustment
+	// and the log2(N) descent term) stays out.
 	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
 	startup = descent
 	total += numSA * descent

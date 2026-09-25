@@ -154,7 +154,10 @@ func TestRangeScanCompositeIndexKeepsFilter(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	if err := runDDL(t, ctx, "CREATE TABLE btg (y int, x int, w int)"); err != nil {
+	// x and w are NOT NULL: `y < 0` leaves them unbound, and goopg only
+	// probes a composite index past its bound prefix when those columns
+	// cannot be NULL (it stores no NULL-keyed index entries).
+	if err := runDDL(t, ctx, "CREATE TABLE btg (y int, x int NOT NULL, w int NOT NULL)"); err != nil {
 		t.Fatal(err)
 	}
 	if err := runDDL(t, ctx, "CREATE INDEX btg_y_x_w ON btg(y, x, w)"); err != nil {

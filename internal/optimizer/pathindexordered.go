@@ -60,6 +60,9 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// express a preference in, and retires with the legacy planner (P6).
 	s.addParameterizedIndexPaths(cat)
 	s.addOrderedIndexPaths(cat)
+	// M0145-0029: the plain half's restriction arm — `index_clauses` from the
+	// relation's own quals (pathindexrestrict.go).
+	s.addRestrictionIndexPaths(cat)
 	// M0128-P2.4: bitmap scan paths compete alongside index scan paths in
 	// add_path for every usable index. They are always generated — PG's
 	// create_index_paths generates both indexscan and bitmap paths for every
@@ -176,6 +179,13 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	if idx.HasPredicate {
 		return false
 	}
+	// An ordering-only path is a full index scan: it binds no key column,
+	// and goopg stores no index entry whose key has a NULL column, so over a
+	// nullable key column it would drop those rows (a merge LEFT JOIN lost
+	// its NULL-keyed outer rows). PG stores NULL keys and has no such rule.
+	if !indexUnboundKeysNotNull(tbl, idx, 0) {
+		return false
+	}
 
 	// Steps 2 and 2b of `build_index_paths`, fused — see the note below on why
 	// the fusion is exact rather than a shortcut. The scan direction those keys
@@ -207,6 +217,9 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 
 		totalTablePages: totalPages,
+		// R1 (plan-parity-fix-take2): with no index quals every local
+		// conjunct is a qpqual, exactly as the seq rival counts them.
+		numQualOps: localQualOpCount(rel.baseLeaf),
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at

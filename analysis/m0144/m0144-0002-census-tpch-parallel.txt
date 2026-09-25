@@ -1,0 +1,41 @@
+Q1 depth=0 [sort-strategy] under -: PG Finalize GroupAggregate | goopg Sort
+Q2 depth=1 [parameterisation] under Sort: PG Hash Join Inner | goopg Hash Join Inner
+Q3 depth=1 [aggregation-strategy] under Sort: PG HashAggregate | goopg GroupAggregate
+Q4 depth=0 [sort-strategy] under -: PG Finalize GroupAggregate | goopg Sort
+Q5 depth=1 [aggregation-strategy] under Sort: PG Finalize GroupAggregate | goopg Finalize HashAggregate
+Q6 MATCH (no structural divergence)
+Q7 depth=0 [sort-strategy] under -: PG GroupAggregate | goopg Sort
+Q8 depth=0 [sort-strategy] under -: PG GroupAggregate | goopg Sort
+Q9 depth=2 [parallelism] under HashAggregate: PG Gather | goopg Nested Loop Inner
+Q10 depth=4 [parallelism] under Hash Join: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q11 depth=2 [parallelism] under HashAggregate: PG Nested Loop Inner | goopg Gather
+Q12 depth=0 [sort-strategy] under -: PG Finalize GroupAggregate | goopg Sort
+Q13 depth=2 [aggregation-strategy] under HashAggregate: PG HashAggregate | goopg Finalize HashAggregate
+Q14 depth=3 [parallelism] under Partial Aggregate: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q15a-VIEWBODY depth=0 [aggregation-strategy] under -: PG Finalize GroupAggregate | goopg Finalize HashAggregate
+Q16 depth=1 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+Q17 depth=0 [aggregation-strategy] under -: PG Aggregate | goopg Finalize Aggregate
+Q18 depth=1 [aggregation-strategy] under Sort: PG HashAggregate | goopg GroupAggregate
+Q19 depth=3 [join-method] under Partial Aggregate: PG Nested Loop Inner | goopg Hash Join Inner
+Q20 depth=2 [qual-placement] under Hash Join: PG Nested Loop Inner | goopg Nested Loop Inner
+Q21 depth=3 [join-method] under Sort: PG Nested Loop Left Semi | goopg Nested Loop Left Anti
+Q22 depth=0 [sort-strategy] under -: PG GroupAggregate | goopg Sort
+FIRST-DIVERGENCE: queries=22 divergent=21 match=1
+CATEGORY-ROLLUP: aggregation-strategy=7 sort-strategy=6 parallelism=4 join-method=2 parameterisation=1 qual-placement=1
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):
+    3  sort-strategy    under -                PG Finalize GroupAggregate      goopg Sort                         depth=0
+    3  sort-strategy    under -                PG GroupAggregate               goopg Sort                         depth=0
+    2  aggregation-strategy under Sort             PG HashAggregate                goopg GroupAggregate               depth=1
+    1  parameterisation under Sort             PG Hash Join Inner              goopg Hash Join Inner              depth=1
+    1  aggregation-strategy under Sort             PG Finalize GroupAggregate      goopg Finalize HashAggregate       depth=1
+    1  parallelism      under HashAggregate    PG Gather                       goopg Nested Loop Inner            depth=2
+    1  parallelism      under Hash Join        PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=4
+    1  parallelism      under HashAggregate    PG Nested Loop Inner            goopg Gather                       depth=2
+    1  aggregation-strategy under HashAggregate    PG HashAggregate                goopg Finalize HashAggregate       depth=2
+    1  parallelism      under Partial Aggregate PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=3
+    1  aggregation-strategy under -                PG Finalize GroupAggregate      goopg Finalize HashAggregate       depth=0
+    1  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=1
+    1  aggregation-strategy under -                PG Aggregate                    goopg Finalize Aggregate           depth=0
+    1  join-method      under Partial Aggregate PG Nested Loop Inner            goopg Hash Join Inner              depth=3
+    1  qual-placement   under Hash Join        PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+    1  join-method      under Sort             PG Nested Loop Left Semi        goopg Nested Loop Left Anti        depth=3

@@ -1,7 +1,9 @@
 package optimizer
 
 import (
+	"reflect"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -465,6 +467,50 @@ type resolveContext struct {
 	// deconstructJointree and consumed by join_is_legal (P1.2+). M0128-P1.1.
 	joinInfoList []*SpecialJoinInfo
 
+	// jtPullup is the jointree pipeline's sublink pull-up record
+	// (M0145-0003, jointreepullup.go): WHERE-clause EXISTS/NOT-EXISTS
+	// bodies bound against a provisional scope and converted to
+	// semi/anti leaf entries for the one join-search problem. nil on
+	// the legacy pipeline and on every scope the pull-up pass declined
+	// — the seam reads it inside tryPGShapedJoinSearch, where the
+	// emitting prefix's real leaf count is known.
+	jtPullup *jtPullup
+
+	// jtScope is the jointree pipeline's leaf/link record table
+	// (M0145-0005 slice 3, jointreescope.go): what planFromItem
+	// attached and what each join's leaf range is, recorded at
+	// construction time so the seam's extractScopeLeaves builds the
+	// same tuple extractSearchLeaves derives by walking the node
+	// chain. Pinned to the chain it was built beside (root); nil for
+	// contexts that did not come out of planFromClause's FromExprs
+	// arm (planFromRangeVars, DML, subquery scopes).
+	jtScope *jtScopeTable
+
+	// appendrelMember marks this resolveContext as a UNION ALL
+	// appendrel's MEMBER scope (M0145-0004): the member plans through
+	// the join search even for a single-leaf FROM, so its searched rel
+	// carries the PartialPathlist the parent's SETOP rel picks from
+	// (allpaths.c:1412-1453's per-child choice). The seam reads it to
+	// lower the one-relation floor `minSearchRels()` imposes —
+	// upstream has no such floor at all (set_base_rel_pathlists runs
+	// for every base rel). Set only inside planSelectImpl for a scope
+	// that arrived carrying plannerSet.appendrelMember; cleared for
+	// deeper scopes by the same one-level bound.
+	appendrelMember bool
+
+	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
+	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
+	// transplanted in this statement (R40/K69). Those conjuncts must not
+	// reach resolveExpr — the ANTI join's Output() (plan.go) no longer
+	// carries the nullable side's columns, and PG's own reduce_outer_joins
+	// drops the identical conjuncts for the identical reason (prepjointree.c:
+	// "must be removed to prevent bogus selectivity calculations"). Column
+	// keys, not table names: PG's ANTI rule is var-granular, so one column of
+	// a table may force the conversion while others keep filtering. Nil in
+	// every context that is not a top-level FROM clause, same convention
+	// as joinlist/joinInfoList above.
+	antiForcedNullCols map[string]bool
+
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
 	// win at the search root (`finalPath`) and whether one is worth keeping
@@ -536,6 +582,9 @@ type rangeBinding struct {
 	table  *catalog.Table
 	alias  string
 	offset int // first output-column index for this relation
+	// columnOffsets overrides the contiguous offset for source columns that
+	// share a physical output slot after JOIN USING. R104.
+	columnOffsets map[string]int
 	// qualifiedOnly hides this binding from the unqualified
 	// column-resolution path AND restricts qualified matches to
 	// alias-only (never via the underlying table's catalog name).
@@ -595,6 +644,14 @@ type rangeBinding struct {
 	// `tableoid` reference instead — correct for non-partitioned
 	// base relations. M0100-0005y.
 	tableOidColIdx int
+	// appendrel marks a binding whose subquery passed the
+	// is_simple_union_all port (jointreeappendrel.go): a non-LATERAL
+	// FROM-clause `(... UNION ALL ...) alias` on the jointree pipeline.
+	// `addAppendRelPartialPaths` reads it — via baseRelInfo.appendrel —
+	// to hoist the leaf's Parallel Append candidate onto the search
+	// leaf rel (M0145-0004). Never set on the legacy pipeline, so the
+	// flag is the arm gate as well as the admissibility record.
+	appendrel bool
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -779,8 +836,12 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps
 		// non-set-op ORDER BY site derives (`limitTuplesForOrderedSort`,
 		// resolved against `ctx` — the set-op output context built above, the
 		// one the LIMIT clause's own resolution uses a few lines below).
+		// M0141-S2a-fix1-sweep-a: `out` above is already the set-op's own
+		// finished output row — nothing wider sits between it and the Sort
+		// to narrow away — so this arm passes no keep (full-width, same as
+		// before the sweep).
 		node = createOrderedPaths(upper, node, keys, s.Pos(), ps.costParams(),
-			tupleFraction, limitTuplesForOrderedSort(s, ctx))
+			tupleFraction, limitTuplesForOrderedSort(s, ctx), nil)
 	}
 
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
@@ -847,6 +908,194 @@ func setOpNeedsCast(lname, rname string) bool {
 	}
 	// Left is a non-string type: validate right's string against it.
 	return !isGenericString(lname)
+}
+
+// setOpNumericRank orders PostgreSQL's TYPCATEGORY_NUMERIC ('N') types by the
+// implicit-coercion lattice select_common_type walks: a narrower type coerces
+// implicitly to a wider one but not the reverse, so the wider one wins. Within
+// this category the lattice is a total order, which is what lets goopg resolve
+// a set operation PAIRWISE (see setOpCommonType) and still land on the answer
+// PostgreSQL gets by considering every member at once.
+//
+// float4/float8 sit above the exact types because int/numeric coerce to them
+// implicitly and not back; float8 is additionally the category's PREFERRED
+// type, and since it is already the maximum here the preference rule needs no
+// separate arm.
+//
+// Returns 0 for anything outside the category, including `unknown`.
+func setOpNumericRank(name string) int {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "smallserial", "serial2":
+		return 1
+	case "int4", "integer", "int", "serial", "serial4":
+		return 2
+	case "int8", "bigint", "bigserial", "serial8":
+		return 3
+	case "numeric", "decimal":
+		return 4
+	case "float4", "real":
+		return 5
+	case "float8", "double precision":
+		return 6
+	}
+	return 0
+}
+
+// setOpCommonTypeName is the subset of PostgreSQL's select_common_type
+// (postgres/src/backend/parser/parse_coerce.c:1342) that goopg models for set
+// operations, returning the resolved type name and whether the pair is modelled
+// at all.
+//
+// goopg used to resolve a set operation's output type to the FIRST member's,
+// and coerce only the RIGHT branch to it. That is not what PostgreSQL does, and
+// the consequence reached the wire: `SELECT 1 UNION ALL SELECT 2.5` was
+// described as `bigint` while carrying a row of 2.5, so a typed client (JDBC,
+// psycopg) was told int8 for a numeric column. The values were right; only the
+// declared type was wrong, which is why no row-count gate could see it.
+//
+// Modelled here: the all-same fast path (upstream's own first loop, and the
+// only way a domain survives unsmashed) and the numeric category. Outside that
+// the pair is declined and the caller keeps its previous behaviour, so this
+// narrows the divergence rather than trading it for a new one. Cross-category
+// pairs, which upstream REJECTS with 42804 "types %s and %s cannot be matched",
+// are among the declined set — goopg still accepts them, and that is recorded
+// in the deferral ledger rather than silently fixed here.
+func setOpCommonTypeName(l, r string) (string, bool) {
+	if strings.EqualFold(l, r) {
+		return l, true
+	}
+	lr, rr := setOpNumericRank(l), setOpNumericRank(r)
+	if lr == 0 || rr == 0 {
+		return "", false
+	}
+	if lr >= rr {
+		return l, true
+	}
+	return r, true
+}
+
+// setOpUnifyBranches coerces BOTH branches of a set operation to the per-column
+// common type, so the accumulated node's schema — which `SetOp.Output()` reads
+// off its LEFT input — reports the resolved type rather than the first member's.
+//
+// Coercing the left branch as well as the right is the whole point: the
+// previous code cast only the right branch to the left's schema, which is what
+// made the first member win. With both sides coerced, `SetOp.Output()` needs no
+// change to become correct.
+//
+// Columns whose pair `setOpCommonTypeName` declines are left exactly as they
+// were, so the existing generic-string validation path (setOpNeedsCast) still
+// runs for them unchanged.
+func setOpUnifyBranches(pos int, left, right Node) (Node, Node) {
+	ls, rs := left.Output(), right.Output()
+	n := min(len(ls), len(rs))
+	common := make([]string, n)
+	anyLeft, anyRight := false, false
+	for i := 0; i < n; i++ {
+		c, ok := setOpCommonTypeName(ls[i].Type.Name, rs[i].Type.Name)
+		if !ok {
+			continue
+		}
+		common[i] = c
+		if !strings.EqualFold(c, ls[i].Type.Name) {
+			anyLeft = true
+		}
+		if !strings.EqualFold(c, rs[i].Type.Name) {
+			anyRight = true
+		}
+	}
+	if anyLeft {
+		left = setOpCastBranchTo(pos, left, common)
+	}
+	if anyRight {
+		right = setOpCastBranchTo(pos, right, common)
+	}
+	return left, right
+}
+
+// setOpBranchTypesDiffer is `!tlist_same_datatypes(member_tlist, colTypes)`
+// (`postgres/src/backend/optimizer/util/tlist.c:257`) for one link of the
+// chain, asked at the only moment it is still answerable: before
+// setOpUnifyBranches coerces both branches to their common type.
+//
+// Upstream compares each member's output types against the TOP-LEVEL
+// colTypes. Comparing the two branches of every link is equivalent for a
+// chain: colTypes is the first member's types, and if every adjacent pair
+// agrees then all members agree with the first — while a single
+// disagreeing pair is a member that differs from colTypes.
+//
+// A nested link that already answered false stays false, which is
+// is_simple_union_all_recurse's `&&` over larg and rarg.
+//
+// Differing column COUNTS also answer false (upstream's "tlist longer than
+// colTypes" / "tlist shorter" arms), though the caller rejects that case
+// earlier with 42601. Typmods and collations are deliberately NOT compared:
+// upstream's own comment is "currently no callers care about comparing
+// typmods".
+func setOpBranchTypesDiffer(left, right Node) bool {
+	if l, ok := left.(*SetOp); ok && l.TlistTypesDiffer {
+		return true
+	}
+	if r, ok := right.(*SetOp); ok && r.TlistTypesDiffer {
+		return true
+	}
+	ls, rs := left.Output(), right.Output()
+	if len(ls) != len(rs) {
+		return true
+	}
+	for i := range ls {
+		if !sameSetOpTypeName(ls[i].Type.Name, rs[i].Type.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameSetOpTypeName decides whether two type SPELLINGS denote the same type.
+//
+// Upstream compares `exprType()` — OIDs — where `decimal` and `numeric` are
+// one type (1700), as are `int` and `int4`. goopg carries the spelling the
+// statement used, so a raw name comparison reports a difference that does not
+// exist: measured on TPC-DS Q5, whose union mixes a table column with
+// `cast(0 as decimal(7,2))`, a name comparison refused a union PostgreSQL
+// flattens, and removed the Parallel Append shape M0145-0004 had landed.
+//
+// `catalog.ArgTypeDisplayAlias` is the existing single alias table (its own
+// doc argues for exactly one, "no second alias source to drift"): every
+// spelling of a base type folds to its SQL display name, so two names denote
+// the same type iff they fold alike. It is a DISPLAY mapping being used for
+// identity, which is sound in this direction — distinct types never share a
+// display name — but it is not an OID, so a genuinely OID-level question
+// (domains over the same base type) is outside what it can answer. That is a
+// conservative direction here: it can only report "same", i.e. keep a union
+// flattenable, never refuse one PG would allow.
+func sameSetOpTypeName(a, b string) bool {
+	return strings.EqualFold(catalog.ArgTypeDisplayAlias(a), catalog.ArgTypeDisplayAlias(b))
+}
+
+// setOpCastBranchTo projects one set-operation branch, casting each column whose
+// resolved common type differs from the branch's own. An empty entry in
+// `common` means the column was declined by setOpCommonTypeName and is passed
+// through untouched.
+func setOpCastBranchTo(pos int, branch Node, common []string) Node {
+	sch := branch.Output()
+	targets := make([]Expr, len(sch))
+	out := make(Schema, len(sch))
+	for i := range sch {
+		var e Expr = &ColumnRef{pos: pos, Index: i, Name: sch[i].Name,
+			Type: sch[i].Type, SourceTableIdx: sch[i].SourceTableIdx}
+		out[i] = sch[i]
+		if i < len(common) && common[i] != "" && !strings.EqualFold(common[i], sch[i].Type.Name) {
+			e = &CastExpr{pos: pos, Operand: e,
+				TargetType: common[i], SourceType: sch[i].Type.Name}
+			out[i] = SchemaColumn{Name: sch[i].Name,
+				Type:           catalog.Type{Name: common[i]},
+				SourceTableIdx: sch[i].SourceTableIdx,
+				Resjunk:        sch[i].Resjunk}
+		}
+		targets[i] = e
+	}
+	return &Project{pos: pos, Child: branch, Targets: targets, schema: out}
 }
 
 // wrapSetOpBranchWithCasts wraps the right branch of a UNION/INTERSECT/EXCEPT
@@ -922,6 +1171,14 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 	return inner == parser.SetOpIntersect && outer != parser.SetOpIntersect
 }
 
+// planSelectWithSettings plans one SELECT scope through the jointree-first
+// pipeline (M0145): WHERE sublinks pulled up into the jointree before the
+// join-order search, one search problem per scope, the post-hoc unnest for
+// what the pull-up declined. Every planning scope re-enters here —
+// subqueries, CTE bodies, set-op branches — matching the way PG's
+// subquery_planner recurses per Query. The legacy node-tree pipeline and
+// its GOOPG_JOINTREE_PIPELINE selection knob were deleted by M0145-0008's
+// legacy-deletion slices.
 func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
@@ -1106,6 +1363,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// necessarily the leftmost branch, so type unification and the
 		// column-count check are re-based on it rather than on a flat index.
 		// M0125-0016.
+		// unionFolds records, for each UNION result this fold built, its
+		// leaf branches and whether it was UNION ALL — the input to
+		// plan_union_children's fold rule below (M0141-S2b-4a).
+		type unionFoldRec struct {
+			leaves []Node
+			all    bool
+		}
+		unionFolds := map[Node]unionFoldRec{}
 		applySetOp := func(acc, right Node, i int) (Node, error) {
 			seg := segments[i]
 			// Each branch must project the same number of columns.
@@ -1120,6 +1385,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// nodes for columns where the left and right types differ. This ensures
 			// that string values like 'foo' are validated when the left branch
 			// declares a typed column (e.g. numeric). M0097-0056.
+			// select_common_type FIRST: resolve each column's common type
+			// across both branches and coerce BOTH to it, so the resolved type
+			// is what `SetOp.Output()` reports. Columns this declines fall
+			// through to the generic-string validation below, unchanged.
+			// tlist_same_datatypes (tlist.c:257), captured BEFORE the
+			// coercion below: upstream's is_simple_union_all_recurse
+			// (prepjointree.c:2258) compares each member's output types
+			// against the top-level colTypes and refuses to flatten when
+			// they differ. Once setOpUnifyBranches has run every branch
+			// agrees by construction, so this is the only point the
+			// question can still be asked. M0145-0004.
+			typesDiffer := setOpBranchTypesDiffer(acc, right)
+			acc, right = setOpUnifyBranches(seg.opPos, acc, right)
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
 			// C-18 (P4-09): the SETOP upper rel's path for this node —
 			// `createSetOpPaths` (windowsetoppaths.go) prices the two
@@ -1133,7 +1411,51 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// partition/inheritance fan-outs also build `*SetOp{All: true}`,
 			// but those are PG APPENDRELS below the upper-rel pipeline, not
 			// set operations — see windowsetoppaths.go's header.
-			return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll}, plannerSet, setOpTupleFraction)
+			if seg.opType != parser.SetOpUnion {
+				return createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: seg.opAll,
+					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+			}
+			// M0141-S2b-4a: `plan_union_children` (prepunion.c:1269). A child
+			// that is itself a UNION built by this fold is folded into the
+			// parent when its `all` equals the parent's or the child is ALL
+			// (a UNION ALL pulls up into a UNION: the distinct step removes
+			// its duplicates anyway). A branch the type unification above
+			// rewrapped is a new node, absent from the map, so it stays one
+			// leaf — upstream's colTypes-equality condition.
+			leavesOf := func(n Node) []Node {
+				if r, ok := unionFolds[n]; ok && (r.all == seg.opAll || r.all) {
+					return r.leaves
+				}
+				return []Node{n}
+			}
+			leaves := append(append([]Node(nil), leavesOf(acc)...), leavesOf(right)...)
+			if seg.opAll {
+				out, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: true,
+					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+				if err == nil {
+					unionFolds[out] = unionFoldRec{leaves: leaves, all: true}
+				}
+				return out, err
+			}
+			// UNION (distinct): one distinct step over a left-deep UNION ALL
+			// chain of every folded leaf. The chain renders as one n-ary
+			// Append; createUnionDistinctPaths elects hashed vs Sort -> Unique
+			// over it, as generate_union_paths does.
+			chain := leaves[0]
+			for _, b := range leaves[1:] {
+				next, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
+					TlistTypesDiffer: typesDiffer, UnionDistinctInput: true}, plannerSet, setOpTupleFraction)
+				if err != nil {
+					return nil, err
+				}
+				chain = next
+			}
+			out, err := createUnionDistinctPaths(upper, &Distinct{pos: s.Pos(), Child: chain, schema: chain.Output()},
+				leaves, plannerSet, setOpTupleFraction)
+			if err == nil {
+				unionFolds[out] = unionFoldRec{leaves: leaves, all: false}
+			}
+			return out, err
 		}
 		// foldSetOpRange folds segments[lo:hi) onto acc, honouring PostgreSQL's
 		// set-operator precedence: INTERSECT binds tighter than UNION/EXCEPT
@@ -1234,13 +1556,26 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
+	// M0145-0004: a UNION ALL appendrel's member scope carries
+	// `plannerSet.appendrelMember` — it lifts the isSimpleSingle bypass
+	// here so the member plans through the join search and its searched
+	// rel carries a PartialPathlist the SETOP rel's partial arms can pick
+	// from (jointreeappendrel.go). Read once, then cleared: the lift is
+	// bounded to THIS scope — the member's own nested subqueries plan
+	// under a cleared flag, exactly as they did before. The setop fold
+	// above returns before this point for the union scope itself, so the
+	// flag reaches member scopes intact.
+	appendrelMember := plannerSet.appendrelMember
+	plannerSet.appendrelMember = false
+
+	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): the
+	// one-relation scope is a searched problem like any other —
+	// `make_one_rel` runs `set_base_rel_pathlists` (allpaths.c:221)
+	// unconditionally before looking at the joinlist, so a single-FROM-item
+	// statement routes through planFromClause and the join search. (The
+	// legacy rule-based single-table bypass was deleted in M0145-0008.)
 	var node Node
 	var ctx *resolveContext
-	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
-	// (set below in the isSimpleSingle branch); planIndexScanFromWhere uses
-	// it to decide whether an IndexScan may safely skip accessible
-	// inheritance children (root-0026 SELECT-side twin, M0119-0004).
-	var fromOnly bool
 
 	if len(s.ValuesRows) > 0 && len(s.From) == 0 && len(s.Targets) == 0 {
 		// Standalone VALUES statement: VALUES (r1), (r2), ...
@@ -1258,37 +1593,6 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			Rows:   [][]Expr{{}},
 			schema: nil,
 		}
-	} else if isSimpleSingle && !oneRelSearchEnabled() {
-		rv := s.From[0]
-		fromOnly = rv.Only
-		// Delegate the simple-single-table case to
-		// planScanRangeVar so view substitution / virtual-rows
-		// dispatch live in one place. SourceTableIdx 1 — only
-		// one binding ever in this branch (0 is the
-		// "unknown / derived" sentinel). The statement scope stamps
-		// the scan's RTID (A-01(ii) cut 1).
-		nrv, b, err := planScanRangeVar(rv, cat, 1, nil, plannerSet, scope)
-		if err != nil {
-			return nil, err
-		}
-		node = nrv
-		schema := tableSchemaWithSource(b.table, b.sourceIdx)
-		// View substitution may have rewritten the schema to
-		// merge the view's column names with the inner plan's
-		// types — preserve it.
-		if b.table.View != nil {
-			schema = make(Schema, len(b.table.Columns))
-			innerOut := node.Output()
-			for i, c := range b.table.Columns {
-				ty := c.Type
-				if i < len(innerOut) {
-					ty = innerOut[i].Type
-				}
-				schema[i] = SchemaColumn{Name: c.Name, Type: ty, SourceTableIdx: b.sourceIdx}
-			}
-		}
-		ctx = newResolveContext([]rangeBinding{b}, schema, plannerSet)
-		ctx.upper = upper
 	} else {
 		// Cost-based join-order reordering: when every comma-FROM
 		// take2 P3-12: the pre-search greedy FROM-list permutation
@@ -1303,6 +1607,16 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
+		}
+		// M0145-0004: an appendrel member's ctx carries the flag to the
+		// seam, where it lowers the one-relation floor so a single-leaf
+		// member (`SELECT … FROM t`) still gets a searched rel — the
+		// PartialPathlist carrier the parent's SETOP rel picks from.
+		// Bounded to this scope: plannerSet.appendrelMember was already
+		// cleared above, so the member's own nested subqueries do not
+		// inherit it.
+		if appendrelMember && ctx != nil {
+			ctx.appendrelMember = true
 		}
 	}
 	// Make the catalog reachable from every resolveExpr call in
@@ -1349,10 +1663,6 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 	}
 
-	// preDPUnnested marks that the S5a pre-DP path already ran the
-	// sublink pull-up, so the legacy post-pushdown call site must not
-	// run it a second time.
-	preDPUnnested := false
 	if s.Where != nil {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
 		// Exception: correlated outer-scope aggregates (all column refs reference
@@ -1373,135 +1683,237 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the full statement of why. `s` itself is NOT mutated: the parse tree
 		// is shared with the view/rule deparsers, which must keep rendering
 		// the query as written.
-		whereQual := canonicalizeQual(s.Where)
-		// E-21 Cut 1b: under GOOPG_ONEREL_SEARCH a single-table statement
-		// is planned by the search, not by the rule-based chooser below —
-		// replacing that chooser with `add_path` for every single-table
-		// statement is what closes the row. The generic arm builds
-		// Filter{scan} and runs the full machinery (unnest, tryJoinSearch,
-		// pathkeys derivation); the seam admits one-relation problems at
-		// `minSearchRels()` (Cut 1) and the one-relation protocol picks
-		// the access method on cost. What the rule chooser did that the
-		// generic arm does not (LIKE-range injection, NOT NULL reduction)
-		// is a missed optimisation in the ON arm, never a wrong answer:
-		// both are value-preserving rewrites. Default OFF: the condition
-		// below is the historical branch, byte for byte.
-		if isSimpleSingle && !oneRelSearchEnabled() {
-			// M0051-0004: inject synthetic range predicates alongside any
-			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
-			whereForIndex := injectLikeRangePredicates(whereQual)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
+		//
+		// R40/K69: same discipline, same reason — a demotedForPlan LEFT->
+		// ANTI transplant (planFromClause, reduce_outer_joins.go) needs the
+		// specific WHERE conjunct that forced it stripped before the qual
+		// reaches resolveExpr, since the ANTI join's Output() no longer
+		// carries that table's columns (plan.go's Semi/Anti special case).
+		// PG drops the identical conjunct for the identical reason
+		// (prepjointree.c: "must be removed to prevent bogus selectivity
+		// calculations"). `whereClause` is a local rewrite; `s.Where` is
+		// untouched, same as `whereQual` below.
+		whereClause := s.Where
+		if len(ctx.antiForcedNullCols) > 0 {
+			whereClause = stripForcingNullQuals(s.Where, ctx.antiForcedNullCols, buildTableMap(s.FromExprs, cat), cat)
+		}
+		whereQual := canonicalizeQual(whereClause)
+		// R40/K69: whereQual can be nil here when a demotedForPlan
+		// ANTI transplant's forcing conjunct was the ENTIRE WHERE
+		// clause (stripForcingNullQuals above) — mirror the
+		// single-relation arm's `rewritten == nil` convention
+		// (restriction_is_always_true) rather than calling resolveExpr
+		// on a nil Expr, which its own type switch does not special-
+		// case and would reach a default/error arm.
+		var pred Expr
+		if whereQual != nil {
+			var err error
+			pred, err = resolveExpr(whereQual, ctx)
+			if err != nil {
 				return nil, err
-			} else if ok {
-				node = idxNode
-			} else {
-				pred, err := resolveExpr(whereQual, ctx)
-				if err != nil {
-					return nil, err
-				}
-				// M0134-0010 §4: NOT NULL-driven reduction of IS [NOT] NULL
-				// restriction quals (initsplan.c add_base_clause_to_rel /
-				// restriction_is_always_true / restriction_is_always_false),
-				// single-baserel only — this branch IS that gate. See
-				// docs/design/m0134-0010-notnull-qual-reduction.md and
-				// notnull_qual_reduce.go.
-				var reduceTbl *catalog.Table
-				var reduceSrcIdx int
-				if len(ctx.bindings) == 1 {
-					reduceTbl = ctx.bindings[0].table
-					reduceSrcIdx = int(ctx.bindings[0].sourceIdx)
-				}
-				rewritten, alwaysFalse := reduceNotNullQuals(pred, reduceTbl, reduceSrcIdx)
+			}
+			// R44/K83 step A: see the sibling call in the single-relation
+			// arm above.
+			if pred, err = foldQualConstants(pred); err != nil {
+				return nil, err
+			}
+			// M0145-0005: the NOT NULL-driven reduction PG applies to
+			// every single-baserel restriction clause
+			// (`restriction_is_always_true` / `restriction_is_always_false`,
+			// initsplan.c's `add_base_clause_to_rel`). Slice 4 routed
+			// single-table+WHERE scopes through THIS arm, so the reduction
+			// lives here: without it `WHERE not_null_col IS NULL` plans as
+			// a real scan under a Filter instead of PG's childless
+			// `Result / One-Time Filter: false`. Single-binding scopes
+			// only; widening it to multi-relation scopes is a separate,
+			// corpus-visible change — ledgered, not smuggled in.
+			reduced := false
+			if len(ctx.bindings) == 1 {
+				rewritten, alwaysFalse := reduceNotNullQuals(pred,
+					ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))
 				switch {
 				case alwaysFalse:
-					// restriction_is_always_false: replace the scan with a
-					// CHILDLESS Result{OneTimeFilter: false} — PG's plan is
-					// `Result / One-Time Filter: false` with NO scan
-					// underneath at all (predicate.out lines 34-40/75-81: 2
-					// rows total, no `->` line). The now-unreachable scan
-					// must not be attached as Child (round 2: it was
-					// wrongly kept, producing a dangling `-> Seq Scan` line
-					// PG never emits). resultOp.Open evaluates OneTimeFilter
-					// against a nil slot and short-circuits to EOF BEFORE
-					// ever touching Child (operators.go Open/Next/Close all
-					// gate on qualFailed first) — the same childless shape
-					// already used by the S6 min/max top-node Result, so a
-					// nil Child here is a pre-existing, exercised path, not
-					// a new one. Targets stay a pass-through identity
-					// projection so Output()/row description still reports
-					// the scan's original column shape for `SELECT *`; they
-					// are never evaluated at runtime since qualFailed always
-					// short-circuits first.
+					// The childless Result the chooser arm builds, for
+					// the reason stated there: PG emits no scan under a
+					// false One-Time Filter.
 					scanSchema := node.Output()
 					node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
 						OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
 						Child:         nil, schema: scanSchema}
+					reduced = true
 				case rewritten == nil:
-					// restriction_is_always_true for every conjunct: bare
-					// scan, no Filter node at all.
+					// Every conjunct was always-true: the bare scan, no
+					// Filter node at all.
+					reduced = true
 				default:
-					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: rewritten}
+					pred = rewritten
 				}
 			}
-		} else {
-			pred, err := resolveExpr(whereQual, ctx)
-			if err != nil {
-				return nil, err
+			if reduced {
+				// Downstream reads `whereQual != nil` as "there is a
+				// Filter to search under" — the pre-DP arm asserts
+				// `node.(*Filter)` on that basis. A reduced scope has no
+				// Filter and nothing left to search, so the clause is
+				// spent here.
+				whereQual = nil
+			} else {
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-			// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
-			// inside the WHERE arm, until C-17 (P4-08) moved it to the
-			// convergent stamping block above — same call, same value, but
-			// reached by every FROM arm rather than only the two that run the
-			// join search. See the comment there.
-			// C-07: `standard_qp_callback` runs here for the same reason
-			// `preprocess_limit` does — before `query_planner` builds a rel.
-			ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
-			ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
-			ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
-			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
-				// S5a (D3.1): pull up sublinks BEFORE join-order
-				// search — matching upstream's pull_up_sublinks-
-				// before-join-planning order — then run the join
-				// search on the subtree below the pinned semi/anti
-				// spine. Engaged only for EXISTS/IN-family WHERE
-				// sublinks; see predp.go for the scope rationale
-				// and the post-search spine re-resolution.
-				f := node.(*Filter)
-				origChain := f.Child
-				node = unnestSubqueriesInPlan(node)
-				node = runJoinSearchBelowPinned(node, origChain, ctx, cat)
-				preDPUnnested = true
-			} else if f, ok := node.(*Filter); ok {
-				// Legacy order (GOOPG_UNNEST_PREDP=off, or a scalar-
-				// family sublink in the WHERE): run the join-order
-				// search over the left-deep CROSS chain. Until
-				// M0127-P6.3 this door led to the subset-bitmask bushy
-				// DP (bushy.go, deleted); it now leads to the PG-shaped
-				// search alone. See internal/planner/joinsearchseam.go.
-				if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
-					node = newChild // all conjuncts consumed → remove Filter
-				} else if newChild != f.Child {
-					f.Child = newChild
-					f.Predicate = newPred
-					node = pushPredicatesIntoCrossJoins(node)
-				} else {
-					// Comma-FROM produces a left-deep CROSS-join chain.
-					// Push WHERE-side equalities into the deepest Join
-					// whose schema spans both sides so the planner can
-					// pick hash join instead of running a Cartesian
-					// product through Filter. See
-					// internal/planner/pushdown.go.
-					node = pushPredicatesIntoCrossJoins(node)
-				}
-			}
-			// Push outer-only quals below a LATERAL join onto its outer
-			// child so a side-effecting lateral RHS (e.g. verify_heapam)
-			// is only opened for outer rows that pass the restriction.
-			// See pushOuterQualsIntoLaterals in pushdown.go.
-			node = pushOuterQualsIntoLaterals(node)
 		}
-	} else if joinTreeHasOuterLink(node) {
+		// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
+		// inside the WHERE arm, until C-17 (P4-08) moved it to the
+		// convergent stamping block above — same call, same value, but
+		// reached by every FROM arm rather than only the two that run the
+		// join search. See the comment there.
+		// C-07: `standard_qp_callback` runs here for the same reason
+		// `preprocess_limit` does — before `query_planner` builds a rel.
+		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
+		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
+		// PG's pull_up_sublinks position, before join-order search —
+		// into leaf entries + SpecialJoinInfo on ctx.jtPullup, which
+		// tryJoinSearch folds into the one search problem
+		// (jointreepullup.go). The predicate itself is NOT rewritten: a
+		// pulled sublink keeps its planned body, so a declined search
+		// falls back to the syntactic shape, and the post-hoc unnest
+		// below pins the spine AFTER the search. (The legacy S5a pre-DP
+		// arm — search below a pinned spine, then again above it — was
+		// deleted with the legacy pipeline, M0145-0008.)
+		if f, okf := node.(*Filter); okf {
+			ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
+			if ctx.jtPullup != nil {
+				// M0145-0007 slice 3 census (nlicensus.go).
+				noteSublinkRoute(spineRouteJointree)
+			} else if countSublinksInExpr(f.Predicate) > 0 {
+				// M0145-0005 slice 7: pull-up declined every
+				// sublink-bearing conjunct, so the statement falls
+				// through to the single-pass search and the
+				// post-hoc unnest builds the pinned spine above it.
+				noteSublinkRoute(spineRoutePosthoc)
+			}
+		}
+		// R40/K69: a fully-stripped WHERE (stripForcingNullQuals elided
+		// the entire clause) leaves `node` as the bare join tree, never
+		// a Filter — the `whereQual == nil` arm below.
+		if f, ok := node.(*Filter); ok {
+			// Run the join-order search over the left-deep CROSS
+			// chain. Until M0127-P6.3 this door led to the
+			// subset-bitmask bushy DP (bushy.go, deleted); it now
+			// leads to the PG-shaped search alone. See
+			// joinsearchseam.go.
+			if newChild, newPred := tryJoinSearch(f.Child, f.Predicate, ctx, cat); newPred == nil {
+				node = newChild // all conjuncts consumed → remove Filter
+			} else if newChild != f.Child {
+				f.Child = newChild
+				f.Predicate = newPred
+				node = pushPredicatesIntoCrossJoins(node)
+			} else {
+				// Comma-FROM produces a left-deep CROSS-join chain.
+				// Push WHERE-side equalities into the deepest Join
+				// whose schema spans both sides so the planner can
+				// pick hash join instead of running a Cartesian
+				// product through Filter. See
+				// internal/planner/pushdown.go.
+				node = pushPredicatesIntoCrossJoins(node)
+			}
+		} else if whereQual == nil {
+			// R40/K69: the WHERE clause existed (`s.Where != nil`) but
+			// was entirely the forcing IS NULL conjunct(s)
+			// `stripForcingNullQuals` elided — `node` is the bare join
+			// tree, not a `*Filter`, so neither arm above runs. The
+			// join-order search must still run so an ANTI-demoted item
+			// gets a cost-based join order rather than the untouched
+			// left-deep CROSS chain (K27's eligibility axis) — mirrors
+			// the WHERE-less `joinTreeHasOuterLink` arm below exactly
+			// (nil predicate, same `tryJoinSearch` call).
+			if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
+				node = newChild
+			} else if newChild != node {
+				node = &Filter{pos: node.Pos(), Child: newChild, Predicate: newPred}
+			}
+		}
+		// Push outer-only quals below a LATERAL join onto its outer
+		// child so a side-effecting lateral RHS (e.g. verify_heapam)
+		// is only opened for outer rows that pass the restriction.
+		// See pushOuterQualsIntoLaterals in pushdown.go.
+		node = pushOuterQualsIntoLaterals(node)
+
+		// M0145-0008: restore the one-relation index producer on the
+		// routes that SKIP the rule-based bypass above.
+		//
+		// The legacy rule-based bypass (deleted with the legacy
+		// pipeline, M0145-0008) was the ONLY producer of an index path
+		// driven by a correlated (outer-reference) restriction. Every
+		// single-relation scope now plans through this generic arm —
+		// PG-faithfully, since `make_one_rel` runs
+		// `set_base_rel_pathlists` unconditionally — but the search's
+		// base-rel pathlist has no such producer, so the scope comes
+		// out as a bare `Filter{SeqScan}`.
+		//
+		// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
+		// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
+		// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
+		// on both of those routes and `Aggregate(BitmapHeapScan(
+		// BitmapIndexScan))` on the bypass. That is not a cosmetic
+		// difference — `canUnnestSubquery`'s S6/D6.2 guard
+		// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
+		// decide whether decorrelating it is a loss, so a body that
+		// never got its probe reads as "not cheap" and is decorrelated
+		// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
+		// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
+		// on the DEFAULT arm — the defect is route-borne, not
+		// arm-borne).
+		//
+		// The rule is strictly NARROWER than the bypass it restores:
+		// it fires only when the search elected NO index path at all,
+		// so it can never displace a costed index choice — it only
+		// fills the hole where this route produces none.
+		if isSimpleSingle && whereQual != nil && planIsBareSeqScanTree(node) {
+			onlyFrom := len(s.From) == 1 && s.From[0].Only
+			whereForIndex := injectLikeRangePredicates(whereQual)
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+				return nil, err
+			} else if ok {
+				node = idxNode
+			} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
+				// M0145-0027: the producer above only reads a WHERE that
+				// is ONE equality (Q17's body). A multi-conjunct WHERE
+				// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
+				// ps_suppkey AND l_shipdate …`) is declined there on
+				// every route; the bypass arm gets its correlated probe
+				// from the SECOND producer instead —
+				// `rewriteScanInputsWithSingleTablePredicates` below,
+				// which absorbs the equality out of `Filter{SeqScan}`.
+				// On this route that producer is shut out: the search
+				// took the constant quals into a SEARCHED leaf
+				// `Filter{SeqScan}` (a searched subtree keeps its own
+				// leaves, P5.9-b) and left the correlated conjuncts —
+				// which `conjunctIsLocalEligible` refuses as leaf quals —
+				// in a residual Filter above it. Flattening the two into
+				// the one unsearched `Filter{SeqScan}` the bypass would
+				// have built hands the tree to that producer unchanged.
+				// Same contract as the rule above: it fires only on a
+				// bare seq-scan tree (the search elected no index) and
+				// only when a correlated conjunct is stranded above it.
+				node = flat
+			}
+		}
+	} else {
+		// M0145-0005 slice 4, unconditional since the M0145-0008 legacy
+		// deletion: every filterless scope reaches the seam. A WHERE-less
+		// single-table statement (`SELECT … FROM t`) is the one-relation
+		// search the floor admits, and a filterless inner join is searched
+		// whole. A declined seam still returns the tree untouched.
+		// M0145-0004: a UNION ALL appendrel's
+		// member scope plans through the join search even when the
+		// member has no WHERE and no outer link (a bare `SELECT … FROM t`
+		// member, the benchmark corpus's dominant shape). PG gives every
+		// appendrel member its own rel with a full pathlist — the
+		// partial_pathlist the parent's add_paths_to_append_rel picks
+		// from; the searchedTree stamp is what carries that rel out to
+		// setOpBranchRelOf.
+		//
 		// M0134-0188: a FROM tree with no WHERE at all. No *Filter wrapper
 		// exists, so the seam chain above — which lives entirely inside the
 		// `s.Where != nil` branch — never ran for such a statement, and its
@@ -1510,11 +1922,6 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// customer scan can only become PG's covering `Index Only Scan
 		// using customer_pk` through the search's base-rel path generation.
 		//
-		// Gated on an OUTER link being present: a filterless INNER/CROSS
-		// tree is left on the legacy path for now — the outer-spine shape is
-		// the one whose LEFT side has NO other route to cost-based access
-		// selection, while widening to every filterless join tree moves many
-		// long-stable plans at once and deserves its own gated round.
 		// The search is invoked with a nil predicate (an empty conjunct
 		// list); a declined search returns the tree untouched, and a residual
 		// can only arise from unconsumed ON quals, which the Filter below
@@ -1533,15 +1940,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 	}
 
-	// Unnest correlated subqueries. With the S5a pre-DP position
-	// engaged the pull-up already ran before join search above; this
-	// legacy call site covers everything else (single-table paths,
-	// scalar-family statements, GOOPG_UNNEST_PREDP=off). Subqueries
-	// that are unnestable are rewritten to semi/anti joins or GROUP BY
-	// aggregate + hash join. See internal/planner/unnest.go.
-	if !preDPUnnested {
-		node = unnestSubqueriesInPlan(node)
-	}
+	// Unnest correlated subqueries the jointree pull-up did not take
+	// (declined sublinks, scalar-family sublinks): unnestable ones are
+	// rewritten to semi/anti joins or GROUP BY aggregate + hash join
+	// AFTER the join search. See unnest.go.
+	node = unnestSubqueriesInPlan(node)
 
 	// The MultiHashJoin packing pass (`rewriteMultiWayChain`, guarded by
 	// `mhjPackingEnabled`) ran here until M0127-P6.2 deleted it (08 §4). PG has
@@ -1554,7 +1957,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// Closes the M0054-0003d Q8 case
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
-	node = rewriteScanInputsWithSingleTablePredicates(node, cat)
+	node = rewriteScanInputsWithSingleTablePredicates(node, cat, plannerSet)
 	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
 	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
 	// the equi-join predicate matches a single-column B-tree index
@@ -1562,6 +1965,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// no-op when the package-level kill-switch is off
 	// (`SetNLIEnabled(false)`).
 	node = rewriteJoinsToNLI(node, cat, plannerSet)
+	// R77: price the rewrite-built SEMI/ANTI NLIs BEFORE the upper
+	// elections (aggregate stage, ORDER BY arm) read their seeds —
+	// otherwise the elections stamp winners priced on the seam base
+	// while EXPLAIN-time derivation reprices the rest (mixed
+	// old/new in one plan). Idempotent with the end-of-pipeline
+	// call below (carrier-set nodes are skipped), which additionally
+	// catches nodes rebuilt by later passes.
+	stampSemiProbePrices(node, cat, plannerSet.costParams())
 	// `remapColumnRefsAfterRewrite(node)` ran here until C-20b (take3 08
 	// §9.2): a tree walk that had mutated nothing since M0127-P6.2 deleted
 	// the MHJ posmap it was built around. joinlayout.go carries the proof.
@@ -1588,6 +1999,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// C-02c: the pass may splice out Filters whose every conjunct moved
 	// below, so it returns the replacement tree.
 	node = pushSingleSideQualsIntoInnerJoinInputs(node)
+	// M0145-0008o: PG's gating plan for pseudoconstant WHERE quals — an
+	// uncorrelated sublink conjunct becomes a Result's One-Time Filter above
+	// the scope's FROM tree instead of a per-row Filter (create_gating_plan).
+	node = gatePseudoconstantQuals(node, cat)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer
@@ -1788,7 +2203,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
-		node, ctx, win, err = buildWindowStage(s, node, ctx, agg, upper, plannerSet, orderTupleFraction)
+		node, ctx, win, err = buildWindowStage(s, node, ctx, agg, upper, plannerSet, orderTupleFraction, ps)
 		if err != nil {
 			return nil, err
 		}
@@ -1854,6 +2269,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
+		// M0141-S2a-fix1-sweep-a: derive the ORDERED rel's narrow cost-input
+		// keep-set (sort keys ∪ the statement's own final SELECT-list
+		// output columns) before costing, the plain top-level ORDER BY arm
+		// only (ordered_input_narrow.go). Declines to nil (today's
+		// full-width sizing) whenever a ProjectSet of either kind is
+		// pending — its expanded schema is not this function's to name.
+		var orderedNarrowKeep []int
+		if selectSrfPending == nil {
+			if aboveNames, ok := finalSelectOutputNames(s, ctx, agg, win, ps, false); ok {
+				if keep, ok2 := deriveOrderedSortInputKeep(keys, aboveNames, ok, node); ok2 {
+					orderedNarrowKeep = keep
+				}
+			}
+		}
 		// C-12 (P4-03): the ORDER BY Sort is the ORDERED upper rel's path
 		// now — `create_ordered_paths` over the finished child, priced by
 		// `cost_sort` through `addPath` (upperordered.go) — and no longer
@@ -1863,7 +2292,22 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// function-local `upper` rather than `ctx.upper`: the aggregate and
 		// window stages hand back contexts of their own, and the rel must
 		// be this scope's whichever context is current.
-		node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples)
+		// R47 slice 2 (K101): before stacking the Sort, let the ORDERED
+		// rel adjudicate the GROUP_AGG survivors — a sorted candidate
+		// whose emission order already delivers the ORDER BY needs no
+		// Sort (PG's `create_ordered_paths` over ALL input paths).
+		// Normal arm only: SRF pre/post-sort shapes are excluded, and
+		// any decline runs the call below on the pristine rel.
+		var loopBuilt Node
+		loopElected := false
+		if selectSrfPending == nil {
+			loopBuilt, loopElected = electOrderedGrouping(upper, agg, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples, orderedNarrowKeep)
+		}
+		if loopElected {
+			node = loopBuilt
+		} else {
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples, orderedNarrowKeep)
+		}
 		if srt, ok := node.(*Sort); ok {
 			// B-01c Slice 1: keys-only construction stamp (above not yet
 			// built); the above-aware re-stamp happens before return.
@@ -1920,7 +2364,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// planner.c:1856) — the Sort sits above the ProjectSet
 			// expansion, so the pre-expansion count is not a bound on its
 			// input; the fraction itself is the statement's, captured above.
-			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, -1)
+			// M0141-S2a-fix1-sweep-a: the SRF post-sort Sort already runs
+			// directly over the ProjectSet's own output — nothing wider
+			// sits between them to narrow away — so this arm passes no
+			// keep (full-width, unchanged by the sweep).
+			node = createOrderedPaths(upper, node, keys, s.Pos(), plannerSet.costParams(), orderTupleFraction, -1, nil)
 			if srt, ok := node.(*Sort); ok {
 				// B-01c Slice 1: SRF post-sort arm — same keys-only stamp as the normal arm.
 				orderSort = srt
@@ -1928,6 +2376,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			}
 		}
 	}
+	var deferredLim, deferredOff Expr
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
 		// WITH TIES without ORDER BY is an error (matches PostgreSQL).
 		if s.WithTies && len(s.OrderBy) == 0 {
@@ -1963,8 +2412,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				tiesKeys = append(tiesKeys, k.Expr)
 			}
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
-			WithTies: s.WithTies, TiesKeys: tiesKeys}
+		if s.Distinct && len(s.DistinctOn) == 0 && !s.WithTies && selectSrfPending == nil && ps == nil && limitBoundMovable(lim) && limitBoundMovable(off) {
+			// R83: LIMIT applies above DISTINCT (PG) — a Limit below
+			// Unique truncates pre-distinct rows (wrong whenever
+			// duplicates exceed the limit). Defer the wrap past the
+			// DISTINCT stage below (applied after the M0097-0046 outer
+			// Sort, so LIMIT sits at the root as in PG). Anything
+			// scope-sensitive (WITH TIES keys, DISTINCT ON, SRF
+			// expansion, non-constant bounds) keeps today's order:
+			// the decline is fail-closed.
+			deferredLim, deferredOff = lim, off
+		} else {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+				WithTies: s.WithTies, TiesKeys: tiesKeys}
+		}
 	}
 
 	var (
@@ -2089,26 +2550,32 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			return nil, lerr
 		}
 		// M0129-S6 resjunk-ctid column-path re-enable: wire ctid columns
-		// into leaf scan schemas, then recompute intermediate-node schemas
-		// (Join, NestedLoopIndexJoin) so the ctid columns propagate through
-		// the join tree. recomputeIntermediateSchemas also fixes the
-		// ColumnRef indices in the top Project from scan-local to absolute
-		// positions. The slot side-channel (MaterializedSlot.hasCTID) remains
-		// as belt-and-braces for plan shapes the column path cannot cover
-		// (CTE scans, VALUES). M0129-0003 §2.
-		// M-NIGHTLY AI-007: ctid column injection breaks the hash join for
-		// self-joins because recomputeIntermediateSchemas rebuilds the join
-		// schema but the hash key expressions still use pre-injection indices.
-		// Skip injection when a locked table appears in multiple FROM items
-		// (same OID referenced more than once). The scan fallback path
-		// (findScanLeafForRel → o.scan.currentTID()) handles TID correctly
-		// in these cases.
-		numCtid := 0
-		if !hasSelfJoinLockedTable(locks, s) {
-			numCtid = wireRowMarkCtidColumns(out, locks)
-		}
+		// into leaf scan schemas, then rebase the whole plan's expression
+		// coordinates (rebaseRowMarkPlan — the goopg analogue of PG's
+		// setrefs.c Var remap — covers join predicates, hash/merge keys,
+		// filter/sort/agg keys, etc., not just the top Project). The slot
+		// side-channel (MaterializedSlot.hasCTID) remains as belt-and-braces
+		// for plan shapes the column path cannot cover (CTE scans, VALUES).
+		// M0129-0003 §2.
+		// M0143-0009: the AI-007 self-join guard is retired — the rebase
+		// repairs every expression coordinate after injection, so
+		// self-joins take the real ctid path like any other shape.
+		numCtid, oldW := wireRowMarkCtidColumns(out, locks)
 		if numCtid > 0 {
-			recomputeIntermediateSchemas(out)
+			rebaseRowMarkPlan(out, oldW)
+			resolveRowMarkCtidResnos(out, locks)
+			// NumCtidCols must count only ctids that actually surfaced into
+			// the LockRows child's output row — a leaf injection that could
+			// not thread up (schema-pinning ancestor it can't cross) occupies
+			// no position there, and counting it would make the Output()
+			// trailing-strip fallback drop a real user column.
+			// AI-20260920-005626-006.
+			numCtid = 0
+			for i := range locks {
+				if locks[i].CtidResno >= 0 {
+					numCtid++
+				}
+			}
 		}
 		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
 		// after the LIMIT count of *successfully-locked* rows (PG plans
@@ -2234,28 +2701,16 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// DistinctOn (defense-in-depth: both parsers leave Distinct=false for
 	// DISTINCT ON today, but the ast.go contract claims otherwise).
 	if s.Distinct && len(s.DistinctOn) == 0 {
-		spec := &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
-		// The registry is this scope's function-local `upper` (C-11), as
-		// the ORDER BY and aggregate sites read it.
-		dnode, derr := createDistinctPaths(upper, spec, cat, plannerSet, orderTupleFraction)
-		if derr != nil {
-			return nil, derr
-		}
-		out = dnode
-		// The distinctOp sorts rows internally in ascending order.  When the
-		// query has ORDER BY, that inner sort loses the requested direction.
-		// Re-apply ORDER BY on top of Distinct by resolving each ORDER BY key
-		// against the Distinct output schema (schema-only, no bindings, so
-		// only unqualified column-name references work — which is fine since
-		// ORDER BY in a DISTINCT query must reference projected columns).
-		// M0097-0046.
+		// The ORDER BY keys are resolved against the DISTINCT output first
+		// (DISTINCT keeps its input's schema, so out.Output() is it).
+		var outerKeys []SortKey
 		if len(s.OrderBy) > 0 {
 			distinctOut := out.Output()
 			outerCtx := newResolveContext(nil, distinctOut, plannerSet)
 			outerCtx.cat = cat
 			// A-01(ii) cut 2: rebuilt contexts keep the statement scope.
 			outerCtx.rtScope = scope
-			outerKeys := make([]SortKey, 0, len(s.OrderBy))
+			outerKeys = make([]SortKey, 0, len(s.OrderBy))
 			for _, sb := range s.OrderBy {
 				var e Expr
 				// `ORDER BY <n>` is a 1-based reference into the DISTINCT
@@ -2303,10 +2758,46 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				}
 				outerKeys = append(outerKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 			}
-			if len(outerKeys) > 0 {
+		}
+		// M0141-S2b-4d: PG plans DISTINCT over the unsorted input
+		// (create_distinct_paths) and applies ORDER BY afterwards
+		// (create_ordered_paths), with the distinct clause ordered by the
+		// ORDER BY (transformDistinctClause). goopg's ORDER BY stage has
+		// already stacked its Sort below the DISTINCT; when every ORDER BY
+		// key resolved against the DISTINCT output, that Sort is taken out
+		// again, and the unique candidate sorts on the distinct clause
+		// instead, so its output delivers the ORDER BY without a second Sort.
+		child := out
+		var clauseKeys []SortKey
+		if len(outerKeys) > 0 && selectSrfPending == nil {
+			if spliced, ok := spliceOrderSortBelowDistinct(out, orderSort); ok {
+				child = spliced
+			}
+			clauseKeys = distinctClauseKeys(outerKeys, child.Output())
+		}
+		spec := &Distinct{pos: s.Pos(), Child: child, schema: child.Output(), SortKeys: clauseKeys}
+		// The registry is this scope's function-local `upper` (C-11), as
+		// the ORDER BY and aggregate sites read it.
+		dnode, derr := createDistinctPaths(upper, spec, cat, plannerSet, orderTupleFraction)
+		if derr != nil {
+			return nil, derr
+		}
+		out = dnode
+		if len(outerKeys) > 0 {
+			// M0141-S2b-1: let the ORDERED rel adjudicate BOTH
+			// `addDistinctPaths` candidates (hashed, unique-over-sorted)
+			// against outerKeys before falling back to the legacy
+			// single-node `distinctOutputSatisfiesOrder` check + always-Sort.
+			if built, ok := electOrderedDistinct(upper, spec, outerKeys, s.Pos(), plannerSet.costParams(), orderTupleFraction, orderLimitTuples); ok {
+				out = built
+			} else if !distinctOutputSatisfiesOrder(out, outerKeys) {
 				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
 			}
 		}
+	}
+	// R83: deferred LIMIT above DISTINCT (see the LIMIT stage above).
+	if deferredLim != nil || deferredOff != nil {
+		out = &Limit{pos: s.Pos(), Child: out, Limit: deferredLim, Offset: deferredOff}
 	}
 	// B-01c Slice 1: finalized above-aware re-stamp of the ORDER BY Sort
 	// (keys-only at construction, keys ∪ above now). Overwrite-only,
@@ -2315,6 +2806,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	if orderSort != nil {
 		stampSortInputTarget(orderSort, out)
 	}
+	// R77: stamp arm-priced costs onto legacy-built SEMI/ANTI NLI nodes
+	// (nlipricesplice.go). Final-tree post-pass — idempotent, fail-closed.
+	stampSemiProbePrices(out, cat, plannerSet.costParams())
 	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }
 
@@ -2479,110 +2973,84 @@ func findBindingByName(bindings []rangeBinding, name string) (rangeBinding, bool
 	return rangeBinding{}, false
 }
 
-
-// hasSelfJoinLockedTable reports whether ctid injection should be skipped
-// because a locked table appears in a self-join (same table name in multiple
-// FROM items). Ctid column injection breaks the hash join schema when a table
-// appears on both sides, because recomputeIntermediateSchemas does not update
-// hash key expressions. The scan fallback path (findScanLeafForRel →
-// o.scan.currentTID()) handles TID correctly. M-NIGHTLY AI-007.
-func hasSelfJoinLockedTable(locks []LockedRel, sel *parser.SelectStmt) bool {
-	for _, lk := range locks {
-		if lk.Table == nil {
-			continue
-		}
-		seen := 0
-		for _, f := range sel.From {
-			if f.Name != "" && f.Name == lk.Table.Name && f.Schema == lk.Table.Schema {
-				seen++
-			}
-		}
-		if seen > 1 {
-			return true
-		}
-	}
-	return false
-}
-
-// wireRowMarkCtidColumns adds resjunk ctid columns to the schema of every
-// SeqScan or IndexScan whose relation is rowmarked, and extends the top-level
-// Project to carry those columns through to the LockRows. Returns the number of
-// ctid columns wired (also reflected in locks[i].CtidResno, set by this call).
-// When no scan can be wired (e.g. a CTE scan), CtidResno stays -1 and the
-// executor falls back to the walker/side-channel path. M0128-P6.1 resjunk-ctid rowmark.
-func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
+// wireRowMarkCtidColumns appends a resjunk ctid column (Resjunk-marked,
+// M0143-0009) to the schema of every rowmarked leaf scan — SeqScan,
+// IndexScan, BitmapHeapScan, the three leaves the executor can surface a
+// heap TID from — and returns the number wired plus oldW, the pre-injection
+// output width of every visited node (the caller's rebase walk needs
+// pre-shift widths to build position remaps). Wired locks get the
+// CtidResno=-2 "wired, resno pending" sentinel; resolveRowMarkCtidResnos
+// assigns real resnos after the rebase. Locks whose scan cannot be wired
+// (e.g. a CTE scan) keep -1 and the executor falls back to the
+// walker/side-channel path. M0128-P6.1 resjunk-ctid rowmark.
+func wireRowMarkCtidColumns(root Node, locks []LockedRel) (int, map[Node]int) {
 	if len(locks) == 0 {
-		return 0
+		return 0, nil
 	}
-	// Build a set of locked relation OIDs.
-	lockedOID := map[uint32]int{} // OID → index into locks
+	lockedOID := map[uint32]bool{}
 	for i := range locks {
 		if locks[i].Table != nil {
-			lockedOID[locks[i].Table.OID] = i
+			lockedOID[locks[i].Table.OID] = true
 		}
 	}
 	if len(lockedOID) == 0 {
-		return 0
+		return 0, nil
 	}
-	// Walk the plan tree and append a ctid column to every matching scan's
-	// schema. Use the same node-enumeration pattern as boundaryWalkChildren.
-	// For self-joins each scan gets its own ctid column; scans are matched to
-	// LockedRel entries by OID, assigning to the first LockedRel for that OID
-	// that hasn't been wired yet.
 	ctidType := catalog.Type{Name: "tid"}
-	type taggedScan struct {
-		lockIdx   int // index into locks
-		schemaIdx int // ctid column index in this scan's output
-	}
-	tagged := []taggedScan{} // in scan-tree walk order
-	// nextLockIdx[oid] is the index into locks of the next LockedRel for this
-	// OID that should be wired when a matching scan is found. Starts at the
-	// first LockedRel for each OID, increments on each match.
-	nextLockIdx := map[uint32]int{}
-	for i := range locks {
-		if locks[i].Table != nil {
-			if _, exists := nextLockIdx[locks[i].Table.OID]; !exists {
-				nextLockIdx[locks[i].Table.OID] = i
+	numCtid := 0
+	// tagScan appends a ctid column to the leaf's schema when its table is
+	// rowmarked. The match is by (OID, effective alias): self-joins bind the
+	// same OID under distinct aliases and each range-table entry gets its own
+	// LockedRel/RowMarkId, so a scan must only claim the lock for ITS binding
+	// (M0143-0009 — this replaces the AI-007 self-join injection skip).
+	tagScan := func(tbl *catalog.Table, alias string, schema *Schema) {
+		if !lockedOID[tbl.OID] {
+			return
+		}
+		eff := alias
+		if eff == "" {
+			eff = tbl.Name
+		}
+		for i := range locks {
+			lk := &locks[i]
+			if lk.Table == nil || lk.Table.OID != tbl.OID || lk.CtidResno != -1 {
+				continue
 			}
+			leff := lk.Alias
+			if leff == "" {
+				leff = lk.Table.Name
+			}
+			if leff != eff {
+				continue
+			}
+			*schema = append(*schema, SchemaColumn{
+				Name:           fmt.Sprintf("ctid%d", lk.RowMarkId),
+				Type:           ctidType,
+				SourceTableIdx: -1,
+				Resjunk:        true,
+			})
+			lk.CtidResno = -2 // wired; real resno resolved post-rebase
+			numCtid++
+			return
 		}
 	}
+	oldW := map[Node]int{}
 	var walk func(n Node)
 	walk = func(n Node) {
 		if n == nil {
 			return
 		}
+		// Snapshot BEFORE descending: pass-through Output()s read their
+		// (still untouched) child schemas, so every entry records the
+		// pre-injection width.
+		oldW[n] = len(n.Output())
 		switch s := n.(type) {
 		case *SeqScan:
-			if li, ok := nextLockIdx[s.Table.OID]; ok {
-				idx := len(s.schema)
-				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
-				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
-				// Advance to the next LockedRel for this OID, if any.
-				li++
-				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
-					li++
-				}
-				if li < len(locks) {
-					nextLockIdx[s.Table.OID] = li
-				} else {
-					delete(nextLockIdx, s.Table.OID)
-				}
-			}
+			tagScan(s.Table, s.Alias, &s.schema)
 		case *IndexScan:
-			if li, ok := nextLockIdx[s.Table.OID]; ok {
-				idx := len(s.schema)
-				s.schema = append(s.schema, SchemaColumn{Name: fmt.Sprintf("ctid%d", locks[li].RowMarkId), Type: ctidType, SourceTableIdx: -1})
-				tagged = append(tagged, taggedScan{lockIdx: li, schemaIdx: idx})
-				li++
-				for li < len(locks) && (locks[li].Table == nil || locks[li].Table.OID != s.Table.OID) {
-					li++
-				}
-				if li < len(locks) {
-					nextLockIdx[s.Table.OID] = li
-				} else {
-					delete(nextLockIdx, s.Table.OID)
-				}
-			}
+			tagScan(s.Table, s.Alias, &s.schema)
+		case *BitmapHeapScan:
+			tagScan(s.Table, s.Alias, &s.schema)
 		case *Project:
 			walk(s.Child)
 		case *Filter:
@@ -2626,144 +3094,663 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) int {
 		}
 	}
 	walk(root)
-	if len(tagged) == 0 {
-		return 0
+	if numCtid == 0 {
+		return 0, nil
 	}
-	// Extend the top-level Project with ColumnRef entries for the ctid columns
-	// so they survive the projection. The ctid resno that the executor reads is
-	// the column's index in the Project's output (i.e. the final user-visible
-	// schema + trailing ctid). Set it on the LockedRel.
-	if proj, ok := root.(*Project); ok {
-		for _, ts := range tagged {
-			li := ts.lockIdx
-			proj.Targets = append(proj.Targets, &ColumnRef{
-				pos:            proj.pos,
-				Index:          ts.schemaIdx,
-				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
-				Type:           ctidType,
-				SourceTableIdx: -1,
-			})
-			proj.schema = append(proj.schema, SchemaColumn{
-				Name:           fmt.Sprintf("ctid%d", locks[li].RowMarkId),
-				Type:           ctidType,
-				SourceTableIdx: -1,
-			})
-			locks[li].CtidResno = len(proj.schema) - 1
-		}
-	}
-	return len(tagged)
+	return numCtid, oldW
 }
 
-// recomputeIntermediateSchemas rebuilds intermediate-node schemas after
-// ctid columns are injected into leaf scans by wireRowMarkCtidColumns.
-// Only Join and NestedLoopIndexJoin store their own schema and need
-// explicit recomputation; all other intermediate types delegate Output()
-// to their child and auto-correct when the child's schema changes.
+// rebaseRowMarkPlan is the goopg analogue of PostgreSQL's setrefs.c Var
+// remap, run after wireRowMarkCtidColumns appended resjunk ctid columns to
+// leaf scan schemas. Injection only ever appends at a leaf's tail, so a
+// column's position shifts only through concat nodes (joins): left-side
+// positions keep their indices while every right-side position moves right
+// by the left child's growth. Before this walk existed
+// (recomputeIntermediateSchemas rebased only *Project targets), any
+// rowmarked leaf that wasn't the rightmost scan corrupted every merged-row
+// expression — the join predicate read the ctid datum and `FOR UPDATE` over
+// a join returned zero rows. M0143-0009.
 //
-// It also fixes ALL ColumnRef indices in the top Project: when a ctid
-// column is injected into a left-side scan, intermediate schema
-// recomputation shifts right-side column positions. Every ColumnRef
-// (user columns and ctid columns alike) is updated to its absolute
-// position in the Project's child output by (name, SourceTableIdx) lookup.
-func recomputeIntermediateSchemas(root Node) {
-	var walk func(n Node)
-	walk = func(n Node) {
+// The walk is post-order and returns for each node a remap []int of length
+// oldW[n] (the node's output width before injection) mapping old output
+// position → new output position. Positions ≥ len(remap) — the appended
+// ctids — are never referenced by pre-injection expressions and need no
+// entry.
+func rebaseRowMarkPlan(root Node, oldW map[Node]int) {
+	// seen dedupes *ColumnRef objects across the whole walk: plan fields
+	// alias each other (HashKeys[0] is LeftKey/RightKey by pointer; cloned
+	// key exprs share inner refs with Predicate — see fillOneJoinHashKeys
+	// and the M0097-0060 comment in planner.go), and a pushed-down conjunct
+	// can share refs between a join predicate and an ancestor filter. Each
+	// map is a pure old→new position function, so a ref remapped once must
+	// never be remapped again.
+	seen := map[*ColumnRef]bool{}
+	var walk func(n Node) []int
+	walk = func(n Node) []int {
 		if n == nil {
-			return
+			return nil
+		}
+		oldLen, snap := oldW[n]
+		if !snap {
+			oldLen = len(n.Output()) // untouched subtree — identity width
 		}
 		switch v := n.(type) {
 		case *Join:
-			walk(v.Left)
-			walk(v.Right)
+			lm := walk(v.Left)
+			rm := walk(v.Right)
+			newLW := len(v.Left.Output())
 			if v.Type != JoinTypeSemi && v.Type != JoinTypeAnti {
 				v.schema = appendSchema(v.Left.Output(), v.Right.Output())
 			}
+			merged := concatRemap(lm, rm, newLW)
+			// All join-side exprs are MERGED-coords (the executor evaluates
+			// keys through mergedKeySlot/VirtualSlot views over the
+			// [left ++ right] row — operators_join_agg.go mergedKeySlot,
+			// join_merge_stream.go keySlot.rebind).
+			rebaseExprRefsSeen(v.Predicate, merged, seen)
+			rebaseExprRefsSeen(v.LeftKey, merged, seen)
+			rebaseExprRefsSeen(v.RightKey, merged, seen)
+			for _, kp := range v.HashKeys {
+				rebaseExprRefsSeen(kp.Left, merged, seen)
+				rebaseExprRefsSeen(kp.Right, merged, seen)
+			}
+			remapIntPositions(v.UsingLeftCols, merged)
+			remapIntPositions(v.UsingRightCols, merged)
+			if v.Type == JoinTypeSemi || v.Type == JoinTypeAnti {
+				return lm
+			}
+			return merged
 		case *NestedLoopIndexJoin:
-			walk(v.Outer)
-			walk(v.Inner)
+			om := walk(v.Outer)
+			im := walk(v.Inner)
 			v.schema = appendSchema(v.Outer.Output(), v.Inner.Output())
+			merged := concatRemap(om, im, len(v.Outer.Output()))
+			rebaseExprRefsSeen(v.Predicate, merged, seen)
+			// Probe keys on the inner scan are OUTER-scoped (nl_index_join.go
+			// binds them by name against the outer node's output): rebase
+			// them against the outer map, not the inner's.
+			rebaseNLIProbeKeys(v.Inner, om, seen)
+			return merged
 		case *SetOp:
 			walk(v.Left)
 			walk(v.Right)
+			return identityRemap(oldLen)
 		case *Project:
-			walk(v.Child)
-			fixColumnRefIndices(v)
+			cm := walk(v.Child)
+			for _, t := range v.Targets {
+				rebaseExprRefsSeen(t, cm, seen)
+			}
+			return identityRemap(oldLen)
 		case *Filter:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.Predicate, cm, seen)
+			for i := range v.PushedBelow {
+				rebaseExprRefsSeen(v.PushedBelow[i], cm, seen)
+			}
+			return cm
 		case *Sort:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for i := range v.Keys {
+				rebaseExprRefsSeen(v.Keys[i].Expr, cm, seen)
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return cm
 		case *Limit:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.Limit, cm, seen)
+			rebaseExprRefsSeen(v.Offset, cm, seen)
+			for i := range v.TiesKeys {
+				rebaseExprRefsSeen(v.TiesKeys[i], cm, seen)
+			}
+			return cm
 		case *Distinct:
-			walk(v.Child)
+			cm := walk(v.Child)
+			v.schema = v.Child.Output()
+			return cm
 		case *DistinctOn:
-			walk(v.Child)
+			cm := walk(v.Child)
+			remapIntPositions(v.KeyCols, cm)
+			v.schema = v.Child.Output()
+			return cm
 		case *OrdinalityWrap:
-			walk(v.Child)
+			cm := walk(v.Child)
+			newChild := v.Child.Output()
+			v.schema = append(appendSchema(nil, newChild), v.schema[len(cm):]...)
+			out := append([]int{}, cm...)
+			for i := len(cm); i < oldLen; i++ {
+				out = append(out, len(newChild)+i-len(cm))
+			}
+			return out
+		case *ProjectSet:
+			cm := walk(v.Child)
+			for i := range v.SrfArgs {
+				rebaseExprRefsSeen(v.SrfArgs[i], cm, seen)
+			}
+			for i := range v.OtherExprs {
+				rebaseExprRefsSeen(v.OtherExprs[i], cm, seen)
+			}
+			newChild := v.Child.Output()
+			v.schema = append(appendSchema(nil, newChild), v.schema[len(cm):]...)
+			v.ChildWidth += len(newChild) - len(cm)
+			v.EvalRowWidth += len(newChild) - len(cm)
+			out := append([]int{}, cm...)
+			for i := len(cm); i < oldLen; i++ {
+				out = append(out, len(newChild)+i-len(cm))
+			}
+			return out
 		case *Aggregate:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.GroupExprs {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, e := range v.Passthrough {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for i := range v.Aggs {
+				a := &v.Aggs[i]
+				rebaseExprRefsSeen(a.Arg, cm, seen)
+				rebaseExprRefsSeen(a.Arg2, cm, seen)
+				for _, e := range a.ExtraArgs {
+					rebaseExprRefsSeen(e, cm, seen)
+				}
+				rebaseExprRefsSeen(a.Filter, cm, seen)
+				for _, sk := range a.OrderBy {
+					rebaseExprRefsSeen(sk.Expr, cm, seen)
+				}
+				for _, sk := range a.WithinGroupOrderBy {
+					rebaseExprRefsSeen(sk.Expr, cm, seen)
+				}
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return identityRemap(oldLen)
 		case *WindowAgg:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.PartitionBy {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, sk := range v.OrderBy {
+				rebaseExprRefsSeen(sk.Expr, cm, seen)
+			}
+			for i := range v.Funcs {
+				for _, e := range v.Funcs[i].Args {
+					rebaseExprRefsSeen(e, cm, seen)
+				}
+				rebaseExprRefsSeen(v.Funcs[i].Filter, cm, seen)
+			}
+			if v.Frame != nil {
+				rebaseExprRefsSeen(v.Frame.StartOffset, cm, seen)
+				rebaseExprRefsSeen(v.Frame.EndOffset, cm, seen)
+			}
+			remapIntPositions(v.InputTarget, cm)
+			return identityRemap(oldLen)
 		case *Memoize:
-			walk(v.Child)
+			cm := walk(v.Child)
+			for _, e := range v.KeyExprs {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			return cm
 		case *LockRows:
-			walk(v.Child)
+			cm := walk(v.Child)
+			rebaseExprRefsSeen(v.LimitCount, cm, seen)
+			rebaseExprRefsSeen(v.OffsetCount, cm, seen)
+			return identityRemap(oldLen)
+		case *Result:
+			var cm []int
+			if v.Child != nil {
+				cm = walk(v.Child)
+				for _, t := range v.Targets {
+					rebaseExprRefsSeen(t, cm, seen)
+				}
+			}
+			return identityRemap(oldLen)
+		case *Gather:
+			cm := walk(v.Child)
+			v.schema = v.Child.Output()
+			return cm
+		case *GatherMerge:
+			cm := walk(v.Child)
+			for i := range v.Keys {
+				rebaseExprRefsSeen(v.Keys[i].Expr, cm, seen)
+			}
+			v.schema = v.Child.Output()
+			return cm
+		case *RecursiveUnion:
+			walk(v.Anchor)
+			walk(v.Recursive)
+			return identityRemap(oldLen)
+		case *CTEDMLPrefix:
+			for _, d := range v.DMls {
+				walk(d)
+			}
+			walk(v.Body)
+			return identityRemap(oldLen)
+		// DML wrappers: unreachable under a rowmark (FOR UPDATE is a SELECT
+		// clause), but kept symmetric with the tagging walk so a future
+		// injection point cannot silently corrupt their expressions.
+		case *Update:
+			cm := walk(v.Child)
+			for _, e := range v.Set {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			for _, e := range v.Returning {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			rebaseExprRefsSeen(v.FromPred, cm, seen)
+			rebaseExprRefsSeen(v.ViewCheckQual, cm, seen)
+			return identityRemap(oldLen)
+		case *Delete:
+			cm := walk(v.Child)
+			for _, e := range v.Returning {
+				rebaseExprRefsSeen(e, cm, seen)
+			}
+			rebaseExprRefsSeen(v.UsingPred, cm, seen)
+			return identityRemap(oldLen)
 		case *Insert:
 			if v.Source != nil {
 				walk(v.Source)
 			}
-		case *Update:
-			walk(v.Child)
-		case *Delete:
-			walk(v.Child)
+			return identityRemap(oldLen)
+		default:
+			// Leaves (SeqScan, IndexScan, BitmapHeapScan, Values, SRF scans,
+			// …): appends grow only the tail, so old positions are unchanged.
+			// Leaf-local exprs (IndexScan.Cond, BitmapHeapScan.BitmapQual)
+			// keep their coordinates; NLI outer-scoped probe keys are
+			// handled by the NestedLoopIndexJoin arm above.
+			return identityRemap(oldLen)
 		}
 	}
 	walk(root)
 }
 
-// columnKey disambiguates columns by name and source-table index so the
-// (name, SourceTableIdx) pair uniquely identifies a column in the child
-// output even in self-joins where both sides have identically named columns.
-type columnKey struct {
-	name   string
-	srcIdx int16
+// resolveRowMarkCtidResnos runs after rebaseRowMarkPlan. When the plan root
+// is a *Project it appends the resjunk ctid ColumnRef targets so the values
+// survive projection (the Index is resolved by name against the child
+// schema — the ctid<N> names are unique by construction), then resolves
+// every wired lock's CtidResno to its column's position in the root's
+// output — previously this ran only for Project roots, leaving join-rooted
+// plans (SELECT *) with ctid columns nothing could find. It also shifts
+// each LockedRel.ColOffset (the binding's column position in the merged
+// row) past any ctid insertions before it, keeping the EPQ refetch-merge
+// writes pointed at the right cells. Locks that could not be wired keep
+// CtidResno=-1 (executor falls back to the side-channel path). M0143-0009.
+func resolveRowMarkCtidResnos(root Node, locks []LockedRel) {
+	ctidType := catalog.Type{Name: "tid"}
+	var ctidPositions []int
+	for i := range locks {
+		if locks[i].CtidResno != -2 {
+			continue
+		}
+		name := fmt.Sprintf("ctid%d", locks[i].RowMarkId)
+		locks[i].CtidResno = -1
+		// Thread the ctid up through schema-pinning ancestors before resolving:
+		// an intermediate Project pins its own schema, so a leaf-injected ctid
+		// never reaches the LockRows child row on its own — the lookup that
+		// used to run here against proj.Child.Output() then failed, leaving
+		// NumCtidCols > 0 with no resjunk column to strip, which dropped a real
+		// user column from the result (AI-20260920-005626-006).
+		if p := surfaceRowMarkCtid(root, name, ctidType); p >= 0 {
+			locks[i].CtidResno = p
+			ctidPositions = append(ctidPositions, p)
+		}
+	}
+	outSchema := root.Output()
+	// ColOffset names the binding's first column in the ORIGINAL merged row;
+	// a ctid inserted at the end of an earlier leaf segment shifts every
+	// binding that starts at or after it. A ctid whose final position is f
+	// was inserted at old-coordinate position f minus the number of earlier
+	// insertions, so sorting the final positions recovers the insertion
+	// points exactly.
+	sort.Ints(ctidPositions)
+	for i := range locks {
+		if locks[i].Table == nil {
+			continue
+		}
+		for k, f := range ctidPositions {
+			if f-k <= locks[i].ColOffset {
+				locks[i].ColOffset++
+			}
+		}
+	}
+	// ColPos: the exact position of each of the locked relation's columns in
+	// the LockRows child's output row. ColOffset+i only coincides with that
+	// when the child's layout is the FROM-order merged row; a top Project may
+	// subset or reorder columns, so the EPQ refetch-merge needs the resolved
+	// positions. Each leaf column is found in the root output by its
+	// (Name, SourceTableIdx) identity. nil when the leaf or a column can't be
+	// located — the executor then falls back to ColOffset+i.
+	for i := range locks {
+		if locks[i].CtidResno < 0 {
+			continue
+		}
+		leaf := findCtidLeafSchema(root, fmt.Sprintf("ctid%d", locks[i].RowMarkId))
+		if leaf == nil {
+			continue
+		}
+		// A projected output may not carry every locked-rel column; those
+		// keep pos=-1 (nothing to merge into) rather than voiding the map.
+		pos := make([]int, 0, len(leaf))
+		for _, lc := range leaf {
+			if lc.Resjunk {
+				continue
+			}
+			p := -1
+			for j, c := range outSchema {
+				if c.Name == lc.Name && c.SourceTableIdx == lc.SourceTableIdx {
+					p = j
+					break
+				}
+			}
+			if p < 0 {
+				p = findLockedColByTarget(root, outSchema, lc)
+			}
+			pos = append(pos, p)
+		}
+		locks[i].ColPos = pos
+	}
 }
 
-// fixColumnRefIndices updates every ColumnRef.Index in the Project (both user
-// columns and ctid columns) to absolute positions in the Project's child output.
-// This is necessary because recomputeIntermediateSchemas rebuilds intermediate
-// join schemas after ctid injection, which shifts right-side column positions.
-// The (name, SourceTableIdx) pair disambiguates columns in self-joins.
-func fixColumnRefIndices(proj *Project) {
-	childSchema := proj.Child.Output()
-	// Build position map from child output.
-	posMap := make(map[columnKey]int, len(childSchema))
-	for i, col := range childSchema {
-		posMap[columnKey{name: col.Name, srcIdx: col.SourceTableIdx}] = i
+// findLockedColByTarget resolves a locked relation's leaf column to its
+// position in the root output when the output SCHEMA NAME no longer matches
+// the leaf's — which is what a target-list alias does: `SELECT ta.value AS
+// ta_value` renames the schema column, so the leaf's (Name, SourceTableIdx)
+// identity is absent from outSchema and the name scan above yields -1 for
+// EVERY column. That is indistinguishable, at the merge site, from "this
+// column is genuinely not carried in the output", so the EPQ refetch-merge
+// silently writes nothing and the row keeps its PRE-update values
+// (isolation spec eval-plan-qual, permutation `updateforss readforss c1 c2`,
+// whose step aliases all three targets).
+//
+// A Project's TARGET expression keeps the column's original identity even
+// when its schema entry is aliased — `ColumnRef.Name` is the resolved source
+// column name — so the target list is the reliable coordinate. Upstream has
+// no equivalent ambiguity: ExecLockRows addresses the rowmark's columns by
+// attnum through the relation's tuple descriptor (execMain.c's
+// EvalPlanQualFetchRowMark), never by output name.
+//
+// Returns -1 when no Project target matches, preserving the existing
+// "column not carried in the output" meaning for a genuinely absent column.
+func findLockedColByTarget(root Node, outSchema Schema, lc SchemaColumn) int {
+	proj := findTopProjectForOutput(root, len(outSchema))
+	if proj == nil {
+		return -1
 	}
-	// Fix all ColumnRefs in Project targets (including inside sub-expressions).
-	for _, t := range proj.Targets {
-		fixColumnRefsInExpr(t, posMap)
+	for j, tgt := range proj.Targets {
+		if j >= len(outSchema) {
+			break
+		}
+		cr, ok := tgt.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		if cr.Name == lc.Name && cr.SourceTableIdx == lc.SourceTableIdx {
+			return j
+		}
+	}
+	return -1
+}
+
+// findTopProjectForOutput returns the highest Project at or below n whose
+// output width matches the row the merge addresses, so a target index is a
+// valid position in that row. Width equality is the guard that keeps this
+// from returning a Project under a node that reshapes the row.
+func findTopProjectForOutput(n Node, width int) *Project {
+	if n == nil {
+		return nil
+	}
+	if p, ok := n.(*Project); ok && len(p.Output()) == width {
+		return p
+	}
+	for _, c := range boundaryWalkChildren(n) {
+		if r := findTopProjectForOutput(c, width); r != nil {
+			return r
+		}
+	}
+	return nil
+}
+
+// surfaceRowMarkCtid returns ctidName's position in n.Output(), threading the
+// column up through schema-pinning ancestors first. A leaf-injected resjunk
+// column only propagates through nodes whose Output() derives live from the
+// child; a Project pins its own schema and needs an explicit pass-through
+// target. Returns -1 when the column cannot surface (e.g. below an
+// Aggregate/WindowAgg/OrdinalityWrap/ProjectSet, whose pinned schemas are not
+// rebuilt here) — the lock then keeps CtidResno=-1 and the executor uses the
+// walker/side-channel paths. M0143-0009 follow-up (AI-20260920-005626-006):
+// multi-Project plans buried the ctid below the top Project, so resno
+// resolution failed while NumCtidCols still counted the leaf injection and
+// LockRows' trailing-strip ate a user column.
+func surfaceRowMarkCtid(n Node, ctidName string, ctidType catalog.Type) int {
+	if n == nil {
+		return -1
+	}
+	// Nodes whose pinned schema interleaves or synthesizes columns (or, for
+	// SetOp, combines rows from two branches only one of which could carry
+	// the mark): a leaf ctid cannot be threaded through them without
+	// invalidating their own layout, and PG cannot lock rows across these
+	// boundaries anyway. Do not recurse — leave the subtree untouched.
+	switch n.(type) {
+	case *Aggregate, *WindowAgg, *OrdinalityWrap, *ProjectSet, *SetOp:
+		return -1
+	}
+	// Children first: a pinned schema rebuilt or extended below must already
+	// carry the column before this node's Output() can expose it.
+	for _, ch := range boundaryWalkChildren(n) {
+		surfaceRowMarkCtid(ch, ctidName, ctidType)
+	}
+	if p, ok := n.(*Project); ok {
+		for i, c := range p.schema {
+			if c.Name == ctidName && c.Resjunk {
+				return i
+			}
+		}
+		cp := -1
+		for i, c := range p.Child.Output() {
+			if c.Name == ctidName && c.Resjunk {
+				cp = i
+				break
+			}
+		}
+		if cp < 0 {
+			return -1
+		}
+		p.Targets = append(p.Targets, &ColumnRef{
+			pos:            p.pos,
+			Index:          cp,
+			Name:           ctidName,
+			Type:           ctidType,
+			SourceTableIdx: -1,
+		})
+		p.schema = append(p.schema, SchemaColumn{
+			Name:           ctidName,
+			Type:           ctidType,
+			SourceTableIdx: -1,
+			Resjunk:        true,
+		})
+		return len(p.schema) - 1
+	}
+	// Rebuild the pinned schemas that concat or mirror child output so a
+	// freshly-threaded column appears in this node's Output().
+	switch v := n.(type) {
+	case *Join:
+		if v.Type != JoinTypeSemi && v.Type != JoinTypeAnti {
+			v.schema = appendSchema(v.Left.Output(), v.Right.Output())
+		}
+	case *NestedLoopIndexJoin:
+		v.schema = appendSchema(v.Outer.Output(), v.Inner.Output())
+	case *Distinct:
+		v.schema = v.Child.Output()
+	case *DistinctOn:
+		v.schema = v.Child.Output()
+	}
+	for i, c := range n.Output() {
+		if c.Name == ctidName && c.Resjunk {
+			return i
+		}
+	}
+	return -1
+}
+
+// findCtidLeafSchema returns the schema of the leaf scan carrying the ctid
+// column named ctidName, or nil when no leaf carries it.
+func findCtidLeafSchema(n Node, ctidName string) Schema {
+	if n == nil {
+		return nil
+	}
+	switch s := n.(type) {
+	case *SeqScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	case *IndexScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	case *BitmapHeapScan:
+		if schemaHasCtidCol(s.schema, ctidName) {
+			return s.schema
+		}
+	}
+	for _, c := range boundaryWalkChildren(n) {
+		if r := findCtidLeafSchema(c, ctidName); r != nil {
+			return r
+		}
+	}
+	return nil
+}
+
+func schemaHasCtidCol(schema Schema, ctidName string) bool {
+	for _, c := range schema {
+		if c.Name == ctidName && c.Resjunk {
+			return true
+		}
+	}
+	return false
+}
+
+// identityRemap returns the position-preserving old→new map of length n.
+func identityRemap(n int) []int {
+	m := make([]int, n)
+	for i := range m {
+		m[i] = i
+	}
+	return m
+}
+
+// concatRemap merges a left-child and right-child output remap into the
+// join's merged-row remap. The merged row is [new left output] ++ [new
+// right output], so an old right-side position j (stored at merged index
+// len(left)+j) lands at newLeftW + right[j].
+func concatRemap(left, right []int, newLeftW int) []int {
+	out := make([]int, 0, len(left)+len(right))
+	out = append(out, left...)
+	for _, p := range right {
+		out = append(out, newLeftW+p)
+	}
+	return out
+}
+
+// remapIntPositions rebases a list of absolute child-row positions
+// (UsingCols, DistinctOn.KeyCols, InputTarget keep-lists) through remap.
+// Out-of-range entries pass through unchanged (defensive — no legitimate
+// position exceeds the old width).
+func remapIntPositions(cols []int, remap []int) {
+	for i, p := range cols {
+		if p >= 0 && p < len(remap) {
+			cols[i] = remap[p]
+		}
 	}
 }
 
-// fixColumnRefsInExpr recursively walks an expression tree via the standard
-// exprChildSlots walker and updates ColumnRef.Index using posMap (child-schema
-// position lookup). Non-ColumnRef leaves and scope-opening nodes are skipped.
-func fixColumnRefsInExpr(e Expr, posMap map[columnKey]int) {
-	if e == nil {
+// rebaseExprRefs rewrites every same-scope ColumnRef.Index in e through
+// remap. Sub-expressions that open a new evaluation scope (subqueries) are
+// skipped via exprChildSlots slot kinds, matching the old name-keyed
+// fixColumnRefsInExpr walk.
+func rebaseExprRefs(e Expr, remap []int) {
+	rebaseExprRefsSeen(e, remap, nil)
+}
+
+// rebaseExprRefsSeen is rebaseExprRefs with a caller-supplied dedupe set:
+// plan fields can share *ColumnRef objects (HashKeys[0] aliases
+// LeftKey/RightKey BY POINTER, and non-ColumnRef key exprs share their
+// inner refs with Predicate — join_hash_keys.go fillOneJoinHashKeys), so
+// rebasing each field independently would apply the remap twice to a
+// shared ref. Pass one seen-set per (node, remap) pair.
+func rebaseExprRefsSeen(e Expr, remap []int, seen map[*ColumnRef]bool) {
+	if e == nil || len(remap) == 0 {
 		return
 	}
 	if cr, ok := e.(*ColumnRef); ok {
-		if newIdx, found := posMap[columnKey{name: cr.Name, srcIdx: cr.SourceTableIdx}]; found {
-			cr.Index = newIdx
+		if seen != nil {
+			if seen[cr] {
+				return
+			}
+			seen[cr] = true
+		}
+		if cr.Index >= 0 && cr.Index < len(remap) {
+			cr.Index = remap[cr.Index]
 		}
 		return
 	}
 	slots, _ := exprChildSlots(e)
 	for _, s := range slots {
 		if s.kind == slotSameScope && s.expr != nil {
-			fixColumnRefsInExpr(*s.expr, posMap)
+			rebaseExprRefsSeen(*s.expr, remap, seen)
+		}
+	}
+}
+
+// rebaseNLIProbeKeys rebases a NestedLoopIndexJoin inner probe's key
+// expressions, which are bound against the OUTER node's output row
+// (nl_index_join.go re-binds them by name), through the outer remap.
+// Leaf-local residuals (IndexScan.Cond, BitmapHeapScan.BitmapQual/Cond) are
+// deliberately untouched — leaf appends never move a leaf's own positions.
+func rebaseNLIProbeKeys(inner Node, outerMap []int, seen map[*ColumnRef]bool) {
+	switch in := inner.(type) {
+	case *IndexScan:
+		rebaseExprRefsSeen(in.Key, outerMap, seen)
+		for _, e := range in.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		for _, e := range in.SAOPKeys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		// M0145-0029 slice 2b: a range probe's equality prefix.
+		for _, e := range in.RangePrefix {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
+	case *IndexOnlyScan:
+		rebaseExprRefsSeen(in.Key, outerMap, seen)
+		for _, e := range in.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
+	case *BitmapHeapScan:
+		rebaseBitmapProbeKeys(in.Outer, outerMap, seen)
+	}
+}
+
+// rebaseBitmapProbeKeys rebases the outer-scoped key expressions inside a
+// parameterized BitmapHeapScan's bitmap subtree.
+func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
+	switch b := n.(type) {
+	case *BitmapIndexScan:
+		rebaseExprRefsSeen(b.Key, outerMap, seen)
+		for _, e := range b.Keys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+		for _, e := range b.Pred {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
+	case *BitmapAnd:
+		for _, c := range b.Inputs {
+			rebaseBitmapProbeKeys(c, outerMap, seen)
+		}
+	case *BitmapOr:
+		for _, c := range b.Inputs {
+			rebaseBitmapProbeKeys(c, outerMap, seen)
 		}
 	}
 }
@@ -2841,10 +3828,32 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	}
 	var root Node
 	var bindings []rangeBinding
+	// M0145-0005 slice 3: the accumulated leaf/link table — each item's
+	// planFromItem emits its own local table; concatenating them in FROM
+	// order reproduces the walk's DFS order across the comma items.
+	jtTab := &jtScopeTable{}
+	// antiForcedNullCols (R40/K69): the union, across every FROM item, of
+	// the column keys whose IS NULL conjunct forced a LEFT->ANTI conversion
+	// demotedForPlan transplanted. Stashed on rctx below so the
+	// WHERE-handling arm in planSelect can strip exactly those conjuncts
+	// before they are resolved — see stripForcingNullQuals and
+	// resolveContext.antiForcedNullCols.
+	var antiForcedNullCols map[string]bool
 	// Counter starts at 1; zero is reserved as the "unknown /
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
-	for _, item := range s.FromExprs {
+	for _, rawItem := range s.FromExprs {
+		// R27 §4a / K28: plan from a copy carrying the outer-join demotions
+		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
+		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
+		// why the call below cannot simply be moved up here instead.
+		item, itemAntiCols := demotedForPlan(rawItem, s.Where, cat)
+		for key := range itemAntiCols {
+			if antiForcedNullCols == nil {
+				antiForcedNullCols = make(map[string]bool)
+			}
+			antiForcedNullCols[key] = true
+		}
 		// LATERAL semantics for FROM-clause SRFs (M0103-0008):
 		// the partial FROM-list context is threaded down so each
 		// item's SRF args see siblings to its left.
@@ -2855,10 +3864,11 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 			// a later FROM item resolves its RTIDs from this statement.
 			lateralCtx.rtScope = scope
 		}
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
+		itemNode, itemBindings, itemScope, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
 			return nil, nil, err
 		}
+		jtTab.appendTable(itemScope)
 		if root == nil {
 			root = itemNode
 			bindings = itemBindings
@@ -2886,6 +3896,8 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	rctx := newResolveContext(bindings, root.Output(), ps)
 	// A-01(ii) cut 2: carry the statement scope (see lateralCtx above).
 	rctx.rtScope = scope
+	// R40/K69: see antiForcedNullCols' declaration above.
+	rctx.antiForcedNullCols = antiForcedNullCols
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
 	// walk that numbered these bindings is still the current walk (collapse.go).
 	// Inert until P5.9 — nothing reads `joinlist` yet.
@@ -2901,6 +3913,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// let the search reorder across the outer join. See
 	// `deconstructJointreeScopedSJI`.
 	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), newSjiScope(s.FromExprs, cat))
+	// M0145-0005 slice 3: pin the table to the exact chain it was built
+	// beside — the seam consumes it only while `jtScope.root == chain`,
+	// so a pre-search rewrite that grafts a different root (the S5a
+	// post-unnest Phase B chain) falls back to the node walk.
+	jtTab.root = root
+	rctx.jtScope = jtTab
 	return root, rctx, nil
 }
 
@@ -3060,29 +4078,52 @@ func nodeReferencesOuter(n Node) bool {
 // executor's CREATE INDEX const-folding of partial-index predicates.
 func ExprContainsColumnRef(e Expr) bool { return exprContainsColumnRef(e) }
 
+// exprContainsColumnRef reports whether e reads a column of the current
+// scope. It walks with the exhaustive exprChildSlots driver (exprwalk.go),
+// not the hand-written walkExprTree, whose missing arms made this answer
+// "no" for a column under an unlisted node — `col IS NOT NULL` once, and
+// `('-H') >= (c2::text) COLLATE "C"` (upstream create_index) until
+// 2026-09-24 — and CREATE INDEX then const-folded a column predicate on a
+// nil slot (XX000 "column ref c2/1 on nil slot"). An unenumerated type
+// fails closed: it counts as containing a column, which only ever costs a
+// missed constant fold. Inner plans are another scope and are not entered.
 func exprContainsColumnRef(e Expr) bool {
 	if e == nil {
 		return false
 	}
 	found := false
-	walkExprTree(e, func(node Expr) {
+	complete := walkExprRefs(e, scopeIgnore, exprVisitor{Visit: func(node Expr) bool {
 		if found {
-			return
+			return false
 		}
 		if _, ok := node.(*ColumnRef); ok {
 			found = true
+			return false
 		}
-	})
-	return found
+		return true
+	}})
+	return found || !complete
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, error) {
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, []rangeBinding, *jtScopeTable, error) {
 	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx, ps, scope)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	// M0145-0005 slice 3: record the leaf/link table the jointree
+	// pipeline's seam reads instead of re-walking this chain
+	// (jointreescope.go). One leaf per attachment point, one link per
+	// join, in exactly the DFS order extractSearchLeaves visits.
+	tab := &jtScopeTable{}
+	tab.addLeaf(leftNode, false)
 	*nextSourceIdx++
-	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output(), ps)
+	leftBindings := []rangeBinding{leftBinding}
+	if item.Base.GroupedJoinUnaliased {
+		if grouped, ok := groupedJoinSourceBindings(item.Base, cat, leftNode.Output()); ok {
+			leftBindings = grouped
+		}
+	}
+	leftCtx := newResolveContext(leftBindings, leftNode.Output(), ps)
 	// M0134-0011c: give every per-join resolve context a catalog handle
 	// so IN (subquery) / EXISTS in a JOIN ... ON clause can plan the
 	// sublink via planInExpr (planner.go's `ctx.cat == nil` guard) the
@@ -3098,9 +4139,12 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// left side. Merge the outer lateralCtx with the current
 		// leftCtx so SRF args on the right see both. M0103-0008.
 		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		if j.Right.Subquery != nil && !j.Right.Lateral {
+			joinLateralCtx = nil
+		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		*nextSourceIdx++
 		rightBinding.offset = len(leftCtx.schema)
@@ -3136,7 +4180,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 
 		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		joinType := mapJoinType(j.Type)
 		// M0063-0005: for LEFT JOIN, partition the ON conjuncts.
@@ -3210,6 +4254,35 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			Predicate: pred,
 			schema:    mergedSchema,
 			Lateral:   nodeReferencesOuter(rightNode),
+		}
+		// R40 §4d / K69: Semi/Anti publish only the left (outer/probe)
+		// side — `Join.Output()` (plan.go) already special-cases this at
+		// read time, but the STORED `.schema` field here was still the
+		// unconditional merged width, and any FURTHER join in this SAME
+		// chain reads column offsets from `leftCtx.schema`/`leftCtx.
+		// bindings`, not from `Output()`. Left un-narrowed, a join
+		// chained after this one (Q78's `... JOIN date_dim` following the
+		// ANTI-demoted `web_returns` link) would place its columns at
+		// offsets that still budget space for the now-invisible right
+		// side — silently wrong data or an out-of-range panic. Mirrors
+		// `unnest.go`'s own Semi/Anti construction, which already stores
+		// a left-only `schema` at construction rather than deferring to
+		// `Output()`; `joinlayout.go`'s `reresolveJoinByName` documents a
+		// previously shipped regression from this identical bug class
+		// (Q21 NOT-EXISTS, silent 0 rows instead of ~411).
+		if joinType == JoinTypeSemi || joinType == JoinTypeAnti {
+			jn.schema = append(Schema(nil), leftCtx.schema...)
+			// R40/K69: every SEMI/ANTI reaching planFromItem comes from the
+			// outer-join reduction — the unnest rewrite builds its own joins
+			// in unnest.go, never here. See Join.FromOuterReduction for why
+			// the NLI cost gate needs to tell the two populations apart.
+			jn.FromOuterReduction = true
+			// M0142-0008a-3i-plumbing-c19 (design doc §55): give this
+			// producer the same placeholder `.SJInfo` `existsUnnestSJInfo`
+			// already attaches for its own SEMI/ANTI joins — see
+			// `demotedAntiSJInfo`'s doc comment (specialjoin.go) for why
+			// `ctx.joinInfoList` cannot supply one instead.
+			jn.SJInfo = demotedAntiSJInfo(joinType)
 		}
 		// M0097-0060: For FULL JOIN USING / FULL JOIN NATURAL, populate
 		// UsingLeftCols/UsingRightCols so the executor can coalesce USING
@@ -3289,6 +4362,22 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			switch jn.Type {
 			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
+			case JoinTypeAnti:
+				// R40/K69: ANTI became reachable here when demotedForPlan
+				// started transplanting the S9.3 LEFT->ANTI verdict. This
+				// switch had no ANTI arm, so the join kept the nested-loop
+				// default and probed the inner index once per outer row —
+				// 1.4M descents on TPC-DS Q78's store_sales arm, measured at
+				// 16s -> 54s. Hash is the same algorithm `unnest.go` already
+				// builds its own SEMI/ANTI joins with (JoinAlgoHash), so this
+				// is an exercised executor path, not a new one. PG picks a
+				// Merge Anti Join for this shape; choosing between hash and
+				// merge on cost is join-METHOD parity and stays out of scope
+				// here — what this arm fixes is the absence of any choice.
+				// SEMI is deliberately absent: mapJoinType never emits it
+				// (applyDemotion produces no SEMI verdict), so an arm for it
+				// would be unreachable.
+				jn.Algo = JoinAlgoHash
 			case JoinTypeRight, JoinTypeFull:
 				// M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL
 				// are no longer PINNED to merge. The pin was never a
@@ -3337,10 +4426,70 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			}
 		}
 		} // close else from allLeavesAreTableScans guard
+		// M0145-0005 slice 3: record the link + right leaf (or fold the
+		// table to one opaque leaf for a non-descendable join type).
+		tab.addJoin(jn)
 		leftNode = jn
-		leftCtx = mergedCtx
+		// R40 §4d / K69: for Semi/Anti, `jn`'s Output() (plan.go) and its
+		// now-narrowed `.schema` (set above) equal exactly what `leftCtx`
+		// already described BEFORE this join — the right/nullable side
+		// never appears past this point, so there is nothing to adopt.
+		// Adopting `mergedCtx` here (the pre-R40 behaviour) is what let a
+		// later join in the SAME chain resolve columns at offsets that
+		// still budgeted space for the invisible right side.
+		if joinType != JoinTypeSemi && joinType != JoinTypeAnti {
+			leftCtx = mergedCtx
+		}
 	}
-	return leftNode, leftCtx.bindings, nil
+	return leftNode, leftCtx.bindings, tab, nil
+}
+
+// groupedJoinSourceBindings maps source aliases of an unaliased grouped JOIN
+// onto the synthetic SELECT * output. A JOIN USING column has one output slot,
+// so both qualified source names map to that slot. R104.
+func groupedJoinSourceBindings(rv parser.RangeVar, cat catalog.Catalog, out Schema) ([]rangeBinding, bool) {
+	if rv.Subquery == nil || len(rv.Subquery.FromExprs) != 1 {
+		return nil, false
+	}
+	item := rv.Subquery.FromExprs[0]
+	rvars := append([]parser.RangeVar{item.Base}, func() []parser.RangeVar {
+		x := make([]parser.RangeVar, len(item.Joins))
+		for i := range item.Joins { x[i] = item.Joins[i].Right }
+		return x
+	}()...)
+	bindings := make([]rangeBinding, 0, len(rvars))
+	for source, inner := range rvars {
+		if inner.Subquery != nil || inner.TableFunc != nil { return nil, false }
+		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: inner.Schema, Name: inner.Name})
+		if !ok { return nil, false }
+		b := rangeBinding{table: tbl, alias: inner.Alias, sourceIdx: int16(source + 1), columnOffsets: make(map[string]int)}
+		for _, c := range tbl.Columns {
+			for idx, sc := range out {
+				if sc.SourceTableIdx == b.sourceIdx && strings.EqualFold(sc.Name, c.Name) {
+					b.columnOffsets[strings.ToLower(c.Name)] = idx
+					break
+				}
+			}
+		}
+		if source > 0 {
+			b.usingHidden = append([]string(nil), item.Joins[source-1].Using...)
+			for _, name := range item.Joins[source-1].Using {
+				for idx, sc := range out {
+					if strings.EqualFold(sc.Name, name) {
+						b.columnOffsets[strings.ToLower(name)] = idx
+						break
+					}
+				}
+			}
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, true
+}
+
+func bindingColumnOffset(b rangeBinding, i int, name string) int {
+	if idx, ok := b.columnOffsets[strings.ToLower(name)]; ok { return idx }
+	return b.offset + i
 }
 
 func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
@@ -3411,6 +4560,19 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			Pos:     rv.Pos(),
 			Code:    "42P01",
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
+		}
+	}
+	// A foreign table whose FDW has NO HANDLER cannot be read. PostgreSQL
+	// refuses at PLAN time — GetFdwRoutineByServerId (foreign.c:403) is reached
+	// from the planner's create_foreignscan_path, which is why `EXPLAIN SELECT
+	// * FROM t` fails there too and not only the execution. Raising here rather
+	// than at scan Open keeps that property. M0122-0015.
+	if fdwName, noHandler := foreignTableWithoutHandler(cat, tbl); noHandler {
+		return nil, rangeBinding{}, &PlanError{
+			Pos:  rv.Pos(),
+			Code: "55000", // ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+			Message: fmt.Sprintf("foreign-data wrapper %q has no handler",
+				fdwName),
 		}
 	}
 	// Validate column alias count when provided: AS t(c1, c2, ...).
@@ -3840,6 +5002,45 @@ func containsSetOp(n Node) bool {
 // Required because SearchPathCatalog wraps InMemory for search-path resolution
 // but planner internals need the concrete type for partition/inheritance BFS.
 // M0097-0022.
+// foreignTableWithoutHandler reports the FDW name when tbl is a foreign table
+// whose foreign-data wrapper has no handler function, which upstream treats as
+// unreadable: GetFdwRoutineByServerId raises
+//
+//	ERROR:  55000: foreign-data wrapper "%s" has no handler
+//
+// (postgres/src/backend/foreign/foreign.c:403, verified against PG 18.3 —
+// SQLSTATE 55000 is ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, and the message
+// is byte-for-byte what the server emits).
+//
+// Fail-OPEN by construction: an unresolvable server or wrapper returns false,
+// so this can only refuse a relation whose wrapper is positively known to have
+// fdwhandler = 0. The server registry is keyed by (dbOid, name), so the lookup
+// passes the catalog's current database rather than defaulting to DefaultDBOid
+// — a server created in another database must not decide this one's plans.
+func foreignTableWithoutHandler(cat catalog.Catalog, tbl *catalog.Table) (string, bool) {
+	if tbl == nil || tbl.ForeignServerName == "" {
+		return "", false
+	}
+	im := inMemoryCat(cat)
+	if im == nil {
+		return "", false
+	}
+	// The server registry is keyed by the NAMESPACE dbOid, which is what
+	// CREATE SERVER registers under (operators_ddl.go: NamespaceDBOid of the
+	// connection's database). Looking up with the raw catalog DBOID misses
+	// every server in the default database, where the two differ — measured:
+	// DBOID()=5 while the registry key is DefaultDBOid.
+	srv, ok := im.LookupForeignServer(tbl.ForeignServerName, catalog.NamespaceDBOid(im.DBOID()))
+	if !ok || srv == nil {
+		return "", false
+	}
+	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName)
+	if !ok || fdw == nil || fdw.HandlerOID != 0 {
+		return "", false
+	}
+	return fdw.Name, true
+}
+
 func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
 	type unwrapper interface {
 		Unwrap() catalog.Catalog
@@ -4485,6 +5686,18 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// cat set so the analyzer outer-scope chain is built correctly.
 	var inner Node
 	var err error
+	// M0145-0004: `is_simple_union_all` (prepjointree.c:2214) on the
+	// subquery's chain — jointree arm and non-LATERAL only, matching the
+	// binding mark and the member-search flag below. A LATERAL union's
+	// members may cross-reference earlier FROM items; PG propagates
+	// rte->lateral to them, which this slice does not express.
+	// lateralCtx is also supplied to a non-LATERAL FROM item merely so its
+	// table-function arguments could resolve earlier siblings. It is not the
+	// SQL LATERAL property: only RangeVar.Lateral makes the UNION member
+	// potentially parameterised and therefore ineligible for this one-shot
+	// appendrel path.
+	appendrelSubquery := !rv.Lateral &&
+		subqueryChainIsSimpleUnionAll(rv.Subquery)
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx
 		latCtxWithCat.cat = cat
@@ -4533,6 +5746,15 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// collide with the outer level's.
 		// B-12d: and this statement's settings (ps), so the inner
 		// join search prices under the session's GUCs.
+		//
+		// M0145-0004: an admissible UNION ALL subquery's member scopes
+		// plan through the join search — the appendrel's members need
+		// searched rels (and their PartialPathlists) for the leaf's
+		// Parallel Append candidate to exist at all. Set only on the
+		// jointree arm and only for a simple UNION ALL chain; the flag
+		// is consumed and cleared inside each member scope, so nothing
+		// deeper inherits it (plannersettings.go).
+		ps.appendrelMember = appendrelSubquery
 		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps, scope)
 	}
 	if err != nil {
@@ -4607,6 +5829,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	}
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	// M0145-0004: mark the appendrel candidate — the admissibility
+	// computed above (jointree arm, non-LATERAL, simple UNION ALL
+	// chain). addAppendRelPartialPaths reads it via
+	// baseRelInfo.appendrel to hoist the leaf's Parallel Append
+	// candidate onto the search leaf rel; the flag is unset on the
+	// legacy arm, so off-knob behaviour is unchanged by construction.
+	b.appendrel = appendrelSubquery
 	return inner, b, nil
 }
 
@@ -6348,7 +7577,24 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		return nil, nil
 	}
 	if join.On != nil {
-		return resolveExpr(join.On, mergedCtx)
+		// R44/K83 step A: ON-clause quals reach the estimator by a different
+		// route than WHERE (planJoinPredicate -> chainOnQual ->
+		// joinsearchseam), so they must be folded here too or the round is
+		// WHERE-only (K86).
+		onPred, onErr := resolveExpr(join.On, mergedCtx)
+		if onErr != nil {
+			return nil, onErr
+		}
+		// M0145-0017 step 1: census sublinks sitting in an explicit join's ON
+		// clause. This is the ONE clause position where upstream's reach
+		// exceeds goopg's — `pull_up_sublinks_jointree_recurse` runs the
+		// pull-up on every jointree level's quals, ON clauses included, while
+		// goopg's `pullUpSublinksIntoJointree` walks the top-level WHERE only.
+		// Every other never-reached position (target list, HAVING, nested
+		// expression contexts) keeps its SubPlan in PG too, so ON is where a
+		// real gap could hide.
+		noteOnQualSublinks(join.Type, onPred)
+		return foldQualConstants(onPred)
 	}
 	if len(join.Using) > 0 {
 		return buildUsingPredicate(join.Pos(), join.Using, leftCtx, rightCtx)
@@ -6587,6 +7833,16 @@ func mapJoinType(t parser.JoinType) JoinType {
 		return JoinTypeFull
 	case parser.JoinCross:
 		return JoinTypeCross
+	case parser.JoinAnti:
+		// R40/K69: demotedForPlan now transplants the LEFT->ANTI verdict
+		// (reduce_outer_joins.go's S9.3 rule) onto the plan tree; before
+		// this case existed it silently fell to JoinTypeInner below,
+		// which would have been wrong rows, not a no-op — the guard was
+		// never exercised because no ANTI verdict reached here until now.
+		// JoinTypeSemi is deliberately NOT added: applyDemotion never
+		// produces one (grep-confirmed), so mapping it would be
+		// speculative code with no caller.
+		return JoinTypeAnti
 	default:
 		return JoinTypeInner
 	}
@@ -6837,7 +8093,12 @@ func needsWindowStage(s *parser.SelectStmt) bool {
 // and `tupleFraction` its `root->tuple_fraction` — all three threaded from
 // `planSelectWithSettings`, because `inputCtx` is replaced per group and a
 // fraction read off a derived context would be zero (the C-12 lesson).
-func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface, upper *upperRels, ps PlannerSettings, tupleFraction float64) (Node, *resolveContext, *windowSurface, error) {
+// `starPS`, when non-nil, is the composite-star ProjectSet the caller built
+// ahead of this stage (`(expr).*` lowering) — M0141-S2a-fix1-sweep-b reads
+// it only to decline the narrow-keep derivation below, the same guard
+// `finalSelectOutputNames` (ordered_input_narrow.go) already applies to the
+// ORDER BY Sort site.
+func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface, upper *upperRels, ps PlannerSettings, tupleFraction float64, starPS *ProjectSet) (Node, *resolveContext, *windowSurface, error) {
 	calls, err := collectWindowCalls(s)
 	if err != nil {
 		return nil, nil, nil, err
@@ -6954,7 +8215,25 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 	// contexts and column bindings, both derived from schemas the copies
 	// share, so it needs no rebuild.
 	if len(windowChain) > 0 {
-		built, werr := createWindowPaths(upper, windowChain, child, ps, tupleFraction)
+		// M0141-S2a-fix1-sweep-b: derive the WINDOW chain's narrow cost-input
+		// keep-sets (window_sort_narrow.go) before costing — `combinedByKey`
+		// and `currentCtx` are already exactly what `surface` below will
+		// hold, so this throwaway windowSurface is a byte-for-byte preview,
+		// not a second resolution. Declines to nil (today's full-width
+		// sizing) whenever a composite-star ProjectSet is pending, the same
+		// guard the ORDER BY site applies.
+		aboveNames, aboveKnown := finalSelectOutputNames(s, inputCtx, agg,
+			&windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey},
+			starPS, false)
+		chainKeep, chainKnown := deriveWindowChainNarrowKeeps(windowChain, aboveNames, aboveKnown)
+		if !chainKnown {
+			chainKeep = nil
+		}
+		relKeep, relKnown := deriveWindowRelNarrowKeep(windowChain[len(windowChain)-1], aboveNames, aboveKnown)
+		if !relKnown {
+			relKeep = nil
+		}
+		built, werr := createWindowPaths(upper, windowChain, child, ps, tupleFraction, chainKeep, relKeep)
 		if werr != nil {
 			return nil, nil, nil, werr
 		}
@@ -7356,49 +8635,82 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	return nil
 }
 
-// pruneUselessGroupByColumns implements the single-relation arm of PostgreSQL's
-// remove_useless_groupby_columns
-// (postgres/src/backend/optimizer/plan/initsplan.c:412).
+// pruneUselessGroupByColumns is PostgreSQL's remove_useless_groupby_columns
+// (postgres/src/backend/optimizer/plan/initsplan.c:412), over every base
+// relation of the FROM clause.
 //
-// When a GROUP BY lists two or more columns of ONE base relation and some
-// non-deferrable unique/PK index on that relation has a key that is a proper
-// subset of those columns, the surplus group columns are functionally
-// determined by the key and PG drops them, grouping on the minimal set. The
+// For each base relation, when a GROUP BY lists two or more of its columns and
+// some non-deferrable unique/PK index on it has a key that is a proper subset
+// of those columns, the surplus group columns are functionally determined by
+// the key and PG drops them, grouping on the minimal set. Relations are
+// decided independently and the drops are unioned (PG's `surplusvars[k]`,
+// one bitmapset per range-table entry); PG applies no outer-join guard, since
+// a NULL-extended key still determines its NULL-extended dependents. The
 // pruned columns remain addressable as functionally-determined passthroughs
 // because parse analysis validated them against the FULL group clause before
 // pruning ran (see aggregateSurface.prunedInputCols).
 //
+// M0145-0008i widened this from the single-relation arm to every relation;
+// the per-relation decision is uselessGroupByKeyForBinding, unchanged.
+//
 // Returns keep[i] == false for each group expression to drop, plus the
-// input-schema indices of the pruned ColumnRefs. Returns (nil, nil) unless
-// EVERY eligibility guard holds — fail-closed, matching PG's "skip" paths.
+// input-schema indices of the pruned ColumnRefs. Returns (nil, nil) when no
+// relation can drop anything — fail-closed, matching PG's "skip" paths.
 func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat catalog.Catalog) ([]bool, map[int]bool) {
 	// Guard: at least two GROUP BY items (initsplan.c:422).
 	if len(groupExprs) < 2 {
 		return nil, nil
 	}
-	// Guard: exactly one base relation (RTE_RELATION; initsplan.c:494). PG
-	// processes each rtable relation independently, but this slice implements
-	// only the single-relation arm; a multi-relation FROM is left untouched.
-	var base *rangeBinding
+	// Per base relation (PG's `rte->rtekind == RTE_RELATION`), the winning
+	// key's column set, keyed by the binding's source index. Subquery, CTE,
+	// VALUES and function-scan bindings carry a SYNTHESISED catalog.Table with
+	// no OID, and a view binding carries the view's own; neither is a plain
+	// relation with keys, so both are skipped explicitly rather than relying
+	// on IndexesOnTable finding nothing for them.
+	keyBySource := map[int16]map[string]bool{}
 	for i := range inputCtx.bindings {
 		b := &inputCtx.bindings[i]
-		if b.table == nil {
-			continue // subquery/CTE/function-scan bindings carry no catalog table
+		if b.table == nil || b.table.OID == 0 || b.table.View != nil {
+			continue
 		}
-		if base != nil {
-			return nil, nil
+		if inKey := uselessGroupByKeyForBinding(groupExprs, b, cat); inKey != nil {
+			keyBySource[b.sourceIdx] = inKey
 		}
-		base = b
 	}
-	if base == nil {
+	if len(keyBySource) == 0 {
 		return nil, nil
 	}
+	// Mark surplus: a relation's group ColumnRefs whose column is not in that
+	// relation's winning key. PG keeps the original group order with the
+	// surplus removed and always keeps non-Var / outer-Var items
+	// (initsplan.c:610-625).
+	keep := make([]bool, len(groupExprs))
+	prunedInputCols := map[int]bool{}
+	for i, g := range groupExprs {
+		keep[i] = true
+		cr, ok := g.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		if inKey, has := keyBySource[cr.SourceTableIdx]; has && !inKey[cr.Name] {
+			keep[i] = false
+			prunedInputCols[cr.Index] = true
+		}
+	}
+	return keep, prunedInputCols
+}
+
+// uselessGroupByKeyForBinding is one relation's turn in
+// remove_useless_groupby_columns: the column set of the smallest qualifying
+// unique key that is a proper subset of this relation's grouped columns, or
+// nil when the relation cannot drop anything.
+func uselessGroupByKeyForBinding(groupExprs []Expr, base *rangeBinding, cat catalog.Catalog) map[string]bool {
 	tbl := base.table
 	// Guard: an inheritance parent may produce duplicate rows from its child
 	// rels, which would not collapse under GROUP BY; partitioned tables are
 	// exempt because their children partition disjoint row sets (initsplan.c:502).
 	if base.tableOidColIdx > 0 && len(tbl.PartitionKey) == 0 {
-		return nil, nil
+		return nil
 	}
 	// Collect the GROUP BY items that are plain ColumnRefs of this relation,
 	// keyed by column name (a base-relation name maps 1:1 to an attno).
@@ -7414,7 +8726,7 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 	// (initsplan.c:507, bms_membership(relattnos) == BMS_MULTIPLE) — one column
 	// cannot make a redundant pair.
 	if len(groupColByName) < 2 {
-		return nil, nil
+		return nil
 	}
 	// Scan the relation's indexes for a qualifying unique key with the fewest
 	// columns (initsplan.c:578) — the fewer the key columns, the more surplus
@@ -7478,7 +8790,7 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 		}
 	}
 	if bestKey == nil {
-		return nil, nil
+		return nil
 	}
 	// Guard: a partitioned table's unique index is only a safe key if it covers
 	// the ENTIRE partition key. PG enforces this at index creation — "unique
@@ -7499,29 +8811,15 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 		}
 		for _, c := range tbl.PartitionKey {
 			if !inKey[c] {
-				return nil, nil
+				return nil
 			}
 		}
 	}
-	// Mark surplus: this relation's group ColumnRefs whose column is not in the
-	// winning key. PG keeps the original group order with the surplus removed
-	// and always keeps non-Var / outer-Var items (initsplan.c:610-625).
-	keep := make([]bool, len(groupExprs))
-	prunedInputCols := map[int]bool{}
 	inKey := map[string]bool{}
 	for _, c := range bestKey {
 		inKey[c] = true
 	}
-	for i, g := range groupExprs {
-		cr, ok := g.(*ColumnRef)
-		if ok && cr.SourceTableIdx == base.sourceIdx && !inKey[cr.Name] {
-			keep[i] = false
-			prunedInputCols[cr.Index] = true
-		} else {
-			keep[i] = true
-		}
-	}
-	return keep, prunedInputCols
+	return inKey
 }
 
 // groupByNameIsInputColumn is a name-*visibility* probe (not a bind) for
@@ -7669,6 +8967,16 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// (src/backend/parser/parse_agg.c) validates the target list before this
 	// pruning runs — a key column that pruning dropped still proves the
 	// dependency.
+	// M0145-0008d: groupOrigIdx[k] is the s.GroupBy index GroupExprs[k] came
+	// from, carried through the pruning below so buildGroupClause can match
+	// each surviving key against ORDER BY by its written form.
+	var groupOrigIdx []int
+	if len(groupExprs) == len(s.GroupBy) {
+		groupOrigIdx = make([]int, len(groupExprs))
+		for i := range groupOrigIdx {
+			groupOrigIdx[i] = i
+		}
+	}
 	originalGroupInputCols := map[int]bool{}
 	for inputIdx := range groupByInputCol {
 		originalGroupInputCols[inputIdx] = true
@@ -7696,13 +9004,20 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			}
 			newGroupExprs := make([]Expr, 0, newIdx)
 			newSchema := make(Schema, 0, newIdx)
+			var newOrigIdx []int
 			for i := range groupExprs {
 				if keep[i] {
 					newGroupExprs = append(newGroupExprs, groupExprs[i])
 					newSchema = append(newSchema, outputSchema[i])
+					if groupOrigIdx != nil {
+						newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+					}
 				}
 			}
 			groupExprs = newGroupExprs
+			if groupOrigIdx != nil {
+				groupOrigIdx = newOrigIdx
+			}
 			outputSchema = newSchema
 			for key, old := range groupByExpr {
 				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
@@ -7950,6 +9265,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		schema:        outputSchema,
 		GroupingSets:  gsSets,
 		GroupingMasks: groupingMasks,
+	}
+	// M0145-0008d: processed_groupClause (groupclause.go). Grouping sets and
+	// the default order leave it nil.
+	if gsSets == nil && groupOrigIdx != nil && len(groupOrigIdx) == len(groupExprs) {
+		aggNode.GroupClause = buildGroupClause(s, groupOrigIdx)
 	}
 	// B-01c second cut: keys-only construction stamp (above not yet built,
 	// passthroughs not yet appended — the append sites below re-stamp to
@@ -9838,7 +11158,12 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 	bmIdxCost := costBitmapIndexScan(cp, in)
 	tuples := clampRowEst(sel * relTuples)
 	pages, tuples := computeBitmapPages(tuples, relTuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
-	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T)
+	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T,
+		// Rule-based chooser: no cost competition exists here (shape match,
+		// no addPath), so the qpqual term stays 0 — R1
+		// (plan-parity-fix-take2) prices only the search's candidates.
+		// Dies with the legacy planner (P6).
+		0)
 	if bm.Total >= idxCost.Total {
 		return nil
 	}
@@ -9858,6 +11183,224 @@ func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *Colu
 		},
 		schema: schema,
 	}
+}
+
+// indexLeadsRegIdentifierArray reports whether the index's leading
+// column is a reg*-identifier ARRAY (regclass[] etc.). See the R46
+// carve-out in seqWinsEqualityProbe (K100).
+func indexLeadsRegIdentifierArray(tbl *catalog.Table, idx *catalog.Index) bool {
+	if tbl == nil || idx == nil || len(idx.Columns) == 0 {
+		return false
+	}
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name != idx.Columns[0] {
+			continue
+		}
+		t := tbl.Columns[i].Type
+		if !t.IsArray {
+			return false
+		}
+		switch t.Name {
+		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation",
+			"regnamespace", "regdictionary":
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// seqWinsEqualityProbe is R46 (K98): the `add_paths_to_base_rel`
+// competition for the one site the legacy planner still owns. The
+// equality arm below hands back an IndexScan unconditionally on
+// shape match; on a 1-page table like TPC-DS `reason` that loses to
+// a sequential scan the way PG's own costing decides it
+// (cost_seqscan ≈ 1 page vs index descent + random heap fetch).
+//
+// Both candidates are priced by the SAME cost functions the join
+// search uses (`costIndexScan` / `costSeqscan`), mirroring the
+// M0134-0185 bitmap-vs-index precedent directly above. true means
+// "decline the index": the caller falls back to its Seq Scan, which
+// is the shape PG lands on. Anything unmeasurable (no stats,
+// non-positive selectivity) returns false — today's behavior —
+// never a fabricated seq win.
+func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
+	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+		return false
+	}
+	// R46 carve-out (K100): sequential comparison of reg*-identifier
+	// arrays is broken in the executor — an unknown literal is
+	// coerced to the SCALAR reg type (resolveExpr drops IsArray, so
+	// `{pg_class}` resolves whole and misses with 42P01), and even
+	// explicitly-cast arrays compare by display text (OID vs name
+	// rendering) instead of element OIDs; compareDatum carries no
+	// catalog to canonicalise either side. Declining here would ship
+	// ERRORs/empty answers where the index path is values-correct.
+	// PG seq-scans these shapes, so the carve-out is a workaround,
+	// not the goal state: it dies with K100's executor fix, at which
+	// point the 3 reg* array unit sub-cases return to SeqScan
+	// expectations. Scalar reg* probes are unaffected (their
+	// per-row resolution works — covered by passing tests).
+	if indexLeadsRegIdentifierArray(tbl, idx) {
+		return false
+	}
+	cp := ps.costParams()
+	relTuples := float64(tbl.Stats.RowCount)
+	relPages := baseRelPages(tbl, relTuples)
+	// The equality qual against a synthetic scan: the same
+	// selectivity the search would price this probe at
+	// (costindex.go:512 precedent). 1.0 here would be the
+	// ordering-only collapse the inputs struct warns about and
+	// would flip every legacy probe corpus-wide.
+	//
+	// The synthetic scan carries the probe index's own uniqueness, so
+	// eqsel's isunique branch applies (1/reltuples) exactly as it does on a
+	// real scan whose UniqueKeys the planner stamped. Without it a unique
+	// point probe was priced at 1/200 of the table and lost to the seq scan
+	// once CREATE INDEX published the heap size (M0145-0029 follow-up; the
+	// multiple-row-versions isolation spec).
+	probeScan := &SeqScan{Table: tbl}
+	if idx != nil && idx.Unique && !idx.HasPredicate && len(idx.Columns) > 0 {
+		probeScan.UniqueKeys = [][]string{append([]string(nil), idx.Columns...)}
+	}
+	sel := clauseSelectivity(queryClause, probeScan)
+	if !(sel > 0) {
+		return false
+	}
+	if sel > 1 {
+		sel = 1
+	}
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	T := float64(relPages)
+	if T < 1 {
+		T = 1
+	}
+	in := indexScanInputs{
+		relPages:    relPages,
+		relTuples:   relTuples,
+		indexPages:  indexPages,
+		indexTuples: indexTuples,
+		treeHeight:  treeHeight,
+		selectivity: sel,
+		// Single-column equality probe on a UNIQUE single-column
+		// index matches at most one tuple (btcostestimate clamp,
+		// costindex.go:336-338). This arm builds only `Key`
+		// (single-column) probes, so a multi-column index never
+		// has all keys bound here.
+		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && len(idx.Columns) == 1,
+		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages:         T,
+		loopCount:               1,
+		// numQualOps 0: the single equality IS the index qual, so
+		// no restriction conjunct is left for the heap fetch
+		// (costsize.c:822-830). numSAScans 1: plain equality, no
+		// ScalarArrayOp product.
+	}
+	idxCost := costIndexScan(cp, in)
+	// The seq rival evaluates the one equality per tuple scanned.
+	seqCost := costSeqscan(cp, relPages, relTuples, 1)
+	// Strict <: ties keep the index — today's behavior, minimal
+	// Strict <: ties keep the index — today's behavior, minimal
+	// blast radius. A tie is never the 1-page-vs-descent shape
+	// this round exists for.
+	return seqCost.Total < idxCost.Total
+}
+// planIsBareSeqScanTree reports whether `n` is a single-relation scan tree
+// that reached no index path at all — a `*SeqScan` under nothing but
+// recognised, index-neutral wrappers.
+//
+// It is deliberately FAIL-CLOSED: any node this function does not recognise
+// makes it return false, so its one caller (the M0145-0008 one-relation index
+// producer above) does nothing rather than overriding a tree it cannot read.
+// The caller's contract is "fill the hole where this route produced no index
+// path", never "replace a path someone else chose", and that contract is only
+// safe if an unrecognised shape counts as "not a hole".
+func planIsBareSeqScanTree(n Node) bool {
+	switch x := n.(type) {
+	case *SeqScan:
+		return true
+	case *Filter:
+		return planIsBareSeqScanTree(x.Child)
+	case *Project:
+		return planIsBareSeqScanTree(x.Child)
+	}
+	return false
+}
+
+// flattenStrandedSeqScanFilters merges a chain of `*Filter` wrappers over a
+// single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
+// conjunct in the chain is one the search refuses as a leaf qual
+// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink).
+//
+// It exists for the one-relation route that skips the rule-based bypass
+// (M0145-0027, M0145-0008): there the search attaches the scope's plain quals
+// to a SEARCHED leaf Filter and holds the ineligible ones in a residual Filter
+// above it. PG has no such split — every one of these is a restriction clause
+// of the one base rel, evaluated in the scan's single qual list
+// (`./postgres/src/backend/optimizer/plan/createplan.c:5420`
+// `order_qual_clauses`). The split is not only cosmetic:
+//
+//   - a correlated equality above a searched leaf is invisible to
+//     `rewriteScanInputsWithSingleTablePredicates`, the producer that turns it
+//     into an index probe on the bypass arm (TPC-H Q20, M0145-0027);
+//   - a sublink conjunct above a searched leaf is charged per input row of
+//     the leaf instead of after the cheap quals, and EXPLAIN renders only
+//     one of the two Filters (TPC-DS Q41, the SF0.25 parity floor).
+//
+// Order: the merged list is sorted by source position — the WHERE's written
+// order, which is exactly the list the bypass arm builds. PG orders by
+// per-tuple cost (`order_qual_clauses`); goopg has no per-clause cost
+// evaluator, so the bypass order is the faithful baseline here (ledgered).
+// Conjuncts without a source position (derived clauses) keep their relative
+// order after the positioned ones.
+//
+// Coordinates: every Filter in the chain sits directly on the same SeqScan
+// with no Project between, so all their predicates already address the
+// SeqScan's own output — merging needs no rebase. Any other node in the chain
+// (a Project, a narrowed boundary, a second relation) declines, fail-closed,
+// as does a chain with no ineligible conjunct: then the search's own
+// election stands and nothing is overridden.
+func flattenStrandedSeqScanFilters(n Node) (Node, bool) {
+	top, ok := n.(*Filter)
+	if !ok {
+		return nil, false
+	}
+	var conjs []Expr
+	cur := Node(top)
+	for {
+		f, isF := cur.(*Filter)
+		if !isF {
+			break
+		}
+		conjs = append(conjs, splitAnd(f.Predicate)...)
+		cur = f.Child
+	}
+	ss, ok := cur.(*SeqScan)
+	if !ok {
+		return nil, false
+	}
+	if _, single := top.Child.(*SeqScan); single {
+		// Already the bypass shape; nothing is stranded.
+		return nil, false
+	}
+	stranded := false
+	for _, c := range conjs {
+		if !conjunctIsLocalEligible(c) {
+			stranded = true
+			break
+		}
+	}
+	if !stranded {
+		return nil, false
+	}
+	sort.SliceStable(conjs, func(i, j int) bool {
+		pi, pj := conjs[i].Pos(), conjs[j].Pos()
+		if pi <= 0 || pj <= 0 {
+			return pi > 0 && pj <= 0
+		}
+		return pi < pj
+	})
+	return &Filter{pos: top.Pos(), Child: ss, Predicate: joinPlannerAnd(conjs)}, true
 }
 
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
@@ -9961,7 +11504,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 			// Var-op-Const shape — it is passed through only so the helper's
 			// (correct) refusal is by shape, not by omission.
 			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
 			if idx == nil {
 				return nil, false, nil
 			}
@@ -10054,8 +11597,15 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	// literal Const (ParamRef, CastExpr, TypedStringLit) — the helper's
 	// toLiteralValue-based recognizer refuses those by shape, as it should.
 	queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
 	if idx == nil {
+		return nil, false, nil
+	}
+	// R46 (K98): cost the legacy funnel's index-vs-seq choice with the
+	// same cost functions the search uses. A 1-page table loses to a
+	// sequential scan; declining returns the caller to its Seq Scan
+	// fallback — the shape PG lands on.
+	if seqWinsEqualityProbe(tbl, idx, queryClause, ctx.settings) {
 		return nil, false, nil
 	}
 	return &IndexScan{
@@ -10165,7 +11715,9 @@ func trySAOPIndexScan(ix *parser.InExpr, tbl *catalog.Table, ctx *resolveContext
 		}
 		keys = append(keys, rk)
 	}
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
+	// The IN list is the whole restriction here, and it binds only the
+	// leading column.
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil, nil)
 	if idx == nil {
 		return nil, false, nil
 	}
@@ -10373,7 +11925,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// The index-only shape is off the table when the session disabled it
 		// (review/260831-2 X-8) — the SeqScan+Agg fallback below is what PG
 		// falls back to as well.
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil); idx != nil &&
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil, wherePred); idx != nil &&
 			!indexOnlyScanRejected(cat) &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
@@ -10635,7 +12187,9 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 		// it. `limitTuples` is -1: this arm re-attaches ORDER BY / DISTINCT
 		// only, and the statement's LIMIT (if any) is applied above it by the
 		// caller, exactly as on the un-rewritten Aggregate path.
-		out = createOrderedPaths(upper, out, keys, s.Pos(), ps.costParams(), tupleFraction, -1)
+		// M0141-S2a-fix1-sweep-a: outSchema above is already the min/max
+		// rewrite's own single-column final row — nothing to narrow.
+		out = createOrderedPaths(upper, out, keys, s.Pos(), ps.costParams(), tupleFraction, -1, nil)
 	}
 	if s.Distinct {
 		// C-16: same DISTINCT upper-rel producer as the normal arm.
@@ -10791,7 +12345,11 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // specialization (both clauses are `Var op Const` over the same column, same
 // operator, equal constant). A nil queryClause can never prove anything, so
 // callers that pass nil keep today's blanket decline exactly as before.
-func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause Expr) *catalog.Index {
+//
+// quals is the resolved restriction the scan will apply (nil when none is
+// known). It only widens which composite index is complete for the probe:
+// see the NULL-key rule below.
+func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause, quals Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
@@ -10832,7 +12390,14 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		if len(idx.Columns) == 1 {
 			return idx
 		}
-		if composite == nil {
+		// A composite index is probed on its leading column only, so every
+		// later key column is unbound: a row with a NULL there has no entry
+		// (goopg stores no NULL-keyed index entries) and the probe would
+		// silently miss it — `WHERE a = 10` on (a, b) lost (10, NULL). An
+		// index is complete for the probe only when each unbound key column
+		// is NOT NULL or strictly restricted by quals (a NULL there fails the
+		// qual anyway) — the path-search producers' rule, widened by quals.
+		if composite == nil && indexUnboundKeysNullSafe(tbl, idx, 1, quals) {
 			composite = idx
 		}
 	}
@@ -11051,6 +12616,9 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	if len(tbl.PartitionKey) > 0 {
 		return nil, false, nil
 	}
+	// The whole restriction, resolved, for the index finder's NULL-key rule
+	// (a nil result only makes that rule stricter).
+	rangeQuals, _ := resolveExpr(where, ctx)
 	conjuncts := collectAndConjuncts(where)
 
 	var chosenColName string
@@ -11118,7 +12686,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// Ensure column is from the target table (not outer ref)
 		if chosenColName == "" {
 			// First indexed column: look up a B-tree index for it
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil, rangeQuals)
 			if idx == nil {
 				continue
 			}
@@ -12999,7 +14567,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 					continue
 				}
 			}
-			idx := b.offset + i
+			idx := bindingColumnOffset(b, i, c.Name)
 			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
@@ -14423,6 +15991,8 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		out.Plan = inner
+		// Subquery: see ExistsExpr.Subquery (M0142-0008a-3i-route-a step 1).
+		out.Subquery = x.Subquery
 		out.IsNonCorrelated = !planHasOuterRef(inner)
 	} else {
 		out.List = make([]Expr, len(x.List))
@@ -14451,7 +16021,10 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+	// Subquery: retain the unplanned body alongside the plan built from it
+	// (M0142-0008a-3i-route-a step 1) — see ExistsExpr.Subquery.
+	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner,
+		Subquery: x.Subquery, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
 // planHasOuterRef reports whether any expression anywhere in the
@@ -14493,41 +16066,231 @@ func planHasOuterRef(node Node) bool {
 // parent scope at the current nesting point (1 at the top call,
 // incrementing by one for each subquery level recursed into — the
 // same convention joinlayout.go's remapOuterRefsInSubplan already uses).
+// planHasEscapingOuterRef reports whether `node`'s subtree demands an
+// outer value that nothing INSIDE the subtree supplies — i.e. a genuinely
+// escaping reference — walking the plan STRUCTURALLY so that a binder
+// standing between a reference and this scope is actually seen.
+//
+// R29. The binder-blind predecessor (now `planHasEscapingOuterRefFlat`)
+// flattened the subtree with `walkPlanExprs` and reported ANY
+// `OuterColumnRef` at `depth` or beyond. That over-reports whenever the
+// subtree contains its own `Join{Lateral:true}`: the join pushes the left
+// row onto `ctx.OuterRows` before re-evaluating its right side, so a
+// level-`depth` reference on that right side is bound BY IT and never
+// reaches this scope. R25 slice 1 made that shape common — a decomposed
+// NLI probe carries `OuterColumnRef` keys (`outerParamKey`, level 1)
+// under exactly such a join — so the guard began reporting bound probe
+// keys as escaping. `chainCarriesLateral` then declined the enclosing
+// join search, which fell to the legacy planner: measured as
+// `seam-decline reason=lateral` on TPC-DS Q30 (a CROSS PRODUCT where PG
+// index-scans both inner sides, 3 s -> >300 s) and Q68.
+//
+// Q30 was first patched by returning false for a `*CTEScan` outright, on
+// the reasoning that a `WITH` body cannot reference the enclosing query.
+// The PG 18.3 oracle refutes that reasoning: `LATERAL` governs visibility
+// of SIBLING FROM items only, and an enclosing QUERY LEVEL is visible
+// from a CTE body (and from a non-lateral derived table) by ordinary
+// correlation --
+//
+//	SELECT 1 FROM store s WHERE EXISTS (            -- accepted by PG
+//	  WITH c AS (SELECT s.s_store_sk AS k) SELECT 1 FROM c)
+//	WITH c AS (SELECT s.s_store_sk AS k)            -- rejected by PG:
+//	SELECT 1 FROM store s, c                        -- "missing FROM-clause
+//	                                                --  entry for table s"
+//
+// so that early-return could hide a real escaping reference. Counting
+// binders subsumes it: the CTE body's probe keys are bound by the lateral
+// join inside the body, and a reference that truly reaches out still
+// escapes. The special case is therefore gone, not merely supplemented.
+//
+// `depth` keeps its meaning — the Level value that refers to this scope's
+// immediate parent — and grows by one whenever the walk descends through
+// something that BINDS that level.
+//
+// Node kinds not enumerated here fall through to the flat fallback, so an
+// unrecognised node declines exactly as it did before this change; the
+// change can only ever REMOVE false declines, never add one.
 func planHasEscapingOuterRef(node Node, depth int) bool {
+	if node == nil {
+		return false
+	}
+	// The BINDERS are the only node kinds named explicitly: they are the
+	// only ones whose children are not all evaluated in this same scope.
+	switch n := node.(type) {
+	case *Join:
+		// A lateral join binds level `depth` for its right side only: the
+		// executor pushes the LEFT row (`openLateral`), so the left side is
+		// evaluated in this scope, unbound.
+		right := depth
+		if n.Lateral {
+			right++
+		}
+		return planHasEscapingOuterRef(n.Left, depth) ||
+			planHasEscapingOuterRef(n.Right, right) ||
+			exprsHaveEscapingOuterRef(depth, n.Predicate, n.LeftKey, n.RightKey)
+	case *NestedLoopIndexJoin:
+		// The fused NLI is a binder by construction: it binds its inner
+		// probe's keys from the outer row (R25 decomposes it into the
+		// `Join{Lateral}` arm above; until then both spellings must agree).
+		return planHasEscapingOuterRef(n.Outer, depth) ||
+			planHasEscapingOuterRef(n.Inner, depth+1) ||
+			exprsHaveEscapingOuterRef(depth, n.Predicate)
+	}
+	// Everything else is a pass-through for scoping purposes: its children
+	// are evaluated in this scope, so they are walked at `depth` unchanged.
+	// Children are discovered by REFLECTION rather than by an 18-arm switch
+	// over the single-child containers (Aggregate, Sort, Limit, Distinct,
+	// CTEScan, ...). A hand-written switch here would have to be kept in
+	// step with `walkPlanExprs`, and the first version of this function got
+	// exactly that wrong: it enumerated six kinds and fell through to the
+	// flat fallback for `*Aggregate`, which is precisely the shape of every
+	// TPC-DS CTE body -- so the fallback flattened past the binder inside
+	// the body and re-reported bound probe keys as escaping (measured: the
+	// TPC-DS `lateral` decline count went 1 -> 4).
+	kids, ok := planChildNodes(node)
+	if !ok {
+		return planHasEscapingOuterRefFlat(node, depth)
+	}
+	for _, k := range kids {
+		if planHasEscapingOuterRef(k, depth) {
+			return true
+		}
+	}
+	return nodeOwnExprsHaveEscapingOuterRef(node, depth)
+}
+
+// emptyPlanStub stands in for a child link while a node's OWN expressions
+// are being walked. A nil child would make `walkPlanExprs` (or an
+// `Output()` call underneath it) dereference nothing; an empty `Values`
+// carries no expressions of its own and a nil schema, so it contributes
+// nothing to the walk.
+var emptyPlanStub Node = &Values{}
+
+// planChildNodes returns the plan children reachable from `node` through
+// its exported `Node` and `[]Node` fields. ok is false when `node` is not
+// a pointer to a struct, in which case the caller keeps the conservative
+// flat behaviour rather than guessing.
+func planChildNodes(node Node) ([]Node, bool) {
+	v := reflect.ValueOf(node)
+	if v.Kind() != reflect.Ptr || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return nil, false
+	}
+	e := v.Elem()
+	var kids []Node
+	for i := 0; i < e.NumField(); i++ {
+		f := e.Field(i)
+		if !f.CanInterface() { // unexported: planner bookkeeping, not plan structure
+			continue
+		}
+		switch f.Type() {
+		case nodeIfaceType:
+			if !f.IsNil() {
+				kids = append(kids, f.Interface().(Node))
+			}
+		case nodeSliceType:
+			for j := 0; j < f.Len(); j++ {
+				if el := f.Index(j); !el.IsNil() {
+					kids = append(kids, el.Interface().(Node))
+				}
+			}
+		}
+	}
+	return kids, true
+}
+
+var (
+	nodeIfaceType = reflect.TypeOf((*Node)(nil)).Elem()
+	nodeSliceType = reflect.TypeOf([]Node(nil))
+)
+
+// nodeOwnExprsHaveEscapingOuterRef judges the expressions `node` carries
+// itself, excluding its children's. It does that by flat-walking a shallow
+// COPY whose child links are stubbed out, so the expression inventory comes
+// from `walkPlanExprs` -- the same switch every other reader uses -- instead
+// of a second hand-written list that could drift from it.
+func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
+	v := reflect.ValueOf(node)
+	cp := reflect.New(v.Elem().Type())
+	cp.Elem().Set(v.Elem())
+	e := cp.Elem()
+	for i := 0; i < e.NumField(); i++ {
+		f := e.Field(i)
+		if !f.CanSet() {
+			continue
+		}
+		switch f.Type() {
+		case nodeIfaceType:
+			if !f.IsNil() {
+				f.Set(reflect.ValueOf(emptyPlanStub))
+			}
+		case nodeSliceType:
+			f.Set(reflect.Zero(f.Type()))
+		}
+	}
+	stub, ok := cp.Interface().(Node)
+	if !ok {
+		return planHasEscapingOuterRefFlat(node, depth)
+	}
+	return planHasEscapingOuterRefFlat(stub, depth)
+}
+
+// exprsHaveEscapingOuterRef is the expression half of the structural walk:
+// the references a node carries in its OWN expressions, which are evaluated
+// in that node's scope and so are judged at `depth` directly.
+func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
+	found := false
+	for _, e := range exprs {
+		if e == nil || found {
+			continue
+		}
+		walkExprTree(e, func(inner Expr) {
+			if found {
+				return
+			}
+			if outerRefEscapes(inner, depth) {
+				found = true
+			}
+		})
+	}
+	return found
+}
+
+// outerRefEscapes judges ONE expression node, and is the single place the
+// level rule and the sublink recursion live so the structural walk and the
+// flat fallback cannot drift apart (the sibling-paths hazard).
+func outerRefEscapes(inner Expr, depth int) bool {
+	switch x := inner.(type) {
+	case *OuterColumnRef:
+		return x.Level >= depth
+	case *SubqueryExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *ArraySubqueryExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *MultiAssignSubqRow:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *InExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	case *ExistsExpr:
+		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+	}
+	return false
+}
+
+// planHasEscapingOuterRefFlat is the conservative, binder-BLIND fallback:
+// it flattens the whole subtree and reports any `OuterColumnRef` at
+// `depth` or beyond, regardless of whether something inside the subtree
+// binds it. It is what every node kind `planHasEscapingOuterRef` does
+// not enumerate still gets, so an unknown node declines exactly as it
+// did before R29 (fail-closed).
+func planHasEscapingOuterRefFlat(node Node, depth int) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
 			return
 		}
 		walkExprTree(e, func(inner Expr) {
-			if found {
-				return
-			}
-			switch x := inner.(type) {
-			case *OuterColumnRef:
-				if x.Level >= depth {
-					found = true
-				}
-			case *SubqueryExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *ArraySubqueryExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *MultiAssignSubqRow:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *InExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
-			case *ExistsExpr:
-				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
-					found = true
-				}
+			if !found && outerRefEscapes(inner, depth) {
+				found = true
 			}
 		})
 	})
@@ -14724,6 +16487,33 @@ func resolveCaseExprAfterAggregate(x *parser.CaseExpr, agg *aggregateSurface) (E
 		out.Else = els
 	}
 	return out, nil
+}
+
+// castTargetTakesStringLiteral says whether `cast('<string>' as T)` may be
+// resolved straight to a `TypedStringLit` of type T (R34 / K45), i.e. whether
+// T is one of the types for which the literal's own text IS the value's
+// canonical form.
+//
+// Deliberately narrow: the DATE/TIME family only. That is where the estimate
+// defect lives (every TPC-DS and TPC-H date bound) and where the conversion is
+// plainly information-preserving — `formatExprConstant` renders
+// `TypedStringLit.Value` verbatim and ANALYZE stamped the histogram from the
+// same text.
+//
+// The numeric and integer targets are excluded ON PURPOSE even though
+// `evalTypedStringLit` accepts them. Upstream flags the trap in the very
+// comment this change transliterates (parse_coerce.c:238-243): a type's INPUT
+// function does not behave like its CONVERSION function — "int4's typinput
+// function will reject '1.2', whereas float-to-int type conversion will round
+// to integer". Routing `cast('1.2' as int4)` through the literal path would
+// change which of those two behaviours a query gets, so it keeps the runtime
+// cast. Widening this set is a separate change with its own oracle cases.
+func castTargetTakesStringLiteral(typeName string) bool {
+	switch typeName {
+	case "date", "time", "timetz", "timestamp", "timestamptz":
+		return true
+	}
+	return false
 }
 
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
@@ -15020,6 +16810,43 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		typeName := strings.ToLower(x.Type.Name)
 		srcType := exprType(operand).Name
 		typmod := encodeTypmod(typeName, x.Typmods)
+		// R34 / K45: a cast whose operand is an UNTYPED string literal is
+		// resolved to a typed literal here, not left as a runtime cast.
+		//
+		// This is `coerce_type`'s unknown-Const arm (parse_coerce.c:232-250):
+		// "Input is a string constant with previously undetermined type.
+		// Apply the target type's typinput function to it to produce a
+		// constant of the target type." PG therefore never presents a cast
+		// node to its planner for this shape, and its EXPLAIN prints
+		// `'2000-08-19'::date` — a Const.
+		//
+		// goopg did leave a `*CastExpr`, and `selectivity.go`'s
+		// `isConstExpr` admits five literal kinds but NOT `*CastExpr`, so a
+		// cast bound silently skipped the histogram and took the DEFAULT
+		// range selectivity. Measured on the TPC-DS SF0.5 clone,
+		// `d_date between cast(..) and cast(..)`: 8116 rows estimated
+		// against PG's 14 (15 actual); TPC-H's `l_shipdate <= cast(..)`
+		// gave 2,000,418 = 6,001,215/3 exactly — the 0.3333 default.
+		//
+		// `TypedStringLit` is the node the `DATE 'x'` spelling already
+		// produces, and it is what makes this safe rather than a new
+		// evaluation: nothing is computed at plan time (PG's own comment
+		// notes typinput may be non-immutable — `date_in` is STABLE — and
+		// that it would rather defer, but cannot represent the call), the
+		// value string is carried through unchanged, and
+		// `formatExprConstant` renders it byte-equal to what ANALYZE
+		// stamped into the histogram.
+		//
+		// Restricted to a BARE string literal operand: a cast over anything
+		// else (including an already-typed literal, where the target type's
+		// input function is NOT the right conversion — upstream's note that
+		// int4's typinput rejects "1.2" while float->int rounds) keeps the
+		// runtime cast.
+		if lit, isStr := operand.(*StringConst); isStr && typmod == 0 {
+			if castTargetTakesStringLiteral(typeName) {
+				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
+			}
+		}
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
@@ -15257,7 +17084,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		for i, c := range b.table.Columns {
 			if strings.EqualFold(c.Name, x.Column) {
-				idx := b.offset + i
+				idx := bindingColumnOffset(b, i, c.Name)
 				if level == 0 {
 					return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 				}
@@ -15314,7 +17141,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if hidden {
 				continue
 			}
-			idx := b.offset + i
+			idx := bindingColumnOffset(b, i, c.Name)
 			if found != nil {
 				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
 			}
@@ -15513,6 +17340,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if len(idxScan.SAOPKeys) > 0 {
 		return proj
 	}
+	// M0145-0029 slice 2b: likewise a RangePrefix probe. IndexOnlyScan has no
+	// RangePrefix, so copying LowKey/HighKey would re-aim the bound at the
+	// LEADING column and return wrong rows (measured: 9476 rows for PG's 2).
+	if len(idxScan.RangePrefix) > 0 {
+		return proj
+	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
 	// because indexOnlyScanOp called the inclusive RangeScan and copied no
 	// LowOp/HighOp, so with the part-5 Filter drop the boundary value leaked
@@ -15701,6 +17534,9 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			AnyOp:           x.AnyOp,
 			AllOp:           x.AllOp,
 			Plan:            x.Plan,
+			// Subquery: a remap copies the SAME sublink, so the retained
+			// body still describes its Plan (M0142-0008a-3i-route-a).
+			Subquery:        x.Subquery,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
 		}
@@ -15803,6 +17639,12 @@ func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
 	// Find a covering, ordering-providing index.
 	for _, idx := range cat.IndexesOnTable(seqScan.Table) {
 		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
+			continue
+		}
+		// A full-range scan binds no key column; goopg stores no index entry
+		// whose key has a NULL column, so a nullable key column would lose
+		// rows (indexUnboundKeysNotNull).
+		if !indexUnboundKeysNotNull(seqScan.Table, idx, 0) {
 			continue
 		}
 		if idx.Method != "" && idx.Method != "btree" {
@@ -15939,6 +17781,9 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			AnyOp:           x.AnyOp,
 			AllOp:           x.AllOp,
 			Plan:            x.Plan,
+			// Subquery: a remap copies the SAME sublink, so the retained
+			// body still describes its Plan (M0142-0008a-3i-route-a).
+			Subquery:        x.Subquery,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
 		}
@@ -16142,6 +17987,40 @@ func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
 	return -1
 }
 
+// spliceOrderSortBelowDistinct removes the ORDER BY stage's Sort from under
+// a SELECT DISTINCT's input (M0141-S2b-4d). It walks down from the DISTINCT
+// input through Project/Filter wrappers only — anything else between them
+// (a Limit that could not be deferred, a LockRows, a ProjectSet) means the
+// Sort's order is consumed below the DISTINCT, and the splice declines. The
+// wrapper directly above the Sort is re-pointed at the Sort's child; the
+// returned node is the (possibly unchanged) DISTINCT input.
+func spliceOrderSortBelowDistinct(in Node, orderSort *Sort) (Node, bool) {
+	if in == nil || orderSort == nil {
+		return in, false
+	}
+	if in == Node(orderSort) {
+		return orderSort.Child, true
+	}
+	for cur := in; ; {
+		switch n := cur.(type) {
+		case *Project:
+			if n.Child == Node(orderSort) {
+				n.Child = orderSort.Child
+				return in, true
+			}
+			cur = n.Child
+		case *Filter:
+			if n.Child == Node(orderSort) {
+				n.Child = orderSort.Child
+				return in, true
+			}
+			cur = n.Child
+		default:
+			return in, false
+		}
+	}
+}
+
 // distinctSortKeyOutputIndex maps a SELECT DISTINCT sort key onto the
 // select-list position it occupies, or returns -1 when it occupies none.
 //
@@ -16252,24 +18131,3 @@ func findExprInTargets(re Expr, targets []Expr) int {
 	return -1
 }
 
-
-// joinTreeHasOuterLink reports whether node is a join tree carrying at least
-// one non-INNER, non-CROSS link — the gate for M0134-0188's WHERE-less seam
-// arm. Cheap and shape-only: it answers "is there an outer spine here for
-// `splitOuterSpine` to peel", not whether the peel will succeed.
-func joinTreeHasOuterLink(node Node) bool {
-	j, ok := node.(*Join)
-	if !ok {
-		return false
-	}
-	for {
-		if j.Type != JoinTypeInner && j.Type != JoinTypeCross {
-			return true
-		}
-		next, ok := j.Left.(*Join)
-		if !ok {
-			return false
-		}
-		j = next
-	}
-}

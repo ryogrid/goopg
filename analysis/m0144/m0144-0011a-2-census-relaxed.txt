@@ -1,0 +1,286 @@
+##Q1
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=273.3228265306123
+##Q2
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=38.335
+##Q3
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=false ncommon=1 totalcost=3730.8918143685487
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q4
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7.724999999999998
+##Q5
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=5.890000000000001
+##Q6
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=false ncommon=0 totalcost=35244.710362245845
+##Q7
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=true ncommon=1 totalcost=9526.44435143777
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q8
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=true ncommon=1 totalcost=19523.123059426016
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q9
+##Q10
+DPPATH seed producer=upper.ordered.seed kind=6 keys=8 contained=true ncommon=8 totalcost=25053.215490161285
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q11
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4.7775
+##Q12
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4771.847104638449
+##Q13
+##Q14
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=40347.33785628822
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.0424999999999995
+##Q15
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=true ncommon=1 totalcost=6055.209148695636
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q16
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=17567.913594129473
+##Q17
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=true ncommon=3 totalcost=3708.4102737297203
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q18
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6015.375894888113
+##Q19
+DPPATH seed producer=upper.ordered.seed kind=6 keys=4 contained=false ncommon=0 totalcost=8103.28844542824
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q20
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=5977.3328324192
+##Q21
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=2 contained=true ncommon=2 totalcost=25543.80208583611
+##Q22
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=44906.24785836277
+##Q23
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=22495.427065295215
+##Q24
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.0425
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.0425
+##Q25
+DPPATH seed producer=upper.ordered.seed kind=6 keys=4 contained=true ncommon=4 totalcost=3664.4953744780314
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q26
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=true ncommon=1 totalcost=13623.874168308872
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q27
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=19489.624432991204
+##Q28
+##Q29
+DPPATH seed producer=upper.ordered.seed kind=6 keys=4 contained=true ncommon=4 totalcost=3585.253332569405
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q30
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1024.92723
+##Q31
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=138.42
+##Q32
+##Q33
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=17.3873605278103
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=10.1475
+DPGROUP elected shape=Sort-over-Aggregate strategy=0
+##Q34
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13.28525
+##Q35
+DPPATH seed producer=upper.ordered.seed kind=6 keys=6 contained=true ncommon=6 totalcost=226606.41956617543
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q36
+##Q37
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=true ncommon=1 totalcost=26919.22733867707
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q38
+##Q39
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.81
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.81
+##Q40
+DPPATH seed producer=upper.ordered.seed kind=6 keys=2 contained=true ncommon=2 totalcost=13050.090498696965
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q41
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=180.78
+DPPATH seed producer=upper.ordered.seed kind=8 keys=1 contained=true ncommon=1 totalcost=185.18130686535628
+DPPATH seed producer=upper.ordered.seed kind=8 keys=1 contained=true ncommon=1 totalcost=187.82761373071256
+##Q42
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=false ncommon=0 totalcost=8106.052241935105
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q43
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=47492.566643526385
+##Q44
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7640.4275
+##Q45
+DPPATH seed producer=upper.ordered.seed kind=6 keys=2 contained=true ncommon=2 totalcost=7761.328385590021
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q46
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3469.4787200000005
+##Q47
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=38.25000000000001
+##Q48
+##Q49
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=14971.432876118333
+##Q50
+DPPATH seed producer=upper.ordered.seed kind=6 keys=10 contained=true ncommon=10 totalcost=3501.9902526768014
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q51
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=380.0244896534951
+##Q52
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=false ncommon=1 totalcost=8106.052241935105
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q53
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6041.241324672302
+##Q54
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=1 totalcost=1.150537478050103
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=0.605
+DPGROUP elected shape=Sort-over-Aggregate strategy=0
+##Q55
+DPPATH seed producer=upper.ordered.seed kind=6 keys=2 contained=false ncommon=0 totalcost=8087.2580287838055
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q56
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=1.6911933293917698
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=1.1775
+DPGROUP elected shape=Sort-over-Aggregate strategy=0
+##Q57
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=18.01
+##Q58
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4.5249999999999995
+##Q59
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=147.755
+##Q60
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=1 totalcost=3.1337488726413554
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=2.0775
+DPGROUP elected shape=Sort-over-Aggregate strategy=0
+##Q61
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=34747.13328527331
+##Q62
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6676.086839230829
+##Q63
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6041.241324672302
+##Q64
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.0449999999999995
+##Q65
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=206.97153070310102
+##Q66
+DPPATH seed producer=upper.ordered.seed kind=6 keys=8 contained=true ncommon=1 totalcost=13177.17222802232
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q67
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=21814.857411576166
+##Q68
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1823.2795199999998
+##Q69
+DPPATH seed producer=upper.ordered.seed kind=6 keys=5 contained=true ncommon=5 totalcost=70506.90554107225
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q70
+##Q71
+DPPATH seed producer=upper.ordered.seed kind=6 keys=4 contained=false ncommon=0 totalcost=1043.0826923076927
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q72
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=false ncommon=0 totalcost=3622.1293505280087
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q73
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13.28525
+##Q74
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1775.0625
+##Q75
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=12.9125
+##Q76
+DPPATH seed producer=upper.ordered.seed kind=6 keys=5 contained=true ncommon=5 totalcost=49438.415871958845
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=46770.646286311705
+DPGROUP elected shape=Sort-over-Aggregate strategy=0
+##Q77
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6.7675
+##Q78
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4694.860000000001
+##Q79
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3287.1575
+##Q80
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.8475
+##Q81
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2226.846080000001
+##Q82
+DPPATH seed producer=upper.ordered.seed kind=6 keys=3 contained=true ncommon=1 totalcost=26920.69243179305
+DPGROUP elected shape=bare-Aggregate strategy=1
+##Q83
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3.5225000000000004
+##Q84
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7574.673929999999
+##Q85
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=7640.154559868339
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q86
+##Q87
+##Q88
+##Q89
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=18020.852470807084
+##Q90
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13422.887037060915
+##Q91
+DPPATH seed producer=upper.ordered.seed kind=6 keys=5 contained=false ncommon=0 totalcost=3234.9276183992456
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q92
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9425.63172083989
+##Q93
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=4202.010511990375
+DPGROUP elected shape=Sort-over-Aggregate strategy=1
+##Q94
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9180.705438500294
+##Q95
+DPGROUP loop-decline reason=anyTranslated=false
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=154969.38554914502
+##Q96
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=16368.945562619992
+##Q97
+##Q98
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9614.272503419763
+##Q99
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=12362.613584900624

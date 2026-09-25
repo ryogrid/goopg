@@ -53,7 +53,7 @@ type gatherOp struct {
 
 	// buildChild constructs a fresh operator tree over the partial plan for
 	// one worker. Injected so tests can drive the operator without a planner.
-	buildChild func() (Operator, error)
+	buildChild func(scope *instrumenter) (Operator, error)
 
 	group   *ParallelGroup
 	ch      chan rowBatch
@@ -96,6 +96,9 @@ type gatherOp struct {
 	// ownsSharedBuilds records that this Gather published hash tables on the
 	// session context (P8) and must retract them at Close.
 	ownsSharedBuilds bool
+	// ownsParallelHash records that this Gather published Parallel Hash
+	// build states on ctx (M0146-0002) and must retract them at Close.
+	ownsParallelHash bool
 
 	// EX0-03b (new): scope is the instrumenter active on this op's own
 	// Build() call, handed over by maybeInstrument (instrumentScopeCarrier).
@@ -110,30 +113,31 @@ type gatherOp struct {
 // EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
 // storing the scope live at this op's own Build() time. Only the timing
 // bool is ever inherited from it — each execution site mints its own
-// fresh table via buildUnderFreshScope, so the stored table is never
-// reused.
+// fresh instrumenter, so the stored table is never reused.
 func (o *gatherOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 // EX0-03b (new): buildChildForSlot builds one child tree for the given
-// execution slot. Instrumented sites (workers, leader) mint a FRESH table
-// under the mutex and file it into the pre-sized slot; uninstrumented
-// builds (no stored scope) still serialize through an explicit NIL scope
-// so a concurrent site's fresh table cannot leak into this tree.
+// execution slot. Instrumented sites (workers, leader) mint a FRESH
+// instrumenter inheriting only the timing flag and file its table into
+// the pre-sized slot; uninstrumented builds (no stored scope) pass an
+// explicit nil. The scope travels as an argument — no package-global
+// handoff, no mutex (M-NIGHTLY-instrumentscope-race-fix).
 func (o *gatherOp) buildChildForSlot(slot int) (Operator, error) {
 	if o.scope == nil {
-		return buildUnderNilScope(o.buildChild)
+		return o.buildChild(nil)
 	}
-	op, tab, err := buildUnderFreshScope(o.scope.timing, o.buildChild)
+	fresh := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
+	op, err := o.buildChild(fresh)
 	if err != nil {
 		return nil, err
 	}
 	if slot >= 0 && slot < len(o.workerTables) {
-		o.workerTables[slot] = tab
+		o.workerTables[slot] = fresh.table
 	}
 	return op, nil
 }
 
-func newGatherOp(p *optimizer.Gather, buildChild func() (Operator, error)) *gatherOp {
+func newGatherOp(p *optimizer.Gather, buildChild func(scope *instrumenter) (Operator, error)) *gatherOp {
 	return &gatherOp{plan: p, schema: p.Output(), buildChild: buildChild}
 }
 
@@ -161,11 +165,28 @@ func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
 		collectBitmapScans(x.child, dst)
 	case *instrumentedOp:
 		collectBitmapScans(x.inner, dst)
+	case *setOp:
+		// M0140-0006c-2: descend both branches so this collection and the
+		// plan-side gate (HasBitmapScan, via parallelChildren) agree on
+		// what sits under a SetOp. bitmapPrebuildTargets re-collects per
+		// branch to attribute each bitmap to its own leaf claim set; this
+		// flat walk only decides whether ANY bitmap sits below.
+		collectBitmapScans(x.left, dst)
+		collectBitmapScans(x.right, dst)
 	case *joinOp:
 		if probeSideIsLeft(x.plan) {
 			collectBitmapScans(x.left, dst)
 		} else {
 			collectBitmapScans(x.right, dst)
+		}
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: descend the partial OUTER only — the bitmap a
+		// driving scan under it needs is leader-prebuilt and page-claimed;
+		// the re-probed inner takes no claim. A non-capable shape
+		// contributes nothing: the claim walks refuse it, so it never
+		// reaches workers.
+		if optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			collectBitmapScans(x.outer, dst)
 		}
 	}
 }
@@ -212,6 +233,11 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
 	// One claim set shared by every child tree, including the leader's.
 	o.parallelClaimSet = newParallelClaimSet()
+
+	// M0146-0002: Parallel Hash build states, one per join, published before
+	// any worker context exists (NewWorkerContext copies the reference) so
+	// every participant reaches the same barrier.
+	o.ownsParallelHash = registerParallelHashBuilds(ctx, o.plan.Child, o.group.Context().Done())
 
 	// P8: hash-join build sides run ONCE, here, before anything fans out.
 	// This must precede both NewWorkerContext (which copies the reference)
@@ -445,6 +471,18 @@ func (o *gatherOp) Close() error {
 	}
 	o.closed = true
 
+	// A Gather that was never Opened launched nothing: no group, no
+	// channel, no workers. That shape is real — a cooperative parallel
+	// hash build's producers rebuild the whole build subtree and Close
+	// it after probing the leader-published shared table, so the Gather
+	// under the shared join's build side is Closed without ever being
+	// Opened. Cancelling a nil group is a nil-pointer panic, and the
+	// panic then cancels the SIBLING producers mid-scan — silently
+	// dropping rows (TPC-H Q20 measured 85-99 of 101 suppliers).
+	if o.group == nil {
+		return nil
+	}
+
 	if o.leaderChild != nil {
 		_ = o.leaderChild.Close()
 		o.leaderChild = nil
@@ -476,6 +514,11 @@ func (o *gatherOp) Close() error {
 		a.Release()
 	}
 	o.workers, o.arenas = nil, nil
+	if o.ownsParallelHash && o.ctx != nil {
+		// Retract after the join: no participant can still be reading.
+		o.ctx.ParallelHashBuilds = nil
+		o.ownsParallelHash = false
+	}
 	if o.ownsSharedBuilds && o.ctx != nil {
 		// Retract the published tables so a later serial statement on this
 		// session does not adopt a stale build for the same plan node, and

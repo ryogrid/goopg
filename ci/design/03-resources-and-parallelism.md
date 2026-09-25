@@ -136,12 +136,16 @@ Server shutdown is always `goopg stop -D <datadir>` (or kill of the exact PID
 from `postmaster.pid`) plus scope stop — the pattern
 `ralph-precommit-test.sh` already uses.
 
-**Concurrency with the loop's spotcheck (requirement):** `tpch-spotcheck.sh`
-unconditionally stops whatever server runs on the canonical dir, and it is
-light (~3–4 min). By running S2 on a clone at 65434, a spotcheck fired by the
-loop at ANY point during the batch's multi-hour TPC-H stage proceeds
-undisturbed on 65433, and vice versa — the two are fully concurrent except
-for the copy window, which fits between spotcheck runs.
+**Concurrency with the loop's spotcheck (requirement):** at design time,
+`tpch-spotcheck.sh` unconditionally stopped whatever server ran on the
+canonical dir, and it is light (~3–4 min). By running S2 on a clone at 65434,
+a spotcheck fired by the loop at ANY point during the batch's multi-hour
+TPC-H stage proceeds undisturbed on 65433, and vice versa — the two are
+fully concurrent except for the copy window, which fits between spotcheck
+runs. **Update (M0137-0007, 2026-09-15):** `tpch-spotcheck.sh` itself now
+takes a private clone on its own port (5580) and never touches 65433 — this
+section's concurrency argument still holds (S2's copy window is unaffected
+either way), it just no longer needs to.
 
 ## E. Disk
 

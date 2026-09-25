@@ -378,6 +378,20 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 		outerNode, outerLay = narrowMergeInput(outerNode, outerLay, outerPath, p)
 		innerNode, innerLay = narrowMergeInput(innerNode, innerLay, innerPath, p)
 	}
+	// M0139-S1/S2: the attachment point neither narrowBuildInput nor
+	// narrowMergeInput reaches — a hash join's outer/probe side, both sides
+	// of a nested loop (plain and NLI), or either side above when the
+	// narrowing above declined. Reuses the same keep-set derivation those
+	// two arms use (see joinleghook.go), so it is safe to call
+	// unconditionally here, after whatever narrowing above already ran, for
+	// every join kind — EXCEPT an NLI inner (both the `*IndexScan` shape
+	// and its `*BitmapHeapScan` sibling, "PathNestLoop(NLI)" and
+	// "PathNestLoop(NLI-bitmap)"), which `nliInner` excludes: those two
+	// inner slots are typed concretely, and wrapping either in a `*Project`
+	// is a plan-time panic, not a narrower plan (joinleghook.go).
+	outerNode, outerLay = narrowJoinLeg(outerNode, outerLay, outerPath, false)
+	innerNode, innerLay = narrowJoinLeg(innerNode, innerLay, innerPath,
+		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)")
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}
@@ -543,10 +557,12 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	in := joinInputsFor(p, "PathHashJoin", p.Children[0], p.Children[1])
 	pairs := in.keyPairs("PathHashJoin", p.HashKeys)
 
-	// C-03c: the join the PATH says it performs, not a constant. Today the
-	// search only ever files INNER hash paths — `jointypeForDirection` gives
-	// the keyed arms nothing else, since SEMI/ANTI are nestloop-only and FULL
-	// is declined outright — so this is the same value it always was.
+	// C-03c: the join the PATH says it performs, not a constant. Stale claim
+	// corrected by M0142-0008a-3i-plumbing-c16: this comment used to say
+	// "SEMI/ANTI are nestloop-only", but M0142-0008a-3(iii) (joinpaths.go's
+	// `addPathsToJoinrel`, mergeDeclined comment) already lifted the hash
+	// arm's SEMI/ANTI decline — only MERGE stays nestloop-only for those
+	// jointypes. FULL is still declined outright.
 	jt := planJoinTypeFor(p, "PathHashJoin")
 	j := &Join{
 		pos:  in.outer.Pos(),
@@ -557,6 +573,8 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		Left:      in.outer,
 		Right:     in.inner,
 		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual),
+		// M0146-0002: the build side is partial and built cooperatively.
+		ParallelHash: p.ParallelHash,
 		// `HashKeys[0] IS (LeftKey, RightKey), by pointer` (plan.go:840) — the
 		// single-pair view and the list view must not be able to disagree, so
 		// the pair is shared rather than rebuilt.
@@ -575,7 +593,13 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		// one estimate — M0128-P3.2 / 09 §3.23).
 		OuterRows: p.Children[0].Rows,
 		InnerRows: p.Children[1].Rows,
+		SJInfo:    p.SJInfo,
 	}
+	// R7 (plan-parity-fix-take2): the flag is read ONCE, here, for both of
+	// its purposes — the fail-closed assertion below and the node's own
+	// record of it, which is what lets EXPLAIN print PG's "Parallel "
+	// prefix. Before this the fact died at plan construction.
+	j.ParallelAware = p.ParallelAware
 	assertParallelAwareJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
 }
@@ -588,8 +612,17 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 // executor's OWN predicate would decline to run it that way.
 //
 // The two can only disagree if a producer changes. `addPartialHashJoinPath`
-// files only INNER hash joins today — since C-03b it is passed the direction's
-// jointype and declines outright for SEMI/ANTI, and no outer link reaches the
+// files {INNER, LEFT, SEMI, ANTI} via `partialHashJoinTypeOK`
+// (parallel.go), the set where PG's parallel block and this file's own
+// `hashJoinIsPartialCapable` coincide.
+//
+// CORRECTED R9 (plan-parity-fix-take2): this comment previously claimed the
+// producer "files only INNER hash joins today … and declines outright for
+// SEMI/ANTI". That described a filter which DID NOT EXIST — the producer took
+// the jointype and never compared it to anything — and the claim is what made
+// the defect invisible to reading. The panic below was therefore reachable,
+// not unreachable, and fired on TPC-DS Q5 under GOOPG_GATHER_PATHS=all with a
+// RIGHT hash join (K17). The filter now exists, and no outer link reaches the
 // search at all (03 §4.4 / C-03 DESIGN §3) — so the panic is unreachable from
 // the live search — which is precisely why it is a separate,
 // directly testable function rather than an inline `if`: an unwinnable path is

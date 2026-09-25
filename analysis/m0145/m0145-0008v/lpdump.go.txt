@@ -1,0 +1,40 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+)
+
+func main() {
+	b, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	for blk := 0; blk*8192 < len(b) && blk < 4; blk++ {
+		p := b[blk*8192 : (blk+1)*8192]
+		lower := binary.LittleEndian.Uint16(p[12:14])
+		upper := binary.LittleEndian.Uint16(p[14:16])
+		flags := binary.LittleEndian.Uint16(p[10:12])
+		prune := binary.LittleEndian.Uint32(p[20:24])
+		n := (int(lower) - 24) / 4
+		cnt := map[uint32]int{}
+		heapOnly, hotUpd := 0, 0
+		for i := 0; i < n; i++ {
+			raw := binary.LittleEndian.Uint32(p[24+i*4:])
+			off, fl, ln := raw&0x7fff, (raw>>15)&3, raw>>17
+			cnt[fl]++
+			if fl == 1 && ln >= 23 {
+				im2 := binary.LittleEndian.Uint16(p[off+18:])
+				if im2&0x8000 != 0 {
+					heapOnly++
+				}
+				if im2&0x4000 != 0 {
+					hotUpd++
+				}
+			}
+		}
+		fmt.Printf("blk %d: lower=%d upper=%d flags=%#x prune_xid=%d nlp=%d unused=%d normal=%d redirect=%d dead=%d heapOnly=%d hotUpdated=%d\n",
+			blk, lower, upper, flags, prune, n, cnt[0], cnt[1], cnt[2], cnt[3], heapOnly, hotUpd)
+	}
+}

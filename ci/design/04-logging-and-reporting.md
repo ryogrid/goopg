@@ -143,9 +143,13 @@ yields `inconclusive`. Making it gating would mean every night that overlaps an
 active Ralph loop reports a regression the tree does not have, and any gate
 phrased as "survives a clean nightly cycle" (e.g. M0127's S7 bar) could never
 be met. The single item still reaches `action-items.md` with kind `infra`,
-because the harness defect is real: the fix that would *prevent* it — running
-the batch from a `git worktree` snapshot pinned to the recorded sha — is
-deferred (see the deferral ledger).
+because the harness defect is real. The fix that *prevents* it — running the
+batch from a `git worktree` snapshot pinned to the recorded sha — LANDED
+2026-09-19 for every Go compile: `go build` stages already ran inside
+`NIGHTLY_SRC_ROOT`, and the three `go test` stages (units/race/testport) now
+`cd` there too, with `postgres/` symlinked in for the oracle fixtures
+(testport). Live-tree drift can no longer change what a stage compiles; the
+fingerprint survives as drift evidence only.
 
 Guards: `ci/batch/lib/test_summarize.py::MidRunBuildBreakTest` (4 cases),
 verified non-vacuous by forcing `tp_build_boundary = None`.
@@ -193,8 +197,9 @@ built from this run's log and asserting both directions (the four build-failed
 packages are not regressions; `internal/wal` still is).
 
 The prevention fix — pinning the batch to a `git worktree` snapshot of the
-recorded sha — remains deferred and is now the resume point for two observed
-recurrences rather than one.
+recorded sha — landed 2026-09-19 (see §C.1 tail): every `go test` stage now
+runs inside `NIGHTLY_SRC_ROOT`, so the observed-recurrence mechanism is
+closed on all three lanes.
 
 ## D. Summary artifacts
 

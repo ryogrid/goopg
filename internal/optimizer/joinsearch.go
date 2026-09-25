@@ -28,7 +28,6 @@ package optimizer
 import (
 	"fmt"
 	"math/bits"
-	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -53,37 +52,12 @@ import (
 // longer exists: bushy.go was deleted with that DP at M0127-P6.3.
 const maxSearchRels = 32
 
-// pgShapedDP gates the whole PG-shaped search (08 §2, S5). **FLIPPED ON
-// 2026-08-06 by M0127-P5.9** — the acceptance event. Every P5 task landed dark
-// behind this gate; run 4 of the 09 §3 bar (2026-08-06, HEAD `9e0cfe67`) is the
-// first run in which nothing in the evidence is attributed to the flag —
-// clauses 1-5 PASS, and clause 6 was discharged by measurement two days later
-// (09 §3.13: both PG-only bushy partitions were OFFERED to `makeJoinRel` at
-// phase 2, so the search can express them and lost them on cost, which the §4
-// ratchet admits).
-//
-// The knob survives the flip as a KILL-SWITCH, not a soak switch. Until
-// M0127-P6.3 the rollback story for S5 was "flips `GOOPG_PGSHAPED_DP` OFF,
-// restoring the `tryBushyDP` enumerator"; P6.3 deleted that enumerator
-// (08 §4), so `=0` now means "no join-order search at all" — the statement
-// keeps its syntactic FROM order and the rule-driven rewrites
-// (`rewriteJoinsToNLI`, the qual-placement passes) do what they have always
-// done to such a tree. Anything else (unset, `1`, garbage) is ON, mirroring
-// `GOOPG_JOIN_SLOT_CHAIN` (08 §2 S1: "default ON, env kill-switch OFF only").
-//
-// The gate is read once at process start so a plan cannot change shape
-// mid-statement.
-var pgShapedDP = pgShapedDPFromEnv(os.Getenv("GOOPG_PGSHAPED_DP"))
-
-// pgShapedDPFromEnv is the kill-switch's polarity, factored out so it is
-// testable without a subprocess: only the exact string "0" turns the search
-// off. An unset variable reads as "" and is therefore ON.
-func pgShapedDPFromEnv(v string) bool { return v != "0" }
-
-// pgShapedDPEnabled reports whether the PG-shaped join search is active. P5.3's
-// entry point is its only production caller; exposed as a function so the flag
-// stays a single read site.
-func pgShapedDPEnabled() bool { return pgShapedDP }
+// The PG-shaped search is unconditional. It was gated by GOOPG_PGSHAPED_DP
+// (flipped on by M0127-P5.9 on 2026-08-06, then kept as a kill-switch whose
+// `=0` meant "no join-order search at all" once M0127-P6.3 deleted the bushy
+// enumerator). M0145-0008 retired the knob with the legacy pipeline: `=0` was a
+// planner nothing ships, and arm scripts defaulting to it measured that
+// planner by accident.
 
 // SetPGShapedJoinSearch — the cross-package test pin for the other enumerator
 // arm — went away with the old DP at M0127-P6.3 (08 §4), as its doc always
@@ -314,12 +288,16 @@ func (s *searchCtx) finalRel() (*RelOptInfo, error) {
 //
 // With no LIMIT (`tupleFraction == 0`) this returns `CheapestTotal` exactly,
 // which is what every caller would have got before.
+//
+// M0145-0019a: the fraction is only allowed to SELECT among paths that already
+// deliver `queryPathkeys` — see fractionalCandidatePathkeys for why, and for
+// the upstream rule this reproduces.
 func (s *searchCtx) finalPath() (*Path, error) {
 	rel, err := s.finalRel()
 	if err != nil {
 		return nil, err
 	}
-	p := getCheapestFractionalPath(rel, s.tupleFraction)
+	p := getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
 	if p == nil {
 		// setCheapest leaves every slot nil only for an empty pathlist, which
 		// joinSearch already rejects per level; reaching here means the final
@@ -432,11 +410,24 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
-		// `baserel->pages` and `baserel->tuples`, not the post-restriction
-		// row count. See baseSeqScanCostInputs.
-		scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
-		p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
+		if isSubplanLeaf(leaf) {
+			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
+			// relation and must not be priced as a scan of one — see
+			// costSubplanLeaf.
+			p.Cost = costSubplanLeaf(cp, leaf, rows)
+		} else {
+			// The scan-cost currency of 04 §1, on `cost_seqscan`'s OWN inputs:
+			// `baserel->pages` and `baserel->tuples`, not the post-restriction
+			// row count. See baseSeqScanCostInputs.
+			scanPages, scanTuples, scanQualOps := baseSeqScanCostInputs(ri, leaf, rows, width)
+			p.Cost = costSeqscan(cp, scanPages, scanTuples, scanQualOps)
+			// The sibling of generateScanPaths' B-17d count: the prebuilt leaf
+			// IS the relation's scan, so `enable_seqscan` / `enable_indexscan`
+			// / `enable_bitmapscan` count onto it by the scan it carries
+			// (costsize.c:295, 560, 1023). It was never counted, so a disabled
+			// method still won on cost (M0145-0029 follow-up).
+			p.DisabledNodes = prebuiltLeafDisabledNodes(cp, leaf)
+		}
 		addPath(rel, p, "joinsearch.prebuilt")
 		setCheapest(rel)
 	}
@@ -502,21 +493,21 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		// already-built join subtree: `filteredRows` was derived from a
 		// synthetic catalog.Table and means nothing, so read the subtree.
 		rows = EstimateRows(leaf)
-		// M0129-S1: CTE scans have no per-column statistics, so
-		// filterSelectivity defaults to defaultEqSelectivity (0.005)
-		// per conjunct. For a CTE like year_total with 4 conjuncts
-		// over columns that actually have 2 distinct values each,
-		// 0.005⁴×17977≈0.000011 collapses to 1 row — a severe
-		// under-estimate that makes nested loops look free. Fall
-		// back to the CTE body's unfiltered row count to avoid
-		// the default-selectivity cliff.
-		if rows <= 1 {
-			if cte, ok := leafBaseScan(leaf).(*CTEScan); ok && cte.Child != nil {
-				if bodyRows := EstimateRows(cte.Child); bodyRows > 1 {
-					rows = bodyRows
-				}
-			}
-		}
+		// A CTE leaf keeps its own (possibly collapsed) estimate, as PG's
+		// `set_cte_size_estimates` does: the only adjustment is the
+		// `clamp_row_est` floor at 1 below
+		// (postgres/src/backend/optimizer/path/costsize.c:5356-5363).
+		//
+		// goopg used to substitute the CTE body's UNFILTERED row count when
+		// the estimate collapsed to <=1 (M0129-S1). PG has no such arm.
+		// M0145-0024 showed that on the current tree it fired on TPC-DS Q74
+		// alone, and there it made goopg diverge from the plan PG 18.3
+		// itself elects (the collapsed Nested Loop shape). M0145-0012
+		// retired it for plan parity (owner decision 2026-09-24): Q74 runs
+		// 2.27 s -> 29.61 s on goopg, still faster than PG's 53.49 s on the
+		// same plan. The upstream route to a better estimate is
+		// `examine_simple_variable`'s CTE arm (selfuncs.c), not a
+		// substitution here.
 	}
 	if rows < 1 {
 		return 1
@@ -543,6 +534,80 @@ func leafBaseScan(n Node) Node {
 			return n
 		}
 		n = f.Child
+	}
+}
+
+// isSubplanLeaf reports whether a join-search leaf wraps a finished SUB-PLAN
+// rather than an access path to a base relation: a set-op, CTE, subquery,
+// VALUES, function scan, or an already-built join/aggregate subtree.
+//
+// The four node kinds it excludes are the base-table accesses. `*SeqScan` is
+// the ordinary case `baseSeqScanCostInputs` was written for; `*IndexScan`,
+// `*IndexOnlyScan` and `*BitmapHeapScan` are the rule-based planner's own
+// choice standing in for the relation. Those three are deliberately LEFT on
+// today's pricing by M0144-0011b-1 even though it is also wrong for them
+// (they are charged a fabricated sequential scan): repricing them is a
+// different question with a different PG function (`cost_index`), and folding
+// it into the same commit would make any category movement unattributable.
+// Ledger row `m0144-0011b-1-index-leaf-still-priced-as-seqscan`.
+func isSubplanLeaf(leaf Node) bool {
+	if leaf == nil {
+		return false
+	}
+	switch leafBaseScan(leaf).(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		return false
+	default:
+		return true
+	}
+}
+
+// costSubplanLeaf is `cost_subqueryscan`'s shape for a sub-plan leaf entering
+// the join search (M0144-0011b-1).
+//
+// PG never re-derives a sub-plan's work from a page count. It starts from the
+// subpath and adds overhead:
+//
+//	/* postgres/src/backend/optimizer/path/costsize.c:1491-1493 */
+//	path->path.startup_cost = path->subpath->startup_cost;
+//	path->path.total_cost = path->subpath->total_cost;
+//
+// then charges `cpu_tuple_cost` per row for selection and projection
+// (costsize.c:1516-1525). `cost_ctescan` and `cost_functionscan` have the same
+// shape. Before this function, goopg priced such a leaf with `costSeqscan`
+// over a page count INVENTED from the row count, so the whole subtree was
+// free: TPC-DS SF0.25 Q8 entered its `HashSetOp Intersect` — a subtree
+// estimated at 7360.42 — into the search at 8.35, and the hash join above it
+// printed a total of 11.28, 650x cheaper than its own child.
+//
+// The qual term PG adds alongside `cpu_tuple_cost` is deliberately NOT added
+// here. PG is pricing a scan node over a bare RTE with a `baserestrictinfo`
+// list still to be applied; goopg's leaf is a FINISHED tree whose local filter
+// is already inside the node being priced, so charging it again would
+// double-count.
+//
+// SCOPE, STATED PLAINLY: `legacyDisplayCostOf` prefers the leaf's carried
+// `PlanCost` and falls back to `DeriveLegacyDisplayCost`, whose own header
+// bars planning against it. For a leaf class that carries a real cost the base
+// here IS real. For `SetOp` and the other classes with no `PlanCost` field the
+// base is that function's pass-through arm — children's own (largely real)
+// costs plus a per-tuple charge, which is `cost_subqueryscan`'s shape again,
+// but which does NOT model the set-op's own hashing work. It is therefore a
+// FLOOR, not PG's number, and the full-fidelity answer is a real upper-rel
+// path per sub-plan class. Ledger row
+// `m0144-0011b-1-subplan-leaf-base-is-legacy-estimate`; design doc
+// docs/design/0100-0149/m0144-0011b-1-subplan-leaf-cost.md §4.
+//
+// Pricing the subtree at a floor is strictly better than pricing it at ZERO,
+// which is what the seq-scan fabrication amounted to.
+func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
+	sub := legacyDisplayCostOf(leaf)
+	if rows < 0 {
+		rows = 0
+	}
+	return Cost{
+		Startup: sub.StartupCost,
+		Total:   sub.TotalCost + cp.cpuTupleCost*rows,
 	}
 }
 
@@ -586,4 +651,28 @@ func (s *searchCtx) stampOutputColsOnRels() {
 			r.OutputCols, r.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
 	}
+}
+
+// prebuiltLeafDisabledNodes is the scan-method toggle count for a prebuilt
+// base leaf: the scan under its Filter wrappers decides which enable_* flag
+// applies. Anything else (a sub-plan, a function scan, …) carries no scan
+// toggle, as in PG.
+func prebuiltLeafDisabledNodes(cp costParams, leaf Node) int {
+	n := leaf
+	for {
+		f, ok := n.(*Filter)
+		if !ok {
+			break
+		}
+		n = f.Child
+	}
+	switch n.(type) {
+	case *SeqScan:
+		return disabledNodesFor(!cp.enableSeqScan)
+	case *IndexScan, *IndexOnlyScan:
+		return disabledNodesFor(!cp.enableIndexScan)
+	case *BitmapHeapScan:
+		return disabledNodesFor(!cp.enableBitmapScan)
+	}
+	return 0
 }

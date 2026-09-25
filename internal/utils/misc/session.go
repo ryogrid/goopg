@@ -168,11 +168,15 @@ func (s *SessionRegistry) GetDisplay(name string) (*Variable, string, bool) {
 }
 
 // AllDisplay is like All but formats each value via GetDisplay — the SHOW
-// ALL / pg_settings-style counterpart to GetDisplay.
+// ALL / pg_settings-style counterpart to GetDisplay. FlagNoShowAll variables
+// are left out, as ShowAllGUCConfig skips GUC_NO_SHOW_ALL.
 func (s *SessionRegistry) AllDisplay() []ReportableValue {
 	all := s.global.All()
 	out := make([]ReportableValue, 0, len(all))
 	for _, v := range all {
+		if v.Flags&FlagNoShowAll != 0 {
+			continue
+		}
 		_, eff, _ := s.GetDisplay(v.Name)
 		out = append(out, ReportableValue{Name: v.Name, Value: eff})
 	}

@@ -393,6 +393,46 @@ func TestCheckUniqueIndexesForUpdate_KeyChangeStillEnforced(t *testing.T) {
 	}
 }
 
+// TestUniqueInsertAfterHotUpdate pins ordinary unique enforcement against a
+// HOT-updated row: the b-tree entry references the update-chain ROOT line
+// pointer, which holds a dead tuple after a non-key UPDATE while the live
+// successor sits deeper in the same-page chain. uniqueCheckWithWait must
+// walk the chain (eachHeapChainMember) — probing the raw index pointer
+// alone let a duplicate-key INSERT succeed, producing two live rows under
+// the same PRIMARY KEY (M0143-0010; demonstrated live on a scratch server
+// before this test was written).
+func TestUniqueInsertAfterHotUpdate(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE uq_hot (a int PRIMARY KEY, b text)"); err != nil {
+		t.Fatalf("CREATE TABLE uq_hot: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO uq_hot VALUES (7, 'x')"); err != nil {
+		t.Fatalf("INSERT uq_hot: %v", err)
+	}
+	// Non-key UPDATEs build a same-page HOT chain: the pkey index entry
+	// still references the root, whose tuple is dead — only a chain walk
+	// reaches the live member holding key 7.
+	if err := runDDL(t, ctx, "UPDATE uq_hot SET b = 'y'"); err != nil {
+		t.Fatalf("UPDATE uq_hot y: %v", err)
+	}
+	if err := runDDL(t, ctx, "UPDATE uq_hot SET b = 'z'"); err != nil {
+		t.Fatalf("UPDATE uq_hot z: %v", err)
+	}
+	err := runDDL(t, ctx, "INSERT INTO uq_hot VALUES (7, 'dup')")
+	if err == nil {
+		t.Fatal("duplicate INSERT after HOT updates succeeded; want 23505")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "23505" {
+		t.Fatalf("want *ExecError 23505, got %T: %v", err, err)
+	}
+	// A genuinely distinct key still inserts cleanly.
+	if err := runDDL(t, ctx, "INSERT INTO uq_hot VALUES (8, 'ok')"); err != nil {
+		t.Fatalf("INSERT distinct key: %v", err)
+	}
+}
+
 // TestCheckUniqueIndexesForUpdate_ForceAllProbesUnchangedKey pins that the
 // cross-partition path (forceAll=true) still probes even when the key is
 // unchanged: a move into a destination relation that already holds the key

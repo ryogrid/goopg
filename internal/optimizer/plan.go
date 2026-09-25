@@ -41,6 +41,13 @@ type SchemaColumn struct {
 	Name           string
 	Type           catalog.Type
 	SourceTableIdx int16
+	// Resjunk marks a column that rides the row for an enclosing operator's
+	// use but is not part of the user-visible output — PostgreSQL's resjunk
+	// targetlist mark. Today only the rowmark ctid columns injected by
+	// wireRowMarkCtidColumns carry it; LockRows strips resjunk positions from
+	// its output and whole-row dedup (distinctOp) excludes them from the
+	// dedup key. M0143-0009.
+	Resjunk bool
 }
 
 // Expr is implemented by every planner expression. The planner
@@ -244,7 +251,11 @@ type InExpr struct {
 	// AllOp selects ALL (AND) instead of ANY/SOME (OR) semantics when AnyOp
 	// is set. M0122-0004.
 	AllOp           bool
-	Plan            Node // populated when the source is a subquery
+	Plan Node // populated when the source is a subquery
+	// Subquery is the UNPLANNED parser body `Plan` was built from, when the
+	// source is a subquery — see ExistsExpr.Subquery for why it is retained
+	// and why nothing reads it yet (M0142-0008a-3i-route-a step 1).
+	Subquery        *parser.SelectStmt
 	List            []Expr
 	IsNonCorrelated bool
 	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
@@ -266,9 +277,35 @@ func (*InExpr) exprNode()  {}
 // IsNonCorrelated is true when Plan contains zero
 // OuterColumnRef nodes — see InExpr for the cache implication.
 type ExistsExpr struct {
-	pos             int
-	Negated         bool
-	Plan            Node
+	pos     int
+	Negated bool
+	Plan    Node
+	// Subquery is the UNPLANNED parser body this ExistsExpr's `Plan` was
+	// built from (M0142-0008a-3i-route-a step 1).
+	//
+	// `Plan` is produced eagerly, at expression-resolution time, by
+	// `planExistsExpr` -> `planSelectWithParent` — a full recursive planner
+	// run that happens BEFORE `unnestSubqueriesInPlan` and before either
+	// join search (planner.go:1499 vs :1539/:1540). That ordering is the
+	// route defect `m0142-0008a-3i-lateral-route-recon.md` names: by the
+	// time the unnest turns this sublink into a pinned Semi/Anti join, its
+	// RHS is a finished plan carrying its own output `*Project` and
+	// sometimes a `*Gather` with a worker count already chosen, so the
+	// search downstream sees one opaque leaf where PG sees base relations.
+	//
+	// PG never plans a body it is about to pull up: `pull_up_sublinks`
+	// (prepjointree.c:468) and `pull_up_subqueries` (:1083) run while the
+	// body is still an unplanned `Query`, and `SS_process_sublinks`
+	// (subselect.c:2026, reached at planner.c:1328) plans only what pull-up
+	// refused. Retaining the parse tree here is what makes goopg's
+	// equivalent possible at all — the field is the prerequisite, not the
+	// fix.
+	//
+	// Nothing reads it yet: step 1 is deliberately inert (the same posture
+	// `pathkeysCountContainedIn` and `costIncrementalSort` landed under).
+	// Step 2 discards `Plan` for a body `sublinkBodyIsSimple` accepts and
+	// splices its FROM items into the outer join list instead.
+	Subquery        *parser.SelectStmt
 	IsNonCorrelated bool
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
@@ -598,6 +635,13 @@ type FuncCall struct {
 	Name       string
 	Args       []Expr
 	Star       bool
+	// Distinct marks a renderer-synthesised DISTINCT aggregate call
+	// (R66 Arm Distinct: `count(DISTINCT x)` expanded from an
+	// AggregateCall). Never set by the planner; the executor's FuncCall
+	// evaluation ignores it, and synthesised objects never reach the
+	// executor — they are built inside the EXPLAIN renderer and handed
+	// only to formatExprQual.
+	Distinct   bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
 	// ArgWidth is the resolved overload width for width-sensitive builtins
@@ -798,6 +842,15 @@ type IndexScan struct {
 	SAOPKeys []Expr
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
+	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
+	// [0, len(RangePrefix)) and moves LowKey/HighKey onto column
+	// len(RangePrefix) — PG's `a = 1 AND b > 5` probe on `(a, b)`
+	// (build_index_paths binds a range behind an equality prefix). Only ever
+	// set together with LowKey and/or HighKey, never with Key/Keys/SAOPKeys;
+	// the one producer (restriction paths, M0145-0029 slice 2b) keeps the
+	// range conjunct as a Filter recheck. A consumer that reinterprets
+	// LowKey/HighKey as leading-column bounds must refuse a node with it set.
+	RangePrefix []Expr
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
 	// col-op-key form (see tryRangeIndexScan / flipRangeOp) for the low/high
 	// bound. The zero value (OpUnknown) means INCLUSIVE — the historical
@@ -978,6 +1031,10 @@ func (n *Memoize) Output() Schema { return n.Child.Output() }
 type IndexOnlyScan struct {
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
+	// searchedTree: a one-relation search root is a bare scan, and an
+	// index-only one needs no boundary Project when it covers the whole
+	// output (M0145-0029 slice 3; searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	// Alias is the FROM-clause alias; empty when not specified. Mirrors
@@ -1102,6 +1159,21 @@ type Join struct {
 	Left      Node
 	Right     Node
 	Predicate Expr
+
+	// ParallelAware is PG's `Plan.parallel_aware` for this node: the join
+	// participates in parallelism itself rather than merely sitting under a
+	// Gather. It exists so EXPLAIN can print PG's "Parallel " prefix
+	// (explain.c:1630, a generic per-node rule goopg already applies to
+	// SeqScan) — goopg really does build the hash cooperatively
+	// (executor/parallel_hash_build.go), so the label states a fact.
+	//
+	// The EXECUTOR does not read this field: it derives parallel behaviour by
+	// walking the built tree (`HasShareableHashJoin`, `attachParallelScan`).
+	// That is why the field can be added without touching execution, and why
+	// `assertParallelAwareJoinIsRunnable` must keep firing — it remains the
+	// only boundary check between the planner's claim and the executor's own
+	// predicate. R7 (plan-parity-fix-take2).
+	ParallelAware bool
 	LeftKey   Expr // populated when Algo == JoinAlgoHash
 	RightKey  Expr
 	// HashKeys holds EVERY usable equi-pair of this join, not just the
@@ -1115,6 +1187,16 @@ type Join struct {
 	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
 	HashKeys  []JoinKeyPair
 	BuildLeft bool // hash join: build on left input instead of right
+	// ParallelHash marks PG's `parallel_hash = true` hash join
+	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a
+	// PARTIAL path, every participant under the Gather builds its share into
+	// one shared table behind a build-completion barrier, and EXPLAIN renders
+	// `Parallel Hash Join` / `Parallel Hash`. Legal only on a Gather's partial
+	// path, for join types whose build side needs no after-probe sweep (INNER,
+	// SEMI, ANTI, LEFT built on the right). The leader prebuild never builds
+	// such a join (HasShareableHashJoin skips it). M0146-0002; design
+	// docs/design/0100-0149/m0146-0002-parallel-hash-partial-inner.md.
+	ParallelHash bool
 	// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
 	// indices (relative to the merged schema) of the USING
 	// columns from the left and right sides respectively.
@@ -1143,6 +1225,34 @@ type Join struct {
 	// nextLazy/openLazyHashJoin special-case this flag instead of
 	// reusing the NOT-EXISTS-shaped default.
 	NullAware bool
+	// FromOuterReduction marks a JoinTypeAnti produced by the LEFT->ANTI
+	// outer-join reduction (reduce_outer_joins.go's S9.3 rule, transplanted
+	// to the plan by demotedForPlan) rather than by the unnest rewrite.
+	// R40/K69.
+	//
+	// It exists because the NLI cost gate's SEMI/ANTI arm
+	// (nl_index_join.go's nliCostGateAccepts) was calibrated on ONE
+	// population — unnest-sourced joins, whose outer is "the small side by
+	// construction of the unnest rewrite", as that file's own comment
+	// records. The reduction is a SECOND population that breaks the premise:
+	// TPC-DS Q78 hands the gate a 1,439,608-row store_sales outer, and the
+	// gate accepts by a hair (1,439,608 < 1,583,094) only because it charges
+	// a B-tree descent as 1 unit — the same as a hash probe. Measured, that
+	// NLI ran Q78 at 54s against 14s for the hash plan PG's own shape implies
+	// (PG picks Merge Anti Join here).
+	//
+	// Capping the gate by outer size instead was tried and REJECTED by
+	// measurement: it also catches unnest-sourced semi joins, where the
+	// premise fails in the other direction — TPC-H Q4's EXISTS has a 385k
+	// outer but a 6M-row lineitem inner, so NLI is genuinely right there and
+	// the cap made it 1.5s -> 13.1s (8.6x). The two populations need
+	// different answers, so the marker distinguishes them rather than a
+	// threshold pretending they are one.
+	//
+	// Retire this flag when the gate learns a real index-descent probe cost;
+	// that is join-METHOD parity work with its own blast radius, not this
+	// round's.
+	FromOuterReduction bool
 	// AvgVarBytes is the average total variable-width payload of a build-side
 	// row, fed from the build relation's RelOptInfo.AvgVarBytes. Zero means
 	// "unknown" (no ANALYZE stats, or a fixed-width relation) and the geometry
@@ -1161,7 +1271,26 @@ type Join struct {
 	// RelOptInfo.Rows has baserestrictinfo selectivity already applied (§3.23).
 	OuterRows float64
 	InnerRows float64
-	schema     Schema
+	// SJInfo is an inert SpecialJoinInfo attached by unnestExistsExpr for
+	// JoinTypeSemi/JoinTypeAnti joins built from EXISTS/NOT EXISTS
+	// unnesting. M0142-0008a-2: nil for every other join constructor, and
+	// UNREAD by every existing consumer — it exists so a future DP-search
+	// participant (M0142-0008a-3) has a ready-built value rather than
+	// reconstructing it, not to change today's plan shape. See
+	// docs/design/0100-0149/m0142-0008a-1-semi-anti-sji-design.md §4.1.
+	SJInfo *SpecialJoinInfo
+	// FlattenedRHS marks a Semi/Anti join whose Right side is a flattened
+	// sublink body — real scan leaves and body quals spliced in place of the
+	// opaque planned subtree (M0142-0008a-3i-route-a step 2). It is set by
+	// the unnest only when the retained parser body passes
+	// `sublinkBodyIsSimple` AND `decomposeFlatBodyTree` decomposes the plan
+	// cleanly; `extractSearchLeaves` then emits one leaf per body relation
+	// instead of the single opaque RHS leaf. False everywhere else — an
+	// unmarked Semi/Anti keeps its whole RHS as one synthetic leaf, the
+	// pre-step-2 shape. The flag changes nothing outside the seam walk:
+	// whether or not the search runs, the join executes the same rows.
+	FlattenedRHS bool
+	schema       Schema
 }
 
 func (n *Join) Pos() int { return n.pos }
@@ -1293,9 +1422,16 @@ type Aggregate struct {
 	// Strategy selects hashed vs sorted aggregation. The zero value is
 	// AggStrategyHashed, so every existing construction site and test
 	// fixture keeps today's hash-only behavior without being touched.
-	// The planner does not set it yet (M0134-0001 S8 lands the executor
-	// capability first); sorted mode is reachable only via direct node
-	// construction until the pathkey slice wires the choice in.
+	// M0141-S1 (2026-09-15): the paragraph that stood here — "the planner
+	// does not set it yet ... sorted mode is reachable only via direct node
+	// construction" — is stale. `groupingpaths.go:addGroupingPaths` runs a
+	// genuine cost-based Hashed-vs-Sorted `PathAgg` contest via `addPath`,
+	// and `createplansimple.go`'s `createAggPlan`/`createFinalizeAggPlan`
+	// copy the winner's strategy onto this field (`out.Strategy =
+	// p.AggStrategy`). See
+	// docs/design/0100-0149/m0141-s1-serial-aggstrategy-audit.md for the
+	// full trace; the open question is why the contest doesn't always pick
+	// PG's shape, not whether it runs.
 	Strategy AggStrategy
 
 	// GroupKeyOrder is an EXPLAIN-only permutation: indices into GroupExprs,
@@ -1314,6 +1450,24 @@ type Aggregate struct {
 	// the alternative design (see docs/design/0134-0001-p2-explain-format.md
 	// §"S8 Slice 2c").
 	GroupKeyOrder []int
+
+	// GroupClause is PG's processed_groupClause for a plain GROUP BY
+	// (M0145-0008d): the order and direction sort-based grouping consumes
+	// its input in, as positions into GroupExprs plus each key's DESC /
+	// NULLS FIRST flags. PG builds it in two steps. Parse analysis gives a
+	// GROUP BY item that ORDER BY also names ORDER BY's sort operator and
+	// nulls ordering (transformGroupClauseExpr, parse_clause.c:2424-2438).
+	// Then preprocess_groupclause (planner.c:2828) moves the GROUP BY items
+	// that form a prefix of ORDER BY to the front, in ORDER BY's order.
+	// `GROUP BY g ORDER BY g DESC` therefore sorts once, DESC, and the
+	// GroupAggregate's output already satisfies the ORDER BY.
+	//
+	// Like GroupKeyOrder, it never reorders GroupExprs: every output binding
+	// is fixed to the written position, so the permutation lives beside the
+	// list. nil means written order, ASC NULLS LAST — the default every
+	// construction site without an ORDER BY gets. Grouping sets never
+	// carry it (PG forces the rollup order there).
+	GroupClause []GroupClauseKey
 
 	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
 	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
@@ -1412,6 +1566,20 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
+	// Presorted says the plan has ALREADY ordered this node's input by
+	// PartitionBy ++ OrderBy, so `windowOp` must not sort again.
+	//
+	// R6 (plan-parity-fix-take2): PG's `nodeWindowAgg` assumes sorted input
+	// and `create_one_window_path` (planner.c:4620) stacks the Sort above
+	// it; goopg's executor sorted privately instead, which hid the ordering
+	// requirement from the planner entirely (K12) and materialised the whole
+	// input. `createWindowPlan` now emits the Sort as a real plan node and
+	// sets this flag.
+	//
+	// FAIL-CLOSED: the zero value is false, so any WindowAgg built by a path
+	// that did NOT stack a Sort — a hand-built node, an older producer —
+	// still sorts internally and stays correct.
+	Presorted bool
 	// Frame is the resolved window frame clause shared by every
 	// func in this node (nil when no explicit frame clause was
 	// written — the executor's default frame applies). The analyzer
@@ -1466,6 +1634,14 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// PlanCost carries the search's cost for this node (plancost.go). Without
+	// this embed, stampPlanCost's `n.(planCostSetter)` assertion silently
+	// fails on a base-local-filtered leaf (buildInitialRels wraps it in
+	// Filter{Child: SeqScan} and prices the WHOLE wrapper), so the correct
+	// cost was discarded and neither this node nor its child ever carried it
+	// — EXPLAIN then fell back to DeriveLegacyDisplayCost's cruder formula for
+	// every such scan (M0137-0011/M0137-0015).
+	PlanCost
 	// searchedTree: the scan arms' leaf rewrapper can restore the leaf's
 	// original *Filter around a rebuilt scan, so a one-relation search root
 	// can be a Filter (searchedtree.go).
@@ -1680,6 +1856,14 @@ func (n *CTEScan) DeclKey() string {
 }
 
 // Sort — orders the child's rows by the given keys.
+// GroupClauseKey is one entry of Aggregate.GroupClause: the GroupExprs
+// position it sorts and the direction it sorts that key in.
+type GroupClauseKey struct {
+	Pos        int
+	Desc       bool
+	NullsFirst bool
+}
+
 type SortKey struct {
 	Expr       Expr
 	Desc       bool
@@ -2253,6 +2437,13 @@ type LockedRel struct {
 	// when not yet wired (the executor falls back to the walker path).
 	// M0128-P6.1 resjunk-ctid rowmark.
 	CtidResno int
+	// ColPos, when non-nil, is the exact position of each of this relation's
+	// columns in the LockRows child's output row — resolved by
+	// (Name, SourceTableIdx) identity after ctid injection. ColOffset+i only
+	// coincides with it when the child row is the FROM-order merged row; a
+	// top Project may subset or reorder. nil → executor uses ColOffset+i.
+	// M0143-0009.
+	ColPos []int
 }
 
 // LockRows is the upstream-shape wrapper that adds row-lock
@@ -2290,14 +2481,33 @@ type LockRows struct {
 
 func (n *LockRows) Pos() int { return n.pos }
 
-// Output returns the user-visible schema (child schema with trailing ctid
-// junk columns stripped). When no ctid columns are wired, this is identical
-// to Child.Output(). M0128-P6.1 resjunk-ctid rowmark.
+// Output returns the user-visible schema (child schema with resjunk ctid
+// columns stripped at their real positions — a ctid injected into a
+// non-rightmost leaf sits mid-row, not at the tail; M0143-0009). When no
+// ctid columns are wired this is identical to Child.Output(). The trailing
+// NumCtidCols convention remains as a fallback for hand-built plans whose
+// schema carries no Resjunk marks. M0128-P6.1 resjunk-ctid rowmark.
 func (n *LockRows) Output() Schema {
-	if n.NumCtidCols == 0 {
-		return n.Child.Output()
-	}
 	child := n.Child.Output()
+	hasJunk := false
+	for _, c := range child {
+		if c.Resjunk {
+			hasJunk = true
+			break
+		}
+	}
+	if hasJunk {
+		out := make(Schema, 0, len(child))
+		for _, c := range child {
+			if !c.Resjunk {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	if n.NumCtidCols == 0 {
+		return child
+	}
 	if n.NumCtidCols >= len(child) {
 		return Schema{}
 	}
@@ -2621,15 +2831,75 @@ func (n *Copy) Output() Schema { return n.schema }
 // all other variants buffer and apply multiset semantics in the executor
 // (operators_setop.go). M0097-0024.
 type SetOp struct {
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos   int
 	Left  Node
 	Right Node
+	// TlistTypesDiffer records that this link's two branches did NOT have
+	// identical output types BEFORE setOpUnifyBranches coerced them —
+	// upstream's `tlist_same_datatypes` (tlist.c:257) answered false, which
+	// makes `is_simple_union_all_recurse` (prepjointree.c:2258) refuse to
+	// flatten the union into an appendrel. It is recorded here because the
+	// pre-cast types exist only at the moment of unification: afterwards
+	// every branch schema agrees by construction, so a post-cast check is a
+	// tautology.
+	//
+	// The polarity is deliberate. The zero value means "no known
+	// difference", so the construction sites that do not set it — the
+	// partition/inheritance fan-outs, which build *SetOp{All: true} as PG
+	// APPENDRELS rather than set operations — keep their behaviour exactly.
+	// Only the genuine set-operation site sets it, and only when the types
+	// really differ. M0145-0004.
+	TlistTypesDiffer bool
+	// UnionDistinctInput marks a UNION ALL link of the chain a UNION
+	// (distinct) folds its branches into (M0141-S2b-4a/4b). PG plans that
+	// input inside generate_union_paths, never as an appendrel, so only the
+	// PURE parallel Append arm applies to it (every child partial), even when
+	// the union sits in a nested scope where goopg otherwise files the mixed
+	// arm on an appendrel's behalf (addPartialSetOpPath).
+	UnionDistinctInput bool
+	// MergeKeys, when non-empty on a UNION ALL link, makes the link an
+	// ORDER-PRESERVING merge of its two inputs, each already sorted on these
+	// keys (M0141-S2b-4c). A left-deep chain of such links is PG's Merge
+	// Append (create_merge_append_path, pathnode.c; nodeMergeAppend.c): the
+	// merge of sorted streams stays sorted, and EXPLAIN renders the chain as
+	// one `Merge Append` with its `Sort Key:`. Built only serially, never
+	// under a Gather.
+	MergeKeys []SortKey
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working
 	// without an explicit Op assignment.
 	Op  parser.SetOpType
 	All bool
+	// LeftNonPartial / RightNonPartial mark a branch as CLAIMED-WHOLE
+	// under a parallel-aware SetOp (PG's pa_nonpartial_subpaths,
+	// M0140-0006c-3): the branch is not split by block claim — one
+	// participant wins a CAS and drains it serially. Stamped by
+	// createSetOpPlan from the Path's SetOpLeftNonPartial/
+	// SetOpRightNonPartial; false everywhere else, including the
+	// serial path and the pure-partial path, both of which attach
+	// ordinary per-branch claim state. The plan-tree walks
+	// (stampParallelScan, drivingScan) skip a marked branch — its
+	// driving scan is never claimed and stays .Parallel = false.
+	LeftNonPartial  bool
+	RightNonPartial bool
+	// ParallelAware is PG's `Plan.parallel_aware` (explain.c:1630's generic
+	// "Parallel " prefix rule), stamped by createSetOpPlan from the PATH's
+	// own flag — true exactly when the node was built from a partial
+	// PathSetOp (addPartialSetOpPath), i.e. when it is the Append under a
+	// Gather whose branches the workers partition. It is render state only:
+	// the executor's claim wiring keys off LeftNonPartial/RightNonPartial
+	// and the claim sets, not this flag. StripGather's inverse walk
+	// (unstampParallelScan) clears it together with the scan labels when a
+	// plan loses its Gather post-cache — a "Parallel Append" with no Gather
+	// above it would claim a parallelism the executor will not run.
+	// M0145-0004a.
+	ParallelAware bool
 }
 
 func (n *SetOp) Pos() int       { return n.pos }
@@ -2660,6 +2930,11 @@ type Gather struct {
 	// cannot carry the tag — an untagged searched subtree would be walked
 	// again by the legacy posmap family and permuted twice.
 	searchedTree
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos   int
 	Child Node
 	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
@@ -2693,6 +2968,11 @@ type GatherMerge struct {
 	PlanCost
 	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
 	searchedTree
+	// setOpBranchTag: M0144-0003b-1 — set when this node is what
+	// `createSetOpPaths` returned for a set operation, so the next link of a
+	// left-deep UNION ALL chain can reach that link's SETOP rel
+	// (setopbranchrel.go).
+	setOpBranchTag
 	pos            int
 	Child          Node
 	WorkersPlanned int
@@ -2714,6 +2994,14 @@ type Distinct struct {
 	pos    int
 	Child  Node
 	schema Schema
+	// SortKeys is the statement's distinct clause in PostgreSQL's order
+	// (transformDistinctClause, parse_clause.c): the ORDER BY items first,
+	// with their direction, then every remaining output column ascending
+	// (M0141-S2b-4d). The unique-over-sorted candidate sorts on it, so its
+	// output already delivers the ORDER BY, and EXPLAIN prints the hashed
+	// candidate's `Group Key:` in it. nil means every column ascending, in
+	// output order.
+	SortKeys []SortKey
 }
 
 func (n *Distinct) Pos() int       { return n.pos }

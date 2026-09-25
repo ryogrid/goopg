@@ -1,0 +1,301 @@
+# R37 — goopg has TWO seq-scan cost models and they differ by the page term
+
+*Investigation round following R36. No code change. Opened by chasing
+the one divergence R36 left on TPC-H Q12.*
+
+## 1. How this was reached
+
+R36 moved Q12's join METHOD onto PG's (both now Hash Join). What
+remained was the build side: PG probes with `lineitem` and hashes
+`orders`; goopg does the reverse. Two candidate explanations were
+eliminated by controlled probe, not by reasoning:
+
+- **Estimate?** No. Hand-folding Q12's `date + interval` bound gives
+  goopg `lineitem` = 28,724 against PG's 28,127 — essentially identical
+  — and **the build side does not flip**.
+- **Parallelism?** No. With `max_parallel_workers_per_gather=0` and the
+  folded bound, goopg still hashes `lineitem`.
+
+What did stand out: goopg priced the same `lineitem` seq scan at
+**60,299** where PG priced it at **264,331**.
+
+## 2. The finding
+
+goopg's bare seq scans come out as *exactly* the CPU term:
+
+```
+lineitem  60012.55 == 0.01 * 6001255      (cpu_tuple_cost * rows)
+orders    15000.00 == 0.01 * 1500000
+```
+
+with **zero page cost**, though `relpages` reads 136,393 and 28,435 and
+`seq_page_cost` is 1.
+
+`cost_funcs.go:192 costSeqscan` implements PG's formula correctly
+(`seqPageCost*relPages + (cpuTupleCost + cpuOperatorCost*qualOps)*relTuples`).
+Instrumenting its inputs (temporary `GOOPG_SEQCOST_TRACE`, reverted)
+shows it is simply **never called** for a single-relation statement:
+
+```
+EXPLAIN SELECT * FROM lineitem          -> no SEQCOST line at all; plan cost 60012.55
+EXPLAIN ... FROM orders, lineitem ...   -> SEQCOST pages=136393 tuples=6001255 -> total=196405.55
+                                           SEQCOST pages=28435  tuples=1500000 -> total=43435.00
+```
+
+196,405.55 = 136,393 + 60,012.55, i.e. PG's `cost_seqscan` exactly.
+
+So there are two models:
+
+| | seq scan on `lineitem` |
+|---|---|
+| **search path** (`costSeqscan`) | **196,405.55** — PG-faithful |
+| **legacy path** (no search) | **60,012.55** — page term absent |
+
+A one-relation statement never enters the path search
+(`makeRelFromJoinlist` returns at `len(items) == 1`, allpaths.c:3399-3404
+— goopg's transcription; C-19h blocker 4 already records this), so it
+is priced by the legacy model.
+
+## 3. Why this matters more than a display discrepancy
+
+**Both models appear inside a single plan.** R36's Q12:
+
+```
+->  Hash Join  (cost=271780.29..328627.53 rows=28724)
+      ->  Seq Scan on orders    (cost=0.00..43435.00)   <-- SEARCH number
+      ->  Seq Scan on lineitem  (cost=0.00..60299.79)   <-- LEGACY number
+```
+
+`orders` carries the search's 43,435.00. `lineitem` carries 60,299.79,
+where the search's own formula with Q12's five quals would give
+136,393 + 0.0225 x 6,001,255 = **271,421**.
+
+So the planner is comparing a page-priced `orders` against a
+page-free `lineitem` — the relation whose page count is *largest* is
+the one priced without pages. `lineitem` looks **4.5x cheaper to scan
+than it is**, which is exactly the direction that makes goopg prefer
+hashing `lineitem` where PG hashes `orders`.
+
+This is a candidate root cause for `join-method` and for the build-side
+half of `join-order`, and it is not an estimate problem — R36 already
+showed estimate corrections do not move join-order.
+
+## 4. What is NOT yet established
+
+- Whether the legacy number is what the SEARCH consumed for `lineitem`
+  when choosing the build side, or only what EXPLAIN rendered. The two
+  models' outputs both reach EXPLAIN; which one `add_path` compared is
+  a separate question and must be instrumented, not inferred. This is
+  the same trap that R35/R36 fell into twice (`EstimateRows` vs
+  `calcJoinrelSize`), and the lesson has been paid for.
+- Whether the legacy model omits the page term deliberately (a scan
+  whose pages are assumed cached) or by omission.
+- The blast radius: how many corpus plans mix the two models.
+
+## 5. Next round
+
+1. Instrument `add_path`/the build-side comparison to record WHICH cost
+   each side carried when the orientation was chosen. Answer §4's first
+   bullet before touching anything.
+2. If the search consumed the legacy number, the fix is to route base
+   scan costing through `costSeqscan` everywhere — which is also
+   C-19h's successor ("build single-relation base-rel path lists as PG
+   does"), already filed and already blocking `MaybeAddGather`'s
+   retirement. The two items are the same work.
+3. Gate as usual, and report `shape-delta.sh` counts alongside the
+   categories (K50).
+
+---
+
+# CORRECTION — K62 answered, and §3 was WRONG
+
+§4 said the consumed-vs-rendered question "must be instrumented, not
+inferred", and then §3 had already inferred it. §3 is withdrawn.
+
+Instrumenting `costSeqscan` on Q12's exact shape (temporary
+`GOOPG_SEQCOST_TRACE`, reverted):
+
+```
+SEQCOST pages=136393 tuples=6001255 qualops=5 -> total=271421.24
+SEQCOST pages=28435  tuples=1500000 qualops=0 -> total=43435.00
+```
+
+**The search priced `lineitem` at 271,421.24** — pages included, five
+quals included, PG's `cost_seqscan` exactly. It is only EXPLAIN that
+renders 60,299.79.
+
+## What survives, what does not
+
+- **K60 stands.** Two seq-scan cost models exist and differ by the
+  entire page term. A one-relation statement is priced by the legacy
+  one; `costSeqscan` is never called for it. Verified twice.
+- **K61 is WRONG and is withdrawn.** The planner does NOT compare a
+  page-priced `orders` against a page-free `lineitem`. The search saw
+  271,421.24 for `lineitem` and 43,435.00 for `orders`, both
+  page-priced and mutually consistent. The mixing happens only in the
+  RENDERING.
+- **The Q12 build-side divergence is therefore still unexplained.**
+  Three candidates are now eliminated by measurement: the estimate
+  (hand-folding the bound gives 28,724 vs PG's 28,127 and the side does
+  not flip), parallelism (disabling it does not flip it), and the page
+  term (the search had it all along).
+
+## The defect this leaves, which is real but different
+
+EXPLAIN reports a scan cost the planner did not use — 60,299.79 against
+the search's 271,421.24, a 4.5x understatement on the largest relation
+in the corpus. That does not affect plan choice, but it does affect
+every cost-based artefact this workstream reads: `make plan-gate
+MODE=semantic-cost`, the estimate-audit tables, and any human reading
+an EXPLAIN to reason about why a plan was chosen. It is the cost twin
+of the `EstimateRows` / `calcJoinrelSize` row-count split that
+`cardinality_two_estimators_test.go` already pins for rows.
+
+Filed as K63. It is a reporting-integrity fix, not a parity fix, and it
+should be labelled as such so nobody expects categories to move.
+
+## Where the build-side question goes next
+
+Since cost INPUTS are now eliminated, the next probe is the comparison
+itself: instrument `add_path` for the two hash-join orientations on
+Q12 and record both candidates' total costs, or whether the
+PG-shaped orientation was generated at all. That is the
+`planner_verify_both_candidates_generated` discipline, and it is now
+the only untested link.
+
+---
+
+# RESOLVED — the Q12 build-side divergence is `hashJoinCost`'s build charge
+
+The correction above left the divergence unexplained with one untested
+link: the comparison itself. Instrumented (temporary `GOOPG_HJ_TRACE`
+in `addHashJoinPath`, reverted). Both orientations, as the search
+costed them:
+
+```
+HJTRACE probe=orders(rows=1500000 cost=43435.00) build=lineitem(rows=28724 cost=271421.24) -> total=328627.53
+HJTRACE probe=lineitem(rows=28724 cost=271421.24) build=orders(rows=1500000 cost=43435.00) -> total=534007.10
+```
+
+**PG's orientation WAS generated**, and goopg priced it 64% higher than
+its own, then correctly chose the cheaper by its own model. So this is
+neither a missing candidate nor a broken comparator: `add_path` did its
+job on the numbers it was given.
+
+## The number that is wrong
+
+The two orientations share identical scan inputs — 43,435 + 271,421 =
+**314,856** either way. Everything above that is hash overhead:
+
+| orientation | build side rows | overhead above scans |
+|---|---|---|
+| goopg's (build `lineitem`) | 28,724 | **13,771** |
+| PG's (build `orders`) | 1,500,000 | **219,151** |
+
+219,151 / 1,500,000 = **~0.146 per build row**. PG's `cost_hashjoin`
+charges the build at roughly `cpu_operator_cost` per row — 0.0025 —
+so goopg is charging on the order of **58x** upstream for hashing a
+row.
+
+That single term is what makes goopg refuse to build the large side.
+PG will happily hash 1.5M `orders` rows because the build is cheap and
+the probe side (`lineitem`) is the expensive scan it wants to stream
+once; goopg cannot, because its build charge dominates everything.
+
+## Why this is the answer and not another layer
+
+Four candidates have now been eliminated by measurement, in order:
+
+1. **Estimate** — hand-folding the bound gives 28,724 vs PG's 28,127;
+   the side does not flip.
+2. **Parallelism** — disabling it does not flip it.
+3. **Page cost** — the search had it all along (271,421.24 traced).
+4. **Candidate generation** — both orientations are enumerated
+   (`makeJoinRel` calls `addPaths` twice, joinsearchlevel.go:658/661,
+   matching joinrels.c:916/919).
+
+What remains is the arithmetic inside `hashJoinCost`, and the trace
+prices it directly.
+
+## Filed as K64 — the next ROUND, and a real one
+
+Compare `hashJoinCost` (cost_funcs.go) term by term against
+`initial_cost_hashjoin` / `final_cost_hashjoin` (costsize.c:4200-4450),
+specifically the per-build-row charge. This is a cost-computation fix
+of exactly the kind the goal asks for — same inputs, same formula — and
+unlike the estimate rounds it is squarely inside the model the parity
+metric can see.
+
+Expected to move `join-method` (TPC-DS 80, TPC-H 13) and plausibly the
+build-side half of `join-order`, which has never moved. Not predicted
+to reach `match`, since these queries also differ in parallelism and
+aggregation-strategy.
+
+---
+
+# K64 CORRECTED — it is not the build charge, it is ROW WIDTH
+
+The "~58x build charge" attribution above was reverse-engineered from
+the two totals and is **wrong**. Instrumenting the actual terms:
+
+```
+BUCKET innerRows=1500000 bucketSize=1e-06     bucketTuples=2 term=71.81
+BUCKET innerRows=28724   bucketSize=0.000178  bucketTuples=5 term=9375.00
+```
+
+The bucket term is tiny both ways, and the build term is ~18,750 for
+1.5M rows — neither is the 205,380 difference. The exact sums:
+
+- goopg's orientation: 271,780 (startup) + 47,472 (run) + 9,375
+  (bucket) = **328,627**, matching the trace to the cent. **No spill
+  term at all.**
+- PG's orientation: 62,185 + 271,780 + 72 = 334,037, and the observed
+  total is 534,007 — so ~**200,000 is batch/spill I/O**.
+
+## Why goopg spills where PG does not
+
+```
+goopg  Seq Scan on orders    width=448      lineitem width=550
+PG     Seq Scan on orders    width=22       lineitem width=17
+```
+
+At the capture's `work_mem=64MB`, hashing 1.5M `orders` rows costs
+
+- goopg: 1,500,000 x 448 B = **641 MB** -> multi-batch -> ~200,000 of
+  spill I/O -> PG's orientation is priced out
+- PG: 1,500,000 x 22 B = **31 MB** -> single batch -> no spill, so PG
+  is free to hash the large side and stream the expensive `lineitem`
+  scan once
+
+**goopg carries FULL-WIDTH rows where PG projects only the columns the
+query needs.** Q12 reads `o_orderkey` from `orders` and four columns
+from `lineitem`; PG's widths (22, 17) reflect exactly that, goopg's
+(448, 550) reflect the whole table.
+
+`hashJoinCost` is not obviously wrong — it is being handed a build side
+20-32x too wide, and its spill arithmetic then does its job correctly.
+
+## Filed as K65, replacing K64
+
+This is a **projection / `attr_needed`** gap, not a hash-costing one.
+The existing note `goopg_optimizer_no_attr_needed_no_ios_path` already
+records the shape of it: inside a join tree there is no `Project` above
+the scan at all, so there is nowhere to hang a narrowed target list.
+
+Blast radius is far wider than Q12. Row width feeds hash-table
+geometry, every spill/batch decision, `Gather` transfer costs, sort
+footprints and memory budgets — so a 20-32x width error perturbs
+join-method, parallelism and sort-strategy simultaneously, which are
+three of the four largest remaining categories.
+
+The owner has explicitly permitted architectural change for this goal.
+Column pruning is the largest single PG divergence this session has
+found, and unlike the estimate work it sits inside the model the parity
+metric can see.
+
+## Method note, recorded because it cost time twice
+
+K64 was written from arithmetic reverse-engineered out of two totals
+rather than from instrumented terms, and it was wrong. This is the same
+error class as K61 earlier in the same round. **Instrument the term,
+never infer it from the sum.**

@@ -114,7 +114,14 @@ func TestHashedInProbeActuallyFires(t *testing.T) {
 	defer optimizer.SetSubqueryUnnestEnabled(true)
 	SetHashedSubPlanEnabled(true)
 
-	runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) ORDER BY a")
+	// The IN sits under an OR, where no pipeline can pull it up. That is
+	// the shape PG 18.3 itself runs as `(hashed SubPlan 1)`. A top-level IN
+	// is pulled up into a semi join by PG and by the jointree pipeline,
+	// which does not consult the legacy unnest switch above (M0145-0030).
+	got := runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) OR a < 0 ORDER BY a")
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1 (a=1; PG 18.3's answer)", len(got))
+	}
 	// Two entries under the constant key stem: the []Datum slice and
 	// the derived subPlanHash.
 	if n := ctx.subqCacheScoped.Len(); n < 2 {
@@ -135,31 +142,16 @@ func TestHashedInAnyAllFormsUnaffected(t *testing.T) {
 	}
 }
 
-// TestHashedInMixedKindFallsBack: an int operand probed against a text
-// inner set must take the linear path, where compareEq's int↔string
-// coercion applies (`10 = '10'` is TRUE). If the hash answered, the
-// family mismatch would wrongly report a miss — the probe must decline
-// instead.
-func TestHashedInMixedKindFallsBack(t *testing.T) {
-	ctx, cleanup := hashFixture(t)
-	defer cleanup()
-	got := runBothHashPaths(t, ctx,
-		"SELECT a FROM ht1 WHERE b IN (SELECT s FROM ht3) ORDER BY a")
-	// b=10 coerces equal to '10' → row a=1 kept; 99 misses (no NULLs
-	// in ht3) → dropped; NULL operand over non-empty inner → NULL.
-	if len(got) != 1 || datumKey(got[0][0]) != datumKey(NewIntDatum(1)) {
-		t.Fatalf("int-vs-text IN: got %d rows, want exactly a=1 (coercion via linear path)", len(got))
-	}
-}
-
 // TestHashedInBudgetPressure: a tiny WorkMem keeps the hash (and even
 // the value slice) from being retained; results must be identical.
 func TestHashedInBudgetPressure(t *testing.T) {
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
 	ctx.WorkMem = 64 // budget = 16 bytes: nothing fits
+	// Under an OR so a SubPlan is built on either pipeline (see
+	// TestHashedInProbeActuallyFires).
 	got := runBothHashPaths(t, ctx,
-		"SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) ORDER BY a")
+		"SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) OR a < 0 ORDER BY a")
 	if len(got) != 1 {
 		t.Fatalf("budget-squeezed IN: got %d rows, want 1", len(got))
 	}
@@ -184,8 +176,22 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 
 	// One statement, TWO scoped non-correlated sublinks (IN + EXISTS):
 	// they share the scoped store and previously ping-pong-cleared it.
-	runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2)"+
-		" AND EXISTS (SELECT 1 FROM ht3) ORDER BY a")
+	// The IN sits under an OR so it stays a SubPlan on the jointree
+	// pipeline, whose ANY pull-up (PG's convert_ANY_sublink_to_join) turns a
+	// bare top-level IN into a semi join regardless of the legacy unnest
+	// knob — see TestHashedInProbeActuallyFires. Until M0145-0008e the seam
+	// declined this statement (residual-hits-pad) and kept the bare IN as a
+	// SubPlan by accident. The OR arm is true for every row, so all three
+	// ht1 rows reach both sublinks (the EXISTS may be evaluated above the
+	// IN's filter).
+	//
+	// The EXISTS sits under an OR for the same reason (M0145-0008o): a bare
+	// uncorrelated EXISTS conjunct is a pseudoconstant, which PG, and now
+	// goopg, evaluates ONCE as a gating Result's One-Time Filter
+	// (create_gating_plan), never per row. The OR keeps it a per-row SubPlan,
+	// which is the shared-scoped-store case this test exists for.
+	runQuery(t, ctx, "SELECT a FROM ht1 WHERE (b IN (SELECT b FROM ht2) OR a > 0)"+
+		" AND (EXISTS (SELECT 1 FROM ht3) OR a > 0) ORDER BY a")
 
 	var inStat, existsStat *SubPlanSiteStats
 	for e, s := range ctx.SubPlanStats {

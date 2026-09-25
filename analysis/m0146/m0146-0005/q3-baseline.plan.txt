@@ -1,0 +1,20 @@
+=== Q3
+Sort  (cost=118224.70..119012.83 rows=315253 width=104)
+  Sort Key: (sum((lineitem.l_extendedprice * (1 - lineitem.l_discount)))) DESC, o_orderdate
+  ->  HashAggregate  (cost=82536.18..85688.71 rows=315253 width=104)
+        Group Key: lineitem.l_orderkey, o_orderdate, o_shippriority
+        ->  Gather  (cost=2000.75..82339.21 rows=315253 width=1622)
+              Workers Planned: 3
+              ->  Nested Loop  (cost=0.75..119008.39 rows=101695 width=1278)
+                    ->  Nested Loop  (cost=0.38..37991.19 rows=47695 width=728)
+                          ->  Parallel Seq Scan on orders  (cost=0.00..32593.39 rows=237288 width=448)
+                                Filter: (o_orderdate < '1995-03-15'::date)
+                          ->  Memoize  (cost=0.38..0.44 rows=1 width=624)
+                                Cache Key: o_custkey
+                                ->  Index Scan using customer_pk on customer  (cost=0.38..0.44 rows=1 width=624)
+                                      Index Cond: (c_custkey = o_custkey)
+                                      Filter: (c_mktsegment = 'BUILDING')
+                    ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.38..1.99 rows=8 width=550)
+                          Index Cond: (l_orderkey = o_orderkey)
+                          Filter: (l_shipdate > '1995-03-15'::date)
+

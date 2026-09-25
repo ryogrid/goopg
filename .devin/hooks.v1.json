@@ -1,0 +1,14 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "^(exec|write_to_process|edit|write|notebook_edit|mcp_call_tool)$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "ROOT=\"${DEVIN_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; \"$ROOT/scripts/ralph-devin-guard-adapter.py\" || { [ \"${RALPH_LOOP:-}\" != 1 ] || printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"RALPH_LOOP guard (Devin): the guard adapter scripts/ralph-devin-guard-adapter.py failed to run, so the call is blocked. Escalate instead of working around it.\"}}'; }",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}

@@ -44,7 +44,7 @@ func TestApplyRecordPGRedoSkipsAbsentPage(t *testing.T) {
 			name:  "heap prune",
 			relID: 5402,
 			build: func(t *testing.T, rel storage.RelFileNode) []byte {
-				framed, err := EncodeHeapPruneOptPG(rel, 9, [][2]uint16{{1, 3}}, []uint16{2})
+				framed, err := EncodeHeapPruneOptPG(rel, 9, [][2]uint16{{1, 3}}, nil, []uint16{2})
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -123,9 +123,15 @@ Each of these holds `48 × columns + 24` bytes per retained row.
 | aggregate hash table | `groups map[string]*groupRuntime`, each with `groupValues Row`, `passthroughVals Row` | `operators_join_agg.go:2009`, `:1850-1855` |
 | aggregate input buffer | `rows []Row` on `aggregateOp` | `operators_join_agg.go:1823-1841` |
 
-Two of these are the same data twice: `operators_join_agg.go` maintains **both**
-`lazyHash` and `lazyIntHash`, so peak build memory on the int-key path is ~2×
-(take2 07 §6 records this separately).
+~~Two of these are the same data twice: `operators_join_agg.go` maintains
+**both** `lazyHash` and `lazyIntHash`, so peak build memory on the int-key
+path is ~2× (take2 07 §6 records this separately).~~ **REFUTED
+(M0139-0004, 2026-09-15):** the two fields are mutually-exclusive lanes
+chosen once per build from the plan's static key types, not a standing
+double-retention — see `docs/design/0100-0149/m0139-0004-duplicate-hash-map-refutation.md`
+and `05-work-estimate.md` §1.5. These are still two distinct struct fields
+(one row above each still counts once toward the 48-field/Tier-A surface in
+05 §2.1), just never both populated for the same build in the routine case.
 
 `hashsize.EntryBytes` (`internal/executor/hashsize/hashsize.go:121-128`) models it
 as `ncols × DatumBytes + RowSliceBytes + avgVarBytes` = `ncols × 48 + 24 +

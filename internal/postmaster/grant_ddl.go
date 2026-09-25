@@ -79,6 +79,11 @@ const aclOwnerRole = "postgres"
 // names the role that is actually executing the statement.
 var errGrantorMustBeCurrentUser = errors.New("grantor must be current user")
 
+// errGrantOptionToPublic is PostgreSQL's 0LP01 refusal of GRANT … TO PUBLIC
+// WITH GRANT OPTION (merge_acl_with_grant, aclchk.c:208), raised before any
+// ACL entry is recorded. query.go maps it to errcodes.InvalidGrantOperation.
+var errGrantOptionToPublic = errors.New(catalog.GrantOptionToPublicMessage)
+
 // tryRecordTableGrant parses a table-level GRANT and records its privileges in
 // the catalog ACL store. It is a best-effort side effect: on any form it does
 // not recognise it simply returns nil, leaving the statement as a successful
@@ -134,6 +139,9 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string, searchPath 
 		if named != "" && named != grantor {
 			return errGrantorMustBeCurrentUser
 		}
+	}
+	if catalog.GrantOptionToPublic(withGrantOption, splitRoleGrantList(rolePart)) {
+		return errGrantOptionToPublic
 	}
 
 	// Optional leading TABLE / SEQUENCE keyword on the object list, or a required

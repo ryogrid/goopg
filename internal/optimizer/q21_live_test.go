@@ -206,6 +206,17 @@ func visit(n Node, fn func(Node) bool) {
 	case *Join:
 		visit(x.Left, fn)
 		visit(x.Right, fn)
+	// M0140-0002: GOOPG_GATHER_PATHS=all can wrap the searched tree in a
+	// Gather/GatherMerge (see createplanroot.go's boundaryWalkChildren,
+	// added for the same reason under R11) — without these two cases this
+	// walk silently stops at the wrapper and every caller below it reports
+	// a false "not found", exactly as TestSplitEqualityForHashMultiKey's
+	// searched-enumerator arm did (the plan already chose JoinAlgoHash with
+	// both keys set; only this walker couldn't see past the Gather).
+	case *Gather:
+		visit(x.Child, fn)
+	case *GatherMerge:
+		visit(x.Child, fn)
 	case *Filter:
 		visit(x.Child, fn)
 	case *Project:

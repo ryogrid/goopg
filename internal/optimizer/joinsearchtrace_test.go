@@ -207,5 +207,307 @@ func TestTraceOffIsNil(t *testing.T) {
 	// The nil-safe call sites: these are what run in production.
 	s.trace.offer(tracePhaseBushy, 0b001, 0b010, true)
 	s.trace.decline(tracePhaseBushy, 0b001, 0b010, "no-join-clause")
+	s.trace.cost(nil)
 	s.trace.emit()
+}
+
+// TestTraceRecordsCostPerRelset: R53 Step-0's instrument. After a full search
+// every built joinrel carries one L-number — the level, the rows setCheapest
+// priced, the pathlist length, the winner's kind and total — so a costing
+// question ("did {ps,p,s,l} lose on rows or on price?") is answered from the
+// trace without re-instrumenting.
+func TestTraceRecordsCostPerRelset(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	b := &recordingBuilder{}
+	if _, err := s.joinSearch(jslClauses(0b011, 0b110), b); err != nil {
+		t.Fatalf("joinSearch: %v", err)
+	}
+	// Three joinrels: {a+b} and {b+c} at level 2, {a+b+c} at level 3.
+	if len(s.trace.costs) != 3 {
+		t.Fatalf("cost records = %d, want 3 (one per built joinrel)", len(s.trace.costs))
+	}
+	for _, c := range s.trace.costs {
+		if c.level != relLevel(c.rel) {
+			t.Errorf("cost record level %d for relset %#b (relLevel %d)", c.level, uint32(c.rel), relLevel(c.rel))
+		}
+		if c.rows <= 0 || c.paths == 0 {
+			t.Errorf("cost record holds no pricing: %+v", c)
+		}
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cost lev=2 rel={a+b}",
+		"DPTRACE cost lev=2 rel={b+c}",
+		"DPTRACE cost lev=3 rel={a+b+c}",
+		"cheapest=",
+		"reqouter=",
+		"total=",
+		"second=",
+		"secondtotal=",
+		"costs=3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceCostSecondAndReqouter: the two fields that scope a pricing slice.
+// The winner is CheapestTotal (the path the search USES), never the min-total
+// pathlist entry: here an unparameterised hash wins while a cheaper
+// parameterised NL stands second, and reqouter says the winner needs no
+// bindings while the inner-parameterisation still reads `nli` on the second.
+func TestTraceCostSecondAndReqouter(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	rel := &RelOptInfo{Relids: 0b011, Rows: 200}
+	rel.Pathlist = []*Path{
+		{Kind: PathHashJoin, Cost: Cost{Total: 100}},
+		{Kind: PathNestLoop, Cost: Cost{Total: 50}, Children: []*Path{{}, {RequiredOuter: 0b001}}},
+	}
+	rel.CheapestTotal = rel.Pathlist[0]
+	s.trace.cost(rel)
+	if len(s.trace.costs) != 1 {
+		t.Fatalf("cost records = %d, want 1", len(s.trace.costs))
+	}
+	c := s.trace.costs[0]
+	if c.kind != "hash" || c.total != 100 || c.reqouter != 0 {
+		t.Errorf("winner = %s reqouter=%#b total=%g, want hash reqouter=0 total=100", c.kind, uint32(c.reqouter), c.total)
+	}
+	if c.second != "nli" || c.secondTotal != 50 {
+		t.Errorf("second = %s total=%g, want nli 50", c.second, c.secondTotal)
+	}
+	out := s.trace.render()
+	if !strings.Contains(out, "cheapest=hash reqouter={} total=100 second=nli secondtotal=50") {
+		t.Errorf("rendered cost line wrong:\n%s", out)
+	}
+}
+
+// TestTracePathKindLabels: the winner vocabulary Step-0 reads off the cost
+// lines — join methods by name, parameterised (NLI) nestloops split from plain
+// ones (same PathKind, different admission rules), and a nil winner named.
+func TestTracePathKindLabels(t *testing.T) {
+	nli := &Path{Kind: PathNestLoop, Children: []*Path{{}, {RequiredOuter: 0b001}}}
+	for _, tc := range []struct {
+		path *Path
+		want string
+	}{
+		{&Path{Kind: PathHashJoin}, "hash"},
+		{&Path{Kind: PathMergeJoin}, "merge"},
+		{&Path{Kind: PathNestLoop}, "nl"},
+		{nli, "nli"},
+		{&Path{Kind: PathSeqScan}, "seq"},
+		{&Path{Kind: PathGatherMerge}, "gathermerge"},
+		{nil, "none"},
+	} {
+		if got := tracePathKind(tc.path); got != tc.want {
+			t.Errorf("tracePathKind(%+v) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestTraceCPAdmitJoinAndVeto: R54 Step-0's S1/S2 records. An admitted joinrel
+// carries its inputs' flags, the clause count, and failidx=-1 with the "none"
+// default; a vetoed one names the first failing clause by %T — the S2
+// explanation Step-0 reads, computed through `firstParallelUnsafeClause`, the
+// same helper the verdict loop is written on, so the name cannot disagree with
+// the flag.
+func TestTraceCPAdmitJoinAndVeto(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.admit(0b011, true, true, true, jslClauses(0b011).all, s.cat)
+	veto := []*restrictInfo{{relids: 0b011, ecID: noEquivClass, clause: &OuterColumnRef{}}}
+	s.trace.admit(0b011, false, true, true, veto, s.cat)
+	if len(s.trace.cpAdmits) != 2 {
+		t.Fatalf("cpadmit records = %d, want 2", len(s.trace.cpAdmits))
+	}
+	a := s.trace.cpAdmits[0]
+	if !a.cp || !a.in1 || !a.in2 || a.nclauses != 1 || a.failidx != -1 || a.failkind != "" {
+		t.Errorf("admitted record wrong: %+v", a)
+	}
+	v := s.trace.cpAdmits[1]
+	if v.cp || v.failidx != 0 || v.failkind != "*optimizer.OuterColumnRef" {
+		t.Errorf("veto record wrong: %+v", v)
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpadmit src=join rel={a+b} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none",
+		"DPTRACE cpadmit src=join rel={a+b} cp=0 in1=1 in2=1 nclauses=1 failidx=0 failkind=*optimizer.OuterColumnRef",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceCPAdmitNilClause: the verdict loop vetoes a nil restrictInfo
+// outright; the record names it "nil-clause" rather than panicking on %T of
+// nothing. %T of that string is "string", which is what the line carries.
+func TestTraceCPAdmitNilClause(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.admit(0b011, false, true, true, []*restrictInfo{nil}, s.cat)
+	if len(s.trace.cpAdmits) != 1 {
+		t.Fatalf("cpadmit records = %d, want 1", len(s.trace.cpAdmits))
+	}
+	v := s.trace.cpAdmits[0]
+	if v.failidx != 0 || v.failkind != "string" {
+		t.Errorf("nil-clause record wrong: %+v", v)
+	}
+	if out := s.trace.render(); !strings.Contains(out, "failidx=0 failkind=string") {
+		t.Errorf("rendered block missing nil-clause naming:\n%s", out)
+	}
+}
+
+// TestTraceBaseCPLeafVerdict: S1's leaf half. The Filter wrapper peels exactly
+// as `relConsiderParallel` peels it, the arm names in the verdict's own
+// vocabulary, and a kind the verdict does not enumerate renders "other" — the
+// verdict fails closed there, and so does the name.
+func TestTraceBaseCPLeafVerdict(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	s.trace.baseCP(0b001, &Filter{Child: &SeqScan{}}, true)
+	s.trace.baseCP(0b010, &BitmapHeapScan{}, false)
+	s.trace.baseCP(0b100, &Sort{}, false)
+	if len(s.trace.cpAdmits) != 3 {
+		t.Fatalf("cpadmit records = %d, want 3", len(s.trace.cpAdmits))
+	}
+	for i, want := range []string{"seq", "bitmap", "other"} {
+		if got := s.trace.cpAdmits[i].leaf; got != want {
+			t.Errorf("leaf %d = %q, want %q", i, got, want)
+		}
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpadmit src=base rel={a} cp=1 leaf=seq",
+		"DPTRACE cpadmit src=base rel={b} cp=0 leaf=bitmap",
+		"DPTRACE cpadmit src=base rel={c} cp=0 leaf=other",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTraceAppendRelVerdicts(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "u", "d")
+	for _, tc := range []struct {
+		rel     RelSet
+		verdict string
+	}{
+		{0b001, "unmarked"}, {0b010, "no-cp"}, {0b001, "carrier"},
+		{0b001, "tlist"}, {0b001, "no-partials"}, {0b001, "admitted"},
+	} {
+		s.trace.appendRel(tc.rel, tc.verdict)
+	}
+	if got := len(s.trace.appendrs); got != 6 {
+		t.Fatalf("appendrel records = %d, want 6", got)
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE appendrel rel={u} verdict=unmarked",
+		"DPTRACE appendrel rel={d} verdict=no-cp",
+		"DPTRACE appendrel rel={u} verdict=carrier",
+		"DPTRACE appendrel rel={u} verdict=tlist",
+		"DPTRACE appendrel rel={u} verdict=no-partials",
+		"DPTRACE appendrel rel={u} verdict=admitted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceGatherVerdicts: S4's "generated but lost" vs "never generated"
+// separation. The record carries the partial-pathlist length at decision time
+// with the gate that fired; whether a Gather won reads off the `cost` line's
+// cheapest kind, not here.
+func TestTraceGatherVerdicts(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b")
+	s.trace.gather(0b011, 2, "admitted")
+	s.trace.gather(0b011, 1, "no-cp")
+	if len(s.trace.gathers) != 2 {
+		t.Fatalf("cpgather records = %d, want 2", len(s.trace.gathers))
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE cpgather rel={a+b} partials=2 verdict=admitted",
+		"DPTRACE cpgather rel={a+b} partials=1 verdict=no-cp",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTraceAdmissionNilSafe: with the gate off the trace is nil and every R54
+// call site tolerates it — the search and the post-pass must be untouched in
+// production. `traceUpperGate` is a package function rather than a method, so
+// it gets its own nil-tolerance pin here: gate off means no output, no panic.
+func TestTraceAdmissionNilSafe(t *testing.T) {
+	var nilTrace *searchTrace
+	nilTrace.admit(0b011, true, true, true, nil, nil)
+	nilTrace.baseCP(0b001, nil, true)
+	nilTrace.gather(0b011, 0, "no-partials")
+	nilTrace.pveto("hash", 0b011, 0b001, 0b010, "V4", "jt=INNER")
+	tracePVetoCtx(nil, "hash", 0b011, 0b001, 0b010, "V2", "sub=s-nil jt=INNER")
+	if got := traceRelids(nil); got != 0 {
+		t.Errorf("traceRelids(nil) = %v, want 0", got)
+	}
+	traceUpperGate("agg", "split", "workers=4 divisor=3")
+}
+
+// TestTracePVetoRenderPins: R54 Step-1's veto lines. One line per producer
+// call that did not file (plus `veto=admitted` per file, so absence of lines
+// is distinguishable from absence of calls), with the site, the rel, the
+// tried orientation (`dir=-` for the base site, which tries none), the veto
+// name and the per-veto detail. Every site's vocabulary renders verbatim —
+// the harvest greps these strings, so a rename must be deliberate.
+func TestTracePVetoRenderPins(t *testing.T) {
+	enableDPTrace(t)
+	s := traceCtx(t, "a", "b", "c")
+	s.trace.pveto("hash", 0b011, 0b001, 0b010, "V4", "jt=INNER")
+	s.trace.pveto("merge", 0b111, 0b011, 0b100, "M12", "jt=INNER workers=2")
+	s.trace.pveto("mergeu", 0b111, 0b011, 0b100, "M7", "cand=1 jt=INNER keys=-1")
+	s.trace.pveto("base", 0b001, 0, 0, "admitted", "leaf=seq workers=2")
+	s.trace.pveto("base", 0, 0, 0, "B1", "sub=mode")
+	if len(s.trace.pvetos) != 5 {
+		t.Fatalf("pveto records = %d, want 5", len(s.trace.pvetos))
+	}
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE pveto site=hash rel={a+b} dir={a}+{b} veto=V4 detail=jt=INNER",
+		"DPTRACE pveto site=merge rel={a+b+c} dir={a+b}+{c} veto=M12 detail=jt=INNER workers=2",
+		"DPTRACE pveto site=mergeu rel={a+b+c} dir={a+b}+{c} veto=M7 detail=cand=1 jt=INNER keys=-1",
+		"DPTRACE pveto site=base rel={a} dir=- veto=admitted detail=leaf=seq workers=2",
+		"DPTRACE pveto site=base rel=- dir=- veto=B1 detail=sub=mode",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSubtreeRefusalKind: R54 Step-1 H6's disjunct vocabulary. The `gate=subtree`
+// detail names which precondition refused — unsafe node, gathered subtree, or
+// no driving scan — with first disjunct winning to match the guard's || order.
+func TestSubtreeRefusalKind(t *testing.T) {
+	for _, tc := range []struct {
+		unsafe, gathered, noScan bool
+		want                     string
+	}{
+		{true, false, false, "unsafe"},
+		{false, true, false, "gathered"},
+		{false, false, true, "no-driving-scan"},
+		{true, true, true, "unsafe"},
+		{false, true, true, "gathered"},
+	} {
+		if got := subtreeRefusalKind(tc.unsafe, tc.gathered, tc.noScan); got != tc.want {
+			t.Errorf("subtreeRefusalKind(%v, %v, %v) = %q, want %q",
+				tc.unsafe, tc.gathered, tc.noScan, got, tc.want)
+		}
+	}
 }

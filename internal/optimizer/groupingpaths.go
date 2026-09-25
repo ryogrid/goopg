@@ -77,6 +77,17 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
+	// R54 redesign (REDESIGN.md rev 2): size the seed from the search
+	// joinrel's rows — serial TOTALS, which is what every seed-driven term
+	// prices (serial costAgg arms, both gather crossings; the split divides
+	// exactly once downstream in partialaggupper.go). Rows-only: the input
+	// price cancels across the live contest (split and gathered no-split
+	// build on the same pseed), so Cost replacement is separately scoped.
+	// Fail-closed: fires only through row-preserving pass-throughs, and only
+	// when the rel carries rows.
+	if sr := searchedJoinInputRelOf(child); sr != nil && sr.Rows > 0 {
+		seed.Rows = sr.Rows
+	}
 
 	addGroupingPaths(grouped, seed, aggNode, child, cat, cp, ps)
 	// C-19g's remainder (that design's §8): the PARALLEL candidate —
@@ -125,13 +136,33 @@ func sizeGroupingRelFromAgg(rel *RelOptInfo, aggNode *Aggregate) {
 		return
 	}
 	cols := aggNode.Output()
-	rel.Rows = float64(estimateNumGroups(aggNode.GroupExprs, aggNode.Child, EstimateRows(aggNode.Child)))
+	rel.Rows = float64(estimateNumGroups(aggNode.GroupExprs, aggNode.Child, groupCountInputRows(aggNode.Child)))
 	if rel.Rows < 1 {
 		rel.Rows = 1
 	}
 	rel.Width = nodeTupleWidth(aggNode)
 	rel.NCols = len(cols)
 	rel.AvgVarBytes = nodeAvgVarBytes(cols)
+}
+
+// groupCountInputRows is the R61 sourcing shared by both group-count
+// consumers — search-rel sizing (`sizeGroupingRelFromAgg` above) and
+// estimate/display recompute (`estimateAggregate`, cardinality.go).
+// It sizes the group count from the search's own joinrel rows when the
+// aggregate input is a row-preserved searched tree — the R54
+// `searchedJoinInputRelOf` gate the seed below uses. Recomputing
+// `EstimateRows` over a parameterized estimate tree falls to the NL 0.005
+// fallback and floors the input to 1 (Q11: 1 instead of 32000), and no
+// downstream clamp can recover it. Fail-closed to the legacy recompute
+// when the gate does not fire; both production sizing callers
+// (`createGroupingPaths` and the partial tournament) share this sourcing,
+// so the serial and split upper rels agree.
+func groupCountInputRows(child Node) int64 {
+	inputRows := EstimateRows(child)
+	if sr := searchedJoinInputRelOf(child); sr != nil && sr.Rows > 0 {
+		inputRows = int64(sr.Rows)
+	}
+	return inputRows
 }
 
 // groupingHashable is the HASHED arm's gate — PG's `numOrderedAggs == 0`
@@ -218,9 +249,10 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		return nil, false
 	}
 
+	// root->group_pathkeys: the processed group clause (M0145-0008d).
 	var grouppathkeys []PathKey
-	for _, g := range aggNode.GroupExprs {
-		grouppathkeys = append(grouppathkeys, PathKey{Expr: g, SortAsc: true, NullsFirst: false})
+	for _, k := range groupClauseKeys(aggNode) {
+		grouppathkeys = append(grouppathkeys, PathKey{Expr: aggNode.GroupExprs[k.Pos], SortAsc: !k.Desc, NullsFirst: k.NullsFirst})
 	}
 
 	bestCount := 0
@@ -277,12 +309,15 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 	return finalSortKeys, true
 }
 
-// groupKeysSortKeys is one ascending SortKey per group expression — the
-// input order a plain sorted aggregate consumes.
+// groupKeysSortKeys is one SortKey per group expression, in the order and
+// direction a plain sorted aggregate consumes: PG's processed_groupClause
+// (Aggregate.GroupClause, groupclause.go — ORDER BY's prefix first, each key
+// in the direction ORDER BY asks for it), written order ASC NULLS LAST when
+// there is none.
 func groupKeysSortKeys(aggNode *Aggregate) []SortKey {
 	keys := make([]SortKey, 0, len(aggNode.GroupExprs))
-	for _, g := range aggNode.GroupExprs {
-		keys = append(keys, SortKey{Expr: g, Desc: false, NullsFirst: false})
+	for _, k := range groupClauseKeys(aggNode) {
+		keys = append(keys, SortKey{Expr: aggNode.GroupExprs[k.Pos], Desc: k.Desc, NullsFirst: k.NullsFirst})
 	}
 	return keys
 }
@@ -293,11 +328,50 @@ func groupKeysSortKeys(aggNode *Aggregate) []SortKey {
 // AvgVarBytes follows the same `nodeAvgVarBytes` rule base rels take from
 // ANALYZE. (Kept for the spill arm's resume — costAgg takes both as future
 // inputs; see the NO-spill note there.)
-func aggInputWidth(child Node) (ncols int, avgVarBytes float64) {
+// aggInputWidth reads the seed child's width: the width of the rows being
+// hashed (input side), never the GROUP_AGG rel's output sizing. The child
+// is a finished Node, so its own output schema is the honest source;
+// AvgVarBytes follows the same `nodeAvgVarBytes` rule base rels take from
+// ANALYZE.
+//
+// When agg is non-nil and agg.InputTargetKnown, the width is computed over
+// agg.InputTarget's kept columns (indices into child.Output()) instead of
+// the full row — M0141-S2a-fix1, the B2 absorption for cost_agg's width
+// currency. PG's own cost_agg/hash_agg_entry_size both key off
+// subpath->pathtarget->width / outerplan->plan_width
+// (pathnode.c:3430-3434, nodeAgg.c:1701-1730,3701-3703): the width of the
+// input node PG's planner has ALREADY narrowed by the time it costs or
+// executes the aggregate, via its query-wide attr_needed/pathtarget
+// machinery. goopg has no query-wide equivalent (that is the K24/M0141-S2b
+// item); agg.InputTarget — the NAME-derived keep-list
+// stampAggregateInputTarget computes before createGroupingPaths runs
+// (group_input_target.go) — is goopg's own per-node substitute for the
+// same quantity, so feeding it here is absorption, not tuning (see
+// docs/design/0100-0149/m0141-s2a-fix-scoping-recon.md Findings 1-2).
+//
+// This is a cost-time PREVIEW ONLY: it does not insert a Project, does not
+// change the schema, and is deliberately separate from whether
+// narrowAggregateInput (upper_narrow_apply.go) later actually COMMITS a
+// narrowing Project for the winning strategy — a HASHED winner declines
+// that commit (no Sort to sink a Project below), and that decline does not
+// invalidate this preview: PG's hash_agg_entry_size charges entry size from
+// the input width regardless of row-storage retention (design doc's
+// "Correctness note"). agg == nil or InputTargetKnown == false falls back
+// to the full child.Output() width unchanged (no narrowing derivable).
+func aggInputWidth(child Node, agg *Aggregate) (ncols int, avgVarBytes float64) {
 	if child == nil {
 		return 0, 0
 	}
 	cols := child.Output()
+	if agg != nil && agg.InputTargetKnown {
+		kept := make(Schema, 0, len(agg.InputTarget))
+		for _, idx := range agg.InputTarget {
+			if idx >= 0 && idx < len(cols) {
+				kept = append(kept, cols[idx])
+			}
+		}
+		return len(kept), nodeAvgVarBytes(kept)
+	}
 	return len(cols), nodeAvgVarBytes(cols)
 }
 
@@ -310,7 +384,38 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	inputRows := seed.Rows
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
 	numGroups := grouped.Rows
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	// M0144-0003c: the Sort beneath a grouping candidate must be priced on the
+	// SAME narrowed row the aggregate above it is priced on.
+	//
+	// `sortPathForBounded` sizes through `pathNCols`/`pathAvgVarBytes`
+	// (joinpathsmerge.go), which fall through to the INPUT rel's full-row
+	// `NCols`/`AvgVarBytes`. So without this the two consumers of one input
+	// disagree: a full-width sort feeding a narrow-width aggregate.
+	//
+	// PG never splits them. `grouping_planner` builds the narrowed input
+	// target once (`make_group_input_target`,
+	// postgres/src/backend/optimizer/plan/planner.c:1676-1744),
+	// `set_pathtarget_cost_width` finalises its width (costsize.c:6367), and
+	// `cost_sort` reads that same `pathtarget->width` (costsize.c:2328) —
+	// one narrowing, every candidate priced from it.
+	//
+	// The quantity is `aggInputWidth` above: already derived, already the
+	// number `costAgg` is charged on, and already justified as M0141-S2a-fix1's
+	// B2 absorption of `pathtarget->width`. No new constant (R6), no newly
+	// chosen quantity (C3) — this only stops the two readers disagreeing.
+	//
+	// A shallow COPY, not a mutation: the hashed and index-driven arms read
+	// the seed's cost rather than its width, so narrowing in place would be
+	// invisible to them but would silently re-point anything else holding the
+	// pointer. `pathNCols`/`pathAvgVarBytes` prefer the per-path override
+	// (path.go:819-842), which is exactly what this copy sets.
+	sortSeed := seed
+	if seed != nil && inNcols > 0 {
+		narrowed := *seed
+		narrowed.NCols, narrowed.AvgVarBytes = inNcols, inAvgVar
+		sortSeed = &narrowed
+	}
 
 	groupedOut := len(aggNode.GroupExprs) > 0 || aggNode.GroupingSets != nil
 	presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
@@ -324,32 +429,24 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		input := seed
 		producer := groupAggPlainProducer
 		if presorted {
-			input = sortPathForBounded(seed, pathkeysForSortKeys(presortedKeys), cp, -1)
+			// M0144-0003c: narrowed seed — both sort sites change together
+			// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
+			input = sortPathForBounded(sortSeed, pathkeysForSortKeys(presortedKeys), cp, -1)
 			producer = groupAggSortedProducer
 		}
+		// R47 slice 1: per-candidate spec clone. All arms below used
+		// to file the shared aggNode pointer, so the winner
+		// copy-back (`*aggNode = *built`) rewrote losers underneath
+		// future readers. Content-identical; behavior change: none.
+		plainSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-				0, 1, len(aggNode.Aggs), inNcols, inAvgVar),
+				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
 		return
-	}
-
-	// HASHED. Offered whenever hashable; enable_hashagg = off marks it
-	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
-	// Grouping sets always hash (today's fall-through; executor has one
-	// hash table per set).
-	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
-			Rel: grouped, Rows: numGroups,
-			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-				len(aggNode.GroupExprs), numGroups, len(aggNode.Aggs), inNcols, inAvgVar),
-			Children: []*Path{seed},
-		}, groupAggHashedProducer)
 	}
 
 	// SORTED. Grouping sets stay out (executor cannot run them sorted).
@@ -364,41 +461,84 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	// never correctness. The executor sorts array_agg/string_agg ORDER BY
 	// internally, so the common built-ins stay correct under hashed either
 	// way.
+	//
+	// Emitted BEFORE hashed, mirroring PG's add_paths_to_grouping_rel
+	// (planner.c: the can_sort block at :7128 runs before can_hash at
+	// :7286). This order matters even though neither block's cost formula
+	// changes: addPath's fuzzy-tie-break (STD_FUZZ_FACTOR, path.go) keeps
+	// whichever candidate was inserted FIRST when two paths have identical
+	// pathkeys and a cost margin under ~1%, which is exactly TPC-H Q4/Q12's
+	// situation (M0141-S2b-10). The former hashed-then-sorted order elected
+	// Hashed+explicit-Sort where real PG elects a plain Sort-fed
+	// GroupAggregate; sorted-first restores the PG election.
 	if aggNode.GroupingSets == nil {
 		keys := presortedKeys
+		haveSortedCandidate := true
 		if !presorted {
 			if groupingHasSpecialAgg(aggNode) {
-				return
+				haveSortedCandidate = false
+			} else {
+				keys = groupKeysSortKeys(aggNode)
 			}
-			keys = groupKeysSortKeys(aggNode)
 		}
-		if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
-			// The index-driven variant: no Sort, narrowed spec. The spec
-			// is the builder's clone (remapped to narrowed positions);
-			// the input price is the index child's own.
-			idxSeed := newPrebuiltPath(grouped, idxChild)
-			idxSeed.Rows = inputRows
-			if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
-				idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+		if haveSortedCandidate {
+			if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
+				// The index-driven variant: no Sort, narrowed spec. The spec
+				// is the builder's clone (remapped to narrowed positions);
+				// the input price is the index child's own.
+				idxSeed := newPrebuiltPath(grouped, idxChild)
+				idxSeed.Rows = inputRows
+				if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
+					idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+				}
+				// M0145-0030: a search-built child's rel already holds the
+				// cost_index-priced full scan of this index; price the
+				// variant from it, as PG takes the sorted input from
+				// input_rel->pathlist (add_paths_to_grouping_rel,
+				// planner.c:7128). The legacy display cost above is a
+				// rule-era estimate that undercut the rel's own seq path.
+				if c, ok := searchRelIndexPathCost(child, idxChild); ok {
+					idxSeed.Cost = c
+				}
+				idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
+						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
+				}, groupAggSortedIdxProducer)
+			} else {
+				// M0144-0003c: narrowed seed — see sortSeed above.
+				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
+				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+				sortSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+				}, groupAggSortedProducer)
 			}
-			idxNcols, idxAvgVar := aggInputWidth(idxChild)
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
-				Rel: grouped, Rows: numGroups,
-				Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
-					len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
-				Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
-			}, groupAggSortedIdxProducer)
-			return
 		}
-		sortedInput := sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
+	}
+
+	// HASHED. Offered whenever hashable; enable_hashagg = off marks it
+	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
+	// Grouping sets always hash (today's fall-through; executor has one
+	// hash table per set).
+	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
+		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+		hashSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: numGroups,
-			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				len(aggNode.GroupExprs), numGroups, len(aggNode.Aggs), inNcols, inAvgVar),
-			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-		}, groupAggSortedProducer)
+			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
+			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+				len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar),
+			Children: []*Path{seed},
+		}, groupAggHashedProducer)
 	}
 }
 
@@ -416,6 +556,45 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 // rather than replicating that); no usable index ⇒ absent. The deleted proxy
 // gate (`enable_hashagg = off`) is deliberately NOT re-checked: price
 // competition replaces it, and the GUC-on PK-FD pin (§5 gate) adjudicates.
+// searchRelIndexPathCost returns the cost of the cheapest unparameterised
+// index path on idxChild's index in the pathlist of the search rel child
+// came from. ok is false when child is not a join-search product (the
+// legacy arm) or the rel holds no such path — the caller keeps its own
+// estimate then.
+func searchRelIndexPathCost(child, idxChild Node) (Cost, bool) {
+	rel := searchedJoinInputRelOf(child)
+	if rel == nil {
+		return Cost{}, false
+	}
+	n := idxChild
+	if f, ok := n.(*Filter); ok {
+		n = f.Child
+	}
+	var idx *catalog.Index
+	switch x := n.(type) {
+	case *IndexOnlyScan:
+		idx = x.Index
+	case *IndexScan:
+		idx = x.Index
+	}
+	if idx == nil {
+		return Cost{}, false
+	}
+	var best *Path
+	for _, p := range rel.Pathlist {
+		if p == nil || p.Kind != PathIndexScan || p.IndexInfo != idx || p.RequiredOuter != 0 {
+			continue
+		}
+		if best == nil || p.Cost.Total < best.Cost.Total {
+			best = p
+		}
+	}
+	if best == nil {
+		return Cost{}, false
+	}
+	return best.Cost, true
+}
+
 func indexOrderedAggInput(aggNode *Aggregate, child Node, cat catalog.Catalog) (newChild Node, spec *Aggregate, ok bool) {
 	if aggNode == nil || cat == nil {
 		return nil, nil, false
@@ -453,6 +632,12 @@ func indexOrderedAggInput(aggNode *Aggregate, child Node, cat catalog.Catalog) (
 	}
 	for _, idx := range cat.IndexesOnTable(seqScan.Table) {
 		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
+			continue
+		}
+		// A full ordered scan binds no key column, and goopg stores no index
+		// entry whose key has a NULL column: over a nullable key column the
+		// scan would drop those rows (a GROUP BY lost its NULL group).
+		if !indexUnboundKeysNotNull(seqScan.Table, idx, 0) {
 			continue
 		}
 		if idx.Method != "" && idx.Method != "btree" {

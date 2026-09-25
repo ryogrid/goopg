@@ -58,6 +58,15 @@ const (
 	aclGrantOptionShift = 32
 )
 
+// ACLItemText is one decoded aclitem array element. Privileges uses
+// aclitemout's canonical letters, including a trailing '*' for each privilege
+// held with grant option. An empty Grantee denotes PUBLIC.
+type ACLItemText struct {
+	Grantee    string
+	Grantor    string
+	Privileges string
+}
+
 // aclRightsChars is ACL_ALL_RIGHTS_STR (acl.h): the privilege letters in
 // canonical aclitemout order. The letter at index i corresponds to AclMode
 // privilege bit (1<<i) — 'a'=INSERT(0) … 'U'=USAGE(8) … 'm'=MAINTAIN(14).
@@ -301,43 +310,62 @@ func encodeAclItemArrayText(aclText string, resolveOID func(roleName string) uin
 // maps a role OID back to its name; ACL_ID_PUBLIC (0) renders as the empty
 // grantee regardless of resolveName. A 0-dimension array yields "{}".
 func decodeAclItemArrayText(blob []byte, resolveName func(oid uint32) string) (string, error) {
-	if len(blob) < arrayHeaderSize {
-		// Too short to carry a header; treat as empty (matches the ndim==0 case).
-		return "{}", nil
-	}
-	ndim := binary.LittleEndian.Uint32(blob[4:8])
-	if ndim == 0 {
-		return "{}", nil
-	}
-	n := int(binary.LittleEndian.Uint32(blob[16:20]))
-	if n <= 0 {
-		return "{}", nil
-	}
-	data := blob[arrayHeaderSize:]
-	if len(data) < n*aclItemSize {
-		return "", fmt.Errorf("aclitem: truncated array body (have %d bytes, need %d for %d items)",
-			len(data), n*aclItemSize, n)
+	items, err := DecodeACLItemArray(blob, resolveName)
+	if err != nil {
+		return "", err
 	}
 	var sb strings.Builder
 	sb.WriteByte('{')
+	for i, item := range items {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(aclPutid(item.Grantee))
+		sb.WriteByte('=')
+		sb.WriteString(item.Privileges)
+		sb.WriteByte('/')
+		sb.WriteString(aclPutid(item.Grantor))
+	}
+	sb.WriteByte('}')
+	return sb.String(), nil
+}
+
+// DecodeACLItemArray decodes a PG-native _aclitem ArrayType blob into
+// catalog-independent textual entries. It is the structured counterpart of
+// aclitemout and permits restart reload code to restore the existing ACL
+// registry without importing catalog into this codec package.
+func DecodeACLItemArray(blob []byte, resolveName func(oid uint32) string) ([]ACLItemText, error) {
+	if len(blob) < arrayHeaderSize {
+		// Too short to carry a header; treat as empty (matches the ndim==0 case).
+		return nil, nil
+	}
+	ndim := binary.LittleEndian.Uint32(blob[4:8])
+	if ndim == 0 {
+		return nil, nil
+	}
+	n := int(binary.LittleEndian.Uint32(blob[16:20]))
+	if n <= 0 {
+		return nil, nil
+	}
+	data := blob[arrayHeaderSize:]
+	if len(data) < n*aclItemSize {
+		return nil, fmt.Errorf("aclitem: truncated array body (have %d bytes, need %d for %d items)",
+			len(data), n*aclItemSize, n)
+	}
+	items := make([]ACLItemText, 0, n)
 	for i := 0; i < n; i++ {
 		off := i * aclItemSize
 		granteeOID := binary.LittleEndian.Uint32(data[off : off+4])
 		grantorOID := binary.LittleEndian.Uint32(data[off+4 : off+8])
 		mode := binary.LittleEndian.Uint64(data[off+8 : off+16])
-		if i > 0 {
-			sb.WriteByte(',')
-		}
 		granteeName := ""
 		if granteeOID != aclPublicRoleOID {
 			granteeName = resolveName(granteeOID)
 		}
-		sb.WriteString(aclPutid(granteeName))
-		sb.WriteByte('=')
-		sb.WriteString(aclModeToPrivLetters(mode))
-		sb.WriteByte('/')
-		sb.WriteString(aclPutid(resolveName(grantorOID)))
+		items = append(items, ACLItemText{
+			Grantee: granteeName, Grantor: resolveName(grantorOID),
+			Privileges: aclModeToPrivLetters(mode),
+		})
 	}
-	sb.WriteByte('}')
-	return sb.String(), nil
+	return items, nil
 }

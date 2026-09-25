@@ -33,6 +33,8 @@ const (
 	pgUserMappingRelOID     = 1418
 	pgUserMappingOidIdxID   = 174
 	pgUserMappingUserSrvIdx = 175
+	pgForeignTableRelOID    = 3118
+	pgForeignTableRelidIdx  = 3119
 )
 
 // PGForeignDataWrapperColumnsPG18 mirrors FormData_pg_foreign_data_wrapper
@@ -70,6 +72,18 @@ func PGUserMappingColumnsPG18() []catalog.Column {
 		{Name: "umuser", Type: catalog.Type{Name: "oid"}},
 		{Name: "umserver", Type: catalog.Type{Name: "oid"}},
 		{Name: "umoptions", Type: catalog.Type{Name: "text", IsArray: true}},
+	}
+}
+
+// PGForeignTableColumnsPG18 mirrors FormData_pg_foreign_table (3 columns,
+// postgres/src/include/catalog/pg_foreign_table.h). The catalog has NO oid
+// system column: ftrelid IS the key, and it is the foreign table's pg_class
+// OID.
+func PGForeignTableColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "ftrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "ftserver", Type: catalog.Type{Name: "oid"}},
+		{Name: "ftoptions", Type: catalog.Type{Name: "text", IsArray: true}},
 	}
 }
 
@@ -174,6 +188,55 @@ func writeForeignServerCatalogRow(ctx *Context, srv *catalog.ForeignServer) erro
 	return nil
 }
 
+// writeForeignTableCatalogRow journals a foreign table's pg_foreign_table row
+// (M0122-0015). Before this, `CREATE FOREIGN TABLE` left NOTHING durable about
+// the foreign-ness of the relation: pg_foreign_table is rendered virtually
+// from catalog.Table.ForeignServerName, and that field had no heap
+// representation, so after a restart the table reloaded as a plain `relkind='r'`
+// heap relation — `pg_foreign_table` was empty and the no-handler refusal in
+// the planner became unreachable.
+//
+// ftserver is resolved to the server's OID at write time and reversed on
+// reload, exactly like pg_user_mapping.umserver. A no-op for a non-foreign
+// table so the single sync funnel can call it unconditionally.
+func writeForeignTableCatalogRow(ctx *Context, tbl *catalog.Table) error {
+	if tbl == nil || tbl.ForeignServerName == "" {
+		return nil
+	}
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	srvOID := uint32(0)
+	if srv, found := im.LookupForeignServer(tbl.ForeignServerName, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); found && srv != nil {
+		srvOID = srv.OID
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	// A re-sync (ALTER FOREIGN TABLE) re-enters this funnel, so stamp any
+	// prior row for the same ftrelid before inserting the new one — the
+	// delete+insert shape the sibling writers above use.
+	stampByOID(ctx, sysForeignRel(pgForeignTableRelOID), tbl.OID)
+	row := Row{
+		NewIntDatum(int64(tbl.OID)),
+		NewIntDatum(int64(srvOID)),
+		optionsDatum(tbl.ForeignOptions),
+	}
+	tid, err := writeHeapRowCanonical(ctx, sysForeignRel(pgForeignTableRelOID), PGForeignTableColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	if err := insertCanonicalSysBtreeLeaf(ctx, pgForeignTableRelidIdx, buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, tbl.OID), cmpKeyUint32); err != nil {
+		return err
+	}
+	mirrorForeignCatalogFiles(ctx)
+	return nil
+}
+
 // writeUserMappingCatalogRow journals CREATE USER MAPPING: umuser = the
 // role's OID (0 for PUBLIC), umserver = the server's OID.
 func writeUserMappingCatalogRow(ctx *Context, um *catalog.UserMapping) error {
@@ -241,6 +304,22 @@ func stampByOID(ctx *Context, rel storage.RelFileNode, rowOID uint32) {
 	})
 }
 
+// stampForeignTableRows marks this relation's pg_foreign_table row dead with
+// the given xmax. Called from deleteCatalogRowsForOID so a DROP FOREIGN TABLE
+// — or an ALTER's delete-then-re-sync — leaves no stale row behind for
+// reloadForeignTablesFromHeap (or a PG standby reading the catalog directly)
+// to see. The rows live in DefaultDBOid's heap, like every other foreign-data
+// catalog above, so the caller's dbOid is deliberately not used.
+func stampForeignTableRows(ctx *Context, relOID uint32, xmax storage.TransactionID) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	stampCatalogRows(ctx, sysForeignRel(pgForeignTableRelOID), xmax, func(data []byte) bool {
+		return len(data) >= 4 && binary.LittleEndian.Uint32(data[0:4]) == relOID
+	})
+	mirrorForeignCatalogFiles(ctx)
+}
+
 // textOrNullDatum returns a NULL datum for an empty string, else the string.
 func textOrNullDatum(s string) Datum {
 	if s == "" {
@@ -249,13 +328,14 @@ func textOrNullDatum(s string) Datum {
 	return NewStringDatum(s)
 }
 
-// mirrorForeignCatalogFiles propagates all three heaps + their indexes to the
-// postgres DB's copies (reload reads base/5).
+// mirrorForeignCatalogFiles propagates all four foreign-data heaps + their
+// indexes to the postgres DB's copies (reload reads base/5).
 func mirrorForeignCatalogFiles(ctx *Context) {
 	for _, oid := range []uint32{
 		pgFdwRelOID, pgFdwOidIndexOID, pgFdwNameIndexOID,
 		pgForeignServerRelOID, pgForeignServerOidIdxID, pgForeignServerNameIdx,
 		pgUserMappingRelOID, pgUserMappingOidIdxID, pgUserMappingUserSrvIdx,
+		pgForeignTableRelOID, pgForeignTableRelidIdx,
 	} {
 		_ = mirrorCatalogRelToPostgresDB(ctx, oid)
 	}

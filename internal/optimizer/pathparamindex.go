@@ -390,6 +390,25 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
 		loopCount:       s.loopCountFor(req),
+		// R1 (plan-parity-fix-take2): qpquals are the clauses evaluated on
+		// the HEAP tuple — PG's `cost_index` takes them as
+		// `baserestrictinfo + ppi_clauses` minus the index quals
+		// (costsize.c:806-820, `qpquals` built by `create_index_path`'s
+		// caller). Two disjoint populations here:
+		//   * every LOCAL conjunct (`rel.baseLeaf`'s Filter chain) — none
+		//     of them is an index qual on this path, since the index quals
+		//     come from the join clauses; `absorbableLeafCond` puts them in
+		//     `IndexScan.Cond`, which is PG's `Filter:` line, not
+		//     `Index Cond:`;
+		//   * the movable JOIN clauses the probe does not bind as index
+		//     quals — `bound` (all movable into `req`) minus `clauses` (the
+		//     gapless leading prefix that becomes the index qual). A clause
+		//     past the first gap still filters, on the heap.
+		// The two are counted, never subtracted from one another: `clauses`
+		// is drawn from `bound`, so `len(bound)-len(clauses) >= 0` and the
+		// count can never go negative (a negative would CREDIT the index
+		// path — the very asymmetry R1 removes).
+		numQualOps: paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
 	})
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.

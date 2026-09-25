@@ -3,6 +3,7 @@ package testport
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -97,25 +98,23 @@ func TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart(t *testing.T) {
 			"upstream XIDs wrongly aborted by MarkUnknownAsAborted): got %v, want %v", got, want)
 	}
 
-	// 4. Best-effort liveness probe: insert a NEW row on the primary after the
-	//    standby restart and see whether it streams through. This is reported
-	//    but NOT asserted: whether the standby's walreceiver auto-reconnects
-	//    after a plain Stop+Start is a streaming-resumption concern that is
-	//    orthogonal to the CLOG standby-attach invariant under test here
-	//    (steps 1-3). Empirically the v0 harness does not re-establish the
-	//    walreceiver stream after a standby restart, so failing the test on it
-	//    would conflate two unrelated behaviours. We log the outcome instead.
+	// 4. The restarted standby must resume streaming. PostgreSQL's recovery
+	//    contract keeps a standby connected across its own restart, resuming at
+	//    the durable local WAL tail. This is deliberately an assertion rather
+	//    than a liveness note: silently leaving the node read-only but stale
+	//    would make recovery-safe CLOG state insufficient for correct standby
+	//    operation.
 	if _, err := rc.Primary.Query(context.Background(), "INSERT INTO attach_t VALUES (6)"); err != nil {
-		t.Logf("post-restart primary insert failed (liveness probe skipped): %v", err)
-		return
+		t.Fatalf("post-restart primary insert: %v", err)
 	}
 	wantWithNew := []string{"1", "2", "3", "4", "5", "6"}
-	if got := waitForUpstreamRows(t, rc.Standby, 6, 15*time.Second); equalIDs(got, wantWithNew) {
-		t.Logf("liveness OK: standby resumed streaming after restart and saw row 6")
-	} else {
-		t.Logf("liveness note: standby did not stream post-restart insert within 15s "+
-			"(walreceiver did not auto-reconnect after restart): got %v, want %v; "+
-			"this does not affect the CLOG standby-attach invariant verified above", got, wantWithNew)
+	if got := waitForUpstreamRows(t, rc.Standby, 6, 30*time.Second); !equalIDs(got, wantWithNew) {
+		primaryRows, primaryErr := rc.Primary.Query(context.Background(),
+			"SELECT slot_name, state FROM pg_catalog.pg_stat_replication")
+		standbyLog, logErr := os.ReadFile(rc.Standby.LogPath())
+		t.Fatalf("standby did not resume streaming after restart: got %v, want %v; "+
+			"primary pg_stat_replication=%v (err=%v); standby log=%s (err=%v)",
+			got, wantWithNew, primaryRows, primaryErr, standbyLog, logErr)
 	}
 }
 

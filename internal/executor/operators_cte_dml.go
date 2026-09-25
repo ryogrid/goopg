@@ -89,11 +89,10 @@ type cteDMLPrefixOp struct {
 
 	// scope is the instrumenter active on this op's own Build() call,
 	// handed over by maybeInstrument (instrumentScopeCarrier). The DML
-	// plans and the outer body below are only Build() at Open() time —
-	// after the top-level withInstrumentation() call has already
-	// restored the package-global instrumentScope — so Open()
-	// reinstates it around each nested Build() to keep those nodes
-	// under EXPLAIN ANALYZE's instrumentation.
+	// plans and the outer body below are only buildNode()d at Open()
+	// time — long after the top-level EXPLAIN ANALYZE Build() call
+	// returned — so Open() passes it down into each nested build to
+	// keep those nodes under EXPLAIN ANALYZE's instrumentation.
 	scope *instrumenter
 }
 
@@ -103,22 +102,15 @@ func newCTEDMLPrefixOp(p *optimizer.CTEDMLPrefix) *cteDMLPrefixOp {
 
 func (o *cteDMLPrefixOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
-// buildUnderScope runs Build(n) with the package-global instrumentScope
-// temporarily set to o.scope, so maybeInstrument wraps n's operator (and
+// buildUnderScope builds n under o.scope — the instrumenter live at
+// this op's own Build() — so maybeInstrument wraps n's operator (and
 // records its stats in the same nodeStatsTable the EXPLAIN renderer
-// reads) exactly as if it had been Build() during the original dispatch.
-//
-// EX0-03b: takes instrumentScopeMu like every other global handoff. This
-// path runs at Open time, which under a Gather is concurrent across
-// workers — the old unguarded save/restore was safe only while the CTE
-// path was serial.
+// reads) exactly as if it had been built during the original dispatch.
+// The scope travels as an argument — no package-global handoff, no
+// mutex (M-NIGHTLY-instrumentscope-race-fix). A nil scope builds
+// uninstrumented, same as Build().
 func (o *cteDMLPrefixOp) buildUnderScope(n optimizer.Node) (Operator, error) {
-	instrumentScopeMu.Lock()
-	defer instrumentScopeMu.Unlock()
-	prev := instrumentScope
-	instrumentScope = o.scope
-	defer func() { instrumentScope = prev }()
-	return Build(n)
+	return buildNode(n, deformBoundNone, o.scope)
 }
 
 func (o *cteDMLPrefixOp) Schema() optimizer.Schema { return o.plan.Body.Output() }
@@ -356,6 +348,9 @@ func planContainsWorkTableScan(n optimizer.Node) bool {
 	}
 	if s, ok := n.(*optimizer.Sort); ok {
 		return planContainsWorkTableScan(s.Child)
+	}
+	if is, ok := n.(*optimizer.IncrementalSort); ok {
+		return planContainsWorkTableScan(is.Child)
 	}
 	if so, ok := n.(*optimizer.SetOp); ok {
 		return planContainsWorkTableScan(so.Left) || planContainsWorkTableScan(so.Right)

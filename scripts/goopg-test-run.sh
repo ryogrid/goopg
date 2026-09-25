@@ -20,6 +20,16 @@
 # runs, but UNCAPPED, with a loud warning — so the script is safe on CI hosts
 # and non-systemd machines.
 #
+# Aggregate budget (added 2026-09-19, global-OOM incident fix): per-scope
+# caps bound ONE run, but nothing bounded the SUM of concurrent scopes —
+# four ~10 GiB goopg servers global-OOMed this 32 GiB host on 2026-09-18.
+# Every scope therefore also lands under a shared slice (default
+# goopg-workloads.slice) whose MemoryHigh/MemoryMax/MemorySwapMax cap the
+# combined footprint of all capped runs, so an aggregate oversubscription
+# dies inside the slice (kernel picks the highest-badness member, biased
+# toward GOOPG_OOM_SCORE_ADJ>0 workloads) instead of tripping the host-wide
+# OOM killer.
+#
 # Usage:
 #   scripts/goopg-test-run.sh <command> [args...]
 #
@@ -33,6 +43,16 @@
 #   GOOPG_MEM_MAX       hard cap — cgroup-local OOM kill happens here  (default 24G)
 #   GOOPG_MEM_SWAP_MAX  swap allowed to the scope                      (default 0)
 #   GOOPG_CG_UNIT       transient scope unit name                      (default goopg-test)
+#   GOOPG_CG_SLICE      shared slice giving the AGGREGATE budget; every
+#                       capped scope lands under it so the kernel bounds
+#                       their SUM. Set empty to disable the slice.   (default goopg-workloads)
+#   GOOPG_SLICE_MEM_HIGH    aggregate soft cap over the whole slice    (default 22G)
+#   GOOPG_SLICE_MEM_MAX     aggregate hard cap — slice-local OOM kill  (default 26G)
+#   GOOPG_SLICE_SWAP_MAX    aggregate swap cap over the whole slice    (default 8G)
+#   GOOPG_OOM_SCORE_ADJ     OOMScoreAdjust for the scope's processes;
+#                           positive values make the kernel prefer this
+#                           workload as the OOM victim (inside the slice
+#                           and globally). 0/empty = neutral.        (default 400)
 #   GOMEMLIMIT          Go soft heap target; exported if unset         (default 18GiB)
 #
 # Stopping a backgrounded run by name:
@@ -53,6 +73,12 @@ MEM_HIGH="${GOOPG_MEM_HIGH:-20G}"
 MEM_MAX="${GOOPG_MEM_MAX:-24G}"
 MEM_SWAP_MAX="${GOOPG_MEM_SWAP_MAX:-0}"
 CG_UNIT="${GOOPG_CG_UNIT:-goopg-test}"
+# Empty GOOPG_CG_SLICE means "no shared slice" (pre-2026-09-19 behaviour).
+CG_SLICE="${GOOPG_CG_SLICE-goopg-workloads}"
+SLICE_HIGH="${GOOPG_SLICE_MEM_HIGH:-22G}"
+SLICE_MAX="${GOOPG_SLICE_MEM_MAX:-26G}"
+SLICE_SWAP_MAX="${GOOPG_SLICE_SWAP_MAX:-8G}"
+OOM_ADJ="${GOOPG_OOM_SCORE_ADJ:-400}"
 
 # Keep the Go GC's target below the cgroup soft cap so goopg tries to stay in
 # budget on its own before the kernel starts throttling the scope.
@@ -120,7 +146,34 @@ controllers="/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgr
 if command -v systemd-run >/dev/null 2>&1 \
     && [ -r "$controllers" ] \
     && grep -qw memory "$controllers"; then
-    echo "goopg-test-run: scope=${CG_UNIT} MemoryHigh=${MEM_HIGH} MemoryMax=${MEM_MAX} MemorySwapMax=${MEM_SWAP_MAX} GOMEMLIMIT=${GOMEMLIMIT}" >&2
+    slice_args=()
+    if [ -n "$CG_SLICE" ]; then
+        # Aggregate budget: put the scope under the shared slice and (re)apply
+        # the slice's caps — runtime properties, idempotent across concurrent
+        # launches, and they re-arm if a `daemon-reload` dropped them. If the
+        # slice cannot be configured (older systemd) fall back to per-scope
+        # caps only rather than refusing to run.
+        if systemctl --user set-property --runtime "${CG_SLICE}.slice" \
+                MemoryHigh="${SLICE_HIGH}" MemoryMax="${SLICE_MAX}" \
+                MemorySwapMax="${SLICE_SWAP_MAX}" 2>/dev/null; then
+            slice_args+=(--slice="${CG_SLICE}.slice")
+            echo "goopg-test-run: slice=${CG_SLICE} MemoryHigh=${SLICE_HIGH} MemoryMax=${SLICE_MAX} MemorySwapMax=${SLICE_SWAP_MAX} (aggregate budget)" >&2
+        else
+            echo "goopg-test-run: WARNING — could not configure ${CG_SLICE}.slice; per-scope caps only (no aggregate budget)" >&2
+        fi
+    fi
+    # OOM victim preference: scope units reject `-p OOMScoreAdjust=` (systemd
+    # does not spawn scope processes, so it cannot set their exec attributes).
+    # Instead set our own oom_score_adj — it is inherited across fork+exec by
+    # the workload and all its children. Raising the value is unprivileged;
+    # a failed/negative write just warns and continues.
+    case "$OOM_ADJ" in
+    ""|0|+0) : ;;
+    *[!0-9+-]*) echo "goopg-test-run: WARNING — ignoring unparsable GOOPG_OOM_SCORE_ADJ='${OOM_ADJ}'" >&2 ;;
+    *) echo "${OOM_ADJ#+}" > /proc/self/oom_score_adj 2>/dev/null || \
+         echo "goopg-test-run: WARNING — could not set oom_score_adj=${OOM_ADJ}" >&2 ;;
+    esac
+    echo "goopg-test-run: scope=${CG_UNIT} MemoryHigh=${MEM_HIGH} MemoryMax=${MEM_MAX} MemorySwapMax=${MEM_SWAP_MAX} GOMEMLIMIT=${GOMEMLIMIT} oom_score_adj=${OOM_ADJ}" >&2
     # --collect: unload the scope unit even on failure/OOM, so its name is free
     #            for the next run without a manual `reset-failed`.
     # --expand-environment=no: pass argv through verbatim (the caller's shell
@@ -128,6 +181,7 @@ if command -v systemd-run >/dev/null 2>&1 \
     exec systemd-run --user --scope --quiet --collect \
         --expand-environment=no \
         --unit="${CG_UNIT}" \
+        "${slice_args[@]}" \
         -p MemoryHigh="${MEM_HIGH}" \
         -p MemoryMax="${MEM_MAX}" \
         -p MemorySwapMax="${MEM_SWAP_MAX}" \

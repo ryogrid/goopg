@@ -28,14 +28,89 @@
 # docs-only machine), never for the development loop.
 set -euo pipefail
 
-if [ "${GOOPG_SKIP_PRECOMMIT:-0}" = "1" ]; then
-  echo "pre-commit: GOOPG_SKIP_PRECOMMIT=1 — skipping pgbench smoke gate" >&2
-  exit 0
-fi
-
 # Resolve the repo root from the hook location so the gate runs regardless of
 # the subdirectory git invoked the hook from.
 ROOT="$(git rev-parse --show-toplevel)"
+
+if [ "${GOOPG_SKIP_PRECOMMIT:-0}" = "1" ]; then
+  # Every skip leaves an audit line (METHODLOGY3 H5): the escape hatch is for
+  # hosts that cannot run the smoke, and its use must be reviewable.
+  mkdir -p "$ROOT/ci/logs"
+  printf '%s %s RALPH_LOOP=%s user=%s\n' \
+    "$(date -Iseconds)" \
+    "$(git rev-parse --verify -q HEAD || echo no-HEAD)" \
+    "${RALPH_LOOP:-}" \
+    "$(git config user.name || echo unknown)" \
+    >>"$ROOT/ci/logs/precommit-skips.log" || true
+  echo "pre-commit: GOOPG_SKIP_PRECOMMIT=1 — skipping pgbench smoke gate (logged to ci/logs/precommit-skips.log)" >&2
+  exit 0
+fi
+
+# Ralph-loop-only guards (RALPH_LOOP=1 is exported by the loop driver; human
+# commits are unaffected). METHODLOGY3 H3/H4:
+#   - no edits to CLAUDE.md, the fix_plan '## Current Priority' banner, or the
+#     AGENT.md PLAN-PARITY-HARNESS section (region text of HEAD vs index),
+#     nor to the harness mechanism files (guards, .githooks, settings.json,
+#     .ralph/PROMPT.md, .ralph/gate-exceptions.md, ref-cluster / gate-stamp
+#     plumbing) — .ralph/gate-exceptions.md decides when a SKIP-BLOCKED gate
+#     stamp may be committed, so a loop that could edit it could waive its own
+#     gates (audit hole C);
+#   - .ralph/deferral_ledger.md is append-only and owner rows stay owner rows;
+#   - AGENT.md rule D3 for design docs (size / index / Status:), which was
+#     prose-only until now — the loop let a design doc reach 1501 lines with a
+#     `Status:` still claiming "no production change" after production landed
+#     through it. Enforced on what the commit STAGES only, so the existing
+#     over-length docs never block an unrelated commit;
+#   - fix_plan lineage budget / Parent: / FROZEN rules.
+if [ "${RALPH_LOOP:-}" = "1" ]; then
+  cd "$ROOT"
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-staged; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 protected-region guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-ledger; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 deferral-ledger append-only guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph_protected_regions.py" check-designdocs; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 design-doc rule D3 guard)" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/ralph-lineage-guard.py" --staged; then
+    echo "pre-commit: REJECTED (RALPH_LOOP=1 fix_plan lineage guard) — see messages above" >&2
+    exit 1
+  fi
+fi
+
+# Non-blocking staged-set visibility (progress 260922-2 §5.7). A concurrent
+# loop's pre-staged WIP once rode into an unrelated commit because nobody saw
+# what was in the index, and a partial staging can commit content the gates
+# never tested. Warn — never block (a legit concurrent stage must keep
+# working): print the commit's file list, flag files that are staged in the
+# real index but outside this commit's pathspec (git commit -- <paths> uses a
+# temporary index), and flag partially staged files (in the commit AND dirty
+# in the working tree).
+{
+  echo "pre-commit: this commit contains:"
+  git -C "$ROOT" diff --cached --name-only | sed 's/^/pre-commit:   /'
+  real_index="${GIT_DIR:-$ROOT/.git}/index"
+  if [ -n "${GIT_INDEX_FILE:-}" ] && [ "${GIT_INDEX_FILE}" != "${real_index}" ]; then
+    # Pathspec commit: the hook's index is a temp index of HEAD + <paths>.
+    # Compare the REAL index's staged-vs-HEAD set with this commit's file
+    # set — that flags staged modifications AND deletions left outside the
+    # pathspec, not just newly-added paths (a bare path-set comparison
+    # would miss both).
+    GIT_INDEX_FILE="${real_index}" git -C "$ROOT" diff --cached --name-only 2>/dev/null | sort > "${TMPDIR:-/tmp}/.goopg-real-idx.$$" || true
+    git -C "$ROOT" diff --cached --name-only | sort > "${TMPDIR:-/tmp}/.goopg-commit-idx.$$"
+    comm -23 "${TMPDIR:-/tmp}/.goopg-real-idx.$$" "${TMPDIR:-/tmp}/.goopg-commit-idx.$$" | \
+      sed 's/^/pre-commit: WARNING staged but OUTSIDE this commit pathspec: /'
+    rm -f "${TMPDIR:-/tmp}/.goopg-real-idx.$$" "${TMPDIR:-/tmp}/.goopg-commit-idx.$$"
+  fi
+  comm -12 \
+    <(git -C "$ROOT" diff --cached --name-only | sort) \
+    <(git -C "$ROOT" diff --name-only | sort) | \
+    sed 's/^/pre-commit: WARNING partially staged (commit content != working tree): /'
+} >&2 || true
 
 echo "pre-commit: running CI-parity pgbench smoke (RALPH_PRECOMMIT_SCOPE=smoke)..."
 RALPH_PRECOMMIT_SCOPE=smoke "$ROOT/scripts/ralph-precommit-test.sh"

@@ -58,11 +58,22 @@ package optimizer
 //
 // Design: docs/design/planner-c19g-partial-agg/DESIGN.md §8.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"strconv"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
 
 // partialAggSplitProducer is this producer's DPPATH trace string
 // (pathtrace.go). It reads `producer=upper.groupagg.split relids=-`.
 const partialAggSplitPathProducer = "upper.groupagg.split"
+
+// partialAggGatherMergeProducer is the R56 worker-sort-under-GatherMerge
+// no-split arm's DPPATH trace string: `producer=upper.groupagg.gathermerge
+// relids=-`. A distinct producer so the trace tells which of the two sorted
+// no-split shapes (leader sort over Gather vs worker sorts under Gather
+// Merge) `add_path` kept.
+const partialAggGatherMergeProducer = "upper.groupagg.gathermerge"
 
 // addPartialAggSplitPath files the parallel `Finalize -> Gather -> Partial`
 // candidate onto the GROUP_AGG rel, or files nothing.
@@ -70,8 +81,124 @@ const partialAggSplitPathProducer = "upper.groupagg.split"
 // Every refusal below is fail-CLOSED, in `considerparallel.go`'s house style: a
 // missing fact means no candidate, never an optimistic one. The order is the
 // cheapest test first.
+// gatherToUnwrapForPartialAgg returns the child of a Gather that the SEARCH
+// placed directly under the aggregate's input, so a partial aggregate can be
+// built below it (R21 slice 2b, K23).
+//
+// Deliberately narrow, because breadth here would be unsound:
+//
+//   - only a Gather reached through the boundary chain's single-child
+//     wrappers is unwrapped. A Gather buried under a join is another rel's
+//     parallelism and is none of this producer's business;
+//   - `*GatherMerge` is NOT unwrapped. It carries an ordering its consumer
+//     may depend on, and dropping it would silently lose that ordering —
+//     the class of change that returns wrong-ordered rows rather than an
+//     error. A GatherMerge input keeps today's refusal.
+//
+// Returns (child, true) only when the unwrap is safe.
+//
+// NOT ENABLED. Two attempts, both measured, so the next one starts from what
+// is actually true rather than from either of my guesses:
+//
+//  1. Enable the unwrap alone -> TPC-H Q9/Q13 panic (below).
+//  2. Enable it AND clear the stale stamp on a copy of the aggregate spec ->
+//     THE SAME PANIC, unchanged. So the stamp is not carried on the spec the
+//     producer passes down: it is applied POST-HOC to the emitted node by the
+//     caller (the same ordering `createWindowPlan`'s comment describes for
+//     windows — "buildWindowStage stamps it on the emitted node after the
+//     producer returns"). Clearing a spec the assertion never reads changes
+//     nothing.
+//
+// So the real question is why `deriveAggregateInputKeep` returns an EMPTY
+// keep marked KNOWN for the unwrapped shape — `[]` with
+// `InputTargetKnown = true` is what the panic reports, and per plan.go an
+// empty list "is NOT the same as unknown". Either the derivation should
+// return `ok = false` here (unknown, the safe direction), or it is failing to
+// enumerate group inputs through the new child and that is the bug. Start
+// there, in `group_input_target.go`, not in the producer.
+//
+// Original symptom, unchanged across both attempts:
+//
+//	createPlan: Aggregate input target [] drops group-input column "l_year"
+//	of a 26-column input row
+//
+// because the aggregate carries a B-01c INPUT TARGET — a keep-list of the child
+// columns it needs — computed against the child it was given, i.e. the
+// GATHER. Swapping in the Gather's child changes what "the input row" is,
+// and the stamped target no longer describes it, so the totality assertion
+// fires (correctly).
+//
+// A Gather is schema-preserving, so the target is not wrong in CONTENT; it
+// is stale in PROVENANCE. The fix is therefore to re-derive the aggregate's
+// input target against the unwrapped child (`stampAggInputTarget`'s path)
+// after the swap, not to weaken the assertion — which is load-bearing:
+// dropping a group-input column silently changes GROUP BY semantics.
+//
+// Verified this crash is MINE and not the flip's: R19 captured all 22 TPC-H
+// plans under `GOOPG_GATHER_PATHS=all` with no failure.
+func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
+	// IMMEDIATE Gather only. The earlier version walked the boundary chain to
+	// find a Gather at any depth and returned its child — which DISCARDS
+	// everything between, and that is what broke TPC-H Q9/Q13: the aggregate
+	// groups on `l_year`, a COMPUTED column (`EXTRACT(year FROM ...)`)
+	// produced by a Project above the Gather. Dropping to the Gather's child
+	// drops the Project, so no column named `l_year` exists in the new input
+	// row, `deriveAggregateInputKeep` matches nothing by name, and the keep
+	// comes back EMPTY-but-known.
+	//
+	// The derivation was right and my helper was wrong: it was silently
+	// changing what the aggregate's input row contains, not merely removing a
+	// Gather. Only a Gather sitting DIRECTLY under the aggregate can be
+	// unwrapped without changing the input row's columns.
+	if g, ok := n.(*Gather); ok {
+		if g.Child == nil {
+			return nil, false
+		}
+		return g.Child, true
+	}
+	// SPLICE, don't descend. A Gather one or more pass-through wrappers down
+	// is removed from the CHAIN, with every wrapper rebuilt over the Gather's
+	// child — `Project(Gather(X))` becomes `Project(X)`.
+	//
+	// This is what attempt 3 established is required: descending to the
+	// Gather's child discards the wrappers, and on TPC-H Q9 one of them is
+	// the Project computing `l_year`, the very column the aggregate groups
+	// on. A Gather is schema-preserving, so removing only that level leaves
+	// every wrapper's schema and expressions valid over the new child.
+	//
+	// Only kinds whose clone-with-a-new-child is OBVIOUSLY sound are peeled:
+	// a `*Project` (targets and schema unchanged — the child's rows are the
+	// same rows) and a `*Filter` (predicate unchanged, same reason).
+	// Anything else declines, which costs an optimisation and never
+	// correctness.
+	switch w := n.(type) {
+	case *Project:
+		inner, ok := gatherToUnwrapForPartialAgg(w.Child)
+		if !ok {
+			return nil, false
+		}
+		c := *w
+		c.Child = inner
+		return &c, true
+	case *Filter:
+		inner, ok := gatherToUnwrapForPartialAgg(w.Child)
+		if !ok {
+			return nil, false
+		}
+		c := *w
+		c.Child = inner
+		return &c, true
+	}
+	return nil, false
+}
+
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
 	if partialAggPathsMode != partialAggPathsOn {
+		// R54 Step-0: upper-rel refusal record. Gate name "agg-upper" keeps
+		// this producer distinct from the post-pass "agg" consumer — the two
+		// are independent verdicts over the same aggregate, and conflating
+		// them would misattribute a refusal to the wrong round.
+		traceUpperGate("agg-upper", "refused", "gate=mode")
 		return nil
 	}
 	// The statement-level refusals `MaybeAddGather` makes at its own entry.
@@ -79,9 +206,11 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// not a DML/DDL/utility statement and not a nested planning scope); the
 	// per-node refusals are `subtreeHasUnsafeNode`'s.
 	if !ps.ParallelStatementOK || !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+		traceUpperGate("agg-upper", "refused", "gate=statement")
 		return nil
 	}
 	if grouped == nil || seed == nil || aggNode == nil || child == nil {
+		traceUpperGate("agg-upper", "refused", "gate=nil-arg")
 		return nil
 	}
 	// The subtree must be one a worker can execute, must not already carry a
@@ -89,15 +218,71 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// than a post-pass stand-down), and must have a driving scan — without one
 	// every worker reads the whole relation and the Gather returns N+1 copies
 	// of every row (`createplangather.go`'s file header).
-	if subtreeHasUnsafeNode(child) || subtreeHasGather(child) || drivingScan(child) == nil {
+	// R21 slice 2b (K23): UNWRAP a Gather the search already placed, rather
+	// than refusing because of it.
+	//
+	// Under `GOOPG_GATHER_PATHS=all` the search puts a Gather at the join
+	// level, so `child` contains one, so the guard below refused and goopg
+	// lost the `Partial`/`Finalize` split it emits without the flip — the
+	// whole of `aggregation-strategy` 10 -> 14.
+	//
+	// The fix does not need a partial PATH, and that is this file's own
+	// point (blocker 1 above): "goopg does not need a distinct partial PLAN.
+	// `gatherOp.runWorker` builds each worker's own copy of the Gather's
+	// child subtree ... so the partial plan IS the serial subtree". So the
+	// partial input is simply the Gather's CHILD — a node that already
+	// exists, in the coordinate space the aggregate above already consumes.
+	// Nothing is rebuilt from a Path, so there is no coordinate translation
+	// and no boundary-map hole to fall into.
+	//
+	// Having unwrapped, the EXISTING arm below builds
+	// `partial agg -> Gather -> finalise` over it, which is PG's shape
+	// (`create_partial_grouping_paths` + `gather_grouping_paths`,
+	// planner.c:7351/:7704). The guard is then satisfied honestly rather
+	// than bypassed: there is genuinely no Gather left in the input, so the
+	// two-Gather hazard it protects against cannot arise.
+	if g, ok := gatherToUnwrapForPartialAgg(child); ok {
+		child = g
+		// The aggregate's B-01c input target was derived against the child
+		// we just replaced (the Gather), so it is STALE IN PROVENANCE — not
+		// wrong in content, since a Gather is schema-preserving, but it no
+		// longer describes "the input row" the assertion checks against.
+		// Leaving it stamped panics `assertAggregateInputTargetCoversKeys`
+		// on TPC-H Q9/Q13.
+		//
+		// Clearing it is what the field's own contract prescribes: the
+		// target is "NEVER applied: no Project insertion, no schema change,
+		// no cost change — behaviour-neutral by construction ... read by
+		// nothing except assertAggregateInputTargetCoversKeys", and
+		// "InputTargetKnown false means unknown ... a clone that drops the
+		// stamp reads as unknown, THE SAFE DIRECTION" (plan.go).
+		//
+		// So this forfeits an assertion, not an optimisation, and forfeits
+		// it only on the arm whose child changed. A shallow copy keeps every
+		// other field (GroupExprs, Aggs, GroupingSets) shared, and the
+		// caller's own aggNode is left untouched for the other arms.
+		unwrapped := *aggNode
+		unwrapped.InputTarget = nil
+		unwrapped.InputTargetKnown = false
+		aggNode = &unwrapped
+	}
+	// The guard stays, and now MEANS something for both routes: after the
+	// unwrap above there is no Gather left, and on the post-pass route there
+	// never was one. Two Gathers would have every worker read the whole
+	// relation and return N+1 copies of every row.
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	if unsafe || gathered || noScan {
+		traceUpperGate("agg-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return nil
 	}
 	workers := upperSplitWorkers(child, cp, ps)
 	if workers <= 0 {
+		traceUpperGate("agg-upper", "refused", "gate=workers")
 		return nil
 	}
 	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
 	if d <= 1 {
+		traceUpperGate("agg-upper", "refused", "gate=divisor workers="+strconv.Itoa(workers))
 		return nil
 	}
 
@@ -139,7 +324,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child)
+	inNcols, inAvgVar := aggInputWidth(child, aggNode)
 	strategy := aggNode.Strategy
 
 	// ── the SPLIT family, offered only for a DECOMPOSABLE aggregate ─────────
@@ -197,18 +382,102 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	if len(aggNode.GroupExprs) == 0 && aggNode.GroupingSets == nil {
 		// PLAIN: one candidate, priced by the hashed arm at 0 group columns
 		// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		plainSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
 				0, 1, nAggs, inNcols, inAvgVar),
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
+		// R54 Step-0: upper-rel admission record. A nil split is still an
+		// admission — the gathered no-split arms were filed and cost
+		// adjudication downstream decides; only the gates above refuse.
+		traceUpperGate("agg-upper", upperSplitVerdict(split), upperSplitDetail(workers, d))
 		return split
 	}
-	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
+	// Candidate order mirrors add_paths_to_grouping_rel's
+	// can_sort-before-can_hash (planner.c): the whole SORTED family is
+	// filed before the HASHED arm. With COSTS_EQUAL restored
+	// (comparePathCostsFuzzily, M0141-S2b-13) insertion order decides
+	// fuzzy ties, so the order is load-bearing, not cosmetic — same
+	// change S2b-11 made in groupingpaths.go for the serial arm.
+	if aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
+		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		sortSpec := *aggNode
 		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: aggNode,
+			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+			Rel: grouped, Rows: finalGroups,
+			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+		}, partialAggNoSplitProducer)
+
+		// R56: the WORKER-SORT no-split arm — `GroupAgg -> GatherMerge ->
+		// Sort -> pseed`, PG's winning Q7 shape
+		// (`GroupAggregate -> Gather Merge -> Sort -> partial join`). The
+		// sort is priced on PER-WORKER rows through `costSortRun` (via
+		// `sortPathForBounded` over the per-worker seed — that is the whole
+		// saving: N sorts of R/N rows against one of R log R), the boundary
+		// through `gatherMergeCost`, the upper through the SORTED arm of
+		// `costAgg` — all existing functions, no new constant (C-19e §3's
+		// argument, unchanged: this round is the upper-aggregate analogue
+		// of C-19e at the site it did not touch). It competes in
+		// `add_path`; `setCheapest` adjudicates.
+		//
+		// The GatherMerge is built MANUALLY rather than through
+		// `makeGatherMergePath`: that constructor only wraps an
+		// already-sorted subpath (`partialPathDrivingKind` refuses Sort),
+		// while this arm builds the sort itself — C-19e's
+		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
+		// worker-side construction this mirrors field for field.
+		workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+		// `sortPathForBounded` prices ParallelSafe but never plans workers;
+		// without this the GatherMerge build below refuses the subpath
+		// (`gatherChildPlan` panics on 0 workers).
+		workerSort.ParallelWorkers = workers
+		// Rows crossing the merge boundary: every input row — a Sort
+		// emits what it reads — i.e. the per-worker count the sort was
+		// priced with (`perWorkerRows`) times the divisor `d`. Spelled
+		// manually rather than via `computeGatherRows`: that helper
+		// re-derives the divisor from the subpath and applies
+		// `clampRowEst`, while here the count must stay exactly the
+		// pricing basis above (float division round-trips:
+		// `perWorkerRows * d` recovers `inputRows` — no integer
+		// truncation, `d` is float64).
+		gmCrossedRows := perWorkerRows * d
+		gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
+		workerGM := &Path{
+			Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
+			// Upstream takes the subpath's own key list ("gather merge
+			// input not sufficiently sorted"); `makeGatherMergePath`
+			// copies it for the same reason.
+			Pathkeys: append([]PathKey(nil), workerSort.Pathkeys...),
+			// Field-for-field with `makeGatherMergePath`: the boundary is
+			// neither partial itself nor usable inside another one.
+			ParallelSafe: false, ParallelWorkers: 0,
+			// `input_disabled_nodes + (enable_gathermerge ? 0 : 1)`
+			// (costsize.c:535).
+			DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+			Children:      []*Path{workerSort},
+		}
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		gmSpec := *aggNode
+		addPath(grouped, &Path{
+			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
+			Rel: grouped, Rows: finalGroups,
+			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, gmCost.Startup, gmCost.Total,
+				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+		}, partialAggGatherMergeProducer)
+	}
+	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
+		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+		hashSpec := *aggNode
+		addPath(grouped, &Path{
+			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: finalGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
@@ -216,17 +485,44 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
 	}
-	if aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
-		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: aggNode,
-			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-		}, partialAggNoSplitProducer)
-	}
+	// R54 Step-0: same admission record as the PLAIN arm above — both exits
+	// filed candidates, so both are admissions of the upper-rel round.
+	traceUpperGate("agg-upper", upperSplitVerdict(split), upperSplitDetail(workers, d))
 	return split
+}
+
+// upperSplitVerdict names the admitted shape: "split" files the
+// Finalize->Gather->Partial candidate, "nosplit" files only the gathered
+// no-split arms (an unsplittable aggregate still admits the round — cost
+// adjudication downstream decides, not this producer).
+func upperSplitVerdict(split *Path) string {
+	if split != nil {
+		return "split"
+	}
+	return "nosplit"
+}
+
+// upperSplitDetail carries the sizing the admission was priced at. Shared by
+// both admission exits so the record cannot drift between them.
+func upperSplitDetail(workers int, d float64) string {
+	return "workers=" + strconv.Itoa(workers) + " divisor=" + strconv.FormatFloat(d, 'g', -1, 64)
+}
+
+// subtreeRefusalKind names which `gate=subtree` disjunct fired (R54 Step-1
+// H6): an UNSAFE node in the partial subtree, an already-GATHERED subtree
+// (two Gathers would duplicate rows), or NO-DRIVING-SCAN (no per-worker
+// entry the attach walks model). Pure over the three booleans so the unit
+// test pins the vocabulary without building a plan; the call site passes
+// the same values the guard tested, so the name cannot drift from the
+// refusal. First disjunct wins, matching the guard's || order.
+func subtreeRefusalKind(unsafe, gathered, noScan bool) string {
+	if unsafe {
+		return "unsafe"
+	}
+	if gathered {
+		return "gathered"
+	}
+	return "no-driving-scan"
 }
 
 // addPartialAggSplitArm files `Finalize -> Gather -> Partial` on the GROUP_AGG
@@ -241,8 +537,10 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	// planner.c:7606.
 	partialCost := costAgg(cp, strategy, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
 		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	partialSpec := *aggNode
 	partialPath := &Path{
-		Kind: PathAgg, AggStrategy: strategy, Agg: aggNode,
+		Kind: PathAgg, AggStrategy: strategy, Agg: &partialSpec,
 		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
 		ParallelSafe: true, ParallelWorkers: workers,
 		Children: []*Path{pseed},
@@ -267,8 +565,10 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	// FINALIZE arm — `create_agg_path(… AGGSPLIT_FINAL_DESERIAL …)`,
 	// planner.c:7250: the combine charged per INPUT row of the finalize node
 	// and the final function per output group.
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	finalSpec := *aggNode
 	split := &Path{
-		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: aggNode,
+		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, strategy, crossedRows, gatherAbove.Startup, gatherAbove.Total,
 			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
@@ -318,7 +618,29 @@ func parallelSeedCost(serial Cost, d float64) Cost {
 // (`create_index_paths` passes `index->pages`). Measured on TPC-H q13/q16
 // (M0134-0189) and repeated here so the two sizings cannot disagree.
 func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
-	scan := drivingScan(child)
+	// M0145-0004: size over EVERY driving scan — a `*SetOp` driving node
+	// stands for all of its streamed member branches (drivingScans), and
+	// the split's worker count is the max across them, the same rule
+	// PG's create_append_path applies to child subpaths. An unsafe or
+	// unsizable branch contributes zero and does not raise the max; the
+	// pre-pass subtree gate (`gate=subtree`) has already refused unsafe
+	// members outright.
+	best := 0
+	for _, scan := range drivingScans(child) {
+		if w := upperSplitWorkersForScan(scan, cp); w > best {
+			best = w
+		}
+	}
+	if best > ps.MaxParallelWorkersPerGather {
+		best = ps.MaxParallelWorkersPerGather
+	}
+	return best
+}
+
+// upperSplitWorkersForScan is the single-scan body of upperSplitWorkers,
+// split out so a SetOp driving node can size each member branch
+// independently.
+func upperSplitWorkersForScan(scan Node, cp costParams) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
@@ -348,9 +670,5 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 			pages = ipages
 		}
 	}
-	workers := computeParallelWorkerForRel(cp, pages, tableParallelWorkersReloption(tbl))
-	if workers > ps.MaxParallelWorkersPerGather {
-		workers = ps.MaxParallelWorkersPerGather
-	}
-	return workers
+	return computeParallelWorkerForRel(cp, pages, tableParallelWorkersReloption(tbl))
 }

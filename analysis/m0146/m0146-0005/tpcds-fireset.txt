@@ -1,0 +1,12 @@
+FIRE-SET: baseline=ba11983eb7953c999a7aa80aebc036b87d23055b (f870d276615c) candidate=worktree (63f9176ed1d6)
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=55 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+PLAN-PARITY: queries=99 match=4 shapediff=67 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=91 join-method=66 scan-type=59 parameterisation=54 aggregation-strategy=41 sort-strategy=62 parallelism=74 qual-placement=27 rendering=25
+FIRE-SET-TIMEOUTS: fires=Q1 Q10 Q12 Q14 Q15 Q16 Q17 Q18 Q19 Q20 Q21 Q23 Q25 Q26 Q29 Q32 Q33 Q34 Q35 Q38 Q39 Q40 Q42 Q45 Q46 Q50 Q51 Q52 Q55 Q57 Q60 Q61 Q62 Q66 Q68 Q69 Q71 Q72 Q73 Q74 Q75 Q76 Q77 Q80 Q83 Q87 Q89 Q92 Q94 Q95 Q97 Q99 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=49 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+PLAN-PARITY: queries=99 match=6 shapediff=68 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=85 join-method=65 scan-type=59 parameterisation=48 aggregation-strategy=44 sort-strategy=68 parallelism=76 qual-placement=25 rendering=22
+FIRE-SET-TIMEOUTS: fires=Q1 Q14 Q16 Q17 Q19 Q21 Q23 Q25 Q29 Q30 Q34 Q37 Q39 Q40 Q42 Q46 Q50 Q52 Q55 Q61 Q66 Q68 Q72 Q73 Q75 Q76 Q77 Q78 Q80 Q81 Q82 Q83 Q89 Q90 Q91 Q94 Q95 introduced=none unchanged=none missing=none
+gate-stamp: tpcds-fireset PASS -> /home/ryo/work/goopg/goopg/tmp/gate-stamps/tpcds-fireset.json

@@ -247,6 +247,32 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 		var data []byte
 		switch d.Kind {
 		case KindString:
+			// M0143-0007b slice 2: a width-carrying bpchar is stored
+			// BLANK-PADDED, and upstream pads at INPUT (`bpchar_input`,
+			// postgres/src/backend/utils/adt/varchar.c) — so by the time
+			// PostgreSQL decides whether to toast, the padding is already part
+			// of the value and a wide `char(N)` is compressed like any other
+			// oversized datum.
+			//
+			// goopg pads in `coerceTextLikeDatum`, which runs inside
+			// `encodeValuePGCtx` — i.e. AFTER this decision. Measured against
+			// PG 18.3 on 200 rows of `char(3000)` holding 'x': PG's heap is
+			// 16 KB (`pg_column_size` 45, the padding compresses away) while
+			// goopg's was 819 KB, because the short datum skipped this check
+			// and the encoder then wrote 3000 raw bytes inline. Padding here
+			// restores upstream's ORDER: pad, then decide.
+			//
+			// The padded value is written back into the row so the later
+			// encode finds it already full width (`PadBpchar` is idempotent)
+			// and so a toast pointer, when one is taken, covers the same bytes
+			// upstream would have externalised.
+			if padded := catalog.PadBpchar(col.Type, d.StringValue()); padded != d.StringValue() {
+				d = NewStringDatum(padded)
+				if newRow == nil {
+					newRow = append(Row(nil), row...)
+				}
+				newRow[i] = d
+			}
 			data = []byte(d.StringValue())
 		case KindBytes:
 			data = d.BytesValue()

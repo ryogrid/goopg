@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+#
+# commit-msg — Ralph-loop commit-message gates (METHODLOGY3 audit H5 / H11).
+#
+# Active ONLY when RALPH_LOOP=1 (exported by the loop driver). Human commits are
+# unaffected. Installed with the other hooks by `make install-hooks`.
+#
+# (i)  Gate stamps — keyed on the STAGED FILES, never on the task id (audit
+#      hole A: three loop commits named only "M-NIGHTLY" and so matched no
+#      task-id regex, which left them checked by nothing). Any commit that
+#      stages a non-test .go file under internal/ or cmd/ (excluding
+#      internal/testport/ and testdata) must carry, for the code being
+#      committed (`code_tree` = sha256 of `git ls-files -s -- internal cmd
+#      go.mod go.sum` over the index):
+#        tmp/gate-stamps/tpch-spotcheck.json  result PASS
+#        tmp/gate-stamps/tpcds-sf025.json     result PASS (PASS implies TIMEOUT=0)
+#        tmp/gate-stamps/tpch-acceptance-arm.json result PASS — additionally
+#          required when a staged internal/ .go path matches cost|stat|selfuncs
+#          or lies under internal/executor/, internal/optimizer/ or
+#          internal/planner/ (a costing site such as
+#          internal/optimizer/incrementalsortpaths.go needs the arm)
+#        tmp/gate-stamps/tpcds-fireset.json   result PASS — additionally
+#          required when the staged set is in the fire-set scope
+#          (M0145-0021a, AGENT.md G9: non-test .go under internal/optimizer/
+#          or internal/planner/, or *cost*|*stat*|*selfuncs* under
+#          internal/ or cmd/; internal/executor/ is out — scripts/fireset-scope.sh
+#          is the same predicate for pre-commit checks)
+#      and a body line starting `CATEGORIES-EXCL-MATCH:` or `PARITY: N/A — `.
+#
+#      A SKIP-BLOCKED stamp is NOT a pass. It is accepted only against an
+#      owner-maintained row in .ralph/gate-exceptions.md naming the commit's
+#      task id and that gate, with an unexpired `expires` date, a `ledger:`
+#      body line, and fewer prior usages than `max-commits` (counted in
+#      ci/logs/gate-exception-usage.log, appended to here on success). With no
+#      rows in that table every SKIP-BLOCKED is a hard failure. The loop may
+#      not add rows (the file is whole-file protected by the harness guards):
+#      the previous data.HOLD-conditional widening let a single-task grant
+#      (P0-E5) cover 18 commits.
+#
+# (ii) Area label (H11). A commit that stages no non-test file under internal/
+#      or cmd/ uses area docs|analysis|ralph|scripts|ci|bench|test; a commit
+#      that DOES stage one may not use area docs|analysis|ralph.
+#
+# (iii) Recon tasks (audit hole B). Recon detection is no longer a subject
+#      string match: every task id named in the subject or body is looked up in
+#      .ralph/fix_plan.md and its `Kind:` line read. A commit referencing a
+#      `Kind: recon` task may not stage non-test internal/ or cmd/ files —
+#      "env-gated trace blocks only" is still a production change, i.e. an
+#      impl task. Tasks with no Kind line fall back to the old title/subject
+#      `recon` marker.
+#
+# Code identity: git sets GIT_INDEX_FILE for hooks, so inside commit-msg
+# `git ls-files -s` / `git diff --cached` see exactly the index being committed
+# (including the temporary index of `git commit -a` / `git commit -- <paths>`).
+# A partial-pathspec commit that leaves out a staged internal/ or cmd/ change
+# therefore has a different code_tree from the full index the gate ran on: run
+# the gates with the same code staged that you commit.
+set -euo pipefail
+
+[ "${RALPH_LOOP:-}" = "1" ] || exit 0
+
+MSG_FILE="$1"
+ROOT="$(git rev-parse --show-toplevel)"
+STAMPS="$ROOT/tmp/gate-stamps"
+PLAN_FILE="$ROOT/.ralph/fix_plan.md"
+EXC_FILE="$ROOT/.ralph/gate-exceptions.md"
+USAGE_LOG="$ROOT/ci/logs/gate-exception-usage.log"
+
+# Message without git comment lines / scissors section.
+msg="$(sed -e '/^# ------------------------ >8 ------------------------$/,$d' -e '/^#/d' "$MSG_FILE")"
+subject="$(printf '%s\n' "$msg" | sed -n '/[^[:space:]]/{p;q;}')"
+body="$(printf '%s\n' "$msg" | awk 'f{print} /[^[:space:]]/ && !f{f=1}')"
+
+mapfile -t files < <(git diff --cached --name-only --diff-filter=ACMRD)
+
+is_test_path() { case "$1" in *_test.go|*/testdata/*) return 0 ;; esac; return 1; }
+
+prod_internal=0     # non-test file under internal/ or cmd/
+gated_go=0          # non-test .go under internal/ or cmd/ (not internal/testport/)
+arm_needed=0        # costing / stats / executor / optimizer / planner
+for f in "${files[@]}"; do
+  case "$f" in
+    internal/*|cmd/*) is_test_path "$f" || prod_internal=1 ;;
+  esac
+  case "$f" in
+    internal/testport/*) ;;
+    internal/*.go|cmd/*.go)
+      if ! is_test_path "$f"; then
+        gated_go=1
+        case "$f" in
+          internal/executor/*|internal/optimizer/*|internal/planner/*) arm_needed=1 ;;
+        esac
+        case "$f" in *cost*|*stat*|*selfuncs*) arm_needed=1 ;; esac
+      fi ;;
+  esac
+done
+
+errors=()
+
+# Fire-set scope (M0145-0021a / AGENT.md G9): single predicate lives in
+# scripts/fireset-scope.sh so the loop can pre-check the same rule.
+# rc 0 = in scope, rc 1 = out of scope, anything else = the predicate itself
+# failed — fail CLOSED like every other gate (a missing/non-exec script must
+# not silently disable G9).
+fireset_needed=0
+fireset_rc=0
+if [ "$gated_go" -eq 1 ]; then
+  # The `|| fireset_rc=$?` form is load-bearing: under `set -e` a bare
+  # `pipeline; rc=$?` aborts on rc 1 ("out of scope", the common case)
+  # before $? is ever read — that bug made the hook exit 1 with no
+  # message for ANY commit staging a non-test .go outside the scope
+  # (loops #17-#148, owner-action note
+  # maintenance_prompts/commit-msg-fireset-arm-owner-action.md).
+  printf '%s\n' "${files[@]}" | "$ROOT/scripts/fireset-scope.sh" --stdin >/dev/null 2>&1 || fireset_rc=$?
+  case "$fireset_rc" in
+    0) fireset_needed=1 ;;
+    1) ;;
+    *) errors+=("scripts/fireset-scope.sh failed with rc=$fireset_rc — cannot determine the fire-set scope; fix the script or restore its exec bit") ;;
+  esac
+fi
+
+# ------------------------------------------------------------------ helpers
+# One embedded python helper with two subcommands, so the hook stays a single
+# file: `kinds` (fix_plan task -> Kind) and `exc` (gate-exception lookup).
+PYHELPER="$(cat <<'PYEOF'
+import os, re, sys
+
+TASK_RE = re.compile(r"^(\s*)- \[([ xX!])\] \*\*([^\s*]+)")
+KIND_RE = re.compile(r"(?:^|\s)Kind:\s*`?([A-Za-z-]+)", re.I)
+
+
+def entries(text):
+    """task-id -> (title_line, body_lines). A task entry runs from its checkbox
+    line to the next task line at the same or a lower indent."""
+    lines = text.splitlines()
+    starts = []
+    for i, ln in enumerate(lines):
+        m = TASK_RE.match(ln)
+        if m:
+            starts.append((i, len(m.group(1).expandtabs(4)),
+                           m.group(3).rstrip(".,:;—")))
+    out = {}
+    for k, (i, ind, tid) in enumerate(starts):
+        end = len(lines)
+        for (i2, ind2, _t) in starts[k + 1:]:
+            if ind2 <= ind:
+                end = i2
+                break
+        if tid not in out:
+            out[tid] = (lines[i], lines[i:end])
+    return out
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def cmd_kinds(argv):
+    ents = entries(read(argv[0]))
+    for tid in argv[1:]:
+        e = ents.get(tid)
+        if e is None:
+            print("%s\tabsent" % tid)
+            continue
+        title, bodyl = e
+        kind = None
+        for n, ln in enumerate(bodyl):
+            if n and TASK_RE.match(ln):
+                break          # a nested subtask's Kind is not the parent's
+            m = KIND_RE.search(ln)
+            if m:
+                kind = m.group(1).lower()
+                break
+        if kind is None:
+            marker = re.search(r"\brecon\b", title, re.I) is not None
+            print("%s\t%s" % (tid, "recon" if marker else "unknown"))
+        else:
+            print("%s\t%s" % (tid, "recon" if kind.startswith("recon") else kind))
+    return 0
+
+
+ROW_GATES = ("tpch-spotcheck", "tpch-acceptance-arm", "tpcds-sf025",
+             "tpcds-fireset")
+
+
+def exc_rows(path):
+    """Rows of the owner-maintained exception table:
+    | task-id | gate | max-commits | expires | reason |"""
+    out = []
+    for ln in read(path).splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip().strip("`") for c in s.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        tid, gate, maxc, exp = cells[0], cells[1], cells[2], cells[3]
+        if gate not in ROW_GATES:
+            continue          # header row, separator, or a typo'd gate name
+        if not re.match(r"^\d+$", maxc) or not re.match(r"^\d{4}-\d{2}-\d{2}$", exp):
+            continue
+        out.append((tid, gate, int(maxc), exp, cells[4]))
+    return out
+
+
+def usage_count(path, tid, gate):
+    n = 0
+    needle_t, needle_g = "task=" + tid + " ", "gate=" + gate + " "
+    for ln in read(path).splitlines():
+        if needle_t in ln + " " and needle_g in ln + " ":
+            n += 1
+    return n
+
+
+def cmd_exc(argv):
+    exc_path, usage_path, gate, today = argv[0], argv[1], argv[2], argv[3]
+    ids = argv[4:]
+    rows = [r for r in exc_rows(exc_path) if r[1] == gate]
+    if not rows:
+        print("NO no row in .ralph/gate-exceptions.md grants a SKIP-BLOCKED for "
+              "gate %s (the table is owner-maintained and currently has no active "
+              "row for it) — a blocked gate is a failed gate" % gate)
+        return 0
+    cands = [r for r in rows if r[0] in ids]
+    if not cands:
+        print("NO .ralph/gate-exceptions.md grants gate %s only to task(s) %s; this "
+              "commit names %s" % (gate, ", ".join(sorted({r[0] for r in rows})),
+                                   ", ".join(ids) if ids else "no task id"))
+        return 0
+    problems = []
+    for tid, g, maxc, exp, _reason in cands:
+        if exp < today:
+            problems.append("the exception row for %s/%s expired on %s (today %s)"
+                            % (tid, g, exp, today))
+            continue
+        used = usage_count(usage_path, tid, g)
+        if used >= maxc:
+            problems.append("the exception row for %s/%s allows %d commit(s) and "
+                            "ci/logs/gate-exception-usage.log already records %d"
+                            % (tid, g, maxc, used))
+            continue
+        print("OK %s %d %d" % (tid, maxc, used))
+        return 0
+    print("NO " + "; ".join(problems))
+    return 0
+
+
+def main(argv):
+    if not argv:
+        return 2
+    if argv[0] == "kinds":
+        return cmd_kinds(argv[1:])
+    if argv[0] == "exc":
+        return cmd_exc(argv[1:])
+    return 2
+
+
+sys.exit(main(sys.argv[1:]))
+PYEOF
+)"
+pyh() { printf '%s' "$PYHELPER" | python3 - "$@"; }
+
+# Task ids named anywhere in the message (subject or body).
+mapfile -t task_ids < <(grep -oE '(M[0-9]{4}-[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*|M-[A-Z0-9]+(-[A-Z0-9]+)*|P0-[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*)' <<<"$msg" | sort -u)
+
+# ---------------------------------------------------------------- (ii) label
+area="${subject%%(*}"
+[ "$area" != "$subject" ] || area="${subject%%:*}"
+area="$(printf '%s' "$area" | tr -d '[:space:]')"
+# area(scope) prefix (up to the first ':') and the summary after it.
+prefix="${subject%%:*}"
+summary="${subject#*:}"
+if [ "$prefix" = "$subject" ]; then prefix=""; summary="$subject"; fi
+summary="${summary#"${summary%%[![:space:]]*}"}"
+if [ "$prod_internal" -eq 0 ] && [ "${#files[@]}" -gt 0 ]; then
+  case "$area" in
+    docs|analysis|ralph|scripts|ci|bench|test) ;;
+    *) errors+=("area label '$area' claims a code change, but no non-test file under internal/ or cmd/ is staged. Use docs(...), analysis(...), ralph(...), scripts(...), ci(...), bench(...) or test(...).") ;;
+  esac
+fi
+if [ "$prod_internal" -eq 1 ]; then
+  case "$area" in
+    docs|analysis|ralph)
+      errors+=("area label '$area' claims a docs/analysis/ralph change, but non-test files under internal/ or cmd/ are staged. Use the code area label, or unstage the production files into their own commit.") ;;
+  esac
+fi
+
+# --------------------------------------------------------------- (iii) recon
+RECON_REMEDY="A recon task may not stage non-test files under internal/ or cmd/ (comments and env-gated traces included): a trace-only production change is an IMPLEMENTATION change. File an impl task (Kind: impl) for the trace/instrumentation code and commit it under that id, or keep this commit to analysis/docs files."
+if [ "$prod_internal" -eq 1 ]; then
+  # Explicit Kind: recon on any referenced task (audit hole B).
+  if [ "${#task_ids[@]}" -gt 0 ] && [ -f "$PLAN_FILE" ]; then
+    while IFS=$'\t' read -r tid kind; do
+      [ -n "${tid:-}" ] || continue
+      case "$kind" in
+        recon)
+          errors+=("task $tid is a recon task in .ralph/fix_plan.md (Kind: recon, or a 'recon' title with no Kind line), but this commit stages non-test internal/ or cmd/ files. $RECON_REMEDY") ;;
+      esac
+    done < <(pyh kinds "$PLAN_FILE" "${task_ids[@]}")
+  fi
+  # Subject/scope fallback, unchanged: area/scope contains `recon`, or the
+  # summary after `):`/`:` starts with `recon`.
+  if grep -qi 'recon' <<<"$prefix" || grep -qi '^recon' <<<"$summary"; then
+    errors+=("the subject labels this a recon commit, but non-test files under internal/ or cmd/ are staged. $RECON_REMEDY")
+  fi
+fi
+
+# ---------------------------------------------------------------- (i) stamps
+# Must match scripts/lib/gate-stamp.sh's code_tree computation exactly.
+tree="$(cd "$ROOT" && git ls-files -s -- internal cmd go.mod go.sum | sha256sum | cut -d' ' -f1)"
+has_ledger=0
+grep -q '^ledger:' <<<"$body" && has_ledger=1
+# Plan-parity task ids (M0137..M0145 / P0-) no longer decide WHETHER the gates
+# are required (that is keyed on the staged files above); the regex is kept for
+# plan-parity-specific extras only. There are none at present.
+plan_parity_task=0
+grep -Eq '(M01(3[7-9]|4[0-5])|P0-)' <<<"$msg" && plan_parity_task=1
+
+pending_usage=()    # "<gate> <task-id>" appended to the usage log on success
+
+if [ "$gated_go" -eq 1 ]; then
+  stamp_field() { # <file> <key>
+    python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except Exception: print("")' "$1" "$2"
+  }
+  check_exception() { # <gate> — errors+= on refusal, pending_usage+= on grant
+    local gate="$1" out verdict tid
+    out="$(pyh exc "$EXC_FILE" "$USAGE_LOG" "$gate" "$(date +%F)" ${task_ids[@]+"${task_ids[@]}"} || true)"
+    verdict="${out%% *}"
+    if [ "$verdict" = "OK" ]; then
+      tid="$(awk '{print $2}' <<<"$out")"
+      pending_usage+=("$gate $tid")
+      return 0
+    fi
+    errors+=("gate $gate result is SKIP-BLOCKED and no owner exception covers it: ${out#NO }. Only the owner adds rows to .ralph/gate-exceptions.md; the loop may not. Fix the blocker or mark the task [!] with an escalation block.")
+    return 1
+  }
+  check_stamp() { # <gate>
+    local gate="$1" f s_tree s_res
+    f="$STAMPS/$gate.json"
+    if [ ! -f "$f" ]; then
+      errors+=("missing gate stamp tmp/gate-stamps/$gate.json. Run the $gate gate on exactly the staged content, then commit.")
+      return
+    fi
+    s_tree="$(stamp_field "$f" code_tree)"
+    s_res="$(stamp_field "$f" result)"
+    if [ "$s_tree" != "$tree" ]; then
+      errors+=("gate stamp $gate.json is for code_tree ${s_tree:-<none>}, but the committed internal/ cmd/ go.mod go.sum index hashes to $tree. Re-run $gate with the staged content (stage first, then run the gate, then commit the same index).")
+      return
+    fi
+    case "$s_res" in
+      PASS) ;;
+      SKIP-BLOCKED)
+        if [ "$has_ledger" -ne 1 ]; then
+          errors+=("gate $gate result is SKIP-BLOCKED and the body carries no 'ledger:' line naming the ledger row for the blocker.")
+        fi
+        check_exception "$gate" || true ;;
+      *) errors+=("gate $gate result is '${s_res:-<none>}' for this tree (PASS required). Fix the failure; do not commit around it.") ;;
+    esac
+  }
+  check_stamp tpch-spotcheck
+  check_stamp tpcds-sf025
+  if [ "$arm_needed" -eq 1 ]; then
+    check_stamp tpch-acceptance-arm
+  fi
+  if [ "$fireset_needed" -eq 1 ]; then
+    check_stamp tpcds-fireset
+  fi
+  if ! grep -Eq '^(CATEGORIES-EXCL-MATCH:|PARITY: N/A — )' <<<"$body"; then
+    errors+=("body needs a line starting 'CATEGORIES-EXCL-MATCH:' (before -> after parity categories) or 'PARITY: N/A — <reason>'.")
+  fi
+fi
+
+if [ "${#errors[@]}" -gt 0 ]; then
+  echo "commit-msg: REJECTED (RALPH_LOOP=1)" >&2
+  for e in "${errors[@]}"; do
+    echo "  - $e" >&2
+  done
+  exit 1
+fi
+
+# Every granted gate exception is recorded so the next commit sees the usage
+# count. commit-msg runs BEFORE the commit object exists, so the line names the
+# staged code_tree and the subject rather than a commit sha. Never fail here.
+if [ "${#pending_usage[@]}" -gt 0 ]; then
+  mkdir -p "$(dirname "$USAGE_LOG")" 2>/dev/null || true
+  for pu in "${pending_usage[@]}"; do
+    printf '%s task=%s gate=%s tree=%s subject=%s\n' \
+      "$(date -Iseconds)" "${pu#* }" "${pu%% *}" "$tree" "$subject" \
+      >>"$USAGE_LOG" 2>/dev/null || true
+  done
+fi
+exit 0

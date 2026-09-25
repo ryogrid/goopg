@@ -81,29 +81,12 @@ func TestGuardINUnderORStaysSubPlan(t *testing.T) {
 	}
 }
 
-// TestGuardNotWrappedINBecomesAntiJoin covers the other half of guard 1:
-// `NOT (x IN (...))` reaches the planner as UnaryOp(NOT, InExpr) rather
-// than InExpr{Negated}, so it is not itself a top-level conjunct. The guard
-// accepts that single NOT wrapper and flips the join to its dual, which is
-// exactly what `x NOT IN (...)` means — it must NOT simply bail, and it
-// must NOT produce a semi join.
-func TestGuardNotWrappedINBecomesAntiJoin(t *testing.T) {
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE NOT (x IN (SELECT z FROM t2))"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j := findFirstJoinByType(node, JoinTypeSemi); j != nil {
-		t.Fatalf("NOT-wrapped IN became a SEMI join (the complement of NOT IN):\n%s", planString(node))
-	}
-	j := findFirstJoinByType(node, JoinTypeAnti)
-	if j == nil {
-		t.Fatalf("NOT-wrapped IN did not become an ANTI join:\n%s", planString(node))
-	}
-	if !j.NullAware {
-		t.Errorf("anti join from NOT-wrapped IN must be NullAware for NOT IN's three-valued semantics")
-	}
+// `NOT (x IN (...))` reaches the planner as UnaryOp(NOT, InExpr), which PG
+// treats as NOT over an ANY_SUBLINK: pull_up_sublinks converts only
+// `NOT EXISTS` under a NOT, so it stays a SubPlan (M0146-0002c). It must
+// above all not become a SEMI join, the complement of what it means.
+func TestGuardNotWrappedINStaysSubPlan(t *testing.T) {
+	assertNotInStaysSubPlan(t, "SELECT x FROM t1 WHERE NOT (x IN (SELECT z FROM t2))")
 }
 
 // TestGuardTopLevelINStillUnnests guards against the top-conjunct check

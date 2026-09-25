@@ -13,13 +13,20 @@ Provenance:
   (estimate-audit `--ref-port 65432`, db `tpch`, SF=1), one file per
   `=== QN` section.
 - TPC-DS: captured per query against the reference cluster
-  (`127.0.0.1:65438`, user `ryo`, db `tpcds05` = SF0.5, matching the
+  (`127.0.0.1:65438`, user `ryo`, db `tpcds025` = SF0.25, matching the
   goopg bench corpus) with the same EXPLAIN-prefix trick as the goopg
-  sweep's plan channel (`sf05_capture_plans`).
+  sweep's plan channel (`sf025_capture_plans`).
 - Q36/Q70/Q86 are `SKIP (oracle: SKIP_QUERYGEN)` — dsqgen artefacts that
   fail on PG too, mirroring the sweep.
 
 Re-capture ONLY when the queries or the dataset change (new PG version,
-new scale factor, regenerated `query*.sql`): re-run the two captures
-above and diff the result against these fixtures before committing —
-an unexpected move means the reference moved, not goopg.
+new scale factor, regenerated `query*.sql`) or when the measurement
+convention moves: re-run the two captures above and diff the result against
+these fixtures before committing — an unexpected move means the reference
+moved, not goopg.
+
+**Recaptured 2026-09-24** under the new measurement convention (owner
+decision): the PG clusters now carry `work_mem = 512MB` in
+`postgresql.conf` and the capture issues no session `SET` — earlier
+fixtures were taken under the 64MB session pin (TPC-DS additionally while
+the cluster ran its 4MB default underneath).

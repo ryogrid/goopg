@@ -211,3 +211,24 @@ func TestPlanCacheInvalidatingStmt(t *testing.T) {
 		t.Error("a nil node must not invalidate")
 	}
 }
+
+// TestSessionPlannerSettingsReadsScanToggles: `SET enable_seqscan/indexscan/
+// bitmapscan/sort = off` must reach the settings the cost-based search counts
+// Path.DisabledNodes from (B-17a/B-17d). They reached only the rule-based scan
+// choice before — the search priced every path as enabled (M0145-0029).
+func TestSessionPlannerSettingsReadsScanToggles(t *testing.T) {
+	sess := misc.NewSessionRegistry(misc.BuildDefaultRegistry())
+	for _, g := range []string{"enable_seqscan", "enable_indexscan", "enable_bitmapscan", "enable_sort"} {
+		if err := sess.Set(g, "off", false); err != nil {
+			t.Fatalf("SET %s: %v", g, err)
+		}
+	}
+	ps := sessionPlannerSettings(sess)
+	if ps.EnableSeqScan || ps.EnableIndexScan || ps.EnableBitmapScan || ps.EnableSort {
+		t.Fatalf("scan/sort toggles not read: seq=%v index=%v bitmap=%v sort=%v",
+			ps.EnableSeqScan, ps.EnableIndexScan, ps.EnableBitmapScan, ps.EnableSort)
+	}
+	if sessionPlannerFingerprint(sess) == sessionPlannerFingerprint(misc.NewSessionRegistry(misc.BuildDefaultRegistry())) {
+		t.Error("a session with scan toggles off must key apart in the shared plan cache")
+	}
+}

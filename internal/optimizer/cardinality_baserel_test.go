@@ -52,13 +52,18 @@ func TestEstimateBaseRowsUsesLocalFilterSelectivity(t *testing.T) {
 	}
 }
 
-// TestEstimateBaseRowsKeepsBaseRowsWhenSelectivityFallback
-// pins design 02 §2 rule (4): when the selectivity estimate
-// falls back to the generic default (no stats, unrecognised
-// shape, missing histogram), `filteredRows` keeps `baseRows`
-// rather than over-trusting an arbitrary 0.005 / 0.333.
-// (M0077-0002 / Slice B.)
-func TestEstimateBaseRowsKeepsBaseRowsWhenSelectivityFallback(t *testing.T) {
+// TestEstimateBaseRowsAppliesDefaultSelectivityWhenNoHistogram pins R36's
+// reversal of design 02 §2 rule (4).
+//
+// It formerly asserted the opposite — that `filteredRows` KEEPS `baseRows`
+// when the estimate falls back to a default, "rather than over-trusting an
+// arbitrary 0.005 / 0.333". That rule has no upstream counterpart:
+// `set_baserel_size_estimates` (costsize.c:5348-5362) multiplies
+// unconditionally, and `clauselist_selectivity` returns DEFAULT_INEQ_SEL for a
+// clause it cannot estimate — never 1.0, which is what keeping the pre-filter
+// count amounts to. Ledgered 2026-08-06 at "up to 200x divergence"; it reached
+// the join SEARCH, not just EXPLAIN (see applyLocalFilterSelectivity).
+func TestEstimateBaseRowsAppliesDefaultSelectivityWhenNoHistogram(t *testing.T) {
 	tbl := &catalog.Table{
 		Name: "orders",
 		Columns: []catalog.Column{
@@ -85,8 +90,10 @@ func TestEstimateBaseRowsKeepsBaseRowsWhenSelectivityFallback(t *testing.T) {
 	if info.baseRows != 1500000 {
 		t.Errorf("baseRows = %d; want 1500000", info.baseRows)
 	}
-	if info.filteredRows != info.baseRows {
-		t.Errorf("filteredRows = %d; want baseRows=%d (selectivity unreliable → keep base)", info.filteredRows, info.baseRows)
+	// 1500000 * DEFAULT_INEQ_SEL(1/3). A single `>=` does not pair into a
+	// range band, so PG's DEFAULT_RANGE_INEQ_SEL punt does not apply here.
+	if info.filteredRows != 500000 {
+		t.Errorf("filteredRows = %d; want 500000 (baseRows * DEFAULT_INEQ_SEL)", info.filteredRows)
 	}
 }
 

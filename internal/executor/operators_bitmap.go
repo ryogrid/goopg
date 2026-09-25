@@ -133,9 +133,16 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	recheck := o.needsRecheck()
 
 	// Compute the lo/hi key bounds (same logic as indexScanOp.Rescan).
-	loBytes, hiBytes, err := o.lookupBounds()
+	loBytes, hiBytes, nullKey, err := o.lookupBounds()
 	if err != nil {
 		return nil, err
+	}
+	// R49 Slice B: a NULL probe key matches nothing (PG btree semantics;
+	// the sibling index arm returns ok=false). Return the TBM empty — still
+	// work_mem-sized, so tbmLossify sees a well-formed bitmap. Without this,
+	// (nil, nil) bounds would run an open-ended full scan per NULL outer row.
+	if nullKey {
+		return tbm, nil
 	}
 
 	// Scan the B-tree and feed TIDs into the bitmap.
@@ -186,11 +193,14 @@ func (o *bitmapIndexScanOp) needsRecheck() bool {
 	return false
 }
 
-// lookupBounds computes the lo/hi key bytes for the index scan.
-func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, err error) {
+// lookupBounds computes the lo/hi key bytes for the index scan. nullKey
+// reports a NULL probe key, which matches nothing — kept distinct from the
+// key-less full scan (lo=hi=nil, nullKey=false) so buildBitmap can return an
+// empty TBM instead of scanning everything per NULL outer row.
+func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey bool, err error) {
 	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
 	if !found {
-		return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
+		return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
 	}
 
 	// Ensure scanRow is allocated for evalExpr.
@@ -207,54 +217,54 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, err error) 
 		return o.lookupKey(col)
 	}
 	// No scan key means scan all. loBytes=nil, hiBytes=nil.
-	return nil, nil, nil
+	return nil, nil, false, nil
 }
 
 // lookupKey encodes a single-column equality key.
-func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, err error) {
+func (o *bitmapIndexScanOp) lookupKey(col *catalog.Column) (lo, hi []byte, nullKey bool, err error) {
 	val, evalErr := evalExprSlot(o.plan.Key, o.outerSlot, o.ctx)
 	if evalErr != nil {
-		return nil, nil, evalErr
+		return nil, nil, false, evalErr
 	}
 	if val.IsNull() {
-		return nil, nil, nil // empty probe
+		return nil, nil, true, nil // empty probe
 	}
 	key, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: val, pos: o.plan.Pos()}})
 	if encErr != nil {
-		return nil, nil, encErr
+		return nil, nil, false, encErr
 	}
 	lo = key
 	hi = key
 	if len(o.plan.Index.Columns) > 1 {
 		hi = o.ctx.compositeUpperBound(o.plan.Index, key)
 	}
-	return lo, hi, nil
+	return lo, hi, false, nil
 }
 
 // lookupKeys encodes multi-column equality keys.
-func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte, err error) {
+func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte, nullKey bool, err error) {
 	// Encode each leading column in order.
 	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, keyExpr := range o.plan.Keys {
 		keyCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
 		if !found {
-			return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
+			return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
 		}
 		val, evalErr := evalExprSlot(keyExpr, o.outerSlot, o.ctx)
 		if evalErr != nil {
-			return nil, nil, evalErr
+			return nil, nil, false, evalErr
 		}
 		if val.IsNull() {
-			return nil, nil, nil // empty probe
+			return nil, nil, true, nil // empty probe
 		}
 		parts = append(parts, indexProbeKeyPart{col: keyCol, val: val, pos: o.plan.Pos()})
 	}
 	keyBytes, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
 	if encErr != nil {
-		return nil, nil, encErr
+		return nil, nil, false, encErr
 	}
 	_ = firstCol // unified interface; first column is looked up per-key in the loop
-	return keyBytes, keyBytes, nil
+	return keyBytes, keyBytes, false, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +284,21 @@ type bitmapHeapScanOp struct {
 	// Cached outer bitmap producer.
 	outer       Operator
 	outerBitmap bitmapProducer
+
+	// R49 Slice B: NLI-probe recheck state. BindOuter retains the bound outer
+	// slot and builds recheckSlot, a VirtualSlot over [outerMS, innerMS] in
+	// merged outer++inner coordinates — the same shape as the NLI driver's
+	// virtualOut — so evalBitmapQual can evaluate a BitmapQual carrying outer
+	// refs. innerMS.row is refreshed to o.scanRow per tuple at the top of
+	// evalBitmapQual. Nil unless bound (standalone bitmaps never receive
+	// BindOuter and keep the legacy inner-row eval). recheckErr carries a
+	// BindOuter-time width-assumption failure to evalBitmapQual, since
+	// BindOuter has no error return.
+	outerSlot   SlotView
+	outerWidth  int
+	innerMS     *MaterializedSlot
+	recheckSlot *VirtualSlot
+	recheckErr  error
 
 	// TIDBitmap iterator state.
 	tbm  *TIDBitmap
@@ -365,6 +390,46 @@ func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 // the probe key is encoded. A producer that cannot be parameterised does not
 // implement bitmapOuterBinder and simply receives nothing.
 func (o *bitmapHeapScanOp) BindOuter(slot SlotView, outerWidth int) {
+	o.outerSlot = slot
+	o.outerWidth = outerWidth
+	o.recheckSlot = nil
+	o.recheckErr = nil
+	// R49 Slice B: build the combined recheck slot when an outer row is
+	// bound. The driver passes its persistent *MaterializedSlot (a TupleSlot);
+	// anything else cannot source a VirtualSlot, so the legacy path stays.
+	if ts, ok := slot.(TupleSlot); ok && ts != nil && outerWidth > 0 {
+		innerOut := o.plan.Output()
+		innerW := len(innerOut)
+		// Width assumption (SLICE-B.md review note 2): the heap's Output is
+		// the full leaf schema, so merged-coord inner refs alias table
+		// ordinals 1:1 and scanRow (length len(tbl.Columns)) is
+		// dimension-compatible. A projection pushdown between table and heap
+		// Output would silently break this — fail named, not wrong.
+		// innerW may exceed the table width when wireRowMarkCtidColumns
+		// appended resjunk ctid columns (M0128-P6.1): they trail the table
+		// columns, so merged-coord refs still alias table ordinals 1:1 and
+		// innerMS (refreshed with table-width scanRow) stays valid.
+		if o.tbl != nil && innerW < len(o.tbl.Columns) {
+			o.recheckErr = &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("BitmapHeapScan NLI recheck: inner Output width %d != table %q width %d; merged-coord BitmapQual refs would mis-resolve",
+					innerW, o.tbl.Name, len(o.tbl.Columns))}
+		} else {
+			if o.innerMS == nil {
+				o.innerMS = SlotFromRow(innerOut, nil)
+			}
+			cols := make([]virtualCol, 0, outerWidth+innerW)
+			for i := 0; i < outerWidth; i++ {
+				cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+			}
+			for i := 0; i < innerW; i++ {
+				cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+			}
+			// Nil schema: recheck eval addresses columns by index only
+			// (evalExprSlot's ColumnRef fast path bounds-checks Width());
+			// the heap op does not know the join's merged schema.
+			o.recheckSlot = NewVirtualSlot(nil, []TupleSlot{ts, o.innerMS}, cols)
+		}
+	}
 	if b, ok := o.outerBitmap.(bitmapOuterBinder); ok {
 		b.BindOuter(slot, outerWidth)
 	}
@@ -389,6 +454,15 @@ func (o *bitmapHeapScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.tbm = nil
 	o.iter = nil
 	o.ownBitmap = false
+	// R49 Slice B: reset the page-walk cursors too. Serial self-heals via the
+	// pinned==nil guard in nextLossyTuple, but a SEMI early-exit (match →
+	// innerExhausted → next-outer Rescan) can strand a lossy walk mid-page;
+	// the next probe would then resume the PREVIOUS outer row's page.
+	o.inLossyPage = false
+	o.lossyOff = 0
+	o.parOffsets = nil
+	o.parOff = 0
+	o.parRecheck = false
 	return nil
 }
 
@@ -443,7 +517,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	o.pf = newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
-	outerOp, err := buildNode(o.plan.Outer, deformBoundFull)
+	outerOp, err := buildNode(o.plan.Outer, deformBoundFull, nil)
 	if err != nil {
 		return err
 	}
@@ -486,10 +560,11 @@ func (o *bitmapHeapScanOp) Close() error {
 	return nil
 }
 
-// releasePinned unpins the current page if any.
+// releasePinned unpins the current page if any. The page RLock is scoped
+// per tuple fetch (see fetchOneTuple), never held across a yield — the
+// same convention seqScanOp adopted in M0100-0005e — so this only Unpins.
 func (o *bitmapHeapScanOp) releasePinned() {
 	if o.pinned != nil {
-		o.pinned.RUnlock()
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 		o.pageBuf = nil
@@ -572,7 +647,12 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 					return nil, err
 				}
 			}
-			slot.RLock()
+			// The bitmap page fetch's heap_page_prune_opt (M0145-0008t).
+			pruneHeapPageOnAccess(o.ctx, slot, o.tbl, o.rel, block)
+			// Pin only — the page RLock is scoped per tuple fetch
+			// (fetchOneTuple). Holding it across a yield deadlocks
+			// lockRowsOp.stampLock, which write-locks the same page
+			// mid-drain (M0100-0005e sibling convention).
 			o.pinned = slot
 			o.pageBuf = slot.Page()
 			o.pageBlock = block
@@ -659,13 +739,14 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 			return nil, EOF
 		}
 
-		// Pin the page.
+		// Pin the page. Pin only — the page RLock is scoped per tuple
+		// fetch (fetchOneTuple), never held across a yield.
 		o.releasePinned()
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.rel, Block: block})
 		if err != nil {
 			return nil, err
 		}
-		slot.RLock()
+		pruneHeapPageOnAccess(o.ctx, slot, o.tbl, o.rel, block) // M0145-0008t
 		o.pinned = slot
 		o.pageBuf = slot.Page()
 		o.pageBlock = block
@@ -726,7 +807,14 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 // fetchOneTuple fetches and decodes a single tuple at (block, offset).
 // Returns (nil, nil) when the tuple is invisible or reclaimed — the caller
 // advances to the next offset. Does NOT recursively call Next().
-func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+//
+// The page RLock is scoped to this call (M0100-0005e convention): the scan
+// holds only the pin across yields, so a consumer — lockRowsOp.stampLock
+// write-locking the same page mid-drain, or a concurrent writer — is never
+// stalled by a lock parked between Next() calls.
+func (o *bitmapHeapScanOp) fetchOneTuple(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+	o.pinned.RLock()
+	defer o.pinned.RUnlock()
 	id, err := storage.PageGetItemID(o.pageBuf, offset)
 	if err != nil {
 		return nil, nil // entry reclaimed, skip
@@ -776,69 +864,63 @@ func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, r
 		}
 	}
 
-	// Clone arena-backed data.
-	row := cloneRowOwned(o.scanRow)
-	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
-	return &o.slot, nil
+	return o.emitRow(block, offset), nil
 }
 
-// fetchExact fetches a specific tuple at the given offset.
-func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
-	// Check that the line pointer is still valid.
-	id, err := storage.PageGetItemID(o.pageBuf, offset)
-	if err != nil {
-		return o.Next() // entry reclaimed, skip
-	}
-	if id.Flags == storage.ItemIDUnused || id.Flags == storage.ItemIDDead {
-		return o.Next() // entry reclaimed, skip
-	}
-
-	// Follow HOT chain + MVCC visibility.
-	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
-	if !found {
-		return o.Next() // tuple invisible, skip
-	}
-
-	// Lazily allocate scanRow.
-	if o.scanRow == nil || len(o.scanRow) != len(o.tbl.Columns) {
-		o.scanRow = acquireRow(len(o.tbl.Columns))
-	}
-
-	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-	if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
-		return o.Next() // decode failure, skip
-	}
-
-	// If recheck is required (lossy page or index AM said recheck),
-	// evaluate the original index qual (BitmapQual).
-	if recheck && len(o.plan.BitmapQual) > 0 {
-		passed, evalErr := o.evalBitmapQual()
-		if evalErr != nil {
-			return nil, evalErr
-		}
-		if !passed {
-			return o.Next() // recheck failed, skip
-		}
-	}
-
-	// PG's `Filter:` on a Bitmap Heap Scan: the relation's local quals,
-	// evaluated on EVERY tuple — unlike BitmapQual above, which is the recheck
-	// list and fires only on a lossy entry. Set only on an NLI inner, where the
-	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
-	if o.plan.Cond != nil {
-		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
-		if cerr != nil {
-			return nil, cerr
-		}
-		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
-			return o.Next() // filtered out; fetchExact skips by recursing, not by nil
-		}
-	}
-
-	// Clone arena-backed data.
+// emitRow builds the output slot for a fetched tuple at (block, offset).
+// Two stampings make the op a full sibling of seqScanOp/indexScanOp for
+// rowmark (FOR UPDATE) TID surfacing:
+//
+//  1. resjunk ctid (M0128-P6.1): when wireRowMarkCtidColumns extended the
+//     scan's schema past the table's own columns, the trailing slots carry
+//     this tuple's TID as a "(block,offset)" string datum so it rides the
+//     row through the plan tree to lockRowsOp's CtidResno read.
+//  2. slot side-channel: hasCTID/ctidBlock/ctidOff on the emitted slot —
+//     the same stamp seqScanOp applies (M0097-0038), consumed by
+//     drainAndStamp's ms.hasCTID fallback for shapes the column path
+//     cannot cover (self-joins skip injection).
+func (o *bitmapHeapScanOp) emitRow(block storage.BlockNumber, offset uint16) TupleSlot {
 	row := cloneRowOwned(o.scanRow)
+	for i := len(o.cols); i < len(o.plan.Output()); i++ {
+		row = append(row, NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)))
+	}
 	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
-	return &o.slot, nil
+	o.slot.hasCTID = true
+	o.slot.ctidBlock = uint32(block)
+	o.slot.ctidOff = offset
+	return &o.slot
+}
+
+// currentTID implements currentTIDProvider (M0021 step 2): the (rel,
+// ItemPointer) of the most recently emitted row, ok=false once the scan
+// is exhausted or closed — the same contract as seqScanOp (the page pin is
+// released at EOF/Close), so a build-side scan drained at hash-join Open
+// reports false and lockRowsOp falls through to the slot's hasCTID stamp.
+func (o *bitmapHeapScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
+	if o.pinned == nil || !o.slot.hasCTID {
+		return storage.RelFileNode{}, storage.ItemPointer{}, false
+	}
+	return o.rel, storage.ItemPointer{
+		Block:  storage.BlockNumber(o.slot.ctidBlock),
+		Offset: o.slot.ctidOff,
+	}, true
+}
+
+// fetchExact fetches a specific tuple at the given offset. On a skip
+// (reclaimed line pointer, invisible tuple, failed recheck/Cond) it
+// recurses through o.Next() to advance the TBM iterator — the same
+// sequence fetchOneTuple performs, differing only in skip handling.
+// The recursion happens after fetchOneTuple has released its per-tuple
+// page RLock, so no nested RLock is ever taken on this goroutine.
+func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
+	slot, err := o.fetchOneTuple(block, offset, recheck)
+	if err != nil {
+		return nil, err
+	}
+	if slot == nil {
+		return o.Next()
+	}
+	return slot, nil
 }
 
 // nextParallelTuple returns the next surviving tuple from the current exact
@@ -887,7 +969,10 @@ func (o *bitmapHeapScanOp) nextLossyTuple(block storage.BlockNumber) (TupleSlot,
 		if o.lossyOff == 0 || o.lossyOff > uint16(MaxOffsetNumber) {
 			return nil, nil
 		}
-		if _, err := storage.PageGetItemID(o.pageBuf, o.lossyOff); err != nil {
+		o.pinned.RLock()
+		_, err := storage.PageGetItemID(o.pageBuf, o.lossyOff)
+		o.pinned.RUnlock()
+		if err != nil {
 			return nil, nil // past the last line pointer: page exhausted
 		}
 		slot, err := o.fetchOneTuple(block, o.lossyOff, true)
@@ -903,6 +988,34 @@ func (o *bitmapHeapScanOp) nextLossyTuple(block storage.BlockNumber) (TupleSlot,
 // evalBitmapQual evaluates the BitmapHeapScan's BitmapQual against the
 // current scanRow.
 func (o *bitmapHeapScanOp) evalBitmapQual() (bool, error) {
+	// R49 Slice B: an NLI-probe BitmapQual lives in merged outer++inner
+	// coordinates and evaluates against the combined row. Two-slot
+	// discipline: plan.Cond stays leaf-local against scanRow (evaluated at
+	// the fetch sites, untouched here); only BitmapQual moves slots.
+	if o.recheckErr != nil {
+		return false, o.recheckErr
+	}
+	if o.recheckSlot != nil {
+		// Refresh the inner source to this tuple — the NLI driver pattern
+		// (outerMS.row/innerMS.row per row). One place covers fetchOneTuple,
+		// fetchExact and nextLossyTuple.
+		o.innerMS.row = o.scanRow
+		for _, qual := range o.plan.BitmapQual {
+			val, err := evalExprSlot(qual, o.recheckSlot, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			if val.IsNull() {
+				// NULL qual → false (strict boolean semantics, same as
+				// the join Predicate this recheck replaces).
+				return false, nil
+			}
+			if !val.BoolValue() {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
 	for _, qual := range o.plan.BitmapQual {
 		val, err := evalExpr(qual, o.scanRow, o.ctx)
 		if err != nil {
@@ -943,7 +1056,7 @@ func (o *bitmapAndOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull)
+		op, err := buildNode(input, deformBoundFull, nil)
 		if err != nil {
 			return err
 		}
@@ -1024,7 +1137,7 @@ func (o *bitmapOrOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull)
+		op, err := buildNode(input, deformBoundFull, nil)
 		if err != nil {
 			return err
 		}

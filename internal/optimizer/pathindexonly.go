@@ -16,9 +16,13 @@ package optimizer
 //
 // Two narrowings, stated as refusals:
 //
-//   - Only a BARE leaf. A leaf carrying local quals has a predicate whose
-//     `ColumnRef.Index` values are written against the FULL leaf schema;
-//     narrowing the scan under it would re-point them.
+//   - Only a BARE leaf, or a leaf whose local quals are ALL consumed as index
+//     quals (M0145-0029 slice 3: `restrictionEqualityPrefix`, PG's
+//     `build_index_paths` with `index_clauses` and `indexonly = true`). A
+//     residual local qual has a predicate whose `ColumnRef.Index` values are
+//     written against the FULL leaf schema; narrowing the scan under it would
+//     re-point them, so a leaf that would keep one is still refused (ledgered:
+//     PG keeps such quals as the Index Only Scan's Filter).
 //   - Only when the needed set is KNOWN (`neededColumnNames`): an index-only
 //     scan that drops a column the query reads returns wrong rows.
 
@@ -43,9 +47,18 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		if tbl == nil {
 			continue
 		}
-		// A leaf with local quals is refused — see the file header.
-		if !scanLeafIsBare(rel.baseLeaf) {
-			continue
+		// A leaf with local quals is refused unless an index consumes all of
+		// them — see the file header.
+		bare := scanLeafIsBare(rel.baseLeaf)
+		var conjuncts []Expr
+		if !bare {
+			if _, _, ok := scanLeafFor(rel.baseLeaf); !ok {
+				continue
+			}
+			conjuncts = extractFilterConjuncts(rel.baseLeaf)
+			if len(conjuncts) == 0 {
+				continue
+			}
 		}
 		needed := s.neededColumnsOf(tbl)
 		if len(needed) == 0 {
@@ -61,7 +74,19 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
-			if s.addOneIndexOnlyPath(rel, tbl, idx, needed, relPages, relTuples, totalPages) {
+			var clauses []indexPathClause
+			if !bare {
+				clauses = consumingIndexClauses(cat, tbl, idx, conjuncts)
+				if clauses == nil {
+					continue
+				}
+			} else if !indexUnboundKeysNotNull(tbl, idx, 0) {
+				// A full scan leaves every key column unbound, so it needs the
+				// same NULL-key rule as consumingIndexClauses: an index without
+				// NULL-keyed entries would drop those rows.
+				continue
+			}
+			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -87,30 +112,96 @@ func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	return out
 }
 
+// consumingIndexClauses returns the equality-prefix index clauses of `idx`
+// when they consume EVERY local conjunct of the leaf, else nil. A partial
+// index declines, as in the plain restriction producer.
+func consumingIndexClauses(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	if idx == nil || idx.HasPredicate {
+		return nil
+	}
+	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	if len(clauses) == 0 || len(clauses) != len(conjuncts) {
+		return nil
+	}
+	// Same NULL-key rule as the plain restriction producer: entries with a
+	// NULL key column are absent from the byte-key btree.
+	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
+		return nil
+	}
+	// Each clause names a distinct conjunct (one per index column), so equal
+	// counts mean every conjunct is consumed — unless one conjunct bound two
+	// columns, which restrictionEqualityPrefix cannot do (one column per
+	// `col = const`); checked anyway, since a missed residual is wrong rows.
+	used := make(map[Expr]bool, len(clauses))
+	for _, c := range clauses {
+		used[c.local] = true
+	}
+	for _, conj := range conjuncts {
+		if !used[conj] {
+			return nil
+		}
+	}
+	return clauses
+}
+
+// restrictionPathIsIndexOnly reports whether addIndexOnlyPaths builds the
+// index-only path over `idx` with the equality-prefix clauses of the leaf's
+// `conjuncts` — the same three conditions it applies (enable_indexonlyscan,
+// a covering index, every local qual consumed). The plain restriction
+// producer asks it so that exactly one of the two builds the path, as
+// build_index_paths' single `index_only_scan` flag does.
+func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+	if !s.neededColsKnown || indexOnlyHardDisabled(cat) {
+		return false
+	}
+	needed := s.neededColumnsOf(tbl)
+	if len(needed) == 0 {
+		return false
+	}
+	if _, ok := indexCoversColumns(idx, needed); !ok {
+		return false
+	}
+	return consumingIndexClauses(cat, tbl, idx, conjuncts) != nil
+}
+
 // addOneIndexOnlyPath builds the index-only path for one index, or declines.
-func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
-	needed []catalog.Column, relPages int64, relTuples, totalPages float64) bool {
+// `clauses` is empty for the full-index-scan shape over a bare leaf, or the
+// index quals that consume all of the leaf's local quals.
+func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	needed []catalog.Column, clauses []indexPathClause, relPages int64, relTuples, totalPages float64) bool {
 	covered, ok := indexCoversColumns(idx, needed)
 	if !ok {
 		return false
 	}
+	// A full index scan: no bound quals, so every entry is read. PG's
+	// selectivity for an index path with no indexclauses is 1.0 ("An empty
+	// indexclauses list implies a full index scan", pathnodes.h:1817).
+	sel, unique := 1.0, false
+	if len(clauses) > 0 {
+		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
+	}
+	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	if qpquals < 0 {
+		qpquals = 0
+	}
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
 	in := indexScanInputs{
-		relPages:    relPages,
-		relTuples:   relTuples,
-		indexPages:  indexPages,
-		indexTuples: indexTuples,
-		treeHeight:  treeHeight,
-		// A full index scan: no bound quals, so every entry is read. PG's
-		// selectivity for an index path with no indexclauses is 1.0 ("An
-		// empty indexclauses list implies a full index scan",
-		// pathnodes.h:1817).
-		selectivity:     1,
-		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
-		totalTablePages: totalPages,
-		loopCount:       1,
-		indexOnly:       true,
-		allVisFrac:      relAllVisibleFraction(tbl, relPages),
+		relPages:                relPages,
+		relTuples:               relTuples,
+		indexPages:              indexPages,
+		indexTuples:             indexTuples,
+		treeHeight:              treeHeight,
+		selectivity:             sel,
+		uniqueEqualityOnAllKeys: unique,
+		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages:         totalPages,
+		loopCount:               1,
+		indexOnly:               true,
+		allVisFrac:              relAllVisibleFraction(cat, tbl, relPages),
+		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
+		// index qual is a qpqual, as the seq rival counts them
+		// (costsize.c:806-820).
+		numQualOps: qpquals,
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
@@ -139,13 +230,19 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 		// hashsize.Choose exists to prevent.
 		NCols:       len(covered),
 		AvgVarBytes: coveredAvgVarBytes(tbl, covered),
+		// R91: virtual-bucket geometry consumes the emitted packed-tuple
+		// width, never the Goopg map-footprint fields. TupleWidth is the
+		// existing PG-style source over exactly this covered schema.
+		OutputWidth: indexOnlyOutputWidth(covered),
 		// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 		// path-creation time. Assert-only — never applied, never costed; the
 		// NCols/AvgVarBytes pair above is unchanged.
 		Target:      tgt,
 		TargetKnown: tgtKnown,
-		// No index clauses: this is the full-index-scan shape, and
-		// `createPlan` reads the empty list as exactly that.
+		// Empty: the full-index-scan shape, and `createPlan` reads the empty
+		// list as exactly that. Non-empty: the probe, whose conjuncts
+		// createPlan drops from the leaf (they were all of them).
+		IndexClauses: clauses,
 	}
 	addPath(rel, serial, "indexonly")
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,
@@ -155,6 +252,17 @@ func (s *searchCtx) addOneIndexOnlyPath(rel *RelOptInfo, tbl *catalog.Table, idx
 	// since M0134-0189 (Parallel Index Only Scan).
 	s.addPartialIndexPath(rel, tbl, serial, in, "indexonly.partial")
 	return true
+}
+
+// indexOnlyOutputWidth constructs the same SchemaColumn view a plan node emits
+// before asking the one PG-style byte-width authority, TupleWidth. It is not a
+// map-footprint proxy: catalog columns carry their real planner type widths.
+func indexOnlyOutputWidth(covered []catalog.Column) int {
+	schema := make([]SchemaColumn, len(covered))
+	for i, col := range covered {
+		schema[i] = SchemaColumn{Name: col.Name, Type: col.Type}
+	}
+	return TupleWidth(schema)
 }
 
 // indexCoversColumns is `check_index_only`'s coverage test: every needed column
@@ -197,14 +305,22 @@ func indexCoversColumns(idx *catalog.Index, needed []catalog.Column) ([]catalog.
 // relAllVisibleFraction is PG's `baserel->allvisfrac` (`estimate_rel_size`,
 // plancat.c:1050): the fraction of the heap the visibility map marks
 // all-visible — the ONLY thing that makes an index-only scan cheaper than an
-// index scan. goopg's VM is readable through `catalog.RelAllVisible` (wired by
-// initdb), so this is the real figure: a never-vacuumed table returns 0 and
-// the path loses on cost.
-func relAllVisibleFraction(tbl *catalog.Table, relPages int64) float64 {
+// index scan. goopg's VM is readable through the catalog (wired by initdb),
+// so this is the real figure: a never-vacuumed table returns 0 and the path
+// loses on cost. The block count is resolved as the pg_class view resolves it
+// (`InMemory.RelAllVisibleBlocks`) — the package-level `catalog.RelAllVisible`
+// is only the fallback for a catalog that is not an InMemory, since it keys a
+// DBOid-less table under the wrong database.
+func relAllVisibleFraction(cat catalog.Catalog, tbl *catalog.Table, relPages int64) float64 {
 	if tbl == nil || relPages <= 0 {
 		return 0
 	}
-	visible := catalog.RelAllVisible(tbl)
+	var visible int32
+	if im := inMemoryCat(cat); im != nil {
+		visible = im.RelAllVisibleBlocks(tbl)
+	} else {
+		visible = catalog.RelAllVisible(tbl)
+	}
 	if visible <= 0 {
 		return 0
 	}

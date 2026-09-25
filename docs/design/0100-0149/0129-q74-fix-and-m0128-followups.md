@@ -12,7 +12,8 @@
 ## 1. Positioning
 
 Every priority milestone through M0128 is CLOSED (banner `f18d3014`,
-2026-08-08). M0129 is the **top-priority milestone** (user directive
+2026-08-08). M0129 **was** the top-priority milestone (historical — superseded by the
+2026-09-14 banner, which ranks the plan-parity group M0137–M0143 first) (user directive
 2026-08-08), ahead of the M-NIGHTLY backlog; the standing M-NIGHTLY *filing*
 obligation (read `ci/logs/action-items.md`, file each new `## AI-` subject)
 still applies to every loop, but selection goes to M0129.

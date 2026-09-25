@@ -248,3 +248,192 @@ so the reason is known rather than guessed.
   PostgreSQL; it is the strongest available oracle for the identity gate.
 - **pgbench smoke** (the pre-commit hook): must be unaffected. Nothing in this
   bundle touches the write path, so a change there is a signal, not noise.
+
+## The SEMI partial-nested-loop divergence (found and fixed 2026-09-21)
+
+A live wrong-answer defect at HEAD, found while doing M0145-0010's scope (d)
+("executor-capability check FIRST for every newly admitted shape"). It is
+recorded here rather than in the milestone because it is a verification lesson
+first and a planner story second.
+
+### The defect
+
+M0137-0019b admitted SEMI to the partial nested-loop set on the PLANNER side —
+both `nestedLoopJoinIsPartialCapable` (the node gate) and
+`partialPathDrivingKind`'s `PathNestLoop` arm — with a documented rationale
+(the verdict is per-outer-row and worker-local; `markInner`/`fillInner` is
+never touched; PG admits `{INNER, LEFT, SEMI, ANTI}` at the same dispatch
+gate). The EXECUTOR twin `ordinaryInnerNestedLoopPartial` was left at INNER.
+
+Its own comment states the invariant that was broken: the three gates "must
+agree… a shape admitted here but refused there (or vice versa) either runs
+unmodelled or never runs".
+
+The consequence is not a safe decline. The attach walk returning false leaves
+the driving scan UNATTACHED, and `attachAll`'s result is **ignored** by
+`gatherOp` (ledger `e10-attachall-precondition-unenforced`), so every worker
+scans the WHOLE outer.
+
+### The measurement
+
+On the SF1 clone, a plain `Nested Loop Semi Join` with a non-parameterized
+inner under a Gather:
+
+```sql
+SELECT count(*) FROM customer c
+ WHERE EXISTS (SELECT 1 FROM region r WHERE r.r_name > c.c_mktsegment);
+
+parallel : 450000
+serial   : 150000
+customers: 150000        -- a semijoin emits at most one row per outer row
+```
+
+Exactly 3x with 3 workers. After the fix all three agree at 150000.
+
+Note what the shape needs, because it is why no gate caught it: a NON-equality
+correlation (else a hash semi join is elected) over an UNINDEXED inner column
+(else the plan is a `*NestedLoopIndexJoin`, a different node that never reaches
+this walk). TPC-H Q4's semijoin is the indexed shape, so Q4 — M0137-0019b's own
+named consumer — executes correctly and proves nothing about this path.
+
+### Why no existing gate saw it
+
+- the TPC-H acceptance arm runs SERIAL;
+- the TPC-DS SF0.25 sweep runs the corpus, and no corpus query produces the
+  unindexed non-equality semijoin shape;
+- the plan channel would not have flagged it anyway: the PLAN is correct, only
+  its execution duplicates rows.
+
+This is the same failure mode `parallel_identity_test.go`'s header records from
+the feature's first days ("the Gather returned N copies of every row"), one
+gate later — which is the argument for the pin being an IDENTITY test rather
+than a predicate test: it catches the divergence whichever of the four gates
+drifts.
+
+### Pins
+
+- `TestParallelSemiNestedLoopIdentity` (end-to-end, workers 1/2/4, asserts the
+  plain SEMI nested loop is actually present so the comparison cannot go
+  vacuous, and FAILS rather than skips if the planner stops electing it);
+- `TestParallelNLWalkerAdmitsSemi` (structural, all three walks);
+- `semi` removed from `TestParallelNLWalkerRefusals`' matrix, deliberately.
+
+### Still refused, on BOTH sides
+
+LEFT and ANTI. Their refusal is scope-minimisation rather than correctness
+(ledger `m0137-0019b-partial-nl-left-anti-still-refused`), and the lesson of
+this defect is that they must move on both sides together or not at all.
+
+## LEFT and ANTI admitted to the ordinary partial nested loop (2026-09-21)
+
+M0145-0010 scope (c) asks for legality read from parameterization rather than
+an enumerated jointype set. This is the jointype half of that, done first
+because it is bounded and measurable: goopg's ordinary partial nested-loop
+family now admits `{INNER, LEFT, SEMI, ANTI}`, which is PG's nestloop dispatch
+set (`joinpath.c:1842-1846`) minus RIGHT and FULL.
+
+### Capability verified BEFORE admission, per scope (d)
+
+The refusal of LEFT/ANTI was scope-minimisation, not correctness — both the
+planner gate's comment and the ledger said so. But "the comment says it is
+safe" is exactly what the SEMI defect above disproved in the other direction,
+so the claim was measured rather than trusted:
+`TestParallelLeftAntiNestedLoopIdentity` forces a Gather over each shape and
+compares against serial. **Before** the widening both showed the N-copy
+signature (800 vs 400 at one worker); after it, all worker counts agree.
+
+The structural reason they are safe is narrow and worth stating: `fillInner` —
+the cross-worker inner-match reduction — is set only for RIGHT/FULL
+(`join_nl_stream.go:135`), and `markInner` is called only under it. LEFT's
+null-extension (`fillOuter`) and ANTI's no-match verdict are each decided by
+one outer row against the whole inner that worker materialises itself.
+
+### A fixture trap worth recording
+
+`SELECT ... FROM outer o LEFT JOIN inner i ON i.nm < o.seg` does **not** plan
+to a LEFT nested loop — the planner commutes it to a RIGHT join (jointype 2),
+which every gate correctly refuses. A fixture in that shape tests the refusal
+while appearing to test the admission, and reads as a LEFT failure when the
+code is right. The test now asserts the planned jointype explicitly
+(`topNestedLoopJointype`) so it cannot go vacuous, and the LEFT case carries an
+extra `AND o.id > 0` that keeps the planner off the commutation.
+
+### One predicate, four gates
+
+The four gates are now `partialNestLoopJointype` (gatherpaths.go) shared by
+`partialPathDrivingKind`'s PathNestLoop arm and its spine mirror,
+`nestedLoopJoinIsPartialCapable` (parallel.go), and
+`ordinaryInnerNestedLoopPartial` (executor). The mirror had drifted — its
+comment claimed to follow the arm "guard-for-guard" while testing
+`!= JoinInner` against the arm's `{INNER, SEMI}`. That was a refusal, hence
+harmless, but a documented invariant true only in prose is the same shape of
+defect as the SEMI wrong answer. Sharing the predicate makes the claim
+structural.
+
+### Movement
+
+None on the corpus: TPC-DS SF0.25 plans 99/99 identical, `PASS=96
+MISMATCH=0`, TPC-H acceptance arm 24/24. No corpus query elects an ordinary
+LEFT or ANTI nested loop with a parallel-eligible outer today, so this is a
+capability and PG-faithfulness change rather than a performance one.
+
+### Still out of the set
+
+RIGHT and FULL, on correctness. And the FUSED NLI family
+(`NestedLoopIndexJoinIsPartialCapable`, a different node type with its own
+gate) remains `{INNER, SEMI}` — deliberately untouched here so this change
+stays attributable; ledgered.
+
+## The FUSED NLI family joins the set (2026-09-21)
+
+The parameterized-probe twin of the previous section:
+`*NestedLoopIndexJoin`, driven by `nestedLoopIndexJoinOp`, partial through its
+OUTER while the inner probe re-opens per outer row. It now admits the same
+`{INNER, LEFT, SEMI, ANTI}`.
+
+### This family is built better, and that is the point
+
+It has **no executor twin to drift**. The attach arm calls the planner's
+exported predicate directly (`optimizer.NestedLoopIndexJoinIsPartialCapable`,
+parallel_scan.go — "literal agreement, no twin to drift"), so widening the one
+predicate widens both sides at once. **The SEMI wrong answer of this same day
+could not have happened here.** That is worth recording as the design lesson
+the ordinary family should eventually follow: a shared predicate is structurally
+stronger than two predicates plus a comment saying they must agree.
+
+Both families now also share their jointype set per type domain:
+`partialNestLoopJoinType` (`optimizer.JoinType`, read by the ordinary node gate
+and the fused gate) and `partialNestLoopJointype` (`parser.JoinType`, read by
+the path arm and its spine mirror). Two helpers only because `Path` carries
+`parser.JoinType` while plan nodes carry `optimizer.JoinType`.
+
+### Capability measured before admission
+
+What a shared predicate cannot tell you is whether the OPERATOR can drive a
+newly admitted jointype per worker, so that was measured:
+`TestParallelNLIJointypeIdentity` forces a Gather over the fused SEMI, ANTI and
+LEFT shapes. Before the widening, SEMI passed (already admitted) while ANTI
+returned 700 against a serial 350 and LEFT 800 against 400 — the N-copy
+signature. After, all three agree at every worker count.
+
+The structural reason: `nestedLoopIndexJoinOp` decides LEFT and ANTI from its
+per-outer-row `outerMatched` flag (`operators_nljoin.go`), not from shared
+inner state, so each worker's verdict for its own outer rows is complete.
+
+### Movement
+
+None on the corpus: plans 99/99 identical, acceptance arm 24/24, spotcheck
+Q12=2 Q13=33. Capability and PG faithfulness, not performance.
+
+### Fixture note
+
+The LEFT case needs the same commutation-avoidance clause the ordinary family's
+does (`AND o.id > 0`); without it the planner elects a hash join and the
+fixture silently stops exercising this family. The test asserts the planned
+node is a fused NLI of the expected jointype so it cannot go vacuous.
+
+### Still out
+
+RIGHT, FULL and CROSS, on correctness: RIGHT/FULL need the cross-worker
+inner-match reduction, and CROSS has no per-outer-row verdict to be worker-local
+about.

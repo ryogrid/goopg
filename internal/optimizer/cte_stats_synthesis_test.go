@@ -49,8 +49,14 @@ func TestSynthesizeAggregateOutputs(t *testing.T) {
 		t.Errorf("group keys kinds = %v %v, want groupkey groupkey",
 			got.cols[0].kind, got.cols[1].kind)
 	}
+	// Step 3 (the group-combo rule, M0145-0009 slice 2) landed, but it applies
+	// only when the INPUT ndistinct is known: min(input, group count). This
+	// fixture's table carries no stats, so the input is unknown and the rule
+	// declines — the group count alone is not a usable fallback (it regressed
+	// TPC-DS Q59; see groupKeyNDistinct's comment). Unknown here is the rule
+	// working, not the rule missing.
 	if got.cols[0].ndistinct != -1 {
-		t.Errorf("group key ndistinct = %v, want unknown (-1) until step 3 restriction rules",
+		t.Errorf("group key ndistinct = %v, want unknown (-1): this fixture has no column stats",
 			got.cols[0].ndistinct)
 	}
 	if got.cols[2].kind != cteColAggOut {
@@ -320,5 +326,103 @@ func TestPeelCTEBody(t *testing.T) {
 	join := &Join{Left: leaf, Right: leaf}
 	if got := peelCTEBody(join); got != Node(join) {
 		t.Error("peel must stop at Join")
+	}
+}
+
+// --- M0145-0009 slice 3: the WindowAgg pass-through arm -----------------
+//
+// `Project(WindowAgg)` was the largest unclassified population the slice-1
+// census found — 366 of 648 unknown asks per TPC-DS SF0.25 run. The rule is
+// stronger than the group-key one because a WindowAgg is row-preserving: a
+// column it hands through HAS its input's distinctness rather than merely
+// being bounded by it.
+
+func synthWindowTestTable() *catalog.Table {
+	return &catalog.Table{
+		Name: "win_src",
+		Columns: []catalog.Column{
+			{Name: "cust", Type: catalog.Type{Name: "int4"}},
+			{Name: "yr", Type: catalog.Type{Name: "int4"}},
+		},
+		Stats: &catalog.TableStats{
+			RowCount: 100000,
+			Columns:  []catalog.ColumnStats{{NDistinct: 40000}, {NDistinct: 5}},
+		},
+	}
+}
+
+func TestSynthesizeWindowPassthrough(t *testing.T) {
+	tbl := synthWindowTestTable()
+	scan := &SeqScan{Table: tbl, EstRelRows: 100000, schema: tableSchema(tbl)}
+	win := &WindowAgg{
+		Child:       scan,
+		PartitionBy: []Expr{&ColumnRef{Index: 0, Name: "cust"}},
+		Funcs:       []WindowFunc{{Name: "rank"}},
+		// child row ++ func outputs
+		schema: Schema{{Name: "cust"}, {Name: "yr"}, {Name: "rnk"}},
+	}
+	proj := &Project{Child: win,
+		Targets: []Expr{
+			&ColumnRef{Index: 1, Name: "yr"},   // pass-through, low cardinality
+			&ColumnRef{Index: 0, Name: "cust"}, // pass-through, high cardinality
+			&ColumnRef{Index: 2, Name: "rnk"},  // the window function output
+		},
+		schema: Schema{{Name: "yr"}, {Name: "cust"}, {Name: "rnk"}}}
+	entry := &plannedCTE{name: "w", body: proj, schema: proj.Output()}
+
+	got := synthesizeCTEStats(entry)
+	// Reordered targets must map correctly, and the pass-through columns take
+	// the INPUT's ndistinct exactly — no clamp, because the row set is
+	// unchanged.
+	if got.cols[0].kind != cteColPassthrough || got.cols[0].ndistinct != 5 {
+		t.Errorf("yr = kind %v nd %v, want passthrough 5", got.cols[0].kind, got.cols[0].ndistinct)
+	}
+	if got.cols[1].kind != cteColPassthrough || got.cols[1].ndistinct != 40000 {
+		t.Errorf("cust = kind %v nd %v, want passthrough 40000", got.cols[1].kind, got.cols[1].ndistinct)
+	}
+	// The window function's own output is a computed value — unknown.
+	if got.cols[2].kind != cteColUnknown || got.cols[2].ndistinct != -1 {
+		t.Errorf("rank output = kind %v nd %v, want unknown", got.cols[2].kind, got.cols[2].ndistinct)
+	}
+}
+
+func TestSynthesizeWindowFailsClosed(t *testing.T) {
+	tbl := synthWindowTestTable()
+	scan := &SeqScan{Table: tbl, EstRelRows: 100000, schema: tableSchema(tbl)}
+	win := &WindowAgg{Child: scan, Funcs: []WindowFunc{{Name: "rank"}},
+		schema: Schema{{Name: "cust"}, {Name: "yr"}, {Name: "rnk"}}}
+
+	// A computed target reads no single input column — unknown, never guessed.
+	computed := &Project{Child: win,
+		Targets: []Expr{&BinaryOp{Op: parser.OpAdd,
+			Left: &ColumnRef{Index: 1}, Right: &IntegerConst{Value: 1}}},
+		schema: Schema{{Name: "yrp1"}}}
+	if got := synthesizeCTEStats(&plannedCTE{name: "w", body: computed, schema: computed.Output()}); got.cols[0].kind != cteColUnknown {
+		t.Errorf("computed target = %v, want unknown", got.cols[0].kind)
+	}
+
+	// A body whose input carries no stats leaves the pass-through unknown
+	// rather than inventing a number.
+	nostats := &SeqScan{Table: &catalog.Table{Name: "win_nostats",
+		Columns: []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}}},
+		EstRelRows: 1000, schema: Schema{{Name: "a"}}}
+	bare := &WindowAgg{Child: nostats, Funcs: []WindowFunc{{Name: "rank"}},
+		schema: Schema{{Name: "a"}, {Name: "rnk"}}}
+	ent := &plannedCTE{name: "w", body: bare, schema: bare.Output()}
+	if got := synthesizeCTEStats(ent); got.cols[0].kind != cteColUnknown {
+		t.Errorf("unanalyzed pass-through = %v, want unknown", got.cols[0].kind)
+	}
+}
+
+// TestSynthesizeWindowDoesNotOverwriteAggregate pins the dispatch order
+// guarantee: the window arm only fills records still `unknown`, so a body that
+// somehow matched an earlier rule keeps that rule's answer.
+func TestSynthesizeWindowDoesNotOverwriteAggregate(t *testing.T) {
+	entry := synthAggEntry(t)
+	got := synthesizeCTEStats(entry)
+	for i, c := range got.cols {
+		if c.kind == cteColPassthrough {
+			t.Errorf("col %d became passthrough on an Aggregate body", i)
+		}
 	}
 }

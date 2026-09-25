@@ -205,16 +205,32 @@ func (n *Join) pairIsHashSafe(p JoinKeyPair) bool {
 //
 //   - float4/float8: `-0.0 = 0.0` is true and NaN's behaviour is operator-
 //     specific, but their datumKey forms differ.
-//   - bpchar (`character(n)`): PG's bpchareq ignores trailing spaces.
 //   - json, arrays, composites, ranges: no equality operator at all, or one
 //     that is structural rather than byte-wise.
 //   - domains: need base-type resolution first.
 //   - oid: unsigned in PG and its datum representation is not pinned yet
 //     (the same exclusion `isMachineIntTypeName` already makes).
+//
+// R50 Slice A admitted the bpchar family (`char`, `bpchar`,
+// `character` — one family under three display names, design
+// `r50-hash-joinfilter-dedup/DESIGN.md` §2). The old exclusion cited
+// PG's bpchareq ignoring trailing spaces, but goopg stores
+// width-carrying bpchar TRIMMED (no padded Datum representation), so on
+// stored values datumKey-equality and `=`-equality coincide exactly; for
+// unbounded-verbatim values a key meeting still implies byte-identical
+// inputs, which `=` (a superset of byte equality) accepts. What `=`
+// accepts-but-keys-miss (e.g. `'ab'` vs `'ab '`, UUID case variants via
+// compareDatum normalisation) misses identically with and without the
+// residual — pre-existing direction-1 behaviour, already accepted for
+// `varchar`/`text` at P2.2. Quoted OID-18 `"char"` shares the
+// `Type.Name`; same-name-both-sides plus byte-exact key/`=` keeps it
+// safe, and `char[]` stays out via the `IsArray` guard in
+// `pairIsHashSafe`.
 func isHashSafeTypeName(name string) bool {
 	switch name {
 	case "numeric", "decimal",
 		"text", "varchar", "character varying", "name",
+		"char", "bpchar", "character",
 		"bool", "boolean",
 		"date",
 		"timestamp", "timestamp without time zone",

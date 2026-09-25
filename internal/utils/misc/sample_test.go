@@ -8,8 +8,9 @@ import (
 )
 
 // sampleEntryRE matches a `name = value` line in postgresql.conf.sample,
-// optionally prefixed by a single `#` (every shipped entry is commented
-// out). The name uses `\w` rather than `[a-z_]` because the registry
+// optionally prefixed by a single `#` (entries ship commented out except
+// the deliberate live `work_mem` line — see the sample's header). The
+// name uses `\w` rather than `[a-z_]` because the registry
 // preserves PG's capitalised names (`DateStyle`, `TimeZone`,
 // `IntervalStyle`).
 //

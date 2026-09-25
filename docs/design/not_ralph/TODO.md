@@ -1209,7 +1209,7 @@ The failing top-level tests, for the resumed session:
   dml.go, expr.go, function.go, copy.go, alter/interval parse helpers),
   prune parser.go drivers (keep Parse/ParseExpr entries, token pool, error
   machinery), remove legacy keyword classification + dead AST sweep.
-- [ ] **P7.3 Final gates**: units, tpch-spotcheck, tpcds SF0.5, full
+- [ ] **P7.3 Final gates**: units, tpch-spotcheck, tpcds SF0.25, full
   regress sweep ≥ baseline, docs updated (design index), README status.
 
 ## Continuous

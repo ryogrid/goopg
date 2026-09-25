@@ -238,12 +238,17 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	if tname == "varchar" || tname == "character varying" {
 		if len(t.Args) > 0 {
 			n := int(t.Args[0])
-			stripped := strings.TrimRight(s, " ")
-			if utf8.RuneCountInString(stripped) > n {
-				return "", &ExecError{Code: "22001",
-					Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+			if utf8.RuneCountInString(s) > n {
+				// varchar_input removes excess trailing spaces only when the
+				// assignment value exceeds typmod. In-range trailing spaces are
+				// data and must survive COPY/INSERT/UPDATE unchanged.
+				stripped := strings.TrimRight(s, " ")
+				if utf8.RuneCountInString(stripped) > n {
+					return "", &ExecError{Code: "22001",
+						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+				}
+				s = stripped
 			}
-			s = stripped
 		}
 	} else if tname == "char" || tname == "bpchar" || tname == "character" {
 		// A typmod-less type carries NO length limit upstream: bpchar_input's
@@ -272,21 +277,34 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			n = 1
 		}
 		if n >= 0 {
-			// goopg stores a WIDTH-CARRYING bpchar trimmed (deliberate and
-			// load-bearing — M0103-0007 rung 24; compareDatum's
-			// padding-insensitive equality and the compact heap image rest on
-			// it) and re-pads to Args[0] at every render boundary via
-			// catalog.PadBpchar. An unbounded bpchar has no width to re-pad
-			// FROM, so trimming it would destroy the trailing blanks instead of
-			// deferring them: measured on PG 18.3, `bpchar` holding 'ab  ' is
-			// octet_length 4 where a char(6) holding the same is 6. Both survive
-			// only if the unbounded value is stored verbatim.
+			// M0143-0007b slice 1 (R23): a WIDTH-CARRYING bpchar is stored
+			// BLANK-PADDED to its declared width, as upstream's bpchar_input
+			// does (postgres/src/backend/utils/adt/varchar.c). goopg used to
+			// store it trimmed and re-pad at every render boundary; that kept
+			// the heap image compact and was the whole of the K41 `relpages`
+			// gap on `customer`/`item` (M0143-0007 measured it). Owner
+			// approved reversing the convention 2026-09-20.
+			//
+			// The two steps are upstream's, in upstream's order: excess
+			// TRAILING SPACES are stripped silently, and only a value still
+			// too long after that is an error (22001). Then pad.
+			//
+			// An UNBOUNDED bpchar (typmod -1) has no width to pad TO, so it is
+			// stored verbatim — trailing blanks in it are data, not padding.
+			// Measured on PG 18.3: `bpchar` holding 'ab  ' is octet_length 4
+			// where a char(6) holding the same is 6. Both survive only if the
+			// unbounded value is left alone, which is why this arm is guarded
+			// by `n >= 0` and not widened.
 			stripped := strings.TrimRight(s, " ")
 			if utf8.RuneCountInString(stripped) > n {
 				return "", &ExecError{Code: "22001",
 					Message: fmt.Sprintf("value too long for type character(%d)", n)}
 			}
-			s = stripped
+			// PadBpchar counts RUNES, matching bpchar_input's
+			// pg_mbstrlen_with_len, and is a no-op on an already-full value —
+			// which is what keeps the render-boundary callers correct while
+			// both trimmed (pre-existing) and padded (new) images are on disk.
+			s = catalog.PadBpchar(catalog.Type{Name: "bpchar", Args: []int64{int64(n)}}, stripped)
 		}
 	} else if tname == "bit" {
 		// bit(n): fixed-length, EXACT bit count — no padding/truncation on
@@ -2079,6 +2097,26 @@ func decodePhysicalPGValueLowered(t *catalog.Type, tname string, data []byte, sc
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "int2[]", "_int2", "oid[]", "_oid":
+		// R126: system-catalog array columns declared with the array spelling
+		// in their NAME (pg_constraint.conkey/confkey/conpfeqop/…) rather than
+		// as {Name:<elem>, IsArray:true}. encodeValuePGCtx writes these
+		// through the `case "int2[]"` / `case "oid[]"` KindBytes passthrough,
+		// so without a matching decode arm a non-null value fell into the
+		// default branch below and came back as varlena TEXT — silently, with
+		// no error. Nothing exercised it before R126 because every array
+		// column in both pg_constraint writers was NullDatum.
+		//
+		// The element type name MUST be handed down explicitly. decodeArray…
+		// → array.RenderTextStyled resolves the element by name and falls
+		// back to varlena-text elements on a miss (pgarray.go:277-280), so
+		// passing "int2[]" through would decode 2-byte ints as 4-byte varlena
+		// text: garbage, again with no error.
+		elem := "int2"
+		if tname == "oid[]" || tname == "_oid" {
+			elem = "oid"
+		}
+		return decodeArrayValuePGStyled(catalog.Type{Name: elem, IsArray: true}, data, st)
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

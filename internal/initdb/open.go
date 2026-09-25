@@ -280,6 +280,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, errors.New("goopg: -D <data-directory> is required")
 	}
 	abs, err := filepath.Abs(opts.DataDir)
+	if err == nil {
+		// Cluster capabilities (global/pg_goopg_features): set before any
+		// index is read or written.
+		features := readGoopgFeatures(abs)
+		catalog.SetNullKeyedIndexEntries(features[catalog.NullKeyedIndexEntriesFeature])
+		storage.SetHeapLinePointerLifecycle(features[storage.HeapLinePointerLifecycleFeature])
+	}
 	if err != nil {
 		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)
 	}
@@ -684,11 +691,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Opportunistic page-pruning change record (M0046-0002). Carries
 	// the freed slot list so replay can deterministically reclaim the
 	// same dead slots without re-running the isDead predicate.
-	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
+	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, dead, unused []uint16) (storage.LSN, error) {
 		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with the redirect
 		// + now-unused sub-records instead of the goopg-native body. Recovery
 		// routes it to replayDecodedXLogHeapPrune.
-		payload, err := xlog.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
+		payload, err := xlog.EncodeHeapPruneOptPG(rel, blk, redirects, dead, unused)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
+	// VACUUM's second-heap-pass record (M0145-0008v): the LP_DEAD items whose
+	// index entries are gone become LP_UNUSED, as a PG
+	// XLOG_HEAP2_PRUNE_VACUUM_CLEANUP record.
+	logHeapVacuumCleanup := func(rel storage.RelFileNode, blk storage.BlockNumber, unused []uint16) (storage.LSN, error) {
+		payload, err := xlog.EncodeHeapVacuumCleanupPG(rel, blk, unused)
 		if err != nil {
 			return 0, err
 		}
@@ -780,6 +802,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapHotUpdate:         logHeapHotUpdate,
 		LogHeapUpdate:            logHeapUpdate,
 		LogHeapPruneOpt:          logHeapPruneOpt,
+		LogHeapVacuumCleanup:     logHeapVacuumCleanup,
 		LogSmgrCreate:            logSmgrCreate,
 		LogChangeRecord:          logChangeRecord,
 		FullPageWrites:           true,
@@ -1550,6 +1573,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_database reload: %w", err)
 	}
 
+	// Per-database schemas, as soon as the database list exists. The earlier
+	// reloadUserSchemasFromHeap could only read the connecting catalog's own
+	// pg_namespace heap, because it has to run before the ts_dict/ts_config
+	// passes that resolve schema OIDs — which is before this point. Without
+	// this second pass a CREATE SCHEMA inside a CREATE DATABASEd database
+	// disappears across a restart.
+	if err := ReloadUserDatabaseSchemasFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: per-database pg_namespace reload: %w", err)
+	}
+
 	// M0122-0007 4e follow-up 39: load each distinct-dbOid database's user
 	// tables from its OWN per-database pg_class/pg_attribute heap
 	// (base/<dbOid>/1259|1249, written by syncTableToCatalogHeap's
@@ -1572,6 +1608,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = walWriter.Close()
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: user table heap load (db %q oid %d): %w", dbName, dbOid, err)
+		}
+	}
+
+	// M0143-0002f: register each distinct-dbOid database's OWN
+	// pg_type/pg_attribute heap tables (base/<dbOid>/1247|1249) into that
+	// database's catalog namespace, mirroring the loadUserTablesFromHeapForDB
+	// loop directly above. Must run here (after reloadDatabasesFromHeap
+	// populated cat.ListDatabases(), the source of the per-DB dbOid list) —
+	// loadSystemCatalogsIfPresent's call further up in this function only
+	// covers the shared DefaultDBOid pass, since ListDatabases() is still
+	// empty at that point on every restart.
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadSystemCatalogsIfPresentForDB(abs, cat, dbOid, dbOid); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: system catalog load (db %q oid %d): %w", dbName, dbOid, err)
 		}
 	}
 
@@ -1658,6 +1716,78 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_inherits reload: %w", err)
 	}
 
+	// R126: FOREIGN KEY persistence from the pg_constraint HEAP rows
+	// (base/<dbOid>/2606, contype='f') written by the DDL funnel. Placed here
+	// for the SAME reason as the pg_inherits pass above and with the same
+	// shape — a foreign key is an EDGE, and the referenced table may reload
+	// after the referencing one, so both must already be registered.
+	//
+	// Until this pass existed, catalog.Table.ForeignKeys was rebuilt by
+	// nothing, so every FK vanished at the first restart — and that took
+	// runtime referential integrity with it, not just the planner's FK
+	// selectivity arm: enforcement reads the same field (operators_fk.go:118,
+	// :170), so an orphan INSERT was silently accepted post-restart.
+	if err := loadForeignKeysFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint FK reload: %w", err)
+	}
+
+	// M0143-0003b: table-level CHECK constraint persistence from the same
+	// pg_constraint HEAP (contype='c', conrelid<>0), written by
+	// writeCheckConstraintRow. Before this pass, catalog.Table.
+	// CheckConstraints/NamedChecks was rebuilt by nothing, so every CHECK
+	// constraint on every table silently stopped being ENFORCED — not merely
+	// hidden from pg_constraint — after any restart (copy.go/operators_fk.go/
+	// operators_storage.go all gate enforcement on len(CheckConstraints) > 0).
+	if err := loadCheckConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint CHECK reload: %w", err)
+	}
+
+	// M0143-0003d: named NOT NULL constraint metadata persistence from the
+	// same pg_constraint HEAP (contype='n', conrelid<>0), written by
+	// writeNotNullConstraintRow. Column.NotNull itself (actual attnotnull
+	// ENFORCEMENT) already reloads correctly via pg_attribute above — before
+	// this pass, only the pg_constraint 'n' rows (name, conislocal,
+	// coninhcount, connoinherit, convalidated) were rebuilt by nothing and so
+	// vanished from pg_constraint/pg_dump after every restart.
+	if err := loadNotNullConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint NOT NULL reload: %w", err)
+	}
+	// M0143-0003c: restore catalog.Index.IsConstraint (and Deferrable/
+	// InitiallyDeferred) for UNIQUE (non-PRIMARY-KEY) constraint-backed
+	// indexes from the pg_constraint HEAP written by writeUniqueConstraintRow.
+	// Before this, an ADD CONSTRAINT ... UNIQUE index was indistinguishable
+	// from a bare CREATE UNIQUE INDEX after a restart — both have
+	// indisunique=true, and only a pg_constraint row whose conindid points
+	// back at the index (real PG's own signal) tells them apart.
+	if err := loadUniqueConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint UNIQUE reload: %w", err)
+	}
+	// M0143-0003e: restore catalog.Index.IsExclusion (and ExclusionOp/
+	// Deferrable/InitiallyDeferred) for EXCLUDE-constraint-backed indexes from
+	// the pg_constraint HEAP written by writeExclusionConstraintRow. Same
+	// shape as the UNIQUE reload directly above — see
+	// loadExclusionConstraintsFromHeap's doc comment for why the flag being
+	// lost silently disabled runtime exclusion-check enforcement, not just
+	// pg_dump visibility.
+	if err := loadExclusionConstraintsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_constraint EXCLUDE reload: %w", err)
+	}
+
 	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
 	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
 	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)
@@ -1684,6 +1814,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_authid reload: %w", err)
+	}
+
+	// pg_database.datacl stores role OIDs while the virtual pg_database reader
+	// consults the name-keyed ACL registry. Reload it only after pg_authid has
+	// restored every role, or grants to a user role would rehydrate as dangling
+	// numeric grantees. M0122-0008a.
+	if err := reloadDatabaseACLsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_database datacl reload: %w", err)
 	}
 
 	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE
@@ -2229,11 +2370,31 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: enum heap reload: %w", err)
 		}
-		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog); err != nil {
+		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog, cat.DBOID(), cat.DBOID()); err != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: range type heap reload: %w", err)
+		}
+		// M0143-0002h: repeat the reload for each distinct-dbOid database's
+		// OWN pg_range/pg_type heap (base/<dbOid>/3541|1247, written by
+		// pgRangeRel's tableCatalogHeapDBOid routing), mirroring the
+		// loadSystemCatalogsIfPresentForDB loop above (open.go:1586). Runs
+		// here (after reloadDatabasesFromHeap populated cat.ListDatabases())
+		// rather than being folded into the main pass, since the main pass
+		// runs before that population on some call paths.
+		for _, dbName := range cat.ListDatabases() {
+			dbOid := cat.DatabaseOid(dbName)
+			if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+				dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+				continue
+			}
+			if err := reloadUserRangeTypesFromHeap(mgr, cat, clog, dbOid, dbOid); err != nil {
+				_ = pool.Close()
+				_ = walWriter.Close()
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: range type heap reload (db %q oid %d): %w", dbName, dbOid, err)
+			}
 		}
 	}
 
@@ -2274,16 +2435,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-
-		// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
-		// heap so installed extensions are visible after a restart.
-		if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
-			_ = pool.Close()
-			_ = walWriter.Close()
-			_ = mgr.Close()
-			return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
-		}
 		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
+	}
+
+	// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
+	// heap so installed extensions are visible after a restart. Per-database
+	// since M0119-0006bs (each registered database's base/<oid>/3079 is
+	// scanned); runs after reloadDatabasesFromHeap so the database registry
+	// is populated. NOTE: this call lived inside the collation error branch
+	// above until M0119-0006bs — extension reload never ran on the success
+	// path at all.
+	if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
 	}
 	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
@@ -2481,6 +2647,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: recovery signal: %w", err)
 	}
+
+	// A physical standby may flush replayed pages at a checkpoint boundary,
+	// but it must not append its own checkpoint records to the primary-owned
+	// WAL stream.  Its reconnect LSN is the received WAL tail, so a local
+	// marker would corrupt the stream position after a clean restart.
+	cp.SetRecoveryMode(standby)
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -2899,7 +3071,8 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 
 // loadSystemCatalogsIfPresent registers pg_type and pg_attribute as
 // real heap-backed catalog tables when their M0030-0001 relfiles are
-// present under <dataDir>/base/<DefaultDBOid>/.
+// present under <dataDir>/base/<DefaultDBOid>/, then repeats the same
+// registration for every OTHER already-existing database (M0143-0002e).
 //
 // On fresh clusters (after goopg init with Phase 1+2 changes), the
 // relfiles exist and contain seeded rows.  On old clusters that were
@@ -2910,8 +3083,35 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) 
 // OID-pre-set), so a SeqScan on these tables reads directly from the
 // heap relfile.  The rows are visible to all sessions because they
 // were written with xmin=BootstrapTransactionID (1).
+//
+// M0143-0002e added a per-database companion pass for pg_type/pg_attribute
+// (docs/design/0100-0149/m0143-0002d-per-database-type-catalog.md), mirroring
+// the identical fix already applied to indexes (loadUserIndexesFromHeap's
+// cat.ListDatabases() loop, M0127-P5.6-f-pre). That companion pass lives at
+// this function's call site in Open — NOT inside this function — because
+// cat.ListDatabases() is empty until reloadDatabasesFromHeap runs, which
+// happens well after this function's call site (M0143-0002f fixed an
+// ordering bug where the loop lived here and silently iterated zero
+// databases on every restart, confirmed live by
+// TestDatabaseDDLTypeCatalogReloadAcrossRestart). See the per-DB loop next to
+// the loadUserTablesFromHeapForDB one below reloadDatabasesFromHeap.
 func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
-	base := filepath.Join(dataDir, "base", fmt.Sprint(cat.DBOID()))
+	return loadSystemCatalogsIfPresentForDB(dataDir, cat, cat.DBOID(), catalog.DefaultDBOid)
+}
+
+// loadSystemCatalogsIfPresentForDB is loadSystemCatalogsIfPresent restricted
+// to ONE database, with the same two-OID split loadUserIndexesFromHeapForDB
+// uses: heapDBOid picks the base/<dbOid> directory the relfiles are read
+// from, nsDBOid the catalog namespace the Table is registered into. They
+// differ only on the main (DefaultDBOid) pass — see loadSystemCatalogsIfPresent.
+//
+// RegisterSystemCatalogsForDB (exported, called from CREATE DATABASE) is a
+// thin wrapper around this with heapDBOid == nsDBOid == dbOid, since a
+// freshly created database's scaffolding already copied its own
+// base/<dbOid>/1247|1249 files (copyBootstrapCatalogImage) — no reload
+// asymmetry to preserve there.
+func loadSystemCatalogsIfPresentForDB(dataDir string, cat *catalog.InMemory, heapDBOid, nsDBOid uint32) error {
+	base := filepath.Join(dataDir, "base", fmt.Sprint(heapDBOid))
 
 	// heapFilePresent returns true only when the file exists AND has at least
 	// one full block. The storage manager opens files with O_CREATE, so a
@@ -2931,8 +3131,8 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 			Columns: catalog.PGTypeColumns(),
 			OID:     catalog.TypeRelationId,
 		}
-		if err := cat.RegisterRealTable(t); err != nil {
-			return fmt.Errorf("register pg_type: %w", err)
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_type (db %d): %w", nsDBOid, err)
 		}
 	}
 
@@ -2945,12 +3145,25 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 			Columns: catalog.PGAttributeColumns(),
 			OID:     catalog.AttributeRelationId,
 		}
-		if err := cat.RegisterRealTable(t); err != nil {
-			return fmt.Errorf("register pg_attribute: %w", err)
+		if err := cat.RegisterRealTable(t, nsDBOid); err != nil {
+			return fmt.Errorf("register pg_attribute (db %d): %w", nsDBOid, err)
 		}
 	}
 
 	return nil
+}
+
+// RegisterSystemCatalogsForDB registers pg_type/pg_attribute into a single
+// newly created database's own catalog namespace (M0143-0002e step 3,
+// CREATE DATABASE time). Exported for internal/postmaster's
+// tryHandleDatabaseDDL, called right after createDatabasePhysicalDirectory
+// provisions the new database's scaffolding (which already copies its own
+// base/<dbOid>/1247|1249 from template0 — copyBootstrapCatalogImage — so this
+// call is registration-only, no new heap write). A missing relfile (e.g. the
+// three built-in databases, which skip scaffolding) is a silent no-op, same
+// as the startup reload path.
+func RegisterSystemCatalogsForDB(dataDir string, cat *catalog.InMemory, dbOid uint32) error {
+	return loadSystemCatalogsIfPresentForDB(dataDir, cat, dbOid, dbOid)
 }
 
 // appendCatalogRows appends HeapTuples to the last page of a relfile,
@@ -3133,7 +3346,11 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	var userTableRows []recoveredPGClassRow
 	for _, r := range classRows {
 		rec := r.(recoveredPGClassRow)
-		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S") && rec.row.OID >= catalog.FirstUserOID {
+		// 'f' (foreign table) joined this set in M0122-0015: its pg_class row
+		// was previously skipped outright, so a foreign table vanished from the
+		// catalog across a restart. reloadForeignTablesFromHeap re-attaches the
+		// server name and options afterwards, from pg_foreign_table.
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S" || rec.row.RelKind == "f") && rec.row.OID >= catalog.FirstUserOID {
 			userTableRows = append(userTableRows, rec)
 		}
 	}
@@ -3611,10 +3828,11 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: catalogRowLive is the single source of truth for
+			// xmax/xmin liveness (an inline "any non-zero xmax = dead" copy
+			// here had the same bug scanCatalogHeapRows's own pre-filter did
+			// — see catalog_heap_reload.go).
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGClassPhysicalRow(ht.Data)
@@ -3687,10 +3905,8 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: see the pg_class scan above — same fix.
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data, ht.Bitmap)
@@ -3910,10 +4126,8 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
+			// P0-E5/B0.2: see the pg_class scan above — same fix.
+			if !catalogRowLive(clog, ht, false) {
 				continue
 			}
 			row, err := catalog.DecodePGStatisticPhysicalRow(ht.Data, ht.Bitmap)

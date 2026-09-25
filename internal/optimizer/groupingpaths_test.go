@@ -10,6 +10,7 @@ package optimizer
 // up. Migrated rule-shape tests live on in their own files, unchanged.
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -70,15 +71,18 @@ func TestCostAggSortedHashedShareTotalCpu(t *testing.T) {
 	}
 }
 
-// TestCostAggHashedNeverChargesSpill pins the executor-faithful omission:
-// `aggregateOp` performs grouped aggregation IN MEMORY with no spill path,
-// so even a group count overflowing memory prices exactly the in-memory
-// terms — trans + grouping comparisons on startup over the input total,
-// final + emit per group on total. A spill charge here would be I/O that
-// never happens; measured, it flipped Q3/Q10/Q13/Q18 to sorted (Q13
-// 5.67 s → 8.71 s), all four away from PG's hash. Resume WITH executor
-// spill support (cost_funcs.go names the terms).
-func TestCostAggHashedNeverChargesSpill(t *testing.T) {
+// TestCostAggHashedFixedWidthChargesSpill pins M0141-S2a-fix2r's reinstated
+// "Arm C": a FIXED-width aggregate input (avgVarBytes == 0, ncols known and
+// > 0) has a real 48*ncols+24 footprint in PG's currency
+// (`hashsize.EntryBytes`), so a group count overflowing memory now prices a
+// real spill charge even though the payload-only figure alone is zero.
+// `aggregateOp` still aggregates in memory with no spill path — the charge
+// prices "this hash table does not fit", not goopg I/O that happens (see the
+// arm's own comment in cost_funcs.go). Formerly this fixture priced no spill
+// at all (`TestCostAggHashedNeverChargesSpill`, pre-fix2r); the sibling
+// `TestCostAggHashedUnknownWidthNeverChargesSpill` below pins the opt-out
+// that survives for callers with neither ncols nor payload.
+func TestCostAggHashedFixedWidthChargesSpill(t *testing.T) {
 	cp := defaultCostParams()
 	const ncols = 16
 	// Group footprint 4x over budget: WOULD spill if the arm existed.
@@ -90,6 +94,31 @@ func TestCostAggHashedNeverChargesSpill(t *testing.T) {
 	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, ncols, groups, 1, ncols, 0)
 	trans := cp.cpuOperatorCost * rows
 	cmp := cp.cpuOperatorCost * ncols * rows
+	fin := cp.cpuOperatorCost * groups
+	emit := cp.cpuTupleCost * groups
+	inMemoryStartup := 500 + trans + cmp
+	inMemoryTotal := inMemoryStartup + fin + emit
+	if !(got.Startup > inMemoryStartup) {
+		t.Fatalf("startup = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Startup, inMemoryStartup)
+	}
+	if !(got.Total > inMemoryTotal) {
+		t.Fatalf("total = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Total, inMemoryTotal)
+	}
+}
+
+// TestCostAggHashedUnknownWidthNeverChargesSpill pins the ONE surviving
+// opt-out from M0141-S2a-fix2r's guard widening: with NEITHER a column count
+// nor a payload estimate (`addDistinctPaths`'s call shape — DISTINCT has no
+// per-column width wired to this call), there is no PG-faithful width to
+// substitute, so the arm must decline exactly as before, however far the
+// group count overflows memory.
+func TestCostAggHashedUnknownWidthNeverChargesSpill(t *testing.T) {
+	cp := defaultCostParams()
+	const groups = 200_000_000.0 // vastly overflows any work_mem, if the arm looked.
+	rows := groups * 10
+	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, 1, groups, 1, 0, 0)
+	trans := cp.cpuOperatorCost * rows
+	cmp := cp.cpuOperatorCost * 1 * rows
 	fin := cp.cpuOperatorCost * groups
 	emit := cp.cpuTupleCost * groups
 	if want := 500 + trans + cmp; !approx(got.Startup, want) {
@@ -125,17 +154,17 @@ func groupingTestSeed(t *testing.T, agg *Aggregate) (*RelOptInfo, *Path) {
 	return grouped, seed
 }
 
-// TestAddGroupingPathsSingleCandidatePerShape pins the §5 negative: one
-// hashed + one sorted candidate, never two of a kind, on a plain grouped
-// aggregate with the GUC on.
+// TestAddGroupingPathsSingleCandidatePerShape pins the §5 negative: never two
+// candidates of a kind, on a plain grouped aggregate with the GUC on. Under
+// PG's COSTS_EQUAL semantics (M0141-S2b-13) a fuzzily-tied hashed candidate
+// is REJECTED at the grouped rel — the keyful sorted path dominates the
+// keyless one (pathnode.c:532-540) — so the surviving set is the single
+// sorted candidate, not one of each. The per-kind invariant still holds.
 func TestAddGroupingPathsSingleCandidatePerShape(t *testing.T) {
 	cp := defaultCostParams()
 	agg := groupingTestAgg(upperOrderedInput(1000))
 	grouped, seed := groupingTestSeed(t, agg)
 	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, DefaultPlannerSettings())
-	if len(grouped.Pathlist) != 2 {
-		t.Fatalf("pathlist holds %d paths, want exactly 2 (one hashed, one sorted)", len(grouped.Pathlist))
-	}
 	seen := map[AggStrategy]int{}
 	for _, p := range grouped.Pathlist {
 		if p.Kind != PathAgg {
@@ -143,8 +172,13 @@ func TestAddGroupingPathsSingleCandidatePerShape(t *testing.T) {
 		}
 		seen[p.AggStrategy]++
 	}
-	if seen[AggStrategyHashed] != 1 || seen[AggStrategySorted] != 1 {
-		t.Fatalf("strategies %v, want exactly one hashed and one sorted", seen)
+	if seen[AggStrategyHashed] > 1 || seen[AggStrategySorted] > 1 {
+		t.Fatalf("duplicate candidate of a kind: %v", seen)
+	}
+	// The fixture's pair is fuzzily tied: PG's pathkeys dominance rejects
+	// the keyless hashed candidate, leaving the sorted one.
+	if len(grouped.Pathlist) != 1 || seen[AggStrategySorted] != 1 {
+		t.Fatalf("pathlist = %d paths %v; want the lone sorted candidate (PG rejects tied hashed)", len(grouped.Pathlist), seen)
 	}
 }
 
@@ -198,6 +232,24 @@ func TestCreateGroupingPathsGucOnPkFdStaysHash(t *testing.T) {
 	}
 	if _, ok := a.Child.(*Sort); ok {
 		t.Fatalf("GUC-on PK-prefix gained a Sort child: the index variant stole a hash plan")
+	}
+}
+
+// TestIndexOrderedGroupingPricedFromSearchRelJointree pins M0145-0030 fix 2
+// on the jointree arm, whose one-rel search prices the base rel's seq path
+// at 1.01 and its full ordered index path at 16.14. The index-driven sorted
+// variant used to be priced from its rule-era display cost (0.01) and
+// out-bid the hash; priced from the search rel's own index path, hashed
+// wins, as PG 18.3 elects HashAggregate over Seq Scan on this shape.
+func TestIndexOrderedGroupingPricedFromSearchRelJointree(t *testing.T) {
+	cat, _, _ := btgIndexOrderCatalog(t)
+	stmt := parseOne(t, "select count(*) from btg group by y, x")
+	node, err := PlanWithSettings(stmt, cat, hashAggSettings(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := indexOrderAggPlan(t, node); a.Strategy != AggStrategyHashed {
+		t.Fatalf("Strategy = %d, want AggStrategyHashed (the index variant must be priced from the search rel's index path)", a.Strategy)
 	}
 }
 
@@ -255,6 +307,60 @@ func TestGroupingPathsC10cReassert(t *testing.T) {
 	}
 	if _, planted := nj.Right.(*Filter); planted {
 		t.Errorf("a Filter reached the NULLABLE input for a preserved-side qual")
+	}
+}
+
+// hashedProducerTotal runs createGroupingPaths over agg and returns the
+// hashed arm's traced total — the priced input the candidate was costed
+// against, read off the provenance channel rather than the plan (the plan
+// carries no cost stamp).
+func hashedProducerTotal(t *testing.T, agg *Aggregate) float64 {
+	t.Helper()
+	var total float64
+	found := false
+	lines := captureTrace(t, func() {
+		if _, err := createGroupingPaths(nil, agg, nil, DefaultPlannerSettings(), 0); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, l := range lines {
+		if !strings.Contains(l, "producer="+groupAggHashedProducer) {
+			continue
+		}
+		for _, kv := range strings.Fields(l) {
+			if v, ok := strings.CutPrefix(kv, "total="); ok {
+				fmt.Sscanf(v, "%f", &total)
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no %s line: the hashed arm was never offered", groupAggHashedProducer)
+	}
+	return total
+}
+
+// TestCreateGroupingPathsSizesSeedFromSearchRel pins the R54 re-land's
+// direction (REDESIGN.md rev 2 §1(i)): over a row-preserved searched child
+// the seed prices search-rel rows, and over the identical unmarked child it
+// prices the legacy estimate — so the searched hashed total is strictly
+// greater. Ordering, not exactness: the assertion is the existence-before-
+// verdict direction (the fail-closed assignment fires), never a figure that
+// would calcify today's cost constants into the test.
+func TestCreateGroupingPathsSizesSeedFromSearchRel(t *testing.T) {
+	rel := fetchUpperRel(newUpperRels(), UpperGroupAgg, 0, 0)
+	rel.Rows = 1834
+
+	scan := &SeqScan{schema: cpjSchema("a", 2)}
+	markSearchedTree(scan)
+	scan.setSearchRel(rel)
+	searched := hashedProducerTotal(t, groupingTestAgg(&Sort{Child: &Project{Child: scan}}))
+
+	legacy := hashedProducerTotal(t, groupingTestAgg(
+		&Sort{Child: &Project{Child: &SeqScan{schema: cpjSchema("a", 2)}}}))
+
+	if !(searched > legacy) {
+		t.Fatalf("searched hashed total %v not above legacy %v: the seed is not sized from the search rel", searched, legacy)
 	}
 }
 

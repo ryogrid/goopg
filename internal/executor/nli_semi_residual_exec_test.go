@@ -75,6 +75,31 @@ func newNLIResidualFixture(t *testing.T) (*Context, func()) {
 	return ctx, cleanup
 }
 
+// newNLIResidualFixtureLargeInner is newNLIResidualFixture plus 100,000
+// inner rows whose keys (>= 101) match no outer row, with stats to match.
+// The index probe must earn its election the way it does in PG: on the
+// 4-row inner PG 18.3 elects Hash Semi/Anti Join (and, with hash and merge
+// off, a Materialize'd full scan), never the parameterised probe. With this
+// inner PG elects `Nested Loop Semi Join` over `Index Scan using
+// line_key_idx` (Index Cond + Filter). For NOT EXISTS PG elects Merge
+// Right Anti Join, which goopg does not have (no JOIN_RIGHT_ANTI — ledgered
+// under M0145-0030); goopg's `Nested Loop Anti Join` of the same shape is
+// PG's choice under enable_mergejoin = off. The extra rows change no answer.
+func newNLIResidualFixtureLargeInner(t *testing.T) (*Context, func()) {
+	t.Helper()
+	ctx, cleanup := newNLIResidualFixture(t)
+	if err := runDDL(t, ctx, "INSERT INTO line SELECT 100 + g, g % 7, g % 11 FROM generate_series(1, 100000) g"); err != nil {
+		cleanup()
+		t.Fatalf("large-inner fixture: %v", err)
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "line"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 100005, Columns: []catalog.ColumnStats{
+			{NDistinct: 100003}, {NDistinct: 8}, {NDistinct: 12},
+		}}
+	}
+	return ctx, cleanup
+}
+
 func nliResidualRows(t *testing.T, ctx *Context, sql string) []string {
 	t.Helper()
 	rows, err := runQueryWithErr(ctx, sql)
@@ -105,13 +130,23 @@ func nliResidualExplain(t *testing.T, ctx *Context, sql string) string {
 func TestNLISemiResidualExecution(t *testing.T) {
 	optimizer.SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-	ctx, cleanup := newNLIResidualFixture(t)
+	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
 	if !strings.Contains(plan, "Nested Loop Semi Join") {
 		t.Fatalf("expected the NLI semi path to serve this query; plan:\n%s", plan)
+	}
+	// R48 Half 2: the inner-only residual lives on the probe as
+	// IndexScan.Cond, rendering as the inner scan's Filter: — exactly
+	// one Filter: line, no join-level line (that shape would double
+	// the evaluation, once per row plus once per pair).
+	if !strings.Contains(plan, "Filter: (l_c < l_r)") {
+		t.Fatalf("expected the probe Cond to render as the inner Filter:; plan:\n%s", plan)
+	}
+	if got := strings.Count(plan, "Filter:"); got != 1 {
+		t.Fatalf("expected exactly one Filter: line (the probe's), got %d; plan:\n%s", got, plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
 	want := []string{"1", "3"}
@@ -123,13 +158,20 @@ func TestNLISemiResidualExecution(t *testing.T) {
 func TestNLIAntiResidualExecution(t *testing.T) {
 	optimizer.SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-	ctx, cleanup := newNLIResidualFixture(t)
+	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE NOT EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
 	if !strings.Contains(plan, "Nested Loop Anti Join") {
 		t.Fatalf("expected the NLI anti path to serve this query; plan:\n%s", plan)
+	}
+	// R48 Half 2: same placement pin as the semi test above.
+	if !strings.Contains(plan, "Filter: (l_c < l_r)") {
+		t.Fatalf("expected the probe Cond to render as the inner Filter:; plan:\n%s", plan)
+	}
+	if got := strings.Count(plan, "Filter:"); got != 1 {
+		t.Fatalf("expected exactly one Filter: line (the probe's), got %d; plan:\n%s", got, plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
 	// o_key=2: inner rows exist but none passes (9<3 false, NULL<5

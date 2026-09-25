@@ -106,7 +106,7 @@ func memoInnerRel(relids RelSet, param RelSet, probeCost float64) (*RelOptInfo, 
 func TestMemoizeWithoutStatisticsIsStrictlyMoreExpensive(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, true, 4, 1)
+	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, true, 4, 1, 8, 0)
 	if rescan.Total <= inner.Total {
 		t.Fatalf("rescan total %.4f <= probe total %.4f; a defaulted ndistinct must never buy a discount",
 			rescan.Total, inner.Total)
@@ -124,7 +124,7 @@ func TestMemoizeWithoutStatisticsIsStrictlyMoreExpensive(t *testing.T) {
 func TestMemoizeWithStatisticsPricesTheHitRatio(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, false, 4, 1)
+	rescan, est := costMemoizeRescan(cp, inner, 1, 10000, 200, false, 4, 1, 8, 0)
 	if rescan.Total >= inner.Total {
 		t.Fatalf("rescan total %.4f >= probe total %.4f; a 98%% hit ratio must be cheaper than probing",
 			rescan.Total, inner.Total)
@@ -142,7 +142,7 @@ func TestMemoizeWithStatisticsPricesTheHitRatio(t *testing.T) {
 func TestMemoizeNDistinctClampedToCalls(t *testing.T) {
 	cp := defaultCostParams()
 	inner := Cost{Startup: 1, Total: 100}
-	rescan, _ := costMemoizeRescan(cp, inner, 1, 100, 1_000_000, false, 4, 1)
+	rescan, _ := costMemoizeRescan(cp, inner, 1, 100, 1_000_000, false, 4, 1, 8, 0)
 	if rescan.Total < inner.Total {
 		t.Fatalf("rescan total %.4f < probe total %.4f; an unclamped ndistinct produced a negative hit ratio",
 			rescan.Total, inner.Total)
@@ -150,6 +150,36 @@ func TestMemoizeNDistinctClampedToCalls(t *testing.T) {
 	if rescan.Startup < 0 || rescan.Total < 0 {
 		t.Fatalf("negative rescan cost %+v", rescan)
 	}
+}
+
+// TestMemoizeKeyWidthsUsesAnalyzedStatThenTypeWidth pins M0139-0007c:
+// `memoizeKeyWidths` (`get_expr_width`, costsize.c:6404, summed over
+// `param_exprs`) must try the outer column's ANALYZEd average width first —
+// the same `stats.AvgWidth` `memoizeKeyNDistinct` reads for ndistinct — and
+// fall back to the type's average width (`typeWidth`) only when there is no
+// statistic, exactly PG's own `attr_widths`-then-`get_typavgwidth` order.
+func TestMemoizeKeyWidthsUsesAnalyzedStatThenTypeWidth(t *testing.T) {
+	outerRelids, innerRelids := relsetOf(0), relsetOf(1)
+
+	t.Run("analyzed column uses stawidth", func(t *testing.T) {
+		s := memoTestCtx(t, 10000, 0.02, true)
+		s.relInfos[0].table.Stats.Columns[0].AvgWidth = 37
+		inner, _ := memoInnerRel(innerRelids, outerRelids, 1)
+		ip := inner.CheapestParameterized[1]
+		if got := memoizeKeyWidths(s, ip, outerRelids); got != 37 {
+			t.Fatalf("memoizeKeyWidths = %v, want 37 (the ANALYZEd stawidth)", got)
+		}
+	})
+
+	t.Run("un-analyzed column falls back to typeWidth", func(t *testing.T) {
+		s := memoTestCtx(t, 10000, 0.02, false)
+		inner, _ := memoInnerRel(innerRelids, outerRelids, 1)
+		ip := inner.CheapestParameterized[1]
+		want := float64(typeWidth(catalog.Type{Name: "int4"}))
+		if got := memoizeKeyWidths(s, ip, outerRelids); got != want {
+			t.Fatalf("memoizeKeyWidths = %v, want %v (get_typavgwidth fallback)", got, want)
+		}
+	})
 }
 
 // TestGetMemoizePathGates walks PG's eligibility gauntlet, one refusal per
@@ -245,7 +275,7 @@ func TestNLIArmOffersBothCandidates(t *testing.T) {
 	outer := scanRel(outerRelids, 10000, estScanPages(10000, 32))
 	inner, _ := memoInnerRel(innerRelids, outerRelids, indexProbeCost(cp))
 	joinrel := newRelOptInfo(outerRelids|innerRelids, 10000, 64)
-	addNLIPaths(s, joinrel, outer, inner, cp, parser.JoinInner, nil, 0)
+	addNLIPaths(s, joinrel, outer, inner, cp, parser.JoinInner, nil, 0, uniqueSideNone, nil, semiAntiJoinFactors{})
 
 	if len(joinrel.Pathlist) != 1 {
 		t.Fatalf("got %d paths, want 1 survivor of the two candidates", len(joinrel.Pathlist))
@@ -260,7 +290,7 @@ func TestNLIArmOffersBothCandidates(t *testing.T) {
 	sBlind := memoTestCtx(t, 10000, 0, false)
 	blindRel := newRelOptInfo(outerRelids|innerRelids, 10000, 64)
 	blindInner, _ := memoInnerRel(innerRelids, outerRelids, indexProbeCost(cp))
-	addNLIPaths(sBlind, blindRel, outer, blindInner, cp, parser.JoinInner, nil, 0)
+	addNLIPaths(sBlind, blindRel, outer, blindInner, cp, parser.JoinInner, nil, 0, uniqueSideNone, nil, semiAntiJoinFactors{})
 	if len(blindRel.Pathlist) != 1 {
 		t.Fatalf("got %d paths, want 1", len(blindRel.Pathlist))
 	}

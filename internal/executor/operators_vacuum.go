@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/commands/vacuum"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -254,53 +255,84 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		if tbl.Temp {
 			relOpts.Horizon = o.ctx.TxnMgr.OldestXminForProc(int32(o.ctx.Tx.Handle) - 1)
 		}
-		stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, relOpts)
-		if err == nil {
-			// Publish reltuples / relpages to pg_class (vac_update_relstats).
-			// reltuples is the count of tuples visible to a FRESH snapshot — the
-			// "currently live" definition upstream uses — NOT the prune's
-			// surviving-line-pointer count: a recently-dead tuple (deleted and
-			// committed, but not yet removable because a concurrent backend holds
-			// OldestXmin back) survives the prune yet must be excluded from
-			// reltuples, exactly as the vacuum-no-cleanup-lock spec requires.
-			// Preserves any per-column pg_statistic from a prior ANALYZE.
-			// M0118-0008 (vacuum-no-cleanup-lock).
-			if as, aerr := vacuum.Analyze(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.MultiXact); aerr == nil {
-				o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
-				// take2 P1-03: and PERSIST it. UpdateRelStats writes memory
-				// only, so before this an autovacuum-maintained cluster planned
-				// from stale sizes after every restart and only an explicit SQL
-				// ANALYZE ever reached disk. Upstream has no such split —
-				// vac_update_relstats writes pg_class for both paths.
-				//
-				// Non-fatal: a failed size write must not fail the VACUUM,
-				// which has already done its real work. The same convention
-				// persistStatsToPGStatistic uses for a column it cannot fit.
-				_ = persistRelSize(o.ctx, tbl, int64(as.Rows), as.Pages)
+		// One VACUUM per relation from the first heap pass through the second
+		// (PG holds ShareUpdateExclusiveLock for the whole run; goopg's lock
+		// above is only waited for). SKIP_LOCKED skips a relation another
+		// VACUUM or autovacuum is processing.
+		var releaseVacuum func()
+		if vs.SkipLocked {
+			var ok bool
+			if releaseVacuum, ok = vacuum.TryLockRelationForVacuum(rel); !ok {
+				if vt.explicit {
+					o.ctx.AddWarning(fmt.Sprintf("skipping vacuum of %q --- lock not available", tbl.Name))
+				}
+				continue
 			}
+		} else {
+			releaseVacuum = vacuum.LockRelationForVacuum(rel)
 		}
-		if err == nil {
-			// Successful VACUUM resets n_dead_tup / n_ins_since_vacuum
-			// (pgstat_relation_vacuum_rel). OID 0 (not yet nailed) skips.
-			relStats.resetVacuumTriggers(tbl.OID)
-		}
-		// relfrozenxid skip-guard (vacuumlazy.c skippedallvis): a
-		// non-aggressive pass that SKIPPED all-visible-but-not-all-frozen
-		// pages cannot know their oldest unfrozen xmin and must not advance.
-		guardedSkip := !relOpts.Aggressive && stats.SkippedAllVisible > 0
-		if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID != 0 {
-			// Advance relfrozenxid to the lowest unfrozen xmin found.
-			tbl.RelFrozenXID = stats.NewFrozenXID
-		} else if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID == 0 && stats.Frozen > 0 {
-			// All tuples frozen — relfrozenxid advances to freezeBelow.
-			tbl.RelFrozenXID = freezeBelow
-		}
+		// The deferred release keeps a panic in either pass from leaving the
+		// relation's VACUUM gate held.
+		func() {
+			defer releaseVacuum()
+			stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, relOpts)
+			if err == nil {
+				// Publish reltuples / relpages to pg_class (vac_update_relstats).
+				// reltuples is the count of tuples visible to a FRESH snapshot — the
+				// "currently live" definition upstream uses — NOT the prune's
+				// surviving-line-pointer count: a recently-dead tuple (deleted and
+				// committed, but not yet removable because a concurrent backend holds
+				// OldestXmin back) survives the prune yet must be excluded from
+				// reltuples, exactly as the vacuum-no-cleanup-lock spec requires.
+				// Preserves any per-column pg_statistic from a prior ANALYZE.
+				// M0118-0008 (vacuum-no-cleanup-lock).
+				if as, aerr := vacuum.Analyze(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.MultiXact); aerr == nil {
+					o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
+					// take2 P1-03: and PERSIST it. UpdateRelStats writes memory
+					// only, so before this an autovacuum-maintained cluster planned
+					// from stale sizes after every restart and only an explicit SQL
+					// ANALYZE ever reached disk. Upstream has no such split —
+					// vac_update_relstats writes pg_class for both paths.
+					//
+					// Non-fatal: a failed size write must not fail the VACUUM,
+					// which has already done its real work. The same convention
+					// persistStatsToPGStatistic uses for a column it cannot fit.
+					_ = persistRelSize(o.ctx, tbl, int64(as.Rows), as.Pages)
+				}
+			}
+			if err == nil {
+				// Successful VACUUM resets n_dead_tup / n_ins_since_vacuum
+				// (pgstat_relation_vacuum_rel). OID 0 (not yet nailed) skips.
+				relStats.resetVacuumTriggers(tbl.OID)
+				// The shared stats entry gets the same report (pgstat_report_vacuum):
+				// live/dead overwritten with the pass's measured values,
+				// ins_since_vacuum zeroed, vacuum_count++. A successful reclaim
+				// pass leaves ~0 dead tuples behind.
+				relStats.reportVacuum(tbl.OID, int64(stats.Live), 0)
+			}
+			// relfrozenxid skip-guard (vacuumlazy.c skippedallvis): a
+			// non-aggressive pass that SKIPPED all-visible-but-not-all-frozen
+			// pages cannot know their oldest unfrozen xmin and must not advance.
+			guardedSkip := stats.RelfrozenxidGuarded(relOpts.Aggressive)
+			if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID != 0 {
+				// Advance relfrozenxid to the lowest unfrozen xmin found.
+				tbl.RelFrozenXID = stats.NewFrozenXID
+			} else if err == nil && freezeBelow > 0 && !guardedSkip && stats.NewFrozenXID == 0 && stats.Frozen > 0 {
+				// All tuples frozen — relfrozenxid advances to freezeBelow.
+				tbl.RelFrozenXID = freezeBelow
+			}
 
-		// Index vacuum (M0047-0002): remove stale B-tree entries pointing
-		// to dead heap tuples and delete any empty leaf pages.
-		if err == nil && len(stats.DeadTIDs) > 0 && o.ctx.Pool != nil {
-			vacuumIndexes(o.ctx, tbl, stats.DeadTIDs)
-		}
+			// Index vacuum (M0047-0002): remove stale B-tree entries pointing
+			// to dead heap tuples and delete any empty leaf pages. Then, only if
+			// every index is now free of those entries, the second heap pass
+			// turns the LP_DEAD items LP_UNUSED (lazy_vacuum_heap_rel,
+			// M0145-0008v).
+			if err == nil && len(stats.DeadTIDs) > 0 && o.ctx.Pool != nil {
+				if vacuumIndexes(o.ctx, tbl, stats.DeadTIDs) {
+					_, _ = vacuum.VacuumDeadItems(o.ctx.Pool, rel, stats.DeadTIDs)
+				}
+			}
+		}()
 
 		// If we vacuumed a nailed catalog relation (pg_class, pg_attribute,
 		// pg_proc, or pg_type), signal that the relcache init files need
@@ -531,19 +563,62 @@ func relationStillExists(ctx *Context, tbl *catalog.Table) bool {
 // vacuumIndexes removes stale B-tree index entries that point to dead heap
 // tuples collected during the heap vacuum pass. Empty index leaf pages are
 // deleted and the tree is compacted if fully empty (M0047-0002).
-func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) {
+//
+// It reports whether EVERY index of tbl is now free of entries for deadTIDs,
+// which is the precondition for the second heap pass: an LP_UNUSED item may
+// be reused, so no index may still point at it. A non-btree index (goopg's
+// index vacuum covers btree only), an index that cannot be opened, or a
+// failed page vacuum answers false, and the LP_DEAD items stay dead.
+func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) bool {
+	return vacuumIndexesImpl(ctx, tbl, deadTIDs)
+}
+
+// VacuumRelationIndexes is vacuumIndexes for a caller without a session
+// (autovacuum, M0145-0008v): it builds the context the btree open needs from
+// the pool, transaction manager and catalog. The index list must come from the
+// catalog namespace that actually holds tbl: an empty list reads as "every
+// index clean" and would let the second heap pass free items that indexes
+// still reference. So the namespace is found by tbl's OID and confirmed by
+// identity; if it cannot be, the answer is false and the LP_DEAD items stay.
+func VacuumRelationIndexes(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table, deadTIDs []storage.ItemPointer) bool {
+	im, ok := cat.(*catalog.InMemory)
+	if !ok || tbl == nil {
+		return false
+	}
+	found, nsOid, ok := im.LookupTableByOIDAllDBs(tbl.OID)
+	if !ok || found != tbl {
+		return false
+	}
+	ctx := &Context{Pool: pool, TxnMgr: mgr, Catalog: cat, CurrentDatabaseOid: nsOid}
+	if len(im.IndexesOnTable(tbl, catalog.NamespaceDBOid(nsOid))) != len(im.IndexesOnTable(tbl, nsOid)) {
+		return false
+	}
+	return vacuumIndexesImpl(ctx, tbl, deadTIDs)
+}
+
+func vacuumIndexesImpl(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) bool {
+	// System catalogs and TOAST relations can carry on-disk indexes that the
+	// catalog's IndexesOnTable does not list (the PG-format catalog indexes
+	// goopg writes for a PG reader), and an unlisted index reads as clean.
+	// Their LP_DEAD items therefore never become reusable (M0145-0008v).
+	clean := tbl != nil && tbl.OID >= firstNormalObjectOID && tbl.Schema != "pg_toast"
 	indexes := ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		if idx.Method != "btree" {
+			clean = false
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
+			clean = false
 			continue // index may not exist yet (e.g. freshly created)
 		}
-		_, _ = tree.VacuumIndexPages(deadTIDs)
+		if _, err := tree.VacuumIndexPages(deadTIDs); err != nil {
+			clean = false
+		}
 	}
+	return clean
 }
 
 // isNailedCatalogOID returns true if oid is one of the four nailed local

@@ -223,8 +223,16 @@ func TestCheckpointerDoDWritePacing(t *testing.T) {
 	if !pf2.flushAllCalled {
 		t.Error("IMMEDIATE checkpoint did not take FlushAll fallback path")
 	}
-	if immediateElapsed > 20*time.Millisecond {
-		t.Errorf("IMMEDIATE checkpoint took %v; want < 20ms (no pacing)", immediateElapsed)
+	// The old absolute bound (want < 20ms) flaked under gate concurrency
+	// (24ms on a loaded host, 2026-09-19): pacing delay can only enter via
+	// the pacer callback, which buildPacer does not even build for
+	// spread=false — so the empty pf2.progresses + flushAllCalled checks
+	// above already prove the bypass deterministically. Keep a load-robust
+	// relative bound instead of an absolute one: the immediate run must beat
+	// the paced run just measured, which always carries ~90ms of pacing
+	// sleeps on top of identical flush work.
+	if immediateElapsed >= elapsed {
+		t.Errorf("IMMEDIATE checkpoint took %v; want < the paced run's %v (no pacing)", immediateElapsed, elapsed)
 	}
 }
 
@@ -801,6 +809,35 @@ func TestCheckpointerShutdownSetsDBShutdowned(t *testing.T) {
 	if state := readState(t, dir2); state != 6 {
 		t.Errorf("online checkpoint state: got %d want %d (DB_IN_PRODUCTION)",
 			state, 6)
+	}
+}
+
+// TestCheckpointerRecoveryModeDoesNotAdvanceWAL pins the physical-standby
+// boundary: a clean standby shutdown may flush replayed pages, but its local
+// checkpointer must not append a checkpoint into the primary-owned WAL stream.
+// Otherwise the next walreceiver reconnect asks the primary to resume after a
+// byte that exists only on the standby.
+func TestCheckpointerRecoveryModeDoesNotAdvanceWAL(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if _, end, err := w.Append([]byte("received-primary-record")); err != nil {
+		t.Fatal(err)
+	} else if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	before := w.WrittenLSN()
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{})
+	cp.SetRecoveryMode(true)
+	if err := cp.CheckpointShutdown(); err != nil {
+		t.Fatalf("CheckpointShutdown in recovery mode: %v", err)
+	}
+	if got := w.WrittenLSN(); got != before {
+		t.Fatalf("recovery checkpoint advanced WAL from %d to %d", before, got)
 	}
 }
 

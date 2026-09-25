@@ -103,15 +103,24 @@ func memoizeEntryOverheadBytes(tuples float64) float64 {
 
 // costMemoizeRescan is `cost_memoize_rescan` (costsize.c:2541), transcribed.
 //
-// Three substitutions, each because goopg does not have the input PG reads:
+// Two substitutions, each because goopg does not have the input PG reads,
+// plus one now-ported term (M0139-0007c):
 //
 //   - `relation_byte_size(tuples, width)` needs a per-column average width,
 //     which goopg has no statistic for (ledger 2026-08-03 M0127-P3.1). The
 //     substitute is `hashsize.EntryBytes(ncols, 0)` — the SAME function the hash
 //     join's sizing goes through, so a cached row and a hashed row are measured
 //     by one ruler and not two.
-//   - `get_expr_width` per cache key, likewise: the keys are counted as columns
-//     through the same function.
+//   - `get_expr_width` per cache key (`keyWidth`, `memoizeKeyWidths` below) IS
+//     now ported when the PG-faithful currency is enabled and
+//     `pgRelationByteSize` itself succeeds: every cache key here is a bare
+//     `*ColumnRef` (`memoizeCacheKeys`'s only admitted shape), so `get_expr_width`
+//     reduces to the same ANALYZEd-width-or-typeWidth lookup every other width
+//     consumer in this package already shares. When the currency is off, or the
+//     PG byte-size substitution itself declined, the per-key term stays
+//     `hashsize.EntryBytes(nkeys, 0)` — the goopg-native ruler paired with the
+//     goopg-native tuple-bytes term it sits beside, so neither term switches
+//     currency without the other.
 //   - `estimate_num_groups` over the param exprs is replaced by the caller's
 //     ndistinct, clamped to `calls`. The clamp is not a simplification: PG's
 //     `estimate_num_groups` clamps its answer to `input_rows` too
@@ -122,7 +131,7 @@ func memoizeEntryOverheadBytes(tuples float64) float64 {
 // `isDefaultND` is PG's `SELFLAG_USED_DEFAULT` (:2592): a guessed ndistinct is
 // replaced by `calls`, which drives the hit ratio to zero and makes the wrapped
 // path strictly more expensive than the one it wraps.
-func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float64, isDefaultND bool, ncols, nkeys int) (Cost, int64) {
+func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float64, isDefaultND bool, ncols, nkeys, width int, keyWidth float64) (Cost, int64) {
 	if calls < 1 {
 		calls = 1
 	}
@@ -130,9 +139,34 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 		tuples = 0
 	}
 
-	estEntryBytes := hashsize.EntryBytes(ncols, 0)*tuples +
-		memoizeEntryOverheadBytes(tuples) +
-		hashsize.EntryBytes(nkeys, 0)
+	// R108/R113-shaped absorption arm (M0139-0007b): PG prices the cached
+	// tuple bytes with `relation_byte_size(tuples, width)` +
+	// `ExecEstimateCacheEntryOverheadBytes(tuples)` (costsize.c:2565-2566),
+	// where `width` is the PG-equivalent pathtarget width, not goopg's
+	// Datum/kvcache entry size. Off by default like its two siblings.
+	//
+	// The per-key term (M0139-0007c) now tracks the SAME currency choice as
+	// the tuple-bytes term beside it: `keyWidth` (the caller's ported
+	// `get_expr_width` sum, `memoizeKeyWidths`) only when the PG currency is
+	// on AND `pgRelationByteSize` itself succeeded — if that substitution
+	// declined, both terms fall back to goopg's own `hashsize.EntryBytes`
+	// ruler together, never a PG per-key width paired with a goopg tuple
+	// width or vice versa.
+	var tupleBytes, perKeyBytes float64
+	if pgMemoizeEntryBytesCostEnabled() {
+		if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
+			tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
+			perKeyBytes = keyWidth
+		} else {
+			tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
+			perKeyBytes = hashsize.EntryBytes(nkeys, 0)
+		}
+	} else {
+		tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
+		perKeyBytes = hashsize.EntryBytes(nkeys, 0)
+	}
+
+	estEntryBytes := tupleBytes + perKeyBytes
 	if estEntryBytes < memoizeMinEntryBytes {
 		estEntryBytes = memoizeMinEntryBytes
 	}
@@ -248,10 +282,39 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 	}
 
 	ndistinct, isDefault := memoizeKeyNDistinct(s, innerPath, outer.Relids)
-	rescan, est := costMemoizeRescan(cp, innerPath.Cost, innerPath.Rows, outer.Rows,
-		ndistinct, isDefault, relNCols(innerPath.Rel), len(keys))
+	// `calls` is the OUTER PATH's row count, not the rel's: PG passes
+	// `outer_path->rows` to create_memoize_path
+	// (postgres/src/backend/optimizer/path/joinpath.c:812-819, stored as
+	// `mpath->calls`, pathnode.c:1693, read by cost_memoize_rescan,
+	// costsize.c:2549). Gate 2 above reads the rel on purpose; this does not.
+	// The two differ for a PARTIAL outer, whose rows are per worker: with the
+	// rel's count, each worker's cache looked 3-4x more reused than it can
+	// be, and TPC-H Q3's partial Memoize nested loop undercut PG's Parallel
+	// Hash Join (M0146-0005).
+	rescan, est := costMemoizeRescan(cp, innerPath.Cost, innerPath.Rows, outerPath.Rows,
+		// R121 Slice A(ii): was relNCols(innerPath.Rel) -- a DIRECT rel read
+		// that bypassed pathNCols and so could never see any narrowing. It is
+		// also the contract Path.NCols' own doc states ("read them through
+		// pathNCols ..., never directly").
+		//
+		// UNCONDITIONAL. R128 note: GOOPG_NARROW_COST_INPUTS is now DEFAULT
+		// ON, so the interesting arm is no longer the one this paragraph was
+		// written for -- narrowing normally DOES reach pathNCols here. The
+		// invariant below is still worth stating, and still holds, but read it
+		// as covering the opted-OUT arm (`=0`) rather than the default:
+		// with narrowing off the ONLY writer of Path.NCols is
+		// pathindexonly.go, and getMemoizePath cannot reach here on an
+		// index-only inner -- memoizeCacheKeys returns (nil,false) when
+		// len(innerPath.IndexClauses)==0, and the index-only producer emits
+		// the full-index-scan shape with no index clauses (its partial twin is
+		// a struct copy of the same). Pinned by
+		// TestGetMemoizePathDeclinesIndexOnlyInner: if a parameterised
+		// index-only path is ever added, that pin fails rather than the
+		// narrowing-off arm silently re-pricing.
+		ndistinct, isDefault, pathNCols(innerPath), len(keys), pathWidth(innerPath),
+		memoizeKeyWidths(s, innerPath, outer.Relids))
 
-	return &Path{
+	mp := &Path{
 		Kind: PathMemoize,
 		// The wrapper stands for the same relation, the same rows and the same
 		// parameterisation as what it wraps — `create_memoize_path`
@@ -269,6 +332,10 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// C-19a.
 		ParallelSafe: innerPath.ParallelSafe,
 	}
+	// R121 Slice A(ii): Memoize is a single-child WRAPPER (same rel, same
+	// rows, same parameterisation), not a join — it emits its child's row.
+	inheritNarrowedWidths(mp, innerPath)
+	return mp
 }
 
 // memoizeCacheKeys is `paraminfo_get_equal_hashops` (joinpath.c:438) reduced to
@@ -360,6 +427,32 @@ func memoizeKeyNDistinct(s *searchCtx, innerPath *Path, outerRelids RelSet) (flo
 		nd = 1
 	}
 	return nd, anyDefault
+}
+
+// memoizeKeyWidths is PG's `get_expr_width` (costsize.c:6404) summed over
+// `mpath->param_exprs` (costsize.c:2574-2575) — M0139-0007c's port. Every key
+// `memoizeCacheKeys` admits is a bare `*ColumnRef` (the type assertion at its
+// own loop), so `get_expr_width`'s Var arm is the only one reachable here: try
+// the column's ANALYZEd average width first (PG's `RelOptInfo.attr_widths`
+// cache, `columnStatsByName`'s `AvgWidth`, read through `examineJoinVar` the
+// same way `memoizeKeyNDistinct` above reads `stats` for ndistinct), and fall
+// back to the type's average width (`get_typavgwidth`, `typeWidth` — already
+// shared by every other width consumer in this package) only when there is no
+// statistic or it is non-positive, exactly PG's own fallback order.
+func memoizeKeyWidths(s *searchCtx, innerPath *Path, outerRelids RelSet) float64 {
+	var sum float64
+	for _, c := range innerPath.IndexClauses {
+		cr, ok := c.key.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		if v := s.examineJoinVar(c.key, memoizeKeyRelids(c, outerRelids)); v.stats != nil && v.stats.AvgWidth > 0 {
+			sum += v.stats.AvgWidth
+			continue
+		}
+		sum += float64(typeWidth(cr.Type))
+	}
+	return sum
 }
 
 // pathRescanTotal is `cost_rescan` (costsize.c:4700) reduced to the two cases
@@ -457,6 +550,27 @@ func relationByteSize(rows, avgVarBytes float64, ncols int) float64 {
 //	         ONCE, plus a spill charge when the cache exceeds work_mem.
 //	rescan — cpu_operator_cost * tuples, the replay (cost_rescan's T_Material
 //	         arm, costsize.c:4703-4712), charged per additional outer row.
+// nestLoopInnerRescanStartup — R69 slice (a): PG's `cost_rescan`
+// STARTUP arm for the nestloop join (`initial_cost_nestloop` charges
+// `(outer−1) × rescan_startup`; all three nestloop call sites passed
+// literal 0). A parameterised inner re-pays its startup (index
+// descent) per rescan (default arm); a Memoize inner pays its modeled
+// rescan startup; a materialised/plain inner pays 0 (`T_Material`
+// arm). Only the first case changes behaviour; the others return
+// exactly what the literal did, by construction.
+func nestLoopInnerRescanStartup(inner *Path) float64 {
+	if inner == nil {
+		return 0
+	}
+	if inner.Kind == PathMemoize && inner.MemoizeInfo != nil {
+		return inner.MemoizeInfo.rescan.Startup
+	}
+	if inner.RequiredOuter != 0 {
+		return inner.Cost.Startup
+	}
+	return 0
+}
+
 func nestLoopInnerRescanCost(inner *Path, cp costParams) (build, rescan float64) {
 	if inner == nil {
 		return 0, 0

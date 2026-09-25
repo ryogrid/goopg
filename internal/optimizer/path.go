@@ -113,6 +113,37 @@ const (
 	// subtree off the bottom of that chain and hands the shape to
 	// `splitAggregate`, the same constructor the post-pass uses.
 	PathFinalizeAgg
+
+	// PathUnique is `createUniquePath`'s (M0142-0008c-1) SEMI-join
+	// de-duplication candidate — PG's `UniquePath` (pathnodes.h:2229).
+	// Produced only by `createUniquePath` (createuniquepath.go) and
+	// consumed only by `createUniquePlan`: goopg has no hash-keyed-subset
+	// dedup node (`*Distinct` hash-dedups on every output column, never a
+	// subset), so unlike `PathDistinct` this kind always emits `*DistinctOn`
+	// — the streaming keyed dedup already reused for DISTINCT's own
+	// unique-over-sorted candidate — over the Sort child this path stacks.
+	PathUnique
+
+	// PathIncrementalSort is M0141-S2b-2c / S7's `addOrderedPaths` third arm
+	// (upperordered.go) — PG's `IncrementalSortPath` (pathnodes.h): a Sort
+	// over a child whose own ordering already satisfies a PREFIX of the
+	// required pathkeys, priced by `costIncrementalSort` (cheaper than a
+	// full `PathSort` because only each prefix-group needs a full in-memory
+	// sort, not the whole input). Produced only by `addIncrementalSortPaths`
+	// (incrementalsortpaths.go). `createPlanNode` HAS an arm for it
+	// (`createIncrementalSortPlan`, createplansimple.go, exec-b) and the
+	// executor operator exists (`incrementalSortOp`, exec-a) — the flag
+	// (`GOOPG_INCREMENTAL_SORT`) stays off by default not because either is
+	// missing but because the 2026-09-17h corpus measurement (design doc's
+	// own update) found the arm inert on the full TPC-DS corpus at HEAD:
+	// `ordered.SearchCandidates`/`SearchCandidateKeys` are populated only
+	// inside `createOrderedPaths`, and `electOrderedGrouping` — the GROUP_AGG
+	// upper rel's own ORDER BY election loop — calls `addOrderedPaths`
+	// directly, bypassing that population, so every GroupAgg-shaped witness
+	// structurally cannot reach this arm regardless of `anyTranslated`
+	// progress (S2b-5/S2b-6). See
+	// docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md.
+	PathIncrementalSort
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -149,6 +180,17 @@ type Path struct {
 	// inherits that rule. Any cross-jointype pruning question belongs to C-04,
 	// with the enumeration that produces it.
 	Jointype parser.JoinType
+
+	// SJInfo carries the Semi/Anti join's SpecialJoinInfo from the DP search
+	// through to the *Join node createNestLoopPlan/createHashJoinPlan build
+	// (M0142-0008a-3i-plumbing-c16, design doc §51.1). unnestExistsExpr's
+	// direct construction path already stamps Join.SJInfo itself; this field
+	// is the missing carrier for the SEPARATE case where the search
+	// reorders/rebuilds the Semi/Anti join as part of a *Path (join_paths.go)
+	// rather than reusing the syntactic Join node verbatim — without it, the
+	// rebuilt Join loses its SJInfo and extractSearchLeaves's SynLefthand/
+	// MinLefthand rebuild (joinsearchseam.go) has nothing to write into.
+	SJInfo *SpecialJoinInfo
 
 	// AggStrategy is the aggregation this path PERFORMS — PG's
 	// `AggPath.aggstrategy`, set per path by `add_paths_to_grouping_rel`
@@ -195,6 +237,14 @@ type Path struct {
 	// other path attribute above.
 	Unique bool
 
+	// UniqueKeyCols is a PathUnique's dedup key: positions into
+	// Children[0]'s eventual built `Node.Output()` (validated against
+	// `SpecialJoinInfo.SemiRhsExprs` by `createUniquePath` at Path-build
+	// time — see its doc comment for why this requires Children[0] to be a
+	// `PathPrebuilt` today). `createUniquePlan` passes it straight to the
+	// emitted `*DistinctOn.KeyCols`. nil for every other kind.
+	UniqueKeyCols []int
+
 	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
 	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,
 	// Funcs, Frame, pos, schema), whose Child the arm replaces with the
@@ -206,6 +256,40 @@ type Path struct {
 	// the `applySetOp` fold built (Op, All, pos), whose Left/Right the arm
 	// replaces with the two built inputs. nil for every other kind. C-18.
 	SetOp *SetOp
+
+	// SetOpLeftNonPartial / SetOpRightNonPartial mark which of a
+	// PathSetOp's two children is a CLAIMED-WHOLE (non-partial) branch —
+	// PG's `pa_nonpartial_subpaths` member (allpaths.c:1588-1627,
+	// M0140-0006c-3). The mixed partial Append picks, per branch, the
+	// cheaper of the branch's cheapest partial path and its cheapest
+	// parallel-safe total path; a branch whose pick is the non-partial one
+	// is claimed and run whole by ONE participant rather than split by
+	// block. Positional: the flags apply to Children[0] (left) and
+	// Children[1] (right) respectively.
+	//
+	// The zero value (both false) is the status-quo reading — "no branch
+	// is claimed-whole" — so the serial SetOp path (addSetOpPaths) and the
+	// pure-partial path (both branches partial) need no stamp, and every
+	// pre-existing reader keeps its meaning. `createSetOpPlan` copies the
+	// pair onto the emitted `*SetOp` node, where the plan-tree walks
+	// (stampParallelScan / drivingScan) and the executor's claim wiring
+	// (attachAll's *setOp arm) read them. Only the mixed arm's producer
+	// sets them.
+	SetOpLeftNonPartial  bool
+	SetOpRightNonPartial bool
+
+	// PresortedCount is a PathIncrementalSort's presorted-prefix width —
+	// `addIncrementalSortPaths`' own `nCommon` (incrementalsortpaths.go),
+	// stashed here at Path-build time rather than re-derived at
+	// `createPlanNode` time (M0141-S7-exec-b sizing note: stash vs
+	// re-derive via `pathkeysCountContainedIn` against the winning
+	// candidate's ordering — stashing was chosen because the candidate that
+	// wins `setCheapest` is not guaranteed to still expose the SAME
+	// `SearchCandidateKeys` entry this path was built against, while the
+	// value computed here is exact by construction). `createIncrementalSortPlan`
+	// copies it verbatim onto `IncrementalSort.PresortedCount`. Zero for
+	// every other kind.
+	PresortedCount int
 
 	Rel *RelOptInfo
 
@@ -262,16 +346,34 @@ type Path struct {
 	// allocated thousands of times per join search, and appending the bool
 	// after the int would have grown it from 336 to 344 bytes for one bit.
 	ParallelAware bool
+	// ParallelHash: this PathHashJoin is PG's `parallel_hash = true` variant
+	// (try_partial_hashjoin_path, joinpath.c:1290-1297) — Children[1], the
+	// build side, is itself a PARTIAL path whose share each participant
+	// builds into one shared table. createHashJoinPlan carries it to
+	// Join.ParallelHash. M0146-0002.
+	ParallelHash bool
 
 	ParallelWorkers int
 
 	// NCols / AvgVarBytes describe what THIS PATH emits, when that is narrower
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
-	// hash sizing. Zero NCols means "not narrowed"; read them through
-	// pathNCols / pathAvgVarBytes, never directly, so the fallback to the
-	// rel's figures stays in one place.
+	// executor hash sizing.
+	//
+	// R121 widened that reading: with GOOPG_NARROW_COST_INPUTS on, a base-rel
+	// scan path carries the columns the STATEMENT needs, which is not
+	// literally what the path emits — goopg's SeqScan does not project, and
+	// neither does its Sort. The figures are a COST currency, and the safe
+	// direction is what licenses the gap: the keep-sets nest as
+	// joinKeepSet ⊆ buildKeepSet ⊆ neededKeepSet, so the planner-narrowed row
+	// is always a SUPERSET of the row the executor's own narrowing
+	// (narrowoutput.go) will actually build. It can over-charge, never
+	// under-size a real hash build. OutputWidth is the separate emitted byte width for
+	// planner-only PG packed-tuple geometry. Zero values mean "not narrowed";
+	// read them through pathNCols/pathAvgVarBytes/pathWidth, never directly, so
+	// the fallback to the rel's figures stays in one place.
 	NCols       int
 	AvgVarBytes float64
+	OutputWidth int
 
 	// Target / TargetKnown is the scan's emitted-column list — take2 P4-01
 	// Slice 1 (planner-p4-01-target DESIGN, "Slice 1"): the ordered
@@ -281,9 +383,12 @@ type Path struct {
 	//
 	// Stored in EMITTED-SCHEMA order — ascending leaf-output positions, the
 	// shape `neededKeepSet` returns — so Slice 2's ascending checks pass
-	// without guard loosening. NEVER applied: no createPlan change, no cost
-	// change — behaviour-neutral by construction (modulo allocator noise: one
-	// small slice header per path). TargetKnown false means "unknown": the
+	// without guard loosening. This once read "NEVER applied: no createPlan
+	// change, no cost change"; both halves have since expired. Slice 2 wired
+	// `buildKeepSet` into narrowBuildInput/narrowMergeInput, so Target DOES
+	// reach createPlan, and R121 narrows COST inputs — though through
+	// NCols/AvgVarBytes/OutputWidth, not through this field, which still has
+	// exactly one production reader (buildKeepSet) and still feeds no cost. TargetKnown false means "unknown": the
 	// collector declined (NeededColsKnown false) or the rel carries no leaf
 	// schema, and no narrowing may be attempted. It is NOT the same as an
 	// empty list.
@@ -384,6 +489,18 @@ type Path struct {
 	PartialPredicate Expr
 
 	Children []*Path
+
+	// OuterRelids/InnerRelids are the two input relsets this join path was
+	// built from, in Children order (Children[0]'s rel, Children[1]'s rel).
+	// R53 slice 1: DPPATH partition attribution. The `addPathsToJoinrel`
+	// partition a path prices is otherwise unrecoverable downstream — the
+	// joinrel is the UNION, and Children carry no relsets — so the
+	// constructors stamp it here and `tracePath` renders it. Trace-only
+	// provenance: no planner code reads these fields, and they are zero on
+	// every non-join path. For hash joins Children[1] is the BUILD side
+	// (Children[0] the probe), so Inner names the hashed input.
+	OuterRelids RelSet
+	InnerRelids RelSet
 
 	// node is the executor Node a PathPrebuilt wraps. nil for every other kind.
 	node Node
@@ -488,6 +605,65 @@ type RelOptInfo struct {
 	Pathlist        []*Path
 	PartialPathlist []*Path
 
+	// SearchCandidates is the SEARCH rel's own Pathlist (`searchedRelOf(input)
+	// .Pathlist`), carried onto the ORDERED rel by `createOrderedPaths`
+	// (M0141-S2b-2a, upperordered.go) so a later consumer does not need to
+	// re-derive `searchedRelOf` itself. It travels as DATA on the rel, the
+	// way NeededCols/OutputCols already do (same P2-A rationale: no spare
+	// parameter down `createOrderedPaths`/`addOrderedPaths` for one list one
+	// future consumer reads).
+	//
+	// Nothing reads this yet, and that is the slice's gate. S2b-2's own
+	// scoping recon (docs/design/0100-0149/m0141-s2b-scoping-decomposition.md
+	// §"S2b-2 result") proved that OFFERING these candidates to the ORDERED
+	// tournament today cannot move a plan — every candidate of one rel
+	// shares the same (rows, width), so `costSortRun`'s constant Sort charge
+	// on top cannot change which one ranks cheapest — so this field is
+	// visibility only until M0141-S7's per-candidate Pathkeys credit
+	// (`cost_incremental_sort`) exists for S2b-2c to spend it on. nil when
+	// `input` is not a searched-tree root, or the search published no
+	// Pathlist.
+	SearchCandidates []*Path
+
+	// SearchCandidateKeys is SearchCandidates[i].Pathkeys re-earned against
+	// this rel's own published schema, one entry per SearchCandidates entry
+	// (M0141-S2b-2b, upperorderedinput.go's `validatedSearchCandidateKeys`).
+	// Every candidate in a search rel's Pathlist carries its Pathkeys in the
+	// SEARCH's inner coordinate space — the same reason `stampSearchPathkeys`
+	// re-validates the single WINNING path's claim instead of trusting it
+	// (upperorderedinput.go's file header, rule 1) applies identically to
+	// every OTHER candidate the search never crowned. This generalizes that
+	// same rule from "the one winner" to "every candidate", which S2b-2c's
+	// Incremental Sort tournament needs before it can trust any non-seed
+	// candidate's ordering claim.
+	//
+	// Nothing reads this yet, same gate as SearchCandidates: computing it
+	// cannot move a plan because nothing offers these candidates to
+	// `addOrderedPaths` yet. nil when SearchCandidates is nil; an individual
+	// entry is nil when that candidate's own Pathkeys validate to nothing
+	// (no ordering claim survives, same truncation rule as the winner's).
+	SearchCandidateKeys [][]PathKey
+
+	// LeftBranchRel / RightBranchRel are the search's own RelOptInfo for a
+	// SETOP rel's two UNION ALL branches (`searchedRelOf(setOpNode.Left)` /
+	// `searchedRelOf(setOpNode.Right)`), carried onto this rel by
+	// `createSetOpPaths` (M0140-0006a, windowsetoppaths.go) so a later
+	// consumer does not need to re-derive `searchedRelOf` itself — the same
+	// rationale as SearchCandidates above, applied to the SetOp's two-input
+	// shape instead of the ORDERED rel's single input.
+	//
+	// Nothing reads this yet, and that is the slice's gate: M0140-0006b's
+	// partial-Append producer seeds PartialPathlist from
+	// LeftBranchRel/RightBranchRel.PartialPathlist, but until that producer
+	// exists these fields are visibility only and cannot move a plan — the
+	// SETOP rel still gets exactly the one candidate `addSetOpPaths` always
+	// offered. nil when the corresponding branch is not a searched-tree
+	// root (e.g. it collapsed to a legacy-built Aggregate/Sort/Values shape
+	// the search never reached, or the branch's own statement had too few
+	// relations for the search to run at all).
+	LeftBranchRel  *RelOptInfo
+	RightBranchRel *RelOptInfo
+
 	// ConsiderParallel is PG's `RelOptInfo.consider_parallel`
 	// (pathnodes.h:911): whether it is worth generating partial paths for
 	// this rel at all — the relation can be read by a worker (not temp, not
@@ -506,6 +682,21 @@ type RelOptInfo struct {
 
 	CheapestTotal   *Path
 	CheapestStartup *Path
+
+	// CheapestUnique is PG's `RelOptInfo.cheapest_unique_path`
+	// (pathnodes.h:967): the cached, at-most-once-built result of
+	// `createUniquePath` (M0142-0008c-1) — a dedup of this rel's
+	// `CheapestTotal` keyed by a SEMI join's correlation columns
+	// (`SpecialJoinInfo.SemiRhsExprs`), letting `joinIsLegal`'s
+	// `unique_ified` admission arm (M0142-0008c-2, not yet wired) join the
+	// unique-ified RHS with any LHS rather than only its syntactic
+	// `MinRighthand`. nil until `createUniquePath` succeeds; also nil,
+	// permanently, when the rel cannot be unique-ified
+	// (`!SemiCanBtree && !SemiCanHash`, or no correlation columns) — PG
+	// re-derives that failure every call rather than caching it (a Go
+	// sentinel would need a tri-state), which is cheap: the guard clauses
+	// short-circuit before any Path is built.
+	CheapestUnique *Path
 
 	// ConsiderStartup / ConsiderParamStartup are PG's per-rel
 	// `consider_startup` / `consider_param_startup` (pathnodes.h:889-890), and
@@ -656,6 +847,22 @@ func pathAvgVarBytes(p *Path) float64 {
 	return 0
 }
 
+// pathWidth is the emitted byte-width analogue of pathNCols. It is deliberately
+// separate from the executor's NCols/AvgVarBytes map-footprint model: PG
+// final_cost_hashjoin's virtual-bucket geometry uses pathtarget->width, which
+// is a packed tuple width. A positive OutputWidth is produced only where a path
+// really narrows its emitted schema; otherwise the relation's width is the
+// single source of truth.
+func pathWidth(p *Path) int {
+	if p != nil && p.OutputWidth > 0 {
+		return p.OutputWidth
+	}
+	if p == nil || p.Rel == nil {
+		return 0
+	}
+	return p.Rel.Width
+}
+
 func relNCols(r *RelOptInfo) int {
 	if r == nil {
 		return 0
@@ -749,30 +956,19 @@ func comparePathCostsFuzzily(p1, p2 *Path, fuzz float64) pathCostComparison {
 	if p2.Cost.Startup > p1.Cost.Startup*fuzz {
 		return costsBetter1
 	}
-	// Both total and startup are fuzzily equal. Use the actual (non-fuzzy)
-	// cost to pick a direction rather than returning costsEqual. Returning
-	// costsEqual would let a non-cost dimension (typically pathkeys) decide
-	// dominance alone — a hash path with no pathkeys then loses to a
-	// near-identically-costed merge path with pathkeys. For CTE self-joins
-	// with low row-count estimates, both paths land inside the 1% fuzz band
-	// and the hash path is silently rejected, leaving only nested-loop
-	// plans. A weak actual-cost directional signal preserves the tie-breaking
-	// cost comparison that makes the paths incomparable (hash cheaper, merge
-	// has pathkeys), so both survive and setCheapest can pick the cheaper
-	// one. M0129-S1.
-	if p1.Cost.Total < p2.Cost.Total {
-		return costsBetter1
-	}
-	if p2.Cost.Total < p1.Cost.Total {
-		return costsBetter2
-	}
-	// Truly equal on total; use startup as the final tie-break.
-	if p1.Cost.Startup < p2.Cost.Startup {
-		return costsBetter1
-	}
-	if p2.Cost.Startup < p1.Cost.Startup {
-		return costsBetter2
-	}
+	// Fuzzily the same on both costs -> costsEqual (pathnode.c:237). PG
+	// deliberately does NOT break this tie on exact cost: at the standard
+	// fuzz level the paths are declared equal so the non-cost dimensions
+	// (pathkeys, parallel safety, required outer rels) and insertion order
+	// decide in add_path, which is the semantics that keeps the first
+	// candidate on an all-equal contest and lets a pathkeyed path dominate
+	// a keyless one. M0129-S1 once kept an exact-cost fallback here to
+	// stop a keyless hash path losing a fuzzy tie to a pathkeyed merge
+	// rival in CTE self-joins (TPC-DS Q74); M0141-S2b-12's recon showed the
+	// nested-loop pathology was actually removed by the same commit's
+	// initialRelRows row-estimate fallback, while this deviation masked
+	// PG's tie-break semantics at every serial pathlist — removed by
+	// M0141-S2b-13.
 	return costsEqual
 }
 
@@ -787,32 +983,6 @@ const (
 	dimBetter2
 	dimIncomparable
 )
-
-func costDim(c pathCostComparison) dimensionCmp {
-	switch c {
-	case costsBetter1:
-		return dimBetter1
-	case costsBetter2:
-		return dimBetter2
-	case costsDifferent:
-		return dimIncomparable
-	default:
-		return dimEqual
-	}
-}
-
-// boolDim compares two eligibility booleans where true is "better" (e.g.
-// parallel_safe): true dominates false.
-func boolDim(a, b bool) dimensionCmp {
-	switch {
-	case a == b:
-		return dimEqual
-	case a && !b:
-		return dimBetter1
-	default:
-		return dimBetter2
-	}
-}
 
 // outerDim compares required-outer relid sets: a path requiring FEWER outer
 // relations (a subset) is less constrained and therefore better; unrelated sets
@@ -845,37 +1015,107 @@ const (
 	relBDominates
 )
 
-// comparePaths reduces the per-dimension comparisons to a single relationship. A
-// dominates B iff A is no worse than B on every dimension and strictly better on
-// at least one; if A is better on one axis and B on another they are
-// incomparable and both survive.
+// comparePaths reproduces add_path's pairwise dominance decision
+// (pathnode.c:480-618). a is the newcomer, b the incumbent: relADominates is
+// PG's remove_old, relBDominates/relEqual are PG's accept_new=false (relEqual
+// keeps the keep-first tie named), and relIncomparable keeps both. The
+// decision is a conditional table, not a dimension-agnostic fold: at
+// COSTS_EQUAL better pathkeys only dominate when outer rels, row count and
+// parallel safety also permit, and the all-equal contest is re-decided by
+// rows and a much tighter fuzz factor (1.0000000001 — an exact comparison
+// produced platform-specific plan variation through cost roundoff).
 func comparePaths(a, b *Path) pathRel {
-	dims := []dimensionCmp{
-		costDim(comparePathCostsFuzzily(a, b, stdFuzzFactor)),
-		comparePathkeysDim(a.Pathkeys, b.Pathkeys),
-		boolDim(a.ParallelSafe, b.ParallelSafe),
-		outerDim(a.RequiredOuter, b.RequiredOuter),
+	costcmp := comparePathCostsFuzzily(a, b, stdFuzzFactor)
+	if costcmp == costsDifferent {
+		// A real startup/total trade-off: PG keeps both without consulting
+		// the other dimensions (pathnode.c:502-510).
+		return relIncomparable
 	}
-	hasA, hasB := false, false
-	for _, d := range dims {
-		switch d {
-		case dimIncomparable:
-			return relIncomparable
-		case dimBetter1:
-			hasA = true
-		case dimBetter2:
-			hasB = true
+	// Parameterized paths pretend to have no pathkeys (pathnode.c:475).
+	var aKeys, bKeys []PathKey
+	if a.RequiredOuter == 0 {
+		aKeys = a.Pathkeys
+	}
+	if b.RequiredOuter == 0 {
+		bKeys = b.Pathkeys
+	}
+	keyscmp := comparePathkeysDim(aKeys, bKeys)
+	if keyscmp == dimIncomparable {
+		// PATHKEYS_DIFFERENT: PG skips the dominance table entirely and
+		// keeps both (pathnode.c:512).
+		return relIncomparable
+	}
+	outercmp := outerDim(a.RequiredOuter, b.RequiredOuter)
+	switch costcmp {
+	case costsBetter1:
+		// COSTS_BETTER1: a dominates b iff a's pathkeys are not worse and a
+		// is no more parameterized, produces no more rows, and is no less
+		// parallel-safe (pathnode.c:586-596).
+		if keyscmp != dimBetter2 && outercmp != dimBetter2 && outercmp != dimIncomparable &&
+			a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
 		}
+		return relIncomparable
+	case costsBetter2:
+		// COSTS_BETTER2: the mirror image (pathnode.c:597-608).
+		if keyscmp != dimBetter1 && outercmp != dimBetter1 && outercmp != dimIncomparable &&
+			a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
 	}
-	switch {
-	case hasA && hasB:
-		return relIncomparable // a trade-off across axes
-	case hasA:
-		return relADominates
-	case hasB:
-		return relBDominates
+	// COSTS_EQUAL (pathnode.c:524-585).
+	switch keyscmp {
+	case dimBetter1:
+		// PATHKEYS_BETTER1: a's keys dominate only when a is no more
+		// parameterized, no heavier, and no less parallel-safe.
+		if (outercmp == dimEqual || outercmp == dimBetter1) &&
+			a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
+		}
+		return relIncomparable
+	case dimBetter2:
+		// PATHKEYS_BETTER2: mirror image — b's keys dominate under the
+		// symmetric conditions.
+		if (outercmp == dimEqual || outercmp == dimBetter2) &&
+			a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
+	}
+	// PATHKEYS_EQUAL (pathnode.c:544-575): same keys and fuzzily-equal cost,
+	// so keep just one. Outer rels decide first; on equal outers the chain
+	// is parallel-safety, then rows, then the tight-fuzz cost comparison —
+	// "If things are still tied, arbitrarily keep only the old path."
+	switch outercmp {
+	case dimEqual:
+		switch {
+		case a.ParallelSafe && !b.ParallelSafe:
+			return relADominates
+		case !a.ParallelSafe && b.ParallelSafe:
+			return relBDominates
+		case a.Rows < b.Rows:
+			return relADominates
+		case a.Rows > b.Rows:
+			return relBDominates
+		case comparePathCostsFuzzily(a, b, 1.0000000001) == costsBetter1:
+			return relADominates
+		default:
+			return relEqual
+		}
+	case dimBetter1:
+		if a.Rows <= b.Rows && (!b.ParallelSafe || a.ParallelSafe) {
+			return relADominates
+		}
+		return relIncomparable
+	case dimBetter2:
+		if a.Rows >= b.Rows && (!a.ParallelSafe || b.ParallelSafe) {
+			return relBDominates
+		}
+		return relIncomparable
 	default:
-		return relEqual
+		// Different parameterizations: keep both.
+		return relIncomparable
 	}
 }
 
@@ -885,6 +1125,13 @@ func comparePaths(a, b *Path) pathRel {
 // duplicates do not accumulate — matching PG's practical behaviour of keeping the
 // first of two indistinguishable paths.
 func addPath(rel *RelOptInfo, newPath *Path, producer string) {
+	// R122 Slice B: a join path publishes the sum of its children's narrowed
+	// widths. Stamped here, in the single funnel every join path passes
+	// through, rather than in each of the seven constructors. Its own cost was
+	// computed from its children before this call, so this cannot change it —
+	// the triple is for the level above. Nil-safe (unlike addPartialPath,
+	// addPath has no nil guard of its own).
+	narrowJoinWidths(newPath)
 	before := len(rel.Pathlist)
 	rel.Pathlist = addToPathlist(rel.Pathlist, newPath)
 	// A candidate is accepted when it is present in the resulting list. Length
@@ -935,6 +1182,8 @@ func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
 	if newPath == nil || !newPath.ParallelSafe || !rel.ConsiderParallel {
 		return
 	}
+	// R122 Slice B — see addPath.
+	narrowJoinWidths(newPath)
 	rel.PartialPathlist = addToPartialPathlist(rel.PartialPathlist, newPath)
 	verdict := verdictDominated
 	for _, p := range rel.PartialPathlist {

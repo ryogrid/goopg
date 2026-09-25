@@ -64,6 +64,26 @@ func TestAclItemHeapDecodeCase(t *testing.T) {
 	}
 }
 
+func TestDecodeACLItemArrayPreservesGrantOption(t *testing.T) {
+	blob, err := encodeAclItemArrayText("{=Tc*/postgres,grantee=U*/postgres}", fixtureResolveOID)
+	if err != nil {
+		t.Fatalf("encodeAclItemArrayText: %v", err)
+	}
+	items, err := DecodeACLItemArray(blob, fixtureResolveName)
+	if err != nil {
+		t.Fatalf("DecodeACLItemArray: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("decoded item count = %d, want 2", len(items))
+	}
+	if got, want := items[0], (ACLItemText{Grantee: "", Grantor: "postgres", Privileges: "Tc*"}); got != want {
+		t.Errorf("PUBLIC item = %+v, want %+v", got, want)
+	}
+	if got, want := items[1], (ACLItemText{Grantee: "grantee", Grantor: "postgres", Privileges: "U*"}); got != want {
+		t.Errorf("grantee item = %+v, want %+v", got, want)
+	}
+}
+
 func TestAclModeFromPrivLetters(t *testing.T) {
 	cases := []struct {
 		privs string

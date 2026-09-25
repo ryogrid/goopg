@@ -9,14 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/replcluster"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestE2E_PhysicalReplication tests a primary ↔ standby pair end-to-end.
@@ -72,6 +72,256 @@ func TestE2E_PhysicalReplication(t *testing.T) {
 		t.Fatalf("standby never saw the row after ~15s: %v", lastErr)
 	}
 	t.Fatal("standby never saw the row after ~15s: timeout")
+}
+
+// TestE2E_PhysicalReplicationResumesAfterPrimaryRestart proves the physical
+// walreceiver's reconnect loop survives a primary outage.  The first row
+// establishes an active stream, then the primary is stopped and restarted on
+// the same address; the second row must reach the still-running standby after
+// its receiver has redialed and resumed at the local durable WAL tail.
+func TestE2E_PhysicalReplicationResumesAfterPrimaryRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping physical-replication primary restart test in short mode")
+	}
+
+	rc, err := replcluster.New("e2e_phys_repl_primary_restart", replcluster.Options{
+		RepoRoot:     repoRoot(t),
+		BaseDir:      t.TempDir(),
+		SlotName:     "e2e_phys_primary_restart_slot",
+		StartupWait:  30 * time.Second,
+		ShutdownWait: 10 * time.Second,
+		PreCloneHook: func(primary *cluster.Cluster) error {
+			_, err := primary.Query(context.Background(), "CREATE TABLE repl_restart_t (id int)")
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	if err := runSQLSimple(t, rc.Primary, "INSERT INTO repl_restart_t VALUES (1)"); err != nil {
+		t.Fatalf("insert before primary restart: %v", err)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "repl_restart_t", 1, 30*time.Second); !equalIDs(got, []string{"1"}) {
+		t.Fatalf("standby did not receive pre-restart row: got %v, want [1]", got)
+	}
+
+	if err := rc.Primary.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("primary stop for reconnect: %v", err)
+	}
+	if err := rc.Primary.Start(); err != nil {
+		t.Fatalf("primary restart for reconnect: %v", err)
+	}
+	if err := runSQLSimple(t, rc.Primary, "INSERT INTO repl_restart_t VALUES (2)"); err != nil {
+		t.Fatalf("insert after primary restart: %v", err)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "repl_restart_t", 2, 30*time.Second); !equalIDs(got, []string{"1", "2"}) {
+		t.Fatalf("standby did not resume after primary restart: got %v, want [1 2]", got)
+	}
+}
+
+// TestE2E_PhysicalPromotionPersistsAcrossRestart proves that a promoted
+// standby becomes a durable primary. It catches up before the old primary is
+// stopped, accepts a write after promotion, and must still come up writable
+// with both histories after its own restart. This covers the promotion
+// timeline/control-file state as well as the recovery-mode checkpoint handoff.
+func TestE2E_PhysicalPromotionPersistsAcrossRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping physical-replication promotion restart test in short mode")
+	}
+
+	rc, err := replcluster.New("e2e_phys_promotion_restart", replcluster.Options{
+		RepoRoot:     repoRoot(t),
+		BaseDir:      t.TempDir(),
+		SlotName:     "e2e_phys_promotion_restart_slot",
+		StartupWait:  30 * time.Second,
+		ShutdownWait: 10 * time.Second,
+		PreCloneHook: func(primary *cluster.Cluster) error {
+			_, err := primary.Query(context.Background(), "CREATE TABLE promotion_restart_t (id int)")
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	if err := runSQLSimple(t, rc.Primary, "INSERT INTO promotion_restart_t VALUES (1)"); err != nil {
+		t.Fatalf("insert before promotion: %v", err)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "promotion_restart_t", 1, 30*time.Second); !equalIDs(got, []string{"1"}) {
+		t.Fatalf("standby did not receive pre-promotion row: got %v, want [1]", got)
+	}
+
+	// Stop the old primary before promoting so the test models failover rather
+	// than allowing a split-brain interval. The standby has already durably
+	// replayed row 1, so it is safe to make it authoritative.
+	if err := rc.Primary.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop old primary before promotion: %v", err)
+	}
+	if err := rc.Promote(); err != nil {
+		t.Fatalf("promote caught-up standby: %v", err)
+	}
+	insertEventually(t, rc.Standby, "INSERT INTO promotion_restart_t VALUES (2)", 30*time.Second)
+
+	if err := rc.Standby.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop promoted primary for restart: %v", err)
+	}
+	if err := rc.Standby.Start(); err != nil {
+		t.Fatalf("restart promoted primary: %v", err)
+	}
+	insertEventually(t, rc.Standby, "INSERT INTO promotion_restart_t VALUES (3)", 30*time.Second)
+	if got := waitForPhysicalIDs(t, rc.Standby, "promotion_restart_t", 3, 30*time.Second); !equalIDs(got, []string{"1", "2", "3"}) {
+		t.Fatalf("promoted primary did not preserve writable history across restart: got %v, want [1 2 3]", got)
+	}
+}
+
+// TestE2E_PhysicalReplicationCatchesUpAfterStandbyCrash verifies the
+// disconnected-slot path rather than a clean restart. The primary continues
+// committing while the standby process is gone; after recovery, the standby
+// must replay its durable local tail and receive every retained primary row in
+// order.
+func TestE2E_PhysicalReplicationCatchesUpAfterStandbyCrash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping physical-replication standby crash catch-up test in short mode")
+	}
+
+	rc, err := replcluster.New("e2e_phys_standby_crash", replcluster.Options{
+		RepoRoot:     repoRoot(t),
+		BaseDir:      t.TempDir(),
+		SlotName:     "e2e_phys_standby_crash_slot",
+		StartupWait:  30 * time.Second,
+		ShutdownWait: 10 * time.Second,
+		PreCloneHook: func(primary *cluster.Cluster) error {
+			_, err := primary.Query(context.Background(), "CREATE TABLE standby_crash_t (id int)")
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	if err := runSQLSimple(t, rc.Primary, "INSERT INTO standby_crash_t VALUES (1)"); err != nil {
+		t.Fatalf("insert before standby crash: %v", err)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "standby_crash_t", 1, 30*time.Second); !equalIDs(got, []string{"1"}) {
+		t.Fatalf("standby did not receive pre-crash row: got %v, want [1]", got)
+	}
+
+	if err := rc.Standby.Kill(); err != nil {
+		t.Fatalf("kill standby: %v", err)
+	}
+	for id := 2; id <= 13; id++ {
+		if err := runSQLSimple(t, rc.Primary, fmt.Sprintf("INSERT INTO standby_crash_t VALUES (%d)", id)); err != nil {
+			t.Fatalf("insert %d while standby is down: %v", id, err)
+		}
+	}
+
+	if err := rc.Standby.Start(); err != nil {
+		t.Fatalf("restart standby after crash: %v", err)
+	}
+	want := make([]string, 13)
+	for i := range want {
+		want[i] = fmt.Sprintf("%d", i+1)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "standby_crash_t", len(want), 30*time.Second); !equalIDs(got, want) {
+		t.Fatalf("standby did not catch up after crash: got %v, want %v", got, want)
+	}
+}
+
+// TestE2E_PhysicalPromotionAfterPrimaryCrash covers manual failover after an
+// unclean primary loss. Once the standby has replayed the committed history,
+// killing the primary must not prevent promotion or the first write on the new
+// primary.
+func TestE2E_PhysicalPromotionAfterPrimaryCrash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping physical-replication primary crash failover test in short mode")
+	}
+
+	rc, err := replcluster.New("e2e_phys_primary_crash_promote", replcluster.Options{
+		RepoRoot:     repoRoot(t),
+		BaseDir:      t.TempDir(),
+		SlotName:     "e2e_phys_primary_crash_promote_slot",
+		StartupWait:  30 * time.Second,
+		ShutdownWait: 10 * time.Second,
+		PreCloneHook: func(primary *cluster.Cluster) error {
+			_, err := primary.Query(context.Background(), "CREATE TABLE primary_crash_promote_t (id int)")
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	if err := runSQLSimple(t, rc.Primary, "INSERT INTO primary_crash_promote_t VALUES (1)"); err != nil {
+		t.Fatalf("insert before primary crash: %v", err)
+	}
+	if got := waitForPhysicalIDs(t, rc.Standby, "primary_crash_promote_t", 1, 30*time.Second); !equalIDs(got, []string{"1"}) {
+		t.Fatalf("standby did not receive pre-crash row: got %v, want [1]", got)
+	}
+
+	if err := rc.Primary.Kill(); err != nil {
+		t.Fatalf("kill primary before failover: %v", err)
+	}
+	if err := rc.Promote(); err != nil {
+		t.Fatalf("promote after primary crash: %v", err)
+	}
+	insertEventually(t, rc.Standby, "INSERT INTO primary_crash_promote_t VALUES (2)", 30*time.Second)
+	if got := waitForPhysicalIDs(t, rc.Standby, "primary_crash_promote_t", 2, 30*time.Second); !equalIDs(got, []string{"1", "2"}) {
+		t.Fatalf("promoted standby did not retain history after primary crash: got %v, want [1 2]", got)
+	}
+}
+
+func insertEventually(t *testing.T, c *cluster.Cluster, statement string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := runSQLSimple(t, c, statement); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("statement never succeeded after %s: %s: %v", timeout, statement, lastErr)
+}
+
+func waitForPhysicalIDs(t *testing.T, c *cluster.Cluster, table string, wantCount int, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last []string
+	for time.Now().Before(deadline) {
+		rows, err := c.Query(context.Background(), "SELECT id FROM "+table+" ORDER BY id")
+		if err == nil {
+			last = last[:0]
+			for _, row := range rows {
+				if len(row) > 0 {
+					last = append(last, row[0])
+				}
+			}
+			if len(last) >= wantCount {
+				return last
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return last
 }
 
 // TestE2E_LogicalReplication tests the logical replication pipeline

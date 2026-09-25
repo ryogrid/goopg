@@ -1,25 +1,25 @@
-Limit  (cost=35286.28..35286.43 rows=60 width=266)
-  ->  Sort  (cost=35286.28..35286.43 rows=60 width=266)
+Limit  (cost=19188.70..19188.78 rows=30 width=266)
+  ->  Sort  (cost=19188.70..19188.78 rows=30 width=266)
         Sort Key: ((tmp1.sum_sales - tmp1.avg_monthly_sales)), tmp1.s_store_name
-        ->  Subquery Scan on tmp1  (cost=35246.62..35284.51 rows=60 width=266)
+        ->  Subquery Scan on tmp1  (cost=19169.22..19187.97 rows=30 width=266)
               Filter: (CASE WHEN (tmp1.avg_monthly_sales <> '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_monthly_sales)) / tmp1.avg_monthly_sales) ELSE NULL::numeric END > 0.1)
-              ->  WindowAgg  (cost=35246.62..35280.33 rows=179 width=234)
+              ->  WindowAgg  (cost=19169.22..19185.87 rows=90 width=234)
                     Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
-                    ->  Incremental Sort  (cost=35246.62..35276.30 rows=179 width=202)
+                    ->  Incremental Sort  (cost=19169.22..19183.84 rows=90 width=202)
                           Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
                           Presorted Key: item.i_category
-                          ->  GroupAggregate  (cost=35243.59..35270.14 rows=179 width=202)
+                          ->  GroupAggregate  (cost=19167.74..19181.09 rows=90 width=202)
                                 Group Key: item.i_category, item.i_class, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_moy
-                                ->  Gather Merge  (cost=35243.59..35264.77 rows=179 width=176)
+                                ->  Gather Merge  (cost=19167.74..19178.39 rows=90 width=176)
                                       Workers Planned: 3
-                                      ->  Sort  (cost=34243.55..34243.70 rows=58 width=176)
+                                      ->  Sort  (cost=18167.70..18167.77 rows=29 width=176)
                                             Sort Key: item.i_category, item.i_class, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_moy
-                                            ->  Hash Join  (cost=1553.92..34241.85 rows=58 width=176)
+                                            ->  Hash Join  (cost=1553.92..18167.00 rows=29 width=176)
                                                   Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
-                                                  ->  Nested Loop  (cost=1552.65..34240.37 rows=61 width=167)
-                                                        ->  Parallel Hash Join  (cost=1552.34..33343.55 rows=12745 width=167)
+                                                  ->  Nested Loop  (cost=1552.65..18165.63 rows=30 width=167)
+                                                        ->  Parallel Hash Join  (cost=1552.34..17420.24 rows=6373 width=167)
                                                               Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
-                                                              ->  Parallel Seq Scan on store_sales  (cost=0.00..30571.90 rows=464390 width=18)
+                                                              ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=18)
                                                               ->  Parallel Hash  (cost=1548.71..1548.71 rows=291 width=157)
                                                                     ->  Parallel Seq Scan on item  (cost=0.00..1548.71 rows=291 width=157)
                                                                           Filter: (((i_category = ANY ('{Books,Children,Electronics}'::bpchar[])) AND (i_class = ANY ('{history,school-uniforms,audio}'::bpchar[]))) OR ((i_category = ANY ('{Men,Sports,Shoes}'::bpchar[])) AND (i_class = ANY ('{pants,tennis,womens}'::bpchar[]))))

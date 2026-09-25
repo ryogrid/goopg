@@ -129,6 +129,9 @@ const (
 	// once its effective value differs from BootVal. See
 	// get_explain_guc_options / ExplainPrintSettings (explain.c).
 	FlagExplain
+	// FlagNoShowAll: guc.h GUC_NO_SHOW_ALL — omitted from SHOW ALL, still
+	// reachable by name.
+	FlagNoShowAll
 )
 
 // Variable is one GUC. Use NewVariable in BuildDefaultRegistry rather
@@ -146,7 +149,7 @@ type Variable struct {
 	MinVal      float64 // valid for Int/Real
 	MaxVal      float64
 	EnumOptions []string            // valid for Enum
-	CheckFn     func(string) error  // optional post-canonicalisation validation
+	CheckFn     func(string) error  // optional validation of the canonical value, every type
 }
 
 // canonicalize normalises an incoming string value into the form we
@@ -179,6 +182,19 @@ func realNumericPrefixLen(s string) int {
 // (a partial spec like "SET datestyle = 'SQL'" must keep the existing
 // order component — see mergeDateStyle); every other type ignores current.
 func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
+	canon, err := v.canonicalizeType(current, value)
+	if err != nil || v.CheckFn == nil {
+		return canon, err
+	}
+	// The check hook sees the canonical form, as PG's check hooks see the
+	// parsed value (check_ssl gets a bool, not the spelling "yes").
+	if err := v.CheckFn(canon); err != nil {
+		return "", err
+	}
+	return canon, nil
+}
+
+func (v *Variable) canonicalizeType(current, value string) (string, error) {
 	if strings.EqualFold(v.Name, "DateStyle") {
 		return mergeDateStyle(current, v.BootVal, value)
 	}
@@ -303,11 +319,6 @@ func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
 		}
 		return fStr, nil
 	case TypeString:
-		if v.CheckFn != nil {
-			if err := v.CheckFn(value); err != nil {
-				return "", err
-			}
-		}
 		return value, nil
 	case TypeEnum:
 		for _, opt := range v.EnumOptions {

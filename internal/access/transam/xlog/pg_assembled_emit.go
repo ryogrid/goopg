@@ -483,11 +483,13 @@ const sizeOfXLogHeapPruneData = 2
 // prune (opportunistic or VACUUM-scan). Main data is {reason=0, flags}; block 0
 // carries the redirection pairs (XLHP_HAS_REDIRECTIONS: ntargets + u2[2*n], each
 // pair = old-slot, target-slot, matching goopg's [2]uint16 redirects exactly)
-// followed by the now-unused slots (XLHP_HAS_NOW_UNUSED_ITEMS: ntargets + u2[n]).
-// goopg reclaims LP_DEAD items directly, so there is no XLHP_HAS_DEAD_ITEMS.
+// then the now-dead slots (XLHP_HAS_DEAD_ITEMS: ntargets + u2[n]; items left
+// LP_DEAD because an index entry still points at them, M0145-0008v), then the
+// now-unused slots (XLHP_HAS_NOW_UNUSED_ITEMS: ntargets + u2[n]), in PG's
+// sub-record order.
 // opcode = XLOG_HEAP2_PRUNE_ON_ACCESS; xl_xid = 0 (pruning is not transactional
 // user-data).
-func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) ([]byte, error) {
+func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, dead, unused []uint16) ([]byte, error) {
 	// XLHP_CLEANUP_LOCK unconditionally: goopg's prune redirects chain roots
 	// and reclaims slots that still have storage, which is precisely the
 	// full-prune shape upstream refuses to replay without this flag. See the
@@ -502,6 +504,13 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 			blockData = binary.LittleEndian.AppendUint16(blockData, r[1])
 		}
 	}
+	if len(dead) > 0 {
+		flags |= xlhpHasDeadItems
+		blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(dead)))
+		for _, d := range dead {
+			blockData = binary.LittleEndian.AppendUint16(blockData, d)
+		}
+	}
 	if len(unused) > 0 {
 		flags |= xlhpHasNowUnusedItems
 		blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(unused)))
@@ -512,6 +521,29 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 	mainData := []byte{0, flags} // reason = 0, flags
 	return framedAssemble(RmgrHeap2, xlogHeap2PruneOnAccess, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
 }
+
+// EncodeHeapVacuumCleanupPG builds the xl_heap_prune record VACUUM's second
+// heap pass writes (lazy_vacuum_heap_page, vacuumlazy.c): opcode
+// XLOG_HEAP2_PRUNE_VACUUM_CLEANUP, reason PRUNE_VACUUM_CLEANUP, and only the
+// now-unused sub-record, listing LP_DEAD items whose index entries are gone.
+// No XLHP_CLEANUP_LOCK: no tuple byte moves, so PG's redo only marks the items
+// unused and truncates the line-pointer array (heap_page_prune_execute's
+// lp_truncate_only arm). M0145-0008v.
+func EncodeHeapVacuumCleanupPG(rel storage.RelFileNode, blk storage.BlockNumber, unused []uint16) ([]byte, error) {
+	if len(unused) == 0 {
+		return nil, fmt.Errorf("wal: heap vacuum-cleanup record needs at least one now-unused item")
+	}
+	blockData := binary.LittleEndian.AppendUint16(nil, uint16(len(unused)))
+	for _, u := range unused {
+		blockData = binary.LittleEndian.AppendUint16(blockData, u)
+	}
+	mainData := []byte{pruneReasonVacuumCleanup, xlhpHasNowUnusedItems}
+	return framedAssemble(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
+}
+
+// pruneReasonVacuumCleanup is PG's PRUNE_VACUUM_CLEANUP (PruneReason, heapam.h),
+// the xl_heap_prune.reason of a second-heap-pass record.
+const pruneReasonVacuumCleanup = 2
 
 // EncodeHeapFreezePG builds a PostgreSQL xl_heap_prune record for one page's
 // tuple freeze. goopg freezes uniformly (rewrites each frozen tuple's xmin to

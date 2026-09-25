@@ -119,6 +119,23 @@ func TestLeftJoinSearchAdmissionValues(t *testing.T) {
 				"LEFT JOIN lj_s ON lj_p.id = lj_s.id ORDER BY lj_t.id",
 			want: []string{"1|100", "2|200", "3|NULL"},
 		},
+		{
+			// R40/K69, required-by-review shape: a further join chained
+			// onto a LEFT->ANTI demotion, in the SAME FromExpr, referencing
+			// a column from the third relation. This is the shape that
+			// exercises the per-item schema-narrowing fix
+			// (planner.go's planFromItem) -- a 2-relation-only case would
+			// stay green even if that narrowing were dropped or wrong,
+			// since the bug only surfaces when a later join's column
+			// offsets are computed against the still-too-wide schema.
+			// Exactly Q78's own repro shape
+			// (`<channel>_sales LEFT JOIN <channel>_returns ... JOIN
+			// date_dim ... WHERE <returns>.order_number IS NULL`).
+			name: "left->anti demotion with a further join chained onto it",
+			q: "SELECT lj_t.id, lj_s.z FROM lj_t LEFT JOIN lj_p ON lj_t.id = lj_p.id " +
+				"JOIN lj_s ON lj_t.id = lj_s.id WHERE lj_p.y IS NULL ORDER BY lj_t.id",
+			want: []string{"3|300"},
+		},
 	}
 
 	for _, c := range cases {

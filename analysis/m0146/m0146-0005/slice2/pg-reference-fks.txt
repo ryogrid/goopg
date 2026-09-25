@@ -1,0 +1,8 @@
+lineitem|lineitem_partsupp_fk|FOREIGN KEY (l_partkey, l_suppkey) REFERENCES partsupp(ps_partkey, ps_suppkey)
+orders|order_customer_fk|FOREIGN KEY (o_custkey) REFERENCES customer(c_custkey)
+partsupp|partsupp_part_fk|FOREIGN KEY (ps_partkey) REFERENCES part(p_partkey)
+partsupp|partsupp_supplier_fk|FOREIGN KEY (ps_suppkey) REFERENCES supplier(s_suppkey)
+supplier|supplier_nation_fk|FOREIGN KEY (s_nationkey) REFERENCES nation(n_nationkey)
+customer|customer_nation_fk|FOREIGN KEY (c_nationkey) REFERENCES nation(n_nationkey)
+nation|nation_region_fk|FOREIGN KEY (n_regionkey) REFERENCES region(r_regionkey)
+lineitem|lineitem_order_fk|FOREIGN KEY (l_orderkey) REFERENCES orders(o_orderkey) DEFERRABLE

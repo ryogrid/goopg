@@ -38,7 +38,8 @@ func TestRelStatsAccumulateFlushGet(t *testing.T) {
 		t.Fatalf("after flush(1): expected shared entry")
 	}
 	// Only session 1's pending applied: 1 scan, 2 returned, 3 inserted, +3 live.
-	want := relStatCounters{numScans: 1, tuplesReturned: 2, tuplesInserted: 3, deltaLive: 3}
+	// The 3 committed inserts are also 3 change events and 3 ins_since_vacuum.
+	want := relStatCounters{numScans: 1, tuplesReturned: 2, tuplesInserted: 3, deltaLive: 3, changedTuples: 3, insSinceVacuum: 3}
 	if got != want {
 		t.Fatalf("after flush(1): got %+v want %+v", got, want)
 	}
@@ -46,8 +47,10 @@ func TestRelStatsAccumulateFlushGet(t *testing.T) {
 	// Session 2's delete is still pending; flush it and verify dead/live deltas.
 	m.flush(2)
 	got, _ = m.get(oid)
-	// delete: tuplesDeleted +1, deltaDead +1, deltaLive -1 → live 3-1=2, dead 1.
-	want = relStatCounters{numScans: 1, tuplesReturned: 2, tuplesInserted: 3, tuplesDeleted: 1, deltaLive: 2, deltaDead: 1}
+	// delete: tuplesDeleted +1, deltaDead +1, deltaLive -1 → live 3-1=2, dead 1;
+	// the committed delete adds 1 change event (mod_since_analyze 4) but no
+	// attempted insert (ins_since_vacuum stays 3).
+	want = relStatCounters{numScans: 1, tuplesReturned: 2, tuplesInserted: 3, tuplesDeleted: 1, deltaLive: 2, deltaDead: 1, changedTuples: 4, insSinceVacuum: 3}
 	if got != want {
 		t.Fatalf("after flush(2): got %+v want %+v", got, want)
 	}
@@ -91,7 +94,9 @@ func TestRelStatsAbortDeadTuples(t *testing.T) {
 	// ins = 1 + 3 = 4 (attempted), upd = 5, del = 1, live stays 1 (no commit
 	// delta), dead = 3 + 5 = 8 (aborted inserts + updates; aborted delete is a
 	// no-op). This is the stats.spec s1_rollback_prepared_a expected row.
-	want := relStatCounters{tuplesInserted: 4, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 1, deltaDead: 8}
+	// ins_since_vacuum counts the aborted inserts too (4); mod_since_analyze
+	// only counts the baseline commit (1 — an abort generates no change events).
+	want := relStatCounters{tuplesInserted: 4, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 1, deltaDead: 8, changedTuples: 1, insSinceVacuum: 4}
 	if got != want {
 		t.Fatalf("abort math: got %+v want %+v", got, want)
 	}
@@ -128,9 +133,13 @@ func TestRelStatsTruncateCommit(t *testing.T) {
 	// ins = 1(setup) + 3(autocommit) + 1(post-truncate) = 5; the two pre-truncate
 	// updates were reset, so upd = 1; live/dead forgotten by the truncate then
 	// rebuilt from the post-truncate insert/update → live 1, dead 1.
+	// mod_since_analyze = 4 baseline changes + 2 post-truncate = 6 (a committed
+	// truncate does not reset it); ins_since_vacuum is reset by the committed
+	// truncate, then rebuilt by the 1 post-truncate insert → 1.
 	if got.tuplesInserted != 5 || got.tuplesUpdated != 1 || got.tuplesDeleted != 0 ||
-		got.deltaLive != 1 || got.deltaDead != 1 {
-		t.Fatalf("truncate commit: got %+v want ins=5 upd=1 del=0 live=1 dead=1", got)
+		got.deltaLive != 1 || got.deltaDead != 1 ||
+		got.changedTuples != 6 || got.insSinceVacuum != 1 {
+		t.Fatalf("truncate commit: got %+v want ins=5 upd=1 del=0 live=1 dead=1 mod=6 insvac=1", got)
 	}
 }
 
@@ -156,7 +165,9 @@ func TestRelStatsTwoPhaseCommit(t *testing.T) {
 	m.finalizePrepared("g", 2, true)
 	m.flush(2)
 	got, _ := m.get(oid)
-	want := relStatCounters{tuplesInserted: 3, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 2, deltaDead: 6}
+	// Commit: dead = upd + del = 6, live = ins - del = 2; the 9 committed events
+	// are mod_since_analyze 9 and ins_since_vacuum 3.
+	want := relStatCounters{tuplesInserted: 3, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 2, deltaDead: 6, changedTuples: 9, insSinceVacuum: 3}
 	if got != want {
 		t.Fatalf("2PC commit: got %+v want %+v", got, want)
 	}
@@ -174,10 +185,79 @@ func TestRelStatsTwoPhaseAbort(t *testing.T) {
 	m.finalizePrepared("g", 2, false)
 	m.flush(2)
 	got, _ := m.get(oid)
-	// Abort: ins/upd/del counted, dead = ins + upd = 8, no live delta.
-	want := relStatCounters{tuplesInserted: 3, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 0, deltaDead: 8}
+	// Abort: ins/upd/del counted, dead = ins + upd = 8, no live delta, no
+	// change events — but ins_since_vacuum counts the 3 attempted inserts.
+	want := relStatCounters{tuplesInserted: 3, tuplesUpdated: 5, tuplesDeleted: 1, deltaLive: 0, deltaDead: 8, insSinceVacuum: 3}
 	if got != want {
 		t.Fatalf("2PC abort: got %+v want %+v", got, want)
+	}
+}
+
+// TestRelStatsTruncateAbortRestores verifies restore_truncdrop_counters: an
+// aborted in-transaction TRUNCATE restores the pre-truncate attempted counts
+// (the post-truncate work happened on the doomed new relfilenode), and the
+// abort dead-tuple math uses the restored values. This is the stats.spec
+// s1_table_truncate + ROLLBACK PREPARED expected row (3|9|4|2|0|4|2|0).
+func TestRelStatsTruncateAbortRestores(t *testing.T) {
+	m := newRelationStatsManager()
+	const oid = uint32(23)
+	// Baseline: setup k0 + an autocommit 3-row insert (ins=4, live=4).
+	m.recordInsert(1, oid, 1)
+	m.commitXact(1)
+	m.recordInsert(1, oid, 3)
+	m.commitXact(1)
+	m.flush(1)
+
+	// Explicit transaction: two updates (pre-truncate), TRUNCATE, insert 1,
+	// update 1, then ABORT.
+	m.recordUpdate(1, oid, 2)
+	m.recordTruncate(1, oid)
+	m.recordInsert(1, oid, 1)
+	m.recordUpdate(1, oid, 1)
+	m.abortXact(1)
+	m.flush(1)
+
+	got, _ := m.get(oid)
+	// Abort restores the pre-truncate counters (ins 0, upd 2, del 0), discarding
+	// the post-truncate work: attempted ins = 4, upd = 2, del = 0; live is
+	// untouched (4); dead = restored ins + upd = 2. The 4 baseline commits are
+	// change events; the abort adds none.
+	want := relStatCounters{tuplesInserted: 4, tuplesUpdated: 2, deltaLive: 4, deltaDead: 2, changedTuples: 4, insSinceVacuum: 4}
+	if got != want {
+		t.Fatalf("truncate abort: got %+v want %+v", got, want)
+	}
+}
+
+// TestRelStatsReportVacuumAnalyze verifies pgstat_report_vacuum /
+// pgstat_report_analyze: a successful VACUUM overwrites the shared live/dead
+// estimates with the pass's measured values, zeroes ins_since_vacuum and bumps
+// vacuum_count; ANALYZE zeroes mod_since_analyze. Pending deltas keep applying
+// on top of the report's absolute values at the next flush.
+func TestRelStatsReportVacuumAnalyze(t *testing.T) {
+	m := newRelationStatsManager()
+	const oid = uint32(29)
+	m.recordInsert(1, oid, 5)
+	m.recordUpdate(1, oid, 2)
+	m.commitXact(1)
+	m.flush(1)
+	// Baseline: live 5, dead 2, ins_since_vacuum 5, mod_since_analyze 7.
+	m.reportVacuum(oid, 5, 0)
+	got, _ := m.get(oid)
+	if got.deltaLive != 5 || got.deltaDead != 0 || got.insSinceVacuum != 0 || got.vacuumCount != 1 {
+		t.Fatalf("after reportVacuum: got %+v want live=5 dead=0 insvac=0 vac=1", got)
+	}
+	// Post-vacuum DML accumulates on top of the reported absolutes.
+	m.recordInsert(1, oid, 1)
+	m.commitXact(1)
+	m.flush(1)
+	got, _ = m.get(oid)
+	if got.deltaLive != 6 || got.changedTuples != 8 || got.insSinceVacuum != 1 {
+		t.Fatalf("post-vacuum flush: got %+v want live=6 mod=8 insvac=1", got)
+	}
+	m.reportAnalyze(oid)
+	got, _ = m.get(oid)
+	if got.changedTuples != 0 || got.deltaLive != 6 || got.vacuumCount != 1 {
+		t.Fatalf("after reportAnalyze: got %+v want mod=0 live=6 vac=1", got)
 	}
 }
 

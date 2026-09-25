@@ -44,10 +44,9 @@ func seamChainFromSQL(t *testing.T, names []string, rows []int64, from string) (
 }
 
 // seamChainFromSQLWrapped is seamChainFromSQL with each leaf passed through
-// `wrap` (nil = identity) before the chain is built over it — C-04b's firewall
-// fixture builds Filter-wrapped CTE leaves this way, over the SAME bindings
-// and joinlist a base-table chain gets, so the only thing that differs is what
-// the leaf classifier sees.
+// `wrap` (nil = identity) before the chain is built over it — C-04b's
+// (now-retired) firewall fixtures built Filter-wrapped CTE leaves this way,
+// over the SAME bindings and joinlist a base-table chain gets.
 func seamChainFromSQLWrapped(t *testing.T, names []string, rows []int64, from string, wrap func(i int, leaf Node) Node) (Node, *resolveContext) {
 	t.Helper()
 	base, ctx := seamFixture(names, rows)
@@ -129,80 +128,6 @@ func spinePlanJoinType(t *testing.T, pt parser.JoinType) JoinType {
 	}
 }
 
-// TestJoinlistTagsAPinnedOuterJoinWithItsType is the producer half: the joinlist
-// now records WHICH join pinned an item, which is the fact everything else in
-// this file rests on.
-//
-// Before P5.9-s a pinned item was indistinguishable from a
-// `from_collapse_limit` sub-list, so `makeRelFromJoinlist` had no way to tell a
-// forced order from an outer join and searched both alike.
-// C-04a retargeted it from LEFT to RIGHT, and C-04b from RIGHT to FULL: LEFT
-// and RIGHT no longer pin and no longer start a spine (they enter the search
-// themselves); FULL still does, and the tag is still what tells
-// `makeRelFromJoinlist` a forced order from an outer join. The LEFT/RIGHT
-// half of this claim lives in TestSeamPlansALeftLinkInsideOneSearchProblem
-// and TestSeamPlansARightLinkInsideOneSearchProblem.
-func TestJoinlistTagsAPinnedOuterJoinWithItsType(t *testing.T) {
-	jl := deconstructJointree(
-		parseFrom(t, "a JOIN b ON a.x = b.x FULL JOIN c ON b.x = c.x"),
-		defaultCollapseLimits())
-
-	if len(jl) != 1 {
-		t.Fatalf("joinlist has %d items, want 1 (the FULL pin absorbs the chain)", len(jl))
-	}
-	if !jl[0].pinnedOuter() {
-		t.Fatalf("the top item is not marked as a pinned outer join (jointype=%s)",
-			joinTypeName(jl[0].jointype))
-	}
-	if jl[0].jointype != parser.JoinFull {
-		t.Fatalf("pinned item jointype = %s, want FULL", joinTypeName(jl[0].jointype))
-	}
-
-	prefix, spine := jl.innerPrefixBelowOuterSpine()
-	if len(spine) != 1 || spine[0] != parser.JoinFull {
-		t.Fatalf("spine = %v, want one FULL link", spine)
-	}
-	if got := prefix.leaves(nil); len(got) != 2 || got[0] != 0 || got[1] != 1 {
-		t.Fatalf("inner prefix leaves = %v, want [0 1] — the two INNER-joined relations", got)
-	}
-
-	// C-04a/b: a LEFT or RIGHT link in the same position does NOT pin, does
-	// NOT start a spine, and leaves one flat three-relation problem behind.
-	for _, spelling := range []string{"LEFT JOIN", "RIGHT JOIN"} {
-		flat := deconstructJointree(
-			parseFrom(t, "a JOIN b ON a.x = b.x "+spelling+" c ON b.x = c.x"),
-			defaultCollapseLimits())
-		if len(flat) != 3 {
-			t.Fatalf("%s joinlist has %d items, want 3 — the link must flatten (C-04a/b)", spelling, len(flat))
-		}
-		if _, spine := flat.innerPrefixBelowOuterSpine(); len(spine) != 0 {
-			t.Fatalf("%s spine = %v, want none: the link belongs in the search now", spelling, spine)
-		}
-	}
-}
-
-// TestInnerPrefixIsTheIdentityWithoutAnOuterPin: a joinlist with no outer pin
-// must come back unchanged, because that is the path every shape P5.9-r already
-// searched still takes. An `innerPrefixBelowOuterSpine` that "helpfully" unwrapped
-// an INNER pin would silently change which orders those statements consider.
-func TestInnerPrefixIsTheIdentityWithoutAnOuterPin(t *testing.T) {
-	for _, from := range []string{
-		"a, b, c",
-		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x",
-	} {
-		t.Run(from, func(t *testing.T) {
-			jl := deconstructJointree(parseFrom(t, from), defaultCollapseLimits())
-			prefix, spine := jl.innerPrefixBelowOuterSpine()
-			if len(spine) != 0 {
-				t.Fatalf("spine = %v, want none: %q has no outer link", spine, from)
-			}
-			if len(prefix) != len(jl) {
-				t.Fatalf("prefix has %d items, want the joinlist's own %d", len(prefix), len(jl))
-			}
-		})
-	}
-}
-
 // TestSearchRefusesToPlanAPinnedOuterJoin is the guard that replaces an
 // accident. Handing `makeRelFromJoinlist` a pinned outer join it cannot rebuild
 // asks it to build an outer join, and the only tree it can build is an inner
@@ -224,7 +149,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 	names := []string{"a", "b"}
 	prob := rfjProblem(names, []int64{1000, 10}, nil)
 	jl := joinlist{pinnedItem(parser.JoinFull, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
-	_, err := planJoinlistSearch(jl, prob)
+	_, _, err := planJoinlistSearch(jl, prob)
 	if err == nil {
 		t.Fatal("the search planned a pinned FULL join — it can only have built an INNER join, " +
 			"which drops the unmatched rows the statement asked for")
@@ -243,7 +168,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinRight} {
 		prob := rfjProblem(names, []int64{1000, 10}, nil)
 		jl := joinlist{pinnedItem(jt, joinlist{leafItem(0)}, joinlist{leafItem(1)})}
-		_, err := planJoinlistSearch(jl, prob)
+		_, _, err := planJoinlistSearch(jl, prob)
 		if err == nil {
 			t.Fatalf("the search planned a pinned %s join with NO SpecialJoinInfo in the list — "+
 				"it can only have built an INNER join", joinTypeName(jt))
@@ -262,7 +187,7 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 		jl[0].sjinfo = sj
 		prob.joinInfoList = []*SpecialJoinInfo{sj}
 		prob.conjuncts = []Expr{rfjEq(names, 0, 1)}
-		rel, err := planJoinlistSearch(jl, prob)
+		rel, _, err := planJoinlistSearch(jl, prob)
 		if err != nil {
 			t.Fatalf("pinned %s join WITH its SpecialJoinInfo: %v", joinTypeName(jt), err)
 		}
@@ -293,7 +218,6 @@ func TestSearchRefusesToPlanAPinnedOuterJoin(t *testing.T) {
 //   - the LEFT link planned as an INNER join, which is the wrong answer the
 //     whole C-03 series exists to prevent.
 func TestSeamPlansALeftLinkInsideOneSearchProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -357,7 +281,6 @@ func TestSeamPlansALeftLinkInsideOneSearchProblem(t *testing.T) {
 // is its adjudication: the conjunct must come back as the residual, by
 // identity, and no leaf may have acquired a filter.
 func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -388,7 +311,6 @@ func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 // The delay test is `qual reaches the nullable side`, not `qual is a leaf
 // local`, precisely so this conjunct is held too.
 func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -415,7 +337,6 @@ func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
 // refuses — and the fixture checks the tree came back untouched rather than
 // half-spliced.
 func TestPGShapedSeamDeclinesAFullSpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x FULL JOIN d ON c.x = d.x")
@@ -445,7 +366,6 @@ func TestPGShapedSeamDeclinesAFullSpine(t *testing.T) {
 // are new: exactly one LEFT join with `d` alone on its preserved input, and a
 // preserved-side `WHERE` that DOES distribute.
 func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	from := "a JOIN b ON a.x = b.x JOIN c ON b.x = c.x RIGHT JOIN d ON c.x = d.x"
 
@@ -549,7 +469,6 @@ func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
 // (which sits on the LEFT link's PRESERVED side) and is still delayed above
 // the whole tree.
 func TestSeamPlansARightLinkUnderALeftLinkInOneProblem(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100},
 		"a JOIN b ON a.x = b.x RIGHT JOIN c ON b.x = c.x LEFT JOIN d ON c.x = d.x")
@@ -598,7 +517,6 @@ func TestSeamPlansARightLinkUnderALeftLinkInOneProblem(t *testing.T) {
 // join — 03 §4.4's real work, not this task's. It must decline, and the fixture
 // checks the tree came back untouched rather than half-spliced.
 func TestPGShapedSeamDeclinesAnOuterLinkBelowAnInnerOne(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10},
 		"a LEFT JOIN b ON a.x = b.x JOIN c ON b.x = c.x")
@@ -619,7 +537,6 @@ func TestPGShapedSeamDeclinesAnOuterLinkBelowAnInnerOne(t *testing.T) {
 // contract honest — a "searched" tree of one leaf would tag a scan and make the
 // legacy layout passes skip it for nothing.
 func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 10},
 		"a LEFT JOIN b ON a.x = b.x")
@@ -666,7 +583,6 @@ func TestPGShapedSeamSearchesAOneRelationPrefixUnderASpine(t *testing.T) {
 // survive as LEFT joins in the searched tree — a chain that admitted one and
 // planned the other as an inner join is the failure this fixture is sized for.
 func TestPGShapedSeamPeelsATwoLinkSpine(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c", "d", "e"}
 	node, ctx := seamChainFromSQL(t, names, []int64{1_000_000, 500_000, 10, 100, 50},
 		"a JOIN b ON a.x = b.x JOIN c ON b.x = c.x "+

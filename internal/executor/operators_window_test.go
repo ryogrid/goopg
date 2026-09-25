@@ -379,3 +379,66 @@ func TestWindowOpRankWithPeersAndPartitions(t *testing.T) {
 		}
 	}
 }
+
+
+// TestWindowOpPresortedFlagControlsTheInternalSort (R6, plan-parity-fix-take2)
+// pins both halves of the executor change on ONE fixture whose input is
+// deliberately out of key order, so "sorted" and "passed through" cannot be
+// confused.
+//
+//   - Presorted FALSE (the zero value): windowOp must still sort internally.
+//     This is the fail-closed guarantee that keeps every hand-built node and
+//     every pre-R6 producer correct now that the planner, not the executor,
+//     is normally responsible for the ordering.
+//   - Presorted TRUE: windowOp must NOT sort, because `createWindowPlan` has
+//     stacked the Sort PG's `create_one_window_path` stacks. Sorting again
+//     would be duplicated work on every windowed query.
+func TestWindowOpPresortedFlagControlsTheInternalSort(t *testing.T) {
+	mk := func(presorted bool) *optimizer.WindowAgg {
+		return &optimizer.WindowAgg{
+			// Rows are supplied in DESCENDING val order within group 1.
+			Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 30}},
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+			}},
+			PartitionBy: []optimizer.Expr{
+				&optimizer.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}},
+			},
+			OrderBy: []optimizer.SortKey{
+				{Expr: &optimizer.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int4"}}},
+			},
+			Funcs: []optimizer.WindowFunc{
+				{Name: "row_number", Type: catalog.Type{Name: "int8"}},
+			},
+			Presorted: presorted,
+		}
+	}
+	vals := func(plan *optimizer.WindowAgg) []int64 {
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := Run(op, NewContext())
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]int64, len(rows))
+		for i, r := range rows {
+			out[i] = r[1].Int
+		}
+		return out
+	}
+
+	// Fail-closed: no flag, so windowOp sorts and emits 10, 20, 30.
+	if got := vals(mk(false)); !(len(got) == 3 && got[0] == 10 && got[1] == 20 && got[2] == 30) {
+		t.Fatalf("Presorted=false emitted %v, want the internally sorted 10,20,30 — "+
+			"a WindowAgg without the plan's Sort MUST sort its own input", got)
+	}
+	// Presorted: windowOp trusts the plan and leaves the arrival order alone,
+	// so the deliberately unsorted input comes back as 30, 10, 20.
+	if got := vals(mk(true)); !(len(got) == 3 && got[0] == 30 && got[1] == 10 && got[2] == 20) {
+		t.Fatalf("Presorted=true emitted %v, want the untouched arrival order 30,10,20 — "+
+			"the plan's Sort already ordered the input and windowOp must not redo it", got)
+	}
+}

@@ -488,3 +488,53 @@ func TestStripeAppendBuiltEmittedWatchdog(t *testing.T) {
 		t.Fatal("watchdog: stripeAppendBuiltEmitted serial loop exceeded 5s")
 	}
 }
+
+// TestStripeAppendBuiltEmittedMemRingEvictionDoesNotFailAppend pins the
+// slice B contract that a MemRing mirror-write eviction is a skipped cache
+// fill, not an append failure. A peer stripe's AdvanceWindow can slide
+// memRing.head past a reservation's start LSN between this stripe's own
+// AdvanceWindow and its WriteReserved; before 2026-09-19 that surfaced
+// errMemRingReservedOutOfRange to tryAppend, which released the walBuf
+// capacity claim while curr stayed advanced — an uncounted LSN hole that
+// cascaded into errWALBufferReservedOutOfRange and the readForDrain panic
+// (TestPort_IsolationSuite, M-NIGHTLY AI-20260916-035206-008). The memRing
+// is a walsender read cache; misses fall back to the segment file, so the
+// append must succeed and the walBuf bytes must still land.
+func TestStripeAppendBuiltEmittedMemRingEvictionDoesNotFailAppend(t *testing.T) {
+	t.Parallel()
+	locks, posTracker, insertTracker, walBuf, _, _ := makeStripeAppendFixture(t, 1<<20)
+
+	// Shrink the mirror so a modest window advance evicts the next write.
+	memRingSmall := NewMemRing(256)
+	const recordLen = 64
+	start, _, total, _, err := stripeAppendBuiltEmitted(
+		locks, posTracker, insertTracker, walBuf, memRingSmall, 0, recordLen,
+		func(_, p uint64, total, leading int) ([]byte, error) {
+			return emittedBuild(p, total, leading, recordLen), nil
+		})
+	if err != nil {
+		t.Fatalf("baseline append: %v", err)
+	}
+
+	// Evict the NEXT reservation's start: slide memRing.head past it the way
+	// a peer stripe's AdvanceWindow(end_p > start+cap) would.
+	curr, _ := posTracker.load()
+	memRingSmall.AdvanceWindow(int64(curr) + 512) // head = curr + 256 > curr
+
+	start2, _, total2, _, err := stripeAppendBuiltEmitted(
+		locks, posTracker, insertTracker, walBuf, memRingSmall, 0, recordLen,
+		func(_, p uint64, total, leading int) ([]byte, error) {
+			return emittedBuild(p, total, leading, recordLen), nil
+		})
+	if err != nil {
+		t.Fatalf("append under evicted memRing window: %v (want nil — cache miss is not an append failure)", err)
+	}
+	// walBuf still received the bytes even though the mirror missed.
+	walBuf.tail.Store(int64(start2) + int64(total2))
+	got := make([]byte, total2)
+	if n := walBuf.readAt(int64(start2), got); n != total2 {
+		t.Fatalf("walBuf.readAt(start=%d) n=%d, want %d — record bytes lost", start2, n, total2)
+	}
+	_ = start
+	_ = total
+}

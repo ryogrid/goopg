@@ -10,13 +10,14 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestCatalogRowLive pins the B0.1 unified reload visibility filter
-// (doc 02a §2.3) — the exact rules the pre-B0.1 pg_class/pg_attribute
-// scans implemented inline:
+// TestCatalogRowLive pins the B0.2 unified reload visibility filter (doc 02a
+// §2.3, landed by P0-E5):
 //
-//	xmin Invalid → dead; any non-zero xmax → dead; aborted xmin → dead
-//	(every layout); out-of-range/unknown xmin passes (basebackup
-//	pass-through) UNLESS requireCommittedXmin (legacy-layout pg_class rows).
+//	xmin Invalid → dead; non-zero xmax → dead UNLESS the xmax transaction
+//	aborted (committed/unknown-horizon xmax → dead, aborted xmax → live);
+//	aborted xmin → dead (every layout); out-of-range/unknown xmin passes
+//	(basebackup pass-through) UNLESS requireCommittedXmin (legacy-layout
+//	pg_class rows).
 func TestCatalogRowLive(t *testing.T) {
 	dir := t.TempDir()
 	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
@@ -50,8 +51,9 @@ func TestCatalogRowLive(t *testing.T) {
 		want             bool
 	}{
 		{"invalid xmin", ht(storage.InvalidTransactionID, 0), false, false},
-		{"deleted (nonzero xmax)", ht(committedXid, committedXid), false, false},
-		{"deleted even by aborted xmax (B0.1 rule; upgraded in B0.2)", ht(committedXid, abortedXid), false, false},
+		{"deleted (committed xmax)", ht(committedXid, committedXid), false, false},
+		{"NOT deleted by an aborted xmax (B0.2: superseding xact never committed)", ht(committedXid, abortedXid), false, true},
+		{"deleted (unknown/horizon xmax treated as committed)", ht(committedXid, unknownXid), false, false},
 		{"committed xmin", ht(committedXid, 0), false, true},
 		{"aborted xmin", ht(abortedXid, 0), false, false},
 		{"aborted xmin, lax mode still dead", ht(abortedXid, 0), false, false},

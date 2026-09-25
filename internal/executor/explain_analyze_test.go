@@ -164,12 +164,65 @@ func TestExplainAnalyzeRowsRemovedByJoinFilter(t *testing.T) {
 		}
 	}
 
-	// Hash join on a.id=b.id with extra residual b.val <> 'y'.
-	// The hash key matches but the residual rejects on id=2 (val='y').
+	// Hash join on a.id=b.id with the two-sided residual a.id + b.id <> 4:
+	// the hash key matches but the residual rejects the id=2 pair. The
+	// residual must reference both sides — a one-sided ON qual such as
+	// b.val <> 'y' is pushed into b's scan as a plain Filter, which is
+	// what PG 18.3 prints (and the jointree arm, M0145-0030).
 	lines := runExplainRows(t, ctx,
-		"EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.id AND b.val <> 'y'")
+		"EXPLAIN ANALYZE SELECT * FROM a JOIN b ON a.id = b.id AND a.id + b.id <> 4")
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Rows Removed by Join Filter:") {
 		t.Errorf("missing 'Rows Removed by Join Filter' line:\n%s", joined)
+	}
+}
+
+// TestRowsPerLoopIsPGsPerLoopAverage: PG's `rows=` is
+// `instrument->ntuples / nloops` (explain.c:1835,1901) — a PER-LOOP
+// average, never the cumulative total across every re-Open of a
+// repeatedly-executed node (a correlated subplan or an NL/NLI inner
+// side is re-Open'd once per outer row). operators_explain.go's text,
+// JSON, and per-worker renderers previously printed the raw cumulative
+// `rowsOut` unconditionally, which inflated `rows=` by up to `loops`x
+// on any such node and made every one of them look like a planner
+// cardinality miss to `make ea-ratchet` when it was actually a
+// mislabeled EXPLAIN ANALYZE actual-rows count (M0142-0004a: q34's
+// `Index Scan using store_pkey`, actual=9969 raw / loops=10082,
+// collapses to rows=0.99 once divided — matching goopg's own est=1).
+func TestRowsPerLoopIsPGsPerLoopAverage(t *testing.T) {
+	cases := []struct {
+		rowsOut, loops int64
+		want           float64
+	}{
+		{rowsOut: 9969, loops: 10082, want: 9969.0 / 10082.0},
+		{rowsOut: 3, loops: 1, want: 3},
+		{rowsOut: 0, loops: 0, want: 0}, // unexecuted node: no division, avoid NaN
+		{rowsOut: 6, loops: 3, want: 2},
+	}
+	for _, c := range cases {
+		if got := rowsPerLoop(c.rowsOut, c.loops); got != c.want {
+			t.Errorf("rowsPerLoop(%d, %d) = %v, want %v", c.rowsOut, c.loops, got, c.want)
+		}
+	}
+}
+
+// TestRound2MatchesExplainPropertyFloatNdigits2: the JSON/XML/YAML
+// "Actual Rows" field needs an explicit round to match PG's
+// `ExplainPropertyFloat(qlabel, unit, value, 2, es)` (explain_format.c:250,
+// `"%.*f"` with ndigits=2) — encoding/json prints a float64 at full
+// precision, unlike fmt's "%.2f" verb the text renderer already uses.
+func TestRound2MatchesExplainPropertyFloatNdigits2(t *testing.T) {
+	cases := []struct {
+		in, want float64
+	}{
+		{9969.0 / 10082.0, 0.99},
+		{2.0 / 3.0, 0.67},
+		{1, 1},
+		{0, 0},
+	}
+	for _, c := range cases {
+		if got := round2(c.in); got != c.want {
+			t.Errorf("round2(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }

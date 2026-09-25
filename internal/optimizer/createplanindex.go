@@ -334,17 +334,28 @@ func createIndexScanPlan(p *Path) Node {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
-	// so it builds a different node with a NARROWER schema. It carries no
-	// index clauses (a full index scan); `baseRelLayout` re-bases the
-	// narrowed output by name and the search boundary pads what was pruned —
-	// see DESIGN §15/§21.
+	// so it builds a different node with a NARROWER schema. It carries either
+	// no index clauses (a full index scan) or, since M0145-0029 slice 3, an
+	// equality-prefix probe that consumed EVERY local qual of the leaf;
+	// `baseRelLayout` re-bases the narrowed output by name and the search
+	// boundary pads what was pruned — see DESIGN §15/§21.
 	if p.IndexOnly {
 		if len(p.IndexOnlyCovered) == 0 {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s covers no columns", p.IndexInfo.Name))
 		}
-		if len(p.IndexClauses) != 0 {
-			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries %d index clauses; the producer builds a full index scan",
-				p.IndexInfo.Name, len(p.IndexClauses)))
+		ioKeys := make([]Expr, 0, len(p.IndexClauses))
+		ioDrop := map[Expr]bool{}
+		for i, c := range p.IndexClauses {
+			if c.indexCol != i || c.key == nil || c.local == nil {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a local equality-prefix clause",
+					p.IndexInfo.Name, i))
+			}
+			ioKeys = append(ioKeys, c.key)
+			ioDrop[c.local] = true
+		}
+		if len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
+				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
 		// Schema entries are COPIED from the leaf's own schema rather than
 		// synthesised: `SchemaColumn` carries a `SourceTableIdx` the leaf has
@@ -366,10 +377,7 @@ func createIndexScanPlan(p *Path) Node {
 			}
 			schema = append(schema, id.schema[at])
 		}
-		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
-		// written against the FULL leaf schema; the producer refuses a
-		// non-bare leaf precisely so there is nothing to reinstate.
-		return &IndexOnlyScan{
+		ios := &IndexOnlyScan{
 			pos:                   id.pos,
 			Table:                 id.table,
 			Alias:                 id.alias,
@@ -380,6 +388,37 @@ func createIndexScanPlan(p *Path) Node {
 			PrivilegeCheckRole:    id.privilegeCheckRole,
 			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 		}
+		// Key vs Keys as on the plain scan below; the executor pads a short
+		// prefix (operators_indexonly.go lookupKeys).
+		switch len(ioKeys) {
+		case 0:
+		case 1:
+			ios.Key = ioKeys[0]
+		default:
+			ios.Keys = ioKeys
+		}
+		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
+		// written against the FULL leaf schema; the producer admits a
+		// non-bare leaf only when its index clauses consume every local qual,
+		// so dropping them must leave nothing to reinstate.
+		if out := rewrapLeafDropping(p.Rel.baseLeaf, ios, ioDrop); out != Node(ios) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s would reinstate a leaf qual over the narrowed schema",
+				p.IndexInfo.Name))
+		}
+		return ios
+	}
+
+	// M0145-0029 slice 2: a range path's clauses are bounds on the leading
+	// column (`op` != equality), lowered onto LowKey/HighKey with the
+	// ORIGINAL strictness in LowOp/HighOp — the fields tryRangeIndexScan
+	// fills, which the executor and EXPLAIN already read.
+	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
+	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
+	if len(p.IndexClauses) >= 1 && len(p.IndexClauses[0].saop) > 0 {
+		return createSAOPIndexScanPlan(p, id, rewrap)
+	}
+	if hasRangeClause(p.IndexClauses) {
+		return createRangeIndexScanPlan(p, id, rewrap)
 	}
 
 	ncols := len(p.IndexInfo.Columns)
@@ -452,5 +491,187 @@ func createIndexScanPlan(p *Path) Node {
 	default:
 		is.Keys = keys
 	}
+	// A restriction path's index quals came out of the leaf's own Filter:
+	// reinstate the Filter WITHOUT them (PG's qpqual excludes quals redundant
+	// with the index quals, createplan.c:3068-3088).
+	drop := map[Expr]bool{}
+	for _, c := range p.IndexClauses {
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
+	}
 	return rewrap(is)
+}
+
+// hasRangeClause reports whether any clause is a range bound.
+func hasRangeClause(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if c.op != parser.OpUnknown {
+			return true
+		}
+	}
+	return false
+}
+
+// createRangeIndexScanPlan lowers a leading-column range path
+// (restrictionLeadingRange): at most one lower and one upper bound, every
+// clause on index column 0, none of them equality — anything else is a
+// producer bug, like the equality arm's panics.
+func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
+	if p.IndexOnly || p.RequiredOuter != 0 {
+		panic(fmt.Sprintf("createPlan: range PathIndexScan on %s must be a plain unparameterised scan", p.IndexInfo.Name))
+	}
+	is := &IndexScan{
+		pos:                   id.pos,
+		Table:                 id.table,
+		Alias:                 id.alias,
+		RTID:                  id.rtid,
+		Index:                 p.IndexInfo,
+		schema:                id.schema,
+		SmallDim:              id.smallDim,
+		UniqueKeys:            id.uniqueKeys,
+		PrivilegeCheckRole:    id.privilegeCheckRole,
+		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+	}
+	drop := map[Expr]bool{}
+	// Slice 2b: equality clauses first (index columns 0..n-1, in order) form
+	// RangePrefix; every bound then sits on column n.
+	var prefix []Expr
+	for _, c := range p.IndexClauses {
+		if c.op != parser.OpUnknown {
+			break
+		}
+		if c.indexCol != len(prefix) || c.key == nil || len(c.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s has a malformed equality prefix", p.IndexInfo.Name))
+		}
+		prefix = append(prefix, c.key)
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(prefix) > 0 {
+		is.RangePrefix = prefix
+	}
+	for i, c := range p.IndexClauses[len(prefix):] {
+		if c.indexCol != len(prefix) || c.key == nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
+		}
+		if len(prefix) > 0 && c.local != nil {
+			panic(fmt.Sprintf("createPlan: range clause %d of %s behind an equality prefix must stay a Filter recheck", i, p.IndexInfo.Name))
+		}
+		switch c.op {
+		case parser.OpGt, parser.OpGe:
+			if is.LowKey != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+			}
+			is.LowKey, is.LowOp = c.key, c.op
+		case parser.OpLt, parser.OpLe:
+			if is.HighKey != nil {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+			}
+			is.HighKey, is.HighOp = c.key, c.op
+		default:
+			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
+		}
+		if c.local != nil {
+			drop[c.local] = true
+		}
+	}
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
+	}
+	return rewrap(is)
+}
+
+// createSAOPIndexScanPlan lowers a leading-column ScalarArrayOp path
+// (restrictionLeadingSAOP) onto IndexScan.SAOPKeys — exclusive of every other
+// probe shape, as the executor requires.
+func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
+	c := p.IndexClauses[0]
+	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != 0 || c.key != nil || c.op != parser.OpUnknown {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be one leading-column clause on a plain unparameterised scan", p.IndexInfo.Name))
+	}
+	var low, high Expr
+	var lowOp, highOp parser.OpCode
+	for i, r := range p.IndexClauses[1:] {
+		// Bounds on the second column (restrictionRangeOnColumn(…, 1, …)):
+		// kept in the Filter, so they must carry no `local`.
+		if r.indexCol != 1 || r.key == nil || r.local != nil || len(r.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
+		}
+		switch r.op {
+		case parser.OpGt, parser.OpGe:
+			if low != nil {
+				panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+			}
+			low, lowOp = r.key, r.op
+		case parser.OpLt, parser.OpLe:
+			if high != nil {
+				panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+			}
+			high, highOp = r.key, r.op
+		default:
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, i+1))
+		}
+	}
+	is := &IndexScan{
+		pos:                   id.pos,
+		Table:                 id.table,
+		Alias:                 id.alias,
+		RTID:                  id.rtid,
+		Index:                 p.IndexInfo,
+		SAOPKeys:              append([]Expr(nil), c.saop...),
+		LowKey:                low,
+		LowOp:                 lowOp,
+		HighKey:               high,
+		HighOp:                highOp,
+		schema:                id.schema,
+		SmallDim:              id.smallDim,
+		UniqueKeys:            id.uniqueKeys,
+		PrivilegeCheckRole:    id.privilegeCheckRole,
+		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
+	}
+	if c.local != nil {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, map[Expr]bool{c.local: true})
+	}
+	return rewrap(is)
+}
+
+// rewrapLeafDropping rebuilds `leaf`'s Filter chain over `scan`, as
+// scanLeafFor's rewrapper does, but with the conjuncts in `drop` removed; a
+// wrapper left with no conjunct is omitted. Conjuncts are matched by pointer
+// identity against flattenExprAnd of each wrapper's predicate — the same
+// decomposition extractFilterConjuncts gave the producer.
+func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
+	var wrappers []*Filter
+	for n := leaf; ; {
+		f, ok := n.(*Filter)
+		if !ok {
+			break
+		}
+		wrappers = append(wrappers, f)
+		n = f.Child
+	}
+	out := scan
+	for i := len(wrappers) - 1; i >= 0; i-- {
+		w := wrappers[i]
+		var keep []Expr
+		for _, c := range flattenExprAnd(w.Predicate) {
+			if !drop[c] {
+				keep = append(keep, c)
+			}
+		}
+		if len(keep) == 0 {
+			continue
+		}
+		pred := keep[0]
+		for _, c := range keep[1:] {
+			pred = &BinaryOp{pos: pred.Pos(), Op: parser.OpAnd, Left: pred, Right: c}
+		}
+		out = &Filter{pos: w.pos, Child: out, Predicate: pred, LeafLocal: w.LeafLocal}
+	}
+	return out
 }

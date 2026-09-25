@@ -321,6 +321,16 @@ func isColumnRefConstEquality(e Expr) (*ColumnRef, Expr, bool) {
 // tuning. (M0077-0004 / Slice D.)
 const smallAnchorRowsThreshold = 1024
 
+// R36 NOTE (inert today, load-bearing if this is ever wired up): anchoring
+// rule (2) below tests `filteredRows*2 <= baseRows`. Since R36 removed the
+// reliability gate, EVERY relation carrying an unreliable filter now scales by
+// a DEFAULT_* constant (0.005 or 1/3), both below 1/2 — so the rule became
+// VACUOUSLY TRUE for them and would make every filtered relation an anchor,
+// synthesising inferred join edges. That is an ENUMERATION change, and
+// over-firing here is what produced the M0075/M0076 Q9 380-600 s hang this rule
+// was written to prevent. `inferAnchoredEqualities` has no non-test caller at
+// present, which is the only reason R36 did not have to address it. Re-derive
+// the threshold before giving it one.
 // inferAnchoredEqualities is the M0077-0004 (Slice D)
 // selective alternative to `inferTransitiveEqualities`.
 // Instead of the full transitive closure, it synthesises

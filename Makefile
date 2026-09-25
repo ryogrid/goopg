@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch ea-ratchet ea-ratchet-repin ledger-triage
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -68,7 +68,7 @@ help:
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
 	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; FAILS when unavailable (strict)."
-	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.5 (~1h)."
+	@echo "  make ea-ratchet         Estimate-accuracy parity ratchet vs PG 18.3 over TPC-DS SF0.25 (~10min)."
 	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
 	@echo
 	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
@@ -603,18 +603,37 @@ nightly-batch:
 # it cannot silently not-run again.
 #
 # It measures goopg's EXPLAIN ANALYZE estimate against its own actual
-# row count over the TPC-DS SF0.5 corpus, at base-relation AND joinrel
+# row count over the TPC-DS SF0.25 corpus (migrated from SF0.5 by
+# e2a50de40, 2026-09-11 — M0137-0018 found the comments here and the
+# pinned baseline had not followed), at base-relation AND joinrel
 # granularity, and fails a node only when goopg is materially worse
 # than PostgreSQL 18.3 on the same relation set (bench/tpcds/plans-pg).
 # That PG-relative bar is the only one that passes Q47 — where PG also
 # emits rows=1 — and fails Q99's 8007x.
 #
-# Runs on its own clone and its own port; it never touches the SF0.5
-# gate's cluster on 65437.  ~1 h for a full capture.  To re-score a
-# capture without a server:  EA_CAPTURE=<file> make ea-ratchet
+# Runs on its own clone and its own port; it never touches the SF0.25
+# gate's cluster on 65437.  ~10 min for a full capture (SF0.5's old
+# ~1h estimate predates the migration).  To re-score a capture without
+# a server:  EA_CAPTURE=<file> make ea-ratchet
 # ---------------------------------------------------------------
 ea-ratchet:
 	@bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
 
 ea-ratchet-repin:
 	@EA_REPIN=1 bash "$(REPO_ROOT)/scripts/estimate-parity-gate.sh"
+
+# ---------------------------------------------------------------
+# ledger-triage: bulk-triage report over .ralph/deferral_ledger.md
+# (M0144-0010, the M0119-successor cadence). Flags rows whose cited
+# code/tests no longer exist, folds same-mechanism rows into clusters,
+# emits only the survivors. Read-only — the ledger is append-only.
+#   make ledger-triage                     # report to stdout (~3min with
+#                                        # git-log attribution)
+#   LEDGER_TRIAGE_OUT=<file> make ledger-triage   # write to file
+#   LEDGER_TRIAGE_FAST=1 ...               # skip attribution (~3s)
+# ---------------------------------------------------------------
+ledger-triage:
+	@python3 "$(REPO_ROOT)/scripts/ledger-triage.py" \
+		$(if $(LEDGER_TRIAGE_FAST),--no-attribution,) \
+		$(if $(LEDGER_TRIAGE_FULL),--full,) \
+		$(if $(LEDGER_TRIAGE_OUT),--out "$(LEDGER_TRIAGE_OUT)",)

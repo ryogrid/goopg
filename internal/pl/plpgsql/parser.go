@@ -59,6 +59,22 @@ func (p *bodyParser) cur() parser.Token {
 	return p.tokens[p.idx]
 }
 
+// identStartsAssignment reports whether the token after the current
+// statement-leading identifier is one of the continuations pl_gram.y's
+// stmt_execsql T_WORD arm treats as an assignment attempt: `=`, `:=`, `[`
+// or `.` (postgres/src/pl/plpgsql/src/pl_gram.y, stmt_execsql).
+func (p *bodyParser) identStartsAssignment() bool {
+	if p.idx+1 >= len(p.tokens) {
+		return true // let parseAssign report the truncated statement
+	}
+	n := p.tokens[p.idx+1]
+	switch n.Value {
+	case "=", ":=", "[", ".":
+		return true
+	}
+	return false
+}
+
 func (p *bodyParser) advance() parser.Token {
 	t := p.cur()
 	p.idx++
@@ -317,6 +333,20 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		t.Keyword == parser.KwDrop ||
 		t.Keyword == parser.KwAlter):
 		return p.parseSQLStmt()
+	// Other SQL commands whose leading word goopg's lexer tokenises as a
+	// keyword. None is a PL/pgSQL statement keyword, so pl_gram.y's
+	// stmt_execsql takes each as T_WORD (MERGE as K_MERGE) and hands the
+	// statement to the SQL parser — the same route as the bare-identifier arm
+	// below (LOCK, NOTIFY, …). 2026-09-23.
+	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwTruncate ||
+		t.Keyword == parser.KwAnalyze || t.Keyword == parser.KwVacuum ||
+		t.Keyword == parser.KwReindex || t.Keyword == parser.KwCluster ||
+		t.Keyword == parser.KwCopy || t.Keyword == parser.KwCheckpoint ||
+		t.Keyword == parser.KwMerge || t.Keyword == parser.KwReset ||
+		t.Keyword == parser.KwShow || t.Keyword == parser.KwPrepare ||
+		t.Keyword == parser.KwDeallocate || t.Keyword == parser.KwValues ||
+		t.Keyword == parser.KwWith || t.Keyword == parser.KwTable):
+		return p.parseSQLStmt()
 	// EXECUTE expr [INTO var] [USING expr, ...]. M0100-0005.
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExecute:
 		return p.parseExecute()
@@ -343,6 +373,15 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		// Handle: ident := value (assignment)
 		// Handle: ident.field = value (record field, treated as no-op expr for trigger OLD)
 		// Handle: ident.field.* (expansion — treated as SQL stmt)
+		//
+		// pl_gram.y stmt_execsql's T_WORD arm: a word that is not followed by
+		// `=`, `:=`, `[` or `.` is not an assignment target at all — the
+		// statement is plain SQL handed to make_execsql_stmt (LOCK TABLE,
+		// NOTIFY, … whatever the main grammar accepts). Only the four
+		// assignment-shaped continuations go to parseAssign.
+		if !p.identStartsAssignment() {
+			return p.parseSQLStmt()
+		}
 		return p.parseAssign()
 	}
 	return nil, p.errAtCur("unsupported PL/pgSQL statement")

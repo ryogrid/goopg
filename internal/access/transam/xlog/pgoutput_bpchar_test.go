@@ -6,14 +6,16 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// TestPgoDecodeBpcharCarriesDeclaredWidth pins the fourth render boundary. A
-// bpchar column's heap image is TRIMMED (executor's coerceTextLikeDatum strips
-// trailing spaces so the image stays compact and compareDatum's
-// padding-insensitive bpchar equality holds), where upstream's is blank-padded
-// to the declared width — so a real PG publisher emits all N characters in the
-// change message and this decoder, which returns the varlena payload verbatim,
-// emitted only the significant ones. A goopg->PG subscription therefore
-// delivered a value of the wrong width into a char(N) column.
+// TestPgoDecodeBpcharCarriesDeclaredWidth pins the fourth render boundary: a
+// goopg publisher must emit all N characters of a bpchar, as a real PG
+// publisher does, or a goopg->PG subscription delivers a value of the wrong
+// width into a char(N) column.
+//
+// Since M0143-0007b the heap image is padded too, so the pad here is a no-op
+// on newly written rows. The cases below deliberately feed TRIMMED payloads:
+// that is what rows written before the convention changed look like on disk,
+// and they must still render at the declared width. This is why the
+// PadBpchar call at this boundary must not be deleted as "now redundant".
 //
 // The pad is catalog.PadBpchar, shared with appendTypedCellText and the two
 // COPY renderers, so the four boundaries cannot drift (.ralph/PROMPT.md

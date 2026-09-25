@@ -220,11 +220,24 @@ func TestVerifyBtreeUnique_PostingListTupleFormat(t *testing.T) {
 	if want := "posting 0 and posting 1 (point to heap tid=(10,1) and tid=(10,7))"; !strings.Contains(got[0].Detail, want) {
 		t.Fatalf("Detail = %q, want it to contain %q", got[0].Detail, want)
 	}
-	blind, err := VerifyBtreeUnique(mapSource(pages), "uidx", tupleFmt, nil, allVisible())
+	// The same page under an explicitly BYTWISE comparator must still report
+	// nothing — the duplicate hiding is what makes the injected comparator
+	// load-bearing. (The nil default no longer exercises this: since
+	// M0119-0006bq it resolves to the format's own CompareKeyAttrs.)
+	blind, err := VerifyBtreeUnique(mapSource(pages), "uidx", tupleFmt, nbtree.CompareKeys, allVisible())
 	if err != nil {
 		t.Fatalf("VerifyBtreeUnique (bytewise): %v", err)
 	}
 	if len(blind) != 0 {
 		t.Fatalf("bytewise comparator reported %d findings on tuple keys; the TID inside the key should hide the duplicate: %+v", len(blind), blind)
+	}
+	// The nil default is now the format's attrs-only comparator, which detects
+	// the duplicate exactly like the explicit CompareKeyAttrs call above.
+	gotNil, err := VerifyBtreeUnique(mapSource(pages), "uidx", tupleFmt, nil, allVisible())
+	if err != nil {
+		t.Fatalf("VerifyBtreeUnique (nil default): %v", err)
+	}
+	if len(gotNil) != 1 {
+		t.Fatalf("nil-default comparator reported %d findings, want 1 (CompareKeyAttrs default): %+v", len(gotNil), gotNil)
 	}
 }

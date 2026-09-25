@@ -1,7 +1,14 @@
-# TPC-DS SF=0.5 warm-start query timings
+# TPC-DS warm-start query timings (half-scale-era archive)
 
 Captured beside the plan fixtures in `../plans-pg/`, so a plan and the runtime
 it produced can be read as a matched pair.
+
+> Archive status: these captures predate the quarter-scale migration
+> (2026-09-11) and were taken on the half-scale gate dataset. The numbers
+> below are not comparable to the current gate; they are kept because the two
+> caveats (concurrent-capture inflation, the 1.1×-not-1.9× Q4 analysis) and
+> the shared_buffers history are still the reference for reading any TPC-DS
+> timing of that era.
 
 ## Protocol
 
@@ -32,8 +39,8 @@ A comparison that silently drops a timeout credits the engine that timed out.
 ## Correctness is gated elsewhere
 
 These files record **timing only**. Result correctness is
-`scripts/tpcds-sf05-regression.sh` against the git-tracked value oracle at
-`../runtime_goopg/tpcds-results-sf05/oracle.txt`, which is unaffected by
+`scripts/tpcds-sf025-regression.sh` against the git-tracked value oracle at
+`../runtime_goopg/tpcds-results-sf025/oracle.txt`, which is unaffected by
 timing, residency or host load.
 
 ## Historical note

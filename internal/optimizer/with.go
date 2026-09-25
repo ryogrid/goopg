@@ -55,6 +55,36 @@ type plannedCTE struct {
 	// CTEScan.DeclKey, which is what the executor keys its materialization
 	// buffer by. M0125-0050.
 	declPos int
+	// synth memoizes this CTE's synthesized output statistics
+	// (cte_stats_synthesis.go), computed on first consumer access.
+	//
+	// M0145-0009 slice 1. The B-06 design specifies a registry keyed by
+	// `DeclKey()` (`declPos:name`) living on the planning context. The entry
+	// POINTER is a strictly stronger identity than that key and has exactly
+	// the lifetime the design asks for — per-`Plan()` call, dangling never,
+	// because the body is planned inside the same call and every consumer
+	// reaches its entry through `CTEScan.cte`. So the map is unnecessary
+	// here: the thing the key would look up is already in hand. Keep the
+	// design's constraints even so — one synthesis per CTE (both sides of a
+	// multi-reference CTE must agree, as they do through one entry), and a
+	// miss yields today's defaults rather than a guess.
+	synth     *cteOutputStats
+	synthDone bool
+}
+
+// outputStats returns the entry's synthesized output statistics, computing
+// them once on first access. Nil entry yields nil, so callers may chain
+// through an unpopulated `CTEScan.cte` (scans built outside
+// preplanWithClause — tests) without a guard.
+func (e *plannedCTE) outputStats() *cteOutputStats {
+	if e == nil {
+		return nil
+	}
+	if !e.synthDone {
+		e.synthDone = true
+		e.synth = synthesizeCTEStats(e)
+	}
+	return e.synth
 }
 
 // cteDeclSeq stamps plannedCTE.declSeq. Package-global and unsynchronised,

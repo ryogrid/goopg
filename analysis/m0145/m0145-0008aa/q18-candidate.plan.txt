@@ -1,0 +1,21 @@
+=== Q18
+Sort  (cost=1518294.51..1525797.00 rows=3000994 width=204)
+  Sort Key: o_totalprice DESC, o_orderdate
+  ->  HashAggregate  (cost=519472.58..549482.52 rows=3000994 width=204)
+        Group Key: customer.c_custkey, orders.o_orderkey
+        ->  Gather  (cost=279515.75..518125.18 rows=538958 width=1654)
+              Workers Planned: 4
+              ->  Hash Join  (cost=279515.75..507346.02 rows=3000994 width=236)
+                    Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
+                    ->  Parallel Seq Scan on lineitem  (cost=0.00..175312.88 rows=1500497 width=550)
+                    ->  Hash Join  (cost=207033.25..270140.75 rows=750000 width=204)
+                          Hash Cond: (orders.o_custkey = customer.c_custkey)
+                          ->  Hash Semi Join  (cost=200083.25..252878.25 rows=750000 width=104)
+                                Hash Cond: (orders.o_orderkey = l_orderkey)
+                                ->  Seq Scan on orders  (cost=0.00..41545.00 rows=1500000 width=448)
+                                ->  HashAggregate  (cost=190317.85..195705.66 rows=134695 width=64)
+                                      Group Key: lineitem_1.l_orderkey
+                                      Filter: (sum(lineitem_1.l_quantity) > 313)
+                                      ->  Seq Scan on lineitem_1  (cost=0.00..175312.88 rows=6001988 width=550)
+                          ->  Seq Scan on customer  (cost=0.00..5075.00 rows=150000 width=624)
+

@@ -61,7 +61,7 @@ const (
 // `limitTuples` is `cost_tuplesort`'s `limit_tuples` (C-13b): the absolute
 // count+offset bound, or <= 0 for none (the SRF post-sort arm always passes
 // -1 — `have_postponed_srfs`, planner.c:1856).
-func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64, limitTuples float64) Node {
+func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp costParams, tupleFraction float64, limitTuples float64, narrowKeep []int) Node {
 	if input == nil || len(keys) == 0 {
 		return input
 	}
@@ -76,6 +76,10 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// The load-bearing step DESIGN §4.3 names: a fresh rel has NCols == 0,
 	// which `costSortRun` reads as "width unknown, charge no I/O".
 	sizeUpperRelFromNode(ordered, input)
+	// M0141-S2a-fix1-sweep-a: refine NCols/AvgVarBytes to the caller's
+	// narrow keep-set, when it derived one (ordered_input_narrow.go). A nil
+	// keep leaves the full-width sizing above untouched.
+	narrowOrderedRelWidths(ordered, input, narrowKeep)
 
 	// The input path. `newPrebuiltPath` leaves the cost zero (the C0 bridge
 	// never needed one); here the cost is the child's own — the search's
@@ -99,7 +103,41 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// the pre-C-07 answer and stacks the Sort exactly as before.
 	seed.Pathkeys = inputNodePathkeys(input)
 
+	// M0141-S2b-2a: thread the search's own Pathlist onto the ORDERED rel
+	// (RelOptInfo.SearchCandidates) so it is visible to `addOrderedPaths`
+	// below — and to a later consumer — without re-deriving
+	// `searchedRelOf(input)`. Plumbing only: `addOrderedPaths` does not read
+	// it yet, so `seed` remains the only candidate offered and the chosen
+	// plan cannot change (see the field's doc comment for why offering more
+	// candidates today is provably inert).
+	if sr := searchedRelOf(input); sr != nil {
+		ordered.SearchCandidates = sr.Pathlist
+		// M0141-S2b-2b: re-earn every OTHER candidate's ordering claim
+		// against this rel's own published schema, the same rule
+		// `stampSearchPathkeys` already applies to the single WINNING path
+		// (upperorderedinput.go's file header, rule 1) — generalized from
+		// "the one winner" to "every candidate", since a losing candidate's
+		// Pathkeys are just as much a claim made in the search's inner
+		// coordinate space. Still plumbing only: nothing below reads it.
+		ordered.SearchCandidateKeys = validatedSearchCandidateKeys(sr.Pathlist, input.Output())
+		if pathTraceEnabled {
+			nonEmpty := 0
+			for _, ks := range ordered.SearchCandidateKeys {
+				if len(ks) > 0 {
+					nonEmpty++
+				}
+			}
+			traceOrderedCandidatePopulation(true, len(ordered.SearchCandidates), nonEmpty)
+		}
+	} else if pathTraceEnabled {
+		traceOrderedCandidatePopulation(false, 0, 0)
+	}
+
 	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
+	// M0140-0006b-2: the upper-rel Gather reader. No-op today (no producer
+	// files partial paths on the ORDERED rel), wired so a future one does
+	// not repeat 0006b's "producer with no reader" trap.
+	generateUpperRelGatherPaths(ordered, cp)
 	setCheapest(ordered)
 
 	best := getCheapestFractionalPath(ordered, tupleFraction)
@@ -120,9 +158,30 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 // from `createOrderedPaths` so the input arm — unreachable from a Node today —
 // is driven by a test with a hand-ordered seed rather than left untested.
 func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
+	if pathTraceEnabled {
+		contained, nCommon := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys)
+		traceOrderedSeedCandidate(input.Kind, len(input.Pathkeys), contained, nCommon, input.Cost.Total)
+		if input.Kind == PathAgg {
+			// M0141-S2b-6-resume: the strategy/rows label the generic seed
+			// line above does not carry, so a Hashed candidate's pre-stack
+			// cost and a Sorted candidate's own (input-sort-inclusive)
+			// cost can be told apart on sight.
+			traceOrderedGroupingCandidate(input.AggStrategy, input.Rows)
+		}
+	}
 	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
-	addPath(ordered, sortPathForBounded(input, sortPathkeys, cp, limitTuples), upperOrderedSortProducer)
+	sorted := sortPathForBounded(input, sortPathkeys, cp, limitTuples)
+	if pathTraceEnabled && input.Kind == PathAgg {
+		traceOrderedSortedCandidate(input.AggStrategy, input.Rows, sorted.Cost.Startup, sorted.Cost.Total)
+	}
+	addPath(ordered, sorted, upperOrderedSortProducer)
+
+	// M0141-S2b-2c / S7: the third arm — every OTHER surviving search
+	// candidate that already satisfies a genuine partial prefix of
+	// sortPathkeys gets an Incremental Sort offer too, not just the seed's
+	// full Sort above. Gated off by default; see incrementalsortpaths.go.
+	addIncrementalSortPaths(ordered, input, sortPathkeys, cp, limitTuples)
 }

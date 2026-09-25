@@ -93,7 +93,12 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		}
 		cr, ok := e.Operand.(*ColumnRef)
 		if !ok {
-			return defaultGenericSelectivity
+			// M0145-0008g: scalararraysel over an expression operand.
+			sel := inListExprSelectivity(e, child)
+			if e.Negated {
+				return 1 - sel
+			}
+			return sel
 		}
 		stats := columnStatsForChild(cr.Index, child)
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
@@ -122,6 +127,17 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 // (in [0,1]); in the common small-sum case that reproduces the old plain
 // sum bit-for-bit, and out-of-range sums fall back to the OR merge.
 func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	return inListMergeSelectivity(e, func(elem Expr) float64 {
+		return inListElementSelectivity(e, cr, elem, stats, tuples, child)
+	})
+}
+
+// inListMergeSelectivity is scalararraysel's merge (selfuncs.c:1821): OR
+// (ANY) or AND (ALL) of the per-element selectivities elemSel returns, with
+// the equality-ANY disjoint sum (and the inequality-ALL twin) accepted when
+// it stays in [0,1]. Factored out of inListSelectivity so the column and
+// expression operands share one merge (M0145-0008g).
+func inListMergeSelectivity(e *InExpr, elemSel func(Expr) float64) float64 {
 	useOr := !e.AllOp
 	isEquality := (e.AnyOp == 0 || e.AnyOp == parser.OpEq) && !e.NotEqualAny
 	isInequality := e.AnyOp == parser.OpNe
@@ -131,7 +147,7 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 	}
 	s1disjoint := s1
 	for _, elem := range e.List {
-		s2 := inListElementSelectivity(e, cr, elem, stats, tuples, child)
+		s2 := elemSel(elem)
 		if useOr {
 			s1 = s1 + s2 - s1*s2
 			if isEquality {
@@ -150,6 +166,28 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 	return clampProbability(s1)
 }
 
+// inListExprSelectivity is scalararraysel for an operand that is not a bare
+// column (M0145-0008g): `substr(c_phone, 1, 2) IN ('13', '31', …)`. PG calls
+// the element operator's estimator per element (eqsel → var_eq_const, which
+// with no statistics for the expression answers 1/DEFAULT_NUM_DISTINCT via
+// get_variable_numdistinct) and merges; for TPC-H Q22's 7-element list that
+// is 7 × 1/200 = 0.035, where goopg returned the generic 1/3. The per-element
+// estimate here is the scalar clause estimator on the synthesized
+// `operand <op> element`, so it is by construction what the same comparison
+// gets when written out (sibling agreement with `expr = const`).
+func inListExprSelectivity(e *InExpr, child Node) float64 {
+	op := e.AnyOp
+	if op == 0 {
+		op = parser.OpEq
+	}
+	if e.NotEqualAny {
+		op = parser.OpNe
+	}
+	return inListMergeSelectivity(e, func(elem Expr) float64 {
+		return clauseSelectivity(&BinaryOp{Op: op, Left: e.Operand, Right: elem}, child)
+	})
+}
+
 // inListElementSelectivity prices one `operand <op> element` comparison
 // with the estimator for the element operator: equality reuses the MCV /
 // histogram machinery, ranges reuse the inequality estimator, LIKE reuses
@@ -157,15 +195,25 @@ func inListSelectivity(e *InExpr, cr *ColumnRef, stats *catalog.ColumnStats, tup
 // default (PG punts operator-less shapes to 0.5; the file-local default
 // applies here pending P1-14b's DEFAULT_* alignment).
 func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalog.ColumnStats, tuples float64, child Node) float64 {
+	// scalararraysel calls the element operator's own estimator, so eqsel's
+	// isunique branch (selfuncs.c:338) applies per element exactly as it does
+	// to a scalar `col = const` (uniqueEqSelectivity; sibling twins must
+	// agree), and neqsel inherits it as 1 - eqsel.
+	eq := func() float64 {
+		if sel, ok := uniqueEqSelectivity(cr, elem, child); ok {
+			return sel
+		}
+		return eqSelectivityForColumn(stats, elem, tuples)
+	}
 	if e.NotEqualAny {
 		// OR of `<>`: one minus the equality mass per element.
-		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+		return 1 - eq()
 	}
 	switch e.AnyOp {
 	case 0, parser.OpEq:
-		return eqSelectivityForColumn(stats, elem, tuples)
+		return eq()
 	case parser.OpNe:
-		return 1 - eqSelectivityForColumn(stats, elem, tuples)
+		return 1 - eq()
 	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 		return rangeOpSelectivity(e.AnyOp, cr, elem, child)
 	case parser.OpLike, parser.OpILike, parser.OpNotLike, parser.OpNotILike:
@@ -237,7 +285,56 @@ func rowCompareSelectivityWithSource(op parser.OpCode, left, right Expr, child N
 // eqOpSelectivity handles `col = const` (or the swapped `const =
 // col`). Returns the MCV frequency on a hit, the non-MCV fallback,
 // or — when stats are missing — the upstream `1/200` constant.
+// uniqueColumnTuples is `vardata->isunique` for a base column: the column is
+// the sole key of a non-partial unique index on its relation
+// (has_unique_index, plancat.c:2244), read from the scan's stamped
+// UniqueKeys. It returns the relation's raw tuple count, the divisor eqsel
+// and var_eq_non_const use (`selec = 1.0 / vardata->rel->tuples`,
+// selfuncs.c:338, 500); ok is false when the column is not such a key or the
+// count is unknown (< 1).
+func uniqueColumnTuples(idx int, child Node) (float64, bool) {
+	ref, ok := resolveBaseColumn(idx, child)
+	if !ok || ref.rawRows < 1 {
+		return 0, false
+	}
+	for _, k := range ref.uniqueKeys {
+		if len(k) == 1 && k[0] == ref.col {
+			return ref.rawRows, true
+		}
+	}
+	return 0, false
+}
+
+// uniqueEqSelectivity applies eqsel's isunique branch — checked BEFORE any
+// statistics, "assume there is exactly one match regardless of anything else"
+// — to whichever operand of an equality is a unique base column.
+//
+// Restricted to `col = <non-column>`: a column-to-column equality is a join
+// clause in PG, priced by eqjoinsel rather than eqsel, and this function must
+// not reach it through clauseSelectivity.
+func uniqueEqSelectivity(left, right Expr, child Node) (float64, bool) {
+	_, lCol := left.(*ColumnRef)
+	_, rCol := right.(*ColumnRef)
+	if lCol == rCol {
+		return 0, false
+	}
+	for _, e := range []Expr{left, right} {
+		if cr, ok := e.(*ColumnRef); ok {
+			if tuples, uok := uniqueColumnTuples(cr.Index, child); uok {
+				return 1.0 / tuples, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func eqOpSelectivity(left, right Expr, child Node) float64 {
+	// M0145-0029 follow-up: without this branch a never-ANALYZEd primary key
+	// fell to 1/200 (5000 rows of 1M), and once CREATE INDEX published the
+	// heap size the planner seq-scanned a point lookup PG index-scans.
+	if sel, ok := uniqueEqSelectivity(left, right, child); ok {
+		return sel
+	}
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
 		// `col = <non-const>`: column-column and column-expression
@@ -313,12 +410,41 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 		op = swapInequalityOp(op)
 	}
 	stats := columnStatsForChild(col.Index, child)
-	if stats == nil || len(stats.Histogram) < 2 {
-		return defaultIneqSelectivity
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+		return sel
+	}
+	return defaultIneqSelectivity
+}
+
+// rangeOpSelectivityStats is the stats-first core of
+// `rangeOpSelectivity`: the MCV satisfied-mass plus
+// `histogramOpSelectivity` over the non-MCV mass — PG's
+// `scalarineqsel` (selfuncs.c:588) arithmetic — but over
+// caller-attributed statistics instead of a child-plan lookup. The
+// restriction path (which has a child Node) and the OR-join arm
+// (which has only search relInfos) price one shape with this one
+// body; sibling-paths rule: the two callers change together.
+// ok=false when the shape carries no measurement (no statistics, a
+// short histogram, or a non-constant) and the caller keeps its own
+// default.
+func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats) (float64, bool) {
+	// M0142-0009: a column whose distinct values all fit the MCV list
+	// (analyze.c's `nmultiple == ndistinct` case, `computeColumnStats`
+	// mirrors it at operators_analyze.go:1441) legitimately stores NO
+	// histogram — the non-MCV remainder is empty by construction, not
+	// unmeasured. Bailing out here on histogram length alone discarded
+	// that fully-measured MCV mass and fell back to defaultIneqSelectivity
+	// for the WHOLE clause; PG's scalarineqsel instead sums mcv_selec with
+	// a defaulted contribution over only the (here empty) non-MCV mass.
+	// TPC-DS date_dim.d_moy (12 distinct values, always MCV-complete at
+	// SF0.25/SF1) is the reproducing case: `d_moy BETWEEN 4 AND 10 AND
+	// d_year = 1999` collapsed 212-actual rows to est=1.
+	if stats == nil || (len(stats.Histogram) < 2 && len(stats.MCV) == 0) {
+		return 0, false
 	}
 	literal, ok := formatExprConstant(val)
 	if !ok {
-		return defaultIneqSelectivity
+		return 0, false
 	}
 
 	// Histogram covers the non-MCV mass.
@@ -346,12 +472,12 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name)
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
-		return 0
+		return 0, true
 	}
 	if sel > 1 {
-		return 1
+		return 1, true
 	}
-	return sel
+	return sel, true
 }
 
 // histogramOpSelectivity returns the fraction of the histogram's
@@ -509,9 +635,27 @@ func numericValue(s, typeName string) (float64, bool) {
 	// large win the item's original wording implied (07 §4 records the
 	// correction).
 	case "date":
-		if t, err := time.Parse("2006-01-02", strings.TrimSpace(s)); err == nil {
-			// Julian-style day number; only differences matter here.
-			return float64(t.Unix()) / 86400.0, true
+		// R44/K83 step B: the timestamp spellings are accepted here too,
+		// because folding `date + interval` yields a TIMESTAMP literal (PG
+		// spells it that way as well) which is then compared against a DATE
+		// column's histogram. Without these layouts the folded literal fails
+		// to parse, `bucketFraction` falls back to a flat 0.5, and the fold
+		// lands the estimate within half a bucket instead of on it — the
+		// residual this arm's own comment above exists to remove.
+		//
+		// The day-based scale is kept for every layout: both the literal and
+		// the histogram bounds come through this same function with the same
+		// typeName, so the scale only has to be self-consistent, and mixing
+		// in the timestamp arm's seconds scale would break that.
+		for _, layout := range []string{
+			"2006-01-02",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+		} {
+			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
+				// Julian-style day number; only differences matter here.
+				return float64(t.Unix()) / 86400.0, true
+			}
 		}
 		return 0, false
 	case "timestamp", "timestamp without time zone", "timestamptz", "timestamp with time zone":
@@ -521,13 +665,49 @@ func numericValue(s, typeName string) (float64, bool) {
 			"2006-01-02 15:04:05",
 			"2006-01-02",
 		} {
-			if t, err := time.Parse(layout, strings.TrimSpace(s)); err == nil {
+			if t, err := time.Parse(layout, padISODateLiteral(s)); err == nil {
 				return float64(t.UnixNano()) / 1e9, true
 			}
 		}
 		return 0, false
 	}
 	return 0, false
+}
+
+// padISODateLiteral zero-pads the month and day of an ISO `YYYY-M-D` date
+// (optionally followed by a space and a time), so the fixed Go layouts above
+// accept the spellings PG's date_in does: TPC-DS Q94 writes `'2002-5-01'`
+// (M0141-S2b-17). Without it that literal failed to parse, the histogram
+// lookup fell to a flat bucket fraction, and the `date + interval` fold
+// (parseTemporalLiteral) declined, leaving the other bound unestimated too.
+//
+// Only the 4-digit-year dash form is normalized, the subset the executor's
+// own parser (nodes.parseDateFields) takes the same way. Any other spelling
+// is returned trimmed and unchanged, so it parses or fails exactly as before.
+func padISODateLiteral(s string) string {
+	s = strings.TrimSpace(s)
+	datePart, rest := s, ""
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		datePart, rest = s[:i], s[i:]
+	}
+	f := strings.Split(datePart, "-")
+	if len(f) != 3 || len(f[0]) != 4 || len(f[1]) < 1 || len(f[1]) > 2 || len(f[2]) < 1 || len(f[2]) > 2 {
+		return s
+	}
+	for _, part := range f {
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return s
+			}
+		}
+	}
+	if len(f[1]) == 1 {
+		f[1] = "0" + f[1]
+	}
+	if len(f[2]) == 1 {
+		f[2] = "0" + f[2]
+	}
+	return f[0] + "-" + f[1] + "-" + f[2] + rest
 }
 
 // isStringScalarType reports whether typeName is one of the
@@ -810,7 +990,15 @@ type selectivityEstimate struct {
 // predates A1); porting the band formula here is filed follow-up
 // work, not part of A1.
 //
-// Slice B uses this to gate updates to
+// R36: `baseRelInfo.filteredRows` NO LONGER READS THIS FLAG.
+// Baserel sizing now multiplies unconditionally, as
+// `set_baserel_size_estimates` does, and it consumes the plain
+// `clauseSelectivity` twin rather than this one precisely
+// BECAUSE of the pairing divergence noted just above: on a
+// histogram-less `x>=a AND x<b` band this twin returns
+// 1/3 x 1/3 = 0.111 where PG's punt rule gives
+// DEFAULT_RANGE_INEQ_SEL = 0.005. Formerly:
+// Slice B used this to gate updates to
 // `baseRelInfo.filteredRows`: when reliability is false, the
 // row count keeps its pre-filter value rather than picking up
 // arbitrary fallback constants that the cost model would then
@@ -875,10 +1063,21 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 		}
 		cr, ok := e.Operand.(*ColumnRef)
 		if !ok {
-			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+			// M0145-0008g: scalararraysel over an expression operand — the
+			// same estimate the plain arm returns (sibling twins agree).
+			// Unreliable: with no expression statistics PG's own answer is
+			// get_variable_numdistinct's default (isdefault).
+			sel := inListExprSelectivity(e, child)
+			if e.Negated {
+				sel = 1 - sel
+			}
+			return selectivityEstimate{value: sel, reliable: false}
 		}
 		stats := columnStatsForChild(cr.Index, child)
-		if stats == nil {
+		// A unique key column is priced from the catalog alone (the isunique
+		// branch inListElementSelectivity applies), so it is reliable
+		// without statistics, as eqOpSelectivityWithSource treats it.
+		if _, unique := uniqueColumnTuples(cr.Index, child); stats == nil && !unique {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
 		sel := inListSelectivity(e, cr, stats, columnRawRowsForChild(cr.Index, child), child)
@@ -899,6 +1098,11 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 // `eqOpSelectivity`. Reliable iff a `column = const` shape is
 // matched AND the column has stats.
 func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate {
+	// The isunique branch, as in eqOpSelectivity (sibling twins must agree);
+	// catalog-proven, so reliable.
+	if sel, ok := uniqueEqSelectivity(left, right, child); ok {
+		return selectivityEstimate{value: sel, reliable: true}
+	}
 	col, val, ok := normalizeColumnConst(left, right)
 	if !ok {
 		// Same delegation as eqOpSelectivity above; reliable iff the

@@ -631,10 +631,33 @@ func PageGetHeapFreeSpace(p Page) int {
 	space -= itemIDSize
 	if space > 0 {
 		if n, err := PageLinePointerCount(p); err != nil || n >= MaxHeapTuplesPerPage {
+			// PG's arm: a page at the line-pointer ceiling still has room
+			// when a free line can be reused (heap_lp_lifecycle clusters
+			// only; M0145-0008v). The ItemIdData subtraction stays, as in PG.
+			if err == nil && HeapLinePointerLifecycle() && h.Flags()&PDHasFreeLines != 0 {
+				if _, ok := firstReusableLinePointer(p, n); ok {
+					return space
+				}
+			}
 			return 0
 		}
 	}
 	return space
+}
+
+// firstReusableLinePointer finds the first LP_UNUSED item without storage
+// among p's count line pointers, as PageAddItemExtended's scan does.
+func firstReusableLinePointer(p Page, count int) (int, bool) {
+	for idx := 0; idx < count; idx++ {
+		item, err := readItemID(p, idx)
+		if err != nil {
+			return 0, false
+		}
+		if item.Flags == ItemIDUnused && item.Length == 0 {
+			return idx, true
+		}
+	}
+	return 0, false
 }
 
 // HeapInsertTargetFreeSpace returns the amount of free space an *existing*
@@ -693,6 +716,29 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	// reads exactly the tuple bytes; the trailing 0..7 bytes are
 	// padding (zero from InitPage). M0106-0010 batched-36.
 	alignedSize := maxAlign8(len(raw))
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	// PageAddItemExtended's reuse arm (bufpage.c): with PD_HAS_FREE_LINES set
+	// the first LP_UNUSED item without storage takes the tuple, and the hint
+	// is cleared when none is left. Only on a heap_lp_lifecycle cluster,
+	// where no LP_UNUSED item is referenced by an index (M0145-0008v).
+	if HeapLinePointerLifecycle() && h.Flags()&PDHasFreeLines != 0 {
+		if idx, ok := firstReusableLinePointer(p, count); ok {
+			if upper-lower < alignedSize {
+				return 0, ErrNoSpaceInPage
+			}
+			newUpper := upper - alignedSize
+			copy(p[newUpper:newUpper+len(raw)], raw)
+			if err := writeItemID(p, idx, ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}); err != nil {
+				return 0, err
+			}
+			h.SetUpper(uint16(newUpper))
+			return uint16(idx + 1), nil
+		}
+		h.SetFlags(h.Flags() &^ PDHasFreeLines)
+	}
 	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
@@ -701,10 +747,6 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	newUpper := upper - alignedSize
 	copy(p[newUpper:newUpper+len(raw)], raw)
 
-	count, err := PageLinePointerCount(p)
-	if err != nil {
-		return 0, err
-	}
 	item := ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}
 	if err := writeItemID(p, count, item); err != nil {
 		return 0, err
@@ -1155,6 +1197,17 @@ func CollectDeadHeapSlots(p Page, isDead func(HeapTupleHeader) bool) ([]uint16, 
 // any out-of-range or non-LP_NORMAL entry returns an error and the
 // page is left untouched.
 func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, error) {
+	return PruneHeapPageBySlots(p, deadSlots, nil)
+}
+
+// PruneHeapPageBySlots is VacuumHeapPageBySlots with a second set: the
+// LP_NORMAL or LP_REDIRECT items in lpDead become ItemIDDead with no storage
+// (PG's ItemIdSetDead, pruneheap.c heap_page_prune_execute), while the ones
+// in unusedSlots become ItemIDUnused. Both lose their tuple bodies in the
+// repack. An LP_DEAD item keeps its offset number because index entries
+// still point at it (M0145-0008v).
+func PruneHeapPageBySlots(p Page, unusedSlots, lpDead []uint16) (HeapPageVacuumStats, error) {
+	deadSlots := unusedSlots
 	h, err := Header(p)
 	if err != nil {
 		return HeapPageVacuumStats{}, err
@@ -1170,6 +1223,13 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 		}
 		deadSet[int(s)-1] = struct{}{}
 	}
+	lpDeadSet := make(map[int]struct{}, len(lpDead))
+	for _, s := range lpDead {
+		if s == 0 || int(s) > count {
+			return HeapPageVacuumStats{}, fmt.Errorf("%w: LP_DEAD slot %d out of range (count=%d)", ErrInvalidSlot, s, count)
+		}
+		lpDeadSet[int(s)-1] = struct{}{}
+	}
 	type live struct {
 		idx  int
 		body []byte
@@ -1180,6 +1240,18 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 		item, err := readItemID(p, idx)
 		if err != nil {
 			return HeapPageVacuumStats{}, err
+		}
+		if _, isLPDead := lpDeadSet[idx]; isLPDead {
+			// A redirect root whose chain died, or a dead LP_NORMAL
+			// tuple: no storage from here on.
+			if item.Flags != ItemIDNormal && item.Flags != ItemIDRedirect {
+				continue
+			}
+			if err := writeItemID(p, idx, ItemID{Flags: ItemIDDead}); err != nil {
+				return HeapPageVacuumStats{}, err
+			}
+			stats.Dead++
+			continue
 		}
 		if item.Flags != ItemIDNormal {
 			continue
@@ -1230,6 +1302,21 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 		}
 	}
 	h.SetUpper(uint16(upper))
+	// PageRepairFragmentation's hint (bufpage.c): PD_HAS_FREE_LINES records
+	// whether any LP_UNUSED item is left, so the next insert may reuse it
+	// (PageAddHeapTuple, M0145-0008v). It is only a hint; reuse itself is
+	// gated on the heap_lp_lifecycle capability.
+	hasUnused := false
+	for idx := 0; idx < count && !hasUnused; idx++ {
+		if it, rerr := readItemID(p, idx); rerr == nil && it.Flags == ItemIDUnused {
+			hasUnused = true
+		}
+	}
+	if hasUnused {
+		h.SetFlags(h.Flags() | PDHasFreeLines)
+	} else {
+		h.SetFlags(h.Flags() &^ PDHasFreeLines)
+	}
 	return stats, nil
 }
 
@@ -1290,9 +1377,7 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid so opportunistic pruning knows when
 	// this page first became prunable (M0046-0002).
-	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
-		MustHeader(p).SetPruneXID(uint32(xmax))
-	}
+	pageSetPrunablePG(p, xmax)
 	return nil
 }
 
@@ -1498,9 +1583,7 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	// update. Mirrors PageSetHeapTupleXmax and PG's heap_update behaviour.
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
-	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
-		MustHeader(p).SetPruneXID(uint32(xmax))
-	}
+	pageSetPrunablePG(p, xmax)
 	return nil
 }
 
@@ -1742,21 +1825,22 @@ func PageApplyHeapLockUpdatedRedo(p Page, slot uint16, xmax TransactionID, infom
 
 // pageSetPrunablePG mirrors upstream's PageSetPrunable (bufpage.h): pd_prune_xid
 // keeps the OLDEST xid that might have made a tuple on the page prunable, so the
-// field is only lowered, never raised. goopg's *producer* helpers
-// (PageStampHotOldTuple and friends) keep the NEWEST instead — a pre-existing
-// divergence that is out of this routine's scope; the redo helpers below take
-// upstream's rule because they mirror heap_xlog_delete / heap_xlog_update, which
-// pass the RECORD's xid (not the stamped xmax — which may be a MultiXactId and
-// therefore not an xid at all).
+// field is only lowered, never raised. Every setter uses it: the producers
+// (PageSetHeapTupleXmax, PageStampHotOldTuple and friends) with the xid they
+// stamp, the redo helpers below with the RECORD's xid, as heap_xlog_delete /
+// heap_xlog_update do (the stamped xmax may be a MultiXactId, not an xid).
 //
-// The comparison is plain rather than wraparound-aware, matching every other
-// pd_prune_xid site in this file.
+// The producers used to keep the NEWEST xid instead. On a page updated
+// continuously the hint then never preceded the horizon, so neither the
+// on-access prune nor the HOT path's PagePruneOpt ever ran, and pgbench's
+// small tables grew by dozens of blocks (M0145-0008w recon, fixed by
+// M0145-0008x). The comparison is wraparound-safe, as TransactionIdPrecedes is.
 func pageSetPrunablePG(p Page, xid TransactionID) {
 	if xid == InvalidTransactionID {
 		return
 	}
 	h := MustHeader(p)
-	if cur := TransactionID(h.PruneXID()); cur == InvalidTransactionID || xid < cur {
+	if cur := TransactionID(h.PruneXID()); cur == InvalidTransactionID || XIDPrecedes(xid, cur) {
 		h.SetPruneXID(uint32(xid))
 	}
 }
@@ -2010,9 +2094,7 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
 	// once xmax is committed and xmax < OldestXmin.
-	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
-		MustHeader(p).SetPruneXID(uint32(xmax))
-	}
+	pageSetPrunablePG(p, xmax)
 	return nil
 }
 
@@ -2052,9 +2134,7 @@ func PageStampUpdatedOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk Bl
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
-	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
-		MustHeader(p).SetPruneXID(uint32(xmax))
-	}
+	pageSetPrunablePG(p, xmax)
 	return nil
 }
 
@@ -2125,9 +2205,7 @@ func PageStampHotOldTupleMulti(p Page, oldSlot uint16, multi TransactionID, info
 	// Advance pd_prune_xid (M0046-0002) using the real update member: the old
 	// HOT tuple is dead once the updater commits and is < OldestXmin. The multi
 	// id itself is not a TransactionID, so prune tracking uses updaterXID.
-	if pruneXID := MustHeader(p).PruneXID(); updaterXID > TransactionID(pruneXID) {
-		MustHeader(p).SetPruneXID(uint32(updaterXID))
-	}
+	pageSetPrunablePG(p, updaterXID)
 	return nil
 }
 

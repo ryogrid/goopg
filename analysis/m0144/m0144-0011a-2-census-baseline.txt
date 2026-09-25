@@ -1,0 +1,598 @@
+##Q1 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=273.3228265306123
+PLAN                                       QUERY PLAN                                       
+PLAN ---------------------------------------------------------------------------------------
+PLAN  Limit
+##Q2 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=38.335
+PLAN                               QUERY PLAN                               
+PLAN -----------------------------------------------------------------------
+PLAN  Gather Merge
+##Q3 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=false ncommon=1 totalcost=3730.306814368549
+PLAN                                       QUERY PLAN                                       
+PLAN ---------------------------------------------------------------------------------------
+PLAN  Limit
+##Q4 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7.724999999999998
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q5 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=5.890000000000001
+PLAN                                                          QUERY PLAN                       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q6 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=false ncommon=0 totalcost=35244.710362245845
+PLAN                                                          QUERY PLAN                       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q7 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=true ncommon=1 totalcost=9525.91185143777
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=45 startup=9525.461851437769 total=9525.91185143777 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=160 inputtotal=-1
+PLAN                                                                   QUERY PLAN              
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q8 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=true ncommon=1 totalcost=19524.46555942602
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=8 startup=19524.385559426017 total=19524.46555942602 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=64 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q9 rc=0
+PLAN                                      QUERY PLAN                                     
+PLAN ------------------------------------------------------------------------------------
+PLAN  Seq Scan on reason
+##Q10 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=8 contained=true ncommon=8 totalcost=25053.192990161286
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=1 startup=25053.182990161287 total=25053.192990161286 disabled=0 pathkeys=8 verdict=accepted jointype=inner outer=- inner=- width=152 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q11 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4.7775
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q12 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4771.847104638449
+PLAN                                                                        QUERY PLAN         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q13 rc=0
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Aggregate
+##Q14 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=40347.33785628822
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.0424999999999995
+PLAN                                                          QUERY PLAN                       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q15 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=true ncommon=1 totalcost=6053.089148695634
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=433 startup=6048.759148695634 total=6053.089148695634 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=64 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q16 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=17567.913594129473
+PLAN                                                                                          Q
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q17 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=true ncommon=3 totalcost=3708.38027372972
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=1 startup=3708.37027372972 total=3708.38027372972 disabled=0 pathkeys=3 verdict=accepted jointype=inner outer=- inner=- width=312 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q18 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6015.375894888113
+PLAN                                                       QUERY PLAN                          
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q19 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=4 contained=false ncommon=0 totalcost=8103.223445428241
+PLAN                                                       QUERY PLAN                          
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q20 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=5977.3328324192
+PLAN                                                                        QUERY PLAN         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q21 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=2 contained=true ncommon=2 totalcost=25543.80208583611
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=13 startup=25541.25208583611 total=25543.80208583611 disabled=0 pathkeys=2 verdict=accepted jointype=inner outer=- inner=- width=72 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q22 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=44906.24785836277
+PLAN                                               QUERY PLAN                                  
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q23 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=22495.427065295215
+PLAN                                                   QUERY PLAN                              
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q24 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.0425
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.0425
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q25 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=4 contained=true ncommon=4 totalcost=3664.477874478031
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=1 startup=3664.467874478031 total=3664.477874478031 disabled=0 pathkeys=4 verdict=accepted jointype=inner outer=- inner=- width=224 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q26 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=true ncommon=1 totalcost=13623.539168308871
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=26 startup=13623.27916830887 total=13623.539168308871 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=160 inputtotal=-1
+PLAN                                                                   QUERY PLAN              
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q27 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=19489.624432991204
+PLAN                                                                    QUERY PLAN             
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q28 rc=0
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q29 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=4 contained=true ncommon=4 totalcost=3585.2358325694045
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=1 startup=3585.2258325694042 total=3585.2358325694045 disabled=0 pathkeys=4 verdict=accepted jointype=inner outer=- inner=- width=140 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q30 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1024.92723
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q31 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=138.42
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q32 rc=0
+PLAN                                                         QUERY PLAN                        
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q33 rc=0
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=17.3873605278103
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=10.1475
+PLAN                                                 QUERY PLAN                                
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q34 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13.28525
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q35 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=6 contained=true ncommon=6 totalcost=226583.81456617545
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=51 startup=226583.30456617544 total=226583.81456617545 disabled=0 pathkeys=6 verdict=accepted jointype=inner outer=- inner=- width=320 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q36 rc=0
+PLAN psql:tmp/qprobe.sql:31: ERROR:  syntax error at or near ";"
+PLAN LINE 28:   limit 100;
+PLAN                     ^
+##Q37 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=true ncommon=1 totalcost=26919.077338677067
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=2 startup=26919.057338677067 total=26919.077338677067 disabled=0 pathkeys=3 verdict=accepted jointype=inner outer=- inner=- width=96 inputtotal=-1
+PLAN                                                                          QUERY PLAN       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q38 rc=0
+PLAN                                                        QUERY PLAN                         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q39 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.81
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.81
+PLAN                                                   QUERY PLAN                              
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q40 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=2 contained=true ncommon=2 totalcost=13049.920498696967
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=17 startup=13049.750498696967 total=13049.920498696967 disabled=0 pathkeys=2 verdict=accepted jointype=inner outer=- inner=- width=128 inputtotal=-1
+PLAN                                                                         QUERY PLAN        
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q41 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=180.78
+DPPATH seed producer=upper.ordered.seed kind=8 keys=1 contained=true ncommon=1 totalcost=185.18130686535628
+DPPATH path producer=upper.ordered.input relids=- kind=8 reqouter=- rows=78 startup=184.40130686535628 total=185.18130686535628 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=32 inputtotal=184.20630686535628
+DPPATH seed producer=upper.ordered.seed kind=8 keys=1 contained=true ncommon=1 totalcost=187.82761373071256
+DPPATH path producer=upper.ordered.input relids=- kind=8 reqouter=- rows=78 startup=186.85261373071256 total=187.82761373071256 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer=- inner=- width=32 inputtotal=186.85261373071256
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q42 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=false ncommon=0 totalcost=8106.002241935104
+PLAN                                             QUERY PLAN                                    
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q43 rc=0
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=47492.566643526385
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q44 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7640.4275
+PLAN                                                          QUERY PLAN                       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q45 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=2 contained=true ncommon=2 totalcost=7760.235885590021
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=164 startup=7758.595885590021 total=7760.235885590021 disabled=0 pathkeys=2 verdict=accepted jointype=inner outer=- inner=- width=96 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q46 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3469.4787200000005
+PLAN                                                                   QUERY PLAN              
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q47 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=38.25000000000001
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q48 rc=0
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Aggregate
+##Q49 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=14971.432876118333
+PLAN                                                                             QUERY PLAN    
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q50 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=10 contained=true ncommon=10 totalcost=3502.3152526768017
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=1 startup=3502.3052526768015 total=3502.3152526768017 disabled=0 pathkeys=10 verdict=accepted jointype=inner outer=- inner=- width=332 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q51 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=380.0244896534951
+PLAN                                                                               QUERY PLAN  
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q52 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=false ncommon=1 totalcost=8106.002241935104
+PLAN                                        QUERY PLAN                                        
+PLAN -----------------------------------------------------------------------------------------
+PLAN  Limit
+##Q53 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6041.241324672302
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q54 rc=0
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=1 totalcost=1.150537478050103
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=0.605
+PLAN                                                            QUERY PLAN                     
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q55 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=2 contained=false ncommon=0 totalcost=8087.233028783806
+PLAN                                        QUERY PLAN                                       
+PLAN ----------------------------------------------------------------------------------------
+PLAN  Limit
+##Q56 rc=0
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=0 totalcost=1.6911933293917698
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=1.1775
+PLAN                                                 QUERY PLAN                                
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q57 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=18.01
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q58 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4.5249999999999995
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q59 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=147.755
+PLAN                                              QUERY PLAN                                   
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q60 rc=0
+DPPATH seed producer=upper.ordered.seed kind=6 keys=1 contained=false ncommon=1 totalcost=3.1337488726413554
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=2.0775
+PLAN                                                 QUERY PLAN                                
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q61 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=34747.13328527331
+PLAN                                                                 QUERY PLAN                
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q62 rc=0
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6676.086839230829
+PLAN                                                        QUERY PLAN                         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q63 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6041.241324672302
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q64 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2.0449999999999995
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q65 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=206.97153070310102
+PLAN                                                  QUERY PLAN                               
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q66 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=8 contained=true ncommon=1 totalcost=13176.95222802232
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=2 startup=13176.932228022319 total=13176.95222802232 disabled=0 pathkeys=8 verdict=accepted jointype=inner outer=- inner=- width=1352 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q67 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=21814.857411576166
+PLAN                                                     QUERY PLAN                            
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q68 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1823.2795199999998
+PLAN                                                                      QUERY PLAN           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q69 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=5 contained=true ncommon=5 totalcost=70505.51054107225
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=93 startup=70504.58054107225 total=70505.51054107225 disabled=0 pathkeys=5 verdict=accepted jointype=inner outer=- inner=- width=140 inputtotal=-1
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q70 rc=0
+PLAN psql:tmp/qprobe.sql:39: ERROR:  syntax error at or near ";"
+PLAN LINE 36:  limit 100;
+PLAN                    ^
+##Q71 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=4 contained=false ncommon=0 totalcost=1043.0576923076926
+PLAN                                                 QUERY PLAN                                
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q72 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=false ncommon=0 totalcost=3620.0968505280093
+PLAN                                                                        QUERY PLAN         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q73 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13.28525
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q74 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=1775.0625
+PLAN                                                                                    QUERY P
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q75 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=12.9125
+PLAN                                                                                    QUERY P
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q76 rc=0
+DPPATH seed producer=upper.ordered.seed kind=6 keys=5 contained=true ncommon=5 totalcost=49438.415871958845
+DPPATH path producer=upper.ordered.input relids=- kind=6 reqouter=- rows=34279 startup=48238.65087195885 total=49438.415871958845 disabled=0 pathkeys=5 verdict=accepted jointype=inner outer=- inner=- width=144 inputtotal=48324.34837195885
+DPPATH seed producer=upper.ordered.seed kind=6 keys=0 contained=false ncommon=0 totalcost=46770.646286311705
+PLAN                                          QUERY PLAN                                       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q77 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=6.7675
+PLAN                                                                QUERY PLAN                 
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q78 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=4694.860000000001
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q79 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3287.1575
+PLAN                                                        QUERY PLAN                         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q80 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=0.8475
+PLAN                                                                         QUERY PLAN        
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q81 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=2226.846080000001
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q82 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=3 contained=true ncommon=1 totalcost=26920.39243179305
+DPPATH path producer=upper.ordered.input relids=- kind=0 reqouter=- rows=2 startup=26920.37243179305 total=26920.39243179305 disabled=0 pathkeys=3 verdict=accepted jointype=inner outer=- inner=- width=96 inputtotal=-1
+PLAN                                                                          QUERY PLAN       
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q83 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=3.5225000000000004
+PLAN                                                    QUERY PLAN                             
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q84 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=7574.673929999999
+PLAN                                                       QUERY PLAN                          
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q85 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=false ncommon=0 totalcost=7640.1445598683395
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q86 rc=0
+PLAN psql:tmp/qprobe.sql:27: ERROR:  syntax error at or near ";"
+PLAN LINE 24:  limit 100;
+PLAN                    ^
+##Q87 rc=0
+PLAN                                                     QUERY PLAN                            
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Aggregate
+##Q88 rc=0
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Nested Loop
+##Q89 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=18020.852470807084
+PLAN                                                                                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q90 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=13422.887037060915
+PLAN                                                      QUERY PLAN                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q91 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=5 contained=false ncommon=0 totalcost=3234.9126183992457
+PLAN                                                                                        QUE
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q92 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9425.63172083989
+PLAN                                                            QUERY PLAN                     
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q93 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=1 contained=false ncommon=0 totalcost=4206.938011990376
+PLAN                                                      QUERY PLAN                           
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q94 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9180.705438500294
+PLAN                                                                         QUERY PLAN        
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q95 rc=0
+DPGROUP loop-decline reason=cands<2(1)
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=154969.38554914502
+PLAN                                                                         QUERY PLAN        
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q96 rc=0
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=16368.945562619992
+PLAN                                              QUERY PLAN                                   
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q97 rc=0
+PLAN                                             QUERY PLAN                                    
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit
+##Q98 rc=0
+DPGROUP loop-decline reason=gate-precondition
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=9614.272503419763
+PLAN                                                                  QUERY PLAN               
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Sort
+##Q99 rc=0
+DPGROUP loop-decline reason=parallel-finalize-agg-present
+DPPATH seed producer=upper.ordered.seed kind=0 keys=0 contained=false ncommon=0 totalcost=12362.613584900624
+PLAN                                                        QUERY PLAN                         
+PLAN ------------------------------------------------------------------------------------------
+PLAN  Limit

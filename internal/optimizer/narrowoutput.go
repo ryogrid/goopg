@@ -562,7 +562,7 @@ func searchedResidualHitsPad(residual Expr, searched Node, needed map[string]boo
 		return false
 	}
 	refs := make(map[string]bool, 8)
-	if !visitColumnRefsByName(residual, func(name string) { refs[name] = true }) {
+	if !residualColumnRefsByName(residual, func(name string) { refs[name] = true }) {
 		for name := range padded {
 			if needed[name] {
 				return true
@@ -576,6 +576,33 @@ func searchedResidualHitsPad(residual Expr, searched Node, needed map[string]boo
 		}
 	}
 	return false
+}
+
+// residualColumnRefsByName is visitColumnRefsByName for the pad check, with
+// one difference: an UNCORRELATED sublink's inner plan does not make the
+// walk partial (M0145-0008e). The residual is evaluated above the searched
+// root, and an uncorrelated SubPlan reads nothing from that row except its
+// same-scope slots (the IN operand, PARAM_EXEC Args), which the walk visits
+// as ordinary refs. The names inside its plan are the subquery's own
+// relation's columns, so matching them against the outer tree's pads would
+// be a name coincidence, not a read.
+//
+// TPC-H Q18 is the witness. Its `o_orderkey IN (SELECT l_orderkey … HAVING
+// sum(l_quantity) > 313)` stays in the residual on the jointree arm (the ANY
+// pull-up declines a grouped body). The statement-wide needed set includes
+// the subquery's l_orderkey / l_quantity, which also name padded outer
+// lineitem slots, so the old all-or-nothing walk declined the whole search
+// (`seam-decline reason=residual-hits-pad`). Q18 fell back to the syntactic
+// customer-orders-lineitem tree and hashed 6M lineitem rows instead of the
+// 1.5M-row customer ⋈ orders join the search had priced cheapest.
+//
+// A correlated inner plan still makes the walk partial: its OuterColumnRefs
+// name this scope's columns by index, and this name-keyed check cannot see
+// them.
+func residualColumnRefsByName(e Expr, fn func(string)) bool {
+	return walkColumnRefsByName(e, fn, func(plan Node) bool {
+		return plan != nil && !planHasOuterRef(plan)
+	})
 }
 
 // boundaryPaddedNames returns the names of every NULL-padded boundary slot

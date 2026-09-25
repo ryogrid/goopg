@@ -29,7 +29,12 @@ func TestValidateCreateCast(t *testing.T) {
 		target  string
 		method  string // "b" binary, "i" inout, "f" function
 		routine *catalog.Routine
-		wantErr string // substring of the expected error message; "" = must succeed
+		// priorCastSource/priorCastTarget register a WITHOUT FUNCTION ('b')
+		// user cast in a live catalog before validation — exercises the
+		// binary-coercibility paths that nil-catalog cases cannot reach.
+		priorCastSource string
+		priorCastTarget string
+		wantErr         string // substring of the expected error message; "" = must succeed
 	}{
 		// --- WITHOUT FUNCTION (binary) -----------------------------------------
 		{name: "binary distinct types ok", source: "text", target: "bytea", method: "b", wantErr: ""},
@@ -79,6 +84,34 @@ func TestValidateCreateCast(t *testing.T) {
 			routine: &catalog.Routine{Name: "f", ArgTypes: []catalog.Type{{Name: "text"}},
 				ReturnType: catalog.Type{Name: "integer"}, IsProcedure: true},
 			wantErr: "cast function must be a normal function"},
+
+		// --- Live cast registry (binary-coercibility) --------------------------
+		// PG's same-type check is strict OID identity
+		// (sourcetypeid == targettypeid), NOT binary-coercibility — a binary
+		// cast registered in the REVERSE direction must not make distinct
+		// source/target types compare "the same". Regression: the
+		// pg_dump-connsetup fixture's bytea→text cast false-rejected after
+		// text→bytea registered. M-NIGHTLY TestPort_PgDumpConnectionSetup.
+		{name: "binary reverse cast registered ok", source: "bytea", target: "text", method: "b",
+			priorCastSource: "text", priorCastTarget: "bytea", wantErr: ""},
+		// IsBinaryCoercibleWithCast is directional (CASTSOURCETARGET
+		// (srctype, targettype) only): a binary cast source→argtype satisfies
+		// the arg check, but the same cast in the reverse direction does not.
+		{name: "function arg coercible via forward cast ok", source: "text", target: "integer", method: "f",
+			routine:     fn("integer", "bytea"),
+			priorCastSource: "text", priorCastTarget: "bytea", wantErr: ""},
+		{name: "function arg reverse-only cast rejected", source: "bytea", target: "integer", method: "f",
+			routine:     fn("integer", "text"),
+			priorCastSource: "text", priorCastTarget: "bytea",
+			wantErr: "argument of cast function must match or be binary-coercible from source data type"},
+		// Return check is likewise directional: rettype→target.
+		{name: "function return coercible via forward cast ok", source: "text", target: "bytea", method: "f",
+			routine:     fn("text", "text"),
+			priorCastSource: "text", priorCastTarget: "bytea", wantErr: ""},
+		{name: "function return reverse-only cast rejected", source: "integer", target: "text", method: "f",
+			routine:     fn("bytea", "integer"),
+			priorCastSource: "text", priorCastTarget: "bytea",
+			wantErr: "return data type of cast function must match or be binary-coercible to target data type"},
 	}
 
 	for _, tc := range cases {
@@ -88,7 +121,12 @@ func TestValidateCreateCast(t *testing.T) {
 				ArgTypes:   []string{tc.source, tc.target},
 				CastMethod: tc.method,
 			}
-			err := validateCreateCast(s, tc.routine, nil)
+			var im *catalog.InMemory
+			if tc.priorCastSource != "" {
+				im = catalog.NewInMemory()
+				im.RegisterCast(tc.priorCastSource, tc.priorCastTarget, "", "b", 0)
+			}
+			err := validateCreateCast(s, tc.routine, im)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected success, got error: %v", err)

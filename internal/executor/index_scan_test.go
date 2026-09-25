@@ -10,6 +10,7 @@ import (
 func TestIndexScanEndToEndConstantKey(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
+	withAutovacuumOff(ctx)
 
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)

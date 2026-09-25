@@ -22,8 +22,8 @@ cluster).
 | 65434 | — | **reserved: nightly TPC-H clone lane** (ci/batch) | `tmp/goopg-nightly-tpch-data` |
 | 65435 | — | **reserved: nightly TPC-DS clone lane** (ci/batch) | `tmp/goopg-nightly-tpcds-data` |
 | 65436 | goopg | TPC-DS SF=1 | `bench/tpcds/runtime_goopg/data` |
-| 65437 | goopg | TPC-DS SF=0.5 (fast regression gate) | `bench/tpcds/runtime_goopg/data-sf05` |
-| 65438 | PostgreSQL 18.3 | TPC-DS reference (dbs `tpcds`, `tpcds05`) | `bench/tpcds/runtime/pgdata` |
+| 65437 | goopg | TPC-DS SF=0.25 (fast regression gate) | `bench/tpcds/runtime_goopg/data-sf025` |
+| 65438 | PostgreSQL 18.3 | TPC-DS reference (dbs `tpcds`, `tpcds025`) | `bench/tpcds/runtime/pgdata` |
 
 Setup / start / stop procedures:
 
@@ -34,25 +34,48 @@ Setup / start / stop procedures:
   per-DB catalog work, goopg persists `CREATE DATABASE`: the tables live in a
   durable `tpch` database and `tpch@tpch` works across restarts (verified on
   the 2026-07-27 rebuild), so `make plan-gate` works against a restarted
-  server too. Two known quirks of the rebuilt layout: HammerDB's final
+  server too. **The `:65433` evidence HOLD was RELEASED 2026-09-19** by an
+  owner-run `scripts/tpch-ref-recover.sh` restore (the second HOLD, caused by
+  the 2026-09-18 host-global OOM — see
+  `~/.ralph/OOM_INCIDENT/2026-09-18-global-oom.md`). The live `data/` dir was
+  restored from `preloss-clone-20260915`, spotcheck passed (Q12=2, Q13=34),
+  and the cluster runs again under `ref-clusters-ensure.sh`. The earlier
+  2026-09-17 incident (uncommitted `ALTER TABLE` stamping catalog rows with
+  xmax that the loader skips, paired with M0143-0008 — see
+  `tmp/METHODLOGY3_RALPH_CHECK0917/03-new-problems.md` §2) is preserved in
+  `tmp/evidence-65433-20260919-unclean/`. **`preloss-clone-20260915` remains
+  under `preloss-clone-20260915.HOLD`** — never start, clone, modify, move
+  or delete it; it is the only pre-loss copy. Two
+  known quirks of the rebuilt layout: HammerDB's final
   ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
   "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
-  the deferral ledger row `bench-reorg ANALYZE-scope`; the gate runs S-cold
+  the archived ledger row `bench-reorg ANALYZE-scope`, resolved 2026-07-27 by
+  M0125-0028 and since pruned from the live ledger — it survives only in
+  `analysis/deferral-ledger-summary-20260824/deferral_ledger_summary_fix.md`;
+  the gate runs S-cold
   regardless), and heavy queries at S-cold need GC headroom — Q21 drew a
   host-level OOM at `GOMEMLIMIT=18GiB` but completes at `GOGC=100` +
   `GOMEMLIMIT=12GiB`.
 - **TPC-DS**: `bench/tpcds/README.md`. Env: `bench/tpcds/env_tpcds.sh`
   (single source of truth for dirs/ports). Lifecycle:
-  `bench/tpcds/server.sh {start|stop|status} [sf1|sf05|pg|all]`.
-  The SF=0.5 fast regression gate (`scripts/tpcds-sf05-regression.sh sweep`,
-  ~1 h) checks goopg row counts against a **git-tracked PG oracle**
-  (`bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt`) and needs no
+  `bench/tpcds/server.sh {start|stop|status} [sf1|sf025|pg|all]`.
+  The SF=0.25 fast regression gate (`scripts/tpcds-sf025-regression.sh sweep`,
+  ~5 min) checks goopg row counts against a **git-tracked PG oracle**
+  (`bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt`) and needs no
   PG instance.
 
 Row-count anchors are **load-dependent**: `bench/tpch/spotcheck_expected.env`
 (Q12/Q13) and `ci/batch/tpch-row-anchors.csv` are pinned to a specific HammerDB
-load and must be re-pinned after any TPC-H reload; the TPC-DS SF0.5 oracle is
+load and must be re-pinned after any TPC-H reload; the TPC-DS SF0.25 oracle is
 re-captured only when the dataset or query files change.
+
+**Reference clusters (`:65432`, `:65433`, `:65438`) are read-only for the Ralph
+loop** — no DDL/DML/ANALYZE/stop/reset; writes go to a private `55xx` clone.
+A stopped one is restarted only via `scripts/ref-clusters-ensure.sh`. Rules:
+`AGENT.md` §"Plan-parity harness". Any other lifecycle action — stop,
+restart, reload, `--reset`, recovery, fresh bootstrap — is **owner-only**;
+the owner runbook is `maintenance_prompts/cluster-ops-runbook.md` and the
+loop escalates those cases instead of acting.
 
 ## Running a server manually
 
@@ -76,7 +99,8 @@ orphans, and materialize the victim set before `pg_terminate_backend`
   (unit/component suite). The git hook runs the pgbench smoke on EVERY commit —
   never `git commit --no-verify`.
 - Planner/executor changes additionally: `scripts/tpch-spotcheck.sh` (fresh
-  capped server + canonical Q12/Q13 row counts) and the TPC-DS SF0.5 gate.
+  capped server + canonical Q12/Q13 row counts; exit 3 = SKIP-BLOCKED, a
+  failure) and the TPC-DS SF0.25 gate.
 - **Never pass `-count=1` to a gate's `go test`** — it defeats the test-result
   cache (~5 min warm vs ~40 min cold). `-count=1` is for one-off probes only.
 

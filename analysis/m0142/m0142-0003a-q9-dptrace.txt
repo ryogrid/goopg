@@ -1,0 +1,971 @@
+DPTRACE problem nrels=6 rels=part,supplier,lineitem,partsupp,orders,nation
+DPTRACE pair phase=1 lev=2 created=1 pair={lineitem} | {part} outer={part} inner={lineitem}
+DPTRACE pair phase=1 lev=2 created=1 pair={partsupp} | {part} outer={part} inner={partsupp}
+DPTRACE pair phase=1 lev=2 created=1 pair={lineitem} | {supplier} outer={supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=2 created=1 pair={partsupp} | {supplier} outer={supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=2 created=1 pair={nation} | {supplier} outer={supplier} inner={nation}
+DPTRACE pair phase=1 lev=2 created=1 pair={lineitem} | {partsupp} outer={lineitem} inner={partsupp}
+DPTRACE pair phase=1 lev=2 created=1 pair={lineitem} | {orders} outer={lineitem} inner={orders}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+part} | {supplier} outer={lineitem+part} inner={supplier}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+part} | {partsupp} outer={lineitem+part} inner={partsupp}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+part} | {orders} outer={lineitem+part} inner={orders}
+DPTRACE pair phase=1 lev=3 created=1 pair={part+partsupp} | {supplier} outer={part+partsupp} inner={supplier}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem} | {part+partsupp} outer={part+partsupp} inner={lineitem}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+supplier} | {part} outer={lineitem+supplier} inner={part}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+supplier} | {partsupp} outer={lineitem+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+supplier} | {orders} outer={lineitem+supplier} inner={orders}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+supplier} | {nation} outer={lineitem+supplier} inner={nation}
+DPTRACE pair phase=1 lev=3 created=0 pair={partsupp+supplier} | {part} outer={partsupp+supplier} inner={part}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem} | {partsupp+supplier} outer={partsupp+supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=3 created=1 pair={nation} | {partsupp+supplier} outer={partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem} | {nation+supplier} outer={nation+supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=3 created=0 pair={nation+supplier} | {partsupp} outer={nation+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+partsupp} | {part} outer={lineitem+partsupp} inner={part}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+partsupp} | {supplier} outer={lineitem+partsupp} inner={supplier}
+DPTRACE pair phase=1 lev=3 created=1 pair={lineitem+partsupp} | {orders} outer={lineitem+partsupp} inner={orders}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+orders} | {part} outer={lineitem+orders} inner={part}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+orders} | {supplier} outer={lineitem+orders} inner={supplier}
+DPTRACE pair phase=1 lev=3 created=0 pair={lineitem+orders} | {partsupp} outer={lineitem+orders} inner={partsupp}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+part+supplier} | {partsupp} outer={lineitem+part+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+part+supplier} | {orders} outer={lineitem+part+supplier} inner={orders}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+part+supplier} | {nation} outer={lineitem+part+supplier} inner={nation}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+part+partsupp} | {supplier} outer={lineitem+part+partsupp} inner={supplier}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+part+partsupp} | {orders} outer={lineitem+part+partsupp} inner={orders}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+part} | {supplier} outer={lineitem+orders+part} inner={supplier}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+part} | {partsupp} outer={lineitem+orders+part} inner={partsupp}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem} | {part+partsupp+supplier} outer={part+partsupp+supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=4 created=1 pair={nation} | {part+partsupp+supplier} outer={part+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+partsupp+supplier} | {part} outer={lineitem+partsupp+supplier} inner={part}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+partsupp+supplier} | {orders} outer={lineitem+partsupp+supplier} inner={orders}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+partsupp+supplier} | {nation} outer={lineitem+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+supplier} | {part} outer={lineitem+orders+supplier} inner={part}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+supplier} | {partsupp} outer={lineitem+orders+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=4 created=1 pair={lineitem+orders+supplier} | {nation} outer={lineitem+orders+supplier} inner={nation}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+nation+supplier} | {part} outer={lineitem+nation+supplier} inner={part}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+nation+supplier} | {partsupp} outer={lineitem+nation+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+nation+supplier} | {orders} outer={lineitem+nation+supplier} inner={orders}
+DPTRACE pair phase=1 lev=4 created=0 pair={nation+partsupp+supplier} | {part} outer={nation+partsupp+supplier} inner={part}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem} | {nation+partsupp+supplier} outer={nation+partsupp+supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+partsupp} | {part} outer={lineitem+orders+partsupp} inner={part}
+DPTRACE pair phase=1 lev=4 created=0 pair={lineitem+orders+partsupp} | {supplier} outer={lineitem+orders+partsupp} inner={supplier}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+part} | {partsupp+supplier} outer={lineitem+part} inner={partsupp+supplier}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+part} | {nation+supplier} outer={lineitem+part} inner={nation+supplier}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+supplier} | {part+partsupp} outer={part+partsupp} inner={lineitem+supplier}
+DPTRACE pair phase=2 lev=4 created=0 pair={nation+supplier} | {part+partsupp} outer={part+partsupp} inner={nation+supplier}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+orders} | {part+partsupp} outer={part+partsupp} inner={lineitem+orders}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+orders} | {partsupp+supplier} outer={partsupp+supplier} inner={lineitem+orders}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+partsupp} | {nation+supplier} outer={nation+supplier} inner={lineitem+partsupp}
+DPTRACE pair phase=2 lev=4 created=0 pair={lineitem+orders} | {nation+supplier} outer={nation+supplier} inner={lineitem+orders}
+DPTRACE pair phase=1 lev=5 created=1 pair={lineitem+part+partsupp+supplier} | {orders} outer={lineitem+part+partsupp+supplier} inner={orders}
+DPTRACE pair phase=1 lev=5 created=1 pair={lineitem+part+partsupp+supplier} | {nation} outer={lineitem+part+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+orders+part+supplier} | {partsupp} outer={lineitem+orders+part+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=5 created=1 pair={lineitem+orders+part+supplier} | {nation} outer={lineitem+orders+part+supplier} inner={nation}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+part+supplier} | {partsupp} outer={lineitem+nation+part+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+part+supplier} | {orders} outer={lineitem+nation+part+supplier} inner={orders}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+orders+part+partsupp} | {supplier} outer={lineitem+orders+part+partsupp} inner={supplier}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem} | {nation+part+partsupp+supplier} outer={nation+part+partsupp+supplier} inner={lineitem}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+orders+partsupp+supplier} | {part} outer={lineitem+orders+partsupp+supplier} inner={part}
+DPTRACE pair phase=1 lev=5 created=1 pair={lineitem+orders+partsupp+supplier} | {nation} outer={lineitem+orders+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+partsupp+supplier} | {part} outer={lineitem+nation+partsupp+supplier} inner={part}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+partsupp+supplier} | {orders} outer={lineitem+nation+partsupp+supplier} inner={orders}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+orders+supplier} | {part} outer={lineitem+nation+orders+supplier} inner={part}
+DPTRACE pair phase=1 lev=5 created=0 pair={lineitem+nation+orders+supplier} | {partsupp} outer={lineitem+nation+orders+supplier} inner={partsupp}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+part} | {nation+partsupp+supplier} outer={lineitem+part} inner={nation+partsupp+supplier}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders+supplier} | {part+partsupp} outer={part+partsupp} inner={lineitem+orders+supplier}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+nation+supplier} | {part+partsupp} outer={part+partsupp} inner={lineitem+nation+supplier}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders+part} | {partsupp+supplier} outer={partsupp+supplier} inner={lineitem+orders+part}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+part+partsupp} | {nation+supplier} outer={nation+supplier} inner={lineitem+part+partsupp}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders+part} | {nation+supplier} outer={nation+supplier} inner={lineitem+orders+part}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders+partsupp} | {nation+supplier} outer={nation+supplier} inner={lineitem+orders+partsupp}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders} | {part+partsupp+supplier} outer={lineitem+orders} inner={part+partsupp+supplier}
+DPTRACE pair phase=2 lev=5 created=0 pair={lineitem+orders} | {nation+partsupp+supplier} outer={lineitem+orders} inner={nation+partsupp+supplier}
+DPTRACE pair phase=1 lev=6 created=1 pair={lineitem+orders+part+partsupp+supplier} | {nation} outer={lineitem+orders+part+partsupp+supplier} inner={nation}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+part+partsupp+supplier} | {orders} outer={lineitem+nation+part+partsupp+supplier} inner={orders}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+orders+part+supplier} | {partsupp} outer={lineitem+nation+orders+part+supplier} inner={partsupp}
+DPTRACE pair phase=1 lev=6 created=0 pair={lineitem+nation+orders+partsupp+supplier} | {part} outer={lineitem+nation+orders+partsupp+supplier} inner={part}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+nation+orders+supplier} | {part+partsupp} outer={part+partsupp} inner={lineitem+nation+orders+supplier}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders+part+partsupp} | {nation+supplier} outer={nation+supplier} inner={lineitem+orders+part+partsupp}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders} | {nation+part+partsupp+supplier} outer={lineitem+orders} inner={nation+part+partsupp+supplier}
+DPTRACE pair phase=2 lev=6 created=0 pair={lineitem+orders+part} | {nation+partsupp+supplier} outer={lineitem+orders+part} inner={nation+partsupp+supplier}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={part} | {supplier}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={orders} | {part}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={nation} | {part}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={orders} | {supplier}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={lineitem} | {nation}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={orders} | {partsupp}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={nation} | {partsupp}
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={nation} | {orders}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={lineitem+part} | {nation}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={orders} | {part+partsupp}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={nation} | {part+partsupp}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={orders} | {partsupp+supplier}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={nation+supplier} | {part}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={nation+supplier} | {orders}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={lineitem+partsupp} | {nation}
+DPTRACE decline phase=1 lev=3 reason=no-join-clause pair={lineitem+orders} | {nation}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={lineitem+part+partsupp} | {nation}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={lineitem+orders+part} | {nation}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={orders} | {part+partsupp+supplier}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={nation+partsupp+supplier} | {orders}
+DPTRACE decline phase=1 lev=4 reason=no-join-clause pair={lineitem+orders+partsupp} | {nation}
+DPTRACE decline phase=1 lev=5 reason=no-join-clause pair={lineitem+orders+part+partsupp} | {nation}
+DPTRACE decline phase=1 lev=5 reason=no-join-clause pair={nation+part+partsupp+supplier} | {orders}
+DPTRACE cost lev=2 rel={lineitem+part} rows=181840 npaths=3 cheapest=hash reqouter={} total=220907.43549999996 second=merge secondtotal=1.2536947820086866e+06
+DPTRACE cost lev=2 rel={part+partsupp} rows=24240 npaths=4 cheapest=hash reqouter={} total=36010.42 second=merge secondtotal=48961.79676848452
+DPTRACE cost lev=2 rel={lineitem+supplier} rows=5.989345e+06 npaths=3 cheapest=hash reqouter={} total=279244.178625 second=merge secondtotal=1.762571603231891e+06
+DPTRACE cost lev=2 rel={partsupp+supplier} rows=800000 npaths=3 cheapest=hash reqouter={} total=38369 second=merge secondtotal=175405.31189774725
+DPTRACE cost lev=2 rel={nation+supplier} rows=10000 npaths=3 cheapest=hash reqouter={} total=467.0625 second=merge secondtotal=1144.3411010011941
+DPTRACE cost lev=2 rel={lineitem+partsupp} rows=2466 npaths=5 cheapest=hash reqouter={} total=756825.8944999999 second=merge secondtotal=1.3532437043865495e+06
+DPTRACE cost lev=2 rel={lineitem+orders} rows=6.001324e+06 npaths=2 cheapest=merge reqouter={} total=454462.9801023186 second=merge secondtotal=454462.9801023186
+DPTRACE cost lev=3 rel={lineitem+part+supplier} rows=181477 npaths=5 cheapest=hash reqouter={} total=223856.69712499995 second=merge secondtotal=240143.47980992074
+DPTRACE cost lev=3 rel={lineitem+part+partsupp} rows=75 npaths=7 cheapest=nli reqouter={} total=80042.99638501374 second=merge secondtotal=288755.5697569406
+DPTRACE cost lev=3 rel={lineitem+orders+part} rows=181840 npaths=5 cheapest=hash reqouter={} total=274058.8355 second=merge secondtotal=323869.15805829986
+DPTRACE cost lev=3 rel={part+partsupp+supplier} rows=24240 npaths=5 cheapest=hash reqouter={} total=36796.72 second=merge secondtotal=38765.56037189727
+DPTRACE cost lev=3 rel={lineitem+partsupp+supplier} rows=2461 npaths=9 cheapest=hash reqouter={} total=757346.9882499998 second=merge secondtotal=757628.0184108507
+DPTRACE cost lev=3 rel={lineitem+orders+supplier} rows=5.989345e+06 npaths=5 cheapest=hash reqouter={} total=537300.9187273186 second=merge secondtotal=2.1716927732383423e+06
+DPTRACE cost lev=3 rel={lineitem+nation+supplier} rows=5.989345e+06 npaths=5 cheapest=hash reqouter={} total=279396.7175 second=merge secondtotal=1.7631268013508685e+06
+DPTRACE cost lev=3 rel={nation+partsupp+supplier} rows=800000 npaths=5 cheapest=hash reqouter={} total=38508.0625 second=merge secondtotal=175960.51001672473
+DPTRACE cost lev=3 rel={lineitem+orders+partsupp} rows=2466 npaths=7 cheapest=nli reqouter={} total=757917.9540804526 second=merge secondtotal=841350.1923699933
+DPTRACE cost lev=4 rel={lineitem+part+partsupp+supplier} rows=75 npaths=10 cheapest=nli reqouter={} total=80063.83437938798 second=merge secondtotal=80672.70719202267
+DPTRACE cost lev=4 rel={lineitem+orders+part+supplier} rows=181477 npaths=7 cheapest=hash reqouter={} total=277008.097125 second=merge secondtotal=293294.87980992073
+DPTRACE cost lev=4 rel={lineitem+nation+part+supplier} rows=181477 npaths=7 cheapest=hash reqouter={} total=223996.16799999995 second=merge secondtotal=240698.67792889822
+DPTRACE cost lev=4 rel={lineitem+orders+part+partsupp} rows=75 npaths=9 cheapest=nli reqouter={} total=80076.20987590343 second=merge secondtotal=164394.83216036644
+DPTRACE cost lev=4 rel={nation+part+partsupp+supplier} rows=24240 npaths=7 cheapest=hash reqouter={} total=37131.582500000004 second=merge secondtotal=38927.565853921
+DPTRACE cost lev=4 rel={lineitem+orders+partsupp+supplier} rows=2461 npaths=11 cheapest=nli reqouter={} total=758436.8335977264 second=merge secondtotal=758720.0779913033
+DPTRACE cost lev=4 rel={lineitem+nation+partsupp+supplier} rows=2461 npaths=11 cheapest=hash reqouter={} total=757382.3894999998 second=merge secondtotal=757524.4749131604
+DPTRACE cost lev=4 rel={lineitem+nation+orders+supplier} rows=5.989345e+06 npaths=7 cheapest=hash reqouter={} total=537453.4576023186 second=merge secondtotal=2.2878415414531864e+06
+DPTRACE cost lev=5 rel={lineitem+orders+part+partsupp+supplier} rows=75 npaths=12 cheapest=nli reqouter={} total=80097.04787027766 second=merge secondtotal=80705.92068291236
+DPTRACE cost lev=5 rel={lineitem+nation+part+partsupp+supplier} rows=75 npaths=12 cheapest=hash reqouter={} total=80066.42812938798 second=merge secondtotal=80069.25066842063
+DPTRACE cost lev=5 rel={lineitem+nation+orders+part+supplier} rows=181477 npaths=9 cheapest=hash reqouter={} total=277147.56799999997 second=merge secondtotal=293850.0779288982
+DPTRACE cost lev=5 rel={lineitem+nation+orders+partsupp+supplier} rows=2461 npaths=13 cheapest=hash reqouter={} total=758472.2348477264 second=merge secondtotal=758614.320260887
+DPTRACE cost lev=6 rel={lineitem+nation+orders+part+partsupp+supplier} rows=75 npaths=14 cheapest=hash reqouter={} total=80099.64162027766 second=merge secondtotal=80102.46415931032
+DPTRACE cpadmit src=base rel={part} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={supplier} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={lineitem} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={partsupp} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={orders} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={nation} cp=0 leaf=seq
+DPTRACE cpadmit src=join rel={lineitem+part} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={part+partsupp} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={nation+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+partsupp} cp=0 in1=0 in2=0 nclauses=2 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+part+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+part+partsupp} cp=0 in1=0 in2=0 nclauses=3 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+part} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=3 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={nation+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+partsupp} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=4 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+part+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+part+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+part+partsupp} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={nation+part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+orders+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+orders+part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+orders+part+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+orders+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpadmit src=join rel={lineitem+nation+orders+part+partsupp+supplier} cp=0 in1=0 in2=0 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={lineitem+part} partials=0 verdict=no-partials
+DPTRACE cpgather rel={part+partsupp} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={nation+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+partsupp} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+part+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+part+partsupp} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+part} partials=0 verdict=no-partials
+DPTRACE cpgather rel={part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={nation+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+partsupp} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+part+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+part+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+part+partsupp} partials=0 verdict=no-partials
+DPTRACE cpgather rel={nation+part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+orders+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+orders+part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+orders+part+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+orders+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE cpgather rel={lineitem+nation+orders+part+partsupp+supplier} partials=0 verdict=no-partials
+DPTRACE pveto site=base rel=- dir=- veto=B1 detail=sub=mode
+DPTRACE pveto site=merge rel={lineitem+part} dir={part}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part} dir={part}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part} dir={part}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part} dir={part}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part} dir={lineitem}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part} dir={lineitem}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part} dir={lineitem}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part} dir={lineitem}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp} dir={part}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp} dir={part}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp} dir={part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp} dir={part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp} dir={partsupp}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp} dir={partsupp}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp} dir={partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp} dir={partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+supplier} dir={supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+supplier} dir={supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+supplier} dir={supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+supplier} dir={supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+supplier} dir={lineitem}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+supplier} dir={lineitem}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+supplier} dir={lineitem}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+supplier} dir={lineitem}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={partsupp+supplier} dir={supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={partsupp+supplier} dir={supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={partsupp+supplier} dir={supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={partsupp+supplier} dir={supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={partsupp+supplier} dir={partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={partsupp+supplier} dir={partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={partsupp+supplier} dir={partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={partsupp+supplier} dir={partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+supplier} dir={supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+supplier} dir={supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+supplier} dir={supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+supplier} dir={supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+supplier} dir={nation}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+supplier} dir={nation}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+supplier} dir={nation}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+supplier} dir={nation}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp} dir={lineitem}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp} dir={lineitem}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp} dir={lineitem}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp} dir={lineitem}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp} dir={lineitem}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp} dir={partsupp}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp} dir={partsupp}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp} dir={partsupp}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp} dir={partsupp}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp} dir={partsupp}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders} dir={lineitem}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders} dir={lineitem}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders} dir={lineitem}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders} dir={lineitem}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders} dir={orders}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders} dir={orders}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders} dir={orders}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders} dir={orders}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+supplier} dir={lineitem+part}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+supplier} dir={lineitem+part}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+supplier} dir={lineitem+part}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+supplier} dir={lineitem+part}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+supplier} dir={supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+supplier} dir={supplier}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+supplier} dir={supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+supplier} dir={supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={lineitem+part}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={lineitem+part}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={lineitem+part}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={lineitem+part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={lineitem+part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={partsupp}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={partsupp}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={partsupp}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={partsupp}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={partsupp}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part} dir={lineitem+part}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part} dir={lineitem+part}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part} dir={lineitem+part}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part} dir={lineitem+part}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part} dir={orders}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part} dir={orders}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part} dir={orders}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part} dir={orders}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp+supplier} dir={part+partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp+supplier} dir={part+partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp+supplier} dir={part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp+supplier} dir={part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp+supplier} dir={supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp+supplier} dir={supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp+supplier} dir={supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp+supplier} dir={supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={part+partsupp}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={part+partsupp}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={part+partsupp}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={part+partsupp}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={part+partsupp}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={lineitem}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={lineitem}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={lineitem}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={lineitem}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={lineitem}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+supplier} dir={lineitem+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+supplier} dir={lineitem+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+supplier} dir={lineitem+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+supplier} dir={lineitem+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+supplier} dir={part}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+supplier} dir={part}+{lineitem+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+supplier} dir={part}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+supplier} dir={part}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={lineitem+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={lineitem+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={lineitem+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={lineitem+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={lineitem+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={partsupp}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={partsupp}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={partsupp}+{lineitem+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={partsupp}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={partsupp}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+supplier} dir={lineitem+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+supplier} dir={lineitem+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+supplier} dir={lineitem+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+supplier} dir={lineitem+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+supplier} dir={orders}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+supplier} dir={orders}+{lineitem+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+supplier} dir={orders}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+supplier} dir={orders}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+supplier} dir={lineitem+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+supplier} dir={lineitem+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+supplier} dir={lineitem+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+supplier} dir={lineitem+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+supplier} dir={nation}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+supplier} dir={nation}+{lineitem+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+supplier} dir={nation}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+supplier} dir={nation}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp+supplier} dir={partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp+supplier} dir={partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp+supplier} dir={partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp+supplier} dir={partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={part+partsupp+supplier} dir={part}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={part+partsupp+supplier} dir={part}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={part+partsupp+supplier} dir={part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={part+partsupp+supplier} dir={part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={partsupp+supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={lineitem}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={lineitem}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={lineitem}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={lineitem}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={lineitem}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+partsupp+supplier} dir={partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+partsupp+supplier} dir={partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+partsupp+supplier} dir={partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+partsupp+supplier} dir={partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+partsupp+supplier} dir={nation}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+partsupp+supplier} dir={nation}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+partsupp+supplier} dir={nation}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+partsupp+supplier} dir={nation}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+supplier} dir={nation+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+supplier} dir={nation+supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+supplier} dir={nation+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+supplier} dir={nation+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+supplier} dir={lineitem}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+supplier} dir={lineitem}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+supplier} dir={lineitem}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+supplier} dir={lineitem}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+partsupp+supplier} dir={nation+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+partsupp+supplier} dir={nation+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+partsupp+supplier} dir={nation+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+partsupp+supplier} dir={nation+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+partsupp+supplier} dir={partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+partsupp+supplier} dir={partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+partsupp+supplier} dir={partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+partsupp+supplier} dir={partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={lineitem+partsupp}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={lineitem+partsupp}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={lineitem+partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={lineitem+partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp} dir={part}+{lineitem+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp} dir={part}+{lineitem+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp} dir={part}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp} dir={part}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={lineitem+partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={lineitem+partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={lineitem+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={lineitem+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+partsupp+supplier} dir={supplier}+{lineitem+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+partsupp+supplier} dir={supplier}+{lineitem+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+partsupp+supplier} dir={supplier}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+partsupp+supplier} dir={supplier}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={lineitem+partsupp}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp} dir={lineitem+partsupp}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp} dir={lineitem+partsupp}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp} dir={lineitem+partsupp}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={orders}+{lineitem+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp} dir={orders}+{lineitem+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp} dir={orders}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp} dir={orders}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part} dir={lineitem+orders}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part} dir={lineitem+orders}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part} dir={lineitem+orders}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part} dir={lineitem+orders}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part} dir={part}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part} dir={part}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part} dir={part}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part} dir={part}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+supplier} dir={lineitem+orders}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+supplier} dir={lineitem+orders}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+supplier} dir={lineitem+orders}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+supplier} dir={lineitem+orders}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+supplier} dir={supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+supplier} dir={supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+supplier} dir={supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+supplier} dir={supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={lineitem+orders}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={lineitem+orders}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp} dir={lineitem+orders}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp} dir={lineitem+orders}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp} dir={lineitem+orders}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={partsupp}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp} dir={partsupp}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp} dir={partsupp}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp} dir={partsupp}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp} dir={partsupp}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem+part+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={partsupp}+{lineitem+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={partsupp}+{lineitem+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={partsupp}+{lineitem+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={partsupp}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={partsupp}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={lineitem+part+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={lineitem+part+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={lineitem+part+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={lineitem+part+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={orders}+{lineitem+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={orders}+{lineitem+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={orders}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={orders}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={lineitem+part+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={lineitem+part+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={lineitem+part+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={lineitem+part+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={nation}+{lineitem+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={nation}+{lineitem+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={nation}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={nation}+{lineitem+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+part+partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem+part+partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem+part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem+part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={supplier}+{lineitem+part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={supplier}+{lineitem+part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={supplier}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={supplier}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+part+partsupp}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={lineitem+part+partsupp}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={lineitem+part+partsupp}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={lineitem+part+partsupp}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={orders}+{lineitem+part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={orders}+{lineitem+part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={orders}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={orders}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={lineitem+orders+part}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={lineitem+orders+part}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={lineitem+orders+part}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={lineitem+orders+part}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={supplier}+{lineitem+orders+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+orders+part}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+orders+part}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={lineitem+orders+part}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={lineitem+orders+part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={lineitem+orders+part}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={partsupp}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={partsupp}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={partsupp}+{lineitem+orders+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={partsupp}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={partsupp}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem}+{part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem}+{part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem}+{part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={part+partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={part+partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={nation}+{part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={nation}+{part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={nation}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={nation}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem+partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={part}+{lineitem+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={part}+{lineitem+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={part}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={part}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+partsupp+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={lineitem+partsupp+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={lineitem+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={lineitem+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={orders}+{lineitem+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={orders}+{lineitem+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={orders}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={orders}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={nation}+{lineitem+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={nation}+{lineitem+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={nation}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={nation}+{lineitem+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={lineitem+orders+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={lineitem+orders+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={lineitem+orders+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={lineitem+orders+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+supplier} dir={part}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+supplier} dir={part}+{lineitem+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+supplier} dir={part}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+supplier} dir={part}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={partsupp}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={partsupp}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={partsupp}+{lineitem+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={partsupp}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={partsupp}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={lineitem+orders+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={lineitem+orders+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={lineitem+orders+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={lineitem+orders+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={nation}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={nation}+{lineitem+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={nation}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={nation}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={lineitem+nation+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={lineitem+nation+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={lineitem+nation+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={lineitem+nation+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={part}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={part}+{lineitem+nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={part}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={part}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem+nation+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem+nation+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={lineitem+nation+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={lineitem+nation+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={lineitem+nation+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={partsupp}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={partsupp}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={partsupp}+{lineitem+nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={partsupp}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={partsupp}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={lineitem+nation+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={lineitem+nation+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={lineitem+nation+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={lineitem+nation+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={orders}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={orders}+{lineitem+nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={orders}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={orders}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={part}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={part}+{nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={lineitem}+{nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={lineitem}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={lineitem}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+orders+partsupp}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={lineitem+orders+partsupp}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={lineitem+orders+partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={lineitem+orders+partsupp}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={part}+{lineitem+orders+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={part}+{lineitem+orders+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={part}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={part}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={supplier}+{lineitem+orders+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={supplier}+{lineitem+orders+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={supplier}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={supplier}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+part}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+part}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem+part}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem+part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem+part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={lineitem+part}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={lineitem+part}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={lineitem+part}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={lineitem+part}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+supplier} dir={nation+supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+supplier} dir={nation+supplier}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+supplier} dir={nation+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+supplier} dir={nation+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={part+partsupp}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={part+partsupp}+{lineitem+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={part+partsupp}+{lineitem+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={part+partsupp}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={part+partsupp}+{lineitem+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+part+partsupp+supplier} dir={lineitem+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+part+partsupp+supplier} dir={lineitem+supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+part+partsupp+supplier} dir={lineitem+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+part+partsupp+supplier} dir={lineitem+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={part+partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={part+partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={nation+part+partsupp+supplier} dir={nation+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={nation+part+partsupp+supplier} dir={nation+supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={nation+part+partsupp+supplier} dir={nation+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={nation+part+partsupp+supplier} dir={nation+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={part+partsupp}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={part+partsupp}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={part+partsupp}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={part+partsupp}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={part+partsupp}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+orders}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp} dir={lineitem+orders}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp} dir={lineitem+orders}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp} dir={lineitem+orders}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp} dir={lineitem+orders}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+partsupp+supplier} dir={lineitem+orders}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={nation+supplier}+{lineitem+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={nation+supplier}+{lineitem+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={nation+supplier}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={nation+supplier}+{lineitem+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+partsupp+supplier} dir={lineitem+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={nation+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={nation+supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={nation+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={nation+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+supplier} dir={lineitem+orders}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+supplier} dir={lineitem+orders}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+supplier} dir={lineitem+orders}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+supplier} dir={lineitem+orders}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={orders}+{lineitem+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={orders}+{lineitem+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={orders}+{lineitem+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={orders}+{lineitem+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation}+{lineitem+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={nation}+{lineitem+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={nation}+{lineitem+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={nation}+{lineitem+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+orders+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+orders+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+orders+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={nation}+{lineitem+orders+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={nation}+{lineitem+orders+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={nation}+{lineitem+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={nation}+{lineitem+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+part+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+part+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+part+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+part+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+part+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={orders}+{lineitem+nation+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={orders}+{lineitem+nation+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={orders}+{lineitem+nation+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={orders}+{lineitem+nation+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={supplier}+{lineitem+orders+part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={supplier}+{lineitem+orders+part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={supplier}+{lineitem+orders+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={supplier}+{lineitem+orders+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem}+{nation+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem}+{nation+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem}+{nation+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem}+{nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem}+{nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={part}+{lineitem+orders+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={part}+{lineitem+orders+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={part}+{lineitem+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={part}+{lineitem+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={nation}+{lineitem+orders+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={nation}+{lineitem+orders+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={nation}+{lineitem+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={nation}+{lineitem+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={part}+{lineitem+nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={part}+{lineitem+nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={part}+{lineitem+nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={part}+{lineitem+nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={orders}+{lineitem+nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={orders}+{lineitem+nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={orders}+{lineitem+nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={orders}+{lineitem+nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+orders+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+orders+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+orders+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={lineitem+nation+orders+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={part}+{lineitem+nation+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={part}+{lineitem+nation+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={part}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={part}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part}+{nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+nation+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={partsupp+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={nation+supplier}+{lineitem+part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={nation+supplier}+{lineitem+part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={nation+supplier}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={nation+supplier}+{lineitem+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+part+partsupp+supplier} dir={lineitem+part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={nation+supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={nation+supplier}+{lineitem+orders+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={nation+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={nation+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+supplier} dir={lineitem+orders+part}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders}+{part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders}+{part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders}+{part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={lineitem+orders}+{part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+orders+part+partsupp+supplier} dir={part+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders}+{nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={lineitem+orders}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp+supplier}+{nation} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp+supplier}+{nation} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp+supplier}+{nation} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation}+{lineitem+orders+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation}+{lineitem+orders+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation}+{lineitem+orders+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation}+{lineitem+orders+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+part+partsupp+supplier}+{orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+part+partsupp+supplier}+{orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+part+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+part+partsupp+supplier}+{orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={orders}+{lineitem+nation+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={orders}+{lineitem+nation+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={orders}+{lineitem+nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={orders}+{lineitem+nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+part+supplier}+{partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+part+supplier}+{partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+part+supplier}+{partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+part+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+part+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={partsupp}+{lineitem+nation+orders+part+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+partsupp+supplier}+{part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+partsupp+supplier}+{part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+partsupp+supplier}+{part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={part}+{lineitem+nation+orders+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={part}+{lineitem+nation+orders+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={part}+{lineitem+nation+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={part}+{lineitem+nation+orders+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+orders+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+orders+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={part+partsupp}+{lineitem+nation+orders+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+nation+orders+supplier}+{part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+part+partsupp} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+part+partsupp} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+supplier}+{lineitem+orders+part+partsupp} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{nation+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{nation+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part+partsupp}+{nation+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders}+{nation+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders}+{nation+part+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders}+{nation+part+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders}+{nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders}+{nation+part+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem+orders} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem+orders} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+part+partsupp+supplier}+{lineitem+orders} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{nation+partsupp+supplier} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{nation+partsupp+supplier} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={lineitem+orders+part}+{nation+partsupp+supplier} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=merge rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders+part} veto=M1 detail=sub=mode jt=INNER
+DPTRACE pveto site=mergeu rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders+part} veto=M0 detail=sub=mode jt=INNER
+DPTRACE pveto site=hash rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE pveto site=nestloop rel={lineitem+nation+orders+part+partsupp+supplier} dir={nation+partsupp+supplier}+{lineitem+orders+part} veto=V2 detail=sub=mode jt=INNER
+DPTRACE end top={lineitem+nation+orders+part+partsupp+supplier} pairs=88 declined=23 costs=29 status=ok

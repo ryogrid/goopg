@@ -294,6 +294,12 @@ type Checkpointer struct {
 	wal     checkpointWAL
 	cfg     CheckpointerConfig
 
+	// recoveryMode is set for a physical standby.  Recovery may flush dirty
+	// data pages, but it must never manufacture a local checkpoint record:
+	// the standby WAL stream is owned by the primary and its reconnect LSN is
+	// derived from that stream's durable tail.
+	recoveryMode atomic.Bool
+
 	// retainer, when non-nil, runs after each successful
 	// checkpoint marker is durable. The slot-aware production
 	// implementation lives in retention.go; tests can wire a
@@ -693,6 +699,19 @@ func (c *Checkpointer) CheckpointShutdown() error {
 	return c.runCheckpoint(context.Background(), false, true)
 }
 
+// SetRecoveryMode makes checkpoints flush received data without appending a
+// local checkpoint record.  A physical standby resumes WAL streaming from its
+// local durable tail; advancing that tail with a standby-local checkpoint
+// would make the next START_REPLICATION request point past (or into) the
+// primary's stream.  The setting is established during startup before Run is
+// launched and remains fixed until promotion.
+func (c *Checkpointer) SetRecoveryMode(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.recoveryMode.Store(enabled)
+}
+
 // runCheckpoint executes one checkpoint cycle. When `spread` is
 // true and CompletionTarget > 0, dirty-page writeback is paced so
 // it finishes near `start + Interval * CompletionTarget`. The WAL
@@ -754,6 +773,9 @@ func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
 }
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
+	if c.recoveryMode.Load() {
+		return c.runRecoveryFlush(ctx)
+	}
 	start := time.Now()
 	checkpointType := "requested"
 	if spread {
@@ -1078,6 +1100,33 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	c.cfg.Logger.Info("checkpoint complete",
 		"type", checkpointType,
 		"lsn", endLSN,
+		"elapsed_ms", time.Since(start).Milliseconds())
+	return nil
+}
+
+// runRecoveryFlush is the standby counterpart to a checkpoint.  It preserves
+// the durability ordering needed for replayed pages and CLOG, but deliberately
+// leaves WAL and pg_control untouched: those belong to the primary until
+// promotion.  In particular, the local WAL tail remains a valid physical
+// restart position for the walreceiver after Stop+Start.
+func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
+	start := time.Now()
+	c.cfg.Logger.Info("recovery checkpoint start", "type", "standby")
+	if err := c.flushDirty(c.buildPacer(ctx, false, start)); err != nil {
+		return fmt.Errorf("flush recovery dirty pages: %w", err)
+	}
+	if c.cfg.FlushCLOGFn != nil {
+		if err := c.cfg.FlushCLOGFn(); err != nil {
+			return fmt.Errorf("flush recovery clog dirty pages: %w", err)
+		}
+	}
+	if ds, ok := c.flusher.(dataFileSyncer); ok {
+		if err := ds.SyncAllDataFiles(); err != nil {
+			return fmt.Errorf("sync recovery data files: %w", err)
+		}
+	}
+	c.numRequested.Add(1)
+	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
 }

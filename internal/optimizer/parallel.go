@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // parallelOn is the process-global kill switch, in the established house
@@ -98,6 +99,14 @@ type ParallelSettings struct {
 //
 // It never mutates root or anything below it.
 func MaybeAddGather(root Node, s ParallelSettings) Node {
+	return maybeAddGatherInner(root, s, false)
+}
+
+// maybeAddGatherInner is MaybeAddGather with the sublink-nesting rule
+// threaded through: ancGathered reports a Gather above the current
+// tree (placed by this pass or pre-existing), in which case nested
+// sublinks stay serial (subquery_parallel.go: the nesting rule).
+func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	if root == nil {
 		return root
 	}
@@ -134,7 +143,7 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	// `parallelChildren` arm, so asking any of them about the wrapper answers
 	// about nothing.
 	if ex, ok := root.(*Explain); ok {
-		inner := MaybeAddGather(ex.Child, s)
+		inner := maybeAddGatherInner(ex.Child, s, ancGathered)
 		if inner == ex.Child {
 			return root
 		}
@@ -186,7 +195,10 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	// Find the deepest point at which the subtree below is partial-capable.
 	tgt, ok := findPartialSubtree(root, s)
 	if !ok {
-		return root
+		// R33 (K44): no top-level target — sublinks still get their
+		// own verdicts (Q9's top is a 1-row scan; its 15 InitPlans
+		// are the whole question).
+		return graftTop(root, s, ancGathered)
 	}
 
 	// Worker count comes from the scan, so a wrapper target (Sort, Aggregate)
@@ -200,10 +212,10 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 	workers := computeParallelWorkers(sized, s)
 	if workers <= 0 {
-		return root
+		return graftTop(root, s, ancGathered)
 	}
 
-	return rebuildWithGather(root, tgt, workers)
+	return rebuildWithGather(root, tgt, workers, s.LeaderParticipates)
 }
 
 // subtreeHasGather reports whether the tree already carries a Gather or a
@@ -412,8 +424,14 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 			cur = kids[0]
 			continue
 		}
-		// cur is partial-capable if it bottoms out in an eligible seq scan.
-		if drivingScan(cur) != nil {
+		// cur is partial-capable if it bottoms out in an eligible seq scan —
+		// but not THROUGH a Sort. A Sort on the driving spine means
+		// per-worker sorts, and parking a concatenating Gather above them
+		// returns unordered rows (TestNoPlainGatherOverWorkerSort). The
+		// walk descends to the Sort itself instead, so P7 places a
+		// GatherMerge over it. Sorts OFF the spine — a join build side,
+		// replicated whole per worker — are unaffected, as before.
+		if drivingScan(cur) != nil && !drivingScanCrossesSort(cur) {
 			return partialTarget{node: cur}, true
 		}
 		kids := parallelChildren(cur)
@@ -502,7 +520,10 @@ func terminatesPartial(n Node) bool {
 
 // stampParallelScan is drivingScan's copy-on-write sibling: it performs the
 // EXACT SAME traversal decision (Filter/Project pass-through, Join probe-side
-// only under hashJoinIsPartialCapable, terminating on *SeqScan/*BitmapHeapScan)
+// only under hashJoinIsPartialCapable, outer-side only under
+// mergeJoinIsPartialCapable / nestedLoopJoinIsPartialCapable /
+// lateralProbeJoinIsPartialCapable, terminating on
+// *SeqScan/*BitmapHeapScan)
 // but instead of merely locating the driving scan, it returns a NEW tree with
 // Parallel: true stamped on a COPY of that scan. This mirrors PostgreSQL's
 // parallel_aware, which is set per-PATH-CHOICE at path-construction time
@@ -560,6 +581,22 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *Sort:
+		// R56: mirror of the drivingScan arm — stamp through to the driving
+		// scan so an Agg→Sort→scan split labels the scan it actually runs
+		// on. Copy-on-write: the post-pass runs on a plan the process-wide
+		// cache may be handing to other sessions right now
+		// (rebuildWithGather's comment). Required, not cosmetic:
+		// `gatherChildPlan` stamps the built child and refuses a subtree
+		// with no driving scan, so without this arm the R56 GatherMerge
+		// upper arm could never build.
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
@@ -571,10 +608,16 @@ func stampParallelScan(n Node) Node {
 		// (`partialPathDrivingKind` Children[0]), this label walk, and the
 		// executor walk (`attachParallelScan` JoinAlgoMerge) all descend
 		// the left.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
 			return n
 		}
-		if joinProbeSideIsLeft(x) {
+		// R94: an ordinary nested loop is partial through its OUTER (left)
+		// side only, named literally — never via joinProbeSideIsLeft, which
+		// answers from BuildLeft, a field a nested loop leaves false by
+		// construction (the seq-arm trap documented on attachParallelScan).
+		// R95: the lateral probe shape shares the literal-left rule — the
+		// probe re-opens per worker-local outer row and takes no claim.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
 			left := stampParallelScan(x.Left)
 			if left == x.Left {
 				return x
@@ -583,12 +626,62 @@ func stampParallelScan(n Node) Node {
 			c.Left = left
 			return &c
 		}
-		right := stampParallelScan(x.Right)
-		if right == x.Right {
+		// The probe side is partial. M0146-0002: a Parallel Hash join's
+		// build side is partial too (each participant builds its claimed
+		// share), so it is labelled as well — the same side the executor's
+		// attachParallelHashBuildSides wires to the join's own claim set.
+		probeLeft := joinProbeSideIsLeft(x)
+		left, right := x.Left, x.Right
+		if probeLeft || (x.ParallelHash && x.Algo == JoinAlgoHash) {
+			left = stampParallelScan(x.Left)
+		}
+		if !probeLeft || (x.ParallelHash && x.Algo == JoinAlgoHash) {
+			right = stampParallelScan(x.Right)
+		}
+		if left == x.Left && right == x.Right {
 			return x
 		}
 		c := *x
-		c.Right = right
+		c.Left, c.Right = left, right
+		return &c
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: mirror of the drivingScan arm — partial through the
+		// OUTER side only; the inner probe takes no stamp (it re-opens per
+		// worker-local outer row and is not a partitioned scan).
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return n
+		}
+		outer := stampParallelScan(x.Outer)
+		if outer == x.Outer {
+			return x
+		}
+		c := *x
+		c.Outer = outer
+		return &c
+	case *SetOp:
+		// M0140-0006c: mirror of the drivingScan *SetOp arm — BOTH branches
+		// are stamped, not just one side, since a partial SetOp streams
+		// both.
+		//
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (x.LeftNonPartial/x.RightNonPartial) is NOT descended — its
+		// driving scan is drained serially by the one participant that
+		// CAS-wins the branch claim, so stamping it would mark a scan no
+		// claim set will ever serve (and mislabel it "Parallel" in
+		// EXPLAIN, where PG shows the non-partial branch's ordinary serial
+		// subtree).
+		left, right := x.Left, x.Right
+		if !x.LeftNonPartial {
+			left = stampParallelScan(x.Left)
+		}
+		if !x.RightNonPartial {
+			right = stampParallelScan(x.Right)
+		}
+		if left == x.Left && right == x.Right {
+			return x
+		}
+		c := *x
+		c.Left, c.Right = left, right
 		return &c
 	}
 	return n
@@ -642,6 +735,15 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Child)
 	case *Project:
 		return drivingScan(x.Child)
+	case *Sort:
+		// R56. A Sort over a partial-capable subtree is transparent to the
+		// driving-scan walk: each worker sorts its own partition (P7), so the
+		// scan below is still the per-worker entry the executor's
+		// `attachParallelScan` descends to (parallel_scan.go, P7 arm). This
+		// admits Agg→Sort→scan to the P9 split verdict and Sort-topped
+		// children to the upper-rel producer; the four walks (drivingScan,
+		// stampParallelScan, unstampParallelScan, attachParallelScan) agree.
+		return drivingScan(x.Child)
 	case *Join:
 		// P8. A hash join is partial through its PROBE side only: the build
 		// side is drained once by the leader before fan-out, and the probe is
@@ -656,15 +758,159 @@ func drivingScan(n Node) Node {
 		// shared side logic below descends the outer with no special case —
 		// which is exactly what must stay true: if BuildLeft ever becomes
 		// meaningful for merge, this arm needs its own side test.
-		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) {
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
 			return nil
+		}
+		// R94: same literal-left rule as the stamp sibling above.
+		// R95: the lateral probe shares it.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
+			return drivingScan(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
 			return drivingScan(x.Left)
 		}
 		return drivingScan(x.Right)
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: the fused NLI (the memoized probe shape — InnerMemo
+		// is a field on this node, not a child) is partial through its
+		// OUTER side only — the same side the lateral-probe *Join arm
+		// descends. The inner probe re-opens per worker-local outer row
+		// (BindOuter/Rescan) and takes no claim; each worker's
+		// memoizeOp/kvcache is private by construction, so the cache is
+		// not a shared-state problem here. PG files exactly this shape:
+		// try_partial_nestloop_path over the get_memoize_path inner
+		// (joinpath.c:2194-2199) is TPC-DS Q34/Q73's
+		// `Gather > Nested Loop > Memoize > Index Scan`.
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return nil
+		}
+		return drivingScan(x.Outer)
+	case *SetOp:
+		// M0140-0006c. A partial SetOp streams BOTH branches (unlike a
+		// join, which is partial through one side only), so BOTH must
+		// resolve to a driving scan the executor's *setOp arm of attachAll
+		// can claim independently (parallel_scan.go) — a single side is
+		// not enough. The planner's own admission gate is narrower than
+		// this recursion (partialPathDrivingKind's PathSetOp arm accepts a
+		// bare scan only), so in practice x.Left/x.Right are already a
+		// bare *SeqScan/*IndexScan here; this stays the general recursive
+		// form anyway, matching every other arm's sibling-agreement shape.
+		//
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (x.LeftNonPartial/x.RightNonPartial — PG's pa_nonpartial_subpaths)
+		// is drained serially by its single CAS-winning participant, so it
+		// needs no driving scan and its side of the check is satisfied by
+		// the marker alone. An all-claimed SetOp therefore returns x with
+		// nothing below it scanned — correct: workers divide BRANCHES, not
+		// rows, and gatherChildPlan's panic guard is answered by the two
+		// claim flags, not by a stamped scan.
+		leftOK := x.LeftNonPartial || drivingScan(x.Left) != nil
+		rightOK := x.RightNonPartial || drivingScan(x.Right) != nil
+		if !leftOK || !rightOK {
+			return nil
+		}
+		return x
 	}
 	return nil
+}
+
+// drivingScans returns every terminal scan `drivingScan` selects — plural
+// because a `*SetOp` driving node stands for ALL of its streamed branches:
+// each worker partitions every member's claim set (the *setOp arm of
+// attachAll), so the worker-count sizing must see each branch's scan and
+// take the max, the same way PG's create_append_path takes
+// `parallel_workers` as the max over child subpaths.
+//
+// A branch stamped claimed-whole (x.LeftNonPartial/x.RightNonPartial) is
+// skipped: it is drained serially by its single CAS-winning participant,
+// contributes no partitioned scan, and must not raise the worker count —
+// matching drivingScan's own arm, which treats the marker as satisfying
+// that side without descending. All-claimed is unreachable here in
+// practice (a SetOp only becomes a driving node when drivingScan's arm
+// resolved every branch), but an empty result is still handled by the
+// callers as "no driving scan" — refuse, same as today.
+//
+// Recursion covers the left-deep chain: `drivingScan`'s SetOp arm returns
+// the OUTER SetOp node when both sides resolve, so a nested
+// `SetOp{SetOp{m1,m2},m3}` expands to [m1, m2, m3] one level at a time.
+func drivingScans(n Node) []Node {
+	scan := drivingScan(n)
+	if scan == nil {
+		return nil
+	}
+	if so, ok := scan.(*SetOp); ok {
+		var out []Node
+		if !so.LeftNonPartial {
+			out = append(out, drivingScans(so.Left)...)
+		}
+		if !so.RightNonPartial {
+			out = append(out, drivingScans(so.Right)...)
+		}
+		return out
+	}
+	return []Node{scan}
+}
+
+// drivingScanCrossesSort reports whether `drivingScan`'s descent from n to
+// its scan passes through a Sort.
+//
+// R56. This is the guard `findPartialSubtree`'s bottom-out rule needs now
+// that `drivingScan` sees through Sorts: a Sort on the spine means the
+// boundary would sit above per-worker sorts, which only a GatherMerge may
+// do. It follows `drivingScan`'s traversal arm for arm — Filter, Project,
+// the probe side of a partial-capable join (P8) — and the two must stay in
+// agreement: a node kind added to one belongs in the other. Sorts anywhere
+// else (a join build side, a NestedLoopIndexJoin inner) are off the spine
+// and read false here, which is what keeps the old verdict for them.
+func drivingScanCrossesSort(n Node) bool {
+	switch x := n.(type) {
+	case *Sort:
+		return true
+	case *Filter:
+		return drivingScanCrossesSort(x.Child)
+	case *Project:
+		return drivingScanCrossesSort(x.Child)
+	case *Join:
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
+			return false
+		}
+		// R94: same literal-left rule as the two siblings above.
+		// R95: the lateral probe shares it.
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
+			return drivingScanCrossesSort(x.Left)
+		}
+		if joinProbeSideIsLeft(x) {
+			return drivingScanCrossesSort(x.Left)
+		}
+		return drivingScanCrossesSort(x.Right)
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: drivingScan descends the capable NLI's outer, so
+		// the Sort check must follow the same path — a Sort between the
+		// join and its driving scan means per-worker sorts under a plain
+		// Gather. (Unreachable from findPartialSubtree today —
+		// terminatesPartial fires first — kept guard-for-guard with
+		// drivingScan so the two can never disagree.)
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return false
+		}
+		return drivingScanCrossesSort(x.Outer)
+	case *SetOp:
+		// M0145-0004: mirror of drivingScan's *SetOp arm — the descent
+		// covers BOTH streamed branches, so a Sort on either puts a
+		// per-worker sort under a plain Gather. Claimed-whole branches
+		// (x.LeftNonPartial/x.RightNonPartial) are skipped exactly as
+		// drivingScan skips them: a claimed branch is a complete serial
+		// subplan drained by its one participant and may sort inside
+		// itself freely.
+		if !x.LeftNonPartial && drivingScanCrossesSort(x.Left) {
+			return true
+		}
+		if !x.RightNonPartial && drivingScanCrossesSort(x.Right) {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // plainIndexScanIsPartialCapable is the one predicate drivingScan (eligibility)
@@ -715,9 +961,40 @@ func HasShareableHashJoin(n Node) bool {
 		return false
 	case *Join:
 		if !hashJoinIsPartialCapable(x) {
+			// R95: hashes below an approved nested-loop outer are still
+			// leader-prebuilt — descend the outer (left) literally so the
+			// prebuild sees what the claim walks will run. Without this,
+			// `collectShareableJoins` (which mirrors this descent)
+			// collects zero joins while workers partition the scan, and
+			// every worker builds a partial hash table with missing rows.
+			// R94's ordinary shape shares the rule (same silent-drop
+			// hazard); both predicates are named so a narrowing of either
+			// fails the agreement test instead of reopening the hole.
+			if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) {
+				return HasShareableHashJoin(x.Left)
+			}
 			return false
 		}
+		if x.ParallelHash {
+			// M0146-0002: the participants build a parallel-hash join
+			// themselves, behind a barrier, so it is NOT leader-prebuilt;
+			// only hash joins further down its probe side can be.
+			if joinProbeSideIsLeft(x) {
+				return HasShareableHashJoin(x.Left)
+			}
+			return HasShareableHashJoin(x.Right)
+		}
 		return true
+	}
+	if x, ok := n.(*NestedLoopIndexJoin); ok {
+		// M0142-0005a: hashes below an approved fused NLI outer are
+		// leader-prebuilt — descend the outer literally, exactly like the
+		// *Join arm above. A non-capable NLI reports "nothing shareable":
+		// drivingScan refuses it anyway, so no partial path can carry it.
+		if NestedLoopIndexJoinIsPartialCapable(x) {
+			return HasShareableHashJoin(x.Outer)
+		}
+		return false
 	}
 	for _, c := range parallelChildren(n) {
 		if HasShareableHashJoin(c) {
@@ -725,6 +1002,51 @@ func HasShareableHashJoin(n Node) bool {
 		}
 	}
 	return false
+}
+
+// ParallelHashJoinsIn returns every Parallel Hash join (Join.ParallelHash) a
+// Gather's partial subtree runs, so the Gather can register their shared build
+// states before fan-out (M0146-0002). It walks exactly what the claim walks
+// run — the descent HasShareableHashJoin makes, plus a partial merge join's
+// outer — and a Parallel Hash join's own build side, which is partial too.
+// A join this walk misses reaches the executor unregistered and fails loudly
+// (errParallelHashUnregistered) rather than probing a partial table.
+func ParallelHashJoinsIn(n Node) []*Join {
+	var out []*Join
+	var walk func(Node)
+	walk = func(n Node) {
+		switch x := n.(type) {
+		case nil:
+			return
+		case *Join:
+			if hashJoinIsPartialCapable(x) {
+				probe, build := x.Right, x.Left
+				if joinProbeSideIsLeft(x) {
+					probe, build = x.Left, x.Right
+				}
+				if x.ParallelHash {
+					out = append(out, x)
+					walk(build)
+				}
+				walk(probe)
+				return
+			}
+			if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) || mergeJoinIsPartialCapable(x) {
+				walk(x.Left)
+			}
+			return
+		case *NestedLoopIndexJoin:
+			if NestedLoopIndexJoinIsPartialCapable(x) {
+				walk(x.Outer)
+			}
+			return
+		}
+		for _, c := range parallelChildren(n) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
 }
 
 // joinProbeSideIsLeft mirrors the executor's probeSideIsLeft. The two must
@@ -769,6 +1091,43 @@ func hashJoinIsPartialCapable(p *Join) bool {
 	return false
 }
 
+// partialHashJoinTypeOK is the jointype half of hashJoinIsPartialCapable,
+// asked at PATH-generation time where only the direction is known and no
+// *Join exists yet (R9, plan-parity-fix-take2, K17).
+//
+// It existed nowhere before: `addPartialHashJoinPath` took the jointype and
+// never compared it to anything, so it filed parallel-aware partial paths for
+// RIGHT hash joins — which `assertParallelAwareJoinIsRunnable` then caught as
+// a panic under GOOPG_GATHER_PATHS=all (TPC-DS Q5), because a right join's
+// per-row verdict is not worker-local and the join would otherwise silently
+// drop or duplicate rows.
+//
+// The set is {INNER, LEFT, SEMI, ANTI}, which is where two authorities
+// coincide:
+//
+//   - PG's `hash_inner_and_outer` parallel block (joinpath.c:2418) files
+//     partial hash joins for exactly these and never for RIGHT/FULL;
+//   - goopg's own `hashJoinIsPartialCapable` (above) allows INNER/SEMI/ANTI
+//     unconditionally and LEFT when `!BuildLeft` — which the hash arm
+//     guarantees ("Outer drives the probe, inner is hashed … BuildLeft stays
+//     false", createHashJoinPlan).
+//
+// Filtering to PG's set alone would have re-created the bug in the other
+// direction, since goopg's LEFT support is the conditional one.
+//
+// KEEP IN SYNC BY TEST, NOT BY COMMENT: the K17 defect was a comment
+// asserting a filter the code did not implement. TestPartialHashJoinTypeOK
+// pins this predicate AGAINST hashJoinIsPartialCapable for every jointype, so
+// narrowing the executor predicate fails that test instead of silently
+// leaving this one over-permissive.
+func partialHashJoinTypeOK(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
+	}
+	return false
+}
+
 // mergeJoinIsPartialCapable states which merge joins may run with a partial
 // outer side (E-20 Cut 3, `try_partial_mergejoin_path`, joinpath.c:1145).
 //
@@ -804,6 +1163,203 @@ func mergeJoinIsPartialCapable(p *Join) bool {
 	return false
 }
 
+// lateralProbeIsPartialProbe reports whether n is the bare parameterized
+// index probe R95 admits under a lateral join: an equality probe (Key or
+// Keys) with no SAOP multi-descent and no range bounds. SAOP is refused
+// because the `pidx` leaf filter is consulted only at the single-range
+// site (operators_index.go); range bounds are refused as
+// scope-minimization (Q96's probe is equality). An IndexOnlyScan has no
+// SAOP shape (promotion declines it), so only the range half applies.
+//
+// The same probe-shape check guards the fused NLI's Inner
+// (NestedLoopIndexJoinIsPartialCapable, M0142-0005a): a *NestedLoopIndexJoin
+// never carries the cache as a child — InnerMemo is a field on the join —
+// so the check sees the bare probe below it, exactly as here.
+func lateralProbeIsPartialProbe(n Node) bool {
+	switch x := n.(type) {
+	case *IndexScan:
+		if x == nil || x.Index == nil {
+			return false
+		}
+		if len(x.SAOPKeys) > 0 || x.LowKey != nil || x.HighKey != nil {
+			return false
+		}
+		return x.Key != nil || len(x.Keys) > 0
+	case *IndexOnlyScan:
+		if x == nil || x.Index == nil {
+			return false
+		}
+		if x.LowKey != nil || x.HighKey != nil {
+			return false
+		}
+		return x.Key != nil || len(x.Keys) > 0
+	}
+	return false
+}
+
+// lateralProbeJoinIsPartialCapable states which lateral-probe nested loops
+// may run with a partial outer side (R95, plan-parity-fix-take2).
+//
+// This is R25's decomposed NLI shape (`createplannl.go:369`): a lateral
+// `Join` over a parameterized index probe with `OuterColumnRef` keys,
+// re-opened per outer tuple by the lateral stream. Partitioning the outer
+// is transparent — every worker re-opens the probe for its own outer rows
+// against its own correlation state (`OuterRows` is value-copied at
+// fan-out, `CTERowCache` is per-worker, the bind/unbind window is
+// per-call). The probe is never materialized whole, so unlike R94's
+// ordinary case there is no N× inner-memory term.
+//
+// Admitted narrowly: INNER only (Q96's comma joins plan as INNER;
+// CROSS/SEMI/ANTI/LEFT/RIGHT/FULL refused as scope-minimization), the
+// bare probe above (no wrappers — the BuildFast bridge implements
+// `lateralBindable` unconditionally, so a wrapped probe would double-bind;
+// no Memoize — R60's `getMemoizePath` loop output never reaches this node
+// type: it emits the fused `*NestedLoopIndexJoin` instead, whose own
+// sibling check is NestedLoopIndexJoinIsPartialCapable (M0142-0005a);
+// no bitmap), non-nil children. General lateral subtrees (aggregates,
+// SRFs, CTE-dependent inners) are refused: those are separate node
+// shapes with unmodelled per-worker semantics.
+func lateralProbeJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoNestedLoop || !p.Lateral {
+		return false
+	}
+	if p.Type != JoinTypeInner {
+		return false
+	}
+	if p.Left == nil || p.Right == nil {
+		return false
+	}
+	return lateralProbeIsPartialProbe(p.Right)
+}
+
+// NestedLoopIndexJoinIsPartialCapable states which fused NLI shapes may run
+// with a partial OUTER side (M0142-0005a): the join PG's
+// `try_partial_nestloop_path` builds when its inner is the cheapest
+// parameterized path — INCLUDING the `get_memoize_path`-wrapped variant
+// (joinpath.c:2194-2199, the mpath call pair — TPC-DS Q34/Q73's
+// `Gather > Nested Loop > Memoize > Index Scan`).
+//
+// The fused `*NestedLoopIndexJoin` node carries the cache as the InnerMemo
+// FIELD, never as a child node, so the capability check sees the bare probe
+// directly — no unwrap step exists at this layer (the unwrap lives one
+// layer down: partialPathDrivingKind's PathNestLoop arm unwraps the PATH's
+// PathMemoize, and executor.go's buildNode arm unwraps it again into
+// nestedLoopIndexJoinOp.inner).
+//
+// Admitted narrowly, same scope as the lateral-probe twin
+// (lateralProbeJoinIsPartialCapable): INNER only (LEFT/SEMI/ANTI/RIGHT/
+// FULL/CROSS refused as scope-minimization), non-nil children, and the
+// inner is exactly the bare parameterized equality probe
+// lateralProbeIsPartialProbe admits — an *IndexScan/*IndexOnlyScan with
+// Key/Keys, no SAOP, no range bounds. A bitmap inner
+// (createNestLoopBitmapJoinPlan's shape) is refused by that check's
+// default arm — a re-probed bitmap has no claim-set story (the *joinOp
+// arm's HasBitmapScan refusal, same reason). InnerMemo's presence is
+// irrelevant to the verdict: every worker builds its own memoizeOp and
+// kvcache over the shared read-only plan (executor.go: "each worker
+// builds its OWN operator tree"), matching real PG's Memoize whose DSM
+// shuttles only instrumentation counters — the cache data is per-worker
+// by construction (nodeMemoize.c:1190-1260).
+// M0137-0019b widens the jointype set to {INNER, SEMI} for the same reason
+// and with the same argument as `nestedLoopJoinIsPartialCapable`: a SEMI
+// verdict is per-outer-row and worker-local — one qualifying probe row
+// decides the outer row, the joined row is never emitted, and the
+// inner-matched bitmap RIGHT/FULL would need reduced across workers is never
+// touched. TPC-H Q4's semi join is this FUSED shape (its inner is a
+// parameterised index probe), not the ordinary one, which is why widening
+// the ordinary twin alone left Q4 serial.
+//
+// M0145-0010 widens the set to PG's full nestloop dispatch set minus RIGHT and
+// FULL, via the shared `partialNestLoopJoinType`. LEFT and ANTI are driven by
+// `nestedLoopIndexJoinOp`'s per-outer-row `outerMatched` flag
+// (`operators_nljoin.go`) — no shared inner state, so each worker's verdict for
+// its own outer rows is complete. Verified by measurement BEFORE admission, per
+// scope (d): `TestParallelNLIJointypeIdentity` showed the N-copy signature for
+// both shapes before this widening and agreement with serial after.
+//
+// This family needs no executor twin — the attach arm calls THIS predicate
+// directly ("literal agreement, no twin to drift", parallel_scan.go), which is
+// why the 2026-09-21 SEMI wrong answer could not happen here.
+func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
+	if p == nil || p.Outer == nil || p.Inner == nil {
+		return false
+	}
+	if !partialNestLoopJoinType(p.Type) {
+		return false
+	}
+	return lateralProbeIsPartialProbe(p.Inner)
+}
+
+// partialNestLoopJoinType is the ONE jointype set the partial nested-loop
+// families admit, in the `optimizer.JoinType` domain: the ordinary node gate
+// `nestedLoopJoinIsPartialCapable` and the FUSED gate
+// `NestedLoopIndexJoinIsPartialCapable` both read it, so the two cannot
+// disagree about which jointypes are worker-local.
+//
+// `partialNestLoopJointype` (gatherpaths.go) is the same set in the
+// `parser.JoinType` domain, read by the path arm and its spine mirror. The two
+// helpers exist only because Path carries `parser.JoinType` while the plan
+// nodes carry `optimizer.JoinType`; they must always name the same set.
+//
+// The set is PG's nestloop dispatch set
+// (`postgres/src/backend/optimizer/path/joinpath.c:1842-1846`) minus RIGHT and
+// FULL, which need to know which INNER rows went unmatched across ALL workers
+// — a cross-worker reduction no gate in either family models.
+func partialNestLoopJoinType(t JoinType) bool {
+	switch t {
+	case JoinTypeInner, JoinTypeLeft, JoinTypeSemi, JoinTypeAnti:
+		return true
+	}
+	return false
+}
+
+// nestedLoopJoinIsPartialCapable states which ordinary nested loops may run
+// with a partial outer side (R94, plan-parity-fix-take2).
+//
+// The rule is "a nested loop whose per-outer-row verdict is worker-local",
+// the same shape as the twins with the build/probe vocabulary replaced by
+// outer/whole-inner: each worker joins ITS partition of the outer against
+// the WHOLE inner, which it materializes and replays itself
+// (`openNestedLoop`, join_nl_stream.go) — there is no shared inner state,
+// so there is nothing for a prebuild step to adopt.
+//
+//   - INNER decides each outer row against the inner alone, so partitioning
+//     the outer is transparent.
+//   - SEMI is admitted since M0137-0019b, whose named consumer is TPC-H Q4 —
+//     the corpus's only fully SERIAL plan in parallel mode. Its verdict is
+//     per-outer-row and worker-local: one qualifying inner tuple decides the
+//     outer tuple and the inner scan breaks (`finishOuter`,
+//     join_nl_stream.go), the joined row is never emitted (the join's schema
+//     is outer-only), and `markInner`/`fillInner` — the inner-matched bitmap
+//     RIGHT and FULL would need reduced across workers — is never touched on
+//     this path. PG admits {INNER, LEFT, SEMI, ANTI} at the same dispatch
+//     gate (joinpath.c:2022-2031).
+//   - LEFT and ANTI joined the set 2026-09-21 (M0145-0010 scope (c)), on the
+//     rationale this comment already stated for them: worker-local, decided
+//     per outer row, never touching the inner-matched bitmap. They were
+//     widened on this gate, `partialPathDrivingKind`'s PathNestLoop arm, that
+//     arm's spine mirror AND the executor twin in ONE change — the discipline
+//     the SEMI defect of 2026-09-21 exists to teach (planner-only widening
+//     produced N copies, not a safe decline). Executor capability was verified
+//     by measurement first, per M0145-0010 scope (d):
+//     `TestParallelLeftAntiNestedLoopIdentity`.
+//   - FULL and RIGHT would require knowing which INNER rows went unmatched
+//     across ALL workers — the same cross-worker reduction the twins
+//     refuse. Refused rather than approximated.
+//
+// LATERAL is excluded on the same ground as the twins. A parameterized
+// (`*NestedLoopIndexJoin`) shape never reaches this predicate: it is a
+// different node type, not a flag.
+func nestedLoopJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoNestedLoop || p.Lateral {
+		return false
+	}
+	if p.Left == nil || p.Right == nil {
+		return false
+	}
+	return partialNestLoopJoinType(p.Type)
+}
+
 // scanTable extracts the *catalog.Table from a scan node (SeqScan,
 // BitmapHeapScan, IndexOnlyScan or — C-19c — a plain IndexScan). Returns nil
 // for any other node kind.
@@ -835,7 +1391,29 @@ func scanTable(n Node) *catalog.Table {
 // comparison — which is exactly why it is reproducible here despite goopg
 // having no absolute node costs to add parallel_setup_cost to.
 func computeParallelWorkers(subtree Node, s ParallelSettings) int {
-	scan := drivingScan(subtree)
+	// M0145-0004: size over EVERY driving scan, not the first — when
+	// drivingScan resolves a `*SetOp` driving node it stands for all of
+	// its streamed branches, and each branch's member table is claimed
+	// per-worker (attachAll's *setOp arm). The gather's worker count is
+	// the max over branches, matching PG's create_append_path, which
+	// takes `parallel_workers` as the max over child subpaths. A branch
+	// that earns zero (unsafe table, unsized, below threshold) simply
+	// does not raise the max; a subtree with no driving scan at all
+	// still returns 0.
+	best := 0
+	for _, scan := range drivingScans(subtree) {
+		if w := computeParallelWorkersForScan(scan, s); w > best {
+			best = w
+		}
+	}
+	return best
+}
+
+// computeParallelWorkersForScan is the single-scan body of
+// computeParallelWorkers — split out so the SetOp arm can size each
+// member branch independently. The subtree-level forced flag applies
+// identically to every branch.
+func computeParallelWorkersForScan(scan Node, s ParallelSettings) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
@@ -944,19 +1522,18 @@ func tableParallelWorkersReloption(t *catalog.Table) int {
 // rebuildWithGather returns a copy of root's spine with target replaced by
 // Gather{target}. Nodes not on the path are shared by pointer; nothing is
 // mutated.
-func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
+func rebuildWithGather(root Node, tgt partialTarget, workers int, leader bool) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
-			// The target IS the Sort, and `stampParallelScan` has no `*Sort`
-			// arm — deliberately: `terminatesPartial` lists `*Sort`, so a Sort
-			// can never appear INSIDE a partial subtree, and the traversal must
-			// stay identical to `drivingScan`'s (this function's sibling
-			// warning). The one place a Sort sits at the top of a partial
-			// subtree is right here, and `findPartialSubtree` already resolved
-			// it the same asymmetric way: it asked `drivingScan(srt.Child)`,
-			// not `drivingScan(srt)`. So stamp the CHILD, for the same reason
-			// and at the same offset.
+			// The target IS the Sort. R56 gave `stampParallelScan` a `*Sort`
+			// arm for Sorts INSIDE a partial subtree (Agg→Sort→scan splits),
+			// but the top-of-subtree case still needs its own branch: stamping
+			// the Sort itself would build a plain Gather over per-worker
+			// Sorts and silently return unordered rows, so the CHILD is
+			// stamped and a GatherMerge wraps the Sort — the same asymmetric
+			// resolution `findPartialSubtree` already made when it asked
+			// `drivingScan(srt.Child)`, not `drivingScan(srt)`.
 			//
 			// Found by C-19e's TPC-H arm (2026-09-07). Stamping `root` here
 			// fell through every arm and returned the Sort UNCHANGED, so the
@@ -974,26 +1551,92 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 			if stampedChild == srt.Child {
 				return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
 			}
+			perWorkerDisplayRows(stampedChild, getParallelDivisor(workers, leader))
 			// Shallow copy: this pass runs on a plan the process-wide cache may
 			// be handing to other sessions right now (file header, property 2).
 			c := *srt
 			c.Child = stampedChild
 			return NewGatherMerge(c.Pos(), &c, workers, tgt.mergeKeys)
 		case tgt.splitAgg:
-			return splitAggregate(root.(*Aggregate), workers)
+			orig := root.(*Aggregate)
+			split := splitAggregate(orig, workers)
+			// splitAggregate's Partial is a fresh copy whose Child is the
+			// freshly stamped subtree; rescale that subtree's driving scan.
+			if fin, ok := split.(*Aggregate); ok {
+				if g, ok := fin.Child.(*Gather); ok {
+					if part, ok := g.Child.(*Aggregate); ok && part.Child != orig.Child {
+						perWorkerDisplayRows(part.Child, getParallelDivisor(workers, leader))
+					}
+				}
+			}
+			return split
 		}
 		stamped := stampParallelScan(root)
+		if stamped != root {
+			perWorkerDisplayRows(stamped, getParallelDivisor(workers, leader))
+		}
 		return NewGather(stamped.Pos(), stamped, workers)
 	}
 	kids := parallelChildren(root)
 	if len(kids) != 1 {
 		return root
 	}
-	rebuilt := rebuildWithGather(kids[0], tgt, workers)
+	rebuilt := rebuildWithGather(kids[0], tgt, workers, leader)
 	if rebuilt == kids[0] {
 		return root
 	}
 	return replaceSingleChild(root, rebuilt)
+}
+
+// perWorkerDisplayRows gives the driving scan of a subtree the post-pass
+// just stamped parallel PG's per-worker row estimate (M0141-S2b-16).
+//
+// The post-pass relabels a SERIAL scan `Parallel` after planning, so its
+// PlanCost still carries the serial row count, and EXPLAIN printed
+// `Parallel Seq Scan … rows=719876` where PG prints the per-worker
+// `rows=232218` — cost_seqscan's parallel arm sets `path->rows =
+// clamp_row_est(rows / get_parallel_divisor)` (costsize.c:335-353). The
+// path-model route (gatherChildPlan) needs none of this: its scan comes from
+// a partial path already priced per worker.
+//
+// Rows only. The cost stays the serial figure, because splitting it into
+// the disk term (charged in full to every worker) and the CPU term (divided)
+// needs the relation's page and tuple inputs, which a finished plan does
+// not carry (ledgered). Display only: the Gather above sizes itself from
+// EstimateRows, which reads table statistics rather than this PlanCost, and
+// display-cost parents read the child's cost, not its rows.
+//
+// stamped must be the COPY stampParallelScan returned (never a node shared
+// with the cached serial plan). The driving scan inside it is then a fresh
+// copy too, since stamping copies every node on the path down to it.
+//
+// A scan whose PlanCost is already PerWorker (lowered from a partial scan
+// path) is left alone; only a scan carrying serial figures, from the
+// post-pass or from a prebuilt serial subtree under a path-model Gather,
+// is divided. divisor is get_parallel_divisor for the Gather's workers.
+//
+// A SetOp driving node stands for its streamed branches (drivingScans); each
+// branch scan is treated on its own and the SetOp itself is never divided.
+func perWorkerDisplayRows(stamped Node, divisor float64) {
+	if !(divisor > 1) {
+		return
+	}
+	for _, scan := range drivingScans(stamped) {
+		if _, isSetOp := scan.(*SetOp); isSetOp {
+			continue
+		}
+		setter, ok := scan.(planCostSetter)
+		if !ok {
+			continue
+		}
+		pc := legacyDisplayCostOf(scan)
+		if pc.PerWorker {
+			continue
+		}
+		pc.PlanRows = clampRowEst(pc.PlanRows / divisor)
+		pc.PerWorker = true
+		setter.setPlanCost(pc)
+	}
 }
 
 // splitAggregate turns one Aggregate into Finalize -> Gather -> Partial.
@@ -1119,6 +1762,14 @@ func parallelChildren(n Node) []Node {
 	case *BitmapHeapScan:
 		// S5.6: the Outer bitmap-producing subtree is the child.
 		return []Node{x.Outer}
+	case *SetOp:
+		// M0140-0006c-2: both branches. This lets the prebuild gates
+		// (HasShareableHashJoin, HasBitmapScan) see joins and bitmaps
+		// driving a SetOp branch. findPartialSubtree and rebuildWithGather
+		// still refuse (they bail on len(kids) != 1, and terminatesPartial
+		// fires first anyway); subtreeHasUnsafeNode and subtreeHasGather
+		// only grow more conservative, which is the safe direction.
+		return []Node{x.Left, x.Right}
 	}
 	return nil
 }
@@ -1193,11 +1844,24 @@ func StripGather(n Node) Node {
 		}
 		return replaceSingleChild(n, child)
 	}
-	// Two-child shapes: a Join is the only one `parallelChildren` reports, and
-	// it is the only one a Gather can sit under.
+	// Two-child shapes: Join and SetOp are the only ones `parallelChildren`
+	// reports, and the Join is the only one a Gather can sit under via the
+	// generic post-pass (a SetOp terminates the partial walk, so a Gather
+	// below one of its branches can only arrive via the upper-rel path —
+	// stripped here all the same, so the walk and the planner agree).
 	j, ok := n.(*Join)
 	if !ok {
-		return n
+		s, ok := n.(*SetOp)
+		if !ok {
+			return n
+		}
+		left, right := StripGather(s.Left), StripGather(s.Right)
+		if left == s.Left && right == s.Right {
+			return n
+		}
+		c := *s
+		c.Left, c.Right = left, right
+		return &c
 	}
 	left, right := StripGather(j.Left), StripGather(j.Right)
 	if left == j.Left && right == j.Right {
@@ -1261,13 +1925,55 @@ func unstampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *Sort:
+		// R56: the inverse of the stampParallelScan arm (that function's
+		// sibling warning). A scan left labelled parallel with no Gather
+		// above it makes EXPLAIN claim a parallelism the executor will
+		// not run.
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Join:
+		// M0146-0002: a Parallel Hash join whose Gather is stripped runs
+		// serially, so it must also stop claiming a shared partial build
+		// (its `Parallel Hash` label and the executor's barrier lookup).
 		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
-		if left == x.Left && right == x.Right {
+		if left == x.Left && right == x.Right && !x.ParallelHash {
 			return n
 		}
 		c := *x
 		c.Left, c.Right = left, right
+		c.ParallelHash = false
+		return &c
+	case *NestedLoopIndexJoin:
+		// M0142-0005a: the inverse of stampParallelScan's NLI arm — the
+		// stamp only ever reaches Outer, but unstamp walks both sides
+		// unconditionally (StripGather's enforcement inverse is not
+		// capability-aware; an inner that could never be stamped
+		// un-stamps to itself).
+		outer, inner := unstampParallelScan(x.Outer), unstampParallelScan(x.Inner)
+		if outer == x.Outer && inner == x.Inner {
+			return n
+		}
+		c := *x
+		c.Outer, c.Inner = outer, inner
+		return &c
+	case *SetOp:
+		// M0140-0006c: the inverse of stampParallelScan's *SetOp arm.
+		// M0145-0004a: also drop the node's own ParallelAware flag — it is
+		// the "Parallel Append" label, and a SetOp whose Gather was just
+		// stripped must not keep claiming parallel awareness.
+		left, right := unstampParallelScan(x.Left), unstampParallelScan(x.Right)
+		if left == x.Left && right == x.Right && !x.ParallelAware {
+			return n
+		}
+		c := *x
+		c.Left, c.Right = left, right
+		c.ParallelAware = false
 		return &c
 	}
 	return n

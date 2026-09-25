@@ -1,0 +1,4 @@
+DPTRACE end top={lineitem} pairs=0 declined=0 costs=0 status=ok
+DPTRACE problem nrels=3 rels=customer,orders,lineitem
+DPTRACE cost lev=3 rel={customer+lineitem+orders} rows=6.001988e+06 npaths=5 cheapest=hash reqouter={} total=353212.7 second=merge secondtotal=587301.7359483567
+DPTRACE end top={customer+lineitem+orders} pairs=4 declined=1 costs=3 status=ok

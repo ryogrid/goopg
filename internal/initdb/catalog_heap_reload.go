@@ -10,6 +10,7 @@ package initdb
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,11 +29,23 @@ import (
 // / M0106-0010) — doc 02a §2.3 is the normative statement of these rules:
 //
 //  1. xmin == Invalid → not a real tuple.
-//  2. Any non-zero xmax → dead. Unconditional today: catalog mutations are
-//     delete+reinsert, and an aborted DDL's reinserted row dies by rule 3.
-//     (B0.2 — catalog heap UPDATE — upgrades this rule to consult the xmax's
-//     CLOG status so an ABORTED updater does not kill the only live version;
-//     that change lands WITH the update emit, not here.)
+//  2. Non-zero xmax → dead UNLESS the xmax transaction aborted (P0-E5 / B0.2:
+//     consult the xmax's CLOG status instead of the old unconditional-dead
+//     rule, so an ABORTED updater/deleter does not kill the only live
+//     version — see docs/design/0100-0149/p0-e4-catalog-xmax-loss-repro.md).
+//     "committed or in the recovered-CLOG unknown window → dead; aborted →
+//     live" (doc 02a §2.3's B0.2 rule). The crash-recovery implicit-abort
+//     sweep (initdb.Open, MarkUnknownAsAborted) always runs BEFORE any
+//     catalog reload, so a genuinely in-flight-at-crash xmax has already been
+//     resolved to Aborted by the time this filter runs; a residual Unknown
+//     status here means the XID predates the CLOG's retained horizon (frozen/
+//     truncated — treated as committed, matching storage.XidCommitted's
+//     OldestClogXid short-circuit and PG's own frozen-XID convention) or is a
+//     subtransaction XID that production never individually stamps in CLOG
+//     (M0143-0008's sibling gap — see the deferral ledger; a superseded row
+//     deleted by a committed-but-never-directly-stamped subxact can
+//     resurrect after a sufficiently later restart, out of scope for P0-E5's
+//     top-level-transaction incident).
 //  3. Aborted xmin → dead, for every layout. This is deliberately the ONLY
 //     xmin check for PG18-canonical rows: basebackup tuples carry upstream
 //     xmin values that are out-of-range for the local clog (GetStatus →
@@ -44,7 +57,16 @@ func catalogRowLive(clog *transam.CLog, ht storage.HeapTuple, requireCommittedXm
 		return false
 	}
 	if ht.Header.Xmax != storage.InvalidTransactionID {
-		return false
+		// No CLOG context (bootstrap/unit path without recovery wiring):
+		// conservative default, matches the pre-B0.2 behavior.
+		if clog == nil {
+			return false
+		}
+		if clog.GetStatus(ht.Header.Xmax) != transam.TxnStatusAborted {
+			return false // committed, sub-committed, or unknown/horizon: dead
+		}
+		// xmax aborted: this version was never actually superseded — it is
+		// still the live row. Fall through to the xmin checks below.
 	}
 	if clog == nil {
 		return true
@@ -93,10 +115,15 @@ func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *tr
 			if err != nil {
 				continue
 			}
-			if ht.Header.Xmin == storage.InvalidTransactionID ||
-				ht.Header.Xmax != storage.InvalidTransactionID {
+			if ht.Header.Xmin == storage.InvalidTransactionID {
 				continue
 			}
+			// P0-E5/B0.2: a non-zero Xmax is NOT rejected here — that was the
+			// bug (this pre-filter ran BEFORE catalogRowLive's CLOG-aware
+			// check below could ever see the tuple, so upgrading rule 2 in
+			// catalogRowLive alone was a no-op against production reload
+			// calls). catalogRowLive below is the single source of truth for
+			// xmax liveness now; decode only needs a real (xmin-valid) tuple.
 			row, requireCommitted, derr := decode(ht, storage.ItemPointer{Block: blk, Offset: slot})
 			if derr != nil {
 				continue
@@ -160,13 +187,74 @@ func simpleCatalogReload(relOid uint32, shared bool, name string,
 // need no special handling: their old versions carry xmax and the liveness
 // filter skips them.
 func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	// Only the connecting catalog's own pg_namespace heap, and deliberately so:
+	// this pass runs EARLY (before the pg_database reload), because the
+	// ts_dict/ts_config passes that follow it need the schema OID map already
+	// populated. The database list does not exist yet at this point, so the
+	// per-database heaps are picked up later by
+	// ReloadUserDatabaseSchemasFromHeap.
+	return reloadUserSchemasFromHeapForDB(mgr, cat, clog, cat.DBOID())
+}
+
+// ReloadUserDatabaseSchemasFromHeap scans the pg_namespace heap of every
+// CREATE DATABASEd database and re-registers its user schemas.
+//
+// It exists as a SECOND pass because of an ordering constraint, not for
+// symmetry: reloadUserSchemasFromHeap above must run before the ts_dict and
+// ts_config reloads (they resolve schema OIDs), which is before the
+// pg_database reload that establishes the database list. So the per-database
+// heaps cannot be read in that first pass — there is nothing to iterate yet.
+//
+// Without this, a CREATE SCHEMA issued inside a CREATE DATABASEd database
+// VANISHED on restart: its heap row sat unread in base/<thatDbOid>/2615 and
+// the schema simply ceased to exist. Tables in that database reloaded fine
+// (they have their own per-database pass), which is exactly what disguised the
+// gap as an extension-only problem — reloadUserExtensionsFromHeap could then
+// not resolve the schema OID and fell back to "public".
+//
+// The skip set mirrors reloadUserExtensionsFromHeap's, which reads
+// per-database heaps under the same rules.
+func ReloadUserDatabaseSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserSchemasFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserSchemasFromHeapForDB scans base/<heapDBOid>/2615 and re-registers
+// each live user schema.
+//
+// NOTE on what this does NOT fix: `RegisterSchemaDuringRecovery` writes the
+// process-wide schema map, so a reloaded schema is visible from every
+// database — exactly as it already is at RUNTIME, where a CREATE SCHEMA in one
+// database is likewise visible from another. That cross-database visibility is
+// a separate, pre-existing divergence from PostgreSQL (pg_namespace is
+// per-database there) and is ledgered. This pass deliberately restores the
+// runtime behaviour rather than inventing scoping here: a schema that silently
+// disappears across a restart is closer to data loss than a schema that is
+// over-visible, and making the two paths agree is the prerequisite for scoping
+// them together later.
+func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type nsRow struct {
 		oid   uint32
 		name  string
 		owner uint32
 		tid   storage.ItemPointer
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2615, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2615, Fork: storage.MainFork}
 	cols := executor.PGNamespaceColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_namespace",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
@@ -377,6 +465,623 @@ func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 		if len(parents) > 0 {
 			childTbl.InheritsParentOIDs = parents
 		}
+	}
+	return nil
+}
+
+// loadForeignKeysFromHeap restores every table's FOREIGN KEY constraints from
+// the pg_constraint heap (contype='f'), repopulating catalog.Table.ForeignKeys.
+//
+// R126. Before this, that field was the ONLY store — pg_constraint's FK rows
+// are synthesised from it (catalog.go:7237) — and nothing rewrote it at
+// startup, so every FK died at the first restart. That cost more than the
+// planner's FK selectivity arm: runtime enforcement reads the same field
+// (operators_fk.go:118, :170), so a post-restart orphan INSERT was silently
+// ACCEPTED.
+//
+// Runs as a standalone unconditional pass AFTER loadInheritanceFromHeap, for
+// that pass's reason plus one of its own: an FK is an EDGE between two tables,
+// and the referenced table may be registered after the referencing one, so the
+// resolution must happen once every table is in the catalog. It is deliberately
+// not folded into loadUserTablesFromHeap, which the M0114 catalog cache
+// bypasses (the cache stores no ForeignKeys, catalog_cache.go:67-90).
+//
+// The main pass reads DefaultDBOid, following loadColumnDefaultsFromHeap
+// exactly rather than cat.DBOID() — see loadStatisticsFromHeap's comment for
+// what reading cat.DBOID() here cost pg_statistic in practice. Note this pass
+// and reloadUserDomainsFromHeap both scan relation 2606 but in DIFFERENT
+// databases, by design: domain CHECK rows are pinned to DefaultDBOid + mirror
+// (pgConstraintRel), FK rows route per-database with their table
+// (pgConstraintTableRel).
+func loadForeignKeysFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadForeignKeysFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadForeignKeysFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fkAttnumsFromArrayText parses a decoded int2[] column ("{2,3}", "{}" or "")
+// back into attnums. The decode side renders the ArrayType blob as canonical
+// array text (codec.go's int2[] arm → decodeArrayValuePGStyled).
+func fkAttnumsFromArrayText(s string) []int16 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	if s == "" {
+		return nil
+	}
+	var out []int16
+	for _, part := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return nil
+		}
+		out = append(out, int16(n))
+	}
+	return out
+}
+
+// fkColumnNames maps 1-based attnums back to column names. goopg's FK store is
+// name-keyed (catalog.ForeignKey.Columns / RefColumns) while pg_constraint
+// stores attnums, so this is the inverse of the write side's resolution.
+//
+// Returns ok=false on any out-of-range attnum: a partially-resolved FK would
+// be worse than an absent one, because keysCovering matches on names
+// (joinrelsize.go:690) and a silently short Columns slice would change which
+// joins the FK arm fires for.
+func fkColumnNames(tbl *catalog.Table, attnums []int16) ([]string, bool) {
+	out := make([]string, 0, len(attnums))
+	for _, n := range attnums {
+		if n < 1 || int(n) > len(tbl.Columns) {
+			return nil, false
+		}
+		out = append(out, tbl.Columns[n-1].Name)
+	}
+	return out, true
+}
+
+func loadForeignKeysFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type fkRow struct {
+		oid                      uint32
+		name                     string
+		conrelid, confrelid      uint32
+		conkey, confkey, setCols []int16
+		deferrable, deferred     bool
+		enforced, validated      bool
+		updAct, delAct, match    string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only foreign keys. Domain CHECK rows (contype='c') share this
+			// heap and are restored by reloadUserDomainsFromHeap.
+			if decoded[3].StringValue() != "f" {
+				return nil, false, errSkipBuiltinRow
+			}
+			return fkRow{
+				oid:        uint32(decoded[0].Int),
+				name:       decoded[1].StringValue(),
+				deferrable: decoded[4].BoolValue(),
+				deferred:   decoded[5].BoolValue(),
+				enforced:   decoded[6].BoolValue(),
+				validated:  decoded[7].BoolValue(),
+				conrelid:   uint32(decoded[8].Int),
+				confrelid:  uint32(decoded[12].Int),
+				updAct:     decoded[13].StringValue(),
+				delAct:     decoded[14].StringValue(),
+				match:      decoded[15].StringValue(),
+				conkey:     fkAttnumsFromArrayText(decoded[20].StringValue()),
+				confkey:    fkAttnumsFromArrayText(decoded[21].StringValue()),
+				setCols:    fkAttnumsFromArrayText(decoded[25].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]fkRow, len(rows))
+	for _, r := range rows {
+		fr := r.(fkRow)
+		if fr.conrelid == 0 || fr.name == "" {
+			continue
+		}
+		byTable[fr.conrelid] = append(byTable[fr.conrelid], fr)
+	}
+	for conrelid, frs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep the declaration order stable across restarts rather than
+		// inheriting physical heap order.
+		sort.Slice(frs, func(i, j int) bool { return frs[i].oid < frs[j].oid })
+		fks := make([]catalog.ForeignKey, 0, len(frs))
+		for _, fr := range frs {
+			refTbl, _, rok := cat.LookupTableByOIDAllDBs(fr.confrelid)
+			if !rok || refTbl == nil {
+				// Referenced table is gone: drop the FK rather than restore it
+				// dangling. fkParentRel matches the parent by NAME
+				// (joinrelsize.go:760) and enforcement resolves it the same
+				// way, so a dangling entry would be a live landmine.
+				//
+				// Every decline in this loop LOGS. This round exists because
+				// an FK vanishing silently went unnoticed; a reload that drops
+				// one FK of three must not look identical to a healthy one.
+				slog.Warn("pg_constraint FK reload: referenced table missing, constraint dropped",
+					"constraint", fr.name, "table", tbl.Name, "confrelid", fr.confrelid)
+				continue
+			}
+			conkeyNames, cok := fkColumnNames(tbl, fr.conkey)
+			if !cok {
+				slog.Warn("pg_constraint FK reload: conkey attnum out of range, constraint dropped",
+					"constraint", fr.name, "table", tbl.Name, "conkey", fr.conkey)
+				continue
+			}
+			// An EMPTY confkey is meaningful, not missing: it is the stored
+			// form of "use the parent's PK" (catalog.go:1665), preserved
+			// verbatim by the writer.
+			confkeyNames, rcok := fkColumnNames(refTbl, fr.confkey)
+			if !rcok {
+				slog.Warn("pg_constraint FK reload: confkey attnum out of range, constraint dropped",
+					"constraint", fr.name, "reftable", refTbl.Name, "confkey", fr.confkey)
+				continue
+			}
+			// Unlike conkey/confkey, an unresolvable confdelsetcols must NOT
+			// silently degrade: dropping it would turn
+			// `ON DELETE SET NULL (a)` into an unrestricted SET NULL over the
+			// whole key — a behaviour change, not a lost estimate.
+			setColNames, sok := fkColumnNames(tbl, fr.setCols)
+			if !sok {
+				slog.Warn("pg_constraint FK reload: confdelsetcols attnum out of range, constraint dropped "+
+					"(restoring it would widen ON DELETE SET to the whole key)",
+					"constraint", fr.name, "table", tbl.Name, "confdelsetcols", fr.setCols)
+				continue
+			}
+			fks = append(fks, catalog.ForeignKey{
+				Name:    fr.name,
+				OID:     fr.oid,
+				Columns: conkeyNames,
+				// Resolved from confrelid (an OID) to the parent's CURRENT
+				// name, deliberately rather than round-tripping a stored name:
+				// a parent renamed between restarts comes back correct, where
+				// the name-keyed in-memory store goes stale today.
+				RefTable:          refTbl.Name,
+				RefColumns:        confkeyNames,
+				OnDelete:          catalog.FKActionFromChar(fr.delAct),
+				OnUpdate:          catalog.FKActionFromChar(fr.updAct),
+				OnDeleteSetCols:   setColNames,
+				Deferrable:        fr.deferrable,
+				InitiallyDeferred: fr.deferred,
+				NotValid:          !fr.validated,
+				MatchFull:         fr.match == "f",
+				NotEnforced:       !fr.enforced,
+			})
+			// The startup OID advance walks tables only (open.go's
+			// cat.AllTables loop), so a constraint OID living solely in 2606
+			// would otherwise be re-issuable to a new object.
+			if fr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(fr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY: the heap is the truth. Guarding on
+		// len(fks) > 0 would make the pass "restore if any", so a table whose
+		// every FK failed to resolve would silently keep whatever was already
+		// in the field. That is a no-op today (nothing populates ForeignKeys
+		// before this pass — the M0114 cache stores none), but it would become
+		// a stale-data bug the moment something did.
+		tbl.ForeignKeys = fks
+	}
+	return nil
+}
+
+// loadCheckConstraintsFromHeap restores catalog.Table.CheckConstraints/
+// NamedChecks (contype='c', conrelid<>0) from the pg_constraint HEAP written
+// by writeCheckConstraintRow (M0143-0003b). Mirrors loadForeignKeysFromHeap's
+// shape exactly — a CHECK constraint is edge-free (unlike an FK it names no
+// other table), so the per-DB ordering has no correctness requirement here,
+// but matching the sibling's structure keeps the two easy to read together.
+func loadCheckConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadCheckConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadCheckConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadCheckConstraintsFromHeapForDB is loadCheckConstraintsFromHeap's per-DB
+// body. See pgConstraintTableRel's routing note (sys_pg_constraint.go) for why
+// a non-default-DB table's CHECK rows live ONLY in that database's own heap.
+func loadCheckConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type checkRow struct {
+		oid                   uint32
+		name, expr            string
+		conrelid              uint32
+		isLocal, noInherit    bool
+		inhCount              int
+		notValid, notEnforced bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only TABLE-level CHECK rows (conrelid<>0). Domain CHECK rows
+			// (contype='c', conrelid=0, contypid=<domain OID>) share this
+			// heap and are restored by reloadUserDomainsFromHeap.
+			if decoded[3].StringValue() != "c" || decoded[8].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return checkRow{
+				oid:      uint32(decoded[0].Int),
+				name:     decoded[1].StringValue(),
+				conrelid: uint32(decoded[8].Int),
+				// notEnforced comes straight from conenforced. notValid can
+				// only be recovered when the row IS enforced — an unenforced
+				// row always reads convalidated=f regardless of the writer's
+				// original NotValid bit (buildPGConstraintRowForTableCheck's
+				// own `!NotValid && !NotEnforced` formula), and that
+				// collapsed bit is harmless: NotValid is never consulted once
+				// NotEnforced is true (see catalog.NamedCheckConstraint's own
+				// doc comment).
+				notEnforced: !decoded[6].BoolValue(),
+				notValid:    decoded[6].BoolValue() && !decoded[7].BoolValue(),
+				isLocal:     decoded[16].BoolValue(),
+				inhCount:    int(decoded[17].Int),
+				noInherit:   decoded[18].BoolValue(),
+				expr:        decoded[27].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]checkRow, len(rows))
+	for _, r := range rows {
+		cr := r.(checkRow)
+		if cr.conrelid == 0 || cr.name == "" {
+			continue
+		}
+		byTable[cr.conrelid] = append(byTable[cr.conrelid], cr)
+	}
+	for conrelid, crs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep declaration order stable across restarts rather than
+		// inheriting physical heap order (mirrors the FK loader).
+		sort.Slice(crs, func(i, j int) bool { return crs[i].oid < crs[j].oid })
+		checks := make([]string, 0, len(crs))
+		named := make([]catalog.NamedCheckConstraint, 0, len(crs))
+		for _, cr := range crs {
+			checks = append(checks, cr.expr)
+			named = append(named, catalog.NamedCheckConstraint{
+				Name: cr.name, Expr: cr.expr, OID: cr.oid,
+				NoInherit: cr.noInherit, IsLocal: cr.isLocal, InhCount: cr.inhCount,
+				NotValid: cr.notValid, NotEnforced: cr.notEnforced,
+			})
+			if cr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(cr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY, same rationale as the FK loader's own
+		// tbl.ForeignKeys assignment above: the heap is the truth.
+		tbl.CheckConstraints = checks
+		tbl.NamedChecks = named
+	}
+	return nil
+}
+
+// loadNotNullConstraintsFromHeap restores catalog.Table.NotNullConstraints
+// (contype='n', conrelid<>0) from the pg_constraint HEAP written by
+// writeNotNullConstraintRow (M0143-0003d). Mirrors
+// loadCheckConstraintsFromHeap's shape exactly. Column.NotNull itself (the
+// attnotnull ENFORCEMENT bit) already reloads correctly via pg_attribute
+// (loadUserTablesFromHeapForDB) — this pass restores only the named-
+// constraint METADATA that drives pg_constraint's 'n' rows.
+func loadNotNullConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadNotNullConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadNotNullConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadNotNullConstraintsFromHeapForDB is loadNotNullConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadNotNullConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type notNullRow struct {
+		oid                uint32
+		name               string
+		conrelid           uint32
+		conkey             []int16
+		isLocal, noInherit bool
+		inhCount           int
+		notValid           bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only TABLE-level NOT NULL rows (conrelid<>0). contype='n' has no
+			// domain-level equivalent (NOT NULL is not a domain constraint
+			// kind), so this predicate alone is sufficient — unlike the CHECK
+			// loader, which also has to exclude contypid<>0 domain rows sharing
+			// the same heap.
+			if decoded[3].StringValue() != "n" || decoded[8].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return notNullRow{
+				oid:      uint32(decoded[0].Int),
+				name:     decoded[1].StringValue(),
+				conrelid: uint32(decoded[8].Int),
+				notValid: !decoded[7].BoolValue(),
+				isLocal:  decoded[16].BoolValue(),
+				inhCount: int(decoded[17].Int),
+				noInherit: decoded[18].BoolValue(),
+				conkey:    fkAttnumsFromArrayText(decoded[20].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	byTable := make(map[uint32][]notNullRow, len(rows))
+	for _, r := range rows {
+		nr := r.(notNullRow)
+		if nr.conrelid == 0 || nr.name == "" {
+			continue
+		}
+		byTable[nr.conrelid] = append(byTable[nr.conrelid], nr)
+	}
+	for conrelid, nrs := range byTable {
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(conrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the rows were written
+		}
+		// Rows are appended by the re-sync funnel, so restore in OID order to
+		// keep declaration order stable across restarts rather than
+		// inheriting physical heap order (mirrors the FK/CHECK loaders).
+		sort.Slice(nrs, func(i, j int) bool { return nrs[i].oid < nrs[j].oid })
+		named := make([]catalog.NamedNotNullConstraint, 0, len(nrs))
+		for _, nr := range nrs {
+			colNames, cok := fkColumnNames(tbl, nr.conkey)
+			if !cok || len(colNames) != 1 {
+				slog.Warn("pg_constraint NOT NULL reload: conkey attnum out of range, constraint dropped",
+					"constraint", nr.name, "table", tbl.Name, "conkey", nr.conkey)
+				continue
+			}
+			named = append(named, catalog.NamedNotNullConstraint{
+				Name: nr.name, ColName: colNames[0], OID: nr.oid,
+				NoInherit: nr.noInherit, NotValid: nr.notValid,
+				IsLocal: nr.isLocal, InhCount: nr.inhCount,
+			})
+			if nr.oid >= catalog.FirstUserOID {
+				cat.AdvanceNextOIDPast(nr.oid)
+			}
+		}
+		// Assigned UNCONDITIONALLY, same rationale as the FK/CHECK loaders'
+		// own assignments above: the heap is the truth.
+		tbl.NotNullConstraints = named
+	}
+	return nil
+}
+
+// loadUniqueConstraintsFromHeap restores catalog.Index.IsConstraint (and
+// Deferrable/InitiallyDeferred) for UNIQUE (non-PRIMARY-KEY) constraint-backed
+// indexes from the pg_constraint HEAP written by writeUniqueConstraintRow
+// (M0143-0003c). Mirrors loadCheckConstraintsFromHeap/
+// loadNotNullConstraintsFromHeap's shape, but the constraint object here IS
+// the index (linked via conindid), not a separate Table-owned list — so this
+// loader mutates catalog.Index in place rather than assigning a Table field.
+// PRIMARY KEY needs no such row (indisprimary already survives via pg_index,
+// M0143-0003a), so every row this loader sees is contype='u'.
+func loadUniqueConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadUniqueConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadUniqueConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadUniqueConstraintsFromHeapForDB is loadUniqueConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadUniqueConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type uniqueRow struct {
+		conindid             uint32
+		deferrable, deferred bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only contype='u' rows with a real conindid — the field this
+			// loader exists to restore. writeUniqueConstraintRow always sets
+			// it; a zero would mean a malformed/foreign row.
+			if decoded[3].StringValue() != "u" || decoded[10].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return uniqueRow{
+				conindid:   uint32(decoded[10].Int),
+				deferrable: decoded[4].BoolValue(),
+				deferred:   decoded[5].BoolValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ur := r.(uniqueRow)
+		idx, ok := cat.LookupIndexByOID(ur.conindid, heapDBOid)
+		if !ok || idx == nil {
+			// Fall back to a cross-database scan — same defensive posture as
+			// the CHECK/NOT NULL/FK loaders' LookupTableByOIDAllDBs, for the
+			// same reason: heapDBOid is where the ROW lives, not necessarily
+			// the namespace the index itself ended up registered under.
+			idx, _, ok = cat.LookupIndexByOIDAllDBs(ur.conindid)
+			if !ok || idx == nil {
+				continue // index dropped since the row was written
+			}
+		}
+		idx.IsConstraint = true
+		idx.Deferrable = ur.deferrable
+		idx.InitiallyDeferred = ur.deferred
+	}
+	return nil
+}
+
+// loadExclusionConstraintsFromHeap restores catalog.Index.IsExclusion (and
+// ExclusionOp/Deferrable/InitiallyDeferred) from durable pg_constraint
+// contype='x' heap rows (M0143-0003e). Sibling of
+// loadUniqueConstraintsFromHeap — same conindid-keyed shape, mirroring
+// idx.IsConstraint's restoration with idx.IsExclusion. Before this,
+// catalog.Index.IsExclusion had no reload path at all, so every EXCLUDE
+// constraint (btree-equality or GiST-stub) silently reverted to looking like
+// a bare/no-op index after a restart — losing not just pg_constraint/pg_dump
+// visibility but runtime ENFORCEMENT (checkExclusionConstraintsForInsert and
+// deferred_exclusion.go both gate on idx.IsExclusion).
+func loadExclusionConstraintsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadExclusionConstraintsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadExclusionConstraintsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadExclusionConstraintsFromHeapForDB is loadExclusionConstraintsFromHeap's
+// per-DB body. See pgConstraintTableRel's routing note (sys_pg_constraint.go)
+// for why a non-default-DB table's rows live ONLY in that database's own heap.
+func loadExclusionConstraintsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	type exclRow struct {
+		conindid             uint32
+		exclusionOp          string
+		deferrable, deferred bool
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2606, Fork: storage.MainFork}
+	cols := executor.PGConstraintColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			// Only contype='x' rows with a real conindid — the field this
+			// loader exists to restore. writeExclusionConstraintRow always
+			// sets it; a zero would mean a malformed/foreign row.
+			if decoded[3].StringValue() != "x" || decoded[10].Int == 0 {
+				return nil, false, errSkipBuiltinRow
+			}
+			return exclRow{
+				conindid:    uint32(decoded[10].Int),
+				exclusionOp: decoded[27].StringValue(),
+				deferrable:  decoded[4].BoolValue(),
+				deferred:    decoded[5].BoolValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		er := r.(exclRow)
+		idx, ok := cat.LookupIndexByOID(er.conindid, heapDBOid)
+		if !ok || idx == nil {
+			// Fall back to a cross-database scan — same defensive posture as
+			// loadUniqueConstraintsFromHeapForDB's identical fallback.
+			idx, _, ok = cat.LookupIndexByOIDAllDBs(er.conindid)
+			if !ok || idx == nil {
+				continue // index dropped since the row was written
+			}
+		}
+		idx.IsExclusion = true
+		idx.ExclusionOp = er.exclusionOp
+		idx.Deferrable = er.deferrable
+		idx.InitiallyDeferred = er.deferred
 	}
 	return nil
 }
@@ -787,8 +1492,78 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		// datconnlimit.
 		cat.SetDatabaseConnLimit(db.name, db.connLimit)
 	}
+	return nil
+}
+
+// reloadDatabaseACLsFromHeap restores the in-memory ACL projection for the
+// shared pg_database.datacl column. The database registry must already exist
+// and roles must already be loaded, because aclitem stores role OIDs while the
+// catalog ACL store is keyed by role name. M0122-0008a.
+func reloadDatabaseACLsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
 		return nil
 	}
+	type aclRow struct {
+		oid uint32
+		acl []byte
+		set bool
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: catalog.PgDatabaseRelationOID, Fork: storage.MainFork}
+	cols := catalog.PgDatabaseColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_database datacl",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			v := d[len(d)-1]
+			if v.IsNull() {
+				return aclRow{oid: uint32(d[0].Int)}, false, nil
+			}
+			return aclRow{oid: uint32(d[0].Int), acl: append([]byte(nil), v.BytesValue()...), set: true}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	privs := map[byte]string{'C': "CREATE", 'T': "TEMPORARY", 'c': "CONNECT"}
+	for _, raw := range rows {
+		r := raw.(aclRow)
+		if !r.set {
+			continue
+		}
+		entries, derr := executor.DecodeACLItemArray(r.acl, cat.RoleNameForOID)
+		if derr != nil {
+			return fmt.Errorf("pg_database datacl for oid %d: %w", r.oid, derr)
+		}
+		cat.DropTableACL(r.oid)
+		if len(entries) == 0 {
+			cat.MaterializeOwnerACL(r.oid, "postgres", []string{"CREATE", "TEMPORARY", "CONNECT"})
+			for _, privilege := range []string{"CREATE", "TEMPORARY", "CONNECT"} {
+				cat.RevokeTablePrivilege(r.oid, "postgres", privilege)
+			}
+			continue
+		}
+		for _, entry := range entries {
+			grantee := entry.Grantee
+			if grantee == "" {
+				grantee = "PUBLIC"
+			}
+			for i := 0; i < len(entry.Privileges); i++ {
+				privilege, ok := privs[entry.Privileges[i]]
+				if !ok {
+					continue
+				}
+				withGrantOption := i+1 < len(entry.Privileges) && entry.Privileges[i+1] == '*'
+				if withGrantOption {
+					i++
+				}
+				cat.GrantTablePrivilegeAs(r.oid, grantee, privilege, withGrantOption, entry.Grantor)
+			}
+		}
+	}
+	return nil
+}
 
 // reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
 // replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +
@@ -1425,12 +2200,24 @@ func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // linkage (subtype, multirange, opclass, collation); the range and
 // multirange pg_type rows carry names/array peers/owner; the subtype name
 // resolves via pgTypeCanonical.
-func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+//
+// M0143-0002h: reloadUserRangeTypesFromHeap is parameterized by the same
+// heapDBOid/nsDBOid split as loadSystemCatalogsIfPresentForDB
+// (internal/initdb/open.go) — heapDBOid picks the base/<dbOid>/pg_range|
+// pg_type files the scan reads, nsDBOid is the dbOid stamped onto each
+// RegisterRangeTypeDuringRecovery call (rangeKey(dbOid, name) is the
+// registry's lookup key — catalog.go already supported per-DB range types,
+// only this caller hardcoded cat.DBOID() on both ends). The main call site
+// keeps passing cat.DBOID() for both (the historical single-DB behavior); a
+// distinct-dbOid database's own pg_range/pg_type heap needs a second call
+// with its own oid on both parameters, mirroring the
+// loadSystemCatalogsIfPresentForDB per-database loop.
+func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 	rangeCols := executor.PGRangeColumnsPG18()
 	type rangeRow struct {
 		typid, subtype, multitypid, collation, subopc uint32
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3541, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3541, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_range",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
 			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
@@ -1462,7 +2249,7 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 		arrayOID  uint32
 		owner     uint32
 	}
-	typeRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	typeRel := storage.RelFileNode{DBOid: heapDBOid, RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
 	typeRows, err := scanCatalogHeapRows(mgr, typeRel, clog, "pg_type",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
 			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
@@ -1504,7 +2291,7 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 		cat.RegisterRangeTypeDuringRecovery(&catalog.RangeType{
 			Name:               rangeT.name,
 			OID:                rr.typid,
-			DBOid:              cat.DBOID(),
+			DBOid:              nsDBOid,
 			ArrayOID:           rangeT.arrayOID,
 			SubtypeName:        subtypeName,
 			OpclassOID:         rr.subopc,
@@ -2359,7 +3146,64 @@ func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	if err := reloadForeignServersFromHeap(mgr, cat, clog); err != nil {
 		return err
 	}
-	return reloadUserMappingsFromHeap(mgr, cat, clog)
+	if err := reloadUserMappingsFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	return reloadForeignTablesFromHeap(mgr, cat, clog)
+}
+
+// reloadForeignTablesFromHeap restores catalog.Table.ForeignServerName /
+// ForeignOptions from the pg_foreign_table heap (M0122-0015). It runs LAST in
+// reloadForeignDataFromHeap for two reasons: ftserver is reversed through the
+// server registry that reloadForeignServersFromHeap just filled, and ftrelid
+// is resolved against the user tables loaded earlier by
+// loadUserTablesFromHeapForDB (Open calls that well before this pass).
+//
+// Restoring the field is what restores the pg_foreign_table VIEW as well —
+// catalog.PGForeignTableRowsForDBOid renders it from ForeignServerName rather
+// than from this heap — and it is what makes the planner's no-handler refusal
+// (foreignTableWithoutHandler) reachable after a restart.
+func reloadForeignTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	cols := executor.PGForeignTableColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3118, Fork: storage.MainFork}
+	type ftRow struct {
+		server  string
+		options []string
+		relid   uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_table",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			server := ""
+			if srv := cat.LookupForeignServerByOID(uint32(d[1].Int)); srv != nil {
+				server = srv.Name
+			}
+			return ftRow{server: server, options: decodeOptions(d[2]), relid: uint32(d[0].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	nsDBOid := catalog.NamespaceDBOid(cat.DBOID())
+	for _, raw := range rows {
+		fr := raw.(ftRow)
+		if fr.server == "" {
+			continue // server gone — the table is no longer usable as foreign
+		}
+		tbl, ok := cat.LookupTableByOID(fr.relid, nsDBOid)
+		if !ok || tbl == nil {
+			continue
+		}
+		tbl.ForeignServerName = fr.server
+		tbl.ForeignOptions = fr.options
+	}
+	return nil
 }
 
 func decodeOptions(d executor.Datum) []string {
@@ -2690,17 +3534,45 @@ func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 }
 
 // reloadUserExtensionsFromHeap (M0130-S3) is the pg_extension reload —
-// reads base/*/3079 to reconstruct the in-memory runtime extension registry
-// after a restart. Each row maps onto the catalog extensionRow.
+// reconstructs the in-memory runtime extension registry after a restart.
+// pg_extension is per-database, so this scans base/<DBOID()>/3079 (the
+// bootstrap postgres/template1 shared scope, attributed "postgres") plus
+// base/<oid>/3079 of every registered user database (M0119-0006bs) —
+// installs made while connected to a CREATE DATABASE'd database journal
+// into that database's own heap dir and would otherwise vanish on
+// restart. Runs after reloadDatabasesFromHeap so cat.ListDatabases() is
+// populated. Each row maps onto the catalog extensionRow.
 func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := reloadUserExtensionsFromHeapForDB(mgr, cat, clog, cat.DBOID(), "postgres"); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserExtensionsFromHeapForDB(mgr, cat, clog, dbOid, dbName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserExtensionsFromHeapForDB scans base/<heapDBOid>/3079 and
+// re-registers each live row scoped to dbName. A missing/empty heap is a
+// no-op.
+func reloadUserExtensionsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32, dbName string) error {
 	extCols := executor.PGExtensionColumnsPG18()
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3079, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3079, Fork: storage.MainFork}
 	type extRec struct {
 		oid     uint32
 		name    string
 		schema  string
 		version string
-		dbName  string
 	}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_extension",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
@@ -2719,7 +3591,6 @@ func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 				name:    decoded[1].StringValue(),
 				schema:  schema,
 				version: decoded[5].StringValue(),
-				dbName:  "", // database is per-catalog reload scope
 			}, false, nil
 		})
 	if err != nil {
@@ -2727,7 +3598,7 @@ func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	}
 	for _, raw := range rows {
 		r := raw.(extRec)
-		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, "", r.oid)
+		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, dbName, r.oid)
 	}
 	return nil
 }

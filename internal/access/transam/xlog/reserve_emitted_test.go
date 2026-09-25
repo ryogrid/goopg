@@ -31,7 +31,7 @@ func TestReserveEmittedAndPublishHappyPathMatchesStandalonePredict(t *testing.T)
 	tr := newInsertionTracker()
 
 	const recordLen = 100
-	start, prev, total, leading := pos.reserveEmittedAndPublish(recordLen, 2, tr)
+	start, prev, total, leading, _ := pos.reserveEmittedAndPublish(recordLen, 2, tr)
 	if start != 1 || prev != 0 {
 		t.Fatalf("first reserve: got (start=%d, prev=%d), want (1, 0)", start, prev)
 	}
@@ -67,7 +67,7 @@ func TestReserveEmittedAndPublishPageBoundaryGetsShortHeader(t *testing.T) {
 	tr := newInsertionTracker()
 
 	const recordLen = 100
-	start, _, total, leading := pos.reserveEmittedAndPublish(recordLen, 0, tr)
+	start, _, total, leading, _ := pos.reserveEmittedAndPublish(recordLen, 0, tr)
 	if start != XLOGBlockSize {
 		t.Fatalf("start=%d, want %d", start, XLOGBlockSize)
 	}
@@ -87,7 +87,7 @@ func TestReserveEmittedAndPublishSegmentBoundaryGetsLongHeader(t *testing.T) {
 	tr := newInsertionTracker()
 
 	const recordLen = 100
-	start, _, total, leading := pos.reserveEmittedAndPublish(recordLen, 5, tr)
+	start, _, total, leading, _ := pos.reserveEmittedAndPublish(recordLen, 5, tr)
 	if start != segSize {
 		t.Fatalf("start=%d, want %d", start, segSize)
 	}
@@ -124,7 +124,7 @@ func TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 	}
 
 	const recordLen = 100
-	start, prev, total, leading := pos.reserveEmittedAndPublish(recordLen, 1, tr)
+	start, prev, total, leading, _ := pos.reserveEmittedAndPublish(recordLen, 1, tr)
 
 	expectedBoundary := 2 * segSize
 	if len(gaps) != 1 {
@@ -164,7 +164,7 @@ func TestReserveEmittedAndPublishCrossSegmentNoHookSkipsNotify(t *testing.T) {
 	startPos := 2*segSize - 50
 	pos := newInsertPosTracker(startPos, 999, segSize, nil)
 	tr := newInsertionTracker()
-	start, prev, total, leading := pos.reserveEmittedAndPublish(100, 0, tr)
+	start, prev, total, leading, _ := pos.reserveEmittedAndPublish(100, 0, tr)
 	if start != 2*segSize || prev != startPos {
 		t.Fatalf("got (start=%d, prev=%d), want (%d, %d)",
 			start, prev, 2*segSize, startPos)
@@ -251,7 +251,7 @@ func TestReserveEmittedAndPublishConcurrentNoRaceMatchesPredictAtStart(t *testin
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				s, p, tot, lead := pos.reserveEmittedAndPublish(recordLen, w, tr)
+				s, p, tot, lead, _ := pos.reserveEmittedAndPublish(recordLen, w, tr)
 				results <- result{s, p, tot, lead}
 				tr.setInsertingAt(w, lsnIdle)
 			}
@@ -366,7 +366,7 @@ func TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent(t *te
 			go func() {
 				defer wg.Done()
 				for i := 0; i < perWorker; i++ {
-					_, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
+					_, _, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
 					tr.setInsertingAt(w, lsnIdle)
 				}
 			}()
@@ -410,7 +410,7 @@ func TestReserveEmittedAndPublishCrossSegmentChainIntegrity(t *testing.T) {
 	// (next page at startPos1+100=boundary which is also a page
 	// boundary, so consumed reaches recordLen at pos==boundary and
 	// the loop exits). Stays in segment.
-	s1, p1, t1, _ := pos.reserveEmittedAndPublish(100, 0, tr)
+	s1, p1, t1, _, _ := pos.reserveEmittedAndPublish(100, 0, tr)
 	if s1 != startPos1 || p1 != 999 || t1 != 100 {
 		t.Fatalf("rec1: got (start=%d, prev=%d, total=%d), want (%d, 999, 100)",
 			s1, p1, t1, startPos1)
@@ -424,7 +424,7 @@ func TestReserveEmittedAndPublishCrossSegmentChainIntegrity(t *testing.T) {
 	// aligned). Leading=long(40); total=140; lands at boundary; prev=
 	// startPos1 (rec1's start). No cross-segment because we're at the
 	// boundary precisely (not crossing it).
-	s2, p2, t2, l2 := pos.reserveEmittedAndPublish(100, 0, tr)
+	s2, p2, t2, l2, _ := pos.reserveEmittedAndPublish(100, 0, tr)
 	if s2 != 2*segSize || p2 != startPos1 {
 		t.Fatalf("rec2: got (start=%d, prev=%d), want (%d, %d)",
 			s2, p2, 2*segSize, startPos1)
@@ -463,7 +463,7 @@ func TestReserveEmittedAndPublishCrossSegmentLeadingDiffersFromPredictAtCurr(t *
 			boundaryLeading)
 	}
 
-	_, _, _, leading := pos.reserveEmittedAndPublish(100, 0, tr)
+	_, _, _, leading, _ := pos.reserveEmittedAndPublish(100, 0, tr)
 	if leading != boundaryLeading {
 		t.Fatalf("leading=%d, want %d (foundation 18 re-predicts at boundary)",
 			leading, boundaryLeading)
@@ -490,7 +490,7 @@ func TestReserveEmittedAndPublishWatchdog(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for i := 0; i < perWorker; i++ {
-					_, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
+					_, _, _, _, _ = pos.reserveEmittedAndPublish(recordLen, w, tr)
 					tr.setInsertingAt(w, lsnIdle)
 				}
 			}()
@@ -535,7 +535,7 @@ func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
 	// A record of size 32 starting at gapStart would straddle boundary:
 	// gapStart + 32 > boundary (boundary - 8 + 32 = boundary + 24 > boundary).
 	// The gap is 8 bytes — onCrossSegment must NOT be called (panic avoidance).
-	start, prev, total, leading := pos.reserveEmittedAndPublish(32, 0, tr)
+	start, prev, total, leading, _ := pos.reserveEmittedAndPublish(32, 0, tr)
 	tr.setInsertingAt(0, lsnIdle)
 
 	if !hookFired {

@@ -79,7 +79,10 @@ package optimizer
 // list is populated on real paths (`indexPathClauses`, pathparamindex.go:338).
 // `pathindexclauses_test.go` is still where its invariants are falsifiable.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // indexPathClause is one entry of PG's `indexclauses` list (`IndexClause`,
 // pathnodes.h:1865): the restriction that became an index qual, the index column
@@ -113,6 +116,24 @@ type indexPathClause struct {
 	// operand, supplied by the parameterising relations. This is what becomes
 	// `IndexScan.Keys[indexCol]`.
 	key Expr
+	// local is the leaf-local restriction conjunct this clause was taken from
+	// (unparameterised restriction paths only, pathindexrestrict.go); nil for
+	// a join-clause index qual. createIndexScanPlan drops it from the leaf's
+	// reinstated Filter, since the probe already applies it — PG's
+	// create_indexscan_plan leaves such quals out of qpqual
+	// (is_redundant_with_indexclauses, createplan.c:3068-3088).
+	local Expr
+	// op is the clause's operator in canonical `indexcol op key` form. The
+	// zero value is equality — every join-clause and equality-prefix clause.
+	// OpGt/OpGe mark a LOWER and OpLt/OpLe an UPPER range bound on the
+	// index's leading column (M0145-0029 slice 2, pathindexrestrict.go);
+	// createIndexScanPlan lowers those onto IndexScan.LowKey/HighKey.
+	op parser.OpCode
+	// saop is the element list of a ScalarArrayOp index qual (`indexcol IN
+	// (…)` / `= ANY (…)`, M0145-0029 slice 4) — one btree descent per
+	// element, lowered onto IndexScan.SAOPKeys. `key` is nil and `op` is
+	// equality when set.
+	saop []Expr
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

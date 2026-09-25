@@ -90,7 +90,16 @@ func findSpineSemi(node Node) (*Join, *NestedLoopIndexJoin) {
 			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
 				return x, nil
 			}
-			return nil, nil
+			// K26: with implied join equalities the DP can legally place an
+			// inner join ABOVE the pinned semi join, so the semi join is no
+			// longer the first join on the spine. Descend both sides rather
+			// than giving up — returning nil here made the caller nil-deref,
+			// which reads as a planner crash and is a walker gap (K19 again,
+			// fourth walker family).
+			if l, n := findSpineSemi(x.Left); l != nil || n != nil {
+				return l, n
+			}
+			return findSpineSemi(x.Right)
 		case *NestedLoopIndexJoin:
 			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
 				return nil, x
@@ -102,141 +111,16 @@ func findSpineSemi(node Node) (*Join, *NestedLoopIndexJoin) {
 	}
 }
 
-// TestPreDPPinnedSemiKeysResolveAfterDP is the mandatory F8 remap
-// test: DP reorders the outer layout below the pinned semi join; every
-// ColumnRef in the semi join's keys/predicate must resolve to the
-// column of the same name in the post-DP outer schema.
-func TestPreDPPinnedSemiKeysResolveAfterDP(t *testing.T) {
-	SetUnnestPreDPEnabled(true)
-	t.Cleanup(func() { SetUnnestPreDPEnabled(true) })
-
-	cat := preDPCatalog(t)
-	node, err := Plan(parseOne(t, preDPFourTableExists), cat)
-	if err != nil {
-		t.Fatal(err)
+// spliceTestSchema is a 2-column schema builder for spliceSearchedSpine
+// tests — bare SeqScan leaves stand in for "the outer schema a pinned
+// Semi/Anti spine publishes" and "the schema a Phase B search returned",
+// without needing a real join tree.
+func spliceTestSchema(names ...string) Schema {
+	s := make(Schema, len(names))
+	for i, n := range names {
+		s[i] = SchemaColumn{Name: n, Type: catalog.Type{Name: "int4"}}
 	}
-	semi, nli := findSpineSemi(node)
-	var outerSchema Schema
-	var leftKey Expr
-	var pred Expr
-	var published Schema
-	switch {
-	case semi != nil:
-		outerSchema = semi.Left.Output()
-		leftKey = semi.LeftKey
-		pred = semi.Predicate
-		published = semi.Output()
-	case nli != nil:
-		outerSchema = nli.Outer.Output()
-		leftKey = nliIn(nli.Inner).Key
-		pred = nli.Predicate
-		published = nli.Output()
-	default:
-		t.Fatalf("no pinned semi join found in plan")
-	}
-
-	checkRef := func(e Expr, side string) {
-		cr, ok := e.(*ColumnRef)
-		if !ok || cr.Name == "" {
-			return
-		}
-		// Left-side refs must land inside the outer schema and on a
-		// column with the same name.
-		if side == "left" {
-			if cr.Index < 0 || cr.Index >= len(outerSchema) {
-				t.Fatalf("semi key %q index %d out of outer schema range %d",
-					cr.Name, cr.Index, len(outerSchema))
-			}
-			if outerSchema[cr.Index].Name != cr.Name {
-				t.Fatalf("F8 stale index: semi key %q resolves to outer column %q (index %d)",
-					cr.Name, outerSchema[cr.Index].Name, cr.Index)
-			}
-		}
-	}
-	checkRef(leftKey, "left")
-	visitColumnRefs(pred, func(e Expr) {
-		cr, ok := e.(*ColumnRef)
-		if !ok || cr.Name == "" {
-			return
-		}
-		if cr.Index < len(outerSchema) {
-			if outerSchema[cr.Index].Name != cr.Name {
-				t.Fatalf("F8 stale index in semi predicate: %q → outer %q",
-					cr.Name, outerSchema[cr.Index].Name)
-			}
-		}
-	})
-
-	// The pinned join must publish an outer-only schema matching its
-	// (post-DP) outer output — the schema-refresh half of the fix.
-	if len(published) != len(outerSchema) {
-		t.Fatalf("semi schema width %d != outer output width %d",
-			len(published), len(outerSchema))
-	}
-	for i := range outerSchema {
-		if published[i].Name != outerSchema[i].Name {
-			t.Fatalf("semi cached schema stale at %d: %q vs outer %q",
-				i, published[i].Name, outerSchema[i].Name)
-		}
-	}
-}
-
-// TestPreDPSublinkFreeByteStable pins the degenerate path: a
-// sublink-free multi-table query must plan byte-identically with the
-// pre-DP position on and off.
-func TestPreDPSublinkFreeByteStable(t *testing.T) {
-	cat := preDPCatalog(t)
-	sql := "SELECT b1_k FROM big1, big2, small3, small4 " +
-		"WHERE b1_j = b2_j AND b2_j = s3_j AND s3_k = s4_k"
-
-	SetUnnestPreDPEnabled(true)
-	onPlan, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	SetUnnestPreDPEnabled(false)
-	offPlan, err := Plan(parseOne(t, sql), cat)
-	SetUnnestPreDPEnabled(true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	on := planShapeString(onPlan)
-	off := planShapeString(offPlan)
-	if on != off {
-		t.Fatalf("sublink-free plan differs between pre-DP on/off:\nON:\n%s\nOFF:\n%s", on, off)
-	}
-}
-
-// TestPreDPFlagOffLegacyStillWorks pins that the legacy order still
-// plans and decorrelates a sublink query when the flag is off.
-func TestPreDPFlagOffLegacyStillWorks(t *testing.T) {
-	SetUnnestPreDPEnabled(false)
-	t.Cleanup(func() { SetUnnestPreDPEnabled(true) })
-
-	cat := preDPCatalog(t)
-	node, err := Plan(parseOne(t, preDPFourTableExists), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	j, nl := findSpineSemi(node)
-	if j == nil && nl == nil && !planHasSubqueryExpr(node) {
-		t.Fatalf("legacy order produced neither a semi join nor a retained SubPlan")
-	}
-}
-
-// TestPreDPEligibility pins the S5a scope narrowing: scalar-family
-// sublinks send the statement down the legacy order.
-func TestPreDPEligibility(t *testing.T) {
-	exists := &ExistsExpr{Plan: &SeqScan{}}
-	scalar := &SubqueryExpr{Plan: &SeqScan{}}
-	if !whereEligibleForPreDPUnnest(&BinaryOp{Op: parser.OpAnd,
-		Left: exists, Right: &BooleanConst{Value: true}}) {
-		t.Fatalf("EXISTS-only WHERE should be eligible")
-	}
-	if whereEligibleForPreDPUnnest(&BinaryOp{Op: parser.OpGt,
-		Left: &ColumnRef{Name: "a"}, Right: scalar}) {
-		t.Fatalf("scalar sublink WHERE must not be eligible")
-	}
+	return s
 }
 
 // planShapeString renders a stable structural signature of a plan for

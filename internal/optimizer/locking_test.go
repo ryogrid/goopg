@@ -3,6 +3,9 @@ package optimizer
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPlanSelectForUpdateWrapsLockRows — the headline case: a
@@ -248,17 +251,14 @@ func TestPlanCtidRowMarkMultiTable(t *testing.T) {
 			t.Errorf("duplicate RowMarkId %d", lk.RowMarkId)
 		}
 		ids[lk.RowMarkId] = true
-			// Column path: for self-joins (AI-007), CtidResno stays -1 because
-		// ctid injection breaks hash join schemas. The scan fallback handles TID.
+		// M0143-0009: the AI-007 self-join guard is retired — every lock
+		// takes the real ctid column path now.
 		if lk.CtidResno < 0 {
-			t.Logf("CtidResno = %d for %s (scan fallback path)", lk.CtidResno, lk.Alias)
-		} else {
-			t.Logf("CtidResno = %d for %s (column path)", lk.CtidResno, lk.Alias)
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path)", lk.CtidResno, lk.Alias)
 		}
 	}
-	// Self-join: ctid injection disabled (AI-007), NumCtidCols == 0.
-	if lr.NumCtidCols != 0 {
-		t.Logf("NumCtidCols = %d", lr.NumCtidCols)
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2 (one ctid per locked binding)", lr.NumCtidCols)
 	}
 	// Output schema has both ctid columns stripped.
 	childOutput := lr.Child.Output()
@@ -288,18 +288,19 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 	if len(lr.Locks) < 2 {
 		t.Fatalf("len(Locks) = %d, want >= 2", len(lr.Locks))
 	}
-	// Self-join: ctid injection disabled (AI-007). Verify each LockedRel
-	// correctly reports -1 (scan fallback path).
+	// M0143-0009: the AI-007 injection skip is retired — each LockedRel gets
+	// a real ctid column (distinct resnos), and the global rebase keeps the
+	// join's expression coordinates correct.
 	for _, lk := range lr.Locks {
-		if lk.CtidResno >= 0 {
-			t.Errorf("CtidResno = %d for %s, want -1 (column path disabled for self-joins)", lk.CtidResno, lk.Alias)
+		if lk.CtidResno < 0 {
+			t.Errorf("CtidResno = %d for %s, want >= 0 (column path)", lk.CtidResno, lk.Alias)
 		}
 		if lk.RowMarkId < 1 {
 			t.Errorf("RowMarkId = %d for %s, want >= 1", lk.RowMarkId, lk.Alias)
 		}
 	}
-	if lr.NumCtidCols != 0 {
-		t.Errorf("NumCtidCols = %d, want 0 (column path disabled for self-joins)", lr.NumCtidCols)
+	if lr.NumCtidCols != 2 {
+		t.Errorf("NumCtidCols = %d, want 2 (one ctid per locked binding)", lr.NumCtidCols)
 	}
 	// The Project must contain two distinct ctid columns.
 	proj, ok := lr.Child.(*Project)
@@ -312,11 +313,12 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 			ctidCols[col.Name] = i
 		}
 	}
-	if len(ctidCols) != 0 {
-		t.Fatalf("Project schema has %d ctid columns, want 0 (column path disabled for self-joins)", len(ctidCols))
+	if len(ctidCols) != 2 {
+		t.Fatalf("Project schema has %d ctid columns, want 2 (one per locked binding)", len(ctidCols))
 	}
-	// The two ctid ColumnRefs must have different indices (pointing to different
-	// positions in the join output).
+	// The two ctid ColumnRefs must have different indices (pointing to
+	// different positions in the join output — a's ctid sits mid-row after
+	// a's columns, b's at the end).
 	ctidIndices := map[int]bool{}
 	for _, target := range proj.Targets {
 		cr, ok := target.(*ColumnRef)
@@ -328,7 +330,217 @@ func TestPlanCtidRowMarkSelfJoin(t *testing.T) {
 		}
 		ctidIndices[cr.Index] = true
 	}
-	if len(ctidIndices) != 0 {
-		t.Errorf("found %d distinct ctid ColumnRef indices, want 0 (column path disabled for self-joins)", len(ctidIndices))
+	if len(ctidIndices) != 2 {
+		t.Errorf("found %d distinct ctid ColumnRef indices, want 2", len(ctidIndices))
+	}
+}
+
+// TestPlanCtidRowMarkDoubleProject — AI-20260920-005626-006 regression.
+// The planner can emit a column-reordering Project between the top Project
+// and the join (the shape `SELECT a.accountid, a.balance FROM lrs_acct a,
+// lrs_side s WHERE a.accountid = s.k FOR UPDATE OF a` produced live: the
+// hash join emits s's columns first, a restrip Project reorders to binding
+// order, and the statement Project applies the select list). A resjunk ctid
+// injected into a leaf does not propagate through an intermediate Project's
+// own target list, so resno resolution used to fail there: CtidResno stayed
+// -1 while NumCtidCols still counted the leaf injection, and LockRows'
+// trailing-strip fallback then dropped a real user column (the wire result
+// lost `balance`). The fix threads the ctid up through every pinned-schema
+// ancestor (surfaceRowMarkCtid) and counts NumCtidCols by surfaced columns.
+func TestPlanCtidRowMarkDoubleProject(t *testing.T) {
+	c := catalog.NewInMemory()
+	acct, err := c.CreateTable(parser.ObjectName{Name: "lrs_acct"}, []catalog.Column{
+		{Name: "accountid", Type: catalog.Type{Name: "text"}},
+		{Name: "balance", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	side, err := c.CreateTable(parser.ObjectName{Name: "lrs_side"}, []catalog.Column{
+		{Name: "k", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	// Join emits s's columns first (s is the hash outer), a's second —
+	// merged order [k, accountid, balance].
+	aScan := &SeqScan{Table: acct, Alias: "a", schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+	}}
+	sScan := &SeqScan{Table: side, Alias: "s", schema: Schema{
+		{Name: "k", Type: textT, SourceTableIdx: 2},
+	}}
+	join := &Join{Type: JoinTypeInner, Left: sScan, Right: aScan}
+	join.schema = appendSchema(sScan.Output(), aScan.Output())
+	// Restrip Project reorders merged output to binding order [acct, bal, k].
+	mid := &Project{Child: join, schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+		{Name: "k", Type: textT, SourceTableIdx: 2},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 1, Name: "accountid", Type: textT, SourceTableIdx: 1},
+		&ColumnRef{Index: 2, Name: "balance", Type: intT, SourceTableIdx: 1},
+		&ColumnRef{Index: 0, Name: "k", Type: textT, SourceTableIdx: 2},
+	}}
+	// Statement Project applies the select list [acct, bal].
+	top := &Project{Child: mid, schema: Schema{
+		{Name: "accountid", Type: textT, SourceTableIdx: 1},
+		{Name: "balance", Type: intT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "accountid", Type: textT, SourceTableIdx: 1},
+		&ColumnRef{Index: 1, Name: "balance", Type: intT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: acct, Alias: "a", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+	// The call-site invariant: NumCtidCols counts only ctids that surfaced.
+	surfaced := 0
+	for i := range locks {
+		if locks[i].CtidResno >= 0 {
+			surfaced++
+		}
+	}
+	lr := &LockRows{Child: top, Locks: locks, NumCtidCols: surfaced}
+
+	if locks[0].CtidResno < 0 {
+		t.Fatalf("CtidResno = %d — ctid did not surface through the mid Project", locks[0].CtidResno)
+	}
+	// Mid Project must carry the ctid as a pass-through target.
+	midHasCtid := false
+	for _, c := range mid.schema {
+		if c.Name == "ctid1" && c.Resjunk {
+			midHasCtid = true
+		}
+	}
+	if !midHasCtid {
+		t.Error("mid Project schema missing the threaded ctid column")
+	}
+	out := lr.Output()
+	if len(out) != 2 || out[0].Name != "accountid" || out[1].Name != "balance" {
+		names := make([]string, len(out))
+		for i, c := range out {
+			names[i] = c.Name
+		}
+		t.Fatalf("LockRows.Output() = %v, want [accountid balance] (pre-fix dropped the trailing user column)", names)
+	}
+}
+
+// TestPlanCtidRowMarkAliasedTargetsResolveColPos pins the EPQ refetch-merge
+// coordinate against a target-list ALIAS.
+//
+// `resolveRowMarkCtidResnos` locates each locked-relation column in the root
+// output by its (Name, SourceTableIdx) identity. An alias renames the SCHEMA
+// column — `SELECT ta.value AS ta_value` — so that identity is absent from the
+// output and every position resolved to -1. At the merge site
+// (`lockRowsOp.Next`, internal/executor/operators_lockrows.go) a -1 is
+// indistinguishable from "this column is not carried in the output", so the
+// re-fetched post-update values were silently dropped and the row kept its
+// PRE-update contents. That is a wrong-answer surface, not a cosmetic one:
+// it is the defect behind the isolation spec eval-plan-qual permutation
+// `updateforss readforss c1 c2` (AI-20260922-004850-001), whose step aliases
+// all three of its targets and which returned `tableAValue` where PostgreSQL
+// returns `newTableAValue`.
+//
+// The Project TARGET keeps the column's original identity even when its
+// schema entry is renamed, so it is the reliable coordinate. Upstream has no
+// equivalent ambiguity: ExecLockRows addresses a rowmark's columns by attnum
+// through the tuple descriptor, never by output name.
+//
+// A genuinely absent column must still resolve to -1 — that meaning is load
+// bearing, so the test pins both halves.
+func TestPlanCtidRowMarkAliasedTargetsResolveColPos(t *testing.T) {
+	c := catalog.NewInMemory()
+	ta, err := c.CreateTable(parser.ObjectName{Name: "lrs_alias_a"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "value", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	scan := &SeqScan{Table: ta, Alias: "ta", schema: Schema{
+		{Name: "id", Type: intT, SourceTableIdx: 1},
+		{Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	// The select list renames BOTH columns, as the spec's `readforss` does.
+	top := &Project{Child: scan, schema: Schema{
+		{Name: "ta_id", Type: intT, SourceTableIdx: 1},
+		{Name: "ta_value", Type: textT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "id", Type: intT, SourceTableIdx: 1},
+		&ColumnRef{Index: 1, Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: ta, Alias: "ta", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+
+	if locks[0].CtidResno < 0 {
+		t.Fatalf("CtidResno = %d — ctid did not surface", locks[0].CtidResno)
+	}
+	got := locks[0].ColPos
+	if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Errorf("ColPos = %v, want [0 1] — an aliased target must still resolve "+
+			"to its output position, or the EPQ refetch-merge silently drops the "+
+			"post-update values", got)
+	}
+}
+
+// TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos pins the other half of
+// the contract exercised above: a locked-relation column the output does NOT
+// carry must stay -1. The merge site relies on that to avoid writing a
+// re-fetched value into an unrelated slot, so the alias fallback must not
+// manufacture a position for a column that was projected away.
+func TestPlanCtidRowMarkAbsentColumnKeepsNegativeColPos(t *testing.T) {
+	c := catalog.NewInMemory()
+	ta, err := c.CreateTable(parser.ObjectName{Name: "lrs_absent_a"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "value", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	textT := catalog.Type{Name: "text"}
+	intT := catalog.Type{Name: "int4"}
+	scan := &SeqScan{Table: ta, Alias: "ta", schema: Schema{
+		{Name: "id", Type: intT, SourceTableIdx: 1},
+		{Name: "value", Type: textT, SourceTableIdx: 1},
+	}}
+	// Only `id` is projected; `value` is genuinely absent from the output.
+	top := &Project{Child: scan, schema: Schema{
+		{Name: "ta_id", Type: intT, SourceTableIdx: 1},
+	}, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "id", Type: intT, SourceTableIdx: 1},
+	}}
+	locks := []LockedRel{{Table: ta, Alias: "ta", RowMarkId: 1, CtidResno: -1}}
+
+	numCtid, oldW := wireRowMarkCtidColumns(top, locks)
+	if numCtid != 1 {
+		t.Fatalf("wired ctids = %d, want 1", numCtid)
+	}
+	rebaseRowMarkPlan(top, oldW)
+	resolveRowMarkCtidResnos(top, locks)
+
+	got := locks[0].ColPos
+	if len(got) != 2 || got[0] != 0 {
+		t.Fatalf("ColPos = %v, want the aliased id at 0", got)
+	}
+	if got[1] != -1 {
+		t.Errorf("ColPos[1] = %d, want -1 — `value` is not in the output and a "+
+			"position for it would merge a re-fetched value into an unrelated slot",
+			got[1])
 	}
 }

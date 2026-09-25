@@ -1141,13 +1141,28 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// than raising 22001 (that error is assignment/INSERT-coercion-only,
 		// already enforced separately by codec.go's coerceTextLikeDatum) —
 		// verified against real PG 18.3: `'abcdef'::varchar(3)` → 'abc', no
-		// error. bpchar/char additionally right-pad short values with spaces
-		// in real PG; goopg's Datum has no distinct padded representation for
-		// bpchar (coerceTextLikeDatum stores it trimmed too), so padding is a
-		// separate, broader gap left deferred. castTargetType (not
-		// x.TargetType) is used so the bare-`char`-synthesized-to-"bpchar"
-		// rename above is truncated too, while the quoted OID-18 `"char"`
-		// form (Typmod==0, already handled above) is unaffected. M0122-0005.
+		// error. castTargetType (not x.TargetType) is used so the
+		// bare-`char`-synthesized-to-"bpchar" rename above is truncated too,
+		// while the quoted OID-18 `"char"` form (Typmod==0, already handled
+		// above) is unaffected. M0122-0005.
+		//
+		// bpchar/char then RIGHT-PAD the truncated value to the declared
+		// length, exactly as upstream's `bpchar()` coercion does
+		// (postgres/src/backend/utils/adt/varchar.c) — varchar does not.
+		// This padding used to be skipped, and the comment here used to say
+		// goopg had "no distinct padded representation for bpchar" because
+		// storage trimmed it too. M0143-0007b's slice 1 flipped storage to
+		// blank-pad, which made that reasoning obsolete and left the cast as
+		// the ONLY bpchar producer still emitting a trimmed image. Two
+		// upstream regress cases caught the resulting asymmetry
+		// (AI-20260922-004850-016): `union`, where
+		// `SELECT CAST(f1 AS char(4)) FROM VARCHAR_TBL UNION SELECT f1 FROM
+		// CHAR_TBL` stopped de-duplicating because the cast produced 'a'
+		// while the stored column held 'a   ', so equal values compared
+		// unequal and every row was emitted twice; and the `char` case's own
+		// width assertions. A producer of a padded type must pad, or the
+		// value has two representations and every equality over it is
+		// unreliable.
 		if x.Typmod > 0 && result.Kind == KindString {
 			switch castTargetType {
 			case "varchar", "bpchar", "char", "character":
@@ -1155,6 +1170,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				runes := []rune(result.StringValue())
 				if len(runes) > n {
 					result = NewStringDatum(string(runes[:n]))
+				}
+				if castTargetType != "varchar" {
+					result = NewStringDatum(catalog.PadBpchar(
+						catalog.Type{Name: "bpchar", Args: []int64{int64(n)}},
+						result.StringValue()))
 				}
 			}
 		}
@@ -1299,6 +1319,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 		}
 	normalBinaryOp:
+		// The interpreted twin reads the declared widths straight off the
+		// operand expressions. Its compiled twin cannot (the expression is
+		// gone by then) and reads them from the node payload instead — see
+		// exprnode.go's ExprBinaryOp arm. Both then apply the same helper.
+		left, right = concatOperandsAsText(x.Op, left, right,
+			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right))
 		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
@@ -4945,6 +4971,14 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
+			// parseTimeString already distinguishes 22007 (syntax) from 22008
+			// (range, e.g. "25:00:00") — see btree_scalar_keys.go's identical
+			// arm. Reusing its ExecError instead of a hardcoded 22007 keeps
+			// this typed-literal path in sync with that sibling.
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+				return Datum{}, ee
+			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
@@ -4954,6 +4988,10 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+				return Datum{}, ee
+			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
 		}
 		return NewTimeTZDatum(ts, offsetSecs), nil
@@ -5573,6 +5611,19 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// PG would use int4 — the known literal-typing divergence documented for
 	// to_hex at planner.go, out of scope here; the fixture spells widths
 	// explicitly via ::intN).
+	// M0143-0007b slice 3: `char(n) -> text` is `rtrim1` upstream — pg_proc.dat
+	// oid 401, "convert char(n) to text", prosrc `rtrim1` — so the blank
+	// padding is STRIPPED by the cast, not carried into the text value.
+	// Measured on PG 18.3 with a stored `char(10)` holding 'ab':
+	// `length(c::text)` is 2 and `bit_length(c)` (which resolves through this
+	// same cast) is 16, while `octet_length(c)` stays 10.
+	//
+	// goopg used to satisfy this by accident, because the stored datum was
+	// already trimmed. Since the storage flip it is padded, so the cast has to
+	// do what upstream's does.
+	if d.Kind == KindString && isBpcharTypeName(sourceType) && isTextTargetTypeName(targetType) {
+		return NewStringDatum(strings.TrimRight(d.StringValue(), " ")), nil
+	}
 	if strings.EqualFold(targetType, "bytea") && d.Kind == KindInt {
 		switch byteaIntSourceWidth(sourceType) {
 		case 2:
@@ -11494,6 +11545,93 @@ func stringFuncArgTypeName(k DatumKind) string {
 // the same default synthesizeBareCharTypmod applies to casts and the bare-char
 // column type carries. Used by octet_length, whose PG implementation
 // (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+// concatOperandsAsText applies upstream's bpchar->text coercion to the operands
+// of `||` before they are concatenated.
+//
+// PostgreSQL has no bpchar concatenation operator: `char(n) || text` resolves
+// the bpchar operand through the implicit bpchar->text cast, which is `rtrim1`
+// (pg_cast.dat, `text(bpchar)`), so the blank padding is stripped BEFORE the
+// concatenation. Measured on PG 18.3: `length('ab'::char(6) || 'z')` is 3, not
+// 7. goopg satisfied this by accident until M0143-0007b's slice 1 flipped
+// bpchar storage from trimmed to blank-padded.
+//
+// The DECLARED type decides this, never the datum: a padded image is
+// indistinguishable from a text value that genuinely ends in spaces. lbp/rbp
+// are each side's `declaredBpcharTypmod` (0 when the operand is not a
+// width-carrying bpchar), which is why this helper takes them as parameters —
+// the two evaluators obtain them differently (see the callers) but must apply
+// the identical rule, so the rule itself lives here once.
+//
+// Only OpConcat is affected. Equality and ordering on bpchar already ignore
+// trailing blanks in the comparator (`PGCompareBpcharC`), so they must NOT be
+// routed through here.
+func concatOperandsAsText(op parser.OpCode, left, right Datum, lbp, rbp int64) (Datum, Datum) {
+	if op != parser.OpConcat {
+		return left, right
+	}
+	if lbp > 0 && left.Kind == KindString {
+		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+			left = NewStringDatum(t)
+		}
+	}
+	if rbp > 0 && right.Kind == KindString {
+		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+			right = NewStringDatum(t)
+		}
+	}
+	return left, right
+}
+
+// coerceBpcharArgDatum applies upstream's bpchar->text coercion to a whole
+// Datum, for a TEXT-declared function whose body reads its argument in more
+// than one place. It is the Datum-level twin of bpcharArgAsText: normalising
+// once, right after the argument is evaluated, is safer than rewriting every
+// s.StringValue() inside a body (regexp_replace alone reads its subject four
+// times, and missing one would strip in some branches but not others).
+//
+// Non-string datums pass through untouched, so the bytea branches of ltrim /
+// reverse / btrim are unaffected.
+//
+// NOTE the asymmetry this does NOT cover, verified on live PG 18.3: `concat`,
+// `concat_ws` and `format`'s %s KEEP the padding, because they take variadic
+// "any" and go through the type's OUTPUT function rather than a bpchar->text
+// cast. goopg already matches PG on all three. Do not "fix" them.
+func coerceBpcharArgDatum(arg optimizer.Expr, d Datum) Datum {
+	if d.Kind != KindString {
+		return d
+	}
+	if t := bpcharArgAsText(arg, d.StringValue()); t != d.StringValue() {
+		return NewStringDatum(t)
+	}
+	return d
+}
+
+// bpcharArgAsText applies upstream's bpchar->text coercion to a value that a
+// TEXT-typed function is about to consume. PostgreSQL has no `lower(bpchar)` /
+// `upper(bpchar)`; those calls resolve through the implicit bpchar->text cast,
+// which is `rtrim1` (pg_proc.dat oid 401, "convert char(n) to text"), so the
+// blank padding is STRIPPED before the function ever sees the value. Measured
+// on PG 18.3 against a stored `char(8)` holding 'bbbb': `lower(c)` is 'bbbb',
+// four characters, not eight.
+//
+// goopg satisfied this by accident until M0143-0007b's slice 1 flipped bpchar
+// storage from trimmed to blank-padded; since then these functions returned the
+// padded image. The upstream regress cases `select_having` and `select_implicit`
+// caught it (AI-20260922-004850-016) via the rendered column width — the VALUES
+// were right, only their width was wrong, which is why every value-comparing
+// gate stayed green.
+//
+// The argument's DECLARED type is what decides this, not the datum: a padded
+// image is indistinguishable from a text value that genuinely ends in spaces.
+// `declaredBpcharTypmod` returns >0 only for a width-carrying bpchar, so an
+// unbounded `bpchar` and every non-bpchar argument are passed through untouched.
+func bpcharArgAsText(arg optimizer.Expr, s string) string {
+	if declaredBpcharTypmod(arg) > 0 {
+		return strings.TrimRight(s, " ")
+	}
+	return s
+}
+
 func declaredBpcharTypmod(e optimizer.Expr) int64 {
 	var name string
 	var typmod int64
@@ -11617,7 +11755,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return d, nil
 	case "current_catalog":
-		return NewStringDatum("postgres"), nil
+		// SQL-standard synonym of current_database(); same value by definition,
+		// so it must resolve through the same helper or the two drift.
+		return NewStringDatum(currentDatabaseName(ctx)), nil
 	case "pg_client_encoding":
 		return evalPgClientEncoding(ctx)
 	case "getdatabaseencoding":
@@ -12030,7 +12170,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// "0" compares correctly. M0118-0009.
 		return NewStringDatum(strconv.FormatFloat(usage, 'g', -1, 64)), nil
 	case "current_database":
-		return NewStringDatum("postgres"), nil
+		return NewStringDatum(currentDatabaseName(ctx)), nil
 	case "current_schema":
 		return currentSchemaFromSearchPath(ctx)
 	case "current_schemas":
@@ -14501,6 +14641,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			n, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
@@ -14519,6 +14660,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
 	case "length":
@@ -14553,7 +14695,25 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// decodes to one RuneError. M0125-0021.
 				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
 			}
-			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
+			// bpchar: PG's `length()` is bpcharlen, which counts characters
+			// AFTER stripping trailing blanks (bcTruelen,
+			// postgres/src/backend/utils/adt/varchar.c) — `length('x'::char(4096))`
+			// is 1, not 4096. goopg used to get that answer by accident,
+			// because a width-carrying bpchar was STORED trimmed; M0143-0007b
+			// slice 1 stores it padded, so the rule has to be applied here
+			// explicitly. Caught by the upstream `strings` regress case, which
+			// is exactly what Hard-won Rule #5 keeps that gate for.
+			//
+			// Note the asymmetry with `octet_length` just below: that one PADS
+			// (bpcharoctetlen returns the raw datum size, so
+			// `octet_length('ab'::char(10))` is 10). Same type, opposite
+			// treatment, because upstream defines the two functions
+			// differently — a sibling pair that must not be "unified".
+			str := s.StringValue()
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				str = strings.TrimRight(str, " ")
+			}
+			return Datum{Kind: KindInt, Int: int64(len([]rune(str)))}, nil
 		}
 	case "octet_length":
 		if len(x.Args) == 1 {
@@ -14572,8 +14732,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			// bpchar: PG's bpcharoctetlen returns the raw datum size, and PG
 			// stores bpchar blank-padded — octet_length('ab'::char(10)) is 10,
-			// not 2. goopg keeps bpchar trimmed in the datum (M0103-0007), so
-			// pad to the declared width first. M0119-0006 (65th slice).
+			// not 2. Since M0143-0007b the datum is padded already, so this is
+			// a no-op on newly written rows — but a row written before that
+			// change is trimmed on disk and still needs the pad. Contrast
+			// `length` above, which STRIPS: bpcharlen and bpcharoctetlen are
+			// deliberately different. M0119-0006 (65th slice).
 			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
 				t := catalog.Type{Name: "char", Args: []int64{tm}}
 				return Datum{Kind: KindInt, Int: int64(len(catalog.PadBpchar(t, s.StringValue())))}, nil
@@ -14583,10 +14746,16 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "bit_length":
 		// PG 18 defines bit_length as a SQL function, octet_length($1) * 8, for
 		// bytea (oid 1810) and text (oid 1811). There is NO bit_length(bpchar):
-		// it resolves through the implicit bpchar→text cast, which trims
-		// trailing spaces, so bit_length('ab'::char(10)) is 16 (2 bytes × 8),
-		// not 80. goopg's bpchar datum is already trimmed (M0103-0007), so the
-		// plain byte length below is the trimmed length. M0119-0006 (65th slice).
+		// it resolves through the implicit bpchar→text cast, and that cast is
+		// `rtrim1` (pg_proc.dat oid 401, "convert char(n) to text"), so the
+		// padding is STRIPPED before the length is taken —
+		// bit_length('ab'::char(10)) is 16 (2 bytes x 8), not 80.
+		//
+		// goopg used to get that for free because the stored datum was already
+		// trimmed. Since M0143-0007b it is padded, so the cast's rule has to be
+		// applied here explicitly, exactly as `length` above does. Measured
+		// against PG 18.3 on a stored char(10) holding 'ab': len 2,
+		// octet_length 10, bit_length 16.
 		if len(x.Args) == 1 {
 			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
@@ -14601,7 +14770,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
 					Pos:     x.Pos()}
 			}
-			return Datum{Kind: KindInt, Int: int64(8 * len(s.StringValue()))}, nil
+			bl := s.StringValue()
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				bl = strings.TrimRight(bl, " ")
+			}
+			return Datum{Kind: KindInt, Int: int64(8 * len(bl))}, nil
 		}
 	case "upper":
 		if len(x.Args) == 1 {
@@ -14609,7 +14782,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(strings.ToUpper(s.StringValue())), nil
+			return NewStringDatum(strings.ToUpper(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "lower":
 		if len(x.Args) == 1 {
@@ -14617,7 +14791,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(strings.ToLower(s.StringValue())), nil
+			return NewStringDatum(strings.ToLower(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "initcap":
 		if len(x.Args) == 1 {
@@ -14625,7 +14800,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(initCap(s.StringValue())), nil
+			return NewStringDatum(initCap(
+				bpcharArgAsText(x.Args[0], s.StringValue()))), nil
 		}
 	case "btrim":
 		// btrim(text [, chars]) — trim chars from both ends
@@ -14662,6 +14838,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
 			// (dobyteatrim / bytealtrim) — same byte-set semantics as btrim.
 			if s.Kind == KindBytes {
@@ -14842,6 +15019,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(strings.ReplaceAll(s.StringValue(), f.StringValue(), t.StringValue())), nil
 		}
 	case "translate":
@@ -14853,6 +15031,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(translateStr(s.StringValue(), f.StringValue(), t.StringValue())), nil
 		}
 	case "strpos", "position":
@@ -14881,6 +15060,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || d.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			fldnum := int(n.Int)
 			// field number is 1 based
 			if fldnum == 0 {
@@ -14990,6 +15170,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			runes := []rune(s.StringValue())
 			cnt := int(n.Int)
 			if cnt < 0 {
@@ -15006,6 +15187,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			runes := []rune(s.StringValue())
 			cnt := int(n.Int)
 			if cnt < 0 {
@@ -15040,6 +15222,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			if s.Kind == KindBytes {
 				// bytea_reverse (postgres/src/backend/utils/adt/varlena.c:3458-3474)
 				// is a plain byte-for-byte reversal, no codepoint awareness.
@@ -15090,6 +15273,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NewStringDatum("NULL"), nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			return NewStringDatum(pgQuoteLiteral(s.StringValue())), nil
 		}
 	case "quote_ident":
@@ -15098,6 +15282,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			// PG's quote_ident only adds double quotes when the identifier
 			// would not survive a re-parse unquoted (uppercase, special chars,
 			// leading digit, empty); a plain lowercase identifier is returned
@@ -15133,6 +15318,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
+			s = coerceBpcharArgDatum(x.Args[0], s)
 			flagsStr := ""
 			start := int64(1)
 			n := int64(1)
@@ -17662,28 +17848,25 @@ case "pg_char_to_encoding":
 			if v < 0 {
 				v = 0 // PG clamps live-tuple estimate to non-negative
 			}
-		case "pg_stat_get_dead_tuples",
-			"pg_stat_get_ins_since_vacuum",
-			"pg_stat_get_mod_since_analyze":
-			// Read from the shared trigger store, NOT the tiered counters:
-			// these three feed autovacuum decisions and must reflect DML
-			// immediately (pending only reaches shared on an explicit
-			// flush), and VACUUM/ANALYZE reset them in place.
-			d, i, m := relStats.triggerSnapshot(oid)
-			switch name {
-			case "pg_stat_get_dead_tuples":
-				v = d
-			case "pg_stat_get_ins_since_vacuum":
-				v = i
-			default:
-				v = m
-			}
+		case "pg_stat_get_dead_tuples":
+			// Read the flushed shared entry (PgStat_StatTabEntry.dead_tuples),
+			// fed by the transactional fold — an aborted xact's inserted+updated
+			// tuples land here as dead — NOT the non-transactional
+			// autovacuum-trigger store, which is launcher-facing only.
+			v = c.deltaDead
 			if v < 0 {
-				v = 0
+				v = 0 // PG clamps dead-tuple estimate to non-negative at flush
 			}
+		case "pg_stat_get_ins_since_vacuum":
+			// Flushed attempted inserts since the last VACUUM (aborted inserts
+			// count — pgstat_relation_flush_cb adds tuples_inserted).
+			v = c.insSinceVacuum
+		case "pg_stat_get_mod_since_analyze":
+			// Flushed committed change events since the last ANALYZE
+			// (tabentry->mod_since_analyze += counts.changed_tuples).
+			v = c.changedTuples
 		case "pg_stat_get_vacuum_count":
-			// No VACUUM-driven relation stats yet; PG reads 0 until first vacuum.
-			v = 0
+			v = c.vacuumCount
 		}
 		return NewIntDatum(v), nil
 	// pg_stat_get_xact_tuples_inserted(oid) → bigint: rows inserted into the
@@ -19626,6 +19809,34 @@ func RegObjectSchemaVisible(ctx *Context, schema string) bool {
 	return false
 }
 
+// currentDatabaseName is what `current_database()` and its SQL-standard synonym
+// `current_catalog` both return: the database this connection is actually bound
+// to, taken from the startup packet via Context.CurrentDatabase.
+//
+// Both used to return the literal "postgres" regardless of the connection, so
+// `psql -d newdb -c "select current_database()"` answered "postgres" even
+// though that database is genuinely isolated — a table created in it is not
+// visible from postgres. The value was wrong, not merely imprecise: a client
+// that routes on current_database() (psql's own prompt, pgAdmin's object
+// browser, migration tools that assert which database they are about to alter)
+// was told it was somewhere it was not.
+//
+// The two are a SIBLING PAIR by definition, not by coincidence: the SQL
+// standard's current_catalog and PostgreSQL's current_database() are the same
+// value (postgres/src/backend/utils/adt/misc.c's current_database, exposed
+// under both spellings), so they resolve through this one helper rather than
+// carrying two copies of the rule.
+//
+// The "postgres" fallback is kept for the embedded/test contexts that never set
+// CurrentDatabase — Context.CurrentDatabase's own doc records that it is empty
+// there — so this changes nothing for them.
+func currentDatabaseName(ctx *Context) string {
+	if ctx != nil && ctx.CurrentDatabase != "" {
+		return ctx.CurrentDatabase
+	}
+	return "postgres"
+}
+
 func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
 	schemas := searchPathSchemas(ctx)
 	if len(schemas) == 0 {
@@ -21216,4 +21427,45 @@ func evalGetDatabaseEncoding(ctx *Context) (Datum, error) {
 		encName = "UTF8"
 	}
 	return NewStringDatum(encName), nil
+}
+
+// isBpcharTypeName reports whether name spells the blank-padded character type.
+// Kept beside the cast that consumes it rather than shared with
+// catalog.PadBpchar's own switch, because that one also requires a length
+// modifier (an unbounded `bpchar` pads to nothing) while the rtrim cast applies
+// to every bpchar regardless of typmod — upstream's rtrim1 takes no typmod.
+func isBpcharTypeName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// isTextTargetTypeName reports whether name is a target the bpchar cast strips
+// its blank padding for.
+//
+// CORRECTION 2026-09-22 (AI-20260922-004850-016): this used to exclude
+// `varchar`, on the stated reasoning that "upstream's bpchar->varchar cast is a
+// separate entry". It IS a separate pg_cast entry, but it names the SAME
+// function — `postgres/src/include/catalog/pg_cast.dat` has
+// `{ castsource => 'bpchar', casttarget => 'varchar', castfunc =>
+// 'text(bpchar)' }`, i.e. rtrim1, exactly as the bpchar->text entry does. So
+// separate-entry did not imply separate-behaviour, and excluding varchar made
+// `CAST(f1 AS varchar)` over a `char(4)` keep its padding. The upstream
+// `union` regress case caught it: `SELECT f1 FROM VARCHAR_TBL UNION SELECT
+// CAST(f1 AS varchar) FROM CHAR_TBL` stopped de-duplicating, because 'a' and
+// 'a   ' are the same value on one side of the cast and different strings on
+// the other.
+//
+// The reverse direction is NOT symmetric and must not be folded in here:
+// varchar->bpchar has `castfunc => '0'` (binary-coercible), and its padding
+// comes from the typmod coercion applied at the CastExpr site, which is where
+// this file applies it.
+func isTextTargetTypeName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "text", "varchar", "character varying":
+		return true
+	}
+	return false
 }

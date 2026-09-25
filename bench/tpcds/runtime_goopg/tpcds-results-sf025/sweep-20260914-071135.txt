@@ -1,0 +1,124 @@
+# TPC-DS SF0.25 goopg sweep — 2026-09-14T07:11:50+09:00
+# goopg: 8a4fa3e79 docs(plan-parity): R126 scope rev 3 — FK constraints do not survive restart, and enforcement goes with them
+# engine-id: 936bbb23d0159fdc8652de87273ccd50443895a4 adac573515d2f130d75ee99e1dd8fd1f328e9924  diff=4bdf29c0c73c
+# build: rebuilt from tree [tree DIRTY in Go sources — the binary is not this commit alone]
+# engine-binary: running=b7fa09be4b65204f on-disk=b7fa09be4b65204f (/home/ryo/work/goopg/goopg/tmp/goopg-bench-bin)
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# planner-flags: GOOPG_RELSIZE_FALLBACK=retired(take2-P1-05) GOOPG_COST_DRIVEN_JOINORDER=retired(M0127-P5.9) GOOPG_MEMOIZE=unset(on) GOOPG_PARALLEL=unset(on) GOOPG_PGSHAPED_DP=unset(on) GOOPG_PGSHAPED_COLLAPSE=retired(take3-C-06) GOOPG_EXISTS_TO_ANY=unset(on) GOOPG_UNNEST_PREDP=unset(on) GOOPG_INDEXKEY_HARVEST=unset(on) GOOPG_NLI_COSTGATE=unset(current) GOOPG_HASH_OUTER_JOIN=unset(off) GOOPG_INDEX_PROBE_MULT=unset(2) GOOPG_MHJ_PACKING_OFF=retired(M0127-P6.2) GOOPG_GS_SHARE_SOURCE=retired(M0125-0048) GOOPG_NARROW_BUILD=unset(on) GOOPG_NARROW_UPPER=unset(on) GOOPG_NARROW_UPPER_SORT=unset(on) GOOPG_NARROW_COST_INPUTS=unset(off) GOOPG_GATHER_PATHS=unset(off) GOOPG_PARTIAL_AGG_PATHS=unset(on) GOOPG_ONEREL_SEARCH=unset(off) GOOPG_PARTIAL_SORT_PATHS=unset(off) GOOPG_PG_HASH_TUPLE_SPILL_COST=unset(off) GOOPG_PG_SORT_RELATION_BYTES_COST=unset(off) GOOPG_HASHAGG_WIDTH_CURRENCY=unset(off)
+Q1   PASS        1s (430ms)      100 rows  ck=n/a
+Q2   PASS        2s (2539ms)     2513 rows  ck=c372ff12ff0235d9
+Q3   PASS        1s (38ms)       30 rows  ck=3bb31a49b1b21bf7
+Q4   PASS        6s (6692ms)        0 rows  ck=1f18d650d205d71d
+Q5   PASS        3s (2706ms)      100 rows  ck=n/a
+Q6   PASS        3s (3365ms)       27 rows  ck=87ec5bd032d11623
+Q7   PASS        1s (739ms)      100 rows  ck=n/a
+Q8   PASS        2s (1756ms)        0 rows  ck=1f18d650d205d71d
+Q9   PASS        1s (826ms)        1 rows  ck=a70e24a9b0f43963
+Q10  PASS        1s (678ms)        0 rows  ck=1f18d650d205d71d
+Q11  PASS        3s (3319ms)        0 rows  ck=1f18d650d205d71d
+Q12  PASS        0s (113ms)      100 rows  ck=n/a
+Q13  PASS        1s (596ms)        1 rows  ck=4d550faf1f8a3c40
+Q14  PASS       25s (24878ms)      200 rows  ck=n/a
+Q15  PASS        0s (217ms)       88 rows  ck=accf3f52f5757e39
+Q16  PASS        1s (900ms)        1 rows  ck=6e6311159ff5d714
+Q17  PASS        0s (327ms)        0 rows  ck=1f18d650d205d71d
+Q18  PASS        1s (439ms)      100 rows  ck=n/a
+Q19  PASS        0s (701ms)      100 rows  ck=n/a
+Q20  PASS        1s (178ms)      100 rows  ck=n/a
+Q21  PASS        0s (511ms)      100 rows  ck=n/a
+Q22  PASS        3s (2571ms)      100 rows  ck=n/a
+Q23  PASS       20s (20146ms)        1 rows  ck=00f53003bda23764
+Q24  PASS        1s (474ms)        0 rows  ck=d4ba2394ffbd157c
+Q25  PASS        0s (546ms)        0 rows  ck=1f18d650d205d71d
+Q26  PASS        1s (380ms)      100 rows  ck=n/a
+Q27  PASS        0s (607ms)      100 rows  ck=n/a
+Q28  PASS        3s (3095ms)        1 rows  ck=58f05f6812160030
+Q29  PASS        1s (296ms)        0 rows  ck=1f18d650d205d71d
+Q30  PASS        0s (169ms)       11 rows  ck=d86c59e4b9736e08
+Q31  PASS        3s (2674ms)        3 rows  ck=6ee894d4093b804a
+Q32  PASS        0s (622ms)        1 rows  ck=a55f36d3bf196bce
+Q33  PASS        1s (620ms)      100 rows  ck=n/a
+Q34  PASS        1s (788ms)       87 rows  ck=9fbbae9bf5176a02
+Q35  PASS        2s (2154ms)      100 rows  ck=n/a
+Q36  SKIP (oracle: SKIP_QUERYGEN)
+Q37  PASS        0s (255ms)        0 rows  ck=1f18d650d205d71d
+Q38  PASS        4s (3817ms)        1 rows  ck=77188220d949e451
+Q39  PASS        5s (4669ms)       32 rows  ck=9adc1bf3ad0f084c
+Q40  PASS        0s (580ms)      100 rows  ck=n/a
+Q41  PASS        8s (8835ms)        1 rows  ck=7b2c30faa474fb80
+Q42  PASS        1s (766ms)       10 rows  ck=1f306df2d30e74ba
+Q43  PASS        2s (1538ms)        6 rows  ck=981d5ed909d03ba3
+Q44  PASS        1s (1111ms)       10 rows  ck=9b00efc9629a92e6
+Q45  PASS        0s (168ms)        3 rows  ck=96d59766c4f99cd8
+Q46  PASS        1s (1064ms)      100 rows  ck=n/a
+Q47  PASS        2s (1892ms)      100 rows  ck=n/a
+Q48  PASS        3s (2338ms)        1 rows  ck=27f2cdd050408599
+Q49  PASS        0s (85ms)       17 rows  ck=847b6be863d3e8ce
+Q50  PASS        0s (112ms)        6 rows  ck=6270f4e3d38a4eed
+Q51  PASS        1s (1544ms)      100 rows  ck=n/a
+Q52  PASS        1s (681ms)      100 rows  ck=n/a
+Q53  PASS        1s (437ms)      100 rows  ck=n/a
+Q54  PASS        1s (1504ms)        0 rows  ck=1f18d650d205d71d
+Q55  PASS        1s (823ms)       68 rows  ck=fe343d36717a4fb5
+Q56  PASS        1s (620ms)      100 rows  ck=n/a
+Q57  PASS        1s (1127ms)      100 rows  ck=n/a
+Q58  PASS        2s (2103ms)        0 rows  ck=1f18d650d205d71d
+Q59  PASS        1s (670ms)      100 rows  ck=n/a
+Q60  PASS        0s (626ms)      100 rows  ck=n/a
+Q61  PASS        2s (1318ms)        1 rows  ck=4766027020fae308
+Q62  PASS        0s (613ms)      100 rows  ck=n/a
+Q63  PASS        1s (483ms)      100 rows  ck=n/a
+Q64  PASS        1s (1097ms)        1 rows  ck=e1fc5695d951684e
+Q65  PASS        2s (1951ms)      100 rows  ck=n/a
+Q66  PASS        1s (931ms)        5 rows  ck=f0996919225fee99
+Q67  PASS        8s (8245ms)      100 rows  ck=n/a
+Q68  PASS        1s (1058ms)      100 rows  ck=n/a
+Q69  PASS        1s (726ms)      100 rows  ck=n/a
+Q70  SKIP (oracle: SKIP_QUERYGEN)
+Q71  PASS        2s (1550ms)      290 rows  ck=e9f1fcd7c28a1f8f
+Q72  PASS        1s (821ms)      100 rows  ck=n/a
+Q73  PASS        0s (748ms)        0 rows  ck=1f18d650d205d71d
+Q74  PASS        2s (1527ms)        0 rows  ck=1f18d650d205d71d
+Q75  PASS        2s (2321ms)      100 rows  ck=n/a
+Q76  PASS        1s (514ms)      100 rows  ck=n/a
+Q77  PASS        1s (703ms)       44 rows  ck=eb9e091ac7669153
+Q78  PASS        5s (4861ms)       15 rows  ck=c06cf981a7819a37
+Q79  PASS        1s (1208ms)      100 rows  ck=n/a
+Q80  PASS        2s (1628ms)      100 rows  ck=n/a
+Q81  PASS        0s (427ms)       58 rows  ck=1d491680786cf5a1
+Q82  PASS        0s (257ms)        0 rows  ck=1f18d650d205d71d
+Q83  PASS        1s (828ms)        1 rows  ck=9480cc8e8c967db7
+Q84  PASS        0s (64ms)        4 rows  ck=0bd76cf1b8b345c1
+Q85  PASS        1s (234ms)        0 rows  ck=1f18d650d205d71d
+Q86  SKIP (oracle: SKIP_QUERYGEN)
+Q87  PASS        3s (3862ms)        1 rows  ck=daa38faef432c025
+Q88  PASS       10s (9771ms)        1 rows  ck=565313322fa6dbbf
+Q89  PASS        1s (951ms)      100 rows  ck=n/a
+Q90  PASS        1s (508ms)        1 rows  ck=ae3e8371b4300ef3
+Q91  PASS        0s (84ms)        0 rows  ck=1f18d650d205d71d
+Q92  PASS        0s (303ms)        1 rows  ck=26c02866b1827f1b
+Q93  PASS        0s (39ms)        0 rows  ck=1f18d650d205d71d
+Q94  PASS        1s (293ms)        1 rows  ck=4349297292f61686
+Q95  PASS        3s (3348ms)        1 rows  ck=91da30ff26d84150
+Q96  PASS        0s (245ms)        1 rows  ck=cfdf49107affebbc
+Q97  PASS        1s (919ms)        1 rows  ck=fac28379b5f7265c
+Q98  PASS        1s (275ms)     1406 rows  ck=0601fac905d15590
+Q99  PASS        1s (1175ms)       90 rows  ck=077e581917849c17
+
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+
+# status-delta: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/sweep-20260914-063745.txt -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/sweep-20260914-071135.txt
+#   old: 8a4fa3e79 docs(plan-parity): R126 scope rev 3 — FK constraints do not survive restart, and enforcement goes with them
+#   new: 8a4fa3e79 docs(plan-parity): R126 scope rev 3 — FK constraints do not survive restart, and enforcement goes with them
+TOTAL      179s -> 184s (+2.8%)  <== aggregate move; no single query need cross 2.0x for this to matter
+=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=0 total-delta=+2.8% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+# The status-delta channel is NON-BLOCKING: it never changes this gate's exit status.
+
+# plan-diff: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/plans-20260914-063745.txt -> /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf025/plans-20260914-071135.txt
+#   old: 8a4fa3e79 docs(plan-parity): R126 scope rev 3 — FK constraints do not survive restart, and enforcement goes with them
+#   new: 8a4fa3e79 docs(plan-parity): R126 scope rev 3 — FK constraints do not survive restart, and enforcement goes with them
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+# plan shapes identical (noise floor is zero — see header)
+# The plan channel is NON-BLOCKING: it never changes this gate's exit status.

@@ -1,0 +1,4 @@
+     14 leaf=*optimizer.CTEScan
+      9 leaf=*optimizer.Project
+      7 leaf=*optimizer.SetOp
+      2 leaf=*optimizer.Filter

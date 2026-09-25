@@ -76,9 +76,11 @@ func TestLoweredScalarProjectedKeyHits(t *testing.T) {
 	}
 }
 
-// TestLoweredExplainRendersParam: the SubPlan subtree's correlation
-// now prints as a PG-style $N exec param instead of a bare column name.
-func TestLoweredExplainRendersParam(t *testing.T) {
+// TestLoweredExplainRendersParamSource: PG deparses a PARAM_EXEC supplied
+// by an ancestor SubPlan as its source outer Var, with forced relation
+// qualification. The internal slot remains the execution mechanism; EXPLAIN
+// must describe where its value comes from rather than exposing `$N`.
+func TestLoweredExplainRendersParamSource(t *testing.T) {
 	// M0125-0036: this probe's `= -999 OR EXISTS (…)` shape is what the
 	// EXISTS→ANY conversion consumes; the correlated-SubPlan path it
 	// grades is still live for every EXISTS the conversion declines.
@@ -97,7 +99,10 @@ func TestLoweredExplainRendersParam(t *testing.T) {
 	if !strings.Contains(out, "SubPlan 1") {
 		t.Fatalf("no SubPlan subtree in EXPLAIN:\n%s", out)
 	}
-	if !strings.Contains(out, "$0") {
-		t.Errorf("lowered correlation does not render as $0:\n%s", out)
+	if !strings.Contains(out, "Filter: (a = t1.a)") {
+		t.Errorf("lowered correlation does not render its qualified source:\n%s", out)
+	}
+	if strings.Contains(out, " = $0") {
+		t.Errorf("lowered correlation still exposes its internal slot:\n%s", out)
 	}
 }

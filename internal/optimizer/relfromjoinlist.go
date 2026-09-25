@@ -46,7 +46,7 @@ package optimizer
 // # Which clauses each problem sees
 //
 // Each problem builds its own clause list from the statement's conjuncts with
-// its OWN `cumOffsets` — one entry per joinlist ITEM, not per FROM item
+// its OWN `itemSpans` — one entry per joinlist ITEM, not per FROM item
 // (`searchOneProblem`). That single substitution does all the placement work,
 // because `relidsOfExpr` (joinrestrict.go:334) already answers "which items does
 // this expression touch" and declines the expression outright when a column
@@ -72,7 +72,6 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 )
 
 // joinlistProblem is everything one statement's joinlist recursion reads. It is
@@ -93,10 +92,13 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
-	// cumOffsets[i] is FROM item i's first binding coordinate, with a
-	// terminating entry for the total width — the coordinate space
-	// `relidsOfExpr` and `baseOffset` are both written in.
-	cumOffsets []int
+	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
+	// the coordinate space `relidsOfExpr` and `baseOffset` are both
+	// written in. One entry per FROM item: the leaf's own span, not an
+	// inference from the next leaf's lo, so a NON-CONTIGUOUS span space
+	// — buildLeafSpans's out-of-band synthetic (Semi/Anti RHS) leaves —
+	// keeps each leaf's true window (P0-H11).
+	leafSpans []leafSpan
 
 	cp  costParams
 	cat catalog.Catalog
@@ -171,6 +173,20 @@ type joinlistRel struct {
 	// `table`, which is what makes every base-relation-only producer
 	// (`addParameterizedIndexPaths`, the sizer's uniqueness proofs) decline it.
 	info baseRelInfo
+	// rel is the `RelOptInfo` the search built for this item, carried out
+	// rather than discarded (R21 slice 1, plan-parity-fix-take2, K24).
+	//
+	// It is the object the UPPER stages need and cannot currently see:
+	// `PartialPathlist` (so partial aggregation can be built BELOW a Gather,
+	// as `create_partial_grouping_paths` does from
+	// `input_rel->partial_pathlist`, planner.c:7351 — K23) and `Pathkeys` (so
+	// a path delivering a required ordering is credited for it and a sorted
+	// aggregate can win the contest PG's wins — K12 slice B).
+	//
+	// Slice 1 only CARRIES it. Nothing consumes it yet, so no plan can move;
+	// that is the slice's gate. nil for a leaf item, which has no searched
+	// rel of its own.
+	rel *RelOptInfo
 	// lo, hi is the half-open range of FROM items this rel covers. Contiguity
 	// is an invariant, checked where it is established.
 	lo, hi int
@@ -182,13 +198,19 @@ type joinlistRel struct {
 // `jl` must cover every FROM item exactly once and in order, which is what
 // `deconstructJointree` produces by construction; a joinlist that does not is a
 // producer bug and is reported rather than planned around.
-func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
+// R21 slice 1 (plan-parity-fix-take2, K24): returns the search's own
+// `*RelOptInfo` alongside the node. It used to be discarded here, which is
+// why every upper stage works on finished Nodes and neither partial
+// aggregation (K23) nor the ordering contest (K12 slice B) can see the
+// paths PG's upper planner consumes. Nil when the search declined or
+// short-circuited to a raw leaf.
+func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, *RelOptInfo, error) {
 	if err := validateJoinlistProblem(jl, prob); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	r, err := makeRelFromJoinlist(jl, prob, prob.tupleFraction)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// M0134-0188: a ONE-leaf problem short-circuits inside makeRelFromJoinlist
 	// ("single joinlist node, so we're done") and comes back as the RAW leaf —
@@ -213,10 +235,10 @@ func planJoinlistSearch(jl joinlist, prob *joinlistProblem) (Node, error) {
 	if _, _, rebuildable := scanLeafFor(r.node); rebuildable && r.info.table != nil && jl.nrels() == 1 {
 		r, err = prob.searchOneProblem([]joinlistRel{r}, prob.tupleFraction)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return r.node, nil
+	return r.node, r.rel, nil
 }
 
 // validateJoinlistProblem checks the caller's inputs against each other. Every
@@ -235,14 +257,14 @@ func validateJoinlistProblem(jl joinlist, prob *joinlistProblem) error {
 		return fmt.Errorf("join search: %d bindings but %d scans and %d rel infos",
 			n, len(prob.scans), len(prob.relInfos))
 	}
-	if len(prob.cumOffsets) != n+1 {
-		return fmt.Errorf("join search: %d FROM items need %d cumulative offsets, got %d",
-			n, n+1, len(prob.cumOffsets))
+	if len(prob.leafSpans) != n {
+		return fmt.Errorf("join search: %d FROM items need %d leaf spans, got %d",
+			n, n, len(prob.leafSpans))
 	}
-	for i := 1; i < len(prob.cumOffsets); i++ {
-		if prob.cumOffsets[i] <= prob.cumOffsets[i-1] {
-			return fmt.Errorf("join search: cumulative offsets are not ascending at item %d (%d after %d)",
-				i, prob.cumOffsets[i], prob.cumOffsets[i-1])
+	for i, sp := range prob.leafSpans {
+		if sp.lo < 0 || sp.hi <= sp.lo {
+			return fmt.Errorf("join search: leaf %d has invalid binding-coordinate span [%d,%d)",
+				i, sp.lo, sp.hi)
 		}
 	}
 	// The joinlist must be a partition of the FROM items into contiguous runs,
@@ -486,124 +508,75 @@ func sjInfosInItemSpace(list []*SpecialJoinInfo, items []joinlistRel) ([]*Specia
 // must exist before `addBaseRelIndexPaths`, because that is the list an index
 // path is parameterised BY (`create_index_paths` after `deconstruct_jointree`,
 // allpaths.c:191), and every initial rel must already carry its cheapest slots
-// leafIsDerivedInput reports whether a statement leaf is a derived
-// (statistics-less) input: a CTE scan, a recursive CTE's worktable, a
-// FROM-subquery, or a function scan. It tests the leaf's NODE TYPE, and it
-// exists because the obvious test — `relInfos[leaf].table == nil` — is WRONG
-// for the case that matters most. `with.go` hands every CTE binding a
-// synthesised `&catalog.Table{Name: cte.Name, Columns: cols}` so that column
-// resolution works, and that table has no statistics behind it. To the
-// `table == nil` test a CTE scan therefore looks like a base relation, and
-// TPC-DS Q78's three CTE leaves classified as `derived=[false false false]`
-// (traced 2026-09-06): the firewall below was reached with both LEFT sjinfos
-// in hand and declined nothing, and the search ran three rows=1 leaves into
-// an epsilon Nested Loop victory (3.07 vs Hash 3.09) — 15 s became a 327 s
-// timeout. The `table == nil` arm is kept as a fallback for a leaf that has
-// no binding table at all.
-func leafIsDerivedInput(scan Node, info baseRelInfo) bool {
-	// A statement leaf reaches the search WRAPPED: a CTE output with a
-	// pushed-down predicate is `*Filter{Child: *CTEScan}`, not a bare
-	// `*CTEScan`, and a type switch on the top node sees only the Filter.
-	// That is exactly how TPC-DS Q78's three leaves escaped the first
-	// version of this classifier (traced 2026-09-06: `scan=*optimizer.Filter
-	// table=true` for all three, `derived=[false false false]`). Descend
-	// through single-child wrappers to the scan underneath, then classify.
-	for {
-		switch x := scan.(type) {
-		case *Filter:
-			scan = x.Child
-			continue
-		case *Project:
-			scan = x.Child
-			continue
-		}
-		break
-	}
-	switch scan.(type) {
-	case *CTEScan, *WorkTableScan:
-		return true
-	}
-	return info.table == nil
-}
 
-// problemPairsOuterWithDerived reports whether any OUTER hand in sjis
-// (already remapped to this problem's item space by sjInfosInItemSpace)
-// touches an item whose STATEMENT leaves include a derived (table-less)
-// FROM item — a CTE scan, FROM-subquery, or function scan. Derived inputs
-// carry no statistics, so an outer join over them is the catastrophic-choice
-// shape C-04a §4 names and the problem must decline (see the firewall in
-// searchOneProblem).
-//
-// The check reads through to statement leaves (prob.relInfos[leaf].table)
-// rather than trusting items[i].info.table: a searched sub-problem's rel is
-// table-less by construction, and declining on that would refuse every
-// nested outer join, including base-only ones. Syn (not Min) sides are
-// tested — Min can narrow to one leaf of a multi-leaf item, and the question
-// is whether the join READS a derived input, not whether the ordering
-// constraint names it.
-func problemPairsOuterWithDerived(sjis []*SpecialJoinInfo, items []joinlistRel, prob *joinlistProblem) bool {
-	if len(sjis) == 0 || prob == nil {
-		return false
+// leafSpanWindow returns the single [lo,hi) binding-coordinate window the
+// leaf range [lo,hi) covers, and whether that coverage is a contiguous
+// TILING — every member span disjoint and the union gap-free. The second
+// return is what keeps a mixed real+synthetic range from being misread as
+// one window: buildLeafSpans places synthetic (Semi/Anti RHS) leaves
+// out-of-band after the total real width, so a range that contains a
+// synthetic leaf and omits a real one has a HOLE no single window
+// expresses (P0-H11). Callers decline rather than publish a window that
+// would swallow a non-member leaf's columns.
+func leafSpanWindow(spans []leafSpan, lo, hi int) (leafSpan, bool) {
+	if lo < 0 || hi > len(spans) || lo >= hi {
+		return leafSpan{}, false
 	}
-	derived := make([]bool, len(items))
-	anyDerived := false
-	for i, it := range items {
-		for leaf := it.lo; leaf < it.hi; leaf++ {
-			if leaf < 0 || leaf >= len(prob.relInfos) {
-				continue
-			}
-			if leafIsDerivedInput(prob.scans[leaf], prob.relInfos[leaf]) {
-				derived[i] = true
-				anyDerived = true
-				break
-			}
+	base := spans[lo].lo
+	end := spans[lo].hi
+	for i := lo + 1; i < hi; i++ {
+		sp := spans[i]
+		if sp.lo < base {
+			base = sp.lo
+		}
+		if sp.hi > end {
+			end = sp.hi
 		}
 	}
-	if !anyDerived {
-		return false
+	covered := 0
+	for i := lo; i < hi; i++ {
+		covered += spans[i].hi - spans[i].lo
 	}
-	for _, sj := range sjis {
-		if sj == nil {
-			continue
-		}
-		switch sj.Jointype {
-		case parser.JoinLeft, parser.JoinRight, parser.JoinFull:
-		default:
-			continue
-		}
-		touched := sj.SynLefthand | sj.SynRighthand
-		for i := range items {
-			if !derived[i] {
-				continue
-			}
-			if touched&(1<<uint(i)) != 0 {
-				return true
-			}
-		}
+	if covered != end-base {
+		return leafSpan{}, false
 	}
-	return false
+	return leafSpan{lo: base, hi: end}, true
 }
 
 // before `joinSearch` compares anything.
 func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction float64) (joinlistRel, error) {
 	lo, hi := items[0].lo, items[len(items)-1].hi
-	base := prob.cumOffsets[lo]
-	width := prob.cumOffsets[hi] - base
-
+	// One entry per ITEM: the coordinate space this problem's clause list is
+	// resolved in (file header). A column outside every item's span resolves
+	// to no item and its clause is declined here — which is how a clause
+	// reaching out of a sub-problem ends up placed by the enclosing one.
+	// Each item's window is the tiling of ITS leaves' spans — contiguous for
+	// every shape reachable today (a sub-joinlist range covers only real
+	// leaves, whose spans are in-band and contiguous; a synthetic Semi/Anti
+	// RHS leaf is always a single-leaf item). A mixed real+synthetic
+	// multi-leaf item would not tile a single window and declines instead
+	// of silently swallowing a neighbour leaf's columns (P0-H11).
+	window, okWindow := leafSpanWindow(prob.leafSpans, lo, hi)
+	if !okWindow {
+		return joinlistRel{}, fmt.Errorf(
+			"join search: FROM items [%d,%d) do not tile a contiguous binding-coordinate window",
+			lo, hi)
+	}
+	base, width := window.lo, window.hi-window.lo
 	bindings := make([]rangeBinding, len(items))
 	scans := make([]Node, len(items))
 	infos := make([]baseRelInfo, len(items))
-	// One entry per ITEM: the coordinate space this problem's clause list is
-	// resolved in (file header). The terminating entry is the problem's own end,
-	// so a column outside `[base, base+width)` resolves to no item and its
-	// clause is declined here — which is how a clause reaching out of a
-	// sub-problem ends up placed by the enclosing one.
-	cum := make([]int, len(items)+1)
+	itemSpans := make([]leafSpan, len(items))
 	for i, it := range items {
 		bindings[i], scans[i], infos[i] = it.binding, it.node, it.info
-		cum[i] = prob.cumOffsets[it.lo]
+		sp, okSp := leafSpanWindow(prob.leafSpans, it.lo, it.hi)
+		if !okSp {
+			return joinlistRel{}, fmt.Errorf(
+				"join search: item covering FROM items [%d,%d) does not tile a contiguous binding-coordinate window",
+				it.lo, it.hi)
+		}
+		itemSpans[i] = sp
 	}
-	cum[len(items)] = prob.cumOffsets[hi]
 
 	// C-04a fix (Q72): `root->join_info_list` is written in STATEMENT-LEAF
 	// coordinates, and this problem searches in ITEM coordinates. They are the
@@ -620,31 +593,6 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
-	// C-04a firewall (Q78): a problem that pairs an OUTER hand with a
-	// derived (table-less) input declines. Derived inputs — CTE scans,
-	// FROM-subqueries, function scans — carry no statistics (B-06's
-	// CTE-output synthesis is inert; a searched sub-problem's rel is
-	// table-less by construction too, but the check below reads through
-	// to STATEMENT leaves so those never trigger it), so their rows are
-	// defaults and guards. The search's algorithm comparison on those
-	// defaults is the catastrophic-choice shape C-04a §4 names: Q78's
-	// outer problem costed Nested Loop 3.07 against Hash 3.09 with every
-	// path at rows=1 (the surviving IS NULL priced from the base
-	// 	column's stanullfrac=0 — rowest A3), and the epsilon victory ran
-	// Nested Loop with a Join Filter over full multi-year CTE outputs
-	// (15 s Hash shape → 327 s timeout). C-04a's §4 floor
-	// (applyOuterJoinRowFloor) cannot see it: the floor is the
-	// preserved side's rows, and the lie is IN the preserved side's
-	// rows. Declining falls back to the syntactic tree (03 §4.2), whose
-	// legacy rewrites hash outer joins without a cost comparison — the
-	// pre-C-04a shape. Base-leaf outer problems (Q72) are unaffected;
-	// inner-only problems over derived inputs are unaffected (their
-	// rows=1 is A4-expected and values-passing). Resume: lift when B-06
-	// wires CTE-output stats (TODO_ALL B-06 step 4).
-	if problemPairsOuterWithDerived(sjis, items, prob) {
-		traceSeamDecline("outer-over-derived", len(prob.bindings), len(items))
-		return joinlistRel{}, fmt.Errorf("join search: problem pairs an outer join with a derived input, which carries no statistics")
-	}
 	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
 	if err != nil {
 		return joinlistRel{}, err
@@ -656,7 +604,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, cum)
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
@@ -686,7 +634,26 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// Target is computed from NeededCols, like the serial scans' (P4-01).
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
+	// M0145-0004: `add_paths_to_append_rel`'s partial arm — hoist the
+	// Parallel Append candidate a marked UNION ALL leaf's nested scope
+	// already filed onto the leaf rel (jointreeappendrel.go). Inert on
+	// the legacy arm, which never sets the mark.
+	s.addAppendRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
+	// R121 Slice A(i): narrow the COST width triple on every base-rel scan
+	// path, in ONE sweep after all of them exist.
+	//
+	// A sweep rather than five constructor edits, deliberately: it cannot miss
+	// a producer (the prebuilt SeqScan above ran before the stamps and could
+	// not narrow itself; partial/index/bitmap/parameterised producers each
+	// build fresh Paths that set no triple), and it makes the all-or-none
+	// PER REL rule hold by construction rather than by five agreeing call
+	// sites. Placed before addBaseRelGatherPaths so Gather/GatherMerge inherit
+	// an already-narrowed child (Slice A(ii)).
+	//
+	// No re-costing is needed: costSeqscan is width-independent, so the
+	// already-costed prebuilt path's cost and setCheapest verdict do not move.
+	s.narrowBaseRelCostWidths()
 	// C-19d: `generate_useful_gather_paths` for every BASE rel, which
 	// upstream runs at the end of `set_rel_pathlist` (allpaths.c) — after
 	// every base path producer, before the rel's set_cheapest — and ONLY when
@@ -739,31 +706,44 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// padded coordinate — the totality assertion stays loud for real
 		// producer bugs (M0134-0187, DESIGN §21).
 		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
-			if !prob.neededColsKnown {
-				return SchemaColumn{}, false
-			}
 			for i := range items {
-				if coord >= cum[i] && coord < cum[i+1] {
-					leafSchema := scans[i].Output()
-					pos := coord - cum[i]
-					if pos < 0 || pos >= len(leafSchema) {
-						return SchemaColumn{}, false
-					}
-					col := leafSchema[pos]
-					if col.Name == "" {
-						return SchemaColumn{}, false
-					}
-					if prob.outputColsKnown && prob.outputCols != nil {
-						if prob.outputCols[col.Name] {
-							return SchemaColumn{}, false
-						}
-						return col, true
-					}
-					if prob.neededCols[col.Name] {
+				sp := itemSpans[i]
+				if coord < sp.lo || coord >= sp.hi {
+					continue
+				}
+				leafSchema := scans[i].Output()
+				pos := coord - sp.lo
+				if pos < 0 || pos >= len(leafSchema) {
+					return SchemaColumn{}, false
+				}
+				col := leafSchema[pos]
+				if col.Name == "" {
+					return SchemaColumn{}, false
+				}
+				// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
+				// projects its RHS columns above itself, so nothing outside
+				// the search can ever reference a semiAnti synthetic leaf's
+				// own coordinate range — it is always fillable, independent
+				// of the statement's needed/output-column sets (which may
+				// even be unknown here). Checked before neededColsKnown
+				// because that gate exists for the OTHER leaf kinds, where
+				// "unknown" must fail closed.
+				if infos[i].isSemiAntiSyntheticLeaf {
+					return col, true
+				}
+				if !prob.neededColsKnown {
+					return SchemaColumn{}, false
+				}
+				if prob.outputColsKnown && prob.outputCols != nil {
+					if prob.outputCols[col.Name] {
 						return SchemaColumn{}, false
 					}
 					return col, true
 				}
+				if prob.neededCols[col.Name] {
+					return SchemaColumn{}, false
+				}
+				return col, true
 			}
 			return SchemaColumn{}, false
 		}),
@@ -777,5 +757,8 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1},
 		lo:      lo,
 		hi:      hi,
+		// R21 slice 1: the chosen path's parent rel — the search's own
+		// RelOptInfo, which used to end here.
+		rel: p.Rel,
 	}, nil
 }

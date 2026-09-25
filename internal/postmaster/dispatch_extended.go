@@ -124,6 +124,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			}
 			return &extendedQueryResult{CommandTag: tag}, nil
 		}
+		// DISCARD ALL's session-layer half, as on the simple path (dispatch.go).
+		if ds, ok := stmt.(*parser.DiscardStmt); ok && ds.Mode == "ALL" {
+			s.discardAllSessionState(connTx, nil)
+		}
 		var perr error
 		node, perr = optimizer.PlanWithSettings(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid), sessionPlannerSettings(sess))
 		if perr != nil {
@@ -575,6 +579,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	if err := op.Close(); err != nil {
 		return nil, newExtendedQueryError(err)
 	}
+	res.NoticeFrames = executorNoticeFrames(ectx)
 	// End-of-statement drain for DEFERRABLE (but not currently deferred-to-
 	// COMMIT) UNIQUE/PK checks queued by this Execute, mirroring the
 	// simple-query dispatcher's identical hook (dispatch.go). Extended Execute

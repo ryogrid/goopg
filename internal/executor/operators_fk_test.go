@@ -180,3 +180,46 @@ func TestFKViolationPartitionRoutedShape(t *testing.T) {
 	}
 }
 
+// TestFKInsertAfterParentHotUpdate pins the index-probe FK check against a
+// HOT-updated parent: goopg's non-key UPDATE builds a same-page version
+// chain and the unique index keeps referencing the chain ROOT line pointer,
+// which now holds a dead tuple. scanIndexForFKMatch must walk the chain to
+// the visible member exactly like followHOTChainNoCopy does for regular
+// index scans — probing the raw pointer alone reported "no match" and made
+// every child INSERT fail 23503 once the parent had been non-key-updated
+// (M0142-0003g regression; isolation specs fk-contention / fk-deadlock /
+// update-locked-tuple).
+func TestFKInsertAfterParentHotUpdate(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE parent_fk_hot (a int PRIMARY KEY, b text)"); err != nil {
+		t.Fatalf("CREATE TABLE parent_fk_hot: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE child_fk_hot (a int NOT NULL REFERENCES parent_fk_hot)"); err != nil {
+		t.Fatalf("CREATE TABLE child_fk_hot: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO parent_fk_hot VALUES (42, 'v0')"); err != nil {
+		t.Fatalf("INSERT parent: %v", err)
+	}
+	// Two committed non-key UPDATEs leave a multi-member HOT chain: the
+	// pkey index entry still points at the root, and both root and the
+	// middle member are dead — only a chain walk reaches the live row.
+	if err := runDDL(t, ctx, "UPDATE parent_fk_hot SET b = 'v1'"); err != nil {
+		t.Fatalf("UPDATE parent v1: %v", err)
+	}
+	if err := runDDL(t, ctx, "UPDATE parent_fk_hot SET b = 'v2'"); err != nil {
+		t.Fatalf("UPDATE parent v2: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO child_fk_hot VALUES (42)"); err != nil {
+		t.Fatalf("INSERT child after parent HOT updates: %v", err)
+	}
+	// The negative arm still holds: a key that genuinely does not exist
+	// must raise 23503.
+	if err := runDDL(t, ctx, "INSERT INTO child_fk_hot VALUES (43)"); err == nil {
+		t.Fatal("INSERT child with non-existent key unexpectedly succeeded")
+	} else if execErr, ok := err.(*ExecError); !ok || execErr.Code != "23503" {
+		t.Fatalf("expected 23503, got %T: %v", err, err)
+	}
+}
+

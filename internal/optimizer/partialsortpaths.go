@@ -53,6 +53,7 @@ package optimizer
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -164,6 +165,10 @@ func (t *partialSortTournament) workerSideWins() bool {
 // the built plan will actually run at.
 func partialSortRootPays(srt *Sort, workers int, leaderParticipates bool) bool {
 	if partialSortPathsMode == partialSortPathsOff {
+		// R54 Step-0: mode-off upper-gate record. Same reasoning as
+		// `partialAggSplitPays`' mode-off arm — the rule still answers but the
+		// tournament never runs.
+		traceUpperGate("sort", "sort-rule", "mode=off")
 		return sortPartialRootPays(srt)
 	}
 	// DefaultPlannerSettings, not the session's — identical reasoning to
@@ -178,9 +183,20 @@ func partialSortRootPays(srt *Sort, workers int, leaderParticipates bool) bool {
 		// No verdict reachable (no worker budget, or no usable input estimate).
 		// Fall back to the rule rather than inventing an answer: a tournament
 		// that cannot be run is not evidence for either side.
+		// R54 Step-0: declined-tournament record. Like the aggregate arm's
+		// "declined", this is bookkeeping, not a loss — the rule answers.
+		traceUpperGate("sort", "declined", "workers="+strconv.Itoa(workers))
 		return sortPartialRootPays(srt)
 	}
-	return t.workerSideWins()
+	// R54 Step-0: tournament verdict record. "worker" accepts the Gather Merge
+	// shape; "serial" keeps the leader-side sort under a plain Gather.
+	wins := t.workerSideWins()
+	verdict := "serial"
+	if wins {
+		verdict = "worker"
+	}
+	traceUpperGate("sort", verdict, "workers="+strconv.Itoa(workers))
+	return wins
 }
 
 // createPartialSortPaths builds the two candidates and files them on an
@@ -211,7 +227,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	u := newUpperRels()
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	ordered.Rows = inputRows
-	ordered.NCols, ordered.AvgVarBytes = aggInputWidth(child)
+	ordered.NCols, ordered.AvgVarBytes = aggInputWidth(child, nil)
 	ordered.Width = tupleWidth(child.Output())
 	// The caller has already established that the subtree is parallel-capable
 	// (`drivingScan(srt.Child) != nil`), which is what this stands for at the
@@ -239,7 +255,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	// they save exactly the log N factor and nothing else. `cost_sort` charges
 	// the comparisons as STARTUP on top of the input's total, which is why the
 	// two arms are assembled the same way `sortPathForBounded` assembles one.
-	wSort := costSortRun(cp, perWorkerRows, ncols, avgVar, -1)
+	wSort := costSortRunWithWidth(cp, perWorkerRows, ncols, avgVar, -1, ordered.Width, "partial.worker")
 	wSortCost := Cost{Startup: seed.Cost.Total + wSort.Startup, Total: seed.Cost.Total + wSort.Total}
 	// `compute_gather_rows` of the sort path: the per-worker count multiplied
 	// by the divisor it was priced with. Every input row crosses the boundary
@@ -269,7 +285,7 @@ func createPartialSortPaths(srt *Sort, workers int, leaderParticipates bool, cp 
 	// `findPartialSubtree` builds when the verdict is "decline", so the
 	// comparison is against the plan that really gets built.
 	gCost := gatherCost(cp, seed.Cost, inputRows)
-	lSort := costSortRun(cp, inputRows, ncols, avgVar, -1)
+	lSort := costSortRunWithWidth(cp, inputRows, ncols, avgVar, -1, ordered.Width, "partial.leader")
 	gather := &Path{
 		Kind: PathGather, Rel: ordered, Rows: inputRows, Cost: gCost,
 		DisabledNodes: seed.DisabledNodes,

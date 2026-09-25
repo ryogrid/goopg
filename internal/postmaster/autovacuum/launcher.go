@@ -200,6 +200,16 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 func (l *Launcher) runVacuum(log *slog.Logger, tbl *catalog.Table,
 	key string, rel storage.RelFileNode, wrap bool, p avParams, now time.Time) {
 
+	// One VACUUM per relation, first heap pass through second (PG's
+	// autovacuum takes ShareUpdateExclusiveLock with
+	// ConditionalLockRelationOid and skips a table it cannot lock;
+	// M0145-0008v).
+	release, ok := vacuum.TryLockRelationForVacuum(rel)
+	if !ok {
+		log.Info("autovacuum: skipping vacuum, relation busy", "table", key)
+		return
+	}
+	defer release()
 	log.Info("autovacuum: running vacuum", "table", key, "wraparound", wrap)
 	nextXID := storage.TransactionID(0)
 	if l.TxnMgr != nil {
@@ -239,10 +249,17 @@ func (l *Launcher) runVacuum(log *slog.Logger, tbl *catalog.Table,
 	}
 	l.lastVacuum[key] = now
 	executor.ResetVacuumTriggers(tbl.OID)
+	// The index pass autovacuum used to skip, then VACUUM's second heap pass
+	// once every index is clean (lazy_vacuum, vacuumlazy.c; M0145-0008v).
+	if len(stats.DeadTIDs) > 0 && executor.VacuumRelationIndexes(l.Pool, l.TxnMgr, l.Cat, tbl, stats.DeadTIDs) {
+		if _, err := vacuum.VacuumDeadItems(l.Pool, rel, stats.DeadTIDs); err != nil {
+			log.Error("autovacuum: second heap pass failed", "table", key, "error", err)
+		}
+	}
 
 	// relfrozenxid skip-guard: non-aggressive passes that skipped
 	// visible-not-frozen pages cannot advance (vacuumlazy.c:884–892).
-	guardedSkip := !aggressive && stats.SkippedAllVisible > 0
+	guardedSkip := stats.RelfrozenxidGuarded(aggressive)
 	if freezeBelow > 0 && !guardedSkip {
 		switch {
 		case stats.NewFrozenXID != 0:

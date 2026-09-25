@@ -50,7 +50,7 @@ func TestSyntax_Catalog_PgStatActivity(t *testing.T) {
 	if rows[0][1] == "" {
 		t.Error("state is empty")
 	}
-	if rows[0][2] != "client_backend" {
+	if rows[0][2] != "client backend" {
 		t.Errorf("backend_type = %q, want upstream literal %q", rows[0][2], "client backend")
 	}
 }

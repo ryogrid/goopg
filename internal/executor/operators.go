@@ -553,6 +553,21 @@ type filterOp struct {
 	pred          optimizer.Expr
 	ctx           *Context
 	filterRemoved *int64 // set by maybeInstrument; nil when not instrumented
+	batchEnabled  bool
+	batchRows     []*MaterializedSlot
+	batchLeft     []Datum
+	batchRight    []Datum
+	batchResults  []Datum
+	batchPos      int
+	batchRejected int
+	batchErr      error
+	batchNil      bool
+	// noReadAhead pins the per-row path: set by disableFilterReadAhead when a
+	// consumer above reads the scan leaf's CURRENT position (currentTID) in
+	// lockstep with the rows this operator emits. The batch path pulls up to
+	// filterBatchSize child rows before emitting the first, which moves that
+	// position past the row being emitted.
+	noReadAhead bool
 }
 
 func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
@@ -561,6 +576,15 @@ func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
 
 func (o *filterOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	o.batchEnabled = !o.noReadAhead && batchFilterEligible(o.pred)
+	o.batchRows = o.batchRows[:0]
+	o.batchLeft = o.batchLeft[:0]
+	o.batchRight = o.batchRight[:0]
+	o.batchResults = o.batchResults[:0]
+	o.batchPos = 0
+	o.batchRejected = 0
+	o.batchErr = nil
+	o.batchNil = false
 	// EX3-05 Cut A: same consumer contract as projectOp — a ctid predicate
 	// above a sort (`WHERE ctid = ...` over an ORDER BY subquery) reads the
 	// side-channel. The planner pushes quals below sorts, so this rarely
@@ -571,11 +595,24 @@ func (o *filterOp) Open(ctx *Context) error {
 	return o.child.Open(ctx)
 }
 func (o *filterOp) Schema() optimizer.Schema  { return o.child.Schema() }
-func (o *filterOp) Close() error            { return o.child.Close() }
+func (o *filterOp) Close() error {
+	o.batchRows = o.batchRows[:0]
+	o.batchLeft = o.batchLeft[:0]
+	o.batchRight = o.batchRight[:0]
+	o.batchResults = o.batchResults[:0]
+	return o.child.Close()
+}
 
 func (o *filterOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 func (o *filterOp) Next() (TupleSlot, error) {
+	if o.batchEnabled {
+		return o.nextBatch()
+	}
+	return o.nextPerRow()
+}
+
+func (o *filterOp) nextPerRow() (TupleSlot, error) {
 	rejected := 0
 	for {
 		// M0062-followup: a highly-selective filter can drain millions
@@ -606,6 +643,91 @@ func (o *filterOp) Next() (TupleSlot, error) {
 			*o.filterRemoved++
 		}
 		rejected++
+	}
+}
+
+const filterBatchSize = 64
+
+// reserveBatchDatums retains the three same-length vectors for the operator's
+// lifetime. batchRows must still be copied because child slots are borrowed;
+// Datum operands are evaluator-owned scratch and are safe to overwrite on the
+// next refill once all surviving rows have been emitted.
+func (o *filterOp) reserveBatchDatums(n int) {
+	if cap(o.batchLeft) < n {
+		o.batchLeft = make([]Datum, n)
+	} else {
+		o.batchLeft = o.batchLeft[:n]
+	}
+	if cap(o.batchRight) < n {
+		o.batchRight = make([]Datum, n)
+	} else {
+		o.batchRight = o.batchRight[:n]
+	}
+	if cap(o.batchResults) < n {
+		o.batchResults = make([]Datum, n)
+	} else {
+		o.batchResults = o.batchResults[:n]
+	}
+}
+
+func (o *filterOp) nextBatch() (TupleSlot, error) {
+	for {
+		if o.batchPos < len(o.batchRows) {
+			slot := o.batchRows[o.batchPos]
+			o.batchPos++
+			return slot, nil
+		}
+		if o.batchErr != nil {
+			err := o.batchErr
+			o.batchErr = nil
+			return nil, err
+		}
+		if o.batchNil {
+			o.batchNil = false
+			return nil, nil
+		}
+
+		o.batchRows = o.batchRows[:0]
+		o.batchLeft = o.batchLeft[:0]
+		o.batchRight = o.batchRight[:0]
+		o.batchResults = o.batchResults[:0]
+		o.batchPos = 0
+		for len(o.batchRows) < filterBatchSize {
+			if o.batchRejected&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
+			slot, err := o.child.Next()
+			if err != nil {
+				o.batchErr = err
+				break
+			}
+			if slot == nil {
+				o.batchNil = true
+				break
+			}
+			o.batchRows = append(o.batchRows, snapshotBatchSlot(slot))
+		}
+		if len(o.batchRows) == 0 {
+			continue
+		}
+		o.reserveBatchDatums(len(o.batchRows))
+		if err := evalFilterBatch(o.pred, o.batchRows, o.ctx, o.batchLeft, o.batchRight, o.batchResults); err != nil {
+			return nil, err
+		}
+		kept := o.batchRows[:0]
+		for i, result := range o.batchResults {
+			if !result.IsNull() && result.Kind == KindBool && result.BoolValue() {
+				kept = append(kept, o.batchRows[i])
+				continue
+			}
+			if o.filterRemoved != nil {
+				*o.filterRemoved++
+			}
+			o.batchRejected++
+		}
+		o.batchRows = kept
 	}
 }
 

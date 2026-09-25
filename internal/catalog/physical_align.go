@@ -83,6 +83,16 @@ func PhysicalTypeAlign(t Type, tname string) int {
 // align; aligned offsets noop). Tightening the list is a catalog-table
 // edit, not a codec change.
 func PhysicalTypeIsVarlena(t Type) bool {
+	// A user array column carries its element type in Name with IsArray set
+	// (M0143-0004; DU-002 slice 62) rather than an array-form Name like the
+	// catalog-internal "int2[]"/"_oid" spellings below — without this arm an
+	// `int4[]`/`bool[]`/`date[]`/… column falls into the fixed-width element
+	// case and is misclassified as NOT varlena, even though every array is a
+	// varlena ArrayType blob on disk (PhysicalTypeAlign's IsArray arm above
+	// already treats it that way for alignment).
+	if t.IsArray {
+		return true
+	}
 	switch strings.ToLower(t.Name) {
 	case "char":
 		// Single-byte internal "char": fixed-length (not varlena).

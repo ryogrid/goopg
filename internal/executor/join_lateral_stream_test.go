@@ -538,3 +538,129 @@ func TestLateralOuterColumnRefInAggregatingTargetList(t *testing.T) {
 		}
 	})
 }
+
+// M0145-0005 slice 4 — SEMI/ANTI emit-once on the lateral stream.
+//
+// The searched NLI for a pulled EXISTS/NOT EXISTS body is
+// `Join{Algo:NestedLoop, Lateral:true, Type:Semi/Anti}` over a
+// parameterised probe whose join clause lives in the probe's own keys —
+// so `Join.Predicate` can be nil and every row the probe yields is a
+// qualifying match by construction. Before these pins the stream had
+// INNER/LEFT/CROSS arms only: joinOp.Open refused the shape (an NL
+// semi/anti with a nil Predicate is a keyless cross in the non-lateral
+// contract), and had it reached the stream it would have emitted the
+// concatenated pair — a wrong-width row — once per qualifying inner
+// tuple instead of once per outer.
+//
+// The contract the tests pin, which is `nestedLoopIndexJoinOp`'s
+// already-proven one applied to the per-outer-tuple driver:
+//
+//   - SEMI emits the outer row alone, exactly once, on the FIRST
+//     qualifying inner tuple (a second match must not re-emit).
+//   - ANTI emits the outer row alone iff NO inner tuple qualified.
+//   - A probe-produced tuple the residual Predicate rejects is not a
+//     match — the anti fallback must still fire for it.
+
+// drainLateralOuter runs the join to completion and returns each emitted
+// row's first column — semi/anti joins emit the outer row alone, so the
+// output width is 1, not the pair width drainLateral asserts.
+func drainLateralOuter(t *testing.T, o *joinOp) []int64 {
+	t.Helper()
+	var got []int64
+	for {
+		slot, err := o.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		row := slotRow(slot)
+		if len(row) != 1 {
+			t.Fatalf("semi/anti output row width %d, want 1 (outer row alone): %v", len(row), row)
+		}
+		got = append(got, row[0].Int)
+	}
+	return got
+}
+
+// TestLateralSemiJoinEmitsOuterOnce: outer 1 and 3 each have TWO
+// qualifying inner tuples — each must emit its outer row exactly once
+// (emit-once, not once-per-match), and the emitted row is the outer row
+// alone. Outer 2's probe yields nothing and emits nothing.
+func TestLateralSemiJoinEmitsOuterOnce(t *testing.T) {
+	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
+	right := &lateralProbeOp{fanout: func(k int64) []int64 {
+		if k == 2 {
+			return nil
+		}
+		return []int64{k * 10, k*10 + 1}
+	}}
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeSemi, nil), left, right)
+	ctx := NewContext()
+	if err := o.Open(ctx); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got := drainLateralOuter(t, o)
+	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("lateral semi: got %v, want [1 3] — a duplicate means emit-once broke; a missing row means a match was not seen", got)
+	}
+	if right.opens != 3 {
+		t.Fatalf("right re-executed %d times, want 3 — LATERAL still re-runs the probe once per outer tuple", right.opens)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestLateralAntiJoinEmitsUnmatchedOuter: anti is semi's mirror — an
+// outer row whose probe yields any qualifying tuple emits nothing; an
+// outer row with none emits the outer row alone.
+func TestLateralAntiJoinEmitsUnmatchedOuter(t *testing.T) {
+	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
+	right := &lateralProbeOp{fanout: func(k int64) []int64 {
+		if k == 2 {
+			return nil
+		}
+		return []int64{k * 10, k*10 + 1}
+	}}
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeAnti, nil), left, right)
+	ctx := NewContext()
+	if err := o.Open(ctx); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got := drainLateralOuter(t, o)
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("lateral anti: got %v, want [2] — only the outer row with no qualifying inner tuple emits", got)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestLateralAntiJoinResidualRejects: the probe produces a tuple for
+// every outer row, but the residual Predicate rejects it — a produced
+// tuple is not a match (R3-1's rule on the fused driver, applied here),
+// so every outer row emits.
+func TestLateralAntiJoinResidualRejects(t *testing.T) {
+	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
+	right := &lateralProbeOp{fanout: func(k int64) []int64 { return []int64{k * 10} }}
+	// inner.v > 1000 — false for every produced row (v = k*10 ≤ 30).
+	pred := &optimizer.BinaryOp{
+		Op:    parser.OpGt,
+		Left:  &optimizer.ColumnRef{Name: "v", Index: 1},
+		Right: &optimizer.IntegerConst{Value: 1000},
+	}
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeAnti, pred), left, right)
+	ctx := NewContext()
+	if err := o.Open(ctx); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got := drainLateralOuter(t, o)
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("lateral anti with rejecting residual: got %v, want [1 2 3] — a rejected probe row must not count as a match", got)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

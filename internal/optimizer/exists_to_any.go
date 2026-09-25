@@ -381,6 +381,11 @@ func existsToAny(ex *ExistsExpr, hostRow Schema) *InExpr {
 		schema: Schema{baseSchema[subCol.Index]},
 	}
 
+	// Subquery is deliberately left nil (M0142-0008a-3i-route-a). This is
+	// not a copy of the EXISTS — it is a REWRITE of it into `x IN (SELECT
+	// ...)` over a re-projected body, so the original parse tree no longer
+	// describes the plan attached here. A nil body reads as "not
+	// pull-up-able", which is the fail-closed answer and the correct one.
 	return &InExpr{
 		pos: ex.Pos(),
 		Operand: &ColumnRef{

@@ -17,6 +17,7 @@ package executor
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -193,6 +194,40 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		{"pidx", &indexOnlyScanOp{}, func(op Operator, cs *parallelClaimSet) bool {
 			return op.(*indexOnlyScanOp).pidx == cs.pidx
 		}},
+		// M0140-0006c: a *setOp's two branches take INDEPENDENT claim state
+		// (setOpLeft/setOpRight), not the flat pscan/pbm/pidx a bare scan
+		// gets — see parallel_scan.go's attachAll *setOp arm.
+		{"setOpLeft", &setOp{left: &seqScanOp{}, right: &seqScanOp{}}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).left.(*seqScanOp).pscan == cs.setOpLeft.pscan
+		}},
+		{"setOpRight", &setOp{left: &seqScanOp{}, right: &seqScanOp{}}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).right.(*seqScanOp).pscan == cs.setOpRight.pscan
+		}},
+		// M0140-0006c-3: a branch stamped claimed-whole
+		// (SetOp.LeftNonPartial) attaches NO scan state — attachAll wires
+		// the leaf's claimedWhole flag into the op's claim pointer instead
+		// (PG's pa_finished on a non-partial Append subplan). The wiring
+		// counts as attached: the flag IS that branch's claim state.
+		{"claimedWhole", &setOp{
+			plan:  &optimizer.SetOp{Op: parser.SetOpUnion, All: true, LeftNonPartial: true},
+			left:  &seqScanOp{},
+			right: &seqScanOp{},
+		}, func(op Operator, cs *parallelClaimSet) bool {
+			return op.(*setOp).claimLeft == &cs.setOpLeft.claimedWhole
+		}},
+		// M0146-0002: a Parallel Hash join's partial BUILD side takes its
+		// own per-join claim state (hashBuildBranch); the probe side keeps
+		// the flat pscan. One state for both would share a block count
+		// across two relations.
+		{"hashBuildKids", &joinOp{
+			plan:  &optimizer.Join{Algo: optimizer.JoinAlgoHash, Type: optimizer.JoinTypeInner, ParallelHash: true},
+			left:  &seqScanOp{},
+			right: &seqScanOp{},
+		}, func(op Operator, cs *parallelClaimSet) bool {
+			j := op.(*joinOp)
+			build := j.right.(*seqScanOp).pscan
+			return j.left.(*seqScanOp).pscan == cs.pscan && build == cs.hashBuildBranch(j.plan).pscan && build != cs.pscan
+		}},
 	}
 
 	covered := map[string]bool{}
@@ -211,7 +246,22 @@ func TestParallelClaimSetAttachesEveryKind(t *testing.T) {
 		}
 	}
 
-	n := reflect.TypeOf(parallelClaimSet{}).NumField()
+	// M0145-0004a: count claim KINDS, not fields — setOpKidsOnce is lazy-
+	// growth bookkeeping for the nested-setOp claim tree (setOpBranch), not
+	// a claim state a subtree attaches to. A field of any other type is a
+	// new claim kind and must be wired into attachAll AND covered above.
+	n := 0
+	cst := reflect.TypeOf(parallelClaimSet{})
+	onceType := reflect.TypeOf(sync.Once{})
+	mutexType := reflect.TypeOf(sync.Mutex{})
+	for i := 0; i < cst.NumField(); i++ {
+		// sync.Once / sync.Mutex are growth locks for lazily built claim
+		// sets (setOpKidsOnce, hashKidsMu), not claim kinds.
+		if ft := cst.Field(i).Type; ft == onceType || ft == mutexType {
+			continue
+		}
+		n++
+	}
 	if len(covered) != n {
 		t.Fatalf("parallelClaimSet has %d claim kinds but this test covers %d (%v) — "+
 			"a new kind must be wired into attachAll AND covered here, or a Gather "+

@@ -744,3 +744,236 @@ func TestBtIndexCheck_OpClassDamageDetectedNumeric(t *testing.T) {
 		t.Errorf("got %q, want substring %q", err.Error(), want)
 	}
 }
+
+// --- M0119-0006 heapallindexed tier ----------------------------------------
+
+// TestBtIndexCheck_HeapAllIndexedClean is the no-false-positive gate for the
+// heapallindexed tier: a healthy heap+index pair must verify cleanly through
+// both functions and every call shape that enables the tier. The tier probes
+// EVERY snapshot-visible heap tuple's re-formed index key against the leaf
+// entry set, so a single former-recipe bug (encoding, visibility, TID) turns
+// every healthy row into a bogus "lacks matching index tuple" finding.
+func TestBtIndexCheck_HeapAllIndexedClean(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('bic_a_idx', true)",
+		"SELECT bt_index_check('bic_a_idx', true, false)",
+		"SELECT bt_index_parent_check('bic_a_idx', true, false, false)",
+		`SELECT public.bt_index_check(index := 'bic_a_idx', heapallindexed := true)`,
+		`SELECT "public".bt_index_parent_check(index := 'bic_a_idx', heapallindexed := true, rootdescend := false)`,
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: clean index raised: %v", sql, err)
+		}
+	}
+}
+
+// TestBtIndexCheck_HeapAllIndexedDetectsUnindexedTuple is the detection half:
+// a heap tuple that bypassed index maintenance (written directly to the heap
+// page, exactly what a lost index insert looks like) must raise
+// ERRCODE_INDEX_CORRUPTED with upstream's "lacks matching index tuple" report.
+// The phantom is injected in one transaction and checked in the next so its
+// xmin is committed and snapshot-visible.
+func TestBtIndexCheck_HeapAllIndexedDetectsUnindexedTuple(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("expected in-memory catalog")
+	}
+	tbl, ok := im.LookupTable(parser.ObjectName{Name: "bic"})
+	if !ok {
+		t.Fatal("table bic not found")
+	}
+	heapRel := ctx.Catalog.RelFileNode(tbl)
+
+	// Encode the phantom row through the same encoder the write path uses and
+	// append it to the heap WITHOUT touching the index — the corruption this
+	// tier exists to find.
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("materialize xid: %v", err)
+	}
+	body, err := EncodeRowPGCtx(tbl.Columns, Row{NewIntDatum(7), NewStringDatum("seven")}, ctx, 0)
+	if err != nil {
+		t.Fatalf("encode phantom row: %v", err)
+	}
+	tup := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	tup.Header.SetNatts(len(tbl.Columns))
+	tup.Header.Infomask |= storage.HeapXmaxInvalid | storage.HeapHasVarWidth
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: 0})
+	if err != nil {
+		t.Fatalf("pin heap block: %v", err)
+	}
+	s.Lock()
+	if _, err := storage.PageAddHeapTuple(s.Page(), tup); err != nil {
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+		t.Fatalf("inject heap tuple: %v", err)
+	}
+	ctx.Pool.MarkDirty(s)
+	s.Unlock()
+	ctx.Pool.Unpin(s)
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('bic_a_idx', true)",
+		"SELECT bt_index_parent_check('bic_a_idx', true, false, false)",
+	} {
+		_, qerr := runQueryWithErr(ctx, sql)
+		if qerr == nil {
+			t.Errorf("%s: unindexed heap tuple not detected", sql)
+			continue
+		}
+		const want = `lacks matching index tuple`
+		if !strings.Contains(qerr.Error(), want) {
+			t.Errorf("%s: got %q, want substring %q", sql, qerr.Error(), want)
+		}
+		ee, ok := qerr.(*ExecError)
+		if !ok || ee.Code != "XX002" {
+			t.Errorf("%s: error is %v, want XX002 ExecError", sql, qerr)
+		}
+		// The same corruption under heapallindexed := false must stay silent —
+		// the tier is opt-in.
+		if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('bic_a_idx', false)"); err != nil {
+			t.Errorf("heapallindexed=false: clean check raised on unrelated corruption: %v", err)
+		}
+	}
+}
+
+// TestBtIndexCheck_HeapAllIndexedHotUpdate exercises the HOT-chain arm: a
+// heap-only member is probed under its chain ROOT's line pointer, because the
+// index entry still points where the original version was inserted. Updating
+// only the unindexed column takes the HOT path (hotUpdateEligible), so the
+// page afterwards holds a dead root plus a live heap-only member — the former
+// must substitute the root TID or it probes a TID no entry carries.
+func TestBtIndexCheck_HeapAllIndexedHotUpdate(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	// b is not indexed, so this UPDATE is HOT-eligible: the new version lands
+	// on the same page as a heap-only tuple and no index entry is written.
+	if err := runDDL(t, ctx, "UPDATE bic SET b = 'uno' WHERE a = 1"); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	// Non-vacuity guard: prove the page really holds a heap-only member,
+	// otherwise the root-TID arm was never exercised.
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("expected in-memory catalog")
+	}
+	tbl, ok := im.LookupTable(parser.ObjectName{Name: "bic"})
+	if !ok {
+		t.Fatal("table bic not found")
+	}
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: ctx.Catalog.RelFileNode(tbl), Block: 0})
+	if err != nil {
+		t.Fatalf("pin heap block: %v", err)
+	}
+	s.RLock()
+	maxoff, _ := storage.PageLinePointerCount(s.Page())
+	heapOnly := false
+	for off := uint16(1); off <= uint16(maxoff); off++ {
+		if tup, terr := storage.PageGetHeapTuple(s.Page(), off); terr == nil && tup.Header.IsHeapOnly() {
+			heapOnly = true
+		}
+	}
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if !heapOnly {
+		t.Fatal("UPDATE did not take the HOT path — no heap-only tuple found")
+	}
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('bic_a_idx', true)",
+		"SELECT bt_index_parent_check('bic_a_idx', true, false, false)",
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: HOT-updated index reported corrupt: %v", sql, err)
+		}
+	}
+}
+
+// TestBtIndexCheck_HeapAllIndexedPartialIndex pins the build-side exclusion
+// parity: rows that fail the index predicate legitimately have no entry, so
+// the former must apply the predicate before probing — otherwise every
+// excluded row reports a bogus "lacks matching index tuple".
+func TestBtIndexCheck_HeapAllIndexedPartialIndex(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		"CREATE TABLE hip (a int, b text)",
+		"INSERT INTO hip VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')",
+		"CREATE INDEX hip_a_idx ON hip (a) WHERE a > 2",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('hip_a_idx', true)",
+		"SELECT bt_index_parent_check('hip_a_idx', true, false, false)",
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: partial index reported corrupt on excluded rows: %v", sql, err)
+		}
+	}
+}
+
+// TestBtIndexCheck_HeapAllIndexedExpressionIndex covers the expression-key
+// arm: the former must evaluate the resolved key expression per row
+// (resolveIndexKeyExprs) rather than reading a catalog column, producing the
+// same bytes the build's encodeCompositeBTreeKeyWithExprs wrote.
+func TestBtIndexCheck_HeapAllIndexedExpressionIndex(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		"CREATE TABLE hie (a int, b text)",
+		"INSERT INTO hie VALUES (1, 'One'), (2, 'Two'), (3, 'Three')",
+		"CREATE INDEX hie_expr_idx ON hie (lower(b))",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('hie_expr_idx', true)"); err != nil {
+		t.Errorf("expression index reported corrupt: %v", err)
+	}
+}
+
+// TestBtIndexCheck_HeapAllIndexedNullKey pins the NULL-key exclusion: goopg's
+// byte-key B-tree stores no NULL-keyed entries (the build skips them), so a
+// row with a NULL key column must be excluded from the probe set rather than
+// reported as lacking an entry.
+func TestBtIndexCheck_HeapAllIndexedNullKey(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	for _, stmt := range []string{
+		"CREATE TABLE hin (a int, b text)",
+		"INSERT INTO hin VALUES (1, 'one'), (NULL, 'nullrow'), (3, 'three')",
+		"CREATE INDEX hin_a_idx ON hin (a)",
+	} {
+		if err := runDDL(t, ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('hin_a_idx', true)"); err != nil {
+		t.Errorf("NULL-keyed row reported corrupt: %v", err)
+	}
+}

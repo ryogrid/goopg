@@ -1,0 +1,636 @@
+# tmp/pg18-optdebug/plancand/q34.log
+=== rel=(b 1) npath=1 npart=0 total=[pt347 rows=15 cost=18110.9..18130.3 pk=2 psafe=0] startup=[pt347 rows=15 cost=18110.9..18130.3] param=[pt347 rows=15 cost=18110.9..18130.3]
+    add       SeqScan rows=719876 cost=0..20134.8
+    ok        SeqScan rows=719876 cost=0..20134.8 removed=0
+    padd      SeqScan rows=232218 cost=0..15258.2 pw=3
+    pok       SeqScan rows=232218 cost=0..15258.2 pw=3 removed=0
+    add       Gather rows=719876 cost=1000..88245.8 psafe=0
+    rej       Gather rows=719876 cost=1000..88245.8 psafe=0 by=[SeqScan rows=719876 cost=0..20134.8] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       GatherMerge rows=719876 cost=41718.3..126884 pk=2 psafe=0
+    ok        GatherMerge rows=719876 cost=41718.3..126884 pk=2 psafe=0 removed=0
+    add       pt347 rows=15 cost=18110.9..18130.3 pk=2 psafe=0
+    ok        pt347 rows=15 cost=18110.9..18130.3 pk=2 psafe=0 removed=0
+=== rel=(b 2) npath=4 npart=2 total=[SeqScan rows=100000 cost=0..3872] startup=[SeqScan rows=100000 cost=0..3872] param=[IndexScan rows=1 cost=0.2925..8.31]
+    add       SeqScan rows=235 cost=0..3158.91
+    ok        SeqScan rows=235 cost=0..3158.91 removed=0
+    padd      SeqScan rows=138 cost=0..2444.54 pw=1
+    pok       SeqScan rows=138 cost=0..2444.54 pw=1 removed=0
+    padd      IndexScan rows=138 cost=0.2925..3621.07 pk=1 pw=1
+    pok       IndexScan rows=138 cost=0.2925..3621.07 pk=1 pw=1 removed=0
+    add       IndexScan rows=235 cost=0.2925..4335.45 pk=1
+    ok        IndexScan rows=235 cost=0.2925..4335.45 pk=1 removed=0
+    add       IndexScan rows=1 cost=0.2925..0.332785 par=(b 1)
+    ok        IndexScan rows=1 cost=0.2925..0.332785 par=(b 1) removed=0
+    add       BitmapHeapScan rows=1 cost=0.301372..4.32762 par=(b 1)
+    rej       BitmapHeapScan rows=1 cost=0.301372..4.32762 par=(b 1) by=[IndexScan rows=1 cost=0.2925..0.332785] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       Gather rows=235 cost=1000..3468.04 psafe=0
+    rej       Gather rows=235 cost=1000..3468.04 psafe=0 by=[SeqScan rows=235 cost=0..3158.91] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       GatherMerge rows=235 cost=1000.3..4647.52 pk=1 psafe=0
+    rej       GatherMerge rows=235 cost=1000.3..4647.52 pk=1 psafe=0 by=[IndexScan rows=235 cost=0.2925..4335.45] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       SeqScan rows=100000 cost=0..3872
+    ok        SeqScan rows=100000 cost=0..3872 removed=0
+    padd      SeqScan rows=58824 cost=0..3460.24 pw=1
+    pok       SeqScan rows=58824 cost=0..3460.24 pw=1 removed=0
+    padd      IndexScan rows=58824 cost=0.2925..5071.07 pk=1 pw=1
+    pok       IndexScan rows=58824 cost=0.2925..5071.07 pk=1 pw=1 removed=0
+    add       IndexScan rows=100000 cost=0.2925..5482.83 pk=1
+    ok        IndexScan rows=100000 cost=0.2925..5482.83 pk=1 removed=0
+    add       IndexScan rows=1 cost=0.2925..8.31 par=(b 1)
+    ok        IndexScan rows=1 cost=0.2925..8.31 par=(b 1) removed=0
+    add       BitmapHeapScan rows=1 cost=4.30025..8.31275 par=(b 1)
+    rej       BitmapHeapScan rows=1 cost=4.30025..8.31275 par=(b 1) by=[IndexScan rows=1 cost=0.2925..8.31] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       Gather rows=100000 cost=1000..14460.2 psafe=0
+    rej       Gather rows=100000 cost=1000..14460.2 psafe=0 by=[SeqScan rows=100000 cost=0..3872] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       GatherMerge rows=100000 cost=1000.3..17321.1 pk=1 psafe=0
+    rej       GatherMerge rows=100000 cost=1000.3..17321.1 pk=1 psafe=0 by=[IndexScan rows=100000 cost=0.2925..5482.83] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       GatherMerge rows=100000 cost=11535.3..22932.4 pk=4 psafe=0
+    ok        GatherMerge rows=100000 cost=11535.3..22932.4 pk=4 psafe=0 removed=0
+=== rel=(b 3) npath=3 npart=0 total=[SeqScan rows=12 cost=0..1.24] startup=[SeqScan rows=12 cost=0..1.24] param=[IndexScan rows=1 cost=0.135..0.162517]
+    add       SeqScan rows=12 cost=0..1.24
+    ok        SeqScan rows=12 cost=0..1.24 removed=0
+    add       IndexScan rows=12 cost=0.135..12.435 pk=1
+    ok        IndexScan rows=12 cost=0.135..12.435 pk=1 removed=0
+    add       IndexScan rows=1 cost=0.135..0.162517 par=(b 1)
+    ok        IndexScan rows=1 cost=0.135..0.162517 par=(b 1) removed=0
+    add       BitmapHeapScan rows=1 cost=0.142761..4.16526 par=(b 1)
+    rej       BitmapHeapScan rows=1 cost=0.142761..4.16526 par=(b 1) by=[IndexScan rows=1 cost=0.135..0.162517] via=cost cmp=cost:B2 keys:EQ outer:EQ
+=== rel=(b 4) npath=3 npart=0 total=[SeqScan rows=489 cost=0..251] startup=[SeqScan rows=489 cost=0..251] param=[IndexScan rows=1 cost=0.2825..0.317917]
+    add       SeqScan rows=489 cost=0..251
+    ok        SeqScan rows=489 cost=0..251 removed=0
+    add       IndexScan rows=489 cost=0.2825..378.283 pk=1
+    ok        IndexScan rows=489 cost=0.2825..378.283 pk=1 removed=0
+    add       IndexScan rows=1 cost=0.2825..0.317917 par=(b 1)
+    ok        IndexScan rows=1 cost=0.2825..0.317917 par=(b 1) removed=0
+    add       BitmapHeapScan rows=1 cost=0.290372..4.32037 par=(b 1)
+    rej       BitmapHeapScan rows=1 cost=0.290372..4.32037 par=(b 1) by=[IndexScan rows=1 cost=0.2825..0.317917] via=cost cmp=cost:B2 keys:EQ outer:EQ
+=== rel=(b 1 2) npath=2 npart=0 total=[Result rows=15 cost=18111.2..18255 psafe=0] startup=[Result rows=15 cost=18111.2..18255] param=[Result rows=15 cost=18111.2..18255]
+    add       MergeJoin rows=2213 cost=108105..111726 jt=INNER out=(b 1) in=(b 2)
+    ok        MergeJoin rows=2213 cost=108105..111726 jt=INNER out=(b 1) in=(b 2) removed=0
+    padd      MergeJoin rows=714 cost=43887..45055.3 pw=3 jt=INNER out=(b 1) in=(b 2)
+    pok       MergeJoin rows=714 cost=43887..45055.3 pw=3 jt=INNER out=(b 1) in=(b 2) removed=0
+    add       NestLoop rows=2213 cost=0..2.27613e+09 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=2213 cost=0..2.27613e+09 jt=INNER out=(b 1) in=(b 2) by=[MergeJoin rows=2213 cost=108105..111726] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=0.2925..230698 pk=0 par=- by=[MergeJoin rows=2213 cost=108105..111726]
+    add       NestLoop rows=2213 cost=0.3025..38738.2 jt=INNER out=(b 1) in=(b 2)
+    ok        NestLoop rows=2213 cost=0.3025..38738.2 jt=INNER out=(b 1) in=(b 2) removed=1
+    add       NestLoop rows=2213 cost=0..2.56083e+06 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=2213 cost=0..2.56083e+06 jt=INNER out=(b 1) in=(b 2) by=[NestLoop rows=2213 cost=0.3025..38738.2] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=2213 cost=41718.3..2.27624e+09 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    ok        NestLoop rows=2213 cost=41718.3..2.27624e+09 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2) removed=0
+    add       NestLoop rows=2213 cost=41718.6..366448 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    ok        NestLoop rows=2213 cost=41718.6..366448 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2) removed=1
+    add       NestLoop rows=2213 cost=41718.6..145488 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    ok        NestLoop rows=2213 cost=41718.6..145488 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2) removed=1
+    add       NestLoop rows=2213 cost=41718.3..2.66758e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=2213 cost=41718.3..2.66758e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 2) by=[NestLoop rows=2213 cost=41718.6..145488] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=714 cost=0..7.34245e+08 pw=3 jt=INNER out=(b 1) in=(b 2)
+    prej      NestLoop rows=714 cost=0..7.34245e+08 pw=3 jt=INNER out=(b 1) in=(b 2) by=[MergeJoin rows=714 cost=43887..45055.3] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=83181.9..83181.9 pk=0 par=- by=[MergeJoin rows=714 cost=43887..45055.3]
+    padd      NestLoop rows=714 cost=0.3025..21670.2 pw=3 jt=INNER out=(b 1) in=(b 2)
+    pok       NestLoop rows=714 cost=0.3025..21670.2 pw=3 jt=INNER out=(b 1) in=(b 2) removed=1
+    padd      NestLoop rows=714 cost=0..836976 pw=3 jt=INNER out=(b 1) in=(b 2)
+    prej      NestLoop rows=714 cost=0..836976 pw=3 jt=INNER out=(b 1) in=(b 2) by=[NestLoop rows=714 cost=0.3025..21670.2] via=cost cmp=keys:EQ
+    add       HashJoin rows=2213 cost=3161.85..25186.4 jt=INNER out=(b 1) in=(b 2)
+    ok        HashJoin rows=2213 cost=3161.85..25186.4 jt=INNER out=(b 1) in=(b 2) removed=1
+    padd      HashJoin rows=714 cost=2446.26..18314 pw=3 jt=INNER out=(b 1) in=(b 2)
+    pok       HashJoin rows=714 cost=2446.26..18314 pw=3 jt=INNER out=(b 1) in=(b 2) removed=1
+    ppreskip  dis=0 cost=19000.6..19000.6 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    preskip   dis=0 cost=108104..109904 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    ppreskip  dis=0 cost=109185..109185 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    preskip   dis=0 cost=0..4.73483e+06 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    preskip   dis=0 cost=0..1.43949e+06 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    preskip   dis=0 cost=0.2925..4.736e+06 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    preskip   dis=0 cost=0.2925..1.44066e+06 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    preskip   dis=0 cost=107058..108968 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    ppreskip  dis=0 cost=2.78104e+06..2.78104e+06 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    ppreskip  dis=0 cost=854958..854958 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    ppreskip  dis=0 cost=2.78222e+06..2.78222e+06 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    ppreskip  dis=0 cost=856135..856135 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    ppreskip  dis=0 cost=108599..108599 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    preskip   dis=0 cost=33352.2..40732.7 pk=0 par=- by=[HashJoin rows=2213 cost=3161.85..25186.4]
+    ppreskip  dis=0 cost=23329.8..23329.8 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    ppreskip  dis=0 cost=40018.1..40018.1 pk=0 par=- by=[HashJoin rows=714 cost=2446.26..18314]
+    add       Gather rows=2213 cost=3446.26..19535.3 psafe=0
+    ok        Gather rows=2213 cost=3446.26..19535.3 psafe=0 removed=0
+    add       GatherMerge rows=2213 cost=19347.9..19609.7 pk=2 psafe=0
+    ok        GatherMerge rows=2213 cost=19347.9..19609.7 pk=2 psafe=0 removed=1
+    add       MergeJoin rows=15 cost=34409.4..34909.7 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    ok        MergeJoin rows=15 cost=34409.4..34909.7 psafe=0 jt=INNER out=(b 1) in=(b 2) removed=0
+    add       NestLoop rows=15 cost=18110.9..94960.3 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=15 cost=18110.9..94960.3 psafe=0 jt=INNER out=(b 1) in=(b 2) by=[MergeJoin rows=15 cost=34409.4..34909.7] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=15 cost=18111.2..18255 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    ok        NestLoop rows=15 cost=18111.2..18255 psafe=0 jt=INNER out=(b 1) in=(b 2) removed=1
+    add       NestLoop rows=15 cost=18111.2..18255.3 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=15 cost=18111.2..18255.3 psafe=0 jt=INNER out=(b 1) in=(b 2) by=[NestLoop rows=15 cost=18111.2..18255] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       NestLoop rows=15 cost=18110.9..62332.3 psafe=0 jt=INNER out=(b 1) in=(b 2)
+    rej       NestLoop rows=15 cost=18110.9..62332.3 psafe=0 jt=INNER out=(b 1) in=(b 2) by=[NestLoop rows=15 cost=18111.2..18255] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=24404.9..25598.4 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=34409.4..34659.5 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=18110.9..1.81304e+09 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=18110.9..25752.4 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=18111.2..1.81304e+09 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=18111.2..27363.2 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    preskip   dis=0 cost=18130.9..23613.5 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+    add       NestLoop rows=15 cost=29646.2..1.81307e+09 pk=4 psafe=0 jt=INNER out=(b 2) in=(b 1)
+    ok        NestLoop rows=15 cost=29646.2..1.81307e+09 pk=4 psafe=0 jt=INNER out=(b 2) in=(b 1) removed=0
+    add       NestLoop rows=15 cost=29646.2..63562.7 pk=4 psafe=0 jt=INNER out=(b 2) in=(b 1)
+    ok        NestLoop rows=15 cost=29646.2..63562.7 pk=4 psafe=0 jt=INNER out=(b 2) in=(b 1) removed=1
+    preskip   dis=0 cost=18130.5..22252.5 pk=0 par=- by=[NestLoop rows=15 cost=18111.2..18255]
+=== rel=(b 1 3) npath=2 npart=1 total=[HashJoin rows=687338 cost=1.39..22663 jt=INNER out=(b 1) in=(b 3)] startup=[HashJoin rows=687338 cost=1.39..22663] param=[HashJoin rows=687338 cost=1.39..22663]
+    add       MergeJoin rows=687338 cost=104937..115410 jt=INNER out=(b 1) in=(b 3)
+    ok        MergeJoin rows=687338 cost=104937..115410 jt=INNER out=(b 1) in=(b 3) removed=0
+    padd      MergeJoin rows=221722 cost=40719.7..44098.1 pw=3 jt=INNER out=(b 1) in=(b 3)
+    pok       MergeJoin rows=221722 cost=40719.7..44098.1 pw=3 jt=INNER out=(b 1) in=(b 3) removed=0
+    add       NestLoop rows=687338 cost=0..953395 jt=INNER out=(b 1) in=(b 3)
+    rej       NestLoop rows=687338 cost=0..953395 jt=INNER out=(b 1) in=(b 3) by=[MergeJoin rows=687338 cost=104937..115410] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=0.135..117318 pk=0 par=- by=[MergeJoin rows=687338 cost=104937..115410]
+    add       NestLoop rows=687338 cost=0.145..37405.8 jt=INNER out=(b 1) in=(b 3)
+    ok        NestLoop rows=687338 cost=0.145..37405.8 jt=INNER out=(b 1) in=(b 3) removed=1
+    add       NestLoop rows=687338 cost=0..140990 jt=INNER out=(b 1) in=(b 3)
+    rej       NestLoop rows=687338 cost=0..140990 jt=INNER out=(b 1) in=(b 3) by=[NestLoop rows=687338 cost=0.145..37405.8] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=687338 cost=41718.3..1.06014e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3)
+    ok        NestLoop rows=687338 cost=41718.3..1.06014e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3) removed=0
+    add       NestLoop rows=687338 cost=41718.4..242631 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3)
+    ok        NestLoop rows=687338 cost=41718.4..242631 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3) removed=1
+    add       NestLoop rows=687338 cost=41718.4..144155 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3)
+    ok        NestLoop rows=687338 cost=41718.4..144155 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3) removed=1
+    add       NestLoop rows=687338 cost=41718.3..247739 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3)
+    rej       NestLoop rows=687338 cost=41718.3..247739 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 3) by=[NestLoop rows=687338 cost=41718.4..144155] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=221722 cost=0..316309 pw=3 jt=INNER out=(b 1) in=(b 3)
+    prej      NestLoop rows=221722 cost=0..316309 pw=3 jt=INNER out=(b 1) in=(b 3) by=[MergeJoin rows=221722 cost=40719.7..44098.1] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=46607.6..46607.6 pk=0 par=- by=[MergeJoin rows=221722 cost=40719.7..44098.1]
+    padd      NestLoop rows=221722 cost=0.145..20830.2 pw=3 jt=INNER out=(b 1) in=(b 3)
+    pok       NestLoop rows=221722 cost=0.145..20830.2 pw=3 jt=INNER out=(b 1) in=(b 3) removed=1
+    padd      NestLoop rows=221722 cost=0..54244.5 pw=3 jt=INNER out=(b 1) in=(b 3)
+    prej      NestLoop rows=221722 cost=0..54244.5 pw=3 jt=INNER out=(b 1) in=(b 3) by=[NestLoop rows=221722 cost=0.145..20830.2] via=cost cmp=keys:EQ
+    add       HashJoin rows=687338 cost=1.39..22663 jt=INNER out=(b 1) in=(b 3)
+    ok        HashJoin rows=687338 cost=1.39..22663 jt=INNER out=(b 1) in=(b 3) removed=1
+    padd      HashJoin rows=221722 cost=1.39..16074.7 pw=3 jt=INNER out=(b 1) in=(b 3)
+    pok       HashJoin rows=221722 cost=1.39..16074.7 pw=3 jt=INNER out=(b 1) in=(b 3) removed=1
+    preskip   dis=0 cost=104937..106737 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=0..241618 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=0..94160 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=0.135..241630 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=0.135..94171.2 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=104936..106746 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    preskip   dis=0 cost=33352.2..37574.5 pk=0 par=- by=[HashJoin rows=687338 cost=1.39..22663]
+    add       Gather rows=687338 cost=1001.39..85808.5 psafe=0
+    rej       Gather rows=687338 cost=1001.39..85808.5 psafe=0 by=[HashJoin rows=687338 cost=1.39..22663] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       GatherMerge rows=687338 cost=40552.4..121869 pk=2 psafe=0
+    ok        GatherMerge rows=687338 cost=40552.4..121869 pk=2 psafe=0 removed=1
+=== rel=(b 1 4) npath=3 npart=1 total=[Gather rows=46656 cost=1257.11..21790.8 psafe=0] startup=[HashJoin rows=46656 cost=257.113..22282.6] param=[Gather rows=46656 cost=1257.11..21790.8]
+    add       MergeJoin rows=46656 cost=105209..109112 jt=INNER out=(b 1) in=(b 4)
+    ok        MergeJoin rows=46656 cost=105209..109112 jt=INNER out=(b 1) in=(b 4) removed=0
+    padd      MergeJoin rows=15050 cost=40991.2..42251.9 pw=3 jt=INNER out=(b 1) in=(b 4)
+    pok       MergeJoin rows=15050 cost=40991.2..42251.9 pw=3 jt=INNER out=(b 1) in=(b 4) removed=0
+    add       NestLoop rows=46656 cost=0..1.85085e+08 jt=INNER out=(b 1) in=(b 4)
+    rej       NestLoop rows=46656 cost=0..1.85085e+08 jt=INNER out=(b 1) in=(b 4) by=[MergeJoin rows=46656 cost=105209..109112] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=0.2825..223500 pk=0 par=- by=[MergeJoin rows=46656 cost=105209..109112]
+    add       NestLoop rows=46656 cost=0.2925..40377.6 jt=INNER out=(b 1) in=(b 4)
+    ok        NestLoop rows=46656 cost=0.2925..40377.6 jt=INNER out=(b 1) in=(b 4) removed=1
+    add       NestLoop rows=46656 cost=0..5.29998e+06 jt=INNER out=(b 1) in=(b 4)
+    rej       NestLoop rows=46656 cost=0..5.29998e+06 jt=INNER out=(b 1) in=(b 4) by=[NestLoop rows=46656 cost=0.2925..40377.6] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=46656 cost=41718.3..1.85192e+08 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4)
+    ok        NestLoop rows=46656 cost=41718.3..1.85192e+08 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4) removed=0
+    add       NestLoop rows=46656 cost=41718.6..355742 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4)
+    ok        NestLoop rows=46656 cost=41718.6..355742 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4) removed=1
+    add       NestLoop rows=46656 cost=41718.6..147127 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4)
+    ok        NestLoop rows=46656 cost=41718.6..147127 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4) removed=1
+    add       NestLoop rows=46656 cost=41718.3..5.40673e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4)
+    rej       NestLoop rows=46656 cost=41718.3..5.40673e+06 pk=2 psafe=0 jt=INNER out=(b 1) in=(b 4) by=[NestLoop rows=46656 cost=41718.6..147127] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=15050 cost=0..5.97135e+07 pw=3 jt=INNER out=(b 1) in=(b 4)
+    prej      NestLoop rows=15050 cost=0..5.97135e+07 pw=3 jt=INNER out=(b 1) in=(b 4) by=[MergeJoin rows=15050 cost=40991.2..42251.9] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=80859.8..80859.8 pk=0 par=- by=[MergeJoin rows=15050 cost=40991.2..42251.9]
+    padd      NestLoop rows=15050 cost=0.2925..23310.5 pw=3 jt=INNER out=(b 1) in=(b 4)
+    pok       NestLoop rows=15050 cost=0.2925..23310.5 pw=3 jt=INNER out=(b 1) in=(b 4) removed=1
+    padd      NestLoop rows=15050 cost=0..1.7186e+06 pw=3 jt=INNER out=(b 1) in=(b 4)
+    prej      NestLoop rows=15050 cost=0..1.7186e+06 pw=3 jt=INNER out=(b 1) in=(b 4) by=[NestLoop rows=15050 cost=0.2925..23310.5] via=cost cmp=keys:EQ
+    add       HashJoin rows=46656 cost=257.113..22282.6 jt=INNER out=(b 1) in=(b 4)
+    ok        HashJoin rows=46656 cost=257.113..22282.6 jt=INNER out=(b 1) in=(b 4) removed=1
+    padd      HashJoin rows=15050 cost=257.113..16125.2 pw=3 jt=INNER out=(b 1) in=(b 4)
+    pok       HashJoin rows=15050 cost=257.113..16125.2 pw=3 jt=INNER out=(b 1) in=(b 4) removed=1
+    preskip   dis=0 cost=105209..106927 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=0..9.84615e+06 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=0..2.96532e+06 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=0.2825..9.84628e+06 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=0.2825..2.96545e+06 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=104936..107031 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    preskip   dis=0 cost=33352.2..37827.4 pk=0 par=- by=[HashJoin rows=46656 cost=257.113..22282.6]
+    add       Gather rows=46656 cost=1257.11..21790.8 psafe=0
+    ok        Gather rows=46656 cost=1257.11..21790.8 psafe=0 removed=0
+    add       GatherMerge rows=46656 cost=18169.5..23689.2 pk=2 psafe=0
+    ok        GatherMerge rows=46656 cost=18169.5..23689.2 pk=2 psafe=0 removed=1
+=== rel=(b 1 2 3) npath=2 npart=1 total=[Gather rows=2113 cost=3447.65..19529.2 psafe=0] startup=[Gather rows=2113 cost=3447.65..19529.2] param=[Gather rows=2113 cost=3447.65..19529.2]
+    add       MergeJoin rows=2113 cost=19659.8..19692 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        MergeJoin rows=2113 cost=19659.8..19692 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=0
+    padd      MergeJoin rows=682 cost=18349.3..18359.8 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    pok       MergeJoin rows=682 cost=18349.3..18359.8 pw=3 jt=INNER out=(b 1 2) in=(b 3) removed=0
+    add       NestLoop rows=2113 cost=3446.26..22404.4 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    rej       NestLoop rows=2113 cost=3446.26..22404.4 psafe=0 jt=INNER out=(b 1 2) in=(b 3) by=[MergeJoin rows=2113 cost=19659.8..19692] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=2113 cost=3446.4..19891.2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    rej       NestLoop rows=2113 cost=3446.4..19891.2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) by=[MergeJoin rows=2113 cost=19659.8..19692] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=2113 cost=3446.41..19589.6 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        NestLoop rows=2113 cost=3446.41..19589.6 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    add       NestLoop rows=2113 cost=3446.26..19908.2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    rej       NestLoop rows=2113 cost=3446.26..19908.2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) by=[NestLoop rows=2113 cost=3446.41..19589.6] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=2113 cost=19347.9..22478.8 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        NestLoop rows=2113 cost=19347.9..22478.8 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=0
+    add       NestLoop rows=2113 cost=19348.1..19965.6 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        NestLoop rows=2113 cost=19348.1..19965.6 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    add       NestLoop rows=2113 cost=19348.1..19664 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        NestLoop rows=2113 cost=19348.1..19664 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    add       NestLoop rows=2113 cost=19347.9..19982.5 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    rej       NestLoop rows=2113 cost=19347.9..19982.5 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 3) by=[NestLoop rows=2113 cost=19348.1..19664] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3161.85..25186.4 pk=0 par=- by=[NestLoop rows=2113 cost=3446.41..19589.6]
+    preskip   dis=0 cost=3161.99..25485.1 pk=0 par=- by=[NestLoop rows=2113 cost=3446.41..19589.6]
+    preskip   dis=0 cost=3162..25209.5 pk=0 par=- by=[NestLoop rows=2113 cost=3446.41..19589.6]
+    preskip   dis=0 cost=3161.85..25186.4 pk=0 par=- by=[NestLoop rows=2113 cost=3446.41..19589.6]
+    padd      NestLoop rows=682 cost=2446.26..19239.5 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    prej      NestLoop rows=682 cost=2446.26..19239.5 pw=3 jt=INNER out=(b 1 2) in=(b 3) by=[MergeJoin rows=682 cost=18349.3..18359.8] via=cost cmp=keys:EQ
+    padd      NestLoop rows=682 cost=2446.4..18428.8 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    prej      NestLoop rows=682 cost=2446.4..18428.8 pw=3 jt=INNER out=(b 1 2) in=(b 3) by=[MergeJoin rows=682 cost=18349.3..18359.8] via=tie cmp=keys:EQ
+    padd      NestLoop rows=682 cost=2446.41..18332.3 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    pok       NestLoop rows=682 cost=2446.41..18332.3 pw=3 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    padd      NestLoop rows=682 cost=2446.26..18435.2 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    prej      NestLoop rows=682 cost=2446.26..18435.2 pw=3 jt=INNER out=(b 1 2) in=(b 3) by=[NestLoop rows=682 cost=2446.41..18332.3] via=tie cmp=keys:EQ
+    preskip   dis=0 cost=3163.24..25193.3 pk=0 par=- by=[NestLoop rows=2113 cost=3446.41..19589.6]
+    add       HashJoin rows=2113 cost=3447.65..19544.5 psafe=0 jt=INNER out=(b 1 2) in=(b 3)
+    ok        HashJoin rows=2113 cost=3447.65..19544.5 psafe=0 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    padd      HashJoin rows=682 cost=2447.65..18317.9 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    pok       HashJoin rows=682 cost=2447.65..18317.9 pw=3 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    add       MergeJoin rows=2113 cost=19659.8..19692 psafe=0 jt=INNER out=(b 3) in=(b 1 2)
+    rej       MergeJoin rows=2113 cost=19659.8..19692 psafe=0 jt=INNER out=(b 3) in=(b 1 2) by=[HashJoin rows=2113 cost=3447.65..19544.5] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3446.26..234425 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    add       NestLoop rows=2113 cost=3446.26..19940.5 psafe=0 jt=INNER out=(b 3) in=(b 1 2)
+    rej       NestLoop rows=2113 cost=3446.26..19940.5 psafe=0 jt=INNER out=(b 3) in=(b 1 2) by=[HashJoin rows=2113 cost=3447.65..19544.5] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3446.4..234437 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    add       NestLoop rows=2113 cost=3446.4..19951.7 psafe=0 jt=INNER out=(b 3) in=(b 1 2)
+    rej       NestLoop rows=2113 cost=3446.4..19951.7 psafe=0 jt=INNER out=(b 3) in=(b 1 2) by=[HashJoin rows=2113 cost=3447.65..19544.5] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       MergeJoin rows=2113 cost=19658.4..19700.9 psafe=0 jt=INNER out=(b 3) in=(b 1 2)
+    rej       MergeJoin rows=2113 cost=19658.4..19700.9 psafe=0 jt=INNER out=(b 3) in=(b 1 2) by=[HashJoin rows=2113 cost=3447.65..19544.5] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       HashJoin rows=2113 cost=19563..19591.1 psafe=0 jt=INNER out=(b 3) in=(b 1 2)
+    rej       HashJoin rows=2113 cost=19563..19591.1 psafe=0 jt=INNER out=(b 3) in=(b 1 2) by=[HashJoin rows=2113 cost=3447.65..19544.5] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=104221..105939 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    ppreskip  dis=0 cost=43275.1..43275.1 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    preskip   dis=0 cost=1.39..22663 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.6825..223709 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.6925..30069.6 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.39..22663 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=40552.4..121869 pk=2 par=- by=[NestLoop rows=2113 cost=19348.1..19664]
+    preskip   dis=0 cost=40552.7..322915 pk=2 par=- by=[NestLoop rows=2113 cost=19348.1..19664]
+    preskip   dis=0 cost=40552.7..129275 pk=2 par=- by=[NestLoop rows=2113 cost=19348.1..19664]
+    preskip   dis=0 cost=40552.4..121869 pk=2 par=- by=[NestLoop rows=2113 cost=19348.1..19664]
+    padd      NestLoop rows=682 cost=1.39..7.01059e+08 pw=3 jt=INNER out=(b 1 3) in=(b 2)
+    prej      NestLoop rows=682 cost=1.39..7.01059e+08 pw=3 jt=INNER out=(b 1 3) in=(b 2) by=[HashJoin rows=682 cost=2447.65..18317.9] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=80928.4..80928.4 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=18825.1..18825.1 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    padd      NestLoop rows=682 cost=1.39..800794 pw=3 jt=INNER out=(b 1 3) in=(b 2)
+    prej      NestLoop rows=682 cost=1.39..800794 pw=3 jt=INNER out=(b 1 3) in=(b 2) by=[HashJoin rows=682 cost=2447.65..18317.9] via=cost cmp=keys:EQ
+    preskip   dis=0 cost=3163.24..27543.2 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    ppreskip  dis=0 cost=19075.3..19075.3 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=19790.9..19790.9 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    preskip   dis=0 cost=104221..105939 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    ppreskip  dis=0 cost=105220..105220 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    preskip   dis=0 cost=1.39..5.32865e+06 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.39..1.22025e+06 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.6825..5.32983e+06 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=1.6825..1.22142e+06 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    preskip   dis=0 cost=103174..105003 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    ppreskip  dis=0 cost=3.12975e+06..3.12975e+06 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=727224..727224 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=3.13093e+06..3.13093e+06 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=728400..728400 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=104634..104634 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    preskip   dis=0 cost=34611.8..41130.3 pk=0 par=- by=[HashJoin rows=2113 cost=3447.65..19544.5]
+    ppreskip  dis=0 cost=23459.1..23459.1 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    ppreskip  dis=0 cost=40415.6..40415.6 pk=0 par=- by=[HashJoin rows=682 cost=2447.65..18317.9]
+    add       Gather rows=2113 cost=3447.65..19529.2 psafe=0
+    ok        Gather rows=2113 cost=3447.65..19529.2 psafe=0 removed=1
+    add       GatherMerge rows=2113 cost=19350.1..19600.1 pk=2 psafe=0
+    ok        GatherMerge rows=2113 cost=19350.1..19600.1 pk=2 psafe=0 removed=1
+=== rel=(b 1 2 4) npath=2 npart=1 total=[Gather rows=143 cost=1257.41..18122.4 psafe=0] startup=[Gather rows=143 cost=1257.41..18122.4] param=[Gather rows=143 cost=1257.41..18122.4]
+    add       MergeJoin rows=143 cost=19931.1..19945.6 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    ok        MergeJoin rows=143 cost=19931.1..19945.6 psafe=0 jt=INNER out=(b 1 2) in=(b 4) removed=0
+    padd      MergeJoin rows=46 cost=18620.7..18627 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    pok       MergeJoin rows=46 cost=18620.7..18627 pw=3 jt=INNER out=(b 1 2) in=(b 4) removed=0
+    add       NestLoop rows=143 cost=3446.26..588525 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    rej       NestLoop rows=143 cost=3446.26..588525 psafe=0 jt=INNER out=(b 1 2) in=(b 4) by=[MergeJoin rows=143 cost=19931.1..19945.6] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3446.54..20160.5 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    preskip   dis=0 cost=3446.55..20182.7 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    add       NestLoop rows=143 cost=3446.26..36019.9 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    rej       NestLoop rows=143 cost=3446.26..36019.9 psafe=0 jt=INNER out=(b 1 2) in=(b 4) by=[MergeJoin rows=143 cost=19931.1..19945.6] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=143 cost=19347.9..588600 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    ok        NestLoop rows=143 cost=19347.9..588600 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4) removed=0
+    add       NestLoop rows=143 cost=19348.2..20313.3 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    ok        NestLoop rows=143 cost=19348.2..20313.3 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4) removed=1
+    add       NestLoop rows=143 cost=19348.2..20368.6 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    rej       NestLoop rows=143 cost=19348.2..20368.6 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4) by=[NestLoop rows=143 cost=19348.2..20313.3] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       NestLoop rows=143 cost=19347.9..36094.3 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    rej       NestLoop rows=143 cost=19347.9..36094.3 pk=2 psafe=0 jt=INNER out=(b 1 2) in=(b 4) by=[NestLoop rows=143 cost=19348.2..20313.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3161.85..25186.4 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    preskip   dis=0 cost=3162.13..25811.6 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    preskip   dis=0 cost=3162.14..25833.7 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    preskip   dis=0 cost=3161.85..25186.4 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    padd      NestLoop rows=46 cost=2446.26..201892 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    prej      NestLoop rows=46 cost=2446.26..201892 pw=3 jt=INNER out=(b 1 2) in=(b 4) by=[MergeJoin rows=46 cost=18620.7..18627] via=cost cmp=keys:EQ
+    padd      NestLoop rows=46 cost=2446.54..18541 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    pok       NestLoop rows=46 cost=2446.54..18541 pw=3 jt=INNER out=(b 1 2) in=(b 4) removed=1
+    padd      NestLoop rows=46 cost=2446.55..18558.9 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    prej      NestLoop rows=46 cost=2446.55..18558.9 pw=3 jt=INNER out=(b 1 2) in=(b 4) by=[NestLoop rows=46 cost=2446.54..18541] via=tie cmp=keys:EQ
+    padd      NestLoop rows=46 cost=2446.26..23803.5 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    prej      NestLoop rows=46 cost=2446.26..23803.5 pw=3 jt=INNER out=(b 1 2) in=(b 4) by=[NestLoop rows=46 cost=2446.54..18541] via=cost cmp=keys:EQ
+    preskip   dis=0 cost=3418.96..25449 pk=0 par=- by=[MergeJoin rows=143 cost=19931.1..19945.6]
+    add       HashJoin rows=143 cost=3703.38..19798.3 psafe=0 jt=INNER out=(b 1 2) in=(b 4)
+    ok        HashJoin rows=143 cost=3703.38..19798.3 psafe=0 jt=INNER out=(b 1 2) in=(b 4) removed=1
+    padd      HashJoin rows=46 cost=2703.38..18573 pw=3 jt=INNER out=(b 1 2) in=(b 4)
+    prej      HashJoin rows=46 cost=2703.38..18573 pw=3 jt=INNER out=(b 1 2) in=(b 4) by=[NestLoop rows=46 cost=2446.54..18541] via=tie cmp=keys:EQ
+    add       MergeJoin rows=143 cost=19931.1..19945.6 psafe=0 jt=INNER out=(b 4) in=(b 1 2)
+    rej       MergeJoin rows=143 cost=19931.1..19945.6 psafe=0 jt=INNER out=(b 4) in=(b 1 2) by=[HashJoin rows=143 cost=3703.38..19798.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3446.26..9.55304e+06 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=3446.26..22497.3 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=3446.54..9.55316e+06 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=3446.54..22624.6 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=19658.6..20041.9 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    add       HashJoin rows=143 cost=19563..19817.9 psafe=0 jt=INNER out=(b 4) in=(b 1 2)
+    rej       HashJoin rows=143 cost=19563..19817.9 psafe=0 jt=INNER out=(b 4) in=(b 1 2) by=[HashJoin rows=143 cost=3703.38..19798.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=28577.4..28694 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    ppreskip  dis=0 cost=20375.6..20375.6 pk=0 par=- by=[NestLoop rows=46 cost=2446.54..18541]
+    preskip   dis=0 cost=1257.11..21790.8 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.4..35437.7 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.41..22790.6 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.11..21790.8 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=257.113..22282.6 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=257.405..35929.5 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=257.415..23282.4 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=257.113..22282.6 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=18169.5..23689.2 pk=2 par=- by=[NestLoop rows=143 cost=19348.2..20313.3]
+    preskip   dis=0 cost=18169.8..37336.1 pk=2 par=- by=[NestLoop rows=143 cost=19348.2..20313.3]
+    preskip   dis=0 cost=18169.8..24689 pk=2 par=- by=[NestLoop rows=143 cost=19348.2..20313.3]
+    preskip   dis=0 cost=18169.5..23689.2 pk=2 par=- by=[NestLoop rows=143 cost=19348.2..20313.3]
+    padd      NestLoop rows=46 cost=257.113..4.7602e+07 pw=3 jt=INNER out=(b 1 4) in=(b 2)
+    prej      NestLoop rows=46 cost=257.113..4.7602e+07 pw=3 jt=INNER out=(b 1 4) in=(b 2) by=[NestLoop rows=46 cost=2446.54..18541] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=20527.3..20527.3 pk=0 par=- by=[NestLoop rows=46 cost=2446.54..18541]
+    padd      NestLoop rows=46 cost=257.415..17108.1 pw=3 jt=INNER out=(b 1 4) in=(b 2)
+    pok       NestLoop rows=46 cost=257.415..17108.1 pw=3 jt=INNER out=(b 1 4) in=(b 2) removed=1
+    padd      NestLoop rows=46 cost=257.113..72336 pw=3 jt=INNER out=(b 1 4) in=(b 2)
+    prej      NestLoop rows=46 cost=257.113..72336 pw=3 jt=INNER out=(b 1 4) in=(b 2) by=[NestLoop rows=46 cost=257.415..17108.1] via=cost cmp=keys:EQ
+    preskip   dis=0 cost=3418.96..25561.1 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=4418.96..25069.3 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    ppreskip  dis=0 cost=18609.1..18609.1 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    ppreskip  dis=0 cost=19324.7..19324.7 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    preskip   dis=0 cost=28577.4..28694 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    ppreskip  dis=0 cost=28467..28467 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    preskip   dis=0 cost=1257.11..5.124e+06 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.11..52476.8 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.4..5.12518e+06 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=1257.4..53653.3 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    preskip   dis=0 cost=27530.7..27758 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    ppreskip  dis=0 cost=27880.5..27880.5 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    preskip   dis=0 cost=22374..25533.5 pk=0 par=- by=[HashJoin rows=143 cost=3703.38..19798.3]
+    ppreskip  dis=0 cost=18758.2..18758.2 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    ppreskip  dis=0 cost=25310.7..25310.7 pk=0 par=- by=[NestLoop rows=46 cost=257.415..17108.1]
+    add       Gather rows=143 cost=1257.41..18122.4 psafe=0
+    ok        Gather rows=143 cost=1257.41..18122.4 psafe=0 removed=1
+    add       GatherMerge rows=143 cost=18109.4..18126.3 pk=2 psafe=0
+    ok        GatherMerge rows=143 cost=18109.4..18126.3 pk=2 psafe=0 removed=1
+=== rel=(b 1 3 4) npath=3 npart=1 total=[Gather rows=44547 cost=1258.5..21634.1 psafe=0] startup=[HashJoin rows=44547 cost=258.502..22447.8] param=[Gather rows=44547 cost=1258.5..21634.1]
+    add       MergeJoin rows=44547 cost=101325..105052 jt=INNER out=(b 1 3) in=(b 4)
+    ok        MergeJoin rows=44547 cost=101325..105052 jt=INNER out=(b 1 3) in=(b 4) removed=0
+    padd      MergeJoin rows=14370 cost=39825.3..41029.1 pw=3 jt=INNER out=(b 1 3) in=(b 4)
+    pok       MergeJoin rows=14370 cost=39825.3..41029.1 pw=3 jt=INNER out=(b 1 3) in=(b 4) removed=0
+    add       NestLoop rows=44547 cost=1.39..1.76723e+08 jt=INNER out=(b 1 3) in=(b 4)
+    rej       NestLoop rows=44547 cost=1.39..1.76723e+08 jt=INNER out=(b 1 3) in=(b 4) by=[MergeJoin rows=44547 cost=101325..105052] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=1.6725..216836 pk=0 par=- by=[MergeJoin rows=44547 cost=101325..105052]
+    add       NestLoop rows=44547 cost=1.6825..42092.4 jt=INNER out=(b 1 3) in=(b 4)
+    ok        NestLoop rows=44547 cost=1.6825..42092.4 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    add       NestLoop rows=44547 cost=1.39..5.06387e+06 jt=INNER out=(b 1 3) in=(b 4)
+    rej       NestLoop rows=44547 cost=1.39..5.06387e+06 jt=INNER out=(b 1 3) in=(b 4) by=[NestLoop rows=44547 cost=1.6825..42092.4] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=44547 cost=40552.4..1.76822e+08 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4)
+    ok        NestLoop rows=44547 cost=40552.4..1.76822e+08 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4) removed=0
+    add       NestLoop rows=44547 cost=40552.7..340382 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4)
+    ok        NestLoop rows=44547 cost=40552.7..340382 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    add       NestLoop rows=44547 cost=40552.7..141298 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4)
+    ok        NestLoop rows=44547 cost=40552.7..141298 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    add       NestLoop rows=44547 cost=40552.4..5.16308e+06 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4)
+    rej       NestLoop rows=44547 cost=40552.4..5.16308e+06 pk=2 psafe=0 jt=INNER out=(b 1 3) in=(b 4) by=[NestLoop rows=44547 cost=40552.7..141298] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=14370 cost=1.39..5.70161e+07 pw=3 jt=INNER out=(b 1 3) in=(b 4)
+    prej      NestLoop rows=14370 cost=1.39..5.70161e+07 pw=3 jt=INNER out=(b 1 3) in=(b 4) by=[MergeJoin rows=14370 cost=39825.3..41029.1] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=78711.2..78711.2 pk=0 par=- by=[MergeJoin rows=14370 cost=39825.3..41029.1]
+    padd      NestLoop rows=14370 cost=1.6825..23864.6 pw=3 jt=INNER out=(b 1 3) in=(b 4)
+    pok       NestLoop rows=14370 cost=1.6825..23864.6 pw=3 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    padd      NestLoop rows=14370 cost=1.39..1.64245e+06 pw=3 jt=INNER out=(b 1 3) in=(b 4)
+    prej      NestLoop rows=14370 cost=1.39..1.64245e+06 pw=3 jt=INNER out=(b 1 3) in=(b 4) by=[NestLoop rows=14370 cost=1.6825..23864.6] via=cost cmp=keys:EQ
+    add       HashJoin rows=44547 cost=258.502..24725.4 jt=INNER out=(b 1 3) in=(b 4)
+    ok        HashJoin rows=44547 cost=258.502..24725.4 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    padd      HashJoin rows=14370 cost=258.502..16914.2 pw=3 jt=INNER out=(b 1 3) in=(b 4)
+    pok       HashJoin rows=14370 cost=258.502..16914.2 pw=3 jt=INNER out=(b 1 3) in=(b 4) removed=1
+    preskip   dis=0 cost=101325..102966 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=1.39..1.10818e+07 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=1.39..2.50648e+06 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=1.6725..1.10819e+07 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=1.6725..2.5066e+06 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=101053..103070 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=34611.8..38225 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    preskip   dis=0 cost=25410.4..25527.1 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    ppreskip  dis=0 cost=17208.6..17208.6 pk=0 par=- by=[HashJoin rows=14370 cost=258.502..16914.2]
+    add       NestLoop rows=44547 cost=1257.11..82276.8 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    rej       NestLoop rows=44547 cost=1257.11..82276.8 psafe=0 jt=INNER out=(b 1 4) in=(b 3) by=[HashJoin rows=44547 cost=258.502..24725.4] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=1257.25..28089.4 pk=0 par=- by=[HashJoin rows=44547 cost=258.502..24725.4]
+    add       NestLoop rows=44547 cost=1257.26..22911.2 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    ok        NestLoop rows=44547 cost=1257.26..22911.2 psafe=0 jt=INNER out=(b 1 4) in=(b 3) removed=0
+    add       NestLoop rows=44547 cost=1257.11..29624.8 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    rej       NestLoop rows=44547 cost=1257.11..29624.8 psafe=0 jt=INNER out=(b 1 4) in=(b 3) by=[NestLoop rows=44547 cost=1257.26..22911.2] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=44547 cost=257.113..82768.6 jt=INNER out=(b 1 4) in=(b 3)
+    rej       NestLoop rows=44547 cost=257.113..82768.6 jt=INNER out=(b 1 4) in=(b 3) by=[HashJoin rows=44547 cost=258.502..24725.4] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=257.248..28581.2 pk=0 par=- by=[NestLoop rows=44547 cost=1257.26..22911.2]
+    add       NestLoop rows=44547 cost=257.257..23403 jt=INNER out=(b 1 4) in=(b 3)
+    ok        NestLoop rows=44547 cost=257.257..23403 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    add       NestLoop rows=44547 cost=257.113..30116.6 jt=INNER out=(b 1 4) in=(b 3)
+    rej       NestLoop rows=44547 cost=257.113..30116.6 jt=INNER out=(b 1 4) in=(b 3) by=[NestLoop rows=44547 cost=257.257..23403] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=44547 cost=18169.5..84175.2 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    ok        NestLoop rows=44547 cost=18169.5..84175.2 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    add       NestLoop rows=44547 cost=18169.7..31190.9 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    ok        NestLoop rows=44547 cost=18169.7..31190.9 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    add       NestLoop rows=44547 cost=18169.7..24809.6 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    ok        NestLoop rows=44547 cost=18169.7..24809.6 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    add       NestLoop rows=44547 cost=18169.5..31523.2 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    rej       NestLoop rows=44547 cost=18169.5..31523.2 pk=2 psafe=0 jt=INNER out=(b 1 4) in=(b 3) by=[NestLoop rows=44547 cost=18169.7..24809.6] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=14370 cost=257.113..35636.9 pw=3 jt=INNER out=(b 1 4) in=(b 3)
+    prej      NestLoop rows=14370 cost=257.113..35636.9 pw=3 jt=INNER out=(b 1 4) in=(b 3) by=[HashJoin rows=14370 cost=258.502..16914.2] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=18157..18157 pk=0 par=- by=[HashJoin rows=14370 cost=258.502..16914.2]
+    padd      NestLoop rows=14370 cost=257.257..16487.4 pw=3 jt=INNER out=(b 1 4) in=(b 3)
+    pok       NestLoop rows=14370 cost=257.257..16487.4 pw=3 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    padd      NestLoop rows=14370 cost=257.113..18653.2 pw=3 jt=INNER out=(b 1 4) in=(b 3)
+    prej      NestLoop rows=14370 cost=257.113..18653.2 pw=3 jt=INNER out=(b 1 4) in=(b 3) by=[NestLoop rows=14370 cost=257.257..16487.4] via=cost cmp=keys:EQ
+    add       HashJoin rows=44547 cost=258.502..22447.8 jt=INNER out=(b 1 4) in=(b 3)
+    ok        HashJoin rows=44547 cost=258.502..22447.8 jt=INNER out=(b 1 4) in=(b 3) removed=2
+    add       HashJoin rows=44547 cost=1258.5..21956 psafe=0 jt=INNER out=(b 1 4) in=(b 3)
+    ok        HashJoin rows=44547 cost=1258.5..21956 psafe=0 jt=INNER out=(b 1 4) in=(b 3) removed=0
+    padd      HashJoin rows=14370 cost=258.502..16179.4 pw=3 jt=INNER out=(b 1 4) in=(b 3)
+    pok       HashJoin rows=14370 cost=258.502..16179.4 pw=3 jt=INNER out=(b 1 4) in=(b 3) removed=1
+    preskip   dis=0 cost=25410.4..25527.1 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=1257.11..261491 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=1257.11..23308.4 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=1257.25..261502 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=1257.25..23319.6 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=25409.1..25536 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    preskip   dis=0 cost=22374..22375.3 pk=0 par=- by=[HashJoin rows=44547 cost=1258.5..21956]
+    add       Gather rows=44547 cost=1258.5..21634.1 psafe=0
+    ok        Gather rows=44547 cost=1258.5..21634.1 psafe=0 removed=1
+    add       GatherMerge rows=44547 cost=18171.8..23442 pk=2 psafe=0
+    ok        GatherMerge rows=44547 cost=18171.8..23442 pk=2 psafe=0 removed=1
+=== rel=(b 1 2 3 4) npath=2 npart=1 total=[Gather rows=137 cost=1258.81..18123.3 psafe=0] startup=[Gather rows=137 cost=1258.81..18123.3] param=[Gather rows=137 cost=1258.81..18123.3]
+    add       MergeJoin rows=137 cost=19918.8..19932.7 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    ok        MergeJoin rows=137 cost=19918.8..19932.7 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) removed=0
+    padd      MergeJoin rows=44 cost=18622.9..18629 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    pok       MergeJoin rows=44 cost=18622.9..18629 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) removed=0
+    add       NestLoop rows=137 cost=3447.65..562808 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    rej       NestLoop rows=137 cost=3447.65..562808 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) by=[MergeJoin rows=137 cost=19918.8..19932.7] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=137 cost=3447.93..20201 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    rej       NestLoop rows=137 cost=3447.93..20201 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) by=[MergeJoin rows=137 cost=19918.8..19932.7] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3447.94..20147.3 pk=0 par=- by=[MergeJoin rows=137 cost=19918.8..19932.7]
+    add       NestLoop rows=137 cost=3447.65..35280.3 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    rej       NestLoop rows=137 cost=3447.65..35280.3 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) by=[MergeJoin rows=137 cost=19918.8..19932.7] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       NestLoop rows=137 cost=19350.1..562879 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    ok        NestLoop rows=137 cost=19350.1..562879 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) removed=0
+    add       NestLoop rows=137 cost=19350.4..20271.8 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    ok        NestLoop rows=137 cost=19350.4..20271.8 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) removed=1
+    add       NestLoop rows=137 cost=19350.4..20324.6 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    rej       NestLoop rows=137 cost=19350.4..20324.6 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) by=[NestLoop rows=137 cost=19350.4..20271.8] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       NestLoop rows=137 cost=19350.1..35351.1 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    rej       NestLoop rows=137 cost=19350.1..35351.1 pk=2 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) by=[NestLoop rows=137 cost=19350.4..20271.8] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    padd      NestLoop rows=44 cost=2447.65..193669 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    prej      NestLoop rows=44 cost=2447.65..193669 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) by=[MergeJoin rows=44 cost=18622.9..18629] via=cost cmp=keys:EQ
+    padd      NestLoop rows=44 cost=2447.93..18534.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    pok       NestLoop rows=44 cost=2447.93..18534.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) removed=1
+    padd      NestLoop rows=44 cost=2447.94..18551.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    prej      NestLoop rows=44 cost=2447.94..18551.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) by=[NestLoop rows=44 cost=2447.93..18534.8] via=tie cmp=keys:EQ
+    padd      NestLoop rows=44 cost=2447.65..23572.6 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    prej      NestLoop rows=44 cost=2447.65..23572.6 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) by=[NestLoop rows=44 cost=2447.93..18534.8] via=cost cmp=keys:EQ
+    add       HashJoin rows=137 cost=3704.76..19791.9 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4)
+    ok        HashJoin rows=137 cost=3704.76..19791.9 psafe=0 jt=INNER out=(b 1 2 3) in=(b 4) removed=1
+    padd      HashJoin rows=44 cost=2704.76..18576.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4)
+    prej      HashJoin rows=44 cost=2704.76..18576.8 pw=3 jt=INNER out=(b 1 2 3) in=(b 4) by=[NestLoop rows=44 cost=2447.93..18534.8] via=tie cmp=keys:EQ
+    add       MergeJoin rows=137 cost=19918.8..19932.7 psafe=0 jt=INNER out=(b 4) in=(b 1 2 3)
+    rej       MergeJoin rows=137 cost=19918.8..19932.7 psafe=0 jt=INNER out=(b 4) in=(b 1 2 3) by=[HashJoin rows=137 cost=3704.76..19791.9] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=3447.65..9.55005e+06 pk=0 par=- by=[HashJoin rows=137 cost=3704.76..19791.9]
+    preskip   dis=0 cost=3447.65..22368.7 pk=0 par=- by=[HashJoin rows=137 cost=3704.76..19791.9]
+    preskip   dis=0 cost=3447.93..9.55018e+06 pk=0 par=- by=[HashJoin rows=137 cost=3704.76..19791.9]
+    preskip   dis=0 cost=3447.93..22496 pk=0 par=- by=[HashJoin rows=137 cost=3704.76..19791.9]
+    preskip   dis=0 cost=19646.2..20029.3 pk=0 par=- by=[HashJoin rows=137 cost=3704.76..19791.9]
+    add       HashJoin rows=137 cost=19555.7..19810.5 psafe=0 jt=INNER out=(b 4) in=(b 1 2 3)
+    rej       HashJoin rows=137 cost=19555.7..19810.5 psafe=0 jt=INNER out=(b 4) in=(b 1 2 3) by=[HashJoin rows=137 cost=3704.76..19791.9] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       MergeJoin rows=137 cost=18129..18131.1 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        MergeJoin rows=137 cost=18129..18131.1 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    padd      MergeJoin rows=44 cost=17110.8..17111.5 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    pok       MergeJoin rows=44 cost=17110.8..17111.5 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=1257.41..18308.2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=1257.41..18308.2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=1257.55..18145.4 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=1257.55..18145.4 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=1257.56..18126.9 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=1257.56..18126.9 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=1257.41..18147.7 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    rej       NestLoop rows=137 cost=1257.41..18147.7 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) by=[NestLoop rows=137 cost=1257.56..18126.9] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       NestLoop rows=137 cost=18109.4..18312.1 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=18109.4..18312.1 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=18109.5..18149.3 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=18109.5..18149.3 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=18109.5..18130.9 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        NestLoop rows=137 cost=18109.5..18130.9 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       NestLoop rows=137 cost=18109.4..18151.6 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    rej       NestLoop rows=137 cost=18109.4..18151.6 pk=2 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) by=[NestLoop rows=137 cost=18109.5..18130.9] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    padd      NestLoop rows=44 cost=257.415..17167.3 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    prej      NestLoop rows=44 cost=257.415..17167.3 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) by=[MergeJoin rows=44 cost=17110.8..17111.5] via=tie cmp=keys:EQ
+    padd      NestLoop rows=44 cost=257.55..17115.5 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    prej      NestLoop rows=44 cost=257.55..17115.5 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) by=[MergeJoin rows=44 cost=17110.8..17111.5] via=tie cmp=keys:EQ
+    padd      NestLoop rows=44 cost=257.56..17110.3 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    pok       NestLoop rows=44 cost=257.56..17110.3 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    padd      NestLoop rows=44 cost=257.415..17117 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    prej      NestLoop rows=44 cost=257.415..17117 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) by=[NestLoop rows=44 cost=257.56..17110.3] via=tie cmp=keys:EQ
+    add       HashJoin rows=137 cost=1258.81..18124.3 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3)
+    ok        HashJoin rows=137 cost=1258.81..18124.3 psafe=0 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    padd      HashJoin rows=44 cost=258.805..17109.6 pw=3 jt=INNER out=(b 1 2 4) in=(b 3)
+    pok       HashJoin rows=44 cost=258.805..17109.6 pw=3 jt=INNER out=(b 1 2 4) in=(b 3) removed=1
+    add       MergeJoin rows=137 cost=18129..18131.1 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4)
+    rej       MergeJoin rows=137 cost=18129..18131.1 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4) by=[HashJoin rows=137 cost=1258.81..18124.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=1257.41..217470 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    add       NestLoop rows=137 cost=1257.41..18149.7 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4)
+    rej       NestLoop rows=137 cost=1257.41..18149.7 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4) by=[HashJoin rows=137 cost=1258.81..18124.3] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    preskip   dis=0 cost=1257.55..217481 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    add       NestLoop rows=137 cost=1257.55..18160.9 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4)
+    rej       NestLoop rows=137 cost=1257.55..18160.9 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4) by=[HashJoin rows=137 cost=1258.81..18124.3] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       MergeJoin rows=137 cost=18127.6..18140 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4)
+    rej       MergeJoin rows=137 cost=18127.6..18140 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4) by=[HashJoin rows=137 cost=1258.81..18124.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       HashJoin rows=137 cost=18124.2..18127.2 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4)
+    rej       HashJoin rows=137 cost=18124.2..18127.2 psafe=0 jt=INNER out=(b 3) in=(b 1 2 4) by=[HashJoin rows=137 cost=1258.81..18124.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    preskip   dis=0 cost=28242.3..28353.7 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    ppreskip  dis=0 cost=20376.1..20376.1 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    preskip   dis=0 cost=1258.5..21634.1 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.8..34664.1 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.81..22612.8 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.5..21634.1 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=258.502..22447.8 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=258.795..35477.8 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=258.805..23426.4 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=258.502..22447.8 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=18171.8..23442 pk=2 par=- by=[NestLoop rows=137 cost=18109.5..18130.9]
+    preskip   dis=0 cost=18172.1..36472 pk=2 par=- by=[NestLoop rows=137 cost=18109.5..18130.9]
+    preskip   dis=0 cost=18172.1..24420.7 pk=2 par=- by=[NestLoop rows=137 cost=18109.5..18130.9]
+    preskip   dis=0 cost=18171.8..23442 pk=2 par=- by=[NestLoop rows=137 cost=18109.5..18130.9]
+    padd      NestLoop rows=44 cost=258.502..4.5452e+07 pw=3 jt=INNER out=(b 1 3 4) in=(b 2)
+    prej      NestLoop rows=44 cost=258.502..4.5452e+07 pw=3 jt=INNER out=(b 1 3 4) in=(b 2) by=[HashJoin rows=44 cost=258.805..17109.6] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=20382.6..20382.6 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    padd      NestLoop rows=44 cost=258.805..17145.3 pw=3 jt=INNER out=(b 1 3 4) in=(b 2)
+    prej      NestLoop rows=44 cost=258.805..17145.3 pw=3 jt=INNER out=(b 1 3 4) in=(b 2) by=[HashJoin rows=44 cost=258.805..17109.6] via=tie cmp=keys:EQ
+    padd      NestLoop rows=44 cost=258.502..69993.2 pw=3 jt=INNER out=(b 1 3 4) in=(b 2)
+    prej      NestLoop rows=44 cost=258.502..69993.2 pw=3 jt=INNER out=(b 1 3 4) in=(b 2) by=[HashJoin rows=44 cost=258.805..17109.6] via=cost cmp=keys:EQ
+    preskip   dis=0 cost=3420.35..25721 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=4420.35..24907.3 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    ppreskip  dis=0 cost=18661.6..18661.6 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    ppreskip  dis=0 cost=19377.2..19377.2 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    preskip   dis=0 cost=28242.3..28353.7 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    ppreskip  dis=0 cost=28448.5..28448.5 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    preskip   dis=0 cost=1258.5..5.08718e+06 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.5..51075.8 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.8..5.08835e+06 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=1258.8..52252.3 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    preskip   dis=0 cost=27195.6..27417.6 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    ppreskip  dis=0 cost=27862..27862 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    preskip   dis=0 cost=22191..25350.5 pk=0 par=- by=[HashJoin rows=137 cost=1258.81..18124.3]
+    ppreskip  dis=0 cost=18803.9..18803.9 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    ppreskip  dis=0 cost=25449.5..25449.5 pk=0 par=- by=[HashJoin rows=44 cost=258.805..17109.6]
+    add       Gather rows=137 cost=1258.81..18123.3 psafe=0
+    ok        Gather rows=137 cost=1258.81..18123.3 psafe=0 removed=1
+    add       GatherMerge rows=137 cost=18110.9..18127.1 pk=2 psafe=0
+    ok        GatherMerge rows=137 cost=18110.9..18127.1 pk=2 psafe=0 removed=1
+=== rel=(b) npath=1 npart=0 total=[Sort rows=15 cost=18255.3..18255.3 pk=5 psafe=0] startup=[Sort rows=15 cost=18255.3..18255.3] param=[Sort rows=15 cost=18255.3..18255.3]
+    padd      Agg rows=44 cost=17110.8..17111.7 pk=2 pw=3
+    pok       Agg rows=44 cost=17110.8..17111.7 pk=2 pw=3 removed=0
+    padd      Agg rows=44 cost=17110..17110.4 pw=3
+    prej      Agg rows=44 cost=17110..17110.4 pw=3 by=[Agg rows=44 cost=17110.8..17111.7] via=keys cmp=keys:B2
+    add       Gather rows=136 cost=18110.8..18125.3 psafe=0
+    ok        Gather rows=136 cost=18110.8..18125.3 psafe=0 removed=0
+    add       GatherMerge rows=136 cost=18110.9..18127.7 pk=2 psafe=0
+    ok        GatherMerge rows=136 cost=18110.9..18127.7 pk=2 psafe=0 removed=1
+    add       Agg rows=15 cost=18128.2..18131.6 pk=2 psafe=0
+    ok        Agg rows=15 cost=18128.2..18131.6 pk=2 psafe=0 removed=0
+    add       Agg rows=15 cost=18110.9..18130.2 pk=2 psafe=0
+    ok        Agg rows=15 cost=18110.9..18130.2 pk=2 psafe=0 removed=1
+    add       Agg rows=15 cost=18110.9..18130.8 pk=2 psafe=0
+    rej       Agg rows=15 cost=18110.9..18130.8 pk=2 psafe=0 by=[Agg rows=15 cost=18110.9..18130.2] via=tie cmp=cost:EQ keys:EQ outer:EQ
+    add       Agg rows=15 cost=18124.4..18126.4 psafe=0
+    rej       Agg rows=15 cost=18124.4..18126.4 psafe=0 by=[Agg rows=15 cost=18110.9..18130.2] via=keys cmp=cost:EQ keys:B2 outer:EQ
+    add       Agg rows=15 cost=18128.8..18130.8 psafe=0
+    rej       Agg rows=15 cost=18128.8..18130.8 psafe=0 by=[Agg rows=15 cost=18110.9..18130.2] via=keys cmp=cost:EQ keys:B2 outer:EQ
+    add       Agg rows=15 cost=18110.9..18130.2 pk=2 psafe=0
+    ok        Agg rows=15 cost=18110.9..18130.2 pk=2 psafe=0 removed=0
+    add       Sort rows=15 cost=18255.3..18255.3 pk=5 psafe=0
+    ok        Sort rows=15 cost=18255.3..18255.3 pk=5 psafe=0 removed=0
+    add       IncrementalSort rows=15 cost=31907.3..63563.4 pk=5 psafe=0
+    rej       IncrementalSort rows=15 cost=31907.3..63563.4 pk=5 psafe=0 by=[Sort rows=15 cost=18255.3..18255.3] via=cost cmp=cost:B2 keys:EQ outer:EQ
+    add       Sort rows=15 cost=18255.3..18255.3 pk=5 psafe=0
+    ok        Sort rows=15 cost=18255.3..18255.3 pk=5 psafe=0 removed=0
+--- totals: {'add': 156, 'ok': 93, 'padd': 63, 'pok': 31, 'rej': 63, 'win': 20, 'preskip': 138, 'prej': 32, 'ppreskip': 44}
+--- reject-via: {'cost': 74, 'preskip': 182, 'tie': 18, 'keys': 3}
+

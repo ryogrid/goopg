@@ -15,6 +15,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -29,11 +30,14 @@ import (
 //
 // v0 collects:
 //
-//   - RowCount: visible-tuple count under a fresh
-//     ReadCommitted snapshot (matches upstream's reltuples
-//     definition; exact, not sample-scaled).
+//   - RowCount: extrapolated from the sampled blocks, matching upstream's
+//     reltuples definition exactly (analyze.c:1330-1339's
+//     `floor((liverows/bs.m)*totalblocks+0.5)`) — a random variable across
+//     runs whenever the relation has more blocks than the sample cap, same
+//     as PG's. Degrades to an exact count for a relation small enough that
+//     every block is sampled. M0138-0002.
 //   - Pages: raw block count.
-//   - AvgWidth: total decoded-row bytes / RowCount.
+//   - AvgWidth: total decoded-row bytes / live rows seen in the sample.
 //   - Per-column NDistinct, NullFrac, MCV list, and equi-depth
 //     histogram (computed from the sample).
 //
@@ -133,6 +137,9 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			_ = werr
 		}
 		relStats.resetAnalyzeTriggers(tbl.OID)
+		// The shared stats entry gets the same report (pgstat_report_analyze):
+		// mod_since_analyze resets to zero.
+		relStats.reportAnalyze(tbl.OID)
 	}
 	// Inheritance-tree statistics for partitioned parents read every leaf
 	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
@@ -167,6 +174,7 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 		parent.Stats = &catalog.TableStats{RowCount: rows, Pages: pages, Analyzed: true}
 		o.ctx.Catalog.SetTableStats(parent, parent.Stats)
 		relStats.resetAnalyzeTriggers(parent.OID)
+		relStats.reportAnalyze(parent.OID)
 	}
 	return nil, EOF
 }
@@ -665,6 +673,37 @@ func analyzeMCVList(mcvCounts []int, numMCV int, staDistinct, staNullFrac float6
 	return numMCV
 }
 
+// analyzeSampleTID is one reservoir entry's physical location, upstream's
+// HeapTuple->t_self as read by `compare_rows` (analyze.c:1361).
+type analyzeSampleTID struct {
+	block  uint32
+	offset uint16
+}
+
+// analyzeSampleByTID sorts the reservoir into physical order, carrying the
+// rows and their locations together. It is `compare_rows`: block first, then
+// offset. ANALYZE's correlation statistic is the Pearson correlation between
+// physical row order and sorted-value order, so `computeColumnStats` can only
+// read a row's index as its physical position once this has run.
+type analyzeSampleByTID struct {
+	rows []Row
+	tids []analyzeSampleTID
+}
+
+func (a *analyzeSampleByTID) Len() int { return len(a.rows) }
+
+func (a *analyzeSampleByTID) Less(i, j int) bool {
+	if a.tids[i].block != a.tids[j].block {
+		return a.tids[i].block < a.tids[j].block
+	}
+	return a.tids[i].offset < a.tids[j].offset
+}
+
+func (a *analyzeSampleByTID) Swap(i, j int) {
+	a.rows[i], a.rows[j] = a.rows[j], a.rows[i]
+	a.tids[i], a.tids[j] = a.tids[j], a.tids[i]
+}
+
 // analyzeSeedEnv is the process-wide fallback seed for ANALYZE's reservoir
 // sampler, read once from `GOOPG_ANALYZE_SEED`. Zero (the unset case) keeps
 // upstream behaviour: every ANALYZE draws a fresh wall-clock-seeded sample,
@@ -748,11 +787,14 @@ func analyzeRelation(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catal
 	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(analyzeSeedFor(tbl))), nil, nil)
 }
 
-// analyzeRelationWith walks every block of tbl under a fresh
-// snapshot, decodes visible tuples via the executor codec,
-// reservoir-samples them with `targrows = target *
-// upstreamSampleMultiplier`, and computes per-table + per-column
-// statistics from the sample (RowCount and Pages remain exact).
+// analyzeRelationWith runs PG's two-stage acquire_sample_rows
+// (analyze.c:1199, ported in analyze_block_sampler.go): stage one samples
+// up to `targrows = target * upstreamSampleMultiplier` BLOCKS at random
+// (blockSampler, Knuth Algorithm S), stage two reservoir-samples ROWS
+// within only those blocks (reservoirState, Vitter Algorithm Z), and
+// computes per-table + per-column statistics from the sample. RowCount is
+// extrapolated from the sampled blocks (see the extrapolation comment at
+// its assignment); Pages remains exact (a raw block count, not sampled).
 // dsCtx supplies session-GUC reachability for DateStyle-aware MCV/
 // histogram-bound rendering (formatDatumDateStyle); pass nil where no
 // session context is available (falls back to ISO/MDY, matching
@@ -779,6 +821,15 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		sampleCap = 1
 	}
 	reservoir := make([]Row, 0, sampleCap)
+	// R30: the physical (block, offset) location of each reservoir entry.
+	// Algorithm R replaces a UNIFORMLY CHOSEN slot, so once the reservoir is
+	// full its index order no longer tracks physical order -- and the index
+	// is exactly what `computeColumnStats` uses as the `pos` of its
+	// correlation pairs. Upstream has the same problem and fixes it by
+	// re-sorting the sample into ItemPointer order before computing stats
+	// (analyze.c:1312-1322, `compare_rows`); goopg never did, so correlation
+	// collapsed toward 0 for every relation bigger than the sample cap.
+	reservoirTID := make([]analyzeSampleTID, 0, sampleCap)
 
 	stats := &catalog.TableStats{
 		Pages:   int(nBlocks),
@@ -790,9 +841,29 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		Analyzed: true,
 	}
 	var totalBytes int64
-	var seen int64
+	// PG: liverows == samplerows. acquire_sample_rows keeps these as two
+	// counters because heapam_scan_analyze_next_tuple can also report
+	// deadrows (skipped without reaching the reservoir logic at all); goopg
+	// has no dead-row bookkeeping yet (ledger row
+	// m0138-0002-deadrows-not-tracked — nothing downstream consumes a dead
+	// count), so one counter serves both roles here.
+	var liverows float64
+	var rowstoskip float64 = -1
 
-	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+	// M0138-0002: PG's two-stage acquire_sample_rows (analyze.c:1199) — stage
+	// one selects up to sampleCap BLOCKS at random (blockSampler, Knuth
+	// Algorithm S), stage two reservoir-samples ROWS within only those
+	// blocks (reservoirState, Vitter Algorithm Z) — replacing the classic
+	// Algorithm R over EVERY block that ran here before this task. `rng`
+	// (analyzeSeedFor, GOOPG_ANALYZE_SEED-pinnable) is consulted exactly
+	// twice, standing in for PG's process-wide pg_global_prng_state that
+	// seeds both sub-generators (analyze.c:1225,1232) — see
+	// analyze_block_sampler.go's file comment for the full rationale.
+	blkSampler := newBlockSampler(uint32(nBlocks), sampleCap, uint64(rng.Int63()))
+	rstate := newReservoirState(sampleCap, uint64(rng.Int63()))
+
+	for blkSampler.hasMore() {
+		blk := storage.BlockNumber(blkSampler.next())
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
 			return nil, err
@@ -830,30 +901,37 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
-			stats.RowCount++
 			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
 
 			// review/260831 EO1-4: decode ONLY the tuples the reservoir keeps.
 			// Every visible tuple used to be decoded into a fresh Row — a full
 			// per-column decode plus an allocation — and then dropped by the
 			// sampling test below, so a 10M-row table paid 10M decodes to keep
-			// a few thousand rows. The RNG is still consulted once per row past
-			// the cap, in the same order, so the sample is the same sample.
+			// a few thousand rows.
 			//
-			// Decode the PG-physical tuple body using the header (natts +
-			// null bitmap). Single on-disk row format since M0111-0002.
-			// Algorithm R: fill the reservoir, then for each
-			// subsequent row replace a uniformly-chosen slot
-			// with probability sampleCap/seen. `keep` is decided BEFORE the
-			// decode, and -1 means "this tuple is not in the sample".
+			// PG's Vitter Algorithm Z (analyze.c:1276-1301, mirrored exactly):
+			// the first sampleCap rows fill the reservoir outright ("if
+			// numrows < targrows"). After that, `rowstoskip` — computed by
+			// reservoirState.getNextS using `liverows` BEFORE this row is
+			// counted, exactly as PG's samplerows argument — counts down rows
+			// to pass over before the next replacement, which then picks its
+			// victim slot via a SEPARATE draw on the same PRNG state, not
+			// Algorithm R's per-row rng.Int63n(seen+1) draw this replaced.
 			keep := -1
-			if seen < int64(sampleCap) {
+			if len(reservoir) < sampleCap {
 				keep = len(reservoir)
 				reservoir = append(reservoir, nil)
-			} else if j := rng.Int63n(seen + 1); j < int64(sampleCap) {
-				keep = int(j)
+				reservoirTID = append(reservoirTID, analyzeSampleTID{})
+			} else {
+				if rowstoskip < 0 {
+					rowstoskip = rstate.getNextS(liverows, sampleCap)
+				}
+				if rowstoskip <= 0 {
+					keep = int(float64(sampleCap) * samplerRandomFract(&rstate.rand))
+				}
+				rowstoskip--
 			}
-			seen++
+			liverows++
 			if keep < 0 {
 				continue
 			}
@@ -866,12 +944,34 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 				return nil, fmt.Errorf("ANALYZE %s slot=%d: %w", tbl.QualifiedName(), s, derr)
 			}
 			reservoir[keep] = row
+			reservoirTID[keep] = analyzeSampleTID{block: uint32(blk), offset: s}
 		}
 		pool.Unpin(slot)
 	}
 
-	if stats.RowCount > 0 {
-		stats.AvgWidth = float64(totalBytes) / float64(stats.RowCount)
+	// R30 / PG analyze.c:1312-1322: restore physical order. Upstream sorts
+	// only when the reservoir filled ("If we didn't find as many tuples as we
+	// wanted then we're done. No sort is needed, since they're already in
+	// order."); the same condition holds here, and keeping it means a
+	// short relation takes exactly the path it took before.
+	if len(reservoir) == sampleCap {
+		sort.Sort(&analyzeSampleByTID{rows: reservoir, tids: reservoirTID})
+	}
+
+	// PG analyze.c:1330-1339: totalrows is an EXTRAPOLATED ESTIMATE from the
+	// sampled blocks, never an exact count once totalblocks > sampleCap — a
+	// consequence of the owner's Q2 decision (AGENT.md "Plan-parity
+	// harness": reproduce PG's estimates, errors included) that the
+	// M0138-0001 census flagged as a scope question for this task
+	// (ledger row m0138-0001-reltuples-sample-extrapolation). It degrades to
+	// an exact count when blkSampler.m == nBlocks (every block sampled),
+	// the same case PG's BlockSampler_Next degrades to a full scan.
+	if blkSampler.m > 0 {
+		stats.RowCount = int64(math.Floor((liverows/float64(blkSampler.m))*float64(nBlocks) + 0.5))
+	}
+
+	if liverows > 0 {
+		stats.AvgWidth = float64(totalBytes) / liverows
 	}
 
 	for i := range tbl.Columns {
@@ -879,7 +979,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 		if !ok {
 			continue
 		}
-		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, stats.RowCount, dsCtx)
+		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, stats.RowCount, tbl.Columns[i].Type, dsCtx)
 		// Honor a per-column `n_distinct` attribute option, mirroring
 		// upstream's override in compute_index_stats/do_analyze_rel
 		// (postgres/src/backend/commands/analyze.c:571-581): a manual
@@ -1072,20 +1172,80 @@ func datumVariablePayloadWidth(d Datum) int {
 		if d.Flags&flagBigNumeric != 0 {
 			return int(uint32(d.Int & 0xFFFFFFFF))
 		}
-		return 0 // fast-path int64 mantissa fits in Datum.Int
+		return numericFastPathOnDiskWidth(d.Int, d.Scale)
 	default:
 		return 0
 	}
+}
+
+// pgVarlenaShortMaxBody is PG's VARATT_SHORT_MAX (postgres/src/include/varatt.h:257)
+// minus VARHDRSZ_SHORT (:255) — the largest varlena BODY (header excluded) that
+// still fits a 1-byte "short" varlena header. numeric_size-equivalent width
+// computation below wraps its NumericData body in this same header the way a
+// small on-heap value actually is.
+const pgVarlenaShortMaxBody = 0x7F - 1
+
+// numericFastPathOnDiskWidth is M0138-0007's fix: PG's `compute_scalar_stats`
+// measures `VARSIZE_ANY(DatumGetPointer(value))` (analyze.c:2008,2124,2471) —
+// the FULL on-disk varlena size, header included, of the sample row's raw
+// (not detoasted-and-repacked) attribute Datum. For a NUMERIC column that is
+// PG's NumericData struct (`postgres/src/backend/utils/adt/numeric.c:130-146`,
+// short 2-byte internal header when `NUMERIC_CAN_BE_SHORT` holds, else the
+// 4-byte long form) wrapped in the varlena's own 1-byte ("short", body <= 126
+// bytes) or 4-byte header — every fast-path value here is well under that
+// bound, since it is bounded by int64.
+//
+// Oracle-verified rather than assumed: PG 18.3 on the TPC-H bench cluster
+// (`:65432`) reports `pg_column_size(l_quantity)=5` for `18` (dscale 0,
+// 1 digit: 1-byte varlena hdr + 2-byte short numeric hdr + 1 digit*2 bytes)
+// and `pg_stats.avg_width=8` for `l_extendedprice` (dscale 2, 2-3 digits:
+// 7 or 9 bytes depending on magnitude) — both match this formula exactly and
+// refute the NUMERIC_HDRSZ-only (long-form, no short-varlena) guess this
+// ticket's ledger row originally floated.
+//
+// Reuses `nodes.NumericBodyFromText` (the same port `codec.go` uses for the
+// heap's on-disk numeric column form) rather than re-deriving the base-10000
+// digit grouping here, so the two callers cannot drift on ndigits/weight
+// rules.
+func numericFastPathOnDiskWidth(mantissa int64, scale int16) int {
+	body, err := nodes.NumericBodyFromText(formatNumeric(mantissa, scale))
+	if err != nil {
+		return 0
+	}
+	if len(body) <= pgVarlenaShortMaxBody {
+		return 1 + len(body)
+	}
+	return 4 + len(body)
 }
 
 // totalRows is the relation's FULL live-row count (goopg's ANALYZE walks every
 // block and reservoir-samples, so the caller has measured it exactly). It is
 // what turns the sample's distinct count into a table-wide estimate — see
 // ndistinctEstimate. M0127-P5.6-e-iii.
-func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int64, dsCtx *Context) catalog.ColumnStats {
+func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int64, colType catalog.Type, dsCtx *Context) catalog.ColumnStats {
 	stats := catalog.ColumnStats{}
 	if len(sample) == 0 {
 		return stats
+	}
+
+	// M0138-0004 / M0138-0001 finding 3: PG's compute_scalar_stats never
+	// measures a fixed-width (non-varlena) type's average width from the
+	// data at all — `is_varwidth = !typbyval && typlen < 0` is false for
+	// every by-value type AND every fixed-length by-reference type (uuid,
+	// interval, macaddr, …), and in that case stawidth is simply the type's
+	// typlen (analyze.c:2565-2569, plus the too-wide-only and all-null
+	// branches at :2965 and :2975, which apply the same typlen literally).
+	// goopg's per-row loop only ever measures a *variable* payload
+	// (datumVariablePayloadWidth returns 0 for every fixed-width kind), so
+	// without this fallback every int4/int8/date/… column reported
+	// AvgWidth=0 — the census's finding 3 (32/61 TPC-H, 70/121 TPC-DS
+	// columns). `colTypeDescriptor` is the same name->OID->pg_type.dat
+	// bridge coltypeinfo.go already uses; TypLen<0 covers both varlena
+	// (-1) and cstring (-2), matching PG's is_varwidth exactly.
+	typLen := colTypeDescriptor(colType).TypLen
+	fixedWidth := typLen >= 0
+	if fixedWidth {
+		stats.AvgWidth = float64(typLen)
 	}
 
 	// Per-key counts plus a representative Datum per key (so we
@@ -1104,13 +1264,23 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// logical (sorted) column order. We collect (value, original_position)
 	// pairs here during the first pass so the correlation can be computed
 	// after sorting by value. Non-orderable kinds skip this.
+	//
+	// `pos` is the position among NON-NULL values only — PG's `tupno`, which
+	// is assigned `values[values_cnt].tupno = values_cnt` (analyze.c:2495)
+	// AFTER the null `continue`, so it counts 0,1,…,nonnull−1 contiguously.
+	// The closed form below is only valid when the physical axis is a
+	// permutation of 0..n−1; the raw sample index is SPARSE when nulls are
+	// present (gaps where nulls were skipped), which silently breaks the
+	// sum(x)=sum(x²) assumptions and can return |corr| > 1 — observed live
+	// as correlation=1.0019597 on TPC-DS `catalog_sales.cs_catalog_page_sk`
+	// (M0142-0005c).
 	type valuePosition struct {
 		d   Datum
 		pos int
 	}
 	var corrPairs []valuePosition
 
-	for pos, row := range sample {
+	for _, row := range sample {
 		if colIdx >= len(row) {
 			// Defensive: mismatched schema shouldn't happen given
 			// DecodeRow honours tbl.Columns, but stay sane.
@@ -1131,12 +1301,18 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		}
 
 		// Collect for correlation: track original position alongside value.
-		corrPairs = append(corrPairs, valuePosition{d: d, pos: pos})
+		// `nonNull-1` is the contiguous non-null index (PG's `tupno`), not
+		// the raw sample offset — see the comment above.
+		corrPairs = append(corrPairs, valuePosition{d: d, pos: nonNull - 1})
 	}
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
 
-	if nonNull > 0 {
+	// Variable-width types only: fixed-width types already got their
+	// typlen-derived AvgWidth above and PG never overwrites it with a
+	// measured value (analyze.c's is_varwidth branch guards the
+	// total_width/nonnull_cnt division the same way).
+	if !fixedWidth && nonNull > 0 {
 		stats.AvgWidth = float64(totalPayloadWidth) / float64(nonNull)
 	}
 
@@ -1163,15 +1339,29 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	}
 
 	// --- correlation (STATISTIC_KIND_CORRELATION) ---
-	// Pearson correlation between physical row order (original sample
-	// position) and logical column order (position after sorting by value).
+	// Pearson correlation between physical row order (original NON-NULL
+	// sample position — PG's `tupno`) and logical column order (position
+	// after sorting by value).
 	// PG's compute_scalar_stats (analyze.c:2853-2890): since both x and y
 	// sets are {0,1,...,n-1}, sum(x)=sum(y)=n*(n-1)/2 and
 	// sum(x^2)=sum(y^2)=n*(n-1)*(2n-1)/6, so the coefficient reduces to
 	//   corr = (n * Σxy - Σx²) / (n * Σx² - Σx²)
 	// where Σxy is the sum of original_position[i] * sorted_position[i].
 	if len(corrPairs) > 1 && isOrderableKind(corrPairs[0].d.Kind) {
-		sort.Slice(corrPairs, func(i, j int) bool {
+		// M0138-0004 / M0138-0001 finding 2: PG's compare_scalars breaks a
+		// tie between equal-valued items by original scan position ---
+		// "for equal datums, sort by tupno" (analyze.c compare_scalars,
+		// `return ta - tb`) --- which is a deterministic total order, not
+		// "whatever qsort happens to do with equal keys". `sort.Slice` is
+		// documented non-stable, so two duplicate values could land in
+		// either relative order run-to-run; `corrPairs` is already built
+		// in ascending original-position order (the loop above appends in
+		// sample scan order), so a STABLE sort reproduces PG's ascending
+		// tupno tie-break exactly instead of leaving it undefined. Live
+		// evidence this mattered: 12/23 TPC-DS `store_sales` columns
+		// clustered inside an unrelated [0.12,0.15] correlation band under
+		// the old unstable sort.
+		sort.SliceStable(corrPairs, func(i, j int) bool {
 			cmp, err := compareDatum(corrPairs[i].d, corrPairs[j].d, 0)
 			if err != nil {
 				return false
@@ -1190,19 +1380,51 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 			corrX2Sum := (n - 1.0) * n * (2.0*n - 1.0) / 6.0
 			denom := n*corrX2Sum - corrXSum*corrXSum
 			if denom != 0 {
-				stats.Correlation = (n*corrXYSum - corrXSum*corrXSum) / denom
+				// PG stores the raw quotient — for genuine permutations it
+				// is exact — and does not clamp (analyze.c:2881-2885). The
+				// clamp below guards only float noise on the closed form;
+				// a result materially outside [-1,1] would mean the
+				// permutation assumption was violated, which is the bug
+				// M0142-0005d removes, not a state to propagate.
+				corr := (n*corrXYSum - corrXSum*corrXSum) / denom
+				stats.Correlation = math.Min(1, math.Max(-1, corr))
 			}
 		}
 	}
 
 	// Sort buckets by count desc — primary input to the MCV /
 	// histogram split.
+	//
+	// M0138-0004: PG builds its MCV `track` list by walking values in
+	// ASCENDING sorted-by-value order and only replacing the current
+	// tail-of-list occupant when a new group's count is STRICTLY greater
+	// (analyze.c: `dups_cnt > track[track_cnt-1].count`); a count TIE at the
+	// truncation boundary is a no-op, so whichever value's group was
+	// encountered first --- i.e. the smaller value --- keeps the slot. A
+	// plain count-only sort here leaves ties in whatever order `freq`'s map
+	// iteration happened to produce, which is unspecified and can disagree
+	// with PG (and with itself run-to-run). Tie-breaking by ascending value
+	// reproduces PG's "earlier in the scan wins" rule for orderable kinds;
+	// non-orderable kinds have no PG-defined order to match here (they take
+	// compute_distinct_stats upstream, a different algorithm not ported),
+	// so their tie order is left as before.
 	buckets := make([]*bucket, 0, len(freq))
 	for _, b := range freq {
 		buckets = append(buckets, b)
 	}
+	orderable := len(buckets) > 0 && isOrderableKind(buckets[0].val.Kind)
 	sort.Slice(buckets, func(i, j int) bool {
-		return buckets[i].count > buckets[j].count
+		if buckets[i].count != buckets[j].count {
+			return buckets[i].count > buckets[j].count
+		}
+		if !orderable {
+			return false
+		}
+		cmp, err := compareDatum(buckets[i].val, buckets[j].val, 0)
+		if err != nil {
+			return false
+		}
+		return cmp < 0
 	})
 
 	// MCV split — take2 P1-08, following compute_scalar_stats
@@ -1221,21 +1443,56 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// `track_cnt == ndistinct && toowide_cnt == 0 && stadistinct > 0 &&
 	// track_cnt <= num_mcv`: every distinct value was seen and they all fit,
 	// so the list is complete and is kept whole.
-	completeAndFits := len(buckets) <= statsTarget
-	if !completeAndFits && mcvCount > 0 {
-		counts := make([]int, mcvCount)
-		for i := 0; i < mcvCount; i++ {
-			counts[i] = buckets[i].count
+	//
+	// M0138-0004: upstream's `track[]` only ever holds MULTIPLY-occurring
+	// values (`dups_cnt > 1` gates every insertion, analyze.c:2549-2552), so
+	// `track_cnt == ndistinct` can only be true when literally every distinct
+	// sample value repeated at least once — a single singleton disqualifies
+	// the whole list from "complete" regardless of how few distinct values
+	// there are. `len(buckets) <= statsTarget` alone (the previous condition
+	// here) checked only the total distinct-value count, not that they were
+	// all multi-occurring, so a column with e.g. 90 repeated values and 10
+	// singletons under a target of 100 wrongly took the "complete" branch and
+	// skipped analyzeMCVList's significance test entirely — keeping all 90
+	// repeated values as MCV members where PG would have narrowed them.
+	// `nmultiple == len(buckets)` is that "no singletons" condition
+	// (`nmultiple` already counts exactly the multiply-occurring distinct
+	// values, computed above for the ndistinct estimator).
+	// `stats.StaDistinct() > 0` reproduces the `stadistinct > 0` guard: PG's
+	// signed convention flips negative once the 10% row-count switch fires
+	// (see catalog.ColumnStats.StaDistinct), which the plain `len(buckets)`
+	// check never consulted at all.
+	completeAndFits := nmultiple == len(buckets) && len(buckets) <= statsTarget && stats.StaDistinct() > 0
+	if !completeAndFits {
+		// M0138-0004: upstream's `track[]` array is sized `num_mcv =
+		// attstattarget` and only ever gains an entry for a multiply-occurring
+		// group (`dups_cnt > 1`), so by construction it can hold at most
+		// `min(nmultiple, statsTarget)` entries — `analyze_mcv_list` never
+		// sees a singly-occurring value as a candidate at all. Capping here by
+		// `len(buckets)` (ndistinct) instead of `nmultiple` handed the
+		// significance test a candidate list padded with singleton noise at
+		// its tail, which is not what PG evaluates.
+		if mcvCount > nmultiple {
+			mcvCount = nmultiple
 		}
-		// staDistinct here is the absolute distinct count this sample implies;
-		// analyzeMCVList accepts PG's signed convention and this is the
-		// positive form.
-		mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
-			stats.NullFrac, len(sample), float64(totalRows))
+		if mcvCount > 0 {
+			counts := make([]int, mcvCount)
+			for i := 0; i < mcvCount; i++ {
+				counts[i] = buckets[i].count
+			}
+			// staDistinct here is the absolute distinct count this sample implies;
+			// analyzeMCVList accepts PG's signed convention and this is the
+			// positive form.
+			mcvCount = analyzeMCVList(counts, mcvCount, float64(len(buckets)),
+				stats.NullFrac, len(sample), float64(totalRows))
+		}
 	}
 	// A single-occurrence "most common value" carries no information; upstream
 	// reaches the same place via its `dups_cnt > 0` tracking, which never
-	// enters a value seen once into the track list at all.
+	// enters a value seen once into the track list at all. Now a pure safety
+	// net (both branches above already guarantee `buckets[:mcvCount]` is
+	// entirely multi-occurring) rather than load-bearing, kept in case that
+	// invariant ever regresses.
 	for mcvCount > 0 && buckets[mcvCount-1].count <= 1 {
 		mcvCount--
 	}
@@ -1295,20 +1552,24 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		idx := i * last / bucketCount
 		bounds[i] = formatDatumDateStyle(expanded[idx], dsCtx)
 	}
-	// Drop adjacent duplicate boundaries; an equi-depth
-	// histogram with flat regions still emits ascending
-	// distinct boundaries upstream (see
-	// `compute_scalar_stats`). The dedup keeps the contract
-	// "boundaries are strictly ascending" predictable.
-	dedup := bounds[:0]
-	for i, v := range bounds {
-		if i == 0 || v != bounds[i-1] {
-			dedup = append(dedup, v)
-		}
-	}
-	if len(dedup) >= 2 {
-		stats.Histogram = dedup
-	}
+	// M0138-0004: upstream does NOT dedup adjacent equal boundaries.
+	// compute_scalar_stats (analyze.c:2806-2836) copies exactly `num_hist`
+	// evenly-spaced values out of the sorted non-MCV array with no
+	// distinctness check at all, so a value that's common but didn't make
+	// the MCV cut (analyze_mcv_list declined it as not "significant" enough)
+	// can legitimately occupy several adjacent histogram slots. The
+	// selectivity consumer already copes with that on both sides: PG's own
+	// ineq_histogram_selectivity falls back to `binfrac = 0.5` whenever a
+	// bin's two boundaries compare equal ("cope if bin boundaries appear
+	// identical", selfuncs.c:1234-1237), and goopg's bucketFraction /
+	// convertStringBucketScales (selectivity.go) already implement that same
+	// 0.5 fallback. A prior version of this function deduped here, which
+	// silently shrank the stored histogram (and therefore the exact bucket
+	// count and boundary positions used by every selectivity computed
+	// against it) relative to what PG would have stored for the identical
+	// sample — a real divergence in "the same statistics", not a rendering
+	// nicety.
+	stats.Histogram = bounds
 	return stats
 }
 

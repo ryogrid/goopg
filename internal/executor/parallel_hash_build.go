@@ -202,7 +202,7 @@ func probeSideIsLeft(p *optimizer.Join) bool {
 //
 // Returns nil when the subtree has no shareable hash join, which is the common
 // case and costs nothing — the check is on the plan, not on a built tree.
-func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func() (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
+func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(scope *instrumenter) (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
 	// Decide from the PLAN, before building anything. An earlier cut built the
 	// tree unconditionally and then looked for joins in it, which called the
 	// Gather's child-builder one extra time — harmless for the production
@@ -215,7 +215,7 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	// (uninstrumented, exactly today's behavior; covers both Gather and
 	// GatherMerge prebuild call sites). Its drains would double-count the
 	// same plan keys into a worker/leader table.
-	tree, err := buildUnderNilScope(buildChild)
+	tree, err := buildChild(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -273,10 +273,31 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 func collectShareableJoins(op Operator, out *[]*joinOp) {
 	switch x := op.(type) {
 	case *joinOp:
+		// R95 (plan-parity-fix-take2): descend the outer (left) of an
+		// approved nested loop — ordinary (R94) or lateral probe — so
+		// hashes below it are leader-prebuilt exactly as standalone
+		// hashes are. Without this, `HasShareableHashJoin` (which does
+		// descend) promises a prebuild the collection never performs,
+		// and every worker builds a PARTIAL hash table from its scan
+		// partition — silently dropped matches. The probe/lateral inner
+		// itself is never descended: it is re-opened per outer row, not
+		// prebuilt.
+		if x.plan != nil && x.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			if ordinaryInnerNestedLoopPartial(x.plan) || lateralProbeJoinPartial(x.plan, x.right) {
+				collectShareableJoins(x.left, out)
+			}
+			return
+		}
 		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash || x.plan.Lateral {
 			return
 		}
-		*out = append(*out, x)
+		// M0146-0002: a Parallel Hash join is built by the participants
+		// behind a barrier, never prebuilt — the plan-side twin
+		// (HasShareableHashJoin) skips it the same way. Its probe side is
+		// still walked: hash joins below it are prebuilt as usual.
+		if !x.plan.ParallelHash {
+			*out = append(*out, x)
+		}
 		if probeSideIsLeft(x.plan) {
 			collectShareableJoins(x.left, out)
 		} else {
@@ -292,6 +313,24 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 		collectShareableJoins(x.child, out)
 	case *instrumentedOp:
 		collectShareableJoins(x.inner, out)
+	case *nestedLoopIndexJoinOp:
+		// M0142-0005a: mirror of HasShareableHashJoin's fused-NLI arm —
+		// hashes under the outer of an approved NLI are leader-prebuilt.
+		// The probe inner is never descended (re-opened per outer row,
+		// not prebuilt); a non-approved shape collects nothing, matching
+		// the plan-side promise of false.
+		if optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
+			collectShareableJoins(x.outer, out)
+		}
+		return
+	case *setOp:
+		// M0140-0006c-2: a partial SetOp streams BOTH branches to
+		// completion, so a hash join driving either branch needs its
+		// build side leader-prebuilt exactly like a top-level partial
+		// join does. Descend both sides — unlike the join arm's
+		// probe-side-only rule, a SetOp has no build side to exclude.
+		collectShareableJoins(x.left, out)
+		collectShareableJoins(x.right, out)
 	}
 }
 
@@ -456,6 +495,12 @@ func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
 //
 // The function never mutates join state.
 func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
+	// M0146-0002: a Parallel Hash participant builds only its CLAIMED share
+	// of the inner. The cooperative builder rebuilds the subtree over its own
+	// scan state and would read the whole relation into every participant.
+	if o.plan.ParallelHash {
+		return false
+	}
 	// Rule 1: must be shareable (P8 eligibility).
 	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight {
 		return false
@@ -620,8 +665,8 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	// SharedHashBuilds map may already be published to a surrounding Gather's
 	// participants, and mutating it here would be a write to a map those
 	// goroutines are reading.
-	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func() (Operator, error) {
-		return buildNode(buildPlan, buildBound)
+	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func(scope *instrumenter) (Operator, error) {
+		return buildNode(buildPlan, buildBound, scope)
 	})
 	if err != nil {
 		return false, err
@@ -665,12 +710,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 		group.Go(func(workerCtx context.Context) error {
 			// EX0-03b: coop throwaway tree — scope explicitly NIL
 			// (uninstrumented, exactly today's behavior). Producer
-			// goroutines build concurrently, so the mutex-serialized
-			// NIL handoff also keeps a concurrent Gather site's fresh
-			// table out of this tree.
-			tree, err := buildUnderNilScope(func() (Operator, error) {
-				return buildNode(buildPlan, buildBound)
-			})
+			// goroutines build concurrently; the scope now travels as an
+			// argument, so nothing shared can leak into this tree.
+			tree, err := buildNode(buildPlan, buildBound, nil)
 			if err != nil {
 				return err
 			}
@@ -762,7 +804,16 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	group.Cancel()
 	for range ch {
 	}
-	group.Wait()
+	// A producer that fails mid-stream must fail the build, not truncate
+	// it: the channelSource sees a closed channel either way, so without
+	// this the hash table is built from a partial row set and the join
+	// silently drops matches — the exact wrong-results signature TPC-H Q20
+	// showed (85-99 of 101 suppliers, plan stable, worker-count dependent).
+	// On the loopErr path a producer error is a CONSEQUENCE of the build's
+	// own failure (Cancel unblocks senders), so the first error wins.
+	if werr := group.Wait(); werr != nil && loopErr == nil {
+		loopErr = werr
+	}
 
 	// Merge per-worker notices/warnings and release arenas.
 	for i := range maxProducers {

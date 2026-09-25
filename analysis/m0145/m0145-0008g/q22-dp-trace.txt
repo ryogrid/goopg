@@ -1,0 +1,15 @@
+DPTRACE problem nrels=2 rels=customer,orders
+DPTRACE pair phase=1 lev=2 created=1 pair={customer} | {orders} outer={customer} inner={orders}
+DPTRACE cost lev=2 rel={customer+orders} rows=658 npaths=1 cheapest=hash reqouter={} total=66165.955 second=none secondtotal=NaN
+DPTRACE cpadmit src=base rel={customer} cp=0 leaf=seq
+DPTRACE cpadmit src=base rel={orders} cp=1 leaf=seq
+DPTRACE cpadmit src=join rel={customer+orders} cp=0 in1=0 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={orders} partials=2 verdict=admitted
+DPTRACE cpgather rel={customer+orders} partials=0 verdict=no-partials
+DPTRACE appendrel rel={customer} verdict=unmarked
+DPTRACE appendrel rel={orders} verdict=unmarked
+DPTRACE pveto site=base rel={customer} dir=- veto=B2 detail=sub=cp leaf=seq
+DPTRACE pveto site=base rel={orders} dir=- veto=admitted detail=leaf=seq workers=3
+DPTRACE pveto site=hash rel={customer+orders} dir={customer}+{orders} veto=V2 detail=sub=cp jt=ANTI
+DPTRACE pveto site=nestloop rel={customer+orders} dir={customer}+{orders} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE end top={customer+orders} pairs=1 declined=0 costs=1 status=ok

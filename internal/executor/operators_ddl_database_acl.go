@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -45,12 +46,24 @@ func normalizeDatabasePriv(priv string) []string {
 
 // execDatabaseACLChange applies a GRANT/REVOKE … ON DATABASE … to the
 // OID-keyed ACL store and re-syncs the heap-backed pg_database.datacl row.
-// goopg v0 has a single logical connected database (per-connection
-// CurrentDatabase, resolved to catalog.InMemory.DBOID() at startup —
-// detectCatalogDBOID) — GRANT ON DATABASE naming any OTHER database name (a
-// legitimately different db in real multi-database PG) is a silent no-op,
-// mirroring persistDatFrozenXID's identical "v0 scope: only the live
-// database's row" restriction. The grantor stamped on each grant is the
+//
+// Every named database is resolved through catalog.ResolveDatabaseOid, NOT
+// just the connected one (M0122-0008). pg_database is a SHARED catalog, and
+// upstream's ExecGrant_Database (`postgres/src/backend/catalog/aclchk.c`)
+// looks each name up in it with no reference to MyDatabaseId — `GRANT CONNECT
+// ON DATABASE otherdb TO r` from a session connected to `postgres` is
+// ordinary, supported PostgreSQL. goopg used to compare each name against the
+// live `CurrentDatabase` and return silently when it did not match, so the
+// statement reported GRANT and changed nothing; measured against PG 18.3, the
+// row that should have gained `r1=c/postgres` kept a NULL datacl.
+//
+// ResolveDatabaseOid is the correct key precisely because it returns DBOID()
+// for "postgres" — the key the previous single-database code used — so the
+// connected-database path is unchanged by construction rather than by
+// coincidence. An unknown name now raises upstream's 3D000 instead of being
+// ignored (`aclchk.c` → get_database_oid(..., false)).
+//
+// The grantor stamped on each grant is the
 // session's current effective role (o.ctx.NonSuperuserRole, empty meaning the
 // bootstrap superuser), mirroring tryRecordTableGrant's/execTypeACLChange's
 // grantor attribution — datacl shares the same tableACLs/tableACLGrantor
@@ -60,23 +73,29 @@ func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
 	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, dc.GrantedBy); err != nil {
 		return err
 	}
+	if err := checkGrantOptionToPublic(dc.Revoke, dc.WithGrantOption, dc.Grantees); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
 	}
-	dbOid := im.DBOID()
-	if dbOid == 0 {
-		return nil
-	}
-	live := o.ctx.CurrentDatabase
-	matched := false
+	// Resolve every named database FIRST, so a statement naming one good and
+	// one bad name changes nothing before it errors — upstream resolves the
+	// whole list in ExecGrant_Database's objects loop under one transaction.
+	oids := make([]uint32, 0, len(dc.DatabaseNames))
 	for _, name := range dc.DatabaseNames {
-		if strings.EqualFold(strings.Trim(name, `"`), live) {
-			matched = true
-			break
+		bare := strings.Trim(name, `"`)
+		oid, found := im.ResolveDatabaseOid(bare)
+		if !found || oid == 0 {
+			return &ExecError{
+				Code:    "3D000",
+				Message: fmt.Sprintf("database %q does not exist", bare),
+			}
 		}
+		oids = append(oids, oid)
 	}
-	if !matched {
+	if len(oids) == 0 {
 		return nil
 	}
 	var privs []string
@@ -86,6 +105,21 @@ func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
 	if len(privs) == 0 {
 		return nil
 	}
+	for _, dbOid := range oids {
+		if err := o.applyDatabaseACLChange(im, dc, dbOid, privs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyDatabaseACLChange applies one resolved database's half of a
+// GRANT/REVOKE … ON DATABASE. Split out of execDatabaseACLChange so the
+// per-database body is identical for the connected database and for any other
+// one — the single-database version of this code lived inline, which is how
+// "only the live database" became a property of the statement rather than of
+// the loop that drives it.
+func (o *ddlOp) applyDatabaseACLChange(im *catalog.InMemory, dc *parser.DatabaseACLChange, dbOid uint32, privs []string) error {
 	if dc.Revoke {
 		// Seed both implicit acldefault('d', …) halves while datacl is still
 		// NULL so an owner-side REVOKE leaves the surviving privileges

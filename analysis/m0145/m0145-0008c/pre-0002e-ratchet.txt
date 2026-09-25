@@ -1,0 +1,9 @@
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 53   current: 51
+  FIXED    Q49:catalog_returns+catalog_sales+date_dim+store_returns+store_sales+web_returns+web_sales
+  FIXED    Q49:catalog_returns+catalog_sales+date_dim+web_returns+web_sales
+  FIXED    Q94:customer_address+date_dim+web_sales+web_site
+  NEW      Q95:cte:ws_wh+customer_address+date_dim+web_sales+web_site
+
+EA-RATCHET: FAIL (1 new estimate finding(s))
+make: *** [Makefile:620: ea-ratchet] Error 1

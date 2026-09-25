@@ -287,3 +287,96 @@ func TestCreateSortPlanPanics(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateIncrementalSortPlanOverPrebuilt: PathSort's sibling test
+// (M0141-S7-exec-b) — same recursion, same pathkey translation, plus the
+// PresortedCount carry-through this arm adds.
+func TestCreateIncrementalSortPlanOverPrebuilt(t *testing.T) {
+	sub := &SeqScan{Table: &catalog.Table{Name: "orders"}}
+	k1, k2, k3 := &ColumnRef{Name: "a"}, &ColumnRef{Name: "b"}, &ColumnRef{Name: "c"}
+	p := &Path{
+		Kind: PathIncrementalSort,
+		Pathkeys: []PathKey{
+			{Expr: k1, SortAsc: true, NullsFirst: false},
+			{Expr: k2, SortAsc: false, NullsFirst: true},
+			{Expr: k3, SortAsc: true, NullsFirst: false},
+		},
+		PresortedCount: 1,
+		Children:       []*Path{newPrebuiltPath(&RelOptInfo{}, sub)},
+	}
+	s, ok := createPlan(p).(*IncrementalSort)
+	if !ok {
+		t.Fatalf("createPlan(PathIncrementalSort) = %T, want *IncrementalSort", createPlan(p))
+	}
+	if s.Child != Node(sub) {
+		t.Fatalf("incremental sort wraps %T, want the child arm's node", s.Child)
+	}
+	if s.PresortedCount != 1 {
+		t.Fatalf("PresortedCount = %d, want 1 (carried from the Path)", s.PresortedCount)
+	}
+	if len(s.Keys) != 3 {
+		t.Fatalf("incremental sort carries %d keys, want 3", len(s.Keys))
+	}
+	if s.Keys[0].Expr != Expr(k1) || s.Keys[0].Desc || s.Keys[0].NullsFirst {
+		t.Fatalf("ascending key mistranslated: %+v", s.Keys[0])
+	}
+	if s.Keys[1].Expr != Expr(k2) || !s.Keys[1].Desc || !s.Keys[1].NullsFirst {
+		t.Fatalf("descending key mistranslated: %+v", s.Keys[1])
+	}
+}
+
+// TestCreateIncrementalSortPlanPanics: the producer-bug preconditions,
+// including PresortedCount's own `0 < PresortedCount < len(Keys)` contract
+// (IncrementalSort's doc comment, incrementalsort.go) which PathSort has no
+// equivalent of.
+func TestCreateIncrementalSortPlanPanics(t *testing.T) {
+	sub := newPrebuiltPath(&RelOptInfo{}, &SeqScan{Table: &catalog.Table{Name: "t"}})
+	twoKeys := []PathKey{
+		{Expr: &ColumnRef{Name: "k1"}, SortAsc: true},
+		{Expr: &ColumnRef{Name: "k2"}, SortAsc: true},
+	}
+	cases := map[string]struct {
+		path *Path
+		want string
+	}{
+		"no children": {
+			path: &Path{Kind: PathIncrementalSort, Pathkeys: twoKeys, PresortedCount: 1},
+			want: "0 children",
+		},
+		"two children": {
+			path: &Path{Kind: PathIncrementalSort, Pathkeys: twoKeys, PresortedCount: 1, Children: []*Path{sub, sub}},
+			want: "2 children",
+		},
+		"no pathkeys": {
+			path: &Path{Kind: PathIncrementalSort, PresortedCount: 1, Children: []*Path{sub}},
+			want: "orders by nothing",
+		},
+		"presorted count zero": {
+			path: &Path{Kind: PathIncrementalSort, Pathkeys: twoKeys, PresortedCount: 0, Children: []*Path{sub}},
+			want: "out of range",
+		},
+		"presorted count equals key count": {
+			path: &Path{Kind: PathIncrementalSort, Pathkeys: twoKeys, PresortedCount: 2, Children: []*Path{sub}},
+			want: "out of range",
+		},
+		"nil key expression": {
+			path: &Path{Kind: PathIncrementalSort, Pathkeys: []PathKey{{SortAsc: true}, {Expr: &ColumnRef{Name: "k"}, SortAsc: true}}, PresortedCount: 1, Children: []*Path{sub}},
+			want: "no expression",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("no panic")
+				}
+				msg, _ := r.(string)
+				if !strings.Contains(msg, tc.want) {
+					t.Fatalf("panic %q does not name the defect %q", msg, tc.want)
+				}
+			}()
+			createPlan(tc.path)
+		})
+	}
+}

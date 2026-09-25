@@ -187,7 +187,7 @@ func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
 // guard above, which is exactly the state this task found.
 func TestGateScriptsUseGeneratedFlagLabels(t *testing.T) {
 	for _, script := range []string{
-		"../../scripts/tpcds-sf05-regression.sh",
+		"../../scripts/tpcds-sf025-regression.sh",
 		"../../scripts/tpch-spotcheck.sh",
 	} {
 		src, err := os.ReadFile(script)

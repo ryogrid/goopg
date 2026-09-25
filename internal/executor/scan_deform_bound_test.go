@@ -39,8 +39,8 @@ func deformLt(l, r optimizer.Expr) optimizer.Expr {
 }
 
 // seqLeafBound walks a built operator tree to its SeqScan leaf and reports
-// the stamped deform bound (normalised: unset reads as full width) and the
-// leaf column count. Gather is followed through the worker buildChild
+// the stamped deform bound (normalised: unset reads as full width, the
+// zero-consumer stamp as 0) and the leaf column count. Gather is followed through the worker buildChild
 // closure, which is exactly the EX1-01 capture under test.
 func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 	t.Helper()
@@ -48,10 +48,7 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 		switch o := op.(type) {
 		case *seqScanOp:
 			n := len(o.cols)
-			if o.deformBound <= 0 {
-				return n, n
-			}
-			return o.deformBound, n
+			return seqScanSurvivorWidth(o.deformBound, n), n
 		case *filterOp:
 			op = o.child
 		case *projectOp:
@@ -59,6 +56,8 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 		case *limitOp:
 			op = o.child
 		case *sortOp:
+			op = o.child
+		case *incrementalSortOp:
 			op = o.child
 		case *aggregateOp:
 			op = o.child
@@ -72,7 +71,7 @@ func seqLeafBound(t *testing.T, op Operator) (bound, ncols int) {
 			}
 			op = o.child
 		case *gatherOp:
-			wc, err := o.buildChild()
+			wc, err := o.buildChild(nil)
 			if err != nil {
 				t.Fatalf("gather buildChild: %v", err)
 			}
@@ -260,6 +259,12 @@ func TestScanDeformBoundChains(t *testing.T) {
 		if b, n := seqLeafBound(t, op); b != 7 || n != 8 {
 			t.Fatalf("sort bound=%d ncols=%d, want 7/8", b, n)
 		}
+		// M0141-S7-exec-b: IncrementalSort narrows on its Keys exactly like
+		// Sort — same fold, same set of consumer expressions.
+		op = mustBuildDeform(t, &optimizer.IncrementalSort{Child: scan8(), Keys: []optimizer.SortKey{{Expr: deformCol(6)}}, PresortedCount: 1})
+		if b, n := seqLeafBound(t, op); b != 7 || n != 8 {
+			t.Fatalf("incremental sort bound=%d ncols=%d, want 7/8", b, n)
+		}
 		// A constant LIMIT references nothing: full width.
 		op = mustBuildDeform(t, &optimizer.Limit{Child: scan8(), Limit: deformInt(10)})
 		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
@@ -301,6 +306,7 @@ func TestEffectiveDeformBoundEdges(t *testing.T) {
 	}{
 		{deformBoundNone, 16, 16},
 		{deformBoundFull, 16, 16},
+		{deformBoundZero, 16, deformWidthZero},
 		{5, 16, 6},
 		{0, 16, 1},
 		{15, 16, 16},
@@ -839,6 +845,8 @@ func joinSideBounds(t *testing.T, plan optimizer.Node) (lb, ln, rb, rn int) {
 		case *projectOp:
 			return find(n.child)
 		case *sortOp:
+			return find(n.child)
+		case *incrementalSortOp:
 			return find(n.child)
 		case *limitOp:
 			return find(n.child)

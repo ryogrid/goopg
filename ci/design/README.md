@@ -35,7 +35,7 @@ barrier → **S2 TPC-H solo** (spotcheck → EXPLAIN capture → 22 queries unde
 exit on any must-pass failure). Every run writes to
 `ci/logs/<YYYYMMDD-HHMMSS>/` with a real-time `progress.log`, and regenerates
 the agent-facing `ci/logs/action-items.md`, which the Ralph loop consumes as
-its highest-priority work source (standing `M-NIGHTLY` milestone in
+its standing filing obligation (the `M-NIGHTLY` milestone in
 `.ralph/fix_plan.md` — doc 07). A resident scheduler
 (`ci/batch/nightly-scheduler.sh`), spawned once from `~/.ralph/ralph_loop.sh`
 and guarded by `flock` against duplicates, fires the batch daily at ~00:00
@@ -51,7 +51,7 @@ local time.
 | [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, §C.1 mid-run build breaks (`build_kills`, source fingerprints), §C.2 the same collapse on the units/race lanes, retention |
 | [05-tpch-stage.md](05-tpch-stage.md) | The 2-hour-bounded TPC-H sweep: budget algorithm, EXPLAIN capture, comparisons |
 | [06-scheduler.md](06-scheduler.md) | Resident daemon, `flock` single-instance control, the `ralph_loop.sh` hook patch |
-| [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing top-priority `M-NIGHTLY` milestone in `.ralph/fix_plan.md` |
+| [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing `M-NIGHTLY` filing milestone in `.ralph/fix_plan.md` (filing unconditional; selection rules live in the Current Priority banner's "Selection rules" subsection — consolidated 2026-09-24) |
 
 ## Design invariants (the short list)
 
@@ -68,4 +68,5 @@ local time.
 5. **One command starts everything**; the scheduler is idempotent to respawn.
 6. **Failures flow back to the loop one-way** — batch writes
    `ci/logs/action-items.md`; the in-loop agent (never the batch) turns items
-   into top-priority fix_plan tasks (doc 07).
+   into fix_plan tasks (doc 07); filing is unconditional, selection order is
+   the Current Priority banner's.

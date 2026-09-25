@@ -122,8 +122,8 @@ func TestAddOrderedIndexPathsSurvivesACheaperSeqScan(t *testing.T) {
 func TestAddOrderedIndexPathsTruncatesAtTheFirstUnmergeableColumn(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}},
-		{Name: "p_brand", Type: catalog.Type{Name: "int4"}},
+		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "p_brand", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestAddOrderedIndexPathsRejectsNonMergeableClauseKinds(t *testing.T) {
 func TestAddOrderedIndexPathsRejectsUnorderedAndPartialIndexes(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "k", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +242,7 @@ func TestAddOrderedIndexPathsRejectsUnorderedAndPartialIndexes(t *testing.T) {
 func TestAddOrderedIndexPathsHonoursDescendingKeys(t *testing.T) {
 	c := catalog.NewInMemory()
 	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "k", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +308,14 @@ func TestAddBaseRelIndexPathsRunsBothHalves(t *testing.T) {
 
 	var parameterised, plain int
 	for _, p := range s.findRel(inner).Pathlist {
-		if p.Kind != PathIndexScan {
+		// The join half's parameterised candidate survives as a bitmap
+		// path: under PG's param_info→NIL-pathkeys pretense
+		// (pathnode.c:475, M0141-S2b-13) the fuzzily-dearer parameterised
+		// PathIndexScan is dominated by the cheaper parameterised
+		// PathBitmapHeapScan, exactly as upstream's add_path rules it.
+		switch p.Kind {
+		case PathIndexScan, PathBitmapIndexScan, PathBitmapHeapScan:
+		default:
 			continue
 		}
 		if p.RequiredOuter != 0 {

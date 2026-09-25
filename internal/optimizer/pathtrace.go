@@ -76,11 +76,147 @@ func tracePath(rel *RelOptInfo, p *Path, producer string, partial bool, verdict 
 	// some lines but not others would need the reader to know which kinds are
 	// joins. Appended at the END of the record, after `verdict`, so a reader
 	// splitting on the existing key=value pairs keeps working unchanged.
-	fmt.Fprintf(os.Stderr,
-		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%.2f total=%.2f disabled=%d pathkeys=%s verdict=%s jointype=%s\n",
+	//
+	// R53 slice 1: the partition labels `outer`/`inner` follow jointype, under
+	// the same append-at-end rule — they name the two input relsets in
+	// Children order (Path.OuterRelids/InnerRelids), `-` on non-join paths.
+	// A DPPATH line still cannot key a DPTRACE pair by itself (bit positions,
+	// not names), but relSetBits is the same rendering both channels use, so
+	// the two join on it.
+	fmt.Fprint(os.Stderr, formatPathLine(list, rel, p, producer, pathkeys, verdict))
+}
+
+// formatPathLine renders one provenance record. Separated from `tracePath`
+// so the vocabulary (including the R53 slice-1 partition labels) is testable
+// without capturing stderr.
+//
+// R54 Step-2: `width`/`inputtotal` close the reviewed STEP2.md §2 contract —
+// rows AND width per leg, plus the input join-path total beneath each upper
+// candidate, so the fix round can subtract join-leg delta from upper-leg
+// delta. `width` is the rel's byte width (RelOptInfo.Width, what the page
+// math prices); `inputtotal` is Children[0]'s total (`-1` when the path
+// carries no input — scan leaves and test fixtures), which for every upper
+// arm is the priced input the candidate was costed against. Appended at the
+// END under the same rule as jointype/partition labels, so a reader
+// splitting on key=value pairs keeps working unchanged.
+//
+// M0142-0003b: `startup`/`total`/`inputtotal` render via `%g`, not `%.2f`.
+// M0142-0003a found a near-tie at the full join for TPC-H Q9 — goopg's
+// winning candidate and PG's own chain's cheapest candidate both rounded to
+// `80099.64` at two decimals, and the fixed `%.2f` could not say whether that
+// was a genuine tie decided by DP insertion order or a real (if small) cost
+// gap. `%g` matches the sibling `DPTRACE cost`/`decline` channel
+// (joinsearchtrace.go's `total=%g`), which already prints full precision for
+// exactly this reason — bringing DPPATH in line closes the one place the two
+// channels disagreed on precision, rather than inventing a second format.
+func formatPathLine(list string, rel *RelOptInfo, p *Path, producer, pathkeys string, verdict pathVerdict) string {
+	inputTotal := -1.0
+	if len(p.Children) > 0 && p.Children[0] != nil {
+		inputTotal = p.Children[0].Cost.Total
+	}
+	return fmt.Sprintf(
+		"%s %s producer=%s relids=%s kind=%d reqouter=%s rows=%.0f startup=%g total=%g disabled=%d pathkeys=%s verdict=%s jointype=%s outer=%s inner=%s width=%d inputtotal=%g\n",
 		pathTraceTag, list, producer, relSetBits(rel.Relids), int(p.Kind),
 		relSetBits(p.RequiredOuter), p.Rows, p.Cost.Startup, p.Cost.Total,
-		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)))
+		p.DisabledNodes, pathkeys, verdict, strings.ToLower(joinTypeName(p.Jointype)),
+		relSetBits(p.OuterRelids), relSetBits(p.InnerRelids), rel.Width, inputTotal)
+}
+
+// traceOrderedCandidatePopulation emits one DPPATH diagnostic line for
+// createOrderedPaths's SearchCandidates population step (upperordered.go).
+//
+// M0141-S7-cd-q64: some ORDER BY witnesses show zero `upper.ordered.*`
+// producer lines beyond the seed Sort, and the trace alone cannot tell apart
+// "searchedRelOf(input) returned nil" (input is not a searched-tree root —
+// e.g. a raw multi-child join or set-op sits at the top, see
+// searchedRelOf's own "not on the boundary chain" case) from "it returned a
+// rel, but every candidate's re-earned Pathkeys came back empty" (every
+// candidate's ordering claim failed validatedSearchCandidateKeys). Both look
+// identical downstream — SearchCandidates is unusable either way — but only
+// the second is a validator bug; the first is a structural gap in which
+// inputs the boundary chain recognises at all.
+func traceOrderedCandidatePopulation(searchedRel bool, candidates int, nonEmptyKeys int) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s candidates producer=upper.ordered.candidates searchedrel=%v candidates=%d nonemptykeys=%d\n",
+		pathTraceTag, searchedRel, candidates, nonEmptyKeys)
+}
+
+// traceIncrementalSortCandidate emits one DPPATH diagnostic line per
+// candidate `addIncrementalSortPaths` (incrementalsortpaths.go) considered
+// and declined or accepted — the finer-grained sibling of
+// traceOrderedCandidatePopulation for the M0141-S7-cd-candidatepool question:
+// which of the `nonempty` candidates traceOrderedCandidatePopulation counted
+// actually reach a genuine partial-prefix offer, and why the rest don't
+// (`kind`=candidate's own Path.Kind, `keys`=len(SearchCandidateKeys[i]),
+// `contained`/`ncommon`=pathkeysCountContainedIn's verdict).
+func traceIncrementalSortCandidate(i int, kind PathKind, keyLen int, contained bool, nCommon int, totalCost float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s candidate producer=upper.ordered.incrementalsort.candidate index=%d kind=%d keys=%d contained=%v ncommon=%d totalcost=%v\n",
+		pathTraceTag, i, int(kind), keyLen, contained, nCommon, totalCost)
+}
+
+// traceOrderedSeedCandidate emits one DPPATH diagnostic line for the seed
+// path itself — the same `input` addOrderedPaths (upperordered.go) receives
+// as its arm-1/2 candidate — scored against sortPathkeys the identical way
+// traceIncrementalSortCandidate scores every OTHER SearchCandidates entry.
+// M0141-S7-cd-candidatepool's question is whether the seed's own ordering
+// claim ever has a genuine partial-prefix match that addIncrementalSortPaths
+// structurally cannot offer (its loop walks ordered.SearchCandidates, which
+// may or may not still contain the exact Path that became the seed) — this
+// line is the seed-side half of that comparison; traceIncrementalSortCandidate
+// is the SearchCandidates-side half. Matching kind/keys/ncommon/totalcost
+// across both for the same query means the seed IS represented in the loop
+// (totalcost disambiguates same-shape-different-candidate coincidences, since
+// every entry in ordered.SearchCandidates shares the same relset and hence
+// the same Rows, but the seed is specifically the CHEAPEST of them by
+// construction — getCheapestFractionalPath's pick — so an exact cost match
+// against one specific SearchCandidates entry is strong identity evidence,
+// not just a shape coincidence); a seed line with no matching candidate line
+// means it structurally is not.
+func traceOrderedSeedCandidate(kind PathKind, keyLen int, contained bool, nCommon int, totalCost float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s seed producer=upper.ordered.seed kind=%d keys=%d contained=%v ncommon=%d totalcost=%v\n",
+		pathTraceTag, int(kind), keyLen, contained, nCommon, totalCost)
+}
+
+// traceOrderedGroupingCandidate emits one DPPATH diagnostic line per PathAgg
+// candidate electOrderedGrouping (upperorderedgrouping.go) offers to
+// addOrderedPaths, BEFORE the contained/sort-stack decision — the seed's own
+// AggStrategy and Rows alongside the cost traceOrderedSeedCandidate already
+// prints for the same call, so a Hashed candidate's pre-stack cost and a
+// Sorted candidate's pre-stack cost (which already has its own input-Sort
+// priced in by whichever grouping-paths producer built it) can be told apart
+// on sight rather than inferred from `contained`. M0141-S2b-6-resume: the
+// question this line exists to answer is a term-by-term Hashed-vs-Sorted
+// diff, which needs the strategy label the generic seed line does not carry.
+func traceOrderedGroupingCandidate(strategy AggStrategy, rows float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s groupcand producer=upper.ordered.grouping.candidate strategy=%d rows=%.0f\n",
+		pathTraceTag, int(strategy), rows)
+}
+
+// traceOrderedSortedCandidate emits one DPPATH diagnostic line for the Sort
+// `addOrderedPaths` (upperordered.go) stacks over a non-contained candidate —
+// the AFTER-sort cost that `setCheapest` actually compares, printed beside
+// traceOrderedGroupingCandidate/traceOrderedSeedCandidate's BEFORE-sort
+// numbers for the same candidate. M0141-S2b-6-resume: separating a Hashed
+// PathAgg's OUTPUT-sort term from a Sorted PathAgg's (already-priced-in)
+// INPUT-sort term requires seeing the seed cost and the stacked cost
+// side by side, not just the final winner.
+func traceOrderedSortedCandidate(strategy AggStrategy, rows float64, sortStartup, sortTotal float64) {
+	if !pathTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s sorted producer=upper.ordered.sorted strategy=%d rows=%.0f startup=%g total=%g\n",
+		pathTraceTag, int(strategy), rows, sortStartup, sortTotal)
 }
 
 // relSetBits renders a RelSet as a stable, parseable member list. The trace has

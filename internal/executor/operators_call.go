@@ -415,7 +415,12 @@ func (o *callOp) Next() (TupleSlot, error) {
 		if o.plan != nil && o.plan.Stmt != nil {
 			callPos = o.plan.Stmt.Pos()
 		}
+		leave, derr := enterRoutineBody(o.ctx, callPos)
+		if derr != nil {
+			return nil, derr
+		}
 		lastRow, err := executeSQLProcedureReturning(r, o.args, o.ctx, callPos)
+		leave()
 		if err != nil {
 			return nil, err
 		}
@@ -447,6 +452,12 @@ func (o *callOp) Next() (TupleSlot, error) {
 	if o.ctx != nil {
 		*child = *o.ctx
 	}
+	// The procedure body is not top-level (PG executes it through SPI).
+	leave, derr := enterRoutineBody(child, o.plan.Stmt.Pos())
+	if derr != nil {
+		return nil, derr
+	}
+	defer leave()
 	child.Params = make([]Datum, len(r.ArgTypes))
 	frame := newPLpgSQLFrame()
 

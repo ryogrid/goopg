@@ -131,7 +131,9 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	// key comparison amcheck makes, and until this slice it went through
 	// btree.CompareKeys unconditionally. Over tuple bytes that orders by the
 	// t_tid header first, so the clean tree above must come back clean only when
-	// the descriptor's comparator is supplied — a nil comparator has to report.
+	// the descriptor's comparator is in force — an explicitly BYTWISE comparator
+	// has to report. (The nil default no longer exercises this: since
+	// M0119-0006bq it resolves to the format's own Compare.)
 	internals := 0
 	badWithBlobCmp := 0
 	for blk := range nblocks {
@@ -146,8 +148,13 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, cmp); len(reps) != 0 {
 			t.Fatalf("tuple-format parent-downlink tier reported %q on a clean tree at block %d", reps[0].Msg, blk)
 		}
-		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, nil); len(reps) != 0 {
+		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, nbtree.CompareKeys); len(reps) != 0 {
 			badWithBlobCmp++
+		}
+		// The nil default is now the format's own comparator — it must agree
+		// with the descriptor comparator on a clean tree.
+		if reps := amcheck.VerifyBtreeParentDownlinks(src, blk, "ix_tuplefmt", tupleFmt, nil); len(reps) != 0 {
+			t.Fatalf("nil-default (format compare) reported %q on a clean tree at block %d", reps[0].Msg, blk)
 		}
 	}
 	if internals == 0 {

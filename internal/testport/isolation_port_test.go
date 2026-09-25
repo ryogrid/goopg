@@ -15,6 +15,7 @@ package testport
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -243,6 +244,34 @@ func runIsoSpecStrict(t *testing.T, root string, c *cluster.Cluster, specRelPath
 	t.Logf("PASS: %s", specRelPath)
 }
 
+// runIsoSpecStrictInDB is runIsoSpecStrict inside a freshly created database
+// `dbname`, for specs that reference their database by name — PG's isolation
+// harness creates and connects to `isolation_regression` for every spec.
+func runIsoSpecStrictInDB(t *testing.T, root string, c *cluster.Cluster, dbname, specRelPath string) {
+	t.Helper()
+	admin, err := sql.Open("postgres", buildDSN(t, c))
+	if err != nil {
+		t.Fatalf("open admin connection: %v", err)
+	}
+	if _, err := admin.Exec("CREATE DATABASE " + dbname); err != nil {
+		_ = admin.Close()
+		t.Fatalf("CREATE DATABASE %s: %v", dbname, err)
+	}
+	_ = admin.Close()
+	runner := &framework.IsolationRunner{DSN: buildDSNForDB(t, c, dbname)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result := runner.RunAndCompare(ctx, root, specRelPath)
+	if result.Status != "pass" {
+		t.Errorf("pass-required spec %s did not match PG (status=%q):\n%s",
+			specRelPath, result.Status, result.Diff)
+		return
+	}
+	t.Logf("PASS: %s", specRelPath)
+}
+
 // ── M0096-0001 dedicated sequential isolation tests ──────────────────────────
 //
 // One function per spec from the 21-spec RC isolation target list.
@@ -304,12 +333,20 @@ func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
 // heap tuple, so the GRANT records its writer XID (Catalog.SetDatabaseACLChangeXID)
 // and the database-wide VACUUM waits on it via mvcc.WaitForXID. The observed
 // datfrozenxid never retreats (cmp3 → 0 rows). All output byte-identical to PG 18.3.
+//
+// The spec names its database: `GRANT TEMP ON DATABASE isolation_regression`.
+// PG's harness always runs specs in a database of that name
+// (postgres/src/test/isolation/isolation_main.c:133, meson.build `dbname`), so
+// this test creates it and connects there. It passed against dbname=postgres
+// only while GRANT ON DATABASE silently ignored an unknown name; since
+// M0122-0008 (6ea8424b8) that raises 3D000 exactly as PG's
+// ExecGrant_Database does.
 func TestPort_IsolationIntraGrantInplaceDb(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_intra_grant_db")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace-db.spec")
+	runIsoSpecStrictInDB(t, root, c, "isolation_regression", "postgres/src/test/isolation/specs/intra-grant-inplace-db.spec")
 }
 
 // TestPort_IsolationIntraGrantInplace exercises the intra-grant-inplace spec
@@ -2114,10 +2151,16 @@ func TestPort_IsolationStats(t *testing.T) {
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
+	return buildDSNForDB(t, c, "postgres")
+}
+
+// buildDSNForDB is buildDSN for a named database.
+func buildDSNForDB(t *testing.T, c *cluster.Cluster, dbname string) string {
+	t.Helper()
 	addr := c.ListenAddr()
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatalf("split host port %q: %v", addr, err)
 	}
-	return fmt.Sprintf("host=%s port=%s user=postgres dbname=postgres sslmode=disable", host, port)
+	return fmt.Sprintf("host=%s port=%s user=postgres dbname=%s sslmode=disable", host, port, dbname)
 }

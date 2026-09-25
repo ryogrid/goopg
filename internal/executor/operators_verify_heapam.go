@@ -263,10 +263,17 @@ func verifyHeapamXidStatus(ctx *Context) amcheck.XidStatusFunc {
 // (context.go), which must still resolve like "no dbOid given" (i.e.
 // DefaultDBOid) rather than literally searching namespace 0 — zero is never
 // a real dbOid (catalog.DefaultDBOid == 1).
+//
+// The raw connection OID must be translated through catalog.NamespaceDBOid:
+// it aliases PostgresDBOid (16384, the `postgres` database) — and zero — onto
+// DefaultDBOid, which is the namespace that database's user tables actually
+// register under (every DDL path already normalizes the same way). Passing
+// the raw OID instead searches an empty namespace and reports every relation
+// in the default database "does not exist" — the regression M0119-0006bo
+// introduced while fixing the genuinely non-default-database case.
+// M0119-0006bq.
 func verifyHeapamResolveTable(d Datum, im *catalog.InMemory, dbOid uint32) (*catalog.Table, bool) {
-	if dbOid == 0 {
-		dbOid = catalog.DefaultDBOid
-	}
+	dbOid = catalog.NamespaceDBOid(dbOid)
 	switch d.Kind {
 	case KindInt:
 		return im.LookupTableByOID(uint32(d.Int), dbOid)

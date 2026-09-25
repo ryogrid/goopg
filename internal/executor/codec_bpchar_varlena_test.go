@@ -41,7 +41,16 @@ func TestEncodeValuePGCharWithArgs(t *testing.T) {
 		t.Fatalf("expected varlena (≥2 bytes), got %d bytes: %v — this is the bare single-byte bug", len(out), out)
 	}
 	// Verify the payload bytes match by round-tripping through varlenaTextBytes.
-	expected := varlenaTextBytes(text)
+	//
+	// M0143-0007b slice 1: a width-carrying bpchar is stored BLANK-PADDED to
+	// its declared width, as upstream's bpchar_input does, so the varlena
+	// carries 84 characters here rather than the 5 that were written. That
+	// growth is not incidental — it IS the fix: storing trimmed was the whole
+	// of the K41 `relpages` gap M0143-0007 measured on `customer`/`item`.
+	// What this test still pins is the ENCODING (a varlena, not a bare byte),
+	// which is why the expectation is derived from the same padding helper the
+	// production path uses instead of a hand-written byte list.
+	expected := varlenaTextBytes(catalog.PadBpchar(typ, text))
 	if !bytes.Equal(out, expected) {
 		t.Fatalf("encoded bytes = %v, want %v", out, expected)
 	}
@@ -71,7 +80,7 @@ func TestEncodeValuePGCharAlignmentMatches(t *testing.T) {
 	}
 }
 
-func TestEncodeValuePGVarcharCoercesIntAndTrimsSpaces(t *testing.T) {
+func TestEncodeValuePGVarcharCoercesIntAndTrimsOnlyExcessSpaces(t *testing.T) {
 	typ := catalog.Type{Name: "varchar", Args: []int64{1}}
 	out, err := encodeValuePG(typ, NewIntDatum(2))
 	if err != nil {
@@ -81,12 +90,29 @@ func TestEncodeValuePGVarcharCoercesIntAndTrimsSpaces(t *testing.T) {
 		t.Fatalf("encoded bytes = %v, want %v", out, want)
 	}
 
-	out, err = encodeValuePG(typ, NewStringDatum("c     "))
+	out, err = encodeValuePG(typ, NewStringDatum("c"))
 	if err != nil {
-		t.Fatalf("unexpected trim-space error: %v", err)
+		t.Fatalf("unexpected in-range error: %v", err)
 	}
 	if want := varlenaTextBytes("c"); !bytes.Equal(out, want) {
-		t.Fatalf("trimmed bytes = %v, want %v", out, want)
+		t.Fatalf("in-range bytes = %v, want %v", out, want)
+	}
+
+	typ = catalog.Type{Name: "varchar", Args: []int64{3}}
+	out, err = encodeValuePG(typ, NewStringDatum("x "))
+	if err != nil {
+		t.Fatalf("unexpected in-range trailing-space error: %v", err)
+	}
+	if want := varlenaTextBytes("x "); !bytes.Equal(out, want) {
+		t.Fatalf("in-range trailing-space bytes = %v, want %v", out, want)
+	}
+
+	out, err = encodeValuePG(typ, NewStringDatum("abc   "))
+	if err != nil {
+		t.Fatalf("unexpected excess-space error: %v", err)
+	}
+	if want := varlenaTextBytes("abc"); !bytes.Equal(out, want) {
+		t.Fatalf("excess-space bytes = %v, want %v", out, want)
 	}
 }
 

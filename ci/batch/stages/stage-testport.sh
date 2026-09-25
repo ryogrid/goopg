@@ -11,8 +11,19 @@ REGRESS_DIFF_DIR="${RUN_DIR}/testport/regress-diffs"
 mkdir -p "${REGRESS_DIFF_DIR}"
 progress "S1.H" "testport start (unit=goopg-nightly-testport high=6G max=8G timeout=120m)"
 
+# Compile+run inside the pinned worktree when the orchestrator provides one
+# (same live-tree build-break phantom class as units/race). The worktree's
+# postgres/ gitlink is empty; run-nightly links the read-only oracle in, and
+# the block below self-heals so a standalone stage run still finds fixtures.
+TEST_ROOT="${NIGHTLY_SRC_ROOT:-${REPO_ROOT}}"
+if [[ "${TEST_ROOT}" != "${REPO_ROOT}" && ! -e "${TEST_ROOT}/postgres/local_install" ]]; then
+    rmdir "${TEST_ROOT}/postgres" 2>/dev/null || true
+    ln -s "${REPO_ROOT}/postgres" "${TEST_ROOT}/postgres" 2>/dev/null \
+        || echo "WARN: postgres oracle fixtures unavailable under ${TEST_ROOT} — tool/spec-dependent tests will skip"
+fi
+
 rc=0
-( cd "${REPO_ROOT}" && \
+( cd "${TEST_ROOT}" && \
   GOOPG_REGRESS_DIFF_DIR="${REGRESS_DIFF_DIR}" \
   GOOPG_CG_UNIT=goopg-nightly-testport GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
   GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \

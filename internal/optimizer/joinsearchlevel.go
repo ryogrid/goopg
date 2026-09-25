@@ -248,6 +248,27 @@ func (s *searchCtx) joinIsLegal(rel1, rel2 *RelOptInfo) (sjinfo *SpecialJoinInfo
 			}
 			matchSJInfo = sj
 			matchReversed = true
+		} else if sj.Jointype == parser.JoinSemi && sj.SynRighthand == rel2.Relids &&
+			createUniquePath(rel2, rel2.CheapestTotal, sj, s.cp) != nil {
+			// M0142-0008c-2: for a semijoin, the RHS can be joined to
+			// anything else by unique-ifying it first, then treating the
+			// result as a plain inner join (joinrels.c:445-467). Only
+			// reachable once M0142-0008c-1's createUniquePath succeeds for
+			// rel2 — see its own doc comment for exactly which SEMI shapes
+			// that is today (the EXISTS/IN-unnest atomic-RHS wrapping).
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = false
+		} else if sj.Jointype == parser.JoinSemi && sj.SynRighthand == rel1.Relids &&
+			createUniquePath(rel1, rel1.CheapestTotal, sj, s.cp) != nil {
+			// Reversed semijoin case (joinrels.c:469-489).
+			if matchSJInfo != nil {
+				return nil, false, fmt.Errorf("join search: join %#08x⋈%#08x matches multiple SpecialJoinInfos — invalid", uint32(rel1.Relids), uint32(rel2.Relids))
+			}
+			matchSJInfo = sj
+			matchReversed = true
 		} else if relsOverlap(sj.MinRighthand, rel1.Relids) && relsOverlap(sj.MinRighthand, rel2.Relids) {
 			// Both inputs overlap RHS — assume valid previous commutation (joinrels.c:509-511).
 			continue
@@ -322,8 +343,12 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 			// would be invisible to the level above. It is a no-op until a
 			// joinrel has partial paths (C-19f) and while GOOPG_GATHER_PATHS
 			// is off.
-			s.generateUsefulGatherPaths(rel)
+			s.generateUsefulGatherPaths(rel, false)
 			setCheapest(rel)
+			// R53 Step-0: one L-number per relset, after the whole level's
+			// pairs have been offered and the cheapest is final. Nil-safe —
+			// a no-op when the trace gate is off.
+			s.trace.cost(rel)
 		}
 	}
 	top, err := s.finalRel()
@@ -646,6 +671,12 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// `joinrel->consider_parallel` (relnode.c:842): both inputs AND the
 		// join's own clauses parallel-safe. C-19a (considerparallel.go).
 		joinrel.ConsiderParallel = joinrelConsiderParallel(s, rel1, rel2, clauses)
+		// R54 Step-0: the admission record for the S1/S2 separation. Inside
+		// the created branch, so first-writer-wins matches the trace's
+		// `created` semantics above; later pairs spanning this relset reuse
+		// the flag. Nil-safe — a no-op when the trace gate is off.
+		s.trace.admit(joinrel.Relids, joinrel.ConsiderParallel,
+			rel1.ConsiderParallel, rel2.ConsiderParallel, clauses, s.cat)
 		if err := s.addRel(joinrel); err != nil {
 			return nil, err
 		}

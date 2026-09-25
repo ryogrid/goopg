@@ -90,8 +90,12 @@ func TestPort_LockRowsSortOverJoinTakesRowLock(t *testing.T) {
 		// The regression: ORDER BY puts a Sort between LockRows and the join.
 		{"sort_over_join", `SELECT a.accountid, a.balance FROM lrs_acct a, lrs_side s
 			WHERE a.accountid = s.k ORDER BY a.accountid FOR UPDATE OF a`},
-		// Control: same join, no Sort. This route (lockRowsOp.scan) always
-		// worked; it is here so a future change cannot "fix" one and break the
+		// Control: same join, no Sort. Written when the plan was a seq-scan
+		// leaf under the join (route 1, lockRowsOp.scan); the planner now puts
+		// the locked relation under a Bitmap Heap Scan here, so this case pins
+		// the bitmap leaf's TID surfacing (resjunk ctid + hasCTID stamp +
+		// currentTID + walker arms, M-NIGHTLY AI-20260917-004357-013). Both
+		// routes are pinned so a future change cannot "fix" one and break the
 		// other unnoticed.
 		{"join_no_sort", `SELECT a.accountid, a.balance FROM lrs_acct a, lrs_side s
 			WHERE a.accountid = s.k AND a.accountid = 'checking' FOR UPDATE OF a`},

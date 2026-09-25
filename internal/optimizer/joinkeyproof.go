@@ -28,11 +28,10 @@ package optimizer
 // `joinResidualSelectivity` excluded BOTH, so the joinrel read
 // `6M · 800k / 10 000 = 481M` against an actual `5 997 241` and the search put
 // it below the `part` filter instead of above it (09 §5.4). Pricing every pair
-// the way `clauselist_selectivity` does swings it the OTHER way — the two
-// marginal distincts multiply to `1/(200 000 · 10 000)`, i.e. ≈ 2 rows — which
-// is exactly the error upstream avoids by removing the covered clauses and
-// substituting ONE `1/ntuples` for the key as a whole. The two halves are one
-// change; landing either alone is a measured regression.
+// the way `clauselist_selectivity` does instead gives the ordinary marginal
+// estimate; R88 keeps that selectivity even when a bare composite unique key
+// proves a no-fan-out ceiling. Only a declared FK may remove the equality
+// pairs and substitute `1/ref_tuples`.
 
 import (
 	"math"
@@ -59,7 +58,9 @@ func uniqueKeyColumnSets(cat catalog.Catalog, tbl *catalog.Table) [][]string {
 	}
 	var out [][]string
 	for _, idx := range cat.IndexesOnTable(tbl) {
-		if idx == nil || !idx.Unique || len(idx.Columns) == 0 {
+		// Without predicate implication, a partial unique index does not
+		// prove that the whole scan output is unique.
+		if idx == nil || !idx.Unique || idx.HasPredicate || len(idx.Columns) == 0 {
 			continue
 		}
 		cols := make([]string, len(idx.Columns))
@@ -145,6 +146,27 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		// Heap-fetching probe: output schema is the table's column order,
 		// same as *SeqScan.
 		return baseColumnOfTable(x, x.Table, x.UniqueKeys, idx)
+	// R63 (M1-display): unlike *IndexScan, the IOS leaf's output schema is
+	// the narrowed `Covered` projection (plan.go), not the table's column
+	// order, so `idx` must be remapped through `Covered[idx].Name` first —
+	// the *Project rule for a fixed projection. IOS carries no UniqueKeys.
+	// Empty/mismatched `Covered` misses exactly as today. A leaf arm (no
+	// recursion into resolveBaseColumn), like *SeqScan/*IndexScan.
+	case *IndexOnlyScan:
+		if x.Table == nil || idx < 0 || idx >= len(x.Covered) {
+			return baseColumnRef{}, false
+		}
+		tableIdx := -1
+		for i := range x.Table.Columns {
+			if x.Table.Columns[i].Name == x.Covered[idx].Name {
+				tableIdx = i
+				break
+			}
+		}
+		if tableIdx < 0 {
+			return baseColumnRef{}, false
+		}
+		return baseColumnOfTable(x, x.Table, nil, tableIdx)
 	case *Filter:
 		return resolveBaseColumn(idx, x.Child)
 	case *Sort:
@@ -171,6 +193,15 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 	case *Gather:
 		return resolveBaseColumn(idx, x.Child)
 	case *GatherMerge:
+		return resolveBaseColumn(idx, x.Child)
+	case *Memoize:
+		// Memoize changes neither its child's row shape nor the values in a
+		// cached tuple.  Its typed IndexScan child is still the base-relation
+		// path behind a grouping or selectivity Var; stopping here instead
+		// silently drops the key's distinct contribution (TPC-DS Q39).
+		if x.Child == nil {
+			return baseColumnRef{}, false
+		}
 		return resolveBaseColumn(idx, x.Child)
 	case *CTEScan:
 		// The scan's schema is the body's output schema, position for
@@ -238,6 +269,57 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 			return resolveBaseColumn(idx-ow, x.Inner)
 		}
 		return resolveBaseColumn(idx, x.Outer)
+
+	// R63 (M1-display): partial-mode ONLY. A partial aggregate's output
+	// layout is [group exprs…, agg calls…, passthrough…], so a bare
+	// *ColumnRef group expr is an identity remap one level down — the
+	// *Project rule. Whole-mode aggs MUST miss here: `groupUniqueNDistinct`
+	// answers them exactly (PG's isunique branch: grouped output IS unique)
+	// and resolveBaseColumn is tried FIRST in `examineGroupVar`, so a
+	// general arm would SHADOW exact agg-rows answers with base-nd
+	// overestimates. `groupUniqueNDistinct` refuses partials (per-worker
+	// rows are not the group count), so this arm converts only today's
+	// misses; whole aggs keep today's behavior bit-identically.
+	// Expressions, agg-call columns, and grouping-sets exoticism beyond
+	// bare refs miss exactly as today. Exempted (not twinned) in
+	// `resolverArmExemptions`: an aggregate's output is groups, not
+	// base-rel rows, so the Yao walk must not descend through it.
+	case *Aggregate:
+		if x.Mode != AggModePartial {
+			return baseColumnRef{}, false
+		}
+		if x.Child == nil || idx < 0 || idx >= len(x.GroupExprs) {
+			return baseColumnRef{}, false
+		}
+		if cr, ok := x.GroupExprs[idx].(*ColumnRef); ok {
+			return resolveBaseColumn(cr.Index, x.Child)
+		}
+
+	// M0145-0009 slice 4 (B-06 gap G1). A `*WindowAgg` publishes
+	// `child row ++ func outputs` and is ROW-PRESERVING — one output row per
+	// input row, values unchanged — so a coordinate landing in the
+	// pass-through region describes exactly the child's column: same values,
+	// same distinct count, same raw relation beneath it. Everything
+	// `baseColumnRef` carries survives the crossing, which is what makes this
+	// arm sound where the `*Aggregate` arm above is deliberately restricted:
+	// an Aggregate's output rows are GROUPS, so its row set is not its
+	// child's, and M0127-P5.6-g-ii MEASURED the unrestricted version worse.
+	//
+	// Upstream needs no such arm because its resolution happens at the parse
+	// level: `examine_simple_variable` (selfuncs.c) walks into a subquery RTE
+	// and reads the targetlist entry, and a window query's pass-through column
+	// IS a plain `Var` of the underlying relation there — the WindowAgg is a
+	// plan node that never stands between them. goopg resolves over the PLAN
+	// tree, so the node has to be crossed explicitly.
+	//
+	// Fail-closed: a coordinate at or past the child's width is a window
+	// function's own output — `rank()`, `sum() OVER (...)` — a computed value
+	// with no base column, and it resolves to nothing.
+	case *WindowAgg:
+		if x.Child == nil || idx < 0 || idx >= len(x.Child.Output()) {
+			return baseColumnRef{}, false
+		}
+		return resolveBaseColumn(idx, x.Child)
 	}
 	return baseColumnRef{}, false
 }
@@ -335,6 +417,16 @@ func resolvesToGroupUniqueColumn(idx int, child Node) bool {
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *CTEScan:
 		return resolvesToGroupUniqueColumn(idx, x.Child)
+	// The `*WindowAgg` twin of `resolveBaseColumn`'s arm. This function's own
+	// contract says the two walkers must agree about which node a coordinate
+	// lands on, so the arm is added here in the same change — a coordinate
+	// that crosses the window there must cross it here too, or the pair would
+	// be describing different columns.
+	case *WindowAgg:
+		if x.Child == nil || idx < 0 || idx >= len(x.Child.Output()) {
+			return false
+		}
+		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *Project:
 		if idx >= 0 && idx < len(x.Targets) {
 			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
@@ -383,6 +475,15 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 			// then fell to a default.
 			ref.ndistinct = int64(tbl.Stats.Columns[idx].ResolvedNDistinct(ref.rawRows))
 			ref.stats = &tbl.Stats.Columns[idx]
+		}
+	}
+	// Without ANALYZE, PG's divisor is still `vardata->rel->tuples`: the
+	// estimate_rel_size row count get_relation_info stamped on the rel
+	// (plancat.c), never zero for a relation with a live block count. goopg
+	// stamps the same estimate on the scan as EstRelRows.
+	if ref.rawRows == 0 {
+		if ss, ok := scan.(*SeqScan); ok && ss.EstRelRows > 0 {
+			ref.rawRows = float64(ss.EstRelRows)
 		}
 	}
 	// take2 P1-19: `get_variable_numdistinct`'s isunique branch
@@ -465,7 +566,11 @@ func soleBaseScan(n Node) Node {
 type joinSuperkeyEstimate struct {
 	sel     float64
 	covered []bool
-	fired   bool
+	// fired means a declared-FK selectivity substitution consumed clauses.
+	fired bool
+	// boundProven is independent: a bare unique key can establish a sound
+	// ceiling while leaving its equality in ordinary selectivity accounting.
+	boundProven bool
 	// rowsBound is the tightest STRUCTURAL upper bound on the join's output
 	// implied by the proven keys, or +Inf when none is provable.
 	rowsBound float64
@@ -489,19 +594,18 @@ type resolvedPair struct {
 	leftOK, rightOK bool
 }
 
-// superkeyJoinEstimate is `get_foreign_key_join_selectivity` over a finished
-// `*Join`: it removes from `pairs` every pair covered by a proven key on one
-// side and returns 1/(that side's RAW tuple count) in their place, multiplied
-// over each key it can prove.
+// superkeyJoinEstimate applies FK selectivity over a finished `*Join` and
+// separately discovers bare-unique structural bounds. Only a declared FK
+// removes its covered pairs and contributes 1/(referenced RAW tuple count);
+// a bare unique key leaves its equality pairs for ordinary selectivity.
 //
 // The three properties reproduced from upstream are spelled out in
 // joinrelsize.go's `superkeyJoinSelectivity` header and hold identically here:
-// the divisor is the RAW count; the WHOLE key must be covered ("if we failed to
-// remove all the matching clauses we expected to find, chicken out",
-// costsize.c:5760) while the CLAUSE list may be partial; and a pair is consumed
-// once, so two overlapping keys cannot both charge for it. Largest divisor
-// first, because a key on either side gives an upper bound and the estimate is
-// the minimum of the available bounds.
+// the FK divisor is the RAW count; the WHOLE key must be covered ("if we
+// failed to remove all the matching clauses we expected to find, chicken out",
+// costsize.c:5760) while the CLAUSE list may be partial; and an FK pair is
+// consumed once. Bare-unique candidates are all inspected because their bounds
+// depend on opposite-side post-filter rows rather than divisor order.
 func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 	est := joinSuperkeyEstimate{sel: 1.0, covered: make([]bool, len(pairs)), rowsBound: math.Inf(1)}
 	if j == nil || j.Left == nil || j.Right == nil || len(pairs) == 0 {
@@ -544,8 +648,17 @@ func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 	leftSole := soleBaseScan(j.Left)
 	rightSole := soleBaseScan(j.Right)
 
+	// Bare UNIQUE evidence is bound-only. Examine every candidate over the
+	// intact pairs: shared pairs can establish distinct post-filter bounds, and
+	// the FK pass below must see the original pair set as well.
+	for _, key := range provableJoinKeys(resolved, make([]bool, len(pairs)), func(k provenJoinKey) bool { return !k.fromFK }) {
+		if b, ok := joinKeyRowsBound(key, leftSole, rightSole, j); ok && b < est.rowsBound {
+			est.rowsBound, est.boundProven = b, true
+		}
+	}
+
 	for {
-		key, ok := bestProvableJoinKey(resolved, est.covered)
+		key, ok := bestProvableJoinKey(resolved, est.covered, func(k provenJoinKey) bool { return k.fromFK })
 		if !ok {
 			break
 		}
@@ -554,22 +667,8 @@ func superkeyJoinEstimate(j *Join, pairs []JoinKeyPair) joinSuperkeyEstimate {
 		}
 		est.sel *= 1.0 / key.rawTuples
 		est.fired = true
-		// The key-implied bound (04 §3.3): every row of the OTHER side
-		// matches at most one row of the key relation, so the join cannot
-		// emit more rows than the other side brings — but only when the key
-		// relation IS that whole side. `Rows` there is the POST-filter
-		// estimate, because the rows it will actually bring are the ones
-		// that survived its quals; unlike the DIVISOR (a match fraction,
-		// hence raw) this is a count of probes.
-		switch {
-		case key.keyScan != nil && key.keyScan == leftSole:
-			if b := float64(EstimateRows(j.Right)); b < est.rowsBound {
-				est.rowsBound = b
-			}
-		case key.keyScan != nil && key.keyScan == rightSole:
-			if b := float64(EstimateRows(j.Left)); b < est.rowsBound {
-				est.rowsBound = b
-			}
+		if b, ok := joinKeyRowsBound(key, leftSole, rightSole, j); ok && b < est.rowsBound {
+			est.rowsBound, est.boundProven = b, true
 		}
 	}
 	est.sel = clampSelectivity(est.sel)
@@ -587,12 +686,45 @@ type provenJoinKey struct {
 	pairs     []int
 	rawTuples float64
 	keyScan   Node
+	fromFK    bool
+}
+
+// joinKeyRowsBound is the plan-node counterpart of keyImpliedRowsBound. A key
+// bounds a join only when its scan is the whole input side; a join below it may
+// otherwise already have duplicated its key rows.
+func joinKeyRowsBound(key provenJoinKey, leftSole, rightSole Node, j *Join) (float64, bool) {
+	if j == nil {
+		return 0, false
+	}
+	switch {
+	case key.keyScan != nil && key.keyScan == leftSole:
+		return float64(EstimateRows(j.Right)), true
+	case key.keyScan != nil && key.keyScan == rightSole:
+		return float64(EstimateRows(j.Left)), true
+	}
+	return 0, false
 }
 
 // bestProvableJoinKey finds the key with the largest divisor over the pairs not
 // yet consumed. Scans are visited in pair order and each scan's candidate keys
 // in stamped (catalog) order, so the answer does not move between runs.
-func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey, bool) {
+func bestProvableJoinKey(resolved []resolvedPair, covered []bool, admit func(provenJoinKey) bool) (provenJoinKey, bool) {
+	candidates := provableJoinKeys(resolved, covered, admit)
+	var best provenJoinKey
+	found := false
+	for _, cand := range candidates {
+		if !found || cand.rawTuples > best.rawTuples {
+			best, found = cand, true
+		}
+	}
+	return best, found
+}
+
+// provableJoinKeys enumerates the candidate evidence over the currently
+// available pairs. The FK pass chooses its largest raw-tuple divisor; bare
+// unique bounds instead inspect every candidate because their tightness comes
+// from the opposite side's post-filter rows.
+func provableJoinKeys(resolved []resolvedPair, covered []bool, admit func(provenJoinKey) bool) []provenJoinKey {
 	// equated[scan] = the columns of that relation instance which a still
 	// available pair equates to something on the other side of this join.
 	type scanState struct {
@@ -622,15 +754,15 @@ func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey
 		}
 	}
 
-	var best provenJoinKey
-	found := false
+	var out []provenJoinKey
 	consider := func(cand provenJoinKey) {
 		if cand.rawTuples < 1 || len(cand.pairs) == 0 {
 			return
 		}
-		if !found || cand.rawTuples > best.rawTuples {
-			best, found = cand, true
+		if admit != nil && !admit(cand) {
+			return
 		}
+		out = append(out, cand)
 	}
 	for _, scan := range order {
 		st := state[scan]
@@ -659,7 +791,12 @@ func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey
 			continue
 		}
 		for _, fk := range st.ref.table.ForeignKeys {
-			if fk.NotValid || fk.NotEnforced || !columnsSubset(fk.Columns, st.cols) {
+			// R125: `NotValid` is not a filter — see the long note in
+			// joinrelsize.go's twin loop. PG gates on `conenforced` only
+			// (plancat.c:642-644). This site can set `rowsBound`, but every
+			// consumer of it is a clamp on a row ESTIMATE, so an unvalidated
+			// constraint costs optimism, never correctness.
+			if fk.NotEnforced || !columnsSubset(fk.Columns, st.cols) {
 				continue
 			}
 			parent, ok := fkParentScan(resolved, covered, scan, fk)
@@ -670,10 +807,11 @@ func bestProvableJoinKey(resolved []resolvedPair, covered []bool) (provenJoinKey
 				pairs:     coveringJoinPairs(resolved, covered, scan, fk.Columns),
 				rawTuples: parent.rawRows,
 				keyScan:   parent.scan,
+				fromFK:    true,
 			})
 		}
 	}
-	return best, found
+	return out
 }
 
 // coveringJoinPairs returns the indexes of the still-available pairs that

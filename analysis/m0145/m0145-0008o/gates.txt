@@ -1,0 +1,13 @@
+tmp/m0145-0008o-fireset.log:FIRE-SET: baseline=63166b4774bf900e88e6bfa75ed42070132f3f7c (379aec49bfb9) candidate=worktree (ede7e482e969)
+tmp/m0145-0008o-fireset.log:FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+tmp/m0145-0008o-fireset.log:FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+tmp/m0145-0008o-tpch.log:FIRE-SET: baseline=63166b4774bf900e88e6bfa75ed42070132f3f7c (4cafd9e538c9) candidate=worktree (ede7e482e969)
+tmp/m0145-0008o-tpch.log:FIRE-SET: corpus=tpch fires=none (plan A/B had no changed query)
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+# first sweep attempt: 12 ERROR = mem_guard cgroup.kill of the sweep server under nightly-batch RAM pressure (75%); re-run clean
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS
+tpch-spotcheck: RESULT=PASS

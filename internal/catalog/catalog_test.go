@@ -1032,7 +1032,7 @@ func TestDropPrimaryKeyConstraint(t *testing.T) {
 	}
 
 	// Drop it.
-	if !c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+	if !c.DropPrimaryKeyConstraint(tbl, "articles_pkey") {
 		t.Fatal("DropPrimaryKeyConstraint returned false")
 	}
 
@@ -1042,7 +1042,7 @@ func TestDropPrimaryKeyConstraint(t *testing.T) {
 	}
 
 	// Dropping again returns false (not found).
-	if c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+	if c.DropPrimaryKeyConstraint(tbl, "articles_pkey") {
 		t.Fatal("expected false on second drop")
 	}
 }

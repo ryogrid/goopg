@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tpcds-plan-diff.py — compare two TPC-DS plan captures, query by query.
 
-Why this exists (M0127-P5.6-g-i-b, 2026-08-05). The SF0.5 regression gate
+Why this exists (M0127-P5.6-g-i-b, 2026-08-05). The SF0.25 regression gate
 compares ROW COUNTS and VALUE CHECKSUMS, which is the right primary bar and is
 not weakened here. But it is blind to plan shape: on 2026-08-05 a whole-corpus
 EXPLAIN A/B showed that commit `4b820ab8` re-ordered **74 of 99** TPC-DS plans
@@ -17,7 +17,7 @@ is therefore signal, not flake — which is only true because the capture is
 EXPLAIN-without-ANALYZE (no timings, no actual rows) on a freshly restarted
 server.
 
-Input format (produced by tpcds-sf05-regression.sh `plans`, and by the
+Input format (produced by tpcds-sf025-regression.sh `plans`, and by the
 hand-rolled `analysis/leftdeep-joins/2026-08-05-p56gi-capture.sh` that preceded
 it — the two are deliberately diff-compatible):
 
@@ -41,7 +41,28 @@ import difflib
 import re
 import sys
 
-BLOCK_RE = re.compile(r"^=====\s*Q(\d+)\s*=====\s*$")
+# TWO capture formats exist in this harness and both must parse (M0145-0021):
+#
+#   `===== Q1 =====`   the SF0.25 sweep's capture
+#   `=== Q1`           scripts/jointree-parity-capture.sh's capture
+#
+# Until this accepted both, pointing the tool at a jointree capture reported
+# `queries=0 same=0 changed=0` — a VACUOUS pass indistinguishable from "the
+# plans agree". Every loop that needed to diff those captures therefore
+# hand-rolled its own diff, and two of them were bitten by the psql-path noise
+# this file already normalises below (loops 82 and 84 each "found" Q36/Q70/Q86
+# changed when only the temp filename inside their parse errors differed).
+# `no_blocks_is_fatal` below is the other half: a capture that parses to
+# nothing is a broken capture, never a clean result.
+# The TPC-H capture writes SUB-LABELLED blocks — `=== Q15a-VIEWBODY` beside
+# `=== Q15b-MAIN` — and a pattern that stopped at the digits did not match
+# them at all, so their bodies were silently appended to the PRECEDING
+# query's block: measured 2026-09-22 on a TPC-H capture, Q15 vanished and
+# Q14 carried Q15a's plan. Sub-blocks now fold onto their numeric id (the
+# id space the fire-set gate needs), separated by a marker line so a
+# reordering or a renamed sub-block is still a difference. TPC-DS captures
+# have no sub-labels, so nothing there changes.
+BLOCK_RE = re.compile(r"^={3,5}\s*Q(\d+)([A-Za-z][\w-]*)?\s*(?:={3,5}\s*)?$")
 # psql prints the provenance the harness stamped; keep it out of the comparison
 # so two captures of the same code never differ on their own timestamps.
 PROVENANCE_RE = re.compile(r"^#")
@@ -49,7 +70,7 @@ PROVENANCE_RE = re.compile(r"^#")
 # `psql:/tmp/xyz.sql:29: ERROR: ...`. That path is the harness's business, not
 # the plan's: TPC-DS Q36/Q70/Q86 are dsqgen artefacts that fail to parse on PG
 # too, so their block is an error message, and every capture written to a
-# different directory (SF05_RESULTS_DIR redirected, or the hand-rolled
+# different directory (SF025_RESULTS_DIR redirected, or the hand-rolled
 # predecessor writing to /tmp) reported all three as "changed". Three permanent
 # false positives in a channel whose entire value rests on a zero noise floor.
 # The line number is KEPT — it moves only when the query file itself does.
@@ -72,7 +93,11 @@ def parse(path):
             m = BLOCK_RE.match(line)
             if m:
                 cur = int(m.group(1))
-                blocks[cur] = []
+                sub = m.group(2)
+                if cur not in blocks:
+                    blocks[cur] = []
+                if sub:
+                    blocks[cur].append("-- block Q%d%s" % (cur, sub))
                 continue
             if cur is None:
                 if PROVENANCE_RE.match(line):
@@ -97,6 +122,80 @@ def label(header, fallback):
     return fallback
 
 
+# M0145-0022: join-method election classification.
+#
+# M0145-0012 and M0145-0018 both produced plans whose VALUES were verified
+# byte-identical at SF0.25 while the shape and the clock regressed — Q74 16.6x
+# there, and at SF1 Q78 did not finish at all, so no value comparison existed
+# at that scale. Every value gate is blind to that class. The shape channel
+# above already reports THAT a plan moved; this reports WHICH WAY, because the
+# direction is what distinguishes a neutral re-shape from the C-04a failure.
+#
+# C-04a's signature is an equi-join demoted to a Join Filter on a nested loop
+# priced off an epsilon row estimate, so a move INTO Nested Loop is the suspect
+# direction and is flagged as such. The reverse and the merge/hash exchanges
+# are reported too, without judgement: a plan is free to elect a nested loop
+# for good reasons, and this channel exists to make a human look, not to decide.
+#
+# Report-only by construction — nothing here touches the exit status, which
+# stays `--strict`'s alone. The task's own instruction is to start report-only
+# and promote after one clean corpus cycle.
+JOIN_METHOD_RES = (
+    # Ordered most-specific first: "Parallel Hash Join" must not be counted as
+    # a bare "Hash Join", and "Nested Loop Left Join" is still a nested loop.
+    ("nestloop", re.compile(r"->\s+(?:Parallel\s+)?Nested Loop\b")),
+    ("hash", re.compile(r"->\s+(?:Parallel\s+)?Hash (?:Left |Right |Full |Semi |Anti )?Join\b")),
+    ("merge", re.compile(r"->\s+(?:Parallel\s+)?Merge (?:Left |Right |Full |Semi |Anti )?Join\b")),
+)
+
+
+def join_methods(body):
+    """Count join nodes by method family in one query's plan body."""
+    counts = {name: 0 for name, _ in JOIN_METHOD_RES}
+    for line in body:
+        for name, rx in JOIN_METHOD_RES:
+            if rx.search(line):
+                counts[name] += 1
+                break
+    return counts
+
+
+def join_method_report(old, new, changed):
+    """Print the per-query election deltas and the summary line.
+
+    Only CHANGED queries are examined: an unchanged plan cannot have moved a
+    join method, so counting it would be noise with a cost.
+    """
+    suspects, moves = [], []
+    for qid in changed:
+        o, n = join_methods(old[qid]), join_methods(new[qid])
+        if o == n:
+            continue
+        delta = {k: n[k] - o[k] for k in n if n[k] != o[k]}
+        rendered = " ".join(
+            "%s%+d" % (k, v) for k, v in sorted(delta.items())
+        )
+        moves.append("Q%d %s" % (qid, rendered))
+        if delta.get("nestloop", 0) > 0:
+            suspects.append(qid)
+    for line in moves:
+        print("# join-method: " + line)
+    print(
+        "=== JOIN-METHOD-ELECTION: moved=%d into-nestloop=%d%s ==="
+        % (
+            len(moves),
+            len(suspects),
+            (" suspects=" + " ".join("Q%d" % q for q in suspects)) if suspects else "",
+        )
+    )
+    if suspects:
+        print(
+            "# a move INTO Nested Loop is the C-04a direction (an equi-join "
+            "demoted to a Join Filter on an epsilon row estimate) — look before "
+            "accepting. Report-only: this line never changes the exit status."
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("old")
@@ -112,6 +211,21 @@ def main():
     except OSError as exc:
         print(f"# plan-diff: unavailable ({exc})")
         return 0
+
+    # A capture that parses to zero query blocks is broken — a wrong path, a
+    # truncated file, or a header format this tool does not know. Reporting
+    # "changed=0" for it would be a vacuous pass that reads exactly like a
+    # clean run, which is the failure mode this repository keeps paying for.
+    # Exit 2 keeps it distinguishable from --strict's 1.
+    for path, blocks in ((args.old, old), (args.new, new)):
+        if not blocks:
+            print(
+                f"# plan-diff: FATAL — {path} parsed 0 query blocks. "
+                "Expected `===== Qn =====` (sweep) or `=== Qn` (jointree "
+                "capture) block headers; a capture with none is broken, and "
+                "reporting no differences for it would be a vacuous pass."
+            )
+            return 2
 
     changed, same = [], []
     for qid in sorted(set(old) & set(new)):
@@ -134,6 +248,8 @@ def main():
     )
     if not changed and not added and not removed:
         print("# plan shapes identical (noise floor is zero — see header)")
+    if changed:
+        join_method_report(old, new, changed)
 
     if args.verbose:
         for qid in changed:

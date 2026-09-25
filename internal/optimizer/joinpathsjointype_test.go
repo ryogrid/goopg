@@ -59,11 +59,13 @@ func kindsOf(list []*Path) map[PathKind]int {
 // the jointype alone cannot express orientation.
 func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	a, b := relsetOf(0), relsetOf(1)
+	relA, relB := mkTestRel(a), mkTestRel(b)
+	cp := defaultCostParams()
 
-	if jt, ok := jointypeForDirection(nil, a, b); !ok || jt != parser.JoinInner {
+	if jt, _, ok := jointypeForDirection(nil, relA, relB, cp); !ok || jt != parser.JoinInner {
 		t.Errorf("nil sjinfo forward = (%v, %v), want (JoinInner, true)", jt, ok)
 	}
-	if jt, ok := jointypeForDirection(nil, b, a); !ok || jt != parser.JoinInner {
+	if jt, _, ok := jointypeForDirection(nil, relB, relA, cp); !ok || jt != parser.JoinInner {
 		t.Errorf("nil sjinfo reversed = (%v, %v), want (JoinInner, true) — an inner "+
 			"join is legal in both directions", jt, ok)
 	}
@@ -72,10 +74,10 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 		parser.JoinRight, parser.JoinSemi, parser.JoinAnti,
 	} {
 		sj := mkSJ(jtype, a, b)
-		if jt, ok := jointypeForDirection(sj, a, b); !ok || jt != jtype {
+		if jt, _, ok := jointypeForDirection(sj, relA, relB, cp); !ok || jt != jtype {
 			t.Errorf("%v forward = (%v, %v), want (%v, true)", jtype, jt, ok, jtype)
 		}
-		if _, ok := jointypeForDirection(sj, b, a); ok {
+		if _, _, ok := jointypeForDirection(sj, relB, relA, cp); ok {
 			t.Errorf("%v reversed = legal; want declined — the reversed direction is "+
 				"PG's JOIN_RIGHT_SEMI/JOIN_RIGHT_ANTI (or an unadmitted commuted RIGHT), "+
 				"which goopg does not generate", jtype)
@@ -87,10 +89,10 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	// ties — PG calls LEFT first — and a pair covering neither orientation
 	// still declines.
 	sjLeft := mkSJ(parser.JoinLeft, a, b)
-	if jt, ok := jointypeForDirection(sjLeft, a, b); !ok || jt != parser.JoinLeft {
+	if jt, _, ok := jointypeForDirection(sjLeft, relA, relB, cp); !ok || jt != parser.JoinLeft {
 		t.Errorf("LEFT forward = (%v, %v), want (JoinLeft, true)", jt, ok)
 	}
-	if jt, ok := jointypeForDirection(sjLeft, b, a); !ok || jt != parser.JoinRight {
+	if jt, _, ok := jointypeForDirection(sjLeft, relB, relA, cp); !ok || jt != parser.JoinRight {
 		t.Errorf("LEFT reversed = (%v, %v), want (JoinRight, true)", jt, ok)
 	}
 	// A disjoint pair covering neither orientation still declines. (With
@@ -99,7 +101,8 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	// no tie for forward to win; PG likewise calls LEFT first and the
 	// second call only fires on the reversed containment.)
 	c, d := relsetOf(2), relsetOf(3)
-	if jt, ok := jointypeForDirection(sjLeft, c, d); ok || jt != parser.JoinLeft {
+	relC, relD := mkTestRel(c), mkTestRel(d)
+	if jt, _, ok := jointypeForDirection(sjLeft, relC, relD, cp); ok || jt != parser.JoinLeft {
 		t.Errorf("LEFT disjoint-neither = (%v, %v), want (JoinLeft, false)", jt, ok)
 	}
 
@@ -107,11 +110,58 @@ func TestJointypeForDirection_OrientationDecidesLegality(t *testing.T) {
 	// so there is no `createPlanNode` arm to emit one and a path would be a
 	// plan that silently drops the rows a full join exists to keep.
 	sjFull := mkSJ(parser.JoinFull, a, b)
-	for _, dir := range [][2]RelSet{{a, b}, {b, a}} {
-		if _, ok := jointypeForDirection(sjFull, dir[0], dir[1]); ok {
+	for _, dir := range [][2]*RelOptInfo{{relA, relB}, {relB, relA}} {
+		if _, _, ok := jointypeForDirection(sjFull, dir[0], dir[1], cp); ok {
 			t.Errorf("FULL (%#b as outer) = legal; want declined in BOTH directions",
-				dir[0])
+				dir[0].Relids)
 		}
+	}
+}
+
+// TestJointypeForDirection_UniqueIfyFallback pins M0142-0008c-3a's new
+// admission arm directly. The fixture's MinLefthand names a THIRD rel
+// ("extra") that neither lone candidate rel covers, so the ordinary
+// MinLefthand/MinRighthand containment check fails for BOTH orientations —
+// the fallback is the only route to admission, and only fires when the
+// candidate rel is bit-EQUAL to SynRighthand and createUniquePath can
+// actually unique-ify it.
+func TestJointypeForDirection_UniqueIfyFallback(t *testing.T) {
+	cp := defaultCostParams()
+	lhs, rhs, extra := relsetOf(0), relsetOf(1), relsetOf(2)
+
+	rhsRel, subpath, sjinfo := uniquePathFixture(500)
+	rhsRel.Relids = rhs
+	rhsRel.CheapestTotal = subpath
+	sjinfo.MinLefthand, sjinfo.SynLefthand = lhs|extra, lhs|extra
+	sjinfo.MinRighthand, sjinfo.SynRighthand = rhs, rhs
+
+	lhsRel := scanRel(lhs, 10000, 100)
+
+	// RHS offered as the inner: the ordinary check fails (MinLefthand needs
+	// `extra`, which lhsRel alone doesn't cover), but SynRighthand ==
+	// inner.Relids and createUniquePath succeeds — admit as uniqueSideInner,
+	// keeping the real jointype as JoinSemi (never silently promoted to
+	// JoinInner by the dispatch layer itself — that demotion is
+	// addPathsToJoinrel's job, downstream).
+	if jt, uniq, ok := jointypeForDirection(sjinfo, lhsRel, rhsRel, cp); !ok || jt != parser.JoinSemi || uniq != uniqueSideInner {
+		t.Errorf("RHS-as-inner = (%v, %v, %v), want (JoinSemi, uniqueSideInner, true)", jt, uniq, ok)
+	}
+	// RHS offered as the outer: SynRighthand == outer.Relids — uniqueSideOuter.
+	if jt, uniq, ok := jointypeForDirection(sjinfo, rhsRel, lhsRel, cp); !ok || jt != parser.JoinSemi || uniq != uniqueSideOuter {
+		t.Errorf("RHS-as-outer = (%v, %v, %v), want (JoinSemi, uniqueSideOuter, true)", jt, uniq, ok)
+	}
+
+	// Negative control: SemiCanBtree false means createUniquePath declines,
+	// so the fallback must decline too rather than admit an un-unique-ifiable
+	// pair as though it were an ordinary inner join.
+	rhsRel2, subpath2, sjinfo2 := uniquePathFixture(500)
+	rhsRel2.Relids = rhs
+	rhsRel2.CheapestTotal = subpath2
+	sjinfo2.MinLefthand, sjinfo2.SynLefthand = lhs|extra, lhs|extra
+	sjinfo2.MinRighthand, sjinfo2.SynRighthand = rhs, rhs
+	sjinfo2.SemiCanBtree = false
+	if _, uniq, ok := jointypeForDirection(sjinfo2, lhsRel, rhsRel2, cp); ok || uniq != uniqueSideNone {
+		t.Errorf("SemiCanBtree=false = (uniq=%v, ok=%v); want (uniqueSideNone, false)", uniq, ok)
 	}
 }
 
@@ -294,18 +344,20 @@ func TestAddPaths_SemiAntiNestloopOnly(t *testing.T) {
 				t.Fatalf("legal direction: %v", err)
 			}
 			kinds := kindsOf(joinrel.Pathlist)
-			if kinds[PathNestLoop] == 0 {
-				t.Fatalf("%v generated %v; want at least one nested loop — a joinrel "+
-					"with an empty pathlist is a hard search failure", jtype, kinds)
+			if kinds[PathNestLoop] == 0 && kinds[PathHashJoin] == 0 {
+				t.Fatalf("%v generated %v; want at least a nested loop or a hash join — a "+
+					"joinrel with an empty pathlist is a hard search failure", jtype, kinds)
 			}
-			if kinds[PathHashJoin] != 0 || kinds[PathMergeJoin] != 0 {
-				t.Errorf("%v generated %v; want nestloop only — goopg has no "+
-					"unique-ification proof, so a keyed SEMI/ANTI would multiply rows",
-					jtype, kinds)
-			}
-			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v generated %d partial paths; the partial hash arm is keyed "+
-					"and must decline with its serial twin", jtype, len(joinrel.PartialPathlist))
+			// M0142-0008a-3(iii): hash is no longer declined for SEMI/ANTI —
+			// the design doc's §5 trace-through confirmed the executor
+			// (join_batch.go) already implements Semi/Anti hash semantics
+			// natively, proven in production via unnestExistsExpr's
+			// hand-built Hash Semi/Anti nodes. MERGE remains declined: the
+			// merge-join executor has no equivalent, traced dedup handling.
+			if kinds[PathMergeJoin] != 0 {
+				t.Errorf("%v generated %v; want no merge join — goopg's merge-join executor "+
+					"has no early-exit/dedup handling for SEMI/ANTI and a keyed merge would "+
+					"multiply rows", jtype, kinds)
 			}
 			for _, p := range joinrel.Pathlist {
 				if p.Jointype != jtype {
@@ -371,8 +423,11 @@ func TestDPPATHAdjudicatesOfferedAndAccepted(t *testing.T) {
 		bannedKind   string // a producer that must NOT
 	}{
 		{parser.JoinLeft, "join.hash", ""},
-		{parser.JoinSemi, "join.nestloop", "join.hash"},
-		{parser.JoinAnti, "join.nestloop", "join.hash"},
+		// M0142-0008a-3(iii): hash is no longer declined for SEMI/ANTI (see
+		// mergeDeclined in joinpaths.go) — only mergejoin still is, since
+		// goopg's merge-join executor has no traced Semi/Anti dedup handling.
+		{parser.JoinSemi, "join.nestloop", "mergejoin"},
+		{parser.JoinAnti, "join.nestloop", "mergejoin"},
 	} {
 		t.Run(joinTypeName(tc.jtype), func(t *testing.T) {
 			a, b, outer, inner, joinrel, clauses := jointypeProblem(t)

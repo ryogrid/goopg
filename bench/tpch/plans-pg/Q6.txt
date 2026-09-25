@@ -1,5 +1,8 @@
 === Q6
-Aggregate  (cost=264897.63..264897.64 rows=1 width=32)
-  ->  Seq Scan on lineitem  (cost=0.00..264331.51 rows=113224 width=12)
-        Filter: ((l_shipdate >= '1994-01-01'::date) AND (l_shipdate < '1995-01-01 00:00:00'::timestamp without time zone) AND (l_discount >= 0.04) AND (l_discount <= 0.06) AND (l_quantity < '24'::numeric))
+Finalize Aggregate  (cost=164234.73..164234.74 rows=1 width=32)
+  ->  Gather  (cost=164234.30..164234.71 rows=4 width=32)
+        Workers Planned: 4
+        ->  Partial Aggregate  (cost=163234.30..163234.31 rows=1 width=32)
+              ->  Parallel Seq Scan on lineitem  (cost=0.00..163090.32 rows=28796 width=12)
+                    Filter: ((l_shipdate >= '1994-01-01'::date) AND (l_shipdate < '1995-01-01 00:00:00'::timestamp without time zone) AND (l_discount >= 0.04) AND (l_discount <= 0.06) AND (l_quantity < '24'::numeric))
 

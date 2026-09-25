@@ -210,7 +210,7 @@ func TestJoinrelConsiderParallel_BothInputsAndClauses(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+			s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.leafSpans)
 			s.setBaseRelConsiderParallel(nil)
 			s.builder = newJoinRelBuilder(s, nil)
 			joinrel, err := s.makeJoinRel(s.joinrels[1][0], s.joinrels[1][1])
@@ -265,7 +265,7 @@ func cpSearch(t *testing.T, prob *joinlistProblem) *searchCtx {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.cumOffsets)
+	s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.leafSpans)
 	s.setBaseRelConsiderParallel(prob.cat)
 	s.addBaseRelPartialPaths()
 	s.addBaseRelIndexPaths(prob.cat)
@@ -405,23 +405,35 @@ func TestPartialPathIsNeverTheFinalPath(t *testing.T) {
 			}
 		}
 		walk(final)
-		// Join rels have no partial paths yet (C-19d/e produce them).
-		for lev := 2; lev < len(s.joinrels); lev++ {
-			for _, rel := range s.joinrels[lev] {
-				if len(rel.PartialPathlist) != 0 {
-					t.Fatalf("join rel %#x has partial paths before C-19d", uint32(rel.Relids))
+		// M0140-0003 re-baseline: this fixture's original assumption — "join
+		// rels have no partial paths yet, C-19d/e produce them" — held only
+		// because `GOOPG_GATHER_PATHS` defaulted `off`. `addPartialHashJoinPath`
+		// (C-19f, joinpathsparallel.go) is a SEPARATE producer that is not
+		// gated behind any later pass; it fires during the ordinary DP search
+		// the moment the flag admits partial paths at all, so a join rel
+		// legitimately carries them under `top`/`all` (M0140-0002's
+		// adjudication). The property that actually matters — no partial path
+		// ever reaches the CHOSEN tree — is `walk(final)` above and is
+		// unconditional; this second loop only pins the join-rel-population
+		// timing, which is mode-dependent, so it is scoped to the `off` arm.
+		if gatherPathsMode == gatherPathsOff {
+			for lev := 2; lev < len(s.joinrels); lev++ {
+				for _, rel := range s.joinrels[lev] {
+					if len(rel.PartialPathlist) != 0 {
+						t.Fatalf("join rel %#x has partial paths before C-19d", uint32(rel.Relids))
+					}
 				}
 			}
 		}
 
 		// The whole production seam, both arms: identical trees.
-		on, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
+		on, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
 		if err != nil {
 			t.Fatal(err)
 		}
 		offProb := cpBigProblem(names)
 		offProb.cp.maxParallelWorkersPerGather = 0
-		off, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
+		off, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
 		if err != nil {
 			t.Fatal(err)
 		}

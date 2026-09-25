@@ -31,9 +31,12 @@
 //     `ExecParallelRetrieveInstrumentation` and merges it into the leader's).
 //     TPC-H Q9 — the chain 09 §5 states its acceptance criterion on — plans
 //     entirely below a Gather, so it is unmeasurable in a parallel plan.
-//     --serial (default) therefore sets `max_parallel_workers_per_gather = 0`
+//     -serial=true therefore sets `max_parallel_workers_per_gather = 0`
 //     on the audit session. The audited join TREE is the same one the
-//     parallel plan builds; only the Gather disappears.
+//     parallel plan builds; only the Gather disappears. Parallel is the
+//     default since M0144-0001 (owner decision 2026-09-20: TPC-H parity is
+//     measured in parallel mode); -serial=true remains for the EXECUTED
+//     estimate audit, whose actual-rows instrumentation needs it.
 //   - goopg's ANALYZE statistics are PER-CONNECTION, and a bare `ANALYZE;`
 //     is a no-op: without an explicit `ANALYZE <table>` for each table in the
 //     SAME session, the planner estimates blind and the audit measures the
@@ -48,6 +51,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -144,6 +148,13 @@ func main() {
 	} else {
 		out = estimateaudit.Render(reports, th)
 	}
+	// M0137-0006: stamp the primary (goopg) capture's stats epoch so a
+	// scripts/check-stats-epoch.sh run can catch a flag-OFF/flag-ON A/B whose
+	// arms straddle a re-ANALYZE (values sweep) rather than differing only by
+	// the flag — the drift N23 measured at 1.31x on Q9 that R120 attributed
+	// to the flag by hand. Always prepended, even in --plan-only or
+	// --from-plans mode, so an artefact's stats provenance is never implicit.
+	out = statsEpochLine(f) + out
 
 	// §4's parity column, when a PG 18.3 reference is available.
 	ref, refPlans, haveRef := referenceReports(f)
@@ -282,7 +293,7 @@ func parseFlags(args []string) *flags {
 	fs.Float64Var(&f.finalMax, "final-max", estimateaudit.DefaultFinalJoinMax, "tighter bar on Q9's final joinrel (09 §5)")
 	fs.BoolVar(&f.failOn, "fail-on-violation", true, "exit 1 when a joinrel is over threshold")
 	fs.BoolVar(&f.keepPlan, "keep-plans", true, "also write the raw EXPLAIN ANALYZE text next to the report")
-	fs.BoolVar(&f.serial, "serial", true, "disable parallel workers (nodes under a Gather report no actual rows)")
+	fs.BoolVar(&f.serial, "serial", false, "disable parallel workers (executed-audit mode: nodes under a Gather report no actual rows)")
 	fs.BoolVar(&f.analyze, "warm-stats", true, "ANALYZE each TPC-H table on the audit session first (goopg stats are per-connection)")
 	fs.StringVar(&f.fromPlans, "from-plans", "", "replay a committed <label>.plans.txt instead of connecting to goopg")
 	fs.StringVar(&f.refPlans, "reference", "", "PG 18.3 reference plans file for the 09 §4 parity gate")
@@ -351,6 +362,20 @@ func (s *session) ensure(ctx context.Context) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("conn: %w", err)
+	}
+	// Measurement convention (owner decision 2026-09-24): the cluster's
+	// work_mem comes from postgresql.conf (= 512MB on both engines), never
+	// from a session SET here — so verify the ambient value instead of
+	// pinning it. Drift must fail loudly rather than produce a capture
+	// under the wrong memory budget.
+	var workMem string
+	if err := conn.QueryRowContext(ctx, "SHOW work_mem").Scan(&workMem); err != nil {
+		conn.Close()
+		return fmt.Errorf("SHOW work_mem: %w", err)
+	}
+	if workMem != "512MB" {
+		conn.Close()
+		return fmt.Errorf("work_mem is %q, want 512MB — set it in postgresql.conf and restart the cluster (no session SET per the measurement convention)", workMem)
 	}
 	if s.serial {
 		// Without this every joinrel under a Gather audits as "(no
@@ -491,6 +516,83 @@ func openDB(f *flags, port int, dbName, user, pass string) *sql.DB {
 		fatal("ping: %v (is the cluster up on %s:%d? bench/tpch/setup_goopg.sh / setup_pg.sh)", err, f.host, port)
 	}
 	return db
+}
+
+// statsEpochLine renders the primary (f.host/f.port/f.db) capture's stats
+// epoch as a `# stats-epoch: <value>\n` header line, the same shape
+// scripts/lib/capture-stamp.sh writes for capture-tpch.sh/capture-tpcds.sh
+// (M0137-0002). It never calls fatal(): a stats-epoch read is a secondary
+// provenance channel, not the audit itself (the same reasoning renderEnum's
+// comment gives for a missing enum-trace log), so any failure degrades to an
+// explicit UNKNOWN(reason) rather than aborting a run that may have just cost
+// a full TPC-H power run.
+func statsEpochLine(f *flags) string {
+	if f.fromPlans != "" {
+		return "# stats-epoch: UNKNOWN(offline replay via --from-plans, no live connection)\n"
+	}
+	connStr := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
+		f.host, f.port, f.db, f.user, f.pass)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return fmt.Sprintf("# stats-epoch: UNKNOWN(sql.Open: %v)\n", err)
+	}
+	defer db.Close()
+	epoch, err := queryStatsEpoch(db)
+	if err != nil {
+		return fmt.Sprintf("# stats-epoch: UNKNOWN(%v)\n", err)
+	}
+	return fmt.Sprintf("# stats-epoch: %s\n", epoch)
+}
+
+// queryStatsEpoch fingerprints pg_stat_user_tables(relname, n_live_tup) —
+// EXACTLY the way scripts/lib/capture-stamp.sh's _capture_stamp_stats_epoch
+// does (sha256 over "relname|n_live_tup" rows ordered by relname, joined by
+// "\n" with a trailing "\n", first 16 hex chars) — so an estimate-audit
+// epoch and a capture-tpch.sh/capture-tpcds.sh epoch are directly comparable
+// by the SAME scripts/check-stats-epoch.sh, one fingerprint format across
+// every M0137 A/B artefact rather than a second incompatible one. n_live_tup
+// is the field capture-stamp.sh's comment picks for the same reason here:
+// goopg's pg_stat_user_tables always reports last_analyze/last_autoanalyze
+// as NULL, but n_live_tup is real on both engines (PG's live counter, and
+// goopg's ANALYZE-persisted reltuples).
+func queryStatsEpoch(db *sql.DB) (string, error) {
+	rows, err := db.Query("SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname")
+	if err != nil {
+		return "", fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+	var epochRows []statsEpochRow
+	for rows.Next() {
+		var r statsEpochRow
+		if err := rows.Scan(&r.relname, &r.nLiveTup); err != nil {
+			return "", fmt.Errorf("scan: %w", err)
+		}
+		epochRows = append(epochRows, r)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(epochRows) == 0 {
+		return "", fmt.Errorf("empty pg_stat_user_tables read")
+	}
+	return hashStatsEpochRows(epochRows), nil
+}
+
+// statsEpochRow and hashStatsEpochRows are split out of queryStatsEpoch so
+// the fingerprint formula itself is unit-testable (cmd/estimate-audit/main_test.go)
+// without a live *sql.DB.
+type statsEpochRow struct {
+	relname  string
+	nLiveTup int64
+}
+
+func hashStatsEpochRows(rows []statsEpochRow) string {
+	var b strings.Builder
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%s|%d\n", r.relname, r.nLiveTup)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return fmt.Sprintf("%x", sum[:])[:16]
 }
 
 func fatal(format string, args ...any) {

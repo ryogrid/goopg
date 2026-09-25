@@ -94,8 +94,21 @@ func TestGroupUniqueNDistinctRefusesAPartialAggregate(t *testing.T) {
 	agg := groupAgg(scanWithStats("l", 5000, 700), 0)
 	agg.Mode = AggModePartial
 
-	if got := columnNDistinctForChild(0, agg); got != 0 {
-		t.Fatalf("ndistinct through a Partial aggregate = %d, want 0", got)
+	// The UNIQUENESS refusal stands: groupUniqueNDistinct answers PG's
+	// isunique branch, and a partial output column is not unique.
+	if _, ok := groupUniqueNDistinct(0, agg); ok {
+		t.Fatalf("groupUniqueNDistinct through a Partial aggregate answered, want refusal")
+	}
+
+	// R63: `columnNDistinctForChild` no longer refuses with it. The
+	// partial-mode-only `*Aggregate` arm in `resolveBaseColumn` answers the
+	// BASE column's ndistinct (700) — the distinct keys present across the
+	// partial output are the groups observed, which is the group count when
+	// every worker sees every group (the high-nd parallel case; M1's
+	// display path needs exactly this). Skewed workers over-count, bounded
+	// by base nd (R63-#1) — a bounded estimate, not a refusal.
+	if got, want := columnNDistinctForChild(0, agg), int64(700); got != want {
+		t.Fatalf("ndistinct through a Partial aggregate = %d, want %d (base nd via the R63 arm)", got, want)
 	}
 }
 

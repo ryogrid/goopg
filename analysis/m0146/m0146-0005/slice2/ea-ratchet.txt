@@ -1,0 +1,8 @@
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 52   current: 51
+  FIXED    Q27:customer_demographics+date_dim+item+store_sales
+  FIXED    Q71:catalog_sales+date_dim+web_sales
+  NEW      Q7:customer_demographics+date_dim+item+store_sales
+
+EA-RATCHET: FAIL (1 new estimate finding(s))
+make: *** [Makefile:620: ea-ratchet] Error 1

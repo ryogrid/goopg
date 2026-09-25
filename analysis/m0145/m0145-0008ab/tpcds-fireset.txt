@@ -1,0 +1,4 @@
+FIRE-SET: baseline=e30383612efabe447b237a5206a4a0d7caee4692 (1fce630ebeaf) candidate=worktree (cdb45b1182c3)
+FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+gate-stamp: tpcds-fireset PASS -> /home/ryo/work/goopg/goopg/tmp/gate-stamps/tpcds-fireset.json

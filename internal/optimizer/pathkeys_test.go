@@ -60,6 +60,47 @@ func TestPathkeysContainedIn_FalseNegativeIsAcceptable(t *testing.T) {
 	}
 }
 
+func TestPathkeysCountContainedIn_FullPrefixMatchesContainedIn(t *testing.T) {
+	keys := []PathKey{pk(0, true), pk(1, true), pk(2, true)} // sorted by (a,b,c)
+	req := []PathKey{pk(0, true), pk(1, true)}
+	contained, n := pathkeysCountContainedIn(keys, req)
+	if !contained || n != 2 {
+		t.Fatalf("want contained=true n=2, got contained=%v n=%d", contained, n)
+	}
+	if contained != pathkeysContainedIn(keys, req) {
+		t.Fatalf("contained must agree with pathkeysContainedIn")
+	}
+}
+
+func TestPathkeysCountContainedIn_PartialPrefixReportsCommonLength(t *testing.T) {
+	keys := []PathKey{pk(0, true)} // sorted by (a) only
+	req := []PathKey{pk(0, true), pk(1, true), pk(2, true)}
+	contained, n := pathkeysCountContainedIn(keys, req)
+	if contained {
+		t.Fatalf("(a) must not satisfy a requirement of (a,b,c)")
+	}
+	if n != 1 {
+		t.Fatalf("want common prefix length 1, got %d", n)
+	}
+}
+
+func TestPathkeysCountContainedIn_DivergenceAtFirstKeyIsZero(t *testing.T) {
+	keys := []PathKey{pk(1, true), pk(0, true)} // sorted by (b,a)
+	req := []PathKey{pk(0, true), pk(1, true)}  // required (a,b)
+	contained, n := pathkeysCountContainedIn(keys, req)
+	if contained || n != 0 {
+		t.Fatalf("want contained=false n=0 on immediate divergence, got contained=%v n=%d", contained, n)
+	}
+}
+
+func TestPathkeysCountContainedIn_EmptyRequirementIsFullyContained(t *testing.T) {
+	keys := []PathKey{pk(0, true)}
+	contained, n := pathkeysCountContainedIn(keys, nil)
+	if !contained || n != 0 {
+		t.Fatalf("want contained=true n=0 for empty requirement, got contained=%v n=%d", contained, n)
+	}
+}
+
 func TestComparePathkeysDim_LongerDominates(t *testing.T) {
 	abc := []PathKey{pk(0, true), pk(1, true), pk(2, true)}
 	ab := []PathKey{pk(0, true), pk(1, true)}

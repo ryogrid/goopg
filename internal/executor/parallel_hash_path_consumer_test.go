@@ -57,17 +57,37 @@ import (
 //
 // `MinParallelTableScanSize: 1` is the path-model twin of what the post-pass
 // tests do with `DebugParallelQuery: "on"`.
+//
+// `MaxParallelWorkersPerGather: 4` and `CpuTupleCost: 1.0` (defaults 2 and
+// 0.01): under M0141-S2b-13's restored COSTS_EQUAL semantics
+// (pathnode.c:227-237, :524-585) a fuzzy-tied keyless Gather is evicted by
+// the keyed mergejoin incumbent (PATHKEYS_BETTER2 with rows/psafe
+// permitting) — at the shipped calibration the margin was 0.26%, inside
+// STD_FUZZ_FACTOR. PG resolves the same contest identically, so the fixture
+// must make the partial path win by a REAL margin. More workers alone does
+// not do it: PG does not amortise a parallel scan's disk cost
+// (cost_seqscan's parallel arm divides only cpu_run_cost), and this
+// fixture's scans are page-bound (Pages: 4096). Raising cpu_tuple_cost
+// makes the divided term a real share of the total so the partial join's
+// margin clears the fuzz band — exactly the "wins by cost" case the
+// design's §7.1 inequality describes.
 func c19fSettings() optimizer.PlannerSettings {
 	ps := optimizer.DefaultPlannerSettings()
+	// C-19f's subject is PG's `parallel_hash = false` join: a partial outer
+	// over a COMPLETE inner whose table the leader prebuilds and shares.
+	// M0146-0002's `parallel_hash = true` variant wins on these shapes when
+	// enabled; its own consumer check is TestParallelHashPathModelWinner.
+	ps.EnableParallelHash = false
 	ps.MinParallelTableScanSize = 1
 	ps.MinParallelIndexScanSize = 1
-	ps.MaxParallelWorkersPerGather = 2
+	ps.MaxParallelWorkersPerGather = 4
 	ps.ParallelLeaderParticipation = true
 	// parallel_setup_cost / parallel_tuple_cost scaled to a fixture two orders
 	// of magnitude smaller than the 2 M-row relation the default constants are
 	// calibrated for.
 	ps.ParallelSetupCost = 0.001
 	ps.ParallelTupleCost = 0.00001
+	ps.CPUTupleCost = 1.0
 	return ps
 }
 

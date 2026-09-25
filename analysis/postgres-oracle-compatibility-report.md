@@ -1,6 +1,6 @@
 # PostgreSQL Oracle Compatibility Report (M0060)
 
-Generated at: 2026-09-02T11:20:48+09:00
+Generated at: 2026-09-25T11:28:32+09:00
 
 Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 ## Inventory Snapshot
@@ -20,13 +20,13 @@ Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 
 | suite_id | pass | failed | not-tried | excluded | port | defer |
 | -------- | ---: | -----: | --------: | -------: | ---: | ----: |
-| client-tools-tap | 0 | 0 | 47 | 3 | 39 | 5 |
+| client-tools-tap | 0 | 0 | 41 | 3 | 44 | 6 |
 | contrib-suites | 0 | 0 | 0 | 0 | 0 | 63 |
 | isolation-specs | 119 | 1 | 0 | 0 | 0 | 1 |
 | modules-suites | 0 | 0 | 0 | 1 | 0 | 46 |
 | recovery-tap | 0 | 0 | 41 | 0 | 8 | 2 |
 | regress-expected | 2 | 0 | 31 | 0 | 0 | 0 |
-| regress-sql | 63 | 167 | 0 | 2 | 0 | 0 |
+| regress-sql | 62 | 168 | 0 | 2 | 0 | 0 |
 | subscription-tap | 0 | 0 | 33 | 0 | 7 | 0 |
 
 ## Deferred Blockers
@@ -34,6 +34,7 @@ Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 | id | item_path | deferred_to | rationale |
 |----|-----------|-------------|-----------|
 |  | `postgres/src/test/isolation/specs/prepared-transactions.spec` | `-` | M-NIGHTLY (AI-20260719-094219-001) demoted pass->defer (strict->runIsoSpec). SSI correctness intact -- every permutation's query results/aborts still match PG 18.3 (PrepareCheckForSerializationFailure at PREPARE TRANSACTION time; a PREPARED-but-not-committed peer treated like a committed-first one). Demoted because this uniquely long spec (1500 permutations, ~60s) is the most exposed to the runner's timing-only blocking heuristic (framework/isolation_runner.go blockDetectWait=300ms): goopg has a real intermittent ~300ms server-side 2PC-commit stall on WSL2 (WAL 16MiB segment zero-fill / 2PC state-file I/O) that hits a random PREPARE/COMMIT PREPARED step once per run (3/3 standalone on a quiet host, at a moving permutation), so a non-blocking step is mislabeled <waiting ...>/<... completed>, shifting output by two lines. Re-promote once pg_isolation_test_session_is_blocked (pg_proc OID 3378, registered-but-unimplemented) is implemented and the runner polls it to confirm genuine lock-blocking before annotating slow steps (upstream isolationtester.c behavior). |
+|  | `postgres/src/bin/pg_dump/t/005_pg_dump_filterfile.pl` | `M0122-0015b (subq_op OPERATOR(...) ANY production)` | DEFERRED by a measured parser gap found 2026-09-22 while probing this file (M0122-0015b): goopg's grammar/pg_grammar.y subq_op is a SUBSET of upstream's subquery_Op (gram.y:16671) that omits the OPERATOR '(' any_operator ')' alternative (gram.y:16674), so every pattern-based pg_dump object selection fails with 'syntax error at or near ANY'. pg_dump emits WHERE c.relkind OPERATOR(pg_catalog.=) ANY (array['r','S','v','m','f','p']) for --filter, --table/-t and --exclude-table/-T alike, so all three are unusable against goopg; --schema/-n uses a different shape and works. Isolated to one production: 'r' = ANY (array[...]) works, 'r' OPERATOR(pg_catalog.=) 'r' works, and LIKE/NOT LIKE/ILIKE ANY all work -- only the OPERATOR(...) arm before ANY/SOME/ALL is missing, and goopg already has the qual_op nonterminal it needs. What DOES work today was measured: pg_dump --filter with a pattern-free filter file dumps all seven fixture tables including the newline-in-name one. Promote to port once M0122-0015b lands. |
 | WD-003 | `postgres/src/bin/pg_waldump/t/002_save_fullpage.pl` | `perf-optimize3-dash resume (GOOPG_WAL_CANONICAL=on + perf-optimize3/05-improvement-designs/01 C1)` | DEFERRED by perf-optimize3-dash S4 (native-only WAL default; canonical emission off): assert-skips unless GOOPG_WAL_CANONICAL=on. Ported as TestPort_PgWaldump002SaveFullpage in internal/testport/pgwaldump_savefullpage_test.go (M0119-0005). Was blocked on two issues (xl_prev 1-based on-disk LSN + HOT updates never emitting a PG-canonical FPI); both fixed. Drives --save-fullpage --relation over a CHECKPOINT+UPDATE workload and asserts the upstream filename format + page-LSN ordering. |
 | D-005l | `postgres/src/bin/scripts/t/200_connstr.pl` | `M0060-0003` | Requires CREATE DATABASE (D-005d) and LATIN1 server encoding; goopg currently UTF8-only. |
 |  | `postgres/src/test/modules/Makefile` | `M0060-0005` |  |

@@ -21,7 +21,9 @@
 package optimizer
 
 import (
+	"fmt"
 	"math"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -47,7 +49,15 @@ func EstimateRows(n Node) int64 {
 	case *IndexScan:
 		// Equality probe → 1 row per call site; a bound-less scan reads the
 		// whole relation (M0127-P5.9-h, see indexScanRows).
-		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
+		// A RangePrefix probe (M0145-0029 slice 2b): its prefix is charged as
+		// equalities on the leading columns and its bounds as inequalities —
+		// the same accounting as Keys plus a trailing range. Keys and
+		// RangePrefix never coexist.
+		keys := x.Keys
+		if len(keys) == 0 {
+			keys = x.RangePrefix
+		}
+		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey)
 	case *IndexOnlyScan:
 		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
 		// without the join search: planner.go's sort-avoidance rewrite builds
@@ -128,6 +138,13 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	case *CTEDMLPrefix:
 		return EstimateRows(x.Body)
+	case *Result:
+		// A gating Result (M0145-0008o) passes its child's rows through:
+		// create_gating_plan copies the gated plan's plan_rows. The childless
+		// Result keeps its old "no estimate".
+		if x.Child != nil {
+			return EstimateRows(x.Child)
+		}
 	case *SetOp:
 		return estimateSetOp(x)
 	case *NestedLoopIndexJoin:
@@ -234,10 +251,295 @@ func estimateSetOp(s *SetOp) int64 {
 
 // estimateNLIndexJoin: the inner side is an equality index probe,
 // which this file already estimates at 1 row per call site
-// (*IndexScan above), so the join carries the outer's cardinality.
-// LEFT keeps the same count by null-extension.
+// (*IndexScan above), so INNER/LEFT carry the outer's cardinality
+// unchanged (LEFT by null-extension). SEMI/ANTI narrow that by match
+// fraction instead — see the SEMI/ANTI arm below and
+// m0137-0013-nli-semi-anti-match-fraction-gap.
+// probeResidualCond returns the residual filter PostgreSQL's `Filter:` line
+// carries alongside a parameterized index/bitmap probe node's `Index Cond:`/
+// `Recheck Cond:` — `IndexScan.Cond`, `IndexOnlyScan.Cond`,
+// `BitmapHeapScan.Cond` (plan.go) — or nil when `n` is not one of those or
+// carries no residual. Its ColumnRefs are leaf-local (the scan's own output
+// coordinates), the same space a `*Filter` wrapping the same scan would use,
+// so a caller scores it with `clauseSelectivity(cond, n)` exactly as
+// `filterSelectivity` scores `f.Predicate` against `f.Child` (:165).
+func probeResidualCond(n Node) Expr {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Cond
+	case *IndexOnlyScan:
+		return x.Cond
+	case *BitmapHeapScan:
+		return x.Cond
+	}
+	return nil
+}
+
 func estimateNLIndexJoin(j *NestedLoopIndexJoin) int64 {
-	return EstimateRows(j.Outer)
+	l := EstimateRows(j.Outer)
+	if j.Type == JoinTypeInner {
+		// M0142-0016: the probe's own residual (PG's inner-`Filter:` line,
+		// lowered onto the leaf as `Cond` — see `probeResidualCond`) narrows
+		// how many outer rows find a match, exactly like a `*Filter` wrapping
+		// the same scan would. LEFT stays unconditional `return l` below: a
+		// LEFT join outputs one null-extended row for every outer row that
+		// fails the probe, so a residual there does not shrink the count.
+		if cond := probeResidualCond(j.Inner); cond != nil {
+			return scaleByFloat(l, clauseSelectivity(cond, j.Inner))
+		}
+	}
+	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		return l
+	}
+	// SEMI/ANTI: the output is a subset of the OUTER, sized by match
+	// fraction — mirrors estimateJoin's SEMI/ANTI arm (:622-631) formula-
+	// for-formula (eqjoinselSemiCore), but the KEY term is sourced from the
+	// probe's own representation (Inner.Key/Keys bound to Index.Columns),
+	// not from joinEquiPairs(Predicate): createplannl.go:418-422 strips
+	// every index-clause column into is.Key/is.Keys before building
+	// Predicate from the LEFTOVER residual (p.Residual), so for the common
+	// fully-bound probe the equi-condition this join is keyed on is never
+	// IN Predicate — joinEquiPairs would find zero pairs there and this arm
+	// would be a silent no-op. Only the genuine residual (if any) is priced
+	// through joinResidualSelectivity below, same as the *Join arm.
+	sel := nliSemiMatchFraction(j)
+	adj := &Join{Left: j.Outer, Right: j.Inner, Predicate: j.Predicate}
+	sel *= joinResidualSelectivity(adj)
+	if sel > 1 {
+		sel = 1
+	}
+	if j.Type == JoinTypeAnti {
+		sel = 1 - sel
+	}
+	return scaleByFloat(l, sel)
+}
+
+// nliSemiMatchFraction is estimateNLIndexJoin's SEMI/ANTI key term: the
+// product, over every index column the probe binds, of
+// eqjoinselSemiCore's per-key match fraction. Both sides resolve through
+// resolveBaseColumn — the outer key expression against j.Outer (whatever
+// wrapper chain sits above the base relation), the bound index column
+// against j.Inner directly (an *IndexScan/*IndexOnlyScan is itself a
+// resolveBaseColumn leaf) — so both get the SAME ndistinct normalisation
+// (ResolvedNDistinct's negative-fraction handling, the unique-index
+// override) the *Join arm's siblings (keyColumnStats/rightExprStats) use,
+// without borrowing their merged-left‖right coordinate arithmetic, which
+// does not apply to an NLI's asymmetric Outer/Inner shape.
+func nliSemiMatchFraction(j *NestedLoopIndexJoin) float64 {
+	idx, key, keys, ok := nliInnerProbe(j.Inner)
+	if !ok || idx == nil || len(idx.Columns) == 0 {
+		return 1.0
+	}
+	var bound []Expr
+	switch {
+	case len(keys) > 0:
+		if len(keys) > len(idx.Columns) {
+			return 1.0
+		}
+		bound = keys
+	case key != nil:
+		bound = []Expr{key}
+	default:
+		return 1.0
+	}
+	var tbl *catalog.Table
+	switch in := j.Inner.(type) {
+	case *IndexScan:
+		tbl = in.Table
+	case *IndexOnlyScan:
+		tbl = in.Table
+	}
+	if tbl == nil {
+		return 1.0
+	}
+	innerRows := tableRows(tbl)
+	sel := 1.0
+	for i, outerKey := range bound {
+		cr, isCol := outerKey.(*ColumnRef)
+		if !isCol {
+			continue
+		}
+		outerRef, outerOK := resolveBaseColumn(cr.Index, j.Outer)
+		colPos := -1
+		for c := range tbl.Columns {
+			if tbl.Columns[c].Name == idx.Columns[i] {
+				colPos = c
+				break
+			}
+		}
+		if colPos < 0 {
+			continue
+		}
+		innerRef, innerOK := resolveBaseColumn(colPos, j.Inner)
+		var st1, st2 *catalog.ColumnStats
+		nd1, nd2 := 0.0, 0.0
+		nullfrac1 := 0.0
+		if outerOK {
+			st1 = outerRef.stats
+			nd1 = float64(outerRef.ndistinct)
+			if st1 != nil {
+				nullfrac1 = st1.NullFrac
+			}
+		}
+		if innerOK {
+			st2 = innerRef.stats
+			nd2 = float64(innerRef.ndistinct)
+		}
+		nd1Known := nd1 > 0
+		nd2Known := nd2 > 0
+		if !nd2Known {
+			nd2 = defaultNumDistinct
+		}
+		// Same rel-rows clamp on nd2 as semiPairMatchFraction (ledger
+		// C-05 plan-node-semi-nd2-rel-rows), sourced here from the
+		// indexed table's own row count rather than a RelOptInfo.Rows.
+		if innerRows > 0 && nd2 >= float64(innerRows) {
+			nd2 = float64(innerRows)
+			nd2Known = true
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	}
+	return sel
+}
+
+// isLateralIndexProbe reports whether n is the R25 decomposed-NLI shape's
+// bound probe leaf: a `*IndexScan`/`*IndexOnlyScan` with a real equality key
+// (not the unrelated full-range/ordering-only shape `indexScanRows` also
+// handles). Scoped to exactly these two types — not `nliInnerProbe`'s wider
+// set — because `createNestLoopBitmapJoinPlan` never builds the decomposed
+// `Join{Lateral}` shape for a bitmap probe; it stays fused (see that
+// function's own comment), so a `*BitmapHeapScan` reaching here would be a
+// genuine SQL `LATERAL` construct, not this mechanism.
+func isLateralIndexProbe(n Node) bool {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Key != nil || len(x.Keys) > 0
+	case *IndexOnlyScan:
+		return x.Key != nil || len(x.Keys) > 0
+	}
+	return false
+}
+
+// estimateLateralIndexJoin is estimateNLIndexJoin's twin for the R25
+// (plan-parity-fix-take2) decomposed NLI shape: same INNER/LEFT-carries-
+// the-outer-unchanged, SEMI/ANTI-narrows-by-match-fraction reasoning (see
+// that function's header), adapted from Outer/Inner to Left/Right. Unlike
+// the fused node, `j` here already embeds a real `*Join`, so
+// `joinResidualSelectivity(j)` can be called directly — no synthetic
+// wrapper is needed the way estimateNLIndexJoin builds one.
+func estimateLateralIndexJoin(j *Join) int64 {
+	l := EstimateRows(j.Left)
+	if j.Type == JoinTypeInner {
+		// M0142-0016: see estimateNLIndexJoin's twin comment — the probe's
+		// own residual (`Cond`, leaf-local coords) narrows the match count
+		// for a plain INNER join exactly as a `*Filter` wrapping the same
+		// scan would. LEFT is excluded for the same reason as the twin.
+		if cond := probeResidualCond(j.Right); cond != nil {
+			return scaleByFloat(l, clauseSelectivity(cond, j.Right))
+		}
+	}
+	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		return l
+	}
+	sel := lateralNLIMatchFraction(j)
+	sel *= joinResidualSelectivity(j)
+	if sel > 1 {
+		sel = 1
+	}
+	if j.Type == JoinTypeAnti {
+		sel = 1 - sel
+	}
+	return scaleByFloat(l, sel)
+}
+
+// lateralNLIMatchFraction is nliSemiMatchFraction's twin for the decomposed
+// shape. The one real difference is the outer-key expression's wrapper type:
+// `outerParamKey` (createplannl.go) re-roots every probe-key `*ColumnRef`
+// into an `*OuterColumnRef{Level: 1}` — a PG nestloop param — whose `Index`
+// is already a position in `j.Left`'s own output schema (the same
+// coordinate space the fused shape's plain `*ColumnRef.Index` used), so
+// resolving it against `j.Left` needs no extra translation. A plain
+// `*ColumnRef` is accepted too, for a genuine SQL `LATERAL` producer that
+// never rewrote its keys to outer params.
+func lateralNLIMatchFraction(j *Join) float64 {
+	idx, key, keys, ok := nliInnerProbe(j.Right)
+	if !ok || idx == nil || len(idx.Columns) == 0 {
+		return 1.0
+	}
+	var bound []Expr
+	switch {
+	case len(keys) > 0:
+		if len(keys) > len(idx.Columns) {
+			return 1.0
+		}
+		bound = keys
+	case key != nil:
+		bound = []Expr{key}
+	default:
+		return 1.0
+	}
+	var tbl *catalog.Table
+	switch in := j.Right.(type) {
+	case *IndexScan:
+		tbl = in.Table
+	case *IndexOnlyScan:
+		tbl = in.Table
+	}
+	if tbl == nil {
+		return 1.0
+	}
+	innerRows := tableRows(tbl)
+	sel := 1.0
+	for i, outerKey := range bound {
+		var outerRef baseColumnRef
+		var outerOK bool
+		if oc, isOuter := outerKey.(*OuterColumnRef); isOuter {
+			if oc.Level != 1 {
+				continue
+			}
+			outerRef, outerOK = resolveBaseColumn(oc.Index, j.Left)
+		} else if cr, isCol := outerKey.(*ColumnRef); isCol {
+			outerRef, outerOK = resolveBaseColumn(cr.Index, j.Left)
+		} else {
+			continue
+		}
+		colPos := -1
+		for c := range tbl.Columns {
+			if tbl.Columns[c].Name == idx.Columns[i] {
+				colPos = c
+				break
+			}
+		}
+		if colPos < 0 {
+			continue
+		}
+		innerRef, innerOK := resolveBaseColumn(colPos, j.Right)
+		var st1, st2 *catalog.ColumnStats
+		nd1, nd2 := 0.0, 0.0
+		nullfrac1 := 0.0
+		if outerOK {
+			st1 = outerRef.stats
+			nd1 = float64(outerRef.ndistinct)
+			if st1 != nil {
+				nullfrac1 = st1.NullFrac
+			}
+		}
+		if innerOK {
+			st2 = innerRef.stats
+			nd2 = float64(innerRef.ndistinct)
+		}
+		nd1Known := nd1 > 0
+		nd2Known := nd2 > 0
+		if !nd2Known {
+			nd2 = defaultNumDistinct
+		}
+		if innerRows > 0 && nd2 >= float64(innerRows) {
+			nd2 = float64(innerRows)
+			nd2Known = true
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	}
+	return sel
 }
 
 // `estimateMultiHashJoin` was deleted with the node by M0127-P6.2. It
@@ -419,6 +721,30 @@ type baseRelInfo struct {
 	localFilter      Expr
 	hasLocalFilter   bool
 	isSmallDimension bool
+	// isSemiAntiSyntheticLeaf marks a leaf built by joinsearchseam.go's
+	// Semi/Anti admission arm for a link's own opaque RHS subtree (the
+	// `j.Right` spliced in wholesale, `table` left nil because it is not a
+	// single base relation). Unlike a genuine derived input (CTE scan,
+	// worktable scan, or any other leaf with no real per-child stats), this
+	// leaf's `baseRows` comes from `EstimateRows(scan)` over an
+	// already-cost-estimated join subtree (M0142-0008a-3i-plumbing-c8). The
+	// mark's live readers are the boundary filler's coordinate rule (c11 —
+	// a SEMI/ANTI RHS never projects, so its own coordinates are always
+	// fillable); it also kept the retired `outer-over-derived` firewall's
+	// `leafIsDerivedInput` from reading the nil `table` as "no statistics".
+	isSemiAntiSyntheticLeaf bool
+	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
+	// is a UNION ALL subquery the jointree pipeline marked at
+	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
+	// the leaf's Parallel Append candidate onto the search leaf rel.
+	appendrel bool
+	// subqueryUniqueOutput marks a derived ANY_subquery leaf whose one output
+	// column PG's `examine_simple_variable` would call `isunique`: it is the
+	// sub-select's only DISTINCT column or only GROUP BY column
+	// (postgres/src/backend/utils/adt/selfuncs.c, RTE_SUBQUERY arm). The
+	// leaf has no catalog table, so this is the whole of its column
+	// statistics — `examineJoinVar` reads it (M0145-0008ab).
+	subqueryUniqueOutput bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM
@@ -439,6 +765,7 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 		table:          binding.table,
 		localFilter:    local,
 		hasLocalFilter: local != nil,
+		appendrel:      binding.appendrel,
 	}
 	// M0125-0043: the small-dimension answer lives on the leaf scan now.
 	// `smallDimensionSide` keeps the catalog-hint reading for the bindings
@@ -460,20 +787,37 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 // a second open-coded copy of the reliability gate is exactly the sibling shape
 // hard-won rule #2 forbids (M0127-P5.6, the M0125-0003 stage-3 re-evaluation).
 //
-// The one deliberate deviation from upstream is the `reliable` gate: PG always
-// multiplies, falling back to DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL when it has no
-// statistic, whereas goopg keeps the pre-filter count (design 02 §2 rule (4)).
-// Ledgered — see the 2026-08-06 row.
+// R36: the multiply is UNCONDITIONAL here, as `set_baserel_size_estimates` is
+// (costsize.c:5348-5362). Upstream has no reliability concept, and
+// `clauselist_selectivity` returns DEFAULT_EQ_SEL / DEFAULT_INEQ_SEL for a
+// clause it cannot estimate — never 1.0, which is what keeping the pre-filter
+// count amounted to.
+//
+// The gate this replaces was ledgered on 2026-08-06 (M0127-P5.6) at "up to 200x
+// divergence, direction makes build sides look too expensive", and it reached
+// the JOIN SEARCH, not just EXPLAIN: `GOOPG_JRS_TRACE` on `calcJoinrelSize` for
+// `orders ⋈ lineitem WHERE l_shipdate < l_commitdate` showed the search
+// consuming `inner.Rows=6001255` — the raw count — where the scan-level
+// estimator had already applied DEFAULT_INEQ_SEL to reach 2000418.
+//
+// The selectivity comes from `clauseSelectivity`, NOT the `…WithSource` twin,
+// and that choice is this function's whole correctness. The twin's AND arm
+// multiplies conjuncts PAIRWISE (selectivity.go:838-847, a divergence its own
+// comment at :806-812 documents), whereas `clauseSelectivity` routes AND
+// through `conjunctionSelectivity`, which ports `clauselist_selectivity`'s
+// range-band handling INCLUDING PG's punt rule: either bound at
+// DEFAULT_INEQ_SEL collapses the pair to DEFAULT_RANGE_INEQ_SEL
+// (rangequery.go:185-192, clausesel.c:283-286). On the histogram-less
+// `x >= a AND x < b` band this round exists to fix, the twin would give
+// 1/3 x 1/3 = 0.111 against PG's 0.005 — 22x too loose, a fresh error in place
+// of the old one. The scan-level estimator (`filterSelectivity`) already uses
+// this same plain twin, so EXPLAIN and the search now agree by construction.
 func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node, local Expr) int64 {
 	if local == nil || scan == nil || baseRows <= 0 {
 		return baseRows
 	}
 	localized := localizeExprToLeaf(local, binding)
-	sel := clauseSelectivityWithSource(localized, scan)
-	if !sel.reliable {
-		return baseRows
-	}
-	rows := scaleByFloat(baseRows, sel.value)
+	rows := scaleByFloat(baseRows, clauseSelectivity(localized, scan))
 	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would
@@ -589,6 +933,19 @@ func IsSmallDimensionSide(n Node) bool {
 //     nd-driven path would silently truncate genuine fan-out; the audit is
 //     what certifies that judgement (09 §5.3).
 func estimateJoin(j *Join) int64 {
+	// M0142-0012: R25 (plan-parity-fix-take2) decomposed the fused
+	// `*NestedLoopIndexJoin` into a generic `Join{Algo: NestedLoop,
+	// Lateral: true, Right: *IndexScan/*IndexOnlyScan}` whose probe key
+	// lives on the index leaf's own Key/Keys (an `*OuterColumnRef`
+	// nestloop param), not in Predicate — createNestLoopIndexJoinPlan /
+	// outerParamKey (createplannl.go). `joinEquiPairs` below always finds
+	// zero pairs on this shape, so without this arm every such join fell
+	// to the crude `l*r*0.005`/`max(l,r)`-capped fallback (measured at
+	// 224/6347 call-site hits across TPC-H/TPC-DS by M0142-0012a).
+	// estimateLateralIndexJoin is estimateNLIndexJoin's twin for it.
+	if j.Lateral && isLateralIndexProbe(j.Right) {
+		return estimateLateralIndexJoin(j)
+	}
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
 	if l <= 0 || r <= 0 {
@@ -619,7 +976,7 @@ func estimateJoin(j *Join) int64 {
 		pairs := joinEquiPairs(j)
 		sk := superkeyJoinEstimate(j, pairs)
 		sel := sk.sel
-		measured := sk.fired
+		measured := sk.fired || sk.boundProven
 		for i, p := range pairs {
 			if i < len(sk.covered) && sk.covered[i] {
 				continue
@@ -636,13 +993,13 @@ func estimateJoin(j *Join) int64 {
 				sel *= mcvSel
 				measured = true
 			} else if nd := pairNDistinct(j, p); nd > 0 {
-				sel /= float64(nd)
+				sel *= pairNullSelectivity(j, p) / float64(nd)
 				measured = true
 			} else {
 				// `clauselist_selectivity` charges an unmeasurable
 				// equijoin the selfuncs.h constant and multiplies it in
 				// with the rest; it does not abandon the measured pairs.
-				sel *= defaultEqSelectivity
+				sel *= defaultEqSelectivity * pairNullSelectivity(j, p)
 			}
 		}
 		if measured {
@@ -970,6 +1327,19 @@ func pairNDistinct(j *Join, p JoinKeyPair) int64 {
 	return nd
 }
 
+// pairNullSelectivity is eqjoinsel's no-MCV strict-operator factor. The MCV
+// arm already accounts for non-null mass and must not call this helper.
+func pairNullSelectivity(j *Join, p JoinKeyPair) float64 {
+	sel := 1.0
+	if st := keyColumnStats(p.Left, j.Left); st != nil {
+		sel *= 1 - st.NullFrac
+	}
+	if st := rightExprStats(j, p.Right); st != nil {
+		sel *= 1 - st.NullFrac
+	}
+	return clampProbability(sel)
+}
+
 // joinEquiPairs is the join's FULL equi-key list in the coordinate space
 // `Predicate` is written in — the list `clauselist_selectivity` would price and
 // `Join.Residual` excludes.
@@ -1104,7 +1474,11 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
-	inputRows := EstimateRows(a.Child)
+	// R61: same searched-input sourcing as the search-rel sizing
+	// (`groupCountInputRows`, groupingpaths.go) — EXPLAIN recomputes this
+	// arm off the built tree, which carries no PlanCost stamp, so sizing
+	// only the search rel leaves display at the recomputed 1 (Q11).
+	inputRows := groupCountInputRows(a.Child)
 	if len(a.GroupingSets) == 0 {
 		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
 	}
@@ -1294,15 +1668,20 @@ func estimateNumGroups(groupExprs []Expr, child Node, inputRows int64) int64 {
 		if reldistinct > clamp {
 			reldistinct = clamp
 		}
-		if filtered, ok := relFilteredRows(child, rel); ok && reldistinct > 0 && filtered < tuples {
+		filteredRows := -1.0
+		if filtered, ok := relFilteredRows(child, rel); ok {
+			filteredRows = filtered
+		}
+		if filteredRows >= 0 && reldistinct > 0 && filteredRows < tuples {
 			// Yao/Dell'Era: selecting p of N rows from n uniformly
 			// distributed distinct values is expected to yield
 			// n·(1 - ((N-p)/N)^(N/n)) of them. This is the only term that
 			// knows the relation was FILTERED, and it is why grouping a
 			// heavily restricted relation inside a fan-out join does not
 			// claim the whole table's distinct count.
-			reldistinct *= 1 - math.Pow((tuples-filtered)/tuples, tuples/reldistinct)
+			reldistinct *= 1 - math.Pow((tuples-filteredRows)/tuples, tuples/reldistinct)
 		}
+		traceGroupRelation(rel, vis, tuples, filteredRows, reldistinct)
 		numdistinct *= clampRowEstF(reldistinct)
 	}
 
@@ -1353,24 +1732,59 @@ func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 				oid = ref.table.OID
 				attnum, _ = attnumOfColumn(ref.table, ref.col)
 			}
-			return groupVarKey{rel: ref.scan, col: ref.col},
-				groupVarInfo{
-					rel:       ref.scan,
-					ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
-					rawRows:   ref.rawRows,
-					tableOID:  oid,
-					attnum:    attnum,
-				}
+			info := groupVarInfo{
+				rel:       ref.scan,
+				ndistinct: groupVarNDistinct(float64(ref.ndistinct), ref.rawRows),
+				rawRows:   ref.rawRows,
+				tableOID:  oid,
+				attnum:    attnum,
+			}
+			traceGroupVar(cr, ref, info, "base")
+			return groupVarKey{rel: ref.scan, col: ref.col}, info
 		}
 		// `get_variable_numdistinct`'s isunique branch: a column that is the
 		// sole grouping key of an intervening grouped node is unique in that
 		// node's output, so its distinct count is that node's row count. No
 		// base relation means no per-relation clamp — see groupVarInfo.rel.
 		if nd, ok := groupUniqueNDistinct(cr.Index, child); ok && nd > 0 {
-			return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: float64(nd)}
+			info := groupVarInfo{ndistinct: float64(nd)}
+			traceGroupVar(cr, baseColumnRef{}, info, "group-unique")
+			return groupVarKey{idx: cr.Index}, info
 		}
 	}
-	return groupVarKey{idx: cr.Index}, groupVarInfo{ndistinct: defaultNumDistinct}
+	info := groupVarInfo{ndistinct: defaultNumDistinct}
+	traceGroupVar(cr, baseColumnRef{}, info, "default")
+	return groupVarKey{idx: cr.Index}, info
+}
+
+// traceGroupVar writes the evidence estimateNumGroups consumes for one GROUP
+// BY variable. It shares the opt-in DP trace switch so corpus captures can
+// explain a group-count collapse without adding a default-path cost or a
+// second diagnostic configuration surface.
+func traceGroupVar(cr *ColumnRef, ref baseColumnRef, info groupVarInfo, source string) {
+	if !pathTraceEnabled || cr == nil {
+		return
+	}
+	table := "-"
+	if ref.table != nil {
+		table = ref.table.Name
+	}
+	fmt.Fprintf(os.Stderr,
+		"GROUPTRACE source=%s index=%d name=%s table=%s col=%s ndistinct=%g rawrows=%g\n",
+		source, cr.Index, cr.Name, table, ref.col, info.ndistinct, info.rawRows)
+}
+
+// traceGroupRelation records the per-relation product after its tuple clamp
+// and optional Yao/Dell'Era restriction term. A negative filtered value means
+// the plan walk deliberately declined to treat the relation as filtered.
+func traceGroupRelation(rel Node, vis []groupVarInfo, tuples, filtered, ndistinct float64) {
+	if !pathTraceEnabled || len(vis) == 0 {
+		return
+	}
+	first := vis[0]
+	fmt.Fprintf(os.Stderr,
+		"GROUPTRACE relation=%T tableoid=%d attnum=%d vars=%d tuples=%g filtered=%g ndistinct=%g\n",
+		rel, first.tableOID, first.attnum, len(vis), tuples, filtered, ndistinct)
 }
 
 // groupVarNDistinct is the tail of `get_variable_numdistinct` (selfuncs.c:6341)
@@ -1443,11 +1857,35 @@ func relFilteredRows(root, rel Node) (float64, bool) {
 	return rows, found
 }
 
+// indexProbeHasOuterRef reports whether an index scan's probe keys reference
+// an outer query level (R62): such a scan is a parameterized probe whose
+// per-scan row count is not base-relation restriction evidence. Reuses the
+// sibling same-scope detector (subplan interiors stepped over as their own
+// scope); unenumerated key shapes decline (true), i.e. decline the evidence,
+// the PG-faithful side of the ambiguity.
+func indexProbeHasOuterRef(is *IndexScan) bool {
+	if is == nil {
+		return false
+	}
+	// Sibling `exprHasOuterRef` (narrowoutput.go) — same-scope outer-level
+	// detection, subplans stepped over; unenumerated shapes decline (true),
+	// which here means declining per-probe evidence, the PG-faithful side.
+	return exprHasOuterRef(is.Key) || exprHasOuterRefList(is.Keys) || exprHasOuterRefList(is.RangePrefix)
+}
+
 func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 	if n == nil {
 		return 0, false, false
 	}
 	if n == rel {
+		// R62: decline per-probe restriction evidence. A parameterized
+		// probe's per-scan rows are not base-relation evidence — upstream
+		// resolves grouping vars to the UNPARAMETERIZED baserel (no Yao
+		// discount when it is unfiltered), which the estimate tree does
+		// not carry. found=false skips the Yao term exactly in that case.
+		if is, ok := n.(*IndexScan); ok && indexProbeHasOuterRef(is) {
+			return 0, false, false
+		}
 		return float64(EstimateRows(n)), true, false
 	}
 	// passthrough: n still describes a single relation if its child does.
@@ -1486,11 +1924,38 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		return passthrough(x.Child)
 	case *GatherMerge:
 		return passthrough(x.Child)
+	case *Memoize:
+		if x.Child == nil {
+			return 0, false, false
+		}
+		return passthrough(x.Child)
 	case *CTEScan:
+		return passthrough(x.Child)
+	// M0145-0009 slice 4: the third member of the resolver-arm family
+	// (`TestResolverFamilyArmListsAgree` enforces that the three walkers carry
+	// the same arms). A `*WindowAgg` is row-preserving — one output row per
+	// input row — so it still describes its child's relation and its own
+	// `EstimateRows` is that relation's filtered count, which is exactly what
+	// `passthrough` returns. Note there is deliberately no `*Aggregate` arm
+	// here for the mirror-image reason: an Aggregate's rows are GROUPS, so it
+	// does NOT describe its child's relation.
+	case *WindowAgg:
 		return passthrough(x.Child)
 	case *Join:
 		return joinSide(x.Left, x.Right)
 	case *NestedLoopIndexJoin:
+		// Every legal NLI Inner is a parameterized probe. Its one-execution
+		// row estimate is consequently not a restriction of the base
+		// relation: the probe is re-executed for every Outer row. The probe
+		// key is commonly a plain ColumnRef in the outer-row coordinate
+		// frame, rather than an OuterColumnRef, so inspecting the key alone
+		// cannot recognize this shape (Q39 / R64). Decline it structurally
+		// before the ordinary join-side walk reaches the leaf.
+		if x.Inner == rel {
+			if _, _, _, ok := nliInnerProbe(x.Inner); ok {
+				return 0, false, false
+			}
+		}
 		if x.Inner != nil {
 			return joinSide(x.Outer, x.Inner)
 		}
@@ -1524,13 +1989,26 @@ func keyNDistinct(key Expr, side Node) int64 {
 // key, and its distinct count is then the node's own row count. The order is
 // upstream's — `isunique` overrides `stadistinct` ("assume it is unique no
 // matter what pg_statistic says", selfuncs.c:6332) — but the two arms cannot
-// both fire here, because `resolveBaseColumn` has no arm that walks through a
-// grouping node in the first place, deliberately (see `groupUniqueNDistinct`).
+// both fire on a WHOLE aggregate, because `resolveBaseColumn`'s only
+// grouping-node arm is partial-mode-only, deliberately: a general arm would
+// shadow `groupUniqueNDistinct`'s exact answers with base-nd overestimates
+// (R63; see `groupUniqueNDistinct`). Through a partial, the base-nd answer
+// is the groups observed — exact when every worker sees every group,
+// bounded by base nd otherwise (R63-#1).
 func columnNDistinctForChild(idx int, child Node) int64 {
 	if ref, ok := resolveBaseColumn(idx, child); ok {
 		return ref.ndistinct
 	}
 	if nd, ok := groupUniqueNDistinct(idx, child); ok {
+		return nd
+	}
+	// M0145-0009 slice 1 (B-06 gap G1): a CTE-output column whose body is an
+	// Aggregate or a UNION of literals resolves to nothing above, so without
+	// this arm every such column falls to `defaultNumDistinct`. The synthesis
+	// declines any shape it does not recognise, so this can only replace a
+	// default with a derived number — never invent one. Ordered LAST so a real
+	// catalog resolution always wins.
+	if nd, ok := cteSynthNDistinct(idx, child); ok {
 		return nd
 	}
 	return 0

@@ -243,29 +243,21 @@ func groupClauseItems(s *parser.SelectStmt) []presearchSortItem {
 	if len(s.GroupBy) == 0 || s.GroupingSets != nil {
 		return nil
 	}
-	pending := make([]parser.Expr, len(s.GroupBy))
-	copy(pending, s.GroupBy)
-	items := make([]presearchSortItem, 0, len(pending))
-	for _, sb := range sortClauseItems(s) {
-		hit := -1
-		for i, g := range pending {
-			if g != nil && parserSortExprEqual(g, sb.expr, s) {
-				hit = i
-				break
-			}
-		}
-		if hit < 0 {
-			// The first ORDER BY item that is not a grouping item ends the
-			// shared prefix (`transformGroupClause`'s own break).
-			break
-		}
-		pending[hit] = nil
-		items = append(items, sb)
-	}
-	for _, g := range pending {
-		if g != nil {
+	// M0145-0008d: processedGroupOrder is the one derivation of the processed
+	// group clause, shared with Aggregate.GroupClause (groupclause.go). Besides
+	// the prefix, it gives a non-prefix GROUP BY item ORDER BY's direction
+	// when ORDER BY names it anywhere (`ORDER BY count(*) DESC, g DESC` groups
+	// on g DESC), as transformGroupClauseExpr does.
+	order := processedGroupOrder(s.GroupBy, s)
+	items := make([]presearchSortItem, 0, len(s.GroupBy))
+	if order == nil {
+		for _, g := range s.GroupBy {
 			items = append(items, defaultSortItem(g))
 		}
+		return items
+	}
+	for _, it := range order {
+		items = append(items, presearchSortItem{expr: s.GroupBy[it.idx], desc: it.desc, nullsFirst: it.nullsFirst})
 	}
 	return items
 }

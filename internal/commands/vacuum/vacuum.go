@@ -29,12 +29,26 @@ type Stats struct {
 	// skips never stall advancement.
 	SkippedAllVisible int
 	SkippedAllFrozen  int
+	// SkippedPinned counts blocks a non-aggressive pass left unpruned
+	// because another backend held a pin (no cleanup lock without
+	// waiting; M0145-0008q). Their unfrozen xmins were not examined, so
+	// callers must not advance relfrozenxid when it is > 0, as for
+	// SkippedAllVisible (RelfrozenxidGuarded).
+	SkippedPinned int
 	OldestXmin        storage.TransactionID
 	NewFrozenXID      storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
 	// DeadTIDs is the list of heap (block, offset) pointers that were
 	// reclaimed in this pass. Index vacuum uses these to remove stale
 	// index entries (M0047-0002).
 	DeadTIDs []storage.ItemPointer
+}
+
+// RelfrozenxidGuarded reports whether a pass with this aggressiveness left
+// pages unexamined, so relfrozenxid must not advance: VM-skipped
+// all-visible pages (vacuumlazy.c skippedallvis) and pinned pages it did
+// not wait for.
+func (s Stats) RelfrozenxidGuarded(aggressive bool) bool {
+	return !aggressive && (s.SkippedAllVisible > 0 || s.SkippedPinned > 0)
 }
 
 // VacuumOptions controls optional vacuum behaviours beyond the core dead-tuple
@@ -181,10 +195,34 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			stats.Pages++
 			continue
 		}
-		// Take the per-page content lock so concurrent readers /
-		// writers can't tear the dead-set scan + repack + pd_lsn
-		// stamp under MarkDirtyChangeRecord.
-		slot.Lock()
+		// Take the page's cleanup lock: the exclusive content lock, held
+		// while this pin is the only one, because the repack moves tuple
+		// bytes a pinned reader may still be using (M0145-0008q). PG's
+		// lazy_scan_heap tries ConditionalLockBufferForCleanup first; a
+		// non-aggressive pass that cannot get it scans the page without
+		// pruning (lazy_scan_noprune), and only an aggressive pass waits.
+		// goopg's non-aggressive pass does the same under the share lock:
+		// it counts the tuples the prune would keep (reltuples), assumes
+		// the page non-empty for truncation, and neither prunes, freezes
+		// nor sets VM bits. The page's unfrozen xmins go unexamined, so
+		// relfrozenxid does not advance (Stats.SkippedPinned).
+		if !pool.ConditionalLockForCleanup(slot) {
+			if !opts.Aggressive {
+				slot.RLock()
+				live, lerr := storage.PageCountVacuumLive(page, horizon)
+				slot.RUnlock()
+				pool.Unpin(slot)
+				if lerr != nil {
+					return stats, lerr
+				}
+				stats.Pages++
+				stats.Live += live
+				stats.SkippedPinned++
+				lastNonEmpty = blk
+				continue
+			}
+			pool.LockForCleanup(slot)
+		}
 
 		pageDirty := false
 
@@ -194,7 +232,10 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		// multi xmax resolves its updater before the horizon compare). The old
 		// naive "xmax < horizon → remove slot" pass broke HOT chains and treated
 		// a raw MultiXactId as an xid — see the freeze-the-dead spec (M0118-0009).
-		pr, liveOnPage, err := storage.PageVacuumPrune(page, horizon)
+		// markUnusedNow stays false: vacuumCore does not know whether the
+		// relation has indexes, so a dead non-HOT tuple is left LP_DEAD for
+		// the index pass (PG sets it only for an index-less relation).
+		pr, liveOnPage, err := storage.PageVacuumPrune(page, horizon, false)
 		if err != nil {
 			slot.Unlock()
 			pool.Unpin(slot)
@@ -203,12 +244,12 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		if cnt, cerr := storage.PageLinePointerCount(page); cerr == nil && (cnt > 0 || liveOnPage > 0) {
 			lastNonEmpty = blk
 		}
-		reclaimed := len(pr.Redirects) + len(pr.Unused)
+		reclaimed := pr.Reclaimed()
 		stats.Live += liveOnPage
 		if reclaimed > 0 {
 			if logPrune != nil {
 				err = pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logPrune(rel, blk, pr.Redirects, pr.Unused)
+					return logPrune(rel, blk, pr.Redirects, pr.Dead, pr.Unused)
 				})
 				if err != nil {
 					slot.Unlock()
@@ -221,14 +262,19 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			pageDirty = true
 			stats.Dead += reclaimed
 			lastNonEmpty = blk
-			// Collect dead TIDs for index vacuum (M0047-0002). Only the
-			// fully-removed (Unused) line pointers may carry an index entry
-			// that must be cleared; redirected roots keep their index entry
-			// valid. HOT-only Unused tuples have no index entry, so removing a
-			// (nonexistent) entry for their TID is a harmless no-op.
-			for _, s := range pr.Unused {
-				stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
-			}
+		}
+		// Collect dead TIDs for index vacuum (M0047-0002): every LP_DEAD item
+		// on the page, whether this prune or an earlier on-access prune left
+		// it dead (lazy_scan_prune's deadoffsets; M0145-0008v). Unused items
+		// have no index entry; redirected roots keep theirs valid.
+		deadItems, derr := storage.PageDeadItems(page)
+		if derr != nil {
+			slot.Unlock()
+			pool.Unpin(slot)
+			return stats, derr
+		}
+		for _, s := range deadItems {
+			stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
 		}
 
 		// Tuple-freeze pass (M0046-0005): rewrite old xmin → FrozenTransactionID.

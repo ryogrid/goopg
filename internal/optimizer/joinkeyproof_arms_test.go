@@ -51,7 +51,14 @@ import (
 // Empty is the goal state and is currently the truth: every descending arm is
 // shared. LEAF arms are not exemptions and are not listed — they are excluded
 // structurally (see descendingSwitchArms).
-var resolverArmExemptions = map[string]string{}
+var resolverArmExemptions = map[string]string{
+	// R63: an aggregate's output is groups, not base-rel rows — descending
+	// the Yao walk (`relFilteredRowsWalk`) through it would misattribute
+	// base restriction evidence (the grouped-subquery case belongs to
+	// `groupUniqueNDistinct`, not the Yao walk). The partial-mode-only
+	// `*Aggregate` arm in `resolveBaseColumn` therefore has no twin.
+	"*Aggregate": "aggregate output is groups, not base-rel rows; the Yao walk must not descend",
+}
 
 // descendingSwitchArms returns the case types of the type switch in `funcName`
 // whose bodies DESCEND — i.e. recurse, directly or through a function-local

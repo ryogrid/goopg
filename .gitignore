@@ -6,6 +6,7 @@
 .ralph/.ralph_session
 .ralph/.ralph_session_history
 .ralph/.claude_session_id
+.ralph/.devin_session_id
 .ralph/.response_analysis
 .ralph/.circuit_breaker_state
 .ralph/.circuit_breaker_history
@@ -98,6 +99,11 @@ bench/tpch/runtime_goopg/data/
 bench/tpch/runtime_goopg/*.pid
 bench/tpch/runtime_goopg/*.log
 bench/tpch/runtime_goopg/tmp/
+bench/tpch/runtime_goopg/preloss-clone-*/
+bench/tpch/runtime_goopg/evidence-*/
+bench/tpch/runtime_goopg/tpch-golden-*/
+bench/tpch/runtime_goopg/*.HOLD
+bench/tpch/runtime_goopg/goopg-bin
 
 # TPC-DS runtime artifacts (bench/tpcds/ — clusters, TSVs, results, logs).
 # The ONE tracked exception is the pinned SF0.5 row-count oracle, which lets
@@ -120,6 +126,9 @@ ci/logs/
 *.pyc
 
 !ci/logs
+# `ci/logs/*` below already covers the harness audit logs
+# (precommit-skips.log, ralph-guard-denials.log, gate-exception-usage.log):
+# they are machine-appended run state, never committed.
 ci/logs/*
 !ci/logs/action-items.md
 !ci/logs/launch.log
@@ -142,3 +151,11 @@ internal/sqlparser/yacc_stderr.txt
 !opencode.json
 # Mermaid validator
 tools/mermaid-validator/node_modules/
+
+# Plan-parity harness (M0137–M0145): scratch must not live at the repo root.
+# `bak/` once held a `package executor` test file at the root and broke
+# `go vet ./...` for 10 hours while five tasks accepted the red as
+# "pre-existing". Scratch belongs in analysis/m01NN/ — see AGENT.md
+# §"Plan-parity harness" → "Working-directory hygiene".
+/bak/
+/estimate-audit

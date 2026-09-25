@@ -1,0 +1,54 @@
+# M0142-0008a-3i-route-a step 2 — post-splice seam census
+# Source: GOOPG_PGSHAPED_DP_TRACE=1 SF025_NO_BUILD=1 GOOPG_BIN=tmp/goopg-sf025-bin \
+#   scripts/tpcds-sf025-regression.sh plans   (2026-09-20 22:55, EXPLAIN-only pass)
+# Log window: bench/tpcds/runtime_goopg/goopg.sf025.log after ===CENSUS-CAPTURE-START===
+#
+# Per-class census (scripts/seam-decline-census.py vocabulary):
+      2 lateral
+     26 leaf-count
+      3 outer-over-derived
+      2 outer-spine
+      3 semianti-not-tail
+#
+# Flattening is ACTIVE: nleaves>nrels records (nrels=3 nleaves=6 lateral;
+# nrels=2 nleaves=3 leaf-count) carry multi-leaf decomposed RHS leaves.
+# No problem rels= line contains a flattened semi RHS member — every
+# still-declining chain has a SECOND undecomposable member or gate.
+#
+# Raw decline records:
+DPTRACE seam-decline reason=lateral nrels=3 nleaves=4
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=2 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=2 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=outer-spine nrels=2 nleaves=0
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=2
+DPTRACE seam-decline reason=lateral nrels=3 nleaves=6
+DPTRACE seam-decline reason=outer-over-derived nrels=2 nleaves=2
+DPTRACE seam-decline reason=outer-over-derived nrels=2 nleaves=2
+DPTRACE seam-decline reason=semianti-not-tail nrels=2 nleaves=3
+DPTRACE seam-decline reason=semianti-not-tail nrels=2 nleaves=3
+DPTRACE seam-decline reason=semianti-not-tail nrels=2 nleaves=3
+DPTRACE seam-decline reason=outer-over-derived nrels=3 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=3 nleaves=2
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=3
+DPTRACE seam-decline reason=leaf-count nrels=4 nleaves=3
+DPTRACE seam-decline reason=outer-spine nrels=2 nleaves=0

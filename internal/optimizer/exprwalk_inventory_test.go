@@ -137,8 +137,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	// function, so the pin DEMOTES instead of disappearing. A conversion is
 	// audited by this role change; only a walker whose switch vanishes
 	// entirely loses its line.
-	"joinlayout.go:remapByPosMap":           nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
-	"joinlayout.go:remapOuterRefsInSubplan": walkerPending, // 5 of 32 arms; moved from bushy.go at M0127-P6.3
+	// M-NIGHTLY NULL-key guard (2026-09-24): decides whether a top-level AND
+	// conjunct strictly tests one column; descends only through AND, and an
+	// unenumerated type answers "not proven", which keeps the index guard.
+	"pseudoconstant_gate.go:SublinkIsInitPlan":        nonRecursiveClassifier, // M0145-0008o: sublink kind -> InitPlan or SubPlan, no recursion
+	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
+
+	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
 	// was never read — so there was no conversion to finish, only dead weight
@@ -150,7 +155,44 @@ var exprSwitchInventory = map[string]walkerRole{
 	// empty-Name *ColumnRef), attributed by the census to its enclosing
 	// function. Same demoted shape as commits 1, 2, 5 and 6's producer half.
 	// RC-1a class 45 -> 44.
-	"joinlayout.go:visitColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only)
+	"joinlayout.go:walkColumnRefsByName": nonRecursiveClassifier, // moved from bushy.go at M0127-P6.3 (rename only); body split out of visitColumnRefsByName at M0145-0008e (scope callback)
+	// Added by M0145-0003. Both are built on the exprwalk drivers —
+	// rebasePulledQual's dispatch lives inside the cloneExprRefs
+	// Rewrite closure (rebase *ColumnRef / convert or veto
+	// *OuterColumnRef; an unenumerated type aborts the clone, so it is
+	// fail-closed), exprListHasLocalAndLevel1Ref's inside the
+	// walkExprRefs Visit closure (collect *ColumnRef presence and
+	// Level-1 *OuterColumnRef presence; OnUnknown aborts the walk and
+	// the conjunct reads as not spanning-capable — a decline, never a
+	// wrong pull-up). The census attributes both closures' switches to
+	// their enclosing functions — the same demoted shape as
+	// upper_narrow_gate.go:remapExprIndices and
+	// local_filters.go:conjunctIsLocalEligible.
+	"jointreepullup.go:rebasePulledQual":             nonRecursiveClassifier,
+	"jointreepullup.go:exprListHasLocalAndLevel1Ref": nonRecursiveClassifier,
+	// M0145-0014. The traversal is `walkExprTree`, not hand-written; the two
+	// arms are a CLASSIFICATION of which sublink kinds
+	// `pull_up_sublinks_qual_recurse` converts (ANY and EXISTS, and nothing
+	// else). It must not be generalised to "any Expr carrying a subplan" —
+	// that is exactly the blanket gate this task removed.
+	"jointreepullup.go:exprHasConvertibleSublink": nonRecursiveClassifier,
+	// M0145-0015. A path-sensitive CLASSIFIER, not a traversal: it walks down
+	// to the first subplan-bearing node and names the outermost non-AND
+	// wrapper it passed through, because that is what decides whether PG
+	// would have converted the sublink (`pull_up_sublinks_qual_recurse`
+	// recurses AND and NOT, stops at everything else). A slot-driven walk
+	// cannot express it — the answer depends on the PATH taken, not on the
+	// node set reached.
+	"nlicensus.go:sublinkConjunctPosition": nonRecursiveClassifier,
+	// Added by M0145-0003's ANY arm. Same demoted shape and the same
+	// fail-closed property as rebasePulledQual above: the dispatch lives
+	// inside a cloneExprRefs Rewrite closure (lift *ColumnRef to Level-1
+	// *OuterColumnRef, VETO an existing *OuterColumnRef), and an
+	// unenumerated type aborts the clone, which declines the pull-up. A
+	// missed type can therefore cost a conversion, never produce a wrong
+	// one — and `rebasePulledQual` validates every index this function
+	// produces against the emitting bindings on the way back out.
+	"jointreepullup.go:outerOperandAsLevel1": nonRecursiveClassifier,
 	// Added by M0127-P5.5-e-i. Built on cloneExprRefs (which carries both the
 	// recursion and the exhaustiveness); what the census sees is the
 	// three-arm dispatch inside the Rewrite closure — renumber *ColumnRef,
@@ -271,7 +313,11 @@ var exprSwitchInventory = map[string]walkerRole{
 	// descent, deliberate default=false (keep Filter). Same shape as
 	// selectivity.go:isConstExpr.
 	"planner.go:isPlainConstantBound":            nonRecursiveClassifier,
-	"planner.go:planHasEscapingOuterRef":         walkerPending, // 6 of 32 arms
+	// R29 renamed this switch: planHasEscapingOuterRef became a STRUCTURAL
+	// plan walk (it counts lateral binders), and its per-expression arms moved
+	// out to outerRefEscapes, which the structural walk and the flat fallback
+	// now share. Same 6 arms, same defect class, new key.
+	"planner.go:outerRefEscapes":                walkerPending, // 6 of 32 arms
 	// Renamed by review/260831-2 X-8: the hand-written switch moved into
 	// planIndexScanFromWhereShape; planIndexScanFromWhere is now the thin
 	// wrapper that applies the enable_indexscan/indexonlyscan toggles.
@@ -280,8 +326,6 @@ var exprSwitchInventory = map[string]walkerRole{
 	"planner.go:replaceExprNode":                 walkerPending, // 6 of 32 arms
 	"planner.go:shiftColumnRefsBy":               walkerPending, // 13 of 32 arms
 	"planner.go:withinGroupDirectArgColumnName":  walkerPending, // 2 of 32 arms
-	"predp.go:remapSublinkOuterRefs":             walkerPending, // 3 of 32 arms
-	"predp.go:whereEligibleForPreDPUnnest":       nonRecursiveClassifier,
 	// Added by take2 P1-14b (patternsel slice): a 2-arm shape recogniser
 	// (StringConst / LikeEscapePattern) with decline-by-default — an
 	// unenumerated type falls through to the match default, the
@@ -297,6 +341,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
 	"subplan_lower.go:rewriteSublinkPlan":        walkerPending, // 6 of 32 arms
+	// R33 (K44): the sublink-graft classifiers — decide-and-return over
+	// the five/six sublink shapes, no descent (descent rides
+	// exprChildSlots via spliceField). Classifier role needs no
+	// conversion.
+	"subquery_parallel.go:copySublinkWithPlan":  nonRecursiveClassifier,
+	"subquery_parallel.go:eligibleSublinkPlan":  nonRecursiveClassifier,
+	"subquery_parallel.go:isSublinkKind":        nonRecursiveClassifier,
 	"subplan_lower_walk.go:lowerTraverseExpr":    walkerPending, // 24 of 32 arms
 	"unnest.go:canUnnestExistsExpr":              walkerPending, // 5 of 32 arms
 	"unnest.go:cloneExprLeaf":                    walkerPending, // 14 of 32 arms
@@ -307,20 +358,20 @@ var exprSwitchInventory = map[string]walkerRole{
 	// deepVisitSublinkChildren descends through walkExprTreeDeep, which is a
 	// PLAN walker with no Expr switch of its own, so the census's mutual-
 	// recursion pass reports it non-recursive. It is a walker.
-	"unnest.go:deepVisitSublinkChildren":   walkerPending, // 5 of 32 arms
-	"unnest.go:findExistsExprInExpr":       walkerPending, // 5 of 32 arms
-	"unnest.go:findExprInExpr":             walkerPending, // 3 of 32 arms
-	"unnest.go:findInExprInExpr":           walkerPending, // 5 of 32 arms
-	"unnest.go:findSubqueryInExpr":         walkerPending, // 5 of 32 arms
-	"unnest.go:liftResidualConjuncts":      walkerPending, // 5 of 32 arms
-	"unnest.go:nullPreservingScalarTarget": walkerPending, // 9 of 32 arms
-	"unnest.go:planCloneSupported":         walkerPending, // 5 of 32 arms
-	"unnest.go:replaceExprInConjunct":      walkerPending, // 5 of 32 arms
-	"unnest.go:residualExprLiftable":       walkerPending, // 12 of 32 arms
-	"unnest.go:shiftExprColumnIdx":         walkerPending, // 5 of 32 arms
-	"unnest.go:subqueryANDReachable":       walkerPending, // 2 of 32 arms
-	"unnest.go:walkExprTree":               walkerPending, // 8 of 32 arms
-	"unnest.go:walkSubqueryPlansInExpr":    walkerPending, // 9 of 32 arms
+	"unnest.go:deepVisitSublinkChildren":        walkerPending, // 5 of 32 arms
+	"unnest.go:findExistsExprInExpr":            walkerPending, // 5 of 32 arms
+	"unnest.go:findExprInExpr":                  walkerPending, // 3 of 32 arms
+	"unnest.go:findInExprInExpr":                walkerPending, // 5 of 32 arms
+	"unnest.go:findSubqueryInExpr":              walkerPending, // 5 of 32 arms
+	"unnest.go:liftResidualConjunctsWithOffset": walkerPending, // 5 of 32 arms
+	"unnest.go:nullPreservingScalarTarget":      walkerPending, // 9 of 32 arms
+	"unnest.go:planCloneSupported":              walkerPending, // 5 of 32 arms
+	"unnest.go:replaceExprInConjunct":           walkerPending, // 5 of 32 arms
+	"unnest.go:residualExprLiftable":            walkerPending, // 12 of 32 arms
+	"unnest.go:shiftExprColumnIdx":              walkerPending, // 5 of 32 arms
+	"unnest.go:subqueryANDReachable":            walkerPending, // 2 of 32 arms
+	"unnest.go:walkExprTree":                    walkerPending, // 8 of 32 arms
+	"unnest.go:walkSubqueryPlansInExpr":         walkerPending, // 9 of 32 arms
 	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
 	// cloneExprRefs (which carries both the recursion and the
 	// exhaustiveness); what the census sees is the four-arm dispatch

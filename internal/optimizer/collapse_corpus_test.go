@@ -84,7 +84,7 @@ func explicitJoinFlattens(sql string) (flattens bool, levels []string, err error
 			rel := 0
 			for _, item := range sel.FromExprs {
 				sub := deconstructFromItem(item, rel, lim)
-				rel += fromItemRels(item)
+				rel += jointreeItemEmittingRels(item)
 				if len(item.Joins) > 0 && len(sub) > 1 {
 					flattens = true
 				}
@@ -375,111 +375,6 @@ func TestExplicitJoinFlatteningOnTheTPCDSCorpus(t *testing.T) {
 		total, len(unparsed), unparsed, got)
 }
 
-// levelHasSearchableInnerPrefix reports whether any query level of sql presents
-// the shape M0127-P5.9-s peels: a joinlist topped by pinned LEFT links with at
-// least two relations below them.
-//
-// It is the production predicate, not a paraphrase — `deconstructJointree` and
-// `innerPrefixBelowOuterSpine` are the same calls the seam makes — because
-// P5.9-m's whole lesson was that a corpus measurement
-// re-derived from the SQL text answers a different question than the planner
-// does (the `72,75` note above: `grep -c ' join '` finds three eligible queries
-// where `deconstructJointree` finds two).
-//
-// The plan-tree half of the seam's check (`splitOuterSpine`) is not modelled: it
-// can only DECLINE what this admits, so the count below is an upper bound on the
-// corpus population, and it is labelled as one.
-func levelHasSearchableInnerPrefix(sql string) (bool, error) {
-	stmts, err := parser.Parse(sql)
-	if err != nil {
-		return false, err
-	}
-	for _, st := range stmts {
-		for _, sel := range selectLevels(st) {
-			if len(sel.FromExprs) == 0 {
-				continue
-			}
-			jl := deconstructJointree(sel.FromExprs, defaultCollapseLimits())
-			prefix, spine := jl.innerPrefixBelowOuterSpine()
-			if len(spine) == 0 || prefix.nrels() < 2 {
-				continue
-			}
-			allLeft := true
-			for _, t := range spine {
-				if t != parser.JoinLeft {
-					allLeft = false
-					break
-				}
-			}
-			if allLeft {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-// TestCorpusQueriesWithASearchableInnerPrefix is P5.9-s's counterpart to
-// `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above, and it is the fact that
-// distinguishes this task from P5.9-r: the INNER walk reached zero corpus
-// queries, and the peel does not.
-//
-// The set is PINNED rather than merely logged, for the reason the collapse-
-// eligible set above is: it is the blast radius of the DS05 plan channel. If a
-// query enters or leaves it, the number of plans the arm can move changed, and
-// the acceptance bar's "same=99" needs re-reading rather than re-quoting.
-//
-func TestCorpusQueriesWithASearchableInnerPrefix(t *testing.T) {
-	entries, err := os.ReadDir(tpcdsCorpusDir)
-	if err != nil {
-		t.Skipf("TPC-DS corpus not present (%v)", err)
-	}
-	nameRE := regexp.MustCompile(`^query([0-9]+)\.sql$`)
-	var peelable []int
-	total := 0
-	for _, e := range entries {
-		m := nameRE.FindStringSubmatch(e.Name())
-		if m == nil {
-			continue
-		}
-		qn, _ := strconv.Atoi(m[1])
-		sql, err := os.ReadFile(filepath.Join(tpcdsCorpusDir, e.Name()))
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		total++
-		ok, perr := levelHasSearchableInnerPrefix(string(sql))
-		if perr != nil {
-			continue
-		}
-		if ok {
-			peelable = append(peelable, qn)
-		}
-	}
-	sort.Ints(peelable)
-	// C-04a re-pin: 2 -> 0, and EMPTY is the correct answer rather than a
-	// regression. The peel existed because a LEFT link could not enter the
-	// search; now it can, so `pinnedOuter` answers false for LEFT and no LEFT
-	// link ever starts a spine again (DESIGN §3.1/§3.3). The peel survives for
-	// RIGHT and FULL only — C-04b's and the ledger's scope — and the queries
-	// that used to be peeled are now in the collapse-eligible set above, where
-	// their whole chain is ONE problem instead of a prefix under a stack.
-	//
-	// Kept pinned rather than deleted: an empty set is the assertion that LEFT
-	// has LEFT the spine, and a non-empty one would mean a LEFT link found its
-	// way back onto it.
-	const want = ""
-	if got := sprintInts(peelable); got != want {
-		t.Errorf("TPC-DS queries with a searchable INNER prefix below a LEFT spine = {%s}, "+
-			"want {%s} (of %d).\nThis is the DS05 plan channel's blast radius for the peel; "+
-			"if it changed, re-run 09 §3.19's protocol rather than re-quoting its numbers.",
-			got, want, total)
-	}
-	t.Logf("TPC-DS corpus: %d queries, %d with a peelable LEFT spine over a >=2-relation "+
-		"inner prefix (upper bound: the plan-tree half of the check can still decline)",
-		total, len(peelable))
-}
-
 // chainIsInnerOnly reports whether EVERY explicit `JOIN` in this statement's
 // FROM clauses is INNER or CROSS — the property `extractSearchLeaves`
 // (joinsearchseam.go) needs to flatten a chain, since the walk stops at an outer
@@ -616,7 +511,6 @@ func TestNoCorpusQueryHasAnInnerOnlyJoinChain(t *testing.T) {
 // must not be confused — confusing them is the exact defect P5.9-m recorded.
 // `TestNoCorpusQueryHasAnInnerOnlyJoinChain` above measures the second.
 func TestExplicitJoinChainReachesTheSearch(t *testing.T) {
-	withPGShapedDP(t)
 	names := []string{"a", "b", "c"}
 	// The chain `planFromItem` builds for that FROM clause, and the joinlist
 	// the deconstruction actually produces for it.

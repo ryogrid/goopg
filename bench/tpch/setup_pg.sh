@@ -82,7 +82,10 @@ HBA
         # OS page cache, so the practical gap was smaller than 4x — but it
         # was an asymmetry in the measurement, not in the engines.
         echo "shared_buffers = 2048MB"
-        echo "work_mem = 64MB"
+        # Measurement convention (owner decision 2026-09-24): both engines'
+        # measurement clusters carry work_mem = 512MB in postgresql.conf —
+        # written here, never overridden by a session SET. Was 64MB.
+        echo "work_mem = 512MB"
         echo "maintenance_work_mem = 256MB"
         echo "effective_cache_size = 2GB"
         # TPC-H queries are read-heavy; larger checkpoints reduce

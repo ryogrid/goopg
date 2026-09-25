@@ -1,0 +1,16 @@
+# M0145-0008k timings, TPC-H SF1 lineitem (6,001,726 rows), private clone of the
+# acceptance-arm data on :5534, HEAD 25095f604, GOMEMLIMIT=12GiB GOGC=100.
+# Four runs each; first run warms. ms, wall clock via psql.
+HEAD   workers=0 count(*)          4903 7088 5077 4735
+HEAD   workers=0 sum(l_quantity)   3132 3184 3266 3294
+HEAD   workers=0 count(l_quantity) 3239 3142 5462 3268
+HEAD   workers=2 count(*)          1793 1800 1748 1762
+HEAD   workers=2 sum(l_quantity)   1036 1020 1039  997
+HEAD   workers=2 count(l_quantity)  968  972  959  971
+# PROBE (not committed): zero-arm Aggregate threads deform bound 0 -> scan
+# deforms/clones column 0 only. count(*) result unchanged (6001726).
+PROBE  workers=0 count(*)          1549 1611 1548 3992
+PROBE  workers=0 sum(l_quantity)   3325 3349 3141 3105
+PROBE  workers=2 count(*)           612  611  620  618
+PROBE  workers=2 sum(l_quantity)   1022 1024 1031 1025
+# PG 18.3 reference (from the task text): count(*) 0.96 s, sum 1.40 s serial.

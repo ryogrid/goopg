@@ -38,6 +38,12 @@ type PlanCost struct {
 	// a node the search did not produce is indistinguishable from a free one,
 	// and the renderer cannot tell which nodes need the legacy derivation.
 	CostSet bool
+	// PerWorker marks figures that are ONE participant's share: the node was
+	// stamped from a partial path (ParallelWorkers > 0), whose rows and cost
+	// are per worker by construction (cost_seqscan's parallel arm).
+	// perWorkerDisplayRows reads it so a scan already priced per worker is
+	// not divided a second time (M0141-S2b-16).
+	PerWorker bool
 }
 
 // PlanCostInfo returns the node's cost annotation and whether one was set.
@@ -92,6 +98,7 @@ func stampPlanCost(n Node, p *Path) {
 		TotalCost:   p.Cost.Total,
 		PlanRows:    p.Rows,
 		PlanWidth:   TupleWidth(n.Output()),
+		PerWorker:   p.ParallelWorkers > 0,
 	})
 }
 

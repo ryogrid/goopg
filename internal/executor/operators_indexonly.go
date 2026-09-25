@@ -22,6 +22,12 @@ import (
 // For pages not yet marked ALL_VISIBLE it falls back to a full heap fetch
 // so MVCC visibility is always respected.
 type indexOnlyScanOp struct {
+	// rangeLoExcl / rangeHiExcl: index-order bound exclusivity, as on
+	// indexScanOp (DESC swap, NULL pivots). Set by every lookupRangeBounds;
+	// the plan's operators otherwise.
+	rangeLoExcl, rangeHiExcl bool
+	rangeBoundsSet           bool
+
 	plan *optimizer.IndexOnlyScan
 	ctx  *Context
 	rows []Row
@@ -220,6 +226,7 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	isHashIdx := o.isHashIdx
 	o.hashProbeFingerprint = nil
 	var loBytes, hiBytes []byte
+	o.rangeBoundsSet = false
 	switch {
 	case len(o.plan.Keys) > 0:
 		// Multi-column equality probe (M0054-0006 composite), preserved
@@ -420,7 +427,11 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// identical — RangeScan is rangeScanPos with both ends inclusive. The two
 	// bool flags carry the bound strictness (M0134-0001 S4 class 8); they are
 	// false for every producer that leaves LowOp/HighOp at OpUnknown.
-	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanPosFn); err != nil {
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
+	if o.rangeBoundsSet {
+		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
+	}
+	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, loExcl, hiExcl, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -481,9 +492,15 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 			ctx.Pool.Unpin(slot)
 			continue
 		}
-		slot.Lock()
-		pr, _, perr := storage.PageVacuumPrune(page, horizon)
-		if perr != nil || (len(pr.Redirects) == 0 && len(pr.Unused) == 0) {
+		// Pruning moves tuple bytes: take the cleanup lock, and skip a page
+		// someone else still has pinned, as heap_page_prune_opt does with
+		// ConditionalLockBufferForCleanup (M0145-0008q).
+		if !ctx.Pool.ConditionalLockForCleanup(slot) {
+			ctx.Pool.Unpin(slot)
+			continue
+		}
+		pr, _, perr := storage.PageVacuumPrune(page, horizon, false)
+		if perr != nil || pr.Reclaimed() == 0 {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			continue
@@ -491,7 +508,7 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 		if logPrune != nil {
 			blkCopy := blk
 			_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Unused)
+				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Dead, pr.Unused)
 			})
 		} else {
 			ctx.Pool.MarkDirty(slot)
@@ -1094,33 +1111,66 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
-	if o.plan.LowKey != nil {
-		v, evalE := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
+	// Value bounds → index-order bounds, as the index scan does
+	// (indexScanOp.lookupRangeBounds): a DESC column of a tuple-format index
+	// swaps the ends and their strictness.
+	valueKey := func(e optimizer.Expr) ([]byte, bool, error) {
+		v, evalE := evalExprSlot(e, o.outerSlot, o.ctx)
 		if evalE != nil {
-			return nil, nil, false, evalE
+			return nil, false, evalE
 		}
 		if v.IsNull() {
+			return nil, false, nil
+		}
+		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: e.Pos()}})
+		if encE != nil {
+			return nil, false, encE
+		}
+		return k, true, nil
+	}
+	var vLo, vHi []byte
+	if o.plan.LowKey != nil {
+		k, present, kerr := valueKey(o.plan.LowKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
+		}
+		if !present {
 			return nil, nil, false, nil
 		}
-		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
-		if encE != nil {
-			return nil, nil, false, encE
-		}
-		lo = k
+		vLo = k
 	}
 	if o.plan.HighKey != nil {
-		v, evalE := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
-		if evalE != nil {
-			return nil, nil, false, evalE
+		k, present, kerr := valueKey(o.plan.HighKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
 		}
-		if v.IsNull() {
+		if !present {
 			return nil, nil, false, nil
 		}
-		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
-		if encE != nil {
-			return nil, nil, false, encE
-		}
-		hi = k
+		vHi = k
 	}
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
+	if rangeColumnReversed(o.ctx, o.plan.Index, 0) {
+		vLo, vHi = vHi, vLo
+		loExcl, hiExcl = hiExcl, loExcl
+	}
+	lo, hi = vLo, vHi
+	// Same open-end NULL stop as the index scan (nullStopRangeBound), and
+	// only for a one-sided range: a bound-less index-only scan is a full scan
+	// and keeps every entry.
+	if (vLo == nil) != (vHi == nil) {
+		k, atHigh, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
+		if nerr != nil {
+			return nil, nil, false, nerr
+		}
+		if stop {
+			if atHigh && vHi == nil {
+				hi, hiExcl = k, true
+			} else if !atHigh && vLo == nil {
+				lo, loExcl = k, true
+			}
+		}
+	}
+	o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = loExcl, hiExcl, true
 	return lo, hi, true, nil
 }

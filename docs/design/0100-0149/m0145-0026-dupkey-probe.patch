@@ -1,0 +1,212 @@
+diff --git a/internal/optimizer/createplanjoin.go b/internal/optimizer/createplanjoin.go
+index cc9e01335..a30fd081b 100644
+--- a/internal/optimizer/createplanjoin.go
++++ b/internal/optimizer/createplanjoin.go
+@@ -554,8 +554,10 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
+ 			uint32(p.Rel.Relids)))
+ 	}
+ 
++	zzDupKeyProbe("createHashJoinPlan", p.HashKeys, p.Jointype)
+ 	in := joinInputsFor(p, "PathHashJoin", p.Children[0], p.Children[1])
+ 	pairs := in.keyPairs("PathHashJoin", p.HashKeys)
++	zzDupPairs("lowered-pairs", pairs, fmt.Sprint(p.Jointype))
+ 
+ 	// C-03c: the join the PATH says it performs, not a constant. Stale claim
+ 	// corrected by M0142-0008a-3i-plumbing-c16: this comment used to say
+diff --git a/internal/optimizer/join_hash_keys.go b/internal/optimizer/join_hash_keys.go
+index 06af11e70..ebe5df13d 100644
+--- a/internal/optimizer/join_hash_keys.go
++++ b/internal/optimizer/join_hash_keys.go
+@@ -188,6 +188,7 @@ func fillJoinHashKeysNodes(n Node) {
+ // lesson): they otherwise alias the `Predicate` nodes, and a future pass
+ // that rebinds an index in the predicate would silently move a key.
+ func fillOneJoinHashKeys(j *Join) {
++	zzDupPairs("prefill", j.HashKeys, zzJT(j.Type))
+ 	j.HashKeys = nil
+ 	if j.Algo != JoinAlgoHash && j.Algo != JoinAlgoMerge {
+ 		return
+diff --git a/internal/optimizer/joinrestrict.go b/internal/optimizer/joinrestrict.go
+index e432b1208..941dbe5ce 100644
+--- a/internal/optimizer/joinrestrict.go
++++ b/internal/optimizer/joinrestrict.go
+@@ -165,6 +165,7 @@ func relsSubset(sub, super RelSet) bool { return sub&^super == 0 }
+ // inside the leaf nodes P5.1 wrapped, so admitting them here would let P5.6
+ // charge their selectivity a second time.
+ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *restrictInfoList {
++	zzConjProbe(conjuncts, inferredCount)
+ 	l := &restrictInfoList{}
+ 
+ 	// explicitEnd mirrors buildJoinGraph's split: conjuncts at or after it are
+diff --git a/internal/optimizer/joinsearchseam.go b/internal/optimizer/joinsearchseam.go
+index 016bacb40..42da42dc4 100644
+--- a/internal/optimizer/joinsearchseam.go
++++ b/internal/optimizer/joinsearchseam.go
+@@ -761,7 +761,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
+ 	// radius was 2 keep-assertions adjudicated against PG. Join-order may
+ 	// still not fall — the DP must also CHOOSE PG's order (costing half,
+ 	// K26 §9.2) — but the candidate half is now open.
++	zzSeg("predConjuncts", predConjuncts)
+ 	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
++		zzSeg("synth", synth)
+ 		conjuncts = append(conjuncts, synth...)
+ 	}
+ 	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
+@@ -823,6 +825,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
+ 		// sits on a nullable side (a WHERE conjunct reaching one was held
+ 		// above, and the ON conjuncts are not in the list yet).
+ 		derived := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
++		zzSeg("pre-onOuter", conjuncts)
++		zzSeg("onOuter", onOuter)
++		zzSeg("derived", derived)
+ 		conjuncts = append(conjuncts, onOuter...)
+ 		conjuncts = append(conjuncts, derived...)
+ 	}
+@@ -905,6 +910,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
+ 	// search can now actually visit the synthetic leaf and satisfy relid
+ 	// sets that include it.
+ 	for _, lk := range semiAnti {
++		zzSeg("semiAnti.pred", splitAnd(lk.pred))
+ 		conjuncts = append(conjuncts, splitAnd(lk.pred)...)
+ 		// Step 2: the flattened body's own quals join the same stream —
+ 		// relids ⊆ `rhs` (checked above), so they land either as
+diff --git a/internal/optimizer/pathgen.go b/internal/optimizer/pathgen.go
+index 1f5a4dbdb..31dc5fdb8 100644
+--- a/internal/optimizer/pathgen.go
++++ b/internal/optimizer/pathgen.go
+@@ -76,6 +76,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
+ // Child convention: Children[0] is the probe (outer) side, Children[1] is the
+ // build (inner) side. createPlan reads it to set the executor Join's BuildLeft.
+ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput, uniq uniqueSide, sjinfo *SpecialJoinInfo) {
++	zzDupKeyProbe("addHashJoinPath", keys, jt)
+ 	p, b := probe.CheapestTotal, build.CheapestTotal
+ 	// M0142-0008c-3c: `hash_inner_and_outer`'s own unique-ify substitution
+ 	// (joinpath.c:2301-2341) — JOIN_UNIQUE_OUTER replaces the probe with its
+diff --git a/internal/optimizer/zz_dupkey_probe.go b/internal/optimizer/zz_dupkey_probe.go
+new file mode 100644
+index 000000000..a913a552b
+--- /dev/null
++++ b/internal/optimizer/zz_dupkey_probe.go
+@@ -0,0 +1,123 @@
++package optimizer
++
++// TEMPORARY PROBE (M0145-0026 recon) — not for commit.
++
++import (
++	"fmt"
++	"runtime/debug"
++	"os"
++	"reflect"
++	"strings"
++
++	"github.com/goopg/goopg/internal/parser"
++)
++
++var zzDupKeyOn = os.Getenv("GOOPG_TMP_DUPKEY") == "1"
++
++func zzDeep(b *strings.Builder, v reflect.Value, depth int) {
++	if depth > 25 {
++		b.WriteString("...")
++		return
++	}
++	switch v.Kind() {
++	case reflect.Invalid:
++		b.WriteString("nil")
++	case reflect.Ptr, reflect.Interface:
++		if v.IsNil() {
++			b.WriteString("nil")
++			return
++		}
++		zzDeep(b, v.Elem(), depth+1)
++	case reflect.Struct:
++		b.WriteString(v.Type().Name() + "{")
++		for i := 0; i < v.NumField(); i++ {
++			if v.Type().Field(i).Name == "pos" {
++				continue
++			}
++			zzDeep(b, v.Field(i), depth+1)
++			b.WriteString(",")
++		}
++		b.WriteString("}")
++	case reflect.Slice, reflect.Array:
++		b.WriteString("[")
++		for i := 0; i < v.Len(); i++ {
++			zzDeep(b, v.Index(i), depth+1)
++			b.WriteString(",")
++		}
++		b.WriteString("]")
++	case reflect.Map:
++		b.WriteString("map")
++	default:
++		fmt.Fprintf(b, "%v", v)
++	}
++}
++
++func zzS(e Expr) string { var b strings.Builder; zzDeep(&b, reflect.ValueOf(e), 0); return b.String() }
++
++func zzDupKeyProbe(site string, keys []*restrictInfo, jt parser.JoinType) {
++	if !zzDupKeyOn {
++		return
++	}
++	var ps []JoinKeyPair
++	for _, k := range keys {
++		ps = append(ps, JoinKeyPair{Left: k.leftKey, Right: k.rightKey})
++	}
++	zzDupPairs(site, ps, fmt.Sprint(jt))
++	if len(keys) == 3 && jt == parser.JoinAnti {
++		for i, k := range keys {
++			fmt.Fprintf(os.Stderr, "ZZKEY site=%s i=%d inferred=%v ec=%d relids=%v clause=%p l=%.160s r=%.160s c=%.300s\n", site, i, k.inferred, k.ecID, k.relids, k.clause, zzS(k.leftKey), zzS(k.rightKey), zzS(k.clause))
++		}
++	}
++}
++
++func zzDupPairs(site string, ps []JoinKeyPair, jt string) {
++	if !zzDupKeyOn {
++		return
++	}
++	seen := map[string]int{}
++	for i, p := range ps {
++		k := zzS(p.Left) + "|" + zzS(p.Right)
++		if j, ok := seen[k]; ok {
++			fmt.Fprintf(os.Stderr, "ZZDUP site=%s jt=%s n=%d i=%d j=%d key=%.300s\n", site, jt, len(ps), i, j, k)
++			return
++		}
++		seen[k] = i
++	}
++	if site != "" {
++		fmt.Fprintf(os.Stderr, "ZZOK site=%s jt=%s n=%d\n", site, jt, len(ps))
++	}
++}
++
++func zzJT(t JoinType) string { return fmt.Sprint(t) }
++
++func zzConjProbe(conj []Expr, inferred int) {
++	if !zzDupKeyOn {
++		return
++	}
++	seen := map[string]int{}
++	for i, c := range conj {
++		b, ok := c.(*BinaryOp)
++		if !ok || b.Op != parser.OpEq {
++			continue
++		}
++		fwd, rev := zzS(b.Left)+"="+zzS(b.Right), zzS(b.Right)+"="+zzS(b.Left)
++		if j, ok := seen[rev]; ok && fwd != rev {
++			fmt.Fprintf(os.Stderr, "ZZCONJ n=%d inferred=%d i=%d j=%d samePtr=%v fwd=%.200s\n%s\n", len(conj), inferred, i, j, conj[j] == c, fwd, debug.Stack())
++			return
++		}
++		seen[fwd] = i
++	}
++}
++
++func zzSeg(tag string, cs []Expr) {
++	if !zzDupKeyOn {
++		return
++	}
++	for _, c := range cs {
++		if b, ok := c.(*BinaryOp); ok && b.Op == parser.OpEq {
++			if l, ok := b.Left.(*ColumnRef); ok && strings.Contains(l.Name, "order_number") {
++				fmt.Fprintf(os.Stderr, "ZZSEG %s %s=%s\n", tag, l.Name, zzS(b.Right))
++			}
++		}
++	}
++}

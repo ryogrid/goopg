@@ -6,18 +6,16 @@ package executor
 // can't vectorise (subquery / In / Exists / FuncCall / LIKE / Concat
 // / Mul / Div).
 //
-// This file lands the entry point + eligibility detector as forward-
-// compat infrastructure. The seqScanOp predicate batch path that
-// would *call* this path remains row-at-a-time at M0074 close;
-// wiring it in is M0075 candidate (the win is gated on benchmark
-// evidence that the batch loop beats the per-row dispatch on real
-// queries — Q5 should benefit, but we want measurement first).
+// filterOp is its first production caller for simple non-scan comparisons.
+// seqScanOp still evaluates absorbed predicates row-at-a-time; changing that
+// path requires a separate ordering and partial-deform contract.
 
 import (
 	"errors"
+	"fmt"
 
-	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // evalBinaryBatch evaluates op over parallel left[i] / right[i]
@@ -102,4 +100,71 @@ func canVectoriseExpression(e optimizer.Expr) bool {
 		return canVectoriseExpression(x.Left) && canVectoriseExpression(x.Right)
 	}
 	return false
+}
+
+// batchFilterEligible intentionally admits a smaller set than
+// canVectoriseExpression. The first production caller batches only a single
+// row-dependent comparison whose operands are slots or constants. Constant-only
+// predicates stay on the established per-row path: batching them would snapshot
+// every child row without making their evaluation depend on any row. Compound
+// boolean trees and arithmetic also remain on the per-row path until their
+// error and short-circuit ordering have dedicated coverage.
+func batchFilterEligible(e optimizer.Expr) bool {
+	b, ok := e.(*optimizer.BinaryOp)
+	if !ok {
+		return false
+	}
+	switch b.Op {
+	case parser.OpEq, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe, parser.OpNe:
+		return batchFilterOperandEligible(b.Left) && batchFilterOperandEligible(b.Right) &&
+			(batchFilterColumnOperand(b.Left) || batchFilterColumnOperand(b.Right))
+	}
+	return false
+}
+
+func batchFilterColumnOperand(e optimizer.Expr) bool {
+	_, ok := e.(*optimizer.ColumnRef)
+	return ok
+}
+
+func batchFilterOperandEligible(e optimizer.Expr) bool {
+	switch e.(type) {
+	case *optimizer.ColumnRef, *optimizer.IntegerConst, *optimizer.NumericConst,
+		*optimizer.StringConst, *optimizer.BooleanConst, *optimizer.NullConst:
+		return true
+	}
+	return false
+}
+
+// evalFilterBatch evaluates the deliberately narrow first production batch
+// shape. The caller has already checked batchFilterEligible and owns all three
+// datum buffers, so consecutive batches do not allocate transient operands.
+func evalFilterBatch(pred optimizer.Expr, slots []*MaterializedSlot, ctx *Context, left, right, out []Datum) error {
+	b := pred.(*optimizer.BinaryOp)
+	if len(left) < len(slots) || len(right) < len(slots) || len(out) < len(slots) {
+		return fmt.Errorf("filter batch buffers shorter than slots: left=%d right=%d out=%d slots=%d", len(left), len(right), len(out), len(slots))
+	}
+	left = left[:len(slots)]
+	right = right[:len(slots)]
+	for i, slot := range slots {
+		var err error
+		if left[i], err = evalExprSlot(b.Left, slot, ctx); err != nil {
+			return err
+		}
+		if right[i], err = evalExprSlot(b.Right, slot, ctx); err != nil {
+			return err
+		}
+	}
+	return evalBinaryBatch(b.Op, left, right, out[:len(slots)])
+}
+
+// snapshotBatchSlot copies both the row and the slot identity. Calling
+// Materialize on an arbitrary TupleSlot is insufficient: a producer may reuse
+// the wrapper itself, not just its row buffer.
+func snapshotBatchSlot(slot TupleSlot) *MaterializedSlot {
+	out := SlotFromRow(slot.Schema(), cloneRowOwned(slot.Row()))
+	if block, off, ok := slot.TID(); ok {
+		out.hasCTID, out.ctidBlock, out.ctidOff = true, block, off
+	}
+	return out
 }

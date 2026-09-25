@@ -1057,10 +1057,16 @@ type seqScanOp struct {
 	// Build-time consumer walk proved no consumer reads past it. Stamped by
 	// both Build paths (buildNode / buildRec); 0 means unset and behaves as
 	// full width (the safe default for directly-constructed scans that
-	// bypass both paths, e.g. COPY's scan). scanRow/schema stay full-width —
-	// only the deform window narrows, so bound == len(cols) takes the exact
-	// pre-EX1-01 path. See scan_deform.go.
+	// bypass both paths, e.g. COPY's scan). deformWidthZero means no column
+	// is deformed: the parent consumes none (M0145-0008p). scanRow/schema
+	// stay full-width — only the deform window narrows, so bound ==
+	// len(cols) takes the exact pre-EX1-01 path. See scan_deform.go.
 	deformBound int
+	// borrowRows is set at Build when the parent consumes every row before
+	// the next Next() and retains nothing of it (aggregateBorrowsScanRows):
+	// Next then yields scanRow itself instead of a per-tuple clone
+	// (M0145-0008u).
+	borrowRows bool
 	// scanSlot is the boxed SlotView over scanRow, cached because
 	// converting a slice to an interface heap-allocates
 	// (runtime.convTslice) and scanRow's identity does not change
@@ -1930,6 +1936,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// proceed while the parent operator processes the
 				// yielded slot. Page eviction is still prevented by
 				// the pin alone.
+				//
+				// heap_prepare_pagescan's heap_page_prune_opt: prune the
+				// page on the way in when it is short of space and holds
+				// prunable tuples (M0145-0008t). Ring-buffer pages are
+				// private copies and are not pruned.
+				pruneHeapPageOnAccess(o.ctx, slot, o.tbl, rel, o.curBlock)
 				o.pinned = slot
 				o.activePage = slot.Page()
 			}
@@ -2090,11 +2102,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// previous contents (poisoned at deform time when the debug
 			// flag is armed). The bound always covers the prefilter
 			// prefix: the walk folds the same predicate it derives
-			// MaxCols from.
-			survivorBound := len(o.cols)
-			if o.deformBound > 0 && o.deformBound < survivorBound {
-				survivorBound = o.deformBound
-			}
+			// MaxCols from. A zero-consumer parent (count(*)) stamps
+			// deformWidthZero, and the window is empty (M0145-0008p).
+			survivorBound := seqScanSurvivorWidth(o.deformBound, len(o.cols))
 			// earlyDecided records that the absorbed qual already returned a
 			// verdict for this row at the EARLY position, so the LATE
 			// position must not evaluate it again. At most one VERDICT per
@@ -2232,7 +2242,19 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// must be safe to read after the page becomes writable
 			// to other sessions; a concurrent UPDATE could otherwise
 			// tear the bytes the parent is decoding.
-			row = cloneRowOwned(row)
+			//
+			// M0145-0008f: only the deformed survivor window is detached;
+			// the undeformed tail is stale and never read (EX1-03a).
+			//
+			// M0145-0008u: a parent that consumes each row before its next
+			// Next() and keeps nothing of it (borrowRows) takes the scan's
+			// own row, as PG hands an aggregate a slot over the buffer
+			// (ExecStoreBufferHeapTuple). Datums never alias page bytes
+			// (varlena values live in the scan's per-page arena), so only
+			// the row slice and the arena's page lifetime are shared.
+			if !o.borrowRows {
+				row = cloneRowOwnedPrefix(row, survivorBound)
+			}
 			// Inject KindEnum datums for enum-typed columns (M0097-enum).
 			if len(o.enumTypes) > 0 {
 				for i, et := range o.enumTypes {
@@ -2921,7 +2943,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			// against any SERIALIZABLE reader that holds a covering predicate
 			// lock (page or relation grain), and aborts this INSERT in place
 			// (40001) when it closes a dangerous structure to a committed pivot.
-			if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+			if serr := ssiRecordTupleInsert(o.ctx, targetRel, ptr.Block); serr != nil {
 				return nil, serr
 			}
 			// SSI hash-index bucket conflict-in (design 0118-0099): forms the
@@ -2967,7 +2989,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		}
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
-		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+		if serr := ssiRecordTupleInsert(o.ctx, targetRel, ptr.Block); serr != nil {
 			return nil, serr
 		}
 		// SSI hash-index bucket conflict-in (design 0118-0099): forms the rw-edge
@@ -3644,11 +3666,54 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		}
 		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
 		keys = append(keys, ix.SAOPKeys...)
-		return &optimizer.InExpr{Operand: ref, List: keys}
+		var combined optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
+		// M0145-0029: a SAOP probe's bounds sit on the SECOND index column.
+		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > 1 {
+			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[1])
+			if !ok2 {
+				return nil
+			}
+			if ix.LowKey != nil {
+				op := parser.OpGe
+				if ix.LowOp == parser.OpGt {
+					op = parser.OpGt
+				}
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: &optimizer.BinaryOp{Op: op, Left: ref2, Right: ix.LowKey}}
+			}
+			if ix.HighKey != nil {
+				op := parser.OpLe
+				if ix.HighOp == parser.OpLt {
+					op = parser.OpLt
+				}
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: &optimizer.BinaryOp{Op: op, Left: ref2, Right: ix.HighKey}}
+			}
+		}
+		return combined
 
 	case ix.LowKey != nil || ix.HighKey != nil:
-		col := ix.Index.Columns[0]
+		// M0145-0029 slice 2b: a RangePrefix probe is `Columns[i] =
+		// RangePrefix[i]` for the prefix, with the bounds on the column after
+		// it. The prefix equalities MUST be rebuilt here: the restriction path
+		// dropped them from the Filter above the scan, so a predicate without
+		// them would match (and update/delete) rows outside the probe.
+		np := len(ix.RangePrefix)
+		if np >= len(ix.Index.Columns) {
+			return nil
+		}
+		col := ix.Index.Columns[np]
 		var combined optimizer.Expr
+		for i, key := range ix.RangePrefix {
+			ref, ok := indexScanColumnRef(ix, ix.Index.Columns[i])
+			if !ok {
+				return nil
+			}
+			eq := &optimizer.BinaryOp{Op: parser.OpEq, Left: ref, Right: key}
+			if combined == nil {
+				combined = eq
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: eq}
+			}
+		}
 		if ix.LowKey != nil {
 			ref, ok := indexScanColumnRef(ix, col)
 			if !ok {
@@ -3658,7 +3723,12 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 			if ix.LowOp == parser.OpGt {
 				op = parser.OpGt
 			}
-			combined = &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.LowKey}
+			low := &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.LowKey}
+			if combined == nil {
+				combined = low
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: low}
+			}
 		}
 		if ix.HighKey != nil {
 			ref, ok := indexScanColumnRef(ix, col)
@@ -3741,7 +3811,7 @@ func markHeapPruneOptDirty(
 		return nil
 	}
 	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-		return logPrune(rel, blk, result.Redirects, result.Unused)
+		return logPrune(rel, blk, result.Redirects, result.Dead, result.Unused)
 	})
 }
 
@@ -4358,10 +4428,14 @@ func tryApplyHOTUpdate(
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
-		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
+		// Pruning moves tuple bytes, so it needs the cleanup lock: the
+		// exclusive lock is already held, and the updater's pin must be
+		// the only one (PG IsBufferCleanupOK; M0145-0008q). A page another
+		// scan still has pinned is not pruned; the update leaves HOT.
+		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil && ctx.Pool.IsCleanupOK(s) {
 			oldestXmin := ctx.TxnMgr.OldestXmin()
 			result, pruneErr := storage.PagePruneOpt(s.Page(), oldestXmin)
-			if pruneErr == nil && (len(result.Redirects)+len(result.Unused)) > 0 {
+			if pruneErr == nil && result.Reclaimed() > 0 {
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
@@ -8178,6 +8252,18 @@ func encodeIndexKeyFromCols(ctx *Context, idx *catalog.Index, cols []catalog.Col
 // pointers INTO cols, parallel to vals and to the descriptor attributes
 // buildPGIndexKeyDesc derives from the same idx.Columns order.
 func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
+	return indexRowKeyValuesOpt(idx, cols, row, false, cat...)
+}
+
+// indexRowKeyValuesKeepNull is indexRowKeyValues for an index ENTRY in a
+// cluster with null_keyed_index_entries: a NULL key value is kept (the entry
+// is filed with it, as PG's index_form_tuple does) instead of meaning "no
+// entry". Probes must keep using indexRowKeyValues — NULL never matches.
+func indexRowKeyValuesKeepNull(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
+	return indexRowKeyValuesOpt(idx, cols, row, true, cat...)
+}
+
+func indexRowKeyValuesOpt(idx *catalog.Index, cols []catalog.Column, row Row, keepNull bool, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
 	var im *catalog.InMemory
 	if len(cat) > 0 && cat[0] != nil {
 		im, _ = cat[0].(*catalog.InMemory)
@@ -8199,7 +8285,12 @@ func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat .
 		}
 		v := row[colOrd]
 		if v.IsNull() {
-			return nil, nil, false // NULLs don't participate in unique constraints
+			if !keepNull {
+				return nil, nil, false // NULLs don't participate in unique constraints
+			}
+			keyCols = append(keyCols, col)
+			vals = append(vals, v)
+			continue
 		}
 		// For enum columns: convert KindString labels to KindEnum (sort order)
 		// so encoding matches the btree probe path. M0097-0022.
@@ -8943,17 +9034,22 @@ func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTre
 			return true, nil
 		}
 		slot.RLock()
-		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// The index entry references the update-chain ROOT — a committed
+		// HOT update leaves the live member deeper in the chain, so the
+		// liveness check runs per member (M0143-0010, same defect class as
+		// uniqueCheckWithWait).
+		stop := false
+		eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, _ uint16) bool {
+			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+				liveConflict = true
+				stop = true
+				return false
+			}
+			return true // dead member — try the HOT successor
+		})
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
-		if terr != nil {
-			return true, nil
-		}
-		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-			liveConflict = true
-			return false, nil
-		}
-		return true, nil
+		return !stop, nil
 	})
 	if liveConflict {
 		return &ExecError{
@@ -9011,29 +9107,36 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 				return true, nil
 			}
 			slot.RLock()
-			tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+			// The index entry references the update-chain ROOT: after a
+			// committed HOT update that member is dead while the live row
+			// sits deeper in the same-page chain. Reading only the root let
+			// a duplicate INSERT bypass UNIQUE entirely (M0143-0010), so
+			// each member is checked in chain order.
+			stop := false
+			eachHeapChainMember(slot.Page(), ptr.Offset, func(tuple storage.HeapTuple, mslot uint16) bool {
+				xmin := tuple.Header.Xmin
+				// In-flight other-xact insert: must wait. A sub-XID of our own
+				// transaction tree must never enter this branch (the row is live and
+				// the caller raises 23505 instead), or the wait blocks forever on
+				// goopg's own subtransaction. M0134-0077.
+				if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
+					!xidIsSelf(ctx, xmin) &&
+					ctx.TxnMgr.IsXIDActive(xmin) {
+					inflightXmin = xmin
+					stop = true
+					return false
+				}
+				if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
+					liveConflict = true
+					conflictPtr = storage.ItemPointer{Block: ptr.Block, Offset: mslot}
+					stop = true
+					return false
+				}
+				return true // dead member — try the HOT successor
+			})
 			slot.RUnlock()
 			ctx.Pool.Unpin(slot)
-			if terr != nil {
-				return true, nil
-			}
-			xmin := tuple.Header.Xmin
-			// In-flight other-xact insert: must wait. A sub-XID of our own
-			// transaction tree must never enter this branch (the row is live and
-			// the caller raises 23505 instead), or the wait blocks forever on
-			// goopg's own subtransaction. M0134-0077.
-			if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
-				!xidIsSelf(ctx, xmin) &&
-				ctx.TxnMgr.IsXIDActive(xmin) {
-				inflightXmin = xmin
-				return false, nil
-			}
-			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
-				liveConflict = true
-				conflictPtr = ptr
-				return false, nil
-			}
-			return true, nil
+			return !stop, nil
 		})
 	}
 

@@ -1,0 +1,16 @@
+Step-0 goopg side, TPC-H Q4. From the s2-tree corpus capture
+/tmp/pp2/oc-tpch-s2.txt (Q4 section, lines 83-93), same pinned GUCs
+as the PG side. Archived in-tree with pg-q4.txt because /tmp
+scratch is ephemeral (cf. the Q15a helper loss in the R47 report).
+
+Sort  (cost=1426.77..1426.78 rows=5 width=72)
+  Sort Key: o_orderpriority
+  ->  HashAggregate  (cost=1283.98..1284.03 rows=5 width=72)
+        Group Key: o_orderpriority
+        ->  Nested Loop Semi Join  (cost=0.00..1141.32 rows=57066 width=448)
+              Filter: (l_commitdate < l_receiptdate)
+              Filter: (true)
+              ->  Seq Scan on orders  (cost=0.00..15570.66 rows=57066 width=448)
+                    Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp))
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..0.05 rows=5 width=550)
+                    Index Cond: (l_orderkey = o_orderkey)

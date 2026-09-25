@@ -106,14 +106,13 @@ func TestTwoJoinEstimatorsAgreeOnThePlainEqjoinselShape(t *testing.T) {
 	}
 }
 
-// TestTwoJoinEstimatorsAgreeOnSuperkeyEvidence is the load-bearing one.
+// TestTwoJoinEstimatorsAgreeOnBareUniqueEvidence pins the two coordinate
+// spaces after R88: a bare composite unique key supplies a bound only.
 //
 // Both columns of `partsupp`'s COMPOSITE primary key are equated, so each
 // `lineitem` row matches at most one `partsupp` row and the join cannot fan
-// out. `calcJoinrelSize` (C-05, joinrelsize.go) recognises this: it removes
-// the two clauses and charges one 1/raw-tuples factor, landing on exactly the
-// outer's 6,000,000 rows — PG's `get_foreign_key_join_selectivity` shape
-// applied to unique-index evidence.
+// out. `calcJoinrelSize` recognises that ceiling, but it retains both clauses
+// for ordinary equality selectivity: a bare unique index is not a declared FK.
 //
 // `estimateJoin` reaches the same conclusion through `superkeyJoinEstimate`
 // in joinkeyproof.go — the "mirror" the item wants deleted — and it is
@@ -126,7 +125,7 @@ func TestTwoJoinEstimatorsAgreeOnThePlainEqjoinselShape(t *testing.T) {
 // moment either moves" rather than as two literals, because pinning a literal
 // once already hid a calibration worth 27% of the TPC-H suite. Both sides are
 // expressed through the fixtures' own inputs.
-func TestTwoJoinEstimatorsAgreeOnSuperkeyEvidence(t *testing.T) {
+func TestTwoJoinEstimatorsAgreeOnBareUniqueEvidence(t *testing.T) {
 	c, partsupp, lineitem := jrsCatalog(t)
 	if _, err := c.CreateIndex(parser.ObjectName{Name: "partsupp_pkey"}, partsupp,
 		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
@@ -142,22 +141,11 @@ func TestTwoJoinEstimatorsAgreeOnSuperkeyEvidence(t *testing.T) {
 	searchRows, _ := s.calcJoinrelSize(c, outer, inner, clauses, nil)
 	legacyRows := estimateJoin(twoEstJoin(c, lineitem, partsupp, [][2]int{{0, 0}, {1, 1}}))
 
-	// The search's answer is the no-fan-out one: the outer, unchanged.
-	const outerRows = 6000000.0
-	if searchRows != outerRows {
-		t.Fatalf("calcJoinrelSize=%v, want the outer's %v (C-05's composite "+
-			"unique-key no-fan-out rule)", searchRows, outerRows)
-	}
-
-	// The marginal product is what BOTH estimators exist to avoid: the two
-	// per-column selectivities multiplied independently, which is wrong by
-	// six orders of magnitude on this shape.
+	// Both equalities remain ordinary selectivity; the unique bound is above
+	// this fixture's result and therefore does not change the marginal value.
 	marginal := clampRowEst(6000000.0 * 800000.0 / 200000.0 / 10000.0)
-	if float64(legacyRows) <= marginal {
-		t.Fatalf("estimateJoin=%d has fallen back to the marginal product "+
-			"(%v) — superkeyJoinEstimate is no longer firing, and deleting "+
-			"joinkeyproof.go's proof would now be a silent 6-order regression",
-			legacyRows, marginal)
+	if searchRows != marginal || float64(legacyRows) != marginal {
+		t.Fatalf("bare unique differs: search=%v legacy=%d want ordinary %v", searchRows, legacyRows, marginal)
 	}
 
 	// And the record: today the two are equal on this shape, by two entirely

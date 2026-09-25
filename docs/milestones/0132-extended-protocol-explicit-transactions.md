@@ -2,10 +2,10 @@
 
 **Status:** in-progress
 **Filed:** 2026-08-12 (user directive)
-**Priority placement:** **promoted** (user directive 2026-08-13) — the
-`## Current Priority` banner in `.ralph/fix_plan.md` names M0132 as the
-next-priority milestone after M-NIGHTLY's nightly regression fixes, ahead of
-M0131 and M0130's remaining items.
+**Priority placement:** promoted by user directive of 2026-08-13, then
+completed and archived. **That ranking is historical — since 2026-09-14 the
+`## Current Priority` banner in `.ralph/fix_plan.md` ranks the plan-parity group
+M0137–M0143 first.**
 **Reference plan:** `.ralph/fix_plan.md` (M0132 section, at the foot of the file)
 **Implementation plan (authoritative task decomposition):**
 `docs/design/0132-extended-protocol-explicit-transactions.md`

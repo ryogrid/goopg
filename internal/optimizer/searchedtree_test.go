@@ -135,6 +135,85 @@ func TestMarkSearchedTreeRefusesAnUntaggableRoot(t *testing.T) {
 // pins — is still the oracle `assertSearchedTreeNeedsNoReconcile` runs on
 // every searched plan.
 
+// TestSearchedJoinInputRelOfDescendsOnlyThroughPassThroughs pins the R54
+// restricted accessor's contract: it finds the search rel through the
+// measured Sort(Project(Join)) wrapper family and every other
+// row-preserving pass-through, and returns nil at anything that can change
+// the row count between the search rel and the aggregate — where a wrong
+// scope's rows would silently seed the outer aggregate. The stop list is the
+// point: each entry is a shape `searchedRelOf` would walk through via
+// `boundaryWalkChildren` and this accessor must not.
+func TestSearchedJoinInputRelOfDescendsOnlyThroughPassThroughs(t *testing.T) {
+	rel := fetchUpperRel(newUpperRels(), UpperGroupAgg, 0, 0)
+	rel.Rows = 1834
+	marked := func() Node {
+		s := &SeqScan{schema: cpjSchema("a", 2)}
+		markSearchedTree(s)
+		s.setSearchRel(rel)
+		return s
+	}
+
+	passThroughs := map[string]func(Node) Node{
+		"bare":               func(n Node) Node { return n },
+		"Project":            func(n Node) Node { return &Project{Child: n} },
+		"Sort(Project)":      func(n Node) Node { return &Sort{Child: &Project{Child: n}} },
+		"Gather":             func(n Node) Node { return &Gather{Child: n} },
+		"GatherMerge":        func(n Node) Node { return &GatherMerge{Child: n} },
+		"OrdinalityWrap":     func(n Node) Node { return &OrdinalityWrap{Child: n} },
+		"LockRows":           func(n Node) Node { return &LockRows{Child: n} },
+		"Memoize(IndexScan)": func(n Node) Node { return n },
+	}
+	// Memoize carries a typed *IndexScan child, so it needs its own marked
+	// root rather than the shared SeqScan one.
+	midx := &IndexScan{}
+	markSearchedTree(midx)
+	midx.setSearchRel(rel)
+	passThroughs["Memoize(IndexScan)"] = func(n Node) Node { return &Memoize{Child: midx} }
+
+	for name, wrap := range passThroughs {
+		if got := searchedJoinInputRelOf(wrap(marked())); got != rel {
+			t.Errorf("%s: got rel %v, want the searched rel", name, got)
+		}
+	}
+
+	cappedLimit, cappedOffset := &ColumnRef{}, &ColumnRef{}
+	deep := marked()
+	for i := 0; i < 40; i++ {
+		deep = &Project{Child: deep}
+	}
+	stops := map[string]Node{
+		"nil":               nil,
+		"unmarked":          &SeqScan{schema: cpjSchema("a", 2)},
+		"marked-nil-rel":    mustMarkWithoutRel(t),
+		"Aggregate":         &Aggregate{Child: marked()},
+		"WindowAgg":         &WindowAgg{Child: marked()},
+		"Distinct":          &Distinct{Child: marked()},
+		"DistinctOn":        &DistinctOn{Child: marked()},
+		"Filter":            &Filter{Child: marked()},
+		"Limit":             &Limit{Child: marked()},
+		"SetOp":             &SetOp{Left: marked(), Right: marked()},
+		"Join":              &Join{Left: marked(), Right: marked()},
+		"LockRows-capped":   &LockRows{Child: marked(), LimitCount: cappedLimit},
+		"LockRows-offset":   &LockRows{Child: marked(), OffsetCount: cappedOffset},
+		"Memoize-nil-child": &Memoize{},
+		"40-deep":           deep,
+	}
+	for name, n := range stops {
+		if got := searchedJoinInputRelOf(n); got != nil {
+			t.Errorf("%s: got rel rows=%v, want nil (descent must stop here)", name, got.Rows)
+		}
+	}
+}
+
+// mustMarkWithoutRel marks a carrier without stamping a rel: the accessor
+// returns the rel, not the tag, so a marked root with nothing stamped reads
+// as absent (fail-closed) rather than panicking.
+func mustMarkWithoutRel(t *testing.T) Node {
+	t.Helper()
+	s := &SeqScan{schema: cpjSchema("a", 2)}
+	return markSearchedTree(s)
+}
+
 // TestReconcileNLILayoutSkipsASearchedTree: the skip has to be observable, not
 // just asserted. A join key is deliberately left pointing at a column whose
 // name lives elsewhere; `reresolveJoinByName` would move it, and on a searched

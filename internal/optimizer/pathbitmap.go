@@ -152,6 +152,12 @@ func (s *searchCtx) buildOneBitmapPath(
 	if len(indexClauses) == 0 && partialPredicate == nil {
 		return nil
 	}
+	// The heap recheck cannot restore rows the index never yields: goopg
+	// stores no index entry whose key has a NULL column, so a key column the
+	// clauses leave unbound must be NOT NULL (indexUnboundKeysNotNull).
+	if !indexUnboundKeysNotNull(tbl, idx, boundIndexColumns(indexClauses)) {
+		return nil
+	}
 
 	// Index geometry — same as the regular index scan cost model.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
@@ -166,6 +172,11 @@ func (s *searchCtx) buildOneBitmapPath(
 		selectivity:     selectivity,
 		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
+		// R1 (plan-parity-fix-take2): PG's cost_bitmap_heap_scan charges
+		// "the full freight for all the scan clauses" (assume-rechecked-
+		// always), so every local conjunct counts — not minus
+		// index-satisfied ones.
+		numQualOps: localQualOpCount(leaf),
 	}
 	tuplesFetched := clampRowEst(selectivity * relTuples)
 
@@ -175,8 +186,10 @@ func (s *searchCtx) buildOneBitmapPath(
 	// Compute how many distinct heap pages the bitmap visits.
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
 
-	// Total cost: index access (startup) + heap fetch (run).
-	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T)
+	// Total cost: index access (startup) + heap fetch (run). R1
+	// (plan-parity-fix-take2): the heap side rechecks every local
+	// conjunct, so the count is the leaf's full conjunct list.
+	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, localQualOpCount(leaf))
 
 	// Build the bitmap index path (the child of the heap scan).
 	bitmapIdxPath := &Path{
@@ -278,6 +291,16 @@ func matchBitmapIndexQuals(
 	var clauses []indexPathClause
 
 	for pos, colName := range idx.Columns {
+		// The bound columns must be a GAPLESS leading prefix: the probe binds
+		// Keys[i] to Index.Columns[i] positionally, and createBitmapIndexScanPlan
+		// panics on a list that skips a column ("claims index column 2"). An
+		// equality on a later column with an earlier one unbound is not an
+		// index qual here (PG 18 would use a btree skip scan, which goopg's
+		// probe cannot express — ledgered). M0145-0029: reached on the
+		// jointree arm, where single-relation scopes plan through the search.
+		if len(clauses) < pos {
+			break
+		}
 		for _, conj := range conjuncts {
 			bin, ok := conj.(*BinaryOp)
 			if !ok || bin.Op != parser.OpEq {
@@ -387,7 +410,7 @@ func (s *searchCtx) chooseBitmapAnd(
 			coveredCols[col] = true
 		}
 		indexPages := indexPagesForPath(paths[i], tbl, relTuples)
-		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries)
+		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries, relQualOpCount(rel))
 
 		for j := i + 1; j < len(paths); j++ {
 			// Redundancy check: skip if the candidate index shares ANY
@@ -416,7 +439,7 @@ func (s *searchCtx) chooseBitmapAnd(
 				ip, _, _ := estimateIndexGeometry(inner.IndexInfo, tbl, relTuples)
 				andIP += ip
 			}
-			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries)
+			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
 
 			if newCost.Total < curCost.Total {
 				// Cheaper — keep the candidate.
@@ -461,7 +484,7 @@ func (s *searchCtx) chooseBitmapAnd(
 	tuplesFetched := clampRowEst(andSelec * relTuples)
 	andIP := indexPagesForPath(bitmapAndPath, tbl, relTuples)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
-	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T)
+	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel))
 
 	return &Path{
 		Kind:     PathBitmapHeapScan,
@@ -571,6 +594,10 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	if len(clauses) == 0 {
 		return nil
 	}
+	// Same NULL-key rule as the unparameterised bitmap and index producers.
+	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
+		return nil
+	}
 	sel = clampSelectivity(sel)
 	tuplesFetched := clampRowEst(sel * relTuples)
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
@@ -594,7 +621,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
 		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
-		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T),
+		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel)),
 		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
 		// top of the index child's count.
 		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, child),

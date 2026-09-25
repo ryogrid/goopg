@@ -1,0 +1,3 @@
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 52   current: 52
+EA-RATCHET: PASS

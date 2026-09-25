@@ -36,32 +36,13 @@ func init() {
 	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
 	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
 	indexKeyHarvestOn.Store(indexKeyHarvestFromEnv(os.Getenv("GOOPG_INDEXKEY_HARVEST")))
-	// S5a (D3.1): run sublink pull-up BEFORE join-order search so
-	// decorrelated semi/anti joins pin above the DP result and their
-	// sunk residual conjuncts participate in join search. Default ON;
-	// GOOPG_UNNEST_PREDP=off restores the historical post-DP position
-	// (field rollback — the legacy call site is kept intact behind
-	// this flag).
-	unnestPreDPOn.Store(unnestPreDPFromEnv(os.Getenv("GOOPG_UNNEST_PREDP")))
 }
 
-// indexKeyHarvestFromEnv / unnestPreDPFromEnv are the two kill-switches'
-// polarities, factored out of init so the provenance table (flaglabels.go) can
-// render their unset defaults from the same functions production resolves them
-// with; see memoizeFromEnv.
+// indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
+// so the provenance table (flaglabels.go) can render its unset default from
+// the same function production resolves it with; see memoizeFromEnv. (Its
+// sibling GOOPG_UNNEST_PREDP retired with the S5a pre-DP route, M0145-0008.)
 func indexKeyHarvestFromEnv(v string) bool { return v != "off" }
-func unnestPreDPFromEnv(v string) bool     { return v != "off" }
-
-// unnestPreDPOn gates the S5a pipeline reorder (pull-up before join
-// search). See init above and runJoinSearchBelowPinned in predp.go.
-var unnestPreDPOn atomic.Bool
-
-// SetUnnestPreDPEnabled flips the S5a pre-DP pull-up position. Test
-// hook, mirroring SetIndexKeyHarvestEnabled.
-func SetUnnestPreDPEnabled(on bool) { unnestPreDPOn.Store(on) }
-
-// unnestPreDPEnabled reports whether pull-up runs before join search.
-func unnestPreDPEnabled() bool { return unnestPreDPOn.Load() }
 
 // SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
 // Test-only API, mirroring SetNLIEnabled: there is deliberately no
@@ -1141,6 +1122,47 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.HighKey != nil {
 			walkExprTree(n.HighKey, visit)
 		}
+		// M0145-0029 slice 2b: the equality prefix of a range probe.
+		for _, k := range n.RangePrefix {
+			walkExprTree(k, visit)
+		}
+		// R33 (K44): the residual filter can host sublinks (a sublink
+		// in an indexqual-adjacent predicate); NodeSubplans already
+		// enumerates it (walk_export.go), and an unvisited Cond hides
+		// both outer refs (planHasOuterRef → IsNonCorrelated) and
+		// parallel-pass sublink discovery.
+		if n.Cond != nil {
+			walkExprTree(n.Cond, visit)
+		}
+	case *IndexOnlyScan:
+		// R33 (K44): mirrors NodeSubplans (walk_export.go); without
+		// this arm the walker skips the node's entire subtree.
+		if n.Key != nil {
+			walkExprTree(n.Key, visit)
+		}
+		for _, k := range n.Keys {
+			walkExprTree(k, visit)
+		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
+		}
+		if n.Cond != nil {
+			walkExprTree(n.Cond, visit)
+		}
+	case *Result:
+		// R33 (K44): the S6 min/max InitPlan hangs in Result.Targets
+		// (plan.go:1557); mirrors NodeSubplans. Child recursion keeps
+		// the subtree walk complete.
+		walkPlanExprs(n.Child, visit)
+		for _, t := range n.Targets {
+			walkExprTree(t, visit)
+		}
+		if n.OneTimeFilter != nil {
+			walkExprTree(n.OneTimeFilter, visit)
+		}
 	// The bitmap family (M0134-0185). These arms are CORRECTNESS, not
 	// coverage hygiene: `planHasOuterRef` rides this walker to compute
 	// `IsNonCorrelated`, and a correlated probe key inside a
@@ -1687,6 +1709,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			if n.HighKey != nil {
 				c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
 			}
+			if len(n.RangePrefix) > 0 {
+				c.RangePrefix = make([]Expr, len(n.RangePrefix))
+				for i, k := range n.RangePrefix {
+					c.RangePrefix[i] = cloneExprReplacingOuter(k, replace)
+				}
+			}
 			return &c, nil
 		}
 		seq := &SeqScan{
@@ -1732,14 +1760,31 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
 			}
 		}
+		// M0145-0029 slice 2b: a RangePrefix probe's equalities, with its
+		// bounds on the column after the prefix; strict bounds keep their
+		// strictness (LowOp/HighOp).
+		for i, k := range n.RangePrefix {
+			if col := indexColRef(i); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
+			}
+		}
+		boundCol := len(n.RangePrefix)
 		if n.LowKey != nil {
-			if col := indexColRef(0); col != nil {
-				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpGe, Left: col, Right: cloneExprReplacingOuter(n.LowKey, replace)})
+			if col := indexColRef(boundCol); col != nil {
+				op := parser.OpGe
+				if n.LowOp == parser.OpGt {
+					op = parser.OpGt
+				}
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: op, Left: col, Right: cloneExprReplacingOuter(n.LowKey, replace)})
 			}
 		}
 		if n.HighKey != nil {
-			if col := indexColRef(0); col != nil {
-				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpLe, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
+			if col := indexColRef(boundCol); col != nil {
+				op := parser.OpLe
+				if n.HighOp == parser.OpLt {
+					op = parser.OpLt
+				}
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: op, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
 			}
 		}
 		if len(conds) > 0 {
@@ -1924,9 +1969,294 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		// with no body to rewrite, so the copy is unconditional.
 		c := *n
 		return &c, nil
+	case *Gather:
+		// M0140-0003: under `GOOPG_GATHER_PATHS`, the subquery's own inner
+		// plan can win a partial path on one of its base rels and come back
+		// from `Plan()` with a `Gather` sitting inside it — this cloner's
+		// node-kind list had never needed one before, the same gap R11 (see
+		// `createplanroot.go`'s `boundaryWalkChildren`) and D3.0's NLI arm
+		// above each hit once already. Without this arm every scalar/EXISTS
+		// subquery whose inner plan happened to admit a partial path failed
+		// this clone, the caller's swallowed error left the sublink a
+		// per-outer-row SubPlan, and TPC-H Q2's decorrelation silently
+		// declined the moment its 4-table inner join won a partial path. A
+		// `Gather` carries no probe key of its own — it is a pure pass-
+		// through — so recursing into `Child` is enough; any harvested
+		// correlation living on a scan beneath it is still reached by the
+		// existing `*IndexScan`/`*BitmapHeapScan` arms.
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		g := *n
+		g.Child = child
+		return &g, nil
+	case *GatherMerge:
+		// Sibling of the *Gather arm immediately above — same pass-through,
+		// same reason.
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		g := *n
+		g.Child = child
+		return &g, nil
 	default:
 		return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "clonePlanReplacingOuter: unsupported plan node"}
 	}
+}
+
+// remapSourceTableIdx shifts the SourceTableIdx of every schema column and
+// embedded ColumnRef in node's own subtree by offset, without mutating node
+// (same copy-on-write discipline as clonePlanReplacingOuter). It exists for
+// exactly the node-kind universe clonePlanReplacingOuter produces —
+// unnestExistsExpr's `innerPlan` — and must be extended alongside that
+// function's case set if it ever grows.
+//
+// Why this is needed (M0142-0008d/0008e, design doc §9): explainNames' bySrc
+// map keys a relation's printed alias by the RAW SourceTableIdx a scan's OWN
+// schema carries. unnestExistsExpr splices innerPlan into the outer tree as
+// an ordinary join child, so once the outer and (former) EXISTS-body trees
+// are walked together by one EXPLAIN pass, any scan whose SourceTableIdx
+// happens to collide with an outer-tree scan's value — and SourceTableIdx
+// restarts at 1 per query level, so "first table in its own FROM list"
+// collides constantly — has its printed alias overwritten by whichever scan
+// collect() visits second (e.g. `cs1.x = cs1.x` instead of `cs1.x = cs2.x`).
+// Shifting every inner-tree value by an offset larger than anything the
+// outer tree uses makes that collision structurally impossible. Execution is
+// unaffected either way: SourceTableIdx is read only by the EXPLAIN naming
+// pass, never by evaluation (which is Index-based).
+//
+// OuterColumnRef is deliberately left untouched: by the time this runs,
+// every in-scope correlation has already been harvested into a plain
+// ColumnRef by clonePlanReplacingOuter, and a genuine OuterColumnRef still
+// present here names a FURTHER-out query level with its own independent
+// numbering, not this level's collision space.
+//
+// Scan-node probe/residual expressions (IndexScan.Key/Keys/LowKey/HighKey/
+// Cond, BitmapIndexScan.Key/Keys/Pred, BitmapHeapScan.Cond/BitmapQual) are
+// deliberately NOT remapped: PostgreSQL's varprefix=false rule for scan
+// quals means they always render unqualified regardless of SourceTableIdx
+// (confirmed by M0142-0008d's repro), so their SourceTableIdx going stale is
+// inert for display — remapping them would only add case-set surface beyond
+// clonePlanReplacingOuter's own precedent for no visible effect.
+func remapSourceTableIdx(node Node, offset int16) (Node, error) {
+	if node == nil {
+		return nil, nil
+	}
+	remapSchema := func(s Schema) Schema {
+		if len(s) == 0 {
+			return s
+		}
+		out := make(Schema, len(s))
+		for i, c := range s {
+			out[i] = c
+			out[i].SourceTableIdx += offset
+		}
+		return out
+	}
+	remapExpr := func(e Expr) (Expr, error) { return remapExprSourceTableIdx(e, offset) }
+	remapKeys := func(keys []SortKey) ([]SortKey, error) {
+		if len(keys) == 0 {
+			return keys, nil
+		}
+		out := make([]SortKey, len(keys))
+		for i, k := range keys {
+			ke, err := remapExpr(k.Expr)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = SortKey{Expr: ke, Desc: k.Desc, NullsFirst: k.NullsFirst}
+		}
+		return out, nil
+	}
+	var err error
+	switch n := node.(type) {
+	case *Join:
+		jn := *n
+		if jn.Left, err = remapSourceTableIdx(n.Left, offset); err != nil {
+			return nil, err
+		}
+		if jn.Right, err = remapSourceTableIdx(n.Right, offset); err != nil {
+			return nil, err
+		}
+		if jn.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		if jn.LeftKey, err = remapExpr(n.LeftKey); err != nil {
+			return nil, err
+		}
+		if jn.RightKey, err = remapExpr(n.RightKey); err != nil {
+			return nil, err
+		}
+		jn.schema = remapSchema(n.schema)
+		return &jn, nil
+	case *NestedLoopIndexJoin:
+		nl := *n
+		if nl.Outer, err = remapSourceTableIdx(n.Outer, offset); err != nil {
+			return nil, err
+		}
+		if nl.Inner, err = remapSourceTableIdx(n.Inner, offset); err != nil {
+			return nil, err
+		}
+		if nl.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		nl.schema = remapSchema(n.schema)
+		// InnerMemo.Child aliases the pre-remap Inner (same reasoning as
+		// clonePlanReplacingOuter's identical arm) — drop it rather than
+		// point the cache at a scan the remap replaced.
+		nl.InnerMemo = nil
+		return &nl, nil
+	case *Filter:
+		f := *n
+		if f.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if f.Predicate, err = remapExpr(n.Predicate); err != nil {
+			return nil, err
+		}
+		return &f, nil
+	case *Project:
+		p := *n
+		if p.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		p.schema = remapSchema(n.schema)
+		p.Targets = make([]Expr, len(n.Targets))
+		for i, t := range n.Targets {
+			if p.Targets[i], err = remapExpr(t); err != nil {
+				return nil, err
+			}
+		}
+		return &p, nil
+	case *Aggregate:
+		a := *n
+		if a.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		a.schema = remapSchema(n.schema)
+		a.GroupExprs = make([]Expr, len(n.GroupExprs))
+		for i, g := range n.GroupExprs {
+			if a.GroupExprs[i], err = remapExpr(g); err != nil {
+				return nil, err
+			}
+		}
+		a.Aggs = make([]AggregateCall, len(n.Aggs))
+		for i, ag := range n.Aggs {
+			a.Aggs[i] = ag
+			if a.Aggs[i].Arg, err = remapExpr(ag.Arg); err != nil {
+				return nil, err
+			}
+			if a.Aggs[i].Arg2, err = remapExpr(ag.Arg2); err != nil {
+				return nil, err
+			}
+			if len(ag.ExtraArgs) > 0 {
+				a.Aggs[i].ExtraArgs = make([]Expr, len(ag.ExtraArgs))
+				for j, ea := range ag.ExtraArgs {
+					if a.Aggs[i].ExtraArgs[j], err = remapExpr(ea); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+		return &a, nil
+	case *Sort:
+		s := *n
+		if s.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if s.Keys, err = remapKeys(n.Keys); err != nil {
+			return nil, err
+		}
+		return &s, nil
+	case *Limit:
+		l := *n
+		if l.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if l.Limit, err = remapExpr(n.Limit); err != nil {
+			return nil, err
+		}
+		if l.Offset, err = remapExpr(n.Offset); err != nil {
+			return nil, err
+		}
+		return &l, nil
+	case *SeqScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *IndexScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *BitmapHeapScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *Values:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		c.Rows = make([][]Expr, len(n.Rows))
+		for i, row := range n.Rows {
+			c.Rows[i] = make([]Expr, len(row))
+			for j, e := range row {
+				if c.Rows[i][j], err = remapExpr(e); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return &c, nil
+	case *CTEScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *MaterializedCTEScan:
+		c := *n
+		c.schema = remapSchema(n.schema)
+		return &c, nil
+	case *Gather:
+		g := *n
+		if g.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		g.schema = remapSchema(n.schema)
+		return &g, nil
+	case *GatherMerge:
+		g := *n
+		if g.Child, err = remapSourceTableIdx(n.Child, offset); err != nil {
+			return nil, err
+		}
+		if g.Keys, err = remapKeys(n.Keys); err != nil {
+			return nil, err
+		}
+		g.schema = remapSchema(n.schema)
+		return &g, nil
+	default:
+		return nil, &PlanError{Pos: node.Pos(), Code: "XX000", Message: "remapSourceTableIdx: unsupported plan node"}
+	}
+}
+
+// remapExprSourceTableIdx clones e with every ColumnRef's SourceTableIdx
+// shifted by offset. Built on the exhaustive CloneExprReplacingColumnRefs
+// walker (exprwalk.go) rather than a hand-written type switch, so a new Expr
+// kind is covered automatically instead of silently passing through
+// unremapped (the RC-1a defect class exprwalk.go exists to kill).
+// OuterColumnRef is a distinct type from ColumnRef and is never touched —
+// see remapSourceTableIdx's doc comment for why that is correct here.
+func remapExprSourceTableIdx(e Expr, offset int16) (Expr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	out, ok := CloneExprReplacingColumnRefs(e, func(c *ColumnRef) Expr {
+		cl := *c
+		cl.SourceTableIdx += offset
+		return &cl
+	})
+	if !ok {
+		return nil, &PlanError{Pos: e.Pos(), Code: "XX000", Message: "remapSourceTableIdx: unenumerated expr type"}
+	}
+	return out, nil
 }
 
 func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Expr {
@@ -2875,6 +3205,16 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	if !inExprIsPlainEquality(in) {
 		return false
 	}
+	// M0146-0002c: NOT IN is never unnested, as in PG. It is `<> ALL`, an
+	// ALL_SUBLINK, and pull_up_sublinks_qual_recurse converts ANY_SUBLINK and
+	// EXISTS_SUBLINK only (prepjointree.c:665/731), so PG keeps it a
+	// `(hashed SubPlan)` filter on the scan. The anti join goopg used to build
+	// was value-correct (null-aware) but put the join outside the search.
+	// `NOT (x IN (...))` is declined the same way where the flip is visible
+	// (effNegated in unnestInExpr / unnestNonCorrelatedInExpr).
+	if in.Negated {
+		return false
+	}
 	// M0069-0005: non-correlated IN — the inner plan has zero
 	// OuterColumnRefs and the outer key is the IN's left operand
 	// (`x IN (SELECT y FROM ...)` becomes a SemiJoin on x = y).
@@ -3046,6 +3386,12 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	effNegated := in.Negated != negateFlip
+	if effNegated {
+		// M0146-0002c: `NOT (x IN (...))` is PG's NOT over an ANY_SUBLINK,
+		// which pull_up_sublinks leaves a SubPlan (it converts only
+		// `NOT EXISTS` under a NOT) — see canUnnestInExprDepth.
+		return nil, nil
+	}
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -3098,9 +3444,54 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		SourceTableIdx: 0, // inner output column; no outer source identity
 	}
 
+	// M0142-0008a-3i-route-a step 2: when the retained parser body is
+	// simple AND the inner plan decomposes into scan leaves + body quals
+	// with a recoverable single target, the RHS flattens. The probe's
+	// right operand then is the body's TARGET expression re-based into
+	// merged (outer ++ inner) coordinates — not the positional
+	// `outerWidth + 0` column, which only names the projected output of
+	// the opaque inner plan. liftResidualConjunctsWithOffset gives the
+	// same rebase the residual quals get (inner col → outerWidth + idx,
+	// OuterColumnRef → outer column).
+	//
+	// The decompose's `body` return replaces innerPlan itself: the target
+	// Project comes off and an IsolatedScope positional-identity re-wrap
+	// (flatBodyScopeProject) goes on, so the right row the executor pads
+	// and the leaves the seam splices are the SAME leaf-concat shape —
+	// making the lifted target operand valid for the executor's RightKey
+	// AND for the seam's folded equality in one convention — while the
+	// wrapper keeps the NLI/pushdown protections the original project
+	// carried. remapSourceTableIdx then applies the EXISTS path's
+	// collision rule (M0142-0008e) to the spliced leaves; srcTableOffset
+	// stays 0 whenever flattening fails, so the residual lift below is
+	// unchanged for the opaque path.
+	var rightOperand Expr = innerKey
+	flattenedRHS := false
+	var srcTableOffset int16
+	var flatTarget Expr
+	if in.Subquery != nil && sublinkBodyIsSimple(in.Subquery) {
+		if _, _, tgt, flatBody, okFlat := decomposeFlatBodyTree(innerPlan, true); okFlat && tgt != nil {
+			off := int16(1)
+			if m := maxSourceTableIdxDeep(outerChild); m >= off {
+				off = m + 1
+			}
+			if remapped, errR := remapSourceTableIdx(flatBody, off); errR == nil {
+				if shifted := liftResidualConjunctsWithOffset([]Expr{tgt}, nil, outerChild.Output(), outerWidth, off); shifted != nil {
+					flattenedRHS = true
+					rightOperand = shifted
+					flatTarget = tgt
+					innerPlan = flatBodyScopeProject(remapped)
+					srcTableOffset = off
+				}
+			}
+		}
+	}
+
 	// Mark the root Project of the inner plan as IsolatedScope so the NLI
 	// rewriter does not convert the SemiJoin into an NLI (mirrors the
-	// non-correlated path; M0071-0002).
+	// non-correlated path; M0071-0002). The flattened arm's
+	// flatBodyScopeProject wrapper is already IsolatedScope — re-marking
+	// it is a no-op; the guard exists for the opaque path.
 	if proj, ok := innerPlan.(*Project); ok {
 		proj.IsolatedScope = true
 	}
@@ -3122,10 +3513,14 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		filter.Predicate = combineAnd(newConjuncts)
 	}
 
-	var semiPred Expr = &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKeyExpr, Right: innerKey}
+	var semiPred Expr = &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKeyExpr, Right: rightOperand}
 	// S4a (D3.2): AND the lifted residual conjuncts onto the join
 	// predicate, exactly the EXISTS mechanism (shared rewriter).
-	if resid := liftResidualConjuncts(eup.Residuals, nil, outerChild.Output(), outerWidth); resid != nil {
+	// srcTableOffset is 0 for the opaque path (identical to
+	// liftResidualConjuncts); when the RHS flattened, the inner refs in
+	// the residuals must carry the same shifted SourceTableIdx the
+	// remapped leaves do (M0142-0008e).
+	if resid := liftResidualConjunctsWithOffset(eup.Residuals, nil, outerChild.Output(), outerWidth, srcTableOffset); resid != nil {
 		semiPred = &BinaryOp{pos: in.Pos(), Op: parser.OpAnd, Left: semiPred, Right: resid}
 	}
 	joinType := JoinTypeSemi
@@ -3133,16 +3528,60 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		joinType = JoinTypeAnti
 	}
 	_ = innerWidth
+	// M0142-0008-producer: carry the SJInfo the seam walk needs to expose
+	// this pinned semi/anti join's RHS as a DP-search participant — the
+	// same producer existsUnnestSJInfo is for the EXISTS path. The RHS
+	// operands of the join's equality conjuncts are the params' inner
+	// columns (the IN testexpr itself is params[0] when correlated), or
+	// the inner plan's output column for the operand-keyed (params==0)
+	// shape. The IN path does not remapSourceTableIdx for the opaque
+	// shape, so srcTableOffset is 0 there; a flattened RHS is remapped
+	// and its entries carry the offset.
+	var semiRhs []Expr
+	if flattenedRHS && flatTarget != nil {
+		// Step 2: for a flattened RHS the uniqueification target is the
+		// body's own comparison expression in leaf-concat coordinates
+		// (innerShift 0) carrying the leaves' shifted SourceTableIdx — the
+		// same operand the folded equality uses, in the RHS's own space,
+		// and the ONLY entry: uniqueifying on the correlation columns too
+		// would deduplicate more aggressively than PG's semijoin RHS.
+		if tgtShifted := liftResidualConjunctsWithOffset([]Expr{flatTarget}, nil, nil, 0, srcTableOffset); tgtShifted != nil {
+			semiRhs = []Expr{tgtShifted}
+		}
+	} else {
+		for _, prm := range params {
+			semiRhs = append(semiRhs, &ColumnRef{
+				pos:            prm.SubCol.Pos(),
+				Index:          prm.SubCol.Index,
+				Name:           prm.SubCol.Name,
+				Type:           prm.SubCol.Type,
+				SourceTableIdx: prm.SubCol.SourceTableIdx + srcTableOffset,
+			})
+		}
+	}
+	if len(semiRhs) == 0 {
+		if out := innerPlan.Output(); len(out) > 0 {
+			semiRhs = append(semiRhs, &ColumnRef{
+				pos:            innerPos,
+				Index:          0,
+				Name:           out[0].Name,
+				Type:           out[0].Type,
+				SourceTableIdx: out[0].SourceTableIdx,
+			})
+		}
+	}
 	join := &Join{
-		pos:       in.Pos(),
-		Type:      joinType,
-		Algo:      JoinAlgoHash,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: semiPred,
-		LeftKey:   outerKeyExpr,
-		RightKey:  innerKey,
-		schema:    append(Schema(nil), outerChild.Output()...),
+		pos:          in.Pos(),
+		Type:         joinType,
+		Algo:         JoinAlgoHash,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    semiPred,
+		LeftKey:      outerKeyExpr,
+		RightKey:     rightOperand,
+		SJInfo:       inUnnestSJInfo(joinType, semiRhs, true),
+		schema:       append(Schema(nil), outerChild.Output()...),
+		FlattenedRHS: flattenedRHS,
 	}
 	filter.Child = join
 	return outer, nil
@@ -3210,6 +3649,12 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	effNegated := in.Negated != negateFlip
+	if effNegated {
+		// M0146-0002c: `NOT (x IN (...))` is PG's NOT over an ANY_SUBLINK,
+		// which pull_up_sublinks leaves a SubPlan (it converts only
+		// `NOT EXISTS` under a NOT) — see canUnnestInExprDepth.
+		return nil, nil
+	}
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -3217,6 +3662,37 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 
 	// Re-index inner key into the merged (outer ++ inner) coord.
 	innerKey.Index = outerWidth
+
+	// M0142-0008a-3i-route-a step 2: same flattening arm as the
+	// correlated path — a simple body whose plan decomposes into scan
+	// leaves with a recoverable single target flattens, the target
+	// Project is stripped and an IsolatedScope positional-identity
+	// re-wrap (flatBodyScopeProject) replaces it so the executor's right
+	// row and the seam's spliced leaves share the leaf-concat convention
+	// without losing the project's NLI/pushdown protections, and the
+	// probe's right operand becomes the target expression re-based into
+	// merged (outer ++ inner) coordinates.
+	var rightOperand Expr = innerKey
+	flattenedRHS := false
+	var srcTableOffset int16
+	var flatTarget Expr
+	if in.Subquery != nil && sublinkBodyIsSimple(in.Subquery) {
+		if _, _, tgt, flatBody, okFlat := decomposeFlatBodyTree(innerPlan, true); okFlat && tgt != nil {
+			off := int16(1)
+			if m := maxSourceTableIdxDeep(outerChild); m >= off {
+				off = m + 1
+			}
+			if remapped, errR := remapSourceTableIdx(flatBody, off); errR == nil {
+				if shifted := liftResidualConjunctsWithOffset([]Expr{tgt}, nil, outerChild.Output(), outerWidth, off); shifted != nil {
+					flattenedRHS = true
+					rightOperand = shifted
+					flatTarget = tgt
+					innerPlan = flatBodyScopeProject(remapped)
+					srcTableOffset = off
+				}
+			}
+		}
+	}
 
 	// The outer key is the IN's left operand itself, already
 	// resolved against outerChild's coord by planInExpr — no
@@ -3261,23 +3737,48 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// output, or in x itself, generally excludes the row — see the
 	// NullAware doc comment on the Join struct) rather than the
 	// plain NOT-EXISTS-shaped Anti join.
-	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
+	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: rightOperand}
 	_ = innerWidth
 	joinType := JoinTypeSemi
 	if effNegated {
 		joinType = JoinTypeAnti
 	}
+	// M0142-0008-producer: same SJInfo producer as unnestInExpr (see its
+	// comment). The single equality conjunct's RHS is the inner plan's one
+	// output column — innerOut[0], not innerKey (innerKey's SourceTableIdx
+	// is deliberately 0 and would trip createUniquePath's schema-drift
+	// guard). strict=false for the NullAware (NOT IN) anti shape: a
+	// null-aware clause is not a plain strict equality and LhsStrict feeds
+	// joinIsLegal's commute checks.
+	//
+	// Step 2: a flattened RHS uniqueifies on the body's own target
+	// expression in leaf-concat coordinates with the remapped
+	// SourceTableIdx — the same operand the folded equality uses.
+	semiRhs := []Expr{&ColumnRef{
+		pos:            in.Pos(),
+		Index:          0,
+		Name:           innerOut[0].Name,
+		Type:           innerOut[0].Type,
+		SourceTableIdx: innerOut[0].SourceTableIdx,
+	}}
+	if flattenedRHS && flatTarget != nil {
+		if tgtShifted := liftResidualConjunctsWithOffset([]Expr{flatTarget}, nil, nil, 0, srcTableOffset); tgtShifted != nil {
+			semiRhs = []Expr{tgtShifted}
+		}
+	}
 	join := &Join{
-		pos:       in.Pos(),
-		Type:      joinType,
-		Algo:      JoinAlgoHash,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: semiPred,
-		LeftKey:   outerKey,
-		RightKey:  innerKey,
-		NullAware: effNegated,
-		schema:    append(Schema(nil), outerChild.Output()...),
+		pos:          in.Pos(),
+		Type:         joinType,
+		Algo:         JoinAlgoHash,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    semiPred,
+		LeftKey:      outerKey,
+		RightKey:     rightOperand,
+		NullAware:    effNegated,
+		SJInfo:       inUnnestSJInfo(joinType, semiRhs, !effNegated),
+		schema:       append(Schema(nil), outerChild.Output()...),
+		FlattenedRHS: flattenedRHS,
 	}
 	filter.Child = join
 	return outer, nil
@@ -3967,6 +4468,21 @@ func resolveOuterSchemaIdx(outerSchema Schema, name string, fallback int, source
 // unchanged), and an inner ColumnRef is shifted by innerShift (the
 // left side's total width). Returns nil when there is nothing to lift.
 func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, innerShift int) Expr {
+	return liftResidualConjunctsWithOffset(residuals, innerOnly, outerSchema, innerShift, 0)
+}
+
+// liftResidualConjunctsWithOffset is liftResidualConjuncts plus
+// innerSourceTableOffset, the SAME offset remapSourceTableIdx applied to the
+// inner plan's own SourceTableIdx values (M0142-0008e). A lifted residual's
+// inner-side ColumnRef is a fresh copy built from the PRE-remap EXISTS body
+// (collectUnnestParamsAndResiduals harvests it before the inner plan is
+// remapped), so without this it would carry the pre-offset SourceTableIdx —
+// disagreeing with the scan explainNames now registers under the shifted
+// value, reintroducing the exact collision remapSourceTableIdx exists to
+// remove, just one level up (the join Predicate instead of the join key).
+// unnestExistsExpr is the only caller that has ever remapped its inner
+// plan, so it is the only one that passes non-zero here.
+func liftResidualConjunctsWithOffset(residuals, innerOnly []Expr, outerSchema Schema, innerShift int, innerSourceTableOffset int16) Expr {
 	if len(residuals) == 0 && len(innerOnly) == 0 {
 		return nil
 	}
@@ -3987,6 +4503,7 @@ func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, inne
 		case *ColumnRef:
 			cl := *x
 			cl.Index = innerShift + x.Index
+			cl.SourceTableIdx += innerSourceTableOffset
 			return &cl
 		case *BinaryOp:
 			return &BinaryOp{
@@ -4038,6 +4555,181 @@ func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, inne
 //
 // The join's output schema is the LEFT (outer) schema only —
 // downstream column indices are unchanged from before unnesting.
+// existsUnnestSJInfo builds an inert *SpecialJoinInfo for the Join
+// unnestExistsExpr is about to construct, using the same shrink logic as
+// makeSpecialJoinInfoScoped (specialjoin.go:127) — not its sc/item/lower
+// parser-facing signature, which has no meaning here: this producer already
+// holds resolved OuterColumnRef/ColumnRef pairs (params, residuals) instead
+// of a raw parser.FromExpr, and builds exactly one join with no sibling SJIs
+// in scope (ctx.joinInfoList belongs to jointree deconstruction, which this
+// rewrite runs independently of), so the lower-outer-join ordering scan
+// (specialjoin.go:190-219) is a no-op by construction — equivalent to
+// calling makeSpecialJoinInfoScoped with lower=nil.
+//
+// M0142-0008a-2 (design doc §4.1): the RelSet numbering is a self-contained
+// 2-bit scheme (LHS=bit0, RHS=bit1), matching the design's "atomic-RHS"
+// recommendation for -3 (§4.2 item 1) — the whole outer side and the whole
+// EXISTS-body side are ONE participant each. This is NOT the join search's
+// real per-call global numbering (which does not exist yet at this phase);
+// -3 recomputes real bits once the RHS actually joins the search. The field
+// is attached but has no reader today, so this numbering choice cannot
+// change any plan.
+func existsUnnestSJInfo(jt JoinType, params []unnestParam, residuals []Expr, srcTableOffset int16) *SpecialJoinInfo {
+	const synL, synR RelSet = 1, 2
+
+	pjt := parser.JoinSemi
+	if jt == JoinTypeAnti {
+		pjt = parser.JoinAnti
+	}
+	sj := &SpecialJoinInfo{
+		SynLefthand:  synL,
+		SynRighthand: synR,
+		Jointype:     pjt,
+	}
+
+	// clause_relids (specialjoin.go:177-185): every param/residual conjunct
+	// relates exactly one outer (LHS) column to exactly one inner (RHS)
+	// column by construction of the EXISTS pull-up, so any param/residual
+	// makes the clause span both sides. The "no relations required" punt
+	// (specialjoin.go:220-229, PG initsplan.c:2007-2013) is unreachable in
+	// practice — unnestExistsExpr's own belt check refuses a keyless join
+	// with no residual — but is kept for the same defensive reason PG keeps
+	// it.
+	var clause RelSet
+	if len(params) > 0 || len(residuals) > 0 {
+		clause = synL | synR
+	}
+	minL, minR := clause&synL, clause&synR
+	if minL == 0 {
+		minL = synL
+	}
+	if minR == 0 {
+		minR = synR
+	}
+	sj.MinLefthand, sj.MinRighthand = minL, minR
+
+	// LhsStrict (specialjoin.go:178): the join's equijoin key comparison(s)
+	// use `=`, a strict operator, so the clause is strict for the LHS
+	// whenever at least one equijoin param exists. The keyless shape
+	// (matrix M14, params==0) falls back to false, PG's safe default.
+	sj.LhsStrict = len(params) > 0
+
+	// Semi-only fields (specialjoin.go:239-247, PG's compute_semijoin_info):
+	// populated only for SEMI. A hash-keyed join here always came from an
+	// equality operator — the only way unnestExistsExpr sets
+	// LeftKey/RightKey — so both flags follow directly from key presence
+	// rather than re-parsing the predicate.
+	if pjt == parser.JoinSemi && len(params) > 0 {
+		sj.SemiCanBtree, sj.SemiCanHash = true, true
+		// SemiRhsExprs (specialjoin.go's declared, previously-never-
+		// populated field — M0142-0008c-1 found this by grep, not
+		// inference): PG's compute_semijoin_info collects the RHS operand
+		// of each AND'ed equality conjunct (initsplan.c:2129-2138). Every
+		// param here IS one such conjunct by construction (the EXISTS
+		// pull-up only produces equijoin pairs), and SubCol is already its
+		// RHS (subquery-side) operand — no re-derivation needed.
+		//
+		// M0142-0008a-3i-plumbing-c9: SubCol was harvested from the
+		// PRE-remap EXISTS body, same as innerKey above — cloned with
+		// +srcTableOffset rather than assigned verbatim, or
+		// createUniquePath's schema-drift guard (comparing against
+		// child.Output(), which IS post-remap) declines every call ("oc.
+		// SourceTableIdx != cr.SourceTableIdx") even though Name and Index
+		// both already agree.
+		sj.SemiRhsExprs = make([]Expr, len(params))
+		for i, prm := range params {
+			sj.SemiRhsExprs[i] = &ColumnRef{
+				pos:            prm.SubCol.Pos(),
+				Index:          prm.SubCol.Index,
+				Name:           prm.SubCol.Name,
+				Type:           prm.SubCol.Type,
+				SourceTableIdx: prm.SubCol.SourceTableIdx + srcTableOffset,
+			}
+		}
+	}
+
+	return sj
+}
+
+// inUnnestSJInfo builds the SpecialJoinInfo for a Join produced by the
+// IN/NOT-IN unnesting paths (unnestInExpr, unnestNonCorrelatedInExpr) —
+// the same shape existsUnnestSJInfo produces for the EXISTS pull-up (PG:
+// compute_semijoin_info, initsplan.c). Without it the seam walk's
+// semiAntiLinksHaveSJInfos gate (joinsearchseam.go) decline-gates every
+// IN-derived link, so no parser.JoinSemi SJInfo ever reaches
+// ctx.joinInfoList and jointypeForDirection's SEMI/ANTI arm stays
+// unreachable (M0142-0008-producer).
+//
+// Both IN paths always build an equi-keyed join (semiPred is always
+// `outerKey = innerKey`, a strict `=`), so MinLefthand/MinRighthand cover
+// both synthetic sides and LhsStrict follows the caller's `strict` flag
+// rather than a param count: the operand-keyed (params==0) shape is still
+// equi-keyed. `strict=false` is reserved for the NullAware (NOT IN) ANTI
+// case — a null-aware clause is not a plain strict equality, and
+// LhsStrict feeds joinIsLegal's commute checks where over-claiming could
+// admit a reordering PG would refuse.
+//
+// rhsExprs are the RHS operands of the join's equality conjuncts,
+// expressed in the inner plan's own column identity (PG collects the
+// righthand-side expressions of the semijoin's clauses; createUniquePath's
+// schema-drift guard compares their SourceTableIdx against the RHS
+// child's Output()). The synthetic {1}/{2} relsets are placeholders — the
+// seam walk renumbers them in place to real leaf bits
+// (joinsearchseam.go:1445-1447).
+func inUnnestSJInfo(jt JoinType, rhsExprs []Expr, strict bool) *SpecialJoinInfo {
+	const synL, synR RelSet = 1, 2
+	pjt := parser.JoinSemi
+	if jt == JoinTypeAnti {
+		pjt = parser.JoinAnti
+	}
+	sj := &SpecialJoinInfo{
+		SynLefthand:  synL,
+		SynRighthand: synR,
+		MinLefthand:  synL,
+		MinRighthand: synR,
+		Jointype:     pjt,
+		LhsStrict:    strict,
+	}
+	if pjt == parser.JoinSemi && len(rhsExprs) > 0 {
+		sj.SemiCanBtree, sj.SemiCanHash = true, true
+		sj.SemiRhsExprs = rhsExprs
+	}
+	return sj
+}
+
+// maxSourceTableIdxDeep returns the highest SourceTableIdx anywhere in
+// node's tree. It walks *Join.Left/*Join.Right and *Filter.Child
+// explicitly, falling back to node.Output() for every other kind — a
+// semi/anti Join's own Output() deliberately omits its RHS columns
+// (plan.go's Semi/Anti special case), so an Output()-only scan would
+// miss a previously-spliced EXISTS body's SourceTableIdx range. See the
+// call site in unnestExistsExpr for why that matters (M0142-0008a c11
+// item b).
+func maxSourceTableIdxDeep(node Node) int16 {
+	var maxIdx int16
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *Filter:
+			walk(x.Child)
+		default:
+			for _, c := range n.Output() {
+				if c.SourceTableIdx > maxIdx {
+					maxIdx = c.SourceTableIdx
+				}
+			}
+		}
+	}
+	walk(node)
+	return maxIdx
+}
+
 func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	if !canUnnestExistsExpr(ex) {
 		return nil, nil
@@ -4213,6 +4905,40 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
 
+	// M0142-0008e: shift innerPlan's own SourceTableIdx numbering so it
+	// cannot collide with the outer side's — see remapSourceTableIdx's doc
+	// comment (design doc §9) for why the collision is otherwise real:
+	// SourceTableIdx restarts at 1 per query level, so a single-table
+	// EXISTS body numbers its own scan "1" just like the outer query's
+	// first FROM item, and splicing innerPlan in as an ordinary join
+	// child puts both scans under one EXPLAIN naming pass. The offset is
+	// sized against outerChild's FULL tree (M0142-0008a c11 item b), not
+	// just outerChild.Output(): a semi/anti Join's Output() deliberately
+	// omits its RHS columns (plan.go's Semi/Anti special case), so once a
+	// PRIOR EXISTS in the same statement has already spliced a semi/anti
+	// join onto outerChild, that prior EXISTS body's SourceTableIdx range
+	// is invisible to an Output()-only scan — a chained multi-EXISTS
+	// statement (Q69: three sibling EXISTS/NOT EXISTS) then hands every
+	// sibling the SAME offset, colliding their inner tables' SourceTableIdx
+	// (confirmed live: store_sales/web_sales/catalog_sales all landed on
+	// SourceTableIdx=5, all three date_dim occurrences on 6). That
+	// collision is what let the DP search's index-path costing pair a
+	// customer_demographics index-probe keyed on customer's
+	// c_current_cdemo_sk with the wrong outer side, producing a
+	// nestloop-param `*OuterColumnRef` no operator ever pushes a row for
+	// ("outer column ref ... out of range (depth=0)" at runtime).
+	// maxSourceTableIdxDeep walks through Join.Left/Right and Filter.Child
+	// explicitly so a previously-spliced semi/anti RHS is counted even
+	// though it no longer appears in outerChild.Output().
+	var srcTableOffset int16 = 1
+	if m := maxSourceTableIdxDeep(outerChild); m >= srcTableOffset {
+		srcTableOffset = m + 1
+	}
+	innerPlan, err = remapSourceTableIdx(innerPlan, srcTableOffset)
+	if err != nil {
+		return nil, err
+	}
+
 	// Belt (checked BEFORE any tree mutation below): a keyless
 	// semi/anti needs at least one residual to serve as its join
 	// predicate — an unconditional cross semi must never be built.
@@ -4248,11 +4974,16 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		// the inner column from the right-side region of that padded
 		// row, so its Index must be `outerWidth + innerColIndex`.
 		innerKey = &ColumnRef{
-			pos:            params[0].SubCol.Pos(),
-			Index:          outerWidth + params[0].SubCol.Index,
-			Name:           params[0].SubCol.Name,
-			Type:           params[0].SubCol.Type,
-			SourceTableIdx: params[0].SubCol.SourceTableIdx,
+			pos:   params[0].SubCol.Pos(),
+			Index: outerWidth + params[0].SubCol.Index,
+			Name:  params[0].SubCol.Name,
+			Type:  params[0].SubCol.Type,
+			// +srcTableOffset: SubCol was harvested from the PRE-remap
+			// EXISTS body, so it still carries the pre-shift value —
+			// without the offset this would disagree with the scan
+			// explainNames now registers under the shifted numbering
+			// (M0142-0008e).
+			SourceTableIdx: params[0].SubCol.SourceTableIdx + srcTableOffset,
 		}
 	}
 
@@ -4309,7 +5040,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		residualsWithPairs = append(residualsWithPairs, eup.Residuals...)
 		residualsWithPairs = append(residualsWithPairs, extraPairConjuncts...)
 	}
-	joinPredicate := liftResidualConjuncts(residualsWithPairs, innerOnlyLifted, outerSchema, outerWidth)
+	joinPredicate := liftResidualConjunctsWithOffset(residualsWithPairs, innerOnlyLifted, outerSchema, outerWidth, srcTableOffset)
 
 	algo := JoinAlgoHash
 	if len(params) == 0 {
@@ -4320,14 +5051,28 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		// tree mutation), so joinPredicate is non-nil.
 		algo = JoinAlgoNestedLoop
 	}
+	// M0142-0008a-3i-route-a step 2: when the retained parser body is
+	// simple AND the already-built inner plan decomposes cleanly into
+	// scan leaves + body quals, mark the join so the seam splices the
+	// body's relations into the outer join list instead of treating the
+	// RHS as one opaque leaf. The plan itself is unchanged — the flag
+	// only widens what the search may do with it.
+	flattenedRHS := false
+	if ex.Subquery != nil && sublinkBodyIsSimple(ex.Subquery) {
+		if _, _, _, _, okFlat := decomposeFlatBodyTree(innerPlan, false); okFlat {
+			flattenedRHS = true
+		}
+	}
 	join := &Join{
-		pos:       ex.Pos(),
-		Type:      joinType,
-		Algo:      algo,
-		Left:      outerChild,
-		Right:     innerPlan,
-		Predicate: joinPredicate,
-		schema:    append(Schema(nil), outerChild.Output()...),
+		pos:          ex.Pos(),
+		Type:         joinType,
+		Algo:         algo,
+		Left:         outerChild,
+		Right:        innerPlan,
+		Predicate:    joinPredicate,
+		schema:       append(Schema(nil), outerChild.Output()...),
+		SJInfo:       existsUnnestSJInfo(joinType, params, eup.Residuals, srcTableOffset),
+		FlattenedRHS: flattenedRHS,
 	}
 	if outerKey != nil {
 		join.LeftKey = outerKey

@@ -24,7 +24,7 @@ func TestPGHeapEncodingPreservesTextLikeInsertCoercions(t *testing.T) {
 
 	ctx := context.Background()
 	for _, q := range []string{
-		`CREATE TABLE pgenc_varchar (id int PRIMARY KEY, v varchar(1))`,
+		`CREATE TABLE pgenc_varchar (id int PRIMARY KEY, v varchar(6))`,
 		`CREATE TABLE pgenc_char (id int PRIMARY KEY, v char)`,
 		`INSERT INTO pgenc_varchar VALUES (1, '1'), (2, 2), (3, ''), (4, 'c     ')`,
 		`INSERT INTO pgenc_char VALUES (1, '1'), (2, 2), (3, ''), (4, 'c     ')`,
@@ -57,8 +57,8 @@ func TestPGHeapEncodingPreservesTextLikeInsertCoercions(t *testing.T) {
 	if gotVarchar[2].String != "2" || !gotVarchar[2].Valid {
 		t.Fatalf("varchar id=2 got %v, want \"2\"", gotVarchar[2])
 	}
-	if gotVarchar[4].String != "c" || !gotVarchar[4].Valid {
-		t.Fatalf("varchar id=4 got %v, want \"c\"", gotVarchar[4])
+	if gotVarchar[4].String != "c     " || !gotVarchar[4].Valid {
+		t.Fatalf("varchar id=4 got %v, want trailing spaces preserved", gotVarchar[4])
 	}
 	if v := gotVarchar[3]; v.Valid && v.String != "" {
 		t.Fatalf("varchar id=3 got %v, want empty-string-ish row", v)
@@ -101,7 +101,7 @@ func TestPGHeapEncodingPreservesTextLikeInsertCoercions(t *testing.T) {
 		t.Fatalf("char id=3 got %v, want a single space (bpchar(1) blank padding)", v)
 	}
 
-	if _, err := db.ExecContext(ctx, `INSERT INTO pgenc_varchar VALUES (5, 'cd')`); err == nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO pgenc_varchar VALUES (5, '1234567')`); err == nil {
 		t.Fatal("expected varchar(1) insert to fail")
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO pgenc_char VALUES (5, 'cd')`); err == nil {

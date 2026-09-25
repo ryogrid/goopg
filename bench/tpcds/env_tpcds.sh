@@ -13,10 +13,10 @@
 #   65434  nightly TPC-H clone lane      (ci/batch — reserved, do not use)
 #   65435  nightly TPC-DS clone lane     (ci/batch — reserved, do not use)
 #   65436  TPC-DS goopg SF=1             bench/tpcds/runtime_goopg/data
-#   65437  TPC-DS goopg SF=0.5           bench/tpcds/runtime_goopg/data-sf05
-#   65438  TPC-DS PostgreSQL reference   bench/tpcds/runtime/pgdata (dbs tpcds, tpcds05)
+#   65437  TPC-DS goopg SF=0.25           bench/tpcds/runtime_goopg/data-sf025
+#   65438  TPC-DS PostgreSQL reference   bench/tpcds/runtime/pgdata (dbs tpcds, tpcds025)
 #
-# (The SF0.5 gate previously defaulted to 65434, silently colliding with the
+# (The fast gate previously defaulted to 65434, silently colliding with the
 # nightly TPC-H lane; the move to 65437 fixed that.)
 #
 # Sourced by scripts/tpcds-*.sh and bench/tpcds/server.sh.
@@ -29,40 +29,48 @@ PG_PREFIX="${REPO_ROOT}/postgres/local_install"
 export PATH="${PG_PREFIX}/bin:${PATH}"
 export LD_LIBRARY_PATH="${PG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-# goopg bench binary (shared with the TPC-H bench; rebuilt by server.sh start).
+# goopg TPC-DS bench binary (rebuilt by server.sh start).
+#
+# 2026-09-17: default moved off the shared tmp/goopg-bench-bin to the
+# TPC-DS-private tmp/goopg-tpcds-bin. Rebuilding tmp/goopg-bench-bin under the
+# live :65433 TPC-H reference server left its exe "(deleted)"; :65433 now
+# serves from the pinned bench/tpch/runtime_goopg/goopg-bin, the nightly TPC-DS
+# stage from tmp/goopg-nightly-tpcds-bin, and the sf025 gate from
+# tmp/goopg-sf025-bin. server.sh additionally refuses to rebuild a path that
+# any other live process is executing.
 #
 # Env-overridable for the same reason the results dirs below are (2026-07-30):
 # this ONE path is shared with the nightly CI batch's clone lanes, which both
 # rebuild it (bench/tpch/setup_goopg.sh:28) and run servers from it for hours.
 # A loop that needs a binary at its own HEAD while the nightly holds the host
 # must be able to build somewhere private instead of clobbering the nightly's
-# binary mid-run — `GOOPG_BIN=tmp/goopg-sf05-bin scripts/tpcds-sf05-regression.sh …`.
-GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-bench-bin}"
+# binary mid-run — `GOOPG_BIN=tmp/goopg-sf025-bin scripts/tpcds-sf025-regression.sh …`.
+GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-tpcds-bin}"
 
 # --- Directories -----------------------------------------------------------
 TPCDS_RUNTIME_DIR="${TPCDS_BENCH_DIR}/runtime_goopg"
 TPCDS_PGDATA="${TPCDS_RUNTIME_DIR}/data"                # goopg SF=1 cluster
-SF05_GOOPG_DATA="${TPCDS_RUNTIME_DIR}/data-sf05"        # goopg SF=0.5 cluster
+SF025_GOOPG_DATA="${TPCDS_RUNTIME_DIR}/data-sf025"        # goopg SF=0.25 cluster
 TPCDS_PG_DATA="${TPCDS_BENCH_DIR}/runtime/pgdata"       # PostgreSQL reference cluster
 TPCDS_DATA_DIR="${TPCDS_RUNTIME_DIR}/tpcds-data"        # SF=1 TSVs + queries/
-SF05_DATA_DIR="${TPCDS_RUNTIME_DIR}/tpcds-data-sf05"    # sampled SF=0.5 TSVs
+SF025_DATA_DIR="${TPCDS_RUNTIME_DIR}/tpcds-data-sf025"    # sampled SF=0.25 TSVs
 # Results dirs are env-overridable so a one-off probe (e.g. the M0124-0004 solo
 # Q35 run) can write to a scratch dir instead of dropping artefacts next to a
 # published sweep. Defaults are unchanged, so every existing caller is a no-op.
 TPCDS_RESULTS_DIR="${TPCDS_RESULTS_DIR:-${TPCDS_RUNTIME_DIR}/tpcds-results}"
-SF05_RESULTS_DIR="${SF05_RESULTS_DIR:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf05}"
+SF025_RESULTS_DIR="${SF025_RESULTS_DIR:-${TPCDS_RUNTIME_DIR}/tpcds-results-sf025}"
 TPCDS_QUERY_DIR="${TPCDS_DATA_DIR}/queries"
 TPCDS_TOOLS="${REPO_ROOT}/third-party/tpcds-postgres/DSGen-software-code-3.2.0rc1/tools"
 
 # --- Endpoints -------------------------------------------------------------
 TPCDS_HOST="127.0.0.1"
 TPCDS_PORT="${TPCDS_PORT:-65436}"        # goopg SF=1
-SF05_PORT="${SF05_PORT:-65437}"          # goopg SF=0.5
+SF025_PORT="${SF025_PORT:-65437}"          # goopg SF=0.25
 TPCDS_PG_PORT="${TPCDS_PG_PORT:-65438}"  # PostgreSQL reference
 TPCDS_SUPERUSER="postgres"               # goopg (auth is trust on loopback)
 TPCDS_PG_USER="ryo"                      # PostgreSQL reference cluster owner
 TPCDS_PG_DB="${TPCDS_PG_DB:-tpcds}"      # SF=1 database on the PG cluster
-SF05_PG_DB="${SF05_PG_DB:-tpcds05}"      # SF=0.5 database on the PG cluster
+SF025_PG_DB="${SF025_PG_DB:-tpcds025}"      # SF=0.25 database on the PG cluster
 
 # --- Contamination guards --------------------------------------------------
 # bench_foreign_procs — the argv of every running process EXCEPT this shell and
@@ -71,7 +79,7 @@ SF05_PG_DB="${SF05_PG_DB:-tpcds05}"      # SF=0.5 database on the PG cluster
 # Any `ps | grep <script-name>` guard self-matches: the invoking shell's own
 # command line contains the script name, so the guard reports "already running"
 # against itself. This is the same trap as `pkill -f goopg` (CLAUDE.md rule 3),
-# and it fired for real on 2026-07-29 — the SF0.5 harness refused to start
+# and it fired for real on 2026-07-29 — the fast-gate harness refused to start
 # because the wrapper `bash -c '… scripts/tpcds-bench-compare.sh …'` string was
 # in the process table. Filtering the ancestor chain is what makes these guards
 # trustworthy enough to leave switched on.
@@ -94,7 +102,7 @@ bench_foreign_procs() {
 #
 # The three helpers moved to scripts/lib/bench-engine-id.sh on 2026-07-30, when
 # the TPC-H relation-size arm harness (M0125-0003) became the third reader:
-# D4a's fields must mean the SAME thing in the SF=1 board, the SF0.5 gate and
+# D4a's fields must mean the SAME thing in the SF=1 board, the SF0.25 gate and
 # the TPC-H arms, and a third ad-hoc copy would drift. Sourcing it here keeps
 # every TPC-DS harness working through this one env file. Both print them as
 #   # engine-id: <trees> diff=<digest>
@@ -104,12 +112,27 @@ bench_foreign_procs() {
 source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
 
 TPCDS_GOOPG_LOG="${TPCDS_RUNTIME_DIR}/goopg.tpcds.log"
-SF05_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf05.log"
+SF025_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf025.log"
 TPCDS_PG_LOG="${TPCDS_RUNTIME_DIR}/pg.log"
 
 # --- goopg runtime knobs (same rationale as bench/tpch/env_goopg.sh) -------
 export GOMEMLIMIT="${GOMEMLIMIT:-12GiB}"
 export GOGC="${GOGC:-off}"
+# Pins ANALYZE's reservoir sampler (internal/executor/operators_analyze.go:704-748,
+# read ONCE at server-process startup — must be exported before `server.sh
+# start`, not by a client-side capture script) so a TPC-DS load's statistics —
+# and therefore every plan captured off this cluster — are reproducible across
+# server restarts, matching scripts/tpch-acceptance-arm.sh's identical default.
+# scripts/capture-tpcds.sh cannot pin this itself: it only opens client `psql`
+# sessions and never runs ANALYZE (bench/tpcds/README.md "3. ANALYZE each
+# table" happens once at load time via scripts/tpcds-load.sh, against whatever
+# seed the already-running server process was started with). M0138-0008 found
+# four unpinned before/after TPC-DS SF0.25 captures at two FIXED commits
+# produced different join-order/qual-placement/join-method/scan-type/
+# aggregation-strategy/parallelism category counts from seed variance alone
+# (docs/design/0100-0149/m0138-0008-category-shift-bisect.md); M0137-0020 pins
+# it here, the earliest point common to every TPC-DS goopg server start.
+export GOOPG_ANALYZE_SEED="${GOOPG_ANALYZE_SEED:-20260905}"
 
 # --- Legacy aliases --------------------------------------------------------
 # The tpcds scripts were written against bench/tpch/env_goopg.sh's variable

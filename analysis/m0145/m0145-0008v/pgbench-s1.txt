@@ -1,0 +1,13 @@
+# M0145-0008v S1 pgbench TPC-B A/B (scale 2, -c 8 -j 4 -T 30, fresh cluster per arm, :5534).
+# HEAD 5247eecea vs candidate (prune writes LP_DEAD). 'pages:' = max heap block in ctid.
+# Round 1 order head,cand,head,cand; round 2 order cand,head,cand,head. The third/fourth
+# runs of each round are slower for BOTH arms (host-side), so the per-arm means
+# (cand 564, head 572 tps) are within noise. No recycling yet, so growth is unchanged.
+head number of failed transactions: 0 (0.000%) tps = 639.302209 (without initial connection time)  pages: pgbench_branches|84 pgbench_tellers|92 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 636.957741 (without initial connection time)  pages: pgbench_branches|84 pgbench_tellers|89 pgbench_accounts|3334 
+head number of failed transactions: 0 (0.000%) tps = 630.116678 (without initial connection time)  pages: pgbench_branches|83 pgbench_tellers|89 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 480.934783 (without initial connection time)  pages: pgbench_branches|63 pgbench_tellers|74 pgbench_accounts|3334 
+cand number of failed transactions: 0 (0.000%) tps = 629.849132 (without initial connection time)  pages: pgbench_branches|83 pgbench_tellers|89 pgbench_accounts|3335 
+head number of failed transactions: 0 (0.000%) tps = 639.030752 (without initial connection time)  pages: pgbench_branches|84 pgbench_tellers|86 pgbench_accounts|3334 
+cand number of failed transactions: 0 (0.000%) tps = 509.607988 (without initial connection time)  pages: pgbench_branches|67 pgbench_tellers|76 pgbench_accounts|3334 
+head number of failed transactions: 0 (0.000%) tps = 378.984492 (without initial connection time)  pages: pgbench_branches|50 pgbench_tellers|59 pgbench_accounts|3333 

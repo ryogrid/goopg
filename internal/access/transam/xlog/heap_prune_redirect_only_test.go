@@ -80,7 +80,7 @@ func TestReplayPGHeapPruneRedirectOnlyCompactsLikeRuntime(t *testing.T) {
 	if _, err := mgr.Extend(rel, base); err != nil {
 		t.Fatal(err)
 	}
-	framed, err := EncodeHeapPruneOptPG(rel, 0, result.Redirects, result.Unused)
+	framed, err := EncodeHeapPruneOptPG(rel, 0, result.Redirects, result.Dead, result.Unused)
 	if err != nil {
 		t.Fatal(err)
 	}

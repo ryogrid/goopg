@@ -228,7 +228,11 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 			actingRole = connTx.NonSuperuserRole
 		}
 		if err := s.tryRecordTableGrant(matchable, actingRole, searchPathSchemas(sess)); err != nil {
-			return s.writeQueryError(w, errcodes.FeatureNotSupported, err.Error())
+			code := errcodes.FeatureNotSupported
+			if errors.Is(err, errGrantOptionToPublic) {
+				code = errcodes.InvalidGrantOperation
+			}
+			return s.writeQueryError(w, code, err.Error())
 		}
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
 			return err

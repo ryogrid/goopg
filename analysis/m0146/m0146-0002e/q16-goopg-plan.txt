@@ -1,0 +1,17 @@
+=== Q16
+Sort  (cost=23848.43..23888.28 rows=15940 width=152)
+  Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+  ->  HashAggregate  (cost=22241.74..22401.14 rows=15940 width=152)
+        Group Key: part.p_brand, part.p_type, part.p_size
+        ->  Gather  (cost=8677.50..22143.47 rows=39307 width=1092)
+              Workers Planned: 3
+              ->  Hash Join  (cost=7677.50..36843.79 rows=39307 width=240)
+                    Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+                    ->  Parallel Seq Scan on partsupp  (cost=0.00..28029.00 rows=266666 width=544)
+                          Filter: (NOT (ps_suppkey = ANY (SubPlan 1)))
+                          SubPlan 1
+                            ->  Seq Scan on supplier  (cost=0.00..337.00 rows=1 width=584)
+                                  Filter: (s_comment LIKE '%Customer%Complaints%')
+                    ->  Seq Scan on part  (cost=0.00..7309.00 rows=29480 width=548)
+                          Filter: (((p_brand <> 'Brand#45') AND (p_type NOT LIKE 'MEDIUM POLISHED%')) AND (p_size = ANY (49, 14, 23, 45, 19, 3, 36, 9)))
+

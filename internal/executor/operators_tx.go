@@ -400,13 +400,60 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	}
 	// Restore catalog entries for any DROP TABLEs that happened inside savepoints.
 	// On full ROLLBACK these are all being undone (the top-level transaction aborts).
-	// M0097-0023.
+	// M0097-0023. drop.Table is nil for an index-only entry (P0-E5/M0143-0008:
+	// ALTER TABLE DROP CONSTRAINT on an index-backed PRIMARY KEY/UNIQUE/EXCLUDE
+	// constraint) — RegisterTable would nil-deref on tbl.Name, so it is guarded.
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 		dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 		for _, drop := range sess.TakePendingDDLDrops() {
-			im.RegisterTable(drop.Table, dbOid)
+			if drop.Table != nil {
+				im.RegisterTable(drop.Table, dbOid)
+			}
 			for _, idx := range drop.Indexes {
 				im.RestoreIndex(idx, dbOid)
+			}
+		}
+	}
+	// Restore *catalog.Index fields mutated in place by ALTER TABLE ADD
+	// CONSTRAINT ... {PRIMARY KEY|UNIQUE} USING INDEX (P0-E5/M0143-0008).
+	// A rename is undone first so the index-name maps agree with the
+	// restored Name before anything else reads them.
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		for _, e := range sess.TakePendingAlterIndexUndos() {
+			if e.Index.Name != e.OldName {
+				_ = im.RenameIndex(
+					parser.ObjectName{Schema: e.Index.Schema, Name: e.Index.Name},
+					parser.ObjectName{Schema: e.Index.Schema, Name: e.OldName},
+					e.DBOid)
+			}
+			e.Index.IsConstraint = e.IsConstraint
+			e.Index.Primary = e.Primary
+			e.Index.Deferrable = e.Deferrable
+			e.Index.InitiallyDeferred = e.InitiallyDeferred
+		}
+	}
+	// Restore NOT NULL state PRIMARY KEY synthesis mutated in place, on the
+	// ALTER's target table and any inheritance/partition child the cascade
+	// touched (P0-E5/M0143-0008).
+	for _, e := range sess.TakePendingNotNullUndos() {
+		for i, wasNotNull := range e.ColNotNull {
+			if i >= 0 && i < len(e.Table.Columns) {
+				e.Table.Columns[i].NotNull = wasNotNull
+			}
+		}
+		e.Table.NotNullConstraints = e.NotNullConstraints
+	}
+	// Restore CHECK/FOREIGN KEY/NOT NULL constraint state ALTER TABLE DROP
+	// CONSTRAINT mutated in place, on the dropped-from table and any
+	// inheritance/partition child the cascade touched (M0143-0008b).
+	for _, e := range sess.TakePendingDropConstraintUndos() {
+		e.Table.CheckConstraints = e.CheckConstraints
+		e.Table.NamedChecks = e.NamedChecks
+		e.Table.ForeignKeys = e.ForeignKeys
+		e.Table.NotNullConstraints = e.NotNullConstraints
+		for i, wasNotNull := range e.ColNotNull {
+			if i >= 0 && i < len(e.Table.Columns) {
+				e.Table.Columns[i].NotNull = wasNotNull
 			}
 		}
 	}

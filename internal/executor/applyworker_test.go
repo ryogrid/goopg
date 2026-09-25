@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestApplyWorkerInsertsRowFromPgoutputStream pins the M0008 /
@@ -114,6 +114,36 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	}
 	if rows[0][1].StringValue() != "alpha" {
 		t.Errorf("col[1]=%q want alpha", rows[0][1].StringValue())
+	}
+}
+
+// TestApplyWorkerMessagePreservesTransaction verifies that pgoutput MESSAGE
+// frames do not abort an apply transaction. They are plugin payloads, not row
+// changes, so the following Commit must still advance the remote LSN.
+func TestApplyWorkerMessagePreservesTransaction(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	w := NewApplyWorker(cat, ctx.Pool, ctx.TxnMgr)
+	defer w.SafeRollback()
+
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{Kind: 'B', XID: 73}); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
+		Kind:                 'M',
+		MessageTransactional: true,
+		MessageLSN:           0x100,
+		MessagePrefix:        "acme.example",
+		MessagePayload:       []byte{0, 1, 2},
+	}); err != nil {
+		t.Fatalf("Message: %v", err)
+	}
+	got, err := w.ApplyMessage(&xlog.DecodedMessage{Kind: 'C', CommitLSN: 0x101})
+	if err != nil {
+		t.Fatalf("Commit after MESSAGE: %v", err)
+	}
+	if got != 0x101 {
+		t.Fatalf("commit LSN = %x, want 101", got)
 	}
 }
 

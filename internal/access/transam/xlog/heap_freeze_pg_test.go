@@ -35,7 +35,7 @@ func TestEncodeHeapFreezePGRoundTripAndReplay(t *testing.T) {
 	if !ok {
 		t.Fatalf("decoded record missing block 0")
 	}
-	gotR, gotU, gotF, err := decodeXLogHeapPrune(dec.XLog.MainData, block.Data)
+	gotR, _, gotU, gotF, err := decodeXLogHeapPrune(dec.XLog.MainData, block.Data)
 	if err != nil {
 		t.Fatal(err)
 	}

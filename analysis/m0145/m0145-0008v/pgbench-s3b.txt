@@ -1,0 +1,11 @@
+# M0145-0008v S3b pgbench TPC-B A/B (scale 2, -c 8 -j 4 -T 30, fresh capable clusters, :5534).
+# HEAD 51c98bf0e vs candidate (line-pointer reuse). 'pages:' = max heap block in ctid.
+head number of failed transactions: 0 (0.000%) tps = 634.327398 (without initial connection time)  pages: pgbench_branches|84 pgbench_tellers|88 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 641.821404 (without initial connection time)  pages: pgbench_branches|85 pgbench_tellers|89 pgbench_accounts|3335 
+head number of failed transactions: 0 (0.000%) tps = 641.034206 (without initial connection time)  pages: pgbench_branches|85 pgbench_tellers|90 pgbench_accounts|3335 
+cand number of failed transactions: 0 (0.000%) tps = 644.360554 (without initial connection time)  pages: pgbench_branches|85 pgbench_tellers|89 pgbench_accounts|3335 
+
+# Diagnosis (candidate, 10 s run): pgbench_branches blocks 0-3 each hold 226 line pointers,
+# ALL LP_UNUSED/LP_DEAD (198-209 unused, 17-28 dead), pd_upper=8192 (empty), PD_HAS_FREE_LINES set.
+# Reuse is available but nothing inserts there again: non-HOT updates (LP_DEAD survivors) take
+# a new slot, and the insertion target (FSM) never learns of on-access-pruned space.

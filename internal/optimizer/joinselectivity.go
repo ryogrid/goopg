@@ -109,6 +109,13 @@ type joinVarStats struct {
 	// to compare numerically or byte-wise — `histCmp` falls back to
 	// strings.Compare without it, which orders "10" before "9". take2 P2-12.
 	typeName string
+
+	// isUnique is PG's `vardata->isunique` for the one case goopg sets it:
+	// the output column of a derived ANY_subquery leaf that is the
+	// sub-select's lone DISTINCT/GROUP BY column (baseRelInfo.
+	// subqueryUniqueOutput). `getVariableNumDistinct` then treats the column
+	// as unique over the relation's rows, as upstream does.
+	isUnique bool
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -154,6 +161,19 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 		v.isBool = cr.Type.Name == "bool"
 	}
 	if !ok {
+		// M0145-0008ab: `examine_simple_variable`'s RTE_SUBQUERY arm. A
+		// derived leaf has no catalog table to read statistics from, but PG
+		// still learns one fact from the sub-select: its lone DISTINCT or
+		// GROUP BY output column is unique. vardata->rel is the subquery rel,
+		// so `tuples`/`rows` are the leaf's own.
+		if cr != nil && relids != 0 && relids&(relids-1) == 0 {
+			j := bits.TrailingZeros32(uint32(relids))
+			if j < len(s.relInfos) && s.relInfos[j].subqueryUniqueOutput {
+				v.isUnique = true
+				v.tuples = float64(s.relInfos[j].baseRows)
+				v.rows = float64(s.relInfos[j].filteredRows)
+			}
+		}
 		return v
 	}
 	info := s.relInfos[i]
@@ -235,6 +255,16 @@ func getVariableNumDistinct(v joinVarStats) (float64, bool) {
 		stadistinct = v.stats.StaDistinct()
 	case v.isBool:
 		stadistinct = 2.0
+	}
+	// "If there is a unique index or DISTINCT clause for the variable, assume
+	// it is unique no matter what pg_statistic says" — upstream overrides
+	// whatever the branches above found.
+	if v.isUnique {
+		nullfrac := 0.0
+		if v.stats != nil {
+			nullfrac = v.stats.NullFrac
+		}
+		stadistinct = -1.0 * (1.0 - nullfrac)
 	}
 
 	// An absolute estimate is used as-is, whatever the relation's size.
@@ -385,6 +415,18 @@ func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64,
 	if !ok {
 		return defaultUnhandledClauseSel, true
 	}
+	// R54 (ii): a whole-OR join clause is estimated arm-by-arm, as PG's
+	// `clause_selectivity_ext` does (clausesel.c:810-824,
+	// `clauselist_selectivity_or`) — even when the OR spans relations and is
+	// therefore a JOIN clause. The old `default` arm below charged every such
+	// OR the unhandled-clause 0.5, which on TPC-H Q7's nation-cross OR (625
+	// rows, no equijoin for the superkey pass to consume) priced the cross at
+	// 312.5 and left the M0126-0010 `max(l,r)` clamp to cut it to 25 — an
+	// effective 0.04 that read as a measured selectivity but was the clamp
+	// (25/625), masking a 12.5x overestimate of PG's 2.
+	if bo.Op == parser.OpOr {
+		return s.orJoinSelectivity(bo)
+	}
 	switch bo.Op {
 	case parser.OpEq:
 		return eqJoinSelectivityExt(s.joinClauseOperands(ri, bo))
@@ -396,6 +438,238 @@ func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64,
 	default:
 		return defaultUnhandledClauseSel, true
 	}
+}
+
+// orJoinSelectivity estimates a whole-OR join clause PG's way
+// (`clauselist_selectivity_or`, clausesel.c): inclusion-exclusion over the
+// arms, folded pairwise the way `clauseSelectivity`'s own OR arm folds its two
+// sides (`a + b - a*b`). Each arm is an AND of conjuncts priced by
+// `orArmSelectivity`.
+//
+// The result is reported as measured (`isdefault=false`) only when EVERY arm
+// was; one guessed conjunct anywhere marks the OR a guess, which is what keeps
+// `calcJoinrelSize`'s all-default `max(l,r)` clamp protecting a partially
+// measured OR. SEMI/ANTI jointypes do NOT reach this function —
+// `joinClauseSelectivityForJoin` gives them their own arms, whose OR default
+// (0.5) is a residual divergence, ledgered below at `orConjunctSelectivity`.
+func (s *searchCtx) orJoinSelectivity(bo *BinaryOp) (float64, bool) {
+	sel := 0.0
+	isdefault := false
+	// `flattenPlannerOr` (joinrestrict.go) is the package's OR-chain
+	// flattener; reused rather than re-flattened here.
+	for _, arm := range flattenPlannerOr(bo) {
+		asel, adef := s.orArmSelectivity(arm)
+		sel = sel + asel - sel*asel
+		isdefault = isdefault || adef
+	}
+	return clampSelectivity(sel), isdefault
+}
+
+// orArmSelectivity prices one OR arm — an AND of conjuncts — as the
+// independent product, the same rule `conjunctionSelectivity` falls back to
+// for unrelated conjuncts. (The range-band pairing it adds on top is a
+// same-variable refinement; OR arms join FILTERs across relations, where PG
+// likewise multiplies.)
+func (s *searchCtx) orArmSelectivity(arm Expr) (float64, bool) {
+	sel := 1.0
+	isdefault := false
+	for _, c := range splitAnd(arm) {
+		csel, cdef := s.orConjunctSelectivity(c)
+		sel *= csel
+		isdefault = isdefault || cdef
+	}
+	return clampSelectivity(sel), isdefault
+}
+
+// orConjunctSelectivity prices one conjunct of an OR arm as a RESTRICTION, as
+// PG does when `treat_as_join_clause` declines it (clausesel.c): a single-side
+// `col = const` reads that column's own statistics through
+// `eqSelectivityForColumn`, the same primitive the restriction path uses.
+//
+// Attribution is positional, never by name: the column's `SourceTableIdx`
+// translates back to the search rel through `relInfos[].sourceIdx` (the
+// `inferAnchoredEqualities` translation, cardinality.go:411), and the table
+// whose statistics are read is that rel's own. Name matching would confuse
+// two aliases of one table — Q7's `n1.n_name`/`n2.n_name` case exactly —
+// while the index the clause builder resolved at build time does not.
+//
+// Shapes with no restriction estimator here (multi-relation conjuncts,
+// unattributable columns, CTE/subquery sides with no recorded identity,
+// general-ANY lists) keep today's whole-OR default contribution
+// (`defaultUnhandledClauseSel`, a guess) rather than inventing a number.
+// Each such shape is an independent, falsifiable follow-up, and the guess
+// flag keeps the fallback clamp available while any of them is present
+// (the clamp itself fires only on an all-default estimate).
+func (s *searchCtx) orConjunctSelectivity(c Expr) (float64, bool) {
+	if bc, ok := c.(*BooleanConst); ok {
+		if bc.Value {
+			return 1.0, false
+		}
+		return 0.0, false
+	}
+	if ie, ok := c.(*InExpr); ok {
+		return s.orInListSelectivity(ie)
+	}
+	bo, ok := c.(*BinaryOp)
+	if !ok {
+		return defaultUnhandledClauseSel, true
+	}
+	switch bo.Op {
+	case parser.OpEq, parser.OpNe:
+		return s.orEqualitySelectivity(bo)
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return s.orRangeSelectivity(bo)
+	default:
+		return defaultUnhandledClauseSel, true
+	}
+}
+
+// orEqualitySelectivity is the R54 equality arm, extracted unchanged: a
+// single-side `col = const` reads that column's own statistics through
+// `eqSelectivityForColumn`, the same primitive the restriction path uses.
+func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
+	col, val, ok := normalizeColumnConst(bo.Left, bo.Right)
+	if !ok || col.Name == "" {
+		return defaultUnhandledClauseSel, true
+	}
+	// `normalizeColumnConst` fires only for column-vs-literal, so `col` is
+	// the conjunct's sole ColumnRef; no same-rel check is needed beyond the
+	// attribution below (`isConstExpr` admits no subquery).
+	i, ok := s.relPosForSource(col.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	stats := columnStatsByName(s.relInfos[i].table, col.Name)
+	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows))
+	if bo.Op == parser.OpNe {
+		// `1 - eq` inherits the equality's flag, as the `OpNe` arm of
+		// `joinClauseSelectivityExtUncached` does for the join form.
+		sel = clampSelectivity(1.0 - sel)
+	}
+	return sel, stats == nil
+}
+
+// orRangeSelectivity prices one single-side `col <op> const` OR-arm
+// conjunct (`< <= > >=`) as a restriction — PG's `scalarineqsel`
+// (selfuncs.c:588) through `restriction_selectivity`, which is where a
+// single-side member of an OR lands when `treat_as_join_clause`
+// declines it. Attribution is the same positional `SourceTableIdx` →
+// `relInfos[].sourceIdx` translation the equality arm uses; the
+// measurement itself is `rangeOpSelectivityStats`, the stats-first
+// core of the restriction path's inequality estimator, so the two
+// paths price one shape with one arithmetic. Shapes with no
+// measurement keep the whole-OR default contribution as a guess.
+func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
+	col, val, swapped, ok := normalizeColumnConstRange(bo.Left, bo.Right)
+	if !ok || col.Name == "" {
+		return defaultUnhandledClauseSel, true
+	}
+	op := bo.Op
+	if swapped {
+		op = swapInequalityOp(op)
+	}
+	i, ok := s.relPosForSource(col.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return defaultUnhandledClauseSel, true
+	}
+	stats := columnStatsByName(s.relInfos[i].table, col.Name)
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+		return sel, false
+	}
+	return defaultUnhandledClauseSel, true
+}
+
+// orInListSelectivity prices one single-side `col IN (consts)` OR-arm
+// conjunct as a restriction — PG's `scalararraysel`
+// (selfuncs.c:1824) with `is_join_clause=false`: the element
+// operator's own estimator per element, merged OR-wise with the
+// disjoint-sum refinement for equality. The merge loop mirrors
+// `inListSelectivity` element for element (sibling-paths rule: the
+// two loops price one shape and change together); only the inputs
+// differ, stats-first here versus child-indexed there. Accepted:
+// plain IN / `= ANY` over an all-constant list, plus range-`ANY`
+// over constants through the same inequality core. Declined as a
+// guess: NOT IN (`Negated`), `ALL`, `!= ANY`, `<> ANY`, LIKE
+// elements, subquery `Plan` sources, and any non-constant element —
+// the general-ANY shapes where goopg's `InExpr` diverges most from
+// PG's Const-array deconstruction (R55 scope §2, ledgered
+// follow-up).
+func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
+	decline := func() (float64, bool) { return defaultUnhandledClauseSel, true }
+	if e.Negated || e.AllOp || e.NotEqualAny || e.Plan != nil {
+		return decline()
+	}
+	cr, ok := e.Operand.(*ColumnRef)
+	if !ok || cr.Name == "" {
+		return decline()
+	}
+	isEquality := e.AnyOp == 0 || e.AnyOp == parser.OpEq
+	isRange := e.AnyOp == parser.OpLt || e.AnyOp == parser.OpLe ||
+		e.AnyOp == parser.OpGt || e.AnyOp == parser.OpGe
+	if !isEquality && !isRange {
+		return decline()
+	}
+	i, ok := s.relPosForSource(cr.SourceTableIdx)
+	if !ok || s.relInfos[i].table == nil {
+		return decline()
+	}
+	stats := columnStatsByName(s.relInfos[i].table, cr.Name)
+	if stats == nil {
+		return decline()
+	}
+	tuples := float64(s.relInfos[i].baseRows)
+	s1 := 0.0
+	s1disjoint := 0.0
+	for _, elem := range e.List {
+		if !isConstExpr(elem) {
+			return decline()
+		}
+		var s2 float64
+		if isEquality {
+			s2 = eqSelectivityForColumn(stats, elem, tuples)
+		} else {
+			var measured bool
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats); !measured {
+				return decline()
+			}
+		}
+		s1 = s1 + s2 - s1*s2
+		if isEquality {
+			s1disjoint += s2
+		}
+	}
+	// The equality-ANY disjoint sum, accepted exactly when
+	// `inListSelectivity` accepts it (in [0,1]). The final clamp is
+	// `clampProbability`, not `clampSelectivity`, so the mirror is
+	// exact down to the NaN policy (NaN→0, as in `inListSelectivity`).
+	if isEquality && s1disjoint >= 0.0 && s1disjoint <= 1.0 {
+		s1 = s1disjoint
+	}
+	return clampProbability(s1), false
+}
+
+// relPosForSource is the `ColumnRef.SourceTableIdx` → search-rel translation
+// `orConjunctSelectivity` attributes single-side conjuncts by: position i in
+// `relInfos` (FROM order, hence relid `1<<i`). A source claimed by zero rels
+// (a column the search never bound) or by more than one (a remapped
+// subproblem sharing one identity) declines rather than guesses.
+func (s *searchCtx) relPosForSource(src int16) (int, bool) {
+	if s == nil || src <= 0 {
+		return -1, false
+	}
+	found := -1
+	for i := range s.relInfos {
+		if s.relInfos[i].sourceIdx == src {
+			if found >= 0 {
+				return -1, false
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		return -1, false
+	}
+	return found, true
 }
 
 // joinClauseOperands examines both sides of an equality clause, preferring the

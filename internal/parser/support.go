@@ -164,6 +164,12 @@ func derivedRangeVar(l *lexerState, pos int, sub *SelectStmt, alias string, cols
 	return rv
 }
 
+func groupedJoinRangeVar(l *lexerState, pos int, sub *SelectStmt, alias string, cols []string, lateral bool) RangeVar {
+	rv := derivedRangeVar(l, pos, sub, alias, cols, lateral)
+	rv.GroupedJoinUnaliased = alias == ""
+	return rv
+}
+
 func strconvFormatHex(v int) string {
 	const digits = "0123456789abcdef"
 	if v == 0 {

@@ -230,8 +230,14 @@ func TestEstimatedRowBytesCountsEnumAndBigNumeric(t *testing.T) {
 	if got := estimatedRowBytes(Row{NewStringDatum("")}); got != 48 {
 		t.Errorf("empty string: estimatedRowBytes = %d, want 48", got)
 	}
-	// Cross-check against the stats ruler on representative shapes.
-	for i, d := range []Datum{enumDatum, fastNum, NewStringDatum("abc"), NewBytesDatum([]byte("abcd"))} {
+	// Cross-check against the stats ruler on representative shapes. Fast-path
+	// numeric is deliberately excluded: M0138-0007 made datumVariablePayloadWidth
+	// report PG's actual on-disk NumericData width (nonzero) for it, but
+	// estimatedRowBytes correctly keeps reporting 0 here — the int64 mantissa
+	// really does add no bytes beyond the fixed Datum struct in memory. This is
+	// exactly the documented in-memory-vs-on-disk divergence above, not a
+	// regression; see the fastNum assertion above for the in-memory pin.
+	for i, d := range []Datum{enumDatum, NewStringDatum("abc"), NewBytesDatum([]byte("abcd"))} {
 		if got, want := estimatedRowBytes(Row{d}), int64(48+datumVariablePayloadWidth(d)); got != want {
 			t.Errorf("case %d (%v): estimatedRowBytes = %d, ruler says %d", i, d.Kind, got, want)
 		}

@@ -1,0 +1,7 @@
+# M0145-0008f serial timings (max_parallel_workers_per_gather=0), warm; goopg on the private TPC-H lane, PG 18.3 on the TPC-H reference cluster (SELECT only)
+query | goopg before | goopg after | PG 18.3
+sum(l_quantity) over lineitem | 3.2 s | 3.3 s | 1.40 s
+count of GROUP BY l_orderkey groups | 4.55 s | 3.8 s | 1.86 s
+same + HAVING sum(l_quantity) > 313 | ~6.8 s | ~6.1 s | 3.05 s
+count(*) over lineitem | 4.95 s | not re-run | 0.96 s  (slower than sum() on goopg: separate finding)
+acceptance arm (parallel): Q18 9.53 -> 8.48 s, Q13 4.26 -> 3.94 s, total 64.02 -> 62.64 s, 24 MATCH

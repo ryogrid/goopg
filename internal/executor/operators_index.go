@@ -116,6 +116,56 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap transam.Snap
 	return storage.HeapTuple{}, 0, false
 }
 
+// eachHeapChainMember iterates the same-page update chain rooted at
+// startSlot on an already content-RLocked page: ItemIDRedirect stubs are
+// followed transparently and every ItemIDNormal member is yielded to fn in
+// chain order. A false return from fn ends the walk; a true return
+// continues to the member's HOT successor (IsHotUpdated → CTID.Offset) when
+// one exists, and ends it otherwise. A missing slot, a non-normal
+// non-redirect line pointer, a self-referencing link, or
+// MaxHeapTuplesPerPage hops also end it (same bound as followHOTChain —
+// M0131-S32).
+//
+// Index entries reference the chain ROOT; probes that must judge the live
+// row version iterate members and apply their own predicate instead of
+// fetching ptr.Offset verbatim — after a committed HOT update the root is
+// dead and a raw read reports a false no-match (M0143-0010).
+func eachHeapChainMember(page storage.Page, startSlot uint16, fn func(t storage.HeapTuple, slot uint16) bool) {
+	cur := startSlot
+	for i := 0; i < storage.MaxHeapTuplesPerPage; i++ {
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			next := item.Offset
+			if next == cur {
+				return
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return
+		}
+		t, err := storage.PageGetHeapTuple(page, cur)
+		if err != nil {
+			return
+		}
+		if !fn(t, cur) {
+			return
+		}
+		if !t.Header.IsHotUpdated() {
+			return
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return
+		}
+		cur = next
+	}
+}
+
 // heapChainDeadToAll walks the HOT chain from startSlot testing every
 // member against storage.TupleDeadToAll (C3-S2: the executor's analog of
 // PG heap_hot_search_buffer's all_dead outcome). It returns true only when
@@ -184,6 +234,12 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
+	// rangeLoExcl / rangeHiExcl: the INDEX-ORDER exclusivity of the bounds
+	// lookupRangeBounds returned — the plan's operators, swapped for a DESC
+	// column, and forced exclusive where an open end became a NULL pivot
+	// (nullStopRangeBound). Rescan hands them to the cursor.
+	rangeLoExcl, rangeHiExcl bool
+
 	plan *optimizer.IndexScan
 	ctx  *Context
 	// enumTypes[i] is non-nil when Table.Columns[i] is a user-defined enum,
@@ -201,9 +257,16 @@ type indexScanOp struct {
 	// re-derived its type facts from a string: 29.70% of TPC-H CPU reached
 	// decodeRowRangeInfo this way. seqScanOp already threaded its memo.
 	colInfo []colTypeInfo
-	// M0092-0001: TID-list-eager + heap-fetch-lazy.
+	// M0092-0001: heap-fetch-lazy; M0142-0005b: TID-list-lazy too.
+	// `tids`/`poss` are now a per-LEAF batch refilled from `cur` (the
+	// leaf-grain nbtree.ScanCursor) only when Next() reaches the batch
+	// end — not the whole match set collected eagerly in Rescan. This is
+	// the index-side laziness PG's index_getnext_tid gives
+	// nodeIndexscan.c: a probe whose consumer stops early (semi/anti
+	// inner, LIMIT, a rejecting Filter) never pays to walk the leaf
+	// pages it did not need.
 	// `tids[i]` holds the (block, index-pointed offset) pair for the
-	// i-th match emitted by btree.RangeScan. The HOT-resolved actual
+	// i-th match of the CURRENT batch. The HOT-resolved actual
 	// slot offset is computed PER Next() and recorded in lastTID for
 	// currentTID() — the lockRowsOp consumer.
 	//
@@ -220,12 +283,38 @@ type indexScanOp struct {
 	hasLast bool
 
 	// C3-S2: physical index-entry positions parallel to tids (from
-	// RangeScanWithPos), and the kill list of entries whose whole heap
-	// chain proved dead-to-all at the Next() visibility step. S3 turns
-	// killList into the deferred exclusive-latched mark pass at
+	// the cursor's per-leaf batch), and the kill list of entries whose
+	// whole heap chain proved dead-to-all at the Next() visibility step.
+	// S3 turns killList into the deferred exclusive-latched mark pass at
 	// Close/Rescan; S2 only collects.
 	poss     []nbtree.ScanPos
 	killList []nbtree.KillItem
+
+	// M0142-0005b cursor state. `cur` is the live ScanCursor (nil once
+	// exhausted); `scanDone` marks the scan fully drained; `sawTID`
+	// records that the scan pulled at least one index entry — the
+	// deferred SSI gap-lock oracle (ssiRecordIndexScanGapLock used to
+	// read len(tids) at Rescan end, when the match set was materialised
+	// eagerly; under laziness the answer is known only at exhaustion or
+	// Rescan/Close, so finalizeIndexScanSSI fires once per scan at the
+	// first of those three). `isFullKeyProbe` is stashed for that
+	// deferred call; `ssiDone` makes it once-only.
+	cur            *nbtree.ScanCursor
+	scanDone       bool
+	sawTID         bool
+	isFullKeyProbe bool
+	ssiDone        bool
+
+	// saopBounds/saopIdx/saopSeen implement the SAOP multi-descent as a
+	// lazy chain of per-element cursors: bounds are encoded eagerly at
+	// Rescan (same eval timing as the pre-cursor loop, same eager
+	// per-element hash-bucket SIREADs), while each element's descent and
+	// leaf reads happen only when the chain reaches it — mirroring PG's
+	// own lazy array-element advance in index_getnext_tid. saopSeen
+	// dedups TIDs across equal array elements (IN (1,1,2)).
+	saopBounds [][2][]byte
+	saopIdx    int
+	saopSeen   map[storage.ItemPointer]struct{}
 
 	// pidx is the shared leaf-block claim set when this scan is a Gather
 	// worker's driving scan (C-19c, the plain-index-scan sibling of the IOS's
@@ -273,6 +362,11 @@ type indexScanOp struct {
 	// scanRow stays full-width — only the deform window narrows, so a
 	// bound equal to the column count takes the exact pre-EX1-02b path.
 	deformBound int
+	// prunedBlock / prunedBlockSet remember the heap block the last
+	// on-access prune ran for, so the prune runs once per block switch
+	// (M0145-0008t).
+	prunedBlock    storage.BlockNumber
+	prunedBlockSet bool
 
 	// M0092-0007: embedded slot reused across every Next() call so
 	// we don't allocate a fresh MaterializedSlot per emission.
@@ -360,6 +454,17 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.killList = nil
 	o.idx = 0
 	o.hasLast = false
+	o.cur = nil
+	o.scanDone = true
+	o.sawTID = false
+	o.isFullKeyProbe = false
+	// ssiDone starts true: no scan is in flight, so the finalize call at
+	// the top of the first Rescan must be a no-op. Rescan clears it once
+	// a scan verdict is owed.
+	o.ssiDone = true
+	o.saopBounds = nil
+	o.saopIdx = 0
+	o.saopSeen = nil
 	o.outerSlot = nil
 	o.outerWidth = 0
 
@@ -386,13 +491,15 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		return err
 	}
 	// M0118-0001: the SERIALIZABLE index-scan SIREAD predicate lock is no
-	// longer acquired eagerly here. Its granularity now depends on what the
-	// probe matches and is decided at the end of Rescan once the matching TID
-	// set is known (ssiRecordIndexScanGapLock): a matched equality probe relies
-	// on the exact per-tuple SIREAD locks recorded in Next, while an empty
-	// equality probe (the read-write-unique phantom gap) or a range scan falls
-	// back to the relation-grain SIREAD. See ssiRecordIndexScanGapLock for the
-	// multiple-row-versions rationale.
+	// longer acquired eagerly here. Its granularity depends on what the
+	// probe matches and is decided by finalizeIndexScanSSI once the scan's
+	// fate is known — at exhaustion, the next Rescan, or Close — via the
+	// sawTID oracle (M0142-0005b deferred it past Rescan, where the cursor
+	// has not yet been iterated): a matched equality probe relies on the
+	// exact per-tuple SIREAD locks recorded in Next, while an empty
+	// equality probe (the read-write-unique phantom gap) or a range scan
+	// falls back to the relation-grain SIREAD. See ssiRecordIndexScanGapLock
+	// for the multiple-row-versions rationale.
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := openIndexBTree(ctx, o.plan.Index, idxRel)
 	if err != nil {
@@ -418,12 +525,22 @@ func (o *indexScanOp) BindOuter(slot SlotView, outerWidth int) {
 // Rescan(nil, 0); the M0054-0006 NLI path calls Open once then Rescan
 // per outer row.
 func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
+	// M0142-0005b: the SSI gap-lock decision is deferred — the previous
+	// scan's verdict (if any) is recorded before its state is reset.
+	o.finalizeIndexScanSSI()
 	o.flushKills() // C3-S3: mark pending kills before discarding them
 	o.tids = o.tids[:0]
 	o.poss = o.poss[:0]
 	o.killList = o.killList[:0]
 	o.idx = 0
 	o.hasLast = false
+	o.cur = nil
+	o.scanDone = true
+	o.sawTID = false
+	o.ssiDone = false
+	o.saopBounds = nil
+	o.saopIdx = 0
+	o.saopSeen = nil
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
 
@@ -439,10 +556,12 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// is a RANGE over the unspecified trailing columns: it matches existing
 	// rows yet still has a gap a concurrent (2016, N) INSERT could fall into,
 	// so it must keep the relation-grain gap lock. Range scans likewise. The
-	// decision is finalised by ssiRecordIndexScanGapLock once o.tids is known
-	// (after RangeScan, or on the unbound/NULL-key early returns).
-	isFullKeyProbe := len(o.plan.Index.Columns) == 1 &&
+	// decision is finalised by finalizeIndexScanSSI once the scan's fate is
+	// known (exhaustion, the next Rescan, or Close — sawTID then plays the
+	// role len(tids)>0 played when the set was materialised eagerly).
+	o.isFullKeyProbe = len(o.plan.Index.Columns) == 1 &&
 		(o.plan.Key != nil || len(o.plan.Keys) > 0 || len(o.plan.SAOPKeys) > 0)
+	isFullKeyProbe := o.isFullKeyProbe
 	// A hash index supports only single-column equality, so any full-key probe
 	// over a declared-hash index is a bucket probe (design 0118-0099). Mark it so
 	// the gap-lock and per-tuple-read paths use bucket-grain predicate locking.
@@ -458,6 +577,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	}
 
 	var loBytes, hiBytes []byte
+	// Index-order bound exclusivity for the cursor. The plan's operators for
+	// every branch but the range one (whose lookupRangeBounds works it out:
+	// DESC swap, NULL pivots).
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality probe (M0054-0006-followup-Q9-
 		// composite). Encode each leading column from
@@ -477,7 +600,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
-			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
+			o.finalizeIndexScanSSI()
 			return nil
 		}
 		loBytes = key
@@ -498,7 +621,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
-			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
+			o.finalizeIndexScanSSI()
 			return nil
 		}
 		loBytes = key
@@ -517,11 +640,12 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
-			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
+			o.finalizeIndexScanSSI()
 			return nil
 		}
 		loBytes = lo
 		hiBytes = hiB
+		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 		// M0134-0001 S4: strict bound ops make the scan stop EXCLUSIVE.
 		// Composite padding must follow the bound's strictness: an inclusive hi
 		// needs trailing +infinity to cover every key with the same leading
@@ -539,27 +663,26 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 	}
 
-	// M0092-0001: lazy iteration. The scanFn collects only TIDs;
-	// HOT-chain follow + decode + detoast happen per Next() so the
-	// produced row aliases scanRow (no cloneRow per match).
-	scanFn := func(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
-		o.tids = append(o.tids, ptr)
-		o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
-		return true, nil
-	}
-
-	// C-19c: under a Gather the leaf filter partitions the TID list across
+	// M0142-0005b: fully lazy iteration. Rescan builds only the leaf-grain
+	// cursor — the descent NewScanCursor performs — and each Next() pulls
+	// one leaf's in-range entries into the tids/poss batch on demand, so a
+	// consumer that stops early never walks the leaf pages it did not need
+	// (PG's index_getnext_tid model). HOT-chain follow + decode + detoast
+	// stay per Next() as M0092-0001 made them.
+	//
+	// C-19c: under a Gather the leaf filter partitions the TID stream across
 	// workers by index leaf block, exactly as the index-only scan's Open does
-	// (operators_indexonly.go). nil for a serial scan, so the scan behaves
-	// exactly as it always has — RangeScanWithPos IS RangeScanWithPosLeafFilter
-	// with a nil filter.
+	// (operators_indexonly.go). nil for a serial scan.
 	var leafFilter func(storage.BlockNumber) bool
 	if o.pidx != nil {
 		leafFilter = o.ownsLeaf
 	}
-	if err := o.tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, leafFilter, scanFn); err != nil {
+	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, loExcl, hiExcl, leafFilter)
+	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.cur = cur
+	o.scanDone = false
 	if o.hashBucketScan {
 		if len(o.hashProbeFingerprint) > 0 {
 			// Bucket-grain SIREAD on the hash index in place of the
@@ -574,7 +697,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			o.hashBucketScan = false
 		}
 	}
-	o.ssiRecordIndexScanGapLock(isFullKeyProbe)
+	// The gap-lock decision is deferred: the matching TID set is no longer
+	// known until the cursor is iterated. finalizeIndexScanSSI records it
+	// once — at scan exhaustion inside Next, at the next Rescan, or at
+	// Close — whichever comes first.
 	return nil
 }
 
@@ -601,17 +727,63 @@ func (o *indexScanOp) rescanSAOP() error {
 	if !ok {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
-	seen := make(map[storage.ItemPointer]struct{}, len(o.plan.SAOPKeys))
-	scanFn := func(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
-		if _, dup := seen[ptr]; dup {
-			return true, nil
-		}
-		seen[ptr] = struct{}{}
-		o.tids = append(o.tids, ptr)
-		o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
-		return true, nil
-	}
+	// M0142-0005b: element keys are still evaluated and encoded eagerly at
+	// Rescan — preserving the pre-cursor eval timing and the eager
+	// per-element hash-bucket SIREADs — but each element's descent and leaf
+	// reads are deferred into the nextLeafBatch chain: one ScanCursor per
+	// element, opened only when the previous element's cursor exhausts
+	// (PG likewise advances its array elements lazily inside
+	// index_getnext_tid). saopSeen dedups TIDs across equal elements; it
+	// holds only TIDs actually pulled.
+	o.saopSeen = make(map[storage.ItemPointer]struct{}, len(o.plan.SAOPKeys))
 	hashRecorded := false
+	// M0145-0029: a SAOP probe may carry bounds on the SECOND index column
+	// (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). Each element's
+	// descent then runs [elem, low] .. [elem, high]; a missing side keeps the
+	// element's own prefix bound. The bounds are evaluated once.
+	var boundCol *catalog.Column
+	var lowV, highV Datum
+	hasLow, hasHigh := o.plan.LowKey != nil, o.plan.HighKey != nil
+	if (hasLow || hasHigh) && rangeColumnReversed(o.ctx, o.plan.Index, 1) {
+		// A DESC second column orders its values backwards in the tree, so the
+		// ascending [elem, low] .. [elem, high] window would be empty or wrong.
+		// The bounds are a Filter recheck on this probe anyway (they never
+		// carry a `local`), so the descent just covers the element's whole
+		// prefix group and the recheck applies them.
+		hasLow, hasHigh = false, false
+	}
+	if hasLow || hasHigh {
+		if len(o.plan.Index.Columns) < 2 {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no second column", o.plan.Index.Name)}
+		}
+		c2, ok2 := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[1])
+		if !ok2 {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[1], o.plan.Table.Name)}
+		}
+		boundCol = c2
+		if hasLow {
+			v, err := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
+			if err != nil {
+				return err
+			}
+			if v.IsNull() {
+				o.finalizeIndexScanSSI()
+				return nil
+			}
+			lowV = v
+		}
+		if hasHigh {
+			v, err := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
+			if err != nil {
+				return err
+			}
+			if v.IsNull() {
+				o.finalizeIndexScanSSI()
+				return nil
+			}
+			highV = v
+		}
+	}
 	for _, ke := range o.plan.SAOPKeys {
 		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
@@ -630,13 +802,38 @@ func (o *indexScanOp) rescanSAOP() error {
 		if len(o.plan.Index.Columns) > 1 {
 			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
+		if boundCol != nil {
+			// Same padding rules as the range branch in Rescan, one column
+			// further in: an exclusive low skips every entry equal to it, an
+			// inclusive high covers every entry sharing it, when columns
+			// follow the bounded one.
+			more := len(o.plan.Index.Columns) > 2
+			if hasLow {
+				lk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: lowV, pos: o.plan.LowKey.Pos()}})
+				if encErr != nil {
+					return encErr
+				}
+				if more && o.plan.LowOp == parser.OpGt {
+					lk = o.ctx.compositeUpperBound(o.plan.Index, lk)
+				}
+				key = lk
+			}
+			if hasHigh {
+				hk, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{parts[0], {col: boundCol, val: highV, pos: o.plan.HighKey.Pos()}})
+				if encErr != nil {
+					return encErr
+				}
+				if more && o.plan.HighOp != parser.OpLt {
+					hk = o.ctx.compositeUpperBound(o.plan.Index, hk)
+				}
+				hiBytes = hk
+			}
+		}
 		if o.hashBucketScan && len(o.hashProbeFingerprint) > 0 {
 			ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
 			hashRecorded = true
 		}
-		if err := o.tree.RangeScanWithPos(key, hiBytes, false, false, scanFn); err != nil {
-			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
-		}
+		o.saopBounds = append(o.saopBounds, [2][]byte{key, hiBytes})
 	}
 	if o.hashBucketScan && !hashRecorded {
 		// No fingerprint (a key part this encoder cannot render, or every
@@ -645,7 +842,13 @@ func (o *indexScanOp) rescanSAOP() error {
 		// single-key tail in Rescan.
 		o.hashBucketScan = false
 	}
-	o.ssiRecordIndexScanGapLock(len(o.plan.Index.Columns) == 1)
+	// Cursor chain opens lazily in nextLeafBatch. If every element was
+	// NULL there is nothing to scan — finalise the gap lock now.
+	if len(o.saopBounds) == 0 {
+		o.finalizeIndexScanSSI()
+		return nil
+	}
+	o.scanDone = false
 	return nil
 }
 
@@ -670,8 +873,26 @@ func (o *indexScanOp) rescanSAOP() error {
 // each leaves a gap a phantom INSERT could fall into. ssiRecordRelationRead
 // gates to SERIALIZABLE and excludes system relations; temp / matview relations
 // are filtered here.
+// finalizeIndexScanSSI records the deferred SERIALIZABLE gap-lock
+// decision for the scan that just ended. M0142-0005b moved this off
+// Rescan's tail: with the leaf-grain cursor the match set is not known
+// until iteration ends (or the scan is superseded/closed), so "did the
+// probe match any index entry" is read from sawTID — set by the batch
+// pull — rather than from a materialised len(tids). It runs at most once
+// per scan (ssiDone) at the first of: Next() hitting exhaustion, the next
+// Rescan, or Close. Registering at any of those is still strictly before
+// commit, preserving the rw-edge semantics the eager version registered
+// at Rescan end.
+func (o *indexScanOp) finalizeIndexScanSSI() {
+	if o.ssiDone {
+		return
+	}
+	o.ssiDone = true
+	o.ssiRecordIndexScanGapLock(o.isFullKeyProbe)
+}
+
 func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
-	if isFullKeyProbe && len(o.tids) > 0 {
+	if isFullKeyProbe && o.sawTID {
 		return
 	}
 	if o.hashBucketScan {
@@ -686,6 +907,71 @@ func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
 	}
 }
 
+// scanAppendEntry is the cursor's per-item callback: it records the TID
+// and its kill-list coordinates into the current per-leaf batch, deduping
+// across SAOP array elements when a dedup map is installed, and marks
+// sawTID — the deferred gap-lock oracle — on every index entry pulled
+// (a duplicate-suppressed entry still proves the probe touched the index).
+// The key argument aliases the pinned leaf and is deliberately unused.
+func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
+	o.sawTID = true
+	if o.saopSeen != nil {
+		if _, dup := o.saopSeen[ptr]; dup {
+			return true, nil
+		}
+		o.saopSeen[ptr] = struct{}{}
+	}
+	o.tids = append(o.tids, ptr)
+	o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
+	return true, nil
+}
+
+// nextLeafBatch refills o.tids/o.poss with the in-range entries of the
+// next leaf page the scan cursor admits. It returns more=true only when
+// the new batch is non-empty; more=false means the scan (including any
+// remaining SAOP elements) is exhausted. Leaves the cursor skipped —
+// Gather-declined blocks, high-key recovery leaves, admitted leaves with
+// no in-range items — are consumed inside the loop.
+func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
+	for {
+		if o.cur == nil {
+			// The active cursor is exhausted (or never opened): open the
+			// next SAOP element's descent, if any. A non-SAOP scan has
+			// no bounds queued, so this also terminates it.
+			if o.saopIdx >= len(o.saopBounds) {
+				return false, nil
+			}
+			b := o.saopBounds[o.saopIdx]
+			o.saopIdx++
+			// Strictness applies only to a bound the plan actually carries;
+			// the element's own prefix bounds are inclusive.
+			loExcl := o.plan.LowKey != nil && o.plan.LowOp == parser.OpGt
+			hiExcl := o.plan.HighKey != nil && o.plan.HighOp == parser.OpLt
+			cur, cerr := o.tree.NewScanCursor(b[0], b[1], loExcl, hiExcl, nil)
+			if cerr != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+			}
+			o.cur = cur
+			continue
+		}
+		o.tids = o.tids[:0]
+		o.poss = o.poss[:0]
+		o.idx = 0
+		ok, cerr := o.cur.Next(o.scanAppendEntry)
+		if cerr != nil {
+			return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+		}
+		if !ok {
+			o.cur = nil
+			continue
+		}
+		if len(o.tids) == 0 {
+			continue
+		}
+		return true, nil
+	}
+}
+
 func (o *indexScanOp) Next() (TupleSlot, error) {
 	// M0092-0001: lazy iteration. Pin heap, follow HOT, decode into
 	// the reusable scanRow, return slot aliasing it. Caller must
@@ -694,14 +980,31 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 	// that skip many invisible tuples (vacuum-pending dead rows).
 	for {
 		if o.idx >= len(o.tids) {
-			o.hasLast = false
-			return nil, EOF
+			// M0142-0005b: refill the per-leaf TID batch from the cursor.
+			// nextLeafBatch guarantees the batch is non-empty when more=true.
+			more, err := o.nextLeafBatch()
+			if err != nil {
+				return nil, err
+			}
+			if !more {
+				o.scanDone = true
+				o.finalizeIndexScanSSI()
+				o.hasLast = false
+				return nil, EOF
+			}
+			continue
 		}
 		ptr := o.tids[o.idx]
 		o.idx++
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.heapRel, Block: ptr.Block})
 		if err != nil {
 			return nil, err
+		}
+		// heapam_index_fetch_tuple prunes when it moves to a new heap
+		// buffer (M0145-0008t); consecutive TIDs on one block prune once.
+		if !o.prunedBlockSet || o.prunedBlock != ptr.Block {
+			o.prunedBlock, o.prunedBlockSet = ptr.Block, true
+			pruneHeapPageOnAccess(o.ctx, slot, o.plan.Table, o.heapRel, ptr.Block)
 		}
 		// M0092-0006: hold the RLock across decode so we can use
 		// followHOTChainNoCopy → tuple.Data aliases the page bytes.
@@ -882,10 +1185,14 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 }
 
 func (o *indexScanOp) Close() error {
-	o.flushKills() // C3-S3: mark pending kills before releasing state
+	o.finalizeIndexScanSSI() // M0142-0005b: record the deferred gap-lock decision
+	o.flushKills()           // C3-S3: mark pending kills before releasing state
 	o.tids = nil
 	o.poss = nil
 	o.killList = nil
+	o.cur = nil
+	o.saopBounds = nil
+	o.saopSeen = nil
 	o.hasLast = false
 	if o.scanRow != nil {
 		// EX1-02b: scrub tail poison before the pooled row is released so
@@ -996,46 +1303,137 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 // evaluates to NULL (the scan should produce no rows). Either loKey
 // or hiKey may be nil for an open-ended range.
 func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, err error) {
-	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	// M0145-0029 slice 2b: an equality prefix (RangePrefix) moves the bounds
+	// onto the column after it; each bound is then the prefix's parts plus the
+	// bound's own part. With no prefix this is the leading-column range scan,
+	// byte for byte as before.
+	np := len(o.plan.RangePrefix)
+	if np >= len(o.plan.Index.Columns) {
+		return nil, nil, false, &ExecError{
+			Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("indexScanOp.lookupRangeBounds: range prefix of %d keys leaves no column to bound on index %q", np, o.plan.Index.Name),
+		}
+	}
+	prefix := make([]indexProbeKeyPart, 0, np+1)
+	for i, ke := range o.plan.RangePrefix {
+		pcol, pfound := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
+		if !pfound {
+			return nil, nil, false, &ExecError{
+				Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[i], o.plan.Table.Name),
+			}
+		}
+		v, evalErr := evalExprSlot(ke, o.outerSlot, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// `col = NULL` matches nothing.
+			return nil, nil, false, nil
+		}
+		prefix = append(prefix, indexProbeKeyPart{col: pcol, val: v, pos: ke.Pos()})
+	}
+	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[np])
 	if !found {
 		return nil, nil, false, &ExecError{
 			Code:    "XX000",
 			Pos:     o.plan.Pos(),
-			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name),
+			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[np], o.plan.Table.Name),
 		}
 	}
+	withBound := func(part indexProbeKeyPart) []indexProbeKeyPart {
+		out := make([]indexProbeKeyPart, 0, np+1)
+		out = append(out, prefix...)
+		return append(out, part)
+	}
 
+	// The plan's bounds are VALUE bounds: LowKey is `col >(=) v`, HighKey is
+	// `col <(=) v`. The cursor wants INDEX-ORDER bounds. For an ascending
+	// column they coincide; for a DESC column of a tuple-format index the
+	// comparator reverses the order, so the value bounds swap ends — `a > 97`
+	// is everything BEFORE 97 in index order. (A blob-format index ignores
+	// DESC in its byte order, so it never swaps.) Before this the DESC case
+	// used the ascending ends: `a > 97` on (a DESC) returned 2910 of 3000
+	// rows instead of 60, and BETWEEN returned none.
+	valueKey := func(e optimizer.Expr) ([]byte, bool, error) {
+		v, evalErr := evalExprSlot(e, o.outerSlot, o.ctx)
+		if evalErr != nil {
+			return nil, false, evalErr
+		}
+		if v.IsNull() {
+			// A NULL bound: no row can satisfy `col op NULL`.
+			return nil, false, nil
+		}
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, withBound(indexProbeKeyPart{col: col, val: v, pos: e.Pos()}))
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		return k, true, nil
+	}
+	var vLo, vHi []byte
 	if o.plan.LowKey != nil {
-		v, evalErr := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
-		if evalErr != nil {
-			return nil, nil, false, evalErr
+		k, present, kerr := valueKey(o.plan.LowKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
 		}
-		if v.IsNull() {
-			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
+		if !present {
 			return nil, nil, false, nil
 		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
+		vLo = k
+	}
+	if o.plan.HighKey != nil {
+		k, present, kerr := valueKey(o.plan.HighKey)
+		if kerr != nil {
+			return nil, nil, false, kerr
+		}
+		if !present {
+			return nil, nil, false, nil
+		}
+		vHi = k
+	}
+	loExcl, hiExcl := o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt
+	if rangeColumnReversed(o.ctx, o.plan.Index, np) {
+		vLo, vHi = vHi, vLo
+		loExcl, hiExcl = hiExcl, loExcl
+	}
+	loKey, hiKey = vLo, vHi
+	if loKey == nil && np > 0 {
+		// No bound at the index-order low end: start at the first entry with
+		// the equality prefix — the same inclusive prefix key a Keys probe
+		// starts at.
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
-		loKey = k
+		loKey, loExcl = k, false
+	}
+	if hiKey == nil && np > 0 {
+		// No bound at the index-order high end: stop after the last entry with
+		// the equality prefix — the padded prefix bound a Keys probe uses.
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, prefix)
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		hiKey, hiExcl = o.ctx.compositeUpperBound(o.plan.Index, k), false
 	}
 
-	if o.plan.HighKey != nil {
-		v, evalErr := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
-		if evalErr != nil {
-			return nil, nil, false, evalErr
+	// An open end must not run into the NULL-keyed entries a capable cluster
+	// stores: `a > 5` excludes NULL, but the NULL group sits at one end of the
+	// index order. Only when the column carries exactly ONE value bound: with
+	// none this is a full scan or an equality-prefix probe, and both must keep
+	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)).
+	if (vLo == nil) != (vHi == nil) {
+		if k, atHigh, stop, err := o.ctx.nullStopRangeBound(o.plan.Index, prefix, col, np); err != nil {
+			return nil, nil, false, err
+		} else if stop {
+			if atHigh && vHi == nil {
+				hiKey, hiExcl = k, true
+			} else if !atHigh && vLo == nil {
+				loKey, loExcl = k, true
+			}
 		}
-		if v.IsNull() {
-			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
-			return nil, nil, false, nil
-		}
-		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
-		if encErr != nil {
-			return nil, nil, false, encErr
-		}
-		hiKey = k
 	}
+	o.rangeLoExcl, o.rangeHiExcl = loExcl, hiExcl
 
 	// ok = true as long as at least one bound is specified (the scan is valid)
 	return loKey, hiKey, true, nil

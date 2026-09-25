@@ -1,0 +1,10 @@
+tmp/m0145-0008j-fireset.log:FIRE-SET: baseline=83042677cd88015769eaf6e1387a2176e9880dde (4509fec5c39f) candidate=worktree (95f3ec76e4ee)
+tmp/m0145-0008j-fireset.log:FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+tmp/m0145-0008j-fireset.log:FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+tmp/m0145-0008j-tpch.log:FIRE-SET: baseline=83042677cd88015769eaf6e1387a2176e9880dde (966a9b86b92f) candidate=worktree (95f3ec76e4ee)
+tmp/m0145-0008j-tpch.log:FIRE-SET: corpus=tpch fires=none (plan A/B had no changed query)
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count

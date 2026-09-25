@@ -130,15 +130,39 @@ func (c *InMemory) relAllVisibleCell(t *Table) string {
 	if c == nil || t == nil {
 		return "0"
 	}
-	dbOid := c.dbOid
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return relAllVisibleFor(dbOid, relOID)
+}
+
+// relAllVisibleKey is the (database, relfilenode) pair a table's VM bits are
+// kept under: the table's own database when it names one, else THIS catalog's
+// database — the one VACUUM ran in and keyed the bits by. Shared by the
+// pg_class cell and RelAllVisibleBlocks so the planner and the view can never
+// read two different counts for one table.
+func (c *InMemory) relAllVisibleKey(t *Table) (dbOid, relOID uint32) {
+	dbOid = c.dbOid
 	if t.DBOid != 0 && t.DBOid != DefaultDBOid {
 		dbOid = t.DBOid
 	}
-	relOID := t.OID
+	relOID = t.OID
 	if t.RelFileNodeOID != 0 {
 		relOID = t.RelFileNodeOID
 	}
-	return relAllVisibleFor(dbOid, relOID)
+	return dbOid, relOID
+}
+
+// RelAllVisibleBlocks is pg_class.relallvisible for t as a number, resolved
+// exactly as the pg_class view resolves it (relAllVisibleKey). The planner's
+// `baserel->allvisfrac` reads this: the package-level RelAllVisible keys a
+// DBOid-less table under DefaultDBOid, while VACUUM keyed its VM bits under the
+// session's database, so on the `postgres` database it read 0 and priced every
+// index-only scan with all its heap fetches (M0145-0029 slice 5).
+func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
+	if c == nil || t == nil || RelAllVisibleFunc == nil {
+		return 0
+	}
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return RelAllVisibleFunc(dbOid, relOID)
 }
 
 // RelAllVisible reports the relation's VM-derived all-visible BLOCK COUNT
@@ -1247,6 +1271,13 @@ func boolToPGChar(b bool) string {
 	return "f"
 }
 
+// TableHasToastRelation is tableHasToastRelation for callers outside the
+// package: whether t owns a TOAST relation (and so a TOAST index) — the same
+// set the pg_class and pg_index builders expose.
+func TableHasToastRelation(t *Table) bool {
+	return t != nil && tableHasToastRelation(t)
+}
+
 func tableHasToastRelation(t *Table) bool {
 	if len(t.ToastReloptions) > 0 {
 		return true
@@ -1689,6 +1720,34 @@ type ForeignKey struct {
 	// NotValid itself is kept independent here. DU-002 slice 431.
 	NotEnforced bool
 }
+
+// FKActionFromChar is FKActionChar's inverse, for the pg_constraint heap
+// reload (initdb.loadForeignKeysFromHeap, R126). Kept adjacent to its twin so
+// the two mappings cannot drift — the pairing is what makes an FK's
+// ON DELETE / ON UPDATE action survive a restart.
+//
+// An unrecognised code degrades to NO ACTION, which is PG's own default and
+// the direction that cannot invent a cascade.
+func FKActionFromChar(c string) parser.FKAction {
+	switch c {
+	case "r":
+		return parser.FKActionRestrict
+	case "c":
+		return parser.FKActionCascade
+	case "n":
+		return parser.FKActionSetNull
+	case "d":
+		return parser.FKActionSetDefault
+	default: // "a" and anything unexpected
+		return parser.FKActionNoAction
+	}
+}
+
+// FKActionChar exports fkActionChar for the pg_constraint heap writer
+// (executor.buildPGConstraintRowForForeignKey, R126), so the heap row and the
+// synthesised view derive confupdtype/confdeltype from the same mapping rather
+// than transcribing it twice.
+func FKActionChar(a parser.FKAction) byte { return fkActionChar(a) }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
 // PostgreSQL stores in pg_constraint.confupdtype / confdeltype. DU-002 slice 51.
@@ -2237,11 +2296,14 @@ type Catalog interface {
 	// CreateExtension records a CREATE EXTENSION install in the runtime
 	// pg_extension registry. schema is the install namespace name (defaulted by
 	// the caller), version the extension version string. When the extension
-	// already exists it returns nil if ifNotExists is set, else an error.
-	// database scopes the install to the connecting database (pg_extension is
-	// per-database in PostgreSQL); empty means visible everywhere.
-	// M0110-0003 (amcheck SQL surface).
-	CreateExtension(name, schema, version, database string, ifNotExists bool) error
+	// already exists in the same database scope it returns (false, nil) if
+	// ifNotExists is set, else an error; created reports whether a row was
+	// actually installed so the caller can skip the heap journal + emit the
+	// "already exists, skipping" NOTICE on the no-op path. database scopes the
+	// install to the connecting database (pg_extension is per-database in
+	// PostgreSQL); empty means visible everywhere.
+	// M0110-0003 (amcheck SQL surface); per-db + created flag M0119-0006bs.
+	CreateExtension(name, schema, version, database string, ifNotExists bool) (bool, error)
 	// CreateTablespace records a CREATE TABLESPACE in the runtime tablespace
 	// registry and returns the freshly allocated OID (used by the executor to
 	// create the in-place pg_tblspc/<oid> directory). An existing name returns a
@@ -3111,8 +3173,13 @@ type InMemory struct {
 	statisticsObjs map[string]*StatisticsObject
 
 	// extensions tracks CREATE EXTENSION installs (e.g. amcheck), keyed by
-	// lowercase extension name. Backs the pg_extension virtual catalog read by
-	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
+	// database scope + "\x00" + lowercase extension name — pg_extension is a
+	// per-database catalog, so the same extname installed in two databases
+	// holds two rows (upstream: pg_extension_name_index constrains within one
+	// database only). The empty database scope ("") marks legacy/direct-call
+	// inserts visible in every database. Backs the pg_extension virtual
+	// catalog read by pg_amcheck's "is amcheck installed?" probe.
+	// M0110-0003; per-db keying M0119-0006bs.
 	extensions map[string]*extensionRow
 
 	// tablespaces tracks CREATE TABLESPACE in-place tablespaces, keyed by
@@ -5187,6 +5254,35 @@ func (c *InMemory) LookupIndexByOID(oid uint32, dbOid ...uint32) (*Index, bool) 
 	return nil, false
 }
 
+// LookupIndexByOIDAllDBs is LookupIndexByOID's cross-database twin, mirroring
+// LookupTableByOIDAllDBs: it checks DefaultDBOid first, then every other
+// registered namespace. M0143-0003c's pg_constraint reload uses this (rather
+// than a single-dbOid LookupIndexByOID call) for the same reason the CHECK/
+// NOT NULL/FK loaders resolve conrelid via LookupTableByOIDAllDBs — a
+// heapDBOid-scoped lookup is not guaranteed to match the index's own
+// registration namespace in every routing edge case those loaders were
+// written defensively against.
+func (c *InMemory) LookupIndexByOIDAllDBs(oid uint32) (*Index, uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, idx := range c.ns(DefaultDBOid).indexes {
+		if idx.OID == oid {
+			return idx, DefaultDBOid, true
+		}
+	}
+	for nsOid := range c.namespaces {
+		if nsOid == DefaultDBOid {
+			continue
+		}
+		for _, idx := range c.ns(nsOid).indexes {
+			if idx.OID == oid {
+				return idx, nsOid, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
 // FindPartitionForValue finds the partition child that matches a given key value
 // string for a LIST-partitioned table. Returns nil if no partition matches.
 // M0096-0007.
@@ -5482,6 +5578,14 @@ func (c *InMemory) DropDatabase(name string) error {
 	delete(c.databaseEncoding, name)
 	delete(c.databaseOwner, name)
 	delete(c.databaseOid, name)
+	// Purge extension rows scoped to the dropped database — otherwise a
+	// recreated same-name database inherits phantom installs (pg_extension
+	// shows them and CREATE EXTENSION conflicts 42710). M0119-0006bs.
+	for k, e := range c.extensions {
+		if e.database == name {
+			delete(c.extensions, k)
+		}
+	}
 	return nil
 }
 
@@ -5517,6 +5621,15 @@ func (c *InMemory) RenameDatabase(oldName, newName string) bool {
 	if v, ok := c.databaseOid[oldName]; ok {
 		delete(c.databaseOid, oldName)
 		c.databaseOid[newName] = v
+	}
+	// Re-key extension rows scoped to the renamed database so the installs
+	// follow the database (pg_extension is per-database). M0119-0006bs.
+	for k, e := range c.extensions {
+		if e.database == oldName {
+			delete(c.extensions, k)
+			e.database = newName
+			c.extensions[extensionRegistryKey(newName, strings.ToLower(e.name))] = e
+		}
 	}
 	return true
 }
@@ -5700,6 +5813,32 @@ func (c *InMemory) DatabaseConnLimit(name string) int32 {
 		return limit
 	}
 	return -1
+}
+
+// DatabaseAllowsConnections reports pg_database.datallowconn for the named
+// database — whether a client may connect to it at all.
+//
+// PostgreSQL seeds template0 with datallowconn = false so that it stays a
+// pristine, byte-stable source for CREATE DATABASE ... TEMPLATE template0, and
+// enforces it in InitPostgres with a FATAL
+// "database %q is not currently accepting connections"
+// (postgres/src/backend/utils/init/postinit.c:361-365). template1 IS
+// connectable, which is the whole point of the two-template design: template1
+// is the one you are meant to customise.
+//
+// This is the single source of truth for the rule. The pg_database row builder
+// renders datallowconn from the same switch, and the postmaster's connect gate
+// calls THIS — hardcoding the name in both places is how a catalog that
+// reports datallowconn=false ends up alongside a server that accepts the
+// connection anyway.
+//
+// A CREATE DATABASE'd database is always connectable here: goopg does not
+// implement `CREATE DATABASE ... ALLOW_CONNECTIONS false` or
+// `ALTER DATABASE ... WITH ALLOW_CONNECTIONS`, so template0 is the only
+// database that can carry the flag. That limitation is ledgered rather than
+// silently approximated.
+func (c *InMemory) DatabaseAllowsConnections(name string) bool {
+	return !strings.EqualFold(name, "template0")
 }
 
 // SetDatabaseConnLimit records a runtime `datconnlimit` override for an
@@ -6628,6 +6767,19 @@ func (c *InMemory) RegisterIndexDuringRecoveryForDB(
 		Unique:        unique,
 		Method:        strings.ToLower(method),
 		Primary:       primary,
+		// IsConstraint gates whether PGConstraintRowsForDBOid synthesises a
+		// pg_constraint row for this index (catalog.go's per-connection view,
+		// filter at the "Emit UNIQUE, PRIMARY KEY..." loop). Recovery has no
+		// durable source for a plain UNIQUE index's IsConstraint (real PG
+		// distinguishes `ALTER TABLE ADD CONSTRAINT UNIQUE` from a bare
+		// `CREATE UNIQUE INDEX` via pg_constraint.conindid, which goopg does
+		// not persist for contype IN ('u','x') — M0143-0003b/e). A PRIMARY
+		// KEY index is always constraint-backed in PG (indisprimary implies
+		// a pg_constraint row unconditionally; there is no "bare primary
+		// index" concept), so `primary` alone is a safe, lossless signal —
+		// restoring it here closes the pg_constraint contype='p' half of
+		// M0143-0003 without new durable state. M0143-0003a.
+		IsConstraint:  primary,
 		OID:           oid,
 		ColDescending: append([]bool(nil), colDescending...),
 		ColNullsFirst: append([]bool(nil), colNullsFirst...),
@@ -6728,6 +6880,48 @@ func (c *InMemory) tableByOID(oid uint32, dbOid uint32) (*Table, bool) {
 		}
 	}
 	return nil, false
+}
+
+// LookupTableByNameAnySchema resolves an UNSCHEMED table name within one
+// database, case-insensitively, ignoring schema. Returns nil when no table or
+// more than one candidate matches.
+//
+// R126: catalog.ForeignKey.RefTable is stored unschemed (see its comment), and
+// the synthesised pg_constraint view resolves it by the same kind of scan — a
+// case-insensitive walk of the namespace's tables, skipping Virtual/OID-0
+// (the `strings.EqualFold(cand.Name, fk.RefTable)` loop in pgConstraintRows).
+// The pg_constraint HEAP writer must agree with the view, or an FK is displayed
+// but never persisted — which is what a `public`-qualified lookup here did.
+//
+// It does NOT agree with the view in one case, deliberately: the view takes the
+// FIRST match and breaks, having no notion of ambiguity, so with two same-named
+// tables in different schemas it renders the FK against an arbitrary parent.
+// This returns nil instead, and the caller declines and warns — journalling an
+// FK that points at the wrong table is worse than not journalling it.
+//
+// The real fix is upstream of both: PG resolves the referenced relation through
+// the search path at DDL time and stores an OID, so ambiguity cannot survive.
+// catalog.ForeignKey should carry the parent's OID alongside the name (both
+// sides of R126 already compute it). Until then, preferring the referencing
+// table's own schema would resolve the common case deterministically.
+// Follow-up, not this round.
+func (c *InMemory) LookupTableByNameAnySchema(name string, dbOid uint32) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var found *Table
+	for _, t := range c.ns(dbOid).tables {
+		if t.Virtual || t.OID == 0 {
+			continue
+		}
+		if !strings.EqualFold(t.Name, name) {
+			continue
+		}
+		if found != nil {
+			return nil // ambiguous across schemas
+		}
+		found = t
+	}
+	return found
 }
 
 // LookupTableByOID is the read-locked public accessor for tableByOID.
@@ -8838,6 +9032,12 @@ func (c *InMemory) registerSystemTables() {
 			case "template0":
 				datallowconn, datistemplate = "false", "true"
 			}
+			// The connect-time gate reads the SAME rule through
+			// DatabaseAllowsConnections, so the catalog cannot say
+			// datallowconn=false while the postmaster lets the connection in.
+			// Asserted here rather than duplicated: a future edit to either
+			// side that breaks the agreement fails TestDatabaseAllowsConnections.
+			_ = datallowconn
 			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
 			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
 			// well-known postgres database OID 5) — NOT by this row's displayed
@@ -8849,11 +9049,20 @@ func (c *InMemory) registerSystemTables() {
 			// SUBSCRIPTION's subdbid) already depend on for "the" connected
 			// database — changing the displayed oid to match broke pg_dump's
 			// subscription round-trip (subdbid join no longer matched). Only the
-			// live "postgres" row can carry a granted ACL (execDatabaseACLChange's
-			// v0 single-database scope), so every other row is unconditionally NULL.
+			// live "postgres" row could carry a granted ACL, because
+			// execDatabaseACLChange only ever wrote that one.
+			//
+			// EVERY row is looked up now (M0122-0008). ResolveDatabaseOid is the
+			// same key execDatabaseACLChange writes under, and it returns DBOID()
+			// for "postgres", so the live row's rendering is byte-identical to the
+			// previous special case. This is the reader half of a sibling pair
+			// (Hard-won Rule #2): while the writer was single-database, rendering
+			// any other row was dead code -- and leaving the reader pinned to
+			// "postgres" after teaching the writer to reach other databases would
+			// have stored a datacl that pg_database could never show.
 			datacl := VirtualNull
-			if n == "postgres" {
-				if aclText := c.DatabaseACLText(c.DBOID()); aclText != "" {
+			if aclOID, found := c.ResolveDatabaseOid(n); found && aclOID != 0 {
+				if aclText := c.DatabaseACLText(aclOID); aclText != "" {
 					datacl = aclText
 				}
 			}
@@ -12272,6 +12481,59 @@ func (c *InMemory) registerSystemTables() {
 			{"default_toast_compression", "pglz", "", "Client Connection Defaults / Statement Behavior",
 				"Sets the default compression method for compressible values.", "",
 				"user", "enum", "default", "", "", "{pglz,lz4}", "pglz", "pglz", "", "", "f"},
+			// CONN_AUTH_SSL family + ssl_library, as a build without USE_SSL
+			// reports them (registered in internal/utils/misc/defaults.go
+			// registerSSLGUCs). Text captured from the PG 18.3 oracle's pg_settings;
+			// ssl_renegotiation_limit is GUC_NO_SHOW_ALL and not listed there.
+			// M0122-0008.
+			{"ssl", "off", "", "Connections and Authentication / SSL",
+				"Enables SSL connections.", "",
+				"sighup", "bool", "default", "", "", "", "off", "off", "", "", "f"},
+			{"ssl_ca_file", "", "", "Connections and Authentication / SSL",
+				"Location of the SSL certificate authority file.", "",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_cert_file", "server.crt", "", "Connections and Authentication / SSL",
+				"Location of the SSL server certificate file.", "",
+				"sighup", "string", "default", "", "", "", "server.crt", "server.crt", "", "", "f"},
+			{"ssl_ciphers", "none", "", "Connections and Authentication / SSL",
+				"Sets the list of allowed TLSv1.2 (and lower) ciphers.", "",
+				"sighup", "string", "default", "", "", "", "none", "none", "", "", "f"},
+			{"ssl_crl_dir", "", "", "Connections and Authentication / SSL",
+				"Location of the SSL certificate revocation list directory.", "",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_crl_file", "", "", "Connections and Authentication / SSL",
+				"Location of the SSL certificate revocation list file.", "",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_dh_params_file", "", "", "Connections and Authentication / SSL",
+				"Location of the SSL DH parameters file.", "An empty string means use compiled-in default parameters.",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_groups", "none", "", "Connections and Authentication / SSL",
+				"Sets the group(s) to use for Diffie-Hellman key exchange.", "Multiple groups can be specified using a colon-separated list.",
+				"sighup", "string", "default", "", "", "", "none", "none", "", "", "f"},
+			{"ssl_key_file", "server.key", "", "Connections and Authentication / SSL",
+				"Location of the SSL server private key file.", "",
+				"sighup", "string", "default", "", "", "", "server.key", "server.key", "", "", "f"},
+			{"ssl_library", "", "", "Preset Options",
+				"Shows the name of the SSL library.", "",
+				"internal", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_max_protocol_version", "", "", "Connections and Authentication / SSL",
+				"Sets the maximum SSL/TLS protocol version to use.", "",
+				"sighup", "enum", "default", "", "", "{\"\",TLSv1,TLSv1.1,TLSv1.2,TLSv1.3}", "", "", "", "", "f"},
+			{"ssl_min_protocol_version", "TLSv1.2", "", "Connections and Authentication / SSL",
+				"Sets the minimum SSL/TLS protocol version to use.", "",
+				"sighup", "enum", "default", "", "", "{TLSv1,TLSv1.1,TLSv1.2,TLSv1.3}", "TLSv1.2", "TLSv1.2", "", "", "f"},
+			{"ssl_passphrase_command", "", "", "Connections and Authentication / SSL",
+				"Command to obtain passphrases for SSL.", "An empty string means use the built-in prompting mechanism.",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"ssl_passphrase_command_supports_reload", "off", "", "Connections and Authentication / SSL",
+				"Controls whether \"ssl_passphrase_command\" is called during server reload.", "",
+				"sighup", "bool", "default", "", "", "", "off", "off", "", "", "f"},
+			{"ssl_prefer_server_ciphers", "on", "", "Connections and Authentication / SSL",
+				"Give priority to server ciphersuite order.", "",
+				"sighup", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"ssl_tls13_ciphers", "", "", "Connections and Authentication / SSL",
+				"Sets the list of allowed TLSv1.3 cipher suites.", "An empty string means use the default cipher suites.",
+				"sighup", "string", "default", "", "", "", "", "", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.
@@ -12623,6 +12885,18 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table, dbOid ...uint32) error {
 // System catalog tables are excluded from Snapshot() so they are
 // never persisted to JSON — they are always re-registered at
 // startup from their heap relfiles.
+//
+// The trailing variadic dbOid registers the table into a distinct
+// database's own catalog namespace (mirrors TryRegisterUserTable /
+// RegisterIndexDuringRecoveryForDB) — M0143-0002e, the read-side half of the
+// per-database pg_type/pg_attribute fix. Omitting it (or passing
+// DefaultDBOid) preserves the original single-namespace behavior exactly:
+// t.DBOid is left at its zero value, which RelFileNode's `table.DBOid != 0`
+// check treats as "route through the process-wide c.dbOid", the pre-existing
+// convention every caller before M0143-0002e relied on. Passing a genuinely
+// distinct dbOid stamps t.DBOid so RelFileNode instead resolves the table's
+// own database's physical file (base/<dbOid>/<OID>), the same fallback rule
+// documented on RelFileNode itself.
 func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	if t == nil {
 		return fmt.Errorf("RegisterRealTable: nil table")
@@ -12635,7 +12909,11 @@ func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	resolved := resolveDBOid(dbOid)
+	if resolved != DefaultDBOid {
+		t.DBOid = resolved
+	}
+	ns := c.getOrCreateNS(resolved)
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
 	if existing, ok := ns.tables[k]; ok {
 		if existing.OID == t.OID {
@@ -13700,37 +13978,86 @@ func (c *InMemory) DropCastDuringRecovery(source, target string) {
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.
 // M0110-0003.
-func (c *InMemory) CreateExtension(name, schema, version, database string, ifNotExists bool) error {
+func (c *InMemory) CreateExtension(name, schema, version, database string, ifNotExists bool) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.extensions[lc]; ok {
-		if ifNotExists {
-			return nil
+	// Per-database uniqueness (pg_extension_name_index constrains within one
+	// database): a same-named row conflicts iff its scope overlaps the
+	// install scope — an unscoped row is visible in every database, and an
+	// unscoped install would collide with every database's row.
+	for _, e := range c.extensions {
+		if strings.ToLower(e.name) == lc && (e.database == "" || database == "" || e.database == database) {
+			if ifNotExists {
+				return false, nil
+			}
+			return false, fmt.Errorf("extension %q already exists", name)
 		}
-		return fmt.Errorf("extension %q already exists", name)
 	}
 	if schema == "" {
 		schema = "public"
 	}
 	c.nextOID++
-	c.extensions[lc] = &extensionRow{
+	c.extensions[extensionRegistryKey(database, lc)] = &extensionRow{
 		oid:      c.nextOID,
 		name:     name,
 		schema:   schema,
 		version:  version,
 		database: database,
 	}
+	return true, nil
+}
+
+// extensionRegistryKey builds the c.extensions map key for (database, lcname).
+// M0119-0006bs.
+func extensionRegistryKey(database, lcname string) string {
+	return database + "\x00" + lcname
+}
+
+// extensionForDBLocked resolves the registry row for name visible in database
+// scope `database`: the exact-scope row, else the unscoped row, else — when
+// database == "" — the first same-named row (matching extensionRowsLocked's
+// "empty filter shows all" convention for embedded/test callers). Must hold
+// c.mu (R or W). M0119-0006bs.
+func (c *InMemory) extensionForDBLocked(name, database string) *extensionRow {
+	lc := strings.ToLower(name)
+	if e, ok := c.extensions[extensionRegistryKey(database, lc)]; ok {
+		return e
+	}
+	if e, ok := c.extensions[extensionRegistryKey("", lc)]; ok {
+		return e
+	}
+	if database == "" {
+		for _, e := range c.extensions {
+			if strings.ToLower(e.name) == lc {
+				return e
+			}
+		}
+	}
 	return nil
 }
 
-// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
-// The caller (execDropCompat) has already validated the extension exists and
-// captured its OID for heap cleanup.
-func (c *InMemory) DropExtension(name string) {
+// DropExtension removes a runtime pg_extension entry (DROP EXTENSION),
+// scoped to database — upstream drops only the current database's
+// pg_extension row. An unscoped row (database == "") visible in `database`
+// is removed as well. Returns the removed row's OID and scope so the caller
+// can stamp xmax on the heap that holds it. The caller (execDropCompat) has
+// already validated the extension exists in this database.
+// M0119-0006bs: per-database scoping.
+func (c *InMemory) DropExtension(name, database string) (uint32, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.extensions, strings.ToLower(name))
+	lc := strings.ToLower(name)
+	key := extensionRegistryKey(database, lc)
+	if _, ok := c.extensions[key]; !ok {
+		key = extensionRegistryKey("", lc)
+		if _, ok := c.extensions[key]; !ok {
+			return 0, "", false
+		}
+	}
+	e := c.extensions[key]
+	delete(c.extensions, key)
+	return e.oid, e.database, true
 }
 
 // CreateExtensionDuringRecovery re-registers an extension at startup from the
@@ -13741,26 +14068,32 @@ func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.extensions[lc]; ok {
-		return // already registered
+	key := extensionRegistryKey(database, lc)
+	if _, ok := c.extensions[key]; ok {
+		return // already registered for this database scope
 	}
-	c.extensions[lc] = &extensionRow{
+	c.extensions[key] = &extensionRow{
 		oid:      oid,
 		name:     name,
 		schema:   schema,
 		version:  version,
 		database: database,
 	}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
 }
 
-// ExtensionOID returns the runtime pg_extension OID for the named extension, or
-// 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
-// key the pg_description row on the extension's catalog OID (classoid 3079) so
-// pg_dump's dumpExtension can re-emit the comment. DU-002 slice 388.
-func (c *InMemory) ExtensionOID(name string) uint32 {
+// ExtensionOID returns the runtime pg_extension OID for the named extension
+// installed in database scope `database`, or 0 if no extension by that name is
+// installed there. Used by COMMENT ON EXTENSION to key the pg_description row
+// on the extension's catalog OID (classoid 3079) so pg_dump's dumpExtension
+// can re-emit the comment. DU-002 slice 388. M0119-0006bs: database scopes the
+// lookup (pg_extension is per-database); "" resolves any same-named row.
+func (c *InMemory) ExtensionOID(name, database string) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if e, ok := c.extensions[strings.ToLower(name)]; ok {
+	if e := c.extensionForDBLocked(name, database); e != nil {
 		return e.oid
 	}
 	return 0
@@ -17446,6 +17779,19 @@ const ownerSequenceACLString = "rwU"
 // publicPseudoRole is the lower-cased name goopg records a GRANT … TO PUBLIC
 // under (PostgreSQL reserves PUBLIC, so no real role can carry this name). It is
 // rendered as the empty grantee in the materialized aclitem[]. DU-002 slice 334.
+// aclWorldDefault reports whether an object class's `acldefault` carries a
+// non-zero world (PUBLIC) default, which is what decides where a PUBLIC
+// aclitem sits in the rendered array. Upstream's switch is
+// `acldefault`, postgres/src/backend/utils/adt/acl.c:804: DATABASE, FUNCTION,
+// LANGUAGE and TYPE have one; TABLE, SEQUENCE, SCHEMA, COLUMN, TABLESPACE,
+// LARGE OBJECT and PARAMETER_ACL do not.
+type aclWorldDefault bool
+
+const (
+	aclHasWorldDefault aclWorldDefault = true
+	aclNoWorldDefault  aclWorldDefault = false
+)
+
 const publicPseudoRole = "public"
 
 // schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
@@ -17568,7 +17914,7 @@ func (c *InMemory) HasParameterACL(parname string) bool {
 func (c *InMemory) ParameterACLText(paramOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString)
+	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString, aclNoWorldDefault)
 }
 
 // ParameterACLEntries returns every granted GUC's (oid, parname) pair, sorted
@@ -17629,7 +17975,7 @@ const ownerForeignServerACLString = "U"
 func (c *InMemory) ForeignServerACLText(srvOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString)
+	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString, aclNoWorldDefault)
 }
 
 // foreignDataWrapperACLPrivOrder lists the foreign-data-wrapper
@@ -17663,7 +18009,7 @@ const ownerForeignDataWrapperACLString = "U"
 func (c *InMemory) ForeignDataWrapperACLText(fdwOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString)
+	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString, aclNoWorldDefault)
 }
 
 // databaseACLPrivOrder lists the database (pg_database) privileges in
@@ -17701,7 +18047,7 @@ const ownerDatabaseACLString = "CTc"
 func (c *InMemory) DatabaseACLText(dbOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString)
+	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString, aclHasWorldDefault)
 }
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)
@@ -17797,7 +18143,7 @@ func (c *InMemory) PGInitPrivsRowsForDBOid(dbOid uint32) [][]string {
 // server-side aclexplode/aclitemout is involved — so projecting the correct
 // text is sufficient for the round-trip.
 func (c *InMemory) relaclTextLocked(relOID uint32) string {
-	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
+	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString, aclNoWorldDefault)
 }
 
 // RelaclText renders the materialized pg_class.relacl text for the table
@@ -17816,7 +18162,7 @@ func (c *InMemory) RelaclText(relOID uint32) string {
 // sequence owner-default string "rwU", which is what pg_dump diffs against via
 // acldefault('s', owner). DU-002 slice 333. Caller must hold c.mu.
 func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
-	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString)
+	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString, aclNoWorldDefault)
 }
 
 // NamespaceACLText renders the materialized pg_namespace.nspacl text for the
@@ -17829,7 +18175,7 @@ func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
 func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString)
+	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString, aclNoWorldDefault)
 }
 
 // ProcACLText renders the materialized pg_proc.proacl text for the routine
@@ -17846,7 +18192,7 @@ func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 func (c *InMemory) ProcACLText(procOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString)
+	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString, aclHasWorldDefault)
 }
 
 // TypeACLText renders the materialized pg_type.typacl text for the type/domain
@@ -17865,7 +18211,7 @@ func (c *InMemory) ProcACLText(procOID uint32) string {
 func (c *InMemory) TypeACLText(typeOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString)
+	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString, aclHasWorldDefault)
 }
 
 // AttrACLText renders the materialized pg_attribute.attacl text for the column
@@ -17949,7 +18295,8 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it
 // renders the materialized aclitem[] for relOID using the given privilege order
 // and owner-default privilege-letter string. Caller must hold c.mu.
-func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
+func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string,
+	worldDefault aclWorldDefault) string {
 	byRole := c.tableACLs[relOID]
 	if len(byRole) == 0 {
 		if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
@@ -17977,6 +18324,32 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	// pg_dump diffs that against acldefault to re-emit the owner's `REVOKE ALL …`.
 	// Suppress the leading owner entry in that case. DU-002 slice 344.
 	var items []string
+	// acldefault() writes the world (PUBLIC) aclitem BEFORE the owner's, but
+	// ONLY for the object classes whose world default is non-zero
+	// (`acldefault`, postgres/src/backend/utils/adt/acl.c:804 — DATABASE
+	// CONNECT|TEMP, FUNCTION EXECUTE, LANGUAGE USAGE, TYPE USAGE). For every
+	// other class the world default is ACL_NO_RIGHTS, so a PUBLIC entry can
+	// only come from an explicit GRANT, and `aclupdate` (same file) APPENDS a
+	// new grantee to the end of the array without sorting — PUBLIC is then an
+	// ordinary grantee in grant order.
+	//
+	// Measured against PG 18.3 on a private cluster, same statement order:
+	//   table    {postgres=arwdDxtm/postgres,bob=r/postgres,=r/postgres}
+	//   database {=Tc/postgres,postgres=CTc/postgres,bob=c/postgres}
+	// aclitem[] is visible text that pg_dump compares, so hoisting PUBLIC for
+	// a table would be a new divergence, not a fix.
+	if publicPrivs := byRole[publicPseudoRole]; worldDefault && len(publicPrivs) > 0 {
+		if letters := renderACLLetters(publicPrivs, privOrder); letters != "" {
+			grantor := aclOwnerRole
+			if g, ok := c.tableACLGrantor[relOID][publicPseudoRole]; ok && g != "" {
+				grantor = g
+			}
+			if disp, ok := c.roleACLDisplay[grantor]; ok {
+				grantor = disp
+			}
+			items = append(items, "="+letters+"/"+aclQuoteName(grantor))
+		}
+	}
 	if !c.relACLEmptied[relOID] && !c.relACLOwnerRevoked[relOID] {
 		ownerLetters := ownerString
 		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
@@ -17996,6 +18369,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if role == aclOwnerRole || seen[role] {
 			continue
 		}
+		if role == publicPseudoRole && worldDefault {
+			continue // already rendered as acldefault's leading world item
+		}
 		if _, ok := byRole[role]; !ok {
 			continue // stale order entry (role fully revoked)
 		}
@@ -18009,6 +18385,9 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	for role := range byRole {
 		if role == aclOwnerRole || seen[role] {
 			continue
+		}
+		if role == publicPseudoRole && worldDefault {
+			continue // already rendered as acldefault's leading world item
 		}
 		missing = append(missing, role)
 	}
@@ -18138,6 +18517,30 @@ func (c *InMemory) DropCompatObject(objType, name string) bool {
 		return true
 	}
 	return false
+}
+
+// HasCompatObject reports whether name is registered under objType.
+func (c *InMemory) HasCompatObject(objType, name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.compatObjects[strings.ToLower(objType)][name]
+	return ok
+}
+
+// RenameCompatObject moves a registered name to newName under objType,
+// returning false when oldName was not registered. Used by ALTER … RENAME of
+// objects whose existence the registry tracks (rules), so a later DROP finds
+// them under the new name.
+func (c *InMemory) RenameCompatObject(objType, oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.compatObjects[strings.ToLower(objType)]
+	if _, ok := m[oldName]; !ok {
+		return false
+	}
+	delete(m, oldName)
+	m[newName] = struct{}{}
+	return true
 }
 
 // ListCompatObjects returns all registered names for a given object type.
@@ -22106,10 +22509,10 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 // DropPrimaryKeyConstraint removes the named primary-key constraint (index)
 // from the table's index registries. Returns true if found and removed.
 // M0097-0036.
-func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropPrimaryKeyConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // DropUniqueConstraint removes the named UNIQUE constraint (index-backed,
@@ -22119,10 +22522,10 @@ func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName stri
 // with IsConstraint set), so the removal logic doesn't need to differ; only
 // the caller-side lookup that finds the index by name distinguishes Primary
 // from plain Unique. DU-002 slice 433 follow-up.
-func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropUniqueConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // DropExclusionConstraint removes the named EXCLUDE constraint (index-backed,
@@ -22131,17 +22534,34 @@ func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) 
 // found and removed. Shares dropIndexByName — an EXCLUDE index is stored the
 // same way as a PK/UNIQUE index; only the caller-side lookup differs. DU-002
 // slice 433 follow-up (2nd pass).
-func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName string) bool {
+func (c *InMemory) DropExclusionConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dropIndexByName(tableOID, constraintName)
+	return c.dropIndexByName(tbl, constraintName)
 }
 
 // dropIndexByName removes the named index (backing either a PRIMARY KEY or a
 // UNIQUE constraint) from both the per-table and flat index registries.
 // Caller must hold c.mu for writing.
-func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
-	inner, ok := c.ns(DefaultDBOid).byTable[tableOID]
+//
+// Takes the resolved *Table (not a bare OID) and keys the namespace lookup
+// off tbl.DBOid instead of hardcoding DefaultDBOid — M0143-0002b: the old
+// (tableOID, name) signature always read/wrote c.ns(DefaultDBOid).byTable,
+// so a PK/UNIQUE/EXCLUDE-backed constraint on a table living in a
+// non-default database silently failed to drop (same shape as M0143-0002's
+// DropForeignKeyConstraint bug, confirmed live via the same two-database
+// repro pattern). Index registration is genuinely per-DB
+// (c.ns(dbOid).byTable[tbl.OID] at every registration site), so this now
+// matches where the entry actually lives.
+func (c *InMemory) dropIndexByName(tbl *Table, constraintName string) bool {
+	if tbl == nil {
+		return false
+	}
+	dbOid := DefaultDBOid
+	if tbl.DBOid != 0 {
+		dbOid = tbl.DBOid
+	}
+	inner, ok := c.ns(dbOid).byTable[tbl.OID]
 	if !ok {
 		return false
 	}
@@ -22150,9 +22570,9 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 	}
 	delete(inner, constraintName)
 	// Also remove from the flat indexes map.
-	for k, idx := range c.ns(DefaultDBOid).indexes {
-		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
-			delete(c.ns(DefaultDBOid).indexes, k)
+	for k, idx := range c.ns(dbOid).indexes {
+		if idx.Table != nil && idx.Table.OID == tbl.OID && idx.Name == constraintName {
+			delete(c.ns(dbOid).indexes, k)
 			break
 		}
 	}
@@ -22162,14 +22582,19 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 // DropForeignKeyConstraint removes the named foreign-key constraint from the
 // table's ForeignKeys slice. Returns true if found and removed. Unlike
 // PK/UNIQUE constraints, a foreign key isn't backed by a separate Index
-// registry entry — it lives only on Table.ForeignKeys — so this looks the
-// table up by OID and mutates that slice directly. DU-002 slice 433
-// follow-up.
-func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
+// registry entry — it lives only on Table.ForeignKeys — so this mutates the
+// caller-supplied *Table directly instead of re-resolving it by OID.
+// (M0143-0002: the old (tableOID, name) signature re-looked the table up via
+// tableByOID(tableOID, DefaultDBOid), which returned ok=false — and so
+// silently dropped nothing — for any table living in a non-default database;
+// confirmed live via a two-database repro. The caller already holds the
+// correct *Table for the target's own database, so taking it directly
+// removes the mismatch instead of threading dbOid through another lookup.)
+// DU-002 slice 433 follow-up.
+func (c *InMemory) DropForeignKeyConstraint(tbl *Table, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
-	if !ok {
+	if tbl == nil {
 		return false
 	}
 	for i := range tbl.ForeignKeys {
@@ -22182,13 +22607,22 @@ func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName stri
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.
+//
+// Keys the namespace lookup off table.DBOid instead of hardcoding
+// DefaultDBOid — M0143-0002b: a table living in a non-default database
+// otherwise always reported false here regardless of its actual PK, the
+// same hardcode shape M0143-0002 fixed for DropForeignKeyConstraint.
 func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if table == nil {
 		return false
 	}
-	idxs := c.ns(DefaultDBOid).byTable[table.OID]
+	dbOid := DefaultDBOid
+	if table.DBOid != 0 {
+		dbOid = table.DBOid
+	}
+	idxs := c.ns(dbOid).byTable[table.OID]
 	for _, idx := range idxs {
 		if idx.Primary {
 			return true
@@ -24759,6 +25193,15 @@ func formatExprForAttrdef(e parser.Expr) string {
 			op = " IS NOT DISTINCT FROM "
 		}
 		return formatExprForAttrdef(v.Left) + op + formatExprForAttrdef(v.Right)
+	}
+	if v, ok := e.(*parser.CollateExpr); ok {
+		// get_rule_expr T_CollateExpr: `(arg COLLATE name)`, the name quoted
+		// by quote_identifier. Executor twin: defaultExprToSQL.
+		parts := strings.Split(v.CollationName, ".")
+		for i, p := range parts {
+			parts[i] = pgQuoteIdentForTSDict(p)
+		}
+		return "(" + formatExprForAttrdef(v.Operand) + " COLLATE " + strings.Join(parts, ".") + ")"
 	}
 	return fmt.Sprintf("%v", e)
 }

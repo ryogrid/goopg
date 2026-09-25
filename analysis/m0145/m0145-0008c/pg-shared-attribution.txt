@@ -1,0 +1,24 @@
+# M0145-0008c per-key PG-shared attribution for the ea-ratchet repin (AGENT.md G4, 2026-09-24 extension)
+# goopg HEAD capture: commit 9520f622f (code = bb90e51a4), binary sha256/16 d793732fb494ac65
+# pre-change capture: worktree a04b5c00e (before M0146-0002e), same data clone, same ANALYZE seed 20260905
+# PG side: bench/tpcds/plans-pg (the ratchet's pinned PG 18.3 estimates), keyed by the scorer's own collect()
+
+## Who introduced each NEW key (A/B on the same data)
+pre-0002e ratchet: NEW = Q95 only                    (pre-0002e-ratchet.txt)
+HEAD ratchet:      NEW = Q95, Q14:date_dim+store_sales, Q14:date_dim+item+store_sales   (head-ratchet.txt)
+=> Q95 introduced by the M0145-0008 flip (its own ledger row); both Q14 keys by M0146-0002e (bb90e51a4).
+
+## Q95:cte:ws_wh+customer_address+date_dim+web_sales+web_site   goopg est 1, actual 22 (Hash Semi Join)
+goopg keys:  {ca,dd,ws,site}            Gather est 1, actual 22   (the error is born here; the semi join inherits it)
+PG keys:     {ca,dd,ws,site}            est [1]           -> PG qerr vs actual 22 = 22
+             {ws_wh,ca,dd,wr,ws,site}   est [1,1,1,1,1]   -> PG qerr vs goopg actual 12 = 12
+goopg's key lies between PG's two nearest scopes; PG estimates both at 1 with the same ~22x underestimate. PG-SHARED.
+
+## Q14:date_dim+store_sales   goopg est 56, actual 4927 (Hash Join; Q14b, d_week_seq = (InitPlan) filter on date_dim)
+## Q14:date_dim+item+store_sales   goopg est 282, actual 21264 (Gather; Q14a channel)
+Why NEW: the scorer keeps a key's LARGEST-actual occurrence. Pre-change that was a 687k-row join estimated at 687530
+(accurate). At HEAD that occurrence sits under a Gather (no actual reported), so the representative became these nodes.
+The estimates of these nodes are the same as before the change.
+PG nearest scope {cte:cross_items,date_dim,item,store_sales}: est [1 x12] vs goopg actual 21135 -> PG qerr 21135.
+PG does not form {date_dim,store_sales} or {date_dim,item,store_sales} (it joins cross_items first); its nearest
+superset scope underestimates far worse than goopg. PG-SHARED.
