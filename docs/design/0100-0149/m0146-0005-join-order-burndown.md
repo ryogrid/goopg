@@ -431,6 +431,34 @@ Results:
 Two changes are not ported: the LEFT-join inner-unique arm, and nested loops
 with a unique inner (ledgered).
 
+## Slice 7 (M0146-0005f): nested loops with a unique inner
+
+`final_cost_nestloop` takes the semi/anti early-exit branch for an INNER pair
+whose inner rel is proven unique, using slice 6's inner-join factors.
+
+For a parameterised probe into a primary key, `has_indexed_join_quals`
+holds. Nearly every outer row is then "unmatched" and pays
+`inner_rescan_run_cost / inner_rows`, and `ntuples` is about 0, so the
+output-row `cpu_tuple_cost` disappears. A Memoize inner is not indexed, so
+its cost barely moves.
+
+The per-pair site in `joinpaths.go` now builds these factors from:
+- `innerRelProvenUnique`, the hash join's uniqueness proof, factored out
+  and made to skip non-key clauses;
+- `innerUniqueMatchFactors`.
+
+Unique-ified pairs keep the old path, because PG computes their factors
+with the SEMI SpecialJoinInfo.
+
+Results:
+- TPC-DS: 6 structural changes per scale, and the first-divergence census
+  is unchanged. Q21's changed subtree is now PG's.
+- TPC-H: census identical.
+- Gates: all pass.
+- Evidence: `analysis/m0146/m0146-0005/slice7/`.
+
+The LEFT-join inner-unique arm remains deferred.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

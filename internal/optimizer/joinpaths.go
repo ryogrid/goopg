@@ -354,6 +354,16 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// nested-loop candidate for the pair reads them. `jt` is already
 	// demoted to INNER when a side is unique-ified, as in PG.
 	semi := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
+	// M0146-0005f: final_cost_nestloop takes the same early-exit branch for
+	// an INNER pair whose inner rel is proven unique (extra->inner_unique),
+	// with the inner-join factors (outer_match_frac = the clause selectivity,
+	// match_count = the inner's rows). A unique-ified pair is left alone: PG
+	// computes its factors with the SEMI SpecialJoinInfo.
+	if !semi.apply && jt == parser.JoinInner && uniq == uniqueSideNone &&
+		s.innerRelProvenUnique(outer, inner, clauses, true) {
+		frac, matchCount := s.innerUniqueMatchFactors(inner, clauses)
+		semi = semiAntiJoinFactors{apply: true, outerMatchFrac: frac, matchCount: matchCount}
+	}
 
 	// 03 §9 rule 2 — PATH_PARAM_BY_REL (joinpath.c:43-47). The two directions
 	// are refused for genuinely different reasons, so they are named

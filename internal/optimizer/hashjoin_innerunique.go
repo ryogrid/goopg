@@ -56,47 +56,74 @@ func (s *searchCtx) hashJoinFinalCostInputFor(joinrel, outer, inner *RelOptInfo,
 		approx *= cs
 	}
 	base := hashJoinFinalCostInput{hashClauseSel: clampSelectivity(approx)}
-	if s.cat == nil || jt != parser.JoinInner || joinrel == nil ||
-		outer == nil || inner == nil || relLevel(inner.Relids) != 1 ||
-		inner.CheapestTotal == nil || inner.CheapestTotal.RequiredOuter != 0 ||
-		outer.Rows <= 0 {
+	if jt != parser.JoinInner || joinrel == nil || outer == nil || outer.Rows <= 0 ||
+		!s.innerRelProvenUnique(outer, inner, keys, false) {
 		return base
 	}
+	base.innerUnique = true
+	base.outerMatchFrac, base.matchCount = s.innerUniqueMatchFactors(inner, clauses)
+	return base
+}
 
+// innerRelProvenUnique is the fail-closed half of PG's innerrel_is_unique
+// that goopg can prove: the inner-side columns of `keys` collectively cover
+// one complete non-partial bare unique index of a sole, complete base
+// relation.  `provableKeys` already implements that coverage and rejects
+// partial indexes; retaining its `fromFK` distinction is essential: an FK can
+// establish selectivity but does not make the inner side unique.  With
+// `skipNonKeys` a clause that is not an outer=inner equi-pair is ignored (a
+// nested loop's whole restriction list); otherwise it declines (a hash
+// join's key list).
+func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restrictInfo, skipNonKeys bool) bool {
+	if s == nil || s.cat == nil || outer == nil || inner == nil || len(keys) == 0 ||
+		relLevel(inner.Relids) != 1 ||
+		inner.CheapestTotal == nil || inner.CheapestTotal.RequiredOuter != 0 {
+		return false
+	}
 	innerRel := bits.TrailingZeros32(uint32(inner.Relids))
 	if innerRel < 0 || innerRel >= len(s.relInfos) || inner.Relids != RelSet(1)<<uint(innerRel) {
-		return base
+		return false
 	}
-
-	pairs := make([]joinKeyPair, len(keys))
-	for i, ri := range keys {
+	pairs := make([]joinKeyPair, 0, len(keys))
+	for _, ri := range keys {
 		pair, ok := s.joinKeyPairOf(ri, outer.Relids, inner.Relids)
 		if !ok {
-			return base
+			if skipNonKeys {
+				continue
+			}
+			return false
 		}
-		pairs[i] = pair
+		pairs = append(pairs, pair)
+	}
+	if len(pairs) == 0 {
+		return false
 	}
 	for _, key := range s.provableKeys(s.cat, pairs, make([]bool, len(pairs)),
 		func(key provenKey) bool { return !key.fromFK && key.keyRel == innerRel }) {
 		if !key.fromFK {
-			sel := 1.0
-			for _, ri := range oneClausePerEquivClass(clauses) {
-				if ri == nil {
-					continue
-				}
-				cs, _ := s.joinClauseSelectivityExt(ri)
-				sel *= cs
-			}
-			sel = clampSelectivity(sel)
-			matchCount := 1.0
-			if sel > 0 {
-				matchCount = math.Max(1.0, inner.Rows)
-			}
-			base.innerUnique = true
-			base.outerMatchFrac = sel
-			base.matchCount = matchCount
-			return base
+			return true
 		}
 	}
-	return base
+	return false
+}
+
+// innerUniqueMatchFactors is compute_semi_anti_join_factors for an INNER
+// pair with a unique inner: outer_match_frac is the inner-join selectivity of
+// the pair's restriction list (one clause per EC) and match_count is the
+// inner rel's row count (nselec * rows / jselec with jselec == nselec).
+func (s *searchCtx) innerUniqueMatchFactors(inner *RelOptInfo, clauses []*restrictInfo) (float64, float64) {
+	sel := 1.0
+	for _, ri := range oneClausePerEquivClass(clauses) {
+		if ri == nil {
+			continue
+		}
+		cs, _ := s.joinClauseSelectivityExt(ri)
+		sel *= cs
+	}
+	sel = clampSelectivity(sel)
+	matchCount := 1.0
+	if sel > 0 {
+		matchCount = math.Max(1.0, inner.Rows)
+	}
+	return sel, matchCount
 }

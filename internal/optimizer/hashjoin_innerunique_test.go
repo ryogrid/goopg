@@ -358,3 +358,23 @@ func TestHashJoinNonUniqueChargesApproxTupleCount(t *testing.T) {
 		t.Fatalf("approx delta = %.6f, want %.6f", got, want)
 	}
 }
+
+// TestInnerRelProvenUniqueNestLoopSkipsNonKeyClauses pins M0146-0005f: a
+// nested loop proves inner uniqueness over its whole restriction list, so a
+// clause that is not an outer=inner equi-pair is skipped rather than
+// declining the proof (PG's innerrel_is_unique considers only the
+// mergejoinable clauses). The hash join's key list still declines.
+func TestInnerRelProvenUniqueNestLoopSkipsNonKeyClauses(t *testing.T) {
+	s, _, outer, inner, keys := r90UniqueFixture(t)
+	withOther := append([]*restrictInfo{{}}, keys...)
+	if !s.innerRelProvenUnique(outer, inner, withOther, true) {
+		t.Fatal("nested-loop proof declined on a non-key clause")
+	}
+	if s.innerRelProvenUnique(outer, inner, withOther, false) {
+		t.Fatal("hash-key proof accepted a non-key clause")
+	}
+	frac, matchCount := s.innerUniqueMatchFactors(inner, keys)
+	if frac != r90InnerJoinSelectivity(s, keys) || matchCount != inner.Rows {
+		t.Fatalf("factors = %g, %g; want the clause selectivity and %g", frac, matchCount, inner.Rows)
+	}
+}

@@ -1,0 +1,4 @@
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=179932 startup=0 total=1.9719068492249918e+08 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=976 inputtotal=6496.5599999999995
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=179932 startup=0.25 total=66496.73317166705 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=976 inputtotal=6496.5599999999995
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=179932 startup=0.25 total=11597.227173001938 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=976 inputtotal=6496.5599999999995
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=74972 startup=0 total=8.216704499416627e+07 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0} inner={1} width=976 inputtotal=5446.816666666667

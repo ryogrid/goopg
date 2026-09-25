@@ -37,9 +37,9 @@ type semiAntiJoinFactors struct {
 // for INNER), so the two numbers agree with the joinrel size. PG applies no
 // foreign-key selectivity in this function, and neither does this.
 //
-// Only SEMI and ANTI are handled. PG also takes this branch for an inner join
-// whose inner rel is proven unique (`extra->inner_unique`); goopg's nested loop
-// does not yet (ledgered with M0145-0008l).
+// Only SEMI and ANTI are handled here. PG also takes this branch for an inner
+// join whose inner rel is proven unique (`extra->inner_unique`); the caller
+// builds those factors with innerUniqueMatchFactors (M0146-0005f).
 func (s *searchCtx) semiAntiJoinFactorsFor(outer, inner *RelOptInfo, jt parser.JoinType, clauses []*restrictInfo) semiAntiJoinFactors {
 	if s == nil || outer == nil || inner == nil || (jt != parser.JoinSemi && jt != parser.JoinAnti) {
 		return semiAntiJoinFactors{}

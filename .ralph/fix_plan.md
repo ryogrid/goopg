@@ -21283,6 +21283,24 @@ M0146-0001 re-baseline census on the new default arm.
     - Deferred \(ledger\): the LEFT\-join inner\-unique arm and the
       nested\-loop inner\-unique arm \(M0145\-0008l\'s row\).
   Movement: TPC\-DS SF0.25 divergent 92 → 91, SF1 91 → 90
+- [x] **M0146\-0005f — nested loops with a proven\-unique inner take
+  `final\_cost\_nestloop`\'s early\-exit branch** \(opened 2026\-09\-25 from
+  M0146\-0005e\'s ledger row and M0145\-0008l\'s\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-25.** Design doc §"Slice 7"; evidence
+    `analysis/m0146/m0146\-0005/slice7/`.
+    - For an INNER pair \(not unique\-ified\) whose inner base rel is proven
+      unique, the per\-pair nested\-loop factors are the inner\-join clause
+      selectivity and the inner\'s row count. An index probe into a key then
+      drops the output\-row `cpu\_tuple\_cost`; a Memoize inner is unchanged.
+    - `innerRelProvenUnique` \(shared with the hash join, skipping non\-key
+      clauses\) and `innerUniqueMatchFactors`.
+    - TPC\-DS: 6 structural changes per scale, first\-divergence census
+      unchanged; Q21\'s changed subtree is now PG\'s. TPC\-H census
+      identical. Sweep 96/96, fire set PASS, spotcheck PASS, arm 24 MATCH.
+    - Still deferred: the LEFT\-join inner\-unique arm \(ledger\).
+  Movement: none
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
