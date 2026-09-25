@@ -303,6 +303,25 @@ absent"). goopg sized `part` at 83333 rows.
 - `scaleByFloat` still truncates at its other call sites; only the
   base-relation size now follows `clamp_row_est`.
 
+## Slice 5 (not landed): the default hash bucket for a stats-less key
+
+Evidence: `analysis/m0146/m0146-0005/slice5/`.
+
+TPC-DS Q79's top join (`join-method` at depth 2, both scales) hash-joins an
+aggregated subquery against `customer`. PG prices that orientation at 37599
+because the hashed key (`ss_customer_sk`, a GROUP BY output) has no
+statistics: `estimate_hash_bucket_stats` punts to a 0.1 bucket, about 14100
+of bucket walk. goopg's `estimateHashBucketSize` skips a key without
+statistics (`continue`, then "no information"), so its hash join costs 22509
+and beats PG's nested loop (24561).
+
+Dropping the skip is PG-faithful, and is saved as
+`default-hash-bucket.wip.patch`. But it makes TPC-DS Q47 time out: the CTE
+self-join then elects a nested loop over `CTE Scan` with an inner merge join
+estimated at 1 row and costed as cached, where PG merge-joins over
+`Materialize`. The patch waits on that election (M0146-0005a). Q79 would
+additionally need PG's fuzzy startup tie-break against the nested loop.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

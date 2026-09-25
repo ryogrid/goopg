@@ -1,0 +1,101 @@
+diff --git a/internal/optimizer/joinsearchnlicost_test.go b/internal/optimizer/joinsearchnlicost_test.go
+index 90749d5ef..961e81344 100644
+--- a/internal/optimizer/joinsearchnlicost_test.go
++++ b/internal/optimizer/joinsearchnlicost_test.go
+@@ -84,8 +84,13 @@ func TestPGShapedSearchPicksHashJoinOnCost(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	cat.SetTableStats(a, &catalog.TableStats{RowCount: 500_000, Pages: 5_000, Analyzed: true})
+-	cat.SetTableStats(b, &catalog.TableStats{RowCount: 400_000, Pages: 4_000, Analyzed: true})
++	// The join keys carry ANALYZE-like distinct counts (unique keys). A
++	// stats-less key is priced by PG at a 0.1 hash bucket
++	// (estimate_hash_bucket_stats), which is not the shape this test pins.
++	cat.SetTableStats(a, &catalog.TableStats{RowCount: 500_000, Pages: 5_000, Analyzed: true,
++		Columns: []catalog.ColumnStats{{NDistinct: 500_000}, {}}})
++	cat.SetTableStats(b, &catalog.TableStats{RowCount: 400_000, Pages: 4_000, Analyzed: true,
++		Columns: []catalog.ColumnStats{{NDistinct: 400_000}, {}}})
+ 
+ 	stmt := parseOne(t, `SELECT av, bv FROM a, b WHERE x = y`)
+ 	node, err := Plan(stmt, cat)
+diff --git a/internal/optimizer/joinselectivity.go b/internal/optimizer/joinselectivity.go
+index 387930ee4..836fe4460 100644
+--- a/internal/optimizer/joinselectivity.go
++++ b/internal/optimizer/joinselectivity.go
+@@ -916,11 +916,15 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
+ // cost the same — the degeneracy `reselectDegenerateHashKeys` was written to
+ // work around (Q78's collapsed bucket, M0125-0035b).
+ //
+-// Returns 0 when no operand resolves to a statistic. 0 means "no information"
+-// and the caller must skip the term entirely rather than substitute a guess:
+-// inventing a bucket size without stats would move plans on nothing, which is
+-// the failure this bundle keeps recording.
++// Returns 0 only when no hash clause has an inner-side operand. A key
++// without statistics is NOT skipped: like PG it gets the default ndistinct
++// and the 0.1 bucket (M0146-0005 slice 5).
+ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids RelSet) float64 {
++	// No search context (a hand-built unit-test pair) has no planner state
++	// to examine a key against: report "no information", as before.
++	if s == nil {
++		return 0
++	}
+ 	// PG takes the SMALLEST bucketsize over the hash clauses: "we use the
+ 	// smallest bucketsize estimated for any individual hashclause", because the
+ 	// most selective key is the one that spreads the table.
+@@ -939,9 +943,15 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids
+ 			continue
+ 		}
+ 		v := s.examineJoinVar(key, relids)
+-		if v.stats == nil && !v.isBool {
+-			continue
+-		}
++		// M0146-0005 slice 5: no `continue` for a key without statistics.
++		// PG's estimate_hash_bucket_stats calls get_variable_numdistinct for
++		// every hash key; a stats-less key (a derived relation's GROUP BY
++		// output, an expression) comes back isdefault on a relation of 200+
++		// rows and takes the Max(0.1, mcv_freq) arm below — ten entries per
++		// bucket. Skipping it priced TPC-DS Q79's hash of a 1131-row
++		// aggregated subquery with no bucket walk at all (goopg 22509 vs
++		// PG's 37599 for the same join), so the hash join beat PG's
++		// nested loop into customer_pkey.
+ 		// `mcv_freq`: the first MCV entry is the most common value
+ 		// (ColumnStats.MCV is stored Frequency-desc, catalog.go:1809).
+ 		mcvFreq := 0.0
+diff --git a/internal/optimizer/pathtarget_test.go b/internal/optimizer/pathtarget_test.go
+index c9d839cfd..3e368550c 100644
+--- a/internal/optimizer/pathtarget_test.go
++++ b/internal/optimizer/pathtarget_test.go
+@@ -1193,6 +1193,14 @@ func TestSlice3WitnessModelArithmetic(t *testing.T) {
+ // slice3Q9Catalog builds the six TPC-H relations at realistic widths with
+ // analyzed stats (no indexes — the live Q9 baseline is all seq scans), so
+ // the 6-way comma join plans as hash joins the derivation can narrow.
++// slice3Q9KeyNDistinct is the TPC-H SF1 key cardinality the Q9 fixture's
++// ANALYZE would record.
++var slice3Q9KeyNDistinct = map[string]int64{
++	"p_partkey": 200_000, "s_suppkey": 10_000, "o_orderkey": 1_500_000, "n_nationkey": 25,
++	"l_partkey": 200_000, "l_suppkey": 10_000, "l_orderkey": 1_500_000,
++	"ps_partkey": 200_000, "ps_suppkey": 10_000, "s_nationkey": 25, "o_custkey": 100_000,
++}
++
+ func slice3Q9Catalog(t *testing.T) catalog.Catalog {
+ 	t.Helper()
+ 	c := catalog.NewInMemory()
+@@ -1215,7 +1223,17 @@ func slice3Q9Catalog(t *testing.T) catalog.Catalog {
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true})
++		// Key columns carry what ANALYZE would measure: a primary key is
++		// distinct per row, a foreign key has its parent's row count. Without
++		// them every hash key is a default-ndistinct key, which PG prices at a
++		// 0.1 bucket (estimate_hash_bucket_stats, M0146-0005 slice 5).
++		colStats := make([]catalog.ColumnStats, len(cols))
++		for i, cn := range cols {
++			if nd, ok := slice3Q9KeyNDistinct[cn]; ok {
++				colStats[i] = catalog.ColumnStats{NDistinct: nd}
++			}
++		}
++		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true, Columns: colStats})
+ 	}
+ 	mk("part", "p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size", "p_container", "p_retailprice", "p_comment")
+ 	mk("supplier", "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")

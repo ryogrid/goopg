@@ -21139,6 +21139,33 @@ M0146-0001 re-baseline census on the new default arm.
     - Next: the TPC\-DS records — re\-run the first\-divergence census on the
       slice\-4 capture first \(`slice4/census\-sf\*\-candidate.txt`\).
     Movement: none — Q19/Q7 joins now match PG, but no match counter moved
+  - **Slice 5 NOT LANDED 2026\-09\-25 — blocked on M0146\-0005a.** Evidence
+    `analysis/m0146/m0146\-0005/slice5/`; design doc §"Slice 5".
+    - The largest TPC\-DS join\-method family is "PG nested loop, goopg hash
+      join" \(Q1, Q79, Q55, Q8, Q30, Q23, Q92, Q96\). For Q79, PG\'s
+      trace prices goopg\'s hash orientation at 37599. The hashed key is a
+      GROUP BY output with no statistics, so PG uses a 0.1 bucket;
+      `estimateHashBucketSize` skips a stats\-less key and charges no bucket
+      walk \(22509\).
+    - The PG\-faithful fix is saved as `slice5/default\-hash\-bucket.wip.patch`.
+      It makes TPC\-DS Q47 time out \(310 s\): a nested loop over `CTE Scan`
+      with a 1\-row inner merge join, costed as cached, where PG
+      merge\-joins over `Materialize`.
+- [ ] **M0146\-0005a — goopg elects a cached\-inner nested loop over CTE
+  scans where PG merge\-joins \(TPC\-DS Q47\)** \(filed 2026\-09\-25 by
+  M0146\-0005 slice 5\): with stats\-less hash keys given PG\'s 0.1 bucket, Q47\'s
+  `v1 / v1\_lag / v1\_lead` CTE self\-join elects `Nested Loop \(CTE Scan
+  v1\_lead\) × Merge Join \(v1, v1\_lag\)`. The inner is estimated at 1 row
+  and costed by `nestLoopInnerRescanCost`\'s cached\-inner model, and the
+  query times out at 310 s. PG plans merge joins over `Materialize`d CTE
+  scans. This blocks landing `slice5/default\-hash\-bucket.wip.patch`.
+  Kind: recon
+  Parent: M0146\-0005
+  - First step: capture PG\'s PLANCAND for Q47\'s CTE joinrels on the private
+    instrumented PG \(`tmp/pg18\-optdebug`, db `tpcds025`\) and compare with
+    goopg\'s DPPATH on the patched build. Is the nested loop offered by PG
+    and priced higher \(its cost\_rescan of a MergeJoin inner / Materialize
+    path\), or not offered?
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
