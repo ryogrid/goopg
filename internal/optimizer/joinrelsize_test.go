@@ -678,31 +678,23 @@ func jrsUnanalysed(t *testing.T) (catalog.Catalog, *searchCtx) {
 	return c, s
 }
 
-// TestCalcJoinrelSizeFallbackCapWithoutStats: M0126-0010's cap
-// (cardinality.go:400-406), carried into the new sizer for the case it was
-// written for. Neither column is analysed, so both ndistincts are
-// DEFAULT_NUM_DISTINCT and the whole estimate is a constant from selfuncs.h;
-// 24 billion rows is not a measurement of anything, and the cap replaces it
-// with the invariant a non-cross equi-join obeys — no more rows than the larger
-// input.
-func TestCalcJoinrelSizeFallbackCapWithoutStats(t *testing.T) {
+// TestCalcJoinrelSizeDefaultNdWithoutStats: neither column is analysed, so
+// both ndistincts are DEFAULT_NUM_DISTINCT and PG's calc_joinrel_size_estimate
+// gives |L|·|R|/200 with no further clamp. goopg used to cap this at
+// max(|L|, |R|) (M0126-0010); M0146-0005k retired the cap because PG has none
+// and TPC-DS Q44's rank join needs PG's 5424²/200 to plan as PG does.
+func TestCalcJoinrelSizeDefaultNdWithoutStats(t *testing.T) {
 	c, s := jrsUnanalysed(t)
 	outer, inner := jrsRels(6000000, 800000)
 
 	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{jrsEq("l_orderkey", "o_orderkey", noEquivClass)}, nil)
-	wantRows(t, rows, 6000000, "two unanalysed columns")
-
-	if uncapped := clampRowEst(6000000.0 * 800000.0 / defaultNumDistinct); rows >= uncapped {
-		t.Fatalf("rows=%v was not capped below the default-selectivity product %v", rows, uncapped)
-	}
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0/defaultNumDistinct), "two unanalysed columns")
 }
 
-// TestCalcJoinrelSizeInequalityIsCapped: the fallback condition is a property of
-// the CLAUSE ARM, not merely of missing statistics. Both columns here are
-// analysed, but `scalarltjoinsel` has no model at all (selfuncs.c:2908 returns
-// DEFAULT_INEQ_SEL unconditionally), so the statistics never entered the
-// answer and the estimate is as much a guess as the unanalysed case above.
-func TestCalcJoinrelSizeInequalityIsCapped(t *testing.T) {
+// TestCalcJoinrelSizeInequalityUsesDefaultSelectivity: scalarltjoinsel has no
+// model (it returns DEFAULT_INEQ_SEL unconditionally), and PG applies that
+// third to the product as it stands (M0146-0005k: no max(l,r) cap).
+func TestCalcJoinrelSizeInequalityUsesDefaultSelectivity(t *testing.T) {
 	c, partsupp, lineitem := jrsCatalog(t)
 	s := jrsCtx(t, lineitem, partsupp)
 	outer, inner := jrsRels(6000000, 800000)
@@ -712,7 +704,7 @@ func TestCalcJoinrelSizeInequalityIsCapped(t *testing.T) {
 	ri.isEquijoin = false
 
 	rows, _ := s.calcJoinrelSize(c, outer, inner, []*restrictInfo{ri}, nil)
-	wantRows(t, rows, 6000000, "inequality join clause")
+	wantRows(t, rows, clampRowEst(6000000.0*800000.0*defaultIneqSel), "inequality join clause")
 }
 
 // TestCalcJoinrelSizeMeasuredBlowUpIsNotCapped: the other half of the cap's

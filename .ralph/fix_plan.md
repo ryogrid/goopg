@@ -21381,7 +21381,7 @@ M0146-0001 re-baseline census on the new default arm.
       estimates 150975 \(PG 147099\). TPC\-H arm 24 MATCH, census identical.
     - Recommendation: retire the cap \(M0146\-0005k\).
   Movement: none
-- [ ] **M0146\-0005k — retire the all\-default `max\(l,r\)` join\-size cap**
+- [x] **M0146\-0005k — retire the all\-default `max\(l,r\)` join\-size cap**
   \(filed 2026\-09\-25 by M0146\-0005j\): delete the `!est.fired &&
   allDefault` branch of `calcJoinrelSize` \(no PG counterpart in
   `calc\_joinrel\_size\_estimate`\), update the tests that pin it, and land it
@@ -21390,6 +21390,16 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146\-0005
   - First step: remove the branch, run the optimizer tests to list what pins
     it, and fix or retire those pins with PG\'s formula as the reference.
+  - **DONE 2026\-09\-25.** Design doc §"Slice 11"; evidence
+    `analysis/m0146/m0146\-0005/slice11/`.
+    - The `calcJoinrelSize` branch is gone; two tests now pin PG\'s
+      unclamped formula \(`TestCalcJoinrelSizeDefaultNdWithoutStats`,
+      `TestCalcJoinrelSizeInequalityUsesDefaultSelectivity`\).
+    - The plan\-node estimator\'s cap stays: its fallback also covers
+      analysed nested\-loop joins it does not measure \(ledgered\).
+    - 4 TPC\-DS plans change, no timeouts, no shallower census record;
+      TPC\-H unchanged. All gates pass.
+  Movement: TPC\-DS SF1 Q44 depth\-1 record sort\-strategy → parameterisation
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

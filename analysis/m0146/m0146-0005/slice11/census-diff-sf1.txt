@@ -1,0 +1,4 @@
+44c44
+< Q44 depth=1 [sort-strategy] under Limit: PG Merge Join Inner | goopg Sort
+---
+> Q44 depth=1 [parameterisation] under Limit: PG Merge Join Inner | goopg Merge Join Inner

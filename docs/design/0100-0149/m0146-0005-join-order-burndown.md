@@ -518,6 +518,15 @@ plans with no timeouts and no shallower record, and brings Q44's merge
 join to 150975 rows (PG 147099). TPC-H is unaffected. Retiring the cap is
 filed as M0146-0005k. Evidence: `analysis/m0146/m0146-0005/recon-0005j/`.
 
+## Slice 11 (M0146-0005k): the search's all-default `max(l,r)` cap retires
+
+`calcJoinrelSize` now gives a join with only default-guessed clauses PG's
+unclamped product (|L|·|R|/200). The two tests that pinned the cap now pin
+PG's formula. The plan-node estimator keeps its cap, because its fallback
+also covers analysed nested-loop joins it cannot measure (ledgered). Four
+TPC-DS plans change, with no timeouts and no shallower record, and TPC-H
+is unchanged. Evidence: `analysis/m0146/m0146-0005/slice11/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
