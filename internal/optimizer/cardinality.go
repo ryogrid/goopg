@@ -234,6 +234,25 @@ func estimateSetOp(s *SetOp) int64 {
 	if l <= 0 || r <= 0 {
 		return 0
 	}
+	// M0146-0005o: INTERSECT / EXCEPT follow generate_nonunion_paths
+	// (prepunion.c): each arm contributes its group count — its own rows
+	// when the arm is itself grouped, distinct or a set operation
+	// (build_setop_child_paths), else estimate_num_groups over its output
+	// columns — and the result is the smaller arm's groups for INTERSECT,
+	// the left arm's for EXCEPT. The ALL forms emit rows, not groups.
+	if s.Op == parser.SetOpIntersect || s.Op == parser.SetOpExcept {
+		if s.All {
+			if s.Op == parser.SetOpExcept || l < r {
+				return l
+			}
+			return r
+		}
+		lg, rg := setOpArmGroups(s.Left, l), setOpArmGroups(s.Right, r)
+		if s.Op == parser.SetOpExcept || lg < rg {
+			return lg
+		}
+		return rg
+	}
 	var out int64
 	switch s.Op {
 	case parser.SetOpIntersect:
@@ -2219,4 +2238,45 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 		return 0, false
 	}
 	return clampProbability(sel), true
+}
+
+// setOpArmGroups is build_setop_child_paths' *pNumGroups for one set-operation
+// arm: the arm's rows when its own query level groups (GROUP BY, aggregates,
+// HAVING, DISTINCT) or is itself a set operation, else estimate_num_groups
+// over the arm's output columns. A dropping Project on top marks a new query
+// level (`SELECT a FROM (grouped subquery)`), which PG estimates rather than
+// counts.
+func setOpArmGroups(arm Node, rows int64) int64 {
+	top := arm
+	for {
+		switch x := top.(type) {
+		case *Filter:
+			top = x.Child
+			continue
+		case *Sort:
+			top = x.Child
+			continue
+		case *Gather:
+			top = x.Child
+			continue
+		}
+		break
+	}
+	switch top.(type) {
+	case *Aggregate, *Distinct, *DistinctOn, *SetOp:
+		return rows
+	}
+	out := arm.Output()
+	if len(out) == 0 {
+		return rows
+	}
+	exprs := make([]Expr, len(out))
+	for i, c := range out {
+		exprs[i] = &ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	}
+	g := estimateNumGroups(exprs, arm, rows)
+	if g < 1 {
+		return 1
+	}
+	return g
 }

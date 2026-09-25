@@ -1,0 +1,1 @@
+                                 ->  Seq Scan on store  (cost=0.00..10.40 rows=40 width=166)

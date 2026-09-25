@@ -73,14 +73,16 @@ func TestEstimateRowsSetOpRules(t *testing.T) {
 		all  bool
 		want int64
 	}{
-		// prepunion.c:1146-1151; non-ALL dedup approximated /2 (no
-		// estimate_num_groups yet — the 0077 line).
+		// prepunion.c: UNION's non-ALL dedup is still approximated /2.
 		{"union all = l+r", parser.SetOpUnion, true, 1400},
 		{"union = (l+r)/2", parser.SetOpUnion, false, 700},
 		{"intersect all = min", parser.SetOpIntersect, true, 400},
-		{"intersect = min/2", parser.SetOpIntersect, false, 200},
+		// M0146-0005o, generate_nonunion_paths: the smaller arm's GROUPS for
+		// INTERSECT, the left arm's for EXCEPT. These fixture columns are
+		// unique, so each arm's estimate_num_groups is its row count.
+		{"intersect = min(groups)", parser.SetOpIntersect, false, 400},
 		{"except all = l", parser.SetOpExcept, true, 1000},
-		{"except = l/2", parser.SetOpExcept, false, 500},
+		{"except = left groups", parser.SetOpExcept, false, 1000},
 	}
 	for _, tc := range cases {
 		s := &SetOp{Left: left, Right: right, Op: tc.op, All: tc.all}
@@ -297,5 +299,24 @@ func TestEstimateJoinCapFallback(t *testing.T) {
 	want4 := int64(1000000)
 	if got4 != want4 {
 		t.Errorf("with-stats join: EstimateRows = %d, want %d (nd-based, cap must NOT fire)", got4, want4)
+	}
+}
+
+// TestEstimateRowsSetOpNestedArmCountsRows pins build_setop_child_paths'
+// grouped-arm rule (M0146-0005o): an arm that is itself a set operation (or
+// grouped / distinct) contributes its ROWS as its group count, not an
+// estimate_num_groups over its output.
+func TestEstimateRowsSetOpNestedArmCountsRows(t *testing.T) {
+	a := &SeqScan{Table: statsTable("a", 1000, 1000)}
+	b := &SeqScan{Table: statsTable("b", 400, 400)}
+	c := &SeqScan{Table: statsTable("c", 300, 300)}
+	nested := &SetOp{Left: a, Right: b, Op: parser.SetOpUnion, All: true} // 1400 rows
+	except := &SetOp{Left: nested, Right: c, Op: parser.SetOpExcept}
+	if got := EstimateRows(except); got != 1400 {
+		t.Fatalf("EXCEPT over a UNION ALL arm = %d, want the arm's 1400 rows", got)
+	}
+	intersect := &SetOp{Left: nested, Right: c, Op: parser.SetOpIntersect}
+	if got := EstimateRows(intersect); got != 300 {
+		t.Fatalf("INTERSECT = %d, want the smaller arm's 300 groups", got)
 	}
 }

@@ -21480,6 +21480,21 @@ M0146-0001 re-baseline census on the new default arm.
       `Filter:` lines \(a `Join Filter:` is the promoted join\).
     - Grouping/distinct/set\-op arms ledgered.
   Movement: none \(prerequisite for M0146\-0005m\)
+- [x] **M0146\-0005o — INTERSECT / EXCEPT row estimates follow
+  `generate\_nonunion\_paths`** \(opened 2026\-09\-26 from the residual triage:
+  TPC\-DS Q8\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc §"Slice 15"; evidence
+    `analysis/m0146/m0146\-0005/slice15/`.
+    - Each arm contributes its rows when grouped/distinct/a set operation,
+      else `estimate\_num\_groups` over its outputs; INTERSECT takes the
+      smaller, EXCEPT the left; ALL forms use rows \(was: half the input\).
+    - SF0.25 Q8 now plans PG\'s nested loops. SF1 Q8 flips the other way
+      only because PG\'s SF1 `store` has no statistics \(default 40\-row
+      estimate\).
+    - UNION\'s non\-ALL `/2` unchanged \(ledgered\).
+  Movement: TPC\-DS SF0.25 Q8 join\-method → join\-order at the same node
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
@@ -21500,6 +21515,10 @@ M0146-0001 re-baseline census on the new default arm.
     `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
     and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
     goopg reference cluster holds unpadded `char\(n\)` values.
+  - Related 2026\-09\-26 \(M0146\-0005o\): the PG SF1 reference\'s `store`
+    table shows the no\-statistics default estimate \(40 rows, cost 10.40\)
+    in TPC\-DS Q8, so SF1 Q8 diverges on reference statistics. A statistics
+    refresh of that reference table is owner\-only.
   - More evidence 2026\-09\-26 \(M0146\-0005 residual triage\): Q55, Q23 and
     Q30 also diverge on the smaller heaps; goopg\'s `item` \(~5.6 MB\) falls
     under `min\_parallel\_table\_scan\_size`, so its parallel paths vanish.

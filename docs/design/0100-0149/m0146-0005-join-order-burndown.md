@@ -581,6 +581,16 @@ causes outside join search:
 Q8 and Q14 are untraced. Evidence:
 `analysis/m0146/m0146-0005/residual-triage-20260926/`.
 
+## Slice 15 (M0146-0005o): INTERSECT / EXCEPT row estimates
+
+`estimateSetOp` now follows `generate_nonunion_paths`: each arm's group
+count is its rows when grouped, distinct or itself a set operation, else
+`estimate_num_groups` over its outputs. INTERSECT takes the smaller count
+and EXCEPT the left; the ALL forms use rows. goopg had halved the input.
+TPC-DS SF0.25 Q8 now plans PG's nested loops. SF1 Q8 diverges only because
+PG's SF1 `store` table has no statistics. Evidence:
+`analysis/m0146/m0146-0005/slice15/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
