@@ -17352,7 +17352,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       cost to the Hash Semi Join → M0145\-0008ad.
     - TPC\-DS: no changed query at either scale; EA\-RATCHET 52 → 52.
   Movement: none — TPC-H PLAN-PARITY match 3 -> 3; category moves within the noise band
-- [ ] **M0145\-0008ad — TPC\-H Q18 elects a Hash Semi Join where PG elects
+- [x] **M0145\-0008ad — TPC\-H Q18 elects a Hash Semi Join where PG elects
   the unique\-inner Hash Join** \(filed 2026\-09\-25 by M0145\-0008ab\). Both
   candidates now exist for `orders ⋈ ANY\_subquery` \(DP trace shows the
   JOIN\_UNIQUE\_INNER arms costed\); goopg\'s semi path wins, PG\'s inner path
@@ -17367,6 +17367,37 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     `final\_cost\_hashjoin` inputs for the same pair.
   - Expected movement: TPC\-H Q18 `join\-method` \(Hash Semi Join → Hash
     Join\), measured on the TPC\-H fire set.
+  - **DONE 2026\-09\-25, recon.** Design doc
+    `docs/design/0100\-0149/m0145\-0008ad\-q18\-semi\-vs\-inner\-recon.md`;
+    evidence `analysis/m0145/m0145\-0008ad/`.
+    - goopg: the semi and unique\-inner hash paths cost exactly the same
+      \(246725.1975 serial, 233111.13 partial\); `addPath` keeps the
+      incumbent semi.
+    - PG \(instrumented build, private copy of the Q18 tables\): all 63
+      candidates for the pair are JOIN\_INNER; there is no SEMI path at all.
+      `reduce\_unique\_semijoins` \(`analyzejoins.c:844`, `planmain.c:234`\)
+      deletes the SJInfo because the RHS is provably unique.
+    - Not a costing gap: the missing pass is filed as M0145\-0008ae.
+  Movement: none
+- [ ] **M0145\-0008ae — port `reduce\_unique\_semijoins`: drop a semijoin\'s
+  SpecialJoinInfo when its single\-rel RHS is unique for the join clauses**
+  \(filed 2026\-09\-25 by M0145\-0008ad\). PG runs it in `query\_planner`
+  before the join search \(`postgres/src/backend/optimizer/plan/analyzejoins.c:844`,
+  `innerrel\_is\_unique` / `rel\_is\_distinct\_for`\), so a pair like Q18\'s
+  `orders ⋈ ANY\_subquery` is planned and estimated as an ordinary inner
+  join. goopg keeps the SJInfo and elects the semi join on an exact cost tie.
+  Kind: impl
+  Parent: M0145-0008ad
+  - First step: in `classifyPulledQuals` \(jointreepullup.go\), skip appending
+    the SJInfo \(and mark the body\'s link an inner join qual\) when the body
+    is one leaf and either `jtPulledBody.distinct` holds \(RTE\_SUBQUERY arm\)
+    or a `uniqueKeyColumnSets` key of its table is covered by the link\'s RHS
+    columns \(RTE\_RELATION arm\). Check that the lowering still emits the
+    body once \(no duplicate rows\) and that estimation switches to the inner
+    arm.
+  - Expected movement: TPC\-H Q18 `join\-method` \(Hash Semi Join → Hash
+    Join\); any pulled `IN \(SELECT pk …\)` in either corpus becomes an inner
+    join. Measured on the TPC\-H fire set and the two\-scale TPC\-DS fire set.
 - [!] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
   \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
   PG pulls a CTE reference in a simple sublink body up like any base rel;
