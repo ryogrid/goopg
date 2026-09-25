@@ -1,0 +1,14 @@
+=== Q19
+Aggregate  (cost=64301.56..64301.57 rows=1 width=32)
+  ->  Nested Loop  (cost=1008.53..64301.55 rows=179 width=1098)
+        Filter: (((((((p_brand = 'Brand#12') AND (p_container = ANY ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))) AND (l_quantity >= 1)) AND (l_quantity <= 11)) AND (p_size <= 5)) OR (((((p_brand = 'Brand#23') AND (p_container = ANY ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))) AND (l_quantity >= 10)) AND (l_quantity <= 20)) AND (p_size <= 10))) OR (((((p_brand = 'Brand#34') AND (p_container = ANY ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))) AND (l_quantity >= 20)) AND (l_quantity <= 30)) AND (p_size <= 15)))
+        ->  Gather  (cost=1000.00..6107.60 rows=486 width=548)
+              Workers Planned: 2
+              ->  Parallel Seq Scan on part  (cost=0.00..5059.00 rows=202 width=548)
+                    Filter: ((p_size >= 1) AND (((((p_brand = 'Brand#12') AND (p_container = ANY ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))) AND (p_size <= 5)) OR (((p_brand = 'Brand#23') AND (p_container = ANY ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))) AND (p_size <= 10))) OR (((p_brand = 'Brand#34') AND (p_container = ANY ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))) AND (p_size <= 15))))
+        ->  Bitmap Heap Scan on lineitem  (cost=8.53..119.73 rows=1 width=550)
+              Recheck Cond: (l_partkey = p_partkey)
+              Filter: (((l_shipmode = ANY ('AIR', 'AIR REG')) AND (l_shipinstruct = 'DELIVER IN PERSON')) AND ((((l_quantity >= 1) AND (l_quantity <= 11)) OR ((l_quantity >= 10) AND (l_quantity <= 20))) OR ((l_quantity >= 20) AND (l_quantity <= 30))))
+              ->  Bitmap Index Scan on lineitem_part_supp_fkidx  (cost=0.38..8.53 rows=29 width=550)
+                    Index Cond: (l_partkey = p_partkey)
+

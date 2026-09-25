@@ -21123,6 +21123,22 @@ M0146-0001 re-baseline census on the new default arm.
         it; the patch lands with it.
       - The slice moves to Q19 \(`join\-method`, PG Nested Loop vs goopg
         Parallel Hash Join under a Partial Aggregate\).
+  - **Slice 4 LANDED 2026\-09\-25 \(`80e2d5d21`\).** Evidence
+    `analysis/m0146/m0146\-0005/slice4/`; design doc §"Slice 4".
+    - Port of PG\'s `extract\_restriction\_or\_clauses` \(`orclauses.go`\):
+      redundant base restrictions derived from join OR clauses, with the
+      `norm\_selec` compensation. Base\-rel rows now round like
+      `clamp\_row\_est` instead of truncating.
+    - TPC\-H: Q19\'s join is now PG\'s \(derived filters, nested loop into
+      `lineitem\_part\_supp\_fkidx`\); Q7\'s whole join tree equals PG\'s. Their
+      remaining first divergences are the top aggregation \(M0146\-0003 /
+      M0146\-0009\). Match 5 → 5; `join\-method` first divergences 2 → 1.
+    - TPC\-DS: SF0.25 match 7 → 7 \(join\-order 84 → 83, join\-method 56 →
+      55\); SF1 8 → 8 \(join\-order 83 → 84, join\-method 58 → 60\); no
+      timeouts; values identical.
+    - Next: the TPC\-DS records — re\-run the first\-divergence census on the
+      slice\-4 capture first \(`slice4/census\-sf\*\-candidate.txt`\).
+    Movement: none — Q19/Q7 joins now match PG, but no match counter moved
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

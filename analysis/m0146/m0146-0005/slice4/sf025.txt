@@ -1,0 +1,4 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=0 total-delta=+0.7% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+changed (48): Q1 Q2 Q3 Q5 Q7 Q8 Q9 Q10 Q13 Q14 Q17 Q18 Q19 Q22 Q23 Q26 Q27 Q28 Q30 Q32 Q34 Q38 Q39 Q43 Q46 Q48 Q49 Q50 Q51 Q53 Q54 Q56 Q58 Q59 Q60 Q63 Q65 Q66 Q73 Q76 Q79 Q81 Q84 Q85 Q87 Q92 Q97 Q99
+=== PLAN-SHAPE: queries=99 same=51 changed=48 added=0 removed=0 ===

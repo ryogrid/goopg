@@ -235,6 +235,74 @@ That is restriction placement, M0146-0012's territory, and it is filed under
 M0146-0012. Q17 waits for it. The saved patch is the costing half, to land
 together with it. The slice moves to Q19.
 
+## Slice 4: derived OR restrictions (`extract_restriction_or_clauses`)
+
+Landed 2026-09-25 (`80e2d5d21`). Evidence: `analysis/m0146/m0146-0005/slice4/`.
+
+### Finding
+
+TPC-H Q19's first divergence was `join-method`: PG nested-loops from `part`
+into `lineitem_part_supp_fkidx`, goopg parallel-hash-joined. PG's `part` scan
+carries a filter the query never wrote: the OR of the three arms'
+`p_brand`/`p_container`/`p_size` sub-clauses. PG's `orclauses.c` derives it
+from the join OR clause, so `part` is sized at about 200 rows. goopg had no
+such step; the gap was ledgered at M0127-P5.6-g-iv ("extract_restriction_or_clauses
+absent"). goopg sized `part` at 83333 rows.
+
+### Change
+
+- **`orclauses.go`** is a port of `extract_restriction_or_clauses`,
+  `extract_or_clause` and `is_safe_restriction_clause_for`. It runs at the
+  seam right after `partitionConjunctsForJoinPlanning`:
+  - for each join OR clause and each real binding it mentions, it ORs each
+    arm's binding-only, leaf-eligible, non-volatile sub-clauses (recursing
+    through nested ORs, flattening);
+  - it declines if any arm yields nothing;
+  - it adds the result to the leaf's local filters when its selectivity is
+    ≤ 0.9.
+  The pool the partition sees already excludes nullable-side relations, which
+  stands in for PG's `join_clause_is_movable_to`.
+- **Compensation** (`consider_new_or_clause`): the join OR clause's
+  selectivity is divided by the derived clauses' selectivity product. The
+  map rides `joinlistProblem` into `searchCtx` and is applied in
+  `joinClauseSelectivityExt` before memoising, as PG hacks `norm_selec`.
+- **`applyLocalFilterSelectivity`** now rounds (PG's `clamp_row_est` is
+  `rint`) instead of truncating. Otherwise Q7's derived
+  `n_name = 'FRANCE' OR n_name = 'GERMANY'` sized `nation` at 1 row where
+  PG says 2 (25 × 0.0784 = 1.96), quartering the join estimate.
+
+### Measured
+
+- **TPC-H Q19:** the join is now PG's. Derived filters on `part` (202 rows;
+  PG 200) and on `lineitem`, and a nested loop probing
+  `lineitem_part_supp_fkidx`. Its first divergence moves to the top
+  Partial/Finalize aggregation, M0146-0003's category.
+- **TPC-H Q7:** the whole join tree now equals PG's, with PG's estimates
+  (5000 / 50000 / 60379 / 2513 rows against 2522). The first divergence is
+  now the top aggregation: goopg estimates 200 groups for
+  `(n1.n_name, n2.n_name, extract(year))` where PG clamps to the input rows
+  and sorts. That is M0146-0009's category.
+- **TPC-H match:** stays 5/22; `join-method` first divergences go from 2 to 1
+  (Q17 remains, blocked on M0146-0012a).
+- **TPC-DS parity:**
+  - SF0.25: match 7 → 7; join-order 84 → 83, join-method 56 → 55,
+    parameterisation 38 → 36, qual-placement 26 → 25.
+  - SF1: match 8 → 8; join-order 83 → 84, join-method 58 → 60,
+    parallelism 78 → 79, qual-placement 23 → 21.
+- **First-divergence depth:** one query per scale went shallower (Q13 at
+  SF0.25, Q48 at SF1). Both are OR-heavy and now carry PG's derived filters;
+  the remaining difference is which join evaluates the OR join clause.
+- **Values:** identical everywhere (acceptance arm; SF0.25 96 PASS); no
+  timeouts at either scale.
+
+### Not ported (ledgered)
+
+- PG extracts from every base rel's `joininfo`, including outer-join clauses
+  on the nullable side where `join_clause_is_movable_to` allows it. goopg
+  derives only from the flat inner pool the seam partitions.
+- `scaleByFloat` still truncates at its other call sites; only the
+  base-relation size now follows `clamp_row_est`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
