@@ -1,0 +1,33 @@
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Hash Join  (cost=570.00..1273.33 rows=3333 width=488)
+   Hash Cond: (a.thousand = b.thousand)
+   Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Seq Scan on tenk1 c  (cost=0.00..445.33 rows=33 width=244)
+           Filter: ((b.hundred = hundred) AND (NOT EXISTS(SubPlan 2)))
+           SubPlan 2
+             ->  Index Only Scan using tenk1_thous_tenthous on tenk1 d  (cost=0.25..474.75 rows=50 width=244)
+                   Filter: ($1 = thousand)
+   ->  Seq Scan on tenk1 a  (cost=0.00..445.00 rows=10000 width=244)
+   ->  Seq Scan on tenk1 b  (cost=0.00..445.00 rows=10000 width=244)
+(11 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Index Only Scan using tenk1_thous_tenthous on tenk1 a
+   SubPlan 1
+     ->  Aggregate
+           ->  Index Only Scan using tenk1_thous_tenthous on tenk1 d
+                 Filter: (a.thousand = thousand)
+(5 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Index Only Scan using tenk1_thous_tenthous on tenk1 a
+   SubPlan 1
+     ->  Aggregate
+           ->  Index Only Scan using tenk1_thous_tenthous on tenk1 d
+                 Filter: (thousand = a.thousand)
+(5 rows)
+
