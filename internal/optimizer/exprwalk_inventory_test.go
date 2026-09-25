@@ -249,7 +249,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// localizeExprToLeaf, its consumer, was DELETED from this map in the
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
-	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
+	"local_filters.go:conjunctLocalEligibility": nonRecursiveClassifier,
 	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
 	// recursion and the exhaustiveness — sublinks and unenumerated
 	// kinds abort the walk, fail-closed); what the census sees is the

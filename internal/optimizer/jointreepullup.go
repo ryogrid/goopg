@@ -991,8 +991,10 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 				// emitting scope, which is what Level 1 always meant for a
 				// top-level body.
 				anc := pb
-				for i := 0; i < r.Level && anc != nil; i++ {
+				hops := 0
+				for hops < r.Level && anc != nil {
 					anc = anc.parent
+					hops++
 				}
 				if anc != nil {
 					base, okBase := bodyBase(anc)
@@ -1011,8 +1013,34 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 						Name: r.Name, Type: r.Type, SourceTableIdx: src,
 					}
 				}
-				if r.Level > 1 {
-					r.Level--
+				// Off the top after `hops` steps: the emitting scope sits
+				// one hop above the topmost body, i.e. `hops` hops from pb
+				// (M0146-0015a). Whatever remains points above the
+				// emitting statement and stays an outer reference, re-
+				// levelled relative to it. Decrementing by ONE, as this
+				// did, is right only for a top-level body (hops == 1): a
+				// nested body's grandparent reference (Level 2 from a
+				// depth-1 body) stayed `OuterColumnRef{Level:1}` instead of
+				// becoming an emitting-scope column — invisible while the
+				// qual stayed in the join residual (the statement fell back
+				// to SubPlans), an "out of range (depth=0)" execution error
+				// once it reached a leaf.
+				if rem := r.Level - hops; rem > 0 {
+					r.Level = rem
+					return x
+				}
+				// A NESTED body (hops > 1) reading the emitting scope makes
+				// the qual a join clause between an emitting rel and a rel
+				// inside the parent body's semi/anti RHS. PG plans that (the
+				// clause joins across the nested semi join), but goopg's
+				// search cannot place it — createPlan panics re-basing it
+				// ("join clause references binding column … not among the
+				// output columns"). Decline, so the statement keeps the
+				// SubPlans it always got for this shape (ledgered as
+				// M0146-0015c).
+				if hops > 1 {
+					noteRebaseFail("nested-body-emitting-ref")
+					failed = true
 					return x
 				}
 				if r.Index < 0 || r.Index >= emittingTotal {

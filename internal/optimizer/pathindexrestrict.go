@@ -92,7 +92,7 @@ func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *cat
 			if !ok || bin.Op != parser.OpEq {
 				continue
 			}
-			cr, val, ok := normalizeColumnConst(bin.Left, bin.Right)
+			cr, val, _, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 			if !ok {
 				continue
 			}
@@ -155,7 +155,7 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 		default:
 			continue
 		}
-		cr, val, colOnRight, ok := normalizeColumnConstRange(bin.Left, bin.Right)
+		cr, val, colOnRight, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 		if !ok {
 			continue
 		}
@@ -268,6 +268,12 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 // admitted) rather than a second Expr type switch, so the literal-kind list
 // lives in one place.
 func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) bool {
+	if t, isOuter := outerParamKeyType(val); isOuter {
+		// The probe encodes the key's runtime Datum against the column's
+		// btree byte key with no cast in between, so an outer key must carry
+		// the column's own type; a cross-type comparison stays a filter.
+		return t.Name == col.Type.Name && t.IsArray == col.Type.IsArray
+	}
 	if !isConstExpr(val) {
 		return false
 	}
@@ -297,7 +303,7 @@ func restrictionIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, clauses
 	sel := 1.0
 	for _, c := range clauses {
 		stats := columnStatsByName(tbl, idx.Columns[c.indexCol])
-		sel *= eqSelectivityForColumn(stats, c.key, rawRows)
+		sel *= indexKeyEqSelectivity(stats, c.key, rawRows)
 	}
 	unique := idx.Unique && len(clauses) == len(idx.Columns)
 	if unique && relTuples > 0 {
@@ -561,3 +567,57 @@ func indexUnboundKeysNotNull(tbl *catalog.Table, idx *catalog.Index, bound int) 
 	return true
 }
 
+
+// normalizeColumnIndexKey recognises a clause the index producers can bind:
+// a column of this relation compared with a PSEUDO-CONSTANT operand — a
+// literal, or a value fixed for the whole scan though unknown at plan time (a
+// correlated outer-level reference, `OuterColumnRef` / `ExecParamRef`).
+// colOnRight reports that the column was the right operand, so a range
+// operator must be flipped. This is the operand half of PG's
+// `match_clause_to_indexcol` (indxpath.c): the other side may be anything that
+// references none of the index's own relation's columns and is not volatile,
+// and an outer-level Var is a PARAM_EXEC Param there (M0146-0015a). The
+// shared `normalizeColumnConst` keeps its literal-only contract: the
+// selectivity code reads MCVs and histograms through it.
+func normalizeColumnIndexKey(l, r Expr) (*ColumnRef, Expr, bool, bool) {
+	if cr, ok := l.(*ColumnRef); ok && isIndexKeyOperand(r) {
+		return cr, r, false, true
+	}
+	if cr, ok := r.(*ColumnRef); ok && isIndexKeyOperand(l) {
+		return cr, l, true, true
+	}
+	return nil, nil, false, false
+}
+
+// isIndexKeyOperand is the pseudo-constant set normalizeColumnIndexKey admits.
+func isIndexKeyOperand(e Expr) bool {
+	if isConstExpr(e) {
+		return true
+	}
+	_, isOuter := outerParamKeyType(e)
+	return isOuter
+}
+
+// outerParamKeyType reports whether e is a correlated outer-level reference —
+// constant for one execution of the scan, re-evaluated when the enclosing
+// SubPlan re-runs it — and returns its type.
+func outerParamKeyType(e Expr) (catalog.Type, bool) {
+	if o, ok := e.(*OuterColumnRef); ok {
+		return o.Type, true
+	}
+	if p, ok := e.(*ExecParamRef); ok {
+		return p.Type, true
+	}
+	return catalog.Type{}, false
+}
+
+// indexKeyEqSelectivity is the selectivity of `col = key` for an index
+// clause. A literal reads the column's MCVs/histogram (eqSelectivityForColumn);
+// a key unknown at plan time takes PG's `var_eq_non_const` average, which is
+// what `eqsel` computes when the other operand is a Param.
+func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64) float64 {
+	if _, isOuter := outerParamKeyType(key); isOuter {
+		return varEqNonConstSelectivity(stats, rawRows)
+	}
+	return eqSelectivityForColumn(stats, key, rawRows)
+}

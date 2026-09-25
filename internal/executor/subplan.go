@@ -179,7 +179,8 @@ func subPlanContainsVolatile(n optimizer.Node, ctx *Context) bool {
 //   - Sort / Distinct / WindowAgg / any join family → rescanCloseOpen
 //     (their Open is not re-entrant).
 //   - Chains of Filter/Project/Aggregate/Limit over SeqScan/IndexScan/
-//     Values/GenerateSeries → rescanReOpen.
+//     Values/GenerateSeries → rescanReOpen; over a keyed single-producer
+//     BitmapHeapScan → rescanCloseOpen.
 //   - A volatile function anywhere (incl. nested sublinks) →
 //     cacheable=false.
 func classifySubPlan(n optimizer.Node, ctx *Context) (kind int, cacheable bool) {
@@ -240,6 +241,23 @@ func classifySubPlan(n optimizer.Node, ctx *Context) (kind int, cacheable bool) 
 			}
 			walk(x.Outer)
 			walk(x.Inner)
+		case *optimizer.BitmapHeapScan:
+			// M0146-0015a: a correlated body's outer reference can now be
+			// its bitmap probe key, so the keyed single-producer bitmap is a
+			// common SubPlan leaf. Same narrowness as the twins
+			// (planIsIndexScanBased here, innerPlanIsIndexProbeCheap in the
+			// planner): one BitmapIndexScan producer, whose probe is rebuilt
+			// from the key against the current outer binding. Close+Open,
+			// not a bare re-Open: openPrep builds a fresh producer on every
+			// Open, so re-Opening without Close would leak the previous one.
+			// And/Or producers stay unmodelled (rebuild).
+			if _, single := x.Outer.(*optimizer.BitmapIndexScan); !single {
+				kind = rescanRebuild
+				return
+			}
+			if kind == rescanReOpen {
+				kind = rescanCloseOpen
+			}
 		case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
 			*optimizer.Values, *optimizer.GenerateSeries, *optimizer.GenerateSubscripts:
 			// Leaves. IndexOnlyScan re-Open safety has not been

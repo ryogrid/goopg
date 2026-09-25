@@ -11334,7 +11334,10 @@ func planIsBareSeqScanTree(n Node) bool {
 // flattenStrandedSeqScanFilters merges a chain of `*Filter` wrappers over a
 // single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
 // conjunct in the chain is one the search refuses as a leaf qual
-// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink).
+// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink) or carries a
+// correlated `OuterColumnRef` inside a searched leaf Filter (a one-relation
+// leaf qual since M0146-0015a, but still one the bypass turns into its index
+// probe).
 //
 // It exists for the one-relation route that skips the rule-based bypass
 // (M0145-0027, M0145-0008): there the search attaches the scope's plain quals
@@ -11383,13 +11386,23 @@ func flattenStrandedSeqScanFilters(n Node) (Node, bool) {
 	if !ok {
 		return nil, false
 	}
-	if _, single := top.Child.(*SeqScan); single {
+	if _, single := top.Child.(*SeqScan); single && !top.LeafLocal && !isSearchedTree(top) {
 		// Already the bypass shape; nothing is stranded.
 		return nil, false
 	}
+	// M0146-0015a: in a one-relation scope a correlated conjunct is an
+	// ordinary leaf qual now (partitionConjunctsForJoinPlanning admits
+	// OuterColumnRef there, as PG makes it a base restriction), so it arrives
+	// INSIDE the searched leaf Filter rather than stranded above it — and a lone searched Filter{SeqScan} is not the
+	// bypass shape either: rewriteScanInputsWithSingleTablePredicates leaves a
+	// searched leaf alone (P5.9-b). When the search elected no index for such
+	// a body (the caller checked planIsBareSeqScanTree), hand it to the
+	// bypass exactly as before, so a correlated body keeps the probe the
+	// bypass builds (TPC-H Q17/Q20) and canUnnestSubquery's shape guard keeps
+	// reading it as probe-cheap.
 	stranded := false
 	for _, c := range conjs {
-		if !conjunctIsLocalEligible(c) {
+		if !conjunctIsLocalEligible(c) || exprHasOuterRef(c) {
 			stranded = true
 			break
 		}

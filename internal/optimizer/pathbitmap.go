@@ -312,7 +312,7 @@ func matchBitmapIndexQuals(
 			if !ok || bin.Op != parser.OpEq {
 				continue
 			}
-			cr, val, ok := normalizeColumnConst(bin.Left, bin.Right)
+			cr, val, _, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 			if !ok {
 				continue
 			}
@@ -324,6 +324,14 @@ func matchBitmapIndexQuals(
 			if tbl.Columns[cr.Index].Name != colName {
 				continue
 			}
+			// An outer-level key must carry the column's own type: the probe
+			// encodes its Datum against the btree byte key uncast.
+			if t, isOuter := outerParamKeyType(val); isOuter {
+				ct := tbl.Columns[cr.Index].Type
+				if t.Name != ct.Name || t.IsArray != ct.IsArray {
+					continue
+				}
+			}
 			// Found an equality conjunct matching this index column.
 			stats := columnStatsByName(tbl, colName)
 			// take2 P2-09: the relation's raw tuple count resolves the
@@ -332,7 +340,7 @@ func matchBitmapIndexQuals(
 			if tbl.Stats != nil {
 				rawRows = float64(tbl.Stats.RowCount)
 			}
-			colSel := eqSelectivityForColumn(stats, val, rawRows)
+			colSel := indexKeyEqSelectivity(stats, val, rawRows)
 			selectivity *= colSel
 
 			// ri is nil: local quals have no restrictInfo. The Key/Keys

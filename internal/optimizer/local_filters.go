@@ -69,7 +69,20 @@ func partitionConjunctsForJoinPlanning(
 		// safely pushed below a join boundary at this layer; the
 		// existing planner stages own that work. Keep them in the
 		// join-residual set.
-		if !conjunctIsLocalEligible(c) {
+		//
+		// M0146-0015a: in a ONE-relation scope a correlated outer reference
+		// does not disqualify. PG makes `x = outer.y` a base restriction
+		// (the outer Var is a PARAM_EXEC Param with no relids —
+		// distribute_qual_to_rels, initsplan.c), which is what lets
+		// match_clause_to_indexcol bind it as the SubPlan's index key;
+		// held above the search, a correlated SubPlan scanned its whole
+		// relation per outer row (the regress `subselect` >1 h hang). A
+		// multi-relation scope keeps the decline: the post-planning
+		// EXISTS→ANY and unnest passes read the correlation off the body's
+		// top qual holder, and a qual sunk to a leaf under the body's join
+		// is invisible to them (TPC-DS Q35 lost its hashed ANY to a
+		// per-row SubPlan) — ledgered.
+		if !conjunctLocalEligibility(c, len(spans) == 1) {
 			joinConjuncts = append(joinConjuncts, c)
 			continue
 		}
@@ -119,6 +132,17 @@ func partitionConjunctsForJoinPlanning(
 //
 // (M0077-0001.)
 func conjunctIsLocalEligible(e Expr) bool {
+	return conjunctLocalEligibility(e, false)
+}
+
+// conjunctLocalEligibility is conjunctIsLocalEligible with the OuterColumnRef
+// decline switchable: admitOuterRefs admits a correlated outer reference
+// (partitionConjunctsForJoinPlanning's one-relation scope, M0146-0015a).
+// Every other decline is unchanged. localizeExprToLeaf leaves an
+// OuterColumnRef untouched (it names a scope above), tableForCol ignores it,
+// and isParallelSafeExpr keeps a leaf carrying one off partial paths — as
+// PG's parallel-restricted Param does.
+func conjunctLocalEligibility(e Expr, admitOuterRefs bool) bool {
 	if anySublinkPullupCandidate(e) {
 		return false
 	}
@@ -135,6 +159,9 @@ func conjunctIsLocalEligible(e Expr) bool {
 				// for it, so scopeVeto can never fire on its behalf
 				// and the decline has to be explicit. Same shape as
 				// commit 5's exprSide veto.
+				if admitOuterRefs {
+					return true
+				}
 				eligible = false
 				return false
 			case *InExpr:

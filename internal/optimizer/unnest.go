@@ -695,6 +695,9 @@ func innerPlanIsIndexProbeCheap(n Node) bool {
 }
 
 func collectUnnestParams(node Node) []unnestParam {
+	if correlationOnUnliftableJoinSide(node) {
+		return nil
+	}
 	var params []unnestParam
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
 	walkPlanExprs(node, func(e Expr) {
@@ -4122,6 +4125,9 @@ func residualExprLiftable(e Expr) bool {
 // one and the same for all three — the difference between the
 // loops is only how the resulting join is keyed and typed.
 func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
+	if correlationOnUnliftableJoinSide(node) {
+		return nil
+	}
 	var params []unnestParam
 	var residuals []Expr
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
@@ -5113,4 +5119,90 @@ func findFilterContainingExistsExpr(node Node, target *ExistsExpr) (*Filter, Exp
 		return findFilterContainingExistsExpr(n.Child, target)
 	}
 	return nil, nil
+}
+
+// correlationOnUnliftableJoinSide reports whether the inner plan carries a
+// correlated outer reference on a join side whose conjuncts cannot be lifted
+// above that join: the RHS of a semi/anti join (its columns are not in the
+// join's output, and moving a qual out of an existential changes its
+// meaning), the nullable side of a left/right join, either side of a full
+// join, or the ON predicate of any non-inner join. Both collectors walk into
+// every join and lift what they find to the unnested join's keys and
+// residuals, so such a reference must make them decline — the sublink then
+// stays a SubPlan, which is always correct.
+//
+// Found by M0146-0015a: while one of its drafts admitted correlated
+// conjuncts as base restrictions in every scope, a nested EXISTS pulled up
+// inside a body left one on the leaf under the body's own semi join, and the
+// collector hoisted it into the outer join's hash key, where it read the
+// semi join's LEFT column at that position: wrong rows. The landed change
+// admits them only in one-relation scopes (no join to sink under), so this
+// guard is defensive — the collectors' soundness must not depend on where
+// the search chose to place a qual.
+func correlationOnUnliftableJoinSide(node Node) bool {
+	found := false
+	predHasOuter := func(e Expr) bool {
+		has := false
+		walkExprTree(e, func(x Expr) {
+			if _, ok := x.(*OuterColumnRef); ok {
+				has = true
+			}
+		})
+		return has
+	}
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		switch x := n.(type) {
+		case *Filter:
+			walk(x.Child)
+		case *Project:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		case *OrdinalityWrap:
+			walk(x.Child)
+		case *Join:
+			if x.Type != JoinTypeInner && x.Type != JoinTypeCross && predHasOuter(x.Predicate) {
+				found = true
+				return
+			}
+			switch x.Type {
+			case JoinTypeSemi, JoinTypeAnti, JoinTypeLeft:
+				if planSubtreeHasOuterRefDeep(x.Right) {
+					found = true
+					return
+				}
+				walk(x.Left)
+			case JoinTypeRight:
+				if planSubtreeHasOuterRefDeep(x.Left) {
+					found = true
+					return
+				}
+				walk(x.Right)
+			case JoinTypeFull:
+				if planSubtreeHasOuterRefDeep(x.Left) || planSubtreeHasOuterRefDeep(x.Right) {
+					found = true
+					return
+				}
+			default:
+				walk(x.Left)
+				walk(x.Right)
+			}
+		case *NestedLoopIndexJoin:
+			if x.Type != JoinTypeInner && x.Type != JoinTypeCross && planSubtreeHasOuterRefDeep(x.Inner) {
+				found = true
+				return
+			}
+			walk(x.Outer)
+		}
+	}
+	walk(node)
+	return found
 }
