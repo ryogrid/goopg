@@ -107,18 +107,21 @@ func (s *searchCtx) buildOneBitmapPath(
 	if idx == nil {
 		return nil
 	}
-	// Partial index — resolve the predicate for recheck at execution time.
-	// Without a predicate-implication prover (same gap as the ordered scan
-	// path), goopg relies on the bitmap's recheck mechanism: the resolved
-	// predicate is appended to BitmapQual and evaluated against every heap
-	// tuple, so correctness is guaranteed even for lossy pages. The cost
-	// model still penalises irrelevant partial indexes through high
-	// selectivity, so they lose to seq scan in add_path when the query
-	// quals don't match (M0129-S5.4).
+	// Partial index. PG builds index paths only for a partial index whose
+	// predicate the query's restriction clauses PROVE (`check_index_predicates`
+	// sets `index->predOK`; `create_index_paths` skips an unproven one,
+	// postgres/src/backend/optimizer/path/indxpath.c). M0145-0008r: this arm
+	// used to admit any partial index on the premise that appending the
+	// predicate to the heap recheck keeps it correct. It does not — a row the
+	// predicate excludes has no index entry, so no recheck can bring it back
+	// (`onek2 WHERE unique1 = 50` over `onek2_u1_prtl ... WHERE stringu1 < 'B'`
+	// returned 0 rows, regress `portals_p2`). The proof is the narrow
+	// `Var op Const` prover the other producers use (M0134-0017b), checked
+	// against each of the leaf's conjuncts below.
 	var partialPredicate Expr
 	if idx.HasPredicate {
 		resolved, err := ResolveIndexPredicate(idx.Predicate, tbl)
-		if err != nil {
+		if err != nil || resolved == nil {
 			// Predicate resolution failed — skip this index.
 			return nil
 		}
@@ -136,6 +139,9 @@ func (s *searchCtx) buildOneBitmapPath(
 	// selectivity replaces the full-scan default of 1.0.
 	id, _, _ := scanLeafFor(leaf)
 	conjuncts := extractFilterConjuncts(leaf)
+	if partialPredicate != nil && !partialPredicateProvenBy(partialPredicate, conjuncts) {
+		return nil
+	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
 
 	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
@@ -639,4 +645,18 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		Children:     []*Path{child},
 		ParallelSafe: parallelSafeWith(rel, child),
 	}
+}
+
+// partialPredicateProvenBy reports whether some restriction conjunct proves a
+// partial index's predicate — PG's `predOK` (`check_index_predicates`,
+// indxpath.c) at the narrow `provePartialIndexPredicate` fidelity. An unproven
+// partial index may not be scanned at all: its missing entries are rows the
+// query can still return.
+func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
+	for _, c := range conjuncts {
+		if provePartialIndexPredicate(predicate, c) {
+			return true
+		}
+	}
+	return false
 }
