@@ -178,12 +178,18 @@ func filterSelectivity(f *Filter) float64 {
 	if f == nil || f.Predicate == nil {
 		return 1.0
 	}
+	// M0146-0005i: a qual PG turns into a WindowAgg run condition leaves the
+	// rel's restrictions and carries no selectivity.
+	pred := dropWindowRunConditions(f.Predicate, f.Child)
+	if pred == nil {
+		return 1.0
+	}
 	if len(f.PushedBelow) == 0 {
-		return clauseSelectivity(f.Predicate, f.Child)
+		return clauseSelectivity(pred, f.Child)
 	}
 	sel := 1.0
-	kept := make([]Expr, 0, len(splitAnd(f.Predicate)))
-	for _, c := range splitAnd(f.Predicate) {
+	kept := make([]Expr, 0, len(splitAnd(pred)))
+	for _, c := range splitAnd(pred) {
 		if f.pricedBelow(c) {
 			continue
 		}
@@ -816,7 +822,10 @@ func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node
 	if local == nil || scan == nil || baseRows <= 0 {
 		return baseRows
 	}
-	localized := localizeExprToLeaf(local, binding)
+	localized := dropWindowRunConditions(localizeExprToLeaf(local, binding), scan)
+	if localized == nil {
+		return baseRows
+	}
 	// PG's set_baserel_size_estimates: rel->rows = clamp_row_est(tuples *
 	// selectivity), and clamp_row_est ROUNDS (rint) with a floor of 1 — it
 	// does not truncate. Truncating sized TPC-H Q7's `n_name = 'FRANCE' OR

@@ -1,0 +1,66 @@
+== Q44 baseline
+-------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=48561.08..48617.01 rows=100 width=984)
+   ->  Merge Join  (cost=48561.08..48597.70 rows=1831 width=80)
+         Merge Cond: (rnk = rnk)
+         ->  Hash Join  (cost=23956.73..24181.31 rows=1831 width=48)
+               Hash Cond: (item_sk = i1.i_item_sk)
+               ->  WindowAgg  (cost=22835.73..23018.89 rows=1831 width=12)
+                     Filter: (rnk < 11)
+                     ->  Sort  (cost=22835.73..22890.68 rows=5495 width=36)
+                           Sort Key: rank_col
+== Q44 candidate
+-------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=49284.40..49450.25 rows=100 width=984)
+   ->  Merge Join  (cost=49284.40..49394.30 rows=5495 width=80)
+         Merge Cond: (rnk = rnk)
+         ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+               Hash Cond: (item_sk = i1.i_item_sk)
+               ->  WindowAgg  (cost=22835.73..23055.53 rows=5495 width=12)
+                     Filter: (rnk < 11)
+                     ->  Sort  (cost=22835.73..22890.68 rows=5495 width=36)
+                           Sort Key: rank_col
+== Q44 candidate-pg
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=80913.15..80929.19 rows=100 width=110)
+   ->  Nested Loop  (cost=80913.15..104499.40 rows=147099 width=110)
+         ->  Nested Loop  (cost=80912.85..93822.78 rows=147099 width=63)
+               ->  Merge Join  (cost=80912.56..83146.16 rows=147099 width=16)
+                     Merge Cond: (v11.rnk = v21.rnk)
+                     ->  Sort  (cost=40456.28..40469.84 rows=5424 width=12)
+                           Sort Key: v11.rnk
+                           ->  Subquery Scan on v11  (cost=39970.71..40119.85 rows=5424 width=12)
+                                 ->  WindowAgg  (cost=39970.71..40065.61 rows=5424 width=44)
+== Q67 baseline
+-------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=21782.04..21797.33 rows=100 width=212)
+   ->  Sort  (cost=21782.04..21796.33 rows=5715 width=212)
+         Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+         ->  WindowAgg  (cost=20992.09..21563.62 rows=5715 width=212)
+               Filter: (rk <= 100)
+               ->  Sort  (cost=20992.09..21163.55 rows=17146 width=204)
+                     Sort Key: i_category, sumsales DESC
+                     ->  HashAggregate (8 keys, 9 grouping sets)  (cost=19443.32..19614.78 rows=17146 width=204)
+                           ->  Gather  (cost=3027.42..19436.15 rows=2869 width=2004)
+== Q67 candidate
+-------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=22333.23..22377.10 rows=100 width=212)
+   ->  Sort  (cost=22333.23..22376.10 rows=17146 width=212)
+         Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+         ->  WindowAgg  (cost=20992.09..21677.93 rows=17146 width=212)
+               Filter: (rk <= 100)
+               ->  Sort  (cost=20992.09..21163.55 rows=17146 width=204)
+                     Sort Key: i_category, sumsales DESC
+                     ->  HashAggregate (8 keys, 9 grouping sets)  (cost=19443.32..19614.78 rows=17146 width=204)
+                           ->  Gather  (cost=3027.42..19436.15 rows=2869 width=2004)
+== Q67 candidate-pg
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=21365.96..21372.48 rows=100 width=273)
+   ->  Incremental Sort  (cost=21365.96..22595.43 rows=18846 width=273)
+         Sort Key: dw1.i_category, dw1.i_class, dw1.i_brand, dw1.i_product_name, dw1.d_year, dw1.d_qoy, dw1.d_moy, dw1.s_store_id, dw1.sumsales, (rank
+         Presorted Key: dw1.i_category
+         ->  WindowAgg  (cost=21360.99..21737.89 rows=18846 width=273)
+               Window: w1 AS (PARTITION BY dw1.i_category ORDER BY dw1.sumsales ROWS UNBOUNDED PRECEDING)
+               Run Condition: (rank() OVER w1 <= 100)
+               ->  Sort  (cost=21360.97..21408.08 rows=18846 width=265)
+                     Sort Key: dw1.i_category, dw1.sumsales DESC

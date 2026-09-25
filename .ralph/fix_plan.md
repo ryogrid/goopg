@@ -21331,6 +21331,35 @@ M0146-0001 re-baseline census on the new default arm.
     `find\_param\_referent` for an RTE\_SUBQUERY with setOperations — it
     resolves through the leftmost setop child\'s targetlist\) and the goopg
     EXPLAIN deparser\'s ColumnRef naming for set\-op leaf columns.
+- [x] **M0146\-0005i — quals PG turns into WindowAgg run conditions carry no
+  selectivity** \(opened 2026\-09\-25 from the census: TPC\-DS Q44\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-25.** Design doc §"Slice 9"; evidence
+    `analysis/m0146/m0146\-0005/slice9/`.
+    - `find\_window\_run\_conditions` sets `keep\_original = false` for
+      `wfunc < const` on an increasing function \(and the mirrored forms\),
+      so the qual leaves the subquery rel\'s restrictions. goopg priced it at
+      1/3.
+    - `window\_runcondition.go`; `filterSelectivity` and
+      `applyLocalFilterSelectivity` skip such conjuncts. The Filter still
+      executes, so results are unchanged.
+    - Q44\'s subqueries now estimate 5495 rows \(PG 5424\); Q67\'s WindowAgg
+      keeps its input\'s rows as PG does. Census unchanged; all gates pass.
+  Movement: none
+- [ ] **M0146\-0005j — re\-evaluate the all\-default `max\(l,r\)` join\-size cap
+  \(M0126\-0010\)** \(filed 2026\-09\-25 by M0146\-0005i\): TPC\-DS Q44\'s
+  `rnk = rnk` merge join estimates 5495 rows where PG\'s
+  `calc\_joinrel\_size\_estimate` gives 5424² / 200 = 147099; the cap
+  `calcJoinrelSize` applies when nothing is proven and every clause
+  selectivity is a default clips it. PG has no such cap, and PG\'s row count
+  drives its nested loops into `item\_pkey` above.
+  Kind: recon
+  Parent: M0146\-0005
+  - First step: the ledger row \(M0127\-P5.6\-c, 2026\-08\-04\) conditions
+    deletion on the MCV arm \(P5.6\-a\) and an audit. Check whether P5.6\-a
+    landed, then measure the fire set with the branch disabled \(both
+    corpora, TPC\-H arm\) and list the queries it moves.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

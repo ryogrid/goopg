@@ -479,6 +479,21 @@ record: PG deparses set-op outputs through to the leftmost branch
 DISTINCT and GROUP BY arms are not ported yet. Evidence:
 `analysis/m0146/m0146-0005/slice8/`.
 
+## Slice 9 (M0146-0005i): window run conditions carry no selectivity
+
+PG pushes an outer qual such as `rnk < 11` over a subquery's monotonic
+window function into the WindowAgg's run condition, and drops the original
+(`keep_original = false`, find\_window\_run\_conditions). The subquery rel
+therefore keeps its full row estimate. `window_runcondition.go` ports the
+operator/monotonicity rule; the two filter-selectivity entry points skip
+such conjuncts. goopg still filters, so results are unchanged.
+
+TPC-DS Q44's subqueries now estimate 5495 rows (PG 5424), and Q67's
+WindowAgg keeps its input's rows as PG does. Q44's join above still reads
+5495, clipped by goopg's all-default `max(l,r)` cap, which PG lacks
+(M0146-0005j). The census is unchanged, and all gates pass. Evidence:
+`analysis/m0146/m0146-0005/slice9/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
