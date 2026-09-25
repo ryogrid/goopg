@@ -282,7 +282,16 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 	}
 
 	ndistinct, isDefault := memoizeKeyNDistinct(s, innerPath, outer.Relids)
-	rescan, est := costMemoizeRescan(cp, innerPath.Cost, innerPath.Rows, outer.Rows,
+	// `calls` is the OUTER PATH's row count, not the rel's: PG passes
+	// `outer_path->rows` to create_memoize_path
+	// (postgres/src/backend/optimizer/path/joinpath.c:812-819, stored as
+	// `mpath->calls`, pathnode.c:1693, read by cost_memoize_rescan,
+	// costsize.c:2549). Gate 2 above reads the rel on purpose; this does not.
+	// The two differ for a PARTIAL outer, whose rows are per worker: with the
+	// rel's count, each worker's cache looked 3-4x more reused than it can
+	// be, and TPC-H Q3's partial Memoize nested loop undercut PG's Parallel
+	// Hash Join (M0146-0005).
+	rescan, est := costMemoizeRescan(cp, innerPath.Cost, innerPath.Rows, outerPath.Rows,
 		// R121 Slice A(ii): was relNCols(innerPath.Rel) -- a DIRECT rel read
 		// that bypassed pathNCols and so could never see any narrowing. It is
 		// also the contract Path.NCols' own doc states ("read them through
