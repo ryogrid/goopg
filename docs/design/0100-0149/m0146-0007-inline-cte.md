@@ -1,6 +1,6 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1 and 2 landed 2026-09-26; multi-reference
+Status: slices 1-3 landed 2026-09-26; multi-reference
 `NOT MATERIALIZED` and reference-site planning are open.
 
 ## PG behaviour
@@ -83,11 +83,24 @@ C-02c move proof holds from the CTE reference down to the placement.
 TPC-DS Q78's `ss` and `cs` lose their `Subquery Scan`. `ws` keeps its copy
 (item 1 below). Evidence: `analysis/m0146/m0146-0007/slice2/`.
 
+## Slice 3 (M0146-0007c): descent into a NestedLoopIndexJoin
+
+`pushConjunctIntoNLI` gives the CTE-path descent a NestedLoopIndexJoin
+arm.
+- An outer-only conjunct descends into Outer.
+- An inner-only conjunct of an INNER join joins the probe's `Cond` (PG's
+  `Filter:` on the inner Index Scan). The probe is mutated in place, so
+  the aliasing Memoize stays consistent.
+- The move proof follows the *Join arm's containment rule.
+
+Q78 now prints no `Subquery Scan`, and `ws`'s `d_year = 1998` sits on the
+inner Index Scan as in PG. Evidence: `analysis/m0146/m0146-0007/slice3/`.
+
 ## Open (ledgered)
 
-1. The descent does not enter a `NestedLoopIndexJoin`
-   (`pushConjunctTraced` has no arm for it), so a CTE body joined that
-   way keeps the copy (Q78's `ws`).
+1. The join pass (`pushSingleSideQualsIntoInnerJoinInputs`) still declines
+   at a NestedLoopIndexJoin and stays placement-only across a projection;
+   both openings are CTE-path only.
 2. `NOT MATERIALIZED` on a multiply-referenced CTE: PG plans each
    reference separately; goopg shares one planned body.
 3. The inlined body is still planned once, at the WITH, not at the

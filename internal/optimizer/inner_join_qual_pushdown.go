@@ -381,6 +381,108 @@ func pushConjunctIntoSubtreeTracedNoSearched(n Node, c Expr, noSearched bool) (N
 	return repl, ok, *st
 }
 
+// pushConjunctIntoNLI places a conjunct below a NestedLoopIndexJoin, the
+// parameterised-nest-loop analogue of the *Join arm. A conjunct reading
+// only OUTER columns descends into Outer — the preserved side for every
+// NLI join type (INNER, LEFT, SEMI, ANTI). One reading only INNER columns
+// of an INNER join joins the probe's own residual (IndexScan /
+// IndexOnlyScan.Cond, the `Filter:` PG prints on the inner Index Scan),
+// in the scan's output coordinates; the probe is mutated in place, so
+// InnerMemo.Child, which aliases it, stays consistent. SEMI/ANTI emit the
+// outer schema only, so an inner reference cannot occur there. The move
+// proof follows the *Join arm's containment rule: every identity the
+// conjunct reads must lie inside the side it enters. M0146-0007c.
+func pushConjunctIntoNLI(x *NestedLoopIndexJoin, c Expr, st *pushTrace) (Node, bool) {
+	if x.Outer == nil || x.Inner == nil {
+		return x, false
+	}
+	joinOut := x.Output()
+	outW := len(x.Outer.Output())
+	inner, outer, bad := false, false, false
+	okWalk := walkExprRefs(c, scopeVeto, exprVisitor{
+		Visit: func(e Expr) bool {
+			if bad {
+				return false
+			}
+			// Built on walkExprRefs; the per-node checks are plain
+			// assertions, not a hand-written Expr switch (RC-1a inventory).
+			if _, isOuter := e.(*OuterColumnRef); isOuter {
+				bad = true
+				return false
+			}
+			if _, isFunc := e.(*FuncCall); isFunc {
+				bad = true
+				return false
+			}
+			r, isCol := e.(*ColumnRef)
+			if !isCol {
+				return true
+			}
+			if r.Index < 0 || r.Index >= len(joinOut) ||
+				(r.Name != "" && !strings.EqualFold(joinOut[r.Index].Name, r.Name)) {
+				bad = true
+				return false
+			}
+			if r.Index < outW {
+				outer = true
+			} else {
+				inner = true
+			}
+			return true
+		},
+	})
+	if !okWalk || bad || inner == outer {
+		return x, false
+	}
+	target, delta := x.Outer, 0
+	if inner {
+		if x.Type != JoinTypeInner || len(joinOut) != outW+len(x.Inner.Output()) {
+			return x, false
+		}
+		target, delta = x.Inner, -outW
+	}
+	qrel, okQ := qualSrcRelSet(c)
+	side, okS := outputRelSet(target.Output())
+	if !okQ || !okS || qrel == 0 || qrel&^side != 0 {
+		st.proven = false
+	}
+	local, ok := shiftConjunctForInput(c, delta)
+	if !ok {
+		return x, false
+	}
+	if outer {
+		repl, ok := pushConjunctTraced(x.Outer, local, st)
+		if !ok {
+			return x, false
+		}
+		x.Outer = repl
+		return x, true
+	}
+	add := func(cond *Expr) {
+		for _, have := range splitAnd(*cond) {
+			if exprEqual(have, local) {
+				// A pre-existing equal copy's proof is unknown here.
+				st.proven = false
+				return
+			}
+		}
+		if *cond == nil {
+			*cond = local
+			return
+		}
+		*cond = combineAnd([]Expr{*cond, local})
+	}
+	switch p := x.Inner.(type) {
+	case *IndexScan:
+		add(&p.Cond)
+	case *IndexOnlyScan:
+		add(&p.Cond)
+	default:
+		return x, false
+	}
+	return x, true
+}
+
 // conjunctRefsAllNamed reports whether every ColumnRef in c carries a
 // name, i.e. whether remapConjunctThroughProjection's positional name
 // check ran for all of them.
@@ -540,6 +642,14 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		}
 		x.Child = repl
 		return x, true
+
+	case *NestedLoopIndexJoin:
+		// M0146-0007c: CTE-path descents only — the join pass keeps its
+		// existing NLI decline (a separate round, ledgered).
+		if !st.cteMove {
+			return n, false
+		}
+		return pushConjunctIntoNLI(x, c, st)
 
 	case *Join:
 		leftOK, rightOK, pushable := joinRestrictionSides(x)

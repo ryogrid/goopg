@@ -575,3 +575,66 @@ func TestPushConjunctProjectArmCTEMoveProof(t *testing.T) {
 		}
 	}
 }
+
+// nliFixture builds INNER NestedLoopIndexJoin(outer ws(ws_item, ws_date),
+// inner IndexScan dd(d_date, d_year)) with source identities 1 and 2 — the
+// reduced shape of TPC-DS Q78's `ws` CTE body.
+func nliFixture(jt JoinType) (*NestedLoopIndexJoin, *SeqScan, *IndexScan) {
+	src := func(name string, idx int16) SchemaColumn {
+		return SchemaColumn{Name: name, Type: catalog.Type{Name: "int4"}, SourceTableIdx: idx}
+	}
+	outer := &SeqScan{Table: &catalog.Table{Name: "ws"}, schema: Schema{src("ws_item", 1), src("ws_date", 1)}}
+	inner := &IndexScan{Table: &catalog.Table{Name: "dd"}, schema: Schema{src("d_date", 2), src("d_year", 2)}}
+	schema := append(append(Schema{}, outer.schema...), inner.schema...)
+	return &NestedLoopIndexJoin{Type: jt, Outer: outer, Inner: inner, schema: schema}, outer, inner
+}
+
+func nliRef(idx int, name string, srcIdx int16) Expr {
+	return &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: idx, Name: name, Type: catalog.Type{Name: "int4"}, SourceTableIdx: srcIdx},
+		Right: &IntegerConst{Value: 1998}}
+}
+
+// TestPushConjunctIntoNLI pins M0146-0007c: on a CTE-path descent an
+// inner-only conjunct of an INNER NestedLoopIndexJoin joins the probe's
+// Cond (PG's `Filter:` on the inner Index Scan) with the move proof intact,
+// an outer-only one descends into Outer, and a mixed reference, an inner
+// reference under LEFT, or a join-pass descent (cteMove unset) declines.
+func TestPushConjunctIntoNLI(t *testing.T) {
+	j, _, inner := nliFixture(JoinTypeInner)
+	st := &pushTrace{proven: true, cteMove: true}
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), st); !ok {
+		t.Fatal("inner-only conjunct must place")
+	}
+	if inner.Cond == nil || !st.proven {
+		t.Fatalf("inner probe Cond = %v, proven = %v; want the conjunct and a kept proof", inner.Cond, st.proven)
+	}
+	if got := columnRefIndexes(inner.Cond); len(got) != 1 || got[0] != 1 {
+		t.Errorf("probe Cond refs = %v, want [1] (scan-local d_year)", got)
+	}
+
+	j, outer, _ := nliFixture(JoinTypeInner)
+	st = &pushTrace{proven: true, cteMove: true}
+	if _, ok := pushConjunctTraced(j, nliRef(0, "ws_item", 1), st); !ok || !st.proven {
+		t.Fatalf("outer-only conjunct: ok=%v proven=%v", ok, st.proven)
+	}
+	if f, isF := j.Outer.(*Filter); !isF || f.Child != Node(outer) {
+		t.Errorf("outer side is %T, want a Filter over the outer scan", j.Outer)
+	}
+
+	mixed := &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "ws_item", SourceTableIdx: 1},
+		Right: &ColumnRef{Index: 3, Name: "d_year", SourceTableIdx: 2}}
+	j, _, _ = nliFixture(JoinTypeInner)
+	if _, ok := pushConjunctTraced(j, mixed, &pushTrace{proven: true, cteMove: true}); ok {
+		t.Error("a conjunct spanning both sides must decline")
+	}
+	j, _, _ = nliFixture(JoinTypeLeft)
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), &pushTrace{proven: true, cteMove: true}); ok {
+		t.Error("an inner reference under LEFT (nullable side) must decline")
+	}
+	j, _, _ = nliFixture(JoinTypeInner)
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), &pushTrace{proven: true}); ok {
+		t.Error("the join pass (cteMove unset) keeps its NLI decline")
+	}
+}

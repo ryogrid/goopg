@@ -1,0 +1,12 @@
+78c78
+< Q78 depth=2 [join-order] under Sort: PG Merge Join Left | goopg Merge Join Left
+---
+> Q78 depth=2 [qual-placement] under Sort: PG Merge Join Left | goopg Merge Join Left
+101c101
+< CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 qual-placement=13 parallelism=8 join-method=7 join-order=5 scan-type=4 parameterisation=3 error=3
+---
+> CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 qual-placement=14 parallelism=8 join-method=7 join-order=4 scan-type=4 parameterisation=3 error=3
+150c150
+<     1  join-order       under Sort             PG Merge Join Left              goopg Merge Join Left              depth=2
+---
+>     1  qual-placement   under Sort             PG Merge Join Left              goopg Merge Join Left              depth=2

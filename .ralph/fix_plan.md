@@ -21674,6 +21674,18 @@ M0146-0001 re-baseline census on the new default arm.
       enter — ledgered\). Census unchanged; SF0.25 join\-method 49 → 48;
       all gates pass.
   Movement: TPC\-DS Q78 ss/cs residual quals move \(first\-divergence record unchanged\)
+- [x] **M0146\-0007c — the CTE qual push descends into a NestedLoopIndexJoin**
+  \(filed 2026\-09\-26 from M0146\-0007b\'s ledger row: Q78 `ws`\).
+  Kind: impl
+  Parent: M0146\-0007
+  - **DONE 2026\-09\-26.** Design doc §"Slice 3"; evidence
+    `analysis/m0146/m0146\-0007/slice3/`.
+    - `pushConjunctIntoNLI` \(CTE\-path only\): outer\-only conjuncts
+      descend into Outer; inner\-only conjuncts of an INNER join join the
+      probe\'s `Cond`; move proof by the \*Join arm\'s containment rule.
+    - Q78 prints no `Subquery Scan`; its SF0.25 record moves from
+      join\-order to qual\-placement at the same node; all gates pass.
+  Movement: TPC\-DS Q78 ws residual qual moves onto the inner Index Scan
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the
