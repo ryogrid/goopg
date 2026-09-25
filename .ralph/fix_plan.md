@@ -21229,7 +21229,7 @@ M0146-0001 re-baseline census on the new default arm.
       none shallower. Q79 still needs PG\'s fuzzy startup tie\-break
       \(M0146\-0005d\).
   Movement: none
-- [ ] **M0146\-0005d — `add\_path`\'s fuzzy startup tie\-break for TPC\-DS Q79\'s top
+- [x] **M0146\-0005d — `add\_path`\'s fuzzy startup tie\-break for TPC\-DS Q79\'s top
   join** \(filed 2026\-09\-25 by M0146\-0005c\): PG keeps the nested loop into
   `customer\_pkey` \(19147.5..24560.8\) over the hash join \(24269.2..24451.2\)
   because the totals are fuzzily equal \(within `STD\_FUZZ\_FACTOR` 1.01\)
@@ -21243,6 +21243,47 @@ M0146-0001 re-baseline census on the new default arm.
     Does goopg offer the parameterised nested loop into `customer\_pkey` at
     all, and does its `addPath` apply the startup tie\-break when the totals
     are fuzzily equal?
+  - **RECON DONE 2026\-09\-25.** Evidence `analysis/m0146/m0146\-0005/slice5/`
+    \(README §"M0146\-0005d recon", DPPATH at multiplier 2 and 1\).
+    - goopg does offer PG\'s nested loop into `customer\_pkey`; the
+      tie\-break is not the gap.
+    - Cause 1: the calibrated `indexProbeCostMultiplier` = 2.0 makes each
+      probe cost 8.0 against PG\'s 4.59. It is owner\-parked \(M0142\-0005c\).
+    - Cause 2: the SF0.25 cluster\'s `customer` heap is 30% smaller than
+      PG\'s \(1979 against 2872 pages\) because its data holds `char\(n\)`
+      values stored unpadded by an older build. Even at multiplier 1,
+      goopg\'s hash join is therefore 2% cheaper than its nested loop,
+      beyond PG\'s 1% fuzz. Filed below.
+  Movement: none
+- [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
+  unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
+  on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
+  `char\(20\)` reads back `Javier` with `octet\_length` 6 where PG returns
+  20, and `customer` has 1979 pages against PG\'s 2872. The current build
+  pads correctly on INSERT, client COPY and server\-side COPY
+  \(`slice5/bpchar\-storage\-probe.txt`\), so the engine is fine and the data
+  is stale. The consequences:
+  - `char`\-heavy tables are sized smaller than PG\'s, which skews every
+    cost that reads their page count \(it keeps TPC\-DS Q79 on a hash join\);
+  - rows read from those clusters are unpadded, unlike PG.
+  The SF1 cluster \(`data`, loaded 2026\-07\-25\) predates it and is likely
+  affected too.
+  Kind: recon
+  Parent: none
+  - First step \(owner\): reload the SF0.25 goopg cluster with the current
+    build \(`scripts/tpcds\-sf025\-regression.sh load\-goopg`\) and SF1 per
+    `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
+    and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
+    goopg reference cluster holds unpadded `char\(n\)` values.
+
+  > ## ESCALATION 2026\-09\-25 — stale measurement data skews plan parity
+  >
+  > The goopg TPC\-DS clusters were loaded by builds that stored `char\(n\)`
+  > unpadded. Their relation sizes are smaller than PG\'s, and plans elected
+  > on them can differ from PG\'s for that reason alone. Reloading is a
+  > cluster lifecycle action, so the loop has not done it; the owner decides
+  > when, and whether the TPC\-H reference goopg cluster needs the same
+  > check.
 - [ ] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
   it cannot see** \(filed 2026\-09\-25 by M0146\-0005c\): in `spillFixture`,
   rows written with `writeHeapRow`, and even rows loaded with `INSERT …

@@ -60,3 +60,29 @@ goopg's CTE scans carry no pathkeys, so its merge join must sort. The
 cached-inner nested loop (856) wins once the hash join pays PG's
 default-bucket walk. The prerequisite is therefore CTE-scan pathkeys, filed
 as M0146-0005b.
+
+## M0146-0005d recon: why Q79 still hash-joins after 0005c
+
+goopg DPPATH for the top joinrel (`goopg-q79-top-join-dppath-mult{2,1}.txt`)
+against PG PLANCAND (`pg-q79-top-join-plancand.txt`):
+
+| candidate | goopg, mult 2 (shipped) | goopg, mult 1 | PG |
+|---|---|---|---|
+| nested loop, index probe into `customer_pkey` | 19221..28401 | 19221..23984 | 19148..24561 (winner) |
+| hash join, `ms` outer, `customer` hashed | 23449..23499 (winner) | 23449..23499 (winner) | 24269..24451 |
+| per-probe index cost | 8.006 | 4.135 | 4.59 |
+
+The fuzzy startup tie-break is not the gap. Two causes are:
+1. **The calibrated `indexProbeCostMultiplier` = 2.0** doubles the random-page
+   terms of every index probe. It is owner-parked (M0142-0005c); retiring it
+   is a measured-regression exit.
+2. **The SF0.25 cluster's `customer` heap is 30% smaller** (1979 pages
+   against 2872). Its data was loaded on 2026-09-16 by an older build that
+   stored `char(n)` unpadded (`bpchar-storage-probe.txt`: a stored
+   `char(20)` reads back `Javier` with `octet_length` 6, against PG's 20).
+   The current engine pads on INSERT, client COPY and server-side COPY
+   alike; the cluster data is stale. The hash
+   build's seq scan is about 890 cheaper, so even at multiplier 1 goopg's
+   hash join (23499) beats its nested loop (23984) by 2%, beyond PG's 1%
+   fuzz. PG's two totals sit within the fuzz, and the nested loop's startup
+   wins there.

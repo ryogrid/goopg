@@ -1,0 +1,12 @@
+query: select pg_column_size('a'::char(20)), pg_column_size(c_first_name), octet_length(c_first_name), c_first_name from customer where c_first_name is not null limit 1
+goopg (private SF0.25 clone of data-sf025, HEAD dedc4b6a2): 20|6|6|Javier
+PG 18.3 (private instrumented, tpcds025):                   24|21|20|Javier
+relpages (goopg / PG): customer 1979 / 2872; store_sales 12934 / 12936; date_dim 1379 / 1424
+
+On the same private clone, rows written by the CURRENT build (dedc4b6a2) pad correctly:
+  INSERT 'ab' into char(5)            -> 'ab   ', octet_length 5
+  client \copy 'ab'                   -> 'ab   ', octet_length 5
+  server COPY FROM '<file>' 'ab'      -> 'ab   ', octet_length 5
+  literal 'ab'::char(5)               -> 'ab   ', octet_length 5
+The unpadded values are the data-sf025 load of 2026-09-16 (PG_VERSION mtime),
+made by an older build: the measurement cluster is stale, not the engine.
