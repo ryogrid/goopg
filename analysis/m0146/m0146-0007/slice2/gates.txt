@@ -1,0 +1,5 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H census identical to M0146-0007a
+regress 41 WITH/plan pass-required cases: diffs identical to a HEAD (aaf9eaac0) worktree
+first-divergence census SF0.25 and SF1: identical (Q78's record is the ws arm, still a copy)

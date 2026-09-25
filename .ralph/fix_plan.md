@@ -21654,7 +21654,7 @@ M0146-0001 re-baseline census on the new default arm.
     - 13 TPC\-DS records per scale move past the `CTE` node; sweep 96/96;
       TPC\-H census identical; regress 41 cases unchanged vs HEAD.
   Movement: TPC\-DS Q2 Q5 Q33 Q51 Q54 Q56 Q58 Q60 Q64 Q77 Q78 Q80 Q83 Q97 records leave the CTE node \(SF0.25 and SF1\)
-- [ ] **M0146\-0007b — move \(not copy\) a qual pushed into an inlined CTE**
+- [x] **M0146\-0007b — move \(not copy\) a qual pushed into an inlined CTE**
   \(filed 2026\-09\-26 by M0146\-0007a\). PG\'s subquery\_push\_qual moves
   the qual; goopg keeps the outer copy, so TPC\-DS Q78 prints
   `Subquery Scan on ss  Filter: \(ss\_sold\_year = 1998\)` where PG has none.
@@ -21664,6 +21664,16 @@ M0146-0001 re-baseline census on the new default arm.
     refs \(the seam that keeps `pushConjunctTraced`\'s `\*Project` arm at
     `proven = false`\), then thread the move proof through
     `pushConjunctIntoCTEBody` and drop proven conjuncts from the residual.
+  - **DONE 2026\-09\-26.** Design doc §"Slice 2"; evidence
+    `analysis/m0146/m0146\-0007/slice2/`.
+    - The seam closes narrowly: `pushTrace.cteMove` plus all\-named refs
+      keeps the proof across a projection on the CTE path only; grouping
+      sets keep the copy.
+    - Q78\'s `ss` and `cs` lose their `Subquery Scan`; `ws` keeps it \(its
+      body joins through a NestedLoopIndexJoin the descent does not
+      enter — ledgered\). Census unchanged; SF0.25 join\-method 49 → 48;
+      all gates pass.
+  Movement: TPC\-DS Q78 ss/cs residual quals move \(first\-divergence record unchanged\)
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the

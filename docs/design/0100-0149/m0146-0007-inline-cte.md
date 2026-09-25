@@ -1,7 +1,7 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slice 1 landed 2026-09-26; the qual move and multi-reference
-`NOT MATERIALIZED` are open.
+Status: slices 1 and 2 landed 2026-09-26; multi-reference
+`NOT MATERIALIZED` and reference-site planning are open.
 
 ## PG behaviour
 
@@ -64,15 +64,30 @@ What changes is how that reference is run and rendered.
   census identical. Regress: 41 pass-required cases using WITH or showing
   plans, same results as HEAD.
 
+## Slice 2 (M0146-0007b): the pushed qual moves
+
+PG's subquery_push_qual moves the qual. goopg now does the same when the
+C-02c move proof holds from the CTE reference down to the placement.
+- `pushConjunctIntoCTEBodyTraced` threads `pushTrace` through the body:
+  - projections are exact when their layout checks hold;
+  - grouping-key crossings are exact except over grouping sets, whose
+    rollup rows have NULL keys only the outer copy rejects;
+  - Sort, Gather Merge and HAVING are passthroughs.
+- `pushConjunctTraced`'s `*Project` arm keeps the proof for a CTE-path
+  descent (`pushTrace.cteMove`) whose ColumnRefs are all named. The
+  positional name check then ran on every hop, which closes the
+  unnamed-ref seam. The join pass stays placement-only there.
+- A proven, unplanted conjunct leaves the residual; an emptied residual
+  is the transparent `true` wrapper.
+
+TPC-DS Q78's `ss` and `cs` lose their `Subquery Scan`. `ws` keeps its copy
+(item 1 below). Evidence: `analysis/m0146/m0146-0007/slice2/`.
+
 ## Open (ledgered)
 
-1. **Qual move.** goopg copies a pushed qual into the body and keeps the
-   outer copy, so an inlined reference with a qual prints
-   `Subquery Scan … Filter:` where PG moved the qual (TPC-DS Q78). Moving
-   needs the C-02c move proof through the body's projections.
-   `pushConjunctTraced`'s `*Project` arm keeps `proven` false because
-   `remapConjunctThroughProjection` does not check an unnamed reference's
-   side.
+1. The descent does not enter a `NestedLoopIndexJoin`
+   (`pushConjunctTraced` has no arm for it), so a CTE body joined that
+   way keeps the copy (Q78's `ws`).
 2. `NOT MATERIALIZED` on a multiply-referenced CTE: PG plans each
    reference separately; goopg shares one planned body.
 3. The inlined body is still planned once, at the WITH, not at the

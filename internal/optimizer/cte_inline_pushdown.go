@@ -109,14 +109,39 @@ func pushFilterQualsThroughCTEScan(f *Filter) {
 	if !ok || scan.cte == nil || !scan.cte.inlinable() || scan.Child == nil {
 		return
 	}
-	for _, c := range splitAnd(f.Predicate) {
+	var kept []Expr
+	conjuncts := splitAnd(f.Predicate)
+	for _, c := range conjuncts {
 		mapped, ok := remapConjunctThroughCTEOutput(c, scan.Output(), scan.Child.Output())
 		if !ok {
+			kept = append(kept, c)
 			continue
 		}
-		if repl, ok := pushConjunctIntoCTEBody(scan.Child, mapped); ok {
-			scan.Child = repl
+		st := &pushTrace{proven: true, cteMove: true}
+		repl, ok := pushConjunctIntoCTEBodyTraced(scan.Child, mapped, st)
+		if !ok {
+			kept = append(kept, c)
+			continue
 		}
+		scan.Child = repl
+		if st.proven && !st.planted {
+			// M0146-0007b MOVE: every hop was exact (projection remap,
+			// grouping-key crossing, order-preserving passthrough) and the
+			// join-tree placement carries the C-02c proof, so the residual
+			// copy is redundant. PG's subquery_push_qual moves the qual the
+			// same way, which is why its inlined subquery prints no
+			// `Subquery Scan ... Filter:`.
+			continue
+		}
+		kept = append(kept, c)
+	}
+	switch {
+	case len(kept) == 0:
+		// A true predicate is the transparent wrapper EXPLAIN and the
+		// executor already treat as absent (R48).
+		f.Predicate = &BooleanConst{Value: true}
+	case len(kept) != len(conjuncts):
+		f.Predicate = combineAnd(kept)
 	}
 }
 
@@ -184,13 +209,28 @@ func remapConjunctThroughCTEOutput(c Expr, cteOut, bodyOut Schema) (Expr, bool) 
 // kept. Anything unrecognized falls through to pushConjunctIntoSubtree,
 // which is itself fail-closed.
 func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
+	return pushConjunctIntoCTEBodyTraced(n, c, &pushTrace{proven: true})
+}
+
+// pushConjunctIntoCTEBodyTraced is pushConjunctIntoCTEBody reporting the
+// C-02c move proof in st. The body's own layers are exact: a projection
+// remap (when its layout checks hold, the guards pushConjunctTraced's
+// *Project arm applies), a grouping-key crossing, and Sort / Gather Merge /
+// HAVING passthroughs. A grouping-sets aggregate is not: its rollup rows
+// carry NULL keys that only the residual copy rejects, so crossing it
+// clears the proof. The join-tree descent reports its own proof.
+// M0146-0007b.
+func pushConjunctIntoCTEBodyTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 	switch x := n.(type) {
 	case *Project:
+		if x.IsolatedScope || x.Child == nil || len(x.Output()) != len(x.Targets) {
+			st.proven = false
+		}
 		mapped, ok := remapConjunctThroughProjection(c, x.Output(), x.Targets, x.Child.Output())
 		if !ok {
 			return n, false
 		}
-		repl, ok := pushConjunctIntoCTEBody(x.Child, mapped)
+		repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, mapped, st)
 		if ok {
 			x.Child = repl
 		}
@@ -215,11 +255,14 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 		// untouched (PG qual_is_pushdown_safe / check_output_expressions).
 		// A reference at or past len(GroupExprs) is an aggregate result
 		// and remapConjunctThroughProjection declines it by bounds.
+		if len(x.GroupingSets) != 0 {
+			st.proven = false
+		}
 		mapped, ok := remapConjunctThroughProjection(c, out, x.GroupExprs, x.Child.Output())
 		if !ok {
 			return n, false
 		}
-		repl, ok := pushConjunctIntoCTEBody(x.Child, mapped)
+		repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, mapped, st)
 		if ok {
 			x.Child = repl
 		}
@@ -228,7 +271,7 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 	case *Filter:
 		switch x.Child.(type) {
 		case *Project, *Aggregate, *Sort, *GatherMerge, *Filter:
-			repl, ok := pushConjunctIntoCTEBody(x.Child, c)
+			repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, c, st)
 			if ok {
 				x.Child = repl
 			}
@@ -237,10 +280,10 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 		// Join tree or terminal below: pushConjunctIntoSubtree's Filter
 		// case owns this shape (exprEqual idempotence guard, LeafLocal
 		// convention check).
-		return pushConjunctIntoSubtree(x, c)
+		return pushConjunctTraced(x, c, st)
 
 	case *Sort:
-		repl, ok := pushConjunctIntoCTEBody(x.Child, c)
+		repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, c, st)
 		if ok {
 			x.Child = repl
 		}
@@ -273,7 +316,7 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 		// same boundary the *Sort* precedent draws. General-path
 		// Gather/GatherMerge crossing there is a separate round with its
 		// own proof (REPORT.md §6).
-		repl, ok := pushConjunctIntoCTEBody(x.Child, c)
+		repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, c, st)
 		if ok {
 			x.Child = repl
 		}
@@ -282,7 +325,7 @@ func pushConjunctIntoCTEBody(n Node, c Expr) (Node, bool) {
 	case *Limit:
 		return n, false
 	}
-	return pushConjunctIntoSubtree(n, c)
+	return pushConjunctTraced(n, c, st)
 }
 
 // remapConjunctThroughProjection re-expresses a conjunct given in a

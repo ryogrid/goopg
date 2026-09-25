@@ -349,6 +349,13 @@ type pushTrace struct {
 	// pushes originate OUTSIDE the body's scope and deliberately cross
 	// the searched boundary (R42: the boundary Project arm).
 	noSearched bool
+	// cteMove marks a descent that started at a single-reference CTE's
+	// residual Filter (pushFilterQualsThroughCTEScan). There every
+	// ColumnRef is named from the schemas it was remapped through, so the
+	// *Project arm's name checks run on both hops and it may keep the
+	// proof when the conjunct has no unnamed ref (M0146-0007b). The join
+	// pass never sets it and stays placement-only across a projection.
+	cteMove bool
 }
 
 func pushConjunctIntoSubtree(n Node, c Expr) (Node, bool) {
@@ -372,6 +379,19 @@ func pushConjunctIntoSubtreeTracedNoSearched(n Node, c Expr, noSearched bool) (N
 	st := &pushTrace{proven: true, noSearched: noSearched}
 	repl, ok := pushConjunctTraced(n, c, st)
 	return repl, ok, *st
+}
+
+// conjunctRefsAllNamed reports whether every ColumnRef in c carries a
+// name, i.e. whether remapConjunctThroughProjection's positional name
+// check ran for all of them.
+func conjunctRefsAllNamed(c Expr) bool {
+	named := true
+	walkExprTree(c, func(e Expr) {
+		if cr, ok := e.(*ColumnRef); ok && cr.Name == "" {
+			named = false
+		}
+	})
+	return named
 }
 
 func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
@@ -484,7 +504,9 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		// checks assume the layout the length guard above now enforces.
 		// The length seam is closed; the unnamed-ref seam is why the move
 		// stays off. Enabling it is a separate round with its own proof.
-		st.proven = false
+		if !st.cteMove || !conjunctRefsAllNamed(c) {
+			st.proven = false
+		}
 		repl, ok := pushConjunctTraced(x.Child, mapped, st)
 		if !ok {
 			return n, false

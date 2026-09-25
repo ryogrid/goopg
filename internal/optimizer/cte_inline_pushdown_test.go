@@ -91,8 +91,11 @@ func TestCTEBodyPushSingleRef(t *testing.T) {
 	if got := columnRefIndexes(bf.Predicate); len(got) != 1 || got[0] != 0 {
 		t.Errorf("pushed predicate refs = %v, want [0]", got)
 	}
-	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	// M0146-0007b: the placement over a base-relation leaf is exact, so the
+	// qual MOVES — the residual keeps only the transparent true wrapper,
+	// as PG's subquery_push_qual leaves no copy above the subquery.
+	if !isTrueConst(f.Predicate) {
+		t.Errorf("residual Filter is %v, want the true wrapper — a proven push must move", f.Predicate)
 	}
 	if bf.Predicate == f.Predicate {
 		t.Errorf("pushed predicate aliases the residual conjunct; the remap must produce a fresh tree")
@@ -166,8 +169,10 @@ func TestCTEBodyPushCrossesGatherMerge(t *testing.T) {
 	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
 		t.Errorf("pushed predicate refs = %v, want [0] (sales.y)", got)
 	}
-	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	// Aggregate (grouping key), GatherMerge and Sort are exact hops: the
+	// qual moves (M0146-0007b).
+	if !isTrueConst(f.Predicate) {
+		t.Errorf("residual Filter is %v, want the true wrapper — a proven push must move", f.Predicate)
 	}
 
 	// Freshness pin on the shared finder: planChildren must see
@@ -494,5 +499,79 @@ func TestCTEInlinableFollowsInlineCTEGate(t *testing.T) {
 	var nilScan *CTEScan
 	if nilScan.Inlined() || (&CTEScan{}).Inlined() {
 		t.Error("a scan without a WITH-list entry is never inlined")
+	}
+}
+
+// isTrueConst reports whether e is the literal TRUE the pass leaves behind
+// when every conjunct moved.
+func isTrueConst(e Expr) bool {
+	b, ok := e.(*BooleanConst)
+	return ok && b.Value
+}
+
+// TestCTEBodyPushGroupingSetsKeepsCopy pins M0146-0007b's grouping-sets
+// exception: a grouping-sets aggregate emits rollup rows whose key is NULL,
+// which only the residual copy rejects, so crossing it plants the qual
+// below but must keep the copy above.
+func TestCTEBodyPushGroupingSetsKeepsCopy(t *testing.T) {
+	leaf := &SeqScan{Table: &catalog.Table{Name: "sales"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+	agg := &Aggregate{
+		Child:        leaf,
+		GroupExprs:   []Expr{&ColumnRef{Index: 0, Name: "y", Type: catalog.Type{Name: "int4"}}},
+		Aggs:         []AggregateCall{{Name: "sum", Arg: &ColumnRef{Index: 1, Name: "cnt", Type: catalog.Type{Name: "int4"}}}},
+		GroupingSets: [][]int{{0}, {}},
+		schema:       Schema{ijCol("y"), ijCol("total")},
+	}
+	ce := &plannedCTE{name: "s", body: agg, schema: Schema{ijCol("y"), ijCol("total")},
+		refs: 1, inlineEligible: true, selectOwned: true}
+	scan := &CTEScan{Name: "s", Alias: "s", Child: agg, schema: ce.schema, cte: ce}
+	f := &Filter{Child: scan, Predicate: ijEq(0, "y", 1998)}
+	pushQualsThroughSingleRefCTEs(f)
+	if _, ok := agg.Child.(*Filter); !ok {
+		t.Fatalf("aggregate child is %T, want the planted *Filter", agg.Child)
+	}
+	if isTrueConst(f.Predicate) || len(splitAnd(f.Predicate)) != 1 {
+		t.Errorf("residual Filter is %v, want the original conjunct kept (copy, not move)", f.Predicate)
+	}
+}
+
+// TestPushConjunctProjectArmCTEMoveProof pins M0146-0007b's narrow opening
+// of pushConjunctTraced's *Project arm: a descent from a CTE residual
+// (cteMove) keeps the move proof across a projection when every ColumnRef
+// is named — the positional name check then ran on both hops. The join
+// pass (cteMove unset) and an unnamed ref both stay placement-only.
+func TestPushConjunctProjectArmCTEMoveProof(t *testing.T) {
+	build := func() *Project {
+		leaf := &SeqScan{Table: &catalog.Table{Name: "t"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+		return &Project{Child: leaf,
+			Targets: []Expr{&ColumnRef{Index: 0, Name: "y", Type: catalog.Type{Name: "int4"}}},
+			schema:  Schema{ijCol("y")}}
+	}
+	cases := []struct {
+		name       string
+		cteMove    bool
+		unnamed    bool
+		wantProven bool
+	}{
+		{"CTE path, named refs", true, false, true},
+		{"join pass", false, false, false},
+		{"CTE path, unnamed ref", true, true, false},
+	}
+	for _, tc := range cases {
+		c := ijEq(0, "y", 1998)
+		if tc.unnamed {
+			walkExprTree(c, func(e Expr) {
+				if cr, ok := e.(*ColumnRef); ok {
+					cr.Name = ""
+				}
+			})
+		}
+		st := &pushTrace{proven: true, cteMove: tc.cteMove}
+		if _, ok := pushConjunctTraced(build(), c, st); !ok {
+			t.Fatalf("%s: the push itself must succeed", tc.name)
+		}
+		if st.proven != tc.wantProven {
+			t.Errorf("%s: proven = %v, want %v", tc.name, st.proven, tc.wantProven)
+		}
 	}
 }
