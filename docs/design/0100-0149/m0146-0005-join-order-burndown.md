@@ -642,6 +642,24 @@ the missing eq_selec, which slice 18 fixed. Q38 now diverges at depth 4
 (was 3) at both scales, on PG's partial Unique + Gather Merge; nothing
 else changes. Evidence: `analysis/m0146/m0146-0005/slice19/`.
 
+## Slice 20 (M0146-0005t): EXPLAIN names a column by its own level
+
+Q14's depth-7 SF0.25 record was a rendering difference, not a plan one.
+goopg printed the cross\_items join as `store_sales.ss_sold_date_sk =
+date_dim.d_date_sk` where PG prints `d1.d_date_sk`. Two causes:
+- `createSeqScanPlan` dropped the leaf's `RTID`, so search-built seq scans
+  had no range-table name;
+- the planner restarts SourceTableIdx in every query level, so the
+  statement-wide lookup handed a CTE body's columns the outer query's
+  relations.
+
+`createSeqScanPlan` now carries `RTID`. `explainNames.columnIn` resolves a
+column against the rendered node's subtree, then its ancestors, stopping
+at CTE and set-operation boundaries (PG's set\_deparse\_plan namespace).
+Scan labels print `<relation> <refname>` as ExplainTargetRel does. Q14's
+record moves to `CTE avg_sales`. The rendering category drops by 2 at
+each scale. Evidence: `analysis/m0146/m0146-0005/slice20/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

@@ -38,6 +38,7 @@ func TestCreateSeqScanPlanLosslessRebuild(t *testing.T) {
 	leaf := &SeqScan{
 		Table:                 tbl,
 		Alias:                 "o",
+		RTID:                  9,
 		EstRelRows:            12345,
 		SmallDim:              true,
 		LockParentOID:         77,
@@ -54,7 +55,9 @@ func TestCreateSeqScanPlanLosslessRebuild(t *testing.T) {
 	if ss == leaf {
 		t.Fatal("arm returned the pipeline's own leaf node; it must rebuild a fresh one")
 	}
-	if ss.Table != tbl || ss.Alias != "o" || ss.EstRelRows != 12345 || !ss.SmallDim ||
+	// RTID is EXPLAIN's range-table identity; losing it left every
+	// search-built seq scan unnamed (M0146-0005t).
+	if ss.Table != tbl || ss.Alias != "o" || ss.RTID != 9 || ss.EstRelRows != 12345 || !ss.SmallDim ||
 		ss.LockParentOID != 77 || !ss.SkipIfVanished || ss.InheritParentOID != 78 ||
 		ss.PrivilegeCheckRole != "view_owner" || !ss.PrivilegeCheckRoleSet {
 		t.Fatalf("rebuild lost fields: %+v", ss)

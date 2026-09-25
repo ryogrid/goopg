@@ -96,6 +96,11 @@ func createSeqScanPlan(p *Path) Node {
 		// every clause of the search was resolved against these coordinates
 		// (createplanindex.go's file header, loss #1).
 		schema:                id.schema,
+		// The leaf's statement-unique range-table identity, as the index
+		// and bitmap arms carry it (createplanindex.go). Without it EXPLAIN
+		// cannot name this scan's columns and falls back to another level's
+		// relation (M0146-0005t).
+		RTID:                  id.rtid,
 		EstRelRows:            id.estRelRows,
 		SmallDim:              id.smallDim,
 		UniqueKeys:            id.uniqueKeys,

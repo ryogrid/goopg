@@ -1,0 +1,12 @@
+14c14
+< Q14 depth=7 [join-order] under Nested Loop: PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+---
+> Q14 depth=1 [sort-strategy] under Limit: PG CTE avg_sales | goopg Sort
+101c101
+< CATEGORY-ROLLUP: sort-strategy=34 qual-placement=14 aggregation-strategy=12 parallelism=8 join-method=7 join-order=6 scan-type=4 parameterisation=3 error=3
+---
+> CATEGORY-ROLLUP: sort-strategy=35 qual-placement=14 aggregation-strategy=12 parallelism=8 join-method=7 join-order=5 scan-type=4 parameterisation=3 error=3
+129c129
+<     1  join-order       under Nested Loop      PG Parallel Hash Join Inner     goopg Parallel Hash Join Inner     depth=7
+---
+>     1  sort-strategy    under Limit            PG CTE avg_sales                goopg Sort                         depth=1

@@ -21552,6 +21552,22 @@ M0146-0001 re-baseline census on the new default arm.
     - Q38 depth 3 → 4 at SF0.25 and SF1; TPC\-H census identical; all
       gates pass.
   Movement: TPC\-DS SF0.25 and SF1 Q38 depth 3 → 4
+- [x] **M0146\-0005t — EXPLAIN names a column by its own query level**
+  \(opened 2026\-09\-26 from the Q14 depth\-7 trace\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc §"Slice 20"; evidence
+    `analysis/m0146/m0146\-0005/slice20/`.
+    - Q14\'s depth\-7 record was rendering: the cross\_items join printed
+      `date\_dim.d\_date\_sk` \(the outer query\'s relation\) where PG prints
+      `d1.d\_date\_sk`.
+    - `createSeqScanPlan` now carries the leaf\'s RTID;
+      `explainNames.columnIn` resolves against the rendered node\'s subtree
+      and ancestors \(set\_deparse\_plan\); scan labels print
+      `<relation> <refname>` \(ExplainTargetRel\).
+    - Q14 SF0.25 record moves to `CTE avg\_sales`; rendering 27 → 25
+      \(SF0.25\), 28 → 26 \(SF1\); all gates pass; regress no case worse.
+  Movement: TPC\-DS Q14 SF0.25 record moves past the cross\_items subtree
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

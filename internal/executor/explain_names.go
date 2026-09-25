@@ -90,6 +90,13 @@ type explainNames struct {
 	// for node labels — the existing bySource/taken/seen serve column
 	// qualification, which has different collision rules.
 	nodeLabels map[string]string
+	// parent maps each plan node (nodePtr) to the node it was first
+	// reached from in collect's walk, and scopes caches each node's
+	// subtree SourceTableIdx → RTID map. Together they let columnIn
+	// resolve a column against the rendered node's own level before the
+	// statement-wide bySrc.
+	parent map[string]optimizer.Node
+	scopes map[string]map[int16]int32
 }
 
 // nodePtr returns a unique string id for a plan node.
@@ -104,6 +111,8 @@ func newExplainNames(n optimizer.Node) *explainNames {
 		cols:       map[int32]map[string]bool{},
 		bySrc:      map[int16]int32{},
 		nodeLabels: map[string]string{},
+		parent:     map[string]optimizer.Node{},
+		scopes:     map[string]map[int16]int32{},
 	}
 	nm.collect(n)
 	return nm
@@ -149,6 +158,85 @@ func (nm *explainNames) column(src int16, colName string, prefix bool) string {
 	return rel + "." + colName
 }
 
+// columnIn is column resolved against the node being rendered, the way
+// PG's ruleutils deparses a Var through the plan node's own namespace
+// (set_deparse_plan: the node's outer and inner children). The planner's
+// SourceTableIdx restarts at 1 in every query level, so the statement-wide
+// bySrc can hand a CTE body's column the consumer query's relation: TPC-DS
+// Q14's cross_items printed `store_sales.ss_sold_date_sk =
+// date_dim.d_date_sk` (the outer query's date_dim) where PG prints
+// `d1.d_date_sk` (M0146-0005t).
+//
+// The lookup tries the scans under `at`, then under each ancestor in turn
+// (a parameterised inner scan names its outer side from the join above
+// it), and stops at a CTE body's root. It falls back to column when no
+// scope names the column.
+func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, prefix bool) string {
+	if !prefix || nm == nil {
+		return colName
+	}
+	for n := at; n != nil; n = nm.parent[nodePtr(n)] {
+		if rtid, ok := nm.scopeSources(n)[src]; ok {
+			if rel := nm.bySource[rtid]; rel != "" && nm.cols[rtid][colName] {
+				return rel + "." + colName
+			}
+		}
+		if p := nm.parent[nodePtr(n)]; p != nil && explainLevelBoundary(p) {
+			break
+		}
+	}
+	return nm.column(src, colName, prefix)
+}
+
+// scopeSources maps SourceTableIdx → RTID for the scans in n's subtree,
+// first in walk order, without descending below a query-level boundary
+// (explainLevelBoundary) other than n itself.
+func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
+	key := nodePtr(n)
+	if m, ok := nm.scopes[key]; ok {
+		return m
+	}
+	if nm.scopes == nil {
+		nm.scopes = map[string]map[int16]int32{}
+	}
+	m := map[int16]int32{}
+	var walk func(x optimizer.Node, top bool)
+	walk = func(x optimizer.Node, top bool) {
+		if x == nil {
+			return
+		}
+		if _, ok := explainRelBaseName(x); ok {
+			if rtid, ok := explainNodeRTID(x); ok {
+				if src, ok := explainSingleSourceIdx(x); ok && src != 0 {
+					if _, claimed := m[src]; !claimed {
+						m[src] = rtid
+					}
+				}
+			}
+		}
+		if !top && explainLevelBoundary(x) {
+			return
+		}
+		for _, c := range planChildren(x) {
+			walk(c, false)
+		}
+	}
+	walk(n, true)
+	nm.scopes[key] = m
+	return m
+}
+
+// explainLevelBoundary reports whether n's children belong to another query
+// level: a CTE reference (its child is the CTE body) or a set operation
+// (each arm is its own SELECT).
+func explainLevelBoundary(n optimizer.Node) bool {
+	switch n.(type) {
+	case *optimizer.CTEScan, *optimizer.MaterializedCTEScan, *optimizer.SetOp:
+		return true
+	}
+	return false
+}
+
 // collect walks the plan subtree rooted at n and registers every scan-like
 // node's relation name. Registration is ordered by RTID (the statement-wide
 // allocation order, ≈ FROM order across query levels) rather than by tree
@@ -182,6 +270,11 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			}
 		}
 		for _, c := range planChildren(node) {
+			if c != nil {
+				if _, ok := nm.parent[nodePtr(c)]; !ok {
+					nm.parent[nodePtr(c)] = node
+				}
+			}
 			walk(c)
 		}
 		// A-01(ii) cut 2 (F3): sublink bodies hang off Expr fields

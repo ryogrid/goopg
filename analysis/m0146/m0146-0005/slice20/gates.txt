@@ -1,0 +1,4 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H first-divergence census: identical to slice 19
+regress (13 pass-required cases with plans) vs HEAD worktree: 12 diffs identical; union 1007 -> 982 lines (Seq Scan on tenk1 tenk1_1 now matches)

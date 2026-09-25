@@ -443,6 +443,7 @@ func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts
 // wrapper's plan node, carried so the collapsed line can report the
 // wrapper's POST-qual row estimate (see below).
 func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, reg *subPlanReg) {
+	defer reg.enter(n)()
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*optimizer.Project); ok {
@@ -996,7 +997,7 @@ func qualifierNamesCTE(reg *subPlanReg, col *optimizer.ColumnRef, cteNames map[s
 	if reg == nil || reg.names() == nil || col == nil || len(cteNames) == 0 {
 		return false
 	}
-	q := reg.names().column(col.SourceTableIdx, col.Name, true)
+	q := reg.names().columnIn(reg.currentNode(), col.SourceTableIdx, col.Name, true)
 	i := strings.LastIndex(q, ".")
 	if i < 0 {
 		return false
@@ -1937,6 +1938,11 @@ type subPlanReg struct {
 	// (an aggregate zeroes SourceTableIdx). Set by the walkers around
 	// each node's render; nil outside one.
 	ancestor optimizer.Node
+	// current is the plan node whose own lines are being rendered. A plain
+	// column in its detail lines is resolved against that node's subtree
+	// first (explainNames.columnIn), the way PG deparses a Var against the
+	// node's own children. Set by both walkers for each node; nil outside.
+	current optimizer.Node
 	// cte holds the CTE bodies lifted out of their reference sites for this
 	// render, so a multiply-referenced CTE prints once as a `CTE <name>`
 	// section instead of once per reference (M0125-0049). Shared with the
@@ -2173,6 +2179,25 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 	return fallback
 }
 
+// currentNode returns the plan node whose own lines are being rendered, or
+// nil.
+func (r *subPlanReg) currentNode() optimizer.Node {
+	if r == nil {
+		return nil
+	}
+	return r.current
+}
+
+// enter makes n the node being rendered and returns the restore func.
+func (r *subPlanReg) enter(n optimizer.Node) func() {
+	if r == nil {
+		return func() {}
+	}
+	prev := r.current
+	r.current = n
+	return func() { r.current = prev }
+}
+
 // ancestorNode returns the plan node currently being rendered, or nil.
 func (r *subPlanReg) ancestorNode() optimizer.Node {
 	if r == nil {
@@ -2284,7 +2309,7 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		// (ruleutils.c get_variable's need_prefix): a plain Var is
 		// printed bare on a scan qual and qualified everywhere else
 		// once the query has more than one range-table entry.
-		return reg.names().column(x.SourceTableIdx, x.Name, qualify)
+		return reg.names().columnIn(reg.currentNode(), x.SourceTableIdx, x.Name, qualify)
 	case *optimizer.OuterColumnRef:
 		// A correlated reference is always prefixed, even inside a
 		// scan qual. Upstream reaches the same output through
@@ -2552,6 +2577,7 @@ func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Ro
 }
 
 func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, filterRowsRemoved int64, reg *subPlanReg) {
+	defer reg.enter(n)()
 	if p, ok := n.(*optimizer.Project); ok {
 		// R32 (K42) twin of the walkPlanFiltered Project visit: target
 		// sublinks must assign here or the ANALYZE text path silently
@@ -3330,7 +3356,7 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		// relation scanned twice without an alias prints two
 		// distinguishable labels (e.g. "nation" / "nation_1").
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return parallelPrefix + seqScanLabel(p) + " on " + dname
+			return parallelPrefix + seqScanLabel(p) + " on " + scanTargetRef(schemaQualify(p.Table.QualifiedName()), dname)
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
@@ -3346,7 +3372,7 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), scanTargetRef(schemaQualify(p.Table.QualifiedName()), dname))
 		}
 		// P0-04: print the FROM-clause alias like the SeqScan arm does, so
 		// a self-join's second scan renders `on customer c2` as PG's
@@ -3372,7 +3398,7 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), scanTargetRef(indexOnlyRelName(p, schemaQualify), dname))
 		}
 		// A-01(i): print the FROM-clause alias like the IndexScan arm
 		// does, so a self-join's IOS probe renders `on customer c2`
@@ -3568,7 +3594,7 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return parallelPrefix + seqScanLabel(p) + " on " + dname
+			return parallelPrefix + seqScanLabel(p) + " on " + scanTargetRef(explainRelName(p.Table, verbose), dname)
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
 			return fmt.Sprintf("%s%s on %s %s", parallelPrefix, seqScanLabel(p), explainRelName(p.Table, verbose), p.Alias)
@@ -3581,7 +3607,7 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Scan using %s on %s", parallelPrefix, explainIndexName(p.Index), scanTargetRef(explainRelName(p.Table, verbose), dname))
 		}
 		// P0-04: same alias branch as the verbose arm above.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
@@ -3609,7 +3635,7 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			parallelPrefix = "Parallel "
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), dname)
+			return fmt.Sprintf("%sIndex Only Scan%s using %s on %s", parallelPrefix, dir, explainIndexName(p.Index), scanTargetRef(indexOnlyRelName(p, func(q string) string { return explainRelName(p.Table, verbose) }), dname))
 		}
 		// A-01(i): same alias branch as the verbose arm above.
 		if p.Alias != "" && p.Table != nil && p.Alias != strings.ToLower(p.Table.Name) {
@@ -3682,7 +3708,7 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			return "Bitmap Heap Scan"
 		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return "Bitmap Heap Scan on " + dname
+			return "Bitmap Heap Scan on " + scanTargetRef(explainRelName(p.Table, verbose), dname)
 		}
 		// P0-04: alias branch, same rule as the SeqScan arm.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
@@ -4256,4 +4282,24 @@ func constSampleFloat(e optimizer.Expr) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// scanTargetRef is ExplainTargetRel's (explain.c) " on <relname> <refname>":
+// the relation's own name, then the range-table name when it differs, so a
+// relation scanned twice without an alias prints `store_sales` and
+// `store_sales store_sales_1`, not a bare `store_sales_1` (M0146-0005t).
+func scanTargetRef(rel, ref string) string {
+	if rel == "" || strings.EqualFold(rel, ref) {
+		return ref
+	}
+	return rel + " " + ref
+}
+
+// indexOnlyRelName is the relation name for an index-only scan's target, or
+// "" when the node carries no table (the label then shows the ref alone).
+func indexOnlyRelName(p *optimizer.IndexOnlyScan, name func(string) string) string {
+	if p.Table == nil {
+		return ""
+	}
+	return name(p.Table.QualifiedName())
 }

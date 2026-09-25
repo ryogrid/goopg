@@ -270,7 +270,9 @@ func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
 		if strings.HasPrefix(trimmed, "->  ") {
 			trimmed = trimmed[4:]
 		}
-		if strings.HasPrefix(trimmed, "Seq Scan on eq_r_1") {
+		// PG's ExplainTargetRel prints the relation, then the
+		// disambiguated range-table name: `eq_r eq_r_1`.
+		if strings.HasPrefix(trimmed, "Seq Scan on eq_r eq_r_1") {
 			hasDisambiguated = true
 		} else if strings.HasPrefix(trimmed, "Seq Scan on eq_r") {
 			hasBare = true
@@ -281,7 +283,7 @@ func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
 			strings.Join(lines, "\n"))
 	}
 	if !hasDisambiguated {
-		t.Errorf("expected one Seq Scan on eq_r_1 (disambiguated) line\nplan:\n%s",
+		t.Errorf("expected one Seq Scan on eq_r eq_r_1 (disambiguated) line\nplan:\n%s",
 			strings.Join(lines, "\n"))
 	}
 }
@@ -464,5 +466,32 @@ func TestJSONCollapsesProjectFilterWrappersLikeText(t *testing.T) {
 	}
 	if len(filters) != 1 || filters[0] != "(a = 42)" {
 		t.Errorf("JSON Filter properties = %v, want [(a = 42)]", filters)
+	}
+}
+
+// TestExplainCTEBodyJoinQualifiesOwnLevel pins M0146-0005t: SourceTableIdx
+// restarts at 1 in every query level, so a statement-wide lookup handed the
+// CTE body's join columns the OUTER query's relations. PG deparses a Var
+// through the plan node's own children (set_deparse_plan), so the body's
+// join prints its own aliases, as TPC-DS Q14's cross_items prints
+// `d1.d_date_sk`.
+func TestExplainCTEBodyJoinQualifiesOwnLevel(t *testing.T) {
+	lines := qualifyExplainLines(t,
+		"EXPLAIN (COSTS OFF) WITH c AS MATERIALIZED (SELECT a.id FROM eq_r a JOIN eq_r b ON a.st = b.st) "+
+			"SELECT eq_r.id FROM eq_r JOIN eq_r y ON eq_r.st = y.st JOIN c ON c.id = eq_r.id")
+	t.Logf("plan:\n%s", strings.Join(lines, "\n"))
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "Cond:") && strings.Contains(l, ".st = ") {
+			if strings.Contains(l, "a.st") || strings.Contains(l, "b.st") {
+				found = true
+				if strings.Contains(l, "eq_r.") || strings.Contains(l, "y.") {
+					t.Errorf("CTE body join mixes the outer level's names: %q", l)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("CTE body join condition not qualified with its own aliases a/b:\n%s", strings.Join(lines, "\n"))
 	}
 }
