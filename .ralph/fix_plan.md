@@ -2469,7 +2469,7 @@ heuristic stays live.)
     \(`analysis/m0145/m0145\-0008s/regress\-suite\-result.txt`\).
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
-- [ ] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
+- [x] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
   `xlhp\_freeze\_plan` is written as 11 bytes, PG\'s struct is 12** \(found
   2026\-09\-25 by M0145\-0008v S2\). PG pads one byte after `frzflags`
   before `ntuples` \(`heapam\_xlog.h`\); `EncodeHeapFreezePG`
@@ -2482,6 +2482,18 @@ heuristic stays live.)
   - First step: pad the plan to 12 bytes on both sides \(encoder and
     `decodeXLogHeapPrune`\), keep reading 11\-byte plans from existing WAL
     if old segments must replay, and pin with a `pg\_waldump` check.
+  - **FIXED 2026\-09\-25 \(`0b37c784b`\).** Evidence
+    `analysis/m-nightly/freeze\-wal\-plan\-padding/`; design log
+    `docs/design/wal\-pg\-identical\-stream/IMPLEMENTATION\-TODO.md` \(A7
+    correction\).
+    - Encoder and decoder use PG\'s 12\-byte plan; the decoder still reads
+      the legacy 11\-byte form, recognised by its odd block\-data length.
+    - PG 18.3 `pg\_waldump` now prints `ntuples: 3, offsets: \[1, 3, 5\]`
+      \(before: `ntuples: 256`\). `findPGWaldump` now finds the repo\'s PG
+      install, so the waldump tests run in the gates instead of skipping.
+    - Gates: units, tpch\-spotcheck, SF0.25 sweep \(99 same\),
+      `TestE2E\_PGStandbyFullCycle`, Recovery001/013/039 — all PASS.
+  Movement: none
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — a PG standby would corrupt frozen pages
   >

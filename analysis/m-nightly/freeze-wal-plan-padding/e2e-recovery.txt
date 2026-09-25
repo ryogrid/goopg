@@ -1,0 +1,5 @@
+--- PASS: TestE2E_PGStandbyFullCycle (9.31s)
+--- PASS: TestPort_Recovery001StreamRep (4.85s)
+--- PASS: TestPort_Recovery013CrashRestart (2.28s)
+--- PASS: TestPort_Recovery039EndOfWal (2.08s)
+ok  	github.com/goopg/goopg/internal/testport	18.541s
