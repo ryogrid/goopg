@@ -2419,7 +2419,7 @@ heuristic stays live.)
     Movement: none
 
 ### Nightly run 20260925-002342 (sha `2e923ff37337`, 5 items) — filed 2026-09-25
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir** — testport TestE2E\_PGColdStartOnGoopgDataDir FAILed
+- [x] **testport/TestE2E_PGColdStartOnGoopgDataDir** — testport TestE2E\_PGColdStartOnGoopgDataDir FAILed
   (AI-20260925-002342-001; repro: `go test -v -run '^TestE2E_PGColdStartOnGoopgDataDir$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
@@ -2435,6 +2435,25 @@ heuristic stays live.)
     carried by the explicit lines already in the bench runtime
     `postgresql.conf` files \(`bench/tpch|tpcds/runtime*/`\), not by the
     init template. Placed in banner item 2a.
+  - **FIXED 2026\-09\-25 \(`b6294af13`\).**
+    - `internal/utils/misc/postgresql.conf.sample`: the `work\_mem` line
+      is commented again, `\#work\_mem = 512MB` \(the BootVal, as
+      `TestSampleConfigCoversRegistry` requires; PG\'s 4MB is the parked
+      take3\-B\-13 flip\). No effective setting changes: an unset
+      `work\_mem` still boots at 512MB.
+    - The convention\'s explicit line was already in all five
+      bench/reference confs and `bench/tpch/setup\_goopg.sh`;
+      `tpcds\-sf025\-regression.sh load\-goopg` now appends it after its
+      plain `goopg init`.
+    - New unit test `TestSampleConfigHasNoActiveSetting` pins the
+      all\-commented template in the unit gate.
+    - Gates: units, `TestE2E\_PGColdStartOnGoopgDataDir` PASS,
+      tpch\-spotcheck, SF0.25 sweep 96 PASS / 99 plans unchanged.
+    - **Owner action:** AGENT.md §"Plan\-parity harness" still says
+      "`goopg init` writes the convention automatically via
+      `internal/utils/misc/postgresql.conf.sample`". That sentence is now
+      stale, and the loop may not edit that section.
+  Movement: none
 - [ ] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
   (AI-20260925-002342-002; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
