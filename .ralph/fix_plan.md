@@ -20764,6 +20764,23 @@ M0146-0001 re-baseline census on the new default arm.
       Q17/Q19 and the TPC\-DS records — re\-run the first\-divergence census
       on each slice\'s capture first.
     Movement: yes — TPC-H PLAN-PARITY match 3 -> 5 (Q3, Q10)
+  - **Slice 2 LANDED 2026\-09\-25 \(`2962ae22d`\).** Evidence
+    `analysis/m0146/m0146\-0005/slice2/`.
+    - Mechanism: the partial nested\-loop arm passed the inner\'s rescan
+      STARTUP as a literal 0 \(the serial NLI arm has passed it since R69\);
+      a parameterised probe re\-paid only its run half. TPC\-H Q9\'s partial
+      nested loop into `orders\_pk` cost 0.066 per probe instead of ~0.43.
+      Both arms now share `nliNestLoopCost`.
+    - TPC\-H: match 5 → 5; Q9\'s first divergence moves from depth 4
+      `join\-method` to depth 5 `qual\-placement`.
+    - TPC\-DS: **SF0.25 match 4 → 7 \(Q12, Q15, Q20\), SF1 6 → 8 \(Q7, Q91\)**;
+      SF0.25 `parameterisation` 54 → 38, `join\-method` 66 → 56; no timeouts;
+      values identical.
+    - EA\-RATCHET FAIL, 1 NEW finding \(Q7\'s 4\-rel Gather, `pg\_est` null,
+      same class as the fixed Q27 key\) → M0146\-0009a \+ ledger row.
+    - Next: Q17 / Q19 \(`join\-method`\), then the TPC\-DS records; re\-run
+      the first\-divergence census on the slice\-2 capture first.
+    Movement: yes — TPC-DS PLAN-PARITY match SF0.25 4 -> 7, SF1 6 -> 8
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -20802,6 +20819,21 @@ M0146-0001 re-baseline census on the new default arm.
   first; each fix is its own gated change.
   Kind: impl
   Parent: none
+- [ ] **M0146\-0009a — the `customer\_demographics \+ date\_dim \+ item \+
+  store\_sales` join is estimated at 47 rows against an actual 1944 \(TPC\-DS
+  Q7 / Q27\)** \(filed 2026\-09\-25 by M0146\-0005 slice 2 as the owning task
+  of its NEW EA\-RATCHET finding\). The same key was a ratchet finding under
+  Q27 \(fixed by slice 2\) and is now one under Q7 \(qerr 41.4\); PG has no
+  node at this relset \(`pg\_est` null\), so the finding is goopg\'s own
+  4\-way join estimate.
+  Kind: recon
+  Parent: M0146-0009
+  - First step: per\-level row estimates for Q7\'s four\-rel join on goopg vs
+    PG\'s nearest\-scope estimates \(the `store\_sales ⋈ customer\_demographics`
+    and `⋈ date\_dim` levels\), to find which join clause\'s selectivity
+    collapses.
+  - Expected movement: EA\-RATCHET finding Q7:customer\_demographics\+date\_dim\+item\+store\_sales
+    cleared \(`make ea\-ratchet` findings 51 → 50\).
 - [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
   the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
   §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;

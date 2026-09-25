@@ -1,0 +1,6 @@
+FIRE-SET: baseline=2ece972e5ab9ef3605f3a33f0fae3c9081d71f2d (54bb2d80fb4d) candidate=worktree (8ab626df9c41)
+PLAN-PARITY: queries=22 match=5 shapediff=17 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=15 join-method=8 scan-type=11 parameterisation=4 aggregation-strategy=4 sort-strategy=9 parallelism=11 qual-placement=5 rendering=2
+PLAN-PARITY: queries=22 match=5 shapediff=17 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=15 join-method=7 scan-type=10 parameterisation=4 aggregation-strategy=4 sort-strategy=9 parallelism=12 qual-placement=5 rendering=2
+FIRE-SET-TIMEOUTS: fires=Q2 Q3 Q5 Q7 Q9 Q18 Q20 introduced=none unchanged=none missing=none

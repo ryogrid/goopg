@@ -1,0 +1,511 @@
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=358 rows=363543 cost=152130..157583 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=358 rows=363543 cost=152130..157583 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=0
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=358 rows=90886 cost=88684.1..90047.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND pok rel=(b 3 4 5 6 7 8) cand={k=358 rows=90886 cost=88684.1..90047.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=0
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.5..665613 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.5..665613 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} by={k=358 rows=363543 cost=152130..157583 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48891.7..168538 pk=0 par=- by={k=358 rows=363543 cost=152130..157583 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=1
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.5..249847 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=48891.5..249847 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.01..449049 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1475..499036 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1575..452688 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.01..449049 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.84048..449051 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1475..449062 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.5..217964 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND prej rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.5..217964 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} by={k=358 rows=90886 cost=88684.1..90047.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=93693.8..93693.8 pk=0 par=- by={k=358 rows=90886 cost=88684.1..90047.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.7..83422.8 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND pok rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.7..83422.8 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=1
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.5..114022 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND prej rel=(b 3 4 5 6 7 8) cand={k=356 rows=90886 cost=47891.5..114022 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} by={k=356 rows=90886 cost=47891.7..83422.8 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=keys:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.5725..449960 pk=0 par=- by={k=356 rows=363543 cost=48891.7..127443 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=1
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND pok rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} removed=1
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=152130..153038 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48891.5..2.96378e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48891.5..142183 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48891.7..2.96379e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48891.7..142194 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=152128..153049 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1475..449062 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=123096..123097 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=314136..318795 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=257122..257122 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=6859.79..2.23965e+10 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=6859.79..2.23965e+10 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.21..239244 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.22..233282 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=6859.79..8.17985e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=6859.79..8.17985e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29368.6..2.23965e+10 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29368.6..2.23965e+10 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} removed=0
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29369..264141 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29369..264141 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} removed=1
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} removed=1
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29368.6..8.17986e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=29368.6..8.17986e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1001.79..829567 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.22..984982 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.23..979020 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1001.79..829567 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197732..1.03005e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1011.39..975963 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=356 rows=117272 cost=5859.79..7.22471e+09 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND prej rel=(b 3 4 5 6 7 8) cand={k=356 rows=117272 cost=5859.79..7.22471e+09 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 3 4 5 6 8) in=(b 7)} by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=96609..96609 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=97781.7..97781.7 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=356 rows=117272 cost=5859.79..2.63871e+09 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND prej rel=(b 3 4 5 6 7 8) cand={k=356 rows=117272 cost=5859.79..2.63871e+09 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 3 4 5 6 8) in=(b 7)} by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=785266..785266 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=824119..824119 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=825028..825028 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=785266..785266 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=985746..985746 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=931662..931662 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62607.8..892082 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.8..146344 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=83061.9..83061.9 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=108374..108374 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=314136..318795 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6859.79..1.25744e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.71..1.44446e+12 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6859.79..1.36341e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.21..1.25744e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1375..1.44446e+12 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.21..1.36352e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=117416..264711 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1011.39..975963 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.61115e+11..3.61115e+11 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.61115e+11..3.61115e+11 pk=0 par=- by={k=359 rows=90886 cost=47893.1..81477.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=88373.8..134980 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND pok rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)} removed=1
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=364479..367388 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=303261..303261 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=364479..367388 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=303261..303261 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156519..226392 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..380898 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..380898 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..380898 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..380898 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156519..226392 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..1.38411e+10 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..1.38411e+10 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} removed=0
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} removed=1
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..1.9946e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..1.9946e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..2.10072e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..2.10072e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..4.21514e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..4.21514e+06 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..5.08987e+09 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=356 rows=363543 cost=197523..5.08987e+09 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197575..242695 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..397200 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..397200 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..397200 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..397200 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197575..242695 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=302086..349205 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..335731 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1001.75..374303 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.17..528809 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.17..528809 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.17..528809 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.17..528809 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1001.75..374303 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=105513..480813 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1010.37..428497 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.49..761317 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.92..915822 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.92..915822 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.92..915822 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.92..915822 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.49..761317 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=113082..867827 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8583.22..836057 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8580.11..815511 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=189038..189038 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=227664..227664 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=227664..227664 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=227664..227664 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=227664..227664 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=189038..189038 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=198393..198393 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=237020..237020 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=237020..237020 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=237020..237020 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=237020..237020 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=198393..198393 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=331341..331341 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=395718..395718 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=395718..395718 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=395718..395718 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=395718..395718 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=331341..331341 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=717015..717015 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=755642..755642 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=755642..755642 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=755642..755642 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=755642..755642 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=717015..717015 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=304904..304904 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=291429..291429 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=437851..437851 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=385535..385535 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=823526..823526 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=791756..791756 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=771209..771209 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=39073.7..414193 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=194591..266282 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=214016..214016 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=227564..227564 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=364479..367388 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=364479..367388 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156519..1.81114e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156519..7.27339e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..1.81114e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..7.27367e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=259977..315071 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1010.37..428497 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..1.81114e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..7.27388e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=259980..335618 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8583.22..836057 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1013.48..449043 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..1.81114e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156520..7.27406e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=259969..353914 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=197576..335731 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=231845..261917 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=212344..212344 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.30211e+06..1.31713e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=387512..387512 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..373178 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..2.89258e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..2.89258e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..517063 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..373178 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.7475..670522 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1675..3.18992e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1675..3.18992e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1775..814407 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.7475..670522 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7571.87..678034 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.28815..684017 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=46826.8..715184 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=46827.2..3.23458e+06 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=46827.2..3.23458e+06 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=46827.2..859069 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=46826.8..715184 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=377163..1.0954e+06 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=377163..3.6148e+06 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=377163..3.6148e+06 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=377163..1.23928e+06 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=377163..1.0954e+06 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=222328..222328 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=852178..852178 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=852178..852178 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=321223..321223 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=222328..222328 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=465240..465240 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.09509e+06..1.09509e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.09509e+06..1.09509e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=564136..564136 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=465240..465240 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=472838..472838 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=478822..478822 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6901.26..692418 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69012.5..395074 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=231430..231430 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=232977..232977 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.30211e+06..1.31713e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.31515e+06..1.31515e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..3.77049e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..3.54545e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..1.03422e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..3.77049e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..3.54545e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..1.03423e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.29454e+06..1.32312e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.28815..684017 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.57094e+09..1.57094e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.47715e+11..1.47715e+11 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.3112e+08..4.3112e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.57095e+09..1.57095e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.47715e+11..1.47715e+11 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.31127e+08..4.31127e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.32166e+06..1.32166e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=682559..682559 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=448160..454938 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=246376..246376 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=453462..453462 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.25903e+06..1.27415e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.26553e+06..1.26553e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.25903e+06..1.27415e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.26553e+06..1.26553e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..1.16e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..4.13567e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69012.1..1.16e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69012.1..4.13567e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=63113.4..1.16e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=63113.4..4.13568e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.22373e+06..1.28217e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1008.45..1.353e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69683.1..1.16e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69683.1..4.1357e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.2303e+06..1.30202e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7580.05..1.37285e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69683.1..1.16001e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69683.1..4.13572e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.23031e+06..1.32257e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7583.02..1.39339e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=63113.5..1.16002e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=63113.5..4.13583e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.22373e+06..1.43117e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=943019..1.22627e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..1.16002e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..4.13584e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.22273e+06..1.44345e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=942019..1.23854e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.742e+09..3.742e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.33432e+09..1.33432e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.83348e+09..4.83348e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.72343e+09..1.72343e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.74205e+09..3.74205e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.33437e+09..1.33437e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.74216e+09..3.74216e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.33448e+09..1.33448e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.27558e+06..1.27558e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.3464e+06..1.3464e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.31547e+06..1.31547e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.38629e+06..1.38629e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.42448e+06..1.42448e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.21957e+06..1.21957e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=391344..597310 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=397696..424117 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=242883..242883 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=418105..418105 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.25903e+06..1.27415e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=390177..390177 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.25903e+06..1.27415e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=390177..390177 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..1.95141e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113.4..3.1894e+07 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62113..3.91007e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..7.27421e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=948371..1.95142e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=942019..3.26255e+07 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=942018..3.91008e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=948371..7.28152e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=978323..1.06924e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=943019..1.22627e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=942019..1.23854e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=354815..1.95142e+11 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=348463..3.26594e+07 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=348462..3.91008e+11 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=354815..7.28186e+08 pk=2 par=- by={k=356 rows=363543 cost=197523..412501 dis=0 par=- pk=2 pw=0 psafe=0 jt=0 out=(b 3 4 5 7 8) in=(b 6)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6354.1..1.95142e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1575..3.29012e+07 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.7375..3.91008e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6354.1..7.28428e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=36305.9..1.34497e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7583.02..1.39339e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1008.45..1.353e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=8.09179e+06..8.09179e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=9.77519e+10..9.77519e+10 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=8.26765e+06..8.26765e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=9.7752e+10..9.7752e+10 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=8.8268e+06..8.8268e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=9.77526e+10..9.77526e+10 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=408448..408448 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=575206..575206 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=967604..967604 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.01348e+06..1.01348e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=992940..992940 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=33259.8..1.3718e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=95371.1..364616 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=228043..228043 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=236924..236924 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=152619..153553 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48307.9..1.17966e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6901.94..2.1355e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48307.9..9.20786e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48306.8..1.17966e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6900.81..2.1355e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48306.8..9.20825e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=151543..153254 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1032.22..305088 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=122511..123338 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=122512..122948 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=152619..153553 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=89425.9..89425.9 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48307.9..1.49425e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=48307.9..9.20698e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1003.32..1.49611e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1003.32..9.39333e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2108.44..305388 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1032.22..305088 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.74075e+07..3.74075e+07 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.3532e+06..2.3532e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.84242e+07..4.84242e+07 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.19284e+06..3.19284e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=261675..261675 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=261375..261375 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1539.02..305762 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=359 rows=363543 cost=48843.6..123502 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 5 6 7) in=(b 4 8)}
+PLANCAND rej rel=(b 3 4 5 6 7 8) cand={k=359 rows=363543 cost=48843.6..123502 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 5 6 7) in=(b 4 8)} by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND padd rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47843.6..82398.7 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 5 6 7) in=(b 4 8)}
+PLANCAND prej rel=(b 3 4 5 6 7 8) cand={k=359 rows=90886 cost=47843.6..82398.7 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 3 5 6 7) in=(b 4 8)} by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)} via=cost cmp=keys:EQ
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=978916..994031 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=436360..436360 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=978915..994032 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=432462..432462 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..1.98714e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=61607.3..3.2149e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..7.27387e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.22..1.98715e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.1475..3.21491e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6860.22..7.28129e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=36901.1..1.04594e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8583.41..1.09719e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7583.81..1.09922e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1009.04..1.05743e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=8.03726e+10..8.03726e+10 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=8.03733e+10..8.03733e+10 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=941760..941760 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=33855.1..1.07277e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=95460.2..330537 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=219590..219590 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=283107..283107 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=978916..994031 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=985417..985417 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=978915..994032 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=985418..985418 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..9.94339e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=68465.4..7.27401e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=90974.1..9.94339e+09 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=90974.1..7.27403e+08 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=91455.1..9.94339e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=91455.1..7.27404e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=971865..992867 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62607.3..9.9434e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=62607.3..7.27417e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=943023..1.00552e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1009.04..1.05743e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=70177..9.94344e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=70177..7.27457e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=950597..1.04528e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8583.41..1.09719e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69177..9.94344e+09 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=69177..7.27459e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=949598..1.04731e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7583.81..1.09922e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.2076e+09..3.2076e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.34853e+08..2.34853e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.2076e+09..3.2076e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.34855e+08..2.34855e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.14321e+09..4.14321e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.03281e+08..3.03281e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.20766e+09..3.20766e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.34907e+08..2.34907e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=986171..986171 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=998921..998921 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.05083e+06..1.05083e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.03858e+06..1.03858e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.0905e+06..1.0905e+06 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=357670..405419 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=363528..390038 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=234430..234430 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=384025..384025 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=368518..371427 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=307300..307300 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=368518..371427 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=307300..307300 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156280..1.11351e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..1.78183e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156280..7.27345e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1507.87..1.11353e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1002.16..1.78185e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1507.87..7.27483e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=110576..475359 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1016.81..460589 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7406.51..1.11353e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=6900.81..1.78185e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=7406.51..7.27499e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=9077.61..1.11357e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8571.91..1.78189e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=9077.61..7.27873e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=118145..865369 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8589.67..871145 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8586.56..850598 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=510.099..1.11358e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.3938..1.7819e+10 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=510.099..7.28019e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=109578..1.01177e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=22.1538..1.01755e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=19.046..997001 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.78393e+09..2.78393e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.45473e+09..4.45473e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.81993e+08..1.81993e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.63986e+09..4.63986e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=7.42452e+09..7.42452e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=3.03306e+08..3.03306e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=2.78445e+09..2.78445e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=4.45525e+09..4.45525e+09 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=1.82515e+08..1.82515e+08 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=432397..432397 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=417627..417627 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=821067..821067 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=826843..826843 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=806297..806297 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=43139..945151 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=198909..270321 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=214968..214968 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=231603..231603 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=368518..371427 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=461087..461087 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=368518..371427 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=461087..461087 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156280..1.80294e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=156280..7.27343e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..1.80294e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..7.27409e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=258960..356657 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1016.81..460589 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=19.046..997001 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..1.80294e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..7.27416e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=258945..363687 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..1.80294e+11 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=155775..7.2743e+08 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=258963..377203 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=8589.67..871145 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=22.1538..1.01755e+06 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=1019.92..481135 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=202600..1.80294e+11 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=202600..7.27454e+08 pk=1 par=- by={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=464689..464689 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=479206..479206 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=964788..964788 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=499753..499753 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=985334..985334 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=230822..338655 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND preskip rel=(b 3 4 5 6 7 8) dis=0 cost=231327..265956 pk=0 par=- by={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=213296..213296 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND ppreskip rel=(b 3 4 5 6 7 8) dis=0 cost=409503..409503 pk=0 par=- by={k=359 rows=90886 cost=47941.1..81246.5 dis=0 par=- pk=0 pw=4 psafe=1 jt=0 out=(b 7) in=(b 3 4 5 6 8)}
+PLANCAND win rel=(b 3 4 5 6 7 8) npath=3 npart=1 total={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)} startup={k=356 rows=363543 cost=29369..262761 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 8) in=(b 7)} param={k=359 rows=363543 cost=48893.1..119669 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 4 5 6 7) in=(b 8)}
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=368 rows=363543 cost=48941.1..118828 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=368 rows=363543 cost=48941.1..118828 dis=0 par=- pk=0 pw=0 psafe=0} removed=1
+PLANCAND add rel=(b 3 4 5 6 7 8) cand={k=369 rows=363543 cost=89959.1..133488 dis=0 par=- pk=2 pw=0 psafe=0}
+PLANCAND ok rel=(b 3 4 5 6 7 8) cand={k=369 rows=363543 cost=89959.1..133488 dis=0 par=- pk=2 pw=0 psafe=0} removed=2
+PLANCAND win rel=(b 3 4 5 6 7 8) npath=2 npart=1 total={k=368 rows=363543 cost=48941.1..118828 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=368 rows=363543 cost=48941.1..118828 dis=0 par=- pk=0 pw=0 psafe=0} param={k=368 rows=363543 cost=48941.1..118828 dis=0 par=- pk=0 pw=0 psafe=0}
