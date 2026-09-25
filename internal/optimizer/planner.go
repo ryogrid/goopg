@@ -2087,6 +2087,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// Same spec, winning strategy, priced input. The producer writes the
 		// winner back onto agg.node in place (the rules mutated in place,
 		// so node, the HAVING filter, and agg.node alias it).
+		// M0145-0008m: every functionally-dependent column read above the
+		// aggregate joins the Passthrough list BEFORE the election, so no
+		// candidate that narrows the aggregate's input can omit it.
+		prefetchFuncDepPassthroughs(s, agg)
 		if _, gerr := createGroupingPaths(upper, agg.node, cat, plannerSet, orderTupleFraction); gerr != nil {
 			return nil, gerr
 		}
