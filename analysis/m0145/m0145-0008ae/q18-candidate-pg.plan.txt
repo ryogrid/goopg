@@ -1,0 +1,23 @@
+=== Q18
+Sort  (cost=403538.71..404713.55 rows=469937 width=79)
+  Sort Key: orders.o_totalprice DESC, orders.o_orderdate
+  ->  HashAggregate  (cost=353391.47..359265.69 rows=469937 width=79)
+        Group Key: customer.c_custkey, orders.o_orderkey
+        ->  Gather  (cost=232156.01..349866.95 rows=469937 width=52)
+              Workers Planned: 4
+              ->  Parallel Hash Join  (cost=231156.01..301873.25 rows=117484 width=52)
+                    Hash Cond: (orders.o_custkey = customer.c_custkey)
+                    ->  Nested Loop  (cost=226087.76..296496.59 rows=117484 width=33)
+                          ->  Hash Join  (cost=226087.33..258635.70 rows=29376 width=34)
+                                Hash Cond: (orders.o_orderkey = lineitem_1.l_orderkey)
+                                ->  Parallel Seq Scan on orders  (cost=0.00..31564.00 rows=375000 width=28)
+                                ->  Hash  (cost=224618.53..224618.53 rows=117504 width=6)
+                                      ->  HashAggregate  (cost=219330.85..224618.53 rows=117504 width=6)
+                                            Group Key: lineitem_1.l_orderkey
+                                            Filter: (sum(lineitem_1.l_quantity) > '313'::numeric)
+                                            ->  Seq Scan on lineitem lineitem_1  (cost=0.00..189335.90 rows=5998990 width=11)
+                          ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.43..1.12 rows=17 width=11)
+                                Index Cond: (l_orderkey = orders.o_orderkey)
+                    ->  Parallel Hash  (cost=4287.00..4287.00 rows=62500 width=25)
+                          ->  Parallel Seq Scan on customer  (cost=0.00..4287.00 rows=62500 width=25)
+

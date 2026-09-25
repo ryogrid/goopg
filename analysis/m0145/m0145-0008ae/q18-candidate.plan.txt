@@ -1,0 +1,25 @@
+=== Q18
+Sort  (cost=381608.68..382956.08 rows=538959 width=204)
+  Sort Key: o_totalprice DESC, o_orderdate
+  ->  GroupAggregate  (cost=324910.69..330300.28 rows=538959 width=204)
+        Group Key: customer.c_custkey, o_orderkey
+        ->  Gather Merge  (cost=260811.63..324573.95 rows=538959 width=1654)
+              Workers Planned: 3
+              ->  Sort  (cost=259811.59..260246.23 rows=173858 width=1654)
+                    Sort Key: customer.c_custkey, o_orderkey
+                    ->  Nested Loop  (cost=200084.00..279986.90 rows=173858 width=1310)
+                          ->  Nested Loop  (cost=200083.62..234858.37 rows=43450 width=760)
+                                ->  Hash Join  (cost=200083.25..233111.13 rows=43450 width=136)
+                                      Hash Cond: (o_orderkey = l_orderkey)
+                                      ->  Parallel Seq Scan on orders  (cost=0.00..31383.71 rows=483871 width=448)
+                                      ->  HashAggregate  (cost=190317.85..195705.66 rows=134695 width=64)
+                                            Group Key: lineitem_1.l_orderkey
+                                            Filter: (sum(lineitem_1.l_quantity) > 313)
+                                            ->  Seq Scan on lineitem_1  (cost=0.00..175312.88 rows=6001988 width=550)
+                                ->  Memoize  (cost=0.38..0.41 rows=1 width=624)
+                                      Cache Key: o_custkey
+                                      ->  Index Scan using customer_pk on customer  (cost=0.38..0.41 rows=1 width=624)
+                                            Index Cond: (c_custkey = o_custkey)
+                          ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.38..1.27 rows=15 width=550)
+                                Index Cond: (l_orderkey = o_orderkey)
+

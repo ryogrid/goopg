@@ -17379,7 +17379,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       deletes the SJInfo because the RHS is provably unique.
     - Not a costing gap: the missing pass is filed as M0145\-0008ae.
   Movement: none
-- [ ] **M0145\-0008ae — port `reduce\_unique\_semijoins`: drop a semijoin\'s
+- [x] **M0145\-0008ae — port `reduce\_unique\_semijoins`: drop a semijoin\'s
   SpecialJoinInfo when its single\-rel RHS is unique for the join clauses**
   \(filed 2026\-09\-25 by M0145\-0008ad\). PG runs it in `query\_planner`
   before the join search \(`postgres/src/backend/optimizer/plan/analyzejoins.c:844`,
@@ -17398,6 +17398,19 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   - Expected movement: TPC\-H Q18 `join\-method` \(Hash Semi Join → Hash
     Join\); any pulled `IN \(SELECT pk …\)` in either corpus becomes an inner
     join. Measured on the TPC\-H fire set and the two\-scale TPC\-DS fire set.
+  - **DONE 2026\-09\-25 \(`f19b6f7cc`\).** Design doc
+    `docs/design/0100\-0149/m0145\-0008ae\-reduce\-unique\-semijoins.md`;
+    evidence `analysis/m0145/m0145\-0008ae/`.
+    - `pulledSemiRhsIsUnique` proves a single\-leaf RHS unique \(derived
+      `distinct`, or a covered non\-partial unique index\); `classifyPulledQuals`
+      then appends no SJInfo.
+    - TPC\-H: Q18 becomes PG\'s Hash Join; Q20\'s `part ⋈ partsupp` becomes
+      PG\'s index nested loop. Values identical serially and in parallel;
+      `join\-method` 11 → 10.
+    - TPC\-DS: no changed query at either scale; EA\-RATCHET 52 → 52.
+    - Q20\'s `ps\_availqty > \(SubPlan\)` filter now runs above the Gather,
+      unprinted; PG keeps it on the `partsupp` scan \(ledgered\).
+  Movement: none — TPC-H PLAN-PARITY match 3 -> 3; join-method 11 -> 10 inside the noise band
 - [!] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
   \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
   PG pulls a CTE reference in a simple sublink body up like any base rel;
