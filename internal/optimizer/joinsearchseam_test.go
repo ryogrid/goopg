@@ -125,15 +125,31 @@ func TestPGShapedSeamResidualIsWhatTheSearchDidNotPlace(t *testing.T) {
 	}
 	// (3) The single-relation restriction went INTO the leaf, in leaf-local
 	// coordinates, and is therefore neither residual nor lost.
-	leafLocals := 0
+	//
+	// (4) M0146-0005 slice 4: PG's extract_restriction_or_clauses also
+	// derives `c1 > 3 OR c1 < 3` from the OR (every arm has a c-only clause;
+	// selectivity 2/3 <= 0.9) as a REDUNDANT restriction on c, while the OR
+	// itself stays in the residual above. So there are two leaf-local
+	// filters: the written restriction and the derived OR.
+	leafLocals, derivedOr := 0, 0
 	for _, f := range seamLeafLocalFilters(out) {
 		leafLocals++
-		if cr, isCol := f.Predicate.(*BinaryOp).Left.(*ColumnRef); isCol && cr.Index != 1 {
+		bin := f.Predicate.(*BinaryOp)
+		if bin.Op == parser.OpOr {
+			derivedOr++
+			for _, arm := range flattenPlannerOr(bin) {
+				if cr, isCol := arm.(*BinaryOp).Left.(*ColumnRef); !isCol || cr.Index != 1 {
+					t.Errorf("derived OR arm %v is not on c's leaf-local column 1", arm)
+				}
+			}
+			continue
+		}
+		if cr, isCol := bin.Left.(*ColumnRef); isCol && cr.Index != 1 {
 			t.Errorf("leaf-local predicate holds index %d, want the leaf-local 1", cr.Index)
 		}
 	}
-	if leafLocals != 1 {
-		t.Fatalf("found %d leaf-local filters, want 1 (the `a1 > 5` restriction)", leafLocals)
+	if leafLocals != 2 || derivedOr != 1 {
+		t.Fatalf("found %d leaf-local filters (%d derived ORs), want the `a1 > 5` restriction plus one derived OR on c", leafLocals, derivedOr)
 	}
 	rfjAssertBindingOrder(t, out, names)
 }

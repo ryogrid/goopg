@@ -817,7 +817,13 @@ func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node
 		return baseRows
 	}
 	localized := localizeExprToLeaf(local, binding)
-	rows := scaleByFloat(baseRows, clauseSelectivity(localized, scan))
+	// PG's set_baserel_size_estimates: rel->rows = clamp_row_est(tuples *
+	// selectivity), and clamp_row_est ROUNDS (rint) with a floor of 1 — it
+	// does not truncate. Truncating sized TPC-H Q7's `n_name = 'FRANCE' OR
+	// n_name = 'GERMANY'` nation (25 x 0.0784 = 1.96) at 1 row where PG says 2,
+	// quartering the join estimate once M0146-0005 slice 4 derived that
+	// restriction on both nation scans.
+	rows := int64(math.RoundToEven(float64(baseRows) * clauseSelectivity(localized, scan)))
 	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would

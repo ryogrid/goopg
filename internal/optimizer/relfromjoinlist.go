@@ -92,6 +92,12 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
+	// orClauseSelDivisor is PG's consider_new_or_clause compensation: for a
+	// join OR clause from which extractRestrictionOrClauses derived redundant
+	// base restrictions, the product of their selectivities, by which the
+	// clause's own join selectivity is divided (M0146-0005 slice 4).
+	orClauseSelDivisor map[Expr]float64
+
 	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
 	// the coordinate space `relidsOfExpr` and `baseOffset` are both
 	// written in. One entry per FROM item: the leaf's own span, not an
@@ -605,6 +611,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
+	s.orClauseSelDivisor = prob.orClauseSelDivisor
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys

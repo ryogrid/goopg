@@ -68,6 +68,9 @@ const maxSearchRels = 32
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.
 type searchCtx struct {
+	// orClauseSelDivisor: see joinlistProblem.orClauseSelDivisor.
+	orClauseSelDivisor map[Expr]float64
+
 	// joinrels is PG's `root->join_rel_level`: `joinrels[lev]` holds every
 	// RelOptInfo whose relset has exactly `lev` base rels. Index 0 is unused
 	// (PG's array is 1-based) and `joinrels[1]` is the initial rels, in FROM

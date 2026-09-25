@@ -399,6 +399,17 @@ func (s *searchCtx) joinClauseSelectivityExt(ri *restrictInfo) (float64, bool) {
 		return ri.normSelec, ri.normSelecDefault
 	}
 	sel, isdefault := s.joinClauseSelectivityExtUncached(ri)
+	// M0146-0005 slice 4: consider_new_or_clause's "hack cached selectivity
+	// so join size remains the same" — the redundant restrictions derived from
+	// this OR clause already reduced its relations' rows.
+	if ri != nil && s != nil && s.orClauseSelDivisor != nil {
+		if d, ok := s.orClauseSelDivisor[ri.clause]; ok && d > 0 {
+			sel /= d
+			if sel > 1 {
+				sel = 1
+			}
+		}
+	}
 	if ri != nil && s != nil {
 		ri.normSelec, ri.normSelecDefault, ri.normSelecValid = sel, isdefault, true
 	}

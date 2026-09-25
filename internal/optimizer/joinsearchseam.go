@@ -856,6 +856,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
 	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, spans)
+	// M0146-0005 slice 4: PG's extract_restriction_or_clauses — redundant
+	// base restrictions derived from join OR clauses, before the leaves are
+	// sized below (orclauses.go).
+	orClauseSelDivisor := extractRestrictionOrClauses(searchConjuncts, spans, ctx.bindings[:nReal], scans[:nReal], &locals, cat)
 	// M0142-0008a-3i-plumbing-c2 (design doc §36, gaps 2-3): `leaves`/
 	// `relInfos`/the bindings handed to the search all grow from `nprefix` to
 	// `nprefix+len(semiAnti)` — one extra slot per synthetic Semi/Anti RHS
@@ -1119,6 +1123,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		scans:     leaves,
 		relInfos:  relInfos,
 		conjuncts: searchConjuncts,
+		// M0146-0005 slice 4: PG's norm_selec compensation for the join OR
+		// clauses extractRestrictionOrClauses derived restrictions from.
+		orClauseSelDivisor: orClauseSelDivisor,
 		// P0-H11: the problem carries the leaf spans THEMSELVES, not a
 		// cumulative boundary array — a synthetic leaf's out-of-band span
 		// survives the hand-off (a cumulative boundary array flattened it
