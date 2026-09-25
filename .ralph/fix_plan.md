@@ -20247,7 +20247,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       isolation and regress = HEAD\'s failures.
     Movement: none — executor only; no plan moved.
 
-- [ ] **M0145\-0008r — WRONG RESULTS: a bitmap scan over an unproven partial
+- [x] **M0145\-0008r — WRONG RESULTS: a bitmap scan over an unproven partial
   index drops the rows its predicate excludes** \(found 2026\-09\-25 while
   filing nightly AI\-20260925\-002342\-005; reproduces at HEAD `b1f93fb81`\).
   The must\-pass regress case `portals\_p2` returns `\(0 rows\)` for `SELECT
@@ -20277,6 +20277,18 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     `findBTreeIndexForColumn` uses\); drop the recheck\-append premise and
     its comment. Pin with the repro above and re\-run `create\_index` \+
     `portals\_p2` \(`GOOPG\_REGRESS\_DIFF\_DIR` shows the diff\).
+  - **DONE 2026\-09\-25 \(`f56d94e86`\).** Design doc
+    `docs/design/0100\-0149/m0145\-0008r\-partial\-index\-bitmap\-proof.md`;
+    evidence `analysis/m0145/m0145\-0008r/`.
+    - `buildOneBitmapPath` declines a partial index unless a leaf conjunct
+      proves its predicate \(`partialPredicateProvenBy` →
+      `provePartialIndexPredicate`\); the recheck premise is gone.
+    - Repro: `unique1 = 51` returns its row \(Seq Scan\). Full
+      `TestPort\_RegressSuite`: `portals\_p2` and `select` PASS; `union`
+      still red → M0145\-0008s.
+    - Gates: units, spotcheck, acceptance arm 24 MATCH, sf025 96 PASS \(99/99
+      shapes same\), fire set none at both scales, pgbench smoke.
+  Movement: none
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — wrong results
   >

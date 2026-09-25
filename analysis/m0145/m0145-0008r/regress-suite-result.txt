@@ -1,0 +1,7 @@
+    --- PASS: TestPort_RegressSuite/copyselect (0.07s)
+    --- SKIP: TestPort_RegressSuite/create_index (8.66s)
+    --- SKIP: TestPort_RegressSuite/create_index_spgist (0.00s)
+    --- PASS: TestPort_RegressSuite/portals_p2 (0.02s)
+    --- PASS: TestPort_RegressSuite/select (0.31s)
+    --- SKIP: TestPort_RegressSuite/subselect (11.43s)
+    --- FAIL: TestPort_RegressSuite/union (0.82s)
