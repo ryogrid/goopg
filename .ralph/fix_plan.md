@@ -21359,7 +21359,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Q44\'s subqueries now estimate 5495 rows \(PG 5424\); Q67\'s WindowAgg
       keeps its input\'s rows as PG does. Census unchanged; all gates pass.
   Movement: none
-- [ ] **M0146\-0005j — re\-evaluate the all\-default `max\(l,r\)` join\-size cap
+- [x] **M0146\-0005j — re\-evaluate the all\-default `max\(l,r\)` join\-size cap
   \(M0126\-0010\)** \(filed 2026\-09\-25 by M0146\-0005i\): TPC\-DS Q44\'s
   `rnk = rnk` merge join estimates 5495 rows where PG\'s
   `calc\_joinrel\_size\_estimate` gives 5424² / 200 = 147099; the cap
@@ -21372,6 +21372,24 @@ M0146-0001 re-baseline census on the new default arm.
     deletion on the MCV arm \(P5.6\-a\) and an audit. Check whether P5.6\-a
     landed, then measure the fire set with the branch disabled \(both
     corpora, TPC\-H arm\) and list the queries it moves.
+  - **RECON DONE 2026\-09\-25.** Evidence
+    `analysis/m0146/m0146\-0005/recon\-0005j/`.
+    - The MCV precondition does not bind: the cap fires only when every
+      clause ndistinct is a default guess, i.e. no statistics and no MCVs.
+    - A/B with the branch disabled: 4 TPC\-DS plans change \(Q2, Q8, Q44,
+      Q64\), no timeouts, no census record gets shallower; Q44\'s merge join
+      estimates 150975 \(PG 147099\). TPC\-H arm 24 MATCH, census identical.
+    - Recommendation: retire the cap \(M0146\-0005k\).
+  Movement: none
+- [ ] **M0146\-0005k — retire the all\-default `max\(l,r\)` join\-size cap**
+  \(filed 2026\-09\-25 by M0146\-0005j\): delete the `!est.fired &&
+  allDefault` branch of `calcJoinrelSize` \(no PG counterpart in
+  `calc\_joinrel\_size\_estimate`\), update the tests that pin it, and land it
+  with the full gates. The recon A/B found no regression.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: remove the branch, run the optimizer tests to list what pins
+    it, and fix or retire those pins with PG\'s formula as the reference.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

@@ -1,0 +1,15 @@
+== Q44 baseline
+ Limit  (cost=49284.40..49450.25 rows=100 width=984)
+   ->  Merge Join  (cost=49284.40..49394.30 rows=5495 width=80)
+         ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+         ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+== Q44 candidate
+ Limit  (cost=49284.40..50905.05 rows=100 width=984)
+   ->  Merge Join  (cost=49284.40..50849.10 rows=150975 width=80)
+         ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+         ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+== Q44 candidate-pg
+ Limit  (cost=80913.15..80929.19 rows=100 width=110)
+   ->  Nested Loop  (cost=80913.15..104499.40 rows=147099 width=110)
+         ->  Nested Loop  (cost=80912.85..93822.78 rows=147099 width=63)
+               ->  Merge Join  (cost=80912.56..83146.16 rows=147099 width=16)

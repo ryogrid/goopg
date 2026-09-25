@@ -508,6 +508,16 @@ divergence moves from depth 2 to depth 6/7, and nothing else moves. Other
 qual kinds (Filter, Sort/Group Key) are ledgered. Evidence:
 `analysis/m0146/m0146-0005/slice10/`.
 
+## M0146-0005j recon: the all-default `max(l,r)` cap
+
+`calcJoinrelSize` clips a join with no proven key and only default-guessed
+clause selectivities to max(outer, inner). PG has no such cap. Its ledgered
+precondition (an MCV arm) cannot bind: the cap fires only when there are
+no statistics at all. An A/B with the branch disabled changes 4 TPC-DS
+plans with no timeouts and no shallower record, and brings Q44's merge
+join to 150975 rows (PG 147099). TPC-H is unaffected. Retiring the cap is
+filed as M0146-0005k. Evidence: `analysis/m0146/m0146-0005/recon-0005j/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
