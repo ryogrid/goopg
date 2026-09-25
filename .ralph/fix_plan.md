@@ -21200,7 +21200,7 @@ M0146-0001 re-baseline census on the new default arm.
     - With the slice\-5 patch on top, Q47 no longer times out. The patch
       stays parked on M0146\-0005c.
   Movement: none
-- [ ] **M0146\-0005c — twelve executor tests depend on hash joins over
+- [x] **M0146\-0005c — twelve executor tests depend on hash joins over
   unanalyzed tables** \(filed 2026\-09\-25 by M0146\-0005b\): with PG\'s default
   0.1 hash bucket for a stats\-less key
   \(`slice5/default\-hash\-bucket.wip.patch`\), the tests in
@@ -21218,6 +21218,45 @@ M0146-0001 re-baseline census on the new default arm.
     way \(a planner\-settings hook in the executor fixture\), not by keeping
     the stats\-less skip. Then land the patch with the full gates and the
     fire set.
+  - **DONE 2026\-09\-25 \(`eae560af7`\).** Design doc §"M0146\-0005c";
+    evidence `analysis/m0146/m0146\-0005/slice5/`.
+    - `estimateHashBucketSize` no longer skips a key without statistics:
+      PG\'s `Max\(0.1, mcv\_freq\)` default bucket applies.
+    - 13 executor tests and 2 optimizer tests now carry the statistics
+      ANALYZE would record \(new `setFixtureStats`; TPC\-H key ndistinct;
+      unique synthetic keys\). Every test keeps its asserted plan.
+    - Fire set: match unchanged; first divergence deeper on Q2, Q30 and Q81,
+      none shallower. Q79 still needs PG\'s fuzzy startup tie\-break
+      \(M0146\-0005d\).
+  Movement: none
+- [ ] **M0146\-0005d — `add\_path`\'s fuzzy startup tie\-break for TPC\-DS Q79\'s top
+  join** \(filed 2026\-09\-25 by M0146\-0005c\): PG keeps the nested loop into
+  `customer\_pkey` \(19147.5..24560.8\) over the hash join \(24269.2..24451.2\)
+  because the totals are fuzzily equal \(within `STD\_FUZZ\_FACTOR` 1.01\)
+  and the nested loop\'s startup is far better \(`compare\_path\_costs\_fuzzily`
+  → COSTS\_BETTER2, PLANCAND `via=cost cmp=cost:B2`\). After 0005c goopg
+  still elects the hash join.
+  Kind: recon
+  Parent: M0146\-0005
+  - First step: trace goopg\'s DPPATH for Q79\'s top joinrel on the
+    post\-0005c build and compare with `slice5/pg\-q79\-top\-join\-plancand.txt`.
+    Does goopg offer the parameterised nested loop into `customer\_pkey` at
+    all, and does its `addPath` apply the startup tie\-break when the totals
+    are fuzzily equal?
+- [ ] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
+  it cannot see** \(filed 2026\-09\-25 by M0146\-0005c\): in `spillFixture`,
+  rows written with `writeHeapRow`, and even rows loaded with `INSERT …
+  SELECT` through `runDDL`, leave `ANALYZE` with `RowCount 0, Analyzed:
+  true` while `count\(\*\)` returns them. PG\'s ANALYZE counts tuples its own
+  transaction inserted. It is unclear whether this is a fixture\-transaction
+  artefact or a real engine divergence.
+  Kind: recon
+  Parent: none
+  - First step: reproduce on a real server \(`goopg start`\): `BEGIN;
+    CREATE TABLE t\(k int\); INSERT … generate\_series; ANALYZE t; SELECT
+    reltuples FROM pg\_class WHERE relname = \'t\'; COMMIT;` against PG 18.3. If
+    the server matches PG, the gap is the fixture\'s transaction handling
+    only.
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

@@ -358,6 +358,37 @@ PG's default bucket now prices out
 - PG's merge join adds `Materialize` over an inner that cannot mark/restore
   cheaply.
 
+### M0146-0005c: the default hash bucket lands (landed)
+
+Landed 2026-09-25 (`eae560af7`).
+
+`estimateHashBucketSize` no longer skips a hash key without statistics. As
+in PG's `estimate_hash_bucket_stats`, a default-ndistinct key gets
+`Max(0.1, mcv_freq)`. A nil search context (hand-built unit-test pairs)
+still reports "no information".
+
+Two prerequisites had to land first:
+- M0146-0005b, the CTE-scan pathkeys (the Q47 timeout);
+- test fixtures with key statistics. Thirteen executor tests and two
+  optimizer tests built tables whose join keys had no statistics and relied
+  on hash joins the default bucket now prices out. The executor fixtures'
+  ANALYZE does not count heap-written or same-transaction rows (a separate
+  recon). So each fixture now carries what ANALYZE would record: a new
+  executor helper `setFixtureStats`, TPC-H key ndistinct for the
+  TPC-H-shaped catalogs, and unique synthetic keys elsewhere. Every test
+  keeps the plan and geometry it asserts.
+
+**Measured:**
+- Match counts unchanged (TPC-DS 7 / 8).
+- The fire set shows no introduced timeouts.
+- First divergence is deeper on Q2 (both scales), Q30 and Q81 (SF1); none
+  got shallower.
+- Categories: join-order −1/−2, sort-strategy −2/−3; rendering +3/+4, and
+  SF1 join-method +2.
+
+Q79 itself still hash-joins. PG keeps its nested loop on the fuzzy
+startup tie-break (M0146-0005d).
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
