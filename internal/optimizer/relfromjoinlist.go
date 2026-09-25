@@ -615,6 +615,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
+	// M0146-0005b: set_cte_pathlist's converted pathkeys on the CTE-scan
+	// leaves, now that the clause list and query pathkeys it reads exist.
+	s.addCTEScanPathkeys()
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.outputCols, s.outputColsKnown = prob.outputCols, prob.outputColsKnown
 	// Take2 P4-01 Slice 3: parent-aware narrowing is eligible only for the
