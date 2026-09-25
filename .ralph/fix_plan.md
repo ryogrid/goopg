@@ -2450,7 +2450,7 @@ heuristic stays live.)
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-- [ ] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
+- [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
@@ -2464,6 +2464,9 @@ heuristic stays live.)
     1660 / 1721 \(PG 5000\), a HashSetOp run per worker over Parallel Seq
     Scans → M0145\-0008s \(S2 escalation\). Close this item when 0008r and
     0008s land.
+  - **CLOSED 2026\-09\-25:** M0145\-0008r \(`f56d94e86`\) and M0145\-0008s
+    \(`031e8452c`\) landed; the full `TestPort\_RegressSuite` PASSes
+    \(`analysis/m0145/m0145\-0008s/regress\-suite\-result.txt`\).
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [ ] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
@@ -20302,7 +20305,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
   > item 2a — wrong results on an ordinary single\-table equality query,
   > the most reachable of the open S2 defects.
 
-- [ ] **M0145\-0008s — WRONG RESULTS: a HashSetOp runs per worker over
+- [x] **M0145\-0008s — WRONG RESULTS: a HashSetOp runs per worker over
   partial \(Parallel Seq Scan\) inputs** \(found 2026\-09\-25 while triaging
   nightly AI\-20260925\-002342\-005; reproduces at HEAD `b1f93fb81` on a clean
   worktree\). The must\-pass regress case `union` returns 1660 / 1721 \(varies
@@ -20323,6 +20326,19 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     stamping above a Partial Aggregate whose input is a SetOp, see memory
     "goopg parallelism = Gather stamping"\) and refuse a partial scan under
     a SetOp. Pin with the regress query at 4 workers.
+  - **DONE 2026\-09\-25 \(`031e8452c`\).** Design doc
+    `docs/design/0100\-0149/m0145\-0008s\-setop\-partial\-driver.md`;
+    evidence `analysis/m0145/m0145\-0008s/`.
+    - The parallel post-pass reached the SetOp through `drivingScan`\'s
+      `\*SetOp` arm, which resolved a driver for every set operation; the
+      path\-level `addPartialSetOpPath` already required `setOpStreams`.
+      The `drivingScan` / `stampParallelScan` / `drivingScanCrossesSort`
+      arms now require it too.
+    - Repro \(10k\-row wide table\): INTERSECT 3672/3968 → 5000; UNION ALL
+      keeps its parallel Append. Full `TestPort\_RegressSuite` PASS.
+    - Gates: units, spotcheck, acceptance arm 24 MATCH, sf025 96 PASS \(99/99
+      shapes same\), fire set none at both scales, pgbench smoke.
+  Movement: none
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — wrong results
   >
