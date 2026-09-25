@@ -495,3 +495,87 @@ func explainIsScanNode(n optimizer.Node) bool {
 	}
 	return false
 }
+
+// setOpResolvedColumn is ruleutils.c's resolve_special_varno for a column
+// that leaves a set operation (M0146-0005h). PG deparses an OUTER/INNER Var
+// by following it into the child plan's target list, and a SetOp or Append
+// deparses through its FIRST child (set_deparse_plan), so a join key read
+// from a set-operation subquery prints as the leftmost branch's column —
+// TPC-DS Q14's `iss.i_brand_id`, where goopg printed the subquery's own
+// column name `brand_id`.
+//
+// It walks output column idx of n down through set operations (first
+// input), identity Project columns and schema-preserving wrappers, and
+// returns "<relation>.<column>" once it reaches a named scan. It returns ""
+// unless the walk crossed a set operation, so every other column keeps its
+// existing rendering, and "" whenever a step is not a plain column reference
+// (PG would deparse the expression; goopg keeps the bare name).
+func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
+	if nm == nil {
+		return ""
+	}
+	crossed := false
+	for n != nil && idx >= 0 {
+		switch p := n.(type) {
+		case *optimizer.SetOp:
+			crossed = true
+			n = p.Left
+		case *optimizer.Project:
+			if idx >= len(p.Targets) {
+				return ""
+			}
+			cr, ok := p.Targets[idx].(*optimizer.ColumnRef)
+			if !ok {
+				return ""
+			}
+			n, idx = p.Child, cr.Index
+		case *optimizer.Filter:
+			n = p.Child
+		case *optimizer.Sort:
+			n = p.Child
+		case *optimizer.Gather:
+			n = p.Child
+		case *optimizer.GatherMerge:
+			n = p.Child
+		case *optimizer.Join:
+			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
+		case *optimizer.NestedLoopIndexJoin:
+			n, idx = concatJoinSide(p, p.Outer, p.Inner, idx)
+		default:
+			if !crossed {
+				return ""
+			}
+			rtid, ok := explainNodeRTID(n)
+			if !ok {
+				return ""
+			}
+			out := n.Output()
+			if idx >= len(out) {
+				return ""
+			}
+			rel, col := nm.bySource[rtid], out[idx].Name
+			if rel == "" || !nm.cols[rtid][col] {
+				return ""
+			}
+			return rel + "." + col
+		}
+	}
+	return ""
+}
+
+// concatJoinSide maps output column idx of a join whose output is exactly
+// its two inputs' columns side by side onto the input that produced it. Any
+// other output shape answers nil, which ends the walk.
+func concatJoinSide(j, left, right optimizer.Node, idx int) (optimizer.Node, int) {
+	if left == nil || right == nil {
+		return nil, -1
+	}
+	lw, rw := len(left.Output()), len(right.Output())
+	if len(j.Output()) != lw+rw {
+		return nil, -1
+	}
+	if idx < lw {
+		return left, idx
+	}
+	return right, idx - lw
+}

@@ -1637,8 +1637,23 @@ func formatJoinKeyCond(p *optimizer.Join, reg *subPlanReg, qualify bool) string 
 		if k.Left == nil || k.Right == nil {
 			continue
 		}
-		parts = append(parts, formatExprQual(
-			&optimizer.BinaryOp{Op: parser.OpEq, Left: k.Left, Right: k.Right}, reg, qualify))
+		l, r := formatExprQual(k.Left, reg, qualify), formatExprQual(k.Right, reg, qualify)
+		// M0146-0005h: a key read from a set-operation input deparses
+		// through the set operation's first branch, as PG's does.
+		if qualify && p.Left != nil {
+			leftWidth := len(p.Left.Output())
+			if cr, ok := k.Left.(*optimizer.ColumnRef); ok && cr.Index < leftWidth {
+				if s := reg.names().setOpResolvedColumn(p.Left, cr.Index); s != "" {
+					l = s
+				}
+			}
+			if cr, ok := k.Right.(*optimizer.ColumnRef); ok && cr.Index >= leftWidth {
+				if s := reg.names().setOpResolvedColumn(p.Right, cr.Index-leftWidth); s != "" {
+					r = s
+				}
+			}
+		}
+		parts = append(parts, "("+l+" = "+r+")")
 	}
 	if len(parts) == 0 {
 		return ""

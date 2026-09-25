@@ -21318,7 +21318,7 @@ M0146-0001 re-baseline census on the new default arm.
       Everything else is unchanged; all gates pass.
   Movement: TPC\-DS join\-method SF0.25 10 → 9, SF1 5 → 4 \(Q14 now
     rendering\-only\)
-- [ ] **M0146\-0005h — EXPLAIN renders set\-operation subquery outputs by
+- [x] **M0146\-0005h — EXPLAIN renders set\-operation subquery outputs by
   the subquery\'s column names** \(filed 2026\-09\-25 by M0146\-0005g\): PG
   deparses a Var of a set\-operation subquery through to the leftmost
   branch\'s column \(`iss.i\_brand\_id`\); goopg prints the subquery alias
@@ -21331,6 +21331,18 @@ M0146-0001 re-baseline census on the new default arm.
     `find\_param\_referent` for an RTE\_SUBQUERY with setOperations — it
     resolves through the leftmost setop child\'s targetlist\) and the goopg
     EXPLAIN deparser\'s ColumnRef naming for set\-op leaf columns.
+  - **DONE 2026\-09\-25.** Design doc §"Slice 10"; evidence
+    `analysis/m0146/m0146\-0005/slice10/`.
+    - `explainNames.setOpResolvedColumn` walks a join key through set
+      operations \(first input\), identity Projects, pass\-through wrappers
+      and concatenating joins to the first branch\'s named scan;
+      `formatJoinKeyCond` uses it. It answers only after crossing a set
+      operation.
+    - Q14\'s first divergence moves from depth 2 to depth 7 \(SF0.25\) / 6
+      \(SF1\); nothing else moves. All gates pass.
+    - Filter / Sort Key / Group Key deparse through a set operation is
+      ledgered.
+  Movement: TPC\-DS Q14 first divergence depth 2 → 7 / 6
 - [x] **M0146\-0005i — quals PG turns into WindowAgg run conditions carry no
   selectivity** \(opened 2026\-09\-25 from the census: TPC\-DS Q44\).
   Kind: impl

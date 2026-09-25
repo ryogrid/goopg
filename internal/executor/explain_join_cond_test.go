@@ -209,3 +209,25 @@ func condLine(t *testing.T, plan, label string) string {
 	t.Fatalf("no %q line in:\n%s", label, plan)
 	return ""
 }
+
+// TestExplainHashCondDeparsesThroughSetOperation pins M0146-0005h: PG
+// deparses a join key read from a set-operation subquery through the set
+// operation's FIRST branch (ruleutils.c resolve_special_varno over
+// set_deparse_plan's outer_plan), so the key prints as that branch's scan
+// column, not as the subquery's own column name.
+func TestExplainHashCondDeparsesThroughSetOperation(t *testing.T) {
+	ctx, cleanup := joinCondFixture(t)
+	defer cleanup()
+
+	lines := runExplainRows(t, ctx,
+		"EXPLAIN (COSTS OFF) SELECT jl.v FROM jl, "+
+			"(SELECT jr.a AS ka FROM jr INTERSECT SELECT jl2.b FROM jl jl2) u WHERE jl.a = u.ka")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Hash Join") {
+		t.Skipf("planner did not pick a hash join; got:\n%s", joined)
+	}
+	cond := condLine(t, joined, "Hash Cond: ")
+	if !strings.Contains(cond, "jr.a") || strings.Contains(cond, "ka") {
+		t.Errorf("Hash Cond %q: the set-op key must deparse as its first branch's jr.a", cond)
+	}
+}

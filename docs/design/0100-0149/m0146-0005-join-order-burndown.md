@@ -494,6 +494,20 @@ WindowAgg keeps its input's rows as PG does. Q44's join above still reads
 (M0146-0005j). The census is unchanged, and all gates pass. Evidence:
 `analysis/m0146/m0146-0005/slice9/`.
 
+## Slice 10 (M0146-0005h): join keys deparse through a set operation
+
+PG deparses a Var from a set-operation (or Append) input through the first
+branch's target list (`resolve_special_varno`, `set_deparse_plan`), so
+Q14's cross\_items key prints as `iss.i_brand_id`. goopg printed the
+subquery's `brand_id`, and the census counted the text difference as
+`join-order`.
+
+`explainNames.setOpResolvedColumn` walks a join key down to the first
+branch's named scan, and `formatJoinKeyCond` uses it. Q14's first
+divergence moves from depth 2 to depth 6/7, and nothing else moves. Other
+qual kinds (Filter, Sort/Group Key) are ledgered. Evidence:
+`analysis/m0146/m0146-0005/slice10/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
