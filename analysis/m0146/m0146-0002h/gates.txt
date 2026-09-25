@@ -1,0 +1,4 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H and TPC-DS first-divergence census identical to HEAD
+regress 41 WITH/plan pass-required cases: diffs identical to a HEAD worktree

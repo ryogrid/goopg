@@ -20828,7 +20828,7 @@ M0146-0001 re-baseline census on the new default arm.
       InitPlan qual on customer.
     Movement: yes — plan shape: Q16/Q22/TPC\-DS Q6 qual placement now PG's; CATEGORIES\-EXCL\-MATCH did not improve \(TPC\-H parameterisation 6→7 via Q22; SF0.25 Q6 −scan\-type \+aggregation\-strategy \+rendering\), match 3/4 unchanged.
 
-- [ ] **M0146\-0002h — a SubPlan clause is estimated at PG's default
+- [x] **M0146\-0002h — a SubPlan clause is estimated at PG's default
   selectivity**: `clauseSelectivity`'s `InExpr`\-with\-Plan arm returns
   `defaultGenericSelectivity` whatever the negation, and a `SubqueryExpr`
   comparison goes through the operator estimators with an unknown RHS. PG
@@ -20842,6 +20842,14 @@ M0146-0001 re-baseline census on the new default arm.
     which estimator the leaf row count takes \(`applyLocalFilterSelectivity` vs
     the partial\-path rows\). Expected movement: Q16 leaf row estimate within
     PG's; category movement only if it flips an election.
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0002h\-subplan\-clause\-selectivity.md`;
+    evidence `analysis/m0146/m0146\-0002h/`.
+    - Both twin estimators return 0.5 for a SubPlan `InExpr` and any
+      `ExistsExpr` \(boolvarsel\'s default\); Q16 partsupp 266667 → 400000
+      rows = PG\'s total.
+    - TPC\-DS Q10/Q35 plans change; census unchanged; all gates pass.
+  Movement: TPC\-H Q16 partsupp leaf estimate matches PG \(no category move\)
 
 - [ ] **M0146\-0002f — a parallel\-safe SubPlan does not make its relation
   parallel\-unsafe**: port `max\_parallel\_hazard\_walker`'s SubPlan arm

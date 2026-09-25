@@ -84,11 +84,16 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
 		}
+	case *ExistsExpr:
+		return subPlanClauseSelectivity
 	case *InExpr:
-		// Only the value-list form matches the column-IN-(consts)
-		// shape selfuncs handles. The subquery form is handled by
-		// the join / subplan estimator.
-		if e.Plan != nil || len(e.List) == 0 {
+		// The subquery form is a SubPlan clause (subPlanClauseSelectivity);
+		// only the value-list form matches the column-IN-(consts) shape
+		// selfuncs handles.
+		if e.Plan != nil {
+			return subPlanClauseSelectivity
+		}
+		if len(e.List) == 0 {
 			return defaultGenericSelectivity
 		}
 		cr, ok := e.Operand.(*ColumnRef)
@@ -114,6 +119,16 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	}
 	return defaultGenericSelectivity
 }
+
+// subPlanClauseSelectivity is PG's estimate for a SubPlan clause — an
+// `x [NOT] IN (subquery)` or `[NOT] EXISTS (subquery)` that stayed a
+// SubPlan rather than becoming a semi/anti join. clause_selectivity_ext
+// (postgres/src/backend/optimizer/path/clausesel.c) has no SubPlan arm, so
+// the clause reaches its final `boolvarsel` call, whose no-statistics
+// default is 0.5 (selfuncs.c); a NOT above it gives 1 - 0.5. The value is
+// the same either way, which is why Negated is not consulted. TPC-DS Q16's
+// `NOT IN` partsupp restriction is the witness (M0146-0002h).
+const subPlanClauseSelectivity = 0.5
 
 // inListSelectivity estimates `operand <op> ANY|ALL (elements)` by
 // applying the element operator's own estimator per element and merging
@@ -1096,8 +1111,13 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 			sub := clauseSelectivityWithSource(e.Operand, child)
 			return selectivityEstimate{value: 1 - sub.value, reliable: sub.reliable}
 		}
+	case *ExistsExpr:
+		return selectivityEstimate{value: subPlanClauseSelectivity, reliable: false}
 	case *InExpr:
-		if e.Plan != nil || len(e.List) == 0 {
+		if e.Plan != nil {
+			return selectivityEstimate{value: subPlanClauseSelectivity, reliable: false}
+		}
+		if len(e.List) == 0 {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
 		cr, ok := e.Operand.(*ColumnRef)
