@@ -361,26 +361,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// parameterised index probe, so its "cache" is per-probe and the
 			// Memoize arm of nestLoopInnerRescanCost is the one that fires
 			// when a Memoize sits between.
-			matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-			// The rescan STARTUP rides alongside the run: nestloopCost
-			// subtracts it back out of the run part
-			// (innerRescanRun = Total − Startup), so pass Total with
-			// the startup included — PG's rescan_total, not just its
-			// run half.
-			rsStart := nestLoopInnerRescanStartup(in)
-			var cost Cost
-			if semi.apply {
-				// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch.
-				// A parameterised index probe that enforces every join
-				// clause makes an unmatched outer row an empty probe
-				// (has_indexed_join_quals).
-				cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
-					semi, hasIndexedJoinQuals(in, residual), len(residual))
-			} else {
-				cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
-				cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
-			}
-			cost.Total += matBuild
+			cost := nliNestLoopCost(cp, o, in, residual, semi)
 			filed = true
 			addPath(joinrel, &Path{
 				Kind:     PathNestLoop,
@@ -560,19 +541,13 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				// (`add_partial_path_precheck` is CPU-only — bail before
 				// creating the path — and the post-costing domination
 				// decides identically, so it is not mirrored.)
-				matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-				var cost Cost
-				if semi.apply {
-					// M0145-0008l: as the serial NLI arm. The factors are in
-					// total-relation coordinates and apply to this partial
-					// outer's own rows, as in final_cost_nestloop.
-					cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan,
-						semi, hasIndexedJoinQuals(in, residual), len(residual))
-				} else {
-					cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, 0, matRescan)
-					cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
-				}
-				cost.Total += matBuild
+				// M0146-0005: the same arithmetic as the serial NLI arm, through
+				// the same helper. This arm used to repeat it inline with the
+				// rescan STARTUP passed as a literal 0, so a parameterised inner
+				// re-paid only its run half and never its index descent —
+				// TPC-H Q9's partial nested loop into orders_pk cost 0.066 per
+				// probe instead of ~0.43.
+				cost := nliNestLoopCost(cp, o, in, residual, semi)
 				// `final_cost_nestloop` (costsize.c:4307-4314-twin): "For
 				// partial paths, scale row estimate." One divisor, applied
 				// here and undone by `computeGatherRows` — not two.
@@ -605,4 +580,34 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 			}
 		}
 	}
+}
+
+// nliNestLoopCost is `initial_cost_nestloop` + `final_cost_nestloop`
+// (postgres/src/backend/optimizer/path/costsize.c:3260-3420) for a nested loop
+// over a parameterised (or memoized) inner, shared by the serial NLI arm and
+// the partial-nestloop arm so the two cannot price the same pair differently
+// (M0146-0005 found the partial arm dropping the rescan startup).
+//
+// The inner is rescanned `outer_rows - 1` times, and each rescan re-pays
+// `inner_rescan_start_cost` (the index descent — `cost_rescan`'s default arm)
+// on top of its run cost. `nestloopCost` subtracts the startup back out of the
+// rescan total it is handed, so the total passed in includes it. The outer is
+// read as given: a partial outer arrives with per-worker rows and costs, and
+// `initial_cost_nestloop` applies no worker division of its own.
+func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi semiAntiJoinFactors) Cost {
+	matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
+	rsStart := nestLoopInnerRescanStartup(in)
+	var cost Cost
+	if semi.apply {
+		// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch. A
+		// parameterised index probe that enforces every join clause makes an
+		// unmatched outer row an empty probe (has_indexed_join_quals).
+		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
+			semi, hasIndexedJoinQuals(in, residual), len(residual))
+	} else {
+		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+		cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+	}
+	cost.Total += matBuild
+	return cost
 }
