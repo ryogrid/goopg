@@ -21111,6 +21111,18 @@ M0146-0001 re-baseline census on the new default arm.
       outer.Rows` lacks the `/ inner.Rows`.
     - Next: implement per the design doc §"Slice 3 / Planned change", then
       fire set at both scales. Every filter containing a SubPlan reprices.
+    - **Update 2026\-09\-25: the costing half alone moves nothing.**
+      Implemented and measured \(`slice3/subplan\-qual\-cost.wip.patch`,
+      census identical\), then set aside uncommitted:
+      - `relidsOfExpr` does not see a sublink\'s correlation, so Q17\'s
+        SubPlan qual is a `lineitem`\-only clause. `buildRestrictInfos`
+        drops it, and it is applied above the finished join.
+      - Prerequisite: correlated\-sublink clauses as JOIN clauses \(relids
+        from their correlation, placed at the join with
+        `remapOuterRefsInSubplan`\), filed under M0146\-0012. Q17 waits for
+        it; the patch lands with it.
+      - The slice moves to Q19 \(`join\-method`, PG Nested Loop vs goopg
+        Parallel Hash Join under a Partial Aggregate\).
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -21202,6 +21214,29 @@ M0146-0001 re-baseline census on the new default arm.
     correlated scalar subquery as a SubPlan, PG\'s shape, costs 1.50 s →
     307 s until the SubPlan inner can probe `partsupp` by the outer
     parameter. Further witnesses: TPC\-H Q2, TPC\-DS Q1/Q6/Q32/Q92.
+- [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
+  and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
+  PG a SubPlan\'s `args` put the relations its correlation reads into the
+  clause\'s relids, so TPC\-H Q17\'s `l\_quantity < \(SubPlan on
+  p\_partkey\)` is a \{lineitem, part\} join clause, costed per join path.
+  The hash join charges it on `outer\_matched` \(10\), the nested loop on
+  every row \(about 5,940\); that is why PG hash\-joins. goopg\'s
+  `relidsOfExpr` does not see into the sublink, so the clause is
+  `lineitem`\-only, `buildRestrictInfos` drops it, and it is applied above
+  the finished join where no path pays for it.
+  Kind: impl
+  Parent: M0146\-0012
+  - First step: make `relidsOfExpr` include a correlated sublink\'s
+    same\-scope outer references \(Level\-1 `OuterColumnRef`s in its plan, or
+    its lowered `Args`\), then place such a clause at the join in
+    `createPlan`, remapping the sublink plan\'s outer references to the
+    join\'s layout \(`remapOuterRefsInSubplan`\).
+  - Land it together with the costing half saved as
+    `analysis/m0146/m0146\-0005/slice3/subplan\-qual\-cost.wip.patch`
+    \(`cost\_subplan` port \+ `joinQualPerTuple` at the seven join\-qual sites
+    and the semi/anti nested\-loop arm\), and PG\'s inner\-unique
+    `outer\_match\_frac = joinrel.rows / \(outer.rows × inner.rows\)`.
+  - Witness: TPC\-H Q17 \(first divergence `join\-method` at depth 1\).
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort

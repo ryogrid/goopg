@@ -204,6 +204,37 @@ goopg has neither piece:
 This overlaps M0146-0013 (`cost_qual_eval` ordering), which will reuse the
 per-conjunct cost.
 
+### Second finding: the qual never reaches the join search (2026-09-25)
+
+Change 1 was implemented as `subplan-qual-cost.wip.patch` in the evidence
+directory: a `cost_subplan` port, `joinQualPerTuple`, and all seven join-qual
+sites plus the semi/anti nested-loop arm. It moved nothing: the TPC-H
+first-divergence census is identical (`census-tpch-with-wip-patch.txt`). The
+reason is upstream of costing:
+- `relidsOfExpr` (`joinrestrict.go`) does not look inside a sublink's plan.
+  `l_quantity < (SubPlan)` therefore reads as a `lineitem`-only clause, and
+  `buildRestrictInfos` drops it as `relLevel < 2`.
+- Being a correlated sublink, it is also not leaf-eligible
+  (`conjunctIsLocalEligible`).
+- So it is re-applied as a Filter above the finished join tree, and no join
+  path is charged for it.
+
+In PG, the SubPlan's `args` (the `part.p_partkey` Param source) put `part` in
+the clause's relids. It is a {lineitem, part} join clause, placed and costed
+per join path; that is what lets the hash join's `outer_matched` charge (10)
+beat the nested loop's charge (about 5,940).
+
+**Prerequisite, not yet built:**
+- The relids of a correlated-sublink clause must include the relations its
+  correlation reads.
+- `createPlan` must then place such a clause at a join, remapping the outer
+  references inside the sublink plan (`remapOuterRefsInSubplan`,
+  `bushy.go`/`joinlayout.go`) to that join's row layout.
+
+That is restriction placement, M0146-0012's territory, and it is filed under
+M0146-0012. Q17 waits for it. The saved patch is the costing half, to land
+together with it. The slice moves to Q19.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
