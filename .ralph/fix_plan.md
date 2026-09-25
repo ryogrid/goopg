@@ -21301,6 +21301,36 @@ M0146-0001 re-baseline census on the new default arm.
       identical. Sweep 96/96, fire set PASS, spotcheck PASS, arm 24 MATCH.
     - Still deferred: the LEFT\-join inner\-unique arm \(ledger\).
   Movement: none
+- [x] **M0146\-0005g — a set\-operation subquery is a unique inner
+  \(`query\_is\_distinct\_for`\)** \(opened 2026\-09\-25 from the census:
+  TPC\-DS Q14\'s `cross\_items`, PG hash join, goopg merge join\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-25.** Design doc §"Slice 8"; evidence
+    `analysis/m0146/m0146\-0005/slice8/`.
+    - PG\'s winning hash join reconciles only as inner\-unique \(walk 6.75 =
+      the unmatched\-probe term\). `rel\_is\_distinct\_for` proves a non\-ALL
+      top set operation distinct when every output column is equated.
+    - `setOpLeafDistinctFor` is that arm over the search leaf, reached from
+      `innerRelProvenUnique` \(hash join and nested loop\).
+    - Q14\'s cross\_items plan is now PG\'s at both scales. Its census record
+      moves to a rendering\-only `join\-order` label \(M0146\-0005h\).
+      Everything else is unchanged; all gates pass.
+  Movement: TPC\-DS join\-method SF0.25 10 → 9, SF1 5 → 4 \(Q14 now
+    rendering\-only\)
+- [ ] **M0146\-0005h — EXPLAIN renders set\-operation subquery outputs by
+  the subquery\'s column names** \(filed 2026\-09\-25 by M0146\-0005g\): PG
+  deparses a Var of a set\-operation subquery through to the leftmost
+  branch\'s column \(`iss.i\_brand\_id`\); goopg prints the subquery alias
+  column \(`brand\_id`\). The first\-divergence census compares Hash Cond
+  text, so TPC\-DS Q14 still counts as a `join\-order` divergence although
+  its join matches PG.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find PG\'s rule in `ruleutils.c` \(`get\_variable` /
+    `find\_param\_referent` for an RTE\_SUBQUERY with setOperations — it
+    resolves through the leftmost setop child\'s targetlist\) and the goopg
+    EXPLAIN deparser\'s ColumnRef naming for set\-op leaf columns.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

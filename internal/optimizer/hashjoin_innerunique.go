@@ -70,7 +70,8 @@ func (s *searchCtx) hashJoinFinalCostInputFor(joinrel, outer, inner *RelOptInfo,
 // one complete non-partial bare unique index of a sole, complete base
 // relation.  `provableKeys` already implements that coverage and rejects
 // partial indexes; retaining its `fromFK` distinction is essential: an FK can
-// establish selectivity but does not make the inner side unique.  With
+// establish selectivity but does not make the inner side unique.  A
+// set-operation subquery leaf is proven by setOpLeafDistinctFor.  With
 // `skipNonKeys` a clause that is not an outer=inner equi-pair is ignored (a
 // nested loop's whole restriction list); otherwise it declines (a hash
 // join's key list).
@@ -104,7 +105,47 @@ func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restr
 			return true
 		}
 	}
-	return false
+	return setOpLeafDistinctFor(inner.baseLeaf, innerRel, pairs)
+}
+
+// setOpLeafDistinctFor is the set-operation arm of PG's rel_is_distinct_for
+// → query_is_distinct_for (postgres/src/backend/optimizer/plan/
+// analyzejoins.c) for a subquery leaf: when the TOP set operation is not ALL,
+// its output rows are distinct, so the leaf is unique for any clause set that
+// equates every output column. TPC-DS Q14's cross_items joins item to an
+// INTERSECT on all three of its columns, and PG costs that hash join as
+// inner-unique (M0146-0005g).
+//
+// A DISTINCT or GROUP BY subquery leaf (the arms PG also has) is not proven
+// here. The proof only moves costs: goopg's executor does not stop at the
+// first match on inner_unique.
+func setOpLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
+	so, ok := leafBaseScan(leaf).(*SetOp)
+	if !ok || so.All {
+		return false
+	}
+	equated := make(map[string]bool)
+	for _, p := range pairs {
+		for k := 0; k < 2; k++ {
+			if p.rel[k] == innerRel {
+				equated[p.col[k]] = true
+			}
+		}
+	}
+	out := so.Output()
+	if len(out) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(out))
+	for _, c := range out {
+		// A repeated output name could not tell which column a clause
+		// equates; refuse rather than guess.
+		if c.Name == "" || seen[c.Name] || !equated[c.Name] {
+			return false
+		}
+		seen[c.Name] = true
+	}
+	return true
 }
 
 // innerUniqueMatchFactors is compute_semi_anti_join_factors for an INNER

@@ -459,6 +459,26 @@ Results:
 
 The LEFT-join inner-unique arm remains deferred.
 
+## Slice 8 (M0146-0005g): a set-operation subquery is a unique inner
+
+TPC-DS Q14's `cross_items` joins `item` to an INTERSECT on all three of its
+output columns. PG's hash join reconciles only as an inner-unique join:
+`rel_is_distinct_for` → `query_is_distinct_for` proves a non-ALL top set
+operation distinct when every output column is equated. goopg's uniqueness
+proof knew only base-relation unique indexes, so the set-op build side kept
+the default 0.1 bucket and lost to a merge join.
+
+`setOpLeafDistinctFor` (hashjoin\_innerunique.go) is that arm over the
+search leaf. `innerRelProvenUnique` falls back to it, so both the hash join
+(slice 6) and the nested loop (slice 7) see it. goopg's cross\_items plan is
+now PG's, with the same run-cost terms.
+
+The census moves Q14 from `join-method` to a rendering-only `join-order`
+record: PG deparses set-op outputs through to the leftmost branch
+(M0146-0005h). Everything else is unchanged, and all gates pass. The
+DISTINCT and GROUP BY arms are not ported yet. Evidence:
+`analysis/m0146/m0146-0005/slice8/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

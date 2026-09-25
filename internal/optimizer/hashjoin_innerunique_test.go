@@ -378,3 +378,34 @@ func TestInnerRelProvenUniqueNestLoopSkipsNonKeyClauses(t *testing.T) {
 		t.Fatalf("factors = %g, %g; want the clause selectivity and %g", frac, matchCount, inner.Rows)
 	}
 }
+
+// TestSetOpLeafDistinctFor pins M0146-0005g, the set-operation arm of PG's
+// query_is_distinct_for: a non-ALL top set operation is distinct, so the
+// leaf is unique for clauses equating EVERY output column; an ALL operation,
+// or a clause set that misses an output column, proves nothing.
+func TestSetOpLeafDistinctFor(t *testing.T) {
+	pairsFor := func(cols ...string) []joinKeyPair {
+		var out []joinKeyPair
+		for _, c := range cols {
+			out = append(out, joinKeyPair{rel: [2]int{0, 1}, col: [2]string{"o_" + c, c}, usable: true})
+		}
+		return out
+	}
+	intersect := setOpTestNode(parser.SetOpIntersect, false, upperOrderedInput(100), upperOrderedInput(50))
+	if !setOpLeafDistinctFor(intersect, 1, pairsFor("k", "v", "w")) {
+		t.Fatal("INTERSECT equated on every output column must be distinct")
+	}
+	if setOpLeafDistinctFor(intersect, 1, pairsFor("k", "v")) {
+		t.Fatal("a missing output column must not prove distinctness")
+	}
+	if setOpLeafDistinctFor(intersect, 0, pairsFor("k", "v", "w")) {
+		t.Fatal("columns equated on the other relation must not count")
+	}
+	all := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+	if setOpLeafDistinctFor(all, 1, pairsFor("k", "v", "w")) {
+		t.Fatal("UNION ALL is not distinct")
+	}
+	if setOpLeafDistinctFor(upperOrderedInput(10), 1, pairsFor("k", "v", "w")) {
+		t.Fatal("a non-set-op leaf proves nothing here")
+	}
+}
