@@ -2839,6 +2839,11 @@ type SetOp struct {
 	pos   int
 	Left  Node
 	Right Node
+	// pinnedSchema is the written first arm's output, kept when
+	// createSetOpPaths swaps an INTERSECT's inputs (M0146-0005r): the set
+	// operation's column names come from the leftmost SELECT whichever
+	// input runs on the left. nil means "Left's output".
+	pinnedSchema Schema
 	// TlistTypesDiffer records that this link's two branches did NOT have
 	// identical output types BEFORE setOpUnifyBranches coerced them —
 	// upstream's `tlist_same_datatypes` (tlist.c:257) answered false, which
@@ -2903,7 +2908,12 @@ type SetOp struct {
 }
 
 func (n *SetOp) Pos() int       { return n.pos }
-func (n *SetOp) Output() Schema { return n.Left.Output() }
+func (n *SetOp) Output() Schema {
+	if n.pinnedSchema != nil {
+		return n.pinnedSchema
+	}
+	return n.Left.Output()
+}
 
 // Distinct eliminates duplicate rows from its child, implementing
 // SELECT DISTINCT. Deduplication uses the same rowKey hash as the

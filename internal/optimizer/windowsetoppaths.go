@@ -360,6 +360,7 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 		u = newUpperRels()
 	}
 	cp := ps.costParams()
+	setOpNode = swapIntersectInputs(setOpNode)
 	// One rel PER NODE, as PG keys its SETOP rel by the node's relids
 	// (prepunion.c:805) — see `newUpperRelForNode` for why sharing one
 	// relids-0 rel across a chain returns the wrong subtree.
@@ -1229,4 +1230,26 @@ func appendNonPartialCost(npCosts []float64, workers int) float64 {
 		}
 	}
 	return max
+}
+
+// swapIntersectInputs is generate_nonunion_paths' input swap (prepunion.c):
+// "For INTERSECT, either order should give the same results, and we prefer
+// to put the smaller input first", smaller meaning fewer groups — to shrink
+// the hash table and to hit the executor's empty-left fast path. It applies
+// to INTERSECT and INTERSECT ALL alike. The swapped node keeps the written
+// first arm's output schema, since the set operation's columns are named by
+// the leftmost SELECT (M0146-0005r).
+func swapIntersectInputs(n *SetOp) *SetOp {
+	if n == nil || n.Op != parser.SetOpIntersect || n.Left == nil || n.Right == nil {
+		return n
+	}
+	lg := setOpArmGroups(n.Left, EstimateRows(n.Left))
+	rg := setOpArmGroups(n.Right, EstimateRows(n.Right))
+	if lg <= rg {
+		return n
+	}
+	sw := *n
+	sw.pinnedSchema = n.Output()
+	sw.Left, sw.Right = n.Right, n.Left
+	return &sw
 }

@@ -632,6 +632,16 @@ for a hashed DISTINCT arm. The SF0.25 census is identical to HEAD. At SF1
 Q38 (depth 2 to 3) and Q87 (depth 1 to 4) now plan PG's sorted SetOp.
 Evidence: `analysis/m0146/m0146-0005/slice18/`.
 
+## Slice 19 (M0146-0005r): INTERSECT smaller-input swap
+
+PG puts the INTERSECT input with fewer groups on the left. goopg now does
+the same in `swapIntersectInputs` using `setOpArmGroups`. The swapped
+node keeps the written first arm's output schema (`SetOp.pinnedSchema`).
+The first attempt had flipped Q14's arms where PG did not; that came from
+the missing eq_selec, which slice 18 fixed. Q38 now diverges at depth 4
+(was 3) at both scales, on PG's partial Unique + Gather Merge; nothing
+else changes. Evidence: `analysis/m0146/m0146-0005/slice19/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

@@ -104,3 +104,27 @@ func TestSortedSetOpArmRebuildsUnique(t *testing.T) {
 		t.Fatal("an arm without DISTINCT has no sorted form")
 	}
 }
+
+// TestSwapIntersectInputs pins M0146-0005r: generate_nonunion_paths puts the
+// INTERSECT input with fewer groups on the left, keeping the written first
+// arm's column names; EXCEPT is never swapped.
+func TestSwapIntersectInputs(t *testing.T) {
+	big := &SeqScan{Table: statsTable("big", 1000, 1000)}
+	small := &SeqScan{Table: statsTable("small", 400, 400)}
+	n := &SetOp{Left: big, Right: small, Op: parser.SetOpIntersect}
+	sw := swapIntersectInputs(n)
+	if sw.Left != Node(small) || sw.Right != Node(big) {
+		t.Fatal("INTERSECT with the larger arm first must swap")
+	}
+	want, got := n.Output(), sw.Output()
+	if len(want) != len(got) || (len(want) > 0 && want[0].Name != got[0].Name) {
+		t.Fatalf("swapped output %v must keep the written first arm's columns %v", got, want)
+	}
+	if swapIntersectInputs(&SetOp{Left: small, Right: big, Op: parser.SetOpIntersect}).Left != Node(small) {
+		t.Fatal("the smaller arm already first must stay")
+	}
+	ex := &SetOp{Left: big, Right: small, Op: parser.SetOpExcept}
+	if swapIntersectInputs(ex) != ex {
+		t.Fatal("EXCEPT must never swap")
+	}
+}

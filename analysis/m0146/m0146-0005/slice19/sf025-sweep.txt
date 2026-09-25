@@ -1,0 +1,2 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=98 changed=1 added=0 removed=0 ===

@@ -1,0 +1,3 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H first-divergence census: identical to slice 18

@@ -21537,20 +21537,21 @@ M0146-0001 re-baseline census on the new default arm.
       HashAggregate.
     - SF0.25 census identical; TPC\-H census identical; all gates pass.
   Movement: TPC\-DS SF1 Q38 depth 2 → 3, Q87 depth 1 → 4
-- [ ] **M0146\-0005r — INTERSECT smaller\-input swap** \(opened 2026\-09\-26
+- [x] **M0146\-0005r — INTERSECT smaller\-input swap** \(opened 2026\-09\-26
   from 0005q\'s ledger row: Q38\'s residue\).
   Kind: impl
   Parent: M0146\-0005
-  - PG\'s generate\_nonunion\_paths swaps INTERSECT inputs when
-    dLeftGroups > dRightGroups. The patch is saved at
-    `tmp/m0146\-0005r/swap.patch` \(SetOp.pinnedSchema keeps the written
-    left arm\'s output; `swapIntersectInputs` in createSetOpPaths\).
-  - First attempt \(not landed\): Q38 improved but Q14 SF0.25 fell from
-    depth 7 to 2. goopg swapped cross\_items\' arms and PG did not,
-    because goopg\'s web\_sales arm estimated 1737 rows against PG\'s 2643
-    \(the missing eq\_selec, fixed by 0005s\).
-  - Next step: re\-apply the patch on top of 0005s and re\-run the fire set
-    and census \(Q14, Q38, Q87\).
+  - **DONE 2026\-09\-26.** Design doc §"Slice 19"; evidence
+    `analysis/m0146/m0146\-0005/slice19/`.
+    - `swapIntersectInputs` puts the fewer\-groups input first
+      \(generate\_nonunion\_paths\); `SetOp.pinnedSchema` keeps the written
+      first arm\'s output.
+    - First attempt \(not landed\): Q14 SF0.25 fell from depth 7 to 2
+      because goopg\'s web\_sales arm was underestimated \(the missing
+      eq\_selec\). After 0005s Q14 is unchanged.
+    - Q38 depth 3 → 4 at SF0.25 and SF1; TPC\-H census identical; all
+      gates pass.
+  Movement: TPC\-DS SF0.25 and SF1 Q38 depth 3 → 4
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

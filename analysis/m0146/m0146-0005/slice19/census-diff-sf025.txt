@@ -1,0 +1,14 @@
+38c38
+< Q38 depth=3 [aggregation-strategy] under SetOp: PG Unique | goopg SetOp Intersect
+---
+> Q38 depth=4 [sort-strategy] under Unique: PG Gather Merge | goopg Sort
+101c101
+< CATEGORY-ROLLUP: sort-strategy=33 qual-placement=14 aggregation-strategy=13 parallelism=8 join-method=7 join-order=6 scan-type=4 parameterisation=3 error=3
+---
+> CATEGORY-ROLLUP: sort-strategy=34 qual-placement=14 aggregation-strategy=12 parallelism=8 join-method=7 join-order=6 scan-type=4 parameterisation=3 error=3
+117a118
+>     2  sort-strategy    under Unique           PG Gather Merge                 goopg Sort                         depth=4
+139d139
+<     1  aggregation-strategy under SetOp            PG Unique                       goopg SetOp Intersect              depth=3
+159d158
+<     1  sort-strategy    under Unique           PG Gather Merge                 goopg Sort                         depth=4
