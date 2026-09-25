@@ -8,9 +8,8 @@ import (
 )
 
 // sampleEntryRE matches a `name = value` line in postgresql.conf.sample,
-// optionally prefixed by a single `#` (entries ship commented out except
-// the deliberate live `work_mem` line — see the sample's header). The
-// name uses `\w` rather than `[a-z_]` because the registry
+// optionally prefixed by a single `#` (every shipped entry is commented
+// out — see the sample's header). The name uses `\w` rather than `[a-z_]` because the registry
 // preserves PG's capitalised names (`DateStyle`, `TimeZone`,
 // `IntervalStyle`).
 //
@@ -82,5 +81,23 @@ func TestSampleConfigCoversRegistry(t *testing.T) {
 		if val != v.BootVal {
 			t.Errorf("postgresql.conf.sample default for %q is %q; registry BootVal is %q", v.Name, val, v.BootVal)
 		}
+	}
+}
+
+// TestSampleConfigHasNoActiveSetting pins that every line of the shipped
+// sample is a comment or blank. `goopg init` copies it verbatim, and PG's
+// initdb leaves a fresh postgresql.conf with no active setting — so the
+// PG 18.3 cold start on a goopg data directory
+// (TestE2E_PGColdStartOnGoopgDataDir) accepts only the lines its harness
+// adds. A live `work_mem = 512MB` line (the 2026-09-24 measurement
+// convention, which belongs in the bench clusters' own confs) broke that
+// test in the nightly run of 2026-09-25.
+func TestSampleConfigHasNoActiveSetting(t *testing.T) {
+	for i, line := range bytes.Split(SampleConfig(), []byte{'\n'}) {
+		l := bytes.TrimSpace(line)
+		if len(l) == 0 || l[0] == '#' {
+			continue
+		}
+		t.Errorf("postgresql.conf.sample line %d is an active setting: %q", i+1, l)
 	}
 }

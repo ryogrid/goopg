@@ -421,6 +421,11 @@ cmd_load_goopg() {
     sf025_goopg_stop
     rm -rf "${SF025_GOOPG_DATA}"
     "${GOOPG_BIN}" init -D "${SF025_GOOPG_DATA}" >/dev/null
+    # Measurement convention (2026-09-24): every measurement cluster carries
+    # work_mem explicitly in its own postgresql.conf. `goopg init` writes
+    # PG's all-commented template, so the line is added here — as
+    # bench/tpch/setup_goopg.sh does — rather than relying on the BootVal.
+    echo "work_mem = 512MB" >> "${SF025_GOOPG_DATA}/postgresql.conf"
     sf025_goopg_start
     log "Loading schema + data"
     ${GOOPG_PSQL} -q -f "${TPCDS_TOOLS}/tpcds.sql" 2>&1 | tail -2 || true

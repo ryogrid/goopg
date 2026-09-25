@@ -8,12 +8,12 @@
 # be found in goopg's `internal/utils/misc/defaults.go`, which is the
 # authoritative source for every GUC the server knows about.
 #
-# Settings are commented out by default; uncommenting an entry sets it to
-# the value shown, which equals the server's compiled-in default. The one
-# deliberate exception is `work_mem`, written out live below: the 2026-09-24
-# measurement-convention owner decision wants every measurement cluster to
-# carry it explicitly (512MB on both engines) rather than rely on the
-# BootVal.
+# All settings are commented out by default.  Uncommenting an entry sets
+# it to the value shown, which equals the server's compiled-in default.
+# `goopg init` copies this file verbatim, so a fresh cluster's
+# postgresql.conf carries no active setting — as PostgreSQL's initdb leaves
+# it. (The 2026-09-24 measurement convention's `work_mem = 512MB` lives in
+# the bench and reference clusters' own postgresql.conf files, not here.)
 #
 # This template is hand-maintained against `BuildDefaultRegistry()` in
 # `internal/utils/misc/defaults.go`.  The unit test
@@ -81,15 +81,13 @@
 #transaction_buffers = 0                # CLOG SLRU page-cache buffers;
                                         # 0 = auto from shared_buffers
                                         # (change requires restart)
-work_mem = 512MB                        # min 64kB; written out explicitly
-                                        # (2026-09-24 owner decision): every
-                                        # measurement cluster carries its
-                                        # work_mem in postgresql.conf on BOTH
-                                        # engines and no session SET may
-                                        # override it — see AGENT.md
-                                        # "Plan-parity harness". Equals
-                                        # goopg's BootVal; PostgreSQL's own
-                                        # default is 4MB
+#work_mem = 512MB                       # min 64kB; goopg's BootVal —
+                                        # PostgreSQL's own default is 4MB
+                                        # (the BootVal flip is parked, see
+                                        # take3-B-13). Measurement clusters
+                                        # set work_mem = 512MB in their own
+                                        # postgresql.conf (AGENT.md
+                                        # "Plan-parity harness")
 #maintenance_work_mem = 64MB            # min 64kB; accepted, VACUUM/CREATE
                                         # INDEX do not yet size off this GUC
 
