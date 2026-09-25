@@ -444,7 +444,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// is a follow-up the A/B can motivate.
 				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			}
-			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys)
+			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, clauses)
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,

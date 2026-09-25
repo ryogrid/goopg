@@ -850,8 +850,7 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	startup := in.outer.Startup + build
 	// Probe: hash each outer key and walk its bucket; emit each match.
 	run := (in.outer.Total - in.outer.Startup) +
-		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows +
-		cp.cpuTupleCost*in.outputRows
+		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows
 
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
@@ -873,11 +872,14 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		// path coordinate.
 		outerMatched := math.RoundToEven(in.outerRows * in.final.outerMatchFrac)
 		if in.innerBucketSize > 0 {
-			innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
+			innerScanFrac := 2.0 / (math.Max(1.0, in.final.matchCount) + 1.0)
 			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
 			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
 				outerMatched * bucketTuples * 0.5
 		}
+		// PG's hashjointuples in this branch is outer_matched_rows, not the
+		// join's result cardinality (M0146-0005e).
+		run += cp.cpuTupleCost * outerMatched
 
 		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
 		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
@@ -892,10 +894,19 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 					unmatched * bucketTuples * 0.05
 			}
 		}
-	} else if in.innerBucketSize > 0 {
-		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
-		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-			in.outerRows * bucketTuples * 0.5
+	} else {
+		if in.innerBucketSize > 0 {
+			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
+			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
+				in.outerRows * bucketTuples * 0.5
+		}
+		// PG's hashjointuples here is approx_tuple_count over the hash
+		// clauses and the two paths' own rows (M0146-0005e).
+		tuples := in.outputRows
+		if in.final.hashClauseSel > 0 {
+			tuples = clampRowEst(in.final.hashClauseSel * in.outerRows * in.innerRows)
+		}
+		run += cp.cpuTupleCost * tuples
 	}
 
 	// R108 is deliberately opt-in. PG decides hash-table batches using packed

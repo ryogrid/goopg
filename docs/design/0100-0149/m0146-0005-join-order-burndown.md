@@ -389,6 +389,48 @@ Two prerequisites had to land first:
 Q79 itself still hash-joins. PG keeps its nested loop on the fuzzy
 startup tie-break (M0146-0005d).
 
+## Slice 6 (M0146-0005e): PG's hash-join tuple counts
+
+Witness: TPC-DS Q31's `ws` CTE. PG hash-joins `web_sales` to `date_dim`
+(10083.57); goopg priced its own hash join at 11993 and ran a Memoize
+nested loop (11597). Evidence: `analysis/m0146/m0146-0005/slice6/`.
+
+**Inner-unique arm.** `date_dim` is unique on `d_date_sk`, so PG's
+`final_cost_hashjoin` takes the semi/anti branch. The instrumented PG's
+`HJCOST` trace shows `hashjointuples = 2` of 179956 outer rows. For an inner
+join, `compute_semi_anti_join_factors` passes `JOIN_SEMI` with the INNER
+SpecialJoinInfo; `eqjoinsel` switches on `sjinfo->jointype`, so the factors
+are:
+- `outer_match_frac` = the inner-join selectivity;
+- `match_count` = nselec × inner rows / jselec = the inner's row count.
+
+goopg had used `joinrel.Rows / outer.Rows` (about 1), a match count of 1 and
+`cpu_tuple_cost` on the join's rows. `hashJoinFinalCostInputFor` now derives
+the clause selectivity over the pair's restriction list (one clause per EC)
+and uses the inner's row count as the match count. `hashJoinCost` charges
+`cpu_tuple_cost × outer_matched_rows`. A unit test reproduces PG's
+3067.60..10083.57 exactly. This resolves take2's B5 chain, which R98 had
+ruled unobservable from EXPLAIN alone.
+
+**Non-unique arm.** With only that change, TPC-H Q10 lost its match: the
+customer join flipped orientation. PG's non-unique arm charges
+`approx_tuple_count` over the hash clauses, i.e. selectivity × outer path
+rows × inner path rows. For a Parallel Hash candidate both are per-worker
+rows (6120 tuples where goopg charged the joinrel's 24479). The
+hash-clause selectivity now rides `hashJoinFinalCostInput.hashClauseSel`,
+and the output rows are only its fallback.
+
+Results:
+- TPC-DS: Q96 matches PG at both scales. Q31 now diverges at depth 1 and
+  Q48 at depth 2. Nothing got shallower.
+- TPC-H: the census is unchanged (5/22).
+- Gates: sweep 96/96; fire set PASS (SF1 Q74 straddles the 600 s limit
+  with an identical plan on both arms, so it was re-run at 1200 s); values
+  identical.
+
+Two changes are not ported: the LEFT-join inner-unique arm, and nested loops
+with a unique inner (ledgered).
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:

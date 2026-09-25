@@ -239,10 +239,8 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		outer: o.Cost, inner: i.Cost,
 		outerRows: o.Rows, innerRows: i.Rows,
 		// PG derives hashjointuples independently via approx_tuple_count over
-		// the already-divided outer_path_rows, arriving at ≈rows/divisor by a
-		// different route. Using the one clamped figure for both Path.Rows and
-		// the per-tuple charge is what stops the two from disagreeing — the
-		// bug class Path.Rows' own comment warns about.
+		// the already-divided outer_path_rows; `final.hashClauseSel` carries
+		// that selectivity (M0146-0005e), and outputRows is only its fallback.
 		outputRows:      rows,
 		numHashClauses:  len(keys),
 		innerBucketSize: bucket,

@@ -21255,6 +21255,34 @@ M0146-0001 re-baseline census on the new default arm.
       goopg\'s hash join is therefore 2% cheaper than its nested loop,
       beyond PG\'s 1% fuzz. Filed below.
   Movement: none
+- [x] **M0146\-0005e — PG\'s inner\-unique and approximate hash\-join tuple
+  counts** \(opened 2026\-09\-25 from the census: TPC\-DS Q31\'s `ws` CTE,
+  PG hash join over `date\_dim`, goopg Memoize nested loop\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-25.** Design doc §"Slice 6"; evidence
+    `analysis/m0146/m0146\-0005/slice6/`.
+    - PG observable \(instrumented PG 18.3 `HJCOST` trace\): for an INNER join
+      with a unique inner, `compute\_semi\_anti\_join\_factors` passes
+      JOIN\_SEMI but an INNER SpecialJoinInfo, and eqjoinsel switches on
+      the SpecialJoinInfo, so `outer\_match\_frac` is the inner\-join
+      selectivity. Q31\'s web\_sales ⋈ date\_dim charges 2 matched tuples of
+      179956 and costs 3067.6..10083.57, which goopg now reproduces exactly
+      \(unit test\). This supersedes take2 R98\'s "unobservable" ruling.
+    - goopg\'s factors were joinrel rows / outer rows \(≈ 1\) and its tuple
+      charge was the join\'s rows. Now: outer\_match\_frac = clause
+      selectivity, match\_count = inner rows, hashjointuples =
+      outer\_matched\_rows; and the non\-unique arm charges
+      approx\_tuple\_count \(hash\-clause selectivity × both path rows\),
+      without which TPC\-H Q10 lost its match.
+    - TPC\-DS: **Q96 now matches PG at both scales**; Q31 and Q48 diverge
+      deeper; nothing shallower. TPC\-H census unchanged \(5/22\). Sweep
+      96/96; fire set PASS \(SF1 Q74 straddles 600 s on both arms with an
+      identical plan: 894 s baseline, 863 s candidate; re\-run at 1200 s
+      on both arms\).
+    - Deferred \(ledger\): the LEFT\-join inner\-unique arm and the
+      nested\-loop inner\-unique arm \(M0145\-0008l\'s row\).
+  Movement: TPC\-DS SF0.25 divergent 92 → 91, SF1 91 → 90
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
@@ -21275,6 +21303,9 @@ M0146-0001 re-baseline census on the new default arm.
     `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
     and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
     goopg reference cluster holds unpadded `char\(n\)` values.
+  - TPC\-H checked read\-only 2026\-09\-25 \(M0146\-0005e loop\): the goopg
+    TPC\-H cluster pads `char\(n\)` \(`l\_shipmode` reads back with
+    `octet\_length` 10\), so only the TPC\-DS clusters are affected.
 
   > ## ESCALATION 2026\-09\-25 — stale measurement data skews plan parity
   >

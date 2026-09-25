@@ -1,0 +1,2 @@
+89d88
+< Q96 depth=5 [join-method] under Partial Aggregate: PG Nested Loop Inner | goopg Hash Join Inner

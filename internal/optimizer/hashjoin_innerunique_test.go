@@ -30,11 +30,23 @@ func r90UniqueFixture(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelO
 	return s, joinrel, outer, inner, keys
 }
 
+func r90InnerJoinSelectivity(s *searchCtx, keys []*restrictInfo) float64 {
+	sel := 1.0
+	for _, ri := range keys {
+		cs, _ := s.joinClauseSelectivityExt(ri)
+		sel *= cs
+	}
+	return clampSelectivity(sel)
+}
+
 func TestHashJoinFinalCostInputProvesCompleteBareUniqueInner(t *testing.T) {
 	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
-	got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys)
-	if !got.innerUnique || got.outerMatchFrac != 0.5 {
-		t.Fatalf("final input = %+v, want unique inner with total-coordinate fraction 0.5", got)
+	got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
+	// M0146-0005e: PG's inner-join factors are the clause selectivity and
+	// the inner rel's row count, not joinrel rows / outer rows.
+	want := r90InnerJoinSelectivity(s, keys)
+	if !got.innerUnique || got.outerMatchFrac != want || got.matchCount != inner.Rows {
+		t.Fatalf("final input = %+v, want unique inner, fraction %g, match count %g", got, want, inner.Rows)
 	}
 }
 
@@ -47,13 +59,14 @@ func TestHashJoinFinalCostInputEvaluatesTwoUniqueOrientationsIndependently(t *te
 	}
 	outer.CheapestTotal = &Path{Rel: outer, Rows: outer.Rows}
 
-	forward := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys)
-	reverse := s.hashJoinFinalCostInputFor(joinrel, inner, outer, parser.JoinInner, keys)
-	if !forward.innerUnique || forward.outerMatchFrac != 0.5 {
-		t.Fatalf("forward input = %+v, want unique inner and 0.5", forward)
+	forward := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
+	reverse := s.hashJoinFinalCostInputFor(joinrel, inner, outer, parser.JoinInner, keys, keys)
+	want := r90InnerJoinSelectivity(s, keys)
+	if !forward.innerUnique || forward.outerMatchFrac != want || forward.matchCount != inner.Rows {
+		t.Fatalf("forward input = %+v, want unique inner, %g and match count %g", forward, want, inner.Rows)
 	}
-	if !reverse.innerUnique || reverse.outerMatchFrac != 1 {
-		t.Fatalf("reverse input = %+v, want unique inner and clamped 1", reverse)
+	if !reverse.innerUnique || reverse.outerMatchFrac != want || reverse.matchCount != outer.Rows {
+		t.Fatalf("reverse input = %+v, want unique inner, %g and match count %g", reverse, want, outer.Rows)
 	}
 }
 
@@ -98,7 +111,7 @@ func TestHashJoinFinalCostInputDeclinesUnsoundEvidence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, joinrel, outer, inner, keys := r90UniqueFixture(t)
 			jt := tc.mut(s, joinrel, outer, inner, keys)
-			if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys); got.innerUnique {
+			if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys); got.innerUnique {
 				t.Fatalf("final input = %+v; unsound evidence must decline", got)
 			}
 		})
@@ -117,8 +130,8 @@ func TestHashJoinFinalCostInputDeclinesPartialUniqueIndex(t *testing.T) {
 	if !partial {
 		t.Fatal("fixture has no composite unique index to mark partial")
 	}
-	if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys); got != (hashJoinFinalCostInput{}) {
-		t.Fatalf("partial unique input = %+v, want zero-value old-cost path", got)
+	if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys); got.innerUnique {
+		t.Fatalf("partial unique input = %+v, want the non-unique path", got)
 	}
 }
 
@@ -134,7 +147,7 @@ func TestHashJoinInnerUniqueFinalCostUsesRoundToEvenWhenGeometryDeclines(t *test
 	// rint(5 * .5) is 2, not 3. Width zero declines R91's PG virtual
 	// geometry, so this pins R90's matched term in isolation.
 	build := (cp.cpuOperatorCost + cp.cpuTupleCost) * 10
-	wantUnique := build + cp.cpuOperatorCost*5 + cp.cpuOperatorCost*2*1*0.5
+	wantUnique := build + cp.cpuOperatorCost*5 + cp.cpuOperatorCost*2*1*0.5 + cp.cpuTupleCost*2
 	if got := hashJoinCost(cp, unique).Total; math.Abs(got-wantUnique) > 1e-12 {
 		t.Fatalf("unique total = %.12g, want %.12g", got, wantUnique)
 	}
@@ -172,8 +185,8 @@ func TestHashJoinInnerUniqueUsesSharedTotalCoordinateFractionForPartialOuter(t *
 	// rint(3*.5)=2. Both multiply the same rel-level .5, with no second worker
 	// divisor and with the complete ten-row inner build retained.
 	build := (cp.cpuOperatorCost + cp.cpuTupleCost) * 10
-	wantSerial := build + cp.cpuOperatorCost*10 + cp.cpuOperatorCost*5*1*0.5 + cp.cpuOperatorCost*5*1*0.05
-	wantPartial := build + cp.cpuOperatorCost*3 + cp.cpuOperatorCost*2*1*0.5 + cp.cpuOperatorCost*1*1*0.05
+	wantSerial := build + cp.cpuOperatorCost*10 + cp.cpuOperatorCost*5*1*0.5 + cp.cpuOperatorCost*5*1*0.05 + cp.cpuTupleCost*5
+	wantPartial := build + cp.cpuOperatorCost*3 + cp.cpuOperatorCost*2*1*0.5 + cp.cpuOperatorCost*1*1*0.05 + cp.cpuTupleCost*2
 	if got := hashJoinCost(cp, serial).Total; math.Abs(got-wantSerial) > 1e-12 {
 		t.Fatalf("serial total = %.12g, want %.12g", got, wantSerial)
 	}
@@ -189,12 +202,18 @@ func TestHashJoinFinalCostInputPreservesNonInnerJoinTypes(t *testing.T) {
 		innerBucketSize: 0.1, innerWidth: 48,
 	}
 	want := hashJoinCost(s.cp, base)
-	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
-		if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys); got != (hashJoinFinalCostInput{}) {
+	// LEFT takes PG's non-unique arm: no Inner Unique factors, but
+	// approx_tuple_count's hash-clause selectivity (M0146-0005e).
+	left := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinLeft, keys, keys)
+	if left.innerUnique || left.hashClauseSel != r90InnerJoinSelectivity(s, keys) {
+		t.Fatalf("LEFT input = %+v, want non-unique with the hash-clause selectivity", left)
+	}
+	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
+		if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys); got != (hashJoinFinalCostInput{}) {
 			t.Fatalf("jointype %v input = %+v, want zero-value preservation", jt, got)
 		}
 		candidate := base
-		candidate.final = s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys)
+		candidate.final = s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys)
 		if got := hashJoinCost(s.cp, candidate); got != want {
 			t.Fatalf("jointype %v final cost = %+v, want unchanged %+v", jt, got, want)
 		}
@@ -271,7 +290,7 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 				partial.Children[0].Rows, partial.Children[1].Rows, inner.Rows)
 		}
 
-		final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys)
+		final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
 		bucket := s.estimateHashBucketSize(keys, inner.Relids)
 		wantSerial := hashJoinCost(s.cp, hashJoinInputs{
 			outer: serial.Children[0].Cost, inner: serial.Children[1].Cost,
@@ -300,4 +319,42 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 			t.Fatalf("partial cost = %+v, want %+v", partial.Cost, wantPartial)
 		}
 	})
+}
+
+// TestHashJoinInnerUniqueReproducesPGQ31WebSalesDateDim pins M0146-0005e on
+// PG 18.3's own numbers for TPC-DS SF0.25 Q31's ws CTE: web_sales hashed
+// against a date_dim build unique on d_date_sk costs 3067.6..10083.57 in PG
+// (final_cost_hashjoin trace: hashjointuples = 2). PG's inner-join
+// outer_match_frac is the clause selectivity 1/73049, so rint(179956/73049)
+// = 2 outer rows count as matched and the other 179954 pay only the
+// unmatched virtual-bucket walk.
+func TestHashJoinInnerUniqueReproducesPGQ31WebSalesDateDim(t *testing.T) {
+	cp := defaultCostParams()
+	in := hashJoinInputs{
+		outer: Cost{Startup: 0, Total: 6543.56}, inner: Cost{Startup: 0, Total: 2154.49},
+		outerRows: 179956, innerRows: 73049, outputRows: 179914, numHashClauses: 1,
+		innerBucketSize: 1.0 / 73049, innerWidth: 12,
+		final: hashJoinFinalCostInput{innerUnique: true, outerMatchFrac: 1.0 / 73049, matchCount: 73049},
+	}
+	got := hashJoinCost(cp, in)
+	if math.Abs(got.Startup-3067.6025) > 0.01 || math.Abs(got.Total-10083.57) > 0.01 {
+		t.Fatalf("cost = %+v, want PG's 3067.60..10083.57", got)
+	}
+}
+
+// TestHashJoinNonUniqueChargesApproxTupleCount pins PG's non-unique
+// hashjointuples: approx_tuple_count = sel * outer path rows * inner path
+// rows, independent of the joinrel's own row estimate. On TPC-H Q10 PG's
+// Parallel Hash of lineitem ⋈ orders probed by customer charges 6119 tuples
+// (62500 * 14687 / 150000), not the joinrel's 24479 per-worker rows.
+func TestHashJoinNonUniqueChargesApproxTupleCount(t *testing.T) {
+	cp := defaultCostParams()
+	base := hashJoinInputs{outerRows: 62500, innerRows: 14687, outputRows: 24479, numHashClauses: 1}
+	approx := base
+	approx.final = hashJoinFinalCostInput{hashClauseSel: 1.0 / 150000}
+	got := hashJoinCost(cp, approx).Total - hashJoinCost(cp, base).Total
+	want := cp.cpuTupleCost * (6120 - 24479) // clamp_row_est(6119.58) = 6120
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("approx delta = %.6f, want %.6f", got, want)
+	}
 }
