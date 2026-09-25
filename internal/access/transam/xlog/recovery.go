@@ -5287,9 +5287,18 @@ func replayExistingXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN st
 	return mgr.WriteBlock(block.Rel, block.Block, page)
 }
 
-// sizeOfXLHPFreezePlan is one xlhp_freeze_plan: xmax(4) + t_infomask2(2) +
-// t_infomask(2) + frzflags(1) + ntuples(2).
-const sizeOfXLHPFreezePlan = 11
+// sizeOfXLHPFreezePlan is sizeof(xlhp_freeze_plan) (heapam_xlog.h): xmax(4) +
+// t_infomask2(2) + t_infomask(2) + frzflags(1) + one byte of alignment padding
+// + ntuples(2). Both PG's emitter (log_heap_prune_and_freeze registers
+// `sizeof(xlhp_freeze_plan) * nplans`) and its redo / heapdesc.c (which cast
+// the block data to the struct array) use the padded size, so ntuples sits at
+// offset 10.
+const sizeOfXLHPFreezePlan = 12
+
+// sizeOfLegacyXLHPFreezePlan is the unpadded 11-byte plan goopg wrote before
+// M-NIGHTLY freeze-WAL (ntuples at offset 9). Replay still reads it so WAL
+// written by an older build recovers; see decodeXLogHeapPrune.
+const sizeOfLegacyXLHPFreezePlan = 11
 
 // decodeXLogHeapPrune parses a PG xl_heap_prune record's main data + block-0
 // sub-records into goopg's page-mutation inputs: the HOT redirect pairs, the
@@ -5321,13 +5330,21 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, dea
 		if _, e = read16(); e != nil { // pad2
 			return nil, nil, nil, nil, e
 		}
+		// Every field of a PG-layout block-0 payload is a multiple of two
+		// bytes, so its length is always even. The legacy goopg layout (one
+		// unpadded 11-byte plan, the only shape goopg ever wrote) is always
+		// odd: an odd length identifies it unambiguously.
+		planSize, ntuplesAt := sizeOfXLHPFreezePlan, 10
+		if len(blockData)%2 == 1 {
+			planSize, ntuplesAt = sizeOfLegacyXLHPFreezePlan, 9
+		}
 		for i := 0; i < int(nplans); i++ {
-			if off+sizeOfXLHPFreezePlan > len(blockData) {
+			if off+planSize > len(blockData) {
 				return nil, nil, nil, nil, fmt.Errorf("wal: truncated xlog heap-prune freeze plan")
 			}
-			ntuples := binary.LittleEndian.Uint16(blockData[off+9 : off+11])
+			ntuples := binary.LittleEndian.Uint16(blockData[off+ntuplesAt : off+ntuplesAt+2])
 			nFreezeTuples += int(ntuples)
-			off += sizeOfXLHPFreezePlan
+			off += planSize
 		}
 	}
 	if flags&xlhpHasRedirections != 0 {

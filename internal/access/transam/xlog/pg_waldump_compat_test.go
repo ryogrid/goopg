@@ -22,6 +22,8 @@ func findPGWaldump(t *testing.T) string {
 		return p
 	}
 	candidates := []string{
+		// This package sits four levels below the repository root.
+		filepath.Join("..", "..", "..", "..", "postgres", "local_install", "bin", "pg_waldump"),
 		filepath.Join("..", "..", "postgres", "local_install", "bin", "pg_waldump"),
 		filepath.Join("postgres", "local_install", "bin", "pg_waldump"),
 	}
