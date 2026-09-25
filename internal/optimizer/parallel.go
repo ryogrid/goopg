@@ -670,6 +670,11 @@ func stampParallelScan(n Node) Node {
 		// claim set will ever serve (and mislabel it "Parallel" in
 		// EXPLAIN, where PG shows the non-partial branch's ordinary serial
 		// subtree).
+		// M0145-0008s: guard-for-guard with drivingScan — a non-streaming
+		// SetOp is never a partial driver, so nothing below it is stamped.
+		if !setOpStreams(x) {
+			return n
+		}
 		left, right := x.Left, x.Right
 		if !x.LeftNonPartial {
 			left = stampParallelScan(x.Left)
@@ -804,6 +809,18 @@ func drivingScan(n Node) Node {
 		// nothing below it scanned — correct: workers divide BRANCHES, not
 		// rows, and gatherChildPlan's panic guard is answered by the two
 		// claim flags, not by a stamped scan.
+		// M0145-0008s: only a STREAMING SetOp (UNION ALL, setOpStreams) is
+		// a partial driver — each worker forwarding its share of both
+		// branches is row-exact there. UNION, INTERSECT and EXCEPT compare
+		// rows across the WHOLE of both inputs; run per worker over partial
+		// inputs they lose every match whose two rows land in different
+		// workers (regress `union`: `count(*) FROM (a INTERSECT b)` gave
+		// 1660 instead of 5000). PG never builds a SetOp over partial paths
+		// (`generate_nonunion_paths`, prepunion.c, plans both children as
+		// complete paths), so a Gather may only sit BELOW such a SetOp.
+		if !setOpStreams(x) {
+			return nil
+		}
 		leftOK := x.LeftNonPartial || drivingScan(x.Left) != nil
 		rightOK := x.RightNonPartial || drivingScan(x.Right) != nil
 		if !leftOK || !rightOK {
@@ -902,6 +919,11 @@ func drivingScanCrossesSort(n Node) bool {
 		// drivingScan skips them: a claimed branch is a complete serial
 		// subplan drained by its one participant and may sort inside
 		// itself freely.
+		// M0145-0008s: guard-for-guard with drivingScan, which refuses a
+		// non-streaming SetOp outright; there is no driving scan to cross to.
+		if !setOpStreams(x) {
+			return false
+		}
 		if !x.LeftNonPartial && drivingScanCrossesSort(x.Left) {
 			return true
 		}
