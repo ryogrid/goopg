@@ -1,0 +1,24 @@
+Private PG 18.3 (EXPLAIN (COSTS OFF)), temp table t(a int, b int):
+
+WITH x AS (SELECT a, b FROM t) SELECT * FROM x
+ Seq Scan on t
+
+WITH x AS (SELECT a, b FROM t), y AS (SELECT a FROM x)
+SELECT * FROM y z1 JOIN y z2 ON z1.a = z2.a
+ Merge Join
+   Merge Cond: (z1.a = z2.a)
+   CTE y
+     ->  Seq Scan on t
+   ->  Sort
+         Sort Key: z1.a
+         ->  CTE Scan on y z1
+   ->  Sort
+         Sort Key: z2.a
+         ->  CTE Scan on y z2
+
+SELECT v FROM (WITH x AS (SELECT a AS v FROM t) SELECT v FROM x) p
+UNION ALL
+SELECT v FROM (WITH x AS (SELECT b AS v FROM t) SELECT v FROM x) q
+ Append
+   ->  Seq Scan on t
+   ->  Seq Scan on t t_1

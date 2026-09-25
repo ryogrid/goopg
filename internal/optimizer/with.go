@@ -43,6 +43,14 @@ type plannedCTE struct {
 	// (side effects run once, rows replayed) and recursive bodies
 	// (WorkTableScan protocol) never qualify.
 	inlineEligible bool
+	// materialized is the declaration's MATERIALIZED / NOT MATERIALIZED
+	// keyword ("" when absent), volatile whether the planned body calls a
+	// volatile function, and selectOwned whether the WITH belongs to a
+	// SELECT (PG's cmdType == CMD_SELECT). Together with refs they are
+	// SS_process_ctes' inline_cte gate — see inlinable. M0146-0007.
+	materialized string
+	volatile     bool
+	selectOwned  bool
 	// declSeq orders CTEs by WITH-list declaration (left to right, and an
 	// enclosing statement's list after any list declared inside a body it
 	// planned first). EXPLAIN reads it through CTEScan.DeclSeq to print the
@@ -85,6 +93,45 @@ func (e *plannedCTE) outputStats() *cteOutputStats {
 		e.synth = synthesizeCTEStats(e)
 	}
 	return e.synth
+}
+
+// inlinable is SS_process_ctes' inline_cte gate (postgres/src/backend/
+// optimizer/plan/subselect.c) for the cases goopg can express: a plain
+// non-recursive SELECT body, owned by a SELECT, referenced exactly once,
+// not written MATERIALIZED, with no volatile function. PG then plans the
+// reference as an ordinary subquery. goopg keeps the CTEScan so the body's
+// single consumer can take pushed-down quals, but runs it without the
+// materialisation fence (the executor streams it) and EXPLAIN renders it as
+// PG renders the subquery. Final only once the whole statement is planned
+// (refs), like pushQualsThroughSingleRefCTEs. M0146-0007.
+//
+// Not expressed: NOT MATERIALIZED on a multiply-referenced CTE (PG inlines
+// each reference; goopg shares one planned body between references).
+func (e *plannedCTE) inlinable() bool {
+	return e != nil && e.inlineEligible && e.selectOwned && e.refs == 1 &&
+		e.materialized != "materialized" && !e.volatile
+}
+
+// planHasVolatileExpr is contain_volatile_functions over a planned body,
+// sublinks included, using the pull-up gate's builtin list and routine
+// lookup (exprListHasVolatileBuiltin).
+func planHasVolatileExpr(n Node, cat catalog.Catalog) bool {
+	var exprs []Expr
+	walkPlanExprsDeep(n, 0, func(e Expr, _ int) { exprs = append(exprs, e) })
+	return exprListHasVolatileBuiltin(exprs, cat)
+}
+
+// markSelectOwnedCTEs flags the entries `with` declared as owned by a
+// SELECT, after preplanWithClause registered them.
+func markSelectOwnedCTEs(with *parser.WithClause) {
+	if with == nil || with.Recursive {
+		return
+	}
+	for _, cte := range with.CTEs {
+		if e := planCTEs[strings.ToLower(cte.Name)]; e != nil && e.declPos == cte.Pos() {
+			e.selectOwned = true
+		}
+	}
 }
 
 // cteDeclSeq stamps plannedCTE.declSeq. Package-global and unsynchronised,
@@ -285,6 +332,8 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 			// a single-reference qual may descend into. The WITH RECURSIVE
 			// branch above and the DML branch never set this.
 			inlineEligible: true,
+			materialized:   cte.Materialized,
+			volatile:       planHasVolatileExpr(body, cat),
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}

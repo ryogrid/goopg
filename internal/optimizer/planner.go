@@ -1216,6 +1216,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		return nil, err
 	}
 	defer restore()
+	markSelectOwnedCTEs(s.With)
 
 	if s.SetOp != nil {
 		// Flatten the right-associative parse tree into a flat list of

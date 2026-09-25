@@ -106,7 +106,7 @@ func pushFilterQualsThroughCTEScan(f *Filter) {
 		return
 	}
 	scan, ok := f.Child.(*CTEScan)
-	if !ok || scan.cte == nil || !scan.cte.inlineEligible || scan.cte.refs != 1 || scan.Child == nil {
+	if !ok || scan.cte == nil || !scan.cte.inlinable() || scan.Child == nil {
 		return
 	}
 	for _, c := range splitAnd(f.Predicate) {

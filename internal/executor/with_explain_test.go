@@ -49,11 +49,14 @@ func runExplain(t *testing.T, ctx *Context, sql string) []string {
 // inlined CTE in the plan tree. Pre-M0016-0004 the consumer
 // site appeared as a bare Values / SeqScan with no CTE
 // signal.
+//
+// The CTE is written MATERIALIZED: a plain single-reference CTE is inlined
+// (PG's inline_cte, M0146-0007) and prints no CTE Scan at all.
 func TestExplainCTEScanLabelsCTEByName(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	lines := runExplain(t, ctx, "WITH a AS (SELECT 1) SELECT * FROM a")
+	lines := runExplain(t, ctx, "WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a")
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "CTE Scan on a") {
 		t.Errorf("EXPLAIN output missing 'CTE Scan on a':\n%s", joined)
@@ -66,7 +69,7 @@ func TestExplainCTEScanShowsAlias(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	lines := runExplain(t, ctx, "WITH a AS (SELECT 1) SELECT * FROM a x")
+	lines := runExplain(t, ctx, "WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a x")
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "CTE Scan on a x") {
 		t.Errorf("EXPLAIN output missing 'CTE Scan on a x':\n%s", joined)
@@ -80,7 +83,7 @@ func TestExplainCTEScanRecursesIntoChild(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	lines := runExplain(t, ctx, "WITH a AS (SELECT 1) SELECT * FROM a")
+	lines := runExplain(t, ctx, "WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a")
 	if len(lines) < 2 {
 		t.Fatalf("expected at least 2 EXPLAIN lines, got %d:\n%s", len(lines), strings.Join(lines, "\n"))
 	}
@@ -107,7 +110,7 @@ func TestExplainCTEScanAnalyzeReportsActualRows(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE WITH a AS (SELECT 1) SELECT * FROM a")
+	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE WITH a AS MATERIALIZED (SELECT 1) SELECT * FROM a")
 	joined := strings.Join(lines, "\n")
 	cteLine := ""
 	for _, l := range lines {

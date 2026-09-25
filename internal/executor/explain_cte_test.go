@@ -111,9 +111,11 @@ func TestExplainCTESectionIndentAndOrder(t *testing.T) {
 // TestExplainCTESectionDeclarationOrder: `y` references `x`, so a render-order
 // hoist would print `CTE y` first. PG prints declaration order (SS_process_ctes
 // walks the WITH list left to right), which is what CTEScan.DeclSeq restores.
+// x is written MATERIALIZED: referenced once (from y), it would otherwise be
+// inlined into y's body and print no section (M0146-0007).
 func TestExplainCTESectionDeclarationOrder(t *testing.T) {
 	lines := cteExplainLines(t,
-		"WITH x AS (SELECT a, b FROM t), y AS (SELECT a FROM x) "+
+		"WITH x AS MATERIALIZED (SELECT a, b FROM t), y AS (SELECT a FROM x) "+
 			"SELECT * FROM y z1 JOIN y z2 ON z1.a = z2.a")
 	joined := strings.Join(lines, "\n")
 	xi, yi := -1, -1
@@ -174,21 +176,28 @@ func TestExplainGroupingSetsSharedSourceSectioned(t *testing.T) {
 	}
 }
 
-// TestExplainSingleReferenceCTEStillSectioned: PG sections a CTE even at one
-// reference (the third capture — `CTE Scan on x` at the root with `CTE x`
-// beneath it), so goopg must not special-case refs==1 into the old inline
-// shape.
-func TestExplainSingleReferenceCTEStillSectioned(t *testing.T) {
+// TestExplainSingleReferenceCTEInlined: PG 18 inlines a single-reference
+// CTE (inline_cte), so `WITH x AS (SELECT a, b FROM t) SELECT * FROM x`
+// prints just `Seq Scan on t` — no `CTE x` section and no `CTE Scan`
+// (live capture, private PG 18.3). M0146-0007.
+func TestExplainSingleReferenceCTEInlined(t *testing.T) {
 	lines := cteExplainLines(t, "WITH x AS (SELECT a, b FROM t) SELECT * FROM x")
 	joined := strings.Join(lines, "\n")
-	if countLinesContaining(lines, "CTE Scan on x") != 1 {
-		t.Errorf("want the reference line:\n%s", joined)
-	}
-	if countLinesContaining(lines, "CTE x") != 1 {
-		t.Errorf("want the section heading:\n%s", joined)
+	if countLinesContaining(lines, "CTE") != 0 {
+		t.Errorf("an inlined CTE prints no section and no CTE Scan:\n%s", joined)
 	}
 	if countLinesContaining(lines, "Scan on t") != 1 {
 		t.Errorf("want the body exactly once:\n%s", joined)
+	}
+}
+
+// TestExplainMaterializedSingleReferenceCTEStillSectioned: MATERIALIZED keeps
+// the fence even at one reference, as SS_process_ctes does.
+func TestExplainMaterializedSingleReferenceCTEStillSectioned(t *testing.T) {
+	lines := cteExplainLines(t, "WITH x AS MATERIALIZED (SELECT a, b FROM t) SELECT * FROM x")
+	joined := strings.Join(lines, "\n")
+	if countLinesContaining(lines, "CTE Scan on x") != 1 || countLinesContaining(lines, "CTE x") != 1 {
+		t.Errorf("want the reference line and the section heading:\n%s", joined)
 	}
 }
 
@@ -204,9 +213,9 @@ func TestExplainSingleReferenceCTEStillSectioned(t *testing.T) {
 // two same-named declarations give two `CTE x` headings.
 func TestExplainSameNameDisjointScopesSectionedTwice(t *testing.T) {
 	lines := cteExplainLines(t,
-		`SELECT v FROM (WITH x AS (SELECT a AS v FROM t) SELECT v FROM x) p
+		`SELECT v FROM (WITH x AS MATERIALIZED (SELECT a AS v FROM t) SELECT v FROM x) p
 		 UNION ALL
-		 SELECT v FROM (WITH x AS (SELECT b AS v FROM t) SELECT v FROM x) q`)
+		 SELECT v FROM (WITH x AS MATERIALIZED (SELECT b AS v FROM t) SELECT v FROM x) q`)
 	joined := strings.Join(lines, "\n")
 
 	sections := 0

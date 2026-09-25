@@ -112,6 +112,13 @@ func collectCTEHoist(root optimizer.Node) *cteHoist {
 				// its own; claiming one here prints `CTE <name>` twice.
 				return
 			}
+			if scan.Inlined() {
+				// PG inlined it: the body renders in place, with no
+				// `CTE <name>` section. Its own CTE references still
+				// need theirs. M0146-0007.
+				walk(scan.Child)
+				return
+			}
 			key := scan.DeclKey()
 			if _, claimed := h.byDecl[key]; claimed {
 				// A second reference to an already-claimed name. Do NOT

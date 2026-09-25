@@ -1803,6 +1803,12 @@ func (n *MaterializedCTEScan) Pos() int       { return n.pos }
 func (n *MaterializedCTEScan) nodeTag()       {}
 func (n *MaterializedCTEScan) Output() Schema { return n.schema }
 
+// Inlined reports whether PG would have inlined this reference's CTE into
+// an ordinary subquery (plannedCTE.inlinable). The executor then streams
+// the body instead of materialising it, and EXPLAIN renders it in place of
+// a `CTE <name>` section. Meaningful once planning has finished.
+func (n *CTEScan) Inlined() bool { return n != nil && n.cte.inlinable() }
+
 func (n *CTEScan) Pos() int       { return n.pos }
 func (n *CTEScan) Output() Schema { return n.schema }
 

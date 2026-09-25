@@ -31,6 +31,7 @@ func cipScan(refs int, eligible bool) (*CTEScan, *SeqScan) {
 		schema:         Schema{ijCol("y"), ijCol("cnt")},
 		refs:           refs,
 		inlineEligible: eligible,
+		selectOwned:    eligible,
 	}
 	return &CTEScan{Name: "s", Alias: "s", Child: body, schema: ce.schema, cte: ce}, body
 }
@@ -133,6 +134,7 @@ func TestCTEBodyPushCrossesGatherMerge(t *testing.T) {
 		schema:         Schema{ijCol("y"), ijCol("total")},
 		refs:           1,
 		inlineEligible: true,
+		selectOwned:    true,
 	}
 	scan := &CTEScan{Name: "s", Alias: "s", Child: agg, schema: ce.schema, cte: ce}
 	f := &Filter{Child: scan, Predicate: ijEq(0, "y", 1998)}
@@ -455,5 +457,42 @@ func TestCTEBodyPushEndToEndDeclinesAggOutput(t *testing.T) {
 	}
 	if lf := cipBodyLeafFilters(scan.Child); len(lf) != 0 {
 		t.Errorf("aggregate-output qual crossed below the aggregate (%d body Filter(s)):\n%s", len(lf), plan)
+	}
+}
+
+// TestCTEInlinableFollowsInlineCTEGate pins M0146-0007: plannedCTE.inlinable
+// is SS_process_ctes' inline_cte gate — one reference, a plain SELECT body
+// owned by a SELECT, not MATERIALIZED, no volatile function. Each decline
+// keeps the CTE as a materialised CTE Scan (and keeps quals out of its
+// body), as PG does.
+func TestCTEInlinableFollowsInlineCTEGate(t *testing.T) {
+	base := func() *plannedCTE {
+		return &plannedCTE{name: "s", refs: 1, inlineEligible: true, selectOwned: true}
+	}
+	if !base().inlinable() {
+		t.Fatal("a single-reference plain SELECT CTE must inline")
+	}
+	cases := map[string]func(*plannedCTE){
+		"two references":     func(e *plannedCTE) { e.refs = 2 },
+		"MATERIALIZED":       func(e *plannedCTE) { e.materialized = "materialized" },
+		"volatile body":      func(e *plannedCTE) { e.volatile = true },
+		"DML-owned WITH":     func(e *plannedCTE) { e.selectOwned = false },
+		"recursive/DML body": func(e *plannedCTE) { e.inlineEligible = false },
+	}
+	for name, mut := range cases {
+		e := base()
+		mut(e)
+		if e.inlinable() {
+			t.Errorf("%s: must not inline", name)
+		}
+	}
+	e := base()
+	e.materialized = "not materialized"
+	if !e.inlinable() {
+		t.Error("NOT MATERIALIZED with one reference must inline")
+	}
+	var nilScan *CTEScan
+	if nilScan.Inlined() || (&CTEScan{}).Inlined() {
+		t.Error("a scan without a WITH-list entry is never inlined")
 	}
 }

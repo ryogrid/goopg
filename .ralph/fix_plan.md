@@ -21639,6 +21639,31 @@ M0146-0001 re-baseline census on the new default arm.
   shallower) and fold or keep per measurement.
   Kind: impl
   Parent: none
+  - Design doc `docs/design/0100\-0149/m0146\-0007\-inline\-cte.md`.
+  - Slice 1 landed 2026\-09\-26 as M0146\-0007a \(below\); 0007b and the
+    ledgered items remain.
+- [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
+  Kind: impl
+  Parent: M0146\-0007
+  - **DONE 2026\-09\-26.** Evidence `analysis/m0146/m0146\-0007/slice1/`.
+    - `plannedCTE.inlinable` is SS\_process\_ctes\' gate; an inlined
+      reference streams its body \(no CTERowCache\) and EXPLAIN prints the
+      body in place, or `Subquery Scan on x` when a qual sits on it.
+    - The pushdown pass uses the same gate \(MATERIALIZED, volatile and
+      DML\-owned CTEs no longer take pushed quals\).
+    - 13 TPC\-DS records per scale move past the `CTE` node; sweep 96/96;
+      TPC\-H census identical; regress 41 cases unchanged vs HEAD.
+  Movement: TPC\-DS Q2 Q5 Q33 Q51 Q54 Q56 Q58 Q60 Q64 Q77 Q78 Q80 Q83 Q97 records leave the CTE node \(SF0.25 and SF1\)
+- [ ] **M0146\-0007b — move \(not copy\) a qual pushed into an inlined CTE**
+  \(filed 2026\-09\-26 by M0146\-0007a\). PG\'s subquery\_push\_qual moves
+  the qual; goopg keeps the outer copy, so TPC\-DS Q78 prints
+  `Subquery Scan on ss  Filter: \(ss\_sold\_year = 1998\)` where PG has none.
+  Kind: impl
+  Parent: M0146\-0007
+  - First step: prove `remapConjunctThroughProjection` exact for unnamed
+    refs \(the seam that keeps `pushConjunctTraced`\'s `\*Project` arm at
+    `proven = false`\), then thread the move proof through
+    `pushConjunctIntoCTEBody` and drop proven conjuncts from the residual.
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the

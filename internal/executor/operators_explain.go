@@ -494,6 +494,14 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		walkPlanFiltered(f.Child, indent, rows, opts, next, nextNode, reg)
 		return
 	}
+	// An inlined CTE is an ordinary subquery in PG, and setrefs removes a
+	// subquery scan that carries no qual (trivial_subqueryscan), so the
+	// body prints in its place. With a qual it stays a `Subquery Scan`
+	// (describePlanVerbose). M0146-0007.
+	if cs, ok := n.(*optimizer.CTEScan); ok && attachedFilter == nil && cs.Inlined() {
+		walkPlanFiltered(cs.Child, indent, rows, opts, nil, nil, reg)
+		return
+	}
 
 	// PG-faithful cumulative indent (postgres/src/backend/commands/explain.c
 	// ExplainNode, ~1616-1635): `indent` here is `es->indent` as seen on
@@ -2622,6 +2630,11 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, next, nextNode, fr, reg)
 		return
 	}
+	// Twin of walkPlanFiltered's inlined-CTE pass-through (M0146-0007).
+	if cs, ok := n.(*optimizer.CTEScan); ok && attachedFilter == nil && cs.Inlined() {
+		walkPlanAnalyzeFiltered(cs.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
+		return
+	}
 
 	// PG-faithful cumulative indent — see walkPlanFiltered's twin comment
 	// (postgres/src/backend/commands/explain.c:1616-1635, ExplainNode) for
@@ -3672,6 +3685,14 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 				return fmt.Sprintf("WorkTable Scan on %s %s", p.Name, p.Alias)
 			}
 			return fmt.Sprintf("WorkTable Scan on %s", p.Name)
+		}
+		// An inlined CTE is PG's subquery RTE, named by its reference.
+		if p.Inlined() {
+			alias := p.Alias
+			if alias == "" {
+				alias = p.Name
+			}
+			return "Subquery Scan on " + alias
 		}
 		// Mirrors upstream's "CTE Scan on <name>" label; the
 		// alias is rendered separately when distinct so output

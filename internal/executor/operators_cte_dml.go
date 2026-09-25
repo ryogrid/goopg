@@ -366,6 +366,14 @@ func (o *cteScanOp) Open(ctx *Context) error {
 		o.streaming = true
 		return o.child.Open(ctx)
 	}
+	// An inlined CTE (PG's inline_cte: one reference, no MATERIALIZED, no
+	// volatile function) is an ordinary subquery in PG, which runs its body
+	// in-line — there is no second reference to replay for, and a rescan
+	// re-executes it. Stream it the same way. M0146-0007.
+	if o.plan.Inlined() {
+		o.streaming = true
+		return o.child.Open(ctx)
+	}
 
 	// Key by DECLARATION, not by name: `WITH x` in two disjoint scopes is two
 	// declarations that must materialize separately, and keying by "x" made

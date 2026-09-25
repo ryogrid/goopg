@@ -1,0 +1,99 @@
+2c2
+< Q2 depth=2 [join-order] under CTE: PG Finalize HashAggregate | goopg Append
+---
+> Q2 depth=2 [aggregation-strategy] under CTE: PG Finalize HashAggregate | goopg HashAggregate
+5c5
+< Q5 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ssr
+---
+> Q5 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+33c33
+< Q33 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ss
+---
+> Q33 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+51c51
+< Q51 depth=1 [scan-type] under Limit: PG Subquery Scan on y | goopg CTE web_v1
+---
+> Q51 depth=1 [scan-type] under Limit: PG Subquery Scan on y | goopg WindowAgg
+54c54
+< Q54 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg CTE my_customers
+---
+> Q54 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+56c56
+< Q56 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ss
+---
+> Q56 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+58c58
+< Q58 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg CTE ss_items
+---
+> Q58 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+60c60
+< Q60 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg CTE ss
+---
+> Q60 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+64c64
+< Q64 depth=2 [qual-placement] under CTE: PG GroupAggregate | goopg GroupAggregate
+---
+> Q64 depth=3 [sort-strategy] under GroupAggregate: PG Incremental Sort | goopg Sort
+77,78c77,78
+< Q77 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ss
+< Q78 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ws
+---
+> Q77 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+> Q78 depth=2 [join-order] under Sort: PG Merge Join Left | goopg Merge Join Left
+80c80
+< Q80 depth=1 [sort-strategy] under Limit: PG Sort | goopg CTE ssr
+---
+> Q80 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+83c83
+< Q83 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg CTE sr_items
+---
+> Q83 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+97c97
+< Q97 depth=1 [join-order] under Limit: PG Aggregate | goopg CTE ssci
+---
+> Q97 depth=2 [join-order] under Aggregate: PG Merge Join Full | goopg Merge Join Full
+101c101
+< CATEGORY-ROLLUP: sort-strategy=35 qual-placement=14 aggregation-strategy=12 parallelism=8 join-method=7 join-order=5 scan-type=4 parameterisation=3 error=3
+---
+> CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 qual-placement=13 parallelism=8 join-method=7 join-order=5 scan-type=4 parameterisation=3 error=3
+103c103,104
+<     5  sort-strategy    under Limit            PG Incremental Sort             goopg Sort                         depth=1
+---
+>     9  sort-strategy    under Limit            PG Incremental Sort             goopg Sort                         depth=1
+>     4  aggregation-strategy under Sort             PG MixedAggregate               goopg HashAggregate                depth=2
+105c106
+<     3  sort-strategy    under Limit            PG Sort                         goopg CTE ss                       depth=1
+---
+>     4  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=2
+111d111
+<     2  sort-strategy    under Limit            PG Sort                         goopg CTE ssr                      depth=1
+113d112
+<     2  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=2
+124c123
+<     1  join-order       under CTE              PG Finalize HashAggregate       goopg Append                       depth=2
+---
+>     1  aggregation-strategy under CTE              PG Finalize HashAggregate       goopg HashAggregate                depth=2
+132d130
+<     1  aggregation-strategy under Sort             PG MixedAggregate               goopg HashAggregate                depth=2
+144,145c142
+<     1  scan-type        under Limit            PG Subquery Scan on y           goopg CTE web_v1                   depth=1
+<     1  sort-strategy    under Limit            PG Incremental Sort             goopg CTE my_customers             depth=1
+---
+>     1  scan-type        under Limit            PG Subquery Scan on y           goopg WindowAgg                    depth=1
+147d143
+<     1  sort-strategy    under Limit            PG Incremental Sort             goopg CTE ss_items                 depth=1
+149,150c145
+<     1  sort-strategy    under Limit            PG Incremental Sort             goopg CTE ss                       depth=1
+<     1  qual-placement   under CTE              PG GroupAggregate               goopg GroupAggregate               depth=2
+---
+>     1  sort-strategy    under GroupAggregate   PG Incremental Sort             goopg Sort                         depth=3
+155c150
+<     1  sort-strategy    under Limit            PG Sort                         goopg CTE ws                       depth=1
+---
+>     1  join-order       under Sort             PG Merge Join Left              goopg Merge Join Left              depth=2
+157d151
+<     1  sort-strategy    under Limit            PG Incremental Sort             goopg CTE sr_items                 depth=1
+163c157
+<     1  join-order       under Limit            PG Aggregate                    goopg CTE ssci                     depth=1
+---
+>     1  join-order       under Aggregate        PG Merge Join Full              goopg Merge Join Full              depth=2
