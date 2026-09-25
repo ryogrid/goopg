@@ -1,0 +1,1 @@
+ok  	github.com/goopg/goopg/internal/testport	304.767s

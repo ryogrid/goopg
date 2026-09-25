@@ -20507,7 +20507,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Found a PRE\-EXISTING wrong result with the same root → M0145\-0008m.
     Movement: none — no corpus plan changed; a regress case's panic is gone.
 
-- [ ] **M0145\-0008m — WRONG RESULTS: a PK\-dependent column reads NULL when
+- [x] **M0145\-0008m — WRONG RESULTS: a PK\-dependent column reads NULL when
   grouping elects an index\-ordered input** \(found 2026\-09\-24 by
   M0145\-0008h; reproduces at HEAD `714738019`\). `SELECT sum\(c1\), c2 FROM
   agg\_sort\_order GROUP BY c1` \(c1 PRIMARY KEY\) returns `1|`, `2|`, … with c2
@@ -20527,6 +20527,16 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     passthroughs before grouping paths are built, or make the lazy append
     re\-validate the elected child and fall back to a plain\-scan input.
     Pin with the values probe in `analysis/m0145/m0145\-0008h/probe.txt`.
+  - **DONE 2026\-09\-25 \(`356cb8b11`\).** Design doc
+    `docs/design/0100\-0149/m0145\-0008m\-funcdep\-passthrough\-before\-election.md`;
+    evidence `analysis/m0145/m0145\-0008m/`.
+    - `prefetchFuncDepPassthroughs` resolves the target list / ORDER BY /
+      DISTINCT ON columns before `createGroupingPaths`, skipping aggregate
+      arguments, sub\-selects and grouping sub\-expressions \(the fire set
+      caught a needless Q23 passthrough in the first cut\).
+    - Probe matches PG row for row; full `TestPort\_RegressSuite` PASS; fire
+      set none at both scales.
+  Movement: none
 
   > ## ESCALATION 2026\-09\-24 \(S2\) — wrong results
   >
