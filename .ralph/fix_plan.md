@@ -21413,7 +21413,7 @@ M0146-0001 re-baseline census on the new default arm.
       deeper at SF1; nothing got shallower. Q4\'s CTE\-join order changed
       \(6.7 s → 10.2 s, under 2x; census unchanged\).
   Movement: TPC\-DS Q31/Q44 top join now PG\'s method; SF1 Q65 depth 2 → 3
-- [ ] **M0146\-0005m — nested loops try every outer path**
+- [x] **M0146\-0005m — nested loops try every outer path**
   \(filed 2026\-09\-26 by M0146\-0005l\): `match\_unsorted\_outer`
   \(joinpath.c\) loops over every path in `outerrel\->pathlist` \(plus the
   cheapest\-startup one\) when building nested loops; goopg\'s producers use
@@ -21434,6 +21434,15 @@ M0146-0001 re-baseline census on the new default arm.
       `truncate\_useless\_pathkeys` \(PG\'s `build\_join\_pathkeys` does\), so
       every outer ordering becomes a separately kept path. Blocked on
       M0146\-0005n.
+  - **DONE 2026\-09\-26 \(re\-applied on M0146\-0005n\).** Design doc §"Slice
+    14"; evidence `analysis/m0146/m0146\-0005/slice14/`.
+    - `nestLoopOuterPaths` feeds every unparameterised outer path to
+      `addNLIPaths` and `addNestLoopPath`; JOIN\_UNIQUE\_OUTER keeps one.
+    - Census: no change at either scale \(no regressions\); Q44\'s join tree
+      is now exactly PG\'s \(its record stays on a parameterisation
+      rendering difference\). Gates pass; the sweep and arm ran FORCE=1
+      \(values\-only\) during the nightly batch, timings void.
+  Movement: none \(Q44 join tree now PG\'s\)
 - [x] **M0146\-0005n — `build\_join\_pathkeys` truncates useless pathkeys**
   \(filed 2026\-09\-26 by M0146\-0005m\): PG\'s `build\_join\_pathkeys`
   returns `truncate\_useless\_pathkeys\(root, joinrel, outer\_pathkeys\)`

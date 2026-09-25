@@ -292,11 +292,15 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		noteNLIPathGate(jt, "jointype-right")
 		return
 	}
-	o := outer.CheapestTotal
-	if uniq == uniqueSideOuter {
-		o = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
-	}
-	if o == nil || o.RequiredOuter != 0 {
+	// match_unsorted_outer (joinpath.c) builds nested loops over EVERY path
+	// in the outer rel's pathlist, not only the cheapest-total one: an ordered
+	// outer that is not the cheapest (TPC-DS Q44's rank merge join) must still
+	// reach the LIMIT's fractional election as an ordered nested loop
+	// (M0146-0005m). Only JOIN_UNIQUE_OUTER restricts the loop to the
+	// cheapest-total path, unique-ified. Outers parameterised by anything are
+	// skipped (goopg files no parameterised nested-loop result, see below).
+	outers := nestLoopOuterPaths(outer, uniq, sjinfo, cp)
+	if len(outers) == 0 {
 		noteNLIPathGate(jt, "outer-unusable")
 		return
 	}
@@ -314,85 +318,87 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			noteNLIPathGate(jt, "inner-rejected")
 		}
 	}()
-	for _, i := range inner.CheapestParameterized {
-		if i == nil || i.RequiredOuter == 0 {
-			continue
-		}
-		sawParamInner = true
-		req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
-		// try_nestloop_path's test, verbatim (joinpath.c:882-889),
-		// over this joinrel's param_source_rels (C-08 derivation,
-		// computed once per addPathsToJoinrel call).
-		if req != 0 &&
-			!relsOverlap(req, paramSrc) &&
-			!allowStarSchemaJoin(outer.Relids, i.RequiredOuter) {
-			continue
-		}
-		// The goopg-only second gate: PG accepts a still-parameterised result
-		// here (the star-schema case) and gives it a `ppi_rows` from
-		// `get_parameterized_joinrel_size`. goopg has no joinrel sizer until
-		// P5.6, so such a path would have to invent its own cardinality.
-		// Ledgered against P5.6 rather than approximated.
-		if req != 0 {
-			continue
-		}
-		residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
-		// PG offers the bare inner AND, when `get_memoize_path` returns one,
-		// the cache-wrapped inner — both to the same `try_nestloop_path`
-		// (joinpath.c:1965-1986), so `add_path` decides whether the cache pays.
-		// The residual is computed ONCE, from the bare inner: a Memoize wrapper
-		// changes nothing about which clauses the probe below it enforces, and
-		// re-deriving it per candidate would invite the two to disagree.
-		// M0127-P5.4b-ii-b-2.
-		for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
-			if in == nil {
+	for _, o := range outers {
+		for _, i := range inner.CheapestParameterized {
+			if i == nil || i.RequiredOuter == 0 {
 				continue
 			}
-			// `in.Cost` prices ONE execution with the parameter bound and
-			// `in.Rows` is its `ppi_rows` (03 §9 rule 3), so the inner's own
-			// total IS the per-outer-row rescan cost for an uncached inner —
-			// PG's `cost_rescan` default for an index scan, which caches
-			// nothing between rescans (costsize.c:4577). This is the whole
-			// reason PG re-costs the pair here instead of in the plain-NL arm,
-			// where the inner's unparameterised total would be charged per
-			// outer row. `pathRescanTotal` is the one place that knows a
-			// Memoize wrapper answers differently.
-			// take2 P2-06: as the plain nested loop above. An NLI inner is a
-			// parameterised index probe, so its "cache" is per-probe and the
-			// Memoize arm of nestLoopInnerRescanCost is the one that fires
-			// when a Memoize sits between.
-			cost := nliNestLoopCost(cp, o, in, residual, semi)
-			filed = true
-			addPath(joinrel, &Path{
-				Kind:     PathNestLoop,
-				Jointype: jt, // C-03b; see addHashJoinPath.
-				Rel:      joinrel,
-				Rows:     joinrel.Rows,
-				Cost:     cost,
-				Children: []*Path{o, in},
-				// R53 slice 1: the partition, in Children order.
-				OuterRelids: outer.Relids,
-				InnerRelids: inner.Relids,
-				Residual:    residual,
-				// The outer path's ordering survives the loop
-				// (build_join_pathkeys, match_unsorted_outer; M0146-0005l).
-				Pathkeys: buildJoinPathkeysFor(joinrel, jt, o.Pathkeys),
-				// Empty by the test above. Carried through the constructor
-				// rather than hard-coded so the star-schema case is a one-line
-				// relaxation once P5.6's sizer exists.
-				RequiredOuter: req,
-				// create_nestloop_path (pathnode.c:2590). C-19a.
-				ParallelSafe: parallelSafeWith(joinrel, o, in),
-				// initial_cost_nestloop (costsize.c:3282-3284): enable_nestloop
-				// counts on EVERY nestloop path, parameterised inner or not —
-				// PG has no separate index-nestloop switch — plus the inner
-				// and outer inputs' own counts. The plain-NL arm (pathgen.go)
-				// always had this; the NLI arm did not, which R59's probe
-				// repricing exposed: with nestloop disabled the NLI path
-				// priced below the merge join and stole a contest the test
-				// fixture had closed to every nestloop.
-				DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
-			}, "nestloop.index")
+			sawParamInner = true
+			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
+			// try_nestloop_path's test, verbatim (joinpath.c:882-889),
+			// over this joinrel's param_source_rels (C-08 derivation,
+			// computed once per addPathsToJoinrel call).
+			if req != 0 &&
+				!relsOverlap(req, paramSrc) &&
+				!allowStarSchemaJoin(outer.Relids, i.RequiredOuter) {
+				continue
+			}
+			// The goopg-only second gate: PG accepts a still-parameterised result
+			// here (the star-schema case) and gives it a `ppi_rows` from
+			// `get_parameterized_joinrel_size`. goopg has no joinrel sizer until
+			// P5.6, so such a path would have to invent its own cardinality.
+			// Ledgered against P5.6 rather than approximated.
+			if req != 0 {
+				continue
+			}
+			residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)
+			// PG offers the bare inner AND, when `get_memoize_path` returns one,
+			// the cache-wrapped inner — both to the same `try_nestloop_path`
+			// (joinpath.c:1965-1986), so `add_path` decides whether the cache pays.
+			// The residual is computed ONCE, from the bare inner: a Memoize wrapper
+			// changes nothing about which clauses the probe below it enforces, and
+			// re-deriving it per candidate would invite the two to disagree.
+			// M0127-P5.4b-ii-b-2.
+			for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+				if in == nil {
+					continue
+				}
+				// `in.Cost` prices ONE execution with the parameter bound and
+				// `in.Rows` is its `ppi_rows` (03 §9 rule 3), so the inner's own
+				// total IS the per-outer-row rescan cost for an uncached inner —
+				// PG's `cost_rescan` default for an index scan, which caches
+				// nothing between rescans (costsize.c:4577). This is the whole
+				// reason PG re-costs the pair here instead of in the plain-NL arm,
+				// where the inner's unparameterised total would be charged per
+				// outer row. `pathRescanTotal` is the one place that knows a
+				// Memoize wrapper answers differently.
+				// take2 P2-06: as the plain nested loop above. An NLI inner is a
+				// parameterised index probe, so its "cache" is per-probe and the
+				// Memoize arm of nestLoopInnerRescanCost is the one that fires
+				// when a Memoize sits between.
+				cost := nliNestLoopCost(cp, o, in, residual, semi)
+				filed = true
+				addPath(joinrel, &Path{
+					Kind:     PathNestLoop,
+					Jointype: jt, // C-03b; see addHashJoinPath.
+					Rel:      joinrel,
+					Rows:     joinrel.Rows,
+					Cost:     cost,
+					Children: []*Path{o, in},
+					// R53 slice 1: the partition, in Children order.
+					OuterRelids: outer.Relids,
+					InnerRelids: inner.Relids,
+					Residual:    residual,
+					// The outer path's ordering survives the loop
+					// (build_join_pathkeys, match_unsorted_outer; M0146-0005l).
+					Pathkeys: buildJoinPathkeysFor(joinrel, jt, o.Pathkeys),
+					// Empty by the test above. Carried through the constructor
+					// rather than hard-coded so the star-schema case is a one-line
+					// relaxation once P5.6's sizer exists.
+					RequiredOuter: req,
+					// create_nestloop_path (pathnode.c:2590). C-19a.
+					ParallelSafe: parallelSafeWith(joinrel, o, in),
+					// initial_cost_nestloop (costsize.c:3282-3284): enable_nestloop
+					// counts on EVERY nestloop path, parameterised inner or not —
+					// PG has no separate index-nestloop switch — plus the inner
+					// and outer inputs' own counts. The plain-NL arm (pathgen.go)
+					// always had this; the NLI arm did not, which R59's probe
+					// repricing exposed: with nestloop disabled the NLI path
+					// priced below the merge join and stole a contest the test
+					// fixture had closed to every nestloop.
+					DisabledNodes: disabledNodesFor(!cp.enableNestLoop, o, in),
+				}, "nestloop.index")
+			}
 		}
 	}
 }
@@ -616,4 +622,27 @@ func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi 
 	}
 	cost.Total += matBuild
 	return cost
+}
+
+// nestLoopOuterPaths is the outer-path loop of match_unsorted_outer
+// (joinpath.c): every unparameterised path of the outer rel, or, for
+// JOIN_UNIQUE_OUTER, only the cheapest-total path unique-ified. A nil
+// unique-ification answers no outer at all.
+func nestLoopOuterPaths(outer *RelOptInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, cp costParams) []*Path {
+	if uniq == uniqueSideOuter {
+		if u := createUniquePath(outer, outer.CheapestTotal, sjinfo, cp); u != nil && u.RequiredOuter == 0 {
+			return []*Path{u}
+		}
+		return nil
+	}
+	var out []*Path
+	seen := make(map[*Path]bool, len(outer.Pathlist)+1)
+	for _, p := range append([]*Path{outer.CheapestTotal}, outer.Pathlist...) {
+		if p == nil || p.RequiredOuter != 0 || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
 }

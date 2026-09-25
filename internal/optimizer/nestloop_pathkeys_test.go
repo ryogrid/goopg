@@ -39,3 +39,37 @@ func TestNestLoopPathInheritsOuterPathkeys(t *testing.T) {
 		}
 	}
 }
+
+// TestNestLoopTriesEveryOuterPath pins M0146-0005m: match_unsorted_outer
+// builds nested loops over every path of the outer rel, so an ordered outer
+// that is NOT the cheapest-total one still yields an ordered nested loop for
+// the LIMIT's fractional election (TPC-DS Q44). JOIN_UNIQUE_OUTER keeps its
+// single cheapest-total outer.
+func TestNestLoopTriesEveryOuterPath(t *testing.T) {
+	cp := defaultCostParams()
+	outer := newRelOptInfo(relsetOf(0), 100, 8)
+	addPath(outer, &Path{Kind: PathSeqScan, Rel: outer, Rows: 100, Cost: Cost{Total: 10}}, "test")
+	addPath(outer, &Path{Kind: PathIndexScan, Rel: outer, Rows: 100, Cost: Cost{Total: 20}, Pathkeys: ascKeys(1)}, "test")
+	setCheapest(outer)
+	if len(outer.Pathlist) != 2 {
+		t.Fatalf("outer pathlist has %d paths, want the cheap and the ordered one", len(outer.Pathlist))
+	}
+	if got := len(nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)); got != 2 {
+		t.Fatalf("nestLoopOuterPaths = %d outers, want 2", got)
+	}
+
+	inner := newRelOptInfo(relsetOf(1), 10, 8)
+	addPath(inner, &Path{Kind: PathSeqScan, Rel: inner, Rows: 10, Cost: Cost{Total: 1}}, "test")
+	setCheapest(inner)
+	joinrel := newRelOptInfo(relsetOf(0, 1), 1000, 16)
+	addNestLoopPath(joinrel, outer, inner, cp, parser.JoinInner, nil, uniqueSideNone, nil, semiAntiJoinFactors{})
+	ordered := false
+	for _, p := range joinrel.Pathlist {
+		if len(p.Pathkeys) == 1 {
+			ordered = true
+		}
+	}
+	if !ordered {
+		t.Fatal("no ordered nested loop over the non-cheapest ordered outer")
+	}
+}

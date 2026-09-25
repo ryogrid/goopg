@@ -1,0 +1,21 @@
+== baseline
+ Limit  (cost=48149.22..255937.73 rows=100 width=984)
+   ->  Nested Loop  (cost=48149.22..255881.78 rows=150975 width=540)
+         ->  Merge Join  (cost=48148.97..49713.67 rows=150975 width=60)
+               ->  Hash Join  (cost=23956.73..24300.85 rows=5495 width=48)
+                     ->  Seq Scan on item i1  (cost=0.00..896.00 rows=18000 width=480)
+         ->  Index Scan using item_pkey on item i2  (cost=0.25..1.37 rows=1 width=480)
+== candidate
+ Limit  (cost=47014.05..460915.47 rows=100 width=984)
+   ->  Nested Loop  (cost=47014.05..460914.47 rows=150975 width=984)
+         ->  Nested Loop  (cost=47013.80..254746.36 rows=150975 width=504)
+               ->  Merge Join  (cost=47013.55..48578.25 rows=150975 width=24)
+               ->  Index Scan using item_pkey on item i1  (cost=0.25..1.37 rows=1 width=480)
+         ->  Index Scan using item_pkey on item i2  (cost=0.25..1.37 rows=1 width=480)
+== candidate-pg
+ Limit  (cost=80913.15..80929.19 rows=100 width=110)
+   ->  Nested Loop  (cost=80913.15..104499.40 rows=147099 width=110)
+         ->  Nested Loop  (cost=80912.85..93822.78 rows=147099 width=63)
+               ->  Merge Join  (cost=80912.56..83146.16 rows=147099 width=16)
+                     ->  Index Scan using item_pkey on item i1  (cost=0.29..1.29 rows=1 width=55)
+               ->  Index Scan using item_pkey on item i2  (cost=0.29..1.29 rows=1 width=55)

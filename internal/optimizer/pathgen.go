@@ -174,13 +174,30 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // domain. A nil substitution declines the whole path, matching
 // `create_unique_path`'s own "can't unique-ify, return NULL" contract.
 func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
-	o, i := outer.CheapestTotal, inner.CheapestTotal
+	i := inner.CheapestTotal
 	if uniq == uniqueSideInner {
 		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
 	}
-	if o == nil || i == nil {
+	if i == nil {
 		return
 	}
+	// M0146-0005m: match_unsorted_outer's outer loop — every unparameterised
+	// outer path, so an ordered non-cheapest outer yields an ordered nested
+	// loop. The JOIN_UNIQUE_OUTER case keeps its single cheapest-total outer.
+	outers := []*Path{outer.CheapestTotal}
+	if uniq != uniqueSideOuter {
+		outers = nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
+	}
+	for _, o := range outers {
+		if o != nil {
+			addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
+		}
+	}
+}
+
+// addNestLoopPathFor files the plain nested loop for one (outer, inner) path
+// pair.
+func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType, quals []*restrictInfo, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	// Child-path row counts, per 03 §9 rule 3 (see addHashJoinPath). The cross
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row

@@ -558,6 +558,14 @@ it. Census: only Q65 changes category at the same depth; TPC-H is
 identical. This unblocks re-applying M0146-0005m. Evidence:
 `analysis/m0146/m0146-0005/slice13/`.
 
+## Slice 14 (M0146-0005m): nested loops over every outer path
+
+With truncated pathkeys (slice 13), the `match_unsorted_outer` outer loop
+now lands: `nestLoopOuterPaths` feeds every unparameterised outer path to
+the index/Memoize and plain nested-loop producers. JOIN_UNIQUE_OUTER keeps
+its single outer. Q44's join tree is now exactly PG's, and nothing
+regresses in the census. Evidence: `analysis/m0146/m0146-0005/slice14/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
