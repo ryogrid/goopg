@@ -844,6 +844,14 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 			// INSIDE the parent's right-hand side.
 			sjLeft = leftBits &^ emittingBits
 		}
+		// M0145-0008ae: `reduce_unique_semijoins` — a semijoin to a single
+		// rel that is unique for the join clauses gets no SpecialJoinInfo,
+		// so the search plans it as the inner join it is.
+		if pulledSemiRhsIsUnique(pb, sjRhs, spanning, spans, ctx.cat) {
+			notePullupClassify("semijoin-reduced-to-inner")
+			pos += n
+			continue
+		}
 		if sj := pulledSemiJoinInfo(pb.jointype, sjRhs, sjLeft, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
 			// M0145-0008ab: a derived ANY_subquery proven distinct on its
 			// output unique-ifies for free — see SpecialJoinInfo.SemiRhsDistinct.

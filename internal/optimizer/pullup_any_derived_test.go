@@ -15,14 +15,22 @@ import (
 // TestPullUpAnyDerivedBody pins the derived arm at the pull-up itself: the
 // body becomes a single leaf holding the body's own plan, marked derived, with
 // the testexpr synthesised as its one link qual.
+//
+// Since M0145-0008ae the join it lands in depends on the body: a body that is
+// `query_is_distinct_for` its output has its semijoin reduced to an inner join
+// (PG's `reduce_unique_semijoins`), and any other body keeps the semi join.
 func TestPullUpAnyDerivedBody(t *testing.T) {
-	cases := map[string]string{
-		"group-having": `select tag from jtp_o where k in (select j from jtp_i group by j having sum(v) > 3)`,
-		"distinct":     `select tag from jtp_o where k in (select distinct j from jtp_i)`,
-		"limit":        `select tag from jtp_o where k in (select j from jtp_i order by j limit 5)`,
-		"union":        `select tag from jtp_o where k in (select j from jtp_i union select j2 from jtp_i2)`,
+	cases := map[string]struct {
+		sql  string
+		semi bool
+	}{
+		"group-having": {`select tag from jtp_o where k in (select j from jtp_i group by j having sum(v) > 3)`, false},
+		"distinct":     {`select tag from jtp_o where k in (select distinct j from jtp_i)`, false},
+		"limit":        {`select tag from jtp_o where k in (select j from jtp_i order by j limit 5)`, true},
+		"union":        {`select tag from jtp_o where k in (select j from jtp_i union select j2 from jtp_i2)`, false},
 	}
-	for name, sql := range cases {
+	for name, tc := range cases {
+		sql := tc.sql
 		t.Run(name, func(t *testing.T) {
 			cat := jtpCatalog(t)
 			delete(sublinkRouteCounts, spineRoutePosthoc)
@@ -32,8 +40,11 @@ func TestPullUpAnyDerivedBody(t *testing.T) {
 				t.Fatalf("jointree pull-up engaged %d times, want 1; tree: %s", n, describePlanTree(node))
 			}
 			j := findSemiOrAntiJoin(node)
-			if j == nil || j.Type != JoinTypeSemi {
+			if tc.semi && (j == nil || j.Type != JoinTypeSemi) {
 				t.Fatalf("no searched semi join over the derived leaf; tree: %s", describePlanTree(node))
+			}
+			if !tc.semi && j != nil {
+				t.Fatalf("a distinct derived body kept its %v join; reduce_unique_semijoins should make it an inner join; tree: %s", j.Type, describePlanTree(node))
 			}
 		})
 	}
