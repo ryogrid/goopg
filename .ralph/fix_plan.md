@@ -21794,6 +21794,21 @@ M0146-0001 re-baseline census on the new default arm.
   - Open: HAVING\-to\-WHERE, partial Group paths, HAVING qual cost —
     ledgered.
   Movement: TPC\-DS Q97 → MATCH \(SF0.25\), Q37 Q82 depth 1 → 2 \(SF0.25, SF1\)
+- [x] **M0146\-0024 — aggregate\-free HAVING conjuncts move into WHERE**
+  \(filed and done 2026\-09\-26 from M0146\-0023\'s ledger item 1\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0024\-having\-to\-where.md`; evidence
+    `analysis/m0146/m0146\-0024/`.
+    - `moveHavingToWhere` \(`subquery\_planner`\'s HAVING loop\), fail\-closed
+      node list, columns must be plain GROUP BY items so the grouping error
+      still fires.
+    - Census\-neutral \(no TPC\-DS/TPC\-H plan moved\); all gates pass,
+      including regress `select\_having` / `aggregates` / `groupingsets`.
+  - Open: grouping sets, the no\-GROUP\-BY copy, grouped\-expression and
+    functionally dependent columns — ledgered.
+  Movement: none \(census\-neutral PG\-fidelity fix\)
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the

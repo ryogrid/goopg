@@ -1197,6 +1197,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// groupingsets.go. Recursive planSelect calls (nested subqueries, the
 	// set-op chain's head operand) reach this same idempotent check.
 	prepareGroupingSets(s)
+	// M0146-0024: subquery_planner moves aggregate-free HAVING conjuncts
+	// into WHERE (a copy of s; the parse tree is not mutated).
+	s = moveHavingToWhere(s, cat)
 
 	// C-11: this scope's upper-rel registry. One per invocation — a
 	// subquery, a CTE body and a view body each plan through their own

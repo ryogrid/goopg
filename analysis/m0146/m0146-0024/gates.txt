@@ -1,0 +1,5 @@
+units PASS
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH (acceptance arm)
+TPC-H census identical; TPC-DS plan A/B: no changed query at SF0.25 or SF1
+regress 41 WITH/plan pass-required cases + select_having/aggregates/groupingsets: identical to a HEAD (ad7fe90f4) worktree
