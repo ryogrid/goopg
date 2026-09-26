@@ -2313,6 +2313,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
+		// M0146-0003b: a row-transport finalize's child delivers
+		// serialized-state rows, not aggregate inputs — absorb each one
+		// into the group map instead of running transitions on it.
+		if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit {
+			if err := o.absorbPartialStateRow(slot, groups, &order); err != nil {
+				return err
+			}
+			continue
+		}
 		// Every grouping column is evaluated ONCE per input row; the per-set
 		// keys below are cut out of that one vector. This is the whole point
 		// of the single-pass shape — the source is read once and each row is
@@ -2387,6 +2396,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 
 	switch o.plan.Mode {
 	case optimizer.AggModePartial:
+		if o.plan.PartialEmit {
+			return o.emitPartialStateRows(groups, order)
+		}
 		// Publish this worker's groups and emit NOTHING. The Finalize node
 		// supplies every output row from the accumulator, so a Partial node
 		// returning zero rows is by construction, not a failure — see the
@@ -2412,6 +2424,17 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return nil
 
 	case optimizer.AggModeFinal:
+		if o.plan.PartialEmit {
+			if o.plan.GroupingSets != nil {
+				return &ExecError{
+					Code:    "XX000",
+					Message: "internal error: row-transport finalize does not support grouping sets",
+				}
+			}
+			// groups/order were absorbed from the state rows in the drain
+			// above; nothing to adopt — fall through to the shared emit.
+			break
+		}
 		if accum == nil {
 			return &ExecError{
 				Code:    "XX000",
@@ -2590,6 +2613,116 @@ func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet 
 		b.WriteString(allKeys[ci])
 	}
 	return b.String()
+}
+
+// emitPartialStateRows emits a PartialEmit partial's output: one row per
+// group carrying [group key values | passthrough values | serialized
+// transition state per aggregate] — the bytea-shaped transport PG's
+// aggserialfn produces (M0146-0003b). Rows leave in group-key order, the
+// same deterministic convention the shared emit tail uses; a Sort node
+// above the partial (PG's `Sort -> Partial HashAggregate`) can only
+// reorder, never change the set.
+func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, order []string) error {
+	o.rows = make([]Row, 0, len(order))
+	for _, key := range order {
+		gr := groups[key]
+		if gr == nil {
+			continue
+		}
+		row := make(Row, 0, len(gr.groupValues)+len(gr.passthroughVals)+len(gr.aggs))
+		row = append(row, gr.groupValues...)
+		row = append(row, gr.passthroughVals...)
+		for i := range gr.aggs {
+			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i])
+			if err != nil {
+				return err
+			}
+			row = append(row, d)
+		}
+		o.rows = append(o.rows, row)
+	}
+	nGroupCols := len(o.plan.GroupExprs)
+	if nGroupCols > 0 {
+		sort.SliceStable(o.rows, func(a, b int) bool {
+			ra, rb := o.rows[a], o.rows[b]
+			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
+				c, _ := compareDatum(ra[k], rb[k], 0)
+				if c != 0 {
+					return c < 0
+				}
+			}
+			return false
+		})
+	}
+	return nil
+}
+
+// absorbPartialStateRow folds one transported partial row —
+// [group key values | passthrough values | serialized states] — into the
+// finalize's group map. Deserialised states combine through the SAME
+// combineAggRuntime rules the shared-accumulator transport uses, so the
+// two transports can never disagree about what a combination means.
+func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*groupRuntime, order *[]string) error {
+	nGroupCols := len(o.plan.GroupExprs)
+	nPass := len(o.plan.Passthrough)
+	nAggs := len(o.plan.Aggs)
+	row := slot.Row()
+	if len(row) != nGroupCols+nPass+nAggs {
+		return &ExecError{
+			Code: "XX000",
+			Message: fmt.Sprintf("internal error: partial-state row has %d columns, want %d "+
+				"(group keys + passthrough + aggregates) — a PartialEmit partial must feed "+
+				"a PartialEmit finalize", len(row), nGroupCols+nPass+nAggs),
+		}
+	}
+	gv := row[:nGroupCols]
+	allKeys := make([]string, nGroupCols)
+	for i, d := range gv {
+		allKeys[i] = datumKey(d)
+	}
+	set := make([]int, nGroupCols)
+	for i := range set {
+		set[i] = i
+	}
+	key := o.setGroupKey(0, set, allKeys, false)
+	gr, ok := groups[key]
+	if !ok {
+		// Retain the founder's key and passthrough values detached from
+		// the transport row, the same retention boundary the input drain
+		// applies (M0073-0004).
+		ngv := make(Row, nGroupCols)
+		for i := range ngv {
+			ngv[i] = gv[i].MaterializeArena()
+		}
+		var npt Row
+		if nPass > 0 {
+			npt = make(Row, nPass)
+			for i := range npt {
+				npt[i] = row[nGroupCols+i].MaterializeArena()
+			}
+		}
+		gr = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, nAggs)}
+		groups[key] = gr
+		*order = append(*order, key)
+	}
+	for i := 0; i < nAggs; i++ {
+		sd := row[nGroupCols+nPass+i]
+		if sd.Kind != KindBytes {
+			return &ExecError{
+				Code: "XX000",
+				Message: fmt.Sprintf("internal error: partial-state column %d has datum kind %v, "+
+					"want serialized bytes", i, sd.Kind),
+			}
+		}
+		st, err := deserializeAggRuntime(o.plan.Aggs[i].Name, sd.BytesValue())
+		if err != nil {
+			return err
+		}
+		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &st); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // finalizeGroup finalizes one group's aggregates and builds its single output

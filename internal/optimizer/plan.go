@@ -1523,6 +1523,31 @@ type Aggregate struct {
 	// Read ONLY by drivingScan / stampParallelScan /
 	// unstampParallelScan / drivingScanCrossesSort (parallel.go).
 	PartialGroup bool
+
+	// PartialEmit marks a row-transport partial/finalize pair
+	// (M0146-0003b): on a Partial node it makes the aggregate emit
+	// (group key values, passthrough values, one serialized transition
+	// state per aggregate) as ordinary rows — PostgreSQL's
+	// aggserialfn-shaped transport (nodeAgg.c's serialised
+	// aggref->aggtranstype internal column) — instead of merging into
+	// the zero-row shared accumulator PartialSource points at. On a
+	// Finalize node it makes the node consume those rows: deserialise
+	// each state column and combineAggRuntime it into the group, rather
+	// than reading the accumulator after draining the Gather to EOF.
+	// The flag must be set on BOTH nodes of a pair; a PartialEmit
+	// partial under a plain finalize (or vice versa) is an
+	// internal-error construction.
+	//
+	// Unlike PartialSource's side channel this shape survives any
+	// row-moving node between the pair — a Sort (PG's
+	// `Sort -> Partial HashAggregate` under `Gather Merge`), a
+	// GatherMerge, or another pass-through — which is what the
+	// `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
+	// HashAggregate` stack (planner.c:7704-7724's
+	// gather_grouping_paths) needs. Read ONLY by the executor
+	// (operators_join_agg.go); no plan producer emits it yet, so a
+	// node carrying it can appear only in directly-constructed plans.
+	PartialEmit bool
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output

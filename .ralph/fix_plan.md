@@ -21333,6 +21333,23 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0137-0019a
   - 2026\-09\-26: slice M0146\-0003a \(below\) landed the nested\-scope split;
     the row\-emitting partial chain \(M0141\-S3 → S6\) remains.
+  - 2026\-09\-27: slice M0146\-0003b landed the S3/S4 transport \-\-
+    `Aggregate.PartialEmit` on a Partial/Finalize pair moves the
+    transition state across the Gather inside real rows
+    \(\[keys | passthrough | serialized state per agg]\), serialised by
+    the name\-keyed `serializeAggRuntime`/`deserializeAggRuntime` pair
+    \(agg\_state\_serial.go, bounded by the aggregateIsDecomposable
+    whitelist; the field belt refuses DISTINCT/string/array/WITHIN
+    GROUP/user state outright\). The transport\-Final folds states
+    through the SAME combineAggRuntime rules as the accumulator
+    transport, so the two can never disagree. No producer emits the
+    flag yet: the pair is reachable only in directly\-constructed
+    plans; GatherMerge\-fed Finalize\-Sorted merge\-combine \(S5\) and
+    wiring/EXPLAIN \(S6\) remain. Design doc
+    `docs/design/0100\-0149/m0146\-0003b\-partial\-agg\-row\-transport.md`;
+    evidence `analysis/m0146/m0146\-0003b/`. Zero plan moves at both
+    TPC\-DS scales \(expected: dead\-in\-production\); Gather/GatherMerge
+    identity vs serial PASS at workers 1/2/4 incl\. \-race.
 - [x] **M0146\-0003a — a subquery\'s aggregate splits over the Gather the
   search placed** \(filed and done 2026\-09\-26 from the census:
   `PG Finalize Aggregate | goopg Aggregate`\).
@@ -21347,6 +21364,24 @@ M0146-0001 re-baseline census on the new default arm.
     - TPC\-DS Q88/Q90 MATCH \(SF0.25\), Q90 MATCH \(SF1\); sort\-strategy
       61 → 55, parallelism 69 → 63 \(SF0.25\); all gates pass.
   Movement: TPC\-DS Q88 Q90 → MATCH \(SF0.25\), Q90 → MATCH \(SF1\), Q88 SF1 depth 7 → 10
+- [x] **M0146\-0003b — a partial aggregate\'s transition state crosses
+  the Gather inside a row** \(M0141\-S3/S4, landed 2026\-09\-27\).
+  Kind: impl
+  Parent: M0146\-0003
+  - **DONE 2026\-09\-27.** Design doc
+    `docs/design/0100\-0149/m0146\-0003b\-partial\-agg\-row\-transport.md`;
+    evidence `analysis/m0146/m0146\-0003b/`.
+    - `Aggregate.PartialEmit` pairs a row\-emitting Partial with a
+      row\-consuming Finalize; `serializeAggRuntime`/
+      `deserializeAggRuntime` \(agg\_state\_serial.go\) carry each
+      whitelisted family\'s state as a KindBytes column; the transport
+      combines through the same `combineAggRuntime` rules as the
+      shared accumulator.
+    - Dead\-in\-production by design \(no producer sets the flag\): TPC\-DS
+      plan shapes 99/99 identical at SF0.25 and fires\=none at SF1;
+      transport identity vs serial verified on Gather and GatherMerge
+      at workers 1/2/4 under \-race.
+  Movement: none \(transport slice; producer lands with S6\)
 - [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed
