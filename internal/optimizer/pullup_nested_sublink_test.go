@@ -28,7 +28,7 @@ func TestBodyQualsAdmitSublinks(t *testing.T) {
 	plain := &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 0, Name: "c"}, Right: &IntegerConst{Value: 1}}
 
 	t.Run("no sublink is admitted", func(t *testing.T) {
-		if why, ok := bodyQualsAdmitSublinks(plain, nil); !ok {
+		if why, ok := bodyQualsAdmitSublinks(plain, nil, 0, nil); !ok {
 			t.Fatalf("a plain qual must be admitted, got %q", why)
 		}
 	})
@@ -39,31 +39,136 @@ func TestBodyQualsAdmitSublinks(t *testing.T) {
 		if !exprHasSublinkPlan(q) {
 			t.Fatalf("fixture is wrong: the qual must carry a subplan or the gate is untested")
 		}
-		if why, ok := bodyQualsAdmitSublinks(q, nil); !ok {
+		if why, ok := bodyQualsAdmitSublinks(q, nil, 0, nil); !ok {
 			t.Fatalf("a NON-convertible nested sublink must ride along as a SubPlan, "+
 				"exactly as it does in PG; got %q", why)
 		}
 	})
 
-	t.Run("convertible nested sublink is declined and named", func(t *testing.T) {
+	// M0146-0015c slice 2: a nested ANY/EXISTS is no longer declined out of
+	// hand. extractNestedPullups already tried — and failed — to convert it;
+	// what remains rides as a SubPlan in the pulled qual with its escaping
+	// correlation re-based into problem space, which is exactly what PG does.
+	// Admission is therefore about the kept plan, not the sublink kind.
+	t.Run("convertible nested sublink is admitted as a kept subplan", func(t *testing.T) {
 		nested := &InExpr{Plan: &SeqScan{}}
 		q := nestedSublinkQual(t, nested)
-		why, ok := bodyQualsAdmitSublinks(q, nil)
-		if ok {
-			t.Fatalf("a nested ANY must stay declined — converting it is the recursion " +
-				"M0145-0014 is named for, and that machinery is not built")
+		if why, ok := bodyQualsAdmitSublinks(q, nil, 0, nil); !ok {
+			t.Fatalf("an uncorrelated nested ANY rides as a kept SubPlan; got %q", why)
 		}
-		if why != "nested-sublink-convertible" {
-			t.Fatalf("reason = %q, want nested-sublink-convertible — the census counts this string", why)
+	})
+
+	t.Run("a kept sublink escaping past the emitting scope declines", func(t *testing.T) {
+		// Level 3 at body depth 0 lands above the emitting statement —
+		// hops = 3 - 0 - 1 = 2 > depth + 1 = 1.
+		nested := &ExistsExpr{Plan: &Filter{
+			Predicate: &BinaryOp{Op: parser.OpEq,
+				Left:  &OuterColumnRef{Level: 3},
+				Right: &IntegerConst{Value: 1}},
+		}}
+		why, ok := bodyQualsAdmitSublinks(nestedSublinkQual(t, nested), nil, 0, nil)
+		if ok || why != "nested-sublink-deep-ref" {
+			t.Fatalf("a ref escaping above the emitting scope must decline "+
+				"nested-sublink-deep-ref, got (%q, %v)", why, ok)
+		}
+	})
+
+	t.Run("an uncloneable kept plan declines", func(t *testing.T) {
+		// *Distinct is outside planCloneSupported's node set — the pulled
+		// arm cannot take a plan it would have to share with the fallback.
+		nested := &ExistsExpr{Plan: &Distinct{}}
+		why, ok := bodyQualsAdmitSublinks(nestedSublinkQual(t, nested), nil, 0, nil)
+		if ok || why != "nested-sublink-uncloneable" {
+			t.Fatalf("an uncloneable kept plan must decline "+
+				"nested-sublink-uncloneable, got (%q, %v)", why, ok)
 		}
 	})
 
 	t.Run("onQuals are checked too", func(t *testing.T) {
-		nested := &ExistsExpr{Plan: &SeqScan{}}
-		if why, ok := bodyQualsAdmitSublinks(nil, []Expr{nestedSublinkQual(t, nested)}); ok {
-			t.Fatalf("an ON qual carrying a convertible sublink must decline, got ok (why=%q)", why)
+		nested := &ExistsExpr{Plan: &Filter{
+			Predicate: &BinaryOp{Op: parser.OpEq,
+				Left:  &OuterColumnRef{Level: 3},
+				Right: &IntegerConst{Value: 1}},
+		}}
+		if why, ok := bodyQualsAdmitSublinks(nil, []Expr{nestedSublinkQual(t, nested)}, 0, nil); ok {
+			t.Fatalf("an ON qual carrying an escaping kept sublink must decline, got ok (why=%q)", why)
 		}
 	})
+}
+
+// TestJointreePullupKeepsNestedExists is M0146-0015c slice 2's core pin: the
+// oracle shape `a … EXISTS (b … EXISTS (c WHERE c.x = a.y AND c.z = b.w))`
+// must plan the OUTER EXISTS as a semi join (PG: `Hash Semi Join … Join
+// Filter: EXISTS/ANY`), with the inner EXISTS carried as a pre-lowered
+// SubPlan inside the join predicate — not left as two nested SubPlans on a
+// scan filter.
+func TestJointreePullupKeepsNestedExists(t *testing.T) {
+	cat := jtpCatalog(t)
+	delete(sublinkRouteCounts, spineRoutePosthoc)
+	delete(sublinkRouteCounts, spineRouteJointree)
+	// j=jtp_i.j, k=jtp_o.k, v=jtp_i.v; inside c: w=j is parent-scope,
+	// j2=k is emitting-scope — the two-scope correlation the whole
+	// slice exists to carry.
+	node := planOnPipeline(t,
+		`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+			`and exists (select 1 from jtp_i2 b where b.j2 = k and b.w = a.v))`, cat)
+	if n := sublinkRouteCounts[spineRouteJointree]; n < 1 {
+		t.Fatalf("jointree pull-up never engaged; tree: %s", describePlanTree(node))
+	}
+	j := findSemiOrAntiJoin(node)
+	if j == nil || j.Type != JoinTypeSemi {
+		t.Fatalf("no semi join for the outer EXISTS; tree: %s", describePlanTree(node))
+	}
+	// The kept EXISTS must be in the semi join's predicate, pre-lowered:
+	// sentinel ids renumbered into the flat space (all >= 0), Args the
+	// problem-space columns translateToLayout re-based for the node.
+	var kept *ExistsExpr
+	walkExprTree(j.Predicate, func(e Expr) {
+		if ex, isEx := e.(*ExistsExpr); isEx {
+			kept = ex
+		}
+	})
+	if kept == nil {
+		t.Fatalf("no kept EXISTS in the semi join predicate; tree: %s", describePlanTree(node))
+	}
+	if len(kept.ParParam) != 2 || len(kept.Args) != 2 {
+		t.Fatalf("kept EXISTS ParParam=%v Args=%d — want one slot per escaping "+
+			"column (parent-body + emitting)", kept.ParParam, len(kept.Args))
+	}
+	for _, id := range kept.ParParam {
+		if id < 0 {
+			t.Fatalf("sentinel ParParam id %d survived lowerSubPlanParams — "+
+				"renumberPulledSubplanParams did not reach the block", id)
+		}
+	}
+	for i, a := range kept.Args {
+		cr, isCR := a.(*ColumnRef)
+		if !isCR {
+			t.Fatalf("Args[%d] = %T, want a positional ColumnRef the eval site "+
+				"can bind against the join row", i, a)
+		}
+		if cr.Index < 0 {
+			t.Fatalf("Args[%d].Index = %d — unbased coordinate", i, cr.Index)
+		}
+	}
+	// The escaping refs inside the kept plan must be ExecParamRefs, no
+	// OuterColumnRef may survive at kept-depth 0.
+	foundParam := false
+	walkPlanExprs(kept.Plan, func(e Expr) {
+		if p, isP := e.(*ExecParamRef); isP {
+			foundParam = true
+			if p.ID < 0 {
+				t.Fatalf("sentinel ExecParamRef %d survived in the kept plan", p.ID)
+			}
+		}
+		if _, isO := e.(*OuterColumnRef); isO {
+			t.Fatalf("an OuterColumnRef survived inside the kept plan — the "+
+				"rebase must replace every escaping ref; tree: %s", describePlanTree(node))
+		}
+	})
+	if !foundParam {
+		t.Fatalf("no ExecParamRef inside the kept plan — escaping refs were not re-based")
+	}
 }
 
 // TestExprHasConvertibleSublink pins WHICH sublink kinds count as convertible.

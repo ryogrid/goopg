@@ -438,7 +438,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		return nil, "nested-spans-scopes", false
 	}
 	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
-	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
+	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, why, false
 	}
 	if exprListHasVolatileBuiltin(quals, cat) {
@@ -954,19 +954,16 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 	// qual fail with `rebase-failed` one step after `bodyQualsAdmitSublinks`
 	// let it through — a decline that merely moved.
 	//
-	// `scopeSignal` reports the crossing and does not descend, which is the
-	// correct treatment: the subplan's own refs live in the subplan's scope
-	// and are not the body-local coordinates this rebase re-stamps. The one
-	// case that would be wrong is a subplan CORRELATED to the body, whose
-	// outer refs do point at coordinates moving underneath it — OnScope
-	// declines those rather than guessing.
+	// `scopeSignal` reports the crossing and does not descend. The subplan's
+	// own refs are not body-local coordinates — this rewrite does not
+	// re-stamp them — but a kept sublink CORRELATED to the body (or beyond)
+	// does point at coordinates moving underneath it, and M0146-0015c's
+	// post-pass (`rebaseQualKeptSubplans`, below) re-bases exactly those:
+	// the kept plan is cloned and its escaping refs become pre-lowered
+	// PARAM_EXEC args in problem space. An excluded eval-site sublink still
+	// cannot ride — that refusal moved into the post-pass, which checks it
+	// per sublink instead of declining on the first plan boundary crossed.
 	out, ok := cloneExprRefs(q, scopeSignal, exprRewriter{
-		OnScope: func(n Node) {
-			if planHasOuterRef(n) {
-				noteRebaseFail("subplan-correlated")
-				failed = true
-			}
-		},
 		OnUnknown: func(x Expr) {
 			// M0145-0014: name the node the rewrite aborted on. Without it
 			// `rebase-failed` is one string for three different causes and
@@ -1068,6 +1065,14 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 		}
 		return nil, false
 	}
+	// M0146-0015c slice 2: re-base every kept sublink's plan the clone
+	// carries. An escaping OuterColumnRef inside it points at coordinates
+	// this qual just vacated; the post-pass turns each into a pre-lowered
+	// PARAM_EXEC arg in problem space (renumbered by lowerSubPlanParams),
+	// or declines — leaving the statement the SubPlans it always had.
+	if !rebaseQualKeptSubplans(out, pb, pullSpans, emittingTotal, ctx, allSpans, bodyBase) {
+		return nil, false
+	}
 	return out, true
 }
 
@@ -1166,41 +1171,71 @@ func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 // that is not itself convertible simply stays a SubPlan inside the pulled-up
 // qual; it never blocks the outer conversion.
 //
-// So the population splits in two, and this function admits only the half that
-// needs no new machinery:
+// So the population splits by what the sublink needs:
 //
 //   - a NON-convertible sublink (a scalar/EXPR subquery) rides along as an
 //     ordinary body-local qual, exactly as it does in PG. TPC-DS Q58's
 //     `d_date IN (SELECT d_date … WHERE d_week_seq = (SELECT …))` is this
 //     shape: a one-leaf body whose single qual holds an uncorrelated scalar
 //     subplan.
-//   - a CONVERTIBLE nested ANY/EXISTS is still declined, because converting it
-//     is the recursion M0145-0014 is named for and that needs the nested
-//     body's leaves spliced and its link predicate rebased against the OUTER
-//     body's leaves rather than against the emitting rels. TPC-DS Q83's
+//   - a CONVERTIBLE nested ANY/EXISTS that failed its own conversion is
+//     admitted the same way since M0146-0015c slice 2: kept as a SubPlan in
+//     the pulled qual — what PG does — with its escaping correlation
+//     re-based into the qual's problem space (see the list form below for
+//     the per-sublink gates). Converting it outright is the recursion
+//     M0145-0014 is named for: that needs the nested body's leaves spliced
+//     and its link predicate rebased against the OUTER body's leaves rather
+//     than against the emitting rels. TPC-DS Q83's
 //     `d_date IN (SELECT d_date … WHERE d_week_seq IN (SELECT …))` is this
-//     shape.
-//
-// A body qual that carries BOTH a sublink and a Level-1 outer reference is
-// declined too: the correlation rebase that `rebasePulledQual` performs on the
-// way out is not defined over a subplan's own scope, and guessing there is how
-// a pull-up reads the wrong column.
-func bodyQualsAdmitSublinks(where Expr, onQuals []Expr) (string, bool) {
-	return bodyQualsAdmitSublinkList(append(splitAnd(where), onQuals...))
+//     shape — extractNestedPullups declines it first, and the kept-subplan
+//     path then carries it.
+func bodyQualsAdmitSublinks(where Expr, onQuals []Expr, depth int, cat catalog.Catalog) (string, bool) {
+	return bodyQualsAdmitSublinkList(append(splitAnd(where), onQuals...), depth, cat)
 }
 
 // bodyQualsAdmitSublinkList is the split-conjunct form, which is what both
 // arms hold once `extractNestedPullups` has rewritten the list.
-func bodyQualsAdmitSublinkList(quals []Expr) (string, bool) {
+//
+// M0146-0015c slice 2 widened what may ride: a kept SubPlan inside a pulled
+// qual is PG's shape (`pull_up_sublinks_qual_recurse` converts the OUTER
+// sublink first and leaves an un-convertible nested one in the pulled-up
+// qual — the `Hash Semi Join … Join Filter: EXISTS` plan the oracle emits
+// for `a … EXISTS (b … EXISTS (c WHERE c.x = a.y AND c.z = b.w))`). What is
+// new is that the kept plan's correlation can be re-based now: the qual-level
+// rebase clones the kept plan and rewrites its escaping OuterColumnRefs to
+// pre-lowered PARAM_EXEC slots whose Args are problem-space exprs
+// (pulledsublink.go). Admission is therefore per sublink, not per qual:
+//
+//   - a LOWERABLE sublink (scalar subquery, EXISTS, scalar-IN with a plan)
+//     must pass keptSubplanAdmissible — cloneable, no LATERAL inside, no
+//     volatile work inside, and every escaping ref landing on the body, a
+//     pulled ancestor, or the emitting scope;
+//   - an EXCLUDED eval-site kind (row-ctor IN, ARRAY subquery, multi-assign)
+//     cannot be re-based at all — it rides only while uncorrelated, exactly
+//     as before (the rebase's excluded check keeps refusing it otherwise).
+func bodyQualsAdmitSublinkList(quals []Expr, depth int, cat catalog.Catalog) (string, bool) {
 	for _, q := range quals {
 		if !exprHasSublinkPlan(q) {
 			continue
 		}
-		if exprHasConvertibleSublink(q) {
-			return "nested-sublink-convertible", false
-		}
-		if exprHasOuterRefAtLevel(q, 1) {
-			return "nested-sublink-correlated", false
+		why := ""
+		walkExprRefs(q, scopeIgnore, exprVisitor{
+			Visit: func(x Expr) bool {
+				if len(ExprSubplans(x)) == 0 {
+					return true
+				}
+				if handleFor(x) == nil {
+					return true // excluded kind — the rebase decides
+				}
+				if w, ok := keptSubplanAdmissible(x, depth, cat); !ok {
+					why = w
+					return false
+				}
+				return true
+			},
+		})
+		if why != "" {
+			return why, false
 		}
 	}
 	return "", true
@@ -1472,7 +1507,7 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		return nil, "nested-spans-scopes", false
 	}
 	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
-	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
+	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, "any-" + why, false
 	}
 	if exprListHasVolatileBuiltin(quals, cat) {

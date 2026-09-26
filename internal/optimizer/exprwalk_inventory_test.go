@@ -337,6 +337,16 @@ var exprSwitchInventory = map[string]walkerRole{
 	"selectivity.go:clauseSelectivityWithSource": walkerPending, // 4 of 32 arms
 	"selectivity.go:formatExprConstant":          nonRecursiveClassifier,
 	"selectivity.go:isConstExpr":                 nonRecursiveClassifier,
+	// M0146-0015c slice 2. The kept-subplan rebase/renumber walkers:
+	// their dispatch tracks sublink-scope DEPTH (linkDepth decides which
+	// OuterColumnRef levels escape the kept plan), a path property no
+	// slot-driven walker models — the same reason analyzeSublink and
+	// lowerTraverseExpr stay hand-written. All four bail on an
+	// unenumerated type (the enclosing pull-up declines, fail-closed).
+	"pulledsublink.go:(keptRebase).rebaseNode":    walkerPending, // 7 of 32 arms
+	"pulledsublink.go:descendSublinkParams":       walkerPending, // 4 of 32 arms
+	"pulledsublink.go:keptPlanRefsAdmissible":     walkerPending, // 6 of 32 arms
+	"pulledsublink.go:renumberDeep":               walkerPending, // 6 of 32 arms
 	"subplan_lower.go:analyzeSublink":            walkerPending, // 7 of 32 arms
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,

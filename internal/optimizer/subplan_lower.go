@@ -54,6 +54,7 @@ func (a *paramAlloc) alloc() int { id := a.next; a.next++; return id }
 type sublinkHandle struct {
 	plan      Node
 	setPlan   func(Node)
+	params    func() []int
 	setParams func(parParam []int, args []Expr)
 	nonCorr   func() bool
 	setNC     func(bool)
@@ -71,6 +72,7 @@ func handleFor(e Expr) *sublinkHandle {
 		return &sublinkHandle{
 			plan:      x.Plan,
 			setPlan:   func(n Node) { x.Plan = n },
+			params:    func() []int { return x.ParParam },
 			setParams: func(pp []int, a []Expr) { x.ParParam, x.Args = pp, a },
 			nonCorr:   func() bool { return x.IsNonCorrelated },
 			setNC:     func(b bool) { x.IsNonCorrelated = b },
@@ -82,6 +84,7 @@ func handleFor(e Expr) *sublinkHandle {
 		return &sublinkHandle{
 			plan:      x.Plan,
 			setPlan:   func(n Node) { x.Plan = n },
+			params:    func() []int { return x.ParParam },
 			setParams: func(pp []int, a []Expr) { x.ParParam, x.Args = pp, a },
 			nonCorr:   func() bool { return x.IsNonCorrelated },
 			setNC:     func(b bool) { x.IsNonCorrelated = b },
@@ -96,6 +99,7 @@ func handleFor(e Expr) *sublinkHandle {
 		return &sublinkHandle{
 			plan:      x.Plan,
 			setPlan:   func(n Node) { x.Plan = n },
+			params:    func() []int { return x.ParParam },
 			setParams: func(pp []int, a []Expr) { x.ParParam, x.Args = pp, a },
 			nonCorr:   func() bool { return x.IsNonCorrelated },
 			setNC:     func(b bool) { x.IsNonCorrelated = b },
@@ -114,8 +118,18 @@ func lowerSubPlanParams(root Node) Node {
 		return root
 	}
 	a := &paramAlloc{}
+	// M0146-0015c slice 2: the pull-up may have pre-lowered a kept sublink
+	// inside a pulled qual — escaping refs already ExecParamRefs on sentinel
+	// ids, Args already in problem space. Renumber every sentinel block into
+	// the flat space `a` mints BEFORE the ordinary walk allocates, and then
+	// leave such sublinks alone: their binding is already correct, and
+	// rewriteSublinkPlan's setParams would clobber it.
+	renumberPulledSubplanParams(root, a)
 	walkPlanExprsIncludingDML(root, func(e Expr) {
 		if h := handleFor(e); h != nil {
+			if len(h.params()) > 0 {
+				return
+			}
 			lowerSublinkTree(h, a)
 		}
 	})
@@ -413,6 +427,12 @@ func rewriteSublinkPlan(chain []*lowerScope, a *paramAlloc) {
 			return &ExecParamRef{pos: x.pos, ID: id, Type: x.Type}, true, true
 		case *SubqueryExpr, *ExistsExpr, *InExpr:
 			if h := handleFor(e); h != nil {
+				if len(h.params()) > 0 {
+					// A pull-up pre-lowered sublink (M0146-0015c): its
+					// block was already renumbered into the flat space —
+					// re-lowering would clobber ParParam/Args.
+					return e, true, true
+				}
 				rewriteSublinkPlan(append(chain, &lowerScope{h: h, slots: map[refKey]int{}}), a)
 				// S4b fix (mirror of analyzeSublink): the operand and
 				// literal list are THIS plan's expressions — rewrite

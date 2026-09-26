@@ -130,9 +130,14 @@ func TestNestedSublinkLevel2Bails(t *testing.T) {
 
 // TestOperandHiddenOuterRefBails: the correlation hides inside a nested
 // IN's Operand — a host-scope position the shallow walkers treat as a
-// leaf. The deep accounting must flag it unaccounted and keep the
-// EXISTS a SubPlan (previously, on the IN/scalar paths, such refs
-// slipped through and the pull-up proceeded over a dangling reference).
+// leaf. M0146-0015c slice 2 changed how the accounting lands: the
+// operand's Level-1 ref is re-based into problem space by the pulled
+// qual's rebase (it evaluates in the host scope, not inside the IN's
+// plan), so the EXISTS now converts — matching PG, which pulls this
+// shape too. What the pin keeps is the hazard underneath: no
+// OuterColumnRef may dangle past the plan root, the exact wrong-results
+// case the old refusal prevented. A nested ANY whose link reads the
+// emitting scope still declines (TestNestedSublinkLevel2Bails).
 func TestOperandHiddenOuterRefBails(t *testing.T) {
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
@@ -142,8 +147,21 @@ func TestOperandHiddenOuterRefBails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if findExistsExpr(node) == nil {
-		t.Fatalf("operand-hidden-ref EXISTS disappeared; it must stay a SubPlan:\n%s", planString(node))
+	if findExistsExpr(node) != nil {
+		t.Fatalf("EXISTS kept as a SubPlan; PG pulls this shape:\n%s", planString(node))
+	}
+	if hasSemiOrAntiJoin(node) == nil {
+		t.Fatalf("operand-hidden-ref EXISTS pulled but no semi/anti join:\n%s", planString(node))
+	}
+	dangling := false
+	walkPlanExprsDeep(node, 0, func(e Expr, depth int) {
+		if o, ok := e.(*OuterColumnRef); ok && o.Level > depth {
+			dangling = true
+		}
+	})
+	if dangling {
+		t.Fatalf("an OuterColumnRef escapes the plan root — the dangling-"+
+			"reference hazard the old refusal prevented:\n%s", planString(node))
 	}
 }
 
