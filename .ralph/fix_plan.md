@@ -20972,7 +20972,7 @@ M0146-0001 re-baseline census on the new default arm.
       timeouts, fire set PASS \(Q6 cost\-only\), full `TestPort\_RegressSuite`
       PASS.
   Movement: none
-- [ ] **M0146\-0015c — pull up a nested EXISTS body that references the
+- [x] **M0146\-0015c — pull up a nested EXISTS body that references the
   emitting scope** \(filed 2026\-09\-25 by M0146\-0015a\): `rebasePulledQual`
   now declines a nested body whose qual reads the grandparent statement
   \(e.g. `a … EXISTS \(b … EXISTS \(c WHERE c.x = a.y AND c.z = b.w\)\)`\),
@@ -21034,6 +21034,40 @@ M0146-0001 re-baseline census on the new default arm.
       inner to plain ColumnRef\); a composite escaping ref in a join
       clause PANICS in `translateToLayout` \(createplanjoin.go:243\) —
       kept admission needs a guard \(ledgered\).
+  - 2026\-09\-26 slice 4 \(landed\): `translateToLayout` in
+    `internal/optimizer/createplanjoin.go` passes a surviving
+    `OuterColumnRef` in a join clause through unchanged — it needs no
+    positional re\-basing and `lowerSubPlanParams` binds it to an
+    `ExecParamRef` at the subplan boundary \(PG leaves the outer Var in
+    the subplan joinqual as a PARAM\_EXEC\). The panic was NOT
+    pull\-up\-specific: any correlated subplan whose multi\-leaf join
+    clause holds an outer ref hit it \(reproduced with a plain
+    correlated scalar subplan\). `ColumnRef` not\-in\-layout and
+    `CTIDExpr` stay refused; `cloneExprShiftIdx`\'s veto is a different
+    boundary and stays.
+    - Measured on :5533: the composite escape `b.j2 = a.v + k` plans
+      `Hash Semi Join / Join Filter: \(EXISTS\(SubPlan 1\)\)` with
+      correct rows; emitting\-only `b.j2 = k` stacks the inner semi
+      join ABOVE the outer one \(PG\'s `j\->larg` insertion\);
+      parent\-only `b.j2 = a.v` nests inside the RHS \(PG\'s `j\->rarg`\);
+      the correlated scalar plans `Merge Join … Merge Cond: \(a.j =
+      \(b.j2 + jtp_o.k\)\)` inside the SubPlan — the outer var in the
+      merge cond, PG\'s placement.
+    - The `nested\-body\-emitting\-ref` decline is now a guard, not a
+      live boundary: it needs a pulled depth\>=1 body with a Level\>=2
+      ref, which `nestedBodySpansScopes` keeps from ever being pulled.
+      No SpecialJoinInfo min\-hand widening was needed — the original
+      framing of this task resolves to "pass the surviving outer ref
+      through so subplan lowering binds it".
+    - New test `TestJoinClauseKeepsSurvivingOuterRef`
+      \(pullup\_nested\_sublink\_test.go\): plans without panic; the
+      lowered subplan carries `ExecParamRef`, no `OuterColumnRef`.
+    - Gates: units, tpch\-spotcheck, SF0\.25 sweep 96 PASS / 0
+      timeouts / no plan\-shape changes, acceptance arm 24 MATCH, fire
+      set PASS, parity capture 6/22.
+    - Remaining \(ledgered\): inner\-expr targets in `keptExistsToAny`.
+    - **DONE 2026\-09\-26 \(`4a89e53cf`\).** Design doc updated; evidence
+      `analysis/m0146/m0146\-0015c/slice4\-goopg.txt`.
 - [ ] **WRONG RESULTS: an index created with an explicit opclass returns
   wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
   `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —

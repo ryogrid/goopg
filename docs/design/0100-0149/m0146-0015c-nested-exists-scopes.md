@@ -1,9 +1,13 @@
 # M0146-0015c: a nested EXISTS that reads the outermost query
 
-Status: slices 1–3 landed 2026-09-26. The outer EXISTS plans as a semi
+Status: slices 1–4 landed 2026-09-26. The outer EXISTS plans as a semi
 join and the kept inner EXISTS now renders PG's hashed-ANY form —
 `Join Filter: (ANY ((a.y = (hashed SubPlan N).col1) AND (b.w = (hashed
-SubPlan N).col2)))`, textually identical to the oracle.
+SubPlan N).col2)))`, textually identical to the oracle. Slice 4 removed
+the `translateToLayout` panic on surviving outer refs in join clauses,
+which was the live manifestation of this task's original
+`nested-body-emitting-ref` framing: every scope placement variant now
+plans PG-shaped.
 
 ## PG behaviour
 
@@ -144,24 +148,71 @@ acceptance digest all identical to HEAD). New coverage:
 `TestKeptExistsToAnyVariants` (convert/decline matrix),
 `TestRowHashedAnyTruthTable`/`TestRowHashedAnyProbeFires` (executor).
 
+## Slice 4 (landed): surviving OuterColumnRefs in join clauses
+
+The composite-escape repro `b.j2 = a.v + k` — a conjunct whose outer
+side mixes two scopes — did not decline anywhere: inside a's subplan
+planning the inner EXISTS pulls (it is a depth-0 body of a's own
+problem, so `nestedBodySpansScopes` does not apply), its link clause
+carries the Level-2 escape as a surviving `OuterColumnRef`, and
+`translateToLayout` PANICKED on it in createPlan
+(`join clause carries a *optimizer.OuterColumnRef`). The same panic was
+reproducible with no pull-up at all — any correlated subplan whose
+multi-leaf join clause holds an outer ref
+(`select k, (select a.j + b.j2 from jtp_i a, jtp_i2 b where a.j =
+b.j2 + k) from jtp_o`) — so the refusal was over-broad, not a pull-up
+boundary.
+
+PG's semantics (subselect.c `convert_EXISTS_sublink_to_join` +
+createplan): the outer Var stays in the joinqual inside the correlated
+subplan and is bound as a PARAM_EXEC at the subplan boundary. goopg's
+equivalent is already in place: `lowerSubPlanParams` rewrites every
+surviving OuterColumnRef in a subplan to an `ExecParamRef`, and the
+executor evaluates any leftover one against the `ctx.OuterRows`
+lexical-scope stack (an unbound one fails loud, `XX000`, not silently).
+`translateToLayout`'s job is only to renumber `ColumnRef`s into the
+merged output layout — an outer ref needs no renumbering and now rides
+the clause unchanged. The `ColumnRef` not-in-layout and `CTIDExpr`
+refusals keep their teeth; `cloneExprShiftIdx`'s veto is a different
+boundary (it hoists a conjunct across a scope level, where Level 1
+would silently rename) and stays.
+
+Resolution produced outer refs only under a parent scope, so any that
+reaches createPlan is inside a subquery plan by construction — the
+pass-through cannot leak a dangling correlation into a top-level plan.
+
+Measured on :5533 (`analysis/m0146/m0146-0015c/slice4-goopg.txt`):
+
+- `b.j2 = a.v + k` (composite, spans scopes): `Hash Semi Join … Join
+  Filter: (EXISTS(SubPlan 1))`, kept form, correct rows.
+- `b.j2 = k` (emitting scope only): the inner semi join stacks ABOVE
+  the outer one — `(jtp_o SEMI jtp_i) SEMI jtp_i2`, `Hash Cond:
+  (jtp_o.k = j2)` over `(jtp_o.k = a.j)` — exactly PG's `j->larg`
+  insertion order.
+- `b.j2 = a.v` (parent body only): `(a SEMI b)` nested inside the
+  outer semi join's RHS — PG's `j->rarg` placement.
+- correlated scalar subplan: `Merge Join … Merge Cond: (a.j = (b.j2 +
+  jtp_o.k))` inside the SubPlan — the outer var in the merge cond, PG's
+  placement — correct values live.
+
+New coverage: `TestJoinClauseKeepsSurvivingOuterRef` (plans without
+panic; the lowered subplan carries an `ExecParamRef` and no
+`OuterColumnRef`). Gates: units PASS; spotcheck PASS; sf025 sweep
+96/96 (verdict-changes=none); acceptance arm 24 MATCH; fire set PASS
+(no fires either corpus); parity capture 6/22.
+
 ## Next slices
 
 - **Inner-expr targets:** PG also converts `innervar_expr = outervar`
   (the expression becomes the child targetlist entry); goopg binds the
   conversion to plain `ColumnRef` inner sides — same bound the flat
   `existsToAny` applies — and keeps EXISTS on `(b.w + 1) = a.v` today.
-- **Composite escaping refs in a join clause panic, not decline:**
-  `b.j2 = a.v + k` (a conjunct whose outer side mixes two scopes)
-  reaches `translateToLayout` inside the pulled body's join planning
-  with a raw `OuterColumnRef` and PANICS
-  (`join clause carries a *optimizer.OuterColumnRef, which is not
-  positional and cannot be re-based`, createplanjoin.go:243). The
-  kept-subplan admission needs a composite-ref guard, or
-  translateToLayout a fail-closed path.
-- **The `nested-body-emitting-ref` boundary** (qual-level, not the
-  kept-subplan path above): a PULLED nested body whose own link qual
-  reads the emitting scope still declines — goopg's search cannot
-  place a join clause between an emitting rel and a rel inside the
-  nested semi join's RHS (`TestNestedSublinkLevel2Bails` keeps the
-  pin). That is the original fix_plan framing of this task and needs
-  the SpecialJoinInfo min-hand widening PG does, a separate change.
+- **The `nested-body-emitting-ref` decline is now a guard, not a live
+  boundary.** A `hops > 1` decline requires a pulled depth >= 1 body
+  carrying a Level >= 2 ref — `nestedBodySpansScopes` keeps exactly
+  those bodies from ever being pulled (slice 1), so the decline is
+  unreachable along every tested shape: emitting-scope refs take the
+  kept/larg-stacked paths verified above. It stays as the fail-closed
+  tripwire for whatever path a later slice opens; lifting it is the
+  SpecialJoinInfo min-hand widening PG does inside `join_is_legal`,
+  which is only needed if a future shape reaches it.
