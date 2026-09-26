@@ -424,6 +424,42 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	if agg == nil {
 		return nil
 	}
+	// M0146-0003 S6: a row-transport Finalize consumes the Gather
+	// Merge's already-grouped state stream. The merge keys ARE
+	// positional references into the transport row — and transport
+	// position k.Pos is exactly the output position of group key
+	// clause[j], so the positional check validates the merge contract
+	// AND lands the claim in output coordinates with no translation at
+	// all (the Simple-mode arm below must translate input coords).
+	if agg.Mode == AggModeFinal {
+		if !agg.PartialEmit || agg.Strategy != AggStrategySorted ||
+			agg.GroupingSets != nil || len(agg.GroupExprs) == 0 ||
+			agg.GroupKeyOrder != nil {
+			return nil
+		}
+		gm, ok := agg.Child.(*GatherMerge)
+		if !ok || len(gm.Keys) < len(agg.GroupExprs) {
+			return nil
+		}
+		out := agg.Output()
+		if len(out) < len(agg.GroupExprs) {
+			return nil
+		}
+		clause := groupClauseKeys(agg)
+		emitted := make([]PathKey, len(clause))
+		for j, k := range clause {
+			cr, ok := gm.Keys[j].Expr.(*ColumnRef)
+			if !ok || cr.Index != k.Pos {
+				return nil
+			}
+			emitted[j] = PathKey{
+				Expr:       &ColumnRef{Index: k.Pos, Name: out[k.Pos].Name, Type: out[k.Pos].Type},
+				SortAsc:    !gm.Keys[j].Desc,
+				NullsFirst: gm.Keys[j].NullsFirst,
+			}
+		}
+		return emitted
+	}
 	if agg.Strategy != AggStrategySorted || agg.Mode != AggModeSimple ||
 		agg.GroupingSets != nil || len(agg.GroupExprs) == 0 ||
 		agg.GroupKeyOrder != nil {

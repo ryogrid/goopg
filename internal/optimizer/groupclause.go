@@ -151,3 +151,34 @@ func groupClauseKeys(agg *Aggregate) []GroupClauseKey {
 	}
 	return out
 }
+
+// transportGroupSortKeys is the sort/merge key list for the sorted
+// row-transport split (M0146-0003 S6): one SortKey per group-clause
+// entry, in clause order, whose Expr is a POSITIONAL ColumnRef into the
+// transport row — position k.Pos carries GroupExprs[k.Pos]'s value, so
+// the same list sorts each worker's partial output, merges the streams
+// in the GatherMerge, and grounds the finalize's emission-order claim
+// (aggregateEmissionPathkeys) with no coordinate translation at all.
+//
+// The ref is a clone of the group expression's own ColumnRef with Index
+// rebound to k.Pos: Name/Type/SourceTableIdx ride along, so `Sort Key:
+// l_returnflag` still renders the name PG prints under Gather Merge
+// rather than an anonymous position.
+//
+// Declines (ok=false) when a group expression is not a *ColumnRef: the
+// positional ref would still evaluate correctly, but the clause could
+// then render no honest `Sort Key:` name — the ledgered remainder, not
+// a silently mislabeled plan (same posture partialGroupKeyRefs takes).
+func transportGroupSortKeys(agg *Aggregate) ([]SortKey, bool) {
+	keys := make([]SortKey, 0, len(agg.GroupExprs))
+	for _, k := range groupClauseKeys(agg) {
+		cr, ok := agg.GroupExprs[k.Pos].(*ColumnRef)
+		if !ok {
+			return nil, false
+		}
+		ref := *cr
+		ref.Index = k.Pos
+		keys = append(keys, SortKey{Expr: &ref, Desc: k.Desc, NullsFirst: k.NullsFirst})
+	}
+	return keys, true
+}

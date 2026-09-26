@@ -75,6 +75,13 @@ const partialAggSplitPathProducer = "upper.groupagg.split"
 // Merge) `add_path` kept.
 const partialAggGatherMergeProducer = "upper.groupagg.gathermerge"
 
+// partialAggSortedSplitProducer is the M0146-0003 S6 sorted row-transport
+// split's DPPATH trace string: `producer=upper.groupagg.sortsplit
+// relids=-`. A distinct producer so the trace tells which split —
+// hashed `Finalize HashAggregate -> Gather` or presorted `Finalize
+// GroupAggregate -> Gather Merge -> Sort -> Partial` — add_path kept.
+const partialAggSortedSplitProducer = "upper.groupagg.sortsplit"
+
 // addPartialAggSplitPath files the parallel `Finalize -> Gather -> Partial`
 // candidate onto the GROUP_AGG rel, or files nothing.
 //
@@ -525,6 +532,23 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
 			workers, d, perWorkerRows, partialGroups, finalGroups,
 			nGroupCols, nAggs, inNcols, inAvgVar, strategy)
+
+		// M0146-0003 S6: the PRESORTED split — `gather_grouping_paths`
+		// files it beside the hashed arm (planner.c:7704-7724), so both
+		// compete in add_path and cost adjudication picks, same as every
+		// other arm pair here. The extra gates: a sorted transport fold
+		// needs ≥1 group key, the sorted fold has no grouping-sets or
+		// special-aggregate variant (the sorted gathered arm's own
+		// gates), and every group key must be a bare column so the
+		// merge keys can name it (transportGroupSortKeys' own refusal,
+		// ledgered).
+		if nGroupCols > 0 && aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
+			if _, ok := transportGroupSortKeys(aggNode); ok {
+				addPartialAggSortedSplitArm(grouped, partialRel, pseed, aggNode, cp,
+					workers, d, perWorkerRows, partialGroups, finalGroups,
+					nGroupCols, nAggs, inNcols, inAvgVar)
+			}
+		}
 	}
 
 	// ── the PARTIAL GROUP arm (aggregate-free GROUP BY only) ────────────
@@ -904,6 +928,99 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	}
 	addPath(grouped, split, partialAggSplitPathProducer)
 	return split
+}
+
+// addPartialAggSortedSplitArm files the PRESORTED split — `Finalize
+// GroupAggregate -> Gather Merge -> Sort -> Partial HashAggregate` — on
+// the GROUP_AGG rel: upstream's `gather_grouping_paths` presorted arm
+// (planner.c:7704-7724), the shape M0141-S5's sorted transport-final
+// was built to consume.
+//
+// It exists because the row transport makes it expressible: the
+// zero-row accumulator could not be sorted per worker (it emits no
+// rows), which is exactly why Q1's `Finalize GroupAggregate` shape was
+// unreachable until M0146-0003b. The worker Sort prices over
+// partialGroups — N sorts of each worker's narrowed group set, the
+// same `create_presorted_path` saving R56's no-split arm prices —
+// and the Gather Merge boundary crosses each worker's partial output,
+// so `crossed = partialGroups * d` exactly like the hashed arm.
+//
+// The Pathkeys on the FINAL path are the transport-position merge keys
+// themselves, not the input-space group exprs the sibling arms
+// advertise: transport position k.Pos IS this path's output position
+// (the finalize emits group values first, in GroupExprs order), so the
+// same list describes both the merge order and the ordering the
+// finalized rows leave in — add_path's usefulness bookkeeping gets one
+// honest claim rather than a translated one.
+func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
+	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
+	nGroupCols, nAggs, inNcols int, inAvgVar float64) *Path {
+
+	sortKeys, ok := transportGroupSortKeys(aggNode)
+	if !ok {
+		// The caller already asked once; this second ask is the
+		// fail-closed assertion that keeps the arm unreachable for a
+		// group expression no merge key can name.
+		return nil
+	}
+	crossed := partialGroups * d
+
+	// PARTIAL arm — hashed per worker, like the split arm's: PG shows
+	// `Partial HashAggregate` under the worker Sort (TPC-H Q1), and
+	// `strategy` deliberately does not reach this arm — a sorted spec
+	// still hashes its partial.
+	partialCost := costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	partialSpec := *aggNode
+	partialPath := &Path{
+		Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &partialSpec,
+		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
+		ParallelSafe: true, ParallelWorkers: workers,
+		Children: []*Path{pseed},
+	}
+
+	// WORKER SORT — `create_presorted_path`'s Sort over the partial
+	// output (planner.c:7662): each worker orders its own group set, so
+	// the sort sees partialGroups rows, not inputRows. The merge keys
+	// are the transport positions (see the doc comment).
+	mergeKeys := pathkeysForSortKeys(sortKeys)
+	workerSort := sortPathForBounded(partialPath, mergeKeys, cp, -1)
+	// `sortPathForBounded` prices ParallelSafe but never plans workers;
+	// without this the shape is incomplete (`gatherChildPlan` panics on
+	// 0 workers). R56's rule, verbatim.
+	workerSort.ParallelWorkers = workers
+
+	// BOUNDARY — `cost_gather_merge` over the sorted state streams. The
+	// crossing count is the workers' deduplicated output, the whole
+	// economic argument of the shape (Q1: 6 group-states per worker
+	// against 1.5 M scanned rows).
+	gmCost := gatherMergeCost(cp, workerSort.Cost, workers, crossed)
+	gmPath := &Path{
+		Kind: PathGatherMerge, Rel: grouped, Rows: crossed, Cost: gmCost,
+		Pathkeys:      append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:  false,
+		DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{workerSort},
+	}
+
+	// FINALIZE arm — `create_agg_path(… AGGSPLIT_FINAL_DESERIAL,
+	// AGG_SORTED …)`, planner.c:7250: the combine charged per input row
+	// of the finalize and the final function per output group, like the
+	// hashed arm — the sorted fold does the same work streaming, in
+	// clause order.
+	finalSpec := *aggNode
+	sorted := &Path{
+		Kind: PathFinalizeAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
+		Rel: grouped, Rows: finalGroups,
+		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
+			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		ParallelWorkers: workers,
+		Children:        []*Path{gmPath},
+	}
+	addPath(grouped, sorted, partialAggSortedSplitProducer)
+	return sorted
 }
 
 // parallelSeedCost is the partial input's price: startup unchanged, RUN cost

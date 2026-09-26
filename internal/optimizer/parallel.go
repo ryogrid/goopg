@@ -1739,13 +1739,23 @@ func perWorkerDisplayRows(stamped Node, divisor float64) {
 // now, so setting Mode on the original would be a data race and would also
 // corrupt the serial plan every other session sees.
 //
-// The schema is unchanged at every level. The Partial node emits no ROWS at
-// all — it publishes per-group states through a side channel and the Finalize
-// reads them from there — so nothing downstream sees a different shape, and
-// the Gather in between needs no knowledge of aggregation whatsoever.
+// The schema is unchanged at every level. When every aggregate is
+// decomposable the pair runs ROW TRANSPORT (M0146-0003): `PartialEmit`
+// marks both nodes, the Partial emits one [keys | passthrough |
+// serialized state] row per group through the Gather, and the Finalize
+// deserialises + combineAggRuntime's them — the belt that makes the
+// M0141-S5 sorted transport arm (splitAggregateTransportSorted)
+// expressible at all. A non-decomposable aggregate keeps the zero-row
+// accumulator model: PartialSource still points at the Partial, which
+// publishes per-group states through the side channel, and the Finalize
+// reads them from there — nothing downstream sees a different shape on
+// either transport, and the Gather in between needs no knowledge of
+// aggregation whatsoever.
 func splitAggregate(a *Aggregate, workers int) Node {
+	emit := aggregateSplitIsSafe(a)
 	partial := *a
 	partial.Mode = AggModePartial
+	partial.PartialEmit = emit
 	// Stamp the "Parallel " label on the partial side's driving scan — the
 	// split-aggregate shape puts a real Gather here too (rebuildWithGather's
 	// sibling call site).
@@ -1755,6 +1765,7 @@ func splitAggregate(a *Aggregate, workers int) Node {
 
 	final := *a
 	final.Mode = AggModeFinal
+	final.PartialEmit = emit
 	final.Child = gather
 	final.PartialSource = &partial
 	// B-01c second cut: the Final's child is now the Gather over the
@@ -1764,6 +1775,54 @@ func splitAggregate(a *Aggregate, workers int) Node {
 	// direction. The Partial keeps the original's stamp: it reads the
 	// same input row (stampParallelScan only labels the scan).
 	// Payload-only, no plan change.
+	final.InputTarget, final.InputTargetKnown = nil, false
+	return &final
+}
+
+// splitAggregateTransportSorted builds the presorted parallel split —
+// `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
+// HashAggregate`, the presorted arm upstream's `gather_grouping_paths`
+// files (planner.c:7704-7724) and TPC-H Q1 elects. It exists only because
+// the row transport makes it expressible: the shared-accumulator Partial
+// emits no rows, so nothing could ever be sorted per worker; the
+// PartialEmit pair emits real [keys | passthrough | state] rows, which
+// a per-worker Sort can order and a Gather Merge can merge.
+//
+// keys are the transport-position sort/merge keys
+// (transportGroupSortKeys): transport position k.Pos carries
+// GroupExprs[k.Pos]'s value, so the SAME key list sorts each worker's
+// partial output and merges the worker streams — the Sort and the
+// GatherMerge can never disagree about the ordering they share.
+//
+// The Partial stays `Strategy = AggStrategyHashed` even when `a` was a
+// sorted spec: PG's own presorted arm hashes per worker and sorts the
+// rows after them (Partial HashAggregate under Sort), and goopg's emit
+// drains the hash table likewise. The Finalize carries `Sorted` — that
+// is what routes it to openSortedPartialTransport's one-live-group fold
+// and what renders `Finalize GroupAggregate` (operators_explain.go's
+// Strategy arm).
+//
+// The pairing contract is the hashed arm's: PartialEmit on BOTH nodes,
+// GroupingSets already refused by the producer (the open gate's belt
+// repeats it), and the Final's input-target keep cleared — its child is
+// the GatherMerge's transport row, not the input row the stamp was
+// derived against.
+func splitAggregateTransportSorted(a *Aggregate, workers int, keys []SortKey) *Aggregate {
+	partial := *a
+	partial.Mode = AggModePartial
+	partial.Strategy = AggStrategyHashed
+	partial.PartialEmit = true
+	partial.Child = stampParallelScan(partial.Child)
+
+	sorter := &Sort{pos: a.Pos(), Child: &partial, Keys: keys}
+	merge := NewGatherMerge(a.Pos(), sorter, workers, keys)
+
+	final := *a
+	final.Mode = AggModeFinal
+	final.Strategy = AggStrategySorted
+	final.PartialEmit = true
+	final.Child = merge
+	final.PartialSource = &partial
 	final.InputTarget, final.InputTargetKnown = nil, false
 	return &final
 }
@@ -1913,6 +1972,14 @@ func StripGather(n Node) Node {
 			src := x.PartialSource
 			c := *x
 			c.Mode = AggModeSimple
+			// Restore the strategy the split was stamped FROM. The
+			// sorted split (M0146-0003 S6) sets the Final's strategy to
+			// AggStrategySorted; folding it back to Simple+Sorted would
+			// make openSorted trust an input order the stripped scan no
+			// longer guarantees — a silently-wrong order claim. The
+			// Partial keeps the spec's own strategy, so src.Strategy is
+			// the honest revert.
+			c.Strategy = src.Strategy
 			c.PartialSource = nil
 			c.Child = unstampParallelScan(StripGather(src.Child))
 			return &c

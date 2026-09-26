@@ -203,8 +203,16 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	if p.ParallelWorkers <= 0 {
 		panic(fmt.Sprintf("createPlan: PathFinalizeAgg planning %d workers", p.ParallelWorkers))
 	}
-	// Finalize -> Gather -> Partial -> input.
-	if len(p.Children) != 1 || p.Children[0] == nil || p.Children[0].Kind != PathGather {
+	// Finalize -> Gather -> Partial -> input, or (M0146-0003 S6) the
+	// presorted split Finalize -> GatherMerge -> Sort -> Partial ->
+	// input. The child path kind names which.
+	if len(p.Children) != 1 || p.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg without a boundary child")
+	}
+	if p.Children[0].Kind == PathGatherMerge {
+		return createFinalizeAggSortedPlan(p)
+	}
+	if p.Children[0].Kind != PathGather {
 		panic("createPlan: PathFinalizeAgg without a PathGather child")
 	}
 	gather := p.Children[0]
@@ -239,6 +247,55 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	// rule).
 	if built.PartialSource.Child != child {
 		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gather, partial))
+	}
+	return built, layout
+}
+
+// createFinalizeAggSortedPlan is the PathFinalizeAgg arm for the
+// M0146-0003 S6 presorted split: `Finalize GroupAggregate ->
+// GatherMerge -> Sort -> Partial HashAggregate`. Like the hashed arm
+// above it does NOT recurse through its own boundary/sort/partial
+// children — the Partial node's `PartialEmit` flag and the Finalize's
+// `PartialSource` pairing are one construction, so the arm walks to the
+// bottom of the chain, builds the ONE input subtree, and hands the
+// shape to `splitAggregateTransportSorted` (parallel.go).
+//
+// Every refusal is a panic, per createplan.go's contract: a path
+// reaching here in one of these shapes is a producer bug.
+func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
+	// Finalize -> GatherMerge -> Sort -> Partial -> input.
+	gm := p.Children[0]
+	if len(gm.Children) != 1 || gm.Children[0] == nil || gm.Children[0].Kind != PathSort {
+		panic("createPlan: PathFinalizeAgg's GatherMerge without a PathSort child")
+	}
+	srt := gm.Children[0]
+	if len(srt.Children) != 1 || srt.Children[0] == nil || srt.Children[0].Kind != PathAgg {
+		panic("createPlan: PathFinalizeAgg's worker Sort without a partial PathAgg child")
+	}
+	partial := srt.Children[0]
+	if len(partial.Children) != 1 || partial.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
+	}
+	child, layout := createPlanNode(partial.Children[0])
+	if child == nil {
+		panic("createPlan: PathFinalizeAgg over a child path that built no node")
+	}
+	simple := *p.Agg
+	simple.Child = child
+	keys, ok := transportGroupSortKeys(&simple)
+	if !ok {
+		panic("createPlan: PathFinalizeAgg's sorted arm over a group key no merge key can name")
+	}
+	built := splitAggregateTransportSorted(&simple, p.ParallelWorkers, keys)
+	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
+		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
+	}
+	// M0141-S2b-16, same rule as the hashed arm: the prebuilt serial
+	// subtree's driving scan still carries serial rows; give it the
+	// per-worker figure with the divisor the merge boundary was priced
+	// with.
+	if built.PartialSource.Child != child {
+		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gm, srt))
 	}
 	return built, layout
 }

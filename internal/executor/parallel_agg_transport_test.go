@@ -456,3 +456,122 @@ func TestPartialEmitSortedRejectsUnsorted(t *testing.T) {
 	}
 	_ = op2.Close()
 }
+
+// sortedTransportFinalSpec clones the pq_agg GROUP BY spec into a
+// sorted transport Finalize carrying the given group clause — the same
+// shape the M0146-0003 S6 producer stamps.
+func sortedTransportFinalSpec(t *testing.T, ctx *Context, clause []optimizer.GroupClauseKey) *optimizer.Aggregate {
+	t.Helper()
+	node := planForTest(t, ctx, "SELECT grp, count(*) FROM pq_agg GROUP BY grp")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+	final.GroupClause = clause
+	return &final
+}
+
+func mkStateRow(t *testing.T, grp Datum, cnt int64) Row {
+	t.Helper()
+	d, err := serializeAggRuntime("count", &aggRuntime{count: cnt})
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	return Row{grp, d}
+}
+
+// TestPartialEmitSortedHonoursClauseOrder pins the belt against the
+// declared merge order rather than a fixed ascending comparator: under
+// GROUP BY ... DESC an ascending stream is the disorder, and under
+// NULLS FIRST the null group must lead. A belt that ignored the clause
+// (a bare compareDatum has no NULL arm at all) would misorder or crash
+// on exactly the cases PG's Gather Merge contract makes routine.
+func TestPartialEmitSortedHonoursClauseOrder(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	nullDatum := Datum{Kind: KindNull}
+	one := NewIntDatum(1)
+	two := NewIntDatum(2)
+
+	type arm struct {
+		name    string
+		clause  []optimizer.GroupClauseKey
+		rows    []Row
+		wantErr bool
+	}
+	run := func(a arm) {
+		final := sortedTransportFinalSpec(t, ctx, a.clause)
+		op := &aggregateOp{plan: final, child: &rowsOp{rows: a.rows}, schema: final.Output()}
+		err := op.Open(ctx)
+		if a.wantErr {
+			if err == nil {
+				t.Fatalf("%s: disordered stream produced no error", a.name)
+			}
+			if !strings.Contains(err.Error(), "not ordered by group key") {
+				t.Fatalf("%s: errored, but not the order belt: %v", a.name, err)
+			}
+			_ = op.Close()
+			return
+		}
+		if err != nil {
+			t.Fatalf("%s: ordered stream rejected: %v", a.name, err)
+		}
+		_ = op.Close()
+	}
+
+	// DESC: a descending stream is the contract; ascending must trip.
+	run(arm{"desc-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0, Desc: true}},
+		[]Row{mkStateRow(t, two, 5), mkStateRow(t, one, 3)}, false})
+	run(arm{"desc-rejects-ascending",
+		[]optimizer.GroupClauseKey{{Pos: 0, Desc: true}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, two, 5)}, true})
+
+	// NULLS LAST (the ASC default): the null group rides at the end.
+	run(arm{"nulls-last-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, two, 5), mkStateRow(t, nullDatum, 7)}, false})
+	run(arm{"nulls-last-rejects-leading-null",
+		[]optimizer.GroupClauseKey{{Pos: 0}},
+		[]Row{mkStateRow(t, nullDatum, 7), mkStateRow(t, one, 3)}, true})
+
+	// NULLS FIRST: the null group must lead.
+	run(arm{"nulls-first-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0, NullsFirst: true}},
+		[]Row{mkStateRow(t, nullDatum, 7), mkStateRow(t, one, 3)}, false})
+	run(arm{"nulls-first-rejects-trailing-null",
+		[]optimizer.GroupClauseKey{{Pos: 0, NullsFirst: true}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, nullDatum, 7)}, true})
+
+	// Consecutive NULL keys fold into one group, not one row each.
+	final := sortedTransportFinalSpec(t, ctx, []optimizer.GroupClauseKey{{Pos: 0}})
+	op := &aggregateOp{plan: final, schema: final.Output(),
+		child: &rowsOp{rows: []Row{
+			mkStateRow(t, nullDatum, 2),
+			mkStateRow(t, nullDatum, 3),
+		}}}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, renderRows([]Row{slot.Row()})...)
+	}
+	if len(out) != 1 || !strings.Contains(out[0], "5") {
+		t.Fatalf("two null-key state rows emitted %v, want one folded group with count 5", out)
+	}
+	_ = op.Close()
+}

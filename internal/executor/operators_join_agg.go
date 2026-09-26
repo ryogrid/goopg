@@ -2772,6 +2772,51 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 	return nil
 }
 
+// transportKeyOrder is one merge-order descriptor for the sorted
+// transport-final's order belt: which group-value position to compare,
+// and in which direction/null placement.
+type transportKeyOrder struct {
+	pos        int
+	desc       bool
+	nullsFirst bool
+}
+
+// partialTransportMergeOrder derives the order a sorted transport
+// stream was merged by from the Final's own GroupClause — the same
+// clause the producer built the worker Sort and Gather Merge keys
+// from. The fallback replicates groupClauseKeys exactly (honour the
+// clause only when it is a complete permutation of the group
+// expressions, else written order ASC NULLS LAST): the belt and the
+// producer must read the same order, because a belt that checks a
+// different order than the Sort produced is a wrong-results tripwire
+// rather than a guard.
+func partialTransportMergeOrder(p *optimizer.Aggregate) []transportKeyOrder {
+	n := len(p.GroupExprs)
+	if len(p.GroupClause) == n {
+		seen := make([]bool, n)
+		ok := true
+		for _, k := range p.GroupClause {
+			if k.Pos < 0 || k.Pos >= n || seen[k.Pos] {
+				ok = false
+				break
+			}
+			seen[k.Pos] = true
+		}
+		if ok {
+			out := make([]transportKeyOrder, n)
+			for i, k := range p.GroupClause {
+				out[i] = transportKeyOrder{pos: k.Pos, desc: k.Desc, nullsFirst: k.NullsFirst}
+			}
+			return out
+		}
+	}
+	out := make([]transportKeyOrder, n)
+	for i := range out {
+		out[i] = transportKeyOrder{pos: i}
+	}
+	return out
+}
+
 // openSortedPartialTransport implements the GatherMerge-fed
 // Finalize-Sorted arm (M0141-S5, adopted by M0146-0003): the child
 // delivers serialized-state rows already ordered by group key — PG's
@@ -2785,7 +2830,13 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 // Order belt: a key comparing BELOW the just-emitted group means the
 // stream is not sorted — a construction error. It must fail loudly
 // rather than emit a group twice, since a duplicated group row is a
-// silently wrong result with no user-visible explanation.
+// silently wrong result with no user-visible explanation. The belt
+// compares in the stream's declared merge order — the Final's
+// GroupClause, with the same positional ASC / NULLS-LAST default
+// groupClauseKeys falls back to — through compareDatumWithNullsFirst,
+// so NULL keys and DESC clauses check against the order the worker
+// Sort and Gather Merge actually used rather than a bare ascending
+// compareDatum (which has no NULL arm at all).
 func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 	var curParts []string
 	var cur *groupRuntime
@@ -2803,6 +2854,7 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 		return nil
 	}
 
+	mergeOrder := partialTransportMergeOrder(o.plan)
 	for {
 		slot, err := o.child.Next()
 		if err == EOF {
@@ -2822,9 +2874,13 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 		}
 		if cur == nil || !sameGroupKey(curParts, dr.keyParts) {
 			if cur != nil {
-				// Belt: merge-ordered input must not descend.
-				for k := 0; k < len(dr.gv) && k < len(cur.groupValues); k++ {
-					c, cerr := compareDatum(cur.groupValues[k], dr.gv[k], 0)
+				// Belt: merge-ordered input must not go backwards in
+				// the order the stream was merged by.
+				for _, ko := range mergeOrder {
+					if ko.pos >= len(dr.gv) || ko.pos >= len(cur.groupValues) {
+						break
+					}
+					c, cerr := compareDatumWithNullsFirst(cur.groupValues[ko.pos], dr.gv[ko.pos], ko.nullsFirst, ko.desc)
 					if cerr != nil {
 						return cerr
 					}
