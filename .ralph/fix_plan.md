@@ -21875,7 +21875,7 @@ M0146-0001 re-baseline census on the new default arm.
     path at all \(ledger: no index\-only inner for a join, M0145\-0008l
     note\) or generates and loses it on cost.
 
-- [ ] **M0146\-0020 — grouping sets plan as PG\'s `MixedAggregate`**
+- [x] **M0146\-0020 — grouping sets plan as PG\'s `MixedAggregate`**
   \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q22 \(both scales\), Q27
   \(SF1\): `PG MixedAggregate | goopg HashAggregate \(N keys, M grouping
   sets\)`.
@@ -21884,6 +21884,26 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: compare PG\'s `consider_groupingsets_paths` mixed\-strategy
     choice \(hash the sets that fit work\_mem, sort the rest\) with goopg\'s
     all\-hash grouping sets.
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0020\-grouping\-sets\-explain.md`;
+    evidence `analysis/m0146/m0146\-0020/`.
+    - Finding: on unsorted input PG hashes every non\-empty set and does the
+      empty set in the sorted phase \(AGG\_MIXED\) — what goopg already
+      executes. The divergence was the label and key lines.
+    - `MixedAggregate` / `HashAggregate` with `Hash Key:` per set and
+      `Group Key: \(\)`; aggregation\-strategy 40 → 36 \(SF0.25\), 45 → 40
+      \(SF1\); Q27 SF1 MATCH; all gates pass.
+  Movement: TPC\-DS Q5 Q22 Q77 Q80 past the aggregate \(both scales\), Q27 SF1 MATCH
+- [ ] **M0146\-0020a — PG\'s sorted grouping\-sets strategy** \(filed
+  2026\-09\-26 by M0146\-0020\): with sorted input,
+  `consider\_groupingsets\_paths` also builds sorted rollups and mixed
+  sort/hash plans; TPC\-DS Q18 and Q27 \(SF0.25\) plan `GroupAggregate`
+  over sorted rollups where goopg always hashes.
+  Kind: impl
+  Parent: M0146\-0020
+  - First step: port the is\_sorted arm \(sorted rollups over the
+    `extract\_rollup\_sets` chains, hash\_mem\-bounded mixed choice\) as a
+    candidate the grouping upper rel can cost.
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

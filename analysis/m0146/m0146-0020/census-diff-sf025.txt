@@ -1,0 +1,42 @@
+5c5
+< Q5 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+---
+> Q5 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+18c18
+< Q18 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate (4 keys, 5 grouping sets)
+---
+> Q18 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg MixedAggregate
+22c22
+< Q22 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (4 keys, 5 grouping sets)
+---
+> Q22 depth=5 [join-method] under Nested Loop: PG Parallel Hash Join Inner | goopg Nested Loop Inner
+27c27
+< Q27 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+---
+> Q27 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg MixedAggregate
+77c77
+< Q77 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+---
+> Q77 depth=6 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+80c80
+< Q80 depth=2 [aggregation-strategy] under Sort: PG MixedAggregate | goopg HashAggregate (2 keys, 3 grouping sets)
+---
+> Q80 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+101c101
+< CATEGORY-ROLLUP: sort-strategy=32 aggregation-strategy=18 qual-placement=14 join-method=7 parallelism=6 join-order=4 scan-type=4 parameterisation=3 error=3
+---
+> CATEGORY-ROLLUP: sort-strategy=33 aggregation-strategy=14 qual-placement=14 join-method=8 scan-type=6 parallelism=6 join-order=4 parameterisation=3 error=3
+104d103
+<     4  aggregation-strategy under Sort             PG MixedAggregate               goopg HashAggregate                depth=2
+106d104
+<     4  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=2
+112a111
+>     2  scan-type        under Append           PG Subquery Scan on ssr         goopg GroupAggregate               depth=4
+113a113
+>     2  aggregation-strategy under Sort             PG GroupAggregate               goopg MixedAggregate               depth=2
+114a115
+>     2  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=2
+129a131
+>     1  join-method      under Nested Loop      PG Parallel Hash Join Inner     goopg Nested Loop Inner            depth=5
+149a152
+>     1  sort-strategy    under GroupAggregate   PG Nested Loop Inner            goopg Sort                         depth=6

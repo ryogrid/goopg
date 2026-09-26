@@ -1543,6 +1543,49 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// line of its own (explain.c:3716-3830). The grouping-sets path is
 		// out of S5 scope (its per-set lines are a separate M0125-0048
 		// shape; the suffix on the label carries the set count).
+		if p.GroupingSets != nil {
+			// show_grouping_set_keys (explain.c): a hashed set prints
+			// `Hash Key:`, and the empty set of a MixedAggregate prints
+			// `Group Key: ()` after them. Keys reference the input's target
+			// list, so a non-Var key prints parenthesized. M0146-0020.
+			renderKey := func(gi int) string {
+				keyExpr := p.GroupExprs[gi]
+				if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
+					if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
+						keyExpr = chased
+					}
+				}
+				s := formatExprQual(keyExpr, reg, qualify)
+				if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
+					s = forceParen(s)
+				}
+				return s
+			}
+			// PG lists the hashed sets in its rollup order
+			// (extract_rollup_sets chains, largest set first along each
+			// chain). Largest-first, otherwise in written order, reproduces
+			// that for ROLLUP, flat GROUPING SETS and a two-column CUBE.
+			sets := make([][]int, len(p.GroupingSets))
+			copy(sets, p.GroupingSets)
+			sort.SliceStable(sets, func(i, j int) bool { return len(sets[i]) > len(sets[j]) })
+			empty := 0
+			for _, set := range sets {
+				if len(set) == 0 {
+					empty++
+					continue
+				}
+				parts := make([]string, 0, len(set))
+				for _, gi := range set {
+					if gi >= 0 && gi < len(p.GroupExprs) {
+						parts = append(parts, renderKey(gi))
+					}
+				}
+				*rows = append(*rows, Row{NewStringDatum(indent + "Hash Key: " + strings.Join(parts, ", "))})
+			}
+			for i := 0; i < empty; i++ {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: ()")})
+			}
+		}
 		if len(p.GroupExprs) > 0 && p.GroupingSets == nil {
 			// GroupKeyOrder (S8 Slice 2c-i, 0134-0001 P2) reorders only this
 			// printed line — GroupExprs itself, and every output binding
@@ -3598,16 +3641,18 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			prefix = "Finalize "
 		}
 		if p.GroupingSets != nil {
-			// M0125-0048: one node, one hash table per grouping set. PG shows
-			// this as a HashAggregate (or MixedAggregate when it sorts some
-			// levels) carrying one "Hash Key:"/"Group Key:" line per set,
-			// including the bare "Group Key: ()" for the grand total. goopg
-			// has no per-key detail lines (see the note below), so the set
-			// count rides on the existing key-count suffix — which is what
-			// distinguishes this from the N-branch UNION ALL the clause used
-			// to expand into.
-			return fmt.Sprintf("%sHashAggregate (%d keys, %d grouping sets)",
-				prefix, len(p.GroupExprs), len(p.GroupingSets))
+			// M0125-0048: one node, one hash table per non-empty grouping
+			// set. PG's consider_groupingsets_paths (planner.c) hashes every
+			// non-empty set and, when an empty set (a grand total) is present,
+			// computes it in the sorted phase: AGG_MIXED, labelled
+			// MixedAggregate (explain.c). Without an empty set it is
+			// AGG_HASHED, a HashAggregate. The per-set keys are the
+			// `Hash Key:` / `Group Key: ()` detail lines (emitNodeDetailLines).
+			// M0146-0020.
+			if groupingSetsHaveEmpty(p.GroupingSets) {
+				return prefix + "MixedAggregate"
+			}
+			return prefix + "HashAggregate"
 		}
 		if len(p.GroupExprs) == 0 {
 			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
@@ -4384,4 +4429,15 @@ func indexOnlyRelName(p *optimizer.IndexOnlyScan, name func(string) string) stri
 		return ""
 	}
 	return name(p.Table.QualifiedName())
+}
+
+// groupingSetsHaveEmpty reports whether a grouping-sets aggregate has an
+// empty set (a grand total), which makes PG's strategy AGG_MIXED.
+func groupingSetsHaveEmpty(sets [][]int) bool {
+	for _, set := range sets {
+		if len(set) == 0 {
+			return true
+		}
+	}
+	return false
 }
