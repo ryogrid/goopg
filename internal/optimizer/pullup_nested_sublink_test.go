@@ -310,6 +310,66 @@ func TestKeptExistsToAnyVariants(t *testing.T) {
 	})
 }
 
+// TestJoinClauseKeepsSurvivingOuterRef pins the translateToLayout
+// pass-through: a surviving `*OuterColumnRef` inside a multi-leaf join
+// clause is a correlation bound through the enclosing scope chain at
+// execution — PG leaves the outer Var in a correlated subplan's join qual
+// — so createPlan must carry it to `lowerSubPlanParams`, not panic. Both
+// shapes below used to die in createPlan ("join clause carries a
+// *optimizer.OuterColumnRef"): a correlated scalar subplan whose join
+// clause mixes two leaves with an outer ref, and the M0146-0015c
+// nested-EXISTS shape whose composite escaping ref made a's own pull-up
+// emit `b.j2 = a.v + OuterRef` as the inner semi join's link clause.
+func TestJoinClauseKeepsSurvivingOuterRef(t *testing.T) {
+	cat := jtpCatalog(t)
+
+	t.Run("correlated join clause inside a scalar subplan plans", func(t *testing.T) {
+		node := planOnPipeline(t,
+			`select k, (select a.j + b.j2 from jtp_i a, jtp_i2 b where a.j = b.j2 + k) from jtp_o`, cat)
+		// The scalar subquery becomes a SubPlan in the projection; inside
+		// its plan the outer ref must have been LOWERED to an ExecParamRef
+		// — a surviving OuterColumnRef would mean the join clause carried
+		// an unbound correlation into the executor.
+		var sub *SubqueryExpr
+		walkPlanExprs(node, func(e Expr) {
+			if s, isS := e.(*SubqueryExpr); isS && s.Plan != nil {
+				sub = s
+			}
+		})
+		if sub == nil {
+			t.Fatalf("no scalar SubPlan in the projection; tree: %s", describePlanTree(node))
+		}
+		var sawParam bool
+		walkPlanExprs(sub.Plan, func(e Expr) {
+			switch x := e.(type) {
+			case *OuterColumnRef:
+				t.Fatalf("OuterColumnRef %s/level=%d survived lowering inside the "+
+					"subplan's join clause", x.Name, x.Level)
+			case *ExecParamRef:
+				sawParam = true
+			}
+		})
+		if !sawParam {
+			t.Fatalf("the surviving outer ref did not lower to an ExecParamRef")
+		}
+	})
+
+	t.Run("composite escaping ref in a nested EXISTS plans", func(t *testing.T) {
+		// `b.j2 = a.v + k`: inside a's subquery the inner EXISTS pulls and
+		// its link clause carries the Level-2 escape as a surviving
+		// OuterColumnRef — the exact shape translateToLayout used to
+		// refuse. At top level the inner EXISTS spans scopes and stays a
+		// kept SubPlan; either way the statement must plan, and plan
+		// correctly.
+		node := planOnPipeline(t,
+			`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+				`and exists (select 1 from jtp_i2 b where b.j2 = a.v + k))`, cat)
+		if node == nil {
+			t.Fatalf("the composite-escape shape must plan (it panicked in createPlan)")
+		}
+	})
+}
+
 // TestExprHasConvertibleSublink pins WHICH sublink kinds count as convertible.
 // The list is not "every sublink": `pull_up_sublinks_qual_recurse` converts
 // ANY and EXISTS and nothing else, so a scalar subquery must answer false or

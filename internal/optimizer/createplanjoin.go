@@ -191,14 +191,20 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 //     the same policy, so a translation with a different notion of "a reference
 //     belonging to this scope" would be translating a different clause than the
 //     one that was placed (rule #2 — sibling paths must agree).
-//   - An `*OuterColumnRef` or a `*CTIDExpr` at this level is refused. Neither
-//     is positional, so both would survive the rewrite unchanged and silently
-//     mean something else: an OuterColumnRef is a correlation into a scope the
-//     flat merged row cannot supply, and a CTIDExpr is injected by the SCAN into
+//   - A `*CTIDExpr` at this level is refused. It is injected by the SCAN into
 //     its own row's slot (`MaterializedSlot.hasCTID`), so hoisting it onto the
-//     join re-points it at whichever side the merged row starts with. The same
-//     two are refused by `cloneExprShiftIdx` (nl_index_join.go:802-811) for the
-//     same reasons.
+//     join re-points it at whichever side the merged row starts with. An
+//     `*OuterColumnRef` is NOT refused: it is a correlation bound through the
+//     enclosing scope chain, not a positional column, so it needs no
+//     renumbering — it rides the clause exactly as it already does in leaf
+//     filters and project targets inside correlated SubPlans (PG likewise
+//     leaves the outer Var in the join qual of a correlated subplan). The
+//     resolver can only produce an OuterColumnRef below a parent scope, so
+//     any that reaches createPlan is inside a subquery plan by construction;
+//     `lowerSubPlanParams` then binds it into a PARAM_EXEC. The hoisting
+//     boundary is different and stays refused: `cloneExprShiftIdx`
+//     (nl_index_join.go) MOVES a conjunct one scope level outward, where the
+//     same Level 1 would silently name a different scope.
 //
 // `what` names the thing being translated ("join clause", "sort key") purely so
 // a panic says which producer to look at; every caller is a `createPlan` arm.
@@ -224,7 +230,7 @@ func translateToLayout(what string, e Expr, lay outputLayout, index map[int]int)
 					return n
 				}
 				x.Index = local
-			case *OuterColumnRef, *CTIDExpr:
+			case *CTIDExpr:
 				if refused == nil {
 					refused = n
 				}
