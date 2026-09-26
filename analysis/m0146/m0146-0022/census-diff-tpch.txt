@@ -1,0 +1,12 @@
+9c9
+< Q9 depth=5 [qual-placement] under Hash Join: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q9 MATCH (no structural divergence)
+23,24c23,24
+< FIRST-DIVERGENCE: queries=22 divergent=17 match=5
+< CATEGORY-ROLLUP: aggregation-strategy=6 sort-strategy=5 qual-placement=3 parameterisation=1 scan-type=1 join-method=1
+---
+> FIRST-DIVERGENCE: queries=22 divergent=16 match=6
+> CATEGORY-ROLLUP: aggregation-strategy=6 sort-strategy=5 qual-placement=2 parameterisation=1 scan-type=1 join-method=1
+32d31
+<     1  qual-placement   under Hash Join        PG Nested Loop Inner            goopg Nested Loop Inner            depth=5

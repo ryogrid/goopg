@@ -611,6 +611,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
+	// M0146-0022: one clause per equivalence class at an inner join, only
+	// where no special join can null-extend a class member.
+	s.clauses.ecReduce = len(sjis) == 0
 	s.orClauseSelDivisor = prob.orClauseSelDivisor
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.

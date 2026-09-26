@@ -329,3 +329,59 @@ func TestRelidsOfExprRejectsForeignCoordinates(t *testing.T) {
 		t.Errorf("expected the unattributable clause to be dropped, got %d clauses", len(l.all))
 	}
 }
+
+// TestInnerJoinAppliesOneClausePerEquivClass pins M0146-0022's
+// generate_join_implied_equalities_normal: at an inner join, a class with
+// several applicable clauses contributes ONE, equating the first outer
+// member to the first inner member in ec_members order (the order
+// process_equivalence added them), written outer = inner.
+func TestInnerJoinAppliesOneClausePerEquivClass(t *testing.T) {
+	cum, c := riTestCols(4)
+	// Written b = a, then c = a, then d = c: ec_members order is b, a, c, d.
+	conjuncts := []Expr{riEq(c[1], c[0]), riEq(c[2], c[0]), riEq(c[3], c[2])}
+	conjuncts = append(conjuncts, inferTransitiveEqualities(conjuncts)...)
+	l := buildRestrictInfos(conjuncts, 0, cum)
+	l.ecReduce = true
+
+	// {a,b} ⋈ {c,d}: outer members b, a; inner members c, d. PG applies
+	// b = c.
+	got := l.buildJoinRelRestrictList(0b0011, 0b1100, nil)
+	if len(got) != 1 {
+		t.Fatalf("{a,b} ⋈ {c,d}: %d clauses, want 1", len(got))
+	}
+	lc, rc, ok := isColumnRefEquality(got[0].clause)
+	if !ok || lc != c[1] || rc != c[2] {
+		t.Fatalf("{a,b} ⋈ {c,d}: got %v, want b = c", got[0].clause)
+	}
+	// Reversed sides: the clause is written outer = inner, c = b.
+	got = l.buildJoinRelRestrictList(0b1100, 0b0011, nil)
+	lc, rc, ok = isColumnRefEquality(got[0].clause)
+	if len(got) != 1 || !ok || lc != c[2] || rc != c[1] {
+		t.Fatalf("{c,d} ⋈ {a,b}: got %v, want c = b", got)
+	}
+	if again := l.buildJoinRelRestrictList(0b1100, 0b0011, nil); again[0] != got[0] {
+		t.Error("the flipped clause must keep one identity across calls")
+	}
+	// Sizing still sees every applicable clause.
+	if n := len(l.joinRelSizingClauses(0b0011, 0b1100, nil)); n != 4 {
+		t.Errorf("sizing clauses = %d, want 4", n)
+	}
+	// Off (a problem with special joins): every clause stays.
+	l.ecReduce = false
+	if n := len(l.buildJoinRelRestrictList(0b0011, 0b1100, nil)); n != 4 {
+		t.Errorf("ecReduce off: %d clauses, want 4", n)
+	}
+}
+
+// TestEquivClassReductionNeedsEquatedSides: without the transitive
+// closure, a side's members are not known equal inside it, so every
+// clause is kept — dropping one would lose a restriction.
+func TestEquivClassReductionNeedsEquatedSides(t *testing.T) {
+	cum, c := riTestCols(3)
+	// a = c and b = c only: {a,b} was joined without an a = b clause.
+	l := buildRestrictInfos([]Expr{riEq(c[0], c[2]), riEq(c[1], c[2])}, 0, cum)
+	l.ecReduce = true
+	if n := len(l.buildJoinRelRestrictList(0b011, 0b100, nil)); n != 2 {
+		t.Fatalf("{a,b} ⋈ {c} without a = b: %d clauses, want 2", n)
+	}
+}

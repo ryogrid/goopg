@@ -21762,6 +21762,23 @@ M0146-0001 re-baseline census on the new default arm.
       29 → 25 \(SF0.25\), 29 → 23 \(SF1\); all gates pass.
   - Open: derived\-table output chase \(Q46/Q68 `bought_city`\) — ledgered.
   Movement: TPC\-DS Q97 depth 2 → 3 \(SF0.25, SF1\); Q74/Q31/Q77 condition text matches PG
+- [x] **M0146\-0022 — an inner join applies one clause per equivalence
+  class** \(filed and done 2026\-09\-26 from the census: TPC\-DS Q74/Q31
+  qual\-placement, three or four redundant equalities per Join Filter\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0022\-one\-clause\-per\-equivalence\-class.md`;
+    evidence `analysis/m0146/m0146\-0022/`.
+    - `reduceEquivClassJoinClauses` \(`generate\_join\_implied\_equalities\_normal`\):
+      first outer member = first inner member in `ec\_members` order,
+      fail\-closed, only in problems without special joins.
+    - Join sizing unchanged \(`joinRelSizingClauses`\).
+    - TPC\-DS Q31/Q74 MATCH \(SF0.25\), Q24 deeper at both scales, TPC\-H Q9
+      MATCH; all gates pass.
+  - Open: sizing with the generated clause, special\-join problems,
+    `ec\_has\_const` — ledgered.
+  Movement: TPC\-DS Q31 Q74 → MATCH \(SF0.25\), Q24 depth 4 → 6 \(SF0.25\) / 4 → 7 \(SF1\); TPC\-H Q9 → MATCH
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the
