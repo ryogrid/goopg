@@ -1,0 +1,14 @@
+ rnk |     best_performing     |    worst_performing     
+-----+-------------------------+-------------------------
+   1 | n stcallypribarought    | bareingcallyought
+   2 | pricallyoughtationought | prioughtoughtcallyought
+   3 | ablecallyesecallyought  | ableantieinganti
+   4 | oughteingbaranti        | antioughtn stpri
+   5 | oughtbareseableought    | oughtn steingpri
+   6 | ationesen stationought  | eingeingprieing
+   7 | eingcallyationeseought  | oughtn stantieseought
+   8 | oughtantiableantiought  | eingationbarpri
+   9 | pricallypripri          | ableeingcallyable
+  10 | ationn stn stought      | priantiprically
+(10 rows)
+

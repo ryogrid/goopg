@@ -1,0 +1,4 @@
+ ss_customer_sk | sumsales 
+----------------+----------
+(0 rows)
+

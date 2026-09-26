@@ -4774,9 +4774,10 @@ before/after proving the defect it closes.
       live fact needed (is the GatherMerge candidate generated?) came from
       a `DP_TRACE=1` plan-only probe, a different instrument that produces
       no timing.
-- [!] **M0137-0019a — reprice the `GatherMerge` + worker-sort arm** (filed
+- [x] **M0137-0019a — reprice the `GatherMerge` + worker-sort arm** (filed
   by M0137-0019's triage). **PREMISE REFUTED 2026-09-20 (loop \#51);
-  BLOCKED on an executor capability, not on a decision the loop may take.**
+  BLOCKED on an executor capability, not on a decision the loop may take —
+  capability landed 2026-09-27; re-evaluation below.**
   Design doc:
   `docs/design/0100-0149/m0137-0019a-gathermerge-arm-refuted.md`.
   Kind: recon
@@ -4829,6 +4830,26 @@ before/after proving the defect it closes.
     **M0146-0002** (M0140-0007's re-scope). This task's re-evaluation
     fires when both land — measured on the canonical capture per the
     note above, not assumed.
+  - **RE-EVALUATION FIRED 2026-09-27 (loop #12).** Both unblock tasks
+    have landed — M0146-0002 `[x]` and M0146-0003 `[x]` (S6 =
+    M0146-0003d). Measured on the canonical `estimate-audit -plan-only
+    -serial=false` capture exactly as the disposition prescribed:
+    `parallelism` reads **9/22**, down from the 16/22 floor this task
+    recorded. Family B resolved as predicted — Q1 is a full MATCH
+    (PG's exact `Finalize GroupAggregate → Gather Merge → Sort →
+    Partial HashAggregate` spine) and Q4/Q5/Q7/Q12 shed the category.
+    The one counter-move is **Q9** (MATCH → SHAPE-DIFF
+    `[sort-strategy, parallelism]`): goopg elects the presorted split
+    where PG hashes, because goopg's `partialGroups` estimate (5000 vs
+    PG's 60125) honestly prices the arm cheaper — a stats-estimate
+    divergence upstream of the capability, NOT the floored class this
+    task tracked. Family B is no longer the floor: the residual
+    `parallelism=9` records live in Q8 Q9 Q15a Q16 Q18 Q19 Q20 Q21 Q22
+    — join-election / Parallel-Hash / stats territory the milestone
+    census already owns, not this task's executor-model class.
+  - Verdict: the premise ("family B floored by the executor model")
+    was correct, the unblock landed, and the predicted movement
+    materialised — measured, not assumed. Closing as completed.
 - [x] **M0137-0019b — file a partial path beneath `Nested Loop Semi Join`**
   (filed by M0137-0019's triage). TPC-H Q4 is the corpus's only fully
   SERIAL plan in parallel mode: goopg plans
@@ -21320,7 +21341,7 @@ M0146-0001 re-baseline census on the new default arm.
       `TestParallelLateralAntiProbeIdentity` — row identity under
       `\-race`, workers 1/2/4, `NOT EXISTS` electing the decomposed
       probe under `SetIndexProbeCostMultiplier("1")`.
-- [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
+- [x] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
   M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
   the zero-row shared-accumulator model to one that emits real partial
   rows (transition-state publication → serialize/deserialize →
@@ -21331,6 +21352,15 @@ M0146-0001 re-baseline census on the new default arm.
   re-evaluated on the canonical capture.
   Kind: impl
   Parent: M0137-0019a
+  Movement: yes — match 5 → 6, `CATEGORIES-EXCL-MATCH` parallelism 13 → 9
+  on the canonical TPC-H capture (Q1 becomes a MATCH; Q4 Q5 Q7 Q12 shed
+  the divergence; Q9 gains it — stats-estimate election, see 0003d)
+  - **DONE 2026-09-27** with slice M0146-0003d (below): the producer
+    files the presorted split beside the hashed one, createPlan lowers
+    it, and the canonical capture measures the movement the task was
+    filed to produce. All four adopted slices landed; deferrals are
+    carried by M0146-0016 (non-column group keys) and the existing
+    ledger rows for grouping sets / special aggregates.
   - 2026\-09\-26: slice M0146\-0003a \(below\) landed the nested\-scope split;
     the row\-emitting partial chain \(M0141\-S3 → S6\) remains.
   - 2026\-09\-27: slice M0146\-0003b landed the S3/S4 transport \-\-
@@ -21413,6 +21443,64 @@ M0146-0001 re-baseline census on the new default arm.
       identical; GatherMerge identity vs serial verified positionally
       at workers 1/2/4 under \-race.
   Movement: none \(consumer slice; producer lands with S6\)
+- [x] **M0146\-0003d — the sorted split producer emits `PartialEmit`
+  pairs and `Finalize GroupAggregate` reaches the corpus** \(M0141\-S6,
+  landed 2026\-09\-27\).
+  Kind: impl
+  Parent: M0146\-0003
+  - **DONE 2026\-09\-27.** Design doc
+    `docs/design/0100\-0149/m0146\-0003d\-partial\-agg\-sorted\-producer.md`;
+    evidence `analysis/m0146/m0146\-0003d/`.
+    - `addPartialAggSortedSplitArm` files `gather_grouping_paths`\'
+      presorted arm \(planner.c:7704\-7724\) beside the hashed split:
+      `PathFinalizeAgg\(Sorted\) → PathGatherMerge → PathSort →
+      PathAgg\(Hashed\)`, priced over `partialGroups \* d` crossed
+      group\-states and competing through `add_path` — never forced.
+    - `transportGroupSortKeys` derives transport\-position merge keys
+      \(clause order, `Desc`/`NullsFirst` preserved, bare `ColumnRef`
+      required — else the arm declines, ledgered as M0146\-0016\);
+      `splitAggregateTransportSorted` constructs the node pair;
+      `createFinalizeAggSortedPlan` lowers the `PathGatherMerge`
+      boundary; `aggregateEmissionPathkeys`\' Final arm claims the
+      merge order in output coords so a group\-key ORDER BY elides the
+      leader Sort.
+    - Belt hardening shipped with it: the order belt reads the
+      declared merge order via `compareDatumWithNullsFirst` \(NULL and
+      DESC clauses were unhandled by the bare `compareDatum` it
+      replaced\); `StripGather` restores `src.Strategy` on fold so a
+      stripped sorted split cannot fake an order claim.
+    - Canonical TPC\-H capture: `parallelism` 13 → 9, `sort\-strategy`
+      10 → 9, `join\-order` 13 → 12, `join\-method` 7 → 6,
+      `rendering` 1 → 0; **Q1 = MATCH** \(the exact
+      `Finalize GroupAggregate → Gather Merge → Sort → Partial
+      HashAggregate → Parallel Seq Scan` spine, cost 166053 vs PG
+      200862\). Q9 moved MATCH → SHAPE\-DIFF `[sort\-strategy,
+      parallelism]`: goopg elects the presorted split where PG hashes —
+      goopg\'s `partialGroups` estimate \(5000 vs PG\'s 60125\) makes
+      the arm honestly cheap\-enough; a stats divergence upstream of
+      this change, not plan forcing, recorded under `Movement:`.
+    - TPC\-DS: 11 plans moved per scale \(Q5 Q19 Q42 Q43 Q44 Q52 Q55
+      Q58 Q60 Q77 Q93\), every fire execution PASS \(values real under
+      FORCE\=1 — nightly co\-resident, timings void\); sweep
+      96/96 verdicts; acceptance arm 24/24 value\-identical.
+  Movement: yes — match 5 → 6, `CATEGORIES\-EXCL\-MATCH` parallelism
+  13 → 9 on the canonical TPC\-H capture \(Q1 → MATCH; TPC\-DS SF0.25
+  `aggregation\-strategy` 31 → 32 / `sort\-strategy` 52 → 54 within
+  the ±3 noise band\)
+- [ ] **M0146-0016 — presorted split admits non-column group keys**
+  (impl). M0146-0003d's `transportGroupSortKeys` requires every group
+  expression to be a bare `ColumnRef` — the transport output positions
+  have no honest name otherwise. PG's arm carries arbitrary group
+  expressions (the transport position IS the merge key). Widen the arm
+  to name transport positions for general group expressions — needs an
+  honest target-name story (PG labels them by the group expression
+  itself, e.g. `Sort Key: (extract(...))` on the transport column) or
+  output-alias naming, plus GatherMerge/EXPLAIN coverage proving the
+  rendered key names still match PG's. Declines today are silent and
+  correct (hashed split still wins where it should); measure a real
+  corpus consumer before implementing.
+  Kind: impl
+  Parent: M0146-0003
 - [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed

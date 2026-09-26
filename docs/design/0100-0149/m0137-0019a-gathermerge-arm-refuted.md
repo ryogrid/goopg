@@ -1,7 +1,9 @@
 # M0137-0019a — the GatherMerge arm is not mispriced; goopg cannot build PG's shape
 
-Status: REFUTED BY PROBE 2026-09-20 — no repricing is possible or correct;
-the task is blocked on an executor capability and marked `[!]`
+Status: COMPLETE 2026-09-27 — premise refuted 2026-09-20 (no repricing
+possible); the blocking capability landed as M0146-0003d and the
+owner-disposition re-evaluation measured `parallelism` 16 -> 9 on the
+canonical capture (see §7). Task closed `[x]`.
 Kind: recon (filed as `impl`; the probe that had to run first refuted its
 premise before any code was written)
 Parent: M0137-0019
@@ -141,3 +143,28 @@ it — read the producer's own comment, which says "no-split" in the first line 
 cost about two minutes this loop. Recorded because this is the third premise in
 this session that survived until someone compared the goopg shape to the PG
 shape node by node.
+
+## 7. Re-evaluation (2026-09-27, M0146-0003d landed)
+
+The owner disposition named the firing condition: when M0146-0003 (row-emitting
+PartialAgg) and M0146-0002 (partial-inner Parallel Hash) both land, re-evaluate
+on the canonical capture — measured, not assumed. Both are now `[x]`.
+
+Measured (`estimate-audit -plan-only -serial=false`, shipped config, private
+clone): `parallelism` reads **9/22**, down from the 16/22 floor §5 recorded.
+
+- **Q1 is a full MATCH** — goopg now emits the exact spine this document said
+  it could not build: `Finalize GroupAggregate -> Gather Merge -> Sort ->
+  Partial HashAggregate -> Parallel Seq Scan on lineitem`.
+- Q4, Q5, Q7, Q12 shed their `parallelism` records — family B's floor moved
+  exactly as predicted.
+- **Q9 moved MATCH -> SHAPE-DIFF** `[sort-strategy, parallelism]`: goopg elects
+  the presorted split where PG hashes, because goopg's `partialGroups` estimate
+  (~5000 vs PG's ~60125) honestly prices the arm cheaper. That is a
+  stats/cardinality divergence upstream of this capability (M0146-0009
+  territory), not the executor-model class this task floored.
+- Residual `parallelism` members — Q8 Q9 Q15a Q16 Q18 Q19 Q20 Q21 Q22 — live in
+  join-election / Parallel-Hash / stats territory the milestone census owns.
+
+Verdict: the premise ("family B floored by the executor model") was correct;
+the unblock landed; the predicted movement materialised. Task closed.
