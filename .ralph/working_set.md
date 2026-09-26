@@ -3,7 +3,7 @@
 Task: M0146-0016 — presorted split admits non-column group keys
 (TPC-DS Q62/Q99 witnesses).
 
-LANDED + PUSHED pending: commit at end of this loop; all gates
+LANDED + PUSHED: `2d66bc4d0` on plan-parity-with-pg-take2-ralph2; all gates
 PASS-stamped against staged code_tree
 f78f78f5520997e75725f2228f99df1d5ef4775ea98b31f832b7712ae2209b25
 (units, tpch-spotcheck Q12=2/Q13=33, sf025 sweep 96 PASS/0 err,
