@@ -293,3 +293,90 @@ func TestBoundaryProjectSurvivesReconcileTargets(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchedCheapestTotalInputRebuildsADisplacedInput is the M0146-0005u
+// mechanism pin: when the seam's fraction pick committed the searched root
+// to a path that is NOT the rel's cheapest-total, the helper rebuilds the
+// boundary node over the cheapest-total path so upper stages can price it
+// (`input_rel->cheapest_total_path`, planner.c:7122). The rel's Pathlist
+// is fabricated into that state by repointing CheapestTotal at a sibling
+// path whose total is made cheaper — the same situation `finalPath`
+// produces under a LIMIT, without needing a statistical fixture.
+func TestSearchedCheapestTotalInputRebuildsADisplacedInput(t *testing.T) {
+	a, b := cpjTwoRel()
+	committed := stHashRoot(a, b)
+	committed.Cost = Cost{Startup: 1, Total: 100}
+	node := createPlanAtSearchRoot(committed, 5)
+	rel := searchedRelOf(node)
+	if rel == nil {
+		t.Fatal("searched root carries no rel — the fixture must stamp one")
+	}
+
+	// A merge path over the same rels, reordered (b outer): lowers to the
+	// same five binding coordinates through a boundary *Project, strictly
+	// cheaper than the committed subtree.
+	key := stNamedEqui(a.Relids, b.Relids, 0, 3, "a0", "b1")
+	other := cpjMergePath(cpjLeafPath(b), cpjLeafPath(a), []*restrictInfo{key}, nil, nil)
+	other.Cost = Cost{Startup: 0.5, Total: 50}
+
+	// No displacement yet: no cheapest-total path at all, then the
+	// committed path itself — both must decline, or the arms above would
+	// file every candidate over an identical input twice.
+	rel.CheapestTotal = nil
+	if got, p := searchedCheapestTotalInput(node); got != nil || p != nil {
+		t.Fatalf("nil cheapest-total: got (%v, %v), want (nil, nil)", got, p)
+	}
+	rel.CheapestTotal = committed
+	if got, p := searchedCheapestTotalInput(node); got != nil || p != nil {
+		t.Fatalf("undisplaced input: got (%v, %v), want (nil, nil)", got, p)
+	}
+
+	// A path that cannot reproduce the boundary row — a leaf path covers
+	// two of the five coordinates — must decline rather than land on
+	// boundaryMap's hole panic.
+	rel.CheapestTotal = &Path{Kind: PathSeqScan, Rel: a, Rows: a.Rows, Cost: Cost{Total: 1}}
+	if got, p := searchedCheapestTotalInput(node); got != nil || p != nil {
+		t.Fatalf("short-emission path: got (%v, %v), want (nil, nil)", got, p)
+	}
+
+	// Displace: the fraction pick's situation — a strictly cheaper
+	// cheapest-total path the committed subtree displaced.
+	rel.CheapestTotal = other
+	got, p := searchedCheapestTotalInput(node)
+	if got == nil || p != other {
+		t.Fatalf("displaced input: got (%v, %v), want (rebuilt node, %v)", got, p, other)
+	}
+	sr, ok := got.(searchRootNode)
+	if !ok || !sr.isFromJoinSearch() || sr.searchedRel() != other.Rel {
+		t.Fatalf("rebuilt root lost the searched-tree tag/rel (%T)", got)
+	}
+	if !outputSchemaEqual(got.Output(), node.Output()) {
+		t.Fatalf("rebuilt input emits a different row: got %v, want %v", got.Output(), node.Output())
+	}
+	if got == node {
+		t.Fatal("rebuild returned the committed subtree, not the path's own")
+	}
+	// The reordered path reaches the boundary through a *Project — the
+	// merge root itself sits below it.
+	proj, isProj := got.(*Project)
+	if !isProj {
+		t.Fatalf("reordered rebuild = %T, want the boundary *Project", got)
+	}
+	if _, isJoin := proj.Child.(*Join); !isJoin {
+		t.Fatalf("boundary child = %T, want the merge *Join", proj.Child)
+	}
+
+	// A Sort-wrapped searched input splices the same rebuild underneath.
+	wrapped := &Sort{Child: node}
+	got2, p2 := searchedCheapestTotalInput(wrapped)
+	if got2 == nil || p2 != other {
+		t.Fatalf("Sort-wrapped displaced input: got (%v, %v), want (spliced node, %v)", got2, p2, other)
+	}
+	srt, isSort := got2.(*Sort)
+	if !isSort {
+		t.Fatalf("splice dropped the wrapper: got %T, want *Sort", got2)
+	}
+	if _, isProj := srt.Child.(*Project); !isProj {
+		t.Fatalf("spliced searched root = %T, want the boundary *Project", srt.Child)
+	}
+}

@@ -660,13 +660,51 @@ Scan labels print `<relation> <refname>` as ExplainTargetRel does. Q14's
 record moves to `CTE avg_sales`. The rendering category drops by 2 at
 each scale. Evidence: `analysis/m0146/m0146-0005/slice20/`.
 
+## Slice 21 (M0146-0005u): grouping inputs read the searched rel's
+cheapest-total path
+
+TPC-DS Q22's SF0.25 `join-method` record was not a candidate-pool gap —
+the parallel hash join for `inventory ⋈ date_dim` was offered, accepted
+and strictly cheaper than the winner (DPPATH totals 27443 vs 96692). The
+seam commits the searched subtree to `finalPath`, the
+`get_cheapest_fractional_path` pick, which under `LIMIT 100` is a
+startup-optimal serial NLI chain. PG's grouping stage never sees that
+pick: `add_paths_to_grouping_rel` reads
+`input_rel->cheapest_total_path` (planner.c:7122), so the upper arms are
+priced over the costed Gather path. goopg's `createGroupingPaths` seeded
+every arm from the committed node tree, so the gathered arm
+re-parallelised the serial subtree while the rel's cheapest-total path
+never stood in the comparison.
+
+`searchedCheapestTotalInput` (searchedtree.go) is the equivalent read at
+the node boundary: when the searched input's stamped rel carries a
+strictly cheaper `CheapestTotal`, it rebuilds a node over that path
+through `searchedBoundaryRebuild` — a coverage pre-check against the
+boundary window, then `createPlanAtSearchRootRange` itself, then a
+positional schema compare against the committed root — and splices it
+under the same `*Project`/`*Sort` wrappers. `createGroupingPaths` swaps
+`seed`/`child` to that input for `addGroupingPaths` only; the
+partial-agg split keeps the committed child because `parallelSeedCost`
+denominates serial-subtree currency. Every unprovable case — no
+searched root, no cheaper total, an unreproducible boundary row, a
+lowering panic — declines and the committed input stands.
+
+Q22 plans `Gather -> Nested Loop -> Parallel Hash Join` now and reads
+as a census MATCH (PG's extra `Parallel Hash` build wrapper is
+normalised); values identical to PG 18.3 SF0.25, 102 rows. Goopg-vs-
+goopg self-diffs on the same private clones: Q22 is the only shape
+change across all 99 TPC-DS queries, and all 22 TPC-H queries are
+unchanged. Evidence: `analysis/m0146/m0146-0005/slice21/`.
+
 ## Remaining records
 
 Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
 - TPC-H: Q17 and Q19 (`join-method`); Q9's first divergence is now a
   `qual-placement` one.
-- TPC-DS: 24 SF0.25 and 21 SF1 records, split between `join-order`,
-  `join-method` and presorted-input `sort-strategy`.
+- TPC-DS: SF0.25 14 MATCH / 11 `join-order`+`join-method` records
+  (Q22 burned), SF1 census unchanged by this slice; the rest split
+  between `join-order`, `join-method` and presorted-input
+  `sort-strategy`.
 
 Re-run the first-divergence census on each slice's capture before choosing
 the next mechanism.

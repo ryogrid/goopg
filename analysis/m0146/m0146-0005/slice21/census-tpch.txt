@@ -1,0 +1,39 @@
+Q1 MATCH (no structural divergence)
+Q2 depth=1 [parameterisation] under Sort: PG Hash Join Inner | goopg Hash Join Inner
+Q3 MATCH (no structural divergence)
+Q4 depth=2 [sort-strategy] under Gather Merge: PG Partial GroupAggregate | goopg Sort
+Q5 depth=3 [sort-strategy] under Gather Merge: PG Partial GroupAggregate | goopg Sort
+Q6 MATCH (no structural divergence)
+Q7 depth=0 [aggregation-strategy] under -: PG GroupAggregate | goopg Finalize GroupAggregate
+Q8 depth=1 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort
+Q9 depth=0 [sort-strategy] under -: PG Sort | goopg Finalize GroupAggregate
+Q10 MATCH (no structural divergence)
+Q11 MATCH (no structural divergence)
+Q12 depth=2 [sort-strategy] under Gather Merge: PG Partial GroupAggregate | goopg Sort
+Q13 depth=4 [scan-type] under Hash Join: PG Index Only Scan customer_pk on customer | goopg Seq Scan on customer
+Q14 MATCH (no structural divergence)
+Q15a-VIEWBODY depth=0 [aggregation-strategy] under -: PG Finalize GroupAggregate | goopg Finalize HashAggregate
+Q16 depth=1 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+Q17 depth=1 [join-method] under Aggregate: PG Hash Join Inner | goopg Nested Loop Inner
+Q18 depth=1 [aggregation-strategy] under Sort: PG HashAggregate | goopg GroupAggregate
+Q19 depth=0 [aggregation-strategy] under -: PG Finalize Aggregate | goopg Aggregate
+Q20 depth=2 [parallelism] under Hash Join: PG Nested Loop Inner | goopg Gather
+Q21 depth=3 [qual-placement] under Sort: PG Nested Loop Left Semi | goopg Nested Loop Left Semi
+Q22 depth=1 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort
+FIRST-DIVERGENCE: queries=22 divergent=16 match=6
+CATEGORY-ROLLUP: sort-strategy=6 aggregation-strategy=5 parameterisation=1 scan-type=1 join-method=1 parallelism=1 qual-placement=1
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):
+    2  sort-strategy    under Gather Merge     PG Partial GroupAggregate       goopg Sort                         depth=2
+    2  sort-strategy    under GroupAggregate   PG Gather Merge                 goopg Sort                         depth=1
+    1  parameterisation under Sort             PG Hash Join Inner              goopg Hash Join Inner              depth=1
+    1  sort-strategy    under Gather Merge     PG Partial GroupAggregate       goopg Sort                         depth=3
+    1  aggregation-strategy under -                PG GroupAggregate               goopg Finalize GroupAggregate      depth=0
+    1  sort-strategy    under -                PG Sort                         goopg Finalize GroupAggregate      depth=0
+    1  scan-type        under Hash Join        PG Index Only Scan customer_pk on customer goopg Seq Scan on customer         depth=4
+    1  aggregation-strategy under -                PG Finalize GroupAggregate      goopg Finalize HashAggregate       depth=0
+    1  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=1
+    1  join-method      under Aggregate        PG Hash Join Inner              goopg Nested Loop Inner            depth=1
+    1  aggregation-strategy under Sort             PG HashAggregate                goopg GroupAggregate               depth=1
+    1  aggregation-strategy under -                PG Finalize Aggregate           goopg Aggregate                    depth=0
+    1  parallelism      under Hash Join        PG Nested Loop Inner            goopg Gather                       depth=2
+    1  qual-placement   under Sort             PG Nested Loop Left Semi        goopg Nested Loop Left Semi        depth=3

@@ -1,0 +1,23 @@
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Limit  (cost=29641.41..29754.92 rows=100 width=160)
+   ->  Sort  (cost=29641.41..29753.92 rows=45005 width=160)
+         Sort Key: (avg(inventory.inv_quantity_on_hand)), i_product_name, i_brand, i_class, i_category
+         ->  MixedAggregate  (cost=27471.30..27921.35 rows=45005 width=160)
+               Hash Key: item.i_product_name, item.i_brand, item.i_class, item.i_category
+               Hash Key: item.i_product_name, item.i_brand, item.i_class
+               Hash Key: item.i_product_name, item.i_brand
+               Hash Key: item.i_product_name
+               Group Key: ()
+               ->  Gather  (cost=3026.36..27443.25 rows=11251 width=916)
+                     Workers Planned: 3
+                     ->  Nested Loop  (cost=2026.36..25318.15 rows=3629 width=916)
+                           ->  Parallel Hash Join  (cost=2026.11..24347.15 rows=3629 width=436)
+                                 Hash Cond: (inventory.inv_date_sk = date_dim.d_date_sk)
+                                 ->  Parallel Seq Scan on inventory  (cost=0.00..20326.77 rows=759677 width=16)
+                                 ->  Parallel Seq Scan on date_dim  (cost=0.00..2023.55 rows=205 width=420)
+                                       Filter: ((d_month_seq >= 1200) AND (d_month_seq <= 1211))
+                           ->  Index Scan using item_pkey on item  (cost=0.25..0.27 rows=1 width=480)
+                                 Index Cond: (i_item_sk = inventory.inv_item_sk)
+(19 rows)
+

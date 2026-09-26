@@ -2459,18 +2459,21 @@ heuristic stays live.)
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
+  - Recurred in the 2026\-09\-27 nightly \(`AI-20260927-002707-001`\).
 - [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
   (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\).
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\) and
+    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-002`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\).
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\) and
+    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\).
 - [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -22047,6 +22050,37 @@ M0146-0001 re-baseline census on the new default arm.
     - Q14 SF0.25 record moves to `CTE avg\_sales`; rendering 27 → 25
       \(SF0.25\), 28 → 26 \(SF1\); all gates pass; regress no case worse.
   Movement: TPC\-DS Q14 SF0.25 record moves past the cross\_items subtree
+- [x] **M0146\-0005u — grouping inputs read the searched rel\'s
+  cheapest\-total path** \(opened 2026\-09\-27 from the SF0.25 census:
+  TPC\-DS Q22\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-27.** Design doc §"Slice 21"; evidence
+    `analysis/m0146/m0146\-0005/slice21/`.
+    - The seam commits the searched subtree to `finalPath` \(the
+      fractional pick\); under `LIMIT` goopg seeded every grouping arm
+      from that startup\-optimal subtree while PG\'s
+      `add\_paths\_to\_grouping\_rel` reads
+      `input\_rel->cheapest\_total\_path` \(planner\.c:7122\). Q22
+      re\-parallelised a serial memoized NLI \(input 96692\) instead of
+      consuming the rel\'s costed Gather\-over\-PHJ path \(27443\).
+    - `searchedCheapestTotalInput` rebuilds the searched input over the
+      stamped rel\'s strictly\-cheaper `CheapestTotal` through the same
+      boundary \(coverage pre\-check → `createPlanAtSearchRootRange` →
+      schema compare\), spliced under the `*Project`/`*Sort` wrappers;
+      `createGroupingPaths` swaps the seed for `addGroupingPaths` only —
+      the partial\-agg split keeps the committed child
+      \(`parallelSeedCost` denominates serial\-subtree currency\). Every
+      unprovable shape declines, including lowering panics.
+    - Q22 → `Gather -> NL -> Parallel Hash Join` = census MATCH; values
+      identical \(102 rows\). Self\-diffs on same clones: Q22 the only
+      TPC\-DS SF0.25 shape change; TPC\-H 22/22 unchanged. All gates
+      pass.
+    - Q73 panic on the stats\-drifted private clone is a pre\-existing
+      `assertSearchedTreeNeedsNoReconcile` trigger on BOTH binaries —
+      ledgered, repro preserved at `tmp/m0146\-0005\-q22/data`.
+  Movement: TPC\-DS SF0.25 Q22 `join\-method` → MATCH \(SF0.25 matches
+  13 → 14\)
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

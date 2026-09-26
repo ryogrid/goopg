@@ -89,14 +89,37 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 		seed.Rows = sr.Rows
 	}
 
+	// M0146-0005u: `input_rel->cheapest_total_path` (planner.c:7122 — the
+	// same read the sorted arms make at :7460 and the hashed arm at :7584).
+	// The seam commits `child` to `finalPath`'s tuple_fraction pick, so
+	// under a LIMIT every arm above is priced over a startup-optimal
+	// subtree upstream's live input rel never offers — TPC-DS Q22's
+	// memoized NLI chain, where the rel's cheapest-total path is the
+	// costed Gather over the partial NL/PHJ subtree. When the searched
+	// input is reachable and that path can be rebuilt through the same
+	// boundary, the arms stand on it instead — the candidate set PG
+	// actually compares. The split producer keeps the committed child:
+	// its partial-agg costing is seeded from the serial subtree, and the
+	// new input's Gather arm already covers the case it would re-derive.
+	splitSeed, splitChild := seed, child
+	if c2, p := searchedCheapestTotalInput(child); c2 != nil {
+		ct := newPrebuiltPath(grouped, c2)
+		ct.Rows = p.Rows
+		ct.Cost = p.Cost
+		seed = ct
+		child = c2
+	}
+
 	addGroupingPaths(grouped, seed, aggNode, child, cat, cp, ps)
 	// C-19g's remainder (that design's §8): the PARALLEL candidate —
 	// `Finalize -> Gather -> Partial` — filed on this same rel and adjudicated
 	// by the same `setCheapest` against the serial arms above, instead of
 	// stamped onto the finished tree by the `MaybeAddGather` post-pass.
 	// Declines to nothing under the default knob and under every fail-closed
-	// refusal in partialaggupper.go.
-	addPartialAggSplitPath(u, grouped, seed, aggNode, child, cp, ps)
+	// refusal in partialaggupper.go. M0146-0005u keeps the committed child
+	// here: the split's pseed is seeded from the serial subtree's own cost
+	// (parallelSeedCost), not from input_rel->cheapest_total_path.
+	addPartialAggSplitPath(u, grouped, splitSeed, aggNode, splitChild, cp, ps)
 	setCheapest(grouped)
 
 	best := getCheapestFractionalPath(grouped, tupleFraction)
