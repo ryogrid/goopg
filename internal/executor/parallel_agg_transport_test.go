@@ -388,6 +388,9 @@ func TestPartialEmitSortedIdentity(t *testing.T) {
 		// Two-column key — the merge order and the boundary test both
 		// walk every key column.
 		{"sorted-gathermerge-twokey", "SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s", true},
+		// M0146-0016: a non-column group key — the merge key is the
+		// transport position, not a named column.
+		{"sorted-gathermerge-exprkey", "SELECT substr(s,1,1), count(*) FROM pq_agg GROUP BY substr(s,1,1) ORDER BY 1", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			checkTransportIdentity(t, ctx, tc.sql, tc.merged, true)

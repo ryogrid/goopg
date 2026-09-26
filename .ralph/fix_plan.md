@@ -21490,7 +21490,7 @@ M0146-0001 re-baseline census on the new default arm.
   13 → 9 on the canonical TPC\-H capture \(Q1 → MATCH; TPC\-DS SF0.25
   `aggregation\-strategy` 31 → 32 / `sort\-strategy` 52 → 54 within
   the ±3 noise band\)
-- [ ] **M0146-0016 — presorted split admits non-column group keys**
+- [x] **M0146-0016 — presorted split admits non-column group keys**
   (impl). M0146-0003d's `transportGroupSortKeys` requires every group
   expression to be a bare `ColumnRef` — the transport output positions
   have no honest name otherwise. PG's arm carries arbitrary group
@@ -21504,6 +21504,23 @@ M0146-0001 re-baseline census on the new default arm.
   corpus consumer before implementing.
   Kind: impl
   Parent: M0146-0003
+  Movement: yes — CATEGORIES\-EXCL\-MATCH `parallelism` 67 → 65
+  \(SF0.25\) and 74 → 72 \(SF1\) on the m0146\-0016 fireset captures;
+  fires = \{Q62, Q99\} at both scales, match counts unchanged
+  \(`sort\-strategy` residue: PG's sorted\-input partial variant\)
+  - **DONE 2026\-09\-27.** Consumers measured on the M0146\-0001 PG
+    captures: Q62/Q99 \(`substr` group key\) at both scales — PG elects
+    the presorted family; Q76's transport constants are columns in
+    goopg \(always admissible, unchanged\); Q23 is NOT a consumer \(PG
+    itself hashes\). `transportGroupSortKeys` now synthesises a
+    positional `\*ColumnRef` named by `agg.Output()[k.Pos]` for
+    non\-column exprs — `sortGroupKeySource` \(R66 Arm S\) resolves the
+    position back to `GroupExprs`, so `Sort Key: \(substr(...)\)` prints
+    PG's label. Fail\-closed on out\-of\-range/short\-schema/unnamed slot.
+    Evidence `analysis/m0146/m0146\-0016/`; design
+    `docs/design/0100\-0149/m0146\-0016\-presorted\-split\-expr\-keys.md`.
+    Open residual: PG's sorted\-input `Partial GroupAggregate` arm
+    \(Q62/Q99's upstream winner\) is a separate admission task.
 - [x] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed

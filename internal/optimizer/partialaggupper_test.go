@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // upperSplitSettings is a PlannerSettings that permits the parallel candidate:
@@ -611,8 +613,10 @@ func TestUpperSplitSortedTransportArmRefusals(t *testing.T) {
 	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
 	defer restore()
 
-	// Non-column group expr: transportGroupSortKeys cannot name transport
-	// position 0 with a literal — the arm declines.
+	// Non-column group expr with no output schema to name the transport
+	// position: the merge key cannot be labelled honestly — the arm
+	// declines but the hashed split still competes (Q16's lesson:
+	// refusing to file is a gate decision, refusing to plan is not).
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	agg.GroupExprs[0] = &IntegerConst{Value: 7}
 	grouped, split := addSplitFor(t, agg, upperSplitSettings())
@@ -638,6 +642,58 @@ func TestUpperSplitSortedTransportArmRefusals(t *testing.T) {
 // (5.9 M rows into 2 groups) either parallel split beats the serial
 // aggregate, and the winner is whichever costs less, decided by
 // setCheapest.
+// TestUpperSplitSortedTransportArmExprKey — M0146-0016. PG's presorted
+// arm carries arbitrary group expressions (TPC-DS Q76's
+// 'store'::text keys, Q62/Q99's substr): the transport position IS the
+// merge key, so a non-column group expr is keyed positionally and NAMED
+// by the output slot — sortGroupKeySource resolves position → GroupExprs
+// at EXPLAIN time, which is what renders PG's `Sort Key: (substr(...))`.
+// This test pins admission: a named literal key files the sorted arm and
+// its worker-Sort pathkey is the positional ref into the transport row.
+func TestUpperSplitSortedTransportArmExprKey(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	agg.GroupExprs[0] = &IntegerConst{Value: 7}
+	// A real Aggregate's output schema names every group slot
+	// (groupExprName → targetMeta, PG's FigureColname); the fixture
+	// leaves it nil, so set the two group slots explicitly.
+	agg.schema = Schema{
+		{Name: "?column?", Type: catalog.Type{Name: "int4"}},
+		{Name: "g1", Type: catalog.Type{Name: "int4"}},
+	}
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("hashed split refused over a named non-column group key")
+	}
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("presorted split did not file over a named non-column group key")
+	}
+	// Finalize -> GatherMerge -> worker Sort: the merge keys ride the
+	// worker sort's Pathkeys as positional refs into the transport row.
+	if len(sorted.Children) != 1 || sorted.Children[0].Kind != PathGatherMerge {
+		t.Fatal("presorted arm is not Finalize over GatherMerge")
+	}
+	ws := sorted.Children[0].Children[0]
+	if ws == nil || ws.Kind != PathSort || len(ws.Pathkeys) != 2 {
+		t.Fatalf("worker sort missing or keyless: %+v", ws)
+	}
+	ref, ok := ws.Pathkeys[0].Expr.(*ColumnRef)
+	if !ok {
+		t.Fatalf("expr-key pathkey is %T, want positional *ColumnRef", ws.Pathkeys[0].Expr)
+	}
+	if ref.Index != 0 || ref.Name != "?column?" {
+		t.Errorf("expr-key pathkey = {Index:%d Name:%q}, want {0 \"?column?\"}", ref.Index, ref.Name)
+	}
+	// The bare-column sibling still carries its own name.
+	ref1, ok := ws.Pathkeys[1].Expr.(*ColumnRef)
+	if !ok || ref1.Index != 1 || ref1.Name != "g1" {
+		t.Errorf("column-key pathkey = %+v, want {Index:1 Name:g1}", ws.Pathkeys[1].Expr)
+	}
+}
+
 func TestUpperSplitSortedTransportArmCompetes(t *testing.T) {
 	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
 	defer restore()

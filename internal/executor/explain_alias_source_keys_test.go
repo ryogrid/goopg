@@ -294,3 +294,46 @@ func TestExprHasSubplanOrOuterRef(t *testing.T) {
 		}
 	}
 }
+
+// TestSortKeyTransportExprKeyRendersSource — M0146-0016. The widened
+// presorted split names a non-column group key by its transport
+// position (a positional ColumnRef carrying the output slot's name);
+// PG's `show_sort_group_keys` prints the group EXPRESSION for that
+// position — `Sort Key: (substr(...))`, parenthesised because the key
+// is a non-Var referent (S18). Pin the render through sortKeyParts:
+// the positional ref resolves position→GroupExprs via Arm S, and a
+// bare-column sibling keeps its own name.
+func TestSortKeyTransportExprKeyRendersSource(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE m14616 (w_name text, sm_type text, v int)"); err != nil {
+		t.Fatal(err)
+	}
+	node := planForTest(t, ctx,
+		"SELECT substr(w_name,1,20), sm_type, count(*) FROM m14616 GROUP BY substr(w_name,1,20), sm_type")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	sch := spec.Output()
+	if len(sch) < 2 || sch[0].Name == "" {
+		t.Fatalf("group output slots unnamed: %+v", sch)
+	}
+	// The refs splitAggregateTransportSorted stamps: positional Index,
+	// schema-slot Name/Type (M0146-0016 arm for the expr, clone for the
+	// column — identical coordinate contract).
+	keys := []optimizer.SortKey{
+		{Expr: &optimizer.ColumnRef{Index: 0, Name: sch[0].Name, Type: sch[0].Type}},
+		{Expr: &optimizer.ColumnRef{Index: 1, Name: sch[1].Name, Type: sch[1].Type}},
+	}
+	full, _ := sortKeyParts(spec, keys, nil, false)
+	if len(full) != 2 {
+		t.Fatalf("sortKeyParts returned %v", full)
+	}
+	if full[0] != "(substr(w_name, 1, 20))" {
+		t.Errorf("expr transport key rendered %q, want `(substr(w_name, 1, 20))`", full[0])
+	}
+	if full[1] != "m14616.sm_type" && full[1] != "sm_type" {
+		t.Errorf("column transport key rendered %q, want the column's own name", full[1])
+	}
+}

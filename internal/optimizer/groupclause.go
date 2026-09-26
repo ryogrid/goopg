@@ -169,16 +169,53 @@ func groupClauseKeys(agg *Aggregate) []GroupClauseKey {
 // positional ref would still evaluate correctly, but the clause could
 // then render no honest `Sort Key:` name — the ledgered remainder, not
 // a silently mislabeled plan (same posture partialGroupKeyRefs takes).
+// transportGroupSortKeys is the sort/merge key list for the sorted
+// row-transport split (M0146-0003 S6): one SortKey per group-clause
+// entry, in clause order, whose Expr is a POSITIONAL ColumnRef into the
+// transport row — position k.Pos carries GroupExprs[k.Pos]'s value, so
+// the same list sorts each worker's partial output, merges the streams
+// in the GatherMerge, and grounds the finalize's emission-order claim
+// (aggregateEmissionPathkeys) with no coordinate translation at all.
+//
+// A bare-ColumnRef group expression keeps its own identity: Name/Type/
+// SourceTableIdx ride along with Index rebound to k.Pos, so `Sort Key:
+// l_returnflag` still renders the name PG prints under the worker Sort.
+//
+// M0146-0016: a non-column group expression (substr, extract, a literal
+// like Q76's 'store'::text) gets a positional ref NAMED BY THE OUTPUT
+// SLOT — PG carries arbitrary group expressions on this arm because the
+// transport position IS the merge key. At EXPLAIN time sortGroupKeySource
+// (R66 Arm S) resolves the position back through the child aggregate's
+// GroupExprs, so `Sort Key: (substr(...))` renders the expression itself,
+// PG's own label, not a slot alias.
+//
+// Declines (ok=false) only when a position cannot be named honestly: an
+// out-of-range clause position, a missing/short output schema, or an
+// unnamed slot — the fail-closed posture partialGroupKeyRefs takes.
 func transportGroupSortKeys(agg *Aggregate) ([]SortKey, bool) {
+	sch := agg.Output()
 	keys := make([]SortKey, 0, len(agg.GroupExprs))
 	for _, k := range groupClauseKeys(agg) {
-		cr, ok := agg.GroupExprs[k.Pos].(*ColumnRef)
-		if !ok {
+		if k.Pos < 0 || k.Pos >= len(agg.GroupExprs) {
 			return nil, false
 		}
-		ref := *cr
-		ref.Index = k.Pos
-		keys = append(keys, SortKey{Expr: &ref, Desc: k.Desc, NullsFirst: k.NullsFirst})
+		if cr, ok := agg.GroupExprs[k.Pos].(*ColumnRef); ok {
+			ref := *cr
+			ref.Index = k.Pos
+			keys = append(keys, SortKey{Expr: &ref, Desc: k.Desc, NullsFirst: k.NullsFirst})
+			continue
+		}
+		if k.Pos >= len(sch) || sch[k.Pos].Name == "" {
+			return nil, false
+		}
+		slot := sch[k.Pos]
+		keys = append(keys, SortKey{Expr: &ColumnRef{
+			pos:            agg.GroupExprs[k.Pos].Pos(),
+			Index:          k.Pos,
+			Name:           slot.Name,
+			Type:           slot.Type,
+			SourceTableIdx: slot.SourceTableIdx,
+		}, Desc: k.Desc, NullsFirst: k.NullsFirst})
 	}
 	return keys, true
 }

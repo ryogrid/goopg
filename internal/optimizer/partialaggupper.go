@@ -539,9 +539,9 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// other arm pair here. The extra gates: a sorted transport fold
 		// needs ≥1 group key, the sorted fold has no grouping-sets or
 		// special-aggregate variant (the sorted gathered arm's own
-		// gates), and every group key must be a bare column so the
-		// merge keys can name it (transportGroupSortKeys' own refusal,
-		// ledgered).
+		// gates), and every group key must admit a positional merge
+		// key (transportGroupSortKeys' own refusal — bare columns
+		// clone; expressions take the output slot's name, M0146-0016).
 		if nGroupCols > 0 && aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
 			if _, ok := transportGroupSortKeys(aggNode); ok {
 				addPartialAggSortedSplitArm(grouped, partialRel, pseed, aggNode, cp,
