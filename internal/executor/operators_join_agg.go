@@ -2257,6 +2257,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return o.openSorted(ctx)
 	}
 
+	// M0146-0003 S5: a sorted-armed row-transport finalize consumes a
+	// merge-ordered serialized-state stream (PG's Finalize GroupAggregate
+	// over Gather Merge). Same pairing contract as the hash absorb: the
+	// flag must sit on both nodes of the pair.
+	if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit && o.plan.Strategy == optimizer.AggStrategySorted {
+		if o.plan.GroupingSets != nil {
+			return &ExecError{
+				Code:    "XX000",
+				Message: "internal error: row-transport finalize does not support grouping sets",
+			}
+		}
+		return o.openSortedPartialTransport(ctx)
+	}
+
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
 
@@ -2657,58 +2671,49 @@ func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, orde
 	return nil
 }
 
-// absorbPartialStateRow folds one transported partial row —
-// [group key values | passthrough values | serialized states] — into the
-// finalize's group map. Deserialised states combine through the SAME
-// combineAggRuntime rules the shared-accumulator transport uses, so the
-// two transports can never disagree about what a combination means.
-func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*groupRuntime, order *[]string) error {
+// partialStateRow is one decoded transport row — [group key values |
+// passthrough values | deserialized transition state per aggregate].
+// keyParts is the datumKey vector the hash absorb's map key is built
+// from and the sorted fold's boundary test compares; gv/pt reference
+// the transport row and are detached by whichever arm retains them.
+type partialStateRow struct {
+	keyParts []string
+	gv       Row
+	pt       Row
+	states   []aggRuntime
+}
+
+// decodePartialStateRow validates and splits one transported partial
+// row. Shared by the hash absorb (absorbPartialStateRow) and the sorted
+// fold (openSortedPartialTransport): a malformed row — wrong width, a
+// non-bytes state column, a truncated or overlong serialized frame —
+// errors identically on both arms, so the two consumers can never
+// disagree about what the wire shape is.
+func (o *aggregateOp) decodePartialStateRow(row Row) (*partialStateRow, error) {
 	nGroupCols := len(o.plan.GroupExprs)
 	nPass := len(o.plan.Passthrough)
 	nAggs := len(o.plan.Aggs)
-	row := slot.Row()
 	if len(row) != nGroupCols+nPass+nAggs {
-		return &ExecError{
+		return nil, &ExecError{
 			Code: "XX000",
 			Message: fmt.Sprintf("internal error: partial-state row has %d columns, want %d "+
 				"(group keys + passthrough + aggregates) — a PartialEmit partial must feed "+
 				"a PartialEmit finalize", len(row), nGroupCols+nPass+nAggs),
 		}
 	}
-	gv := row[:nGroupCols]
-	allKeys := make([]string, nGroupCols)
-	for i, d := range gv {
-		allKeys[i] = datumKey(d)
+	dr := &partialStateRow{
+		keyParts: make([]string, nGroupCols),
+		gv:       row[:nGroupCols],
+		pt:       row[nGroupCols : nGroupCols+nPass],
+		states:   make([]aggRuntime, nAggs),
 	}
-	set := make([]int, nGroupCols)
-	for i := range set {
-		set[i] = i
-	}
-	key := o.setGroupKey(0, set, allKeys, false)
-	gr, ok := groups[key]
-	if !ok {
-		// Retain the founder's key and passthrough values detached from
-		// the transport row, the same retention boundary the input drain
-		// applies (M0073-0004).
-		ngv := make(Row, nGroupCols)
-		for i := range ngv {
-			ngv[i] = gv[i].MaterializeArena()
-		}
-		var npt Row
-		if nPass > 0 {
-			npt = make(Row, nPass)
-			for i := range npt {
-				npt[i] = row[nGroupCols+i].MaterializeArena()
-			}
-		}
-		gr = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, nAggs)}
-		groups[key] = gr
-		*order = append(*order, key)
+	for i, d := range dr.gv {
+		dr.keyParts[i] = datumKey(d)
 	}
 	for i := 0; i < nAggs; i++ {
 		sd := row[nGroupCols+nPass+i]
 		if sd.Kind != KindBytes {
-			return &ExecError{
+			return nil, &ExecError{
 				Code: "XX000",
 				Message: fmt.Sprintf("internal error: partial-state column %d has datum kind %v, "+
 					"want serialized bytes", i, sd.Kind),
@@ -2716,13 +2721,155 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 		}
 		st, err := deserializeAggRuntime(o.plan.Aggs[i].Name, sd.BytesValue())
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &st); err != nil {
+		dr.states[i] = st
+	}
+	return dr, nil
+}
+
+// absorbPartialStateRow folds one transported partial row into the
+// finalize's group map (M0146-0003b): deserialised states combine
+// through the SAME combineAggRuntime rules the shared-accumulator
+// transport uses, so the two transports can never disagree about what a
+// combination means.
+func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*groupRuntime, order *[]string) error {
+	dr, err := o.decodePartialStateRow(slot.Row())
+	if err != nil {
+		return err
+	}
+	nGroupCols := len(dr.gv)
+	set := make([]int, nGroupCols)
+	for i := range set {
+		set[i] = i
+	}
+	key := o.setGroupKey(0, set, dr.keyParts, false)
+	gr, ok := groups[key]
+	if !ok {
+		// Retain the founder's key and passthrough values detached from
+		// the transport row, the same retention boundary the input drain
+		// applies (M0073-0004).
+		ngv := make(Row, nGroupCols)
+		for i := range ngv {
+			ngv[i] = dr.gv[i].MaterializeArena()
+		}
+		var npt Row
+		if len(dr.pt) > 0 {
+			npt = make(Row, len(dr.pt))
+			for i := range npt {
+				npt[i] = dr.pt[i].MaterializeArena()
+			}
+		}
+		gr = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, len(dr.states))}
+		groups[key] = gr
+		*order = append(*order, key)
+	}
+	for i := range dr.states {
+		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// openSortedPartialTransport implements the GatherMerge-fed
+// Finalize-Sorted arm (M0141-S5, adopted by M0146-0003): the child
+// delivers serialized-state rows already ordered by group key — PG's
+// `Finalize GroupAggregate` over `Gather Merge -> Sort -> Partial
+// HashAggregate` (nodeAgg.c's sorted combine path). Runs of equal keys
+// fold through combineAggRuntime into ONE live groupRuntime; a key
+// change finalizes and emits. There is no group map: on a
+// merge-ordered stream a key cannot recur once its run ends, which is
+// the same memory contract nodeAgg.c's finalize makes.
+//
+// Order belt: a key comparing BELOW the just-emitted group means the
+// stream is not sorted — a construction error. It must fail loudly
+// rather than emit a group twice, since a duplicated group row is a
+// silently wrong result with no user-visible explanation.
+func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		out, err := o.finalizeGroup(cur)
+		if err != nil {
+			return err
+		}
+		o.rows = append(o.rows, out)
+		cur = nil
+		return nil
+	}
+
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		dr, err := o.decodePartialStateRow(slot.Row())
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, dr.keyParts) {
+			if cur != nil {
+				// Belt: merge-ordered input must not descend.
+				for k := 0; k < len(dr.gv) && k < len(cur.groupValues); k++ {
+					c, cerr := compareDatum(cur.groupValues[k], dr.gv[k], 0)
+					if cerr != nil {
+						return cerr
+					}
+					if c > 0 {
+						return &ExecError{
+							Code: "XX000",
+							Message: "internal error: partial-state stream is not ordered by group key — " +
+								"a sorted row-transport finalize requires a merge-ordered child",
+						}
+					}
+					if c != 0 {
+						break
+					}
+				}
+			}
+			if err := flush(); err != nil {
+				return err
+			}
+			// Retain the founder's key and passthrough values detached
+			// from the transport row (M0073-0004 retention boundary,
+			// same as the hash absorb and the input drain).
+			var ngv Row
+			if len(dr.gv) > 0 {
+				ngv = make(Row, len(dr.gv))
+				for i := range ngv {
+					ngv[i] = dr.gv[i].MaterializeArena()
+				}
+			}
+			var npt Row
+			if len(dr.pt) > 0 {
+				npt = make(Row, len(dr.pt))
+				for i := range npt {
+					npt[i] = dr.pt[i].MaterializeArena()
+				}
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, len(dr.states))}
+			curParts = dr.keyParts
+		}
+		for i := range dr.states {
+			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
 }
 
 // finalizeGroup finalizes one group's aggregates and builds its single output

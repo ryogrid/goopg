@@ -1534,6 +1534,11 @@ type Aggregate struct {
 	// Finalize node it makes the node consume those rows: deserialise
 	// each state column and combineAggRuntime it into the group, rather
 	// than reading the accumulator after draining the Gather to EOF.
+	// With Strategy == AggStrategySorted the finalize instead consumes a
+	// merge-ordered stream — PG's `Finalize GroupAggregate` over `Gather
+	// Merge -> Sort -> Partial HashAggregate` — folding same-key runs
+	// into one live group with no group map (M0146-0003 S5); an
+	// out-of-order key errors rather than emitting a group twice.
 	// The flag must be set on BOTH nodes of a pair; a PartialEmit
 	// partial under a plain finalize (or vice versa) is an
 	// internal-error construction.

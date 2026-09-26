@@ -30,7 +30,7 @@ import (
 // PartialEmit partial/finalize pair, and runs it under a Gather (or a
 // Sort->GatherMerge composition when merged is true). Returns the
 // rendered rows.
-func runTransportSplit(t *testing.T, ctx *Context, sql string, workers int, merged bool) []string {
+func runTransportSplit(t *testing.T, ctx *Context, sql string, workers int, merged bool, sortedFinal bool) []string {
 	t.Helper()
 	node := planForTest(t, ctx, sql)
 	spec := findGroupAgg(node)
@@ -70,6 +70,12 @@ func runTransportSplit(t *testing.T, ctx *Context, sql string, workers int, merg
 	final.Mode = optimizer.AggModeFinal
 	final.PartialEmit = true
 	final.PartialSource = nil
+	if sortedFinal {
+		// M0146-0003 S5: `Finalize GroupAggregate` — the finalize
+		// consumes the merge-ordered state stream one live group at a
+		// time rather than absorbing every row into a group map.
+		final.Strategy = optimizer.AggStrategySorted
+	}
 	final.Child = transport
 
 	advanceStmtCounter(ctx)
@@ -99,7 +105,7 @@ func runTransportSplit(t *testing.T, ctx *Context, sql string, workers int, merg
 	return out
 }
 
-func checkTransportIdentity(t *testing.T, ctx *Context, sql string, merged bool) {
+func checkTransportIdentity(t *testing.T, ctx *Context, sql string, merged bool, sortedFinal bool) {
 	t.Helper()
 	serialRows, err := runQueryWithErr(ctx, sql)
 	if err != nil {
@@ -114,7 +120,7 @@ func checkTransportIdentity(t *testing.T, ctx *Context, sql string, merged bool)
 		}
 	}
 	for _, workers := range []int{1, 2, 4} {
-		got := runTransportSplit(t, ctx, sql, workers, merged)
+		got := runTransportSplit(t, ctx, sql, workers, merged, sortedFinal)
 		if len(got) != len(want) {
 			t.Fatalf("merged=%v workers=%d: got %d rows, want %d\n got=%v\nwant=%v",
 				merged, workers, len(got), len(want), got, want)
@@ -164,7 +170,7 @@ func TestPartialEmitIdentity(t *testing.T) {
 		{"grouped-gathermerge-float", "SELECT grp, sum(f), avg(f) FROM pq_agg GROUP BY grp ORDER BY grp", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			checkTransportIdentity(t, ctx, tc.sql, tc.merged)
+			checkTransportIdentity(t, ctx, tc.sql, tc.merged, false)
 		})
 	}
 }
@@ -349,4 +355,104 @@ func TestPartialEmitPairingErrors(t *testing.T) {
 		t.Fatalf("mismatched pair errored, but not the pairing failure: %v", err)
 	}
 	_ = op.Close()
+}
+
+// TestPartialEmitSortedIdentity pins the GatherMerge-fed Finalize-Sorted
+// arm (M0146-0003 S5): Strategy=AggStrategySorted on the transport
+// finalize, which folds same-key state rows into ONE live group instead
+// of absorbing every row into a group map — PG's `Finalize
+// GroupAggregate -> Gather Merge -> Sort -> Partial HashAggregate`.
+// The merged splice supplies the order contract; the comparison is
+// positional (sorted output, not a multiset) because ORDER BY grp's
+// serial result defines the merge order.
+func TestPartialEmitSortedIdentity(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name   string
+		sql    string
+		merged bool
+	}{
+		// Ungrouped — no merge needed: every transported row carries the
+		// same (empty) key, so the fold is a single group over a plain
+		// Gather.
+		{"ungrouped", "SELECT count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg", false},
+		// The PG stack: Finalize GroupAggregate over Gather Merge.
+		{"sorted-gathermerge", "SELECT grp, count(*), sum(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"sorted-gathermerge-aggmix", "SELECT grp, avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"sorted-gathermerge-float", "SELECT grp, sum(f), avg(f) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		// Groups absent from some workers: an empty worker contributes no
+		// state row, so its key's run is simply shorter.
+		{"sorted-gathermerge-sparse", "SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp", true},
+		// Two-column key — the merge order and the boundary test both
+		// walk every key column.
+		{"sorted-gathermerge-twokey", "SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkTransportIdentity(t, ctx, tc.sql, tc.merged, true)
+		})
+	}
+}
+
+// TestPartialEmitSortedRejectsUnsorted pins the order belt: a sorted
+// row-transport finalize fed a stream whose keys descend must error,
+// never emit a group twice. Without the belt a key recurring after a
+// higher key produces two output rows for one group — a silently wrong
+// result.
+func TestPartialEmitSortedRejectsUnsorted(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	node := planForTest(t, ctx, "SELECT grp, count(*) FROM pq_agg GROUP BY grp")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+
+	mk := func(grp, cnt int64) Row {
+		d, err := serializeAggRuntime("count", &aggRuntime{count: cnt})
+		if err != nil {
+			t.Fatalf("serialize: %v", err)
+		}
+		return Row{NewIntDatum(grp), d}
+	}
+
+	// Ascending then descending: the 2->1 boundary must trip the belt.
+	op := &aggregateOp{plan: &final, child: &rowsOp{rows: []Row{mk(1, 3), mk(2, 5), mk(1, 7)}}, schema: final.Output()}
+	err := op.Open(ctx)
+	if err == nil {
+		t.Fatal("unsorted partial-state stream produced no error")
+	}
+	if !strings.Contains(err.Error(), "not ordered by group key") {
+		t.Fatalf("unsorted stream errored, but not the order belt: %v", err)
+	}
+	_ = op.Close()
+
+	// And the sanity arm: the same stream WITHOUT the out-of-order tail
+	// is accepted and produces one row per key run.
+	op2 := &aggregateOp{plan: &final, child: &rowsOp{rows: []Row{mk(1, 3), mk(2, 5)}}, schema: final.Output()}
+	if err := op2.Open(ctx); err != nil {
+		t.Fatalf("sorted stream rejected: %v", err)
+	}
+	var n int
+	for {
+		_, err := op2.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("sorted stream emitted %d rows, want 2", n)
+	}
+	_ = op2.Close()
 }

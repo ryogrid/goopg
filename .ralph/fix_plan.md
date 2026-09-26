@@ -21350,6 +21350,20 @@ M0146-0001 re-baseline census on the new default arm.
     evidence `analysis/m0146/m0146\-0003b/`. Zero plan moves at both
     TPC\-DS scales \(expected: dead\-in\-production\); Gather/GatherMerge
     identity vs serial PASS at workers 1/2/4 incl\. \-race.
+  - 2026\-09\-27: slice M0146\-0003c landed S5 \-\-
+    `Strategy\=AggStrategySorted` on a Final\+PartialEmit node routes to
+    `openSortedPartialTransport`, the row\-transport twin of
+    `openSorted`: same\-key runs fold via `combineAggRuntime` into ONE
+    live group, a key change finalizes\+emits through the shared
+    `finalizeGroup`, and an out\-of\-order key trips a belt error
+    \(never a duplicated group row\). `decodePartialStateRow` is now the
+    shared validator both transport arms use. S6 \(producer \+ EXPLAIN\)
+    remains; Partial\-GroupAggregate \(sorted partial, no Sort under
+    the merge\) stays deferred with it. Design doc
+    `docs/design/0100\-0149/m0146\-0003c\-finalize\-sorted\-transport.md`;
+    evidence `analysis/m0146/m0146\-0003c/`. Gates incl\. \-race PASS;
+    sf025 sweep \+ acceptance arm ran under FORCE\=1 \(nightly batch
+    co\-resident — timings void, verdicts 96/96 and 24/24 real\).
 - [x] **M0146\-0003a — a subquery\'s aggregate splits over the Gather the
   search placed** \(filed and done 2026\-09\-26 from the census:
   `PG Finalize Aggregate | goopg Aggregate`\).
@@ -21382,6 +21396,23 @@ M0146-0001 re-baseline census on the new default arm.
       transport identity vs serial verified on Gather and GatherMerge
       at workers 1/2/4 under \-race.
   Movement: none \(transport slice; producer lands with S6\)
+- [x] **M0146\-0003c — a sorted transport\-final folds same\-key state
+  runs without a group map** \(M0141\-S5, landed 2026\-09\-27\).
+  Kind: impl
+  Parent: M0146\-0003
+  - **DONE 2026\-09\-27.** Design doc
+    `docs/design/0100\-0149/m0146\-0003c\-finalize\-sorted\-transport.md`;
+    evidence `analysis/m0146/m0146\-0003c/`.
+    - `openSortedPartialTransport` streams the merge\-ordered state
+      rows: `decodePartialStateRow` \(shared with the hash absorb\) →
+      `sameGroupKey` boundary test → `combineAggRuntime` fold →
+      `finalizeGroup` emit; a key below the just\-emitted group errors
+      \(order belt — a duplicated group is a silent wrong result\).
+    - Dead\-in\-production like 0003b: TPC\-DS plan shapes 99/99
+      identical at SF0.25, fires\=none at SF1, canonical TPC\-H capture
+      identical; GatherMerge identity vs serial verified positionally
+      at workers 1/2/4 under \-race.
+  Movement: none \(consumer slice; producer lands with S6\)
 - [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed
