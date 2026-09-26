@@ -1,9 +1,9 @@
 # M0146-0015c: a nested EXISTS that reads the outermost query
 
-Status: slice 1 (PG's scope gate) and slice 2 (kept-subplan re-base)
-landed 2026-09-26. The outer EXISTS now plans as a semi join with the
-inner EXISTS carried as a pre-lowered SubPlan in the join filter.
-Slice 3 (`convert_EXISTS_to_ANY`, PG's hashed-ANY rendering) is open.
+Status: slices 1–3 landed 2026-09-26. The outer EXISTS plans as a semi
+join and the kept inner EXISTS now renders PG's hashed-ANY form —
+`Join Filter: (ANY ((a.y = (hashed SubPlan N).col1) AND (b.w = (hashed
+SubPlan N).col2)))`, textually identical to the oracle.
 
 ## PG behaviour
 
@@ -93,12 +93,71 @@ correct rows; `NOT EXISTS` gives the Hash Anti Join analogue; the
 correlated `b.w IN (…)` variant returns correct rows with the ANY kept
 the same way.
 
+## Slice 3 (landed): convert_EXISTS_to_ANY for kept sublinks
+
+PG's `convert_EXISTS_to_ANY` (subselect.c:1731) turns an EXISTS whose
+correlation clauses are hash-equalities into an ANY over the inner key
+columns: the inner side of every `outervar = innervar` pair becomes a
+target of the decorrelated body, the outer side becomes the parent's
+testexpr, and the subplan runs hashed with `unknownEqFalse`.
+
+`keptExistsToAny` (pulledsublink.go) applies that to the slice-2 kept
+form, where correlation already sits in `ExecParamRef` negative
+sentinels + `Args`: every top-level `innercol = sentinel` conjunct of
+the body qual holder becomes one projected column plus one operand
+element, the produced `InExpr` is `IsNonCorrelated` with no param
+binding, `Operand` is a `RowExpr` of the correlated columns (scalar
+when one pair survives — currently unreachable: a kept EXISTS needs
+refs to both scopes, hence ≥ 2 pairs), and `UnknownEqFalse` carries
+the licence — the source EXISTS is two-valued, so its ANY is too.
+Declines keep the correct slice-2 EXISTS form (fail-open): a
+non-equality or composite-inner conjunct, a stray sentinel anywhere at
+body level, a non-simple spine. A kept negated EXISTS converts too —
+`NOT EXISTS` resolves as `UnaryOp{OpNot, EXISTS}`, so the ANY lands
+under the NOT where PG leaves `NOT (SubPlan)`. The flat `existsToAny`
+product gets the flag as well — same conversion, same licence.
+
+Executor side: `evalRowHashProbe` (subplan_hash.go) is the tuple-key
+analogue of `evalInHashProbe` — the inner plan materialises once into
+a `subPlanRowHash` (length-prefixed `datumKey` composite + per-column
+datum family, cached in the scoped store under
+`nonCorrelatedCacheKey + "\x00rowhash"`); probes demand pairwise
+family equality and answer FALSE on any NULL operand element. The
+`unknownEqFalse` collapse — NULL → FALSE — is applied once in
+`evalInExpr`'s wrapper, so the tuple hash, the scalar value hash and
+both linear fallbacks agree. Rows containing a NULL element are
+dropped at build (they can contribute neither TRUE nor a
+distinguishable NULL — which is also why goopg needs no partial-match
+table). `subPlanUsesHashTable` renders the row-operand ANY `hashed`
+only under the flag. `foldconst.go` was found REBUILDING `InExpr`
+field-by-field — it was silently dropping `ParParam`/`Args` before
+this slice ever touched it; it now retains all three fields.
+
+Measured (canonical shape, throwaway cluster :5533): `Hash Semi Join /
+Join Filter: (ANY ((a.y = (hashed SubPlan 1).col1) AND (b.w = (hashed
+SubPlan 1).col2)))` — textually identical to PG modulo SubPlan
+numbering — with correct rows including a NULL operand element
+(excluded) and NULL-carrying inner tuples (never match); `NOT EXISTS`
+renders `NOT (ANY (...))`, PG's shape. Corpus movement is still none:
+TPC-H/TPC-DS carry no two-scope nested EXISTS (sweep, fire set and
+acceptance digest all identical to HEAD). New coverage:
+`TestKeptExistsToAnyVariants` (convert/decline matrix),
+`TestRowHashedAnyTruthTable`/`TestRowHashedAnyProbeFires` (executor).
+
 ## Next slices
 
-- **Slice 3:** `convert_EXISTS_to_ANY`, a hashed ANY for an EXISTS
-  whose correlation is equality pairs. Until it lands goopg renders
-  `Join Filter: (EXISTS(SubPlan N))` where PG prints the hashed-ANY
-  form — semantically equivalent, textually different.
+- **Inner-expr targets:** PG also converts `innervar_expr = outervar`
+  (the expression becomes the child targetlist entry); goopg binds the
+  conversion to plain `ColumnRef` inner sides — same bound the flat
+  `existsToAny` applies — and keeps EXISTS on `(b.w + 1) = a.v` today.
+- **Composite escaping refs in a join clause panic, not decline:**
+  `b.j2 = a.v + k` (a conjunct whose outer side mixes two scopes)
+  reaches `translateToLayout` inside the pulled body's join planning
+  with a raw `OuterColumnRef` and PANICS
+  (`join clause carries a *optimizer.OuterColumnRef, which is not
+  positional and cannot be re-based`, createplanjoin.go:243). The
+  kept-subplan admission needs a composite-ref guard, or
+  translateToLayout a fail-closed path.
 - **The `nested-body-emitting-ref` boundary** (qual-level, not the
   kept-subplan path above): a PULLED nested body whose own link qual
   reads the emitting scope still declines — goopg's search cannot

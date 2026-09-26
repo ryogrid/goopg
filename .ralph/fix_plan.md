@@ -21016,6 +21016,24 @@ M0146-0001 re-baseline census on the new default arm.
       form\); the separate `nested\-body\-emitting\-ref` boundary for a
       PULLED nested body\'s own link qual \(needs SpecialJoinInfo
       min\-hand widening — the original framing of this task\).
+  - 2026\-09\-26 slice 3 \(landed\): `keptExistsToAny` in
+    `internal/optimizer/pulledsublink.go` applies
+    `convert\_EXISTS\_to\_ANY` to the kept form — every `innercol =
+    sentinel` conjunct becomes a projected column plus a `RowExpr`
+    operand element; `InExpr.UnknownEqFalse` carries the two\-valued
+    licence; `evalRowHashProbe` tuple\-hashes the inner once; NULL
+    collapses to FALSE in `evalInExpr`. Canonical shape now renders
+    `Join Filter: \(ANY \(\(a.y = \(hashed SubPlan 1\).col1\) AND \(b.w =
+    \(hashed SubPlan 1\).col2\)\)\)` — PG\'s text. `NOT EXISTS` lands
+    under `UnaryOp\{OpNot\}` — PG\'s `NOT \(SubPlan\)`. `foldconst.go`
+    was silently dropping `ParParam`/`Args` on `InExpr` rebuild — fixed.
+    Corpora unchanged \(fireset/sweep/arm identical; parity 6/22\).
+    Evidence `analysis/m0146/m0146\-0015c/slice3\-goopg.txt`.
+    - Remaining: the `nested\-body\-emitting\-ref` boundary above;
+      inner\-expr targets \(PG converts `expr = outervar`, goopg binds
+      inner to plain ColumnRef\); a composite escaping ref in a join
+      clause PANICS in `translateToLayout` \(createplanjoin.go:243\) —
+      kept admission needs a guard \(ledgered\).
 - [ ] **WRONG RESULTS: an index created with an explicit opclass returns
   wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
   `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —

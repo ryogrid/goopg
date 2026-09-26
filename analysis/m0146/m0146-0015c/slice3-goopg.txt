@@ -1,0 +1,47 @@
+M0146-0015c slice 3 — convert_EXISTS_to_ANY for kept sublinks
+goopg @127.0.0.1:5533 (throwaway, scope goopg-s3), 2026-09-26
+Data: ta(k,y)={(1,10),(2,20),(3,30),(4,NULL),(5,NULL)},
+      tb(k,w)={(1,100),(1,101),(2,200),(5,500)},
+      tc(x,z)={(10,100),(10,101),(20,200),(10,NULL),(NULL,100)}
+
+== EXISTS — the canonical shape ==
+
+explain select k, y from ta a where exists (
+  select 1 from tb b where b.k = a.k
+    and exists (select 1 from tc c where c.x = a.y and c.z = b.w));
+
+ Hash Semi Join  (cost=60.85..744.61 rows=565 width=8)
+   Hash Cond: (a.k = b.k)
+   Join Filter: (ANY ((a.y = (hashed SubPlan 1).col1) AND (b.w = (hashed SubPlan 1).col2)))
+   SubPlan 1
+     ->  Seq Scan on tc c  (cost=0.00..22.60 rows=2260 width=8)
+   ->  Seq Scan on ta a  (cost=0.00..32.60 rows=2260 width=8)
+   ->  Seq Scan on tb b  (cost=0.00..32.60 rows=2260 width=8)
+
+PG 18.3 (pg-oracle.txt):
+   Join Filter: (ANY ((a.y = (hashed SubPlan 2).col1) AND (b.w = (hashed SubPlan 2).col2)))
+   — textually identical modulo SubPlan numbering. goopg's Hash Semi
+   Join shows the tb Seq Scan directly (no `-> Hash` wrapper line);
+   that is the hash join's own build-side rendering, not this slice's
+   concern.
+
+rows: {(1,10),(2,20)} — correct.
+  (5,NULL): a.y NULL => inner EXISTS false => excluded (two-valued,
+   unknownEqFalse — a parser-written row-IN would owe NULL here).
+  (10,NULL)/(NULL,100) inner tuples dropped at hash build — never match.
+
+== NOT EXISTS — negated kept sublink ==
+
+   Join Filter: (NOT (ANY ((a.y = (hashed SubPlan 1).col1) AND (b.w = (hashed SubPlan 1).col2))))
+   — PG's `NOT (SubPlan)` shape (goopg resolves NOT EXISTS as
+   UnaryOp{OpNot, EXISTS}; the converted ANY lands under the NOT).
+
+rows: {(5,NULL)} — (5,NULL): inner EXISTS false => NOT => kept.
+  rows 1,2: full matches exist => NOT => dropped. rows 3,4: no tb.
+
+== corpus movement ==
+
+TPC-H / TPC-DS corpora carry no two-scope nested EXISTS — plan counts
+identical to HEAD on every gate (see gates.txt). The parity movement
+is the canonical shape above: EXISTS(SubPlan) -> ANY((hashed SubPlan))
+on the join filter, matching the oracle text.

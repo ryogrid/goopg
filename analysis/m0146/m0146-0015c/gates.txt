@@ -30,3 +30,25 @@ tpch parity capture (tmp/m0146-0015c-s2/tpch): PLAN-PARITY queries=22 match=6
 live check: goopg @127.0.0.1:5533 — EXISTS -> Hash Semi Join / Join Filter:
     (EXISTS(SubPlan 1)), rows {a1,a2}; NOT EXISTS -> Hash Anti Join, rows {a3,a4};
     same-shape IN variant rows {a1,a2}. Correct answers verified by hand.
+
+## slice 3 (convert_EXISTS_to_ANY for kept sublinks — PG's hashed-ANY join filter)
+units: PASS (RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh)
+tpch-spotcheck: RESULT=PASS (Q12 rows=2, Q13 rows=33; stamped code_tree 2220e001…)
+tpch-acceptance-arm: SUMMARY 24 MATCH, VERDICT PASS vs tmp/m0145-0008m/arm-on.txt
+tpcds-sf025 sweep: === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+                   === PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+                   === STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=2 total-delta=+3.3% ===
+tpcds-fireset: PASS — baseline=HEAD (bd8b102e8) candidate=worktree
+               FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+               FIRE-SET: corpus=tpcds-sf1   fires=none (plan A/B had no changed query)
+tpch parity capture (tmp/m0146-0015c-s3/tpch): PLAN-PARITY queries=22 match=6
+    CATEGORIES-EXCL-MATCH: join-order=14 join-method=6 scan-type=9 parameterisation=3
+                           aggregation-strategy=6 sort-strategy=10 parallelism=13
+                           qual-placement=2 rendering=0
+    (floor 3; corpora still do not exercise the two-scope nested EXISTS —
+     canonical evidence is slice3-goopg.txt + TestKeptExistsToAnyVariants +
+     TestRowHashedAnyTruthTable/ProbeFires)
+live check: goopg @127.0.0.1:5533 — EXISTS -> Hash Semi Join / Join Filter:
+    (ANY ((a.y = (hashed SubPlan 1).col1) AND (b.w = (hashed SubPlan 1).col2))),
+    rows {(1,10),(2,20)}; NOT EXISTS -> NOT (ANY (...)), rows {(5,NULL)}.
+    NULL operand element -> FALSE (unknownEqFalse), NULL inner tuples dropped.
