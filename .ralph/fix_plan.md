@@ -22141,9 +22141,9 @@ M0146-0001 re-baseline census on the new default arm.
     parameterisation 44→43, D3\-partialpath 29→26\). Deferred:
     unparameterized skip \(restriction/bitmap/IOS\), DESC/expr skipped
     columns — ledgered.
-- [ ] **M0146\-0005w — a set\-operation arm that is a subquery renders as a
+- [x] **M0146\-0005w — a set\-operation arm that is a subquery renders as a
   `Subquery Scan` leaf** \(filed 2026\-09\-27 by M0146\-0005 slice 22,
-  witness TPC\-DS Q8 depth\-3 join\-order\): PG plans each leaf arm of a
+  witness TPC\-DS Q8 depth\-3 join\-order; LANDED slice 24\): PG plans each leaf arm of a
   set operation via `subquery_planner`, so the subquery arm is a
   `SubqueryScan` RTE — `Subquery Scan on a1` — which counts as ONE leaf
   against the enclosing NL's leaf set. goopg plans the arm inline, so its
@@ -22165,6 +22165,25 @@ M0146-0001 re-baseline census on the new default arm.
     rels hidden\). Watch the executor: no standalone SubqueryScan op
     exists — a pass\-through wrapper over the arm subtree, or reuse the
     inlined\-CTE scan node, whichever matches the arm's tuple contract.
+  - DONE \(slice 24\): `optimizer.SubqueryScan{Alias,Child,schema,src}`
+    emitted by `planSubqueryRangeVar` on every leaf PG's
+    `is_simple_subquery` refuses \(appendrel UNION ALL arms keep the
+    inline path\); executor\-transparent via `buildNode` recursion \(no
+    runtime op\). The decisive piece is
+    `stripTrivialSubqueryScans` \(subqueryscan\_strip.go\) at `Plan()`'s
+    tail — upstream's `setrefs.c` `trivial_subqueryscan` port: the label
+    survives iff the enclosing scope's consumed leaf\-local positions are
+    not the full in\-order identity, or a Filter sits on the leaf.
+    Consumption is scope\-bounded by `rtableScope.derivedSubtrees` \(every
+    FROM\-subquery subtree root, wrapped or not\) plus structural CTEScan /
+    set\-op\-arm boundaries; refs map back via \(Name, SourceTableIdx\)
+    because `ColumnRef.Index` is eval\-context\-global. Q8 renders PG's
+    exact leaf structure \(`Subquery Scan on a1` kept — subset; v1/a2
+    stripped\). Gates: units PASS, spotcheck PASS, sweep 96/0/0, arm
+    24/24 MATCH, fireset `introduced=none` both scales \(match 14/12
+    unchanged; Q8 jointree\-search→D3\-partialpath; Q34/Q73 moved INTO
+    jt\-search — leaf\-level quals PG pushes via `subquery_push_qual`,
+    a separate gap now visible through the label\).
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

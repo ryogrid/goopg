@@ -682,6 +682,11 @@ func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
 			n = p.Child
 		case *optimizer.GatherMerge:
 			n = p.Child
+		case *optimizer.SubqueryScan:
+			// M0146-0005w: the label is position-for-position
+			// transparent — the set operation's first-branch deparse
+			// continues into the subplan exactly as it did unwrapped.
+			n = p.Child
 		case *optimizer.Join:
 			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
 		case *optimizer.NestedLoopIndexJoin:

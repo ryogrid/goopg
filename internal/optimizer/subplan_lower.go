@@ -372,6 +372,11 @@ func lowerNodeChildren(n Node) []Node {
 		return []Node{x.Left, x.Right}
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — the subplan's own
+		// subtree keeps its visibility to the lowering walkers, same
+		// as when it sat unwrapped.
+		return []Node{x.Child}
 	}
 	return nil
 }

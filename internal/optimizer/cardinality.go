@@ -106,6 +106,11 @@ func EstimateRows(n Node) int64 {
 		// Pass-through wrapper: appends an ordinal column, row count
 		// unchanged (S4a scalar residual rewrite reuses it).
 		return EstimateRows(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — same row count as the
+		// subplan it wraps; without this arm every estimate above it
+		// zeroed (the M0125-0038 class).
+		return EstimateRows(x.Child)
 	case *Aggregate:
 		return estimateAggregate(x)
 	case *Insert:
@@ -1932,6 +1937,11 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		return passthrough(x.Child)
 	case *Limit:
 		return passthrough(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: the wrapper's schema is the subplan's own output,
+		// so a coordinate crossing it crosses here exactly as it does in
+		// resolveBaseColumn — the resolver twins must agree.
+		return passthrough(x.Child)
 	case *LockRows:
 		return passthrough(x.Child)
 	case *Gather:
@@ -2237,6 +2247,12 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 			top = x.Child
 			continue
 		case *Gather:
+			top = x.Child
+			continue
+		case *SubqueryScan:
+			// M0146-0005w: labelling wrapper — strip to the arm's own
+			// top so a contained SetOp/Aggregate still reads as
+			// already-grouped.
 			top = x.Child
 			continue
 		}

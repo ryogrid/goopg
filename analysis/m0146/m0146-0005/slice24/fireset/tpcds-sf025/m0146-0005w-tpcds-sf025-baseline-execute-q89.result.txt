@@ -1,0 +1,104 @@
+ i_category |     i_class     |      i_brand       | s_store_name | s_company_name | d_moy | sum_sales |   avg_monthly_sales   
+------------+-----------------+--------------------+--------------+----------------+-------+-----------+-----------------------
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     6 |    373.22 | 1788.5583333333333333
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     5 |    596.38 | 1865.0875000000000000
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     6 |    667.21 | 1928.1691666666666667
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     5 |    629.72 | 1844.2208333333333333
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     4 |    673.44 | 1844.2208333333333333
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     7 |    710.75 | 1860.5291666666666667
+ Shoes      | womens          | amalgedu pack #2   | ese          | Unknown        |     2 |    703.30 | 1838.2983333333333333
+ Men        | pants           | exportiimporto #2  | ation        | Unknown        |     2 |    423.01 | 1532.8366666666666667
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     7 |    821.06 | 1928.1691666666666667
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     6 |    566.32 | 1653.3333333333333333
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     2 |    804.89 | 1860.5291666666666667
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     6 |    805.71 | 1852.4825000000000000
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     4 |    892.60 | 1928.1691666666666667
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     6 |    832.17 | 1865.0875000000000000
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     2 |    819.39 | 1844.2208333333333333
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     2 |    733.21 | 1753.8325000000000000
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     4 |    734.37 | 1753.8325000000000000
+ Men        | pants           | exportiimporto #2  | ation        | Unknown        |     3 |    518.87 | 1532.8366666666666667
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     5 |    752.88 | 1753.8325000000000000
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     5 |    799.16 | 1788.5583333333333333
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     1 |    802.00 | 1788.5583333333333333
+ Shoes      | womens          | amalgedu pack #2   | eing         | Unknown        |     5 |    825.31 | 1807.6225000000000000
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     1 |    698.66 | 1666.0475000000000000
+ Shoes      | womens          | amalgedu pack #2   | bar          | Unknown        |     2 |    820.33 | 1783.5125000000000000
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     4 |    890.13 | 1852.4825000000000000
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     6 |    717.84 | 1666.0475000000000000
+ Shoes      | womens          | amalgedu pack #2   | ese          | Unknown        |     5 |    897.44 | 1838.2983333333333333
+ Men        | pants           | exportiimporto #2  | ought        | Unknown        |     4 |    781.94 | 1714.1908333333333333
+ Shoes      | womens          | amalgedu pack #2   | eing         | Unknown        |     3 |    880.57 | 1807.6225000000000000
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     5 |    850.25 | 1748.5791666666666667
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     2 |    895.30 | 1791.2725000000000000
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     7 |    968.12 | 1852.4825000000000000
+ Men        | pants           | exportiimporto #2  | bar          | Unknown        |     3 |    746.60 | 1630.2233333333333333
+ Men        | pants           | exportiimporto #2  | ought        | Unknown        |     3 |    834.57 | 1714.1908333333333333
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     3 |    974.19 | 1852.4825000000000000
+ Shoes      | womens          | amalgedu pack #2   | bar          | Unknown        |     4 |    911.68 | 1783.5125000000000000
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     7 |   1001.45 | 1865.0875000000000000
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     5 |    932.68 | 1791.2725000000000000
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     6 |    995.46 | 1844.2208333333333333
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     5 |   1006.83 | 1852.4825000000000000
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     4 |    909.84 | 1748.5791666666666667
+ Men        | pants           | exportiimporto #2  | ation        | Unknown        |     7 |    695.30 | 1532.8366666666666667
+ Shoes      | womens          | amalgedu pack #2   | eing         | Unknown        |     2 |    975.65 | 1807.6225000000000000
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     4 |    831.25 | 1653.3333333333333333
+ Shoes      | womens          | amalgedu pack #2   | bar          | Unknown        |     7 |    967.10 | 1783.5125000000000000
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     2 |    972.68 | 1788.5583333333333333
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     3 |    845.62 | 1653.3333333333333333
+ Men        | pants           | exportiimporto #2  | ought        | Unknown        |     1 |    912.22 | 1714.1908333333333333
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     6 |    959.57 | 1753.8325000000000000
+ Men        | pants           | exportiimporto #2  | ation        | Unknown        |     4 |    741.42 | 1532.8366666666666667
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     2 |    961.37 | 1748.5791666666666667
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     7 |    874.29 | 1653.3333333333333333
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     2 |   1086.13 | 1852.4825000000000000
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     1 |   1103.67 | 1865.0875000000000000
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     3 |   1110.34 | 1865.0875000000000000
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     5 |   1109.85 | 1860.5291666666666667
+ Men        | pants           | exportiimporto #2  | ese          | Unknown        |     1 |   1109.48 | 1852.4825000000000000
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     7 |    925.62 | 1666.0475000000000000
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     4 |   1051.96 | 1791.2725000000000000
+ Shoes      | womens          | amalgedu pack #2   | eing         | Unknown        |     4 |   1070.06 | 1807.6225000000000000
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     1 |   1111.87 | 1844.2208333333333333
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     3 |   1017.19 | 1748.5791666666666667
+ Children   | school-uniforms | edu packexporti #2 | ought        | Unknown        |     2 |   1136.67 | 1865.0875000000000000
+ Shoes      | womens          | amalgedu pack #2   | bar          | Unknown        |     3 |   1057.66 | 1783.5125000000000000
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     5 |    934.50 | 1653.3333333333333333
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     1 |   1075.54 | 1791.2725000000000000
+ Shoes      | womens          | amalgedu pack #2   | ese          | Unknown        |     6 |   1128.93 | 1838.2983333333333333
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     3 |   1085.53 | 1791.2725000000000000
+ Shoes      | womens          | amalgedu pack #2   | ese          | Unknown        |     1 |   1137.95 | 1838.2983333333333333
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     7 |   1150.45 | 1844.2208333333333333
+ Men        | pants           | exportiimporto #2  | ought        | Unknown        |     2 |   1030.36 | 1714.1908333333333333
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     1 |   1066.81 | 1748.5791666666666667
+ Children   | school-uniforms | edu packexporti #2 | bar          | Unknown        |     1 |   1012.46 | 1689.2208333333333333
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     1 |   1251.76 | 1928.1691666666666667
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     7 |   1116.17 | 1788.5583333333333333
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     3 |   1005.13 | 1666.0475000000000000
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     6 |   1202.97 | 1860.5291666666666667
+ Shoes      | womens          | amalgedu pack #2   | able         | Unknown        |     2 |    995.84 | 1653.3333333333333333
+ Children   | school-uniforms | edu packexporti #2 | bar          | Unknown        |     2 |   1031.74 | 1689.2208333333333333
+ Shoes      | womens          | amalgedu pack #2   | ese          | Unknown        |     4 |   1183.69 | 1838.2983333333333333
+ Men        | pants           | exportiimporto #2  | able         | Unknown        |     7 |   1097.10 | 1748.5791666666666667
+ Shoes      | womens          | amalgedu pack #2   | ation        | Unknown        |     6 |   1144.90 | 1791.2725000000000000
+ Men        | pants           | exportiimporto #2  | bar          | Unknown        |     7 |    996.93 | 1630.2233333333333333
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     3 |   1168.45 | 1788.5583333333333333
+ Children   | school-uniforms | edu packexporti #2 | bar          | Unknown        |     3 |   1080.05 | 1689.2208333333333333
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     3 |   1326.11 | 1928.1691666666666667
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     3 |   1266.42 | 1860.5291666666666667
+ Shoes      | womens          | amalgedu pack #2   | ought        | Unknown        |     3 |   1265.63 | 1844.2208333333333333
+ Men        | pants           | exportiimporto #2  | eing         | Unknown        |     4 |   1286.72 | 1860.5291666666666667
+ Shoes      | womens          | amalgedu pack #2   | eing         | Unknown        |     7 |   1236.48 | 1807.6225000000000000
+ Children   | school-uniforms | edu packexporti #2 | ation        | Unknown        |     4 |   1217.71 | 1788.5583333333333333
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     7 |   1193.13 | 1753.8325000000000000
+ Shoes      | womens          | amalgedu pack #2   | bar          | Unknown        |     6 |   1226.78 | 1783.5125000000000000
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     4 |   1113.99 | 1666.0475000000000000
+ Children   | school-uniforms | edu packexporti #2 | bar          | Unknown        |     4 |   1139.51 | 1689.2208333333333333
+ Children   | school-uniforms | edu packexporti #2 | ese          | Unknown        |     5 |   1122.63 | 1666.0475000000000000
+ Children   | school-uniforms | edu packexporti #2 | able         | Unknown        |     2 |   1389.37 | 1928.1691666666666667
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     1 |   1221.35 | 1753.8325000000000000
+ Children   | school-uniforms | edu packexporti #2 | eing         | Unknown        |     3 |   1221.88 | 1753.8325000000000000
+ Men        | pants           | exportiimporto #2  | ought        | Unknown        |     6 |   1189.68 | 1714.1908333333333333
+(100 rows)
+

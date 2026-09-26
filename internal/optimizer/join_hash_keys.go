@@ -143,6 +143,9 @@ func fillJoinHashKeysNodes(n Node) {
 		fillJoinHashKeysNodes(x.Inner)
 	case *CTEScan:
 		fillJoinHashKeysNodes(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through.
+		fillJoinHashKeysNodes(x.Child)
 	case *CTEDMLPrefix:
 		fillJoinHashKeysNodes(x.Body)
 	case *Project:

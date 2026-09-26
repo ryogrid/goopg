@@ -896,6 +896,18 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			}
 			node = c
 			continue
+		case *optimizer.SubqueryScan:
+			// M0146-0005w: the label publishes no republishing layer of
+			// its own — same positions, alias-renamed names only — so it
+			// steps through without consuming chase depth (a nested
+			// derived table must not starve the tuned cap).
+			c := childNodeOf(n)
+			if c == nil || len(n.Output()) != len(c.Output()) {
+				return nil, false
+			}
+			node = c
+			depth--
+			continue
 		case *optimizer.Filter:
 			// A sublink-bearing Filter on the path (Q44's HAVING-shaped
 			// Filter above the avg agg) marks a level PG may wall off
@@ -1029,13 +1041,15 @@ func qualifierNamesCTE(reg *subPlanReg, col *optimizer.ColumnRef, cteNames map[s
 	return cteNames[q[:i]]
 }
 
-// childNodeOf returns the single child of a Sort/Filter node — the only
-// two kinds resolveKeySource steps through directly.
+// childNodeOf returns the single child of a Sort/Filter/SubqueryScan
+// node — the kinds resolveKeySource steps through directly.
 func childNodeOf(n optimizer.Node) optimizer.Node {
 	switch t := n.(type) {
 	case *optimizer.Sort:
 		return t.Child
 	case *optimizer.Filter:
+		return t.Child
+	case *optimizer.SubqueryScan:
 		return t.Child
 	}
 	return nil
@@ -2154,9 +2168,12 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 
 	// Relation candidates are leaves for this lookup. In particular a
 	// CTEScan's Child is a separately planned CTE scope and must not be
-	// inspected even though the general EXPLAIN walker renders it.
+	// inspected even though the general EXPLAIN walker renders it. A
+	// SubqueryScan is the same class: its Child is the derived table's
+	// own planning scope, whose SourceTableIdx numbering restarts inside.
 	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
 		*optimizer.CTEScan, *optimizer.MaterializedCTEScan,
+		*optimizer.SubqueryScan,
 		*optimizer.BitmapHeapScan:
 		return nil, true
 
@@ -3884,6 +3901,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			return fmt.Sprintf("CTE Scan on %s %s", p.Name, p.Alias)
 		}
 		return fmt.Sprintf("CTE Scan on %s", p.Name)
+	case *optimizer.SubqueryScan:
+		// M0146-0005w: PG's "Subquery Scan on <alias>" (explain.c).
+		return "Subquery Scan on " + p.Alias
 	case *optimizer.LockRows:
 		// Mirrors upstream's "LockRows" label; per-relation
 		// detail is too verbose for the single-line label and
@@ -4287,6 +4307,10 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 		if isRecursiveSelfRef(p) {
 			return nil
 		}
+		return []optimizer.Node{p.Child}
+	case *optimizer.SubqueryScan:
+		// M0146-0005w: the wrapper renders `Subquery Scan on <alias>`
+		// with the subplan beneath it, as in PG.
 		return []optimizer.Node{p.Child}
 	case *optimizer.LockRows:
 		return []optimizer.Node{p.Child}

@@ -581,6 +581,17 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *SubqueryScan:
+		// M0146-0005w: mirror of the drivingScan arm — the label is a
+		// pass-through, so the stamp reaches the subplan's own scan the
+		// same way it did when the leaf sat unwrapped.
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Sort:
 		// R56: mirror of the drivingScan arm — stamp through to the driving
 		// scan so an Agg→Sort→scan split labels the scan it actually runs
@@ -757,6 +768,12 @@ func drivingScan(n Node) Node {
 		return drivingScan(x.Child)
 	case *Project:
 		return drivingScan(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — the subplan's own
+		// driving scan stays findable, matching every sibling arm and
+		// the unwrapped subtree's own behaviour before this node
+		// existed.
+		return drivingScan(x.Child)
 	case *Sort:
 		// R56. A Sort over a partial-capable subtree is transparent to the
 		// driving-scan walk: each worker sorts its own partition (P7), so the
@@ -925,6 +942,10 @@ func drivingScanCrossesSort(n Node) bool {
 	case *Filter:
 		return drivingScanCrossesSort(x.Child)
 	case *Project:
+		return drivingScanCrossesSort(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: same gate as the siblings — the spine walk sees
+		// through the label exactly as drivingScan does.
 		return drivingScanCrossesSort(x.Child)
 	case *Join:
 		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
@@ -1865,6 +1886,13 @@ func replaceSingleChild(n Node, child Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *SubqueryScan:
+		// M0146-0005w: parallelChildren descends the label, so the
+		// splice must rebuild it — a partial target inside the leaf
+		// declines silently otherwise.
+		c := *x
+		c.Child = child
+		return &c
 	}
 	// Unknown wrapper: refuse rather than guess. Returning n unchanged means
 	// no Gather is inserted, which is always safe.
@@ -1914,6 +1942,12 @@ func parallelChildren(n Node) []Node {
 	case *BitmapHeapScan:
 		// S5.6: the Outer bitmap-producing subtree is the child.
 		return []Node{x.Outer}
+	case *SubqueryScan:
+		// M0146-0005w: the subplan must stay visible to the safety
+		// walks — a temp/virtual scan inside an unlisted wrapper would
+		// hide from subtreeHasUnsafeNode (the comment below's own
+		// warning), and a leaf-resident Gather from subtreeHasGather.
+		return []Node{x.Child}
 	case *SetOp:
 		// M0140-0006c-2: both branches. This lets the prebuild gates
 		// (HasShareableHashJoin, HasBitmapScan) see joins and bitmaps
@@ -2148,6 +2182,17 @@ func unstampParallelScan(n Node) Node {
 		c := *x
 		c.Left, c.Right = left, right
 		c.ParallelAware = false
+		return &c
+	case *SubqueryScan:
+		// M0146-0005w: the labelling wrapper is transparent to the
+		// stamp/unstamp siblings, as every other single-child
+		// pass-through here is.
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
 		return &c
 	}
 	return n

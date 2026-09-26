@@ -1,0 +1,104 @@
+ c_last_name | c_first_name |     ca_city     |   bought_city   | ss_ticket_number |   amt    |  profit   
+-------------+--------------+-----------------+-----------------+------------------+----------+-----------
+ Aaron       | Doris        | Belmont         | Yorktown        |           100428 |  1866.90 |  -9246.85
+ Abbott      | Daria        | Riverside       | Cedar Grove     |            95328 |  2438.29 | -16784.64
+ Abbott      | Grace        | Quincy          | Mount Zion      |           109452 |   974.66 | -21419.41
+ Abel        | Lori         | Greenfield      | Riverside       |            81796 |   864.10 | -12408.85
+ Abernathy   | Eduardo      | Newport         | Pine Grove      |            35876 |  2719.72 | -13451.14
+ Acker       | Kenya        | Riverdale       | Woodland        |           215848 |   621.05 |  -2411.51
+ Adams       | David        | Stringtown      | Friendship      |           150668 |  6957.90 |  -6615.54
+ Adams       | Eunice       | Pierce          | Five Points     |            49808 |     0.00 |  -8268.71
+ Adams       | Jorge        | Oakland         | Bethel          |           142988 |  4372.05 | -14150.44
+ Adams       | Kristan      | Sullivan        | Spring Valley   |           113208 |    12.14 |  -8556.74
+ Adams       | Leona        | Plainview       | Newtown         |           170464 |     0.00 |  -9020.73
+ Adams       | Marcia       | Forest Hills    | Midway          |           231600 |     0.00 |  -2596.47
+ Adams       | Timothy      | Florence        | Mount Vernon    |           138900 |  6496.32 | -12105.66
+ Adams       |              | Fairview        | Springfield     |            32484 |  5424.90 | -10954.56
+ Adamson     | Virginia     | Clinton         | Mountain View   |            10904 |   424.83 |  -6906.39
+ Aguilera    | Gladys       | Union Hill      | Mount Pleasant  |           163364 |  1502.16 |  -9560.23
+ Aldrich     | Delbert      | Summit          | Wildwood        |           194336 |  1845.94 | -14499.13
+ Aleman      | Janice       | Waterloo        | Woodbine        |            41032 |   375.98 |  -7541.60
+ Alexander   | Christopher  | Providence      | Amity           |           237672 |  2215.15 |  -9286.80
+ Alexander   | Harry        | Fillmore        | Five Forks      |           128676 |  2577.83 |   -685.65
+ Alexander   | James        | Glenwood        | Bethel          |           192700 |   338.89 | -13208.04
+ Alexander   | James        | Maple Grove     | Franklin        |           213868 |  1734.99 | -12834.97
+ Alexander   | Leslie       | Highland        | Greenwood       |            42760 |   677.50 | -16643.38
+ Alexander   | Victor       | Highland Park   | Maple Hill      |            95572 |  6416.25 |  -7653.93
+ Allen       | David        | Maple Grove     | Greenville      |           151980 |  2559.31 | -19107.98
+ Allen       | Jack         | Mount Vernon    | Jackson         |           225740 |  2082.61 |  -7375.14
+ Allen       | Keith        | Unionville      | Freeman         |           137096 |  1172.09 |  -3998.09
+ Allen       | Nancy        | Springdale      | Walnut Grove    |           108944 |   604.53 | -10672.73
+ Allen       | Ronald       | Wright          | Pleasant Valley |             8104 |    24.26 |  -1996.98
+ Allen       | Virginia     | Shady Grove     | Friendship      |           159940 |  1985.74 |  -7694.71
+ Alonso      | David        | Wildwood        | Newtown         |            55604 |  4859.38 |  -9397.38
+ Alvarado    | Brandon      | Union           | Hopewell        |             6928 |  6092.02 | -15714.24
+ Alvarez     | Eric         | Cedar Grove     | Arlington       |           144580 |  1350.45 |  -5017.82
+ Alvarez     | Pearl        | Macedonia       | Crossroads      |           202928 |    18.03 |  -9078.03
+ Amador      | Michael      | Green Acres     | Mount Olive     |            17928 |     0.00 |  -3341.18
+ Anaya       | Mildred      | Oak Hill        | Jamestown       |            73720 |  9359.92 | -11388.39
+ Anders      | Tricia       | Spring Valley   | Union Hill      |           208892 |   431.50 | -19049.20
+ Anderson    | Anne         | Clinton         | Summit          |             5764 |   102.70 |    231.08
+ Anderson    | Blake        | Friendship      | Hazelwood       |           140912 |  1763.97 | -18063.38
+ Anderson    | Darlene      | Lakeview        | Waterloo        |            59408 |     0.00 |  -2456.99
+ Anderson    | Diane        | Greenville      | Granite         |           134356 |  8681.29 | -13725.73
+ Anderson    | Dolores      | Lakeside        | Sulphur Springs |           107484 |  2734.67 |  -7373.60
+ Anderson    | Edward       | Ashland         | Pleasant Valley |            10620 |  1642.28 | -11541.51
+ Anderson    | Jason        | Liberty         | Spring Valley   |            33724 |  3677.25 |   1347.04
+ Anderson    | Jason        | Weldon          | Clinton         |            52544 |  6737.65 | -24962.02
+ Anderson    | Jeremy       | Bridgeport      | Golden          |           148124 |  4154.95 |  -7994.12
+ Anderson    | Jo           | Pleasant Valley | Clinton         |            34960 |  1007.48 |  -6559.40
+ Anderson    | Jonathan     | Lakeview        | Bunker Hill     |            28632 |  3503.15 | -21588.52
+ Anderson    | Mark         | Mount Zion      | Green Acres     |             6816 |   808.46 | -10922.37
+ Anderson    | Randy        | Newport         | Mount Vernon    |           113184 |  1477.23 |  -3410.95
+ Anderson    | Roy          | Hamilton        | Five Points     |           211904 |   831.93 | -17528.32
+ Anderson    | Sean         | Mount Olive     | New Hope        |           108064 |   281.80 |  -9193.10
+ Anderson    | Shaun        | Wilson          | Jerome          |           204500 |   187.67 |   -430.16
+ Anderson    |              | Denmark         | Wilson          |           231724 |   654.56 |  -4540.36
+ Anderson    |              | Newtown         | Lakeview        |            40844 |    94.44 |  -4472.09
+ Andrade     | Xenia        | Forest Hills    | Macedonia       |           115724 | 12710.96 | -25456.74
+ Andrews     | Douglas      | Point Pleasant  | Oakland         |           189608 |  1363.39 |    208.45
+ Andrews     | Lee          | Lakeview        | Cumberland      |           231272 |  1588.58 |  -9344.91
+ Anglin      | Gary         | Clifton         | Providence      |           180720 |  1385.50 |  -4535.67
+ Anthony     | Charlotte    | Jackson         | Antioch         |             1672 |   916.91 | -18845.94
+ Aragon      | Cheryl       | Belleville      | Georgetown      |           144472 |   907.12 |   -929.18
+ Archer      | Clarence     | Spring Valley   | Shiloh          |              232 |   933.50 |  -7838.93
+ Armenta     | Hilda        | Saint Paul      | Jackson         |           153188 |  1071.25 |  -6604.03
+ Armstrong   | Esther       | Hillcrest       | Concord         |           206520 |  4201.08 |  -8101.85
+ Armstrong   | James        | Concord         | Edgewood        |           167984 |   643.94 |  -9851.09
+ Armstrong   | John         | Lakeview        | Plainview       |            89788 |  1124.97 |  -8102.30
+ Arnold      | Jane         | Vance           | Cedar Grove     |           228436 |   372.12 |  -6913.33
+ Arnold      | Thomas       | Cedar Grove     | Buena Vista     |            96988 |   167.73 |  -7116.17
+ Arnold      | Willie       | Summerville     | Lincoln         |           235952 |  1319.61 |  -2658.57
+ Arroyo      | Bernice      | Hillcrest       | Union Hill      |           216000 |   206.45 | -19933.81
+ Ashby       | Ursula       | Stafford        | Raymond         |           147056 |  5914.60 | -11730.12
+ Ashley      | Brittany     | Forest Hills    | Edgewood        |           113812 |  1539.73 | -12565.88
+ Ashley      | Edna         | Lee             | Woodland        |           211792 |   430.84 | -12554.51
+ Atkinson    | Jeanne       | Bunker Hill     | Summit          |            73004 |   587.26 |  -9269.46
+ Augustine   | Tara         | Shady Grove     | Hopewell        |           145084 |  6505.22 |  -9920.19
+ Ault        | Garland      | Greenville      | Florence        |           166952 |    59.07 | -12482.70
+ Ault        | Randall      | Lakeside        | Wilson          |            43808 |  3447.53 |  -6605.44
+ Austin      | Derrick      | Riverside       | Belmont         |           153980 |   971.74 | -13989.41
+ Austin      | Jonathan     | Mount Zion      | Glenwood        |            30532 |  2562.09 |  -6801.48
+ Austin      | Joseph       | Enterprise      | Ashland         |           139200 |  3379.35 |   -217.52
+ Avery       | Chris        | Maple Grove     | Fairfield       |           179648 |     0.00 | -18837.01
+ Aviles      | Jeremy       | Hamilton        | Georgetown      |           198828 |   259.58 |  -1427.03
+ Ayala       | Ann          | Oakland         | Sunnyside       |            98604 |  9309.43 | -19143.70
+ Ayers       | Joe          | Sulphur Springs | Marion          |           130280 |  3930.01 |  -4038.66
+ Ayers       | Luis         | Lakeview        | Belmont         |            34788 |     0.00 |  -1942.46
+ Bacon       | Stephanie    | Hillcrest       | Macedonia       |           134824 |    43.61 | -19122.02
+ Bagley      | Daniel       | Greenwood       | Lone Pine       |           233044 |  5087.36 |  -4733.85
+ Bailey      | Brian        | Woodlawn        | Summit          |            37132 |  1937.10 |  -8693.87
+ Bailey      | Edmond       | Birmingham      | Pleasant Hill   |           142932 |  4481.32 | -19511.79
+ Bailey      | Kayla        | Pleasant Grove  | Wildwood        |           197856 |   167.41 |  -2573.08
+ Bailey      | Tisha        | San Jose        | Wildwood        |           230028 |   668.05 |  -8533.14
+ Baird       | Bryan        | Salem           | Greenfield      |           204308 |    17.23 |  -8863.41
+ Baird       | Cheryl       | New Hope        | Riverview       |             4428 |  6652.19 | -20098.03
+ Baker       | Barb         | New Hope        | Pleasant Grove  |           166756 | 11022.05 | -13170.06
+ Baker       | Christopher  | Woodville       | Valley View     |           150068 |   480.96 |  -9069.13
+ Baker       | Delores      | Oakland         | Woodland        |           178960 |    82.69 |    530.55
+ Baker       | Denise       | Midway          | Spring Hill     |           236432 |    26.63 |  -5587.94
+ Baker       | Edith        | Union Hill      | Wilson          |            93360 |   399.06 | -11214.29
+ Baker       | Kyung        | Arlington       | Newtown         |           173840 |  2317.54 | -12384.42
+ Baker       | Michael      | Concord         | Walnut          |            28780 |   984.26 |  -3827.25
+(100 rows)
+

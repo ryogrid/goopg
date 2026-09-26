@@ -565,6 +565,16 @@ func graftNodeUncached(n Node, s ParallelSettings, anc bool, st *sublinkGraftSta
 			return &c
 		}
 		return n
+	case *SubqueryScan:
+		// M0146-0005w: the labelling wrapper carries no expressions;
+		// graft descends the subplan like every other pass-through so
+		// a graftable Gather inside it is not missed.
+		c := *x
+		if nc := gc(x.Child); nc != x.Child {
+			c.Child = nc
+			return &c
+		}
+		return n
 	case *WindowAgg:
 		c := *x
 		changed := gxs(x.PartitionBy, func(v []Expr) { c.PartitionBy = v })

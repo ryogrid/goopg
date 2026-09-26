@@ -1,0 +1,64 @@
+2026-09-27 — M0146-0005w gates (tree a460a3d8c + slice24 diff, staged index
+code_tree d9a0e48cc7a0e7fd64e4d614d0740bf1d7969952d7b26ee86ae061b87c819532)
+
+Unit (package) tests
+  go test ./internal/optimizer/ ./internal/executor/
+    -> ok / ok
+    New pins:
+      optimizer: TestSubqueryScanWrapsSetOperationArm,
+        TestSubqueryScanWrapsGroupedDerivedTable,
+        TestSubqueryScanSkipsSimpleSubquery,
+        TestSubqueryScanNestedDerivedTables,
+        TestSubqueryScanStripsTrivialWrapper (4 arms: full in-order
+        strips x2; out-of-order and subset keep)
+      executor: TestExplainSubqueryScanLabelOnSetOpArm,
+        TestSubqueryScanExecutesTransparently
+    Iteration history this slice:
+      - v1 wrapped every non-simple leaf -> fireset regressed
+        (SF0.25 match 14->12, jointree-search 21->28): PG keeps the
+        label only when setrefs' trivial_subqueryscan declines.
+      - v2 added stripTrivialSubqueryScans keyed on ordered consumed
+        positions; ColumnRef.Index proved eval-context-global -> mapped
+        via (Name, SourceTableIdx) against the leaf schema.
+      - 8 first-run walk/test failures (Project-over-Aggregate hunters,
+        explain deparse arms) fixed by SubqueryScan traversal arms +
+        a depth-free resolveKeySource chase.
+
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+  -> PASS
+
+scripts/tpch-spotcheck.sh
+  -> RESULT=PASS (Q12 rows=2, Q13 rows=33)
+  gate-stamp: tpch-spotcheck PASS (second run, over the staged index;
+    the first run's verdict was also PASS — stamp FAILed only on
+    unstaged code)
+
+GOOPG_BIN=bin/goopg scripts/tpcds-sf025-regression.sh sweep
+  -> PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  gate-stamp: tpcds-sf025 PASS
+  status-delta vs previous sweep: verdict-changes=none;
+    runtime SLOWER Q31 2s->5s (non-blocking channel)
+
+ACCEPT_BASELINE=tmp/m0145-0008m/arm-on.txt \
+  scripts/tpch-acceptance-arm.sh on tmp/arm-on-m0146-0005w.txt
+  -> SUMMARY: 24 MATCH — values identical to baseline
+  gate-stamp: tpch-acceptance-arm PASS
+
+scripts/tpcds-fireset-gate.sh m0146-0005w tmp/fireset-0005w
+  (artifacts copied to analysis/m0146/m0146-0005/slice24/fireset/)
+  -> SF0.25: baseline match=14 candidate match=14, divergent 85/85;
+     jointree-search 21 -> 22 (Q8 OUT to D3-partialpath — leaf pairing
+     fixed; Q34/Q73/Q53/Q89 IN — see README "Fireset outcome": kept
+     labels on leaf-level quals PG pushes via subquery_push_qual).
+     D1-sublink 7->5, D2-unionall 2->4, D3 25->24.
+     Fires: 27 ids, all PASS both arms. introduced=none.
+  -> SF1: match=12 both, divergent 87/87; jointree-search 16 -> 18
+     (Q34/Q73 same class), D3 26->23, D1 8->6, D2 2->4.
+     Fires: 27 ids, all PASS both arms. introduced=none.
+  gate-stamp: tpcds-fireset PASS
+
+Live evidence
+  Q8 on SF0.25 private clone (tmp/m0146-0005v-data-tpcds-sf025, :5533):
+    `Subquery Scan on a1` retained (subset consumption), `HashSetOp
+    Intersect` directly under the NL (v1/a2 labels stripped — PG's
+    pulled-up/trivial shapes), result 0 rows = oracle.

@@ -190,6 +190,9 @@ func upperNarrowChildren(n Node) []Node {
 		return []Node{x.Child}
 	case *CTEScan:
 		return []Node{x.Child}
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through.
+		return []Node{x.Child}
 	}
 	return nil
 }

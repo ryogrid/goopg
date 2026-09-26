@@ -244,6 +244,10 @@ func deformProjectThrough(p *optimizer.Project, incoming int) int {
 // subtree to full deform.
 func deformBoundBelow(parent optimizer.Node, incoming int) int {
 	switch p := parent.(type) {
+	case *optimizer.SubqueryScan:
+		// M0146-0005w: labelling pass-through — output column i is child
+		// column i, so the bound crosses unchanged.
+		return incoming
 	case *optimizer.Filter:
 		return deformFoldRefs(incoming, p.Predicate)
 	case *optimizer.Sort:

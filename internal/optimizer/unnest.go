@@ -1057,6 +1057,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *OrdinalityWrap:
 		walkPlanExprs(n.Child, visit)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — the subplan's
+		// expressions stay visible to every reader of this walker
+		// (lowerNodeChildren descends it too; the two must stay in
+		// lockstep per planContainsLateralJoin's contract).
+		walkPlanExprs(n.Child, visit)
 	case *Gather:
 		// C-19g's upper-rel-resident half: a Gather can now appear in the
 		// tree BEFORE `Plan()`'s tail passes run, where previously the only
@@ -1639,6 +1645,18 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			}
 		}
 		return &a, nil
+	case *SubqueryScan:
+		// M0146-0005w: a derived-table leaf inside a decorrelating
+		// sublink plan must clone like every other wrapper — unlisted,
+		// the cloner errored and the driver silently kept the sublink
+		// correlated (the NLI-arm comment's own defect class).
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		c := *n
+		c.Child = child
+		return &c, nil
 	case *Sort:
 		child, err := clonePlanReplacingOuter(n.Child, replace)
 		if err != nil {

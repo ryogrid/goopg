@@ -1,0 +1,104 @@
+ i_category |    i_class     |        i_brand        | i_product_name | d_year | d_qoy | d_moy | s_store_id |  sumsales   | rk  
+------------+----------------+-----------------------+----------------+--------+-------+-------+------------+-------------+-----
+ Books      | arts           | amalgmaxi #10         |                |        |       |       |            |   184962.95 |  78
+ Books      | arts           | amalgmaxi #12         |                |        |       |       |            |   258479.12 |  47
+ Books      | arts           | amalgmaxi #2          |                |        |       |       |            |   182777.67 |  80
+ Books      | arts           | amalgmaxi #8          |                |        |       |       |            |   206396.28 |  70
+ Books      | arts           |                       |                |        |       |       |            |  1091192.70 |  17
+ Books      | business       | importomaxi #12       |                |        |       |       |            |   142482.16 |  99
+ Books      | business       | importomaxi #2        |                |        |       |       |            |   315087.72 |  32
+ Books      | business       | importomaxi #4        |                |        |       |       |            |   180943.55 |  82
+ Books      | business       | importomaxi #8        |                |        |       |       |            |   202036.57 |  71
+ Books      | business       |                       |                |        |       |       |            |  1146482.81 |  16
+ Books      | computers      | exportimaxi #10       |                |        |       |       |            |   265835.67 |  45
+ Books      | computers      | exportimaxi #12       |                |        |       |       |            |   207442.61 |  69
+ Books      | computers      | exportimaxi #2        |                |        |       |       |            |   328633.12 |  30
+ Books      | computers      | exportimaxi #4        |                |        |       |       |            |   312647.59 |  33
+ Books      | computers      | exportimaxi #6        |                |        |       |       |            |   208146.38 |  68
+ Books      | computers      | exportimaxi #8        |                |        |       |       |            |   346103.17 |  25
+ Books      | computers      |                       |                |        |       |       |            |  1852169.58 |   2
+ Books      | cooking        | amalgunivamalg #10    |                |        |       |       |            |   174282.01 |  83
+ Books      | cooking        | amalgunivamalg #12    |                |        |       |       |            |   241490.64 |  54
+ Books      | cooking        | amalgunivamalg #4     |                |        |       |       |            |   251350.22 |  51
+ Books      | cooking        | amalgunivamalg #6     |                |        |       |       |            |   191404.63 |  75
+ Books      | cooking        | amalgunivamalg #8     |                |        |       |       |            |   186474.69 |  77
+ Books      | cooking        |                       |                |        |       |       |            |  1317013.08 |  14
+ Books      | entertainments | edu packmaxi #10      |                |        |       |       |            |   248744.68 |  52
+ Books      | entertainments | edu packmaxi #2       |                |        |       |       |            |   213363.70 |  66
+ Books      | entertainments | edu packmaxi #4       |                |        |       |       |            |   300097.12 |  37
+ Books      | entertainments | edu packmaxi #6       |                |        |       |       |            |   183941.22 |  79
+ Books      | entertainments | edu packmaxi #8       |                |        |       |       |            |   168185.63 |  86
+ Books      | entertainments |                       |                |        |       |       |            |  1374091.90 |  12
+ Books      | fiction        | scholarunivamalg #10  |                |        |       |       |            |   272176.22 |  44
+ Books      | fiction        | scholarunivamalg #12  |                |        |       |       |            |   141701.02 | 100
+ Books      | fiction        | scholarunivamalg #2   |                |        |       |       |            |   391336.66 |  20
+ Books      | fiction        | scholarunivamalg #6   |                |        |       |       |            |   163960.21 |  89
+ Books      | fiction        | scholarunivamalg #8   |                |        |       |       |            |   371360.34 |  22
+ Books      | fiction        |                       |                |        |       |       |            |  1588253.81 |   6
+ Books      | history        | scholarmaxi #10       |                |        |       |       |            |   334911.20 |  27
+ Books      | history        | scholarmaxi #12       |                |        |       |       |            |   247961.56 |  53
+ Books      | history        | scholarmaxi #2        |                |        |       |       |            |   538694.97 |  18
+ Books      | history        | scholarmaxi #6        |                |        |       |       |            |   201956.45 |  72
+ Books      | history        | scholarmaxi #8        |                |        |       |       |            |   232188.33 |  59
+ Books      | history        |                       |                |        |       |       |            |  1728503.91 |   4
+ Books      | home repair    | importounivamalg #10  |                |        |       |       |            |   251804.08 |  50
+ Books      | home repair    | importounivamalg #2   |                |        |       |       |            |   361552.73 |  23
+ Books      | home repair    | importounivamalg #4   |                |        |       |       |            |   162153.29 |  92
+ Books      | home repair    | importounivamalg #6   |                |        |       |       |            |   159812.31 |  93
+ Books      | home repair    | importounivamalg #8   |                |        |       |       |            |   420572.19 |  19
+ Books      | home repair    |                       |                |        |       |       |            |  1587405.09 |   7
+ Books      | mystery        | corpunivamalg #10     |                |        |       |       |            |   181143.31 |  81
+ Books      | mystery        | corpunivamalg #12     |                |        |       |       |            |   190984.16 |  76
+ Books      | mystery        | corpunivamalg #2      |                |        |       |       |            |   167686.20 |  87
+ Books      | mystery        | corpunivamalg #4      |                |        |       |       |            |   151648.63 |  96
+ Books      | mystery        | corpunivamalg #6      |                |        |       |       |            |   195732.15 |  74
+ Books      | mystery        | corpunivamalg #8      |                |        |       |       |            |   162811.96 |  91
+ Books      | mystery        |                       |                |        |       |       |            |  1165306.23 |  15
+ Books      | parenting      | corpmaxi #10          |                |        |       |       |            |   275523.60 |  42
+ Books      | parenting      | corpmaxi #12          |                |        |       |       |            |   169618.06 |  85
+ Books      | parenting      | corpmaxi #2           |                |        |       |       |            |   201461.16 |  73
+ Books      | parenting      | corpmaxi #4           |                |        |       |       |            |   319386.13 |  31
+ Books      | parenting      | corpmaxi #6           |                |        |       |       |            |   328690.45 |  29
+ Books      | parenting      | corpmaxi #8           |                |        |       |       |            |   171913.49 |  84
+ Books      | parenting      |                       |                |        |       |       |            |  1534815.15 |   8
+ Books      | reference      | brandmaxi #10         |                |        |       |       |            |   235809.74 |  57
+ Books      | reference      | brandmaxi #12         |                |        |       |       |            |   216883.61 |  64
+ Books      | reference      | brandmaxi #2          |                |        |       |       |            |   235930.96 |  56
+ Books      | reference      | brandmaxi #4          |                |        |       |       |            |   375100.26 |  21
+ Books      | reference      | brandmaxi #6          |                |        |       |       |            |   225994.36 |  63
+ Books      | reference      | brandmaxi #8          |                |        |       |       |            |   339717.98 |  26
+ Books      | reference      |                       |                |        |       |       |            |  1749146.57 |   3
+ Books      | romance        | namelessmaxi #10      |                |        |       |       |            |   158736.33 |  94
+ Books      | romance        | namelessmaxi #12      |                |        |       |       |            |   210809.45 |  67
+ Books      | romance        | namelessmaxi #2       |                |        |       |       |            |   291679.01 |  38
+ Books      | romance        | namelessmaxi #4       |                |        |       |       |            |   303951.46 |  35
+ Books      | romance        | namelessmaxi #6       |                |        |       |       |            |   282822.76 |  41
+ Books      | romance        | namelessmaxi #8       |                |        |       |       |            |   235736.25 |  58
+ Books      | romance        |                       |                |        |       |       |            |  1591784.29 |   5
+ Books      | science        | maximaxi #10          |                |        |       |       |            |   228821.59 |  61
+ Books      | science        | maximaxi #2           |                |        |       |       |            |   237378.04 |  55
+ Books      | science        | maximaxi #4           |                |        |       |       |            |   157121.71 |  95
+ Books      | science        | maximaxi #6           |                |        |       |       |            |   251917.57 |  49
+ Books      | science        | maximaxi #8           |                |        |       |       |            |   285492.77 |  40
+ Books      | science        |                       |                |        |       |       |            |  1346339.51 |  13
+ Books      | self-help      | exportiunivamalg #10  |                |        |       |       |            |   331321.57 |  28
+ Books      | self-help      | exportiunivamalg #2   |                |        |       |       |            |   289849.80 |  39
+ Books      | self-help      | exportiunivamalg #4   |                |        |       |       |            |   215192.69 |  65
+ Books      | self-help      | exportiunivamalg #6   |                |        |       |       |            |   273028.53 |  43
+ Books      | self-help      | exportiunivamalg #8   |                |        |       |       |            |   163897.08 |  90
+ Books      | self-help      |                       |                |        |       |       |            |  1457226.49 |  10
+ Books      | sports         | edu packunivamalg #10 |                |        |       |       |            |   255944.70 |  48
+ Books      | sports         | edu packunivamalg #12 |                |        |       |       |            |   149168.35 |  98
+ Books      | sports         | edu packunivamalg #4  |                |        |       |       |            |   231571.76 |  60
+ Books      | sports         | edu packunivamalg #6  |                |        |       |       |            |   258845.19 |  46
+ Books      | sports         | edu packunivamalg #8  |                |        |       |       |            |   311647.51 |  34
+ Books      | sports         |                       |                |        |       |       |            |  1472840.81 |   9
+ Books      | travel         | univunivamalg #10     |                |        |       |       |            |   151276.77 |  97
+ Books      | travel         | univunivamalg #12     |                |        |       |       |            |   164739.34 |  88
+ Books      | travel         | univunivamalg #2      |                |        |       |       |            |   226772.90 |  62
+ Books      | travel         | univunivamalg #4      |                |        |       |       |            |   302572.30 |  36
+ Books      | travel         | univunivamalg #8      |                |        |       |       |            |   346205.33 |  24
+ Books      | travel         |                       |                |        |       |       |            |  1448011.52 |  11
+ Books      |                |                       |                |        |       |       |            | 23465724.82 |   1
+(100 rows)
+

@@ -207,6 +207,10 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		// The scan's schema is the body's output schema, position for
 		// position.
 		return resolveBaseColumn(idx, x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: same position-for-position contract — the
+		// wrapper's schema is the subplan's output, alias-renamed.
+		return resolveBaseColumn(idx, x.Child)
 
 	// M0127-P5.6-e-iii added this arm to the ndistinct lookup (P5.6-e-ii to
 	// the stats twin). Upstream resolves a join-level Var straight to its
@@ -416,6 +420,11 @@ func resolvesToGroupUniqueColumn(idx int, child Node) bool {
 	case *GatherMerge:
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *CTEScan:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: same contract as CTEScan — a coordinate crossing
+		// the label must cross here exactly as it does in
+		// resolveBaseColumn, or the pair describe different columns.
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	// The `*WindowAgg` twin of `resolveBaseColumn`'s arm. This function's own
 	// contract says the two walkers must agree about which node a coordinate

@@ -245,6 +245,9 @@ func legacyDisplayChildren(n Node) []Node {
 		return []Node{p.Anchor, p.Recursive}
 	case *SetOp:
 		return []Node{p.Left, p.Right}
+	case *SubqueryScan:
+		// M0146-0005w: the subplan must be priced beneath the label.
+		return []Node{p.Child}
 	}
 	return nil
 }

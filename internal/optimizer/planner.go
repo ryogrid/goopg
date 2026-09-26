@@ -139,7 +139,8 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 		plannerSet.ParallelStatementOK = false
 	}
 	// A-01(ii) cut 1: one RTID scope per top-level statement (F1).
-	node, err := planStmtWithSettings(stmt, cat, plannerSet, newRtableScope())
+	scope := newRtableScope()
+	node, err := planStmtWithSettings(stmt, cat, plannerSet, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +202,12 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// the passes that turned out to be able to rewrite the map; this one runs
 	// after all of them. A no-op boolean test with `GOOPG_PGSHAPED_DP` off.
 	assertSearchedBoundariesIntact(node)
+	// M0146-0005w: upstream's setrefs cleans up trivial SubqueryScan nodes
+	// LAST (clean_up_removed_plan_level) — a label survives only when the
+	// leaf's consumption is non-trivial. Runs after the boundary assert on
+	// purpose: the assert verifies the as-planned coordinate map, and this
+	// pass removes labelling nodes only.
+	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees)
 	return node, nil
 }
 
@@ -3797,6 +3804,24 @@ func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
 // consumes its own RTID; see planScanRangeVar.
 type rtableScope struct {
 	next int32
+	// derivedSubtrees registers every FROM-subquery leaf's subtree root —
+	// wrapped in a SubqueryScan or not — so Plan()'s tail can bound each
+	// derived scope for the setrefs-style triviality pass
+	// (stripTrivialSubqueryScans). Unwrapped subtrees are still separate
+	// binding scopes (a simple subquery keeps its own column namespace),
+	// so they must be recorded just like wrapped ones. M0146-0005w.
+	derivedSubtrees []Node
+}
+
+// recordDerivedSubtree appends a FROM-subquery leaf subtree root to the
+// scope's registry. Nil-receiver safe, matching Alloc: callers on the
+// unthreaded utility paths simply record nothing (the triviality pass
+// then under-bounds, which only ever over-keeps a label). M0146-0005w.
+func (s *rtableScope) recordDerivedSubtree(n Node) {
+	if s == nil || n == nil {
+		return
+	}
+	s.derivedSubtrees = append(s.derivedSubtrees, n)
 }
 
 func newRtableScope() *rtableScope { return &rtableScope{next: 1} }
@@ -5000,6 +5025,12 @@ func containsSetOp(n Node) bool {
 	if l, ok := n.(*Limit); ok {
 		return containsSetOp(l.Child)
 	}
+	if sq, ok := n.(*SubqueryScan); ok {
+		// M0146-0005w: the wrapper labels a set-operation arm, so the
+		// guard below it must still see the SetOp inside — same answer
+		// the unwrapped subtree gave.
+		return containsSetOp(sq.Child)
+	}
 	return false
 }
 
@@ -5846,7 +5877,72 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// candidate onto the search leaf rel; the flag is unset on the
 	// legacy arm, so off-knob behaviour is unchanged by construction.
 	b.appendrel = appendrelSubquery
+	// M0146-0005w: a subquery PG's is_simple_subquery could not pull up
+	// stays an RTE_SUBQUERY and renders `Subquery Scan on <alias>`. The
+	// appendrel candidate is the one set-op shape that IS pulled up
+	// (is_simple_union_all), so it keeps its inline path; every other
+	// non-simple leaf gets the labelling wrapper.
+	if !appendrelSubquery && derivedSubqueryNeedsScan(rv.Subquery, inner) {
+		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx}
+	}
+	// Register the leaf subtree root whether or not it got the label —
+	// the triviality pass needs every derived scope's boundary to bound
+	// column-consumption per scope (setrefs.c trivial_subqueryscan).
+	scope.recordDerivedSubtree(inner)
 	return inner, b, nil
+}
+
+// derivedSubqueryNeedsScan reports whether a FROM-clause subquery must keep
+// a SubqueryScan leaf in the finished plan — the inverse of PG's
+// is_simple_subquery (postgres/src/backend/optimizer/prep/prepjointree.c),
+// which pulls a range-table subquery into an appendrel only for a bare
+// SELECT. Every clause-level refusal there maps to a field here; the
+// target-level properties (hasAggs, windowFuncs, hasTargetSRFs) are read
+// off the PLANNED subtree's shape — Aggregate, WindowAgg and ProjectSet
+// are the resolved form of the same properties, which also covers
+// user-defined aggregates and SETOF routines no name list would catch.
+// M0146-0005w.
+func derivedSubqueryNeedsScan(s *parser.SelectStmt, inner Node) bool {
+	if s == nil {
+		return false
+	}
+	if s.SetOp != nil || s.SetOpOperand != nil ||
+		len(s.GroupBy) > 0 || s.GroupingSets != nil || s.Having != nil ||
+		len(s.OrderBy) > 0 || s.Distinct || len(s.DistinctOn) > 0 ||
+		s.Limit != nil || s.Offset != nil || s.WithTies ||
+		s.With != nil || len(s.Locking) > 0 {
+		return true
+	}
+	return subqueryPlanContains(inner, func(n Node) bool {
+		switch n.(type) {
+		case *Aggregate, *WindowAgg, *ProjectSet:
+			return true
+		}
+		return false
+	})
+}
+
+// subqueryPlanContains reports whether the subtree rooted at n holds a
+// node matching want. Children come from planChildNodes' reflection over
+// exported Node fields, so the walk stays correct for node kinds it does
+// not name. M0146-0005w.
+func subqueryPlanContains(n Node, want func(Node) bool) bool {
+	if n == nil {
+		return false
+	}
+	if want(n) {
+		return true
+	}
+	kids, ok := planChildNodes(n)
+	if !ok {
+		return false
+	}
+	for _, k := range kids {
+		if subqueryPlanContains(k, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteIndirectionStarTargets is a thin adapter that delegates to the

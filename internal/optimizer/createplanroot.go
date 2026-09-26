@@ -459,6 +459,9 @@ func boundaryWalkChildren(n Node) []Node {
 		return []Node{x.Child}
 	case *GatherMerge:
 		return []Node{x.Child}
+	case *SubqueryScan:
+		// M0146-0005w: single-child labelling pass-through.
+		return []Node{x.Child}
 	case *Join:
 		return []Node{x.Left, x.Right}
 	case *SetOp:

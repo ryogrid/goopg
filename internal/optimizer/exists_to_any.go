@@ -161,6 +161,9 @@ func rewriteExistsToAnyNode(node Node) {
 		rewriteExistsToAnyNode(n.Child)
 	case *CTEScan:
 		rewriteExistsToAnyNode(n.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through.
+		rewriteExistsToAnyNode(n.Child)
 	case *SetOp:
 		rewriteExistsToAnyNode(n.Left)
 		rewriteExistsToAnyNode(n.Right)

@@ -98,6 +98,13 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newFromRegexpMatchesOp(p), scope), nil
 	case *optimizer.FromRegexpSplitToTable:
 		return maybeInstrument(p, newFromRegexpSplitToTableOp(p), scope), nil
+	case *optimizer.SubqueryScan:
+		// M0146-0005w: a labelling wrapper, not an operator — PG's
+		// SubqueryScan node forwards tuples unchanged, which the child
+		// op already does when it is built directly. The bound threads
+		// through unchanged: the wrapper's output columns are the
+		// child's own columns at identical positions.
+		return buildNode(p.Child, deformBoundBelow(p, bound), scope)
 	case *optimizer.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls

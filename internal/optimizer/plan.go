@@ -1849,6 +1849,39 @@ type CTEScan struct {
 	SourceIdx int16
 }
 
+// SubqueryScan labels a derived-table leaf whose subquery PG could not
+// pull up (is_simple_subquery, prepjointree.c): set operations, grouping
+// or aggregation, window functions, target SRFs, ORDER BY / DISTINCT /
+// LIMIT, WITH, or row locking keep the subquery an RTE_SUBQUERY, which
+// PG's planner renders as `Subquery Scan on <alias>`. goopg used to hand
+// the inner subtree to the join leaf set directly, so a set-operation
+// arm read as its innermost relations (TPC-DS Q8's `customer` /
+// `customer_address` pair) instead of the one scan leaf PG reports.
+//
+// Like CTEScan, the wrap is purely a labelling artifact: the executor's
+// Build switch unwraps it to Child, so no new operator type exists and
+// no runtime semantics change. The schema is the binding's (alias-
+// renamed) output — same column positions as the child's, so every
+// single-child plan walk treats it as a transparent pass-through and
+// only scope-aware readers (reconcileNLILayoutBody, execParamOwner-
+// Children) stop at it, exactly as they already stop at a separately
+// planned scope. M0146-0005w.
+type SubqueryScan struct {
+	pos    int
+	Alias  string
+	Child  Node
+	schema Schema
+	// src is the leaf binding's per-FROM-clause sourceIdx — the
+	// coordinate the enclosing scope's ColumnRefs use to name this
+	// leaf's columns. The setrefs-style triviality pass
+	// (stripTrivialSubqueryScans) reads it to compute which output
+	// positions the consumer actually references. M0146-0005w.
+	src int16
+}
+
+func (n *SubqueryScan) Pos() int       { return n.pos }
+func (n *SubqueryScan) Output() Schema { return n.schema }
+
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
 // before the outer query. DMls are executed in order; each plan's RETURNING
 // rows are collected into ctx.MaterializedCTEs[Names[i]] for CTEScan

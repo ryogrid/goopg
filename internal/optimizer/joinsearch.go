@@ -532,11 +532,24 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 // this planner keeps paying for.
 func leafBaseScan(n Node) Node {
 	for {
-		f, ok := n.(*Filter)
-		if !ok || f.Child == nil {
-			return n
+		switch x := n.(type) {
+		case *Filter:
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
+		case *SubqueryScan:
+			// M0146-0005w: labelling wrapper — strip to the subplan's
+			// own top so the set-op leaf readers (setOpLeafDistinctFor)
+			// see the same node they saw unwrapped.
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
 		}
-		n = f.Child
+		return n
 	}
 }
 

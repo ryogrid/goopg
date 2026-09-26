@@ -42,6 +42,11 @@ func projectOverAggregate(t *testing.T, c catalog.Catalog, sql string) *Project 
 		case *SetOp:
 			walk(x.Left)
 			walk(x.Right)
+		case *SubqueryScan:
+			// M0146-0005w: the aggregate leaf now sits under the
+			// labelling wrapper; descend it like every other
+			// pass-through in this walk.
+			walk(x.Child)
 		}
 	}
 	walk(plan)
