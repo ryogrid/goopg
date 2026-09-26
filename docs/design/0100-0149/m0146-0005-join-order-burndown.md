@@ -696,15 +696,41 @@ goopg self-diffs on the same private clones: Q22 is the only shape
 change across all 99 TPC-DS queries, and all 22 TPC-H queries are
 unchanged. Evidence: `analysis/m0146/m0146-0005/slice21/`.
 
+## Slice 22 (recon): Q82 = btree skip-scan; Q8 decomposes — no code
+
+TPC-DS Q82's `join-method` depth=7 record: PG drives `NL (item ->
+inventory_pkey probe)` where the probe's `Index Cond: (inv_item_sk =
+item.i_item_sk)` binds the SECOND column of
+`btree (inv_date_sk, inv_item_sk, inv_warehouse_sk)` — PG 18's skip
+arrays (`_bt_skiparray`, nbtpreprocesskeys.c/nbtutils.c) cycle the 209
+distinct `inv_date_sk` values at one descent each, costed by
+`btcostestimate`'s `num_sa_scans *= get_variable_numdistinct`
+(selfuncs.c:7342+). goopg admits index keys only on a gapless leading
+prefix, so no `{0}`-parameterised path exists on `{1}` and the joinrel
+elects `Parallel Hash Join`. The gap was ledgered under M0145-0029-2b
+with no consumer; Q82 is the first measured one. Filed `M0146-0005v`.
+
+TPC-DS Q8's `join-order` depth=3 leaf-set record decomposes into: (a) a
+missing `Subquery Scan on a1` leaf — PG plans each set-op leaf arm via
+`subquery_planner`, goopg plans arms inline — filed `M0146-0005w`;
+(b) two missing `Materialize` wrappers (M0146-0010); (c) an INTERSECT
+arm-order estimate (`ca_zip` n_distinct 3124 vs goopg's substr() arm
+group estimate ≤ 1070 — M0146-0009 territory). Q14's depth-7 record is
+gone from the post-21 census.
+
+Evidence: `analysis/m0146/m0146-0005/slice22/`.
+
 ## Remaining records
 
-Per M0146-0001's `m0146-0001-ranked.txt`, still to be worked:
-- TPC-H: Q17 and Q19 (`join-method`); Q9's first divergence is now a
-  `qual-placement` one.
-- TPC-DS: SF0.25 14 MATCH / 11 `join-order`+`join-method` records
-  (Q22 burned), SF1 census unchanged by this slice; the rest split
-  between `join-order`, `join-method` and presorted-input
-  `sort-strategy`.
+Post-slice-21 census, still to be worked:
+- TPC-H: Q17 (`join-method`; waits on M0146-0012's correlated-sublink
+  JOIN clauses) and Q19 (aggregation first divergence); Q9's first
+  divergence is `qual-placement`/`sort-strategy` at depth 0.
+- TPC-DS SF0.25: `join-method` Q1, Q23, Q30, Q55, Q65, Q79, Q82, Q92
+  and `join-order` Q4, Q8, Q11 — attributed per the slice-22 table:
+  owner-blocked (Q23/Q30/Q55/Q79), filed children (Q82 → 0005v, Q8 →
+  0005w), other families (Q1/Q92 sublinks, Q65 aggregation), or cost
+  ties (Q4/Q11). Every remaining record has a named owner.
 
 Re-run the first-divergence census on each slice's capture before choosing
 the next mechanism.

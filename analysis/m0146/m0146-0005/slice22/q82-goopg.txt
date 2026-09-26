@@ -1,0 +1,26 @@
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=11062.77..11062.81 rows=2 width=96)
+   ->  Group  (cost=11062.77..11062.79 rows=2 width=96)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=11061.91..11062.77 rows=6 width=96)
+               Workers Planned: 3
+               ->  Group  (cost=10061.90..10061.92 rows=2 width=96)
+                     Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                     ->  Sort  (cost=10061.87..10061.90 rows=13 width=1344)
+                           Sort Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                           ->  Nested Loop  (cost=2031.65..26924.58 rows=40 width=964)
+                                 ->  Nested Loop  (cost=1031.28..25922.88 rows=1 width=536)
+                                       ->  Hash Join  (cost=1031.03..25913.80 rows=32 width=116)
+                                             Hash Cond: (inventory.inv_item_sk = item.i_item_sk)
+                                             ->  Parallel Seq Scan on inventory  (cost=0.00..24125.16 rows=288546 width=16)
+                                                   Filter: ((inv_quantity_on_hand >= 100) AND (inv_quantity_on_hand <= 500))
+                                             ->  Seq Scan on item  (cost=0.00..1031.00 rows=2 width=480)
+                                                   Filter: (((i_current_price >= 58) AND (i_current_price <= 88)) AND (i_manufact_id = ANY (259, 559, 580, 485)))
+                                       ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.28 rows=1 width=420)
+                                             Index Cond: (d_date_sk = inventory.inv_date_sk)
+                                             Filter: ((d_date >= '2001-01-13'::date) AND (d_date <= '2001-03-14 00:00:00'::timestamp))
+                                 ->  Index Scan using store_sales_pkey on store_sales  (cost=0.38..1.17 rows=44 width=428)
+                                       Index Cond: (ss_item_sk = inventory.inv_item_sk)
+(22 rows)
+

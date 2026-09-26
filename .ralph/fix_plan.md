@@ -22081,6 +22081,69 @@ M0146-0001 re-baseline census on the new default arm.
       ledgered, repro preserved at `tmp/m0146\-0005\-q22/data`.
   Movement: TPC\-DS SF0.25 Q22 `join\-method` → MATCH \(SF0.25 matches
   13 → 14\)
+- [ ] **M0146\-0005v — btree skip scan: index quals on non\-leading columns**
+  \(filed 2026\-09\-27 by M0146\-0005 slice 22, witness TPC\-DS Q82\):
+  `inventory_pkey` is `btree \(inv_date_sk, inv_item_sk, inv_warehouse_sk\)`;
+  PG 18 probes it on `inv_item_sk = item.i_item_sk` — a NON\-leading column —
+  via its PG18 skip arrays, so `NL \(item -> inventory probe\)` costs
+  0.43..1822 and wins; goopg admits index keys only on a gapless leading
+  prefix, so no `{0}`\-parameterised path exists on `{1}` and the {item,
+  inventory} joinrel elects `Parallel Hash Join` \(DPPATH: the only
+  parameterised inventory probes are reqouter=\{2\} on the leading
+  `inv_date_sk` and \{0,2\}/\{2,3\} on the full prefix\). The gap is already
+  ledgered \(deferral\_ledger M0145\-0029\-2b item 4, `pathbitmap.go:304`
+  comment\); Q82 is its first measured corpus consumer.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: planner admission — the key collectors
+    \(`restrictionEqualityPrefix` / `consumingIndexClauses` /
+    `restrictionKeyUsable` in `pathindexrestrict.go`, `pathindexonly.go`;
+    `matchBitmapIndexQuals` in `pathbitmap.go`\) stop at the first unbound
+    column today. Admit an `=` \(and later range\) key on a later column,
+    recording which leading positions are unbound \(the skip set\).
+    Costing: follow `btcostestimate` \(selfuncs.c:7342+\) — `num_sa_scans`
+    multiplies by `get_variable_numdistinct` of each skipped attribute
+    \(with its `indexSkipQuals` selectivity folded in, plus a NULL
+    fraction/\+1 arm\); a stats\-less skipped column must decline, matching
+    PG\'s `isdefault` fallback. Executor: `indexScanOp` / the
+    `NestedLoopIndexJoin` probe enumerate each distinct skipped\-column
+    value \(prefix\-successor descent on the composite key —
+    `NewScanCursor` already re\-descends; per\-column encoding parts come
+    from `encodeBTreeKeyForColumn` / `indexProbeKeyPart`\) and run the
+    existing bounded probe per value. Scope the first slice to btree
+    equality skips only; decline SAOP/bitmap/index\-only/partial arms until
+    each is covered. Pin: Q82 elects `NL \(item -> Index Scan
+    inventory_pkey, Index Cond: \(inv_item_sk = item.i_item_sk\)\)`; values
+    identical; fire set at both scales.
+  - Decomposition guidance: executor skip iteration lands FIRST behind a
+    planner\-off default \(it is the riskiest half\), planner admission and
+    `num_sa_scans` costing in the same commit as the enable — an admitted
+    qual with a naive full\-index scan would elect PG\'s plan but time out
+    on wide probes.
+- [ ] **M0146\-0005w — a set\-operation arm that is a subquery renders as a
+  `Subquery Scan` leaf** \(filed 2026\-09\-27 by M0146\-0005 slice 22,
+  witness TPC\-DS Q8 depth\-3 join\-order\): PG plans each leaf arm of a
+  set operation via `subquery_planner`, so the subquery arm is a
+  `SubqueryScan` RTE — `Subquery Scan on a1` — which counts as ONE leaf
+  against the enclosing NL's leaf set. goopg plans the arm inline, so its
+  leaves \(customer, customer\_address\) leak into the parent's leaf set
+  and the census pairing fails. Decomposition of Q8's record: \(a\) this
+  missing leaf wrapper; \(b\) two missing `Materialize` wrappers — the
+  rescanned inner of the top NL and the `HashSetOp` — which belong to
+  M0146\-0010; \(c\) arm order — PG's INTERSECT swap put the grouped arm
+  left because `ca_zip` has stats \(n\_distinct 3124\) while goopg
+  estimated the substr\(\) arm's groups below the aggregate's 1070
+  \(estimate\-level, M0146\-0009 territory\).
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: introduce a subquery\-scan plan node for set\-op arms whose
+    arm query is a `FROM` subquery \(label `Subquery Scan on <alias>`;
+    the EXPLAIN label already exists via `CTEScan.Inlined`\). Cost it as
+    PG's `subqueryscanpath` \(a trivial per\-tuple charge\). Where the
+    census pairs leaves, the wrapper must expose ONE leaf \(the arm's own
+    rels hidden\). Watch the executor: no standalone SubqueryScan op
+    exists — a pass\-through wrapper over the arm subtree, or reuse the
+    inlined\-CTE scan node, whichever matches the arm's tuple contract.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
