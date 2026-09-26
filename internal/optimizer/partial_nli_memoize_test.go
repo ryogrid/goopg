@@ -187,25 +187,21 @@ func TestPartialPathDrivingKindMemoizedNLI(t *testing.T) {
 		t.Fatalf("memoized satisfiable probe must drive on the outer scan, got %v", got)
 	}
 
-	// M0146-0002i: a MEMOIZED SEMI probe must classify too — the wrapper is
-	// transparent to the jointype check, and the fused NLI gate it lowers
-	// to already admits SEMI (M0145-0010).
-	{
+	// M0146-0002i/j: MEMOIZED SEMI and ANTI probes must classify too — the
+	// wrapper is transparent to the jointype check, and the fused NLI gate
+	// they lower to already admits both (M0145-0010).
+	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
 		jr, o, i, _, _ := latClassifyFixture()
 		pr := latParamInner(i, o.Relids)
-		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, parser.JoinSemi, nliMemoizeInner(pr))); got != PathSeqScan {
-			t.Errorf("memoized SEMI probe must classify to its outer's driving kind, got %v", got)
+		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, jt, nliMemoizeInner(pr))); got != PathSeqScan {
+			t.Errorf("memoized %v probe must classify to its outer's driving kind, got %v", jt, got)
 		}
 	}
 
 	cases := map[string]func(joinrel, outer, inner *RelOptInfo, probe *Path) *Path{
-		// ANTI waits for M0146-0002j's producer widening; LEFT stays
-		// unverified for the probe shape.
+		// LEFT stays unverified for the probe shape.
 		"left-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
 			return latClassifyPath(jr, o, i, parser.JoinLeft, nliMemoizeInner(pr))
-		},
-		"anti-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
-			return latClassifyPath(jr, o, i, parser.JoinAnti, nliMemoizeInner(pr))
 		},
 		"memoize-empty": func(jr, o, i *RelOptInfo, pr *Path) *Path {
 			bad := *nliMemoizeInner(pr)

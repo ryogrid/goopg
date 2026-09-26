@@ -465,14 +465,19 @@ func partialNestLoopJointype(t parser.JoinType) bool {
 // whose PG plan is this exact shape: `Nested Loop Semi Join` inside the
 // Gather, probing lineitem's index per worker.
 //
-// ANTI stays refused until M0146-0002j lands the producer gate with it —
-// widening here alone would admit a filed-by-nobody arm. LEFT stays
-// refused: worker-local in principle but never executor-verified for the
-// probe shape, and no measured consumer exists (ledger
-// `m0146-0002a-left-probe`).
+// ANTI joins for M0146-0002j, landed together with the producer gate:
+// emit the outer row iff no probe row qualifies — decided per outer row,
+// worker-local exactly as the whole-inner ANTI arm
+// (`TestParallelLeftAntiNestedLoopIdentity`) already proved. Its named
+// consumer is TPC-H Q21's `Nested Loop Anti Join` inside the Gather
+// probing l3's index per worker.
+//
+// LEFT stays refused: worker-local in principle but never
+// executor-verified for the probe shape, and no measured consumer exists
+// (ledger `m0146-0002a-left-probe`).
 func partialProbeNestLoopJointype(t parser.JoinType) bool {
 	switch t {
-	case parser.JoinInner, parser.JoinSemi:
+	case parser.JoinInner, parser.JoinSemi, parser.JoinAnti:
 		return true
 	}
 	return false

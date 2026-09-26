@@ -21285,7 +21285,7 @@ M0146-0001 re-baseline census on the new default arm.
       under `\-race`, workers 1/2/4 — uses
       `SetIndexProbeCostMultiplier("1")` so the fixture elects the plain
       index probe rather than the still\-refused bitmap family\).
-- [ ] **M0146\-0002j — parameterized\-probe partial nested loop under
+- [x] **M0146\-0002j — parameterized\-probe partial nested loop under
   ANTI** \(filed 2026\-09\-27 by M0146\-0002a on TPC\-H Q21\). Same three\-gate
   widening as M0146\-0002i PLUS the producer gate
   \(`joinpathsnli.go:465` `jt != Inner && jt != Semi` → admit ANTI\).
@@ -21295,9 +21295,31 @@ M0146-0001 re-baseline census on the new default arm.
   M0146\-0002i — same code sites, keep the attribution separate.
   Kind: impl
   Parent: M0146-0002a
-  - Expected movement: TPC\-H Q21's `NL Anti` inside the Gather probing
-    l3's index per worker — `join\-order`/`qual\-placement`/`parallelism`
-    categories; measured on the canonical capture.
+  - **DONE 2026\-09\-27.** Evidence `analysis/m0146/m0146\-0002j/`;
+    design doc `docs/design/0100\-0149/m0146\-0002a\-parallel\-hash\-arm\-regressions.md`
+    §"M0146\-0002j outcome". Producer {I,S} → {I,S,A}
+    \(`addPartialNestLoopPaths` files both ANTI inner families — the
+    whole\-inner arm M0145\-0010 already verified plus the probe arm\);
+    `partialProbeNestLoopJointype` / `partialProbeNestLoopJoinType` /
+    executor `lateralProbeJoinPartial` widened to \{I,S,A\} in the same
+    change. LEFT and bitmap probes stay refused at every gate.
+    - **Measured TPC\-H Q21** \(canonical parallel arm\): `Nested Loop
+      Anti Join` inside `Gather` probing `idx_lineitem_orderkey_fkidx`
+      on l3 per worker — PG's placement; 182221 vs pre\-change 263100,
+      vs PG 269864; ~2\.3 s, canonical 412 rows.
+    - Residual recorded honestly: outer\-tree join order still differs
+      — goopg joins \(l1↔supplier\) inside the gather then probes
+      orders above it, where PG builds `Parallel Hash Join` over all
+      three inside the gather. Q21 categories \[join\-order,
+      parallelism, qual\-placement\] → \[join\-order, join\-method,
+      parallelism, qual\-placement\] \(+join\-method from the
+      reelected outer methods; attribution class stays D1\-sublink\).
+    - Fire\-set: zero fires at both TPC\-DS scales; acceptance arm
+      24/24 value\-identical; sf025 96/96, shapes 99/99.
+    - Pins: producer test now \{I,S,A\}/LEFT; boundary tests re\-pinned;
+      `TestParallelLateralAntiProbeIdentity` — row identity under
+      `\-race`, workers 1/2/4, `NOT EXISTS` electing the decomposed
+      probe under `SetIndexProbeCostMultiplier("1")`.
 - [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
   M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
   the zero-row shared-accumulator model to one that emits real partial

@@ -1389,17 +1389,18 @@ func partialNestLoopJoinType(t JoinType) bool {
 // `partialNestLoopJointype` do — Path carries `parser.JoinType` while the
 // plan nodes carry `optimizer.JoinType` — and must name the same set.
 //
-// The set is {INNER, SEMI} (M0146-0002i): a SEMI verdict is per-outer-row
-// and worker-local (one qualifying probe row decides the outer row and the
-// probe breaks — `finishOuter`), so partitioning the outer is transparent.
-// ANTI joins for M0146-0002j together with the producer gate; LEFT stays
-// refused (never executor-verified for probes, no measured consumer —
-// gatherpaths.go's predicate comment names the ledger row). The fused
-// family already verified all four jointypes (`partialNestLoopJoinType`
-// above, M0145-0010) and needs no narrowing.
+// The set is {INNER, SEMI, ANTI}: SEMI joined for M0146-0002i and ANTI
+// for M0146-0002j — both verdicts are per-outer-row and worker-local
+// (one qualifying probe row decides the outer row and the probe breaks —
+// `finishOuter`; for ANTI, no qualifying row emits the outer), so
+// partitioning the outer is transparent. LEFT stays refused (never
+// executor-verified for probes, no measured consumer — gatherpaths.go's
+// predicate comment names the ledger row). The fused family already
+// verified all four jointypes (`partialNestLoopJoinType` above,
+// M0145-0010) and needs no narrowing.
 func partialProbeNestLoopJoinType(t JoinType) bool {
 	switch t {
-	case JoinTypeInner, JoinTypeSemi:
+	case JoinTypeInner, JoinTypeSemi, JoinTypeAnti:
 		return true
 	}
 	return false

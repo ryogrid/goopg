@@ -1,0 +1,35 @@
+=== Q21
+Sort  (cost=182221.58..182221.58 rows=1 width=112)
+  Sort Key: (count(*)) DESC, supplier.s_name
+  ->  GroupAggregate  (cost=182221.55..182221.56 rows=1 width=112)
+        Group Key: supplier.s_name
+        ->  Sort  (cost=182221.55..182221.55 rows=1 width=3172)
+              Sort Key: supplier.s_name
+              ->  Nested Loop Semi Join  (cost=1240.60..182221.53 rows=1 width=2072)
+                    Join Filter: (l2.l_suppkey <> l1.l_suppkey)
+                    ->  Nested Loop  (cost=1240.22..182215.70 rows=1 width=2072)
+                          ->  Gather  (cost=1239.85..182210.39 rows=1 width=1624)
+                                Workers Planned: 4
+                                ->  Nested Loop Anti Join  (cost=239.85..181210.29 rows=1 width=1624)
+                                      Join Filter: (l3.l_suppkey <> l1.l_suppkey)
+                                      ->  Hash Join  (cost=239.47..136364.38 rows=20007 width=1624)
+                                            Hash Cond: (l1.l_suppkey = supplier.s_suppkey)
+                                            ->  Parallel Seq Scan on lineitem l1  (cost=0.00..134049.21 rows=500166 width=550)
+                                                  Filter: (l_receiptdate > l_commitdate)
+                                            ->  Nested Loop  (cost=10.35..234.47 rows=400 width=1074)
+                                                  ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=490)
+                                                        Filter: (n_name = 'SAUDI ARABIA')
+                                                  ->  Bitmap Heap Scan on supplier  (cost=10.35..229.16 rows=400 width=584)
+                                                        Recheck Cond: (s_nationkey = n_nationkey)
+                                                        ->  Bitmap Index Scan on supplier_nation_fkidx  (cost=0.25..10.35 rows=400 width=584)
+                                                              Index Cond: (s_nationkey = nation.n_nationkey)
+                                      ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem l3  (cost=0.38..5.84 rows=5 width=550)
+                                            Index Cond: (l_orderkey = l1.l_orderkey)
+                                            Filter: (l_receiptdate > l_commitdate)
+                          ->  Index Scan using orders_pk on orders  (cost=0.38..5.30 rows=1 width=448)
+                                Index Cond: (o_orderkey = l1.l_orderkey)
+                                Filter: (o_orderstatus = 'F')
+                    ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem l2  (cost=0.38..5.81 rows=15 width=550)
+                          Index Cond: (l_orderkey = l1.l_orderkey)
+
+=== Q22

@@ -261,19 +261,20 @@ func nlProbeClassifyPath(joinrel, outer, inner *RelOptInfo, jt parser.JoinType) 
 }
 
 // TestPartialPathDrivingKindNestLoopProbe pins the R95 probe arm's jointype
-// set after M0146-0002i: {INNER, SEMI} admit, everything else refused. SEMI
-// is TPC-H Q4's shape (Nested Loop Semi Join inside the Gather probing the
-// index per worker); ANTI waits for M0146-0002j's producer widening, and
-// LEFT stays refused per the probe family's ledger row.
+// set after M0146-0002i/j: {INNER, SEMI, ANTI} admit, everything else
+// refused. SEMI is TPC-H Q4's shape (Nested Loop Semi Join inside the
+// Gather probing the index per worker); ANTI is TPC-H Q21's (Nested Loop
+// Anti Join inside the Gather probing l3 per worker, M0146-0002j); LEFT
+// stays refused per the probe family's ledger row.
 func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
-	for _, jt := range []parser.JoinType{parser.JoinInner, parser.JoinSemi} {
+	for _, jt := range []parser.JoinType{parser.JoinInner, parser.JoinSemi, parser.JoinAnti} {
 		jr, o, i := nlClassifyFixture()
 		p := nlProbeClassifyPath(jr, o, i, jt)
 		if got := partialPathDrivingKind(p); got != PathSeqScan {
 			t.Errorf("%v probe partial NL must classify to its outer's driving kind, got %v", jt, got)
 		}
 	}
-	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinAnti, parser.JoinRight, parser.JoinFull} {
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinRight, parser.JoinFull} {
 		jr, o, i := nlClassifyFixture()
 		p := nlProbeClassifyPath(jr, o, i, jt)
 		if got := partialPathDrivingKind(p); got != PathPrebuilt {
@@ -293,9 +294,11 @@ func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
 }
 
 // TestPartialNLFilingInnerOnly pins R60's narrowed V1 gate, as widened by
-// M0137-0019b: only INNER and SEMI are filed, so a refused head can never
-// starve admittable siblings (the gather-path reader takes
-// PartialPathlist[0] only). LEFT and ANTI stay unfiled by scope.
+// M0137-0019b (SEMI) and M0146-0002j (ANTI): only INNER, SEMI and ANTI are
+// filed, so a refused head can never starve admittable siblings (the
+// gather-path reader takes PartialPathlist[0] only). LEFT stays unfiled
+// by scope — the probe shape is unverified and no measured consumer
+// exists.
 func TestPartialNLFilingInnerOnly(t *testing.T) {
 	withParallelOn(t, func() {
 		defer setGatherPathsModeForTest(gatherPathsAll)()
@@ -316,14 +319,14 @@ func TestPartialNLFilingInnerOnly(t *testing.T) {
 			s := &searchCtx{parallelModeOK: true}
 			clauses := []*restrictInfo{equiClause(a, b)}
 			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{})
-			if jt == parser.JoinInner || jt == parser.JoinSemi {
+			if jt != parser.JoinLeft {
 				if len(joinrel.PartialPathlist) == 0 {
 					t.Errorf("%v partial NL must be filed", jt)
 				}
 				continue
 			}
 			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v: partial NL outside {INNER, SEMI} must not be filed", jt)
+				t.Errorf("%v: partial NL outside {INNER, SEMI, ANTI} must not be filed", jt)
 			}
 		}
 	})

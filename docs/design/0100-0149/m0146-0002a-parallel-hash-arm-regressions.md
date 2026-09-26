@@ -208,3 +208,33 @@ walker test admitting SEMI on all three attach walks. Gates: units,
 tpch-spotcheck (Q12=2/Q13=33), tpcds-sf025 (96/96, 99/99 shapes),
 tpch-acceptance-arm (24/24 value-identical), tpcds-fireset (no fires) —
 all PASS.
+
+## M0146-0002j outcome (2026-09-27, impl)
+
+The ANTI arm landed as predicted: the producer gate went {INNER,SEMI} →
+{INNER,SEMI,ANTI} and the three probe gates moved to the same set in the
+one change (the shared predicates now carry `parser.JoinAnti` /
+`JoinTypeAnti`). The producer now files ANTI for both inner families —
+the whole-inner arm had already proven ANTI
+(`TestParallelLeftAntiNestedLoopIdentity`, M0145-0010) and the probe
+arm's gates widened with it. LEFT and bitmap probes stay refused.
+
+Measured on the canonical parallel TPC-H arm: Q21's `Nested Loop Anti
+Join` is inside `Gather` probing `idx_lineitem_orderkey_fkidx` on l3 per
+worker — the placement PG shows — at 182221 (vs pre-change 263100, vs PG
+269864; ~2.3 s with canonical 412 rows). The residual is join-order on
+the outer tree: goopg joins (l1↔supplier) inside the gather then probes
+orders above it, where PG builds `Parallel Hash Join` over all three
+inside the gather. Categories went `[join-order, parallelism,
+qual-placement]` → `[join-order, join-method, parallelism,
+qual-placement]` — the targeted placement landed while the outer
+reelection added a method-label diff; the attribution class stays
+D1-sublink (unchanged), not the partial-path arm. TPC-DS moved zero
+plans at either scale (`fires=none`).
+
+Verified end to end: `TestParallelLateralAntiProbeIdentity`
+(serial-vs-parallel row identity, `-race`, workers 1/2/4), boundary
+tests re-pinned to {I,S,A} with LEFT refused, producer test now asserts
+{I,S,A} filed / LEFT unfiled. Gates: units, tpch-spotcheck
+(Q12=2/Q13=33), tpcds-sf025 (96/96, 99/99 shapes), tpch-acceptance-arm
+(24/24 value-identical), tpcds-fireset (no fires) — all PASS.
