@@ -1,0 +1,5 @@
+# plan-diff: tmp/m0146-0015d/fireset/tpcds-sf1/m0146-0015d-tpcds-sf1-baseline.plans.txt -> tmp/m0146-0015d/fireset/tpcds-sf1/m0146-0015d-tpcds-sf1-candidate.plans.txt
+#   old: provenance not stamped
+#   new: provenance not stamped
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+# plan shapes identical (noise floor is zero — see header)

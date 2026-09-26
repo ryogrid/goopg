@@ -1,0 +1,27 @@
+digest diff: A=tmp/m0145-0008m/arm-on.txt B=tmp/m0146-0015d/arm-on.txt
+  Q1              MATCH        rows=4
+  Q2              MATCH        rows=463
+  Q3              MATCH        rows=11354
+  Q4              MATCH        rows=5
+  Q5              MATCH        rows=5
+  Q6              MATCH        rows=1
+  Q7              MATCH        rows=4
+  Q8              MATCH        rows=2
+  Q9              MATCH        rows=175
+  Q10             MATCH        rows=20421
+  Q11             MATCH        rows=755
+  Q12             MATCH        rows=2
+  Q13             MATCH        rows=33
+  Q14             MATCH        rows=1
+  Q15-CREATEVIEW  MATCH        rows=0
+  Q15a-VIEWBODY   MATCH        rows=10000
+  Q15b-MAIN       MATCH        rows=1
+  Q16             MATCH        rows=18215
+  Q17             MATCH        rows=1
+  Q18             MATCH        rows=11
+  Q19             MATCH        rows=1
+  Q20             MATCH        rows=101
+  Q21             MATCH        rows=412
+  Q22             MATCH        rows=7
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count

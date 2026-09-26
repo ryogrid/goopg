@@ -1,7 +1,8 @@
 # M0146-0015b: a nested sublink that reads only the emitting scope
 
-Status: recon complete 2026-09-26; impl arm filed. Evidence
-`analysis/m0146/m0146-0015b/`.
+Status: **landed 2026-09-26** (M0146-0015d, EXISTS arm only — see "Landed").
+Recon evidence `analysis/m0146/m0146-0015b/`; impl evidence
+`analysis/m0146/m0146-0015d/`.
 
 ## The case
 
@@ -101,11 +102,46 @@ keeps it too) whose plan contains `BitmapHeapScan` still aborts the outer
 pull via `nested-sublink-uncloneable`. Widening the clone set is
 orthogonal work.
 
+## Landed (M0146-0015d)
+
+Implemented per the fix shape above, one deviation:
+
+- `jtPulledBody` carries a separate `largChildren` list (the rarg
+  `children` list is unchanged). `extractNestedPullups` returns both and
+  tries the EXISTS bind against `bodyCtx.parent` first, falling back to
+  `bodyCtx`.
+- `flattenPulledBodies` emits a body's larg children immediately before
+  the body itself, stamping them with the body's own `parent` so each
+  body is represented exactly once; rarg descendants still follow the
+  parent.
+- `classifyPulledQuals` widens the parent body's `leftBits`/`sjLeft` by
+  the larg children's subtree leaf ranges — the `syn_lefthand` analog.
+- Canonical query on tenk1 now plans `Merge Join (a=b)` over
+  `Nested Loop Anti Join (a,d)` in the left subtree and
+  `Nested Loop Semi Join (b,c)` on the right — PG's larg structure
+  (`analysis/m0146/m0146-0015d/canonical-explain.txt`). 0 rows in
+  ~0.23 s vs ~197 s as correlated SubPlans.
+
+**The ANY arm was tried and removed.** `outerOperandAsLevel1` rewrites a
+pulled ANY operand's `ColumnRef`s into `OuterColumnRef{Level:1}` resolved
+*by column name*. For a larg child those names re-resolve against the
+emitting scope; TPC-DS Q83's operand (`d_week_seq`, bound in the middle
+body's `date_dim`) silently landed on the emitting problem's own
+`date_dim` leaf and `createPlan` panicked in `translateToLayout`
+(binding column not among the re-based outputs). PG's
+`IncrementVarSublevelsUp` re-levels by varno and cannot misresolve;
+goopg's name-based operand binding makes the ANY larg arm unsound for
+parent-scope operands, and emitting-scope operands arrive as
+`OuterColumnRef` and are refused anyway — so the arm can never bind
+correctly. `pullUpAnyBody` keeps the rarg path only; a regression test
+pins it ("ANY operand bound in the parent scope never larg-binds").
+
 ## Expected movement
 
 None on the parity instruments (the corpora carry no two-scope nested
-sublink — M0146-0015c slice-3 census). The measurable artifact is the
-regress `subselect` plan shape (`Nested Loop Semi Join` over
-`Hash Anti Join (a,d)`) and its runtime — verified by live EXPLAIN on a
-seeded throwaway cluster plus the `TestPort_RegressSuite` `subselect`
-case.
+sublink — M0146-0015c slice-3 census; confirmed: SF0.25 planset and the
+TPC-H parity capture are byte-identical to the pre-change baselines). The
+measurable artifact is the regress `subselect` plan shape (`Nested Loop
+Semi Join` over `Hash Anti Join (a,d)`) and its runtime — verified by
+live EXPLAIN on a seeded throwaway cluster plus the
+`TestPort_RegressSuite` `subselect` case.

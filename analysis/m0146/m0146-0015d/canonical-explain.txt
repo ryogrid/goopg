@@ -1,0 +1,14 @@
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Merge Join
+   Merge Cond: (a.thousand = b.thousand)
+   ->  Nested Loop Anti Join
+         ->  Seq Scan on tenk1 a
+         ->  Index Scan using tenk1_thous_tenthous on tenk1 d
+               Index Cond: (thousand = a.thousand)
+   ->  Nested Loop Semi Join
+         ->  Seq Scan on tenk1 b
+         ->  Index Scan using tenk1_hundred on tenk1 c
+               Index Cond: (hundred = b.hundred)
+(10 rows)
+

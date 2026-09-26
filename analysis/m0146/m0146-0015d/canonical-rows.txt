@@ -1,0 +1,6 @@
+Timing is on.
+ thousand 
+----------
+(0 rows)
+
+Time: 226.970 ms

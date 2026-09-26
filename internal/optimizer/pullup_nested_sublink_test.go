@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -446,4 +447,184 @@ func TestJointreePullupNestedExistsIsPulled(t *testing.T) {
 	if len(pu.bodies[0].children) != 0 || len(pu.bodies[1].children) != 0 {
 		t.Fatalf("children must be cleared after flattening — two representations of one tree double-count leaves")
 	}
+}
+
+// TestJointreePullupNestedLargArm is M0146-0015d's pin: a nested sublink
+// whose correlation names the EMITTING scope — not the parent body's own
+// rels — pulls through PG's OTHER insertion point, `&j->larg` under
+// `available_rels1` (prepjointree.c:749-754), instead of dying at
+// `no-level1-correlation` against the parent-body context. The child
+// flattens BEFORE its parent, carries parent=nil (its Level-1 refs are
+// emitting-scope refs), and the parent keeps it on largChildren so
+// classifyPulledQuals can widen the parent's sjLeft by its leaves — PG's
+// `syn_lefthand` of the stacked join.
+func TestJointreePullupNestedLargArm(t *testing.T) {
+	cat := jtpCatalog(t)
+
+	planPullup := func(t *testing.T, sql string) *jtPullup {
+		t.Helper()
+		sel, ok := parseOne(t, sql).(*parser.SelectStmt)
+		if !ok {
+			t.Fatalf("stmt is not *parser.SelectStmt")
+		}
+		ps := DefaultPlannerSettings()
+		node, ctx, err := planFromClause(sel, cat, ps, nil)
+		if err != nil || node == nil || ctx == nil {
+			t.Fatalf("planFromClause: node=%v ctx=%v err=%v", node, ctx, err)
+		}
+		ctx.cat = cat
+		ctx.settings = ps
+		where, err := resolveExpr(sel.Where, ctx)
+		if err != nil {
+			t.Fatalf("resolveExpr: %v", err)
+		}
+		pu := pullUpSublinksIntoJointree(where, ctx, cat, ps)
+		if pu == nil {
+			t.Fatalf("pull-up declined the statement entirely")
+		}
+		return pu
+	}
+
+	t.Run("emitting-scope NOT EXISTS pulls as a larg anti join", func(t *testing.T) {
+		// `d` correlates on `x` — an EMITTING-scope rel — so it cannot
+		// bind inside `b`'s body (Level-2 there). PG converts it under
+		// available_rels1={x,a} into `j->larg`: the canonical
+		// regress-subselect shape.
+		pu := planPullup(t,
+			`select tag from jtp_o x, jtp_i a where a.j = x.k and exists `+
+				`(select 1 from jtp_i2 b where b.j2 = a.v and not exists `+
+				`(select 1 from jtp_o d where d.k = x.k))`)
+		if len(pu.bodies) != 2 {
+			t.Fatalf("pulled %d bodies, want 2 (the outer EXISTS and the larg anti join)", len(pu.bodies))
+		}
+		anti, semi := pu.bodies[0], pu.bodies[1]
+		if anti.jointype != parser.JoinAnti {
+			t.Fatalf("larg child's jointype = %v, want JoinAnti", anti.jointype)
+		}
+		if semi.jointype != parser.JoinSemi {
+			t.Fatalf("outer body's jointype = %v, want JoinSemi", semi.jointype)
+		}
+		if anti.parent != nil {
+			t.Fatalf("larg child's parent = %p, want nil — its Level-1 refs name the EMITTING "+
+				"scope (the parent's own parent), not the parent's columns", anti.parent)
+		}
+		if len(semi.largChildren) != 1 || semi.largChildren[0] != anti {
+			t.Fatalf("parent largChildren = %v, want [%p] — flatten must keep the link so "+
+				"classifyPulledQuals widens sjLeft (PG's syn_lefthand of the larg subtree)", semi.largChildren, anti)
+		}
+		if semi.subtreeLeaves != 1 {
+			t.Fatalf("parent subtreeLeaves = %d, want 1 — the larg child is NOT in the "+
+				"parent's rarg subtree (it sits in the parent's LEFT subtree)", semi.subtreeLeaves)
+		}
+	})
+
+	t.Run("emitting-scope EXISTS pulls as a larg semi join", func(t *testing.T) {
+		pu := planPullup(t,
+			`select tag from jtp_o x, jtp_i a where a.j = x.k and exists `+
+				`(select 1 from jtp_i2 b where b.j2 = a.v and exists `+
+				`(select 1 from jtp_o d where d.k = x.k))`)
+		if len(pu.bodies) != 2 || pu.bodies[0].jointype != parser.JoinSemi ||
+			pu.bodies[0].parent != nil || len(pu.bodies[1].largChildren) != 1 {
+			t.Fatalf("emitting-scope nested EXISTS did not pull as a larg semi join: %s",
+				describeBodiesForTest(pu))
+		}
+	})
+
+	t.Run("parent-scope-only nested body still pulls rarg", func(t *testing.T) {
+		// `d` correlates on `b` — the parent body's own rel — so the larg
+		// bind fails name resolution (b is not in the enclosing scope)
+		// and the j->rarg arm takes it exactly as before.
+		pu := planPullup(t,
+			`select tag from jtp_o x, jtp_i a where a.j = x.k and exists `+
+				`(select 1 from jtp_i2 b where b.j2 = a.v and not exists `+
+				`(select 1 from jtp_o d where d.k = b.w))`)
+		if len(pu.bodies) != 2 {
+			t.Fatalf("pulled %d bodies, want 2", len(pu.bodies))
+		}
+		semi, child := pu.bodies[0], pu.bodies[1]
+		if child.parent != semi {
+			t.Fatalf("rarg child's parent = %p, want %p — a parent-scope correlation must "+
+				"still splice inside the parent's RIGHT subtree", child.parent, semi)
+		}
+		if len(semi.largChildren) != 0 {
+			t.Fatalf("largChildren = %v, want empty — a parent-scope correlation cannot "+
+				"bind against the enclosing scope", semi.largChildren)
+		}
+		if semi.subtreeLeaves != 2 {
+			t.Fatalf("parent subtreeLeaves = %d, want 2 (rarg descendants count)", semi.subtreeLeaves)
+		}
+	})
+
+	t.Run("mixed-scope nested body stays kept", func(t *testing.T) {
+		// `d` correlates on BOTH the emitting scope (x) and the parent
+		// body (b): the larg bind cannot resolve `b`, the rarg bind
+		// fails nestedBodySpansScopes — PG keeps it as a SubPlan too
+		// ({x,b} is a subset of neither {x,a} nor {b}).
+		pu := planPullup(t,
+			`select tag from jtp_o x, jtp_i a where a.j = x.k and exists `+
+				`(select 1 from jtp_i2 b where b.j2 = a.v and not exists `+
+				`(select 1 from jtp_o d where d.k = x.k and d.k = b.w))`)
+		if len(pu.bodies) != 1 {
+			t.Fatalf("pulled %d bodies, want 1 — the mixed-scope inner sublink must stay kept "+
+				"inside the outer EXISTS (PG's available-rels subset test fails both arms)", len(pu.bodies))
+		}
+	})
+
+	t.Run("ANY operand bound in the parent scope never larg-binds", func(t *testing.T) {
+		// The TPC-DS Q83 shape: a nested `parentcol IN (...)` inside a
+		// pulled ANY body. outerOperandAsLevel1 re-expresses the
+		// operand's ColumnRefs by NAME — bound against the enclosing
+		// scope a same-named binding steals them (Q83 rebound
+		// `d_week_seq` onto the outer query's own date_dim leaf and
+		// panicked in translateToLayout). The ANY arm therefore has no
+		// larg branch at all: the rarg arm — or nothing — takes it.
+		pu := planPullup(t,
+			`select tag from jtp_o x where x.k in `+
+				`(select j from jtp_i a where a.v in (select w from jtp_i2 b))`)
+		if len(pu.bodies) != 2 {
+			t.Fatalf("pulled %d bodies, want 2", len(pu.bodies))
+		}
+		if pu.bodies[1].parent != pu.bodies[0] {
+			t.Fatalf("the nested ANY must splice inside the parent's rarg (parent=%p), "+
+				"got %p — a larg splice would misresolve the operand by name",
+				pu.bodies[0], pu.bodies[1].parent)
+		}
+		if len(pu.bodies[0].largChildren) != 0 {
+			t.Fatalf("largChildren = %v, want empty for a parent-scope ANY operand",
+				pu.bodies[0].largChildren)
+		}
+	})
+
+	t.Run("the canonical shape plans end to end", func(t *testing.T) {
+		node := planOnPipeline(t,
+			`select tag from jtp_o x, jtp_i a where a.j = x.k and exists `+
+				`(select 1 from jtp_i2 b where b.j2 = a.v and not exists `+
+				`(select 1 from jtp_o d where d.k = x.k))`, cat)
+		if node == nil {
+			t.Fatalf("canonical larg-pull shape did not plan")
+		}
+		if planHasExistsExpr(node) {
+			t.Fatalf("an EXISTS survived into the plan — the larg pull or its sjLeft "+
+				"widening was refused downstream: %s", describePlanTree(node))
+		}
+	})
+}
+
+// describeBodiesForTest renders a pulled-body list compactly for test
+// failures — flat order, jointype, and the parent link, the three facts
+// every larg/rarg assertion pins.
+func describeBodiesForTest(pu *jtPullup) string {
+	if pu == nil {
+		return "<nil pullup>"
+	}
+	out := ""
+	for i, pb := range pu.bodies {
+		parent := "nil"
+		if pb.parent != nil {
+			parent = "set"
+		}
+		out += fmt.Sprintf(" [%d] jointype=%v parent=%s leaves=%d subtree=%d larg=%d", i,
+			pb.jointype, parent, len(pb.leafScans), pb.subtreeLeaves, len(pb.largChildren))
+	}
+	return out
 }

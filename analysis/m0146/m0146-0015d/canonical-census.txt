@@ -1,0 +1,8 @@
+PULLUPCENSUS decline=no-level1-correlation
+SUBLINKCENSUS route=jointree-posthoc
+PULLUPCENSUS decline=(pulled)
+SUBLINKCENSUS route=jointree-pullup
+PULLUPCENSUS decline=no-level1-correlation
+SUBLINKCENSUS route=jointree-posthoc
+PULLUPCENSUS decline=(pulled)
+SUBLINKCENSUS route=jointree-pullup

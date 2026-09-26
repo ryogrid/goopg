@@ -124,6 +124,20 @@ type jtPulledBody struct {
 	// NOT arm :836-845). Each child's conjunct has been REMOVED from
 	// `quals`: its semantics now live in the child's own semi/anti link.
 	children []*jtPulledBody
+	// largChildren are nested sublinks pulled out of THIS body's quals
+	// through PG's OTHER insertion point — `&j->larg` under
+	// `available_rels1`, the scope THIS body converted into
+	// (prepjointree.c:749-754 recurses the moved quals with both links).
+	// A nested body whose correlation names only enclosing-scope rels
+	// binds Level-1 there — e.g. `EXISTS (... c ... AND NOT EXISTS
+	// (... a ...))` where `a` belongs to the scope the outer sublink
+	// sat in — and converts as an anti/semi join stacked below this
+	// body's own join. flattenPulledBodies emits them before their
+	// parent carrying the parent's OWN `parent` link (their Level-1
+	// refs name the scope the parent converted into, not the parent's
+	// columns), and classifyPulledQuals widens the parent's sjLeft by
+	// their leaf range.
+	largChildren []*jtPulledBody
 	// srcOffset is added to every SourceTableIdx the body's leaves and
 	// rebased refs carry (M0145-0030). The body's scope numbers its tables
 	// from 1 like the outer query does, so without it a self-correlated
@@ -342,6 +356,13 @@ func flattenPulledBodies(bodies []*jtPulledBody, parent *jtPulledBody) []*jtPull
 		pb.parent = parent
 		kids := pb.children
 		pb.children = nil
+		// A body's larg children splice BELOW it against the scope the
+		// body converted into — their Level-1 refs name the parent's own
+		// parent (the enclosing problem for a top-level body), so they
+		// flatten with THIS `parent` link and emit before `pb`. They
+		// are left on `pb.largChildren` afterwards: classifyPulledQuals
+		// needs the list to widen the parent's sjLeft.
+		out = append(out, flattenPulledBodies(pb.largChildren, parent)...)
 		out = append(out, pb)
 		sub := flattenPulledBodies(kids, pb)
 		pb.subtreeLeaves = len(pb.leafScans)
@@ -437,7 +458,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 	if nestedBodySpansScopes(quals, depth) {
 		return nil, "nested-spans-scopes", false
 	}
-	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	quals, children, largChildren := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
 	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, why, false
 	}
@@ -471,6 +492,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		bodyBindings: bodyCtx.bindings,
 		quals:        quals,
 		children:     children,
+		largChildren: largChildren,
 	}, "", true
 }
 
@@ -763,6 +785,21 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 				return false
 			}
 			leftBits |= leafRangeRelSet(ab, ab+an)
+		}
+		// A larg child splices below this body in ITS larg subtree — its
+		// leaves join this body's syn_lefthand (prepjointree.c:749-754:
+		// the jtlink1 insert takes the current spine as its own larg,
+		// so the new join's syn left scope includes everything already
+		// stacked there). Larg children emit before their parent in flat
+		// order, so their slots are already numbered; subtreeLeaves
+		// covers their own descendants the way sjRhs does.
+		for _, lc := range pb.largChildren {
+			lb, okA := bodyBase[lc]
+			if !okA {
+				notePullupClassify("larg-child-not-numbered")
+				return false
+			}
+			leftBits |= leafRangeRelSet(lb, lb+lc.subtreeLeaves)
 		}
 		var spanning []Expr
 		for _, q := range pb.quals {
@@ -1253,14 +1290,38 @@ func bodyQualsAdmitSublinkList(quals []Expr, depth int, cat catalog.Catalog) (st
 // from the parent's qual list, because its semantics now live in the child's
 // own semi/anti link. PG does this at prepjointree.c:682-693 (ANY), :736-747
 // (EXISTS) and :836-845 (the NOT arm).
-func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) ([]Expr, []*jtPulledBody) {
+func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) ([]Expr, []*jtPulledBody, []*jtPulledBody) {
 	if depth+1 >= maxPulledSublinkDepth {
-		return quals, nil
+		return quals, nil, nil
 	}
 	var kept []Expr
 	var children []*jtPulledBody
+	var largChildren []*jtPulledBody
+	// PG's recursion on a converted EXISTS's quals tries jtlink1 —
+	// `&j->larg` under `available_rels1`, the scope THIS body converted
+	// into — before jtlink2 — `&j->rarg` under `child_rels`, this
+	// body's own rels (prepjointree.c:749-754). Binding the nested body
+	// against `bodyCtx.parent` IS the available-rels test: a reference
+	// to this body's own rels cannot resolve there (the arm declines),
+	// while a reference to the enclosing scope lands as a Level-1
+	// correlation — exactly the semi/anti link the j->larg insert
+	// needs. Bounded to depth-1 children: deeper larg bindings name a
+	// pulled body's own scope rather than the emitting problem, and
+	// stay declined (M0146-0015b ledger).
+	largCtx := bodyCtx.parent
+	allowLarg := depth == 0 && largCtx != nil
 	for _, q := range quals {
 		if in, okIn := anyPullupConjunct(q); okIn {
+			// No larg arm for ANY: the operand was bound against THIS
+			// body's scope before the pull runs, and outerOperandAsLevel1
+			// re-expresses its ColumnRefs as name-based Level-1 refs —
+			// under the enclosing scope a same-named binding of a
+			// different RTE can steal the name (TPC-DS Q83's
+			// `d_week_seq IN ...` rebound onto the outer query's own
+			// date_dim leaf and panicked in translateToLayout). PG's
+			// IncrementVarSublevelsUp re-levels by varno and cannot
+			// misresolve; an EXISTS has no operand, so only its arm is
+			// safe to bind against largCtx.
 			if child, _, ok := pullUpAnyBody(in, bodyCtx, cat, ps, depth+1); ok {
 				children = append(children, child)
 				continue
@@ -1269,6 +1330,12 @@ func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Cat
 			continue
 		}
 		if ex, negated, okEx := existsPullupConjunct(q); okEx && ex.Subquery != nil {
+			if allowLarg {
+				if child, _, ok := pullUpExistsBody(ex, negated, largCtx, cat, ps, depth+1); ok {
+					largChildren = append(largChildren, child)
+					continue
+				}
+			}
 			if child, _, ok := pullUpExistsBody(ex, negated, bodyCtx, cat, ps, depth+1); ok {
 				children = append(children, child)
 				continue
@@ -1276,7 +1343,7 @@ func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Cat
 		}
 		kept = append(kept, q)
 	}
-	return kept, children
+	return kept, children, largChildren
 }
 
 // exprHasConvertibleSublink reports whether e carries a sublink of a kind
@@ -1512,7 +1579,7 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 	if nestedBodySpansScopes(quals, depth) {
 		return nil, "nested-spans-scopes", false
 	}
-	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	quals, children, largChildren := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
 	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, "any-" + why, false
 	}
@@ -1537,6 +1604,7 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		bodyBindings: bodyCtx.bindings,
 		quals:        append([]Expr{link}, quals...),
 		children:     children,
+		largChildren: largChildren,
 	}, "", true
 }
 

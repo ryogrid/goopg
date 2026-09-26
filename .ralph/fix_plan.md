@@ -21157,7 +21157,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Ledgered: `BitmapHeapScan` clone gap for genuinely\-kept nested
       sublinks; depth≥2 larg bindings stay declined.
   Movement: none
-- [ ] **M0146\-0015d — `j\->larg` arm for nested sublink pull\-up**
+- [x] **M0146\-0015d — `j\->larg` arm for nested sublink pull\-up**
   \(filed 2026\-09\-26 by M0146\-0015b\): `extractNestedPullups` gains the
   emitting\-scope arm — re\-bind a nested sublink body with
   `parent = bodyCtx.parent` before falling back to `bodyCtx`
@@ -21179,6 +21179,29 @@ M0146-0001 re-baseline census on the new default arm.
     `TestPort_RegressSuite`.
   - Rank: child of an item\-2a task per 0015b\'s conservative reading →
     normal M0146 order.
+  - Landed 2026\-09\-26, EXISTS arm only:
+    - `jtPulledBody.largChildren` carries enclosing\-scope\-bound
+      children; `flattenPulledBodies` emits them before their parent
+      stamped with the parent\'s `parent`; `classifyPulledQuals` widens
+      the parent\'s `leftBits`/`sjLeft` by their leaves.
+    - Canonical `subselect` query: `Merge Join \(a=b)` over `NL Anti
+      \(a,d)` \(larg\) + `NL Semi \(b,c)` \(rarg\); 0 rows in ~0\.23 s
+      vs ~197 s kept\. Synthetic s\_a…s\_d checks: 1/0/2 rows as
+      expected\.
+    - **ANY arm tried and removed — unsound**: `outerOperandAsLevel1`
+      binds operand refs by column NAME, so a parent\-scope operand can
+      land on a same\-named emitting relation \(TPC\-DS Q83 `d_week_seq`
+      → `createPlan` panic in `translateToLayout`\). PG\'s varno\-level
+      `IncrementVarSublevelsUp` cannot misresolve. `pullUpAnyBody` stays
+      rarg\-only; regression test pins it\. Ledgered\.
+    - Gates: optimizer tests PASS; units PASS; tpch\-spotcheck PASS
+      \(Q12=2 Q13=33\); SF0\.25 sweep PASS=96 \(plans byte\-identical to
+      baseline; `jointree\-pullup=23`=\); arm PASS \(24 MATCH\); fireset
+      no fires SF0\.25\+SF1; tpch parity 6/22 = baseline;
+      `TestPort_RegressSuite` PASS \(291 s\)\.
+    - Evidence: `analysis/m0146/m0146\-0015d/`\.
+  Movement: none on corpus instruments \(canonical regress shape
+  converted — the intended artifact\)\.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains

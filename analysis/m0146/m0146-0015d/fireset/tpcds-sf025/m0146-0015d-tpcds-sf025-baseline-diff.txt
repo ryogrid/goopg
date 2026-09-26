@@ -1,0 +1,211 @@
+# plan-parity: tmp/m0146-0015d/fireset/tpcds-sf025/m0146-0015d-tpcds-sf025-baseline.plans.txt -> tmp/m0146-0015d/fireset/tpcds-sf025/m0146-0015d-tpcds-sf025-baseline-pg.plans.txt
+Q1 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy] estimates(goopg cost=278.53..279.81 rows=100 width=32 | pg cost=7268.50..7268.51 rows=7 width=17)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q10 MISSING-NODE [join-order,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=21762.55..21762.59 rows=2 width=152 | pg cost=24002728.45..24002728.56 rows=3 width=100)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q11 MISSING-NODE [join-order,scan-type,sort-strategy,qual-placement] estimates(goopg cost=33460.78..33460.79 rows=1 width=512 | pg cost=148189.83..171219.72 rows=2 width=480)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q12 MATCH [rendering] estimates(goopg cost=6384.76..6385.04 rows=22 width=224 | pg cost=8775.67..8775.73 rows=23 width=291)
+    note: normalisation: strip-pg-Hash
+Q13 SHAPE-DIFF [scan-type,qual-placement] estimates(goopg cost=19080.79..19080.80 rows=1 width=128 | pg cost=24516.19..24516.20 rows=1 width=128)
+Q14 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=37598.40..37598.41 rows=1 width=168 | pg cost=92406.04..92406.05 rows=1 width=168)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q15 MATCH [] estimates(goopg cost=7589.21..7592.61 rows=100 width=64 | pg cost=14057.35..14064.68 rows=54 width=43)
+    note: normalisation: strip-pg-Hash
+Q16 MISSING-NODE [join-order,join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=20607.21..20607.23 rows=1 width=72 | pg cost=17036.06..17036.07 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q17 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4836.75..4836.77 rows=1 width=312 | pg cost=4713.91..4714.67 rows=1 width=434)
+Q18 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=7534.44..7535.05 rows=49 width=352 | pg cost=14219.26..14219.38 rows=49 width=272)
+    note: normalisation: strip-pg-Hash
+Q19 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=8264.08..8264.15 rows=5 width=104 | pg cost=18967.96..18967.97 rows=5 width=142)
+    note: normalisation: strip-pg-Hash
+Q2 SHAPE-DIFF [join-order,aggregation-strategy,parallelism,rendering] estimates(goopg cost=5334.17..5335.82 rows=659 width=456 | pg cost=37628.72..37628.75 rows=13 width=228)
+    note: normalisation: strip-pg-Hash
+Q20 MATCH [rendering] estimates(goopg cost=7531.66..7532.21 rows=44 width=224 | pg cost=13978.78..13978.89 rows=45 width=291)
+    note: normalisation: strip-pg-Hash
+Q21 SHAPE-DIFF [qual-placement] estimates(goopg cost=11303.91..11306.63 rows=13 width=72 | pg cost=25622.05..25640.99 rows=13 width=51)
+    note: normalisation: strip-pg-Hash
+Q22 SHAPE-DIFF [join-order,join-method,parameterisation] estimates(goopg cost=35788.01..35910.56 rows=100 width=160 | pg cost=30559.37..30559.62 rows=100 width=236)
+    note: normalisation: strip-pg-Hash
+Q23 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism,rendering] estimates(goopg cost=24100.23..24101.51 rows=100 width=96 | pg cost=103214.60..103214.76 rows=63 width=84)
+    note: normalisation: canonicalise-bare-semi-anti,canonicalise-right-join,strip-pg-Hash
+Q24 SHAPE-DIFF [join-order,parameterisation,sort-strategy,qual-placement] estimates(goopg cost=0.04..0.06 rows=1 width=128 | pg cost=19324.09..19324.14 rows=1 width=358)
+    note: normalisation: strip-pg-Hash
+Q25 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4782.99..4783.01 rows=1 width=224 | pg cost=4676.39..4677.12 rows=1 width=237)
+Q26 SHAPE-DIFF [sort-strategy,parallelism] estimates(goopg cost=7581.52..7582.04 rows=26 width=160 | pg cost=14289.36..14290.24 rows=25 width=145)
+    note: normalisation: strip-pg-Hash
+Q27 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=9269.53..9270.64 rows=89 width=196 | pg cost=19491.07..19491.29 rows=89 width=152)
+    note: normalisation: strip-pg-Hash
+Q28 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=52169.75..52170.02 rows=1 width=288 | pg cost=133041.38..133041.49 rows=1 width=288)
+Q29 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4684.62..4684.64 rows=1 width=140 | pg cost=4608.93..4609.66 rows=1 width=153)
+Q3 MISSING-NODE [join-order,sort-strategy,parallelism] estimates(goopg cost=3911.91..3912.54 rows=50 width=72 | pg cost=4070.98..4079.90 rows=50 width=91)
+    note: PG-only node kinds: Incremental Sort
+Q30 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation] estimates(goopg cost=1023.13..1023.14 rows=1 width=332 | pg cost=2772.74..2772.74 rows=1 width=253)
+Q31 MATCH [] estimates(goopg cost=25056.99..25057.00 rows=1 width=432 | pg cost=123685.26..123685.27 rows=1 width=210)
+    note: normalisation: strip-pg-Hash
+Q32 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=16442.42..16442.44 rows=1 width=32 | pg cost=15509.62..15509.63 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q33 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=16.82..18.27 rows=100 width=36 | pg cost=46261.28..46261.53 rows=100 width=36)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q34 SHAPE-DIFF [join-order,scan-type,qual-placement] estimates(goopg cost=7630.02..7630.02 rows=1 width=340 | pg cost=18256.23..18256.27 rows=15 width=77)
+    note: normalisation: strip-pg-Hash
+Q35 MISSING-NODE [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=24237.45..24257.65 rows=100 width=320 | pg cost=1088111.47..4084449.23 rows=100 width=259)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort,Materialize
+Q36 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q37 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,qual-placement] estimates(goopg cost=11063.56..11063.60 rows=2 width=96 | pg cost=4340.02..4340.51 rows=2 width=125)
+Q38 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=43280.45..43280.47 rows=1 width=8 | pg cost=43222.42..43222.43 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q39 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,qual-placement,rendering] estimates(goopg cost=78.98..78.99 rows=1 width=280 | pg cost=27919.19..27919.20 rows=1 width=152)
+    note: normalisation: strip-pg-Hash
+Q4 MISSING-NODE [join-order,scan-type,sort-strategy,qual-placement] estimates(goopg cost=71579.20..71579.22 rows=1 width=768 | pg cost=254456.21..318663.66 rows=2 width=334)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q40 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=13568.55..13568.91 rows=18 width=128 | pg cost=13988.19..13991.22 rows=19 width=84)
+    note: normalisation: strip-pg-Hash
+Q41 MATCH [] estimates(goopg cost=184.31..186.17 rows=83 width=32 | pg cost=72523826.68..72523827.10 rows=84 width=51)
+Q42 SHAPE-DIFF [join-order,parameterisation,parallelism,rendering] estimates(goopg cost=8266.41..8266.47 rows=5 width=72 | pg cost=18965.95..18965.96 rows=5 width=91)
+    note: normalisation: strip-pg-Hash
+Q43 MISSING-NODE [join-order,sort-strategy,parallelism] estimates(goopg cost=17880.03..17880.13 rows=8 width=288 | pg cost=18896.20..18939.76 rows=8 width=246)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q44 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy] estimates(goopg cost=47014.05..460915.47 rows=100 width=984 | pg cost=80913.15..80929.19 rows=100 width=110)
+Q45 SHAPE-DIFF [sort-strategy,parallelism] estimates(goopg cost=6444.22..6446.86 rows=100 width=96 | pg cost=8923.54..8925.79 rows=100 width=52)
+    note: normalisation: strip-pg-Hash
+Q46 SHAPE-DIFF [join-method,scan-type,qual-placement,rendering] estimates(goopg cost=12535.75..12538.34 rows=100 width=196 | pg cost=23089.70..23089.95 rows=100 width=138)
+    note: normalisation: strip-pg-Hash
+Q47 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=38.26..38.28 rows=1 width=196 | pg cost=20863.93..20863.93 rows=1 width=400)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q48 SHAPE-DIFF [qual-placement] estimates(goopg cost=7798.40..7798.41 rows=1 width=4 | pg cost=24750.09..24750.10 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q49 MISSING-NODE [join-order,scan-type,sort-strategy,parallelism,rendering] estimates(goopg cost=14987.30..14987.34 rows=3 width=84 | pg cost=10467.64..10467.79 rows=3 width=84)
+    note: PG-only node kinds: Incremental Sort
+Q5 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism,rendering] estimates(goopg cost=14.23..15.73 rows=100 width=160 | pg cost=55164.12..55164.37 rows=100 width=160)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+Q50 SHAPE-DIFF [join-order,scan-type,sort-strategy,parallelism,qual-placement] estimates(goopg cost=4582.25..4582.27 rows=1 width=332 | pg cost=4538.12..4538.34 rows=1 width=125)
+Q51 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=305.40..418.06 rows=100 width=136 | pg cost=28664.12..28674.62 rows=100 width=136)
+    note: normalisation: strip-pg-Hash
+Q52 SHAPE-DIFF [join-order,parameterisation,parallelism,rendering] estimates(goopg cost=8266.41..8266.47 rows=5 width=72 | pg cost=18967.85..18967.86 rows=5 width=91)
+    note: normalisation: strip-pg-Hash
+Q53 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=6212.52..6212.55 rows=2 width=68 | pg cost=5748.40..5748.40 rows=2 width=68)
+    note: normalisation: strip-pg-Hash
+Q54 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy] estimates(goopg cost=0.04..0.05 rows=1 width=12 | pg cost=30807.60..30807.65 rows=2 width=16)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q55 SHAPE-DIFF [join-order,join-method,scan-type,parallelism] estimates(goopg cost=8248.26..8248.30 rows=3 width=68 | pg cost=16984.16..16984.16 rows=3 width=87)
+Q56 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,parallelism,rendering] estimates(goopg cost=1.73..2.00 rows=22 width=64 | pg cost=26037.90..26037.95 rows=22 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q57 MISSING-NODE [join-order,join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=20.74..20.76 rows=1 width=228 | pg cost=15123.52..15123.52 rows=1 width=690)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q58 MISSING-NODE [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=3.06..3.08 rows=1 width=192 | pg cost=54736.29..54744.05 rows=2 width=241)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort,Materialize
+Q59 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,parallelism,rendering] estimates(goopg cost=7083.18..7084.31 rows=100 width=516 | pg cost=62404.28..62404.28 rows=1 width=250)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q6 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=19143.57..19143.78 rows=17 width=40 | pg cost=430178.89..430178.93 rows=17 width=11)
+    note: normalisation: strip-pg-Hash
+Q60 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=3.03..3.49 rows=37 width=64 | pg cost=38037.98..38041.36 rows=36 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q61 SHAPE-DIFF [join-order,parallelism,rendering] estimates(goopg cost=25566.83..25566.85 rows=1 width=64 | pg cost=36096.29..36096.30 rows=1 width=96)
+    note: normalisation: strip-pg-Hash
+Q62 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=11763.71..11765.01 rows=100 width=136 | pg cost=8787.06..8840.71 rows=100 width=110)
+    note: normalisation: strip-pg-Hash
+Q63 MISSING-NODE [join-order,join-method,scan-type,sort-strategy,parallelism] estimates(goopg cost=6212.52..6212.55 rows=2 width=68 | pg cost=5748.22..5748.48 rows=2 width=68)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q64 MISSING-NODE [join-order,scan-type,sort-strategy,qual-placement] estimates(goopg cost=0.09..0.10 rows=1 width=944 | pg cost=13874.27..13874.28 rows=1 width=1310)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q65 MISSING-NODE [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=19678.33..19682.29 rows=100 width=192 | pg cost=39290.58..39290.77 rows=75 width=202)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q66 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=5820.00..5821.76 rows=88 width=1352 | pg cost=20446.84..20449.02 rows=8 width=1254)
+    note: normalisation: strip-pg-Hash
+Q67 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=12785.90..12833.13 rows=100 width=212 | pg cost=21365.96..21372.48 rows=100 width=273)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q68 SHAPE-DIFF [join-order,scan-type,qual-placement] estimates(goopg cost=9756.36..9757.72 rows=100 width=228 | pg cost=20233.40..20233.65 rows=100 width=170)
+    note: normalisation: strip-pg-Hash
+Q69 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=42643.96..42646.22 rows=100 width=140 | pg cost=43123.06..43125.59 rows=92 width=64)
+    note: normalisation: canonicalise-bare-semi-anti,canonicalise-right-join,strip-pg-Hash
+Q7 SHAPE-DIFF [join-order,join-method,sort-strategy,parallelism] estimates(goopg cost=19510.93..19511.85 rows=46 width=160 | pg cost=19493.40..19500.34 rows=46 width=145)
+    note: normalisation: strip-pg-Hash
+Q70 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q71 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,rendering] estimates(goopg cost=42515.38..42515.39 rows=2 width=76 | pg cost=40364.51..40364.51 rows=3 width=95)
+    note: normalisation: strip-pg-Hash
+Q72 SHAPE-DIFF [join-order,join-method,parameterisation,sort-strategy,parallelism,qual-placement] estimates(goopg cost=19926.00..19927.34 rows=100 width=92 | pg cost=15484.92..15484.93 rows=1 width=148)
+    note: normalisation: strip-pg-Hash
+Q73 SHAPE-DIFF [join-order,scan-type,qual-placement,rendering] estimates(goopg cost=7612.73..7612.74 rows=1 width=340 | pg cost=18130.86..18130.87 rows=5 width=77)
+    note: normalisation: strip-pg-Hash
+Q74 MATCH [] estimates(goopg cost=333.14..333.16 rows=1 width=384 | pg cost=30505.75..30505.76 rows=1 width=276)
+    note: normalisation: strip-pg-Hash
+Q75 SHAPE-DIFF [join-order,join-method,parameterisation,parallelism,rendering] estimates(goopg cost=2585.81..2586.81 rows=100 width=112 | pg cost=64214.10..64214.10 rows=1 width=80)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+Q76 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=49071.12..49157.81 rows=100 width=144 | pg cost=39117.58..39161.70 rows=100 width=163)
+    note: normalisation: strip-pg-Hash
+Q77 MISSING-NODE [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism,rendering] estimates(goopg cost=11.94..13.30 rows=100 width=132 | pg cost=51730.63..51730.88 rows=100 width=132)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q78 MISSING-NODE [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=5670.23..5673.18 rows=100 width=208 | pg cost=42509.40..42509.65 rows=100 width=180)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q79 SHAPE-DIFF [join-method,scan-type,rendering] estimates(goopg cost=13701.62..13705.47 rows=100 width=164 | pg cost=24700.19..24700.44 rows=100 width=152)
+    note: normalisation: strip-pg-Hash
+Q8 MISSING-NODE [join-order,scan-type] estimates(goopg cost=27153.17..27153.33 rows=8 width=64 | pg cost=28541.61..28547.80 rows=8 width=37)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Materialize
+Q80 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,rendering] estimates(goopg cost=2.28..2.77 rows=39 width=160 | pg cost=41717.85..41717.95 rows=39 width=160)
+    note: normalisation: strip-pg-Hash
+Q81 SHAPE-DIFF [join-order,scan-type,parameterisation,rendering] estimates(goopg cost=2223.10..2223.11 rows=1 width=512 | pg cost=4265.24..4265.25 rows=2 width=236)
+Q82 SHAPE-DIFF [join-order,join-method,scan-type,parallelism] estimates(goopg cost=11063.94..11063.98 rows=2 width=96 | pg cost=4341.01..4341.63 rows=2 width=125)
+Q83 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=0.82..0.93 rows=10 width=108 | pg cost=23603.38..23603.98 rows=2 width=169)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q84 SHAPE-DIFF [scan-type,sort-strategy,parallelism,qual-placement] estimates(goopg cost=7416.62..7418.16 rows=100 width=96 | pg cost=8140.19..8141.33 rows=10 width=49)
+    note: normalisation: strip-pg-Hash
+Q85 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=7638.75..7638.76 rows=1 width=128 | pg cost=8454.75..8454.75 rows=1 width=229)
+    note: normalisation: strip-pg-Hash
+Q86 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q87 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=43330.20..43330.21 rows=1 width=8 | pg cost=43327.51..43327.52 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q88 MATCH [] estimates(goopg cost=135712.05..135712.39 rows=1 width=64 | pg cost=145273.37..145273.52 rows=1 width=64)
+    note: normalisation: strip-pg-Hash
+Q89 MISSING-NODE [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=8307.89..8308.26 rows=30 width=228 | pg cost=19188.70..19188.78 rows=30 width=266)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+Q9 MATCH [] estimates(goopg cost=0.00..1.44 rows=1 width=68 | pg cost=262960.38..262961.83 rows=1 width=160)
+Q90 MATCH [rendering] estimates(goopg cost=11793.86..11793.87 rows=1 width=16 | pg cost=13908.43..13908.43 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q91 MISSING-NODE [join-order,qual-placement] estimates(goopg cost=3234.61..3234.61 rows=1 width=192 | pg cost=3002.45..3002.45 rows=1 width=97)
+    note: PG-only node kinds: Materialize
+Q92 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=10508.46..10508.48 rows=1 width=32 | pg cost=8959.97..8959.97 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q93 MATCH [rendering] estimates(goopg cost=4451.07..4451.09 rows=1 width=36 | pg cost=4305.47..4305.48 rows=2 width=36)
+    note: normalisation: strip-pg-Hash
+Q94 SHAPE-DIFF [join-order,scan-type,parallelism,qual-placement] estimates(goopg cost=14793.16..14793.18 rows=1 width=72 | pg cost=9165.25..9165.25 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q95 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=170347.30..170347.32 rows=1 width=72 | pg cost=141010.29..141010.30 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q96 MATCH [] estimates(goopg cost=16597.61..16597.62 rows=1 width=8 | pg cost=17673.05..17673.05 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q97 MATCH [] estimates(goopg cost=116.06..116.08 rows=1 width=24 | pg cost=33669.15..33669.16 rows=1 width=24)
+    note: normalisation: strip-pg-Hash
+Q98 MATCH [rendering] estimates(goopg cost=9173.66..9173.89 rows=89 width=224 | pg cost=18985.52..18985.73 rows=84 width=291)
+    note: normalisation: strip-pg-Hash
+Q99 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=22873.40..22874.30 rows=72 width=136 | pg cost=13992.35..14059.50 rows=72 width=115)
+    note: normalisation: strip-pg-Hash
+PLAN-PARITY: queries=99 match=13 shapediff=58 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES: join-order=75 join-method=45 scan-type=50 parameterisation=31 aggregation-strategy=31 sort-strategy=52 parallelism=62 qual-placement=26 rendering=30
+CATEGORIES-EXCL-MATCH: join-order=75 join-method=45 scan-type=50 parameterisation=31 aggregation-strategy=31 sort-strategy=52 parallelism=62 qual-placement=26 rendering=25
+NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation
