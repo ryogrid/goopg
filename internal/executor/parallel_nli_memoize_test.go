@@ -18,10 +18,14 @@ package executor
 // inner per worker, no claim state crossing the boundary.
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // nliProbePlan builds the bare parameterized equality probe
@@ -224,4 +228,122 @@ func TestCollectBitmapScansDescendsNLI(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("refused NLI: collected %d bitmaps, want none", len(got))
 	}
+}
+
+// M0146-0004 — the serial-vs-parallel identity pin for the memoized fused
+// NLI under a Gather. The claim-topology pins above prove WHICH scan takes
+// the claim; this pin proves the whole shape returns identical rows: each
+// worker partitions the outer, re-opens the probe per its own outer rows,
+// and caches in a PRIVATE memoizeOp/kvcache — PG's per-worker MemoizeState
+// (nodeMemoize.c:1190-1260, the DSM shuttles only instrumentation). The
+// fixture's key stream has 4 rows per key, so repeats for one key can
+// split across workers — each worker's first sight of that key is a miss,
+// and correctness must hold anyway.
+func TestParallelNLIMemoizeIdentity(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	const sql = "SELECT mo.pad, mi.v FROM mo JOIN mi ON mi.id = mo.k"
+
+	want := sortedRowStrings(t, ctx, sql)
+	if len(want) == 0 {
+		t.Fatal("fixture produced no rows; the comparison would be vacuous")
+	}
+
+	// The plan must be the fused memoized shape — a bare fused NLI or a
+	// decomposed join means the fixture no longer exercises this family
+	// (and a hand-wrapped Gather over it would measure the wrong thing).
+	stmts0, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plan0, err := optimizer.Plan(stmts0[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	nli := findNLI(plan0)
+	if nli == nil || nli.InnerMemo == nil {
+		t.Fatalf("fixture no longer plans a memoized fused NLI (InnerMemo=%v)",
+			nli != nil && nli.InnerMemo != nil)
+	}
+	if !optimizer.NestedLoopIndexJoinIsPartialCapable(nli) {
+		t.Fatal("fixture's fused NLI is not partial-capable; a hand-wrapped " +
+			"Gather would run the whole plan per participant")
+	}
+
+	for _, workers := range []int{1, 2, 4} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+		if err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+		gathered := optimizer.NewGather(0, plan, workers)
+		ctx.MaxParallelWorkers = 8
+		ctx.ParallelLeaderParticipation = true
+		op, err := Build(gathered)
+		if err != nil {
+			t.Fatalf("workers=%d build: %v", workers, err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("workers=%d open: %v", workers, err)
+		}
+		var got []string
+		for {
+			slot, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				op.Close()
+				t.Fatalf("workers=%d next: %v", workers, err)
+			}
+			r := slot.Row()
+			cells := make([]string, len(r))
+			for i, d := range r {
+				if d.IsNull() {
+					cells[i] = "NULL"
+				} else {
+					cells[i] = fmt.Sprint(d.Int)
+				}
+			}
+			got = append(got, strings.Join(cells, ","))
+			slot.Release()
+		}
+		op.Close()
+		sort.Strings(got)
+		if diff := multisetDiff(got, want); diff != "" {
+			t.Errorf("workers=%d: %s", workers, diff)
+		}
+	}
+}
+
+// findNLI locates the fused *NestedLoopIndexJoin under the transparent
+// wrappers (Project/Filter) a plain join select may carry.
+func findNLI(n optimizer.Node) *optimizer.NestedLoopIndexJoin {
+	switch x := n.(type) {
+	case *optimizer.NestedLoopIndexJoin:
+		return x
+	case *optimizer.Project:
+		return findNLI(x.Child)
+	case *optimizer.Filter:
+		return findNLI(x.Child)
+	}
+	return nil
+}
+
+// multisetDiff reports the first count mismatch between two sorted
+// multisets, "" when identical.
+func multisetDiff(got, want []string) string {
+	if len(got) != len(want) {
+		return fmt.Sprintf("row count %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Sprintf("row %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	return ""
 }

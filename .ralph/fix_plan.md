@@ -21501,7 +21501,7 @@ M0146-0001 re-baseline census on the new default arm.
   corpus consumer before implementing.
   Kind: impl
   Parent: M0146-0003
-- [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
+- [x] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed
   cache model; planner: relax `partialPathDrivingKind`'s lateral-probe
@@ -21512,6 +21512,29 @@ M0146-0001 re-baseline census on the new default arm.
   NOT part of this task.
   Kind: impl
   Parent: M0142-0005
+  Movement: none — no production change this task; the mechanism's
+  movement was credited to M0142-0005a when it landed
+  - **DONE 2026\-09\-27 \(closeout\).** Design doc
+    `docs/design/0100\-0149/m0146\-0004\-memoize\-partial\-admission\-closeout.md`;
+    evidence `analysis/m0146/m0146\-0004/`.
+    - Scoping verdict: both adopted halves already landed — the
+      per\-worker private `memoizeOp`/`kvcache` is PG\'s per\-worker
+      MemoizeState by construction \(2026\-09\-18 re\-scope\), and
+      `partialPathDrivingKind` unwraps `PathMemoize` probes for
+      \{I,S,A\} \(M0142\-0005a, 2026\-09\-19\).
+    - Floor measurement on the canonical \(0003d\) captures: TPC\-H 0/0
+      Memoize \(no consumer\); TPC\-DS SF0\.25 PG 41 / goopg 50; SF1
+      37/38 — zero first\-divergence records attributable to this
+      task\'s gates. Q34/Q73 render `Gather Merge → Sort → NL →
+      Memoize → Index Scan` post\-cutover.
+    - Every PG Memoize parent is a plain Nested Loop; the 3 index\-only
+      memoize children \(Q53/Q63/Q77\) sit downstream of unrelated
+      divergences — the parameterised index\-only probe gap folds into
+      the standing M0127\-P5\.5\-c ledger rows.
+    - New `TestParallelNLIMemoizeIdentity`: serial multiset == workers
+      1/2/4 under `\-race` for the memoized fused NLI under Gather —
+      the per\-shape identity pin the milestone\'s admission rule
+      requires \(claim topology was already pinned\).
 - [ ] **M0146-0005 — join-order / candidate-pool divergence burn-down**
   (impl). The largest residual category (~90 SF0.25 `join-order`
   records): work the per-family decomposition M0146-0001's census
