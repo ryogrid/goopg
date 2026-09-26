@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/optimizer"
@@ -234,4 +237,220 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 		return NullDatum, true
 	}
 	return NewBoolDatum(x.Negated), true
+}
+
+// ---------------------------------------------------------------------------
+// M0146-0015c slice 3 — tuple-key hash for a row-operand ANY sublink
+//
+// The EXISTS→ANY conversions (keptExistsToAny, and a future widening of the
+// flat pass) produce InExpr{Operand: RowExpr{…}, Plan: uncorrelated} whose
+// inner set must be materialised once and probed per outer row — upstream's
+// ExecHashSubPlan over a multi-column testexpr. goopg's row-IN executor
+// (evalRowConstructorInExpr) still re-runs the inner plan per outer row with
+// NULL-precise three-valued semantics; this hash serves only the shape the
+// conversions emit, where InExpr.UnknownEqFalse licenses a two-valued answer
+// and NULL elements can never form a match — which is what lets goopg skip
+// PG's partial-match table entirely.
+//
+// Every decline (unknownEqFalse unset, correlated or unlowered link,
+// volatile inner, unhashable or mixed datum families, a width mismatch)
+// returns "not served" and the caller falls back to the exact linear path —
+// a missed optimisation, never a wrong answer.
+
+// subPlanRowHash is the tuple-key analogue of subPlanHash: inner rows keyed
+// by the composite of per-element datumKeys, plus the per-column datum
+// family recorded at build so a probe can demand pairwise family equality
+// (the same rule the single-column probe applies to its one column).
+// unusable marks the cached "do not retry" sentinel: the build ran once and
+// found the shape unhashable (mixed/unkeyable families or an uncacheable
+// inner) — without it every outer row would pay a rebuild before falling
+// back to the linear path.
+type subPlanRowHash struct {
+	set      map[string]struct{}
+	fams     []subPlanHashFamily // per column, only over fully non-NULL rows
+	width    int
+	unusable bool
+}
+
+const subPlanRowHashKeySuffix = "\x00rowhash"
+
+// rowTupleKey joins element datumKeys with explicit length prefixes so a
+// string payload can never forge a component boundary (datumKey is free-form
+// text: "s:" + payload admits arbitrary bytes).
+func rowTupleKey(elems []Datum) string {
+	var b strings.Builder
+	for _, d := range elems {
+		k := datumKey(d)
+		b.WriteString(strconv.Itoa(len(k)))
+		b.WriteByte(':')
+		b.WriteString(k)
+		b.WriteByte('\x00')
+	}
+	return b.String()
+}
+
+// buildSubPlanRowHash keys the materialised inner rows. Rows containing a
+// NULL element are dropped: under unknownEqFalse they can contribute
+// neither TRUE nor a distinguishable NULL answer. A column's family is
+// pinned by the first fully non-NULL row that supplies it; a later
+// disagreement, or an unkeyable kind, makes the whole set unhashable — the
+// coercion rules compareEq applies across kinds stay on the linear path.
+func buildSubPlanRowHash(rows [][]Datum, width int) *subPlanRowHash {
+	h := &subPlanRowHash{set: make(map[string]struct{}, len(rows)), width: width}
+	fams := make([]subPlanHashFamily, width)
+	init := false
+	for _, r := range rows {
+		null := false
+		for _, v := range r {
+			if v.IsNull() {
+				null = true
+				break
+			}
+		}
+		if null {
+			continue
+		}
+		for i, v := range r {
+			f := subPlanHashFamilyOf(v)
+			if f == hashFamNone {
+				return &subPlanRowHash{width: width, unusable: true}
+			}
+			if init && fams[i] != f {
+				return &subPlanRowHash{width: width, unusable: true}
+			}
+			fams[i] = f
+		}
+		init = true
+		h.set[rowTupleKey(r)] = struct{}{}
+	}
+	h.fams = fams
+	return h
+}
+
+// subPlanRowHashSize is the resident-byte estimate charged to the shared
+// sublink budget (same shape as subPlanHashSize).
+func subPlanRowHashSize(key string, h *subPlanRowHash) int64 {
+	const perEntryOverhead = 96
+	const perKeyOverhead = 48
+	n := int64(len(key)) + perEntryOverhead
+	for k := range h.set {
+		n += int64(len(k)) + perKeyOverhead
+	}
+	return n
+}
+
+// materializeSubPlanRowHash runs the inner plan once and keys its rows.
+// Volatile or LockRows-bearing inners return the unusable sentinel instead
+// of a set, for the reason evalInHashProbe records on its own sentinel.
+func materializeSubPlanRowHash(x *optimizer.InExpr, width int, ctx *Context) (*subPlanRowHash, error) {
+	if !subPlanResultCacheable(ctx, x, x.Plan, false) {
+		return &subPlanRowHash{width: width, unusable: true}, nil
+	}
+	op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	var rows [][]Datum
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		r := slotRow(slot)
+		if len(r) != width {
+			return nil, &ExecError{
+				Code: "42601", Pos: x.Pos(),
+				Message: fmt.Sprintf("row value has %d columns but subquery has %d columns",
+					width, len(r)),
+			}
+		}
+		// Rows outlive their slot — copy (slot.Row() may alias buffers the
+		// next op.Next() overwrites).
+		rows = append(rows, append([]Datum(nil), r...))
+	}
+	return buildSubPlanRowHash(rows, width), nil
+}
+
+// rowHashFor returns the built tuple hash, building and caching it on the
+// first probe. served=false means "fall back to the linear path": the
+// recorded unusable sentinel or a width disagreement.
+func rowHashFor(x *optimizer.InExpr, width int, ctx *Context) (h *subPlanRowHash, err error, served bool) {
+	key := nonCorrelatedCacheKey(x) + subPlanRowHashKeySuffix
+	// Scoped store, matching evalInHashProbe's reasoning: the hash
+	// shadows data whose IsNonCorrelated flag is only trustworthy until
+	// the depth changes, so it shares the scoped store's lifetime guard.
+	store := ctx.subqCacheStore(true)
+	if v, ok := store.Get(key); ok {
+		h = v.(*subPlanRowHash)
+		return h, nil, !h.unusable && h.width == width
+	}
+	h, err = materializeSubPlanRowHash(x, width, ctx)
+	if err != nil {
+		return nil, err, true
+	}
+	store.Put(key, h, subPlanRowHashSize(key, h))
+	return h, nil, !h.unusable
+}
+
+// evalRowHashProbe answers a row-operand uncorrelated ANY sublink from the
+// tuple hash. Returns (datum, nil, true) when the probe served the answer;
+// (_, nil, false) means fall back to evalRowConstructorInExpr;
+// (_, err, true) means the probe took ownership and hit a real error —
+// the linear path would fail identically, so the error propagates.
+//
+// The UnknownEqFalse licence is doing the semantic work: a NULL operand
+// element, or an inner tuple that cannot fully match, answers FALSE —
+// exactly what the EXISTS this ANY was converted from reports. It is only
+// set by conversions that fire exclusively in qual positions.
+func evalRowHashProbe(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error, bool) {
+	if ctx == nil || x.Plan == nil || !x.IsNonCorrelated || !x.UnknownEqFalse ||
+		!hashedSubPlanEnabled() {
+		return Datum{}, nil, false
+	}
+	n := len(rowOp.Elems)
+	if n == 0 {
+		return Datum{}, nil, false
+	}
+	stat := ctx.subPlanStat(x)
+	stat.Calls++
+	elems := make([]Datum, n)
+	for i, e := range rowOp.Elems {
+		v, err := evalExprSlot(e, slot, ctx)
+		if err != nil {
+			return Datum{}, err, true
+		}
+		elems[i] = v
+	}
+	for _, v := range elems {
+		if v.IsNull() {
+			return NewBoolDatum(x.Negated), nil, true
+		}
+	}
+	h, err, served := rowHashFor(x, n, ctx)
+	if err != nil {
+		return Datum{}, err, true
+	}
+	if !served {
+		return Datum{}, nil, false
+	}
+	if len(h.set) == 0 {
+		// No inner tuple can match — no coercion consult needed, so no
+		// family check either.
+		return NewBoolDatum(x.Negated), nil, true
+	}
+	for i, v := range elems {
+		if subPlanHashFamilyOf(v) != h.fams[i] {
+			// Cross-kind comparison — compareEq's coercions apply; the
+			// linear path computes them exactly.
+			return Datum{}, nil, false
+		}
+	}
+	if _, hit := h.set[rowTupleKey(elems)]; hit {
+		return NewBoolDatum(!x.Negated), nil, true
+	}
+	return NewBoolDatum(x.Negated), nil, true
 }

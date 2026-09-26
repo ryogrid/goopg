@@ -96,12 +96,16 @@ func TestBodyQualsAdmitSublinks(t *testing.T) {
 	})
 }
 
-// TestJointreePullupKeepsNestedExists is M0146-0015c slice 2's core pin: the
+// TestJointreePullupKeepsNestedExists is M0146-0015c's core pin: the
 // oracle shape `a … EXISTS (b … EXISTS (c WHERE c.x = a.y AND c.z = b.w))`
 // must plan the OUTER EXISTS as a semi join (PG: `Hash Semi Join … Join
-// Filter: EXISTS/ANY`), with the inner EXISTS carried as a pre-lowered
-// SubPlan inside the join predicate — not left as two nested SubPlans on a
-// scan filter.
+// Filter: (ANY ((a.y = (hashed SubPlan N).col1) AND (b.w = (hashed SubPlan
+// N).col2)))`). Slice 2 carried the inner EXISTS as a pre-lowered SubPlan;
+// slice 3's keptExistsToAny then applies PG's convert_EXISTS_to_ANY: every
+// escaping ref is consumed by an `innercol = sentinel` conjunct, so the
+// kept SubPlan dissolves into an uncorrelated row-ANY — operand the row of
+// correlated columns, plan a Project over the inner equality columns, and
+// UnknownEqFalse the two-valued licence PG stamps as unknownEqFalse.
 func TestJointreePullupKeepsNestedExists(t *testing.T) {
 	cat := jtpCatalog(t)
 	delete(sublinkRouteCounts, spineRoutePosthoc)
@@ -119,56 +123,191 @@ func TestJointreePullupKeepsNestedExists(t *testing.T) {
 	if j == nil || j.Type != JoinTypeSemi {
 		t.Fatalf("no semi join for the outer EXISTS; tree: %s", describePlanTree(node))
 	}
-	// The kept EXISTS must be in the semi join's predicate, pre-lowered:
-	// sentinel ids renumbered into the flat space (all >= 0), Args the
-	// problem-space columns translateToLayout re-based for the node.
-	var kept *ExistsExpr
+	// The kept EXISTS must have converted in the semi join's predicate:
+	// an InExpr — not an ExistsExpr — whose correlation is fully
+	// dissolved into the row operand.
+	var kept *InExpr
+	var stray *ExistsExpr
 	walkExprTree(j.Predicate, func(e Expr) {
+		if in, isIn := e.(*InExpr); isIn && in.Plan != nil {
+			kept = in
+		}
 		if ex, isEx := e.(*ExistsExpr); isEx {
-			kept = ex
+			stray = ex
 		}
 	})
 	if kept == nil {
-		t.Fatalf("no kept EXISTS in the semi join predicate; tree: %s", describePlanTree(node))
+		t.Fatalf("no converted ANY in the semi join predicate; tree: %s", describePlanTree(node))
 	}
-	if len(kept.ParParam) != 2 || len(kept.Args) != 2 {
-		t.Fatalf("kept EXISTS ParParam=%v Args=%d — want one slot per escaping "+
-			"column (parent-body + emitting)", kept.ParParam, len(kept.Args))
+	if stray != nil {
+		t.Fatalf("an EXISTS survived keptExistsToAny; tree: %s", describePlanTree(node))
 	}
-	for _, id := range kept.ParParam {
-		if id < 0 {
-			t.Fatalf("sentinel ParParam id %d survived lowerSubPlanParams — "+
-				"renumberPulledSubplanParams did not reach the block", id)
-		}
+	if !kept.IsNonCorrelated || !kept.UnknownEqFalse {
+		t.Fatalf("converted ANY flags IsNonCorrelated=%v UnknownEqFalse=%v — "+
+			"want both true (decorrelated hashed-ANY licence)",
+			kept.IsNonCorrelated, kept.UnknownEqFalse)
 	}
-	for i, a := range kept.Args {
-		cr, isCR := a.(*ColumnRef)
+	if len(kept.ParParam) != 0 || len(kept.Args) != 0 {
+		t.Fatalf("converted ANY ParParam=%v Args=%d — the operand IS the "+
+			"testexpr; no param binding may remain", kept.ParParam, len(kept.Args))
+	}
+	row, isRow := kept.Operand.(*RowExpr)
+	if !isRow || len(row.Elems) != 2 {
+		t.Fatalf("operand = %T — want a 2-element RowExpr, one column per "+
+			"correlation pair (parent-body + emitting)", kept.Operand)
+	}
+	for i, el := range row.Elems {
+		cr, isCR := el.(*ColumnRef)
 		if !isCR {
-			t.Fatalf("Args[%d] = %T, want a positional ColumnRef the eval site "+
-				"can bind against the join row", i, a)
+			t.Fatalf("operand element %d = %T, want a positional ColumnRef the "+
+				"eval site can bind against the join row", i, el)
 		}
 		if cr.Index < 0 {
-			t.Fatalf("Args[%d].Index = %d — unbased coordinate", i, cr.Index)
+			t.Fatalf("operand element %d Index = %d — unbased coordinate", i, cr.Index)
 		}
 	}
-	// The escaping refs inside the kept plan must be ExecParamRefs, no
-	// OuterColumnRef may survive at kept-depth 0.
-	foundParam := false
-	walkPlanExprs(kept.Plan, func(e Expr) {
-		if p, isP := e.(*ExecParamRef); isP {
-			foundParam = true
-			if p.ID < 0 {
-				t.Fatalf("sentinel ExecParamRef %d survived in the kept plan", p.ID)
-			}
+	// The ANY's plan must be a Project emitting exactly the two inner
+	// equality columns the conjuncts named.
+	proj, isProj := kept.Plan.(*Project)
+	if !isProj || len(proj.Targets) != 2 {
+		t.Fatalf("kept.Plan = %T — want a Project over the two inner "+
+			"equality columns", kept.Plan)
+	}
+	for i, tg := range proj.Targets {
+		if _, isCR := tg.(*ColumnRef); !isCR {
+			t.Fatalf("projected target %d = %T, want ColumnRef", i, tg)
 		}
+	}
+	// Every escaping ref was consumed by a conjunct: no OuterColumnRef
+	// and no ExecParamRef may survive anywhere in the converted plan.
+	walkPlanExprs(kept.Plan, func(e Expr) {
 		if _, isO := e.(*OuterColumnRef); isO {
-			t.Fatalf("an OuterColumnRef survived inside the kept plan — the "+
-				"rebase must replace every escaping ref; tree: %s", describePlanTree(node))
+			t.Fatalf("an OuterColumnRef survived in the converted ANY plan; tree: %s",
+				describePlanTree(node))
+		}
+		if p, isP := e.(*ExecParamRef); isP {
+			t.Fatalf("ExecParamRef %d survived — correlation not fully consumed", p.ID)
 		}
 	})
-	if !foundParam {
-		t.Fatalf("no ExecParamRef inside the kept plan — escaping refs were not re-based")
+}
+
+// TestKeptExistsToAnyVariants pins keptExistsToAny's convert/decline
+// matrix — the boundary PG's convert_EXISTS_to_ANY draws, expressed on
+// goopg's kept-sublink representation:
+//
+//   - `NOT EXISTS` converts too — goopg resolves it as
+//     `UnaryOp{OpNot, EXISTS}`, so the ANY lands under the NOT exactly
+//     where PG leaves `NOT (SubPlan)`;
+//   - a correlation conjunct that is not an equality, or whose inner
+//     side is not a plain column, keeps EXISTS — the sentinel it still
+//     carries is the stray PG detects via contain_vars_of_level;
+//   - an equality pair plus a sentinel-free residual converts AND keeps
+//     the residual in the subplan's own predicate.
+//
+// Every case carries `b.j2 = k` (parent scope) plus `b.w = a.v`
+// (emitting scope) or a deliberate variant of it: a kept EXISTS needs
+// refs to BOTH scopes, because a single-scope correlation pulls the
+// inner link into a join of its own and nothing is kept.
+func TestKeptExistsToAnyVariants(t *testing.T) {
+	cat := jtpCatalog(t)
+	// kept censes the kept sublink forms anywhere in the planned tree.
+	// The ANY may land in the join predicate or in a filter one side
+	// feeds — placement is the join planner's business; this pass owns
+	// the conversion, wherever the link ends up.
+	kept := func(sql string) (any *InExpr, notAny *InExpr, ex *ExistsExpr) {
+		node := planOnPipeline(t, sql, cat)
+		j := findSemiOrAntiJoin(node)
+		if j == nil {
+			t.Fatalf("no semi/anti join for %q; tree: %s", sql, describePlanTree(node))
+		}
+		walkPlanExprs(node, func(e Expr) {
+			switch x := e.(type) {
+			case *InExpr:
+				if x.Plan != nil {
+					any = x
+				}
+			case *UnaryOp:
+				if x.Op == parser.OpNot {
+					walkExprTree(x.Operand, func(e2 Expr) {
+						if in, isIn := e2.(*InExpr); isIn && in.Plan != nil {
+							notAny = in
+						}
+					})
+				}
+			case *ExistsExpr:
+				ex = x
+			}
+		})
+		return any, notAny, ex
 	}
+
+	t.Run("NOT EXISTS converts to an ANY under the NOT", func(t *testing.T) {
+		any, notAny, ex := kept(
+			`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+				`and not exists (select 1 from jtp_i2 b where b.j2 = k and b.w = a.v))`)
+		if ex != nil {
+			t.Fatalf("a negated EXISTS must still convert — PG keeps the NOT "+
+				"in the qual above the converted SubPlan")
+		}
+		if notAny == nil {
+			t.Fatalf("converted ANY = %v under NOT = %v — want the link under "+
+				"a UnaryOp{OpNot}, PG's `NOT (SubPlan)`", any, notAny)
+		}
+	})
+
+	t.Run("non-equality correlation keeps EXISTS", func(t *testing.T) {
+		// `b.w > a.v` leaves its sentinel in a residual conjunct — the
+		// stray check must refuse the whole conversion, exactly as
+		// contain_vars_of_level keeps PG's EXISTS.
+		any, _, ex := kept(
+			`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+				`and exists (select 1 from jtp_i2 b where b.j2 = k and b.w > a.v))`)
+		if any != nil {
+			t.Fatalf("non-equality correlation converted — a sentinel would be stranded")
+		}
+		if ex == nil {
+			t.Fatalf("the kept EXISTS form must survive on decline")
+		}
+	})
+
+	t.Run("composite inner side keeps EXISTS", func(t *testing.T) {
+		// `b.w + 1 = a.v`: the sentinel sits against a composite inner
+		// expr — PG would also allow an inner expr target, but goopg
+		// binds the conversion to plain columns (same bound the flat
+		// existsToAny pass applies); the EXISTS form must survive.
+		any, _, ex := kept(
+			`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+				`and exists (select 1 from jtp_i2 b where b.j2 = k and b.w + 1 = a.v))`)
+		if any != nil {
+			t.Fatalf("a composite inner side converted — want decline")
+		}
+		if ex == nil {
+			t.Fatalf("the kept EXISTS form must survive on decline")
+		}
+	})
+
+	t.Run("sentinel-free residual is preserved in the subplan", func(t *testing.T) {
+		// `b.j2 > 0` is inner-local — the two pairs convert and the
+		// residual stays in the Filter the ANY's Project wraps.
+		any, _, ex := kept(
+			`select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k `+
+				`and exists (select 1 from jtp_i2 b where b.j2 = k and b.w = a.v and b.j2 > 0))`)
+		if ex != nil || any == nil {
+			t.Fatalf("clean pairs beside a local residual must convert; any=%v ex=%v", any, ex)
+		}
+		proj, isProj := any.Plan.(*Project)
+		if !isProj || len(proj.Targets) != 2 {
+			t.Fatalf("any.Plan = %T — want a 2-column Project", any.Plan)
+		}
+		filt, isFilt := proj.Child.(*Filter)
+		if !isFilt {
+			t.Fatalf("the residual conjunct must survive as a Filter under the Project; child=%T", proj.Child)
+		}
+		bin, isBin := filt.Predicate.(*BinaryOp)
+		if !isBin || bin.Op != parser.OpGt {
+			t.Fatalf("residual predicate = %T — want the `b.j2 > 0` conjunct", filt.Predicate)
+		}
+	})
 }
 
 // TestExprHasConvertibleSublink pins WHICH sublink kinds count as convertible.

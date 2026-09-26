@@ -10308,9 +10308,30 @@ func roundIntervalMicrosToPrec(micros int64, p int) int64 {
 // Multi-column subqueries raise 42601 unless the operand is a RowExpr,
 // in which case element-wise tuple comparison is used (row-constructor IN).
 func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	d, err := evalInExprScalarRow(x, slot, ctx)
+	// M0146-0015c slice 3: an EXISTS→ANY conversion product is two-valued —
+	// PG's subplan->unknownEqFalse. Three-valued IN owes NULL where EXISTS
+	// reports FALSE (unmatched over a NULL-bearing set, a NULL operand
+	// against a non-empty set), and the difference is observable through a
+	// NOT above the link even though a bare qual cannot tell them apart.
+	// Collapse it once at this boundary so the tuple hash, the value hash
+	// and both linear fallbacks agree.
+	if err == nil && x.UnknownEqFalse && d.IsNull() {
+		d = NewBoolDatum(x.Negated)
+	}
+	return d, err
+}
+
+func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// Row-constructor IN/NOT IN subquery: (a, b) IN (SELECT x, y FROM ...).
 	// Route to element-wise tuple comparison. M0097-0020.
 	if rowOp, ok := x.Operand.(*optimizer.RowExpr); ok && x.Plan != nil {
+		// M0146-0015c slice 3: an EXISTS→ANY conversion product serves
+		// from the tuple hash when UnknownEqFalse licenses it; every
+		// other row-IN keeps the NULL-precise linear path.
+		if d, err, served := evalRowHashProbe(x, rowOp, slot, ctx); served {
+			return d, err
+		}
 		return evalRowConstructorInExpr(x, rowOp, slot, ctx)
 	}
 	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.

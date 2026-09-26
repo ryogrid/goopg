@@ -2622,7 +2622,11 @@ func subPlanUsesHashTable(x *optimizer.InExpr, reg *subPlanReg) bool {
 		(x.AnyOp != 0 && x.AnyOp != parser.OpEq) || !hashedSubPlanEnabled() {
 		return false
 	}
-	if row, isRow := x.Operand.(*optimizer.RowExpr); isRow && len(row.Elems) > 1 {
+	if row, isRow := x.Operand.(*optimizer.RowExpr); isRow && len(row.Elems) > 1 &&
+		!x.UnknownEqFalse {
+		// A row-operand IN hashes only for the EXISTS→ANY conversions'
+		// two-valued licence (evalRowHashProbe); a parser-written
+		// (a,b) IN (...) keeps the linear path and is never `hashed`.
 		return false
 	}
 	rows, _, _, width := explainCostFields(x.Plan, optimizer.EstimateRows(x.Plan))

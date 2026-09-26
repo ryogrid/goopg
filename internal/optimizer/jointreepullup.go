@@ -1073,6 +1073,12 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 	if !rebaseQualKeptSubplans(out, pb, pullSpans, emittingTotal, ctx, allSpans, bodyBase) {
 		return nil, false
 	}
+	// M0146-0015c slice 3: PG's convert_EXISTS_to_ANY — a kept EXISTS
+	// whose escaping refs all pair as `innercol = sentinel` conjuncts
+	// becomes a hashed ANY over the inner columns (its ParParam/Args
+	// binding dissolves into the operand). Fail-open: an unconvertible
+	// EXISTS keeps the pre-lowered SubPlan form.
+	out = keptExistsToAnyQual(out)
 	return out, true
 }
 

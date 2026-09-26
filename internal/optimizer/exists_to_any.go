@@ -397,6 +397,13 @@ func existsToAny(ex *ExistsExpr, hostRow Schema) *InExpr {
 		},
 		Plan:            projected,
 		IsNonCorrelated: true,
+		// M0146-0015c slice 3: the source EXISTS is two-valued, so this
+		// ANY is too — upstream stamps the same conversion's subplan
+		// unknownEqFalse. The bounded spine this pass walks already
+		// keeps the link out of NULL-distinguishing positions; the flag
+		// makes the executor enforce it (NULL collapses to FALSE) rather
+		// than rely on the placement.
+		UnknownEqFalse: true,
 	}
 }
 

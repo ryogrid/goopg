@@ -258,6 +258,15 @@ type InExpr struct {
 	Subquery        *parser.SelectStmt
 	List            []Expr
 	IsNonCorrelated bool
+	// UnknownEqFalse is subplan->unknownEqFalse (subselect.c
+	// build_subplan): the ANY was produced from a two-valued EXISTS, so a
+	// probe that cannot match may answer FALSE where a parser-written IN
+	// would owe NULL. Set only by the EXISTS→ANY conversions, which fire
+	// exclusively for exprs standing in qual positions — where NULL and
+	// FALSE filter identically — and which never convert a negated or
+	// operand-distinguishing site. It is what lets the row-operand probe
+	// answer without PG's partial-match table (M0146-0015c slice 3).
+	UnknownEqFalse bool
 	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
 	// Args[i] is evaluated against the current outer row and written to
 	// ParamExec slot ParParam[i] before Plan runs; Plan then reads the

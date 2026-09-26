@@ -245,3 +245,87 @@ func TestBuildSubPlanHashClassification(t *testing.T) {
 	}
 	// Kill-switch / probe declines are covered end-to-end above.
 }
+
+// ---------------------------------------------------------------------------
+// M0146-0015c slice 3 — tuple-key probe for the kept-EXISTS conversion's
+// row-operand ANY (InExpr{Operand: RowExpr, UnknownEqFalse}).
+
+func rowHashFixture(t *testing.T) (*Context, func()) {
+	t.Helper()
+	ctx, _, cleanup := newDDLFixture(t)
+	for _, ddl := range []string{
+		"CREATE TABLE ra (k int, y int)",
+		"CREATE TABLE rb (k int, w int)",
+		"CREATE TABLE rc (x int, z int)",
+		// ra: (1,10) and (2,20) find a matching (b,c) pair; (3,30) has no
+		// b row; (5,NULL) exercises the NULL operand element — the
+		// conversion's two-valued licence must answer FALSE, not NULL.
+		"INSERT INTO ra VALUES (1,10),(2,20),(3,30),(5,NULL)",
+		"INSERT INTO rb VALUES (1,100),(1,101),(2,200),(5,500)",
+		// rc: (10,NULL) and (NULL,100) are tuples a full match can never
+		// use — the build drops them under unknownEqFalse.
+		"INSERT INTO rc VALUES (10,100),(10,101),(20,200),(10,NULL),(NULL,100)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			cleanup()
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	return ctx, cleanup
+}
+
+const rowAnySQL = `SELECT a.k, a.y FROM ra a WHERE EXISTS (
+	SELECT 1 FROM rb b WHERE b.k = a.k
+	  AND EXISTS (SELECT 1 FROM rc c WHERE c.x = a.y AND c.z = b.w)) ORDER BY a.k`
+
+const rowNotAnySQL = `SELECT a.k, a.y FROM ra a WHERE EXISTS (
+	SELECT 1 FROM rb b WHERE b.k = a.k
+	  AND NOT EXISTS (SELECT 1 FROM rc c WHERE c.x = a.y AND c.z = b.w)) ORDER BY a.k`
+
+// TestRowHashedAnyTruthTable pins the tuple probe's truth against the
+// linear oracle and — because both paths share the UnknownEqFalse
+// collapse — the two-valued EXISTS semantics: a NULL operand element
+// answers FALSE (row (5,NULL) drops), and inner tuples carrying NULL
+// elements can never match.
+func TestRowHashedAnyTruthTable(t *testing.T) {
+	ctx, cleanup := rowHashFixture(t)
+	defer cleanup()
+	got := runBothHashPaths(t, ctx, rowAnySQL)
+	if len(got) != 2 || datumKey(got[0][0]) != datumKey(NewIntDatum(1)) ||
+		datumKey(got[1][0]) != datumKey(NewIntDatum(2)) {
+		t.Fatalf("row-ANY truth: got %v, want [(1,10),(2,20)]", got)
+	}
+	// The NOT EXISTS twin: every ra row's b-matched pairs see a full
+	// (x,z) match except (5,NULL), whose inner EXISTS is FALSE →
+	// NOT → TRUE — the only kept row.
+	got = runBothHashPaths(t, ctx, rowNotAnySQL)
+	if len(got) != 1 || datumKey(got[0][0]) != datumKey(NewIntDatum(5)) {
+		t.Fatalf("row-NOT-ANY truth: got %v, want [(5,NULL)]", got)
+	}
+}
+
+// TestRowHashedAnyProbeFires asserts the served answer really came from
+// the tuple hash — a usable *subPlanRowHash must sit under the
+// conversion product's cache key in the scoped store.
+func TestRowHashedAnyProbeFires(t *testing.T) {
+	ctx, cleanup := rowHashFixture(t)
+	defer cleanup()
+	_ = runBothHashPaths(t, ctx, rowAnySQL)
+	found := false
+	for e := range ctx.SubPlanStats {
+		in, isIn := e.(*optimizer.InExpr)
+		if !isIn || !in.UnknownEqFalse {
+			continue
+		}
+		v, ok := ctx.subqCacheScoped.Get(nonCorrelatedCacheKey(in) + subPlanRowHashKeySuffix)
+		if !ok {
+			continue
+		}
+		if h, isH := v.(*subPlanRowHash); isH && !h.unusable && len(h.set) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no usable *subPlanRowHash in the scoped store — the tuple probe never served")
+	}
+}

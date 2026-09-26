@@ -69,7 +69,7 @@ func FoldConstants(e Expr) Expr {
 		// Subquery rides alongside Plan: this arm REBUILDS the node, so a
 		// field it forgets is a field the rest of the planner never sees
 		// (M0142-0008a-3i-route-a — the retention test caught exactly this).
-		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, Subquery: x.Subquery, List: folded, IsNonCorrelated: x.IsNonCorrelated}
+		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, Subquery: x.Subquery, List: folded, IsNonCorrelated: x.IsNonCorrelated, ParParam: x.ParParam, Args: x.Args, UnknownEqFalse: x.UnknownEqFalse}
 
 	case *FuncCall:
 		foldedArgs := make([]Expr, len(x.Args))

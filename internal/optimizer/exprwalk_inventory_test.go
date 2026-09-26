@@ -345,6 +345,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// unenumerated type (the enclosing pull-up declines, fail-closed).
 	"pulledsublink.go:(keptRebase).rebaseNode":    walkerPending, // 7 of 32 arms
 	"pulledsublink.go:descendSublinkParams":       walkerPending, // 4 of 32 arms
+	"pulledsublink.go:keptExistsToAnyQual":        nonRecursiveClassifier, // M0146-0015c s3: a lowerTraverseExpr Visit callback; descent is the driver's, and an unenumerated type keeps the EXISTS form (fail-open)
 	"pulledsublink.go:keptPlanRefsAdmissible":     walkerPending, // 6 of 32 arms
 	"pulledsublink.go:renumberDeep":               walkerPending, // 6 of 32 arms
 	"subplan_lower.go:analyzeSublink":            walkerPending, // 7 of 32 arms

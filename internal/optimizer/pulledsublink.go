@@ -1,6 +1,11 @@
 package optimizer
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // pulledsublink.go — M0146-0015c slice 2: carry a correlated SubPlan inside a
 // pulled-up body qual.
@@ -562,4 +567,199 @@ func renumberDeep(n Node, m map[int]int, a *paramAlloc) bool {
 		return e, false, true
 	}
 	return lowerTraverseNode(n, fx)
+}
+
+// ---------------------------------------------------------------------------
+// M0146-0015c slice 3 — convert_EXISTS_to_ANY for kept sublinks
+//
+// PG's convert_EXISTS_to_ANY (subselect.c:1731, reached from make_subplan at
+// :263) turns an EXISTS whose correlation clauses are hash-equalities into an
+// ANY sublink over the correlated columns: the inner side of every
+// `outervar = innervar` pair becomes a target of the (now decorrelated) body
+// and the outer side becomes the parent's testexpr — a hashed SubPlan at
+// execution. goopg's kept-subplan form arrives here already pre-lowered: the
+// escaping OuterColumnRefs were rewritten to negative-sentinel ExecParamRefs
+// and the outer expressions sit in Args. The conversion therefore maps each
+// sentinel pair to one projected column plus one operand element instead of
+// minting Params; the produced InExpr is non-correlated, carries no ParParam
+// binding at all, and gets UnknownEqFalse — subplan->unknownEqFalse — because
+// its source was a two-valued EXISTS in a qual position, which is what lets
+// the executor's tuple probe answer FALSE where a parser-written IN would
+// owe NULL (no partial-match table needed).
+//
+// Every check runs BEFORE the first mutation, exactly as in existsToAny:
+// a decline leaves the (correct, pre-lowered) EXISTS form untouched.
+
+// keptExistsToAnyQual runs the conversion over a rebased pulled qual. It is
+// deliberately fail-OPEN: a traversal bail or an unconvertible EXISTS leaves
+// the slice-2 form in place (a missed rendering improvement, never a wrong
+// answer), so a partial rewrite is still a coherent qual.
+func keptExistsToAnyQual(q Expr) Expr {
+	out, _ := lowerTraverseExpr(q, func(e Expr) (Expr, bool, bool) {
+		switch x := e.(type) {
+		case *ExistsExpr:
+			if in := keptExistsToAny(x); in != nil {
+				return in, true, true
+			}
+			return e, true, true
+		case *InExpr, *SubqueryExpr, *ArraySubqueryExpr,
+			*MultiAssignSubqRow, *MultiAssignSubqElem:
+			// Sublink-bearing kinds are opaque to this pass — their plans
+			// are inner scope, and the generic descent would bail on them
+			// anyway (lowerTraverseExpr's `x.Plan != nil` arm).
+			return e, true, true
+		}
+		return e, false, true
+	})
+	return out
+}
+
+// keptExistsToAny returns the ANY-sublink form of a kept, pre-lowered
+// EXISTS, or nil when the shape does not qualify. Mirrors
+// convert_EXISTS_to_ANY's checks against the slice-2 representation:
+//
+//   - every escaping ref (negative-sentinel ExecParamRef) must sit in a
+//     top-level `innercol = sentinel` conjunct of the body's own qual
+//     holder — the pair extraction PG does over the WHERE clause;
+//   - the inner side must be a plain ColumnRef resolvable by index AND
+//     name in the holder's output (complex inner exprs keep the EXISTS
+//     form — same bound existsToAny applies);
+//   - no sentinel may remain anywhere at body level once the equality
+//     conjuncts are removed — PG's `contain_vars_of_level(newWhere,1)`
+//     and `contain_vars_of_level(rightargs,1)` refusals, expressed
+//     against the sentinel set.
+//
+// Volatility needs no re-check: keptSubplanAdmissible already required
+// planHasVolatileExpr == false on this exact body.
+func keptExistsToAny(ex *ExistsExpr) *InExpr {
+	if ex == nil || ex.Plan == nil || ex.IsNonCorrelated ||
+		len(ex.ParParam) == 0 || len(ex.Args) != len(ex.ParParam) {
+		return nil
+	}
+	for _, p := range ex.ParParam {
+		// Only the slice-2 sentinel block is pullable apart — a
+		// non-negative id means some other path claimed this sublink.
+		if p >= 0 {
+			return nil
+		}
+	}
+	if !existsBodySpineSimple(ex.Plan) {
+		return nil
+	}
+	holder, pred := existsBodyQualHolder(ex.Plan)
+	if holder == nil {
+		return nil
+	}
+	holderSchema := holder.Output()
+
+	type pair struct {
+		arg  int
+		col  *ColumnRef
+		ref  *ExecParamRef
+	}
+	var pairs []pair
+	var residual []Expr
+	for _, c := range splitAnd(pred) {
+		bin, ok := c.(*BinaryOp)
+		if !ok || bin.Op != parser.OpEq {
+			residual = append(residual, c)
+			continue
+		}
+		var pr *ExecParamRef
+		var col *ColumnRef
+		if l, isRef := bin.Right.(*ExecParamRef); isRef && l.ID < 0 {
+			pr = l
+			col, _ = bin.Left.(*ColumnRef)
+		} else if r, isRef := bin.Left.(*ExecParamRef); isRef && r.ID < 0 {
+			pr = r
+			col, _ = bin.Right.(*ColumnRef)
+		}
+		if pr == nil || col == nil {
+			residual = append(residual, c)
+			continue
+		}
+		argIdx := -pr.ID - 1
+		if argIdx < 0 || argIdx >= len(ex.Args) {
+			residual = append(residual, c)
+			continue
+		}
+		if col.Index < 0 || col.Index >= len(holderSchema) ||
+			!strings.EqualFold(holderSchema[col.Index].Name, col.Name) {
+			// An inner side that cannot be named in holder-output
+			// coordinates cannot become a projected column.
+			return nil
+		}
+		pairs = append(pairs, pair{arg: argIdx, col: col, ref: pr})
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	// No body-level sentinel may survive outside the extracted conjuncts
+	// (contain_vars_of_level over newWhere/rightargs). Pointer-identity is
+	// exact: the sentinel occurrences the walk finds are the same objects
+	// the conjuncts hold. Depth-0 only — a negative id inside a nested
+	// sublink's plan belongs to that block's own pre-lowering.
+	extracted := make(map[*ExecParamRef]bool, len(pairs))
+	for _, p := range pairs {
+		extracted[p.ref] = true
+	}
+	stray := false
+	walkPlanExprsDeep(ex.Plan, 0, func(e Expr, planDepth int) {
+		if planDepth != 0 {
+			return
+		}
+		if pr, isRef := e.(*ExecParamRef); isRef && pr.ID < 0 && !extracted[pr] {
+			stray = true
+		}
+	})
+	if stray {
+		return nil
+	}
+
+	// --- every decline is behind us; mutate ---------------------------
+
+	newPred := combineAnd(residual)
+	if newPred == nil {
+		newPred = &BooleanConst{pos: ex.Pos(), Value: true}
+	}
+	switch h := holder.(type) {
+	case *Filter:
+		h.Predicate = newPred
+	case *Join:
+		h.Predicate = newPred
+	}
+
+	targets := make([]Expr, len(pairs))
+	schema := make(Schema, len(pairs))
+	elems := make([]Expr, len(pairs))
+	types := make([]catalog.Type, len(pairs))
+	for i, p := range pairs {
+		targets[i] = &ColumnRef{
+			pos: p.col.Pos(), Index: p.col.Index, Name: p.col.Name,
+			Type: p.col.Type, SourceTableIdx: p.col.SourceTableIdx,
+		}
+		schema[i] = holderSchema[p.col.Index]
+		elems[i] = ex.Args[p.arg]
+		if cr, isCol := ex.Args[p.arg].(*ColumnRef); isCol {
+			types[i] = cr.Type
+		}
+	}
+	projected := &Project{
+		pos: ex.Pos(), Child: holder, Targets: targets, schema: schema,
+	}
+	var operand Expr = &RowExpr{pos: ex.Pos(), Elems: elems, Types: types}
+	if len(elems) == 1 {
+		operand = elems[0]
+	}
+
+	// Subquery stays nil for the reason existsToAny records: this is a
+	// rewrite, not a copy — the parser body no longer describes the plan.
+	// Negated survives as the link's own flag: `NOT EXISTS` is PG's
+	// `NOT (SubPlan)` in the qual, which converts identically — and
+	// under unknownEqFalse a negated ANY can never owe NULL either.
+	return &InExpr{
+		pos: ex.Pos(), Operand: operand, Negated: ex.Negated, Plan: projected,
+		IsNonCorrelated: true, UnknownEqFalse: true,
+	}
 }
