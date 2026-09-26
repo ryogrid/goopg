@@ -21779,6 +21779,21 @@ M0146-0001 re-baseline census on the new default arm.
   - Open: sizing with the generated clause, special\-join problems,
     `ec\_has\_const` — ledgered.
   Movement: TPC\-DS Q31 Q74 → MATCH \(SF0.25\), Q24 depth 4 → 6 \(SF0.25\) / 4 → 7 \(SF1\); TPC\-H Q9 → MATCH
+- [x] **M0146\-0023 — GROUP BY without aggregates is PG\'s Group node**
+  \(filed and done 2026\-09\-26 from the census: `PG Group \| goopg
+  GroupAggregate/HashAggregate`, TPC\-DS Q37/Q82/Q97\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0023\-group\-node.md`; evidence
+    `analysis/m0146/m0146\-0023/`.
+    - EXPLAIN prints `Group` for a sorted aggregate\-free grouping;
+      `costAgg`\'s sorted arm with no aggregates is `cost\_group`.
+    - Q97 MATCH \(SF0.25\); Q37/Q82 depth 1 → 2 at both scales; all gates
+      pass.
+  - Open: HAVING\-to\-WHERE, partial Group paths, HAVING qual cost —
+    ledgered.
+  Movement: TPC\-DS Q97 → MATCH \(SF0.25\), Q37 Q82 depth 1 → 2 \(SF0.25, SF1\)
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the

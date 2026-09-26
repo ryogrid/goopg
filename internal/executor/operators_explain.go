@@ -3735,6 +3735,12 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		// (explain.c:1531-1553). The planner does not set Strategy yet, so a
 		// hand-built node is the only way this renders GroupAggregate today.
 		if p.Strategy == optimizer.AggStrategySorted {
+			// M0146-0023: a sorted grouping with no aggregate is PG's Group
+			// node (create_group_path: GROUP BY without aggregates),
+			// labelled bare "Group" in every split mode (explain.c T_Group).
+			if len(p.Aggs) == 0 {
+				return "Group"
+			}
 			return prefix + "GroupAggregate"
 		}
 		return prefix + "HashAggregate"

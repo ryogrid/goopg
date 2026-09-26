@@ -517,6 +517,14 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	finalPerGroup := cp.cpuOperatorCost * float64(nAggs)
 	groupCmpPerTuple := cp.cpuOperatorCost * float64(numGroupCols)
 
+	if strategy == AggStrategySorted && nAggs == 0 && numGroupCols > 0 {
+		// M0146-0023: GROUP BY without aggregates is PG's Group path,
+		// priced by cost_group (costsize.c): the input plus one
+		// comparison per grouping column per input tuple — no per-group
+		// emit charge, unlike cost_agg's AGG_SORTED arm below.
+		return Cost{Startup: inputStartup,
+			Total: inputTotal + groupCmpPerTuple*tuples}
+	}
 	if strategy == AggStrategySorted {
 		// Streams: startup is the input's; total adds trans + grouping
 		// comparisons per input tuple, final + emit per group.

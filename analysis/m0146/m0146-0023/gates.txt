@@ -1,0 +1,5 @@
+units PASS
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH (acceptance arm, values identical to tmp/m0145-0008m/arm-on.txt)
+TPC-H census identical
+regress 41 WITH/plan pass-required cases: identical to a HEAD (05c3c0773) worktree

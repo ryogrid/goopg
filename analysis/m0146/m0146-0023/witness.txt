@@ -1,0 +1,15 @@
+## Q37 SF0.25 baseline
+ Limit  (cost=26928.19..26928.23 rows=2 width=96)
+   ->  GroupAggregate  (cost=26928.19..26928.21 rows=2 width=96)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Sort  (cost=26928.14..26928.19 rows=20 width=1472)
+## Q37 SF0.25 candidate
+ Limit  (cost=26928.19..26928.23 rows=2 width=96)
+   ->  Group  (cost=26928.19..26928.21 rows=2 width=96)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Sort  (cost=26928.14..26928.19 rows=20 width=1472)
+## Q37 SF0.25 candidate-pg
+ Limit  (cost=4340.02..4340.51 rows=2 width=125)
+   ->  Group  (cost=4340.02..4340.51 rows=2 width=125)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=4340.02..4340.49 rows=3 width=125)

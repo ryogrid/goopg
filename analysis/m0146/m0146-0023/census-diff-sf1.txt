@@ -1,0 +1,16 @@
+37c37
+< Q37 depth=1 [aggregation-strategy] under Limit: PG Group | goopg GroupAggregate
+---
+> Q37 depth=2 [sort-strategy] under Group: PG Nested Loop Inner | goopg Sort
+82c82
+< Q82 depth=1 [aggregation-strategy] under Limit: PG Group | goopg GroupAggregate
+---
+> Q82 depth=2 [sort-strategy] under Group: PG Nested Loop Inner | goopg Sort
+101c101
+< CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 parallelism=10 join-method=7 scan-type=7 qual-placement=6 parameterisation=5 error=3 join-order=1
+---
+> CATEGORY-ROLLUP: sort-strategy=32 aggregation-strategy=16 parallelism=10 join-method=7 scan-type=7 qual-placement=6 parameterisation=5 error=3 join-order=1
+114c114
+<     2  aggregation-strategy under Limit            PG Group                        goopg GroupAggregate               depth=1
+---
+>     2  sort-strategy    under Group            PG Nested Loop Inner            goopg Sort                         depth=2
