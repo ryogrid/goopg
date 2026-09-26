@@ -1,0 +1,83 @@
+2026-09-27 — M0146-0005v gates (tree b13bf6017 + slice23 diff, staged index)
+
+Unit (package) tests
+  go test ./internal/optimizer/ ./internal/executor/
+    -> ok / ok — all new skip-scan tests pass:
+       planner: TestPickIndexSkipRunEligible, TestPickIndexSkipRunDeclines,
+         TestIndexSkipClausesPositions, TestSkipScanDescents,
+         TestCreateIndexScanPlanSkipEmission
+       executor: TestSkipScanEnumeratesGroups, TestSkipScanRescanReEnumerates,
+         TestSkipScanEarlyStop, TestSkipScanNoMatchAndNullProbe,
+         TestSkipScanRejectsMixedShapes, TestSkipExplainIndexCondNamesBoundColumn
+       partial-twin pin added: skip probe admitted by
+         lateralProbeIsPartialProbe (partial_lateral_test.go)
+    Three first-run failures, all fixed this slice:
+      - TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels:
+        {supplier} now legitimately admits a skip path — test premise
+        ("btree cannot begin below its leading column") is what PG18
+        removed; expectation updated to {part,supplier,part|supplier}.
+      - TestSAOPNumSAScansCost clamp case: rint(100/30)=3 tuples/descent
+        changes tuple-CPU by exactly -10*cpuIndexTupleCost — the PG
+        (selfuncs.c:7150) division SAOP shares; expectation updated.
+      - TestIndexProbeKeyIsTheOnlyScanSideEncoder: blob arm routed
+        through ctx.indexProbeKey (its blob arm is the concatenation).
+
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+  -> PASS (all packages ok)
+
+scripts/tpch-spotcheck.sh
+  -> RESULT=PASS (Q12 rows=2, Q13 rows=33)
+  gate-stamp: tpch-spotcheck PASS
+
+scripts/tpcds-sf025-regression.sh sweep  (:65437, staged binary)
+  -> PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  gate-stamp: tpcds-sf025 PASS
+  INCIDENT: first sweep FAILed with Q16/Q72 ERROR — panic
+    "PathGather over a subtree with no driving scan" at
+    createNestLoopIndexJoinPlan. Cause: this slice's draft refused
+    SkipPrefix in lateralProbeIsPartialProbe while the path twin
+    (partialPathDrivingKind's parameterized-IndexScan arm) admitted
+    the same probe -> Gather elected over an NL whose node-twin
+    drivingScan refused. Reverted the refusal (the skip probe IS a
+    legal per-worker rescan — PG's own Gather>NL>IndexScan shape);
+    second sweep clean. Q72 0s->168s recorded (parity shape; probe
+    machinery speed, not a wrong election). Plan-channel moved
+    {Q16 Q37 Q72 Q82 Q94}, all skip-scan elections toward PG.
+
+ACCEPT_BASELINE=tmp/m0145-0008m/arm-on.txt \
+  scripts/tpch-acceptance-arm.sh m0146-0005v tmp/arm-on-m0146-0005v.txt
+  -> SUMMARY: 24 MATCH — values identical to baseline
+  gate-stamp: tpch-acceptance-arm PASS
+
+scripts/tpcds-fireset-gate.sh m0146-0005v analysis/m0146/m0146-0005/slice23/fireset
+  -> FIRST RUN FAIL: SF1 candidate Q72 TIMEOUT — see README "Q72 at
+     SF1" section. The skip election at SF1 produced a ~9.5k-rescan NL
+     over a ~980ms/rescan probe (~2.6h estimated); PG elects the
+     d2-first prefix-probe order there.
+     Fix inside the slice: executor-capability admission bounds
+     (maxSkipProbeRows=600, maxSkipProbeLifetimeRows=5e8). The Q72
+     inventory probe (709 rows/execution) is declined under every
+     required-outer set; the search re-elects the d2-first order
+     (plan byte-identical to baseline; Q72 executes ~5s).
+     RERUN (bounded candidate): PASS at BOTH scales —
+       SF0.25 fires {Q16 Q37 Q72 Q82 Q94}: baseline 5/5 PASS,
+         candidate 5/5 PASS
+       SF1 fires {Q16 Q37 Q82 Q94} (Q72 plan reverted to baseline,
+         no longer a fire): baseline 4/4 PASS, candidate 4/4 PASS
+       FIRE-SET-TIMEOUTS: introduced=none unchanged=none missing=none
+       (both scales)
+  -> SF0.25 census delta (baseline HEAD vs candidate):
+       jointree-search 23 -> 21 (Q82, Q37 leave for D3-partialpath)
+       join-method 45 -> 43, join-order 73 -> 72,
+       qual-placement 26 -> 25
+  -> SF1 census delta: join-method 53 -> 50, parameterisation 44 -> 43,
+       aggregation-strategy 39 -> 37, D3-partialpath 29 -> 26;
+       D1-sublink 7 -> 8, D4-upperrel 30 -> 32, sort-strategy 58 -> 59,
+       qual-placement 20 -> 22 moved the other way.
+  gate-stamp: tpcds-fireset PASS (verdict PASS; stamp rewrites at
+    commit with the staged index)
+
+Self-diffs (goopg-vs-goopg):
+  sf025 plans-022905 -> plans-033255: same=94 changed=5
+    {Q16 Q37 Q72 Q82 Q94}, all into-Nested-Loop skip-scan elections.
+  tpch acceptance arm: 24/24 value-identical (see above).

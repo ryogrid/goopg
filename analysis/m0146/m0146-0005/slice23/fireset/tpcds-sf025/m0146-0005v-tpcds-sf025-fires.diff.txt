@@ -1,0 +1,12 @@
+# plan-diff: analysis/m0146/m0146-0005/slice23/fireset/tpcds-sf025/m0146-0005v-tpcds-sf025-baseline.plans.txt -> analysis/m0146/m0146-0005/slice23/fireset/tpcds-sf025/m0146-0005v-tpcds-sf025-candidate.plans.txt
+#   old: provenance not stamped
+#   new: provenance not stamped
+changed (5): Q16 Q37 Q72 Q82 Q94
+=== PLAN-SHAPE: queries=99 same=94 changed=5 added=0 removed=0 ===
+# join-method: Q16 hash-2 nestloop+2
+# join-method: Q37 hash-1 nestloop+1
+# join-method: Q72 hash-3 nestloop+3
+# join-method: Q82 hash-1 nestloop+1
+# join-method: Q94 hash-1 nestloop+1
+=== JOIN-METHOD-ELECTION: moved=5 into-nestloop=5 suspects=Q16 Q37 Q72 Q82 Q94 ===
+# a move INTO Nested Loop is the C-04a direction (an equi-join demoted to a Join Filter on an epsilon row estimate) — look before accepting. Report-only: this line never changes the exit status.

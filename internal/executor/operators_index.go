@@ -316,6 +316,22 @@ type indexScanOp struct {
 	saopIdx    int
 	saopSeen   map[storage.ItemPointer]struct{}
 
+	// skip-scan state (M0146-0005v, PG18's `_bt_skiparray`): a probe that
+	// binds a NON-leading key column is executed as an outer loop over the
+	// distinct values stored in the skipped leading columns — one descent
+	// that finds each group's first entry (skipSeek as a strictly-past
+	// bound), then one bounded probe descent per group, chained lazily
+	// through nextLeafBatch exactly like the SAOP multi-descent. No
+	// dedup map: the strictly-past successor guarantees strictly increasing
+	// groups, unlike SAOP's possibly-duplicated array elements.
+	skipRest      []indexProbeKeyPart // evaluated bound-column parts (columns SkipPrefix..), once per Rescan
+	skipKeyCols   []*catalog.Column   // resolved index key columns (pgIndexKeyColumns), tuple AND blob prefix decode
+	skipDesc      *nbtree.PGIndexKeyDesc
+	skipRestBytes []byte // blob format only: encoded suffix bound, appended behind each group's prefix
+	skipSeek      []byte // lo bound for the next group's first entry (nil = index start)
+	skipSeekExcl  bool   // skipSeek is exclusive (tuple pivots; blob successors are inclusive)
+	skipDone      bool   // enumeration exhausted (or impossible — e.g. a NULL bound)
+
 	// pidx is the shared leaf-block claim set when this scan is a Gather
 	// worker's driving scan (C-19c, the plain-index-scan sibling of the IOS's
 	// M0134-0189 field); nil for a serial scan, and a nil receiver claims
@@ -465,6 +481,13 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
+	o.skipRest = nil
+	o.skipKeyCols = nil
+	o.skipDesc = nil
+	o.skipRestBytes = nil
+	o.skipSeek = nil
+	o.skipSeekExcl = false
+	o.skipDone = true
 	o.outerSlot = nil
 	o.outerWidth = 0
 
@@ -541,6 +564,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
+	o.skipRest = nil
+	o.skipKeyCols = nil
+	o.skipDesc = nil
+	o.skipRestBytes = nil
+	o.skipSeek = nil
+	o.skipSeekExcl = false
+	o.skipDone = false
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
 
@@ -567,6 +597,16 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// the gap-lock and per-tuple-read paths use bucket-grain predicate locking.
 	o.hashBucketScan = isFullKeyProbe && o.plan.Index.DeclaredHash
 	o.hashProbeFingerprint = nil
+
+	// M0146-0005v: btree skip-scan — an equality probe on a NON-leading key
+	// column. Distinct-value enumeration of the skipped prefix plus per-group
+	// bounded descents lives in rescanSkip / skipNextGroup. Dispatched BEFORE
+	// the SAOP arm on purpose: a plan carrying both shapes is a planner bug,
+	// and rescanSkip's shape check is what reports it rather than silently
+	// running the SAOP half.
+	if o.plan.SkipPrefix > 0 {
+		return o.rescanSkip()
+	}
 
 	// B-14 (P2-09a): ScalarArrayOp multi-descent (`col = ANY (consts)`).
 	// Exactly one probe shape is ever set on the node; SAOPKeys takes
@@ -852,6 +892,196 @@ func (o *indexScanOp) rescanSAOP() error {
 	return nil
 }
 
+// rescanSkip initialises a btree skip-scan (M0146-0005v, PG18's
+// `_bt_skiparray`, nbtpreprocesskeys.c): an equality probe whose keys bind
+// columns [SkipPrefix, SkipPrefix+len(Keys)) while the leading SkipPrefix
+// columns carry no qual at all.
+//
+// The probe becomes an outer loop over the DISTINCT values the index
+// stores in the skipped prefix. PG backfills a procedurally-generated
+// ScalarArrayOp-style skip array per unbound leading column; the executor
+// equivalent here is an enumeration descent that lands on each prefix
+// group's first entry, followed by that group's ordinary bounded descent
+// (the Keys probe under the prefix). Both runs stay lazy: the group's
+// cursor opens only when the previous group's cursor exhausts, so a
+// consumer that stops early (semi/anti inner, LIMIT) pays for the groups
+// it actually read plus one enumeration descent — never a full index scan.
+//
+// The bound column values are evaluated ONCE per Rescan — the same eval
+// timing lookupKeys applies — and re-joined with each enumerated prefix to
+// form that group's probe bounds. A NULL bound matches nothing anywhere,
+// which empties the whole scan (same rule as a NULL probe key).
+func (o *indexScanOp) rescanSkip() error {
+	s := o.plan.SkipPrefix
+	ncols := len(o.plan.Index.Columns)
+	// Planner contract: skip is an equality run strictly inside the key,
+	// never mixed with the other probe shapes. A violation is a planner
+	// bug, not a scan shape to interpret — report it like the lookupKeys
+	// count guard does.
+	if s < 1 || s >= ncols || len(o.plan.Keys) == 0 || s+len(o.plan.Keys) > ncols ||
+		len(o.plan.SAOPKeys) > 0 || o.plan.Key != nil || o.plan.LowKey != nil ||
+		o.plan.HighKey != nil || len(o.plan.RangePrefix) > 0 {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexScanOp: skip scan on index %q carries an incompatible probe shape (SkipPrefix=%d, Keys=%d, columns=%d)",
+			o.plan.Index.Name, s, len(o.plan.Keys), ncols)}
+	}
+	o.skipKeyCols = pgIndexKeyColumns(o.plan.Index)
+	if len(o.skipKeyCols) != ncols {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+			"indexScanOp: skip scan on index %q cannot resolve its %d key columns (expression index?)",
+			o.plan.Index.Name, ncols)}
+	}
+	o.skipRest = make([]indexProbeKeyPart, 0, len(o.plan.Keys))
+	for i, ke := range o.plan.Keys {
+		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
+		if err != nil {
+			return err
+		}
+		if v.IsNull() {
+			// `col = NULL` is never true — in ANY prefix group, so the
+			// whole scan is empty. Same early-out as lookupKeys.
+			o.finalizeIndexScanSSI()
+			return nil
+		}
+		o.skipRest = append(o.skipRest, indexProbeKeyPart{col: o.skipKeyCols[s+i], val: v, pos: ke.Pos()})
+	}
+	o.skipDesc = o.ctx.pgIndexKeyDesc(o.plan.Index)
+	if o.skipDesc == nil {
+		// Blob format: pre-encode the suffix bound once; each group's lo is
+		// (prefix bytes || suffix bytes). The skipped columns' decode is
+		// decodeIndexKeyColumn walking the concatenated encoding — the same
+		// walk the index-only scan's multi-column decode performs.
+		var encErr *ExecError
+		o.skipRestBytes, encErr = o.ctx.indexProbeKey(o.plan.Index, o.skipRest)
+		if encErr != nil {
+			return encErr
+		}
+	}
+	o.skipDone = false
+	o.scanDone = false
+	return nil
+}
+
+// skipNextGroup advances the skip enumeration to the next distinct value of
+// the skipped prefix and returns the bounded probe for that group as
+// (lo, hi) — both inclusive — or ok=false when no further group exists.
+//
+// The enumeration is a pair of strictly-increasing descent positions:
+//
+//   - tuple format: the group's prefix is decoded back to datums
+//     (pgIndexTupleKeyDatums), re-encoded as a pivot of SkipPrefix
+//     attributes, and the NEXT group's first entry is the first entry
+//     strictly past that pivot — `compareHigh` treats a truncated bound
+//     as plus infinity beyond its named attributes, so an exclusive lo
+//     pivot skips every entry sharing the prefix (pgkeycmp.go).
+//   - blob format: the prefix is the concatenated column encodings,
+//     split by decodeIndexKeyColumn's consumed byte counts; the successor
+//     is the byte-string increment of the prefix (order-preserving column
+//     encodings are prefix-free, so no other group's prefix can extend it
+//     — byteInc lands on or before the next group's first entry).
+//
+// The group's own probe is (prefix || bound columns) as one pivot of
+// SkipPrefix+len(Keys) attributes for the tuple format — lo == hi, with
+// the truncated-hi rule covering the unbound tail — or the byte
+// concatenation plus the usual upper padding for the blob format.
+func (o *indexScanOp) skipNextGroup() (lo, hi []byte, ok bool, err error) {
+	s := o.plan.SkipPrefix
+	for !o.skipDone {
+		var first []byte
+		enum, cerr := o.tree.NewScanCursor(o.skipSeek, nil, o.skipSeekExcl, false, nil)
+		if cerr != nil {
+			return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+		}
+		for first == nil {
+			more, nerr := enum.Next(func(key []byte, _ storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+				// The key aliases the pinned leaf; the probe bounds it
+				// produces outlive the callback, so copy.
+				first = append([]byte(nil), key...)
+				return false, nil
+			})
+			if nerr != nil {
+				return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: nerr.Error()}
+			}
+			if !more {
+				break
+			}
+		}
+		if first == nil {
+			o.skipDone = true
+			return nil, nil, false, nil
+		}
+		if o.skipDesc != nil {
+			datums, derr := pgIndexTupleKeyDatums(o.skipDesc, o.skipKeyCols, first)
+			if derr != nil {
+				return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+					"indexScanOp: skip scan on index %q could not decode a prefix entry: %v", o.plan.Index.Name, derr)}
+			}
+			parts := make([]indexProbeKeyPart, 0, s+len(o.skipRest))
+			for i := 0; i < s; i++ {
+				parts = append(parts, indexProbeKeyPart{col: o.skipKeyCols[i], val: datums[i], pos: o.plan.Pos()})
+			}
+			probe, encErr := o.ctx.indexProbeKey(o.plan.Index, append(parts, o.skipRest...))
+			if encErr != nil {
+				return nil, nil, false, encErr
+			}
+			succ, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+			if encErr != nil {
+				return nil, nil, false, encErr
+			}
+			o.skipSeek = succ
+			o.skipSeekExcl = true
+			return probe, probe, true, nil
+		}
+		// Blob format: split the entry's leading SkipPrefix column
+		// encodings off the composite key.
+		off := 0
+		for i := 0; i < s; i++ {
+			_, n, derr := decodeIndexKeyColumn(first[off:], *o.skipKeyCols[i])
+			if derr != nil {
+				return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+					"indexScanOp: skip scan on index %q could not split a key prefix: %v", o.plan.Index.Name, derr)}
+			}
+			off += n
+		}
+		prefix := first[:off]
+		loKey := append(append([]byte(nil), prefix...), o.skipRestBytes...)
+		hiKey := loKey
+		if s+len(o.skipRest) < len(o.plan.Index.Columns) {
+			hiKey = o.ctx.compositeUpperBound(o.plan.Index, loKey)
+		}
+		// The next group's prefix is the byte-string increment of this
+		// one. An all-0xFF prefix has no successor — and cannot be
+		// extended by another group's prefix either (prefix-free
+		// encodings), so the enumeration ends after this group.
+		if succ := byteKeySuccessor(prefix); succ != nil {
+			o.skipSeek = succ
+			o.skipSeekExcl = false
+		} else {
+			o.skipDone = true
+		}
+		return loKey, hiKey, true, nil
+	}
+	return nil, nil, false, nil
+}
+
+// byteKeySuccessor returns the smallest byte string greater than every
+// extension of k — k with its last non-0xFF byte incremented and the
+// trailing 0xFF run zeroed — or nil when k is all 0xFF (no successor
+// exists). Used by the blob-format skip enumeration: order-preserving
+// column encodings are prefix-free, so this lands at or before the first
+// entry of the next distinct prefix group.
+func byteKeySuccessor(k []byte) []byte {
+	out := append([]byte(nil), k...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] != 0xFF {
+			out[i]++
+			return out
+		}
+		out[i] = 0
+	}
+	return nil
+}
+
 // ssiRecordIndexScanGapLock finalises the SERIALIZABLE index-scan SIREAD
 // predicate lock after Rescan has determined the matching TID set.
 //
@@ -935,6 +1165,25 @@ func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbt
 func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 	for {
 		if o.cur == nil {
+			// Skip-scan (M0146-0005v): the active cursor is exhausted (or
+			// never opened) — enumerate the next distinct prefix and open
+			// its bounded descent. Enumeration laziness is what keeps an
+			// early-stopping consumer from paying for groups it never read.
+			if o.plan.SkipPrefix > 0 {
+				lo, hi, ok, err := o.skipNextGroup()
+				if err != nil {
+					return false, err
+				}
+				if !ok {
+					return false, nil
+				}
+				cur, cerr := o.tree.NewScanCursor(lo, hi, false, false, nil)
+				if cerr != nil {
+					return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+				}
+				o.cur = cur
+				continue
+			}
 			// The active cursor is exhausted (or never opened): open the
 			// next SAOP element's descent, if any. A non-SAOP scan has
 			// no bounds queued, so this also terminates it.
@@ -1193,6 +1442,12 @@ func (o *indexScanOp) Close() error {
 	o.cur = nil
 	o.saopBounds = nil
 	o.saopSeen = nil
+	o.skipRest = nil
+	o.skipKeyCols = nil
+	o.skipDesc = nil
+	o.skipRestBytes = nil
+	o.skipSeek = nil
+	o.skipDone = true
 	o.hasLast = false
 	if o.scanRow != nil {
 		// EX1-02b: scrub tail poison before the pooled row is released so

@@ -316,8 +316,9 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// The same order assertion `createIndexScanPlan` makes, restated because
 		// this arm REPLACES the key list that function built: a silently
 		// reordered list binds the right values to the wrong index columns and
-		// returns wrong rows rather than failing.
-		if c.indexCol != i {
+		// returns wrong rows rather than failing. `IndexSkipPrefix` shifts the
+		// run — slot i binds `Columns[IndexSkipPrefix+i]`.
+		if c.indexCol != innerPath.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s claims index column %d; the index-column order was lost",
 				i, innerPath.IndexInfo.Name, c.indexCol))
 		}
@@ -345,7 +346,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	// will hold. `translateToLayout` clones, so the path's own clause
 	// expressions — which the search still owns — are untouched.
 	is.Key, is.Keys = nil, nil
-	if len(keys) == 1 {
+	if len(keys) == 1 && is.SkipPrefix == 0 {
 		is.Key = keys[0]
 	} else {
 		is.Keys = keys
@@ -407,7 +408,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 	outerIndex := outerLay.bindingIndex()
 	keys := make([]Expr, 0, len(innerPath.IndexClauses))
 	for i, c := range innerPath.IndexClauses {
-		if c.indexCol != i {
+		if c.indexCol != innerPath.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s claims index column %d; the index-column order was lost",
 				i, innerPath.IndexInfo.Name, c.indexCol))
 		}
@@ -420,7 +421,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 		panic(fmt.Sprintf("createPlan: NLI inner %s binds no probe key; the parameter would never be applied", innerPath.IndexInfo.Name))
 	}
 	is.Key, is.Keys = nil, nil
-	if len(keys) == 1 {
+	if len(keys) == 1 && is.SkipPrefix == 0 {
 		is.Key = keys[0]
 	} else {
 		is.Keys = keys

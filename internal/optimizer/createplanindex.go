@@ -433,6 +433,14 @@ func createIndexScanPlan(p *Path) Node {
 	case len(p.IndexClauses) > ncols:
 		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d clauses to a %d-column index",
 			p.IndexInfo.Name, len(p.IndexClauses), ncols))
+	case p.IndexSkipPrefix < 0 || p.IndexSkipPrefix+len(p.IndexClauses) > ncols:
+		panic(fmt.Sprintf("createPlan: PathIndexScan on %s skips %d columns then binds %d clauses on a %d-column index",
+			p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses), ncols))
+	case p.IndexSkipPrefix > 0 && p.RequiredOuter == 0:
+		// The only producer of a skip path this slice is the
+		// parameterised one; a skip would also work for a constant probe
+		// but its planner arm is deliberately unbuilt (M0146-0005v).
+		panic(fmt.Sprintf("createPlan: unparameterised skip PathIndexScan on %s has no producer", p.IndexInfo.Name))
 	}
 
 	is := &IndexScan{
@@ -461,7 +469,11 @@ func createIndexScanPlan(p *Path) Node {
 	// columns and returns wrong rows rather than failing.
 	keys := make([]Expr, 0, len(p.IndexClauses))
 	for i, c := range p.IndexClauses {
-		if c.indexCol != i {
+		// With `IndexSkipPrefix` the bound run starts that many key
+		// columns in: slot i binds `Columns[IndexSkipPrefix+i]`, the same
+		// positional contract `IndexScan.SkipPrefix` documents
+		// (M0146-0005v).
+		if c.indexCol != p.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: index clause %d of %s claims index column %d; the index-column order was lost",
 				i, p.IndexInfo.Name, c.indexCol))
 		}
@@ -489,6 +501,15 @@ func createIndexScanPlan(p *Path) Node {
 	case 1:
 		is.Key = keys[0]
 	default:
+		is.Keys = keys
+	}
+	// A skip probe binds `Columns[SkipPrefix+i]`, not `Columns[i]` — a
+	// single bound column there is still `Keys` (and never the col-0
+	// `Key`), and `SkipPrefix` names how many leading columns the executor
+	// enumerates instead.
+	if p.IndexSkipPrefix > 0 {
+		is.SkipPrefix = p.IndexSkipPrefix
+		is.Key = nil
 		is.Keys = keys
 	}
 	// A restriction path's index quals came out of the leaf's own Filter:

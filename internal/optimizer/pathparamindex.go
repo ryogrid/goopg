@@ -345,7 +345,12 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// already cheaper and `addPath` already discarded the bitmap.
 	idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter)
 	if idx == nil {
-		return false
+		// No index starts a leading-prefix probe under this
+		// parameterisation — the only remaining way an index can drive the
+		// scan is a btree skip (M0146-0005v): a bound column PAST the first
+		// unbound one, with the unbound leading columns enumerated at run
+		// time. Same `bound` population, different eligibility rule.
+		return s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
 	}
 	// The probe binds a gapless leading prefix, which may be SHORTER than
 	// `bound`: a clause on a column past the first unbound one is not an index
@@ -441,7 +446,286 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		Target:        tgt,
 		TargetKnown:   tgtKnown,
 	}, "index.parameterised")
+	// The leading-prefix path existing does not preclude a skip path on a
+	// DIFFERENT index — PG's `create_index_paths` offers every usable index
+	// and lets add_path decide, so offer the skip candidate too.
+	s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
 	return true
+}
+
+// maxSkipProbeRows bounds the per-execution output of a parameterized
+// skip probe. PG files every usable skip path and lets cost decide;
+// goopg's executor pays a much higher per-descent and per-heap-tuple
+// cost than PG's, so a probe that returns hundreds of rows per rescan —
+// each a heap fetch plus visibility check — is a bulk scan in disguise
+// whose election risk the engine cannot afford: an underestimated outer
+// turns directly into rescans of an expensive probe, and the same probe
+// can be reached through any outer rel supplying the bound column, so a
+// per-execution bound is the airtight one. Declining is fail-closed:
+// the rel keeps its ordinary parameterized and restriction paths and
+// the join search elects among them.
+//
+// Witness: TPC-DS Q72 at SF1 — a skip probe on
+// inventory_pkey(inv_item_sk) estimated at 709 rows/execution was
+// elected over PostgreSQL's d2-first prefix-probe order by an ~8%
+// margin the join-cost model drifted on; the elected shape executed
+// ~9.5k rescans of a ~1s/rescan probe and timed out. Every verified
+// skip election (Q16/Q37/Q82/Q94 at both scales) estimates ≤ ~530 rows
+// per probe; Q37/Q82 sit at ~200-270. Thin probes under large
+// modelled outer estimates get a second bound below.
+const maxSkipProbeRows = 600
+
+// maxSkipProbeLifetimeRows bounds the modelled lifetime output of a
+// parameterized skip probe: per-execution rows × get_loop_count (the
+// outer baserel's row estimate — the same quantity cost_index
+// amortizes over). It catches the other blowup signature: a THIN probe
+// (few rows per rescan) under a huge modelled rescan count still
+// models a lifetime of hundreds of millions of emitted tuples.
+// Verified elections model under ~2e8; the Q72 {catalog_sales}-
+// parameterized inventory probe modelled ~1.0e9.
+const maxSkipProbeLifetimeRows = 5e8
+
+// addOneParameterizedSkipPath is the skip-scan arm of
+// addOneParameterizedIndexPath (M0146-0005v, PG18's `_bt_skiparray`
+// mechanism — see nbtpreprocesskeys.c and `btcostestimate`'s num_sa_scans
+// loop, selfuncs.c:7444-7577). A btree whose first BOUND column sits at
+// position `skip` (1 or later) can still drive the scan: nbtree enumerates
+// the distinct values of the unbound leading columns and performs a bounded
+// descent per value. The bound run must be contiguous from `skip` — the
+// same `amoptionalkey` gaplessness PG applies after the skip — and every
+// UNBOUND key column (the skipped prefix AND any trailing columns) must be
+// NOT NULL, or the byte/tuple-key btree — which keeps no NULL-keyed
+// entries — would silently lose matching rows.
+//
+// Only the pure-skip shape is admitted: no bound column may precede the
+// skipped columns, the bound columns must be equality clauses (the only
+// kind `bound` carries), and the skipped columns must be ordinary ASC
+// columns resolvable to the table — an expression or DESC key there is a
+// harder enumeration this slice declines.
+//
+// The cost model is `btcostestimate` verbatim where it matters: each
+// skipped column multiplies `num_sa_scans` by its
+// `get_variable_numdistinct` (+1 — the initial probe counts as a value
+// when no skip quals constrain it), a default ndistinct REVERTS the
+// multiply rather than declining the path (PG still produces it — the
+// executor still skips at run time), and a cumulative estimate beyond
+// `index->pages` reverts the same way (`index->pages < num_sa_scans`).
+func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, innerToOuter, innerExprs map[string]Expr, bound []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
+	idx, skip, run := pickIndexSkipRun(cat, tbl, innerToOuter)
+	if idx == nil {
+		return false
+	}
+	clauses := indexSkipClauses(idx, bound, skip, run)
+	if len(clauses) == 0 {
+		return false
+	}
+	probed := boundPrefixClauses(bound, clauses)
+	// `fullyBound` is false by construction: the skipped prefix is never
+	// bound, so a unique index cannot collapse the probe to one tuple, and
+	// PG's unique-index clamp does not apply.
+	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, false)
+	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false)
+	// The emitted stream is globally key-ordered — groups are enumerated
+	// in prefix order and each group's probe is suffix-ordered — so the
+	// index's pathkeys are as valid here as on the prefix path.
+	keys, dir := indexPathOrdering(idx, innerExprs, false)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	numSA, boundCounted := skipScanDescents(tbl, idx, skip, relTuples, indexPages)
+	// `indexBoundQuals` vs `indexQuals` (selfuncs.c:7643-7680): the heap
+	// side always filters by the probe's quals (`selectivity`), but the
+	// index side counts them only when the skip estimate SURVIVED — a
+	// default-ndistinct or past-pages revert drops them from the bound
+	// list, and numIndexTuples is then estimated over the whole index.
+	boundSel := sel
+	if !boundCounted {
+		boundSel = 1
+	}
+	loopCount := s.loopCountFor(req)
+	if rows > maxSkipProbeRows || (loopCount > 0 && rows*loopCount > maxSkipProbeLifetimeRows) {
+		return false
+	}
+	cost := costIndexScan(s.cp, indexScanInputs{
+		relPages:         relPages,
+		relTuples:        relTuples,
+		indexPages:       indexPages,
+		indexTuples:      indexTuples,
+		treeHeight:       treeHeight,
+		selectivity:      sel,
+		correlation:      indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages:  totalPages,
+		loopCount:        loopCount,
+		numQualOps:       paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numSAScans:       numSA,
+		boundSelectivity: boundSel,
+	})
+	tgt, tgtKnown := scanPathTarget(rel)
+	addPath(rel, &Path{
+		Kind:            PathIndexScan,
+		Rel:             rel,
+		Rows:            rows,
+		Cost:            cost,
+		ParallelSafe:    rel.ParallelSafeForPath(),
+		DisabledNodes:   disabledNodesFor(!s.cp.enableIndexScan),
+		Pathkeys:        keys,
+		IndexInfo:       idx,
+		IndexScanDir:    dir,
+		IndexClauses:    clauses,
+		IndexSkipPrefix: skip,
+		RequiredOuter:   req,
+		Target:          tgt,
+		TargetKnown:     tgtKnown,
+	}, "index.parameterised.skip")
+	return true
+}
+
+// pickIndexSkipRun finds the best btree index whose FIRST bound column sits
+// at position `skip >= 1` — the eligibility predicate of a skip-scan probe.
+// Returns (index, skipped-column count, contiguous bound-run length).
+//
+// The rules, all fail-closed, and what each prevents:
+//
+//   - btree, non-partial, all-plain columns — the same gates the prefix
+//     picker applies, plus expression keys ("" names) declined;
+//   - `skip` is the FIRST bound position: a bound column before it would
+//     be a prefix+skip mix PG handles and this slice declines;
+//   - the bound run is contiguous from `skip` — `amoptionalkey` after the
+//     skip;
+//   - a DESC column inside the skipped prefix declines (the enumeration
+//     semantics of descending groups are untested);
+//   - every UNBOUND key column — the skipped prefix and the tail after
+//     the run — must be NOT NULL: NULL-keyed rows are absent from the
+//     index, so a skipped column that can be NULL would lose matches
+//     (an index that stores NULL-keyed entries is exempt — same rule
+//     `indexUnboundKeysNotNull` applies to the tail of a prefix probe).
+//
+// Ranking prefers the longest bound run (narrower probe), then the
+// shortest skipped prefix (fewer descents), then the first index seen.
+func pickIndexSkipRun(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, int, int) {
+	var best *catalog.Index
+	bestSkip, bestRun := 0, 0
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if !isBTreeIndex(idx) || idx.HasPredicate || len(idx.Columns) < 2 {
+			continue
+		}
+		// The first bound position — 0 is the prefix picker's domain.
+		s := -1
+		for pos, col := range idx.Columns {
+			if _, ok := innerToOuter[col]; ok {
+				s = pos
+				break
+			}
+		}
+		if s <= 0 {
+			continue
+		}
+		// Contiguous bound run from s.
+		run := 0
+		for pos := s; pos < len(idx.Columns); pos++ {
+			if _, ok := innerToOuter[idx.Columns[pos]]; !ok {
+				break
+			}
+			run++
+		}
+		ok := true
+		for i := 0; i < s && ok; i++ {
+			if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
+				ok = false
+			}
+		}
+		if !ok || !indexSkipNullSafe(tbl, idx, s, run) {
+			continue
+		}
+		if best == nil || run > bestRun || (run == bestRun && s < bestSkip) {
+			best, bestSkip, bestRun = idx, s, run
+		}
+	}
+	return best, bestSkip, bestRun
+}
+
+// indexSkipNullSafe is `indexUnboundKeysNotNull` generalised to a bound run
+// that does not start at column 0: every key column OUTSIDE [skip, skip+run)
+// is unbound, and each must be NOT NULL (or the index stores NULL-keyed
+// entries and the whole check is moot) — a NULL in any unbound position is
+// a row the probe cannot see.
+func indexSkipNullSafe(tbl *catalog.Table, idx *catalog.Index, skip, run int) bool {
+	if tbl == nil || idx == nil {
+		return false
+	}
+	if catalog.IndexHasNullKeyedEntries(idx) {
+		return true
+	}
+	for i := 0; i < len(idx.Columns); i++ {
+		if i >= skip && i < skip+run {
+			continue
+		}
+		name := idx.Columns[i]
+		if name == "" {
+			return false
+		}
+		found := false
+		for _, c := range tbl.Columns {
+			if c.Name == name {
+				found = true
+				if !c.NotNull {
+					return false
+				}
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// indexSkipClauses is `indexPathClauses` for a skip path: the clauses the
+// probe binds, one per index column of the contiguous run
+// [skip, skip+run), with `indexCol` recording the TRUE position — the
+// positional-contract check downstream (`IndexScan.Keys[i]` binds
+// `Columns[IndexSkipPrefix+i]`) reads it.
+func indexSkipClauses(idx *catalog.Index, bound []paramIndexClause, skip, run int) []indexPathClause {
+	out := make([]indexPathClause, 0, run)
+	for pos := skip; pos < skip+run; pos++ {
+		c, ok := boundClauseForColumn(bound, idx.Columns[pos])
+		if !ok {
+			// pickIndexSkipRun measured the run contiguous — a gap here is
+			// a contract break, not a shorter probe.
+			return nil
+		}
+		out = append(out, indexPathClause{ri: c.ri, indexCol: pos, key: c.outerKey})
+	}
+	return out
+}
+
+// skipScanDescents is the `num_sa_scans` side of `btcostestimate`
+// (selfuncs.c:7391-7577) for a pure leading skip: one multiply of
+// `get_variable_numdistinct` (+1 — `indexSkipQuals == NIL` counts the
+// initial probe as a value, :7539) per skipped column, with PG's two
+// reverts — a DEFAULT ndistinct estimate (no statistics) and a cumulative
+// product that exceeds `index->pages` — each reverting to the product of
+// the columns that survived (`num_sa_scans_prev_cols`).
+//
+// The second return reports whether the run's quals reached
+// `indexBoundQuals`: a revert `break`s the clause loop before they are
+// added (selfuncs.c:7590), so the caller must then price the index side
+// over the whole index. A revert still produces the path — PG executes
+// the skip arrays at run time regardless; only the cost reverts.
+func skipScanDescents(tbl *catalog.Table, idx *catalog.Index, skip int, relTuples, indexPages float64) (numSA float64, boundCounted bool) {
+	numSA = 1.0
+	for i := 0; i < skip; i++ {
+		stats := columnStatsByName(tbl, idx.Columns[i])
+		nd, isDefault := getVariableNumDistinct(joinVarStats{stats: stats, tuples: relTuples})
+		if isDefault {
+			return numSA, false
+		}
+		prev := numSA
+		numSA *= nd + 1
+		if numSA > indexPages {
+			return prev, false
+		}
+	}
+	return numSA, true
 }
 
 // parameterizedIndexSelectivity is `indexSelectivity` for the clauses bound

@@ -51,6 +51,18 @@ func TestLateralProbeIsPartialProbe(t *testing.T) {
 	if !lateralProbeIsPartialProbe(ios) {
 		t.Fatal("bare index-only probe must be admitted")
 	}
+	// M0146-0005v: the skip probe — Keys binding non-leading columns —
+	// is a per-worker rescan exactly like the prefix probe (PG's
+	// Gather > NL > Index Scan skip shape), so this gate and the path
+	// twin (partialPathDrivingKind's parameterized-IndexScan arm) admit
+	// it together.
+	skip := latProbeNode(nil).(*IndexScan)
+	skip.Key = nil
+	skip.Keys = []Expr{&OuterColumnRef{Level: 1, Index: 1}}
+	skip.SkipPrefix = 1
+	if !lateralProbeIsPartialProbe(skip) {
+		t.Fatal("skip-scan probe must be admitted")
+	}
 	refusals := map[string]Node{
 		"nil":          nil,
 		"seq":          &SeqScan{},

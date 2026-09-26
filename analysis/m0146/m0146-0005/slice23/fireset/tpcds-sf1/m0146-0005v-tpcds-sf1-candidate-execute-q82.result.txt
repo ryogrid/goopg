@@ -1,0 +1,6 @@
+    i_item_id     |                               i_item_desc                                | i_current_price 
+------------------+--------------------------------------------------------------------------+-----------------
+ AAAAAAAAAGEBAAAA | Now concerned efforts sue main, future instruments. Hardly deaf days may |           63.04
+ AAAAAAAACKJCAAAA | Professional examples will not watch perhaps s                           |           74.03
+(2 rows)
+

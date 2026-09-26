@@ -858,7 +858,7 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 				harvestKey(is.Key, 0)
 			}
 			for i, k := range is.Keys {
-				harvestKey(k, i)
+				harvestKey(k, is.SkipPrefix+i)
 			}
 		}
 		// Recurse through the single/dual-child plan nodes an inner

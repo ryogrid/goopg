@@ -834,6 +834,18 @@ type IndexScan struct {
 	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
 	// probe (no suffix padding); a shorter prefix is rejected by the planner
 	// to keep the executor probe path purely equality-shaped.
+	// SkipPrefix, when non-zero, re-bases Keys: Keys[i] binds
+	// Index.Columns[SkipPrefix+i], and the first SkipPrefix key columns are
+	// NOT bound by any clause. The executor then runs PG18's btree skip-scan
+	// (M0146-0005v, the `_bt_skiparray` mechanism of nbtpreprocesskeys.c):
+	// it enumerates the distinct values the index stores in the skipped
+	// prefix and performs one bounded descent per value, so a qual on a
+	// non-leading column can drive the index rather than filter after it.
+	// Legal only with Keys set — equality skips are the whole scope of the
+	// slice; combining it with Key/SAOPKeys/LowKey/HighKey/RangePrefix is a
+	// planner bug the executor reports rather than interprets. 0 keeps the
+	// positional binding every existing caller relies on.
+	SkipPrefix int
 	// SAOPKeys holds one probe expression per element of a ScalarArrayOp
 	// (`col = ANY (consts)`, i.e. `col IN (consts)`) over the index's LEADING
 	// column — PG's `match_saopclause_to_indexcol` shape

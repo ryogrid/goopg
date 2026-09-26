@@ -404,6 +404,12 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 		lineitem, []string{"l_partkey", "l_suppkey"}, false, "btree", false); err != nil {
 		t.Fatal(err)
 	}
+	// Analyzed stats keep the probes thin — a stats-less fixture models a
+	// 600_000/200 = 3000-row probe, which maxSkipProbeRows declines.
+	lineitem.Stats = &catalog.TableStats{
+		Analyzed: true,
+		Columns:  []catalog.ColumnStats{{NDistinct: 50_000}, {NDistinct: 50_000}},
+	}
 
 	part, supplier, fact := relsetOf(0), relsetOf(1), relsetOf(2)
 	s, err := newSearchCtx(3, defaultCostParams(), nil)
@@ -435,13 +441,14 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 		}
 	}
 	// `part` alone binds the index's LEADING column (`l_partkey`), so it gets a
-	// prefix path; `part|supplier` binds both and gets the full probe. What
-	// must NOT appear is `supplier` alone: `l_suppkey` is the index's TRAILING
-	// column, and a btree cannot begin a scan below its leading column.
+	// prefix path; `part|supplier` binds both and gets the full probe.
+	// `supplier` alone binds the TRAILING column `l_suppkey`: before PG18's
+	// skip scan that was unusable; now it files a skip path that enumerates
+	// the distinct `l_partkey` values and probes each (M0146-0005v).
 	sort.Slice(params, func(i, j int) bool { return params[i] < params[j] })
-	want := []RelSet{part, part | supplier}
-	if len(params) != len(want) || params[0] != want[0] || params[1] != want[1] {
+	want := []RelSet{part, supplier, part | supplier}
+	if len(params) != len(want) || params[0] != want[0] || params[1] != want[1] || params[2] != want[2] {
 		t.Fatalf("got parameterisations %v, want %v: {part} is the prefix probe, "+
-			"{part,supplier} the full one, and {supplier} alone is unusable", params, want)
+			"{supplier} the skip probe, {part,supplier} the full one", params, want)
 	}
 }

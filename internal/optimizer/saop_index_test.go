@@ -254,10 +254,13 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 	}
 
 	// Clamp: 100000 descents on a 90-page index clamp to ceil(90/3) = 30.
+	// The per-descent tuple count is rint(100/30) = 3, so the tuple-CPU
+	// charge prices 90 tuples over the 30 descents, not the full 100
+	// (selfuncs.c:7150 — the same division SAOP descents go through).
 	in.numSAScans = 100000
 	clamped := costIndexScan(cp, in)
-	if want := single.Total + 29*descent; math.Abs(clamped.Total-want) > 1e-9 {
-		t.Fatalf("clamped total = %v, want single total + 29 descents = %v", clamped.Total, want)
+	if want := single.Total + 29*descent - 10*cp.cpuIndexTupleCost; math.Abs(clamped.Total-want) > 1e-9 {
+		t.Fatalf("clamped total = %v, want single total + 29 descents - 10 tuples = %v", clamped.Total, want)
 	}
 
 	// The shared index side feeds the bitmap cost too: the same descent

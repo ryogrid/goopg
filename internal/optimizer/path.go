@@ -452,6 +452,13 @@ type Path struct {
 	IndexScanDir ScanDirection
 	IndexClauses []indexPathClause
 
+	// IndexSkipPrefix is the count of LEADING index columns left unbound
+	// before the run IndexClauses binds — PG18's btree skip-scan
+	// (M0146-0005v): clause i of the list probes Columns[IndexSkipPrefix+i]
+	// and the executor enumerates the skipped prefix's distinct values. 0
+	// means the list is PG's `amoptionalkey` leading prefix as before.
+	IndexSkipPrefix int
+
 	// IndexOnly marks this path as PG's T_IndexOnlyScan rather than
 	// T_IndexScan (`create_index_path`'s `indexonly` argument). PG carries the
 	// distinction on the pathtype of the SAME IndexPath struct rather than in

@@ -22081,8 +22081,9 @@ M0146-0001 re-baseline census on the new default arm.
       ledgered, repro preserved at `tmp/m0146\-0005\-q22/data`.
   Movement: TPC\-DS SF0.25 Q22 `join\-method` → MATCH \(SF0.25 matches
   13 → 14\)
-- [ ] **M0146\-0005v — btree skip scan: index quals on non\-leading columns**
-  \(filed 2026\-09\-27 by M0146\-0005 slice 22, witness TPC\-DS Q82\):
+- [x] **M0146\-0005v — btree skip scan: index quals on non\-leading columns**
+  \(filed 2026\-09\-27 by M0146\-0005 slice 22, witness TPC\-DS Q82;
+  LANDED slice 23\):
   `inventory_pkey` is `btree \(inv_date_sk, inv_item_sk, inv_warehouse_sk\)`;
   PG 18 probes it on `inv_item_sk = item.i_item_sk` — a NON\-leading column —
   via its PG18 skip arrays, so `NL \(item -> inventory probe\)` costs
@@ -22120,6 +22121,26 @@ M0146-0001 re-baseline census on the new default arm.
     `num_sa_scans` costing in the same commit as the enable — an admitted
     qual with a naive full\-index scan would elect PG\'s plan but time out
     on wide probes.
+  - DONE \(slice 23\): `Path.IndexSkipPrefix`/`IndexScan.SkipPrefix`
+    contract \(Keys\[i\] binds Columns\[SkipPrefix\+i\]\); parameterized
+    admission in `pathparamindex.go` emitted alongside the prefix
+    candidate; `num_sa_scans` costing with PG\'s default\-ndistinct and
+    pages\-exceed reverts \(`boundSelectivity` splits the bound set\);
+    lazy cursor\-driven executor enumeration \(tuple\+blob formats\);
+    EXPLAIN renders the bound column. Q82 elects the NL probe; moved
+    plans \{Q16,Q37,Q72,Q82,Q94\} all skip\-scan elections; fire\-set
+    census jointree\-search 23→21, join\-method 45→43. SF1 first
+    fireset FAILed \(candidate Q72 timeout — the 709\-row skip probe
+    under an ~9\.5k\-rescan NL, ~980ms/rescan\); resolved inside the
+    slice by two executor\-capability admission bounds
+    \(`maxSkipProbeRows`=600 on per\-execution rows,
+    `maxSkipProbeLifetimeRows`=5e8 on rows×loopCount\) — the fat probe
+    is declined under every outer relset, Q72 SF1 reverted to the
+    baseline/PG order and left the fire set; final verdict
+    `introduced=none` at BOTH scales \(SF1 join\-method 53→50,
+    parameterisation 44→43, D3\-partialpath 29→26\). Deferred:
+    unparameterized skip \(restriction/bitmap/IOS\), DESC/expr skipped
+    columns — ledgered.
 - [ ] **M0146\-0005w — a set\-operation arm that is a subquery renders as a
   `Subquery Scan` leaf** \(filed 2026\-09\-27 by M0146\-0005 slice 22,
   witness TPC\-DS Q8 depth\-3 join\-order\): PG plans each leaf arm of a

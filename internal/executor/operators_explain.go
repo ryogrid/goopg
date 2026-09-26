@@ -1827,6 +1827,18 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		}
 		return wrapParen(strings.Join(parts, " AND "))
 	}
+	// M0146-0005v: a skip probe binds Columns[SkipPrefix+i] — PG prints
+	// only the bound quals (`Index Cond: (inv_item_sk = ...)`); the
+	// procedurally generated skip array never appears in Index Cond.
+	// Rendering it through the shared body would mislabel slot i with
+	// column i's name.
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
+		parts := make([]string, len(p.Keys))
+		for i, k := range p.Keys {
+			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+		}
+		return wrapParen(strings.Join(parts, " AND "))
+	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 

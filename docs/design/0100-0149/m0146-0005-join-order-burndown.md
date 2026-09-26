@@ -720,17 +720,68 @@ gone from the post-21 census.
 
 Evidence: `analysis/m0146/m0146-0005/slice22/`.
 
+## Slice 23: M0146-0005v — btree skip scan landed (parameterized probes)
+
+PG18's `_bt_skiparray` mechanism (nbtpreprocesskeys.c): a btree index
+key on a non-leading column files an equality scan over procedurally
+generated skipped-prefix values — one bounded descent per distinct
+leading value. Landed for PARAMETERIZED probes only.
+
+- Plan contract: `Path.IndexSkipPrefix` / `IndexScan.SkipPrefix` —
+  `Keys[i]` binds `Index.Columns[SkipPrefix+i]`; `Key`/SAOP/range are
+  invalid in combination (executor reports, never interprets).
+- Admission (`pathparamindex.go`): btree, ≥2 cols, contiguous equality
+  run past column 0, ordinary ASC skipped columns, NOT NULL unbound
+  columns (or null-keyed index). Emitted ALONGSIDE the prefix
+  candidate — PG files all usable index paths and costs them.
+- Costing: `num_sa_scans = ∏ ndistinct(+1)` per skipped column with
+  PG's two reverts (default ndistinct, product > index->pages) — a
+  revert drops the run's quals from the bound set, so `boundSelectivity`
+  splits from heap-side `selectivity`. `numIndexTuples =
+  rint(numIndexTuples/num_sa_scans)` shared with the SAOP arm.
+- Executor: lazy cursor-driven enumeration per rescan (no
+  materialized skip list → early-stop preserved), tuple-format datum
+  decode/re-encode + blob-format byte-increment prefix successors.
+- Sibling audits: `unnest.go` harvest gained the offset;
+  `lateralProbeIsPartialProbe` MUST admit skip probes — its refusal
+  produced a path/node twin mismatch that panicked
+  `gatherChildPlan` (Q16/Q72) since `partialPathDrivingKind` admits
+  parameterized `PathIndexScan` inners.
+- Measured: Q82 elects `NL -> Index Scan inventory_pkey
+  (inv_item_sk = ...)`; fire-set census `jointree-search` 23→21,
+  `join-method` 45→43, `join-order` 73→72; five moved plans
+  {Q16,Q37,Q72,Q82,Q94} all skip-scan elections matching PG shapes.
+- Executor-capability bounds (the SF1 fire-set lesson): a fat skip
+  probe is a bulk scan in disguise — `maxSkipProbeRows=600` on
+  per-execution rows, `maxSkipProbeLifetimeRows=5e8` on
+  rows×loopCount. Witness: Q72 SF1 elected `NL(cs→inv-skip)` by an
+  ~8% margin the join-cost model drifted on, then ran ~9.5k rescans
+  of a ~980ms/rescan probe (>600s timeout). PG files the same path
+  and its model rejects it — the residual is ~8k of join-cost drift
+  in the surrounding subtree, `join-order`/`costing` family. The
+  bound declines the 709-row probe under every outer relset; the
+  search re-elects PG's d2-first order (plan = baseline, ~5s), and
+  SF1 Q72 left the fire set. SF0.25's 527-row probe stays admitted
+  (PG-matching election preserved, 168s — parity shape inside the
+  window). Final fire-set: `introduced=none` at both scales.
+- Deferred: unparameterized skip (restriction/bitmap/IOS), DESC/expr
+  skipped columns, null-keyed blob e2e.
+
+Evidence: `analysis/m0146/m0146-0005/slice23/`.
+
 ## Remaining records
 
 Post-slice-21 census, still to be worked:
 - TPC-H: Q17 (`join-method`; waits on M0146-0012's correlated-sublink
   JOIN clauses) and Q19 (aggregation first divergence); Q9's first
   divergence is `qual-placement`/`sort-strategy` at depth 0.
-- TPC-DS SF0.25: `join-method` Q1, Q23, Q30, Q55, Q65, Q79, Q82, Q92
+- TPC-DS SF0.25: `join-method` Q1, Q23, Q30, Q55, Q65, Q79, Q92
   and `join-order` Q4, Q8, Q11 — attributed per the slice-22 table:
-  owner-blocked (Q23/Q30/Q55/Q79), filed children (Q82 → 0005v, Q8 →
+  owner-blocked (Q23/Q30/Q55/Q79), filed children (Q8 →
   0005w), other families (Q1/Q92 sublinks, Q65 aggregation), or cost
-  ties (Q4/Q11). Every remaining record has a named owner.
+  ties (Q4/Q11). Q82's record closed at slice 23 (skip-scan landed;
+  it moved to the D3-partialpath class along with Q37 — remaining
+  diffs are the parallel/IOS substrate, not join shape).
 
 Re-run the first-divergence census on each slice's capture before choosing
 the next mechanism.

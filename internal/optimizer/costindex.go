@@ -114,17 +114,25 @@ type indexScanInputs struct {
 	numQualOps float64
 
 	// numSAScans is PG's `num_sa_scans`: the number of index descents a
-	// ScalarArrayOp (`col = ANY (consts)`) scan performs — the product of
-	// the array lengths over the scan's SAOP quals (`genericcostestimate`,
-	// postgres/src/backend/utils/adt/selfuncs.c:7086-7103: multiply by
-	// each array's `estimate_array_length` when > 1, min 1). 0 (unset) or
-	// 1 means a single descent and reproduces the pre-existing cost
-	// exactly. The producer contract is that value; the clamp and the
-	// descent charge below are this function's. P2-09b owns the
-	// search-side SAOP producer that will set this above 1; until then it
-	// is exercised by unit tests (the pipeline SAOP arm is rule-based,
-	// like its `col = const` sibling, and prices nothing).
+	// ScalarArrayOp (`col = ANY (consts)`) or skip-array scan performs —
+	// the product of the array lengths over the scan's SAOP quals
+	// (`genericcostestimate`, selfuncs.c:7086-7103) times the distinct
+	// count of each procedurally generated skip column
+	// (`btcostestimate`, selfuncs.c:7391-7577). 0 (unset) or 1 means a
+	// single descent and reproduces the pre-existing cost exactly.
 	numSAScans float64
+
+	// boundSelectivity is the selectivity of `indexBoundQuals` alone —
+	// the quals PG counts toward `numIndexTuples`, which are a SUBSET of
+	// the `indexQuals` that drive `indexSelectivity` (the heap-side
+	// fraction). They differ exactly when `btcostestimate` declines to
+	// add a clause's quals to the bound set — the skip-array reverts
+	// (selfuncs.c:7464-7573): a default ndistinct or a descent estimate
+	// past `index->pages` makes PG drop the column's quals from the
+	// bound list, so the index side is priced over the WHOLE index even
+	// though the heap side still filters by the qual. <= 0 means "same
+	// as selectivity", which is every non-skip producer's contract.
+	boundSelectivity float64
 }
 
 // localQualOpCount counts the rel's local restriction conjuncts from the
@@ -325,7 +333,14 @@ func btreeIndexAMCost(cp costParams, in indexScanInputs) (startup, total float64
 // output, `indexPages` (`costs.numIndexPages`, selfuncs.c:7146) — the page
 // count cost_index's partial arm hands to compute_parallel_worker (C-19c).
 func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, indexPages float64) {
-	numIndexTuples := in.selectivity * in.indexTuples
+	// `numIndexTuples` is over `indexBoundQuals` — usually the same set
+	// `selectivity` reflects, except when a producer deliberately splits
+	// them (btcostestimate's skip-array reverts — see boundSelectivity).
+	boundSel := in.boundSelectivity
+	if boundSel <= 0 {
+		boundSel = in.selectivity
+	}
+	numIndexTuples := boundSel * in.indexTuples
 	if numIndexTuples < 0 {
 		numIndexTuples = 0
 	}
@@ -342,10 +357,6 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	if in.uniqueEqualityOnAllKeys && numIndexTuples > 1 {
 		numIndexTuples = 1
 	}
-	numIndexPages := 1.0
-	if in.indexPages > 1 && in.indexTuples > 1 {
-		numIndexPages = math.Ceil(numIndexTuples * in.indexPages / in.indexTuples)
-	}
 
 	// num_sa_scans, clamped to at most a third of the index's pages
 	// (`btcostestimate`, selfuncs.c:7718-7719: descents cannot exceed leaf
@@ -360,6 +371,22 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	if numSA > 1 {
 		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
 		numSA = math.Max(numSA, 1)
+	}
+	// `genericcostestimate` adjusts numIndexTuples to the PER-DESCENT count
+	// before sizing the page estimate and the tuple-CPU charge
+	// (selfuncs.c:7150 `numIndexTuples = rint(numIndexTuples / num_sa_scans)`):
+	// num_sa_scans descents each see a 1/numSA slice of the matching tuples
+	// and pages. PG 18's skip arrays feed exactly this: distinct leading
+	// values × bounded suffix probes (M0146-0005v).
+	if numSA > 1 {
+		numIndexTuples = math.RoundToEven(numIndexTuples / numSA)
+		if numIndexTuples < 1 {
+			numIndexTuples = 1
+		}
+	}
+	numIndexPages := 1.0
+	if in.indexPages > 1 && in.indexTuples > 1 {
+		numIndexPages = math.Ceil(numIndexTuples * in.indexPages / in.indexTuples)
 	}
 
 	// The repeated-scan arm (`genericcostestimate`, selfuncs.c:7180-7204).
@@ -385,7 +412,11 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 		indexPageCost = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
 	}
 	total = indexPageCost
-	total += numIndexTuples * cp.cpuIndexTupleCost
+	// Tuple-CPU is charged per descent — numIndexTuples is already the
+	// per-descent count, and PG multiplies it back by num_sa_scans
+	// (selfuncs.c:7268: `numIndexTuples * num_sa_scans *
+	// (cpu_index_tuple_cost + qual_op_cost)`).
+	total += numIndexTuples * numSA * cp.cpuIndexTupleCost
 
 	// The B-tree descent (selfuncs.c:7780): tree height plus the leaf page,
 	// at 50 cpu_operator_cost per page. Charged at startup as well as total —
