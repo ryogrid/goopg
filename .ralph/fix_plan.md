@@ -21111,7 +21111,7 @@ M0146-0001 re-baseline census on the new default arm.
   > wrong results. M0146\-0015a inherits item 2a\'s rank as a descendant; the
   > owner decides whether it needs a different placement.
 
-- [ ] **M0146\-0015b — pull up nested EXISTS / NOT EXISTS into semi/anti
+- [x] **M0146\-0015b — pull up nested EXISTS / NOT EXISTS into semi/anti
   joins** \(filed 2026\-09\-25 by M0146\-0015; pre\-existing, not caused by
   the cutover\): for the regress `subselect` query PG plans a Nested Loop
   Semi Join over a Hash Anti Join \(a, d\) in 4 ms; goopg keeps both
@@ -21127,6 +21127,58 @@ M0146-0001 re-baseline census on the new default arm.
     normal M0146 order; being a descendant of an item\-2a task would place it
     in 2a. The two readings conflict, and the loop takes the conservative
     one \(normal M0146 order\) until the owner rules.
+  - **RECON DONE 2026\-09\-26** \(HEAD `12143918a`, post\-0015c\). Design doc
+    `docs/design/0100\-0149/m0146\-0015b\-nested\-sublink\-larg\-pull.md`;
+    evidence `analysis/m0146/m0146\-0015b/` \(census lines, canonical and
+    variant plans, PG oracle plan\).
+    - **PG pulls the inner NOT EXISTS via the `j\->larg` insertion
+      point**: `pull\_up\_sublinks\_qual\_recurse` recurses the converted
+      outer EXISTS\'s quals with `&j\->larg` \(`available_rels1={a,b}`\)
+      AND `&j\->rarg` \(`child_rels={c}`\)
+      \(prepjointree.c:749\-754\). `IncrementVarSublevelsUp\(-1,1\)` on the
+      moved quals drops `a` to varlevelsup 1 inside `d`
+      \(subselect.c:1547\-1548\); `{a} ⊆ {a,b}` admits the `j\->larg` arm
+      → `JoinExpr\{ANTI, larg: FromExpr\{a,b\}, rarg: d\}`.
+    - **goopg binds a nested body only against the parent body scope**
+      \(`extractNestedPullups`, jointreepullup.go:1256 — the `j\->rarg`
+      arm\). `d` reads Level\-2\-only → `no\-level1\-correlation`
+      \(jointreepullup.go:450\) → kept → `keptSubplanAdmissible` clone
+      fails on `BitmapHeapScan` \(`planCloneSupported`, unnest.go:4364 —
+      no bitmap arm\) → `nested\-sublink\-uncloneable` aborts the whole
+      outer pull. Both SubPlans stay.
+    - Cloneable inner plan probe \(`a.odd = d.even`, SeqScan\): outer pull
+      lands — `NL Semi \(b,c)` + slice\-3 `NOT \(ANY \(odd = \(hashed
+      SubPlan 1\).col1\)\)` on the a scan. Correct rows, not PG\'s shape.
+    - **Impl**: re\-bind the nested body against the enclosing problem ctx
+      \(`bodyCtx.parent`\) — emitting refs become Level\-1, parent\-body
+      refs unresolvable \(the bind IS PG\'s ⊆ test\) — splice below the
+      parent, parent `sjLeft` widens by the larg child\'s leaves. No
+      `hops>1`/SpecialJoinInfo widening needed. → M0146\-0015d.
+    - Ledgered: `BitmapHeapScan` clone gap for genuinely\-kept nested
+      sublinks; depth≥2 larg bindings stay declined.
+  Movement: none
+- [ ] **M0146\-0015d — `j\->larg` arm for nested sublink pull\-up**
+  \(filed 2026\-09\-26 by M0146\-0015b\): `extractNestedPullups` gains the
+  emitting\-scope arm — re\-bind a nested sublink body with
+  `parent = bodyCtx.parent` before falling back to `bodyCtx`
+  \(PG\'s jtlink1\-before\-jtlink2 order\); a bound child splices into the
+  spine below its parent body and the parent\'s `sjLeft` widens by the
+  larg child\'s leaves. Depth≥2 stays declined; the ANY arm is the same
+  one\-line arm if the EXISTS arm proves out.
+  Kind: impl
+  Parent: M0146\-0015b
+  - First step: `internal/optimizer/jointreepullup.go`
+    `extractNestedPullups` + `jtPulledBody` bookkeeping \(flat\-list
+    order, `parent`, `subtreeLeaves` vs the larg side\); pin with the
+    regress `subselect` query EXPLAIN — `Nested Loop Semi Join` over
+    `Hash Anti Join \(a,d\)` — and the cloneable\-inner variant\'s
+    \(b,c\)\-semi shape preserved; live rows on :5533.
+  - Expected movement: none on parity instruments \(no corpus two\-scope
+    nested sublink — 0015c slice\-3 census\); measured by the
+    `subselect` regress plan shape \+ runtime and
+    `TestPort_RegressSuite`.
+  - Rank: child of an item\-2a task per 0015b\'s conservative reading →
+    normal M0146 order.
 
 - [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains

@@ -1,0 +1,17 @@
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.00..150.00 rows=5000 width=488)
+   Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Bitmap Heap Scan on tenk1 c  (cost=8.51..145.10 rows=1 width=244)
+           Filter: ((b.hundred = hundred) AND EXISTS(SubPlan 2))
+           SubPlan 2
+             ->  Seq Scan on tenk1 d  (cost=0.00..100.50 rows=50 width=244)
+                   Filter: ($0 = even)
+           ->  Bitmap Index Scan on tenk1_hundred  (cost=0.25..8.51 rows=50 width=244)
+                 Index Cond: (hundred = b.hundred)
+   ->  Seq Scan on tenk1 a  (cost=0.00..445.00 rows=10000 width=244)
+   ->  Index Scan using tenk1_thous_tenthous on tenk1 b  (cost=0.00..0.50 rows=50 width=244)
+         Index Cond: (thousand = a.thousand)
+(13 rows)
+

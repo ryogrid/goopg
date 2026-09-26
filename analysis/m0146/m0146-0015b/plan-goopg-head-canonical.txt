@@ -1,0 +1,19 @@
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Merge Join  (cost=2218.77..7468.77 rows=5000 width=488)
+   Merge Cond: (a.thousand = b.thousand)
+   Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Bitmap Heap Scan on tenk1 c  (cost=8.51..145.10 rows=1 width=244)
+           Filter: ((b.hundred = hundred) AND (NOT EXISTS(SubPlan 2)))
+           SubPlan 2
+             ->  Bitmap Heap Scan on tenk1 d  (cost=8.51..145.09 rows=50 width=244)
+                   Filter: ($0 = thousand)
+                   ->  Bitmap Index Scan on tenk1_thous_tenthous  (cost=0.25..8.51 rows=50 width=244)
+                         Index Cond: (thousand = $0)
+           ->  Bitmap Index Scan on tenk1_hundred  (cost=0.25..8.51 rows=50 width=244)
+                 Index Cond: (hundred = b.hundred)
+   ->  Seq Scan on tenk1 a  (cost=0.00..445.00 rows=10000 width=244)
+   ->  Seq Scan on tenk1 b  (cost=0.00..445.00 rows=10000 width=244)
+(15 rows)
+
