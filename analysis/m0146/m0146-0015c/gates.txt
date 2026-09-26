@@ -1,3 +1,6 @@
+# Gate record — M0146-0015c
+
+## slice 1 (commit 1b453ba9e — plan-neutral nested-scope gate)
 === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
 === PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
 FIRE-SET: baseline=a5b2a3e5b4bc8c37604130a67902c3f99a57ca02 (63c7814b6d70) candidate=worktree (f8a229cba965)
@@ -6,3 +9,24 @@ FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
 tpch-spotcheck: RESULT=PASS
 SUMMARY: 24 MATCH
 regress 41 WITH/plan pass-required cases + subselect: diffs identical to a HEAD (a5b2a3e5b) worktree
+
+## slice 2 (kept correlated SubPlan rides in a pulled-up qual)
+units: PASS (RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh)
+tpch-spotcheck: RESULT=PASS (Q12 rows=2, Q13 rows=33; stamped code_tree 1c777295…)
+tpch-acceptance-arm: SUMMARY 24 MATCH, VERDICT PASS vs tmp/m0145-0008m/arm-on.txt
+tpcds-sf025 sweep: === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+                   === PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+                   === STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=2 total-delta=+0.9% ===
+tpcds-fireset: PASS — baseline=HEAD (842ba5eaf) candidate=worktree
+               FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+               FIRE-SET: corpus=tpcds-sf1   fires=none (plan A/B had no changed query)
+tpch parity capture (tmp/m0146-0015c-s2/tpch): PLAN-PARITY queries=22 match=6
+    CATEGORIES-EXCL-MATCH: join-order=14 join-method=6 scan-type=9 parameterisation=3
+                           aggregation-strategy=6 sort-strategy=10 parallelism=13
+                           qual-placement=2 rendering=0
+    (floor 3; identical count to the take2 floor capture — the new admitted shape
+     is not exercised by the TPC-H/TPC-DS corpora; canonical evidence is
+     slice2-goopg.txt + TestJointreePullupKeepsNestedExists)
+live check: goopg @127.0.0.1:5533 — EXISTS -> Hash Semi Join / Join Filter:
+    (EXISTS(SubPlan 1)), rows {a1,a2}; NOT EXISTS -> Hash Anti Join, rows {a3,a4};
+    same-shape IN variant rows {a1,a2}. Correct answers verified by hand.

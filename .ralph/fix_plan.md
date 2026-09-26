@@ -21004,6 +21004,18 @@ M0146-0001 re-baseline census on the new default arm.
       refs by depth \(body → problem space, emitting scope → one level
       down\), fail\-closed over node kinds; then admit it in
       `bodyQualsAdmitSublinkList`. Slice 3: `convert\_EXISTS\_to\_ANY`.
+  - 2026\-09\-26 slice 2 \(landed\): `internal/optimizer/pulledsublink.go`.
+    The kept sublink\'s plan is cloned and its escaping OuterColumnRefs
+    become pre\-lowered PARAM_EXEC args \(negative sentinels renumbered by
+    `lowerSubPlanParams`; `Args` are problem\-space ColumnRefs that
+    `translateToLayout` re\-bases with the qual\). Admission is
+    per\-sublink \(`keptSubplanAdmissible`\). Canonical shape now plans
+    `Hash Semi Join / Join Filter: \(EXISTS\(SubPlan 1\)\)` with correct
+    rows; `NOT EXISTS` gives the Anti analogue.
+    - Remaining: slice 3 `convert\_EXISTS\_to\_ANY` \(PG\'s hashed\-ANY
+      form\); the separate `nested\-body\-emitting\-ref` boundary for a
+      PULLED nested body\'s own link qual \(needs SpecialJoinInfo
+      min\-hand widening — the original framing of this task\).
 - [ ] **WRONG RESULTS: an index created with an explicit opclass returns
   wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
   `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —

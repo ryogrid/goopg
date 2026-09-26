@@ -1,7 +1,9 @@
 # M0146-0015c: a nested EXISTS that reads the outermost query
 
-Status: slice 1 (PG's scope gate) landed 2026-09-26, plan-neutral; the
-pull-up of the outer EXISTS is open.
+Status: slice 1 (PG's scope gate) and slice 2 (kept-subplan re-base)
+landed 2026-09-26. The outer EXISTS now plans as a semi join with the
+inner EXISTS carried as a pre-lowered SubPlan in the join filter.
+Slice 3 (`convert_EXISTS_to_ANY`, PG's hashed-ANY rendering) is open.
 
 ## PG behaviour
 
@@ -45,18 +47,62 @@ nested sublink is then left in the parent body's quals, as in PG. Blocker
 2 still declines the outer pull-up, so no plan changes: the sweep, fire
 set and regress output are identical to HEAD.
 
+## Slice 2 (landed): the kept-subplan re-base
+
+`internal/optimizer/pulledsublink.go` carries a correlated SubPlan
+inside a pulled-up qual, in two steps.
+
+At qual-rebase time `rebasePulledQual` runs a post-pass
+(`rebaseQualKeptSubplans`) over its output: every lowerable sublink in
+the qual gets its plan CLONED — the original stays attached to the
+untouched conjunct the declined-search fallback runs — and every
+escaping OuterColumnRef inside the clone is rewritten to an
+`ExecParamRef` with a NEGATIVE sentinel id (`-(i+1)`). Each escape
+becomes an `Args[i]` expression in problem space: `Args` are same-scope
+children of the sublink expr, so `relidsOfExpr` counts them toward the
+clause's relset (join-search attribution) and `translateToLayout`
+re-bases them to whichever node layout the qual lands on, exactly like
+an ordinary join qual. `lowerSubPlanParams` then renumbers each
+sentinel block into the flat per-statement ParamExec space and skips
+pre-lowered sublinks so ordinary lowering cannot clobber the binding.
+
+Scope arithmetic (`keptRebase.escapeArg`): inside a kept plan,
+`hops = Level - linkDepth - 1` counts scopes above the pulled body —
+0 is the body itself (`bodyLeafOf`/`allSpans` + `srcOffset`), hops
+through the ancestor chain land on ancestor bodies, exactly `walked`
+hops past the topmost body is the emitting scope, anything deeper
+declines (`kept-deep-ref`). Refs at `Level <= linkDepth` read frames
+an unlowered nested eval still pushes and are untouched. Two bugs the
+first attempt had, pinned now: `Visit` returning false to
+`walkExprRefs` PRUNES without aborting (failure travels on a flag, as
+in `rebasePulledQual`), and the emitting-scope hop count was off by
+one.
+
+`bodyQualsAdmitSublinkList` is now per-sublink
+(`keptSubplanAdmissible`): cloneable plan, no LATERAL inside, no
+volatile work inside, every escaping ref reachable. Excluded eval-site
+kinds (row-ctor IN, ARRAY, multi-assign) still refuse when correlated;
+a correlated non-lowerable subplan still refuses
+(`subplan-correlated`).
+
+Measured, on the canonical shape (`a … EXISTS (b … EXISTS (c WHERE
+c.x = a.y AND c.z = b.w))`, throwaway cluster, hand-checked data):
+`Hash Semi Join / Join Filter: (EXISTS(SubPlan 1))` with
+`Filter: ((x = a.y) AND (z = b.w))` inside the SubPlan — PG's shape,
+correct rows; `NOT EXISTS` gives the Hash Anti Join analogue; the
+correlated `b.w IN (…)` variant returns correct rows with the ANY kept
+the same way.
+
 ## Next slices
 
-- **Slice 2:** carry a correlated SubPlan in a pulled-up qual. Clone the
-  inner plan (the original is shared with the declined-search fallback)
-  and re-base its OuterColumnRefs by depth:
-  - a reference to the parent body keeps its level and maps to
-    problem-space coordinates (`bodyLeafOf` / `pullSpans`, source
-    identity + `srcOffset`);
-  - a reference to the emitting scope drops one level;
-  - deeper references drop one level.
-  Every plan node and expression kind the clone meets must be enumerated
-  (fail closed). Then relax `bodyQualsAdmitSublinkList` for re-based
-  sublinks.
-- **Slice 3:** `convert_EXISTS_to_ANY`, a hashed ANY for an EXISTS whose
-  correlation is equality pairs.
+- **Slice 3:** `convert_EXISTS_to_ANY`, a hashed ANY for an EXISTS
+  whose correlation is equality pairs. Until it lands goopg renders
+  `Join Filter: (EXISTS(SubPlan N))` where PG prints the hashed-ANY
+  form — semantically equivalent, textually different.
+- **The `nested-body-emitting-ref` boundary** (qual-level, not the
+  kept-subplan path above): a PULLED nested body whose own link qual
+  reads the emitting scope still declines — goopg's search cannot
+  place a join clause between an emitting rel and a rel inside the
+  nested semi join's RHS (`TestNestedSublinkLevel2Bails` keeps the
+  pin). That is the original fix_plan framing of this task and needs
+  the SpecialJoinInfo min-hand widening PG does, a separate change.
