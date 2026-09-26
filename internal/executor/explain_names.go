@@ -97,6 +97,10 @@ type explainNames struct {
 	// statement-wide bySrc.
 	parent map[string]optimizer.Node
 	scopes map[string]map[int16]int32
+	// nodes maps each registered RTID to its scan node, so a column whose
+	// scope resolves to a transparent inlined CTE can be chased into the
+	// CTE body (transparentCTEFor). M0146-0021.
+	nodes map[int32]optimizer.Node
 }
 
 // nodePtr returns a unique string id for a plan node.
@@ -186,6 +190,38 @@ func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, p
 		}
 	}
 	return nm.column(src, colName, prefix)
+}
+
+// transparentCTEFor returns the inlined CTE reference a column at `at` with
+// source index `src` resolves to, when that reference prints transparently —
+// PG removed the subquery scan (no qual on it, trivial_subqueryscan) — so
+// the column must print as its source inside the body. It returns nil when
+// the column resolves to anything else or to a reference kept as a
+// `Subquery Scan` (a Filter above it). M0146-0021.
+func (nm *explainNames) transparentCTEFor(at optimizer.Node, src int16) *optimizer.CTEScan {
+	if nm == nil || src == 0 {
+		return nil
+	}
+	for n := at; n != nil; n = nm.parent[nodePtr(n)] {
+		rtid, ok := nm.scopeSources(n)[src]
+		if !ok {
+			if p := nm.parent[nodePtr(n)]; p != nil && explainLevelBoundary(p) {
+				return nil
+			}
+			continue
+		}
+		cs, isCTE := nm.nodes[rtid].(*optimizer.CTEScan)
+		if !isCTE || !cs.Inlined() {
+			return nil
+		}
+		if f, isFilter := nm.parent[nodePtr(cs)].(*optimizer.Filter); isFilter {
+			if b, isTrue := f.Predicate.(*optimizer.BooleanConst); !isTrue || !b.Value {
+				return nil
+			}
+		}
+		return cs
+	}
+	return nil
 }
 
 // scopeSources maps SourceTableIdx → RTID for the scans in n's subtree,
@@ -389,6 +425,10 @@ func (nm *explainNames) register(rtid int32, base string, node optimizer.Node) {
 		cols[c.Name] = true
 	}
 	nm.cols[rtid] = cols
+	if nm.nodes == nil {
+		nm.nodes = map[int32]optimizer.Node{}
+	}
+	nm.nodes[rtid] = node
 	nm.bySource[rtid] = claimName(nm.taken, base)
 }
 
@@ -446,6 +486,18 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 // SourceTableIdx, and collect records this value in the bySrc translation
 // alongside the RTID-keyed registration.
 func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
+	// A CTE reference's output schema is the body's; the consumer's own
+	// binding index rides on the node (M0146-0021).
+	switch x := n.(type) {
+	case *optimizer.CTEScan:
+		if x.SourceIdx != 0 {
+			return x.SourceIdx, true
+		}
+	case *optimizer.MaterializedCTEScan:
+		if x.SourceIdx != 0 {
+			return x.SourceIdx, true
+		}
+	}
 	var src int16
 	for _, c := range n.Output() {
 		if c.SourceTableIdx == 0 {

@@ -1766,6 +1766,13 @@ type CTEScan struct {
 	// threaded) and keeps today's rendering. Only explain_names.go will
 	// read this field (a later cut); value and executor paths never do.
 	RTID int32
+	// SourceIdx is the consumer binding's per-level SourceTableIdx — the
+	// value the query's ColumnRefs over this reference carry. The output
+	// schema is the CTE body's and holds the body's own indexes (or none,
+	// after a column-alias rename), so EXPLAIN reads this field to name the
+	// reference's columns by its alias, as PG does (`t_s_firstyear.customer_id`,
+	// M0146-0021). 0 = unknown.
+	SourceIdx int16
 }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -1797,6 +1804,13 @@ type MaterializedCTEScan struct {
 	// threaded) and keeps today's rendering. Only explain_names.go will
 	// read this field (a later cut); value and executor paths never do.
 	RTID int32
+	// SourceIdx is the consumer binding's per-level SourceTableIdx — the
+	// value the query's ColumnRefs over this reference carry. The output
+	// schema is the CTE body's and holds the body's own indexes (or none,
+	// after a column-alias rename), so EXPLAIN reads this field to name the
+	// reference's columns by its alias, as PG does (`t_s_firstyear.customer_id`,
+	// M0146-0021). 0 = unknown.
+	SourceIdx int16
 }
 
 func (n *MaterializedCTEScan) Pos() int       { return n.pos }

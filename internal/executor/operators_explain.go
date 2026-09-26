@@ -856,8 +856,9 @@ func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 // boundary alias than half-chased internals.
 //
 // Chase (expr, node), depth-capped, fail-closed at every step:
-//   - Sort, or Filter whose Predicate carries no sublink, with nout ==
-//     ncout (definitional position preservation, plan.go:1785/:1573):
+//   - Sort, Gather, Gather Merge, or Filter whose Predicate carries no
+//     sublink, with nout == ncout (definitional position preservation,
+//     plan.go:1785/:1573):
 //     step into the child.
 //   - Project (!IsolatedScope — view-rename/unnest boundaries stop and
 //     keep today's text): at chase position j, a bare-ColumnRef target
@@ -869,7 +870,8 @@ func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 //     and renders (ExtractExpr) unless it carries derived inputs;
 //     anything else declines.
 //   - Aggregate (GroupingSets == nil carried over): a group position
-//     recurses into GroupExprs; an Aggs position synthesises via
+//     naming a base-table column stops and renders (a CTE qualifier
+//     declines); any other group position recurses into GroupExprs; an Aggs position synthesises via
 //     synthAggCall — positionally, with NO name check (cross-scope
 //     names never agree: probe-D `c` vs `count`, Q13 `c_count` vs
 //     `count`; the pass-through rename maps already matched names).
@@ -884,7 +886,10 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 	cur := expr
 	for depth := 0; depth < 4; depth++ {
 		switch n := node.(type) {
-		case *optimizer.Sort:
+		case *optimizer.Sort, *optimizer.Gather, *optimizer.GatherMerge:
+			// Row-order and worker boundaries pass their child's columns
+			// through unchanged (M0146-0021: Q77's sr body aggregates over
+			// a Gather Merge).
 			c := childNodeOf(n)
 			if c == nil || len(n.Output()) != len(c.Output()) {
 				return nil, false
@@ -962,6 +967,16 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				g := n.GroupExprs[j]
 				if g == nil || exprHasSubplanOrOuterRef(g) {
 					return nil, false
+				}
+				// A key naming a base table column is the text PG prints;
+				// stop here as the Project arm does, rather than hunting
+				// for a narrowing Project the parallel form lacks
+				// (M0146-0021: Q77's sr body under a Gather Merge).
+				if gc, isCol := g.(*optimizer.ColumnRef); isCol && gc.SourceTableIdx != 0 {
+					if qualifierNamesCTE(reg, gc, cteNames) {
+						return nil, false
+					}
+					return gc, true
 				}
 				cur = g
 				node = n.Child
@@ -2365,6 +2380,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		// (ruleutils.c get_variable's need_prefix): a plain Var is
 		// printed bare on a scan qual and qualified everywhere else
 		// once the query has more than one range-table entry.
+		if qualify {
+			if cs := reg.names().transparentCTEFor(reg.currentNode(), x.SourceTableIdx); cs != nil {
+				if out, ok := formatThroughInlinedCTE(cs, x, reg, qualify); ok {
+					return out
+				}
+			}
+		}
 		return reg.names().columnIn(reg.currentNode(), x.SourceTableIdx, x.Name, qualify)
 	case *optimizer.OuterColumnRef:
 		// A correlated reference is always prefixed, even inside a
@@ -2611,6 +2633,38 @@ func subPlanUsesHashTable(x *optimizer.InExpr, reg *subPlanReg) bool {
 		limit = reg.hashMemLimit
 	}
 	return size <= float64(limit)
+}
+
+// formatThroughInlinedCTE renders a column of a transparent inlined CTE
+// reference as its source inside the body, as PG prints a Var of a removed
+// subquery scan: `WITH x AS (SELECT id FROM va) … x.id` shows `va.id`. The
+// column is matched by name (a duplicated name declines) and chased with
+// resolveKeySource; the result renders in the body's own scope. ok=false
+// keeps the alias-qualified rendering. M0146-0021.
+func formatThroughInlinedCTE(cs *optimizer.CTEScan, col *optimizer.ColumnRef, reg *subPlanReg, qualify bool) (string, bool) {
+	if cs == nil || cs.Child == nil || col == nil || col.Name == "" {
+		return "", false
+	}
+	idx := -1
+	for i, c := range cs.Output() {
+		if c.Name == col.Name {
+			if idx >= 0 {
+				return "", false
+			}
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return "", false
+	}
+	ref := &optimizer.ColumnRef{Index: idx, Name: col.Name, Type: col.Type}
+	src, ok := resolveKeySource(ref, cs.Child, reg)
+	if !ok {
+		return "", false
+	}
+	restore := reg.enter(cs.Child)
+	defer restore()
+	return formatExprQual(src, reg, qualify), true
 }
 
 // explainHashMem is the session's hash_mem in bytes, the limit

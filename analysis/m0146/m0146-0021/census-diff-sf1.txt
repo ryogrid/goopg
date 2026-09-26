@@ -1,0 +1,12 @@
+97c97
+< Q97 depth=2 [join-order] under Aggregate: PG Merge Join Full | goopg Merge Join Full
+---
+> Q97 depth=3 [aggregation-strategy] under Merge Join: PG Group | goopg HashAggregate
+101c101
+< CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=17 parallelism=9 join-method=7 scan-type=7 qual-placement=7 parameterisation=5 error=3 join-order=2
+---
+> CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 parallelism=9 join-method=7 scan-type=7 qual-placement=7 parameterisation=5 error=3 join-order=1
+159c159
+<     1  join-order       under Aggregate        PG Merge Join Full              goopg Merge Join Full              depth=2
+---
+>     1  aggregation-strategy under Merge Join       PG Group                        goopg HashAggregate                depth=3

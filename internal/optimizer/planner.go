@@ -4535,8 +4535,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					pos:    rv.Pos(),
 					Name:   ce.name,
 					Alias:  alias,
-					schema: ce.schema,
-					RTID:   rtid,
+					schema:    ce.schema,
+					RTID:      rtid,
+					SourceIdx: sourceIdx,
 				}
 				return scan, b, nil
 			}
@@ -4552,9 +4553,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Name:   ce.name,
 				Alias:  alias,
 				Child:  ce.body,
-				schema: ce.schema,
-				cte:    ce,
-				RTID:   rtid,
+				schema:    ce.schema,
+				cte:       ce,
+				RTID:      rtid,
+				SourceIdx: sourceIdx,
 			}
 			return scan, b, nil
 		}

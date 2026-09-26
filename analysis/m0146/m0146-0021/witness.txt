@@ -1,0 +1,8 @@
+## Q77 SF0.25 ss LEFT JOIN sr Merge Cond (baseline / candidate / PG)
+baseline: Merge Cond: (s_store_sk = s_store_sk)
+candidate: Merge Cond: (store.s_store_sk = store_1.s_store_sk)
+candidate-pg: Merge Cond: (store.s_store_sk = store_1.s_store_sk)
+## Q74 SF0.25 first CTE-column condition (baseline / candidate / PG)
+baseline: Merge Cond: (customer_id = customer_id)
+candidate: Merge Cond: (t_s_secyear.customer_id = t_s_firstyear.customer_id)
+candidate-pg: Merge Cond: (t_s_secyear.customer_id = t_c_secyear.customer_id)

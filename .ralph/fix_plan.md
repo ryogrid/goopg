@@ -21744,6 +21744,24 @@ M0146-0001 re-baseline census on the new default arm.
     - Q78 prints no `Subquery Scan`; its SF0.25 record moves from
       join\-order to qual\-placement at the same node; all gates pass.
   Movement: TPC\-DS Q78 ws residual qual moves onto the inner Index Scan
+- [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
+  them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
+  `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).
+  Kind: impl
+  Parent: M0146\-0007
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0021\-cte\-column\-qualification.md`;
+    evidence `analysis/m0146/m0146\-0021/`.
+    - `CTEScan` / `MaterializedCTEScan` carry `SourceIdx`, so a kept
+      reference qualifies by its alias; an inlined, transparently rendered
+      reference chases to the body's source column \(`transparentCTEFor`,
+      `formatThroughInlinedCTE`\).
+    - `resolveKeySource` steps through Gather / Gather Merge and stops at a
+      base\-table grouping key.
+    - Q97 moves past its Merge Join \(SF0.25 and SF1\); rendering records
+      29 → 25 \(SF0.25\), 29 → 23 \(SF1\); all gates pass.
+  - Open: derived\-table output chase \(Q46/Q68 `bought_city`\) — ledgered.
+  Movement: TPC\-DS Q97 depth 2 → 3 \(SF0.25, SF1\); Q74/Q31/Q77 condition text matches PG
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the
