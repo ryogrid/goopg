@@ -1,0 +1,49 @@
+DPPATH path producer=gather relids={0} kind=11 reqouter=- rows=57340 startup=1000 total=40537.06451612903 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=448 inputtotal=33803.06451612903
+DPPATH path producer=gather.merge relids={0} kind=12 reqouter=- rows=57340 startup=1000.415 total=82085.75021457598 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=448 inputtotal=74348.26021457597
+DPPATH path producer=gather relids={1} kind=11 reqouter=- rows=2000663 startup=1000 total=335115.5125 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=550 inputtotal=134049.2125
+DPPATH path producer=gather.merge relids={1} kind=12 reqouter=- rows=2000663 startup=1000.4330482023722 total=479817.54175362864 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer=- inner=- width=550 inputtotal=240519.2330649181
+DPPGHASH outer={0} inner={1} mapentry=910.00 mapbuckets=2097152 mapbatches=2 mapspill=true pgouterwidth=448 pginnerwidth=550 pgtuplebytes=584 pgbuckets=2097152 pgbatches=2 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=15447 startup=438568.1375 total=709616.147016129 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=40537.06451612903
+DPPATH partial producer=join.hash.partial.parallelhash relids={0,1} kind=3 reqouter=- rows=4983 startup=140301.2875 total=174292.90951612903 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=33803.06451612903
+DPPGHASH outer={0} inner={1} mapentry=910.00 mapbuckets=2097152 mapbatches=2 mapspill=true pgouterwidth=448 pginnerwidth=550 pgtuplebytes=584 pgbuckets=2097152 pgbatches=2 pgouterpages=- pginnerpages=- pgspill=false currency=map
+DPPATH partial producer=join.hash.partial relids={0,1} kind=3 reqouter=- rows=4983 startup=437568.1375 total=696604.093266129 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=33803.06451612903
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=15447 startup=1000 total=1.4132338512185924e+09 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=40537.06451612903
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=15447 startup=0 total=1.4132423591540763e+09 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=49045
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=15447 startup=0.375 total=1.4132829043497748e+09 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=89590.19569844694
+DPPATH path producer=join.nestloop relids={0,1} kind=5 reqouter=- rows=15447 startup=1000.415 total=1.4132753999042907e+09 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=82085.75021457598
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=1000.375 total=171540.0157157799 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=40537.06451612903
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=1000.375 total=442394.29660323524 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=40537.06451612903
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=0.375 total=180047.9511996509 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=49045
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=0.375 total=450902.23208710615 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=49045
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=0.75 total=220593.14689809785 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=89590.19569844694
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=0.75 total=491447.4277855531 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=89590.19569844694
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=1000.79 total=213088.7014142269 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=82085.75021457598
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=15447 startup=1000.79 total=483942.9823016821 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=82085.75021457598
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0 total=4.5603977556788874e+08 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=33803.06451612903
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0.375 total=76062.63609042476 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0} inner={1} width=448 inputtotal=33803.06451612903
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0.375 total=163435.80289212594 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=33803.06451612903
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0.375 total=4.560803207635872e+08 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=74348.26021457597
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0.75 total=116607.8317888717 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=74348.26021457597
+DPPATH partial producer=join.nestloop.partial relids={0,1} kind=5 reqouter=- rows=4983 startup=0.75 total=203980.99859057288 disabled=0 pathkeys=0 verdict=dominated jointype=semi outer={0} inner={1} width=448 inputtotal=74348.26021457597
+DPTRACE problem nrels=2 rels=orders,lineitem
+DPTRACE pair phase=1 lev=2 created=1 pair={lineitem} | {orders} outer={orders} inner={lineitem}
+DPTRACE cost lev=2 rel={lineitem+orders} rows=15447 npaths=2 cheapest=nli reqouter={} total=171540.0157157799 second=nli secondtotal=180047.9511996509
+DPTRACE cpadmit src=base rel={orders} cp=1 leaf=seq
+DPTRACE cpadmit src=base rel={lineitem} cp=1 leaf=seq
+DPTRACE cpadmit src=join rel={lineitem+orders} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+DPTRACE cpgather rel={orders} partials=2 verdict=admitted
+DPTRACE cpgather rel={lineitem} partials=2 verdict=admitted
+DPTRACE cpgather rel={lineitem+orders} partials=1 verdict=admitted
+DPTRACE appendrel rel={orders} verdict=unmarked
+DPTRACE appendrel rel={lineitem} verdict=unmarked
+DPTRACE pveto site=base rel={orders} dir=- veto=admitted detail=leaf=seq workers=3
+DPTRACE pveto site=base rel={lineitem} dir=- veto=admitted detail=leaf=seq workers=4
+DPTRACE pveto site=hash rel={lineitem+orders} dir={orders}+{lineitem} veto=PH-filed detail=phash jt=SEMI
+DPTRACE pveto site=hash rel={lineitem+orders} dir={orders}+{lineitem} veto=V9 detail=jt=SEMI workers=3
+DPTRACE end top={lineitem+orders} pairs=1 declined=0 costs=1 status=ok
+GROUPTRACE source=base index=3 name=o_orderpriority table=orders col=o_orderpriority ndistinct=5 rawrows=1.5e+06
+GROUPTRACE relation=*optimizer.SeqScan tableoid=16409 attnum=4 vars=1 tuples=1.5e+06 filtered=57339 ndistinct=5
+DPPGSORT caller=sortpath inputrows=15447 tuples=15447 output=15447 limit=-1 width=72 goopginput=2.10079e+06 goopgoutput=2.10079e+06 pginput=1.48291e+06 pgoutput=1.48291e+06 goopgbranch=memory pgbranch=memory currency=goopg
+DPPATH path producer=upper.groupagg.sort relids=- kind=6 reqouter=- rows=5 startup=172769.20375723287 total=172885.11875723288 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=72 inputtotal=172807.8212572329
+DPPATH path producer=upper.groupagg.hashed relids=- kind=6 reqouter=- rows=5 startup=171771.7107157799 total=171771.7732157799 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=72 inputtotal=171694.4757157799
+DPTRACE upper gate=agg-upper verdict=refused gate=subtree subtree=gathered

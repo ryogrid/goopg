@@ -21203,7 +21203,7 @@ M0146-0001 re-baseline census on the new default arm.
   Movement: none on corpus instruments \(canonical regress shape
   converted — the intended artifact\)\.
 
-- [ ] **M0146\-0002a — category regressions from the Parallel Hash arm**
+- [x] **M0146\-0002a — category regressions from the Parallel Hash arm**
   \(measured 2026\-09\-24 at slice 2, TPC\-H parallel lane\): Q12 gains
   join\-method, join\-order and scan\-type; Q21 gains join\-method; Q4 trades
   aggregation\-strategy/join\-order for join\-method/scan\-type.
@@ -21215,6 +21215,65 @@ M0146-0001 re-baseline census on the new default arm.
     Parallel Hash election is where PG differs or exposes an older
     divergence. Expected movement: the join\-method category back to 11 on
     TPC\-H if the elections are corrected.
+  - **DONE 2026\-09\-27 \(recon, no code\).** Design:
+    `docs/design/0100\-0149/m0146\-0002a\-parallel\-hash\-arm\-regressions.md`;
+    evidence `analysis/m0146/m0146\-0002a/` \(canonical captures \+ live DP
+    trace on the :5533 clone \+ relpages vs PG\).
+    - **The arm elects correctly on all three queries.** Two distinct
+      causes carry the categories:
+    - **Q4**: the parameterized\-probe partial NL SEMI IS filed and
+      costs 76062 \(≈ PG's 68894\) — it dominates the PHSJ \(174292\) in
+      the partial pathlist, then `partialPathDrivingKind` refuses it
+      \(parameterized inner requires `JoinInner`\) and `makeGatherPath`
+      reads head\-only → no joinrel Gather → serial NL over
+      `Gather\(orders\)`. The R94 filed\-at\-head starvation case, live.
+      → M0146\-0002i.
+    - **Q21**: the ANTI probe never exists — producer refuses jt=ANTI
+      \(`joinpathsnli.go:465`, `V1\-nl\-inner` traced 12× incl. the exact
+      PG outer set `{l1+orders+supplier}+{l3}`\) → the NL Anti sits above
+      the Gather probing 39277 rows where PG probes per worker inside.
+      → M0146\-0002j.
+    - **Q12**: goopg's heap packs smaller \(orders 26545 vs PG 27814,
+      lineitem 115293 vs 129346 pages\) → seqscan disk cost and
+      `compute_parallel_worker` counts differ under PG\-faithful
+      formulas \(orders 3 vs 4 workers straddles the ×3 threshold\);
+      PHJ \(184617\) legitimately beats the NL \(~195k\) under goopg's
+      real pages while PG's NL \(190868\) wins under its larger heap.
+      Boundary, not a planner defect — ledgered.
+    Movement: none — recon.
+- [ ] **M0146\-0002i — parameterized\-probe partial nested loop under
+  SEMI** \(filed 2026\-09\-27 by M0146\-0002a on TPC\-H Q4\). The producer
+  already files it \(`addPartialNestLoopPaths` admits SEMI\); the filed
+  probe is undrivable and starves admissible siblings at the partial
+  pathlist head. Widen the two downstream gates per R94's
+  together\-or\-not\-at\-all rule: `partialPathDrivingKind`'s
+  parameterized\-inner arm \(refuses `Jointype != JoinInner`\) and
+  `lateralProbeJoinIsPartialCapable` / executor twin
+  `lateralProbeJoinPartial` \(parallel\_scan.go:107\). Verdict is
+  per\-outer\-row and worker\-local — the same argument the file already
+  makes for whole\-inner SEMI \(finishOuter on first match\).
+  Kind: impl
+  Parent: M0146-0002a
+  - Expected movement: TPC\-H Q4's join spine becomes PG's — `NL Semi`
+    inside the Gather over `PSeq orders` with the lineitem index probe
+    per worker \(cost ~76k vs current 172k serial\-above\-gather\);
+    `join\-order` clears, `sort\-strategy`/`parallelism` likely follow
+    \(partial\-agg/Gather\-Merge upper still M0146\-0003/0025\).
+    Pin with a parallel\-vs\-serial row\-identity test under `\-race`
+    \(workers 1/2/4\) and measure on the canonical TPC\-H capture.
+- [ ] **M0146\-0002j — parameterized\-probe partial nested loop under
+  ANTI** \(filed 2026\-09\-27 by M0146\-0002a on TPC\-H Q21\). Same three\-gate
+  widening as M0146\-0002i PLUS the producer gate
+  \(`joinpathsnli.go:465` `jt != Inner && jt != Semi` → admit ANTI\).
+  The anti verdict is worker\-local \(emit outer iff no inner match;
+  whole\-inner ANTI partial already proven by
+  `TestParallelLeftAntiNestedLoopIdentity`\). Land with or after
+  M0146\-0002i — same code sites, keep the attribution separate.
+  Kind: impl
+  Parent: M0146-0002a
+  - Expected movement: TPC\-H Q21's `NL Anti` inside the Gather probing
+    l3's index per worker — `join\-order`/`qual\-placement`/`parallelism`
+    categories; measured on the canonical capture.
 - [ ] **M0146-0003 — row-emitting PartialAgg** (impl; adopts the filed
   M0141-S3→S4→S5→S6 chain as its slices). Convert Partial Aggregate from
   the zero-row shared-accumulator model to one that emits real partial
