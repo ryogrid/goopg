@@ -205,13 +205,31 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// `ParallelStatementOK` is the top-level statement's shape (a bare SELECT,
 	// not a DML/DDL/utility statement and not a nested planning scope); the
 	// per-node refusals are `subtreeHasUnsafeNode`'s.
-	if !ps.ParallelStatementOK || !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+	if !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
 		traceUpperGate("agg-upper", "refused", "gate=statement")
 		return nil
 	}
 	if grouped == nil || seed == nil || aggNode == nil || child == nil {
 		traceUpperGate("agg-upper", "refused", "gate=nil-arg")
 		return nil
+	}
+	// A nested planning scope (a subquery leaf, TPC-DS Q90's `am` / `pm`)
+	// may still split an aggregate whose input the search already put under
+	// a Gather: Aggregate(Gather(X)) becomes Finalize(Gather(Partial(X))),
+	// which moves the aggregation below the EXISTING Gather and introduces
+	// no new parallel section — PG plans exactly this inside a subquery
+	// (create_partial_grouping_paths runs per query level). Without that
+	// Gather, a nested scope keeps the statement-level refusal, because a
+	// NEW Gather there could land under another parallel-aware node. A
+	// correlated body (a sublink whose input reads the outer query) is never
+	// split either: its outer values are PARAM_EXEC params, which make it
+	// parallel-restricted in PG, and the unnest pass decorrelates its
+	// aggregate as a plain Aggregate. M0146-0003a.
+	if !ps.ParallelStatementOK {
+		if _, ok := gatherToUnwrapForPartialAgg(child); !ok || planHasOuterRef(child) {
+			traceUpperGate("agg-upper", "refused", "gate=statement")
+			return nil
+		}
 	}
 	// The subtree must be one a worker can execute, must not already carry a
 	// Gather (C-19d's coexistence rule, here as a generation refusal rather

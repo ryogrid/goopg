@@ -1,0 +1,5 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+arm on: values identical to baseline tmp/m0145-0008m/arm-on.txt — PASS
+TPC-H census identical
+regress 41 WITH/plan pass-required cases: identical to a HEAD (3cea6eb69) worktree

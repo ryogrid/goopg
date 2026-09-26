@@ -1,0 +1,6 @@
+CATEGORIES-EXCL-MATCH: join-order=77 join-method=47 scan-type=50 parameterisation=31 aggregation-strategy=36 sort-strategy=61 parallelism=69 qual-placement=26 rendering=30
+CATEGORIES-EXCL-MATCH: join-order=76 join-method=45 scan-type=50 parameterisation=31 aggregation-strategy=34 sort-strategy=55 parallelism=63 qual-placement=26 rendering=29
+FIRE-SET-TIMEOUTS: fires=Q21 Q23 Q28 Q34 Q39 Q44 Q46 Q61 Q65 Q66 Q67 Q68 Q73 Q79 Q88 Q89 Q90 introduced=none unchanged=none missing=none
+CATEGORIES-EXCL-MATCH: join-order=80 join-method=56 scan-type=54 parameterisation=44 aggregation-strategy=40 sort-strategy=64 parallelism=73 qual-placement=24 rendering=30
+CATEGORIES-EXCL-MATCH: join-order=80 join-method=55 scan-type=54 parameterisation=44 aggregation-strategy=38 sort-strategy=59 parallelism=70 qual-placement=24 rendering=29
+FIRE-SET-TIMEOUTS: fires=Q21 Q28 Q34 Q39 Q44 Q46 Q61 Q65 Q66 Q67 Q68 Q73 Q79 Q88 Q89 Q90 introduced=none unchanged=none missing=none

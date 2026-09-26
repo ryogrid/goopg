@@ -505,3 +505,32 @@ func TestR56GatherMergeArmFiledAndEvictsLeaderSort(t *testing.T) {
 			gmArm.Cost, gm.Cost, ws.Cost)
 	}
 }
+
+// TestUpperSplitInNestedScopeNeedsExistingGather pins M0146-0003a: a nested
+// planning scope (ParallelStatementOK false — a subquery leaf such as TPC-DS
+// Q90's `am`) splits an aggregate whose input the search already put under a
+// Gather, because Finalize(Gather(Partial(X))) only moves the aggregation
+// below that Gather; without one, the statement-level refusal stands, since a
+// NEW Gather there could land under another parallel-aware node.
+func TestUpperSplitInNestedScopeNeedsExistingGather(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	ps.ParallelStatementOK = false
+
+	bare := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	if _, split := addSplitFor(t, bare, ps); split != nil {
+		t.Error("nested scope without a Gather must keep the statement-level refusal")
+	}
+
+	gathered := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	gathered.Child = NewGather(0, gathered.Child, 2)
+	_, split := addSplitFor(t, gathered, ps)
+	if split == nil {
+		t.Fatal("nested scope over an existing Gather must offer the Finalize->Gather->Partial split")
+	}
+	if len(split.Children) != 1 || split.Children[0].Kind != PathGather {
+		t.Fatal("split candidate is not Finalize over Gather")
+	}
+}

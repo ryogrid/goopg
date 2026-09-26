@@ -21087,6 +21087,22 @@ M0146-0001 re-baseline census on the new default arm.
   re-evaluated on the canonical capture.
   Kind: impl
   Parent: M0137-0019a
+  - 2026\-09\-26: slice M0146\-0003a \(below\) landed the nested\-scope split;
+    the row\-emitting partial chain \(M0141\-S3 → S6\) remains.
+- [x] **M0146\-0003a — a subquery\'s aggregate splits over the Gather the
+  search placed** \(filed and done 2026\-09\-26 from the census:
+  `PG Finalize Aggregate | goopg Aggregate`\).
+  Kind: impl
+  Parent: M0146\-0003
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0003a\-nested\-scope\-partial\-agg.md`;
+    evidence `analysis/m0146/m0146\-0003a/`.
+    - `addPartialAggSplitPath` in a nested scope splits
+      Aggregate\(Gather\(X\)\) → Finalize\(Gather\(Partial\(X\)\)\) when the
+      Gather exists and the input is uncorrelated.
+    - TPC\-DS Q88/Q90 MATCH \(SF0.25\), Q90 MATCH \(SF1\); sort\-strategy
+      61 → 55, parallelism 69 → 63 \(SF0.25\); all gates pass.
+  Movement: TPC\-DS Q88 Q90 → MATCH \(SF0.25\), Q90 → MATCH \(SF1\), Q88 SF1 depth 7 → 10
 - [ ] **M0146-0004 — per-worker Memoize + Gather-over-Memoize
   admission** (impl; M0142-0005 resume option (a), owner disposition
   2026-09-23). Executor: `nodeMemoize.c`'s `parallel_worker_number`-keyed
