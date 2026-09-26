@@ -1491,6 +1491,29 @@ type Aggregate struct {
 	// clone that drops the stamp reads as unknown, the safe direction).
 	InputTarget      []int
 	InputTargetKnown bool
+
+	// PartialGroup marks the per-worker dedup node of the parallel
+	// `Group -> Gather Merge -> Group` shape (M0146-0025): an
+	// aggregate-free GROUP BY split where each worker dedups its own
+	// partition and the leader-side final Group re-dedups the merge —
+	// PostgreSQL's `create_group_path` inside
+	// `create_partial_grouping_paths` (planner.c:7570), which the
+	// zero-row Partial/Finalize model cannot express (a group-only node
+	// has no transition state to merge).
+	//
+	// The flag is what lets the driving-scan walks descend THROUGH this
+	// node to the scan below: a marked node promises a leader-side
+	// re-grouping consumes its output, so partitioning its input is the
+	// intended semantics — not the `count(*) over (SELECT DISTINCT …)`
+	// over-count an UNMARKED dedup would produce if the same walks
+	// descended through it inside a candidate partial subtree. The
+	// planner emits it only from addPartialAggSplitPath's group-only
+	// arm; the executor runs it as the ordinary AggModeSimple sorted
+	// dedup it is, and EXPLAIN prints `Group`.
+	//
+	// Read ONLY by drivingScan / stampParallelScan /
+	// unstampParallelScan / drivingScanCrossesSort (parallel.go).
+	PartialGroup bool
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output

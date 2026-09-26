@@ -534,3 +534,187 @@ func TestUpperSplitInNestedScopeNeedsExistingGather(t *testing.T) {
 		t.Fatal("split candidate is not Finalize over Gather")
 	}
 }
+
+// ── M0146-0025: partial Group arm (aggregate-free GROUP BY) ────────────────
+//
+// PG's create_partial_grouping_paths files create_group_path partial paths
+// for !hasAggs (planner.c:7570): Group -> Gather Merge -> Group -> Sort.
+// goopg's zero-row Partial/Finalize model cannot express it, so the arm
+// files an ORDINARY sorted dedup once per worker — admitted only under the
+// PartialGroup marker that lets the driving-scan walks see through it.
+
+// partialGroupChain digs `Group -> Gather Merge -> Group -> Sort` out of a
+// filed path, returning nil at the first wrong link.
+func partialGroupChain(p *Path) (gm, partial, workerSort *Path) {
+	if p == nil || p.Kind != PathAgg || p.AggStrategy != AggStrategySorted {
+		return nil, nil, nil
+	}
+	if p.Agg == nil || p.Agg.PartialGroup {
+		return nil, nil, nil
+	}
+	if len(p.Children) != 1 || p.Children[0].Kind != PathGatherMerge {
+		return nil, nil, nil
+	}
+	gm = p.Children[0]
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathAgg {
+		return nil, nil, nil
+	}
+	partial = gm.Children[0]
+	if partial.Agg == nil || !partial.Agg.PartialGroup {
+		return nil, nil, nil
+	}
+	if len(partial.Children) != 1 || partial.Children[0].Kind != PathSort {
+		return nil, nil, nil
+	}
+	workerSort = partial.Children[0]
+	return gm, partial, workerSort
+}
+
+func TestPartialGroupArmFilesThePGShape(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("aggregate-free GROUP BY produced no parallel candidate")
+	}
+	gm, partial, workerSort := partialGroupChain(split)
+	if gm == nil {
+		t.Fatal("candidate is not Group -> Gather Merge -> Group -> Sort")
+	}
+	if partial.ParallelWorkers <= 0 || workerSort.ParallelWorkers <= 0 {
+		t.Fatal("worker-side Group/Sort carry no planned workers")
+	}
+	if len(gm.Pathkeys) == 0 || len(partial.Pathkeys) == 0 {
+		t.Fatal("the merge carries no pathkeys; the boundary is not ordered")
+	}
+	// The final spec's keys must be rewritten to the partial output's own
+	// positions — PG's setrefs OUTER_VAR step for the leader Group.
+	for i, e := range split.Agg.GroupExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Index != i {
+			t.Fatalf("final GroupExprs[%d] = %#v, want ColumnRef at partial output position %d", i, e, i)
+		}
+	}
+	// The partial spec keeps input-coordinate keys and the marker.
+	if cr, ok := partial.Agg.GroupExprs[0].(*ColumnRef); !ok || cr.Index != 0 {
+		t.Fatalf("partial GroupExprs[0] = %#v, want input-coordinate ColumnRef", partial.Agg.GroupExprs[0])
+	}
+	if len(grouped.Pathlist) == 0 {
+		t.Fatal("no path filed on the grouped rel")
+	}
+}
+
+func TestPartialGroupArmRefusals(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	t.Run("expression key", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 1)
+		agg.GroupExprs[0] = &FuncCall{Name: "lower", Args: []Expr{agg.GroupExprs[0]}}
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("an expression group key must not admit the partial-Group arm")
+		}
+	})
+	t.Run("passthrough", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 1)
+		agg.Passthrough = []Expr{&ColumnRef{Index: 2, Name: "v"}}
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("a passthrough column must not admit the partial-Group arm")
+		}
+	})
+	t.Run("no group keys", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 0)
+		if _, split := addSplitFor(t, agg, upperSplitSettings()); split != nil {
+			t.Fatal("an ungrouped aggregate-free query admits no parallel candidate")
+		}
+	})
+	t.Run("aggregate calls keep the split arm only", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 1, 2)
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("an aggregate call must never take the partial-Group arm")
+		}
+	})
+}
+
+// TestPartialGroupWalkAgreement pins the sibling contract: drivingScan,
+// stampParallelScan, unstampParallelScan and drivingScanCrossesSort admit
+// exactly the producer-marked partial Group and treat every other aggregate
+// as a wall.
+func TestPartialGroupWalkAgreement(t *testing.T) {
+	scan := sizedAggFixture(t, 100, 4, 0, 1).Child
+	marked := &Aggregate{Child: scan, PartialGroup: true}
+	unmarked := &Aggregate{Child: scan}
+
+	if got := drivingScan(marked); got != Node(scan) {
+		t.Fatalf("drivingScan(marked) = %#v, want the scan", got)
+	}
+	if got := drivingScan(unmarked); got != nil {
+		t.Fatalf("drivingScan(unmarked) = %#v, want nil — an ordinary dedup is a wall", got)
+	}
+
+	stamped := stampParallelScan(marked)
+	st, ok := stamped.(*Aggregate)
+	if !ok {
+		t.Fatalf("stampParallelScan returned %T, want *Aggregate", stamped)
+	}
+	if s, ok := st.Child.(*SeqScan); !ok || !s.Parallel {
+		t.Fatal("stampParallelScan did not reach the scan under the marked partial Group")
+	}
+	if got := stampParallelScan(unmarked); got != Node(unmarked) {
+		t.Fatal("stampParallelScan descended through an unmarked aggregate")
+	}
+
+	unstamped := unstampParallelScan(st)
+	ut := unstamped.(*Aggregate)
+	if s, ok := ut.Child.(*SeqScan); !ok || s.Parallel {
+		t.Fatal("unstampParallelScan did not strip the label under the marked partial Group")
+	}
+	if !drivingScanCrossesSort(&Aggregate{PartialGroup: true, Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort must see the Sort under the marked partial Group")
+	}
+	if drivingScanCrossesSort(&Aggregate{Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort descended through an unmarked aggregate")
+	}
+}
+
+// TestPartialGroupLowering runs the filed path through createPlanNode and
+// pins the emitted node chain: leader Group -> Gather Merge -> per-worker
+// marked Group -> Sort -> Parallel SeqScan.
+func TestPartialGroupLowering(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
+	_, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("no candidate")
+	}
+	n, _ := createPlanNode(split)
+	leader, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	partial, ok := gm.Child.(*Aggregate)
+	if !ok || !partial.PartialGroup {
+		t.Fatalf("merge child is %T (PartialGroup=%v), want marked *Aggregate", gm.Child, partial != nil && partial.PartialGroup)
+	}
+	if _, ok := partial.Child.(*Sort); !ok {
+		t.Fatalf("partial child is %T, want *Sort", partial.Child)
+	}
+	scan := drivingScan(gm.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan — the walks disagree with the producer")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
+	}
+}

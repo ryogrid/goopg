@@ -192,6 +192,156 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 	return nil, false
 }
 
+// spliceGatherOnPartialSpine removes ONE Gather / Gather Merge the JOIN
+// SEARCH placed inside the input subtree, found along `drivingScan`'s own
+// descent path — pass-through wrappers and the probe side of partial-capable
+// joins, arm for arm. It is the M0146-0025 second route: under
+// `GOOPG_GATHER_PATHS=all` the search may elect a Gather INSIDE the input
+// (TPC-DS Q37/Q82's `NL(Gather(…), idx)`), which the shared subtree guard
+// then refuses on. PG's answer is different — the partial grouping path
+// consumes input_rel->partial_pathlist, the same subtree with the workers
+// doing the WHOLE join and the driving scan partitioned — and the spliced
+// child is exactly that: a Gather is row-transparent, so removing the
+// boundary and partitioning the new driving scan reproduces the gathered
+// subtree's rows one partition per worker.
+//
+// Off-spine gathers (a join build side, a SetOp branch) are never spliced:
+// the post-splice `subtreeHasGather` re-check refuses them, fail-closed.
+// An unmarked Aggregate declines like drivingScan does; a node kind with no
+// driving-scan arm declines too, so the splice can never descend a walk the
+// stamping siblings would not follow.
+func spliceGatherOnPartialSpine(n Node) (Node, bool) {
+	switch x := n.(type) {
+	case *Gather:
+		if x.Child == nil {
+			return nil, false
+		}
+		return x.Child, true
+	case *GatherMerge:
+		if x.Child == nil {
+			return nil, false
+		}
+		return x.Child, true
+	case *Filter:
+		if c, ok := spliceGatherOnPartialSpine(x.Child); ok {
+			cc := *x
+			cc.Child = c
+			return &cc, true
+		}
+	case *Project:
+		if c, ok := spliceGatherOnPartialSpine(x.Child); ok {
+			cc := *x
+			cc.Child = c
+			return &cc, true
+		}
+	case *Sort:
+		if c, ok := spliceGatherOnPartialSpine(x.Child); ok {
+			cc := *x
+			cc.Child = c
+			return &cc, true
+		}
+	case *Aggregate:
+		// The marked partial dedup is the only aggregate the spine crosses —
+		// drivingScan's arm, verbatim.
+		if !x.PartialGroup {
+			return nil, false
+		}
+		if c, ok := spliceGatherOnPartialSpine(x.Child); ok {
+			cc := *x
+			cc.Child = c
+			return &cc, true
+		}
+	case *Join:
+		if !hashJoinIsPartialCapable(x) && !mergeJoinIsPartialCapable(x) && !nestedLoopJoinIsPartialCapable(x) && !lateralProbeJoinIsPartialCapable(x) {
+			return nil, false
+		}
+		if nestedLoopJoinIsPartialCapable(x) || lateralProbeJoinIsPartialCapable(x) || joinProbeSideIsLeft(x) {
+			if c, ok := spliceGatherOnPartialSpine(x.Left); ok {
+				cc := *x
+				cc.Left = c
+				return &cc, true
+			}
+			return nil, false
+		}
+		if c, ok := spliceGatherOnPartialSpine(x.Right); ok {
+			cc := *x
+			cc.Right = c
+			return &cc, true
+		}
+	case *NestedLoopIndexJoin:
+		if !NestedLoopIndexJoinIsPartialCapable(x) {
+			return nil, false
+		}
+		if c, ok := spliceGatherOnPartialSpine(x.Outer); ok {
+			cc := *x
+			cc.Outer = c
+			return &cc, true
+		}
+	}
+	return nil, false
+}
+
+// addPartialGroupOnlyPath is the second-route entry spliceGatherOnPartialSpine
+// feeds: the shared subtree guard refused on a search-placed Gather inside
+// the input, the splice removed it, and the partial-Group arm is the only
+// candidate this route files — the other arms' boundary would land on a
+// gathered subtree their costing never modelled. The producer preamble runs
+// here on the SPLICED child so workers, divisor and group counts measure the
+// subtree the plan actually executes per worker.
+func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
+	workers := upperSplitWorkers(child, cp, ps)
+	if workers <= 0 {
+		traceUpperGate("agg-upper", "refused", "gate=workers route=partialgroup")
+		return nil
+	}
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	if d <= 1 {
+		traceUpperGate("agg-upper", "refused", "gate=divisor route=partialgroup workers="+strconv.Itoa(workers))
+		return nil
+	}
+	inputRows := seed.Rows
+	if inputRows < 1 {
+		inputRows = 1
+	}
+	perWorkerRows := inputRows / d
+	partialGroups := float64(estimateNumGroups(aggNode.GroupExprs, child, int64(perWorkerRows)))
+	if perWorkerRows >= 1 && partialGroups > perWorkerRows {
+		partialGroups = perWorkerRows
+	}
+	if partialGroups < 1 {
+		partialGroups = 1
+	}
+	finalGroups := grouped.Rows
+	if finalGroups < 1 {
+		finalGroups = 1
+	}
+	partialRel := fetchUpperRel(u, UpperPartialGroupAgg, 0, 0)
+	partialRel.Rows = partialGroups
+	partialRel.Width, partialRel.NCols, partialRel.AvgVarBytes = grouped.Width, grouped.NCols, grouped.AvgVarBytes
+	partialRel.ConsiderParallel = true
+	pseed := newPrebuiltPath(partialRel, child)
+	pseed.Rows = perWorkerRows
+	pseed.Cost = parallelSeedCost(seed.Cost, d)
+	pseed.ParallelSafe = true
+	pseed.ParallelWorkers = workers
+	// The B-01c input target was derived against the ORIGINAL gathered
+	// child — stale in provenance after the splice, exactly the
+	// gatherToUnwrapForPartialAgg case: clear it so a clone reads
+	// "unknown", the stamp's own safe direction.
+	unwrapped := *aggNode
+	unwrapped.InputTarget = nil
+	unwrapped.InputTargetKnown = false
+	keyRefs, ok := partialGroupKeyRefs(&unwrapped)
+	if !ok {
+		traceUpperGate("agg-upper", "refused", "gate=keys route=partialgroup")
+		return nil
+	}
+	inNcols, inAvgVar := aggInputWidth(child, &unwrapped)
+	return addPartialGroupArm(grouped, partialRel, pseed, &unwrapped, keyRefs, cp,
+		workers, d, perWorkerRows, partialGroups, finalGroups,
+		len(aggNode.GroupExprs), inNcols, inAvgVar)
+}
+
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
 	if partialAggPathsMode != partialAggPathsOn {
 		// R54 Step-0: upper-rel refusal record. Gate name "agg-upper" keeps
@@ -290,6 +440,21 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// relation and return N+1 copies of every row.
 	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
 	if unsafe || gathered || noScan {
+		// M0146-0025's second route: the PARTIAL-GROUP arm alone retries on
+		// a child whose Gather is spliced out along the driving spine (the
+		// helper's own comment carries why that is the subtree PG hands
+		// create_partial_grouping_paths). The retry is scoped three ways:
+		// top-level statements only (a nested scope may not introduce a NEW
+		// parallel boundary), aggregate-free grouping only (the split arm's
+		// boundary lands on the gathered subtree its costing modelled and
+		// stays refused), and the spliced child must pass the same three
+		// checks — unsafe, gathered, no-driving-scan — verbatim.
+		if ps.ParallelStatementOK && len(aggNode.Aggs) == 0 && aggNode.GroupingSets == nil && len(aggNode.GroupExprs) > 0 {
+			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
+				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				return addPartialGroupOnlyPath(u, grouped, seed, aggNode, gc, cp, ps)
+			}
+		}
 		traceUpperGate("agg-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return nil
 	}
@@ -360,6 +525,34 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
 			workers, d, perWorkerRows, partialGroups, finalGroups,
 			nGroupCols, nAggs, inNcols, inAvgVar, strategy)
+	}
+
+	// ── the PARTIAL GROUP arm (aggregate-free GROUP BY only) ────────────
+	//
+	// PG's `create_partial_grouping_paths` files `create_group_path`
+	// partial paths for `!hasAggs` (planner.c:7570): each worker sorts its
+	// share and dedups it, `gather_grouping_paths` (planner.c:7704) puts a
+	// Gather Merge over the sorted streams, and a final Group collapses
+	// the merge — `Group -> Gather Merge -> Group -> Sort`, the shape
+	// TPC-DS Q37/Q82 take at both scales.
+	//
+	// goopg's zero-row Partial/Finalize model cannot express it — a
+	// group-only node has no transition state to merge, which is why
+	// `aggregateSplitIsSafe` refuses nAggs == 0 above — and does not need
+	// to: the partial Group is an ORDINARY sorted dedup run once per
+	// worker, which every worker subtree already knows how to execute.
+	// The `PartialGroup` marker on its spec is the only thing that lets
+	// the driving-scan walks descend through an aggregate to the scan
+	// (parallel.go): it states the leader-side Group re-dedups what the
+	// merge returns, so partitioning the input is the intended
+	// semantics, not the `count(*) FROM (SELECT DISTINCT …)` over-count
+	// an unmarked dedup would produce.
+	if nAggs == 0 && aggNode.GroupingSets == nil && nGroupCols > 0 {
+		if keyRefs, ok := partialGroupKeyRefs(aggNode); ok {
+			split = addPartialGroupArm(grouped, partialRel, pseed, aggNode, keyRefs, cp,
+				workers, d, perWorkerRows, partialGroups, finalGroups,
+				nGroupCols, inNcols, inAvgVar)
+		}
 	}
 
 	// ── the GATHERED NO-SPLIT arm ───────────────────────────────────────────
@@ -513,6 +706,122 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 // Finalize->Gather->Partial candidate, "nosplit" files only the gathered
 // no-split arms (an unsplittable aggregate still admits the round — cost
 // adjudication downstream decides, not this producer).
+// partialGroupMergeProducer is the M0146-0025 partial-Group arm's DPPATH
+// trace string: `producer=upper.groupagg.partialgroup relids=-`. The
+// partial path itself files under partialAggPartialProducer — it is a
+// partial path on the partially-grouped rel either way.
+const partialGroupMergeProducer = "upper.groupagg.partialgroup"
+
+// partialGroupKeyRefs rewrites each group key as a reference to the partial
+// group's own output column — position j of its output IS group key j's
+// value (PG's setrefs rewriting the final Group's keys to OUTER_VAR for
+// the same reason).
+//
+// Declines (ok=false) when a key is not a plain column reference or a
+// Passthrough column is present: a stand-in ColumnRef there would render
+// the final `Group Key:` line as a bare column name instead of the
+// expression, and a passthrough expr would need its own re-positioning —
+// both are the filed remainder, not silently-wrong output. The rewrite
+// keeps the original ref's Name, Type and SourceTableIdx, so EXPLAIN
+// still prints `item.i_item_id` for the columns it renders.
+func partialGroupKeyRefs(agg *Aggregate) ([]Expr, bool) {
+	if len(agg.Passthrough) > 0 {
+		return nil, false
+	}
+	refs := make([]Expr, len(agg.GroupExprs))
+	for i, e := range agg.GroupExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return nil, false
+		}
+		c := *cr
+		c.Index = i
+		refs[i] = &c
+	}
+	return refs, true
+}
+
+// addPartialGroupArm files the `Group -> Gather Merge -> Group(partial) ->
+// Sort` candidate for an aggregate-free GROUP BY — the arm comment in
+// addPartialAggSplitPath carries the PG provenance. keyRefs are the group
+// keys rewritten to the partial group's output positions
+// (partialGroupKeyRefs).
+func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, keyRefs []Expr,
+	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
+	nGroupCols, inNcols int, inAvgVar float64) *Path {
+
+	// The worker's own sort on the group keys — `make_ordered_path`
+	// (planner.c:7644) over the partial input, through the same
+	// sortPathForBounded the R56 arm below uses.
+	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+	// `sortPathForBounded` prices ParallelSafe but never plans workers;
+	// without this the GatherMerge build refuses the subpath
+	// (gatherChildPlan panics on 0 workers). R56's rule, verbatim.
+	workerSort.ParallelWorkers = workers
+
+	// The PARTIAL GROUP path — `create_group_path` on the
+	// partially_grouped_rel (planner.c:7570). The spec clone keeps the
+	// original input-coordinate expressions (its child is the worker's
+	// sort over the same input row); the marker is what the parallel
+	// walks gate on. The advertised pathkeys are the group's own output
+	// positions — the ordering the Gather Merge merges on.
+	partialSpec := *aggNode
+	partialSpec.PartialGroup = true
+	mergeKeys := make([]PathKey, 0, len(keyRefs))
+	for _, k := range groupClauseKeys(aggNode) {
+		mergeKeys = append(mergeKeys, PathKey{Expr: keyRefs[k.Pos], SortAsc: !k.Desc, NullsFirst: k.NullsFirst})
+	}
+	partialPath := &Path{
+		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &partialSpec,
+		Rel: partialRel, Rows: partialGroups,
+		Cost: costAgg(cp, AggStrategySorted, perWorkerRows, workerSort.Cost.Startup, workerSort.Cost.Total,
+			nGroupCols, partialGroups, 0, inNcols, inAvgVar),
+		DisabledNodes:   workerSort.DisabledNodes,
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+		Pathkeys:        mergeKeys,
+		Children:        []*Path{workerSort},
+	}
+	addPath(partialRel, partialPath, partialAggPartialProducer)
+
+	// BOUNDARY — `cost_gather_merge` over the partial group's rows: what
+	// crosses is each worker's deduplicated output, not its input, so the
+	// crossing count is partialGroups × d rather than the R56 arm's
+	// perWorkerRows × d — the whole economic argument of the shape
+	// (Q37's 2 final groups against a 20-row sort each worker already
+	// narrowed).
+	crossed := partialGroups * d
+	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
+	gmPath := &Path{
+		Kind: PathGatherMerge, Rel: grouped, Rows: crossed, Cost: gmCost,
+		// Upstream takes the subpath's own key list ("gather merge input
+		// not sufficiently sorted"); same copy the R56 arm makes.
+		Pathkeys:      append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:  false,
+		DisabledNodes: partialPath.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{partialPath},
+	}
+
+	// FINAL GROUP — a second `create_group_path`, on the grouped rel this
+	// time: the leader-side dedup over the merge. Its GroupExprs are
+	// rewritten to the partial output positions, and its B-01c input
+	// target is cleared — that stamp was derived against the ORIGINAL
+	// input row, and the partial group's output is a different schema;
+	// unknown is the safe direction (the stamp's own contract, plan.go).
+	finalSpec := *aggNode
+	finalSpec.GroupExprs = keyRefs
+	finalSpec.InputTarget, finalSpec.InputTargetKnown = nil, false
+	finalPath := &Path{
+		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
+		Rel: grouped, Rows: finalGroups,
+		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
+			nGroupCols, finalGroups, 0, inNcols, inAvgVar),
+		Pathkeys: gmPath.Pathkeys, Children: []*Path{gmPath},
+	}
+	addPath(grouped, finalPath, partialGroupMergeProducer)
+	return finalPath
+}
+
 func upperSplitVerdict(split *Path) string {
 	if split != nil {
 		return "split"

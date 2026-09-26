@@ -597,6 +597,23 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *Aggregate:
+		// M0146-0025: mirror of the drivingScan arm — descend only the
+		// producer-marked per-worker dedup; anything else is returned
+		// unstamped, the fail-closed direction both siblings agree on.
+		// Required, not cosmetic: the partial Group's node sits directly
+		// under the Gather Merge, so without this arm `gatherChildPlan`
+		// refuses the whole shape as having no driving scan.
+		if !x.PartialGroup {
+			return n
+		}
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
@@ -749,6 +766,20 @@ func drivingScan(n Node) Node {
 		// children to the upper-rel producer; the four walks (drivingScan,
 		// stampParallelScan, unstampParallelScan, attachParallelScan) agree.
 		return drivingScan(x.Child)
+	case *Aggregate:
+		// M0146-0025. Only a node the partial-Group producer BUILT for this
+		// descent is transparent: `PartialGroup` marks the per-worker dedup
+		// of a `Group -> Gather Merge -> Group` split, where a leader-side
+		// Group re-dedups the merge, so partitioning its input reproduces
+		// the serial result exactly. An UNMARKED aggregate stays a wall —
+		// descending through an ordinary dedup inside a candidate partial
+		// subtree would emit each cross-partition duplicate once per worker
+		// (the `count(*) FROM (SELECT DISTINCT …)` over-count), the wrong
+		// answer with nothing to flag it.
+		if x.PartialGroup {
+			return drivingScan(x.Child)
+		}
+		return nil
 	case *Join:
 		// P8. A hash join is partial through its PROBE side only: the build
 		// side is drained once by the leader before fan-out, and the probe is
@@ -883,6 +914,14 @@ func drivingScanCrossesSort(n Node) bool {
 	switch x := n.(type) {
 	case *Sort:
 		return true
+	case *Aggregate:
+		// M0146-0025: same gate as the three siblings — the marked
+		// partial dedup is transparent to the spine walk, so its Sort
+		// still counts as a Sort on the spine.
+		if x.PartialGroup {
+			return drivingScanCrossesSort(x.Child)
+		}
+		return false
 	case *Filter:
 		return drivingScanCrossesSort(x.Child)
 	case *Project:
@@ -1952,6 +1991,20 @@ func unstampParallelScan(n Node) Node {
 		// sibling warning). A scan left labelled parallel with no Gather
 		// above it makes EXPLAIN claim a parallelism the executor will
 		// not run.
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Aggregate:
+		// M0146-0025: the inverse of the stampParallelScan arm — StripGather
+		// removes the boundary but leaves the dedup pair, which still
+		// collapses to the right answer (a dedup of a dedup is idempotent).
+		if !x.PartialGroup {
+			return n
+		}
 		child := unstampParallelScan(x.Child)
 		if child == x.Child {
 			return n
