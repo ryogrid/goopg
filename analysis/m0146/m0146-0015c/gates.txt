@@ -1,0 +1,8 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== PLAN-SHAPE: queries=99 same=99 changed=0 added=0 removed=0 ===
+FIRE-SET: baseline=a5b2a3e5b4bc8c37604130a67902c3f99a57ca02 (63c7814b6d70) candidate=worktree (f8a229cba965)
+FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+regress 41 WITH/plan pass-required cases + subselect: diffs identical to a HEAD (a5b2a3e5b) worktree

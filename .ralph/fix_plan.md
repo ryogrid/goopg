@@ -20989,6 +20989,21 @@ M0146-0001 re-baseline census on the new default arm.
     \(`noteRebaseFail\("nested\-body\-emitting\-ref"\)`\).
   - Rank: per M0146\-0015\'s placement a pre\-existing capability gap keeps
     normal M0146 order.
+  - 2026\-09\-26 recon \+ slice 1: design doc
+    `docs/design/0100\-0149/m0146\-0015c\-nested\-exists\-scopes.md`;
+    evidence `analysis/m0146/m0146\-0015c/`.
+    - PG does NOT pull the inner EXISTS: it fails `available\_rels` \(reads
+      both `a` and `b`\) and stays a hashed ANY SubPlan in the semi join\'s
+      Join Filter.
+    - Landed \(plan\-neutral\): `nestedBodySpansScopes` applies that gate in
+      both pull\-up arms.
+    - Still blocked: the kept inner sublink\'s plan holds raw
+      OuterColumnRefs at pull\-up time, and no depth\-aware re\-base exists,
+      so the outer pull\-up declines `nested\-sublink\-convertible`.
+    - Next step \(slice 2\): clone the inner plan and re\-base its outer
+      refs by depth \(body → problem space, emitting scope → one level
+      down\), fail\-closed over node kinds; then admit it in
+      `bodyQualsAdmitSublinkList`. Slice 3: `convert\_EXISTS\_to\_ANY`.
 - [ ] **WRONG RESULTS: an index created with an explicit opclass returns
   wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
   `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —

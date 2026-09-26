@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -440,5 +441,37 @@ func TestNLIResidualPredicateRendered(t *testing.T) {
 		t.Logf("shape took hash semi, NLI residual display not exercised:\n%s", out)
 	} else {
 		t.Logf("shape stayed SubPlan, NLI residual display not exercised:\n%s", out)
+	}
+}
+
+// TestNestedExistsSpanningScopesResults pins the answers for M0146-0015c's
+// shape — a nested [NOT] EXISTS whose body reads both its parent body and
+// the outermost query. PG plans the outer EXISTS as a semi join and keeps
+// the inner one as a SubPlan; goopg keeps both as SubPlans for now (the
+// correlated SubPlan cannot yet ride a pulled-up qual). Either way the rows
+// must be PG's: 1 for EXISTS, 2 and 3 for NOT EXISTS.
+func TestNestedExistsSpanningScopesResults(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table ta(y int, k int)", "create table tb(k int, w int)", "create table tc(x int, z int)",
+		"insert into ta values (1,1),(2,2),(3,3)", "insert into tb values (1,10),(2,20),(3,30)",
+		"insert into tc values (1,10),(3,99)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q, want := range map[string]string{
+		"select a.y from ta a where exists (select 1 from tb b where b.k = a.k and exists (select 1 from tc c where c.x = a.y and c.z = b.w)) order by 1":     "[1]",
+		"select a.y from ta a where exists (select 1 from tb b where b.k = a.k and not exists (select 1 from tc c where c.x = a.y and c.z = b.w)) order by 1": "[2 3]",
+	} {
+		rows, err := runQueryWithErr(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := fmt.Sprint(renderRows(rows)); got != want {
+			t.Errorf("%s: got %s, want %s", q, got, want)
+		}
 	}
 }

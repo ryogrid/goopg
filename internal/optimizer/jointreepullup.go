@@ -434,6 +434,9 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		}
 	}
 	quals := append(splitAnd(where), onQuals...)
+	if nestedBodySpansScopes(quals, depth) {
+		return nil, "nested-spans-scopes", false
+	}
 	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
 	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
 		return nil, why, false
@@ -1117,6 +1120,27 @@ func exprHasOuterRefAtLevel(e Expr, level int) bool {
 	return found || !ok
 }
 
+// nestedBodySpansScopes is convert_EXISTS_sublink_to_join's
+// `bms_is_subset(upper_varnos, available_rels)` test (subselect.c) for a
+// NESTED sublink (depth > 0): pull_up_sublinks_qual_recurse offers the
+// sublink either the rels above its parent body (available_rels1) or the
+// parent body's own rels (child_rels), never both. A body whose quals read
+// the parent body (Level 1) AND a scope above it (Level >= 2) fits neither,
+// so PG keeps it as a SubPlan — `a … EXISTS (b … EXISTS (c WHERE c.x = a.y
+// AND c.z = b.w))` plans as a semi join a ⋈ b with the inner EXISTS in its
+// Join Filter. M0146-0015c.
+func nestedBodySpansScopes(quals []Expr, depth int) bool {
+	if depth == 0 || !exprListHasOuterRefAtLevel(quals, 1) {
+		return false
+	}
+	for level := 2; level <= maxPulledSublinkDepth+1; level++ {
+		if exprListHasOuterRefAtLevel(quals, level) {
+			return true
+		}
+	}
+	return false
+}
+
 // exprListHasOuterRefAtLevel is exprHasOuterRefAtLevel over a slice.
 func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 	for _, e := range es {
@@ -1444,6 +1468,9 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		}
 	}
 	quals := append(splitAnd(where), onQuals...)
+	if nestedBodySpansScopes(quals, depth) {
+		return nil, "nested-spans-scopes", false
+	}
 	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
 	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
 		return nil, "any-" + why, false
