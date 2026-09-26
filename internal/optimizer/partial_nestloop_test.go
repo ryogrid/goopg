@@ -236,6 +236,62 @@ func TestPartialPathDrivingKindNestLoop(t *testing.T) {
 	}
 }
 
+// nlProbeClassifyPath builds the R95 shape under test: a PathNestLoop over a
+// partial outer and a PARAMETERIZED index-probe inner (RequiredOuter nonzero,
+// PathIndexScan with IndexClauses) — the path addPartialNestLoopPaths files
+// for the lateral-probe arm.
+func nlProbeClassifyPath(joinrel, outer, inner *RelOptInfo, jt parser.JoinType) *Path {
+	probe := &Path{
+		Kind:          PathIndexScan,
+		Rel:           inner,
+		Rows:          5,
+		RequiredOuter: outer.Relids, // parameter satisfiable by the outer
+		IndexClauses:  []indexPathClause{{key: &ColumnRef{}}},
+	}
+	return &Path{
+		Kind: PathNestLoop, Jointype: jt, Rel: joinrel,
+		Rows: 2500, Cost: Cost{Total: 300},
+		Children:        []*Path{outer.PartialPathlist[0], probe},
+		OuterRelids:     outer.Relids,
+		InnerRelids:     inner.Relids,
+		RequiredOuter:   0,
+		ParallelSafe:    true,
+		ParallelWorkers: 2,
+	}
+}
+
+// TestPartialPathDrivingKindNestLoopProbe pins the R95 probe arm's jointype
+// set after M0146-0002i: {INNER, SEMI} admit, everything else refused. SEMI
+// is TPC-H Q4's shape (Nested Loop Semi Join inside the Gather probing the
+// index per worker); ANTI waits for M0146-0002j's producer widening, and
+// LEFT stays refused per the probe family's ledger row.
+func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
+	for _, jt := range []parser.JoinType{parser.JoinInner, parser.JoinSemi} {
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, jt)
+		if got := partialPathDrivingKind(p); got != PathSeqScan {
+			t.Errorf("%v probe partial NL must classify to its outer's driving kind, got %v", jt, got)
+		}
+	}
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinAnti, parser.JoinRight, parser.JoinFull} {
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, jt)
+		if got := partialPathDrivingKind(p); got != PathPrebuilt {
+			t.Errorf("%v probe partial NL must refuse, got %v", jt, got)
+		}
+	}
+	// The subset re-check still fires under SEMI: a probe parameter no outer
+	// supplies is refused even though the jointype admits.
+	{
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, parser.JoinSemi)
+		p.Children[1].RequiredOuter = relsetOf(2) // no outer supplies bit 2
+		if got := partialPathDrivingKind(p); got != PathPrebuilt {
+			t.Errorf("SEMI probe with unsatisfiable parameter must refuse, got %v", got)
+		}
+	}
+}
+
 // TestPartialNLFilingInnerOnly pins R60's narrowed V1 gate, as widened by
 // M0137-0019b: only INNER and SEMI are filed, so a refused head can never
 // starve admittable siblings (the gather-path reader takes

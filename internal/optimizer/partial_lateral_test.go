@@ -74,11 +74,20 @@ func TestLateralProbeJoinIsPartialCapable(t *testing.T) {
 	if !lateralProbeJoinIsPartialCapable(latTestJoin(JoinTypeInner, true, latProbeNode(nil))) {
 		t.Fatal("lateral probe INNER must be partial-capable")
 	}
+	// M0146-0002i: SEMI joins the set — a per-outer-row verdict decided by
+	// one qualifying probe row (`finishOuter`), worker-local exactly as the
+	// whole-inner SEMI arm's. TPC-H Q4's partial NL semi probe is the named
+	// consumer.
+	if !lateralProbeJoinIsPartialCapable(latTestJoin(JoinTypeSemi, true, latProbeNode(nil))) {
+		t.Fatal("lateral probe SEMI must be partial-capable (M0146-0002i)")
+	}
 	refusals := map[string]*Join{
 		"nil":        nil,
 		"non-lateral": latTestJoin(JoinTypeInner, false, latProbeNode(nil)),
 		"cross":      latTestJoin(JoinTypeCross, true, latProbeNode(nil)),
-		"semi":       latTestJoin(JoinTypeSemi, true, latProbeNode(nil)),
+		// ANTI waits for M0146-0002j's producer widening; LEFT stays
+		// unverified for the probe shape (ledger).
+		"anti":       latTestJoin(JoinTypeAnti, true, latProbeNode(nil)),
 		"left":       latTestJoin(JoinTypeLeft, true, latProbeNode(nil)),
 		"hash":       {Algo: JoinAlgoHash, Type: JoinTypeInner, Lateral: true, Left: &SeqScan{}, Right: latProbeNode(nil)},
 		"seq-inner":  latTestJoin(JoinTypeInner, true, &SeqScan{}),
@@ -126,11 +135,23 @@ func TestPartialLateralWalkAgreement(t *testing.T) {
 		t.Error("unstamp must clear the outer Parallel label")
 	}
 
+	// M0146-0002i: the same four walks must now ADMIT a SEMI lateral probe,
+	// or the filed path would be costed and then refused at the Gather —
+	// the "filed but not runnable" trap the gate-sharing exists to prevent.
+	semiLat := latTestJoin(JoinTypeSemi, true, latProbeNode(nil))
+	if drivingScan(semiLat) == nil {
+		t.Error("semi-lateral: drivingScan must admit (M0146-0002i)")
+	}
+	if got := stampParallelScan(semiLat); got == Node(semiLat) {
+		t.Error("semi-lateral: stamp must label the outer Parallel")
+	}
+
 	// Refusals pin all walks at once. (A non-lateral INNER over the
 	// probe is NOT a refusal — R94's ordinary rule admits it; the shape
 	// is worker-sound either way, which is the point of the agreement.)
 	for name, j := range map[string]*Join{
-		"semi-lateral":  latTestJoin(JoinTypeSemi, true, latProbeNode(nil)),
+		"anti-lateral":  latTestJoin(JoinTypeAnti, true, latProbeNode(nil)),
+		"left-lateral":  latTestJoin(JoinTypeLeft, true, latProbeNode(nil)),
 		"cross-lateral": latTestJoin(JoinTypeCross, true, latProbeNode(nil)),
 		"lateral-seq-inner": latTestJoin(JoinTypeInner, true, &SeqScan{}),
 	} {
@@ -185,9 +206,24 @@ func TestPartialPathDrivingKindLateralProbe(t *testing.T) {
 		t.Fatalf("satisfiable parameterized probe must drive on the outer scan, got %v", got)
 	}
 
+	// M0146-0002i: a SEMI probe must classify to the outer's driving kind —
+	// TPC-H Q4's shape (Nested Loop Semi Join inside the Gather).
+	{
+		jr, o, i, _, _ := latClassifyFixture()
+		pr := latParamInner(i, o.Relids)
+		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, parser.JoinSemi, pr)); got != PathSeqScan {
+			t.Errorf("SEMI parameterized probe must classify to its outer's driving kind, got %v", got)
+		}
+	}
+
 	cases := map[string]func(joinrel, outer, inner *RelOptInfo, probe *Path) *Path{
-		"semi-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
-			return latClassifyPath(jr, o, i, parser.JoinSemi, pr)
+		// ANTI waits for M0146-0002j's producer widening; LEFT stays
+		// unverified for the probe shape.
+		"left-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinLeft, pr)
+		},
+		"anti-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinAnti, pr)
 		},
 		"unsatisfiable-req": func(jr, o, i *RelOptInfo, pr *Path) *Path {
 			bad := *pr

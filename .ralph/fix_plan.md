@@ -21241,7 +21241,7 @@ M0146-0001 re-baseline census on the new default arm.
       real pages while PG's NL \(190868\) wins under its larger heap.
       Boundary, not a planner defect — ledgered.
     Movement: none — recon.
-- [ ] **M0146\-0002i — parameterized\-probe partial nested loop under
+- [x] **M0146\-0002i — parameterized\-probe partial nested loop under
   SEMI** \(filed 2026\-09\-27 by M0146\-0002a on TPC\-H Q4\). The producer
   already files it \(`addPartialNestLoopPaths` admits SEMI\); the filed
   probe is undrivable and starves admissible siblings at the partial
@@ -21254,13 +21254,37 @@ M0146-0001 re-baseline census on the new default arm.
   makes for whole\-inner SEMI \(finishOuter on first match\).
   Kind: impl
   Parent: M0146-0002a
-  - Expected movement: TPC\-H Q4's join spine becomes PG's — `NL Semi`
-    inside the Gather over `PSeq orders` with the lineitem index probe
-    per worker \(cost ~76k vs current 172k serial\-above\-gather\);
-    `join\-order` clears, `sort\-strategy`/`parallelism` likely follow
-    \(partial\-agg/Gather\-Merge upper still M0146\-0003/0025\).
-    Pin with a parallel\-vs\-serial row\-identity test under `\-race`
-    \(workers 1/2/4\) and measure on the canonical TPC\-H capture.
+  - **DONE 2026\-09\-27.** Evidence `analysis/m0146/m0146\-0002i/`;
+    design doc `docs/design/0100\-0149/m0146\-0002a\-parallel\-hash\-arm\-regressions.md`
+    §"M0146\-0002i outcome". One shared jointype set \{INNER, SEMI\} now
+    drives all three probe gates — new `partialProbeNestLoopJointype`
+    \(gatherpaths.go, `parser.JoinType` domain\) and
+    `partialProbeNestLoopJoinType` \(parallel.go, `optimizer.JoinType`
+    domain\) so the arms cannot drift; executor `lateralProbeJoinPartial`
+    carries the same set. Producer admission unchanged \(still \{I,S\}\).
+    ANTI/LEFT/CROSS/RIGHT/FULL and bitmap probes stay refused at every
+    probe gate; the fused `NestedLoopIndexJoin` family keeps its own
+    \{I,L,S,A\} set.
+    - **Measured TPC\-H Q4** \(canonical parallel arm\):
+      `NL Semi` inside `Gather` probing `idx_lineitem_orderkey_fkidx` per
+      worker — PG's exact spine; cost 76255 vs pre\-change 172846
+      serial\-above\-Gather \(PG 70092\). Q4 categories
+      \[join\-order, aggregation\-strategy, sort\-strategy, parallelism\]
+      → \[sort\-strategy, parallelism\]; aggregate join\-order 14→13,
+      aggregation\-strategy 6→5. Residual Q4 categories are the
+      `Gather Merge` \+ `Partial GroupAggregate` upper \(M0146\-0003/0025\),
+      not this arm.
+    - Fire\-set: zero fires on TPC\-DS SF0\.25 and SF1 \(no TPC\-DS plan
+      moved\); acceptance arm 24/24 value\-identical; sf025 96/96, shapes
+      99/99.
+    - Pins: `TestPartialPathDrivingKindNestLoopProbe` \(SEMI admits;
+      LEFT/ANTI/RIGHT/FULL \+ unsatisfiable `RequiredOuter` refuse\);
+      four boundary tests re\-pinned to \{I,S\};
+      `TestParallelLateralWalkerRefusals` \(SEMI attaches on all three
+      walks\); `TestParallelLateralSemiProbeIdentity` \(row identity
+      under `\-race`, workers 1/2/4 — uses
+      `SetIndexProbeCostMultiplier("1")` so the fixture elects the plain
+      index probe rather than the still\-refused bitmap family\).
 - [ ] **M0146\-0002j — parameterized\-probe partial nested loop under
   ANTI** \(filed 2026\-09\-27 by M0146\-0002a on TPC\-H Q21\). Same three\-gate
   widening as M0146\-0002i PLUS the producer gate

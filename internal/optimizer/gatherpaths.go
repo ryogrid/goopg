@@ -447,6 +447,37 @@ func partialNestLoopJointype(t parser.JoinType) bool {
 	return false
 }
 
+// partialProbeNestLoopJointype is the ONE jointype set the parameterized-probe
+// partial nested-loop arms admit — narrower than `partialNestLoopJointype`
+// because the probe's per-outer-row verdict must additionally be provable
+// worker-local at every downstream gate, and only INNER and SEMI have been.
+// The three probe gates — this arm's R95 tail below,
+// `lateralProbeJoinIsPartialCapable` (parallel.go) and the executor twin
+// `lateralProbeJoinPartial` (internal/executor/parallel_scan.go) — carry the
+// same set and move together or not at all; the fused family
+// (`NestedLoopIndexJoinIsPartialCapable`) verified all four of PG's dispatch
+// jointypes by measurement (M0145-0010) and stays on its own wider set.
+//
+// SEMI joins INNER for M0146-0002i: one qualifying probe row decides the
+// outer row, the probe scan breaks (`finishOuter`, join_nl_stream.go), and
+// the joined row is never emitted — worker-local by the same argument the
+// whole-inner SEMI arm already records. Its named consumer is TPC-H Q4,
+// whose PG plan is this exact shape: `Nested Loop Semi Join` inside the
+// Gather, probing lineitem's index per worker.
+//
+// ANTI stays refused until M0146-0002j lands the producer gate with it —
+// widening here alone would admit a filed-by-nobody arm. LEFT stays
+// refused: worker-local in principle but never executor-verified for the
+// probe shape, and no measured consumer exists (ledger
+// `m0146-0002a-left-probe`).
+func partialProbeNestLoopJointype(t parser.JoinType) bool {
+	switch t {
+	case parser.JoinInner, parser.JoinSemi:
+		return true
+	}
+	return false
+}
+
 // refusal must be visible where it is decided, not implicit in a missing case.
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
@@ -647,7 +678,10 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// the child. RequiredOuter propagates, so in.RequiredOuter below
 		// reads the same value the child carries. Anything else
 		// parameterized is refused: no worker can supply its parameter.
-		if p.Jointype != parser.JoinInner {
+		// M0146-0002i: the probe jointype set — INNER plus SEMI — read
+		// through the shared predicate, so the three probe gates cannot
+		// drift apart the way the 2026-09-21 ordinary-SEMI gates did.
+		if !partialProbeNestLoopJointype(p.Jointype) {
 			return PathPrebuilt
 		}
 		probe := in

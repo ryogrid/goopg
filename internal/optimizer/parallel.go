@@ -1270,8 +1270,10 @@ func lateralProbeIsPartialProbe(n Node) bool {
 // per-call). The probe is never materialized whole, so unlike R94's
 // ordinary case there is no N× inner-memory term.
 //
-// Admitted narrowly: INNER only (Q96's comma joins plan as INNER;
-// CROSS/SEMI/ANTI/LEFT/RIGHT/FULL refused as scope-minimization), the
+// The jointype set is `partialProbeNestLoopJoinType` — {INNER, SEMI}
+// (M0146-0002i widened from INNER-only, which itself admitted Q96's comma
+// joins; the SEMI verdict is per-outer-row and worker-local exactly as the
+// whole-inner SEMI arm's). The remaining shape gates are unchanged: the
 // bare probe above (no wrappers — the BuildFast bridge implements
 // `lateralBindable` unconditionally, so a wrapped probe would double-bind;
 // no Memoize — R60's `getMemoizePath` loop output never reaches this node
@@ -1284,7 +1286,7 @@ func lateralProbeJoinIsPartialCapable(p *Join) bool {
 	if p == nil || p.Algo != JoinAlgoNestedLoop || !p.Lateral {
 		return false
 	}
-	if p.Type != JoinTypeInner {
+	if !partialProbeNestLoopJoinType(p.Type) {
 		return false
 	}
 	if p.Left == nil || p.Right == nil {
@@ -1369,6 +1371,35 @@ func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 func partialNestLoopJoinType(t JoinType) bool {
 	switch t {
 	case JoinTypeInner, JoinTypeLeft, JoinTypeSemi, JoinTypeAnti:
+		return true
+	}
+	return false
+}
+
+// partialProbeNestLoopJoinType is the ONE jointype set the parameterized-probe
+// partial nested-loop families admit, in the `optimizer.JoinType` domain:
+// `lateralProbeJoinIsPartialCapable` reads it and the executor twin
+// `lateralProbeJoinPartial` (internal/executor/parallel_scan.go) carries the
+// same set, so the decomposed-probe gates cannot disagree about which
+// jointypes a per-worker re-opened probe may serve.
+//
+// `partialProbeNestLoopJointype` (gatherpaths.go) is the same set in the
+// `parser.JoinType` domain, read by `partialPathDrivingKind`'s R95 tail; the
+// pair exists for the same reason `partialNestLoopJoinType` /
+// `partialNestLoopJointype` do — Path carries `parser.JoinType` while the
+// plan nodes carry `optimizer.JoinType` — and must name the same set.
+//
+// The set is {INNER, SEMI} (M0146-0002i): a SEMI verdict is per-outer-row
+// and worker-local (one qualifying probe row decides the outer row and the
+// probe breaks — `finishOuter`), so partitioning the outer is transparent.
+// ANTI joins for M0146-0002j together with the producer gate; LEFT stays
+// refused (never executor-verified for probes, no measured consumer —
+// gatherpaths.go's predicate comment names the ledger row). The fused
+// family already verified all four jointypes (`partialNestLoopJoinType`
+// above, M0145-0010) and needs no narrowing.
+func partialProbeNestLoopJoinType(t JoinType) bool {
+	switch t {
+	case JoinTypeInner, JoinTypeSemi:
 		return true
 	}
 	return false

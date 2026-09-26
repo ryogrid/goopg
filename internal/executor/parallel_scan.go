@@ -104,7 +104,13 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || !p.Lateral {
 		return false
 	}
-	if p.Type != optimizer.JoinTypeInner {
+	// M0146-0002i: the jointype set mirrors the planner twin's
+	// `partialProbeNestLoopJoinType` — {INNER, SEMI} — widened together,
+	// the discipline the 2026-09-21 ordinary-SEMI wrong answer teaches.
+	// A SEMI verdict is per-outer-row and worker-local: one qualifying
+	// probe row decides the outer row and the probe breaks
+	// (`finishOuter`, join_nl_stream.go).
+	if p.Type != optimizer.JoinTypeInner && p.Type != optimizer.JoinTypeSemi {
 		return false
 	}
 	if p.Left == nil || p.Right == nil || right == nil {

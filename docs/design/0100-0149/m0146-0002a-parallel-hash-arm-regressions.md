@@ -172,3 +172,39 @@ property. Ledgered as a boundary note so it is not re-litigated.
 None required — recon only, no code change. The live trace and EXPLAINs
 above were captured on the private clone (`:5533`, cgroup-capped) with
 `GOOPG_PGSHAPED_DP_TRACE=1`.
+
+## M0146-0002i outcome (2026-09-27, impl)
+
+The SEMI arm landed as predicted. Rather than widening each gate's inline
+jointype check independently, one shared set — `{INNER, SEMI}` — is now
+read by all three probe gates: `partialProbeNestLoopJointype`
+(`parser.JoinType` domain, gatherpaths.go) for `partialPathDrivingKind`'s
+parameterized-inner arm, `partialProbeNestLoopJoinType`
+(`optimizer.JoinType` domain, parallel.go) for
+`lateralProbeJoinIsPartialCapable`, and the same set inline in executor
+`lateralProbeJoinPartial`. The producer admission `{INNER, SEMI}` was
+already correct and is untouched. ANTI waits for M0146-0002j's producer
+widening; LEFT and bitmap probes stay refused; the fused
+`NestedLoopIndexJoin` family keeps its verified {I,L,S,A} set.
+
+Measured on the canonical parallel TPC-H arm: Q4's join spine is now PG's
+— `Nested Loop Semi Join` inside `Gather` over `Parallel Seq Scan orders`
+with the `Index Scan` probe on `idx_lineitem_orderkey_fkidx` per worker
+(cost 76255 vs PG 70092; pre-change serial-above-Gather at 172846). Q4's
+categories went `[join-order, aggregation-strategy, sort-strategy,
+parallelism]` → `[sort-strategy, parallelism]`; aggregate TPC-H
+join-order 14→13 and aggregation-strategy 6→5. The two residual
+categories belong to the `Gather Merge` + `Partial GroupAggregate` upper
+(M0146-0003/0025), not this arm. TPC-DS moved zero plans at either scale
+(fire-set `fires=none`).
+
+Worker-locality holds by the same per-outer-row argument the whole-inner
+SEMI arm already records: one qualifying probe row decides the outer row
+and the probe breaks (`finishOuter`). Verified end to end:
+`TestParallelLateralSemiProbeIdentity` (serial-vs-parallel row identity,
+`-race`, workers 1/2/4), the four classifier/walk boundary tests
+re-pinned to {I,S} with LEFT/ANTI as the refused set, and the executor
+walker test admitting SEMI on all three attach walks. Gates: units,
+tpch-spotcheck (Q12=2/Q13=33), tpcds-sf025 (96/96, 99/99 shapes),
+tpch-acceptance-arm (24/24 value-identical), tpcds-fireset (no fires) —
+all PASS.
