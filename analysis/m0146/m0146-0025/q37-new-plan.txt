@@ -1,0 +1,19 @@
+=== Q37 candidate (goopg, SF0.25)
+Limit
+  -> Group
+       Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+       -> Gather Merge
+            Workers Planned: 3
+            -> Group
+                 Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                 -> Sort
+                      Sort Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                      -> Nested Loop
+                           Join Filter: (inventory.inv_item_sk = catalog_sales.cs_item_sk)
+                           -> Nested Loop
+                                 -> Hash Join
+                                       Hash Cond: (inventory.inv_item_sk = item.i_item_sk)
+                                       -> Parallel Seq Scan on inventory
+                                       -> Seq Scan on item
+                                 -> Index Scan using date_dim_pkey on date_dim
+                           -> Index Scan using catalog_sales_pkey on catalog_sales

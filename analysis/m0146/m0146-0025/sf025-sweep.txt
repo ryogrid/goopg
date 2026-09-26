@@ -1,0 +1,4 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=1 total-delta=-8.6% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+changed (2): Q37 Q82
+=== PLAN-SHAPE: queries=99 same=97 changed=2 added=0 removed=0 ===

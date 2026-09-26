@@ -1,0 +1,18 @@
+units PASS (RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh)
+tpch-spotcheck: RESULT=PASS (Q12 rows=2, Q13 rows=33)
+tpch-acceptance-arm: SUMMARY 24 MATCH, VERDICT PASS vs tmp/m0145-0008m/arm-on.txt
+tpcds-sf025 sweep: PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3;
+  PLAN-SHAPE same=97 changed=2 (Q37 Q82 — this task's target)
+tpcds-fireset: PASS — fires Q37 Q82 both scales, values identical baseline/candidate,
+  no new timeouts
+tpch parity capture (jointree-parity-capture.sh tpch): match=6/22 (floor 3),
+  CATEGORIES-EXCL-MATCH recorded; TPC-H corpus carries no aggregate-free
+  GROUP BY so no plan could move (arm is gated len(Aggs)==0)
+census (pg-plan-first-divergence.py on the fireset captures):
+  SF0.25: Q37 sort-strategy depth 2 -> qual-placement depth 5;
+          Q82 sort-strategy depth 2 -> join-method depth 7; match 13->13
+  SF1:    Q37/Q82 sort-strategy -> parallelism at depth 2
+          (PG's SF1 plan inverts the join and carries no partial Group —
+          residual is the join-order class, M0146-0005); match 12->12
+ea-ratchet: not run — no estimator/selectivity/statistics change; the arm
+  reuses estimateNumGroups/costAgg/cost_group untouched

@@ -21809,6 +21809,33 @@ M0146-0001 re-baseline census on the new default arm.
   - Open: grouping sets, the no\-GROUP\-BY copy, grouped\-expression and
     functionally dependent columns — ledgered.
   Movement: none \(census\-neutral PG\-fidelity fix\)
+- [x] **M0146\-0025 — partial Group paths for aggregate\-free GROUP BY**
+  \(filed and done 2026\-09\-26 from M0146\-0023\'s ledger item 2\).
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-26.** Design doc
+    `docs/design/0100\-0149/m0146\-0025\-partial\-group\-paths.md`; evidence
+    `analysis/m0146/m0146\-0025/`.
+    - PG's `create_partial_grouping_paths` group arm \(planner\.c:7570,
+      7704\): `Group -> Gather Merge -> Group -> Sort` — a row\-emitting
+      per\-worker dedup, not the zero\-row Partial/Finalize model.
+    - `Aggregate.PartialGroup` is the marker the driving\-scan walks gate
+      on; unmarked dedups stay walls \(the `count(*)` over `DISTINCT`
+      over\-count stays unreachable\).
+    - `spliceGatherOnPartialSpine` removes a search\-placed Gather along
+      `drivingScan`'s descent so the arm reaches Q37/Q82's
+      `NL(Gather(…))` inputs; the other arms keep the refusal.
+    - Q37/Q82 emit the oracle shape and identical rows at both scales;
+      Q97 unchanged; executor identity test pins dedup of dedup.
+  - Open: expression/Passthrough keys, nested scopes, multi/off\-spine
+    gathers — ledgered.
+  Movement: none \(match 13→13 SF0\.25, 12→12 SF1; every CATEGORIES\-EXCL\-MATCH
+    delta within ±3 — but per\-query categories DID improve: SF0\.25
+    Q37/Q82 dropped aggregation\-strategy and sort\-strategy entirely \(the
+    Group subtree now matches the oracle; residual divergence is deeper:
+    qual\-placement on Q37, none new on Q82\); SF1 dropped sort\-strategy,
+    retained join\-order \+ worker\-count sizing — both M0146\-0005
+    territory\)
 - [ ] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the
