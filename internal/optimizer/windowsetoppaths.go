@@ -894,9 +894,9 @@ func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams, 
 	// pure arm did not file", PG's undefined partial_rows.
 	pureRows := -1.0
 	if lChainOK && rChainOK && len(left.PartialPathlist) > 0 && len(right.PartialPathlist) > 0 {
-		lp, rp := left.PartialPathlist[0], right.PartialPathlist[0]
-		if lp != nil && rp != nil && lp.ParallelWorkers > 0 && rp.ParallelWorkers > 0 &&
-			lp.ParallelSafe && rp.ParallelSafe {
+		lp := cheapestRunnableSetOpBranchPartial(left)
+		rp := cheapestRunnableSetOpBranchPartial(right)
+		if lp != nil && rp != nil {
 			// parallel_workers: Max over the two subpaths' own worker
 			// counts (allpaths.c:1544-1550), then at least
 			// `pg_leftmost_one_pos32(2)+1 == 2` — PG's
@@ -1159,9 +1159,11 @@ func setOpBranchPartialChainOK(n Node) bool {
 // non-nil, or both nil when the branch offers neither — the caller's
 // `pa_subpaths_valid` kill.
 //
-// The partial candidate is the searched rel's PartialPathlist[0] (cheapest
-// by addToPartialPathlist's ordering), admissible only when chainOK — see
-// setOpBranchPartialChainOK. The non-partial candidate is goopg's nppath:
+// The partial candidate is the searched rel's cheapest RUNNABLE partial
+// (cheapestRunnableSetOpBranchPartial — upstream's
+// `linitial(child->partial_pathlist)` needs no runnable qualifier because
+// every partial path is runnable there), admissible only when chainOK —
+// see setOpBranchPartialChainOK. The non-partial candidate is goopg's nppath:
 // a fresh PathPrebuilt seed over the branch's own finished plan in its
 // parallel-safe serial form — the node itself, or `StripGather(node)` when
 // the branch's serial winner carried a Gather. The strip is not optional:
@@ -1179,10 +1181,8 @@ func setOpBranchPartialChainOK(n Node) bool {
 // `parallel_safe` on the child's plan.
 func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK bool) (partial, nonPartial *Path) {
 	var bp *Path
-	if chainOK && len(branch.PartialPathlist) > 0 {
-		if c := branch.PartialPathlist[0]; c != nil && c.ParallelWorkers > 0 && c.ParallelSafe {
-			bp = c
-		}
+	if chainOK {
+		bp = cheapestRunnableSetOpBranchPartial(branch)
 	}
 	var bnp *Path
 	if branchNode != nil {
@@ -1196,6 +1196,35 @@ func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK bool
 		return bp, nil
 	}
 	return nil, bnp
+}
+
+// cheapestRunnableSetOpBranchPartial is the executor-capable form of the
+// cheapest-partial pick upstream makes per Append child
+// (`linitial(child->partial_pathlist)` — allpaths.c:1544 for the pure arm,
+// allpaths.c:1408-1453's per-child pick for the `pa_subpaths` arm). Every
+// partial path upstream is runnable, so "cheapest" needs no qualifier there;
+// here a branch whose cheapest partial is a shape a SetOp branch cannot
+// drive — today only a Parallel Hash Join, whose per-join build state the
+// branch claim sets do not carry (M0146-0002 slice 2, deferral ledger
+// 2026-09-24) — would embed a child partialPathDrivingKind's PathSetOp arm
+// refuses, so the produced path could never be gathered. Pick the cheapest
+// RUNNABLE entry instead: `setOpBranchDrivingKindIsSupported` is exactly
+// the admission the gather-side check applies, so the produced path is
+// gatherable by construction. A branch with no runnable partial returns
+// nil — same verdict as an empty list.
+func cheapestRunnableSetOpBranchPartial(branch *RelOptInfo) *Path {
+	if branch == nil {
+		return nil
+	}
+	for _, p := range branch.PartialPathlist {
+		if p == nil || p.ParallelWorkers <= 0 || !p.ParallelSafe {
+			continue
+		}
+		if setOpBranchDrivingKindIsSupported(p) {
+			return p
+		}
+	}
+	return nil
 }
 
 // appendNonPartialCost is `append_nonpartial_cost` (costsize.c:2168-2243)

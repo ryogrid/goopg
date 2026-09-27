@@ -23235,7 +23235,36 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: units pass, tpch\-spotcheck PASS \(Q12=2 Q13=33\), SF0\.25
       sweep PASS=96 \(changed=Q19/Q34/Q42/Q52/Q98\), acceptance arm 24
       MATCH, fireset PASS \(SF0\.25 fires x5 \+ SF1 Q55, both arms\)\.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\)
+  - Slice 4 landed 2026\-09\-28 — runnable branch pick \+ PHJ\-probe
+    claim wiring \(Q14/Q71/Q76\). Evidence `analysis/m0146/m0146\-0027/slice4/`\.
+    - Q6 diagnosed and routed, NOT fixed here: goopg decorrelates the
+      correlated scalar `avg\(\)` where PG keeps a `SubPlan` — owned by
+      M0145\-0008y, blocked on M0146\-0012; no M0146\-0027 mechanism gap\.
+    - Producer: `setOpBranchPick` embedded `PartialPathlist\[0\]`
+      unconditionally — upstream's `linitial` \(allpaths\.c:1544\)
+      without upstream's every\-partial\-is\-runnable invariant; Q71's
+      legs lead with refused `ParallelHash` partials, so the PathSetOp
+      could never be gathered\. `cheapestRunnableSetOpBranchPartial`
+      picks the cheapest partial `setOpBranchDrivingKindIsSupported`
+      admits\.
+    - Executor: `attachAll`'s `*setOp` arm early\-returned after branch
+      wiring, so a ParallelHash join whose PROBE unwraps to the setOp
+      never got its `hashBuildBranch` claim — every participant fed the
+      whole build into the shared table \(isolated repro: 2403 = 3x801;
+      Q71 ck flipped to `c59974eb81acf046`\)\. The arm now also runs
+      `attachParallelHashBuildSides\(op\)`\.
+    - Measured: Q71 290 rows ck=e9f1fcd7c28a1f8f \(oracle\-exact\) on
+      `Gather -> NL -> PHJ\(Parallel Append, item\) -> time_dim`\. Q14/Q76
+      collapse per\-leg gathers into `Gather -> Parallel Append`; Q55
+      gains `Finalize -> Gather Merge -> Partial GroupAggregate`\. SF0\.25
+      census: parallelism 55\->54, D3 28\->26, deeper records on
+      Q37/Q55/Q71\. Gates: spotcheck PASS, sweep PASS=96 \(0 mismatch\),
+      acceptance 24 MATCH, fireset PASS \(fires Q14/Q71/Q76 both arms;
+      SF1 parallelism 60\->58\), units pass\.
+    - Q71 residual is `join\-order` at depth 4 under the shared Gather
+      \(PG index\-probes item + per\-leg PHJ — the ledgered per\-branch
+      PHJ build state\); cost\-space difference, not reach\.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

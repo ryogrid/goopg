@@ -1,0 +1,61 @@
+M0146-0027 slice 4 — runnable SetOp branch pick + ParallelHash-probe
+claim wiring (Q6 recon routed; Q14/Q71/Q76 impl)
+2026-09-28, private SF0.25 clone :5590 + standard gates.
+
+Gate stamps (all PASS on staged index; code_tree
+c514b566dd262c7aed32b5efe6e3c2b964c803589524ebdd50d64440918269a0 — see
+tmp/gate-stamps/*.json):
+
+- tpch-spotcheck        PASS  (Q12 rows=2, Q13 rows=33)
+- tpcds-sf025 sweep     PASS  PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+                              TIMEOUT=0 SKIP=3
+                              plans vs pre-slice sweep: changed=3
+                              (Q14 Q71 Q76 — all the per-leg-gather ->
+                              Gather(Parallel Append) collapse)
+- tpch-acceptance-arm   PASS  SUMMARY: 24 MATCH / VERDICT: PASS
+- tpcds-fireset         PASS  SF0.25 fires Q14 Q71 Q76, SF1 fires
+                              Q5 Q14 Q71 Q76 — all execute on baseline
+                              and candidate arms;
+                              FIRE-SET-TIMEOUTS: introduced=none
+- RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh — PASS
+- go test ./internal/optimizer ./internal/executor — pass, incl. new:
+    TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial
+    TestSetOpBranchPickSkipsUnrunnablePartial
+    TestAttachAllWiresHashBuildAboveProbeSetOp
+    TestGatherOverParallelHashProbeSetOpIdentity (1/2/4 workers;
+    confirmed RED pre-fix: 80/120 rows for a 40-row join)
+
+Plan-parity capture (tmp/m0146-0027s5-capture/, GOOPG_BIN=bin/goopg):
+
+  PLAN-PARITY: queries=99 match=11 shapediff=61 unparsed=0 missingnode=24
+               error=3 timeout=0
+  DIVERGENCE-CLASSES: queries=99 match=11 divergent=88
+    D1-sublink=5 D2-unionall=3 D3-partialpath=26 D4-upperrel=26
+    D5-narrowing=0 D6-cte=1 jointree-search=24 verdict=3
+
+Fireset baseline-vs-candidate (SF0.25): parallelism 55->54,
+parameterisation 35->34, qual-placement 22->23, D3 27->26,
+jointree-search 23->24.  (SF1): parallelism 60->58, sort-strategy
+54->53, join-method 41->42.
+
+First-divergence census diff vs census-sf025-slice3.txt — three records:
+
+  - Q37 depth=2 [sort-strategy] under Group:
+        PG Gather Merge | goopg Sort
+  + Q37 depth=6 [join-order] under Nested Loop:
+        PG Nested Loop Inner | goopg Nested Loop Inner
+  - Q55 depth=4 [parallelism] under Sort:
+        PG Gather | goopg Nested Loop Inner
+  + Q55 depth=2 [aggregation-strategy] under Sort:
+        PG GroupAggregate | goopg Finalize GroupAggregate
+  - Q71 depth=3 [parallelism] under Sort:
+        PG Gather | goopg Nested Loop Inner
+  + Q71 depth=4 [join-order] under Gather:
+        PG Nested Loop Inner | goopg Nested Loop Inner
+
+  CATEGORY-ROLLUP: parallelism 8->6, sort-strategy 35->34,
+  join-order 5->7, aggregation-strategy 12->13 (divergent 88->88)
+
+Q71 oracle-exact on the new shape: 290 rows ck=e9f1fcd7c28a1f8f.
+Q6 unchanged (27 rows ck=87ec5bd032d11623) — routed to M0145-0008y /
+M0146-0012, not an M0146-0027 gap.

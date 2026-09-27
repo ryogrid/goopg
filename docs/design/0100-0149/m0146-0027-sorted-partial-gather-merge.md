@@ -270,6 +270,48 @@ invariant. Fireset PASS on all changed plans both arms (SF0.25:
 Q19/Q34/Q42/Q52/Q98; SF1: Q55); TPC-H acceptance arm 24 MATCH; spotcheck
 PASS.
 
+## Slice 4 (2026-09-28): runnable branch pick + PHJ-probe claim wiring
+
+The `PG Gather | goopg Nested Loop Inner` records (Q71, and latently
+Q14/Q76) were two compounding defects, not one.
+
+**Producer** — `setOpBranchPick` embedded `branch.PartialPathlist[0]`
+unconditionally, matching upstream's `linitial(child->partial_pathlist)`
+(allpaths.c:1544) without upstream's invariant: in PG every
+partial_pathlist entry is runnable, while goopg's list can carry
+executor-refused shapes — Q71's legs lead with a `ParallelHash` partial
+that `setOpBranchDrivingKindIsSupported` declines (per-branch PHJ build
+state is the ledgered M0140-0006c-3 residual). The produced PathSetOp
+could never pass gather admission — a dead-weight partial, so no
+`Gather(Parallel Append)` was ever filed. `cheapestRunnableSetOpBranch-
+Partial` now picks the cheapest partial the driving-kind predicate
+actually admits (`internal/optimizer/windowsetoppaths.go`).
+
+**Executor** — electing the new shape exposed a claim gap in
+`attachAll`'s `*setOp` arm (`internal/executor/parallel_scan.go`): the
+arm returns after wiring `setOpLeft`/`setOpRight`, so when
+`unwrapToSetOp` found the setOp *through a Parallel Hash join's probe
+side*, the join's own partial build was never attached to its
+`hashBuildBranch` claim set — every participant scanned the whole build
+relation into the shared table. First observed as Q71 passing rows=290
+with checksum `c59974eb81acf046` (oracle `e9f1fcd7c28a1f8f`); the
+isolated repro `(web ∪ catalog ∪ store) ⋈ item` returned 2403 = 3×801.
+The arm now also runs `attachParallelHashBuildSides(op)`, which walks
+the same probe path and stops at the setOp boundary.
+
+**Result**: Q71 emits `Gather -> NL -> PHJ(Parallel Append, item) ->
+Index Scan time_dim` with the exact oracle checksum; Q14/Q76 collapse
+`Append -> per-leg Gathers` into `Gather -> Parallel Append -> per-leg
+HJs`; Q55 gains `Finalize -> Gather Merge -> Partial GroupAggregate`.
+SF0.25 census: parallelism 55 -> 54, D3-partialpath 28 -> 26, records
+moved deeper on Q37/Q55/Q71; sweep PASS=96 / 0 mismatches; fireset PASS
+(fires Q14/Q71/Q76 both arms; SF1 parallelism 60 -> 58). Tests:
+`TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial`,
+`TestSetOpBranchPickSkipsUnrunnablePartial`,
+`TestAttachAllWiresHashBuildAboveProbeSetOp`,
+`TestGatherOverParallelHashProbeSetOpIdentity` (pre-fix: 80/120 rows for
+a 40-row join).
+
 ## Open
 
 - **Placement residue**: goopg elects a 6-rel partial chain where PG
@@ -281,6 +323,13 @@ PASS.
   std-fuzz but past the tight-fuzz tie-breaker. The mechanism exists and
   wins where the model prices it ahead; matching PG's election there is
   a cost-margin question (M0146-0007 territory), not reach.
-- **Q6**: different composition — no qualifying partial exists on its
-  spine.
+- **Q6**: routed — goopg decorrelates the correlated scalar `avg()` into
+  a hash join while PG keeps a `SubPlan` and probes `item` above the
+  `Gather Merge`. Owning task M0145-0008y, blocked on M0146-0012
+  (correlated restrictions as base-rel index quals). No M0146-0027
+  mechanism gap.
+- **Q71 residual**: `join-order` at depth 4 under the shared Gather —
+  PG index-probes `item` inside the NL chain and runs per-leg Parallel
+  Hash joins inside the Append (needs the ledgered per-branch PHJ build
+  state); goopg elects a single PHJ over the append instead.
 - `presorted > 0` incremental-sort arm: deferred to M0146-0006 as filed.

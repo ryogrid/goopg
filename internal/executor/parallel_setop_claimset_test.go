@@ -1244,3 +1244,179 @@ func planTreeHasSetOp(n optimizer.Node) bool {
 	walk(n)
 	return found
 }
+
+// TestAttachAllWiresHashBuildAboveProbeSetOp is the unit-level guard for the
+// M0146-0027 slice-4 claim gap: when unwrapToSetOp reaches a *setOp THROUGH
+// a Parallel Hash join's probe side (Gather → Parallel Hash → Parallel
+// Append), the join's own build side lives OUTSIDE the setOp subtree and
+// needs its hashBuildBranch claim set. Before the fix the setOp arm
+// returned after wiring only the branches — every participant then scanned
+// the whole build relation into the shared table and the join emitted
+// (participants) copies of every match (Q71: 801-row join returned 2403).
+func TestAttachAllWiresHashBuildAboveProbeSetOp(t *testing.T) {
+	probeScanA := &seqScanOp{}
+	probeScanB := &seqScanOp{}
+	so := &setOp{
+		plan:  &optimizer.SetOp{Op: parser.SetOpUnion, All: true},
+		left:  probeScanA,
+		right: probeScanB,
+	}
+	buildScan := &seqScanOp{}
+	j := &optimizer.Join{
+		Algo:         optimizer.JoinAlgoHash,
+		Type:         optimizer.JoinTypeInner,
+		ParallelHash: true,
+	}
+	// probe = left (BuildLeft false): left holds the union, right builds.
+	op := &joinOp{plan: j, left: so, right: buildScan}
+
+	cs := newParallelClaimSet()
+	if !cs.attachAll(op) {
+		t.Fatal("attachAll reported nothing attached")
+	}
+	if probeScanA.pscan != cs.setOpLeft.pscan {
+		t.Error("left branch scan not wired to the setOpLeft claim set")
+	}
+	if probeScanB.pscan != cs.setOpRight.pscan {
+		t.Error("right branch scan not wired to the setOpRight claim set")
+	}
+	want := cs.hashBuildBranch(j).pscan
+	if buildScan.pscan != want {
+		t.Error("parallel build scan not wired to the join's hashBuildBranch claim set — " +
+			"every participant would feed the whole build relation into the shared table")
+	}
+	if buildScan.pscan == cs.pscan {
+		t.Error("build scan took the gather's flat pscan — it must claim against its own per-join set")
+	}
+}
+
+// TestGatherOverParallelHashProbeSetOpIdentity is the end-to-end gate for the
+// same defect: a Parallel Hash join whose PROBE is a partial UNION ALL.
+// Serial-vs-gathered identity over the join's 40-row result; the pre-fix
+// wiring returned 40*(participants) rows because each participant fed the
+// whole build table into the shared hash.
+//
+// The shape is assembled by flipping the hash-forced plan's join to
+// ParallelHash — the same plan node the path model elects for Q71 — rather
+// than relying on the planner to elect it over a 40-row fixture.
+func TestGatherOverParallelHashProbeSetOpIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const sql = "SELECT u.id FROM (SELECT id FROM pq_setop_a UNION ALL SELECT id FROM pq_setop_b) u, " +
+		"pq_setop_c c WHERE u.id = c.aid"
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			join := planHashForced(t, ctx, sql)
+
+			hj := findHashJoin(join)
+			if hj == nil {
+				t.Fatal("no Hash Join in the forced plan; the fixture moved")
+			}
+			probe := hj.Left
+			build := hj.Right
+			if hj.BuildLeft {
+				probe, build = hj.Right, hj.Left
+			}
+			if !planTreeHasSetOp(probe) {
+				t.Fatalf("probe side (%T chain) contains no *SetOp; the join orientation moved", probe)
+			}
+
+			// Serial baseline: drain the join node itself.
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, join)
+			if len(want) != 40 {
+				t.Fatalf("serial baseline = %d rows, want 40; the fixture moved", len(want))
+			}
+
+			// Replan fresh (the drained plan carries execution state), then
+			// mark the join Parallel Hash and the build scan parallel —
+			// the same plan shape the path model elects for Q71.
+			join = planHashForced(t, ctx, sql)
+			hj = findHashJoin(join)
+			hj.ParallelHash = true
+			hj.ParallelAware = true
+			markScansParallel(build)
+			markSetOpBranchesParallel(join)
+
+			gathered := optimizer.NewGather(0, join, workers)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means each participant fed the "+
+					"whole build relation into the shared table (the pre-fix claim gap)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// markScansParallel stamps SeqScan.Parallel on every scan in n — the flag is
+// EXPLAIN-only, but keeping it truthful makes test plans diagnose like real
+// parallel plans.
+func markScansParallel(n optimizer.Node) {
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
+		if cur == nil {
+			return
+		}
+		if s, ok := cur.(*optimizer.SeqScan); ok {
+			s.Parallel = true
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+}
+
+// markSetOpBranchesParallel stamps SetOp.ParallelAware on the probe union so
+// the plan tree states the same facts a planner-produced partial PathSetOp's
+// plan does.
+func markSetOpBranchesParallel(n optimizer.Node) {
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
+		if cur == nil {
+			return
+		}
+		if s, ok := cur.(*optimizer.SetOp); ok {
+			s.ParallelAware = true
+		}
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+}

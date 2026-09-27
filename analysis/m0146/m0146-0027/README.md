@@ -249,3 +249,22 @@ both arms clean). Full record in `gates-slice3.txt`.
 - Placement residue (Q17/Q25/Q29 depth-4), Q6 unchanged.
 - Upstream's `presorted > 0` incremental-sort arm stays deferred to
   M0146-0006.
+
+## Slice 4 (2026-09-28): runnable branch pick + PHJ-probe claim wiring
+
+`slice4/` — `setOpBranchPick` no longer embeds `PartialPathlist[0]`
+blindly: `cheapestRunnableSetOpBranchPartial` picks the cheapest partial
+`setOpBranchDrivingKindIsSupported` admits (upstream needs no filter —
+allpaths.c:1544 — because every partial_pathlist entry is runnable).
+The elected `Gather -> PHJ(probe=Parallel Append)` shape then exposed an
+executor claim gap: `attachAll`'s `*setOp` arm early-returned before
+wiring ParallelHash build sides on the path to the setOp, so every
+participant scanned the whole build into the shared table (2403 = 3x801
+on the isolated repro). `attachAll` now also runs
+`attachParallelHashBuildSides(op)` on that path.
+
+Q71 oracle-exact (290 rows, ck=e9f1fcd7c28a1f8f); Q14/Q76 collapse to
+`Gather -> Parallel Append`; Q55 gains the Finalize/GatherMerge/Partial
+spine. Census: parallelism 8->6 records, deeper first divergences on
+Q37/Q55/Q71. Q6 confirmed routed (M0145-0008y / M0146-0012). Gates and
+census diff in `slice4/gates.txt`.

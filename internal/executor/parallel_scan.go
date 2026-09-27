@@ -928,7 +928,18 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 		} else {
 			right = cs.setOpBranch(true).attachAll(so.right)
 		}
-		return left || right
+		// M0146-0027 slice 4: when unwrapToSetOp reached the setOp THROUGH a
+		// Parallel Hash join's probe side (Q71's elected shape: Gather →
+		// Parallel Hash → Parallel Append), the branch wiring above claims
+		// only what is INSIDE the setOp. The join's own build side lives
+		// outside it and still needs its hashBuildBranch claim set —
+		// without it every participant scans the whole build relation into
+		// the shared table and the join returns (participants) copies of
+		// every match. The walk descends the same probe path and stops at
+		// the setOp (no arm), so a non-join wrapper chain is a harmless
+		// no-op here.
+		builds := cs.attachParallelHashBuildSides(op)
+		return left || right || builds
 	}
 	attached := attachParallelScan(op, cs.pscan)
 	attached = attachParallelBitmapScan(op, cs.pbm) || attached
