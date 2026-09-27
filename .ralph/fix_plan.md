@@ -3041,7 +3041,7 @@ heuristic stays live.)
     (`support.go:169`) only, i.e. synthetic unaliased parenthesized JOINs,
     not every `FROM`-clause RangeVar.
 
-- [ ] **bpchar HASH semantics parity — verify/fix blank-insensitive
+- [x] **bpchar HASH semantics parity — verify/fix blank-insensitive
   hashing wherever bpchar keys are grouped, joined, or de-duplicated**
   (found 2026-09-27 while analysing the post-reload SF0.25 sweep; the
   companion `bpchareq` finding is recorded in OWNER DECISIONS
@@ -3077,6 +3077,38 @@ heuristic stays live.)
     partition into its own bucket, so join/group paths silently lose
     rows even though `=` is correct. Fix both sides in the same
     change, or file the remainder explicitly.
+  - **DONE 2026-09-27 (M0146-0015f).** Both halves landed together per
+    the caveat: `comparisonOperandsAsBpchar` gives scalar `=`, `IN`,
+    `CASE`, `IS [NOT] DISTINCT FROM`, and the compiled exprnode twin
+    the `bcTruelen` comparison image (declared types decide — an
+    explicit text operand keeps its padding, an untyped literal
+    opposite bpchar coerces to bpchar), and every hash/dedup key
+    boundary normalises identically: `evalSortKeyValue` (sort, Gather
+    Merge, incremental sort, SetOp merge), `buildKeyTrim`/
+    `probeKeyTrim` on hash-join build+probe, merge-join stream keys,
+    `aggregateOp.gkTrims` (hash + sorted grouping, `COUNT(DISTINCT)`),
+    `distinctOp`/`distinctOnOp` schema trims, `rowKeyTrimmed` for
+    SetOp + recursive-CTE dedup, window partition/order/peer keys,
+    `subPlanRowHash` multi-column `IN`, `corrSubqHashMap` inner+outer
+    trims (the `ExecParamRef` arm is what Q41 needed), and ANALYZE
+    frequency bucketing.
+  - Witnesses (all match PG 18.3 :65438, probe matrix in
+    `analysis/m0146/m0146-0015f/`): cross-width char(20)/char(5)
+    equality `t`, bare-literal coercion, `text`-side padding retained,
+    `IN`, correlated scalars, semi join, hash join, multi-col `IN`,
+    mixed-width `GROUP BY`, `UNION` dedup, window partition,
+    `IS [NOT] DISTINCT FROM` both directions.
+  - Gates: units PASS; tpch-spotcheck PASS (Q12=2, Q13=33); TPC-H
+    acceptance arm 24 MATCH vs baseline-digests; SF0.25 sweep
+    **PASS=96 MISMATCH=0 CKMISMATCH=0** (sweep-20260927-130805.txt,
+    was 70/26 on the padded reload) with plan-shape `same=99
+    changed=0` — executor semantics only, no plan movement.
+  - Deferred (ledgered): `op ANY(array-datum)` — elements of a
+    `bpchar[]` column or multi-element `ARRAY[...]` carry no declared
+    element type, so that element side stays byte-exact while a
+    declared-bpchar operand trims.
+  - Design `docs/design/0100-0149/m0146-0015f-bpchar-hash-semantics-parity.md`;
+    evidence `analysis/m0146/m0146-0015f/`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
@@ -21229,7 +21261,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Remaining \(ledgered\): inner\-expr targets in `keptExistsToAny`.
     - **DONE 2026\-09\-26 \(`4a89e53cf`\).** Design doc updated; evidence
       `analysis/m0146/m0146\-0015c/slice4\-goopg.txt`.
-- [ ] **WRONG RESULTS: an index created with an explicit opclass returns
+- [x] **WRONG RESULTS: an index created with an explicit opclass returns
   wrong rows after a clean restart** \(found 2026\-09\-25 by M0146\-0015a\):
   `CREATE INDEX t1_a ON t1 USING btree \(a int4_ops\)`, clean stop, start —
   `SELECT count\(\*\) FROM t1 WHERE a < 50` returns 0 \(49 before the
@@ -21243,6 +21275,35 @@ M0146-0001 re-baseline census on the new default arm.
     before and after the restart — the catalog reload probably resolves the
     explicit opclass to a different key encoding than the one the index was
     built with.
+  - Root cause \(confirmed\): the live catalog kept
+    `ColOpClasses\[0\]=="int4_ops"` while the checkpoint-restart path
+    reverse-resolves the identical `indclass` OID to `""`
+    \(`ResolveIndexColumnOpclassName`\'s default\-equivalence arm — correct
+    for indexdef rendering\). `buildPGIndexKeyDesc` refuses non\-empty
+    `ColOpClasses\[i\]`, so the on\-disk\-format decision flipped across the
+    restart — goopg blob keys at CREATE, PG per\-datum tuple keys after —
+    and probes encoded keys the index was never written in.
+  - Fix \(M0146\-0015e\): `createBTreeIndex` normalises an explicit opclass
+    that resolves to the column type\'s own default opclass OID to `""`
+    before `bulkBuildBTreeFull` and the WAL/catalog\-heap emission — PG\'s
+    `indclass` cannot distinguish them either \(the default opclass is not
+    spelled out in indexdef\). Non\-default opclasses
+    \(`text_pattern_ops`, user\-created\) keep their spelling and stay on
+    the blob format on both sides.
+  - Regression test:
+    `TestExplicitDefaultOpclassIndexSurvivesCheckpointedRestart`
+    \(initdb\) — pins the normalised entry, asserts the probe plans an
+    IndexScan, verifies `count\(\*\)=49` before AND after the checkpointed
+    restart; fails pre\-fix.
+  - Gates: units PASS, tpch\-spotcheck PASS \(Q12=2, Q13=33\), live repro
+    `before|49` / `after|49|1`.
+  - Deferred \(ledgered\): a pre\-fix explicit\-opclass image is blob
+    format with no on\-disk marker — a post\-fix restart still misreads
+    it; repair is REINDEX \(a durable per\-index format marker is the only
+    automatic fix — no PG\-shaped field exists for it\).
+  - **DONE 2026\-09\-27.** Design
+    `docs/design/0100\-0149/m0146\-0015e\-explicit\-default\-opclass\-restart.md`;
+    evidence `analysis/m0146/m0146\-0015e/`.
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — explicit\-opclass indexes return wrong rows after restart
   >
