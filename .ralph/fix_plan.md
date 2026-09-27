@@ -22646,6 +22646,39 @@ M0146-0001 re-baseline census on the new default arm.
       \(operators\_analyze\_test.go\).
   Movement: none expected — statistics-taking visibility, not a plan input
   the corpus exercises
+- [x] **M0146\-0005y — SF0\.25 residual re\-routing at `32d779e41`**
+  \(recon, filed and done 2026\-09\-27\): fresh first\-divergence census on
+  the post\-slice\-25 fire\-set captures \(89 divergent / 10 match\), one
+  flag experiment, one live DPPATH trace. Evidence
+  `analysis/m0146/m0146\-0005/residual\-triage\-20260927/`.
+  Kind: recon
+  Parent: M0146\-0005
+  - `GOOPG_PARTIAL_SORT_PATHS=on` full capture \(private clone
+    `tmp/m0146\-0005\-pson\-data\-tpcds\-sf025`\): **zero plan movement** —
+    header\-only diff, all 99 first\-divergence records byte\-identical.
+    The Sorts sit above join spines `findPartialSubtree` cannot reach, so
+    the priced tournament never fires; the flag\-off type switch was not
+    the binding constraint on this corpus. Do not flip the default as a
+    parity move \(C\-19e design §6\.5's re\-pin parking reason stands\).
+  - Q91 traced: `depth=5` swapped NL children is the
+    `match_unsorted_outer` matpath mechanism \(joinpath\.c:1893\) — goopg's
+    `addNestLoopPathFor` always prices a cache\-replay rescan \(take2
+    P2\-06\); PG prices raw\-rescan vs `create_material_path` as separate
+    candidates and the 0\.012 margin flips. Routed to M0146\-0010, scope
+    sharpened there.
+  - Q14 routed to M0146\-0007 \(`avg_sales` CTE placement\); the
+    8 qual\-placement records \(Q13/Q24/Q46/Q48/Q68/Q78/Q94/Q95\) are
+    PG pushing composite OR join clauses into the parameterised inner
+    index scan's `Filter:` \(verified Q13/Q48\) → M0146\-0012/0012a;
+    parameterisation → 0011; IOS → 0019; Subquery\-Scan arms → 0026/0007;
+    WindowAgg/Group/grouping\-sets cells → 0017/0018/0020a;
+    aggregation\-strategy → 0009 \+ the M0141\-S4/S5/S6 chain.
+  - One family had no owner: `PG Nested Loop Inner | goopg Sort` under
+    `GroupAggregate` \+ `PG Gather Merge | goopg Sort` \+ `PG Gather |
+    goopg Nested Loop` \(Q6/Q17/Q25/Q29/Q50/Q77 and kin, ~10 records\) —
+    PG's partial subtree covers the parameterised NL chain; goopg's stops
+    early. Filed as M0146\-0027.
+  Movement: none — routing recon
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -22849,6 +22882,18 @@ M0146-0001 re-baseline census on the new default arm.
   Q65 Q77 Q78 Q91).
   Kind: impl
   Parent: M0144-0011c
+  - **Q91 trace sharpening 2026\-09\-27** \(M0146\-0005y;
+    `analysis/m0146/m0146\-0005/residual\-triage\-20260927/q91\-dppath\-rel0\-6\.txt`\):
+    the missing piece is the path\-level two\-candidate adjudication, not
+    only node emission. `match_unsorted_outer` \(joinpath\.c:1893\) files
+    NL over the raw cheapest inner AND over `create_material_path`'s
+    output; goopg's `addNestLoopPathFor` \(pathgen\.go:205\-218\)
+    collapses both into one cache\-replay rescan price \(take2 P2\-06\).
+    On Q91 both orientations sit in the pathlist 0\.012 apart and the
+    wrong one wins. Slice \(3\) must therefore cost raw rescan and
+    matpath rescan as separate candidates — the cost gap is what both
+    elects `Materialize` when it pays \(Q8\) and flips the orientation
+    when it doesn't \(Q91\).
 - [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
   (recon; M0145-0010's residual). Re-measure the `lateral` decline
   family on the new default arm (2 fires today — Q30/Q68, posthoc
@@ -22979,6 +23024,30 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: port the is\_sorted arm \(sorted rollups over the
     `extract\_rollup\_sets` chains, hash\_mem\-bounded mixed choice\) as a
     candidate the grouping upper rel can cost.
+
+- [ ] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
+  2026\-09\-27 by M0146\-0005y's residual re\-routing, the last unowned
+  SF0\.25 first\-divergence family\). ~10 records: `PG Nested Loop Inner |
+  goopg Sort` under `GroupAggregate` \(Q6/Q17/Q25/Q29/Q50/Q77\), `PG
+  Gather Merge | goopg Sort` under `GroupAggregate`/`Unique`/`Group`/
+  `Limit`, `PG Gather | goopg Nested Loop Inner` under `Sort`, `PG
+  Partial GroupAggregate | goopg Sort` under `Gather Merge`. PG's
+  `generate_gather_paths` covers the whole parameterized\-NL chain and a
+  `Gather Merge` over per\-worker Sort carries ordering through the NLs
+  above it, so the upper `GroupAggregate`/`Limit` consumes presorted
+  input. goopg's parallel post\-pass lands the Gather deeper — in Q17 on
+  the `sr ⋈ d2` NL — and the Sorts above the join spine are unreachable
+  to `findPartialSubtree`, which is also why
+  `GOOPG_PARTIAL_SORT_PATHS=on` moved zero plans on this corpus.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: on a private SF0\.25 clone, trace where
+    `findPartialSubtree`/`terminatesPartial` stops on Q17's spine and
+    whether `MaybeAddGather` can reach the GroupAggregate\-feeding Sort;
+    then either extend the partial\-subtree walk or offer Gather\-Merge
+    over the deeper Sort through `partialSortRootPays`'s already\-costed
+    arm. Witnesses to pin: Q17 \(PG `Gather Merge -> Sort` carrying
+    `i_item_id, i_item_desc, s_state` into the outer NLs\), Q6/Q25.
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
