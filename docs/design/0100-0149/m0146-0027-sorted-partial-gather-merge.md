@@ -312,6 +312,54 @@ moved deeper on Q37/Q55/Q71; sweep PASS=96 / 0 mismatches; fireset PASS
 `TestGatherOverParallelHashProbeSetOpIdentity` (pre-fix: 80/120 rows for
 a 40-row join).
 
+## Slice 5 (2026-09-28): Parallel Hash join as a SetOp branch driver
+
+The ledgered deferral (M0146-0002 slice 2): PG files Parallel Hash
+joins inside Parallel Append subpaths — Q71's three UNION ALL legs each
+elect a `sales ⋈ date_dim` PHJ — but goopg refused
+`PathHashJoin.ParallelHash` in `setOpBranchDrivingKindIsSupported` on
+the grounds that branch claim sets carry no per-join build state.
+
+Auditing the claim model showed the executor half had already gone
+generic: `collectShareableJoins` descends both `*setOp` branches,
+`ParallelHashJoinsIn` reaches SetOp children through
+`parallelChildren`, slice 4's `attachAll` arm runs
+`attachParallelHashBuildSides(op)` at the setOp node (a branch-local PHJ
+gets its `hashBuildBranch` claim from the leaf claim set), and the
+`parallelHashBuild` barrier is keyed per optimizer join regardless of
+position in the tree. The only live gate was the admission refusal
+itself.
+
+**Change**: the `PathHashJoin` arm of
+`setOpBranchDrivingKindIsSupported` admits `ParallelHash` when the build
+child's driving kind is `PathSeqScan` — mirroring the top-level
+`partialPathDrivingKind` arm exactly. `partialPathDrivingKind` answers
+the *terminal* driving kind, so a merge-join build over a seqscan outer
+is admitted (each participant merge-joins its claimed partition against
+the shared table) while bitmap- and index-driven builds stay refused: an
+unclaimed bitmap build would find no prebuilt bitmap in the leaf claim
+set and feed the whole relation into the shared table once per
+participant — the slice-4 defect class, kept fail-closed. No executor
+code changed.
+
+**Tests**: `TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild`
+(admission matrix), `TestAttachAllWiresHashBuildInsideSetOpBranch`
+(claim wiring when the PHJ is the branch driver),
+`TestGatherOverSetOpBranchParallelHashIdentity` (e2e serial-vs-parallel
+at 1/2/4 workers). The slice-4 "unrunnable branch" fixtures used a
+seq-build PHJ — now runnable — and were re-pinned on a bitmap-driven
+build.
+
+**Result**: Q71 emits PG's shape end to end — `Gather -> NL -> NL ->
+Parallel Append -> per-leg Parallel Hash Join -> Index Scan item ->
+Index Scan time_dim`, 290 rows, oracle checksum `e9f1fcd7c28a1f8f`.
+Q76 gains per-leg PHJs inside its `Gather Merge -> Parallel Append`.
+SF0.25 sweep PASS=96 / 0 mismatches (plans changed: Q14/Q71/Q76);
+fireset PASS (SF0.25 fires Q14/Q71/Q76, SF1 Q5/Q14/Q71/Q75/Q76, both
+arms). Evidence `analysis/m0146/m0146-0027/slice5/`; the M0146-0002
+slice-2 deferral row's mechanism is closed (the row's status flip is
+owner/M0119 bookkeeping — the loop's ledger is append-only).
+
 ## Open
 
 - **Placement residue**: goopg elects a 6-rel partial chain where PG
@@ -328,8 +376,10 @@ a 40-row join).
   `Gather Merge`. Owning task M0145-0008y, blocked on M0146-0012
   (correlated restrictions as base-rel index quals). No M0146-0027
   mechanism gap.
-- **Q71 residual**: `join-order` at depth 4 under the shared Gather —
-  PG index-probes `item` inside the NL chain and runs per-leg Parallel
-  Hash joins inside the Append (needs the ledgered per-branch PHJ build
-  state); goopg elects a single PHJ over the append instead.
+- **Q71 residual** (post-slice-5): `join-order` at depth 4 under the
+  shared Gather — the join spine now matches PG (NL chain over the
+  append, item/time_dim index probes); the remaining deltas are the
+  append leg ordering (PG desc store/catalog/web, goopg asc
+  web/catalog/store) and PG's per-leg `Subquery Scan on "*SELECT* N"`
+  wrapper — M0146-0026 territory, not branch reach.
 - `presorted > 0` incremental-sort arm: deferred to M0146-0006 as filed.

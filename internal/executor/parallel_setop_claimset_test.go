@@ -1420,3 +1420,134 @@ func markSetOpBranchesParallel(n optimizer.Node) {
 	}
 	walk(n)
 }
+
+// TestAttachAllWiresHashBuildInsideSetOpBranch is the wiring half of
+// M0146-0027 slice 5: a Parallel Hash join AS a SetOp branch (PG's
+// `Parallel Append` member shape — Q71's legs) must claim BOTH its probe
+// scan and its build scan — the build through the join's own
+// hashBuildBranch claim set grown on the BRANCH's leaf claim set, not on
+// the gather's flat state and not left unattached. An unattached build
+// feeds the whole relation into the shared table once per participant
+// (the N-copies defect, in build form).
+func TestAttachAllWiresHashBuildInsideSetOpBranch(t *testing.T) {
+	probeScan := &seqScanOp{}
+	buildScan := &seqScanOp{}
+	j := &optimizer.Join{
+		Algo:         optimizer.JoinAlgoHash,
+		Type:         optimizer.JoinTypeInner,
+		ParallelHash: true,
+	}
+	// probe = left (BuildLeft false): left is the partitioned probe.
+	branchJoin := &joinOp{plan: j, left: probeScan, right: buildScan}
+	otherScan := &seqScanOp{}
+	so := &setOp{
+		plan:  &optimizer.SetOp{Op: parser.SetOpUnion, All: true},
+		left:  branchJoin,
+		right: otherScan,
+	}
+
+	cs := newParallelClaimSet()
+	if !cs.attachAll(so) {
+		t.Fatal("attachAll reported nothing attached")
+	}
+	if probeScan.pscan != cs.setOpLeft.pscan {
+		t.Error("branch probe scan not wired to the left branch's claim set")
+	}
+	if otherScan.pscan != cs.setOpRight.pscan {
+		t.Error("right branch scan not wired to the setOpRight claim set")
+	}
+	want := cs.setOpLeft.hashBuildBranch(j).pscan
+	if buildScan.pscan != want {
+		t.Error("in-branch parallel build scan not wired to the join's hashBuildBranch " +
+			"claim set — every participant would feed the whole build relation into the shared table")
+	}
+	if buildScan.pscan == cs.setOpLeft.pscan {
+		t.Error("in-branch build scan took the branch's flat pscan — probe and build " +
+			"must claim against different sets (parallelScanState's first-open boundary)")
+	}
+}
+
+// TestGatherOverSetOpBranchParallelHashIdentity is the slice-5 e2e gate:
+// Gather → SetOp(UNION ALL) whose LEFT branch is a Parallel Hash join
+// (probe = partial seqscan on pq_setop_a, build = partial seqscan on
+// pq_setop_c) and whose right branch is a plain scan on pq_setop_b.
+// Every row of both branches must come back exactly once at any worker
+// count — the branch PHJ's build is claimed per-partition through the
+// branch leaf's hashBuildBranch set, so the shared table holds each build
+// row once, not once per participant.
+func TestGatherOverSetOpBranchParallelHashIdentity(t *testing.T) {
+	ctx, cleanup := parallelSetOpFixture(t)
+	defer cleanup()
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const joinSQL = "SELECT a.id FROM pq_setop_a a JOIN pq_setop_c c ON a.id = c.aid"
+
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			// Serial baseline: drain the union before any parallel marking.
+			leftSerial := planHashForced(t, ctx, joinSQL)
+			rightSerial := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			serial := &optimizer.SetOp{Left: leftSerial, Right: rightSerial,
+				Op: parser.SetOpUnion, All: true}
+			advanceStmtCounter(ctx)
+			want := drainPlan(t, ctx, serial)
+			if len(want) != 40+90 {
+				t.Fatalf("serial baseline = %d rows, want %d; the fixture moved",
+					len(want), 40+90)
+			}
+
+			// Replan fresh and mark the branch join Parallel Hash — the
+			// shape a PathSetOp child now lowers to.
+			left := planHashForced(t, ctx, joinSQL)
+			hj := findHashJoin(left)
+			if hj == nil {
+				t.Fatal("no Hash Join in the branch plan; the fixture moved")
+			}
+			hj.ParallelHash = true
+			hj.ParallelAware = true
+			right := planForTest(t, ctx, "SELECT id FROM pq_setop_b")
+			so := &optimizer.SetOp{Left: left, Right: right,
+				Op: parser.SetOpUnion, All: true, ParallelAware: true}
+			markScansParallel(so)
+
+			gathered := optimizer.NewGather(0, so, workers)
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					op.Close()
+					t.Fatalf("next: %v", err)
+				}
+				got = append(got, renderRows([]Row{slot.Row()})...)
+			}
+			if err := op.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			sort.Strings(want)
+			sort.Strings(got)
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d — more means a participant fed the "+
+					"whole build or a whole branch into the shared state (the claim gap)",
+					len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: got %q want %q", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}

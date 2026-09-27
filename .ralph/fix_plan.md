@@ -2529,21 +2529,24 @@ heuristic stays live.)
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-  - Recurred in the 2026\-09\-27 nightly \(`AI-20260927-002707-001`\).
+  - Recurred in the 2026\-09\-27 nightly \(`AI-20260927-002707-001`\) and
+    again in the 2026\-09\-28 nightly \(`AI-20260928-004845-001`\).
 - [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
   (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\) and
-    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-002`\).
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\),
+    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-002`\) and
+    again in the 2026\-09\-28 nightly \(`AI-20260928-004845-002`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
   Parent: none
-  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\) and
-    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\).
+  - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\),
+    again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\) and
+    again in the 2026\-09\-28 nightly \(`AI-20260928-004845-003`\).
 - [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2584,6 +2587,23 @@ heuristic stays live.)
     divergence classes are \(a\) unique violation raised before the SSI
     rw\-dependency check and \(b\) a committed read that should have
     tripped a dangerous\-structure abort\.
+
+### Nightly run 20260928-004845 (sha `2ddc97fddc1f`, 4 items) — filed 2026-09-28
+- [ ] **testport/TestPort_RegressSuite/limit re-fails** \(AI\-20260928\-004845\-004;
+  repro: `go test \-v \-run '^TestPort_RegressSuite$/^limit$' ./internal/testport/`,
+  evidence `ci/logs/20260928-004845/testport/go-test.log`\). New tonight: the
+  must\-pass `limit` regress subtest output diverges again after the
+  2026\-09\-18 `FETCH BACKWARD` fix \(closed task above\); the nightly
+  message says "output mismatch; normalization rules need extension"\.
+  The three isolation AI items \-001/\-002/\-003 recur — recurrence
+  noted on their open tasks above; no new entries needed\.
+  Kind: impl
+  Parent: none
+  - First step: run the subtest and diff `limit.out` against
+    `postgres/src/test/regress/expected/limit.out` — identify whether the
+    mismatch is a new normalization gap or a cursor/fetch regression
+    \(the 2026\-09\-18 fix touched `executeFetch`'s backward\-position
+    bookkeeping\).
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
@@ -23264,7 +23284,42 @@ M0146-0001 re-baseline census on the new default arm.
     - Q71 residual is `join\-order` at depth 4 under the shared Gather
       \(PG index\-probes item + per\-leg PHJ — the ledgered per\-branch
       PHJ build state\); cost\-space difference, not reach\.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\)
+  - Slice 5 landed 2026\-09\-28 — Parallel Hash join admitted as a
+    SetOp branch driver; the M0146\-0002 slice\-2 deferral row's
+    mechanism is closed \(row status flip is owner/M0119 bookkeeping —
+    the loop's ledger is append\-only\)\. Evidence
+    `analysis/m0146/m0146\-0027/slice5/`\.
+    - Audit found the executor half already generic:
+      `collectShareableJoins` descends both `\*setOp` branches,
+      `ParallelHashJoinsIn` reaches SetOp children through
+      `parallelChildren`, slice\-4 `attachAll` runs
+      `attachParallelHashBuildSides\(op\)` at the setOp node \(branch\-
+      local PHJ claims from the leaf claim set\), and
+      `parallelHashBuild` is keyed per optimizer join\. The only live
+      gate was the admission refusal itself\.
+    - `setOpBranchDrivingKindIsSupported`'s PathHashJoin arm now admits
+      `ParallelHash` iff the build child's driving kind is
+      `PathSeqScan` — the top\-level arm's own restriction, so a
+      merge\-join build over a seqscan outer is admitted while
+      bitmap\-/index\-driven builds stay fail\-closed \(an unclaimed
+      build is the N\-copies defect\)\. No executor code changed\.
+    - Tests: `TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild`,
+      `TestAttachAllWiresHashBuildInsideSetOpBranch`,
+      `TestGatherOverSetOpBranchParallelHashIdentity` \(1/2/4
+      workers\); slice\-4 refused fixtures re\-pinned on a
+      bitmap\-driven build\.
+    - Measured \(private SF0\.25 :5590\): Q71 emits PG's spine end to
+      end — `Gather \-> NL \-> NL \-> Parallel Append \-> per\-leg
+      Parallel Hash Join\(sales ⋈ date\_dim\) \-> idx item \-> idx
+      time\_dim`, 290 rows ck=`e9f1fcd7c28a1f8f` oracle\-exact; Q76
+      gains per\-leg PHJs\. Sweep PASS=96 MISMATCH=0 \(plans changed
+      Q14/Q71/Q76\)\. Remaining delta: append leg ordering \(PG desc
+      cost, goopg asc\) \+ per\-leg Subquery Scan — M0146\-0026
+      territory\.
+    - Gates: spotcheck PASS \(Q12=2 Q13=33\), acceptance 24 MATCH,
+      fireset PASS \(SF0\.25 fires Q14/Q71/Q76, SF1
+      Q5/Q14/Q71/Q75/Q76, both arms\), units pass\.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\); Q71 emits PG's full NL\-over\-ParallelAppend\-\>per\-leg\-PHJ spine and Q76 gains per\-leg PHJs \(slice 5; all\-depth categories join\-method 46\->45, parallelism 54\->53 SF0\.25; first\-divergence record relabels only — Q76 sort\-strategy\->aggregation\-strategy\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

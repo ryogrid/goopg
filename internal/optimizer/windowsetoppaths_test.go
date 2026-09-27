@@ -1606,9 +1606,10 @@ func TestPartialPathDrivingKindRefusesSetOpWithBadMergeJoinBranch(t *testing.T) 
 
 // TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial pins the
 // cheapest-RUNNABLE branch pick: a branch whose cheapest partial is a
-// Parallel Hash Join — a shape a SetOp branch cannot drive because the
-// branch claim sets carry no per-join build state (M0146-0002 slice 2's
-// ledgered deferral; setOpBranchDrivingKindIsSupported's PathHashJoin arm)
+// shape the branch claim sets cannot drive — a Parallel Hash Join whose
+// BUILD side is not a plain partial seq scan (a bitmap-driven build finds
+// no prebuilt bitmap in the join's leaf claim set; M0146-0027 slice 5's
+// kept refusal in setOpBranchDrivingKindIsSupported's PathHashJoin arm)
 // — must fall through to the next runnable entry. Picking [0] blind
 // produces a PathSetOp that makeGatherPath can only refuse: filed, never
 // gatherable. TPC-DS Q71 is the corpus witness (all three UNION ALL legs
@@ -1617,7 +1618,7 @@ func TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial(t *testing.T) {
 	cp := defaultCostParams()
 	probe := &Path{Kind: PathSeqScan, Rows: 500, Cost: Cost{Total: 40},
 		ParallelSafe: true, ParallelWorkers: 2}
-	build := &Path{Kind: PathSeqScan, Rows: 10, Cost: Cost{Total: 5}}
+	build := &Path{Kind: PathBitmapHeapScan, Rows: 10, Cost: Cost{Total: 5}}
 	phj := &Path{Kind: PathHashJoin, ParallelHash: true, Rows: 50,
 		Cost: Cost{Startup: 3, Total: 50}, ParallelSafe: true, ParallelWorkers: 3,
 		Children: []*Path{probe, build}}
@@ -1668,14 +1669,15 @@ func TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial(t *testing.T) {
 }
 
 // TestSetOpBranchPickSkipsUnrunnablePartial pins the same runnable filter on
-// the mixed arm's partial candidate — a Parallel Hash partial that is the
-// cheapest entry must not win the pick when a runnable partial follows it.
+// the mixed arm's partial candidate — a Parallel Hash partial whose build
+// side is not a plain partial seq scan is still unrunnable in a SetOp
+// branch and must not win the pick when a runnable partial follows it.
 func TestSetOpBranchPickSkipsUnrunnablePartial(t *testing.T) {
 	probe := &Path{Kind: PathSeqScan, Rows: 500, Cost: Cost{Total: 40},
 		ParallelSafe: true, ParallelWorkers: 2}
 	phj := &Path{Kind: PathHashJoin, ParallelHash: true, Rows: 50,
 		Cost: Cost{Total: 50}, ParallelSafe: true, ParallelWorkers: 3,
-		Children: []*Path{probe, {Kind: PathSeqScan}}}
+		Children: []*Path{probe, {Kind: PathBitmapHeapScan}}}
 	runnable := &Path{Kind: PathSeqScan, Rows: 50,
 		Cost: Cost{Total: 70}, ParallelSafe: true, ParallelWorkers: 2}
 	branch := &RelOptInfo{PartialPathlist: []*Path{phj, runnable}}
@@ -1690,5 +1692,53 @@ func TestSetOpBranchPickSkipsUnrunnablePartial(t *testing.T) {
 	partial, nonPartial = setOpBranchPick(&RelOptInfo{}, onlyPhj, nil, true)
 	if partial != nil || nonPartial != nil {
 		t.Fatalf("pick = (%v, %v), want (nil, nil) with no runnable partial", partial, nonPartial)
+	}
+}
+
+// TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild pins the M0146-0027
+// slice-5 admission: a Parallel Hash join IS runnable as a SetOp branch
+// when its build side is seq-scan-DRIVEN — the branch's leaf claim set
+// grows the join's hashBuildBranch (attachAll's flat walk), and
+// registration reaches it through parallelChildren's *SetOp descent
+// (ParallelHashJoinsIn). The kept refusal is the top-level arm's own:
+// partialPathDrivingKind answers the build's TERMINAL driving kind, so a
+// merge-join build over a seqscan outer is admitted (each participant
+// merge-joins its claimed outer partition against the whole inner) while
+// a bitmap- or index-driven build finds no claim state in the leaf set
+// and would feed the whole relation into the shared table once per
+// participant.
+func TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild(t *testing.T) {
+	scan := func() *Path {
+		return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
+	}
+	phj := func(build *Path) *Path {
+		return &Path{Kind: PathHashJoin, ParallelHash: true, ParallelSafe: true,
+			ParallelWorkers: 2, Children: []*Path{scan(), build}}
+	}
+	cases := []struct {
+		name    string
+		branch  *Path
+		wantRef bool
+	}{
+		{"parallel-hash-seq-build", phj(scan()), false},
+		{"parallel-hash-merge-over-seq-build", phj(&Path{Kind: PathMergeJoin,
+			Children: []*Path{scan(), scan()}}), false},
+		{"parallel-hash-bitmap-build", phj(&Path{Kind: PathBitmapHeapScan}), true},
+		{"parallel-hash-index-build", phj(&Path{Kind: PathIndexScan}), true},
+		{"parallel-hash-merge-over-bitmap-build", phj(&Path{Kind: PathMergeJoin,
+			Children: []*Path{{Kind: PathBitmapHeapScan}, scan()}}), true},
+		{"plain-hash-any-build", &Path{Kind: PathHashJoin, ParallelSafe: true,
+			ParallelWorkers: 2, Children: []*Path{scan(), {Kind: PathBitmapHeapScan}}}, false},
+	}
+	for _, tc := range cases {
+		setOp := &Path{Kind: PathSetOp, Children: []*Path{scan(), tc.branch}}
+		got := partialPathDrivingKind(setOp)
+		want := PathSetOp
+		if tc.wantRef {
+			want = PathPrebuilt
+		}
+		if got != want {
+			t.Errorf("%s: partialPathDrivingKind = %v, want %v", tc.name, got, want)
+		}
 	}
 }

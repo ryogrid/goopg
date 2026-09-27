@@ -910,9 +910,17 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		if p.RequiredOuter != 0 || len(p.Children) != 2 {
 			return false
 		}
-		// M0146-0002: no Parallel Hash inside a partial SetOp branch — the
-		// branch claim sets carry no per-join build state.
-		if p.ParallelHash {
+		// M0146-0027 slice 5: a Parallel Hash join inside a branch is
+		// claimed the same way a top-level one is — the branch's leaf
+		// claim set grows the join's own hashBuildBranch set
+		// (attachParallelHashBuildSides), registration reaches it through
+		// parallelChildren's *SetOp arm (ParallelHashJoinsIn), and
+		// stampParallelScan labels the build side through the *SetOp
+		// branch descent. The same build-side restriction the top-level
+		// PathHashJoin arm carries applies: only a seq-scan-driven build
+		// — a bitmap build would find no prebuilt bitmap in the leaf
+		// claim set, and an unclaimed build is the N-copies defect.
+		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
 			return false
 		}
 		return setOpBranchDrivingKindIsSupported(p.Children[0])
