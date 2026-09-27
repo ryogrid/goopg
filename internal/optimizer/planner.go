@@ -4173,7 +4173,15 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// leftCtx so SRF args on the right see both. M0103-0008.
 		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
 		if j.Right.Subquery != nil && !j.Right.Lateral {
-			joinLateralCtx = nil
+			// Non-LATERAL: same-level siblings (leftCtx/joinLateralCtx)
+			// stay invisible inside the right subquery, but outer query
+			// levels do not — PG links the parent ParseState regardless
+			// of rte->lateral. A binding-free link to planParent does
+			// both jobs at once: sibling names still miss, and a
+			// correlated ref counts the extra level openLateral's
+			// left-row push adds at runtime (the Join flips Lateral on
+			// the resolved OuterColumnRef). M0146-0015h.
+			joinLateralCtx = &resolveContext{parent: planParent}
 		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
@@ -5608,6 +5616,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 	ctx := &resolveContext{cat: cat, settings: ps}
 	if lateralCtx != nil {
 		ctx.parent = lateralCtx
+	} else {
+		// M0146-0015h: same wiring as planSubqueryRangeVar's nil arm —
+		// non-LATERAL closes same-level siblings, not outer levels.
+		ctx.parent = planParent
 	}
 	// A-01(ii) cut 2: VALUES cells may hang scalar subqueries (F6 records
 	// the RTE consumption at the planScanRangeVar level); they allocate
@@ -5796,7 +5808,16 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// is consumed and cleared inside each member scope, so nothing
 		// deeper inherits it (plannersettings.go).
 		ps.appendrelMember = appendrelSubquery
-		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps, scope)
+		// M0146-0015h: non-LATERAL hides same-level FROM siblings, not
+		// outer query levels — PG links the parent ParseState for every
+		// subquery-in-FROM regardless of rte->lateral, so a correlated
+		// ref inside the derived body (WHERE/ON/targets) must reach the
+		// enclosing scope. planParent is that enclosing statement's ctx;
+		// its bindings never include this statement's own FROM items, so
+		// sibling visibility stays closed while level-1 outer refs land
+		// on the pushed subplan-boundary row (no openLateral hop exists
+		// on this arm).
+		inner, err = planSelectWithParent(rv.Subquery, cat, planParent, ps, scope)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
