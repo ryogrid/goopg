@@ -1,0 +1,60 @@
+=== PG rel headers (b1=date_dim b2=store_sales b3=item b4=customer b5=customer_address b6=store) ===
+2:=== rel=(b 1) npath=3 npart=2 total=[SeqScan rows=30 cost=0..2519.73] startup=[SeqScan rows=30 cost=0..2519.73] param=[IndexScan rows=1 cost=0.2925..0.324035]
+19:=== rel=(b 2) npath=3 npart=2 total=[SeqScan rows=719876 cost=0..20134.8] startup=[SeqScan rows=719876 cost=0..20134.8] param=[BitmapHeapScan rows=44 cost=4.56122..120.777]
+36:=== rel=(b 3) npath=4 npart=1 total=[SeqScan rows=293 cost=0..1509] startup=[SeqScan rows=293 cost=0..1509] param=[IndexScan rows=1 cost=0.2875..0.314924]
+51:=== rel=(b 4) npath=3 npart=2 total=[SeqScan rows=100000 cost=0..3872] startup=[SeqScan rows=100000 cost=0..3872] param=[IndexScan rows=1 cost=0.2925..0.327492]
+68:=== rel=(b 5) npath=3 npart=2 total=[SeqScan rows=50000 cost=0..1636] startup=[SeqScan rows=50000 cost=0..1636] param=[IndexScan rows=1 cost=0.29..0.3585]
+85:=== rel=(b 6) npath=3 npart=0 total=[SeqScan rows=12 cost=0..1.12] startup=[SeqScan rows=12 cost=0..1.12] param=[IndexScan rows=1 cost=0.135..0.152517]
+
+=== PG {1,2} joinrel: elected partial hash (ss probe-side, dd build) ===
+94:=== rel=(b 1 2) npath=9 npart=2 total=[Gather rows=283 cost=3068.78..18964.9 psafe=0] startup=[NestLoop rows=283 cost=0..346595] param=[Gather rows=283 cost=3068.78..18964.9]
+
+=== PG {2,3} joinrel: elected partial hash (ss probe-side, item build) ===
+161:=== rel=(b 2 3) npath=8 npart=1 total=[Gather rows=11718 cost=2418.5..19458.2 psafe=0] startup=[NestLoop rows=11718 cost=0..3.18532e+06] param=[Gather rows=11718 cost=2418.5..19458.2]
+
+=== PG {1,2,3} joinrel: the race ===
+444:=== rel=(b 1 2 3) npath=13 npart=1 total=[Gather rows=5 cost=3069.06..18965.7 psafe=0] startup=[NestLoop rows=5 cost=0..349348] param=[Gather rows=5 cost=3069.06..18965.7]
+    padd      NestLoop rows=2 cost=2069.06..17965.2 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    pok       NestLoop rows=2 cost=2069.06..17965.2 pw=3 jt=INNER out=(b 1 2) in=(b 3) removed=1
+    padd      NestLoop rows=2 cost=2069.07..17967.5 pw=3 jt=INNER out=(b 1 2) in=(b 3)
+    prej      NestLoop rows=2 cost=2069.07..17967.5 pw=3 jt=INNER out=(b 1 2) in=(b 3) by=[NestLoop rows=2 cost=2069.06..17965.2] via=tie cmp=keys:EQ
+    prej      NestLoop rows=2 cost=2068.78..19846.2 pw=3 jt=INNER out=(b 1 2) in=(b 3) by=[NestLoop rows=2 cost=2069.06..17965.2] via=cost cmp=keys:EQ
+    ppreskip  dis=0 cost=74337.9..74337.9 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=74364.1..74364.1 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=74365..74365 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=74337.9..74337.9 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=75859.7..75859.7 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=76169.3..76169.3 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=19355.3..19355.3 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=19449.5..19449.5 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+    ppreskip  dis=0 cost=25980..25980 pk=0 par=- by=[NestLoop rows=2 cost=2069.06..17965.2]
+=== PG {1,2} elected partial hash + param field ===
+    padd      HashJoin rows=91 cost=2068.78..17936.6 pw=3 jt=INNER out=(b 2) in=(b 1)
+    pok       HashJoin rows=91 cost=2068.78..17936.6 pw=3 jt=INNER out=(b 2) in=(b 1) removed=1
+    ppreskip  dis=0 cost=18358.8..18358.8 pk=0 par=- by=[HashJoin rows=91 cost=2068.78..17936.6]
+
+=== PG {2,3} elected partial hash ===
+=== rel=(b 2 3) npath=8 npart=1 total=[Gather rows=11718 cost=2418.5..19458.2 psafe=0] startup=[NestLoop rows=11718 cost=0..3.18532e+06] param=[Gather rows=11718 cost=2418.5..19458.2]
+    padd      HashJoin rows=3780 cost=1418.5..17286.4 pw=3 jt=INNER out=(b 2) in=(b 3)
+    pok       HashJoin rows=3780 cost=1418.5..17286.4 pw=3 jt=INNER out=(b 2) in=(b 3) removed=1
+    padd      HashJoin rows=3780 cost=1512.66..17380.6 pw=3 jt=INNER out=(b 2) in=(b 3)
+    prej      HashJoin rows=3780 cost=1512.66..17380.6 pw=3 jt=INNER out=(b 2) in=(b 3) by=[HashJoin rows=3780 cost=1418.5..17286.4] via=tie cmp=keys:EQ
+    ppreskip  dis=0 cost=108159..108159 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=3.4646e+06..3.4646e+06 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=22190..22190 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=22211..22211 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=1.05857e+06..1.05857e+06 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=22307.7..22307.7 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    ppreskip  dis=0 cost=38996..38996 pk=0 par=- by=[HashJoin rows=3780 cost=1418.5..17286.4]
+    add       Gather rows=11718 cost=2418.5..19458.2 psafe=0
+    ok        Gather rows=11718 cost=2418.5..19458.2 psafe=0 removed=0
+    add       GatherMerge rows=11718 cost=18511.1..19897.4 pk=4 psafe=0
+    ok        GatherMerge rows=11718 cost=18511.1..19897.4 pk=4 psafe=0 removed=0
+
+=== PG {1,2,3}: arm-B verdicts (the losing orientation) ===
+    padd      NestLoop rows=2 cost=1418.5..9.5433e+06 pw=3 jt=INNER out=(b 2 3) in=(b 1)
+    prej      NestLoop rows=2 cost=1418.5..9.5433e+06 pw=3 jt=INNER out=(b 2 3) in=(b 1) by=[NestLoop rows=2 cost=2069.06..17965.2] via=cost cmp=keys:EQ
+    padd      NestLoop rows=2 cost=1418.81..17971.5 pw=3 jt=INNER out=(b 2 3) in=(b 1)
+    prej      NestLoop rows=2 cost=1418.81..17971.5 pw=3 jt=INNER out=(b 2 3) in=(b 1) by=[NestLoop rows=2 cost=2069.06..17965.2] via=tie cmp=keys:EQ
+    padd      NestLoop rows=2 cost=1418.5..21507.2 pw=3 jt=INNER out=(b 2 3) in=(b 1)
+    prej      NestLoop rows=2 cost=1418.5..21507.2 pw=3 jt=INNER out=(b 2 3) in=(b 1) by=[NestLoop rows=2 cost=2069.06..17965.2] via=cost cmp=keys:EQ

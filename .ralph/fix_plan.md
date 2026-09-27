@@ -22679,6 +22679,33 @@ M0146-0001 re-baseline census on the new default arm.
     PG's partial subtree covers the parameterised NL chain; goopg's stops
     early. Filed as M0146\-0027.
   Movement: none — routing recon
+- [x] **M0146\-0005z — Q19 `{ss,dd,item}` seed order is a priced\-input
+  divergence, not a mechanism gap** \(recon, filed and done
+  2026\-09\-27\): M0146\-0027 slice 3 moved Q19's record off the aggregate
+  shape onto depth\-10 join order — PG seeds `store_sales ⋈ date_dim`,
+  goopg seeds `store_sales ⋈ item`. Instrumented\-PG candidate trace
+  \+ goopg DPPATH on private SF0\.25 clones; evidence
+  `analysis/m0146/m0146\-0005/slice26/`.
+  Kind: recon
+  Parent: M0146-0005
+  - Both seeds and both NL orientations are generated and priced by both
+    engines; `addToPartialPathlist` already carries
+    `add_partial_path`'s fuzzy/incumbent semantics \(code\-verified\).
+    PG prices the arms 17965\.2 vs 17971\.5 \(Δ6\.3 — fuzzy tie, filing
+    order keeps the ss⋈dd seed\); goopg prices them 17941\.20 vs
+    17860\.95 \(Δ80\.25\) and elects ss⋈item legitimately at its own
+    prices.
+  - Decomposition: −44 on the `{ss,item}` build and −21 on `{ss,dd}` from
+    physical `relpages` \(item 1242 vs 1284, dd 1405 vs 1424, ca 1088 vs
+    1136, customer 2854 vs 2872, ss −2 — post\-R23 heap\-density residual
+    on varchar/char\-rich dims; the arithmetic closes exactly\); −66\.5 on
+    the memoized dd probe \(per\-probe 0\.287 vs 0\.324, ~11%, inside the
+    `indexProbeMultiplier=2` compensation; cache\-key stats equivalent\).
+  - Routing: density residual → `m0140\-0005\-nonplanner\-heap\-density\-floor`
+    ledger row \(its resume point's unnamed on\-disk representation
+    difference — now quantified on the post\-fix corpus\); probe epsilon →
+    M0142\-0005c cost\-model lineage. No planner change justified.
+  Movement: none — routing recon
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
