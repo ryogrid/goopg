@@ -21418,7 +21418,14 @@ M0146-0001 re-baseline census on the new default arm.
     `lateralCtx.bindings` — non\-LATERAL `VALUES \(o.\*\)` must error
     too, matching PG.
 
-- [ ] **`coalesce\(d.c, e.c\) IS NOT NULL` demotes a FULL JOIN to inner**
+- [x] **`coalesce\(d.c, e.c\) IS NOT NULL` demotes a FULL JOIN to inner**
+  \(landed as M0146\-0015j — `collectNonNullableWalk`'s `IS NOT NULL` arm
+  now collects the operand's strict refs via new `strictOperandRefs`
+  \(strict ops/functions via proisstrict, casts, collate, NOT, ROW
+  elements\); `coalesce`/`nullif`/`greatest`/`least` miss the pg\_proc
+  proname lookup and contribute nothing, matching PG's missing walker
+  case for CoalesceExpr. `IS NULL` arms tightened to plain `Var`
+  operands like `find_forced_null_var`\):
   \(found 2026\-09\-27 by M0146\-0015g; reproduces at HEAD on any
   corpus\): `select count\(\*\) from tk d full join tk e on e.u1 = d.u2 and
   e.h = 0 where coalesce\(d.u1, e.u1\) is not null` → goopg `Hash Join` /
