@@ -2,8 +2,10 @@
 
 Status: slice 1 landed 2026-09-27 (ORDER BY / GROUP BY stages); slice 2
 landed 2026-09-27 (the partial-DISTINCT producer — `Unique -> Gather
-Merge -> Unique`, §7). Remaining: the Gather-Merge placement residue and
-the `Group`/partial-GroupAggregate records, see §6.
+Merge -> Unique`, §7); slice 3 landed 2026-09-27 (the sorted-input
+partial arm — `Partial GroupAggregate -> Sort`, §8). Remaining: the
+Gather-Merge placement residue, see §6; the Q62/Q99 epsilon-adjudication
+residual, §8's tail.
 
 ## PG behaviour
 
@@ -185,17 +187,100 @@ Q38/Q54/Q87, all clause-level DISTINCT. Tests in distinctpaths_test.go
 workers (`TestPartialUniqueGatherMergeIdentity` — the per-worker dedup +
 leader dedup collapses cross-worker duplicates exactly once).
 
+## Slice 3 (2026-09-27): the sorted-input partial arm
+
+Upstream's `create_partial_grouping_paths` (planner.c:7518-7560) files a
+second aggregation family beside the hashed one this task's earlier
+slices built: for each useful partial ordering it sorts the *input* by
+the group keys and stacks a sorted partial aggregate on top —
+`create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` — so the
+partial streams one serialized state row per group boundary instead of
+draining a hash table. The presorted `Sort -> Partial HashAggregate`
+wrap (M0146-0003d's arm, upstream's `gather_grouping_paths` sort loop)
+files *after* it, which makes filing order the tie-breaker when the two
+land within `comparePathCostsFuzzily`'s tight epsilon — and upstream's
+own `cost_agg` comment makes the contest honest: "AGG_SORTED and
+AGG_HASHED have exactly the same total CPU cost" in the no-spill model,
+so election rides on the sort-volume delta (input rows vs emitted
+groups), the lower sorted-startup, and the hash spill arm at tiny
+work_mem. The shape PG elected on TPC-DS Q19/Q62/Q99:
+
+    Finalize GroupAggregate
+      -> Gather Merge
+           -> Partial GroupAggregate   sorted partial, serialized emit
+                -> Sort                group keys, input space
+                     -> <partial subtree>
+
+**Change** (`internal/optimizer/`, `internal/executor/`):
+
+- **partialaggupper.go — `addPartialAggSortedInputArm`** (producer tag
+  `upper.groupagg.sortinput`), called in `addPartialAggSplitPath`
+  immediately before `addPartialAggSortedSplitArm` to match upstream's
+  file order. Refuses fail-closed on grouping sets, special aggregates,
+  empty group keys, or group keys `transportGroupSortKeys` cannot
+  express as merge keys. Builds `PathAgg{Sorted, PartialEmit} ->
+  PathSort{input-space keys, per-worker rows, ParallelWorkers stamped}
+  -> pseed` under a `PathGatherMerge` whose pathkeys carry through the
+  partial's emitted order, then the existing `PathFinalizeAgg{Sorted}`
+  and normal `addPath` pricing/pruning — no forcing.
+- **createplansimple.go — `createFinalizeAggSortedPlan`** dispatches on
+  the GatherMerge child's `Kind`: `PathSort` is the presorted arm,
+  `PathAgg` the sorted-input arm (its own child is the worker Sort).
+- **parallel.go — `splitAggregateTransportSortedInput`** clones the
+  spec into `Finalize{Sorted, PartialEmit}` over a `GatherMerge` over
+  `Partial{Sorted, PartialEmit}` over `Sort{inputKeys}` over the stamped
+  input. `StripGather` folds it for free: `Simple+Sorted -> Sort ->
+  input` is a valid serial plan via the pre-existing `*Sort` arm in
+  `unstampParallelScan`.
+- **executor/operators_join_agg.go — `openSortedPartialEmit`** is the
+  streaming sibling of `emitPartialStateRows`: `sameGroupKey` boundary
+  detection over the ordered input, one `[keys | passthrough |
+  serialized state]` row per group, sharing the existing sorted
+  transport wire shape and the final's order belt; a `PartialEmit`
+  sorted node without the emit path falls through to the hash drain.
+  Dispatch in `Open` keys on `Mode=Partial && PartialEmit &&
+  Strategy=Sorted && no grouping sets && GroupExprs>0`.
+
+**Election mechanics** (pinned by `TestUpperSplitSortedInputArmElection`
+over direct arm calls): near-saturated groups tie within tight fuzz —
+sorted-input survives on filing order + lower startup; large reduction
+correctly elects the presorted sibling (sorting emitted groups is
+materially cheaper than sorting input); tiny work_mem elects
+sorted-input outright (the hashed arm's spill pricing dominates).
+
+**Evidence** (private SF0.25 clone, `analysis/m0146/m0146-0027/`): Q19
+now emits the PG spine — its first divergence moved past the aggregate
+stage entirely (was `PG Partial GroupAggregate | goopg Sort`, now a
+join-order record at depth 10). Q34/Q42/Q52/Q98 also flipped to the
+sorted-input partial but remain masked by their pre-existing
+split-vs-nosplit first divergences — no new records. Q62/Q99 still elect
+the presorted sibling: the measured contest is si.tot 5966.47 vs sp.tot
+5954.83 (~11.6 units of sort-volume delta, inside std-fuzz but past the
+tight-fuzz tie-breaker), so the sibling wins on cost. That residual is
+epsilon adjudication inside `add_path`'s documented compare — a
+cost-margin question for M0146-0007 territory, not a missing mechanism:
+the arm exists, prices itself, and wins where the model says it should.
+
+**Correctness**: all five flipped plans execute through
+`openSortedPartialEmit` under real Gather Merge — sweep PASS=96 /
+0 mismatches / 0 checksum mismatches; Q19 verified 100/100 rows vs the
+oracle. Executor identity at 1/2/4 workers
+(`TestPartialEmitSortedInputIdentity`) guards the no-over-counting
+invariant. Fireset PASS on all changed plans both arms (SF0.25:
+Q19/Q34/Q42/Q52/Q98; SF1: Q55); TPC-H acceptance arm 24 MATCH; spotcheck
+PASS.
+
 ## Open
 
 - **Placement residue**: goopg elects a 6-rel partial chain where PG
   stops at 5 (Q17/Q25/Q29's depth-4 `PG NL Inner | goopg Gather Merge`)
   — join-order/costing inside the search, not this mechanism.
-- **`Group`/partial-GroupAggregate consumers**: the `is_sorted`
-  iteration exists only at the ORDER BY and GROUP BY stages; slice 2
-  showed `Unique` heads never needed it (DISTINCT has its own partial
-  stage — §7). The remaining `PG Partial GroupAggregate | goopg Sort`
-  records (Q19/Q62/Q99) need a sorted per-worker GroupAggregate mode —
-  a different, larger mechanism than the Unique one.
+- **Q62/Q99 epsilon adjudication**: the sorted-input partial arm landed
+  in §8 and cleared Q19's record, but Q62/Q99 still elect the presorted
+  sibling — measured ~11.6 cost units of sort-volume delta, inside
+  std-fuzz but past the tight-fuzz tie-breaker. The mechanism exists and
+  wins where the model prices it ahead; matching PG's election there is
+  a cost-margin question (M0146-0007 territory), not reach.
 - **Q6**: different composition — no qualifying partial exists on its
   spine.
 - `presorted > 0` incremental-sort arm: deferred to M0146-0006 as filed.

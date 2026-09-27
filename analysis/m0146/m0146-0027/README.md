@@ -186,3 +186,66 @@ was unreachable, not merely unpriced.
 - Placement residue (Q17/Q25/Q29 depth-4) and Q6 unchanged from slice 1.
 - Upstream's partial hashed-DISTINCT arm and empty-pathkeys LIMIT-1 arm:
   declined by construction (ledger-recorded).
+
+# Slice 3 (2026-09-27): sorted-input partial — `Partial GroupAggregate -> Sort`
+
+The residual above named the mechanism: `PG Partial GroupAggregate |
+goopg Sort` records (Q19/Q62/Q99) needed a *sorted* per-worker
+GroupAggregate mode — upstream's `create_agg_path(… AGG_SORTED,
+AGGSPLIT_INITIAL_SERIAL …)` arm of `create_partial_grouping_paths`
+(planner.c:7518-7560), filed *before* the presorted
+`Sort -> Partial HashAggregate` wrap so filing order resolves the tight
+fuzz ties.
+
+## What landed (slice 3)
+
+- `partialaggupper.go` — `addPartialAggSortedInputArm`
+  (`upper.groupagg.sortinput`): worker `Sort` on input-space group keys
+  priced at per-worker rows, sorted `PathAgg{PartialEmit}` over it,
+  `PathGatherMerge` carrying the emitted order, existing
+  `PathFinalizeAgg{Sorted}` on top. Filed first, presorted sibling
+  second — same as upstream.
+- `createplansimple.go` — `createFinalizeAggSortedPlan` dispatches on
+  the GatherMerge child kind (`PathSort` presorted / `PathAgg`
+  sorted-input); `parallel.go` —
+  `splitAggregateTransportSortedInput` builds
+  `Final{Sorted,PartialEmit} -> GM -> Partial{Sorted,PartialEmit} ->
+  Sort -> stamped input`.
+- `operators_join_agg.go` — `openSortedPartialEmit`: boundary detection
+  via `sameGroupKey`, one serialized transport row per group, same wire
+  shape and order belt as the hashed drain. Dispatch gated on
+  `Partial && PartialEmit && Sorted && no grouping sets && keys>0`.
+
+## Evidence
+
+- `census-sf025-slice3.txt` vs slice 2: exactly one record moved — Q19
+  `depth=4 sort-strategy under Gather Merge` -> `depth=10 join-order
+  under Nested Loop` (past the aggregate stage entirely). Rollup:
+  sort-strategy 36->35, join-order 4->5.
+- `q19-goopg-sf025-slice3.txt` vs `q19-pg-sf025-slice3.txt` — identical
+  aggregate spine: `Finalize GroupAggregate -> Gather Merge -> Partial
+  GroupAggregate -> Sort`.
+- Q34/Q42/Q52/Q98 also flipped to the sorted-input partial but are
+  masked by pre-existing split-vs-nosplit records (depth 2); all PASS
+  the sweep on the new shape.
+- Q62/Q99 still elect the presorted sibling: measured si=5966.47 vs
+  sp=5954.83 — ~11.6 units of sort-volume delta, past tight fuzz.
+  Epsilon adjudication residual, not reach.
+- Oracle-equal on the private clone: Q19 100/100, Q62 100/100,
+  Q99 90/90 ck=077e581917849c17.
+
+## Gates (slice 3)
+
+All PASS on code_tree 1602c794…: units, tpch-spotcheck (Q12=2 Q13=33),
+SF0.25 sweep (PASS=96, changed=Q19/Q34/Q42/Q52/Q98), TPC-H acceptance
+arm (24 MATCH), fireset (SF0.25 fires Q19/Q34/Q42/Q52/Q98 + SF1 Q55,
+both arms clean). Full record in `gates-slice3.txt`.
+
+## Residual / next steps (post slice 3)
+
+- Q62/Q99's `PG Partial GroupAggregate | goopg Sort` records: the arm
+  exists and prices itself; PG's election of it needs the epsilon
+  margin closed — M0146-0007 territory.
+- Placement residue (Q17/Q25/Q29 depth-4), Q6 unchanged.
+- Upstream's `presorted > 0` incremental-sort arm stays deferred to
+  M0146-0006.

@@ -2304,6 +2304,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return o.openSortedPartialTransport(ctx)
 	}
 
+	// M0146-0027 slice 3: the sorted-INPUT partial — `Partial
+	// GroupAggregate` over a per-worker Sort (upstream's
+	// `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` arm,
+	// planner.c:7518-7560). Streams the worker's already-ordered
+	// partition like openSorted and emits the transport row at each
+	// group boundary; a Partial/Sorted node whose producer gate dropped
+	// (grouping sets or no keys) falls through to the hash drain, which
+	// emits the same wire shape sorted at the end — the safe direction.
+	if o.plan.Mode == optimizer.AggModePartial && o.plan.PartialEmit &&
+		o.plan.Strategy == optimizer.AggStrategySorted &&
+		o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 {
+		return o.openSortedPartialEmit(ctx)
+	}
+
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
 
@@ -2709,6 +2723,117 @@ func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, orde
 		})
 	}
 	return nil
+}
+
+// openSortedPartialEmit is the SORTED-input PartialEmit partial —
+// `Partial GroupAggregate -> Sort` per worker, upstream's
+// `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` arm of
+// create_partial_grouping_paths (planner.c:7518-7560), the shape PG
+// elects on TPC-DS Q19/Q62/Q99 (M0146-0027 slice 3). It runs
+// openSorted's streaming loop verbatim — the per-worker Sort under it
+// delivers the partition in group-key order, so a key change is a group
+// boundary — but flushes the emitPartialStateRows wire shape
+// ([group values | passthrough | serialized transition state]) instead
+// of a finished row. Input order IS group-key order, so unlike the hash
+// drain it needs no emit-time sort: the rows reach the Gather Merge
+// already ordered by the transport keys the merge was built with.
+//
+// The transition state is serialized exactly as emitPartialStateRows
+// does — raw, unsynced follower states included; the Finalize side's
+// own shared-state sync (the same code the hashed transport relies on)
+// does the reconciliation after the combine. GroupRuntime construction
+// (first row's passthrough, gv copy, SharedStateSlot follower skip) is
+// identical to both siblings on purpose: the transport row for a group
+// must not depend on which strategy discovered it.
+func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
+	nGroupCols := len(o.plan.GroupExprs)
+
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		row := make(Row, 0, len(cur.groupValues)+len(cur.passthroughVals)+len(cur.aggs))
+		row = append(row, cur.groupValues...)
+		row = append(row, cur.passthroughVals...)
+		for i := range cur.aggs {
+			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i])
+			if err != nil {
+				return err
+			}
+			row = append(row, d)
+		}
+		o.rows = append(o.rows, row)
+		cur = nil
+		return nil
+	}
+
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		allVals, parts, err := o.evalGroupExprs(slot)
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, parts) {
+			if err := flush(); err != nil {
+				return err
+			}
+			var ptVals Row
+			if len(o.plan.Passthrough) > 0 {
+				ptVals = make(Row, len(o.plan.Passthrough))
+				for i, expr := range o.plan.Passthrough {
+					v, err := evalExprSlot(expr, slot, o.ctx)
+					if err != nil {
+						ptVals[i] = NullDatum
+					} else {
+						ptVals[i] = v
+					}
+				}
+			}
+			var gv Row
+			if nGroupCols > 0 {
+				gv = make(Row, nGroupCols)
+				copy(gv, allVals)
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			curParts = parts
+		}
+		o.currentRowVersion++
+		for i, call := range o.plan.Aggs {
+			// SharedStateSlot followers skip sfunc exactly as the hash
+			// drain and openSorted do (M0097-0035): they are synced from
+			// the leader's combined state on the FINALIZE side.
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+				isFollower := false
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						isFollower = true
+						break
+					}
+				}
+				if isFollower {
+					continue
+				}
+			}
+			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
 }
 
 // partialStateRow is one decoded transport row — [group key values |

@@ -578,3 +578,154 @@ func TestPartialEmitSortedHonoursClauseOrder(t *testing.T) {
 	}
 	_ = op.Close()
 }
+
+// runTransportSplitSortedInput plans sql and runs the M0146-0027
+// slice-3 shape end to end — `Finalize Aggregate(Sorted) -> Gather
+// Merge -> Partial Aggregate(Sorted, PartialEmit) -> Sort(input
+// keys)` — PG's `Finalize GroupAggregate -> Gather Merge -> Partial
+// GroupAggregate -> Sort`, where the per-worker Sort orders the
+// aggregate's INPUT rows (upstream's `make_ordered_path` arm of
+// create_partial_grouping_paths, planner.c:7518-7560). Distinct from
+// the presorted sibling this file's runTransportSplit builds: there the
+// Sort sits ABOVE the partial and orders the emitted state rows; here
+// the partial itself streams a sorted partition and emits each group's
+// state row as the key boundary passes.
+func runTransportSplitSortedInput(t *testing.T, ctx *Context, sql string, workers int) []string {
+	t.Helper()
+	node := planForTest(t, ctx, sql)
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatalf("plan for %q has no aggregate to clone", sql)
+	}
+	if spec.Mode != optimizer.AggModeSimple || spec.GroupingSets != nil || len(spec.Aggs) == 0 {
+		t.Fatalf("plan for %q: aggregate not a plain splittable spec", sql)
+	}
+
+	// Worker sort: the INPUT-space group exprs evaluated against the
+	// input rows — `groupKeysSortKeys`, not transport positions.
+	var inKeys []optimizer.SortKey
+	for _, ge := range spec.GroupExprs {
+		inKeys = append(inKeys, optimizer.SortKey{Expr: ge})
+	}
+	inputSort := &optimizer.Sort{Child: spec.Child, Keys: inKeys}
+
+	partial := *spec
+	partial.Mode = optimizer.AggModePartial
+	partial.PartialEmit = true
+	partial.Strategy = optimizer.AggStrategySorted
+	partial.Child = inputSort
+
+	// Merge keys name the transport positions: the partial emits
+	// [group values | passthrough | serialized state] in group-key
+	// order — that ordering IS the merge order.
+	var mergeKeys []optimizer.SortKey
+	for i, ge := range spec.GroupExprs {
+		typ := catalog.Type{Name: "int4"}
+		if cr, ok := ge.(*optimizer.ColumnRef); ok && cr.Type.Name != "" {
+			typ = cr.Type
+		}
+		mergeKeys = append(mergeKeys, optimizer.SortKey{
+			Expr: &optimizer.ColumnRef{Index: i, Name: "gk", Type: typ},
+		})
+	}
+	transport := optimizer.NewGatherMerge(0, &partial, workers, mergeKeys)
+
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+	final.Child = transport
+
+	advanceStmtCounter(ctx)
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+	op, err := Build(&final)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, renderRows([]Row{slot.Row()})...)
+	}
+	if err := op.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return out
+}
+
+// TestPartialEmitSortedInputIdentity pins the sorted-input transport
+// end to end — the executor's openSortedPartialEmit over a real
+// GatherMerge, at 1/2/4 workers, compared positionally against serial
+// execution. The failure it exists to catch is the same one every
+// transport test in this file names: an N-times overcount when a
+// worker aggregates rows outside its partition, or a group emitted
+// twice when the boundary detection misreads a sorted stream.
+func TestPartialEmitSortedInputIdentity(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	serialRows, err := runQueryWithErr(ctx,
+		"SELECT grp, count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	want := renderRows(serialRows)
+	aggMixRows, err := runQueryWithErr(ctx,
+		"SELECT grp, avg(f), count(f) FROM pq_agg GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial aggmix: %v", err)
+	}
+	wantMix := renderRows(aggMixRows)
+	twoKeyRows, err := runQueryWithErr(ctx,
+		"SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s")
+	if err != nil {
+		t.Fatalf("serial twokey: %v", err)
+	}
+	wantTwoKey := renderRows(twoKeyRows)
+	sparseRows, err := runQueryWithErr(ctx,
+		"SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial sparse: %v", err)
+	}
+	wantSparse := renderRows(sparseRows)
+
+	for _, workers := range []int{1, 2, 4} {
+		for _, tc := range []struct {
+			name string
+			sql  string
+			want []string
+		}{
+			{"grouped", "SELECT grp, count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", want},
+			{"aggmix-float", "SELECT grp, avg(f), count(f) FROM pq_agg GROUP BY grp ORDER BY grp", wantMix},
+			// Two-column key: the boundary test and the merge order both
+			// walk every key column.
+			{"twokey", "SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s", wantTwoKey},
+			// Groups absent from some workers: an empty worker's stream
+			// simply contributes no state row for the key.
+			{"sparse", "SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp", wantSparse},
+		} {
+			got := runTransportSplitSortedInput(t, ctx, tc.sql, workers)
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s workers=%d: got %d rows, want %d\n got=%v\nwant=%v",
+					tc.name, workers, len(got), len(tc.want), got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("%s workers=%d: row %d differs:\n got %q\nwant %q",
+						tc.name, workers, i, got[i], tc.want[i])
+				}
+			}
+		}
+	}
+}

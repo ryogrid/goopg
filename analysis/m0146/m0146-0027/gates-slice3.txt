@@ -1,0 +1,63 @@
+M0146-0027 slice 3 — sorted-input partial arm (Partial GroupAggregate -> Sort)
+2026-09-27, private SF0.25 clone + standard gates.
+
+Gate stamps (all on code_tree 1602c794e10e1ba49b033f75e80b84ec3ccc28dfb2a16cdb1698fa3288563fa2,
+index tree 9e6c7f7ba34fa19da2f96a22fd5dbc75eddbaabc, HEAD 567ddecc0):
+
+- tpch-spotcheck        PASS  (Q12 rows=2, Q13 rows=33)
+- tpcds-sf025 sweep     PASS  PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+                              plans: same=94 changed=5 (Q19 Q34 Q42 Q52 Q98)
+- tpch-acceptance-arm   PASS  SUMMARY: 24 MATCH / VERDICT: PASS
+- tpcds-fireset         PASS  SF0.25 fires Q19 Q34 Q42 Q52 Q98, SF1 fire Q55 —
+                              all execute on baseline and candidate arms,
+                              FIRE-SET-TIMEOUTS: introduced=none
+- RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh — pass
+- go test ./internal/optimizer ./internal/executor — pass (incl.
+  TestUpperSplitSortedInputArm{FilesThePGShape,Lowers,Refusals,Election},
+  TestStripGatherFoldsTheSortedInputBack, TestPartialEmitSortedInputIdentity
+  at 1/2/4 workers)
+
+Plan-parity capture (tmp/m0146-0027s3-capture/, private clone :5590):
+
+  PLAN-PARITY: queries=99 match=11 shapediff=61 unparsed=0 missingnode=24
+               error=3 timeout=0
+  DIVERGENCE-CLASSES: queries=99 match=11 divergent=88
+    D1-sublink=5 D2-unionall=3 D3-partialpath=28 D4-upperrel=26
+    D5-narrowing=0 D6-cte=1 jointree-search=22 verdict=3
+
+First-divergence census diff vs census-sf025-slice2.txt — one record:
+
+  - Q19 depth=4 [sort-strategy] under Gather Merge:
+        PG Partial GroupAggregate | goopg Sort
+  + Q19 depth=10 [join-order] under Nested Loop:
+        PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+
+  CATEGORY-ROLLUP: sort-strategy 36->35, join-order 4->5
+  (all other 87 divergent records byte-identical)
+
+Q19's goopg plan now emits PG's aggregate spine (q19-goopg-sf025-slice3.txt
+vs q19-pg-sf025-slice3.txt):
+
+  Finalize GroupAggregate
+    -> Gather Merge
+         -> Partial GroupAggregate
+              -> Sort
+                   -> <partial join subtree>
+
+Q62/Q99 retain `PG Partial GroupAggregate | goopg Sort` records (depth 3
+under Gather Merge): goopg's cost model elects the presorted
+`Sort -> Partial HashAggregate` sibling there. Measured producer contest
+on Q62's SF0.25 plan (direct arm probe): sorted-input total 5966.47 vs
+presorted 5954.83 — the ~11.6-unit sort-volume delta is inside add_path's
+standard fuzz but past the tight-fuzz tie-breaker, so the presorted arm
+keeps the slot. Not a reach gap; an epsilon adjudication residual.
+
+Result verification on the private clone (against tracked oracle):
+  Q19 rows=100/100 match, Q62 rows=100/100 match,
+  Q99 rows=90/90 match ck=077e581917849c17 exact.
+
+Corpus check on the four other flips (Q34/Q42/Q52/Q98): all changed-plan
+queries PASS the sweep on the new shape; their first-divergence records
+are unchanged (split-vs-nosplit at depth 2 — PG files no partial
+aggregate on those spines at all), so the flips are masked, not new
+records.

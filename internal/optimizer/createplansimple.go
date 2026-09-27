@@ -260,23 +260,55 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 // bottom of the chain, builds the ONE input subtree, and hands the
 // shape to `splitAggregateTransportSorted` (parallel.go).
 //
+// M0146-0027 slice 3 adds the sibling sorted-INPUT shape — `Finalize
+// GroupAggregate -> GatherMerge -> Partial GroupAggregate -> Sort ->
+// input`, upstream's `create_agg_path(… AGG_SORTED,
+// AGGSPLIT_INITIAL_SERIAL …)` arm (planner.c:7518-7560) — dispatched on
+// the GatherMerge child's kind: a PathSort child is the presorted arm,
+// a PathAgg child is the sorted-input arm (its own child is the
+// worker-side Sort). The builders differ only in where the Sort node
+// and the strategy marking sit; both feed the same merge keys and the
+// same `openSortedPartialTransport` finalize.
+//
 // Every refusal is a panic, per createplan.go's contract: a path
 // reaching here in one of these shapes is a producer bug.
 func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
-	// Finalize -> GatherMerge -> Sort -> Partial -> input.
 	gm := p.Children[0]
-	if len(gm.Children) != 1 || gm.Children[0] == nil || gm.Children[0].Kind != PathSort {
-		panic("createPlan: PathFinalizeAgg's GatherMerge without a PathSort child")
+	if len(gm.Children) != 1 || gm.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg's GatherMerge without a child")
 	}
-	srt := gm.Children[0]
-	if len(srt.Children) != 1 || srt.Children[0] == nil || srt.Children[0].Kind != PathAgg {
-		panic("createPlan: PathFinalizeAgg's worker Sort without a partial PathAgg child")
+	sub := gm.Children[0]
+
+	var input *Path
+	sortedInput := sub.Kind == PathAgg
+	switch {
+	case sub.Kind == PathSort:
+		// Presorted arm: Finalize -> GatherMerge -> Sort -> Partial -> input.
+		srt := sub
+		if len(srt.Children) != 1 || srt.Children[0] == nil || srt.Children[0].Kind != PathAgg {
+			panic("createPlan: PathFinalizeAgg's worker Sort without a partial PathAgg child")
+		}
+		partial := srt.Children[0]
+		if len(partial.Children) != 1 || partial.Children[0] == nil {
+			panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
+		}
+		input = partial.Children[0]
+	case sortedInput:
+		// Sorted-input arm: Finalize -> GatherMerge -> Partial -> Sort -> input.
+		partial := sub
+		if len(partial.Children) != 1 || partial.Children[0] == nil || partial.Children[0].Kind != PathSort {
+			panic("createPlan: PathFinalizeAgg's sorted partial without a PathSort input")
+		}
+		srt := partial.Children[0]
+		if len(srt.Children) != 1 || srt.Children[0] == nil {
+			panic("createPlan: PathFinalizeAgg's sorted-partial Sort without an input")
+		}
+		input = srt.Children[0]
+	default:
+		panic("createPlan: PathFinalizeAgg's GatherMerge over neither Sort nor sorted partial")
 	}
-	partial := srt.Children[0]
-	if len(partial.Children) != 1 || partial.Children[0] == nil {
-		panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
-	}
-	child, layout := createPlanNode(partial.Children[0])
+
+	child, layout := createPlanNode(input)
 	if child == nil {
 		panic("createPlan: PathFinalizeAgg over a child path that built no node")
 	}
@@ -286,16 +318,23 @@ func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
 	if !ok {
 		panic("createPlan: PathFinalizeAgg's sorted arm over a group key no merge key can name")
 	}
-	built := splitAggregateTransportSorted(&simple, p.ParallelWorkers, keys)
+	var built *Aggregate
+	if sortedInput {
+		built = splitAggregateTransportSortedInput(&simple, p.ParallelWorkers, keys, groupKeysSortKeys(&simple))
+	} else {
+		built = splitAggregateTransportSorted(&simple, p.ParallelWorkers, keys)
+	}
 	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
 		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
 	}
 	// M0141-S2b-16, same rule as the hashed arm: the prebuilt serial
 	// subtree's driving scan still carries serial rows; give it the
 	// per-worker figure with the divisor the merge boundary was priced
-	// with.
+	// with. `sub` is the merge's own child path in both shapes — its
+	// Rows are the per-worker partial output, so gatherPathDivisor
+	// recovers exactly the divisor the crossing count was priced with.
 	if built.PartialSource.Child != child {
-		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gm, srt))
+		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gm, sub))
 	}
 	return built, layout
 }

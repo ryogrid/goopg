@@ -1880,6 +1880,51 @@ func splitAggregateTransportSorted(a *Aggregate, workers int, keys []SortKey) *A
 	return &final
 }
 
+// splitAggregateTransportSortedInput builds the sorted-input parallel
+// split — `Finalize GroupAggregate -> Gather Merge -> Partial
+// GroupAggregate -> Sort -> <input>`, upstream's
+// `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` arm of
+// create_partial_grouping_paths (planner.c:7518-7560), the shape PG
+// elects on TPC-DS Q19/Q62/Q99 (M0146-0027 slice 3).
+//
+// The presorted sibling puts the worker Sort OVER the hashed partial's
+// emit rows; this arm puts it UNDER a SORTED partial: each worker
+// orders its own input partition by the group keys (`inputKeys`, the
+// input-space `groupKeysSortKeys`), then streams boundary detection and
+// emits the same [keys | passthrough | serialized state] transport row
+// at each group boundary — `openSortedPartialEmit`
+// (operators_join_agg.go). Rows leave in input order, which the Sort
+// makes group-key order, so the merge keys are the same
+// transport-position list the presorted arm uses.
+//
+// The pairing contract is unchanged: PartialEmit on both nodes, the
+// Finalize carries `Sorted` (routing it to openSortedPartialTransport
+// and rendering `Finalize GroupAggregate`), GroupingSets already
+// refused by the producer, and the Final's input-target keep cleared —
+// its child is the transport row, not the input row the stamp was
+// derived against. The Partial keeps the stamp: it reads the same input
+// row, sorted.
+func splitAggregateTransportSortedInput(a *Aggregate, workers int, mergeKeys, inputKeys []SortKey) *Aggregate {
+	sorter := &Sort{pos: a.Pos(), Child: stampParallelScan(a.Child), Keys: inputKeys}
+
+	partial := *a
+	partial.Mode = AggModePartial
+	partial.Strategy = AggStrategySorted
+	partial.PartialEmit = true
+	partial.Child = sorter
+
+	merge := NewGatherMerge(a.Pos(), &partial, workers, mergeKeys)
+
+	final := *a
+	final.Mode = AggModeFinal
+	final.Strategy = AggStrategySorted
+	final.PartialEmit = true
+	final.Child = merge
+	final.PartialSource = &partial
+	final.InputTarget, final.InputTargetKnown = nil, false
+	return &final
+}
+
 // replaceSingleChild returns a SHALLOW COPY of n with its single child
 // replaced. Copying is what keeps the pass non-mutating: the original node is
 // still referenced by the plan cache and by any session executing it

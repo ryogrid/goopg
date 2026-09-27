@@ -23112,7 +23112,38 @@ M0146-0001 re-baseline census on the new default arm.
       `is_sorted` consumption; Q12/Q20/Q73's records are measured
       0\.08\-margin cost\-tie losses \(searchcand arm files the right
       shape\), M0146\-0007 margin territory, not reach.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\)
+  - Slice 3 landed 2026\-09\-27 — the sorted\-input partial arm,
+    upstream's `create_agg_path\(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …\)`
+    arm of `create_partial_grouping_paths` \(planner\.c:7518\-7560\):
+    `Finalize GroupAggregate -> Gather Merge -> Partial GroupAggregate ->
+    Sort -> <partial>`\. `addPartialAggSortedInputArm`
+    \(`upper\.groupagg\.sortinput`, partialaggupper\.go\) files it FIRST —
+    before the presorted sibling — matching upstream's file order so the
+    tight\-fuzz tie resolves by insertion; `createFinalizeAggSortedPlan`
+    dispatches on the GatherMerge child kind \(`PathAgg` = sorted\-input\),
+    `splitAggregateTransportSortedInput` \(parallel\.go\) builds the node
+    chain, and `openSortedPartialEmit` \(operators\_join\_agg\.go\) streams
+    one serialized state row per `sameGroupKey` boundary through the
+    existing sorted transport\. Election is honest: upstream's own
+    `cost_agg` comment pins `AGG_SORTED`/`AGG_HASHED` at identical total
+    CPU cost — the contest rides sort\-volume delta \+ startup \+ spill\.
+    - Measured \(private SF0\.25 clone\): Q19 emits PG's spine
+      \(census record moved depth 4 -> 10, sort\-strategy 36 -> 35\);
+      Q34/Q42/Q52/Q98 flipped too but are masked by pre\-existing
+      split\-vs\-nosplit records \(depth 2\) — all PASS the sweep on the
+      new shape\. Q62/Q99 still elect the presorted sibling —
+      si=5966\.47 vs sp=5954\.83, ~11\.6 units past tight fuzz —
+      a cost\-margin residual \(M0146\-0007 territory\), not reach\.
+      Oracle\-equal: Q19 100/100, Q62 100/100, Q99 90/90
+      ck=077e581917849c17\.
+    - New tests: `TestUpperSplitSortedInputArm{FilesThePGShape,Lowers,
+      Refusals,Election}` \(saturated/reduced/tiny\-work\_mem election
+      pins\), `TestStripGatherFoldsTheSortedInputBack` \(optimizer\),
+      `TestPartialEmitSortedInputIdentity` \(executor, 1/2/4 workers\)\.
+    - Gates: units pass, tpch\-spotcheck PASS \(Q12=2 Q13=33\), SF0\.25
+      sweep PASS=96 \(changed=Q19/Q34/Q42/Q52/Q98\), acceptance arm 24
+      MATCH, fireset PASS \(SF0\.25 fires x5 \+ SF1 Q55, both arms\)\.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
