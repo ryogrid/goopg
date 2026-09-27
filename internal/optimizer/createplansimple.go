@@ -325,7 +325,12 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathDistinct over a child path that built no node")
 	}
 	if p.Unique {
-		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
+		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema,
+			// M0146-0027 slice 2: the per-worker dedup marker — true only
+			// on the `Unique -> Gather Merge -> Unique` shape's inner node,
+			// where a leader-side Unique re-dedups the merge. The parallel
+			// walks descend only a marked node (plan.go PartialUnique).
+			PartialUnique: p.Distinct.PartialUnique}, nil
 	}
 	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema, SortKeys: p.Distinct.SortKeys}, nil
 }

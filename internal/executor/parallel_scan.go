@@ -312,6 +312,17 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// combines N full results into an N-times overcount — arithmetically
 		// plausible output with nothing to flag it.
 		return attachParallelScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: the `Unique -> Gather Merge -> Unique` shape's
+		// per-worker dedup — each worker dedups its own partition and the
+		// leader-side Unique re-dedups the merge. Only the producer-marked
+		// node may be descended: an unmarked Unique under a Gather would
+		// emit each cross-partition duplicate once per worker, the same
+		// over-count the planner's drivingScan arm refuses on.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
+		return attachParallelScan(x.child, st)
 	case *sortOp:
 		// P7. A Sort inside the partial subtree is legal ONLY under Gather
 		// Merge: each worker sorts its own partition and the leader merges the
@@ -405,6 +416,14 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 		return attachParallelBitmapScan(x.right, st)
 	case *aggregateOp:
 		// P9: Partial aggregate must read only its worker's partition.
+		return attachParallelBitmapScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: same producer-marked gate as the sequential
+		// sibling — the per-worker Unique of `Unique -> Gather Merge ->
+		// Unique`; an unmarked dedup refuses.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
 		return attachParallelBitmapScan(x.child, st)
 	case *sortOp:
 		// P7: per-worker Sort under Gather Merge.
@@ -572,6 +591,14 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		}
 		return attachParallelIndexScan(x.right, st)
 	case *aggregateOp:
+		return attachParallelIndexScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: same producer-marked gate as the sequential
+		// sibling — the per-worker Unique of `Unique -> Gather Merge ->
+		// Unique`; an unmarked dedup refuses.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
 		return attachParallelIndexScan(x.child, st)
 	case *sortOp:
 		return attachParallelIndexScan(x.child, st)

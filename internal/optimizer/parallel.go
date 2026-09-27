@@ -625,6 +625,20 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *DistinctOn:
+		// M0146-0027 slice 2: the partial-DISTINCT counterpart of the
+		// PartialGroup arm above — descend only the producer-marked
+		// per-worker Unique; an unmarked one stays a wall.
+		if !x.PartialUnique {
+			return n
+		}
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Join:
 		// P8 (drivingScan): a hash join is partial through its PROBE side
 		// only. Mirrored here so the same side gets labelled.
@@ -797,6 +811,17 @@ func drivingScan(n Node) Node {
 			return drivingScan(x.Child)
 		}
 		return nil
+	case *DistinctOn:
+		// M0146-0027 slice 2: the partial-DISTINCT counterpart of the
+		// PartialGroup arm — `Unique -> Gather Merge -> Unique -> Sort`,
+		// where the leader-side Unique re-dedups the merge. Only a node
+		// the partial-distinct producer marked for the descent is
+		// transparent; an unmarked dedup stays a wall for the same
+		// over-count reason the aggregate arm states.
+		if x.PartialUnique {
+			return drivingScan(x.Child)
+		}
+		return nil
 	case *Join:
 		// P8. A hash join is partial through its PROBE side only: the build
 		// side is drained once by the leader before fan-out, and the probe is
@@ -936,6 +961,13 @@ func drivingScanCrossesSort(n Node) bool {
 		// partial dedup is transparent to the spine walk, so its Sort
 		// still counts as a Sort on the spine.
 		if x.PartialGroup {
+			return drivingScanCrossesSort(x.Child)
+		}
+		return false
+	case *DistinctOn:
+		// M0146-0027 slice 2: same gate — the marked per-worker Unique is
+		// transparent; the worker Sort below it stays a Sort on the spine.
+		if x.PartialUnique {
 			return drivingScanCrossesSort(x.Child)
 		}
 		return false
@@ -2136,6 +2168,20 @@ func unstampParallelScan(n Node) Node {
 		// removes the boundary but leaves the dedup pair, which still
 		// collapses to the right answer (a dedup of a dedup is idempotent).
 		if !x.PartialGroup {
+			return n
+		}
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *DistinctOn:
+		// M0146-0027 slice 2: the same inverse — the stripped plan keeps
+		// `Unique -> Unique -> Sort`, still correct (the inner dedup is
+		// idempotent), so the scan label comes off through it.
+		if !x.PartialUnique {
 			return n
 		}
 		child := unstampParallelScan(x.Child)

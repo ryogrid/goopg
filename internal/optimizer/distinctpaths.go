@@ -33,6 +33,11 @@ import (
 const (
 	distinctHashedProducer = "upper.distinct.hashed"
 	distinctUniqueProducer = "upper.distinct.unique"
+	// distinctPartialUniqueProducer is the `Unique -> Gather Merge ->
+	// Unique -> Sort -> <partial>` candidate's trace label — the partial
+	// DISTINCT arm of `create_partial_distinct_paths` (planner.c:4852),
+	// M0146-0027 slice 2.
+	distinctPartialUniqueProducer = "upper.distinct.partial.unique"
 )
 
 // createDistinctPaths is `create_distinct_paths` for the one DISTINCT
@@ -69,6 +74,7 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 
 	addDistinctPaths(distinctRel, seed, distinctNode, child, cp, ps)
+	addPartialDistinctPaths(u, distinctRel, seed, distinctNode, child, cp, ps)
 	setCheapest(distinctRel)
 
 	best := getCheapestFractionalPath(distinctRel, tupleFraction)
@@ -302,4 +308,201 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 		Pathkeys:      sortInput.Pathkeys, Children: []*Path{sortInput},
 	}
 	return hashed, unique
+}
+
+// addPartialDistinctPaths is `create_partial_distinct_paths`
+// (planner.c:4852) at its sorted arm — the arm every observed TPC-DS
+// witness elects (Q38/Q87:
+// `Unique -> Gather Merge -> Unique -> Sort -> <partial subtree>`).
+//
+// It is the M0146-0025 partial-Group arm's DISTINCT sibling, built on the
+// same node-level model partialaggupper.go's header states: the partial
+// input is the SERIAL subtree run once per worker (a Gather unwraps to
+// its own child), not a separate partial path — PG's
+// `input_rel->partial_pathlist` iteration has no goopg counterpart
+// because the searched rel's partial list is where the gather-path
+// arm already files the same subtree's candidates, and the prebuilt
+// node carries no coordinate boundary to cross. Same guards as the
+// aggregate arm, same `PartialUnique`≙`PartialGroup` marker discipline:
+// the per-worker dedup is only correct because the leader-side Unique
+// re-dedups the merge, so the driving-scan walks gate the descent on
+// the mark rather than on the node kind.
+//
+// The arm is sorted-only, deliberately narrower than upstream's
+// producer: upstream also offers a partial HASHED aggregate for DISTINCT
+// (planner.c:4989) and a LIMIT-1 partial path for an empty distinct
+// pathkey list; goopg's hashed partial emission is the transition-state
+// transport, which a dedup has no state to feed, and the empty-keys case
+// is left serial — both refusals, never approximations.
+func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+	if !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+		traceUpperGate("distinct-upper", "refused", "gate=statement")
+		return
+	}
+	if distinctRel == nil || seed == nil || distinctNode == nil || child == nil {
+		traceUpperGate("distinct-upper", "refused", "gate=nil-arg")
+		return
+	}
+	// The ordering the per-worker Sort imposes — the dedup's full-column
+	// key (distinct-clause order when the statement carries one), the same
+	// derivation `distinctCandidates` makes for the serial Unique. A
+	// zero-column output is upstream's LIMIT-1 arm — declined here rather
+	// than modelled.
+	keys := distinctAllColKeys(child)
+	if len(distinctNode.SortKeys) == len(keys) {
+		keys = distinctNode.SortKeys
+	}
+	if len(keys) == 0 {
+		traceUpperGate("distinct-upper", "refused", "gate=keys")
+		return
+	}
+	// Drop the leader-side Sort the serial Unique candidate's input
+	// carries: it exists to feed exactly the dedup this arm relocates,
+	// and the worker-side Sort below imposes the same ordering per
+	// partition. Stripping it is also what lets the Gather splice see the
+	// boundary underneath (`Sort{Gather{X}}` -> `Gather{X}` -> `X`).
+	if s, ok := child.(*Sort); ok && s.Child != nil {
+		child = s.Child
+	}
+	// Statement-level gate, mirroring addPartialAggSplitPath verbatim: a
+	// nested planning scope may only reuse a parallel boundary the input
+	// already carries (it may not introduce a NEW Gather under a
+	// parallel-aware parent), and a correlated input is never split.
+	if !ps.ParallelStatementOK {
+		if _, ok := gatherToUnwrapForPartialAgg(child); !ok || planHasOuterRef(child) {
+			traceUpperGate("distinct-upper", "refused", "gate=statement")
+			return
+		}
+	}
+	// Unwrap a search-placed Gather — direct, or under the pass-through
+	// wrappers gatherToUnwrapForPartialAgg peels (schema-preserving all).
+	if g, ok := gatherToUnwrapForPartialAgg(child); ok {
+		child = g
+	}
+	// The subtree must be worker-executable, Gather-free, and have a
+	// driving scan — the identical triple the aggregate arm asserts, with
+	// the identical second route when the only refusal is a Gather on the
+	// driving spine (spliceGatherOnPartialSpine; TPC-DS Q38's input is
+	// exactly `Sort{Gather{NL…}}` before the strip above).
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	if unsafe || gathered || noScan {
+		if ps.ParallelStatementOK {
+			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
+				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				child = gc
+				unsafe, gathered, noScan = false, false, false
+			}
+		}
+	}
+	if unsafe || gathered || noScan {
+		traceUpperGate("distinct-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
+		return
+	}
+	workers := upperSplitWorkers(child, cp, ps)
+	if workers <= 0 {
+		traceUpperGate("distinct-upper", "refused", "gate=workers")
+		return
+	}
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	if d <= 1 {
+		traceUpperGate("distinct-upper", "refused", "gate=divisor "+upperSplitDetail(workers, d))
+		return
+	}
+	inputRows := seed.Rows
+	if inputRows < 1 {
+		inputRows = 1
+	}
+	perWorkerRows := inputRows / d
+	// Upstream's numDistinctRows (planner.c:4897-4900): estimate_num_groups
+	// over the cheapest_partial_path's row count — the per-worker scale.
+	// Same ColumnRef-over-output-schema exprs estimateDistinctRows builds.
+	cols := child.Output()
+	exprs := make([]Expr, 0, len(cols))
+	for i, c := range cols {
+		exprs = append(exprs, &ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx})
+	}
+	partialGroups := float64(estimateNumGroups(exprs, child, int64(perWorkerRows)))
+	if perWorkerRows >= 1 && partialGroups > perWorkerRows {
+		partialGroups = perWorkerRows
+	}
+	if partialGroups < 1 {
+		partialGroups = 1
+	}
+	finalRows := distinctRel.Rows
+	if finalRows < 1 {
+		finalRows = 1
+	}
+
+	partialRel := fetchUpperRel(u, UpperPartialDistinct, 0, 0)
+	partialRel.Rows = partialGroups
+	partialRel.Width, partialRel.NCols, partialRel.AvgVarBytes = distinctRel.Width, distinctRel.NCols, distinctRel.AvgVarBytes
+	// `partial_distinct_rel->consider_parallel =
+	// input_rel->consider_parallel` (planner.c:4880); a rel reaches here
+	// only with the subtree guard's green light.
+	partialRel.ConsiderParallel = true
+
+	pseed := newPrebuiltPath(partialRel, child)
+	pseed.Rows = perWorkerRows
+	pseed.Cost = parallelSeedCost(seed.Cost, d)
+	pseed.ParallelSafe = true
+	pseed.ParallelWorkers = workers
+
+	mergeKeys := pathkeysForSortKeys(keys)
+	// `make_ordered_path` (planner.c:4926): the worker's own sort, priced
+	// on the per-worker row count — sortPathForBounded already prices the
+	// path's own rows, so the worker-side saving is charged exactly.
+	workerSort := sortPathForBounded(pseed, mergeKeys, cp, -1)
+	// `sortPathForBounded` prices ParallelSafe but never plans workers —
+	// gatherChildPlan panics on a 0-worker subpath, the R56 rule the
+	// partial-Group arm records verbatim.
+	workerSort.ParallelWorkers = workers
+
+	// The PARTIAL UNIQUE — `create_upper_unique_path` on the
+	// partial_distinct_rel (planner.c:4973): each worker adjacent-dedups
+	// its own sorted partition. The spec clone carries PartialUnique, the
+	// flag every driving/attach walk gates the descent on; the clone's
+	// other fields are the statement's own (pos/schema are the only ones
+	// createDistinctPlan reads for the Unique shape).
+	partialSpec := *distinctNode
+	partialSpec.PartialUnique = true
+	partialPath := &Path{
+		Kind: PathDistinct, Unique: true, Distinct: &partialSpec,
+		Rel: partialRel, Rows: partialGroups,
+		Cost:            distinctCost(workerSort.Cost.Startup, workerSort.Cost.Total, perWorkerRows, partialGroups, cp),
+		DisabledNodes:   workerSort.DisabledNodes,
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		Children:        []*Path{workerSort},
+	}
+	addPath(partialRel, partialPath, distinctPartialUniqueProducer)
+
+	// BOUNDARY — `cost_gather_merge` over the partial unique's rows: what
+	// crosses is each worker's DEDUPLICATED output (partialGroups × d),
+	// the whole economic argument of the shape. Upstream files it through
+	// generate_useful_gather_paths on the partial rel (planner.c:5017);
+	// this arm builds the same node directly, the partial-Group arm's
+	// construction verbatim.
+	crossed := partialGroups * d
+	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
+	gmPath := &Path{
+		Kind: PathGatherMerge, Rel: distinctRel, Rows: crossed, Cost: gmCost,
+		Pathkeys:      append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:  false,
+		DisabledNodes: partialPath.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{partialPath},
+	}
+
+	// FINAL UNIQUE — the leader-side `create_upper_unique_path` of
+	// `create_final_distinct_paths` over the gathered rel (planner.c:5167):
+	// re-dedups cross-worker duplicates the merge brings adjacent.
+	finalPath := &Path{
+		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
+		Rel: distinctRel, Rows: finalRows,
+		DisabledNodes: gmPath.DisabledNodes,
+		Cost:          distinctCost(gmCost.Startup, gmCost.Total, crossed, finalRows, cp),
+		Pathkeys:      gmPath.Pathkeys,
+		Children:      []*Path{gmPath},
+	}
+	addPath(distinctRel, finalPath, distinctPartialUniqueProducer)
 }

@@ -23078,7 +23078,41 @@ M0146-0001 re-baseline census on the new default arm.
       depth\-4 record is a join\-order/costing residue \(goopg's partial
       chain spans 6 rels vs PG's 5\); Q6 unchanged — its spine files no
       qualifying partial to sort.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\)
+  - Slice 2 landed 2026\-09\-27 — the `Unique`\-head records turned out
+    NOT to need an `is_sorted` consumer: PG never routes DISTINCT through
+    pathlist iteration, it files `UPPERREL_PARTIAL_DISTINCT`
+    \(`create_partial_distinct_paths`, planner\.c:4852\).
+    `addPartialDistinctPaths` \(distinctpaths\.go\) builds
+    `Unique -> Gather Merge -> Unique -> Sort -> <partial>` on the
+    M0146\-0025 node\-level model — sort\-strip the serial input,
+    unwrap/splice the search\-placed Gather, per\-worker Sort + marked
+    worker Unique, merge crossing `partialGroups × d`, unmarked leader
+    Unique. `PartialUnique` on `Distinct`/`DistinctOn` is the
+    `PartialGroup` counterpart and gates all four spine walks
+    \(stamp/unstamp/drivingScan/drivingScanCrossesSort\) plus the three
+    executor attach walks — an unmarked dedup under a Gather refuses
+    rather than N\-times over\-count. Sorted arm only: upstream's partial
+    hashed\-DISTINCT and LIMIT\-1 arms declined by construction
+    \(ledger\-recorded\).
+    - Measured \(private SF0\.25 clone :5590\): Q38 and Q87 emit PG's
+      spine — all three Unique heads under the INTERSECT's HashSetOps
+      parallelized; Q38 ck=77188220d949e451, Q87 ck=daa38faef432c025,
+      oracle\-equal. Sweep: PASS=96 MISMATCH=0 CKMISMATCH=0; plan channel
+      changed = Q38/Q54/Q87 \(exactly the clause\-level DISTINCTs\).
+    - New tests: `TestPartialDistinctArmFilesThePGShape`,
+      `TestPartialDistinctArmLowers`, `TestPartialDistinctArmUnwrapsGather`,
+      `TestPartialDistinctArmRefusals`, `TestPartialDistinctWalkAgreement`
+      \(optimizer\), `TestPartialUniqueGatherMergeIdentity` \(executor,
+      1/2/4 workers — duplicates collapse exactly once\).
+    - Gates: units pass, tpch\-spotcheck PASS \(Q12=2 Q13=33\), acceptance
+      arm 24 MATCH / VERDICT PASS, SF0\.25 sweep PASS=96.
+    - Corrected diagnosis for the residual: `Group`\-head / `PG Partial
+      GroupAggregate | goopg Sort` records \(Q19/Q62/Q99\) need a SORTED
+      per\-worker GroupAggregate mode — a different mechanism than
+      `is_sorted` consumption; Q12/Q20/Q73's records are measured
+      0\.08\-margin cost\-tie losses \(searchcand arm files the right
+      shape\), M0146\-0007 margin territory, not reach.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

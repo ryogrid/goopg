@@ -110,3 +110,79 @@ Merge -> Sort -> partial chain`). Result: 0 rows both.
 - **Q6**: different composition — no qualifying partial exists on its
   spine to sort; likely needs the partial-join election widened, not this
   mechanism.
+
+---
+
+# Slice 2 (2026-09-27): partial DISTINCT — `Unique -> Gather Merge -> Unique`
+
+The "Unique-head needs the `is_sorted` consumer" hypothesis above was
+wrong in a useful way: tracing Q38/Q87 showed PostgreSQL never routes
+DISTINCT through pathlist iteration at all — it files a dedicated
+`UPPERREL_PARTIAL_DISTINCT` stage (`create_partial_distinct_paths`,
+planner.c:4852): per-worker `Unique` over a per-worker `Sort`, gathered
+ordered, re-deduped by a leader `Unique`. goopg had no counterpart —
+`createDistinctPaths` offered only serial-seed candidates — so the shape
+was unreachable, not merely unpriced.
+
+## What landed (slice 2)
+
+- `distinctpaths.go` — `addPartialDistinctPaths`: the producer, on the
+  M0146-0025 partial-Group node-level model. Sort-strips the serial
+  candidate's input, unwraps/splices a search-placed `Gather` (Q38's
+  input is `Sort{Gather{NL}}`), per-worker `Sort` + marked worker
+  `Unique` (`PartialUnique`), `Gather Merge` crossing
+  `partialGroups × d` rows, unmarked final `Unique`. Sorted arm only —
+  upstream's partial hashed DISTINCT and LIMIT-1 arms declined, never
+  approximated.
+- `plan.go` — `PartialUnique` on `Distinct` (spec) + `DistinctOn`
+  (node); `createDistinctPlan` propagates it. The marker is the walk
+  contract: only a marked node is transparent to the parallel descents.
+- `parallel.go` — gated `*DistinctOn` arms in `stampParallelScan`,
+  `drivingScan`, `drivingScanCrossesSort`, `unstampParallelScan`.
+- `executor/parallel_scan.go` — the same gate in `attachParallelScan`,
+  `attachParallelIndexScan`, `attachParallelBitmapScan`. An unmarked
+  dedup under a Gather refuses attachment rather than emit each
+  cross-partition duplicate once per worker.
+
+## Evidence
+
+- `q38-goopg-plan.txt` / `q87-goopg-plan.txt` — all three `Unique` heads
+  under Q38's `HashSetOp Intersect` emit
+  `Unique -> Gather Merge -> Unique -> Sort -> <partial>`, PG's spine.
+- Sweep `sweep-20260927-201641.txt`: PASS=96 MISMATCH=0 CKMISMATCH=0;
+  Q38 ck=`77188220d949e451`, Q87 ck=`daa38faef432c025` — oracle-equal.
+  Plan channel: changed = Q38/Q54/Q87 (exactly the clause-level
+  DISTINCTs); Q54 PASS with the same architecture.
+- Executor identity `TestPartialUniqueGatherMergeIdentity` (1/2/4
+  workers): partial dedup + leader dedup = serial `SELECT DISTINCT`
+  row set — cross-worker duplicates collapse exactly once.
+
+## Gates (slice 2; stamp FAIL markers are the dirty-tree note only)
+
+- `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` — pass.
+- `scripts/tpch-spotcheck.sh` — Q12 rows=2, Q13 rows=33, RESULT=PASS.
+- `scripts/tpch-acceptance-arm.sh on` vs `tmp/m0145-0008m/arm-on.txt` —
+  SUMMARY 24 MATCH, VERDICT PASS.
+- `scripts/tpcds-sf025-regression.sh sweep` — PASS=96 MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3; plans: same=96 changed=3
+  (Q38/Q54/Q87). Total runtime −4.0%; Q95 2s→6s noise (`distinct` there
+  is `count(distinct)` — aggregate, not this node kind; plan unchanged).
+- `scripts/tpcds-fireset-gate.sh m0146-0027s2` — fires Q38/Q54/Q87 PASS
+  on both arms at both scales, values identical, no new timeouts.
+  Census (slice2 vs baseline captures): divergent 88→88, sort-strategy
+  38→36 — Q38/Q87's Unique-head records are gone; they now diverge at
+  `SetOp Intersect/Except` vs `HashSetOp …` kind (depth 4→2/1, a
+  different mechanism family). Full record in `gates-slice2.txt`.
+
+## Residual / next steps (post slice 2)
+
+- The `is_sorted` consumer for `Group` heads and the
+  `PG Partial GroupAggregate | goopg Sort` records (Q19/Q62/Q99): need a
+  sorted per-worker GroupAggregate transport — a different mechanism
+  (M0146-0025's emit transport is hashed).
+- Q12/Q20/Q73's `PG Gather Merge | goopg Sort` records: measured 0.08
+  cost-tie losses (the searchcand arm files the right shape; election
+  margin, M0146-0007 territory), not reach.
+- Placement residue (Q17/Q25/Q29 depth-4) and Q6 unchanged from slice 1.
+- Upstream's partial hashed-DISTINCT arm and empty-pathkeys LIMIT-1 arm:
+  declined by construction (ledger-recorded).

@@ -3139,6 +3139,14 @@ type Distinct struct {
 	// candidate's `Group Key:` in it. nil means every column ascending, in
 	// output order.
 	SortKeys []SortKey
+	// PartialUnique marks this spec's UNIQUE candidate as the per-worker
+	// dedup of the parallel `Unique -> Gather Merge -> Unique -> Sort`
+	// shape (M0146-0027 slice 2): PostgreSQL's `create_upper_unique_path`
+	// inside `create_partial_distinct_paths` (planner.c:4973), where each
+	// worker dedups its own partition and a leader-side Unique re-dedups
+	// the merge. The emitted *DistinctOn carries the flag; see its comment
+	// for the walk contract.
+	PartialUnique bool
 }
 
 func (n *Distinct) Pos() int       { return n.pos }
@@ -3154,6 +3162,21 @@ type DistinctOn struct {
 	Child   Node
 	KeyCols []int // indices into the output schema for DISTINCT ON keys
 	schema  Schema
+	// PartialUnique marks the per-worker dedup node of the parallel
+	// `Unique -> Gather Merge -> Unique` distinct shape (M0146-0027 slice
+	// 2) — the `*Aggregate.PartialGroup` counterpart. A marked node
+	// promises a leader-side Unique re-dedups what the merge returns, so
+	// partitioning its input is the intended semantics — not the
+	// `count(*) FROM (SELECT DISTINCT …)` over-count an UNMARKED dedup
+	// would emit once per worker.
+	//
+	// The flag is what lets the driving-scan walks descend THROUGH this
+	// node to the scan below, exactly as PartialGroup does for the
+	// aggregate dedup. Read ONLY by drivingScan / stampParallelScan /
+	// unstampParallelScan / drivingScanCrossesSort (parallel.go) and the
+	// executor's attach* walks (parallel_scan.go), which all refuse the
+	// unmarked kind.
+	PartialUnique bool
 }
 
 func (n *DistinctOn) Pos() int       { return n.pos }

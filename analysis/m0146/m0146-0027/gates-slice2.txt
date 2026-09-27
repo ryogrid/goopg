@@ -1,0 +1,29 @@
+M0146-0027 slice 2 gates (partial DISTINCT — Unique -> Gather Merge -> Unique)
+2026-09-27, tree 7779cacf9 + slice-2 delta (stamps read FAIL = dirty-tree note only)
+
+units: PASS (RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh)
+tpch-spotcheck: RESULT=PASS (Q12 rows=2, Q13 rows=33)
+tpch-acceptance-arm: SUMMARY 24 MATCH, VERDICT PASS vs tmp/m0145-0008m/arm-on.txt
+  (capture /tmp/m0146-0027-arm-on.txt, log /tmp/m0146-0027-arm.log)
+tpcds-sf025 sweep: PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  (sweep-20260927-201641.txt)
+  PLAN-SHAPE same=96 changed=3 (Q38 Q54 Q87 — exactly the clause-level DISTINCTs)
+  runtime: total -4.0% vs prior sweep; Q95 2s->6s noise (its distinct is
+  count(distinct) — an aggregate, not this node; plan unchanged), Q7 same.
+tpcds-fireset (m0146-0027s2, corpora tpcds-sf025 + tpcds-sf1):
+  fires = Q38 Q54 Q87 (the changed plans), PASS on BOTH arms at BOTH scales,
+  values identical baseline vs candidate, FIRE-SET-TIMEOUTS introduced=none.
+  census (pg-plan-first-divergence.py on fireset captures):
+    SF0.25 baseline->candidate: divergent 88->88, match 11->11;
+      sort-strategy 38->36 (Q38/Q87 left the Unique-head record),
+      join-order 2->4 (Q38/Q87 now diverge at SetOp-vs-HashSetOp kind,
+      depth 4->2/1 — the whole Unique->GatherMerge spine now matches PG);
+      D3-partialpath 30->28, D2-unionall 1->3 (same records, new class).
+    SF1: D3-partialpath 27->25, D2-unionall 2->4; match 13->13.
+value checksums vs SF0.25 oracle (private clone :5590):
+  Q38 rows=1 ck=77188220d949e451 (oracle 77188220d949e451)
+  Q87 rows=1 ck=daa38faef432c025 (oracle daa38faef432c025)
+  Q6  rows=27 ck=87ec5bd032d11623 (oracle 87ec5bd032d11623)
+  Q54 rows=0 ck=1f18d650d205d71d (oracle 1f18d650d205d71d)
+ea-ratchet: not run — no estimator change; the arm reuses
+  estimateNumGroups/distinctCost/gatherMergeCost untouched.

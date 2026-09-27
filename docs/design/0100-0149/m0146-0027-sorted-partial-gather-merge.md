@@ -1,8 +1,9 @@
 # M0146-0027: parallel partial-subtree reach — sorted-partial Gather Merge + searched-candidate consumption
 
-Status: landed 2026-09-27 (slice 1 — ORDER BY / GROUP BY stages; the
-`Unique`/`Group`-head consumers and the Gather-Merge placement residue are
-open, see §6).
+Status: slice 1 landed 2026-09-27 (ORDER BY / GROUP BY stages); slice 2
+landed 2026-09-27 (the partial-DISTINCT producer — `Unique -> Gather
+Merge -> Unique`, §7). Remaining: the Gather-Merge placement residue and
+the `Group`/partial-GroupAggregate records, see §6.
 
 ## PG behaviour
 
@@ -123,15 +124,78 @@ units green. Tests: `TestGenerateUsefulGatherPathsSortedPartialArm`,
 parallel-off negative in upperorderedinput_test, PathSort descent in
 joinpathspartialmerge_test.
 
+## Slice 2 (2026-09-27): the partial-DISTINCT producer
+
+The `Unique`-head records turned out NOT to need the `is_sorted` consumer
+after all: PostgreSQL never routes DISTINCT through one. Upstream files a
+whole `UPPERREL_PARTIAL_DISTINCT` stage — `create_partial_distinct_paths`
+(planner.c:4852) plans per-worker `Unique` over sorted partial inputs,
+gathers them ordered, and `create_final_distinct_paths` (planner.c:5167)
+stacks a leader-side `Unique` on the merge:
+
+    Unique
+      -> Gather Merge
+           -> Unique               per-worker dedup
+                -> Sort
+                     -> <partial subtree>
+
+goopg had no counterpart stage — `createDistinctPaths` offered only the
+final hashed and sorted candidates over a serial seed — so Q38/Q87 could
+never reach the shape regardless of ordering machinery.
+
+**Change** (`internal/optimizer/`, `internal/executor/`):
+
+- **distinctpaths.go — `addPartialDistinctPaths`**: the producer, built
+  node-level on the M0146-0025 partial-Group arm's model (the partial
+  input is the serial subtree run once per worker; a search-placed
+  `Gather` under it is unwrapped by `gatherToUnwrapForPartialAgg` or
+  spliced by `spliceGatherOnPartialSpine`, never discarded). Per-worker
+  `Sort` on the dedup key list priced at per-worker scale
+  (`sortPathForBounded` + `ParallelWorkers`), a marked worker `Unique`
+  priced at `estimate_num_groups` over the per-worker rows
+  (planner.c:4897-4900's numDistinctRows), `Gather Merge` crossing
+  `partialGroups × d` rows — the whole economic argument of the shape —
+  and a final unmarked `Unique`. Deliberately narrower than upstream:
+  the partial HASHED-distinct arm (planner.c:4989) and the empty-keys
+  LIMIT-1 arm are declined, not approximated — goopg's hashed partial
+  emission is transition-state transport a dedup cannot feed.
+- **plan.go — `PartialUnique` on `Distinct` (spec) and `DistinctOn`
+  (node)**: the `PartialGroup` marker's counterpart. A marked node
+  promises a leader-side Unique re-dedups the merged worker streams, so
+  partitioning its input is the intended semantics; an unmarked dedup
+  node stays a traversal wall in every walk below. `createDistinctPlan`
+  propagates spec → node.
+- **parallel.go** — marker-gated `*DistinctOn` arms in all four spine
+  walks (`stampParallelScan`, `drivingScan`, `drivingScanCrossesSort`,
+  `unstampParallelScan`; `perWorkerDisplayRows` is covered transitively
+  through `drivingScans`).
+- **executor/parallel_scan.go** — the same marked-only descent in
+  `attachParallelScan`, `attachParallelIndexScan`,
+  `attachParallelBitmapScan`. Without an arm a partial Unique would have
+  each worker run the whole child and emit every cross-partition
+  duplicate N times — the over-count the marker exists to prevent.
+
+**Evidence**: Q38 and Q87 both emit the PG spine (`q38-goopg-plan.txt`,
+`q87-goopg-plan.txt` — three `Unique` heads under the INTERSECT's
+HashSetOps all parallelized) with oracle-equal checksums
+(`77188220d949e451`, `daa38faef432c025`); sweep plan channel: changed =
+Q38/Q54/Q87, all clause-level DISTINCT. Tests in distinctpaths_test.go
+(`TestPartialDistinctArm*` shape/lowering/unwrap/refusal,
+`TestPartialDistinctWalkAgreement`) plus executor identity at 1/2/4
+workers (`TestPartialUniqueGatherMergeIdentity` — the per-worker dedup +
+leader dedup collapses cross-worker duplicates exactly once).
+
 ## Open
 
 - **Placement residue**: goopg elects a 6-rel partial chain where PG
   stops at 5 (Q17/Q25/Q29's depth-4 `PG NL Inner | goopg Gather Merge`)
   — join-order/costing inside the search, not this mechanism.
-- **`Unique`/`Group`-head consumers**: the `is_sorted` iteration exists
-  only at the ORDER BY and GROUP BY stages; the remaining `PG Gather
-  Merge | goopg Sort` records under Unique/Group heads need the same arm
-  there.
+- **`Group`/partial-GroupAggregate consumers**: the `is_sorted`
+  iteration exists only at the ORDER BY and GROUP BY stages; slice 2
+  showed `Unique` heads never needed it (DISTINCT has its own partial
+  stage — §7). The remaining `PG Partial GroupAggregate | goopg Sort`
+  records (Q19/Q62/Q99) need a sorted per-worker GroupAggregate mode —
+  a different, larger mechanism than the Unique one.
 - **Q6**: different composition — no qualifying partial exists on its
   spine.
 - `presorted > 0` incremental-sort arm: deferred to M0146-0006 as filed.
