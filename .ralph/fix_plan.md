@@ -401,6 +401,19 @@ delegated; details in each task's entry):
   skip is accepted (loop spotcheck + acceptance arm cover the value
   floor); a real fix wants an owner scheduling decision (nightly
   quiesces the bench cluster vs. accepts no nightly TPC-H lane).
+- **Guard-denial recurrence:** loops keep re-attempting denied
+  operations (no cross-session memory). Mitigation added: a Key
+  Principles bullet in `.ralph/PROMPT.md` — denials are durable; check
+  the `ci/logs/ralph-guard-denials.log` tail before planning
+  cluster/protected-file work and escalate rather than retry.
+- **`[!]` blocker staleness:** mechanical check added as
+  ralph-lineage-guard Rule F — a `[!]` task whose body names its
+  blocker by structured id while the blocker is `[ ]`/`[x]` prints a
+  non-blocking advisory. It immediately surfaced M0141-S2b-4e (blocked
+  on the landed M0145-0008 — re-opened) and M0141-S7 (its cited S2b
+  reference resolved, but the `[!]` stands: the remaining work was
+  refiled as M0146-0006 and the `[!]` is the S4 lineage-budget
+  escalation, not the citation).
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -7344,8 +7357,10 @@ spill route is net-negative.
     Movement: none
     Kind: impl
     Parent: M0141-S2b-4
-  - [!] **M0141-S2b-4e — presorted branch paths for the Merge Append arm**
-    \(filed 2026\-09\-24 by S2b\-4c\). PG\'s `build\_setop\_child\_paths`
+  - [ ] **M0141-S2b-4e — presorted branch paths for the Merge Append arm**
+    \(filed 2026\-09\-24 by S2b\-4c; **UNBLOCKED 2026\-09\-27 — the recorded
+    blocker M0145\-0008 \(cutover\) has landed; the resume condition in the
+    BLOCKED note is met**\). PG\'s `build\_setop\_child\_paths`
     offers each UNION child\'s cheapest path sorted on the union pathkeys,
     reusing an already\-sorted path \(index scan, Gather Merge over a partial
     path, Incremental Sort over a partially sorted one\). goopg sorts every

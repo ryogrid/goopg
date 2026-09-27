@@ -64,6 +64,12 @@ loop.
 - Update .ralph/fix_plan.md with your learnings
 - Commit working changes with descriptive messages
 - A loop that changes a non-trivial subsystem is not complete unless its design doc is created/updated and indexed
+- Guard denials are durable, not transient: a denied operation (bash guard,
+  file guard, devin adapter — all logged to `ci/logs/ralph-guard-denials.log`)
+  denies the same class every time, so re-attempting it in a later loop is a
+  wasted turn. When planning cluster-lifecycle, reference-cluster, or
+  protected-file work, skim the denials log tail first; an operation already
+  denied there needs an escalation, not another attempt.
 
 ## Working Set Carry (read first / write last — EVERY loop)
 `.ralph/working_set.md` is the baton between loops. Loops are frequently cut off by

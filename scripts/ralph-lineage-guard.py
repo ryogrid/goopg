@@ -58,6 +58,13 @@ when the candidate:
       duplicated in the baseline is reported only when the candidate adds yet
       another occurrence — growth is checked by per-id OCCURRENCE COUNT, not
       line identity, so a verbatim-copied header is caught too.
+  Rule F (blocked-task staleness — ADVISORY ONLY, never fails): a `[!]` task
+      whose body names its blocker by a structured id (`blocked on M0145-XXXX`,
+      `BLOCKED ... <id>`) while that task is `[ ]` or `[x]` prints a warning —
+      the blocker has lifted but the dependant never tracked it (the template1
+      extension task sat `[!]` two days after its blocker got Option A GO).
+      Non-id prose blockers ("blocked on the template1 namespace") are not
+      caught — naming the blocker by id keeps the check honest.
 
 Task grammar:  `<indent>- [ |x|!] **<TASK-ID>...`  (id ends at whitespace or `*`)
 Body lines (until the next checkbox task line or `#` heading), or the task's
@@ -409,6 +416,49 @@ def check(baseline, candidate):
     return errs
 
 
+BLOCK_RE = re.compile(r"(?i)\bblock")
+UNBLOCK_RE = re.compile(
+    r"(?i)\bunblock|\bblocker\b.{0,40}(lifted|cleared|released|gone|resolved)")
+IDREF_RE = re.compile(r"(M\d{4}-[\w.-]*|P0-[\w.-]+|testport/[\w.-]+)")
+
+
+def blocker_advisories(candidate):
+    """Rule F — non-blocking warnings: a `[!]` task that names its blocker by
+    structured id while that blocker is now `[ ]`/`[x]` (stale block)."""
+    import bisect
+    ctasks, corder = parse(candidate)
+    norm_tasks = {}
+    for tid, t in ctasks.items():
+        norm_tasks.setdefault(tid.replace("\\", ""), t)
+    lines = candidate.splitlines()
+    # a task body runs until the next task header or `#` heading
+    bounds = [n for n, ln in enumerate(lines, 1)
+              if TASK_RE.match(ln) or HEAD_RE.match(ln)]
+    warns = []
+    for t in corder:
+        if t.status != "!":
+            continue
+        i = bisect.bisect_right(bounds, t.line)
+        end = bounds[i] if i < len(bounds) else len(lines) + 1
+        seen = set()
+        for n in range(t.line, end):
+            ln = lines[n - 1]
+            if not BLOCK_RE.search(ln) or UNBLOCK_RE.search(ln):
+                continue
+            for ref in IDREF_RE.findall(ln):
+                tid = ref.rstrip(".,:;—").replace("\\", "")
+                bt = norm_tasks.get(tid)
+                if bt is None or bt.status not in " x" or tid in seen:
+                    continue
+                seen.add(tid)
+                warns.append(
+                    f"task {t.id} (line {t.line}) is `[!]` but its blocked-on "
+                    f"reference {tid} is now `[{bt.status}]` (line {bt.line}, "
+                    f"cited at line {n}) — the blocker may have lifted; "
+                    f"re-check whether {t.id} should re-open.")
+    return warns
+
+
 def git_show(spec):
     r = subprocess.run(["git", "show", spec], capture_output=True)
     if r.returncode != 0:
@@ -443,6 +493,8 @@ def main(argv=None):
         if not cand:  # file absent/deleted: nothing to police here
             return 0
     errs = check(base, cand)
+    for w in blocker_advisories(cand):
+        sys.stderr.write("ralph-lineage-guard advisory: " + w + "\n")
     if errs:
         sys.stderr.write("ralph-lineage-guard: %d violation(s) in %s\n" % (len(errs), a.path))
         for e in errs:
