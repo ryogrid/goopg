@@ -490,15 +490,68 @@ func collectNonNullableWalk(e parser.Expr, topLevel bool, tableMap map[string]*c
 		}
 
 	case *parser.IsNullExpr:
-		// IS NOT NULL: the tested column must be non-null.
+		// IS NOT NULL: the tested column must be non-null. The operand
+		// is walked at PG's top_level=false (find_nonnullable_vars,
+		// clauses.c): only refs whose own NULL forces the operand NULL
+		// count, so `coalesce(d.u1, e.u1) IS NOT NULL` marks neither
+		// side of a FULL JOIN — it can be non-NULL with either input
+		// NULL. M0146-0015j.
 		if x.Negated {
-			for _, name := range collectColumnRefTableNames(x.Operand, tableMap, cat) {
-				result[name] = true
+			for _, ref := range strictOperandRefs(x.Operand, tableMap, cat) {
+				for _, name := range collectColumnRefTableNames(ref, tableMap, cat) {
+					result[name] = true
+				}
 			}
 		}
 	}
 
 	return result
+}
+
+// strictOperandRefs returns the operand's column references that must be
+// non-NULL for the operand itself to be non-NULL — PG's
+// find_nonnullable_vars applied to an `IS NOT NULL` operand at
+// top_level=false (postgres/src/backend/optimizer/util/clauses.c).
+// Only strict-preserving constructs are descended: bare vars, strict
+// operators, strict builtin functions (catalog proisstrict — resolved by
+// proname, so SQL special forms spelled as calls here — coalesce,
+// nullif, greatest, least — miss the pg_proc lookup exactly as their
+// dedicated non-strict node types miss PG's walker), casts, collations,
+// NOT/unary, and ROW elements (a ROW IS NOT NULL requires every element
+// non-NULL). CASE, non-strict functions, and everything else contribute
+// nothing — they can be non-NULL while any of their inputs are NULL.
+// M0146-0015j.
+func strictOperandRefs(e parser.Expr, tableMap map[string]*catalog.Table, cat catalog.Catalog) []parser.Expr {
+	if e == nil {
+		return nil
+	}
+	var out []parser.Expr
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		out = append(out, x)
+	case *parser.BinaryOp:
+		if isStrictOp(x.Op, x.Left, x.Right, tableMap, cat) {
+			out = append(out, strictOperandRefs(x.Left, tableMap, cat)...)
+			out = append(out, strictOperandRefs(x.Right, tableMap, cat)...)
+		}
+	case *parser.UnaryOp:
+		out = strictOperandRefs(x.Operand, tableMap, cat)
+	case *parser.CastExpr:
+		out = strictOperandRefs(x.Operand, tableMap, cat)
+	case *parser.CollateExpr:
+		out = strictOperandRefs(x.Operand, tableMap, cat)
+	case *parser.RowExpr:
+		for _, el := range x.Elems {
+			out = append(out, strictOperandRefs(el, tableMap, cat)...)
+		}
+	case *parser.FuncCall:
+		if oid, ok := catalog.LookupBuiltinProcByProname(x.Name.Name); ok && catalog.IsStrictProc(oid) {
+			for _, arg := range x.Args {
+				out = append(out, strictOperandRefs(arg, tableMap, cat)...)
+			}
+		}
+	}
+	return out
 }
 
 // isStrictOp reports whether a binary operator is strict — that is, it returns
@@ -727,10 +780,15 @@ func collectForcedNullWalk(e parser.Expr, topLevel bool, tableMap map[string]*ca
 	switch x := e.(type) {
 	case *parser.IsNullExpr:
 		// IS NULL (not IS NOT NULL): the column IS forced to be null if the
-		// clause passes.
+		// clause passes. PG's find_forced_null_var accepts only a plain
+		// `var IS NULL` — a compound operand (coalesce(a,b), f(x), a+b, …)
+		// forces nullness on nothing it names, so collecting all of its
+		// refs over-marks tables/columns as forcing. M0146-0015j.
 		if !x.Negated {
-			for _, name := range collectColumnRefTableNames(x.Operand, tableMap, cat) {
-				result[name] = true
+			if _, ok := x.Operand.(*parser.ColumnRef); ok {
+				for _, name := range collectColumnRefTableNames(x.Operand, tableMap, cat) {
+					result[name] = true
+				}
 			}
 		}
 
@@ -979,10 +1037,14 @@ func collectNonNullableColumnKeysWalk(e parser.Expr, dst map[string]bool, tableM
 		}
 
 	case *parser.IsNullExpr:
-		// IS NOT NULL: the tested column must be non-null.
+		// IS NOT NULL: same operand-level rule as the table-name walker —
+		// strict refs only, so `coalesce(d.u1, e.u1) IS NOT NULL` marks
+		// neither side. M0146-0015j.
 		if x.Negated {
-			for _, key := range collectColumnRefColumnKeys(x.Operand, tableMap, cat) {
-				dst[key] = true
+			for _, ref := range strictOperandRefs(x.Operand, tableMap, cat) {
+				for _, key := range collectColumnRefColumnKeys(ref, tableMap, cat) {
+					dst[key] = true
+				}
 			}
 		}
 	}
@@ -1003,9 +1065,13 @@ func collectForcedNullColumnKeysWalk(e parser.Expr, topLevel bool, dst map[strin
 	}
 	switch x := e.(type) {
 	case *parser.IsNullExpr:
+		// Plain `var IS NULL` only, matching PG's find_forced_null_var
+		// (same operand restriction as the table-name twin). M0146-0015j.
 		if !x.Negated {
-			for _, key := range collectColumnRefColumnKeys(x.Operand, tableMap, cat) {
-				dst[key] = true
+			if _, ok := x.Operand.(*parser.ColumnRef); ok {
+				for _, key := range collectColumnRefColumnKeys(x.Operand, tableMap, cat) {
+					dst[key] = true
+				}
 			}
 		}
 	case *parser.BinaryOp:

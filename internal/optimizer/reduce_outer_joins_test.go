@@ -1383,3 +1383,124 @@ func TestReduceOuterJoinsLeftToAntiSameColumnStillConverts(t *testing.T) {
 		t.Errorf("ON strict for b.id + WHERE forcing b.id: got %v, want JoinAnti", got)
 	}
 }
+
+// M0146-0015j: `coalesce(d.c, e.c) IS NOT NULL` must NOT null-reject
+// either side of a FULL JOIN — PG's find_nonnullable_vars has no
+// CoalesceExpr walker case, so the operand contributes nothing. goopg
+// collected every ColumnRef under the operand and demoted the join to
+// inner, returning 10 rows where PG keeps 190.
+
+func TestReduceOuterJoinsCoalesceIsNotNullKeepsFull(t *testing.T) {
+	// d FULL JOIN e ON ... WHERE coalesce(d.u1, e.u1) IS NOT NULL
+	// → stays FULL (PG emits Hash Full Join + Filter).
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "d"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinFull, Right: parser.RangeVar{Name: "e"}},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Negated: true,
+		Operand: &parser.FuncCall{
+			Name: parser.ObjectName{Name: "coalesce"},
+			Args: []parser.Expr{
+				&parser.ColumnRef{Table: "d", Column: "u1"},
+				&parser.ColumnRef{Table: "e", Column: "u1"},
+			},
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinFull {
+		t.Errorf("FULL JOIN under coalesce(d.u1,e.u1) IS NOT NULL: got %v, want JoinFull", got)
+	}
+}
+
+func TestReduceOuterJoinsCoalesceConstIsNotNullKeepsLeft(t *testing.T) {
+	// d LEFT JOIN e WHERE coalesce(e.u1, 0) IS NOT NULL — the qual can be
+	// true on a null-extended row, so PG keeps the LEFT JOIN.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "d"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinLeft, Right: parser.RangeVar{Name: "e"}},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Negated: true,
+		Operand: &parser.FuncCall{
+			Name: parser.ObjectName{Name: "coalesce"},
+			Args: []parser.Expr{
+				&parser.ColumnRef{Table: "e", Column: "u1"},
+				&parser.IntegerConst{Value: 0},
+			},
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN under coalesce(e.u1,0) IS NOT NULL: got %v, want JoinLeft", got)
+	}
+}
+
+func TestReduceOuterJoinsStrictFuncIsNotNullStillDemotes(t *testing.T) {
+	// abs(e.u1) IS NOT NULL — abs is a strict builtin (pg_proc
+	// proisstrict), so PG DOES null-reject e and demotes to inner.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "d"},
+		Joins: []parser.JoinExpr{
+			{Type: parser.JoinLeft, Right: parser.RangeVar{Name: "e"}},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Negated: true,
+		Operand: &parser.FuncCall{
+			Name: parser.ObjectName{Name: "abs"},
+			Args: []parser.Expr{
+				&parser.ColumnRef{Table: "e", Column: "u1"},
+			},
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinInner {
+		t.Errorf("LEFT JOIN under abs(e.u1) IS NOT NULL: got %v, want JoinInner", got)
+	}
+}
+
+func TestReduceOuterJoinsCoalesceIsNullDoesNotForce(t *testing.T) {
+	// d LEFT JOIN e ON e.u1 = d.u2 WHERE coalesce(d.u1, e.u1) IS NULL —
+	// PG's find_forced_null_var accepts only a plain Var operand, so the
+	// compound operand forces nothing: no LEFT->ANTI conversion even
+	// though the ON qual is strict on e.u1.
+	from := []parser.FromExpr{{
+		Base: parser.RangeVar{Name: "d"},
+		Joins: []parser.JoinExpr{
+			{
+				Type: parser.JoinLeft, Right: parser.RangeVar{Name: "e"},
+				On: &parser.BinaryOp{
+					Op:    parser.OpEq,
+					Left:  &parser.ColumnRef{Table: "d", Column: "u2"},
+					Right: &parser.ColumnRef{Table: "e", Column: "u1"},
+				},
+			},
+		},
+	}}
+	where := &parser.IsNullExpr{
+		Operand: &parser.FuncCall{
+			Name: parser.ObjectName{Name: "coalesce"},
+			Args: []parser.Expr{
+				&parser.ColumnRef{Table: "d", Column: "u1"},
+				&parser.ColumnRef{Table: "e", Column: "u1"},
+			},
+		},
+	}
+
+	reduceOuterJoins(from, where, nil)
+
+	if got := from[0].Joins[0].Type; got != parser.JoinLeft {
+		t.Errorf("LEFT JOIN under coalesce(d.u1,e.u1) IS NULL: got %v, want JoinLeft", got)
+	}
+}
