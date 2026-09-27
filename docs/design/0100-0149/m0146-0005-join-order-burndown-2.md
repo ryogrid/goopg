@@ -299,3 +299,35 @@ NLs; all checksums clean.
 
 Evidence: `analysis/m0146/m0146-0005/slice27/`; fix-plan entry
 M0146-0005aa.
+## Slice 28 (recon): Q17/Q25/Q29 gather height = probe-cost epsilon, routed
+
+Post-slice-27, the last `parallelism`-classified census family is Q17,
+Q25, Q29: both engines gather the same `Gather Merge -> Sort -> NL
+chain` shape, but goopg pulls `catalog_sales` **inside** the partial
+subtree (the Gather Merge covers six relations) while PG gathers the
+five-relation chain and probes `catalog_sales` above it via index.
+
+Instrumented-PG plancand + goopg DPPATH on private SF0.25 clones show
+the candidate sets are **complete on both sides**: goopg files the
+PG-shaped serial arm (`nestloop.index` over the 5-rel outer probing cs,
+4862.38) and loses it to the six-rel `gather.merge.sort` (4841.90,
+Δ≈20.5 ≈ 0.4%); PG files both gather arms at the six-rel rel and
+rejects them `via=tie` against the already-filed `NL(GM5, cs)` (all at
+4715.94–4715.98 — a dead fuzzy tie kept by filing order).
+
+The sign flip originates at the 3-rel probe arm sharing the `{sr,d2}`
+partial outer: PG prices `ss` pkey probing cheapest (NL arm 3714.44 vs
+cs arm 3736.47), goopg prices `cs` `item_sk`-index probing cheapest
+(3839.84 vs ss 3860.95). Per-probe param costs bound to `sr`: goopg
+ss=2.055 / cs=1.916; PG ss=1.313 / cs=1.458 — a ~0.3-unit ordering flip
+amplified ~144× by inner repetition. Same probe-cost-epsilon class as
+slice 26, including the uniform ~0.5-0.75 uplift inside the
+`indexProbeMultiplier=2` compensation.
+
+Routing: probe-cost epsilon → M0142-0005c cost-model lineage. The
+census signature stays `parallelism` mechanically, but the true cause
+is documented; re-file as cost-adjudication when it next re-runs.
+No planner change is justified.
+
+Evidence: `analysis/m0146/m0146-0005/slice28/`; fix-plan entry
+M0146-0005ab.

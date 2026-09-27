@@ -22743,6 +22743,34 @@ M0146-0001 re-baseline census on the new default arm.
     unchanged\).
   Movement: yes — CATEGORIES-EXCL-MATCH parallelism 8 -> 7 \(Q55 moves to
     aggregation\-strategy depth 2, the deliberate Finalize/Partial split\)
+- [x] **M0146\-0005ab — Q17/Q25/Q29 gather\-height residual is a
+  probe\-cost epsilon, not a mechanism gap** \(slice 28, recon, filed
+  and done 2026\-09\-28\): the last `parallelism`\-classified census
+  family; both engines gather the same `Gather Merge \-> Sort \-> NL`
+  shape, but goopg pulls `catalog\_sales` inside the partial subtree
+  \(6\-rel gather\) while PG probes it above a 5\-rel gather.
+  Instrumented\-PG plancand `tpcds025@:5560` \+ goopg DPPATH on the
+  private clone `:5590`; evidence `analysis/m0146/m0146\-0005/slice28/`.
+  Kind: recon
+  Parent: M0146-0005
+  - Candidate sets complete on both sides: goopg files the PG\-shaped
+    serial arm \(`nestloop.index` over the 5\-rel outer probing cs,
+    4862\.38\) and loses it to the 6\-rel `gather\.merge\.sort`
+    \(4841\.90, Δ20\.5 ≈ 0\.4%\); PG files both gather arms at the
+    6\-rel rel and rejects them `via\=tie` vs the already\-filed
+    `NL\(GM5, cs\)` \(all at 4715\.94\-4715\.98 — a dead fuzzy tie
+    kept by filing order\).
+  - The sign flip is at the 3\-rel probe arm over the shared `{sr,d2}`
+    partial outer: PG `ss`\-probe NL 3714\.44 < cs 3736\.47; goopg
+    cs 3839\.84 < ss 3860\.95. Per\-probe param costs bound to `sr`:
+    goopg ss=2\.055 / cs=1\.916; PG ss=1\.313 / cs=1\.458 — a ~0\.3
+    per\-probe ordering flip, amplified ~144× by inner repetition.
+  - Routing: probe\-cost epsilon \(index\-probe per\-qual/descent
+    pricing inside the `indexProbeMultiplier=2` compensation\) →
+    M0142\-0005c cost\-model lineage, same as 0005z. The census still
+    reads `parallelism` mechanically; true cause documented — re\-file
+    as cost\-adjudication on the next census re\-run.
+  Movement: none — routing recon
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
