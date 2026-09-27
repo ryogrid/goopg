@@ -373,14 +373,42 @@ delegated; details in each task's entry):
 - **Explicit-opclass index restart defect (S2) → item 2a.** Wrong rows
   after a clean restart on any explicit-opclass index (the regress
   `tenk1` indexes qualify) — placed as item 2a's live member.
-- **Stale TPC-DS measurement data: reload APPROVED, scheduled for a
-  quiescent window.** The owner decision is yes — reload the goopg
-  SF0.25 (`scripts/tpcds-sf025-regression.sh load-goopg`) and SF1
-  (per `bench/tpcds/README.md`) clusters and ANALYZE the PG SF1
-  `store` table. These are cluster-lifecycle actions that take the
-  gate clusters down, so they are owner-window work, not loop work;
-  until they run, TPC-DS divergences on `char`-heavy tables may be
-  data artifacts — treat new findings there accordingly.
+- **Stale TPC-DS measurement data: reload APPROVED — EXECUTED
+  2026-09-27.** The owner decision was yes — reload the goopg SF0.25
+  and SF1 clusters and ANALYZE the PG SF1 `store` table — and the
+  owner then delegated execution in a stopped-loop window (the loop
+  restart stays owner-controlled). Done: SF0.25 reloaded via
+  `scripts/tpcds-sf025-regression.sh load-goopg`; SF1 reloaded per
+  `bench/tpcds/README.md` (schema drop + `scripts/tpcds-load.sh` —
+  25/25 tables, ANALYZE + CHECKPOINT); `char(n)` padding verified
+  (`customer.c_first_name` octet_length=20; `customer` relpages now
+  ~2854 vs PG's 2872, was ~1979 unpadded). PG reference ANALYZE was
+  widened to the whole `tpcds` + `tpcds025` databases because every
+  reference table, not just `store`, had never been analyzed
+  (`pg_stat_user_tables.last_analyze` was NULL for all 25 — prior PG
+  plan evidence was captured against no-statistics defaults). TPC-DS
+  divergences on `char`-heavy tables recorded before this date may be
+  data artifacts — re-derive rather than trust them.
+- **Post-reload finding (2026-09-27): bpchar equality divergence,
+  previously masked by the unpadded data.** The SF0.25 sweep on the
+  reloaded cluster is red (PASS=70 MISMATCH=20 CKMISMATCH=6 vs
+  96/96 before) — and the cause is an engine bug the stale data was
+  hiding, not a reload defect. Repro: `select 'Javier
+  '::char(20) = 'Javier'` returns f on goopg, t on PG (PG's
+  `bpchareq` ignores trailing blanks); `select count(*) from
+  customer where c_first_name='Javier'` returns 0 on goopg vs 31 on
+  PG (`'Javier'::char(20)` returns 31 on both). With unpadded
+  storage the bytewise comparison happened to match, so the old
+  cluster reported correct rows; correctly padded data now exposes
+  that char-vs-shorter-literal comparisons miss. The many
+  `goopg=0 oracle=100` mismatches are this class. Re-verified
+  meaning: the pre-reload 96/96 was partially phantom. Expected
+  follow-up: fix bpchar comparison semantics (text vs bpchar
+  coercion + blank-insensitive equality), then re-sweep; queries
+  still diverging after that are real planner gaps. Also note the
+  census-era "char-heavy divergences may be data artifacts" runs
+  both ways — the stale data did not just create noise, it
+  *cancelled* a real defect.
 - **M0146-0015b rank conflict: conservative reading confirmed.** A
   pre-existing (not cutover-caused) cause keeps normal M0146 order
   even when the task descends from an item-2a member. (Landed
