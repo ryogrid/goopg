@@ -96,6 +96,37 @@ arm.
 Q78 now prints no `Subquery Scan`, and `ws`'s `d_year = 1998` sits on the
 inner Index Scan as in PG. Evidence: `analysis/m0146/m0146-0007/slice3/`.
 
+## Slice 4 (M0146-0007d): a CTE referenced only from sublinks still hoists
+
+EXPLAIN's `collectCTEHoist` (`internal/executor/explain_cte.go`) walked the
+plan spine only: a CTE whose EVERY reference sits inside a sublink body was
+never claimed, so each reference rendered the whole body inline — TPC-DS
+Q14's `avg_sales` printed three copies of its Finalize-Aggregate subtree,
+one under each of the three InitPlans probing it. Upstream plans the CTE
+once (`SS_process_ctes`, subselect.c — the subplan rides the topmost
+`init_plans`) and prints one `CTE avg_sales` section no matter where the
+references live; PG's own InitPlan probes show bare `CTE Scan on avg_sales`
+leaves.
+
+- The collector now also walks `optimizer.NodeSubplans(n)` at every node —
+  the same expression-side enumeration explain_names.go already uses, kept
+  in lockstep with walkPlanExprs by exprwalk_inventory_test.go. Sublink
+  bodies (scalar/EXISTS/IN/ARRAY/multi-assign, slot-driven via
+  ExprSubplans) reach the walk; claim keying, dedup, inlined-scan descent
+  and declSeq section order are all unchanged.
+- Nested sublinks inside a reached body recurse through the same walk; a
+  second reference to an already-claimed declaration still declines to
+  descend.
+- Verified on Q14 (SF0.25, private clone): one `CTE avg_sales` section and
+  three bare `CTE Scan` InitPlan leaves, matching plans-pg/Q14.txt. The
+  first-divergence record leaves the CTE boundary (`D6-cte` 1 → 0, Q14 →
+  `D1-sublink`; the residual is the Append-leg aggregate shape plus its
+  inner join strategy — routed outside this task).
+- `TestExplainSublinkOnlyCTEHoistsToSection` pins the shape.
+- The deferral-ledger row for this divergence (2026-08-06, M0125-0049) is
+  marked resolved; its "single reference prints once either way" caveat was
+  wrong for the multi-InitPlan case — N probes rendered N inline copies.
+
 ## Open (ledgered)
 
 1. The join pass (`pushSingleSideQualsIntoInnerJoinInputs`) still declines

@@ -237,3 +237,40 @@ func TestExplainSameNameDisjointScopesSectionedTwice(t *testing.T) {
 		t.Errorf("want 2 `CTE Scan on x` reference leaves, got %d:\n%s", got, joined)
 	}
 }
+
+// TestExplainSublinkOnlyCTEHoistsToSection is the M0146-0007d regression,
+// TPC-DS Q14's shape: `avg_sales` is referenced ONLY from inside scalar
+// InitPlans (`sum(...) > (SELECT average_sales FROM avg_sales)`), so the
+// spine walk in collectCTEHoist never saw it — every InitPlan rendered the
+// CTE's whole body inline, N copies for N probes. PG still prints one
+// `CTE x` section and bare `CTE Scan` leaves: SS_process_ctes attaches the
+// subplan to the declaring level regardless of where the references sit.
+//
+// The fix walks NodeSubplans at every node, the same expression-side
+// enumeration explain_names.go already uses for qualifier attribution.
+func TestExplainSublinkOnlyCTEHoistsToSection(t *testing.T) {
+	lines := cteExplainLines(t,
+		`WITH x AS (SELECT avg(a) AS v FROM t)
+		 SELECT a FROM t WHERE a > (SELECT v FROM x) AND a < (SELECT v FROM x) + 1000`)
+	joined := strings.Join(lines, "\n")
+
+	sections := 0
+	for _, l := range lines {
+		if strings.HasSuffix(l, "CTE x") {
+			sections++
+		}
+	}
+	if sections != 1 {
+		t.Errorf("want exactly 1 `CTE x` section, got %d:\n%s", sections, joined)
+	}
+	// Both InitPlan probes still render, as bare CTE Scan leaves — the body
+	// lives only in the section.
+	if got := countLinesContaining(lines, "CTE Scan on x"); got != 2 {
+		t.Errorf("want 2 `CTE Scan on x` reference leaves, got %d:\n%s", got, joined)
+	}
+	// The body scans t exactly once (the outer Seq Scan is the second `t`).
+	// Unhoisted, each InitPlan carried a full inline copy — three scans.
+	if got := countLinesContaining(lines, "Scan on t"); got != 2 {
+		t.Errorf("want 2 scans of t (outer + one CTE body), got %d:\n%s", got, joined)
+	}
+}

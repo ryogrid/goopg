@@ -22856,6 +22856,28 @@ M0146-0001 re-baseline census on the new default arm.
     - Q78 prints no `Subquery Scan`; its SF0.25 record moves from
       join\-order to qual\-placement at the same node; all gates pass.
   Movement: TPC\-DS Q78 ws residual qual moves onto the inner Index Scan
+- [x] **M0146\-0007d — a CTE referenced only from sublinks still hoists to
+  a `CTE <name>` section** \(filed and done 2026\-09\-28 from the
+  2026\-09\-27 triage\'s `PG CTE avg_sales | goopg Sort` \(Q14\) record\).
+  Kind: impl
+  Parent: M0146\-0007
+  - **DONE 2026\-09\-28.** Design doc
+    `docs/design/0100\-0149/m0146\-0007\-inline\-cte.md` §"Slice 4";
+    evidence `analysis/m0146/m0146\-0007/slice4/`.
+    - `collectCTEHoist` \(explain\_cte.go\) walked the plan spine only;
+      sublink bodies hang off expression fields, so a CTE probed purely
+      by InitPlans \(Q14\'s `avg_sales`, three probes\) rendered its whole
+      body inline per reference. The walk now also descends
+      `optimizer.NodeSubplans(n)` at every node — the slot\-driven
+      sublink enumerator explain\_names.go already uses.
+    - Q14\'s record leaves the CTE boundary: first\-divergence class
+      `D6\-cte` → `D1\-sublink` \(residual = Append\-leg aggregate shape
+      + inner join strategy, routed outside\).
+    - Closes the 2026\-08\-06 M0125\-0049 ledger row \(its "prints once
+      either way" caveat was wrong for N\-probe CTEs\).
+    - `TestExplainSublinkOnlyCTEHoistsToSection` pins it; gates:
+      `analysis/m0146/m0146\-0007/slice4/gates.txt`.
+  Movement: TPC\-DS Q14 first\-divergence class D6\-cte → D1\-sublink \(SF0.25 census D6\-cte 1 → 0; SF1 fires Q14, classes unchanged\)
 - [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
   them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
   `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).
