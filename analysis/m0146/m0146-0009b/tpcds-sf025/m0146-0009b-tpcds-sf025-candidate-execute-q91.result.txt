@@ -1,0 +1,4 @@
+ call_center | call_center_name | manager | returns_loss 
+-------------+------------------+---------+--------------
+(0 rows)
+

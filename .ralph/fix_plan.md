@@ -23043,7 +23043,7 @@ M0146-0001 re-baseline census on the new default arm.
     pure estimator artifact.
   - Fix filed as M0146\-0009b. PG oracle used: `:65438` db `tpcds025`
     user `ryo` \(the `postgres` role does not exist there\).
-- [ ] **M0146\-0009b — `bpchar(n)` constants never hit the MCV list**
+- [x] **M0146\-0009b — `bpchar(n)` constants never hit the MCV list**
   \(impl, filed by M0146\-0009a 2026\-09\-28\). `eqSelectivityForColumn`
   \(`internal/optimizer/selectivity\.go:376`\) byte\-compares
   `formatExprConstant(literal)` against `MCV.Value`; for `char(N>1)`
@@ -23072,6 +23072,41 @@ M0146-0001 re-baseline census on the new default arm.
     `make ea\-ratchet` sweep, not just Q7.
   - Gates: optimizer unit tests; tpch\-spotcheck; SF0\.25 sweep; EA
     ratchet.
+  - Done 2026\-09\-28: truelen compare at every literal\-vs\-stats site
+    \(`statLiteralEqual` for MCV probes, `histCmp`/`bucketFraction` for
+    histograms, truelen pairing in `eqjoinselSemiCore`/`eqjoinselInnerMCV`
+    when both keys are bpchar\); type names threaded through
+    `eqSelectivityForColumn`/`indexKeyEqSelectivity`/`columnTypeByName`/
+    `joinKeyTypeName`. Witness: `='College'` 9\,604 → 272\,433 \(PG
+    \~274k\); Q7 Gather Merge 2 → 45 \(PG 46\); Q27 2 → 45. SF0\.25
+    parity MATCH 12 → 15 \(Q12/Q20/Q98\), no losses; fireset 25 fires all
+    PASS both arms; SF1 unchanged; TPC\-H floor match=6, arm digest 24/24.
+    Design: `docs/design/0100\-0149/m0146\-0009b\-bpchar\-stats\-compare\.md`;
+    evidence `analysis/m0146/m0146\-0009b/`.
+- [ ] **M0146\-0009c — triage the 5 NEW ea\-ratchet findings** \(recon,
+  filed 2026\-09\-28 by M0146\-0009b\). With the gate actually measuring
+  \(see M0146\-0009d\), five relsets crossed the bar that were absent from
+  the 2026\-09\-22 baseline — all on plans byte\-identical baseline\-vs\-
+  candidate, i\.e\. drift accumulated while the gate ran vacuous, not from
+  0009b. Classes: \(a\) Q85 `reason\+web_returns\+web_sales` NL/Gather
+  Merge est=1 vs actual \~596 \(3 relsets\); \(b\) Q78
+  `date_dim\+store_returns\+store_sales\+web_returns\+web_sales` Merge
+  Left Join est=1\,407 vs 123\,049; \(c\) Q83
+  `catalog_returns\+date_dim\+item\+store_returns` Merge Join est=1 vs 22\.
+  Ledger rows filed under M0146\-0009c.
+  Kind: recon
+  Parent: M0146-0009
+- [ ] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
+  filed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
+  foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
+  short\-circuits `start_server`\) and on a stale `tmp/c20a/data\-sf025`
+  clone without TPC\-DS tables; all 99 captures were `relation does not
+  exist` ERRORs, `nodes scored: 0`, and the ratchet printed
+  `PASS \(52 fixed\)` — a NO\-COMPARE presented as all\-clear. Fix:
+  verify the port\'s server is the gate\'s own \(binary/datadir identity\),
+  and fail \(not PASS\) when `scored == 0` or the capture is all\-ERROR\.
+  Kind: impl
+  Parent: M0146-0009
 - [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
   the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
   §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;
