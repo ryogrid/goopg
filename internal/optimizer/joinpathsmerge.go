@@ -519,6 +519,13 @@ func sortPathForBounded(sub *Path, keys []PathKey, cp costParams, limitTuples fl
 		// create_sort_path (pathnode.c:3065): `rel->consider_parallel &&
 		// subpath->parallel_safe`. C-19a.
 		ParallelSafe: parallelSafeWith(sub.Rel, sub),
+		// M0146-0027: `pathnode->path.parallel_workers =
+		// subpath->parallel_workers` — a Sort over a partial path is itself
+		// per-worker (each worker sorts its own partition), which is the
+		// stamp `gatherSubpathIsRunnable` and `gatherChildPlan` read when the
+		// sort is the Gather Merge's child. Serial inputs carry 0, so the
+		// merge-join and ordered-rel callers are unchanged.
+		ParallelWorkers: sub.ParallelWorkers,
 	}
 	// R121 Slice A(ii): a Sort reorders rows, it does not project them. NOTE
 	// goopg's Sort genuinely runs at the full row width -- this makes the

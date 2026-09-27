@@ -620,14 +620,15 @@ type RelOptInfo struct {
 	// parameter down `createOrderedPaths`/`addOrderedPaths` for one list one
 	// future consumer reads).
 	//
-	// Nothing reads this yet, and that is the slice's gate. S2b-2's own
-	// scoping recon (docs/design/0100-0149/m0141-s2b-scoping-decomposition.md
-	// §"S2b-2 result") proved that OFFERING these candidates to the ORDERED
-	// tournament today cannot move a plan — every candidate of one rel
-	// shares the same (rows, width), so `costSortRun`'s constant Sort charge
-	// on top cannot change which one ranks cheapest — so this field is
-	// visibility only until M0141-S7's per-candidate Pathkeys credit
-	// (`cost_incremental_sort`) exists for S2b-2c to spend it on. nil when
+	// Read by `addOrderedPaths`' `is_sorted` arm (M0146-0027): upstream's
+	// `create_ordered_paths` offers every input_rel->pathlist path that
+	// already satisfies the ordering (planner.c:5342-5345), which is how an
+	// ordering-carrying runner-up — a merge join, a gather.merge.sort —
+	// reaches the ordered rel instead of losing to cheapest-total. The
+	// S2b-2 scoping recon's "cannot move a plan" finding held only for
+	// sort-WRAPPING every candidate (`costSortRun`'s constant charge can
+	// never reorder a contest); the already-sorted arm adds no sort and so
+	// moves plans exactly where an ordered runner-up exists. nil when
 	// `input` is not a searched-tree root, or the search published no
 	// Pathlist.
 	SearchCandidates []*Path
@@ -644,12 +645,27 @@ type RelOptInfo struct {
 	// Incremental Sort tournament needs before it can trust any non-seed
 	// candidate's ordering claim.
 	//
-	// Nothing reads this yet, same gate as SearchCandidates: computing it
-	// cannot move a plan because nothing offers these candidates to
-	// `addOrderedPaths` yet. nil when SearchCandidates is nil; an individual
-	// entry is nil when that candidate's own Pathkeys validate to nothing
-	// (no ordering claim survives, same truncation rule as the winner's).
+	// Read by `addOrderedPaths`' `is_sorted` arm (M0146-0027) — the
+	// containment test for the offer above is run on THESE keys, never on
+	// the candidate's own search-space claim. nil when SearchCandidates is
+	// nil; an individual entry is nil when that candidate's own Pathkeys
+	// validate to nothing (no ordering claim survives, same truncation rule
+	// as the winner's).
 	SearchCandidateKeys [][]PathKey
+
+	// BoundaryFill is the hole-filler closure this rel's boundary publication
+	// was stamped with (`createPlanAtSearchRootRange`'s `fill` parameter,
+	// built at relfromjoinlist.go's joinlistRel site). It answers whether a
+	// binding coordinate the searched path's emission dropped may be PADDED
+	// — a typed NULL at a slot the statement provably never reads — and is
+	// the same license the committed subtree's publication ran under.
+	// `searchedBoundaryRebuild` replays it when offering a non-winning
+	// searched path as an upper stage's input (M0146-0027): without it every
+	// candidate whose narrowed leaf dropped a below-only column declines the
+	// rebuild, while the committed winner — whose own emission ran under the
+	// license — would have carried the same hole. nil for a boundary that
+	// published with no filler.
+	BoundaryFill func(int) (SchemaColumn, bool)
 
 	// LeftBranchRel / RightBranchRel are the search's own RelOptInfo for a
 	// SETOP rel's two UNION ALL branches (`searchedRelOf(setOpNode.Left)` /

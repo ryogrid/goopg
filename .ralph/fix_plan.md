@@ -23048,6 +23048,37 @@ M0146-0001 re-baseline census on the new default arm.
     over the deeper Sort through `partialSortRootPays`'s already\-costed
     arm. Witnesses to pin: Q17 \(PG `Gather Merge -> Sort` carrying
     `i_item_id, i_item_desc, s_state` into the outer NLs\), Q6/Q25.
+  - Slice 1 landed 2026\-09\-27. Design doc
+    `docs/design/0100\-0149/m0146\-0027\-sorted\-partial\-gather\-merge\.md`;
+    evidence `analysis/m0146/m0146\-0027/`.
+    - The post\-pass was never the reach mechanism — `subtreeHasGather`
+      stands it down once the path model elects any Gather; PG instead
+      files `Gather Merge -> Sort -> partial` as a REAL candidate in
+      `generate_useful_gather_paths`' second half \(allpaths\.c:3255\-3341\),
+      which goopg lacked. Landed it as `gather.merge.sort` over the
+      partial pathlist, gated by `usefulPathkeysForRelation` /
+      `pathkeySortableEarly` \(`relation_can_be_sorted_early`, resolved
+      through the new `searchCtx.itemSpans`\), per\-worker sort pricing,
+      `ParallelWorkers` propagation, and a `PathSort` arm in
+      `partialPathDrivingKind`.
+    - `addOrderedPaths`/`addGroupingPaths` gained upstream's `is_sorted`
+      pathlist iteration \(planner\.c:5342/7134\): searched runner\-up
+      candidates with re\-validated ordering are rebuilt through
+      `searchedCandidateInput` — `BoundaryFill` replays the committed
+      boundary's hole license; decline is fail\-closed, never a crash.
+      `aggregateEmissionPathkeys` accepts a searched\-root child, so no
+      redundant top Sort.
+    - SF0\.25 census: divergent 89 -> 88, matches 10 -> 11,
+      sort\-strategy 43 -> 38. Q7 -> MATCH; Q17/Q25/Q29 pushed from
+      `Sort under GroupAggregate` to depth\-4 Gather Merge placement;
+      Q50 -> qual\-placement; Q77 -> scan\-type. Sweep PASS=96, zero
+      mismatches; TPC\-H spotcheck PASS; units green.
+    - Remaining in scope: `Unique`/`Group`\-head records need the same
+      `is_sorted` consumer ported to their upper stages; Q17/Q25/Q29's
+      depth\-4 record is a join\-order/costing residue \(goopg's partial
+      chain spans 6 rels vs PG's 5\); Q6 unchanged — its spine files no
+      qualifying partial to sort.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

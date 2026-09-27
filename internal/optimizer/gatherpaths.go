@@ -137,17 +137,29 @@ func SetGatherPathsMode(label string) (restore func()) {
 	return setGatherPathsModeForTest(gatherPathModeFromEnv(label))
 }
 
-// generateUsefulGatherPaths is `generate_useful_gather_paths` (allpaths.c:3236)
-// at this slice's scope: its `generate_gather_paths` body (allpaths.c:3099) —
-// one Gather over the cheapest partial path, plus one Gather Merge per partial
-// path that already has an ordering.
+// generateUsefulGatherPaths is `generate_useful_gather_paths` (allpaths.c:3236):
+// its `generate_gather_paths` body (allpaths.c:3099) — one Gather over the
+// cheapest partial path, plus one Gather Merge per partial path that already
+// has an ordering — and its sorted-partial arm (allpaths.c:3255-3341): for
+// each useful ordering, sorting the cheapest partial path INSIDE the workers
+// and gathering that per-worker ordering with a Gather Merge.
 //
-// The half NOT here is upstream's :3255-3341: sorting a partial path (fully or
-// incrementally) to reach an ordering it does not already have, and gathering
-// THAT. It needs a Sort path over a partial path plus
-// `get_useful_pathkeys_for_relation`, and it is C-19e's ("re-decide Gather
-// Merge → Sort → Parallel scan by cost"). The name is upstream's because the
-// call sites are upstream's; the missing half is stated rather than implied.
+// The second arm is M0146-0027's. It is the only producer of
+// `Gather Merge -> Sort -> <partial subtree>` in the path model — the shape
+// PG elects on TPC-DS Q17 (`Gather Merge -> Sort -> Nested Loop chain`)
+// where the parallel post-pass cannot reach: `MaybeAddGather` stands down
+// the moment a path-model Gather sits anywhere in the tree, and even when it
+// does run, `findPartialSubtree` cannot push a Gather above the existing one
+// because a nested Gather is not parallel-safe. Without the arm the upper rel
+// sees only unordered inputs and pays a leader-side `Sort -> Gather`, losing
+// both the worker-side sort and the ordering the GroupAggregate wants.
+//
+// The one upstream arm not here is `create_incremental_sort_path` for a
+// partially-presorted subpath when `enable_incremental_sort` is on
+// (allpaths.c:3324-3330): goopg's incremental-sort election is M0146-0006's
+// scope and its cost model needs a group estimate no mid-search rel carries,
+// so a `presorted > 0` subpath while the IS flag is on is skipped rather than
+// incrementally sorted — fail-closed, a missed candidate never a wrong plan.
 //
 // Called immediately before `setCheapest` on each rel, which is where
 // `standard_join_search` calls it (allpaths.c:3503-3517) and where
@@ -211,6 +223,98 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 			addPath(rel, gm, "gather.merge")
 		}
 	}
+
+	// "Consider sorted paths for each interesting ordering." (allpaths.c:3255-
+	// 3341.) For each useful ordering the subpath does not already deliver,
+	// sort the partial path inside the workers and gather the ordered
+	// partitions — PG's `Gather Merge -> Sort -> <partial>`; the ordering
+	// survives to feed whatever wants it above (an ordered input to an upper
+	// rel, or an outer pathkey chain through the NLs over it).
+	cheapestPartial := rel.PartialPathlist[0]
+	incOn := incrementalSortPathsMode == incrementalSortOn
+	for _, useful := range s.usefulPathkeysForRelation(rel) {
+		for _, sub := range rel.PartialPathlist {
+			// `pathkeys_count_contained_in(useful_pathkeys,
+			// subpath->pathkeys, &presorted_keys)` (allpaths.c:3271).
+			contained, presorted := pathkeysCountContainedIn(sub.Pathkeys, useful)
+			if contained {
+				// Already sorted: the loop above filed the bare
+				// Gather Merge over it.
+				continue
+			}
+			if sub != cheapestPartial && (presorted == 0 || !incOn) {
+				continue
+			}
+			if presorted > 0 && incOn {
+				// Upstream's `create_incremental_sort_path` arm — deferred
+				// to M0146-0006 (see the function header); nothing is
+				// offered here rather than a regular Sort upstream would
+				// not price.
+				continue
+			}
+			// `create_sort_path(root, rel, subpath, useful_pathkeys, -1)`
+			// (allpaths.c:3304-3309): the sort is priced on the subpath's
+			// own rows — goopg's partial paths carry PER-WORKER rows, the
+			// same convention `compute_gather_rows` multiplies back out —
+			// so the worker-side saving is priced exactly.
+			sorted := sortPathForBounded(sub, useful, s.cp, -1)
+			if gm := makeGatherMergePath(rel, sorted, s.cp, overrideRows); gm != nil {
+				addPath(rel, gm, "gather.merge.sort")
+			}
+		}
+	}
+}
+
+// usefulPathkeysForRelation is `get_useful_pathkeys_for_relation`
+// (allpaths.c:3147) at its one populated arm: the longest prefix of
+// `root->query_pathkeys` whose every key `relation_can_be_sorted_early`
+// (equivclass.c:1077) admits for this rel. Upstream's comment applies
+// unchanged — "at the moment this can only ever return a list with a single
+// element" — so the list-of-lists shape is kept but populated from
+// `s.queryPathkeys` alone.
+//
+// `relation_can_be_sorted_early`'s EC-member search is syntactic here: a
+// pathkey is sortable early when every ColumnRef it reads resolves inside
+// `rel.Relids` (computable from the reltarget — `relidsOfExpr` over
+// `s.itemSpans`, the same item-coordinate windows `buildRestrictInfos`
+// used), and when the expression is parallel-safe
+// (`is_parallel_safe`, require_parallel_safe=true at the sole call site —
+// `isParallelSafeExpr` refuses volatile functions too, covering upstream's
+// `ec_has_volatile` refusal). An unresolvable or empty rel set is refused —
+// upstream's EM search would find no member and answer the same.
+//
+// nil whenever there is no ordering or no spans to attribute one with —
+// hand-built contexts and the minimal context `generateUpperRelGatherPaths`
+// builds both answer nil, which is upstream's "no useful ordering" outcome.
+func (s *searchCtx) usefulPathkeysForRelation(rel *RelOptInfo) [][]PathKey {
+	if s == nil || rel == nil || len(s.queryPathkeys) == 0 || len(s.itemSpans) == 0 {
+		return nil
+	}
+	n := 0
+	for _, pk := range s.queryPathkeys {
+		if pk.Expr == nil || !s.pathkeySortableEarly(rel, pk.Expr) {
+			break
+		}
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	return [][]PathKey{s.queryPathkeys[:n:n]}
+}
+
+// pathkeySortableEarly is the per-key half of the derivation above —
+// `relation_can_be_sorted_early`'s two tests (computable from the reltarget,
+// parallel-safe) on the pathkey's own expression.
+func (s *searchCtx) pathkeySortableEarly(rel *RelOptInfo, e Expr) bool {
+	rels, ok := relidsOfExpr(e, s.itemSpans)
+	if !ok {
+		return false
+	}
+	if rels != 0 && !relsSubset(rels, rel.Relids) {
+		return false
+	}
+	return isParallelSafeExpr(e, s.cat)
 }
 
 // generateUpperRelGatherPaths is M0140-0006b-2's upper-rel entry point for
@@ -707,8 +811,22 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(o)
+	case PathSort:
+		// M0146-0027: `generate_useful_gather_paths`' sorted-partial arm
+		// (allpaths.c:3304-3328) wraps the cheapest partial path in a Sort
+		// and gathers THAT. The Sort is a per-worker pass-through — each
+		// worker sorts its own partition — so the driving question is the
+		// child's, unchanged. The node-level siblings agree: `drivingScan`
+		// and `stampParallelScan` both descend `*Sort` (parallel.go R56
+		// arm) and the executor's `attachParallelScan` `sortOp` arm does
+		// the same (parallel_scan.go P7 arm — Gather Merge over per-worker
+		// Sorts is the only shape that ever files this).
+		if len(p.Children) != 1 || p.Children[0] == nil || p.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	default:
-		// PathPrebuilt, joins, Sort, Memoize, Agg: not modelled by any attach
+		// PathPrebuilt, joins, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.
 		return PathPrebuilt
 	}

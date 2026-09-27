@@ -302,9 +302,13 @@ func TestPartialMergeJoinDrivingKind(t *testing.T) {
 	if !partialPathShapeIsGatherable(merge) {
 		t.Error("a scan-driven partial merge is not gatherable")
 	}
+	// M0146-0027: the PathSort arm exists now — the sorted-partial arm of
+	// `generateUsefulGatherPaths` wraps partial paths in per-worker Sorts, and
+	// the executor's `sortOp` arm of attachParallelScan descends them the same
+	// way. A sorted outer under a partial merge drives the scan below the Sort.
 	sorted := &Path{Kind: PathMergeJoin, Children: []*Path{{Kind: PathSort, Children: []*Path{scan}}, scan}}
-	if got := partialPathDrivingKind(sorted); got != PathPrebuilt {
-		t.Errorf("sorted-outer merge driving kind = %v, want Prebuilt (no PathSort arm)", got)
+	if got := partialPathDrivingKind(sorted); got != PathSeqScan {
+		t.Errorf("sorted-outer merge driving kind = %v, want the seq scan under the Sort", got)
 	}
 	badKids := &Path{Kind: PathMergeJoin, Children: []*Path{scan}}
 	if got := partialPathDrivingKind(badKids); got != PathPrebuilt {

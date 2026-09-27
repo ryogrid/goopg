@@ -83,7 +83,10 @@ package optimizer
 // production trees DO carry the tag and all three skips are reachable on real
 // plans — the same correction enclosingtree.go's header already carries.
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // searchedTree is the tag. It is embedded (not a named field) so that every
 // carrier gets the same two methods, and so that `isSearchedTree` can ask for
@@ -468,6 +471,39 @@ func searchedCheapestTotalInput(n Node) (Node, *Path) {
 	return nil, nil
 }
 
+// searchedCandidateInput is `searchedCheapestTotalInput` parameterized on the
+// path: rebuild `p` through the boundary at the searched root, then re-wrap
+// the same *Project/*Sort pass-through chain `n` carries above it. It is the
+// input-position half of upstream's `foreach(lc, input_rel->pathlist)` — PG's
+// upper stages (add_paths_to_grouping_rel, create_ordered_paths) offer every
+// surviving input path, not only cheapest_total_path, so an ordered runner-up
+// reaches the sorted-aggregate contest. nil on exactly the refusals
+// searchedCheapestTotalInput makes, minus the cheapest-total gate (the caller
+// chooses the path).
+func searchedCandidateInput(n Node, p *Path) Node {
+	if p == nil {
+		return nil
+	}
+	if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+		return searchedBoundaryRebuild(p, s.Output())
+	}
+	switch x := n.(type) {
+	case *Project:
+		if c := searchedCandidateInput(x.Child, p); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc
+		}
+	case *Sort:
+		if c := searchedCandidateInput(x.Child, p); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc
+		}
+	}
+	return nil
+}
+
 // searchedBoundaryRebuild builds the node `createPlanAtSearchRootRange`
 // would have published for `p` at the statement boundary — the same
 // binding-order row `exemplar` (the committed searched root's Output)
@@ -497,6 +533,9 @@ func searchedBoundaryRebuild(p *Path, exemplar Schema) (r Node) {
 		// signal is not lost because the same path stays priced and the
 		// producer bug it names is still reachable through the search.
 		if rec := recover(); rec != nil {
+			if dpTraceEnabled() {
+				fmt.Fprintf(os.Stderr, "DPPATH boundaryrebuild declined: %v\n", rec)
+			}
 			r = nil
 		}
 	}()
@@ -508,6 +547,17 @@ func searchedBoundaryRebuild(p *Path, exemplar Schema) (r Node) {
 	if n == nil || lay == nil || len(lay) != len(n.Output()) {
 		return nil
 	}
+	// M0146-0027: replay the boundary's own hole-filler. The committed
+	// subtree published under this license — a narrowed leaf that dropped a
+	// below-only join key gets a padded NULL slot, not a declined rebuild —
+	// so a non-winning candidate carrying the same kind of hole must be
+	// judged by the same rule. A hole the filler declines (a column the
+	// statement does read) still fails closed, here rather than in
+	// boundaryMap's panic below.
+	var fill func(int) (SchemaColumn, bool)
+	if p.Rel != nil {
+		fill = p.Rel.BoundaryFill
+	}
 	seen := make([]bool, w)
 	for _, bind := range lay {
 		if bind < 0 || bind >= w || seen[bind] {
@@ -517,10 +567,15 @@ func searchedBoundaryRebuild(p *Path, exemplar Schema) (r Node) {
 	}
 	for i := range seen {
 		if !seen[i] {
-			return nil
+			if fill == nil {
+				return nil
+			}
+			if _, ok := fill(i); !ok {
+				return nil
+			}
 		}
 	}
-	r = createPlanAtSearchRootRange(p, 0, w, nil)
+	r = createPlanAtSearchRootRange(p, 0, w, fill)
 	if r == nil || len(r.Output()) != w || !outputSchemaEqual(r.Output(), exemplar) {
 		return nil
 	}

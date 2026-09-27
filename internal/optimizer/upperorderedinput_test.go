@@ -193,6 +193,7 @@ func TestOrderedInputArmFiresEndToEndAndRemovesTheSort(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		sql        string
+		noParallel bool
 		wantSort   bool
 		wantMarker string
 	}{
@@ -203,16 +204,28 @@ func TestOrderedInputArmFiresEndToEndAndRemovesTheSort(t *testing.T) {
 			wantMarker: upperOrderedInputProducer,
 		},
 		{
+			// M0146-0027: with parallel workers available this case no
+			// longer keeps its Sort — the `gather.merge.sort` arm of
+			// `generateUsefulGatherPaths` (allpaths.c:3304-3328) sorts the
+			// cheapest partial path per worker by the ORDER BY keys and the
+			// Gather Merge delivers that order for free, exactly as PG does.
+			// MaxParallelWorkersPerGather = 0 removes that arm so the case
+			// still pins "an ORDER BY nothing delivers keeps its Sort".
 			name:       "ORDER BY a different column: the Sort must stay",
 			sql:        "select o_orderkey, l_orderkey from orders, lineitem where o_custkey = l_orderkey order by o_orderkey",
+			noParallel: true,
 			wantSort:   true,
 			wantMarker: upperOrderedSortProducer,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			run := ps
+			if c.noParallel {
+				run.MaxParallelWorkersPerGather = 0
+			}
 			var node Node
 			lines := captureTrace(t, func() {
-				n, err := PlanWithSettings(parseOne(t, c.sql), cat, ps)
+				n, err := PlanWithSettings(parseOne(t, c.sql), cat, run)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -391,6 +404,46 @@ func TestAggregateEmissionPathkeysReadsAGatherMergeChild(t *testing.T) {
 
 	if got := inputNodePathkeys(agg); len(got) != 1 {
 		t.Fatalf("a Gather Merge child delivers its merged order: got %d keys, want 1", len(got))
+	}
+}
+
+// TestAggregateEmissionPathkeysReadsASearchedRootChild is M0146-0027: the
+// grouping stage's `upper.groupagg.searchcand` arm can elect a searched
+// candidate as the sorted aggregate's input directly — no `*Sort` node —
+// because that path already delivers the group ordering. The rebuilt searched
+// root carries the WINNING searched path's validated pathkeys
+// (`stampSearchPathkeys`), so `inputNodePathkeys` must read that stamped claim
+// through the `*Aggregate` exactly as it reads a `*Sort` child's `Keys`.
+func TestAggregateEmissionPathkeysReadsASearchedRootChild(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	group := agg.GroupExprs[0]
+	root := &searchedPricedNode{pricedNode: pricedNode{sch: Schema{
+		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	}}}
+	root.markFromJoinSearch()
+	// A DESC/NULLS-FIRST claim — direction must survive the round trip.
+	root.setSearchPathkeys([]PathKey{{Expr: group, SortAsc: false, NullsFirst: true}})
+	agg.Child = root
+
+	got := inputNodePathkeys(agg)
+	if len(got) != 1 {
+		t.Fatalf("a searched root carrying the group order delivers it to the sorted aggregate: got %d keys, want 1", len(got))
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("the searched path's direction must be carried, got %+v", got[0])
+	}
+
+	// A searched root that does NOT satisfy the group order claims nothing.
+	root.setSearchPathkeys([]PathKey{{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}}})
+	if got := inputNodePathkeys(agg); got != nil {
+		t.Fatalf("a searched root sorted on a non-group column is not a sorted input, got %d keys", len(got))
+	}
+	// Neither does an untagged node — the stamped claim is what the walk
+	// trusts, not "this might have come from a search".
+	root.fromJoinSearch = false
+	if got := inputNodePathkeys(agg); got != nil {
+		t.Fatalf("an unmarked node carries no searched ordering claim, got %d keys", len(got))
 	}
 }
 

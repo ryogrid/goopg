@@ -156,6 +156,17 @@ type searchCtx struct {
 	// Nil in hand-built test contexts → the derivation yields 0 (legacy).
 	problemItems []joinlistRel
 
+	// itemSpans is the same item-coordinate binding window list
+	// `buildRestrictInfos` resolved `prob.conjuncts` against: itemSpans[i]
+	// is item i's `[lo,hi)` span of statement binding coordinates, which is
+	// the input `relidsOfExpr` needs to attribute an expression's ColumnRefs
+	// to item bits. Stamped beside `problemItems` in `searchOneProblem`; nil
+	// in hand-built contexts, where consumers decline (nil-spans
+	// `relidsOfExpr` answers not-ok). Read by `usefulPathkeysForRelation`
+	// (gatherpaths.go) for `relation_can_be_sorted_early`'s computable-from-
+	// reltarget test — M0146-0027.
+	itemSpans []leafSpan
+
 	// queryPathkeys is `PlannerInfo.query_pathkeys` (C-07/P3-06,
 	// querypathkeys.go): the ordering the STATEMENT wants from this level,
 	// derived once by `standard_qp_callback` before the first rel exists and

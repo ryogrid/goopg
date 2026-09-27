@@ -46,6 +46,11 @@ package optimizer
 const (
 	upperOrderedInputProducer = "upper.ordered.input"
 	upperOrderedSortProducer  = "upper.ordered.sort"
+	// upperOrderedCandidateProducer labels the `is_sorted` arm of upstream's
+	// `foreach(lc, input_rel->pathlist)` (planner.c:5342-5345) — a searched
+	// candidate whose validated ordering already satisfies sortPathkeys,
+	// offered as-is. M0146-0027.
+	upperOrderedCandidateProducer = "upper.ordered.searchcand"
 )
 
 // createOrderedPaths is `create_ordered_paths` for the one input goopg has
@@ -104,12 +109,9 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	seed.Pathkeys = inputNodePathkeys(input)
 
 	// M0141-S2b-2a: thread the search's own Pathlist onto the ORDERED rel
-	// (RelOptInfo.SearchCandidates) so it is visible to `addOrderedPaths`
-	// below — and to a later consumer — without re-deriving
-	// `searchedRelOf(input)`. Plumbing only: `addOrderedPaths` does not read
-	// it yet, so `seed` remains the only candidate offered and the chosen
-	// plan cannot change (see the field's doc comment for why offering more
-	// candidates today is provably inert).
+	// (RelOptInfo.SearchCandidates) so `addOrderedPaths`' is_sorted arm
+	// (M0146-0027) sees the surviving candidates — and a later consumer can
+	// too — without re-deriving `searchedRelOf(input)`.
 	if sr := searchedRelOf(input); sr != nil {
 		ordered.SearchCandidates = sr.Pathlist
 		// M0141-S2b-2b: re-earn every OTHER candidate's ordering claim
@@ -118,7 +120,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 		// (upperorderedinput.go's file header, rule 1) — generalized from
 		// "the one winner" to "every candidate", since a losing candidate's
 		// Pathkeys are just as much a claim made in the search's inner
-		// coordinate space. Still plumbing only: nothing below reads it.
+		// coordinate space. `addOrderedPaths` reads them below.
 		ordered.SearchCandidateKeys = validatedSearchCandidateKeys(sr.Pathlist, input.Output())
 		if pathTraceEnabled {
 			nonEmpty := 0
@@ -178,6 +180,45 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 		traceOrderedSortedCandidate(input.AggStrategy, input.Rows, sorted.Cost.Startup, sorted.Cost.Total)
 	}
 	addPath(ordered, sorted, upperOrderedSortProducer)
+
+	// M0146-0027: the `is_sorted` arm of upstream's `foreach(lc,
+	// input_rel->pathlist)` (planner.c:5342-5345) — every OTHER searched
+	// candidate whose validated ordering claim already contains
+	// sortPathkeys is offered AS-IS, no re-sort. The search crowns only
+	// cheapest-total, so without this scan an ordering-carrying runner-up —
+	// a nested loop over an ordered outer, a Gather Merge — is invisible to
+	// the ordered rel even though PG's loop sees it (TPC-DS Q17's
+	// pathkeys-3 `nestloop.index` loses the rel's total-cost contest by
+	// 0.04 and is the plan PG elects). The sort-wrapping arms need nothing
+	// new: upstream sorts only the cheapest input path (the seed above is
+	// its stand-in) and incrementally sorts presorted ones
+	// (`addIncrementalSortPaths` below already walks this same candidate
+	// list when the IS flag is on).
+	// Each offered path is rebuilt through the searched boundary
+	// (`searchedCandidateInput` — declines any shape the seam cannot
+	// reproduce in this input's published row), the same replay the
+	// cheapest-total seed went through; a raw searched path offered here
+	// would lower in the search's inner coordinate order, not the row the
+	// boundary committed.
+	if input != nil && input.node != nil {
+		for i, cand := range ordered.SearchCandidates {
+			if cand == nil || i >= len(ordered.SearchCandidateKeys) {
+				continue
+			}
+			if !pathkeysContainedIn(ordered.SearchCandidateKeys[i], sortPathkeys) {
+				continue
+			}
+			cNode := searchedCandidateInput(input.node, cand)
+			if cNode == nil {
+				continue
+			}
+			cs := newPrebuiltPath(ordered, cNode)
+			cs.Rows = cand.Rows
+			cs.Cost = cand.Cost
+			cs.Pathkeys = ordered.SearchCandidateKeys[i]
+			addPath(ordered, cs, upperOrderedCandidateProducer)
+		}
+	}
 
 	// M0141-S2b-2c / S7: the third arm — every OTHER surviving search
 	// candidate that already satisfies a genuine partial prefix of

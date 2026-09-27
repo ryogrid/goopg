@@ -30,6 +30,7 @@ const (
 	groupAggSortedProducer    = "upper.groupagg.sort"
 	groupAggPlainProducer     = "upper.groupagg.plain"
 	groupAggSortedIdxProducer = "upper.groupagg.sortedidx"
+	groupAggSearchProducer    = "upper.groupagg.searchcand"
 )
 
 // createGroupingPaths is `create_grouping_paths` for the one aggregate
@@ -505,6 +506,47 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			}
 		}
 		if haveSortedCandidate {
+			// M0146-0027: upstream's sorted arm iterates ALL of
+			// input_rel->pathlist (add_paths_to_grouping_rel,
+			// planner.c:7134) and make_ordered_path offers each input
+			// already sorted for the needed group ordering WITHOUT a
+			// Sort. The seed arms below price only cheapest_total_path,
+			// which is precisely the path that cannot carry the ordering
+			// when a runner-up can — TPC-DS Q17's searched pathlist holds
+			// a pathkeys=3 ordered nested loop (and a gather.merge.sort)
+			// covering the group keys exactly, and the GroupAggregate's
+			// Sort only disappears when that path reaches this contest.
+			// Each candidate's ordering claim is re-earned against the
+			// input node's published schema (validatedSearchCandidateKeys)
+			// and its emission re-proven through the boundary
+			// (searchedCandidateInput declines on any shape the seam
+			// cannot reproduce) — nothing here can elect a path whose
+			// ordering or row the committed input would not have carried.
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				groupPathkeys := pathkeysForSortKeys(keys)
+				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+				for i, cand := range sr.Pathlist {
+					if i >= len(candKeys) || !pathkeysContainedIn(candKeys[i], groupPathkeys) {
+						continue
+					}
+					cNode := searchedCandidateInput(child, cand)
+					if cNode == nil {
+						continue
+					}
+					cs := newPrebuiltPath(grouped, cNode)
+					cs.Rows = inputRows
+					cs.Cost = cand.Cost
+					cs.Pathkeys = candKeys[i]
+					candSpec := *aggNode
+					addPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
+						Rel: grouped, Rows: numGroups,
+						Cost: costAgg(cp, AggStrategySorted, inputRows, cs.Cost.Startup, cs.Cost.Total,
+							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inNcols, inAvgVar),
+						Pathkeys: groupPathkeys, Children: []*Path{cs},
+					}, groupAggSearchProducer)
+				}
+			}
 			if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
 				// The index-driven variant: no Sort, narrowed spec. The spec
 				// is the builder's clone (remapped to narrowed positions);

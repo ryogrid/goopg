@@ -466,16 +466,37 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		return nil
 	}
 	var childKeys []SortKey
+	var childPathkeys []PathKey
 	switch c := agg.Child.(type) {
 	case *Sort:
 		childKeys = c.Keys
 	case *GatherMerge:
 		childKeys = c.Keys
 	default:
-		return nil
+		// M0146-0027: a third ordered-input shape — a searched subtree root
+		// whose WINNING searched path claimed the group ordering itself
+		// (`searchedPathkeys`, validated against the published schema at the
+		// boundary). The grouping stage can now elect a searched candidate
+		// with no Sort node on top (addGroupingPaths' searchcand arm), and
+		// the sorted aggregate over it still emits in group-key order.
+		if keys := searchedTreePathkeys(c); len(keys) > 0 {
+			childPathkeys = keys
+		} else {
+			return nil
+		}
+	}
+	childKeyAt := func(j int) (e Expr, desc, nullsFirst bool) {
+		if childPathkeys != nil {
+			return childPathkeys[j].Expr, !childPathkeys[j].SortAsc, childPathkeys[j].NullsFirst
+		}
+		return childKeys[j].Expr, childKeys[j].Desc, childKeys[j].NullsFirst
+	}
+	nChildKeys := len(childKeys)
+	if childPathkeys != nil {
+		nChildKeys = len(childPathkeys)
 	}
 	groups := agg.GroupExprs
-	if len(childKeys) < len(groups) {
+	if nChildKeys < len(groups) {
 		return nil
 	}
 	out := agg.Output()
@@ -494,7 +515,8 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		if _, ok := g.(*ColumnRef); !ok {
 			return nil
 		}
-		if !exprEqual(childKeys[j].Expr, g) {
+		keyExpr, _, _ := childKeyAt(j)
+		if !exprEqual(keyExpr, g) {
 			return nil
 		}
 		// An empty name is a column nobody can address by name, so the claim
@@ -505,10 +527,11 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	}
 	emitted := make([]PathKey, len(clause))
 	for j, k := range clause {
+		_, desc, nullsFirst := childKeyAt(j)
 		emitted[j] = PathKey{
 			Expr:       &ColumnRef{Index: k.Pos, Name: out[k.Pos].Name, Type: out[k.Pos].Type},
-			SortAsc:    !childKeys[j].Desc,
-			NullsFirst: childKeys[j].NullsFirst,
+			SortAsc:    !desc,
+			NullsFirst: nullsFirst,
 		}
 	}
 	return emitted

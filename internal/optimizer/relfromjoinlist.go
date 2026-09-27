@@ -607,6 +607,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// param_source_rels derivation remaps statement-global SJI hands
 	// through it (see paramSourceRelsForProblem's frame rule).
 	s.problemItems = items
+	// M0146-0027: the same item-coordinate windows, published for
+	// `usefulPathkeysForRelation`'s relidsOfExpr attribution.
+	s.itemSpans = itemSpans
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
