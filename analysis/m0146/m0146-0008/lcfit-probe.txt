@@ -1,0 +1,4 @@
+DPTRACE seam-decline reason=leaf-count nrels=2 nleaves=1
+DPTRACE LCFIT scan[0] *optimizer.Join jtype=3 nprefix=2 nSynthetic=0 chain=*optimizer.Join
+DPTRACE seam-decline reason=leaf-count nrels=2 nleaves=1
+DPTRACE LCFIT scan[0] *optimizer.Join jtype=3 nprefix=2 nSynthetic=0 chain=*optimizer.Join

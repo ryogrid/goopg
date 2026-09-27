@@ -22970,7 +22970,7 @@ M0146-0001 re-baseline census on the new default arm.
     qual\-placement on Q37, none new on Q82\); SF1 dropped sort\-strategy,
     retained join\-order \+ worker\-count sizing — both M0146\-0005
     territory\)
-- [ ] **M0146-0008 — leaf-count residual re-census + admission**
+- [x] **M0146-0008 — leaf-count residual re-census + admission**
   (impl; M0144-0003a's successor). First re-census the opaque-leaf
   population on the NEW default arm — the earlier probe showed the
   leaves are already-planned composites (`*Gather`/`*CTEScan`/`*Filter`/
@@ -22981,6 +22981,27 @@ M0146-0001 re-baseline census on the new default arm.
   measurement.
   Kind: impl
   Parent: M0144-0003a
+  - **DONE 2026\-09\-28 — closed by measurement.** Design doc
+    `docs/design/0100\-0149/m0146\-0008\-leaf\-count\-recensus.md`;
+    evidence `analysis/m0146/m0146\-0008/`.
+    - Re\-census at HEAD `81abd893a` \(traced private SF0\.25 clone,
+      `GOOPG_PGSHAPED_DP_TRACE=1`, all 99 queries EXPLAINed with
+      per\-query attribution; temporary LCFIT leaf\-type probe reverted\):
+      `leaf\-count` declines 26 → 2 \(Q51, Q97\), and the
+      opaque\-`*Project`\-over\-composite population the task was filed
+      against is **zero** — jointree pull\-up feeds the seam real
+      FROM\-item leaves.
+    - Both survivors are `*Join` leaves with `Type == JoinTypeFull`
+      \(Q51 `web_v1 FULL JOIN store_v1`, Q97 `ssci FULL JOIN csci`\) —
+      the documented fail\-closed FULL pin declining at leaf\-count by
+      design \(joinsearchseam\.go:1808\-1813 appends a non\-reorderable
+      join type as one opaque leaf\). At nprefix\=2 the fall\-back builds
+      the only possible tree, so the decline is semantically free;
+      searchable FULL joins are a `joinPinned`\-semantics task, not leaf
+      admission, and none is filed \(the pin wall is already documented\).
+    - No production change; no admission work exists that the census can
+      see.
+  Movement: none
 - [ ] **M0146-0009 — statistics/cardinality burn-down** (impl). Work
   the 53-finding ea-ratchet baseline
   (`analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt`)
