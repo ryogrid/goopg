@@ -64,7 +64,10 @@ when the candidate:
       the blocker has lifted but the dependant never tracked it (the template1
       extension task sat `[!]` two days after its blocker got Option A GO).
       Non-id prose blockers ("blocked on the template1 namespace") are not
-      caught — naming the blocker by id keeps the check honest.
+      caught — naming the blocker by id keeps the check honest. An
+      owner-adjudicated `[!]` that stands for a DIFFERENT reason cites
+      `STALE-OK: <id>` to acknowledge and silence the advisory for that
+      reference.
 
 Task grammar:  `<indent>- [ |x|!] **<TASK-ID>...`  (id ends at whitespace or `*`)
 Body lines (until the next checkbox task line or `#` heading), or the task's
@@ -80,6 +83,7 @@ Exit 0 when candidate == baseline. stdlib only.
 """
 
 import argparse
+import bisect
 import re
 import subprocess
 import sys
@@ -418,14 +422,19 @@ def check(baseline, candidate):
 
 BLOCK_RE = re.compile(r"(?i)\bblock")
 UNBLOCK_RE = re.compile(
-    r"(?i)\bunblock|\bblocker\b.{0,40}(lifted|cleared|released|gone|resolved)")
+    r"(?i)\bunblock|\bblocker\b.{0,40}(lifted|cleared|released|gone|resolved|"
+    r"landed|done|closed)|\bno longer blocked\b|\bnot blocking\b")
 IDREF_RE = re.compile(r"(M\d{4}-[\w.-]*|P0-[\w.-]+|testport/[\w.-]+)")
+# An owner-adjudicated `[!]` cites `STALE-OK: <id>` to acknowledge (and
+# silence) the advisory for that reference — used when the `[!]` stands for a
+# different reason than the resolved citation (e.g. an S4 escalation whose
+# work was refiled elsewhere).
+STALEOK_RE = re.compile(r"STALE-OK:")
 
 
 def blocker_advisories(candidate):
     """Rule F — non-blocking warnings: a `[!]` task that names its blocker by
     structured id while that blocker is now `[ ]`/`[x]` (stale block)."""
-    import bisect
     ctasks, corder = parse(candidate)
     norm_tasks = {}
     for tid, t in ctasks.items():
@@ -441,21 +450,31 @@ def blocker_advisories(candidate):
         i = bisect.bisect_right(bounds, t.line)
         end = bounds[i] if i < len(bounds) else len(lines) + 1
         seen = set()
+        stale_ok = set()
         for n in range(t.line, end):
-            ln = lines[n - 1]
+            ln = lines[n - 1].replace("\\", "")
+            if STALEOK_RE.search(ln):
+                stale_ok.update(
+                    r.rstrip(".,:;—") for r in IDREF_RE.findall(ln))
+        for n in range(t.line, end):
+            ln = lines[n - 1].replace("\\", "")
             if not BLOCK_RE.search(ln) or UNBLOCK_RE.search(ln):
                 continue
             for ref in IDREF_RE.findall(ln):
-                tid = ref.rstrip(".,:;—").replace("\\", "")
+                tid = ref.rstrip(".,:;—")
                 bt = norm_tasks.get(tid)
-                if bt is None or bt.status not in " x" or tid in seen:
+                if (bt is None or bt.status not in " x" or tid in seen
+                        or tid in stale_ok):
                     continue
                 seen.add(tid)
+                state = ("landed" if bt.status == "x"
+                         else "been re-opened — the block may still stand")
                 warns.append(
                     f"task {t.id} (line {t.line}) is `[!]` but its blocked-on "
                     f"reference {tid} is now `[{bt.status}]` (line {bt.line}, "
-                    f"cited at line {n}) — the blocker may have lifted; "
-                    f"re-check whether {t.id} should re-open.")
+                    f"cited at line {n}) — the blocker has {state}; "
+                    f"re-check whether {t.id} should re-open "
+                    f"(owner-adjudicated holds may cite `STALE-OK: {tid}`).")
     return warns
 
 

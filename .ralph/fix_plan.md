@@ -8276,6 +8276,9 @@ spill route is net-negative.
   step (Finding 3 table row 3, the `PathIncrementalSort`/`addOrderedPaths`
   third arm, which genuinely needs a real multi-candidate `Pathlist` to
   build a presorted-prefix candidate over).
+  STALE-OK: M0141-S2b (owner-adjudicated 2026-09-27: the remaining work was
+  refiled as M0146-0006; this `[!]` is the S4 lineage-budget escalation,
+  not the S2b citation — do not re-open on that reference alone.)
   **UPDATE 2026-09-17c**: row 3 landed as **M0141-S2b-2c** (see that task's
   own entry above for the full writeup) — `addOrderedPaths`'s third arm now
   exists (`internal/optimizer/incrementalsortpaths.go`), gated off by

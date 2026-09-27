@@ -227,6 +227,38 @@ case("unchanged -> ok", b, b, None)
 case("heading ends a task body (Parent after heading ignored)",
      base, base + "- [ ] **M0142-0030 — t**\n\n## Next\n  Parent: none\n", "B")
 
+# --- Rule E (task-id uniqueness) ----------------------------------------------
+ebase = plan(ROOT, task("M0146-0016", "x", parent="none"))
+case("E: new header reusing an existing structured id -> violation", ebase,
+     ebase + task("M0146-0016", " ", parent="none"), "E")
+case("E: escaped-id variant collides with the unescaped form", ebase,
+     ebase + task("M0146\\-0016", " ", parent="none"), "E")
+egbase = plan(ROOT, task("M0146-0016", "x", parent="none"),
+              task("M0146\\-0016", "x", parent="none"))
+case("E: baseline-stable duplicate is grandfathered", egbase,
+     egbase + task("M0146-0027", " ", parent="none"), None)
+case("E: adding a THIRD occurrence to a grandfathered dup -> violation", egbase,
+     egbase + task("M0146-0016", " ", parent="none"), "E")
+wrbase = plan(ROOT)
+case("E: repeating non-id title word (WRONG RESULTS) is exempt", wrbase,
+     wrbase + "- [ ] **WRONG RESULTS: first defect**\n  body\n"
+     + "- [ ] **WRONG RESULTS: second defect**\n  body\n", None)
+
+# --- Rule F fixtures (advisory, asserted separately below) --------------------
+FPLAN = (HEADER
+         + "- [x] **M0145-0008 — landed blocker**\n  done\n"
+         + "- [!] **M0141-S2b-4e — dependant**\n  body\n"
+         + "  - BLOCKED on M0145\\-0008 (cutover); resume after it lands.\n"
+         + "- [!] **M0141-S7 — adjudicated hold**\n  body\n"
+         + "  still blocked on M0141-S2b (historical).\n"
+         + "  STALE-OK: M0141-S2b\n"
+         + "- [x] **M0141-S2b — landed**\n  done\n"
+         + "- [ ] **M0146-0012 — open blocker**\n  body\n"
+         + "- [!] **M0145-0008y — dependant on open work**\n  body\n"
+         + "  - BLOCKED 2026-09-25 on M0146\\-0012.\n")
+case("F: advisories never become violations", FPLAN,
+     FPLAN + task("M0142-0099", " ", parent="none"), None)
+
 fail = 0
 for name, base_t, cand_t, want in cases:
     errs = lg.check(base_t, cand_t)
@@ -237,5 +269,17 @@ for name, base_t, cand_t, want in cases:
         print(f"FAIL {name}: want={want} got={sorted(rules)}")
         for e in errs:
             print("   ", e)
-print(f"ralph-lineage-guard-test: {len(cases) - fail} passed, {fail} failed")
+# Rule F advisory assertions (blocker_advisories, not check()).
+fw = lg.blocker_advisories(FPLAN)
+f_total = len(cases) + 3
+if not any("M0141-S2b-4e" in w and "M0145-0008" in w for w in fw):
+    fail += 1
+    print("FAIL F: escaped-id blocker citation should warn (M0141-S2b-4e)")
+if any("M0141-S7 " in w for w in fw):
+    fail += 1
+    print("FAIL F: STALE-OK citation should be suppressed (M0141-S7)")
+if not any("M0145-0008y" in w for w in fw):
+    fail += 1
+    print("FAIL F: [ ]-blocker citation should warn (M0145-0008y)")
+print(f"ralph-lineage-guard-test: {f_total - fail} passed, {fail} failed")
 sys.exit(1 if fail else 0)
