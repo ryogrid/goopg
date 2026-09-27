@@ -218,7 +218,7 @@ func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalo
 		if sel, ok := uniqueEqSelectivity(cr, elem, child); ok {
 			return sel
 		}
-		return eqSelectivityForColumn(stats, elem, tuples)
+		return eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 	}
 	if e.NotEqualAny {
 		// OR of `<>`: one minus the equality mass per element.
@@ -367,13 +367,48 @@ func eqOpSelectivity(left, right Expr, child Node) float64 {
 		return defaultEqSelectivity
 	}
 	stats := columnStatsForChild(col.Index, child)
-	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child))
+	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child), col.Type.Name)
+}
+
+// isBpcharTypeName reports whether typeName is in PG's bpchar family —
+// `char`, `bpchar`, `character`. The trio is the same one the hash-key
+// admission check names (join_exec_keys.go).
+func isBpcharTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// statLiteralEqual compares a statistics-stamped value — an MCV entry,
+// rendered from the sampled datum by formatDatumDateStyle — with a query
+// literal rendered by formatExprConstant. For the bpchar family the stamped
+// form is blank-PADDED to the column width ("College             ") while
+// the literal is not ("College"), so a byte-equal probe never matches and
+// the clause falls to defaultEqSelectivity — M0146-0009a measured the
+// 28.4x under-estimate this produces on `cd_education_status = 'College'`
+// (est 9,604 vs MCV-implied ~272,000), cascading through join math to the
+// EA finding on Q7/Q27's four-rel joinrel.
+//
+// The fix applies PG's own comparison semantics rather than padding the
+// literal: bpchareq (postgres/src/backend/utils/adt/varchar.c:743) compares
+// via bpchartruelen (:675), i.e. trailing blanks are insignificant, so both
+// sides are stripped before the byte compare. That also covers the reverse
+// case (a literal carrying trailing blanks, which PG likewise ignores).
+func statLiteralEqual(stamped, literal, typeName string) bool {
+	if isBpcharTypeName(typeName) {
+		return strings.TrimRight(stamped, " ") == strings.TrimRight(literal, " ")
+	}
+	return stamped == literal
 }
 
 // eqSelectivityForColumn prices `col = const`. `tuples` is the relation's RAW
 // tuple count, needed only to resolve the relative ndistinct form; pass 0 when
-// it is unknown and the absolute form will still be used.
-func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64) float64 {
+// it is unknown and the absolute form will still be used. `typeName` is the
+// column's catalog type name — needed for the MCV probe's bpchar handling
+// (statLiteralEqual).
+func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64, typeName string) float64 {
 	literal, ok := formatExprConstant(val)
 	if !ok {
 		return defaultEqSelectivity
@@ -382,7 +417,7 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64
 		return defaultEqSelectivity
 	}
 	for _, mcv := range stats.MCV {
-		if mcv.Value == literal {
+		if statLiteralEqual(mcv.Value, literal, typeName) {
 			return mcv.Frequency
 		}
 	}
@@ -582,6 +617,15 @@ func histogramEqSel(stats *catalog.ColumnStats, tuples float64) float64 {
 // bucketFraction returns the fraction of a single histogram
 // bucket [lo, hi] that lies below `lit`. Always in [0, 1].
 func bucketFraction(lo, hi, lit, typeName string) float64 {
+	// bpchar histogram bounds are blank-padded; the literal is not.
+	// Truelen-strip all three before scalarising so interpolation agrees
+	// with the truelen ordering histCmp just used to place the literal
+	// (bpcharcmp, varchar.c:909; M0146-0009a).
+	if isBpcharTypeName(typeName) {
+		lo = strings.TrimRight(lo, " ")
+		hi = strings.TrimRight(hi, " ")
+		lit = strings.TrimRight(lit, " ")
+	}
 	if isStringScalarType(typeName) {
 		// take2 B-08: `convert_string_to_scalar` (selfuncs.c:4787-4906).
 		// The three scalings share one adaptive range and one
@@ -641,6 +685,16 @@ func rangeOpMatches(op parser.OpCode, cmp int) bool {
 // path (same function); anything else falls back to byte-wise
 // compare.
 func histCmp(a, b, typeName string) int {
+	// bpchar ordering is truelen ordering (bpcharcmp, varchar.c:909):
+	// the stats-stamped bound is blank-padded and the literal is not,
+	// so trailing blanks must be stripped on both sides before any
+	// compare — `'College' < 'College             '` under a byte
+	// compare where PG treats them as equal. Same miss class as
+	// statLiteralEqual (M0146-0009a).
+	if isBpcharTypeName(typeName) {
+		a = strings.TrimRight(a, " ")
+		b = strings.TrimRight(b, " ")
+	}
 	if an, ok := numericValue(a, typeName); ok {
 		if bn, ok := numericValue(b, typeName); ok {
 			switch {
@@ -1181,7 +1235,7 @@ func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate
 	if stats == nil {
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
-	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child)), reliable: true}
+	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child), col.Type.Name), reliable: true}
 }
 
 // rangeOpSelectivityWithSource is the reliability-tracking twin

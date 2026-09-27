@@ -900,6 +900,22 @@ func columnStatsByName(tbl *catalog.Table, name string) *catalog.ColumnStats {
 	return nil
 }
 
+// columnTypeByName resolves a column name to its declared catalog type name
+// ("" when unknown). The stats-stamped value compares — statLiteralEqual /
+// histCmp — need it to pick the bpchar family's truelen semantics; a stats
+// lookup cannot carry it because ColumnStats has no type field.
+func columnTypeByName(tbl *catalog.Table, name string) string {
+	if tbl == nil {
+		return ""
+	}
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name == name {
+			return tbl.Columns[i].Type.Name
+		}
+	}
+	return ""
+}
+
 // boundPrefixClauses narrows `bound` to just the clauses the probe actually
 // binds, named by the index-column list `indexPathClauses` produced. The
 // remainder are movable clauses that could not become index quals; they still

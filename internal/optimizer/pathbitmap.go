@@ -340,7 +340,7 @@ func matchBitmapIndexQuals(
 			if tbl.Stats != nil {
 				rawRows = float64(tbl.Stats.RowCount)
 			}
-			colSel := indexKeyEqSelectivity(stats, val, rawRows)
+			colSel := indexKeyEqSelectivity(stats, val, rawRows, columnTypeByName(tbl, colName))
 			selectivity *= colSel
 
 			// ri is nil: local quals have no restrictInfo. The Key/Keys

@@ -551,7 +551,7 @@ func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
 		return defaultUnhandledClauseSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows))
+	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows), col.Type.Name)
 	if bo.Op == parser.OpNe {
 		// `1 - eq` inherits the equality's flag, as the `OpNe` arm of
 		// `joinClauseSelectivityExtUncached` does for the join form.
@@ -637,7 +637,7 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 		}
 		var s2 float64
 		if isEquality {
-			s2 = eqSelectivityForColumn(stats, elem, tuples)
+			s2 = eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 		} else {
 			var measured bool
 			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples); !measured {
@@ -817,7 +817,7 @@ func eqJoinSelectivitySemi(v1, v2 joinVarStats, innerRows float64) (float64, boo
 	if v1.stats != nil {
 		nullfrac1 = v1.stats.NullFrac
 	}
-	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1)
+	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1, v1.typeName, v2.typeName)
 	// The nd arms are a guess when EITHER nd was (upstream's
 	// `!isdefault1 && !isdefault2` gate picks the 0.5 branch otherwise); the
 	// MCV arm is a measurement whatever the nds were, because the matched

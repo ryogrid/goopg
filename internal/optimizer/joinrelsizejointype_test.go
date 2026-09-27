@@ -273,7 +273,7 @@ func TestEqjoinselSemiCoreMCVArm(t *testing.T) {
 		MCV: []catalog.MCVEntry{{Value: "a", Frequency: freqA}, {Value: "b", Frequency: 0.2}}}
 	st2 := &catalog.ColumnStats{NDistinct: nd2,
 		MCV: []catalog.MCVEntry{{Value: "a", Frequency: 0.5}, {Value: "c", Frequency: 0.5}}}
-	got := eqjoinselSemiCore(st1, st2, nd1, nd2, true, true, nullfrac1)
+	got := eqjoinselSemiCore(st1, st2, nd1, nd2, true, true, nullfrac1, "text", "text")
 	// nmatches = 1; nd1-1 <= nd2-1 → uncertainfrac = 1.0;
 	// uncertain = 1 - matchfreq1 - nullfrac1.
 	want := freqA + 1.0*(1-freqA-nullfrac1)

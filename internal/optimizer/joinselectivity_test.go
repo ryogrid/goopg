@@ -589,7 +589,7 @@ func TestOrJoinSelectivityMeasuredArms(t *testing.T) {
 		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: jsNameEq(2, 4)}}
 	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
 
-	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25, "bpchar")
 	arm := e * e
 	want := arm + arm - arm*arm
 	sel, isDefault := s.joinClauseSelectivityExt(ri)
@@ -617,7 +617,7 @@ func TestOrJoinSelectivityGuessedConjunctMarksTheOr(t *testing.T) {
 		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: lost}}
 	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
 
-	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25, "bpchar")
 	measuredArm := e * e
 	guessedArm := e * defaultUnhandledClauseSel
 	want := measuredArm + guessedArm - measuredArm*guessedArm
@@ -734,7 +734,7 @@ func TestOrInListSelectivityMeasured(t *testing.T) {
 	stats := columnStatsByName(n1, "n_name")
 	var want float64
 	for _, elem := range in.List {
-		e := eqSelectivityForColumn(stats, elem, 25)
+		e := eqSelectivityForColumn(stats, elem, 25, "bpchar")
 		want += e
 	}
 	sel, isDefault := s.orConjunctSelectivity(in)

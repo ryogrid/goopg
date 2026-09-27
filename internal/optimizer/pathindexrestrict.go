@@ -303,7 +303,7 @@ func restrictionIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, clauses
 	sel := 1.0
 	for _, c := range clauses {
 		stats := columnStatsByName(tbl, idx.Columns[c.indexCol])
-		sel *= indexKeyEqSelectivity(stats, c.key, rawRows)
+		sel *= indexKeyEqSelectivity(stats, c.key, rawRows, columnTypeByName(tbl, idx.Columns[c.indexCol]))
 	}
 	unique := idx.Unique && len(clauses) == len(idx.Columns)
 	if unique && relTuples > 0 {
@@ -615,9 +615,9 @@ func outerParamKeyType(e Expr) (catalog.Type, bool) {
 // clause. A literal reads the column's MCVs/histogram (eqSelectivityForColumn);
 // a key unknown at plan time takes PG's `var_eq_non_const` average, which is
 // what `eqsel` computes when the other operand is a Param.
-func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64) float64 {
+func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64, typeName string) float64 {
 	if _, isOuter := outerParamKeyType(key); isOuter {
 		return varEqNonConstSelectivity(stats, rawRows)
 	}
-	return eqSelectivityForColumn(stats, key, rawRows)
+	return eqSelectivityForColumn(stats, key, rawRows, typeName)
 }

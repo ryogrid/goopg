@@ -228,6 +228,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// false and the position stays unknown. Same demoted shape as the
 	// CTE entries above.
 	"cte_stats_synthesis.go:branchLiteralAt": nonRecursiveClassifier,
+	// M0146-0009b: top-node-only accessor — reads a join key's declared type
+	// name for the MCV-MCV bpchar check; unenumerated types answer "", which
+	// keeps the pairing on byte-equal (fail-closed, no recursion).
+	"cardinality.go:joinKeyTypeName": nonRecursiveClassifier,
 	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
 	// the transformation's NULL-semantics invariant, not an omission.
 	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,

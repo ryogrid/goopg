@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -407,7 +408,8 @@ func nliSemiMatchFraction(j *NestedLoopIndexJoin) float64 {
 			nd2 = float64(innerRows)
 			nd2Known = true
 		}
-		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+			cr.Type.Name, tbl.Columns[colPos].Type.Name)
 	}
 	return sel
 }
@@ -547,7 +549,12 @@ func lateralNLIMatchFraction(j *Join) float64 {
 			nd2 = float64(innerRows)
 			nd2Known = true
 		}
-		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+		outerType := ""
+		if outerOK {
+			outerType = columnTypeByName(outerRef.table, outerRef.col)
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+			outerType, tbl.Columns[colPos].Type.Name)
 	}
 	return sel
 }
@@ -1174,7 +1181,8 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 		nd2 = float64(innerRows)
 		nd2Known = true
 	}
-	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+		joinKeyTypeName(p.Left, j.Left), joinKeyTypeName(p.Right, j.Left))
 }
 
 // eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
@@ -1189,8 +1197,38 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 // `nd1Known`/`nd2Known` are the complements of upstream's `isdefault1/2`: a
 // clamped nd2 counts as known, because an inner relation smaller than
 // DEFAULT_NUM_DISTINCT bounds its own distinct count exactly.
-func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64) float64 {
+// joinKeyTypeName resolves a join-key expression's declared type name for
+// the MCV-MCV pairing's bpchar check ("" when the key is not a plain column
+// reference or the type is unknown). `bpchar = bpchar` resolves to bpchareq
+// (varchar.c:743), so a char(N) list joined to a char(M) list pairs on
+// truelen values — byte-equal pairing of the padded stamped forms would
+// miss whenever the widths differ (M0146-0009b).
+func joinKeyTypeName(e Expr, side Node) string {
+	switch k := e.(type) {
+	case *ColumnRef:
+		return k.Type.Name
+	case *OuterColumnRef:
+		if ref, ok := resolveBaseColumn(k.Index, side); ok {
+			return columnTypeByName(ref.table, ref.col)
+		}
+	}
+	return ""
+}
+
+// eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
+// (selfuncs.c): the caller supplies the already-clamped distinct counts and
+// flags. `type1`/`type2` are the join columns' catalog type names — MCV
+// pairing needs them because a `bpchar = bpchar` join compares on truelen
+// values (bpchareq, varchar.c:743) while every other type pairs byte-equal.
+func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64, type1, type2 string) float64 {
 	if st1 != nil && st2 != nil && len(st1.MCV) > 0 && len(st2.MCV) > 0 {
+		bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
+		mcvKey := func(v string) string {
+			if bp {
+				return strings.TrimRight(v, " ")
+			}
+			return v
+		}
 		// "The clamping above could have resulted in nd2 being less than
 		// sslot2->nvalues; in which case, we assume that precisely the nd2 most
 		// common values in the relation will appear in the join input"
@@ -1208,12 +1246,12 @@ func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known
 		// unused index for a value is exactly what the inner scan did.
 		firstByValue := make(map[string]int, clamped2)
 		for k := clamped2 - 1; k >= 0; k-- {
-			firstByValue[st2.MCV[k].Value] = k // lowest index wins
+			firstByValue[mcvKey(st2.MCV[k].Value)] = k // lowest index wins
 		}
 		matched2 := make([]bool, clamped2)
 		matchFreq1, nmatches := 0.0, 0
 		for i := range st1.MCV {
-			k, ok := firstByValue[st1.MCV[i].Value]
+			k, ok := firstByValue[mcvKey(st1.MCV[i].Value)]
 			if !ok {
 				continue
 			}
@@ -1221,10 +1259,10 @@ func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known
 			// the forward scan only runs if one ever holds duplicates, and it
 			// then picks the same "lowest still-unused index" the old nested
 			// loop did.
-			for k < clamped2 && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+			for k < clamped2 && matched2[k] && mcvKey(st2.MCV[k].Value) == mcvKey(st1.MCV[i].Value) {
 				k++
 			}
-			if k >= clamped2 || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+			if k >= clamped2 || matched2[k] || mcvKey(st2.MCV[k].Value) != mcvKey(st1.MCV[i].Value) {
 				continue
 			}
 			matched2[k] = true
@@ -2154,22 +2192,33 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 	// Pair the two lists, each entry consumed at most once. Indexed rather
 	// than nested-loop for the reason recorded on the semi arm (review/260831
 	// OP1-2): a nested loop is statistics_target^2 comparisons per estimate.
+	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
+	// char(N) list joined to a char(M) list still matches (M0146-0009b).
+	type1 := joinKeyTypeName(p.Left, j.Left)
+	type2 := joinKeyTypeName(p.Right, j.Left)
+	bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
+	mcvKey := func(v string) string {
+		if bp {
+			return strings.TrimRight(v, " ")
+		}
+		return v
+	}
 	firstByValue := make(map[string]int, len(st2.MCV))
 	for k := len(st2.MCV) - 1; k >= 0; k-- {
-		firstByValue[st2.MCV[k].Value] = k
+		firstByValue[mcvKey(st2.MCV[k].Value)] = k
 	}
 	matched1 := make([]bool, len(st1.MCV))
 	matched2 := make([]bool, len(st2.MCV))
 	matchprodfreq, nmatches := 0.0, 0
 	for i := range st1.MCV {
-		k, ok := firstByValue[st1.MCV[i].Value]
+		k, ok := firstByValue[mcvKey(st1.MCV[i].Value)]
 		if !ok {
 			continue
 		}
-		for k < len(st2.MCV) && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+		for k < len(st2.MCV) && matched2[k] && mcvKey(st2.MCV[k].Value) == mcvKey(st1.MCV[i].Value) {
 			k++
 		}
-		if k >= len(st2.MCV) || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+		if k >= len(st2.MCV) || matched2[k] || mcvKey(st2.MCV[k].Value) != mcvKey(st1.MCV[i].Value) {
 			continue
 		}
 		matched1[i], matched2[k] = true, true
