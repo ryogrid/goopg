@@ -1363,14 +1363,19 @@ func lateralProbeJoinIsPartialCapable(p *Join) bool {
 // nestedLoopIndexJoinOp.inner).
 //
 // Admitted narrowly, same scope as the lateral-probe twin
-// (lateralProbeJoinIsPartialCapable): INNER only (LEFT/SEMI/ANTI/RIGHT/
-// FULL/CROSS refused as scope-minimization), non-nil children, and the
-// inner is exactly the bare parameterized equality probe
-// lateralProbeIsPartialProbe admits — an *IndexScan/*IndexOnlyScan with
-// Key/Keys, no SAOP, no range bounds. A bitmap inner
-// (createNestLoopBitmapJoinPlan's shape) is refused by that check's
-// default arm — a re-probed bitmap has no claim-set story (the *joinOp
-// arm's HasBitmapScan refusal, same reason). InnerMemo's presence is
+// (lateralProbeJoinIsPartialCapable): non-nil children, and the inner is
+// exactly a bare parameterized probe — an *IndexScan/*IndexOnlyScan with
+// Key/Keys, no SAOP, no range bounds (lateralProbeIsPartialProbe), or —
+// M0146-0005 slice 27 — a *BitmapHeapScan whose Outer is a single
+// *BitmapIndexScan carrying probe keys (`nliBitmapProbeIsPartialProbe`,
+// createNestLoopBitmapJoinPlan's shape — TPC-DS Q55's `Parallel Seq Scan
+// item -> Bitmap Heap Scan store_sales` per-worker re-probe). The bitmap
+// inner runs SERIAL in every worker: it takes no claim (the claim walks
+// descend Outer literally and never touch Inner), shares no TIDBitmap
+// (each worker's private op rebuilds one per Rescan), and is invisible to
+// prebuildBitmap because collectBitmapScans descends this node's Outer
+// only — so it can never be mistaken for a driving bitmap. What remains
+// refused is every shape that is not a re-bindable probe. InnerMemo's presence is
 // irrelevant to the verdict: every worker builds its own memoizeOp and
 // kvcache over the shared read-only plan (executor.go: "each worker
 // builds its OWN operator tree"), matching real PG's Memoize whose DSM
@@ -1403,7 +1408,30 @@ func NestedLoopIndexJoinIsPartialCapable(p *NestedLoopIndexJoin) bool {
 	if !partialNestLoopJoinType(p.Type) {
 		return false
 	}
-	return lateralProbeIsPartialProbe(p.Inner)
+	return lateralProbeIsPartialProbe(p.Inner) || nliBitmapProbeIsPartialProbe(p.Inner)
+}
+
+// nliBitmapProbeIsPartialProbe reports whether n is the bitmap-probe inner
+// createNestLoopBitmapJoinPlan emits under a fused NestedLoopIndexJoin
+// (createplannl.go): a *BitmapHeapScan whose Outer is exactly one
+// *BitmapIndexScan carrying the bound probe keys. It is the bitmap sibling
+// of lateralProbeIsPartialProbe, kept a separate predicate because that one
+// is shared with the DECOMPOSED lateral-Join gate whose executor twin
+// (lateralProbeJoinPartial, parallel_scan.go) admits only
+// *indexScanOp/*indexOnlyScanOp — a shape check that must not widen there.
+// Here the executor is the same fused op that already runs this inner
+// serially (operators_nljoin.go's nliInner), so admission is literal
+// agreement with the attach walks, which all read this predicate.
+func nliBitmapProbeIsPartialProbe(n Node) bool {
+	bhs, ok := n.(*BitmapHeapScan)
+	if !ok || bhs == nil {
+		return false
+	}
+	bis, ok := bhs.Outer.(*BitmapIndexScan)
+	if !ok || bis == nil || bis.Index == nil {
+		return false
+	}
+	return bis.Key != nil || len(bis.Keys) > 0
 }
 
 // partialNestLoopJoinType is the ONE jointype set the partial nested-loop

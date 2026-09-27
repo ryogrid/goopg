@@ -800,7 +800,33 @@ func partialPathDrivingKind(p *Path) PathKind {
 			}
 			probe = in.Children[0]
 		}
-		if probe == nil || probe.Kind != PathIndexScan || len(probe.IndexClauses) == 0 {
+		// M0146-0005 slice 27: the parameterized bitmap probe joins the
+		// admitted set — `try_partial_nestloop_path` admits it too
+		// (joinpath.c's inner only needs to be parallel_safe; each worker
+		// re-probes it serially). A bitmap inner takes NO claim and shares
+		// NO bitmap: every worker builds a private bitmapHeapScanOp whose
+		// Rescan rebuilds a private TIDBitmap per outer row
+		// (operators_bitmap.go), and the claim-side walks never reach it —
+		// collectBitmapScans descends the fused NLI's OUTER only, so the
+		// inner bitmap is never mistaken for the driving bitmap
+		// prebuildBitmap would publish. The probe-shape check matches the
+		// producer's invariant (buildOneParameterizedBitmapPaths: a heap
+		// path over exactly one PathBitmapIndexScan child; the clause list
+		// lives on the heap path itself, pathbitmap.go:644-651). The
+		// Memoize-wrapped bitmap stays refused: createPlan's unwrap hands
+		// the child straight to createNestLoopBitmapJoinPlan, which would
+		// drop the cache the path was priced with.
+		if probe == nil || len(probe.IndexClauses) == 0 {
+			return PathPrebuilt
+		}
+		switch probe.Kind {
+		case PathIndexScan:
+		case PathBitmapHeapScan:
+			if probe != in || len(probe.Children) != 1 ||
+				probe.Children[0] == nil || probe.Children[0].Kind != PathBitmapIndexScan {
+				return PathPrebuilt
+			}
+		default:
 			return PathPrebuilt
 		}
 		if p.OuterRelids == 0 || p.InnerRelids == 0 {

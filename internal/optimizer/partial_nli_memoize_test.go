@@ -43,6 +43,20 @@ func nliTestJoin(typ JoinType, inner Node, memo bool) *NestedLoopIndexJoin {
 	return nli
 }
 
+// nliBitmapProbeNode builds the bitmap-probe inner
+// createNestLoopBitmapJoinPlan emits (createplannl.go): a *BitmapHeapScan
+// over exactly one *BitmapIndexScan carrying the bound probe keys — the
+// shape M0146-0005 slice 27 admits (TPC-DS Q55's `Parallel Seq Scan item ->
+// Bitmap Heap Scan store_sales` per-worker re-probe).
+func nliBitmapProbeNode(mutate func(*BitmapIndexScan)) Node {
+	bis := &BitmapIndexScan{Index: &catalog.Index{},
+		Key: &OuterColumnRef{Level: 1, Index: 1}}
+	if mutate != nil {
+		mutate(bis)
+	}
+	return &BitmapHeapScan{Outer: bis}
+}
+
 func TestNestedLoopIndexJoinIsPartialCapable(t *testing.T) {
 	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeInner, latProbeNode(nil), false)) {
 		t.Fatal("bare-probe INNER NLI must be partial-capable")
@@ -67,10 +81,24 @@ func TestNestedLoopIndexJoinIsPartialCapable(t *testing.T) {
 	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, latProbeNode(nil), true)) {
 		t.Fatal("memoized SEMI NLI must be partial-capable (M0137-0019b)")
 	}
+	// M0146-0005 slice 27: the bitmap probe inner joins the admitted set —
+	// the fused-NLI sibling of the index probe, serially re-probed per
+	// worker-local outer row, taking no claim and sharing no TIDBitmap.
+	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeInner, nliBitmapProbeNode(nil), false)) {
+		t.Fatal("bitmap-probe INNER NLI must be partial-capable (M0146-0005 slice 27)")
+	}
+	if !NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, nliBitmapProbeNode(nil), false)) {
+		t.Fatal("bitmap-probe SEMI NLI must be partial-capable (M0146-0005 slice 27)")
+	}
 	// The probe-shape refusals must still bite on SEMI — the jointype
-	// widening must not become a bypass of lateralProbeIsPartialProbe.
+	// widening must not become a bypass of the probe-shape check. A bare
+	// *BitmapHeapScan (no index child, no bound keys) is not a probe.
 	if NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi, &BitmapHeapScan{}, false)) {
-		t.Fatal("SEMI NLI with a bitmap inner must still be refused")
+		t.Fatal("SEMI NLI with a shapeless bitmap inner must still be refused")
+	}
+	if NestedLoopIndexJoinIsPartialCapable(nliTestJoin(JoinTypeSemi,
+		nliBitmapProbeNode(func(b *BitmapIndexScan) { b.Key = nil }), false)) {
+		t.Fatal("SEMI NLI with a keyless bitmap probe must still be refused")
 	}
 	refusals := map[string]*NestedLoopIndexJoin{
 		"nil":   nil,
@@ -82,12 +110,17 @@ func TestNestedLoopIndexJoinIsPartialCapable(t *testing.T) {
 		// first by TestParallelNLIJointypeIdentity in internal/executor).
 		// CROSS stays: it has no per-outer-row verdict to be worker-local
 		// about.
-		"cross-jt":     nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
-		"right-jt":     nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
-		"right":        nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
-		"full":         nliTestJoin(JoinTypeFull, latProbeNode(nil), false),
-		"seq-inner":    nliTestJoin(JoinTypeInner, &SeqScan{}, false),
-		"bitmap-inner": nliTestJoin(JoinTypeInner, &BitmapHeapScan{}, false),
+		"cross-jt":  nliTestJoin(JoinTypeCross, latProbeNode(nil), false),
+		"right-jt":  nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
+		"right":     nliTestJoin(JoinTypeRight, latProbeNode(nil), false),
+		"full":      nliTestJoin(JoinTypeFull, latProbeNode(nil), false),
+		"seq-inner": nliTestJoin(JoinTypeInner, &SeqScan{}, false),
+		// A bare heap scan is not a probe: no index child, no bound keys.
+		// The shaped probe (nliBitmapProbeNode) is admitted above; these
+		// are the malformed forms.
+		"bitmap-inner":         nliTestJoin(JoinTypeInner, &BitmapHeapScan{}, false),
+		"bitmap-and-or-outer":  nliTestJoin(JoinTypeInner, &BitmapHeapScan{Outer: &BitmapAnd{}}, false),
+		"bitmap-keyless-probe": nliTestJoin(JoinTypeInner, nliBitmapProbeNode(func(b *BitmapIndexScan) { b.Key = nil }), false),
 		"saop-inner": nliTestJoin(JoinTypeInner, latProbeNode(func(n *IndexScan) {
 			n.SAOPKeys = []Expr{&OuterColumnRef{Level: 1}}
 		}), false),
@@ -146,6 +179,30 @@ func TestPartialNLIWalkAgreement(t *testing.T) {
 	semi := nliTestJoin(JoinTypeSemi, latProbeNode(nil), false)
 	if drivingScan(semi) == nil {
 		t.Error("semi: drivingScan must reach the outer scan (M0137-0019b)")
+	}
+
+	// M0146-0005 slice 27: all walks must admit the bitmap-probe inner the
+	// same way — drivingScan and stampParallelScan reach only the OUTER,
+	// and the inner bitmap is never stamped (it re-probes serially per
+	// worker).
+	{
+		outer := &SeqScan{schema: Schema{{Name: "a"}}}
+		n := nliTestJoin(JoinTypeInner, nliBitmapProbeNode(nil), false)
+		n.Outer = outer
+		if got := drivingScan(n); got != Node(outer) {
+			t.Fatalf("bitmap probe: drivingScan must reach the OUTER scan, got %T", got)
+		}
+		stamped := stampParallelScan(n)
+		sj, ok := stamped.(*NestedLoopIndexJoin)
+		if !ok {
+			t.Fatalf("bitmap probe: stamp must copy the NLI, got %T", stamped)
+		}
+		if ss, ok := sj.Outer.(*SeqScan); !ok || !ss.Parallel {
+			t.Fatal("bitmap probe: stamp must label the outer scan Parallel")
+		}
+		if ib, ok := sj.Inner.(*BitmapHeapScan); !ok || ib.Parallel {
+			t.Fatal("bitmap probe: the inner re-probe must NOT be stamped Parallel")
+		}
 	}
 
 	// Refusals pin all walks at once. ANTI left this set for M0145-0010;
@@ -227,6 +284,86 @@ func TestPartialPathDrivingKindMemoizedNLI(t *testing.T) {
 	for name, build := range cases {
 		jr, o, i, _, _ := latClassifyFixture()
 		pr := latParamInner(i, o.Relids)
+		if got := partialPathDrivingKind(build(jr, o, i, pr)); got != PathPrebuilt {
+			t.Errorf("%s: must refuse, got %v", name, got)
+		}
+	}
+}
+
+// nliBitmapProbePath builds the filed parameterized bitmap probe path
+// (buildOneParameterizedBitmapPaths's shape): a PathBitmapHeapScan carrying
+// the clause list and the outer requirement, over exactly one
+// PathBitmapIndexScan child.
+func nliBitmapProbePath(rel *RelOptInfo, req RelSet) *Path {
+	return &Path{
+		Kind: PathBitmapHeapScan, Rel: rel, Rows: 40, Cost: Cost{Total: 4},
+		IndexClauses:  []indexPathClause{{indexCol: 0, key: &ColumnRef{Index: 0}}},
+		RequiredOuter: req,
+		Children: []*Path{{
+			Kind: PathBitmapIndexScan, Rel: rel, Rows: 40, Cost: Cost{Total: 1},
+			IndexClauses:  []indexPathClause{{indexCol: 0, key: &ColumnRef{Index: 0}}},
+			RequiredOuter: req,
+		}},
+	}
+}
+
+// TestPartialPathDrivingKindBitmapProbe pins the M0146-0005 slice-27 probe
+// arm: a parameterized bitmap heap probe classifies to its outer's driving
+// kind exactly like the index probe, and every malformed form still refuses.
+// The named consumer is TPC-DS Q55's `Gather -> Nested Loop -> Parallel Seq
+// Scan item / Bitmap Heap Scan store_sales` shape — the partial candidate
+// existed and was cheaper than the elected serial chain, but the
+// IndexScan-only probe check returned PathPrebuilt and no Gather was filed.
+func TestPartialPathDrivingKindBitmapProbe(t *testing.T) {
+	joinrel, outer, inner, a, _ := latClassifyFixture()
+	probe := nliBitmapProbePath(inner, a)
+	if got := partialPathDrivingKind(latClassifyPath(joinrel, outer, inner, parser.JoinInner, probe)); got != PathSeqScan {
+		t.Fatalf("satisfiable bitmap probe must drive on the outer scan, got %v", got)
+	}
+
+	// SEMI/ANTI ride the same probe jointype set as the index sibling.
+	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
+		jr, o, i, _, _ := latClassifyFixture()
+		pr := nliBitmapProbePath(i, o.Relids)
+		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, jt, pr)); got != PathSeqScan {
+			t.Errorf("%v bitmap probe must classify to its outer's driving kind, got %v", jt, got)
+		}
+	}
+
+	cases := map[string]func(joinrel, outer, inner *RelOptInfo, probe *Path) *Path{
+		// A Memoize-wrapped bitmap probe is refused: createPlan's unwrap
+		// hands the child to createNestLoopBitmapJoinPlan, which drops the
+		// cache the path was priced with.
+		"memoized-bitmap": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinInner, nliMemoizeInner(pr))
+		},
+		"clauseless-bitmap": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			bad := *pr
+			bad.IndexClauses = nil
+			return latClassifyPath(jr, o, i, parser.JoinInner, &bad)
+		},
+		"bitmap-wrong-child": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			bad := *pr
+			bad.Children = []*Path{{Kind: PathSeqScan}}
+			return latClassifyPath(jr, o, i, parser.JoinInner, &bad)
+		},
+		"bitmap-two-children": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			bad := *pr
+			bad.Children = []*Path{pr.Children[0], {Kind: PathBitmapIndexScan}}
+			return latClassifyPath(jr, o, i, parser.JoinInner, &bad)
+		},
+		"bitmap-unsatisfiable": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			bad := *pr
+			bad.RequiredOuter = relsetOf(2)
+			return latClassifyPath(jr, o, i, parser.JoinInner, &bad)
+		},
+		"left-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinLeft, pr)
+		},
+	}
+	for name, build := range cases {
+		jr, o, i, _, _ := latClassifyFixture()
+		pr := nliBitmapProbePath(i, o.Relids)
 		if got := partialPathDrivingKind(build(jr, o, i, pr)); got != PathPrebuilt {
 			t.Errorf("%s: must refuse, got %v", name, got)
 		}

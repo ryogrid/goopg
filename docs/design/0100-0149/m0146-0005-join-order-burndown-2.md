@@ -250,3 +250,52 @@ upstream-identical semantics; the record converges when the inputs do.
 
 Evidence: `analysis/m0146/m0146-0005/slice26/`; fix-plan entry
 M0146-0005z.
+
+## Slice 27: parameterized bitmap-probe partial NLI is gatherable
+
+Q55: PG elects `Gather -> NL(-> NL(Parallel Seq Scan item, Bitmap Heap
+Scan store_sales probe), Memoize -> Index Scan date_dim)`; goopg ran a
+serial `Nested Loop` over `Gather(Parallel Hash Join ss ⋈ dd)` instead.
+The DP trace showed the PG-shaped partial NL already sat at the head of
+the `{0,1,2}` partial pathlist at 16255.65 — cheaper than every serial
+candidate — yet `cpgather` admitted the survivor and `makeGatherPath`
+still filed no `Gather`: `partialPathDrivingKind`'s PathNestLoop probe
+arm admitted only `PathIndexScan` (or `PathMemoize`-wrapped index)
+inners, so the parameterized `PathBitmapHeapScan` inner classified the
+subtree `PathPrebuilt`.
+
+Two surfaces move together, fail-closed:
+
+- `partialPathDrivingKind` (`gatherpaths.go`): the probe arm now admits
+  `PathBitmapHeapScan` iff it has exactly one child and that child is a
+  `PathBitmapIndexScan` (the `IndexClauses` requirement still applies);
+  a `PathMemoize`-wrapped *bitmap* probe stays refused because
+  `createPlan` unwraps memoize into `createNestLoopBitmapJoinPlan` and
+  would lose the priced cache.
+- `NestedLoopIndexJoinIsPartialCapable` (`parallel.go`): gains
+  `nliBitmapProbeIsPartialProbe` — `*BitmapHeapScan` whose `Outer` is
+  exactly one `*BitmapIndexScan` carrying probe keys. Separate from
+  `lateralProbeIsPartialProbe` on purpose: the decomposed-lateral
+  executor only supports index/index-only probes, while the fused NLI
+  executor already drives a `BitmapHeapScan` inner through `nliInner`
+  (`BindOuter` + `Rescan` rebuild a private TID bitmap per outer row,
+  `pbm == nil`).
+
+No executor code changed — every claim walk (`attachAll`,
+`collectBitmapScans`, `drivingScan`) reads the same exported predicate,
+so widening it keeps planner and executor in lockstep: claims attach to
+the NLI outer only, the inner bitmap is never collected into
+`prebuildBitmap`'s shared claim set, and each worker rescans its own
+serial bitmap per outer row (no N-copy over-counting — pinned by a
+1/2/4-worker identity test and a `collectBitmapScans` inner-isolation
+case).
+
+Result: Q55 elects `Gather Merge -> Partial GroupAggregate -> Sort ->
+NL(NL(Parallel Seq Scan item, Bitmap Heap Scan ss), Memoize(dd))` —
+shape-identical to PG modulo the deliberate partial-agg split
+(M0146-0027 slice 3); rows=68, checksum `fe343d36717a4fb5` = oracle.
+Sweep collateral: Q3/Q37/Q75/Q76 take the same gather over bitmap-probe
+NLs; all checksums clean.
+
+Evidence: `analysis/m0146/m0146-0005/slice27/`; fix-plan entry
+M0146-0005aa.

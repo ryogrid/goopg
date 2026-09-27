@@ -36,6 +36,16 @@ func nliProbePlan() *optimizer.IndexScan {
 		Key: &optimizer.OuterColumnRef{Level: 1, Index: 1}}
 }
 
+// nliBitmapProbePlan builds the bitmap-probe inner createNestLoopBitmapJoinPlan
+// emits (M0146-0005 slice 27): a *BitmapHeapScan over exactly one
+// *BitmapIndexScan carrying bound probe keys.
+func nliBitmapProbePlan() *optimizer.BitmapHeapScan {
+	return &optimizer.BitmapHeapScan{
+		Outer: &optimizer.BitmapIndexScan{Index: &catalog.Index{},
+			Key: &optimizer.OuterColumnRef{Level: 1, Index: 1}},
+	}
+}
+
 // nliPlan builds a fused NLI plan: INNER over a SeqScan outer and a bare
 // keyed probe inner. memo=true adds the InnerMemo wrapper — the field
 // aliases the same *IndexScan, exactly as createNestLoopPlan's fused arm
@@ -98,11 +108,29 @@ func TestParallelNLIWalkerAdmission(t *testing.T) {
 			}
 		})
 	}
+
+	// M0146-0005 slice 27: the bitmap-probe inner attaches identically —
+	// the claim lands on the OUTER; the inner is a per-worker serial
+	// re-probe that takes no claim state of any kind.
+	for _, jt := range []optimizer.JoinType{optimizer.JoinTypeInner, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti} {
+		op := &nestedLoopIndexJoinOp{
+			plan:  nliPlan(jt, nliBitmapProbePlan(), false),
+			outer: &seqScanOp{},
+			inner: &bitmapHeapScanOp{},
+		}
+		if !attachParallelScan(op, newParallelScanState(0)) {
+			t.Errorf("%v bitmap-inner NLI: sequential walk must attach", jt)
+		}
+		if op.outer.(*seqScanOp).pscan == nil {
+			t.Errorf("%v bitmap-inner NLI: outer scan must take the claim", jt)
+		}
+	}
 }
 
 // TestParallelNLIWalkerRefusals pins the refusal matrix on all three
-// walks: every non-INNER jointype, a bitmap inner, an unkeyed inner, an
-// SAOP probe, a range-bounded probe, nil plan, nil state.
+// walks: every non-INNER jointype outside the probe set, a bitmap inner
+// missing its probe shape, an unkeyed inner, an SAOP probe, a
+// range-bounded probe, nil plan, nil state.
 func TestParallelNLIWalkerRefusals(t *testing.T) {
 	bitmapInner := &optimizer.BitmapHeapScan{}
 	saopInner := &optimizer.IndexScan{Index: &catalog.Index{},
@@ -120,8 +148,16 @@ func TestParallelNLIWalkerRefusals(t *testing.T) {
 		// LEFT joined it for M0145-0010 after their capability was verified
 		// by TestParallelNLIJointypeIdentity. What remains refused is the
 		// set with no worker-local per-outer-row verdict.
-		"cross":   nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
-		"bitmap":  nliPlan(optimizer.JoinTypeInner, bitmapInner, false),
+		"cross": nliPlan(optimizer.JoinTypeCross, nliProbePlan(), false),
+		// A bare *BitmapHeapScan (no index child, no keys) is not a probe;
+		// the shaped probe from nliBitmapProbePlan is admitted and pinned
+		// in TestParallelNLIWalkerAdmission. The malformed forms — And/Or
+		// outer tree, keyless index child — stay refused.
+		"bitmap":           nliPlan(optimizer.JoinTypeInner, bitmapInner, false),
+		"bitmap-and-outer": nliPlan(optimizer.JoinTypeInner, &optimizer.BitmapHeapScan{Outer: &optimizer.BitmapAnd{}}, false),
+		"bitmap-keyless": nliPlan(optimizer.JoinTypeInner, &optimizer.BitmapHeapScan{
+			Outer: &optimizer.BitmapIndexScan{Index: &catalog.Index{}},
+		}, false),
 		"saop":    nliPlan(optimizer.JoinTypeInner, saopInner, false),
 		"unkeyed": nliPlan(optimizer.JoinTypeInner, unkeyedInner, false),
 		"ranged":  nliPlan(optimizer.JoinTypeInner, rangedInner, false),
@@ -227,6 +263,27 @@ func TestCollectBitmapScansDescendsNLI(t *testing.T) {
 	collectBitmapScans(refused, &got)
 	if len(got) != 0 {
 		t.Fatalf("refused NLI: collected %d bitmaps, want none", len(got))
+	}
+
+	// M0146-0005 slice 27 — the pin that makes the bitmap inner safe: the
+	// collection walk descends the OUTER only, so an approved bitmap-probe
+	// inner is never collected and can never be mistaken for the driving
+	// bitmap prebuildBitmap would publish. With a bitmap inner AND a
+	// bitmap outer, exactly the outer is collected.
+	innerBM := &bitmapHeapScanOp{}
+	outerBM := &bitmapHeapScanOp{}
+	bitmapProbe := &nestedLoopIndexJoinOp{
+		plan:  nliPlan(optimizer.JoinTypeInner, nliBitmapProbePlan(), false),
+		outer: outerBM,
+		inner: innerBM,
+	}
+	got = got[:0]
+	collectBitmapScans(bitmapProbe, &got)
+	if len(got) != 1 || got[0] != outerBM {
+		t.Fatalf("bitmap-inner NLI: collected %v, want exactly the OUTER driving bitmap", got)
+	}
+	if innerBM.pbm != nil {
+		t.Fatal("the inner re-probe must never take bitmap claim state")
 	}
 }
 
@@ -346,4 +403,148 @@ func multisetDiff(got, want []string) string {
 		}
 	}
 	return ""
+}
+
+// M0146-0005 slice 27 — the serial-vs-parallel identity pin for the
+// bitmap-probe fused NLI under a Gather, TPC-DS Q55's shape (`Parallel Seq
+// Scan -> Nested Loop -> Bitmap Heap Scan` per worker). The walker pins
+// above prove WHICH scan takes the claim; this pin proves the whole shape
+// returns identical rows: each worker partitions the outer, re-opens the
+// bitmap probe per its own outer rows, and builds a PRIVATE TIDBitmap per
+// rescan (bitmapHeapScanOp.Rescan -> tbm=nil -> lazy rebuild). The fixture
+// gives the inner ~2000 rows per key, which is what makes the planner elect
+// a bitmap probe over an index probe at all — the same election PG makes
+// for Q55's ss_item_sk probe (~480 rows/key).
+func newBitmapNLIFixture(t *testing.T) (*Context, func()) {
+	t.Helper()
+	ctx, _, cleanup := newDDLFixture(t)
+	for _, ddl := range []string{
+		"CREATE TABLE nlib_outer (id int, k int)",
+		"CREATE TABLE nlib_inner (k int, v int)",
+		"CREATE INDEX nlib_inner_k ON nlib_inner (k)",
+	} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			cleanup()
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	// 24 outer rows over 40 keys — a small outer is what lets a nested
+	// loop beat hashing the whole inner.
+	for i := 0; i < 24; i++ {
+		if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO nlib_outer VALUES (%d, %d)", i, i%40)); err != nil {
+			cleanup()
+			t.Fatalf("insert outer: %v", err)
+		}
+	}
+	// 40 keys x 500 rows: each parameterized probe returns ~500 rows —
+	// the fan-out where a bitmap scan beats the index probe per rescan
+	// (Q55's ss probe returns ~480 rows/key).
+	if err := runDDL(t, ctx, "INSERT INTO nlib_inner SELECT g % 40, g FROM generate_series(1, 20000) g"); err != nil {
+		cleanup()
+		t.Fatalf("insert inner: %v", err)
+	}
+	// The in-process ANALYZE is a no-op; seed the stats it would record so
+	// the probe election sees the real fan-out.
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "nlib_outer"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 24, Columns: []catalog.ColumnStats{
+			{NDistinct: 24}, {NDistinct: 40},
+		}}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "nlib_inner"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 20000, Columns: []catalog.ColumnStats{
+			{NDistinct: 40}, {NDistinct: 20000},
+		}}
+	}
+	return ctx, cleanup
+}
+
+func TestParallelNLIBitmapInnerIdentity(t *testing.T) {
+	ctx, cleanup := newBitmapNLIFixture(t)
+	defer cleanup()
+
+	const sql = "SELECT o.id, i.v FROM nlib_outer o JOIN nlib_inner i ON i.k = o.k"
+
+	want := sortedRowStrings(t, ctx, sql)
+	if len(want) == 0 {
+		t.Fatal("fixture produced no rows; the comparison would be vacuous")
+	}
+
+	// The plan must be the fused NLI over a BITMAP inner — an index probe
+	// or a decomposed join means the fixture no longer exercises this
+	// family (and a hand-wrapped Gather over it would measure the wrong
+	// thing). Hash and merge join are disabled for the plan under test so
+	// the election is between the probe shapes, not between algorithms —
+	// the same knob measurement PG's own force_parallel_max regress setup
+	// uses. The serial baseline runs with defaults, so it may legitimately
+	// take a hash plan; only the row SET must agree.
+	nloOnly := optimizer.DefaultPlannerSettings()
+	nloOnly.EnableHashJoin = false
+	nloOnly.EnableMergeJoin = false
+	stmts0, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plan0, err := optimizer.PlanWithSettings(stmts0[0], ctx.Catalog, nloOnly)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	nli := findNLI(plan0)
+	if nli == nil {
+		t.Fatal("fixture no longer plans a fused NLI")
+	}
+	if _, ok := nli.Inner.(*optimizer.BitmapHeapScan); !ok {
+		t.Fatalf("fixture's NLI inner is %T, want *BitmapHeapScan — the probe election changed", nli.Inner)
+	}
+	if !optimizer.NestedLoopIndexJoinIsPartialCapable(nli) {
+		t.Fatal("fixture's fused NLI is not partial-capable; a hand-wrapped " +
+			"Gather would run the whole plan per participant")
+	}
+
+	for _, workers := range []int{1, 2, 4} {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, nloOnly)
+		if err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+		gathered := optimizer.NewGather(0, plan, workers)
+		ctx.MaxParallelWorkers = 8
+		ctx.ParallelLeaderParticipation = true
+		op, err := Build(gathered)
+		if err != nil {
+			t.Fatalf("workers=%d build: %v", workers, err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("workers=%d open: %v", workers, err)
+		}
+		var got []string
+		for {
+			slot, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				op.Close()
+				t.Fatalf("workers=%d next: %v", workers, err)
+			}
+			r := slot.Row()
+			cells := make([]string, len(r))
+			for i, d := range r {
+				if d.IsNull() {
+					cells[i] = "NULL"
+				} else {
+					cells[i] = fmt.Sprint(d.Int)
+				}
+			}
+			got = append(got, strings.Join(cells, ","))
+			slot.Release()
+		}
+		op.Close()
+		sort.Strings(got)
+		if diff := multisetDiff(got, want); diff != "" {
+			t.Errorf("workers=%d: %s", workers, diff)
+		}
+	}
 }

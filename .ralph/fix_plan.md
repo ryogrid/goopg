@@ -22706,6 +22706,43 @@ M0146-0001 re-baseline census on the new default arm.
     difference — now quantified on the post\-fix corpus\); probe epsilon →
     M0142\-0005c cost\-model lineage. No planner change justified.
   Movement: none — routing recon
+- [x] **M0146\-0005aa — parameterized bitmap\-probe partial NLI is
+  gatherable** \(slice 27, impl, done 2026\-09\-28\): Q55's PG shape —
+  `Gather \-> NL\(NL\(Parallel Seq Scan item, Bitmap Heap Scan
+  store\_sales\), Memoize\(dd\)\)` — sat at the head of the `{0,1,2}`
+  partial pathlist at 16255\.65 \(cheaper than the elected 19023 serial
+  chain\) but `makeGatherPath` filed no `Gather`:
+  `partialPathDrivingKind`'s PathNestLoop probe arm only admitted
+  `PathIndexScan` inners, classifying the bitmap probe `PathPrebuilt`.
+  Evidence `analysis/m0146/m0146\-0005/slice27/`; design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 27".
+  Kind: impl
+  Parent: M0146-0005
+  - `gatherpaths.go` probe arm admits `PathBitmapHeapScan` iff single
+    `PathBitmapIndexScan` child \+ `IndexClauses`; memoized bitmap probes
+    stay refused \(createPlan unwraps memoize into
+    `createNestLoopBitmapJoinPlan`, losing the priced cache\).
+  - `NestedLoopIndexJoinIsPartialCapable` gains
+    `nliBitmapProbeIsPartialProbe` \(`*BitmapHeapScan` whose `Outer` is
+    one `*BitmapIndexScan` with keys\); kept apart from
+    `lateralProbeIsPartialProbe` — the decomposed\-lateral executor only
+    drives index/index\-only probes. No executor code change: all claim
+    walks read the shared predicate, so claims stay outer\-only and the
+    inner bitmap never enters `prebuildBitmap`'s claim set \(per\-worker
+    private serial re\-probe per outer row\).
+  - Tests: capability/walk\-agreement/driving\-kind admit\+refuse cases;
+    `collectBitmapScans` inner\-isolation pin; bitmap\-inner NLI
+    serial\-vs\-parallel identity at 1/2/4 workers.
+  - Q55 = PG shape \(modulo the deliberate partial\-agg split\),
+    rows=68 ck=`fe343d36717a4fb5` = oracle; elected 17255\.95 vs 19023.
+    Sweep collateral: Q3/Q37/Q75/Q76 take the same gather, Q61/Q49
+    reprice — all checksums clean.
+  - Gates: units PASS; tpch\-spotcheck PASS \(Q12=2, Q13=33\);
+    tpcds\-sf025 sweep PASS=96 MISMATCH=0 \(plans changed 7, verdicts
+    unchanged\).
+  Movement: yes — CATEGORIES-EXCL-MATCH parallelism 8 -> 7 \(Q55 moves to
+    aggregation\-strategy depth 2, the deliberate Finalize/Partial split\)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
