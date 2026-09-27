@@ -2534,6 +2534,29 @@ heuristic stays live.)
     \(`031e8452c`\) landed; the full `TestPort\_RegressSuite` PASSes
     \(`analysis/m0145/m0145\-0008s/regress\-suite\-result.txt`\).
 
+### Nightly run 20260927-002707 (sha `104c2c90ba04`, 3 items) — filed 2026-09-27
+- [ ] **testport isolation SSI divergences at HEAD** \(AI\-20260927\-002707\-002
+  / \-003; repro at HEAD `3f3877a88`: `go test \-v \-run
+  '^TestPort_IsolationReadWriteUnique4$|^TestPort_IsolationTemporalRangeIntegrity$'
+  \./internal/testport/` — both FAIL on a capped private run\).
+  `ReadWriteUnique4`: a permutation expects `could not serialize access`
+  where goopg raises `duplicate key value violates` — unique\-check vs
+  SSI\-predicate ordering\. `TemporalRangeIntegrity`: the permutation
+  `rx1 wy1 ry2 wx2 c1 c2` reads a row SSI should have killed \(expected
+  379 output lines, got 361 — a whole permutation\'s tail diverges\)\.
+  NOT the M0146\-0005x optimizer work — the tests are MVCC/isolation
+  scheduler\-level, both failed identically in the previous nightly, and
+  `internal/testport` is outside the commit gate\.
+  `TestPort_IsolationEvalPlanQual` \(AI \-001\) re\-ran PASS at HEAD —
+  stale item, no entry needed\.
+  Kind: impl
+  Parent: none
+  - First step: reproduce each against PG 18\.3 \(the ported spec is the
+    oracle\) and locate the serialization\-failure emission point — the
+    divergence classes are \(a\) unique violation raised before the SSI
+    rw\-dependency check and \(b\) a committed read that should have
+    tripped a dangerous\-structure abort\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
   `xlhp\_freeze\_plan` is written as 11 bytes, PG\'s struct is 12** \(found
@@ -22258,6 +22281,49 @@ M0146-0001 re-baseline census on the new default arm.
     unchanged; Q8 jointree\-search→D3\-partialpath; Q34/Q73 moved INTO
     jt\-search — leaf\-level quals PG pushes via `subquery_push_qual`,
     a separate gap now visible through the label\).
+- [x] **M0146\-0005x — `subquery_push_qual` aggregate arm: derived\-table
+  leaf quals sink into the subquery\'s aggregate, and
+  `trivial_subqueryscan` learns the physical\-tlist regime** \(filed
+  2026\-09\-27 by the M0146\-0005w closeout; witnesses TPC\-DS Q34/Q73 at
+  both scales; LANDED slice 25\): PG\'s `subquery_push_qual`
+  \(allpaths\.c:4023\) rewrites a leaf baserestrictinfo through the
+  subquery target list and appends it to `havingQual` when the subquery
+  aggregates — `cnt BETWEEN 15 AND 20` becomes `Filter: \(\(count\(\*\)
+  >= 15\) AND \(count\(\*\) <= 20\)\)` on the aggregate, and the
+  qual\-free wrapper is then deleted by `trivial_subqueryscan`
+  \(setrefs\.c\)\. goopg kept `Subquery Scan on dn` with the qual as a
+  leaf Filter\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: at the seam\'s leaf\-local attach \(joinsearchseam\.go\),
+    sink pushdown\-safe conjuncts into a `Filter` directly above the leaf
+    subquery\'s `*Aggregate` \(descend
+    `*Project`/`*Sort`/`*IncrementalSort`/`*Filter` passthroughs; rebase
+    localized ColumnRefs through `Project.Targets`; adopt the
+    aggregate\'s own output names so `expandAggOutputRef` renders
+    `count(*)`\)\. Decline volatile/correlated/sublink/nullable\-side and
+    non\-passthrough shapes; the original tree is never mutated on a
+    decline \(shallow\-copied wrappers share the aggregate subtree, so
+    `PartialSource` linkage survives\)\.
+  - Second step: `trivial_subqueryscan`\'s real test is structural — no
+    scan qual AND scan tlist position\-for\-position identical to the
+    subplan\'s\. Which tlist the scan carries follows the createplan
+    flags its ancestors pass: EXACT/SMALL \(top level; Sort,
+    IncrementalSort, Memoize, WindowAgg add SMALL; Gather\*/RecursiveUnion
+    restart EXACT\) → pathtarget regime → consumption\-identity decides;
+    bare `0`/LABEL/IGNORE \(joins incl\. NestedLoopIndexJoin, Aggregate,
+    ProjectSet\) → `use_physical_tlist` → identity by construction →
+    strip whenever qual\-free\. The strip pass gained the per\-level
+    regime walk \(verified live on PG 18\.3\)\.
+  - DONE \(slice 25\): both steps landed; Q34/Q73 render PG\'s exact
+    shape \(bare `GroupAggregate` with the pushed `count(*)` filter, no
+    `Subquery Scan`\), counts 87/0 = oracle; Q8\'s `a1` label retained\.
+    Evidence `analysis/m0146/m0146\-0005/slice25/`\.
+  - Residual \(ledgered\): the NON\-aggregate arm of
+    `subquery_push_qual` \(quals re\-entered into a non\-grouping
+    subquery\'s jointree — a deeper replan than this leaf splice\) and
+    volatile\-qual pushdown \(PG admits volatiles into grouped
+    subqueries; goopg declines\) remain open\.
 - [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored

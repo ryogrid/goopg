@@ -102,11 +102,13 @@ func planSQL(t *testing.T, cat catalog.Catalog, sql string) Node {
 func TestSubqueryScanWrapsSetOperationArm(t *testing.T) {
 	cat := subqueryScanFixture(t)
 	// Non-trivial consumption keeps the label: u publishes two columns
-	// and the outer scope reads only the first — setrefs.c's
-	// trivial_subqueryscan declines on a subset tlist, exactly like the
-	// `SELECT u.a` live-PG probe this ticket ran.
+	// and the outer scope reads only the first — the leaf is at top
+	// level, so upstream's pathtarget regime applies (CP_EXACT_TLIST)
+	// and trivial_subqueryscan declines on the subset tlist. Under a
+	// join PG would strip it regardless — the physical tlist regime —
+	// see the M0146-0005x cases in TestSubqueryScanStripsTrivialWrapper.
 	plan := planSQL(t, cat,
-		"select u.a from t1, (select a, b from t1 intersect select a, b from t1) u where t1.a = u.a")
+		"select u.a from (select a, b from t1 intersect select a, b from t1) u")
 	sq := findSubqueryScan(plan)
 	if sq == nil {
 		t.Fatalf("no *SubqueryScan in plan for a set-operation derived table")
@@ -128,10 +130,11 @@ func TestSubqueryScanWrapsSetOperationArm(t *testing.T) {
 
 func TestSubqueryScanWrapsGroupedDerivedTable(t *testing.T) {
 	cat := subqueryScanFixture(t)
-	// `u.q` alone is a subset of the published [p q] — non-trivial, so
-	// the wrapper survives the triviality strip.
+	// `u.q` alone is a subset of the published [p q] at top level —
+	// pathtarget regime, non-trivial, so the wrapper survives the
+	// triviality strip.
 	plan := planSQL(t, cat,
-		"select u.q from t1, (select a, count(a) c from t1 group by a) u(p, q) where t1.a = u.q")
+		"select u.q from (select a, count(a) c from t1 group by a) u(p, q)")
 	sq := findSubqueryScan(plan)
 	if sq == nil {
 		t.Fatalf("no *SubqueryScan in plan for a grouped derived table")
@@ -209,6 +212,26 @@ func TestSubqueryScanStripsTrivialWrapper(t *testing.T) {
 			"select u.c, u.a from (select a, count(a) c from t1 group by a) u", false},
 		{"subset consumption keeps",
 			"select u.a from (select a, count(a) c from t1 group by a) u", false},
+		// M0146-0005x — the physical-tlist regime: a leaf below a
+		// spine-breaker (join, aggregate) gets the subquery's full
+		// output tlist in attno order, so trivial_subqueryscan strips
+		// it no matter which subset the outer scope reads. Verified on
+		// PG 18.3 (`select u.a … join` → bare Merge Join input;
+		// `select count(*) …` → bare Aggregate input).
+		{"subset consumption under join strips",
+			"select u.a, t1.b from t1, (select a, count(a) c from t1 group by a) u where t1.a = u.a", true},
+		{"subset consumption under top aggregate strips",
+			"select count(*) from (select a, count(a) c from t1 group by a) u", true},
+		// Spine-continuing ancestors keep the pathtarget regime: the
+		// leaf's tlist is the needed columns in first-needed order, so
+		// a subset still declines (PG verified under Sort, Limit and
+		// Unique alike).
+		{"subset under sort keeps",
+			"select u.a from (select a, count(a) c from t1 group by a) u order by u.a", false},
+		{"subset under limit keeps",
+			"select u.a from (select a, count(a) c from t1 group by a) u limit 5", false},
+		{"subset under distinct keeps",
+			"select distinct u.a from (select a, count(a) c from t1 group by a) u", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sq := findSubqueryScan(planSQL(t, cat, tc.sql))

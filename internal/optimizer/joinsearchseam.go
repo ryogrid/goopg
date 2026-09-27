@@ -175,6 +175,9 @@ package optimizer
 // ran the old subset-bitmask DP instead; that enumerator is deleted, 08 §4.)
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -879,12 +882,48 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		leaves[i] = scans[i]
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
-			local = combineAnd(preds)
-			localized := make([]Expr, 0, len(preds))
-			for _, p := range preds {
-				localized = append(localized, localizeExprToLeaf(p, b))
+			// M0146-0005x — the HAVING arm of PG's subquery_push_qual
+			// (allpaths.c): restriction conjuncts on a derived-table leaf
+			// sink below the SubqueryScan label into a Filter on its
+			// aggregate, so a fully-pushed leaf renders the bare aggregate
+			// (the M0146-0005w strip then applies) instead of
+			// `Subquery Scan on <alias> + Filter` (TPC-DS Q34/Q73). Leaves
+			// under an outer link's nullable side are declined: their leaf
+			// locals can be ON-qual-derived, which upstream keeps in
+			// joininfo, never in baserestrictinfo. Whatever does not push
+			// keeps the ordinary leaf Filter — nothing is dropped.
+			if ss, isSub := scans[i].(*SubqueryScan); isSub {
+				nullable := false
+				for _, lk := range outerLinks {
+					if relsSubset(leafRangeRelSet(i, i+1), lk.nullable) {
+						nullable = true
+						break
+					}
+				}
+				if !nullable {
+					if wrapped, kept, pushed := pushQualsIntoSubqueryLeaf(ss, preds, b, cat); pushed {
+						if dpTraceEnabled() {
+							fmt.Fprintf(os.Stderr, "%s subqpush leaf=%d pushed=%d kept=%d\n", traceTag, i, len(preds)-len(kept), len(kept))
+						}
+						scans[i] = wrapped
+						leaves[i] = wrapped
+						preds = kept
+						if len(kept) == 0 {
+							delete(locals.byBinding, i)
+						} else {
+							locals.byBinding[i] = kept
+						}
+					}
+				}
 			}
-			leaves[i] = &Filter{Child: scans[i], Predicate: combineAnd(localized), LeafLocal: true}
+			if len(preds) > 0 {
+				local = combineAnd(preds)
+				localized := make([]Expr, 0, len(preds))
+				for _, p := range preds {
+					localized = append(localized, localizeExprToLeaf(p, b))
+				}
+				leaves[i] = &Filter{Child: scans[i], Predicate: combineAnd(localized), LeafLocal: true}
+			}
 		}
 		relInfos[i] = estimateBaseRelInfo(b, scans[i], local)
 		relInfos[i].bindingIdx = i

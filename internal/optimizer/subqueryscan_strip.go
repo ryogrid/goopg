@@ -57,6 +57,9 @@ func stripTrivialSubqueryScans(root Node, derived []Node) Node {
 		region Node
 		parent Node
 		scan   *SubqueryScan
+		// physical records whether a spine-breaking ancestor sits
+		// between the leaf and its region root — see below.
+		physical bool
 	}
 	var leaves []leaf
 
@@ -64,32 +67,77 @@ func stripTrivialSubqueryScans(root Node, derived []Node) Node {
 	// (reflection over exported Node fields) supplies children, so new
 	// node kinds are traversed automatically; the boundary set is what
 	// makes a deeper region, and it is explicit.
-	var walk func(n, region, parent Node)
-	walk = func(n, region, parent Node) {
+	//
+	// M0146-0005x: each leaf also tracks the tlist regime upstream picks
+	// for it. create_plan hands the top path CP_EXACT_TLIST; Limit,
+	// LockRows and Result pass their flags through and Sort, Material
+	// and Memoize add CP_SMALL_TLIST — all of which keep a leaf in the
+	// pathtarget regime, where the scan's tlist is the needed columns in
+	// first-needed order and the consumption-identity test below decides.
+	// Joins — including NestedLoopIndexJoin, whose Outer/Inner take the
+	// same recurse call — Agg and ProjectSet instead pass children bare
+	// CP_LABEL_TLIST/0, so use_physical_tlist fires: the scan's tlist is
+	// the subquery's whole output in attno order — identity by
+	// construction — and trivial_subqueryscan strips whenever the leaf
+	// has no qual, regardless of consumption. (Verified on PG 18.3:
+	// `u.a` from a two-column grouped leaf keeps `Subquery Scan` at top
+	// level and under Sort/Limit/Unique, but loses it under Merge Join
+	// and under a top Aggregate.)
+	var walk func(n, region, parent Node, physical bool)
+	walk = func(n, region, parent Node, physical bool) {
 		if n == nil {
 			return
 		}
 		inner := region
+		innerPhysical := physical
 		if sq, ok := n.(*SubqueryScan); ok {
-			leaves = append(leaves, leaf{region: region, parent: parent, scan: sq})
+			leaves = append(leaves, leaf{region: region, parent: parent, scan: sq, physical: physical})
 			inner = n
+			innerPhysical = false
 		} else if isDerived[n] {
 			inner = n
+			innerPhysical = false
 		} else if _, ok := n.(*CTEScan); ok {
 			inner = n
+			innerPhysical = false
+		}
+		// A child's tlist regime is recomputed at EVERY level, the way
+		// createplan.c's flags are: a spine breaker hands its children
+		// bare 0/LABEL/IGNORE (physical regime), a node demanding an
+		// exact or small tlist hands out CP_EXACT_TLIST or adds
+		// CP_SMALL_TLIST (pathtarget regime — even under a breaker:
+		// `NL -> Sort -> SubqueryScan` still keeps the label on subset
+		// consumption), and a passthrough node propagates the incoming
+		// regime (Limit, LockRows, Unique/Distinct via flags|LABEL).
+		// A new query region restarts in the EXACT regime, matching
+		// each subplan's own CP_EXACT_TLIST entry into create_plan.
+		childPhysical := innerPhysical
+		switch {
+		case subqueryStripSpineBreaker(n):
+			childPhysical = true
+		case subqueryStripTlistReset(n):
+			childPhysical = false
 		}
 		kids, _ := planChildNodes(n)
 		for _, k := range kids {
 			r := inner
+			p := childPhysical
+			if r != region {
+				// Region boundary — derived body, CTEScan body or
+				// SubqueryScan interior each begin their own
+				// EXACT-tlist regime.
+				p = false
+			}
 			if _, isSetOp := n.(*SetOp); isSetOp {
 				// Each arm was planned in its own query scope; the arm
 				// subtree is the region for everything inside it.
 				r = k
+				p = false
 			}
-			walk(k, r, n)
+			walk(k, r, n, p)
 		}
 	}
-	walk(root, root, nil)
+	walk(root, root, nil, false)
 
 	if len(leaves) == 0 {
 		return root
@@ -102,18 +150,25 @@ func stripTrivialSubqueryScans(root Node, derived []Node) Node {
 	trivial := make(map[*SubqueryScan]bool, len(leaves))
 	for _, l := range leaves {
 		used, clean := leafUsedPositions(l.region, l.scan, isDerived)
-		if !clean {
-			continue
-		}
 		w := len(l.scan.Output())
-		identity := len(used) == w
-		for i, u := range used {
-			if u != i {
-				identity = false
-				break
+		identity := clean && len(used) == w
+		if identity {
+			for i, u := range used {
+				if u != i {
+					identity = false
+					break
+				}
 			}
 		}
-		if !identity {
+		// M0146-0005x — consumption-identity is the pathtarget-regime
+		// proxy for PG's structural test; under a spine breaker the
+		// physical tlist makes the wrapper trivial regardless of which
+		// positions the consumer reads or in what order (createplan.c
+		// use_physical_tlist + plancat.c's RTE_SUBQUERY arm). The
+		// width guard keeps coordinate honesty: the wrapper may go
+		// only when the child's output is position-for-position the
+		// leaf's schema.
+		if !identity && !(l.physical && len(l.scan.Output()) == len(l.scan.Child.Output())) {
 			continue
 		}
 		if _, isFilter := l.parent.(*Filter); isFilter {
@@ -189,6 +244,48 @@ func leafUsedPositions(region Node, scan *SubqueryScan, isDerived map[Node]bool)
 	}
 	visit(region)
 	return used, clean
+}
+
+// subqueryStripSpineBreaker reports whether this node hands its
+// children a bare tlist demand: in createplan.c terms, the child
+// create_plan_recurse calls that pass 0, CP_LABEL_TLIST or
+// CP_IGNORE_TLIST, letting use_physical_tlist fire on a scan leaf
+// below (the flag word carries neither CP_EXACT_TLIST nor
+// CP_SMALL_TLIST). create_nestloop_plan covers both goopg join node
+// kinds (*Join and *NestedLoopIndexJoin). goopg's *Project is NOT a
+// breaker: a SubqueryScan path is projection-capable, so PG folds a
+// computed select list into the scan's own tlist (non-identity →
+// keep) — verified live (`u.c+1` under Limit keeps the label).
+// Everything else either propagates `flags` (Limit, LockRows,
+// Unique/Distinct/UpperUnique via flags|LABEL — the added LABEL bit
+// does not set EXACT or SMALL) or resets to the pathtarget regime —
+// see subqueryStripTlistReset.
+func subqueryStripSpineBreaker(n Node) bool {
+	switch n.(type) {
+	// Joins: create_nestloop_plan passes 0 and a directly-attached
+	// merge/hash join child the same (an input needing sort carries a
+	// Sort node that resets the regime itself). Aggregate covers
+	// create_agg_plan/create_group_plan (CP_LABEL_TLIST).
+	case *Join, *NestedLoopIndexJoin, *Aggregate, *ProjectSet:
+		return true
+	}
+	return false
+}
+
+// subqueryStripTlistReset reports whether this node hands its children
+// an exact or small tlist demand — the (CP_EXACT_TLIST |
+// CP_SMALL_TLIST) test that makes use_physical_tlist decline regardless
+// of the incoming flags: create_sort_plan/create_incrementalsort_plan,
+// create_material_plan/create_memoize_plan and create_windowagg_plan
+// add CP_SMALL_TLIST; create_gather_plan/create_gather_merge_plan and
+// create_recursiveunion_plan request CP_EXACT_TLIST outright.
+func subqueryStripTlistReset(n Node) bool {
+	switch n.(type) {
+	case *Sort, *IncrementalSort, *Memoize, *WindowAgg,
+		*Gather, *GatherMerge, *RecursiveUnion:
+		return true
+	}
+	return false
 }
 
 // leafLocalPosition maps a scope-level reference to a position in the

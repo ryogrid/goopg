@@ -27,12 +27,14 @@ func TestExplainSubqueryScanLabelOnSetOpArm(t *testing.T) {
 	}
 
 	// u publishes two columns and the query reads only the first — a
-	// subset consumption PG's setrefs judges non-trivial, so the label
-	// survives (a full in-order read would strip it; see the optimizer's
-	// triviality pins).
+	// subset consumption at top level, where PG's CP_EXACT_TLIST regime
+	// keeps the scan's tlist as the needed-vars list (non-identity), so
+	// trivial_subqueryscan declines and the label survives. Under a
+	// join the same shape strips (physical tlist — see the optimizer's
+	// M0146-0005x pins).
 	rows := runExplainRows(t, ctx,
-		"EXPLAIN (COSTS OFF) SELECT u.a FROM sqs1, "+
-			"(SELECT a, b FROM sqs1 INTERSECT SELECT a, b FROM sqs2) u WHERE sqs1.a = u.a")
+		"EXPLAIN (COSTS OFF) SELECT u.a FROM "+
+			"(SELECT a, b FROM sqs1 INTERSECT SELECT a, b FROM sqs2) u")
 	joined := strings.Join(rows, "\n")
 	labelIdx := strings.Index(joined, "Subquery Scan on u")
 	if labelIdx < 0 {
