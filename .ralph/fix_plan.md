@@ -22612,7 +22612,7 @@ M0146-0001 re-baseline census on the new default arm.
   > there. Cluster lifecycle stays owner\-window work — not loop work —
   > because it takes gate clusters down; until it runs, TPC\-DS
   > divergences on `char`\-heavy tables may be data artifacts.
-- [ ] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
+- [x] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
   it cannot see** \(filed 2026\-09\-25 by M0146\-0005c\): in `spillFixture`,
   rows written with `writeHeapRow`, and even rows loaded with `INSERT …
   SELECT` through `runDDL`, leave `ANALYZE` with `RowCount 0, Analyzed:
@@ -22626,6 +22626,26 @@ M0146-0001 re-baseline census on the new default arm.
     reltuples FROM pg\_class WHERE relname = \'t\'; COMMIT;` against PG 18.3. If
     the server matches PG, the gap is the fixture\'s transaction handling
     only.
+  - **DONE 2026\-09\-27 — real engine divergence, fixed.** Design doc
+    `docs/design/0100\-0149/m0146\-0005\-analyze\-own\-xid.md`; evidence
+    `analysis/m0146/m0146\-0005/analyze\-own\-xmin/` \(byte\-identical vs PG
+    18\.3, including the in\-txn DELETE arm\).
+    - `analyzeRelationWith` passed the nested snapshot\-minting tx\'s XID
+      to `TupleVisible` as `currentXID`; the own\-xmin arm never fired, so
+      `BEGIN; INSERT …; ANALYZE;` recorded RowCount 0 on a real server —
+      same\-txn `SELECT count\(\*\)` saw the rows fine.
+    - Fix: the scan now credits `dsCtx.Tx.XID` gated on
+      `mgr.IsXIDActive` \(PG\'s `TransactionIdIsCurrentTransactionId`\);
+      `dsCtx == nil` \(autovacuum `AnalyzeRelationSampled`, the test\-only
+      `analyzeRelation` wrapper\) keeps the nested XID. Committed/aborted
+      caller XIDs \(fixture commit\-then\-analyze\) fall to the snapshot arm.
+    - Fixture note: rows written and analyzed at the same command id stay
+      invisible — PG\'s own\-command rule, not a bug; `runDDL`\'s
+      `advanceStmtCounter` and `setFixtureStats` cover the fixture paths.
+    - Regression pin `TestAnalyzeSeesOwnUncommittedInserts`
+      \(operators\_analyze\_test.go\).
+  Movement: none expected — statistics-taking visibility, not a plan input
+  the corpus exercises
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

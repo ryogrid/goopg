@@ -1,0 +1,15 @@
+=== PG 18.3 scratch :5541 ===
+BEGIN
+ERROR:  relation "u" already exists
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+ reltuples 
+-----------
+        50
+(1 row)
+

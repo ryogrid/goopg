@@ -811,6 +811,28 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 	if err != nil {
 		return nil, err
 	}
+	// ownXID is the transaction whose uncommitted tuples this scan must see.
+	// The SQL ANALYZE path runs inside the session transaction, so its
+	// own-inserted rows (xmin = ctx.Tx.XID) count, as PG's ANALYZE counts
+	// tuples its own transaction inserted (HeapTupleSatisfiesMVCC's own-xmin
+	// arm); the cmin/curcid ordering still hides tuples stamped by the
+	// current command. Without this, `BEGIN; INSERT …; ANALYZE;` recorded
+	// RowCount 0 where PG records the row count — the divergence behind the
+	// executor fixture's "ANALYZE sees nothing" report (M0146-0005 task:
+	// fixture ANALYZE RowCount 0). The nested tx above exists only to mint
+	// the snapshot, so its own XID can never appear on a tuple; when no
+	// session context exists (autovacuum's AnalyzeRelationSampled and the
+	// test-only analyzeRelation wrapper, dsCtx == nil) ownXID stays the
+	// nested tx's, preserving the scan-only-committed behaviour PG's
+	// autovacuum worker exhibits in its own transaction.
+	// IsXIDActive mirrors PG's TransactionIdIsCurrentTransactionId: the
+	// credit applies only while the session transaction is still open —
+	// a committed (fixture commit-then-analyze) or aborted caller XID
+	// must fall through to the snapshot check like any other xid.
+	ownXID := tx.XID
+	if dsCtx != nil && mgr.IsXIDActive(dsCtx.Tx.XID) {
+		ownXID = dsCtx.Tx.XID
+	}
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
 		return nil, err
@@ -898,7 +920,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 				curcid = dsCtx.CmdID
 				combo = dsCtx.comboStore()
 			}
-			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
+			if !transam.TupleVisible(t.Header, snap, ownXID, curcid, combo, mxs) {
 				continue
 			}
 			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
