@@ -21392,8 +21392,13 @@ M0146-0001 re-baseline census on the new default arm.
   Movement: none — correctness bug fix outside the parity instruments'
     reach.
 
-- [ ] **A non\-LATERAL comma\-item derived table sees same\-level FROM
-  siblings \(PG rejects\)** \(found 2026\-09\-27 by M0146\-0015h\):
+- [x] **A non\-LATERAL comma\-item derived table sees same\-level FROM
+  siblings \(PG rejects\)** \(found 2026\-09\-27 by M0146\-0015h; landed
+  as M0146\-0015i — `planSubqueryRangeVar` now strips
+  bindings/schema/joinlist from a non\-LATERAL item's lateralCtx while
+  keeping the one\-level parent hop; live probes vs PG 18\.3 + regression
+  pin `TestDerivedTableCommaItemSiblingScope`; residual: error wording
+  stays 42703/`SELECT * with no FROM clause` vs PG's 42P01 phrase\):
   `select count\(\*\) from tk o, \(select x.u1 from tk x where x.h =
   o.h\) s` → goopg `1000`; PG `invalid reference to FROM\-clause entry
   for table "o"` \(42P01\). `planFromClause` builds `lateralCtx` whenever
