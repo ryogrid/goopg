@@ -14720,6 +14720,39 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			idx.ExclusionOp = xp.ExclusionOp
 		}
 	}
+	// M0146-0015a (banner item 2a): an explicit opclass that resolves to the
+	// column type's OWN default is the default — pg_index.indclass records
+	// the same OID either way and pg_get_indexdef does not print it — so the
+	// checkpoint-restart path (loadUserIndexesFromHeap →
+	// ResolveIndexColumnOpclassName) can only ever reconstruct it as "".
+	// Keeping the spelling here made ColOpClasses[i] differ across a clean
+	// restart, which flips buildPGIndexKeyDesc's on-disk-format decision
+	// (non-empty opclass → refuse → goopg blob keys; "" → PG per-datum
+	// tuple keys): probes then encode under a different format than the
+	// index was built with and a clean restart silently returns wrong
+	// rows. Normalise the name away at CREATE time so both construction
+	// paths produce the same catalog entry — must run BEFORE
+	// bulkBuildBTreeFull, which encodes under whatever descriptor the
+	// normalised catalog entry yields, and before the WAL/catalog-heap
+	// emission that replays/persists it. A name resolving to a non-default
+	// OID (text_pattern_ops, or a user opclass shadowing a builtin name)
+	// keeps its spelling and keeps refusing the tuple format — equally
+	// consistent across restart, since indclass preserves its OID and the
+	// reverse-resolver returns the name back.
+	for i, opName := range idx.ColOpClasses {
+		if opName == "" {
+			continue
+		}
+		var typeName string
+		if i < len(cols) && cols[i] != nil {
+			typeName = cols[i].Type.Name
+		}
+		methodOID := catalog.AccessMethodOIDByName(idx.Method)
+		if named := o.ctx.Catalog.ResolveIndexColumnOpclassOID(opName, typeName, methodOID); named != 0 &&
+			named == o.ctx.Catalog.ResolveIndexColumnOpclassOID("", typeName, methodOID) {
+			idx.ColOpClasses[i] = ""
+		}
+	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {

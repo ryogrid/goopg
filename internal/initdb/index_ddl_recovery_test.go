@@ -4,6 +4,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -317,6 +320,185 @@ func TestCreateIndexOpclassAndCollationSurviveCheckpointedRestart(t *testing.T) 
 	if len(idx.ColCollations) != 2 || idx.ColCollations[0] != "" || idx.ColCollations[1] != "C" {
 		t.Errorf("recovered ColCollations = %v, want [\"\" C]", idx.ColCollations)
 	}
+}
+
+// TestExplicitDefaultOpclassIndexSurvivesCheckpointedRestart pins the
+// banner-2a wrong-rows defect (found 2026-09-25 by M0146-0015a; repro
+// analysis/m0146/m0146-0015a/opclass-restart-repro.sh): `CREATE INDEX
+// … (a int4_ops)` — an explicit opclass that IS the column type's default —
+// returned 0 rows after a clean restart for a probe that returned 49
+// before it.
+//
+// Root cause: the live catalog kept ColOpClasses[0]=="int4_ops" while the
+// heap-reload path reverse-resolves pg_index.indclass to "" for a
+// default-equivalent opclass (ResolveIndexColumnOpclassName). That made
+// buildPGIndexKeyDesc's on-disk-format decision flip across the restart —
+// goopg blob keys at CREATE, PG per-datum tuple keys after — so probes
+// encoded under a different format than the index was built with.
+// createBTreeIndex now normalises a default-equivalent explicit opclass to
+// "" so both construction paths agree (PG's indclass cannot distinguish
+// them either — the default opclass is not spelled out in indexdef).
+// A genuinely non-default opclass keeps its spelling on both sides and
+// stays on the blob format — already pinned by
+// TestCreateIndexOpclassAndCollationSurviveCheckpointedRestart above.
+func TestExplicitDefaultOpclassIndexSurvivesCheckpointedRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDLRealDataDir(t, rt1, "CREATE TABLE opc_probe (a int4)")
+	runDDLRealDataDir(t, rt1, "INSERT INTO opc_probe SELECT g FROM generate_series(1,1000) g")
+	runDDLRealDataDir(t, rt1, "CREATE INDEX opc_probe_a ON opc_probe USING btree (a int4_ops)")
+
+	// The normalisation this fix relies on: the catalog entry carries no
+	// opclass spelling — int4_ops IS int4's default opclass, so indclass
+	// holds the default OID and the heap-reload path can only reconstruct
+	// "" — which is now exactly what the live entry holds too.
+	idx1, ok := rt1.Catalog.LookupIndex(parser.ObjectName{Name: "opc_probe_a"})
+	if !ok {
+		t.Fatal("opc_probe_a not in catalog")
+	}
+	for _, n := range idx1.ColOpClasses {
+		if n != "" {
+			t.Fatalf("ColOpClasses=%v: a default-equivalent explicit opclass must normalise to \"\" (int4_ops IS int4's default opclass)", idx1.ColOpClasses)
+		}
+	}
+	// The probe must actually go through the index — a seqscan would
+	// quietly pass while the on-disk key format is broken.
+	if !planUsesIndexScan(t, rt1, "SELECT count(*) FROM opc_probe WHERE a < 50") {
+		t.Fatal("test premise broken: a < 50 probe did not plan an IndexScan (planner cost model changed?)")
+	}
+	if got := runCountQuery(t, rt1, "SELECT count(*) FROM opc_probe WHERE a < 50"); got != 49 {
+		t.Fatalf("indexed probe before restart: count=%d, want 49", got)
+	}
+
+	// Graceful shutdown: Runtime.Close performs a synchronous checkpoint
+	// (M0089-0002), flushing the pg_index heap page — recovery on the next
+	// Open is won by loadUserIndexesFromHeap, not WAL replay.
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	if !planUsesIndexScan(t, rt2, "SELECT count(*) FROM opc_probe WHERE a < 50") {
+		t.Fatal("test premise broken: a < 50 probe did not plan an IndexScan after restart")
+	}
+	// Pre-fix this returned 0: the reloaded catalog lost the opclass
+	// spelling, the key descriptor flipped to the tuple format, and the
+	// probe encoded keys the blob-format index could never match.
+	if got := runCountQuery(t, rt2, "SELECT count(*) FROM opc_probe WHERE a < 50"); got != 49 {
+		t.Fatalf("indexed probe after restart: count=%d, want 49 (pre-fix bug returned 0 — probe encoded under a different key format than the index was built with)", got)
+	}
+}
+
+// planUsesIndexScan plans sql and reports whether the plan tree contains an
+// index-driven scan — the precondition for the before/after-restart probes
+// above to exercise the index key format rather than a seqscan.
+func planUsesIndexScan(t *testing.T, rt *Runtime, sql string) bool {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse %q: %v", sql, err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
+	if err != nil {
+		t.Fatalf("plan %q: %v", sql, err)
+	}
+	return walkForIndexScan(plan)
+}
+
+func walkForIndexScan(n optimizer.Node) bool {
+	switch nd := n.(type) {
+	case *optimizer.IndexScan, *optimizer.IndexOnlyScan:
+		return true
+	case *optimizer.Aggregate:
+		return walkForIndexScan(nd.Child)
+	case *optimizer.Result:
+		return walkForIndexScan(nd.Child)
+	case *optimizer.Project:
+		return walkForIndexScan(nd.Child)
+	case *optimizer.Filter:
+		return walkForIndexScan(nd.Child)
+	case *optimizer.Sort:
+		return walkForIndexScan(nd.Child)
+	case *optimizer.Limit:
+		return walkForIndexScan(nd.Child)
+	}
+	return false
+}
+
+// runCountQuery executes a single-statement SELECT returning one int64 row
+// (count(*)) through the full planner+executor pipeline, mirroring runDDL.
+func runCountQuery(t *testing.T, rt *Runtime, sql string) int64 {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse %q: %v", sql, err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
+	if err != nil {
+		t.Fatalf("plan %q: %v", sql, err)
+	}
+	op, err := executor.Build(plan)
+	if err != nil {
+		t.Fatalf("build %q: %v", sql, err)
+	}
+
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	snap, err := rt.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		_ = rt.TxnMgr.Commit(tx)
+		t.Fatalf("SnapshotFor: %v", err)
+	}
+	ctx := executor.NewContext()
+	ctx.Pool = rt.Pool
+	ctx.Catalog = rt.Catalog
+	ctx.TxnMgr = rt.TxnMgr
+	ctx.Tx = tx
+	ctx.Snap = snap
+
+	if err := op.Open(ctx); err != nil {
+		_ = rt.TxnMgr.Commit(tx)
+		t.Fatalf("Open %q: %v", sql, err)
+	}
+	slot, nextErr := op.Next()
+	if nextErr != nil {
+		op.Close()
+		_ = rt.TxnMgr.Commit(tx)
+		t.Fatalf("Next %q: %v", sql, nextErr)
+	}
+	row := slot.Row()
+	if len(row) != 1 {
+		op.Close()
+		_ = rt.TxnMgr.Commit(tx)
+		t.Fatalf("%q: want 1-column row, got %d columns", sql, len(row))
+	}
+	got := row[0].Int
+	slot.Release()
+	op.Close()
+	if err := rt.TxnMgr.Commit(tx); err != nil {
+		t.Fatalf("commit after %q: %v", sql, err)
+	}
+	return got
 }
 
 // TestDropIndexSurvivesRestartViaWAL pins the symmetric DROP
