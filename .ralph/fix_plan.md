@@ -3041,6 +3041,43 @@ heuristic stays live.)
     (`support.go:169`) only, i.e. synthetic unaliased parenthesized JOINs,
     not every `FROM`-clause RangeVar.
 
+- [ ] **bpchar HASH semantics parity — verify/fix blank-insensitive
+  hashing wherever bpchar keys are grouped, joined, or de-duplicated**
+  (found 2026-09-27 while analysing the post-reload SF0.25 sweep; the
+  companion `bpchareq` finding is recorded in OWNER DECISIONS
+  2026-09-27). PG's `bpcharhash` (hash over the blank-stripped image)
+  ignores trailing blanks so that `char(20) 'x   '` and `char(5) 'x'`
+  hash identically — this is what makes hash joins, `GROUP BY`,
+  `DISTINCT`, and SetOp de-duplication on bpchar agree with
+  `bpchareq`. If goopg hashes the padded image bytewise, those paths
+  miss matches that `=` now accepts — the exact failure mode that
+  appeared as `goopg=0 oracle=100` after the reload. The stale
+  unpadded load masked BOTH sides of this; padding-correct data
+  exposes whichever side remains wrong.
+  Kind: impl
+  Parent: none
+  - Verification scope (each needs a witness query, not just a code
+    read): (a) hash join between bpchar columns of different declared
+    widths — e.g. a `char(20)` column against a narrower bpchar side;
+    (b) `GROUP BY`/`DISTINCT` over bpchar where equal-logical values
+    carry different padding (mixed-width inputs via UNION); (c) SetOp
+    de-duplication (`UNION`/`INTERSECT`/`EXCEPT` over bpchar) — the
+    `union` regress case already bit this class once for CAST
+    padding; (d) `IN`/`NOT IN` on bpchar when they take the hashed
+    subplan path; (e) `bpchar = text/varchar` comparisons, which
+    route through `text(bpchar)` rtrim casts rather than `bpchareq` —
+    check the coercion choice matches `pg_cast.dat`.
+  - First step: with the padded-data clusters up, run each witness on
+    goopg vs the `:65438` reference; then fix the hashing/coercion
+    paths that diverge and re-run `scripts/tpcds-sf025-regression.sh
+    sweep` — residual MISMATCH/CKMISMATCH rows after the `bpchareq`
+    fix are the signal this task exists for.
+  - Caveat for whoever fixes `bpchareq`: pad-aware equality alone is
+    NOT sufficient — a bytewise hash turns every padded hash
+    partition into its own bucket, so join/group paths silently lose
+    rows even though `=` is correct. Fix both sides in the same
+    change, or file the remainder explicitly.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0130 (Cluster-directory compat with PG 18.3 + PG physical replication).
