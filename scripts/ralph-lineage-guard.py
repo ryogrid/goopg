@@ -43,6 +43,21 @@ when the candidate:
       lose the FROZEN token. A new task may not have a frozen-prefixed id, a
       frozen-prefixed Parent / Parent-chain ancestor, or be nested by indent
       under a frozen-prefixed task.
+  Rule E (task-id uniqueness — the M0146-0016 collision): a candidate may not
+      add a task header under a structured id (`M0146-0016`, `P0-E7`,
+      `testport/...` — tokens carrying a digit or a `/`) that ANOTHER task
+      header already carries. The parser resolves Parent: references and the
+      Rule A lineage by first occurrence only, so a second task filed under an
+      already-used id is silently invisible to every check above (a `[ ]`
+      Subquery-Scan task hid behind the landed M0146-0016 presorted-split
+      task that way — the markdown `\\-` escape even made the collision
+      undetectable by eye and by the first-wins dictionary). Ids are compared
+      after stripping the `\\-` escape. Two grandfatherings keep the ledger's
+      conventions legal: (1) non-structured first words (`**WRONG RESULTS:`
+      etc.) are titles, not ids, and are exempt; (2) a structured id already
+      duplicated in the baseline is reported only when the candidate adds yet
+      another occurrence — growth is checked by per-id OCCURRENCE COUNT, not
+      line identity, so a verbatim-copied header is caught too.
 
 Task grammar:  `<indent>- [ |x|!] **<TASK-ID>...`  (id ends at whitespace or `*`)
 Body lines (until the next checkbox task line or `#` heading), or the task's
@@ -359,6 +374,38 @@ def check(baseline, candidate):
                 f"(descendant counting and the lineage budget both miss it). Put the field at "
                 f"the START of its own line, or on the task's title line. "
                 f"Line: {ln.strip()[:120]}")
+
+    # Rule E — task-id uniqueness for STRUCTURED ids (tokens with a digit or
+    # a `/`; bolded first words like `WRONG`/`The`/`store-null-keys` are
+    # titles, exempt). parse() resolves ids first-occurrence-wins, so a
+    # second header under an existing id never reaches `order`/`ctasks` and
+    # escapes Rules A-D entirely; scan the raw lines instead. The `\-`
+    # markdown escape is stripped so `M0146-0016` and `M0146\-0016` collide
+    # (they did). Growth is measured by per-id OCCURRENCE COUNT — a
+    # verbatim-copied header line is caught even though it matches a
+    # baseline line, while a structured id already duplicated in the
+    # baseline stays grandfathered until the candidate adds ANOTHER one.
+    id_lines_c, id_lines_b = {}, {}
+    for text, out in ((candidate, id_lines_c), (baseline, id_lines_b)):
+        for n, ln in enumerate(text.splitlines(), 1):
+            mt = TASK_RE.match(ln)
+            if mt:
+                tid = mt.group(3).rstrip(".,:;—").replace("\\", "")
+                out.setdefault(tid, []).append(n)
+    for tid, clines in sorted(id_lines_c.items()):
+        if len(clines) <= 1:
+            continue
+        if not (re.search(r"[0-9/]", tid)):
+            continue  # not a structured id — a repeating title word
+        blines = id_lines_b.get(tid, [])
+        if len(clines) <= len(blines):
+            continue  # pre-existing duplication, unchanged
+        errs.append(
+            f"[E] task id {tid} now appears {len(clines)} times on task "
+            f"headers (lines {', '.join(map(str, clines))}; baseline had "
+            f"{len(blines)}). A second entry under an existing id is "
+            f"invisible to Parent: resolution and the lineage budget — "
+            f"renumber the new task to the next free id and record the fix.")
     return errs
 
 

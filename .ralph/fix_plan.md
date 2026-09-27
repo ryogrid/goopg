@@ -81,25 +81,19 @@ banner at the next `## ` line).
    M0145-0004/0004a) — their wall
    is the resolver-time lowering, fixed inside item 3's M0145-0003/0004.
 2a. **Post-cutover correctness and gate-red batch** (owner decision
-   2026-09-25 — S2 placement; see OWNER DECISIONS 2026-09-25 below), in
-   this order: **M0145-0008r** (bitmap scan over an unproven partial
-   index drops rows — regress `portals_p2` red) → **M0145-0008s**
-   (per-worker HashSetOp over partial inputs — regress `union` red) →
-   **M0145-0008m** (PK-dependent column reads NULL under an
-   index-ordered grouping input) → **the freeze-WAL record** (the
-   manually-discovered `xlhp_freeze_plan` 11-vs-12-byte item under
-   M-NIGHTLY) → **M0146-0015** (`subselect` >1h hang — recon; its
-   bisect answers whether the cutover introduced it) →
-   **testport/TestE2E_PGColdStartOnGoopgDataDir** (init-template conf
-   fidelity: `goopg init` writes PG's commented `work_mem` default; the
-   512MB convention lives in the bench runtime confs, not the
-   template). The `TestPort_RegressSuite` reopen item closes when
-   0008r and 0008s land. The three isolation specs (EvalPlanQual,
-   ReadWriteUnique4, TemporalRangeIntegrity) are SSI-semantics /
-   scheduling divergences and keep M-NIGHTLY order — no bump.
-   Descendants filed under this item's tasks inherit item 2a's rank
-   (explicit owner placement; S7's lowest-candidate tiebreak does not
-   re-queue them under item 3).
+   2026-09-25 — S2 placement; see OWNER DECISIONS 2026-09-25 below).
+   The original six drained 2026-09-25/27: **M0145-0008r**, **0008s**,
+   **0008m**, the freeze-WAL record, **M0146-0015** (+ its fix
+   M0146-0015a) and the TestE2E conf-template item are all `[x]`, and
+   `TestPort_RegressSuite` closed as recorded. **Current live member:**
+   the explicit-opclass index restart task (wrong rows after a clean
+   restart — the newest open S2 defect, filed under the M0146 section),
+   which is item 2a's only occupant until it lands. The three isolation
+   specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
+   SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
+   no bump. Descendants filed under this item's tasks inherit item
+   2a's rank (explicit owner placement; S7's lowest-candidate tiebreak
+   does not re-queue them under item 3).
 3. **M0145 jointree-first planner** (flow unification, owner decision
    2026-09-20 — fix the medium-level route divergence documented in
    `METHODOLOGY4/plan-flow-medium-abstraction.md` at the boundary, not per
@@ -372,6 +366,41 @@ delegated; details in each task's entry):
   template1 (the design doc's recommendation, explicitly a
   workaround); Option B stays the M0122-0007 epic (slices 4b-4e).
   Task re-opened `[ ]`.
+
+OWNER DECISIONS 2026-09-27 (post-cutover progress review
+`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/000-plan-party-progtess-0927.md`,
+delegated; details in each task's entry):
+- **Explicit-opclass index restart defect (S2) → item 2a.** Wrong rows
+  after a clean restart on any explicit-opclass index (the regress
+  `tenk1` indexes qualify) — placed as item 2a's live member.
+- **Stale TPC-DS measurement data: reload APPROVED, scheduled for a
+  quiescent window.** The owner decision is yes — reload the goopg
+  SF0.25 (`scripts/tpcds-sf025-regression.sh load-goopg`) and SF1
+  (per `bench/tpcds/README.md`) clusters and ANALYZE the PG SF1
+  `store` table. These are cluster-lifecycle actions that take the
+  gate clusters down, so they are owner-window work, not loop work;
+  until they run, TPC-DS divergences on `char`-heavy tables may be
+  data artifacts — treat new findings there accordingly.
+- **M0146-0015b rank conflict: conservative reading confirmed.** A
+  pre-existing (not cutover-caused) cause keeps normal M0146 order
+  even when the task descends from an item-2a member. (Landed
+  regardless; recorded to settle the ambiguity.)
+- **LEFT JOIN ON outer-ref error stays in normal order.** A loud
+  ERROR on valid SQL, not silent wrong results — not S2.
+- **template1 extension re-attribution unblocked:** its recorded
+  blocker (the template1 namespace `[!]`) got Option A GO on 09-25,
+  so the `[!]` is stale — re-opened to `[ ]`.
+- **M0146-0016 id collision fixed:** the census-filed Subquery-Scan
+  task is renumbered M0146-0026 (the landed presorted-split task
+  keeps 0016 — its design doc, analysis dir and ledger already cite
+  it). A task-id uniqueness rule is added to
+  `scripts/ralph-lineage-guard.py` (Rule E).
+- **Nightly tpch `skip(port-busy)` — diagnosed, owner scheduling call
+  deferred:** the stage needs :65433 free for a snapshot-copy window,
+  but `ref-clusters-ensure` keeps it up for loop gates. Interim: the
+  skip is accepted (loop spotcheck + acceptance arm cover the value
+  floor); a real fix wants an owner scheduling decision (nightly
+  quiesces the bench cluster vs. accepts no nightly TPC-H lane).
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -3168,10 +3197,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       is the prerequisite for scoping them together later. That scoping is the
       same M0122-0007 family as the template1 collision escalation.
 
-- [!] **a template1 extension re-attributes to "postgres" on restart**
-  (M0119-0006 bs residual). **BLOCKED 2026-09-22 on the `[!]` template1
-  namespace collision — it is a CONSEQUENCE of that collision, and the
-  2026-09-22 entry claiming otherwise is corrected below.**
+- [ ] **a template1 extension re-attributes to "postgres" on restart**
+  (M0119-0006 bs residual). **UNBLOCKED 2026-09-27 — the recorded blocker
+  (the `[!]` template1 namespace collision) got Option A GO on
+  2026-09-25, so the `[!]` here was stale; re-opened.** It is a
+  CONSEQUENCE of that collision, and the 2026-09-22 entry claiming
+  otherwise is corrected below.
   Kind: bug
   Parent: M0119-0006
   Movement: none
@@ -20671,7 +20702,7 @@ M0146-0001 re-baseline census on the new default arm.
       6. M0146\-0007 `inline\_cte` — 15
       7. M0146\-0009 statistics \(hash vs sort grouping\) — 9
       8. M0146\-0011 lateral / parameterised — 5
-      9. new, unowned until now: M0146\-0016 Subquery Scan retention 6,
+      9. new, unowned until now: M0146\-0026 Subquery Scan retention 6,
          M0146\-0017 WindowAgg sort sharing 4, M0146\-0018 Group node 4,
          M0146\-0019 index\-only scan inner 3, M0146\-0020 MixedAggregate 3.
       The 6 `error` records are Q36/Q70/Q86 on both arms \(dsqgen
@@ -21113,6 +21144,9 @@ M0146-0001 re-baseline census on the new default arm.
   > `tenk1` indexes are\) silently returns wrong rows once the server
   > restarts. Filed and not selected ahead of the banner, per S2; the owner
   > decides its placement.
+  >
+  > **OWNER ANSWER 2026\-09\-27 \(delegated\):** placed at banner item 2a —
+  > the drained batch's slot; it is the only live member until it lands.
 
 - [ ] **An outer reference in a LEFT JOIN ON clause errors `column … does
   not exist`** \(found 2026\-09\-25 by M0146\-0015a; reproduces at HEAD\):
@@ -21122,6 +21156,8 @@ M0146-0001 re-baseline census on the new default arm.
   "hundred" does not exist`; PG returns 2.
   Kind: bug
   Parent: none
+  - Direction \(owner 2026\-09\-27, delegated\): a loud ERROR on valid SQL,
+    not silent wrong results — normal order, not item 2a.
   - First step: find which resolver scope the ON clause of a join inside a
     correlated subquery binds against; the outer\-level fallback appears to
     skip the parent scope for ON quals.
@@ -21150,7 +21186,10 @@ M0146-0001 re-baseline census on the new default arm.
   - **Rank:** per M0146\-0015\'s placement, a pre\-existing cause keeps
     normal M0146 order; being a descendant of an item\-2a task would place it
     in 2a. The two readings conflict, and the loop takes the conservative
-    one \(normal M0146 order\) until the owner rules.
+    one \(normal M0146 order\) until the owner rules. **OWNER ANSWER
+    2026\-09\-27 \(delegated\): the conservative reading stands** — a
+    pre\-existing \(not cutover\-caused\) cause keeps normal M0146 order
+    even under an item\-2a member. Landed under that reading.
   - **RECON DONE 2026\-09\-26** \(HEAD `12143918a`, post\-0015c\). Design doc
     `docs/design/0100\-0149/m0146\-0015b\-nested\-sublink\-larg\-pull.md`;
     evidence `analysis/m0146/m0146\-0015b/` \(census lines, canonical and
@@ -22240,6 +22279,15 @@ M0146-0001 re-baseline census on the new default arm.
   > cluster lifecycle action, so the loop has not done it; the owner decides
   > when, and whether the TPC\-H reference goopg cluster needs the same
   > check.
+  >
+  > **OWNER ANSWER 2026\-09\-27 \(delegated\): GO — approved, scheduled for
+  > a quiescent window.** Reload goopg SF0\.25
+  > \(`scripts/tpcds\-sf025\-regression.sh load\-goopg`\), reload SF1 per
+  > `bench/tpcds/README.md`, and ANALYZE the PG SF1 reference `store`
+  > table; the TPC\-H cluster already pads \(M0146\-0005e\), so no action
+  > there. Cluster lifecycle stays owner\-window work — not loop work —
+  > because it takes gate clusters down; until it runs, TPC\-DS
+  > divergences on `char`\-heavy tables may be data artifacts.
 - [ ] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
   it cannot see** \(filed 2026\-09\-25 by M0146\-0005c\): in `spillFixture`,
   rows written with `writeHeapRow`, and even rows loaded with `INSERT …
@@ -22517,7 +22565,7 @@ M0146-0001 re-baseline census on the new default arm.
   a sublink before a cheap qual.
   Kind: impl
   Parent: none
-- [ ] **M0146\-0016 — keep a Subquery Scan whose qual cannot be pushed
+- [ ] **M0146\-0026 — keep a Subquery Scan whose qual cannot be pushed
   down, as PG does** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q39,
   Q53, Q89 \(both scales\): PG keeps `Subquery Scan on foo/tmp1` above a
   window or aggregate output with the outer qual on it; goopg flattens it

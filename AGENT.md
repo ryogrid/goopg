@@ -528,9 +528,11 @@ issue no `SET` at all and verify `work_mem=512MB` /
 loudly on drift; `cmd/estimate-audit` verifies `work_mem` the same way at
 session open. This supersedes the former `SET work_mem='64MB'` session
 pins; the conf line is the single alignment mechanism. `goopg init` writes
-the convention automatically via `internal/utils/misc/postgresql.conf.sample`;
-`bench/tpch/setup_{goopg,pg}.sh` and the TPC-DS cluster confs carry it too,
-and `bench/tpcds/server.sh` plus `scripts/lib/ref-clusters.sh` warn when a
+`work_mem` commented out (PG's commented-default style — the sample shows
+goopg's BootVal, PG-faithful since the 2026-09-26 cold-start fix); the 512MB
+convention lives in the bench runtime confs — `bench/tpch/setup_{goopg,pg}.sh`
+and the TPC-DS cluster confs carry it, and `bench/tpcds/server.sh` plus
+`scripts/lib/ref-clusters.sh` warn when a
 conf leaves `work_mem` implicit. Deliberate non-canonical arms may still SET
 these GUCs as their measured variable (e.g. `estimate-audit -serial`,
 `goopg-margin-census.py`'s forcing arms) — what is prohibited is silently
