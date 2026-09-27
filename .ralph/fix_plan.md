@@ -23011,7 +23011,7 @@ M0146-0001 re-baseline census on the new default arm.
   first; each fix is its own gated change.
   Kind: impl
   Parent: none
-- [ ] **M0146\-0009a — the `customer\_demographics \+ date\_dim \+ item \+
+- [x] **M0146\-0009a — the `customer\_demographics \+ date\_dim \+ item \+
   store\_sales` join is estimated at 47 rows against an actual 1944 \(TPC\-DS
   Q7 / Q27\)** \(filed 2026\-09\-25 by M0146\-0005 slice 2 as the owning task
   of its NEW EA\-RATCHET finding\). The same key was a ratchet finding under
@@ -23026,6 +23026,52 @@ M0146-0001 re-baseline census on the new default arm.
     collapses.
   - Expected movement: EA\-RATCHET finding Q7:customer\_demographics\+date\_dim\+item\+store\_sales
     cleared \(`make ea\-ratchet` findings 51 → 50\).
+  - Done 2026\-09\-28 \(recon complete, `docs/design/0100\-0149/
+    m0146\-0009a\-bpchar\-mcv\-eqsel\-miss\.md`, evidence under
+    `analysis/m0146/m0146\-0009a/`): root cause is a BASE\-REL MCV probe
+    miss, not the join estimator — `cd\_education\_status` is `char(20)`,
+    ANALYZE stamps `MCV.Value` blank\-padded \(`"College             "`\)
+    while `formatExprConstant` renders the literal unpadded, so the
+    byte\-equal compare at `eqSelectivityForColumn`
+    \(selectivity\.go:385\) misses and the MCV\-complete column falls to
+    DEFAULT\_EQ\_SEL \(0\.005 vs measured 0\.1418 — 28\.4x\)\.
+  - Cascade is arithmetic\-exact: cd\.Rows 980 \(PG 28\,038, actual 27\,440\)
+    → \{cd\+ss\} 351 vs PG \~10\,046 → \{cd\+dd\+ss\} 2 → \{cd\+dd\+item\+ss\}
+    2; every join sel above it is PG\-faithful on the same inputs.
+    Q27 shares the mechanism \(`='Secondary'`, same column; Gather Merge
+    rows=2 vs actual 1\,957\). Both engines pick the IDENTICAL Q7 shape —
+    pure estimator artifact.
+  - Fix filed as M0146\-0009b. PG oracle used: `:65438` db `tpcds025`
+    user `ryo` \(the `postgres` role does not exist there\).
+- [ ] **M0146\-0009b — `bpchar(n)` constants never hit the MCV list**
+  \(impl, filed by M0146\-0009a 2026\-09\-28\). `eqSelectivityForColumn`
+  \(`internal/optimizer/selectivity\.go:376`\) byte\-compares
+  `formatExprConstant(literal)` against `MCV.Value`; for `char(N>1)`
+  columns ANALYZE stores the blank\-padded datum form and the unpadded
+  literal always misses \→ `remainingDistinct <= 0` on MCV\-complete
+  columns \→ DEFAULT\_EQ\_SEL. PG coerces the const to `bpchar(N)` before
+  `eqsel` \(`var_eq_const`, selfuncs\.c\) so the datums match.
+  Fix: bpchar\-aware normalization at the literal\-vs\-MCV probe \— pad the
+  literal to the column width or strip trailing blanks on both sides
+  \(decide at impl; PG\'s bpchar eq ignores trailing blanks\). The column
+  type is available at the call sites but is currently dropped before
+  `eqSelectivityForColumn` — thread it through. Sibling compare sites that
+  must move together: selectivity\.go:221 \(IN\-list element probe\), :370
+  \(scan arm\), :1184 \(`selectivityEstimate`\), and audit `histCmp`
+  \(:643, range\-op ordering against padded MCV/histogram entries\) plus
+  the MCV\-vs\-MCV pairing at cardinality\.go:1224/:2169 \(consistent
+  same\-type today; cross\-type bpchar\-vs\-text would miss\). Regression
+  witness for the fix itself: `cd\_education\_status = 'College'` est
+  9\,604 → \~272k.
+  Kind: impl
+  Parent: M0146-0009a
+  - Expected movement: EA\-RATCHET `Q7:customer\_demographics\+date\_dim\+item\+store\_sales`
+    cleared; likely also `Q27` \(same column, `='Secondary'`\). Wider
+    blast radius: every `char(N>1)` equality corpus\-wide \(TPC\-DS
+    `i_*_id` char\(16\), promotion/customer char cols\) — measure the full
+    `make ea\-ratchet` sweep, not just Q7.
+  - Gates: optimizer unit tests; tpch\-spotcheck; SF0\.25 sweep; EA
+    ratchet.
 - [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
   the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
   §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;
