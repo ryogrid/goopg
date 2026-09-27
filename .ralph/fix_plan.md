@@ -21352,23 +21352,66 @@ M0146-0001 re-baseline census on the new default arm.
   Movement: none — correctness bug fix outside the parity instruments'
     reach.
 
-- [ ] **A non\-LATERAL derived table inside a correlated subquery cannot see
-  outer\-scope columns** \(found 2026\-09\-27 by M0146\-0015g\):
-  `select \(select count\(\*\) from \(select x.u1 from tk x where x.h =
-  a.h\) s\) from tk a` → `ERROR: column "h" does not exist`; PG resolves the
-  grandparent scope fine. `planSubqueryRangeVar` \(planner.go:~5717\) calls
-  `planSelectWithParent\(subq, cat, nil, …\)` whenever `lateralCtx == nil`
-  — the first FROM item and every non\-LATERAL join right side — so nothing
-  inside the derived table \(WHERE, ON, targets\) reaches the enclosing
-  query's scope. When `lateralCtx != nil` the chain IS wired
-  \(`latCtxWithCat.parent = planParent`, ~5756\); the nil arm needs the same
-  parent so the derived body's level\-1 refs land on the subquery's outer.
+- [x] **M0146\-0015h — a non\-LATERAL derived table inside a correlated
+  subquery cannot see outer\-scope columns** \(found 2026\-09\-27 by
+  M0146\-0015g\): `select \(select count\(\*\) from \(select x.u1 from tk x
+  where x.h = a.h\) s\) from tk a` → `ERROR: column "h" does not exist`;
+  PG resolves the grandparent scope fine. `planSubqueryRangeVar`
+  \(planner.go:~5717\) called `planSelectWithParent\(subq, cat, nil, …\)`
+  whenever `lateralCtx == nil` — the first FROM item and every
+  non\-LATERAL join right side — so nothing inside the derived table
+  \(WHERE, ON, targets\) reached the enclosing query's scope.
   Kind: bug
   Parent: none
-  - First step: stamp `planParent` onto the ctx the nil arm plans under
-    \(or pass a parent\-only ctx\); verify a ref to the subquery's OWN FROM
-    siblings still errors \(non\-LATERAL must not see them\), and that the
-    executor's OuterRows addressing stays consistent.
+  - Root cause: PG links the parent ParseState for every
+    subquery\-in\-FROM regardless of `rte->lateral` — LATERAL controls
+    same\-level sibling visibility only. goopg conflated the two: the nil
+    arm had no parent at all.
+  - **DONE 2026\-09\-27.** Design:
+    `docs/design/0100\-0149/m0146\-0015h\-derived\-table\-outer\-scope.md`;
+    evidence `analysis/m0146/m0146\-0015h/`. Three points:
+    \(1\) nil arm passes `planParent` → outer refs resolve at level 1
+    \(the subplan\-boundary push; no openLateral hop on that arm\);
+    \(2\) `planFromItem` replaces `joinLateralCtx = nil` for
+    non\-LATERAL subquery right sides with a binding\-free
+    `&resolveContext\{parent: planParent\}` — the marker costs one level
+    hop, matching the left\-row push `openLateral` performs once
+    `Join.Lateral` flips on the resolved OuterColumnRef, and keeps
+    siblings invisible; \(3\) `planValuesSubquery`'s nil arm parents to
+    `planParent` identically.
+  - Verified live vs PG 18\.3 \(:5533/:5534\): filed shape \(10/row\),
+    first\-item VALUES \(1/row\), non\-lateral JOIN right side ref'ing
+    outer \(1000/row — level\-2 addressing\), sibling ref still errors on
+    both engines, LATERAL unchanged, EXISTS/target\-list/LIMIT/
+    unqualified all match. Regression:
+    `internal/executor/derived_table_outer_ref_test.go`.
+  - Sibling found \(filed below\): a non\-LATERAL comma\-item derived
+    table \(2nd\+ FROM entry, `lateralCtx != nil` arm\) still sees
+    same\-level siblings — `from tk o, \(select … where x.h = o.h\) s`
+    returns rows where PG errors 42P01.
+  Movement: none — correctness bug fix outside the parity instruments'
+    reach.
+
+- [ ] **A non\-LATERAL comma\-item derived table sees same\-level FROM
+  siblings \(PG rejects\)** \(found 2026\-09\-27 by M0146\-0015h\):
+  `select count\(\*\) from tk o, \(select x.u1 from tk x where x.h =
+  o.h\) s` → goopg `1000`; PG `invalid reference to FROM\-clause entry
+  for table "o"` \(42P01\). `planFromClause` builds `lateralCtx` whenever
+  `len\(bindings\) > 0` \(planner.go:3894\) — for SRF/tablefunc args —
+  and `planSubqueryRangeVar`'s `lateralCtx != nil` arm then exposes the
+  sibling bindings inside non\-LATERAL subqueries too. Permissive
+  acceptance: silently computes lateral semantics for a query PG
+  rejects.
+  Kind: bug
+  Parent: none
+  - First step: for `!rv.Lateral` subquery items reached with
+    `lateralCtx != nil`, substitute the same binding\-free marker
+    `&resolveContext\{parent: planParent\}` M0146\-0015h added for join
+    right sides \(level bookkeeping identical: the comma Join still
+    flips Lateral on the OuterColumnRef and openLateral pushes\); watch
+    `planValuesSubquery`'s `n.\*` star expansion which reads
+    `lateralCtx.bindings` — non\-LATERAL `VALUES \(o.\*\)` must error
+    too, matching PG.
 
 - [ ] **`coalesce\(d.c, e.c\) IS NOT NULL` demotes a FULL JOIN to inner**
   \(found 2026\-09\-27 by M0146\-0015g; reproduces at HEAD on any
