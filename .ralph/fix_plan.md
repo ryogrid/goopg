@@ -21315,19 +21315,78 @@ M0146-0001 re-baseline census on the new default arm.
   > **OWNER ANSWER 2026\-09\-27 \(delegated\):** placed at banner item 2a —
   > the drained batch's slot; it is the only live member until it lands.
 
-- [ ] **An outer reference in a LEFT JOIN ON clause errors `column … does
-  not exist`** \(found 2026\-09\-25 by M0146\-0015a; reproduces at HEAD\):
-  `select sum\(\(select count\(e.unique1\) from tenk1 d left join tenk1 e on
-  e.unique1 = d.unique2 and e.hundred = a.hundred where d.thousand =
-  a.thousand\)\) from tenk1 a where a.unique1 < 20` → `ERROR: column
-  "hundred" does not exist`; PG returns 2.
+- [x] **M0146\-0015g — an outer reference in a LEFT JOIN ON clause errors
+  `column … does not exist`** \(found 2026\-09\-25 by M0146\-0015a;
+  reproduced at HEAD\): `select sum\(\(select count\(e.unique1\) from tenk1 d
+  left join tenk1 e on e.unique1 = d.unique2 and e.hundred = a.hundred where
+  d.thousand = a.thousand\)\) from tenk1 a where a.unique1 < 20` → `ERROR:
+  column "hundred" does not exist`; PG returns 2.
   Kind: bug
   Parent: none
   - Direction \(owner 2026\-09\-27, delegated\): a loud ERROR on valid SQL,
     not silent wrong results — normal order, not item 2a.
-  - First step: find which resolver scope the ON clause of a join inside a
-    correlated subquery binds against; the outer\-level fallback appears to
-    skip the parent scope for ON quals.
+  - Root cause: `planFromItem`'s per\-join contexts \(`leftCtx`/`rightCtx`/
+    `mergedCtx`\) never receive a `parent`, and the statement ctx only gets
+    `parent = planParent` AFTER the whole FROM clause returns
+    \(planner.go:1644\) — so `resolveExpr\(join.On, mergedCtx\)` in
+    `planJoinPredicate` had no outer scope to walk while WHERE \(resolved
+    later, on the stamped ctx\) did.
+  - **DONE 2026\-09\-27.** Design:
+    `docs/design/0100\-0149/m0146\-0015g\-join\-on\-outer\-reference.md`;
+    evidence `analysis/m0146/m0146\-0015g/`. Fix: `planJoinPredicate`
+    resolves the ON expr against a copy of `mergedCtx` with
+    `parent = planParent` stamped — a copy so `mergedCtx` itself stays
+    parent\-free and the USING/NATURAL name lookups plus the next
+    iteration's `leftCtx = mergedCtx` keep their local\-only behaviour.
+    `walkColumnRefsImpl` already flags `OuterColumnRef` out\-of\-scope, so
+    the LEFT\-JOIN inner\-only push never misfiles the correlated conjunct,
+    and `shiftColumnRefsBy` does not touch `OuterColumnRef`.
+  - Verified live vs PG 18\.3 on a private pair \(:5533/:5534\): the filed
+    LEFT shape, INNER/RIGHT joins, EXISTS, `IS NOT DISTINCT FROM`, and an
+    unqualified outer ref all return identical rows; the exact regress
+    shape on synthetic tenk1 gives 200 on both. Regression test:
+    `internal/executor/join_on_outer_ref_test.go`.
+  - Siblings found \(filed below\): the non\-LATERAL derived\-table arm of
+    `planSubqueryRangeVar` chains NO parent at all; `coalesce\(…\) IS NOT
+    NULL` over a FULL JOIN's outputs demotes it to inner.
+  Movement: none — correctness bug fix outside the parity instruments'
+    reach.
+
+- [ ] **A non\-LATERAL derived table inside a correlated subquery cannot see
+  outer\-scope columns** \(found 2026\-09\-27 by M0146\-0015g\):
+  `select \(select count\(\*\) from \(select x.u1 from tk x where x.h =
+  a.h\) s\) from tk a` → `ERROR: column "h" does not exist`; PG resolves the
+  grandparent scope fine. `planSubqueryRangeVar` \(planner.go:~5717\) calls
+  `planSelectWithParent\(subq, cat, nil, …\)` whenever `lateralCtx == nil`
+  — the first FROM item and every non\-LATERAL join right side — so nothing
+  inside the derived table \(WHERE, ON, targets\) reaches the enclosing
+  query's scope. When `lateralCtx != nil` the chain IS wired
+  \(`latCtxWithCat.parent = planParent`, ~5756\); the nil arm needs the same
+  parent so the derived body's level\-1 refs land on the subquery's outer.
+  Kind: bug
+  Parent: none
+  - First step: stamp `planParent` onto the ctx the nil arm plans under
+    \(or pass a parent\-only ctx\); verify a ref to the subquery's OWN FROM
+    siblings still errors \(non\-LATERAL must not see them\), and that the
+    executor's OuterRows addressing stays consistent.
+
+- [ ] **`coalesce\(d.c, e.c\) IS NOT NULL` demotes a FULL JOIN to inner**
+  \(found 2026\-09\-27 by M0146\-0015g; reproduces at HEAD on any
+  corpus\): `select count\(\*\) from tk d full join tk e on e.u1 = d.u2 and
+  e.h = 0 where coalesce\(d.u1, e.u1\) is not null` → goopg `Hash Join` /
+  10 rows; PG 18\.3 `Hash Full Join` / 190 rows. The WHERE term is not
+  strict on either input \(a null\-extended row still has the other side's
+  columns\), so PG keeps the full join; goopg's outer\-join reduction
+  \(`reduceOuterJoins` / `collectNonNullable…` in
+  internal/optimizer/reduce\_outer\_joins.go\) reads `IS NOT NULL` over a
+  `coalesce` as null\-rejecting.
+  Kind: bug
+  Parent: none
+  - First step: PG's `find_nonnullable_vars` does not descend COALESCE —
+    check `clause_sides_match`/the IS NOT NULL walker for a FuncExpr arm
+    that treats coalesce's args as strict, and exempt it \(COALESCE is
+    `is_pseudo_constant_for_qual`\-style non\-strict; only `coalesce\(…\)
+    IS NULL` rejects both sides\).
 
   > ## ESCALATION 2026\-09\-25 \(S2\) — cutover regression: correlated subqueries lose index keys
   >
