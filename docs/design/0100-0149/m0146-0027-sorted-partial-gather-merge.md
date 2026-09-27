@@ -360,6 +360,84 @@ arms). Evidence `analysis/m0146/m0146-0027/slice5/`; the M0146-0002
 slice-2 deferral row's mechanism is closed (the row's status flip is
 owner/M0119 bookkeeping — the loop's ledger is append-only).
 
+## Slice 6 (2026-09-28): the ordered-PLAIN arm — Q28's `Aggregate -> Gather Merge -> Sort`
+
+**Residual**: TPC-DS Q28 is six derived-table scalar aggregates of the
+form `avg(ss_list_price), count(distinct ss_list_price), ...` over a
+filtered `store_sales` scan. PG places each aggregate over
+`Gather Merge -> Sort(ss_list_price) -> Parallel Seq Scan` — the
+DISTINCT aggregate's own sort requirement becomes `group_pathkeys`
+via `adjust_group_pathkeys_for_groupagg` (planner.c:3201), which
+`query_pathkeys` then drives through `generate_useful_gather_paths`.
+goopg emitted `Aggregate -> Gather -> Parallel Seq Scan` instead — no
+Sort anywhere, on every aggregate.
+
+**Root cause**: not the serial path. `presortedAggKeysOrAbsent` already
+reconstructed the DISTINCT sort list, and both the standalone and the
+unfiltered derived-table probes produced the Gather Merge spine through
+the slice-1 `gather.merge.sort` arm plus the P7 post-pass. The filtered
+subquery instead selected the no-split PLAIN arm's unsorted
+`Agg -> Gather` — a candidate **upstream never creates** for this shape:
+`GROUPING_CAN_USE_HASH` requires `groupClause != NIL` (planner.c:3848),
+so an ungrouped `count(DISTINCT)` is never hashed, and
+`add_paths_to_grouping_rel` runs every input-rel pathlist entry through
+`make_ordered_path` on the extended `group_pathkeys`
+(planner.c:7134-7160). Every upstream candidate carries the ordering;
+goopg's strictly-cheaper unsorted candidate always won where the input
+was small.
+
+**Change**: in `addPartialAggSplitPath`'s PLAIN (no GROUP BY) arm, when
+`presortedAggKeysOrAbsent` yields keys, the unsorted `Agg -> Gather` is
+suppressed and the two inputs upstream's iteration would have produced
+are filed instead:
+
+- `Agg -> Sort -> Gather` — `make_ordered_path` over the cheapest
+  gather path (leader-side sort), the shape Q16 keeps;
+- `Agg -> Gather Merge -> Sort -> <pseed>` — the worker-side sort,
+  upstream's gather.merge.sort path under the extended query_pathkeys.
+
+Both keep the PLAIN arm's own pricing (`costAgg` hashed at 0 group
+columns / 1 group). The worker-side construction is the new shared
+helper `workerSortGatherMergePath` — the R56 group-keys arm and this
+arm differ only in which SortKey list the worker sort runs, so the
+R56 arm was re-pointed at the helper too (sortPathForBounded +
+ParallelWorkers + perWorkerRows×d crossing + gatherMergeCost +
+subpath-pathkey copy + disabled-node accounting).
+
+`AggStrategyHashed` on an ordered-input candidate is upstream-faithful:
+upstream still builds a `PLAIN` AggPath for these candidates — the
+input ordering is a property of the child, not the strategy — and the
+executor's `distinctSlotStates` sorts/dedups internally regardless.
+
+**Tests**: `TestUpperSplitPlainOrderedAggFilesSortedArms` (pathlist
+contains no unordered `Agg` input; the `Gather Merge -> Sort` arm is
+present with the presorted pathkey and correct worker count — the
+leader-sort sibling is filed but legitimately evicted by `add_path`
+when the worker-sort dominates on identical pathkeys, same as
+upstream), `TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm`
+(GOOPG_PARTIAL_AGG_PATHS=off keeps the plain Gather), and
+`TestUpperSplitPlainOrderedAggLowers` (plan lowering on the
+GatherMerge input).
+
+**Result**: Q28 is a full plan MATCH against PG 18.3 at **both** SF0.25
+and SF1 — all six aggregates emit `Aggregate -> Gather Merge ->
+Sort(ss_list_price) -> Parallel Seq Scan`; 1 row, checksum
+`58f05f6812160030` oracle-exact. The first-divergence record
+`PG Gather Merge | goopg Gather under Aggregate` is gone. Side effect:
+Q16's aggregate gained the leader-side `Sort(cs_order_number) -> Gather`
+input PG has — its record shrank to
+`[join-order,scan-type,parallelism]` from
+`[join-order,join-method,scan-type,sort-strategy,parallelism,
+qual-placement]` at both scale factors (the remaining deltas are the
+pre-existing call_center placement / join spine, MISSING-NODE class —
+different subsystem). SF0.25 census baseline->candidate: match 11->12,
+divergent 88->87, parallelism 53->52, sort-strategy 58->56; SF1: match
+13->14, divergent 86->85, parallelism 58->57. Gates: spotcheck PASS
+(Q12=2 Q13=33), sweep PASS=96 / 0 mismatches (plans changed Q16/Q28 —
+both toward PG), acceptance arm 24 MATCH, fireset PASS (fires Q16/Q28
+execute on both arms at both scales, no new timeouts), units pass.
+Evidence `analysis/m0146/m0146-0027/slice6/`.
+
 ## Open
 
 - **Placement residue**: goopg elects a 6-rel partial chain where PG

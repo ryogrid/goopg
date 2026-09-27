@@ -1,0 +1,45 @@
+M0146-0027 slice 6 — ordered-PLAIN parallel arm (worker-side Sort +
+Gather Merge) for ungrouped ordered/distinct aggregates; Q28's
+`PG Gather Merge | goopg Gather` record closed to a full MATCH.
+2026-09-28, private SF0.25 clone :5590 (probe) + standard gates.
+
+Gate stamps (all PASS on the staged index; see tmp/gate-stamps/*.json):
+
+- tpch-spotcheck        PASS  (Q12 rows=2, Q13 rows=33)
+- tpcds-sf025 sweep     PASS  PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+                              TIMEOUT=0 SKIP=3
+                              plans vs pre-slice sweep: changed=2
+                              (Q16 — leader-side Sort(cs_order_number)
+                              now under the Aggregate, matching PG's
+                              agg-input spine; Q28 — all six scalar
+                              aggregates now
+                              `Aggregate -> Gather Merge -> Sort ->
+                              Parallel Seq Scan`)
+- tpch-acceptance-arm   PASS  SUMMARY: 24 MATCH / VERDICT: PASS
+                              (baseline tmp/m0145-0008m/arm-on.txt)
+- tpcds-fireset         PASS  SF0.25 fires Q16 Q28, SF1 fires Q16 Q28 —
+                              all execute on baseline and candidate
+                              arms; FIRE-SET-TIMEOUTS: introduced=none
+- RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh — PASS
+- go test ./internal/optimizer ./internal/executor — pass, incl. new:
+    TestUpperSplitPlainOrderedAggFilesSortedArms
+    TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm
+    TestUpperSplitPlainOrderedAggLowers
+
+Census (fireset captures, baseline=HEAD 6e327a8c vs candidate=staged):
+
+  SF0.25: match 11->12, divergent 88->87; categories
+          parallelism 53->52, sort-strategy 58->56, join-order 73->72,
+          join-method 45->44, qual-placement 23->22.
+          Q28: SHAPE-DIFF -> MATCH.  Q16: MISSING-NODE stays but its
+          category set shrank [join-order,join-method,scan-type,
+          sort-strategy,parallelism,qual-placement] -> [join-order,
+          scan-type,parallelism].
+  SF1:    match 13->14, divergent 86->85; categories
+          parallelism 58->57, sort-strategy 53->51, join-order 70->69,
+          qual-placement 20->19.
+          Q28: SHAPE-DIFF -> MATCH.  Q16 same shrink as SF0.25.
+
+Q28 oracle-exact on the new shape: 1 row, ck=58f05f6812160030 (SF0.25
+sweep; matches the pinned oracle). Q16 result unchanged
+(1 row, ck=6e6311159ff5d714, PASS).

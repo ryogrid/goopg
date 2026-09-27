@@ -1,0 +1,53 @@
+===== Q28 =====
+                                                                                                                                           QUERY PLAN                                                                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=54083.24..54083.56 rows=1 width=288)
+   ->  Nested Loop  (cost=54083.24..54083.55 rows=1 width=288)
+         ->  Nested Loop  (cost=45051.62..45051.88 rows=1 width=240)
+               ->  Nested Loop  (cost=36132.29..36132.49 rows=1 width=192)
+                     ->  Nested Loop  (cost=27082.78..27082.93 rows=1 width=144)
+                           ->  Nested Loop  (cost=18156.48..18156.57 rows=1 width=96)
+                                 ->  Aggregate  (cost=9022.32..9022.33 rows=1 width=48)
+                                       ->  Gather Merge  (cost=7925.54..8956.94 rows=8718 width=428)
+                                             Workers Planned: 3
+                                             ->  Sort  (cost=6925.50..6932.53 rows=2812 width=428)
+                                                   Sort Key: store_sales.ss_list_price
+                                                   ->  Parallel Seq Scan on store_sales  (cost=1000.00..6764.39 rows=2812 width=428)
+                                                         Filter: (((ss_quantity >= 0) AND (ss_quantity <= 5)) AND ((((ss_list_price >= 107) AND (ss_list_price <= 117)) OR ((ss_coupon_amt >= 1319) AND (ss_coupon_amt <= 2319))) OR ((ss_wholesale_cost >= 60) AND (ss_wholesale_cost <= 80))))
+                                 ->  Aggregate  (cost=9134.16..9134.17 rows=1 width=48)
+                                       ->  Gather Merge  (cost=7958.76..9064.09 rows=9343 width=428)
+                                             Workers Planned: 3
+                                             ->  Sort  (cost=6958.72..6966.25 rows=3014 width=428)
+                                                   Sort Key: store_sales_1.ss_list_price
+                                                   ->  Parallel Seq Scan on store_sales store_sales_1  (cost=1000.00..6784.55 rows=3014 width=428)
+                                                         Filter: (((ss_quantity >= 6) AND (ss_quantity <= 10)) AND ((((ss_list_price >= 23) AND (ss_list_price <= 33)) OR ((ss_coupon_amt >= 825) AND (ss_coupon_amt <= 1825))) OR ((ss_wholesale_cost >= 43) AND (ss_wholesale_cost <= 63))))
+                           ->  Aggregate  (cost=8926.30..8926.31 rows=1 width=48)
+                                 ->  Gather Merge  (cost=7897.08..8864.95 rows=8181 width=428)
+                                       Workers Planned: 3
+                                       ->  Sort  (cost=6897.04..6903.64 rows=2639 width=428)
+                                             Sort Key: store_sales_2.ss_list_price
+                                             ->  Parallel Seq Scan on store_sales store_sales_2  (cost=1000.00..6747.07 rows=2639 width=428)
+                                                   Filter: (((ss_quantity >= 11) AND (ss_quantity <= 15)) AND ((((ss_list_price >= 74) AND (ss_list_price <= 84)) OR ((ss_coupon_amt >= 4381) AND (ss_coupon_amt <= 5381))) OR ((ss_wholesale_cost >= 57) AND (ss_wholesale_cost <= 77))))
+                     ->  Aggregate  (cost=9049.51..9049.52 rows=1 width=48)
+                           ->  Gather Merge  (cost=7933.61..8982.99 rows=8870 width=428)
+                                 Workers Planned: 3
+                                 ->  Sort  (cost=6933.57..6940.72 rows=2861 width=428)
+                                       Sort Key: store_sales_3.ss_list_price
+                                       ->  Parallel Seq Scan on store_sales store_sales_3  (cost=1000.00..6769.30 rows=2861 width=428)
+                                             Filter: (((ss_quantity >= 16) AND (ss_quantity <= 20)) AND ((((ss_list_price >= 89) AND (ss_list_price <= 99)) OR ((ss_coupon_amt >= 3117) AND (ss_coupon_amt <= 4117))) OR ((ss_wholesale_cost >= 68) AND (ss_wholesale_cost <= 88))))
+               ->  Aggregate  (cost=8919.34..8919.35 rows=1 width=48)
+                     ->  Gather Merge  (cost=7895.02..8858.27 rows=8142 width=428)
+                           Workers Planned: 3
+                           ->  Sort  (cost=6894.98..6901.55 rows=2626 width=428)
+                                 Sort Key: store_sales_4.ss_list_price
+                                 ->  Parallel Seq Scan on store_sales store_sales_4  (cost=1000.00..6745.81 rows=2626 width=428)
+                                       Filter: (((ss_quantity >= 21) AND (ss_quantity <= 25)) AND ((((ss_list_price >= 58) AND (ss_list_price <= 68)) OR ((ss_coupon_amt >= 9402) AND (ss_coupon_amt <= 10402))) OR ((ss_wholesale_cost >= 38) AND (ss_wholesale_cost <= 58))))
+         ->  Aggregate  (cost=9031.61..9031.62 rows=1 width=48)
+               ->  Gather Merge  (cost=7928.30..8965.85 rows=8770 width=428)
+                     Workers Planned: 3
+                     ->  Sort  (cost=6928.26..6935.33 rows=2829 width=428)
+                           Sort Key: store_sales_5.ss_list_price
+                           ->  Parallel Seq Scan on store_sales store_sales_5  (cost=1000.00..6766.07 rows=2829 width=428)
+                                 Filter: (((ss_quantity >= 26) AND (ss_quantity <= 30)) AND ((((ss_list_price >= 64) AND (ss_list_price <= 74)) OR ((ss_coupon_amt >= 5792) AND (ss_coupon_amt <= 6792))) OR ((ss_wholesale_cost >= 73) AND (ss_wholesale_cost <= 93))))
+(48 rows)
+

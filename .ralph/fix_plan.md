@@ -23319,7 +23319,46 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: spotcheck PASS \(Q12=2 Q13=33\), acceptance 24 MATCH,
       fireset PASS \(SF0\.25 fires Q14/Q71/Q76, SF1
       Q5/Q14/Q71/Q75/Q76, both arms\), units pass\.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\); Q71 emits PG's full NL\-over\-ParallelAppend\-\>per\-leg\-PHJ spine and Q76 gains per\-leg PHJs \(slice 5; all\-depth categories join\-method 46\->45, parallelism 54\->53 SF0\.25; first\-divergence record relabels only — Q76 sort\-strategy\->aggregation\-strategy\)
+  - Slice 6 landed 2026\-09\-28 — the ordered\-PLAIN arm: worker\-side
+    Sort \+ Gather Merge under ungrouped ordered/distinct aggregates
+    \(Q28's `PG Gather Merge | goopg Gather under Aggregate` record\)\.
+    Evidence `analysis/m0146/m0146\-0027/slice6/`\.
+    - Root cause was the filed\-candidate set, not cost adjudication:
+      `addPartialAggSplitPath`'s PLAIN arm filed only an unsorted
+      `Agg \-> Gather` — a candidate upstream NEVER creates for
+      ungrouped ordered aggs \(`GROUPING_CAN_USE_HASH` requires
+      `groupClause != NIL`, planner\.c:3848; every input goes through
+      `make_ordered_path` on `group_pathkeys` extended by
+      `adjust_group_pathkeys_for_groupagg`, planner\.c:3201/7134\-7160\)\.
+      `presortedAggKeysOrAbsent` already reconstructed the DISTINCT
+      sort list — it just never reached this arm\.
+    - The arm now files, when presorted keys exist, the two ordered
+      inputs upstream's iteration produces: `Agg \-> Sort \-> Gather`
+      \(leader sort — Q16's shape\) and `Agg \-> Gather Merge \-> Sort
+      \-> <pseed>` \(worker sort — Q28's shape\), both on the PLAIN
+      arm's own `costAgg` pricing\. New shared helper
+      `workerSortGatherMergePath`; the R56 group\-keys arm re\-pointed
+      at it\.
+    - Measured: Q28 SHAPE\-DIFF \-> MATCH at BOTH SF0\.25 and SF1
+      \(1 row ck=`58f05f6812160030` oracle\-exact\)\. Q16 side effect:
+      gained PG's `Sort \-> Gather` agg input, record shrank 6 \-> 3
+      categories \(still MISSING\-NODE on the pre\-existing join
+      spine\)\. SF0\.25 census match 11\->12 divergent 88\->87
+      \(parallelism 53\->52, sort\-strategy 58\-\>56\); SF1 match
+      13\->14 divergent 86\->85\.
+    - Tests: `TestUpperSplitPlainOrderedAgg{FilesSortedArms,
+      GUCOffKeepsUnsortedArm,Lowers}` \(optimizer\)\.
+    - Gates: spotcheck PASS, sweep PASS=96 \(0 mismatch, plans changed
+      Q16/Q28 — both toward PG\), acceptance 24 MATCH, fireset PASS
+      \(fires Q16/Q28 execute on both arms at both scales\), units
+      pass\.
+    - Remaining `parallelism` first\-divergence records \(SF0\.25\):
+      Q17/Q25/Q29 routed to M0142\-0005c cost epsilon; Q10/Q66 are the
+      reverse direction \(goopg gathers where PG stays serial —
+      over\-eager parallel election, costing side not reach\); Q16's
+      parallelism mark rides its join\-spine MISSING\-NODE
+      \(pre\-existing, join\-order subsystem\)\.
+  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\); Q71 emits PG's full NL\-over\-ParallelAppend\-\>per\-leg\-PHJ spine and Q76 gains per\-leg PHJs \(slice 5; all\-depth categories join\-method 46\->45, parallelism 54\->53 SF0\.25; first\-divergence record relabels only — Q76 sort\-strategy\->aggregation\-strategy\); Q28 full MATCH at both scales and Q16's agg\-input spine matches PG's \(slice 6; SF0\.25 match 11\->12 divergent 88\->87, SF1 match 13\->14 divergent 86\->85\)
 
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and

@@ -643,17 +643,71 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// explicit `Sort`, which is exactly the shape the post-pass produces for
 	// Q16 today (Sort above Gather, GroupAggregate above that).
 	if len(aggNode.GroupExprs) == 0 && aggNode.GroupingSets == nil {
-		// PLAIN: one candidate, priced by the hashed arm at 0 group columns
-		// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
-		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-		plainSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
-			Rel: grouped, Rows: 1,
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
-				0, 1, nAggs, inNcols, inAvgVar),
-			Children: []*Path{nsGather},
-		}, partialAggNoSplitProducer)
+		presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
+		if presorted {
+			// M0146-0027 slice 6: ORDERED-AGGREGATE PLAIN
+			// (numOrderedAggs > 0, no groupClause — TPC-DS Q28's six
+			// scalar-aggregate subqueries). Upstream files NO unsorted
+			// candidate for this shape: `GROUPING_CAN_USE_HASH` needs a
+			// group clause (planner.c:3848), and `add_paths_to_grouping_rel`
+			// runs every input_rel pathlist entry through
+			// `make_ordered_path` on group_pathkeys — which
+			// `adjust_group_pathkeys_for_groupagg` extended with the
+			// aggregate's own sort list — so every candidate carries the
+			// ordering (planner.c:7134-7160). The unsorted `Agg -> Gather`
+			// this arm used to file is a candidate PG never creates, and
+			// being strictly cheaper than any sorted one it always won
+			// where the input was small — Q28's `Aggregate -> Gather ->
+			// Parallel Seq Scan` against PG's
+			// `Aggregate -> Gather Merge -> Sort -> Parallel Seq Scan`.
+			//
+			// The two candidates below are the two inputs upstream's
+			// iteration would have handed the aggregate: a leader-side
+			// Sort over the Gather (`make_ordered_path` over the cheapest
+			// gather path) and the worker-side Sort under a Gather Merge
+			// (the `generate_useful_gather_paths` gather.merge.sort path
+			// the extended query_pathkeys files upstream). Both price the
+			// aggregate by the hashed arm at 0 group columns / 1 group —
+			// the PLAIN arm's own pricing, unchanged.
+			sortedGather := sortPathForBounded(nsGather,
+				pathkeysForSortKeys(presortedKeys), cp, -1)
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			sortSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &sortSpec,
+				Rel: grouped, Rows: 1,
+				Cost: costAgg(cp, AggStrategyHashed, inputRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
+					0, 1, nAggs, inNcols, inAvgVar),
+				Pathkeys: sortedGather.Pathkeys, Children: []*Path{sortedGather},
+			}, partialAggNoSplitProducer)
+			workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
+				presortedKeys, cp, workers, d, perWorkerRows)
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			gmSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
+				Rel: grouped, Rows: 1,
+				Cost: costAgg(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
+					0, 1, nAggs, inNcols, inAvgVar),
+				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+			}, partialAggGatherMergeProducer)
+		} else {
+			// PLAIN: one candidate, priced by the hashed arm at 0 group columns
+			// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
+			// With no ordered aggregates (or no usable presorted keys) the
+			// unsorted gathered input is exactly what upstream files —
+			// `make_ordered_path` over empty pathkeys returns the path
+			// unchanged.
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			plainSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
+				Rel: grouped, Rows: 1,
+				Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
+					0, 1, nAggs, inNcols, inAvgVar),
+				Children: []*Path{nsGather},
+			}, partialAggNoSplitProducer)
+		}
 		// R54 Step-0: upper-rel admission record. A nil split is still an
 		// admission — the gathered no-split arms were filed and cost
 		// adjudication downstream decides; only the gates above refuse.
@@ -696,42 +750,14 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// while this arm builds the sort itself — C-19e's
 		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
 		// worker-side construction this mirrors field for field.
-		workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
-		// `sortPathForBounded` prices ParallelSafe but never plans workers;
-		// without this the GatherMerge build below refuses the subpath
-		// (`gatherChildPlan` panics on 0 workers).
-		workerSort.ParallelWorkers = workers
-		// Rows crossing the merge boundary: every input row — a Sort
-		// emits what it reads — i.e. the per-worker count the sort was
-		// priced with (`perWorkerRows`) times the divisor `d`. Spelled
-		// manually rather than via `computeGatherRows`: that helper
-		// re-derives the divisor from the subpath and applies
-		// `clampRowEst`, while here the count must stay exactly the
-		// pricing basis above (float division round-trips:
-		// `perWorkerRows * d` recovers `inputRows` — no integer
-		// truncation, `d` is float64).
-		gmCrossedRows := perWorkerRows * d
-		gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
-		workerGM := &Path{
-			Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
-			// Upstream takes the subpath's own key list ("gather merge
-			// input not sufficiently sorted"); `makeGatherMergePath`
-			// copies it for the same reason.
-			Pathkeys: append([]PathKey(nil), workerSort.Pathkeys...),
-			// Field-for-field with `makeGatherMergePath`: the boundary is
-			// neither partial itself nor usable inside another one.
-			ParallelSafe: false, ParallelWorkers: 0,
-			// `input_disabled_nodes + (enable_gathermerge ? 0 : 1)`
-			// (costsize.c:535).
-			DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
-			Children:      []*Path{workerSort},
-		}
+		workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
+			groupKeysSortKeys(aggNode), cp, workers, d, perWorkerRows)
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		gmSpec := *aggNode
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
 			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, gmCost.Startup, gmCost.Total,
+			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
 			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
 		}, partialAggGatherMergeProducer)
@@ -872,6 +898,50 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 	}
 	addPath(grouped, finalPath, partialGroupMergeProducer)
 	return finalPath
+}
+
+// workerSortGatherMergePath builds the `Gather Merge -> Sort -> <partial>`
+// input the sorted no-split arms share — the R56 group-keys arm and the
+// M0146-0027 slice-6 ordered-PLAIN arm differ only in which SortKey list the
+// worker sort runs. Returns the Gather Merge path and the row count crossing
+// the merge boundary, which the caller needs for its own `costAgg` input.
+//
+// Rows crossing the merge boundary: every input row — a Sort emits what it
+// reads — i.e. the per-worker count the sort was priced with (`perWorkerRows`)
+// times the divisor `d`. Spelled manually rather than via
+// `computeGatherRows`: that helper re-derives the divisor from the subpath and
+// applies `clampRowEst`, while here the count must stay exactly the pricing
+// basis above (float division round-trips: `perWorkerRows * d` recovers
+// `inputRows` — no integer truncation, `d` is float64).
+//
+// The GatherMerge is built MANUALLY rather than through `makeGatherMergePath`:
+// that constructor only wraps an already-sorted subpath
+// (`partialPathDrivingKind` refuses Sort), while this arm builds the sort
+// itself — C-19e's `createPartialSortPaths` pattern (partialsortpaths.go),
+// whose worker-side construction this mirrors field for field.
+func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, d, perWorkerRows float64) (*Path, float64) {
+	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(keys), cp, -1)
+	// `sortPathForBounded` prices ParallelSafe but never plans workers;
+	// without this the GatherMerge build below refuses the subpath
+	// (`gatherChildPlan` panics on 0 workers).
+	workerSort.ParallelWorkers = workers
+	gmCrossedRows := perWorkerRows * d
+	gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
+	workerGM := &Path{
+		Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
+		// Upstream takes the subpath's own key list ("gather merge
+		// input not sufficiently sorted"); `makeGatherMergePath`
+		// copies it for the same reason.
+		Pathkeys: append([]PathKey(nil), workerSort.Pathkeys...),
+		// Field-for-field with `makeGatherMergePath`: the boundary is
+		// neither partial itself nor usable inside another one.
+		ParallelSafe: false, ParallelWorkers: 0,
+		// `input_disabled_nodes + (enable_gathermerge ? 0 : 1)`
+		// (costsize.c:535).
+		DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{workerSort},
+	}
+	return workerGM, gmCrossedRows
 }
 
 func upperSplitVerdict(split *Path) string {

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // upperSplitSettings is a PlannerSettings that permits the parallel candidate:
@@ -1394,5 +1395,175 @@ func TestStripGatherFoldsTheSortedInputBack(t *testing.T) {
 	}
 	if s, ok := scan.(*SeqScan); ok && s.Parallel {
 		t.Error("the folded scan kept the parallel stamp")
+	}
+}
+
+// ── M0146-0027 slice 6: ordered-aggregate PLAIN over a parallel input ──────
+//
+// TPC-DS Q28's six scalar-aggregate derived tables (`avg(x), count(x),
+// count(distinct x)` with no GROUP BY) are PLAIN aggregates with
+// `numOrderedAggs > 0` upstream. Two facts combine there: `can_hash` needs a
+// group clause (planner.c:3848), and `make_ordered_path` wraps EVERY
+// input_rel pathlist entry in the presorted ordering (planner.c:7134) — so
+// no unsorted `Agg -> Gather` candidate exists at all and PG elects
+// `Aggregate -> Gather Merge -> Sort -> Partial Seq Scan`. goopg used to file
+// the unsorted arm only, which is strictly cheaper than any sorted input, so
+// it always won on the small filtered inputs.
+//
+// The slice files the two ordered-input variants instead: leader-side
+// `Sort -> Gather` and worker-side `Gather Merge -> Sort`.
+
+// sizedPlainOrderedAggFixture is sizedAggFixture's ungrouped counterpart with
+// an ordered aggregate — `avg(v), count(distinct v)` over a bare scan, the
+// Q28 subquery shape. `Distinct` on the call is what makes
+// presortedAggKeysOrAbsent fire; nGroupCols=0 alone does not.
+func sizedPlainOrderedAggFixture(t *testing.T, rows int64) *Aggregate {
+	t.Helper()
+	cat := catalog.NewInMemory()
+	cols := []catalog.Column{
+		{Name: "v", Type: catalog.Type{Name: "int4"}},
+		{Name: "w", Type: catalog.Type{Name: "int4"}},
+	}
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "agg_plain_t"}, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	colStats := make([]catalog.ColumnStats, len(cols))
+	for i := range colStats {
+		colStats[i].NDistinct = 1000
+		colStats[i].NDistinctFrac = 1000.0 / float64(rows)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: rows, Columns: colStats}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "v"}, {Name: "w"}}}
+	return &Aggregate{Child: scan, Aggs: []AggregateCall{
+		{Name: "avg", Arg: &ColumnRef{Index: 0, Name: "v"}},
+		{Name: "count", Arg: &ColumnRef{Index: 0, Name: "v"}, Distinct: true},
+	}}
+}
+
+// aggOver finds a PathAgg whose single child is of the wanted kind.
+func aggOver(rel *RelOptInfo, childKind PathKind) *Path {
+	for _, p := range rel.Pathlist {
+		if p.Kind == PathAgg && len(p.Children) == 1 && p.Children[0].Kind == childKind {
+			return p
+		}
+	}
+	return nil
+}
+
+// TestUpperSplitPlainOrderedAggFilesSortedArms pins the candidate set: the
+// unsorted `Agg -> Gather` is GONE (upstream cannot produce it for a query
+// with ordered aggregates), and both ordered gathered inputs are filed —
+// `Agg -> Sort -> Gather` and `Agg -> Gather Merge -> Sort`.
+func TestUpperSplitPlainOrderedAggFilesSortedArms(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	if len(agg.GroupExprs) != 0 || agg.GroupingSets != nil {
+		t.Fatal("fixture must be a PLAIN aggregate")
+	}
+	keys, presorted := presortedAggKeysOrAbsent(agg, upperSplitSettings())
+	if !presorted || len(keys) == 0 {
+		t.Fatal("fixture's count(DISTINCT) produced no presorted keys — the test is vacuous")
+	}
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+
+	if unsorted := aggOver(grouped, PathGather); unsorted != nil {
+		t.Error("unsorted Agg->Gather filed for an ordered-agg PLAIN: " +
+			"upstream's candidate set is sorted-only (planner.c:3848/7134)")
+	}
+	// The leader-sort variant (`Agg -> Sort -> Gather`) shares the worker-sort
+	// arm's pathkeys, so `add_path` keeps at most the cheaper one — the same
+	// eviction upstream's add_path performs on identical pathkeys
+	// (costsize.c add_path: equal pathkeys, higher total cost is dominated).
+	// What must be true either way: no UNSORTED aggregate survives.
+	for _, p := range grouped.Pathlist {
+		if p.Kind != PathAgg {
+			continue
+		}
+		if len(p.Pathkeys) == 0 {
+			t.Error("an unsorted PathAgg survived: upstream files only ordered inputs for numOrderedAggs>0")
+		}
+	}
+	gmArm := aggOver(grouped, PathGatherMerge)
+	if gmArm == nil {
+		t.Fatal("Agg->GatherMerge->Sort (worker-sort) arm missing")
+	}
+	gm := gmArm.Children[0]
+	if len(gm.Pathkeys) == 0 {
+		t.Error("GatherMerge arm carries no pathkeys: createPlan would panic it into a plain Gather")
+	}
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
+		t.Fatal("GatherMerge arm is not over a worker Sort")
+	}
+	if ws := gm.Children[0]; ws.ParallelWorkers <= 0 {
+		t.Error("worker Sort plans no workers: gatherChildPlan would refuse it as single_copy")
+	}
+	if gmArm.Cost.Total <= 0 || gm.Cost.Total <= 0 {
+		t.Errorf("gathermerge chain priced non-positive: agg=%v gm=%v", gmArm.Cost, gm.Cost)
+	}
+	// The sort key is the DISTINCT argument, not a group key — the fixture
+	// has no GroupExprs, so a non-empty key list can only have come from
+	// presortedAggKeysOrAbsent.
+}
+
+// TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm: with
+// enable_presorted_aggregate off, upstream's group_pathkeys stay empty and
+// `make_ordered_path` returns the gather path unchanged — the unsorted arm
+// IS the upstream candidate then, so it must survive.
+func TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	ps.EnablePresortedAggregate = false
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	grouped, _ := addSplitFor(t, agg, ps)
+
+	if unsorted := aggOver(grouped, PathGather); unsorted == nil {
+		t.Error("unsorted Agg->Gather arm missing under enable_presorted_aggregate=off")
+	}
+	if gmArm := aggOver(grouped, PathGatherMerge); gmArm != nil {
+		t.Error("worker-sort GatherMerge arm filed under enable_presorted_aggregate=off")
+	}
+}
+
+// TestUpperSplitPlainOrderedAggLowers: the winner's node chain is
+// `Aggregate -> GatherMerge -> Sort -> <parallel-stamped scan>` — the same
+// lowering the R56 grouped arm already proves, exercised here for the PLAIN
+// (0-group) spec.
+func TestUpperSplitPlainOrderedAggLowers(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	gmArm := aggOver(grouped, PathGatherMerge)
+	if gmArm == nil {
+		t.Fatal("worker-sort GatherMerge arm missing")
+	}
+	n, _ := createPlanNode(gmArm)
+	top, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	gm, ok := top.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("agg child is %T, want *GatherMerge", top.Child)
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("merge child is %T, want *Sort", gm.Child)
+	}
+	if len(srt.Keys) != 1 {
+		t.Fatalf("worker sort has %d keys, want 1 (the DISTINCT arg)", len(srt.Keys))
+	}
+	scan := drivingScan(srt.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
 	}
 }
