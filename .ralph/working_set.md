@@ -4,7 +4,7 @@ Task: M0146-0005x — `subquery_push_qual` aggregate arm +
 tlist-regime-aware `trivial_subqueryscan` (TPC-DS Q34/Q73 witnesses,
 filed by the slice-24 closeout).
 
-LANDED + PUSHED: `<commit>` on plan-parity-with-pg-take2-ralph2; all gates
+LANDED + PUSHED: `96ad5efd3` on plan-parity-with-pg-take2-ralph2; all gates
 PASS-stamped against the staged index (units 44 pkgs, tpch-spotcheck
 Q12=2/Q13=33, sf025 sweep 96 PASS/0 err, acceptance arm 24/24 MATCH,
 fireset `introduced=none` both scales, fires={Q2 Q21 Q34 Q38 Q39 Q44
