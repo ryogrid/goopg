@@ -1,0 +1,32 @@
+--- select count(*) from tk o, (select x.u1 from tk x where x.h = o.h) s
+ERROR:  invalid reference to FROM-clause entry for table "o"
+LINE 1: ...ount(*) from tk o, (select x.u1 from tk x where x.h = o.h) s
+                                                                 ^
+DETAIL:  There is an entry for table "o", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
+--- select count(*) from tk o, lateral (select x.u1 from tk x where x.h = o.h) s
+  1000
+
+--- select count(*) from tk o, (values (o.h)) v
+ERROR:  invalid reference to FROM-clause entry for table "o"
+LINE 1: select count(*) from tk o, (values (o.h)) v
+                                            ^
+DETAIL:  There is an entry for table "o", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
+--- select count(*) from tk o, (values (o.*)) v
+ERROR:  invalid reference to FROM-clause entry for table "o"
+LINE 1: select count(*) from tk o, (values (o.*)) v
+                                            ^
+DETAIL:  There is an entry for table "o", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
+--- select a.u1, (select count(*) from tk o, (select x.u1 from tk x where x.h = a.h) s) from tk a where a.u1 < 3 order by a.u1
+  0 |  1000
+  1 |  1000
+  2 |  1000
+
+--- select (select count(*) from tk o, (select x.u1 from tk x where x.h = o.h) s) from tk z limit 1
+ERROR:  invalid reference to FROM-clause entry for table "o"
+LINE 1: ...(*) from tk o, (select x.u1 from tk x where x.h = o.h) s) fr...
+                                                             ^
+DETAIL:  There is an entry for table "o", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.

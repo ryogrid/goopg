@@ -5728,6 +5728,31 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 // Never parent.settings / lateralCtx.settings — see
 // planSelectWithParent's wrong-scope note.
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
+	// M0146-0015i: PG limits sibling FROM-item visibility to explicitly
+	// LATERAL items (and implicitly-lateral table functions); a non-LATERAL
+	// derived table or VALUES reached past earlier comma items gets a
+	// sibling-bearing lateralCtx anyway because the FROM planner builds it
+	// unconditionally for SRF/table-function arguments. Strip the bindings
+	// here so sibling names stop resolving (42P01, matching PG), while the
+	// context still costs one outer level — a comma-item join flips
+	// Join.Lateral on a resolved OuterColumnRef and openLateral pushes the
+	// left row, so the single parent hop keeps OuterColumnRef.Level
+	// consistent with the executor's OuterRows stack. For a join right side
+	// the incoming ctx is already the binding-free marker M0146-0015h
+	// built, so the strip is a no-op there.
+	if !rv.Lateral && lateralCtx != nil {
+		stripped := *lateralCtx
+		stripped.bindings = nil
+		stripped.schema = nil
+		stripped.table = nil
+		stripped.alias = ""
+		stripped.lateralSibling = false
+		stripped.joinlist = nil
+		if stripped.parent == nil {
+			stripped.parent = planParent
+		}
+		lateralCtx = &stripped
+	}
 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
 	// M0097-0003. Pass lateralCtx so qualified star (n.*) can be expanded. M0097-0020.
 	if len(rv.Subquery.ValuesRows) > 0 {
