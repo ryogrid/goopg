@@ -1,0 +1,22 @@
+=== goopg :5533 ===
+psql:/tmp/sibling-probe.sql:2: ERROR:  column "h" does not exist
+LINE 1: ... count(*) from (select x.u1 from tk x where x.h = a.h) s) fr...
+                                                             ^
+ count 
+-------
+    10
+(1 row)
+
+=== pg18 :5534 ===
+ u1 | count 
+----+-------
+  0 |    10
+  1 |    10
+  2 |    10
+(3 rows)
+
+ count 
+-------
+   190
+(1 row)
+

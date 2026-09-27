@@ -7687,7 +7687,22 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		// route than WHERE (planJoinPredicate -> chainOnQual ->
 		// joinsearchseam), so they must be folded here too or the round is
 		// WHERE-only (K86).
-		onPred, onErr := resolveExpr(join.On, mergedCtx)
+		//
+		// Outer references in an ON clause (`e.hundred = a.hundred` inside a
+		// correlated subquery) resolve one level up, exactly as WHERE-clause
+		// outer references do — PG's parse_expr walks the parent ParseState
+		// chain from every jointree level (parse_relation.c's p_parentParseState
+		// hand-off). planFromItem builds mergedCtx as a sibling of the
+		// statement ctx, which only receives `parent = planParent` after the
+		// whole FROM clause returns, so ON resolution saw no parent and the
+		// ref died 42703 "column does not exist" (regress subselect shape:
+		// `... left join e on ... and e.hundred = a.hundred`). Stamp the
+		// parent on a copy: mergedCtx itself stays parent-free so the
+		// USING/NATURAL name lookups below and the next iteration's
+		// `leftCtx = mergedCtx` keep their local-only behaviour.
+		onCtx := *mergedCtx
+		onCtx.parent = planParent
+		onPred, onErr := resolveExpr(join.On, &onCtx)
 		if onErr != nil {
 			return nil, onErr
 		}
