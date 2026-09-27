@@ -142,7 +142,14 @@ type subPlanHash struct {
 // mistrusted IsNonCorrelated flag (see subq_cache.go).
 const subPlanHashKeySuffix = "\x00hash"
 
-func buildSubPlanHash(values []Datum) *subPlanHash {
+// buildSubPlanHash keys the materialised inner values. When trimKeys is
+// set the inner column is bpchar-typed and every key is built on the
+// datum's bcTruelen image — the same normalisation the scalar
+// comparisonOperandsAsBpchar rule applies, so a probe datum pre-trimmed
+// the same way can only miss when PG's comparison genuinely would.
+// Without it a stored 'Javier   ' and a probed 'Javier' (or vice versa)
+// hash to different keys and the probe silently reports NOT IN.
+func buildSubPlanHash(values []Datum, trimKeys bool) *subPlanHash {
 	h := &subPlanHash{set: make(map[string]struct{}, len(values))}
 	fam := hashFamNone
 	for _, v := range values {
@@ -156,6 +163,9 @@ func buildSubPlanHash(values []Datum) *subPlanHash {
 			return &subPlanHash{family: hashFamNone}
 		}
 		fam = f
+		if trimKeys {
+			v = trimStringDatum(v)
+		}
 		h.set[datumKey(v)] = struct{}{}
 	}
 	if fam == hashFamNone {
@@ -201,6 +211,17 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 	if opFam == hashFamNone {
 		return Datum{}, false
 	}
+	// bpchar semantics for the probe (M0146): the same rule
+	// comparisonOperandsAsBpchar applies per element on the linear path,
+	// resolved once here because every inner value shares the plan's first
+	// output column type. The operand trims when it is bpchar-typed, or is
+	// an untyped literal that PG would coerce to the inner bpchar column;
+	// the set keys trim when the inner column is bpchar. Both are pure
+	// functions of the sublink's types, so a hash cached under this
+	// normalisation stays correct for every outer row.
+	inBP := len(x.Plan.Output()) > 0 && bpcharCatalogType(x.Plan.Output()[0].Type)
+	opBP := declaredBpcharTypmod(x.Operand) > 0
+	opTrim := opBP || (isBareStringLit(x.Operand) && inBP)
 	key := nonCorrelatedCacheKey(x) + subPlanHashKeySuffix
 	// The hash lives in the SCOPED store alongside the constant-key
 	// value slice it is derived from (see collectInValues: uncorrelated
@@ -221,7 +242,7 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 		if !subPlanResultCacheable(ctx, x, x.Plan, false) {
 			h = &subPlanHash{family: hashFamNone}
 		} else {
-			h = buildSubPlanHash(values)
+			h = buildSubPlanHash(values, inBP)
 		}
 		store.Put(key, h, subPlanHashSize(key, h))
 		// A failed Put (budget pressure) just means the next row
@@ -229,6 +250,9 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 	}
 	if h.family == hashFamNone || h.family != opFam {
 		return Datum{}, false
+	}
+	if opTrim {
+		operand = trimStringDatum(operand)
 	}
 	if _, hit := h.set[datumKey(operand)]; hit {
 		return NewBoolDatum(!x.Negated), true
@@ -266,9 +290,14 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 // inner) — without it every outer row would pay a rebuild before falling
 // back to the linear path.
 type subPlanRowHash struct {
-	set      map[string]struct{}
-	fams     []subPlanHashFamily // per column, only over fully non-NULL rows
-	width    int
+	set   map[string]struct{}
+	fams  []subPlanHashFamily // per column, only over fully non-NULL rows
+	width int
+	// trims[i] marks a bpchar-typed inner column: its key image is the
+	// bcTruelen form, so a probe element declared bpchar (or a bare
+	// literal opposite it) is trimmed before hashing — the tuple twin of
+	// the single-column trimKeys path. nil when no column is bpchar.
+	trims    []bool
 	unusable bool
 }
 
@@ -295,8 +324,8 @@ func rowTupleKey(elems []Datum) string {
 // pinned by the first fully non-NULL row that supplies it; a later
 // disagreement, or an unkeyable kind, makes the whole set unhashable — the
 // coercion rules compareEq applies across kinds stay on the linear path.
-func buildSubPlanRowHash(rows [][]Datum, width int) *subPlanRowHash {
-	h := &subPlanRowHash{set: make(map[string]struct{}, len(rows)), width: width}
+func buildSubPlanRowHash(rows [][]Datum, width int, trims []bool) *subPlanRowHash {
+	h := &subPlanRowHash{set: make(map[string]struct{}, len(rows)), width: width, trims: trims}
 	fams := make([]subPlanHashFamily, width)
 	init := false
 	for _, r := range rows {
@@ -321,6 +350,16 @@ func buildSubPlanRowHash(rows [][]Datum, width int) *subPlanRowHash {
 			fams[i] = f
 		}
 		init = true
+		if trims != nil {
+			r2 := make([]Datum, len(r))
+			copy(r2, r)
+			for i := range r2 {
+				if i < len(trims) && trims[i] {
+					r2[i] = trimStringDatum(r2[i])
+				}
+			}
+			r = r2
+		}
 		h.set[rowTupleKey(r)] = struct{}{}
 	}
 	h.fams = fams
@@ -372,7 +411,18 @@ func materializeSubPlanRowHash(x *optimizer.InExpr, width int, ctx *Context) (*s
 		// next op.Next() overwrites).
 		rows = append(rows, append([]Datum(nil), r...))
 	}
-	return buildSubPlanRowHash(rows, width), nil
+	var trims []bool
+	if out := x.Plan.Output(); len(out) == width {
+		for i, c := range out {
+			if bpcharCatalogType(c.Type) {
+				if trims == nil {
+					trims = make([]bool, width)
+				}
+				trims[i] = true
+			}
+		}
+	}
+	return buildSubPlanRowHash(rows, width, trims), nil
 }
 
 // rowHashFor returns the built tuple hash, building and caching it on the
@@ -447,6 +497,16 @@ func evalRowHashProbe(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slot SlotVi
 			// Cross-kind comparison — compareEq's coercions apply; the
 			// linear path computes them exactly.
 			return Datum{}, nil, false
+		}
+	}
+	for i := range elems {
+		// A probe element is trimmed when it is declared bpchar (the
+		// implicit bpchar->text rtrim applies whatever the inner column
+		// type is), or when it is a bare literal opposite a bpchar inner
+		// column — the same two arms comparisonOperandsAsBpchar applies.
+		if declaredBpcharTypmod(rowOp.Elems[i]) > 0 ||
+			(i < len(h.trims) && h.trims[i] && isBareStringLit(rowOp.Elems[i])) {
+			elems[i] = trimStringDatum(elems[i])
 		}
 	}
 	if _, hit := h.set[rowTupleKey(elems)]; hit {

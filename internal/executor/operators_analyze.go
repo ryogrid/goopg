@@ -1293,7 +1293,15 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		}
 		nonNull++
 		totalPayloadWidth += int64(datumVariablePayloadWidth(d))
-		key := datumKey(d)
+		kd := d
+		if bpcharCatalogType(colType) {
+			// n_distinct/MCV bucketing on bpchar runs over the bcTruelen
+			// image — hashbpchar ignores trailing blanks, so unbounded
+			// 'x' and 'x  ' are one value. The stored datum itself keeps
+			// its padding (avg width and the MCV representative).
+			kd = trimStringDatum(kd)
+		}
+		key := datumKey(kd)
 		if b, ok := freq[key]; ok {
 			b.count++
 		} else {

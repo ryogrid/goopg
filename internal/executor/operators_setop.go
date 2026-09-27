@@ -67,6 +67,15 @@ type setOp struct {
 	sorted     bool
 	pendingRow Row
 	pendingN   int
+
+	// lTrims / rTrims mark bpchar columns on each input's rows: dedup keys
+	// (rowKeyTrimmed) must hash the bcTruelen image so a char(20) 'x' from
+	// one arm and a char(5) 'x' from the other are the same row — PG's
+	// set-op dedup runs under the result column's hashbpchar. A column is
+	// trimmed when either the arm's declared type or the set-op output
+	// type is bpchar. M0146 bpchar hash parity.
+	lTrims []bool
+	rTrims []bool
 }
 
 func newSetOp(p *optimizer.SetOp, left, right Operator) *setOp {
@@ -278,11 +287,31 @@ func (o *setOp) nextStreaming() (TupleSlot, error) {
 // computeBuffered drains both children and materialises the output rows for
 // every non-UNION-ALL variant.
 func (o *setOp) computeBuffered() error {
-	leftRows, _, err := drainSetOpInput(o.left)
+	o.lTrims = bpcharSchemaTrims(o.left.Schema())
+	o.rTrims = bpcharSchemaTrims(o.right.Schema())
+	// The result column type decides too: when the resolved output is
+	// bpchar, every arm's column dedups under bpchareq regardless of the
+	// arm's own declared type.
+	if out := bpcharSchemaTrims(o.plan.Output()); out != nil {
+		merge := func(t []bool) []bool {
+			if len(t) < len(out) {
+				nt := make([]bool, len(out))
+				copy(nt, t)
+				t = nt
+			}
+			for i, b := range out {
+				t[i] = t[i] || b
+			}
+			return t
+		}
+		o.lTrims = merge(o.lTrims)
+		o.rTrims = merge(o.rTrims)
+	}
+	leftRows, _, err := drainSetOpInput(o.left, o.lTrims)
 	if err != nil {
 		return err
 	}
-	rightRows, rightCount, err := drainSetOpInput(o.right)
+	rightRows, rightCount, err := drainSetOpInput(o.right, o.rTrims)
 	if err != nil {
 		return err
 	}
@@ -303,7 +332,7 @@ func (o *setOp) computeBuffered() error {
 func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 	seen := make(map[string]struct{})
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -311,7 +340,7 @@ func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 		o.rows = append(o.rows, r)
 	}
 	for _, r := range rightRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.rTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -325,7 +354,7 @@ func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 func (o *setOp) computeIntersect(leftRows []Row, rightCount map[string]int) {
 	emitted := make(map[string]int)
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		rc := rightCount[k]
 		if rc == 0 {
 			continue
@@ -348,7 +377,7 @@ func (o *setOp) computeIntersect(leftRows []Row, rightCount map[string]int) {
 func (o *setOp) computeExcept(leftRows []Row, rightCount map[string]int) {
 	emitted := make(map[string]int)
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		rc := rightCount[k]
 		if o.plan.All {
 			// Each of the first rc left occurrences is cancelled.
@@ -373,7 +402,7 @@ func (o *setOp) computeExcept(leftRows []Row, rightCount map[string]int) {
 
 // drainSetOpInput fully consumes an operator, returning the cloned rows in
 // order plus a multiset count keyed by rowKey.
-func drainSetOpInput(op Operator) ([]Row, map[string]int, error) {
+func drainSetOpInput(op Operator, trims []bool) ([]Row, map[string]int, error) {
 	var rows []Row
 	counts := make(map[string]int)
 	for {
@@ -389,7 +418,7 @@ func drainSetOpInput(op Operator) ([]Row, map[string]int, error) {
 		}
 		owned := cloneRow(slot.Row())
 		rows = append(rows, owned)
-		counts[rowKey(owned)]++
+		counts[rowKeyTrimmed(owned, nil, trims)]++
 	}
 	return rows, counts, nil
 }

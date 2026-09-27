@@ -242,13 +242,22 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		// compiled in here because this is the last point at which the operand
 		// EXPRESSION still exists — evalFastExpr only ever sees Datums, and a
 		// blank-padded bpchar datum is indistinguishable from a text value that
-		// genuinely ends in spaces. Only `||` consumes them
-		// (concatOperandsAsText); storing them unconditionally keeps the build
-		// arm free of an op test. Sibling of the interpreted twin's direct
-		// declaredBpcharTypmod call in expr.go's normalBinaryOp arm — the two
+		// genuinely ends in spaces. `||` and the comparison operators consume
+		// them (concatOperandsAsText / comparisonOperandsAsBpchar); storing
+		// them unconditionally keeps the build arm free of an op test.
+		// payload[16] bits 0/1 flag an untyped string literal on the
+		// left/right — PG's unknown-literal arm of the same rule. Sibling of
+		// the interpreted twin's direct declaredBpcharTypmod /
+		// isBareStringLit calls in expr.go's normalBinaryOp arm — the two
 		// MUST agree, which is why they share one helper.
 		binary.LittleEndian.PutUint32((*s)[idx].payload[8:], uint32(declaredBpcharTypmod(t.Left)))
 		binary.LittleEndian.PutUint32((*s)[idx].payload[12:], uint32(declaredBpcharTypmod(t.Right)))
+		if isBareStringLit(t.Left) {
+			(*s)[idx].payload[16] |= 1
+		}
+		if isBareStringLit(t.Right) {
+			(*s)[idx].payload[16] |= 2
+		}
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -444,9 +453,11 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				return res, nil
 			}
 		}
-		left, right = concatOperandsAsText(op, left, right,
-			int64(binary.LittleEndian.Uint32(n.payload[8:])),
-			int64(binary.LittleEndian.Uint32(n.payload[12:])))
+		lbp := int64(binary.LittleEndian.Uint32(n.payload[8:]))
+		rbp := int64(binary.LittleEndian.Uint32(n.payload[12:]))
+		left, right = concatOperandsAsText(op, left, right, lbp, rbp)
+		left, right = comparisonOperandsAsBpchar(op, left, right, lbp, rbp,
+			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
 		result, err := evalBinary(op, left, right, pos, ctx)
 		if err != nil {
 			return Datum{}, err

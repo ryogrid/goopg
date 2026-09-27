@@ -23,6 +23,10 @@ type distinctOp struct {
 	// dedup key — a unique ctid datum would otherwise make every row
 	// distinct. M0143-0009.
 	junkPos map[int]bool
+	// colTrims flags bpchar-typed columns: dedup keys and the output-order
+	// comparison run on the bcTruelen image so a char(20) 'x' and a
+	// char(5) 'x' are one row — hashbpchar/bpcharlt parity. M0146.
+	colTrims []bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
@@ -35,7 +39,8 @@ func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
 			junk[i] = true
 		}
 	}
-	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk}
+	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk,
+		colTrims: bpcharSchemaTrims(p.Output())}
 }
 
 func (o *distinctOp) Schema() optimizer.Schema { return o.schema }
@@ -82,7 +87,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 		row := slot.Row()
 		// Clone the row so we own the data (child slot is reused).
 		ownedRow := cloneRow(row)
-		k := rowKeyExcluding(ownedRow, o.junkPos)
+		k := rowKeyTrimmed(ownedRow, o.junkPos, o.colTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -103,6 +108,9 @@ func (o *distinctOp) Open(ctx *Context) error {
 			}
 			if b.IsNull() {
 				return true
+			}
+			if col < len(o.colTrims) && o.colTrims[col] {
+				a, b = trimStringDatum(a), trimStringDatum(b)
 			}
 			cmp, err := compareDatum(a, b, 0)
 			if err != nil || cmp == 0 {
@@ -140,10 +148,25 @@ type distinctOnOp struct {
 	schema  optimizer.Schema
 	prevKey string
 	started bool
+	// keyTrims[i] marks a bpchar-typed DISTINCT-ON key column: its key
+	// image is the bcTruelen form so padding-width variants of one value
+	// stay one key. Contiguity under that image is guaranteed by the
+	// child's pre-sort, whose keys evalSortKeyValue already trims.
+	keyTrims []bool
 }
 
 func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
-	return &distinctOnOp{plan: p, child: child, schema: p.Output()}
+	var trims []bool
+	cs := child.Schema()
+	for i, idx := range p.KeyCols {
+		if idx >= 0 && idx < len(cs) && bpcharCatalogType(cs[idx].Type) {
+			if trims == nil {
+				trims = make([]bool, len(p.KeyCols))
+			}
+			trims[i] = true
+		}
+	}
+	return &distinctOnOp{plan: p, child: child, schema: p.Output(), keyTrims: trims}
 }
 
 func (o *distinctOnOp) Schema() optimizer.Schema { return o.schema }
@@ -168,9 +191,13 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 		row := slot.Row()
 		// Build a key from the DISTINCT ON columns.
 		var key string
-		for _, idx := range keyCols {
+		for ki, idx := range keyCols {
 			if idx >= 0 && idx < len(row) {
-				key += datumKey(row[idx]) + "\x00"
+				v := row[idx]
+				if ki < len(o.keyTrims) && o.keyTrims[ki] {
+					v = trimStringDatum(v)
+				}
+				key += datumKey(v) + "\x00"
 			}
 		}
 		if !o.started || key != o.prevKey {

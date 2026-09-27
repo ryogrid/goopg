@@ -85,6 +85,12 @@ type mergeSortedSource struct {
 	child    Operator
 	isLeft   bool
 	keyExprs []optimizer.Expr
+	// keyTrims[i] flags a bpchar-typed key expression on this side: the
+	// merge's equality (compareMergeKeys on the evaluated key datums)
+	// must see the same bcTruelen image the scalar `=` sees, or a
+	// char(10) = char(20) merge pair can never meet — the merge-join
+	// sibling of the hash buildKeyTrim/probeKeyTrim flags. M0146.
+	keyTrims []bool
 	nkeys    int
 
 	// Widths of the merged column space this side's key expressions are
@@ -142,11 +148,21 @@ func newMergeSortedSource(o *joinOp, child Operator, isLeft bool) (*mergeSortedS
 	// keyRow) — same split, same moment as keyExprs, so the two can
 	// never disagree.
 	o.ensureMergeExprs()
+	other := o.mergeSideKeyExprs(!isLeft)
+	keyTrims := make([]bool, len(keyExprs))
+	for i, e := range keyExprs {
+		otherBP := int64(0)
+		if i < len(other) {
+			otherBP = declaredBpcharTypmod(other[i])
+		}
+		keyTrims[i] = declaredBpcharTypmod(e) > 0 || (isBareStringLit(e) && otherBP > 0)
+	}
 	s := &mergeSortedSource{
 		o:        o,
 		child:    child,
 		isLeft:   isLeft,
 		keyExprs: keyExprs,
+		keyTrims: keyTrims,
 		nkeys:    len(keyExprs),
 		rowSlot:  SlotFromRow(child.Schema(), nil),
 	}
@@ -287,6 +303,9 @@ func (s *mergeSortedSource) keyRow(row Row) ([]Datum, bool, error) {
 			// an outer side, which is what the nullKey flag buys: the row
 			// stays in the stream and sorts behind every real key.
 			return keys, true, nil
+		}
+		if i < len(s.keyTrims) && s.keyTrims[i] {
+			v = trimStringDatum(v)
 		}
 		keys[i] = v
 	}

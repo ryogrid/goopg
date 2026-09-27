@@ -1322,9 +1322,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// The interpreted twin reads the declared widths straight off the
 		// operand expressions. Its compiled twin cannot (the expression is
 		// gone by then) and reads them from the node payload instead — see
-		// exprnode.go's ExprBinaryOp arm. Both then apply the same helper.
-		left, right = concatOperandsAsText(x.Op, left, right,
-			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right))
+		// exprnode.go's ExprBinaryOp arm. Both then apply the same helpers.
+		lbp, rbp := declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right)
+		left, right = concatOperandsAsText(x.Op, left, right, lbp, rbp)
+		left, right = comparisonOperandsAsBpchar(x.Op, left, right, lbp, rbp,
+			isBareStringLit(x.Left), isBareStringLit(x.Right))
 		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
@@ -1424,6 +1426,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if err != nil {
 			return Datum{}, err
 		}
+		// The equality half resolves under the operands' declared types —
+		// PG's null-safe `=` is the same bpchareq, so bpchar operands
+		// compare on their bcTruelen images here too.
+		lv, rv = comparisonOperandsAsBpchar(parser.OpEq, lv, rv,
+			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right),
+			isBareStringLit(x.Left), isBareStringLit(x.Right))
 		return evalIsDistinctFrom(lv, rv, x.Negated)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
@@ -10354,6 +10362,43 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	if err != nil {
 		return Datum{}, err
 	}
+	// bpchar comparison semantics for `operand = item` (M0146): each
+	// element comparison resolves under the same rules
+	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
+	// side compares blank-insensitively (bcTruelen), an untyped literal
+	// opposite a bpchar is coerced to bpchar, and an explicitly
+	// text-typed side keeps its padding byte-exact. The DECLARED types
+	// decide, never the datum, so the item metadata is captured here
+	// while the expressions/plan are still visible:
+	//   - a literal list (x.List) exposes each item's expression;
+	//   - a subquery list's items all share the inner plan's first
+	//     output column type;
+	//   - a single-element array-literal expansion gives every element
+	//     the source expression's classification.
+	opBP := declaredBpcharTypmod(x.Operand)
+	opLit := isBareStringLit(x.Operand)
+	itemBP := make([]int64, len(values))
+	itemLit := make([]bool, len(values))
+	switch {
+	case x.Plan != nil:
+		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
+			for i := range itemBP {
+				itemBP[i] = 1
+			}
+		}
+	case len(values) == len(x.List):
+		for i, e := range x.List {
+			itemBP[i] = declaredBpcharTypmod(e)
+			itemLit[i] = isBareStringLit(e)
+		}
+	case len(x.List) == 1:
+		bp := declaredBpcharTypmod(x.List[0])
+		lit := isBareStringLit(x.List[0])
+		for i := range itemBP {
+			itemBP[i] = bp
+			itemLit[i] = lit
+		}
+	}
 	if operandNull {
 		if len(values) == 0 {
 			// Vacuous quantification over an empty list.
@@ -10374,11 +10419,13 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// as the ANY branch below, not full three-valued NULL propagation).
 	// M0122-0004.
 	if x.AnyOp != 0 && x.AllOp {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
+			o, vv := comparisonOperandsAsBpchar(x.AnyOp, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			res, err := evalBinary(x.AnyOp, o, vv, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10392,11 +10439,13 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// (left op elem) for each element. Used for non-equality operators like
 	// `col ~ ANY(ARRAY[...])`. M0097-0068.
 	if x.AnyOp != 0 {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
+			o, vv := comparisonOperandsAsBpchar(x.AnyOp, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			res, err := evalBinary(x.AnyOp, o, vv, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10409,11 +10458,13 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// != ANY semantics: return true if operand != at least one element (OR
 	// of inequality comparisons). M0097-0067.
 	if x.NotEqualAny {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue // skip nulls in the list
 			}
-			eq, err := compareEq(operand, v)
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			eq, err := compareEq(o, vv)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10434,12 +10485,14 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 		return res, nil
 	}
 	sawNull := false
-	for _, v := range values {
+	for i, v := range values {
 		if v.IsNull() {
 			sawNull = true
 			continue
 		}
-		eq, err := compareEq(operand, v)
+		o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
+			opBP, itemBP[i], opLit, itemLit[i])
+		eq, err := compareEq(o, vv)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -10487,6 +10540,22 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 	}
 	defer func() { _ = op.Close() }()
 
+	// bpchar metadata per column (M0146): the operand element's declared
+	// type from the row constructor, the inner column's from the subplan
+	// output schema — the same declared-type rule comparisonOperandsAsBpchar
+	// applies to scalar `=`.
+	var innerBP []bool
+	if out := x.Plan.Output(); len(out) == nCols {
+		for i, c := range out {
+			if bpcharCatalogType(c.Type) {
+				if innerBP == nil {
+					innerBP = make([]bool, nCols)
+				}
+				innerBP[i] = true
+			}
+		}
+	}
+
 	sawNullRow := false
 	for {
 		innerSlot, err := op.Next()
@@ -10516,6 +10585,13 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 				rowNull = true
 				continue
 			}
+			var rbp int64
+			if i < len(innerBP) && innerBP[i] {
+				rbp = 1
+			}
+			left, right = comparisonOperandsAsBpchar(parser.OpEq, left, right,
+				declaredBpcharTypmod(rowOp.Elems[i]), rbp,
+				isBareStringLit(rowOp.Elems[i]), false)
 			eq, err := compareEq(left, right)
 			if err != nil {
 				return Datum{}, err
@@ -11119,6 +11195,9 @@ func subqueryImpl(x *optimizer.SubqueryExpr, ctx *Context) (Datum, error) {
 			if outerVal.IsNull() {
 				return NullDatum, nil
 			}
+			if info.outerBP {
+				outerVal = trimStringDatum(outerVal)
+			}
 			result, found := hm[datumKey(outerVal)]
 			if !found {
 				return NullDatum, nil
@@ -11178,6 +11257,13 @@ type corrSubqHashInfo struct {
 	scanColIdx int                     // index of the join key column in SeqScan output
 	outerRef   optimizer.Expr // outer join-key value: OuterColumnRef or (lowered) ExecParamRef
 	projExpr   optimizer.Expr            // project expression to evaluate for result
+	// innerBP / outerBP mark bpchar-typed join keys: the map hashes the
+	// bcTruelen image and the probe trims identically, the same
+	// normalisation hash-join buildKeyTrim/probeKeyTrim applies —
+	// without it a char(20) outer value and a char(5) inner column never
+	// meet. M0146 bpchar hash parity.
+	innerBP bool
+	outerBP bool
 }
 
 // extractCorrSubqHashInfo detects the pattern
@@ -11234,11 +11320,18 @@ func extractCorrSubqHashInfo(n optimizer.Node) (corrSubqHashInfo, bool) {
 	if innerCol == nil || outerRef == nil {
 		return corrSubqHashInfo{}, false
 	}
+	innerBP := bpcharCatalogType(innerCol.Type)
 	return corrSubqHashInfo{
 		scan:       scan,
 		scanColIdx: innerCol.Index,
 		outerRef:   outerRef,
 		projExpr:   projectTarget,
+		innerBP:    innerBP,
+		// PG's rule for the probe side mirrors comparisonOperandsAsBpchar:
+		// a bpchar outer value trims under bpchareq; a text outer value
+		// does not (bpchar=text routes through the rtrim1 cast on the
+		// INNER side only — which innerBP already applies at build).
+		outerBP: declaredBpcharTypmod(outerRef) > 0,
 	}, true
 }
 
@@ -11268,6 +11361,9 @@ func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum
 			continue
 		}
 		keyDatum := row[info.scanColIdx]
+		if info.innerBP {
+			keyDatum = trimStringDatum(keyDatum)
+		}
 		valDatum, verr := evalExprSlot(info.projExpr, slot, ctx)
 		if verr != nil {
 			return nil, verr
@@ -11438,6 +11534,16 @@ func evalCaseExpr(x *optimizer.CaseExpr, row Row, ctx *Context) (Datum, error) {
 		}
 		operand = v
 	}
+	// bpchar semantics for the simple-CASE operand's implicit `=` per
+	// WHEN: the same rule comparisonOperandsAsBpchar gives a BinaryOp —
+	// `CASE c WHEN 'Javier'` on a char(n) column resolves the literal to
+	// bpchar and must match. M0146.
+	opBP := int64(0)
+	opLit := false
+	if hasOperand {
+		opBP = declaredBpcharTypmod(x.Operand)
+		opLit = isBareStringLit(x.Operand)
+	}
 	for _, w := range x.Whens {
 		whenVal, err := evalExpr(w.When, row, ctx)
 		if err != nil {
@@ -11445,7 +11551,9 @@ func evalCaseExpr(x *optimizer.CaseExpr, row Row, ctx *Context) (Datum, error) {
 		}
 		var matched bool
 		if hasOperand {
-			eq, err := compareEq(operand, whenVal)
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, whenVal,
+				opBP, declaredBpcharTypmod(w.When), opLit, isBareStringLit(w.When))
+			eq, err := compareEq(o, vv)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11603,6 +11711,111 @@ func concatOperandsAsText(op parser.OpCode, left, right Datum, lbp, rbp int64) (
 	return left, right
 }
 
+// comparisonOperandsAsBpchar applies PostgreSQL's blank-insensitive bpchar
+// comparison semantics to the operands of a comparison operator before
+// compareDatum sees them — the scalar-evaluator twin of the btree's
+// PGCompareBpcharC (varchar.c's bcTruelen).
+//
+// The rules, measured on PG 18.3:
+//   - bpchar vs bpchar: bpchareq/bpcharlt compare both sides under
+//     bcTruelen — 'Javier   ' = 'Javier' is TRUE.
+//   - bpchar vs a bare string literal: the unknown literal resolves to the
+//     bpchar operand's type (coerce_type picks the typed side), so the
+//     comparison is bpchar=bpchar and the literal strips trailing blanks
+//     too — c = 'Javier   ' is TRUE when c is char(n).
+//   - bpchar vs text/varchar: text is the string category's preferred
+//     type, so the comparison is text=text and only the bpchar side is
+//     routed through the implicit bpchar->text cast (rtrim1). The text
+//     operand keeps its trailing blanks byte-exact — 'Javier'::char(10) =
+//     'Javier   '::text is FALSE, and the asymmetry matters.
+//
+// The DECLARED type decides, never the datum: a blank-padded image is
+// indistinguishable from a text value that genuinely ends in spaces.
+// lbp/rbp are each side's declaredBpcharTypmod (0 when not bpchar) — the
+// same words concatOperandsAsText already receives, so both evaluator
+// twins share one plumbing path. lLit/rLit report "operand is an untyped
+// string literal" (isBareStringLit), which plays PG's unknown-type role.
+func comparisonOperandsAsBpchar(op parser.OpCode, left, right Datum, lbp, rbp int64, lLit, rLit bool) (Datum, Datum) {
+	switch op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+	default:
+		return left, right
+	}
+	if lbp <= 0 && rbp <= 0 {
+		return left, right
+	}
+	if (lbp > 0 || lLit) && left.Kind == KindString {
+		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+			left = NewStringDatum(t)
+		}
+	}
+	if (rbp > 0 || rLit) && right.Kind == KindString {
+		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+			right = NewStringDatum(t)
+		}
+	}
+	return left, right
+}
+
+// isBareStringLit reports whether e is an untyped string literal — the
+// node an un-cast 'x' parses into (optimizer.StringConst). It plays the
+// role of PostgreSQL's unknown-type literal in comparisonOperandsAsBpchar:
+// PG coerces the unknown side to the bpchar operand's type, so a bare
+// literal opposite a bpchar compares blank-insensitively. An explicitly
+// typed literal lands on CastExpr or TypedStringLit instead and is handled
+// by the declared-type arm.
+func isBareStringLit(e optimizer.Expr) bool {
+	_, ok := e.(*optimizer.StringConst)
+	return ok
+}
+
+// bpcharCatalogType reports whether a catalog.Type names the bpchar
+// family — the plan-schema twin of declaredBpcharTypmod's name check,
+// used where only a plan output column (no expression) remains, e.g.
+// the inner column of `operand IN (SELECT ...)`. Only the name matters
+// for comparison semantics: bcTruelen trimming is width-independent.
+func bpcharCatalogType(t catalog.Type) bool {
+	if t.IsArray {
+		return false
+	}
+	switch strings.ToLower(t.Name) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// bpcharSchemaTrims returns per-column trim flags for a schema — the
+// whole-row twin of declaredBpcharTypmod for dedup paths that see only
+// datums (DISTINCT, SetOp, recursive-CTE dedup). nil when no column is
+// bpchar-typed so every caller keeps its zero-cost fast path.
+func bpcharSchemaTrims(s optimizer.Schema) []bool {
+	var trims []bool
+	for i, c := range s {
+		if bpcharCatalogType(c.Type) {
+			if trims == nil {
+				trims = make([]bool, len(s))
+			}
+			trims[i] = true
+		}
+	}
+	return trims
+}
+
+// trimStringDatum returns d with trailing ASCII spaces stripped when it
+// is a KindString — the Datum-level bcTruelen. Shared by
+// comparisonOperandsAsBpchar and the subplan hash probe's key
+// normalisation so both spell "strip the padding" identically.
+func trimStringDatum(d Datum) Datum {
+	if d.Kind != KindString {
+		return d
+	}
+	if t := strings.TrimRight(d.StringValue(), " "); t != d.StringValue() {
+		return NewStringDatum(t)
+	}
+	return d
+}
+
 // coerceBpcharArgDatum applies upstream's bpchar->text coercion to a whole
 // Datum, for a TEXT-declared function whose body reads its argument in more
 // than one place. It is the Datum-level twin of bpcharArgAsText: normalising
@@ -11665,9 +11878,31 @@ func declaredBpcharTypmod(e optimizer.Expr) int64 {
 		if len(n.Type.Args) > 0 {
 			typmod = n.Type.Args[0]
 		}
+	case *optimizer.OuterColumnRef:
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
+	case *optimizer.ExecParamRef:
+		// subplan_lower rewrites OuterColumnRefs to PARAM_EXEC slots and
+		// preserves the declared type — the same bpchar predicate applies.
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
 	case *optimizer.CastExpr:
 		name = n.TargetType
 		typmod = n.Typmod
+	case *optimizer.TypedStringLit:
+		// `char(10) 'x'` — the literal carries the type name but no typmod
+		// field; typmod stays 0 and normalises to the bare-char default 1.
+		name = n.Type
 	case *optimizer.FuncCall:
 		// coalesce/greatest/least/nullif take the first argument's type
 		// (planner.exprType), so octet_length(coalesce(charcol, '')) still sees
@@ -20779,6 +21014,11 @@ func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, sl
 		if lDat.IsNull() || rDat.IsNull() {
 			return NullDatum, nil
 		}
+		// Elementwise bpchar normalisation — ROW comparison resolves each
+		// element pair under its own type rule, exactly as scalar `=`.
+		lDat, rDat = comparisonOperandsAsBpchar(parser.OpEq, lDat, rDat,
+			declaredBpcharTypmod(left.Elems[i]), declaredBpcharTypmod(right.Elems[i]),
+			isBareStringLit(left.Elems[i]), isBareStringLit(right.Elems[i]))
 		cmp, err := compareDatum(lDat, rDat, 0)
 		if err != nil {
 			return Datum{}, err

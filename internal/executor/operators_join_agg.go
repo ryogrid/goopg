@@ -138,6 +138,18 @@ type joinOp struct {
 	execResidualNode int32
 	execCompiled     bool
 
+	// buildKeyTrim/probeKeyTrim flag a bpchar-typed key expression on each
+	// side: PostgreSQL's bpchar hash opclass (hashbpchar, varchar.c) hashes
+	// the bcTruelen image, so 'ab' and 'ab   ' must land on the same bucket
+	// or the hash join misses pairs the scalar `=` calls equal. Computed
+	// once in compileExecExprs from the same expression split the loops
+	// index, mirroring how the node lists are derived. An untyped literal
+	// key trims only when the OTHER side is bpchar (PG coerces the unknown
+	// to the typed side). M0146 bpchar-join sibling of the scalar
+	// comparisonOperandsAsBpchar rule.
+	buildKeyTrim []bool
+	probeKeyTrim []bool
+
 	// M0127-P2.3 (07 §2): the same split for the MERGE algorithm, taken
 	// from planner.Join.ExecMergeKeyPlan by initMergeKeys. Deliberately
 	// NOT the execKeys/execResidual slots above: those are filled on the
@@ -928,7 +940,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -998,7 +1010,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -1088,7 +1100,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 			key = string(o.execKeyBuf)
 		} else {
 			var kerr error
-			key, ok, kerr = o.evalHashKeySlot(o.buildKeyNodes[0], keySlot)
+			key, ok, kerr = o.evalHashKeySlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 			if kerr != nil {
 				return kerr
 			}
@@ -1145,7 +1157,7 @@ func (o *joinOp) evalHashKeyDatum(keyExpr optimizer.Expr, row Row) (Datum, bool,
 // build/probe split still happens once in initExecKeys, so the two loops
 // still cannot disagree about orientation — they now index the same two
 // node lists instead of the same two expression lists.
-func (o *joinOp) evalHashKeyDatumSlot(node int32, slot SlotView) (Datum, bool, error) {
+func (o *joinOp) evalHashKeyDatumSlot(node int32, trim bool, slot SlotView) (Datum, bool, error) {
 	if node == noExpr {
 		return Datum{}, false, errNilHashKey
 	}
@@ -1156,12 +1168,15 @@ func (o *joinOp) evalHashKeyDatumSlot(node int32, slot SlotView) (Datum, bool, e
 	if v.IsNull() {
 		return Datum{}, false, nil
 	}
+	if trim {
+		v = trimStringDatum(v)
+	}
 	return v, true, nil
 }
 
 // evalHashKeySlot is the SlotView variant of evalHashKey, on the same
 // compiled node index as evalHashKeyDatumSlot.
-func (o *joinOp) evalHashKeySlot(node int32, slot SlotView) (string, bool, error) {
+func (o *joinOp) evalHashKeySlot(node int32, trim bool, slot SlotView) (string, bool, error) {
 	if node == noExpr {
 		return "", false, errNilHashKey
 	}
@@ -1171,6 +1186,9 @@ func (o *joinOp) evalHashKeySlot(node int32, slot SlotView) (string, bool, error
 	}
 	if v.IsNull() {
 		return "", false, nil
+	}
+	if trim {
+		v = trimStringDatum(v)
 	}
 	return datumKey(v), true, nil
 }
@@ -1814,7 +1832,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, keySlot)
+			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -1843,7 +1861,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// Assign the OUTER key: the preserveBuildSide CTID lookup
 			// below reads o.lazyHashCTID[key], so a shadowing inner
 			// declaration would leave it empty for FOR UPDATE joins.
-			key, ok, err = o.evalHashKeySlot(probeKeyNode, keySlot)
+			key, ok, err = o.evalHashKeySlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
 			if err != nil {
 				return nil, err
 			}
@@ -2009,6 +2027,12 @@ type aggregateOp struct {
 	// previous row's key parts across rows (curParts).
 	gkVals Row
 	gkKeys []string
+	// gkTrims[i] flags a bpchar-typed grouping expression: its bcTruelen
+	// image is what the group key must hash (PG's hashbpchar ignores
+	// trailing blanks so that char(20) 'x' and char(5) 'x' land in one
+	// group). nil when no grouping column is bpchar — the common case
+	// pays nothing. M0146 bpchar hash parity.
+	gkTrims []bool
 	// slot is reused across emissions (review/260831 EO2-24).
 	slot MaterializedSlot
 
@@ -2161,7 +2185,16 @@ type aggRuntime struct {
 }
 
 func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
-	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
+	o := &aggregateOp{plan: plan, child: child, schema: plan.Output()}
+	for i, g := range plan.GroupExprs {
+		if declaredBpcharTypmod(g) > 0 {
+			if o.gkTrims == nil {
+				o.gkTrims = make([]bool, len(plan.GroupExprs))
+			}
+			o.gkTrims[i] = true
+		}
+	}
+	return o
 }
 
 // aggPlanUsesCTID reports whether an Aggregate plan evaluates any expression
@@ -2558,7 +2591,7 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 	}
 	vals := make(Row, 0, n)
 	parts := make([]string, 0, n)
-	for _, g := range o.plan.GroupExprs {
+	for i, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
 			return nil, nil, err
@@ -2571,7 +2604,11 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 		// MaterializeArena is a no-op for non-arena Datums.
 		v = v.MaterializeArena()
 		vals = append(vals, v)
-		parts = append(parts, datumKey(v))
+		kv := v
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			kv = trimStringDatum(kv)
+		}
+		parts = append(parts, datumKey(kv))
 	}
 	return vals, parts, nil
 }
@@ -2589,12 +2626,15 @@ func (o *aggregateOp) evalGroupKeysScratch(slot TupleSlot) (Row, []string, error
 	}
 	vals := o.gkVals[:0]
 	keys := o.gkKeys[:0]
-	for _, g := range o.plan.GroupExprs {
+	for i, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
 			return nil, nil, err
 		}
 		vals = append(vals, v)
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			v = trimStringDatum(v)
+		}
 		keys = append(keys, datumKey(v))
 	}
 	o.gkVals, o.gkKeys = vals, keys
@@ -2708,6 +2748,9 @@ func (o *aggregateOp) decodePartialStateRow(row Row) (*partialStateRow, error) {
 		states:   make([]aggRuntime, nAggs),
 	}
 	for i, d := range dr.gv {
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			d = trimStringDatum(d)
+		}
 		dr.keyParts[i] = datumKey(d)
 	}
 	for i := 0; i < nAggs; i++ {
@@ -3397,7 +3440,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		if st.distinct == nil {
 			st.distinct = map[string]struct{}{}
 		}
-		k := datumKey(arg)
+		ka := arg
+		if declaredBpcharTypmod(call.Arg) > 0 {
+			// COUNT(DISTINCT c) on bpchar dedups under bpchareq/
+			// hashbpchar — 'x  ' and 'x' are one value.
+			ka = trimStringDatum(ka)
+		}
+		k := datumKey(ka)
 		if _, seen := st.distinct[k]; seen {
 			return nil
 		}

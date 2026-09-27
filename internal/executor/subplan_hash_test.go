@@ -223,7 +223,7 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 func TestBuildSubPlanHashClassification(t *testing.T) {
 	// Int + scale-normalised numeric share the numeric family and one
 	// canonical key (1 == 1.0).
-	h := buildSubPlanHash([]Datum{NewIntDatum(1), NewNumericInt64Datum(10, 1)})
+	h := buildSubPlanHash([]Datum{NewIntDatum(1), NewNumericInt64Datum(10, 1)}, false)
 	if h.family != hashFamNumeric {
 		t.Fatalf("int+numeric: family = %v, want hashFamNumeric", h.family)
 	}
@@ -231,16 +231,16 @@ func TestBuildSubPlanHashClassification(t *testing.T) {
 		t.Fatalf("1 and 1.0 should canonicalise to one key; set has %d", len(h.set))
 	}
 	// Mixed families → sentinel.
-	if h := buildSubPlanHash([]Datum{NewIntDatum(1), NewStringDatum("x")}); h.family != hashFamNone {
+	if h := buildSubPlanHash([]Datum{NewIntDatum(1), NewStringDatum("x")}, false); h.family != hashFamNone {
 		t.Fatalf("mixed int+string: family = %v, want hashFamNone", h.family)
 	}
 	// NULLs tracked, not stored.
-	h = buildSubPlanHash([]Datum{NewIntDatum(1), NullDatum})
+	h = buildSubPlanHash([]Datum{NewIntDatum(1), NullDatum}, false)
 	if !h.hasNull || len(h.set) != 1 {
 		t.Fatalf("null tracking: hasNull=%v set=%d", h.hasNull, len(h.set))
 	}
 	// All-NULL set → sentinel (linear path handles).
-	if h := buildSubPlanHash([]Datum{NullDatum, NullDatum}); h.family != hashFamNone {
+	if h := buildSubPlanHash([]Datum{NullDatum, NullDatum}, false); h.family != hashFamNone {
 		t.Fatalf("all-NULL: family = %v, want hashFamNone", h.family)
 	}
 	// Kill-switch / probe declines are covered end-to-end above.

@@ -1537,7 +1537,20 @@ func evalSortKeyValue(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 			return ov, nil
 		}
 	}
-	return evalExpr(e, row, ctx)
+	v, err := evalExpr(e, row, ctx)
+	if err != nil {
+		return v, err
+	}
+	// bpchar ordering is blank-insensitive (bpcharlt compares the bcTruelen
+	// image): pre-trim the key value so compareDatum, mergeKeysLess and
+	// every ordered-merge/SetOp comparator built on this function see the
+	// same image the scalar `<`/`=` twins see. A char(20) 'x' and a
+	// char(5) 'x' must sort equal — and contiguous — or sorted-path
+	// grouping, DISTINCT ON and merge joins can never meet.
+	if declaredBpcharTypmod(e) > 0 {
+		v = trimStringDatum(v)
+	}
+	return v, nil
 }
 
 // lessRows returns true iff a should sort before b under the

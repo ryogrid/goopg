@@ -38,6 +38,14 @@ func bpcharJoinFixture(t *testing.T) (*Context, func()) {
 		"CREATE TABLE tb (id bpchar)",
 		"INSERT INTO ta VALUES ('ab')",
 		"INSERT INTO tb VALUES ('ab ')",
+		// Cross-width bpchar pair: 'a' pads to 16 vs 24 — byte-distinct
+		// images that bpchareq calls equal (bcTruelen). The join only
+		// matches when the key normalises the padding; byte-exact keys
+		// silently return 0. M0146.
+		"CREATE TABLE wa (id char(16), v int)",
+		"CREATE TABLE wb (id char(24), w int)",
+		"INSERT INTO wa VALUES ('a', 1), ('b', 2)",
+		"INSERT INTO wb VALUES ('a', 10), ('c', 30)",
 		// UUID case variants: compareDatum normalizes both sides, so `=`
 		// is true while the key encodings differ.
 		"CREATE TABLE ua (id char(36), v int)",
@@ -135,16 +143,24 @@ func TestHashJoinBpcharValues(t *testing.T) {
 	if got := bpcharValues(t, ctx, "SELECT va.v FROM va JOIN vb ON va.id = vb.id ORDER BY va.v"); got != "1" {
 		t.Errorf("varchar control join returned %q, want \"1\"", got)
 	}
+	// Cross-width char(16)=char(24): the stored images differ ('a'+15
+	// blanks vs 'a'+23) but bpchareq calls them equal — PG returns 1.
+	// Byte-exact keys would silently miss here.
+	if got := bpcharValues(t, ctx, "SELECT wa.v FROM wa JOIN wb ON wa.id = wb.id ORDER BY wa.v"); got != "1" {
+		t.Errorf("cross-width char join returned %q, want \"1\"", got)
+	}
 }
 
-// TestHashJoinBpcharTrailingSpaceAgreement documents the verbatim-storage
-// corner: unbounded bpchar keeps 'ab ' byte-distinct (octet_length 3 vs
-// 2), goopg's `=` is byte-exact on strings so the scalar equality is
-// FALSE, and the join is empty. Keys and `=` agree — both miss — so
-// folding changes nothing here: residual-false ⟺ no emit pre-slice,
-// no-meet ⟺ no emit post-slice. (PG would match under bpchareq's
-// trailing-space rule; goopg misses either way — UNCHANGED by this
-// slice, values work if ever.)
+// TestHashJoinBpcharTrailingSpaceAgreement pins the verbatim-storage
+// corner under bpchar semantics (M0146): unbounded bpchar keeps 'ab '
+// byte-distinct in storage (octet_length 3 vs 2), but PG's bpchareq
+// compares under bcTruelen — trailing blanks ignored — so the scalar
+// `=` is TRUE and the join must emit the match too. The join keys are
+// normalised by buildKeyTrim/probeKeyTrim (hash) and keyTrims (merge),
+// the same normalisation upstream's hashbpchar opclass applies, so keys
+// and `=` agree — both hit — and folding the conjunct stays exact.
+// Pre-M0146 this test pinned the byte-exact miss (scalar `f`, join 0);
+// both flips are intentional and PG-verified on 18.3.
 func TestHashJoinBpcharTrailingSpaceAgreement(t *testing.T) {
 	ctx, cleanup := bpcharJoinFixture(t)
 	defer cleanup()
@@ -155,11 +171,11 @@ func TestHashJoinBpcharTrailingSpaceAgreement(t *testing.T) {
 	if got := bpcharValues(t, ctx, "SELECT octet_length(id) FROM tb"); got != "3" {
 		t.Errorf("verbatim premise broken: tb octet_length = %q, want \"3\"", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT ta.id = tb.id FROM ta, tb"); got != "f" {
-		t.Errorf("scalar `=` = %q, want \"f\" (byte-exact strings); if this flips, the agreement argument below must be re-derived", got)
+	if got := bpcharValues(t, ctx, "SELECT ta.id = tb.id FROM ta, tb"); got != "t" {
+		t.Errorf("scalar `=` = %q, want \"t\" (bpchareq ignores trailing blanks — PG 18.3)", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ta JOIN tb ON ta.id = tb.id"); got != "0" {
-		t.Errorf("trailing-space join count = %q, want \"0\"", got)
+	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ta JOIN tb ON ta.id = tb.id"); got != "1" {
+		t.Errorf("trailing-space join count = %q, want \"1\" (hash keys hash the trimmed image)", got)
 	}
 }
 

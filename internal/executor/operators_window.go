@@ -38,10 +38,34 @@ type windowOp struct {
 	// FrameBoundOffsetPreceding/Following; see frameBoundsRange.
 	frameStartOffDatum Datum
 	frameEndOffDatum   Datum
+
+	// pTrims / obTrims flag bpchar-typed PARTITION BY / ORDER BY
+	// expressions: partition keys hash and peers compare under the
+	// bcTruelen image (hashbpchar / bpcharlt), so padding-width variants
+	// of one value share a partition and a peer group. M0146.
+	pTrims  []bool
+	obTrims []bool
 }
 
 func newWindowOp(plan *optimizer.WindowAgg, child Operator) *windowOp {
-	return &windowOp{plan: plan, child: child, schema: plan.Output()}
+	o := &windowOp{plan: plan, child: child, schema: plan.Output()}
+	for i, e := range plan.PartitionBy {
+		if declaredBpcharTypmod(e) > 0 {
+			if o.pTrims == nil {
+				o.pTrims = make([]bool, len(plan.PartitionBy))
+			}
+			o.pTrims[i] = true
+		}
+	}
+	for i, k := range plan.OrderBy {
+		if declaredBpcharTypmod(k.Expr) > 0 {
+			if o.obTrims == nil {
+				o.obTrims = make([]bool, len(plan.OrderBy))
+			}
+			o.obTrims[i] = true
+		}
+	}
+	return o
 }
 
 func (o *windowOp) Open(ctx *Context) error {
@@ -89,12 +113,18 @@ func (o *windowOp) Open(ctx *Context) error {
 				if err != nil {
 					return err
 				}
+				if j < len(o.pTrims) && o.pTrims[j] {
+					v = trimStringDatum(v)
+				}
 				kv[j] = v
 			}
 			for j, ok := range o.plan.OrderBy {
 				v, err := evalExpr(ok.Expr, row, ctx)
 				if err != nil {
 					return err
+				}
+				if j < len(o.obTrims) && o.obTrims[j] {
+					v = trimStringDatum(v)
 				}
 				kv[len(o.plan.PartitionBy)+j] = v
 			}
@@ -1156,10 +1186,13 @@ func (o *windowOp) partitionKey(row Row) (string, error) {
 		return "__all__", nil
 	}
 	parts := make([]string, 0, len(o.plan.PartitionBy))
-	for _, pe := range o.plan.PartitionBy {
+	for i, pe := range o.plan.PartitionBy {
 		v, err := evalExpr(pe, row, o.ctx)
 		if err != nil {
 			return "", err
+		}
+		if i < len(o.pTrims) && o.pTrims[i] {
+			v = trimStringDatum(v)
 		}
 		parts = append(parts, datumKey(v))
 	}
@@ -1170,7 +1203,7 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 	if len(o.plan.OrderBy) == 0 {
 		return true, nil
 	}
-	for _, ok := range o.plan.OrderBy {
+	for i, ok := range o.plan.OrderBy {
 		a, err := evalExpr(ok.Expr, prev, o.ctx)
 		if err != nil {
 			return false, err
@@ -1184,6 +1217,9 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 				continue
 			}
 			return false, nil
+		}
+		if i < len(o.obTrims) && o.obTrims[i] {
+			a, b = trimStringDatum(a), trimStringDatum(b)
 		}
 		cmp, err := compareDatum(a, b, ok.Expr.Pos())
 		if err != nil {
