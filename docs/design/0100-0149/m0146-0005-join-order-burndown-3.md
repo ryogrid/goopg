@@ -128,3 +128,45 @@ Movement: TPC-DS SF1 PLAN-PARITY match 14 → 17 (Q17, Q25, Q29) and
 `qual-placement` 17 → 14; SF0.25 `qual-placement` 13 → 12 (Q24). TPC-H filter
 lines are byte-identical. The regress runner (10 cases) is unchanged versus
 HEAD. Evidence: `analysis/m0146/m0146-0005/slice40/`.
+
+## Slice 41: M0146-0005ao — the parameterized-probe partial nested loop admits LEFT
+
+TPC-DS Q40's first divergence is its aggregate: PG runs `Finalize
+GroupAggregate -> Gather Merge -> Partial GroupAggregate`, while goopg ran a
+serial GroupAggregate. The cause is one level below. PG's `catalog_returns`
+LEFT join (`Nested Loop Left Join` probing `catalog_returns_pkey`) runs
+inside the workers. goopg could only run it above the Gather Merge, so no
+partial aggregate could be split under it.
+
+The parameterized-probe partial nested-loop family admitted {INNER, SEMI,
+ANTI} (M0146-0002i/j). LEFT was held back by ledger rows `m0146-0002a` /
+`m0146-0002j` until a left-probe consumer was measured. Q40 is that
+consumer. A LEFT verdict is per outer row: a worker emits each qualifying
+probe row, or the outer row null-padded when none qualifies. That makes it
+as worker-local as ANTI. The four gates widen together (the move-together
+rule):
+
+- the producer: `addPartialNestLoopPaths`'s V1-nl-inner set
+  (joinpathsnli.go), now PG's full dispatch set (joinpath.c:2022-2031);
+- the classifier twin: `partialProbeNestLoopJointype` (gatherpaths.go);
+- the plan-node twin: `partialProbeNestLoopJoinType` (parallel.go);
+- the executor twin: `lateralProbeJoinPartial` (parallel_scan.go).
+
+`TestParallelLateralLeftProbeIdentity` runs the LEFT probe under 1, 2 and 4
+workers. It checks the total row count and, separately, the number of
+null-padded rows (50 of 100). With the executor twin left at the old set it
+fails with 100 padded rows, because each worker padded outer rows that other
+workers' partitions matched. The refusal pins in the optimizer and executor
+unit tests now use FULL/RIGHT, which need a cross-worker unmatched-inner
+reduction.
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 17 → 18 (Q40 = PG), `join-order` 66
+→ 64, `join-method` 38 → 36, `parallelism` 47 → 46. At SF1, Q40 and Q80's LEFT
+probes move inside the Gather Merge as well. Q40's category set there moves
+from parallelism to sort-strategy, because a join order further down still
+differs. SF1 match is unchanged at 17. At SF1 both plans also join the
+pre-existing family (23 queries in the baseline) whose post-pass-parallelized
+subtree shows a per-worker `Sort` cost below its unscaled child. That is the
+Gather-stamping display, not new here. TPC-H plans are byte-identical apart
+from costs. The regress runner (10 cases) is unchanged. Evidence:
+`analysis/m0146/m0146-0005/slice41/`.

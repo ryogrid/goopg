@@ -466,11 +466,14 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	// `TestParallelLeftAntiNestedLoopIdentity` (M0145-0010) and the probe
 	// arm's three gates widened to ANTI in the same change.
 	//
-	// LEFT stays refused — worker-local by the same argument, but
-	// unverified for the probe shape and with no measured consumer. Ledger
-	// row `m0137-0019b-partial-nl-left-anti-still-refused` /
-	// `m0146-0002a-left-probe`.
-	if jt != parser.JoinInner && jt != parser.JoinSemi && jt != parser.JoinAnti {
+	// LEFT joined the set 2026-09-29 (M0146-0005ao): emit the outer row
+	// null-padded iff no probe row qualifies — decided per outer row, as
+	// worker-local as ANTI. Its named consumer is TPC-DS Q40, whose PG plan
+	// runs `Nested Loop Left Join` probing catalog_returns' index inside the
+	// Gather Merge; the probe arm's three gates widened in the same change
+	// and `TestParallelLateralLeftProbeIdentity` pins the executor. The set
+	// is now PG's full dispatch set (joinpath.c:2022-2031).
+	if jt != parser.JoinInner && jt != parser.JoinLeft && jt != parser.JoinSemi && jt != parser.JoinAnti {
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1-nl-inner", "jt="+traceJoinTypeName(jt))
 		return
 	}

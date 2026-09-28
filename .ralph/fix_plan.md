@@ -23035,6 +23035,24 @@ M0146-0001 re-baseline census on the new default arm.
     Q24, SF1 Q17 Q25 Q29, none introduced\), TPC\-H filter lines identical,
     regress runner 10 cases 0 changed\.
   Movement: yes — TPC-DS SF1 PLAN-PARITY match 14 -> 17 (Q17, Q25, Q29), CATEGORIES-EXCL-MATCH qual-placement SF1 17 -> 14, SF0.25 13 -> 12 (Q24); TPC-H unchanged
+- [x] **M0146\-0005ao — the parameterized\-probe partial nested loop admits
+  LEFT** \(slice 41, impl, filed and done 2026\-09\-29 from the TPC\-DS SF0\.25
+  census, Q40\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 41"\.
+  Kind: impl
+  Parent: M0146-0005
+  - Q40\'s serial GroupAggregate sat above a LEFT probe that could not run
+    in the workers; PG runs `Nested Loop Left Join` inside the Gather Merge
+    and splits the aggregate\.
+  - The four gates widen together: producer \(joinpathsnli.go\), classifier
+    \(gatherpaths.go\), plan\-node \(parallel.go\), executor \(parallel\_scan.go\);
+    resolves the `m0146\-0002a`/`0002j` LEFT\-probe ledger condition\.
+  - `TestParallelLateralLeftProbeIdentity` checks totals and null\-padded
+    rows under 1/2/4 workers; fails with the executor twin unwidened\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(Q40
+    Q80 at both scales, none introduced\), TPC\-H plans identical, regress
+    runner 10 cases 0 changed\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 17 -> 18 (Q40), CATEGORIES-EXCL-MATCH join-order 66 -> 64, join-method 38 -> 36, parallelism 47 -> 46; SF1 match unchanged (sort-strategy 50 -> 51, Q40); TPC-H unchanged
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

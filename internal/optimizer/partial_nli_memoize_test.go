@@ -247,7 +247,7 @@ func TestPartialPathDrivingKindMemoizedNLI(t *testing.T) {
 	// M0146-0002i/j: MEMOIZED SEMI and ANTI probes must classify too — the
 	// wrapper is transparent to the jointype check, and the fused NLI gate
 	// they lower to already admits both (M0145-0010).
-	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
 		jr, o, i, _, _ := latClassifyFixture()
 		pr := latParamInner(i, o.Relids)
 		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, jt, nliMemoizeInner(pr))); got != PathSeqScan {
@@ -257,8 +257,8 @@ func TestPartialPathDrivingKindMemoizedNLI(t *testing.T) {
 
 	cases := map[string]func(joinrel, outer, inner *RelOptInfo, probe *Path) *Path{
 		// LEFT stays unverified for the probe shape.
-		"left-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
-			return latClassifyPath(jr, o, i, parser.JoinLeft, nliMemoizeInner(pr))
+		"full-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinFull, nliMemoizeInner(pr))
 		},
 		"memoize-empty": func(jr, o, i *RelOptInfo, pr *Path) *Path {
 			bad := *nliMemoizeInner(pr)
@@ -322,7 +322,7 @@ func TestPartialPathDrivingKindBitmapProbe(t *testing.T) {
 	}
 
 	// SEMI/ANTI ride the same probe jointype set as the index sibling.
-	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
 		jr, o, i, _, _ := latClassifyFixture()
 		pr := nliBitmapProbePath(i, o.Relids)
 		if got := partialPathDrivingKind(latClassifyPath(jr, o, i, jt, pr)); got != PathSeqScan {
@@ -357,8 +357,8 @@ func TestPartialPathDrivingKindBitmapProbe(t *testing.T) {
 			bad.RequiredOuter = relsetOf(2)
 			return latClassifyPath(jr, o, i, parser.JoinInner, &bad)
 		},
-		"left-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
-			return latClassifyPath(jr, o, i, parser.JoinLeft, pr)
+		"full-jointype": func(jr, o, i *RelOptInfo, pr *Path) *Path {
+			return latClassifyPath(jr, o, i, parser.JoinFull, pr)
 		},
 	}
 	for name, build := range cases {

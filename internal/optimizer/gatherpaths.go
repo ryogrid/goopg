@@ -554,7 +554,8 @@ func partialNestLoopJointype(t parser.JoinType) bool {
 // partialProbeNestLoopJointype is the ONE jointype set the parameterized-probe
 // partial nested-loop arms admit — narrower than `partialNestLoopJointype`
 // because the probe's per-outer-row verdict must additionally be provable
-// worker-local at every downstream gate, and only INNER and SEMI have been.
+// worker-local at every downstream gate (it now matches: every member has
+// been).
 // The three probe gates — this arm's R95 tail below,
 // `lateralProbeJoinIsPartialCapable` (parallel.go) and the executor twin
 // `lateralProbeJoinPartial` (internal/executor/parallel_scan.go) — carry the
@@ -576,12 +577,14 @@ func partialNestLoopJointype(t parser.JoinType) bool {
 // consumer is TPC-H Q21's `Nested Loop Anti Join` inside the Gather
 // probing l3's index per worker.
 //
-// LEFT stays refused: worker-local in principle but never
-// executor-verified for the probe shape, and no measured consumer exists
-// (ledger `m0146-0002a-left-probe`).
+// LEFT joins for M0146-0005ao: emit the outer row null-padded iff no probe
+// row qualifies — decided per outer row, worker-local as ANTI is. Its named
+// consumer is TPC-DS Q40 (`Nested Loop Left Join` probing catalog_returns'
+// index inside PG's Gather Merge); `TestParallelLateralLeftProbeIdentity`
+// pins the executor twin.
 func partialProbeNestLoopJointype(t parser.JoinType) bool {
 	switch t {
-	case parser.JoinInner, parser.JoinSemi, parser.JoinAnti:
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
 		return true
 	}
 	return false

@@ -165,9 +165,10 @@ func TestParallelLateralWalkerRefusals(t *testing.T) {
 		t.Error("index walk must refuse a bindable inner")
 	}
 
-	// M0146-0002i/j: SEMI and ANTI lateral probes must attach on all three
-	// walks — TPC-H Q4's and Q21's per-worker probe shapes.
-	for _, jt := range []optimizer.JoinType{optimizer.JoinTypeSemi, optimizer.JoinTypeAnti} {
+	// M0146-0002i/j, M0146-0005ao: LEFT, SEMI and ANTI lateral probes must
+	// attach on all three walks — TPC-DS Q40's, TPC-H Q4's and Q21's
+	// per-worker probe shapes.
+	for _, jt := range []optimizer.JoinType{optimizer.JoinTypeLeft, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti} {
 		latOp := &joinOp{plan: &optimizer.Join{Algo: optimizer.JoinAlgoNestedLoop,
 			Type: jt, Lateral: true,
 			Left: &optimizer.SeqScan{}, Right: probePlan()},
@@ -178,8 +179,8 @@ func TestParallelLateralWalkerRefusals(t *testing.T) {
 	}
 
 	refusals := map[string]*joinOp{
-		// LEFT stays unverified for the probe shape (planner ledger).
-		"left":        {plan: &optimizer.Join{Algo: optimizer.JoinAlgoNestedLoop, Type: optimizer.JoinTypeLeft, Lateral: true, Left: &optimizer.SeqScan{}, Right: probePlan()}, left: &seqScanOp{}, right: &indexScanOp{}},
+		// FULL needs a cross-worker unmatched-inner reduction.
+		"full":        {plan: &optimizer.Join{Algo: optimizer.JoinAlgoNestedLoop, Type: optimizer.JoinTypeFull, Lateral: true, Left: &optimizer.SeqScan{}, Right: probePlan()}, left: &seqScanOp{}, right: &indexScanOp{}},
 		"cross":       {plan: &optimizer.Join{Algo: optimizer.JoinAlgoNestedLoop, Type: optimizer.JoinTypeCross, Lateral: true, Left: &optimizer.SeqScan{}, Right: probePlan()}, left: &seqScanOp{}, right: &indexScanOp{}},
 		// NOTE: non-lateral INNER over a probe is NOT refused — R94's
 		// ordinary rule admits it (same agreement lesson as the planner
