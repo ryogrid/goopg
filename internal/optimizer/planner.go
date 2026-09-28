@@ -6064,12 +6064,50 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// non-simple leaf gets the labelling wrapper.
 	if !appendrelSubquery && derivedSubqueryNeedsScan(rv.Subquery, inner) {
 		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx}
+	} else if p, ok := inner.(*Project); ok {
+		// M0146-0029: the columns of a derived leaf "stay at 0" (above) —
+		// but an UNLABELLED leaf publishes its root's own schema, whose
+		// SourceTableIdx values are the INNER scope's numbering (restarted
+		// at 1 per query level). An outer reference to `ss1.x` carries the
+		// OUTER binding's id, which can equal an inner id of a sibling
+		// leg's column of the same name; every by-(Name, SourceTableIdx)
+		// re-resolver (reconcileNLILayout, reresolveJoinByName) then binds
+		// it to the wrong leg — regress join.sql's variable-free join alias
+		// panicked in assertSearchedTreeNeedsNoReconcile ("moves x from
+		// column 1 to 3"). Publish the root's columns at 0, as the labelled
+		// form already does, so resolution falls back to names and abstains
+		// on a genuine ambiguity. A copy, because the planned root can be
+		// shared.
+		inner = projectWithUnknownSources(p)
 	}
 	// Register the leaf subtree root whether or not it got the label —
 	// the triviality pass needs every derived scope's boundary to bound
 	// column-consumption per scope (setrefs.c trivial_subqueryscan).
 	scope.recordDerivedSubtree(inner)
 	return inner, b, nil
+}
+
+// projectWithUnknownSources returns p itself when none of its output
+// columns carries a SourceTableIdx, else a shallow copy whose schema has
+// every SourceTableIdx reset to 0 ("unknown / derived", plan.go). M0146-0029.
+func projectWithUnknownSources(p *Project) Node {
+	needs := false
+	for _, c := range p.schema {
+		if c.SourceTableIdx != 0 {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return p
+	}
+	c := *p
+	c.schema = make(Schema, len(p.schema))
+	for i, col := range p.schema {
+		col.SourceTableIdx = 0
+		c.schema[i] = col
+	}
+	return &c
 }
 
 // derivedSubqueryNeedsScan reports whether a FROM-clause subquery must keep

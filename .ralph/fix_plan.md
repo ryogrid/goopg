@@ -23723,7 +23723,7 @@ M0146-0001 re-baseline census on the new default arm.
     up; results = PG; gates units, tpch\-spotcheck, sf025 96/96, TPC\-H arm
     24/24, fire set \(Q51 Q93, none introduced\), regress runner 0/22\.
   Movement: none — PLAN-PARITY categories unchanged (Q93 already matched; Q51 first divergence above the window stage)
-- [ ] **M0146\-0029 — planner panic on a variable\-free join alias**
+- [x] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
   \(select \*, 123 as x from int4\_tbl i1\) ss1 left join \(select \*, q2 as
@@ -23737,6 +23737,46 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: plan the statement on a private cluster with the regress
     fixtures and find which createPlan arm binds `x` \(the USING merge column
     of two derived legs\) at a position `reconcileNLILayout` disagrees with\.
+  - **DONE 2026\-09\-28\.** Cause: SourceTableIdx numbering restarts per
+    query level\. An unlabelled derived leaf \(a simple subquery whose root is
+    a Project\) published its root schema with the INNER scope\'s ids, while
+    outer references carry the OUTER binding\'s id; `ss1\.x` \(outer id 1\)
+    collided with the sibling leg\'s `x` \(inner id 1\), and
+    `reresolveExprByName` moved it \(the searched\-tree assertion caught it\)\.
+    Fix \(`projectWithUnknownSources`, planner\.go\): such a leaf publishes its
+    columns at 0, the documented "columns themselves stay at 0" intent the
+    `SubqueryScan`\-labelled form already met\. Rows = PG expected\.
+    Test `TestDerivedLeafVariableFreeJoinAliasPlans` reproduces the panic
+    without the fix\.
+  - Residual \(ledgered\): EXPLAIN qualifies the sort key `i0\.f1` as
+    `i1\.f1` \(the same cross\-level id collision in EXPLAIN\'s qualifier\)\.
+  - `join` still aborts the regress runner, on the separate pre\-existing
+    M0146\-0030 below\.
+  Movement: none — crash fix; regress join.sql advances from line 1768 to line 3217
+- [ ] **M0146\-0030 — planner panic: LATERAL subquery with a column alias
+  list under ORDER BY** \(filed 2026\-09\-28 by M0146\-0029; pre\-existing,
+  reproduces on the HEAD\-equivalent binary\)\. Regress `join.sql:3217`
+  \(`int8\_tbl a, int8\_tbl x left join lateral \(select a\.q1 from int4\_tbl
+  y\) ss\(z\) on x\.q2 = ss\.z order by a\.q1, a\.q2, x\.q1, x\.q2, ss\.z`\)
+  panics `createPlan: Sort input target \[0 1 2 3 4\] drops sort\-key
+  column …` and aborts the regress runner\'s `join` case\.
+  Kind: impl
+  Parent: none
+  - First step: plan it on a private fixture cluster and find which
+    sort key \(`ss\.z`, the aliased LATERAL output\) the Sort input target
+    cannot place\.
+- [ ] **M0146\-0031 — planner panic: array\_agg\(distinct … order by …\) over
+  a derived column alias list** \(filed 2026\-09\-28; pre\-existing — the
+  regress `arrays` case already aborted the HEAD binary\)\. Regress
+  `arrays.sql:682` \(`select array\_agg\(distinct ar order by ar desc\) from
+  \(select array\[i / 2\] from generate\_series\(1,10\) a\(i\)\) b\(ar\)`\)
+  panics `createPlan: Aggregate input target \[\] drops group\-input column
+  …`\.
+  Kind: impl
+  Parent: none
+  - First step: reproduce on a private cluster; check what column the
+    DISTINCT/ORDER BY aggregate input needs from the `b\(ar\)` leaf that the
+    empty input target omits\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above
