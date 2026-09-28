@@ -127,3 +127,29 @@ a HEAD baseline.
   regress runner shows 0 of 22 case diffs changed against the HEAD baseline.
   A like-for-like list is required: runs over different case lists leave
   different catalog/statistics state and show spurious plan differences.
+
+## 8. Slice 3 (M0146-0028c, 2026-09-28): INNER / CROSS joins inside the body
+
+A body FROM item may carry INNER or CROSS joins to further plain relations.
+PG pulls the body's whole join tree up with it: only an outer join *around*
+the pulled subquery needs PlaceHolderVars, and an inner join's ON clause is a
+WHERE qual in all but name. `planFromItem` already plans a FROM item with
+its join chain and resolves the ON clauses against the item's own bindings.
+The pull-up only has to hide every relation of the chain and hand the chain
+to the parent's walk, where the seam flattens the INNER links into the one
+search problem.
+
+Still declined, each for a concrete reason:
+
+- **outer joins in the body.** goopg's outer-join demotion
+  (`demotedForPlan`, `reduceOuterJoins`) reads the parent's WHERE by column
+  name, and its IS-NULL strip for LEFT→ANTI runs on the parent's WHERE. For
+  a body join those must be the body's WHERE; wiring that is its own slice.
+- **USING / NATURAL.** They merge columns through per-join resolve contexts
+  (`usingHidden` lives on the merged context, not the binding), which the
+  body re-resolution does not rebuild.
+- **derived legs** (a subquery as a join operand).
+
+Movement: none on TPC-H or TPC-DS (no corpus body has an inner JOIN);
+regress runner 0 of 22 case diffs changed vs HEAD; live queries with joined
+bodies return PG's rows and search the joined relations as one problem.

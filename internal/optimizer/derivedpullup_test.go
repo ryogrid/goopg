@@ -103,7 +103,10 @@ func TestDerivedPullupDeclines(t *testing.T) {
 		"SELECT * FROM (SELECT DISTINCT ax FROM a) y, b",                                    // DISTINCT
 		"SELECT * FROM (SELECT ax FROM a LIMIT 1) y, b",                                     // LIMIT
 		"SELECT * FROM (SELECT ax FROM a) y (z), b",                                         // column alias list
-		"SELECT * FROM (SELECT ax FROM a JOIN c ON a.ay = c.cy) y, b",                       // JOIN in body
+		"SELECT * FROM (SELECT ax FROM a LEFT JOIN c ON a.ay = c.cy) y, b",                  // outer JOIN in body
+		"SELECT * FROM (SELECT ax FROM a JOIN c USING (ax)) y, b",                           // USING in body
+		"SELECT * FROM (SELECT ax FROM a NATURAL JOIN c) y, b",                              // NATURAL in body
+		"SELECT * FROM (SELECT ax FROM a JOIN (SELECT cx FROM c) z ON ax = cx) y, b",        // derived join leg
 		"SELECT * FROM (SELECT ax FROM a WHERE ay IN (SELECT dx FROM d)) y, b",              // sublink in body
 		"SELECT * FROM (SELECT ax, ax FROM a) y, b",                                         // duplicate output name
 		"SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay = b.by) y",                     // LATERAL
@@ -192,5 +195,24 @@ func TestDerivedPullupLoneFromItem(t *testing.T) {
 	}
 	if len(node.Output()) != 4 {
 		t.Fatalf("FROM tree width %d, want a's 2 + b's 2", len(node.Output()))
+	}
+}
+
+// Slice 3 (M0146-0028c): an INNER join inside the body is pulled up with it
+// — every relation of the join becomes a hidden leaf of the parent search.
+func TestDerivedPullupBodyInnerJoin(t *testing.T) {
+	_, node, rctx := pullupPlanFrom(t, "SELECT k, z FROM (SELECT ax AS k, cy AS z FROM a JOIN c ON a.ay = c.cx WHERE ax > 1) y, b WHERE y.k = b.bx")
+	if len(rctx.pulledDerived) != 1 || len(rctx.bindings) != 3 {
+		t.Fatalf("body join not pulled up: derived=%d bindings=%d", len(rctx.pulledDerived), len(rctx.bindings))
+	}
+	if !rctx.bindings[0].pulledHidden || !rctx.bindings[1].pulledHidden || rctx.bindings[2].pulledHidden {
+		t.Fatal("both join relations must be hidden leaves; b must stay visible")
+	}
+	if len(node.Output()) != 6 {
+		t.Fatalf("FROM tree width %d, want a(2)+c(2)+b(2)", len(node.Output()))
+	}
+	z, ok := pullupResolve(t, rctx, "y", "z").(*ColumnRef)
+	if !ok || z.Index != rctx.bindings[1].offset+1 {
+		t.Fatalf("y.z resolved to %#v, want c.cy at slot %d", z, rctx.bindings[1].offset+1)
 	}
 }

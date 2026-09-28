@@ -23696,6 +23696,19 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(no fires\), regress runner 0/22 diffs changed vs HEAD\.
   Movement: yes — TPC-H PLAN-PARITY match 6 -> 7 (Q9), CATEGORIES-EXCL-MATCH aggregation-strategy 7 -> 5
+- [x] **M0146\-0028c — slice 3: INNER / CROSS joins inside the body**
+  \(impl, done 2026\-09\-28\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §8\.
+  Kind: impl
+  Parent: M0146-0028
+  - `simpleDerivedPullupBody` admits INNER/CROSS join chains of plain
+    relations with sublink\-free ON clauses; `planFromItem` plans the chain
+    and every relation of it becomes a hidden leaf\.
+  - Declined: outer joins \(demotion reads the parent WHERE by name\),
+    USING/NATURAL \(merged\-column contexts\), derived join legs\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(no fires\), regress runner 0/22 changed vs HEAD\.
+  Movement: none — no corpus body carries an inner JOIN; PG-faithful widening
 - [ ] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
