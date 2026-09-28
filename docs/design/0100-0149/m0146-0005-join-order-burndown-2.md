@@ -368,3 +368,24 @@ Q37, Q59 and Q71 moved to new, unrouted `join-order`/`join-method` records.
 Movement: SF0.25 `parallelism` 48 → 47, `qual-placement` 19 → 18; SF1
 `qual-placement` 20 → 19; match unchanged (16 / 14). Sweep 96/96 (5 plans
 changed: Q5 Q66 Q71 Q75 Q76), fire set 5 fires, no introduced timeouts.
+
+## Slice 30 (recon): M0146-0005ad — Q59 has no FROM-subquery pull-up, routed
+
+Evidence `analysis/m0146/m0146-0005/slice30/`. With the DP trace on, goopg
+solves Q59 as three separate problems — `{wss,store,d}` for each of the
+subqueries y and x, then `{y,x}` — so PG's order, which joins x's
+`wss_1 ⋈ store_1` to all of y and adds `date_dim d_1` last through a nested
+loop over a Materialize, is outside goopg's search space. The cause is
+architectural: `planSubqueryRangeVar` plans every FROM-clause subquery as its
+own scope (M0146-0005w only removes the `Subquery Scan` label for simple
+bodies), while PG's `pull_up_simple_subquery` (prepjointree.c) splices a
+simple body's FROM items into the parent jointree and substitutes the
+subquery's output columns by expression (`pullup_replace_vars`). The
+M0145-0001 contract (§4.3, "the same mechanism covers FROM-clause derived
+tables") planned this and it was never built.
+
+Reach on TPC-DS: simple multi-relation FROM subqueries appear in Q2, Q51,
+Q59 and Q93; only Q2 and Q59 have a sibling FROM item, so only they can
+change join order (Q2 currently diverges earlier). TPC-H Q7/Q8/Q9 are
+unaffected — their lone FROM subquery already holds every relation. Filed as
+M0146-0028. Movement: none — routing recon.

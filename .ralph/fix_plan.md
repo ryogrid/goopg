@@ -22814,6 +22814,24 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck \(Q12=2 Q13=33\), sf025 sweep 96/96,
     TPC\-H arm 24/24, fire set \(5 fires, none introduced\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 parallelism 48 -> 47, qual-placement 19 -> 18; SF1 qual-placement 20 -> 19
+- [x] **M0146\-0005ad — Q59 is outside goopg\'s join search: no
+  FROM\-subquery pull\-up** \(slice 30, recon, filed and done 2026\-09\-28\):
+  the last unrouted record of the `bb431e90c` census\. Evidence
+  `analysis/m0146/m0146\-0005/slice30/`; design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 30"\.
+  Kind: recon
+  Parent: M0146-0005
+  - DP trace on a private SF0\.25 clone: three separate problems
+    \(`\{wss,store,d\}` for y and for x, then `\{y,x\}`\); PG searches all six
+    relations and joins x\'s `wss\_1 ⋈ store\_1` to y first\.
+  - Cause: `planSubqueryRangeVar` plans a FROM subquery as its own scope;
+    PG\'s `pull\_up\_simple\_subquery` splices simple bodies into the parent
+    jointree\. Planned in M0145\-0001 §4\.3, never built\.
+  - Reach: Q2 and Q59 \(simple multi\-relation subquery beside another FROM
+    item\); Q51/Q93/TPC\-H Q7\-Q9 are lone FROM items and unaffected\.
+    Filed M0146\-0028\.
+  Movement: none — routing recon
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -23613,6 +23631,22 @@ M0146-0001 re-baseline census on the new default arm.
       \(pre\-existing, join\-order subsystem\)\.
   Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\); Q71 emits PG's full NL\-over\-ParallelAppend\-\>per\-leg\-PHJ spine and Q76 gains per\-leg PHJs \(slice 5; all\-depth categories join\-method 46\->45, parallelism 54\->53 SF0\.25; first\-divergence record relabels only — Q76 sort\-strategy\->aggregation\-strategy\); Q28 full MATCH at both scales and Q16's agg\-input spine matches PG's \(slice 6; SF0\.25 match 11\->12 divergent 88\->87, SF1 match 13\->14 divergent 86\->85\)
 
+- [ ] **M0146\-0028 — pull simple FROM\-clause subqueries into the parent
+  join search** \(impl; filed 2026\-09\-28 by M0146\-0005ad\)\. PG\'s
+  `pull\_up\_subqueries` → `pull\_up\_simple\_subquery` \(prepjointree.c\)
+  replaces an `is\_simple\_subquery` RTE\_SUBQUERY with its FROM items and
+  quals and rewrites references to its outputs through
+  `pullup\_replace\_vars`; goopg\'s `planSubqueryRangeVar` plans every FROM
+  subquery as a separate scope, so the parent search never sees its
+  relations\. Witnesses: TPC\-DS Q59 \(first divergence depth 2
+  `join\-method`\), Q2\.
+  Kind: impl
+  Parent: M0146-0005
+  - First step: reuse the sublink pull\-up splice
+    \(`flattenPulledBodyTree` / `splicePulledLeaves`, jointreepullup.go\)
+    for an inner\-join body, adding the by\-expression output substitution
+    the M0145\-0001 contract §4\.3 describes; keep non\-simple bodies
+    \(`derivedSubqueryNeedsScan`\) as opaque leaves\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above
