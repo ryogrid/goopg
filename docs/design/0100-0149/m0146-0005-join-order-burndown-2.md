@@ -492,3 +492,35 @@ Movement: TPC-H Q16's first divergence moves from depth 1
 `parallelism` 7 → 6, `parameterisation` 4 → 3, `join-order` 11 → 10. TPC-DS
 plans are unchanged at both scales (no fires). Values are identical.
 Evidence: `analysis/m0146/m0146-0005/slice33/`.
+
+## Slice 34: M0146-0005ah — passthrough columns belong to the aggregate's input target
+
+TPC-H Q18 groups by `c_name, c_custkey, o_orderkey, o_orderdate,
+o_totalprice`. PG reduces the key to `c_custkey, o_orderkey` through
+primary-key functional dependency (`remove_useless_groupby_columns`) and
+elects `HashAggregate -> Gather`. goopg performs the same reduction and
+carries the dropped columns as `Aggregate.Passthrough`, yet elected
+`GroupAggregate -> Gather Merge -> Sort`. Its hashed candidates cost about
+1.6M over a 335k input, while PG's HashAggregate adds about 6k.
+
+- **Cause.** `groupAggregateInputNames` declined — returned "unknown" — for
+  any aggregate with a Passthrough, so `InputTarget` was never known.
+  `aggInputWidth` then sized the hash entries and the sort rows from the
+  full 33-column join row (width 1654). At 509k groups that overflows the
+  1GB hash budget and charges a spill. PG sizes the same entries from the
+  narrowed input target (width 52).
+- **Change.** Passthrough expressions are enumerated like group keys. The
+  applying cut (`narrowAggregateInput`) already rewrote and gate-checked
+  them (`keepPreservesExprList`); only the derivation declined. An
+  unenumerable passthrough (an outer reference, say) still declines.
+  `TestAggregateInputTargetUnknownOnPassthrough` becomes
+  `TestAggregateInputTargetKeepsPassthrough`.
+
+Movement: Q18's first divergence moves from depth 1 (aggregation-strategy)
+to depth 3 (PG's Parallel Hash Join against a nested loop under the Gather).
+TPC-H `aggregation-strategy` 4 → 3, `sort-strategy` 4 → 3, `parallelism`
+6 → 5, `join-method` 4 → 5. TPC-DS plans are unchanged at both scales, and
+values are identical. In the regress runner, 7 cases (including
+`functional_deps`) show one change against HEAD: the row order of one
+unordered `join.sql` query, with the same row set. Evidence:
+`analysis/m0146/m0146-0005/slice34/`.

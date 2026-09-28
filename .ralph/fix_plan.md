@@ -22886,6 +22886,22 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
     TPC\-DS plan change\), regress runner 7 cases 0 changed vs HEAD\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 5 -> 4, sort-strategy 5 -> 4, parallelism 7 -> 6, parameterisation 4 -> 3, join-order 11 -> 10 (Q16 first divergence depth 1 -> 5)
+- [x] **M0146\-0005ah — passthrough columns belong to the aggregate input
+  target** \(slice 34, impl, filed and done 2026\-09\-28 from the same TPC\-H
+  census\): TPC\-H Q18\'s FD\-reduced grouping declined its input target
+  \(any Passthrough → unknown\), so hashing was priced on the full 1654\-wide
+  join row and spilled; PG sizes it on the narrowed row and elects
+  `HashAggregate \-> Gather`\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 34"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `groupAggregateInputNames` enumerates `Aggregate.Passthrough`; the
+    applying cut already remapped/gated it\.
+  - Regress runner \(7 cases incl\. functional\_deps\): one unordered
+    join.sql query changes row order, same row set; EXPLAINs identical\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
+    TPC\-DS plan change\)\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 4 -> 3, sort-strategy 4 -> 3, parallelism 6 -> 5 (Q18 first divergence depth 1 -> 3)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

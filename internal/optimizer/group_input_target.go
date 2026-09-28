@@ -29,9 +29,10 @@ import "fmt"
 //     arm now walks Filter (B-01c window cut), but the group derivation
 //     keeps the field-level decline anyway: a future applying cut must
 //     re-prove the filter's evaluation scope before consuming it, and the
-//     decline is the safe side. (Same for Passthrough below.)
-//   - any Aggregate.Passthrough present → UNKNOWN. walkPlanExprs now walks
-//     Passthrough too (same cut), with the same intentional decline here.
+//     decline is the safe side.
+//   - Aggregate.Passthrough expressions are enumerated like group keys
+//     (M0146-0005ah; they used to decline). The applying cut rewrites and
+//     gate-checks them (narrowAggregateInput → keepPreservesExprList).
 //     (enclosingNodeScopeOf does — enclosingtree.go:143
 //     — but that is the above-chain walker, whose extra width only ever
 //     widens a keep; the stamped node's own reads need the node-level
@@ -57,13 +58,13 @@ import "fmt"
 // LIFECYCLE: buildAggregateStage stamps keys-only at construction (above not
 // yet built, passthroughs not yet appended). Passthrough columns are appended
 // later during target resolution (resolveColumnRefAfterAggregate /
-// resolveTargetsAfterAggregate), which re-stamps: presence of any
-// passthrough flips the payload to unknown per the decline rule above.
+// resolveTargetsAfterAggregate), which re-stamps with the passthrough
+// columns in the keep.
 
 // groupAggregateInputNames returns every column name the Aggregate reads from
 // its input row, and whether the answer is COMPLETE. Incomplete (false) means
-// "decline": any Filter present, any Passthrough present, or an unenumerable
-// group/arg/order expression. A nil Arg (count(*)) or nil order key Expr
+// "decline": any Filter present, or an unenumerable group/passthrough/arg/order
+// expression. A nil Arg (count(*)) or nil order key Expr
 // contributes nothing (matching walkPlanExprs' Aggregate arm, which walks
 // non-nil fields only).
 func groupAggregateInputNames(agg *Aggregate) (map[string]bool, bool) {
@@ -75,10 +76,7 @@ func groupAggregateInputNames(agg *Aggregate) (map[string]bool, bool) {
 			return nil, false
 		}
 	}
-	if len(agg.Passthrough) > 0 {
-		return nil, false
-	}
-	names := make(map[string]bool, len(agg.GroupExprs)+len(agg.Aggs))
+	names := make(map[string]bool, len(agg.GroupExprs)+len(agg.Aggs)+len(agg.Passthrough))
 	visit := func(e Expr) bool {
 		if e == nil {
 			return true
@@ -90,6 +88,17 @@ func groupAggregateInputNames(agg *Aggregate) (map[string]bool, bool) {
 	}
 	for _, g := range agg.GroupExprs {
 		if !visit(g) {
+			return nil, false
+		}
+	}
+	// M0146-0005ah: Passthrough columns (functionally dependent GROUP BY
+	// columns the grouping carries without comparing, PG's
+	// remove_useless_groupby_columns) are input-row reads like a group key;
+	// the applying cut already rewrites and gate-checks them
+	// (narrowAggregateInput → keepPreservesExprList). Declining on them left
+	// every FD-reduced grouping — TPC-H Q18 — priced on the full join row.
+	for _, pt := range agg.Passthrough {
+		if !visit(pt) {
 			return nil, false
 		}
 	}
@@ -180,7 +189,7 @@ func pathToAggregateNode(above Node, stopAt *Aggregate) ([]Node, bool) {
 // above information" (the construction-time stamp): the keep is the group
 // inputs alone. ok == false ("unknown", decline) wherever the derivation does
 // not apply: nil aggregate, nil child, a declined group-input enumeration
-// (Filter / Passthrough / unenumerable expression), or (with a non-nil above)
+// (Filter / unenumerable expression), or (with a non-nil above)
 // an unenumerable above-chain.
 //
 // A name in the union that matches no input column contributes no position:
