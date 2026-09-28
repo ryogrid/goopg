@@ -2298,6 +2298,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// aggregate stage's target. TPC-H Q3, Q5, Q9, Q10,
 			// Q21 all use ORDER BY <alias> shapes.
 			expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+			// M0146-0005ak: an item a WHERE constant pins sorts nothing
+			// (PG's redundant sort pathkey, groupkeyconst.go).
+			if orderItemPinnedByWhere(expr, s) {
+				continue
+			}
 			var e Expr
 			var err error
 			// If resolveOrderBySubstitution returned the original IntegerConst
@@ -9353,62 +9358,76 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// GROUPING(...) calls and grouping sets both depend on the full column set,
 	// so neither can coexist with pruning (initsplan.c:426).
 	if s.GroupingSets == nil && len(collectGroupingCalls(s)) == 0 {
-		keep, pruned := pruneUselessGroupByColumns(groupExprs, inputCtx, cat)
-		if keep != nil {
-			// Remap slot indices: kept item i moves to slot oldToNew[i]. PG
-			// keeps the ORIGINAL group order with the surplus removed
-			// (initsplan.c:610-625). Aggregate and grouping-mask output columns
-			// are appended AFTER the group columns, so compacting the prefix
-			// shifts their indices automatically.
-			oldToNew := make([]int, len(groupExprs))
-			newIdx := 0
-			for i := range groupExprs {
-				if keep[i] {
-					oldToNew[i] = newIdx
-					newIdx++
-				} else {
-					oldToNew[i] = -1
-				}
+		// M0146-0005ak: two prunings, in PG's order —
+		// remove_useless_groupby_columns (initsplan.c, query_planner time),
+		// then the redundant-pathkey filter standard_qp_callback applies
+		// to what remains (groupkeyconst.go).
+		for pass := 0; pass < 2; pass++ {
+			var keep []bool
+			var pruned map[int]bool
+			if pass == 0 {
+				keep, pruned = pruneUselessGroupByColumns(groupExprs, inputCtx, cat)
+			} else {
+				keep, pruned = redundantConstGroupKeys(groupExprs, s, inputCtx)
 			}
-			newGroupExprs := make([]Expr, 0, newIdx)
-			newSchema := make(Schema, 0, newIdx)
-			var newOrigIdx []int
-			for i := range groupExprs {
-				if keep[i] {
-					newGroupExprs = append(newGroupExprs, groupExprs[i])
-					newSchema = append(newSchema, outputSchema[i])
-					if groupOrigIdx != nil {
-						newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+			if keep != nil {
+				// Remap slot indices: kept item i moves to slot oldToNew[i]. PG
+				// keeps the ORIGINAL group order with the surplus removed
+				// (initsplan.c:610-625). Aggregate and grouping-mask output columns
+				// are appended AFTER the group columns, so compacting the prefix
+				// shifts their indices automatically.
+				oldToNew := make([]int, len(groupExprs))
+				newIdx := 0
+				for i := range groupExprs {
+					if keep[i] {
+						oldToNew[i] = newIdx
+						newIdx++
+					} else {
+						oldToNew[i] = -1
 					}
 				}
-			}
-			groupExprs = newGroupExprs
-			if groupOrigIdx != nil {
-				groupOrigIdx = newOrigIdx
-			}
-			outputSchema = newSchema
-			for key, old := range groupByExpr {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByExpr[key] = oldToNew[old]
-				} else {
-					delete(groupByExpr, key)
+				newGroupExprs := make([]Expr, 0, newIdx)
+				newSchema := make(Schema, 0, newIdx)
+				var newOrigIdx []int
+				for i := range groupExprs {
+					if keep[i] {
+						newGroupExprs = append(newGroupExprs, groupExprs[i])
+						newSchema = append(newSchema, outputSchema[i])
+						if groupOrigIdx != nil {
+							newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+						}
+					}
+				}
+				groupExprs = newGroupExprs
+				if groupOrigIdx != nil {
+					groupOrigIdx = newOrigIdx
+				}
+				outputSchema = newSchema
+				for key, old := range groupByExpr {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByExpr[key] = oldToNew[old]
+					} else {
+						delete(groupByExpr, key)
+					}
+				}
+				for key, old := range groupByExprQual {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByExprQual[key] = oldToNew[old]
+					} else {
+						delete(groupByExprQual, key)
+					}
+				}
+				for inputIdx, old := range groupByInputCol {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByInputCol[inputIdx] = oldToNew[old]
+					} else {
+						delete(groupByInputCol, inputIdx)
+					}
+				}
+				for k := range pruned {
+					prunedInputCols[k] = true
 				}
 			}
-			for key, old := range groupByExprQual {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByExprQual[key] = oldToNew[old]
-				} else {
-					delete(groupByExprQual, key)
-				}
-			}
-			for inputIdx, old := range groupByInputCol {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByInputCol[inputIdx] = oldToNew[old]
-				} else {
-					delete(groupByInputCol, inputIdx)
-				}
-			}
-			prunedInputCols = pruned
 		}
 	}
 

@@ -22942,6 +22942,25 @@ M0146-0001 re-baseline census on the new default arm.
       \(Q16 Q48 Q72 Q94, none introduced\), regress runner 5 cases: one
       join\.sql EXPLAIN moves the PG way\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH qual-placement 3 -> 2 (Q19); TPC-DS qual-placement SF0.25 18 -> 17, SF1 19 -> 18 (Q94)
+- [x] **M0146\-0005ak — keys a WHERE constant pins; sorted aggregates split
+  over a Gather Merge** \(slice 37, impl, filed and done 2026\-09\-29 from the
+  TPC\-DS SF0\.25 census, Q42/Q52\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 37"\.
+  Kind: impl
+  Parent: M0146-0005
+  - GROUP BY: `redundantConstGroupKeys` drops a bare\-column key pinned by a
+    top\-level WHERE `col = const` \(PG 16\+ processed\_groupClause\); the
+    column stays a passthrough; declines when every key is pinned\.
+  - ORDER BY: `orderItemPinnedByWhere` skips pinned items \(not for grouping
+    sets or set operations\)\.
+  - Fixed a pre\-existing run\-time ERROR: a sorted aggregate split around
+    a plain Gather \(`addPartialAggSplitArm` pinned to hashed;
+    `splitAggregate` builds the Gather Merge sorted\-input split\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(FORCE=1 values\-only, nightly
+    batch running\), TPC\-H arm \(FORCE=1 values\), fire set \(5 fires, none
+    introduced\), regress runner 10 cases: limit\.sql error fixed, one
+    PG\-ward Sort removal\.
+  Movement: yes — TPC-DS CATEGORIES-EXCL-MATCH rendering SF0.25 24 -> 21, SF1 20 -> 17; SF1 Q52 near-tie flip (join-method/aggregation-strategy/sort-strategy +1 each)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -23968,6 +23987,21 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: port `array\_agg\_array\_transfn` / `array\_agg\_array\_finalfn`
     \(src/backend/utils/adt/array\_userfuncs\.c\) as the anyarray arm of
     goopg\'s array\_agg, including the dimension\-mismatch error\.
+- [ ] **M0146\-0034 — WRONG RESULTS: Limit over a plain Gather of an
+  ordered parallel index scan returns rows in scheduling order** \(filed
+  2026\-09\-29 by M0146\-0005ak; S2, pre\-existing on e379ea18b\)\.
+  `select d\_date\_sk from date\_dim where d\_year = 1998 order by d\_date\_sk
+  limit 1` on the TPC\-DS SF0\.25 data plans `Limit \-> Gather \-> Parallel
+  Index Scan using date\_dim\_pkey` and returns 2450926 in 6 of 12 runs
+  \(correct: 2450815\)\. A Gather interleaves leader and worker streams, so
+  the index order is lost; PG orders such a partial path with Gather Merge
+  \(generate\_useful\_gather\_paths\) and never claims pathkeys for a Gather\.
+  Repro `analysis/m0146/m0146\-0005/slice37/m0146\-0034\-repro.sql`\.
+  Kind: impl
+  Parent: none
+  - First step: find where the ordered\-rel / Limit path accepts a Gather
+    path as carrying the index scan\'s pathkeys \(Gather must publish no
+    pathkeys\)\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

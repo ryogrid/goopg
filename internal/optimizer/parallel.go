@@ -1754,6 +1754,13 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int, leader bool) N
 			// splitAggregate's Partial is a fresh copy whose Child is the
 			// freshly stamped subtree; rescale that subtree's driving scan.
 			if fin, ok := split.(*Aggregate); ok {
+				// A sorted aggregate splits over a Gather Merge instead
+				// (splitAggregate): same per-worker rescale.
+				if gm, ok := fin.Child.(*GatherMerge); ok {
+					if part, ok := gm.Child.(*Aggregate); ok && part.Child != orig.Child {
+						perWorkerDisplayRows(part.Child, getParallelDivisor(workers, leader))
+					}
+				}
 				if g, ok := fin.Child.(*Gather); ok {
 					if part, ok := g.Child.(*Aggregate); ok && part.Child != orig.Child {
 						perWorkerDisplayRows(part.Child, getParallelDivisor(workers, leader))
@@ -1851,6 +1858,29 @@ func perWorkerDisplayRows(stamped Node, divisor float64) {
 // aggregation whatsoever.
 func splitAggregate(a *Aggregate, workers int) Node {
 	emit := aggregateSplitIsSafe(a)
+	// M0146-0005ak: a SORTED aggregate cannot split around a plain Gather.
+	// The Gather interleaves the workers' streams, and since the row
+	// transport (M0146-0003b) a sorted finalize requires a merge-ordered
+	// child — `Finalize GroupAggregate -> Gather` failed at run time with
+	// "partial-state stream is not ordered by group key" (`SELECT d_moy,
+	// count(*) ... GROUP BY d_moy ORDER BY d_moy` on a one-worker scan).
+	// Nor may it silently become hashed: the plan above may rely on the
+	// sorted output order. PG's sorted split is `Finalize GroupAggregate ->
+	// Gather Merge -> Partial GroupAggregate -> Sort`, which
+	// splitAggregateTransportSortedInput builds; the serial input Sort is
+	// replaced by the per-worker one. With no expressible merge key the
+	// aggregate stays serial.
+	if a.Strategy == AggStrategySorted && emit {
+		mergeKeys, ok := transportGroupSortKeys(a)
+		if !ok {
+			return a
+		}
+		src := *a
+		if srt, isSort := a.Child.(*Sort); isSort && srt.Child != nil {
+			src.Child = srt.Child
+		}
+		return splitAggregateTransportSortedInput(&src, workers, mergeKeys, groupKeysSortKeys(a))
+	}
 	partial := *a
 	partial.Mode = AggModePartial
 	partial.PartialEmit = emit

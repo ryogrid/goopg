@@ -627,3 +627,60 @@ Remaining (ledgered):
   l2.l_orderkey`) is not generated.
 
 Evidence: `analysis/m0146/m0146-0005/slice36/`.
+
+## Slice 37: M0146-0005ak — keys a WHERE constant pins; sorted aggregates split over a Gather Merge
+
+TPC-DS Q42/Q52 group and order by `dt.d_year` under `WHERE dt.d_year =
+<const>`. PG's `Group Key:` and `Sort Key:` lines omit it. Since PG 16,
+`standard_qp_callback` builds the group and sort pathkeys with
+`make_pathkeys_for_sortclauses_extended(..., remove_redundant = true)`. A
+clause whose equivalence class holds a constant sorts and groups nothing
+(`pathkey_is_redundant`), so it leaves `processed_groupClause` and
+`sort_pathkeys`.
+
+- **GROUP BY** (`redundantConstGroupKeys`, groupkeyconst.go). A second pass
+  after `pruneUselessGroupByColumns` in `buildAggregateStage` drops a
+  bare-column key pinned by a top-level WHERE `col = const`. The column
+  stays in the output as a passthrough, the same mechanism
+  functional-dependency pruning uses. It declines in three cases:
+  - every key is pinned (PG then runs a keyless GroupAggregate that
+    returns no row on empty input, which goopg's zero-key aggregate
+    cannot express);
+  - the query has grouping sets or `GROUPING()` calls (existing gate);
+  - the equality is under an OR.
+- **ORDER BY** (`orderItemPinnedByWhere`). A pinned item is skipped when
+  sort keys are built. Items are matched on the written column, and an
+  unqualified name that resolved is unambiguous. It declines for grouping
+  sets, where a set's non-member columns are NULL above the WHERE (regress
+  groupingsets `WHERE x = 1 ... GROUPING SETS (x, y) ORDER BY 1, 2`), and
+  for set operations. With every item pinned no Sort is built. With WITH
+  TIES every row ties, which is correct because pinned rows are equal.
+- **A sorted aggregate split around a plain Gather** (pre-existing run-time
+  ERROR, fixed here). Since the row transport (M0146-0003b) a sorted
+  finalize needs a merge-ordered child. Two producers still built
+  `Finalize GroupAggregate -> Gather`, which failed with "partial-state
+  stream is not ordered by group key" (regress `limit.sql`, and `SELECT
+  d_moy, count(*) ... GROUP BY d_moy ORDER BY d_moy` on a one-worker scan):
+  - `addPartialAggSplitArm` took the serial election's strategy. It is now
+    pinned to hashed: that arm is `Finalize -> Gather`, and PG's sorted
+    finalize always sits on a Gather Merge, which the sorted-input and
+    presorted arms file.
+  - The parallel post-pass `splitAggregate` split a sorted aggregate around
+    a Gather. It now builds `splitAggregateTransportSortedInput` (Finalize
+    GroupAggregate -> Gather Merge -> Partial GroupAggregate -> Sort). It
+    cannot become hashed, because the plan above may rely on the sorted
+    output order.
+
+Movement: TPC-DS `rendering` 24 → 21 at SF0.25 and 20 → 17 at SF1 (Q42, Q52,
+Q81 group and sort lines now match). One cost tie flips at SF1: Q52's
+sorted-input split (20331.816) now undercuts the gathered GroupAggregate PG
+elects (20331.819) because the pinned key's comparison cost left both, and
+SF1 `join-method`, `aggregation-strategy` and `sort-strategy` each rise by
+1. TPC-H is unchanged. In the regress runner (10 cases like-for-like):
+`limit.sql` returns PG's rows instead of the internal error, and join.sql's
+`WHERE fault = 122 ORDER BY fault` loses its Sort, as in PG.
+
+Found on the way and filed as S2, not fixed: **M0146-0034**. `Limit ->
+Gather -> Parallel Index Scan` returns rows in scheduling order: `ORDER BY
+d_date_sk LIMIT 1` gives the wrong first row in 6 of 12 runs on HEAD. Evidence:
+`analysis/m0146/m0146-0005/slice37/`.

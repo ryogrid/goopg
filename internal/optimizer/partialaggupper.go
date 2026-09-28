@@ -524,7 +524,6 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
 	inNcols, inAvgVar := aggInputWidth(child, aggNode)
-	strategy := aggNode.Strategy
 
 	// ── the SPLIT family, offered only for a DECOMPOSABLE aggregate ─────────
 	//
@@ -556,10 +555,20 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		hashedPartialSurvives := !sortedEligible ||
 			hashedPartialAggSurvives(pseed, aggNode, cp, ps, perWorkerRows, partialGroups,
 				nGroupCols, nAggs, inNcols, inAvgVar)
-		if hashedPartialSurvives || strategy != AggStrategyHashed {
+		// M0146-0005ak: this arm is `Finalize -> Gather -> Partial`, and a
+		// Gather interleaves the workers' streams, so only a HASHED
+		// finalize can consume it: since the row transport (M0146-0003b)
+		// a sorted finalize needs a merge-ordered child and errors at run
+		// time ("partial-state stream is not ordered by group key"). The
+		// serial election's `strategy` used to reach it, so a query whose
+		// serial arm chose sorted (`... GROUP BY d_moy ORDER BY d_moy` on a
+		// one-worker scan) elected `Finalize GroupAggregate -> Gather`.
+		// PG's sorted finalize always sits on a Gather Merge — the
+		// sorted-input and presorted arms below file those.
+		if hashedPartialSurvives {
 			split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar, strategy)
+				nGroupCols, nAggs, inNcols, inAvgVar, AggStrategyHashed)
 		}
 
 		// M0146-0003 S6: the PRESORTED split — `gather_grouping_paths`
