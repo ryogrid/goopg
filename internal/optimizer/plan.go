@@ -814,6 +814,13 @@ func SeqScanWithSchemaForTest(t *catalog.Table, schema Schema) *SeqScan {
 	return &SeqScan{Table: t, schema: schema}
 }
 
+// WithSchemaForTest stamps n's output schema, for executor-package tests
+// that need a probe's output columns to carry source ids.
+func (n *IndexScan) WithSchemaForTest(schema Schema) *IndexScan {
+	n.schema = schema
+	return n
+}
+
 // IndexScan probes a single-column B-tree index with an equality key
 // or a range of keys.
 //

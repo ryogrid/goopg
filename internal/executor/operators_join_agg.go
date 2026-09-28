@@ -337,6 +337,11 @@ type joinOp struct {
 	// each time joinPredicateMatchSlot returns false (residual reject).
 	joinFilterRemoved *int64
 
+	// probeQual / probeFilterRemoved: see nestedLoopIndexJoinOp — the
+	// Lateral nested-loop form over a parameterized probe splits the same way.
+	probeQual          optimizer.Expr
+	probeFilterRemoved *int64
+
 	// deformLeftBound / deformRightBound are the EX1-02 per-side deform
 	// bounds the tree builder used for THIS join's two children
 	// (deformJoinBounds, scan_deform.go). They are stamped by the Join arms
@@ -383,6 +388,10 @@ func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 }
 
 func (o *joinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
+
+func (o *joinOp) setProbeFilterAttribution(probe optimizer.Expr, counter *int64) {
+	o.probeQual, o.probeFilterRemoved = probe, counter
+}
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -1392,6 +1401,15 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
 	if !ok && o.joinFilterRemoved != nil {
 		*o.joinFilterRemoved++
+		if o.probeQual != nil && o.probeFilterRemoved != nil {
+			pv, err := evalExpr(o.probeQual, row, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			if pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+				*o.probeFilterRemoved++
+			}
+		}
 	}
 	return ok, nil
 }
@@ -1424,6 +1442,9 @@ func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
 	if !ok && o.joinFilterRemoved != nil {
 		*o.joinFilterRemoved++
+		if err := attributeProbeReject(o.probeQual, o.probeFilterRemoved, slot, o.ctx); err != nil {
+			return false, err
+		}
 	}
 	return ok, nil
 }

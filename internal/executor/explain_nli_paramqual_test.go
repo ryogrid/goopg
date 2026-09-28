@@ -19,13 +19,14 @@ func TestInnerParamQualPlacement(t *testing.T) {
 	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "i"),
 		Key:  &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1},
 		Cond: &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "p", SourceTableIdx: 2}})
 	outerCol := &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1}
 	innerCol := &optimizer.ColumnRef{Index: 1, Name: "a", SourceTableIdx: 2}
 	joinQual := &optimizer.BinaryOp{Op: parser.OpNe, Left: innerCol, Right: outerCol}
 	outerOnly := &optimizer.BinaryOp{Op: parser.OpGt, Left: outerCol, Right: &optimizer.IntegerConst{Value: 1}}
 
 	nli := &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeAnti, Outer: outer, Inner: inner, Predicate: joinQual}
-	q, _ := renderedParamQual(nli)
+	q, _, _ := renderedParamQual(nli)
 	if q == nil {
 		t.Fatal("inner-reading residual not moved to the inner scan")
 	}
@@ -45,8 +46,11 @@ func TestInnerParamQualPlacement(t *testing.T) {
 
 	mixed := &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner,
 		Predicate: &optimizer.BinaryOp{Op: parser.OpAnd, Left: joinQual, Right: outerOnly}}
-	if movedParamQual(mixed) {
-		t.Error("a conjunct that reads only the outer side must keep the residual on the join")
+	// PG places clauses one by one: the inner-reading conjunct moves to the
+	// probe and the outer-only one stays on the join (TPC-DS Q24's split).
+	mq, mj, applies := renderedParamQual(mixed)
+	if !applies || mq == nil || mj != outerOnly {
+		t.Errorf("mixed residual must split: probe=%v join=%v applies=%v", mq, mj, applies)
 	}
 
 	memo := &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner,
@@ -66,7 +70,7 @@ func TestInnerParamQualPlacement(t *testing.T) {
 	// ppi_clause and moves (TPC-DS Q50); one naming a relation outside it
 	// stays on the join (TPC-H Q9's supplier.s_suppkey = lineitem.l_suppkey).
 	ecEq := &optimizer.BinaryOp{Op: parser.OpEq, Left: innerCol, Right: outerCol}
-	if q, _ := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: ecEq}); q == nil {
+	if q, _, _ := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: ecEq}); q == nil {
 		t.Error("an inner = outer equality within required_outer renders under the probe, as TPC-DS Q50's")
 	}
 	ecOther := &optimizer.BinaryOp{Op: parser.OpEq, Left: innerCol, Right: &optimizer.ColumnRef{Index: 0, Name: "z", SourceTableIdx: 3}}
@@ -76,7 +80,7 @@ func TestInnerParamQualPlacement(t *testing.T) {
 
 	lateral := &optimizer.Join{Type: optimizer.JoinTypeSemi, Algo: optimizer.JoinAlgoNestedLoop, Lateral: true,
 		Left: outer, Right: inner, Predicate: joinQual}
-	if q, _ := renderedParamQual(lateral); q == nil || !paramInnerChild(lateral, inner) {
+	if q, _, _ := renderedParamQual(lateral); q == nil || !paramInnerChild(lateral, inner) {
 		t.Error("a lateral nested-loop join over a probe must move its residual too")
 	}
 	plain := &optimizer.Join{Type: optimizer.JoinTypeSemi, Algo: optimizer.JoinAlgoNestedLoop,
@@ -96,6 +100,7 @@ func TestInnerParamQualSeesInListOperand(t *testing.T) {
 	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "i"),
 		Key:  &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1},
 		Cond: &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "s", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "p", SourceTableIdx: 2}})
 	outerCol := &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1}
 	innerCol := &optimizer.ColumnRef{Index: 1, Name: "s", SourceTableIdx: 2}
 	arm := func(lo int64) optimizer.Expr {
@@ -105,7 +110,7 @@ func TestInnerParamQualSeesInListOperand(t *testing.T) {
 	}
 	orQual := &optimizer.BinaryOp{Op: parser.OpOr, Left: arm(0), Right: arm(10)}
 	nli := &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: orQual}
-	q, _ := renderedParamQual(nli)
+	q, _, _ := renderedParamQual(nli)
 	if q == nil {
 		t.Fatal("a residual reading the inner only inside IN operands must render under the probe")
 	}
@@ -133,25 +138,103 @@ func TestInnerParamQualDropsRestatedProbeKey(t *testing.T) {
 		Index: &catalog.Index{Name: "cd_pkey", Columns: []string{"cd_demo_sk"}},
 		Key:   &optimizer.ColumnRef{Index: 0, Name: "c_cdemo", SourceTableIdx: 1},
 		Cond:  &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "cd_demo_sk", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "p", SourceTableIdx: 2}})
 	outerCol := &optimizer.ColumnRef{Index: 0, Name: "c_cdemo", SourceTableIdx: 1}
 	keyCol := &optimizer.ColumnRef{Index: 1, Name: "cd_demo_sk", SourceTableIdx: 2}
 	restated := &optimizer.BinaryOp{Op: parser.OpEq, Left: outerCol, Right: keyCol}
 
-	q, moved := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: restated})
-	if !moved || q != nil {
+	q, j, moved := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: restated})
+	if !moved || q != nil || j != nil {
 		t.Fatalf("a restated key equality must print nowhere, got moved=%v qual=%v", moved, q)
 	}
 
 	// With another inner-reading conjunct, only that conjunct renders.
 	other := &optimizer.BinaryOp{Op: parser.OpNe, Left: &optimizer.ColumnRef{Index: 2, Name: "cd_x", SourceTableIdx: 2}, Right: outerCol}
-	q, moved = renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner,
+	q, j, moved = renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner,
 		Predicate: &optimizer.BinaryOp{Op: parser.OpAnd, Left: restated, Right: other}})
-	if b, ok := q.(*optimizer.BinaryOp); !moved || !ok || b.Op != parser.OpNe {
+	if b, ok := q.(*optimizer.BinaryOp); !moved || !ok || b.Op != parser.OpNe || j != nil {
 		t.Fatalf("only the non-key conjunct renders under the probe, got moved=%v qual=%#v", moved, q)
 	}
 }
 
+// movedParamQual reports whether any of n's residual renders differently
+// from the unsplit join line.
 func movedParamQual(n optimizer.Node) bool {
-	_, moved := renderedParamQual(n)
-	return moved
+	_, _, applies := renderedParamQual(n)
+	return applies
+}
+
+// TestSplitParamQualRejections pins how ANALYZE divides a parameterized
+// nested loop's residual rejections: a split residual reports the operator's
+// probe share on the inner scan and the rest on the join; an unsplit one
+// reports everything on whichever line prints it.
+func TestSplitParamQualRejections(t *testing.T) {
+	outer := optimizer.SeqScanWithSchemaForTest(parallelLabelTestTable(t, "o"), optimizer.Schema{{Name: "a"}})
+	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "i"),
+		Key:  &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1},
+		Cond: &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "p", SourceTableIdx: 2}})
+	outerCol := &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1}
+	innerCol := &optimizer.ColumnRef{Index: 1, Name: "a", SourceTableIdx: 2}
+	movable := &optimizer.BinaryOp{Op: parser.OpNe, Left: innerCol, Right: outerCol}
+	staying := &optimizer.BinaryOp{Op: parser.OpNe, Left: innerCol, Right: &optimizer.ColumnRef{Index: 0, Name: "z", SourceTableIdx: 3}}
+	nli := func(pred optimizer.Expr) optimizer.Node {
+		return &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: pred}
+	}
+	st := &nodeStats{joinFilterRejected: 10, probeFilterRejected: 4}
+	for _, tc := range []struct {
+		name        string
+		n           optimizer.Node
+		probe, join int64
+	}{
+		{"split", nli(&optimizer.BinaryOp{Op: parser.OpAnd, Left: movable, Right: staying}), 4, 6},
+		{"all moved", nli(movable), 10, 0},
+		{"none moved", nli(staying), 0, 10},
+	} {
+		p, j := splitParamQualRejections(tc.n, st)
+		if p != tc.probe || j != tc.join {
+			t.Errorf("%s: got probe=%d join=%d, want %d/%d", tc.name, p, j, tc.probe, tc.join)
+		}
+	}
+}
+
+// TestInnerParamQualSourceIdCollision pins the fail-closed rule for source
+// ids: they are FROM bindings within one planning scope, so in
+// `(a JOIN b) JOIN c` the nested join's b can carry the probe's own id. An
+// outer column whose id is also the probe's is not provably within
+// required_outer, so its conjunct stays on the join while its sibling moves.
+func TestInnerParamQualSourceIdCollision(t *testing.T) {
+	outer := optimizer.SeqScanWithSchemaForTest(parallelLabelTestTable(t, "o"), optimizer.Schema{{Name: "k"}, {Name: "v"}, {Name: "zv"}})
+	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "i"),
+		Key:  &optimizer.ColumnRef{Index: 0, Name: "k", SourceTableIdx: 1},
+		Cond: &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "w", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "p", SourceTableIdx: 2}})
+	w := &optimizer.ColumnRef{Index: 4, Name: "w", SourceTableIdx: 2}
+	movable := &optimizer.BinaryOp{Op: parser.OpNe, Left: w, Right: &optimizer.ColumnRef{Index: 1, Name: "v", SourceTableIdx: 1}}
+	colliding := &optimizer.BinaryOp{Op: parser.OpGt, Left: w, Right: &optimizer.ColumnRef{Index: 2, Name: "zv", SourceTableIdx: 2}}
+	q, j, applies := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner,
+		Predicate: &optimizer.BinaryOp{Op: parser.OpAnd, Left: movable, Right: colliding}})
+	if !applies || q == nil || j != colliding {
+		t.Fatalf("the colliding conjunct must stay on the join: probe=%v join=%v applies=%v", q, j, applies)
+	}
+}
+
+// TestInnerParamQualIgnoresOuterRefsInProbeQuals pins TPC-H Q19's shape: a
+// bitmap probe's Recheck Cond repeats the key's outer column, which must not
+// make the outer relation look like the probe's own — the residual reading
+// both relations still moves to the probe.
+func TestInnerParamQualIgnoresOuterRefsInProbeQuals(t *testing.T) {
+	outer := optimizer.SeqScanWithSchemaForTest(parallelLabelTestTable(t, "part"), optimizer.Schema{{Name: "p_partkey", SourceTableIdx: 1}, {Name: "p_brand", SourceTableIdx: 1}})
+	key := &optimizer.ColumnRef{Index: 0, Name: "p_partkey", SourceTableIdx: 1}
+	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "lineitem"), Key: key,
+		Cond: &optimizer.BinaryOp{Op: parser.OpEq, Left: &optimizer.ColumnRef{Index: 0, Name: "l_partkey", SourceTableIdx: 2},
+			Right: &optimizer.ColumnRef{Index: 0, Name: "p_partkey", SourceTableIdx: 1}}}
+	inner.WithSchemaForTest(optimizer.Schema{{Name: "l_partkey", SourceTableIdx: 2}, {Name: "l_quantity", SourceTableIdx: 2}})
+	resid := &optimizer.BinaryOp{Op: parser.OpOr,
+		Left:  &optimizer.BinaryOp{Op: parser.OpEq, Left: &optimizer.ColumnRef{Index: 1, Name: "p_brand", SourceTableIdx: 1}, Right: &optimizer.IntegerConst{Value: 12}},
+		Right: &optimizer.BinaryOp{Op: parser.OpGe, Left: &optimizer.ColumnRef{Index: 3, Name: "l_quantity", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 1}}}
+	q, j, applies := renderedParamQual(&optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: resid})
+	if !applies || q == nil || j != nil {
+		t.Fatalf("Q19's residual must move whole: probe=%v join=%v applies=%v", q, j, applies)
+	}
 }

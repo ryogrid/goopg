@@ -45,6 +45,14 @@ type nodeStats struct {
 	// nodes, surfaced by EXPLAIN ANALYZE as "Rows Removed by Join Filter".
 	joinFilterRejected int64
 
+	// probeFilterRejected is the share of joinFilterRejected a
+	// parameterized nested loop attributes to the part of its residual
+	// EXPLAIN renders as the inner scan's Filter (PG's ppi_clauses): a
+	// rejected row whose moved part fails counts here, as PG's scan qual
+	// would have rejected it before the join qual ran. Set only when the
+	// residual splits across both lines (probeFilterAttributor).
+	probeFilterRejected int64
+
 	// bufHit / bufRead / bufDirtied / bufWritten are the cumulative
 	// shared-buffer hit/read/dirtied/written counts EXPLAIN (ANALYZE,
 	// BUFFERS) attributes to this node, inclusive of its children (same
@@ -281,6 +289,16 @@ type joinFilterRemoveCounter interface {
 	setJoinFilterRemoveCounter(*int64)
 }
 
+// probeFilterAttributor is implemented by the parameterized nested-loop
+// operators. When EXPLAIN splits a residual between the inner scan's Filter
+// and the join line (paramQualPlacement), maybeInstrument hands the operator
+// the moved part (join-row coordinates) and a counter: on each rejection the
+// operator re-evaluates that part and counts the row there when it fails.
+// Only rejected rows pay the extra evaluation, and only under ANALYZE.
+type probeFilterAttributor interface {
+	setProbeFilterAttribution(probe optimizer.Expr, counter *int64)
+}
+
 // nodeStatsTable maps a planner.Node back to its instrumentation
 // counters. The EXPLAIN ANALYZE renderer walks the plan tree the
 // same way the static path does and looks up stats in this map
@@ -423,6 +441,11 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	}
 	if jf, ok := op.(joinFilterRemoveCounter); ok {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
+	}
+	if pa, ok := op.(probeFilterAttributor); ok {
+		if probe, join, applies := paramQualPlacement(plan); applies && probe != nil && join != nil {
+			pa.setProbeFilterAttribution(probe, &stats.probeFilterRejected)
+		}
 	}
 	if sc, ok := op.(instrumentScopeCarrier); ok {
 		sc.setInstrumentScope(scope)

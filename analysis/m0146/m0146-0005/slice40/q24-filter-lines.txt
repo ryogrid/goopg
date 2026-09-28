@@ -1,0 +1,10 @@
+##### date.plans.txt
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                         Filter: (customer.c_birth_country <> upper(ca_country))
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                         Filter: (customer.c_birth_country <> upper(ca_country))
+##### e-pg.plans.txt
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                         Filter: ((customer.c_birth_country)::text <> upper((ca_country)::text))
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                         Filter: ((customer.c_birth_country)::text <> upper((ca_country)::text))

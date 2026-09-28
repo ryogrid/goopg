@@ -22982,7 +22982,7 @@ M0146-0001 re-baseline census on the new default arm.
 - [x] **M0146\-0005al — the probe\-Filter rule sees `= ANY \(list\)` operands**
   \(slice 38, impl, filed and done 2026\-09\-29 from the TPC\-DS SF0\.25
   census, Q48\)\. Design
-  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 38"\.
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 38"\.
   Kind: impl
   Parent: M0146-0005
   - Q48\'s only divergence was its `customer\_address` OR clause kept as a
@@ -22998,7 +22998,7 @@ M0146-0001 re-baseline census on the new default arm.
 - [x] **M0146\-0005am — a probe residual\'s equalities follow PG\'s
   ppi\_clauses rules** \(slice 39, impl, filed and done 2026\-09\-29 from the
   TPC\-DS SF0\.25 census, Q50/Q84\)\. Design
-  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 39"\.
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 39"\.
   Kind: impl
   Parent: M0146-0005
   - Slice 36 kept any residual holding an `inner = outer` equality on the
@@ -23014,6 +23014,27 @@ M0146-0001 re-baseline census on the new default arm.
     identical, regress runner 10 cases: join\.sql loses 7 key\-restating
     Filter lines \(PG prints none\)\.
   Movement: yes — TPC-DS CATEGORIES-EXCL-MATCH qual-placement SF0.25 15 -> 13, SF1 18 -> 17; TPC-H unchanged
+- [x] **M0146\-0005an — a probe residual splits per clause; ANALYZE
+  attributes its rejections** \(slice 40, impl, filed and done 2026\-09\-29
+  from the TPC\-DS SF0\.25 census, Q24\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 40"\.
+  Kind: impl
+  Parent: M0146-0005
+  - PG places each clause separately \(`join\_clause\_is\_movable\_into`\):
+    Q24\'s `c\_birth\_country <> upper\(ca\_country\)` moves to the probe,
+    `s\_zip = ca\_zip` stays; goopg was all\-or\-nothing\.
+  - `paramQualPlacement` returns \(probe, join, applies\);
+    `probeFilterAttributor` \(NLI \+ joinOp\) re\-evaluates the moved part on
+    rejected rows under ANALYZE; `splitParamQualRejections`\.
+  - `SourceTableIdx` is scope\-local: a nested join reused the probe\'s id\.
+    Inner ids now come from the probe\'s output schema only, and a
+    colliding outer id keeps its conjunct on the join \(fail\-closed\)\.
+  - Ledgered: the probe under a nested loop is not instrumented \(no
+    actuals, no moved\-part count\); relation identity by a unique relid\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(SF0\.25
+    Q24, SF1 Q17 Q25 Q29, none introduced\), TPC\-H filter lines identical,
+    regress runner 10 cases 0 changed\.
+  Movement: yes — TPC-DS SF1 PLAN-PARITY match 14 -> 17 (Q17, Q25, Q29), CATEGORIES-EXCL-MATCH qual-placement SF1 17 -> 14, SF0.25 13 -> 12 (Q24); TPC-H unchanged
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

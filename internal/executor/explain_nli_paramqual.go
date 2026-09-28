@@ -19,24 +19,27 @@ import (
 // nested-loop Join over a parameterized probe) already evaluate the residual
 // Predicate at the same point: once per candidate row the parameterized probe returns for the
 // current outer row, before the join emits (or, for SEMI/ANTI/LEFT, counts
-// the row as a match). So the residual IS the probe's ppi_clauses, and the
-// renderers attribute it to the inner scan when:
+// the row as a match). So the renderers split the residual per conjunct as
+// PG places clauses (paramQualPlacement):
 //
-//   - every conjunct reads the inner relation (a conjunct naming only outer
-//     columns is not movable into the inner rel and would stay a join qual)
-//     and names nothing outside the probe's required_outer;
+//   - a conjunct that reads the inner relation and names nothing outside the
+//     probe's required_outer renders as the inner scan's Filter;
 //   - a conjunct that restates an index key's equality (`inner.k = outer.x`
 //     where the probe binds k to x) is enforced by the Index Cond and prints
 //     nowhere — PG generates one clause per equivalence class for the
 //     parameterized rel and removes the one the index consumes (TPC-DS
 //     Q84's `c_current_cdemo_sk = cd_demo_sk`);
-//   - the inner is a bare parameterized scan (IndexScan / BitmapHeapScan /
-//     IndexOnlyScan) with no Memoize between — with a cache, the residual
-//     runs ABOVE the cache here, while PG would key the cache on the extra
-//     outer values it reads.
+//   - every other conjunct stays on the join line;
+//   - nothing moves when a Memoize sits between join and probe — with a
+//     cache the residual runs ABOVE the cache here, while PG would key the
+//     cache on the extra outer values it reads — or when the inner is not a
+//     bare parameterized scan (IndexScan / BitmapHeapScan / IndexOnlyScan).
 //
-// Rendering only: no plan field changes, so every pass that remaps the
-// Predicate's coordinates keeps working unmodified.
+// The plan is not changed: the join still evaluates the whole residual, and
+// under ANALYZE it attributes each rejection the way PG's evaluation order
+// would — to the probe when the moved part fails, else to the join
+// (probeFilterAttributor). Every pass that remaps the Predicate's coordinates
+// keeps working unmodified.
 
 // paramJoinParts returns the pieces the rule reads from either parameterized
 // nested-loop form: the NestedLoopIndexJoin, or a Lateral nested-loop Join
@@ -54,58 +57,74 @@ func paramJoinParts(n optimizer.Node) (pred optimizer.Expr, outer, inner optimiz
 	return nil, nil, nil, false, false
 }
 
-// paramQualPlacement decides where n's residual renders. moved is false
-// when it stays on the join line (Join Filter / the NLI's Filter). When
-// moved, probe is what renders under the inner scan — nil when every
-// conjunct restates an index key equality and nothing is left to print.
-func paramQualPlacement(n optimizer.Node) (probe optimizer.Expr, moved bool) {
+// paramQualPlacement splits n's residual the way PG places a parameterized
+// path's clauses. applies is false when the residual renders unchanged on the
+// join line. Otherwise probe is the part that renders as the inner scan's
+// Filter and join the part that stays on the join line (either may be nil);
+// a conjunct restating an index key equality is in neither.
+func paramQualPlacement(n optimizer.Node) (probe, join optimizer.Expr, applies bool) {
 	pred, outer, inner, memo, ok := paramJoinParts(n)
 	if !ok || pred == nil || memo || outer == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	switch inner.(type) {
 	case *optimizer.IndexScan, *optimizer.BitmapHeapScan, *optimizer.IndexOnlyScan:
 	default:
-		return nil, false
+		return nil, nil, false
 	}
 	outerW := len(outer.Output())
-	probeRels := probeRelations(inner, outer)
+	innerRels, outerRels := probeRelations(inner, outer)
 	keyEqs := probeKeyEqualities(inner)
-	var kept []optimizer.Expr
+	var moved, kept []optimizer.Expr
+	changed := false
 	for _, c := range splitAndExpr(pred) {
 		if restatesProbeKey(c, keyEqs, outerW, outer) {
+			changed = true
 			continue
 		}
-		// An inner = outer equality is a join clause of its equivalence
-		// class. PG's ppi_clauses carry the class's clause for the inner
-		// rel against required_outer (TPC-DS Q50's `sr_customer_sk =
-		// ss_customer_sk` prints as the store_sales probe's Filter); a
-		// member pair naming a relation outside required_outer is checked
-		// at the join (TPC-H Q9's `supplier.s_suppkey =
+		// join_clause_is_movable_into, per clause: a conjunct moves into
+		// the probe when it reads the inner relation and names nothing
+		// outside the probe's required_outer. An inner = outer equality
+		// is no exception — PG's ppi_clauses carry the class's clause for
+		// the inner rel against required_outer (TPC-DS Q50's
+		// `sr_customer_sk = ss_customer_sk` prints as the store_sales
+		// probe's Filter) — while one naming a relation outside it is
+		// checked at the join (TPC-H Q9's `supplier.s_suppkey =
 		// lineitem.l_suppkey` over a lineitem probe parameterized by
-		// partsupp), which the required_outer test below keeps there.
+		// partsupp; TPC-DS Q24's `store.s_zip = customer_address.ca_zip`,
+		// whose sibling `c_birth_country <> upper(ca_country)` moves).
 		//
 		// The host-scope walk reaches an `= ANY (list)` operand, which the
 		// shallow WalkExprTree does not (TPC-DS Q48's `ca_state = ANY
-		// (...)` arms read as outer-only and kept the clause on the join).
+		// (...)` arms read as outer-only).
 		readsInner := false
 		withinParams := true
 		enumerated := optimizer.WalkExprHostScope(c, func(x optimizer.Expr) {
-			if cr, ok := x.(*optimizer.ColumnRef); ok {
-				if cr.Index >= outerW {
-					readsInner = true
-				}
-				if cr.SourceTableIdx == 0 || !probeRels[cr.SourceTableIdx] {
+			cr, ok := x.(*optimizer.ColumnRef)
+			if !ok {
+				return
+			}
+			src := cr.SourceTableIdx
+			if cr.Index >= outerW {
+				readsInner = true
+				if src == 0 || !innerRels[src] {
 					withinParams = false
 				}
+			} else if src == 0 || !outerRels[src] || innerRels[src] {
+				withinParams = false
 			}
 		})
-		if !enumerated || !readsInner || !withinParams {
-			return nil, false
+		if enumerated && readsInner && withinParams {
+			moved = append(moved, c)
+			changed = true
+			continue
 		}
 		kept = append(kept, c)
 	}
-	return joinAndExprs(kept), true
+	if !changed {
+		return nil, nil, false
+	}
+	return joinAndExprs(moved), joinAndExprs(kept), true
 }
 
 // probeKeyEquality is one `index column = outer key` binding of a
@@ -213,8 +232,9 @@ func joinAndExprs(es []optimizer.Expr) optimizer.Expr {
 	return out
 }
 
-// probeRelations is the set of relations a parameterized probe reads: its
-// own table and every outer relation its index keys are parameterized by
+// probeRelations returns the relations a parameterized probe reads, split
+// by side: inner is the probe's own relation (its output columns and its own
+// quals), outer is every outer relation its index keys are parameterized by
 // (PG's required_outer). join_clause_is_movable_into admits a clause into
 // the probe's ppi_clauses only when it references nothing else — TPC-DS
 // Q19's `substr(ca_zip) <> substr(s_zip)` stays a Join Filter because the
@@ -222,25 +242,20 @@ func joinAndExprs(es []optimizer.Expr) optimizer.Expr {
 //
 // A key's outer reference indexes the OUTER row; when it carries no source
 // id of its own, the outer row's column at that position names the relation.
-func probeRelations(inner, outer optimizer.Node) map[int16]bool {
-	rels := map[int16]bool{}
-	optimizer.WalkPlanExprs(inner, func(e optimizer.Expr) {
-		optimizer.WalkExprTree(e, func(x optimizer.Expr) {
-			switch r := x.(type) {
-			case *optimizer.ColumnRef:
-				if r.SourceTableIdx != 0 {
-					rels[r.SourceTableIdx] = true
-				}
-			case *optimizer.OuterColumnRef:
-				if r.SourceTableIdx != 0 {
-					rels[r.SourceTableIdx] = true
-				}
-			}
-		})
-	})
+//
+// Source ids are FROM bindings within one planning scope, so a nested join
+// (`(a JOIN b) JOIN c`) can number an outer relation with the same id as the
+// probe's. The caller treats an outer column whose id is also an inner id as
+// unidentifiable and keeps its clause on the join.
+func probeRelations(inner, outer optimizer.Node) (innerRels, outerRels map[int16]bool) {
+	innerRels, outerRels = map[int16]bool{}, map[int16]bool{}
+	// The probe's own relation is read from its output schema only: its
+	// quals mix in outer references (a bitmap probe's Recheck Cond repeats
+	// the key's outer column), which would name an outer relation inner.
+	// No output ids means nothing is provably inner, so nothing moves.
 	for _, c := range inner.Output() {
 		if c.SourceTableIdx != 0 {
-			rels[c.SourceTableIdx] = true
+			innerRels[c.SourceTableIdx] = true
 		}
 	}
 	outerCols := outer.Output()
@@ -249,7 +264,7 @@ func probeRelations(inner, outer optimizer.Node) map[int16]bool {
 			src = outerCols[idx].SourceTableIdx
 		}
 		if src != 0 {
-			rels[src] = true
+			outerRels[src] = true
 		}
 	}
 	for _, k := range probeKeyExprs(inner) {
@@ -262,7 +277,7 @@ func probeRelations(inner, outer optimizer.Node) map[int16]bool {
 			}
 		})
 	}
-	return rels
+	return innerRels, outerRels
 }
 
 // probeKeyExprs returns the index-key expressions a parameterized probe binds
@@ -293,15 +308,14 @@ func probeKeyExprs(inner optimizer.Node) []optimizer.Expr {
 	return out
 }
 
-// renderedParamQual is the residual placement with the probe's part as the
-// inner scan's namespace sees it — outer-side columns become correlated
-// references (always prefixed, PG's get_parameter rule), inner columns stay
-// bare. moved=false keeps the residual on the join; moved with a nil qual
-// prints nothing under the probe.
-func renderedParamQual(n optimizer.Node) (optimizer.Expr, bool) {
-	q, moved := paramQualPlacement(n)
-	if !moved || q == nil {
-		return nil, moved
+// renderedParamQual is paramQualPlacement with the probe's part as the inner
+// scan's namespace sees it — outer-side columns become correlated references
+// (always prefixed, PG's get_parameter rule), inner columns stay bare. join
+// keeps the join row's coordinates. applies=false keeps today's rendering.
+func renderedParamQual(n optimizer.Node) (probe, join optimizer.Expr, applies bool) {
+	q, join, applies := paramQualPlacement(n)
+	if !applies || q == nil {
+		return nil, join, applies
 	}
 	_, outer, _, _, _ := paramJoinParts(n)
 	outerW := len(outer.Output())
@@ -312,9 +326,9 @@ func renderedParamQual(n optimizer.Node) (optimizer.Expr, bool) {
 		return &optimizer.OuterColumnRef{Level: 1, Index: cr.Index, Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
 	})
 	if !ok || d == nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return d, true
+	return d, join, true
 }
 
 // paramInnerChild reports whether c is n's parameterized inner child.
@@ -328,4 +342,25 @@ func splitAndExpr(e optimizer.Expr) []optimizer.Expr {
 		return append(splitAndExpr(b.Left), splitAndExpr(b.Right)...)
 	}
 	return []optimizer.Expr{e}
+}
+
+// splitParamQualRejections divides a parameterized nested loop's residual
+// rejections between its lines: the inner scan's `Rows Removed by Filter`
+// and the join's `Rows Removed by Join Filter`. With the residual split
+// across both, the operator attributed the probe's share
+// (probeFilterRejected); otherwise every rejection belongs to whichever line
+// prints the residual.
+func splitParamQualRejections(n optimizer.Node, s *nodeStats) (probe, join int64) {
+	if s == nil {
+		return 0, 0
+	}
+	q, j, applies := paramQualPlacement(n)
+	switch {
+	case !applies || q == nil:
+		return 0, s.joinFilterRejected
+	case j == nil:
+		return s.joinFilterRejected, 0
+	default:
+		return s.probeFilterRejected, s.joinFilterRejected - s.probeFilterRejected
+	}
 }

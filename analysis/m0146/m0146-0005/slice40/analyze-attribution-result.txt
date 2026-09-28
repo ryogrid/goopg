@@ -1,0 +1,4 @@
+Synthetic ANALYZE attribution check (private SF0.25 clone, 2026-09-29), tmp/qa3.sql:
+  goopg:  Nested Loop  Filter: ((w + pa_z.zv) > 1)   Rows Removed by Join Filter: 7
+          Index Scan using pa_i_pkey  Filter: ((w + (pa_o.k % 3)) <> pa_o.v)   (no count line: probe not instrumented, ledgered)
+  ground truth: probe_rej=33 join_rej=7 out_rows=60
