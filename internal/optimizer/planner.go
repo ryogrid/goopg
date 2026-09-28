@@ -1912,7 +1912,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// it fires only when the search elected NO index path at all,
 		// so it can never displace a costed index choice — it only
 		// fills the hole where this route produces none.
-		if isSimpleSingle && whereQual != nil && planIsBareSeqScanTree(node) {
+		// M0146-0028b: not for a pulled-up derived table — the index
+		// producer rebuilds the scan from the statement's own WHERE alone
+		// and would drop the pulled body's quals.
+		if isSimpleSingle && whereQual != nil && len(ctx.pulledDerived) == 0 && planIsBareSeqScanTree(node) {
 			onlyFrom := len(s.From) == 1 && s.From[0].Only
 			whereForIndex := injectLikeRangePredicates(whereQual)
 			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
@@ -14844,9 +14847,9 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			}
 			outExpr := make([]Expr, 0, len(r.cols))
 			outSchema := make(Schema, 0, len(r.cols))
-			for i, cr := range r.cols {
-				outExpr = append(outExpr, pulledDerivedRef(cr, star.Pos(), 0))
-				outSchema = append(outSchema, SchemaColumn{Name: r.names[i], Type: cr.Type, SourceTableIdx: cr.SourceTableIdx})
+			for i, e := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(e, star.Pos(), 0))
+				outSchema = append(outSchema, pulledDerivedSchemaColumn(r.names[i], e))
 			}
 			return outExpr, outSchema, nil
 		}
@@ -14865,9 +14868,9 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			return
 		}
 		for _, r := range bsetPulled[k] {
-			for i, cr := range r.cols {
-				outExpr = append(outExpr, pulledDerivedRef(cr, star.Pos(), 0))
-				outSchema = append(outSchema, SchemaColumn{Name: r.names[i], Type: cr.Type, SourceTableIdx: cr.SourceTableIdx})
+			for i, e := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(e, star.Pos(), 0))
+				outSchema = append(outSchema, pulledDerivedSchemaColumn(r.names[i], e))
 			}
 		}
 	}
@@ -14963,6 +14966,18 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		}
 		if r, ok := e.(*OuterColumnRef); ok && !strings.EqualFold(r.Name, w.Column) {
 			return w.Column, r.Type
+		}
+		// A bare column that resolved to an expression — an expression
+		// output of a pulled-up derived table — is still named as
+		// written. (Whole-row, ctid and tableoid references keep their
+		// own arms below; they are named as written too.)
+		_, isCol := e.(*ColumnRef)
+		_, isOuter := e.(*OuterColumnRef)
+		_, isRow := e.(*RowExpr)
+		_, isCtid := e.(*CTIDExpr)
+		_, isOid := e.(*TableOidExpr)
+		if !isCol && !isOuter && !isRow && !isCtid && !isOid {
+			return w.Column, exprType(e)
 		}
 	}
 	if cr, ok := e.(*ColumnRef); ok {

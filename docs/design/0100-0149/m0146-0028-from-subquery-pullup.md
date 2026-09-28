@@ -1,6 +1,6 @@
 # M0146-0028 — pulling simple FROM-clause subqueries into the parent search
 
-Status: slice 1 landed 2026-09-28. Code: `internal/optimizer/derivedpullup.go`
+Status: slices 1 and 2 landed 2026-09-28 (§7 for slice 2). Code: `internal/optimizer/derivedpullup.go`
 and hooks in `planner.go`. Evidence: `analysis/m0146/m0146-0028/`.
 
 ## 1. The gap
@@ -74,12 +74,10 @@ fallback.
 
 ## 5. Deferred (ledgered)
 
-- expression targets (PG wraps non-Var outputs in PlaceHolderVars when they
-  can go NULL);
+- function-call targets (landed for call-free expressions in slice 2, §7),
+  and PlaceHolderVar-wrapped pull-up (grouping sets, outer joins);
 - JOINs inside the body, a derived item with a JOIN attached, and outer
   joins around it;
-- the lone FROM item (PG pulls it up too; its plan is unaffected because the
-  inner search already covers every relation);
 - sublinks in the body WHERE (PG hands them to the parent's
   `pull_up_sublinks`);
 - LATERAL items and column-alias lists.
@@ -96,3 +94,36 @@ space. Q59 output is byte-identical to PG's. 12 hand-written edge queries
 correlated sublink on a derived column, ambiguity and missing-FROM errors)
 match PG. The regress runner shows 0 changed diffs across 11 cases against
 a HEAD baseline.
+
+## 7. Slice 2 (M0146-0028b, 2026-09-28): expression targets and the lone FROM item
+
+- **Expression targets.** A body target may be any expression with no
+  function call and no sublink (`parserExprHasNode`). This excludes, without
+  a catalog lookup, everything PG's `is_simple_subquery` refuses in a target
+  list: aggregates, window functions, SRFs (`hasTargetSRFs`) and volatile
+  functions (`contain_volatile_functions`, prepjointree.c:1926). The parent
+  is a plain comma list, so no outer join can null the derived item and
+  `pullup_replace_vars` needs no PlaceHolderVar: `pulledDerivedRef` hands
+  every reference its own deep copy of the resolved body expression
+  (`cloneExprRefs`), with every column rebased to an `OuterColumnRef` of the
+  referencing level. Output names are `targetMeta`'s on the resolved body
+  target — what the body's own projection would have named them. A bare
+  column reference that resolves to an expression is named as written
+  (FigureColname).
+- **The lone FROM item.** PG pulls it up too; the parent gate no longer
+  needs a second item. The one-relation index arm (`isSimpleSingle`) is
+  skipped for a pulled scope, because it rebuilds the scan from the
+  statement's own WHERE alone and would drop the body's quals.
+- **Grouping sets decline.** PG pulls up under grouping sets but wraps every
+  substituted output in a PlaceHolderVar (`REPLACE_WRAP_ALL`), so two
+  outputs renaming one column stay two grouping columns. goopg has no
+  PlaceHolderVar, and substituting there merged them: regress `groupingsets`
+  raised `column ref four/3 out of Slot range 2`. The parent gate declines
+  statements with grouping sets.
+- **Movement.** TPC-H Q7/Q8/Q9 wrap their whole join in a lone subquery with
+  `extract(…)` and arithmetic outputs. TPC-H PLAN-PARITY match 6 → 7 (Q9 now
+  matches PG) and `aggregation-strategy` 7 → 5; Q7/Q8 moved to
+  `sort-strategy`/`parallelism` (+1 each). TPC-DS unchanged (no fires). The
+  regress runner shows 0 of 22 case diffs changed against the HEAD baseline.
+  A like-for-like list is required: runs over different case lists leave
+  different catalog/statistics state and show spurious plan differences.

@@ -19,16 +19,23 @@ import (
 // to the whole of subquery y and adds x's `date_dim` last, an order goopg
 // could not reach while each subquery was planned as a separate problem.
 //
-// Slice 1 covers the shape whose `pullup_replace_vars` is a pure renaming:
+// Slice 1 covered the shape whose `pullup_replace_vars` is a pure renaming;
+// slice 2 (M0146-0028b) admits expression targets and the lone FROM item:
 //
-//   - the parent FROM is a comma list with at least two items, none LATERAL
-//     and none a table function, and the statement takes no row locks;
+//   - the parent FROM is a comma list, none of its items LATERAL or a table
+//     function, and the statement takes no row locks;
 //   - the derived item is a non-LATERAL `(SELECT …) alias` with no column
 //     alias list and no JOIN attached to it;
 //   - its body is a bare SELECT (no WITH, set operation, grouping, HAVING,
 //     DISTINCT, ORDER BY, LIMIT/OFFSET, window clause, VALUES or locking)
 //     over a comma list of plain relation names (tables or CTE references);
-//   - every body target is a bare column reference, output names unique;
+//   - every body target is an expression with no function call and no
+//     sublink — which excludes, without a catalog lookup, everything PG's
+//     is_simple_subquery refuses in a target list (aggregates, window
+//     functions, set-returning and volatile functions) — output names
+//     unique. With the parent a plain comma list no outer join can null the
+//     derived item's outputs, so `pullup_replace_vars` needs no
+//     PlaceHolderVar: an output expression is substituted as is;
 //   - the body WHERE is made only of expression kinds collectExprColumnNames
 //     enumerates (no sublinks).
 //
@@ -48,7 +55,9 @@ import (
 type pulledDerivedRel struct {
 	alias string
 	names []string
-	cols  []*ColumnRef
+	// cols is each output's resolved body expression, parent coordinates.
+	// A reference receives its own deep copy (pulledDerivedRef).
+	cols []Expr
 	// firstBinding is the index of the body's first leaf binding in the
 	// parent's bindings: `SELECT *` emits the derived columns there, in
 	// FROM order.
@@ -65,7 +74,6 @@ type derivedPullupCandidate struct {
 	itemHi   int // one past the last
 	bindLo   int
 	bindHi   int
-	outNames []string
 }
 
 // derivedPullupDisabled is the per-call fallback switch: planFromClause
@@ -79,7 +87,17 @@ const (
 
 // parentFromAdmitsDerivedPullup is slice 1's parent-side gate.
 func parentFromAdmitsDerivedPullup(s *parser.SelectStmt) bool {
-	if s == nil || len(s.FromExprs) < 2 || len(s.Locking) > 0 {
+	if s == nil || len(s.FromExprs) == 0 || len(s.Locking) > 0 {
+		return false
+	}
+	// PG pulls up under grouping sets too, but wraps every substituted
+	// output in a PlaceHolderVar (pull_up_simple_subquery:
+	// `if (parse->groupingSets) rvcontext.wrap_option = REPLACE_WRAP_ALL`),
+	// so that two outputs renaming one column stay two grouping columns.
+	// goopg has no PlaceHolderVar; substituting bare columns there merges
+	// them (regress groupingsets: `select four as x, four as y … grouping
+	// sets (x, y)`).
+	if s.GroupingSets != nil {
 		return false
 	}
 	for _, it := range s.FromExprs {
@@ -95,14 +113,14 @@ func parentFromAdmitsDerivedPullup(s *parser.SelectStmt) bool {
 	return true
 }
 
-// simpleDerivedPullupBody is slice 1's `is_simple_subquery` for one FROM item:
-// it returns the body and its output names when the item may be pulled up.
-func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, []string, bool) {
+// simpleDerivedPullupBody is the `is_simple_subquery` gate for one FROM item:
+// it returns the body when the item may be pulled up.
+func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, bool) {
 	rv := it.Base
 	sub := rv.Subquery
 	if sub == nil || len(it.Joins) > 0 || rv.Lateral || rv.Alias == "" || len(rv.Columns) > 0 ||
 		rv.TableFunc != nil || rv.TableSample != nil {
-		return nil, nil, false
+		return nil, false
 	}
 	if sub.With != nil || sub.SetOp != nil || sub.SetOpOperand != nil ||
 		len(sub.GroupBy) > 0 || sub.GroupingSets != nil || sub.Having != nil ||
@@ -110,45 +128,55 @@ func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, []string, 
 		sub.Limit != nil || sub.Offset != nil || sub.WithTies ||
 		len(sub.WindowClause) > 0 || len(sub.ValuesRows) > 0 || len(sub.Locking) > 0 ||
 		len(sub.FromExprs) == 0 || len(sub.Targets) == 0 {
-		return nil, nil, false
+		return nil, false
 	}
 	for _, f := range sub.FromExprs {
 		b := f.Base
 		if len(f.Joins) > 0 || b.Subquery != nil || b.TableFunc != nil || b.TableSample != nil ||
 			b.Lateral || len(b.Columns) > 0 || b.GroupedJoinUnaliased || b.Name == "" {
-			return nil, nil, false
+			return nil, false
 		}
 	}
-	names := make([]string, 0, len(sub.Targets))
-	seen := make(map[string]bool, len(sub.Targets))
 	for _, t := range sub.Targets {
-		cr, ok := t.Expr.(*parser.ColumnRef)
-		if !ok || cr.Column == "" || cr.Column == "*" {
-			return nil, nil, false
+		if t.Expr == nil {
+			return nil, false
 		}
-		name := t.Alias
-		if name == "" {
-			name = cr.Column
+		if _, star := t.Expr.(*parser.StarExpr); star {
+			return nil, false
 		}
-		key := strings.ToLower(name)
-		if seen[key] {
-			return nil, nil, false
+		if cr, ok := t.Expr.(*parser.ColumnRef); ok && (cr.Column == "" || cr.Column == "*") {
+			return nil, false
 		}
-		seen[key] = true
-		names = append(names, name)
+		if !collectExprColumnNames(t.Expr, map[string]bool{}) ||
+			parserExprHasNode(reflect.ValueOf(t.Expr), 0, parserNodeIsSelectOrCall) {
+			return nil, false
+		}
 	}
-	if sub.Where != nil && (!collectExprColumnNames(sub.Where, map[string]bool{}) || parserExprHasSelect(reflect.ValueOf(sub.Where), 0)) {
-		return nil, nil, false
+	if sub.Where != nil && (!collectExprColumnNames(sub.Where, map[string]bool{}) ||
+		parserExprHasNode(reflect.ValueOf(sub.Where), 0, parserNodeIsSelect)) {
+		return nil, false
 	}
-	return sub, names, true
+	return sub, true
 }
 
-// parserExprHasSelect reports whether a nested SELECT (any sublink form) is
-// reachable from v through exported fields. Fails closed past the depth
-// bound. Slice 1 leaves sublink-bearing bodies to the ordinary derived leaf:
-// PG pulls them up and lets pull_up_sublinks see them in the parent, which
-// this slice does not rebase.
-func parserExprHasSelect(v reflect.Value, depth int) bool {
+func parserNodeIsSelect(x any) bool {
+	_, ok := x.(*parser.SelectStmt)
+	return ok
+}
+
+func parserNodeIsSelectOrCall(x any) bool {
+	if _, ok := x.(*parser.FuncCall); ok {
+		return true
+	}
+	return parserNodeIsSelect(x)
+}
+
+// parserExprHasNode reports whether a pointer node matching `want` is
+// reachable from v through exported fields — a nested SELECT (any sublink
+// form) or a function call. Fails closed past the depth bound. Sublink-bearing
+// bodies stay ordinary derived leaves: PG pulls them up and lets
+// pull_up_sublinks see them in the parent, which this pull-up does not rebase.
+func parserExprHasNode(v reflect.Value, depth int, want func(any) bool) bool {
 	if depth > 64 {
 		return true
 	}
@@ -160,21 +188,19 @@ func parserExprHasSelect(v reflect.Value, depth int) bool {
 		if v.IsNil() {
 			return false
 		}
-		if v.Kind() == reflect.Ptr && v.CanInterface() {
-			if _, ok := v.Interface().(*parser.SelectStmt); ok {
-				return true
-			}
+		if v.Kind() == reflect.Ptr && v.CanInterface() && want(v.Interface()) {
+			return true
 		}
-		return parserExprHasSelect(v.Elem(), depth+1)
+		return parserExprHasNode(v.Elem(), depth+1, want)
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
-			if f := v.Field(i); f.CanInterface() && parserExprHasSelect(f, depth+1) {
+			if f := v.Field(i); f.CanInterface() && parserExprHasNode(f, depth+1, want) {
 				return true
 			}
 		}
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < v.Len(); i++ {
-			if parserExprHasSelect(v.Index(i), depth+1) {
+			if parserExprHasNode(v.Index(i), depth+1, want) {
 				return true
 			}
 		}
@@ -193,12 +219,12 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
 	for _, it := range s.FromExprs {
-		body, names, ok := simpleDerivedPullupBody(it)
+		body, ok := simpleDerivedPullupBody(it)
 		if !ok {
 			out = append(out, it)
 			continue
 		}
-		c := &derivedPullupCandidate{alias: it.Base.Alias, body: body, itemLo: len(out), outNames: names}
+		c := &derivedPullupCandidate{alias: it.Base.Alias, body: body, itemLo: len(out)}
 		out = append(out, body.FromExprs...)
 		c.itemHi = len(out)
 		cands = append(cands, c)
@@ -214,9 +240,10 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 // resolved against its own leaf bindings only — the parent's other FROM items
 // are invisible to a non-LATERAL subquery — with the enclosing query levels as
 // its parent chain, at the parent's level (pull-up flattens one level away).
-// Any resolution failure, or a target that does not resolve to a plain
-// current-level column, returns ok=false and the caller re-plans without
-// pull-up.
+// Output names are targetMeta's — the names the body's own projection would
+// give its columns when planned as a separate scope. Any resolution failure,
+// or a duplicate output name, returns ok=false and the caller re-plans
+// without pull-up.
 func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBinding, schema Schema, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) ([]*pulledDerivedRel, []Expr, bool) {
 	var rels []*pulledDerivedRel
 	var quals []Expr
@@ -230,17 +257,24 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		bodyCtx.cat = cat
 		bodyCtx.rtScope = scope
 		bodyCtx.parent = planParent
-		rel := &pulledDerivedRel{alias: c.alias, names: c.outNames, firstBinding: c.bindLo, body: c.body}
+		rel := &pulledDerivedRel{alias: c.alias, firstBinding: c.bindLo, body: c.body}
+		seen := map[string]bool{}
 		for _, t := range c.body.Targets {
 			e, err := resolveExpr(t.Expr, bodyCtx)
 			if err != nil {
 				return nil, nil, false
 			}
-			cr, ok := e.(*ColumnRef)
-			if !ok {
+			if e, err = foldQualConstants(e); err != nil {
 				return nil, nil, false
 			}
-			rel.cols = append(rel.cols, cr)
+			name, _ := targetMeta(e, t)
+			key := strings.ToLower(name)
+			if seen[key] {
+				return nil, nil, false
+			}
+			seen[key] = true
+			rel.names = append(rel.names, name)
+			rel.cols = append(rel.cols, e)
 		}
 		if c.body.Where != nil {
 			q, err := resolveExpr(canonicalizeQual(c.body.Where), bodyCtx)
@@ -296,18 +330,43 @@ func pulledDerivedAliasMatches(ctx *resolveContext, table, schema string) *pulle
 	return nil
 }
 
-// pulledDerivedRef is the parent-level reference to one derived output: the
-// body column it renames, at the requested query level. It keeps the body
-// column's own name and source identity, because the plan's schema at that
-// slot is the body column's; the output name the user wrote is restored by
-// targetMeta from the written reference.
-func pulledDerivedRef(cr *ColumnRef, pos, level int) Expr {
-	if level == 0 {
-		c := *cr
-		c.pos = pos
-		return &c
+// pulledDerivedRef is the parent-level reference to one derived output — the
+// body expression it stands for (`pullup_replace_vars`), as a fresh copy, at
+// the requested query level: a reference from a sublink `level` scopes below
+// reads every body column as an OuterColumnRef of that level. A bare column
+// keeps the body column's own name and source identity, because the plan's
+// schema at that slot is the body column's; the output name the user wrote is
+// restored by targetMeta from the written reference.
+func pulledDerivedRef(e Expr, pos, level int) Expr {
+	if cr, ok := e.(*ColumnRef); ok {
+		if level == 0 {
+			c := *cr
+			c.pos = pos
+			return &c
+		}
+		return &OuterColumnRef{pos: pos, Level: level, Index: cr.Index, Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
 	}
-	return &OuterColumnRef{pos: pos, Level: level, Index: cr.Index, Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
+	out, ok := cloneExprRefs(e, scopeIgnore, exprRewriter{Rewrite: func(x Expr) Expr {
+		if cr, isCol := x.(*ColumnRef); isCol && level > 0 {
+			return &OuterColumnRef{pos: cr.pos, Level: level, Index: cr.Index, Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
+		}
+		return x
+	}})
+	if !ok {
+		// resolvePulledDerived only admits call-free, sublink-free
+		// expressions, which the exhaustive walker always enumerates.
+		panic("pulledDerivedRef: derived output expression is not cloneable")
+	}
+	return out
+}
+
+// pulledDerivedSchemaColumn is the schema entry `SELECT *` gives an output.
+func pulledDerivedSchemaColumn(name string, e Expr) SchemaColumn {
+	sc := SchemaColumn{Name: name, Type: exprType(e)}
+	if cr, ok := e.(*ColumnRef); ok {
+		sc.SourceTableIdx = cr.SourceTableIdx
+	}
+	return sc
 }
 
 // pulledDerivedWholeRow is the whole-row reference to a pulled-up derived
@@ -315,9 +374,9 @@ func pulledDerivedRef(cr *ColumnRef, pos, level int) Expr {
 func pulledDerivedWholeRow(r *pulledDerivedRel, pos, level int) Expr {
 	elems := make([]Expr, len(r.cols))
 	types := make([]catalog.Type, len(r.cols))
-	for i, cr := range r.cols {
-		elems[i] = pulledDerivedRef(cr, pos, level)
-		types[i] = cr.Type
+	for i, e := range r.cols {
+		elems[i] = pulledDerivedRef(e, pos, level)
+		types[i] = exprType(e)
 	}
 	return &RowExpr{pos: pos, Elems: elems, Types: types}
 }
@@ -327,7 +386,7 @@ func pulledDerivedWholeRow(r *pulledDerivedRel, pos, level int) Expr {
 func pulledDerivedTable(r *pulledDerivedRel) *catalog.Table {
 	cols := make([]catalog.Column, len(r.names))
 	for i, n := range r.names {
-		cols[i] = catalog.Column{Name: n, Type: r.cols[i].Type}
+		cols[i] = catalog.Column{Name: n, Type: exprType(r.cols[i])}
 	}
 	return &catalog.Table{Name: r.alias, Columns: cols}
 }
@@ -344,8 +403,12 @@ func addPulledBodyColumnNames(ctx *resolveContext) {
 			}
 		}
 		if ctx.outputColsKnown {
-			for _, cr := range r.cols {
-				ctx.outputCols[cr.Name] = true
+			for _, e := range r.cols {
+				walkExprTree(e, func(x Expr) {
+					if cr, ok := x.(*ColumnRef); ok {
+						ctx.outputCols[cr.Name] = true
+					}
+				})
 			}
 		}
 	}

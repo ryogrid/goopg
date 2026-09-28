@@ -91,19 +91,22 @@ func TestDerivedPullupStarAndOrdinal(t *testing.T) {
 	}
 }
 
-// Shapes slice 1 leaves as ordinary derived leaves.
+// Shapes the pull-up leaves as ordinary derived leaves.
 func TestDerivedPullupDeclines(t *testing.T) {
 	for _, q := range []string{
-		"SELECT * FROM (SELECT ax FROM a) y",                                   // lone FROM item
-		"SELECT * FROM (SELECT ax + 1 AS k FROM a) y, b",                       // expression target
-		"SELECT * FROM (SELECT ax, count(*) FROM a GROUP BY ax) y, b",          // grouping
-		"SELECT * FROM (SELECT DISTINCT ax FROM a) y, b",                       // DISTINCT
-		"SELECT * FROM (SELECT ax FROM a LIMIT 1) y, b",                        // LIMIT
-		"SELECT * FROM (SELECT ax FROM a) y (z), b",                            // column alias list
-		"SELECT * FROM (SELECT ax FROM a JOIN c ON a.ay = c.cy) y, b",          // JOIN in body
-		"SELECT * FROM (SELECT ax FROM a WHERE ay IN (SELECT dx FROM d)) y, b", // sublink in body
-		"SELECT * FROM (SELECT ax, ax FROM a) y, b",                            // duplicate output name
-		"SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay = b.by) y",        // LATERAL
+		"SELECT * FROM (SELECT ax, count(*) FROM a GROUP BY ax) y, b",
+		"SELECT x, y FROM (SELECT ax AS x, ax AS y FROM a) t GROUP BY GROUPING SETS (x, y)", // parent grouping sets (PHV wrap)
+		"SELECT * FROM (SELECT abs(ax) AS k FROM a) y, b",                                   // function call target
+		"SELECT * FROM (SELECT count(ax) AS k FROM a) y, b",                                 // aggregate without GROUP BY
+		"SELECT * FROM (SELECT (SELECT 1) AS k FROM a) y, b",                                // sublink target
+		"SELECT * FROM (SELECT ax AS k, ay AS k FROM a) y, b",                               // duplicate output name          // grouping
+		"SELECT * FROM (SELECT DISTINCT ax FROM a) y, b",                                    // DISTINCT
+		"SELECT * FROM (SELECT ax FROM a LIMIT 1) y, b",                                     // LIMIT
+		"SELECT * FROM (SELECT ax FROM a) y (z), b",                                         // column alias list
+		"SELECT * FROM (SELECT ax FROM a JOIN c ON a.ay = c.cy) y, b",                       // JOIN in body
+		"SELECT * FROM (SELECT ax FROM a WHERE ay IN (SELECT dx FROM d)) y, b",              // sublink in body
+		"SELECT * FROM (SELECT ax, ax FROM a) y, b",                                         // duplicate output name
+		"SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay = b.by) y",                     // LATERAL
 	} {
 		t.Run(q, func(t *testing.T) {
 			stmts, err := parser.Parse(q)
@@ -115,7 +118,7 @@ func TestDerivedPullupDeclines(t *testing.T) {
 				return // a shape the FROM walk itself rejects is also not pulled up
 			}
 			if len(rctx.pulledDerived) != 0 {
-				t.Fatalf("pulled up a shape slice 1 declines")
+				t.Fatalf("pulled up a declined shape")
 			}
 		})
 	}
@@ -136,5 +139,58 @@ func TestDerivedPullupTwoBodiesSameRelation(t *testing.T) {
 	}
 	if _, err := resolveColumnRef(&parser.ColumnRef{Column: "ax"}, rctx); err == nil {
 		t.Fatal("unqualified ax resolved; it is ambiguous between y and x")
+	}
+}
+
+// Slice 2 (M0146-0028b): an expression output is substituted wherever the
+// derived column is referenced — a fresh copy per reference, rebased to the
+// referencing level — and the lone FROM item is pulled up too.
+func TestDerivedPullupExpressionTargets(t *testing.T) {
+	_, _, rctx := pullupPlanFrom(t, "SELECT v, w FROM (SELECT ax * 2 AS v, ay FROM a WHERE ax > 0) y, b WHERE y.ay = b.bx")
+	if len(rctx.pulledDerived) != 1 {
+		t.Fatalf("pulledDerived=%d, want 1", len(rctx.pulledDerived))
+	}
+	v1 := pullupResolve(t, rctx, "y", "v")
+	v2 := pullupResolve(t, rctx, "", "v")
+	if _, isCol := v1.(*ColumnRef); isCol {
+		t.Fatalf("y.v resolved to a bare column %#v; want the body expression", v1)
+	}
+	if v1 == v2 {
+		t.Fatal("two references share one expression tree; each must get its own copy")
+	}
+	// A sublink one level down reads the body columns as level-1 outer refs.
+	outer := pulledDerivedRef(rctx.pulledDerived[0].cols[0], 0, 1)
+	sawOuter := false
+	walkExprTree(outer, func(x Expr) {
+		if _, ok := x.(*ColumnRef); ok {
+			t.Fatalf("level-1 reference still holds a current-level ColumnRef")
+		}
+		if o, ok := x.(*OuterColumnRef); ok && o.Level == 1 {
+			sawOuter = true
+		}
+	})
+	if !sawOuter {
+		t.Fatal("level-1 reference carries no OuterColumnRef")
+	}
+	// targetMeta names the output as written, not by the expression.
+	name, _ := targetMeta(v2, parser.ResTarget{Expr: &parser.ColumnRef{Column: "v"}})
+	if name != "v" {
+		t.Fatalf("output name %q, want v", name)
+	}
+	// Unnamed expression outputs take the name the body's own projection
+	// would have given them.
+	_, _, rctx2 := pullupPlanFrom(t, "SELECT 1 FROM (SELECT ax + 1, ay FROM a) y, b")
+	if len(rctx2.pulledDerived) != 1 || rctx2.pulledDerived[0].names[0] != "?column?" {
+		t.Fatalf("unnamed expression output: %+v", rctx2.pulledDerived)
+	}
+}
+
+func TestDerivedPullupLoneFromItem(t *testing.T) {
+	_, node, rctx := pullupPlanFrom(t, "SELECT k FROM (SELECT ax AS k FROM a, b WHERE ay = bx) y")
+	if len(rctx.pulledDerived) != 1 || len(rctx.bindings) != 2 || len(rctx.pulledQuals) != 1 {
+		t.Fatalf("lone item not pulled up: derived=%d bindings=%d quals=%d", len(rctx.pulledDerived), len(rctx.bindings), len(rctx.pulledQuals))
+	}
+	if len(node.Output()) != 4 {
+		t.Fatalf("FROM tree width %d, want a's 2 + b's 2", len(node.Output()))
 	}
 }

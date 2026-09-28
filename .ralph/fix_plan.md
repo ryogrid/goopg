@@ -23665,6 +23665,22 @@ M0146-0001 re-baseline census on the new default arm.
     changed\), TPC\-H arm 24/24, fire set \(Q2 Q59, none introduced\);
     regress runner 0/11 diffs changed vs HEAD; Q59 output = PG\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-method 39 -> 38, rendering 25 -> 24; SF1 join-method 42 -> 41
+- [x] **M0146\-0028b — slice 2: expression targets and the lone FROM item**
+  \(impl, done 2026\-09\-28\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §7;
+  evidence `analysis/m0146/m0146\-0028/slice2/`\.
+  Kind: impl
+  Parent: M0146-0028
+  - Call\-free, sublink\-free target expressions are substituted per
+    reference \(fresh copy, level\-rebased\); names from `targetMeta`\.
+  - The lone FROM item is pulled up; the one\-relation index arm skips
+    pulled scopes \(it would drop the body quals\)\.
+  - Grouping\-sets parents decline: PG wraps outputs in PlaceHolderVars
+    \(REPLACE\_WRAP\_ALL\), goopg has none — found by regress
+    `groupingsets` \(`column ref four/3 out of Slot range 2`\) before commit\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(no fires\), regress runner 0/22 diffs changed vs HEAD\.
+  Movement: yes — TPC-H PLAN-PARITY match 6 -> 7 (Q9), CATEGORIES-EXCL-MATCH aggregation-strategy 7 -> 5
 - [ ] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(

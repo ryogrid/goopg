@@ -224,8 +224,10 @@ func TestExplainLeavesScanQualBare(t *testing.T) {
 // confident, wrong relation name — worse than the bare name it replaced.
 // The column-membership guard degrades those refs back to unqualified.
 func TestExplainDoesNotQualifyDerivedColumns(t *testing.T) {
+	// OFFSET 0 keeps the subquery a separate scope (PG's pull-up fence),
+	// which is the shape the hazard lives in.
 	lines := qualifyExplainLines(t,
-		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id) t "+
+		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id OFFSET 0) t "+
 			"WHERE t.s1 <> t.s2")
 
 	got := findLine(lines, "s1 <> s2")
@@ -234,6 +236,16 @@ func TestExplainDoesNotQualifyDerivedColumns(t *testing.T) {
 	}
 	if strings.Contains(got, "a.s2") || strings.Contains(got, "b.s1") {
 		t.Errorf("derived column attributed to the wrong relation: %q", got)
+	}
+
+	// Without the fence the subquery is pulled up (M0146-0028b,
+	// pull_up_simple_subquery): the qual is over the base columns it
+	// renames and renders as PG prints it.
+	pulled := qualifyExplainLines(t,
+		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id) t "+
+			"WHERE t.s1 <> t.s2")
+	if findLine(pulled, "a.st <> b.st") == "" {
+		t.Errorf("pulled-up qual not rendered over its base columns:\n%s", strings.Join(pulled, "\n"))
 	}
 }
 
