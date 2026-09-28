@@ -23438,7 +23438,7 @@ M0146-0001 re-baseline census on the new default arm.
     presorted input\) is the elected shape and whether goopg\'s EXPLAIN
     merely labels it differently \(rendering\) or builds a different node.
 
-- [ ] **M0146\-0019 — Index Only Scan where goopg seq\-scans a probed
+- [x] **M0146\-0019 — Index Only Scan where goopg seq\-scans a probed
   relation** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-H Q13 \(`customer\_pk`
   under a Hash Join\), TPC\-DS Q23 \(`customer\_pkey`\), SF1 Q9
   \(`reason\_pkey` at the root\).
@@ -23447,6 +23447,31 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: for each, check whether goopg generates the index\-only
     path at all \(ledger: no index\-only inner for a join, M0145\-0008l
     note\) or generates and loses it on cost.
+  - **DONE 2026\-09\-28** \(from the M0146\-0005 TPC\-H census, Q13/Q16\)\.
+    Design `docs/design/0100\-0149/m0146\-0019\-index\-only\-recon.md`;
+    evidence `analysis/m0146/m0146\-0019/`\.
+    - The goopg bench data is never vacuumed: `relallvisible` 0 on every
+      TPC\-H table \(PG: all\-visible\); PG TPC\-DS 15/25 tables all\-visible
+      via autovacuum; no goopg loader vacuums\. A cold VM prices an
+      index\-only path as the index scan — corpus state, owner escalation\.
+    - Q13: path generated; after a private\-clone vacuum it is 5570 vs seq
+      5075 \(PG 3906 vs 5162\) — the gap is `indexProbeCostMultiplier` on a
+      single full index scan\'s page term \(M0142\-0005c lineage, parked\)\.
+    - Q16: never generated — a leaf keeping a residual local qual is refused
+      \(`addIndexOnlyPaths`\); filed M0146\-0019a\.
+    - SF1 Q9 `reason\_pkey`: not a VM case \(PG reason 0/1 all\-visible\); open\.
+  Movement: none — routing recon
+- [ ] **M0146\-0019a — index\-only paths keep a residual Filter** \(filed
+  2026\-09\-28 by M0146\-0019\): PG builds an Index Only Scan whose
+  non\-index quals stay as its Filter \(TPC\-H Q16 `partsupp\_pk` with
+  `NOT \(ps\_suppkey = ANY \(hashed SubPlan\)\)`\); goopg refuses any leaf
+  with a residual qual because the predicate addresses the full leaf schema\.
+  Remap the residual predicate onto the covered\-column schema in
+  `addIndexOnlyPaths` / `addOneIndexOnlyPath` \(pathindexonly.go\)\.
+  Moves no plan until the goopg bench clusters are vacuumed \(M0146\-0019
+  finding 1\)\.
+  Kind: impl
+  Parent: M0146-0019
 
 - [x] **M0146\-0020 — grouping sets plan as PG\'s `MixedAggregate`**
   \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q22 \(both scales\), Q27
