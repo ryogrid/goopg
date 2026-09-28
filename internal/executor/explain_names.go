@@ -687,6 +687,9 @@ func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
 			// transparent — the set operation's first-branch deparse
 			// continues into the subplan exactly as it did unwrapped.
 			n = p.Child
+		case *optimizer.Materialize:
+			// M0146-0010: same transparency — a buffer renames nothing.
+			n = p.Child
 		case *optimizer.Join:
 			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
 		case *optimizer.NestedLoopIndexJoin:

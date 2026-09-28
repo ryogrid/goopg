@@ -343,7 +343,7 @@ func deriveJoinKeepsAt(p *Path, out map[string]bool, anc map[string]bool, poison
 		}
 		deriveJoinKeepsAt(outer, out, childAnc, childPoison)
 		deriveJoinKeepsAt(inner, out, childAnc, childPoison)
-	case PathNestLoop, PathMemoize, PathPrebuilt,
+	case PathNestLoop, PathMemoize, PathMaterial, PathPrebuilt,
 		PathBitmapHeapScan, PathBitmapIndexScan, PathBitmapAnd, PathBitmapOr,
 		PathAgg, PathGather, PathGatherMerge, PathFinalizeAgg:
 		// F3-conservative, B-01a NL policy (decline): a nested-loop

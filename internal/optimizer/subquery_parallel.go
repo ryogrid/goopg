@@ -575,6 +575,14 @@ func graftNodeUncached(n Node, s ParallelSettings, anc bool, st *sublinkGraftSta
 			return &c
 		}
 		return n
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same graft rule.
+		c := *x
+		if nc := gc(x.Child); nc != x.Child {
+			c.Child = nc
+			return &c
+		}
+		return n
 	case *WindowAgg:
 		c := *x
 		changed := gxs(x.PartitionBy, func(v []Expr) { c.PartitionBy = v })

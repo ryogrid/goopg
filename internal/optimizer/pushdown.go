@@ -117,6 +117,10 @@ func collectScanOutputNames(n Node, names map[string]bool) {
 		for _, c := range x.Output() {
 			names[c.Name] = true
 		}
+	case *Materialize:
+		// M0146-0010: transparent wrapper — the child's names are the
+		// node's own (Output() == Child.Output(), no renaming).
+		collectScanOutputNames(x.Child, names)
 	case *SetOp, *RecursiveUnion:
 		// M0125-0034 (C1). A FROM-clause subquery whose body is a set
 		// operation is a legal join input, and its Output() is the

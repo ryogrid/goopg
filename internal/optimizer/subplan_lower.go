@@ -377,6 +377,9 @@ func lowerNodeChildren(n Node) []Node {
 		// subtree keeps its visibility to the lowering walkers, same
 		// as when it sat unwrapped.
 		return []Node{x.Child}
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same visibility rule.
+		return []Node{x.Child}
 	}
 	return nil
 }

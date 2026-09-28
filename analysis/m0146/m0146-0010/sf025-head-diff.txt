@@ -1,0 +1,1149 @@
+# plan-parity: tmp/m0146-0010/parity-head/m0146-0010-head.plans.txt -> tmp/m0146-0010/parity-head/m0146-0010-head-pg.plans.txt
+Q1 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy] estimates(goopg cost=282.43..283.72 rows=100 width=32 | pg cost=7284.17..7284.19 rows=7 width=17)
+    note: normalisation: strip-pg-Hash
+    /Q1/Limit/c1/Sort/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q1/Limit/c1/Sort/c0/Hash Join parameterisation: leaf sets differ: customer customer_total_return customer_total_return store vs customer customer_total_return store
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop parameterisation: leaf sets differ: customer customer_total_return store vs customer_total_return store
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: Hash Join Inner vs CTE Scan on customer_total_return ctr1
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on customer_total_return ctr1
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c0/SubPlan2 parameterisation: SubPlan/InitPlan present only on PG side
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c1/Index Scan scan-type: Index Scan customer_pkey on customer vs Materialize
+    /Q1/Limit/c1/Sort/c0/Hash Join/c0/Nested Loop/c1/Index Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store
+    /Q1/Limit/c1/Sort/c0/Hash Join/c1/HashAggregate scan-type: HashAggregate vs Index Scan customer_pkey on customer
+    /Q1/Limit/c1/Sort/c0/Hash Join/c1/HashAggregate/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on customer_total_return ctr2
+    Q1 aggregation-strategy: HashAggregate present only on goopg side
+Q10 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=22309.52..22309.56 rows=2 width=152 | pg cost=24002729.79..24002729.90 rows=3 width=100)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop join-order: Nested Loop Inner vs Seq Scan on customer_demographics
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_demographics_pkey on customer_demographics
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/SubPlan2 parameterisation: SubPlan/InitPlan at different levels (goopg side here)
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/SubPlan2/SubPlan/c0/Gather/c0/Hash Join join-order: leaf sets differ: catalog_sales date_dim vs date_dim web_sales
+    /Q10/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    Q10 aggregation-strategy: HashAggregate present only on PG side
+Q11 MISSING-NODE [join-order,sort-strategy,qual-placement] estimates(goopg cost=33460.78..33460.79 rows=1 width=512 | pg cost=148232.94..171272.49 rows=2 width=480)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q11/Limit/c1/Sort sort-strategy: Sort vs Incremental Sort
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual signature differs
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Merge Join join-order: Merge Cond signature differs
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/CTE Scan sort-strategy: CTE Scan on year_total t_s_secyear vs Sort
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/CTE Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on year_total t_s_secyear
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/CTE Scan sort-strategy: CTE Scan on year_total t_s_firstyear vs Sort
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/CTE Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on year_total t_w_secyear
+    /Q11/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c1/CTE Scan qual-placement: Filter signature differs
+    Q11 MISSING-NODE: PG-only kinds: Incremental Sort
+Q12 MATCH [rendering] estimates(goopg cost=6411.07..6411.34 rows=22 width=224 | pg cost=8774.73..8774.79 rows=22 width=291)
+    note: normalisation: strip-pg-Hash
+Q13 SHAPE-DIFF [scan-type,qual-placement] estimates(goopg cost=19098.45..19098.46 rows=1 width=128 | pg cost=24520.75..24520.76 rows=1 width=128)
+    /Q13/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q13/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c1/Index Scan qual-placement: Filter signature differs
+    /Q13/Aggregate/c0/Nested Loop/c1/Index Scan scan-type: Index Scan store_pkey on store vs Index Only Scan store_pkey on store
+Q14 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism,rendering] estimates(goopg cost=37650.66..37650.68 rows=1 width=168 | pg cost=92452.90..92452.90 rows=1 width=168)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q14/Limit/c2/Sort rendering: Sort Key text differs
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Inner
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop parameterisation: leaf sets differ: date_dim item store_sales vs cross_items item
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs HashAggregate
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_3
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan store_sales_pkey on store_sales
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c1/CTE Scan scan-type: CTE Scan on cross_items vs Index Scan date_dim_pkey on date_dim
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c1/InitPlan3 parameterisation: SubPlan/InitPlan at different levels (PG side here)
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/GroupAggregate/c0/Sort/c0/Hash Join/c1/InitPlan3/InitPlan/c0/Seq Scan scan-type: Seq Scan on date_dim date_dim_5 vs CTE Scan on avg_sales
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/InitPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/InitPlan4 parameterisation: SubPlan/InitPlan at different levels (PG side here)
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c0/InitPlan4/InitPlan/c0/CTE Scan scan-type: CTE Scan on avg_sales vs Seq Scan on date_dim date_dim_6
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Inner
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop parameterisation: leaf sets differ: date_dim item store_sales vs cross_items item
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs HashAggregate
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_5
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan store_sales_pkey on store_sales store_sales_1
+    /Q14/Limit/c2/Sort/c0/Nested Loop/c1/GroupAggregate/c0/Sort/c0/Hash Join/c1/CTE Scan scan-type: CTE Scan on cross_items vs Index Scan date_dim_pkey on date_dim date_dim_1
+    ... and 4 more divergences
+Q15 MATCH [] estimates(goopg cost=7616.92..7620.32 rows=100 width=64 | pg cost=14058.48..14065.81 rows=54 width=43)
+    note: normalisation: strip-pg-Hash
+Q16 SHAPE-DIFF [join-order,scan-type,parameterisation,parallelism] estimates(goopg cost=8216.22..8216.24 rows=1 width=72 | pg cost=17033.41..17033.42 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q16/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q16/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Gather/c0/Nested Loop join-order: Nested Loop Left Semi vs Seq Scan on call_center
+    /Q16/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Gather/c0/Nested Loop/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q16/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan catalog_sales_pkey on catalog_sales cs2
+    /Q16/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Gather/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    Q16 scan-type: Index Only Scan present only on PG side
+Q17 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4842.52..4842.54 rows=1 width=312 | pg cost=4716.34..4717.12 rows=1 width=434)
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge parallelism: Gather Merge vs Nested Loop Inner
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store store_returns store_sales vs date_dim item store store_returns store_sales
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns store_sales vs date_dim store store_returns store_sales
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns vs date_dim store_returns store_sales
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+    /Q17/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan catalog_sales_pkey on catalog_sales
+Q18 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=7569.82..7570.43 rows=49 width=352 | pg cost=14220.30..14220.42 rows=49 width=272)
+    note: normalisation: strip-pg-Hash
+    /Q18/Limit/c0/Sort/c0/MixedAggregate aggregation-strategy: MixedAggregate vs GroupAggregate
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather sort-strategy: Gather vs Sort
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer customer_address customer_demographics customer_demographics date_dim vs catalog_sales customer customer_address customer_demographics customer_demographics date_dim item
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer customer_address customer_demographics date_dim vs catalog_sales customer customer_address customer_demographics customer_demographics date_dim
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer customer_address date_dim vs catalog_sales customer customer_address customer_demographics date_dim
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer date_dim vs catalog_sales customer customer_address date_dim
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-method: Parallel Hash Join Inner vs Nested Loop Inner
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: catalog_sales date_dim vs catalog_sales customer date_dim
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on catalog_sales vs Parallel Hash Join Inner
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on catalog_sales
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Index Scan scan-type: Index Scan customer_demographics_pkey on customer_demographics cd1 vs Index Only Scan customer_demographics_pkey on customer_demographics cd2
+    /Q18/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+Q19 SHAPE-DIFF [join-order,parameterisation] estimates(goopg cost=17862.93..17862.99 rows=5 width=104 | pg cost=18967.96..18967.97 rows=5 width=142)
+    note: normalisation: strip-pg-Hash
+    /Q19/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: item store_sales vs date_dim store_sales
+    /Q19/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Index Scan item_pkey on item
+    /Q19/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+Q2 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=5384.81..5402.29 rows=363 width=228 | pg cost=37623.39..37623.42 rows=13 width=228)
+    note: normalisation: strip-pg-Hash
+    /Q2/Gather sort-strategy: Gather vs Sort
+    /Q2/Gather/c0/CTE/c0/HashAggregate join-order: HashAggregate vs Finalize HashAggregate
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join parallelism: Hash Join Inner vs Gather
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c0/Append join-order: Append vs Partial HashAggregate
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c0/Append/c0/Seq Scan join-order: Seq Scan on web_sales vs Parallel Hash Join Inner
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c0/Append/c0/Seq Scan/c-extra-pg/Append join-order: present only on PG side: Parallel Append
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c0/Append/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim date_dim_2
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c0/Append/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on catalog_sales
+    /Q2/Gather/c0/CTE/c0/HashAggregate/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on date_dim
+    /Q2/Gather/c1/Merge Join join-method: Merge Join Inner vs Hash Join Inner
+    /Q2/Gather/c1/Merge Join/c0/Hash Join join-order: Hash Join Inner vs CTE Scan on wswscs
+    /Q2/Gather/c1/Merge Join/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_2
+    /Q2/Gather/c1/Merge Join/c0/Hash Join/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on wswscs
+    /Q2/Gather/c1/Merge Join/c1/Hash Join join-order: leaf sets differ: date_dim wswscs vs date_dim date_dim wswscs
+    /Q2/Gather/c1/Merge Join/c1/Hash Join/c0/Seq Scan join-order: Seq Scan on date_dim date_dim_3 vs Hash Join Inner
+    /Q2/Gather/c1/Merge Join/c1/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on date_dim date_dim_1
+    /Q2/Gather/c1/Merge Join/c1/Hash Join/c0/Seq Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on wswscs wswscs_1
+    Q2 aggregation-strategy: HashAggregate present only on goopg side
+Q20 MATCH [rendering] estimates(goopg cost=7557.84..7558.39 rows=44 width=224 | pg cost=13977.86..13977.97 rows=44 width=291)
+    note: normalisation: strip-pg-Hash
+Q21 SHAPE-DIFF [join-order,join-method,sort-strategy,parallelism] estimates(goopg cost=11332.15..11332.31 rows=13 width=72 | pg cost=25638.13..25658.55 rows=14 width=51)
+    note: normalisation: strip-pg-Hash
+    /Q21/Limit/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q21/Limit/c0/Sort/c0/GroupAggregate parallelism: GroupAggregate vs Gather Merge
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Hash Join Inner
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join join-order: leaf sets differ: date_dim inventory item warehouse vs date_dim inventory item
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: date_dim inventory item vs date_dim inventory
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on inventory
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on inventory
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q21/Limit/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on warehouse
+Q22 MATCH [] estimates(goopg cost=30019.56..30142.11 rows=100 width=160 | pg cost=30559.37..30559.62 rows=100 width=236)
+    note: normalisation: strip-pg-Hash
+Q23 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism,rendering] estimates(goopg cost=24154.42..24155.70 rows=100 width=96 | pg cost=103232.58..103232.74 rows=63 width=84)
+    note: normalisation: canonicalise-bare-semi-anti,canonicalise-right-join,strip-pg-Hash
+    /Q23/Limit/c1/CTE/c0/HashAggregate/c0/Hash Join/c1/Seq Scan scan-type: Seq Scan on customer customer_1 vs Index Only Scan customer_pkey on customer customer_3
+    /Q23/Limit/c1/CTE/c0/InitPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+    /Q23/Limit/c1/CTE/c0/InitPlan2 parameterisation: SubPlan/InitPlan present only on PG side
+    /Q23/Limit/c2/Sort rendering: Sort Key text differs
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Inner
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: catalog_sales customer date_dim frequent_ss_items vs best_ss_customer catalog_sales date_dim frequent_ss_items
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather parallelism: Gather vs Hash Join Inner
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_pkey on customer customer_2
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c-extra-pg/HashAggregate aggregation-strategy: present only on PG side: HashAggregate
+    /Q23/Limit/c2/Sort/c0/Append/c0/GroupAggregate/c0/Sort/c0/Hash Join/c1/CTE Scan scan-type: CTE Scan on best_ss_customer vs Index Scan customer_pkey on customer
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Inner
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: customer date_dim frequent_ss_items web_sales vs best_ss_customer date_dim frequent_ss_items web_sales
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather parallelism: Gather vs Hash Join Inner
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_pkey on customer customer_3
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c-extra-pg/HashAggregate aggregation-strategy: present only on PG side: HashAggregate
+    /Q23/Limit/c2/Sort/c0/Append/c1/GroupAggregate/c0/Sort/c0/Hash Join/c1/CTE Scan scan-type: CTE Scan on best_ss_customer vs Index Scan customer_pkey on customer customer_1
+Q24 SHAPE-DIFF [join-order,parameterisation,sort-strategy,qual-placement] estimates(goopg cost=0.04..0.06 rows=1 width=128 | pg cost=19324.17..19324.22 rows=1 width=358)
+    note: normalisation: strip-pg-Hash
+    /Q24/GroupAggregate/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop qual-placement: JoinQual signature differs
+    /Q24/GroupAggregate/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c1/Index Scan qual-placement: Filter present only on PG side
+    /Q24/GroupAggregate/c1/Sort sort-strategy: Sort vs CTE Scan on ssales
+    /Q24/GroupAggregate/c1/Sort/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on ssales
+    /Q24/InitPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+    /Q24/InitPlan2 parameterisation: SubPlan/InitPlan present only on PG side
+Q25 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4788.76..4788.78 rows=1 width=224 | pg cost=4680.16..4680.91 rows=1 width=237)
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge parallelism: Gather Merge vs Nested Loop Inner
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store store_returns store_sales vs date_dim item store store_returns store_sales
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns store_sales vs date_dim store store_returns store_sales
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns vs date_dim store_returns store_sales
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+    /Q25/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan catalog_sales_pkey on catalog_sales
+Q26 SHAPE-DIFF [sort-strategy,parallelism] estimates(goopg cost=7624.49..7625.01 rows=26 width=160 | pg cost=14290.13..14291.00 rows=25 width=145)
+    note: normalisation: strip-pg-Hash
+    /Q26/Limit/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q26/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather
+    Q26 parallelism: Gather present only on PG side
+Q27 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=9311.10..9312.21 rows=89 width=196 | pg cost=19493.49..19493.72 rows=91 width=152)
+    note: normalisation: strip-pg-Hash
+    /Q27/Limit/c0/Sort/c0/MixedAggregate aggregation-strategy: MixedAggregate vs GroupAggregate
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather parallelism: Gather vs Gather Merge
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: customer_demographics date_dim store store_sales vs customer_demographics date_dim item store store_sales
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim store store_sales vs customer_demographics date_dim store store_sales
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join parallelism: Parallel flag differs
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: date_dim store_sales vs date_dim store store_sales
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Parallel Hash Join Inner
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q27/Limit/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+Q28 MATCH [] estimates(goopg cost=54083.24..54083.56 rows=1 width=288 | pg cost=132911.43..132911.54 rows=1 width=288)
+Q29 SHAPE-DIFF [join-order,sort-strategy,parallelism] estimates(goopg cost=4690.39..4690.41 rows=1 width=140 | pg cost=4612.70..4613.45 rows=1 width=153)
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge parallelism: Gather Merge vs Nested Loop Inner
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store store_returns store_sales vs date_dim item store store_returns store_sales
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns store_sales vs date_dim store store_returns store_sales
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim store_returns vs date_dim store_returns store_sales
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+    /Q29/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan catalog_sales_pkey on catalog_sales
+Q3 MISSING-NODE [sort-strategy] estimates(goopg cost=3807.79..3808.41 rows=50 width=72 | pg cost=4070.98..4079.90 rows=50 width=91)
+    note: PG-only node kinds: Incremental Sort
+    /Q3/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    Q3 MISSING-NODE: PG-only kinds: Incremental Sort
+Q30 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation] estimates(goopg cost=1024.56..1024.57 rows=1 width=332 | pg cost=2777.10..2777.10 rows=1 width=253)
+    /Q30/Limit/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q30/Limit/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Seq Scan parameterisation: Seq Scan on date_dim vs Memoize
+    /Q30/Limit/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Seq Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim
+    /Q30/Limit/c1/Sort/c0/Nested Loop parameterisation: JoinQual present only on goopg side
+    /Q30/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/CTE Scan parameterisation: parameterised inner differs
+    /Q30/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/CTE Scan parameterisation: Filter present only on PG side
+    /Q30/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/SubPlan2 parameterisation: SubPlan/InitPlan present only on PG side
+    /Q30/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan scan-type: Bitmap Heap Scan on customer vs Index Scan customer_pkey on customer
+    /Q30/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan/c-extra-goopg/Bitmap Index Scan join-order: present only on goopg side: Bitmap Index Scan on customer_pkey
+    /Q30/Limit/c1/Sort/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+Q31 MATCH [] estimates(goopg cost=25056.99..25057.00 rows=1 width=432 | pg cost=123634.62..123634.63 rows=1 width=210)
+    note: normalisation: strip-pg-Hash
+Q32 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=16994.60..16994.62 rows=1 width=32 | pg cost=15505.98..15505.99 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+    /Q32/Limit/c0/Aggregate/c0/Hash Join parameterisation: leaf sets differ: catalog_sales catalog_sales date_dim date_dim item vs catalog_sales date_dim item
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales item vs catalog_sales date_dim
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan parallelism: Parallel flag differs
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c1/HashAggregate scan-type: HashAggregate vs Seq Scan on item
+    /Q32/Limit/c0/Aggregate/c0/Hash Join/c1/HashAggregate/c-extra-goopg/Gather parallelism: present only on goopg side: Gather
+    /Q32/Limit/c0/Aggregate/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on PG side
+    Q32 aggregation-strategy: HashAggregate present only on goopg side
+Q33 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=16.82..18.27 rows=100 width=36 | pg cost=46257.36..46257.61 rows=100 width=36)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q33/Limit/c0/Sort rendering: Sort Key text differs
+    /Q33/Limit/c0/Sort/c0/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append join-order: Append vs Merge Append
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Hash Join Inner
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join parallelism: Parallel Hash Join Left Semi vs Gather
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item item_1
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/HashAggregate aggregation-strategy: present only on PG side: HashAggregate
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Hash Join Inner
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join parallelism: Parallel Hash Join Left Semi vs Gather
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item item_3
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/HashAggregate aggregation-strategy: present only on PG side: HashAggregate
+    /Q33/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Seq Scan qual-placement: Filter signature differs
+Q34 SHAPE-DIFF [join-order,scan-type] estimates(goopg cost=7631.84..7631.84 rows=1 width=340 | pg cost=18265.14..18265.18 rows=16 width=77)
+    note: normalisation: strip-pg-Hash
+    /Q34/Sort/c0/Nested Loop/c1/Bitmap Heap Scan scan-type: Bitmap Heap Scan on customer vs Index Scan customer_pkey on customer
+    /Q34/Sort/c0/Nested Loop/c1/Bitmap Heap Scan/c-extra-goopg/Bitmap Index Scan join-order: present only on goopg side: Bitmap Index Scan on customer_pkey
+Q35 MISSING-NODE [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=25084.25..25104.45 rows=100 width=320 | pg cost=1095385.36..4090274.17 rows=100 width=259)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Incremental Sort
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop parallelism: Nested Loop Inner vs Gather Merge
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Left Semi vs Parallel Seq Scan on customer_address ca
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on customer c
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Inner
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_demographics_pkey on customer_demographics
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_address_pkey on customer_address ca
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/SubPlan2 parameterisation: SubPlan/InitPlan at different levels (goopg side here)
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/SubPlan2/SubPlan/c0/Gather/c0/Hash Join join-order: leaf sets differ: catalog_sales date_dim vs date_dim web_sales
+    /Q35/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    Q35 aggregation-strategy: HashAggregate present only on PG side
+    Q35 MISSING-NODE: PG-only kinds: Incremental Sort
+Q36 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q37 SHAPE-DIFF [join-order,scan-type,parameterisation] estimates(goopg cost=4262.45..4262.49 rows=2 width=96 | pg cost=4342.18..4342.68 rows=2 width=125)
+    /Q37/Limit/c0/Group/c0/Gather Merge/c0/Group/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales inventory item vs date_dim inventory item
+    /Q37/Limit/c0/Group/c0/Gather Merge/c0/Group/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales item vs inventory item
+    /Q37/Limit/c0/Group/c0/Gather Merge/c0/Group/c0/Sort/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Index Only Scan catalog_sales_pkey on catalog_sales
+    /Q37/Limit/c0/Group/c0/Gather Merge/c0/Group/c0/Sort/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    Q37 scan-type: Bitmap Heap Scan present only on goopg side
+Q38 SHAPE-DIFF [join-order,join-method,sort-strategy] estimates(goopg cost=24576.97..24576.99 rows=1 width=8 | pg cost=43275.08..43275.09 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp join-order: HashSetOp Intersect vs SetOp Intersect
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp join-order: HashSetOp Intersect vs SetOp Intersect
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique sort-strategy: Unique vs Sort
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop join-order: leaf sets differ: customer date_dim store_sales vs date_dim store_sales
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q38/Limit/c0/Aggregate/c0/HashSetOp/c1/HashSetOp/c1/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_pkey on customer customer_2
+Q39 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,qual-placement,rendering] estimates(goopg cost=78.98..78.99 rows=1 width=280 | pg cost=27924.19..27924.19 rows=1 width=152)
+    note: normalisation: strip-pg-Hash
+    /Q39/Sort rendering: Sort Key text differs
+    /Q39/Sort/c0/CTE/c0/HashAggregate scan-type: HashAggregate vs Subquery Scan on foo
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather parallelism: Gather vs HashAggregate
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join join-order: Hash Cond signature differs
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join parallelism: Parallel flag differs
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim inventory vs date_dim inventory warehouse
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on inventory vs Parallel Hash Join Inner
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on inventory
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+    /Q39/Sort/c0/CTE/c0/HashAggregate/c0/Gather/c0/Hash Join/c1/Seq Scan scan-type: Seq Scan on warehouse vs Index Only Scan item_pkey on item
+    /Q39/Sort/c1/Hash Join/c0/CTE Scan qual-placement: Filter signature differs
+    /Q39/Sort/c1/Hash Join/c1/CTE Scan qual-placement: Filter signature differs
+    Q39 join-method: Nested Loop present only on goopg side
+Q4 MISSING-NODE [join-order,sort-strategy,qual-placement] estimates(goopg cost=71579.20..71579.22 rows=1 width=768 | pg cost=254479.11..318694.46 rows=2 width=334)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q4/Limit/c1/Sort sort-strategy: Sort vs Incremental Sort
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual signature differs
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Merge Join join-order: Merge Cond signature differs
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/CTE Scan sort-strategy: CTE Scan on year_total t_s_secyear vs Sort
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/CTE Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on year_total t_s_secyear
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/CTE Scan sort-strategy: CTE Scan on year_total t_s_firstyear vs Sort
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/CTE Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on year_total t_c_secyear
+    /Q4/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/CTE Scan qual-placement: Filter signature differs
+    Q4 MISSING-NODE: PG-only kinds: Incremental Sort
+Q40 SHAPE-DIFF [join-order,join-method,aggregation-strategy,parallelism] estimates(goopg cost=13913.72..13914.08 rows=18 width=128 | pg cost=13985.06..13987.63 rows=17 width=84)
+    note: normalisation: strip-pg-Hash
+    /Q40/Limit/c0/GroupAggregate join-order: GroupAggregate vs Finalize GroupAggregate
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop parallelism: Nested Loop Left vs Gather Merge
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge parallelism: Gather Merge vs Partial GroupAggregate
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim item warehouse vs catalog_returns catalog_sales date_dim item warehouse
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop join-method: join type Inner vs Left
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim item vs catalog_returns catalog_sales date_dim item
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-method: Parallel Hash Join Inner vs Nested Loop Inner
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: catalog_sales date_dim vs catalog_sales date_dim item
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on catalog_sales vs Parallel Hash Join Inner
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on catalog_sales
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q40/Limit/c0/GroupAggregate/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan catalog_returns_pkey on catalog_returns
+    Q40 aggregation-strategy: GroupAggregate present only on goopg side
+Q41 SHAPE-DIFF [join-order,parameterisation,sort-strategy,parallelism] estimates(goopg cost=184.31..187.00 rows=83 width=32 | pg cost=72523826.68..72523827.10 rows=84 width=51)
+    /Q41/Limit/c0/Unique/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q41/Limit/c0/Unique/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Seq Scan on item i1
+    /Q41/Limit/c0/Unique/c0/Gather Merge/c0/Sort/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item i1
+    /Q41/Limit/c0/Unique/c0/Gather Merge/c0/SubPlan1 parameterisation: SubPlan/InitPlan at different levels (PG side here)
+    Q41 parallelism: Gather Merge present only on goopg side
+Q42 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=17870.59..17870.65 rows=5 width=72 | pg cost=18965.95..18965.96 rows=5 width=91)
+    note: normalisation: strip-pg-Hash
+    /Q42/Limit/c0/Sort rendering: Sort Key text differs
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate parallelism: Partial GroupAggregate vs Gather
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-order: leaf sets differ: date_dim item store_sales vs date_dim store_sales
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Parallel Seq Scan on date_dim dt
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim dt
+    /Q42/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item
+    Q42 aggregation-strategy: GroupAggregate present only on PG side
+Q43 MISSING-NODE [sort-strategy] estimates(goopg cost=17906.23..17906.33 rows=8 width=288 | pg cost=18896.41..18940.08 rows=8 width=246)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q43/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q43/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q43/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate sort-strategy: Partial HashAggregate vs Sort
+    Q43 MISSING-NODE: PG-only kinds: Incremental Sort
+Q44 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism,rendering] estimates(goopg cost=46566.38..216025.08 rows=100 width=984 | pg cost=80932.00..80948.01 rows=100 width=110)
+    /Q44/Limit/c0/Nested Loop parameterisation: leaf sets differ: item item store_sales store_sales v11 v21 vs item item store_sales store_sales v1 v11 v2 v21
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop parameterisation: leaf sets differ: item store_sales store_sales v11 v21 vs item store_sales store_sales v1 v11 v2 v21
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join parameterisation: leaf sets differ: store_sales store_sales v11 v21 vs store_sales store_sales v1 v11 v2 v21
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan sort-strategy: Subquery Scan on v11 vs Sort
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg scan-type: WindowAgg vs Subquery Scan on v11
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs WindowAgg
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/HashAggregate sort-strategy: HashAggregate vs Sort
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1 parameterisation: SubPlan/InitPlan at different levels (goopg side here)
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1/InitPlan/c0/Finalize GroupAggregate rendering: Group Key text differs
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1/InitPlan/c0/Finalize GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Gather
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1/InitPlan/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1/InitPlan/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate scan-type: Partial HashAggregate vs Parallel Seq Scan on store_sales
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan1/InitPlan/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan sort-strategy: Subquery Scan on v21 vs Sort
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg scan-type: WindowAgg vs Subquery Scan on v21
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs WindowAgg
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/HashAggregate sort-strategy: HashAggregate vs Sort
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan2 parameterisation: SubPlan/InitPlan at different levels (goopg side here)
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan2/InitPlan/c0/Finalize GroupAggregate rendering: Group Key text differs
+    /Q44/Limit/c0/Nested Loop/c0/Nested Loop/c0/Merge Join/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/InitPlan2/InitPlan/c0/Finalize GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Gather
+    ... and 7 more divergences
+Q45 SHAPE-DIFF [sort-strategy,parallelism] estimates(goopg cost=6473.25..6475.89 rows=100 width=96 | pg cost=8927.27..8929.52 rows=100 width=52)
+    note: normalisation: strip-pg-Hash
+    /Q45/Limit/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q45/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather
+    Q45 parallelism: Gather present only on PG side
+Q46 SHAPE-DIFF [join-method,scan-type,qual-placement,rendering] estimates(goopg cost=13431.77..13434.37 rows=100 width=196 | pg cost=23086.06..23086.31 rows=100 width=138)
+    note: normalisation: strip-pg-Hash
+    /Q46/Limit/c0/Sort rendering: Sort Key text differs
+    /Q46/Limit/c0/Sort/c0/Nested Loop qual-placement: JoinQual signature differs
+    /Q46/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q46/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Seq Scan scan-type: Seq Scan on customer vs Index Scan customer_pkey on customer
+Q47 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=38.26..38.28 rows=1 width=196 | pg cost=20868.04..20868.05 rows=1 width=400)
+    note: normalisation: strip-pg-Hash
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort sort-strategy: Sort vs WindowAgg
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg join-order: WindowAgg vs GroupAggregate
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate sort-strategy: HashAggregate vs Sort
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop join-order: leaf sets differ: date_dim item store store_sales vs date_dim store store_sales
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join parallelism: Parallel flag differs
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim store store_sales vs date_dim store_sales
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q47/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/HashAggregate/c0/Gather/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item
+    /Q47/Limit/c1/Sort rendering: Sort Key text differs
+    /Q47/Limit/c1/Sort/c0/Subquery Scan join-order: Subquery Scan on v2 vs Merge Join Inner
+    /Q47/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join join-order: Merge Join Inner vs CTE Scan on v1 v1_lead
+    /Q47/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join/c-extra-goopg/Merge Join join-order: present only on goopg side: Merge Join Inner
+    /Q47/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on v1 v1_lead
+    /Q47/Limit/c1/Sort/c0/Subquery Scan/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    ... and 2 more divergences
+Q48 SHAPE-DIFF [qual-placement] estimates(goopg cost=7801.82..7801.83 rows=1 width=4 | pg cost=24748.47..24748.48 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    /Q48/Aggregate/c0/Gather/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q48/Aggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q48/Aggregate/c0/Gather/c0/Nested Loop/c0/Nested Loop/c1/Index Scan qual-placement: Filter signature differs
+    /Q48/Aggregate/c0/Gather/c0/Nested Loop/c1/Index Scan qual-placement: Filter signature differs
+Q49 MISSING-NODE [join-order,scan-type,sort-strategy,parallelism,rendering] estimates(goopg cost=13536.57..13536.61 rows=3 width=84 | pg cost=10459.26..10459.41 rows=3 width=84)
+    note: PG-only node kinds: Incremental Sort
+    /Q49/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort rendering: Sort Key text differs
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort rendering: Sort Key text differs
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort rendering: Sort Key text differs
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on in_web
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: web_returns web_sales vs date_dim web_returns web_sales
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan join-order: Seq Scan on web_returns wr vs Nested Loop Inner
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on web_returns wr
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan web_sales_pkey on web_sales ws
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort rendering: Sort Key text differs
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort rendering: Sort Key text differs
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on in_cat
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_returns catalog_sales vs catalog_returns catalog_sales date_dim
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan join-order: Seq Scan on catalog_returns cr vs Nested Loop Inner
+    /Q49/Limit/c0/Sort/c0/Unique/c0/Sort/c0/Append/c1/Subquery Scan/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on catalog_returns cr
+    ... and 16 more divergences
+Q5 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism,rendering] estimates(goopg cost=14.23..15.73 rows=100 width=160 | pg cost=55166.85..55167.10 rows=100 width=160)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+    /Q5/Limit/c0/Sort rendering: Sort Key text differs
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on ssr
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather sort-strategy: Gather vs Sort
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join parallelism: Hash Join Inner vs Gather
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join parallelism: Parallel flag differs
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: date_dim store_returns store_sales vs date_dim store store_returns store_sales
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join/c0/Append join-order: Parallel Append vs Parallel Hash Join Inner
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join/c0/Append/c0/Seq Scan scan-type: Parallel Seq Scan on store_sales vs Parallel Append
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join/c0/Append/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join/c0/Append/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_returns
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on csr
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs GroupAggregate
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join join-method: Parallel Hash Join Inner vs Nested Loop Inner
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: catalog_returns catalog_sales date_dim vs catalog_page catalog_returns catalog_sales date_dim
+    /Q5/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Append join-order: Parallel Append vs Parallel Hash Join Inner
+    ... and 15 more divergences
+Q50 SHAPE-DIFF [scan-type,qual-placement] estimates(goopg cost=4588.01..4588.03 rows=1 width=332 | pg cost=4539.23..4539.45 rows=1 width=125)
+    /Q50/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q50/Limit/c0/GroupAggregate/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Index Scan qual-placement: Filter present only on PG side
+    /Q50/Limit/c0/GroupAggregate/c0/Nested Loop/c1/Index Scan scan-type: Index Scan date_dim_pkey on date_dim d1 vs Index Only Scan date_dim_pkey on date_dim d1
+Q51 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=526.71..530.50 rows=100 width=136 | pg cost=28641.96..28652.45 rows=100 width=136)
+    note: normalisation: strip-pg-Hash
+    /Q51/Limit/c0/Sort sort-strategy: Sort vs Subquery Scan on y
+    /Q51/Limit/c0/Sort/c0/Subquery Scan scan-type: Subquery Scan on y vs WindowAgg
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg sort-strategy: WindowAgg vs Sort
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Merge Join Full
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join join-order: Merge Join Full vs WindowAgg
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg join-order: WindowAgg vs GroupAggregate
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort/c0/GroupAggregate sort-strategy: GroupAggregate vs Sort
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Parallel Hash Join Inner
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Parallel Seq Scan on web_sales
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Inner
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Merge Join/c-extra-goopg/WindowAgg join-order: present only on goopg side: WindowAgg
+    /Q51/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c-extra-pg/WindowAgg join-order: present only on PG side: WindowAgg
+    Q51 aggregation-strategy: HashAggregate present only on goopg side
+Q52 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=17870.59..17870.65 rows=5 width=72 | pg cost=18966.89..18966.91 rows=5 width=91)
+    note: normalisation: strip-pg-Hash
+    /Q52/Limit/c0/Sort rendering: Sort Key text differs
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate parallelism: Partial GroupAggregate vs Gather
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-order: leaf sets differ: date_dim item store_sales vs date_dim store_sales
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Parallel Seq Scan on date_dim dt
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim dt
+    /Q52/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item
+    Q52 aggregation-strategy: GroupAggregate present only on PG side
+Q53 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=4459.57..4459.59 rows=2 width=68 | pg cost=5748.40..5748.40 rows=2 width=68)
+    note: normalisation: strip-pg-Hash
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate sort-strategy: Finalize GroupAggregate vs Sort
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Gather
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate join-order: Partial HashAggregate vs Hash Join Inner
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-order: leaf sets differ: date_dim item store store_sales vs item store_sales
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join join-order: Hash Join Inner vs Parallel Seq Scan on item
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store
+    /Q53/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim
+    Q53 aggregation-strategy: GroupAggregate present only on PG side
+Q54 MISSING-NODE [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.04..0.05 rows=1 width=12 | pg cost=30914.73..30914.77 rows=2 width=16)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q54/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q54/Limit/c0/Sort/c0/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate sort-strategy: GroupAggregate vs Sort
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs Subquery Scan on my_revenue
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort/c0/Nested Loop join-order: Nested Loop Inner vs GroupAggregate
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan join-order: Seq Scan on store vs Nested Loop Inner
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Nested Loop join-order: present only on PG side: Nested Loop Inner
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store
+    /Q54/Limit/c0/Sort/c0/HashAggregate/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    Q54 parallelism: Gather present only on PG side
+    Q54 scan-type: Subquery Scan present only on PG side
+    Q54 MISSING-NODE: PG-only kinds: Incremental Sort
+Q55 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=16255.79..16255.83 rows=3 width=68 | pg cost=16984.16..16984.16 rows=3 width=87)
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate parallelism: Partial GroupAggregate vs Gather
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-order: leaf sets differ: date_dim item store_sales vs item store_sales
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: Nested Loop Inner vs Parallel Seq Scan on item
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Bitmap Heap Scan join-order: present only on goopg side: Bitmap Heap Scan on store_sales
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Bitmap Heap Scan on store_sales
+    /Q55/Limit/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c-extra-pg/Memoize parameterisation: present only on PG side: Memoize
+    Q55 aggregation-strategy: GroupAggregate present only on PG side
+Q56 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=1.73..2.00 rows=22 width=64 | pg cost=26065.92..26065.98 rows=21 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q56/Limit/c0/Sort rendering: Sort Key text differs
+    /Q56/Limit/c0/Sort/c0/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append join-order: Append vs Merge Append
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate parallelism: Partial GroupAggregate vs Gather
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop join-order: leaf sets differ: customer_address date_dim item item web_sales vs date_dim item item web_sales
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim item item web_sales vs item item web_sales
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Left Semi
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: item item web_sales vs item item
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Left Semi vs Parallel Seq Scan on item item_4
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item item_4
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on item item_5
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Index Scan web_sales_pkey on web_sales
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim date_dim_2
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Index Scan parameterisation: Index Scan customer_address_pkey on customer_address customer_address_2 vs Memoize
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c0/Nested Loop/c1/Index Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim date_dim_2
+    /Q56/Limit/c0/Sort/c0/HashAggregate/c0/Append/c2/Finalize GroupAggregate/c0/Gather Merge/c0/Partial GroupAggregate/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_address_pkey on customer_address customer_address_2
+Q57 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=20.74..20.76 rows=1 width=228 | pg cost=15124.75..15124.76 rows=1 width=690)
+    note: normalisation: strip-pg-Hash
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort sort-strategy: Sort vs WindowAgg
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg join-order: WindowAgg vs GroupAggregate
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate sort-strategy: GroupAggregate vs Sort
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Nested Loop Inner
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Hash Join Inner
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop join-order: leaf sets differ: call_center catalog_sales date_dim item vs catalog_sales date_dim
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Hash Join Inner vs Parallel Seq Scan on catalog_sales
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Inner
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on call_center
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on call_center
+    /Q57/Limit/c0/CTE/c0/WindowAgg/c0/Sort/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item
+    /Q57/Limit/c1/Sort/c0/Subquery Scan join-order: Subquery Scan on v2 vs Merge Join Inner
+    /Q57/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join join-order: Merge Join Inner vs CTE Scan on v1 v1_lead
+    /Q57/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join/c-extra-goopg/Merge Join join-order: present only on goopg side: Merge Join Inner
+    /Q57/Limit/c1/Sort/c0/Subquery Scan/c0/Merge Join/c-extra-goopg/CTE Scan join-order: present only on goopg side: CTE Scan on v1 v1_lead
+    /Q57/Limit/c1/Sort/c0/Subquery Scan/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    Q57 scan-type: Subquery Scan present only on goopg side
+Q58 MISSING-NODE [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement] estimates(goopg cost=3.16..3.17 rows=1 width=192 | pg cost=54736.29..54744.05 rows=2 width=241)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q58/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q58/Limit/c0/Sort/c0/Hash Join join-method: Hash Join Inner vs Merge Join Inner
+    /Q58/Limit/c0/Sort/c0/Hash Join/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop parameterisation: leaf sets differ: date_dim date_dim item store_sales vs catalog_sales date_dim date_dim item
+    /Q58/Limit/c0/Sort/c0/Hash Join/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join parameterisation: leaf sets differ: date_dim date_dim store_sales vs catalog_sales date_dim date_dim
+    /Q58/Limit/c0/Sort/c0/Hash Join/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/InitPlan1 parameterisation: SubPlan/InitPlan at different levels (goopg side here)
+    /Q58/Limit/c0/Sort/c0/Hash Join/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/InitPlan2 parameterisation: SubPlan/InitPlan at different levels (PG side here)
+    /Q58/Limit/c0/Sort/c0/Hash Join/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Nested Loop/c1/Index Scan qual-placement: Index Cond signature differs
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join join-order: Hash Join Inner vs Materialize
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate join-order: Finalize GroupAggregate vs Merge Join Inner
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs GroupAggregate
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather Merge
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate sort-strategy: Partial HashAggregate vs Sort
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop parameterisation: leaf sets differ: catalog_sales date_dim date_dim item vs date_dim date_dim item store_sales
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join parameterisation: leaf sets differ: catalog_sales date_dim date_dim vs date_dim date_dim store_sales
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/InitPlan1 parameterisation: SubPlan/InitPlan already compared at another level
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/InitPlan2 parameterisation: SubPlan/InitPlan already compared at another level
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c1/Index Scan qual-placement: Index Cond signature differs
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c0/Finalize GroupAggregate/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    /Q58/Limit/c0/Sort/c0/Hash Join/c1/Hash Join/c-extra-goopg/GroupAggregate aggregation-strategy: present only on goopg side: GroupAggregate
+    Q58 MISSING-NODE: PG-only kinds: Incremental Sort
+Q59 SHAPE-DIFF [join-order,join-method,parameterisation,rendering] estimates(goopg cost=8398.38..8399.69 rows=100 width=516 | pg cost=62384.58..62384.58 rows=1 width=250)
+    note: normalisation: strip-pg-Hash
+    /Q59/Limit/c1/Sort rendering: Sort Key text differs
+    /Q59/Limit/c1/Sort/c0/Merge Join join-method: Merge Join Inner vs Nested Loop Inner
+    /Q59/Limit/c1/Sort/c0/Merge Join/c0/Hash Join join-order: Hash Join Inner vs Seq Scan on date_dim d_1
+    /Q59/Limit/c1/Sort/c0/Merge Join/c0/Hash Join/c-extra-goopg/Hash Join join-order: present only on goopg side: Hash Join Inner
+    /Q59/Limit/c1/Sort/c0/Merge Join/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on date_dim d
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join join-order: Hash Join Inner vs Materialize
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join join-order: leaf sets differ: store wss vs date_dim store store wss wss
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c0/CTE Scan join-order: CTE Scan on wss vs Hash Join Inner
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c0/CTE Scan/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on wss wss_1
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c0/CTE Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store store_1
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c1/Seq Scan join-order: Seq Scan on store store_1 vs Hash Join Inner
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c1/Seq Scan/c-extra-pg/Hash Join join-order: present only on PG side: Hash Join Inner
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c0/Hash Join/c1/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on date_dim d
+    /Q59/Limit/c1/Sort/c0/Merge Join/c1/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on date_dim d_1
+    Q59 parameterisation: Materialize present only on PG side
+Q6 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=19172.50..19172.71 rows=17 width=40 | pg cost=430178.85..430178.89 rows=17 width=11)
+    note: normalisation: strip-pg-Hash
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join parallelism: Hash Join Inner vs Gather Merge
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather sort-strategy: Gather vs Sort
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop parameterisation: leaf sets differ: customer customer_address date_dim item store_sales vs customer customer_address date_dim store_sales
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop parameterisation: leaf sets differ: customer customer_address date_dim store_sales vs customer date_dim store_sales
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop parameterisation: leaf sets differ: customer date_dim store_sales vs date_dim store_sales
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales s
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales s
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim d
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Hash Join/c-extra-goopg/HashAggregate aggregation-strategy: present only on goopg side: HashAggregate
+    /Q6/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item i
+Q60 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=3.03..3.49 rows=37 width=64 | pg cost=38095.70..38099.26 rows=38 width=49)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q60/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q60/Limit/c0/Sort/c0/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append join-order: Append vs Merge Append
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Gather
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate join-order: Partial HashAggregate vs Nested Loop Inner
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-order: leaf sets differ: customer_address date_dim item item store_sales vs date_dim item item store_sales
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join join-method: Parallel Hash Join Left Semi vs Nested Loop Inner
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim item item store_sales vs item item store_sales
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Left Semi
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: date_dim item store_sales vs item item
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on item
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c1/Index Scan scan-type: Index Scan item_pkey on item vs Parallel Seq Scan on item item_1
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_address_pkey on customer_address
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/Finalize GroupAggregate join-order: Finalize GroupAggregate vs GroupAggregate
+    /Q60/Limit/c0/Sort/c0/HashAggregate/c0/Append/c1/Finalize GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    ... and 32 more divergences
+Q61 SHAPE-DIFF [join-order,parallelism,rendering] estimates(goopg cost=25567.64..25567.65 rows=1 width=64 | pg cost=36096.18..36096.18 rows=1 width=96)
+    note: normalisation: strip-pg-Hash
+    /Q61/Limit/c0/Sort rendering: Sort Key text differs
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate join-order: Aggregate vs Finalize Aggregate
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop parallelism: Nested Loop Inner vs Gather
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather parallelism: Gather vs Partial Aggregate
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop join-order: leaf sets differ: customer customer_address date_dim item store store_sales vs customer customer_address date_dim item promotion store store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: customer date_dim item store store_sales vs customer date_dim item promotion store store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim item store store_sales vs date_dim item promotion store store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim store store_sales vs date_dim promotion store store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: store store_sales vs promotion store store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Hash Join Inner
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store
+    /Q61/Limit/c0/Sort/c0/Nested Loop/c0/Aggregate/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan promotion_pkey on promotion
+Q62 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy] estimates(goopg cost=11765.94..11768.14 rows=100 width=136 | pg cost=8787.06..8840.71 rows=100 width=110)
+    note: normalisation: strip-pg-Hash
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate sort-strategy: Partial HashAggregate vs Sort
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim ship_mode web_sales web_site vs date_dim ship_mode warehouse web_sales
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim ship_mode web_sales vs date_dim warehouse web_sales
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Parallel Seq Scan on date_dim
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Seq Scan on warehouse
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan ship_mode_pkey on ship_mode
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Seq Scan on ship_mode
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan web_site_pkey on web_site
+    /Q62/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c1/Seq Scan scan-type: Seq Scan on warehouse vs Seq Scan on web_site
+Q63 MISSING-NODE [join-order,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=4459.57..4459.59 rows=2 width=68 | pg cost=5748.22..5748.48 rows=2 width=68)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q63/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate sort-strategy: Finalize GroupAggregate vs Sort
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge parallelism: Gather Merge vs Gather
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate join-order: Partial HashAggregate vs Hash Join Inner
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-order: leaf sets differ: date_dim item store store_sales vs item store_sales
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join join-order: Hash Join Inner vs Parallel Seq Scan on item
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store
+    /Q63/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim
+    Q63 aggregation-strategy: GroupAggregate present only on PG side
+    Q63 MISSING-NODE: PG-only kinds: Incremental Sort
+Q64 MISSING-NODE [join-order,scan-type,sort-strategy,qual-placement] estimates(goopg cost=0.09..0.10 rows=1 width=944 | pg cost=13874.27..13874.28 rows=1 width=1310)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan join-order: Seq Scan on income_band ib1 vs Nested Loop Inner
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Nested Loop join-order: present only on PG side: Nested Loop Inner
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_demographics_pkey on customer_demographics cd2
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop join-order: Nested Loop Inner vs Index Scan customer_address_pkey on customer_address ad2
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q64/Sort/c0/CTE/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan household_demographics_pkey on household_demographics hd1
+    Q64 scan-type: Bitmap Heap Scan present only on goopg side
+    Q64 MISSING-NODE: PG-only kinds: Incremental Sort
+Q65 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=19882.44..19886.40 rows=100 width=192 | pg cost=39165.16..39165.33 rows=68 width=202)
+    note: normalisation: strip-pg-Hash
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: swapped children: Hash Join Inner vs Merge Join Inner
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Merge Join Inner
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join join-order: Hash Join Inner vs Materialize
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate join-order: HashAggregate vs Merge Join Inner
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate/c0/Gather sort-strategy: Gather vs Sort
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate/c0/Gather/c0/Hash Join join-order: Parallel Hash Join Inner vs Seq Scan on store
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate/c0/Gather/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales store_sales_1
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate/c0/Gather/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_1
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c0/HashAggregate/c-extra-pg/GroupAggregate aggregation-strategy: present only on PG side: GroupAggregate
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c1/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c1/HashAggregate/c0/HashAggregate parallelism: HashAggregate vs Gather Merge
+    /Q65/Limit/c0/Sort/c0/Nested Loop/c0/Hash Join (swapped)/c1/HashAggregate/c0/HashAggregate/c0/Gather sort-strategy: Gather vs Sort
+    Q65 parameterisation: Materialize present only on PG side
+Q66 SHAPE-DIFF [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism,rendering] estimates(goopg cost=5820.49..5822.25 rows=88 width=1352 | pg cost=20447.15..20449.33 rows=8 width=1254)
+    note: normalisation: strip-pg-Hash
+    /Q66/Limit/c0/GroupAggregate rendering: Group Key text differs
+    /Q66/Limit/c0/GroupAggregate/c0/Sort rendering: Sort Key text differs
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather parallelism: Gather vs Append
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append join-order: Parallel Append vs Finalize GroupAggregate
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate parallelism: GroupAggregate vs Gather Merge
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim ship_mode time_dim web_sales vs date_dim ship_mode time_dim warehouse web_sales
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim ship_mode web_sales vs date_dim ship_mode time_dim web_sales
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: ship_mode web_sales vs date_dim ship_mode web_sales
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Seq Scan on web_sales vs Hash Join Inner
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on web_sales
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on ship_mode
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c1/Seq Scan parameterisation: Seq Scan on ship_mode vs Memoize
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c1/Seq Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Index Scan time_dim_pkey on time_dim
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Index Scan parameterisation: Index Scan time_dim_pkey on time_dim vs Memoize
+    /Q66/Limit/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Index Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan warehouse_pkey on warehouse
+    ... and 3 more divergences
+Q67 MISSING-NODE [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=12589.18..12605.59 rows=100 width=212 | pg cost=21320.61..21327.12 rows=100 width=273)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q67/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q67/Limit/c0/Sort/c0/Subquery Scan scan-type: Subquery Scan on dw2 vs WindowAgg
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg sort-strategy: WindowAgg vs Sort
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Subquery Scan on dw1
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate aggregation-strategy: MixedAggregate vs GroupAggregate
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather parallelism: Gather vs Gather Merge
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim store store_sales vs date_dim item store store_sales
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join parallelism: Parallel flag differs
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: date_dim store_sales vs date_dim store store_sales
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Parallel Hash Join Inner
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q67/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/MixedAggregate/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan item_pkey on item
+    Q67 MISSING-NODE: PG-only kinds: Incremental Sort
+Q68 SHAPE-DIFF [join-order,scan-type,qual-placement] estimates(goopg cost=9763.56..9764.91 rows=100 width=228 | pg cost=20234.95..20235.20 rows=100 width=170)
+    note: normalisation: strip-pg-Hash
+    /Q68/Limit/c0/Sort/c0/Nested Loop qual-placement: JoinQual signature differs
+    /Q68/Limit/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan scan-type: Bitmap Heap Scan on customer vs Index Scan customer_pkey on customer
+    /Q68/Limit/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan/c-extra-goopg/Bitmap Index Scan join-order: present only on goopg side: Bitmap Index Scan on customer_pkey
+Q69 SHAPE-DIFF [join-order,join-method,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=43258.51..43260.77 rows=100 width=140 | pg cost=43133.32..43135.82 rows=91 width=64)
+    note: normalisation: canonicalise-bare-semi-anti,canonicalise-right-join,strip-pg-Hash
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge sort-strategy: Gather Merge vs Sort
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Hash Join Left Anti
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join join-method: Parallel Hash Join Left Anti vs Nested Loop Inner
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join join-order: leaf sets differ: catalog_sales customer customer_address customer_demographics date_dim date_dim date_dim store_sales web_sales vs customer customer_address customer_demographics date_dim date_dim store_sales web_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer customer_address customer_demographics date_dim date_dim store_sales vs customer customer_address date_dim date_dim store_sales web_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join parallelism: Parallel flag differs
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: catalog_sales customer customer_address date_dim date_dim store_sales vs customer date_dim date_dim store_sales web_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: customer customer_address date_dim store_sales vs customer date_dim store_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Left Semi vs HashAggregate
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Seq Scan parallelism: Parallel Seq Scan on customer c vs Gather
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Hash Join join-order: present only on PG side: Parallel Hash Join Inner
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Inner
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Hash Join parallelism: Parallel Hash Join Inner vs Gather
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on catalog_sales vs Parallel Hash Join Inner
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on web_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim date_dim_1
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_2
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Hash Join join-order: Parallel Hash Join Inner vs Index Scan customer_demographics_pkey on customer_demographics
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on web_sales
+    /Q69/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_1
+    ... and 2 more divergences
+Q7 MATCH [] estimates(goopg cost=19564.28..19565.20 rows=46 width=160 | pg cost=19495.23..19502.17 rows=46 width=145)
+    note: normalisation: strip-pg-Hash
+Q70 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q71 SHAPE-DIFF [join-order,scan-type,qual-placement,rendering] estimates(goopg cost=16221.04..16221.04 rows=2 width=76 | pg cost=40346.42..40346.43 rows=2 width=95)
+    note: normalisation: strip-pg-Hash
+    /Q71/Sort rendering: Sort Key text differs
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim date_dim date_dim item store_sales time_dim web_sales vs "*select* "*select* "*select* catalog_sales date_dim date_dim date_dim item store_sales time_dim web_sales
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim date_dim date_dim item store_sales web_sales vs "*select* "*select* "*select* catalog_sales date_dim date_dim date_dim item store_sales web_sales
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c0/Hash Join join-order: Parallel Hash Join Inner vs Subquery Scan on "*SELECT* 3"
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on web_sales vs Parallel Hash Join Inner
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c1/Hash Join join-order: Parallel Hash Join Inner vs Subquery Scan on "*SELECT* 2"
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c1/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on catalog_sales vs Parallel Hash Join Inner
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c1/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on catalog_sales
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c1/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim date_dim_1
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c1/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_1
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c2/Hash Join join-order: Parallel Hash Join Inner vs Subquery Scan on "*SELECT* 1"
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c2/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Parallel Hash Join Inner
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c2/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on web_sales
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c2/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim date_dim_2
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Append/c2/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_2
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c0/Nested Loop/c1/Index Scan qual-placement: Index Cond signature differs
+    /Q71/Sort/c0/GroupAggregate/c0/Sort/c0/Gather/c0/Nested Loop/c1/Index Scan qual-placement: Index Cond signature differs
+    ... and 1 more divergences
+Q72 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism] estimates(goopg cost=16028.82..16029.06 rows=19 width=92 | pg cost=15490.83..15490.83 rows=1 width=148)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs Nested Loop Left
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop join-method: join type Left vs Inner
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop join-order: leaf sets differ: catalog_returns catalog_sales customer_demographics date_dim date_dim date_dim household_demographics inventory item promotion warehouse vs catalog_sales customer_demographics date_dim date_dim date_dim household_demographics inventory item warehouse
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop parallelism: Nested Loop Left vs Gather Merge
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather parallelism: Gather vs Nested Loop Inner
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer_demographics date_dim date_dim household_demographics inventory vs catalog_sales customer_demographics date_dim household_demographics inventory
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer_demographics date_dim household_demographics inventory vs catalog_sales customer_demographics date_dim household_demographics
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales customer_demographics date_dim household_demographics vs catalog_sales date_dim household_demographics
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim household_demographics vs catalog_sales household_demographics
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: Hash Join Inner vs Parallel Seq Scan on catalog_sales
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on catalog_sales
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on household_demographics
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Seq Scan on household_demographics
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim d1
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Index Scan parameterisation: Index Scan customer_demographics_pkey on customer_demographics vs Memoize
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Index Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan date_dim_pkey on date_dim d1
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Index Scan inventory_pkey on inventory
+    /Q72/Limit/c0/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim d2
+    ... and 5 more divergences
+Q73 SHAPE-DIFF [join-order,scan-type,rendering] estimates(goopg cost=7615.51..7615.52 rows=1 width=340 | pg cost=18131.28..18131.29 rows=5 width=77)
+    note: normalisation: strip-pg-Hash
+    /Q73/Sort rendering: Sort Key text differs
+    /Q73/Sort/c0/Nested Loop/c1/Bitmap Heap Scan scan-type: Bitmap Heap Scan on customer vs Index Scan customer_pkey on customer
+    /Q73/Sort/c0/Nested Loop/c1/Bitmap Heap Scan/c-extra-goopg/Bitmap Index Scan join-order: present only on goopg side: Bitmap Index Scan on customer_pkey
+Q74 MATCH [] estimates(goopg cost=333.14..333.16 rows=1 width=384 | pg cost=30510.97..30510.97 rows=1 width=276)
+    note: normalisation: strip-pg-Hash
+Q75 SHAPE-DIFF [join-order,join-method,parallelism,qual-placement,rendering] estimates(goopg cost=2585.81..2586.81 rows=100 width=112 | pg cost=64209.47..64209.47 rows=1 width=80)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+    /Q75/Limit/c0/CTE/c0/HashAggregate rendering: Group Key text differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate rendering: Group Key text differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join parallelism: Parallel flag differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join join-order: leaf sets differ: catalog_returns catalog_sales date_dim item vs date_dim item store_returns store_sales
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: catalog_sales date_dim item vs date_dim item store_sales
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: catalog_sales item vs item store_sales
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join/c0/Nested Loop/c1/Memoize/c0/Index Scan qual-placement: Index Cond signature differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join parallelism: Parallel flag differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join join-order: leaf sets differ: date_dim item store_returns store_sales vs catalog_returns catalog_sales date_dim item
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join/c0/Nested Loop join-order: leaf sets differ: date_dim item store_sales vs catalog_sales date_dim item
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: item store_sales vs catalog_sales item
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join/c0/Nested Loop/c1/Memoize/c0/Index Scan qual-placement: Index Cond signature differs
+    /Q75/Limit/c0/CTE/c0/HashAggregate/c0/HashAggregate/c0/Gather/c0/Append/c1/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q75/Limit/c1/Sort/c0/Merge Join join-order: swapped children: Merge Join Inner vs Hash Join Inner
+    /Q75/Limit/c1/Sort/c0/Merge Join join-method: Merge Join Inner vs Hash Join Inner
+Q76 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,rendering] estimates(goopg cost=20802.51..21146.30 rows=100 width=144 | pg cost=39026.66..39070.79 rows=100 width=163)
+    note: normalisation: strip-pg-Hash
+    /Q76/Limit/c0/GroupAggregate join-order: GroupAggregate vs Finalize GroupAggregate
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort rendering: Sort Key text differs
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append join-order: Parallel Append vs Partial HashAggregate
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Append
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop join-order: leaf sets differ: date_dim store_sales vs date_dim item store_sales
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Nested Loop Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Memoize parameterisation: present only on PG side: Memoize
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Parallel Seq Scan on item
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c1/Seq Scan join-order: Parallel Seq Scan on item vs Nested Loop Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c1/Seq Scan/c-extra-pg/Nested Loop join-order: present only on PG side: Nested Loop Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c1/Seq Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan item_pkey on item item_1
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c0/Hash Join/c-extra-pg/Nested Loop join-order: present only on PG side: Nested Loop Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c-extra-goopg/Nested Loop join-order: present only on goopg side: Nested Loop Inner
+    /Q76/Limit/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Append/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Inner
+    Q76 scan-type: Bitmap Heap Scan present only on goopg side
+    Q76 aggregation-strategy: GroupAggregate present only on goopg side
+Q77 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism,rendering] estimates(goopg cost=11.99..13.35 rows=100 width=132 | pg cost=51732.07..51732.32 rows=100 width=132)
+    note: normalisation: strip-pg-Hash
+    /Q77/Limit/c0/Sort rendering: Sort Key text differs
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c0/Index Scan scan-type: Index Scan store_pkey on store vs Index Only Scan store_pkey on store
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather parallelism: Gather vs Materialize
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather/c0/Hash Join parallelism: Parallel Hash Join Inner vs Gather
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Parallel Hash Join Inner
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c0/GroupAggregate/c0/Nested Loop/c1/Gather/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate join-order: GroupAggregate vs Finalize GroupAggregate
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join join-method: Hash Join Inner vs Merge Join Inner
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Seq Scan join-order: Parallel Seq Scan on store_returns vs Nested Loop Inner
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_returns
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c0/Seq Scan/c-extra-pg/Memoize parameterisation: present only on PG side: Memoize
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c-extra-goopg/Memoize parameterisation: present only on goopg side: Memoize
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Seq Scan sort-strategy: Seq Scan on store store_1 vs Sort
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/Merge Join/c1/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c1/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on store store_1
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/Nested Loop join-order: leaf sets differ: catalog_returns catalog_sales date_dim date_dim vs catalog_returns catalog_sales cr date_dim date_dim
+    /Q77/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/Nested Loop/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    ... and 21 more divergences
+Q78 SHAPE-DIFF [join-order,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=5670.23..5673.18 rows=100 width=208 | pg cost=42510.23..42510.48 rows=100 width=180)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q78/Limit/c0/Sort rendering: Sort Key text differs
+    /Q78/Limit/c0/Sort/c0/Merge Join qual-placement: JoinQual signature differs
+    /Q78/Limit/c0/Sort/c0/Merge Join join-order: Merge Cond signature differs
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join join-order: leaf sets differ: date_dim date_dim store_returns store_sales web_returns web_sales vs catalog_returns catalog_sales date_dim date_dim store_returns store_sales
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate aggregation-strategy: HashAggregate vs GroupAggregate
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join parallelism: Hash Join Inner vs Gather Merge
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c0/Hash Join sort-strategy: Hash Join Left Anti vs Sort
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c0/Hash Join/c0/Seq Scan join-order: Seq Scan on store_sales vs Nested Loop Left Anti
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Hash Join join-order: present only on PG side: Parallel Hash Join Inner
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Index Only Scan join-order: present only on PG side: Index Only Scan store_returns_pkey on store_returns
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on store_returns
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c0/HashAggregate/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on date_dim date_dim_2
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate join-order: HashAggregate vs Materialize
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop join-order: Nested Loop Inner vs GroupAggregate
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop/c0/Hash Join parallelism: Hash Join Left Anti vs Gather Merge
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Seq Scan sort-strategy: Seq Scan on web_sales vs Sort
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Nested Loop join-order: present only on PG side: Nested Loop Left Anti
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on web_returns
+    /Q78/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/HashAggregate/c0/Nested Loop/c-extra-goopg/Memoize parameterisation: present only on goopg side: Memoize
+    /Q78/Limit/c0/Sort/c0/Merge Join/c1/HashAggregate join-order: HashAggregate vs Materialize
+    ... and 7 more divergences
+Q79 SHAPE-DIFF [join-method,scan-type,rendering] estimates(goopg cost=14614.03..14617.89 rows=100 width=164 | pg cost=24605.76..24606.01 rows=100 width=152)
+    note: normalisation: strip-pg-Hash
+    /Q79/Limit/c0/Sort rendering: Sort Key text differs
+    /Q79/Limit/c0/Sort/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q79/Limit/c0/Sort/c0/Hash Join/c1/Seq Scan scan-type: Seq Scan on customer vs Index Scan customer_pkey on customer
+Q8 SHAPE-DIFF [join-order,parameterisation] estimates(goopg cost=28510.36..28510.52 rows=8 width=64 | pg cost=28552.49..28558.75 rows=8 width=37)
+    note: normalisation: strip-pg-Hash
+    /Q8/Limit/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop join-order: Nested Loop Inner vs Materialize
+    /Q8/Limit/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c0/Index Scan join-order: Index Scan store_pkey on store vs Nested Loop Inner
+    /Q8/Limit/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c0/Index Scan/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan store_pkey on store
+    /Q8/Limit/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c0/Index Scan/c-extra-pg/Materialize parameterisation: present only on PG side: Materialize
+    /Q8/Limit/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c1/Nested Loop/c-extra-goopg/HashSetOp join-order: present only on goopg side: HashSetOp Intersect
+Q80 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism,rendering] estimates(goopg cost=2.28..2.77 rows=39 width=160 | pg cost=41715.91..41716.01 rows=39 width=160)
+    note: normalisation: strip-pg-Hash
+    /Q80/Limit/c0/Sort rendering: Sort Key text differs
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on ssr
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Left vs Sort
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop join-order: leaf sets differ: date_dim item promotion store store_sales vs date_dim item promotion store store_returns store_sales
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop join-method: join type Inner vs Left
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: date_dim item store store_sales vs date_dim item store store_returns store_sales
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: date_dim store store_sales vs date_dim item store store_sales
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join parallelism: Parallel flag differs
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: date_dim store_sales vs date_dim store store_sales
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on store_sales vs Parallel Hash Join Inner
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on store_sales
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on date_dim
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join/c0/Hash Join/c1/Seq Scan parallelism: Parallel flag differs
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan store_returns_pkey on store_returns
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate scan-type: GroupAggregate vs Subquery Scan on csr
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Sort sort-strategy: Sort vs GroupAggregate
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Sort/c0/Nested Loop sort-strategy: Nested Loop Left vs Sort
+    /Q80/Limit/c0/Sort/c0/MixedAggregate/c0/Append/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Gather/c0/Nested Loop join-order: leaf sets differ: catalog_page catalog_sales date_dim item promotion vs catalog_page catalog_returns catalog_sales date_dim item promotion
+    ... and 22 more divergences
+Q81 SHAPE-DIFF [join-order,scan-type,parameterisation,rendering] estimates(goopg cost=2226.21..2226.22 rows=1 width=512 | pg cost=4272.30..4272.31 rows=2 width=236)
+    /Q81/Limit/c1/Sort rendering: Sort Key text differs
+    /Q81/Limit/c1/Sort/c0/Nested Loop parameterisation: JoinQual present only on goopg side
+    /Q81/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/CTE Scan parameterisation: parameterised inner differs
+    /Q81/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/CTE Scan parameterisation: Filter present only on PG side
+    /Q81/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c0/SubPlan2 parameterisation: SubPlan/InitPlan present only on PG side
+    /Q81/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan scan-type: Bitmap Heap Scan on customer vs Index Scan customer_pkey on customer
+    /Q81/Limit/c1/Sort/c0/Nested Loop/c0/Nested Loop/c1/Bitmap Heap Scan/c-extra-goopg/Bitmap Index Scan join-order: present only on goopg side: Bitmap Index Scan on customer_pkey
+    /Q81/Limit/c1/Sort/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on goopg side
+Q82 SHAPE-DIFF [scan-type] estimates(goopg cost=4919.12..4919.16 rows=2 width=96 | pg cost=4343.11..4343.73 rows=2 width=125)
+    /Q82/Limit/c0/Group/c0/Gather Merge/c0/Group/c0/Sort/c0/Nested Loop/c1/Index Scan scan-type: Index Scan store_sales_pkey on store_sales vs Index Only Scan store_sales_pkey on store_sales
+Q83 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=0.98..1.04 rows=5 width=108 | pg cost=23604.71..23605.31 rows=2 width=169)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q83/Limit/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join join-method: join type Inner vs Left Semi
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Hash Cond signature differs
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Seq Scan on web_returns vs Nested Loop Inner
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on web_returns
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Memoize parameterisation: present only on PG side: Memoize
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Gather parallelism: Gather vs Hash Join Inner
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Gather/c0/Hash Join join-order: Parallel Hash Join Left Semi vs Seq Scan on date_dim date_dim_4
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Gather/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim date_dim_6
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Gather/c0/Hash Join/c-extra-goopg/Hash Join join-order: present only on goopg side: Parallel Hash Join Left Semi
+    /Q83/Limit/c0/Sort/c0/Merge Join/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Gather/c-extra-pg/HashAggregate aggregation-strategy: present only on PG side: HashAggregate
+    /Q83/Limit/c0/Sort/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Hash Join join-method: join type Left Semi vs Inner
+    /Q83/Limit/c0/Sort/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/Seq Scan scan-type: Seq Scan on date_dim date_dim_5 vs HashAggregate
+    /Q83/Limit/c0/Sort/c0/Merge Join/c1/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Hash Join/c1/Hash Join/c1/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on date_dim date_dim_8
+    Q83 MISSING-NODE: PG-only kinds: Incremental Sort
+Q84 SHAPE-DIFF [scan-type,qual-placement] estimates(goopg cost=8287.81..8292.20 rows=100 width=1252 | pg cost=8142.56..8143.70 rows=10 width=49)
+    note: normalisation: strip-pg-Hash
+    /Q84/Limit/c0/Gather Merge/c0/Sort/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q84/Limit/c0/Gather Merge/c0/Sort/c0/Nested Loop/c1/Index Scan scan-type: Index Scan customer_demographics_pkey on customer_demographics vs Index Only Scan customer_demographics_pkey on customer_demographics
+Q85 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism] estimates(goopg cost=7643.12..7643.14 rows=1 width=128 | pg cost=8416.51..8416.51 rows=1 width=229)
+    note: normalisation: strip-pg-Hash
+    /Q85/Limit/c0/Sort/c0/GroupAggregate join-order: GroupAggregate vs Finalize GroupAggregate
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop parallelism: Nested Loop Inner vs Gather Merge
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop join-order: Nested Loop Inner vs Partial GroupAggregate
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: customer_demographics reason web_page web_returns web_sales vs customer_address customer_demographics customer_demographics date_dim reason web_page web_returns web_sales
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-order: leaf sets differ: reason web_page web_returns web_sales vs customer_address customer_demographics customer_demographics reason web_page web_returns web_sales
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge parallelism: Gather Merge vs Nested Loop Inner
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop join-order: leaf sets differ: reason web_returns web_sales vs customer_address reason web_returns web_sales
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: leaf sets differ: web_returns web_sales vs customer_address reason web_returns
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan join-order: Parallel Seq Scan on web_sales vs Hash Join Inner
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Parallel Seq Scan on customer_address
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c0/Nested Loop/c0/Hash Join/c0/Seq Scan/c-extra-pg/Seq Scan join-order: present only on PG side: Seq Scan on web_returns
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c0/Sort/c-extra-pg/Index Only Scan join-order: present only on PG side: Index Only Scan web_page_pkey on web_page
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Gather Merge/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_demographics_pkey on customer_demographics cd2
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_demographics_pkey on customer_demographics cd1
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_address_pkey on customer_address
+    /Q85/Limit/c0/Sort/c0/GroupAggregate/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    Q85 aggregation-strategy: GroupAggregate present only on goopg side
+    Q85 scan-type: Index Only Scan present only on PG side
+Q86 ERROR [] estimates(goopg n/a | pg n/a)
+    note: ERROR marker in both block
+Q87 SHAPE-DIFF [join-order,join-method,sort-strategy] estimates(goopg cost=24626.72..24626.73 rows=1 width=8 | pg cost=43325.56..43325.57 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+    /Q87/Aggregate/c0/HashSetOp join-order: HashSetOp Except vs SetOp Except
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp join-order: HashSetOp Except vs SetOp Except
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique sort-strategy: Unique vs Sort
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort sort-strategy: Sort vs Nested Loop Inner
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop join-order: leaf sets differ: customer date_dim store_sales vs date_dim store_sales
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join join-order: Parallel Hash Join Inner vs Parallel Seq Scan on store_sales
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on store_sales
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c0/Nested Loop/c0/Hash Join/c-extra-goopg/Seq Scan join-order: present only on goopg side: Parallel Seq Scan on date_dim
+    /Q87/Aggregate/c0/HashSetOp/c0/HashSetOp/c0/Unique/c0/Gather Merge/c0/Unique/c0/Sort/c-extra-pg/Index Scan join-order: present only on PG side: Index Scan customer_pkey on customer
+Q88 MATCH [] estimates(goopg cost=135825.51..135825.94 rows=1 width=64 | pg cost=145284.92..145285.07 rows=1 width=64)
+    note: normalisation: strip-pg-Hash
+Q89 MISSING-NODE [sort-strategy,qual-placement] estimates(goopg cost=8739.77..8740.15 rows=30 width=228 | pg cost=19188.70..19188.78 rows=30 width=266)
+    note: normalisation: strip-pg-Hash
+    note: PG-only node kinds: Incremental Sort
+    /Q89/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort sort-strategy: Sort vs Incremental Sort
+    /Q89/Limit/c0/Sort/c0/Subquery Scan/c0/WindowAgg/c0/Sort/c0/GroupAggregate/c0/Gather Merge/c0/Sort/c0/Hash Join/c0/Nested Loop/c1/Memoize/c0/Index Scan qual-placement: Filter signature differs
+    Q89 MISSING-NODE: PG-only kinds: Incremental Sort
+Q9 MATCH [] estimates(goopg cost=0.00..1.44 rows=1 width=68 | pg cost=262958.93..262960.38 rows=1 width=160)
+Q90 MATCH [rendering] estimates(goopg cost=11809.68..11809.69 rows=1 width=16 | pg cost=13908.43..13908.43 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q91 SHAPE-DIFF [join-order] estimates(goopg cost=3249.50..3249.50 rows=1 width=192 | pg cost=3000.29..3000.29 rows=1 width=97)
+    /Q91/Sort/c0/GroupAggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop join-order: swapped children: Nested Loop Inner
+Q92 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,aggregation-strategy,parallelism] estimates(goopg cost=11060.65..11060.66 rows=1 width=32 | pg cost=8959.93..8959.94 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join join-method: Hash Join Inner vs Nested Loop Inner
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join parameterisation: leaf sets differ: date_dim date_dim item web_sales web_sales vs date_dim item web_sales
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop parameterisation: leaf sets differ: date_dim item web_sales vs item web_sales
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop join-order: Nested Loop Inner vs Seq Scan on web_sales
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Seq Scan join-order: present only on goopg side: Seq Scan on item
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c0/Nested Loop/c-extra-goopg/Bitmap Heap Scan join-order: present only on goopg side: Bitmap Heap Scan on web_sales
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/Nested Loop/c1/Index Scan scan-type: Index Scan date_dim_pkey on date_dim vs Seq Scan on item
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c0/SubPlan1 parameterisation: SubPlan/InitPlan present only on PG side
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c1/HashAggregate scan-type: HashAggregate vs Index Scan date_dim_pkey on date_dim
+    /Q92/Limit/c0/Sort/c0/Aggregate/c0/Hash Join/c1/HashAggregate/c-extra-goopg/Gather parallelism: present only on goopg side: Gather
+    Q92 aggregation-strategy: HashAggregate present only on goopg side
+Q93 MATCH [rendering] estimates(goopg cost=4456.00..4456.02 rows=1 width=36 | pg cost=4301.51..4301.51 rows=2 width=36)
+    note: normalisation: strip-pg-Hash
+Q94 SHAPE-DIFF [scan-type,qual-placement] estimates(goopg cost=8611.58..8611.59 rows=1 width=72 | pg cost=9164.15..9164.15 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q94/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop qual-placement: JoinQual present only on goopg side
+    /Q94/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Nested Loop/c0/Nested Loop/c1/Index Scan qual-placement: Filter present only on PG side
+    /Q94/Limit/c0/Sort/c0/Aggregate/c0/Sort/c0/Nested Loop/c1/Index Scan scan-type: Index Scan web_returns_pkey on web_returns wr1 vs Index Only Scan web_returns_pkey on web_returns wr1
+Q95 SHAPE-DIFF [join-order,join-method,scan-type,sort-strategy,parallelism,qual-placement,rendering] estimates(goopg cost=170349.63..170349.65 rows=1 width=72 | pg cost=141550.11..141550.11 rows=1 width=72)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+    /Q95/Limit/c0/CTE/c0/Hash Join qual-placement: JoinQual signature differs
+    /Q95/Limit/c0/CTE/c0/Hash Join join-order: Hash Cond signature differs
+    /Q95/Limit/c1/Sort rendering: Sort Key text differs
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort sort-strategy: Sort vs Nested Loop Left Semi
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Left Semi
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join join-order: leaf sets differ: customer_address date_dim web_returns web_sales web_site ws_wh ws_wh vs customer_address date_dim web_returns web_sales web_site ws_wh
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join join-method: Hash Join Left Semi vs Nested Loop Inner
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join join-order: leaf sets differ: customer_address date_dim web_sales web_site ws_wh vs customer_address date_dim web_sales web_site
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather parallelism: Gather vs Gather Merge
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop sort-strategy: Nested Loop Inner vs Sort
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c0/Hash Join join-order: Hash Cond signature differs
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c0/Index Scan qual-placement: Index Cond signature differs
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c0/Hash Join/c0/Gather/c0/Nested Loop/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan customer_address_pkey on customer_address
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c1/Hash Join qual-placement: JoinQual present only on PG side
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c0/Hash Join/c1/Hash Join/c1/Seq Scan scan-type: Seq Scan on web_returns vs Index Only Scan web_returns_pkey on web_returns
+    /Q95/Limit/c1/Sort/c0/Aggregate/c0/Sort/c-extra-pg/CTE Scan join-order: present only on PG side: CTE Scan on ws_wh
+Q96 MATCH [] estimates(goopg cost=16607.51..16607.52 rows=1 width=8 | pg cost=17673.79..17673.79 rows=1 width=8)
+    note: normalisation: strip-pg-Hash
+Q97 MATCH [] estimates(goopg cost=116.06..116.08 rows=1 width=24 | pg cost=33668.84..33668.85 rows=1 width=24)
+    note: normalisation: strip-pg-Hash
+Q98 MATCH [rendering] estimates(goopg cost=9199.85..9200.07 rows=89 width=224 | pg cost=18988.73..18988.95 rows=89 width=291)
+    note: normalisation: strip-pg-Hash
+Q99 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy] estimates(goopg cost=22874.50..22875.94 rows=72 width=136 | pg cost=13993.07..14060.85 rows=72 width=115)
+    note: normalisation: strip-pg-Hash
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort sort-strategy: Sort vs Partial GroupAggregate
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate sort-strategy: Partial HashAggregate vs Sort
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Hash Join Inner
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop join-method: Nested Loop Inner vs Parallel Hash Join Inner
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Parallel Seq Scan on date_dim
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan date_dim_pkey on date_dim
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize parameterisation: Memoize vs Seq Scan on ship_mode
+    /Q99/Limit/c0/Finalize GroupAggregate/c0/Gather Merge/c0/Sort/c0/Partial HashAggregate/c0/Nested Loop/c0/Nested Loop/c0/Nested Loop/c1/Memoize/c-extra-goopg/Index Scan join-order: present only on goopg side: Index Scan ship_mode_pkey on ship_mode
+    Q99 scan-type: Index Scan present only on goopg side
+PLAN-PARITY: queries=99 match=15 shapediff=67 unparsed=0 missingnode=14 error=3 timeout=0
+CATEGORIES: join-order=68 join-method=39 scan-type=42 parameterisation=35 aggregation-strategy=32 sort-strategy=50 parallelism=49 qual-placement=19 rendering=30
+CATEGORIES-EXCL-MATCH: join-order=68 join-method=39 scan-type=42 parameterisation=35 aggregation-strategy=32 sort-strategy=50 parallelism=49 qual-placement=19 rendering=25
+NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation

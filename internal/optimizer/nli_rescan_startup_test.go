@@ -7,30 +7,50 @@ import (
 
 // R69 slice (a): PG's `cost_rescan` STARTUP arm for the nestloop join
 // (`initial_cost_nestloop` charges `(outer−1) × rescan_startup`;
-// all three nestloop call sites passed literal 0). Only the
-// parameterised-index case changes behaviour (descent repaid per
-// rescan); Memoize and materialised/plain cases return exactly what
-// the literal did.
-
+// all three nestloop call sites passed literal 0). M0146-0010 folded the
+// helper into `pathRescanCost` itself — `cost_rescan` per candidate — so
+// the pin now exercises the same four shapes through it:
+//
+//   - a parameterised probe re-pays its descent per rescan (default arm);
+//   - a Memoize pays its modeled rescan startup;
+//   - a BARE unparameterised inner re-executes — rescan startup is the
+//     path's own startup (the arm the executor's rescanByReexec matches);
+//   - a PathMaterial replays the buffer — rescan startup 0, T_Material arm.
 func TestNestLoopInnerRescanStartup(t *testing.T) {
-	if got := nestLoopInnerRescanStartup(nil); got != 0 {
-		t.Errorf("nil inner: got %v, want 0", got)
+	cp := defaultCostParams()
+	if st, _ := pathRescanCost(nil, cp); st != 0 {
+		t.Errorf("nil inner: got %v, want 0", st)
 	}
 	// Parameterised index probe: the descent, repaid per rescan (PG's
 	// cost_rescan default arm returns the path's own startup).
-	probe := &Path{Kind: PathNestLoop, RequiredOuter: 1, Cost: Cost{Startup: 0.38, Total: 0.44}}
-	if got := nestLoopInnerRescanStartup(probe); got != 0.38 {
-		t.Errorf("parameterised probe: got %v, want descent 0.38", got)
+	probe := &Path{Kind: PathIndexScan, RequiredOuter: 1, Cost: Cost{Startup: 0.38, Total: 0.44}}
+	if st, tot := pathRescanCost(probe, cp); st != 0.38 || tot != 0.44 {
+		t.Errorf("parameterised probe: got (%v, %v), want re-exec (0.38, 0.44)", st, tot)
 	}
 	// Memoize inner: its modeled rescan startup (cache-lookup scale).
 	memo := &Path{Kind: PathMemoize, MemoizeInfo: &memoizePathInfo{rescan: Cost{Startup: 0.05, Total: 1.2}}}
-	if got := nestLoopInnerRescanStartup(memo); got != 0.05 {
-		t.Errorf("memoize inner: got %v, want 0.05", got)
+	if st, _ := pathRescanCost(memo, cp); st != 0.05 {
+		t.Errorf("memoize inner: got %v, want 0.05", st)
 	}
-	// Plain (materialised-model) inner: 0, PG's T_Material arm.
-	plain := &Path{Kind: PathNestLoop, RequiredOuter: 0, Cost: Cost{Startup: 12.5, Total: 100.0}}
-	if got := nestLoopInnerRescanStartup(plain); got != 0 {
-		t.Errorf("plain inner: got %v, want 0", got)
+	// Bare unparameterised inner: re-executed, startup repaid — the
+	// default arm, where the pre-M0146-0010 model charged 0 because every
+	// inner was silently materialised.
+	plain := &Path{Kind: PathSeqScan, RequiredOuter: 0, Cost: Cost{Startup: 12.5, Total: 100.0}}
+	if st, tot := pathRescanCost(plain, cp); st != 12.5 || tot != 100.0 {
+		t.Errorf("bare inner: got (%v, %v), want re-exec (12.5, 100.0)", st, tot)
+	}
+	// Materialised inner: rescan startup 0, T_Material arm — the cheap
+	// replay that makes the election worth filing.
+	mat := materialInnerPath(&RelOptInfo{Relids: 2}, plain, cp)
+	if mat == nil || mat.Kind != PathMaterial {
+		t.Fatalf("materialInnerPath returned %v", mat)
+	}
+	st, tot := pathRescanCost(mat, cp)
+	if st != 0 {
+		t.Errorf("materialised inner rescan startup: got %v, want 0", st)
+	}
+	if want := materialRescanCost(cp, plain.Rows, pathAvgVarBytes(plain), pathNCols(plain)); tot != want {
+		t.Errorf("materialised inner rescan total: got %v, want %v", tot, want)
 	}
 }
 
@@ -54,7 +74,8 @@ func TestNestloopCostRescanStartupTerm(t *testing.T) {
 	if got.Startup != 10.38 {
 		t.Errorf("got startup %v, want 10.38", got.Startup)
 	}
-	// Zero startup (plain-NL callers) is byte-identical to the old shape.
+	// Zero startup (the T_Material rescan arm) is byte-identical to the
+	// old plain-NL shape.
 	plain := nestloopCost(cp, outer, Cost{Startup: 0.38, Total: 0.44}, 101, 1, 0, 0.06)
 	wantPlain := 10.38 + 100 + 0.06 + 100*0.06 + 0.01*101
 	if math.Abs(plain.Total-wantPlain) > 1e-9 {

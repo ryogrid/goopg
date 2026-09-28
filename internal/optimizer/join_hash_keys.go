@@ -146,6 +146,9 @@ func fillJoinHashKeysNodes(n Node) {
 	case *SubqueryScan:
 		// M0146-0005w: labelling pass-through.
 		fillJoinHashKeysNodes(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — descend.
+		fillJoinHashKeysNodes(x.Child)
 	case *CTEDMLPrefix:
 		fillJoinHashKeysNodes(x.Body)
 	case *Project:

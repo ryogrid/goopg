@@ -7,6 +7,7 @@ package executor
 // See docs/design/0018-0003-explain-analyze-instrumentation.md.
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -216,6 +217,18 @@ func (o *instrumentedOp) Close() error {
 	err := o.inner.Close()
 	o.accountBuffers()
 	return err
+}
+
+// Rescan forwards the rescannable contract to the wrapped operator
+// (M0146-0010): under EXPLAIN ANALYZE a nested loop's materialised inner
+// arrives instrumented, and the join's per-outer-row Rescan must reach the
+// materializeOp inside or the inner would replay wrongly — while rows keep
+// flowing through Next() so the Materialize node's counters stay live.
+func (o *instrumentedOp) Rescan() error {
+	if r, ok := o.inner.(rescannable); ok {
+		return r.Rescan()
+	}
+	return fmt.Errorf("instrumentedOp: wrapped operator %T is not rescannable", o.inner)
 }
 
 // RowsAffected delegates so wrapped DML operators continue to

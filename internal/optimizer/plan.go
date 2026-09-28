@@ -1042,6 +1042,28 @@ type Memoize struct {
 func (n *Memoize) Pos() int       { return n.pos }
 func (n *Memoize) Output() Schema { return n.Child.Output() }
 
+// Materialize is PG's `Material` node (createplan.c's make_material feeding
+// nodeMaterial.c): a transparent single-child wrapper that buffers the
+// child's output on first pull and replays it on every rescan. It is emitted
+// only by createPlan's PathMaterial arm — the path PG's match_unsorted_outer
+// files beside the bare inner (joinpath.c:1890-1901) when the cheapest inner
+// does not already materialize its output (execAmi.c's
+// ExecMaterializesOutput) and enable_material is on.
+//
+// Like PG's, the node carries no state of its own: same rows, same width,
+// same pathkeys as its child — its only content is "rescanning me is cheap".
+// The executor half is `materializeOp` (operators_material.go), which the
+// nested-loop driver reaches for only when this node is present.
+type Materialize struct {
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
+	pos   int
+	Child Node
+}
+
+func (n *Materialize) Pos() int       { return n.pos }
+func (n *Materialize) Output() Schema { return n.Child.Output() }
+
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
 // visibility map reports ALL_VISIBLE for the target page.

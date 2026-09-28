@@ -507,6 +507,10 @@ func seamLeafLocalFilters(n Node) []*Filter {
 			walk(t.Child)
 		case *GatherMerge:
 			walk(t.Child)
+		case *Materialize:
+			// M0146-0010: transparent wrapper — the buffered subtree's
+			// LeafLocal filters are still in it.
+			walk(t.Child)
 		}
 	}
 	walk(n)

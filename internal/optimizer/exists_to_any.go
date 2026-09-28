@@ -164,6 +164,9 @@ func rewriteExistsToAnyNode(node Node) {
 	case *SubqueryScan:
 		// M0146-0005w: labelling pass-through.
 		rewriteExistsToAnyNode(n.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — descend.
+		rewriteExistsToAnyNode(n.Child)
 	case *SetOp:
 		rewriteExistsToAnyNode(n.Left)
 		rewriteExistsToAnyNode(n.Right)

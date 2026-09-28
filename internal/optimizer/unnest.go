@@ -1063,6 +1063,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		// (lowerNodeChildren descends it too; the two must stay in
 		// lockstep per planContainsLateralJoin's contract).
 		walkPlanExprs(n.Child, visit)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same visibility rule.
+		walkPlanExprs(n.Child, visit)
 	case *Gather:
 		// C-19g's upper-rel-resident half: a Gather can now appear in the
 		// tree BEFORE `Plan()`'s tail passes run, where previously the only
@@ -1650,6 +1653,15 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		// sublink plan must clone like every other wrapper — unlisted,
 		// the cloner errored and the driver silently kept the sublink
 		// correlated (the NLI-arm comment's own defect class).
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		c := *n
+		c.Child = child
+		return &c, nil
+	case *Materialize:
+		// M0146-0010: transparent wrapper — clone through.
 		child, err := clonePlanReplacingOuter(n.Child, replace)
 		if err != nil {
 			return nil, err

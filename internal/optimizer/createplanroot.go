@@ -469,6 +469,9 @@ func boundaryWalkChildren(n Node) []Node {
 	case *SubqueryScan:
 		// M0146-0005w: single-child labelling pass-through.
 		return []Node{x.Child}
+	case *Materialize:
+		// M0146-0010: single-child transparent wrapper — same rule.
+		return []Node{x.Child}
 	case *Join:
 		return []Node{x.Left, x.Right}
 	case *SetOp:

@@ -120,6 +120,17 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newCTEDMLPrefixOp(p), scope), nil
 	case *optimizer.MaterializedCTEScan:
 		return maybeInstrument(p, newMaterializedCTEScanOp(p), scope), nil
+	case *optimizer.Materialize:
+		// M0146-0010: PG's Material node — build the child, wrap it in the
+		// replay cache. Under a nested loop this op surfaces as joinOp's
+		// o.right and the join drives it through `rescannable` instead of
+		// wrapping a second cache (join_nl_stream.go); anywhere else it is a
+		// standalone rescannable subtree the parent pulls once.
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newMaterializeOp(child), scope), nil
 	case *optimizer.Project:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
 		if err != nil {

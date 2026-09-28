@@ -39,6 +39,7 @@ package executor
 //     tuple, so the bound is at least as tight as the two old loop counters.
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/goopg/goopg/internal/optimizer"
@@ -47,6 +48,29 @@ import (
 // nlInnerWorkMemEnabled gates the work_mem bound on the nested loop's inner
 // Materialize. See openNestedLoop for why the default is off.
 var nlInnerWorkMemEnabled = os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") == "1"
+
+// nlBareReexec selects the STRICT bare-inner semantics (M0146-0010): when the
+// plan elects no `*optimizer.Materialize` over a nested-loop inner, the rescan
+// re-executes the subtree — `cost_rescan`'s default arm, and what PG's
+// ExecReScan does. The default is off: the inner is still wrapped in an
+// attach-time materializeOp exactly as before this task, because the strict
+// semantics exposed a real executor cliff that is not this task's to fix —
+// TPC-DS Q14's second statement joins two aggregate subqueries under a
+// Nested Loop whose inner is a self-contained (unparameterised) subtree.
+// The planner elects the bare inner faithfully (outer est. rows=1 makes the
+// matpath lose by epsilon; PG's own plan shows no Materialize there either),
+// but goopg's inner subtree is a hash-semi-join pipeline costed ~18825 where
+// PG's is a ~2730 correlated NL/index-probe chain — a pre-existing join-order
+// gap for CTE-backed semi inners (the un-wired `joinIsLegal` unique_ified arm,
+// M0142-0008c-2), invisible while every inner was cached. Under strict
+// semantics the ~830 actual outer rows re-execute that subtree wholesale —
+// measured 11 s → >300 s on the SF0.25 sweep, a deterministic gate regression.
+// Until that join-order fix lands, the compat wrap keeps the runtime; the
+// plan/executor disagreement it preserves is a stated debt, narrower than
+// before (the wrap now fires only where the plan did NOT elect Materialize,
+// never duplicating an elected one). GOOPG_NL_BARE_REEXEC=1 flips to strict
+// for diagnostics and for the eventual default flip.
+var nlBareReexec = os.Getenv("GOOPG_NL_BARE_REEXEC") == "1"
 
 const (
 	nlPhaseOuter = iota // need the next outer tuple
@@ -57,8 +81,15 @@ const (
 
 // nlJoinStream is the state machine. One instance per Open.
 type nlJoinStream struct {
-	o     *joinOp
-	inner *materializeOp
+	o *joinOp
+	// inner is whichever rescannable serves the inner side (M0146-0010): the
+	// materializeOp a `*optimizer.Materialize` plan node built, the compat
+	// attach-time cache over a bare inner (default), or — under
+	// GOOPG_NL_BARE_REEXEC — a rescanByReexec re-executing a bare inner.
+	inner rescannable
+	// mat is the *materializeOp half of inner, kept beside it so Close can
+	// release the buffer without a type assertion at the close site.
+	mat *materializeOp
 
 	lw, rw    int
 	nullLeft  Row
@@ -89,10 +120,11 @@ type nlJoinStream struct {
 	steps    int
 }
 
-// openNestedLoop opens both children and prepares the streaming join. The
-// inner side is wrapped in a Materialize over the ALREADY-OPEN child: joinOp
-// owns both children's lifecycle (joinOp.Close closes them), so the cache is
-// attached rather than opened.
+// openNestedLoop opens both children and prepares the streaming join. When
+// the plan carries a `*optimizer.Materialize` inner, buildNode's arm already
+// built it as o.right — a real operator owning its child's lifecycle through
+// its own Open/Close. A bare inner gets the compat attach-time cache by
+// default (or rescanByReexec under GOOPG_NL_BARE_REEXEC) — see nlBareReexec.
 //
 // captureCTID selects M0100-0010's outer-side ctid side-channel. It is on for
 // the general join path (which is what lockRowsOp sits above) and off for the
@@ -105,28 +137,74 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 		_ = o.left.Close()
 		return err
 	}
-	inner := newMaterializeOp(o.right)
-	inner.openCached(ctx)
-	if !nlInnerWorkMemEnabled {
-		// The inner cache runs UNBOUNDED by default, which is exactly what the
-		// pre-P4.3 `drainRowsCtx` did. The bound is not declined out of
-		// caution: measured on TPC-DS SF0.5 Q54, whose plan is a nested loop
-		// over a 1.44M-row `store_sales` seq scan (~1.6 GB as `[]Datum`), the
-		// work_mem-bounded cache spills and then every outer tuple replays the
-		// whole file with full datum decoding — 144 s → >400 s, the sweep's
-		// only regression. PG never meets that wall because `cost_rescan`
-		// prices exactly this case and the planner picks another path;
-		// `costInnerNestLoop` has no such term yet (ledger row, → P5.7). Until
-		// it does, bounding the cache would be trading unbounded memory for an
-		// unbounded plan-quality cliff. `GOOPG_NL_MATERIALIZE_WORK_MEM=1`
-		// turns the bound on for the A/B, exactly as P4.2's gate does for the
-		// hash outer fill.
-		inner.setUnbounded()
+	// M0146-0010: the wrap is conditional on the PLAN now. PG elects
+	// materialisation at the path level (joinpath.c:1890-1901 files the
+	// matpath beside the bare inner; addPath elects on cost), so a
+	// `*optimizer.Materialize` node is present exactly when the planner
+	// priced and chose it — the executor follows the plan rather than
+	// deciding for it.
+	var inner rescannable
+	var mat *materializeOp
+	if _, planned := o.plan.Right.(*optimizer.Materialize); planned {
+		// buildNode's Materialize arm already constructed the cache: o.right
+		// fronts it — directly (legacy), under an instrumentedOp (ANALYZE), or
+		// through the op-tree adapter (BuildFast). Rescan/Next flow through
+		// the wrapper so ANALYZE counters stay live; the concrete
+		// materializeOp is still dug out for the unbounded/default and the
+		// Close-time cache release.
+		mat = planMaterializeOp(o.right)
+		rs, ok := o.right.(rescannable)
+		if mat == nil || !ok {
+			// A plan that says Materialize over an inner that built no
+			// materializeOp is a producer/executor disagreement — fail closed
+			// rather than wrap a second buffer and hide it.
+			_ = o.left.Close()
+			_ = o.right.Close()
+			return fmt.Errorf("nested loop: plan elected Materialize over the inner but no materializeOp was built")
+		}
+		if !nlInnerWorkMemEnabled {
+			// The inner cache runs UNBOUNDED by default, which is exactly
+			// what the pre-P4.3 `drainRowsCtx` did. The bound is not declined
+			// out of caution: measured on TPC-DS SF0.5 Q54, whose plan is a
+			// nested loop over a 1.44M-row `store_sales` seq scan (~1.6 GB as
+			// `[]Datum`), the work_mem-bounded cache spills and then every
+			// outer tuple replays the whole file with full datum decoding —
+			// 144 s → >400 s, the sweep's only regression. PG never meets
+			// that wall because `cost_rescan` prices exactly this case and
+			// the planner picks another path — which is now true here too
+			// (costMaterial + materialRescanCost, optimizer/materialize.go);
+			// re-timing the default is slice 4 of the same task.
+			// `GOOPG_NL_MATERIALIZE_WORK_MEM=1` turns the bound on for the
+			// A/B, exactly as P4.2's gate does for the hash outer fill.
+			mat.setUnbounded()
+		}
+		inner = rs
+	} else if nlBareReexec {
+		// The strict bare-inner arm: no Materialize node means PG's cost
+		// model priced (and chose) a rescan that RE-EXECUTES the inner —
+		// the cost_rescan default arm. rescanByReexec performs exactly
+		// that. Default-off pending the Q14 join-order fix; see
+		// nlBareReexec's comment.
+		inner = &rescanByReexec{op: o.right, ctx: ctx}
+	} else {
+		// Compat arm (pre-M0146-0010 semantics, kept): attach a cache over
+		// the ALREADY-OPEN bare inner — joinOp owns the child's lifecycle,
+		// so the cache is attached, not opened. Correct because a
+		// non-parameterised inner is deterministic across rescans; the
+		// plan/executor disagreement is the documented debt.
+		m := newMaterializeOp(o.right)
+		m.openCached(ctx)
+		if !nlInnerWorkMemEnabled {
+			m.setUnbounded()
+		}
+		mat = m
+		inner = m
 	}
 
 	m := &nlJoinStream{
 		o:         o,
 		inner:     inner,
+		mat:       mat,
 		lw:        len(o.left.Schema()),
 		rw:        len(o.right.Schema()),
 		semiAnti:  o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti,
@@ -156,7 +234,10 @@ func (o *joinOp) closeNLStream() {
 	if o.nlStream == nil {
 		return
 	}
-	o.nlStream.inner.releaseCache()
+	// A bare inner has no cache to release — rescanByReexec owns nothing.
+	if o.nlStream.mat != nil {
+		o.nlStream.mat.releaseCache()
+	}
 	o.nlStream = nil
 }
 

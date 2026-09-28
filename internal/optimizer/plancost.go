@@ -234,6 +234,8 @@ func legacyDisplayChildren(n Node) []Node {
 		return []Node{p.Child}
 	case *Memoize:
 		return []Node{p.Child}
+	case *Materialize:
+		return []Node{p.Child}
 	case *Result:
 		if p.Child == nil {
 			return nil

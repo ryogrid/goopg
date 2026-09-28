@@ -519,9 +519,9 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		// unparameterised inner (partial PLAIN nestloop) and the
 		// parameterised probes (partial INDEX nestloop) ride one loop, as
 		// they do in PG. UNIQUE_INNER is vacuous (no such jointype, hence no
-		// `create_unique_path` to call). The materialised-inner tail is
-		// deliberately absent: goopg builds no Material path anywhere
-		// (`plannersettings.go:72`), a pre-existing all-join-types gap.
+		// `create_unique_path` to call). The materialised-inner tail —
+		// joinpath.c:2197-2199's matpath member — is filed per outer after
+		// this loop, under PG's two extra gates (:2135-2136).
 		for _, i := range inner.CheapestParameterized {
 			if i == nil || !i.ParallelSafe {
 				// "Can't join to an inner path that is not parallel-safe."
@@ -599,6 +599,44 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				}, "join.nestloop.partial")
 			}
 		}
+		// The materialised-inner member (joinpath.c:2197-2199 calls
+		// `try_partial_nestloop_path` once more per outer with `matpath`,
+		// built at :2129-2141). PG's two partial-only gates ride in
+		// addition to `materialInnerPathFor`'s own rule (unparameterised,
+		// not-already-materialising, enable_material): the inner must be
+		// parallel-safe (`inner_cheapest_total->parallel_safe`) and must
+		// not be parameterised by the outer (`PATH_PARAM_BY_REL`) — the
+		// second is `RequiredOuter == 0`, already enforced.
+		if in := materialInnerPathFor(inner.CheapestTotal, inner, cp); in != nil {
+			if !in.Children[0].ParallelSafe {
+				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "matpath jt="+traceJoinTypeName(jt))
+				continue
+			}
+			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, in.RequiredOuter)
+			if req != 0 {
+				continue
+			}
+			residual := nestloopResidualClauses(clauses, in, inner.Relids, in.RequiredOuter)
+			cost := nliNestLoopCost(cp, o, in, residual, semi)
+			divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
+			addPartialPath(joinrel, &Path{
+				Kind:            PathNestLoop,
+				Jointype:        jt,
+				Rel:             joinrel,
+				Rows:            clampRowEst(joinrel.Rows / divisor),
+				Cost:            cost,
+				Children:        []*Path{o, in},
+				OuterRelids:     outer.Relids,
+				InnerRelids:     inner.Relids,
+				Residual:        residual,
+				Pathkeys:        buildJoinPathkeysFor(joinrel, jt, o.Pathkeys),
+				RequiredOuter:   req,
+				ParallelSafe:    parallelSafeWith(joinrel, o, in),
+				ParallelWorkers: o.ParallelWorkers,
+				ParallelAware:   false,
+				DisabledNodes:   disabledNodesFor(!cp.enableNestLoop, o, in),
+			}, "join.nestloop.partial")
+		}
 	}
 }
 
@@ -615,20 +653,25 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 // read as given: a partial outer arrives with per-worker rows and costs, and
 // `initial_cost_nestloop` applies no worker division of its own.
 func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi semiAntiJoinFactors) Cost {
-	matBuild, matRescan := nestLoopInnerRescanCost(in, cp)
-	rsStart := nestLoopInnerRescanStartup(in)
+	// M0146-0010: the rescan is `cost_rescan` of the inner itself — a
+	// parameterised probe re-pays its descent per rescan (default arm), a
+	// Memoize pays its modelled rescan, and an unparameterised inner here is
+	// BARE (materialised candidates are filed beside the cheapest inner by
+	// addNestLoopPath, whose PathMaterial inner prices through the same
+	// arm). No materialisation build is added on top: a PathMaterial path
+	// already carries cost_material inside its own Cost.
+	rsStart, rsTot := pathRescanCost(in, cp)
 	var cost Cost
 	if semi.apply {
 		// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch. A
 		// parameterised index probe that enforces every join clause makes an
 		// unmatched outer row an empty probe (has_indexed_join_quals).
-		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
+		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, rsTot,
 			semi, hasIndexedJoinQuals(in, residual), len(residual))
 	} else {
-		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, rsTot)
 		cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
 	}
-	cost.Total += matBuild
 	return cost
 }
 

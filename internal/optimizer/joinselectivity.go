@@ -244,6 +244,10 @@ func derivedLeafUniqueCols(scan Node) map[string]bool {
 	case *SubqueryScan:
 		body = x.Child
 		out = x.Output()
+	case *Materialize:
+		// M0146-0010: transparent wrapper — analyse the child.
+		body = x.Child
+		out = x.Output()
 	default:
 		return nil
 	}

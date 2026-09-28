@@ -3086,6 +3086,8 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) (int, map[Node]int) {
 			walk(s.Child)
 		case *Memoize:
 			walk(s.Child)
+		case *Materialize:
+			walk(s.Child)
 		case *LockRows:
 			walk(s.Child)
 		case *Join:
@@ -3304,6 +3306,9 @@ func rebaseRowMarkPlan(root Node, oldW map[Node]int) {
 				rebaseExprRefsSeen(e, cm, seen)
 			}
 			return cm
+		case *Materialize:
+			// M0146-0010: transparent — no exprs of its own to rebase.
+			return walk(v.Child)
 		case *LockRows:
 			cm := walk(v.Child)
 			rebaseExprRefsSeen(v.LimitCount, cm, seen)

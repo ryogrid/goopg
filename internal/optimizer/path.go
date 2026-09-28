@@ -144,6 +144,19 @@ const (
 	// progress (S2b-5/S2b-6). See
 	// docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md.
 	PathIncrementalSort
+
+	// PathMaterial is PG's `MaterialPath` (pathnodes.h): the
+	// materializing wrapper create_material_path (pathnode.c:1637)
+	// places over a nested loop's cheapest unparameterised inner so the
+	// loop rescans a buffered result instead of re-executing the child.
+	// It exists as a path because PG makes the election at the PATH level
+	// — match_unsorted_outer files it beside the bare inner (joinpath.c:
+	// 1890-1901) — not because any executor detail needs it. Rows and
+	// Pathkeys pass through unchanged (the buffer preserves ordering);
+	// Cost carries cost_material's build overhead, and cost_rescan's
+	// Material arm is what makes the election worth filing. Children[0]
+	// is the wrapped inner.
+	PathMaterial
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept

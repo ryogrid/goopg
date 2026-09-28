@@ -559,6 +559,13 @@ func leafBaseScan(n Node) Node {
 			}
 			n = x.Child
 			continue
+		case *Materialize:
+			// M0146-0010: transparent wrapper — same strip rule.
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
 		}
 		return n
 	}

@@ -251,6 +251,11 @@ func searchedJoinInputRelOf(n Node) *RelOptInfo {
 				return nil
 			}
 			n = x.Child
+		case *Materialize:
+			if x.Child == nil {
+				return nil
+			}
+			n = x.Child
 		case *OrdinalityWrap:
 			n = x.Child
 		case *LockRows:

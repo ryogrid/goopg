@@ -2161,6 +2161,8 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 		return p.Inputs, true
 	case *optimizer.Memoize:
 		return []optimizer.Node{p.Child}, true
+	case *optimizer.Materialize:
+		return []optimizer.Node{p.Child}, true
 	case *optimizer.RowsFrom:
 		return p.Funcs, true
 	case *optimizer.ProjectSet:
@@ -3959,6 +3961,8 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return joinLabel("Nested Loop", p.Type)
 	case *optimizer.Memoize:
 		return "Memoize"
+	case *optimizer.Materialize:
+		return "Materialize"
 	case *optimizer.Merge:
 		return fmt.Sprintf("Merge on %s", explainRelName(p.Target, verbose))
 	case *optimizer.CTEDMLPrefix:
@@ -4335,6 +4339,8 @@ func planChildren(n optimizer.Node) []optimizer.Node {
 	case *optimizer.BitmapOr:
 		return p.Inputs
 	case *optimizer.Memoize:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Materialize:
 		return []optimizer.Node{p.Child}
 	case *optimizer.Merge:
 		return []optimizer.Node{p.Source}

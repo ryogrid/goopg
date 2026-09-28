@@ -193,6 +193,9 @@ func upperNarrowChildren(n Node) []Node {
 	case *SubqueryScan:
 		// M0146-0005w: labelling pass-through.
 		return []Node{x.Child}
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same rule.
+		return []Node{x.Child}
 	}
 	return nil
 }

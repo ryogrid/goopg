@@ -112,6 +112,10 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathGatherMerge:
 		// The order-preserving twin, priced by cost_gather_merge.
 		return createGatherMergePlan(p)
+	case PathMaterial:
+		// M0146-0010: `make_material` — the plan half of the materialised
+		// inner PG's match_unsorted_outer elects. materialize.go.
+		return createMaterialPlan(p)
 	case PathMemoize:
 		// A Memoize path has NO arm here, deliberately (M0127-P5.4b-ii-b-2).
 		// goopg's executor expresses the cache as `NestedLoopIndexJoin.InnerMemo`

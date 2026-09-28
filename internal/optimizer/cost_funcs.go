@@ -92,6 +92,11 @@ type costParams struct {
 	// input's count (costsize.c:2144). The Sort producer is sortPathFor.
 	enableSort   bool
 	enableMemoize bool
+	// enableMaterial is `enable_material`, a GENERATION gate in PG: the
+	// matpath is never created when it is off (joinpath.c:1897, :2135 —
+	// unlike the counted toggles above, the producer skips, and cost_material
+	// counts the disabled node only for paths admitted another way).
+	enableMaterial bool
 	// enableSeqScan / enableIndexScan / enableBitmapScan are `enable_seqscan`
 	// / `enable_indexscan` / `enable_bitmapscan` (B-17d): cost_seqscan's,
 	// cost_index's and cost_bitmap_heap_scan's own flags (costsize.c:295, 560,
@@ -155,6 +160,7 @@ func defaultCostParams() costParams {
 		enableBitmapScan: true,
 		enableGatherMerge: true,
 		enableMemoize:   true,
+		enableMaterial:  true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),
 		geqoEffort:      5,

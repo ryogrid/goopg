@@ -156,11 +156,16 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // which is what makes this path correctly ruinous for two large inputs and the
 // only available path for a cartesian pair.
 //
-// The inner rescan cost is the inner path's own total: no `Material` is
-// interposed, because Material is a plan node placed by `cost_rescan` and is
-// P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
-// over-charges a rescan of a cheap inner, which biases against nested loops —
-// the safe direction.
+// M0146-0010: the inner side is filed TWICE where PG files twice —
+// match_unsorted_outer's bare `inner_cheapest_total` AND the materialised
+// form `create_material_path` builds over it (joinpath.c:1890-1901), the
+// latter gated by `enable_material` and `ExecMaterializesOutput`
+// (materialize.go). The bare candidate pays true re-execution per rescan
+// (cost_rescan's default arm); the matpath pays cost_material once and the
+// T_Material replay per rescan — `addPath` then elects on cost, which is the
+// whole point of pricing both. Before this, `nestLoopInnerRescanCost` fused
+// the materialised price into EVERY inner: PG-shaped by accident of having
+// only one candidate, wrong the moment the election exists.
 //
 // M0142-0008c-3b: `uniq == uniqueSideInner` is PG's separate, narrower
 // `JOIN_UNIQUE_INNER` branch of `match_unsorted_outer` (joinpath.c, design
@@ -175,8 +180,14 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // `create_unique_path`'s own "can't unique-ify, return NULL" contract.
 func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	i := inner.CheapestTotal
+	var matpath *Path
 	if uniq == uniqueSideInner {
+		// JOIN_UNIQUE_INNER substitutes the unique-ified cheapest inner — and
+		// is the `if` arm PG's matpath `else if` chain excludes
+		// (joinpath.c:1883-1901): no Material over a unique'd inner.
 		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
+	} else {
+		matpath = materialInnerPathFor(i, inner, cp)
 	}
 	if i == nil {
 		return
@@ -189,8 +200,14 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 		outers = nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
 	}
 	for _, o := range outers {
-		if o != nil {
-			addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
+		if o == nil {
+			continue
+		}
+		// PG's inner pair per outer (joinpath.c:1924-1930): the bare inner
+		// first, then its materialised form when one exists.
+		addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
+		if matpath != nil {
+			addNestLoopPathFor(joinRel, outer, inner, o, matpath, cp, jt, quals, sjinfo, semi)
 		}
 	}
 }
@@ -202,20 +219,26 @@ func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costPa
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	// take2 P2-06: goopg's nested loop always materialises its inner, so the
-	// rescan is a cache replay and the build is paid once.
-	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
+	//
+	// M0146-0010: the rescan is `cost_rescan` of whatever inner THIS candidate
+	// carries (joinpathsmemoize.go): a bare scan re-executes (default arm —
+	// startup re-paid, full total per outer row); a PathMaterial replays the
+	// buffer (T_Material arm — no startup, cpu_operator_cost per tuple). A
+	// PathMaterial's build overhead is inside i.Cost already
+	// (cost_material, materialize.go), so nothing is added here — this is the
+	// separation PG draws between inner_path->total_cost (one scan + fill)
+	// and rescan cost (replays 2..N).
+	rsStart, rsTotal := pathRescanCost(i, cp)
 	var cost Cost
 	if semi.apply {
 		// M0145-0008l: SEMI/ANTI stop at the first inner match
 		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
 		// is never "indexed", so an unmatched outer row scans it all.
-		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, len(quals))
+		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal, semi, false, len(quals))
 	} else {
-		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal)
 		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
 	}
-	cost.Total += matBuild
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
 		Jointype:      jt, // C-03b; see addHashJoinPath.

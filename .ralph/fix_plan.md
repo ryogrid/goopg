@@ -23184,7 +23184,7 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: gate\-test 14/14 PASS; live negative against the real foreign
     postgres on :5534 — refused with exit 2 immediately; full valid run
     on EA\_PORT=5541 \(torn\-WAL clone override\) — see run log.
-- [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
+- [x] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
   the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
   §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;
   (2) `cost_material` + `cost_rescan`'s Material arm as tested pure
@@ -23207,6 +23207,35 @@ M0146-0001 re-baseline census on the new default arm.
     matpath rescan as separate candidates — the cost gap is what both
     elects `Materialize` when it pays \(Q8\) and flips the orientation
     when it doesn't \(Q91\).
+  - Landed 2026\-09\-28 \(slices 1\-3\): `*Materialize` node \+
+    `PathMaterial`, `costMaterial`, `pathRescanCost` as `cost\_rescan` per
+    candidate \(incl\. new T\_CteScan and T\_FunctionScan arms\), the
+    joinpath\.c:1890 admission with `execMaterializesOutput`, executor
+    drives a plan\-elected Materialize\. Design
+    `docs/design/0100\-0149/m0146\-0010\-materialize\-node\.md`\.
+  Movement: yes — TPC\-DS SF0\.25 match 15 → 16 \(Q91\), join\-order
+    68 → 66; SF1 join\-order 68 → 65, parameterisation 44 → 41 \(same diff
+    tool both arms; the tool\'s own `missingnode` 24 → 14 is a
+    reclassification, not engine movement\)\.
+  - Deferred \(ledgered\): strict bare\-inner re\-exec → M0146\-0010a;
+    slice 4 → M0146\-0010b; T\_HashJoin rescan arm; `enable\_material`
+    session wire\.
+- [ ] **M0146\-0010a — retire the legacy bare\-inner replay wrap** \(filed
+  2026\-09\-28 by M0146\-0010\)\. PG re\-executes a bare NL inner; goopg still
+  caches it unless `GOOPG\_NL\_BARE\_REEXEC=1`\. Flip the default once a
+  unique\-ified CTE semi\-inner can lead the join \(M0142\-0008c\-2\) — TPC\-DS
+  Q14 statement 2 goes 11 s → \>300 s under strict re\-exec until then\.
+  Kind: impl
+  Parent: M0146-0010
+  - First step: re\-time Q14 stmt2 with `GOOPG\_NL\_BARE\_REEXEC=1` after
+    M0142\-0008c\-2 lands; if PG\'s `unique\(cross\_items\)` lead is elected,
+    flip the default and run the fire set at both scales\.
+- [ ] **M0146\-0010b — re\-time the Q54\-class `nlInnerWorkMemEnabled` cliff**
+  \(filed 2026\-09\-28 by M0146\-0010; the sizing doc\'s slice 4\)\. With
+  Material now priced by `cost\_material`/`cost\_rescan`, measure whether
+  the unbounded\-cache exception is still needed\.
+  Kind: recon
+  Parent: M0146-0010
 - [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
   (recon; M0145-0010's residual). Re-measure the `lateral` decline
   family on the new default arm (2 fires today — Q30/Q68, posthoc

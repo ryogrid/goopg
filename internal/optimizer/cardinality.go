@@ -112,6 +112,9 @@ func EstimateRows(n Node) int64 {
 		// subplan it wraps; without this arm every estimate above it
 		// zeroed (the M0125-0038 class).
 		return EstimateRows(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same rows as the child.
+		return EstimateRows(x.Child)
 	case *Aggregate:
 		return estimateAggregate(x)
 	case *Insert:
@@ -1997,6 +2000,9 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		// so a coordinate crossing it crosses here exactly as it does in
 		// resolveBaseColumn — the resolver twins must agree.
 		return passthrough(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent — same rule as SubqueryScan.
+		return passthrough(x.Child)
 	case *LockRows:
 		return passthrough(x.Child)
 	case *Gather:
@@ -2319,6 +2325,10 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 			// M0146-0005w: labelling wrapper — strip to the arm's own
 			// top so a contained SetOp/Aggregate still reads as
 			// already-grouped.
+			top = x.Child
+			continue
+		case *Materialize:
+			// M0146-0010: transparent — same strip rule.
 			top = x.Child
 			continue
 		}

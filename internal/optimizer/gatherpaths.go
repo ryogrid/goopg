@@ -851,6 +851,14 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
+	case PathMaterial:
+		// M0146-0010: same transparency — a buffer changes nothing about
+		// which child scan drives the partial path (no producer files a
+		// partial matpath today; the arm is consistency, not load-bearing).
+		if len(p.Children) != 1 || p.Children[0] == nil || p.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	default:
 		// PathPrebuilt, joins, Memoize, Agg: not modelled by any attach
 		// walk at this slice's scope. Refuse.

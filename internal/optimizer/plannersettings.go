@@ -74,9 +74,19 @@ type PlannerSettings struct {
 	// (sortPathFor) still builds the Sort path when off, so a query whose
 	// only legal plan sorts still plans.
 	//
-	// There is deliberately no EnableMaterial: goopg builds no Material path
-	// (joinpathsmemoize.go; take2 P2-06), so the flag would have no consumer.
+	// There is deliberately no EnableMaterial SESSION wire: M0146-0010 added
+	// the Material path and reads the toggle through cp.enableMaterial
+	// (materialize.go), but no registry bridge carries the GUC into
+	// PlannerSettings — the flag exists so tests can close the producer, not
+	// because a session can reach it yet. Deferred with the rest of the
+	// P2-02 remainder.
 	EnableSort bool
+
+	// EnableMaterial is PG's `enable_material` — a generation gate at the
+	// producer (joinpath.c:1897), not a counted flag like the methods above:
+	// the matpath is simply never created when it is off.
+	// PlannerSettings.costParams copies it; nothing sets it from the session.
+	EnableMaterial bool
 
 	// EnableSeqScan / EnableIndexScan / EnableBitmapScan are PG's
 	// `enable_seqscan` / `enable_indexscan` / `enable_bitmapscan` (B-17d):
@@ -228,6 +238,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableBitmapScan: true,
 		EnableGatherMerge: true,
 		EnableMemoize:   true,
+		EnableMaterial:  true,
 
 		EnableHashAgg:            HashAggEnabled(),
 		EnablePresortedAggregate: PresortedAggEnabled(),
@@ -294,6 +305,7 @@ func (ps PlannerSettings) costParams() costParams {
 		enableBitmapScan: ps.EnableBitmapScan,
 		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
+		enableMaterial:  ps.EnableMaterial,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
 		geqoEffort:      ps.GeqoEffort,

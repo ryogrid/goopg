@@ -276,6 +276,8 @@ func tracePathKind(p *Path) string {
 		return "gathermerge"
 	case PathSort:
 		return "sort"
+	case PathMaterial:
+		return "material"
 	case PathAgg:
 		return "agg"
 	default:

@@ -33,6 +33,8 @@
 package executor
 
 import (
+	"fmt"
+
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -411,6 +413,21 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 
 func (w *opNodeOperator) Close() error           { return opClose(w.tree, w.idx) }
 func (w *opNodeOperator) Schema() optimizer.Schema { return w.schema }
+
+// Rescan forwards the rescannable contract into the slab (M0146-0010): a
+// nested loop's materialised inner reaches the join as an OpAdapter fronting
+// a *materializeOp under the BuildFast path, and the join's Rescan must reach
+// it. Same forwarder shape as BindLateralOuter below.
+func (w *opNodeOperator) Rescan() error {
+	if w.tree != nil && int(w.idx) >= 0 && int(w.idx) < len(w.tree.ops) {
+		if s, ok := w.tree.ops[w.idx].state.(*opAdapterState); ok {
+			if r, ok := s.op.(rescannable); ok {
+				return r.Rescan()
+			}
+		}
+	}
+	return fmt.Errorf("opNodeOperator: slab node %d (%v) is not rescannable", w.idx, w.tree.ops[w.idx].Kind)
+}
 
 // BindLateralOuter forwards the lateral outer-row binding to the wrapped
 // underlying operator when this opNodeOperator fronts a FROM-clause SRF
