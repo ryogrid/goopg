@@ -3054,6 +3054,11 @@ type SetOp struct {
 	// above it would claim a parallelism the executor will not run.
 	// M0145-0004a.
 	ParallelAware bool
+	// appendArms is plan-construction scratch (M0146-0005ac): the flattened,
+	// already-ordered arms of the parallel Append this link tops, each with
+	// the path that built it, so the next link up can order its whole chain
+	// (parallelappendorder.go). nil on every other node.
+	appendArms []parallelAppendArm
 }
 
 func (n *SetOp) Pos() int       { return n.pos }

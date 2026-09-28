@@ -22791,6 +22791,29 @@ M0146-0001 re-baseline census on the new default arm.
     reads `parallelism` mechanically; true cause documented — re\-file
     as cost\-adjudication on the next census re\-run.
   Movement: none — routing recon
+- [x] **M0146\-0005ac — Parallel Append arms in create\_append\_path\'s
+  order** \(slice 29, impl, filed and done 2026\-09\-28 from a fresh
+  census at `bb431e90c`\): PG sorts a parallel\-aware Append\'s subpaths
+  \(pathnode.c:1343\-1361\) — non\-partial by total desc, partial by
+  startup desc then total desc; goopg kept the written order \(TPC\-DS Q71:
+  PG store, catalog, web\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 29"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `orderParallelAppendArms` \(`parallelappendorder.go`\), called from
+    `createSetOpPlan`, sorts the flattened UNION ALL chain and rebuilds it
+    left\-deep; rebuilt links pin the written first arm\'s schema and keep
+    each arm\'s claimed\-whole mark; an already\-ordered inner link hands
+    its arms up in `SetOp.appendArms`\.
+  - Q71 arm order = PG; its first divergence is now PG\'s
+    `Subquery Scan on "\*SELECT\* n"` per arm \(M0146\-0026 family\)\.
+  - Routing from the same census: Q37 = the `indexProbeCostMultiplier`
+    calibration \(`GOOPG\_INDEX\_PROBE\_MULT=1` elects PG\'s order\) →
+    M0142\-0005c lineage, inner IOS → M0146\-0019; Q59 not yet traced\.
+  - Gates: units, tpch\-spotcheck \(Q12=2 Q13=33\), sf025 sweep 96/96,
+    TPC\-H arm 24/24, fire set \(5 fires, none introduced\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 parallelism 48 -> 47, qual-placement 19 -> 18; SF1 qual-placement 20 -> 19
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

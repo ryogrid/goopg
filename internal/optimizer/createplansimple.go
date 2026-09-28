@@ -580,7 +580,9 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	// Append, and the label is what the plan-parity walk reads. Only a
 	// partial PathSetOp carries it; the serial path leaves it false.
 	out.ParallelAware = p.ParallelAware
-	return &out, baseRelLayout(p.Rel, &out)
+	// M0146-0005ac: create_append_path's arm sort over the flattened chain.
+	top := orderParallelAppendArms(p, &out)
+	return top, baseRelLayout(p.Rel, top)
 }
 
 // spliceBranchEmission rebuilds `branch` with the searched emission swapped

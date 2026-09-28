@@ -331,3 +331,40 @@ No planner change is justified.
 
 Evidence: `analysis/m0146/m0146-0005/slice28/`; fix-plan entry
 M0146-0005ab.
+
+## Slice 29: M0146-0005ac — Parallel Append arm order + residual routing at `bb431e90c`
+
+Census on the post-M0146-0010 SF0.25 capture (83 divergent / 16 match):
+Q37, Q59 and Q71 moved to new, unrouted `join-order`/`join-method` records.
+
+- **Q71 (fixed here).** PG's `create_append_path` (pathnode.c:1343-1361)
+  sorts a parallel-aware Append's subpaths: non-partial first by total cost
+  descending, partial by startup descending then total descending, relids
+  breaking ties. goopg kept the written order. goopg's union is a left-deep
+  chain of two-child `*SetOp` links, so the sort runs at plan construction
+  (`orderParallelAppendArms`, `parallelappendorder.go`, called from
+  `createSetOpPlan`): each link collects the flattened arms with the paths
+  that built them, sorts, and rebuilds the chain; every rebuilt link pins the
+  chain's original output schema (the written first arm's names), and each
+  arm keeps its claimed-whole mark. An inner link, already reordered when it
+  was built, hands its ordered arms up in `SetOp.appendArms` — re-pairing by
+  position after an inner reorder produced store, web, catalog on the first
+  live run. Q71 now lists store, catalog, web as PG does; its first
+  divergence is PG's `Subquery Scan on "*SELECT* n"` wrapper over each arm
+  (the Subquery-Scan family, M0146-0026).
+- **Q37 (routed).** The join order is decided by the `inventory_pkey`
+  skip-scan probe (`inv_item_sk` is its second column): goopg 3512 per loop
+  vs PG 1824 — exactly the `indexProbeCostMultiplier = 2` calibration. With
+  `GOOPG_INDEX_PROBE_MULT=1` goopg elects PG's order (item → inventory
+  1800.93 vs PG 1824.06, then date\_dim, then catalog\_sales). Routed to the
+  M0142-0005c cost-model lineage with 0005z/0005ab; the remaining inner
+  `Index Scan` vs PG `Index Only Scan` is M0146-0019.
+- **Q59 (not traced).** PG nests `Materialize(Hash Join(wss⋈store, wss⋈store⋈d))`
+  under a nested loop driven by `date_dim d_1`; goopg merge-joins the two
+  halves. Unchanged by the multiplier.
+- Found on the way (ledgered): goopg files no skip scan for a
+  constant-bound probe (`inv_item_sk = 5` seq-scans; PG skip-scans at 1817).
+
+Movement: SF0.25 `parallelism` 48 → 47, `qual-placement` 19 → 18; SF1
+`qual-placement` 20 → 19; match unchanged (16 / 14). Sweep 96/96 (5 plans
+changed: Q5 Q66 Q71 Q75 Q76), fire set 5 fires, no introduced timeouts.
