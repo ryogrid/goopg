@@ -232,3 +232,28 @@ func TestDerivedPullupBodyOuterJoin(t *testing.T) {
 		}
 	}
 }
+
+// Slice 5 (M0146-0028e): a pullable derived operand of an all-INNER join
+// chain is pulled up — the chain is split into comma items and its ON
+// clauses become statement-level quals, exactly as an inner join's ON clause
+// is a WHERE qual in all but name.
+func TestDerivedPullupInnerJoinOperand(t *testing.T) {
+	_, _, rctx := pullupPlanFrom(t, "SELECT b.bx, s.k FROM b JOIN (SELECT ax AS k FROM a WHERE ay > 0) s ON b.bx = s.k")
+	if len(rctx.pulledDerived) != 1 {
+		t.Fatalf("inner-join derived operand not pulled up")
+	}
+	if len(rctx.pulledQuals) != 2 {
+		t.Fatalf("want the body WHERE and the ON clause as statement quals, got %d", len(rctx.pulledQuals))
+	}
+	for _, q := range []string{
+		"SELECT * FROM b LEFT JOIN (SELECT ax AS k FROM a) s ON b.bx = s.k", // outer link
+		"SELECT * FROM b JOIN (SELECT ax AS k FROM a) s ON bx = s.k",        // unqualified ON ref
+		"SELECT * FROM b JOIN (SELECT ax AS bx FROM a) s USING (bx)",        // USING
+		"SELECT * FROM b JOIN c ON b.bx = c.cx",                             // no derived operand
+	} {
+		_, _, rctx := pullupPlanFrom(t, q)
+		if len(rctx.pulledDerived) != 0 {
+			t.Fatalf("%s: pulled up a declined chain", q)
+		}
+	}
+}

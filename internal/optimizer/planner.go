@@ -3916,13 +3916,13 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// search (derivedpullup.go). A pull-up attempt that fails to resolve
 	// leaves no trace — the scope's RTID counter and derived-subtree registry
 	// are restored — and the FROM clause is planned exactly as before.
-	if items, cands := expandDerivedPullups(s, derivedPullupOn); cands != nil {
+	if items, cands, onQuals := expandDerivedPullups(s, derivedPullupOn); cands != nil {
 		var next int32
 		var nDerived int
 		if scope != nil {
 			next, nDerived = scope.next, len(scope.derivedSubtrees)
 		}
-		node, rctx, ok, err := planFromClauseItems(s, items, cands, cat, ps, scope)
+		node, rctx, ok, err := planFromClauseItems(s, items, cands, onQuals, cat, ps, scope)
 		if err == nil && ok {
 			return node, rctx, nil
 		}
@@ -3931,7 +3931,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 			scope.derivedSubtrees = scope.derivedSubtrees[:nDerived]
 		}
 	}
-	node, rctx, _, err := planFromClauseItems(s, s.FromExprs, nil, cat, ps, scope)
+	node, rctx, _, err := planFromClauseItems(s, s.FromExprs, nil, nil, cat, ps, scope)
 	return node, rctx, err
 }
 
@@ -3939,7 +3939,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 // statement's FROM list, or its expansion with pulled-up subquery bodies
 // (M0146-0028) described by `cands`. ok=false reports a pull-up that did not
 // resolve; the caller then re-plans without it.
-func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []*derivedPullupCandidate, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, bool, error) {
+func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []*derivedPullupCandidate, onQuals []parser.Expr, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, bool, error) {
 	var root Node
 	var bindings []rangeBinding
 	// M0145-0005 slice 3: the accumulated leaf/link table — each item's
@@ -4045,6 +4045,22 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 			return nil, nil, false, nil
 		}
 		rctx.pulledDerived, rctx.pulledQuals = rels, quals
+		// M0146-0028e: the ON clauses of a split inner join chain resolve
+		// at the statement's level, where every operand (and a pulled
+		// derived operand's alias) is in scope.
+		if len(onQuals) > 0 {
+			rctx.cat, rctx.parent = cat, planParent
+			for _, on := range onQuals {
+				q, err := resolveExpr(canonicalizeQual(on), rctx)
+				if err != nil {
+					return nil, nil, false, nil
+				}
+				if q, err = foldQualConstants(q); err != nil {
+					return nil, nil, false, nil
+				}
+				rctx.pulledQuals = append(rctx.pulledQuals, q)
+			}
+		}
 	}
 	// R40/K69: see antiForcedNullCols' declaration above.
 	rctx.antiForcedNullCols = antiForcedNullCols

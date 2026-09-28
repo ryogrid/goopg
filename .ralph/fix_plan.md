@@ -23723,6 +23723,18 @@ M0146-0001 re-baseline census on the new default arm.
     up; results = PG; gates units, tpch\-spotcheck, sf025 96/96, TPC\-H arm
     24/24, fire set \(Q51 Q93, none introduced\), regress runner 0/22\.
   Movement: none — PLAN-PARITY categories unchanged (Q93 already matched; Q51 first divergence above the window stage)
+- [x] **M0146\-0028e — slice 5: derived operands of an inner JOIN** \(impl,
+  done 2026\-09\-28\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §10\.
+  Kind: impl
+  Parent: M0146-0028
+  - An all\-INNER/CROSS chain with a pullable derived operand is split into
+    comma items; ON clauses become statement quals; declined for outer/
+    USING/NATURAL links, sublinks, and unqualified ON references\.
+  - No witness: regress join\.sql\'s derived operands are LEFT JOINs or
+    `SELECT \*` bodies; `SELECT \*` bodies are the next most frequent
+    unsupported shape\.
+  Movement: none — PG-faithful widening, no corpus witness
 - [x] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(

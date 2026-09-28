@@ -180,3 +180,23 @@ Movement: TPC-DS Q51 (FULL JOIN body) and Q93 (LEFT JOIN body, reduced to
 INNER by its own WHERE, as PG does) now pull up. Q93 already matched PG; Q51's
 first divergence is a Subquery Scan above its window stage, unchanged.
 Category counts are unchanged, no timeouts. Regress runner 0 of 22 changed.
+
+## 10. Slice 5 (M0146-0028e, 2026-09-28): derived operands of an inner JOIN
+
+PG pulls a simple subquery up wherever it sits in the jointree, including
+as an operand of an explicit INNER JOIN. `splitInnerJoinChainForPullup`
+splits an all-INNER/CROSS chain that carries a pullable derived operand into
+comma items, and moves its ON clauses to the statement's quals. Those quals
+are resolved once `pulledDerived` exists, so an ON clause naming `s.k`
+reaches the body column. Declined:
+
+- outer, USING or NATURAL links;
+- ON clauses with a sublink;
+- ON clauses with an **unqualified** column reference. An ON clause sees
+  only its join's inputs while a WHERE qual sees every FROM item, so moving
+  it could make a unique name ambiguous or rebind it.
+
+Movement: none. No TPC body has this shape, and regress join.sql's derived
+join operands are almost all LEFT JOINs (a PlaceHolderVar case) or
+`SELECT *` bodies. Regress runner: 25 cases, 0 changed. The most frequent
+unsupported shape in regress is now the `SELECT *` body.

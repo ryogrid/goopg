@@ -254,13 +254,26 @@ func parserExprHasNode(v reflect.Value, depth int, want func(any) bool) bool {
 // admitted derived item replaced by its body's FROM items — and the
 // candidates in expanded-item coordinates. With nothing admitted it returns
 // the input list and nil.
-func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parser.FromExpr, []*derivedPullupCandidate) {
+func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parser.FromExpr, []*derivedPullupCandidate, []parser.Expr) {
 	if mode == derivedPullupOff || !parentFromAdmitsDerivedPullup(s) {
-		return s.FromExprs, nil
+		return s.FromExprs, nil, nil
+	}
+	// M0146-0028e: an all-INNER join chain carrying a pullable derived
+	// operand is split into comma items first; its ON clauses become
+	// parent-level quals (splitInnerJoinChainForPullup).
+	var onQuals []parser.Expr
+	var flat []parser.FromExpr
+	for _, it := range s.FromExprs {
+		if pieces, ons, ok := splitInnerJoinChainForPullup(it); ok {
+			flat = append(flat, pieces...)
+			onQuals = append(onQuals, ons...)
+			continue
+		}
+		flat = append(flat, it)
 	}
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
-	for _, it := range s.FromExprs {
+	for _, it := range flat {
 		body, ok := simpleDerivedPullupBody(it)
 		if !ok {
 			out = append(out, it)
@@ -272,9 +285,67 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 		cands = append(cands, c)
 	}
 	if len(cands) == 0 {
-		return s.FromExprs, nil
+		return s.FromExprs, nil, nil
 	}
-	return out, cands
+	return out, cands, onQuals
+}
+
+// splitInnerJoinChainForPullup is M0146-0028e: PG pulls a simple subquery up
+// wherever it sits in the jointree, including as an operand of an explicit
+// INNER JOIN, and an inner join's ON clause is a WHERE qual in all but name
+// (deconstruct_jointree distributes both alike). goopg's pull-up splices FROM
+// items, so an item `a JOIN (SELECT …) s ON c1 JOIN b ON c2` whose chain is
+// INNER/CROSS only is split into the comma items a, s, b with c1, c2 moved to
+// the statement's quals — only when at least one operand is a pullable
+// derived table, so every other chain keeps its written form.
+//
+// Declined: any outer, USING or NATURAL link (the chain is not a pure inner
+// product then); an ON clause with a sublink; and an ON clause with an
+// UNQUALIFIED column reference, because an ON clause sees only its join's
+// inputs while a WHERE qual sees every FROM item — moving `x = 1` could turn
+// a unique name ambiguous or bind it to a later item.
+func splitInnerJoinChainForPullup(it parser.FromExpr) ([]parser.FromExpr, []parser.Expr, bool) {
+	if len(it.Joins) == 0 {
+		return nil, nil, false
+	}
+	operands := []parser.RangeVar{it.Base}
+	var ons []parser.Expr
+	for _, j := range it.Joins {
+		if (j.Type != parser.JoinInner && j.Type != parser.JoinCross) || j.Natural || len(j.Using) > 0 {
+			return nil, nil, false
+		}
+		if j.On != nil {
+			if !collectExprColumnNames(j.On, map[string]bool{}) ||
+				parserExprHasNode(reflect.ValueOf(j.On), 0, parserNodeIsSelect) ||
+				parserExprHasNode(reflect.ValueOf(j.On), 0, parserNodeIsUnqualifiedColumn) {
+				return nil, nil, false
+			}
+			ons = append(ons, j.On)
+		}
+		operands = append(operands, j.Right)
+	}
+	anyDerived := false
+	for _, rv := range operands {
+		if rv.Lateral || rv.TableFunc != nil || rv.GroupedJoinUnaliased {
+			return nil, nil, false
+		}
+		if _, ok := simpleDerivedPullupBody(parser.FromExpr{Base: rv}); ok {
+			anyDerived = true
+		}
+	}
+	if !anyDerived {
+		return nil, nil, false
+	}
+	pieces := make([]parser.FromExpr, 0, len(operands))
+	for _, rv := range operands {
+		pieces = append(pieces, parser.FromExpr{Base: rv})
+	}
+	return pieces, ons, true
+}
+
+func parserNodeIsUnqualifiedColumn(x any) bool {
+	cr, ok := x.(*parser.ColumnRef)
+	return ok && cr.Table == "" && cr.Schema == ""
 }
 
 // resolvePulledDerived builds, for every candidate, the parent-level view
