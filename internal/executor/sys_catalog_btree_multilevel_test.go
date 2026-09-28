@@ -8,6 +8,7 @@ package executor
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"sort"
 	"testing"
 
@@ -290,5 +291,62 @@ func TestSyncRoutineInsertsPgProcIndexEntries(t *testing.T) {
 	}
 	if got := len(readSysBtreeLeaf(t, ctx, pgProcPronameArgsNspIndexOID)); got != 2 {
 		t.Errorf("2691 after update: %d tuples, want 2", got)
+	}
+}
+
+// TestBulkLayoutBuildsThreeLevels pins the any-height rebuild: a catalog
+// btree that outgrows one internal root (the regress-suite failure
+// "internal-root overflow inserting downlink 97") gets another internal
+// level, with high keys on non-rightmost internal pages — and descent and
+// collection, which read slot 1 as the minus-infinity downlink only on a
+// rightmost page, still reach every tuple.
+func TestBulkLayoutBuildsThreeLevels(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	const n = 8000
+	seed := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("fn%06d", i)
+		seed = append(seed, buildIndexTupleProcNameArgsNsp(uint32(i/100+1), uint16(i%100+1), name, []uint32{23}, 11))
+	}
+	sort.Slice(seed, func(i, j int) bool {
+		return cmpKeyProcNameArgsNsp(seed[i][sysIndexTupleHoff:], seed[j][sysIndexTupleHoff:]) < 0
+	})
+	image, err := buildBulkSysBtreeLayoutVariable(seed, 3)
+	if err != nil {
+		t.Fatalf("bulk layout: %v", err)
+	}
+	writeSysBtreeImage(t, ctx, pgProcPronameArgsNspIndexOID, image)
+	rel := storage.RelFileNode{DBOid: catalog.DefaultDBOid, RelOid: pgProcPronameArgsNspIndexOID, Fork: storage.MainFork}
+	rootBlk, level, err := readSysBtreeMeta(ctx, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if level < 2 {
+		t.Fatalf("meta level = %d, want >= 2 for %d tuples", level, n)
+	}
+	meta, _ := keyMetaForSysBtree(pgProcPronameArgsNspIndexOID)
+	all, err := collectAllLeafTuples(ctx, rel, rootBlk, level, meta)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(all) != n {
+		t.Fatalf("collected %d tuples, want %d", len(all), n)
+	}
+	for i := 1; i < len(all); i++ {
+		if cmpKeyProcNameArgsNsp(all[i-1][sysIndexTupleHoff:], all[i][sysIndexTupleHoff:]) > 0 {
+			t.Fatalf("tuples %d/%d out of order", i-1, i)
+		}
+	}
+	for i := 0; i < n; i += 37 {
+		want := seed[i]
+		leafBlk, err := descendSysBtreeToLeaf(ctx, rel, rootBlk, level, want[sysIndexTupleHoff:], cmpKeyProcNameArgsNsp)
+		if err != nil {
+			t.Fatalf("descend %d: %v", i, err)
+		}
+		if !leafContainsTuple(t, ctx, rel, leafBlk, want) {
+			t.Fatalf("tuple %d not on its descent leaf %d", i, leafBlk)
+		}
 	}
 }

@@ -1107,6 +1107,24 @@ heuristic stays live.)
     `select_implicit` and `union`, named when this row was filed, now pass.
   - The suite therefore stays red until that one row is cleared; this row
     itself carries no separate work.
+- [x] **M\-NIGHTLY\-20260929\-004 — testport RegressSuite: limit, vacuum\_parallel, varchar**
+  \(AI\-20260928\-004845\-004, AI\-20260929\-003700\-004; repro: `go test \-v
+  \-run \'^TestPort\_RegressSuite$\' ./internal/testport/`\)\. Selected ahead of
+  banner order under the M\-NIGHTLY exception: a must\-pass gate was red and
+  an own commit \(M0146\-0030\) exposed it\.
+  Kind: impl
+  Parent: none
+  - `limit`: the sorted\-split\-over\-Gather run\-time ERROR, fixed by
+    M0146\-0005ak \(`68b95f351`\)\.
+  - `varchar`/`vacuum\_parallel`: every CREATE failed once pg\_class needed
+    more than one internal root in pg\_class\_relname\_nsp\_index \("internal\-root
+    overflow inserting downlink 97"\); order\-dependent \(full suite only\);
+    bisect → `0994872a3`, which only let join/arrays run further\. Fixed by
+    any\-height internal levels in the catalog btree rebuild\. Design
+    `docs/design/0100\-0149/0106\-0010\-sys\-btree\-any\-height.md`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(FORCE=1 values\-only, nightly
+    batch running\), full TestPort\_RegressSuite PASS, new real\-PG E2E PASS\.
+  Movement: none — correctness (nightly must-pass gate green)
 
 ### Nightly run 20260901-010436 (sha `d93fb9edc669`, 7 items) — filed 2026-09-01
 - [x] **testport/TestPort_PgStatActivity (AI-20260901-010436-005, AI-20260905-011015-007, AI-20260914-235643-010, AI-20260916-035206-011, AI-20260917-004357-015)**.
