@@ -168,10 +168,24 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 		// so `tuples`/`rows` are the leaf's own.
 		if cr != nil && relids != 0 && relids&(relids-1) == 0 {
 			j := bits.TrailingZeros32(uint32(relids))
-			if j < len(s.relInfos) && s.relInfos[j].subqueryUniqueOutput {
-				v.isUnique = true
-				v.tuples = float64(s.relInfos[j].baseRows)
-				v.rows = float64(s.relInfos[j].filteredRows)
+			if j < len(s.relInfos) {
+				info := &s.relInfos[j]
+				// M0146-0009e: vardata->rel = find_base_rel(varno) is
+				// unconditional for a Var operand, so the leaf's own row
+				// estimates stand in even when no column statistics
+				// resolve — prefix derived leaves carry them in
+				// leafTuples/leafRows, pulled/synthetic derived leaves
+				// (table == nil) already carry EstimateRows in baseRows.
+				if info.leafTuples > 0 {
+					v.tuples = info.leafTuples
+					v.rows = info.leafRows
+				} else if info.table == nil {
+					v.tuples = float64(info.baseRows)
+					v.rows = float64(info.filteredRows)
+				}
+				if info.subqueryUniqueOutput || info.uniqueOutCols[cr.Name] {
+					v.isUnique = true
+				}
 			}
 		}
 		return v
@@ -180,7 +194,83 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	v.tuples = float64(info.baseRows)
 	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
+	// M0146-0009e: a derived leaf resolves `ok` through its binding's
+	// synthetic catalog.Table, but that table carries no statistics —
+	// columnStatsByName already returns nil for it. What the catalog path
+	// cannot supply is vardata->rel: PG's leaf is the derived rel itself,
+	// so its tuples are the leaf's own estimate, and the body's lone
+	// GROUP BY / DISTINCT key is isunique.
+	if info.leafTuples > 0 {
+		v.tuples = info.leafTuples
+		v.rows = info.leafRows
+		if info.uniqueOutCols[cr.Name] {
+			v.isUnique = true
+		}
+	}
 	return v
+}
+
+// derivedLeafUniqueCols names the leaf output columns PG's
+// `examine_simple_variable` marks isunique for a FROM-clause derived leaf:
+// the leaf body's lone GROUP BY or DISTINCT(ON) key (selfuncs.c:5865-5883),
+// generalized to per-column form (M0146-0009e). Column names are read in the
+// leaf's own output schema so they match the probed ColumnRef.Name. Every
+// other shape — base scans, VALUES, function scans, set-ops, multi-key or
+// unkeyed bodies — returns nil, upstream's punting behavior.
+func derivedLeafUniqueCols(scan Node) map[string]bool {
+	// leaf-local *Filter wrappers do not reach uniqueness classification
+	// (a filter shrinks the leaf's rows but cannot change which of its
+	// output columns are unique). *SubqueryScan is deliberately NOT
+	// stripped here — it is a labeling wrapper whose schema carries the
+	// leaf's output names, which is the naming space the probed
+	// ColumnRef.Name lives in.
+	for {
+		if f, ok := scan.(*Filter); ok && f.Child != nil {
+			scan = f.Child
+			continue
+		}
+		break
+	}
+	var body Node
+	var out Schema
+	var st *cteOutputStats
+	switch x := scan.(type) {
+	case *CTEScan:
+		if x.cte == nil {
+			return nil
+		}
+		st = x.cte.outputStats()
+		out = x.Output()
+	case *SubqueryScan:
+		body = x.Child
+		out = x.Output()
+	default:
+		return nil
+	}
+	var uniq map[int]bool
+	if st != nil {
+		uniq = make(map[int]bool)
+		for i := range st.cols {
+			if st.cols[i].unique {
+				uniq[i] = true
+			}
+		}
+	} else {
+		uniq = loneKeyPositions(body, len(out))
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(uniq))
+	for i := range uniq {
+		if i < len(out) && out[i].Name != "" {
+			names[out[i].Name] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
 }
 
 // resolveJoinVarColumn is the operand-RESOLUTION half of `examine_variable`:

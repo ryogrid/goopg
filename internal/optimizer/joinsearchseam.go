@@ -937,6 +937,22 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// "scaling a fallback invents precision" concern is enforced by the
 		// gate rather than by refusing to scale. See `applyRelSizeFallback`.
 		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
+		// M0146-0009e: a DERIVED leaf (CTE scan, subquery scan, set-op, …)
+		// still gets `vardata->rel = find_base_rel(varno)` upstream
+		// (selfuncs.c:5331), so a Var operand on it reads the leaf's own row
+		// estimate — the binding's synthetic catalog.Table leaves baseRows
+		// at 0 — and a lone GROUP BY / DISTINCT output column is marked
+		// isunique (:5865-5883). leafBaseScan strips a leaf-local *Filter
+		// wrapper without touching the classification.
+		if isSubplanLeaf(scans[i]) {
+			if t := EstimateRows(scans[i]); t > 0 {
+				relInfos[i].leafTuples = float64(t)
+				if r := EstimateRows(leaves[i]); r > 0 {
+					relInfos[i].leafRows = float64(r)
+				}
+			}
+			relInfos[i].uniqueOutCols = derivedLeafUniqueCols(scans[i])
+		}
 	}
 	// M0145-0005 slice 2: the pulled leaves at [nReal, nprefix) are REAL
 	// joinlist items — numbered in binding order by the pull-up — but

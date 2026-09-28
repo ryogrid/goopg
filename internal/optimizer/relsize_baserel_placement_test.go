@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -164,7 +165,7 @@ func TestRelSizeFallbackPlacementInertWhenRowCountKnown(t *testing.T) {
 	warm := estimateBaseRelInfo(binding, scan, pred)
 	before := warm
 	applyRelSizeFallback(&warm, binding, scan, pred, cat)
-	if warm != before {
+	if !reflect.DeepEqual(warm, before) {
 		t.Errorf("a relation with a positive post-filter count must be untouched: %+v -> %+v", before, warm)
 	}
 	if warm.baseRows != 4242 {

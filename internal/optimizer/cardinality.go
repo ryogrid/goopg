@@ -762,6 +762,23 @@ type baseRelInfo struct {
 	// leaf has no catalog table, so this is the whole of its column
 	// statistics — `examineJoinVar` reads it (M0145-0008ab).
 	subqueryUniqueOutput bool
+	// leafTuples/leafRows carry a DERIVED input leaf's own row estimates —
+	// EstimateRows over its subtree before and after leaf-local quals —
+	// for the FROM-clause leaf shapes isSubplanLeaf accepts (CTE scan,
+	// subquery scan, set-op, VALUES, …). PG's examine_variable assigns
+	// vardata->rel = the leaf rel unconditionally for a Var operand
+	// (selfuncs.c:5331), so join-var examination must see these rows even
+	// though the leaf's binding table is a synthetic catalog.Table whose
+	// baseRows is 0. Zero for base relations, where the catalog-statistics
+	// path already supplies both. M0146-0009e.
+	leafTuples float64
+	leafRows   float64
+	// uniqueOutCols names the leaf output columns PG marks isunique — the
+	// leaf body's lone GROUP BY or DISTINCT(ON) key (selfuncs.c:5865-5883),
+	// the RTE_SUBQUERY/RTE_CTE arm generalized to per-column form. nil for
+	// base relations and derived leaves whose top query has no lone key.
+	// M0146-0009e.
+	uniqueOutCols map[string]bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM

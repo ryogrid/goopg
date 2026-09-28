@@ -23118,27 +23118,41 @@ M0146-0001 re-baseline census on the new default arm.
       hit PG's early exits \(setOps / multi\-key group\), Q83 hits the one
       arm that produces statistics.
   - Movement: none \(recon; one fix routed\).
-- [ ] **M0146\-0009e — `isunique` propagation for FROM\-clause derived
-  leaves** \(impl, filed 2026\-09\-28 by M0146\-0009c\). Port PG's
-  `examine_simple_variable` RTE\_SUBQUERY lone\-key arm
-  \(selfuncs\.c:5876\-5883: `groupClause`/`distinctClause` length 1 \+
-  `targetIsInSortList` → `isunique`\) to `\*CTEScan`/`SubqueryScan` FROM
-  leaves: when the probed output column is the body\'s lone GROUP
-  BY/DISTINCT key, mark `joinVarStats.isUnique` AND populate
-  `v.tuples`/`v.rows` from `relInfos[j].baseRows`/`filteredRows`
-  \(vardata\->rel is the leaf rel in that early\-return arm\). Today
-  `subqueryUniqueOutput` is set only for pulled ANY leaves
-  \(joinsearchseam\.go:1034 `pulledLeafUniqueOutput`\) and is a leaf\-level
-  bool — derived leaves need a per\-output\-column set \(leaf body plan\'s
-  lone group key → leaf output col name; `\*CTEScan` keeps the cloned body
-  in `Child` and the WITH entry in `cte`\). Witness: Q83 `sr_items ⋈
-  cr_items` goopg est=1 vs PG est=10 \(legs identical: 20/10\); Q95
-  `cte:ws_wh` HJ\-Semi est=1 vs 22 likely same class.
+- [x] **M0146\-0009e — `isunique` propagation for FROM\-clause derived
+  leaves** \(impl, filed 2026\-09\-28 by M0146\-0009c\). Landed
+  2026\-09\-28. The actual defect was one level earlier than filed:
+  `resolveJoinVarColumn` SUCCEEDS on a CTE/subquery leaf because the
+  binding carries a synthetic `catalog\.Table` \(planner\.go:4564\) — the
+  `ok` path then read `v\.tuples = baseRows = 0` \(synthetic table has no
+  stats\), so `!ok`'s `subqueryUniqueOutput` arm was never reached. Fix:
+  `baseRelInfo\.\{leafTuples,leafRows,uniqueOutCols\}` — leafTuples/leafRows
+  = `EstimateRows` over the derived leaf pre/post leaf\-local quals
+  \(PG's unconditional `vardata->rel = find_base_rel`, selfuncs\.c:5331\),
+  populated for `isSubplanLeaf` prefix leaves; uniqueOutCols = shared
+  classifier `loneKeyPositions` \(lone `GroupExprs`/`DistinctOn` key,
+  single\-col `Distinct`; peels Filter/Sort/Limit/Project/SubqueryScan
+  labels; punts on set\-ops/grouping\-sets/multi\-key\). `cteOutputStats`
+  carries `\.unique` per col via the same classifier \(one rule source\);
+  `examineJoinVar` overrides tuples/rows + per\-col isUnique on the `ok`
+  path, and the `!ok` arm generalizes \(table==nil derived leaves now get
+  `tuples = baseRows` too\). Witnesses: Q83 probe `rows=1 → 10` \(PG: 10\);
+  real Q83 merge chain 5/2; `make ea\-ratchet` PASS \(52 fixed incl. all
+  four Q83 relsets, Q95 `cte:ws_wh`, Q78/Q85 leaf relsets\). Q95's flagged
+  semijoin stays rows=1 — PG also estimates it 1 \(self\-join body, no
+  lone key — PG\-shared, driven by the filtered\-chain estimate\). NOT
+  ported: the arm's passthrough recursion
+  \(`examine_simple_variable(subroot, var)` recovering base\-column stats
+  for pass\-through output vars — `cteColPassthrough` class\) — ledger
+  row filed.
   Kind: impl
   Parent: M0146-0009c
-  - Gates: optimizer units; tpcds\-sf025 sweep; fireset; ea\-ratchet
-    re\-score for Q83/Q95 movement \(Q83 expected est 1 → ~10, still under
-    actual 22 — par with PG\'s own 5–10\).
+  - Gates: optimizer units incl\. new `derivedleaf_unique_test\.go`;
+    units suite PASS; tpch\-spotcheck PASS; sf025 sweep PASS=96 \(plan\-diff
+    moved 6: Q2 merge\+1, Q54/Q58/Q65/Q77/Q83 — all row\-count correct\);
+    acceptance arm 24/24 MATCH; fireset PASS \(no introduced timeouts,
+    sf025+sf1\); ea\-ratchet PASS \(52 fixed\) \+ baseline re\-pinned on
+    EA\_PORT=5541 \(default 5534 was squatted by a foreign postgres —
+    M0146\-0009d demonstrated live a second time\).
 - [ ] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready

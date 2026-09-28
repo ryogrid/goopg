@@ -227,14 +227,18 @@ func TestExamineJoinVarRejectsMultiRelOperand(t *testing.T) {
 
 // TestExamineJoinVarSubqueryLeafIsUnresolved: `buildInitialRels` admits every
 // FROM item, so a search relation need not have a catalog table behind it. Such
-// a rel has no per-column statistics to read, and the estimator must fall to
-// the default rather than dereference a nil table.
+// a rel has no per-column statistics to read — stats stays nil and the
+// distinct count still falls to the default — but the leaf's own row count
+// does apply: PG's examine_variable assigns `vardata->rel = find_base_rel`
+// unconditionally for a Var operand (selfuncs.c:5331), so `tuples` is the
+// leaf's estimate (M0146-0009e). Here 900 >= DEFAULT_NUM_DISTINCT, so the
+// ndistinct answer is unchanged; below the constant the leaf's size wins.
 func TestExamineJoinVarSubqueryLeafIsUnresolved(t *testing.T) {
 	s := jsCtx(t)
 	s.relInfos[1] = baseRelInfo{baseRows: 900}
 	v := s.examineJoinVar(jsCol(3, "sub_col"), relsetOf(1))
-	if v.stats != nil || v.tuples != 0 {
-		t.Fatalf("a table-less rel resolved to %+v; want the unresolved zero value", v)
+	if v.stats != nil || v.tuples != 900 {
+		t.Fatalf("a table-less rel resolved to %+v; want stats=nil tuples=900 (leaf rel->tuples)", v)
 	}
 	if nd, isDefault := getVariableNumDistinct(v); nd != defaultNumDistinct || !isDefault {
 		t.Fatalf("nd=%v isDefault=%v; want the default", nd, isDefault)
