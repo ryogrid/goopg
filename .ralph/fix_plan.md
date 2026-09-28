@@ -23647,6 +23647,38 @@ M0146-0001 re-baseline census on the new default arm.
     for an inner\-join body, adding the by\-expression output substitution
     the M0145\-0001 contract §4\.3 describes; keep non\-simple bodies
     \(`derivedSubqueryNeedsScan`\) as opaque leaves\.
+- [x] **M0146\-0028a — slice 1: bare\-column bodies over comma lists** \(impl,
+  done 2026\-09\-28\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md`; evidence
+  `analysis/m0146/m0146\-0028/`\.
+  Kind: impl
+  Parent: M0146-0028
+  - `derivedpullup.go`: `expandDerivedPullups` splices admitted bodies into
+    the FROM walk; body bindings are `pulledHidden`; `pulledDerived` answers
+    the alias \(column, `\*`, whole\-row, HAVING, analyzer scope\); body quals
+    are resolved, constant\-folded and ANDed into the WHERE Filter; failed
+    resolution restores the scope and re\-plans without pull\-up\.
+  - `targetMeta` names a bare column target by its written name
+    \(FigureColname\); ORDER BY ordinals over `SELECT \*` walk the star
+    expansion \(latent wrong\-sort bug, also reachable through JOIN USING\)\.
+  - Gates: units, tpch\-spotcheck \(Q12=2 Q13=33\), sf025 96/96 \(Q2 Q59
+    changed\), TPC\-H arm 24/24, fire set \(Q2 Q59, none introduced\);
+    regress runner 0/11 diffs changed vs HEAD; Q59 output = PG\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-method 39 -> 38, rendering 25 -> 24; SF1 join-method 42 -> 41
+- [ ] **M0146\-0029 — planner panic on a variable\-free join alias**
+  \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
+  `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
+  \(select \*, 123 as x from int4\_tbl i1\) ss1 left join \(select \*, q2 as
+  x from int8\_tbl i2\) ss2 using \(x\) \) ss0 on …`\) panics
+  `createPlan: searched subtree needed reconciliation — name resolution moves
+  "x" from column 1 to 4` \(`assertSearchedTreeNeedsNoReconcile`,
+  searchedtree.go\) and drops the connection; the regress runner aborts the
+  `join` case\. A crash on valid SQL, not wrong rows\.
+  Kind: impl
+  Parent: none
+  - First step: plan the statement on a private cluster with the regress
+    fixtures and find which createPlan arm binds `x` \(the USING merge column
+    of two derived legs\) at a position `reconcileNLILayout` disagrees with\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

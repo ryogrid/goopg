@@ -412,6 +412,13 @@ type resolveContext struct {
 	schema Schema // schema produced by the input scan
 	// bindings keeps every FROM-clause relation in output-column order.
 	bindings []rangeBinding
+	// pulledDerived / pulledQuals: the FROM-clause subqueries pulled up into
+	// this scope's join search (derivedpullup.go, M0146-0028) — the name view
+	// of each (its alias and output columns, resolved to the body columns
+	// they rename) and the bodies' resolved WHERE conjuncts, ANDed into this
+	// scope's WHERE by planSelect.
+	pulledDerived []*pulledDerivedRel
+	pulledQuals   []Expr
 	// cat threads the catalog through so subexpression rewrites
 	// (currently subquery planning) can recurse into Plan() without
 	// every helper taking it as a separate argument. Populated by
@@ -659,6 +666,12 @@ type rangeBinding struct {
 	// leaf rel (M0145-0004). Never set on the legacy pipeline, so the
 	// flag is the arm gate as well as the admissibility record.
 	appendrel bool
+	// pulledHidden marks a leaf binding that came from a pulled-up
+	// FROM-clause subquery's body (derivedpullup.go, M0146-0028): a real
+	// leaf of this scope's search, but — like PG's pulled-up RTEs — not
+	// reachable by name from the parent query. Name resolution skips it;
+	// the derived alias resolves through resolveContext.pulledDerived.
+	pulledHidden bool
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -1674,12 +1687,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 	}
 
-	if s.Where != nil {
+	// M0146-0028: a pulled-up FROM subquery's WHERE is part of this scope's
+	// qual (pull_up_simple_subquery appends the subquery's quals to the
+	// parent's), so a WHERE-less statement with pulled bodies takes this arm.
+	var pulledQuals []Expr
+	if ctx != nil {
+		pulledQuals = ctx.pulledQuals
+	}
+	if s.Where != nil || len(pulledQuals) > 0 {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
 		// Exception: correlated outer-scope aggregates (all column refs reference
 		// tables NOT in the current FROM clause) are allowed — PG permits
 		// `WHERE sum(outer.col) = inner.col` inside EXISTS subqueries. M0097-0035.
-		if exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
+		if s.Where != nil && exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
 			return nil, &PlanError{Pos: firstAggregatePos(s.Where), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
@@ -1705,10 +1725,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// calculations"). `whereClause` is a local rewrite; `s.Where` is
 		// untouched, same as `whereQual` below.
 		whereClause := s.Where
-		if len(ctx.antiForcedNullCols) > 0 {
+		if whereClause != nil && len(ctx.antiForcedNullCols) > 0 {
 			whereClause = stripForcingNullQuals(s.Where, ctx.antiForcedNullCols, buildTableMap(s.FromExprs, cat), cat)
 		}
-		whereQual := canonicalizeQual(whereClause)
+		var whereQual parser.Expr
+		if whereClause != nil {
+			whereQual = canonicalizeQual(whereClause)
+		}
 		// R40/K69: whereQual can be nil here when a demotedForPlan
 		// ANTI transplant's forcing conjunct was the ENTIRE WHERE
 		// clause (stripForcingNullQuals above) — mirror the
@@ -1768,8 +1791,16 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				// spent here.
 				whereQual = nil
 			} else {
+				if len(pulledQuals) > 0 {
+					pred = combineAnd(append([]Expr{pred}, pulledQuals...))
+				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
+		}
+		if whereQual == nil && len(pulledQuals) > 0 {
+			// M0146-0028: no parent WHERE (or a fully stripped one) — the
+			// pulled bodies' quals are the whole Filter.
+			node = &Filter{pos: s.Pos(), Child: node, Predicate: combineAnd(pulledQuals)}
 		}
 		// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
 		// inside the WHERE arm, until C-17 (P4-08) moved it to the
@@ -1781,6 +1812,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		addPulledBodyColumnNames(ctx)
 		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
 		// PG's pull_up_sublinks position, before join-order search —
 		// into leaf entries + SpecialJoinInfo on ctx.jtPullup, which
@@ -1944,6 +1976,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		addPulledBodyColumnNames(ctx)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
 			node = newChild
 		} else if newChild != node {
@@ -2263,9 +2296,21 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// 1-based positional reference against the output schema.  This
 			// matches wrapSetOpSortLimit and the SRF post-sort path.
 			if ic, ok := expr.(*parser.IntegerConst); ok {
+				// The ordinal counts OUTPUT columns, and a star's output is
+				// its expansion, not the input schema: a pulled-up derived
+				// table (M0146-0028) hides its body's other columns, and a
+				// JOIN USING hides the right-side copy. Walk the target list
+				// through the expansions first; the input-schema index is
+				// right only when every star expands to its bindings'
+				// contiguous columns, which stays the fallback.
+				if agg == nil && win == nil {
+					if se, ok := ordinalThroughStarTargets(int(ic.Value), s.Targets, sortCtx); ok {
+						e = se
+					}
+				}
 				outSchema := sortCtx.schema
 				idx := int(ic.Value) - 1
-				if idx >= 0 && idx < len(outSchema) {
+				if e == nil && idx >= 0 && idx < len(outSchema) {
 					sc := outSchema[idx]
 					e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
 				}
@@ -3864,6 +3909,34 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	if len(s.FromExprs) == 0 {
 		return planFromRangeVars(s.From, cat, ps, scope)
 	}
+	// M0146-0028: pull simple FROM-clause subqueries into this scope's join
+	// search (derivedpullup.go). A pull-up attempt that fails to resolve
+	// leaves no trace — the scope's RTID counter and derived-subtree registry
+	// are restored — and the FROM clause is planned exactly as before.
+	if items, cands := expandDerivedPullups(s, derivedPullupOn); cands != nil {
+		var next int32
+		var nDerived int
+		if scope != nil {
+			next, nDerived = scope.next, len(scope.derivedSubtrees)
+		}
+		node, rctx, ok, err := planFromClauseItems(s, items, cands, cat, ps, scope)
+		if err == nil && ok {
+			return node, rctx, nil
+		}
+		if scope != nil {
+			scope.next = next
+			scope.derivedSubtrees = scope.derivedSubtrees[:nDerived]
+		}
+	}
+	node, rctx, _, err := planFromClauseItems(s, s.FromExprs, nil, cat, ps, scope)
+	return node, rctx, err
+}
+
+// planFromClauseItems is planFromClause's FROM walk over `items` — the
+// statement's FROM list, or its expansion with pulled-up subquery bodies
+// (M0146-0028) described by `cands`. ok=false reports a pull-up that did not
+// resolve; the caller then re-plans without it.
+func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []*derivedPullupCandidate, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, bool, error) {
 	var root Node
 	var bindings []rangeBinding
 	// M0145-0005 slice 3: the accumulated leaf/link table — each item's
@@ -3880,7 +3953,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// Counter starts at 1; zero is reserved as the "unknown /
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
-	for _, rawItem := range s.FromExprs {
+	for itemIdx, rawItem := range items {
 		// R27 §4a / K28: plan from a copy carrying the outer-join demotions
 		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
 		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
@@ -3904,9 +3977,24 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		}
 		itemNode, itemBindings, itemScope, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		jtTab.appendTable(itemScope)
+		// M0146-0028: a pulled-up body's leaves are this scope's leaves but
+		// not nameable from it; record where each body's bindings land.
+		for _, c := range cands {
+			if itemIdx == c.itemLo {
+				c.bindLo = len(bindings)
+			}
+			if itemIdx >= c.itemLo && itemIdx < c.itemHi {
+				for i := range itemBindings {
+					itemBindings[i].pulledHidden = true
+				}
+			}
+			if itemIdx == c.itemHi-1 {
+				c.bindHi = len(bindings) + len(itemBindings)
+			}
+		}
 		if root == nil {
 			root = itemNode
 			bindings = itemBindings
@@ -3929,11 +4017,18 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		bindings = append(bindings, shifted...)
 	}
 	if root == nil {
-		return nil, nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
+		return nil, nil, false, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
 	rctx := newResolveContext(bindings, root.Output(), ps)
 	// A-01(ii) cut 2: carry the statement scope (see lateralCtx above).
 	rctx.rtScope = scope
+	if len(cands) > 0 {
+		rels, quals, ok := resolvePulledDerived(cands, bindings, root.Output(), cat, ps, scope)
+		if !ok {
+			return nil, nil, false, nil
+		}
+		rctx.pulledDerived, rctx.pulledQuals = rels, quals
+	}
 	// R40/K69: see antiForcedNullCols' declaration above.
 	rctx.antiForcedNullCols = antiForcedNullCols
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
@@ -3941,7 +4036,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
 	// demoted joins enter the joinlist as plain INNER joins.
-	reduceOuterJoins(s.FromExprs, s.Where, cat)
+	reduceOuterJoins(items, s.Where, cat)
 	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo
 	// Min/LhsStrict population can resolve ON-clause names (syn fallback
 	// on any uncertainty — never an underestimate).
@@ -3950,14 +4045,14 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// pin has no item to carry one, and losing its ordering constraint would
 	// let the search reorder across the outer join. See
 	// `deconstructJointreeScopedSJI`.
-	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), newSjiScope(s.FromExprs, cat))
+	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(items, defaultCollapseLimits(), newSjiScope(items, cat))
 	// M0145-0005 slice 3: pin the table to the exact chain it was built
 	// beside — the seam consumes it only while `jtScope.root == chain`,
 	// so a pre-search rewrite that grafts a different root (the S5a
 	// post-unnest Phase B chain) falls back to the node walk.
 	jtTab.root = root
 	rctx.jtScope = jtTab
-	return root, rctx, nil
+	return root, rctx, true, nil
 }
 
 func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, error) {
@@ -9017,8 +9112,15 @@ func groupByNameIsInputColumn(name string, ctx *resolveContext) bool {
 		}
 		return false
 	}
+	for _, r := range ctx.pulledDerived {
+		for _, n := range r.names {
+			if strings.EqualFold(n, name) {
+				return true
+			}
+		}
+	}
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		for _, c := range b.table.Columns {
@@ -9602,13 +9704,16 @@ func groupExprName(e Expr) string {
 // the outer row for HAVING subqueries. M0097-0035.
 func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
 	return &resolveContext{
-		table:     agg.input.table,
-		alias:     agg.input.alias,
-		schema:    agg.input.schema,
-		bindings:  agg.input.bindings,
-		cat:       agg.input.cat,
-		parent:    agg.input.parent,
-		havingAgg: agg,
+		table:    agg.input.table,
+		alias:    agg.input.alias,
+		schema:   agg.input.schema,
+		bindings: agg.input.bindings,
+		// M0146-0028: pulled-up derived tables stay nameable from HAVING
+		// sublinks exactly as the bindings do.
+		pulledDerived: agg.input.pulledDerived,
+		cat:           agg.input.cat,
+		parent:        agg.input.parent,
+		havingAgg:     agg,
 		// EX3-03 cut 1 (F5 audit): this parent carries HAVING subqueries,
 		// so it inherits the scope's settings — a zero here would price
 		// the subquery's search at 0.0 instead of the statement's budget.
@@ -10498,6 +10603,9 @@ func exprAllAggregatesAreOuterRef(e parser.Expr, ctx *resolveContext) bool {
 		if b.table != nil {
 			currentTables[strings.ToLower(b.table.Name)] = true
 		}
+	}
+	for _, r := range ctx.pulledDerived {
+		currentTables[strings.ToLower(r.alias)] = true
 	}
 	// collectColRefs collects all ColumnRef table names from an expression (non-recursive
 	// through function calls — only looks at direct args).
@@ -14695,12 +14803,23 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	// (e.g. the `excluded` pseudo-table in ON CONFLICT DO UPDATE and the
 	// diagnostic-only `excluded` added to the RETURNING scope).
 	var bset []rangeBinding
-	for _, b := range ctx.bindings {
-		if !b.qualifiedOnly && !b.notReferenceable {
+	// M0146-0028: a pulled-up derived table's columns expand where the
+	// derived item stood in FROM — before the first of its body's (hidden)
+	// leaf bindings. bsetPulled[k] lists the derived tables emitted before
+	// bset[k]; the entry at len(bset) catches a table whose body leaves are
+	// the last bindings.
+	bsetPulled := map[int][]*pulledDerivedRel{}
+	for i, b := range ctx.bindings {
+		for _, r := range ctx.pulledDerived {
+			if r.firstBinding == i {
+				bsetPulled[len(bset)] = append(bsetPulled[len(bset)], r)
+			}
+		}
+		if !b.qualifiedOnly && !b.notReferenceable && !b.pulledHidden {
 			bset = append(bset, b)
 		}
 	}
-	if len(bset) == 0 {
+	if len(bset) == 0 && len(ctx.pulledDerived) == 0 {
 		bset = ctx.bindings // fallback: shouldn't happen, but avoid empty expansion
 	}
 	// A table-qualified star (`t.*`) expands to ALL of that table's
@@ -14712,12 +14831,24 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	if qualified {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
-			if b.notReferenceable {
+			if b.notReferenceable || b.pulledHidden {
 				continue // diagnostic-only binding — not a real FROM-clause entry
 			}
 			if bindingMatchesRelation(b, star.Table, star.Schema) {
 				matches = append(matches, b)
 			}
+		}
+		if r := pulledDerivedAliasMatches(ctx, star.Table, star.Schema); r != nil {
+			if len(matches) > 0 {
+				return nil, nil, &PlanError{Pos: star.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", star.Table)}
+			}
+			outExpr := make([]Expr, 0, len(r.cols))
+			outSchema := make(Schema, 0, len(r.cols))
+			for i, cr := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(cr, star.Pos(), 0))
+				outSchema = append(outSchema, SchemaColumn{Name: r.names[i], Type: cr.Type, SourceTableIdx: cr.SourceTableIdx})
+			}
+			return outExpr, outSchema, nil
 		}
 		if len(matches) == 0 {
 			return nil, nil, errorMissingRTEPlan(star.Pos(), star.Schema, star.Table, ctx)
@@ -14729,7 +14860,19 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	}
 	outExpr := make([]Expr, 0)
 	outSchema := make(Schema, 0)
-	for _, b := range bset {
+	emitPulled := func(k int) {
+		if qualified {
+			return
+		}
+		for _, r := range bsetPulled[k] {
+			for i, cr := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(cr, star.Pos(), 0))
+				outSchema = append(outSchema, SchemaColumn{Name: r.names[i], Type: cr.Type, SourceTableIdx: cr.SourceTableIdx})
+			}
+		}
+	}
+	for k, b := range bset {
+		emitPulled(k)
 		for i, c := range b.table.Columns {
 			// For an unqualified `SELECT *` over a JOIN USING / NATURAL
 			// join, the right-side copy of each merged column is hidden:
@@ -14757,6 +14900,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
 	}
+	emitPulled(len(bset))
 	// M0097-0061: PostgreSQL places USING columns first in SELECT * output:
 	// "using-cols, left-rest, right-rest". Without explicit reordering the
 	// left table's natural column order is preserved, which is wrong when the
@@ -14807,6 +14951,19 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
 		return t.Alias, exprType(e)
+	}
+	// FigureColname (parse_target.c) names a bare column reference by the
+	// name as WRITTEN. The resolved ref carries the column it reads, which is
+	// the same name except through a pulled-up derived table
+	// (derivedpullup.go, M0146-0028): `y.s_store_name1` reads the body's
+	// `s_store_name`, and the output is still `s_store_name1`.
+	if w, ok := t.Expr.(*parser.ColumnRef); ok && w.Column != "" && w.Column != "*" {
+		if r, ok := e.(*ColumnRef); ok && !strings.EqualFold(r.Name, w.Column) {
+			return w.Column, r.Type
+		}
+		if r, ok := e.(*OuterColumnRef); ok && !strings.EqualFold(r.Name, w.Column) {
+			return w.Column, r.Type
+		}
 	}
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
@@ -16587,7 +16744,15 @@ func buildAnalyzerOuterScope(ctx *resolveContext) *analyzer.OuterScope {
 	parent := buildAnalyzerOuterScope(ctx.parent)
 	rels := make([]analyzer.OuterRelation, 0, len(ctx.bindings))
 	for _, b := range ctx.bindings {
+		if b.pulledHidden {
+			continue
+		}
 		rels = append(rels, analyzer.OuterRelation{Table: b.table, Alias: b.alias})
+	}
+	// M0146-0028: a pulled-up derived table is still an outer relation by
+	// name for the sublinks below this scope.
+	for _, r := range ctx.pulledDerived {
+		rels = append(rels, analyzer.OuterRelation{Table: pulledDerivedTable(r), Alias: r.alias})
 	}
 	return analyzer.NewOuterScope(ctx.cat, rels, parent)
 }
@@ -17168,7 +17333,7 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 // when nothing close enough is found. M0134-0120.
 func suggestColumnHintAllBindings(ctx *resolveContext, want string) string {
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		qualifier := b.alias
@@ -17211,6 +17376,9 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		matches := make([]rangeBinding, 0, 1)
 		var deferredBlockErr *PlanError
 		for _, b := range ctx.bindings {
+			if b.pulledHidden {
+				continue
+			}
 			if b.qualifiedOnly {
 				// Pseudo-tables (e.g. ON CONFLICT's `excluded`) reach name
 				// resolution only via their alias.
@@ -17241,6 +17409,20 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)
 			}
+		}
+		// M0146-0028: a pulled-up derived table answers to its alias.
+		if r := pulledDerivedAliasMatches(ctx, x.Table, x.Schema); r != nil {
+			if len(matches) > 0 {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", x.Table)}
+			}
+			if refs := resolvePulledDerivedColumn(x, ctx, level); len(refs) == 1 {
+				return refs[0], true, nil
+			}
+			pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %s.%s does not exist", r.alias, x.Column)}
+			if hint := suggestColumnHint(pulledDerivedTable(r).Columns, r.alias, x.Column); hint != "" {
+				pe.Hint = hint
+			}
+			return nil, false, pe
 		}
 		if len(matches) == 0 {
 			if deferredBlockErr != nil {
@@ -17306,7 +17488,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 
 	var found Expr
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		for i, c := range b.table.Columns {
@@ -17337,6 +17519,15 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			}
 		}
 	}
+	// M0146-0028: the outputs of pulled-up derived tables are unqualified
+	// names of this level too, ambiguous with each other and with the
+	// bindings' own columns exactly as the derived leaves were.
+	if refs := resolvePulledDerivedColumn(x, ctx, level); len(refs) > 0 {
+		if found != nil || len(refs) > 1 {
+			return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+		}
+		found = refs[0]
+	}
 	// Unqualified `tableoid` system-column resolution. PG raises
 	// "column reference is ambiguous" when more than one binding
 	// could supply it; for a single-binding scope it resolves to
@@ -17344,7 +17535,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found == nil && strings.EqualFold(x.Column, "tableoid") {
 		var matchB *rangeBinding
 		for i := range ctx.bindings {
-			if ctx.bindings[i].qualifiedOnly {
+			if ctx.bindings[i].qualifiedOnly || ctx.bindings[i].pulledHidden {
 				continue
 			}
 			if matchB != nil {
@@ -17360,7 +17551,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found == nil && strings.EqualFold(x.Column, "ctid") {
 		var matchB *rangeBinding
 		for i := range ctx.bindings {
-			if ctx.bindings[i].qualifiedOnly {
+			if ctx.bindings[i].qualifiedOnly || ctx.bindings[i].pulledHidden {
 				continue
 			}
 			if matchB != nil {
@@ -17380,7 +17571,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	// qualifiedOnly bindings (e.g. MERGE RETURNING `old`/`new`) also match here
 	// by alias so that bare `old`/`new` produce a composite row value. M0100-0007.
 	for _, b := range ctx.bindings {
-		if b.notReferenceable {
+		if b.notReferenceable || b.pulledHidden {
 			continue
 		}
 		name := b.alias
@@ -17410,6 +17601,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			types[i] = c.Type
 		}
 		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types}, true, nil
+	}
+	// M0146-0028: whole-row reference to a pulled-up derived table.
+	if r := pulledDerivedAliasMatches(ctx, x.Column, ""); r != nil {
+		return pulledDerivedWholeRow(r, x.Pos(), level), true, nil
 	}
 	return nil, false, nil
 }
@@ -17453,7 +17648,7 @@ func errorMissingRTEPlan(pos int, schema, table string, ctx *resolveContext) *Pl
 			// qualifiedOnly = the ON CONFLICT `excluded` pseudo-table
 			// (a keyword, not a user-chosen rename); notReferenceable =
 			// present for diagnostics only, never a real FROM entry.
-			if b.qualifiedOnly || b.notReferenceable || b.alias == "" || b.table == nil {
+			if b.qualifiedOnly || b.notReferenceable || b.pulledHidden || b.alias == "" || b.table == nil {
 				continue
 			}
 			if schema != "" && !strings.EqualFold(schema, b.table.Schema) {
