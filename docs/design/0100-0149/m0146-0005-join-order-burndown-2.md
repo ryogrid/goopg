@@ -461,3 +461,34 @@ against PG's 68.9k, so the same ~300-unit worker sort is 1.15% of goopg's
 base against PG's 0.3%, just outside the fuzz. That is the approximation
 the function's own comment names (ledgered). Evidence:
 `analysis/m0146/m0146-0005/slice32/`.
+
+## Slice 33: M0146-0005ag — the gathered arm's ordered-aggregate rules
+
+TPC-H Q16 groups `count(DISTINCT ps_suppkey)`. PG elects `GroupAggregate ->
+Gather Merge -> Sort (p_brand, p_type, p_size, ps_suppkey)`. Two upstream
+rules produce it. `GROUPING_CAN_USE_HASH` requires `numOrderedAggs == 0`
+(planner.c:3846), so a grouping with DISTINCT or ORDER BY aggregates is
+never hashed. `adjust_group_pathkeys_for_groupagg` also appends the
+aggregate's own keys to `group_pathkeys`, so the input is sorted to serve
+both the grouping and the DISTINCT.
+
+goopg's serial grouping arm (groupingpaths.go) already followed both rules
+through `presortedAggKeysOrAbsent` and `groupingHashable(agg, presorted)`.
+Its parallel twin, the gathered no-split arm in `addPartialAggSplitPath`,
+did not. It skipped the sorted family for any special aggregate and always
+offered the hashed arm, so Q16 elected `HashAggregate -> Gather`.
+
+- **Change.** The gathered arm now takes the serial arm's rules verbatim. With
+  presorted keys, both sorted gathered candidates sort to them: the leader
+  Sort above the Gather, and the per-worker Sort under a Gather Merge. The
+  hashed candidate is not offered. With no special aggregate the keys are
+  the group keys, as before. A special aggregate without usable presorted
+  keys still gets the hashed candidate alone, the serial arm's documented
+  conservatism.
+
+Movement: TPC-H Q16's first divergence moves from depth 1
+(aggregation-strategy) to depth 5 (PG's `Parallel Index Only Scan` on
+`partsupp`). TPC-H `aggregation-strategy` 5 → 4, `sort-strategy` 5 → 4,
+`parallelism` 7 → 6, `parameterisation` 4 → 3, `join-order` 11 → 10. TPC-DS
+plans are unchanged at both scales (no fires). Values are identical.
+Evidence: `analysis/m0146/m0146-0005/slice33/`.

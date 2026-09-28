@@ -1650,3 +1650,37 @@ func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
 		t.Error("no arm over the hashed partial where it wins outright")
 	}
 }
+
+// TestGatheredArmFollowsTheSerialOrderedAggRules pins M0146-0005ag: the
+// gathered no-split arm applies the serial arm's validity rules to a
+// DISTINCT aggregate. PG never hashes a grouping with DISTINCT / ORDER BY
+// aggregates (GROUPING_CAN_USE_HASH needs numOrderedAggs == 0), and sorts
+// its input by the group keys extended with the aggregate's own keys — TPC-H
+// Q16's `GroupAggregate -> Gather Merge -> Sort (p_brand, p_type, p_size,
+// ps_suppkey)`.
+func TestGatheredArmFollowsTheSerialOrderedAggRules(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2_000, 1, 1)
+	agg.Aggs[0] = AggregateCall{Name: "count", Distinct: true, Arg: &ColumnRef{Index: 2, Name: "v"}}
+	if _, ok := presortedAggKeysOrAbsent(agg, upperSplitSettings()); !ok {
+		t.Fatal("fixture has no presorted keys; the case this test exists for is unreachable")
+	}
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	sortedGathered := false
+	for _, p := range grouped.Pathlist {
+		if p.Kind != PathAgg || len(p.Children) != 1 {
+			continue
+		}
+		if p.AggStrategy == AggStrategyHashed && p.Children[0].Kind == PathGather {
+			t.Error("hashed Agg-over-Gather offered for a DISTINCT aggregate")
+		}
+		if p.AggStrategy == AggStrategySorted && len(p.Pathkeys) == 2 {
+			sortedGathered = true
+		}
+	}
+	if !sortedGathered {
+		t.Error("no sorted gathered candidate ordered by the group key plus the DISTINCT argument")
+	}
+}

@@ -658,10 +658,10 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	//
 	// The one thing that cannot carry over is PRESORTEDNESS: a Gather
 	// interleaves its workers' streams, so whatever order the input had is
-	// gone above it. Both arms below are therefore built as if no usable keys
-	// existed — hashed on `groupingHashable(agg, false)`, sorted over an
-	// explicit `Sort`, which is exactly the shape the post-pass produces for
-	// Q16 today (Sort above Gather, GroupAggregate above that).
+	// gone above it. The sorted arms below therefore always sort explicitly
+	// (above the Gather, or per worker under a Gather Merge); the ordering
+	// they sort to, and whether hashing is offered at all, follow the serial
+	// arm's rules (M0146-0005ag, below).
 	if len(aggNode.GroupExprs) == 0 && aggNode.GroupingSets == nil {
 		presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
 		if presorted {
@@ -740,8 +740,24 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// (comparePathCostsFuzzily, M0141-S2b-13) insertion order decides
 	// fuzzy ties, so the order is load-bearing, not cosmetic — same
 	// change S2b-11 made in groupingpaths.go for the serial arm.
-	if aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
-		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+	//
+	// M0146-0005ag: the serial twin's (groupingpaths.go) validity rules,
+	// verbatim. With DISTINCT / ORDER BY aggregates the only valid sorted
+	// input is the presorted-keys order (`adjust_group_pathkeys_for_groupagg`
+	// appends the aggregate's own keys to group_pathkeys), and PG never
+	// hashes such a grouping — `GROUPING_CAN_USE_HASH` requires
+	// `numOrderedAggs == 0` (planner.c:3846). This arm used to skip the
+	// sorted family for them and offer only the hashed one, so TPC-H Q16's
+	// `count(DISTINCT ps_suppkey)` elected `HashAggregate -> Gather` where
+	// PG runs `GroupAggregate -> Gather Merge -> Sort (…, ps_suppkey)`.
+	gatheredKeys := groupKeysSortKeys(aggNode)
+	gatheredSortOK := !groupingHasSpecialAgg(aggNode)
+	presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
+	if presorted {
+		gatheredKeys, gatheredSortOK = presortedKeys, true
+	}
+	if aggNode.GroupingSets == nil && gatheredSortOK {
+		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(gatheredKeys), cp, -1)
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		sortSpec := *aggNode
 		addPath(grouped, &Path{
@@ -771,7 +787,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
 		// worker-side construction this mirrors field for field.
 		workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
-			groupKeysSortKeys(aggNode), cp, workers, d, perWorkerRows)
+			gatheredKeys, cp, workers, d, perWorkerRows)
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		gmSpec := *aggNode
 		addPath(grouped, &Path{
@@ -782,7 +798,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
 		}, partialAggGatherMergeProducer)
 	}
-	if groupingHashable(aggNode, false) || aggNode.GroupingSets != nil {
+	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		hashSpec := *aggNode
 		addPath(grouped, &Path{

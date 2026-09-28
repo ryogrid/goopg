@@ -22870,6 +22870,22 @@ M0146-0001 re-baseline census on the new default arm.
     24/24, fire set \(5 fires, none introduced\), regress runner 7 cases 0
     changed vs HEAD\.
   Movement: yes — TPC-H PLAN-PARITY match 8 -> 9 (Q5), CATEGORIES-EXCL-MATCH sort-strategy 6 -> 5; TPC-DS sort-strategy SF0.25 50 -> 48, SF1 51 -> 49
+- [x] **M0146\-0005ag — the gathered arm follows the serial ordered\-aggregate
+  rules** \(slice 33, impl, filed and done 2026\-09\-28 from the same TPC\-H
+  census\): TPC\-H Q16\'s `count\(DISTINCT ps\_suppkey\)` elected
+  `HashAggregate \-> Gather`; PG never hashes with ordered aggregates
+  \(`numOrderedAggs == 0`, planner.c:3846\) and sorts to the presorted
+  keys\. Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md`
+  § "Slice 33"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `addPartialAggSplitPath`\'s gathered no\-split arm now uses
+    `presortedAggKeysOrAbsent` for its sorted candidates and
+    `groupingHashable\(agg, presorted\)` for the hashed one, as the serial
+    twin does\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
+    TPC\-DS plan change\), regress runner 7 cases 0 changed vs HEAD\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 5 -> 4, sort-strategy 5 -> 4, parallelism 7 -> 6, parameterisation 4 -> 3, join-order 11 -> 10 (Q16 first divergence depth 1 -> 5)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
