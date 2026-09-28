@@ -23790,6 +23790,29 @@ M0146-0001 re-baseline census on the new default arm.
     `SELECT \*` bodies; `SELECT \*` bodies are the next most frequent
     unsupported shape\.
   Movement: none — PG-faithful widening, no corpus witness
+- [x] **M0146\-0028f — slice 6: function\-call targets and sublinks in the
+  body WHERE** \(impl, done 2026\-09\-28; witness TPC\-H Q22 from the
+  M0146\-0005 census\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §11\.
+  Kind: impl
+  Parent: M0146-0028
+  - Target calls admitted when known, not aggregate/window, not
+    set\-returning and not volatile \(`pullupSafeTargetCall`\); the built\-in
+    flags come from a new generated registry
+    \(`cmd/gen\-pg\-proc\-data \-flags` → `catalog.BuiltinProcReturnsSet` /
+    `BuiltinProcIsVolatile` / `IsBuiltinProcName`\)\.
+  - Body WHERE sublinks admitted; each pulled conjunct keeps its body
+    context \(`resolveContext.pulledQualCtx`\), which the jointree sublink
+    pull\-up binds against — without it the legacy unnest built a serial
+    anti join with a duplicated join filter\.
+  - Q22: the `cntrycode` grouping now estimates 653 groups \(PG 640\) and
+    elects PG\'s `GroupAggregate \-> Gather Merge \-> Sort \-> NL Anti`;
+    first divergence depth 0 → 6 \(the InitPlan\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
+    TPC\-DS plan change\), regress runner 14 cases — one EXPLAIN change
+    \(join\.sql self\-join test, both EXISTS bodies now semi joins\); 6
+    pulled\-vs\-fenced edge queries equal\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 3 -> 2, sort-strategy 3 -> 2, parameterisation 3 -> 2 (Q22 first divergence depth 0 -> 6)
 - [x] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(

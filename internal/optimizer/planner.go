@@ -419,6 +419,12 @@ type resolveContext struct {
 	// scope's WHERE by planSelect.
 	pulledDerived []*pulledDerivedRel
 	pulledQuals   []Expr
+	// pulledQualCtx maps each top-level conjunct of a pulled body's WHERE
+	// to the body context it was resolved in (M0146-0028f). The jointree
+	// sublink pull-up binds a sublink in that conjunct against it — PG runs
+	// pull_up_sublinks on the subquery before splicing it — because the
+	// body's relations are hidden from the statement's own name lookup.
+	pulledQualCtx map[Expr]*resolveContext
 	// cat threads the catalog through so subexpression rewrites
 	// (currently subquery planning) can recurse into Plan() without
 	// every helper taking it as a separate argument. Populated by
@@ -3916,7 +3922,7 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// search (derivedpullup.go). A pull-up attempt that fails to resolve
 	// leaves no trace — the scope's RTID counter and derived-subtree registry
 	// are restored — and the FROM clause is planned exactly as before.
-	if items, cands, onQuals := expandDerivedPullups(s, derivedPullupOn); cands != nil {
+	if items, cands, onQuals := expandDerivedPullups(s, derivedPullupOn, cat); cands != nil {
 		var next int32
 		var nDerived int
 		if scope != nil {
@@ -4040,11 +4046,11 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 	// A-01(ii) cut 2: carry the statement scope (see lateralCtx above).
 	rctx.rtScope = scope
 	if len(cands) > 0 {
-		rels, quals, ok := resolvePulledDerived(cands, bindings, root.Output(), cat, ps, scope)
+		rels, quals, qualCtx, ok := resolvePulledDerived(cands, bindings, root.Output(), cat, ps, scope)
 		if !ok {
 			return nil, nil, false, nil
 		}
-		rctx.pulledDerived, rctx.pulledQuals = rels, quals
+		rctx.pulledDerived, rctx.pulledQuals, rctx.pulledQualCtx = rels, quals, qualCtx
 		// M0146-0028e: the ON clauses of a split inner join chain resolve
 		// at the statement's level, where every operand (and a pulled
 		// derived operand's alias) is in scope.

@@ -96,7 +96,9 @@ func TestDerivedPullupDeclines(t *testing.T) {
 	for _, q := range []string{
 		"SELECT * FROM (SELECT ax, count(*) FROM a GROUP BY ax) y, b",
 		"SELECT x, y FROM (SELECT ax AS x, ax AS y FROM a) t GROUP BY GROUPING SETS (x, y)", // parent grouping sets (PHV wrap)
-		"SELECT * FROM (SELECT abs(ax) AS k FROM a) y, b",                                   // function call target
+		"SELECT * FROM (SELECT random() AS k FROM a) y, b",                                  // volatile call target
+		"SELECT * FROM (SELECT generate_series(1, ax) AS k FROM a) y, b",                    // set-returning call target
+		"SELECT * FROM (SELECT no_such_fn(ax) AS k FROM a) y, b",                            // unknown call target
 		"SELECT * FROM (SELECT count(ax) AS k FROM a) y, b",                                 // aggregate without GROUP BY
 		"SELECT * FROM (SELECT (SELECT 1) AS k FROM a) y, b",                                // sublink target
 		"SELECT * FROM (SELECT ax AS k, ay AS k FROM a) y, b",                               // duplicate output name          // grouping
@@ -106,7 +108,6 @@ func TestDerivedPullupDeclines(t *testing.T) {
 		"SELECT * FROM (SELECT ax FROM a JOIN c USING (ax)) y, b",                           // USING in body
 		"SELECT * FROM (SELECT ax FROM a NATURAL JOIN c) y, b",                              // NATURAL in body
 		"SELECT * FROM (SELECT ax FROM a JOIN (SELECT cx FROM c) z ON ax = cx) y, b",        // derived join leg
-		"SELECT * FROM (SELECT ax FROM a WHERE ay IN (SELECT dx FROM d)) y, b",              // sublink in body
 		"SELECT * FROM (SELECT ax, ax FROM a) y, b",                                         // duplicate output name
 		"SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay = b.by) y",                     // LATERAL
 	} {
@@ -255,5 +256,40 @@ func TestDerivedPullupInnerJoinOperand(t *testing.T) {
 		if len(rctx.pulledDerived) != 0 {
 			t.Fatalf("%s: pulled up a declined chain", q)
 		}
+	}
+}
+
+// TestDerivedPullupAdmitsSafeCallsAndWhereSublinks pins M0146-0028f: a known,
+// non-volatile, non-set-returning function call in a body target and a
+// sublink in the body WHERE no longer decline (PG's is_simple_subquery
+// refuses only hasTargetSRFs / volatile targets, and pull_up_simple_subquery
+// runs pull_up_sublinks on the body first). Each WHERE conjunct keeps the
+// body context it was resolved in for the jointree sublink pull-up.
+func TestDerivedPullupAdmitsSafeCallsAndWhereSublinks(t *testing.T) {
+	for _, q := range []string{
+		"SELECT * FROM (SELECT abs(ax) AS k FROM a) y, b",
+		"SELECT * FROM (SELECT ax FROM a WHERE ay IN (SELECT dx FROM d)) y, b",
+		"SELECT * FROM (SELECT ax FROM a WHERE NOT EXISTS (SELECT 1 FROM d WHERE dx = ay)) y, b",
+	} {
+		t.Run(q, func(t *testing.T) {
+			stmts, err := parser.Parse(q)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			_, rctx, err := planFromClause(stmts[0].(*parser.SelectStmt), scopeTestCatalog(t), DefaultPlannerSettings(), newRtableScope())
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			if len(rctx.pulledDerived) != 1 {
+				t.Fatalf("pulled %d bodies, want 1", len(rctx.pulledDerived))
+			}
+			for _, q := range rctx.pulledQuals {
+				for _, c := range splitAnd(q) {
+					if rctx.pulledQualCtx[c] == nil {
+						t.Errorf("pulled conjunct %T has no body context", c)
+					}
+				}
+			}
+		})
 	}
 }

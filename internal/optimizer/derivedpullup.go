@@ -72,12 +72,12 @@ type pulledDerivedRel struct {
 // derivedPullupCandidate records one derived item chosen for pull-up while
 // the FROM list is being expanded.
 type derivedPullupCandidate struct {
-	alias    string
-	body     *parser.SelectStmt
-	itemLo   int // first expanded item of the body
-	itemHi   int // one past the last
-	bindLo   int
-	bindHi   int
+	alias  string
+	body   *parser.SelectStmt
+	itemLo int // first expanded item of the body
+	itemHi int // one past the last
+	bindLo int
+	bindHi int
 }
 
 // derivedPullupDisabled is the per-call fallback switch: planFromClause
@@ -119,7 +119,7 @@ func parentFromAdmitsDerivedPullup(s *parser.SelectStmt) bool {
 
 // simpleDerivedPullupBody is the `is_simple_subquery` gate for one FROM item:
 // it returns the body when the item may be pulled up.
-func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, bool) {
+func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.SelectStmt, bool) {
 	rv := it.Base
 	sub := rv.Subquery
 	if sub == nil || len(it.Joins) > 0 || rv.Lateral || rv.Alias == "" || len(rv.Columns) > 0 ||
@@ -172,14 +172,25 @@ func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, bool) {
 			return nil, false
 		}
 		if !collectExprColumnNames(t.Expr, map[string]bool{}) ||
-			parserExprHasNode(reflect.ValueOf(t.Expr), 0, parserNodeIsSelectOrCall) {
+			parserExprHasNode(reflect.ValueOf(t.Expr), 0, func(x any) bool {
+				if fc, ok := x.(*parser.FuncCall); ok {
+					return !pullupSafeTargetCall(fc, cat)
+				}
+				return parserNodeIsSelect(x)
+			}) {
 			return nil, false
 		}
 	}
-	if sub.Where != nil && (!collectExprColumnNames(sub.Where, map[string]bool{}) ||
-		parserExprHasNode(reflect.ValueOf(sub.Where), 0, parserNodeIsSelect)) {
-		return nil, false
-	}
+	// M0146-0028f: a sublink in the body WHERE no longer declines.
+	// pull_up_simple_subquery runs pull_up_sublinks on the subquery before
+	// splicing it (prepjointree.c), so its sublinks reach the parent as
+	// ordinary quals; here the body WHERE is resolved in the body's context
+	// (its correlated references bind to the pulled leaves) and ANDed into
+	// the parent's WHERE, where the statement's own sublink processing
+	// applies to it. Targets and ON clauses keep the decline. The body WHERE
+	// need not be name-enumerable: the only name-based consumer of it,
+	// addPulledBodyColumnNames, turns the needed-column set unknown (no
+	// index-only pruning) when collectStmtColumnNames cannot enumerate it.
 	return sub, true
 }
 
@@ -201,16 +212,44 @@ func pullupPlainRelation(b parser.RangeVar) bool {
 		len(b.Columns) == 0 && !b.GroupedJoinUnaliased && b.Name != ""
 }
 
+// pullupSafeTargetCall is is_simple_subquery's target-list test for one
+// function call (M0146-0028f): PG refuses a subquery whose targets carry an
+// aggregate (hasAggs), a window function (hasWindowFuncs), a set-returning
+// function (hasTargetSRFs) or a volatile function
+// (contain_volatile_functions, prepjointree.c:1926). The call must also be
+// known: a PG built-in (pg_proc.dat, catalog.IsBuiltinProcName) or a
+// registered routine. Flags come from the generated built-in sets
+// (catalog.BuiltinProcReturnsSet / BuiltinProcIsVolatile) and, for routines,
+// from the catalog (ReturnsSet; Volatile "v" or unmarked). Any doubt declines.
+func pullupSafeTargetCall(fc *parser.FuncCall, cat catalog.Catalog) bool {
+	if fc == nil || fc.Over != nil || len(fc.WithinGroup) > 0 || fc.Filter != nil ||
+		fc.Star || fc.Distinct || len(fc.OrderBy) > 0 {
+		return false
+	}
+	if isAggregateFuncName(fc) || isUserAggregateFunc(fc, cat) {
+		return false
+	}
+	name := strings.ToLower(fc.Name.Name)
+	known := catalog.IsBuiltinProcName(name)
+	if catalog.BuiltinProcReturnsSet(name) || catalog.BuiltinProcIsVolatile(name) || pullupVolatileBuiltins[name] {
+		return false
+	}
+	if cat != nil {
+		if rs := cat.Routines(); rs != nil {
+			for _, r := range rs.LookupByName(parser.ObjectName{Name: name}) {
+				known = true
+				if r.ReturnsSet || r.Volatile == "v" || r.Volatile == "" {
+					return false
+				}
+			}
+		}
+	}
+	return known
+}
+
 func parserNodeIsSelect(x any) bool {
 	_, ok := x.(*parser.SelectStmt)
 	return ok
-}
-
-func parserNodeIsSelectOrCall(x any) bool {
-	if _, ok := x.(*parser.FuncCall); ok {
-		return true
-	}
-	return parserNodeIsSelect(x)
 }
 
 // parserExprHasNode reports whether a pointer node matching `want` is
@@ -254,7 +293,7 @@ func parserExprHasNode(v reflect.Value, depth int, want func(any) bool) bool {
 // admitted derived item replaced by its body's FROM items — and the
 // candidates in expanded-item coordinates. With nothing admitted it returns
 // the input list and nil.
-func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parser.FromExpr, []*derivedPullupCandidate, []parser.Expr) {
+func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat catalog.Catalog) ([]parser.FromExpr, []*derivedPullupCandidate, []parser.Expr) {
 	if mode == derivedPullupOff || !parentFromAdmitsDerivedPullup(s) {
 		return s.FromExprs, nil, nil
 	}
@@ -264,7 +303,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 	var onQuals []parser.Expr
 	var flat []parser.FromExpr
 	for _, it := range s.FromExprs {
-		if pieces, ons, ok := splitInnerJoinChainForPullup(it); ok {
+		if pieces, ons, ok := splitInnerJoinChainForPullup(it, cat); ok {
 			flat = append(flat, pieces...)
 			onQuals = append(onQuals, ons...)
 			continue
@@ -274,7 +313,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
 	for _, it := range flat {
-		body, ok := simpleDerivedPullupBody(it)
+		body, ok := simpleDerivedPullupBody(it, cat)
 		if !ok {
 			out = append(out, it)
 			continue
@@ -304,7 +343,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode) ([]parse
 // UNQUALIFIED column reference, because an ON clause sees only its join's
 // inputs while a WHERE qual sees every FROM item — moving `x = 1` could turn
 // a unique name ambiguous or bind it to a later item.
-func splitInnerJoinChainForPullup(it parser.FromExpr) ([]parser.FromExpr, []parser.Expr, bool) {
+func splitInnerJoinChainForPullup(it parser.FromExpr, cat catalog.Catalog) ([]parser.FromExpr, []parser.Expr, bool) {
 	if len(it.Joins) == 0 {
 		return nil, nil, false
 	}
@@ -329,7 +368,7 @@ func splitInnerJoinChainForPullup(it parser.FromExpr) ([]parser.FromExpr, []pars
 		if rv.Lateral || rv.TableFunc != nil || rv.GroupedJoinUnaliased {
 			return nil, nil, false
 		}
-		if _, ok := simpleDerivedPullupBody(parser.FromExpr{Base: rv}); ok {
+		if _, ok := simpleDerivedPullupBody(parser.FromExpr{Base: rv}, cat); ok {
 			anyDerived = true
 		}
 	}
@@ -357,9 +396,10 @@ func parserNodeIsUnqualifiedColumn(x any) bool {
 // give its columns when planned as a separate scope. Any resolution failure,
 // or a duplicate output name, returns ok=false and the caller re-plans
 // without pull-up.
-func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBinding, schema Schema, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) ([]*pulledDerivedRel, []Expr, bool) {
+func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBinding, schema Schema, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) ([]*pulledDerivedRel, []Expr, map[Expr]*resolveContext, bool) {
 	var rels []*pulledDerivedRel
 	var quals []Expr
+	var qualCtx map[Expr]*resolveContext
 	for _, c := range cands {
 		bodyBindings := make([]rangeBinding, 0, c.bindHi-c.bindLo)
 		for _, b := range bindings[c.bindLo:c.bindHi] {
@@ -375,15 +415,15 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		for _, t := range c.body.Targets {
 			e, err := resolveExpr(t.Expr, bodyCtx)
 			if err != nil {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			if e, err = foldQualConstants(e); err != nil {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			name, _ := targetMeta(e, t)
 			key := strings.ToLower(name)
 			if seen[key] {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			seen[key] = true
 			rel.names = append(rel.names, name)
@@ -392,19 +432,27 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		if c.body.Where != nil {
 			q, err := resolveExpr(canonicalizeQual(c.body.Where), bodyCtx)
 			if err != nil {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			// The same constant folding the parent's own WHERE gets
 			// (planSelect): a range bound written `1195 + 11` must reach
 			// the estimator as a constant.
 			if q, err = foldQualConstants(q); err != nil {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			quals = append(quals, q)
+			// M0146-0028f: remember the body context per conjunct for the
+			// jointree sublink pull-up (resolveContext.pulledQualCtx).
+			if qualCtx == nil {
+				qualCtx = map[Expr]*resolveContext{}
+			}
+			for _, conj := range splitAnd(q) {
+				qualCtx[conj] = bodyCtx
+			}
 		}
 		rels = append(rels, rel)
 	}
-	return rels, quals, true
+	return rels, quals, qualCtx, true
 }
 
 // resolvePulledDerivedColumn is resolveColumnRefAt's arm for pulled-up

@@ -1,6 +1,6 @@
 # M0146-0028 — pulling simple FROM-clause subqueries into the parent search
 
-Status: slices 1 and 2 landed 2026-09-28 (§7 for slice 2). Code: `internal/optimizer/derivedpullup.go`
+Status: slices 1–6 landed 2026-09-28 (§7–§11 for slices 2–6). Code: `internal/optimizer/derivedpullup.go`
 and hooks in `planner.go`. Evidence: `analysis/m0146/m0146-0028/`.
 
 ## 1. The gap
@@ -200,3 +200,57 @@ Movement: none. No TPC body has this shape, and regress join.sql's derived
 join operands are almost all LEFT JOINs (a PlaceHolderVar case) or
 `SELECT *` bodies. Regress runner: 25 cases, 0 changed. The most frequent
 unsupported shape in regress is now the `SELECT *` body.
+
+## 11. Slice 6 (M0146-0028f, 2026-09-28): function-call targets and body-WHERE sublinks
+
+Witness: TPC-H Q22. Its `custsale` body has the target `substr(c_phone, 1, 2)`
+and two WHERE sublinks: an uncorrelated scalar comparison and a correlated
+NOT EXISTS. goopg planned it as a derived leaf. The grouping key `cntrycode`
+was then an output column with no source table, and its group count fell to
+the default 200. PG pulls the body up and counts the groups from the Vars
+of `substr(c_phone, 1, 2)`, which gives 640. The split partial aggregate won
+in goopg on that estimate.
+
+- **Function-call targets.** PG's `is_simple_subquery` refuses a target list
+  with `hasTargetSRFs` or volatile functions (`contain_volatile_functions`),
+  besides aggregates and window functions. goopg's built-in functions have
+  no pg_proc rows carrying those flags. The generator `cmd/gen-pg-proc-data`
+  gains `-flags`, which emits three name sets from PG 18.3's `pg_proc.dat`
+  into `internal/catalog/builtin_proc_flags_gen.go`:
+  - every proname;
+  - names with a `proretset` overload;
+  - names with a `provolatile = 'v'` overload. An absent `provolatile` is
+    `'i'`, per `BKI_DEFAULT(i)` in pg_proc.h.
+
+  A test re-runs the generator and compares its output with the committed
+  file. `pullupSafeTargetCall` admits a call only if it is known (a built-in
+  or a registered routine), is not an aggregate, window or DISTINCT/ORDER
+  BY call, and is neither set-returning nor volatile. Registered routines
+  are judged by `ReturnsSet` and `Volatile`, with an unmarked routine
+  counting as volatile.
+- **Body-WHERE sublinks.** `pull_up_simple_subquery` runs `pull_up_sublinks`
+  on the subquery before splicing it. goopg resolves the body WHERE in the
+  body's own context, where the body's relations are visible, and ANDs it
+  into the statement's WHERE. The jointree sublink pull-up
+  (`pullUpSublinksIntoJointree`) re-binds each sublink's retained parse tree
+  against a context. The statement context hides the body's relations, so a
+  correlated reference like `c_custkey` failed there. Each pulled conjunct
+  now records its body context (`resolveContext.pulledQualCtx`), and the
+  pull-up binds that conjunct's sublink against it. The body context is
+  built over the statement's schema, so the coordinates agree. Before this,
+  the conjunct fell to the legacy post-hoc unnest, which built a serial
+  anti join with the correlation qual duplicated in its join filter.
+- **Still declined:** sublinks in targets and ON clauses, and
+  `pullupVolatileBuiltins`' partial list in the other pull-up gates (both
+  ledgered).
+
+Movement: Q22 estimates 653 groups (PG 640) and elects PG's `GroupAggregate
+-> Gather Merge -> Sort -> Nested Loop Anti Join`. Its first divergence moves
+from depth 0 to depth 6: PG plans the InitPlan as a parallel aggregate.
+TPC-H `aggregation-strategy`, `sort-strategy` and `parameterisation` each
+drop by 1. TPC-DS plans are unchanged at both scales. In the regress runner
+(14 cases), one EXPLAIN changes against HEAD: join.sql's self-join test,
+whose two EXISTS-bearing derived operands now pull up as semi joins, as in
+PG. Six pulled-versus-fenced (`OFFSET 0`) edge queries (EXISTS, NOT EXISTS,
+IN, NOT IN, scalar, function targets) return equal results. Evidence:
+`analysis/m0146/m0146-0028/slice6/`.

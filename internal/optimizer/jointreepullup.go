@@ -202,13 +202,22 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	var pu *jtPullup
 	for _, c := range splitAnd(pred) {
+		// M0146-0028f: a conjunct of a pulled-up FROM subquery's WHERE binds
+		// its sublinks against the body's context, whose relations the
+		// statement's own lookup hides (pull_up_simple_subquery runs
+		// pull_up_sublinks on the subquery first). Same coordinates: the
+		// body context is built over this scope's schema.
+		bindCtx := ctx
+		if bc, ok := ctx.pulledQualCtx[c]; ok {
+			bindCtx = bc
+		}
 		// M0145-0003 ANY arm: `x IN (SELECT y FROM …)` is the other half
 		// of PG's pull-up scope (`pull_up_sublinks_qual_recurse` converts
 		// ANY_SUBLINK at prepjointree.c:665 and EXISTS_SUBLINK at :731).
 		// The decline census measured it as 34 of the 45 unpulled sublink
 		// conjuncts on TPC-DS SF0.25 — the dominant miss.
 		if in, okIn := anyPullupConjunct(c); okIn {
-			body, reason, okBody := pullUpAnyBody(in, ctx, cat, ps, 0)
+			body, reason, okBody := pullUpAnyBody(in, bindCtx, cat, ps, 0)
 			if !okBody {
 				notePullupDecline(reason)
 				continue
@@ -236,7 +245,7 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 			}
 			continue
 		}
-		body, reason, ok := pullUpExistsBody(ex, negated, ctx, cat, ps, 0)
+		body, reason, ok := pullUpExistsBody(ex, negated, bindCtx, cat, ps, 0)
 		if !ok {
 			notePullupDecline(reason)
 			continue
