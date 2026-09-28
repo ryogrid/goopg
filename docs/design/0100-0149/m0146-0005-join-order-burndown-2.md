@@ -389,3 +389,25 @@ Q59 and Q93; only Q2 and Q59 have a sibling FROM item, so only they can
 change join order (Q2 currently diverges earlier). TPC-H Q7/Q8/Q9 are
 unaffected — their lone FROM subquery already holds every relation. Filed as
 M0146-0028. Movement: none — routing recon.
+
+## Slice 31: M0146-0005ae — expression group keys carry their emission order
+
+After M0146-0028b pulled up TPC-H Q7/Q8's lone FROM subqueries, both queries'
+first divergence was the very top: PG ends in the `GroupAggregate` (its
+output is already in `ORDER BY` order), goopg added a `Sort` on the same
+keys. Pre-existing and not pull-up specific: `SELECT a % 3, count(*) … GROUP
+BY 1 ORDER BY 1` on a sorted aggregate also re-sorted. Both emission-order
+twins — `aggregateEmissionPathkeys` (finished `*Aggregate`,
+upperorderedinput.go) and `groupingEmissionPathkeys` (`PathAgg`,
+upperorderedgrouping.go) — accepted bare-column group keys only ("only a
+column has a name"). The claim they publish names the OUTPUT POSITION of the
+key, and the ORDERED step matches it with `exprEqual`, whose ColumnRef
+identity is `Index` alone (names excluded, exprwalk.go). So an expression key
+whose child sort key is the same expression is as sound as a column key.
+Both twins now admit it together; the output-name check stays for column
+keys. PG needs no such argument: its pathkey is the key's EquivalenceClass.
+
+Movement: TPC-H PLAN-PARITY match 7 → 8 (Q7 = PG); Q8's first divergence
+advances from depth 0 to depth 9 (`lineitem_part_supp_fkidx` Index Scan vs
+goopg's Bitmap Heap Scan). TPC-H `join-order` 12 → 11, `join-method` 6 → 4,
+`sort-strategy` 8 → 6, `parallelism` 9 → 7. TPC-DS unchanged.

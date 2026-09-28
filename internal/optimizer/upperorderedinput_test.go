@@ -371,7 +371,7 @@ func TestAggregateEmissionPathkeysDeclinesTheSameShapesAsItsPathTwin(t *testing.
 				{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}},
 			}}
 		}},
-		{"a non-ColumnRef group expression cannot be named", func(a *Aggregate) {
+		{"an expression group key the child does not sort on", func(a *Aggregate) {
 			a.GroupExprs = []Expr{&BinaryOp{}}
 		}},
 		{"the output position does not carry the group key's name", func(a *Aggregate) {
@@ -560,5 +560,25 @@ func TestRelabelPathkeysToTruncatesRatherThanGuessing(t *testing.T) {
 	}
 	if got := relabelPathkeysTo(nil, out); got != nil {
 		t.Fatal("no claim must stay no claim")
+	}
+}
+
+// TestAggregateEmissionPathkeysClaimsAnExpressionGroupKey is M0146-0005ae: a
+// sorted aggregate over an EXPRESSION group key (TPC-H Q7/Q8's `EXTRACT(year
+// FROM …)`) emits in that key's order exactly as over a column key, so the
+// ORDER BY on it needs no second Sort — PG's pathkey is the key's
+// EquivalenceClass either way. The claim names the output position.
+func TestAggregateEmissionPathkeysClaimsAnExpressionGroupKey(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	expr := &BinaryOp{Op: parser.OpMod, Left: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}, Right: &IntegerConst{Value: 3}}
+	agg.GroupExprs = []Expr{expr}
+	agg.Child.(*Sort).Keys = []SortKey{{Expr: expr}}
+	agg.schema[0].Name = "?column?"
+	got := inputNodePathkeys(agg)
+	if len(got) != 1 {
+		t.Fatalf("an expression group key sorted by its child is an emission order: got %d keys", len(got))
+	}
+	if cr, ok := got[0].Expr.(*ColumnRef); !ok || cr.Index != 0 || !got[0].SortAsc {
+		t.Fatalf("claim must be output position 0 ascending, got %+v", got[0])
 	}
 }

@@ -509,15 +509,22 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	clause := groupClauseKeys(agg)
 	for j, k := range clause {
 		g := groups[k.Pos]
-		// Bare group keys only: the output side names positions, and only a
-		// column has a name. Both sides are input-coordinate here, so
-		// `exprEqual`'s positional `Index` equality is the match.
-		if _, ok := g.(*ColumnRef); !ok {
-			return nil
-		}
+		// Both sides are input-coordinate here, so `exprEqual`'s positional
+		// `Index` equality (names are not part of its key) is the match —
+		// for a bare column and for an expression key alike.
 		keyExpr, _, _ := childKeyAt(j)
 		if !exprEqual(keyExpr, g) {
 			return nil
+		}
+		if _, ok := g.(*ColumnRef); !ok {
+			// M0146-0005ae: an EXPRESSION group key (`GROUP BY
+			// EXTRACT(year FROM l_shipdate)`) is emitted at output
+			// position k.Pos exactly as a column key is — the aggregate's
+			// output there IS the key's value — and the claim below names
+			// that position by Index, which is all the ORDERED step's
+			// exprEqual reads. PG's pathkey is the key's EquivalenceClass
+			// either way (TPC-H Q7/Q8: no Sort above the GroupAggregate).
+			continue
 		}
 		// An empty name is a column nobody can address by name, so the claim
 		// cannot be confirmed and stops there.

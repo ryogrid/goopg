@@ -22832,6 +22832,21 @@ M0146-0001 re-baseline census on the new default arm.
     item\); Q51/Q93/TPC\-H Q7\-Q9 are lone FROM items and unaffected\.
     Filed M0146\-0028\.
   Movement: none — routing recon
+- [x] **M0146\-0005ae — expression group keys carry their emission order**
+  \(slice 31, impl, filed and done 2026\-09\-28 from the post\-M0146\-0028b
+  TPC\-H census\): a sorted aggregate over `EXTRACT\(year …\)` did not
+  claim its output order, so TPC\-H Q7/Q8 re\-sorted on the same keys above
+  the GroupAggregate\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 31"\.
+  Kind: impl
+  Parent: M0146-0005
+  - Both twins \(`aggregateEmissionPathkeys`, `groupingEmissionPathkeys`\)
+    admit an expression key whose child sort key is the same expression;
+    the claim names the output position, which is all `exprEqual` reads\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(no TPC\-DS change\)\.
+  Movement: yes — TPC-H PLAN-PARITY match 7 -> 8 (Q7), CATEGORIES-EXCL-MATCH sort-strategy 8 -> 6, join-method 6 -> 4
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
