@@ -1,0 +1,28 @@
+=== Q48
+                                                                                                                                                                                                                                                                                                                                                                                 QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=7801.82..7801.83 rows=1 width=4)
+   ->  Gather  (cost=2002.14..7801.80 rows=1 width=2060)
+         Workers Planned: 3
+         ->  Nested Loop  (cost=2.15..17980.59 rows=1 width=1044)
+               ->  Nested Loop  (cost=1.77..17951.36 rows=11 width=896)
+                     ->  Hash Join  (cost=1.52..17899.23 rows=135 width=508)
+                           Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                           ->  Nested Loop  (cost=0.25..17897.47 rows=142 width=504)
+                                 ->  Parallel Seq Scan on store_sales  (cost=0.00..16417.27 rows=29807 width=428)
+                                       Filter: (((((ss_sales_price >= 100.00) AND (ss_sales_price <= 150.00)) OR ((ss_sales_price >= 50.00) AND (ss_sales_price <= 100.00))) OR ((ss_sales_price >= 150.00) AND (ss_sales_price <= 200.00))) AND ((((ss_net_profit >= 0) AND (ss_net_profit <= 2000)) OR ((ss_net_profit >= 150) AND (ss_net_profit <= 3000))) OR ((ss_net_profit >= 50) AND (ss_net_profit <= 25000))))
+                                 ->  Memoize  (cost=0.25..0.40 rows=1 width=420)
+                                       Cache Key: store_sales.ss_sold_date_sk
+                                       ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.40 rows=1 width=420)
+                                             Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                             Filter: (d_year = 2001)
+                           ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=676)
+                     ->  Index Scan using customer_address_pkey on customer_address  (cost=0.25..0.37 rows=1 width=388)
+                           Index Cond: (ca_address_sk = store_sales.ss_addr_sk)
+                           Filter: (((ca_country = 'United States') AND (((ca_state = ANY ('ND', 'NY', 'SD')) OR (ca_state = ANY ('MD', 'GA', 'KS'))) OR (ca_state = ANY ('CO', 'MN', 'NC')))) AND (((((ca_state = ANY ('ND', 'NY', 'SD')) AND (store_sales.ss_net_profit >= 0)) AND (store_sales.ss_net_profit <= 2000)) OR (((ca_state = ANY ('MD', 'GA', 'KS')) AND (store_sales.ss_net_profit >= 150)) AND (store_sales.ss_net_profit <= 3000))) OR (((ca_state = ANY ('CO', 'MN', 'NC')) AND (store_sales.ss_net_profit >= 50)) AND (store_sales.ss_net_profit <= 25000))))
+               ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.38..2.64 rows=1 width=148)
+                     Index Cond: (cd_demo_sk = store_sales.ss_cdemo_sk)
+                     Filter: (((((cd_marital_status = 'S') AND (cd_education_status = 'Secondary')) OR ((cd_marital_status = 'M') AND (cd_education_status = '2 yr Degree'))) OR ((cd_marital_status = 'D') AND (cd_education_status = 'Advanced Degree'))) AND ((((((cd_marital_status = 'S') AND (cd_education_status = 'Secondary')) AND (store_sales.ss_sales_price >= 100.00)) AND (store_sales.ss_sales_price <= 150.00)) OR ((((cd_marital_status = 'M') AND (cd_education_status = '2 yr Degree')) AND (store_sales.ss_sales_price >= 50.00)) AND (store_sales.ss_sales_price <= 100.00))) OR ((((cd_marital_status = 'D') AND (cd_education_status = 'Advanced Degree')) AND (store_sales.ss_sales_price >= 150.00)) AND (store_sales.ss_sales_price <= 200.00))))
+(22 rows)
+
+

@@ -22979,6 +22979,22 @@ M0146-0001 re-baseline census on the new default arm.
     introduced\), regress runner 10 cases: limit\.sql error fixed, one
     PG\-ward Sort removal\.
   Movement: yes — TPC-DS CATEGORIES-EXCL-MATCH rendering SF0.25 24 -> 21, SF1 20 -> 17; SF1 Q52 near-tie flip (join-method/aggregation-strategy/sort-strategy +1 each)
+- [x] **M0146\-0005al — the probe\-Filter rule sees `= ANY \(list\)` operands**
+  \(slice 38, impl, filed and done 2026\-09\-29 from the TPC\-DS SF0\.25
+  census, Q48\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 38"\.
+  Kind: impl
+  Parent: M0146-0005
+  - Q48\'s only divergence was its `customer\_address` OR clause kept as a
+    Join Filter: `innerParamQual` walked conjuncts with the shallow
+    `WalkExprTree`, which treats an `InExpr` as a leaf, so the
+    `ca\_state = ANY \(...\)` inner reads were invisible\.
+  - `optimizer.WalkExprHostScope` \(exhaustive `walkExprRefs`, fail\-closed on
+    unknown kinds\) now classifies each conjunct\.
+  - Gates: units, tpch\-spotcheck \(Q12=2 Q13=33\), sf025 96/96, TPC\-H arm
+    24/24, fire set \(Q13 Q48, none introduced\), regress runner 10 cases 0
+    changed vs HEAD \(timing only\)\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 16 -> 17 (Q48), CATEGORIES-EXCL-MATCH qual-placement 17 -> 15; SF1 and TPC-H unchanged
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

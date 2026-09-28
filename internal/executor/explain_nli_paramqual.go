@@ -75,9 +75,12 @@ func innerParamQual(n optimizer.Node) optimizer.Expr {
 		if isInnerOuterColumnEquality(c, outerW) {
 			return nil
 		}
+		// The host-scope walk reaches an `= ANY (list)` operand, which the
+		// shallow WalkExprTree does not (TPC-DS Q48's `ca_state = ANY
+		// (...)` arms read as outer-only and kept the clause on the join).
 		readsInner := false
 		withinParams := true
-		optimizer.WalkExprTree(c, func(x optimizer.Expr) {
+		enumerated := optimizer.WalkExprHostScope(c, func(x optimizer.Expr) {
 			if cr, ok := x.(*optimizer.ColumnRef); ok {
 				if cr.Index >= outerW {
 					readsInner = true
@@ -87,7 +90,7 @@ func innerParamQual(n optimizer.Node) optimizer.Expr {
 				}
 			}
 		})
-		if !readsInner || !withinParams {
+		if !enumerated || !readsInner || !withinParams {
 			return nil
 		}
 	}

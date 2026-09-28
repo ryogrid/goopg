@@ -13,6 +13,18 @@ func WalkPlanExprs(n Node, fn func(Expr)) { walkPlanExprs(n, fn) }
 // Same sublink caveat as WalkPlanExprs.
 func WalkExprTree(e Expr, fn func(Expr)) { walkExprTree(e, fn) }
 
+// WalkExprHostScope invokes fn on e and every sub-expression evaluated in
+// e's own scope, enumerating every expression kind exprChildSlots knows —
+// an IN / = ANY list's operand and elements included, which WalkExprTree
+// treats as a leaf. Inner plans are stepped over. It returns false when e
+// holds a kind the enumeration does not cover; a caller classifying the
+// expression must then treat it as unknown (fail-closed).
+func WalkExprHostScope(e Expr, fn func(Expr)) bool {
+	return walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool { fn(x); return true },
+	})
+}
+
 // CloneExprReplacingColumnRefs returns a CLONE of e with every ColumnRef
 // for which replace returns non-nil substituted by that replacement.
 //

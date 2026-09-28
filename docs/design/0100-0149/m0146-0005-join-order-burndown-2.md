@@ -684,3 +684,37 @@ Found on the way and filed as S2, not fixed: **M0146-0034**. `Limit ->
 Gather -> Parallel Index Scan` returns rows in scheduling order: `ORDER BY
 d_date_sk LIMIT 1` gives the wrong first row in 6 of 12 runs on HEAD. Evidence:
 `analysis/m0146/m0146-0005/slice37/`.
+
+## Slice 38: M0146-0005al — the probe-Filter rule sees `= ANY (list)` operands
+
+TPC-DS Q48 differed from PG in one category only, `qual-placement`. The
+`customer_address` probe's OR clause
+
+```
+((ca_state = ANY ('ND','NY','SD')) AND ss_net_profit >= 0 AND ...) OR ...
+```
+
+stayed on the nested loop as a `Join Filter`, where PG prints it in the
+inner index scan's `Filter` (its `ppi_clauses`, slice 36). The one level
+higher `customer_demographics` join, whose clause has no IN list, already
+rendered the PG way.
+
+- **Cause.** `innerParamQual` classified each conjunct with the shallow
+  `WalkExprTree`, which treats an `InExpr` as a leaf. Every inner read in
+  this clause sits inside a `ca_state = ANY (...)` operand, so the clause
+  looked outer-only (it reads only `ss_net_profit` otherwise) and the rule
+  declined.
+- **Fix.** New `optimizer.WalkExprHostScope` exposes the exhaustive
+  `walkExprRefs` driver (`exprChildSlots`, `scopeIgnore`), which visits an
+  IN node's operand and list. It returns false on an unenumerated
+  expression kind, and `innerParamQual` then keeps the clause on the join
+  (fail-closed). The display rewrite `renderedParamQual` already used the
+  exhaustive cloner, so the moved clause renders correctly without change.
+- **Test.** `TestInnerParamQualSeesInListOperand` (fails before the fix).
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 16 → 17 (Q48 now matches PG),
+`qual-placement` 17 → 15 (Q48, Q13). At SF1 the Q48 and Q13 plans change the
+same way, but other divergences come first there, so the counts do not move.
+TPC-H is unchanged (match 9). In the regress runner (10 EXPLAIN-heavy cases,
+HEAD-built baseline) no output differs except `Build Time` timing. Evidence:
+`analysis/m0146/m0146-0005/slice38/`.

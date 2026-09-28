@@ -78,3 +78,40 @@ func TestInnerParamQualPlacement(t *testing.T) {
 		t.Error("a non-parameterized nested loop keeps its Join Filter")
 	}
 }
+
+// TestInnerParamQualSeesInListOperand pins the TPC-DS Q48 case: a residual
+// whose only inner reads sit in `col = ANY (list)` operands still reads the
+// inner relation, so it renders under the probe as PG's ppi_clauses do. The
+// shallow expression walker treated the IN node as a leaf and kept the
+// clause on the join.
+func TestInnerParamQualSeesInListOperand(t *testing.T) {
+	outer := optimizer.SeqScanWithSchemaForTest(parallelLabelTestTable(t, "o"), optimizer.Schema{{Name: "a"}})
+	inner := &optimizer.IndexScan{Table: parallelLabelTestTable(t, "i"),
+		Key:  &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1},
+		Cond: &optimizer.BinaryOp{Op: parser.OpGt, Left: &optimizer.ColumnRef{Index: 0, Name: "s", SourceTableIdx: 2}, Right: &optimizer.IntegerConst{Value: 0}}}
+	outerCol := &optimizer.ColumnRef{Index: 0, Name: "a", SourceTableIdx: 1}
+	innerCol := &optimizer.ColumnRef{Index: 1, Name: "s", SourceTableIdx: 2}
+	arm := func(lo int64) optimizer.Expr {
+		return &optimizer.BinaryOp{Op: parser.OpAnd,
+			Left:  &optimizer.InExpr{Operand: innerCol, List: []optimizer.Expr{&optimizer.IntegerConst{Value: lo}, &optimizer.IntegerConst{Value: lo + 1}}},
+			Right: &optimizer.BinaryOp{Op: parser.OpGe, Left: outerCol, Right: &optimizer.IntegerConst{Value: lo}}}
+	}
+	orQual := &optimizer.BinaryOp{Op: parser.OpOr, Left: arm(0), Right: arm(10)}
+	nli := &optimizer.NestedLoopIndexJoin{Type: optimizer.JoinTypeInner, Outer: outer, Inner: inner, Predicate: orQual}
+	q := renderedParamQual(nli)
+	if q == nil {
+		t.Fatal("a residual reading the inner only inside IN operands must render under the probe")
+	}
+	var in *optimizer.InExpr
+	optimizer.WalkExprTree(q, func(x optimizer.Expr) {
+		if e, ok := x.(*optimizer.InExpr); ok && in == nil {
+			in = e
+		}
+	})
+	if in == nil {
+		t.Fatal("rendered qual lost its IN arm")
+	}
+	if _, ok := in.Operand.(*optimizer.ColumnRef); !ok {
+		t.Errorf("the IN operand is an inner column and must stay a scan column, got %T", in.Operand)
+	}
+}
