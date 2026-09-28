@@ -1,0 +1,8 @@
+## baseline
+                                       Join Filter: (store_sales.ss_customer_sk = store_returns.sr_customer_sk)
+                                             Index Cond: (ss_item_sk = store_returns.sr_item_sk AND ss_ticket_number = store_returns.sr_ticket_number)
+## candidate
+                                             Index Cond: (ss_item_sk = store_returns.sr_item_sk AND ss_ticket_number = store_returns.sr_ticket_number)
+## candidate-pg
+                                             Index Cond: ((ss_item_sk = store_returns.sr_item_sk) AND (ss_ticket_number = store_returns.sr_ticket_number))
+                                             Filter: (store_returns.sr_customer_sk = ss_customer_sk)

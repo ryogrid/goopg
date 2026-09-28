@@ -600,7 +600,7 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
-			if q := renderedParamQual(n); q != nil {
+			if q, moved := renderedParamQual(n); moved {
 				walkPlanFiltered(c, childIndent, rows, opts, q, c, reg)
 				continue
 			}
@@ -1534,8 +1534,10 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// same class of blind spot `Hash Cond:` itself closed at P2.1.
 		// M0146-0005aj: a parameterized nested loop's residual renders
 		// under its inner scan (explain_nli_paramqual.go).
-		if jf := formatJoinFilter(p, reg, qualify); jf != "" && renderedParamQual(p) == nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
+		if _, moved := renderedParamQual(p); !moved {
+			if jf := formatJoinFilter(p, reg, qualify); jf != "" {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
+			}
 		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
@@ -1549,7 +1551,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// csq-S6). Render it as a Filter: line, house style.
 		// M0146-0005aj: a residual that is the probe's ppi_clauses renders
 		// under the inner scan instead (explain_nli_paramqual.go).
-		if p.Predicate != nil && renderedParamQual(p) == nil {
+		if _, moved := renderedParamQual(p); p.Predicate != nil && !moved {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(p.Predicate, reg, qualify)))})
 		}
 		if attachedFilter != nil {
@@ -3010,10 +3012,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// from the join node's own stats.joinFilterRejected. Mirrors
 		// PG's show_instrumentation_count (nfiltered1 for joinqual
 		// rejects, per-loop average). Zero suppressed in text mode.
-		nliMoved := false
-		if renderedParamQual(n) != nil {
-			nliMoved = true // counted on the inner scan instead
-		}
+		_, nliMoved := renderedParamQual(n) // counted on the inner scan instead
 		if s, ok := stats[n]; ok && s != nil && s.joinFilterRejected > 0 && s.loops > 0 && !nliMoved {
 			avg := float64(s.joinFilterRejected) / float64(s.loops)
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Join Filter: %.0f", avg))})
@@ -3165,7 +3164,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
-			if q := renderedParamQual(n); q != nil {
+			if q, moved := renderedParamQual(n); moved {
 				// The residual's rejections are the inner scan's
 				// `Rows Removed by Filter` (M0146-0005aj).
 				var removed int64

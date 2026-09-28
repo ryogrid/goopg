@@ -1,0 +1,42 @@
+2785d2784
+<   Filter: (t1.a = t2.a)
+2807c2806
+< (29 rows)
+---
+> (28 rows)
+3165d3163
+<   Filter: (t1.a = t2.a)
+3174c3172
+< (13 rows)
+---
+> (12 rows)
+3185d3182
+<   Filter: (t1.a = t2.a)
+3196c3193
+< (15 rows)
+---
+> (14 rows)
+3207d3203
+<   Filter: (t1.a = t2.a)
+3221c3217
+< (18 rows)
+---
+> (17 rows)
+3659d3654
+<   Filter: (t1.id = t2.id)
+3669c3664
+< (14 rows)
+---
+> (13 rows)
+3714d3708
+<   Filter: (t1.id = t2.id)
+3719c3713
+< (8 rows)
+---
+> (7 rows)
+3743d3736
+<   Filter: (t1.id = t2.id)
+3748c3741
+< (8 rows)
+---
+> (7 rows)

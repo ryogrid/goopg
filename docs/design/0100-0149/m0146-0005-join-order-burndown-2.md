@@ -718,3 +718,53 @@ same way, but other divergences come first there, so the counts do not move.
 TPC-H is unchanged (match 9). In the regress runner (10 EXPLAIN-heavy cases,
 HEAD-built baseline) no output differs except `Build Time` timing. Evidence:
 `analysis/m0146/m0146-0005/slice38/`.
+
+## Slice 39: M0146-0005am — PG's ppi_clauses rules for equalities in a probe's residual
+
+Slice 36 kept every residual containing an `inner = outer` column equality on
+the join, on the theory that an equivalence-class clause is always a Join
+Filter (TPC-H Q9/Q21). The TPC-DS SF0.25 census shows PG does two other
+things with such equalities:
+
+- **Q84**: goopg printed `Join Filter: (customer.c_current_cdemo_sk =
+  customer_demographics.cd_demo_sk)` above a probe whose Index Cond is
+  `cd_demo_sk = customer.c_current_cdemo_sk`. PG prints the clause nowhere:
+  `generate_join_implied_equalities` yields one clause per class for the
+  parameterized rel, and the index consumes it.
+- **Q50**: `sr_customer_sk = ss_customer_sk` belongs to a class the
+  `store_sales_pkey` probe does not use, and store_returns is in the probe's
+  `required_outer`. PG puts it in `ppi_clauses`, so it prints as the probe's
+  `Filter`.
+- **Q9/Q21** differ from Q50 only because their equality names a relation
+  outside `required_outer` (supplier, orders), and the existing
+  `probeRelations` test already keeps those on the join.
+
+The rule (`paramQualPlacement`, replacing `innerParamQual`) now classifies each
+conjunct:
+
+1. `restatesProbeKey`: an `inner.col = outer.x` equality where the probe binds
+   index column `col` to the same outer column (`probeKeyEqualities` pairs
+   `Key` / `Keys` (+ `SkipPrefix`) / `RangePrefix` with index columns the
+   way `formatIndexCond` does) is dropped from the rendering.
+2. Otherwise the conjunct must read the inner relation and stay within
+   `required_outer` (the host-scope walk from slice 38), equality or not.
+3. Any conjunct failing (2) keeps the whole residual on the join.
+
+`renderedParamQual` returns `(qual, moved)`. A moved residual with no
+remaining conjunct prints nothing on either line. The residual is still
+evaluated in full by the executor (the dropped conjunct is implied by the
+probe, so it never rejects a row), so ANALYZE's rejection count is
+unaffected.
+
+Movement: TPC-DS `qual-placement` 15 → 13 at SF0.25 (Q50, Q84) and 18 → 17
+at SF1. Q17/Q25 and SF1 Q37 lose a key-restating Join Filter the same way.
+TPC-H filter lines are byte-identical (Q9/Q21 keep theirs). In the regress
+runner, seven `Filter: (t1.a = t2.a)` / `(t1.id = t2.id)` lines disappear from
+join.sql's self-join-elimination EXPLAINs. They restated the probe's own
+Index Cond, and PG prints none of them. Evidence:
+`analysis/m0146/m0146-0005/slice39/`.
+
+Ledgered: the moved equality keeps its written operand order. PG builds it
+outer member first (`build_implied_join_equality(outer_em, inner_em)`), so
+Q50 renders `(ss_customer_sk = store_returns.sr_customer_sk)` against PG's
+`(store_returns.sr_customer_sk = ss_customer_sk)`.

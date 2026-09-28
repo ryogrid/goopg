@@ -23,7 +23,13 @@ import (
 // renderers attribute it to the inner scan when:
 //
 //   - every conjunct reads the inner relation (a conjunct naming only outer
-//     columns is not movable into the inner rel and would stay a join qual);
+//     columns is not movable into the inner rel and would stay a join qual)
+//     and names nothing outside the probe's required_outer;
+//   - a conjunct that restates an index key's equality (`inner.k = outer.x`
+//     where the probe binds k to x) is enforced by the Index Cond and prints
+//     nowhere — PG generates one clause per equivalence class for the
+//     parameterized rel and removes the one the index consumes (TPC-DS
+//     Q84's `c_current_cdemo_sk = cd_demo_sk`);
 //   - the inner is a bare parameterized scan (IndexScan / BitmapHeapScan /
 //     IndexOnlyScan) with no Memoize between — with a cache, the residual
 //     runs ABOVE the cache here, while PG would key the cache on the extra
@@ -48,33 +54,37 @@ func paramJoinParts(n optimizer.Node) (pred optimizer.Expr, outer, inner optimiz
 	return nil, nil, nil, false, false
 }
 
-// innerParamQual returns n's residual when it renders as the inner scan's
-// Filter, else nil (it then stays on the join line).
-func innerParamQual(n optimizer.Node) optimizer.Expr {
+// paramQualPlacement decides where n's residual renders. moved is false
+// when it stays on the join line (Join Filter / the NLI's Filter). When
+// moved, probe is what renders under the inner scan — nil when every
+// conjunct restates an index key equality and nothing is left to print.
+func paramQualPlacement(n optimizer.Node) (probe optimizer.Expr, moved bool) {
 	pred, outer, inner, memo, ok := paramJoinParts(n)
 	if !ok || pred == nil || memo || outer == nil {
-		return nil
+		return nil, false
 	}
 	switch inner.(type) {
 	case *optimizer.IndexScan, *optimizer.BitmapHeapScan, *optimizer.IndexOnlyScan:
 	default:
-		return nil
+		return nil, false
 	}
 	outerW := len(outer.Output())
 	probeRels := probeRelations(inner, outer)
+	keyEqs := probeKeyEqualities(inner)
+	var kept []optimizer.Expr
 	for _, c := range splitAndExpr(pred) {
-		// An inner = outer column equality is an equivalence-class clause:
-		// PG's ppi_clauses carry ONE clause per equivalence class
-		// (generate_join_implied_equalities for the inner rel, the one the
-		// index probe uses), and the join re-checks any other member pair
-		// as a Join Filter — TPC-H Q9's `supplier.s_suppkey =
-		// lineitem.l_suppkey`, Q21's `orders.o_orderkey = l2.l_orderkey`.
-		// A residual that carries one stays on the join whole: the
-		// executor keeps one rejection counter, so a split rendering
-		// could not report both lines' counts honestly (ledgered).
-		if isInnerOuterColumnEquality(c, outerW) {
-			return nil
+		if restatesProbeKey(c, keyEqs, outerW, outer) {
+			continue
 		}
+		// An inner = outer equality is a join clause of its equivalence
+		// class. PG's ppi_clauses carry the class's clause for the inner
+		// rel against required_outer (TPC-DS Q50's `sr_customer_sk =
+		// ss_customer_sk` prints as the store_sales probe's Filter); a
+		// member pair naming a relation outside required_outer is checked
+		// at the join (TPC-H Q9's `supplier.s_suppkey =
+		// lineitem.l_suppkey` over a lineitem probe parameterized by
+		// partsupp), which the required_outer test below keeps there.
+		//
 		// The host-scope walk reaches an `= ANY (list)` operand, which the
 		// shallow WalkExprTree does not (TPC-DS Q48's `ca_state = ANY
 		// (...)` arms read as outer-only and kept the clause on the join).
@@ -91,10 +101,116 @@ func innerParamQual(n optimizer.Node) optimizer.Expr {
 			}
 		})
 		if !enumerated || !readsInner || !withinParams {
+			return nil, false
+		}
+		kept = append(kept, c)
+	}
+	return joinAndExprs(kept), true
+}
+
+// probeKeyEquality is one `index column = outer key` binding of a
+// parameterized probe.
+type probeKeyEquality struct {
+	column string
+	key    optimizer.Expr
+}
+
+// probeKeyEqualities lists the equality bindings an IndexScan /
+// IndexOnlyScan probe enforces, pairing each key with the index column it
+// binds the way formatIndexCond does. Range bounds and array keys are not
+// equalities and are left out.
+func probeKeyEqualities(inner optimizer.Node) []probeKeyEquality {
+	var (
+		cols            []string
+		key             optimizer.Expr
+		keys, rangePref []optimizer.Expr
+		skip            int
+	)
+	switch p := inner.(type) {
+	case *optimizer.IndexScan:
+		if p.Index == nil {
 			return nil
 		}
+		cols, key, keys, rangePref, skip = p.Index.Columns, p.Key, p.Keys, p.RangePrefix, p.SkipPrefix
+	case *optimizer.IndexOnlyScan:
+		if p.Index == nil {
+			return nil
+		}
+		cols, key, keys = p.Index.Columns, p.Key, p.Keys
+	default:
+		return nil
 	}
-	return pred
+	var out []probeKeyEquality
+	bind := func(i int, k optimizer.Expr) {
+		if k != nil && i >= 0 && i < len(cols) {
+			out = append(out, probeKeyEquality{column: cols[i], key: k})
+		}
+	}
+	switch {
+	case len(keys) > 0:
+		for i, k := range keys {
+			bind(skip+i, k)
+		}
+	case key != nil:
+		bind(0, key)
+	}
+	for i, k := range rangePref {
+		bind(i, k)
+	}
+	return out
+}
+
+// restatesProbeKey reports whether c is `inner.col = outer.x` (either
+// operand order) where the probe binds index column col to that same outer
+// column x.
+func restatesProbeKey(c optimizer.Expr, keyEqs []probeKeyEquality, outerW int, outer optimizer.Node) bool {
+	b, ok := c.(*optimizer.BinaryOp)
+	if !ok || b.Op != parser.OpEq || len(keyEqs) == 0 {
+		return false
+	}
+	l, lok := b.Left.(*optimizer.ColumnRef)
+	r, rok := b.Right.(*optimizer.ColumnRef)
+	if !lok || !rok || (l.Index >= outerW) == (r.Index >= outerW) {
+		return false
+	}
+	in, out := l, r
+	if l.Index < outerW {
+		in, out = r, l
+	}
+	outerCols := outer.Output()
+	for _, ke := range keyEqs {
+		if ke.column != in.Name {
+			continue
+		}
+		idx, src, name := -1, int16(0), ""
+		switch k := ke.key.(type) {
+		case *optimizer.ColumnRef:
+			idx, src, name = k.Index, k.SourceTableIdx, k.Name
+		case *optimizer.OuterColumnRef:
+			idx, src, name = k.Index, k.SourceTableIdx, k.Name
+		default:
+			continue
+		}
+		if src == 0 && idx >= 0 && idx < len(outerCols) {
+			src, name = outerCols[idx].SourceTableIdx, outerCols[idx].Name
+		}
+		if idx == out.Index || (src != 0 && src == out.SourceTableIdx && name == out.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func joinAndExprs(es []optimizer.Expr) optimizer.Expr {
+	var out optimizer.Expr
+	for _, e := range es {
+		if out == nil {
+			out = e
+			continue
+		}
+		out = &optimizer.BinaryOp{Op: parser.OpAnd, Left: out, Right: e}
+	}
+	return out
 }
 
 // probeRelations is the set of relations a parameterized probe reads: its
@@ -177,14 +293,15 @@ func probeKeyExprs(inner optimizer.Node) []optimizer.Expr {
 	return out
 }
 
-// renderedParamQual is the residual as the inner scan's namespace sees it —
-// outer-side columns become correlated references (always prefixed, PG's
-// get_parameter rule), inner columns stay bare — or nil when the residual
-// stays on the join.
-func renderedParamQual(n optimizer.Node) optimizer.Expr {
-	q := innerParamQual(n)
-	if q == nil {
-		return nil
+// renderedParamQual is the residual placement with the probe's part as the
+// inner scan's namespace sees it — outer-side columns become correlated
+// references (always prefixed, PG's get_parameter rule), inner columns stay
+// bare. moved=false keeps the residual on the join; moved with a nil qual
+// prints nothing under the probe.
+func renderedParamQual(n optimizer.Node) (optimizer.Expr, bool) {
+	q, moved := paramQualPlacement(n)
+	if !moved || q == nil {
+		return nil, moved
 	}
 	_, outer, _, _, _ := paramJoinParts(n)
 	outerW := len(outer.Output())
@@ -195,9 +312,9 @@ func renderedParamQual(n optimizer.Node) optimizer.Expr {
 		return &optimizer.OuterColumnRef{Level: 1, Index: cr.Index, Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
 	})
 	if !ok || d == nil {
-		return nil
+		return nil, false
 	}
-	return d
+	return d, true
 }
 
 // paramInnerChild reports whether c is n's parameterized inner child.
@@ -211,20 +328,4 @@ func splitAndExpr(e optimizer.Expr) []optimizer.Expr {
 		return append(splitAndExpr(b.Left), splitAndExpr(b.Right)...)
 	}
 	return []optimizer.Expr{e}
-}
-
-// isInnerOuterColumnEquality reports whether c is `col = col` with one column
-// on each side of the parameterized join (a mergejoinable equivalence-class
-// clause rather than a general join qual).
-func isInnerOuterColumnEquality(c optimizer.Expr, outerW int) bool {
-	b, ok := c.(*optimizer.BinaryOp)
-	if !ok || b.Op != parser.OpEq {
-		return false
-	}
-	l, lok := b.Left.(*optimizer.ColumnRef)
-	r, rok := b.Right.(*optimizer.ColumnRef)
-	if !lok || !rok {
-		return false
-	}
-	return (l.Index >= outerW) != (r.Index >= outerW)
 }

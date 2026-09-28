@@ -22995,6 +22995,25 @@ M0146-0001 re-baseline census on the new default arm.
     24/24, fire set \(Q13 Q48, none introduced\), regress runner 10 cases 0
     changed vs HEAD \(timing only\)\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 16 -> 17 (Q48), CATEGORIES-EXCL-MATCH qual-placement 17 -> 15; SF1 and TPC-H unchanged
+- [x] **M0146\-0005am — a probe residual\'s equalities follow PG\'s
+  ppi\_clauses rules** \(slice 39, impl, filed and done 2026\-09\-29 from the
+  TPC\-DS SF0\.25 census, Q50/Q84\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` § "Slice 39"\.
+  Kind: impl
+  Parent: M0146-0005
+  - Slice 36 kept any residual holding an `inner = outer` equality on the
+    join\. PG drops one that restates the index key \(Q84\) and moves one
+    within `required\_outer` into the probe\'s Filter \(Q50\); Q9/Q21 stay
+    because their equality names a relation outside `required\_outer`\.
+  - `paramQualPlacement` / `restatesProbeKey` / `probeKeyEqualities`;
+    `renderedParamQual` returns \(qual, moved\)\.
+  - Ledgered: the moved equality keeps its written operand order \(PG: outer
+    member first\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(Q17
+    Q25 Q29 Q50 Q84 / SF1 Q37, none introduced\), TPC\-H filter lines
+    identical, regress runner 10 cases: join\.sql loses 7 key\-restating
+    Filter lines \(PG prints none\)\.
+  Movement: yes — TPC-DS CATEGORIES-EXCL-MATCH qual-placement SF0.25 15 -> 13, SF1 18 -> 17; TPC-H unchanged
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
