@@ -1288,12 +1288,23 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + otf)})
 		}
 	case *optimizer.Gather:
+		// M0146-0005ai: a Filter folded onto the Gather is the node's own
+		// qual — explain.c's T_Gather arm prints `show_scan_qual(plan->qual,
+		// "Filter")` BEFORE `Workers Planned`. Dropping it hid an executed
+		// qual (TPC-H Q20's `ps_availqty > (SubPlan 1)`) that JSON showed.
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
 		// ANALYZE walk instead.
 		*rows = append(*rows, Row{NewStringDatum(
 			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
 	case *optimizer.GatherMerge:
+		// The same qual line as Gather (explain.c's T_GatherMerge arm).
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
 		// print the merge keys (explain.c has no show_sort_keys call in the
 		// T_GatherMerge arm) — the keys are the child Sort's, and it prints
@@ -2968,7 +2979,15 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			// reject count by the CHILD's loops mixed two operators again.
 			if s, ok := stats[statSrc]; ok && s != nil && s.loops > 0 {
 				avg := float64(filterRowsRemoved) / float64(s.loops)
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Filter: %.0f", avg))})
+				removed := Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Filter: %.0f", avg))}
+				*rows = append(*rows, removed)
+				// M0146-0005ai: explain.c's Gather / Gather Merge arms print
+				// the qual's instrumentation count BEFORE `Workers Planned`,
+				// which the plain-detail pass has already emitted.
+				switch n.(type) {
+				case *optimizer.Gather, *optimizer.GatherMerge:
+					moveBeforeLastDetail(*rows, detailIndent+"Workers Planned: ")
+				}
 			}
 		}
 
@@ -4546,4 +4565,25 @@ func groupingSetsHaveEmpty(sets [][]int) bool {
 		}
 	}
 	return false
+}
+
+// moveBeforeLastDetail moves the final row of rows up to sit immediately
+// before the last earlier row that starts with prefix (the node's own detail
+// line), shifting the rows between down by one. No match leaves rows as is.
+func moveBeforeLastDetail(rows []Row, prefix string) {
+	last := len(rows) - 1
+	if last < 1 {
+		return
+	}
+	for i := last - 1; i >= 0; i-- {
+		if len(rows[i]) == 0 {
+			continue
+		}
+		if strings.HasPrefix(rows[i][0].StringValue(), prefix) {
+			moved := rows[last]
+			copy(rows[i+1:last+1], rows[i:last])
+			rows[i] = moved
+			return
+		}
+	}
 }

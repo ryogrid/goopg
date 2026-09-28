@@ -22902,6 +22902,31 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
     TPC\-DS plan change\)\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 4 -> 3, sort-strategy 4 -> 3, parallelism 6 -> 5 (Q18 first divergence depth 1 -> 3)
+- [x] **M0146\-0005ai — a Gather\'s own Filter is printed** \(slice 35,
+  impl, filed and done 2026\-09\-28 from the TPC\-H census, Q20\): the text
+  EXPLAIN dropped a Filter folded onto a Gather / Gather Merge, hiding
+  Q20\'s executed `ps\_availqty > \(SubPlan 1\)` \(JSON showed it\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 35"\.
+  Kind: impl
+  Parent: M0146-0005
+  - Gather/Gather Merge arms print `Filter:` before `Workers Planned`
+    \(explain\.c\); ANALYZE\'s `Rows Removed by Filter` moves in front of it\.
+  - Exposes Q20\'s SubPlan: TPC\-H scan\-type 9 → 10, parameterisation 2 → 3
+    \(real, previously hidden\); first divergences and TPC\-DS unchanged\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
+    change\), regress runner 4 cases 0 changed\.
+  Movement: none — rendering fidelity; the census counts rise because a hidden SubPlan became visible
+- [ ] **M0146\-0005aj — join clauses movable to a parameterized inner path are
+  enforced in the inner scan** \(filed 2026\-09\-28 by M0146\-0005ai\): PG\'s
+  `get\_baserel\_parampathinfo` puts every movable join clause in
+  `ppi\_clauses`, which become the parameterized inner scan\'s Filter
+  \(TPC\-H Q19\'s OR clause, Q21\'s `l3.l\_suppkey <> l1.l\_suppkey`\); goopg
+  keeps them as the nested loop\'s Join Filter \(`qual\-placement`, 3 TPC\-H,
+  18/19 TPC\-DS records\)\. Needs the inner scan to read the bound outer row
+  in its Filter and Memoize to key on every referenced outer value\.
+  Kind: impl
+  Parent: M0146-0005
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

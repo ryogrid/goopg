@@ -524,3 +524,46 @@ values are identical. In the regress runner, 7 cases (including
 `functional_deps`) show one change against HEAD: the row order of one
 unordered `join.sql` query, with the same row set. Evidence:
 `analysis/m0146/m0146-0005/slice34/`.
+
+## Slice 35: M0146-0005ai — a Gather's own Filter is printed
+
+Checking TPC-H Q20 (first divergence: `parallelism`), the goopg plan showed no
+`ps_availqty > (SubPlan)` qual and no `lineitem` at all. The rows were right:
+a self-check through an explicit pre-aggregated join returns the same 101
+rows, and dropping the predicate returns 271. The two engines' loads
+differ, so their row counts cannot be compared. The qual was executed but
+invisible. `EXPLAIN (FORMAT JSON)` put it as a `Filter` on the Gather node:
+goopg evaluates the parallel-restricted correlated SubPlan in the leader,
+above the Gather. The text renderer's Gather arm printed only `Workers
+Planned`.
+
+- **Change.** explain.c's `T_Gather` and `T_GatherMerge` arms print
+  `show_scan_qual(plan->qual, "Filter")` before `Workers Planned`, and
+  under ANALYZE `Rows Removed by Filter` directly after it. goopg's Gather
+  and Gather Merge text arms now print the folded Filter in that position,
+  and the SubPlan tree renders with it. The ANALYZE walk appends the
+  removed-rows line after the plain details, so it is moved in front of the
+  node's `Workers Planned` line (`moveBeforeLastDetail`).
+- **What it exposes.** Q20's SubPlan is now compared. PG probes `lineitem`
+  with an Index Scan inside the SubPlan, and goopg uses a Bitmap Heap
+  Scan, so TPC-H `scan-type` rises 9 → 10 and `parameterisation` 2 → 3.
+  These are real divergences that were hidden, not regressions. First
+  divergences are unchanged, and so are TPC-DS plans.
+- **Q20's real divergence** is the placement itself. PG keeps the
+  parallel-restricted SubPlan qual on the serial parameterized inner scan
+  and runs no Gather there. goopg parallelizes the join and filters above
+  the Gather (ledgered).
+
+Found on the way (both ledgered, one filed):
+
+- **Q19/Q21 `qual-placement`.** PG enforces every join clause movable to a
+  parameterized inner path inside that inner scan: `ppi_clauses`
+  (`get_baserel_parampathinfo`) become the scan's Filter. goopg keeps them
+  as the nested loop's Join Filter. Filed M0146-0005aj. Doing this needs a
+  Memoize cache key per referenced outer value.
+- **Q22's InitPlan.** PG evaluates it once in the leader and passes the
+  value to the workers, which lets the InitPlan itself run parallel. goopg
+  evaluates it inside the workers' Filter, and so refuses a parallel
+  aggregate there (`gate=statement`).
+
+Evidence: `analysis/m0146/m0146-0005/slice35/`.
