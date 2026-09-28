@@ -153,3 +153,30 @@ Still declined, each for a concrete reason:
 Movement: none on TPC-H or TPC-DS (no corpus body has an inner JOIN);
 regress runner 0 of 22 case diffs changed vs HEAD; live queries with joined
 bodies return PG's rows and search the joined relations as one problem.
+
+## 9. Slice 4 (M0146-0028d, 2026-09-28): outer joins inside the body
+
+A body join chain may now carry LEFT, RIGHT and FULL joins. What blocked
+them in slice 3 was not the pull-up but goopg's outer-join simplification,
+which is keyed to one WHERE clause by column name:
+
+- **Demotion** (`demotedForPlan`, LEFT/RIGHT→INNER): an item of a pulled
+  body is demoted against the BODY's WHERE, the quals that stood above its
+  outer joins before the pull-up. Parent items keep the statement's WHERE.
+- **Reduction for the joinlist** (`reduceOuterJoins`): the statement's own
+  items are reduced by its WHERE and each body's items by the body's WHERE.
+  The partitions share their `Joins` slices with the expanded list, so
+  reducing them reduces what `deconstructJointreeScopedSJI` reads.
+- **LEFT→ANTI inside a body abandons the pull-up.** The anti join drops the
+  nullable side's columns, which a body target may still name, and the
+  forcing IS-NULL qual would have to be stripped from the body's quals.
+  The body stays an ordinary derived leaf.
+
+PG additionally lets the parent's quals reduce a pulled body's outer joins
+(reduce_outer_joins runs over the whole pulled-up jointree). goopg uses only
+the body's quals, which is exactly the pre-pull-up behaviour (ledgered).
+
+Movement: TPC-DS Q51 (FULL JOIN body) and Q93 (LEFT JOIN body, reduced to
+INNER by its own WHERE, as PG does) now pull up. Q93 already matched PG; Q51's
+first divergence is a Subquery Scan above its window stage, unchanged.
+Category counts are unchanged, no timeouts. Regress runner 0 of 22 changed.

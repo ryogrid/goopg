@@ -21,7 +21,8 @@ import (
 //
 // Slice 1 covered the shape whose `pullup_replace_vars` is a pure renaming;
 // slice 2 (M0146-0028b) admits expression targets and the lone FROM item;
-// slice 3 (M0146-0028c) admits INNER / CROSS joins inside the body:
+// slice 3 (M0146-0028c) admits INNER / CROSS joins inside the body and
+// slice 4 (M0146-0028d) outer joins inside it:
 //
 //   - the parent FROM is a comma list, none of its items LATERAL or a table
 //     function, and the statement takes no row locks;
@@ -30,7 +31,8 @@ import (
 //   - its body is a bare SELECT (no WITH, set operation, grouping, HAVING,
 //     DISTINCT, ORDER BY, LIMIT/OFFSET, window clause, VALUES or locking)
 //     over a comma list of plain relation names (tables or CTE references),
-//     each optionally joined to more of them by INNER or CROSS joins;
+//     each optionally joined to more of them (INNER, CROSS, LEFT, RIGHT,
+//     FULL; no USING/NATURAL);
 //   - every body target is an expression with no function call and no
 //     sublink — which excludes, without a catalog lookup, everything PG's
 //     is_simple_subquery refuses in a target list (aggregates, window
@@ -136,19 +138,21 @@ func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, bool) {
 		if !pullupPlainRelation(f.Base) {
 			return nil, false
 		}
-		// M0146-0028c: INNER / CROSS joins inside the body. PG pulls every
-		// join tree up with the body (only an outer join AROUND the
-		// subquery needs PlaceHolderVars); an inner join's ON clause is a
-		// WHERE qual in all but name, so nothing about it changes when the
-		// join lands in the parent's jointree. Outer joins stay declined:
-		// goopg's outer-join demotion (demotedForPlan / reduceOuterJoins)
-		// reads the PARENT's WHERE by column name, and its IS-NULL strip
-		// runs on the parent's WHERE, neither of which is the body's. USING
-		// and NATURAL merge columns through per-join resolve contexts the
-		// body re-resolution does not rebuild.
+		// M0146-0028c/d: joins inside the body. PG pulls every join tree up
+		// with the body — only an outer join AROUND the subquery needs
+		// PlaceHolderVars. An inner join's ON clause is a WHERE qual in all
+		// but name; an outer join (slice d) is demoted and reduced against
+		// the BODY's WHERE (planFromClauseItems), exactly the quals that
+		// stood above it before the pull-up. USING and NATURAL merge
+		// columns through per-join resolve contexts the body re-resolution
+		// does not rebuild.
 		for _, j := range f.Joins {
-			if (j.Type != parser.JoinInner && j.Type != parser.JoinCross) || j.Natural || len(j.Using) > 0 ||
-				!pullupPlainRelation(j.Right) {
+			switch j.Type {
+			case parser.JoinInner, parser.JoinCross, parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+			default:
+				return nil, false
+			}
+			if j.Natural || len(j.Using) > 0 || !pullupPlainRelation(j.Right) {
 				return nil, false
 			}
 			if j.On != nil && (!collectExprColumnNames(j.On, map[string]bool{}) ||
@@ -177,6 +181,17 @@ func simpleDerivedPullupBody(it parser.FromExpr) (*parser.SelectStmt, bool) {
 		return nil, false
 	}
 	return sub, true
+}
+
+// pulledCandidateOwning returns the candidate whose expanded body items
+// include item index i, or nil.
+func pulledCandidateOwning(cands []*derivedPullupCandidate, i int) *derivedPullupCandidate {
+	for _, c := range cands {
+		if i >= c.itemLo && i < c.itemHi {
+			return c
+		}
+	}
+	return nil
 }
 
 // pullupPlainRelation reports whether a body FROM item is a plain relation

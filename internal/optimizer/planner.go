@@ -3961,7 +3961,21 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
 		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
 		// why the call below cannot simply be moved up here instead.
-		item, itemAntiCols := demotedForPlan(rawItem, s.Where, cat)
+		// M0146-0028d: an item of a pulled-up body is demoted against the
+		// BODY's WHERE — the quals that stood above its outer joins before
+		// the pull-up — never the statement's.
+		demoteWhere := s.Where
+		owner := pulledCandidateOwning(cands, itemIdx)
+		if owner != nil {
+			demoteWhere = owner.body.Where
+		}
+		item, itemAntiCols := demotedForPlan(rawItem, demoteWhere, cat)
+		if owner != nil && len(itemAntiCols) > 0 {
+			// A LEFT->ANTI demotion drops the nullable side's columns from
+			// the join's output, which a body target may still name; the
+			// body stays an ordinary derived leaf.
+			return nil, nil, false, nil
+		}
 		for key := range itemAntiCols {
 			if antiForcedNullCols == nil {
 				antiForcedNullCols = make(map[string]bool)
@@ -4039,7 +4053,24 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
 	// demoted joins enter the joinlist as plain INNER joins.
-	reduceOuterJoins(items, s.Where, cat)
+	// M0146-0028d: the statement's WHERE reduces the statement's own outer
+	// joins; each pulled body's WHERE reduces the body's (the Joins slices
+	// are shared with the AST items, so reducing the partitions reduces
+	// `items`).
+	if len(cands) == 0 {
+		reduceOuterJoins(items, s.Where, cat)
+	} else {
+		var own []parser.FromExpr
+		for i, it := range items {
+			if pulledCandidateOwning(cands, i) == nil {
+				own = append(own, it)
+			}
+		}
+		reduceOuterJoins(own, s.Where, cat)
+		for _, c := range cands {
+			reduceOuterJoins(items[c.itemLo:c.itemHi], c.body.Where, cat)
+		}
+	}
 	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo
 	// Min/LhsStrict population can resolve ON-clause names (syn fallback
 	// on any uncertainty — never an underestimate).

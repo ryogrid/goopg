@@ -103,7 +103,6 @@ func TestDerivedPullupDeclines(t *testing.T) {
 		"SELECT * FROM (SELECT DISTINCT ax FROM a) y, b",                                    // DISTINCT
 		"SELECT * FROM (SELECT ax FROM a LIMIT 1) y, b",                                     // LIMIT
 		"SELECT * FROM (SELECT ax FROM a) y (z), b",                                         // column alias list
-		"SELECT * FROM (SELECT ax FROM a LEFT JOIN c ON a.ay = c.cy) y, b",                  // outer JOIN in body
 		"SELECT * FROM (SELECT ax FROM a JOIN c USING (ax)) y, b",                           // USING in body
 		"SELECT * FROM (SELECT ax FROM a NATURAL JOIN c) y, b",                              // NATURAL in body
 		"SELECT * FROM (SELECT ax FROM a JOIN (SELECT cx FROM c) z ON ax = cx) y, b",        // derived join leg
@@ -214,5 +213,22 @@ func TestDerivedPullupBodyInnerJoin(t *testing.T) {
 	z, ok := pullupResolve(t, rctx, "y", "z").(*ColumnRef)
 	if !ok || z.Index != rctx.bindings[1].offset+1 {
 		t.Fatalf("y.z resolved to %#v, want c.cy at slot %d", z, rctx.bindings[1].offset+1)
+	}
+}
+
+// Slice 4 (M0146-0028d): an outer join inside the body is pulled up with it,
+// demoted against the BODY's WHERE: a strict body qual on the nullable side
+// reduces LEFT to INNER exactly as it did while the body was its own scope,
+// and without one the join stays LEFT.
+func TestDerivedPullupBodyOuterJoin(t *testing.T) {
+	for _, q := range []string{
+		"SELECT k, z FROM (SELECT ax AS k, cy AS z FROM a LEFT JOIN c ON a.ay = c.cx) y, b WHERE y.k = b.bx",
+		"SELECT k, z FROM (SELECT ax AS k, cy AS z FROM a LEFT JOIN c ON a.ay = c.cx WHERE c.cy > 0) y, b WHERE y.k = b.bx",
+		"SELECT k FROM (SELECT ax AS k FROM a FULL JOIN c ON a.ay = c.cx) y",
+	} {
+		_, _, rctx := pullupPlanFrom(t, q)
+		if len(rctx.pulledDerived) != 1 {
+			t.Fatalf("%s: outer-join body not pulled up", q)
+		}
 	}
 }

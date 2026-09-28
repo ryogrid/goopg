@@ -23709,6 +23709,20 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(no fires\), regress runner 0/22 changed vs HEAD\.
   Movement: none — no corpus body carries an inner JOIN; PG-faithful widening
+- [x] **M0146\-0028d — slice 4: outer joins inside the body** \(impl, done
+  2026\-09\-28\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §9\.
+  Kind: impl
+  Parent: M0146-0028
+  - Body items are demoted \(`demotedForPlan`\) and reduced
+    \(`reduceOuterJoins`\) against the body\'s WHERE; the statement\'s own
+    items keep the statement\'s WHERE\.
+  - LEFT\->ANTI inside a body abandons the pull\-up \(anti join drops the
+    nullable side a target may name\)\.
+  - Witnesses: TPC\-DS Q93 \(LEFT, reduced to INNER\), Q51 \(FULL\) now pulled
+    up; results = PG; gates units, tpch\-spotcheck, sf025 96/96, TPC\-H arm
+    24/24, fire set \(Q51 Q93, none introduced\), regress runner 0/22\.
+  Movement: none — PLAN-PARITY categories unchanged (Q93 already matched; Q51 first divergence above the window stage)
 - [ ] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
