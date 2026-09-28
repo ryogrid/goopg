@@ -22917,7 +22917,7 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(no
     change\), regress runner 4 cases 0 changed\.
   Movement: none — rendering fidelity; the census counts rise because a hidden SubPlan became visible
-- [ ] **M0146\-0005aj — join clauses movable to a parameterized inner path are
+- [x] **M0146\-0005aj — join clauses movable to a parameterized inner path are
   enforced in the inner scan** \(filed 2026\-09\-28 by M0146\-0005ai\): PG\'s
   `get\_baserel\_parampathinfo` puts every movable join clause in
   `ppi\_clauses`, which become the parameterized inner scan\'s Filter
@@ -22927,6 +22927,21 @@ M0146-0001 re-baseline census on the new default arm.
   in its Filter and Memoize to key on every referenced outer value\.
   Kind: impl
   Parent: M0146-0005
+  - **DONE 2026\-09\-29** \(slice 36\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+    "Slice 36"\.
+    - goopg\'s parameterized nested loops already evaluate the residual per
+      probe row — the probe\'s ppi\_clauses in substance — so the renderers
+      now attribute it to the inner scan \(`innerParamQual`\): every conjunct
+      reads the inner, stays within the probe\'s required\_outer, no
+      inner=outer column equality \(EC clause, stays a Join Filter as in PG\),
+      no Memoize between\.
+    - ANALYZE: the rejection count moves to the inner scan\'s `Rows Removed
+      by Filter`\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set
+      \(Q16 Q48 Q72 Q94, none introduced\), regress runner 5 cases: one
+      join\.sql EXPLAIN moves the PG way\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH qual-placement 3 -> 2 (Q19); TPC-DS qual-placement SF0.25 18 -> 17, SF1 19 -> 18 (Q94)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

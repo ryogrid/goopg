@@ -599,6 +599,12 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
+		if paramInnerChild(n, c) {
+			if q := renderedParamQual(n); q != nil {
+				walkPlanFiltered(c, childIndent, rows, opts, q, c, reg)
+				continue
+			}
+		}
 		walkPlanFiltered(c, childIndent, rows, opts, nil, nil, reg)
 	}
 }
@@ -1417,7 +1423,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			if filt == nil {
 				filt = p.Cond
 			} else {
-				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+				// The scan's own quals lead: PG appends a parameterized
+				// path's ppi_clauses after the restriction quals.
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: p.Cond, Right: filt}
 			}
 		}
 		if filt != nil {
@@ -1454,7 +1462,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			if filt == nil {
 				filt = p.Cond
 			} else {
-				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: filt, Right: p.Cond}
+				// The scan's own quals lead: PG appends a parameterized
+				// path's ppi_clauses after the restriction quals.
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: p.Cond, Right: filt}
 			}
 		}
 		if filt != nil {
@@ -1522,7 +1532,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// conjunct the executor re-checks per match was invisible, so a plan
 		// could not be read against PG's output for the same query — the
 		// same class of blind spot `Hash Cond:` itself closed at P2.1.
-		if jf := formatJoinFilter(p, reg, qualify); jf != "" {
+		// M0146-0005aj: a parameterized nested loop's residual renders
+		// under its inner scan (explain_nli_paramqual.go).
+		if jf := formatJoinFilter(p, reg, qualify); jf != "" && renderedParamQual(p) == nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
 		}
 		if attachedFilter != nil {
@@ -1535,7 +1547,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// l_receiptdate) was previously invisible in EXPLAIN, which hid a
 		// mis-resolution during the Q7 alias/residual fix (deferral ledger,
 		// csq-S6). Render it as a Filter: line, house style.
-		if p.Predicate != nil {
+		// M0146-0005aj: a residual that is the probe's ppi_clauses renders
+		// under the inner scan instead (explain_nli_paramqual.go).
+		if p.Predicate != nil && renderedParamQual(p) == nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(p.Predicate, reg, qualify)))})
 		}
 		if attachedFilter != nil {
@@ -2996,7 +3010,11 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// from the join node's own stats.joinFilterRejected. Mirrors
 		// PG's show_instrumentation_count (nfiltered1 for joinqual
 		// rejects, per-loop average). Zero suppressed in text mode.
-		if s, ok := stats[n]; ok && s != nil && s.joinFilterRejected > 0 && s.loops > 0 {
+		nliMoved := false
+		if renderedParamQual(n) != nil {
+			nliMoved = true // counted on the inner scan instead
+		}
+		if s, ok := stats[n]; ok && s != nil && s.joinFilterRejected > 0 && s.loops > 0 && !nliMoved {
 			avg := float64(s.joinFilterRejected) / float64(s.loops)
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Join Filter: %.0f", avg))})
 		}
@@ -3146,6 +3164,18 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
+		if paramInnerChild(n, c) {
+			if q := renderedParamQual(n); q != nil {
+				// The residual's rejections are the inner scan's
+				// `Rows Removed by Filter` (M0146-0005aj).
+				var removed int64
+				if s, ok := stats[n]; ok && s != nil {
+					removed = s.joinFilterRejected
+				}
+				walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, q, c, removed, reg)
+				continue
+			}
+		}
 		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	}
 }

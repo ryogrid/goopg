@@ -807,6 +807,13 @@ type SeqScan struct {
 func (n *SeqScan) Pos() int       { return n.pos }
 func (n *SeqScan) Output() Schema { return n.schema }
 
+// SeqScanWithSchemaForTest builds a SeqScan whose Output() is the given
+// schema, for tests in other packages that need a node of known width (the
+// executor's EXPLAIN placement tests, M0146-0005aj).
+func SeqScanWithSchemaForTest(t *catalog.Table, schema Schema) *SeqScan {
+	return &SeqScan{Table: t, schema: schema}
+}
+
 // IndexScan probes a single-column B-tree index with an equality key
 // or a range of keys.
 //

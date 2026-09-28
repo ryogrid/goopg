@@ -567,3 +567,63 @@ Found on the way (both ledgered, one filed):
   aggregate there (`gate=statement`).
 
 Evidence: `analysis/m0146/m0146-0005/slice35/`.
+
+## Slice 36: M0146-0005aj — a parameterized nested loop's residual is the probe's Filter
+
+PG enforces every join clause movable to a parameterized inner path inside
+that inner scan. `get_baserel_parampathinfo` collects them as `ppi_clauses`,
+and `create_scan_plan` appends them to the scan qual after its own
+restriction quals. They print as the inner scan's `Filter:`, with the outer
+side's Vars as Params that deparse prefixed. goopg printed the same clauses
+as the nested loop's `Filter:` or `Join Filter:`. That is the
+`qual-placement` class: TPC-H Q19's OR clause, Q21's `l3.l_suppkey <>
+l1.l_suppkey`, TPC-DS Q94's `ws1.ws_warehouse_sk <> ws_warehouse_sk`.
+
+- **Why rendering is the faithful fix.** Both parameterized nested-loop
+  forms (`NestedLoopIndexJoin`, and the Lateral nested-loop `Join` over a
+  probe) evaluate `Predicate` once per candidate row the probe returns for
+  the current outer row, before the join emits or counts a match. That is
+  exactly where PG's scan qual runs. The residual already is the probe's
+  `ppi_clauses`; only its attribution differed. A new plan field would
+  have had to be threaded through every pass that remaps `Predicate`
+  coordinates, for no semantic change.
+- **The rule** (`explain_nli_paramqual.go`, `innerParamQual`). The whole
+  residual renders under the inner scan only when all of these hold:
+  - the inner is a bare IndexScan, BitmapHeapScan or IndexOnlyScan with
+    no Memoize in between (with a cache the residual runs above it here,
+    while PG would key the cache on the extra values);
+  - every conjunct reads the inner relation;
+  - every conjunct references only the probe's own table and the relations
+    its index keys are parameterized by. This is PG's `required_outer` test
+    (`join_clause_is_movable_into`). TPC-DS Q19's `substr(ca_zip) <>
+    substr(s_zip)` stays a Join Filter because the `store` probe is
+    parameterized by `store_sales` alone. A key's outer reference with no
+    source id is resolved through the outer row's schema.
+  - no conjunct is an inner-to-outer column equality. That is an
+    equivalence-class clause: PG's `ppi_clauses` carry one per class (the
+    one the index uses), and the join re-checks any other member pair as a
+    Join Filter (TPC-H Q9's `s_suppkey = l_suppkey`).
+- **Rendering details.** Outer columns become correlated references,
+  printed prefixed. The scan's own `Cond` leads the combined Filter. Under
+  ANALYZE the join's rejection count becomes the inner scan's `Rows
+  Removed by Filter`, and the join's `Rows Removed by Join Filter` line is
+  dropped.
+
+Movement: TPC-H `qual-placement` 3 → 2 (Q19 moves past to a scan-type
+record); TPC-DS `qual-placement` 18 → 17 at SF0.25 and 19 → 18 at SF1 (Q94).
+No category rises and no timeouts are introduced. In the regress runner,
+one join.sql EXPLAIN moves its clause the PG way (that query's PG plan
+removes the self-join, a separate gap).
+
+Remaining (ledgered):
+
+- A residual that mixes an equivalence-class equality with movable
+  clauses stays on the join whole, because the executor keeps one
+  rejection counter.
+- Under ANALYZE, the inner scan's actual `rows` still counts rows before
+  the moved qual.
+- JSON EXPLAIN renders neither the NLI residual nor `IndexScan.Cond`.
+- PG's extra equivalence-class Join Filter (Q21's `orders.o_orderkey =
+  l2.l_orderkey`) is not generated.
+
+Evidence: `analysis/m0146/m0146-0005/slice36/`.
