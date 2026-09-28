@@ -411,3 +411,53 @@ Movement: TPC-H PLAN-PARITY match 7 → 8 (Q7 = PG); Q8's first divergence
 advances from depth 0 to depth 9 (`lineitem_part_supp_fkidx` Index Scan vs
 goopg's Bitmap Heap Scan). TPC-H `join-order` 12 → 11, `join-method` 6 → 4,
 `sort-strategy` 8 → 6, `parallelism` 9 → 7. TPC-DS unchanged.
+
+## Slice 32: M0146-0005af — the partially grouped rel's own add\_partial\_path
+
+A fresh TPC-H census at `7c72251a2` showed its largest first-divergence
+family at the partial aggregate. Q4, Q5 and Q12 each show PG's
+`Partial GroupAggregate` directly under `Gather Merge`, where goopg has
+`Sort -> Partial HashAggregate`. PG costs the hashed partial lower (Q4:
+68911.18 against 69117.54) and still elects the sorted one. The serial plan
+behaves the same way: 192198 hashed against 193158 sorted, and `add_path`
+keeps the sorted one.
+
+- **The election PG runs.** `create_partial_grouping_paths` files the sorted
+  partial (`Partial GroupAggregate -> Sort`) and then the hashed partial on
+  `partially_grouped_rel` through `add_partial_path` (pathnode.c:795). The
+  two totals are within `STD_FUZZ_FACTOR`, so the sorted partial wins on its
+  pathkeys and evicts the hashed one. `gather_grouping_paths` then wraps
+  only what survived. Neither `Gather -> Partial HashAggregate` nor the
+  presorted `Gather Merge -> Sort -> Partial HashAggregate` ever exists.
+- **What goopg did.** `addPartialAggSplitPath` filed the finished arms on
+  the grouped rel and let that rel's `add_path` choose. There, the presorted
+  split undercut the sorted-input split. The two arms share a transport, a
+  merge and a finalize, so a 0.3% saving at the partial became the whole
+  margin.
+- **Change.** `hashedPartialAggSurvives` replays `addToPartialPathlist` over
+  the two partial paths in upstream's filing order: sorted first (the
+  can\_sort block), hashed second. It applies the same fuzz, pathkeys and
+  `disabled_nodes` rules as every other partial rival. `enable_sort=off`
+  disables the sorted partial, so the hashed partial survives, as upstream.
+  An evicted hashed partial files neither the presorted split nor a hashed
+  split. The sorted-input arm's partial path is now built once, by
+  `sortedInputPartialAgg`, and inherits its Sort's disabled count.
+- **Not filed.** PG's `Finalize HashAggregate -> Gather -> Partial
+  GroupAggregate` still exists upstream over the surviving sorted partial
+  (its hashed final reads `cheapest_total_path`). goopg's split arm uses one
+  strategy for both halves and cannot express it. Near a fuzz tie that
+  candidate loses to the Gather Merge one on pathkeys anyway (ledgered).
+
+Movement: TPC-H PLAN-PARITY match 8 → 9 (Q5 = PG); `sort-strategy` 6 → 5.
+Q12's first divergence moves from depth 2 to depth 4 (a join method under
+the aggregate). TPC-DS `sort-strategy` goes 50 → 48 at SF0.25 and 51 → 49 at
+SF1: Q62 and Q99 lose the category. Values are identical everywhere, and the
+fire set has no introduced timeouts.
+
+Q4 stays divergent for a different reason. goopg's per-worker seed is
+`parallelSeedCost`, which divides the whole run cost by the divisor, while
+upstream leaves the I/O undivided. It prices Q4's input at about 25.7k
+against PG's 68.9k, so the same ~300-unit worker sort is 1.15% of goopg's
+base against PG's 0.3%, just outside the fuzz. That is the approximation
+the function's own comment names (ledgered). Evidence:
+`analysis/m0146/m0146-0005/slice32/`.

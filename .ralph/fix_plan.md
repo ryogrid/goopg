@@ -22847,6 +22847,29 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(no TPC\-DS change\)\.
   Movement: yes — TPC-H PLAN-PARITY match 7 -> 8 (Q7), CATEGORIES-EXCL-MATCH sort-strategy 8 -> 6, join-method 6 -> 4
+- [x] **M0146\-0005af — the partially grouped rel\'s own add\_partial\_path**
+  \(slice 32, impl, filed and done 2026\-09\-28 from a fresh TPC\-H census at
+  `7c72251a2`\): PG elects `Partial GroupAggregate \-> Sort` under Gather
+  Merge on TPC\-H Q4/Q5/Q12 while pricing the hashed partial lower, because
+  `add\_partial\_path` on `partially\_grouped\_rel` lets a fuzzily tied
+  sorted partial evict it; goopg compared only the finished arms and elected
+  `Sort \-> Partial HashAggregate`\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-2.md` §
+  "Slice 32"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `hashedPartialAggSurvives` \(`partialaggupper.go`\) replays
+    `addToPartialPathlist` over the sorted and hashed partials in upstream\'s
+    filing order; an evicted hashed partial files neither the presorted nor
+    the hashed split\. `sortedInputPartialAgg` builds the sorted partial once
+    and carries its Sort\'s disabled count\.
+  - Q4 residual: `parallelSeedCost` divides the whole run cost, so goopg\'s
+    per\-worker base is ~25\.7k against PG\'s 68\.9k and the same worker sort
+    lands at 1\.15% — outside the fuzz \(ledgered\)\.
+  - Gates: units, tpch\-spotcheck \(Q12=2 Q13=33\), sf025 96/96, TPC\-H arm
+    24/24, fire set \(5 fires, none introduced\), regress runner 7 cases 0
+    changed vs HEAD\.
+  Movement: yes — TPC-H PLAN-PARITY match 8 -> 9 (Q5), CATEGORIES-EXCL-MATCH sort-strategy 6 -> 5; TPC-DS sort-strategy SF0.25 50 -> 48, SF1 51 -> 49
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

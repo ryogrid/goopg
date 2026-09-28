@@ -538,9 +538,29 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// it, which is exactly what `terminatesPartial` makes the post-pass do).
 	var split *Path
 	if aggregateSplitIsSafe(aggNode) {
-		split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
-			workers, d, perWorkerRows, partialGroups, finalGroups,
-			nGroupCols, nAggs, inNcols, inAvgVar, strategy)
+		// M0146-0005af: the partially grouped rel's own add_partial_path.
+		// Upstream files the sorted partial (`Partial GroupAggregate ->
+		// Sort`) and the hashed partial on `partially_grouped_rel` before
+		// anything gathers them (create_partial_grouping_paths), and
+		// gather_grouping_paths only wraps what survived. A sorted partial
+		// within STD_FUZZ_FACTOR of the hashed one wins on its pathkeys and
+		// evicts it, so neither `Gather -> Partial HashAggregate` nor the
+		// presorted `Sort -> Partial HashAggregate` exists above it (TPC-H
+		// Q4/Q5/Q12: 69117.54 against 68911.18). Comparing only the
+		// finished arms at the grouped rel let the presorted split win on
+		// a 0.3% saving PG never sees.
+		sortedEligible := nGroupCols > 0 && aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode)
+		if sortedEligible {
+			_, sortedEligible = transportGroupSortKeys(aggNode)
+		}
+		hashedPartialSurvives := !sortedEligible ||
+			hashedPartialAggSurvives(pseed, aggNode, cp, ps, perWorkerRows, partialGroups,
+				nGroupCols, nAggs, inNcols, inAvgVar)
+		if hashedPartialSurvives || strategy != AggStrategyHashed {
+			split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
+				workers, d, perWorkerRows, partialGroups, finalGroups,
+				nGroupCols, nAggs, inNcols, inAvgVar, strategy)
+		}
 
 		// M0146-0003 S6: the PRESORTED split — `gather_grouping_paths`
 		// files it beside the hashed arm (planner.c:7704-7724), so both
@@ -551,27 +571,27 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// gates), and every group key must admit a positional merge
 		// key (transportGroupSortKeys' own refusal — bare columns
 		// clone; expressions take the output slot's name, M0146-0016).
-		if nGroupCols > 0 && aggNode.GroupingSets == nil && !groupingHasSpecialAgg(aggNode) {
-			if _, ok := transportGroupSortKeys(aggNode); ok {
-				// M0146-0027 slice 3: the sorted-INPUT split —
-				// `Partial GroupAggregate -> Sort`, upstream's
-				// sorted arm of create_partial_grouping_paths
-				// (planner.c:7518-7560). Same gates as the sibling:
-				// a sorted fold needs group keys a merge key can
-				// name and has no grouping-sets / special-agg
-				// variant. Filed FIRST deliberately: upstream files
-				// the sorted partial inside
-				// create_partial_grouping_paths and the presorted
-				// wrap only later, in gather_grouping_paths' sort
-				// loop over the partial pathlist — so on a fuzzy
-				// cost tie (STD_FUZZ_FACTOR, comparePathCostsFuzzily)
-				// insertion order elects `Partial GroupAggregate`,
-				// which is exactly the election PG makes on
-				// Q19/Q62/Q99's near-tied small-join shapes.
-				addPartialAggSortedInputArm(grouped, partialRel, pseed, aggNode, cp,
-					workers, d, perWorkerRows, partialGroups, finalGroups,
-					nGroupCols, nAggs, inNcols, inAvgVar)
+		if sortedEligible {
+			// M0146-0027 slice 3: the sorted-INPUT split —
+			// `Partial GroupAggregate -> Sort`, upstream's sorted arm
+			// of create_partial_grouping_paths (planner.c:7518-7560).
+			// Same gates as the sibling: a sorted fold needs group
+			// keys a merge key can name and has no grouping-sets /
+			// special-agg variant. Filed before the presorted split:
+			// upstream files the sorted partial inside
+			// create_partial_grouping_paths and the presorted wrap
+			// only later, in gather_grouping_paths' sort loop over the
+			// partial pathlist.
+			sortedInput := addPartialAggSortedInputArm(grouped, partialRel, pseed, aggNode, cp,
+				workers, d, perWorkerRows, partialGroups, finalGroups,
+				nGroupCols, nAggs, inNcols, inAvgVar)
+			if split == nil {
+				split = sortedInput
+			}
 
+			// The presorted split sorts the HASHED partial, so it
+			// exists only where that partial survived (M0146-0005af).
+			if hashedPartialSurvives {
 				addPartialAggSortedSplitArm(grouped, partialRel, pseed, aggNode, cp,
 					workers, d, perWorkerRows, partialGroups, finalGroups,
 					nGroupCols, nAggs, inNcols, inAvgVar)
@@ -1159,38 +1179,11 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	}
 	crossed := partialGroups * d
 
-	// WORKER SORT — `make_ordered_path` of the partial input
-	// (planner.c:7538): each worker orders its own INPUT partition by
-	// the group keys, so the sort sees perWorkerRows rows (vs the
-	// presorted arm's partialGroups) — the whole honest cost difference
-	// between the two arms. Keys are the INPUT-space group keys
-	// (`groupKeysSortKeys`), not transport positions: the rows being
-	// sorted are the aggregate's input tuples.
-	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
-	// Same `ParallelWorkers` stamp the sibling arms set: the merge
-	// boundary below needs a runnable per-worker subpath
-	// (`gatherChildPlan` refuses 0 workers).
-	workerSort.ParallelWorkers = workers
-
-	// PARTIAL arm — `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL
-	// …)` over the ordered input: a streaming per-worker GroupAggregate
-	// emitting the transport row per group boundary, in group-key order.
+	// WORKER SORT and PARTIAL — see sortedInputPartialAgg.
 	mergeKeys := pathkeysForSortKeys(sortKeys)
-	partialCost := costAgg(cp, AggStrategySorted, perWorkerRows,
-		workerSort.Cost.Startup, workerSort.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
-	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-	partialSpec := *aggNode
-	partialPath := &Path{
-		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &partialSpec,
-		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
-		// The partial output IS merge-ordered: transport position k is
-		// group key k, emitted in sorted order.
-		Pathkeys:        append([]PathKey(nil), mergeKeys...),
-		ParallelSafe:    true,
-		ParallelWorkers: workers,
-		Children:        []*Path{workerSort},
-	}
+	partialPath := sortedInputPartialAgg(partialRel, pseed, aggNode, cp, workers,
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, mergeKeys)
+	partialCost := partialPath.Cost
 
 	// BOUNDARY — `cost_gather_merge` over the ordered partial streams,
 	// crossing the workers' deduplicated transport rows — `partialGroups
@@ -1220,6 +1213,77 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	}
 	addPath(grouped, sorted, partialAggSortedInputProducer)
 	return sorted
+}
+
+// sortedInputPartialAgg builds the sorted-input arm's PARTIAL path,
+// `Partial GroupAggregate -> Sort -> pseed`.
+//
+// WORKER SORT — `make_ordered_path` of the partial input (planner.c:7538):
+// each worker orders its own INPUT partition by the group keys, so the sort
+// sees perWorkerRows rows (vs the presorted arm's partialGroups) — the whole
+// honest cost difference between the two arms. Keys are the INPUT-space
+// group keys (`groupKeysSortKeys`), not transport positions: the rows being
+// sorted are the aggregate's input tuples. The Sort carries the same
+// `ParallelWorkers` stamp the sibling arms set: the merge boundary above
+// needs a runnable per-worker subpath (`gatherChildPlan` refuses 0 workers).
+//
+// PARTIAL — `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` over
+// the ordered input: a streaming per-worker GroupAggregate emitting the
+// transport row per group boundary, in group-key order, so its pathkeys are
+// the transport-position merge keys. It inherits the Sort's disabled count,
+// as cost_agg adds its input's.
+func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, cp costParams, workers int,
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64, mergeKeys []PathKey) *Path {
+	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+	workerSort.ParallelWorkers = workers
+	partialCost := costAgg(cp, AggStrategySorted, perWorkerRows,
+		workerSort.Cost.Startup, workerSort.Cost.Total,
+		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+	partialSpec := *aggNode
+	return &Path{
+		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &partialSpec,
+		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
+		DisabledNodes:   workerSort.DisabledNodes,
+		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+		Children:        []*Path{workerSort},
+	}
+}
+
+// hashedPartialAggSurvives replays add_partial_path (pathnode.c:795) on the
+// partially grouped rel for the two partial aggregates
+// create_partial_grouping_paths files there, in its order: the sorted-input
+// partial (the can_sort block, planner.c:7518) and then the hashed partial
+// (planner.c:7605). It reports whether the hashed one is still in the list —
+// only then do gather_grouping_paths' wraps of it exist upstream (M0146-0005af).
+//
+// Both are real partial paths over the same per-worker input; the verdict is
+// addToPartialPathlist's, so the fuzz, pathkeys and disabled_nodes rules are
+// the ones every other partial rival in this package is judged by.
+func hashedPartialAggSurvives(pseed *Path, aggNode *Aggregate, cp costParams, ps PlannerSettings,
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64) bool {
+	sortKeys, ok := transportGroupSortKeys(aggNode)
+	if !ok {
+		return true
+	}
+	sorted := sortedInputPartialAgg(pseed.Rel, pseed, aggNode, cp, pseed.ParallelWorkers,
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, pathkeysForSortKeys(sortKeys))
+	hashed := &Path{
+		Kind: PathAgg, AggStrategy: AggStrategyHashed, Rel: pseed.Rel, Rows: partialGroups,
+		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+			nGroupCols, partialGroups, nAggs, inNcols, inAvgVar),
+		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
+		ParallelSafe:  true,
+	}
+	list := addToPartialPathlist(addToPartialPathlist(nil, sorted), hashed)
+	for _, p := range list {
+		if p == hashed {
+			return true
+		}
+	}
+	return false
 }
 
 // parallelSeedCost is the partial input's price: startup unchanged, RUN cost

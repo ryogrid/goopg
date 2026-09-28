@@ -1567,3 +1567,86 @@ func TestUpperSplitPlainOrderedAggLowers(t *testing.T) {
 		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
 	}
 }
+
+// TestHashedPartialAggEvictedByFuzzyTiedSortedPartial pins M0146-0005af:
+// create_partial_grouping_paths files the sorted and the hashed partial
+// aggregate on the partially grouped rel through add_partial_path, so a
+// sorted partial within STD_FUZZ_FACTOR of the hashed one evicts it on
+// pathkeys, and gather_grouping_paths never wraps the hashed partial in the
+// presorted `Sort -> Partial HashAggregate`. TPC-H Q4/Q5/Q12 are the shape:
+// an expensive input (a nested loop) under a small group set, where the
+// worker sort is noise against the input's cost (PG: 69117.54 vs 68911.18).
+func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	survives := func(agg *Aggregate, inputTotal float64, enableSort bool) bool {
+		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inc, iav := sortedInputCtx(t, agg, ps)
+		if inputTotal > 0 {
+			pseed.Cost = Cost{Startup: 0.4, Total: inputTotal}
+		}
+		cp.enableSort = enableSort
+		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inc, iav)
+	}
+
+	// Expensive input: the worker sort is inside the fuzz.
+	if survives(sizedAggFixture(t, 2_000_000, 5, 1, 1), 50_000_000, true) {
+		t.Error("hashed partial survived a sorted partial within STD_FUZZ_FACTOR")
+	}
+	// enable_sort=off disables the sorted partial: disabled_nodes decides first.
+	if !survives(sizedAggFixture(t, 2_000_000, 5, 1, 1), 50_000_000, false) {
+		t.Error("hashed partial evicted by a disabled sorted partial")
+	}
+	// TPC-H Q1's shape over a plain scan: the worker sort is no tie.
+	if !survives(sizedAggFixture(t, 5_900_000, 2, 8, 2), 0, true) {
+		t.Error("hashed partial evicted where the worker sort is far dearer")
+	}
+}
+
+// TestUpperSplitSkipsArmsOverEvictedHashedPartial is the producer side of
+// M0146-0005af: with the hashed partial evicted, the grouped rel holds the
+// sorted-input split and neither the presorted split nor a hashed split
+// built on the evicted partial.
+func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	file := func(inputTotal float64) *RelOptInfo {
+		ps := upperSplitSettings()
+		cp := ps.costParams()
+		agg := sizedAggFixture(t, 2_000_000, 5, 1, 1)
+		agg.Strategy = AggStrategyHashed
+		u := newUpperRels()
+		grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+		sizeGroupingRelFromAgg(grouped, agg)
+		seed := newPrebuiltPath(grouped, agg.Child)
+		seed.Rows = float64(EstimateRows(agg.Child))
+		seed.Cost = Cost{Startup: 0.4, Total: inputTotal}
+		addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+		return grouped
+	}
+	hashedSplit := func(rel *RelOptInfo) *Path {
+		for _, p := range rel.Pathlist {
+			if p.Kind == PathFinalizeAgg && p.AggStrategy == AggStrategyHashed {
+				return p
+			}
+		}
+		return nil
+	}
+
+	tied := file(150_000_000)
+	if sortedSplitArm(tied) != nil || hashedSplit(tied) != nil {
+		t.Error("an arm over the evicted hashed partial was filed")
+	}
+	if sortedInputArm(tied) == nil {
+		t.Error("sorted-input split missing from the grouped rel")
+	}
+
+	cheap := file(costSeqscan(upperSplitSettings().costParams(), estScanPages(2_000_000, 32), 2_000_000, 0).Total)
+	// The grouped rel's own add_path adjudicates the two arms over a
+	// surviving hashed partial; at least one of them must be offered.
+	if hashedSplit(cheap) == nil && sortedSplitArm(cheap) == nil {
+		t.Error("no arm over the hashed partial where it wins outright")
+	}
+}
