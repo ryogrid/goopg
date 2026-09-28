@@ -191,6 +191,13 @@ func deriveWindowInputKeep(win *WindowAgg, above Node) ([]int, bool) {
 		}
 	}
 	in := win.Child.Output()
+	// M0146-0030: a KEY name that matches no input column means the
+	// name-based mapping failed — a column-alias list (`FROM (...) ss(z)`)
+	// renames the binding but not the leaf's output schema — so the answer
+	// is unknown, never a keep that silently omits the key.
+	if !inputTargetNamesPresent(keyNames, in) {
+		return nil, false
+	}
 	keep := make([]int, 0, len(need))
 	for i, col := range in {
 		if need[col.Name] {

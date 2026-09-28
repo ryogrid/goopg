@@ -23753,7 +23753,7 @@ M0146-0001 re-baseline census on the new default arm.
   - `join` still aborts the regress runner, on the separate pre\-existing
     M0146\-0030 below\.
   Movement: none — crash fix; regress join.sql advances from line 1768 to line 3217
-- [ ] **M0146\-0030 — planner panic: LATERAL subquery with a column alias
+- [x] **M0146\-0030 — planner panic: LATERAL subquery with a column alias
   list under ORDER BY** \(filed 2026\-09\-28 by M0146\-0029; pre\-existing,
   reproduces on the HEAD\-equivalent binary\)\. Regress `join.sql:3217`
   \(`int8\_tbl a, int8\_tbl x left join lateral \(select a\.q1 from int4\_tbl
@@ -23765,7 +23765,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: plan it on a private fixture cluster and find which
     sort key \(`ss\.z`, the aliased LATERAL output\) the Sort input target
     cannot place\.
-- [ ] **M0146\-0031 — planner panic: array\_agg\(distinct … order by …\) over
+- [x] **M0146\-0031 — planner panic: array\_agg\(distinct … order by …\) over
   a derived column alias list** \(filed 2026\-09\-28; pre\-existing — the
   regress `arrays` case already aborted the HEAD binary\)\. Regress
   `arrays.sql:682` \(`select array\_agg\(distinct ar order by ar desc\) from
@@ -23777,6 +23777,42 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: reproduce on a private cluster; check what column the
     DISTINCT/ORDER BY aggregate input needs from the `b\(ar\)` leaf that the
     empty input target omits\.
+  - **M0146\-0030 / M0146\-0031 DONE 2026\-09\-28** \(one cause, fixed in the
+    three sibling stamp sites together\): the Sort / Aggregate / WindowAgg
+    input\-target derivations map key reads to input positions BY NAME, and a
+    column\-alias list \(`\(…\) ss\(z\)`\) renames the binding but not the
+    leaf\'s output schema\. A key named `z` met input column `f1`, the keep
+    omitted it, and the coverage assert panicked on valid SQL\. Now a key
+    name absent from the input makes the derivation decline \(unknown — the
+    stamp is compute\-only\)\. Design
+    `docs/design/0100\-0149/m0146\-0030\-input\-target\-name\-mapping.md`\.
+    Regress `join` and `arrays` now run to completion; the rows then exposed
+    two pre\-existing wrong\-results defects, filed below\.
+  Movement: none — crash fix
+- [ ] **M0146\-0032 — WRONG RESULTS: a LATERAL subquery\'s outer reference
+  binds to a same\-named column of the wrong relation** \(filed 2026\-09\-28 by
+  M0146\-0030; S2, pre\-existing — reproduces on `611c32ed3`\)\. `select \*
+  from int8\_tbl a, int8\_tbl x left join lateral \(select a\.q1 from int4\_tbl
+  y\) ss\(z\) on x\.q2 = ss\.z` evaluates `a\.q1` as `x\.q1`: goopg returns
+  `z = 4567890123456789` where `x\.q1 = x\.q2 = 4567890123456789` and NULL
+  where `x\.q2 = 123`; PG \(regress join\.out:8254\) the reverse\.
+  Kind: impl
+  Parent: none
+  - First step: EXPLAIN VERBOSE the query on a private fixture cluster and
+    find where the lateral `OuterColumnRef a\.q1` is bound — the comma item
+    `a` sits to the left of the `x LEFT JOIN LATERAL` item, and the
+    reference likely resolves by name/position against `x`\'s row\.
+- [ ] **M0146\-0033 — WRONG RESULTS: array\_agg over an array input returns
+  an array of text, not a multidimensional array** \(filed 2026\-09\-28 by
+  M0146\-0030; S2, pre\-existing\)\. `select array\_agg\(x\) from \(values
+  \(array\[1\]\),\(array\[2\]\)\) v\(x\)` returns `\{"\{1\}","\{2\}"\}`; PG
+  returns `\{\{1\},\{2\}\}` \(array\_agg\_array\_transfn, regress
+  arrays\.out:2270\)\.
+  Kind: impl
+  Parent: none
+  - First step: port `array\_agg\_array\_transfn` / `array\_agg\_array\_finalfn`
+    \(src/backend/utils/adt/array\_userfuncs\.c\) as the anyarray arm of
+    goopg\'s array\_agg, including the dimension\-mismatch error\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

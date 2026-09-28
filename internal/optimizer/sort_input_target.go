@@ -111,6 +111,24 @@ func pathToSortNode(above Node, stopAt *Sort) ([]Node, bool) {
 	return nil, false
 }
 
+// inputTargetNamesPresent reports whether every name in names is the name of
+// some column of in. The three input-target derivations (Sort, Aggregate,
+// WindowAgg) map their key reads to input positions BY NAME; when a key name
+// is absent the mapping cannot be trusted and the derivation declines
+// (M0146-0030).
+func inputTargetNamesPresent(names map[string]bool, in Schema) bool {
+	have := make(map[string]bool, len(in))
+	for _, c := range in {
+		have[c.Name] = true
+	}
+	for n := range names {
+		if !have[n] {
+			return false
+		}
+	}
+	return true
+}
+
 // deriveSortInputKeep computes the Sort input keep-set: ascending positions
 // into the Sort's input schema (sort.Child.Output()) of the sort-key columns
 // plus the above-needed columns. above == nil means "no above information"
@@ -145,6 +163,13 @@ func deriveSortInputKeep(sort *Sort, above Node) ([]int, bool) {
 		}
 	}
 	in := sort.Child.Output()
+	// M0146-0030: a KEY name that matches no input column means the
+	// name-based mapping failed — a column-alias list (`FROM (...) ss(z)`)
+	// renames the binding but not the leaf's output schema — so the answer
+	// is unknown, never a keep that silently omits the key.
+	if !inputTargetNamesPresent(keyNames, in) {
+		return nil, false
+	}
 	keep := make([]int, 0, len(need))
 	for i, col := range in {
 		if need[col.Name] {

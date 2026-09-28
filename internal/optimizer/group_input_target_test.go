@@ -316,7 +316,11 @@ func TestAggregateAssertFiresOnUncoveredKey(t *testing.T) {
 			t.Fatalf("panic %q does not name the dropped key", msg)
 		}
 	}()
-	stampAggregateInputTarget(a, nil)
+	// M0146-0030: the derivation now DECLINES a key naming no input
+	// column (an alias list renames the binding, not the input), so the
+	// known-but-uncovering stamp is hand-built to exercise the assert.
+	a.InputTarget, a.InputTargetKnown = []int{0}, true
+	assertAggregateInputTargetCoversKeys(a)
 }
 
 // TestAssertFiresOnHandBuiltUncoveringStamp: the assert also fires when the

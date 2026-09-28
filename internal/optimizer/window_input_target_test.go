@@ -340,7 +340,11 @@ func TestWindowAssertFiresOnUncoveredPartitionKey(t *testing.T) {
 			t.Fatalf("panic %q does not name the dropped key", msg)
 		}
 	}()
-	stampWindowInputTarget(w, nil)
+	// M0146-0030: the derivation now DECLINES a key naming no input
+	// column (an alias list renames the binding, not the input), so the
+	// known-but-uncovering stamp is hand-built to exercise the assert.
+	w.InputTarget, w.InputTargetKnown = []int{0}, true
+	assertWindowInputTargetCoversKeys(w)
 }
 
 // TestWindowAssertFiresOnUncoveredOrderKey: the assert covers order keys too,
@@ -360,7 +364,11 @@ func TestWindowAssertFiresOnUncoveredOrderKey(t *testing.T) {
 			t.Fatalf("panic %q does not name the dropped key", msg)
 		}
 	}()
-	stampWindowInputTarget(w, nil)
+	// M0146-0030: the derivation now DECLINES a key naming no input
+	// column (an alias list renames the binding, not the input), so the
+	// known-but-uncovering stamp is hand-built to exercise the assert.
+	w.InputTarget, w.InputTargetKnown = []int{0}, true
+	assertWindowInputTargetCoversKeys(w)
 }
 
 // TestWindowAssertFiresOnHandBuiltUncoveringStamp: the assert also fires when
