@@ -23153,17 +23153,37 @@ M0146-0001 re-baseline census on the new default arm.
     sf025+sf1\); ea\-ratchet PASS \(52 fixed\) \+ baseline re\-pinned on
     EA\_PORT=5541 \(default 5534 was squatted by a foreign postgres —
     M0146\-0009d demonstrated live a second time\).
-- [ ] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
-  filed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
+- [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
+  filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
   short\-circuits `start_server`\) and on a stale `tmp/c20a/data\-sf025`
   clone without TPC\-DS tables; all 99 captures were `relation does not
   exist` ERRORs, `nodes scored: 0`, and the ratchet printed
-  `PASS \(52 fixed\)` — a NO\-COMPARE presented as all\-clear. Fix:
+  `PASS \(52 fixed\)` — a NO\-COMPARE presented as all\-clear. Fixed:
   verify the port\'s server is the gate\'s own \(binary/datadir identity\),
   and fail \(not PASS\) when `scored == 0` or the capture is all\-ERROR\.
   Kind: impl
   Parent: M0146-0009
+  - Landed \(design `docs/design/0100\-0149/m0146\-0009d\-ea\-ratchet\-vacuous\-pass\.md`,
+    evidence `analysis/m0146/m0146\-0009d/`): `verify_server` requires
+    `${EA_DATA}/postmaster\.pid` to name a live pid whose cmdline is
+    `start \-D EA\_DATA` \(as\-passed or `realpath`\-canonicalised\), the
+    pidfile's ListenAddr to cover EA\_PORT, and wire `version\(\)` to
+    contain `goopg` — pg\_isready may no longer short\-circuit a foreign
+    responder. Corpus sentinel \(`store_sales` in `pg\_class`\) plus a
+    hard `ANALYZE` gate \(`reltuples>0` count nonzero\) catch stale
+    clones; post\-capture, zero `=====` sections or all\-ERROR sections
+    exit 2; `parity\.py` itself refuses `queries==0`/`scored==0` with
+    exit 2 BEFORE any `--write\-baseline` or ratchet verdict — the exact
+    clobber path closed.
+  - `EA_VERIFY_ONLY=1` exposes `verify_server` standalone; covered by
+    `scripts/estimate\-parity\-gate\-test\.py` \(14 unittest cases —
+    vacuous captures exit 2 incl\. baseline\-write and ratchet paths;
+    pidfile dead\-pid/recycled\-pid/malformed negatives; `EA_CAPTURE`
+    end\-to\-end\).
+  - Gates: gate\-test 14/14 PASS; live negative against the real foreign
+    postgres on :5534 — refused with exit 2 immediately; full valid run
+    on EA\_PORT=5541 \(torn\-WAL clone override\) — see run log.
 - [ ] **M0146-0010 — `Materialize` node** (impl; M0144-0011c's sizing is
   the spec — `docs/design/0100-0149/m0144-0011c-materialize-sizing.md`
   §4's four slices). (1) plan node + EXPLAIN + `createPlan`, inert;

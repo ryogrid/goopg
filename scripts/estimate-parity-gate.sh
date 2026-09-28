@@ -81,6 +81,48 @@ score() {
         "${CAPTURE}" "${EA_PGDIR}" --json "${EA_OUT}/ea-findings.json" "${extra[@]}"
 }
 
+PSQL=(psql -h 127.0.0.1 -p "${EA_PORT}" -U postgres -d postgres -X -q -A -t
+      -v ON_ERROR_STOP=0)
+
+# M0146-0009d: verify_server — is the thing answering on EA_PORT THIS gate's
+# goopg? pg_isready only proves "something speaks the wire protocol"; a
+# foreign postgres squatting on the default port twice let the gate score an
+# all-ERROR capture and print a vacuous PASS (2026-09-28). Identity here is
+# three independent facts: the pidfile INSIDE EA_DATA names a live pid whose
+# cmdline is a goopg `start -D <EA_DATA>` (a stale pidfile naming a recycled
+# pid fails the cmdline check), the pidfile's recorded listen address covers
+# EA_PORT, and the wire-level version() carries goopg's own string (a real
+# PostgreSQL never emits it).
+verify_server() {
+    local pidfile="${EA_DATA}/postmaster.pid" pid cmdline canon line4
+    [[ -f "${pidfile}" ]] || return 1
+    pid="$(sed -n '1p' "${pidfile}")"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    [[ -r "/proc/${pid}/cmdline" ]] || return 1
+    cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+    # `start` is the subcommand every invocation of this gate passes; a real
+    # postgres postmaster's cmdline (`postgres -D …`) never carries it.
+    [[ "${cmdline}" == *"start"* ]] || return 1
+    canon="$(realpath "${EA_DATA}" 2>/dev/null || echo "${EA_DATA}")"
+    case " ${cmdline} " in
+        *" -D ${EA_DATA} "*|*" -D=${EA_DATA} "*|*" -D ${canon} "*|*" -D=${canon} "*) ;;
+        *) return 1 ;;
+    esac
+    line4="$(sed -n '4p' "${pidfile}")"
+    [[ "${line4}" == *:"${EA_PORT}" ]] || return 1
+    "${PSQL[@]}" -c "SELECT version()" 2>/dev/null | grep -qi goopg
+}
+
+# Test/debug seam: check the port's server identity and nothing else.
+if [[ -n "${EA_VERIFY_ONLY:-}" ]]; then
+    if verify_server; then
+        log "verify OK: :${EA_PORT} is a goopg serving ${EA_DATA}"
+        exit 0
+    fi
+    log "verify FAILED: :${EA_PORT} is not this gate's goopg on ${EA_DATA}"
+    exit 2
+fi
+
 # Re-score an existing capture without touching a server at all. This is the
 # mode a reviewer uses on a committed capture, and the mode that makes the
 # gate cheap enough to run against a code change that cannot move a row count.
@@ -113,14 +155,36 @@ stop_server() {
 trap stop_server EXIT
 
 start_server() {
-    pg_isready -h 127.0.0.1 -p "${EA_PORT}" >/dev/null 2>&1 && return 0
+    if pg_isready -h 127.0.0.1 -p "${EA_PORT}" >/dev/null 2>&1; then
+        # Something is already listening. Reuse it ONLY if it is this
+        # gate's own goopg on EA_DATA — a foreign responder used to
+        # short-circuit straight past startup and score all-ERROR captures
+        # (M0146-0009d).
+        if verify_server; then
+            log "reusing this gate's server already on :${EA_PORT}"
+            return 0
+        fi
+        log "port ${EA_PORT} is held by a server that is not this gate's" \
+            "goopg on ${EA_DATA} — refusing to capture against it"
+        return 1
+    fi
     systemctl --user reset-failed "${EA_CG_UNIT}.scope" >/dev/null 2>&1
     GOOPG_CG_UNIT="${EA_CG_UNIT}" "${REPO_ROOT}/scripts/goopg-test-run.sh" \
         "${EA_BIN}" start -D "${EA_DATA}" --listen "127.0.0.1:${EA_PORT}" \
         >>"${EA_OUT}/server.log" 2>&1 &
-    local i
+    local child=$! i
     for i in $(seq 1 "${EA_READY_TRIES:-300}"); do
-        pg_isready -h 127.0.0.1 -p "${EA_PORT}" >/dev/null 2>&1 && return 0
+        if pg_isready -h 127.0.0.1 -p "${EA_PORT}" >/dev/null 2>&1; then
+            verify_server && return 0
+            # Port answers but identity fails. If our spawn is already dead
+            # the responder is foreign — fail now instead of waiting out the
+            # loop.
+            kill -0 "${child}" 2>/dev/null || {
+                log "spawned server exited but :${EA_PORT} still answers" \
+                    "— a foreign server holds the port"
+                return 1
+            }
+        fi
         sleep 2
     done
     return 1
@@ -132,8 +196,17 @@ if ! start_server; then
     exit 2
 fi
 
-PSQL=(psql -h 127.0.0.1 -p "${EA_PORT}" -U postgres -d postgres -X -q -A -t
-      -v ON_ERROR_STOP=0)
+# M0146-0009d: corpus sanity. The verified server is a goopg on EA_DATA, but
+# a stale or wrongly-seeded clone can still lack the TPC-DS tables — the
+# second half of the 2026-09-28 incident. A gate that captures 99
+# `relation does not exist` answers measures nothing.
+CORPUSOK="$("${PSQL[@]}" -c \
+    "SELECT count(*) FROM pg_class WHERE relname = 'store_sales'" \
+    2>/dev/null | tr -d ' ')"
+if [[ ! "${CORPUSOK}" =~ ^[0-9]+$ || "${CORPUSOK}" -eq 0 ]]; then
+    log "EA_DATA has no TPC-DS corpus (store_sales absent) — refusing to capture"
+    exit 2
+fi
 
 # ---------------------------------------------------------------- analyze
 #
@@ -148,6 +221,12 @@ done
 ANOK=$("${PSQL[@]}" -c \
     "SELECT count(*) FROM pg_class WHERE reltuples > 0" 2>/dev/null | tr -d ' ')
 log "  relations with reltuples > 0: ${ANOK:-?}"
+# M0146-0009d: a capture over an un-analyzed corpus measures the default
+# selectivities, not the estimators — refuse rather than score it.
+if [[ ! "${ANOK}" =~ ^[0-9]+$ || "${ANOK}" -eq 0 ]]; then
+    log "ANALYZE left no analyzed relations — refusing to capture blind"
+    exit 2
+fi
 
 # ---------------------------------------------------------------- capture
 #
@@ -179,6 +258,23 @@ for q in $(seq 1 "${EA_NQ}"); do
     fi
 done
 log "capture done: $(wc -l <"${CAPTURE}") lines; non-zero psql rc:${FAILED:- none}"
+
+# M0146-0009d: never hand a vacuous capture to the scorer. ON_ERROR_STOP=0
+# means psql exits 0 even when every statement in the file errored, so an
+# all-ERROR corpus passes the per-query rc check silently — this is the
+# shape the foreign-server incident took.
+QBLOCKS="$(grep -c '^===== Q' "${CAPTURE}")"
+# psql renders file-mode errors as `psql:<file>:<line>: ERROR:  …` — the
+# marker is mid-line, so match it unanchored.
+ERRBLOCKS="$(awk '/^===== Q/      { if (q) tot += err; q++; err = 0 }
+                 /ERROR:|FATAL:/ { err = 1 }
+                 END             { if (q) tot += err; print tot + 0 }' \
+                 "${CAPTURE}")"
+if [[ "${QBLOCKS}" -eq 0 || "${ERRBLOCKS}" -eq "${QBLOCKS}" ]]; then
+    log "capture is empty or all-ERROR (${ERRBLOCKS}/${QBLOCKS} sections" \
+        "errored) — refusing to score a vacuous capture"
+    exit 2
+fi
 
 {
     echo "# ea-parity capture"
