@@ -23982,7 +23982,7 @@ M0146-0001 re-baseline census on the new default arm.
     pushdown refusal \(`subquery_is_pushdown_safe`, window/aggregate
     output quals\) against goopg's flattening for Q53.
 
-- [ ] **M0146\-0017 — stacked WindowAggs share one sort, as PG does**
+- [x] **M0146\-0017 — stacked WindowAggs share one sort, as PG does**
   \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q47, Q57 \(both scales\): PG
   places two WindowAggs directly over one Sort \(compatible window
   orderings, `select_active_windows` ordering\); goopg inserts a Sort
@@ -23991,6 +23991,17 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146-0001
   - First step: compare goopg's window\-clause ordering with PG's
     `select_active_windows` / `common_prefix_cmp` on Q47.
+  - **DONE 2026\-09\-30 \(verified resolved\)\.** Q47/Q57 at both scales
+    now plan `WindowAgg \-> WindowAgg \-> GroupAggregate \-> Gather Merge`
+    with no Sort between the windows, node for node as PG 18\.3\. The fix
+    was M0146\-0005ay \(slice 51, create\_one\_window\_path\'s presorted
+    test: a WindowAgg passes its input ordering through, so the second
+    window\'s required keys are already delivered\)\. Evidence
+    `analysis/m0146/m0146\-0017/window\-stacks\-20260930.txt`
+    \(fire set 20a captures\)\.
+    - Remaining rendering gap, already ledgered under M0134\-0022 bucket D:
+      PG prints `Window: wN AS \(...\)` under each WindowAgg, goopg none\.
+  Movement: none — recon; the window stack already matched since M0146-0005ay (slice 51)
 
 - [ ] **M0146\-0018 — grouping without aggregates plans as PG\'s `Group`
   node** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q37, Q82 \(both
