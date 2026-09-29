@@ -23202,6 +23202,25 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q8, none introduced\), TPC\-H census identical, regress runner 6
     cases \(no semantic delta\)\.
   Movement: yes — TPC-DS PLAN-PARITY match SF0.25 21 -> 22, SF1 19 -> 20 (Q8); CATEGORIES-EXCL-MATCH SF0.25 scan-type 42 -> 41, aggregation-strategy 24 -> 23; SF1 scan-type 46 -> 45, aggregation-strategy 26 -> 25
+- [x] **M0146\-0005ax — an ordering crosses a computing Project and a
+  Subquery Scan** \(slice 50, impl, done 2026\-09\-29 from the census record
+  `PG Subquery Scan on y \| goopg Sort` on TPC\-DS Q51\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 50"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `inputNodePathkeys` gains `projectEmissionPathkeys`
+    \(`convert\_subquery\_pathkeys`: child key → target computing the same
+    deterministic expression\) and a `SubqueryScan` positional arm\.
+  - Q64: CTE\-scan pathkeys now reach its final join \(Merge Join without
+    Sort, sound — body keyed item\_sk, store\_name, zip\); PG nest\-loops
+    over a differently planned body; first divergence unchanged\.
+  - Tests: `TestProjectEmissionPathkeysCarriesComputedOrdering` \(fails on
+    base\); positional\-identity test re\-pinned for permutation/narrowing\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q21 Q51 Q64, none introduced\), TPC\-H census identical, regress
+    runner 9 cases \(no semantic delta\); Q51 ordered output md5 = PG\.
+  Movement: yes — TPC-DS PLAN-PARITY match SF0.25 22 -> 23, SF1 20 -> 21 (Q21); CATEGORIES-EXCL-MATCH SF0.25 join-order 62 -> 61, scan-type 41 -> 40, sort-strategy 44 -> 43, parallelism 42 -> 41, rendering 20 -> 21; SF1 join-order 63 -> 62, scan-type 45 -> 44, sort-strategy 47 -> 46, parallelism 52 -> 51, rendering 18 -> 19
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

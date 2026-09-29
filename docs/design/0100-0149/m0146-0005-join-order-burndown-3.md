@@ -547,3 +547,44 @@ Test: a case in `TestSwapIntersectInputs` (a computed arm over a
 Movement: TPC-DS PLAN-PARITY match SF0.25 21 → 22 and SF1 19 → 20 (Q8 =
 PG at both scales). scan-type and aggregation-strategy each fall by 1.
 TPC-H is identical. Evidence: `analysis/m0146/m0146-0005/slice49/`.
+
+## Slice 50: M0146-0005ax — an ordering crosses a computing Project and a Subquery Scan (convert_subquery_pathkeys)
+
+TPC-DS Q51 sorted its final 100 rows again: `Limit → Sort → Subquery Scan on
+y → WindowAgg → Sort (CASE …)`, where PG prints no top Sort. The window's
+input is sorted on `CASE WHEN web.item_sk IS NOT NULL THEN web.item_sk ELSE
+store.item_sk END`, which is the expression subquery x publishes as
+`item_sk`. PG's `convert_subquery_pathkeys` matches that pathkey to the
+target-list entry computing it, so the rows y publishes are already ordered
+on `ORDER BY item_sk, d_date`. goopg's `inputNodePathkeys` crossed only
+schema-identical wrappers. It stopped at the Project that computes the CASE
+columns, and it had no arm for `SubqueryScan`.
+
+- Project arm: a non-identity, non-isolated Project now delivers
+  `projectEmissionPathkeys`. That takes the child's ordering and maps each
+  key to the output position of the target that computes the same
+  expression (`exprEqual`), stopping at the first unmapped key. So a
+  permutation moves a key and a narrowing keeps it. A key whose expression
+  contains a function call or a sublink is not carried, because the
+  Project re-evaluates it and a volatile value need not reproduce the sort.
+  `orderPreservingExpr` is a whitelist of deterministic node kinds, pinned
+  as a classifier in `exprSwitchInventory`.
+- SubqueryScan arm: the wrapper publishes its subplan's rows position for
+  position under the reference's names, so it is a positional-identity
+  step.
+
+`inputNodePathkeys` also feeds CTE-scan pathkeys and the slice-47 Merge
+Append, so orderings computed inside CTE bodies now reach merge joins. In
+Q64, the two `cross_sales` scans now merge-join without a Sort. The body
+really is ordered on the keys, so the claim is sound. PG plans that body
+differently and nest-loops, and Q64's first divergence is unchanged.
+
+Tests: `TestProjectEmissionPathkeysCarriesComputedOrdering` (new; fails on
+base). In `TestProjectIsPositionalIdentityRefusesEverythingElse`, the
+permutation and narrowing cases now expect the translated key, and the
+computed, isolated-scope and empty-target cases still stop. Q51's ordered
+LIMIT output is md5-identical to PG's.
+
+Movement: TPC-DS PLAN-PARITY match SF0.25 22 → 23 and SF1 20 → 21 (Q21 =
+PG at both scales). Q51's first divergence moves from depth 1 to 4. TPC-H
+is identical. Evidence: `analysis/m0146/m0146-0005/slice50/`.

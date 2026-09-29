@@ -346,6 +346,24 @@ func inputNodePathkeys(input Node) []PathKey {
 			return deliver(mergeJoinEmissionPathkeys(t))
 		case *Project:
 			if !projectIsPositionalIdentity(t) {
+				// M0146-0005ax: convert_subquery_pathkeys. A Project that
+				// computes its columns still passes its child's rows through
+				// in order; a child ordering survives as the target that
+				// computes the same expression — TPC-DS Q51's
+				// `item_sk = CASE WHEN web.item_sk IS NOT NULL …`, the very
+				// expression its WindowAgg's input was sorted on.
+				if t.IsolatedScope || !agrees(t.Output()) {
+					return nil
+				}
+				return deliver(projectEmissionPathkeys(t))
+			}
+			renamed = true
+			n = t.Child
+		case *SubqueryScan:
+			// M0146-0005ax: the labelling wrapper publishes its subplan's
+			// rows position for position under the reference's own column
+			// names — a positional-identity step, like the Project above.
+			if t.Child == nil || len(t.Child.Output()) != limit {
 				return nil
 			}
 			renamed = true
@@ -713,4 +731,61 @@ func relabelPathkeysTo(keys []PathKey, out Schema) []PathKey {
 		return nil
 	}
 	return kept
+}
+
+// projectEmissionPathkeys is convert_subquery_pathkeys (pathkeys.c) for a
+// computing Project: the child's ordering, key by key, expressed as the
+// output position of the target that computes the same expression. The
+// translation stops at the first key no target carries — an ordering prefix
+// is still an ordering, a gapped one is not. A key whose expression could be
+// volatile or holds a sublink is not carried: re-evaluated in the Project it
+// need not reproduce the value the rows were sorted on.
+func projectEmissionPathkeys(p *Project) []PathKey {
+	if p == nil || p.Child == nil {
+		return nil
+	}
+	below := inputNodePathkeys(p.Child)
+	out := p.Output()
+	var keys []PathKey
+	for _, bk := range below {
+		if !orderPreservingExpr(bk.Expr) {
+			break
+		}
+		pos := -1
+		for j, t := range p.Targets {
+			if j < len(out) && exprEqual(t, bk.Expr) {
+				pos = j
+				break
+			}
+		}
+		if pos < 0 {
+			break
+		}
+		c := out[pos]
+		keys = append(keys, PathKey{
+			Expr:       &ColumnRef{Index: pos, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx},
+			SortAsc:    bk.SortAsc,
+			NullsFirst: bk.NullsFirst,
+		})
+	}
+	return keys
+}
+
+// orderPreservingExpr reports whether e is built only from nodes whose value
+// is a deterministic function of the row: column references, constants, CASE,
+// NULL/boolean/distinctness tests, casts, collations and operators. Function
+// calls (whose volatility this package cannot always see) and sublinks are
+// refused.
+func orderPreservingExpr(e Expr) bool {
+	ok := true
+	walkExprTree(e, func(x Expr) {
+		switch x.(type) {
+		case *ColumnRef, *IntegerConst, *StringConst, *NumericConst, *BooleanConst,
+			*NullConst, *TypedStringLit, *CaseExpr, *IsNullExpr, *IsBoolExpr,
+			*IsDistinctFromExpr, *CastExpr, *CollateExpr, *BinaryOp, *UnaryOp:
+		default:
+			ok = false
+		}
+	})
+	return ok
 }

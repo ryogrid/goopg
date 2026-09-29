@@ -387,6 +387,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:subqueryANDReachable":            walkerPending, // 2 of 32 arms
 	"unnest.go:walkExprTree":                    walkerPending, // 8 of 32 arms
 	"unnest.go:walkSubqueryPlansInExpr":         walkerPending, // 9 of 32 arms
+	// Added by M0146-0005ax. A per-node whitelist evaluated inside
+	// walkExprTree (which owns the recursion): any unlisted type makes the
+	// key decline to cross a computing Project, the conservative answer.
+	"upperorderedinput.go:orderPreservingExpr": nonRecursiveClassifier,
 	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
 	// cloneExprRefs (which carries both the recursion and the
 	// exhaustiveness); what the census sees is the four-arm dispatch

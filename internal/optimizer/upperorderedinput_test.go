@@ -509,25 +509,30 @@ func TestInputNodePathkeysCrossesAPositionalIdentityProject(t *testing.T) {
 func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
 	agg := upperOrderedSortedAgg()
 
+	// wantAt is the output position the child's group-key ordering must be
+	// claimed at once the Project is crossed by convert_subquery_pathkeys
+	// (M0146-0005ax: a permutation or a narrowing still carries the column
+	// that holds the key), or -1 when no claim may survive.
 	cases := []struct {
 		name   string
 		mutate func(*Project)
+		wantAt int
 	}{
-		{"a permutation needs a position map", func(p *Project) {
+		{"a permutation moves the key to its new position", func(p *Project) {
 			p.Targets[0] = &ColumnRef{Index: 1, Name: "count"}
 			p.Targets[1] = &ColumnRef{Index: 0, Name: "k"}
-		}},
+		}, 1},
 		{"a computed column is a new value", func(p *Project) {
 			p.Targets[0] = &BinaryOp{}
-		}},
+		}, -1},
 		{"an isolated scope indexes its targets in another space", func(p *Project) {
 			p.IsolatedScope = true
-		}},
-		{"a narrowing projection is not yet expressible", func(p *Project) {
+		}, -1},
+		{"a narrowing projection keeps the key column", func(p *Project) {
 			p.Targets = p.Targets[:1]
 			p.schema = p.schema[:1]
-		}},
-		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }},
+		}, 0},
+		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }, -1},
 	}
 	for _, c := range cases {
 		p := identityProject(agg, "renamed_k", "n")
@@ -535,8 +540,18 @@ func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
 		if projectIsPositionalIdentity(p) {
 			t.Fatalf("%s: admitted, want refused", c.name)
 		}
-		if got := inputNodePathkeys(p); got != nil {
-			t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+		got := inputNodePathkeys(p)
+		if c.wantAt < 0 {
+			if got != nil {
+				t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+			}
+			continue
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s: want one key at position %d, got %v", c.name, c.wantAt, got)
+		}
+		if cr, ok := got[0].Expr.(*ColumnRef); !ok || cr.Index != c.wantAt {
+			t.Fatalf("%s: want the key at position %d, got %#v", c.name, c.wantAt, got[0].Expr)
 		}
 	}
 }
