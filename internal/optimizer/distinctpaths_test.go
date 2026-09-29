@@ -306,7 +306,7 @@ func addPartialDistinctFor(t *testing.T, d *Distinct, ps PlannerSettings) (*RelO
 	if seed.Cost.Total <= 0 {
 		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 	}
-	addPartialDistinctPaths(u, dr, seed, d, child, cp, ps)
+	addPartialDistinctPaths(u, dr, seed, d, child, cp, ps, nil)
 	for _, p := range dr.Pathlist {
 		if p != nil && p.Kind == PathDistinct && p.Unique &&
 			len(p.Children) == 1 && p.Children[0].Kind == PathGatherMerge {
@@ -314,6 +314,57 @@ func addPartialDistinctFor(t *testing.T, d *Distinct, ps PlannerSettings) (*RelO
 		}
 	}
 	return dr, nil
+}
+
+// sortedArmSettings is upperSplitSettings with enable_hashagg off, so the
+// partial HASHED arm carries a disabled node and the sorted Unique arm the
+// tests below inspect is the one add_path keeps (M0146-0005bf).
+func sortedArmSettings() PlannerSettings {
+	ps := upperSplitSettings()
+	ps.EnableHashAgg = false
+	return ps
+}
+
+// TestPartialDistinctHashedArmLowers pins the hashed arm of
+// create_partial_distinct_paths (planner.c:4983, M0146-0005bf): PG 18.3's
+// select_distinct.sql `SELECT DISTINCT four FROM tenk1` plan is
+// `Unique -> Gather Merge -> Sort -> HashAggregate -> Parallel Seq Scan`.
+// The per-worker node is a group-only hashed Aggregate carrying the
+// PartialGroup mark the driving-scan walks descend through.
+func TestPartialDistinctHashedArmLowers(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	d := sizedDistinctFixture(t, 5_900_000, 4)
+	_, final := addPartialDistinctFor(t, d, upperSplitSettings())
+	if final == nil {
+		t.Fatal("producer filed no candidate")
+	}
+	node, _ := createPlanNode(final)
+	leader, ok := node.(*DistinctOn)
+	if !ok || leader.PartialUnique {
+		t.Fatalf("final path lowered to %T (marked=%v), want an unmarked *DistinctOn", node, ok && leader.PartialUnique)
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("merge child is %T, want the worker *Sort", gm.Child)
+	}
+	agg, ok := srt.Child.(*Aggregate)
+	if !ok || !agg.PartialGroup || agg.Strategy != AggStrategyHashed || len(agg.Aggs) != 0 {
+		t.Fatalf("worker sort child is %T, want a PartialGroup hashed group-only *Aggregate", srt.Child)
+	}
+	if len(agg.GroupExprs) != len(agg.Output()) {
+		t.Fatalf("the dedup must group on all %d output columns, got %d", len(agg.Output()), len(agg.GroupExprs))
+	}
+	scan, ok := agg.Child.(*SeqScan)
+	if !ok || !scan.Parallel {
+		t.Fatalf("the hashed dedup's input is %T, want a Parallel *SeqScan", agg.Child)
+	}
 }
 
 // partialDistinctChain unwraps the candidate's `Unique -> Gather Merge ->
@@ -343,7 +394,7 @@ func TestPartialDistinctArmFilesThePGShape(t *testing.T) {
 	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
-	dr, final := addPartialDistinctFor(t, d, upperSplitSettings())
+	dr, final := addPartialDistinctFor(t, d, sortedArmSettings())
 	if final == nil {
 		t.Fatal("no `Unique -> Gather Merge -> Unique` candidate was filed")
 	}
@@ -386,7 +437,7 @@ func TestPartialDistinctArmLowers(t *testing.T) {
 	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
-	_, final := addPartialDistinctFor(t, d, upperSplitSettings())
+	_, final := addPartialDistinctFor(t, d, sortedArmSettings())
 	if final == nil {
 		t.Fatal("producer filed no candidate")
 	}

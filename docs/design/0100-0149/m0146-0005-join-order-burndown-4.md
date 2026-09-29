@@ -134,3 +134,58 @@ SF1 11 → 9); only Q47 and Q57 move, and both execute. TPC-H plans are
 byte-identical. The regress runner (8 cases) shows only the known join.sql
 row-order flap. Evidence: `analysis/m0146/m0146-0005/slice57/`. This
 resolves slice 56's ledgered "residual equality inside Merge Cond" row.
+
+## Slice 58: M0146-0005bf — a parallel DISTINCT stands on the cheapest partial path
+
+TPC-DS Q38/Q87 dedup each set-operation branch with a parallel DISTINCT.
+goopg printed `Sort (cost=8471.30..)` over its partial `Nested Loop
+(cost=..18260.63)`, which is impossible: a Sort's startup cost includes
+its input's total. The partial DISTINCT arm (`addPartialDistinctPaths`)
+priced its per-worker input as the serial input's run cost divided by the
+parallel divisor (`parallelSeedCost`, an acknowledged approximation). The
+node it ran over was the search's own partial path, whose per-worker cost
+the search had already computed. The grouped-aggregate split stopped
+approximating in M0146-0005ap; the DISTINCT arm never followed.
+
+- `createDistinctPaths` passes `searchedCheapestPartialInput`'s rebuilt
+  input and partial path to the arm. Workers, per-worker rows and the seed
+  cost come from that path, as `create_partial_distinct_paths` reads
+  `input_rel->cheapest_partial_path` (planner.c:4897-4930). Without one,
+  the arm keeps the old fallback.
+- Priced honestly, the sorted arm (which sorts every input row per worker)
+  stopped beating the serial plan on select\_distinct.sql's `SELECT
+  DISTINCT four FROM tenk1`, which PG plans in parallel through its HASHED
+  arm (planner.c:4983). goopg's arm had refused that one. It is now filed:
+  `Unique -> Gather Merge -> Sort -> HashAggregate(partial)`. The per-worker
+  node is a group-only hashed Aggregate over every output column, carrying
+  the `PartialGroup` mark the parallel walks already descend through
+  (M0146-0025). A dedup has no transition state, so the refusal's stated
+  reason did not apply.
+
+Tests:
+
+- `TestPartialDistinctHashedArmLowers` pins the hashed arm's node chain
+  down to a Parallel SeqScan.
+- The sorted-arm tests run with `enable_hashagg` off so they keep
+  inspecting that arm.
+- On a scratch server, parallel and serial runs of multi-column DISTINCTs
+  return identical results.
+
+Movement: no TPC-DS category change. Q38/Q54/Q87 costs move to PG's
+(Q87's Sort 18315.79 over the 18260.63 partial Nested Loop, PG 18352.37;
+total 43057 against PG's 43325), and all three execute at both scales.
+select\_distinct.sql's parallel case now matches PG 18.3 exactly (diff
+102 → 97 lines). TPC-H plans are byte-identical. Evidence:
+`analysis/m0146/m0146-0005/slice58/`.
+
+Q87 still hashes its set operations where PG sorts them (`SetOp
+Except`). The leader Unique estimates 355 rows where PG estimates 3260
+(its estimate\_num\_groups keeps the input row count), and that estimate
+drives the setop choice. Next.
+
+Ledgered:
+
+- EXPLAIN prints every Aggregate's cost through the legacy display
+  derivation: `Aggregate` carries no PlanCost, so a path-chosen partial
+  HashAggregate prints 2845.67 where its path costs 1949.84.
+- The Q87 DISTINCT row estimate.

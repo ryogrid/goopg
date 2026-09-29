@@ -74,7 +74,16 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 
 	addDistinctPaths(distinctRel, seed, distinctNode, child, cp, ps)
-	addPartialDistinctPaths(u, distinctRel, seed, distinctNode, child, cp, ps)
+	// M0146-0005bf: create_partial_distinct_paths dedups
+	// `input_rel->cheapest_partial_path` (planner.c:4897-4930), priced at
+	// that path's own per-worker cost — the aggregate split's M0146-0005ap
+	// route. Only when the search built none does the arm fall back to the
+	// committed serial child seeded by parallelSeedCost.
+	partialChild, partial := child, (*Path)(nil)
+	if c2, pp := searchedCheapestPartialInput(child, cp); c2 != nil {
+		partialChild, partial = c2, pp
+	}
+	addPartialDistinctPaths(u, distinctRel, seed, distinctNode, partialChild, cp, ps, partial)
 	setCheapest(distinctRel)
 
 	best := getCheapestFractionalPath(distinctRel, tupleFraction)
@@ -328,13 +337,11 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 // re-dedups the merge, so the driving-scan walks gate the descent on
 // the mark rather than on the node kind.
 //
-// The arm is sorted-only, deliberately narrower than upstream's
-// producer: upstream also offers a partial HASHED aggregate for DISTINCT
-// (planner.c:4989) and a LIMIT-1 partial path for an empty distinct
-// pathkey list; goopg's hashed partial emission is the transition-state
-// transport, which a dedup has no state to feed, and the empty-keys case
-// is left serial — both refusals, never approximations.
-func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings) {
+// Both of upstream's arms are filed: the sorted partial Unique and the
+// partial HASHED dedup (planner.c:4989, M0146-0005bf). Upstream's LIMIT-1
+// partial path for an empty distinct pathkey list is not: the empty-keys
+// case is left serial — a refusal, not an approximation.
+func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings, partial *Path) {
 	if !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
 		traceUpperGate("distinct-upper", "refused", "gate=statement")
 		return
@@ -399,6 +406,9 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		return
 	}
 	workers := upperSplitWorkers(child, cp, ps)
+	if partial != nil && partial.ParallelWorkers > 0 {
+		workers = partial.ParallelWorkers
+	}
 	if workers <= 0 {
 		traceUpperGate("distinct-upper", "refused", "gate=workers")
 		return
@@ -413,6 +423,9 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		inputRows = 1
 	}
 	perWorkerRows := inputRows / d
+	if partial != nil && partial.Rows > 0 {
+		perWorkerRows = partial.Rows
+	}
 	// Upstream's numDistinctRows (planner.c:4897-4900): estimate_num_groups
 	// over the cheapest_partial_path's row count — the per-worker scale.
 	// Same ColumnRef-over-output-schema exprs estimateDistinctRows builds.
@@ -444,6 +457,9 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	pseed := newPrebuiltPath(partialRel, child)
 	pseed.Rows = perWorkerRows
 	pseed.Cost = parallelSeedCost(seed.Cost, d)
+	if partial != nil {
+		pseed.Cost = partial.Cost
+	}
 	pseed.ParallelSafe = true
 	pseed.ParallelWorkers = workers
 
@@ -505,4 +521,50 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Children:      []*Path{gmPath},
 	}
 	addPath(distinctRel, finalPath, distinctPartialUniqueProducer)
+
+	// The HASHED arm (planner.c:4983-5003, M0146-0005bf): each worker
+	// hash-dedups its partition with a partial HashAggregate, sorts the
+	// survivors, and the leader re-dedups the merged stream —
+	// `Unique -> Gather Merge -> Sort -> HashAggregate`. The partial node
+	// is a group-only hashed Aggregate over every output column (a dedup
+	// needs no transition state) carrying the PartialGroup marker the
+	// parallel walks already descend through (M0146-0025). Once
+	// the partial input is priced at its real per-worker cost, this is the
+	// arm that makes a parallel DISTINCT pay: the sorted arm sorts every
+	// input row per worker, this one only the distinct ones.
+	groupExprs := make([]Expr, len(cols))
+	for i, c := range cols {
+		groupExprs[i] = &ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	}
+	hashSpec := &Aggregate{pos: distinctNode.pos, GroupExprs: groupExprs,
+		schema: append(Schema(nil), cols...), PartialGroup: true}
+	hashPartial := &Path{
+		Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: hashSpec,
+		Rel: partialRel, Rows: partialGroups,
+		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
+		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+			len(cols), partialGroups, 0, 0, 0),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+		Children:        []*Path{pseed},
+	}
+	addPath(partialRel, hashPartial, distinctPartialUniqueProducer)
+	hashSort := sortPathForBounded(hashPartial, mergeKeys, cp, -1)
+	hashSort.ParallelWorkers = workers
+	hgmCost := gatherMergeCost(cp, hashSort.Cost, workers, crossed)
+	hgmPath := &Path{
+		Kind: PathGatherMerge, Rel: distinctRel, Rows: crossed, Cost: hgmCost,
+		Pathkeys:      append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:  false,
+		DisabledNodes: hashSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{hashSort},
+	}
+	addPath(distinctRel, &Path{
+		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
+		Rel: distinctRel, Rows: finalRows,
+		DisabledNodes: hgmPath.DisabledNodes,
+		Cost:          distinctCost(hgmCost.Startup, hgmCost.Total, crossed, finalRows, cp),
+		Pathkeys:      hgmPath.Pathkeys,
+		Children:      []*Path{hgmPath},
+	}, distinctPartialUniqueProducer)
 }

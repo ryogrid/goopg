@@ -23345,6 +23345,25 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q47, Q57 at both scales\), TPC\-H census byte\-identical, regress
     runner 8 cases \(join\.sql row\-order flap only\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 qual-placement 14 -> 12; SF1 qual-placement 11 -> 9 (Q47, Q57)
+- [x] **M0146\-0005bf — a parallel DISTINCT stands on the cheapest partial
+  path** \(slice 58, impl, done 2026\-09\-30 from Q87\'s Sort\-below\-input
+  cost\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 58"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `addPartialDistinctPaths` takes `searchedCheapestPartialInput`\'s
+    partial path \(workers, rows, cost\) instead of `parallelSeedCost`\.
+  - PG\'s hashed partial arm filed: `Unique \-> Gather Merge \-> Sort \->
+    HashAggregate\(PartialGroup\)`\.
+  - Tests `TestPartialDistinctHashedArmLowers`; sorted\-arm tests run with
+    enable\_hashagg off\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q38/Q54/Q87 both scales\), TPC\-H census byte\-identical, regress
+    runner 5 cases \(select\_distinct parallel case = PG, 102 \-> 97\)\.
+  - Next: Q87\'s leader Unique estimates 355 rows \(PG 3260\), which keeps
+    the set operations hashed where PG sorts\.
+  Movement: none — TPC-DS categories unchanged; costs of Q38/Q54/Q87 now PG's (Q87 total 43057 vs PG 43325); regress select_distinct 102 -> 97 diff lines
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
