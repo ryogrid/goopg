@@ -636,6 +636,14 @@ func pushConjunctTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		// defect class as R56's Q78 loss (three `Filter:` lines dropped
 		// with sweep checksums still green): a values-only gate cannot see
 		// a qual-placement divergence from PG.
+		//
+		// M0146-0005aq: only a parallel-safe conjunct crosses. Below the
+		// Gather it runs inside every worker, which PG never allows for a
+		// restricted or unsafe qual (consider_parallel), and a SubPlan over
+		// its own Gather would nest parallel plans inside workers.
+		if !gatherPushableConjunct(c) {
+			return n, false
+		}
 		repl, ok := pushConjunctTraced(x.Child, c, st)
 		if !ok {
 			return n, false

@@ -316,6 +316,13 @@ func pushConjunctIntoCTEBodyTraced(n Node, c Expr, st *pushTrace) (Node, bool) {
 		// same boundary the *Sort* precedent draws. General-path
 		// Gather/GatherMerge crossing there is a separate round with its
 		// own proof (REPORT.md §6).
+		//
+		// M0146-0005aq: below the Gather Merge the conjunct runs inside the
+		// workers, so it crosses only when parallel-safe — the Gather arm
+		// of pushConjunctTraced applies the same gate (sibling paths).
+		if !gatherPushableConjunct(c) {
+			return n, false
+		}
 		repl, ok := pushConjunctIntoCTEBodyTraced(x.Child, c, st)
 		if ok {
 			x.Child = repl

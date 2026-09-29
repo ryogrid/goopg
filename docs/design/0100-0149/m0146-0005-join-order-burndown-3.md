@@ -244,3 +244,37 @@ of near-ties (ledgered). SF1 Q74's plan is now PG's, but goopg runs it about
 baseline took 591–603 s, the candidate 617–654 s. It timed out once and
 passed on re-run (evidence `q74-sf1-timing.txt`; filed as M0146-0036).
 Evidence: `analysis/m0146/m0146-0005/slice42/`.
+
+## Slice 43: M0146-0005aq — a qual crosses a Gather only when it is parallel-safe
+
+Investigating TPC-DS Q10's `parallelism` record (goopg evaluates an OR of two
+hashed `ANY` SubPlans, each over its own `Gather -> Parallel Hash Join`, on a
+nested loop beneath the statement's Gather, nesting parallel plans inside
+workers) led to the qual-pushdown passes. PG never evaluates a
+parallel-restricted or parallel-unsafe qual inside workers. A rel whose
+restrictinfo is not `is_parallel_safe` gets `consider_parallel = false`
+(`set_rel_consider_parallel`, allpaths.c), so no partial path, and no Gather,
+ever sits beneath it. goopg's post-search pushdown crosses Gathers
+unconditionally:
+
+- `pushConjunctTraced`'s `*Gather` arm (O15, M0137-0016);
+- `pushConjunctIntoCTEBodyTraced`'s `*GatherMerge` arm (R56).
+
+A `nextval()` restriction, or a SubPlan over its own Gather, could therefore
+be planted into worker plans.
+
+`gatherPushableConjunct` (considerparallel.go) gates both arms. It is
+`isParallelSafeExpr` with a nil catalog, since the passes carry none, plus a
+fail-closed rule: a function that is not a builtin (`catalog.IsBuiltinProcName`)
+keeps the conjunct above the Gather, because a user routine's `proparallel`
+cannot be read without the catalog. Test:
+`TestPushdownKeepsParallelUnsafeConjunctAboveGather` (the restricted and
+user-routine cases cross without the gate).
+
+Movement: none. No TPC-DS plan changes at either scale, TPC-H plans are
+identical, and the regress runner (13 cases) shows only the known unordered
+`join.sql` row flap. Q10's qual does not reach the workers through these
+passes: it is attached to the nested loop by another placement, which is
+filed as M0146-0037. Ledgered: a user routine that is actually `PARALLEL
+SAFE` stays above a Gather here, where PG would push it (the catalog is not
+threaded into the pushdown passes).

@@ -482,6 +482,39 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 	return ok && safe
 }
 
+// gatherPushableConjunct reports whether a restriction may be moved below a
+// Gather, i.e. evaluated inside the workers. PG only ever places a qual there
+// when it is parallel-safe: a rel whose restrictinfo is not is_parallel_safe
+// gets consider_parallel = false (set_rel_consider_parallel, allpaths.c), so
+// no partial path — and no Gather — ever sits beneath it. The qual pushdown
+// passes run without a catalog, so this is isParallelSafeExpr with a nil
+// catalog plus a fail-closed rule for the one thing a nil catalog cannot
+// judge: a function that is not a builtin (a user routine's proparallel is
+// unknown here) keeps the conjunct above the Gather. A SubPlan whose body
+// holds its own Gather is caught by isParallelSafeExpr (TPC-DS Q10's
+// EXISTS-over-Parallel-Hash-Join quals were planted under the statement's
+// Gather, nesting parallel plans inside workers — M0146-0005aq).
+func gatherPushableConjunct(c Expr) bool {
+	if !isParallelSafeExpr(c, nil) {
+		return false
+	}
+	builtinOnly := true
+	enumerated := WalkExprHostScope(c, func(x Expr) {
+		fc, ok := x.(*FuncCall)
+		if !ok {
+			return
+		}
+		bare := fc.Name
+		if i := strings.LastIndexByte(bare, '.'); i >= 0 {
+			bare = bare[i+1:]
+		}
+		if !catalog.IsBuiltinProcName(bare) {
+			builtinOnly = false
+		}
+	})
+	return enumerated && builtinOnly
+}
+
 // subPlanParallelSafe is make_subplan's `splan->parallel_safe`: the
 // subquery's plan is parallel-safe as a whole. A correlated body is not —
 // its outer references are PARAM_EXEC Params, parallel-restricted unless

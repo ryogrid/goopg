@@ -23075,6 +23075,21 @@ M0146-0001 re-baseline census on the new default arm.
     \(re\-run PASS, none introduced\), regress runner 12 cases \(join\.sql row
     order; limit\.sql = known M0146\-0034 in both arms\)\.
   Movement: yes — TPC-H PLAN-PARITY match 9 -> 10 (Q4); TPC-DS match SF0.25 18 -> 19, SF1 17 -> 18; CATEGORIES-EXCL-MATCH aggregation-strategy SF0.25 33 -> 26, SF1 37 -> 28, sort-strategy 48 -> 45 / 51 -> 48, parallelism 46 -> 43 / 56 -> 53
+- [x] **M0146\-0005aq — a qual crosses a Gather only when it is
+  parallel\-safe** \(slice 43, impl, filed and done 2026\-09\-29 while
+  tracing TPC\-DS Q10\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 43"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `pushConjunctTraced`\'s Gather arm and the CTE body push\'s Gather Merge
+    arm crossed unconditionally; PG never evaluates a restricted/unsafe qual
+    in workers \(`consider\_parallel`\)\. `gatherPushableConjunct` gates both
+    \(nil\-catalog `isParallelSafeExpr` \+ builtin\-only functions\)\.
+  - Test `TestPushdownKeepsParallelUnsafeConjunctAboveGather`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(no fires\), TPC\-H plans identical, regress runner 13 cases \(known
+    join\.sql row flap only\)\.
+  Movement: none — hazard fix; no TPC-DS or TPC-H plan changes
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -24157,6 +24172,21 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: EXPLAIN ANALYZE both plans on a private SF1 clone and
     attribute the difference by node \(partial aggregation transport vs the
     join inputs\)\.
+- [ ] **M0146\-0037 — TPC\-DS Q10 evaluates Gather\-bodied SubPlans inside
+  workers** \(filed 2026\-09\-29 by M0146\-0005aq\)\. goopg attaches Q10\'s
+  `ANY \(hashed SubPlan 1\) OR ANY \(hashed SubPlan 2\)` qual \(each SubPlan
+  a `Gather \-> Parallel Hash Join`\) to the nested loop beneath the
+  statement\'s Gather, nesting parallel plans in workers; PG treats such a
+  SubPlan as parallel\-restricted, so its qual never sits below a Gather\.
+  The consider\-parallel trace admits every joinrel with only its equijoin
+  clauses \(`nclauses=1`\), so the qual is attached outside the search\'s
+  clause lists and not through the pushdown passes 0005aq gated\.
+  Kind: impl
+  Parent: M0146-0005
+  - First step: find where the post\-search residual \(the EXISTS→ANY
+    rewritten OR\) is attached to the top join, and apply the same
+    parallel\-safety rule there \(or register it as a restriction the
+    consider\-parallel check sees\)\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

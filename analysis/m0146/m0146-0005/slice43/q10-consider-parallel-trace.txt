@@ -1,0 +1,34 @@
+      1 DPTRACE cpadmit src=base rel={catalog_sales} cp=1 leaf=seq
+      1 DPTRACE cpadmit src=base rel={ca} cp=1 leaf=seq
+      1 DPTRACE cpadmit src=base rel={customer_demographics} cp=1 leaf=seq
+      1 DPTRACE cpadmit src=base rel={c} cp=1 leaf=seq
+      4 DPTRACE cpadmit src=base rel={date_dim} cp=1 leaf=seq
+      2 DPTRACE cpadmit src=base rel={store_sales} cp=1 leaf=seq
+      1 DPTRACE cpadmit src=base rel={web_sales} cp=1 leaf=seq
+      1 DPTRACE cpadmit src=join rel={c+ca+customer_demographics+date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+ca+customer_demographics} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+ca+date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+ca} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+customer_demographics+date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+customer_demographics} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={c+date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={catalog_sales+date_dim} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      2 DPTRACE cpadmit src=join rel={date_dim+store_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpadmit src=join rel={date_dim+web_sales} cp=1 in1=1 in2=1 nclauses=1 failidx=-1 failkind=none
+      1 DPTRACE cpgather rel={c+ca+customer_demographics+date_dim+store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={c+ca+customer_demographics} partials=2 verdict=admitted
+      1 DPTRACE cpgather rel={c+ca+date_dim+store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={c+ca} partials=2 verdict=admitted
+      1 DPTRACE cpgather rel={c+customer_demographics+date_dim+store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={c+customer_demographics} partials=2 verdict=admitted
+      1 DPTRACE cpgather rel={c+date_dim+store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={catalog_sales+date_dim} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={catalog_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={ca} partials=2 verdict=admitted
+      1 DPTRACE cpgather rel={customer_demographics} partials=2 verdict=admitted
+      1 DPTRACE cpgather rel={c} partials=2 verdict=admitted
+      2 DPTRACE cpgather rel={date_dim+store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={date_dim+web_sales} partials=1 verdict=admitted
+      4 DPTRACE cpgather rel={date_dim} partials=2 verdict=admitted
+      2 DPTRACE cpgather rel={store_sales} partials=1 verdict=admitted
+      1 DPTRACE cpgather rel={web_sales} partials=1 verdict=admitted
