@@ -1,0 +1,72 @@
+===== sf025 Q37 pg =====
+ Limit  (cost=4342.18..4342.68 rows=2 width=125)
+   ->  Group  (cost=4342.18..4342.68 rows=2 width=125)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=4342.18..4342.66 rows=3 width=125)
+               ->  Group  (cost=3342.17..3342.31 rows=2 width=125)
+                     Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                     ->  Sort  (cost=3342.17..3342.21 rows=14 width=125)
+                           ->  Nested Loop  (cost=1.15..3341.90 rows=14 width=125)
+===== sf025 Q37 goopg =====
+ Limit  (cost=4863.75..4863.79 rows=2 width=96)
+   ->  Group  (cost=4863.75..4863.77 rows=2 width=96)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=4863.25..4863.75 rows=3 width=96)
+               ->  Group  (cost=3863.27..3863.29 rows=2 width=96)
+                     Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                     ->  Sort  (cost=3863.24..3863.27 rows=12 width=1472)
+                           ->  Nested Loop  (cost=9.12..3863.02 rows=12 width=1096)
+===== sf025 Q82 pg =====
+ Limit  (cost=4343.11..4343.73 rows=2 width=125)
+   ->  Group  (cost=4343.11..4343.73 rows=2 width=125)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=4343.11..4343.71 rows=3 width=125)
+               ->  Group  (cost=3343.10..3343.36 rows=2 width=125)
+                     Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                     ->  Sort  (cost=3343.10..3343.17 rows=26 width=125)
+                           ->  Nested Loop  (cost=1.15..3342.49 rows=26 width=125)
+===== sf025 Q82 goopg =====
+ Limit  (cost=5987.37..5987.41 rows=2 width=96)
+   ->  Group  (cost=5987.37..5987.39 rows=2 width=96)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Gather Merge  (cost=5986.75..5987.37 rows=3 width=96)
+               ->  Group  (cost=4986.80..4986.82 rows=2 width=96)
+                     Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+                     ->  Sort  (cost=4986.74..4986.80 rows=24 width=1344)
+                           ->  Nested Loop  (cost=1.00..4986.19 rows=24 width=968)
+===== sf1 Q37 pg =====
+ Limit  (cost=4994.72..4997.91 rows=2 width=125)
+   ->  Group  (cost=4994.72..4997.91 rows=2 width=125)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Nested Loop  (cost=4994.72..4997.26 rows=87 width=125)
+               ->  Gather Merge  (cost=4994.29..4994.41 rows=1 width=133)
+                     ->  Sort  (cost=3994.28..3994.28 rows=1 width=133)
+                           ->  Nested Loop  (cost=0.74..3994.27 rows=1 width=133)
+                                 ->  Nested Loop  (cost=0.43..3904.29 rows=294 width=137)
+===== sf1 Q37 goopg =====
+ Limit  (cost=10530.78..10530.82 rows=2 width=500)
+   ->  Group  (cost=10530.78..10530.80 rows=2 width=500)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Sort  (cost=10530.58..10530.78 rows=80 width=2476)
+               ->  Nested Loop  (cost=1.00..10528.05 rows=80 width=1078)
+                     ->  Nested Loop  (cost=0.62..10525.19 rows=1 width=792)
+                           ->  Nested Loop  (cost=0.38..10441.49 rows=493 width=524)
+                                 ->  Seq Scan on item  (cost=0.00..1096.00 rows=2 width=1906)
+===== sf1 Q82 pg =====
+ Limit  (cost=4994.72..5000.93 rows=2 width=125)
+   ->  Group  (cost=4994.72..5000.93 rows=2 width=125)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Nested Loop  (cost=4994.72..4999.63 rows=173 width=125)
+               ->  Gather Merge  (cost=4994.29..4994.41 rows=1 width=133)
+                     ->  Sort  (cost=3994.28..3994.28 rows=1 width=133)
+                           ->  Nested Loop  (cost=0.74..3994.27 rows=1 width=133)
+                                 ->  Nested Loop  (cost=0.43..3904.29 rows=294 width=137)
+===== sf1 Q82 goopg =====
+ Limit  (cost=10536.32..10536.36 rows=2 width=500)
+   ->  Group  (cost=10536.32..10536.34 rows=2 width=500)
+         Group Key: item.i_item_id, item.i_item_desc, item.i_current_price
+         ->  Sort  (cost=10535.92..10536.32 rows=160 width=2402)
+               ->  Nested Loop  (cost=1.00..10530.07 rows=160 width=1004)
+                     ->  Nested Loop  (cost=0.62..10525.19 rows=1 width=792)
+                           ->  Nested Loop  (cost=0.38..10441.49 rows=493 width=524)
+                                 ->  Seq Scan on item  (cost=0.00..1096.00 rows=2 width=1906)

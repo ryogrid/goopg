@@ -24003,7 +24003,7 @@ M0146-0001 re-baseline census on the new default arm.
       PG prints `Window: wN AS \(...\)` under each WindowAgg, goopg none\.
   Movement: none — recon; the window stack already matched since M0146-0005ay (slice 51)
 
-- [ ] **M0146\-0018 — grouping without aggregates plans as PG\'s `Group`
+- [x] **M0146\-0018 — grouping without aggregates plans as PG\'s `Group`
   node** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q37, Q82 \(both
   scales\): `PG Group | goopg GroupAggregate` under a Limit.
   Kind: recon
@@ -24011,6 +24011,14 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: check whether PG\'s `create_group_path` \(no aggregates,
     presorted input\) is the elected shape and whether goopg\'s EXPLAIN
     merely labels it differently \(rendering\) or builds a different node.
+  - **DONE 2026\-09\-30 \(verified resolved\)\.** Q37/Q82 at both scales
+    now plan PG\'s `Group` nodes with PG\'s `Group Key:` lists — SF0\.25
+    `Limit \-> Group \-> Gather Merge \-> Group \-> Sort`, node for node;
+    SF1 the leader `Group` matches and the divergence sits below it \(join
+    order, owned by M0146\-0005\)\. The node came from M0146\-0025
+    \(partial Group paths for aggregate\-free GROUP BY\)\. Evidence
+    `analysis/m0146/m0146\-0018/group\-nodes\-20260930.txt`\.
+  Movement: none — recon; resolved by M0146-0025
 
 - [x] **M0146\-0019 — Index Only Scan where goopg seq\-scans a probed
   relation** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-H Q13 \(`customer\_pk`
