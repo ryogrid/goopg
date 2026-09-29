@@ -1,0 +1,16 @@
+# M0146-0005ba — cost_qual_eval operator currency
+sf025 baseline match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=35 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=14 rendering=21
+sf025 candidate match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=35 scan-type=39 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=14 rendering=21
+< Q83 MISSING-NODE [join-order,join-method,scan-type,parameterisation,aggregation-strategy,sort-strategy,parallelism]
+> Q83 MISSING-NODE [join-order,join-method,parameterisation,aggregation-strategy,sort-strategy,parallelism]
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=34 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=11 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=65 join-method=34 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=11 rendering=19
+< Q68 SHAPE-DIFF [join-method,scan-type]
+> Q68 SHAPE-DIFF [join-order,join-method,scan-type]
+first-divergence records: unchanged (TPC-DS both scales)
+FIRE-SET-TIMEOUTS: fires=Q6 Q7 Q8 Q10 Q12 Q13 Q14 Q16 Q17 Q18 Q20 Q23 Q26 Q27 Q28 Q29 Q33 Q34 Q37 Q44 Q46 Q47 Q48 Q51 Q53 Q54 Q56 Q57 Q58 Q60 Q61 Q63 Q64 Q68 Q69 Q71 Q73 Q76 Q79 Q82 Q83 Q85 Q88 Q89 Q91 Q98 introduced=none unchanged=none missing=none
+TPC-H census: before CATEGORIES-EXCL-MATCH: join-order=10 join-method=5 scan-type=10 parameterisation=2 aggregation-strategy=1 sort-strategy=1 parallelism=4 qual-placement=2 rendering=0 match=10
+TPC-H census: after  CATEGORIES-EXCL-MATCH: join-order=9 join-method=5 scan-type=9 parameterisation=2 aggregation-strategy=1 sort-strategy=0 parallelism=3 qual-placement=2 rendering=0 match=11 (Q15a-VIEWBODY = PG)
+Q47 filtered v1 CTE Scan: 143.36 (= 3823 x (0.02 + 7 x 0.0025)); PG 144.38 over 3850 rows
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS
+regress (join subselect aggregates select_parallel partition_join inherit union with window create_index select limit) vs HEAD worktree: join.sql known flap; limit.sql 'order by unique2 limit 10' rows differ between runs on BOTH arms' identical plan Limit -> Gather -> Parallel Index Scan (M0146-0034, S2) — the candidate run happened to print PG's rows

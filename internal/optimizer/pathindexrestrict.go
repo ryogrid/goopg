@@ -408,7 +408,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	qpquals := localQualOpCount(rel.baseLeaf) - indexClausesEvalOps(clauses)
 	if qpquals < 0 {
 		qpquals = 0
 	}

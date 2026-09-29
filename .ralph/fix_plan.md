@@ -23257,6 +23257,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(18 fires, PASS after the Q74 re\-run\), TPC\-H census identical,
     regress runner 6 cases \(0 delta\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 36 -> 34, qual-placement 14 -> 11; SF0.25 join-method 33 -> 35, qual-placement 15 -> 14; match unchanged (24 SF0.25, 21 SF1)
+- [x] **M0146\-0005ba — scan quals are priced by cost\_qual\_eval\'s
+  operator count** \(slice 53, impl, done 2026\-09\-29 from slice 52\'s
+  residual: conjunct\-count currency\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 53"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `qualEvalOps` \(`qualevalcost.go`, on `walkExprRefs`\) feeds
+    `baseSeqScanCostInputs`, `localQualOpCount`, `costKeptCTEScanLeaf`;
+    index sites subtract `indexClausesEvalOps`\.
+  - Tests: `TestQualEvalOpsMatchesCostQualEval` \(Q47 filter = 7; IN
+    list 8 → linear 4, 9 → hashed 2\); two currency tests re\-pinned\.
+  - Regress limit\.sql witnessed M0146\-0034 \(Limit over plain Gather\):
+    rows differ between runs on an unchanged plan\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(45 fires, none introduced\), TPC\-H census, regress runner 12 cases\.
+  Movement: yes — TPC-H PLAN-PARITY match 10 -> 11 (Q15 view body); TPC-H CATEGORIES-EXCL-MATCH join-order 10 -> 9, scan-type 10 -> 9, sort-strategy 1 -> 0, parallelism 4 -> 3; TPC-DS SF0.25 scan-type 40 -> 39, SF1 join-order 64 -> 65
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -24326,6 +24343,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where the ordered\-rel / Limit path accepts a Gather
     path as carrying the index scan\'s pathkeys \(Gather must publish no
     pathkeys\)\.
+  - Witness 2026\-09\-29 \(M0146\-0005ba regress runner\): limit\.sql `select unique1, unique2, nextval\('testseq'\) from tenk1 order by unique2 limit 10` prints different rows on two runs of the same plan `Limit -> Gather -> Parallel Index Scan`\.
 - [ ] **M0146\-0035 — WRONG RESULTS / DATA LOSS: an online TPC\-H clone
   loses database `tpch` and role `tpch`** \(filed 2026\-09\-29 by
   M0146\-0005ap; S2\)\. `tpch\_private\_clone\_snapshot` \(pg\_basebackup of the

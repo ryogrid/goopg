@@ -535,7 +535,11 @@ func TestCostIndexScanQpqualCurrency(t *testing.T) {
 // price exactly as before on both sides).
 func TestLocalQualOpCountMirrorsSeqRivalCount(t *testing.T) {
 	mkAnd := func(l, r Expr) Expr { return &BinaryOp{Op: parser.OpAnd, Left: l, Right: r} }
-	col := func(i int) Expr { return &ColumnRef{Index: i} }
+	// M0146-0005ba: the currency is cost_qual_eval's operator count, so each
+	// conjunct is a comparison (one operator); a bare constant costs nothing.
+	col := func(i int) Expr {
+		return &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: i}, Right: &IntegerConst{Value: 1}}
+	}
 	tru := &BooleanConst{Value: true}
 
 	scan := &SeqScan{}
@@ -543,8 +547,8 @@ func TestLocalQualOpCountMirrorsSeqRivalCount(t *testing.T) {
 		t.Fatalf("bare scan counts %v, want 0", got)
 	}
 	two := &Filter{Child: scan, Predicate: mkAnd(mkAnd(col(0), col(1)), tru)}
-	if got := localQualOpCount(two); got != 3 {
-		t.Fatalf("three-conjunct filter counts %v, want 3", got)
+	if got := localQualOpCount(two); got != 2 {
+		t.Fatalf("two comparisons and a constant count %v, want 2", got)
 	}
 	// Nested Filter wrappers (the extractor walks the whole chain).
 	nested := &Filter{Child: &Filter{Child: scan, Predicate: col(0)}, Predicate: mkAnd(col(1), col(2))}
@@ -566,7 +570,10 @@ func TestLocalQualOpCountMirrorsSeqRivalCount(t *testing.T) {
 // clauses - those bound as index quals), added, floored at zero.
 func TestParamIndexQualOpCountAddsPopulations(t *testing.T) {
 	mkAnd := func(l, r Expr) Expr { return &BinaryOp{Op: parser.OpAnd, Left: l, Right: r} }
-	col := func(i int) Expr { return &ColumnRef{Index: i} }
+	// One operator per local conjunct under cost_qual_eval (M0146-0005ba).
+	col := func(i int) Expr {
+		return &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: i}, Right: &IntegerConst{Value: 1}}
+	}
 	scan := &SeqScan{}
 	twoLocal := &Filter{Child: scan, Predicate: mkAnd(col(0), col(1))}
 

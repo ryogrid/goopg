@@ -144,7 +144,9 @@ type indexScanInputs struct {
 // the leaf IS Filter{scan, combineAnd(localized)} over the same predicate
 // list (joinsearchseam.go).
 func localQualOpCount(leaf Node) float64 {
-	return float64(len(extractFilterConjuncts(leaf)))
+	// M0146-0005ba: cost_qual_eval per conjunct (qualEvalOps).
+	_, ops := conjunctsEvalOps(extractFilterConjuncts(leaf))
+	return ops
 }
 
 // relQualOpCount counts the rel's local restriction conjuncts for qpqual

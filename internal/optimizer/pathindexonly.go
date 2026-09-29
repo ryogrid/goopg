@@ -180,7 +180,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	if len(clauses) > 0 {
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 	}
-	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	qpquals := localQualOpCount(rel.baseLeaf) - indexClausesEvalOps(clauses)
 	if qpquals < 0 {
 		qpquals = 0
 	}

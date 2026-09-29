@@ -814,7 +814,7 @@ func parallelWorkerLadder(pages float64, minBlocks int64) int {
 // serial scan's shape with `parallel_workers > 0`, priced by cost_seqscan's
 // parallel arm. A partial path is always parallel-safe (`parallel_safe =
 // rel->consider_parallel`, and the caller has checked the rel).
-func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTuples float64, numQualOps, workers int) {
+func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTuples, numQualOps float64, workers int) {
 	cost, rows := costParallelSeqscan(cp, relPages, relTuples, rel.Rows, numQualOps, workers)
 	tgt, tgtKnown := scanPathTarget(rel)
 	addPartialPath(rel, &Path{

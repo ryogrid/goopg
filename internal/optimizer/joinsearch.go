@@ -485,13 +485,15 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 // an index leaf is the rule-based planner's own choice standing in for the
 // relation and must not be repriced as a full sequential scan, and a subquery
 // or CTE leaf has no `baserel->tuples` to speak of.
-func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps int) {
+func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps float64) {
 	if _, ok := leafBaseScan(leaf).(*SeqScan); !ok || ri.table == nil || ri.baseRows < 1 {
 		return estScanPages(fallbackRows, fallbackWidth), fallbackRows, 0
 	}
 	tuples = float64(ri.baseRows)
 	if ri.localFilter != nil {
-		numQualOps = len(splitConjuncts(ri.localFilter, nil))
+		// M0146-0005ba: cost_qual_eval's operator currency, not a
+		// conjunct count (qualEvalOps).
+		_, numQualOps = conjunctsEvalOps(splitConjuncts(ri.localFilter, nil))
 	}
 	return baseRelPages(ri.table, tuples), tuples, numQualOps
 }
@@ -607,8 +609,8 @@ func isSubplanLeaf(leaf Node) bool {
 // cpu_tuple_cost and the restriction quals per tuple scanned. The row count is
 // the CTE's whole output, the tuples the scan reads, not the rows its filter
 // keeps: TPC-DS Q47's filtered `v1` reads 3850 rows (PG 144.38), where the
-// sub-plan shape charged its 2 surviving rows. The qual term counts
-// conjuncts, the currency baseSeqScanCostInputs uses.
+// sub-plan shape charged its 2 surviving rows. The qual term is
+// cost_qual_eval's (qualEvalOps), the currency every scan leaf uses.
 func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) {
 	cs, ok := leafBaseScan(leaf).(*CTEScan)
 	if !ok || cs.Inlined() {
@@ -618,11 +620,11 @@ func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) 
 	if tuples < 0 {
 		tuples = 0
 	}
-	quals := 0
+	var quals float64
 	if ri.localFilter != nil {
-		quals = len(splitConjuncts(ri.localFilter, nil))
+		_, quals = conjunctsEvalOps(splitConjuncts(ri.localFilter, nil))
 	}
-	perTuple := 2*cp.cpuTupleCost + cp.cpuOperatorCost*float64(quals)
+	perTuple := 2*cp.cpuTupleCost + cp.cpuOperatorCost*quals
 	return Cost{Startup: 0, Total: perTuple * tuples}, true
 }
 

@@ -31,7 +31,7 @@ package optimizer
 import "github.com/goopg/goopg/internal/parser"
 
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
-	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
+	seqCost := costSeqscan(cp, relPages, rel.Rows, float64(numQualOps))
 	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
 	// runs; a disabled seqscan is counted, not skipped.
 	seqDisabled := disabledNodesFor(!cp.enableSeqScan)
@@ -57,7 +57,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		// stamped here, AFTER the serial path, whose parallel_safe stays
 		// whatever the rel said before.
 		rel.ConsiderParallel = true
-		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, numQualOps, parallelWorkers)
+		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, float64(numQualOps), parallelWorkers)
 	}
 }
 

@@ -199,9 +199,9 @@ func getParallelDivisor(workers int, leaderParticipates bool) float64 {
 // costSeqscan reproduces cost_seqscan (costsize.c:295): sequential page reads
 // plus per-tuple CPU. numQualOps is the number of operator evaluations per tuple
 // from the scan's restriction qual. The parallel arm is costParallelSeqscan.
-func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps int) Cost {
+func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps float64) Cost {
 	run := cp.seqPageCost*float64(relPages) +
-		(cp.cpuTupleCost+cp.cpuOperatorCost*float64(numQualOps))*relTuples
+		(cp.cpuTupleCost+cp.cpuOperatorCost*numQualOps)*relTuples
 	return Cost{Startup: 0, Total: run}
 }
 
@@ -217,10 +217,10 @@ func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps in
 // is clamp_row_est(rows / divisor), "the number of tuples processed per
 // worker". C-19b (take3 08 §8): this is what makes a partial scan a REAL path
 // with a real cost rather than the post-pass's size rule.
-func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows float64, numQualOps, workers int) (Cost, float64) {
+func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows, numQualOps float64, workers int) (Cost, float64) {
 	d := getParallelDivisor(workers, cp.parallelLeaderParticipation)
 	disk := cp.seqPageCost * float64(relPages)
-	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQualOps)) * relTuples / d
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*numQualOps) * relTuples / d
 	return Cost{Startup: 0, Total: disk + cpu}, clampRowEst(rows / d)
 }
 

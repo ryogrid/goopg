@@ -669,3 +669,49 @@ shows no delta. Evidence: `analysis/m0146/m0146-0005/slice52/`.
 Ledgered: the qual term counts conjuncts where `cost_qual_eval` counts
 operators and function calls. That understates CASE-heavy CTE filters and
 is what still separates Q4 at SF0.25.
+
+## Slice 53: M0146-0005ba — scan quals are priced by cost_qual_eval's operator count
+
+Slice 52's residual. PG prices a restriction qual with `cost_qual_eval`:
+every operator and function call costs its procost (1 for built-ins) ×
+`cpu_operator_cost`. AND, OR, NOT, CASE and NULL tests are free, and a
+ScalarArrayOpExpr costs half its list per row, or a hash plus a
+comparison once the list reaches nine constants. goopg charged one
+`cpu_operator_cost` per top-level conjunct, in every scan-cost site: seq
+and partial seq scans, index and index-only qpquals, bitmap heap quals,
+and the new CTE leaf. TPC-DS Q47's filter on `v1` is seven operators in
+three conjuncts.
+
+- `qualEvalOps` (new qualevalcost.go) is `cost_qual_eval_walker` for
+  goopg's expression kinds. It is built on `walkExprRefs`, which owns the
+  recursion, does not enter sublink scopes, and fails closed. It returns
+  startup and per-tuple operator counts.
+- The shared currency changes in one place per population:
+  `baseSeqScanCostInputs` (seq and partial seq), `localQualOpCount`
+  (index, index-only and bitmap qpquals), and `costKeptCTEScanLeaf`. The
+  index sites subtract the consumed index clauses' own cost
+  (`indexClausesEvalOps`) rather than one per clause. `costSeqscan` and
+  `costParallelSeqscan` take a float operator count.
+
+Tests: `TestQualEvalOpsMatchesCostQualEval` checks Q47's filter at 7 and
+the IN-list linear/hashed boundary at 8 and 9 elements.
+`TestLocalQualOpCountMirrorsSeqRivalCount` and
+`TestParamIndexQualOpCountAddsPopulations` are re-pinned to comparison
+conjuncts, since a bare column or constant costs 0 under
+`cost_qual_eval`.
+
+Movement: TPC-H PLAN-PARITY match 10 → 11 (the Q15 view body equals
+PG's), with join-order, scan-type, sort-strategy and parallelism each −1.
+TPC-DS match counts are unchanged: SF0.25 scan-type −1 (Q83), and SF1
+join-order +1 (Q68). Q47's filtered CTE scan now costs 143.36, which is
+`cost_ctescan` exactly on goopg's 3823 rows (PG prints 144.38 over 3850).
+Q4's SF0.25 CTE join order did not move. Evidence:
+`analysis/m0146/m0146-0005/slice53/`.
+
+Ledgered:
+
+- The startup half (a hashed IN list's table build) is computed but not
+  yet added to scan startup costs.
+- Casts count 0, where PG's cast functions cost 1 and CoerceViaIO costs 2.
+- Every function's procost is taken as 1.
+- A sublink counts 1, where PG uses the SubPlan's per-call cost.
