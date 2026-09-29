@@ -23425,7 +23425,7 @@ M0146-0001 re-baseline census on the new default arm.
   - Q8 loses its match at both scales \(razor\-edge election, filed
     M0146\-0005bk\)\.
   Movement: yes — printed Aggregate/SetOp costs now the paths' (Q87 SetOp Except 42288.96..43153.81 vs PG 42449.87..43284.81); PLAN-PARITY SF0.25 match 27 -> 26, SF1 24 -> 23 (Q8)
-- [ ] **M0146\-0005bk — TPC\-DS Q8: store ⋈ INTERSECT election** \(filed
+- [x] **M0146\-0005bk — TPC\-DS Q8: store ⋈ INTERSECT election** \(filed
   2026\-09\-30 by M0146\-0005bj\)\. With the INTERSECT leaf priced at its
   path cost \(PG\'s 9268\), goopg elects `Hash Join \(Gather\(... ⋈ store\),
   HashSetOp\)` at 28307 over PG\'s `Nested Loop \(Gather,
@@ -23435,6 +23435,18 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: price PG\'s shape node by node in goopg against PG 18\.3\'s
     EXPLAIN \(NL 12337\.51\.\.28512\.75\) and find the term that makes the
     hash alternative cheaper here\.
+  - **DONE 2026\-09\-30 \(slice 63\)\.** PG\'s own hash alternative is cheaper
+    \(28305\.93 with enable\_nestloop off\); PG keeps the nested loop because
+    the two tie within STD\_FUZZ\_FACTOR and add\_path keeps the path offered
+    first — match\_unsorted\_outer\'s nested loops precede
+    hash\_inner\_and\_outer\. goopg now offers its nested\-loop arms first\.
+    Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 63"\.
+  - Test `TestJoinArmsOfferNestLoopBeforeHash` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(7 queries both scales\), TPC\-H shapes identical, regress runner 7 cases
+    \(join\.sql j1⋈j3 now PG\'s Hash Join\)\.
+  Movement: yes — PLAN-PARITY SF0.25 match 26 -> 27, SF1 23 -> 24 (Q8 = PG); CATEGORIES-EXCL-MATCH SF0.25 join-order 55 -> 54, scan-type 38 -> 37; SF1 join-order 61 -> 60, scan-type 43 -> 41
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

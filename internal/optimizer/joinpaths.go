@@ -451,8 +451,8 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// to `addPath` BEFORE the hash path, and wins an exact tie against
 				// it exactly as it does in PG. Only the merge half of that arm is
 				// here; goopg's nested-loop halves (`addNestLoopPath` /
-				// `addNLIPaths`) were landed separately and still run after the
-				// hash arm, which can only change a hash-vs-nestloop exact tie.
+				// `addNLIPaths` / `addPartialNestLoopPaths`) follow this block,
+				// still ahead of the hash arm (M0146-0005bk).
 				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
 				// (joinpath.c:2071-2097) beside the serial arm above — every
@@ -462,23 +462,6 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// is a follow-up the A/B can motivate.
 				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			}
-			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, clauses)
-			// take2 P2-11: the inner side is the BUILD side here, so the
-			// bucket fraction is measured on its keys. Computed at this site
-			// because the searchCtx — and so the statistics — is in scope,
-			// exactly as mergeTuplesFor is.
-			bucket := s.estimateHashBucketSize(keys, inner.Relids)
-			addHashJoinPath(joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
-			// C-19f: `hash_inner_and_outer`'s parallel block (joinpath.c:2418)
-			// sits immediately after the serial `try_hashjoin_path` loop
-			// (:2398), and is passed the SAME hashclauses — so the partial
-			// path and its serial twin are priced from identical inputs and
-			// can differ only in the parallel terms. It files into the
-			// joinrel's PartialPathlist, which nothing but
-			// generateUsefulGatherPaths and the next level's own partial
-			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
-			// at all (joinpathsparallel.go).
-			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing
@@ -498,6 +481,35 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// results must be fully unparameterised; there is no star-schema
 	// exception to test).
 	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semi)
+	// M0146-0005bk: `hash_inner_and_outer` (joinpath.c:212) runs AFTER
+	// match_unsorted_outer's nested loops (:290 and consider_parallel_
+	// nestloop). addPath keeps the incumbent when two paths tie within
+	// STD_FUZZ_FACTOR and nothing else separates them (add_path's "keep
+	// just one ... arbitrarily keep only the old path"), so the arm order
+	// decides such ties: TPC-DS Q8's nested loop (28512.75) and hash join
+	// (28305.93) are 0.7% apart and PG keeps the nested loop, filed first.
+	if !pathParamByRel(i, outer) {
+		keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
+		if len(keys) > 0 {
+			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, clauses)
+			// take2 P2-11: the inner side is the BUILD side here, so the
+			// bucket fraction is measured on its keys. Computed at this site
+			// because the searchCtx — and so the statistics — is in scope,
+			// exactly as mergeTuplesFor is.
+			bucket := s.estimateHashBucketSize(keys, inner.Relids)
+			addHashJoinPath(joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
+			// C-19f: `hash_inner_and_outer`'s parallel block (joinpath.c:2418)
+			// sits immediately after the serial `try_hashjoin_path` loop
+			// (:2398), and is passed the SAME hashclauses — so the partial
+			// path and its serial twin are priced from identical inputs and
+			// can differ only in the parallel terms. It files into the
+			// joinrel's PartialPathlist, which nothing but
+			// generateUsefulGatherPaths and the next level's own partial
+			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
+			// at all (joinpathsparallel.go).
+			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
+		}
+	}
 	// M0145-0008 follow-up census (nlicensus.go): the full candidate set for a
 	// semi/anti joinrel, after every arm has filed. Off unless
 	// GOOPG_NLI_CENSUS=1.

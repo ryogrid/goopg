@@ -346,3 +346,41 @@ query, since every cost text moved), and the sweep's plan-shape channel
 is unchanged. TPC-H shapes are identical. The regress runner (7 cases)
 shows only the known join.sql row-order flap. Evidence:
 `analysis/m0146/m0146-0005/slice62/`.
+
+## Slice 63: M0146-0005bk — nested loops are offered before the hash join
+
+Slice 62 cost TPC-DS Q8 its match. The fix is PG's add\_path tie rule
+combined with its arm order. With `enable_nestloop = off`, PG 18.3's own
+hash alternative for Q8 costs 28305.93 against the 28512.75 nested loop it
+keeps. The two paths are within STD\_FUZZ\_FACTOR on both startup and total,
+and pathkeys, rows and parallel safety are equal. So add\_path "arbitrarily
+keep[s] only the old path", and the old path is whichever was offered
+first. `add_paths_to_joinrel` offers `match_unsorted_outer`'s nested loops
+(joinpath.c:290, then `consider_parallel_nestloop`) before
+`hash_inner_and_outer` (:212 runs after them). goopg filed its hash arm
+first. Its comment said the order could only change an exact tie; under
+fuzzy ties it decides.
+
+- `addPathsForJointype` now files the serial nested loop, the NLI
+  (parameterised) arm and the partial nested loop before the serial and
+  partial hash arms. The merge arms keep their place ahead of both.
+
+Test: `TestJoinArmsOfferNestLoopBeforeHash` captures the path trace for one
+join pair and requires the first nestloop offer to precede the first hash
+offer. Base offered `mergejoin, join.hash, join.nestloop, ...`, so the test
+fails there.
+
+Movement:
+
+- TPC-DS PLAN-PARITY match SF0.25 26 → 27 and SF1 23 → 24 (Q8 = PG again).
+- SF0.25: join-order 55 → 54, join-method 30 → 29, scan-type 38 → 37,
+  parallelism 36 → 35.
+- SF1: join-order 61 → 60, scan-type 43 → 41, qual-placement 9 → 8, and
+  aggregation-strategy 22 → 23 (Q26 moves between categories).
+- The fire set (Q8/Q16/Q19/Q26/Q40/Q64/Q72) executes at both scales.
+- TPC-H shapes are identical.
+- In the regress runner, join.sql's "non-unique rel is not chosen as
+  inner" case now plans PG's `Hash Join` with j3 outer, where it had a
+  nested loop.
+
+Evidence: `analysis/m0146/m0146-0005/slice63/`.
