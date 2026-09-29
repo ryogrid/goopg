@@ -23274,6 +23274,23 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(45 fires, none introduced\), TPC\-H census, regress runner 12 cases\.
   Movement: yes — TPC-H PLAN-PARITY match 10 -> 11 (Q15 view body); TPC-H CATEGORIES-EXCL-MATCH join-order 10 -> 9, scan-type 10 -> 9, sort-strategy 1 -> 0, parallelism 4 -> 3; TPC-DS SF0.25 scan-type 40 -> 39, SF1 join-order 64 -> 65
+- [x] **M0146\-0005bb — a statistics\-less grouping variable still belongs
+  to its relation** \(slice 54, impl, done 2026\-09\-29 from Q75: all\_sales
+  estimated 124831 groups vs PG 12155\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 54"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `groupVarSourceNode` gives `examineGroupVar`\'s fallback the producing
+    relation \(set op, aggregate, CTE/subquery scan, computing Project\) so
+    the per\-relation clamp applies; partition/inheritance expansions
+    excluded \(`setOpExpandsTableHierarchy`\)\.
+  - Tests `TestGroupsOverSetOpClampPerRelation` \(fails on base\),
+    `TestGroupsOverPartitionAppendNotClampedAsSubquery`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q5 Q38 Q59 Q75 Q76 Q87, none introduced\), TPC\-H census identical,
+    regress runner 8 cases \(join\.sql Gather row\-order flap only\)\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 24 -> 25 (Q75); CATEGORIES-EXCL-MATCH SF0.25 join-order 59 -> 58, join-method 35 -> 34, rendering 21 -> 20, parallelism 36 -> 37; SF1 join-method 34 -> 32, join-order 65 -> 64, aggregation-strategy 25 -> 24, parallelism 48 -> 49
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

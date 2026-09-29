@@ -1830,8 +1830,139 @@ func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 		}
 	}
 	info := groupVarInfo{ndistinct: defaultNumDistinct}
+	// M0146-0005bb: examine_variable still knows WHICH relation a
+	// statistics-less variable belongs to — a subquery or CTE RTE whose
+	// output PG cannot drill into (a set operation, a grouped body) — and
+	// estimate_num_groups clamps per relation: at most rel->tuples, a tenth
+	// of it when several variables come from that relation. Without the
+	// relation, TPC-DS Q75's five grouping columns over its UNION subquery
+	// multiplied freely up to the input rows (124831 groups; PG 12155 =
+	// 121550 / 10).
+	if src := groupVarSourceNode(cr.Index, child, 0); src != nil {
+		info.rel = src
+		info.rawRows = float64(EstimateRows(src))
+		traceGroupVar(cr, baseColumnRef{}, info, "default-rel")
+		return groupVarKey{rel: src, idx: cr.Index}, info
+	}
 	traceGroupVar(cr, baseColumnRef{}, info, "default")
 	return groupVarKey{idx: cr.Index}, info
+}
+
+// groupVarSourceNode finds the relation-level node that produces output
+// column idx of child — the node PG would name as the variable's RTE when it
+// has no statistics for it. It walks the same row-preserving wrappers and
+// join sides resolveBaseColumn does and stops at the first node that is
+// neither: a set operation, an aggregate, a CTE or subquery scan, a VALUES
+// list. Base scans are resolveBaseColumn's business and return nil here, as
+// does an index that cannot be followed; nil keeps the relation-less
+// default.
+func groupVarSourceNode(idx int, child Node, depth int) Node {
+	if child == nil || idx < 0 || depth > 64 {
+		return nil
+	}
+	switch x := child.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		return nil
+	case *Filter:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Sort:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Limit:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *LockRows:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Gather:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Memoize:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Materialize:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return groupVarSourceNode(cr.Index, x.Child, depth+1)
+			}
+		}
+		// A computed column is the subquery's own output: the Project is
+		// the relation.
+		return x
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return nil
+		}
+		lw := len(x.Left.Output())
+		if idx >= lw {
+			return groupVarSourceNode(idx-lw, x.Right, depth+1)
+		}
+		return groupVarSourceNode(idx, x.Left, depth+1)
+	case *NestedLoopIndexJoin:
+		if x.Outer == nil {
+			return nil
+		}
+		ow := len(x.Outer.Output())
+		if idx >= ow {
+			return groupVarSourceNode(idx-ow, x.Inner, depth+1)
+		}
+		return groupVarSourceNode(idx, x.Outer, depth+1)
+	case *SetOp:
+		// A partitioned or inherited table expands to a UNION ALL of its
+		// members, but it is ONE relation to PG, whose variables read the
+		// parent's inherited statistics (pg_statistic stainherit), not the
+		// statistics-less subquery default. Leave those to the existing
+		// path rather than clamp them as a subquery.
+		if setOpExpandsTableHierarchy(x) {
+			return nil
+		}
+	}
+	return child
+}
+
+// setOpExpandsTableHierarchy reports whether a UNION ALL is a partitioned or
+// inherited table's expansion: some member scans a partition or an
+// inheritance child.
+func setOpExpandsTableHierarchy(so *SetOp) bool {
+	// Members are collected across every UNION ALL link, parallel-aware or
+	// merging ones included (unionAllMembers declines those), since a
+	// partition Append is routinely parallel.
+	var members []Node
+	var collect func(n Node, depth int)
+	collect = func(n Node, depth int) {
+		if l, ok := n.(*SetOp); ok && l.Op == parser.SetOpUnion && l.All && depth < 64 {
+			collect(l.Left, depth+1)
+			collect(l.Right, depth+1)
+			return
+		}
+		members = append(members, n)
+	}
+	collect(so, 0)
+	for _, m := range members {
+		// Each member is the child scan, often under the appendrel's
+		// column-translation Project.
+		for {
+			if pr, ok := m.(*Project); ok && pr.Child != nil {
+				m = pr.Child
+				continue
+			}
+			break
+		}
+		var tbl *catalog.Table
+		switch sc := leafBaseScan(m).(type) {
+		case *SeqScan:
+			tbl = sc.Table
+		case *IndexScan:
+			tbl = sc.Table
+		case *IndexOnlyScan:
+			tbl = sc.Table
+		case *BitmapHeapScan:
+			tbl = sc.Table
+		}
+		if tbl != nil && (tbl.PartitionParentOID != 0 || len(tbl.InheritsParentOIDs) > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // traceGroupVar writes the evidence estimateNumGroups consumes for one GROUP

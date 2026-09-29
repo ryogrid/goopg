@@ -715,3 +715,44 @@ Ledgered:
 - Casts count 0, where PG's cast functions cost 1 and CoerceViaIO costs 2.
 - Every function's procost is taken as 1.
 - A sublink counts 1, where PG uses the SubPlan's per-call cost.
+
+## Slice 54: M0146-0005bb — a statistics-less grouping variable still belongs to its relation
+
+TPC-DS Q75's `all_sales` CTE groups the output of a UNION subquery by five
+columns. goopg estimated 124831 groups, where PG estimates 12155; the
+10× larger CTE scans then chose a Merge Join where PG hash-joins. PG's
+`examine_variable` finds no statistics for a subquery output that is a
+set operation, but it still records the variable's relation. That lets
+`estimate_num_groups` clamp per relation: the product of the 200 defaults
+is capped at `rel->tuples`, or a tenth of it when several variables come
+from the relation (121550 / 10). goopg's unresolved variables had no
+relation, so they multiplied freely up to the input rows.
+
+- `examineGroupVar`'s fallback asks `groupVarSourceNode` for the variable's
+  producing node. The walk crosses row-preserving wrappers and join sides
+  like `resolveBaseColumn`, and stops at the first relation-level node (a
+  set operation, an aggregate, a CTE or subquery scan, a computing
+  Project). That node becomes the variable's relation, with its row
+  estimate as `rel->tuples`. Base scans are unaffected, since
+  `resolveBaseColumn` answers for them first.
+- A partitioned or inherited table's UNION ALL expansion is excluded
+  (`setOpExpandsTableHierarchy`: some member, under the appendrel's
+  translation Project, scans a partition or an inheritance child). To PG
+  that is one relation read through the parent's inherited statistics.
+  The first attempt missed the Project wrapper and re-estimated two
+  partition_aggregate.sql plans.
+
+Tests: `TestGroupsOverSetOpClampPerRelation` (fails on base: 10000 groups
+against 1000) and `TestGroupsOverPartitionAppendNotClampedAsSubquery`.
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 24 → 25 (Q75 = PG). Q76's first
+divergence moves from depth 1 to 6 at both scales. SF0.25 join-order
+59 → 58, join-method 35 → 34 and rendering 21 → 20; SF1 join-method
+34 → 32. Parallelism rises by 1 at each scale, from Q76's deeper records.
+TPC-H is identical. Evidence: `analysis/m0146/m0146-0005/slice54/`.
+
+Ledgered: the parent's inherited statistics for partitioned or inherited
+tables are not implemented (goopg reads no `stainherit` rows), so those
+variables keep the relation-less default. The variable key is the
+consumer-side index, so two references to one source column are not
+de-duplicated as PG's `add_unique_group_var` would.
