@@ -34,14 +34,14 @@ func TestMergeJoinChargedOnMergeTuplesNotJoinrelRows(t *testing.T) {
 	const joinRows = 2000
 
 	narrow := newRelOptInfo(a|b, joinRows, 64)
-	sortInnerAndOuter(nil, narrow, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, nil,
+	sortInnerAndOuter(nil, narrow, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, false, keys, nil,
 		func([]*restrictInfo) float64 { return joinRows },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
 	// The merge emits 4x the joinrel's rows before the residual filters them,
 	// exactly the Q9 ratio.
 	wide := newRelOptInfo(a|b, joinRows, 64)
-	sortInnerAndOuter(nil, wide, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, keys, residual,
+	sortInnerAndOuter(nil, wide, scanRel(a, 10000, 100), scanRel(b, 5000, 50), cp, parser.JoinInner, false, keys, residual,
 		func([]*restrictInfo) float64 { return joinRows * 4 },
 		func([]*restrictInfo) (float64, float64) { return 1, 1 }, 0)
 
@@ -60,27 +60,27 @@ func TestMergeJoinChargedOnMergeTuplesNotJoinrelRows(t *testing.T) {
 	}
 }
 
-// TestMergeJoinTuplesRecoversPreFilterCount pins the helper directly: dividing
-// the joinrel's rows by the residual's selectivity is what recovers the count
-// the operator emits, and it must never report FEWER tuples than the joinrel
-// has rows, nor more than the cross product.
-func TestMergeJoinTuplesRecoversPreFilterCount(t *testing.T) {
+// TestMergeJoinTuplesIsApproxTupleCount pins the helper against
+// approx_tuple_count (costsize.c): the cross product of the input rows times
+// each merge clause's selectivity, clamped to at least one row. It is NOT
+// recovered from the joinrel's clamped row count — that is what inflated
+// TPC-DS Q47's one-row `v1_lag ⋈ v1` merge to 200 emitted tuples
+// (M0146-0005bd).
+func TestMergeJoinTuplesIsApproxTupleCount(t *testing.T) {
 	s := &searchCtx{}
-	const rows = 1000.0
-
-	if got := s.mergeJoinTuples(rows, nil, 5000, 4000); got != rows {
-		t.Errorf("no residual must leave the count alone: got %v, want %v", got, rows)
+	sel := func(v float64) *restrictInfo {
+		return &restrictInfo{relids: 3, ecID: noEquivClass, normSelec: v, normSelecValid: true}
 	}
-	// A residual can only ever raise the emitted count above the joinrel's rows.
-	if got := s.mergeJoinTuples(rows, []*restrictInfo{plainClause(3)}, 5000, 4000); got < rows {
-		t.Errorf("mergejointuples %v is below the joinrel's %v rows", got, rows)
+	if got := s.mergeJoinTuples(nil, 50, 40); got != 2000 {
+		t.Errorf("no merge clause: got %v, want the 50x40 cross product", got)
 	}
-	// Never more pairs than the cross product — checked with a joinrel small
-	// enough for the clamp to be reachable. (When the joinrel's own row count
-	// already exceeds the cross product the inputs are degenerate, and the
-	// helper deliberately returns the row count rather than a smaller number:
-	// under-reporting is the failure mode being fixed.)
-	if got := s.mergeJoinTuples(50, []*restrictInfo{plainClause(3)}, 10, 10); got > 100 {
-		t.Errorf("mergejointuples %v exceeds the 10x10 cross product", got)
+	if got := s.mergeJoinTuples([]*restrictInfo{sel(0.1), sel(0.5)}, 100, 40); got != 200 {
+		t.Errorf("two clauses at 0.1 and 0.5 over 100x40: got %v, want 200", got)
+	}
+	// Four independent 1/200 clauses over 3823x2 rows — Q47's lag x v1 —
+	// estimate a fraction of a row; clamp_row_est makes it one.
+	c := sel(1.0 / 200)
+	if got := s.mergeJoinTuples([]*restrictInfo{c, c, c, c}, 3823, 2); got != 1 {
+		t.Errorf("Q47-shaped merge: got %v, want the clamped 1", got)
 	}
 }

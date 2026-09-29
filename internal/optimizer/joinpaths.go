@@ -421,6 +421,13 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		// comment above for the citation).
 		if len(keys) > 0 {
 			if !mergeDeclined {
+				// extra->inner_unique (joinpath.c:152-179): false for SEMI
+				// and ANTI, true for a unique-ified inner, else whether the
+				// inner rel is proven unique for the restriction list. A
+				// merge whose every join clause is a merge clause then never
+				// rewinds its inner (skip_mark_restore).
+				innerUnique := jt != parser.JoinSemi && jt != parser.JoinAnti &&
+					(uniq == uniqueSideInner || s.innerRelProvenUnique(outer, inner, clauses, true))
 				// mergejointuples: what the merge operator emits, before the
 				// residual filters it to joinrel.Rows. Computed ONCE here, where
 				// the searchCtx (and so the selectivity model) is in scope, and
@@ -429,15 +436,16 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// A closure, not a scalar: the match_unsorted_outer arm TRIMS its
 				// merge-clause list per trial and demotes the dropped clauses into
 				// the residual, so its mergejointuples differs per call. Passing
-				// the rule lets each site apply it to its own residual, while the
-				// searchCtx stays out of the merge helpers' signatures.
-				mergeTuplesFor := func(res []*restrictInfo) float64 {
-					return s.mergeJoinTuples(joinrel.Rows, res, outer.Rows, inner.Rows)
+				// the rule lets each site apply it to its own merge clauses
+				// (approx_tuple_count), while the searchCtx stays out of the
+				// merge helpers' signatures.
+				mergeTuplesFor := func(mc []*restrictInfo) float64 {
+					return s.mergeJoinTuples(mc, outer.Rows, inner.Rows)
 				}
 				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
-				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 				// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 				// and arm 4 — so a merge over an already-ordered outer is offered
 				// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -445,14 +453,14 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// here; goopg's nested-loop halves (`addNestLoopPath` /
 				// `addNLIPaths`) were landed separately and still run after the
 				// hash arm, which can only change a hash-vs-nestloop exact tie.
-				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
 				// (joinpath.c:2071-2097) beside the serial arm above — every
 				// already-ordered partial outer (the cheapest is almost never
 				// the ordered one) against the cheapest parallel-safe complete
 				// inner. First candidate per outer only; the truncation search
 				// is a follow-up the A/B can motivate.
-				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, clauses)
 			// take2 P2-11: the inner side is the BUILD side here, so the

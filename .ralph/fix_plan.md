@@ -23305,6 +23305,30 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q51\), TPC\-H census identical, regress runner 6 cases \(join\.sql
     row\-order flap only\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 58 -> 57, rendering 20 -> 19; SF1 join-order 64 -> 63, rendering 19 -> 18 (Q51 first divergence depth 4 -> 10)
+- [x] **M0146\-0005bd — a merge join is priced by final\_cost\_mergejoin**
+  \(slice 56, impl, done 2026\-09\-30 from Q47/Q57\'s CTE\-scan join order\)\.
+  Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 56"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `mergeJoinCost` ports the merge\-qual operator count, rescan ratio and
+    materialize\_inner election; an elected presorted inner gets a
+    PathMaterial \(EXPLAIN `Materialize` as PG\)\.
+  - `mergejointuples` is approx\_tuple\_count over the merge clauses \(the
+    old `joinrel.Rows / sel\(residual\)` inflated a clamped one\-row join to
+    200 and, with the rescan term, made Q47/Q57 time out on a nested loop\)\.
+  - inner\_unique reaches the merge arm \(skip\_mark\_restore\);
+    `groupedLeafDistinctFor` adds query\_is\_distinct\_for\'s GROUP BY /
+    DISTINCT arm \(Q83, Q77 inners\)\.
+  - Tests: `TestExplainMergeJoinMaterializesCTEInner` \(fails on base\),
+    `TestMergeJoinCostMaterializeElection`, `TestGroupedLeafDistinctFor`,
+    `TestMergeJoinTuplesIsApproxTupleCount`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(FORCE: nightly batch
+    live\), TPC\-H arm 24/24 values \(FORCE, values\-only\), fire set \(8 SF0\.25 / 6 SF1 fires\) all
+    executed, TPC\-H census byte\-identical, regress
+    runner 10 cases \(merge plans move among PG\-unmatched shapes only\)\.
+  - Evidence `analysis/m0146/m0146\-0005/slice56/`\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 57 -> 56, join-method 34 -> 31, scan-type 39 -> 37, aggregation-strategy 24 -> 22; SF1 join-order 63 -> 62, join-method 32 -> 30, scan-type 44 -> 42 (match unchanged 26 / 22; Q47/Q57 take PG's join order)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

@@ -105,7 +105,8 @@ func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restr
 			return true
 		}
 	}
-	return setOpLeafDistinctFor(inner.baseLeaf, innerRel, pairs)
+	return setOpLeafDistinctFor(inner.baseLeaf, innerRel, pairs) ||
+		groupedLeafDistinctFor(inner.baseLeaf, innerRel, pairs)
 }
 
 // setOpLeafDistinctFor is the set-operation arm of PG's rel_is_distinct_for
@@ -116,9 +117,9 @@ func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restr
 // INTERSECT on all three of its columns, and PG costs that hash join as
 // inner-unique (M0146-0005g).
 //
-// A DISTINCT or GROUP BY subquery leaf (the arms PG also has) is not proven
-// here. The proof only moves costs: goopg's executor does not stop at the
-// first match on inner_unique.
+// The DISTINCT and GROUP BY arms are groupedLeafDistinctFor. The proof only
+// moves costs: goopg's executor does not stop at the first match on
+// inner_unique.
 func setOpLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
 	so, ok := leafBaseScan(leaf).(*SetOp)
 	if !ok || so.All {
@@ -167,4 +168,120 @@ func (s *searchCtx) innerUniqueMatchFactors(inner *RelOptInfo, clauses []*restri
 		matchCount = math.Max(1.0, inner.Rows)
 	}
 	return sel, matchCount
+}
+
+// groupedLeafDistinctFor is the DISTINCT / GROUP BY arm of PG's
+// query_is_distinct_for (analyzejoins.c) for a subquery leaf: a grouped
+// body emits one row per group, so the leaf is unique for any clause set
+// that equates every grouping column; an aggregate with no GROUP BY emits
+// one row; a DISTINCT emits distinct rows over its whole target list.
+// TPC-DS Q83's per-channel `GROUP BY i_item_id` CTEs join on item_id, and PG
+// costs those merge joins as inner-unique — skip_mark_restore, so no
+// Material above the inner (M0146-0005bd).
+//
+// The equated columns are tracked by output position from the leaf's top
+// down to the grouping node: wrappers that keep rows and positions
+// (Filter, Sort, Limit, Materialize, subquery and inlined CTE scans, a
+// WindowAgg's input columns) pass them through, and a Project maps a bare
+// column reference to its input position. Anything else declines.
+func groupedLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
+	if leaf == nil {
+		return false
+	}
+	names := make(map[string]bool)
+	for _, p := range pairs {
+		for k := 0; k < 2; k++ {
+			if p.rel[k] == innerRel {
+				names[p.col[k]] = true
+			}
+		}
+	}
+	top := leaf.Output()
+	equated := make(map[int]bool)
+	seen := make(map[string]bool, len(top))
+	for i, c := range top {
+		if seen[c.Name] {
+			// A repeated name could not tell which column a clause equates.
+			if names[c.Name] {
+				return false
+			}
+			continue
+		}
+		seen[c.Name] = true
+		if c.Name != "" && names[c.Name] {
+			equated[i] = true
+		}
+	}
+	if len(equated) == 0 {
+		return false
+	}
+	n := leaf
+	for depth := 0; depth < 32 && n != nil; depth++ {
+		switch x := n.(type) {
+		case *Filter:
+			n = x.Child
+		case *Sort:
+			n = x.Child
+		case *Limit:
+			n = x.Child
+		case *Materialize:
+			n = x.Child
+		case *SubqueryScan:
+			if x.Child == nil || len(x.Child.Output()) != len(x.Output()) {
+				return false
+			}
+			n = x.Child
+		case *CTEScan:
+			if !x.Inlined() || x.Child == nil || len(x.Child.Output()) != len(x.Output()) {
+				return false
+			}
+			n = x.Child
+		case *WindowAgg:
+			if x.Child == nil {
+				return false
+			}
+			w := len(x.Child.Output())
+			for i := range equated {
+				if i >= w {
+					delete(equated, i)
+				}
+			}
+			n = x.Child
+		case *Project:
+			next := make(map[int]bool, len(equated))
+			for i := range equated {
+				if i >= len(x.Targets) {
+					continue
+				}
+				if cr, ok := x.Targets[i].(*ColumnRef); ok && cr.Index >= 0 {
+					next[cr.Index] = true
+				}
+			}
+			equated = next
+			n = x.Child
+		case *Aggregate:
+			if x.GroupingSets != nil || x.Mode == AggModePartial {
+				return false
+			}
+			for i := range x.GroupExprs {
+				if !equated[i] {
+					return false
+				}
+			}
+			return true
+		case *Distinct:
+			for i := range x.Output() {
+				if !equated[i] {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+		if len(equated) == 0 {
+			return false
+		}
+	}
+	return false
 }

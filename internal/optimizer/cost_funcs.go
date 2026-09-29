@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // envFloatDefault reads a float from the environment, returning def when unset
@@ -1033,34 +1034,154 @@ func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerR
 	return Cost{Startup: startup, Total: startup + run}
 }
 
-// mergeJoinCost reproduces final_cost_mergejoin (costsize.c:3837) at milestone
-// fidelity: merge two already-costed (and sorted) inputs, charging a per-row
-// merge. A cost_sort on an unsorted input is added by the caller when the input's
-// pathkeys do not satisfy the merge clause (design ch. 06 §3.2) — the whole
-// reason pathkeys exist.
-func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64) Cost {
+// mergeInner describes the inner input of a merge join to mergeJoinCost:
+// what final_cost_mergejoin (costsize.c:3837) reads off the MergePath beyond
+// the two input costs.
+type mergeInner struct {
+	// qualOps is cost_qual_eval over the merge clauses, in units of
+	// cpu_operator_cost per comparison.
+	qualOps float64
+	// sorted: the merge sorts the inner explicitly (innersortkeys != NIL).
+	sorted bool
+	// markRestore is ExecSupportsMarkRestore on the inner path.
+	markRestore bool
+	// skipMarkRestore: a SEMI/ANTI (or unique-inner) merge whose every join
+	// clause is a merge clause never rewinds the inner (costsize.c:3895).
+	skipMarkRestore bool
+	// bytes is relation_byte_size of the inner path.
+	bytes float64
+}
+
+// mergeJoinCost is final_cost_mergejoin (costsize.c:3837) over two
+// already-costed inputs; a cost_sort on an unsorted input is the caller's
+// (it is part of `inner`/`outer` here, as initial_cost_mergejoin folds it
+// in). It returns the cost and PG's materialize_inner election.
+//
+//   - mergejoinscansel (take2 P2-12): the merge stops once one side passes
+//     the other's maximum key, so only that fraction of each input's run
+//     cost and rows is paid. 1 means "no information" and charges the full
+//     pass; the scaling can only reduce cost, so an unknown must not.
+//   - Rescans: every inner tuple matched more than once is re-fetched,
+//     `rescannedtuples = mergejointuples - inner_path_rows`, scaling the
+//     inner's run cost by `rescanratio`.
+//   - materialize_inner: a Material node above the inner costs
+//     cpu_operator_cost per (re)fetched tuple instead of re-running the
+//     inner. PG elects it when that is cheaper, when a presorted inner
+//     cannot mark/restore, or when an explicitly sorted inner exceeds
+//     work_mem.
+//   - The merge clauses cost their operators on every tuple read from
+//     either side (cost_qual_eval, not one comparison per row), and each
+//     merged tuple pays cpu_tuple_cost; the caller adds the residual quals.
+func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64, mi mergeInner) (Cost, bool) {
 	startup := outer.Startup + inner.Startup
-	// take2 P2-12, `mergejoinscansel` applied as final_cost_mergejoin does
-	// (costsize.c:3686-3745): a merge join stops once one side passes the
-	// other's maximum key, so only that FRACTION of each input's RUN cost is
-	// paid. Both branches of PG's sort/no-sort split scale the same way — the
-	// sort's own startup, which is where the full input read lives, is charged
-	// UNSCALED, and only the read-out portion scales. goopg's sortPathFor has
-	// that same shape, so applying the scaling to (Total - Startup) is correct
-	// whether or not the input needed sorting.
-	//
-	// 1 means "no information" and charges the full pass, i.e. the behaviour
-	// before this term. The scaling can only ever REDUCE cost, so an unknown
-	// must not be allowed to.
 	if outerEndSel <= 0 || outerEndSel > 1 {
 		outerEndSel = 1
 	}
 	if innerEndSel <= 0 || innerEndSel > 1 {
 		innerEndSel = 1
 	}
-	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel +
-		cp.cpuOperatorCost*(outerRows*outerEndSel+innerRows*innerEndSel) + cp.cpuTupleCost*outputRows
-	return Cost{Startup: startup, Total: startup + run}
+	innerPathRows := innerRows
+	if innerPathRows <= 0 {
+		innerPathRows = 1
+	}
+	outerScanRows := clampRowEst(outerRows * outerEndSel)
+	innerScanRows := clampRowEst(innerRows * innerEndSel)
+	innerRun := (inner.Total - inner.Startup) * innerEndSel
+	run := (outer.Total - outer.Startup) * outerEndSel
+
+	rescanned := 0.0
+	if !mi.skipMarkRestore {
+		rescanned = math.Max(outputRows-innerPathRows, 0)
+	}
+	rescanRatio := 1.0 + rescanned/innerScanRows
+	bare := innerRun * rescanRatio
+	mat := innerRun + cp.cpuOperatorCost*innerScanRows*rescanRatio
+	materialize := false
+	switch {
+	case mi.skipMarkRestore:
+	case cp.enableMaterial && mat < bare:
+		materialize = true
+	case !mi.sorted && !mi.markRestore:
+		materialize = true
+	case cp.enableMaterial && mi.sorted && mi.bytes > float64(cp.workMem):
+		materialize = true
+	}
+	if materialize {
+		run += mat
+	} else {
+		run += bare
+	}
+	run += cp.cpuOperatorCost * mi.qualOps * (outerScanRows + innerScanRows*rescanRatio)
+	run += cp.cpuTupleCost * outputRows
+	return Cost{Startup: startup, Total: startup + run}, materialize
+}
+
+// mergeInnerFor assembles mergeInner for a merge candidate whose (possibly
+// sorted) inner path is ip; sorted says the merge added the Sort, and
+// innerUnique is the pair's extra->inner_unique.
+func mergeInnerFor(ip *Path, sorted bool, jt parser.JoinType, innerUnique bool, mergeClauses, residual []*restrictInfo) mergeInner {
+	return mergeInner{
+		qualOps:         mergeClauseOps(mergeClauses),
+		sorted:          sorted,
+		markRestore:     execSupportsMarkRestore(ip),
+		skipMarkRestore: (jt == parser.JoinSemi || jt == parser.JoinAnti || innerUnique) && len(residual) == 0,
+		bytes:           relationByteSize(ip.Rows, pathAvgVarBytes(ip), pathNCols(ip)),
+	}
+}
+
+// mergeClauseOps is cost_qual_eval's per-tuple operator count over a merge
+// clause list.
+func mergeClauseOps(clauses []*restrictInfo) float64 {
+	var ops float64
+	for _, c := range clauses {
+		if c == nil || c.clause == nil {
+			ops++
+			continue
+		}
+		_, p := qualEvalOps(c.clause)
+		ops += p
+	}
+	return ops
+}
+
+// execSupportsMarkRestore is ExecSupportsMarkRestore (execAmi.c) on a path:
+// btree index scans, Material and Sort can rewind to a mark; nothing else
+// goopg plans can.
+func execSupportsMarkRestore(p *Path) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Kind {
+	case PathIndexScan, PathMaterial, PathSort:
+		return true
+	case PathPrebuilt:
+		switch leafBaseScan(p.node).(type) {
+		case *IndexScan, *IndexOnlyScan:
+			return true
+		}
+	}
+	return false
+}
+
+// mergeMaterialInner is the Material create_mergejoin_plan puts above an
+// inner PG's final_cost_mergejoin elected to materialize: the inner's own
+// cost plus cpu_operator_cost per tuple, "assum[ing] the materialize will
+// not spill to disk" (createplan.c:4663-4669).
+func mergeMaterialInner(sub *Path, cp costParams) *Path {
+	return &Path{
+		Kind:          PathMaterial,
+		Rel:           sub.Rel,
+		Rows:          sub.Rows,
+		Pathkeys:      sub.Pathkeys,
+		NCols:         sub.NCols,
+		AvgVarBytes:   sub.AvgVarBytes,
+		OutputWidth:   sub.OutputWidth,
+		Cost:          Cost{Startup: sub.Cost.Startup, Total: sub.Cost.Total + cp.cpuOperatorCost*sub.Rows},
+		ParallelSafe:  sub.ParallelSafe,
+		RequiredOuter: sub.RequiredOuter,
+		Children:      []*Path{sub},
+		DisabledNodes: sub.DisabledNodes,
+	}
 }
 
 // gatherCost reproduces cost_gather (costsize.c:446): a flat parallel_setup_cost

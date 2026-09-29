@@ -178,7 +178,14 @@ func TestGenerateMergejoinPaths_TruncationDemotesDroppedClauseToResidual(t *test
 
 	var truncated *Path
 	for _, p := range unsortedMergePaths(joinrel) {
-		if len(p.HashKeys) == 1 && p.Children[1].Kind == PathIndexScan {
+		// The one-key merge rescans duplicate inner groups, so PG's
+		// final_cost_mergejoin shields the index scan with a Material
+		// (M0146-0005bd); the truncation claim is about what lies below.
+		in := p.Children[1]
+		if in.Kind == PathMaterial {
+			in = in.Children[0]
+		}
+		if len(p.HashKeys) == 1 && in.Kind == PathIndexScan {
 			truncated = p
 		}
 	}

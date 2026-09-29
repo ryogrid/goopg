@@ -300,7 +300,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 // the join DELIVERS (`merge_pathkeys`): the loop's `outerKeys` at site 1,
 // the outer's full ordering at site 2.
 func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
-	jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey,
+	jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey,
 	mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
 	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 
@@ -371,7 +371,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, "merge", resultKeys, outerSortKeys, innerSortKeys,
+	tryPartialMergeJoinPath(s, joinrel, o, i, outer.Relids, inner.Relids, cp, jt, innerUnique, "merge", resultKeys, outerSortKeys, innerSortKeys,
 		mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
@@ -403,7 +403,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 // `sort_inner_and_outer` wrapper above, "mergeu" for
 // `matchUnsortedOuterMergePartial` — so the veto line attributes to the
 // route, not just the refusal (R54 Step-1 H5).
-func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType,
+func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool,
 	site string,
 	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
 	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64),
@@ -459,13 +459,17 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// workers emit together, and each worker emits a 1/divisor share.
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)
-	mergeTuples := mergeTuplesFor(residual) / divisor
+	mergeTuples := mergeTuplesFor(mergeClauses) / divisor
 	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
 	// The partial outer's Rows is ALREADY the per-worker count
 	// (costParallelSeqscan divides it); the inner's are the WHOLE inner,
 	// read complete by every worker — the same asymmetry the hash twin
 	// implements and `final_cost_mergejoin` prices.
-	cost := mergeJoinCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, mergeTuples, outerEndSel, innerEndSel)
+	cost, matInner := mergeJoinCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, mergeTuples, outerEndSel, innerEndSel,
+		mergeInnerFor(i, i.Kind == PathSort, jt, innerUnique, mergeClauses, residual))
+	if matInner && i.Kind != PathSort {
+		i = mergeMaterialInner(i, cp)
+	}
 	// The residual rides the join's OUTPUT cardinality, which for a partial
 	// path is the per-worker one — the same rule the serial twin and the
 	// hash twin apply.

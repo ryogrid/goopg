@@ -783,3 +783,7 @@ Q51's next record is a planner behaviour: goopg keeps `Filter:
 NULL test on a column declared NOT NULL (`restriction_is_always_true`,
 initsplan.c). This is filed as M0146-0038. Evidence:
 `analysis/m0146/m0146-0005/slice55/`.
+
+
+Continued in [m0146-0005-join-order-burndown-4.md](m0146-0005-join-order-burndown-4.md)
+(slices 56+), split per the design-doc size rule (D3).

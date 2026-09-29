@@ -237,7 +237,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -265,13 +265,13 @@ func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costP
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, outer, inner, cp, jt, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		addMergeJoinPath(joinrel, outer, inner, cp, jt, innerUnique, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 		// E-20 Cut 3: PG's `sort_inner_and_outer` loop offers a partial
 		// mergejoin per ordering (`cheapest_partial_outer` +
 		// `cheapest_safe_inner`, joinpath.c:1535-1545), beside the serial
 		// offer above. The delivered ordering here IS the loop's ordering
 		// (resultKeys == outerKeys), exactly as the serial call passes.
-		addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
 
@@ -315,7 +315,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	o, i := outer.CheapestTotal, inner.CheapestTotal
 	if o == nil || i == nil {
 		return
@@ -324,7 +324,7 @@ func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parse
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, outer.Relids, inner.Relids, cp, jt, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, o, i, outer.Relids, inner.Relids, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
 // buildJoinPathkeys is the ONE rule of `build_join_pathkeys` (pathkeys.c:1295)
@@ -379,7 +379,7 @@ func buildJoinPathkeysRule(jt parser.JoinType, outerKeys []PathKey) []PathKey {
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
@@ -427,9 +427,16 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 	// undercharge made the merge path win at PostgreSQL's work_mem and lose at
 	// goopg's inflated default, which is what made that default load-bearing.
 	// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
-	mergeTuples := mergeTuplesFor(residual)
+	mergeTuples := mergeTuplesFor(mergeClauses)
 	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
-	cost := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, outerEndSel, innerEndSel)
+	cost, matInner := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, outerEndSel, innerEndSel,
+		mergeInnerFor(ip, ip != i, jt, innerUnique, mergeClauses, residual))
+	if matInner && ip == i {
+		// create_mergejoin_plan's Material above the inner (createplan.c:4659).
+		// An explicitly sorted inner PG would also shield is left bare: the
+		// merge plan absorbs its Sort child (absorbMergeSort) — ledgered.
+		ip = mergeMaterialInner(ip, cp)
+	}
 	// The residual is evaluated on the tuples that already matched on the
 	// merge keys — that is `mergeTuples`, which is what the comment here always
 	// said and what the code now passes.

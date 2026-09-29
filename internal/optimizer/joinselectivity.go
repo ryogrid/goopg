@@ -962,30 +962,23 @@ func (s *searchCtx) residualSelectivity(residual []*restrictInfo) float64 {
 }
 
 // mergeJoinTuples is `final_cost_mergejoin`'s `mergejointuples`
-// (costsize.c:3960-4045): the number of tuples the merge operator actually
-// emits, before the non-merge quals filter them down to the joinrel's row
-// count.
+// (costsize.c:3960): `approx_tuple_count` over the path's MERGE clauses — the
+// cross product of the two input paths' rows times each merge clause's
+// selectivity, taken independently with inner-join semantics
+// (costsize.c:5300-5340). It is what the merge operator emits before the
+// residual quals filter it.
 //
-// Returns joinrelRows unchanged when there is no residual — the overwhelmingly
-// common case, and the one where the old code was already right.
-func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInfo, outerRows, innerRows float64) float64 {
-	if len(residual) == 0 || joinrelRows <= 0 {
-		return joinrelRows
+// It is computed from the clauses, not recovered from the joinrel's row
+// count: that count is clamped to at least one row, so dividing a clamped
+// estimate by the residual's selectivity inflated a one-row join's merge
+// output to 1/sel (TPC-DS Q47's `v1_lag ⋈ v1`: 200 where PG counts 1),
+// which then priced 199 phantom inner rescans (M0146-0005bd).
+func (s *searchCtx) mergeJoinTuples(mergeClauses []*restrictInfo, outerRows, innerRows float64) float64 {
+	sel := 1.0
+	for _, ri := range mergeClauses {
+		sel *= s.joinClauseSelectivity(ri)
 	}
-	sel := s.residualSelectivity(residual)
-	if sel <= 0 {
-		return joinrelRows
-	}
-	tuples := joinrelRows / sel
-	// The merge can never emit more pairs than the cross product; the clamp
-	// mirrors the one calcJoinrelSize applies to its own estimate.
-	if cross := math.Max(outerRows, 1) * math.Max(innerRows, 1); tuples > cross {
-		tuples = cross
-	}
-	if tuples < joinrelRows {
-		return joinrelRows
-	}
-	return tuples
+	return clampRowEst(outerRows * innerRows * sel)
 }
 
 // estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c:4060)
