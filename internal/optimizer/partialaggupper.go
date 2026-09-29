@@ -358,7 +358,11 @@ func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggN
 		len(aggNode.GroupExprs), inNcols, inAvgVar)
 }
 
-func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
+// partial, when non-nil, is the searched rel's cheapest partial path and
+// child is that path rebuilt under a Gather: the partial input then takes the
+// path's own worker count, per-worker rows and per-worker cost, as
+// create_partial_grouping_paths does, instead of dividing the serial seed.
+func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings, partial *Path) *Path {
 	if partialAggPathsMode != partialAggPathsOn {
 		// R54 Step-0: upper-rel refusal record. Gate name "agg-upper" keeps
 		// this producer distinct from the post-pass "agg" consumer — the two
@@ -475,6 +479,9 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		return nil
 	}
 	workers := upperSplitWorkers(child, cp, ps)
+	if partial != nil && partial.ParallelWorkers > 0 {
+		workers = partial.ParallelWorkers
+	}
 	if workers <= 0 {
 		traceUpperGate("agg-upper", "refused", "gate=workers")
 		return nil
@@ -490,6 +497,9 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		inputRows = 1
 	}
 	perWorkerRows := inputRows / d
+	if partial != nil && partial.Rows > 0 {
+		perWorkerRows = partial.Rows
+	}
 
 	// Upstream's `dNumPartialPartialGroups = get_number_of_groups(root,
 	// cheapest_partial_path->rows, …)` (planner.c:7452), through the same
@@ -518,6 +528,9 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	pseed := newPrebuiltPath(partialRel, child)
 	pseed.Rows = perWorkerRows
 	pseed.Cost = parallelSeedCost(seed.Cost, d)
+	if partial != nil {
+		pseed.Cost = partial.Cost
+	}
 	pseed.ParallelSafe = true
 	pseed.ParallelWorkers = workers
 

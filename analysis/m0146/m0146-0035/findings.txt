@@ -1,0 +1,11 @@
+M0146-0035 evidence (2026-09-29, collected read-only; no writes to the bench cluster)
+
+1. Clones via scripts/lib/tpch-private-clone.sh tpch_private_clone_snapshot (pg_basebackup -X fetch of the live TPC-H bench cluster):
+   - tmp/goopg-acceptance-arm-tpch-data (arm, 09:32): first start (crash recovery) served user tpch / db tpch; Q1-Q22 ran.
+   - same dir, restarted 09:3x after the arm's clean stop: pg_database = postgres, template1, template0; base/16408 present.
+   - tmp/q15-clone (09:37 and ~09:50): first start already lacks db tpch and role tpch ("role \"tpch\" does not exist").
+   - later arm clones (09:41, 10:xx) again served tpch.
+2. Source (read-only SELECT): pg_database lists postgres, template0, template1, tpch; server up since 2026-09-24 17:21.
+3. global/1262 heap page (clone copy): lp 4 = tpch, xmin 5, xmax 0, infomask 0x803 (HASNULL|HASVARWIDTH|XMAX_INVALID, no XMIN hint).
+4. pg_xact/0000 xid 5 = COMMITTED in the source, the arm clone and the fresh clone.
+=> the heap row is visible by PG rules; the startup database list comes from elsewhere.

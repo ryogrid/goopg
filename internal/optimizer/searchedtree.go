@@ -476,6 +476,48 @@ func searchedCheapestTotalInput(n Node) (Node, *Path) {
 	return nil, nil
 }
 
+// searchedCheapestPartialInput is the partial-aggregate split's input:
+// upstream's create_partial_grouping_paths builds the partial aggregate on
+// `input_rel->cheapest_partial_path` (planner.c:7435-7470), priced at that
+// path's own per-worker cost. It returns the searched rel's cheapest partial
+// path rebuilt under a Gather through the same boundary as
+// searchedCheapestTotalInput (the split producer unwraps that Gather), plus the
+// partial path itself; nil when the searched input is unreachable, the search
+// built no partial path, or the path cannot be run or rebuilt under a Gather.
+func searchedCheapestPartialInput(n Node, cp costParams) (Node, *Path) {
+	if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+		rel := s.searchedRel()
+		if rel == nil || len(rel.PartialPathlist) == 0 || rel.PartialPathlist[0] == nil {
+			return nil, nil
+		}
+		pp := rel.PartialPathlist[0]
+		g := makeGatherPath(rel, pp, cp, false)
+		if g == nil {
+			return nil, nil
+		}
+		r := searchedBoundaryRebuild(g, s.Output())
+		if r == nil {
+			return nil, nil
+		}
+		return r, pp
+	}
+	switch x := n.(type) {
+	case *Project:
+		if c, p := searchedCheapestPartialInput(x.Child, cp); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	case *Sort:
+		if c, p := searchedCheapestPartialInput(x.Child, cp); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	}
+	return nil, nil
+}
+
 // searchedCandidateInput is `searchedCheapestTotalInput` parameterized on the
 // path: rebuild `p` through the boundary at the searched root, then re-wrap
 // the same *Project/*Sort pass-through chain `n` carries above it. It is the

@@ -1,0 +1,3 @@
+Regress runner, 12 cases (join subselect select_parallel partition_join equivclass memoize inherit aggregates create_index groupingsets limit union), HEAD-built baseline vs candidate:
+- join.sql: two rows of an unordered LATERAL/LEFT JOIN result swap order (same row set, no ORDER BY).
+- limit.sql: `select ... nextval('testseq') from tenk1 order by unique2 limit 10` returns wrong rows in BOTH arms (baseline 1 row, candidate 10 rows starting at unique2=365); same plan in both (Limit -> Gather -> Parallel Index Scan) = the known S2 M0146-0034, nondeterministic.

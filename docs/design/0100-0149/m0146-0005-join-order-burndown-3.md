@@ -170,3 +170,77 @@ subtree shows a per-worker `Sort` cost below its unscaled child. That is the
 Gather-stamping display, not new here. TPC-H plans are byte-identical apart
 from costs. The regress runner (10 cases) is unchanged. Evidence:
 `analysis/m0146/m0146-0005/slice41/`.
+
+## Slice 42: M0146-0005ap — the partial-aggregate split stands on the cheapest partial path
+
+TPC-DS Q99 (PG: `Finalize GroupAggregate -> Gather Merge -> Partial
+GroupAggregate -> Sort -> Hash Joins over a Parallel Hash Join`) planned
+instead as a serial Memoize nested-loop chain, parallelized after planning. The
+DP trace shows the search did build PG's input: a partial Parallel Hash Join
+path at the top relation (12890 per worker) and a Gather over it (14071.78,
+the relation's cheapest). The grouping stage's split arm ignored it. It split
+the aggregate over the COMMITTED serial child and priced the partial input
+with `parallelSeedCost` (the whole serial run cost divided by the parallel
+divisor), so the nested-loop chain cost 8404 per worker, below any real
+partial path. The same function was the ledgered cause of TPC-H Q4's residual
+(`M0146-0005af`: goopg's per-worker seed 25.7k against PG's partial path
+68.9k).
+
+### PG
+
+`create_partial_grouping_paths` (planner.c:7435-7470) builds the partial
+aggregate on `input_rel->cheapest_partial_path` and prices it at that path's
+own per-worker cost. There is no divided-serial estimate anywhere.
+
+### Change
+
+1. **Partial seed** (`searchedCheapestPartialInput`, searchedtree.go). When
+   the searched input rel has a partial path, `createGroupingPaths` rebuilds
+   `PartialPathlist[0]` under a Gather through the same boundary as
+   `searchedCheapestTotalInput`. `addPartialAggSplitPath` gets the partial
+   path as a new argument: it unwraps the Gather as before, and takes the
+   path's worker count, per-worker rows and cost instead of
+   `parallelSeedCost`. With no partial path, the old seed stays (the
+   committed-child route).
+2. **Plain presorted aggregate pays for its Sort** (groupingpaths.go). The
+   PLAIN arm built `Aggregate -> Sort` but charged `costAgg` on the unsorted
+   seed. PG's `cost_agg` reads the input path's cost. Honest seeds exposed it:
+   TPC-DS Q28's `Aggregate -> Sort -> Gather` priced below its own Sort beat
+   PG's per-worker Sort under a Gather Merge.
+3. **The Sort over `cheapest_total_path` is offered first** (groupingpaths.go).
+   `add_paths_to_grouping_rel` walks `input_rel->pathlist`, which `add_path`
+   keeps in ascending total cost, so the cheapest-total input (sorted) is
+   offered before any presorted runner-up. `add_path`'s tie chain
+   (parallel-safety, rows, then `compare_path_costs_fuzzily` at 1e-10) ends in
+   "keep the old path" when startup and total trade off, so the order decides
+   true near-ties. TPC-DS Q93: PG's `Sort -> Gather` beats a per-worker Sort
+   under a Gather Merge by 0.03.
+4. **Reconcile leaves a Finalize aggregate's keys on the partial input**
+   (joinlayout.go). A Finalize aggregate is a copy of the original: its keys
+   and arguments address the Partial's input row (`PartialSource`), not its
+   child (the Gather over the partial-state row). `reconcileNLILayoutBody`
+   re-resolved them against the child. That is a production pass, and it
+   would have moved them. The splits now happen during planning, so TPC-H
+   Q15's view aggregate sits inside the outer join search, and
+   `assertSearchedTreeNeedsNoReconcile` panicked (`l_suppkey` 4 → 0). Test:
+   `TestReconcileLeavesFinalizeKeysOnPartialInput`.
+
+### Results
+
+| instrument | before | after |
+|---|---|---|
+| TPC-DS SF0.25 PLAN-PARITY match | 18 | 19 (+Q55 +Q62, −Q40) |
+| TPC-DS SF1 match | 17 | 18 (+Q74 +Q97, −Q93) |
+| TPC-H match | 9 | 10 (+Q4) |
+| TPC-DS aggregation-strategy SF0.25 / SF1 | 33 / 37 | 26 / 28 |
+| TPC-DS sort-strategy SF0.25 / SF1 | 48 / 51 | 45 / 48 |
+| TPC-DS parallelism SF0.25 / SF1 | 46 / 56 | 43 / 53 |
+
+Costs rose (`join-method` +2 at both scales, `qual-placement` +2/+1,
+`scan-type` +1 at SF1) where the partial input's join order differs from the
+committed serial one. Q40 (SF0.25) and Q93 (SF1) now fall on the other side
+of near-ties (ledgered). SF1 Q74's plan is now PG's, but goopg runs it about
+5–9% slower. The query sits at the fire-set's 600 s limit in both arms: the
+baseline took 591–603 s, the candidate 617–654 s. It timed out once and
+passed on re-run (evidence `q74-sf1-timing.txt`; filed as M0146-0036).
+Evidence: `analysis/m0146/m0146-0005/slice42/`.

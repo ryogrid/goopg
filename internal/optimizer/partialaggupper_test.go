@@ -46,7 +46,7 @@ func addSplitFor(t *testing.T, agg *Aggregate, ps PlannerSettings) (*RelOptInfo,
 		// the same thing; give the seed the seq-scan price its own rows imply.
 		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 	}
-	return grouped, addPartialAggSplitPath(u, grouped, seed, agg, child, cp, ps)
+	return grouped, addPartialAggSplitPath(u, grouped, seed, agg, child, cp, ps, nil)
 }
 
 // TestUpperSplitPathIsGeneratedAndPriced is the "the candidate exists" pin —
@@ -109,7 +109,7 @@ func TestUpperSplitWinsForLowCardinalityGrouping(t *testing.T) {
 	if serialOnly == 0 {
 		t.Fatal("no serial candidate: the comparison would be vacuous")
 	}
-	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 	if split == nil {
 		t.Fatal("no parallel candidate: the comparison would be vacuous")
 	}
@@ -146,7 +146,7 @@ func TestUpperSplitLosesWhenGroupingReducesNothing(t *testing.T) {
 	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 
 	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, ps)
-	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 	if split == nil {
 		t.Skip("producer declined outright; the verdict is the same either way")
 	}
@@ -728,7 +728,7 @@ func TestUpperSplitSortedTransportArmCompetes(t *testing.T) {
 	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 
 	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, ps)
-	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 	sorted := sortedSplitArm(grouped)
 	if sorted == nil {
 		t.Fatal("no presorted split filed — the contest would be vacuous")
@@ -1623,7 +1623,7 @@ func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
 		seed := newPrebuiltPath(grouped, agg.Child)
 		seed.Rows = float64(EstimateRows(agg.Child))
 		seed.Cost = Cost{Startup: 0.4, Total: inputTotal}
-		addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+		addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 		return grouped
 	}
 	hashedSplit := func(rel *RelOptInfo) *Path {

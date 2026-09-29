@@ -23053,6 +23053,28 @@ M0146-0001 re-baseline census on the new default arm.
     Q80 at both scales, none introduced\), TPC\-H plans identical, regress
     runner 10 cases 0 changed\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 17 -> 18 (Q40), CATEGORIES-EXCL-MATCH join-order 66 -> 64, join-method 38 -> 36, parallelism 47 -> 46; SF1 match unchanged (sort-strategy 50 -> 51, Q40); TPC-H unchanged
+- [x] **M0146\-0005ap — the partial\-aggregate split stands on the cheapest
+  partial path** \(slice 42, impl, filed and done 2026\-09\-29 from the
+  TPC\-DS SF0\.25 census, Q99\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 42"\.
+  Kind: impl
+  Parent: M0146-0005
+  - The split priced a stamped serial child at `parallelSeedCost` \(serial
+    run / divisor\); PG builds on `cheapest\_partial\_path` at its own
+    per\-worker cost\. `searchedCheapestPartialInput` rebuilds
+    `PartialPathlist\[0\]` under a Gather and seeds the split from it\.
+  - Siblings the honest seed exposed: the presorted PLAIN arm now pays for
+    its Sort \(Q28\); the Sort over cheapest\_total is filed before presorted
+    runner\-ups \(pathlist order, Q93\); reconcile keeps a Finalize
+    aggregate\'s keys on its partial input \(TPC\-H Q15 panic, new test
+    `TestReconcileLeavesFinalizeKeysOnPartialInput`\)\.
+  - Resolves the `M0146\-0005af` ledger row\'s Q4 residual \(TPC\-H Q4 = PG\)\.
+  - SF1 Q74 plan = PG but runs 5\-9% slower at the 600 s fire\-set limit
+    \(timed out once, passed on re\-run\) → M0146\-0036\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(re\-run PASS, none introduced\), regress runner 12 cases \(join\.sql row
+    order; limit\.sql = known M0146\-0034 in both arms\)\.
+  Movement: yes — TPC-H PLAN-PARITY match 9 -> 10 (Q4); TPC-DS match SF0.25 18 -> 19, SF1 17 -> 18; CATEGORIES-EXCL-MATCH aggregation-strategy SF0.25 33 -> 26, SF1 37 -> 28, sort-strategy 48 -> 45 / 51 -> 48, parallelism 46 -> 43 / 56 -> 53
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -24094,6 +24116,47 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where the ordered\-rel / Limit path accepts a Gather
     path as carrying the index scan\'s pathkeys \(Gather must publish no
     pathkeys\)\.
+- [ ] **M0146\-0035 — WRONG RESULTS / DATA LOSS: an online TPC\-H clone
+  loses database `tpch` and role `tpch`** \(filed 2026\-09\-29 by
+  M0146\-0005ap; S2\)\. `tpch\_private\_clone\_snapshot` \(pg\_basebackup of the
+  live bench cluster\) produced clones whose first start lists only
+  postgres/template0/template1 and rejects role `tpch` \(09:37 and ~09:50\),
+  while the arm\'s own clones at 09:32 and 09:41 had them\. The source still
+  lists `tpch` in memory \(up since 2026\-09\-24\); the on\-disk
+  `global/1262` row for `tpch` is `xmin=5`, `xmax=0`, infomask 0x803, and
+  xid 5 is COMMITTED in `pg\_xact/0000` of both the source and the clones,
+  so the heap row is visible — the listing comes from another store\. A
+  restarted arm clone also lost `tpch` \(base/16408 present, row absent from
+  `pg\_database`\)\. If the source keeps the same state on disk, its next
+  restart would lose `tpch` too\. Evidence
+  `analysis/m0146/m0146\-0035/`\.
+  Kind: bug
+  Parent: none
+  - First step: find which store the per\-database catalog list is loaded
+    from at startup \(goopg\-private catalog WAL/replay vs the 1262 heap\) and
+    why the `tpch` entry is missing from it in a clone taken after a
+    checkpoint\.
+
+  > ## ESCALATION 2026\-09\-29 \(S2\) — online TPC\-H clones lose database `tpch`
+  >
+  > A private clone of the TPC\-H bench cluster can come up without its
+  > `tpch` database and role, although the files and the committed heap row
+  > are present; the TPC\-H gates that clone the cluster may then fail to
+  > connect, and a restart of the source may lose the database the same
+  > way\. Filed and not selected ahead of the banner, per S2; the owner
+  > decides its placement\. The loop did not touch the source cluster
+  > \(reads and pg\_basebackup only\)\.
+
+- [ ] **M0146\-0036 — TPC\-DS SF1 Q74 runs 5\-9% slower on PG\'s plan shape**
+  \(filed 2026\-09\-29 by M0146\-0005ap\)\. After 0005ap Q74\'s SF1 plan
+  matches PG, but goopg executes it in 617\-654 s against 591\-603 s for the
+  previous plan, at the fire\-set\'s 600 s limit \(one timeout, one pass\)\.
+  Evidence `analysis/m0146/m0146\-0005/slice42/q74\-sf1\-timing.txt`\.
+  Kind: recon
+  Parent: M0146-0005
+  - First step: EXPLAIN ANALYZE both plans on a private SF1 clone and
+    attribute the difference by node \(partial aggregation transport vs the
+    join inputs\)\.
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above

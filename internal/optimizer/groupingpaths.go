@@ -117,10 +117,18 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// by the same `setCheapest` against the serial arms above, instead of
 	// stamped onto the finished tree by the `MaybeAddGather` post-pass.
 	// Declines to nothing under the default knob and under every fail-closed
-	// refusal in partialaggupper.go. M0146-0005u keeps the committed child
-	// here: the split's pseed is seeded from the serial subtree's own cost
-	// (parallelSeedCost), not from input_rel->cheapest_total_path.
-	addPartialAggSplitPath(u, grouped, splitSeed, aggNode, splitChild, cp, ps)
+	// refusal in partialaggupper.go.
+	//
+	// M0146-0005ap: the split stands on `input_rel->cheapest_partial_path`
+	// (planner.c:7435) when the search built one — the partial subtree PG
+	// aggregates per worker, priced at its own per-worker cost. Only when
+	// there is none does it fall back to the committed serial child, seeded
+	// by parallelSeedCost (M0146-0005u's route).
+	var splitPartial *Path
+	if c2, pp := searchedCheapestPartialInput(splitChild, cp); c2 != nil {
+		splitChild, splitPartial = c2, pp
+	}
+	addPartialAggSplitPath(u, grouped, splitSeed, aggNode, splitChild, cp, ps, splitPartial)
 	setCheapest(grouped)
 
 	best := getCheapestFractionalPath(grouped, tupleFraction)
@@ -462,11 +470,20 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		// to file the shared aggNode pointer, so the winner
 		// copy-back (`*aggNode = *built`) rewrote losers underneath
 		// future readers. Content-identical; behavior change: none.
+		// cost_agg reads the INPUT PATH's cost (costsize.c cost_agg), so a
+		// presorted plain aggregate pays for its Sort: charging the unsorted
+		// seed priced TPC-DS Q28's `Aggregate -> Sort -> Gather` below its
+		// own Sort and let it beat PG's per-worker `Sort` under a Gather
+		// Merge (M0146-0005ap).
+		plainStartup, plainTotal := inputStartup, inputTotal
+		if presorted {
+			plainStartup, plainTotal = input.Cost.Startup, input.Cost.Total
+		}
 		plainSpec := *aggNode
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+			Cost: costAgg(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
 				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
@@ -522,6 +539,27 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// (searchedCandidateInput declines on any shape the seam
 			// cannot reproduce) — nothing here can elect a path whose
 			// ordering or row the committed input would not have carried.
+			// M0146-0005ap: the Sort over cheapest_total_path is filed FIRST.
+			// Upstream walks input_rel->pathlist in ascending total-cost
+			// order (add_path keeps it sorted), so the cheapest-total input —
+			// sorted here — is offered before any presorted runner-up, and a
+			// runner-up within STD_FUZZ_FACTOR of it loses the tie (TPC-DS
+			// Q93: PG's `Sort -> Gather` beats a per-worker Sort under a
+			// Gather Merge by 0.03).
+			idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat)
+			if !ok {
+				// M0144-0003c: narrowed seed — see sortSeed above.
+				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
+				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+				sortSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+				}, groupAggSortedProducer)
+			}
 			if sr := searchedJoinInputRelOf(child); sr != nil {
 				groupPathkeys := pathkeysForSortKeys(keys)
 				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
@@ -547,7 +585,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					}, groupAggSearchProducer)
 				}
 			}
-			if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
+			if ok {
 				// The index-driven variant: no Sort, narrowed spec. The spec
 				// is the builder's clone (remapped to narrowed positions);
 				// the input price is the index child's own.
@@ -573,18 +611,6 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
-			} else {
-				// M0144-0003c: narrowed seed — see sortSeed above.
-				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
-				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
-				sortSpec := *aggNode
-				addPath(grouped, &Path{
-					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
-					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
-					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-				}, groupAggSortedProducer)
 			}
 		}
 	}
