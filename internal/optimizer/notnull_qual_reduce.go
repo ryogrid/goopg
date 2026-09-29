@@ -1,6 +1,8 @@
 package optimizer
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -79,12 +81,12 @@ func exprIsNonNullable(e Expr, tbl *catalog.Table, srcIdx int) bool {
 // assertion that a row-valued IS NULL simply falls through singleClauseTruth
 // as an ordinary (non-Var) operand and is therefore never folded, matching
 // upstream's guard without needing one.
-func singleClauseTruth(e Expr, tbl *catalog.Table, srcIdx int) quantifiedTruth {
+func singleClauseTruth(e Expr, nonNull func(Expr) bool) quantifiedTruth {
 	nt, ok := e.(*IsNullExpr)
 	if !ok {
 		return truthUnknown
 	}
-	if !exprIsNonNullable(nt.Operand, tbl, srcIdx) {
+	if !nonNull(nt.Operand) {
 		return truthUnknown
 	}
 	if nt.Negated {
@@ -98,11 +100,11 @@ func singleClauseTruth(e Expr, tbl *catalog.Table, srcIdx int) quantifiedTruth {
 // (initsplan.c:3122-3143 / :3187-3212 — both walk `orclause->args` and defer
 // to the very same pair of functions per arm, not a separate AND-aware
 // recursion).
-func conjunctTruth(e Expr, tbl *catalog.Table, srcIdx int) quantifiedTruth {
+func conjunctTruth(e Expr, nonNull func(Expr) bool) quantifiedTruth {
 	if bin, ok := e.(*BinaryOp); ok && bin.Op == parser.OpOr {
-		return orClauseTruth(bin, tbl, srcIdx)
+		return orClauseTruth(bin, nonNull)
 	}
-	return singleClauseTruth(e, tbl, srcIdx)
+	return singleClauseTruth(e, nonNull)
 }
 
 // orClauseTruth applies PG's ASYMMETRIC OR quantifiers: the whole OR is
@@ -111,11 +113,11 @@ func conjunctTruth(e Expr, tbl *catalog.Table, srcIdx int) quantifiedTruth {
 // (truthUnknown) — upstream deliberately does not prune individual
 // disprovable arms here (initsplan.c:3187-3196 comment, carried into the
 // design doc §2).
-func orClauseTruth(bin *BinaryOp, tbl *catalog.Table, srcIdx int) quantifiedTruth {
+func orClauseTruth(bin *BinaryOp, nonNull func(Expr) bool) quantifiedTruth {
 	arms := flattenOrConjuncts(bin)
 	allFalse := true
 	for _, a := range arms {
-		switch conjunctTruth(a, tbl, srcIdx) {
+		switch conjunctTruth(a, nonNull) {
 		case truthTrue:
 			return truthTrue
 		case truthFalse:
@@ -147,10 +149,16 @@ func orClauseTruth(bin *BinaryOp, tbl *catalog.Table, srcIdx int) quantifiedTrut
 //     re-assembled as an AND chain — the caller keeps the Filter, using
 //     rewritten as its Predicate.
 func reduceNotNullQuals(pred Expr, tbl *catalog.Table, srcIdx int) (Expr, bool) {
+	return reduceNotNullQualsWith(pred, func(e Expr) bool { return exprIsNonNullable(e, tbl, srcIdx) })
+}
+
+// reduceNotNullQualsWith is reduceNotNullQuals over any expr_is_nonnullable
+// answer: the conjunct walk is the same whichever relations are in scope.
+func reduceNotNullQualsWith(pred Expr, nonNull func(Expr) bool) (Expr, bool) {
 	conjuncts := flattenAndConjuncts(pred)
 	kept := make([]Expr, 0, len(conjuncts))
 	for _, c := range conjuncts {
-		switch conjunctTruth(c, tbl, srcIdx) {
+		switch conjunctTruth(c, nonNull) {
 		case truthTrue:
 			continue // dropped: restriction_is_always_true
 		case truthFalse:
@@ -215,4 +223,59 @@ func andConjuncts(parts []Expr) Expr {
 		out = &BinaryOp{Op: parser.OpAnd, Left: out, Right: p}
 	}
 	return out
+}
+
+// scopeNonNullable is expr_is_nonnullable over a multi-relation scope whose
+// FROM list joins its relations by inner joins only (fromJoinsInnerOnly), so
+// no Var in the WHERE clause carries a varnullingrels bit: a bare column of
+// a catalog base relation declared NOT NULL. The column is located by its
+// binding identity (SourceTableIdx) and the binding's contiguous offset; any
+// binding that is not a stored relation (a CTE, subquery or function binding
+// synthesises an OID-less table — PG's RTE_SUBQUERY has no notnullattnums
+// either), a JOIN USING merged slot, or a name that disagrees with the
+// catalog column at that position declines.
+func scopeNonNullable(bindings []rangeBinding) func(Expr) bool {
+	return func(e Expr) bool {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.SourceTableIdx == 0 {
+			return false
+		}
+		for i := range bindings {
+			b := &bindings[i]
+			if b.sourceIdx != cr.SourceTableIdx {
+				continue
+			}
+			if b.table == nil || b.table.OID == 0 || b.columnOffsets != nil {
+				return false
+			}
+			local := cr.Index - b.offset
+			if local < 0 || local >= len(b.table.Columns) {
+				return false
+			}
+			col := b.table.Columns[local]
+			return col.NotNull && strings.EqualFold(col.Name, cr.Name)
+		}
+		return false
+	}
+}
+
+// fromJoinsInnerOnly reports whether a FROM list combines its items with
+// comma, INNER and CROSS joins only. Under an outer join a Var of the
+// nullable side is nulled above the join (varnullingrels), and goopg has no
+// per-Var record of that, so such a scope keeps its NullTests.
+func fromJoinsInnerOnly(from []parser.FromExpr) bool {
+	for _, fe := range from {
+		if fe.Base.GroupedJoinUnaliased {
+			return false
+		}
+		for _, j := range fe.Joins {
+			if j.Type != parser.JoinInner && j.Type != parser.JoinCross {
+				return false
+			}
+			if j.Right.GroupedJoinUnaliased {
+				return false
+			}
+		}
+	}
+	return true
 }

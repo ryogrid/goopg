@@ -1793,6 +1793,25 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// only; widening it to multi-relation scopes is a separate,
 			// corpus-visible change — ledgered, not smuggled in.
 			reduced := false
+			if len(ctx.bindings) > 1 && len(pulledQuals) == 0 && len(ctx.pulledDerived) == 0 &&
+				fromJoinsInnerOnly(s.FromExprs) {
+				// M0146-0038: the same reduction for a scope of several
+				// relations joined without outer joins — no Var of this
+				// WHERE is nulled by a join, so `expr_is_nonnullable`'s
+				// varnullingrels test passes for all of them (TPC-DS Q51's
+				// `ws_item_sk IS NOT NULL` beside `ws_sold_date_sk =
+				// d_date_sk`). Only always-true conjuncts are dropped; an
+				// always-false one keeps the predicate as written, since
+				// PG's constant-FALSE baserestrictinfo empties one
+				// relation of a join goopg would otherwise still plan.
+				if rewritten, alwaysFalse := reduceNotNullQualsWith(pred, scopeNonNullable(ctx.bindings)); !alwaysFalse {
+					if rewritten == nil {
+						reduced = true
+					} else {
+						pred = rewritten
+					}
+				}
+			}
 			if len(ctx.bindings) == 1 {
 				rewritten, alwaysFalse := reduceNotNullQuals(pred,
 					ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))

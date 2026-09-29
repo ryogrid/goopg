@@ -158,6 +158,32 @@ subquery source, or inheritance takes the untouched path.
 `docs/test-port/postgres-oracle-target-inventory.csv` — **no `make regen-testport`
 this loop.**
 
+## 5a. Inner-join scopes (M0146\-0038, 2026\-09\-30)
+
+The WHERE clause of a query level whose FROM list joins its relations with
+comma, `INNER` and `CROSS` joins only is now reduced too. No Var of such a
+WHERE is nulled by a join, so `expr_is_nonnullable`\'s `varnullingrels` test
+holds structurally for every relation in scope, exactly as the single\-baserel
+gate made it hold for one \(`add_base_clause_to_rel` runs per baserel,
+whatever else shares the level\). Witness: TPC\-DS Q51\'s CTE bodies filter
+`ws_item_sk IS NOT NULL` beside `ws_sold_date_sk = d_date_sk`; PG prints no
+Filter on the web\_sales scan.
+
+- `scopeNonNullable(bindings)` locates a bare column by its binding identity
+  \(`SourceTableIdx`\) and the binding\'s offset. It declines a binding that is
+  not a stored relation \(an OID\-less synthesised table: CTE, subquery,
+  function\), a JOIN USING merged slot, and a name mismatch at the position.
+- `fromJoinsInnerOnly(s.FromExprs)` gates the scope; an unaliased
+  parenthesised join declines. A LEFT JOIN that goopg\'s reduce\_outer\_joins
+  port has already rewritten to inner counts as inner, as in PG \(join.sql bug
+  \#18170 case: `c2.id IS NOT NULL` now drops as PG\'s expected output does\).
+- Scopes with pulled\-up FROM subqueries are skipped \(their bodies may carry
+  outer joins the gate cannot see\).
+- Only always\-true conjuncts are dropped. An always\-false conjunct in a
+  multi\-relation scope keeps the predicate as written \(PG files a
+  constant\-FALSE baserestrictinfo and plans `Result / One\-Time Filter:
+  false`\) — ledgered.
+
 ## 5b. Also landed (found while implementing, outside §4's original scope)
 
 Two defects surfaced only once the FALSE case rendered, and both were fixed rather

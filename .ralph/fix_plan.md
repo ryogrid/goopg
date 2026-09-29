@@ -23305,7 +23305,7 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q51\), TPC\-H census identical, regress runner 6 cases \(join\.sql
     row\-order flap only\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 58 -> 57, rendering 20 -> 19; SF1 join-order 64 -> 63, rendering 19 -> 18 (Q51 first divergence depth 4 -> 10)
-- [ ] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
+- [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
   web\_sales scan, PG prints none\)\. PG 17\+ reduces a NullTest on a Var
@@ -23317,6 +23317,19 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where goopg distributes base restrictions and add the
     reduction for a bare column of a table whose `catalog.Column` is NOT
     NULL \(not through an outer join\'s nullable side\)\.
+  - Landed 2026\-09\-30: M0134\-0010\'s reduction now also runs on the WHERE
+    of a multi\-relation scope joined by comma/INNER/CROSS only
+    \(`fromJoinsInnerOnly`, `scopeNonNullable` in notnull\_qual\_reduce\.go;
+    planner\.go WHERE arm\)\. Always\-true conjuncts drop; always\-false in a
+    multi\-relation scope is left as written \(ledgered\)\.
+  - Test `TestExplainNotNullQualDroppedUnderInnerJoin` \(fails on base;
+    LEFT JOIN `IS NULL` case keeps its Filter as PG 18\.3 does\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q51 executes\), TPC\-H census plans byte\-identical, regress runner 9
+    cases \(join\.sql only: known row\-order/Materialize flaps plus the bug
+    \#18170 case now dropping `id IS NOT NULL` as PG\'s expected output does\)\.
+  - Evidence `analysis/m0146/m0146\-0038/`\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 match 25 -> 26, qual-placement 14 -> 13; SF1 match 21 -> 22, qual-placement 11 -> 10 (Q51 now matches PG at both scales)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
