@@ -23412,6 +23412,29 @@ M0146-0001 re-baseline census on the new default arm.
     \(6 queries both scales\), TPC\-H census byte\-identical, regress runner
     7 cases \(union 382 \-> 376; join\.sql j3 inner = PG Unique\)\.
   Movement: none — TPC-DS categories unchanged (Unique costs now PG's); regress union.sql 382 -> 376 diff lines
+- [x] **M0146\-0005bj — Aggregate and SetOp nodes carry their path\'s cost**
+  \(slice 62, impl, done 2026\-09\-30 from the slice 58/59 ledger rows\)\.
+  Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 62"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `Aggregate`/`SetOp` embed PlanCost \(stamped by createPlanNode\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(plan shapes 99 same\),
+    TPC\-H arm 24/24, fire set \(every query executed, both scales\), TPC\-H
+    shapes identical, regress runner 7 cases \(join\.sql flap only\)\.
+  - Q8 loses its match at both scales \(razor\-edge election, filed
+    M0146\-0005bk\)\.
+  Movement: yes — printed Aggregate/SetOp costs now the paths' (Q87 SetOp Except 42288.96..43153.81 vs PG 42449.87..43284.81); PLAN-PARITY SF0.25 match 27 -> 26, SF1 24 -> 23 (Q8)
+- [ ] **M0146\-0005bk — TPC\-DS Q8: store ⋈ INTERSECT election** \(filed
+  2026\-09\-30 by M0146\-0005bj\)\. With the INTERSECT leaf priced at its
+  path cost \(PG\'s 9268\), goopg elects `Hash Join \(Gather\(... ⋈ store\),
+  HashSetOp\)` at 28307 over PG\'s `Nested Loop \(Gather,
+  Materialize\(store ⋈ Materialize\(HashSetOp\)\)\)` \(~28480 in goopg\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: price PG\'s shape node by node in goopg against PG 18\.3\'s
+    EXPLAIN \(NL 12337\.51\.\.28512\.75\) and find the term that makes the
+    hash alternative cheaper here\.
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

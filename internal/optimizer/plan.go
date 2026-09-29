@@ -1436,6 +1436,9 @@ func (a AggregateCall) Pos() int { return a.pos }
 // by the GROUP BY key (e.g. non-key cols when GROUP BY covers a primary key).
 // The executor evaluates them from the first row of each group. M0097-0003.
 type Aggregate struct {
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
+	PlanCost
 	pos         int
 	Child       Node
 	GroupExprs  []Expr
@@ -3001,6 +3004,9 @@ func (n *Copy) Output() Schema { return n.schema }
 // all other variants buffer and apply multiset semantics in the executor
 // (operators_setop.go). M0097-0024.
 type SetOp struct {
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
+	PlanCost
 	// setOpBranchTag: M0144-0003b-1 — set when this node is what
 	// `createSetOpPaths` returned for a set operation, so the next link of a
 	// left-deep UNION ALL chain can reach that link's SETOP rel

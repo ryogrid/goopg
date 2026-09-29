@@ -311,3 +311,38 @@ Q38/Q87's catalog\_sales and web\_sales branches. Under PG's Unique formula,
 the split arm costs the per-worker comparisons more than the unsplit one,
 and PG adds the unsplit arm first. So PG's choice points at an input-path
 difference, not at pricing.
+
+## Slice 62: M0146-0005bj — Aggregate and SetOp nodes carry their path's cost
+
+Slices 58/59 ledgered it: `Aggregate` and `SetOp` embedded no `PlanCost`,
+so every reader priced them with `DeriveLegacyDisplayCost`. That is a
+monotone display estimate: max child startup, sum of child totals. The
+readers are EXPLAIN and every planner site that prices an input node from
+its cost (`legacyDisplayCostOf`): subquery leaves in the join search,
+upper-rel seeds, and set-operation arms. A path-chosen partial
+HashAggregate printed 2845.67 where its path cost 1949.84. Q66's Parallel
+Append printed 11759..18259 (the sum) where its path cost 7496..12758.
+
+- `Aggregate` and `SetOp` embed `PlanCost`; the `createPlanNode` funnel
+  stamps the chosen path's cost and rows on them. Nodes the legacy
+  rewriter builds stay unstamped and keep the legacy derivation.
+
+Movement: printed costs now follow the paths. Q87's `SetOp Except`
+prints 42288.96..43153.81 (PG 42449.87..43284.81), and Q8's `HashSetOp
+Intersect` prints 9265.66..9266.16 (PG 9268.15..9268.65; legacy
+7029..9502).
+
+The sharper costs cost one match at each scale: TPC-DS PLAN-PARITY SF0.25
+27 → 26 and SF1 24 → 23, both Q8. Q8's `store ⋈ INTERSECT` leaf is priced
+from the INTERSECT node. With its correct startup the join search now
+builds `Hash Join (Gather(... ⋈ store), HashSetOp)` at 28307 over PG's
+`Nested Loop (Gather, Materialize(store ⋈ Materialize(HashSetOp)))`,
+which goopg prices about 28480. The two shapes are within about 0.6% in
+goopg's model. The legacy estimate's lower startup had tipped the
+election PG's way by accident. Filed as M0146-0005bk.
+
+All TPC-DS queries execute at both scales (the fire set fired on every
+query, since every cost text moved), and the sweep's plan-shape channel
+is unchanged. TPC-H shapes are identical. The regress runner (7 cases)
+shows only the known join.sql row-order flap. Evidence:
+`analysis/m0146/m0146-0005/slice62/`.
