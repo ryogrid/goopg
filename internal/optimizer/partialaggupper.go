@@ -187,6 +187,16 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 	// same rows) and a `*Filter` (predicate unchanged, same reason).
 	// Anything else declines, which costs an optimisation and never
 	// correctness.
+	//
+	// M0146-0005ar: a peeled wrapper ends up BELOW the split's new Gather, i.e.
+	// inside the workers, so it is peeled only when its expressions are
+	// parallel-safe (wrapperRunsInWorkers). TPC-DS Q10's `ANY (hashed SubPlan)
+	// OR ANY (hashed SubPlan)` residual — each SubPlan a Gather of its own —
+	// was peeled into the workers this way, nesting parallel plans inside
+	// them; PG keeps a parallel-restricted qual above every Gather.
+	if !wrapperRunsInWorkers(n) {
+		return nil, false
+	}
 	switch w := n.(type) {
 	case *Project:
 		inner, ok := gatherToUnwrapForPartialAgg(w.Child)
@@ -208,6 +218,27 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 	return nil, false
 }
 
+// wrapperRunsInWorkers reports whether a pass-through wrapper may move below
+// a Gather — the splices above rebuild it over the Gather's child, so after
+// the split it executes inside every worker. A *Filter's predicate and a
+// *Project's targets must pass gatherPushableConjunct (parallel-safe, builtin
+// functions only), the rule the qual-pushdown passes apply at a Gather
+// (M0146-0005aq). Every other node kind answers true: the splices' own arms
+// decide whether they descend it at all.
+func wrapperRunsInWorkers(n Node) bool {
+	switch w := n.(type) {
+	case *Filter:
+		return gatherPushableConjunct(w.Predicate)
+	case *Project:
+		for _, t := range w.Targets {
+			if !gatherPushableConjunct(t) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // spliceGatherOnPartialSpine removes ONE Gather / Gather Merge the JOIN
 // SEARCH placed inside the input subtree, found along `drivingScan`'s own
 // descent path — pass-through wrappers and the probe side of partial-capable
@@ -227,6 +258,11 @@ func gatherToUnwrapForPartialAgg(n Node) (Node, bool) {
 // driving-scan arm declines too, so the splice can never descend a walk the
 // stamping siblings would not follow.
 func spliceGatherOnPartialSpine(n Node) (Node, bool) {
+	// M0146-0005ar: the wrappers above the spliced Gather run in the workers
+	// afterwards — the same rule as gatherToUnwrapForPartialAgg.
+	if !wrapperRunsInWorkers(n) {
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *Gather:
 		if x.Child == nil {

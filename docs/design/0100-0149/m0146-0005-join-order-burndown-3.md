@@ -278,3 +278,32 @@ passes: it is attached to the nested loop by another placement, which is
 filed as M0146-0037. Ledgered: a user routine that is actually `PARALLEL
 SAFE` stays above a Gather here, where PG would push it (the catalog is not
 threaded into the pushdown passes).
+
+## Slice 44: M0146-0005ar — the partial-aggregate splices keep worker-unsafe wrappers above the Gather
+
+M0146-0037 (TPC-DS Q10) was traced to its route with temporary
+instrumentation. The search leaves Q10's residual
+`ANY (c_customer_sk = (hashed SubPlan 1).col1) OR ANY (… SubPlan 2 …)` (each
+SubPlan a `Gather -> Parallel Hash Join`) correctly above its Gather:
+`Filter -> Project -> Gather -> joins`. The grouping stage's split producer
+then unwraps the Gather: `gatherToUnwrapForPartialAgg` splices it out from
+under the pass-through wrappers (`Filter(Project(Gather(X)))` becomes
+`Filter(Project(X))`), and the winning "gathered" arm puts a new Gather on
+top. The Filter, and the SubPlans' own Gathers with it, moved into the
+workers. `spliceGatherOnPartialSpine` (the M0146-0025 route) does the same.
+
+`wrapperRunsInWorkers` now gates both splices. A `*Filter` predicate or
+`*Project` target is peeled below the new Gather only if it passes
+`gatherPushableConjunct`, the rule slice 43 gave the qual-pushdown passes.
+When a wrapper fails, the split declines for that input, and the aggregate
+stays above the committed `Filter -> Gather`, whose Filter prints as the
+Gather's own `Filter:` (evaluated in the leader). Test:
+`TestGatherSplicesKeepWorkerUnsafeWrappersAbove`.
+
+Movement: TPC-DS Q10 and Q35 (the OR-of-EXISTS queries) change at both
+scales. Their parity counts do not move, because other divergences come
+first. TPC-H Q17's correlated `l_quantity < (SubPlan 1)` filter now stays
+above the Gather, where PG evaluates it (on its serial Hash Join). TPC-H
+`parameterisation` 3 → 2, `aggregation-strategy` 2 → 1, `sort-strategy` 2 →
+1, `parallelism` 5 → 4; the TPC-H match count is unchanged (10). Evidence:
+`analysis/m0146/m0146-0005/slice44/`.

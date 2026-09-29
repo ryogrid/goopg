@@ -1684,3 +1684,36 @@ func TestGatheredArmFollowsTheSerialOrderedAggRules(t *testing.T) {
 		t.Error("no sorted gathered candidate ordered by the group key plus the DISTINCT argument")
 	}
 }
+
+// TestGatherSplicesKeepWorkerUnsafeWrappersAbove pins M0146-0005ar: the
+// partial-aggregate splices rebuild the wrappers above a Gather over its
+// child, which moves them into the workers once the split adds its own
+// Gather. A Filter whose predicate is not parallel-safe (TPC-DS Q10's
+// SubPlans; here nextval) must stop both splices; a safe one is still peeled.
+func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
+	build := func(pred Expr) Node {
+		scan := srcScan("a", srcCol("x", 1))
+		return &Filter{Child: NewGather(0, scan, 2), Predicate: pred}
+	}
+	eqWith := func(right Expr) Expr {
+		c := srcEq(0, "x", 1, 0).(*BinaryOp)
+		c.Right = right
+		return c
+	}
+	unsafe := eqWith(&FuncCall{Name: "nextval", Args: []Expr{&StringConst{Value: "s"}}})
+	if _, ok := gatherToUnwrapForPartialAgg(build(unsafe)); ok {
+		t.Error("gatherToUnwrapForPartialAgg must not peel a parallel-unsafe Filter into the workers")
+	}
+	if _, ok := spliceGatherOnPartialSpine(build(unsafe)); ok {
+		t.Error("spliceGatherOnPartialSpine must not peel a parallel-unsafe Filter into the workers")
+	}
+	safe := srcEq(0, "x", 1, 7)
+	if got, ok := gatherToUnwrapForPartialAgg(build(safe)); !ok {
+		t.Error("a parallel-safe Filter is still peeled")
+	} else if f, isF := got.(*Filter); !isF || subtreeHasGather(f) {
+		t.Errorf("the peeled Filter must sit directly on the Gather's child, got %T", got)
+	}
+	if _, ok := spliceGatherOnPartialSpine(build(safe)); !ok {
+		t.Error("the partial-spine splice still peels a parallel-safe Filter")
+	}
+}

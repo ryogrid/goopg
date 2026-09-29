@@ -23090,6 +23090,20 @@ M0146-0001 re-baseline census on the new default arm.
     \(no fires\), TPC\-H plans identical, regress runner 13 cases \(known
     join\.sql row flap only\)\.
   Movement: none — hazard fix; no TPC-DS or TPC-H plan changes
+- [x] **M0146\-0005ar — the partial\-aggregate splices keep worker\-unsafe
+  wrappers above the Gather** \(slice 44, impl, done 2026\-09\-29; resolves
+  M0146\-0037\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 44"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `gatherToUnwrapForPartialAgg` / `spliceGatherOnPartialSpine` rebuilt a
+    Filter/Project over the Gather\'s child, moving it into the workers;
+    `wrapperRunsInWorkers` gates both with `gatherPushableConjunct`\.
+  - Test `TestGatherSplicesKeepWorkerUnsafeWrappersAbove`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q10 Q35 at both scales, none introduced\), regress runner 13 cases
+    \(limit\.sql = known M0146\-0034 only\)\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH parameterisation 3 -> 2, aggregation-strategy 2 -> 1, sort-strategy 2 -> 1, parallelism 5 -> 4 (Q17); TPC-DS Q10/Q35 plans change, counts unchanged
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -24172,7 +24186,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: EXPLAIN ANALYZE both plans on a private SF1 clone and
     attribute the difference by node \(partial aggregation transport vs the
     join inputs\)\.
-- [ ] **M0146\-0037 — TPC\-DS Q10 evaluates Gather\-bodied SubPlans inside
+- [x] **M0146\-0037 — TPC\-DS Q10 evaluates Gather\-bodied SubPlans inside
   workers** \(filed 2026\-09\-29 by M0146\-0005aq\)\. goopg attaches Q10\'s
   `ANY \(hashed SubPlan 1\) OR ANY \(hashed SubPlan 2\)` qual \(each SubPlan
   a `Gather \-> Parallel Hash Join`\) to the nested loop beneath the
@@ -24187,6 +24201,12 @@ M0146-0001 re-baseline census on the new default arm.
     rewritten OR\) is attached to the top join, and apply the same
     parallel\-safety rule there \(or register it as a restriction the
     consider\-parallel check sees\)\.
+  - **DONE 2026\-09\-29 as M0146\-0005ar \(slice 44\).** The search leaves the
+    residual above its Gather; the split producer\'s
+    `gatherToUnwrapForPartialAgg` splice peeled the Filter below the new
+    Gather\. Both splices now peel only worker\-safe wrappers
+    \(`wrapperRunsInWorkers`\)\.
+  Movement: yes — TPC-H CATEGORIES-EXCL-MATCH parameterisation 3 -> 2, aggregation-strategy 2 -> 1, sort-strategy 2 -> 1, parallelism 5 -> 4 (Q17); TPC-DS Q10/Q35 plans change, counts unchanged
 - [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above
