@@ -96,3 +96,41 @@ Ledgered:
 - EXPLAIN prints a merge path's residual equality inside `Merge Cond`
   rather than `Join Filter`.
 - `groupedLeafDistinctFor` does not check PG's `hasTargetSRFs` guard.
+
+## Slice 57: M0146-0005be — a merge join keys on its path's mergeclauses
+
+PG's merge path merges on the clauses its inputs' ordering serves
+(`find_mergeclauses_for_outer_pathkeys`, then the truncation search). Every
+other equality between the two sides stays in `joinqual` and prints as
+`Join Filter:`. TPC-DS Q47/Q57 show this:
+
+```
+Merge Cond: ((v1_lag.i_category = v1.i_category) AND … )   -- 4 EC keys
+Join Filter: (v1.rn = (v1_lag.rn + 1))
+```
+
+goopg's path carried the same four clauses, with the `rn` equality as
+residual. The late `fillJoinHashKeys` pass then re-derived the key list
+from the predicate and published every equality as a merge key. EXPLAIN
+printed six `Merge Cond` pairs, and the executor sorted on all of them.
+
+- `Join.MergeKeyCount` records the path's mergeclauses count in
+  `createMergeJoinPlan`. The predicate lists those pairs first.
+- `fillOneJoinHashKeys` keeps that prefix for a merge join. The later
+  equalities fall to `ExecMergeKeyPlan`'s residual, which is the executor's
+  per-pair check and EXPLAIN's `Join Filter`.
+
+The executor still sorts both inputs itself on the (now shorter) key list.
+Rows are unchanged: the dropped equalities are evaluated per pair instead.
+
+Test: `TestExplainMergeJoinResidualEqualityIsJoinFilter` pins PG 18.3's
+`Merge Cond: (y.a = x.a)` / `Join Filter: (x.rn = (y.rn + 1))`. It fails
+on base, which printed both pairs as Merge Cond. On that query the whole
+plan now reads as PG's: join order, Materialize inner, and the run cost
+within 2%.
+
+Movement: qual-placement −2 at both TPC-DS scales (SF0.25 14 → 12,
+SF1 11 → 9); only Q47 and Q57 move, and both execute. TPC-H plans are
+byte-identical. The regress runner (8 cases) shows only the known join.sql
+row-order flap. Evidence: `analysis/m0146/m0146-0005/slice57/`. This
+resolves slice 56's ledgered "residual equality inside Merge Cond" row.

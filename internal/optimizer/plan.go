@@ -1243,6 +1243,13 @@ type Join struct {
 	// means "no list available" and every consumer must fall back to the
 	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
 	HashKeys  []JoinKeyPair
+	// MergeKeyCount is the length of the merge path's mergeclauses list
+	// (M0146-0005be), 0 when unknown. A merge path uses only the clauses its
+	// inputs' ordering serves (find_mergeclauses_for_outer_pathkeys, and the
+	// truncation search), leaving the other equalities in joinqual; the
+	// predicate lists the merge pairs first, so fillJoinHashKeys keeps this
+	// prefix and the rest stay residual — `Join Filter:` as in PG.
+	MergeKeyCount int
 	BuildLeft bool // hash join: build on left input instead of right
 	// ParallelHash marks PG's `parallel_hash = true` hash join
 	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a

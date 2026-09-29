@@ -23329,6 +23329,22 @@ M0146-0001 re-baseline census on the new default arm.
     runner 10 cases \(merge plans move among PG\-unmatched shapes only\)\.
   - Evidence `analysis/m0146/m0146\-0005/slice56/`\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 57 -> 56, join-method 34 -> 31, scan-type 39 -> 37, aggregation-strategy 24 -> 22; SF1 join-order 63 -> 62, join-method 32 -> 30, scan-type 44 -> 42 (match unchanged 26 / 22; Q47/Q57 take PG's join order)
+- [x] **M0146\-0005be — a merge join keys on its path\'s mergeclauses**
+  \(slice 57, impl, done 2026\-09\-30 from slice 56\'s ledgered Merge Cond
+  rendering\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 57"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `Join.MergeKeyCount` set by `createMergeJoinPlan`;
+    `fillOneJoinHashKeys` keeps that prefix for merge joins, the other
+    equalities stay residual \(`Join Filter:`\)\.
+  - Test `TestExplainMergeJoinResidualEqualityIsJoinFilter` \(fails on
+    base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q47, Q57 at both scales\), TPC\-H census byte\-identical, regress
+    runner 8 cases \(join\.sql row\-order flap only\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 qual-placement 14 -> 12; SF1 qual-placement 11 -> 9 (Q47, Q57)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

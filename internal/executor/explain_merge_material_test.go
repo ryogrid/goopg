@@ -48,3 +48,29 @@ func TestExplainMergeJoinMaterializesCTEInner(t *testing.T) {
 	}
 }
 
+
+// TestExplainMergeJoinResidualEqualityIsJoinFilter pins M0146-0005be against
+// PG 18.3: a merge path keys on the clauses its inputs' ordering serves
+// (find_mergeclauses_for_outer_pathkeys); another equality between the two
+// sides stays in joinqual and prints as `Join Filter:`. goopg's late key
+// pass used to publish every equality as a merge key. PG 18.3 on this query
+// (TPC-DS Q47's rn = rn + 1 shape) prints
+//
+//	Merge Join
+//	  Merge Cond: (y.a = x.a)
+//	  Join Filter: (x.rn = (y.rn + 1))
+func TestExplainMergeJoinResidualEqualityIsJoinFilter(t *testing.T) {
+	lines := cteExplainLines(t,
+		`WITH v AS (SELECT a, b, sum(a) AS s, rank() OVER (PARTITION BY a ORDER BY b) AS rn FROM t GROUP BY a, b)
+		 SELECT * FROM v x, v y WHERE x.a = y.a AND x.rn = y.rn + 1 AND x.s > 5`)
+	joined := strings.Join(lines, "\n")
+	if countLinesContaining(lines, "Merge Join") != 1 {
+		t.Skipf("not a merge join here; nothing to pin:\n%s", joined)
+	}
+	if countLinesContaining(lines, "Merge Cond: (y.a = x.a)") != 1 {
+		t.Errorf("want the merge keyed on a alone:\n%s", joined)
+	}
+	if countLinesContaining(lines, "Join Filter: (x.rn = (y.rn + 1))") != 1 {
+		t.Errorf("want the rn equality as the Join Filter:\n%s", joined)
+	}
+}

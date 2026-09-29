@@ -746,6 +746,8 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		RightKey:  pairs[0].Right,
 		HashKeys:  pairs,
 		schema:    in.publishedSchema(jt),
+		// The path's mergeclauses — its other equalities are joinqual.
+		MergeKeyCount: len(pairs),
 	}
 	assertPartialMergeJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
