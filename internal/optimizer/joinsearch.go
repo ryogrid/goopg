@@ -424,7 +424,11 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		if isSubplanLeaf(leaf) {
+		if c, ok := costKeptCTEScanLeaf(cp, ri, leaf); ok {
+			// M0146-0005az: a reference to a CTE that stays a CTE is
+			// cost_ctescan, not a sub-plan: its body is an initPlan.
+			p.Cost = c
+		} else if isSubplanLeaf(leaf) {
 			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
 			// relation and must not be priced as a scan of one — see
 			// costSubplanLeaf.
@@ -594,6 +598,32 @@ func isSubplanLeaf(leaf Node) bool {
 	default:
 		return true
 	}
+}
+
+// costKeptCTEScanLeaf is cost_ctescan (costsize.c) for a leaf over a CTE
+// reference that stays a CTE (not inlined): the referenced query is an
+// initPlan charged to the plan root, so the scan pays only for reading the
+// tuplestore — cpu_tuple_cost per stored tuple for the tuplestore plus
+// cpu_tuple_cost and the restriction quals per tuple scanned. The row count is
+// the CTE's whole output, the tuples the scan reads, not the rows its filter
+// keeps: TPC-DS Q47's filtered `v1` reads 3850 rows (PG 144.38), where the
+// sub-plan shape charged its 2 surviving rows. The qual term counts
+// conjuncts, the currency baseSeqScanCostInputs uses.
+func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) {
+	cs, ok := leafBaseScan(leaf).(*CTEScan)
+	if !ok || cs.Inlined() {
+		return Cost{}, false
+	}
+	tuples := float64(EstimateRows(cs))
+	if tuples < 0 {
+		tuples = 0
+	}
+	quals := 0
+	if ri.localFilter != nil {
+		quals = len(splitConjuncts(ri.localFilter, nil))
+	}
+	perTuple := 2*cp.cpuTupleCost + cp.cpuOperatorCost*float64(quals)
+	return Cost{Startup: 0, Total: perTuple * tuples}, true
 }
 
 // costSubplanLeaf is `cost_subqueryscan`'s shape for a sub-plan leaf entering

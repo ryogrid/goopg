@@ -23237,6 +23237,26 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q47 Q51 Q53 Q57 Q63, none introduced\), TPC\-H census identical,
     regress runner 8 cases \(window\.sql loses 3 Sorts PG never had\)\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 23 -> 24 (Q53); CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 43 -> 39, parallelism 41 -> 36, join-method 37 -> 33, join-order 61 -> 59, qual-placement 12 -> 13; SF1 sort-strategy 46 -> 42, parallelism 51 -> 48, join-method 38 -> 36, join-order 62 -> 64, qual-placement 13 -> 12
+- [x] **M0146\-0005az — a kept CTE reference is priced by cost\_ctescan**
+  \(slice 52, impl, done 2026\-09\-29 from the Q47 cost comparison: CTE
+  Scan 38\.23 vs PG 77\.00, filtered 38\.27 vs PG 144\.38\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 52"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `costKeptCTEScanLeaf` \(search\) and a `CTEScan` arm in
+    `DeriveLegacyDisplayCost` \(EXPLAIN\): stored tuples ×
+    \(2·cpu\_tuple\_cost \+ conjuncts·cpu\_operator\_cost\)\.
+  - Test `TestExplainKeptCTEScanCostsTwoTuplesPerRow` \(fails on base\)\.
+  - Mixed join\-order effect \(SF0\.25 Q4 away from PG, SF1 Q4/Q11 toward\);
+    qual\-cost currency \(conjuncts vs operators\) ledgered\.
+  - Gate notes: SF1 Q74 timed out once on an unchanged plan \(M0146\-0036
+    flake\), PASS on resume; `TestSharedSpillingBuildLoadsOncePerBatch`
+    failed once under the full units gate, 5/5 in isolation, re\-run PASS\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(18 fires, PASS after the Q74 re\-run\), TPC\-H census identical,
+    regress runner 6 cases \(0 delta\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 36 -> 34, qual-placement 14 -> 11; SF0.25 join-method 33 -> 35, qual-placement 15 -> 14; match unchanged (24 SF0.25, 21 SF1)
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

@@ -631,3 +631,41 @@ identical to before. Q51's ordered output is still md5-identical to PG's.
 In the regress runner, window.sql's three `COUNT(*) OVER (ORDER BY
 t1.unique1)` nested-loop plans drop a Sort PG never had. TPC-H is
 identical. Evidence: `analysis/m0146/m0146-0005/slice51/`.
+
+## Slice 52: M0146-0005az — a kept CTE reference is priced by cost_ctescan
+
+PG prices a scan of a CTE that stays a CTE with `cost_ctescan`. It charges
+`cpu_tuple_cost` per stored tuple for the tuplestore, plus `cpu_tuple_cost`
+and the restriction quals per tuple scanned. The referenced query is an
+initPlan charged to the plan root, never to the scan. goopg priced the leaf
+in two ways:
+
+- The join search used the sub-plan shape (`costSubplanLeaf`). Unfiltered,
+  that happened to equal `2*cpu_tuple_cost*rows`. A filtered leaf, though,
+  charged its surviving rows (TPC-DS Q47's filtered `v1`: 38.27, where PG
+  charges 144.38 for 3850 rows).
+- EXPLAIN printed `cpu_tuple_cost*rows` (38.23, where PG prints 77.00).
+
+- `costKeptCTEScanLeaf` (joinsearch.go) prices every non-inlined CTE leaf
+  as the CTE's output rows × (`2*cpu_tuple_cost` + the local filter's
+  conjunct count × `cpu_operator_cost`). The conjunct count is the
+  currency `baseSeqScanCostInputs` uses.
+- `DeriveLegacyDisplayCost` gains the matching `CTEScan` arm, so an
+  unfiltered kept reference prints PG's figure.
+
+Test: `TestExplainKeptCTEScanCostsTwoTuplesPerRow` fails on base (2.00
+against the required 4.00).
+
+Movement: no match or first-divergence change. Q47's CTE scans now print
+76.46 for 3823 rows (PG 77.00 for 3850), and its filtered `v1` prints
+105.13 (PG 144.38; PG counts every operator inside the CASE qual). The
+join-order effect is mixed and recorded as measured. Q4/Q11's CTE-scan
+join order moved toward PG at SF1 but away from it at SF0.25, where the
+baseline had shared PG's Merge Join base. All-depth categories: SF0.25
+join-method 33 → 35 and qual-placement 15 → 14; SF1 join-method 36 → 34
+and qual-placement 14 → 11. TPC-H is identical, and the regress runner
+shows no delta. Evidence: `analysis/m0146/m0146-0005/slice52/`.
+
+Ledgered: the qual term counts conjuncts where `cost_qual_eval` counts
+operators and function calls. That understates CASE-heavy CTE filters and
+is what still separates Q4 at SF0.25.

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -127,4 +128,33 @@ func TestExplainSimpleCTEReferencePullsUp(t *testing.T) {
 	if got := countLinesContaining(twice, "CTE v"); got != 1 {
 		t.Errorf("a CTE referenced twice stays one CTE:\n%s", strings.Join(twice, "\n"))
 	}
+}
+
+var explainRowsRE = regexp.MustCompile(` rows=([0-9]+) `)
+
+// TestExplainKeptCTEScanCostsTwoTuplesPerRow pins M0146-0005az: a reference to
+// a CTE that stays a CTE is cost_ctescan — cpu_tuple_cost for the tuplestore
+// and again for the scan, per stored tuple, with the referenced query charged
+// as an initPlan rather than to the scan (TPC-DS Q47's `CTE Scan on v1
+// v1_lag`: 77.00 for 3850 rows in PG 18.3).
+func TestExplainKeptCTEScanCostsTwoTuplesPerRow(t *testing.T) {
+	lines := cteExplainLines(t,
+		`WITH v AS (SELECT a, count(*) AS c FROM t GROUP BY a)
+		 SELECT * FROM v x, v y WHERE x.a = y.a`)
+	for _, l := range lines {
+		if !strings.Contains(l, "CTE Scan on v x") {
+			continue
+		}
+		m := explainRowsRE.FindStringSubmatch(l)
+		if m == nil {
+			t.Fatalf("no rows on %q", l)
+		}
+		rows, _ := strconv.ParseFloat(m[1], 64)
+		total := explainTotalCost(t, []string{l}, "CTE Scan on v x")
+		if want := 0.02 * rows; math.Abs(total-want) > 0.011 {
+			t.Fatalf("CTE Scan total %.2f, want cost_ctescan's 2*cpu_tuple_cost*rows = %.2f:\n%s", total, want, strings.Join(lines, "\n"))
+		}
+		return
+	}
+	t.Fatalf("no `CTE Scan on v x` line:\n%s", strings.Join(lines, "\n"))
 }

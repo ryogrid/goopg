@@ -144,6 +144,18 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 
 	perRow := cp.cpuTupleCost * float64(rows)
 	switch x := n.(type) {
+	case *CTEScan:
+		if !x.Inlined() {
+			// cost_ctescan (M0146-0005az): cpu_tuple_cost per tuple for the
+			// tuplestore and again for the scan; the referenced query is an
+			// initPlan and stays out. (An inlined reference takes the
+			// default arm over its body — legacyDisplayChildren.)
+			out.StartupCost = 0
+			out.TotalCost = 2 * perRow
+			return out
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
 	case *Sort:
 		// PG's cost_sort charges a comparison term and is BLOCKING: nothing
 		// emerges until the input is consumed, so startup is the child's
