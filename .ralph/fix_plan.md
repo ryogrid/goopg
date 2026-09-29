@@ -23185,6 +23185,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q5 Q39 Q47 Q54 Q57 Q80, none introduced\), TPC\-H census identical,
     regress runner 11 cases \(no semantic delta\)\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 20 -> 21 (Q80); CATEGORIES-EXCL-MATCH SF0.25 scan-type 43 -> 42, rendering 22 -> 20, join-order 63 -> 62; SF1 scan-type 49 -> 46, join-method 40 -> 38, rendering 19 -> 18
+- [x] **M0146\-0005aw — a set\-operation arm\'s groups are estimated over
+  its target expressions** \(slice 49, impl, done 2026\-09\-29 from the
+  census record `PG Subquery Scan on a1 \| goopg Seq Scan on
+  customer\_address` under Q8\'s HashSetOp\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 49"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `setOpArmGroups` estimates over a top Project\'s targets
+    \(`build\_setop\_child\_paths` → `estimate\_num\_groups` over the tlist
+    exprs\); Q8\'s left arm reads 3203 groups as in PG, not the 200 default,
+    so the INTERSECT swaps\.
+  - Test: `TestSwapIntersectInputs` computed\-arm case \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q8, none introduced\), TPC\-H census identical, regress runner 6
+    cases \(no semantic delta\)\.
+  Movement: yes — TPC-DS PLAN-PARITY match SF0.25 21 -> 22, SF1 19 -> 20 (Q8); CATEGORIES-EXCL-MATCH SF0.25 scan-type 42 -> 41, aggregation-strategy 24 -> 23; SF1 scan-type 46 -> 45, aggregation-strategy 26 -> 25
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

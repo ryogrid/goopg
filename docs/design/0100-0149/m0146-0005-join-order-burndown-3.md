@@ -520,3 +520,30 @@ Ledgered:
 - Q5 has 3 wrappers against PG's 4, and Q77 has 0 against 1.
 - Q23, Q47 and Q57 keep one wrapper PG strips.
 - Sublink-held plans are not visited by the wrap pass.
+
+## Slice 49: M0146-0005aw — a set-operation arm's groups are estimated over its target expressions
+
+TPC-DS Q8's INTERSECT printed its inputs in written order, where PG puts
+`Subquery Scan on a1` first. PG's `generate_nonunion_paths` swaps INTERSECT
+inputs when the left arm has more groups than the right. Each arm's count
+comes from `build_setop_child_paths`, which runs `estimate_num_groups` over
+the arm's target-list expressions (`get_tlist_exprs`). The left arm's
+`substr(ca_zip, 1, 5)` therefore reduces to `ca_zip` and its statistics:
+3203 groups against the grouped `a1` arm's 200, so PG swaps. goopg's
+`setOpArmGroups` estimated over references to the arm's output columns.
+A computed column is opaque to `examineGroupVar`, so it fell to the
+200-group default, the two arms tied at 200, and no swap happened.
+
+- `setOpArmGroups` now estimates over a top Project's target expressions,
+  against the Project's child. This is the tlist PG uses, so an
+  expression's variables and their statistics are reached. Arms that
+  group, and non-Project tops, keep the existing rules.
+- The same count sizes INTERSECT and EXCEPT output (`estimateSetOp`), as
+  PG's `dNumGroups` does.
+
+Test: a case in `TestSwapIntersectInputs` (a computed arm over a
+1000-distinct column beats a 400-row arm). It fails on the base tree.
+
+Movement: TPC-DS PLAN-PARITY match SF0.25 21 → 22 and SF1 19 → 20 (Q8 =
+PG at both scales). scan-type and aggregation-strategy each fall by 1.
+TPC-H is identical. Evidence: `analysis/m0146/m0146-0005/slice49/`.

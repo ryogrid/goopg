@@ -2338,6 +2338,20 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 	case *Aggregate, *Distinct, *DistinctOn, *SetOp:
 		return rows
 	}
+	// build_setop_child_paths estimates over the arm's target-list
+	// EXPRESSIONS (get_tlist_exprs), so a computed column such as TPC-DS
+	// Q8's `substr(ca_zip, 1, 5)` reduces to its variable `ca_zip` and its
+	// statistics (estimate_num_groups step 2). A reference to the Project's
+	// output column is opaque to examineGroupVar and fell to the 200
+	// default, which kept Q8's INTERSECT from putting the 200-group arm on
+	// the hashed side as PG does (3203 vs 200 groups).
+	if pr, ok := top.(*Project); ok && pr.Child != nil && len(pr.Targets) > 0 {
+		g := estimateNumGroups(pr.Targets, pr.Child, rows)
+		if g < 1 {
+			return 1
+		}
+		return g
+	}
 	out := arm.Output()
 	if len(out) == 0 {
 		return rows

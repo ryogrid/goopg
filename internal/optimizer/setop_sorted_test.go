@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"github.com/goopg/goopg/internal/catalog"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -126,5 +127,18 @@ func TestSwapIntersectInputs(t *testing.T) {
 	ex := &SetOp{Left: big, Right: small, Op: parser.SetOpExcept}
 	if swapIntersectInputs(ex) != ex {
 		t.Fatal("EXCEPT must never swap")
+	}
+
+	// M0146-0005aw: an arm computing its column — TPC-DS Q8's
+	// `substr(ca_zip, 1, 5)` — is estimated over the expression's variable
+	// (build_setop_child_paths → estimate_num_groups over the tlist exprs),
+	// 1000 groups here, not the 200 default an opaque output column gets.
+	computed := &Project{
+		Child:   &SeqScan{Table: statsTable("big", 1000, 1000)},
+		Targets: []Expr{&FuncCall{Name: "substr", Args: []Expr{jrCol(0), &IntegerConst{Value: 1}, &IntegerConst{Value: 5}}}},
+		schema:  Schema{SchemaColumn{Name: "z", Type: catalog.Type{Name: "text"}}},
+	}
+	if sw := swapIntersectInputs(&SetOp{Left: computed, Right: small, Op: parser.SetOpIntersect}); sw.Left != Node(small) {
+		t.Fatal("a computed arm must be estimated over its expression's variable (1000 > 400) and swap")
 	}
 }
