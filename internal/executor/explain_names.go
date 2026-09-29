@@ -656,13 +656,40 @@ func explainIsScanNode(n optimizer.Node) bool {
 // existing rendering, and "" whenever a step is not a plain column reference
 // (PG would deparse the expression; goopg keeps the bare name).
 func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
+	return nm.resolvedColumn(n, idx, true)
+}
+
+// joinResidualColumn is resolve_special_varno for a column of a join's
+// residual (M0146-0005as). The residual indexes the join's concatenated input
+// row, and PG deparses such a Var by following it into the child plan that
+// produced it, down to the scan — so a column a grouped subquery republishes
+// under an alias prints as its source (TPC-DS Q46/Q68's `bought_city` →
+// `customer_address.ca_city`), and a column whose binding id no longer names
+// a relation still prints qualified (`current_addr.ca_city`). "" when the
+// walk does not reach a named scan through plain column references.
+func (nm *explainNames) joinResidualColumn(join optimizer.Node, idx int) string {
+	return nm.resolvedColumn(join, idx, false)
+}
+
+// resolvedColumn walks output column idx of n down to a named scan and returns
+// "<relation>.<column>". With requireSetOp it answers only for walks that
+// crossed a set operation (setOpResolvedColumn's contract).
+func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp bool) string {
 	if nm == nil {
 		return ""
 	}
-	crossed := false
+	crossed := !requireSetOp
 	for n != nil && idx >= 0 {
 		switch p := n.(type) {
 		case *optimizer.SetOp:
+			// A join residual stops here: an appendrel (inheritance or
+			// partition) Var deparses with the PARENT's alias
+			// (`tuplesest_parted.b`, regress inherit), which the
+			// first-branch walk cannot produce — it would print the first
+			// child relation instead.
+			if !requireSetOp {
+				return ""
+			}
 			crossed = true
 			n = p.Left
 		case *optimizer.Project:
@@ -694,6 +721,26 @@ func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
 			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
 		case *optimizer.NestedLoopIndexJoin:
 			n, idx = concatJoinSide(p, p.Outer, p.Inner, idx)
+		case *optimizer.Memoize:
+			if requireSetOp {
+				return ""
+			}
+			n = p.Child
+		case *optimizer.Aggregate:
+			// A group key is republished as-is: PG deparses the Var through
+			// the Agg's target list to the grouped column. Anything else
+			// (an aggregate result, grouping sets) ends the walk. The
+			// set-operation walk keeps its original arms (an aggregate
+			// there ends it: past one, an appendrel's Var prints with the
+			// parent's alias, not the first branch's — regress inherit).
+			if requireSetOp || p.GroupingSets != nil || idx >= len(p.GroupExprs) {
+				return ""
+			}
+			cr, ok := p.GroupExprs[idx].(*optimizer.ColumnRef)
+			if !ok {
+				return ""
+			}
+			n, idx = p.Child, cr.Index
 		default:
 			if !crossed {
 				return ""

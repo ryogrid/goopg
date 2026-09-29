@@ -307,3 +307,44 @@ above the Gather, where PG evaluates it (on its serial Hash Join). TPC-H
 `parameterisation` 3 → 2, `aggregation-strategy` 2 → 1, `sort-strategy` 2 →
 1, `parallelism` 5 → 4; the TPC-H match count is unchanged (10). Evidence:
 `analysis/m0146/m0146-0005/slice44/`.
+
+## Slice 45: M0146-0005as — a join residual's columns deparse through the child that produced them
+
+TPC-DS Q46/Q68's `qual-placement` records were a rendering difference. goopg
+printed `Join Filter: (ca_city <> bought_city)`, while PG prints
+`(current_addr.ca_city)::text <> (customer_address.ca_city)::text`. PG's
+ruleutils deparses an OUTER/INNER Var through the child plan's target list
+(`resolve_special_varno`): a column that a grouped subquery republishes
+under an alias prints as the grouped column it carries, and every column
+prints with the relation that produced it. goopg rendered join-residual
+columns by name and statement-level binding id only. That printed the alias
+for a derived column, and it named the wrong relation whenever binding ids
+collided across query levels: regress join.sql printed `(ax = t2.a)` for
+`q1.ax = q2.a` (it is `t2.a = t3.a`), and `(i42.f1 > 1)` for `ON (i43.f1 >
+1)`.
+
+- `explainNames.resolvedColumn` generalizes `setOpResolvedColumn`'s walk
+  (joins by `concatJoinSide`, Projects, Filters, Sorts, Gathers,
+  SubqueryScans) with an Aggregate group-key arm and a Memoize arm. It has
+  two modes. The set-operation mode is unchanged: it answers only when the
+  walk crossed a SetOp, and keeps its old arms. The join-residual mode
+  (`joinResidualColumn`) answers for any walk that ends at a named scan, and
+  stops at a SetOp, because an appendrel Var prints with the parent's alias
+  (`tuplesest_parted.b`, regress inherit), not the first branch's.
+- `subPlanReg.joinRow` is set only while a join's residual is printed (the
+  Join Filter, an index join's Filter, and the split residual of slices
+  36–40). The ColumnRef arm resolves positionally first there and falls back
+  to the name-based rendering.
+
+Test: `TestJoinFilterResolvesSubqueryColumnToSource`.
+
+Movement: TPC-DS `qual-placement` 14 → 12 at SF0.25 and 15 → 13 at SF1.
+SF1 `rendering` 18 → 17, and SF1 PLAN-PARITY match 18 → 19 (Q46 = PG). TPC-H
+plan text is identical. In the regress runner, join.sql's join filters now
+name the right relations: ten lines change, each checked against its query.
+Evidence: `analysis/m0146/m0146-0005/slice45/`.
+
+Ledgered: Hash/Merge Cond keys and ordinary Filters keep the name-based
+rendering; the residual walk stops at a set operation, where PG prints the
+appendrel parent's alias; and the `::text`-style casts PG deparses are not
+printed.

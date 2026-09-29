@@ -1534,13 +1534,15 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// same class of blind spot `Hash Cond:` itself closed at P2.1.
 		// M0146-0005aj: a parameterized nested loop's residual renders
 		// under its inner scan (explain_nli_paramqual.go).
-		if _, join, applies := renderedParamQual(p); !applies {
-			if jf := formatJoinFilter(p, reg, qualify); jf != "" {
-				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
+		reg.withJoinRow(p, func() {
+			if _, join, applies := renderedParamQual(p); !applies {
+				if jf := formatJoinFilter(p, reg, qualify); jf != "" {
+					*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + jf)})
+				}
+			} else if join != nil {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + wrapParen(formatExprQual(join, reg, qualify)))})
 			}
-		} else if join != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Join Filter: " + wrapParen(formatExprQual(join, reg, qualify)))})
-		}
+		})
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -1558,7 +1560,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			residual = join
 		}
 		if residual != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(residual, reg, qualify)))})
+			reg.withJoinRow(p, func() {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(residual, reg, qualify)))})
+			})
 		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
@@ -2069,6 +2073,12 @@ type subPlanReg struct {
 	// first (explainNames.columnIn), the way PG deparses a Var against the
 	// node's own children. Set by both walkers for each node; nil outside.
 	current optimizer.Node
+	// joinRow is the join whose residual (Join Filter / an index join's
+	// Filter) is being rendered, set only around that call: its columns
+	// index the join's concatenated input row, so a column that would print
+	// bare is resolved positionally through the child that produced it
+	// (explainNames.joinResidualColumn, M0146-0005as).
+	joinRow optimizer.Node
 	// hashMemLimit is the session's hash_mem in bytes (work_mem *
 	// hash_mem_multiplier), which decides whether a SubPlan renders as
 	// `hashed` (subPlanUsesHashTable). 0 means unknown: the defaults.
@@ -2316,6 +2326,18 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 
 // currentNode returns the plan node whose own lines are being rendered, or
 // nil.
+// withJoinRow renders fn with joinRow set to n (nil-receiver safe).
+func (r *subPlanReg) withJoinRow(n optimizer.Node, fn func()) {
+	if r == nil {
+		fn()
+		return
+	}
+	prev := r.joinRow
+	r.joinRow = n
+	defer func() { r.joinRow = prev }()
+	fn()
+}
+
 func (r *subPlanReg) currentNode() optimizer.Node {
 	if r == nil {
 		return nil
@@ -2449,6 +2471,17 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 				if out, ok := formatThroughInlinedCTE(cs, x, reg, qualify); ok {
 					return out
 				}
+			}
+		}
+		// A join residual indexes the join's input row, so the column is
+		// resolved POSITIONALLY first — exact where name/binding-id
+		// resolution is not: the planner's SourceTableIdx restarts per query
+		// level, and regress join.sql printed `(t2.a = t2.a)` for
+		// `q1.ax = q2.a` (t3's id collided with t2's). The name-based
+		// rendering stays the fallback when the walk declines.
+		if qualify && reg != nil && reg.joinRow != nil {
+			if s := reg.names().joinResidualColumn(reg.joinRow, x.Index); s != "" {
+				return s
 			}
 		}
 		return reg.names().columnIn(reg.currentNode(), x.SourceTableIdx, x.Name, qualify)

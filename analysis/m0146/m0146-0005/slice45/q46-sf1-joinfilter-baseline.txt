@@ -1,0 +1,1 @@
+               Join Filter: (ca_city <> bought_city)
