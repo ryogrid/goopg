@@ -23383,6 +23383,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 queries both scales\), TPC\-H census byte\-identical, regress runner
     6 cases unchanged\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 aggregation-strategy 22 -> 21; Q38/Q87 first divergence depth 1 -> 5/6 at both scales (SetOp Intersect/Except = PG)
+- [x] **M0146\-0005bh — a parallel DISTINCT may skip the per\-worker
+  dedup** \(slice 60, impl, done 2026\-09\-30 from Q38/Q87\'s depth\-5
+  record\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 60"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `addPartialDistinctPaths` files the unsplit `Unique \-> Gather Merge \->
+    Sort` arm beside the split arms \(PG: create\_final\_distinct\_paths
+    over input\_rel\'s Gather Merge path\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q38/Q87 both scales\), TPC\-H census byte\-identical, regress runner
+    5 cases \(select\_distinct 97 \-> 96\)\.
+  - Ledgered: Unique cost is not create\_upper\_unique\_path\'s
+    \(numCols\); PG\'s split\-arm choice on SF0\.25 Q38/Q87 branches 2/3
+    unexplained\.
+  Movement: yes — PLAN-PARITY SF1 match 22 -> 23 (Q87 = PG); CATEGORIES-EXCL-MATCH SF1 join-order 62 -> 61, join-method 30 -> 29, sort-strategy 42 -> 41
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

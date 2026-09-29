@@ -567,4 +567,31 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Pathkeys:      hgmPath.Pathkeys,
 		Children:      []*Path{hgmPath},
 	}, distinctPartialUniqueProducer)
+
+	// The UNSPLIT arm (M0146-0005bh): create_final_distinct_paths over the
+	// input rel's Gather Merge of its sorted cheapest partial path
+	// (generate_useful_gather_paths files it on input_rel; planner.c's
+	// sorted DISTINCT arm consumes it) — `Unique -> Gather Merge -> Sort
+	// -> <partial>`, no per-worker dedup. When the per-worker groups are
+	// barely fewer than the per-worker rows the worker Unique only adds
+	// its comparisons, and PG keeps this shape (TPC-DS Q38/Q87's
+	// store_sales branch); the add_path contest against the split arms
+	// decides.
+	sortedCrossed := perWorkerRows * d
+	sgmCost := gatherMergeCost(cp, workerSort.Cost, workers, sortedCrossed)
+	sgmPath := &Path{
+		Kind: PathGatherMerge, Rel: distinctRel, Rows: sortedCrossed, Cost: sgmCost,
+		Pathkeys:      append([]PathKey(nil), mergeKeys...),
+		ParallelSafe:  false,
+		DisabledNodes: workerSort.DisabledNodes + disabledNodesFor(!cp.enableGatherMerge),
+		Children:      []*Path{workerSort},
+	}
+	addPath(distinctRel, &Path{
+		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
+		Rel: distinctRel, Rows: finalRows,
+		DisabledNodes: sgmPath.DisabledNodes,
+		Cost:          distinctCost(sgmCost.Startup, sgmCost.Total, sortedCrossed, finalRows, cp),
+		Pathkeys:      sgmPath.Pathkeys,
+		Children:      []*Path{sgmPath},
+	}, distinctPartialUniqueProducer)
 }

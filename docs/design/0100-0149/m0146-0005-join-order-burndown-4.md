@@ -235,3 +235,40 @@ ledgered Q87 row-estimate row.
 Ledgered: the sorted SetOp's printed startup is the legacy display's
 larger child startup, where PG sums both inputs' startups. `SetOp`, like
 `Aggregate`, carries no PlanCost.
+
+## Slice 60: M0146-0005bh — a parallel DISTINCT may skip the per-worker dedup
+
+After slice 59, Q38/Q87's first divergence was PG's store\_sales branch:
+`Unique -> Gather Merge -> Sort -> <partial join>`, with no per-worker
+Unique. PG's `create_distinct_paths` builds the final DISTINCT paths
+over `input_rel` first. That includes the sorted Unique over the input
+rel's Gather Merge of its sorted cheapest partial path, which
+`generate_useful_gather_paths` files. Only after that does
+`create_partial_distinct_paths` add the split arms. goopg filed only the
+split arms (sorted per-worker Unique, and hashed per-worker dedup since
+slice 58).
+
+- `addPartialDistinctPaths` also files the unsplit arm: the leader Unique
+  over a Gather Merge of the worker Sort, carrying every per-worker row
+  (`perWorkerRows × d`). add\_path elects among the three.
+
+Movement: TPC-DS SF1 PLAN-PARITY match 22 → 23 (Q87 = PG), with SF1
+join-order 62 → 61, join-method 30 → 29 and sort-strategy 42 → 41.
+SF0.25 categories are unchanged. There, Q38/Q87's first divergence (depth
+5) is now the other branches, where PG keeps the per-worker Unique that
+goopg drops. The Q38/Q87 fire set executes at both scales. TPC-H plans
+are byte-identical. In the regress runner, select\_distinct.sql's `WHERE
+four = 10` case loses one line of divergence (PG's LIMIT-1 partial arm is
+still ledgered). Evidence: `analysis/m0146/m0146-0005/slice60/`.
+
+Ledgered:
+
+- goopg prices a Unique with `distinctCost`: a comparison per input row
+  in both startup and total, plus `cpu_tuple_cost` per output row. PG's
+  `create_upper_unique_path` keeps the subpath's startup and adds
+  `cpu_operator_cost × rows × numCols` to the total (verified on Q87:
+  19738.09 + 0.0025 × 3260 × 3 = 19762.54). Under PG's figures the split
+  and unsplit arms differ by the per-worker Unique alone.
+- Why PG keeps the split arm for Q38/Q87's catalog\_sales and web\_sales
+  branches at SF0.25 is not yet explained; the two arms tie within
+  add\_path's fuzz there.
