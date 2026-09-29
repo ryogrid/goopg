@@ -1650,6 +1650,30 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			sets := make([][]int, len(p.GroupingSets))
 			copy(sets, p.GroupingSets)
 			sort.SliceStable(sets, func(i, j int) bool { return len(sets[i]) > len(sets[j]) })
+			// M0146-0020a: a sorted rollup prints `Group Key:` for every set,
+			// largest first, its columns in the rollup's sort order, then
+			// `Group Key: ()` (show_grouping_set_keys over an AGG_SORTED
+			// rollup — TPC-DS Q27).
+			if order, ok := optimizer.RollupChainOrder(p.GroupingSets); ok && p.Strategy == optimizer.AggStrategySorted {
+				for _, set := range sets {
+					in := map[int]bool{}
+					for _, gi := range set {
+						in[gi] = true
+					}
+					parts := make([]string, 0, len(set))
+					for _, gi := range order {
+						if in[gi] && gi >= 0 && gi < len(p.GroupExprs) {
+							parts = append(parts, renderKey(gi))
+						}
+					}
+					if len(parts) == 0 {
+						*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: ()")})
+						continue
+					}
+					*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
+				}
+				sets = nil
+			}
 			empty := 0
 			for _, set := range sets {
 				if len(set) == 0 {
@@ -3841,6 +3865,13 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			// AGG_HASHED, a HashAggregate. The per-set keys are the
 			// `Hash Key:` / `Group Key: ()` detail lines (emitNodeDetailLines).
 			// M0146-0020.
+			// M0146-0020a: a single rollup computed in one sorted pass is
+			// AGG_SORTED, `GroupAggregate`.
+			if p.Strategy == optimizer.AggStrategySorted {
+				if _, ok := optimizer.RollupChainOrder(p.GroupingSets); ok {
+					return prefix + "GroupAggregate"
+				}
+			}
 			if groupingSetsHaveEmpty(p.GroupingSets) {
 				return prefix + "MixedAggregate"
 			}

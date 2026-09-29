@@ -24055,7 +24055,7 @@ M0146-0001 re-baseline census on the new default arm.
       `Group Key: \(\)`; aggregation\-strategy 40 → 36 \(SF0.25\), 45 → 40
       \(SF1\); Q27 SF1 MATCH; all gates pass.
   Movement: TPC\-DS Q5 Q22 Q77 Q80 past the aggregate \(both scales\), Q27 SF1 MATCH
-- [ ] **M0146\-0020a — PG\'s sorted grouping\-sets strategy** \(filed
+- [x] **M0146\-0020a — PG\'s sorted grouping\-sets strategy** \(filed
   2026\-09\-26 by M0146\-0020\): with sorted input,
   `consider\_groupingsets\_paths` also builds sorted rollups and mixed
   sort/hash plans; TPC\-DS Q18 and Q27 \(SF0.25\) plan `GroupAggregate`
@@ -24065,6 +24065,29 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: port the is\_sorted arm \(sorted rollups over the
     `extract\_rollup\_sets` chains, hash\_mem\-bounded mixed choice\) as a
     candidate the grouping upper rel can cost.
+  - Landed 2026\-09\-30 for a SINGLE rollup: `RollupChainOrder`
+    \(groupingsets\_sorted\.go\), the sorted candidate in the grouping upper
+    rel \(create\_groupingsets\_path cost, no pathkeys\), AGG\_SORTED emission
+    order in the executor, `GroupAggregate` \+ per\-set `Group Key:` in
+    EXPLAIN\. Design `docs/design/0100\-0149/m0146\-0020\-grouping\-sets\-explain.md`\.
+  - Tests `TestSortedRollupMatchesPG`; C\-10a gate tests restated\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q14/Q18/Q27\), TPC\-H census byte\-identical, regress runner 5 cases
+    \(groupingsets 1047 \-> 994, plan lines only\)\.
+  - Remainder filed as M0146\-0020b\.
+  Movement: yes — PLAN-PARITY SF0.25 match 26 -> 27, SF1 23 -> 24 (Q27 = PG); CATEGORIES-EXCL-MATCH SF0.25 aggregation-strategy 21 -> 19, join-order 56 -> 54; SF1 aggregation-strategy 23 -> 22
+- [ ] **M0146\-0020b — multi\-rollup and mixed grouping\-sets strategies**
+  \(filed 2026\-09\-30 by M0146\-0020a\)\. PG\'s consider\_groupingsets\_paths
+  splits CUBE / disjoint GROUPING SETS into several rollups
+  \(extract\_rollup\_sets\), sorts some and hashes the rest under
+  hash\_mem, and orders a rollup\'s added columns to follow ORDER BY\.
+  goopg offers the sorted form only for a single rollup, in ascending
+  column order\.
+  Kind: impl
+  Parent: M0146\-0020a
+  - First step: port extract\_rollup\_sets and the ORDER BY reordering
+    of preprocess\_grouping\_sets; witnesses groupingsets\.sql \(reordering
+    test, ProjectSet rollup where PG keeps MixedAggregate\)\.
 
 - [ ] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
   2026\-09\-27 by M0146\-0005y's residual re\-routing, the last unowned

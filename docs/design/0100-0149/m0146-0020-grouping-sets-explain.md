@@ -56,3 +56,64 @@ hashes every non-empty set and computes the empty set in the same pass.
 - The rollup order for CUBE over three or more columns follows
   `extract_rollup_sets`' chain matching, which largest-first ordering does
   not reproduce.
+
+## M0146-0020a — the sorted strategy for a single rollup (2026-09-30)
+
+With sorted input, PG's `consider_groupingsets_paths` also computes a rollup
+(a chain of grouping sets, each contained in the next) in one sorted pass:
+AGG\_SORTED, printed `GroupAggregate` with a `Group Key:` line per set,
+largest first, above a Sort on the rollup order. TPC-DS Q18/Q27 (SF0.25)
+plan it that way; goopg always hashed.
+
+- `RollupChainOrder` (groupingsets\_sorted.go) recognises a single rollup
+  and returns its column order. That is the smallest non-empty set's
+  columns, then each larger set's additional columns, so every set is a
+  prefix of it.
+- The grouping upper rel (groupingpaths.go) offers the sorted rollup
+  before the hashed arm, over the Sort of its input and over every
+  searched input path already ordered that way. It is priced as
+  `create_groupingsets_path` prices one rollup:
+  - `cost_agg(AGG_SORTED)` over the longest set's columns and every set's
+    groups;
+  - no pathkeys: PG 18's grouped outputs are RTE\_GROUP expressions made
+    nullable by the grouping step, so an ORDER BY above still sorts
+    (Q27: `Sort -> GroupAggregate`).
+- The executor still computes every set in one materialising pass. For a
+  Sorted rollup it emits rows in AGG\_SORTED's order: along the rollup,
+  detail groups before their rolled-up group, the grand total last. This
+  was verified against PG 18.3 on `GROUP BY ROLLUP(k1, k2)`.
+- EXPLAIN prints `GroupAggregate` and one `Group Key:` per set, including
+  `Group Key: ()`.
+
+Tests:
+
+- `TestSortedRollupMatchesPG` pins PG 18.3's plan and row order with
+  hash aggregation off.
+- The C-10a strategy-gate tests become
+  `TestC10aGroupingSetsSortedRollupComputesEveryLevel` (rollup order) and
+  `TestC10aGroupingSetsStrategiesAgreeOnRows` (same row multiset).
+
+Movement:
+
+- TPC-DS PLAN-PARITY match SF0.25 26 → 27 and SF1 23 → 24; Q27 = PG at
+  both scales.
+- Q18 SF0.25 drops to a single scan-type record.
+- SF0.25 join-order 56 → 54, join-method 31 → 29, aggregation-strategy
+  21 → 19, sort-strategy 39 → 37, parallelism 37 → 35.
+- SF1 join-order 61 → 60, join-method 29 → 28, aggregation-strategy
+  23 → 22, sort-strategy 41 → 40, parallelism 48 → 47.
+- TPC-H plans are byte-identical.
+- groupingsets.sql moves toward PG (1047 → 994 diff lines; only plan
+  lines change).
+
+Evidence: `analysis/m0146/m0146-0020a/`.
+
+Not ported (M0146-0020b):
+
+- More than one rollup (CUBE, disjoint GROUPING SETS) and PG's
+  hash\_mem-bounded mixed sort/hash choice across rollups.
+- PG orders a rollup's added columns to match the query's ORDER BY
+  (groupingsets.sql "reordering of grouping sets": `Group Key: v, b, a`
+  where goopg prints `v, a, b`).
+- On one groupingsets.sql rollup under a ProjectSet, PG keeps
+  MixedAggregate where goopg now elects the sorted rollup.

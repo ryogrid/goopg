@@ -631,6 +631,55 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		}
 	}
 
+	// SORTED ROLLUP (M0146-0020a): consider_groupingsets_paths' is_sorted
+	// arm for a single rollup — every set contained in the next — computed
+	// in one pass over input sorted on the rollup order. Priced as
+	// create_groupingsets_path prices one rollup: cost_agg(AGG_SORTED) over
+	// the longest set's columns and every set's groups. Offered first, as
+	// PG's sorted arm precedes its hashed one. No pathkeys are advertised:
+	// PG 18's grouped outputs are RTE_GROUP expressions nullable by the
+	// grouping step, so its rollup's group pathkeys never satisfy an ORDER
+	// BY over them and a Sort stays above (TPC-DS Q27: `Sort ->
+	// GroupAggregate`).
+	if aggNode.GroupingSets != nil && !groupingHasSpecialAgg(aggNode) {
+		if rkeys, ok := rollupSortKeys(aggNode); ok {
+			rollupPathkeys := pathkeysForSortKeys(rkeys)
+			sortedInput := sortPathForBounded(sortSeed, rollupPathkeys, cp, -1)
+			rSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &rSpec,
+				Rel: grouped, Rows: numGroups,
+				Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+					len(rkeys), numGroups, len(rSpec.Aggs), inNcols, inAvgVar),
+				Children: []*Path{sortedInput},
+			}, groupAggSortedProducer)
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+				for i, cand := range sr.Pathlist {
+					if i >= len(candKeys) || !pathkeysContainedIn(candKeys[i], rollupPathkeys) {
+						continue
+					}
+					cNode := searchedCandidateInput(child, cand)
+					if cNode == nil {
+						continue
+					}
+					cs := newPrebuiltPath(grouped, cNode)
+					cs.Rows = inputRows
+					cs.Cost = cand.Cost
+					cs.Pathkeys = candKeys[i]
+					cSpec := *aggNode
+					addPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &cSpec,
+						Rel: grouped, Rows: numGroups,
+						Cost: costAgg(cp, AggStrategySorted, inputRows, cs.Cost.Startup, cs.Cost.Total,
+							len(rkeys), numGroups, len(cSpec.Aggs), inNcols, inAvgVar),
+						Children: []*Path{cs},
+					}, groupAggSearchProducer)
+				}
+			}
+		}
+	}
+
 	// HASHED. Offered whenever hashable; enable_hashagg = off marks it
 	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
 	// Grouping sets always hash (today's fall-through; executor has one

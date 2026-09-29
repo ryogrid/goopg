@@ -2582,7 +2582,60 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// rewrite. rowSets[i] is the set index of o.rows[i]; it is carried
 	// alongside rather than in the row because the set index is not an output
 	// column.
-	if nGroupCols > 0 {
+	// M0146-0020a: a SORTED single rollup emits as PG's one-pass AGG_SORTED
+	// does: along the rollup order, each group closes when its prefix
+	// changes, so within a prefix the detail groups come first and the
+	// rolled-up group after them; the grand total is last.
+	rollupOrder, rollup := []int(nil), false
+	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil {
+		rollupOrder, rollup = optimizer.RollupChainOrder(o.plan.GroupingSets)
+	}
+	if nGroupCols > 0 && rollup {
+		rowSets := emitted
+		inSet := make([]map[int]bool, len(o.plan.GroupingSets))
+		for si, set := range o.plan.GroupingSets {
+			inSet[si] = map[int]bool{}
+			for _, c := range set {
+				inSet[si][c] = true
+			}
+		}
+		idxOf := make([]int, len(o.rows))
+		for i := range idxOf {
+			idxOf[i] = i
+		}
+		sort.SliceStable(idxOf, func(a, b int) bool {
+			i, j := idxOf[a], idxOf[b]
+			ra, rb := o.rows[i], o.rows[j]
+			for _, c := range rollupOrder {
+				aIn, bIn := inSet[rowSets[i]][c], inSet[rowSets[j]][c]
+				switch {
+				case !aIn && !bIn:
+					continue
+				case aIn && !bIn:
+					return true // detail group before its rolled-up group
+				case !aIn && bIn:
+					return false
+				}
+				av, bv := ra[c], rb[c]
+				if av.IsNull() || bv.IsNull() {
+					if av.IsNull() == bv.IsNull() {
+						continue
+					}
+					return !av.IsNull() // NULLS LAST
+				}
+				cmp, _ := compareDatum(av, bv, 0)
+				if cmp != 0 {
+					return cmp < 0
+				}
+			}
+			return false
+		})
+		sorted := make([]Row, len(o.rows))
+		for pos, i := range idxOf {
+			sorted[pos] = o.rows[i]
+		}
+		o.rows = sorted
+	} else if nGroupCols > 0 {
 		rowSets := emitted
 		idxOf := make([]int, len(o.rows))
 		for i := range idxOf {
