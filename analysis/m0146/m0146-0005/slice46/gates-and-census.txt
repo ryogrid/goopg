@@ -1,0 +1,24 @@
+# M0146-0005at fire-set census (tmp/fireset-0005at), first-divergence roll-up
+sf025 baseline match=19 CATEGORY-ROLLUP: sort-strategy=27 scan-type=13 join-method=9 aggregation-strategy=9 join-order=8 parallelism=6 parameterisation=3 error=3 qual-placement=2
+sf025 candidate match=19 CATEGORY-ROLLUP: sort-strategy=29 scan-type=13 join-method=9 join-order=8 aggregation-strategy=7 parallelism=6 parameterisation=3 error=3 qual-placement=2
+< Q33 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+> Q33 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+< Q56 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+> Q56 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+sf1 baseline match=19 CATEGORY-ROLLUP: sort-strategy=28 aggregation-strategy=13 parallelism=10 scan-type=8 join-method=6 join-order=6 parameterisation=4 error=3 qual-placement=2
+sf1 candidate match=19 CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=11 parallelism=10 scan-type=8 join-method=6 join-order=6 parameterisation=4 error=3 qual-placement=2
+< Q33 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+> Q33 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+< Q56 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+> Q56 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+
+FIRE-SET: FIRE-SET-TIMEOUTS: fires=Q5 Q33 Q47 Q51 Q54 Q56 Q57 Q58 Q60 Q77 Q78 Q80 Q83 Q97 introduced=none unchanged=none missing=none
+FIRE-SET-TIMEOUTS: fires=Q5 Q33 Q47 Q51 Q54 Q56 Q57 Q58 Q60 Q77 Q78 Q80 Q83 Q97 introduced=none unchanged=none missing=none
+TPC-H census (tmp/census-l12/at): DIVERGENCE-CLASSES: queries=22 match=10 divergent=12 D1-sublink=1 D2-unionall=0 D3-partialpath=6 D4-upperrel=0 D5-narrowing=0 D6-cte=0 jointree-search=5 verdict=0 — class file identical to 0005as
+sweep: === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+acceptance: 24 MATCH (tmp/arm-0005at.txt); spotcheck Q12=2 Q13=33
+regress (with union subselect join aggregates groupingsets select_parallel equivclass memoize inherit partition_join limit window select_distinct) vs HEAD worktree: 0-line delta except memoize (worker counts/timings) and join (no-ORDER-BY lateral row order; the baseline reorders it between its own runs)
+sf025 baseline CATEGORIES-EXCL-MATCH: join-order=64 join-method=38 scan-type=43 parameterisation=33 aggregation-strategy=26 sort-strategy=45 parallelism=43 qual-placement=12 rendering=21
+sf025 candidate CATEGORIES-EXCL-MATCH: join-order=64 join-method=40 scan-type=44 parameterisation=34 aggregation-strategy=25 sort-strategy=46 parallelism=44 qual-placement=9 rendering=23
+sf1 baseline CATEGORIES-EXCL-MATCH: join-order=63 join-method=40 scan-type=49 parameterisation=40 aggregation-strategy=28 sort-strategy=48 parallelism=53 qual-placement=13 rendering=17
+sf1 candidate CATEGORIES-EXCL-MATCH: join-order=63 join-method=40 scan-type=50 parameterisation=39 aggregation-strategy=28 sort-strategy=48 parallelism=53 qual-placement=11 rendering=19

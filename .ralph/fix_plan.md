@@ -23123,6 +23123,30 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q46 Q68, none introduced\), TPC\-H plans identical, regress runner 6
     cases \(join\.sql join filters corrected\)\.
   Movement: yes — TPC-DS SF1 PLAN-PARITY match 18 -> 19 (Q46), CATEGORIES-EXCL-MATCH qual-placement SF0.25 14 -> 12, SF1 15 -> 13, SF1 rendering 18 -> 17
+- [x] **M0146\-0005at — set\-op branches share the statement\'s CTEs, and an
+  inlined CTE reference prices its body** \(slice 46, impl, done 2026\-09\-29
+  from the TPC\-DS census, Q5/Q33/Q56/Q60/Q80 `Append` priced near zero\)\.
+  Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 46"\.
+  Kind: impl
+  Parent: M0146-0005
+  - The leftmost set\-op branch recursed with `s.With` attached and
+    preplanned the WITH list again, so each branch counted references
+    against its own `plannedCTE`; a CTE read by two branches was inlined
+    twice\. Now detached; data\-modifying CTEs wrap the finished set
+    operation \(`wrapDMLCTEPrefix`\) on both set\-op returns\.
+  - `legacyDisplayChildren` gained a `CTEScan` arm: an inlined reference
+    prices its body \(`cost\_subqueryscan`\), a kept one stays
+    `cost\_ctescan`\. Feeds `costSubplanLeaf` too\.
+  - Tests `TestExplainUnionBranchesShareOneCTE`,
+    `TestExplainInlinedCTEPricesItsBody` \(both fail on base\)\.
+  - Recon, no change: Q34/Q68/Q73 → M0142\-0005c multiplier \(parked\); Q37 →
+    cold VM \(owner vacuum\); Q16 → near\-tie inside PG \(17033\.6 vs
+    17033\.36\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(14 fires, none introduced\), TPC\-H plans identical, regress runner 14
+    cases \(no semantic delta\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 qual-placement 12 -> 9, aggregation-strategy 26 -> 25, SF1 qual-placement 13 -> 11, parameterisation 40 -> 39; offset by alignment-only rises (SF0.25 join-method 38 -> 40, scan-type/parameterisation/parallelism +1, rendering 21 -> 23; SF1 scan-type +1, rendering +2 — Q33/Q56 branch plans unchanged, the diff now aligns them under PG's Merge Append); match 19 -> 19 both scales; first-divergence aggregation-strategy SF0.25 9 -> 7, SF1 13 -> 11
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

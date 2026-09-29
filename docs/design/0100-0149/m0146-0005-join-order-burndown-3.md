@@ -348,3 +348,71 @@ Ledgered: Hash/Merge Cond keys and ordinary Filters keep the name-based
 rendering; the residual walk stops at a set operation, where PG prints the
 appendrel parent's alias; and the `::text`-style casts PG deparses are not
 printed.
+
+## Slice 46: M0146-0005at — set-op branches share the statement's CTEs, and an inlined CTE reference prices its body
+
+In the census, TPC-DS Q5, Q33, Q56, Q60 and Q80 had an `Append` over
+UNION ALL branches that cost almost nothing. Q5 printed `Append
+(cost=0.00..3.90)` over three branches of about 20000 each, and a root of
+15.73 where PG has 55167. Two defects combined to produce this.
+
+- **The leftmost set-op branch preplanned the WITH list a second time.**
+  `planSelectWithSettings` plans the leftmost branch by recursing on the
+  set-op statement itself, with its SetOp chain and trailing
+  sort/limit detached but `s.With` still attached. The recursion ran
+  `preplanWithClause` again into a scope of its own. Each branch therefore
+  counted its references against a different `plannedCTE`. A CTE read by
+  two branches looked single-reference to each and was inlined twice,
+  where PG keeps one `CTE x` with a CTE Scan per branch (`cterefcount` is
+  statement-wide, `SS_process_ctes`). The recursion now runs with `s.With`
+  detached as well. The chain's data-modifying CTEs, which the leftmost
+  branch's duplicate preplan used to supply, are wrapped around the finished
+  set operation (`wrapDMLCTEPrefix`) on both set-op returns.
+- **An inlined CTE reference was priced as a bare CTE Scan.** `CTEScan` is
+  not a cost carrier, and `legacyDisplayChildren` had no arm for it, so
+  every reference cost `cpu_tuple_cost × rows`. That is `cost_ctescan`,
+  which is right for a kept CTE, whose body PG charges as an initPlan. It
+  is wrong for a reference PG inlines: after `inline_cte` that reference is
+  an ordinary subquery, priced by `cost_subqueryscan` over its body
+  (costsize.c:1491-1493). The arm now descends into the body when
+  `CTEScan.Inlined()`. `costSubplanLeaf`, the join search's price for a
+  sub-plan leaf, reads the same function, so inlined CTEs in join trees stop
+  being free too. Note that the reference count is final only once the
+  statement is planned: a set-op branch priced before a later branch adds
+  the second reference still reads one.
+
+Tests: `TestExplainUnionBranchesShareOneCTE` and
+`TestExplainInlinedCTEPricesItsBody`. Both fail on the base tree.
+
+Movement: TPC-DS Q33/Q56 now elect PG's `GroupAggregate` over the Append
+(it was a HashAggregate) at both scales. Their first divergence moves one
+level deeper to `PG Merge Append | goopg Sort`: aggregation-strategy
+9 → 7 at SF0.25 and 13 → 11 at SF1, sort-strategy +2 at each. Q5/Q80's
+Append and root costs are now in PG's range (Q5 root 59253 vs PG 55167).
+The match counts are unchanged at 19 for both scales, and the TPC-H census
+is identical.
+
+In all-depth `CATEGORIES-EXCL-MATCH`, qual-placement falls 12 → 9 at SF0.25
+and 13 → 11 at SF1. A few categories rise by 1–2: join-method,
+scan-type, parameterisation, parallelism and rendering. Those rises are
+alignment only. Q33/Q56's branch plans are byte-identical apart from text
+width, and the tree diff now pairs them with PG's per-branch sorts under
+its Merge Append. Evidence: `analysis/m0146/m0146-0005/slice46/`.
+
+Census recon from the same loop (no change):
+
+- Q34/Q68/Q73 (`Bitmap Heap Scan` vs `Index Scan` on `customer_pkey`) are
+  the `indexProbeCostMultiplier` lineage (M0142-0005c, parked).
+- Q37's join order follows from the cold visibility map: there is no
+  catalog_sales Index Only Scan (probe 93 vs PG 0.83). That is the owner
+  vacuum item.
+- Q16 is a near-tie inside PG itself. Forcing goopg's shape on the
+  reference costs 17033.6 against PG's chosen 17033.36.
+
+Ledgered:
+
+- PG charges a kept CTE's body to the plan root as an initPlan
+  (`SS_charge_for_initplans`). goopg's root costs omit it.
+- A second reference is aliased `a_1` in PG. goopg prints the bare name.
+- `WITH x AS (INSERT …) (SELECT …)` is rejected at parse time
+  (pre-existing).

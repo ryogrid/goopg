@@ -250,6 +250,16 @@ func legacyDisplayChildren(n Node) []Node {
 	case *SubqueryScan:
 		// M0146-0005w: the subplan must be priced beneath the label.
 		return []Node{p.Child}
+	case *CTEScan:
+		// A reference PG would inline is an ordinary subquery there, priced
+		// by cost_subqueryscan over its body (costsize.c:1491-1493). A kept
+		// CTE's body is an initPlan and stays out of the scan's cost, as in
+		// cost_ctescan. The reference count is final only once the whole
+		// statement is planned: a read taken before a later set-op branch
+		// adds the second reference still sees one, and prices the body in.
+		if p.Inlined() && p.Child != nil {
+			return []Node{p.Child}
+		}
 	}
 	return nil
 }

@@ -1340,6 +1340,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		s.OrderBy = nil
 		s.Limit = nil
 		s.Offset = nil
+		// The WITH list also belongs to the whole chain and was preplanned
+		// above. Left attached, the leftmost branch would preplan it again
+		// into a scope of its own, so every branch counted its references
+		// against a different plannedCTE and a CTE read by two branches
+		// looked single-reference to each (inlined twice where PG keeps one
+		// `CTE <name>` with two CTE Scans).
+		savedWith := s.With
+		s.With = nil
 		// Plan the leftmost branch: s without its SetOp chain and without the
 		// whole chain's sort/limit. When s is a grouping node this recursion
 		// lands on the SetOpOperand branch below and plans the parenthesised
@@ -1361,6 +1369,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
 		s.Offset = savedOffset
+		s.With = savedWith
 		if err != nil {
 			return nil, err
 		}
@@ -1552,7 +1561,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
-		return wrapSetOpSortLimit(s, left, cat, plannerSet, scope, upper, setOpTupleFraction)
+		// The chain's data-modifying CTEs run once, ahead of the whole set
+		// operation — the branches no longer preplan the WITH list.
+		out, err := wrapSetOpSortLimit(s, left, cat, plannerSet, scope, upper, setOpTupleFraction)
+		if err != nil {
+			return nil, err
+		}
+		return wrapDMLCTEPrefix(out, dmlPlans), nil
 	}
 	// A grouping node stands for a parenthesised set-op operand with nothing
 	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
@@ -1571,7 +1586,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 		// C-17: a grouping node's own trailing sort/limit belongs to the
 		// parenthesised operand it wraps; its fraction is this statement's.
-		return wrapSetOpSortLimit(s, operand, cat, plannerSet, scope, upper, searchTupleFraction(s.Limit, s.Offset))
+		out, err := wrapSetOpSortLimit(s, operand, cat, plannerSet, scope, upper, searchTupleFraction(s.Limit, s.Offset))
+		if err != nil {
+			return nil, err
+		}
+		return wrapDMLCTEPrefix(out, dmlPlans), nil
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
