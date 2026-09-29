@@ -23302,6 +23302,25 @@ M0146-0001 re-baseline census on the new default arm.
     - Q78 prints no `Subquery Scan`; its SF0.25 record moves from
       join\-order to qual\-placement at the same node; all gates pass.
   Movement: TPC\-DS Q78 ws residual qual moves onto the inner Index Scan
+- [x] **M0146\-0007e — the reference site pulls a simple CTE body up**
+  \(slice 5, impl, done 2026\-09\-29 from the M0146\-0005 census record
+  `PG Merge Join \| goopg Subquery Scan on v2` on TPC\-DS Q47/Q57; the
+  design doc\'s open item 3\)\.
+  Kind: impl
+  Parent: M0146\-0007
+  - `cteAsDerivedItem` \(`ctepullup.go`\) presents a FROM reference to an
+    inlinable CTE to the M0146\-0028 pull\-up as `\(<body>\) alias`; the
+    reference count is an AST `cterefcount` \(`countCTEReferences`\);
+    `takeBackPulledBodyRefs` removes the preplanned body\'s references once
+    the pull\-up succeeds\.
+  - Test `TestExplainSimpleCTEReferencePullsUp` \(fails on base; the
+    take\-back half fails without it\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q47 Q54 Q57, none introduced\), TPC\-H census identical, regress
+    runner 8 cases \(no semantic delta\); Q47/Q57 md5 = PG\.
+  - Next at Q47/Q57 depth 2: merge\-clause selection — goopg merges on
+    `\(rn \+ 1\) = rn`, PG keeps it as a Join Filter\.
+  Movement: yes — CATEGORIES-EXCL-MATCH qual-placement SF0.25 13 -> 15, SF1 12 -> 14 (Q47/Q57 depth-2 node now = PG, first divergence join-order -> qual-placement at the same depth); match 24 -> 24 SF0.25, 21 -> 21 SF1
 - [x] **M0146\-0007d — a CTE referenced only from sublinks still hoists to
   a `CTE <name>` section** \(filed and done 2026\-09\-28 from the
   2026\-09\-27 triage\'s `PG CTE avg_sales | goopg Sort` \(Q14\) record\).

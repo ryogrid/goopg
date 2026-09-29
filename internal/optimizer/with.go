@@ -48,6 +48,25 @@ type plannedCTE struct {
 	// a reference stays an RTE_SUBQUERY and plans as a SubqueryScan
 	// (wrapInlinedCTEScans), which setrefs keeps unless trivial.
 	needsScan bool
+	// astRefs is parse analysis' cterefcount: how many times the statement
+	// that owns the WITH names this CTE as a relation, counted from the AST
+	// before planning (countCTEReferences; shadowing declines — only an
+	// overcount). refs above is final only after planning, and the
+	// reference-site pull-up (M0146-0007e) must decide while the FROM list
+	// is being planned.
+	astRefs int
+	// bodyRefDeltas records how many references to OTHER CTEs planning this
+	// body at the WITH added. When the reference site pulls the body up
+	// (M0146-0007e), the preplanned body is never run and the parent
+	// re-plans those references, so the deltas are taken back once
+	// (pulledUp) — otherwise a CTE the body read once would look doubly
+	// referenced and lose its own inlining.
+	bodyRefDeltas map[*plannedCTE]int
+	pulledUp      bool
+	// query and aliasColumns are the CTE's written body and column-alias
+	// list, kept for the reference-site pull-up (cteAsDerivedItem).
+	query        *parser.SelectStmt
+	aliasColumns []string
 	// materialized is the declaration's MATERIALIZED / NOT MATERIALIZED
 	// keyword ("" when absent), volatile whether the planned body calls a
 	// volatile function, and selectOwned whether the WITH belongs to a
@@ -294,6 +313,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 		// to a later one.
 		// A-01(ii) cut 2: the body shares the statement scope.
 		// EX3-03 cut 1: under ps — the CTE body holds the join tree.
+		refsBefore := make(map[*plannedCTE]int, len(cur))
+		for _, e := range cur {
+			refsBefore[e] = e.refs
+		}
 		body, err := planSelectWithSettings(cte.Query, cat, ps, scope)
 		if err != nil {
 			restore()
@@ -341,6 +364,16 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 				derivedSubqueryNeedsScan(cte.Query, body),
 			materialized: cte.Materialized,
 			volatile:     planHasVolatileExpr(body, cat),
+			query:        cte.Query,
+			aliasColumns: cte.Columns,
+		}
+		for e, before := range refsBefore {
+			if d := e.refs - before; d > 0 {
+				if entry.bodyRefDeltas == nil {
+					entry.bodyRefDeltas = map[*plannedCTE]int{}
+				}
+				entry.bodyRefDeltas[e] = d
+			}
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}

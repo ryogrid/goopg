@@ -134,7 +134,54 @@ leaves.
    both openings are CTE-path only.
 2. `NOT MATERIALIZED` on a multiply-referenced CTE: PG plans each
    reference separately; goopg shares one planned body.
-3. The inlined body is still planned once, at the WITH, not at the
+3. (FROM-clause references: done in slice 5 below.) The inlined body is still planned once, at the WITH, not at the
    reference site. So it is not pulled up into the parent's join search
    (PG's `pull_up_simple_subquery` for simple bodies), and its
    parallel-safety follows the CTE scan.
+
+## Slice 5 (M0146-0007e): the reference site pulls a simple body up
+
+Open item 3 above, for FROM-clause references. TPC-DS Q47/Q57's `v2` is a
+single-reference CTE whose body is a plain join of three `v1` references.
+PG's `inline_cte` turns it into an RTE_SUBQUERY before
+`pull_up_subqueries`, so the body's relations join the main query's search
+and its WHERE lands on the `v1` scan. goopg printed `Subquery Scan on v2`
+with that WHERE as its filter.
+
+- `cteAsDerivedItem` (new `ctepullup.go`) presents a FROM item naming an
+  inlinable CTE to the M0146-0028 pull-up as the derived table
+  `(<CTE body>) <alias>`. The same `is_simple_subquery` gate
+  (`simpleDerivedPullupBody`) then decides. The CTE must pass
+  `inlinable`'s gates except for the reference count, and must have no
+  column-alias list.
+- The reference count is parse analysis' `cterefcount`. `refs` is final
+  only after planning, and this decision is made while the FROM list is
+  planned, so `stampCTEReferenceCounts` counts relation references by name
+  over the WITH-owning statement's AST (`countCTEReferences`). It skips
+  `SelectStmt.From`, the flattened copy of `FromExprs`. A shadowing nested
+  WITH and an over-deep AST only overcount, which declines the pull-up.
+- The body was already planned once at the WITH, and that preplan added
+  references to other CTEs (`bodyRefDeltas`, recorded around each body's
+  preplan). Once the parent's pull-up succeeds, the parent re-plans those
+  references and `takeBackPulledBodyRefs` subtracts the preplan's, once
+  (`pulledUp`). Without this, a CTE read once through the pulled body looks
+  doubly referenced and loses its own inlining.
+
+Test: `TestExplainSimpleCTEReferencePullsUp`. A pulled `v` leaves no
+Subquery Scan. The `g` it reads stays inlined, and fails without the
+take-back. A CTE read twice keeps its `CTE v`.
+
+Movement: Q47/Q57's depth-2 node now matches PG (`Merge Join`, not
+`Subquery Scan on v2`). Their first-divergence category moves from
+join-order to qual-placement at the same depth: goopg merges on `(rn + 1)
+= rn`, while PG keeps it as a Join Filter. All-depth qual-placement goes
++2 at both scales, and match counts are unchanged. Q47/Q57 results are
+md5-identical to PG's, and TPC-H is identical. Evidence:
+`analysis/m0146/m0146-0007/slice5/`.
+
+Still open (ledgered): a CTE reference inside a JOIN chain, a CTE with a
+column-alias list, and CTE references in sublinks are not presented to the
+pull-up. After the pull-up, EXPLAIN qualifies the CTE body's outer key by
+the statement-wide binding table and prints `ss_item_sk` bare, where PG
+prints `store_sales.ss_item_sk`; this is the same cross-level
+SourceTableIdx collision as the M0146-0005as rendering row.

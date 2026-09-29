@@ -1249,6 +1249,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	}
 	defer restore()
 	markSelectOwnedCTEs(s.With)
+	// M0146-0007e: parse analysis' cterefcount, for the reference-site
+	// pull-up that must decide before planning finishes counting.
+	stampCTEReferenceCounts(s)
 
 	if s.SetOp != nil {
 		// Flatten the right-associative parse tree into a flat list of
@@ -3957,6 +3960,9 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		}
 		node, rctx, ok, err := planFromClauseItems(s, items, cands, onQuals, cat, ps, scope)
 		if err == nil && ok {
+			for _, c := range cands {
+				takeBackPulledBodyRefs(c.cte)
+			}
 			return node, rctx, nil
 		}
 		if scope != nil {

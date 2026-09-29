@@ -78,6 +78,9 @@ type derivedPullupCandidate struct {
 	itemHi int // one past the last
 	bindLo int
 	bindHi int
+	// cte is set when the item was a reference to an inlinable CTE,
+	// presented as its body (M0146-0007e, ctepullup.go).
+	cte *plannedCTE
 }
 
 // derivedPullupDisabled is the per-call fallback switch: planFromClause
@@ -313,12 +316,17 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
 	for _, it := range flat {
-		body, ok := simpleDerivedPullupBody(it, cat)
+		src := it
+		var cteEntry *plannedCTE
+		if conv, e, ok := cteAsDerivedItem(it); ok {
+			src, cteEntry = conv, e
+		}
+		body, ok := simpleDerivedPullupBody(src, cat)
 		if !ok {
 			out = append(out, it)
 			continue
 		}
-		c := &derivedPullupCandidate{alias: it.Base.Alias, body: body, itemLo: len(out)}
+		c := &derivedPullupCandidate{alias: src.Base.Alias, body: body, itemLo: len(out), cte: cteEntry}
 		out = append(out, body.FromExprs...)
 		c.itemHi = len(out)
 		cands = append(cands, c)

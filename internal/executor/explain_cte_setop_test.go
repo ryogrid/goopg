@@ -101,3 +101,30 @@ func TestExplainInlinedGroupedCTEKeepsSubqueryScan(t *testing.T) {
 		t.Errorf("moved qual under a join: want the scan stripped, got %d:\n%s", got, strings.Join(joined, "\n"))
 	}
 }
+
+// TestExplainSimpleCTEReferencePullsUp pins M0146-0007e against PG 18.3:
+// inline_cte makes a single-reference CTE an RTE_SUBQUERY before
+// pull_up_subqueries, so a simple body is flattened into the referencing
+// query — its relations join the parent's search and the parent's quals reach
+// them (TPC-DS Q47/Q57's `v2`). A CTE the pulled body reads once stays
+// inlined too: the preplanned body's reference to it is taken back. A CTE
+// read twice is neither pulled nor inlined.
+func TestExplainSimpleCTEReferencePullsUp(t *testing.T) {
+	pulled := cteExplainLines(t,
+		`WITH g AS (SELECT a, count(*) AS c FROM t GROUP BY a),
+		      v AS (SELECT g.a, t.b FROM g, t WHERE g.a = t.a)
+		 SELECT * FROM v WHERE b = 1`)
+	joined := strings.Join(pulled, "\n")
+	if got := countLinesContaining(pulled, "Subquery Scan"); got != 0 {
+		t.Errorf("simple single-reference CTE must be pulled up, got a Subquery Scan:\n%s", joined)
+	}
+	if got := countLinesContaining(pulled, "CTE g"); got != 0 {
+		t.Errorf("g is read once (through the pulled v) and must stay inlined:\n%s", joined)
+	}
+	twice := cteExplainLines(t,
+		`WITH v AS (SELECT t.a, u.b FROM t, t u WHERE t.a = u.a)
+		 SELECT * FROM v WHERE b = 1 UNION ALL SELECT * FROM v`)
+	if got := countLinesContaining(twice, "CTE v"); got != 1 {
+		t.Errorf("a CTE referenced twice stays one CTE:\n%s", strings.Join(twice, "\n"))
+	}
+}
