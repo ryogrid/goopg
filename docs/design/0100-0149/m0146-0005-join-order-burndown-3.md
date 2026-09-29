@@ -468,3 +468,55 @@ Ledgered:
   distinct-UNION arm shares this.
 - The partial arm (a Gather Merge over a Parallel Append) and group-key
   reordering to match a member's ordering are not ported.
+
+## Slice 48: M0146-0005av — an inlined CTE reference PG cannot pull up is a SubqueryScan
+
+In TPC-DS Q5/Q80, the first divergence was `PG Subquery Scan on ssr |
+goopg GroupAggregate`, under the Append of the three channel members.
+`inline_cte` (subselect.c) makes a single-reference CTE an ordinary
+RTE_SUBQUERY before `pull_up_subqueries` runs. A grouped body is one
+pull-up refuses, so the reference stays a subquery with a SubqueryScan.
+Each member's `'store' || s_store_id` target list is then applied to that
+projection-capable scan, which setrefs keeps because its tlist differs
+from the subplan's. goopg gave derived tables this wrapper (slice 24), but
+not inlined CTE references. Those rendered as their body unless a filter
+was attached.
+
+- `plannedCTE.needsScan` records PG's pull-up verdict for the body. It uses
+  the same `derivedSubqueryNeedsScan` test derived tables take, and treats
+  a simple UNION ALL as pulled up (`subqueryChainIsSimpleUnionAll`).
+- `wrapInlinedCTEScans` runs at Plan()'s tail, where the reference count
+  is final. It wraps each inlined reference that needs a scan in a
+  SubqueryScan labelled with the reference's alias. It copies only the
+  spine above a wrapped reference, and never enters a kept CTE's shared
+  body. A reference already under a SubqueryScan is not wrapped again: an
+  inner Plan() call can finish the subtree first, which printed the label
+  twice.
+- `stripTrivialSubqueryScans` then decides, with two refinements:
+  - A Project directly on the leaf that computes a target keeps the node,
+    because that is the level's final tlist folded into the scan
+    (`create_projection_plan`). A bare-column Project is left to the
+    consumption / physical-tlist test, since it is goopg's own narrowing
+    or a plain select list.
+  - A constant-true Filter is not a qual. It is the residue of a qual that
+    M0146-0007b moved into the body. Without this rule, Q78's ss/ws/cs
+    under merge joins kept three labels PG strips.
+
+Test: `TestExplainInlinedGroupedCTEKeepsSubqueryScan` covers three cases:
+a computed member keeps the node, an identity member strips it, and a
+moved qual under a join strips it. It fails on the base tree, and its
+third case fails without the constant-true rule.
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 20 → 21 (Q80 = PG). Q5's first
+divergence moves from depth 4 to 6 (SF0.25) and 9 (SF1), SF1 Q80 from 4 to
+12, and Q39 from 2 to 4 at both scales. Scan-type falls 43 → 42 at SF0.25
+and 49 → 46 at SF1, and rendering falls 22 → 20 and 19 → 18. TPC-H is
+identical. Evidence: `analysis/m0146/m0146-0005/slice48/`.
+
+Ledgered:
+
+- A UNION ALL member without FROM prints `Values (1 rows)`, where PG
+  prints `Subquery Scan on "*SELECT* n" → Result`, or a bare `Result`.
+- Q5 has 3 wrappers against PG's 4, and Q77 has 0 against 1.
+- Q23, Q47 and Q57 keep one wrapper PG strips.
+- Sublink-held plans are not visited by the wrap pass.

@@ -207,7 +207,10 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// leaf's consumption is non-trivial. Runs after the boundary assert on
 	// purpose: the assert verifies the as-planned coordinate map, and this
 	// pass removes labelling nodes only.
-	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees)
+	// M0146-0005av: an inlined CTE reference PG could not pull up is a
+	// subquery RTE there too; wrap it before the strip decides.
+	node, wrappedCTE := wrapInlinedCTEScans(node)
+	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
 	return node, nil
 }
 

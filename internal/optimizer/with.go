@@ -43,6 +43,11 @@ type plannedCTE struct {
 	// (side effects run once, rows replayed) and recursive bodies
 	// (WorkTableScan protocol) never qualify.
 	inlineEligible bool
+	// needsScan: once inlined, is the body a subquery PG's pull-up
+	// refuses (is_simple_subquery false and not a simple UNION ALL)? Such
+	// a reference stays an RTE_SUBQUERY and plans as a SubqueryScan
+	// (wrapInlinedCTEScans), which setrefs keeps unless trivial.
+	needsScan bool
 	// materialized is the declaration's MATERIALIZED / NOT MATERIALIZED
 	// keyword ("" when absent), volatile whether the planned body calls a
 	// volatile function, and selectOwned whether the WITH belongs to a
@@ -332,8 +337,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 			// a single-reference qual may descend into. The WITH RECURSIVE
 			// branch above and the DML branch never set this.
 			inlineEligible: true,
-			materialized:   cte.Materialized,
-			volatile:       planHasVolatileExpr(body, cat),
+			needsScan: !subqueryChainIsSimpleUnionAll(cte.Query) &&
+				derivedSubqueryNeedsScan(cte.Query, body),
+			materialized: cte.Materialized,
+			volatile:     planHasVolatileExpr(body, cat),
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}

@@ -71,3 +71,33 @@ func TestExplainInlinedCTEPricesItsBody(t *testing.T) {
 		t.Errorf("Append total %.2f < its inlined aggregate branch %.2f:\n%s", appendTotal, aggTotal, joined)
 	}
 }
+
+// TestExplainInlinedGroupedCTEKeepsSubqueryScan pins M0146-0005av against
+// PG 18.3: inline_cte makes a single-reference CTE an ordinary subquery, and
+// a grouped body is one pull_up_subqueries refuses, so the reference is a
+// SubqueryScan. setrefs keeps it when the member's target list computes
+// anything (TPC-DS Q5's `'store' || s_store_id`), and deletes it when the
+// member reads the columns as they are.
+func TestExplainInlinedGroupedCTEKeepsSubqueryScan(t *testing.T) {
+	kept := cteExplainLines(t,
+		`WITH s AS (SELECT a, count(*) AS c FROM t GROUP BY a)
+		 SELECT 'x' AS ch, a + 1 AS id, c FROM s UNION ALL SELECT 'y', 1, 1`)
+	if got := countLinesContaining(kept, "Subquery Scan on s"); got != 1 {
+		t.Errorf("computed member target list: want 1 `Subquery Scan on s`, got %d:\n%s", got, strings.Join(kept, "\n"))
+	}
+	stripped := cteExplainLines(t,
+		`WITH s AS (SELECT a, count(*) AS c FROM t GROUP BY a)
+		 SELECT a, c FROM s UNION ALL SELECT 1, 1`)
+	if got := countLinesContaining(stripped, "Subquery Scan on s"); got != 0 {
+		t.Errorf("identity member target list: want the scan stripped, got %d:\n%s", got, strings.Join(stripped, "\n"))
+	}
+	// A qual moved into the body (M0146-0007b) leaves a constant-true
+	// Filter on the reference; that is no scan qual, and under a join the
+	// physical tlist makes the scan trivial (TPC-DS Q78's ss/ws/cs).
+	joined := cteExplainLines(t,
+		`WITH s AS (SELECT a, count(*) AS c FROM t GROUP BY a)
+		 SELECT s.c, t.b FROM s JOIN t ON s.a = t.a WHERE s.a = 1`)
+	if got := countLinesContaining(joined, "Subquery Scan on s"); got != 0 {
+		t.Errorf("moved qual under a join: want the scan stripped, got %d:\n%s", got, strings.Join(joined, "\n"))
+	}
+}

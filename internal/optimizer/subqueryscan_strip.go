@@ -43,9 +43,10 @@ import (
 // stripTrivialSubqueryScans unwraps every trivial SubqueryScan in the
 // finished plan. derived is the per-statement registry of FROM-subquery
 // leaf subtree roots (rtableScope.derivedSubtrees); an empty registry
-// leaves the plan untouched.
-func stripTrivialSubqueryScans(root Node, derived []Node) Node {
-	if root == nil || len(derived) == 0 {
+// leaves the plan untouched unless force (a wrapped inlined CTE reference,
+// wrapInlinedCTEScans) says a wrapper exists anyway.
+func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
+	if root == nil || (len(derived) == 0 && !force) {
 		return root
 	}
 	isDerived := make(map[Node]bool, len(derived))
@@ -171,7 +172,22 @@ func stripTrivialSubqueryScans(root Node, derived []Node) Node {
 		if !identity && !(l.physical && len(l.scan.Output()) == len(l.scan.Child.Output())) {
 			continue
 		}
-		if _, isFilter := l.parent.(*Filter); isFilter {
+		// A constant-true Filter is no qual: it is what the CTE qual push
+		// leaves behind when it MOVES a conjunct into an inlined body
+		// (M0146-0007b), and EXPLAIN prints nothing for it.
+		if f, isFilter := l.parent.(*Filter); isFilter && !filterIsConstTrue(f) {
+			continue
+		}
+		// M0146-0005av: a Project directly on the leaf that COMPUTES a
+		// target is its query level's final target list, which PG
+		// applies to the projection-capable SubqueryScan itself
+		// (create_projection_plan folds it into the scan's tlist). A
+		// constant or `'store' || s_store_id` makes that tlist differ
+		// from the subplan's, and setrefs keeps the node however the
+		// column references happen to be consumed. A Project of bare
+		// columns — goopg's own narrowing, or a plain select list — is
+		// left to the consumption / physical-tlist test above.
+		if pr, isProject := l.parent.(*Project); isProject && projectComputes(pr) {
 			continue
 		}
 		trivial[l.scan] = true
@@ -395,4 +411,100 @@ func mapPlanChildren(n Node, fn func(Node) Node) Node {
 		return n
 	}
 	return out
+}
+
+// wrapInlinedCTEScans gives every inlined CTE reference PG could not pull up
+// the SubqueryScan PG plans for it. inline_cte (subselect.c) turns a
+// single-reference CTE into an ordinary RTE_SUBQUERY before
+// pull_up_subqueries runs, so a grouped or otherwise non-simple body stays a
+// subquery and set_subquery_pathlist gives it a SubqueryScan, exactly like a
+// FROM-clause derived table (planSubqueryRangeVar's wrapper, M0146-0005w).
+// stripTrivialSubqueryScans then deletes the trivial ones as setrefs does;
+// what survives is `Subquery Scan on <alias>` over the body — TPC-DS Q5's
+// `'store' || s_store_id` members over the ssr/csr/wsr CTEs.
+//
+// It runs at Plan()'s tail because the inline decision (plannedCTE.refs) is
+// final only there. Only the spine above a wrapped reference is copied; a
+// statement without one keeps its plan untouched. A kept CTE's shared body
+// is never entered. Reports whether it wrapped anything.
+func wrapInlinedCTEScans(root Node) (Node, bool) {
+	var rebuild func(n Node) (Node, bool)
+	rebuild = func(n Node) (Node, bool) {
+		if n == nil {
+			return nil, false
+		}
+		if cs, ok := n.(*CTEScan); ok {
+			if !cs.Inlined() || cs.Child == nil {
+				return n, false
+			}
+			body, changed := rebuild(cs.Child)
+			if changed {
+				cc := *cs
+				cc.Child = body
+				cs = &cc
+			}
+			if !cs.cte.needsScan {
+				return cs, changed
+			}
+			alias := cs.Alias
+			if alias == "" {
+				alias = cs.Name
+			}
+			return &SubqueryScan{pos: cs.pos, Alias: alias, Child: cs, schema: cs.Output(), src: cs.SourceIdx}, true
+		}
+		if sq, ok := n.(*SubqueryScan); ok {
+			// Already wrapped — by a derived-table leaf, or by an inner
+			// Plan() call that finished this subtree first. Wrapping the
+			// reference again would print the label twice; only its body
+			// is still eligible.
+			if cs, ok := sq.Child.(*CTEScan); ok && cs.Inlined() && cs.Child != nil {
+				body, changed := rebuild(cs.Child)
+				if !changed {
+					return n, false
+				}
+				cc := *cs
+				cc.Child = body
+				sc := *sq
+				sc.Child = &cc
+				return &sc, true
+			}
+		}
+		kids, _ := planChildNodes(n)
+		var repl map[Node]Node
+		for _, k := range kids {
+			if nk, changed := rebuild(k); changed {
+				if repl == nil {
+					repl = map[Node]Node{}
+				}
+				repl[k] = nk
+			}
+		}
+		if repl == nil {
+			return n, false
+		}
+		return mapPlanChildren(n, func(c Node) Node {
+			if r, ok := repl[c]; ok {
+				return r
+			}
+			return c
+		}), true
+	}
+	return rebuild(root)
+}
+
+// projectComputes reports whether any of pr's targets is something other
+// than a bare column reference.
+func projectComputes(pr *Project) bool {
+	for _, t := range pr.Targets {
+		if _, ok := t.(*ColumnRef); !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// filterIsConstTrue reports whether f's predicate is the literal TRUE.
+func filterIsConstTrue(f *Filter) bool {
+	b, ok := f.Predicate.(*BooleanConst)
+	return ok && b.Value
 }

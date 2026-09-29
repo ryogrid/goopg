@@ -23166,6 +23166,25 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q33 Q56 Q60, none introduced\), TPC\-H census identical, regress
     runner 12 cases \(no semantic delta\)\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 19 -> 20 (Q56); CATEGORIES-EXCL-MATCH SF0.25 join-order 64 -> 63, join-method 40 -> 38, aggregation-strategy 25 -> 23, qual-placement 9 -> 11 (Q33/Q60 aligned deeper); SF1 aggregation-strategy 28 -> 26, scan-type 50 -> 49
+- [x] **M0146\-0005av — an inlined CTE reference PG cannot pull up is a
+  SubqueryScan** \(slice 48, impl, done 2026\-09\-29 from the census record
+  `PG Subquery Scan on ssr \| goopg GroupAggregate` on TPC\-DS Q5/Q80\)\.
+  Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 48"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `wrapInlinedCTEScans` \(Plan\(\) tail\) wraps inlined references whose
+    body pull\-up refuses \(`plannedCTE.needsScan`\); the strip keeps a
+    wrapper under a computing Project and ignores a constant\-true
+    \(moved\-qual\) Filter\.
+  - Found while bisecting: port 5534 is a scratch PG 18\.3
+    \(`tmp/pg\-probe\-data`, started 2026\-09\-27\), not a goopg server —
+    a writable oracle for toy tables; left as found\.
+  - Test `TestExplainInlinedGroupedCTEKeepsSubqueryScan` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q5 Q39 Q47 Q54 Q57 Q80, none introduced\), TPC\-H census identical,
+    regress runner 11 cases \(no semantic delta\)\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 20 -> 21 (Q80); CATEGORIES-EXCL-MATCH SF0.25 scan-type 43 -> 42, rendering 22 -> 20, join-order 63 -> 62; SF1 scan-type 49 -> 46, join-method 40 -> 38, rendering 19 -> 18
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

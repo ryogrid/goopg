@@ -1,0 +1,26 @@
+# M0146-0005av census (tmp/fireset-0005av)
+sf025 baseline match=20 CATEGORIES-EXCL-MATCH: join-order=63 join-method=38 scan-type=43 parameterisation=33 aggregation-strategy=23 sort-strategy=45 parallelism=43 qual-placement=11 rendering=22
+sf025 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=62 join-method=37 scan-type=42 parameterisation=33 aggregation-strategy=24 sort-strategy=44 parallelism=42 qual-placement=12 rendering=20
+< Q5 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+> Q5 depth=6 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+< Q39 depth=2 [scan-type] under CTE: PG Subquery Scan on foo | goopg HashAggregate
+> Q39 depth=4 [parallelism] under HashAggregate: PG Hash Join Inner | goopg Gather
+< Q80 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+> Q80 MATCH (no structural divergence)
+sf1 baseline match=19 CATEGORIES-EXCL-MATCH: join-order=63 join-method=40 scan-type=49 parameterisation=40 aggregation-strategy=26 sort-strategy=48 parallelism=53 qual-placement=12 rendering=19
+sf1 candidate match=19 CATEGORIES-EXCL-MATCH: join-order=63 join-method=38 scan-type=46 parameterisation=40 aggregation-strategy=26 sort-strategy=47 parallelism=52 qual-placement=13 rendering=18
+< Q5 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg Finalize GroupAggregate
+> Q5 depth=9 [qual-placement] under Nested Loop: PG Index Scan catalog_page_pkey on catalog_page | goopg Index Scan catalog_page_pkey on catalog_page
+< Q39 depth=2 [scan-type] under CTE: PG Subquery Scan on foo | goopg HashAggregate
+> Q39 depth=4 [parallelism] under HashAggregate: PG Hash Join Inner | goopg Gather
+< Q80 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg Finalize GroupAggregate
+> Q80 depth=12 [parallelism] under Nested Loop: PG Parallel Hash Join Inner | goopg Hash Join Inner
+
+FIRE-SET-TIMEOUTS: fires=Q5 Q39 Q47 Q54 Q57 Q80 introduced=none unchanged=none missing=none
+sweep: === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+TPC-H census: DIVERGENCE-CLASSES: queries=22 match=10 divergent=12 D1-sublink=1 D2-unionall=0 D3-partialpath=6 D4-upperrel=0 D5-narrowing=0 D6-cte=0 jointree-search=5 verdict=0 (class file identical to 0005au)
+acceptance 24 MATCH; spotcheck PASS
+regress (with subselect union join aggregates inherit select_distinct limit groupingsets rowsecurity window) vs HEAD worktree: no semantic delta (join.sql known no-ORDER-BY row order; rowsecurity prints Go pointer addresses in a pre-existing mis-deparse)
+
+Subquery Scan counts, SF0.25 EXPLAIN (costs off), candidate vs PG (HEAD in parens), CTE-bearing queries that still differ:
+Q5 3 vs 4 (0); Q23 1 vs 0 (2); Q47 1 vs 0 (1); Q57 1 vs 0 (1); Q77 0 vs 1 (0); Q78 0 vs 0 after the const-true Filter rule (3 without it)
