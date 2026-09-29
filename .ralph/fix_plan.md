@@ -23104,6 +23104,25 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q10 Q35 at both scales, none introduced\), regress runner 13 cases
     \(limit\.sql = known M0146\-0034 only\)\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH parameterisation 3 -> 2, aggregation-strategy 2 -> 1, sort-strategy 2 -> 1, parallelism 5 -> 4 (Q17); TPC-DS Q10/Q35 plans change, counts unchanged
+- [x] **M0146\-0005as — a join residual\'s columns deparse through the child
+  that produced them** \(slice 45, impl, done 2026\-09\-29 from the TPC\-DS
+  census, Q46/Q68\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md` § "Slice 45"\.
+  Kind: impl
+  Parent: M0146-0005
+  - PG\'s `resolve\_special\_varno` follows a join Var into the child plan\'s
+    target list; goopg printed subquery aliases \(`bought\_city`\) and, under
+    cross\-level binding\-id collisions, the wrong relation\.
+  - `explainNames.joinResidualColumn` \(positional walk incl\. aggregate group
+    keys; stops at set operations\) is tried first while
+    `subPlanReg.joinRow` is set\.
+  - Test `TestJoinFilterResolvesSubqueryColumnToSource`\.
+  - Also recon: M0146\-0012a\'s single\-relation case \(TPC\-DS Q30/Q81\) —
+    see the note under M0146\-0012a\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q46 Q68, none introduced\), TPC\-H plans identical, regress runner 6
+    cases \(join\.sql join filters corrected\)\.
+  Movement: yes — TPC-DS SF1 PLAN-PARITY match 18 -> 19 (Q46), CATEGORIES-EXCL-MATCH qual-placement SF0.25 14 -> 12, SF1 15 -> 13, SF1 rendering 18 -> 17
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
@@ -23599,6 +23618,15 @@ M0146-0001 re-baseline census on the new default arm.
     and the semi/anti nested\-loop arm\), and PG\'s inner\-unique
     `outer\_match\_frac = joinrel.rows / \(outer.rows × inner.rows\)`.
   - Witness: TPC\-H Q17 \(first divergence `join\-method` at depth 1\).
+  - 2026\-09\-29 \(recon during M0146\-0005as\): TPC\-DS Q30/Q81 are the
+    single\-relation case — PG files `ctr\_total\_return > \(SubPlan\)` on the
+    `ctr1` CTE scan\. The sublink reaches `partitionConjunctsForJoinPlanning`
+    un\-lowered \(Args 0, plan OuterColumnRefs\); `keptRebase` with `pb == nil`
+    can pre\-lower it \(hop\-0 refs are the statement scope\), after which
+    `localizeExprToLeaf` rebases its Args\. Blocker: a sunk qual is invisible
+    to the post\-planning unnest pass, and keeping scalar subqueries as
+    SubPlans without M0146\-0012\'s parameterized index probes regressed
+    TPC\-H Q2 1\.5 s → 307 s \(M0145\-0008y\)\.
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort
