@@ -8,6 +8,7 @@ package optimizer
 // gate (producer never fires there), and the C-10c Sort arm one node up.
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -216,7 +217,7 @@ func TestCreateDistinctPathsNilSpec(t *testing.T) {
 
 // TestDistinctCostSharedInput pins the pricing shape: hashed vs unique
 // differ only in input price (seed vs Sort) — the dedup terms are shared,
-// pinned as numbers (unique == distinctCost over its Sort input exactly),
+// pinned as numbers (unique == uniquePathCost over its Sort input exactly),
 // and unique prices strictly above hashed (the Sort costs something).
 func TestDistinctCostSharedInput(t *testing.T) {
 	cp := defaultCostParams()
@@ -242,9 +243,9 @@ func TestDistinctCostSharedInput(t *testing.T) {
 		t.Fatalf("unique has %d children, want the 1 Sort input", len(unique.Children))
 	}
 	sortIn := unique.Children[0]
-	want := distinctCost(sortIn.Cost.Startup, sortIn.Cost.Total, 1000, rel.Rows, cp)
+	want := uniquePathCost(sortIn.Cost.Startup, sortIn.Cost.Total, 1000, len(unique.Pathkeys), cp)
 	if unique.Cost != want {
-		t.Fatalf("unique %+v != distinctCost over its Sort input %+v", unique.Cost, want)
+		t.Fatalf("unique %+v != uniquePathCost over its Sort input %+v", unique.Cost, want)
 	}
 	for _, p := range rel.Pathlist {
 		if p.Unique {
@@ -590,5 +591,17 @@ func TestPartialDistinctWalkAgreement(t *testing.T) {
 	}
 	if drivingScanCrossesSort(&DistinctOn{Child: &Sort{Child: scan}}) {
 		t.Fatal("drivingScanCrossesSort descended through an unmarked dedup")
+	}
+}
+
+// TestUniquePathCostIsCreateUpperUniquePath pins M0146-0005bi against PG
+// 18.3's create_upper_unique_path on TPC-DS Q87's leader Unique: the input's
+// startup unchanged, and 0.0025 per compared column per input row on top of
+// its total (`Gather Merge (cost=19352.41..19738.09 rows=3260)` ->
+// `Unique (cost=19352.41..19762.54)` over three columns).
+func TestUniquePathCostIsCreateUpperUniquePath(t *testing.T) {
+	got := uniquePathCost(19352.41, 19738.09, 3260, 3, defaultCostParams())
+	if got.Startup != 19352.41 || math.Abs(got.Total-19762.54) > 0.005 {
+		t.Fatalf("Unique cost %+v, want PG's 19352.41..19762.54", got)
 	}
 }

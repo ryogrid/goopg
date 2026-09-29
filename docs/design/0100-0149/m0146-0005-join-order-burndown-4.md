@@ -272,3 +272,42 @@ Ledgered:
 - Why PG keeps the split arm for Q38/Q87's catalog\_sales and web\_sales
   branches at SF0.25 is not yet explained; the two arms tie within
   add\_path's fuzz there.
+
+## Slice 61: M0146-0005bi — a Unique is priced by create_upper_unique_path
+
+Slice 60's ledger item. goopg priced every Unique with `distinctCost`: one
+comparison per input row in both startup and total, plus `cpu_tuple_cost`
+per output row. PG's `create_upper_unique_path` keeps the input's startup
+(a Unique emits its first row as soon as the input does) and adds
+`cpu_operator_cost × rows × numCols` to the total. TPC-DS Q87's leader
+Unique in PG 18.3 checks out: `19738.09 + 0.0025 × 3260 × 3 = 19762.54`.
+
+- `uniquePathCost` replaces `distinctCost` at all six Unique sites: the
+  serial sorted DISTINCT, the per-worker Unique, the three leader Uniques
+  over a Gather Merge, and UNION's Unique over a Merge Append. `numCols` is
+  the sort-key count.
+
+Tests: `TestUniquePathCostIsCreateUpperUniquePath` pins PG's Q87 figure.
+`TestDistinctOrderByExpressionKeepsOuterSort`'s vacuity guard now also
+recognises the sort-based Unique that can win the election; its assertion
+already accepted either form.
+
+Movement:
+
+- No TPC-DS category change. Q87's Unique costs now follow PG's formula
+  (branch 1: 19716.69 → 19742.10 over its Gather Merge; PG 19738.09 →
+  19762.54).
+- The fire set (Q6/Q38/Q41/Q49/Q54/Q87) executes at both scales, and
+  TPC-H plans are byte-identical.
+- Regress runner: union.sql moves toward PG (382 → 376 diff lines). In
+  join.sql, the `select distinct id from j3` inner now plans PG's
+  `Unique -> Sort` instead of HashAggregate, alongside known
+  row-order/position shuffles.
+
+Evidence: `analysis/m0146/m0146-0005/slice61/`.
+
+Still ledgered (slice 60): why PG keeps the per-worker Unique on SF0.25
+Q38/Q87's catalog\_sales and web\_sales branches. Under PG's Unique formula,
+the split arm costs the per-worker comparisons more than the unsplit one,
+and PG adds the unsplit arm first. So PG's choice points at an input-path
+difference, not at pricing.

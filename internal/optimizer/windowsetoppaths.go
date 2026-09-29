@@ -584,7 +584,7 @@ func addUnionMergeAppendPath(rel *RelOptInfo, seed *Path, distinctNode *Distinct
 		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
 		Rel: rel, Rows: rel.Rows,
 		DisabledNodes: disabled,
-		Cost:          distinctCost(merge.Cost.Startup, merge.Cost.Total, seed.Rows, rel.Rows, cp),
+		Cost:          uniquePathCost(merge.Cost.Startup, merge.Cost.Total, seed.Rows, len(keys), cp),
 		Pathkeys:      pathkeys, Children: []*Path{merge},
 	}, setOpMergeAppendProducer)
 }

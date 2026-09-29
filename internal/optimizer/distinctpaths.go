@@ -229,17 +229,14 @@ func distinctAllKeyCols(child Node) []int {
 	return cols
 }
 
-// distinctCost prices the dedup work both DISTINCT forms share: PG's Unique
-// price (`cpu_operator` per input row for the adjacent comparison +
-// `cpu_tuple` per output row) on top of the input. The hashed form pays the
-// same terms — the executor hash-dedups per row either way — so hashed vs
-// unique differ only in their INPUT price (seed vs Sort), never here.
-// Startup carries the input's startup plus the per-row compare (the Sort
-// blocks anyway, so streaming buys nothing here — stated, not modeled).
-func distinctCost(inputStartup, inputTotal, inputRows, outputRows float64, cp costParams) Cost {
-	startup := inputStartup + cp.cpuOperatorCost*inputRows
-	total := inputTotal + cp.cpuOperatorCost*inputRows + cp.cpuTupleCost*outputRows
-	return Cost{Startup: startup, Total: total}
+// uniquePathCost is create_upper_unique_path's price (pathnode.c): a Unique
+// adds nothing before its first row, so its startup is its input's, and it
+// compares `numCols` columns of every input row, adding
+// `cpu_operator_cost × rows × numCols` to the total. No cpu_tuple_cost is
+// charged for its output (M0146-0005bi). TPC-DS Q87's leader Unique in PG
+// 18.3: 19738.09 + 0.0025 × 3260 × 3 = 19762.54.
+func uniquePathCost(inputStartup, inputTotal, inputRows float64, numCols int, cp costParams) Cost {
+	return Cost{Startup: inputStartup, Total: inputTotal + cp.cpuOperatorCost*inputRows*float64(numCols)}
 }
 
 // addDistinctPaths is the per-input body of `create_final_distinct_paths`
@@ -308,7 +305,7 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 	if len(keys) > 0 {
 		sortInput = sortPathForBounded(seed, pathkeysForSortKeys(keys), cp, -1)
 	}
-	uniqueCost := distinctCost(sortInput.Cost.Startup, sortInput.Cost.Total, inputRows, numDistinct, cp)
+	uniqueCost := uniquePathCost(sortInput.Cost.Startup, sortInput.Cost.Total, inputRows, len(keys), cp)
 	unique = &Path{
 		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
 		Rel: distinctRel, Rows: numDistinct,
@@ -484,7 +481,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	partialPath := &Path{
 		Kind: PathDistinct, Unique: true, Distinct: &partialSpec,
 		Rel: partialRel, Rows: partialGroups,
-		Cost:            distinctCost(workerSort.Cost.Startup, workerSort.Cost.Total, perWorkerRows, partialGroups, cp),
+		Cost:            uniquePathCost(workerSort.Cost.Startup, workerSort.Cost.Total, perWorkerRows, len(mergeKeys), cp),
 		DisabledNodes:   workerSort.DisabledNodes,
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
@@ -516,7 +513,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
 		Rel: distinctRel, Rows: finalRows,
 		DisabledNodes: gmPath.DisabledNodes,
-		Cost:          distinctCost(gmCost.Startup, gmCost.Total, crossed, finalRows, cp),
+		Cost:          uniquePathCost(gmCost.Startup, gmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      gmPath.Pathkeys,
 		Children:      []*Path{gmPath},
 	}
@@ -563,7 +560,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
 		Rel: distinctRel, Rows: finalRows,
 		DisabledNodes: hgmPath.DisabledNodes,
-		Cost:          distinctCost(hgmCost.Startup, hgmCost.Total, crossed, finalRows, cp),
+		Cost:          uniquePathCost(hgmCost.Startup, hgmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      hgmPath.Pathkeys,
 		Children:      []*Path{hgmPath},
 	}, distinctPartialUniqueProducer)
@@ -590,7 +587,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
 		Rel: distinctRel, Rows: finalRows,
 		DisabledNodes: sgmPath.DisabledNodes,
-		Cost:          distinctCost(sgmCost.Startup, sgmCost.Total, sortedCrossed, finalRows, cp),
+		Cost:          uniquePathCost(sgmCost.Startup, sgmCost.Total, sortedCrossed, len(mergeKeys), cp),
 		Pathkeys:      sgmPath.Pathkeys,
 		Children:      []*Path{sgmPath},
 	}, distinctPartialUniqueProducer)

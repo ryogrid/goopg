@@ -23400,6 +23400,18 @@ M0146-0001 re-baseline census on the new default arm.
     \(numCols\); PG\'s split\-arm choice on SF0\.25 Q38/Q87 branches 2/3
     unexplained\.
   Movement: yes — PLAN-PARITY SF1 match 22 -> 23 (Q87 = PG); CATEGORIES-EXCL-MATCH SF1 join-order 62 -> 61, join-method 30 -> 29, sort-strategy 42 -> 41
+- [x] **M0146\-0005bi — a Unique is priced by create\_upper\_unique\_path**
+  \(slice 61, impl, done 2026\-09\-30 from slice 60\'s ledger row\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+  § "Slice 61"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `uniquePathCost` replaces `distinctCost` at all six Unique sites\.
+  - Test `TestUniquePathCostIsCreateUpperUniquePath`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(6 queries both scales\), TPC\-H census byte\-identical, regress runner
+    7 cases \(union 382 \-> 376; join\.sql j3 inner = PG Unique\)\.
+  Movement: none — TPC-DS categories unchanged (Unique costs now PG's); regress union.sql 382 -> 376 diff lines
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
