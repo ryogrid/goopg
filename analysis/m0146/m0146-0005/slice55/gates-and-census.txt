@@ -1,0 +1,13 @@
+# M0146-0005bc census (tmp/fireset-0005bc)
+sf025 baseline match=25 CATEGORIES-EXCL-MATCH: join-order=58 join-method=34 scan-type=39 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=37 qual-placement=14 rendering=20
+sf025 candidate match=25 CATEGORIES-EXCL-MATCH: join-order=57 join-method=34 scan-type=39 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=37 qual-placement=14 rendering=19
+< Q51 depth=4 [join-order] under Sort: PG Merge Join Full | goopg Merge Join Full
+> Q51 depth=10 [qual-placement] under Hash Join: PG Parallel Seq Scan on web_sales | goopg Parallel Seq Scan on web_sales
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=32 scan-type=44 parameterisation=40 aggregation-strategy=24 sort-strategy=42 parallelism=49 qual-placement=11 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=63 join-method=32 scan-type=44 parameterisation=40 aggregation-strategy=24 sort-strategy=42 parallelism=49 qual-placement=11 rendering=18
+< Q51 depth=4 [join-order] under Sort: PG Merge Join Full | goopg Merge Join Full
+> Q51 depth=10 [qual-placement] under Hash Join: PG Parallel Seq Scan on web_sales | goopg Parallel Seq Scan on web_sales
+FIRE-SET-TIMEOUTS: fires=Q51 introduced=none unchanged=none missing=none
+Q51 Merge Cond now: (web_sales.ws_item_sk = store_sales.ss_item_sk) AND (date_dim.d_date = date_dim_1.d_date) = PG
+Q51 next record (depth 10): goopg keeps Filter (ws_item_sk IS NOT NULL) on a NOT NULL column; PG 17+ drops it
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; TPC-H census class-identical; regress (window with subselect join union aggregates): join.sql lateral row-order flap only

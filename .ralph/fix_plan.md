@@ -23291,6 +23291,32 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q5 Q38 Q59 Q75 Q76 Q87, none introduced\), TPC\-H census identical,
     regress runner 8 cases \(join\.sql Gather row\-order flap only\)\.
   Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 24 -> 25 (Q75); CATEGORIES-EXCL-MATCH SF0.25 join-order 59 -> 58, join-method 35 -> 34, rendering 21 -> 20, parallelism 36 -> 37; SF1 join-method 34 -> 32, join-order 65 -> 64, aggregation-strategy 25 -> 24, parallelism 48 -> 49
+- [x] **M0146\-0005bc — a CTE column chase steps through a WindowAgg**
+  \(slice 55, impl, done 2026\-09\-29 from Q51\'s depth\-4 join\-order record,
+  which was Merge Cond text\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 55"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `resolveKeySource` gains a WindowAgg arm \(input columns pass through
+    at the same positions; window results decline\)\.
+  - Test `TestExplainInlinedCTEKeyChasesThroughWindow` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q51\), TPC\-H census identical, regress runner 6 cases \(join\.sql
+    row\-order flap only\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 58 -> 57, rendering 20 -> 19; SF1 join-order 64 -> 63, rendering 19 -> 18 (Q51 first divergence depth 4 -> 10)
+- [ ] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
+  planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
+  depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
+  web\_sales scan, PG prints none\)\. PG 17\+ reduces a NullTest on a Var
+  whose column is declared NOT NULL to constant TRUE
+  \(`restriction_is_always_true` / `expr_is_nonnullable`, initsplan\.c;
+  and to FALSE for IS NULL\), so the qual never reaches the scan\.
+  Kind: impl
+  Parent: M0146-0005
+  - First step: find where goopg distributes base restrictions and add the
+    reduction for a bare column of a table whose `catalog.Column` is NOT
+    NULL \(not through an outer join\'s nullable side\)\.
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

@@ -756,3 +756,30 @@ tables are not implemented (goopg reads no `stainherit` rows), so those
 variables keep the relation-less default. The variable key is the
 consumer-side index, so two references to one source column are not
 de-duplicated as PG's `add_unique_group_var` would.
+
+## Slice 55: M0146-0005bc — a CTE column chase steps through a WindowAgg
+
+TPC-DS Q51's first divergence (depth 4, join-order) turned out to be text.
+goopg printed `Merge Cond: ((web.item_sk = store.item_sk) AND …)` where
+PG prints `(web_sales.ws_item_sk = store_sales.ss_item_sk) AND
+(date_dim.d_date = date_dim_1.d_date)`. PG deparses a Var of the removed
+subquery scan through the subplan's target list. goopg's
+`formatThroughInlinedCTE` chase (`resolveKeySource`) stepped through Sort,
+Gather, SubqueryScan, Filter, Project and Aggregate, but not through a
+WindowAgg, and the web_v1/store_v1 bodies are
+`WindowAgg → GroupAggregate`. A WindowAgg publishes its input's columns
+at the same positions and appends the window results after them. The new
+arm steps through for an input column and declines for a window result.
+
+Test: `TestExplainInlinedCTEKeyChasesThroughWindow` (fails on base with
+`u.b = x.a`).
+
+Movement: Q51's first divergence moves from depth 4 to 10 at both
+scales, with join-order and rendering each −1. Its Merge Cond and window
+Sort Keys now read as PG's. TPC-H is identical.
+
+Q51's next record is a planner behaviour: goopg keeps `Filter:
+(ws_item_sk IS NOT NULL)` on a NOT NULL column. PG 17+ drops an IS NOT
+NULL test on a column declared NOT NULL (`restriction_is_always_true`,
+initsplan.c). This is filed as M0146-0038. Evidence:
+`analysis/m0146/m0146-0005/slice55/`.

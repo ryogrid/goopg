@@ -158,3 +158,19 @@ func TestExplainKeptCTEScanCostsTwoTuplesPerRow(t *testing.T) {
 	}
 	t.Fatalf("no `CTE Scan on v x` line:\n%s", strings.Join(lines, "\n"))
 }
+
+// TestExplainInlinedCTEKeyChasesThroughWindow pins M0146-0005bc: PG deparses
+// a Var of a removed subquery scan through the subplan's target list, and a
+// WindowAgg passes its input columns through unchanged, so a join key read
+// from an inlined CTE whose body is `window over grouped aggregate` prints as
+// the grouped base column (TPC-DS Q51: `web_sales.ws_item_sk =
+// store_sales.ss_item_sk`, not `web.item_sk = store.item_sk`).
+func TestExplainInlinedCTEKeyChasesThroughWindow(t *testing.T) {
+	lines := cteExplainLines(t,
+		`WITH w AS (SELECT a, sum(sum(b)) OVER (PARTITION BY a) AS s FROM t GROUP BY a)
+		 SELECT * FROM w x JOIN t u ON x.a = u.b`)
+	joined := strings.Join(lines, "\n")
+	if countLinesContaining(lines, "x.a") != 0 {
+		t.Errorf("the join key must chase through the window to its source column, not print the CTE alias:\n%s", joined)
+	}
+}

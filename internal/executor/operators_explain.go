@@ -969,6 +969,19 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				return nil, false
 			}
 			return tc, true
+		case *optimizer.WindowAgg:
+			// M0146-0005bc: a WindowAgg publishes its input's columns at
+			// the same positions and appends the window results after
+			// them (TPC-DS Q51's web_v1 / store_v1 bodies: the join keys
+			// item_sk and d_date are the GroupAggregate's group keys under
+			// the window). An input column steps through; a window result
+			// has no source column to print.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || n.Child == nil || col.Index < 0 || col.Index >= len(n.Child.Output()) {
+				return nil, false
+			}
+			node = n.Child
+			continue
 		case *optimizer.Aggregate:
 			if n.GroupingSets != nil {
 				return nil, false
