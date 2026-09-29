@@ -470,12 +470,20 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 func childDeliversSortKeys(child Node, keys []SortKey) bool {
 	switch c := child.(type) {
 	case *Sort:
-		return sortKeysEqual(c.Keys, keys)
+		if sortKeysEqual(c.Keys, keys) {
+			return true
+		}
 	case *WindowAgg:
 		// Only if the lower window is itself known-ordered on those keys.
-		return c.Presorted && sortKeysEqual(windowSortKeys(c), keys)
+		if c.Presorted && sortKeysEqual(windowSortKeys(c), keys) {
+			return true
+		}
 	}
-	return false
+	// M0146-0005ay: pathkeys_contained_in against whatever ordering the
+	// child is known to emit — a sorted GroupAggregate's group keys, a
+	// merge join's keys, an ordering carried through a Project — the test
+	// create_one_window_path applies, and the one addWindowPaths priced.
+	return pathkeysContainedIn(inputNodePathkeys(child), pathkeysForSortKeys(keys))
 }
 
 // sortKeysEqual compares two key lists by expression identity and direction.

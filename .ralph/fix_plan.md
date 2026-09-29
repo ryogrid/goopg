@@ -23221,6 +23221,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q21 Q51 Q64, none introduced\), TPC\-H census identical, regress
     runner 9 cases \(no semantic delta\); Q51 ordered output md5 = PG\.
   Movement: yes — TPC-DS PLAN-PARITY match SF0.25 22 -> 23, SF1 20 -> 21 (Q21); CATEGORIES-EXCL-MATCH SF0.25 join-order 62 -> 61, scan-type 41 -> 40, sort-strategy 44 -> 43, parallelism 42 -> 41, rendering 20 -> 21; SF1 join-order 63 -> 62, scan-type 45 -> 44, sort-strategy 47 -> 46, parallelism 52 -> 51, rendering 18 -> 19
+- [x] **M0146\-0005ay — a window reads an input that is already ordered**
+  \(slice 51, impl, done 2026\-09\-29 from Q51\'s next record — a Sort
+  between WindowAgg and its sorted GroupAggregate\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 51"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `childDeliversSortKeys` answers `pathkeys\_contained\_in` against
+    `inputNodePathkeys`; `addWindowPaths` tracks the chain\'s ordering and
+    passes `costWindow` the presorted count \(closes the S2b\-3b wiring
+    gap for the first level and chained levels\)\.
+  - Test `TestExplainWindowOverSortedGroupsSkipsSort` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q47 Q51 Q53 Q57 Q63, none introduced\), TPC\-H census identical,
+    regress runner 8 cases \(window\.sql loses 3 Sorts PG never had\)\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 23 -> 24 (Q53); CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 43 -> 39, parallelism 41 -> 36, join-method 37 -> 33, join-order 61 -> 59, qual-placement 12 -> 13; SF1 sort-strategy 46 -> 42, parallelism 51 -> 48, join-method 38 -> 36, join-order 62 -> 64, qual-placement 13 -> 12
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

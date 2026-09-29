@@ -588,3 +588,46 @@ LIMIT output is md5-identical to PG's.
 Movement: TPC-DS PLAN-PARITY match SF0.25 22 → 23 and SF1 20 → 21 (Q21 =
 PG at both scales). Q51's first divergence moves from depth 1 to 4. TPC-H
 is identical. Evidence: `analysis/m0146/m0146-0005/slice50/`.
+
+## Slice 51: M0146-0005ay — a window reads an input that is already ordered (create_one_window_path)
+
+After slice 50, TPC-DS Q51's first divergence was in its CTE bodies:
+goopg sorted between the WindowAgg and the GroupAggregate below it. The
+GroupAggregate already emits rows ordered on `(ws_item_sk, d_date)`, which
+is the window's `PARTITION BY ws_item_sk ORDER BY d_date`.
+`create_one_window_path` stacks a Sort only when the input's pathkeys do
+not already contain the window's PARTITION BY ++ ORDER BY. goopg's
+`childDeliversSortKeys` only recognised a child that was itself a
+matching Sort or a presorted WindowAgg. `addWindowPaths` always priced a
+full sort, with `costWindow`'s presorted credit fixed at 0 (the S2b-3b
+wiring left open).
+
+- `childDeliversSortKeys` also answers `pathkeys_contained_in` against
+  `inputNodePathkeys(child)`. That covers a sorted aggregate's group keys,
+  a merge join's keys, a searched tree's stamp, and orderings carried
+  through Projects (slice 50).
+- `addWindowPaths` tracks the known ordering across the window chain. It
+  starts from the input's pathkeys, and a WindowAgg passes its input's
+  order through. A level whose required keys are contained pays no sort
+  (`presortedCount` = all keys). Otherwise the level is priced as the full
+  Sort that `createWindowPlan` builds, and its keys become the known
+  ordering. Price and plan now agree.
+
+Test: `TestExplainWindowOverSortedGroupsSkipsSort` pins PG 18.3's Sort
+counts (verified on the scratch PG): a window on the group keys needs 1
+sort, a window on another key needs 2. It fails on the base tree.
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 23 → 24 (Q53 = PG). Q47/Q57's
+CTE bodies now equal PG's. Their first-divergence record moves to the
+main query's pre-existing `Subquery Scan on v2`, whose plan text is
+identical to before. Q51's ordered output is still md5-identical to PG's.
+
+| Category (all depths) | SF0.25 | SF1 |
+|---|---|---|
+| sort-strategy | 43 → 39 | 46 → 42 |
+| parallelism | 41 → 36 | 51 → 48 |
+| join-method | 37 → 33 | 38 → 36 |
+
+In the regress runner, window.sql's three `COUNT(*) OVER (ORDER BY
+t1.unique1)` nested-loop plans drop a Sort PG never had. TPC-H is
+identical. Evidence: `analysis/m0146/m0146-0005/slice51/`.

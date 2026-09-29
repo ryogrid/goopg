@@ -294,11 +294,29 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 	below := seed
 	belowNode := input
 	var top *Path
+	// M0146-0005ay: create_one_window_path sorts a level's input only when
+	// the ordering already there does not contain the level's
+	// PARTITION BY ++ ORDER BY pathkeys. The ordering starts as the input's
+	// own (a sorted GroupAggregate's group keys — TPC-DS Q51's
+	// `sum(sum(...)) OVER (PARTITION BY ws_item_sk ORDER BY d_date)` over
+	// `GROUP BY ws_item_sk, d_date`) and each WindowAgg passes its input's
+	// order through. A partial match is priced as the full Sort
+	// createWindowPlan stacks, not as an Incremental Sort goopg does not
+	// build here.
+	have := inputNodePathkeys(input)
 	for i, w := range windows {
 		cols := belowNode.Output()
 		if i < len(chainKeep) {
 			if narrowed := narrowedWindowCols(cols, chainKeep[i]); narrowed != nil {
 				cols = narrowed
+			}
+		}
+		presortedCount := 0
+		if required := pathkeysForSortKeys(windowSortKeys(w)); len(required) > 0 {
+			if pathkeysContainedIn(have, required) {
+				presortedCount = len(required)
+			} else {
+				have = required
 			}
 		}
 		p := &Path{
@@ -308,7 +326,7 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			Cost: costWindow(cp, below.Cost.Total, below.Rows,
 				len(w.PartitionBy), len(w.OrderBy), len(w.Funcs),
 				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode),
-				0, 0),
+				presortedCount, 0),
 			Children: []*Path{below},
 		}
 		below = p
