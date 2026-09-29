@@ -3176,6 +3176,9 @@ func NewGatherMerge(pos int, child Node, nWorkers int, keys []SortKey) *GatherMe
 }
 
 type Distinct struct {
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
+	PlanCost
 	pos    int
 	Child  Node
 	schema Schema
@@ -3206,6 +3209,9 @@ func (n *Distinct) Output() Schema { return n.schema }
 // KeyCols holds the output column indices that form the DISTINCT ON key.
 // M0097-0005.
 type DistinctOn struct {
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
+	PlanCost
 	pos     int
 	Child   Node
 	KeyCols []int // indices into the output schema for DISTINCT ON keys

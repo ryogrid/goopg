@@ -791,6 +791,13 @@ func setOpArmSortedAllCols(n Node) bool {
 	default:
 		return false
 	}
+	// M0146-0005bg: a parallel DISTINCT's leader Unique reads a Gather
+	// Merge of the workers' sorted dedups, merged on every output column
+	// (create_partial_distinct_paths' `Unique -> Gather Merge`), which is
+	// as sorted as a Sort on those columns.
+	if gm, ok := child.(*GatherMerge); ok {
+		return len(gm.Output()) == ncols && sortKeysAllColsAsc(gm.Keys, ncols)
+	}
 	srt, ok := child.(*Sort)
 	if !ok || len(srt.Output()) != ncols {
 		return false

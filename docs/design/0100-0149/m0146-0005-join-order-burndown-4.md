@@ -189,3 +189,49 @@ Ledgered:
   derivation: `Aggregate` carries no PlanCost, so a path-chosen partial
   HashAggregate prints 2845.67 where its path costs 1949.84.
 - The Q87 DISTINCT row estimate.
+
+## Slice 59: M0146-0005bg — a DISTINCT node keeps its path's rows, and a parallel DISTINCT arm feeds the sorted SetOp
+
+After slice 58, TPC-DS Q38/Q87 still built `HashSetOp` where PG 18.3
+builds `SetOp Intersect` / `SetOp Except`. Their branch DISTINCTs printed
+355 and 200 rows (PG: 3260), although the DISTINCT rel was sized at 3548.
+
+- `Distinct` and `DistinctOn` embed `PlanCost`, so the `createPlanNode`
+  funnel stamps the chosen path's cost and rows on them.
+  `EstimateRows` reads a stamped, non-per-worker row count
+  (`stampedUpperRows`), and EXPLAIN prints it. The lowered leader Unique
+  reads a Gather Merge over a per-worker Unique. Re-estimating
+  `estimate_num_groups` there lost the variables, so the default (200)
+  or a partial clamp (355) took over. PG sizes the DISTINCT rel once, and
+  every consumer reads that number.
+- `setOpArmSortedAllCols` accepts a Unique over a Gather Merge whose merge
+  keys are every output column. That is create\_partial\_distinct\_paths'
+  shape, and it is as sorted as a Unique over a Sort. The SETOP\_SORTED
+  candidate (M0146-0005q) is now offered over those arms and ties the
+  hashed one on total while winning on startup, as in PG.
+- EXPLAIN prints no `Sort Key:` under a sorted INTERSECT/EXCEPT. explain.c
+  prints merge keys only for Merge Append.
+
+Tests:
+
+- `TestSetOpArmSortedThroughGatherMerge`.
+- `TestEstimateRowsReadsStampedDistinctRows` (a per-worker stamp is
+  ignored).
+- `TestExplainSortedSetOpPrintsNoSortKey` (fails on base).
+
+Movement:
+
+- Q38/Q87's first divergence moves from depth 1 (HashSetOp vs SetOp) to
+  depth 5/6 at both scales. The next record is PG's first branch sorting
+  its Gather Merge input without a per-worker Unique.
+- SF0.25 aggregation-strategy 22 → 21; other categories unchanged.
+- The Q6/Q38/Q41/Q49/Q54/Q75/Q87 fire set executes at both scales.
+- TPC-H plans are byte-identical, and the regress runner (6 cases) is
+  unchanged.
+
+Evidence: `analysis/m0146/m0146-0005/slice59/`. This resolves slice 58's
+ledgered Q87 row-estimate row.
+
+Ledgered: the sorted SetOp's printed startup is the legacy display's
+larger child startup, where PG sums both inputs' startups. `SetOp`, like
+`Aggregate`, carries no PlanCost.

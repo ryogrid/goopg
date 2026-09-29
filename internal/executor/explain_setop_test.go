@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0125-0037(i) — set operations were opaque to EXPLAIN.
@@ -403,5 +406,41 @@ func TestSelectDistinctOrderByPGShape(t *testing.T) {
 		if strings.Join(got, "|") != tc.want {
 			t.Errorf("%s: rows %s, want %s", tc.sql, strings.Join(got, "|"), tc.want)
 		}
+	}
+}
+
+// TestExplainSortedSetOpPrintsNoSortKey pins M0146-0005bg against PG 18.3's
+// explain.c: a sorted INTERSECT / EXCEPT (`SetOp Except`) prints no key line
+// — only a Merge Append shows `Sort Key:` (show_merge_append_keys). goopg
+// printed the merge keys under the SetOp once TPC-DS Q38/Q87 elected it. The
+// planned HashSetOp is given merge keys here, which is the sorted form the
+// SETOP_SORTED candidate builds.
+func TestExplainSortedSetOpPrintsNoSortKey(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE eso_a (id int, y int)")
+	runSQL(t, ctx, "CREATE TABLE eso_b (id int, y int)")
+	sql := "SELECT id FROM eso_a EXCEPT SELECT id FROM eso_b"
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	so, ok := node.(*optimizer.SetOp)
+	if !ok {
+		t.Fatalf("EXCEPT planned to %T, want *optimizer.SetOp", node)
+	}
+	c := so.Output()[0]
+	so.MergeKeys = []optimizer.SortKey{{Expr: &optimizer.ColumnRef{Index: 0, Name: c.Name, Type: c.Type}}}
+	lines := runExplainOverChild(t, ctx, "EXPLAIN "+sql, so)
+	joined := strings.Join(lines, "\n")
+	if !strings.HasPrefix(strings.TrimSpace(lines[0]), "SetOp Except") {
+		t.Fatalf("a SetOp with merge keys renders as the sorted SetOp:\n%s", joined)
+	}
+	if strings.Contains(joined, "Sort Key:") {
+		t.Errorf("a sorted SetOp prints no Sort Key line:\n%s", joined)
 	}
 }

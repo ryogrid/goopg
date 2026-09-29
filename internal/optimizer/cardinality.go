@@ -43,6 +43,26 @@ const (
 // Estimates flow bottom-up: SeqScan reads the catalog's
 // TableStats; Filter/Limit/Join/Aggregate/Project/Sort scale
 // their children; Values is exact.
+// stampedUpperRows is the row count the path search chose for an upper node
+// it built (M0146-0005bg): create_distinct_paths sizes the DISTINCT rel with
+// estimate_num_groups over its input rel once, and every later reader of
+// that node — the set operation above a DISTINCT branch, EXPLAIN — sees that
+// number. Re-estimating the lowered node instead groups over whatever the
+// lowering put beneath it (a Gather Merge over a per-worker Unique), where
+// the variables no longer resolve and the default takes over (TPC-DS Q87:
+// 355 and 200 where PG keeps 3260). A per-worker figure is not a whole-node
+// count and is not used.
+func stampedUpperRows(pc *PlanCost) (int64, bool) {
+	c, set := pc.PlanCostInfo()
+	if !set || c.PerWorker || c.PlanRows <= 0 {
+		return 0, false
+	}
+	if c.PlanRows < 1 {
+		return 1, true
+	}
+	return int64(c.PlanRows + 0.5), true
+}
+
 func EstimateRows(n Node) int64 {
 	switch x := n.(type) {
 	case *SeqScan:
@@ -91,6 +111,9 @@ func EstimateRows(n Node) int64 {
 		// goopg passed the child's row count straight through, so a DISTINCT
 		// that collapses a million rows to a hundred was costed, and every
 		// node above it sized, as if it collapsed nothing.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateDistinctRows(x.schema, x.Child)
 	case *DistinctOn:
 		// M0127-P5.6-g-ii: another of the pass-through wrappers whose absence
@@ -98,6 +121,9 @@ func EstimateRows(n Node) int64 {
 		// below). Neither this nor `*Distinct` is SIZED — upstream runs
 		// `estimate_num_groups` over the DISTINCT clause and goopg does not —
 		// which is a ledgered gap, not this arm's business.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateDistinctOnRows(x, x.Child)
 	case *WindowAgg:
 		return EstimateRows(x.Child)

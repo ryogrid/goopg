@@ -1350,7 +1350,10 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// targetlist, which is its first branch's, so a sorted first branch
 		// renders its own Sort's keys (`tenk1.unique1`, not the union
 		// output's bare `unique1`).
-		if len(p.MergeKeys) > 0 {
+		// A sorted INTERSECT / EXCEPT (`SetOp`, M0146-0005q) merges on its
+		// keys too, but explain.c prints no key line for a SetOp node
+		// (M0146-0005bg: TPC-DS Q38/Q87).
+		if len(p.MergeKeys) > 0 && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept {
 			if branches := setOpAppendBranches(p, nil); len(branches) > 0 {
 				keyNode, keys := branches[0], p.MergeKeys
 				if s, ok := keyNode.(*optimizer.Sort); ok && len(s.Keys) == len(keys) {
