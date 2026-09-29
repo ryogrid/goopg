@@ -416,3 +416,55 @@ Ledgered:
 - A second reference is aliased `a_1` in PG. goopg prints the bare name.
 - `WITH x AS (INSERT …) (SELECT …)` is rejected at parse time
   (pre-existing).
+
+## Slice 47: M0146-0005au — grouping a UNION ALL of sorted members merges them (generate_orderedappend_paths)
+
+Slice 46 left TPC-DS Q33/Q56 electing PG's GroupAggregate over their UNION
+ALL. The first divergence was then `PG Merge Append | goopg Sort`. Each
+channel branch is a GroupAggregate on the item key, so it already emits rows
+in the order the outer GROUP BY needs. PG's `generate_orderedappend_paths`
+(allpaths.c) files a Merge Append on the appendrel for every ordering a
+child delivers, and `add_paths_to_grouping_rel` walks the input rel's whole
+pathlist and takes that path as presorted input. goopg sorted the whole
+Append instead.
+
+- `orderedAppendInput` (new `orderedappend.go`) handles the ordering the
+  grouping stage asks for. The Aggregate's input must be a plain serial
+  UNION ALL chain: no merge, distinct-input, parallel-aware or
+  coerced-type link. For each member it reuses the member when it already
+  delivers the group keys by output position, and otherwise adds an
+  explicit Sort (`create_merge_append_path`). It builds the Merge Append as
+  the existing left-deep `SetOp.MergeKeys` chain, which the executor
+  already merges and EXPLAIN already renders. It declines when no member is
+  presorted, an ordering `all_child_pathkeys` would never propose.
+- `memberOrdering` is `convert_subquery_pathkeys` for a member. A member
+  is typically a Project choosing its body's columns over an inlined CTE
+  reference. It crosses Projects through bare-column targets, looks
+  through an inlined CTEScan or a SubqueryScan (both keep body positions),
+  stops at the first key the target list drops, and falls back to
+  `inputNodePathkeys`.
+- The grouping sorted arm files the candidate after the Sort-over-cheapest
+  and searched-pathlist candidates, which is PG's pathlist order. It is
+  priced by `mergeAppendCost` (cost_merge_append, now shared with
+  `addUnionMergeAppendPath`).
+
+Test: `TestExplainUnionAllOfSortedGroupsMergeAppends` fails on the base
+tree. The witness over `item` (enable_hashagg off, serial) is
+byte-identical to PG, and its result md5 matches:
+`analysis/m0146/m0146-0005/slice47/`.
+
+Movement: TPC-DS SF0.25 PLAN-PARITY match 19 → 20 (Q56 = PG). Q33's
+first divergence moves from depth 3 to 5 at both scales. At SF0.25, every
+all-depth category except qual-placement falls by 1–2; qual-placement rises
+9 → 11, because Q33/Q60 now align deeper. TPC-H is identical.
+
+Ledgered:
+
+- An ordered appendrel is offered only to the grouping stage. PG's Merge
+  Append also feeds merge joins and ORDER BY through the appendrel's
+  pathlist.
+- The Merge Append's displayed cost is the legacy derivation (children's
+  totals), not the `cost_merge_append` figure the election used. The
+  distinct-UNION arm shares this.
+- The partial arm (a Gather Merge over a Parallel Append) and group-key
+  reordering to match a member's ordering are not ported.

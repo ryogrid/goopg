@@ -557,14 +557,9 @@ func addUnionMergeAppendPath(rel *RelOptInfo, seed *Path, distinctNode *Distinct
 		chain = &SetOp{pos: distinctNode.pos, Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
 			UnionDistinctInput: true, MergeKeys: keys}
 	}
-	n := float64(len(leaves))
-	logN := math.Log2(n)
-	comparison := 2.0 * cp.cpuOperatorCost
-	startup := comparison * n * logN
-	run := rows*comparison*logN + cp.cpuTupleCost*appendCPUCostMultiplier*rows
 	merge := newPrebuiltPath(rel, chain)
 	merge.Rows = rows
-	merge.Cost = Cost{Startup: startup + startupSum, Total: startup + run + totalSum}
+	merge.Cost = mergeAppendCost(cp, len(leaves), rows, startupSum, totalSum)
 	merge.Pathkeys = pathkeys
 	merge.DisabledNodes = disabled
 	addPath(rel, &Path{

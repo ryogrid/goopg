@@ -1,0 +1,19 @@
+# set enable_hashagg=off; set max_parallel_workers_per_gather=0;
+# explain (costs off) select i_brand_id, sum(s) from (select i_brand_id, sum(i_current_price) s from item group by i_brand_id
+#   union all select i_brand_id, sum(i_wholesale_cost) from item group by i_brand_id) u group by i_brand_id;
+# PG 18.3 (:65438 tpcds025) and goopg (private SF0.25 clone) print the SAME plan:
+ GroupAggregate
+   Group Key: item.i_brand_id
+   ->  Merge Append
+         Sort Key: item.i_brand_id
+         ->  GroupAggregate
+               Group Key: item.i_brand_id
+               ->  Sort
+                     Sort Key: item.i_brand_id
+                     ->  Seq Scan on item
+         ->  GroupAggregate
+               Group Key: item_1.i_brand_id
+               ->  Sort
+                     Sort Key: item_1.i_brand_id
+                     ->  Seq Scan on item item_1
+# result md5 (unaligned): PG e148c64947fb7cecfc3408d0902b076a = goopg e148c64947fb7cecfc3408d0902b076a; 949 rows, in group order

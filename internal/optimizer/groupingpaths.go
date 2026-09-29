@@ -31,6 +31,7 @@ const (
 	groupAggPlainProducer     = "upper.groupagg.plain"
 	groupAggSortedIdxProducer = "upper.groupagg.sortedidx"
 	groupAggSearchProducer    = "upper.groupagg.searchcand"
+	groupAggMergeProducer     = "upper.groupagg.mergeappend"
 )
 
 // createGroupingPaths is `create_grouping_paths` for the one aggregate
@@ -584,6 +585,21 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						Pathkeys: groupPathkeys, Children: []*Path{cs},
 					}, groupAggSearchProducer)
 				}
+			}
+			// M0146-0005au: a UNION ALL input whose members already emit
+			// the group ordering is merged rather than sorted — the Merge
+			// Append generate_orderedappend_paths files on the appendrel,
+			// which add_paths_to_grouping_rel then takes as presorted input.
+			if _, ma := orderedAppendInput(seed.Rel, child, keys, cp); ma != nil {
+				maSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &maSpec,
+					Rel: grouped, Rows: numGroups,
+					DisabledNodes: ma.DisabledNodes,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
+						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{ma},
+				}, groupAggMergeProducer)
 			}
 			if ok {
 				// The index-driven variant: no Sort, narrowed spec. The spec

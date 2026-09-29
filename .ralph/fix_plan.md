@@ -23147,6 +23147,25 @@ M0146-0001 re-baseline census on the new default arm.
     \(14 fires, none introduced\), TPC\-H plans identical, regress runner 14
     cases \(no semantic delta\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 qual-placement 12 -> 9, aggregation-strategy 26 -> 25, SF1 qual-placement 13 -> 11, parameterisation 40 -> 39; offset by alignment-only rises (SF0.25 join-method 38 -> 40, scan-type/parameterisation/parallelism +1, rendering 21 -> 23; SF1 scan-type +1, rendering +2 — Q33/Q56 branch plans unchanged, the diff now aligns them under PG's Merge Append); match 19 -> 19 both scales; first-divergence aggregation-strategy SF0.25 9 -> 7, SF1 13 -> 11
+- [x] **M0146\-0005au — grouping a UNION ALL of sorted members merges
+  them** \(slice 47, impl, done 2026\-09\-29 from the census record `PG Merge
+  Append | goopg Sort` on TPC\-DS Q33/Q56\)\. Design
+  `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-3.md`
+  § "Slice 47"\.
+  Kind: impl
+  Parent: M0146-0005
+  - `orderedAppendInput` \(`orderedappend.go`\) ports
+    `generate\_orderedappend\_paths` for the grouping stage: presorted
+    members reused, others Sorted, `SetOp.MergeKeys` chain, priced by the
+    shared `mergeAppendCost`\.
+  - `memberOrdering` is `convert\_subquery\_pathkeys` through member
+    Projects, inlined CTE scans and subquery scans\.
+  - Test `TestExplainUnionAllOfSortedGroupsMergeAppends` \(fails on base\);
+    `item` witness byte\-identical to PG, result md5 equal\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q33 Q56 Q60, none introduced\), TPC\-H census identical, regress
+    runner 12 cases \(no semantic delta\)\.
+  Movement: yes — TPC-DS SF0.25 PLAN-PARITY match 19 -> 20 (Q56); CATEGORIES-EXCL-MATCH SF0.25 join-order 64 -> 63, join-method 40 -> 38, aggregation-strategy 25 -> 23, qual-placement 9 -> 11 (Q33/Q60 aligned deeper); SF1 aggregation-strategy 28 -> 26, scan-type 50 -> 49
 - [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —

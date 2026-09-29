@@ -1,0 +1,19 @@
+# M0146-0005au census (tmp/fireset-0005au)
+sf025 baseline match=19 CATEGORIES-EXCL-MATCH: join-order=64 join-method=40 scan-type=44 parameterisation=34 aggregation-strategy=25 sort-strategy=46 parallelism=44 qual-placement=9 rendering=23
+sf025 candidate match=20 CATEGORIES-EXCL-MATCH: join-order=63 join-method=38 scan-type=43 parameterisation=33 aggregation-strategy=23 sort-strategy=45 parallelism=43 qual-placement=11 rendering=22
+< Q33 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+> Q33 depth=5 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+< Q56 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+> Q56 MATCH (no structural divergence)
+sf1 baseline match=19 CATEGORIES-EXCL-MATCH: join-order=63 join-method=40 scan-type=50 parameterisation=39 aggregation-strategy=28 sort-strategy=48 parallelism=53 qual-placement=11 rendering=19
+sf1 candidate match=19 CATEGORIES-EXCL-MATCH: join-order=63 join-method=40 scan-type=49 parameterisation=40 aggregation-strategy=26 sort-strategy=48 parallelism=53 qual-placement=12 rendering=19
+< Q33 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+> Q33 depth=5 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+< Q56 depth=3 [sort-strategy] under GroupAggregate: PG Merge Append | goopg Sort
+> Q56 depth=5 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort
+
+FIRE-SET-TIMEOUTS: fires=Q33 Q56 Q60 introduced=none unchanged=none missing=none
+sweep: === SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+TPC-H census: DIVERGENCE-CLASSES: queries=22 match=10 divergent=12 D1-sublink=1 D2-unionall=0 D3-partialpath=6 D4-upperrel=0 D5-narrowing=0 D6-cte=0 jointree-search=5 verdict=0 (class file identical to 0005at)
+acceptance 24 MATCH; spotcheck Q12=2 Q13=33
+regress (union aggregates groupingsets subselect select_parallel partition_join partition_aggregate inherit limit with select_distinct join) vs HEAD worktree: 0-line delta except join.sql row order of two no-ORDER-BY results (one under a 4-worker Gather), plans identical
