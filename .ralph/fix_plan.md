@@ -23447,6 +23447,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 queries both scales\), TPC\-H shapes identical, regress runner 7 cases
     \(join\.sql j1⋈j3 now PG\'s Hash Join\)\.
   Movement: yes — PLAN-PARITY SF0.25 match 26 -> 27, SF1 23 -> 24 (Q8 = PG); CATEGORIES-EXCL-MATCH SF0.25 join-order 55 -> 54, scan-type 38 -> 37; SF1 join-order 61 -> 60, scan-type 43 -> 41
+- [x] **M0146\-0005bl — HAVING bounds on an aggregate are not a range**
+  \(filed 2026\-09\-30 from the ea\-ratchet Q34 finding\)\. goopg paired
+  `count\(\*\) \>= 15 AND count\(\*\) \<= 20` as a range and fell to
+  DEFAULT\_RANGE\_INEQ\_SEL \(Q34 GroupAggregate est 1\); PG pairs only
+  clauses with NumRelids == 1, and an Aggref has none, so it uses 1/9\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 64\)\.** `columnIsAggregateResult` in
+    `internal/optimizer/rangequery\.go` keeps aggregate\-result bounds
+    unpaired\. Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 64"\.
+  - Test `TestExplainHavingBoundsAreNotARange` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    Q34/Q73 both scales, TPC\-H shapes identical, regress runner 5 cases
+    unchanged, ea\-ratchet repinned \(11 entries\)\.
+  Movement: yes — ea-ratchet findings 12 -> 11 (Q34 FIXED); Q34 GroupAggregate est 1 -> 15 (actual 87); PLAN-PARITY categories unchanged (SF0.25 match 27, SF1 24)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

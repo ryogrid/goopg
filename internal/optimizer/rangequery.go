@@ -148,6 +148,14 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 			continue
 		}
 		key, isLo, boundCR, ok := rangeBoundOf(c)
+		if ok && columnIsAggregateResult(boundCR, child) {
+			// M0146-0005bl: clausesel.c pairs bounds only on a clause over
+			// exactly one relation (`NumRelids(root, clause) == 1`); a HAVING
+			// bound on an aggregate result is an Aggref with no relids, so
+			// each bound is its own DEFAULT_INEQ_SEL factor (TPC-DS Q34's
+			// `count(*) BETWEEN 15 AND 20`: PG 1/9, not 0.005).
+			ok = false
+		}
 		if !ok {
 			// Not a pairable bound: multiply it in as before.
 			s1 *= clauseSelectivity(c, child)
@@ -232,4 +240,23 @@ func conjunctionSelectivity(conjuncts []Expr, child Node) float64 {
 		return 1
 	}
 	return s1
+}
+
+// columnIsAggregateResult reports whether cr, read against child's output,
+// is an aggregate's result rather than a grouping column: an Aggregate emits
+// [group exprs, aggregate results, grouping masks, passthrough], and only the
+// group exprs and passthrough columns are variables of a relation in PG's
+// terms — the aggregate results and GROUPING() masks are expressions over
+// none (NumRelids 0).
+func columnIsAggregateResult(cr *ColumnRef, child Node) bool {
+	if cr == nil || child == nil {
+		return false
+	}
+	agg, ok := child.(*Aggregate)
+	if !ok {
+		return false
+	}
+	lo := len(agg.GroupExprs)
+	hi := lo + len(agg.Aggs) + len(agg.GroupingMasks)
+	return cr.Index >= lo && cr.Index < hi
 }

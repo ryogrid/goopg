@@ -7,12 +7,7 @@ Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim
 Q23:catalog_sales+customer+date_dim
 Q23:cte:frequent_ss_items+customer+date_dim+web_sales
 Q23:customer+date_dim+web_sales
-Q34:customer+date_dim+household_demographics+store+store_sales
-Q40:catalog_sales+date_dim+item+warehouse
 Q78:date_dim+store_returns+store_sales+web_returns+web_sales
 Q84:customer+customer_address+customer_demographics+household_demographics+income_band+store_returns
-Q85:customer_demographics+reason+web_page+web_returns+web_sales
-Q85:reason+web_page+web_returns+web_sales
-Q85:reason+web_returns+web_sales
 Q92:date_dim+web_sales
 Q95:cte:ws_wh+customer_address+date_dim+web_sales+web_site

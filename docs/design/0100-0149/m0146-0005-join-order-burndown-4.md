@@ -384,3 +384,35 @@ Movement:
   nested loop.
 
 Evidence: `analysis/m0146/m0146-0005/slice63/`.
+
+## Slice 64: M0146-0005bl — HAVING bounds on an aggregate are not a range
+
+In TPC-DS Q34, `HAVING count(*) BETWEEN 15 AND 20` estimated 1 row, where
+PG estimates 16. goopg's conjunctionSelectivity paired the two bounds as a
+range on one variable, and because both are DEFAULT\_INEQ\_SEL punts the
+pairing fell to DEFAULT\_RANGE\_INEQ\_SEL (0.005). PG never pairs them.
+clauselist\_selectivity only treats a clause as a range bound when
+`NumRelids(root, clause) == 1` (clausesel.c), and an Aggref references no
+relation, so each bound is its own 1/3 factor: 1/9 overall.
+
+- `columnIsAggregateResult` recognises a bound whose column reads an
+  Aggregate child's aggregate result or GROUPING() mask; such a bound is
+  multiplied in unpaired. Grouping columns and passthrough columns are
+  still variables of a relation and keep the pairing.
+
+Test: `TestExplainHavingBoundsAreNotARange` requires
+`GROUP BY a HAVING count(*) >= 15 AND count(*) <= 20` over 200 groups to
+estimate 22 rows. Base estimated 1, so the test fails there.
+
+Movement:
+
+- ea-ratchet findings 12 → 11 (Q34 FIXED). Q34's GroupAggregate now
+  estimates 15 rows at SF0.25 (actual 87; was 1).
+- The TPC-DS categories are unchanged at both scales (match SF0.25 27,
+  SF1 24), and the fire set Q34/Q73 executes at both scales.
+- TPC-H plans are identical, the arm is 24/24, and the SF0.25 sweep is
+  96/96.
+- Regress aggregates/groupingsets/subselect are unchanged; join.sql
+  shows only the known row-order flap.
+
+Evidence: `analysis/m0146/m0146-0005/slice64/`.
