@@ -142,3 +142,70 @@ Movement (fire set):
   unchanged.
 
 Evidence: `analysis/m0146/m0146-0005/slice73/`.
+
+## Slice 74: M0146-0005bu — a correlated scalar sublink on one relation is that relation's restriction
+
+TPC-DS Q1, Q30 and Q81 filter
+`ctr1.ctr_total_return > (SELECT avg(...) * 1.2 FROM ctr ctr2 WHERE
+ctr1.k = ctr2.k)`. PG 18.3 places this on the `ctr1` CTE Scan:
+`distribute_qual_to_rels` takes a clause's relids from `pull_varnos`, and a
+correlated SubPlan contributes its testexpr Vars plus the outer Vars its
+parameters carry. All of those name `ctr1`, so the clause is a base
+restriction there (Q30 SF1: `rows=109` on the scan). goopg kept every
+correlated sublink conjunct of a multi-relation scope as a join residual
+(M0146-0015a), so the filter sat on the top Nested Loop.
+
+- `correlatedScalarSublinkLeaf` (local\_filters.go) admits a conjunct that
+  `conjunctLocalEligibility` declines when all of the following hold:
+  - its only sublinks are scalar;
+  - its same-scope columns all lie in binding 0;
+  - every outer reference in its inner plans names binding 0 of this scope,
+    and none reaches past it.
+
+  EXISTS and IN stay excluded because the post-planning EXISTS→ANY and
+  unnest passes read them off the top qual holder.
+- The admission is built on `walkExprRefs`, which is complete over Expr
+  types and fails closed. The inner plans are judged by `planEscapesBy`,
+  which is `planHasEscapingOuterRef` with the escape rule passed in (the
+  historical rule is `outerRefReachesPast`). Its Visit dispatch is pinned in
+  the walker inventory as a classifier, next to its sibling.
+- **Offset 0 only.** Binding 0's leaf coordinates are the FROM-cumulative
+  ones, so neither `localizeExprToLeaf` nor the unlowered inner plan moves a
+  coordinate. The rebase needed for any other binding is ledgered.
+- **Join-width fix in the unnest driver.** goopg's scalar-aggregate unnest
+  (not a PG transform) still decorrelates such a leaf qual. It appends the
+  aggregate's columns to the host, which is harmless under the top Project
+  but shifts every coordinate past a join input. A plain-table repro counted
+  0 where PG counts 993. `unnestKeepingWidth` now projects a widened join
+  input back to its original columns.
+
+Tests:
+
+- `TestCorrelatedSublinkIsBaseRestriction`: the PG 18.3 shape, with the SubPlan
+  on the r1 CTE Scan and count 801, read with the unnest post-pass off.
+- `TestUnnestedLeafSublinkKeepsJoinWidth`: counts 993/993/801 with the pass
+  on. It fails, reading 0, without `unnestKeepingWidth`.
+
+Movement (fire set):
+
+- The qual is placed as in PG for Q1 (SF0.25), Q30 and Q81 at both scales.
+  TPC-H Q20's `ps_availqty > (SubPlan)` now filters the partsupp index scan,
+  as in PG.
+- PLAN-PARITY match is unchanged: SF0.25 36, SF1 28, TPC-H 11.
+  CATEGORIES-EXCL-MATCH aggregation-strategy goes SF0.25 18 → 17 (Q1 no
+  longer unnests at SF0.25). SF1 join-order goes 60 → 62 and scan-type
+  34 → 35: with 109 driving rows instead of 327, the customer probe flips
+  to a bitmap scan.
+- The two differences left on Q30/Q81 are both outside this slice:
+  - goopg prices the customer index probe at 12.25 where PG has 7.61. This
+    is the parked M0142-0005c multiplier, and it is what makes the bitmap
+    win.
+  - EXPLAIN numbers `SubPlan 1` where PG numbers `SubPlan 2`. PG's plan ids
+    count the CTE plan first; filed as M0146-0005bv.
+- goopg still charges a sublink one operator in `qualEvalOps`; PG adds the
+  SubPlan's per-call cost (`cost_subplan`). That is ledgered.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24 and ea-ratchet (10)
+  pass. Regress subselect, with and join are unchanged (join shows only its
+  known row-order flap).
+
+Evidence: `analysis/m0146/m0146-0005/slice74/`.

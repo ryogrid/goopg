@@ -496,8 +496,8 @@ func unnestSubqueriesInPlan(node Node) Node {
 		// EXISTS) must stay visible to the driver loops above.
 		pushConjunctsBelowSemiAnti(n)
 	case *Join:
-		n.Left = unnestSubqueriesInPlan(n.Left)
-		n.Right = unnestSubqueriesInPlan(n.Right)
+		n.Left = unnestKeepingWidth(n.Left)
+		n.Right = unnestKeepingWidth(n.Right)
 	case *Project:
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	case *Aggregate:
@@ -508,6 +508,37 @@ func unnestSubqueriesInPlan(node Node) Node {
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	}
 	return node
+}
+
+// unnestKeepingWidth is unnestSubqueriesInPlan for a join input, whose width
+// is part of the join's coordinate space: every column of the right input
+// sits at an offset of the left one's width. A decorrelated scalar sublink
+// joins its aggregate onto the host and APPENDS the inner columns, which is
+// harmless above the joins (the upper Project reads the host's columns by
+// position) but shifts every coordinate past a join input. Since
+// M0146-0005bu places a correlated scalar sublink on a join's base relation
+// (correlatedScalarSublinkLeaf), such a host can be a join input, so the
+// original columns are projected back out. A rewrite that does not keep them
+// as a prefix returns unchanged — the join above would misread it either way,
+// and no rewrite reaches that shape today.
+func unnestKeepingWidth(child Node) Node {
+	if child == nil {
+		return nil
+	}
+	before := append(Schema(nil), child.Output()...)
+	out := unnestSubqueriesInPlan(child)
+	got := out.Output()
+	if len(got) <= len(before) {
+		return out
+	}
+	m := make([]int, len(before))
+	for i := range before {
+		if !strings.EqualFold(got[i].Name, before[i].Name) {
+			return out
+		}
+		m[i] = i
+	}
+	return projectToBindingOrder(out, m, nil)
 }
 
 // walkSubqueryPlansInExpr walks an expression tree and recursively

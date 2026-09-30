@@ -16647,6 +16647,15 @@ func planHasOuterRef(node Node) bool {
 // unrecognised node declines exactly as it did before this change; the
 // change can only ever REMOVE false declines, never add one.
 func planHasEscapingOuterRef(node Node, depth int) bool {
+	return planEscapesBy(node, depth, outerRefReachesPast)
+}
+
+// planEscapesBy is planHasEscapingOuterRef with the escape rule for one
+// reference supplied: esc judges an OuterColumnRef met where `depth` is the
+// Level naming the walk root's parent scope (outerRefReachesPast is the
+// historical rule; correlatedScalarSublinkLeaf also rejects a reference to
+// this scope outside one binding, M0146-0005bu).
+func planEscapesBy(node Node, depth int, esc outerRefPred) bool {
 	if node == nil {
 		return false
 	}
@@ -16661,16 +16670,16 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 		if n.Lateral {
 			right++
 		}
-		return planHasEscapingOuterRef(n.Left, depth) ||
-			planHasEscapingOuterRef(n.Right, right) ||
-			exprsHaveEscapingOuterRef(depth, n.Predicate, n.LeftKey, n.RightKey)
+		return planEscapesBy(n.Left, depth, esc) ||
+			planEscapesBy(n.Right, right, esc) ||
+			exprsHaveEscapingOuterRef(depth, esc, n.Predicate, n.LeftKey, n.RightKey)
 	case *NestedLoopIndexJoin:
 		// The fused NLI is a binder by construction: it binds its inner
 		// probe's keys from the outer row (R25 decomposes it into the
 		// `Join{Lateral}` arm above; until then both spellings must agree).
-		return planHasEscapingOuterRef(n.Outer, depth) ||
-			planHasEscapingOuterRef(n.Inner, depth+1) ||
-			exprsHaveEscapingOuterRef(depth, n.Predicate)
+		return planEscapesBy(n.Outer, depth, esc) ||
+			planEscapesBy(n.Inner, depth+1, esc) ||
+			exprsHaveEscapingOuterRef(depth, esc, n.Predicate)
 	}
 	// Everything else is a pass-through for scoping purposes: its children
 	// are evaluated in this scope, so they are walked at `depth` unchanged.
@@ -16685,14 +16694,14 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 	// TPC-DS `lateral` decline count went 1 -> 4).
 	kids, ok := planChildNodes(node)
 	if !ok {
-		return planHasEscapingOuterRefFlat(node, depth)
+		return planHasEscapingOuterRefFlat(node, depth, esc)
 	}
 	for _, k := range kids {
-		if planHasEscapingOuterRef(k, depth) {
+		if planEscapesBy(k, depth, esc) {
 			return true
 		}
 	}
-	return nodeOwnExprsHaveEscapingOuterRef(node, depth)
+	return nodeOwnExprsHaveEscapingOuterRef(node, depth, esc)
 }
 
 // emptyPlanStub stands in for a child link while a node's OWN expressions
@@ -16744,7 +16753,7 @@ var (
 // COPY whose child links are stubbed out, so the expression inventory comes
 // from `walkPlanExprs` -- the same switch every other reader uses -- instead
 // of a second hand-written list that could drift from it.
-func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
+func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int, esc outerRefPred) bool {
 	v := reflect.ValueOf(node)
 	cp := reflect.New(v.Elem().Type())
 	cp.Elem().Set(v.Elem())
@@ -16765,15 +16774,15 @@ func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
 	}
 	stub, ok := cp.Interface().(Node)
 	if !ok {
-		return planHasEscapingOuterRefFlat(node, depth)
+		return planHasEscapingOuterRefFlat(node, depth, esc)
 	}
-	return planHasEscapingOuterRefFlat(stub, depth)
+	return planHasEscapingOuterRefFlat(stub, depth, esc)
 }
 
 // exprsHaveEscapingOuterRef is the expression half of the structural walk:
 // the references a node carries in its OWN expressions, which are evaluated
 // in that node's scope and so are judged at `depth` directly.
-func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
+func exprsHaveEscapingOuterRef(depth int, esc outerRefPred, exprs ...Expr) bool {
 	found := false
 	for _, e := range exprs {
 		if e == nil || found {
@@ -16783,7 +16792,7 @@ func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
 			if found {
 				return
 			}
-			if outerRefEscapes(inner, depth) {
+			if outerRefEscapes(inner, depth, esc) {
 				found = true
 			}
 		})
@@ -16794,20 +16803,20 @@ func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
 // outerRefEscapes judges ONE expression node, and is the single place the
 // level rule and the sublink recursion live so the structural walk and the
 // flat fallback cannot drift apart (the sibling-paths hazard).
-func outerRefEscapes(inner Expr, depth int) bool {
+func outerRefEscapes(inner Expr, depth int, esc outerRefPred) bool {
 	switch x := inner.(type) {
 	case *OuterColumnRef:
-		return x.Level >= depth
+		return esc(x, depth)
 	case *SubqueryExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *ArraySubqueryExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *MultiAssignSubqRow:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *InExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *ExistsExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	}
 	return false
 }
@@ -16818,20 +16827,27 @@ func outerRefEscapes(inner Expr, depth int) bool {
 // binds it. It is what every node kind `planHasEscapingOuterRef` does
 // not enumerate still gets, so an unknown node declines exactly as it
 // did before R29 (fail-closed).
-func planHasEscapingOuterRefFlat(node Node, depth int) bool {
+func planHasEscapingOuterRefFlat(node Node, depth int, esc outerRefPred) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
 			return
 		}
 		walkExprTree(e, func(inner Expr) {
-			if !found && outerRefEscapes(inner, depth) {
+			if !found && outerRefEscapes(inner, depth, esc) {
 				found = true
 			}
 		})
 	})
 	return found
 }
+
+// outerRefPred judges one OuterColumnRef met at `depth` (see planEscapesBy).
+type outerRefPred func(o *OuterColumnRef, depth int) bool
+
+// outerRefReachesPast is the historical escape rule: the reference names the
+// walk root's parent scope or one above it.
+func outerRefReachesPast(o *OuterColumnRef, depth int) bool { return o.Level >= depth }
 
 // planSelectWithParent plans an inner SELECT with the supplied
 // resolveContext as the lexical-scope parent. Used by

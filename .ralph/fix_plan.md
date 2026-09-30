@@ -23648,6 +23648,56 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q16 Q94 both scales\), TPC\-H shapes identical, regress 6 cases
     unchanged \(incl\. btree\_index\), ea\-ratchet PASS \(10\)\.
   Movement: yes — match SF0.25 35 -> 36, SF1 27 -> 28; CATEGORIES-EXCL-MATCH scan-type SF0.25 30 -> 28, SF1 36 -> 34
+- [x] **M0146\-0005bu — a correlated scalar sublink on one relation is
+  that relation\'s base restriction** \(filed 2026\-09\-30 by the census:
+  TPC\-DS Q30 SF1\'s only difference was the `ctr\_total\_return >
+  \(SubPlan\)` filter, which PG places on the ctr1 CTE Scan and goopg on
+  the top Nested Loop; Q1/Q81 share the shape\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 74\)\.** `correlatedScalarSublinkLeaf`
+    \(local\_filters.go\) admits a scalar\-sublink conjunct whose columns
+    and inner outer refs all name binding 0 \(offset 0: no coordinate
+    rebase\), judged by `planEscapesBy` \(planHasEscapingOuterRef with a
+    pluggable rule\)\. `unnestKeepingWidth` \(unnest.go\) projects a join
+    input the scalar unnest widened back to its columns \(a plain\-table
+    repro counted 0 vs PG 993\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 74"\.
+  - Tests `TestCorrelatedSublinkIsBaseRestriction`,
+    `TestUnnestedLeafSublinkKeepsJoinWidth` \(reads 0 without the fix\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q1 Q30 Q81 both scales\), TPC\-H census 11 \(Q20 filter now on the
+    partsupp probe as PG\), regress subselect/with/join unchanged,
+    ea\-ratchet PASS \(10\)\.
+  Movement: none — match unchanged (SF0.25 36, SF1 28); CATEGORIES-EXCL-MATCH aggregation-strategy SF0.25 18 -> 17 but SF1 join-order 60 -> 62 and scan-type 34 -> 35 (customer probe flips to bitmap at 109 driving rows: M0142-0005c)
+- [ ] **M0146\-0005bv — SubPlan/InitPlan numbering follows PG\'s plan\_id**
+  \(filed 2026\-09\-30 by slice 74\)\. PG numbers SubPlans and InitPlans by
+  their position in `glob\->subplans`, CTE plans included and a sublink
+  planned inside a CTE body before that CTE: Q30/Q81/Q1 print `SubPlan 2`
+  after one CTE, Q23/Q24 `InitPlan 2`, Q14 `InitPlan 3\.\.6`, and Q10/Q35
+  `SubPlan 2`/`SubPlan 4` \(the hashed AlternativeSubPlan pair\)\. goopg
+  numbers sublinks alone from 1, so the parity diff reports
+  `SubPlan/InitPlan present only on one side` \(parameterisation\) — with
+  M0142\-0005c it is all that separates Q30/Q81 from a match\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where EXPLAIN assigns SubPlan/InitPlan numbers and
+    number CTE plans in the same sequence \(post\-order: a CTE body\'s
+    sublinks, then the CTE\); compare with
+    `analysis/m0146/m0146\-0005/slice74/` and the 0bu fire\-set captures\.
+- [ ] **M0146\-0039 — \(observed\) temp tables survive a server restart**
+  \(filed 2026\-09\-30 by slice 74, NOT yet reproduced cleanly\)\. On the
+  private :5533 probe cluster \(tmp/c20a/data\-sf025\) a session created
+  `TEMP TABLE ca/cb`; after `goopg stop` + start, a new session\'s
+  `CREATE TEMP TABLE ca` failed with `relation "ca" does not exist` and
+  the following INSERT appended to the old rows \(count doubled\)\. PG drops
+  temp relations at backend exit\.
+  Kind: bug
+  Parent: M0146
+  - First step: reproduce on a throwaway cluster \(port 5534\-free range\):
+    create a temp table, stop/start, list pg\_class for pg\_temp\_\* and
+    retry the CREATE; then find the temp\-namespace cleanup path\.
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

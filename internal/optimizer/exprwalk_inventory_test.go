@@ -254,6 +254,12 @@ var exprSwitchInventory = map[string]walkerRole{
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
 	"local_filters.go:conjunctLocalEligibility": nonRecursiveClassifier,
+	// Added by M0146-0005bu, the same shape: walkExprRefs (scopeSignal)
+	// carries the recursion and the exhaustiveness, an unenumerated kind
+	// aborts it (fail-closed: the conjunct stays a join residual), and the
+	// inner plan is judged by planEscapesBy. The census sees the five-arm
+	// admission dispatch inside the Visit closure.
+	"local_filters.go:correlatedScalarSublinkLeaf": nonRecursiveClassifier,
 	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
 	// recursion and the exhaustiveness — sublinks and unenumerated
 	// kinds abort the walk, fail-closed); what the census sees is the

@@ -83,6 +83,10 @@ func partitionConjunctsForJoinPlanning(
 		// is invisible to them (TPC-DS Q35 lost its hashed ANY to a
 		// per-row SubPlan) — ledgered.
 		if !conjunctLocalEligibility(c, len(spans) == 1) {
+			if b := correlatedScalarSublinkLeaf(c, spans); b >= 0 {
+				locals.byBinding[b] = append(locals.byBinding[b], c)
+				continue
+			}
 			joinConjuncts = append(joinConjuncts, c)
 			continue
 		}
@@ -301,4 +305,60 @@ func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 			"here leaves FROM-cumulative indices on a leaf-local Filter", e))
 	}
 	return out
+}
+
+// correlatedScalarSublinkLeaf returns the binding a conjunct holding a
+// correlated scalar sublink restricts, or -1 (M0146-0005bu). PG distributes
+// a qual by the relids of its Vars, and a correlated SubPlan's Vars are its
+// testexpr's plus the outer Vars its parameters carry
+// (distribute_qual_to_rels over pull_varnos, initsplan.c): when all of them
+// name one relation the whole clause is that relation's base restriction.
+// TPC-DS Q1/Q30/Q81 filter `ctr1.ctr_total_return > (SELECT avg(...) FROM
+// ctr2 WHERE ctr1.k = ctr2.k)` on the ctr1 CTE Scan; goopg held it above the
+// whole join.
+//
+// Admitted: scalar sublinks only (the post-planning EXISTS->ANY and unnest
+// passes read EXISTS/IN off the top qual holder), every inner-plan outer
+// reference naming this scope (none reaching past it) and every such
+// reference plus every same-scope column inside ONE binding that starts at
+// offset 0. Offset 0 is the one binding whose leaf coordinates ARE the
+// FROM-cumulative ones, so neither localizeExprToLeaf nor the inner plan
+// (whose references stay unrebased — the rebase is ledgered) moves a
+// coordinate.
+func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
+	if len(spans) < 2 || spans[0].lo != 0 || anySublinkPullupCandidate(c) || tableForCol(c, spans) != 0 {
+		return -1
+	}
+	lo, hi := spans[0].lo, spans[0].hi
+	// planEscapesBy's walk: a reference past this scope escapes as ever, and
+	// one naming this scope escapes the leaf unless binding 0 holds it.
+	outside := func(o *OuterColumnRef, depth int) bool {
+		return o.Level > depth || (o.Level == depth && (o.Index < lo || o.Index >= hi))
+	}
+	scalar, ok := false, true
+	walked := walkExprRefs(c, scopeSignal, exprVisitor{
+		Visit: func(n Expr) bool {
+			switch x := n.(type) {
+			case *OuterColumnRef:
+				ok = false
+			case *SubqueryExpr:
+				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
+					planEscapesBy(x.Plan, 1, outside) {
+					ok = false
+				}
+				scalar = true
+			case *InExpr:
+				if x.Plan != nil {
+					ok = false
+				}
+			case *ExistsExpr, *ArraySubqueryExpr, *MultiAssignSubqRow, *MultiAssignSubqElem:
+				ok = false
+			}
+			return ok
+		},
+	})
+	if !walked || !ok || !scalar {
+		return -1
+	}
+	return 0
 }
