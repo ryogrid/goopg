@@ -360,7 +360,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// addIndexOnlyPaths will build that index-only path with these same
 	// clauses, a plain twin here would tie it on cost and — filed first —
 	// win add_path's tie, electing the heap-fetching shape PG never builds.
-	if s.restrictionPathIsIndexOnly(cat, tbl, idx, conjuncts) {
+	if s.restrictionPathIsIndexOnly(cat, rel, tbl, idx, conjuncts) {
 		return false
 	}
 	// The byte-key btree stores NO entry whose key has a NULL column

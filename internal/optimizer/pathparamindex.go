@@ -392,7 +392,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	var ioCovered []catalog.Column
 	indexOnly := false
 	if s.neededColsKnown && !indexOnlyHardDisabled(cat) && scanLeafIsBare(rel.baseLeaf) {
-		if needed := s.neededColumnsOf(tbl); len(needed) > 0 {
+		if needed := s.neededColumnsOfRel(rel, tbl); len(needed) > 0 {
 			ioCovered, indexOnly = indexCoversColumns(idx, needed)
 		}
 	}

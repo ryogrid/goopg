@@ -750,13 +750,24 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 				if !prob.neededColsKnown {
 					return SchemaColumn{}, false
 				}
+				// M0146-0005bq-b: attributed to this leaf's alias, the same
+				// rule the index-only producer used to prune it — another
+				// alias of the same table reading the name by qualified
+				// reference does not read THIS leaf's column.
+				qual := ""
+				if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
+					qual = id.alias
+					if qual == "" && id.table != nil {
+						qual = id.table.Name
+					}
+				}
 				if prob.outputColsKnown && prob.outputCols != nil {
-					if prob.outputCols[col.Name] {
+					if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
 						return SchemaColumn{}, false
 					}
 					return col, true
 				}
-				if prob.neededCols[col.Name] {
+				if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
 					return SchemaColumn{}, false
 				}
 				return col, true

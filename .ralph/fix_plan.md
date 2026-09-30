@@ -23580,6 +23580,24 @@ M0146-0001 re-baseline census on the new default arm.
     tables \(Q18 cd2, Q50 d1\); ordered unparameterised index path not
     index\-only; residual\-qual leaves are M0146\-0019a\.
   Movement: yes — match SF0.25 30 -> 33; CATEGORIES-EXCL-MATCH scan-type SF0.25 37 -> 32, SF1 41 -> 37
+- [x] **M0146\-0005br — the index\-only needed set is attributed per alias**
+  \(filed 2026\-09\-30 by M0146\-0005bq\'s ledger row\)\. The statement\-wide
+  name set counted another alias\'s columns \(TPC\-DS Q18 cd2, Q50 d1\);
+  Q18\'s ROLLUP also voided the whole set\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 70\)\.** Qualifier markers in
+    `collectExprColumnNames`; `neededColumnNamedFor` /
+    `neededColumnsOfRel` for the three index\-only producers and the
+    relfromjoinlist boundary filler; `collectGroupingSetColumnNames`\.
+    Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 70"\.
+  - Test `TestIndexOnlyProbePerAlias` \(fails on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q18 Q22 Q50 Q67 both scales\), TPC\-H shapes identical, regress 8 cases
+    \(groupingsets unchanged, create\_index 1804 → 1788\), ea\-ratchet PASS
+    \(10\)\.
+  Movement: yes — match SF0.25 33 -> 35, SF1 26 -> 27; CATEGORIES-EXCL-MATCH scan-type SF0.25 32 -> 30, SF1 37 -> 36
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

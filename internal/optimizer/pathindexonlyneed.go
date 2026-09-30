@@ -26,7 +26,11 @@ package optimizer
 // with the opposite default — correct for its own conservative question and a
 // wrong-answer bug if reused here (rule #2).
 
-import "github.com/goopg/goopg/internal/parser"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // neededColumnNames returns every column name the statement reads, and whether
 // the answer is TRUSTWORTHY. A false second return means "assume every column
@@ -36,10 +40,44 @@ func neededColumnNames(s *parser.SelectStmt) (map[string]bool, bool) {
 		return nil, false
 	}
 	dst := make(map[string]bool, 16)
+	dst[neededMarkersKey] = true
 	if !collectStmtColumnNames(s, dst) {
 		return nil, false
 	}
 	return dst, true
+}
+
+// M0146-0005bq-b — per-relation attribution for the qualified references.
+//
+// The name set over-states on purpose (file header), but for a table read
+// under two aliases it over-states by a whole relation: TPC-DS Q18 reads
+// `cd1.cd_gender` and `cd2.cd_demo_sk`, so `cd_gender` counted as needed for
+// cd2 too and PG's `Index Only Scan ... cd2` probe was refused. Alongside the
+// plain names the collector records, per reference, the qualifier it was
+// written with (or that it had none), in marker keys no column name can
+// collide with. A relation read as alias A then needs a column only when some
+// reference is UNQUALIFIED (it may be A's) or is qualified by A. An
+// unqualified reference still counts for every relation, so the attribution
+// narrows only what another alias's qualified reads added — never below what
+// the relation itself reads. A qualifier that names some other scope's
+// relation by the same alias still counts for A: over-stating, never under.
+const neededMarkersKey = "\x00markers"
+
+func neededUnqualKey(col string) string { return "\x00u\x00" + strings.ToLower(col) }
+
+func neededQualKey(qual, col string) string {
+	return "\x00q\x00" + strings.ToLower(qual) + "\x00" + strings.ToLower(col)
+}
+
+// neededColumnNamedFor reports whether column col of the relation read under
+// qualifier qual is needed. Without the markers (a set built by an older
+// path), or without a qualifier to attribute by, it falls back to the name
+// alone.
+func neededColumnNamedFor(needed map[string]bool, qual, col string) bool {
+	if qual == "" || !needed[neededMarkersKey] {
+		return needed[col]
+	}
+	return needed[neededUnqualKey(col)] || needed[neededQualKey(qual, col)]
 }
 
 // outputColumnNames returns every column name read ABOVE the statement's
@@ -74,6 +112,7 @@ func outputColumnNames(s *parser.SelectStmt) (map[string]bool, bool) {
 		return nil, false
 	}
 	dst := make(map[string]bool, 16)
+	dst[neededMarkersKey] = true
 	if !collectOutputColumnNames(s, dst) {
 		return nil, false
 	}
@@ -91,8 +130,15 @@ func collectOutputColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// reference is a dropped column, so they decline as a group. Mirrors
 	// collectStmtColumnNames.
 	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
-		len(s.ValuesRows) != 0 || s.GroupingSets != nil ||
+		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its
+	// sets list (ROLLUP/CUBE/GROUPING SETS expand to them), so walking every
+	// set's expressions accounts for it — TPC-DS Q18's ROLLUP had made the
+	// whole needed set unknown and every index-only path unofferable.
+	if !collectGroupingSetColumnNames(s.GroupingSets, dst) {
 		return false
 	}
 	for _, t := range s.Targets {
@@ -241,8 +287,15 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// Shapes whose column usage this walker does not model; an unaccounted
 	// reference is a dropped column, so they decline as a group.
 	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
-		len(s.ValuesRows) != 0 || s.GroupingSets != nil ||
+		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its
+	// sets list (ROLLUP/CUBE/GROUPING SETS expand to them), so walking every
+	// set's expressions accounts for it — TPC-DS Q18's ROLLUP had made the
+	// whole needed set unknown and every index-only path unofferable.
+	if !collectGroupingSetColumnNames(s.GroupingSets, dst) {
 		return false
 	}
 	for _, t := range s.Targets {
@@ -285,6 +338,7 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 			}
 			for _, u := range jn.Using {
 				dst[u] = true
+				dst[neededUnqualKey(u)] = true
 			}
 			if !collectExprColumnNames(jn.On, dst) {
 				return false
@@ -318,6 +372,13 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 	switch x := e.(type) {
 	case *parser.ColumnRef:
 		dst[x.Column] = true
+		// M0146-0005bq-b: which relation the name was read FROM, as far as
+		// the text says — see neededQualKey.
+		if x.Table == "" {
+			dst[neededUnqualKey(x.Column)] = true
+		} else {
+			dst[neededQualKey(x.Table, x.Column)] = true
+		}
 		return true
 
 	// Leaves that provably carry no column reference.
@@ -408,4 +469,19 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		// and is now handled above — it was declining TPC-H Q7/Q8/Q9.)
 		return false
 	}
+}
+
+// collectGroupingSetColumnNames adds every column the grouping sets name.
+func collectGroupingSetColumnNames(gs *parser.GroupingSetsSpec, dst map[string]bool) bool {
+	if gs == nil {
+		return true
+	}
+	for _, set := range gs.Sets {
+		for _, e := range set {
+			if !collectExprColumnNames(e, dst) {
+				return false
+			}
+		}
+	}
+	return true
 }

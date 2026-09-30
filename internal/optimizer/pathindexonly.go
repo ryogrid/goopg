@@ -60,7 +60,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 				continue
 			}
 		}
-		needed := s.neededColumnsOf(tbl)
+		needed := s.neededColumnsOfRel(rel, tbl)
 		if len(needed) == 0 {
 			// Nothing read from this relation at all — the walker and the
 			// plan disagree about what this rel is for; a scan emitting no
@@ -102,6 +102,28 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 // which of THIS table's columns does the statement read? Name-matched against
 // the statement-wide set, which over-states rather than under-states — see
 // pathindexonlyneed.go.
+// neededColumnsOfRel is neededColumnsOf for the relation `rel` reads
+// `tbl` as: a column only another alias of the same table reads by
+// qualified name is not needed here (M0146-0005bq-b, pathindexonlyneed.go).
+func (s *searchCtx) neededColumnsOfRel(rel *RelOptInfo, tbl *catalog.Table) []catalog.Column {
+	qual := ""
+	if rel != nil {
+		if id, _, ok := scanLeafFor(rel.baseLeaf); ok && id != nil {
+			qual = id.alias
+			if qual == "" {
+				qual = tbl.Name
+			}
+		}
+	}
+	out := make([]catalog.Column, 0, len(tbl.Columns))
+	for _, c := range tbl.Columns {
+		if neededColumnNamedFor(s.neededCols, qual, c.Name) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	out := make([]catalog.Column, 0, len(tbl.Columns))
 	for _, c := range tbl.Columns {
@@ -150,11 +172,11 @@ func consumingIndexClauses(cat catalog.Catalog, tbl *catalog.Table, idx *catalog
 // a covering index, every local qual consumed). The plain restriction
 // producer asks it so that exactly one of the two builds the path, as
 // build_index_paths' single `index_only_scan` flag does.
-func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
 	if !s.neededColsKnown || indexOnlyHardDisabled(cat) {
 		return false
 	}
-	needed := s.neededColumnsOf(tbl)
+	needed := s.neededColumnsOfRel(rel, tbl)
 	if len(needed) == 0 {
 		return false
 	}

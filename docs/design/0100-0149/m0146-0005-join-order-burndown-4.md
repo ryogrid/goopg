@@ -736,3 +736,54 @@ Still plain, and ledgered:
   PG makes it index-only too.
 
 Evidence: `analysis/m0146/m0146-0005/slice69/`.
+
+## Slice 70: M0146-0005br — the index-only needed set is attributed per alias, and grouping sets no longer void it
+
+Slice 69 left TPC-DS Q18's `cd2` and Q50's `d1` as plain Index Scan probes.
+`check_index_only` asks what THIS relation's reltarget and clauses read.
+goopg answers from a statement-wide set of column names (the M0134-0187
+approximation), so a column that another alias of the same table reads
+(`cd1.cd_gender`, `d2.d_year`) counted as needed for `cd2` / `d1`. Q18 was
+additionally blocked by its `GROUP BY ROLLUP`: the collector declined any
+statement with grouping sets, which made the whole needed set unknown.
+
+- The collector (`collectExprColumnNames`, pathindexonlyneed.go) records a
+  marker key for each reference it walks: the qualifier the reference was
+  written with, or the fact that it had none (USING columns count as
+  unqualified). A sentinel key says the markers are present.
+- `neededColumnNamedFor(set, qual, col)` then decides per relation:
+  - a column is needed when some reference to it is unqualified, or is
+    qualified by the relation's own alias (or table name);
+  - without markers or without a qualifier it falls back to the plain name.
+  
+  Unqualified references still count for every relation, so the
+  attribution only removes what another alias's qualified reads added;
+  it never goes below what the relation itself reads.
+- `neededColumnsOfRel` feeds all three index-only producers: the base
+  index-only paths, the restriction path's single-path rule and the
+  parameterised probe. The search boundary's hole filler
+  (relfromjoinlist.go) uses the same rule with the leaf's alias, so a
+  column pruned by the producer is padded rather than refused.
+- Both collectors now walk `GroupingSets.Sets` instead of declining.
+  ROLLUP, CUBE and GROUPING SETS read exactly the expressions their sets
+  list. A `GROUPING()` call still declines through the default arm.
+
+Test: `TestIndexOnlyProbePerAlias` uses a PG 18.3 oracle where `p p1` reads
+`x` and `p p2` reads only `id`. PG plans an Index Scan for p1 and an Index
+Only Scan for p2, and returns count 20. The test fails with the change
+reverted.
+
+Movement (fire set):
+
+- PLAN-PARITY match SF0.25 33 → 35 (Q18, Q50), SF1 26 → 27 (Q50).
+- CATEGORIES-EXCL-MATCH scan-type SF0.25 32 → 30, SF1 37 → 36.
+- Four fires: Q22 and Q67 (ROLLUP queries) change plans without any
+  category movement. All four execute at both scales.
+- ea-ratchet stays at 10. TPC-H plans are identical. Units, spotcheck, the
+  sweep (96/96) and the arm (24/24) pass.
+- Regress: create\_index's diff against PG shrinks from 1804 to 1788 lines
+  (PG's `Index Only Scan using tenk1_hundred` is now reproduced), and
+  groupingsets is unchanged. join.sql shows its flaps plus one Index Only
+  Scan line.
+
+Evidence: `analysis/m0146/m0146-0005/slice70/`.
