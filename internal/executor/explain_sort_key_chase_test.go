@@ -157,3 +157,39 @@ func TestSortKeyDeparsesThroughFirstUnionArm(t *testing.T) {
 		t.Fatalf("want PG's `Sort Key: ua.v, ua.id`:\n%s", plain)
 	}
 }
+
+// TestGroupKeyDeparsesThroughInlinedCTE pins M0146-0005cc against PG 18.3:
+// a single-reference CTE is inlined (no CTE Scan in PG's plan), so an upper
+// key over a UNION of such CTEs deparses into the first CTE body — TPC-DS
+// Q33/Q60's `Group Key: item.i_manufact_id` where goopg printed
+// `ss.i_manufact_id`. PG on this fixture prints the outer
+//
+//	GroupAggregate
+//	  Group Key: it.m
+func TestGroupKeyDeparsesThroughInlinedCTE(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{"CREATE TABLE it (i int, m int)", "CREATE TABLE sa (i int, v int)", "CREATE TABLE ca2 (i int, v int)",
+		"INSERT INTO it SELECT g, g % 10 FROM generate_series(1,200) g",
+		"INSERT INTO sa SELECT g % 200 + 1, g FROM generate_series(1,2000) g",
+		"INSERT INTO ca2 SELECT g % 200 + 1, g FROM generate_series(1,2000) g",
+		"ANALYZE it", "ANALYZE sa", "ANALYZE ca2"} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	ps.EnableHashAgg = false
+	var first string
+	for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) WITH ss AS (SELECT it.m, sum(sa.v) tot FROM sa, it WHERE sa.i = it.i GROUP BY it.m), "+
+		"cs AS (SELECT it.m, sum(ca2.v) tot FROM ca2, it WHERE ca2.i = it.i GROUP BY it.m) "+
+		"SELECT m, sum(tot) FROM (SELECT * FROM ss UNION ALL SELECT * FROM cs) tmp1 GROUP BY m ORDER BY m", ps)) {
+		if len(r) > 0 && r[0].Kind == KindString {
+			if s := strings.TrimSpace(r[0].StringValue()); first == "" && strings.HasPrefix(s, "Group Key:") {
+				first = s
+			}
+		}
+	}
+	if first != "Group Key: it.m" {
+		t.Fatalf("outer Group Key = %q, want PG's %q", first, "Group Key: it.m")
+	}
+}

@@ -994,6 +994,34 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			crossedJoin = true
 			depth--
 			continue
+		case *optimizer.CTEScan:
+			// M0146-0005cc: an INLINED CTE reference is PG's flattened
+			// subquery — there is no CTE Scan in PG's plan, so an upper key
+			// deparses into the body's own columns (TPC-DS Q33/Q60's
+			// `item.i_manufact_id` where goopg stopped at `ss.i_manufact_id`).
+			// The scan publishes the body's columns at the same positions.
+			// A materialised CTE keeps its scan (and its name) in PG too,
+			// and a recursive self-reference has no body to enter: both
+			// keep today's text.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || !n.Inlined() || n.Child == nil || col.Index < 0 {
+				return nil, false
+			}
+			bout := n.Child.Output()
+			if col.Index >= len(bout) || len(bout) != len(n.Output()) {
+				return nil, false
+			}
+			moved := *col
+			moved.Name = bout[col.Index].Name
+			moved.SourceTableIdx = bout[col.Index].SourceTableIdx
+			cur, node = &moved, n.Child
+			crossedJoin = true
+			if reg != nil {
+				reg.chaseCrossedLevel = true
+			}
+			wantRel, wantName = 0, ""
+			depth--
+			continue
 		case *optimizer.SetOp:
 			// M0146-0005cb: set_deparse_plan (ruleutils.c) makes an
 			// Append's FIRST child its outer plan, so a key over a UNION
@@ -1019,6 +1047,9 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			moved.SourceTableIdx = lout[col.Index].SourceTableIdx
 			cur, node = &moved, n.Left
 			crossedJoin = true
+			if reg != nil {
+				reg.chaseCrossedLevel = true
+			}
 			// The arm names its own columns: the key's relation id and
 			// name belong to the level above.
 			wantRel, wantName = 0, ""
@@ -1146,7 +1177,7 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 					return nil, false
 				}
 				if crossedJoin {
-					return pinKeyExprNames(t, n.Child, reg)
+					return pinKeyExprNames(t, n, reg)
 				}
 				return t, true
 			}
@@ -1173,13 +1204,26 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			// scans it when the path is a plain one (joins, row-order
 			// wrappers), so it renders in that scan's naming context; any
 			// other path keeps stopping here.
-			if at, ok := resolveKeySource(tc, c, reg); ok {
+			prevLevel := reg != nil && reg.chaseCrossedLevel
+			if reg != nil {
+				reg.chaseCrossedLevel = false
+			}
+			at, ok := resolveKeySource(tc, c, reg)
+			lvl := reg != nil && reg.chaseCrossedLevel
+			if reg != nil {
+				reg.chaseCrossedLevel = prevLevel || lvl
+			}
+			if ok {
 				// Only when the scan reached is the relation tc names:
 				// the target's relation id is the rendering's truth, and
 				// a positional walk that lands elsewhere (a FULL join's
 				// merged columns) keeps tc (regress partition_join).
+				// Across a query-level boundary (an inlined CTE body, a
+				// UNION arm) ids restart, so the comparison cannot apply
+				// (M0146-0005cc: TPC-DS Q33's `ss.i_manufact_id` →
+				// `item.i_manufact_id`).
 				if ac, isCol := at.(*optimizer.ColumnRef); isCol && ac.Name == tc.Name &&
-					ac.SourceTableIdx == tc.SourceTableIdx {
+					(lvl || ac.SourceTableIdx == tc.SourceTableIdx) {
 					return at, true
 				}
 			}
@@ -1226,7 +1270,7 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 						return nil, false
 					}
 					if crossedJoin {
-						return pinKeyExprNames(gc, n.Child, reg)
+						return pinKeyExprNames(gc, n, reg)
 					}
 					return gc, true
 				}
@@ -1239,7 +1283,7 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			}
 			call, ok := synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
 			if ok && crossedJoin {
-				return pinKeyExprNames(call, n.Child, reg)
+				return pinKeyExprNames(call, n, reg)
 			}
 			return call, ok
 		default:
@@ -2446,6 +2490,11 @@ type subPlanReg struct {
 	// being printed instead, a relation id reused at another query level in
 	// the subtree (planner ids restart per level) would make the qualifier
 	// ambiguous and print the bare name.
+	// chaseCrossedLevel is set by resolveKeySource's arms that enter another
+	// query level (an inlined CTE body, a UNION arm), where relation ids
+	// restart; the Project arm's descent reads it to know the landing
+	// column's id cannot be compared with its own target's (M0146-0005cc).
+	chaseCrossedLevel bool
 	pinnedKeyName map[*optimizer.ColumnRef]string
 	// boundaryKeyName is a key the chase stopped at a Subquery Scan PG keeps
 	// (one with quals), named `alias.col`: always qualified, since a plan

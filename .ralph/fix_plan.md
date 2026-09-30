@@ -23809,6 +23809,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q5 Q14 Q23 Q49 Q76 Q77 Q80\), regress 12 cases \(union 968 → 953,
     inherit three keys to PG\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 17 -> 16 (SF1 20 unchanged); regress union 968 -> 953
+- [x] **M0146\-0005cc — a key deparses through an inlined CTE** \(filed and
+  landed 2026\-10\-01 by the rendering census: Q33/Q60 `ss.i\_manufact\_id`
+  vs PG `item.i\_manufact\_id`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 82\)\.** `resolveKeySource` inlined
+    `\*CTEScan` arm; `reg.chaseCrossedLevel` lets the Project descent accept
+    a landing across a level boundary; body names pinned from the node
+    itself\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 82"\.
+  - Test `TestGroupKeyDeparsesThroughInlinedCTE` \(fails with the arm
+    off\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q33 Q56 Q60 Q83\), regress 12 cases unchanged, ea\-ratchet PASS
+    \(10\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 16 -> 15, SF1 20 -> 19
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

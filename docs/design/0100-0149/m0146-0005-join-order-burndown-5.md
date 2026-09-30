@@ -577,3 +577,44 @@ Movement:
   cases) and ea-ratchet (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice81/`.
+
+## Slice 82: M0146-0005cc — a key deparses through an inlined CTE
+
+A single-reference CTE is inlined as a subquery and flattened, so PG's plan
+has no CTE Scan for it. A key over a UNION of such CTEs therefore deparses
+into the first body: TPC-DS Q33/Q60 print `Group Key: item.i_manufact_id`,
+where goopg stopped at the CTE reference (`ss.i_manufact_id`).
+
+- `resolveKeySource` gains an inlined `*CTEScan` arm. It steps into the
+  body at the same position and pins names as past a join. A materialised
+  CTE keeps its scan (and name) in PG too, and a recursive self-reference
+  has no body to enter, so both keep today's text.
+- **Level-crossing flag.** Slice 79's Project-arm descent accepted a landing
+  column only if its relation id equalled the target's. Across an inlined
+  CTE body or a UNION arm the ids restart, so they never compare. The
+  crossing arms now set `reg.chaseCrossedLevel`, and the descent accepts
+  the landing on name alone when the flag is set.
+- The names of a key found inside a body are pinned from the Aggregate or
+  Project node itself, not its child: the body aggregate's own Group Key
+  line resolves `item` from there.
+
+Test: `TestGroupKeyDeparsesThroughInlinedCTE`, whose PG 18.3 oracle is the
+outer `Group Key: it.m`. It fails with the arm disabled.
+
+Movement:
+
+- CATEGORIES-EXCL-MATCH rendering goes SF0.25 16 → 15 and SF1 20 → 19; the
+  Group Key lines of Q33, Q56 and Q60 now match PG, with no new rendering
+  divergence.
+- Regress (12 cases) is unchanged apart from join.sql's known row-order
+  flap.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Not done (ledgered): an aggregate's arguments are not chased. Q33/Q60's
+Sort Key `(sum(ss.total_sales))` needs PG's
+`(sum((sum(store_sales.ss_ext_sales_price))))`, including PG's forced
+parentheses around a non-Var referent inside the call. Other leftovers are
+grouping-set (MixedAggregate) keys (Q5/Q77) and Q61/Q66's chase failures.
+
+Evidence: `analysis/m0146/m0146-0005/slice82/`.
