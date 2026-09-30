@@ -267,3 +267,59 @@ Movement (fire set):
   pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice75/`.
+
+## Slice 76: M0146-0005bw — a CTE scan carries its body's ordering to the grouping stage
+
+TPC-DS Q24 groups and orders its `ssales` CTE by a prefix of the CTE's
+own group key. PG 18.3 plans a GroupAggregate directly over the CTE Scan,
+with no Sort below it or above it:
+
+- `set_cte_pathlist` (allpaths.c, PG 17+) gives the scan the body's
+  pathkeys through `convert_subquery_pathkeys`.
+- `add_paths_to_grouping_rel`'s `is_sorted` test takes a presorted input
+  path without a Sort.
+- `create_agg_path` copies the subpath's pathkeys, so the ORDER BY is
+  already satisfied.
+
+goopg had the first rule only inside the join search
+(`addCTEScanPathkeys`). A one-relation query never reaches that search,
+and the grouping stage always stacked a Sort over a finished child.
+
+- `inputNodePathkeys` gains a `*CTEScan` arm: a positional-identity step
+  onto the body, like `*SubqueryScan`. A recursive self-reference wraps a
+  WorkTableScan and is refused one step down.
+- `addGroupingPaths`' SORTED arm has an `is_sorted` offer. When the finished
+  child's derived ordering (`inputNodePathkeys`) contains the group
+  pathkeys, it files AGG\_SORTED over the child itself, carrying those
+  pathkeys, and offers no Sort over that same path.
+- `aggregateEmissionPathkeys` reads that derived ordering for any other
+  child, so the ORDERED step sees the aggregate's emission order.
+  `groupingEmissionPathkeys`, its path-level sibling, already reads the
+  child path's pathkeys.
+- The same arm catches TPC-DS Q65's second-level `GROUP BY ss_store_sk` over
+  the sorted `(ss_store_sk, ss_item_sk)` GroupAggregate, which is now a
+  GroupAggregate as in PG instead of a HashAggregate.
+
+Test: `TestGroupAggOverSortedCTEScanSkipsSort` pins the PG 18.3 shape: one
+Sort (the body's), the GroupAggregate directly over `CTE Scan on s` with
+the ORDER BY satisfied, count 50 and sum 12502500. It fails with the
+grouping arm disabled.
+
+Movement (fire set):
+
+- PLAN-PARITY match goes SF0.25 36 → 37 (Q24). SF1 stays at 28; there Q24
+  differs only by a parallel hash flag inside the CTE body.
+- CATEGORIES-EXCL-MATCH:
+  - join-order SF0.25 54 → 53, SF1 62 → 61;
+  - sort-strategy SF0.25 33 → 32, SF1 36 → 35;
+  - rendering +1 at both scales: Q65's two derived tables now line up node
+    for node, which exposes the `store_sales` vs `store_sales_1` alias
+    choice.
+- TPC-H plans are identical. Units, spotcheck, sweep 96/96, arm 24/24 and
+  ea-ratchet (10) pass.
+
+Not done (ledgered): the PLAIN presorted-aggregate arm, the rollup arm and
+the partial-aggregate split arm do not read `is_sorted` from a derived
+ordering yet.
+
+Evidence: `analysis/m0146/m0146-0005/slice76/`.

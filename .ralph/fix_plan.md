@@ -23700,6 +23700,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(8 fires\), regress 22 numbered cases \(subselect 2811 → 2806; others
     shape\-only renumbering or known flaps\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0.25 33 -> 30, SF1 40 -> 36; match unchanged (SF0.25 36, SF1 28)
+- [x] **M0146\-0005bw — a CTE scan carries its body\'s ordering to the
+  grouping stage** \(filed and landed 2026\-09\-30 by the census: TPC\-DS
+  Q24 SF0.25\'s only differences were a Sort over the ssales CTE Scan
+  under the outer GroupAggregate and a Sort above it\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 76\)\.** `inputNodePathkeys` `\*CTEScan`
+    arm \(set\_cte\_pathlist\); the `is\_sorted` offer in
+    `addGroupingPaths`\' SORTED arm \(add\_paths\_to\_grouping\_rel\);
+    `aggregateEmissionPathkeys` reads a derived child ordering\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 76"\.
+  - Test `TestGroupAggOverSortedCTEScanSkipsSort` \(fails with the arm
+    disabled\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q24 Q65\), TPC\-H census identical, ea\-ratchet PASS \(10\)\.
+  Movement: yes — match SF0.25 36 -> 37; CATEGORIES-EXCL-MATCH join-order SF0.25 54 -> 53, SF1 62 -> 61; sort-strategy SF0.25 33 -> 32, SF1 36 -> 35
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

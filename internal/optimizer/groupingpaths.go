@@ -548,7 +548,28 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// Q93: PG's `Sort -> Gather` beats a per-worker Sort under a
 			// Gather Merge by 0.03).
 			idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat)
-			if !ok {
+			// M0146-0005bw: add_paths_to_grouping_rel's is_sorted test
+			// (planner.c) — an input path whose pathkeys already contain the
+			// group pathkeys feeds AGG_SORTED with no Sort. The finished child
+			// carries its ordering only as a derivation (inputNodePathkeys:
+			// a CTE scan over a sorted body, a sorted aggregate, a Sort); the
+			// searched-input candidates below cover the join-search case.
+			isSorted := false
+			if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
+				pathkeysContainedIn(seedKeys, pathkeysForSortKeys(keys)) {
+				sorted := *seed
+				sorted.Pathkeys = seedKeys
+				presortedSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
+						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sorted.Pathkeys, Children: []*Path{&sorted},
+				}, groupAggSortedProducer)
+				isSorted = true // upstream offers no Sort over this same path
+			}
+			if !ok && !isSorted {
 				// M0144-0003c: narrowed seed — see sortSeed above.
 				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
 				// R47 slice 1: per-candidate spec clone (see PLAIN arm).

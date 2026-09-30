@@ -359,6 +359,20 @@ func inputNodePathkeys(input Node) []PathKey {
 			}
 			renamed = true
 			n = t.Child
+		case *CTEScan:
+			// M0146-0005bw: set_cte_pathlist (allpaths.c) gives a CTE scan
+			// the body's own pathkeys through convert_subquery_pathkeys
+			// (PG 17+): the body is materialised once, in the order it
+			// emits, and every scan replays that buffer front to back. The
+			// scan publishes the body's columns position for position, so
+			// it is a positional-identity step like SubqueryScan below. A
+			// recursive self-reference wraps a WorkTableScan, which the walk
+			// refuses one step down.
+			if t.Child == nil || len(t.Child.Output()) != limit {
+				return nil
+			}
+			renamed = true
+			n = t.Child
 		case *SubqueryScan:
 			// M0146-0005ax: the labelling wrapper publishes its subplan's
 			// rows position for position under the reference's own column
@@ -498,6 +512,13 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		// with no Sort node on top (addGroupingPaths' searchcand arm), and
 		// the sorted aggregate over it still emits in group-key order.
 		if keys := searchedTreePathkeys(c); len(keys) > 0 {
+			childPathkeys = keys
+		} else if keys := inputNodePathkeys(c); len(keys) > 0 {
+			// M0146-0005bw: any other ordered input the walk can derive —
+			// the is_sorted grouping arm (addGroupingPaths) now elects an
+			// AGG_SORTED over a presorted CTE scan or sorted aggregate
+			// with no Sort between, and the emission follows that input's
+			// order exactly as create_agg_path copies subpath->pathkeys.
 			childPathkeys = keys
 		} else {
 			return nil

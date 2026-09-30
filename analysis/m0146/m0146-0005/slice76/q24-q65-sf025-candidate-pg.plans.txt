@@ -1,0 +1,127 @@
+=== Q24
+                                                                                                      QUERY PLAN                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=19324.17..19324.22 rows=1 width=358)
+   Group Key: ssales.c_last_name, ssales.c_first_name, ssales.s_store_name
+   Filter: (sum(ssales.netpaid) > (InitPlan 2).col1)
+   CTE ssales
+     ->  GroupAggregate  (cost=19324.09..19324.13 rows=1 width=158)
+           Group Key: customer.c_last_name, customer.c_first_name, store.s_store_name, customer_address.ca_state, store.s_state, item.i_color, item.i_current_price, item.i_manager_id, item.i_units, item.i_size
+           ->  Sort  (cost=19324.09..19324.09 rows=1 width=132)
+                 Sort Key: customer.c_last_name, customer.c_first_name, store.s_store_name, customer_address.ca_state, store.s_state, item.i_color, item.i_current_price, item.i_manager_id, item.i_units, item.i_size
+                 ->  Nested Loop  (cost=17353.28..19324.08 rows=1 width=132)
+                       ->  Gather  (cost=17352.99..19323.77 rows=1 width=77)
+                             Workers Planned: 1
+                             ->  Nested Loop  (cost=16352.99..18323.67 rows=1 width=77)
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                   ->  Nested Loop  (cost=16352.70..18322.91 rows=2 width=98)
+                                         ->  Parallel Hash Join  (cost=16352.41..18322.26 rows=2 width=37)
+                                               Hash Cond: ((store_returns.sr_ticket_number = store_sales.ss_ticket_number) AND (store_returns.sr_item_sk = store_sales.ss_item_sk))
+                                               ->  Parallel Seq Scan on store_returns  (cost=0.00..1653.62 rows=42162 width=8)
+                                               ->  Parallel Hash  (cost=16074.81..16074.81 rows=18507 width=37)
+                                                     ->  Hash Join  (cost=1.16..16074.81 rows=18507 width=37)
+                                                           Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                           ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=22)
+                                                           ->  Hash  (cost=1.15..1.15 rows=1 width=23)
+                                                                 ->  Seq Scan on store  (cost=0.00..1.15 rows=1 width=23)
+                                                                       Filter: (s_market_id = 5)
+                                         ->  Index Scan using customer_pkey on customer  (cost=0.29..0.33 rows=1 width=69)
+                                               Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+                                   ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=32)
+                                         Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                                         Filter: ((customer.c_birth_country)::text <> upper((ca_country)::text))
+                       ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=67)
+                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
+   InitPlan 2
+     ->  Aggregate  (cost=0.02..0.04 rows=1 width=32)
+           ->  CTE Scan on ssales ssales_1  (cost=0.00..0.02 rows=1 width=32)
+   ->  CTE Scan on ssales  (cost=0.00..0.02 rows=1 width=358)
+         Filter: (i_color = 'aquamarine'::bpchar)
+(36 rows)
+
+                                                                                                      QUERY PLAN                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=19324.17..19324.22 rows=1 width=358)
+   Group Key: ssales.c_last_name, ssales.c_first_name, ssales.s_store_name
+   Filter: (sum(ssales.netpaid) > (InitPlan 2).col1)
+   CTE ssales
+     ->  GroupAggregate  (cost=19324.09..19324.13 rows=1 width=158)
+           Group Key: customer.c_last_name, customer.c_first_name, store.s_store_name, customer_address.ca_state, store.s_state, item.i_color, item.i_current_price, item.i_manager_id, item.i_units, item.i_size
+           ->  Sort  (cost=19324.09..19324.09 rows=1 width=132)
+                 Sort Key: customer.c_last_name, customer.c_first_name, store.s_store_name, customer_address.ca_state, store.s_state, item.i_color, item.i_current_price, item.i_manager_id, item.i_units, item.i_size
+                 ->  Nested Loop  (cost=17353.28..19324.08 rows=1 width=132)
+                       ->  Gather  (cost=17352.99..19323.77 rows=1 width=77)
+                             Workers Planned: 1
+                             ->  Nested Loop  (cost=16352.99..18323.67 rows=1 width=77)
+                                   Join Filter: (store.s_zip = customer_address.ca_zip)
+                                   ->  Nested Loop  (cost=16352.70..18322.91 rows=2 width=98)
+                                         ->  Parallel Hash Join  (cost=16352.41..18322.26 rows=2 width=37)
+                                               Hash Cond: ((store_returns.sr_ticket_number = store_sales.ss_ticket_number) AND (store_returns.sr_item_sk = store_sales.ss_item_sk))
+                                               ->  Parallel Seq Scan on store_returns  (cost=0.00..1653.62 rows=42162 width=8)
+                                               ->  Parallel Hash  (cost=16074.81..16074.81 rows=18507 width=37)
+                                                     ->  Hash Join  (cost=1.16..16074.81 rows=18507 width=37)
+                                                           Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                           ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=22)
+                                                           ->  Hash  (cost=1.15..1.15 rows=1 width=23)
+                                                                 ->  Seq Scan on store  (cost=0.00..1.15 rows=1 width=23)
+                                                                       Filter: (s_market_id = 5)
+                                         ->  Index Scan using customer_pkey on customer  (cost=0.29..0.33 rows=1 width=69)
+                                               Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+                                   ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=32)
+                                         Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                                         Filter: ((customer.c_birth_country)::text <> upper((ca_country)::text))
+                       ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=67)
+                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
+   InitPlan 2
+     ->  Aggregate  (cost=0.02..0.04 rows=1 width=32)
+           ->  CTE Scan on ssales ssales_1  (cost=0.00..0.02 rows=1 width=32)
+   ->  CTE Scan on ssales  (cost=0.00..0.02 rows=1 width=358)
+         Filter: (i_color = 'seashell'::bpchar)
+(36 rows)
+
+=== Q65
+                                                                          QUERY PLAN                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=39165.16..39165.33 rows=68 width=202)
+   ->  Sort  (cost=39165.16..39165.33 rows=68 width=202)
+         Sort Key: store.s_store_name, item.i_item_desc
+         ->  Nested Loop  (cost=37990.95..39163.09 rows=68 width=202)
+               ->  Merge Join  (cost=37990.66..39035.88 rows=68 width=41)
+                     Merge Cond: (store_sales.ss_store_sk = store_sales_1.ss_store_sk)
+                     Join Filter: ((sum(store_sales.ss_sales_price)) <= (0.1 * (avg((sum(store_sales_1.ss_sales_price))))))
+                     ->  GroupAggregate  (cost=18994.66..19466.70 rows=3413 width=40)
+                           Group Key: store_sales.ss_store_sk, store_sales.ss_item_sk
+                           ->  Gather Merge  (cost=18994.66..19398.44 rows=3413 width=14)
+                                 Workers Planned: 3
+                                 ->  Sort  (cost=17994.62..17997.38 rows=1101 width=14)
+                                       Sort Key: store_sales.ss_store_sk, store_sales.ss_item_sk
+                                       ->  Parallel Hash Join  (cost=2071.21..17939.00 rows=1101 width=14)
+                                             Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=18)
+                                             ->  Parallel Hash  (cost=2068.55..2068.55 rows=213 width=4)
+                                                   ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=213 width=4)
+                                                         Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+                     ->  Materialize  (cost=18996.00..19522.44 rows=12 width=45)
+                           ->  Merge Join  (cost=18996.00..19522.41 rows=12 width=45)
+                                 Merge Cond: (store.s_store_sk = store_sales_1.ss_store_sk)
+                                 ->  Sort  (cost=1.34..1.37 rows=12 width=9)
+                                       Sort Key: store.s_store_sk
+                                       ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=9)
+                                 ->  GroupAggregate  (cost=18994.66..19520.40 rows=200 width=36)
+                                       Group Key: store_sales_1.ss_store_sk
+                                       ->  GroupAggregate  (cost=18994.66..19466.70 rows=3413 width=40)
+                                             Group Key: store_sales_1.ss_store_sk, store_sales_1.ss_item_sk
+                                             ->  Gather Merge  (cost=18994.66..19398.44 rows=3413 width=14)
+                                                   Workers Planned: 3
+                                                   ->  Sort  (cost=17994.62..17997.38 rows=1101 width=14)
+                                                         Sort Key: store_sales_1.ss_store_sk, store_sales_1.ss_item_sk
+                                                         ->  Parallel Hash Join  (cost=2071.21..17939.00 rows=1101 width=14)
+                                                               Hash Cond: (store_sales_1.ss_sold_date_sk = date_dim_1.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..15258.18 rows=232218 width=18)
+                                                               ->  Parallel Hash  (cost=2068.55..2068.55 rows=213 width=4)
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2068.55 rows=213 width=4)
+                                                                           Filter: ((d_month_seq >= 1176) AND (d_month_seq <= 1187))
+               ->  Index Scan using item_pkey on item  (cost=0.29..1.87 rows=1 width=169)
+                     Index Cond: (i_item_sk = store_sales.ss_item_sk)
+(41 rows)
+
