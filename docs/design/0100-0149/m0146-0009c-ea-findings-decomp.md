@@ -68,3 +68,41 @@ est=1 vs 22 likely same class.
 
 Three M0146-0009c rows flipped `resolved`: (a)/(b) PG-shared, no defect;
 (c) routed to M0146-0009e.
+
+## M0146-0009f (2026-09-30): the ten remaining findings
+
+Slices 64 through 67 (M0146-0005bl/bm/bn/bo) removed the Q34 and Q84
+findings and brought the Q78 and Q95 estimates in line with PG's. What
+remains is ten findings, sorted into two classes:
+
+- **PG-level estimate math, no goopg defect** (nine findings). At these
+  relsets PG builds no node, but at the comparable node goopg's estimate
+  equals PG's within a few percent. PG is also off by the same order from
+  the actual.
+  - Q14 ×3: `date_dim+item+*_sales` Gathers.
+  - Q78: the ss ⋈ ws Merge Left Join is 1403. PG's ss ⋈ cs is 1381, and
+    both sit against 123049 actual.
+  - Q92: web\_sales ⋈ date\_dim over a 90-day range is 232. That is
+    |ws| × 93 / 73049, PG's `1/max(nd)` join selectivity. goopg's
+    decorrelation of the scalar subquery is the separate, routed
+    divergence.
+  - Q95: the four-way join's outer estimate is 1 in both engines. PG
+    applies the ws\_wh semi join at another relset.
+  - Q23 ×2: the catalog\_sales/web\_sales ⋈ date\_dim Gathers are
+    151 / 76 (PG 147 / 74).
+  - Q23: the web\_sales ⋈ customer semi join is 38 against actual 0; PG's
+    estimate is equally far from 0.
+- **Unexplained divergence** (Q23 `cs ⋈ date_dim ⋈ frequent_ss_items`).
+  goopg is 76 and PG is 42, against actual 0, so the finding is
+  unwinnable either way. PG's semi fraction is 0.2865, which equals
+  |CTE| / nd(cs\_item\_sk) = 4582 / 15993. goopg's is the default 0.5.
+  PG probes (`analysis/m0146/m0146-0009f/`):
+  - The fraction appears only when the grouped CTE carries a HAVING, even
+    `count(*) > 0`.
+  - The same CTE without HAVING gives 0.5.
+  - The PG 18.3 source read so far does not produce this split.
+    `examine_simple_variable` returns at a multi-key groupClause, and
+    `get_variable_numdistinct` then gives the 200 default below the CTE's
+    rows.
+  - Filed as M0146-0009g: resolve the mechanism on an instrumented
+    PG 18.3 (M0144-0004's OPTIMIZER\_DEBUG build) before changing goopg.

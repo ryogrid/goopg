@@ -1,0 +1,9 @@
+PG 18.3 (:65438, tpcds025), max_parallel_workers_per_gather=0; catalog_sales 360397 rows, nd(cs_item_sk)=15993, nullfrac 0
+variant                                                        CTE rows   semi rows   fraction
+A  3-key grouped CTE + HAVING count(*)>4, 2 refs (Q23 shape)     4582      103254      0.2865 (= 4582/15993)
+D  same, MATERIALIZED single ref                                  4582      103254      0.2865
+E  same with HAVING count(*)>0                                    4582      103254      0.2865
+B  3-key grouped CTE, no HAVING, 2 refs                          13746      180198      0.5000
+F  same, MATERIALIZED single ref                                 13746      180198      0.5000
+G  ungrouped MATERIALIZED CTE over store_sales (MCVs both sides)  7952      175918      0.4881
+goopg (tmp/zz-goopg on c20a/data-sf025): variant A/Q23 shape -> 0.5000 (180198), cs x date_dim x fsi 76 vs PG 42

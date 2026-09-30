@@ -23941,6 +23941,33 @@ M0146-0001 re-baseline census on the new default arm.
     sf025+sf1\); ea\-ratchet PASS \(52 fixed\) \+ baseline re\-pinned on
     EA\_PORT=5541 \(default 5534 was squatted by a foreign postgres —
     M0146\-0009d demonstrated live a second time\).
+- [x] **M0146\-0009f — classify the 10 remaining ea\-ratchet findings**
+  \(recon, 2026\-09\-30, after M0146\-0005bl/bm/bn/bo\)\.
+  Kind: recon
+  Parent: M0146\-0009
+  - **DONE 2026\-09\-30.** Design
+    `docs/design/0100\-0149/m0146\-0009c\-ea\-findings\-decomp\.md`
+    § "M0146\-0009f"; evidence `analysis/m0146/m0146\-0009f/`\.
+    - 9 findings are PG\-level math: Q14 ×3, Q78, Q92, Q95, Q23 ×3 \(the
+      goopg estimate equals PG\'s comparable node within a few percent;
+      PG is equally far from actual\)\.
+    - 1 is unexplained: the Q23 CTE semi fraction \(PG 0\.2865 =
+      |CTE|/nd1, goopg 0\.5\) → filed M0146\-0009g\.
+  Movement: none — ea-ratchet 10 -> 10 (recon)
+- [ ] **M0146\-0009g — Q23: PG\'s semi fraction against a grouped CTE with
+  HAVING** \(filed 2026\-09\-30 by M0146\-0009f\)\. PG 18\.3 gives
+  `cs_item_sk IN \(SELECT item_sk FROM frequent_ss_items\)` a semi fraction
+  of 4582/15993 = 0\.2865 when the 3\-key grouped CTE has a HAVING \(even
+  `count\(\*\) > 0`\), and 0\.5 without one; goopg always gives 0\.5\. The
+  PG source read so far \(examine\_simple\_variable\'s multi\-key
+  groupClause return, get\_variable\_numdistinct\'s default\) does not
+  explain the split\.
+  Kind: recon
+  Parent: M0146\-0009
+  - First step: on an instrumented PG 18\.3 \(M0144\-0004 OPTIMIZER\_DEBUG
+    build, or a private build with an elog in eqjoinsel\_semi\), print nd1,
+    nd2, isdefault1/2 and the clamps for variants A and F of
+    `analysis/m0146/m0146\-0009f/q23semi2\.sql`; then port the arm\.
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
