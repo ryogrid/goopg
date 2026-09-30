@@ -23793,6 +23793,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(Q53 Q63 Q67 Q89\), regress 12 cases \(union 970 → 968\), ea\-ratchet
     PASS \(10\)\.
   Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 17, SF1 20; Q53/Q63 keys now byte-identical but N4 already matched them); regress union 970 -> 968
+- [x] **M0146\-0005cb — a key over a UNION deparses through the first arm**
+  \(filed and landed 2026\-10\-01 from slice 79\'s ledger row: TPC\-DS
+  Q5/Q77 `channel` vs PG `\(\'store channel\'::text\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 81\)\.** `resolveKeySource` `\*SetOp` arm
+    \(UNION only, leftmost arm, pinned as past a join\); partition /
+    inheritance child scans decline \(`scanNodeTable`\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 81"\.
+  - Test `TestSortKeyDeparsesThroughFirstUnionArm` \(fails with the arm
+    off\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q5 Q14 Q23 Q49 Q76 Q77 Q80\), regress 12 cases \(union 968 → 953,
+    inherit three keys to PG\), ea\-ratchet PASS \(10\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 17 -> 16 (SF1 20 unchanged); regress union 968 -> 953
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

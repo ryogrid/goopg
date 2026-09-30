@@ -531,3 +531,49 @@ Movement:
   cases) and ea-ratchet (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice80/`.
+
+## Slice 81: M0146-0005cb — a key over a UNION deparses through the first arm
+
+`set_deparse_plan` (ruleutils.c) makes an Append's first child its outer
+plan. A key above a UNION ALL therefore prints the leftmost arm's
+expression: TPC-DS Q5/Q77 show `('store channel'::text)`, and regress
+union.sql shows `(1), (generate_series(1, 10))`. goopg printed the output
+label (`channel`), because `resolveKeySource` declined at a `*SetOp`.
+
+- **UNION arm:** a `*SetOp` with `Op == SetOpUnion` steps into `Left`,
+  whose columns sit at the same positions; a left-deep chain reaches the
+  leftmost arm one link at a time. INTERSECT and EXCEPT decline, because
+  PG's SetOp node deparses through its own flagged input. The arm is
+  another query level, so what the chase returns is pinned to its
+  evaluating node, as past a join, and the key's relation id and name stop
+  constraining it.
+- **Partition and inheritance children:** goopg builds these fan-outs as
+  UNION ALL SetOps too, but PG names such columns by the parent reference
+  (`prt1.a`). A scan of a relation with `PartitionParentOID` or
+  `InheritsParentOIDs` therefore declines (`scanNodeTable`), keeping
+  today's text.
+
+Test: `TestSortKeyDeparsesThroughFirstUnionArm`, with the PG 18.3 oracle
+
+    Group Key: ('a chan'::text), ua.id
+    Sort Key: ua.v, ua.id
+
+It fails with the arm disabled. goopg omits the literal's `::text` cast,
+which the test does not pin.
+
+Movement:
+
+- CATEGORIES-EXCL-MATCH rendering goes SF0.25 17 → 16. Per line, Q23, Q49
+  and Q76 lose their key-text divergences at both scales (SF1's query
+  count stays 20: Q49 and Q76 still differ elsewhere). No new rendering
+  divergence appears.
+- Regress: union.sql goes 968 → 953 diff lines. In inherit.sql three keys
+  now print PG's `tenk1.thousand, tenk1.tenthous` / `a.thousand,
+  a.tenthous`. One prints `(tenk1.thousand)`, because goopg casts the arm
+  to int8. That comes from the ledgered integer-literal typing (a bare
+  `42` is bigint in goopg and integer in PG, re-confirmed:
+  `pg_typeof(42)`), so the UNION column unifies to int8.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set, regress (12
+  cases) and ea-ratchet (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice81/`.

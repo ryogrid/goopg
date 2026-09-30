@@ -994,6 +994,36 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			crossedJoin = true
 			depth--
 			continue
+		case *optimizer.SetOp:
+			// M0146-0005cb: set_deparse_plan (ruleutils.c) makes an
+			// Append's FIRST child its outer plan, so a key over a UNION
+			// deparses through the leftmost arm's target list — TPC-DS
+			// Q5's `('store channel'::text)` where goopg printed the
+			// output label `channel`. A UNION publishes each arm's columns
+			// at the same positions, so the column steps into the left
+			// arm unrenumbered (a left-deep chain reaches the leftmost
+			// arm one link at a time). INTERSECT / EXCEPT decline: PG's
+			// SetOp node deparses through its own flagged input. The arm
+			// is another query level, so what the chase returns is pinned
+			// to its evaluating node, as past a join.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || n.Op != parser.SetOpUnion || n.Left == nil || col.Index < 0 {
+				return nil, false
+			}
+			lout := n.Left.Output()
+			if col.Index >= len(lout) || col.Index >= len(n.Output()) {
+				return nil, false
+			}
+			moved := *col
+			moved.Name = lout[col.Index].Name
+			moved.SourceTableIdx = lout[col.Index].SourceTableIdx
+			cur, node = &moved, n.Left
+			crossedJoin = true
+			// The arm names its own columns: the key's relation id and
+			// name belong to the level above.
+			wantRel, wantName = 0, ""
+			depth--
+			continue
 		case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan, *optimizer.BitmapHeapScan:
 			// M0146-0005bz: the chase ends at the relation: the column
 			// renders as that relation's own, qualified the way the scan
@@ -1013,6 +1043,14 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			src := &optimizer.ColumnRef{Index: col.Index, Name: out[col.Index].Name,
 				Type: out[col.Index].Type, SourceTableIdx: out[col.Index].SourceTableIdx}
 			if qualifierNamesCTE(reg, src, cteNames) {
+				return nil, false
+			}
+			// M0146-0005cb: a partition or inheritance child is scanned on
+			// its parent's behalf, and PG names such a column by the parent
+			// reference (`prt1.a`, regress partition_join), not the child
+			// relation the scan reads; goopg's scan carries no parent alias,
+			// so decline and keep today's text.
+			if t := scanNodeTable(n); t != nil && (t.PartitionParentOID != 0 || len(t.InheritsParentOIDs) > 0) {
 				return nil, false
 			}
 			if reg != nil && reg.names() != nil {
@@ -1209,6 +1247,21 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 		}
 	}
 	return nil, false
+}
+
+// scanNodeTable returns the relation a scan node reads, or nil.
+func scanNodeTable(n optimizer.Node) *catalog.Table {
+	switch t := n.(type) {
+	case *optimizer.SeqScan:
+		return t.Table
+	case *optimizer.IndexScan:
+		return t.Table
+	case *optimizer.IndexOnlyScan:
+		return t.Table
+	case *optimizer.BitmapHeapScan:
+		return t.Table
+	}
+	return nil
 }
 
 // pinKeyExprNames returns a copy of e whose columns render with the qualified

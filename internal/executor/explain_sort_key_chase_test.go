@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"github.com/goopg/goopg/internal/optimizer"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,45 @@ func TestSortKeyStopsAtKeptSubqueryScan(t *testing.T) {
 	}
 	if got := explainLine(t, ctx, q, "Sort Key:"); got != "Sort Key: tmp.av, tmp.s" {
 		t.Fatalf("got %q, want PG's %q", got, "Sort Key: tmp.av, tmp.s")
+	}
+}
+
+// TestSortKeyDeparsesThroughFirstUnionArm pins M0146-0005cb against PG 18.3:
+// set_deparse_plan makes an Append's first child the outer plan, so a key
+// over a UNION ALL prints the leftmost arm's expression (TPC-DS Q5/Q77's
+// `('store channel'::text)` where goopg printed the label `channel`). PG on
+// this fixture (goopg omits the `::text` literal cast, which is not pinned):
+//
+//	Group Key: ('a chan'::text), ua.id
+//	Sort Key: ('a chan'::text), ua.id
+//	Sort Key: ua.v, ua.id
+func TestSortKeyDeparsesThroughFirstUnionArm(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{"CREATE TABLE ua (id int, v int)", "CREATE TABLE ub (id int, v int)",
+		"INSERT INTO ua SELECT i, i FROM generate_series(1,100) i", "INSERT INTO ub SELECT i, i FROM generate_series(1,100) i",
+		"ANALYZE ua", "ANALYZE ub"} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	ps.EnableHashAgg = false
+	lines := func(q string) string {
+		var out []string
+		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)) {
+			if len(r) > 0 && r[0].Kind == KindString {
+				out = append(out, strings.TrimSpace(r[0].StringValue()))
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	grouped := lines("SELECT channel, id, sum(v) FROM (SELECT 'a chan' AS channel, id, v FROM ua UNION ALL SELECT 'b chan', id, v FROM ub) x GROUP BY channel, id ORDER BY channel, id")
+	for _, want := range []string{"Group Key: ('a chan'", "Sort Key: ('a chan'"} {
+		if !strings.Contains(grouped, want) || !strings.Contains(grouped, "), ua.id") {
+			t.Fatalf("want %q … ua.id (PG's first-arm deparse):\n%s", want, grouped)
+		}
+	}
+	if plain := lines("SELECT * FROM (SELECT id, v FROM ua UNION ALL SELECT id, v FROM ub) x ORDER BY v, id"); !strings.Contains(plain, "Sort Key: ua.v, ua.id") {
+		t.Fatalf("want PG's `Sort Key: ua.v, ua.id`:\n%s", plain)
 	}
 }
