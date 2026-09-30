@@ -533,6 +533,11 @@ type resolveContext struct {
 	// every context that is not a top-level FROM clause, same convention
 	// as joinlist/joinInfoList above.
 	antiForcedNullCols map[string]bool
+	// reducedFrom is the statement's FROM list with reduce_outer_joins'
+	// verdicts applied (planFromClauseItems), for readers that need the
+	// joins as the deconstruction sees them. The AST keeps the written
+	// types (M0146-0005bn); nil when the FROM walk did not run.
+	reducedFrom []parser.FromExpr
 
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
@@ -1659,6 +1664,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// permuted on a different rule. The search chooses join order
 		// on cost; a greedy pre-pass can only take that choice away.
 		var err error
+		// M0146-0005bn: subquery_push_qual runs before the subquery is
+		// planned (subquerypushqual_ast.go).
+		s = pushWhereQualsIntoGroupedItems(s, cat)
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
@@ -1794,7 +1802,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// corpus-visible change — ledgered, not smuggled in.
 			reduced := false
 			if len(ctx.bindings) > 1 && len(pulledQuals) == 0 && len(ctx.pulledDerived) == 0 &&
-				fromJoinsInnerOnly(s.FromExprs) {
+				fromJoinsInnerOnly(ctx.reducedFromOr(s.FromExprs)) {
 				// M0146-0038: the same reduction for a scope of several
 				// relations joined without outer joins — no Var of this
 				// WHERE is nulled by a join, so `expr_is_nonnullable`'s
@@ -4129,10 +4137,17 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 	// demoted joins enter the joinlist as plain INNER joins.
 	// M0146-0028d: the statement's WHERE reduces the statement's own outer
 	// joins; each pulled body's WHERE reduces the body's (the Joins slices
-	// are shared with the AST items, so reducing the partitions reduces
-	// `items`).
+	// are shared between `items` and the partitions below, so reducing the
+	// partitions reduces `items`).
+	// M0146-0005bn: on a private copy — the verdicts are the deconstruction's
+	// alone, and writing them through into the statement's AST made a second
+	// planning of the same SELECT (a CTE body re-planned as a derived table)
+	// see LEFT joins already turned ANTI with their forcing IS NULL still in
+	// its WHERE.
+	items = cloneFromJoins(items)
 	if len(cands) == 0 {
 		reduceOuterJoins(items, s.Where, cat)
+		rctx.reducedFrom = items
 	} else {
 		var own []parser.FromExpr
 		for i, it := range items {
@@ -4143,6 +4158,13 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 		reduceOuterJoins(own, s.Where, cat)
 		for _, c := range cands {
 			reduceOuterJoins(items[c.itemLo:c.itemHi], c.body.Where, cat)
+		}
+		// A pulled derived item stood in the written list as a join-free
+		// Base, so the statement's own items are what an inner-only test
+		// over the written list would have seen reduced.
+		rctx.reducedFrom = own
+		if rctx.reducedFrom == nil {
+			rctx.reducedFrom = []parser.FromExpr{}
 		}
 	}
 	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo

@@ -412,11 +412,15 @@ func TestCTEBodyPushEndToEndGroupKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	scan := cipFindCTEScan(plan)
-	if scan == nil {
-		t.Fatalf("no CTE reference in plan:\n%s", plan)
+	// M0146-0005bn: the single reference is now planned as the derived
+	// table inline_cte makes of it, with the qual in its HAVING before
+	// planning (subquerypushqual_ast.go) — so there may be no CTEScan, and
+	// the qual reaches the leaf either way.
+	var root Node = plan
+	if scan := cipFindCTEScan(plan); scan != nil {
+		root = scan.Child
 	}
-	lf := cipBodyLeafFilters(scan.Child)
+	lf := cipBodyLeafFilters(root)
 	if len(lf) != 1 {
 		t.Fatalf("body has %d leaf Filters, want 1 (the pushed group-key qual):\n%s", len(lf), plan)
 	}

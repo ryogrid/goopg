@@ -23486,6 +23486,35 @@ M0146-0001 re-baseline census on the new default arm.
   - Residual: Q84\'s Gather Merge estimates 11 where PG has 10 \(cause
     not traced; below the ratchet bar, not filed\)\.
   Movement: yes — ea-ratchet findings 11 -> 10 (Q84 FIXED); Q84 Limit rows 100 -> 11 (PG 10); PLAN-PARITY categories unchanged (SF0.25 match 27, SF1 24)
+- [x] **M0146\-0005bn — subquery\_push\_qual before the subquery is planned**
+  \(filed 2026\-09\-30 from the ea\-ratchet Q78 finding\)\. goopg plans a
+  derived table / CTE body before looking at the outer WHERE and splices
+  pushed quals in afterwards, so TPC\-DS Q78\'s channel joins kept their
+  all\-years estimates \(store\_sales ⋈ date\_dim 281532 vs PG 3441\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 66\)\.** `pushWhereQualsIntoGroupedItems`
+    \(new `internal/optimizer/subquerypushqual_ast.go`\) moves a WHERE
+    `col op const` on a grouping column into a copy of the grouped body\'s
+    HAVING before planFromClause, following `=` equalities into LEFT\-join
+    nullable partners; `cloneFromJoins` stops reduce\_outer\_joins writing
+    into the AST \(`resolveContext.reducedFrom` feeds the NOT NULL
+    reduction\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 66"\.
+  - Tests `TestSubqueryPushQualReachesTheScan`,
+    `TestSubqueryPushQualFollowsLeftJoinEquality` \(both fail with the pass
+    off\), `TestSubqueryPushQualSkipsNullableSide` \(values\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q78 both scales\), TPC\-H shapes identical, regress 9 cases unchanged,
+    ea\-ratchet PASS \(10\)\.
+  - Findings kept:
+    - Q78\'s ea row stays — ss ⋈ ws is a relset PG never forms, and PG\'s
+      ss aggregate is equally low \(1381 vs 123049 actual\)\.
+    - goopg still keeps the constant\-pinned year in the merge keys and
+      group keys PG\'s equivalence class drops, which is why it joins
+      ss ⋈ ws first \(join\-method \+1 at SF0\.25\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 aggregation-strategy 19 -> 18, join-method 29 -> 30; Q78 SF0.25 cost 108758 -> 42487 (PG 42510); store_sales x date_dim est 281532 -> 1107/worker (PG 1107); Q78 exec 3959 -> 3063 ms
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

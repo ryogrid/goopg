@@ -474,3 +474,96 @@ Movement:
   unchanged.
 
 Evidence: `analysis/m0146/m0146-0005/slice65/`.
+
+## Slice 66: M0146-0005bn — subquery\_push\_qual before the subquery is planned
+
+TPC-DS Q78's `ss_sold_year = 1998` did reach the date\_dim scans of all
+three channel CTEs, but only after goopg had planned them. goopg plans a
+derived table (planSubqueryRangeVar) and a CTE body (preplanWithClause)
+before it looks at the outer WHERE. Its pushes, pushQualsIntoSubqueryLeaf
+and pushQualsThroughSingleRefCTEs, then splice the qual into a body whose
+joins and aggregates were estimated without it. As a result:
+
+- store\_sales ⋈ date\_dim kept its all-years 281532 rows (PG 3441).
+- The aggregate was a HashAggregate over 281k rows, where PG runs a sorted
+  GroupAggregate over 1.4k.
+- The statement cost 108758 against PG's 42510.
+
+PG's set\_subquery\_pathlist moves the restriction into the subquery's
+Query first, and only then plans the subquery. subquery\_push\_qual puts it
+into havingQual when the subquery groups, and subquery\_planner's HAVING
+preprocessing moves an aggregate-free clause on to WHERE.
+
+- `pushWhereQualsIntoGroupedItems` (new `subquerypushqual_ast.go`) does
+  that move on the AST, in planSelect right before planFromClause.
+  - It takes a WHERE conjunct `col op const` on a grouping column of a
+    grouped derived table. A single-reference inlinable CTE counts too, and
+    becomes the derived table inline\_cte makes of it.
+  - The conjunct is ANDed into a copy of the body's HAVING and removed from
+    the WHERE. goopg's existing HAVING→WHERE transfer takes it to the scan.
+- For `=`, the constant also follows the column's equalities: WHERE
+  equalities, INNER join ONs, and the ON clause of a LEFT join whose
+  nullable side the partner is (reconsider\_outer\_join\_clauses). Every
+  partner must accept the push, or nothing moves. goopg's own constant
+  propagation reads the WHERE conjunct, so a partial move would lose a
+  derived restriction.
+- The pass declines, leaving the later pushes in charge, for any of the
+  following:
+  - A column the body does not group on, or a target expression other than
+    a plain column.
+  - A body with set operations, grouping sets, DISTINCT, LIMIT/OFFSET,
+    locking, window functions or its own WITH.
+  - A LEFT join's nullable side, which is not a restriction of that rel
+    alone, or any item under a RIGHT/FULL/USING/NATURAL join.
+  - LATERAL items.
+  - An unqualified column not exposed by exactly one FROM item.
+
+Re-planning a CTE body exposed a latent AST mutation. planFromClauseItems
+ran reduce\_outer\_joins on Joins slices shared with the statement's AST.
+One planning of a SELECT therefore left its LEFT joins turned ANTI while
+their forcing `IS NULL` stayed in its WHERE. A second planning then failed
+with "column sr\_ticket\_number does not exist"; the existing CTE pull-up
+hit the same failure and fell back silently. The fixes:
+
+- The reduction now runs on a private copy (`cloneFromJoins`).
+- The one reader that relied on the write-through, the WHERE arm's
+  NOT NULL reduction (`fromJoinsInnerOnly`), reads the reduced list from
+  `resolveContext.reducedFrom`.
+- regress join.sql's bug #18170 case, a parse tree reused by a set
+  operation, stays as it was.
+
+Tests:
+
+- `TestSubqueryPushQualReachesTheScan` covers the derived-table and CTE
+  forms: the qual appears once, at the scan.
+- `TestSubqueryPushQualFollowsLeftJoinEquality` checks the constant at both
+  grouped scans, plus the values.
+- `TestSubqueryPushQualSkipsNullableSide` is a values test showing that a
+  WHERE qual on the nullable side stays above the join.
+- The first two fail with the pass disabled.
+- `TestCTEBodyPushEndToEndGroupKey` now accepts the derived form the
+  reference plans as.
+
+Movement:
+
+- TPC-DS SF0.25 Q78: aggregation-strategy is off its divergence list
+  (sorted GroupAggregate over a Nested Loop Anti Join, as PG). The
+  statement costs 42487 against PG's 42510, down from 108758.
+- The three branch estimates are 1419/468/835 (PG 1381/469/828). The
+  store\_sales ⋈ date\_dim estimate is 1107 per worker, the same as PG's.
+- Q78 execution is 3063 ms, down from 3959 ms.
+- SF0.25 categories: aggregation-strategy 19 → 18, join-method 29 → 30.
+  goopg now joins ss ⋈ ws first where PG joins ss ⋈ cs, because PG's
+  equivalence class drops the constant-pinned year from the merge keys and
+  goopg keeps it. SF1 categories are unchanged, and matches are unchanged
+  (27/24).
+- The ea-ratchet Q78 finding stays (10 findings). It sits at the ss ⋈ ws
+  relset, which PG never forms, and PG's own ss aggregate is equally low
+  (1381 against 123049 actual). This is PG-faithful estimate math, like
+  Q14's.
+- TPC-H plans are identical. Units, spotcheck, the sweep (96/96) and the
+  arm (24/24) pass. Regress with, subselect, join, aggregates,
+  groupingsets, union, select\_distinct, window and select\_having are
+  unchanged, apart from join.sql's catalog-count and row-order noise.
+
+Evidence: `analysis/m0146/m0146-0005/slice66/`.
