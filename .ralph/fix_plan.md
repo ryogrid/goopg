@@ -23515,6 +23515,26 @@ M0146-0001 re-baseline census on the new default arm.
       group keys PG\'s equivalence class drops, which is why it joins
       ss ⋈ ws first \(join\-method \+1 at SF0\.25\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 aggregation-strategy 19 -> 18, join-method 29 -> 30; Q78 SF0.25 cost 108758 -> 42487 (PG 42510); store_sales x date_dim est 281532 -> 1107/worker (PG 1107); Q78 exec 3959 -> 3063 ms
+- [x] **M0146\-0005bo — a non\-equijoin clause reads its operands\' statistics**
+  \(filed 2026\-09\-30 from the ea\-ratchet Q95 finding\)\. `a.x <> b.y`
+  priced at 1 \- DEFAULT\_EQ\_SEL because `joinClauseOperands` passed relids 0
+  for non\-equijoin operands; PG\'s neqjoinsel examines both Vars
+  \(get\_join\_variables\)\. Q95\'s ws\_wh: goopg 2168680 vs PG 1752341\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 67\)\.** `restrictInfo.opLeftRelids` /
+    `opRightRelids` \(joinrestrict\.go\) feed `joinClauseOperands` and
+    `semiJoinOperands` \(joinselectivity\.go\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 67"\.
+  - Test `TestExplainNeqJoinReadsColumnStats` \(PG 4000 rows; base 4975\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q16 Q46 Q64 Q68 Q94 Q95 both scales\), TPC\-H plans and estimates
+    identical, regress 7 cases unchanged, ea\-ratchet PASS \(10\)\.
+  - Finding kept: Q95\'s ea row is PG\-level math \(the four\-way join\'s
+    outer estimate is 1 in both; PG applies the ws\_wh semi join at a
+    different relset\)\.
+  Movement: none — ea-ratchet 10 -> 10, CATEGORIES-EXCL-MATCH unchanged; Q95 ws_wh body est 2168680 -> 1759792 (PG 1752341)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

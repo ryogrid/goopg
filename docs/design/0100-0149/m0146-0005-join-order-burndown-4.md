@@ -567,3 +567,44 @@ Movement:
   unchanged, apart from join.sql's catalog-count and row-order noise.
 
 Evidence: `analysis/m0146/m0146-0005/slice66/`.
+
+## Slice 67: M0146-0005bo — a non-equijoin clause reads its operands' statistics
+
+TPC-DS Q95's `ws_wh` CTE joins web\_sales to itself on
+`ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <>
+ws2.ws_warehouse_sk`. goopg estimated 2168680 rows where PG estimates
+1752341. The `<>` factor was 0.995, which is `1 - DEFAULT_EQ_SEL`; PG's is
+0.8. PG's `neqjoinsel` computes eqjoinsel for the negator over
+`get_join_variables`, which examines each operand against its own
+relation whatever the operator. goopg's `joinClauseOperands` resolved
+operands only for an equijoin's key split, and passed relids 0 for any
+other clause. So the operands of `<>` never found their column statistics,
+and eqjoinsel fell to 1/DEFAULT\_NUM\_DISTINCT.
+
+- `restrictInfo.opLeftRelids` / `opRightRelids` (joinrestrict.go) hold
+  each operand's relids for every comparison join clause. The commuted
+  copy swaps them.
+- `joinClauseOperands` examines a non-equijoin clause's operands with
+  those relids. `semiJoinOperands` orients them by the outer rel, so
+  neqjoinsel's semi arm reads the outer column's null fraction.
+
+Test: `TestExplainNeqJoinReadsColumnStats` uses 1000 rows with h holding 5
+distinct values. `o = o AND h <> h` estimates PG's 4000 rows; base gave
+4975, so the test fails there.
+
+Movement:
+
+- Q95's ws\_wh body estimates 1759792 rows (PG 1752341), down from
+  2168680.
+- Six fire-set queries change plan: Q16, Q46, Q64, Q68, Q94 and Q95. All
+  execute at both scales, and the categories are unchanged (SF0.25 match
+  27, SF1 24).
+- ea-ratchet stays at 10. The Q95 finding is the Hash Semi Join over the
+  four-way join, whose outer estimate of 1 row equals PG's own at the same
+  join. The finding stands because PG applies the ws\_wh semi join at a
+  different relset.
+- TPC-H plans and row estimates are identical. Units, spotcheck, the sweep
+  (96/96) and the arm (24/24) pass. Regress join, subselect, select,
+  aggregates, partition\_join, inherit and stats\_ext are unchanged.
+
+Evidence: `analysis/m0146/m0146-0005/slice67/`.

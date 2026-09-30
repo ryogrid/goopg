@@ -791,6 +791,14 @@ func (s *searchCtx) joinClauseOperands(ri *restrictInfo, bo *BinaryOp) (joinVarS
 	if ri.isEquijoin {
 		return s.examineJoinVar(ri.leftKey, ri.leftRelids), s.examineJoinVar(ri.rightKey, ri.rightRelids)
 	}
+	if bo == ri.clause {
+		// M0146-0005bo: get_join_variables examines each operand against its
+		// own relation for every operator, so `a.x <> b.y` (neqjoinsel) reads
+		// both columns' statistics as `a.x = b.y` would. Before this the
+		// non-equijoin operands resolved to no relation and `<>` came out as
+		// 1 - DEFAULT_EQ_SEL (TPC-DS Q95's ws_wh: 0.995 where PG has 0.8).
+		return s.examineJoinVar(bo.Left, ri.opLeftRelids), s.examineJoinVar(bo.Right, ri.opRightRelids)
+	}
 	return s.examineJoinVar(bo.Left, 0), s.examineJoinVar(bo.Right, 0)
 }
 
@@ -861,6 +869,10 @@ func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.Joi
 func (s *searchCtx) semiJoinOperands(ri *restrictInfo, bo *BinaryOp, outer *RelOptInfo) (joinVarStats, joinVarStats) {
 	v1, v2 := s.joinClauseOperands(ri, bo)
 	if ri.isEquijoin && outer != nil && !relsSubset(ri.leftRelids, outer.Relids) && relsSubset(ri.rightRelids, outer.Relids) {
+		return v2, v1
+	}
+	if !ri.isEquijoin && bo == ri.clause && outer != nil && ri.opLeftRelids != 0 && ri.opRightRelids != 0 &&
+		!relsSubset(ri.opLeftRelids, outer.Relids) && relsSubset(ri.opRightRelids, outer.Relids) {
 		return v2, v1
 	}
 	return v1, v2

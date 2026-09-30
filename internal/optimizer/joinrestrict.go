@@ -68,6 +68,14 @@ type restrictInfo struct {
 	// why the split is stored as relsets rather than as two FROM positions.
 	isEquijoin bool
 
+	// opLeftRelids / opRightRelids are the relids of a comparison clause's two
+	// operands whatever its operator — what `get_join_variables`
+	// (selfuncs.c) hands examine_variable for `neqjoinsel` and friends. For
+	// an equijoin they equal leftRelids/rightRelids; zero when the clause is
+	// not a binary comparison or an operand's relids do not resolve.
+	// M0146-0005bo.
+	opLeftRelids, opRightRelids RelSet
+
 	// inferred marks a clause synthesised by `inferAnchoredEqualities`
 	// (equiv_class.go:236) rather than written by the user. Per 04 §5 this is
 	// NOT an admissibility penalty — an inferred clause connects its two rels
@@ -228,6 +236,16 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 			return
 		}
 		ri := &restrictInfo{clause: e, relids: relids, inferred: inferred, ecID: noEquivClass}
+		if bin, isBin := e.(*BinaryOp); isBin {
+			switch bin.Op {
+			case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+				lr, lok := relidsOfExpr(bin.Left, spans)
+				rr, rok := relidsOfExpr(bin.Right, spans)
+				if lok && rok {
+					ri.opLeftRelids, ri.opRightRelids = lr, rr
+				}
+			}
+		}
 		if bin, isBin := e.(*BinaryOp); isBin && bin.Op == parser.OpEq {
 			lr, lok := relidsOfExpr(bin.Left, spans)
 			rr, rok := relidsOfExpr(bin.Right, spans)
@@ -606,8 +624,10 @@ func (l *restrictInfoList) flipped(ri *restrictInfo) *restrictInfo {
 		isEquijoin:  true,
 		leftKey:     ri.rightKey,
 		rightKey:    ri.leftKey,
-		leftRelids:  ri.rightRelids,
-		rightRelids: ri.leftRelids,
+		leftRelids:    ri.rightRelids,
+		rightRelids:   ri.leftRelids,
+		opLeftRelids:  ri.opRightRelids,
+		opRightRelids: ri.opLeftRelids,
 		inferred:    ri.inferred,
 		ecID:        ri.ecID,
 	}
