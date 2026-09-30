@@ -423,3 +423,69 @@ Not done (ledgered):
 - View and rule deparse of the rewritten form.
 
 Evidence: `analysis/m0146/m0146-0005/slice78/`.
+
+## Slice 79: M0146-0005bz — a Sort Key chases its OUTER_VAR through joins
+
+PG's `show_sort_keys` deparses a key through the target lists below it, down
+to the join input, aggregate or relation that computes it. TPC-DS Q73
+prints `Sort Key: (count(*)) DESC, customer.c_last_name`; goopg printed its
+output labels, `cnt DESC, c_last_name`. The executor's key chase
+(`resolveKeySource`) stopped at every join and scan. `sortKeyParts` only
+started the chase when the Sort's child was an Aggregate or Project.
+
+- **Join arms** (`*Join`, `*NestedLoopIndexJoin`) step into the input that
+  holds the column, renumbered there. They first verify that the join's
+  row really is left ++ right (left only for semi/anti), by name and
+  relation (`joinOutputIsConcat`).
+- **Scan arms** (Seq/Index/IndexOnly/BitmapHeap) end the chase at the
+  relation. The name is pinned in that scan's own naming context
+  (`reg.pinnedKeyName`), because relation ids restart per query level and
+  resolving from the Sort would be ambiguous.
+- **Project arm:** a base-table target is followed down to its scan when
+  the scan names the same relation.
+- **After a join**, returned expressions have their columns pinned to the
+  node that evaluates them (`pinKeyExprNames`), as PG deparses each Var in
+  its producing plan node. Regress join.sql's
+  `(SELECT a c1, COALESCE(a) c2 FROM group_tbl t2)` first printed
+  `coalesce(t1.a)`; it now prints `(coalesce(t2.a))`.
+- **`sortKeyParts` entry (iii)** chases for any other child.
+- **Fail-closed rules found by the regress A/B:**
+  - A key never lands on a same-named column of another relation
+    (`relMismatch`). partition\_join's `t2.b` had read as `t1.b` through a
+    narrowing scaffold.
+  - A Subquery Scan child keeps today's text, because PG's boundary
+    rendering (`tmp1.sum_sales`) needs the sibling Group Key sites and the
+    M0146-0005w step-through arm changed together.
+  - The previously dead Gather/Gather Merge pass-through stays dead:
+    enabling it mislabelled Q59's Finalize group key as
+    `sum(CASE …)` (the partial layout).
+
+Tests:
+
+- `TestSortKeyChaseCrossesJoins`: `(count(*)) DESC, sk_c.ln`.
+- `TestSortKeyChaseNamesTheEvaluatingLevel`: `t2.a, (COALESCE(t2.a))`.
+- `TestSortKeyChaseKeepsTheKeysRelation`: `t1.a, t2.b, …`.
+
+All are PG 18.3 oracle text. The first two fail with the join arm disabled.
+
+Movement (fire set):
+
+- CATEGORIES-EXCL-MATCH rendering goes SF0.25 20 → 17 (Q46, Q73, Q79) and
+  SF1 21 → 20 (Q73), with no new rendering divergence. Match is unchanged
+  (38 / 28).
+- Regress (12 EXPLAIN-heavy cases): only join.sql moves, all toward PG
+  (`t1.q1`, `i0.f1`, `coalesce(t2.a)`).
+- Gates: units, spotcheck, sweep 96/96 (FORCE=1, because the nightly batch
+  held the host; row verdicts are unaffected), the TPC-H arm 24/24 (run
+  after the nightly finished) and ea-ratchet (10) pass.
+
+Not done (ledgered):
+
+- PG's Subquery Scan boundary (`alias.col`) for Sort and Group Key
+  together.
+- Set-operation keys deparsed through the first arm (Q5/Q71/Q77).
+- The `_1` alias suffix (Q61).
+- Casts inside function arguments (Q79's `(store.s_city)::text`).
+- The Gather/partial-aggregate layout.
+
+Evidence: `analysis/m0146/m0146-0005/slice79/`.

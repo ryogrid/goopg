@@ -23757,6 +23757,25 @@ M0146-0001 re-baseline census on the new default arm.
     arm 24/24, fire set \(Q33 Q60 Q89\), TPC\-H census identical, regress 11
     cases \(inherit now PG\'s `b = \'ab\'`\), ea\-ratchet PASS \(10\)\.
   Movement: yes — match SF0.25 37 -> 38; CATEGORIES-EXCL-MATCH qual-placement SF0.25 12 -> 10, SF1 8 -> 7
+- [x] **M0146\-0005bz — a Sort Key chases its OUTER\_VAR through joins**
+  \(filed and landed 2026\-10\-01 by the census: 20 SF0.25 rendering
+  divergences, mostly Sort Keys printing output labels — Q73 `cnt DESC,
+  c\_last\_name` vs PG `\(count\(\*\)\) DESC, customer.c\_last\_name`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 79\)\.** `resolveKeySource`: join/NLI arms
+    \(`joinOutputIsConcat`\), scan arms with names pinned in the scan\'s
+    context, `pinKeyExprNames` after a join, `relMismatch` fail\-closed
+    rule; `sortKeyParts` entry \(iii\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 79"\.
+  - Tests `TestSortKeyChaseCrossesJoins`,
+    `TestSortKeyChaseNamesTheEvaluatingLevel`,
+    `TestSortKeyChaseKeepsTheKeysRelation`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(FORCE=1 under the nightly\),
+    TPC\-H arm 24/24 \(after the nightly\), fire set, regress 12 cases
+    \(join.sql only, toward PG\), ea\-ratchet PASS \(10\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 20 -> 17, SF1 21 -> 20; match unchanged (38 / 28)
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

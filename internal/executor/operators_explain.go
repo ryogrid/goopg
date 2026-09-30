@@ -892,8 +892,138 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 	}
 	cteNames := cteNameSet(reg)
 	cur := expr
+	// steps bounds the free (depth-neutral) crossings below — joins and
+	// labelling wrappers — so a malformed plan cannot loop.
+	steps := 0
+	// crossedJoin: past a join the source expression belongs to a query
+	// level whose relation ids may collide with the printed node's, so what
+	// the chase returns is rendered with its columns pinned to the node that
+	// evaluates them (pinKeyExprNames) — PG's deparse resolves each Var in
+	// the plan node that produces it (regress join.sql's
+	// `(SELECT a c1, COALESCE(a) c2 FROM group_tbl t2)` under `t1`).
+	crossedJoin := false
+	// wantRel is the first relation the chase has seen the key name (its
+	// own SourceTableIdx, or a target's on the way down). Where the walk
+	// crosses a join or ends at a scan it must land on that same relation;
+	// otherwise the published positions disagree with the key's own
+	// naming (regress partition_join's `t2.b` over a narrowing scaffold
+	// whose position holds t1.b) and the chase declines, keeping today's
+	// text rather than printing another relation's column.
+	//
+	// The comparison is only meaningful while the column still carries the
+	// key's own name: ids restart per query level, and a subquery column
+	// reached through an alias (`s.c1` → `t2.a`, regress join.sql) has
+	// another level's id by construction. So the check fires only when the
+	// landing column keeps wantName — the same-named column of a different
+	// relation, which is exactly the mislabel it guards against.
+	var wantRel int16
+	wantName := ""
+	if c, ok := expr.(*optimizer.ColumnRef); ok {
+		wantRel, wantName = c.SourceTableIdx, c.Name
+	}
+	relMismatch := func(name string, rel int16) bool {
+		return wantRel != 0 && rel != 0 && name == wantName && rel != wantRel
+	}
 	for depth := 0; depth < 4; depth++ {
+		if steps++; steps > 64 {
+			return nil, false
+		}
 		switch n := node.(type) {
+		case *optimizer.Join, *optimizer.NestedLoopIndexJoin:
+			// M0146-0005bz: PG deparses an upper node's OUTER_VAR through
+			// the join that produced it, down to the relation or grouping
+			// node that computes the column (TPC-DS Q73's `Sort Key:
+			// (count(*)) DESC, customer.c_last_name` over a join). A join
+			// publishes left ++ right (semi/anti: left only) at the same
+			// positions, so a column steps into the input that holds it,
+			// renumbered there; a name mismatch declines. Free of chase
+			// depth, like the labelling wrappers: a join tree is not a
+			// republishing layer.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || col.Index < 0 {
+				return nil, false
+			}
+			var left, right optimizer.Node
+			leftOnly := false
+			switch j := n.(type) {
+			case *optimizer.Join:
+				left, right = j.Left, j.Right
+				leftOnly = j.Type == optimizer.JoinTypeSemi || j.Type == optimizer.JoinTypeAnti
+			case *optimizer.NestedLoopIndexJoin:
+				left, right = j.Outer, j.Inner
+				leftOnly = j.Type == optimizer.JoinTypeSemi || j.Type == optimizer.JoinTypeAnti
+			}
+			if left == nil || right == nil || len(n.Output()) <= col.Index {
+				return nil, false
+			}
+			lout := left.Output()
+			// The position arithmetic is only as good as the layout: a
+			// join whose published row is not literally left ++ right
+			// (a swapped build side, a search-root republication) would
+			// map a position onto the other input's same-named column
+			// (regress partition_join: `t2.b` read as `t1.b`). Verify the
+			// whole row, name and relation, before stepping.
+			if !joinOutputIsConcat(n.Output(), lout, right.Output(), leftOnly) {
+				return nil, false
+			}
+			next, idx := left, col.Index
+			if idx >= len(lout) {
+				if leftOnly {
+					return nil, false
+				}
+				next, idx = right, idx-len(lout)
+			}
+			nout := next.Output()
+			if idx >= len(nout) || nout[idx].Name != col.Name {
+				return nil, false
+			}
+			// A reference that names its relation must land on that
+			// relation's column: goopg can carry an Index that disagrees
+			// with SourceTableIdx across a FULL join's merged columns
+			// (regress partition_join's `t2.b`), and the relation id is the
+			// rendering's truth, so a disagreement declines.
+			if col.SourceTableIdx != 0 && nout[idx].SourceTableIdx != col.SourceTableIdx {
+				return nil, false
+			}
+			if relMismatch(nout[idx].Name, nout[idx].SourceTableIdx) {
+				return nil, false
+			}
+			moved := *col
+			moved.Index = idx
+			cur, node = &moved, next
+			crossedJoin = true
+			depth--
+			continue
+		case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan, *optimizer.BitmapHeapScan:
+			// M0146-0005bz: the chase ends at the relation: the column
+			// renders as that relation's own, qualified the way the scan
+			// names it (PG's `customer.c_last_name` where goopg printed the
+			// bare output label).
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok {
+				return nil, false
+			}
+			out := n.Output()
+			if col.Index < 0 || col.Index >= len(out) || out[col.Index].Name != col.Name ||
+				out[col.Index].SourceTableIdx == 0 ||
+				(col.SourceTableIdx != 0 && col.SourceTableIdx != out[col.Index].SourceTableIdx) ||
+				relMismatch(out[col.Index].Name, out[col.Index].SourceTableIdx) {
+				return nil, false
+			}
+			src := &optimizer.ColumnRef{Index: col.Index, Name: out[col.Index].Name,
+				Type: out[col.Index].Type, SourceTableIdx: out[col.Index].SourceTableIdx}
+			if qualifierNamesCTE(reg, src, cteNames) {
+				return nil, false
+			}
+			if reg != nil && reg.names() != nil {
+				if q := reg.names().columnIn(n, src.SourceTableIdx, src.Name, true); strings.Contains(q, ".") {
+					if reg.pinnedKeyName == nil {
+						reg.pinnedKeyName = map[*optimizer.ColumnRef]string{}
+					}
+					reg.pinnedKeyName[src] = q
+				}
+			}
+			return src, true
 		case *optimizer.Sort, *optimizer.Gather, *optimizer.GatherMerge:
 			// Row-order and worker boundaries pass their child's columns
 			// through unchanged (M0146-0021: Q77's sr body aggregates over
@@ -952,6 +1082,9 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				if exprHasSubplanOrOuterRef(t) || exprHasTableZeroRef(t) {
 					return nil, false
 				}
+				if crossedJoin {
+					return pinKeyExprNames(t, n.Child, reg)
+				}
 				return t, true
 			}
 			c := n.Child
@@ -969,6 +1102,23 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			}
 			if qualifierNamesCTE(reg, tc, cteNames) {
 				return nil, false
+			}
+			if crossedJoin && relMismatch(tc.Name, tc.SourceTableIdx) {
+				return nil, false
+			}
+			// M0146-0005bz: follow the column on down to the relation that
+			// scans it when the path is a plain one (joins, row-order
+			// wrappers), so it renders in that scan's naming context; any
+			// other path keeps stopping here.
+			if at, ok := resolveKeySource(tc, c, reg); ok {
+				// Only when the scan reached is the relation tc names:
+				// the target's relation id is the rendering's truth, and
+				// a positional walk that lands elsewhere (a FULL join's
+				// merged columns) keeps tc (regress partition_join).
+				if ac, isCol := at.(*optimizer.ColumnRef); isCol && ac.Name == tc.Name &&
+					ac.SourceTableIdx == tc.SourceTableIdx {
+					return at, true
+				}
 			}
 			return tc, true
 		case *optimizer.WindowAgg:
@@ -1009,6 +1159,12 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 					if qualifierNamesCTE(reg, gc, cteNames) {
 						return nil, false
 					}
+					if crossedJoin && relMismatch(gc.Name, gc.SourceTableIdx) {
+						return nil, false
+					}
+					if crossedJoin {
+						return pinKeyExprNames(gc, n.Child, reg)
+					}
 					return gc, true
 				}
 				cur = g
@@ -1018,12 +1174,68 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			if j >= n.GroupingMaskColOffset() {
 				return nil, false
 			}
-			return synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
+			call, ok := synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
+			if ok && crossedJoin {
+				return pinKeyExprNames(call, n.Child, reg)
+			}
+			return call, ok
 		default:
 			return nil, false
 		}
 	}
 	return nil, false
+}
+
+// pinKeyExprNames returns a copy of e whose columns render with the qualified
+// name they carry in ctx — the node e is evaluated against — instead of being
+// re-resolved from the node being printed (M0146-0005bz). A column ctx cannot
+// name declines the whole expression: a half-pinned key would mix contexts.
+func pinKeyExprNames(e optimizer.Expr, ctx optimizer.Node, reg *subPlanReg) (optimizer.Expr, bool) {
+	if e == nil || ctx == nil || reg == nil || reg.names() == nil {
+		return nil, false
+	}
+	failed := false
+	out, ok := optimizer.CloneExprReplacingColumnRefs(e, func(c *optimizer.ColumnRef) optimizer.Expr {
+		cp := *c
+		q := reg.names().columnIn(ctx, c.SourceTableIdx, c.Name, true)
+		if c.SourceTableIdx == 0 || !strings.Contains(q, ".") {
+			failed = true
+			return &cp
+		}
+		if reg.pinnedKeyName == nil {
+			reg.pinnedKeyName = map[*optimizer.ColumnRef]string{}
+		}
+		reg.pinnedKeyName[&cp] = q
+		return &cp
+	})
+	if !ok || failed {
+		return nil, false
+	}
+	return out, true
+}
+
+// joinOutputIsConcat reports whether out is exactly left ++ right (left only
+// for a semi/anti join), position by position, by column name and relation.
+func joinOutputIsConcat(out, left, right optimizer.Schema, leftOnly bool) bool {
+	want := len(left)
+	if !leftOnly {
+		want += len(right)
+	}
+	if len(out) != want {
+		return false
+	}
+	for i, c := range out {
+		src := optimizer.SchemaColumn{}
+		if i < len(left) {
+			src = left[i]
+		} else {
+			src = right[i-len(left)]
+		}
+		if c.Name != src.Name || c.SourceTableIdx != src.SourceTableIdx {
+			return false
+		}
+	}
+	return true
 }
 
 // cteNameSet returns the CTE names declared in this render (nil-safe:
@@ -1074,6 +1286,20 @@ func childNodeOf(n optimizer.Node) optimizer.Node {
 		return t.Child
 	}
 	return nil
+}
+
+// childSubqueryScanThroughFilters returns the Subquery Scan directly below n
+// (modulo output-identical Filter wrappers), or nil.
+func childSubqueryScanThroughFilters(n optimizer.Node) *optimizer.SubqueryScan {
+	for {
+		f, ok := n.(*optimizer.Filter)
+		if !ok {
+			break
+		}
+		n = f.Child
+	}
+	sq, _ := n.(*optimizer.SubqueryScan)
+	return sq
 }
 
 // childProjectThroughFilters resolves the Project below (modulo Filter
@@ -1231,6 +1457,19 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 						keyExpr = chased
 					}
 				}
+			} else if childSubqueryScanThroughFilters(child) != nil {
+				// A Subquery Scan PG keeps is a naming boundary — its
+				// OUTER_VAR deparses to `alias.col` (TPC-DS Q53/Q63's
+				// `tmp1.sum_sales`) — but the sibling Group Key sites chase
+				// straight through the scan (M0146-0005w), so the pair
+				// would disagree. Keep today's text here; the
+				// alias-qualified boundary is ledgered for both sites
+				// together.
+			} else if chased, ok := resolveKeySource(col, child, reg); ok {
+				// Entry (iii) — M0146-0005bz: any other child (a join, a
+				// scan): the same OUTER_VAR chase, which now crosses joins
+				// down to the relation or aggregate that computes the key.
+				keyExpr = chased
 			}
 		}
 		s := formatExprQual(keyExpr, reg, qualify)
@@ -2145,6 +2384,13 @@ type subPlanReg struct {
 	// PG's plan_id order before rendering (reservePGPlanIDs, M0146-0005bv),
 	// keyed by the sublink's inner plan root; lastID is the highest number
 	// handed out, so an unreserved sublink continues the sequence.
+	// pinnedKeyName holds a key the OUTER_VAR chase ended at a base-relation
+	// scan, rendered qualified in THAT scan's own naming context
+	// (resolveKeySource's scan arm, M0146-0005bz). Resolved from the node
+	// being printed instead, a relation id reused at another query level in
+	// the subtree (planner ids restart per level) would make the qualifier
+	// ambiguous and print the bare name.
+	pinnedKeyName map[*optimizer.ColumnRef]string
 	planID       map[optimizer.Node]int
 	hashedPlanID map[optimizer.Node]int
 	lastID       int
@@ -2540,6 +2786,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	}
 	switch x := e.(type) {
 	case *optimizer.ColumnRef:
+		// A key the OUTER_VAR chase ended at a relation scan is named in
+		// that scan's context (pinnedKeyName, M0146-0005bz).
+		if qualify && reg != nil {
+			if q, ok := reg.pinnedKeyName[x]; ok {
+				return q
+			}
+		}
 		// qualify is upstream's deparse_context.varprefix
 		// (ruleutils.c get_variable's need_prefix): a plain Var is
 		// printed bare on a scan qual and qualified everywhere else
