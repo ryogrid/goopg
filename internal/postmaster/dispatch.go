@@ -1949,6 +1949,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_indexscan", &ps.EnableIndexScan)
 	readBool("enable_bitmapscan", &ps.EnableBitmapScan)
 	readBool("enable_sort", &ps.EnableSort)
+	readBool("enable_incremental_sort", &ps.EnableIncrementalSort)
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
 	readBool("enable_parallel_hash", &ps.EnableParallelHash)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)

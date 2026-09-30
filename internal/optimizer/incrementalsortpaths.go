@@ -164,32 +164,38 @@ func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []Pa
 		if contained || nCommon == 0 {
 			continue
 		}
-		groupExprs := make([]Expr, nCommon)
-		for j := 0; j < nCommon; j++ {
-			groupExprs[j] = sortPathkeys[j].Expr
-		}
-		groups := estimateNumGroups(groupExprs, input.node, int64(candidate.Rows))
-		sp := &Path{
-			Kind: PathIncrementalSort,
-			// `cost_incremental_sort` folds enable_sort's flag in via
-			// `cost_sort` upstream (costsize.c:2144); see the file header
-			// GUC note for why this reuses cp.enableSort rather than a
-			// second, still-unwired flag.
-			DisabledNodes: disabledNodesFor(!cp.enableSort, candidate),
-			Rel:           ordered,
-			Rows:          candidate.Rows,
-			Cost: costIncrementalSort(cp, candidate.Cost, candidate.Rows, float64(groups),
-				pathNCols(candidate), pathAvgVarBytes(candidate), limitTuples, pathWidth(candidate)),
-			Pathkeys: sortPathkeys,
-			// M0141-S7-exec-b: stashed for `createIncrementalSortPlan` —
-			// see the field's own doc comment (path.go) for why it is
-			// carried here rather than re-derived at createPlanNode time.
-			PresortedCount: nCommon,
-			Children:       []*Path{candidate},
-			RequiredOuter:  candidate.RequiredOuter,
-			ParallelSafe:   parallelSafeWith(candidate.Rel, candidate),
-		}
-		inheritNarrowedWidths(sp, candidate)
-		addPath(ordered, sp, upperOrderedIncrementalSortProducer)
+		addPath(ordered, incrementalSortPathOver(ordered, candidate, input.node, sortPathkeys, nCommon, cp, limitTuples),
+			upperOrderedIncrementalSortProducer)
 	}
+}
+
+// incrementalSortPathOver is create_incremental_sort_path over sub, whose
+// ordering already delivers the first nCommon of sortPathkeys. statsNode is
+// the materialized input `estimateNumGroups` reads column statistics from
+// (the presorted prefix's group count is cost_incremental_sort's input).
+func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sortPathkeys []PathKey, nCommon int, cp costParams, limitTuples float64) *Path {
+	groupExprs := make([]Expr, nCommon)
+	for j := 0; j < nCommon; j++ {
+		groupExprs[j] = sortPathkeys[j].Expr
+	}
+	groups := estimateNumGroups(groupExprs, statsNode, int64(sub.Rows))
+	sp := &Path{
+		Kind: PathIncrementalSort,
+		// `cost_incremental_sort` folds enable_sort's flag in via
+		// `cost_sort` upstream (costsize.c:2144).
+		DisabledNodes: disabledNodesFor(!cp.enableSort, sub),
+		Rel:           ordered,
+		Rows:          sub.Rows,
+		Cost: costIncrementalSort(cp, sub.Cost, sub.Rows, float64(groups),
+			pathNCols(sub), pathAvgVarBytes(sub), limitTuples, pathWidth(sub)),
+		Pathkeys: sortPathkeys,
+		// M0141-S7-exec-b: stashed for `createIncrementalSortPlan` — see
+		// the field's own doc comment (path.go).
+		PresortedCount: nCommon,
+		Children:       []*Path{sub},
+		RequiredOuter:  sub.RequiredOuter,
+		ParallelSafe:   parallelSafeWith(sub.Rel, sub),
+	}
+	inheritNarrowedWidths(sp, sub)
+	return sp
 }

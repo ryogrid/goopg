@@ -77,8 +77,9 @@ Declared normalisation policy (applied before comparison, printed with
      Left for the same preserved side; Q13 is the witness).
 
 MISSING-NODE rule: a normalised PG tree containing a node kind goopg's
-EXPLAIN renderer cannot emit -- `Incremental Sort` (grounded: gated off by
-default; no producer files the candidate) -- or any unknown kind. `Hash` is
+EXPLAIN renderer cannot emit (GOOPG_UNEMITTABLE; empty since
+`Incremental Sort` gained its producer at M0146-0005bp) -- or any unknown
+kind. `Hash` is
 explicitly NOT in this set (see N2). `Materialize` was in this set until
 M0146-0010 gave the renderer an arm; it now compares positionally and by
 kind presence like every other emittable node.
@@ -113,14 +114,14 @@ CATEGORIES = (
 VERDICTS = ("MATCH", "SHAPE-DIFF", "UNPARSED", "MISSING-NODE", "ERROR", "TIMEOUT")
 
 # Node kinds goopg's EXPLAIN renderer cannot emit on this corpus (grounded in
-# internal/executor/operators_explain.go and the planner's producers:
-# Incremental Sort has a renderer arm but its path producer is gated off, so
-# no plan emits it). A PG plan containing one forces MISSING-NODE.
-# `Materialize` left this set at M0146-0010: the node is produced and
-# rendered, so a one-sided Materialize is a positional/presence divergence,
-# not an unemittable kind. Standalone `Hash` is deliberately absent here:
-# it is stripped by normalisation N2.
-GOOPG_UNEMITTABLE = ("Incremental Sort",)
+# internal/executor/operators_explain.go and the planner's producers). A PG
+# plan containing one forces MISSING-NODE. Empty since M0146-0005bp:
+# `Materialize` left the set at M0146-0010 and `Incremental Sort` at
+# M0146-0005bp (create_ordered_paths now files it for a partially presorted
+# input) — both are produced and rendered, so a one-sided one is a
+# positional/presence divergence, not an unemittable kind. Standalone `Hash`
+# is deliberately absent: it is stripped by normalisation N2.
+GOOPG_UNEMITTABLE = ()
 
 SECTION_RE = re.compile(r"^===\s*(\S+)\s*$")
 COST_RE = re.compile(r"\(cost=([0-9.]+)\.\.([0-9.]+)\s+rows=([0-9]+)\s+width=([0-9]+)\)")

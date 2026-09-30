@@ -175,11 +175,24 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
-	sorted := sortPathForBounded(input, sortPathkeys, cp, limitTuples)
-	if pathTraceEnabled && input.Kind == PathAgg {
-		traceOrderedSortedCandidate(input.AggStrategy, input.Rows, sorted.Cost.Startup, sorted.Cost.Total)
+	// M0146-0005bp: create_ordered_paths sorts the cheapest input with an
+	// Incremental Sort when its pathkeys already deliver a leading prefix of
+	// the ORDER BY and enable_incremental_sort is on, and with a full Sort
+	// otherwise — never both (planner.c: "We'll just do a sort if there are
+	// no presorted keys and an incremental sort when there are presorted
+	// keys"). TPC-DS Q3's ORDER BY d_year, sum DESC, brand_id over a
+	// GroupAggregate grouped by d_year first.
+	if _, presorted := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys); presorted > 0 &&
+		cp.enableIncrementalSort && input.node != nil {
+		addPath(ordered, incrementalSortPathOver(ordered, input, input.node, sortPathkeys, presorted, cp, limitTuples),
+			upperOrderedIncrementalSortProducer)
+	} else {
+		sorted := sortPathForBounded(input, sortPathkeys, cp, limitTuples)
+		if pathTraceEnabled && input.Kind == PathAgg {
+			traceOrderedSortedCandidate(input.AggStrategy, input.Rows, sorted.Cost.Startup, sorted.Cost.Total)
+		}
+		addPath(ordered, sorted, upperOrderedSortProducer)
 	}
-	addPath(ordered, sorted, upperOrderedSortProducer)
 
 	// M0146-0027: the `is_sorted` arm of upstream's `foreach(lc,
 	// input_rel->pathlist)` (planner.c:5342-5345) — every OTHER searched

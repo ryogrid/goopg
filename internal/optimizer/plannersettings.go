@@ -82,6 +82,9 @@ type PlannerSettings struct {
 	// P2-02 remainder.
 	EnableSort bool
 
+	// EnableIncrementalSort is PG's `enable_incremental_sort` (default on).
+	EnableIncrementalSort bool
+
 	// EnableMaterial is PG's `enable_material` — a generation gate at the
 	// producer (joinpath.c:1897), not a counted flag like the methods above:
 	// the matpath is simply never created when it is off.
@@ -233,6 +236,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableNestLoop:  true,
 		EnableParallelHash: true,
 		EnableSort:      true,
+		EnableIncrementalSort: true,
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
 		EnableBitmapScan: true,
@@ -300,6 +304,7 @@ func (ps PlannerSettings) costParams() costParams {
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
 		enableSort:      ps.EnableSort,
+		enableIncrementalSort: ps.EnableIncrementalSort,
 		enableSeqScan:    ps.EnableSeqScan,
 		enableIndexScan:  ps.EnableIndexScan,
 		enableBitmapScan: ps.EnableBitmapScan,

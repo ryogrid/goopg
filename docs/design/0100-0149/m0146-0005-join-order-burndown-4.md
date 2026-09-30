@@ -608,3 +608,66 @@ Movement:
   aggregates, partition\_join, inherit and stats\_ext are unchanged.
 
 Evidence: `analysis/m0146/m0146-0005/slice67/`.
+
+## Slice 68: M0146-0005bp — ORDER BY over a partially presorted input is an Incremental Sort
+
+TPC-DS Q3, Q43 and Q63 (and Q43/Q83 at SF1) each differed from PG in one
+node only: PG sorts the final ORDER BY with an Incremental Sort (`Presorted
+Key: d_year`), because the GroupAggregate below it already delivers the
+first sort key. `create_ordered_paths` (planner.c) sorts its cheapest input
+path with an Incremental Sort when that path's pathkeys cover a leading
+prefix of the ORDER BY and `enable_incremental_sort` is on, and with a full
+Sort otherwise, never both. goopg's `addOrderedPaths` always stacked a full
+Sort on the cheapest input. Its Incremental Sort arm
+(`addIncrementalSortPaths`, M0141-S7) looked only at the other search
+candidates and sat behind `GOOPG_INCREMENTAL_SORT` (default off).
+
+- `addOrderedPaths` (upperordered.go) now counts the cheapest input's
+  presorted prefix, and offers `PathIncrementalSort` over it when that
+  count is greater than zero and `enable_incremental_sort` is on.
+  - The construction is factored into `incrementalSortPathOver`
+    (incrementalsortpaths.go) and shared with the gated other-candidates
+    arm.
+  - The node's costs follow PG: Q3's Incremental Sort adds +0.14/+2.25 over
+    its input, against PG's +0.15/+2.25.
+- `enable_incremental_sort` is wired from the session into
+  `PlannerSettings.EnableIncrementalSort` / `costParams.enableIncrementalSort`
+  (dispatch.go). It was declared in the catalog but unconsumed.
+- `scripts/pg-plan-parity-diff.py`: `GOOPG_UNEMITTABLE` loses
+  `Incremental Sort`, as it lost `Materialize` at M0146-0010. goopg now
+  emits the node, so a PG Incremental Sort compares like any other node
+  instead of forcing MISSING-NODE. Re-scoring the baseline captures
+  changes no match count (27 / 24); only the MISSING-NODE labels become
+  SHAPE-DIFF.
+
+Tests:
+
+- `TestExplainOrderByIncrementallySortsPresortedInput` checks the PG 18.3
+  oracle shape `Incremental Sort / Presorted Key: a` over a presorted
+  subquery, plus the values. It fails on base.
+- `TestAddOrderedPathsIncrementallySortsAPresortedSeed` covers the GUC on
+  (exactly one PathIncrementalSort) and off (a PathSort).
+
+Movement (fire set, both scales; re-scored with the corrected tool):
+
+- PLAN-PARITY match: SF0.25 27 → 30 (Q3, Q43, Q63), SF1 24 → 26 (Q43,
+  Q83).
+- CATEGORIES-EXCL-MATCH sort-strategy: SF0.25 37 → 33, SF1 40 → 36.
+- Seven fires (Q3 Q43 Q58 Q63 Q67 Q78 Q83), all executing at both scales.
+- Q67 (and Q78 at SF1) gain a rendering item. Now that the node kinds
+  match, the tool compares Sort Key text, and goopg prints the unqualified
+  subquery output names over a Subquery Scan where PG prints
+  `dw1.i_category`. That difference existed before and does not affect the
+  verdict.
+- ea-ratchet stays at 10. TPC-H plans are identical. Units, spotcheck, the
+  sweep (96/96) and the arm (24/24) pass.
+- Regress: incremental\_sort's diff against PG shrinks from 470 to 408
+  lines, aggregates from 424 to 423 and window from 2151 to 2145, all in
+  plan text. join.sql shows only its known row-order flap.
+
+Not ported, and ledgered: PG's other Incremental Sort sites (GROUP BY
+input, window input, DISTINCT, partial paths below Gather Merge). Also
+observed: over an `OFFSET 0` subquery, goopg's input carries the hidden
+SubqueryScan's per-row charge, which PG removes.
+
+Evidence: `analysis/m0146/m0146-0005/slice68/`.

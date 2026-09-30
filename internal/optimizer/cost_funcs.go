@@ -92,6 +92,10 @@ type costParams struct {
 	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
 	// input's count (costsize.c:2144). The Sort producer is sortPathFor.
 	enableSort   bool
+	// enableIncrementalSort is `enable_incremental_sort`: create_ordered_paths
+	// gives a partially presorted input an Incremental Sort only when on
+	// (planner.c). M0146-0005bp.
+	enableIncrementalSort bool
 	enableMemoize bool
 	// enableMaterial is `enable_material`, a GENERATION gate in PG: the
 	// matpath is never created when it is off (joinpath.c:1897, :2135 —
@@ -156,6 +160,7 @@ func defaultCostParams() costParams {
 		enableMergeJoin: true,
 		enableNestLoop:  true,
 		enableSort:      true,
+		enableIncrementalSort: true,
 		enableSeqScan:   true,
 		enableIndexScan: true,
 		enableBitmapScan: true,

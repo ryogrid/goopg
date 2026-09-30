@@ -23535,6 +23535,27 @@ M0146-0001 re-baseline census on the new default arm.
     outer estimate is 1 in both; PG applies the ws\_wh semi join at a
     different relset\)\.
   Movement: none — ea-ratchet 10 -> 10, CATEGORIES-EXCL-MATCH unchanged; Q95 ws_wh body est 2168680 -> 1759792 (PG 1752341)
+- [x] **M0146\-0005bp — ORDER BY over a partially presorted input is an
+  Incremental Sort** \(filed 2026\-09\-30 from the SF0\.25 single\-category
+  sort\-strategy diffs Q3/Q43/Q63\)\. create\_ordered\_paths gives the
+  cheapest input an Incremental Sort when its pathkeys cover a leading
+  prefix of the ORDER BY; goopg always stacked a full Sort\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 68\)\.** `addOrderedPaths` seed arm \+
+    `incrementalSortPathOver`; `enable_incremental_sort` wired
+    \(PlannerSettings/costParams/dispatch\)\;
+    `scripts/pg\-plan\-parity\-diff.py` `GOOPG_UNEMITTABLE` emptied
+    \(baseline re\-score: match unchanged\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 68"\.
+  - Tests `TestExplainOrderByIncrementallySortsPresortedInput` \(fails on
+    base\), `TestAddOrderedPathsIncrementallySortsAPresortedSeed`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(7 queries both scales\), TPC\-H shapes identical, regress 9 cases
+    \(incremental\_sort 470 → 408 diff lines; no result changes\),
+    ea\-ratchet PASS \(10\), diff\-tool self\-test 18/18 \+ unittest 7/7\.
+  Movement: yes — match SF0.25 27 -> 30, SF1 24 -> 26; CATEGORIES-EXCL-MATCH sort-strategy SF0.25 37 -> 33, SF1 40 -> 36
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

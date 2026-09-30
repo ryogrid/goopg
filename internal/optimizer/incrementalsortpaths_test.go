@@ -236,3 +236,34 @@ func TestIncrementalSortModeFromEnv(t *testing.T) {
 		}
 	}
 }
+
+// TestAddOrderedPathsIncrementallySortsAPresortedSeed pins M0146-0005bp:
+// create_ordered_paths gives the cheapest input an Incremental Sort — and no
+// full Sort — when its pathkeys deliver a leading prefix of the ORDER BY and
+// enable_incremental_sort is on (planner.c), and a full Sort when the GUC is
+// off. Independent of the GOOPG_INCREMENTAL_SORT knob, which gates only the
+// other-candidates arm.
+func TestAddOrderedPathsIncrementallySortsAPresortedSeed(t *testing.T) {
+	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
+	for _, on := range []bool{true, false} {
+		ordered, _, seed := incrementalSortOrderedFixture()
+		seed.Pathkeys = sortPathkeys[:1]
+		cp := defaultCostParams()
+		cp.enableIncrementalSort = on
+		addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
+		var kinds []PathKind
+		for _, p := range ordered.Pathlist {
+			kinds = append(kinds, p.Kind)
+		}
+		want := PathSort
+		if on {
+			want = PathIncrementalSort
+		}
+		if len(ordered.Pathlist) != 1 || ordered.Pathlist[0].Kind != want {
+			t.Fatalf("enable_incremental_sort=%v: ordered.Pathlist kinds = %v, want exactly [%v]", on, kinds, want)
+		}
+		if on && ordered.Pathlist[0].PresortedCount != 1 {
+			t.Fatalf("PresortedCount = %d, want 1", ordered.Pathlist[0].PresortedCount)
+		}
+	}
+}
