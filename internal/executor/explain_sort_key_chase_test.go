@@ -91,3 +91,28 @@ func TestSortKeyChaseKeepsTheKeysRelation(t *testing.T) {
 		t.Fatalf("got %q, want PG's key relations `t1.a, t2.b, …`", got)
 	}
 }
+
+// TestSortKeyStopsAtKeptSubqueryScan pins M0146-0005ca against PG 18.3: a
+// Subquery Scan carrying quals is non-trivial to setrefs.c, so PG keeps it
+// and an upper key deparses to the scan's own column (TPC-DS Q53/Q63's
+// tmp1, regress union's ss.x). On this fixture PG prints
+//
+//	Sort Key: tmp.av, tmp.s
+//	->  Subquery Scan on tmp
+//	      Filter: …
+func TestSortKeyStopsAtKeptSubqueryScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE sqw (a int, b int, v int)")
+	runSQL(t, ctx, "INSERT INTO sqw SELECT i % 20, i % 7, i FROM generate_series(1,5000) i")
+	runSQL(t, ctx, "ANALYZE sqw")
+	const q = "EXPLAIN (COSTS OFF) SELECT * FROM (SELECT a, b, sum(v) s, avg(sum(v)) OVER (PARTITION BY a) av FROM sqw GROUP BY a, b) tmp " +
+		"WHERE CASE WHEN av > 0 THEN s / av ELSE NULL END > 0.1 ORDER BY av, s"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	if !strings.Contains(plan, "Subquery Scan on tmp") {
+		t.Fatalf("fixture lost its Subquery Scan:\n%s", plan)
+	}
+	if got := explainLine(t, ctx, q, "Sort Key:"); got != "Sort Key: tmp.av, tmp.s" {
+		t.Fatalf("got %q, want PG's %q", got, "Sort Key: tmp.av, tmp.s")
+	}
+}

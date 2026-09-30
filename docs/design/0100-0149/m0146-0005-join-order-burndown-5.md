@@ -489,3 +489,45 @@ Not done (ledgered):
 - The Gather/partial-aggregate layout.
 
 Evidence: `analysis/m0146/m0146-0005/slice79/`.
+
+## Slice 80: M0146-0005ca — a kept Subquery Scan is a naming boundary for every key line
+
+setrefs.c's `trivial_subqueryscan` removes a Subquery Scan with no quals and
+a pass-through target list; one with quals survives. An upper OUTER\_VAR
+then deparses to the scan's own column, never to the subquery's internals.
+Examples:
+
+- TPC-DS Q53/Q63: `Sort Key: tmp1.avg_quarterly_sales, tmp1.sum_sales, …`;
+- regress union: `Sort Key: ss.x` over `Subquery Scan on ss / Filter`.
+
+Slice 79 left this out, because the Sort and Group Key sites would have
+disagreed. The regress evidence gives the discriminator: every kept scan in
+PG's expected output carries a Filter, and the one goopg keeps without
+quals (aggregates' `q1`) is removed by PG, which prints the internals.
+
+- `resolveKeySource`'s Filter arm stops at a Filter directly over a Subquery
+  Scan. It returns the scan's column, named `alias.col` in
+  `reg.boundaryKeyName`, and the name is always qualified: a plan holding a
+  subquery RTE has rtable \> 1, so PG's useprefix is on. Every key site
+  shares this function, so Sort and Group Key agree by construction. A
+  qual-less Subquery Scan stays transparent (the M0146-0005w arm).
+- Slice 79's keep-today's-text branch for a Subquery Scan child is removed.
+
+Test: `TestSortKeyStopsAtKeptSubqueryScan`, whose PG 18.3 oracle is
+`Sort Key: tmp.av, tmp.s`.
+
+Movement:
+
+- Q53 and Q63 now print PG's Sort Key byte for byte. The parity diff
+  already counted them as matches under its alias canonicalisation (N4),
+  so CATEGORIES-EXCL-MATCH is unchanged (rendering 17 / 20).
+- Regress union.sql goes 970 → 968 diff lines: two of its three `ss.x`
+  keys now match.
+- Q67 prints `dw2.*` where PG prints `dw1.*`, because PG turns
+  `rk <= 100` into a WindowAgg run condition, which makes its `dw2`
+  trivial. goopg has no run conditions, so it keeps `dw2`; the name is
+  right for goopg's plan, and the old bare text mismatched too. Ledgered.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set, regress (12
+  cases) and ea-ratchet (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice80/`.

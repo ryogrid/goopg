@@ -1047,6 +1047,31 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			depth--
 			continue
 		case *optimizer.Filter:
+			// M0146-0005ca: a Subquery Scan with quals is non-trivial to
+			// setrefs.c's trivial_subqueryscan, so PG keeps it, and an
+			// upper OUTER_VAR deparses to the scan's own column —
+			// `tmp1.sum_sales` (TPC-DS Q53/Q63), regress union's `ss.x` —
+			// never to the subquery's internals. The chase stops there;
+			// the alias qualifies the key unconditionally, since a plan
+			// holding a subquery RTE always has rtable > 1 (useprefix).
+			// A qual-less Subquery Scan stays transparent below: PG
+			// removes it and prints the internals (regress aggregates'
+			// q1). Every key site shares this function, so the Sort and
+			// Group Key lines agree by construction.
+			if sq, isSQ := n.Child.(*optimizer.SubqueryScan); isSQ && sq.Alias != "" {
+				col, ok := cur.(*optimizer.ColumnRef)
+				out := sq.Output()
+				if !ok || col.Index < 0 || col.Index >= len(out) || out[col.Index].Name != col.Name || reg == nil {
+					return nil, false
+				}
+				at := &optimizer.ColumnRef{Index: col.Index, Name: out[col.Index].Name,
+					Type: out[col.Index].Type, SourceTableIdx: out[col.Index].SourceTableIdx}
+				if reg.boundaryKeyName == nil {
+					reg.boundaryKeyName = map[*optimizer.ColumnRef]string{}
+				}
+				reg.boundaryKeyName[at] = sq.Alias + "." + at.Name
+				return at, true
+			}
 			// A sublink-bearing Filter on the path (Q44's HAVING-shaped
 			// Filter above the avg agg) marks a level PG may wall off
 			// (SubqueryScan v1 keeps the InitPlan inside): do not chase
@@ -1288,20 +1313,6 @@ func childNodeOf(n optimizer.Node) optimizer.Node {
 	return nil
 }
 
-// childSubqueryScanThroughFilters returns the Subquery Scan directly below n
-// (modulo output-identical Filter wrappers), or nil.
-func childSubqueryScanThroughFilters(n optimizer.Node) *optimizer.SubqueryScan {
-	for {
-		f, ok := n.(*optimizer.Filter)
-		if !ok {
-			break
-		}
-		n = f.Child
-	}
-	sq, _ := n.(*optimizer.SubqueryScan)
-	return sq
-}
-
 // childProjectThroughFilters resolves the Project below (modulo Filter
 // wrappers, which are output-identical by definition) for a Sort whose
 // child carries no aggregate — the grouping-input-sort entry (Q7's
@@ -1457,14 +1468,6 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 						keyExpr = chased
 					}
 				}
-			} else if childSubqueryScanThroughFilters(child) != nil {
-				// A Subquery Scan PG keeps is a naming boundary — its
-				// OUTER_VAR deparses to `alias.col` (TPC-DS Q53/Q63's
-				// `tmp1.sum_sales`) — but the sibling Group Key sites chase
-				// straight through the scan (M0146-0005w), so the pair
-				// would disagree. Keep today's text here; the
-				// alias-qualified boundary is ledgered for both sites
-				// together.
 			} else if chased, ok := resolveKeySource(col, child, reg); ok {
 				// Entry (iii) — M0146-0005bz: any other child (a join, a
 				// scan): the same OUTER_VAR chase, which now crosses joins
@@ -2391,6 +2394,10 @@ type subPlanReg struct {
 	// the subtree (planner ids restart per level) would make the qualifier
 	// ambiguous and print the bare name.
 	pinnedKeyName map[*optimizer.ColumnRef]string
+	// boundaryKeyName is a key the chase stopped at a Subquery Scan PG keeps
+	// (one with quals), named `alias.col`: always qualified, since a plan
+	// holding a subquery RTE has more than one range-table entry.
+	boundaryKeyName map[*optimizer.ColumnRef]string
 	planID       map[optimizer.Node]int
 	hashedPlanID map[optimizer.Node]int
 	lastID       int
@@ -2787,9 +2794,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	switch x := e.(type) {
 	case *optimizer.ColumnRef:
 		// A key the OUTER_VAR chase ended at a relation scan is named in
-		// that scan's context (pinnedKeyName, M0146-0005bz).
-		if qualify && reg != nil {
-			if q, ok := reg.pinnedKeyName[x]; ok {
+		// that scan's context (pinnedKeyName, M0146-0005bz); one it stopped
+		// at a kept Subquery Scan by the scan's alias (boundaryKeyName).
+		if reg != nil {
+			if q, ok := reg.boundaryKeyName[x]; ok {
+				return q
+			}
+			if q, ok := reg.pinnedKeyName[x]; ok && qualify {
 				return q
 			}
 		}

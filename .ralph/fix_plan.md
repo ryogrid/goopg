@@ -23776,6 +23776,23 @@ M0146-0001 re-baseline census on the new default arm.
     TPC\-H arm 24/24 \(after the nightly\), fire set, regress 12 cases
     \(join.sql only, toward PG\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 20 -> 17, SF1 21 -> 20; match unchanged (38 / 28)
+- [x] **M0146\-0005ca — a kept Subquery Scan is a naming boundary for
+  every key line** \(filed and landed 2026\-10\-01 from slice 79\'s ledger
+  row: PG prints `tmp1.sum_sales` / `ss.x` above a Subquery Scan it
+  keeps\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 80\)\.** `resolveKeySource` Filter arm
+    stops at a Filter over a Subquery Scan \(PG\'s non\-trivial scan\),
+    naming `alias.col` via `reg.boundaryKeyName`; Sort and Group Key sites
+    share it\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 80"\.
+  - Test `TestSortKeyStopsAtKeptSubqueryScan`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q53 Q63 Q67 Q89\), regress 12 cases \(union 970 → 968\), ea\-ratchet
+    PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 17, SF1 20; Q53/Q63 keys now byte-identical but N4 already matched them); regress union 970 -> 968
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the
