@@ -439,6 +439,14 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 			// lower WindowAgg emits its input's order untouched, so a second
 			// sort would be both a wasted node and a plan PG never prints.
 			out.Presorted = true
+		} else if n := p.PresortedCount; n > 0 && n < len(keys) &&
+			pathkeysContainedIn(inputNodePathkeys(child), pathkeysForSortKeys(keys[:n])) {
+			// M0146-0005bx: addWindowPaths priced a partially presorted
+			// input as create_one_window_path's Incremental Sort. The
+			// prefix claim is re-checked against the built child, so a
+			// child that lost its order degrades to the full Sort.
+			child = &IncrementalSort{pos: child.Pos(), Child: child, Keys: keys, PresortedCount: n}
+			out.Presorted = true
 		} else {
 			child = &Sort{Child: child, Keys: keys}
 			out.Presorted = true

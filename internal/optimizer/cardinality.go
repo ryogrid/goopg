@@ -136,6 +136,8 @@ func EstimateRows(n Node) int64 {
 		return int64(rows)
 	case *Sort:
 		return EstimateRows(x.Child)
+	case *IncrementalSort:
+		return EstimateRows(x.Child)
 	case *Project:
 		return EstimateRows(x.Child)
 	case *Distinct:
@@ -961,6 +963,8 @@ func IsSmallDimensionSide(n Node) bool {
 	case *Project:
 		return IsSmallDimensionSide(x.Child)
 	case *Sort:
+		return IsSmallDimensionSide(x.Child)
+	case *IncrementalSort:
 		return IsSmallDimensionSide(x.Child)
 	}
 	return false
@@ -1927,6 +1931,8 @@ func groupVarSourceNode(idx int, child Node, depth int) Node {
 		return groupVarSourceNode(idx, x.Child, depth+1)
 	case *Sort:
 		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return groupVarSourceNode(idx, x.Child, depth+1)
 	case *Limit:
 		return groupVarSourceNode(idx, x.Child, depth+1)
 	case *LockRows:
@@ -2191,6 +2197,8 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 	case *Project:
 		return passthrough(x.Child)
 	case *Sort:
+		return passthrough(x.Child)
+	case *IncrementalSort:
 		return passthrough(x.Child)
 	case *Limit:
 		return passthrough(x.Child)
@@ -2515,6 +2523,9 @@ func setOpArmGroups(arm Node, rows int64) int64 {
 			top = x.Child
 			continue
 		case *Sort:
+			top = x.Child
+			continue
+		case *IncrementalSort:
 			top = x.Child
 			continue
 		case *Gather:

@@ -323,3 +323,51 @@ the partial-aggregate split arm do not read `is_sorted` from a derived
 ordering yet.
 
 Evidence: `analysis/m0146/m0146-0005/slice76/`.
+
+## Slice 77: M0146-0005bx — a partially presorted window input gets an Incremental Sort
+
+TPC-DS Q89's window is `PARTITION BY i_category, i_brand, s_store_name,
+s_company_name`. It sits over a GroupAggregate sorted on `(i_category,
+i_class, i_brand, …)`, so the input shares a one-column prefix with the
+window's ordering. PG 18.3's `create_one_window_path` then stacks an
+Incremental Sort (`Presorted Key: item.i_category`) when
+`enable_incremental_sort` is on. goopg priced that case as a full Sort and
+built one.
+
+- `addWindowPaths` reads `pathkeysCountContainedIn`. On a partial match it
+  prices `costWindow`'s existing incremental arm, using the prefix's
+  `estimateNumGroups` count, and records the prefix on the path as
+  `PresortedCount`.
+- `createWindowPlan` stacks `IncrementalSort{PresortedCount}`. It first
+  re-checks the prefix against the built child (`inputNodePathkeys`); a
+  child that lost the order falls back to the full Sort.
+- The window's Incremental Sort is the first one built without a path
+  stamp. EXPLAIN derives its estimate, and with no `*IncrementalSort` arm
+  that estimate came out as rows=1, cost=0; the collapse reached Q89's
+  Limit as `0.01..0.01`. The arms now exist next to `*Sort`'s:
+  - `DeriveLegacyDisplayCost`: `cost_incremental_sort` over the child's
+    costs;
+  - its children list;
+  - `EstimateRows`, `IsSmallDimensionSide`, `groupVarSourceNode`, the
+    pass-through walkers;
+  - `resolveBaseColumn` (joinkeyproof.go), whose arm list a guard test
+    requires to agree with `relFilteredRowsWalk`'s.
+
+Tests:
+
+- `TestWindowInputIncrementalSort` pins PG's shape (count 1820, sum
+  200010000). It fails with the arm disabled.
+- `TestWindowInputIncrementalSortDisplayRows` pins the estimate: rows=1820
+  and a 17xx startup, against PG's `1739.26..2061.71`.
+
+Movement (fire set):
+
+- CATEGORIES-EXCL-MATCH sort-strategy goes SF0.25 32 → 31 and SF1 35 → 34.
+  Match is unchanged (37 / 28).
+- Q89 now differs only by `d_year = ANY (2001)` vs PG's `d_year = 2001`:
+  `transformAExprIn` builds a ScalarArrayOpExpr only for two or more
+  non-Var elements. Filed as M0146-0005by.
+- TPC-H plans are identical. Units, spotcheck, sweep 96/96, arm 24/24 and
+  ea-ratchet (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice77/`.

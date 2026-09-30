@@ -23717,6 +23717,34 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(Q24 Q65\), TPC\-H census identical, ea\-ratchet PASS \(10\)\.
   Movement: yes — match SF0.25 36 -> 37; CATEGORIES-EXCL-MATCH join-order SF0.25 54 -> 53, SF1 62 -> 61; sort-strategy SF0.25 33 -> 32, SF1 36 -> 35
+- [x] **M0146\-0005bx — a partially presorted window input gets an
+  Incremental Sort** \(filed and landed 2026\-09\-30 by the census: TPC\-DS
+  Q89\'s WindowAgg input is PG\'s Incremental Sort, `Presorted Key:
+  item.i\_category`; goopg stacked a full Sort\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 77\)\.** `addWindowPaths` prices the
+    partial match \(`costWindow` incremental arm, `PresortedCount`\);
+    `createWindowPlan` stacks `IncrementalSort`; `\*IncrementalSort` arms
+    beside `\*Sort` in the display\-cost and cardinality walkers and
+    `resolveBaseColumn`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 77"\.
+  - Tests `TestWindowInputIncrementalSort` \(fails with the arm off\),
+    `TestWindowInputIncrementalSortDisplayRows`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q89\), TPC\-H census identical, ea\-ratchet PASS \(10\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH sort-strategy SF0.25 32 -> 31, SF1 35 -> 34; match unchanged (37 / 28)
+- [ ] **M0146\-0005by — a one\-element IN list is a plain equality** \(filed
+  2026\-09\-30 by slice 77\)\. PG\'s `transformAExprIn` \(parse\_expr.c\)
+  builds a ScalarArrayOpExpr only for two or more non\-Var elements; one
+  element becomes `x = c`\. goopg keeps `d\_year = ANY \(2001\)` \(TPC\-DS
+  Q89\'s only remaining difference, reported as qual\-placement\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where the analyzer/planner lowers an IN list to
+    InExpr/ANY and emit a `=` BinaryOp for a single non\-Var element;
+    check both selectivity \(eqsel vs scalararraysel\) and EXPLAIN\.
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

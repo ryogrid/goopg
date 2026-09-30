@@ -171,6 +171,8 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		return resolveBaseColumn(idx, x.Child)
 	case *Sort:
 		return resolveBaseColumn(idx, x.Child)
+	case *IncrementalSort:
+		return resolveBaseColumn(idx, x.Child)
 
 	// M0125-0038 (C5): a join input is routinely Project-wrapped, and this
 	// lookup returning nothing through the wrapper is what made every such

@@ -300,9 +300,7 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 	// own (a sorted GroupAggregate's group keys — TPC-DS Q51's
 	// `sum(sum(...)) OVER (PARTITION BY ws_item_sk ORDER BY d_date)` over
 	// `GROUP BY ws_item_sk, d_date`) and each WindowAgg passes its input's
-	// order through. A partial match is priced as the full Sort
-	// createWindowPlan stacks, not as an Incremental Sort goopg does not
-	// build here.
+	// order through. A partial match is an Incremental Sort (M0146-0005bx).
 	have := inputNodePathkeys(input)
 	for i, w := range windows {
 		cols := belowNode.Output()
@@ -312,10 +310,27 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			}
 		}
 		presortedCount := 0
+		incremental := 0
+		var presortedGroups float64
 		if required := pathkeysForSortKeys(windowSortKeys(w)); len(required) > 0 {
-			if pathkeysContainedIn(have, required) {
+			if contained, nCommon := pathkeysCountContainedIn(have, required); contained {
 				presortedCount = len(required)
 			} else {
+				// M0146-0005bx: create_one_window_path's other arm — a
+				// partially presorted input gets an Incremental Sort when
+				// enable_incremental_sort is on (TPC-DS Q89: PARTITION BY
+				// i_category, i_brand, … over a GroupAggregate sorted on
+				// i_category, i_class, …), priced from the presorted
+				// prefix's group count as cost_incremental_sort does.
+				if nCommon > 0 && cp.enableIncrementalSort {
+					presortedCount = nCommon
+					incremental = nCommon
+					groupExprs := make([]Expr, nCommon)
+					for j := range groupExprs {
+						groupExprs[j] = required[j].Expr
+					}
+					presortedGroups = float64(estimateNumGroups(groupExprs, belowNode, int64(below.Rows)))
+				}
 				have = required
 			}
 		}
@@ -326,8 +341,11 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			Cost: costWindow(cp, below.Cost.Total, below.Rows,
 				len(w.PartitionBy), len(w.OrderBy), len(w.Funcs),
 				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode),
-				presortedCount, 0),
-			Children: []*Path{below},
+				presortedCount, presortedGroups),
+			// Read by createWindowPlan: the prefix the stacked Incremental
+			// Sort is told is already ordered (0 = a full Sort).
+			PresortedCount: incremental,
+			Children:       []*Path{below},
 		}
 		below = p
 		belowNode = w

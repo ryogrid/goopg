@@ -156,6 +156,18 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		}
 		out.StartupCost = childStartup
 		out.TotalCost = childTotal + perRow
+	case *IncrementalSort:
+		// M0146-0005bx: cost_incremental_sort over the child's costs, with
+		// the presorted prefix's group count — the node the window path
+		// stacks (createWindowPlan) is built without a path stamp.
+		groupExprs := make([]Expr, 0, x.PresortedCount)
+		for j := 0; j < x.PresortedCount && j < len(x.Keys); j++ {
+			groupExprs = append(groupExprs, x.Keys[j].Expr)
+		}
+		groups := estimateNumGroups(groupExprs, x.Child, rows)
+		c := costIncrementalSort(cp, Cost{Startup: childStartup, Total: childTotal}, float64(rows), float64(groups),
+			len(x.Child.Output()), 0, -1, out.PlanWidth)
+		out.StartupCost, out.TotalCost = c.Startup, c.Total+perRow
 	case *Sort:
 		// PG's cost_sort charges a comparison term and is BLOCKING: nothing
 		// emerges until the input is consumed, so startup is the child's
@@ -239,6 +251,8 @@ func legacyDisplayChildren(n Node) []Node {
 	case *Filter:
 		return []Node{p.Child}
 	case *Sort:
+		return []Node{p.Child}
+	case *IncrementalSort:
 		return []Node{p.Child}
 	case *Limit:
 		return []Node{p.Child}
