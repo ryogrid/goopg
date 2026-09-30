@@ -291,11 +291,16 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}
 		}
-		// The memoize cache (S7) wraps only a plain index probe: `Memoize.Child`
-		// is typed `*IndexScan`, and the optimizer declines to build the cache
-		// for any other inner kind, so this assertion cannot fire.
+		// The memoize cache (S7) wraps an index probe — plain or, since
+		// M0146-0005bq, index-only; the optimizer builds it over no other
+		// inner kind.
 		if p.InnerMemo != nil {
-			innerScan = newMemoizeOp(p.InnerMemo, innerScan.(*indexScanOp))
+			probe, ok := innerScan.(memoProbe)
+			if !ok {
+				return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
+					Message: fmt.Sprintf("NestedLoopIndexJoin memoizes a %T, which is not an index probe", innerScan)}
+			}
+			innerScan = newMemoizeOp(p.InnerMemo, probe)
 		}
 		// M0071-0013 Stage D-1: NLI now composes outer + inner via
 		// a persistent VirtualSlot. outerMS.row is overwritten per

@@ -308,7 +308,7 @@ func idxDeformNLIInnerBound(t *testing.T, jo *nestedLoopIndexJoinOp, ncols int) 
 	case *indexScanOp:
 		return idxDeformEff(in.deformBound, ncols)
 	case *memoizeOp:
-		return idxDeformEff(in.child.deformBound, ncols)
+		return idxDeformEff(in.child.(*indexScanOp).deformBound, ncols)
 	case *bitmapHeapScanOp:
 		return idxDeformEff(in.deformBound, ncols)
 	default:
@@ -723,7 +723,7 @@ func collectDeformBounds(op Operator, out *[][2]int) {
 		// The inner satisfies nliInner (no Open), not Operator: unwrap
 		// the Memoize cache the same way nliInnerIndexScan does.
 		if mo, ok := o.inner.(*memoizeOp); ok {
-			collectDeformBounds(mo.child, out)
+			collectDeformBounds(mo.child.(Operator), out)
 			return
 		}
 		if io, ok := o.inner.(*indexScanOp); ok {

@@ -1038,7 +1038,8 @@ func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
 //
 // KeyExprs are the probe-key expressions (they reference OUTER columns
 // and are evaluated against the bound outer slot — the same expressions
-// the aliased Child IndexScan consumes as Key/Keys). SingleRow marks a
+// the aliased Child probe — an *IndexScan or, since M0146-0005bq, an
+// *IndexOnlyScan — consumes as Key/Keys). SingleRow marks a
 // provably-unique probe (entries complete after the first row, PG's
 // `singlerow`). EstEntries is the planner's cache-population estimate
 // for initial sizing (cost_memoize_rescan analog); the executor clamps
@@ -1047,7 +1048,7 @@ type Memoize struct {
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	pos        int
-	Child      *IndexScan
+	Child      Node
 	KeyExprs   []Expr
 	SingleRow  bool
 	EstEntries int64

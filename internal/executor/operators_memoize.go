@@ -70,7 +70,7 @@ const memoEntryRowOverhead = 48
 
 type memoizeOp struct {
 	plan  *optimizer.Memoize
-	child *indexScanOp
+	child memoProbe
 	ctx   *Context
 	cache *kvcache.Cache
 	stats *MemoizeStats
@@ -87,7 +87,7 @@ type memoizeOp struct {
 	emitMS    *MaterializedSlot
 }
 
-func newMemoizeOp(p *optimizer.Memoize, child *indexScanOp) *memoizeOp {
+func newMemoizeOp(p *optimizer.Memoize, child memoProbe) *memoizeOp {
 	return &memoizeOp{plan: p, child: child}
 }
 
@@ -127,11 +127,8 @@ func (o *memoizeOp) BindOuter(slot SlotView, outerWidth int) {
 // stale. KeyExprs stays authoritative only for EXPLAIN and the attach
 // gate.
 func (o *memoizeOp) keyExprs() []optimizer.Expr {
-	if len(o.child.plan.Keys) > 0 {
-		return o.child.plan.Keys
-	}
-	if o.child.plan.Key != nil {
-		return []optimizer.Expr{o.child.plan.Key}
+	if keys := o.child.probeKeys(); len(keys) > 0 {
+		return keys
 	}
 	return o.plan.KeyExprs
 }
@@ -256,4 +253,30 @@ func (o *memoizeOp) Close() error {
 	o.filling = nil
 	o.mode = memoizeModeIdle
 	return o.child.Close()
+}
+
+// memoProbe is the parameterised probe a Memoize caches: an index scan or,
+// since M0146-0005bq, an index-only scan (PG's `Memoize -> Index Only Scan`).
+type memoProbe interface {
+	Schema() optimizer.Schema
+	openPrep(ctx *Context) error
+	BindOuter(slot SlotView, outerWidth int)
+	Rescan(outerSlot SlotView, outerWidth int) error
+	Next() (TupleSlot, error)
+	Close() error
+	// probeKeys is the probe's bound Key/Keys, in binding order.
+	probeKeys() []optimizer.Expr
+}
+
+func (o *indexScanOp) probeKeys() []optimizer.Expr     { return probeKeyList(o.plan.Key, o.plan.Keys) }
+func (o *indexOnlyScanOp) probeKeys() []optimizer.Expr { return probeKeyList(o.plan.Key, o.plan.Keys) }
+
+func probeKeyList(key optimizer.Expr, keys []optimizer.Expr) []optimizer.Expr {
+	if len(keys) > 0 {
+		return keys
+	}
+	if key != nil {
+		return []optimizer.Expr{key}
+	}
+	return nil
 }

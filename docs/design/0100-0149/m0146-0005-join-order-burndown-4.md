@@ -671,3 +671,68 @@ observed: over an `OFFSET 0` subquery, goopg's input carries the hidden
 SubqueryScan's per-row charge, which PG removes.
 
 Evidence: `analysis/m0146/m0146-0005/slice68/`.
+
+## Slice 69: M0146-0005bq — a parameterised probe is index-only when its index covers the rel
+
+After slice 68, the SF0.25 single-category diffs were all one node: PG's
+nested-loop inner probe is an `Index Only Scan` where goopg's is an
+`Index Scan`. The six were Q13 (`store_pkey`), Q18, Q50, Q82
+(`store_sales_pkey`), Q84 (`customer_demographics_pkey`) and Q94.
+`build_index_paths` (indxpath.c) builds ONE path per usable index, and it
+is index-only whenever `check_index_only` finds the index covers every
+column the query reads from the rel, parameterised or not. The visibility
+map only prices it through cost\_index's allvisfrac, which is why PG uses
+the node even on `store`, a table with 0 all-visible pages. goopg built
+index-only paths only for base scans (addIndexOnlyPaths), and never for
+the parameterised probe.
+
+- `addOneParameterizedIndexPath` (pathparamindex.go) makes the probe path
+  index-only when three things hold:
+  - the needed set is known and `enable_indexonlyscan` is on;
+  - the leaf is bare;
+  - the index covers the rel's needed columns.
+
+  The path is costed with `indexOnly`/allvisfrac and carries the covered
+  width fields that addOneIndexOnlyPath sets.
+- `createIndexScanPlan`'s index-only branch accepts parameterised clauses.
+  `nliProbeWithCond` / `setNLIProbeKeys` (createplannl.go) let both
+  nested-loop builders (the lateral decomposed arm and the fused Memoize
+  arm) take an `*IndexOnlyScan` probe.
+- `Memoize.Child` is widened to `Node`. The executor's `memoizeOp` now
+  wraps a `memoProbe` interface, implemented by `indexScanOp` and
+  `indexOnlyScanOp`, so PG's `Memoize -> Index Only Scan` is expressible.
+- The first fire-set run exposed a missing sibling. `relFilteredRowsWalk`'s
+  R62 guard declined a parameterised `*IndexScan`'s per-probe rows as
+  restriction evidence, but not an `*IndexOnlyScan`'s. Q39's `item` probe
+  therefore read as filtered to 1 row, and its grouping estimate collapsed
+  from 3911 to 60 (PG 3922). The index-only twin is now declined as well.
+  subplan\_cost.go gains the same arm.
+
+Tests:
+
+- `TestParameterisedProbeIsIndexOnly` checks PG 18.3's
+  `Nested Loop -> Index Only Scan using p_pkey` plus the values, with bitmap
+  scans off, because goopg's probe still prices above its bitmap twin on
+  that fixture (M0142-0005c). It fails with the producer change reverted.
+- `TestRelFilteredRowsDeclinesIndexOnlyProbe` fails without the guard.
+
+Movement (fire set):
+
+- PLAN-PARITY match SF0.25 30 → 33 (Q13, Q82, Q84).
+- CATEGORIES-EXCL-MATCH scan-type SF0.25 37 → 32, SF1 41 → 37. No other
+  category moves up.
+- Nine fires, all executing at both scales.
+- ea-ratchet stays at 10. TPC-H plans are identical. Units, spotcheck, the
+  sweep (96/96) and the arm (24/24) pass.
+- Regress: nine cases have unchanged diff counts. join.sql shows some Index
+  Only Scan lines plus its row-order flap; memoize differs in timings only.
+
+Still plain, and ledgered:
+
+- Q18 `cd2` and Q50 `d1`: goopg's needed set is name-matched across the
+  statement, so another alias of the same table over-states the columns.
+- Probes over a leaf with local quals (M0146-0019a).
+- The unparameterised ordered index path, which a merge join consumes.
+  PG makes it index-only too.
+
+Evidence: `analysis/m0146/m0146-0005/slice69/`.

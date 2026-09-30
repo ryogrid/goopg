@@ -23556,6 +23556,30 @@ M0146-0001 re-baseline census on the new default arm.
     \(incremental\_sort 470 → 408 diff lines; no result changes\),
     ea\-ratchet PASS \(10\), diff\-tool self\-test 18/18 \+ unittest 7/7\.
   Movement: yes — match SF0.25 27 -> 30, SF1 24 -> 26; CATEGORIES-EXCL-MATCH sort-strategy SF0.25 37 -> 33, SF1 40 -> 36
+- [x] **M0146\-0005bq — a parameterised probe is index\-only when its index
+  covers the rel** \(filed 2026\-09\-30 from the SF0\.25 single\-category
+  scan\-type diffs Q13/Q18/Q50/Q82/Q84/Q94\)\. build\_index\_paths builds one
+  path per index, index\-only whenever check\_index\_only holds —
+  parameterised or not; goopg never built the index\-only probe\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 69\)\.** `addOneParameterizedIndexPath`
+    index\-only arm; `createIndexScanPlan` accepts parameterised clauses on
+    an index\-only path; `nliProbeWithCond`/`setNLIProbeKeys` in both NLI
+    builders; `Memoize.Child` widened, executor `memoProbe`; R62 guard\'s
+    `*IndexOnlyScan` twin in `relFilteredRowsWalk` \(Q39 group estimate
+    3911 → 60 otherwise\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 69"\.
+  - Tests `TestParameterisedProbeIsIndexOnly`,
+    `TestRelFilteredRowsDeclinesIndexOnlyProbe` \(both fail on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(9 queries both scales\), TPC\-H shapes identical, regress 9 cases,
+    ea\-ratchet PASS \(10\)\.
+  - Residual \(ledgered\): name\-matched needed set blocks multi\-alias
+    tables \(Q18 cd2, Q50 d1\); ordered unparameterised index path not
+    index\-only; residual\-qual leaves are M0146\-0019a\.
+  Movement: yes — match SF0.25 30 -> 33; CATEGORIES-EXCL-MATCH scan-type SF0.25 37 -> 32, SF1 41 -> 37
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

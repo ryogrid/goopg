@@ -2154,6 +2154,14 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		if is, ok := n.(*IndexScan); ok && indexProbeHasOuterRef(is) {
 			return 0, false, false
 		}
+		// M0146-0005bq: the index-only twin — since a parameterised probe can
+		// be index-only, the same per-probe rows must be declined for it
+		// (TPC-DS Q39's `item` probe otherwise read as filtered to 1 row and
+		// collapsed the grouping estimate 3911 -> 60).
+		if ios, ok := n.(*IndexOnlyScan); ok && ios != nil &&
+			(exprHasOuterRef(ios.Key) || exprHasOuterRefList(ios.Keys)) {
+			return 0, false, false
+		}
 		return float64(EstimateRows(n)), true, false
 	}
 	// passthrough: n still describes a single relation if its child does.

@@ -380,7 +380,29 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// scan model the unparameterised ordered path uses (pathindexordered.go),
 	// not a second one.
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	// M0146-0005bq: build_index_paths' single `index_only_scan` flag
+	// (indxpath.c) — when check_index_only finds the index covers every
+	// column the statement reads from this rel, the ONE path PG builds for
+	// the index is index-only, parameterised or not; the visibility map only
+	// prices it (cost_index's allvisfrac). goopg built a plain probe here
+	// and never the index-only one, so PG's `Index Only Scan` inner probes
+	// (TPC-DS Q13/Q18/Q50/Q82/Q84/Q94) were unreachable. A leaf with local
+	// quals keeps the plain probe: an index-only probe would need them as a
+	// Filter over its covered schema (M0146-0019a).
+	var ioCovered []catalog.Column
+	indexOnly := false
+	if s.neededColsKnown && !indexOnlyHardDisabled(cat) && scanLeafIsBare(rel.baseLeaf) {
+		if needed := s.neededColumnsOf(tbl); len(needed) > 0 {
+			ioCovered, indexOnly = indexCoversColumns(idx, needed)
+		}
+	}
+	allVisFrac := 0.0
+	if indexOnly {
+		allVisFrac = relAllVisibleFraction(cat, tbl, relPages)
+	}
 	cost := costIndexScan(s.cp, indexScanInputs{
+		indexOnly:       indexOnly,
+		allVisFrac:      allVisFrac,
 		relPages:        relPages,
 		relTuples:       relTuples,
 		indexPages:      indexPages,
@@ -418,7 +440,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	path := &Path{
 		Kind:     PathIndexScan,
 		Rel:      rel,
 		Rows:     rows,
@@ -445,7 +467,19 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		RequiredOuter: req,
 		Target:        tgt,
 		TargetKnown:   tgtKnown,
-	}, "index.parameterised")
+	}
+	producer := "index.parameterised"
+	if indexOnly {
+		// The same width fields the unparameterised index-only path carries
+		// (addOneIndexOnlyPath): the probe emits only the covered columns.
+		path.IndexOnly = true
+		path.IndexOnlyCovered = ioCovered
+		path.NCols = len(ioCovered)
+		path.AvgVarBytes = coveredAvgVarBytes(tbl, ioCovered)
+		path.OutputWidth = indexOnlyOutputWidth(ioCovered)
+		producer = "indexonly.parameterised"
+	}
+	addPath(rel, path, producer)
 	// The leading-prefix path existing does not preclude a skip path on a
 	// DIFFERENT index — PG's `create_index_paths` offers every usable index
 	// and lets add_path decide, so offer the skip candidate too.

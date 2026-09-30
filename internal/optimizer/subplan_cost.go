@@ -64,8 +64,14 @@ func estimateSubplanCostPerCall(n Node) int64 {
 	case *NestedLoopIndexJoin:
 		l := estimateSubplanCostPerCall(x.Outer)
 		var r int64
-		if is, ok := x.Inner.(*IndexScan); ok {
+		switch is := x.Inner.(type) {
+		case *IndexScan:
 			r = indexProbeMatchSet(is)
+		case *IndexOnlyScan:
+			// M0146-0005bq: a parameterised probe may be index-only.
+			if is != nil && is.Table != nil && is.Index != nil {
+				r = matchSetByColumnName(is.Table, firstIndexColumn(is.Index))
+			}
 		}
 		if l <= 0 || r <= 0 {
 			return 0

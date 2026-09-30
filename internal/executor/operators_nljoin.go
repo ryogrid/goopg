@@ -123,7 +123,9 @@ func nliInnerIndexScan(in nliInner) *indexScanOp {
 	case *indexScanOp:
 		return x
 	case *memoizeOp:
-		return x.child
+		// An index-only child (M0146-0005bq) has no heap TID to provide.
+		is, _ := x.child.(*indexScanOp)
+		return is
 	}
 	return nil
 }

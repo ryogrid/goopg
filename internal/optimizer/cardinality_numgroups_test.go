@@ -213,3 +213,28 @@ func TestNumGroupsThroughAggregate(t *testing.T) {
 		t.Fatalf("EstimateRows(ungrouped Aggregate) = %d, want 1", got)
 	}
 }
+
+// M0146-0005bq: a parameterised probe can now be an *IndexOnlyScan (the
+// decomposed lateral NestLoop's right child, keyed by PG nestloop params).
+// Its per-probe row count is no more a base-relation restriction than the
+// *IndexScan probe's (R62), so relFilteredRows must decline it too — TPC-DS
+// Q39 grouped item's key above such a probe and collapsed 3911 groups to 60.
+func TestRelFilteredRowsDeclinesIndexOnlyProbe(t *testing.T) {
+	base := numGroupsScan("inner", 18000, 18000)
+	idx := &catalog.Index{Table: base.Table, Columns: []string{"a"}}
+	probe := &IndexOnlyScan{
+		Table:   base.Table,
+		Index:   idx,
+		Key:     &OuterColumnRef{Level: 1, Name: "k", Type: catalog.Type{Name: "int4"}},
+		Covered: []catalog.Column{base.Table.Columns[0]},
+		schema:  base.Output()[:1],
+	}
+	if got, ok := relFilteredRows(probe, probe); ok || got != 0 {
+		t.Fatalf("parameterised index-only probe evidence = (%v, %v), want (0, false)", got, ok)
+	}
+	constProbe := &IndexOnlyScan{Table: base.Table, Index: idx, Key: &IntegerConst{Value: 7},
+		Covered: []catalog.Column{base.Table.Columns[0]}, schema: base.Output()[:1]}
+	if _, ok := relFilteredRows(constProbe, constProbe); !ok {
+		t.Fatalf("a constant-keyed index-only scan is restriction evidence and must be found")
+	}
+}
