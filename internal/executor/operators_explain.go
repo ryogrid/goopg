@@ -1942,6 +1942,15 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
+	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
+	// (formatIndexCond) — only the bound quals, each under its own column.
+	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
+		parts := make([]string, len(p.Keys))
+		for i, k := range p.Keys {
+			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+		}
+		return wrapParen(strings.Join(parts, " AND "))
+	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
 

@@ -23627,7 +23627,7 @@ M0146-0001 re-baseline census on the new default arm.
     gone\), TPC\-H arm 24/24, fire set \(5 fires, no category move\), TPC\-H
     shapes identical, regress 6 cases, ea\-ratchet PASS \(10\)\.
   Movement: none — CATEGORIES-EXCL-MATCH unchanged at both scales (prerequisite slice; 5 plans change)
-- [ ] **M0146\-0005bt — index\-only skip probes** \(filed 2026\-09\-30 by
+- [x] **M0146\-0005bt — index\-only skip probes** \(filed 2026\-09\-30 by
   slice 72\)\. TPC\-DS Q94\'s `wr1` anti\-join probe binds the 2nd key of
   `web_returns_pkey`; PG 18 plans an index\-only skip scan, goopg\'s
   `IndexOnlyScan` has no skip prefix\.
@@ -23637,6 +23637,17 @@ M0146-0001 re-baseline census on the new default arm.
     `SkipPrefix` enumeration `indexScanOp` has, add the field to
     `IndexOnlyScan`, then the index\-only arm in
     `addOneParameterizedSkipPath` and `createIndexScanPlan`\.
+  - **DONE 2026\-09\-30 \(slice 73\)\.** `btreeSkipEnum` \(btree\_skip.go\)
+    shared by `indexScanOp` and `indexOnlyScanOp`;
+    `IndexOnlyScan.SkipPrefix`; index\-only arm in
+    `addOneParameterizedSkipPath`; EXPLAIN skip rendering for IOS\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 73"\.
+  - Test `TestIndexOnlySkipProbe` \(fails without the producer arm\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(Q16 Q94 both scales\), TPC\-H shapes identical, regress 6 cases
+    unchanged \(incl\. btree\_index\), ea\-ratchet PASS \(10\)\.
+  Movement: yes — match SF0.25 35 -> 36, SF1 27 -> 28; CATEGORIES-EXCL-MATCH scan-type SF0.25 30 -> 28, SF1 36 -> 34
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

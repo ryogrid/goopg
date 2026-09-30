@@ -579,7 +579,7 @@ func setNLIProbeKeys(n Node, keys []Expr) {
 		}
 	case *IndexOnlyScan:
 		x.Key, x.Keys = nil, nil
-		if len(keys) == 1 {
+		if len(keys) == 1 && x.SkipPrefix == 0 {
 			x.Key = keys[0]
 		} else {
 			x.Keys = keys

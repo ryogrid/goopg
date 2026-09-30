@@ -155,7 +155,7 @@ func probeKeyEqualities(inner optimizer.Node) []probeKeyEquality {
 		if p.Index == nil {
 			return nil
 		}
-		cols, key, keys = p.Index.Columns, p.Key, p.Keys
+		cols, key, keys, skip = p.Index.Columns, p.Key, p.Keys, p.SkipPrefix
 	default:
 		return nil
 	}

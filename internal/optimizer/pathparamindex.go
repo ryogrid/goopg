@@ -578,7 +578,25 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	if rows > maxSkipProbeRows || (loopCount > 0 && rows*loopCount > maxSkipProbeLifetimeRows) {
 		return false
 	}
+	// M0146-0005bt: the skip probe is index-only under the same
+	// check_index_only rule the prefix probe uses (M0146-0005bq) — PG 18's
+	// skip scan is an ordinary index path, so build_index_paths' single
+	// `index_only_scan` flag applies to it too (TPC-DS Q94's `wr1` probe on
+	// web_returns_pkey's second key).
+	var ioCovered []catalog.Column
+	indexOnly := false
+	if s.neededColsKnown && !indexOnlyHardDisabled(cat) && scanLeafIsBare(rel.baseLeaf) {
+		if needed := s.neededColumnsOfRel(rel, tbl); len(needed) > 0 {
+			ioCovered, indexOnly = indexCoversColumns(idx, needed)
+		}
+	}
+	allVisFrac := 0.0
+	if indexOnly {
+		allVisFrac = relAllVisibleFraction(cat, tbl, relPages)
+	}
 	cost := costIndexScan(s.cp, indexScanInputs{
+		indexOnly:        indexOnly,
+		allVisFrac:       allVisFrac,
 		relPages:         relPages,
 		relTuples:        relTuples,
 		indexPages:       indexPages,
@@ -593,7 +611,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 		boundSelectivity: boundSel,
 	})
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	path := &Path{
 		Kind:            PathIndexScan,
 		Rel:             rel,
 		Rows:            rows,
@@ -608,7 +626,17 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 		RequiredOuter:   req,
 		Target:          tgt,
 		TargetKnown:     tgtKnown,
-	}, "index.parameterised.skip")
+	}
+	producer := "index.parameterised.skip"
+	if indexOnly {
+		path.IndexOnly = true
+		path.IndexOnlyCovered = ioCovered
+		path.NCols = len(ioCovered)
+		path.AvgVarBytes = coveredAvgVarBytes(tbl, ioCovered)
+		path.OutputWidth = indexOnlyOutputWidth(ioCovered)
+		producer = "indexonly.parameterised.skip"
+	}
+	addPath(rel, path, producer)
 	return true
 }
 

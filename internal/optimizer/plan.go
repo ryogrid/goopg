@@ -1122,6 +1122,10 @@ type IndexOnlyScan struct {
 	HighOp  parser.OpCode
 	// Covered is the slice of catalog.Column entries that the output schema
 	// contains (a subset of Index.Columns, in projection order).
+	// SkipPrefix is IndexScan.SkipPrefix for the index-only probe
+	// (M0146-0005bt): Keys[i] binds Index.Columns[SkipPrefix+i] and the
+	// first SkipPrefix key columns are enumerated by the executor.
+	SkipPrefix int
 	Covered []catalog.Column
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe

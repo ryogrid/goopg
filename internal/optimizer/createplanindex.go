@@ -348,8 +348,9 @@ func createIndexScanPlan(p *Path) Node {
 		for i, c := range p.IndexClauses {
 			// A parameterised probe (M0146-0005bq) binds outer join clauses,
 			// which have no leaf-local conjunct; its keys are re-based onto
-			// the outer by the NLI builder.
-			if c.indexCol != i || c.key == nil || (c.local == nil && p.RequiredOuter == 0) {
+			// the outer by the NLI builder. A skip probe (M0146-0005bt) binds
+			// Columns[IndexSkipPrefix+i].
+			if c.indexCol != p.IndexSkipPrefix+i || c.key == nil || (c.local == nil && p.RequiredOuter == 0) {
 				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a local equality-prefix clause",
 					p.IndexInfo.Name, i))
 			}
@@ -358,8 +359,10 @@ func createIndexScanPlan(p *Path) Node {
 				ioDrop[c.local] = true
 			}
 		}
-		if p.IndexSkipPrefix != 0 {
-			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a skip prefix", p.IndexInfo.Name))
+		if p.IndexSkipPrefix < 0 || (p.IndexSkipPrefix > 0 && p.RequiredOuter == 0) ||
+			p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s skips %d columns then binds %d clauses",
+				p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses)))
 		}
 		if len(p.IndexClauses) > len(p.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
@@ -398,9 +401,12 @@ func createIndexScanPlan(p *Path) Node {
 		}
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).
-		switch len(ioKeys) {
-		case 0:
-		case 1:
+		switch {
+		case len(ioKeys) == 0:
+		case p.IndexSkipPrefix > 0:
+			ios.SkipPrefix = p.IndexSkipPrefix
+			ios.Keys = ioKeys
+		case len(ioKeys) == 1:
 			ios.Key = ioKeys[0]
 		default:
 			ios.Keys = ioKeys

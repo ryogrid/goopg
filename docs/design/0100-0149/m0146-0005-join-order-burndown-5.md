@@ -96,3 +96,49 @@ arm of `addOneParameterizedSkipPath` needs executor skip support in
 `indexOnlyScanOp` first. Filed as M0146-0005bt.
 
 Evidence: `analysis/m0146/m0146-0005/slice72/`.
+
+## Slice 73: M0146-0005bt — index-only skip probes
+
+Slice 72 traced TPC-DS Q94's remaining divergence to its `wr1` anti-join
+probe. The probe binds `wr_order_number`, the SECOND key of
+`web_returns_pkey`, so it is a PG 18 skip scan, and PG makes it index-only
+under the same `check_index_only` rule as any index path. goopg's
+`IndexOnlyScan` had no skip prefix, so the parameterised skip producer
+offered only the heap-fetching probe.
+
+- The skip enumeration moved out of `indexScanOp` into a shared
+  `btreeSkipEnum` (new btree\_skip.go):
+  - `init` evaluates the bound columns once per Rescan, and reports a NULL
+    bound as an empty scan;
+  - `next` returns the next prefix group's (lo, hi) probe, for both the
+    tuple and the blob key formats.
+  
+  `indexScanOp` delegates to it (its lazy cursor-per-group drive is
+  unchanged). `indexOnlyScanOp.Rescan` gains a skip branch that runs one
+  bounded range scan per group, materialised eagerly like every other
+  index-only shape.
+- `IndexOnlyScan.SkipPrefix` is added on the plan node. The index-only
+  branch of `createIndexScanPlan` accepts a parameterised skip path, and
+  `setNLIProbeKeys` keeps `Keys` under a skip prefix. EXPLAIN renders only
+  the bound quals under their own columns, in `formatIndexOnlyCond` and in
+  `probeKeyEqualities` (the Memoize/NLI qual reader).
+- `addOneParameterizedSkipPath` gains the index-only arm of slice 69
+  (bare leaf, covering index, per-alias needed set, allvisfrac costing and
+  covered widths).
+
+Test: `TestIndexOnlySkipProbe` covers two PG 18.3 oracle shapes over
+`q_pkey(k1, k2)` probed on k2. The anti join gives count 19; the inner join
+gives count 18 and `sum(k1)` 36, reading the skipped key column back out.
+It fails with the producer arm removed.
+
+Movement (fire set):
+
+- PLAN-PARITY match SF0.25 35 → 36, SF1 27 → 28 (Q94).
+- CATEGORIES-EXCL-MATCH scan-type SF0.25 30 → 28, SF1 36 → 34 (Q94, and
+  Q16's probe).
+- ea-ratchet stays at 10. TPC-H plans are identical. Units, spotcheck, the
+  sweep (96/96) and the arm (24/24) pass. Regress btree\_index,
+  create\_index, index\_including, join, subselect and select are
+  unchanged.
+
+Evidence: `analysis/m0146/m0146-0005/slice73/`.

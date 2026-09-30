@@ -132,3 +132,48 @@ func TestExistsStarProbeIsIndexOnly(t *testing.T) {
 		t.Fatalf("rows = %v, want [19]", rows)
 	}
 }
+
+// TestIndexOnlySkipProbe pins M0146-0005bt against PG 18.3: a parameterised
+// probe binding only the SECOND key of q_pkey(k1, k2) is a skip scan, and it
+// is index-only when the index covers the rel (TPC-DS Q94's `wr1`):
+//
+//	->  Index Only Scan using q_pkey on q  Index Cond: (k2 = (o.a * 200))  -- anti: count 19
+//	->  Index Only Scan using q_pkey on q  Index Cond: (k2 = (o.a * 3))    -- inner: count 18, sum(k1) 36
+//
+// The inner join reads k1 back out of the skipped key column.
+func TestIndexOnlySkipProbe(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE o (a int, b int)")
+	runSQL(t, ctx, "CREATE TABLE q (k1 int, k2 int, v int, PRIMARY KEY (k1, k2))")
+	runSQL(t, ctx, "INSERT INTO o SELECT i*37, i % 50 FROM generate_series(1,1000) i")
+	runSQL(t, ctx, "INSERT INTO q SELECT i % 5, i, i FROM generate_series(1,100000) i")
+	runSQL(t, ctx, "ANALYZE o")
+	runSQL(t, ctx, "ANALYZE q")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	ps.MaxParallelWorkersPerGather = 0
+	for _, c := range []struct {
+		q, cond, rows string
+	}{
+		{"SELECT count(*) FROM o WHERE o.b = 7 AND NOT EXISTS (SELECT * FROM q WHERE q.k2 = o.a * 200)",
+			"Index Cond: (k2 = (o.a * 200))", "19"},
+		{"SELECT count(*), sum(q.k1) FROM o JOIN q ON q.k2 = o.a * 3 WHERE o.b = 7",
+			"Index Cond: (k2 = (o.a * 3))", "18,36"},
+	} {
+		var lines []string
+		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN "+c.q, ps)) {
+			if len(r) > 0 && r[0].Kind == KindString {
+				lines = append(lines, strings.TrimSpace(r[0].StringValue()))
+			}
+		}
+		joined := strings.Join(lines, "\n")
+		if !strings.Contains(joined, "Index Only Scan using q_pkey on q") || !strings.Contains(joined, c.cond) {
+			t.Errorf("%s\nwant PG's index-only skip probe %q:\n%s", c.q, c.cond, joined)
+		}
+		rows := formatRows(drainPlanRows(t, ctx, planWithSettings(t, ctx, c.q, ps)))
+		if len(rows) != 1 || rows[0] != c.rows {
+			t.Errorf("%s: rows = %v, want [%s]", c.q, rows, c.rows)
+		}
+	}
+}
