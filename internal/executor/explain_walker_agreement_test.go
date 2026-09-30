@@ -146,7 +146,9 @@ func TestNoNodeRendersZeroCost(t *testing.T) {
 // TestLegacyDisplayCostIsMonotone pins the one property
 // DeriveLegacyDisplayCost is allowed to claim: a parent costs at least its
 // child. It is not a cost model and nothing plans against it, but a
-// non-monotone cost column is actively misleading in a diff.
+// non-monotone cost column is actively misleading in a diff. The exception
+// is PG's own: a Limit reads only part of its input, so adjust_limit_rows_costs
+// puts its total between the input's startup and total (M0146-0005bm).
 func TestLegacyDisplayCostIsMonotone(t *testing.T) {
 	tbl := parallelLabelTestTable(t, "t")
 	scan := &optimizer.SeqScan{Table: tbl, EstRelRows: 10000}
@@ -160,8 +162,9 @@ func TestLegacyDisplayCostIsMonotone(t *testing.T) {
 	if sortCost.TotalCost < scanCost.TotalCost {
 		t.Errorf("Sort total %.2f < child scan total %.2f", sortCost.TotalCost, scanCost.TotalCost)
 	}
-	if limitCost.TotalCost < sortCost.TotalCost {
-		t.Errorf("Limit total %.2f < child sort total %.2f", limitCost.TotalCost, sortCost.TotalCost)
+	if limitCost.TotalCost < sortCost.StartupCost || limitCost.TotalCost > sortCost.TotalCost {
+		t.Errorf("Limit total %.2f outside child sort %.2f..%.2f",
+			limitCost.TotalCost, sortCost.StartupCost, sortCost.TotalCost)
 	}
 	// Sort is blocking: PG's cost_tuplesort puts the whole input cost into
 	// startup, so nothing emerges until the child is fully consumed.

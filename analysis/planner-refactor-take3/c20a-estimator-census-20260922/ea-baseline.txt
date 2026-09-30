@@ -8,6 +8,5 @@ Q23:catalog_sales+customer+date_dim
 Q23:cte:frequent_ss_items+customer+date_dim+web_sales
 Q23:customer+date_dim+web_sales
 Q78:date_dim+store_returns+store_sales+web_returns+web_sales
-Q84:customer+customer_address+customer_demographics+household_demographics+income_band+store_returns
 Q92:date_dim+web_sales
 Q95:cte:ws_wh+customer_address+date_dim+web_sales+web_site

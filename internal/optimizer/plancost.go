@@ -170,8 +170,20 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		// blocking reading — the conservative one for a startup column.
 		out.StartupCost = childTotal + cp.cpuOperatorCost*float64(len(x.Aggs))*childRowsOf(n)
 		out.TotalCost = out.StartupCost + perRow
+	case *Limit:
+		// create_limit_path (M0146-0005bm): the input's costs and rows put
+		// through adjust_limit_rows_costs; a Limit charges no CPU of its own.
+		in, ok := limitInputPath(x.Child)
+		if !ok {
+			in = legacyDisplayCostOf(x.Child)
+		}
+		inRows := in.PlanRows
+		if in.PerWorker || inRows <= 0 {
+			inRows = float64(EstimateRows(x.Child))
+		}
+		out.PlanRows, out.StartupCost, out.TotalCost = adjustLimitRowsCosts(inRows, in.StartupCost, in.TotalCost, limitEstimatesOf(x))
 	default:
-		// Pass-through wrappers: Project, Filter, Limit, Distinct, Result,
+		// Pass-through wrappers: Project, Filter, Distinct, Result,
 		// SetOp, WindowAgg, LockRows and the rest. They stream, so startup is
 		// the child's startup.
 		out.StartupCost = childStartup

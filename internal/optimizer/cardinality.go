@@ -63,6 +63,36 @@ func stampedUpperRows(pc *PlanCost) (int64, bool) {
 	return int64(c.PlanRows + 0.5), true
 }
 
+// limitInputPath is the path a Limit reads, as create_limit_path sees it:
+// the first node under child that carries its path's cost, looking through
+// goopg's Project wrappers (PG projects on the input path's own tlist, so
+// there is no node between them). ok is false when that node is unstamped or
+// per-worker.
+func limitInputPath(child Node) (PlanCost, bool) {
+	for {
+		p, isProj := child.(*Project)
+		if !isProj || p.Child == nil {
+			break
+		}
+		child = p.Child
+	}
+	if c, ok := child.(PlanCostCarrier); ok {
+		if pc, set := c.PlanCostInfo(); set && !pc.PerWorker && pc.PlanRows > 0 {
+			return pc, true
+		}
+	}
+	return PlanCost{}, false
+}
+
+// limitInputRows is the row count a Limit reads: its input path's rows
+// (the count create_limit_path adjusts), else the legacy estimate.
+func limitInputRows(child Node) int64 {
+	if pc, ok := limitInputPath(child); ok {
+		return int64(clampRowEst(pc.PlanRows))
+	}
+	return EstimateRows(child)
+}
+
 func EstimateRows(n Node) int64 {
 	switch x := n.(type) {
 	case *SeqScan:
@@ -93,13 +123,17 @@ func EstimateRows(n Node) int64 {
 		}
 		return scaleByFloat(child, filterSelectivity(x))
 	case *Limit:
-		child := EstimateRows(x.Child)
-		if lim, ok := constInt(x.Limit); ok {
-			if child <= 0 || lim < child {
+		child := limitInputRows(x.Child)
+		if child <= 0 {
+			if lim, ok := constInt(x.Limit); ok {
 				return lim
 			}
+			return child
 		}
-		return child
+		// adjust_limit_rows_costs (M0146-0005bm): OFFSET and an
+		// unestimatable LIMIT shape the count too, as in create_limit_path.
+		rows, _, _ := adjustLimitRowsCosts(float64(child), 0, 0, limitEstimatesOf(x))
+		return int64(rows)
 	case *Sort:
 		return EstimateRows(x.Child)
 	case *Project:

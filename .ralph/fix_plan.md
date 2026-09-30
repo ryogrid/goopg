@@ -23463,6 +23463,29 @@ M0146-0001 re-baseline census on the new default arm.
     Q34/Q73 both scales, TPC\-H shapes identical, regress runner 5 cases
     unchanged, ea\-ratchet repinned \(11 entries\)\.
   Movement: yes — ea-ratchet findings 12 -> 11 (Q34 FIXED); Q34 GroupAggregate est 1 -> 15 (actual 87); PLAN-PARITY categories unchanged (SF0.25 match 27, SF1 24)
+- [x] **M0146\-0005bm — a Limit is sized from the path it reads**
+  \(filed 2026\-09\-30 from the ea\-ratchet Q84 finding\)\. `LIMIT 100` over
+  a Gather Merge of 11 printed `rows=100` with a total above its input\'s;
+  PG\'s create\_limit\_path runs the input path\'s rows/costs through
+  adjust\_limit\_rows\_costs \(pathnode\.c\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-09\-30 \(slice 65\)\.** `adjustLimitRowsCosts` /
+    `limitEstimatesOf` \(tuplefraction\.go\), `limitInputPath` /
+    `limitInputRows` \(cardinality\.go, look through Project wrappers\), a
+    Limit arm in `DeriveLegacyDisplayCost`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-4.md`
+    § "Slice 65"\.
+  - Tests `TestExplainLimitClampsToInputRows` \(fails on base\),
+    `TestLimitReadsInputPathThroughProject`;
+    `TestLegacyDisplayCostIsMonotone` now pins PG\'s Limit rule \(total
+    between the child\'s startup and total\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(81 queries both scales, no timeouts\), TPC\-H shapes identical,
+    regress runner 7 cases unchanged, ea\-ratchet repinned \(10 entries\)\.
+  - Residual: Q84\'s Gather Merge estimates 11 where PG has 10 \(cause
+    not traced; below the ratchet bar, not filed\)\.
+  Movement: yes — ea-ratchet findings 11 -> 10 (Q84 FIXED); Q84 Limit rows 100 -> 11 (PG 10); PLAN-PARITY categories unchanged (SF0.25 match 27, SF1 24)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

@@ -416,3 +416,61 @@ Movement:
   shows only the known row-order flap.
 
 Evidence: `analysis/m0146/m0146-0005/slice64/`.
+
+## Slice 65: M0146-0005bm — a Limit is sized from the path it reads
+
+In TPC-DS Q84, `LIMIT 100` over a Gather Merge of 11 rows printed
+`Limit (rows=100)`, and its total was above its input's. PG prints the
+input's own rows and cost there. create\_limit\_path copies its input path's
+rows and costs and passes them through `adjust_limit_rows_costs`
+(pathnode.c):
+
+- OFFSET rows are skipped first, which moves startup by that fraction of
+  the input's run cost.
+- The count is then capped at what remains, and total is interpolated over
+  the fraction read.
+- An unestimatable clause is 10% of the input, and the result is at least 1
+  row. The Limit itself charges no CPU.
+
+goopg had two defects:
+
+- `EstimateRows(Limit)` took min(count, child) from the legacy estimator,
+  and never subtracted OFFSET.
+- The EXPLAIN display fell through the pass-through arm (child total plus
+  cpu\_tuple\_cost per row).
+
+In Q84 the input sits behind an unstamped Project wrapper. goopg projects
+there, whereas PG projects on the input path's own tlist. So the legacy
+estimate was all either reader saw.
+
+- `adjustLimitRowsCosts` (tuplefraction.go) ports the PG function, with
+  `limitEstimatesOf` giving preprocess\_limit's count/offset estimates.
+- `limitInputPath` / `limitInputRows` (cardinality.go) find the Limit's
+  input path by looking through Project wrappers to the first node that
+  carries its path's cost. The legacy estimate is used only when that node
+  is unstamped or per-worker.
+- `DeriveLegacyDisplayCost` gained a Limit arm that applies the
+  adjustment. `TestLegacyDisplayCostIsMonotone` used to require a Limit to
+  cost at least its child. That is not PG's rule, and the test now
+  requires the Limit's total to lie between the child's startup and total.
+
+Tests:
+
+- `TestExplainLimitClampsToInputRows` checks the Limit lines of three PG
+  18.3 oracle shapes: LIMIT over a 22-row aggregate, LIMIT 10 OFFSET 5,
+  and LIMIT/OFFSET over a scan. It fails on base.
+- `TestLimitReadsInputPathThroughProject` covers the Q84 shape (a Project
+  over a stamped node) plus the OFFSET and 10%-punt arithmetic.
+
+Movement:
+
+- ea-ratchet findings 11 → 10 (Q84 FIXED). Q84's Limit prints rows 100 →
+  11 at the Gather Merge's own cost. PG's Gather Merge estimates 10; that
+  residual is upstream of the Limit and not traced here.
+- PLAN-PARITY is unchanged (SF0.25 match 27, SF1 24). The fire set covers
+  81 queries, and every one executes at both scales.
+- TPC-H plans are identical, the arm is 24/24, and the sweep is 96/96.
+- Regress limit/select/subselect/union/aggregates/join/window diffs are
+  unchanged.
+
+Evidence: `analysis/m0146/m0146-0005/slice65/`.

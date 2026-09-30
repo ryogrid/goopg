@@ -458,3 +458,56 @@ func getCheapestFractionalPathOrdered(rel *RelOptInfo, tupleFraction float64, qu
 	}
 	return best
 }
+
+// limitEstimatesOf is preprocess_limit's (count_est, offset_est) pair for a
+// Limit node, without the tuple-fraction fold.
+func limitEstimatesOf(lim *Limit) limitEstimates {
+	return limitEstimates{
+		count:  limitClauseEstimate(lim.Limit, true),
+		offset: limitClauseEstimate(lim.Offset, false),
+	}
+}
+
+// adjustLimitRowsCosts is `adjust_limit_rows_costs` (pathnode.c): a Limit
+// emits at most count rows after skipping offset rows, never more than its
+// input has, and its costs are the input's interpolated over the fraction of
+// the input it reads. An unestimatable clause (-1) is 10% of the input.
+// M0146-0005bm: goopg's Limit printed `rows=<count>` and a total above its
+// input's whenever the count exceeded the input (TPC-DS Q84: rows=100 over
+// a Gather Merge of 11; PG 10).
+func adjustLimitRowsCosts(rows, startup, total float64, est limitEstimates) (float64, float64, float64) {
+	inRows, inStartup, inTotal := rows, startup, total
+	if est.offset != 0 {
+		offRows := float64(est.offset)
+		if est.offset < 0 {
+			offRows = clampRowEst(inRows * unestimatableLimitFraction)
+		}
+		if offRows > rows {
+			offRows = rows
+		}
+		if inRows > 0 {
+			startup += (inTotal - inStartup) * offRows / inRows
+		}
+		rows -= offRows
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	if est.count != 0 {
+		countRows := float64(est.count)
+		if est.count < 0 {
+			countRows = clampRowEst(inRows * unestimatableLimitFraction)
+		}
+		if countRows > rows {
+			countRows = rows
+		}
+		if inRows > 0 {
+			total = startup + (inTotal-inStartup)*countRows/inRows
+		}
+		rows = countRows
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	return rows, startup, total
+}
