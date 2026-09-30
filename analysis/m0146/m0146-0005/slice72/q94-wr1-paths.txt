@@ -1,0 +1,4 @@
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=2 startup=0 total=556 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=348 inputtotal=-1
+DPPATH path producer=joinsearch.prebuilt relids={5} kind=0 reqouter=- rows=17920 startup=0 total=511.20000000000005 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=348 inputtotal=-1
+DPPATH path producer=index.parameterised.skip relids={5} kind=2 reqouter={0} rows=2 startup=0.25 total=89.88693747360466 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=348 inputtotal=-1
+DPPATH path producer=indexonly relids={5} kind=2 reqouter=- rows=17920 startup=0.25 total=3317.0477911595517 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=348 inputtotal=-1

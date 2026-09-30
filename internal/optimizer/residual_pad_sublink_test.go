@@ -34,8 +34,31 @@ func TestResidualColumnRefsByNameSublinkScopes(t *testing.T) {
 	if len(names) != 1 || names[0] != "o_orderkey" {
 		t.Errorf("uncorrelated sublink: want only the operand o_orderkey, got %v", names)
 	}
-	if residualColumnRefsByName(corr, func(string) {}) {
-		t.Error("correlated sublink: walk must stay partial (its outer refs are index-keyed)")
+	// M0146-0005bs: a correlated plan reads the row only through its outer
+	// references, which carry names — the walk is total and reports them
+	// (TPC-DS Q35's exists-or-exists residual had fallen back on any padded
+	// needed column). A nameless outer reference still makes it partial.
+	var corrNames []string
+	if !residualColumnRefsByName(corr, func(n string) { corrNames = append(corrNames, n) }) {
+		t.Fatal("correlated sublink: walk must be total when every outer ref is named")
+	}
+	hasCust := false
+	for _, n := range corrNames {
+		if n == "o_custkey" {
+			hasCust = true
+		}
+	}
+	if !hasCust {
+		t.Errorf("correlated sublink: want the outer ref o_custkey reported, got %v", corrNames)
+	}
+	nameless := &InExpr{Operand: operand, Plan: &Filter{
+		Child: &SeqScan{Table: &catalog.Table{Name: "lineitem"}},
+		Predicate: &BinaryOp{Op: parser.OpEq,
+			Left:  &ColumnRef{Index: 0, Name: "l_orderkey"},
+			Right: &OuterColumnRef{Level: 1, Index: 3}},
+	}}
+	if residualColumnRefsByName(nameless, func(string) {}) {
+		t.Error("a nameless outer ref must keep the walk partial")
 	}
 	if visitColumnRefsByName(uncorr, func(string) {}) {
 		t.Error("visitColumnRefsByName must still report any inner plan as partial")

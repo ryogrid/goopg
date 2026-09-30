@@ -47,3 +47,52 @@ Prerequisites before the EXISTS change can land (filed as M0146-0005bs):
    EXISTS leaf, and give it the index-only arm.
 
 Evidence: `analysis/m0146/m0146-0005/recon71/`.
+
+## Slice 72: M0146-0005bs — the EXISTS star lands, with a residual pad check that reads outer references
+
+Recon 71's first prerequisite is done here, and the EXISTS change lands.
+
+- `residualColumnRefsByName` (narrowoutput.go) no longer marks the walk
+  partial when the residual holds a correlated sublink. A correlated plan
+  reads the row it runs under only through its `OuterColumnRef`s, and each
+  of them carries the column's name.
+  - Every outer reference whose level reaches this scope or beyond is
+    reported by name, including those in nested sublinks
+    (`walkPlanExprsDeep`).
+  - Over-reporting (a reference that a lateral binder inside the plan
+    satisfies, or one aimed further out) only makes the fallback fire more.
+  - A nameless outer reference still makes the walk partial.
+- Q35's `exists(...) or exists(...)` residual reads only
+  `c.c_customer_sk`. The old partial walk fell back on any statement-needed
+  column padded anywhere, and slice 70's per-alias pads made that fire.
+- `existsBodyForColumns` (pathindexonlyneed.go) drops an EXISTS body's
+  target list when it holds only stars and constants, as simplify\_EXISTS\_query
+  does. A `SELECT *` inside EXISTS therefore no longer voids the
+  statement's needed set.
+
+Tests:
+
+- `TestExistsStarProbeIsIndexOnly` uses a PG 18.3 oracle: an anti join over
+  `NOT EXISTS (SELECT * ...)` probes `p_pkey` index-only, count 19.
+- `TestResidualColumnRefsByNameSublinkScopes` now pins the new contract:
+  total, reporting the outer reference, and partial only for a nameless one.
+
+Movement:
+
+- None on the instruments. Five fires (Q10 Q16 Q35 Q69 Q94) change plans
+  with no category movement at either scale, and all execute.
+- The `residual-hits-pad` seam declines that recon 71 hit are gone: the
+  sweep shows only its baseline `leaf-count` declines.
+- ea-ratchet stays at 10. TPC-H plans are identical. Units, spotcheck, the
+  sweep (96/96) and the arm (24/24) pass. Regress is unchanged apart from
+  join.sql's flaps.
+
+Q94 is still not index-only, and the cause is now traced. The `wr1` probe
+is a parameterised SKIP path (`index.parameterised.skip`). The join binds
+`wr_order_number`, the second key of `web_returns_pkey`, and PG 18's
+matching node is an index-only skip scan. goopg's `IndexOnlyScan` has no
+skip prefix, which is why `createIndexScanPlan` refuses one. The index-only
+arm of `addOneParameterizedSkipPath` needs executor skip support in
+`indexOnlyScanOp` first. Filed as M0146-0005bt.
+
+Evidence: `analysis/m0146/m0146-0005/slice72/`.

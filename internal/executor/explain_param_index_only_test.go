@@ -91,3 +91,44 @@ func TestIndexOnlyProbePerAlias(t *testing.T) {
 		t.Fatalf("rows = %v, want [20,356680]", rows)
 	}
 }
+
+// TestExistsStarProbeIsIndexOnly pins M0146-0005bs against PG 18.3: an
+// EXISTS reads no column through its SELECT list (simplify_EXISTS_query
+// discards it), so `NOT EXISTS (SELECT * FROM p WHERE p.id = ...)` probes
+// p_pkey index-only:
+//
+//	->  Nested Loop Anti Join
+//	      ->  Seq Scan on o  Filter: (b = 7)
+//	      ->  Index Only Scan using p_pkey on p  Index Cond: (id = (o.a * 200))
+//
+// count 19. goopg's needed-column collector declined the whole statement on
+// the star.
+func TestExistsStarProbeIsIndexOnly(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE o (a int, b int)")
+	runSQL(t, ctx, "CREATE TABLE p (id int PRIMARY KEY, x int)")
+	runSQL(t, ctx, "INSERT INTO o SELECT i*37, i % 50 FROM generate_series(1,1000) i")
+	runSQL(t, ctx, "INSERT INTO p SELECT i, i FROM generate_series(1,100000) i")
+	runSQL(t, ctx, "ANALYZE o")
+	runSQL(t, ctx, "ANALYZE p")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	ps.MaxParallelWorkersPerGather = 0
+	const q = "SELECT count(*) FROM o WHERE o.b = 7 AND NOT EXISTS (SELECT * FROM p WHERE p.id = o.a * 200)"
+
+	var lines []string
+	for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN "+q, ps)) {
+		if len(r) > 0 && r[0].Kind == KindString {
+			lines = append(lines, strings.TrimSpace(r[0].StringValue()))
+		}
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Anti Join") || !strings.Contains(joined, "Index Only Scan using p_pkey on p") {
+		t.Fatalf("want PG's index-only anti-join probe:\n%s", joined)
+	}
+	rows := formatRows(drainPlanRows(t, ctx, planWithSettings(t, ctx, q, ps)))
+	if len(rows) != 1 || rows[0] != "19" {
+		t.Fatalf("rows = %v, want [19]", rows)
+	}
+}

@@ -269,7 +269,7 @@ func collectSublinkOuterNames(e parser.Expr, dst map[string]bool) bool {
 	case *parser.ExtractExpr:
 		return collectSublinkOuterNames(x.Source, dst)
 	case *parser.ExistsExpr:
-		return collectStmtColumnNames(x.Subquery, dst)
+		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
 		return collectStmtColumnNames(x.Inner, dst)
 	default:
@@ -459,7 +459,7 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		// exactly the plan take2 P4-01 is justified by.
 		return collectExprColumnNames(x.Source, dst)
 	case *parser.ExistsExpr:
-		return collectStmtColumnNames(x.Subquery, dst)
+		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
 		return collectStmtColumnNames(x.Inner, dst)
 	default:
@@ -484,4 +484,27 @@ func collectGroupingSetColumnNames(gs *parser.GroupingSetsSpec, dst map[string]b
 		}
 	}
 	return true
+}
+
+// existsBodyForColumns is simplify_EXISTS_query's target-list discard
+// (subselect.c) as the column collector sees it: an EXISTS reads no column
+// through its SELECT list, so `EXISTS (SELECT * FROM wr1 WHERE ...)` — TPC-DS
+// Q94's anti-join probe — must not void the statement's needed set with its
+// star. Only a list of stars and constants is dropped; any other target is
+// still walked, which can only over-state (M0146-0005bs).
+func existsBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
+	if sub == nil || len(sub.Targets) == 0 {
+		return sub
+	}
+	for _, t := range sub.Targets {
+		switch t.Expr.(type) {
+		case *parser.StarExpr, *parser.IntegerConst, *parser.StringConst,
+			*parser.NumericConst, *parser.BooleanConst, *parser.NullConst:
+		default:
+			return sub
+		}
+	}
+	cp := *sub
+	cp.Targets = nil
+	return &cp
 }

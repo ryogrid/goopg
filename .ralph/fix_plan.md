@@ -23598,7 +23598,7 @@ M0146-0001 re-baseline census on the new default arm.
     \(groupingsets unchanged, create\_index 1804 → 1788\), ea\-ratchet PASS
     \(10\)\.
   Movement: yes — match SF0.25 33 -> 35, SF1 26 -> 27; CATEGORIES-EXCL-MATCH scan-type SF0.25 32 -> 30, SF1 37 -> 36
-- [ ] **M0146\-0005bs — an EXISTS body\'s star voids the needed set** \(filed
+- [x] **M0146\-0005bs — an EXISTS body\'s star voids the needed set** \(filed
   2026\-09\-30 by recon 71\)\. PG\'s simplify\_EXISTS\_query discards an
   EXISTS target list; goopg\'s needed\-column collector declines on the
   `SELECT \*`, so TPC\-DS Q94\'s `wr1` anti\-join probe never becomes
@@ -23615,7 +23615,28 @@ M0146-0001 re-baseline census on the new default arm.
     \(narrowoutput.go\) alias\-aware — carry each padded slot\'s qualifier
     from the boundary filler — then trace the producer of Q94\'s anti\-join
     probe over the pulled EXISTS leaf\.
-  Movement: none — recon; change reverted (would have added 2 seam declines)
+  - **DONE 2026\-09\-30 \(slice 72\)\.** `residualColumnRefsByName` reports
+    correlated plans\' outer refs by name \(`walkPlanExprsDeep`\);
+    `existsBodyForColumns` drops star/constant EXISTS targets\. Q94\'s
+    `wr1` probe is a skip path → M0146\-0005bt\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 72"\.
+  - Tests `TestExistsStarProbeIsIndexOnly`,
+    `TestResidualColumnRefsByNameSublinkScopes` \(updated contract\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(residual\-hits\-pad declines
+    gone\), TPC\-H arm 24/24, fire set \(5 fires, no category move\), TPC\-H
+    shapes identical, regress 6 cases, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged at both scales (prerequisite slice; 5 plans change)
+- [ ] **M0146\-0005bt — index\-only skip probes** \(filed 2026\-09\-30 by
+  slice 72\)\. TPC\-DS Q94\'s `wr1` anti\-join probe binds the 2nd key of
+  `web_returns_pkey`; PG 18 plans an index\-only skip scan, goopg\'s
+  `IndexOnlyScan` has no skip prefix\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: give `indexOnlyScanOp` \(operators\_indexonly.go\) the
+    `SkipPrefix` enumeration `indexScanOp` has, add the field to
+    `IndexOnlyScan`, then the index\-only arm in
+    `addOneParameterizedSkipPath` and `createIndexScanPlan`\.
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
