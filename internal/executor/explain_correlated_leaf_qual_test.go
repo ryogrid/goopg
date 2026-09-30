@@ -57,6 +57,12 @@ func TestCorrelatedSublinkIsBaseRestriction(t *testing.T) {
 	if !placed {
 		t.Fatalf("want the SubPlan qual on the r1 CTE Scan:\n%s", strings.Join(lines, "\n"))
 	}
+	// The CTE plan takes plan_id 1 (SS_process_ctes runs before the
+	// sublink is planned), so the SubPlan is PG's `SubPlan 2`
+	// (M0146-0005bv).
+	if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "(SubPlan 2)") || !strings.Contains(joined, "\nSubPlan 2") {
+		t.Fatalf("want PG's plan_id numbering `SubPlan 2`:\n%s", joined)
+	}
 	rows := formatRows(drainPlanRows(t, ctx, planWithSettings(t, ctx, q, ps)))
 	if len(rows) != 1 || rows[0] != "801" {
 		t.Fatalf("rows = %v, want [801]", rows)

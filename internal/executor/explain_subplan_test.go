@@ -239,18 +239,21 @@ func TestExplainSubPlanNumbering(t *testing.T) {
 	defer cleanup()
 
 	// Two independent sublinks in one predicate get distinct numbers
-	// and distinct subtrees.
+	// and distinct subtrees. Each EXISTS is planned twice by PG (the
+	// EXISTS SubPlan, then the hashed ANY alternative), so the hashed
+	// forms print PG 18.3's `hashed SubPlan 2` and `hashed SubPlan 4`
+	// (M0146-0005bv).
 	plan, lines := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE t1.a = 1 "+
 			"OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) "+
 			"OR EXISTS (SELECT 1 FROM t2 WHERE t2.b = t1.b)")
 
-	if !strings.Contains(plan, "SubPlan 1") || !strings.Contains(plan, "SubPlan 2") {
+	if !strings.Contains(plan, "hashed SubPlan 2") || !strings.Contains(plan, "hashed SubPlan 4") {
 		t.Errorf("want two numbered sublinks:\n%s", plan)
 	}
 	headers := 0
 	for _, l := range lines {
-		if s := strings.TrimSpace(l); s == "SubPlan 1" || s == "SubPlan 2" {
+		if s := strings.TrimSpace(l); s == "SubPlan 2" || s == "SubPlan 4" {
 			headers++
 		}
 	}

@@ -209,3 +209,61 @@ Movement (fire set):
   known row-order flap).
 
 Evidence: `analysis/m0146/m0146-0005/slice74/`.
+
+## Slice 75: M0146-0005bv — SubPlan/InitPlan numbers follow PG's plan\_id
+
+PG numbers a SubPlan or InitPlan by its position in `glob->subplans`, so
+the number records planning order (`build_subplan`, `SS_process_ctes` and
+`SS_make_initplan_from_plan` in subselect.c):
+
+- CTE plans take ids first, in declaration order, and each is appended
+  after its own body is planned. The ids are not printed.
+- `make_subplan` plans a sublink's subquery before appending the sublink,
+  so nested sublinks (planagg's MIN/MAX InitPlan included) come before the
+  one that holds them.
+- A simple EXISTS that converts to a hashable ANY is planned twice. The
+  hashed ANY plan takes the second id, and it is the one EXPLAIN shows when
+  hashing wins.
+
+goopg numbered sublinks from 1 in render order. Every CTE statement was
+therefore off by the CTE count: TPC-DS Q1/Q30/Q81 printed `SubPlan 1`
+against PG's `SubPlan 2`, and Q14 printed InitPlans 1–4 against 3–6. Every
+nested pair was inverted, and every hashed EXISTS was one low.
+
+- `reservePGPlanIDs` (new explain\_plan\_ids.go) walks the plan once
+  before rendering and reserves numbers in that order:
+  1. the CTE sections, each body before its CTE;
+  2. the plan spine pre-order, a node's own sublinks before its children,
+     and each sublink's body before the sublink.
+
+  An EXISTS→ANY conversion (`InExpr.UnknownEqFalse`) that renders `hashed`
+  reserves a second id. `assignHashed` looks the reservation up by inner
+  plan root; an unreserved sublink continues the sequence.
+- `optimizer.NodeSublinks` pairs each subplan root with its sublink
+  expression; `NodeSubplans` is now built on it.
+- Four tests pinned goopg's old numbers and now pin PG 18.3's, checked on
+  a live PG 18.3: `hashed SubPlan 2`/`4` for two EXISTS; `InitPlan 2` over
+  planagg's `InitPlan 1`. `TestCorrelatedSublinkIsBaseRestriction`
+  additionally pins `SubPlan 2` after one CTE.
+
+Not modelled (ledgered):
+
+- FROM subqueries are planned in range-table order after the level's
+  sublinks (Q58's InitPlan 2/1/3).
+- A CTE declared inside a sublink body is planned during that sublink.
+- planagg's InitPlans at the query's own level come after its quals.
+- A sublink goopg decorrelated still consumed an id in PG.
+
+Movement (fire set):
+
+- CATEGORIES-EXCL-MATCH parameterisation goes SF0.25 33 → 30 and SF1
+  40 → 36. Match is unchanged (SF0.25 36, SF1 28).
+- Q30/Q81 now differ from PG only by the customer probe (the parked
+  index-probe multiplier).
+- Regress: subselect goes 2811 → 2806 diff lines, and its hashed-EXISTS
+  case now prints PG's `hashed SubPlan 2`. The join, partition\_prune and
+  with hunks renumber sublinks in plan shapes PG does not build.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24 and ea-ratchet (10)
+  pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice75/`.

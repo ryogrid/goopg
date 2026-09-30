@@ -77,10 +77,15 @@ func TestExplainInitPlanValueRendersCol1(t *testing.T) {
 	ctx, cleanup := explainSubPlanFixture(t)
 	defer cleanup()
 
+	// goopg plans max() through planagg's MIN/MAX InitPlan, which is
+	// made while the sublink's subquery is planned, so it takes plan_id
+	// 1 and the sublink's own InitPlan 2 — PG 18.3 prints exactly
+	// `Filter: (b > (InitPlan 2).col1)` over `InitPlan 2 -> Result /
+	// InitPlan 1` for this shape (M0146-0005bv).
 	plan, _ := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE t1.b > (SELECT max(t2.b) FROM t2)")
-	if !strings.Contains(plan, "(InitPlan 1).col1") {
-		t.Errorf("want value-position (InitPlan 1).col1 in plan:\n%s", plan)
+	if !strings.Contains(plan, "(InitPlan 2).col1") {
+		t.Errorf("want value-position (InitPlan 2).col1 in plan:\n%s", plan)
 	}
 	assertNoOpaqueExpr(t, plan)
 }

@@ -23671,7 +23671,7 @@ M0146-0001 re-baseline census on the new default arm.
     partsupp probe as PG\), regress subselect/with/join unchanged,
     ea\-ratchet PASS \(10\)\.
   Movement: none — match unchanged (SF0.25 36, SF1 28); CATEGORIES-EXCL-MATCH aggregation-strategy SF0.25 18 -> 17 but SF1 join-order 60 -> 62 and scan-type 34 -> 35 (customer probe flips to bitmap at 109 driving rows: M0142-0005c)
-- [ ] **M0146\-0005bv — SubPlan/InitPlan numbering follows PG\'s plan\_id**
+- [x] **M0146\-0005bv — SubPlan/InitPlan numbering follows PG\'s plan\_id**
   \(filed 2026\-09\-30 by slice 74\)\. PG numbers SubPlans and InitPlans by
   their position in `glob\->subplans`, CTE plans included and a sublink
   planned inside a CTE body before that CTE: Q30/Q81/Q1 print `SubPlan 2`
@@ -23686,6 +23686,20 @@ M0146-0001 re-baseline census on the new default arm.
     number CTE plans in the same sequence \(post\-order: a CTE body\'s
     sublinks, then the CTE\); compare with
     `analysis/m0146/m0146\-0005/slice74/` and the 0bu fire\-set captures\.
+  - **DONE 2026\-09\-30 \(slice 75\)\.** `reservePGPlanIDs`
+    \(explain\_plan\_ids.go\) reserves numbers before rendering: CTE
+    sections \(body, then CTE\), then the spine pre\-order with each
+    sublink\'s body first; a hashed EXISTS→ANY takes a second id
+    \(`assignHashed`\)\. `optimizer.NodeSublinks` pairs roots with exprs\.
+    Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 75"\.
+  - Tests: four EXPLAIN tests re\-pinned to PG 18\.3\'s numbers \(oracle
+    checked live\); `TestCorrelatedSublinkIsBaseRestriction` pins
+    `SubPlan 2`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(8 fires\), regress 22 numbered cases \(subselect 2811 → 2806; others
+    shape\-only renumbering or known flaps\), ea\-ratchet PASS \(10\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0.25 33 -> 30, SF1 40 -> 36; match unchanged (SF0.25 36, SF1 28)
 - [ ] **M0146\-0039 — \(observed\) temp tables survive a server restart**
   \(filed 2026\-09\-30 by slice 74, NOT yet reproduced cleanly\)\. On the
   private :5533 probe cluster \(tmp/c20a/data\-sf025\) a session created

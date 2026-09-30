@@ -434,7 +434,9 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64) {
-	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem})
+	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	reg.reservePGPlanIDs(n)
+	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
@@ -2139,6 +2141,13 @@ type subPlanReg struct {
 	// `SubPlan N` subtree must render as a leaf too. nil when the plan has
 	// no CTE, and nil-receiver tolerant either way.
 	cte *cteHoist
+	// planID / hashedPlanID are the SubPlan/InitPlan numbers reserved in
+	// PG's plan_id order before rendering (reservePGPlanIDs, M0146-0005bv),
+	// keyed by the sublink's inner plan root; lastID is the highest number
+	// handed out, so an unreserved sublink continues the sequence.
+	planID       map[optimizer.Node]int
+	hashedPlanID map[optimizer.Node]int
+	lastID       int
 	// sortStats / sortWorkers carry EX0-03c's per-Sort execution stats for
 	// this render (the leader's main-line entries and the folded per-worker
 	// carrier). They live here rather than in their own walker parameters
@@ -2434,6 +2443,13 @@ type subPlanEntry struct {
 // assign returns the SubPlan number already given to e, or
 // allocates the next one and queues e's inner plan for emission.
 func (r *subPlanReg) assign(e optimizer.Expr, plan optimizer.Node) int {
+	return r.assignHashed(e, plan, false)
+}
+
+// assignHashed is assign for a sublink that renders `hashed`: an
+// EXISTS→ANY conversion's hashed plan is the second of the two PG plans
+// for it, so it prints the second reserved number.
+func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed bool) int {
 	if r == nil {
 		return 0
 	}
@@ -2443,7 +2459,14 @@ func (r *subPlanReg) assign(e optimizer.Expr, plan optimizer.Node) int {
 	if r.num == nil {
 		r.num = make(map[optimizer.Expr]int)
 	}
-	n := len(r.num) + 1
+	n, ok := r.planID[plan]
+	if h, alt := r.hashedPlanID[plan]; ok && alt && hashed {
+		n = h
+	}
+	if !ok {
+		r.lastID++
+		n = r.lastID
+	}
 	r.num[e] = n
 	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan})
 	return n
@@ -2470,7 +2493,13 @@ func (r *subPlanReg) takePending() []subPlanEntry {
 // Without a registry the number is unknown, so the bare kind is
 // printed instead of a wrong number.
 func subPlanName(r *subPlanReg, e optimizer.Expr, plan optimizer.Node) string {
-	if n := r.assign(e, plan); n > 0 {
+	return subPlanNameHashed(r, e, plan, false)
+}
+
+// subPlanNameHashed is subPlanName for a sublink whose hashed-ness is known
+// (assignHashed).
+func subPlanNameHashed(r *subPlanReg, e optimizer.Expr, plan optimizer.Node, hashed bool) string {
+	if n := r.assignHashed(e, plan, hashed); n > 0 {
 		kind := "SubPlan"
 		if optimizer.SublinkIsInitPlan(e) {
 			kind = "InitPlan"
@@ -2737,8 +2766,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 // column, ANDed, as the testexpr does. NOT IN is the boolean NOT above it.
 // M0146-0002g.
 func formatSubPlanInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool, operand, op, quant string) string {
-	ref := subPlanName(reg, x, x.Plan)
-	if subPlanUsesHashTable(x, reg) {
+	hashed := subPlanUsesHashTable(x, reg)
+	ref := subPlanNameHashed(reg, x, x.Plan, hashed)
+	if hashed {
 		ref = "hashed " + ref
 	}
 	var test string
@@ -2888,6 +2918,7 @@ func schemaColumnNames(n optimizer.Node) []string {
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, hashMem int64) {
 	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }

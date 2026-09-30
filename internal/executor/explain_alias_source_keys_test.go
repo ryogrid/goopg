@@ -182,7 +182,9 @@ func TestExplainSortKeySubqueryGroupByUnchanged(t *testing.T) {
 		t.Errorf("expected byte-identical `Sort Key: max`; got:\n%s", strings.Join(rows, "\n"))
 	}
 	joined := strings.Join(rows, "\n")
-	if !strings.Contains(joined, "Group Key: (InitPlan 1).col1") {
+	// PG plan_id order: the MIN/MAX InitPlan inside the sublink is
+	// InitPlan 1, the sublink InitPlan 2 (PG 18.3, M0146-0005bv).
+	if !strings.Contains(joined, "Group Key: (InitPlan 2).col1") {
 		t.Errorf("expected Group Key InitPlan numbering intact; got:\n%s", joined)
 	}
 	assertNoOpaqueExpr(t, joined)

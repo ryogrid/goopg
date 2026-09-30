@@ -1,0 +1,91 @@
+== join (diff lines 18735 -> 18734)
+4619c4619
+<   Filter: (ANY ((q1 = (SubPlan 1).col1) AND ((random() > 0) = (SubPlan 1).col2)))
+---
+>   Filter: (ANY ((q1 = (SubPlan 3).col1) AND ((random() > 0) = (SubPlan 3).col2)))
+4621c4621
+<   SubPlan 1
+---
+>   SubPlan 3
+4623c4623
+<   Filter: ((q2 = (SubPlan 2)) AND (SubPlan 3))
+---
+>   Filter: ((q2 = (SubPlan 1)) AND (SubPlan 2))
+4625c4625
+<   SubPlan 2
+---
+>   SubPlan 1
+4627c4627
+<   SubPlan 3
+---
+>   SubPlan 2
+== partition_prune (diff lines 6419 -> 6420)
+2524,2525c2524,2525
+<   Filter: ((ab_a2_b1.a = (InitPlan 1).col1) AND (ab_a2_b1.b = (InitPlan 2).col1))
+<   InitPlan 1
+---
+>   Filter: ((ab_a2_b1.a = (InitPlan 2).col1) AND (ab_a2_b1.b = (InitPlan 3).col1))
+>   InitPlan 2
+2527c2527
+<   InitPlan 3
+---
+>   InitPlan 1
+2533c2533
+<   InitPlan 2
+---
+>   InitPlan 3
+3070c3070
+<   Filter: (ma_test_p1.a >= (InitPlan 1).col1)
+---
+>   Filter: (ma_test_p1.a >= (InitPlan 2).col1)
+3072c3072
+<   InitPlan 1 (calls=30 rebuilds=1 rescans=0 hits=29 misses=1)
+---
+>   InitPlan 2 (calls=30 rebuilds=1 rescans=0 hits=29 misses=1)
+3074c3074
+<   InitPlan 2 (calls=1 rebuilds=1 rescans=0 hits=0 misses=1)
+---
+>   InitPlan 1 (calls=1 rebuilds=1 rescans=0 hits=0 misses=1)
+== subselect (diff lines 2811 -> 2806)
+113c113
+<   SubPlan 1
+---
+>   SubPlan 2
+115c115
+<   InitPlan 2
+---
+>   InitPlan 1
+441,442c441,442
+<   Filter: ((ANY (t1.c1 = (hashed SubPlan 1).col1)) OR (t1.c3 < 0))
+<   SubPlan 1
+---
+>   Filter: ((ANY (t1.c1 = (hashed SubPlan 2).col1)) OR (t1.c3 < 0))
+>   SubPlan 2
+683c683
+<   Join Filter: (CASE WHEN (ANY (int4_tbl.f1 = (hashed SubPlan 2).col1)) THEN int4_tbl.f1 ELSE NULL END = b.ten)
+---
+>   Join Filter: (CASE WHEN (ANY (int4_tbl.f1 = (hashed SubPlan 1).col1)) THEN int4_tbl.f1 ELSE NULL END = b.ten)
+688c688
+<   SubPlan 2
+---
+>   SubPlan 1
+1338,1341c1338
+<   One-Time Filter: (EXISTS(SubPlan 1))
+<   SubPlan 1
+<   ->  Seq Scan on tenk2 b
+<   Filter: (ANY (a.hundred = (SubPlan 2).col1))
+---
+>   One-Time Filter: (EXISTS(SubPlan 2))
+1342a1340,1342
+>   ->  Seq Scan on tenk2 b
+>   Filter: (ANY (a.hundred = (SubPlan 1).col1))
+>   SubPlan 1
+== with (diff lines 2982 -> 2982)
+1209c1209
+<   SubPlan 1
+---
+>   SubPlan 2
+1239c1239
+<   SubPlan 1
+---
+>   SubPlan 2

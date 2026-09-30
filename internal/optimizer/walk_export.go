@@ -111,6 +111,29 @@ func ExprSubplans(e Expr) []Node {
 // sublinks it can hang — never to a wrong qualifier — so extend this
 // switch when a node type gains expression fields.
 func NodeSubplans(n Node) []Node {
+	refs := NodeSublinks(n)
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]Node, len(refs))
+	for i, r := range refs {
+		out[i] = r.Plan
+	}
+	return out
+}
+
+// SublinkRef is one sublink hung off a plan node's own expressions: the
+// sublink expression and its inner plan root.
+type SublinkRef struct {
+	Expr Expr
+	Plan Node
+}
+
+// NodeSublinks is NodeSubplans with each subplan root paired with the
+// sublink expression holding it, in the same order and with the same
+// de-duplication. EXPLAIN's PG plan_id numbering reads the expression
+// (an EXISTS→ANY conversion takes two ids, M0146-0005bv).
+func NodeSublinks(n Node) []SublinkRef {
 	var exprs []Expr
 	addKeys := func(keys []SortKey) {
 		for _, k := range keys {
@@ -356,7 +379,7 @@ func NodeSubplans(n Node) []Node {
 	if len(exprs) == 0 {
 		return nil
 	}
-	var out []Node
+	var out []SublinkRef
 	seen := map[Node]struct{}{}
 	for _, e := range exprs {
 		if e == nil {
@@ -371,7 +394,7 @@ func NodeSubplans(n Node) []Node {
 					continue
 				}
 				seen[sp] = struct{}{}
-				out = append(out, sp)
+				out = append(out, SublinkRef{Expr: sub, Plan: sp})
 			}
 		})
 	}

@@ -183,11 +183,13 @@ func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
 
+	// The EXISTS is hashed as PG's second (ANY) plan of the pair, so its
+	// line is `SubPlan 2` (PG 18.3 plan_id order, M0146-0005bv).
 	const probe = "SELECT * FROM t1 WHERE t1.a = -999 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)"
 
 	plain := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+probe), "\n")
 	for _, line := range strings.Split(plain, "\n") {
-		if strings.Contains(line, "SubPlan 1") && strings.Contains(line, "calls=") {
+		if strings.Contains(line, "SubPlan 2") && strings.Contains(line, "calls=") {
 			t.Errorf("plain EXPLAIN must not carry counters:\n%s", plain)
 		}
 	}
@@ -195,7 +197,7 @@ func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	analyzed := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE) "+probe), "\n")
 	var counterLine string
 	for _, line := range strings.Split(analyzed, "\n") {
-		if strings.Contains(line, "SubPlan 1") {
+		if strings.Contains(line, "SubPlan 2") {
 			counterLine = strings.TrimSpace(line)
 		}
 	}
