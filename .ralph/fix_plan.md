@@ -23598,6 +23598,24 @@ M0146-0001 re-baseline census on the new default arm.
     \(groupingsets unchanged, create\_index 1804 → 1788\), ea\-ratchet PASS
     \(10\)\.
   Movement: yes — match SF0.25 33 -> 35, SF1 26 -> 27; CATEGORIES-EXCL-MATCH scan-type SF0.25 32 -> 30, SF1 37 -> 36
+- [ ] **M0146\-0005bs — an EXISTS body\'s star voids the needed set** \(filed
+  2026\-09\-30 by recon 71\)\. PG\'s simplify\_EXISTS\_query discards an
+  EXISTS target list; goopg\'s needed\-column collector declines on the
+  `SELECT \*`, so TPC\-DS Q94\'s `wr1` anti\-join probe never becomes
+  index\-only\.
+  Kind: impl
+  Parent: M0146\-0005
+  - Recon 71 \(not landed\): dropping star/constant EXISTS targets in both
+    collectors turned Q10/Q35 into `seam\-decline reason=residual\-hits\-pad`
+    fallbacks \(name\-keyed pad check vs slice 70\'s per\-alias pads\) and
+    left Q94\'s probe plain\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Recon 71"\.
+  - First step: make `searchedResidualHitsPad` / `boundaryPaddedNames`
+    \(narrowoutput.go\) alias\-aware — carry each padded slot\'s qualifier
+    from the boundary filler — then trace the producer of Q94\'s anti\-join
+    probe over the pulled EXISTS leaf\.
+  Movement: none — recon; change reverted (would have added 2 seam declines)
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

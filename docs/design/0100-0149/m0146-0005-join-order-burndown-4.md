@@ -787,3 +787,6 @@ Movement (fire set):
   Scan line.
 
 Evidence: `analysis/m0146/m0146-0005/slice70/`.
+
+Continued in [m0146-0005-join-order-burndown-5.md](m0146-0005-join-order-burndown-5.md)
+(slices 71+), split per the design-doc size rule (D3).
