@@ -23700,8 +23700,9 @@ M0146-0001 re-baseline census on the new default arm.
     \(8 fires\), regress 22 numbered cases \(subselect 2811 → 2806; others
     shape\-only renumbering or known flaps\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0.25 33 -> 30, SF1 40 -> 36; match unchanged (SF0.25 36, SF1 28)
-- [ ] **M0146\-0039 — \(observed\) temp tables survive a server restart**
-  \(filed 2026\-09\-30 by slice 74, NOT yet reproduced cleanly\)\. On the
+- [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
+  after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
+  S2 escalation: wrong results \+ a durable catalog row\)\. On the
   private :5533 probe cluster \(tmp/c20a/data\-sf025\) a session created
   `TEMP TABLE ca/cb`; after `goopg stop` + start, a new session\'s
   `CREATE TEMP TABLE ca` failed with `relation "ca" does not exist` and
@@ -23712,6 +23713,41 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: reproduce on a throwaway cluster \(port 5534\-free range\):
     create a temp table, stop/start, list pg\_class for pg\_temp\_\* and
     retry the CREATE; then find the temp\-namespace cleanup path\.
+  - **Reproduced 2026\-09\-30** \(`analysis/m0146/m0146\-0039/repro.sh`\):
+    after stop/start, pg\_class shows `ca` in namespace 2200 with
+    relpersistence `p`, `SELECT \* FROM ca` returns the old row, and
+    `CREATE TEMP TABLE ca` fails `relation "ca" does not exist`\. Without a
+    restart a second session correctly does not see it\.
+  - Cause \(read\-only trace\):
+    - `execCreateTable` \(internal/executor/operators\_ddl.go ~4072\) calls
+      `syncTableToCatalogHeap` for temp tables too; `namespaceOIDForSchema`
+      maps the schema to public \(2200\); `buildUserPGClassRow`
+      \(pg18\_user\_catalog\_rows.go ~525\) only writes `p`/`u`, its comment
+      assuming temp tables never reach disk\.
+    - `loadUserTablesFromHeapForDB` \(internal/initdb/open.go ~3293\) loads
+      every user pg\_class row, no relpersistence filter, and never sets
+      `Temp`/`TempOwner`\.
+    - `DropSessionTempObjects` \(internal/catalog/catalog.go ~22028\) and
+      DISCARD TEMP are in\-memory only: no xmax stamp, no file drop\.
+  - PG behavior to match: temp rels get relpersistence `t` in their
+    `pg\_temp\_N` namespace; leftover rows are removed by
+    `RemoveTempRelations` when a later backend takes that namespace
+    \(`InitTempTableNamespace`, namespace.c\) or by autovacuum\'s orphan
+    cleanup; they are never visible to another session\.
+  - Fix sketch: write relpersistence `t` \+ the temp namespace OID, and at
+    load skip/drop `t` rows and unlink their files; or stamp the catalog
+    rows' xmax and drop the files at session exit, as the DROP path does
+    \(operators\_ddl.go ~8344\)\.
+
+  > ## ESCALATION 2026\-09\-30 \(S2\) — a temp table resurrects as a permanent public table after a restart
+  >
+  > Every `CREATE TEMP TABLE` writes a durable pg\_class/pg\_attribute row as
+  > a permanent `public` relation, and the session\-exit drop is in\-memory
+  > only\. After any restart the table reappears for every session with its
+  > rows, and it blocks a later `CREATE TEMP TABLE` of the same name
+  > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
+  > of the banner, per S2; the owner decides its placement\.
+
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the
