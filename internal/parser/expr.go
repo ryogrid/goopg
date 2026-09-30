@@ -283,6 +283,13 @@ type InExpr struct {
 	AllOp    bool
 	Subquery *SelectStmt // populated for IN/ANY/ALL (subquery)
 	List     []Expr      // populated for IN/ANY/ALL (val_list / array)
+	// Quantified marks the `op ANY|SOME|ALL (...)` spellings (list or
+	// subquery), which desugar to
+	// this same shape (AnyOp stays OpUnknown for `= ANY`). Only the IN
+	// (val_list) syntax is PG's AEXPR_IN, whose one-element list
+	// transformAExprIn turns into a plain `=` (M0146-0005by); `= ANY
+	// (ARRAY[c])` stays a ScalarArrayOpExpr.
+	Quantified bool
 }
 
 func (e *InExpr) Pos() int { return e.pos }

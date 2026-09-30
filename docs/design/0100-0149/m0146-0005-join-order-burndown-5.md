@@ -371,3 +371,55 @@ Movement (fire set):
   ea-ratchet (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice77/`.
+
+## Slice 78: M0146-0005by — a one-element IN list is a plain comparison
+
+PG's `transformAExprIn` (parse\_expr.c) builds a ScalarArrayOpExpr only for
+two or more non-Var list items. Every other item is compared on its own
+with the IN's operator (`=`, or `<>` for NOT IN), so `x IN (c)` is exactly
+`x = c`: TPC-DS Q89 prints `Filter: (d_year = 2001)`, and eqsel estimates it.
+goopg kept `d_year = ANY (2001)`, Q89's last difference after slice 77.
+
+- **Parser.** `x = ANY (ARRAY[c])` desugars to the same `parser.InExpr` as
+  `x IN (c)`, yet it is PG's AEXPR\_OP\_ANY and stays an array comparison.
+  The AST therefore gains `InExpr.Quantified` for the `op ANY|SOME|ALL
+  (…)` spellings, list or subquery. Both parsers set it and agree:
+  - yacc: `quantifiedAny`, and `NewInExpr` when an ALL operator is given;
+  - legacy: all three returns of `parseAnyTail`.
+
+  The parity goldens changed only by the added field (24 `true` rows, all
+  ANY/SOME/ALL spellings), checked by stripping it and diffing against HEAD.
+  No grammar rule changed.
+- **Planner.** `oneElementInAsComparison` rewrites a non-quantified,
+  one-item, non-row IN list to a parser `=`/`<>` BinaryOp before
+  resolution. It runs in `planInExpr` (the WHERE and HAVING resolvers) and
+  in `resolveExprAfterWindow`'s arm.
+
+Test: `TestOneElementInIsEquality` pins PG 18.3's filters and estimates:
+
+- `a IN (7)` → `(a = 7)`, rows=100;
+- `a NOT IN (7)` → `(a <> 7)`, rows=9900;
+- `b IN ('3')` → `(b = '3')`, rows=1000;
+- `a = ANY (ARRAY[7])` keeps its ANY.
+
+It fails with the rewrite disabled.
+
+Movement (fire set):
+
+- PLAN-PARITY match goes SF0.25 37 → 38 (Q89). CATEGORIES-EXCL-MATCH
+  qual-placement goes SF0.25 12 → 10 and SF1 8 → 7 (Q33 and Q60 also carry
+  one-element IN lists).
+- Regress: inherit's `b in ('ab')` now prints PG's `(b = 'ab')`. The
+  other ten numbered cases are unchanged apart from rowsecurity's
+  pointer-text noise.
+- TPC-H plans are identical. Units (parser parity included), spotcheck,
+  sweep 96/96, arm 24/24 and ea-ratchet (10) pass.
+
+Not done (ledgered):
+
+- The multi-item list whose Var items PG splits into separate ORed
+  comparisons.
+- A row operand, which PG compares through `make_row_comparison_op`.
+- View and rule deparse of the rewritten form.
+
+Evidence: `analysis/m0146/m0146-0005/slice78/`.

@@ -123,7 +123,9 @@ func NewIsDistinctFromExpr(pos int, left, right Expr, negated bool) *IsDistinctF
 }
 
 func NewInExpr(pos int, operand Expr, negated bool, anyOp OpCode, allOp bool, sub *SelectStmt, list []Expr) *InExpr {
-	return &InExpr{pos: pos, Operand: operand, Negated: negated, AnyOp: anyOp, AllOp: allOp, Subquery: sub, List: list}
+	// Quantified: see InExpr. An ALL spelling reaches here directly; the ANY
+	// and SOME spellings through quantifiedAny, which marks them itself.
+	return &InExpr{pos: pos, Operand: operand, Negated: negated, AnyOp: anyOp, AllOp: allOp, Subquery: sub, List: list, Quantified: allOp}
 }
 
 func NewLikeEscapePattern(pos int, pattern, escape Expr) *LikeEscapePattern {

@@ -10445,6 +10445,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
 	case *parser.InExpr:
+		if cmp, ok := oneElementInAsComparison(x); ok {
+			return resolveExprAfterWindow(cmp, win)
+		}
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
 			return nil, err
@@ -16505,6 +16508,9 @@ func planRowExprIn(row *parser.RowExpr, valuesRows [][]parser.Expr, negated bool
 // references) or recursively resolves the value list,
 // depending on which the parser produced.
 func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
+	if cmp, ok := oneElementInAsComparison(x); ok {
+		return resolveExpr(cmp, ctx)
+	}
 	// Row constructor IN (VALUES ...): expand to OR(AND(a=v1,b=v1b), ...) at plan time.
 	// M0097-0020.
 	if rowExpr, ok := x.Operand.(*parser.RowExpr); ok && x.Subquery != nil && len(x.Subquery.ValuesRows) > 0 {
@@ -16541,6 +16547,36 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 		}
 	}
 	return out, nil
+}
+
+// oneElementInAsComparison is transformAExprIn's (parse_expr.c) one-element
+// case: a ScalarArrayOpExpr is built only for two or more non-Var list items,
+// and any other item is compared on its own with the IN's operator — `=` for
+// IN, `<>` for NOT IN — so `x IN (c)` is exactly `x = c`. TPC-DS Q89's
+// `d_year IN (2001)` prints `Filter: (d_year = 2001)` in PG 18.3 and is
+// estimated by eqsel, not scalararraysel (M0146-0005by).
+//
+// Only the IN (val_list) syntax qualifies: `= ANY (ARRAY[c])` desugars to the
+// same parser shape but is PG's AEXPR_OP_ANY, which stays an array
+// comparison (parser.InExpr.Quantified). A row operand or row item keeps the
+// IN form: PG builds make_row_comparison_op there, which goopg's `=` on rows
+// does not reproduce (ledgered).
+func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
+	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
+		x.NotEqualAny || len(x.List) != 1 {
+		return nil, false
+	}
+	if _, row := x.Operand.(*parser.RowExpr); row {
+		return nil, false
+	}
+	if _, row := x.List[0].(*parser.RowExpr); row {
+		return nil, false
+	}
+	op := parser.OpEq
+	if x.Negated {
+		op = parser.OpNe
+	}
+	return parser.NewBinaryOp(x.Pos(), op, x.Operand, x.List[0]), true
 }
 
 // planExistsExpr plans the inner subquery and wraps in an

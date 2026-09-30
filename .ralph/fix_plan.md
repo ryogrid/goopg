@@ -23735,7 +23735,7 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
     \(Q89\), TPC\-H census identical, ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH sort-strategy SF0.25 32 -> 31, SF1 35 -> 34; match unchanged (37 / 28)
-- [ ] **M0146\-0005by — a one\-element IN list is a plain equality** \(filed
+- [x] **M0146\-0005by — a one\-element IN list is a plain equality** \(filed
   2026\-09\-30 by slice 77\)\. PG\'s `transformAExprIn` \(parse\_expr.c\)
   builds a ScalarArrayOpExpr only for two or more non\-Var elements; one
   element becomes `x = c`\. goopg keeps `d\_year = ANY \(2001\)` \(TPC\-DS
@@ -23745,6 +23745,18 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where the analyzer/planner lowers an IN list to
     InExpr/ANY and emit a `=` BinaryOp for a single non\-Var element;
     check both selectivity \(eqsel vs scalararraysel\) and EXPLAIN\.
+  - **DONE 2026\-09\-30 \(slice 78\)\.** `oneElementInAsComparison`
+    \(planner.go\) in `planInExpr` and `resolveExprAfterWindow`;
+    `parser.InExpr.Quantified` \(set by `quantifiedAny`, `NewInExpr` for ALL,
+    legacy `parseAnyTail`\) keeps `= ANY \(ARRAY\[c\]\)` an array
+    comparison; parity goldens regenerated \(field\-only diff\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 78"\.
+  - Test `TestOneElementInIsEquality` \(fails with the rewrite off\)\.
+  - Gates: units \(parser parity\), tpch\-spotcheck, sf025 96/96, TPC\-H
+    arm 24/24, fire set \(Q33 Q60 Q89\), TPC\-H census identical, regress 11
+    cases \(inherit now PG\'s `b = \'ab\'`\), ea\-ratchet PASS \(10\)\.
+  Movement: yes — match SF0.25 37 -> 38; CATEGORIES-EXCL-MATCH qual-placement SF0.25 12 -> 10, SF1 8 -> 7
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

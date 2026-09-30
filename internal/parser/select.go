@@ -2513,7 +2513,7 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')' to close ANY/ALL subquery")
 		}
-		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
+		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel, Quantified: true}, nil
 	}
 	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
 	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
@@ -2532,7 +2532,7 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		if !ok {
 			return nil, &SyntaxError{Pos: pos, Message: "ANY/ALL subquery did not produce SELECT"}
 		}
-		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
+		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel, Quantified: true}, nil
 	}
 	var elems []Expr
 	// array[e1, e2, ...] constructor form.
@@ -2587,7 +2587,7 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
 	}
-	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems}, nil
+	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems, Quantified: true}, nil
 }
 
 // synthesizeBareCharTypmod mirrors parseColumnType's handling of the bare

@@ -1836,6 +1836,7 @@ func quantifiedAny(l yyLexer, pos int, left Expr, op OpCode, sub *SelectStmt, li
 	}
 	ie := NewInExpr(pos, left, false, anyOp, false, sub, unwrapAnyArray(l, list, listPos))
 	ie.NotEqualAny = notEq
+	ie.Quantified = true
 	return ie
 }
 
