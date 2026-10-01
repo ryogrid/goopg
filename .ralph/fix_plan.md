@@ -23858,6 +23858,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cf — a grouping\-mask key deparses as its GROUPING call**
+  \(filed and landed 2026\-10\-01 from slice 83\'s ledger row: goopg printed
+  the label `grouping`, PG `\(GROUPING\(a, b\)\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 85\)\.** `Aggregate.GroupingMaskSlots`
+    \(set from `groupingCallMasksSlots`\); `groupingMaskCall` used by the
+    Sort\-over\-Aggregate entry and `resolveKeySource`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 85"\.
+  - Test `TestSortKeyOnGroupingMaskDeparsesGroupingCall` \(fails with the
+    helper off\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(no fires\), regress 12 cases \(groupingsets 1920 → 1916\), ea\-ratchet
+    PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; no TPC-DS GROUPING keys); regress groupingsets 1920 -> 1916
 - [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the

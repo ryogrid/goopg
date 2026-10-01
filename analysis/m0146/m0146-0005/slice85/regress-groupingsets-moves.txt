@@ -1,0 +1,40 @@
+556c556
+< ------------------------------
+---
+> ------------------------------------
+558c558
+<   Sort Key: grouping, a, b
+---
+>   Sort Key: (GROUPING(a, b)), a, b
+573c573
+< ------------------------------
+---
+> ------------------------------------
+575c575
+<   Sort Key: grouping, a, b
+---
+>   Sort Key: (GROUPING(a, b)), a, b
+623d622
+<   from gstest4 group by grouping sets ((unhashable_col),(unsortable_col))
+626c625
+< ----------------------------------
+---
+> ------------------------------------------------------------------
+628c627
+<   Sort Key: grouping, (sum(v))
+---
+>   Sort Key: (GROUPING(unhashable_col, unsortable_col)), (sum(v))
+657d655
+<   from gstest4 group by grouping sets ((v,unhashable_col),(v,unsortable_col))
+660c658
+< -------------------------------------
+---
+> ------------------------------------------------------------------
+662c660
+<   Sort Key: grouping, (sum(v))
+---
+>   Sort Key: (GROUPING(unhashable_col, unsortable_col)), (sum(v))
+725c723
+<   Sort Key: grouping, (max(v))
+---
+>   Sort Key: (GROUPING(a, b)), (max(v))

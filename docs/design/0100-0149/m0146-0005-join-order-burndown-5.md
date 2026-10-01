@@ -690,3 +690,33 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice84/`.
+
+## Slice 85: M0146-0005cf — a grouping-mask key deparses as its GROUPING call
+
+goopg materialises each `GROUPING(...)` call as an Aggregate output column
+holding a per-set bitmask (M0125-0048). The column carried only the mask
+values, so EXPLAIN had nothing to deparse and printed the output label
+`grouping`. PG prints the call: `Sort Key: (GROUPING(a, b)), a, b`, and in
+regress groupingsets `(GROUPING(unhashable_col, unsortable_col)), (sum(v))`.
+
+- `Aggregate.GroupingMaskSlots` records each call's argument slots into
+  `GroupExprs` (EXPLAIN-only). `groupingCallMasksSlots` returns them next
+  to the masks.
+- `groupingMaskCall` rebuilds `GROUPING(group exprs…)` for a mask output
+  position. It is used by the Sort-over-Aggregate entry in `sortKeyParts`
+  and by `resolveKeySource`'s Aggregate arm, which previously declined at
+  mask positions.
+
+Test: `TestSortKeyOnGroupingMaskDeparsesGroupingCall`, PG 18.3 oracle
+`Sort Key: (GROUPING(a, b)), a, b`. It fails with the helper disabled.
+
+Movement:
+
+- Regress groupingsets.sql goes 1920 → 1916; its GROUPING keys now print
+  PG's text, e.g. `(GROUPING(unhashable_col, unsortable_col)), (sum(v))`.
+- No TPC-DS query sorts on a GROUPING result, so the fire set had no fires
+  and CATEGORIES-EXCL-MATCH is unchanged (rendering 12 / 15).
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice85/`.

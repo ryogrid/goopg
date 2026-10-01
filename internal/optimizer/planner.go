@@ -9679,6 +9679,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// in that fixed order.
 	var gsSets [][]int
 	var groupingMasks [][]int64
+	var groupingMaskSlots [][]int
 	var groupCommonSlots map[int]bool
 	groupingCallCol := map[string]int{}
 	if s.GroupingSets != nil {
@@ -9701,12 +9702,13 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			maskSets = [][]int{all}
 		}
 		for _, gc := range calls {
-			masks, mErr := groupingCallMasks(gc, maskSets, s.Targets, groupByExpr, groupByExprQual)
+			masks, slots, mErr := groupingCallMasksSlots(gc, maskSets, s.Targets, groupByExpr, groupByExprQual)
 			if mErr != nil {
 				return nil, nil, nil, nil, mErr
 			}
 			groupingCallCol[groupingCallKey(gc)] = len(outputSchema)
 			groupingMasks = append(groupingMasks, masks)
+			groupingMaskSlots = append(groupingMaskSlots, slots)
 			// PostgreSQL names the column "grouping" (GroupingFunc's
 			// FigureColname case in parse_target.c).
 			outputSchema = append(outputSchema, SchemaColumn{Name: "grouping", Type: catalog.Type{Name: "int4"}})
@@ -9721,6 +9723,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		schema:        outputSchema,
 		GroupingSets:  gsSets,
 		GroupingMasks: groupingMasks,
+		// EXPLAIN-only: the GROUPING(...) arguments' group slots.
+		GroupingMaskSlots: groupingMaskSlots,
 	}
 	// M0145-0008d: processed_groupClause (groupclause.go). Grouping sets and
 	// the default order leave it nil.

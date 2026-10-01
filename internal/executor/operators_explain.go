@@ -808,6 +808,35 @@ func synthAggCall(call *optimizer.AggregateCall) (optimizer.Expr, bool) {
 	return &optimizer.FuncCall{Name: call.Name, Args: args}, true
 }
 
+// groupingMaskCall rebuilds the GROUPING(...) call an Aggregate's grouping-
+// mask output column at position j materialises, from the per-call argument
+// slots (Aggregate.GroupingMaskSlots) and the group expressions they name —
+// PG deparses such a key as `(GROUPING(unhashable_col, unsortable_col))`
+// where goopg printed the output label `grouping` (M0146-0005cf). Declines
+// on any position or slot that does not resolve.
+func groupingMaskCall(agg *optimizer.Aggregate, j int) (optimizer.Expr, bool) {
+	if agg == nil {
+		return nil, false
+	}
+	i := j - agg.GroupingMaskColOffset()
+	if i < 0 || i >= len(agg.GroupingMasks) || i >= len(agg.GroupingMaskSlots) {
+		return nil, false
+	}
+	slots := agg.GroupingMaskSlots[i]
+	if len(slots) == 0 {
+		return nil, false
+	}
+	args := make([]optimizer.Expr, len(slots))
+	for k, slot := range slots {
+		if slot < 0 || slot >= len(agg.GroupExprs) || agg.GroupExprs[slot] == nil ||
+			exprHasSubplanOrOuterRef(agg.GroupExprs[slot]) {
+			return nil, false
+		}
+		args[k] = agg.GroupExprs[slot]
+	}
+	return &optimizer.FuncCall{Name: "GROUPING", Args: args}, true
+}
+
 // sortGroupKeySource — R66 Arm S. A Sort key naming a GROUP-BY output
 // position (not a computed aggregate) is PG's OUTER_VAR into the child's
 // grouping list, so render the grouping expression itself instead of the
@@ -1294,6 +1323,14 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				continue
 			}
 			if j >= n.GroupingMaskColOffset() {
+				// M0146-0005cf: a grouping-mask column deparses as the
+				// GROUPING call it materialises.
+				if g, ok := groupingMaskCall(n, j); ok {
+					if crossedJoin {
+						return pinKeyExprNames(g, n, reg)
+					}
+					return g, true
+				}
 				return nil, false
 			}
 			call, ok := synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
@@ -1572,6 +1609,9 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 					}
 				} else if expanded, hit := expandAggOutputRef(col, agg); hit {
 					keyExpr = expanded
+				} else if g, hit := groupingMaskCall(agg, col.Index); hit {
+					// M0146-0005cf: PG's `(GROUPING(a, b))`.
+					keyExpr = g
 				}
 			} else if proj := childProjectThroughFilters(child); proj != nil {
 				// Entry (ii) — grouping-input / order-by Sort

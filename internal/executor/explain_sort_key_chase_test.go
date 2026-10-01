@@ -248,3 +248,22 @@ func TestSortKeyOverCrossJoinOfAggregates(t *testing.T) {
 		t.Fatalf("got %q, want PG's `(sum(sp.v)), (sum(sp_1.v))`", got)
 	}
 }
+
+// TestSortKeyOnGroupingMaskDeparsesGroupingCall pins M0146-0005cf against
+// PG 18.3: a grouping-mask column deparses as the GROUPING call it
+// materialises, so a Sort above the grouping-set aggregate prints
+//
+//	Sort Key: (GROUPING(a, b)), a, b
+//
+// where goopg printed the output label `grouping` (regress groupingsets).
+func TestSortKeyOnGroupingMaskDeparsesGroupingCall(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE gm (a int, b int, v int)")
+	runSQL(t, ctx, "INSERT INTO gm SELECT i % 5, i % 3, i FROM generate_series(1,300) i")
+	runSQL(t, ctx, "ANALYZE gm")
+	got := explainLine(t, ctx, "EXPLAIN (COSTS OFF) SELECT a, b, GROUPING(a, b), sum(v) FROM gm GROUP BY ROLLUP (a, b) ORDER BY GROUPING(a, b), a, b", "Sort Key:")
+	if got != "Sort Key: (GROUPING(a, b)), a, b" {
+		t.Fatalf("got %q, want PG's %q", got, "Sort Key: (GROUPING(a, b)), a, b")
+	}
+}

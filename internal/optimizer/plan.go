@@ -1490,6 +1490,12 @@ type Aggregate struct {
 	// determined column discovered during target resolution never displaces
 	// a grouping column. M0125-0048.
 	GroupingMasks [][]int64
+	// GroupingMaskSlots holds, per GroupingMasks entry, the GroupExprs
+	// index of each GROUPING(...) argument, in argument order. It exists
+	// so EXPLAIN can deparse a mask column the way PG does,
+	// `(GROUPING(a, b))`, instead of printing its output label `grouping`
+	// (M0146-0005cf). Read by EXPLAIN only; nil where no producer set it.
+	GroupingMaskSlots [][]int
 
 	// Strategy selects hashed vs sorted aggregation. The zero value is
 	// AggStrategyHashed, so every existing construction site and test
