@@ -1,0 +1,61 @@
+# M0146-0005 (part 6): slices 87+ — EXPLAIN constant and array rendering
+
+Continuation of [m0146-0005-join-order-burndown-5.md](m0146-0005-join-order-burndown-5.md)
+(slices 71-86), split per the design-doc size rule (D3). Same task and census
+family.
+
+## Slice 87: M0146-0005ch — an IN list prints as PG's folded array Const
+
+PG's transformAExprIn turns `a IN (1, 2)` into a ScalarArrayOpExpr over an
+ArrayExpr. eval_const_expressions folds the ArrayExpr to one array Const,
+so EXPLAIN prints `(a = ANY ('{1,2}'::integer[]))`. goopg printed the
+element list, `(a = ANY (1, 2))`, in every IN-list qual. None of the 51
+array Consts PG prints over TPC-DS (each scale) matched.
+
+- `inListArrayConst` returns the Const text for an all-literal list. The
+  element type is select_common_type's pick for the column and the
+  literals:
+  - int2/int4 → `integer[]`, int8 → `bigint[]`;
+  - an integer column against a decimal literal → `numeric[]` with
+    `(a)::numeric`;
+  - text → `text[]`, char(n) → `bpchar[]`, varchar → `text[]` with
+    `(f)::text`, and canonical ISO dates → `date[]`.
+
+  Elements are quoted as array_out does: double quotes around empty, NULL,
+  or any element holding `"`, a backslash, braces, a comma or whitespace.
+  Embedded `"` and backslashes are escaped. Any other list (a NULL, a
+  non-literal, an unmodelled type) keeps the old rendering.
+- NOT IN prints `(a <> ALL (…))`, and `<> ANY` keeps its own operator.
+  The UnaryOp arm pushes an explicit `NOT (b IN …)` into the list as
+  negate_clause does.
+- The Index Cond SAOP renderer (`formatIndexCond`) is the sibling. It uses
+  the same helper with the index column's catalog type. Its
+  bounds-on-the-second-column form now parenthesises each clause:
+  `((a = ANY (…)) AND (b > 1))`.
+
+Test: `TestInListPrintsFoldedArrayConst` (13 PG 18.3 oracle lines; all 13
+fail with the branch disabled). `TestSAOPExplainRendersAnyCond` now
+expects PG's `'{2,4}'::integer[]`.
+
+Movement:
+
+- TPC-DS: goopg prints 49 of PG's 51 array Consts per scale (was 0). The
+  rest are the
+  `substr(ca_zip, …)` lists of Q8/Q15/Q45. There PG also casts the
+  argument (`(ca_zip)::text`, the ledgered argument-cast gap) and
+  ExprResultType does not resolve `substr(bpchar, …)`. The classifier treats
+  qual text as rendering inside MATCH, so CATEGORIES-EXCL-MATCH is
+  unchanged (rendering 12 / 15).
+- Regress, same-order A/B over 12 cases: btree_index 507 → 500,
+  create_index 3310 → 3309. Five array lines now match PG exactly (was 0).
+  Most other changed lines stay mismatched because of the plan shape or
+  partition-child qualification around them.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered): non-literal lists (`ARRAY[...]` and PG's
+Var/non-Var split into OR arms), lists with NULL elements, float, timestamp
+and other element types, and a function-call operand whose type
+ExprResultType cannot resolve.
+
+Evidence: `analysis/m0146/m0146-0005/slice87/`.

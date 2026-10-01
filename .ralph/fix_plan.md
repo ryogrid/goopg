@@ -23858,6 +23858,24 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005ch — an IN list prints as PG's folded array Const**
+  \(filed and landed 2026\-10\-01 from the census: goopg printed
+  `\(a = ANY \(1, 2\)\)`, PG `\(a = ANY \('\{1,2\}'::integer\[\]\)\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 87\)\.** `inListArrayConst` /
+    `arrayOutElem` in operators\_explain\.go, used by formatInExprPG and the
+    Index Cond SAOP renderer; NOT IN and pushed\-in NOT print `<> ALL`\.
+    Design `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 87" \(new part 6\)\.
+  - Test `TestInListPrintsFoldedArrayConst` \(13 PG oracle lines, 13/13 fail
+    with the branch off\); `TestSAOPExplainRendersAnyCond` updated to PG's
+    text\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress 12\-case same\-order A/B, ea\-ratchet PASS \(10\)\.
+  - Left \(ledgered\): non\-literal and NULL\-bearing lists, more element
+    types, untyped function\-call operands \(Q8/Q15/Q45 substr\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; qual text is rendering inside MATCH); TPC-DS array Consts identical 49/51 per scale (was 0/51); regress btree_index 507 -> 500, create_index 3310 -> 3309
 - [x] **M0146\-0005cg — WindowAgg prints its `Window:` definition**
   \(filed and landed 2026\-10\-01 from the census: PG 18 prints
   `Window: w1 AS \(…\)` under every WindowAgg; goopg printed nothing\)\.

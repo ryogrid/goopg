@@ -2407,6 +2407,23 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
 		cond := p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
+		// M0146-0005ch: the same folded array Const the Filter-side
+		// formatInExprPG prints (sibling renderers of one SAOP).
+		if p.Table != nil {
+			for _, c := range p.Table.Columns {
+				if c.Name != p.Index.Columns[0] {
+					continue
+				}
+				if cast, lit, ok := inListArrayConst(c.Type, p.SAOPKeys); ok {
+					col := p.Index.Columns[0]
+					if cast != "" {
+						col = "(" + col + ")::" + cast
+					}
+					cond = col + " = ANY (" + lit + ")"
+				}
+				break
+			}
+		}
 		// M0145-0029: bounds on the second column (PG
 		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
 		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > 1 {
@@ -2416,15 +2433,18 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 				if p.LowOp == parser.OpGt {
 					op = ">"
 				}
-				cond += " AND " + col + " " + op + " " + formatIndexCondKey(p.LowKey, reg)
+				cond += ") AND (" + col + " " + op + " " + formatIndexCondKey(p.LowKey, reg)
 			}
 			if p.HighKey != nil {
 				op := "<="
 				if p.HighOp == parser.OpLt {
 					op = "<"
 				}
-				cond += " AND " + col + " " + op + " " + formatIndexCondKey(p.HighKey, reg)
+				cond += ") AND (" + col + " " + op + " " + formatIndexCondKey(p.HighKey, reg)
 			}
+			// Each clause carries its own parens inside the AND list
+			// (make_ands_explicit), as the comment above shows.
+			return "((" + cond + "))"
 		}
 		return wrapParen(cond)
 	}
@@ -3162,6 +3182,15 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.BinaryOp:
 		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
 	case *optimizer.UnaryOp:
+		// M0146-0005ch: negate_clause pushes NOT into a literal-list
+		// ScalarArrayOpExpr (`NOT (b IN (3, 4))` plans as
+		// `b <> ALL ('{3,4}'::bigint[])`), the same node NOT IN builds.
+		if in, ok := x.Operand.(*optimizer.InExpr); ok && x.Op == parser.OpNot && in.Plan == nil &&
+			!in.Negated && !in.NotEqualAny && in.AnyOp == 0 && !in.AllOp {
+			neg := *in
+			neg.Negated = true
+			return formatExprQual(&neg, reg, qualify)
+		}
 		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
 	case *optimizer.CastExpr:
 		return formatExprQual(x.Operand, reg, qualify)
@@ -3440,6 +3469,29 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 	if x.Plan != nil {
 		return formatSubPlanInExprPG(x, reg, qualify, operand, op, quant)
 	}
+	// M0146-0005ch: an all-constant IN list is transformAExprIn's
+	// ScalarArrayOpExpr over an ArrayExpr, which eval_const_expressions
+	// folds to one array Const: `(a = ANY ('{1,2}'::integer[]))`. NOT IN
+	// is the `<> ALL` form of the same node (negate_clause turns an
+	// explicit NOT (a IN …) into it too).
+	if x.AnyOp == 0 && !x.AllOp {
+		if lt, ok := optimizer.ExprResultType(x.Operand); ok {
+			if cast, lit, ok := inListArrayConst(lt, x.List); ok {
+				if cast != "" {
+					operand = "(" + operand + ")::" + cast
+				}
+				switch {
+				case x.NotEqualAny && x.Negated:
+					return "(NOT (" + operand + " <> ANY (" + lit + ")))"
+				case x.NotEqualAny:
+					return "(" + operand + " <> ANY (" + lit + "))"
+				case x.Negated:
+					return "(" + operand + " <> ALL (" + lit + "))"
+				}
+				return "(" + operand + " = ANY (" + lit + "))"
+			}
+		}
+	}
 	var rhs string
 	{
 		parts := make([]string, len(x.List))
@@ -3454,6 +3506,163 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 		return "(NOT " + s + ")"
 	}
 	return s
+}
+
+// inListArrayConst renders an all-literal IN list as the array Const PG
+// folds it to: `'{e1,e2}'::type[]`, the element type being the common
+// type select_common_type picks for the column and the literals. cast is
+// the column's coercion when the operator works on another type (a
+// varchar column compares as text). ok is false for any list this does
+// not model (a NULL or non-literal element, an unmodelled type), and the
+// caller keeps its element-list rendering.
+func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string, ok bool) {
+	if lt.IsArray || len(list) == 0 {
+		return "", "", false
+	}
+	elems := make([]string, len(list))
+	ints := func(wide bool) bool {
+		for i, e := range list {
+			ic, isInt := e.(*optimizer.IntegerConst)
+			if !isInt {
+				return false
+			}
+			if !wide && (ic.Value > math.MaxInt32 || ic.Value < math.MinInt32) {
+				return false
+			}
+			elems[i] = strconv.FormatInt(ic.Value, 10)
+		}
+		return true
+	}
+	strs := func() bool {
+		for i, e := range list {
+			sc, isStr := e.(*optimizer.StringConst)
+			if !isStr {
+				return false
+			}
+			elems[i] = arrayOutElem(sc.Value)
+		}
+		return true
+	}
+	// Catalog spellings vary with how the column was declared (`int`,
+	// `char(5)`); a bare `char` is PG's internal "char" type, not bpchar.
+	name := strings.ToLower(lt.Name)
+	switch name {
+	case "int", "integer":
+		name = "int4"
+	case "smallint":
+		name = "int2"
+	case "bigint":
+		name = "int8"
+	case "decimal":
+		name = "numeric"
+	case "character varying":
+		name = "varchar"
+	case "char", "character":
+		if len(lt.Args) == 0 {
+			return "", "", false
+		}
+		name = "bpchar"
+	}
+	// An integer column against a decimal literal resolves to numeric
+	// (select_common_type), and the column is cast: `(a)::numeric`.
+	if name == "int2" || name == "int4" || name == "int8" {
+		for _, e := range list {
+			if _, isNum := e.(*optimizer.NumericConst); isNum {
+				name, cast = "numeric", "numeric"
+				break
+			}
+		}
+	}
+	var typ string
+	switch name {
+	case "int2", "int4":
+		if !ints(false) {
+			return "", "", false
+		}
+		typ = "integer"
+	case "int8":
+		if !ints(true) {
+			return "", "", false
+		}
+		typ = "bigint"
+	case "numeric":
+		for i, e := range list {
+			switch c := e.(type) {
+			case *optimizer.IntegerConst:
+				elems[i] = strconv.FormatInt(c.Value, 10)
+			case *optimizer.NumericConst:
+				elems[i] = c.Value
+			default:
+				return "", "", false
+			}
+		}
+		typ = "numeric"
+	case "text":
+		if !strs() {
+			return "", "", false
+		}
+		typ = "text"
+	case "varchar":
+		if !strs() {
+			return "", "", false
+		}
+		cast, typ = "text", "text"
+	case "bpchar":
+		if !strs() {
+			return "", "", false
+		}
+		typ = "bpchar"
+	case "date":
+		for i, e := range list {
+			sc, isStr := e.(*optimizer.StringConst)
+			if !isStr || !isCanonicalISODate(sc.Value) {
+				return "", "", false
+			}
+			elems[i] = sc.Value
+		}
+		typ = "date"
+	default:
+		return "", "", false
+	}
+	body := "{" + strings.Join(elems, ",") + "}"
+	return cast, "'" + strings.ReplaceAll(body, "'", "''") + "'::" + typ + "[]", true
+}
+
+// arrayOutElem quotes one element the way array_out does: double quotes
+// around an empty string, a case-insensitive NULL, or any element holding
+// a quote, backslash, brace, comma or array_isspace character, with `"`
+// and `\` backslash-escaped inside.
+func arrayOutElem(v string) string {
+	need := v == "" || strings.EqualFold(v, "NULL")
+	for _, r := range v {
+		switch r {
+		case '"', '\\', '{', '}', ',', ' ', '\t', '\n', '\r', '\v', '\f':
+			need = true
+		}
+	}
+	if !need {
+		return v
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range v {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// isCanonicalISODate reports whether v is already date_out's ISO text
+// (YYYY-MM-DD), so the array element prints unchanged.
+func isCanonicalISODate(v string) bool {
+	if len(v) != 10 || v[4] != '-' || v[7] != '-' {
+		return false
+	}
+	_, err := time.Parse("2006-01-02", v)
+	return err == nil
 }
 
 // schemaColumnNames returns the names of n's output columns,
