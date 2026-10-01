@@ -1719,6 +1719,10 @@ type WindowAgg struct {
 	// by the time a Frame reaches the planner it is a well-formed
 	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
+	// Name is the window's EXPLAIN name — the WINDOW clause's own name, or
+	// the "wN" planner.c's name_active_windows makes up for an unnamed
+	// one (numbered per query level, bottom-up). EXPLAIN-only.
+	Name   string
 	schema Schema
 
 	// InputTarget / InputTargetKnown is the window's input-column keep list —
@@ -1758,6 +1762,9 @@ type WindowFrame struct {
 	EndKind     parser.FrameBoundKind
 	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
 	Exclusion   parser.FrameExclusion
+	// HasBetween is FRAMEOPTION_BETWEEN: EXPLAIN's Window line spells the
+	// frame the way it was written (`ROWS BETWEEN … AND …` vs `ROWS …`).
+	HasBetween bool
 }
 
 func (n *WindowAgg) Pos() int       { return n.pos }

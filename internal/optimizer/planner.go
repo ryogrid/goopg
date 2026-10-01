@@ -8563,6 +8563,12 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 	}
 
+	groupNames := make([]string, len(groups))
+	for i, g := range groups {
+		groupNames[i] = windowClauseName(s, g.calls)
+	}
+	nameUnnamedWindows(groupNames)
+
 	currentChild := child
 	currentCtx := inputCtx
 	combinedByKey := make(map[string]windowBinding)
@@ -8571,7 +8577,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 	// single stack of paths.
 	var windowChain []*WindowAgg
 
-	for _, g := range groups {
+	for gi, g := range groups {
 		partition := make([]Expr, 0, len(g.calls[0].Over.PartitionBy))
 		for _, p := range g.calls[0].Over.PartitionBy {
 			r, err := resolveExprForWindowInput(p, currentCtx, agg)
@@ -8614,6 +8620,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 
 		windowNode := &WindowAgg{
 			pos:         s.Pos(),
+			Name:        groupNames[gi],
 			Child:       currentChild,
 			PartitionBy: partition,
 			OrderBy:     order,
@@ -8677,6 +8684,60 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 
 	surface := &windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey}
 	return currentChild, currentCtx, surface, nil
+}
+
+// windowClauseName is the WINDOW-clause name a spec group's WindowAgg
+// carries, or "" for an unnamed window. It mirrors where parse_agg.c's
+// transformWindowFuncCall points a call's winref: a bare `OVER name` names
+// that clause; any other OVER clause reuses the first p_windowdefs entry it
+// equals — the WINDOW clause's own entries come first, and an entry matches
+// only when both or neither carry the same refname.
+func windowClauseName(s *parser.SelectStmt, calls []*parser.FuncCall) string {
+	for _, fc := range calls {
+		if fc.Over == nil {
+			continue
+		}
+		if fc.Over.IsBareRef {
+			return strings.ToLower(fc.Over.RefName)
+		}
+		key := windowSpecKey(fc.Over)
+		for _, nw := range s.WindowClause {
+			if nw.Def == nil || !strings.EqualFold(nw.Def.RefName, fc.Over.RefName) {
+				continue
+			}
+			if windowSpecKey(nw.Def) == key {
+				return strings.ToLower(nw.Name)
+			}
+		}
+	}
+	return ""
+}
+
+// nameUnnamedWindows is planner.c's name_active_windows: every unnamed
+// window, in activeWindows order (the chain's bottom-up order), takes the
+// first "wN" not already used by a named window of the same query level.
+func nameUnnamedWindows(names []string) {
+	next := 1
+	for i := range names {
+		if names[i] != "" {
+			continue
+		}
+		for {
+			cand := fmt.Sprintf("w%d", next)
+			next++
+			taken := false
+			for _, n := range names {
+				if n == cand {
+					taken = true
+					break
+				}
+			}
+			if !taken {
+				names[i] = cand
+				break
+			}
+		}
+	}
 }
 
 func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
@@ -8744,7 +8805,7 @@ func resolveWindowFrame(fr *parser.WindowFrame, inputCtx *resolveContext, agg *a
 	if fr == nil {
 		return nil, nil
 	}
-	out := &WindowFrame{Mode: fr.Mode, StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
+	out := &WindowFrame{Mode: fr.Mode, StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion, HasBetween: fr.HasBetween}
 	if fr.StartOffset != nil {
 		r, err := resolveExprForWindowInput(fr.StartOffset, inputCtx, agg)
 		if err != nil {

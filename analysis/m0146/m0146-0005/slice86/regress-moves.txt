@@ -1,0 +1,485 @@
+205a206
+>   Window: w1 AS ()
+209c210
+< (4 rows)
+---
+> (5 rows)
+213,214d213
+<  x  | lag | lead
+< ----+-----+------
+1818,1821d1816
+< explain (costs off)
+< select f1, sum(f1) over (partition by f1 order by f2
+<   range between 1 preceding and 1 following)
+< from t1 where f1 = f2;
+1823c1818
+< ---------------------------------
+---
+> -------------------------------------------------------------------------------------------------------------
+1824a1820
+>   Window: w1 AS (PARTITION BY f1 ORDER BY f2 RANGE BETWEEN '1'::bigint PRECEDING AND '1'::bigint FOLLOWING)
+1829c1825
+< (5 rows)
+---
+> (6 rows)
+1832,1838d1827
+< from t1 where f1 = f2;
+<  f1 | sum
+< ----+-----
+< explain (costs off)
+< select f1, sum(f1) over (partition by f1 order by f2
+<   groups between 1 preceding and 1 following)
+< from t1 where f1 = f2;
+1840c1829
+< ---------------------------------
+---
+> --------------------------------------------------------------------------------------------------------------
+1841a1831
+>   Window: w1 AS (PARTITION BY f1 ORDER BY f2 GROUPS BETWEEN '1'::bigint PRECEDING AND '1'::bigint FOLLOWING)
+1846c1836
+< (5 rows)
+---
+> (6 rows)
+1849,1851d1838
+< from t1 where f1 = f2;
+<  f1 | sum
+< ----+-----
+1929c1916
+< ----------------------------------------------------------------
+---
+> --------------------------------------------------------------------------------------------------------------
+1930a1918
+>   Window: w5 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1931a1920
+>   Window: w4 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1932a1922
+>   Window: w3 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1933a1924
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1934a1926
+>   Window: w1 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1938c1930
+< (8 rows)
+---
+> (13 rows)
+1949c1941
+< ------------------------------------------------------------------------
+---
+> -------------------------------------------------------------------------------------------------------
+1950a1943
+>   Window: w3 AS (PARTITION BY depname ORDER BY enroll_date RANGE BETWEEN CURRENT ROW AND CURRENT ROW)
+1952a1946
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1954a1949
+>   Window: w1 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+1961c1956
+< (11 rows)
+---
+> (14 rows)
+1965a1961
+>   row_number() OVER (PARTITION BY depname ORDER BY enroll_date) rn,
+1983c1979
+< -----------------------------------------------------
+---
+> ------------------------------------------------------------------
+1986a1983
+>   Window: w2 AS (PARTITION BY ((depname || 'A')), depname)
+1989a1987
+>   Window: w1 AS (PARTITION BY depname)
+1993c1991
+< (9 rows)
+---
+> (11 rows)
+2003c2001
+< -----------------------------------------------------
+---
+> --------------------------------------------------------------
+2006a2005
+>   Window: w2 AS (PARTITION BY depname)
+2009a2009
+>   Window: w1 AS (PARTITION BY enroll_date)
+2013c2013
+< (9 rows)
+---
+> (11 rows)
+2017d2016
+< SELECT * FROM
+2023c2022
+< -----------------------------------------
+---
+> -----------------------------------------------------------------
+2026a2026
+>   Window: w1 AS (ORDER BY empno ROWS UNBOUNDED PRECEDING)
+2030c2030
+< (6 rows)
+---
+> (7 rows)
+2033a2034,2035
+>   row_number() OVER (ORDER BY empno) rn
+>   FROM empsalary) emp
+2039c2041
+< -----------------------------------------
+---
+> ------------------------------------------------------------------
+2042a2045
+>   Window: w1 AS (ORDER BY salary ROWS UNBOUNDED PRECEDING)
+2046c2049
+< (6 rows)
+---
+> (7 rows)
+2049a2053,2054
+>   rank() OVER (ORDER BY salary DESC) r
+>   FROM empsalary) emp
+2055c2060
+< -----------------------------------------
+---
+> ------------------------------------------------------------------
+2058a2064
+>   Window: w1 AS (ORDER BY salary ROWS UNBOUNDED PRECEDING)
+2062c2068
+< (6 rows)
+---
+> (7 rows)
+2076a2083
+>   Window: w1 AS (ORDER BY salary)
+2080c2087
+< (6 rows)
+---
+> (7 rows)
+2083a2091,2092
+>   count(*) OVER (ORDER BY salary DESC) c
+>   FROM empsalary) emp
+2092a2102
+>   Window: w1 AS (ORDER BY salary)
+2096c2106
+< (6 rows)
+---
+> (7 rows)
+2099a2110,2111
+>   count(empno) OVER (ORDER BY salary DESC) c
+>   FROM empsalary) emp
+2105c2117
+< -----------------------------------------
+---
+> ------------------------------------------------------------------------------------------
+2108a2121
+>   Window: w1 AS (ORDER BY salary ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+2112c2125
+< (6 rows)
+---
+> (7 rows)
+2124a2138
+>   Window: w1 AS ()
+2126c2140
+< (4 rows)
+---
+> (5 rows)
+2129a2144
+>   salary,
+2138a2154
+>   Window: w1 AS (ORDER BY salary)
+2142c2158
+< (6 rows)
+---
+> (7 rows)
+2152c2168
+< -----------------------------------------
+---
+> --------------------------------------------------------------------------------------
+2155a2172
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno ROWS UNBOUNDED PRECEDING)
+2159c2176
+< (6 rows)
+---
+> (7 rows)
+2164a2182,2183
+>   depname,
+>   row_number() OVER (PARTITION BY depname ORDER BY empno) rn
+2168c2187
+< -----------------------------------------
+---
+> --------------------------------------------------------------------------------------
+2171a2191
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno ROWS UNBOUNDED PRECEDING)
+2175c2195
+< (6 rows)
+---
+> (7 rows)
+2179,2180d2198
+<   (SELECT empno,
+<   depname,
+2186c2204
+< ----------------------------------------------
+---
+> --------------------------------------------------------------
+2189a2208
+>   Window: w1 AS (PARTITION BY depname ORDER BY salary)
+2193c2212
+< (6 rows)
+---
+> (7 rows)
+2196a2216,2217
+>   depname,
+>   salary,
+2205a2227
+>   Window: w1 AS ()
+2207c2229
+< (4 rows)
+---
+> (5 rows)
+2210a2233,2234
+>   lead(depname) OVER (PARTITION BY salary) || ' Department' AS n_dep
+>   FROM empsalary) emp
+2216c2240
+< -------------------------------------------------------------------
+---
+> --------------------------------------------------------------------------------
+2219a2244
+>   Window: w3 AS (PARTITION BY (('' || depname)))
+2222a2248
+>   Window: w2 AS (PARTITION BY depname)
+2225a2252
+>   Window: w1 AS (PARTITION BY ((depname || '')))
+2229c2256
+< (12 rows)
+---
+> (15 rows)
+2246,2247d2272
+<   (SELECT ntile(e2.salary) OVER (PARTITION BY e1.depname) AS c
+<   FROM empsalary e1 LEFT JOIN empsalary e2 ON TRUE
+2251c2276
+< -------------------------------------------------------
+---
+> --------------------------------------------------------------------------
+2254a2280
+>   Window: w1 AS (PARTITION BY e1.depname ROWS UNBOUNDED PRECEDING)
+2261c2287
+< (9 rows)
+---
+> (10 rows)
+2270c2296
+< -------------------------------------
+---
+> --------------------------------------------------
+2273a2300
+>   Window: w1 AS (ROWS UNBOUNDED PRECEDING)
+2277c2304
+< (6 rows)
+---
+> (7 rows)
+2288c2315
+< -----------------------------------------
+---
+> ------------------------------------------------------------------------------------------
+2291a2319
+>   Window: w1 AS (ORDER BY salary ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+2295c2323
+< (6 rows)
+---
+> (7 rows)
+2299,2300d2326
+< SELECT * FROM
+<   (SELECT empno,
+2309a2336
+>   Window: w1 AS (ORDER BY salary)
+2313c2340
+< (6 rows)
+---
+> (7 rows)
+2317,2318d2343
+< SELECT * FROM
+<   (SELECT empno,
+2327a2353
+>   Window: w1 AS (ORDER BY empno)
+2331c2357
+< (6 rows)
+---
+> (7 rows)
+2335d2360
+<   (SELECT empno,
+2344a2370
+>   Window: w1 AS (ORDER BY empno)
+2348c2374
+< (6 rows)
+---
+> (7 rows)
+2358c2384
+< -----------------------------------------------------
+---
+> --------------------------------------------------------------------------
+2361a2388
+>   Window: w2 AS (PARTITION BY depname, empno ORDER BY enroll_date)
+2365a2393
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno)
+2369c2397
+< (10 rows)
+---
+> (12 rows)
+2375d2402
+<   sum(salary) OVER (PARTITION BY depname order by empno) depsalary,
+2380c2407
+< -----------------------------------------------------
+---
+> -------------------------------------------------------------------------
+2384a2412
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date)
+2388a2417
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno)
+2392c2421
+< (11 rows)
+---
+> (13 rows)
+2403,2423c2432
+< -----------------------------------------------
+<  WindowAgg
+<   ->  Incremental Sort
+<   Sort Key: depname, enroll_date
+<   Presorted Key: depname
+<   ->  WindowAgg
+<   ->  Sort
+<   Sort Key: depname, empno
+<   ->  Seq Scan on empsalary
+< (8 rows)
+< SET enable_hashagg TO off;
+< -- Ensure we don't get a sort for both DISTINCT and ORDER BY.  We expect the
+< -- sort for the DISTINCT to provide presorted input for the ORDER BY.
+< EXPLAIN (COSTS OFF)
+< SELECT DISTINCT
+<   sum(salary) OVER (PARTITION BY depname order by empno) depsalary,
+<   min(salary) OVER (PARTITION BY depname order by enroll_date) depminsalary
+< FROM empsalary
+< ORDER BY depname, enroll_date;
+<   QUERY PLAN
+< ------------------------------------------------------------------------
+---
+> -------------------------------------------------------------------------------
+2427a2437
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date)
+2431a2442
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno)
+2435c2446
+< (11 rows)
+---
+> (13 rows)
+2446c2457
+< ------------------------------------------------------------------------
+---
+> -------------------------------------------------------------------------------------
+2453a2465
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date)
+2457a2470
+>   Window: w1 AS (PARTITION BY depname ORDER BY empno)
+2461c2474
+< (14 rows)
+---
+> (16 rows)
+2470c2483
+< ------------------------------------------------------------
+---
+> ---------------------------------------------------------------------------------
+2471a2485
+>   Window: w2 AS (PARTITION BY depname ORDER BY salary, enroll_date, empno)
+2475a2490
+>   Window: w1 AS (PARTITION BY depname ORDER BY salary, enroll_date)
+2479c2494
+< (8 rows)
+---
+> (10 rows)
+2490c2505
+< ----------------------------------------------------------
+---
+> --------------------------------------------------------------------------------------------------------
+2493a2509
+>   Window: w2 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+2497a2514
+>   Window: w1 AS (PARTITION BY depname ORDER BY enroll_date ROWS UNBOUNDED PRECEDING)
+2501c2518
+< (10 rows)
+---
+> (12 rows)
+2505,2506d2521
+<   salary,
+<   enroll_date,
+2938a2954
+>   Window: w1 AS (ORDER BY t1.unique1)
+2943c2959
+< (6 rows)
+---
+> (7 rows)
+2947d2962
+< EXPLAIN (COSTS OFF)
+2955a2971
+>   Window: w1 AS ()
+2962c2978
+< (8 rows)
+---
+> (9 rows)
+2965,2968d2980
+< EXPLAIN (COSTS OFF)
+< SELECT COUNT(*) OVER (ORDER BY t1.unique1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+< FROM tenk1 t1 INNER JOIN tenk1 t2 ON t1.unique1 = t2.tenthous
+< LIMIT 1;
+2970c2982
+< ---------------------------------------------------------------------
+---
+> ------------------------------------------------------------------------------------------------------
+2972a2985
+>   Window: w1 AS (ORDER BY t1.unique1 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+2977c2990
+< (6 rows)
+---
+> (7 rows)
+2983d2995
+< LIMIT 1;
+2985c2997
+< ---------------------------------------------------------------------
+---
+> ------------------------------------------------------------------------------------------------------------
+2987a3000
+>   Window: w1 AS (ORDER BY t1.unique1 ROWS BETWEEN UNBOUNDED PRECEDING AND '10000'::bigint FOLLOWING)
+2992c3005
+< (6 rows)
+---
+> (7 rows)
+740a741
+>   Window: w1 AS (ORDER BY a, b)
+744,747d744
+<   Hash Key: a, b
+<   Hash Key: a
+<   Hash Key: b
+<   Group Key: ()
+749c746
+< (11 rows)
+---
+> (12 rows)
+1138c1135
+< -------------------------------------
+---
+> ----------------------------------------------------------
+1139a1137
+>   Window: w1 AS (ORDER BY a, b ROWS UNBOUNDED PRECEDING)
+1147c1145
+< (8 rows)
+---
+> (9 rows)
+1152d1149
+< ---+---+------------
+1158,1175d1157
+<   QUERY PLAN
+< ------------------------------------------------------
+<  Sort
+<   Sort Key: t1.a
+<   ->  WindowAgg
+<   ->  Sort
+<   Sort Key: t2.a
+<   ->  Nested Loop Left Join
+<   Join Filter: (t1.a = t2.a)
+<   ->  Seq Scan on gtest32 t1
+<   ->  Materialize
+<   ->  Seq Scan on gtest32 t2
+< (10 rows)
+< select sum(t2.b) over (partition by t2.a),
+<   sum(t2.c) over (partition by t2.a),
+<   sum(t2.d) over (partition by t2.a)
+< from gtest32 as t1 left join gtest32 as t2 on (t1.a = t2.a)
+< order by t1.a;

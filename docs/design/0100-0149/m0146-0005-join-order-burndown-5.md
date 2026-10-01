@@ -720,3 +720,60 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice85/`.
+
+## Slice 86: M0146-0005cg — WindowAgg prints its `Window:` definition
+
+PG 18 prints `Window: w1 AS (PARTITION BY … ORDER BY … frame)` under every
+WindowAgg (explain.c show_window_def); goopg printed nothing.
+
+- **Name.** `WindowAgg.Name` (EXPLAIN-only) is set in `buildWindowStage`.
+  `windowClauseName` mirrors transformWindowFuncCall's winref choice: a
+  bare `OVER w` names w, and any other OVER clause reuses the first WINDOW
+  clause entry it equals, with the same refname. `nameUnnamedWindows` is
+  name_active_windows: unnamed windows take the first free `wN` in chain
+  order, per query level.
+- **Keys.** They deparse as a Sort's keys over the WindowAgg's child, through
+  `sortKeyParts`, minus the sort options (show_window_keys makes the same
+  deparse_expression call).
+- **Frame.** `windowFrameText` is get_window_frame_options:
+  - `optimize_window_clauses` rewrites a window whose functions are all
+    row_number / rank / dense_rank / percent_rank / cume_dist / ntile to
+    `ROWS UNBOUNDED PRECEDING`.
+  - `WindowFrame.HasBetween` (FRAMEOPTION_BETWEEN) keeps the written form.
+  - ROWS / GROUPS offsets print as int8 consts (`'1'::bigint`).
+  - A RANGE literal offset is int8 only over an int8 ORDER BY key.
+- **Key chase.** `resolveKeySource` now also passes an Incremental Sort.
+  TPC-DS Q89's window keys sit over one and printed unqualified.
+
+Test: `TestWindowAggPrintsWindowDefinition` (9 PG 18.3 oracle lines). It
+fails 7 of 7 cases with the line suppressed.
+
+Movement:
+
+- TPC-DS: 7 of the 12 window queries print PG's exact `Window:` lines at
+  both scales (Q12/Q20/Q51/Q53/Q63/Q89/Q98). The plan-parity classifier
+  does not read the line, so CATEGORIES-EXCL-MATCH is unchanged
+  (rendering 12 / 15).
+- Regress, same-order A/B over 19 cases:
+  - generated_virtual 1715 → 1694 and groupingsets 1916 → 1911.
+  - window 4463 → 4460, explain 818 → 824 and partition_prune 6420 → 6422
+    grew. Their plans stack windows in a different order or need
+    VERBOSE / rtable-size qualification, so the new lines join diffs that
+    were already there.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered):
+
+- **Stacking order.** select_active_windows sorts the clauses; goopg keeps
+  first-appearance order (Q47/Q49/Q57, regress window/explain). This is a
+  plan change, not rendering.
+- **Merging.** optimize_window_clauses merges clauses its frame rewrite made
+  identical, so PG has one WindowAgg where goopg has several (regress
+  window `w2…w5`).
+- **Subquery alias.** Window keys over a kept Subquery Scan print the
+  internals instead of `v1.rank_col` / `dw1.sumsales` (Q44/Q49/Q67).
+- **OVER text.** A key that reads a window result prints the output label
+  (`sum`) instead of `sum(…) OVER w1` (Q12/Q20/Q98 Sort Key).
+
+Evidence: `analysis/m0146/m0146-0005/slice86/`.

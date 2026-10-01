@@ -1130,10 +1130,11 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				}
 			}
 			return src, true
-		case *optimizer.Sort, *optimizer.Gather, *optimizer.GatherMerge:
+		case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather, *optimizer.GatherMerge:
 			// Row-order and worker boundaries pass their child's columns
 			// through unchanged (M0146-0021: Q77's sr body aggregates over
-			// a Gather Merge).
+			// a Gather Merge; M0146-0005cg: TPC-DS Q89's window keys over
+			// an Incremental Sort).
 			c := childNodeOf(n)
 			if c == nil || len(n.Output()) != len(c.Output()) {
 				return nil, false
@@ -1454,6 +1455,8 @@ func childNodeOf(n optimizer.Node) optimizer.Node {
 	switch t := n.(type) {
 	case *optimizer.Sort:
 		return t.Child
+	case *optimizer.IncrementalSort:
+		return t.Child
 	case *optimizer.Filter:
 		return t.Child
 	case *optimizer.SubqueryScan:
@@ -1743,6 +1746,18 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if len(p.Keys) > 0 {
 			full, _ := sortKeyParts(p.Child, p.Keys, reg, qualify)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
+		}
+	case *optimizer.WindowAgg:
+		// M0146-0005cg: PG 18's `Window: w1 AS (PARTITION BY … ORDER BY …
+		// frame)` (explain.c show_window_def). The keys deparse against the
+		// child's targetlist exactly as a Sort's do (show_window_keys makes
+		// the same deparse_expression call as show_sort_group_keys), minus
+		// the sort-order options.
+		if p.Name != "" {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Window: " + windowDefText(p, reg, qualify))})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	case *optimizer.SetOp:
 		// M0141-S2b-4c: PG's Merge Append prints its `Sort Key:` (explain.c
@@ -2167,6 +2182,126 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
 	}
+}
+
+// windowDefText is show_window_def's text: `name AS (PARTITION BY …
+// ORDER BY … frame)`.
+func windowDefText(w *optimizer.WindowAgg, reg *subPlanReg, qualify bool) string {
+	var b strings.Builder
+	b.WriteString(pgQuoteIdent(w.Name))
+	b.WriteString(" AS (")
+	space := false
+	if len(w.PartitionBy) > 0 {
+		keys := make([]optimizer.SortKey, len(w.PartitionBy))
+		for i, e := range w.PartitionBy {
+			keys[i] = optimizer.SortKey{Expr: e}
+		}
+		_, bare := sortKeyParts(w.Child, keys, reg, qualify)
+		b.WriteString("PARTITION BY " + strings.Join(bare, ", "))
+		space = true
+	}
+	if len(w.OrderBy) > 0 {
+		if space {
+			b.WriteByte(' ')
+		}
+		_, bare := sortKeyParts(w.Child, w.OrderBy, reg, qualify)
+		b.WriteString("ORDER BY " + strings.Join(bare, ", "))
+		space = true
+	}
+	if fr := windowFrameText(w, reg, qualify); fr != "" {
+		if space {
+			b.WriteByte(' ')
+		}
+		b.WriteString(fr)
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+// windowRowsFrameFuncs are the window functions whose prosupport answers
+// SupportRequestOptimizeWindowClause with ROWS UNBOUNDED PRECEDING
+// (windowfuncs.c: row_number, rank, dense_rank, percent_rank, cume_dist,
+// ntile).
+var windowRowsFrameFuncs = map[string]bool{
+	"row_number": true, "rank": true, "dense_rank": true,
+	"percent_rank": true, "cume_dist": true, "ntile": true,
+}
+
+// windowFrameText is get_window_frame_options for a non-default frame, ""
+// for the default one. planner.c's optimize_window_clauses first rewrites
+// a window whose every function is in windowRowsFrameFuncs to
+// `ROWS UNBOUNDED PRECEDING` (no BETWEEN), whatever frame was written.
+func windowFrameText(w *optimizer.WindowAgg, reg *subPlanReg, qualify bool) string {
+	allRows := len(w.Funcs) > 0
+	for _, f := range w.Funcs {
+		if !windowRowsFrameFuncs[strings.ToLower(f.Name)] {
+			allRows = false
+			break
+		}
+	}
+	if allRows {
+		return "ROWS UNBOUNDED PRECEDING"
+	}
+	fr := w.Frame
+	if fr == nil {
+		return ""
+	}
+	var parts []string
+	switch fr.Mode {
+	case parser.FrameModeRange:
+		parts = append(parts, "RANGE")
+	case parser.FrameModeGroups:
+		parts = append(parts, "GROUPS")
+	default:
+		parts = append(parts, "ROWS")
+	}
+	if fr.HasBetween {
+		parts = append(parts, "BETWEEN")
+	}
+	// transformFrameOffset coerces a ROWS / GROUPS offset to int8, so a
+	// literal deparses as get_const_expr's `'1'::bigint`. A RANGE offset
+	// takes the in_range function's offset type: an integer literal stays
+	// int4 unless the ORDER BY key is int8, whose integer_ops in_range
+	// support takes only an int8 offset.
+	int8Offset := fr.Mode != parser.FrameModeRange
+	if !int8Offset && len(w.OrderBy) == 1 {
+		if t, ok := optimizer.ExprResultType(w.OrderBy[0].Expr); ok && !t.IsArray && t.Name == "int8" {
+			int8Offset = true
+		}
+	}
+	offset := func(off optimizer.Expr) string {
+		if ic, ok := off.(*optimizer.IntegerConst); ok && int8Offset {
+			return fmt.Sprintf("'%d'::bigint", ic.Value)
+		}
+		return formatExprQual(off, reg, qualify)
+	}
+	bound := func(k parser.FrameBoundKind, off optimizer.Expr) string {
+		switch k {
+		case parser.FrameBoundUnboundedPreceding:
+			return "UNBOUNDED PRECEDING"
+		case parser.FrameBoundUnboundedFollowing:
+			return "UNBOUNDED FOLLOWING"
+		case parser.FrameBoundCurrentRow:
+			return "CURRENT ROW"
+		case parser.FrameBoundOffsetPreceding:
+			return offset(off) + " PRECEDING"
+		default:
+			return offset(off) + " FOLLOWING"
+		}
+	}
+	parts = append(parts, bound(fr.StartKind, fr.StartOffset))
+	if fr.HasBetween {
+		parts = append(parts, "AND", bound(fr.EndKind, fr.EndOffset))
+	}
+	switch fr.Exclusion {
+	case parser.FrameExcludeCurrentRow:
+		parts = append(parts, "EXCLUDE CURRENT ROW")
+	case parser.FrameExcludeGroup:
+		parts = append(parts, "EXCLUDE GROUP")
+	case parser.FrameExcludeTies:
+		parts = append(parts, "EXCLUDE TIES")
+	}
+	return strings.Join(parts, " ")
 }
 
 // formatJoinKeyCond renders a hash/merge join's key list the way

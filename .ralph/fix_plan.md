@@ -23858,6 +23858,24 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cg — WindowAgg prints its `Window:` definition**
+  \(filed and landed 2026\-10\-01 from the census: PG 18 prints
+  `Window: w1 AS \(…\)` under every WindowAgg; goopg printed nothing\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 86\)\.** `WindowAgg.Name` \(windowClauseName \+
+    nameUnnamedWindows\), `WindowFrame.HasBetween`, `windowDefText` /
+    `windowFrameText` in operators\_explain\.go; the key chase passes an
+    Incremental Sort\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-5.md`
+    § "Slice 86"\.
+  - Test `TestWindowAggPrintsWindowDefinition` \(9 PG oracle lines; 7/7
+    original cases fail with the line suppressed\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress 19\-case same\-order A/B, ea\-ratchet PASS \(10\)\.
+  - Left \(ledgered\): window clause order and duplicate merge \(plan
+    change\), subquery\-alias window keys, `OVER w1` in keys\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; classifier ignores Window lines); TPC-DS Window lines identical 7/12 per scale (was 0/12); regress generated_virtual 1715 -> 1694, groupingsets 1916 -> 1911
 - [x] **M0146\-0005cf — a grouping\-mask key deparses as its GROUPING call**
   \(filed and landed 2026\-10\-01 from slice 83\'s ledger row: goopg printed
   the label `grouping`, PG `\(GROUPING\(a, b\)\)`\)\.
