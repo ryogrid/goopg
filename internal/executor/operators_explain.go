@@ -1762,6 +1762,20 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 	return full, bare
 }
 
+// keyChildPassesThrough reports whether an Aggregate's child is a node that
+// cannot project — its targetlist only references its own input — so a
+// computed group key reaches the Agg as an OUTER_VAR and deparses in
+// get_special_variable's parentheses. A scan or join computes the key in its
+// own targetlist and prints it bare (`Group Key: (a % 10)` over a Seq Scan).
+func keyChildPassesThrough(n optimizer.Node) bool {
+	switch n.(type) {
+	case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather,
+		*optimizer.GatherMerge, *optimizer.Materialize:
+		return true
+	}
+	return false
+}
+
 // sortOrderSuffix is a key's DESC / NULLS decoration, printed only when it
 // differs from the direction's default (show_sortorder_options).
 func sortOrderSuffix(k optimizer.SortKey) string {
@@ -2377,7 +2391,12 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// scan/join computes the group key itself and keeps the
 			// single (unwrapped) form. docs/design/0134-0001-p2-explain-format.md
 			// § S18.
-			_, groupAgg := p.Child.(*optimizer.Sort)
+			// M0146-0005cr: the wrap applies whenever the child passes its
+			// input's columns through instead of computing them — a Sort, and
+			// equally a Gather Merge under a Finalize GroupAggregate (TPC-DS
+			// Q62's `(substr(…))`): show_agg_keys deparses the key against the
+			// child's targetlist, which there is an OUTER_VAR.
+			groupAgg := keyChildPassesThrough(p.Child)
 			parts := make([]string, 0, len(order))
 			for _, gi := range order {
 				// R66 Slice 2: a ColumnRef group key chases past

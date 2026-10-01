@@ -482,3 +482,34 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice96/`.
+
+## Slice 97: M0146-0005cr — a group key over a pass-through child is parenthesised
+
+show_agg_keys deparses each group key against the Agg's child targetlist.
+
+- A scan or join computes a key expression in its own targetlist, so it
+  prints bare: `Group Key: (a % 10)` over a Seq Scan, checked on PG 18.3.
+- A Sort or Gather Merge only passes its input's columns through. The key
+  then reaches the Agg as an OUTER_VAR, and get_special_variable wraps the
+  non-Var referent: `Group Key: (substr((b)::text, 1, 2))`.
+
+goopg applied the wrap (S18) only when the child was a Sort, so the
+Finalize GroupAggregate over Gather Merge in TPC-DS Q62/Q99 printed the
+bare form.
+
+- `keyChildPassesThrough` names the non-projecting children (Sort,
+  IncrementalSort, Gather, GatherMerge, Materialize). The plain-grouping
+  Group Key arm uses it in place of the Sort-only test.
+
+Test: `TestFinalizeGroupKeyOverGatherMergeIsParenthesised` (PG 18.3 output
+for the same statement and settings; fails with the Sort-only test).
+
+Movement:
+
+- Q62/Q99 Group Keys equal PG's at both scales. Text-identical plans go
+  16 → 17 at SF0.25 (Q62).
+- Regress A/B (groupingsets / aggregates / select_parallel) is flat.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice97/`.

@@ -23858,6 +23858,19 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cr — a group key over a pass\-through child is parenthesised**
+  \(filed and landed 2026\-10\-02 from the MATCH\-plan text census: Q62/Q99's
+  Finalize GroupAggregate over Gather Merge printed `substr\(…\)` bare\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 97\)\.** `keyChildPassesThrough` replaces the
+    Sort\-only S18 test in the plain\-grouping Group Key arm\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 97"\.
+  - Test `TestFinalizeGroupKeyOverGatherMergeIsParenthesised`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress A/B, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS text-identical 16 -> 17 (SF0.25); Q62/Q99 Group Keys equal PG's
 - [x] **M0146\-0005cq — a NestLoop param names its relation by its printed label**
   \(filed and landed 2026\-10\-02 from the MATCH\-plan text census: Q88/Q90
   printed `web\_sales\.` in every subquery, PG `web\_sales\_1\.` …\)\.
