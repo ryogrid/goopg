@@ -23868,6 +23868,19 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cx — an expression key over a join chases its columns into the aggregates**
+  \(filed and landed 2026\-10\-02 from the 0cw ledger row: Q90 printed
+  `amc`/`pmc`, PG `\(count\(\*\)\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 103\)\.** `chaseJoinKeyExprColumns`; Finalize
+    aggregate\-result positions resolve in `resolveKeySource`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 103"\.
+  - Test `TestSortKeyExprOverJoinChasesAggregates` \(serial \+ parallel\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress A/B, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); CATEGORIES incl. MATCH rendering 15 -> 14 (SF0.25), 16 -> 15 (SF1); TPC-DS text-identical 20 -> 21, 12 -> 13 (Q90)
 - [x] **M0146\-0005cw — an explicit cast prints as PG's coercion**
   \(filed and landed 2026\-10\-02 from the census: goopg's CastExpr arm
   printed only the operand; Q90 `\(amc / pmc\)` vs PG

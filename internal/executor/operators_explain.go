@@ -1381,15 +1381,26 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			// address (a Finalize key read through the Partial below printed
 			// `sum(CASE …)` for TPC-DS Q59's group key), so the split pair
 			// declines (M0146-0005ce, now that Gather passes through).
-			if n.Mode != optimizer.AggModeSimple {
-				return nil, false
-			}
 			col, ok := cur.(*optimizer.ColumnRef)
 			if !ok {
 				return nil, false
 			}
 			j := col.Index
 			if j < 0 {
+				return nil, false
+			}
+			// M0146-0005cx: a Finalize aggregate's own aggregate result is
+			// its final call (`count(*)`, TPC-DS Q90) — no descent into the
+			// transport layout, so only its group positions decline.
+			if n.Mode == optimizer.AggModeFinal && j >= len(n.GroupExprs) && j < n.GroupingMaskColOffset() &&
+				j-len(n.GroupExprs) < len(n.Aggs) {
+				call, ok := synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
+				if ok && crossedJoin {
+					return pinKeyExprNames(call, n, reg)
+				}
+				return call, ok
+			}
+			if n.Mode != optimizer.AggModeSimple {
 				return nil, false
 			}
 			if j < len(n.GroupExprs) {
@@ -1736,6 +1747,11 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 				continue
 			}
 		}
+		if _, isCol := keyExpr.(*optimizer.ColumnRef); !isCol {
+			if chased, ok := chaseJoinKeyExprColumns(keyExpr, child, reg, qualify); ok {
+				keyExpr = chased
+			}
+		}
 		s := formatExprQual(keyExpr, reg, qualify)
 		// S18: a Sort never evaluates expressions — its key is
 		// always PG's OUTER_VAR reference into the child's target
@@ -1775,6 +1791,41 @@ func keyChildPassesThrough(n optimizer.Node) bool {
 		return true
 	}
 	return false
+}
+
+// chaseJoinKeyExprColumns rewrites the column references inside an
+// expression Sort key whose child is a join (M0146-0005cx). PG evaluates the
+// key in the join's targetlist, where each column is an OUTER_VAR /
+// INNER_VAR into the join's inputs; get_variable follows it to the input's
+// expression and parenthesises a non-Var referent. Over TPC-DS Q90's cross
+// join of two count(*) subqueries that is
+// `((((count(*)))::numeric(15,4) / ((count(*)))::numeric(15,4)))`.
+// ok is false when the child is not a join or nothing resolves.
+func chaseJoinKeyExprColumns(key optimizer.Expr, child optimizer.Node, reg *subPlanReg, qualify bool) (optimizer.Expr, bool) {
+	switch child.(type) {
+	case *optimizer.Join, *optimizer.NestedLoopIndexJoin:
+	default:
+		return nil, false
+	}
+	if reg == nil {
+		return nil, false
+	}
+	changed := false
+	out, ok := optimizer.CloneExprReplacingColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+		chased, hit := resolveKeySource(c, child, reg)
+		if !hit {
+			return c
+		}
+		changed = true
+		if _, isCol := chased.(*optimizer.ColumnRef); isCol {
+			return chased
+		}
+		return displayColumn(c, "("+formatExprQual(chased, reg, qualify)+")", reg)
+	})
+	if !ok || !changed {
+		return nil, false
+	}
+	return out, true
 }
 
 // sortOrderSuffix is a key's DESC / NULLS decoration, printed only when it

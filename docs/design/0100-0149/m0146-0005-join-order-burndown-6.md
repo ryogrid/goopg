@@ -679,3 +679,38 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice102/`.
+
+## Slice 103: M0146-0005cx — an expression key over a join chases its columns into the aggregates
+
+PG evaluates an expression Sort key over a join in the join's
+targetlist. Each column there is an OUTER/INNER_VAR into the join's
+inputs; get_variable follows it and parenthesises a non-Var referent.
+TPC-DS Q90's cross join of two `count(*)` subqueries therefore prints
+`((((count(*)))::numeric(15,4) / ((count(*)))::numeric(15,4)))`, where
+goopg printed `(((amc)::numeric(15,4) / (pmc)::numeric(15,4)))`.
+
+- `chaseJoinKeyExprColumns`: when a non-column Sort key's child is a Join
+  or NestedLoopIndexJoin, each column reference is chased through
+  `resolveKeySource`. One that lands on a non-column expression prints in
+  parentheses via `displayColumn`.
+- `resolveKeySource`'s Aggregate arm declined every non-simple aggregate
+  (slice 84, against Q59's Finalize group key read through the Partial's
+  transport layout). A Finalize aggregate's aggregate-result position is
+  its final call with no descent, so it now returns that call. Group
+  positions still decline.
+
+Test: `TestSortKeyExprOverJoinChasesAggregates` (PG 18.3's line for the
+serial and the parallel plan). Disabling the Finalize branch fails the
+parallel case; disabling the chase fails both.
+
+Movement:
+
+- Q90 becomes text-identical at both scales: 20 → 21 (SF0.25) and
+  12 → 13 (SF1).
+- Rendering including MATCH goes 15 → 14 and 16 → 15. The fire set
+  touched Q90 only.
+- Regress A/B over 9 cases is flat.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice103/`.
