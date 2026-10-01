@@ -23868,6 +23868,21 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cz — an IN list over a text\-only function folds to an array Const**
+  \(filed and landed 2026\-10\-02 from the text\-identity census: Q8, Q15 and
+  Q45 printed `= ANY \('85669', …\)` where PG prints `'\{…\}'::text\[\]`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 105\)\.** `formatInExprPG` falls back to
+    `stringTypeName` when `ExprResultType` cannot resolve a text\-only
+    function over char/varchar\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Slice 105"\.
+  - Test: `explain\_in\_list\_array\_test\.go` \(4 new cases, PG 18\.3 text\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(Q8 Q15
+    Q45\), ea\-ratchet PASS \(10\); regress A/B not applicable \(no PG expected
+    output has this shape\)\.
+  Movement: yes — TPC-DS text-identical 24 -> 25 (SF0.25), 13 -> 14 (SF1); unfolded IN lists 3 -> 0; CATEGORIES-EXCL-MATCH unchanged (rendering 12 / 15)
 - [x] **M0146\-0005cy — a Memoize node prints its Cache Mode**
   \(filed and landed 2026\-10\-02 from the text\-identity census: seven
   MATCH plans differed from PG by the one missing `Cache Mode:` line\)\.

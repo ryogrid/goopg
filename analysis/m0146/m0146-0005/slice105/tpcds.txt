@@ -1,0 +1,26 @@
+== sf025
+baseline: text-identical 24/99 aligned-lines 2211  Q3 Q7 Q9 Q12 Q13 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q48 Q51 Q55 Q62 Q82 Q84 Q88 Q90 Q93 Q96 Q97 Q98
+candidate: text-identical 25/99 aligned-lines 2214  Q3 Q7 Q9 Q12 Q13 Q15 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q48 Q51 Q55 Q62 Q82 Q84 Q88 Q90 Q93 Q96 Q97 Q98
+unfolded IN lists: baseline 3 candidate 0
+== sf1
+baseline: text-identical 13/99 aligned-lines 2013  Q9 Q12 Q20 Q27 Q28 Q41 Q51 Q87 Q88 Q90 Q96 Q97 Q98
+candidate: text-identical 14/99 aligned-lines 2016  Q9 Q12 Q15 Q20 Q27 Q28 Q41 Q51 Q87 Q88 Q90 Q96 Q97 Q98
+unfolded IN lists: baseline 3 candidate 0
+FIRE-SET: baseline=c3226bd85b9e4858057b1994c2031814b35f6c2b (f7f4d57122c8) candidate=worktree (ad98c0be0482)
+PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=14
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+DIVERGENCE-CLASSES: queries=99 match=38 divergent=61 D1-sublink=4 D2-unionall=1 D3-partialpath=20 D4-upperrel=12 D5-narrowing=0 D6-cte=0 jointree-search=21 verdict=3
+PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=14
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+DIVERGENCE-CLASSES: queries=99 match=38 divergent=61 D1-sublink=4 D2-unionall=1 D3-partialpath=20 D4-upperrel=12 D5-narrowing=0 D6-cte=0 jointree-search=21 verdict=3
+FIRE-SET-TIMEOUTS: fires=Q8 Q15 Q45 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+DIVERGENCE-CLASSES: queries=99 match=28 divergent=71 D1-sublink=2 D2-unionall=1 D3-partialpath=30 D4-upperrel=14 D5-narrowing=0 D6-cte=0 jointree-search=21 verdict=3
+PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+DIVERGENCE-CLASSES: queries=99 match=28 divergent=71 D1-sublink=2 D2-unionall=1 D3-partialpath=30 D4-upperrel=14 D5-narrowing=0 D6-cte=0 jointree-search=21 verdict=3

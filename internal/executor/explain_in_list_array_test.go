@@ -34,6 +34,10 @@ func TestInListPrintsFoldedArrayConst(t *testing.T) {
 		{"a NOT IN (1,2)", "Filter: (a <> ALL ('{1,2}'::integer[]))"},
 		{"NOT (b IN (3,4))", "Filter: (b <> ALL ('{3,4}'::bigint[]))"},
 		{"a <> ANY (ARRAY[1,2])", "Filter: (a <> ANY ('{1,2}'::integer[]))"},
+		{"substr(f, 1, 2) IN ('ab','cd')", "Filter: (substr((f)::text, 1, 2) = ANY ('{ab,cd}'::text[]))"},
+		{"substr(d, 1, 2) IN ('ab','cd')", "Filter: (substr(d, 1, 2) = ANY ('{ab,cd}'::text[]))"},
+		{"upper(c) IN ('ab','cd')", "Filter: (upper((c)::text) = ANY ('{ab,cd}'::text[]))"},
+		{"a + 1 IN (1,2)", "Filter: ((a + 1) = ANY ('{1,2}'::integer[]))"},
 	} {
 		q := "SELECT * FROM ii WHERE " + c.where
 		var lines []string

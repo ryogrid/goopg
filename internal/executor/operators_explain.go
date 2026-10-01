@@ -3945,7 +3945,15 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 	// is the `<> ALL` form of the same node (negate_clause turns an
 	// explicit NOT (a IN …) into it too).
 	if x.AnyOp == 0 && !x.AllOp {
-		if lt, ok := optimizer.ExprResultType(x.Operand); ok {
+		lt, ok := optimizer.ExprResultType(x.Operand)
+		// M0146-0005cz: a text-only function over a char/varchar argument
+		// returns text through the argument's implicit coercion, which the
+		// exact pg_proc lookup behind ExprResultType cannot resolve
+		// (`substr((ca_zip)::text, 1, 5) = ANY ('{…}'::text[])`).
+		if !ok && stringTypeName(x.Operand) == "text" {
+			lt, ok = catalog.Type{Name: "text"}, true
+		}
+		if ok {
 			if cast, lit, ok := inListArrayConst(lt, x.List); ok {
 				if cast != "" {
 					operand = "(" + operand + ")::" + cast
