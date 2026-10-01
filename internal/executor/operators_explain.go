@@ -831,9 +831,11 @@ func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 	if col == nil || agg == nil || col.Name == "" {
 		return nil, false
 	}
-	if agg.GroupingSets != nil {
-		return nil, false
-	}
+	// M0146-0005cd: grouping sets keep the group-prefix layout
+	// ([groups|aggs|grouping masks|passthrough], GroupingMaskColOffset), so
+	// output position idx < len(GroupExprs) is GroupExprs[idx] as for plain
+	// grouping — PG's `Sort Key: ('store channel'::text), …` above a
+	// MixedAggregate (TPC-DS Q5/Q77). The name check below still guards.
 	idx := col.Index
 	if idx < 0 || idx >= len(agg.GroupExprs) {
 		return nil, false
@@ -1242,9 +1244,9 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			node = n.Child
 			continue
 		case *optimizer.Aggregate:
-			if n.GroupingSets != nil {
-				return nil, false
-			}
+			// Grouping sets keep the group-prefix layout too (see
+			// sortGroupKeySource, M0146-0005cd); a mask position declines
+			// below.
 			col, ok := cur.(*optimizer.ColumnRef)
 			if !ok {
 				return nil, false

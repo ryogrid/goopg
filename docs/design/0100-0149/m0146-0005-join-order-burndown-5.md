@@ -618,3 +618,35 @@ parentheses around a non-Var referent inside the call. Other leftovers are
 grouping-set (MixedAggregate) keys (Q5/Q77) and Q61/Q66's chase failures.
 
 Evidence: `analysis/m0146/m0146-0005/slice82/`.
+
+## Slice 83: M0146-0005cd — grouping-set aggregates keep the group-prefix key layout
+
+The key chase declined at any aggregate with grouping sets, both in
+`sortGroupKeySource` and in `resolveKeySource`'s Aggregate arm. A comment
+claimed their output layout differs, but it does not. The executor's layout
+is `[groups | aggs | grouping masks | passthrough]`
+(`GroupingMaskColOffset`), so output position j \< len(GroupExprs) is
+GroupExprs\[j\], as for plain grouping. PG's Sort above a MixedAggregate
+therefore prints the grouping expressions: TPC-DS Q5/Q77
+`Sort Key: ('store channel'::text), …`, where goopg printed `channel, id`.
+
+- Both declines are lifted. A grouping-mask position still declines, and
+  the per-position output-name check still guards every step.
+
+Test: `TestSortKeyOverGroupingSetsDeparsesGroupExprs`, with the PG 18.3
+oracle `Sort Key: ('a chan'::text), (('x'::text || (ra.id)::text))` (casts
+not pinned). It fails with the decline restored.
+
+Movement:
+
+- CATEGORIES-EXCL-MATCH rendering goes SF0.25 15 → 14 and SF1 19 → 17 (Q5,
+  and Q80 at SF1), with no new rendering divergence.
+- Regress groupingsets.sql moves toward PG's form: `(sum(v))`, which
+  matches expected, and `((b + 1))`. The VALUES-column naming
+  (`"*VALUES*".column1`) and the `GROUPING(...)` mask key stay different
+  (ledgered). The diff line count is unchanged, and join.sql shows only its
+  known row-order flap.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice83/`.

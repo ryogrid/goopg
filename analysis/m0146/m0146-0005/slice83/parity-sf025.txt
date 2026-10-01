@@ -1,0 +1,4 @@
+tmp/fireset-0cd/tpcds-sf025/0cd-tpcds-sf025-baseline-diff.txt:PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cd/tpcds-sf025/0cd-tpcds-sf025-baseline-diff.txt:CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=15
+tmp/fireset-0cd/tpcds-sf025/0cd-tpcds-sf025-candidate-diff.txt:PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cd/tpcds-sf025/0cd-tpcds-sf025-candidate-diff.txt:CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=14

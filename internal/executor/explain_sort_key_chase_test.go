@@ -193,3 +193,36 @@ func TestGroupKeyDeparsesThroughInlinedCTE(t *testing.T) {
 		t.Fatalf("outer Group Key = %q, want PG's %q", first, "Group Key: it.m")
 	}
 }
+
+// TestSortKeyOverGroupingSetsDeparsesGroupExprs pins M0146-0005cd against PG
+// 18.3: a grouping-set aggregate keeps the group-prefix output layout, so a
+// Sort key above a MixedAggregate deparses to the grouping expression like
+// any other group key (TPC-DS Q5/Q77, where goopg printed `channel, id`). PG
+// on this fixture (goopg omits the literals' `::text` casts, not pinned):
+//
+//	Sort Key: ('a chan'::text), (('x'::text || (ra.id)::text))
+//	->  MixedAggregate
+//	      Hash Key: ('a chan'::text), (('x'::text || (ra.id)::text))
+func TestSortKeyOverGroupingSetsDeparsesGroupExprs(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{"CREATE TABLE ra (id int, v int)", "CREATE TABLE rb (id int, v int)",
+		"INSERT INTO ra SELECT i, i FROM generate_series(1,100) i", "INSERT INTO rb SELECT i, i FROM generate_series(1,100) i",
+		"ANALYZE ra", "ANALYZE rb"} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	var sortKey string
+	for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT channel, id, sum(v) FROM (SELECT 'a chan' AS channel, 'x' || id AS id, v FROM ra "+
+		"UNION ALL SELECT 'b chan', 'y' || id, v FROM rb) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id", ps)) {
+		if len(r) > 0 && r[0].Kind == KindString {
+			if s := strings.TrimSpace(r[0].StringValue()); sortKey == "" && strings.HasPrefix(s, "Sort Key:") {
+				sortKey = s
+			}
+		}
+	}
+	if !strings.HasPrefix(sortKey, "Sort Key: ('a chan'") || !strings.Contains(sortKey, "ra.id") {
+		t.Fatalf("got %q, want PG's grouping-expression deparse `('a chan'…), (('x' || ra.id))`", sortKey)
+	}
+}

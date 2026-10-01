@@ -1,0 +1,4 @@
+12d11
+< Q5     Sort rendering: Sort Key text differs
+27d25
+< Q80     Sort rendering: Sort Key text differs
