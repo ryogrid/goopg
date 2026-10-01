@@ -1752,7 +1752,7 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 				keyExpr = chased
 			}
 		}
-		s := formatExprQual(keyExpr, reg, qualify)
+		s := formatKeyExprQual(keyExpr, reg, qualify)
 		// S18: a Sort never evaluates expressions — its key is
 		// always PG's OUTER_VAR reference into the child's target
 		// list, so get_special_variable's "force parentheses for a
@@ -1785,12 +1785,29 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 // get_special_variable's parentheses. A scan or join computes the key in its
 // own targetlist and prints it bare (`Group Key: (a % 10)` over a Seq Scan).
 func keyChildPassesThrough(n optimizer.Node) bool {
-	switch n.(type) {
+	switch x := n.(type) {
 	case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather,
 		*optimizer.GatherMerge, *optimizer.Materialize:
 		return true
+	case *optimizer.SetOp:
+		// M0146-0005dc: an (Merge) Append cannot project either; its
+		// OUTER_VAR resolves through the first child's targetlist
+		// (set_deparse_plan), so a UNION ALL arm's literal or expression
+		// prints parenthesized.
+		return setOpRendersAsAppend(x)
 	}
 	return false
+}
+
+// formatKeyExprQual renders a Sort / Group / Hash key. A string literal
+// there is a target-list entry, which parse analysis resolved from
+// unknown to text (resolveTargetListUnknowns), so it prints as the text
+// Const: `('store channel'::text)` (M0146-0005dc).
+func formatKeyExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
+	if c, ok := e.(*optimizer.StringConst); ok {
+		return quoteLiteral(c.Value) + "::text"
+	}
+	return formatExprQual(e, reg, qualify)
 }
 
 // chaseJoinKeyExprColumns rewrites the column references inside an
@@ -2135,7 +2152,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 						keyExpr = chased
 					}
 				}
-				str := formatExprQual(keyExpr, reg, qualify)
+				str := formatKeyExprQual(keyExpr, reg, qualify)
 				if seen[str] {
 					continue
 				}
@@ -2384,7 +2401,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 						keyExpr = chased
 					}
 				}
-				s := formatExprQual(keyExpr, reg, qualify)
+				s := formatKeyExprQual(keyExpr, reg, qualify)
 				if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
 					s = forceParen(s)
 				}
@@ -2488,7 +2505,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 						keyExpr = chased
 					}
 				}
-				s := formatExprQual(keyExpr, reg, qualify)
+				s := formatKeyExprQual(keyExpr, reg, qualify)
 				if groupAgg {
 					if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
 						s = forceParen(s)
@@ -3617,6 +3634,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if s, ok := formatLikeOpExpr(x, reg, qualify); ok {
 			return s
 		}
+		if s, ok := formatTextConcatExpr(x, reg, qualify); ok {
+			return s
+		}
 		if l, r, ok := formatCoercedLiteralOperands(x, reg, qualify); ok {
 			return "(" + l + " " + x.Op.String() + " " + r + ")"
 		}
@@ -4177,6 +4197,69 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 	return "", "", false
 }
 
+// formatTextConcatExpr renders `a || b` over character operands the way PG
+// deparses textcat / textanycat / anytextcat (M0146-0005dc): both sides are
+// text, so a literal prints as the text Const, a char(n) / varchar operand
+// shows its implicit `(x)::text`, and a scalar of another type the
+// textanycat SQL function casts explicitly — `('store'::text ||
+// (ssr.store_id)::text)`. At least one side must be character-typed (or a
+// literal, or a nested text concatenation); anything else (array, jsonb,
+// bytea, tsvector concatenation) declines and keeps the generic rendering.
+func formatTextConcatExpr(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, bool) {
+	lk, rk, ok := textConcatKinds(x)
+	if !ok {
+		return "", false
+	}
+	side := func(e optimizer.Expr, k string) string {
+		if c, isStr := e.(*optimizer.StringConst); isStr {
+			return quoteLiteral(c.Value) + "::text"
+		}
+		s := formatExprQual(e, reg, qualify)
+		if k != "text" {
+			s = "(" + s + ")::text"
+		}
+		return s
+	}
+	return "(" + side(x.Left, lk) + " || " + side(x.Right, rk) + ")", true
+}
+
+// textConcatKinds classifies the operands of a `||` node for
+// formatTextConcatExpr: "lit" (string literal), "text", "varchar",
+// "bpchar" (character types) or "scalar" (a type textanycat casts). ok is
+// false when the node is not a text concatenation.
+func textConcatKinds(x *optimizer.BinaryOp) (lk, rk string, ok bool) {
+	if x.Op != parser.OpConcat {
+		return "", "", false
+	}
+	kind := func(e optimizer.Expr) string {
+		switch y := e.(type) {
+		case *optimizer.StringConst:
+			return "lit"
+		case *optimizer.BinaryOp:
+			if _, _, nested := textConcatKinds(y); nested {
+				return "text"
+			}
+			return ""
+		}
+		if st := stringTypeName(e); st != "" {
+			return st
+		}
+		if t, ok := optimizer.ExprResultType(e); ok && !t.IsArray {
+			switch strings.ToLower(t.Name) {
+			case "int2", "int4", "int8", "smallint", "int", "integer", "bigint",
+				"numeric", "decimal", "date", "float4", "float8":
+				return "scalar"
+			}
+		}
+		return ""
+	}
+	lk, rk = kind(x.Left), kind(x.Right)
+	if lk == "" || rk == "" || (lk == "scalar" && rk == "scalar") {
+		return "", "", false
+	}
+	return lk, rk, true
+}
+
 // likeOperatorNames are the pg_operator spellings of the LIKE family
 // (textlike / bpcharlike / namelike and their negated and ILIKE
 // siblings), which ruleutils.c prints for the OpExpr the parser built.
@@ -4228,6 +4311,12 @@ var textOnlyFuncs = map[string]bool{
 func stringTypeName(e optimizer.Expr) string {
 	if f, ok := e.(*optimizer.FuncCall); ok && textOnlyFuncs[strings.ToLower(f.Name)] {
 		return "text"
+	}
+	if b, ok := e.(*optimizer.BinaryOp); ok {
+		// A text concatenation (textcat / textanycat) yields text.
+		if _, _, isCat := textConcatKinds(b); isCat {
+			return "text"
+		}
 	}
 	t, ok := optimizer.ExprResultType(e)
 	if !ok || t.IsArray {

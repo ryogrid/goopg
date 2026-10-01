@@ -130,3 +130,52 @@ Movement:
   ea-ratchet (10).
 
 Evidence: `analysis/m0146/m0146-0005/slice107/`.
+
+## Slice 108: M0146-0005dc — `||` and a target-list literal print as text
+
+TPC-DS Q80 unions three channel subqueries. Each arm has a literal channel
+name and an id built with `'store' || store_id`, and the union is grouped
+and sorted on both. PG prints:
+
+    Sort Key: ('store channel'::text), (('store'::text || (ssr.store_id)::text))
+
+goopg printed `('store channel'), (('store' || ssr.store_id))`. There
+are three PG rules involved:
+
+- **Concatenation is textcat / textanycat.** Both operands are text, so:
+  - a literal prints as its text Const;
+  - a char(n) or varchar operand shows its implicit `(x)::text`;
+  - a non-character scalar (int, numeric, date) shows the `::text` cast
+    that the inlined textanycat SQL function writes.
+
+  `formatTextConcatExpr` renders this, classifying operands with
+  `textConcatKinds`. Array, jsonb and bytea concatenation decline.
+  `stringTypeName` now types a text concatenation as text, so a literal
+  compared with one is coerced too (`= 'q'::text`).
+- **A target-list literal is text.** resolveTargetListUnknowns turns an
+  unknown output literal into text, so a key that is a literal prints
+  `'x'::text`. `formatKeyExprQual` applies this at the Sort, Group,
+  Hash and grouping-set key sites. Quals keep their own coercion path.
+- **An Append cannot project.** The Agg's group key above a UNION ALL is
+  an OUTER_VAR that resolves through the Append's first child's
+  targetlist, so a non-Var key prints parenthesized, as for Sort and
+  Gather. `keyChildPassesThrough` now admits a SetOp that renders as
+  (Merge) Append.
+
+Test: `explain_text_concat_test.go` has six cases, each with PG 18.3's
+output. All six fail without the change.
+
+Movement:
+
+- Typed literal keys in the TPC-DS captures go 0 → 21 of PG's 24 at both
+  scales.
+- Text-identical plans go 26 → 27 at SF0.25 (Q80). SF1 stays 16, though
+  aligned lines go 2018 → 2025.
+- Regress A/B over the ten cases whose expected output has `||` or
+  text-literal keys: no diff grew. In pg_lsn and window every moved line
+  now has PG's concat form.
+- CATEGORIES-EXCL-MATCH is unchanged.
+- Gates pass: units, spotcheck, sweep 96/96, arm, fire set (Q5 Q14 Q49
+  Q66 Q76 Q77 Q80) and ea-ratchet (10).
+
+Evidence: `analysis/m0146/m0146-0005/slice108/`.

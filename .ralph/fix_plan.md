@@ -23868,6 +23868,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005dc — `\|\|` and a target\-list literal print as text**
+  \(filed and landed 2026\-10\-02 from the text\-identity census: Q80 printed
+  `\('store channel'\), \(\('store' \|\| ssr\.store\_id\)\)` where PG prints the
+  `::text` forms\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 108\)\.** `formatTextConcatExpr` /
+    `textConcatKinds`, `formatKeyExprQual` at the four key sites, and
+    `keyChildPassesThrough` admits an Append\-rendered SetOp\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Slice 108"\.
+  - Test: `explain\_text\_concat\_test\.go` \(6 cases, PG 18\.3 text; all fail
+    on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(7
+    queries\), ea\-ratchet PASS \(10\); regress A/B 10 cases, no diff grew\.
+  Movement: yes — TPC-DS text-identical SF0.25 26 -> 27 (Q80), SF1 16 (aligned 2018 -> 2025); typed literal keys 0 -> 21/24; CATEGORIES-EXCL-MATCH unchanged (rendering 12 / 15)
 - [x] **M0146\-0005db — LIKE prints as its `\~\~` operator**
   \(filed and landed 2026\-10\-02 from the text\-identity census: Q91 printed
   `LIKE 'Unknown%'` where PG prints `\~\~ 'Unknown%'::text`\)\.
