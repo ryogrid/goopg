@@ -23868,6 +23868,21 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cw — an explicit cast prints as PG's coercion**
+  \(filed and landed 2026\-10\-02 from the census: goopg's CastExpr arm
+  printed only the operand; Q90 `\(amc / pmc\)` vs PG
+  `::numeric\(15,4\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 102\)\.** `CastExpr\.Explicit` \(set at the
+    parser\-cast resolve sites, carried by clones\); `explicitCastText`,
+    `castLiteralConstText`, `castTypeName` in operators\_explain\.go\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 102"\.
+  - Test `TestExplicitCastPrints` \(9 PG oracle lines\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress A/B, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS non-text cast tokens 41 -> 55/58 (SF0.25)
 - [x] **M0146\-0005cv — a scalar sublink's value has its subplan's type**
   \(filed and landed 2026\-10\-02 from the 0cu ledger row: PG
   `\(\(InitPlan 1\)\.col1\)::numeric`, goopg uncast\)\.

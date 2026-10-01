@@ -590,6 +590,11 @@ type CastExpr struct {
 	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
 	SourceType string // operand's declared type — used by executor to pick rounding mode. M0097-0003.
 	Typmod     int64  // optional precision/scale modifier (e.g., 4 for ::timetz(4)); 0 means no typmod.
+	// Explicit marks a cast written in the query (`x::t`, `CAST(x AS t)`),
+	// as opposed to one the planner inserted (set-operation column
+	// coercion, index-key alignment). EXPLAIN shows only explicit casts
+	// (ruleutils' COERCE_EXPLICIT_CAST) — M0146-0005cw.
+	Explicit bool
 }
 
 func (e *CastExpr) Pos() int { return e.pos }
@@ -610,6 +615,7 @@ func NewCastExprFromParser(x *parser.CastExpr, operand Expr) *CastExpr {
 		TargetType: typeName,
 		SourceType: exprType(operand).Name,
 		Typmod:     encodeTypmod(typeName, x.Typmods),
+		Explicit:   true,
 	}
 }
 

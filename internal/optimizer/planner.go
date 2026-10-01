@@ -6363,7 +6363,7 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: replaceExprNode(x.Operand, target, repl)}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *CollateExpr:
 		return &CollateExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), CollationName: x.CollationName}
 	case *CaseExpr:
@@ -10252,7 +10252,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		typmod := encodeTypmod(typeName, x.Typmods)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod, Explicit: true}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
@@ -10456,7 +10456,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		typmod := encodeTypmod(typeName, x.Typmods)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod, Explicit: true}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
 		if err != nil {
@@ -17508,7 +17508,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
 			}
 		}
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod, Explicit: true}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -18203,7 +18203,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			ResultType: x.ResultType,
 		}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex)}
 	case *FuncCall:
@@ -18437,7 +18437,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			ResultType: x.ResultType,
 		}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
 	case *FuncCall:

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -3578,6 +3579,11 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
 	case *optimizer.CastExpr:
+		if x.Explicit {
+			if txt, ok := explicitCastText(x, reg, qualify); ok {
+				return txt
+			}
+		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
 		// R66: renderer-synthesised Star/Distinct aggregate calls.
@@ -3981,6 +3987,17 @@ func coercibleLiteral(e optimizer.Expr) (optimizer.Expr, bool) {
 	switch x := e.(type) {
 	case *optimizer.IntegerConst, *optimizer.NumericConst, *optimizer.StringConst:
 		return e, true
+	case *optimizer.CastExpr:
+		// An explicit cast of a literal without a modifier is folded to a
+		// Const at parse time, and eval_const_expressions folds the
+		// operator's own coercion of it too (`n > cast(7 as bigint)` prints
+		// `'7'::numeric`), so it is coerced like the bare literal
+		// (M0146-0005cw).
+		if x.Explicit && x.Typmod == 0 {
+			if inner, ok := coercibleLiteral(x.Operand); ok {
+				return inner, true
+			}
+		}
 	case *optimizer.UnaryOp:
 		if x.Op != parser.OpUnaryNeg {
 			return nil, false
@@ -4075,6 +4092,11 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 	case "text":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
 			return "", quoteLiteral(c.Value) + "::text", true
+		}
+	case "date":
+		// date_in's canonical ISO text prints unchanged (M0146-0005cw).
+		if c, isStr := lit.(*optimizer.StringConst); isStr && isCanonicalISODate(c.Value) {
+			return "", quoteLiteral(c.Value) + "::date", true
 		}
 	case "varchar", "character varying":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
@@ -4224,6 +4246,132 @@ func numericKind(e optimizer.Expr) string {
 		return "numeric"
 	}
 	return ""
+}
+
+// explicitCastText is get_coercion_expr for a cast written in the query
+// (M0146-0005cw): a literal operand was folded into a Const of the target
+// type at parse time and prints as `'5'::numeric(15,4)`; any other operand
+// prints as `(arg)::type`, with format_type_with_typemod's name. A cast to
+// the operand's own type with no modifier is no node in PG (coerce_type
+// returns the input), so it prints nothing. ok is false for a target this
+// does not name, and the caller prints the operand as before.
+func explicitCastText(x *optimizer.CastExpr, reg *subPlanReg, qualify bool) (string, bool) {
+	typ, ok := castTypeName(x.TargetType, x.Typmod)
+	if !ok {
+		return "", false
+	}
+	if x.Typmod == 0 {
+		if src, ok := optimizer.ExprResultType(x.Operand); ok && !src.IsArray && len(src.Args) == 0 {
+			if same, ok2 := castTypeName(src.Name, 0); ok2 && same == typ {
+				return formatExprQual(x.Operand, reg, qualify), true
+			}
+		}
+	}
+	if lit, isLit := coercibleLiteral(x.Operand); isLit {
+		return castLiteralConstText(lit, strings.ToLower(x.TargetType), x.Typmod, typ)
+	}
+	return "(" + formatExprQual(x.Operand, reg, qualify) + ")::" + typ, true
+}
+
+// castLiteralConstText is get_const_expr for a literal parse analysis
+// folded into a Const of the cast's target type: int4 bare unless negative,
+// int8/int2 labelled, numeric rescaled to its typmod and printed bare when
+// it has a decimal point (labelled when it carries a typmod: `5.00::
+// numeric(10,2)`), anything else quoted and labelled.
+func castLiteralConstText(lit optimizer.Expr, target string, typmod int64, typ string) (string, bool) {
+	var v string
+	switch c := lit.(type) {
+	case *optimizer.IntegerConst:
+		v = strconv.FormatInt(c.Value, 10)
+	case *optimizer.NumericConst:
+		v = c.Value
+	case *optimizer.StringConst:
+		v = c.Value
+	}
+	switch target {
+	case "int", "int4", "integer":
+		if ic, ok := lit.(*optimizer.IntegerConst); ok {
+			return intConstText(ic.Value), true
+		}
+		return "", false
+	case "numeric", "decimal":
+		if _, isStr := lit.(*optimizer.StringConst); isStr {
+			return "", false
+		}
+		if typmod >= 1<<16 {
+			r, ok := new(big.Rat).SetString(v)
+			if !ok {
+				return "", false
+			}
+			v = r.FloatString(int(typmod & 0xffff))
+		}
+		if v != "" && v[0] >= '0' && v[0] <= '9' && strings.ContainsAny(v, ".eE") {
+			if typmod > 0 {
+				return v + "::" + typ, true
+			}
+			return v, true
+		}
+		return quoteLiteral(v) + "::" + typ, true
+	case "date":
+		if !isCanonicalISODate(v) {
+			return "", false
+		}
+	case "bool", "boolean":
+		return "", false
+	}
+	return quoteLiteral(v) + "::" + typ, true
+}
+
+// castTypeName is format_type_with_typemod's spelling for the cast targets
+// TPC-DS and the regress plans use. numeric's typmod is goopg's
+// encodeTypmod packing: precision<<16|scale, or a bare precision.
+func castTypeName(name string, typmod int64) (string, bool) {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		switch {
+		case typmod >= 1<<16:
+			return fmt.Sprintf("numeric(%d,%d)", typmod>>16, typmod&0xffff), true
+		case typmod > 0:
+			return fmt.Sprintf("numeric(%d)", typmod), true
+		}
+		return "numeric", true
+	case "varchar", "character varying":
+		if typmod > 0 {
+			return fmt.Sprintf("character varying(%d)", typmod), true
+		}
+		return "character varying", true
+	case "bpchar", "char", "character":
+		if typmod > 0 {
+			return fmt.Sprintf("character(%d)", typmod), true
+		}
+		return "bpchar", true
+	}
+	if typmod != 0 {
+		return "", false
+	}
+	switch strings.ToLower(name) {
+	case "int", "int4", "integer":
+		return "integer", true
+	case "int8", "bigint":
+		return "bigint", true
+	case "int2", "smallint":
+		return "smallint", true
+	case "float8", "double precision":
+		return "double precision", true
+	case "float4", "real":
+		return "real", true
+	case "text":
+		return "text", true
+	case "date":
+		return "date", true
+	case "bool", "boolean":
+		return "boolean", true
+	case "timestamp":
+		return "timestamp without time zone", true
+	case "timestamptz":
+		return "timestamp with time zone", true
+	}
+	return "", false
 }
 
 // numericConstText is get_const_expr's numeric arm: a value that starts

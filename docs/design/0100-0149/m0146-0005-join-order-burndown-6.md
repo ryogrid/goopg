@@ -632,3 +632,50 @@ scale) or on the subselect / aggregates / join regress cases. The rule is
 PG's and is pinned by the test.
 
 Evidence: `analysis/m0146/m0146-0005/slice101/`.
+
+## Slice 102: M0146-0005cw — an explicit cast prints as PG's coercion
+
+A cast written in the query is a COERCE_EXPLICIT_CAST node, which ruleutils
+always shows through get_coercion_expr as `(arg)::type`, using
+format_type_with_typemod's name:
+`((a)::numeric(15,4) / (n)::numeric(15,4))`, `(((n / '50'::numeric))::integer`.
+goopg's CastExpr arm printed only the operand. CastExpr could not tell a
+written cast from one the planner inserts (set-operation coercion,
+index-key alignment), which PG never shows.
+
+- `CastExpr.Explicit` is set where a parser cast is resolved: the
+  after-aggregate, after-window and main resolve arms, and
+  NewCastExprFromParser. Every clone carries it.
+- `explicitCastText` handles three cases:
+  - a cast of a literal is the Const parse analysis folds it into, printed
+    by `castLiteralConstText` with get_const_expr's rules (int4 bare,
+    int8/int2 labelled, numeric rescaled to its typmod and printed bare with
+    the label, e.g. `5.00::numeric(10,2)`, everything else quoted and
+    labelled);
+  - a cast to the operand's own type without a modifier prints nothing,
+    since coerce_type returns its input;
+  - anything else prints `(arg)::type`.
+
+  `castTypeName` spells numeric/varchar/bpchar with typmods and the common
+  scalar types.
+- `coercibleLiteral` treats a modifier-free explicit cast of a literal as
+  that literal. eval_const_expressions folds the operator's coercion of it
+  too, so `n > cast(7 as bigint)` prints `'7'::numeric`.
+- A string literal against a date column prints `'…'::date` (canonical ISO
+  text only).
+
+Test: `TestExplicitCastPrints` (9 PG 18.3 oracle lines; 5 fail with the
+arm disabled, the others pin the folding rules).
+
+Movement:
+
+- TPC-DS non-text cast / typed-constant tokens go 41 → 55 of PG's 58
+  (SF0.25). The only goopg-only cast is still Q67's (slice 100).
+- Q90's sort key now carries `::numeric(15,4)`. What is left there is the
+  chase of `amc`/`pmc` through the cross-joined subqueries to `(count(*))`.
+- Text-identical counts are unchanged (20 / 12). Regress A/B over 13
+  cases is flat.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice102/`.
