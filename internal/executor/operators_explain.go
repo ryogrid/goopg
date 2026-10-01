@@ -3505,6 +3505,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if l, r, ok := formatCoercedLiteralOperands(x, reg, qualify); ok {
 			return "(" + l + " " + x.Op.String() + " " + r + ")"
 		}
+		if l, r, ok := formatTextCastOperands(x, reg, qualify); ok {
+			return "(" + l + " " + x.Op.String() + " " + r + ")"
+		}
 		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
 	case *optimizer.UnaryOp:
 		// M0146-0005ch: negate_clause pushes NOT into a literal-list
@@ -3532,6 +3535,12 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
 			args[i] = formatExprQual(a, reg, qualify)
+			// M0146-0005cn: a text-only function's string argument is
+			// coerced to text, and get_func_expr shows argument coercions
+			// (`substr((ca_zip)::text, 1, 5)`, `upper((ca_country)::text)`).
+			if i == 0 && textOnlyFuncs[strings.ToLower(x.Name)] && isCharOrVarchar(a) {
+				args[i] = "(" + args[i] + ")::text"
+			}
 		}
 		if x.Distinct {
 			return x.Name + "(DISTINCT " + strings.Join(args, ", ") + ")"
@@ -3942,6 +3951,11 @@ func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualif
 		return "", "", false
 	}
 	t, ok := optimizer.ExprResultType(other)
+	if !ok && stringTypeName(other) == "text" {
+		// A text-only function over a char(n) / varchar argument, which
+		// pg_proc lookup cannot type without the implicit cast.
+		t, ok = catalog.Type{Name: "text"}, true
+	}
 	if !ok || t.IsArray {
 		return "", "", false
 	}
@@ -3995,6 +4009,70 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 		}
 	}
 	return "", "", false
+}
+
+// textOnlyFuncs take their first argument as text only (pg_proc has no
+// bpchar or varchar overload), so a char(n) / varchar argument reaches them
+// through an implicit cast that EXPLAIN shows.
+var textOnlyFuncs = map[string]bool{
+	"substr": true, "substring": true, "upper": true, "lower": true, "initcap": true,
+}
+
+// stringTypeName classifies e's static type as "varchar", "bpchar" or
+// "text" ("" for anything else or an unresolvable type).
+func stringTypeName(e optimizer.Expr) string {
+	if f, ok := e.(*optimizer.FuncCall); ok && textOnlyFuncs[strings.ToLower(f.Name)] {
+		return "text"
+	}
+	t, ok := optimizer.ExprResultType(e)
+	if !ok || t.IsArray {
+		return ""
+	}
+	switch strings.ToLower(t.Name) {
+	case "varchar", "character varying":
+		return "varchar"
+	case "text":
+		return "text"
+	case "bpchar":
+		return "bpchar"
+	case "char", "character":
+		if len(t.Args) > 0 {
+			return "bpchar"
+		}
+	}
+	return ""
+}
+
+func isCharOrVarchar(e optimizer.Expr) bool {
+	k := stringTypeName(e)
+	return k == "varchar" || k == "bpchar"
+}
+
+// formatTextCastOperands renders a comparison between string operands the
+// way make_op resolves it: varchar has no operators of its own, so a
+// varchar operand against a varchar or text one is compared as text and
+// shows its RelabelType (`((ss1.ca_county)::text = (ws2.ca_county)::text)`;
+// get_oper_expr deparses operator arguments with showimplicit). char(n)
+// against char(n) keeps bpchar's own operators and is left alone.
+func formatTextCastOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, string, bool) {
+	switch x.Op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+	default:
+		return "", "", false
+	}
+	lk, rk := stringTypeName(x.Left), stringTypeName(x.Right)
+	if lk == "" || rk == "" || lk == "bpchar" || rk == "bpchar" || (lk == "text" && rk == "text") {
+		return "", "", false
+	}
+	l := formatExprQual(x.Left, reg, qualify)
+	r := formatExprQual(x.Right, reg, qualify)
+	if lk == "varchar" {
+		l = "(" + l + ")::text"
+	}
+	if rk == "varchar" {
+		r = "(" + r + ")::text"
+	}
+	return l, r, true
 }
 
 // numericConstText is get_const_expr's numeric arm: a value that starts

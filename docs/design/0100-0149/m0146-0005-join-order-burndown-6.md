@@ -312,3 +312,48 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice92/`.
+
+## Slice 93: M0146-0005cn — string operands show their text coercion
+
+varchar has no comparison operators of its own, and substr / upper /
+lower / initcap take text only. Parse analysis therefore coerces a varchar
+operand, or a char(n) / varchar argument, to text. get_oper_expr and
+get_func_expr deparse their arguments with showimplicit, so EXPLAIN shows
+the coercion:
+
+- `((ss1.ca_county)::text = (ws2.ca_county)::text)`;
+- `substr((ca_zip)::text, 1, 5)`;
+- `((c_birth_country)::text <> upper((ca_country)::text))`.
+
+goopg printed the bare columns. Slice 88 had covered only the varchar
+column against a literal: 19 of PG's 73 `(x)::text` over TPC-DS.
+
+- `formatTextCastOperands` handles a comparison whose operands are
+  varchar/text (at least one varchar): each varchar side takes `::text`.
+  char(n) against char(n) keeps bpchar's operators and is left alone.
+- The FuncCall arm casts a char(n) / varchar first argument of a
+  `textOnlyFuncs` function.
+- `stringTypeName` classifies operands, and treats a text-only function's
+  result as text when pg_proc lookup cannot type it (`substr(char, …)`).
+  The literal-coercion path uses the same fallback, so
+  `substr((b)::text, 1, 2) = 'ab'::text`.
+
+Test: `TestStringOperandsShowTextCast` (6 PG 18.3 oracle lines; 5 fail with
+the casts disabled, the char(n) join pins the no-cast case). The plain
+`b = b` probe was dropped: PG rewrites it to `b IS NOT NULL`.
+
+Movement:
+
+- TPC-DS `(x)::text` casts: 19 → 57 of PG's 73 at both scales. No cast
+  goopg prints is missing from PG's plan for the same query.
+- Aligned identical lines go 1941 → 1952 and 1918 → 1929. Text-identical
+  plans stay at 13 / 9.
+- Regress, same-order A/B: 57036 → 57026.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered): `||` operands (Q5/Q80 `(ssr.store_id)::text`), and varchar
+columns read through CTE / subquery outputs whose type goopg does not carry
+as varchar (Q47/Q57).
+
+Evidence: `analysis/m0146/m0146-0005/slice93/`.
