@@ -83,3 +83,50 @@ Movement:
   and ea-ratchet (10).
 
 Evidence: `analysis/m0146/m0146-0005/slice106/`.
+
+## Slice 107: M0146-0005db — LIKE prints as its `~~` operator
+
+PG's parser turns `x LIKE 'p'` into an OpExpr on the `~~` operator family:
+
+| SQL | operator |
+|---|---|
+| LIKE | `~~` |
+| NOT LIKE | `!~~` |
+| ILIKE | `~~*` |
+| NOT ILIKE | `!~~*` |
+
+The left operand picks the implementation: textlike, bpcharlike or
+namelike. The pattern is always text. ruleutils deparses the operator
+symbol and the text Const make_op coerced the pattern to:
+`(hd_buy_potential ~~ 'Unknown%'::text)`. goopg printed the SQL keyword
+and the bare literal (`LIKE 'Unknown%'`), which affected TPC-DS Q91 and
+four regress cases.
+
+- `formatLikeOpExpr` renders the family with PG's operator names:
+  - A string-literal operand prints as `'…'::text`.
+  - A varchar operand on either side shows its implicit `(x)::text`.
+  - bpchar and name operands print bare, since they have their own
+    left-operand implementations.
+- A pattern with an ESCAPE clause declines and keeps the old text. PG
+  folds `like_escape()` into the pattern Const (`'a\%'::text`), which is
+  ledgered.
+
+Test: `explain_like_op_test.go` has nine cases (char, text, varchar,
+name, negated, ILIKE, column pattern, function operand), each with PG
+18.3's output.
+
+Movement:
+
+- TPC-DS LIKE lines go 1 → 0 (now `~~`) at both scales.
+- Text-identical plans go 15 → 16 at SF1 (Q91). At SF0.25 they stay 26,
+  because Q91 there still differs by its Join Filter operand order.
+- Regress A/B over btree_index, partition_prune, rowsecurity and
+  select_parallel:
+  - btree_index: the diff goes 500 → 491 lines.
+  - partition_prune and rowsecurity: the LIKE lines now print PG's text,
+    and nothing else moved.
+- CATEGORIES-EXCL-MATCH is unchanged.
+- Gates pass: units, spotcheck, sweep 96/96, arm, fire set (Q91) and
+  ea-ratchet (10).
+
+Evidence: `analysis/m0146/m0146-0005/slice107/`.

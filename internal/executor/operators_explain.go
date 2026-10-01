@@ -3614,6 +3614,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			}
 			return "(" + strings.Join(parts, " "+x.Op.String()+" ") + ")"
 		}
+		if s, ok := formatLikeOpExpr(x, reg, qualify); ok {
+			return s
+		}
 		if l, r, ok := formatCoercedLiteralOperands(x, reg, qualify); ok {
 			return "(" + l + " " + x.Op.String() + " " + r + ")"
 		}
@@ -4172,6 +4175,45 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 		}
 	}
 	return "", "", false
+}
+
+// likeOperatorNames are the pg_operator spellings of the LIKE family
+// (textlike / bpcharlike / namelike and their negated and ILIKE
+// siblings), which ruleutils.c prints for the OpExpr the parser built.
+var likeOperatorNames = map[parser.OpCode]string{
+	parser.OpLike:     "~~",
+	parser.OpNotLike:  "!~~",
+	parser.OpILike:    "~~*",
+	parser.OpNotILike: "!~~*",
+}
+
+// formatLikeOpExpr renders a LIKE-family comparison the way PG deparses
+// its OpExpr (M0146-0005db): `(c ~~ 'Unknown%'::text)`. Every operator of
+// the family takes its pattern as text, so a literal pattern prints as the
+// text Const make_op coerced it to, and a varchar operand on either side
+// shows its implicit cast to text (bpchar and name have their own
+// bpcharlike / namelike left operands and print bare). A pattern with an
+// ESCAPE clause declines: PG folds like_escape() into the Const, which
+// this renderer does not reproduce.
+func formatLikeOpExpr(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, bool) {
+	op, ok := likeOperatorNames[x.Op]
+	if !ok {
+		return "", false
+	}
+	if _, esc := x.Right.(*optimizer.LikeEscapePattern); esc {
+		return "", false
+	}
+	side := func(e optimizer.Expr) string {
+		if c, isStr := e.(*optimizer.StringConst); isStr {
+			return quoteLiteral(c.Value) + "::text"
+		}
+		s := formatExprQual(e, reg, qualify)
+		if stringTypeName(e) == "varchar" {
+			s = "(" + s + ")::text"
+		}
+		return s
+	}
+	return "(" + side(x.Left) + " " + op + " " + side(x.Right) + ")", true
 }
 
 // textOnlyFuncs take their first argument as text only (pg_proc has no
