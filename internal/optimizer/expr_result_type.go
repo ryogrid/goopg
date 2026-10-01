@@ -76,6 +76,18 @@ func ExprResultType(e Expr) (catalog.Type, bool) {
 		return catalog.Type{Name: strings.ToLower(x.Type)}, true
 	case *IntervalLit:
 		return catalog.Type{Name: "interval"}, true
+	case *SubqueryExpr:
+		// A scalar sublink's value is its subplan's single output column
+		// (exprType of a SubLink / Param is the first target's type), e.g.
+		// the bigint of `(SELECT sum(int_col) …)` — M0146-0005cv.
+		if x.Plan == nil {
+			return catalog.Type{}, false
+		}
+		out := x.Plan.Output()
+		if len(out) != 1 || out[0].Type.Name == "" {
+			return catalog.Type{}, false
+		}
+		return out[0].Type, true
 	case *ExtractExpr:
 		// PG 14+ returns numeric from EXTRACT (float8 before that).
 		return catalog.Type{Name: "numeric"}, true

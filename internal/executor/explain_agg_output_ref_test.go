@@ -65,10 +65,10 @@ func TestExplainHavingFilterExpandsAggOutput(t *testing.T) {
 	// binary-op arg carries its own parens from the BinaryOp arm, so the
 	// expansion is byte-identical to PG's `sum((…))` shape.
 	// PG 18.3 coerces the int operand to numeric and shows it
-	// (`(r65h.availqty)::numeric`, M0146-0005cu); it also casts the
-	// bigint InitPlan result, `((InitPlan 1).col1)::numeric`, which goopg
-	// does not type yet (ledgered), so only the left side is pinned.
-	if !strings.Contains(joined, "Filter: (sum((r65h.supplycost * (r65h.availqty)::numeric)) > ") || !strings.Contains(joined, "(InitPlan 1).col1") {
+	// (`(r65h.availqty)::numeric`, M0146-0005cu), and casts the bigint
+	// InitPlan result the same way (`((InitPlan 1).col1)::numeric`,
+	// M0146-0005cv).
+	if !strings.Contains(joined, "Filter: (sum((r65h.supplycost * (r65h.availqty)::numeric)) > ((InitPlan 1).col1)::numeric)") {
 		t.Errorf("expected expanded Filter with .col1; got:\n%s", joined)
 	}
 	if !strings.Contains(joined, "Sort Key: (sum((r65h.supplycost * (r65h.availqty)::numeric))) DESC") {

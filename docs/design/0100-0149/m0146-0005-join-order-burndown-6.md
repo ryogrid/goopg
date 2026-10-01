@@ -607,3 +607,28 @@ Left (ledgered): the cast on a non-literal whose type ExprResultType cannot
 resolve, such as `((InitPlan 1).col1)::numeric` (a bigint InitPlan result).
 
 Evidence: `analysis/m0146/m0146-0005/slice100/`.
+
+## Slice 101: M0146-0005cv — a scalar sublink's value has its subplan's type
+
+`ExprResultType` declined a SubqueryExpr. Slice 100's numeric promotion
+therefore could not see that `(SELECT sum(int_col) …)` is bigint, and
+printed `> (InitPlan 1).col1` where PG prints
+`> ((InitPlan 1).col1)::numeric`.
+
+- `ExprResultType` types a SubqueryExpr by its subplan's single output
+  column, as exprType does for a SubLink or its Param. The other callers
+  are unaffected:
+  - the min/max const-arg branch admits only `isConstantExpr` arguments;
+  - the index-key callers cannot hold a sublink.
+
+Test: `TestExplainHavingFilterExpandsAggOutput` now pins PG 18.3's whole
+line, `Filter: (sum((r65h.supplycost * (r65h.availqty)::numeric)) >
+((InitPlan 1).col1)::numeric)`. It fails with the case disabled. The probe
+(`slice101/probe.sql`) also matches PG on an avg (numeric) and a max (int)
+InitPlan.
+
+Movement: none on TPC-DS (the fire set shows no changed plan at either
+scale) or on the subselect / aggregates / join regress cases. The rule is
+PG's and is pinned by the test.
+
+Evidence: `analysis/m0146/m0146-0005/slice101/`.
