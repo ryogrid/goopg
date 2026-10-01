@@ -1,6 +1,11 @@
 package optimizer
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // M0077-0001 (Slice A): relation-local predicate
 // partition + leaf-local rebasing.
@@ -99,7 +104,58 @@ func partitionConjunctsForJoinPlanning(
 		}
 		locals.byBinding[bidx] = append(locals.byBinding[bidx], c)
 	}
+	for b, cs := range locals.byBinding {
+		locals.byBinding[b] = equivalenceClausesLast(cs)
+	}
 	return joinConjuncts, locals
+}
+
+// equivalenceClausesLast reorders one relation's restriction list the way
+// PG's baserestrictinfo comes out (M0146-0005co). distribute_qual_to_rels
+// keeps an equality that process_equivalence accepts (`t_hour = 8`, or two
+// columns of the relation equated) out of the list, and
+// generate_base_implied_equalities appends it back after every other qual;
+// order_qual_clauses' stable cost sort leaves that order alone when the
+// costs tie. So `t_hour = 8 AND t_minute >= 30` filters as
+// `(t_minute >= 30) AND (t_hour = 8)`. The partition is stable; the cost
+// sort for unequal costs is not modelled.
+func equivalenceClausesLast(cs []Expr) []Expr {
+	if len(cs) < 2 {
+		return cs
+	}
+	var rest, ec []Expr
+	for _, c := range cs {
+		if isEquivalenceClause(c) {
+			ec = append(ec, c)
+		} else {
+			rest = append(rest, c)
+		}
+	}
+	out := append(rest, ec...)
+	// order_qual_clauses: a stable sort by per-tuple evaluation cost
+	// (qualEvalOps, cost_qual_eval's count), so a cheap equality still
+	// precedes a costlier OR or IN list.
+	cost := make(map[Expr]float64, len(out))
+	for _, c := range out {
+		_, cost[c] = qualEvalOps(c)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return cost[out[i]] < cost[out[j]] })
+	return out
+}
+
+// isEquivalenceClause reports whether c is an `=` whose two sides are a
+// column and a constant, or two columns — the shape process_equivalence
+// turns into an EquivalenceClass member pair. Written as type assertions
+// (no new Expr switch site for the walker census).
+func isEquivalenceClause(c Expr) bool {
+	b, ok := c.(*BinaryOp)
+	if !ok || b.Op != parser.OpEq {
+		return false
+	}
+	lc, rc := isPlainConstantBound(b.Left), isPlainConstantBound(b.Right)
+	_, lcol := b.Left.(*ColumnRef)
+	_, rcol := b.Right.(*ColumnRef)
+	return (lcol && (rc || rcol)) || (rcol && lc)
 }
 
 // conjunctIsLocalEligible reports whether the expression

@@ -357,3 +357,54 @@ columns read through CTE / subquery outputs whose type goopg does not carry
 as varchar (Q47/Q57).
 
 Evidence: `analysis/m0146/m0146-0005/slice93/`.
+
+## Slice 94: M0146-0005co — a scan's restriction list follows PG's order
+
+PG builds a relation's baserestrictinfo in two passes:
+
+- distribute_qual_to_rels adds every qual except the equalities
+  process_equivalence absorbs into an EquivalenceClass (`col = const`, or
+  two columns of the relation);
+- generate_base_implied_equalities appends those afterwards.
+
+order_qual_clauses then stable-sorts the list by per-tuple cost. So
+`t_hour = 8 AND t_minute >= 30` filters as
+`((t_minute >= 30) AND (t_hour = 8))`, while `a = 1 AND (b = 2 OR b = 3)`
+keeps the cheap equality ahead of the three-operator OR. goopg kept the
+written order. This was the largest remaining text gap in the TPC-DS
+MATCH plans (Q74/Q88/Q96, 10 Filter lines).
+
+- `equivalenceClausesLast` (local_filters.go) reorders each relation's
+  local conjuncts in `partitionConjunctsForJoinPlanning`:
+  - `isEquivalenceClause` arms (an `=` between a column and a plain
+    constant, or two columns; type assertions only, no new walker switch)
+    move after the rest;
+  - a stable sort by `qualEvalOps`' per-tuple cost follows.
+
+  This is a plan change, not a rendering one: the scan evaluates its quals
+  in the printed order, as PG's does.
+
+Test: `TestRestrictionQualOrder` (6 PG 18.3 oracle lines; 5 fail with the
+reorder disabled).
+
+Movement:
+
+- TPC-DS text-identical plans go 13 → 14 at SF0.25 (Q96) and 9 → 11 at SF1
+  (Q88, Q96). Aligned identical lines go 1952 → 1963 and 1929 → 1941.
+- The plan-parity classification is identical before and after at both
+  scales, and the TPC-H census is unchanged (11/22 match, same categories).
+- Regress, same-order A/B over 21 cases: 63877 → 63865.
+  - In join.sql a whole hunk now matches.
+  - create_index's Recheck / Filter lines take PG's
+    `(hundred = 42) AND (…OR…)` order.
+  - One create_index plan moves from a Parallel Seq Scan to an Index Scan
+    on the cheaper ANY. PG plans an Index Only Scan with both quals; goopg
+    diverged before and after.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set, TPC-H census
+  and ea-ratchet (10) pass.
+
+Left (ledgered): EC creation order among several EC equalities (Q31's
+`d_year` before `d_qoy`), joins' Join Filter clause order (Q8/Q31/Q74),
+and qualEvalOps' cast and sublink costs.
+
+Evidence: `analysis/m0146/m0146-0005/slice94/`.
