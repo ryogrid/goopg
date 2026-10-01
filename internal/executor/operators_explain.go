@@ -5463,7 +5463,17 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			if alias == "" {
 				alias = p.Name
 			}
+			if dname := nm.disambiguatedName(n); dname != "" {
+				alias = dname
+			}
 			return "Subquery Scan on " + alias
+		}
+		// M0146-0005cp: a CTE referenced twice without aliases is two
+		// range-table entries named after the CTE, so set_rtable_names
+		// suffixes the later one (`CTE Scan on ssales ssales_1`, TPC-DS
+		// Q24), as it does for a table scanned twice.
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return "CTE Scan on " + scanTargetRef(p.Name, dname)
 		}
 		// Mirrors upstream's "CTE Scan on <name>" label; the
 		// alias is rendered separately when distinct so output

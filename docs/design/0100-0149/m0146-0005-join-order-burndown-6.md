@@ -408,3 +408,40 @@ Left (ledgered): EC creation order among several EC equalities (Q31's
 and qualEvalOps' cast and sublink costs.
 
 Evidence: `analysis/m0146/m0146-0005/slice94/`.
+
+## Slice 95: M0146-0005cp — a repeated CTE reference takes its `_N` suffix
+
+A CTE referenced twice without aliases is two range-table entries sharing
+one name. set_rtable_names suffixes the later one, so PG prints
+`CTE Scan on ssales` and `CTE Scan on ssales ssales_1` (TPC-DS Q24). goopg
+already computed the disambiguated name in `explainNames.nodeLabels` and
+used it for table scans, but the CTE Scan arm never consulted it.
+
+- The CTE Scan arm, and the inlined-CTE `Subquery Scan` arm, print
+  `disambiguatedName` when one is assigned.
+- The first attempt suffixed the outer reference of a recursive CTE.
+  goopg numbers the CTE body, with its WorkTable self-reference, before
+  the outer query, so the self-reference claimed the bare name. PG names
+  the outer reference first (`CTE Scan on x`,
+  `WorkTable Scan on x x_1`). The label pass in `explain_names.go` now
+  skips recursive self-references, so the outer scan keeps the bare name.
+  The working table's own `_1` is ledgered.
+
+Test: `TestRepeatedCTEReferenceTakesSuffix` (PG 18.3 oracle
+`CTE Scan on c` / `CTE Scan on c c_1`; fails with the arm disabled). The
+regress A/B caught the recursive-CTE regression before commit
+(subselect.sql); after the fix the 8-case A/B is neutral.
+
+Movement:
+
+- The CTE Scan labels of every fired TPC-DS query (Q2/Q14/Q23/Q24/Q59/Q95)
+  equal PG's at both scales.
+- Text-identical plans go 14 → 15 at SF0.25 (Q24).
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered): the recursive working table's `x_1`, and the
+`(x)::numeric` cast PG shows comparing an int column with a numeric
+InitPlan result.
+
+Evidence: `analysis/m0146/m0146-0005/slice95/`.

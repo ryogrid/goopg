@@ -367,6 +367,14 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			continue
 		}
 		labelSeen[ptr] = true
+		// A recursive CTE's self-reference sits in the CTE body, which goopg
+		// numbers before the outer query; PG names the outer reference first
+		// (`CTE Scan on x`, then `WorkTable Scan on x x_1`). Letting the
+		// working table claim first would suffix the outer scan instead, so
+		// it claims nothing here (M0146-0005cp; its own `_1` is ledgered).
+		if cs, ok := e.node.(*optimizer.CTEScan); ok && isRecursiveSelfRef(cs) {
+			continue
+		}
 		if name := claimName(labelTaken, e.base); name != e.base {
 			nm.nodeLabels[ptr] = name
 		}
