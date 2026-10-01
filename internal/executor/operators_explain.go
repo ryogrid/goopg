@@ -3562,6 +3562,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if l, r, ok := formatTextCastOperands(x, reg, qualify); ok {
 			return "(" + l + " " + x.Op.String() + " " + r + ")"
 		}
+		if l, r, ok := formatNumericPromotedOperands(x, reg, qualify); ok {
+			return "(" + l + " " + x.Op.String() + " " + r + ")"
+		}
 		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
 	case *optimizer.UnaryOp:
 		// M0146-0005ch: negate_clause pushes NOT into a literal-list
@@ -4169,6 +4172,56 @@ func nullConstTypeLabel(t catalog.Type) string {
 		return "double precision"
 	case "date":
 		return "date"
+	}
+	return ""
+}
+
+// formatNumericPromotedOperands renders a comparison or arithmetic operator
+// between an integer operand and a numeric one the way make_op resolves it:
+// there are no mixed integer/numeric operators, so the integer side is
+// coerced to numeric (int4_numeric), and get_oper_expr shows the coercion
+// (`((ss_quantity)::numeric * ss_sales_price)`, TPC-DS Q14/Q23/Q54). A
+// literal operand is formatCoercedLiteralOperands' case and never reaches
+// here (M0146-0005cu).
+func formatNumericPromotedOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, string, bool) {
+	switch x.Op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe,
+		parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv:
+	default:
+		return "", "", false
+	}
+	if _, lit := coercibleLiteral(x.Left); lit {
+		return "", "", false
+	}
+	if _, lit := coercibleLiteral(x.Right); lit {
+		return "", "", false
+	}
+	lk, rk := numericKind(x.Left), numericKind(x.Right)
+	if !((lk == "int" && rk == "numeric") || (lk == "numeric" && rk == "int")) {
+		return "", "", false
+	}
+	l := formatExprQual(x.Left, reg, qualify)
+	r := formatExprQual(x.Right, reg, qualify)
+	if lk == "int" {
+		l = "(" + l + ")::numeric"
+	} else {
+		r = "(" + r + ")::numeric"
+	}
+	return l, r, true
+}
+
+// numericKind classifies e's static type as "int" (int2/int4/int8),
+// "numeric", or "" for anything else or an unresolvable type.
+func numericKind(e optimizer.Expr) string {
+	t, ok := optimizer.ExprResultType(e)
+	if !ok || t.IsArray {
+		return ""
+	}
+	switch strings.ToLower(t.Name) {
+	case "int", "integer", "int4", "int2", "smallint", "int8", "bigint":
+		return "int"
+	case "numeric", "decimal":
+		return "numeric"
 	}
 	return ""
 }

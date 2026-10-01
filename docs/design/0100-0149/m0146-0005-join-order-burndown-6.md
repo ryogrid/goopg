@@ -572,3 +572,38 @@ Movement:
   nightly batch) and ea-ratchet (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice99/`.
+
+## Slice 100: M0146-0005cu — an integer operand against a numeric one shows its numeric cast
+
+There are no mixed integer/numeric operators. make_op coerces the integer
+operand to numeric (int4_numeric), and get_oper_expr shows the coercion
+because operator arguments deparse with showimplicit:
+`sum((ss_sales_price * (ss_quantity)::numeric))`, `(n = (a)::numeric)`,
+`(((a - b))::numeric < n)`. goopg printed the bare integer operand. Over
+TPC-DS (Q14/Q23/Q93 …) PG prints 18 such casts and goopg printed 3.
+
+- `formatNumericPromotedOperands` handles comparison and arithmetic
+  operators whose operands are integer (int2/int4/int8) and numeric, with
+  neither a literal (literals are slice 88's coercion). The integer side
+  prints `(…)::numeric`. `numericKind` classifies by ExprResultType.
+
+Test: `TestIntegerOperandPromotedToNumeric` (5 PG 18.3 oracle lines; 4 fail
+with the arm disabled, the int-vs-int case pins no cast).
+`TestExplainHavingFilterExpandsAggOutput` now expects PG's
+`(r65h.availqty)::numeric`.
+
+Movement:
+
+- TPC-DS `)::numeric` casts go 3 → 15 of PG's 18 at both scales.
+- Text-identical plans go 19 → 20 at SF0.25 (Q93).
+- The one query where goopg prints more casts than PG is Q67, where goopg
+  chases a window key into the aggregate PG prints as `dw1.sumsales` (the
+  ledgered subquery-alias window-key gap). The cast itself is PG's.
+- Regress A/B over 9 cases is flat (join.sql row flap).
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered): the cast on a non-literal whose type ExprResultType cannot
+resolve, such as `((InitPlan 1).col1)::numeric` (a bigint InitPlan result).
+
+Evidence: `analysis/m0146/m0146-0005/slice100/`.
