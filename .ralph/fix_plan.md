@@ -23858,6 +23858,22 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005ck — a hash join prints its Hash node**
+  \(filed and landed 2026\-10\-01 from the census: goopg printed none of
+  PG's 241 `\->  Hash` lines over TPC\-DS SF0\.25\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 90\)\.** `hashBuildChild` / `hashNodeCost` /
+    `emitHashNodeLine` / `hashNodeJSON` in operators\_explain\.go, wired
+    into the text, text ANALYZE, JSON and JSON ANALYZE renderers; the
+    Buckets line moves under the Hash node\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 90"\.
+  - Tests `TestHashJoinPrintsHashNode`, `TestHashJoinJSONPrintsHashNode`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    \(all queries fire, about 70 minutes\), regress 12\-case A/B, ea\-ratchet
+    PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; the classifier strips Hash nodes); TPC-DS plans text-identical to PG with costs ignored 1 -> 8 (SF0.25), 1 -> 5 (SF1); regress 12-case total 47737 -> 47567
 - [x] **M0146\-0005cj — a Sort key over a WindowAgg prints its window function**
   \(filed and landed 2026\-10\-01 from the 0cg ledger row: goopg printed
   `\(\(\(sum \* 100\) / sum\)\)`, PG `sum\(\(sum\(x\)\)\) OVER w1` inside the key\)\.

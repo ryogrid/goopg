@@ -168,3 +168,57 @@ reached through other nodes (Filter, Subquery Scan), Group Key / Window
 lines that read window results, and the missing `Parallel Hash` node line.
 
 Evidence: `analysis/m0146/m0146-0005/slice89/`.
+
+## Slice 90: M0146-0005ck — a hash join prints its Hash node
+
+PG's create_hashjoin_plan puts a Hash node (Parallel Hash for a
+parallel_hash join) over the build input, so every hash join prints
+`->  Hash` between the join and its inner scan. goopg's join operator
+builds the table itself and had no such node. EXPLAIN printed the inner
+scan directly under the join: 0 of PG's 241 Hash lines over TPC-DS SF0.25
+appeared. The plan-parity classifier strips PG's Hash nodes, so this never
+showed in its counts, but no TPC-DS plan with a hash join could match PG's
+text.
+
+- `hashBuildChild` names the build side (`Right`, or `Left` under
+  BuildLeft) and the node label. Every renderer synthesises the node over
+  that child:
+  - the text walker (`emitHashNodeLine`);
+  - the text ANALYZE walker, which states the input's actual rows and loops
+    and its total time at both ends;
+  - FORMAT JSON plain and ANALYZE (`hashNodeJSON`).
+- The Hash node's estimate is create_hashjoin_plan's: the input's rows and
+  width, with startup = total = the input's total cost. `hashNodeCost`
+  reads it through Project wrappers, the node the input's own line prints.
+- ANALYZE's hash-table line (`Buckets: …`) moves from the join to the Hash
+  node, where show_hash_info prints it.
+
+Tests: `TestHashJoinPrintsHashNode` (PG 18.3's COSTS OFF block
+byte-for-byte, the cost identity, and the ANALYZE Buckets placement) and
+`TestHashJoinJSONPrintsHashNode`.
+
+Movement:
+
+- TPC-DS plans whose text equals PG's with costs ignored: 1 → 8 at SF0.25
+  (Q9 Q12 Q18 Q20 Q22 Q84 Q97 Q98) and 1 → 5 at SF1.
+- goopg now prints 270 Hash lines to PG's 241 (SF0.25), because it chooses
+  more hash joins. The classifier counts are unchanged.
+- Regress, same-order A/B over 12 cases: 47737 → 47567 lines. join_hash
+  goes 1022 → 899 and partition_join 6381 → 6293. In join, subselect and
+  inherit the new lines sit in hunks where goopg already chose a different
+  plan.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set (all queries
+  fire; it ran about 70 minutes) and ea-ratchet (10) pass.
+
+Left (ledgered):
+
+- a BuildLeft join still prints its build side first, where PG's plan has
+  it as the second child;
+- the Hash node's ANALYZE actual time is approximated from the input's
+  total;
+- ANALYZE still reports the build input as `rows=0 loops=0` (the existing
+  M0145-0030 row);
+- the JSON Hash object lacks PG's other per-node properties (goopg's JSON
+  carries none of them).
+
+Evidence: `analysis/m0146/m0146-0005/slice90/`.

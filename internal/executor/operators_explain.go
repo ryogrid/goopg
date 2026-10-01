@@ -607,8 +607,99 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 				continue
 			}
 		}
-		walkPlanFiltered(c, childIndent, rows, opts, nil, nil, reg)
+		ci := childIndent
+		if lbl, ok := hashBuildChild(n, c); ok {
+			ci = emitHashNodeLine(rows, lbl, childIndent, c, showCosts, nil)
+		}
+		walkPlanFiltered(c, ci, rows, opts, nil, nil, reg)
 	}
+}
+
+// hashBuildChild reports whether c is the input a hash join n builds its
+// table from, and the label of the node PG plans over it: create_hashjoin_plan
+// always puts a Hash node (Parallel Hash for a parallel_hash join) on the
+// build side. goopg's join operator builds the table itself, so EXPLAIN
+// synthesises that node (M0146-0005ck).
+func hashBuildChild(n, c optimizer.Node) (string, bool) {
+	j, ok := n.(*optimizer.Join)
+	if !ok || j.Algo != optimizer.JoinAlgoHash || c == nil {
+		return "", false
+	}
+	build := j.Right
+	if j.BuildLeft {
+		build = j.Left
+	}
+	if c != build {
+		return "", false
+	}
+	if j.ParallelHash {
+		return "Parallel Hash", true
+	}
+	return "Hash", true
+}
+
+// hashNodeCost is the Hash node's estimate: create_hashjoin_plan copies the
+// input's size and sets startup = total = the input's total cost.
+func hashNodeCost(c optimizer.Node) (est int64, cost float64, width int) {
+	// The input's printed line is the node a Project wrapper collapses into
+	// (walkPlanFiltered skips Projects), so read the cost there too.
+	for {
+		p, ok := c.(*optimizer.Project)
+		if !ok || p.Child == nil {
+			break
+		}
+		c = p.Child
+	}
+	est = optimizer.EstimateRows(c)
+	if est <= 0 {
+		est = 1
+	}
+	est, _, cost, width = explainCostFields(c, est)
+	return est, cost, width
+}
+
+// hashInputStats is the instrumentation of the Hash node's input: the
+// child's own entry, or the node a Project / Filter wrapper collapses into
+// (the text walker reads the same entry for the child's line).
+func hashInputStats(c optimizer.Node, stats nodeStatsTable) *nodeStats {
+	for c != nil {
+		if s, ok := stats[c]; ok && s != nil {
+			return s
+		}
+		switch w := c.(type) {
+		case *optimizer.Filter:
+			c = w.Child
+		case *optimizer.Project:
+			c = w.Child
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// emitHashNodeLine prints the synthesised Hash node above a hash join's build
+// input at the child's indent and returns the indent its own child takes.
+// ANALYZE reports the input's actuals: the Hash node returns no tuples to its
+// parent in PG, but its instrumentation counts the rows it consumed, and its
+// time is when the table was complete (both ends of the input's total).
+func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, showCosts bool, s *nodeStats) int {
+	line := strings.Repeat(" ", indent*2) + "->  " + label
+	if showCosts {
+		est, cost, width := hashNodeCost(c)
+		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", cost, cost, est, width)
+	}
+	if s != nil {
+		rowsAvg := rowsPerLoop(s.rowsOut, s.loops)
+		if s.timing {
+			line += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
+				nsToMs(s.totalNs), nsToMs(s.totalNs), rowsAvg, s.loops)
+		} else {
+			line += fmt.Sprintf(" (actual rows=%.2f loops=%d)", rowsAvg, s.loops)
+		}
+	}
+	*rows = append(*rows, Row{NewStringDatum(line)})
+	return indent + 3
 }
 
 // emitSubPlanSubtrees drains the sublinks assigned while rendering
@@ -4275,14 +4366,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		}
 	}
 
-	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
-	// off the HASH node; goopg has no Hash node (the build lives inside
-	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
-	if j, isJoin := n.(*optimizer.Join); isJoin && j.Algo == optimizer.JoinAlgoHash {
-		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
-			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
-		}
-	}
+	// A hash join's hash-table line (M0127-P3.5) prints under the Hash node
+	// the child loop below synthesises, as PG's show_hash_info does
+	// (M0146-0005ck).
 
 	// EX0-03c: a Sort emits PG's `Sort Method:` line under ANALYZE, text
 	// format only (no JSON twin, same escape clause as EX0-03/03b). The
@@ -4384,7 +4470,18 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 				continue
 			}
 		}
-		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
+		ci := childIndent
+		if lbl, ok := hashBuildChild(n, c); ok {
+			ci = emitHashNodeLine(rows, lbl, childIndent, c, showCostsA, hashInputStats(c, stats))
+			// PG prints the hash table's `Buckets:` line under the Hash
+			// node (show_hash_info), not under the join.
+			if j, isJoin := n.(*optimizer.Join); isJoin {
+				if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
+					*rows = append(*rows, Row{NewStringDatum(strings.Repeat(" ", ci*2) + line)})
+				}
+			}
+		}
+		walkPlanAnalyzeFiltered(c, ci, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	}
 }
 
@@ -4496,7 +4593,11 @@ func planToJSONWithStatsNamed(n optimizer.Node, opts parser.ExplainOptions, stat
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSONWithStatsNamed(c, opts, stats, trackIOTiming, reg))
+			child := planToJSONWithStatsNamed(c, opts, stats, trackIOTiming, reg)
+			if lbl, ok := hashBuildChild(surviving, c); ok {
+				child = hashNodeJSON(lbl, c, child)
+			}
+			plans = append(plans, child)
 		}
 		obj["Plans"] = plans
 	}
@@ -4620,11 +4721,41 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		for _, c := range children {
 			// Same shared name table (P0-04e header comment): a fresh
 			// per-child table would qualify differently from text.
-			plans = append(plans, planToJSONNamed(c, opts, reg))
+			child := planToJSONNamed(c, opts, reg)
+			if lbl, ok := hashBuildChild(n, c); ok {
+				child = hashNodeJSON(lbl, c, child)
+			}
+			plans = append(plans, child)
 		}
 		obj["Plans"] = plans
 	}
 	return obj
+}
+
+// hashNodeJSON wraps a hash join's rendered build input in the Hash node PG
+// plans over it (the JSON twin of emitHashNodeLine). Under ANALYZE it copies
+// the input's actual rows and loops and states the input's total time as
+// both ends.
+func hashNodeJSON(label string, c optimizer.Node, child map[string]any) map[string]any {
+	est, cost, width := hashNodeCost(c)
+	h := map[string]any{
+		"Node Type":    label,
+		"Startup Cost": cost,
+		"Total Cost":   cost,
+		"Plan Rows":    est,
+		"Plan Width":   width,
+		"Plans":        []map[string]any{child},
+	}
+	if t, ok := child["Actual Total Time"]; ok {
+		h["Actual Startup Time"] = t
+		h["Actual Total Time"] = t
+	}
+	for _, k := range []string{"Actual Rows", "Actual Loops"} {
+		if v, ok := child[k]; ok {
+			h[k] = v
+		}
+	}
+	return h
 }
 
 // describePlan renders the v0 single-line label for a plan node.
