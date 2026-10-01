@@ -23868,6 +23868,40 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [ ] **M0146\-0005de — an inner\-join equality prints in PG\'s EC\-derived
+  operand order** \(filed 2026\-10\-02 by slice 109; Q8, Q50, Q53, Q63, Q74,
+  Q91 print the written order, PG the EC\-derived one\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - PG model \(validated on scratch PG, 4 variants\): the first creator
+    fixes the order\. 1\) per base rel in range\-table order, an index key
+    column in an EC gives `rel\.col = other\.col`
+    \(generate\_implied\_equalities\_for\_column\); 2\) that index\'s
+    param paths give the rel\'s other EC clauses to the parameterizing rel
+    as `outer\.col = rel\.col` \(get\_baserel\_parampathinfo\); 3\) else the
+    first join pair, lower relid first\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Finding"\.
+  - A render\-time "outer side first" rule is NOT faithful \(PG prints
+    `j1\.a = j2\.b` with j2 outer when no index exists\)\.
+  - First step: find where goopg turns WHERE equalities into join
+    predicates and whether rtable order \+ index key columns are reachable
+    there\.
+- [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
+  qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
+  `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
+  `\(\(tmp1\.sum\_sales \- tmp1\.avg\_monthly\_sales\)\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 109\)\.** `chaseJoinKeyExprColumns`
+    admits a Filter over an aliased SubqueryScan\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Slice 109"\.
+  - Test: `explain\_subquery\_key\_test\.go` \(2 cases; both fail on base\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(Q89\),
+    ea\-ratchet PASS \(10\); regress A/B union/subselect/window/with
+    unchanged\.
+  Movement: yes — TPC-DS text-identical SF0.25 27 -> 28 (Q89), SF1 16; CATEGORIES-EXCL-MATCH unchanged (rendering 12 / 15)
 - [x] **M0146\-0005dc — `\|\|` and a target\-list literal print as text**
   \(filed and landed 2026\-10\-02 from the text\-identity census: Q80 printed
   `\('store channel'\), \(\('store' \|\| ssr\.store\_id\)\)` where PG prints the

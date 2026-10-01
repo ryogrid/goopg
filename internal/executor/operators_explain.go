@@ -1819,8 +1819,18 @@ func formatKeyExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 // `((((count(*)))::numeric(15,4) / ((count(*)))::numeric(15,4)))`.
 // ok is false when the child is not a join or nothing resolves.
 func chaseJoinKeyExprColumns(key optimizer.Expr, child optimizer.Node, reg *subPlanReg, qualify bool) (optimizer.Expr, bool) {
-	switch child.(type) {
+	switch c := child.(type) {
 	case *optimizer.Join, *optimizer.NestedLoopIndexJoin:
+	case *optimizer.Filter:
+		// M0146-0005dd: a kept Subquery Scan (one with quals). Its
+		// columns are the scan's own (`tmp1.sum_sales`), which
+		// resolveKeySource names through boundaryKeyName — the same
+		// stop a bare column key makes, so `((tmp1.sum_sales -
+		// tmp1.avg_monthly_sales)), tmp1.s_store_name` (TPC-DS Q89)
+		// qualifies both keys alike.
+		if sq, isSQ := c.Child.(*optimizer.SubqueryScan); !isSQ || sq.Alias == "" {
+			return nil, false
+		}
 	default:
 		return nil, false
 	}

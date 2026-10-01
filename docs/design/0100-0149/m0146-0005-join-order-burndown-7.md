@@ -179,3 +179,70 @@ Movement:
   Q66 Q76 Q77 Q80) and ea-ratchet (10).
 
 Evidence: `analysis/m0146/m0146-0005/slice108/`.
+
+## Slice 109: M0146-0005dd — an expression key over a kept Subquery Scan qualifies its columns
+
+TPC-DS Q89 sorts on `sum_sales - avg_monthly_sales` above a Subquery Scan
+`tmp1` whose qual keeps it in the plan (setrefs.c trivial_subqueryscan).
+The key's Vars are OUTER_VARs into the scan's own columns, so PG prints
+`((tmp1.sum_sales - tmp1.avg_monthly_sales)), tmp1.s_store_name`. goopg
+already stopped a bare column key at that scan (slice 0005ca,
+`boundaryKeyName`), but an expression key printed its columns bare.
+
+- `chaseJoinKeyExprColumns` (slice 103's per-column chase for expression
+  keys) now also admits a Filter over an aliased SubqueryScan. That is
+  goopg's shape for a kept Subquery Scan. Each column then resolves
+  through resolveKeySource to the same `alias.col` a bare key gets.
+
+Test: `explain_subquery_key_test.go` has two Sort Key shapes, both with
+PG 18.3's text. Both fail without the change.
+
+Movement:
+
+- Text-identical plans go 27 → 28 at SF0.25 (Q89). SF1 stays 16
+  (aligned lines +1).
+- Regress A/B over union, subselect, window and with: unchanged.
+- CATEGORIES-EXCL-MATCH is unchanged.
+- Gates pass: units, spotcheck, sweep 96/96, arm, fire set (Q89) and
+  ea-ratchet (10).
+
+Not changed, but found while probing:
+
+- A query holding a subquery RTE qualifies columns inside the subquery
+  too (`PARTITION BY zsq.a`), since useprefix is `rtable_size > 1`.
+  goopg prints them bare.
+
+### Finding (filed as M0146-0005de, not landed): EC join-clause orientation
+
+Five TPC-DS queries (Q8, Q50, Q53, Q63, Q74, Q91) print an inner-join
+equality with its operands swapped relative to PG. PG never reuses the
+written clause for a join. generate_join_implied_equalities calls
+create_join_clause with `parent_ec = ec`, while source clauses carry
+`parent_ec = NULL`, so ec_search_clause_for_ems never matches them. The
+derived clause is cached in ec_derives, so **the first code path to create
+it fixes its operand order**:
+
+1. In set_base_rel_pathlists (range-table order),
+   match_eclass_clauses_to_index → generate_implied_equalities_for_column
+   creates `indexed_rel.col = other.col` for each index key column that
+   is an EC member.
+2. That index's parameterized paths then call get_baserel_parampathinfo,
+   which creates every remaining EC clause to the parameterizing rel as
+   `outer.col = rel.col`.
+3. Otherwise, the first join pair creates it (make_join_rel(rel1, rel2)),
+   lower range-table index first.
+
+On scratch PG 18.3, j1(a,x)/j2(b,y) checks the model in four variants:
+
+| setup | PG prints |
+|---|---|
+| no index | `(j1.a = j2.b)` whatever the outer side or written order |
+| index on j2.b | `(j2.b = j1.a)` |
+| index on j1.x | `(j2.b = j1.a) AND (j1.x = j2.y)` |
+| `FROM j2, j1` | `j2` first |
+
+All the TPC-DS cases agree with the model. A render-time "outer side
+first" rule matched TPC-DS but contradicts the no-index case, so it was
+discarded. Implementing the model needs planner-side state (range-table
+order, per-relation index key columns, equivalence classes), which goopg
+lacks in one place.
