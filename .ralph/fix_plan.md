@@ -2565,6 +2565,16 @@ heuristic stays live.)
   - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\),
     again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-003`\).
+- [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
+  (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
+  evidence `ci/logs/20261002-010412/units/go-test.log`).
+  Kind: impl
+  Parent: none
+  - Failing test: `TestConcurrentInsertSearch` — `btree\_test\.go:319: no
+    successful concurrent searches recorded` \(0\.04s\); first seen
+    2026\-10\-02, new tonight\. Looks timing\-dependent \(the searchers may
+    not overlap the inserters on a loaded host\); triage before treating as
+    a regression\.
 - [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
