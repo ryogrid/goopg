@@ -611,7 +611,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		if lbl, ok := hashBuildChild(n, c); ok {
 			ci = emitHashNodeLine(rows, lbl, childIndent, c, showCosts, nil)
 		}
+		restore := reg.enterParamInner(n, c)
 		walkPlanFiltered(c, ci, rows, opts, nil, nil, reg)
+		restore()
 	}
 }
 
@@ -1797,7 +1799,7 @@ func windowUnderNarrowing(child optimizer.Node, key optimizer.Expr) (*optimizer.
 		}
 	}
 	bad := false
-	mapped, ok := optimizer.CloneExprMapColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+	mapped, ok := optimizer.CloneExprReplacingColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
 		if c.Index < 0 || c.Index >= len(p.Targets) {
 			bad = true
 			return c
@@ -1827,7 +1829,7 @@ func windowKeyText(key optimizer.Expr, w *optimizer.WindowAgg, reg *subPlanReg, 
 		return "", false
 	}
 	failed := false
-	disp, ok := optimizer.CloneExprMapColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+	disp, ok := optimizer.CloneExprReplacingColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
 		if c.Index >= nIn {
 			txt, ok := windowFuncText(w, c.Index-nIn, reg, qualify)
 			if !ok {
@@ -1866,7 +1868,7 @@ func windowFuncText(w *optimizer.WindowAgg, j int, reg *subPlanReg, qualify bool
 	if !f.Star {
 		parts := make([]string, len(f.Args))
 		for i, a := range f.Args {
-			disp, ok := optimizer.CloneExprMapColumnRefs(a, func(c *optimizer.ColumnRef) optimizer.Expr {
+			disp, ok := optimizer.CloneExprReplacingColumnRefs(a, func(c *optimizer.ColumnRef) optimizer.Expr {
 				chased, ok := resolveKeySource(c, w.Child, reg)
 				if !ok {
 					return c
@@ -2123,6 +2125,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			for _, q := range p.BitmapQual[1:] {
 				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
 			}
+			rc = qualifyForeignColumns(rc, p, reg)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
 		}
 		filt := attachedFilter
@@ -2708,7 +2711,7 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 			}
 			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.HighKey, reg))
 		}
-		return wrapParen(strings.Join(parts, " AND "))
+		return indexCondAndText(parts)
 	}
 	// M0146-0005v: a skip probe binds Columns[SkipPrefix+i] — PG prints
 	// only the bound quals (`Index Cond: (inv_item_sk = ...)`); the
@@ -2720,7 +2723,7 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		for i, k := range p.Keys {
 			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
 		}
-		return wrapParen(strings.Join(parts, " AND "))
+		return indexCondAndText(parts)
 	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
@@ -2741,7 +2744,7 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 		for i, k := range p.Keys {
 			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
 		}
-		return wrapParen(strings.Join(parts, " AND "))
+		return indexCondAndText(parts)
 	}
 	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
 }
@@ -2782,7 +2785,7 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 		for i, k := range p.Keys {
 			parts[i] = cols[i] + " = " + formatIndexCondKey(k, reg)
 		}
-		return wrapParen(strings.Join(parts, " AND "))
+		return indexCondAndText(parts)
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
@@ -2807,7 +2810,7 @@ func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowK
 			parts = append(parts, col+" "+hiOp+" "+formatIndexCondKey(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
-			return wrapParen(strings.Join(parts, " AND "))
+			return indexCondAndText(parts)
 		}
 	}
 	return ""
@@ -3220,6 +3223,76 @@ func (r *subPlanReg) enter(n optimizer.Node) func() {
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
+// enterParamInner makes a parameterised nested loop's outer input the
+// ancestor while its inner side prints, and returns the restore. An outer
+// reference in the inner scan's Index Cond is PG's NestLoop param, which
+// get_parameter deparses against the NestLoop's outer plan with the
+// relation prefix forced (`c_customer_sk = store_sales.ss_customer_sk`);
+// resolveInAncestor finds that relation when the reference's own binding
+// id cannot (M0146-0005cm). Other children leave the ancestor as is.
+func (r *subPlanReg) enterParamInner(n, c optimizer.Node) func() {
+	if r == nil {
+		return func() {}
+	}
+	var outer optimizer.Node
+	switch j := n.(type) {
+	case *optimizer.NestedLoopIndexJoin:
+		if c != j.Outer {
+			outer = j.Outer
+		}
+	case *optimizer.Join:
+		if paramInnerChild(n, c) {
+			outer = j.Left
+		}
+	}
+	if outer == nil {
+		return func() {}
+	}
+	prev := r.ancestor
+	r.ancestor = outer
+	return func() { r.ancestor = prev }
+}
+
+// indexCondAndText joins an index qual's clauses the way PG prints its
+// implicit-AND list: each clause in its own parentheses, the list in one
+// more (`((a = 1) AND (b > 2))`); a single clause is just `(a = 1)`
+// (M0146-0005cm).
+func indexCondAndText(parts []string) string {
+	if len(parts) == 1 {
+		return "(" + parts[0] + ")"
+	}
+	return "((" + strings.Join(parts, ") AND (") + "))"
+}
+
+// qualifyForeignColumns pins every column of e that the scan n does not
+// produce to its qualified name. A scan qual prints its own columns bare
+// (show_scan_qual's varprefix=false), but a column of another relation in
+// it is a NestLoop param, which get_parameter always prefixes
+// (`Recheck Cond: (c_customer_sk = s.ss_customer_sk)`, M0146-0005cm).
+func qualifyForeignColumns(e optimizer.Expr, n optimizer.Node, reg *subPlanReg) optimizer.Expr {
+	if reg == nil || reg.names() == nil {
+		return e
+	}
+	own := map[int16]bool{}
+	for _, c := range n.Output() {
+		own[c.SourceTableIdx] = true
+	}
+	out, ok := optimizer.CloneExprReplacingColumnRefs(e, func(c *optimizer.ColumnRef) optimizer.Expr {
+		if c.SourceTableIdx == 0 || own[int16(c.SourceTableIdx)] {
+			return c
+		}
+		q := reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
+		if !strings.Contains(q, ".") {
+			return c
+		}
+		return displayColumn(c, q, reg)
+	})
+	if !ok {
+		return e
+	}
+	return out
+}
+
 func (r *subPlanReg) ancestorNode() optimizer.Node {
 	if r == nil {
 		return nil
@@ -4503,7 +4576,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 				}
 			}
 		}
+		restore := reg.enterParamInner(n, c)
 		walkPlanAnalyzeFiltered(c, ci, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
+		restore()
 	}
 }
 

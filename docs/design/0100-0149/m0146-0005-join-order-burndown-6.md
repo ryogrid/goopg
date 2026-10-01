@@ -134,8 +134,8 @@ goopg printed the output labels, `(((sum * 100) / sum))`, and
 `Sort Key: rank` for a bare window result.
 
 - `windowKeyText` rewrites the key's column references for display with
-  `optimizer.CloneExprMapColumnRefs` (new; a thin exported wrapper over
-  `cloneExprRefs`):
+  `optimizer.CloneExprReplacingColumnRefs` (slice 92 replaced a duplicate
+  wrapper this slice had added):
   - a window result becomes `windowFuncText` (`name(args) OVER wname`,
     with arguments chased through the window's child);
   - an input column is chased through `resolveKeySource` and wrapped
@@ -264,3 +264,51 @@ Next gaps by count in the MATCH plans:
   not.
 
 Evidence: `analysis/m0146/m0146-0005/slice91/`.
+
+## Slice 92: M0146-0005cm — outer references in a parameterised scan's quals print qualified
+
+An outer column in the inner scan of a parameterised nested loop is PG's
+NestLoop param. get_parameter deparses it against the NestLoop's outer
+plan with the relation prefix forced, so PG prints
+`Index Cond: (c_customer_sk = store_sales.ss_customer_sk)`, and the
+bitmap scan's `Recheck Cond` the same way. goopg printed the bare name
+in two cases:
+
+- a reference whose binding id could not be named, inside a CTE body where
+  ids restart (TPC-DS Q24);
+- every Recheck Cond, which is a scan qual and therefore unqualified.
+
+There were 75 such Index / Recheck lines over TPC-DS SF0.25; PG has none.
+
+- `subPlanReg.enterParamInner` makes a parameterised nested loop's outer
+  input the deparse ancestor while its inner side prints. This covers a
+  NestedLoopIndexJoin's inner and a Join whose inner `paramInnerChild`
+  accepts, in both text walkers. The OuterColumnRef arm's existing
+  `resolveInAncestor` fallback then names the relation.
+- `qualifyForeignColumns` pins every Recheck Cond column the scan does not
+  produce to its qualified name.
+- `indexCondAndText` joins a multi-clause Index Cond as PG's implicit-AND
+  list, `((a = 1) AND (b > 2))`. The five former
+  `wrapParen(strings.Join(parts, " AND "))` sites printed
+  `(a = 1 AND b > 2)`.
+- The executor's duplicate `optimizer.CloneExprMapColumnRefs` (slice 89)
+  is removed in favour of the existing `CloneExprReplacingColumnRefs`.
+
+Tests: the three `TestNLIBitmapProbe*` expectations now hold PG's text
+(`Recheck Cond: (l_key = ord.o_key)`, checked on PG 18.3). A minimal unit
+reproduction of the CTE-body case did not trigger: it needs Q24's
+OuterColumnRef under a parallel join. The ancestor change is therefore
+evidenced by the TPC-DS captures.
+
+Movement:
+
+- Unqualified outer-reference Index / Recheck lines go 75 → 8 at SF0.25 and
+  63 → 6 at SF1.
+- Text-identical plans go 12 → 13 at SF0.25 (Q3) and 8 → 9 at SF1 (Q87).
+  Aligned identical lines go 1916 → 1941 and 1895 → 1918.
+- The classifier counts are unchanged. Regress, same-order A/B over 17
+  cases: 52409 → 52402.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice92/`.
