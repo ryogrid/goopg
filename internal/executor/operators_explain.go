@@ -1634,6 +1634,14 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 				keyExpr = chased
 			}
 		}
+		if w, wkey, isWin := windowUnderNarrowing(child, k.Expr); isWin {
+			// M0146-0005cj: a key computed over a WindowAgg's output.
+			if txt, ok := windowKeyText(wkey, w, reg, qualify); ok {
+				bare = append(bare, txt)
+				full = append(full, txt+sortOrderSuffix(k))
+				continue
+			}
+		}
 		s := formatExprQual(keyExpr, reg, qualify)
 		// S18: a Sort never evaluates expressions — its key is
 		// always PG's OUTER_VAR reference into the child's target
@@ -1659,6 +1667,144 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 		full = append(full, s)
 	}
 	return full, bare
+}
+
+// sortOrderSuffix is a key's DESC / NULLS decoration, printed only when it
+// differs from the direction's default (show_sortorder_options).
+func sortOrderSuffix(k optimizer.SortKey) string {
+	s := ""
+	if k.Desc {
+		s += " DESC"
+	}
+	if k.NullsFirst && !k.Desc {
+		s += " NULLS FIRST"
+	} else if !k.NullsFirst && k.Desc {
+		s += " NULLS LAST"
+	}
+	return s
+}
+
+// windowUnderNarrowing finds the WindowAgg a Sort key reads: the Sort's
+// child itself, or the child of a Project that only selects columns (the
+// narrowing goopg places where PG's WindowAgg emits the final targetlist).
+// The key is returned in the WindowAgg's output coordinates.
+func windowUnderNarrowing(child optimizer.Node, key optimizer.Expr) (*optimizer.WindowAgg, optimizer.Expr, bool) {
+	if w, ok := child.(*optimizer.WindowAgg); ok {
+		return w, key, true
+	}
+	p, ok := child.(*optimizer.Project)
+	if !ok || p.IsolatedScope {
+		return nil, nil, false
+	}
+	w, ok := p.Child.(*optimizer.WindowAgg)
+	if !ok {
+		return nil, nil, false
+	}
+	for _, t := range p.Targets {
+		if _, isCol := t.(*optimizer.ColumnRef); !isCol {
+			return nil, nil, false
+		}
+	}
+	bad := false
+	mapped, ok := optimizer.CloneExprMapColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+		if c.Index < 0 || c.Index >= len(p.Targets) {
+			bad = true
+			return c
+		}
+		return p.Targets[c.Index]
+	})
+	if !ok || bad {
+		return nil, nil, false
+	}
+	return w, mapped, true
+}
+
+// windowKeyText deparses a Sort key over a WindowAgg the way PG does. The
+// key's OUTER_VAR points into the WindowAgg's targetlist, where a window
+// function is evaluated in place (`sum((…)) OVER w1`, bare) and an input
+// column is itself an OUTER_VAR into the window's child, parenthesised when
+// that referent is not a plain column (get_special_variable). The whole
+// key is a non-Var referent, so it takes the outer pair too. ok is false
+// for a key that is a plain input column (the generic chase prints it) or
+// one this cannot rewrite.
+func windowKeyText(key optimizer.Expr, w *optimizer.WindowAgg, reg *subPlanReg, qualify bool) (string, bool) {
+	if w.Child == nil || reg == nil {
+		return "", false
+	}
+	nIn := len(w.Child.Output())
+	if col, ok := key.(*optimizer.ColumnRef); ok && col.Index < nIn {
+		return "", false
+	}
+	failed := false
+	disp, ok := optimizer.CloneExprMapColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+		if c.Index >= nIn {
+			txt, ok := windowFuncText(w, c.Index-nIn, reg, qualify)
+			if !ok {
+				failed = true
+				return c
+			}
+			return displayColumn(c, txt, reg)
+		}
+		chased, ok := resolveKeySource(c, w, reg)
+		if !ok {
+			return c
+		}
+		if _, isCol := chased.(*optimizer.ColumnRef); isCol {
+			return chased
+		}
+		return displayColumn(c, "("+formatExprQual(chased, reg, qualify)+")", reg)
+	})
+	if !ok || failed {
+		return "", false
+	}
+	return forceParen(formatExprQual(disp, reg, qualify)), true
+}
+
+// windowFuncText is a window function as the WindowAgg's targetlist
+// deparses it: `name(args) OVER wname`, each argument an OUTER_VAR into the
+// window's child (parenthesised over a non-Var referent).
+func windowFuncText(w *optimizer.WindowAgg, j int, reg *subPlanReg, qualify bool) (string, bool) {
+	if j < 0 || j >= len(w.Funcs) || w.Name == "" {
+		return "", false
+	}
+	f := w.Funcs[j]
+	if f.Filter != nil {
+		return "", false
+	}
+	args := "*"
+	if !f.Star {
+		parts := make([]string, len(f.Args))
+		for i, a := range f.Args {
+			disp, ok := optimizer.CloneExprMapColumnRefs(a, func(c *optimizer.ColumnRef) optimizer.Expr {
+				chased, ok := resolveKeySource(c, w.Child, reg)
+				if !ok {
+					return c
+				}
+				if _, isCol := chased.(*optimizer.ColumnRef); isCol {
+					return chased
+				}
+				return displayColumn(c, "("+formatExprQual(chased, reg, qualify)+")", reg)
+			})
+			if !ok {
+				return "", false
+			}
+			parts[i] = formatExprQual(disp, reg, qualify)
+		}
+		args = strings.Join(parts, ", ")
+	}
+	return strings.ToLower(f.Name) + "(" + args + ") OVER " + pgQuoteIdent(w.Name), true
+}
+
+// displayColumn is a stand-in ColumnRef that prints as txt (through the
+// boundaryKeyName map formatExprQual consults first) and keeps c's type,
+// so a literal beside it is still coerced as PG coerces it.
+func displayColumn(c *optimizer.ColumnRef, txt string, reg *subPlanReg) optimizer.Expr {
+	d := &optimizer.ColumnRef{Index: c.Index, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	if reg.boundaryKeyName == nil {
+		reg.boundaryKeyName = map[*optimizer.ColumnRef]string{}
+	}
+	reg.boundaryKeyName[d] = txt
+	return d
 }
 
 func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]Row, attachedFilter optimizer.Expr, reg *subPlanReg) {

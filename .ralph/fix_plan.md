@@ -23858,6 +23858,21 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cj — a Sort key over a WindowAgg prints its window function**
+  \(filed and landed 2026\-10\-01 from the 0cg ledger row: goopg printed
+  `\(\(\(sum \* 100\) / sum\)\)`, PG `sum\(\(sum\(x\)\)\) OVER w1` inside the key\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 89\)\.** `windowKeyText` / `windowFuncText` /
+    `windowUnderNarrowing` / `displayColumn` in operators\_explain\.go;
+    `optimizer.CloneExprMapColumnRefs`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 89"\.
+  - Test `TestSortKeyOverWindowAggDeparsesWindowFunc` \(3 PG oracle lines,
+    3/3 fail with the arm off\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress 10\-case same\-order A/B, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); CATEGORIES incl. MATCH rendering 18 -> 15 (SF0.25), 19 -> 16 (SF1): Q12/Q20/Q98 MATCH [rendering] -> MATCH []; regress groupingsets 1893 -> 1880
 - [x] **M0146\-0005ci — a literal prints as the Const it was coerced to**
   \(filed and landed 2026\-10\-01 from the census: goopg printed
   `\(ca\_gmt\_offset = \-6\)`, PG `\(ca\_gmt\_offset = '\-6'::numeric\)`\)\.

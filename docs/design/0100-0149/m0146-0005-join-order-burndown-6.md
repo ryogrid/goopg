@@ -116,3 +116,55 @@ returns a timestamp-formatted value of type unknown, and errors with a
 literal date operand.
 
 Evidence: `analysis/m0146/m0146-0005/slice88/`.
+
+## Slice 89: M0146-0005cj — a Sort key over a WindowAgg prints its window function
+
+PG computes `sum(x) * 100 / sum(sum(x)) OVER (…)` in the WindowAgg's
+targetlist, and the Sort above keys on that entry. EXPLAIN therefore prints
+`((((sum(x)) * '100'::numeric) / sum((sum(x))) OVER w1))`:
+
+- the window function is evaluated in place, so it prints bare with its
+  `OVER w1`;
+- each input column is an OUTER_VAR into the window's child, parenthesised
+  around its non-Var referent (get_special_variable), so the aggregate
+  prints as `(sum(x))`, also inside the window function's argument;
+- the whole key is a non-Var referent and takes the outer pair.
+
+goopg printed the output labels, `(((sum * 100) / sum))`, and
+`Sort Key: rank` for a bare window result.
+
+- `windowKeyText` rewrites the key's column references for display with
+  `optimizer.CloneExprMapColumnRefs` (new; a thin exported wrapper over
+  `cloneExprRefs`):
+  - a window result becomes `windowFuncText` (`name(args) OVER wname`,
+    with arguments chased through the window's child);
+  - an input column is chased through `resolveKeySource` and wrapped
+    unless it lands on a plain column.
+
+  Stand-ins print through the `boundaryKeyName` map and keep the column's
+  type, so slice 88's literal coercion still labels `'100'::numeric`.
+- `windowUnderNarrowing` also finds the WindowAgg under a column-selecting
+  Project, which goopg places where PG's WindowAgg emits the final
+  targetlist (`ORDER BY rk` → `(rank() OVER w1)`).
+
+Test: `TestSortKeyOverWindowAggDeparsesWindowFunc` (3 PG 18.3 oracle
+lines; all fail with the arm disabled).
+
+Movement:
+
+- TPC-DS Q12/Q20/Q98 go from `MATCH [rendering]` to `MATCH []` at both
+  scales. Rendering including MATCH goes 18 → 15 (SF0.25) and 19 → 16
+  (SF1), and fully identical plans 32 → 35 and 24 → 27.
+  CATEGORIES-EXCL-MATCH is unchanged (12 / 15).
+- What is left in those three plans is a missing `Parallel Hash` line under
+  a parallel hash join, which the classifier does not score.
+- Regress groupingsets 1893 → 1880: the cube-over-window EXPLAIN hunk now
+  matches PG completely.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Left (ledgered): window functions with FILTER, keys over a WindowAgg
+reached through other nodes (Filter, Subquery Scan), Group Key / Window
+lines that read window results, and the missing `Parallel Hash` node line.
+
+Evidence: `analysis/m0146/m0146-0005/slice89/`.

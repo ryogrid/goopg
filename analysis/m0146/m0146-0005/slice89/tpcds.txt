@@ -1,0 +1,26 @@
+== sf025
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-candidate-diff.txt:PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-candidate-diff.txt:CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=15
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-candidate-diff.txt:CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-baseline-diff.txt:PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-baseline-diff.txt:CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=18
+tmp/fireset-0cj/tpcds-sf025/0cj-tpcds-sf025-baseline-diff.txt:CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+Q12 MATCH [] estimates(goopg cost=8708.2
+Q20 MATCH [] estimates(goopg cost=13900.
+Q98 MATCH [] estimates(goopg cost=18964.
+Q12 MATCH [rendering] estimates(goopg co
+Q20 MATCH [rendering] estimates(goopg co
+Q98 MATCH [rendering] estimates(goopg co
+== sf1
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-candidate-diff.txt:PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-candidate-diff.txt:CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=16
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-candidate-diff.txt:CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-baseline-diff.txt:PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-baseline-diff.txt:CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=19
+tmp/fireset-0cj/tpcds-sf1/0cj-tpcds-sf1-baseline-diff.txt:CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+Q12 MATCH [] estimates(goopg cost=26695.
+Q20 MATCH [] estimates(goopg cost=48867.
+Q98 MATCH [] estimates(goopg cost=71971.
+Q12 MATCH [rendering] estimates(goopg co
+Q20 MATCH [rendering] estimates(goopg co
+Q98 MATCH [rendering] estimates(goopg co

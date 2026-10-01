@@ -829,3 +829,17 @@ func shallowCloneExpr(e Expr) (Expr, bool) {
 
 	return nil, false
 }
+
+// CloneExprMapColumnRefs returns a clone of e with every same-scope
+// ColumnRef replaced by fn's result. ok is false when e holds an inner plan
+// or a type the walker does not enumerate. EXPLAIN uses it to rename a
+// key's column references for display without touching the plan's own
+// expression.
+func CloneExprMapColumnRefs(e Expr, fn func(*ColumnRef) Expr) (Expr, bool) {
+	return cloneExprRefs(e, scopeVeto, exprRewriter{Rewrite: func(x Expr) Expr {
+		if c, ok := x.(*ColumnRef); ok {
+			return fn(c)
+		}
+		return x
+	}})
+}
