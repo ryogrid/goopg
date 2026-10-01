@@ -190,9 +190,9 @@ func TestExplainLeavesSingleRelationQualsBare(t *testing.T) {
 	lines := qualifyExplainLines(t, "EXPLAIN SELECT id FROM eq_r WHERE st = 'a'")
 
 	got := findLine(lines, "Filter:")
-	if got != "Filter: (st = 'a')" {
+	if got != "Filter: (st = 'a'::text)" {
 		t.Errorf("single-relation filter should stay unqualified:\n got %q\nwant %q\nplan:\n%s",
-			got, "Filter: (st = 'a')", strings.Join(lines, "\n"))
+			got, "Filter: (st = 'a'::text)", strings.Join(lines, "\n"))
 	}
 }
 

@@ -23858,6 +23858,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005ci — a literal prints as the Const it was coerced to**
+  \(filed and landed 2026\-10\-01 from the census: goopg printed
+  `\(ca\_gmt\_offset = \-6\)`, PG `\(ca\_gmt\_offset = '\-6'::numeric\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 88\)\.** `formatCoercedLiteralOperands` /
+    `coerceLiteralText` / `intConstText` / `typedLiteralTypeName` in
+    operators\_explain\.go\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 88"\.
+  - Test `TestLiteralPrintsAsCoercedConst` \(13 PG oracle lines\); two older
+    tests now expect PG's `'…'::text`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress 20\-case same\-order A/B, ea\-ratchet PASS \(10\)\.
+  - Side finding: S2 bug filed as M0146\-0040 \(`date \+ integer`\), not
+    worked\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; qual text is rendering inside MATCH); TPC-DS literal labels matched: bpchar 49 -> 207/207, numeric 0 -> 141/152, text 6 -> 33/68, timestamp 0 -> 28/28, integer 19 -> 28/28
 - [x] **M0146\-0005ch — an IN list prints as PG's folded array Const**
   \(filed and landed 2026\-10\-01 from the census: goopg printed
   `\(a = ANY \(1, 2\)\)`, PG `\(a = ANY \('\{1,2\}'::integer\[\]\)\)`\)\.
@@ -23958,6 +23975,25 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0040 — `date \+ integer` returns a timestamp\-formatted
+  value of type unknown** \(filed 2026\-10\-01 by slice 88; REPRODUCED on
+  the private :5533 probe cluster, S2 escalation: wrong results\)\.
+  `SELECT d\_date, d\_date \+ 30, pg\_typeof\(d\_date \+ 30\) FROM date\_dim
+  ORDER BY d\_date LIMIT 1` returns `1900\-02\-01 00:00:00\.000000 \| unknown`;
+  PG 18\.3 returns `1900\-02\-01 \| date` \(date\_pli, `date \+ integer →
+  date`\)\. A literal operand errors instead:
+  `SELECT '2001\-07\-15'::date \+ 30` → `operator \+ requires integer
+  operands`, and `d\_date <= '2001\-07\-15'::date \+ 30` → `operator <= has
+  incompatible operand types "date" and "int8"`\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-01 \(S2\) — wrong results from `date \+ integer`
+  > Filed by slice 88, not worked\. Owner: place M0146\-0040 in the banner\.
+  - Not worked \(S2: the owner places it\)\. First step: find the
+    BinaryOp `\+`/`\-` arm for a date operand with an integer operand in
+    the executor evaluator and the analyzer's operator typing; PG's
+    operators are date\_pli / date\_mii / date\_mi \(pg\_operator 1100/1101/
+    1099\)\.
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

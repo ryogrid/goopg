@@ -26,7 +26,7 @@ func TestOneElementInIsEquality(t *testing.T) {
 	for _, c := range []struct{ where, filter, rows, count string }{
 		{"a IN (7)", "Filter: (a = 7)", " rows=100 ", "100"},
 		{"a NOT IN (7)", "Filter: (a <> 7)", " rows=9900 ", "9900"},
-		{"b IN ('3')", "Filter: (b = '3')", " rows=1000 ", "1000"},
+		{"b IN ('3')", "Filter: (b = '3'::text)", " rows=1000 ", "1000"},
 		{"a = ANY (ARRAY[7])", "ANY", "", "100"},
 	} {
 		plan := strings.Join(runExplainRows(t, ctx, "EXPLAIN SELECT * FROM e WHERE "+c.where), "\n")

@@ -59,3 +59,60 @@ and other element types, and a function-call operand whose type
 ExprResultType cannot resolve.
 
 Evidence: `analysis/m0146/m0146-0005/slice87/`.
+
+## Slice 88: M0146-0005ci — a literal prints as the Const it was coerced to
+
+PG coerces a literal to the other operand's type during parse analysis
+(make_op → coerce_type), so EXPLAIN prints the resulting Const through
+get_const_expr: `(ca_gmt_offset = '-6'::numeric)`,
+`(s_state = 'TN'::bpchar)`, `(revenue / '50'::numeric)`. goopg printed the
+literal as written (`= -6`, `= 'TN'`).
+
+- `formatCoercedLiteralOperands` covers `= <> < <= > >= + - * /` with one
+  literal side and one side whose type ExprResultType resolves.
+  `coerceLiteralText` applies the operator's input type:
+  - int2/int4/int8 operand: the literal stays int4 (cross-type operators);
+  - numeric: an integer becomes `'N'::numeric`, a decimal prints bare
+    unless negative;
+  - an integer operand against a decimal is cast, `((a)::numeric > 2.5)`;
+  - char(n) → `'x'::bpchar`, text → `'x'::text`, varchar → `((f)::text =
+    'x'::text)`.
+- `intConstText` is get_const_expr's int4 arm everywhere: a negative
+  literal is `'-6'::integer`, and one past int4's range is
+  `'N'::bigint`.
+- Typed literals print format_type's names (`timestamp without time zone`),
+  and a timestamp's ISO value goes through timestamp_out's form
+  (`'2001-07-15 00:00:00'`).
+
+Test: `TestLiteralPrintsAsCoercedConst` (13 PG 18.3 oracle lines; 8 fail
+with the coercion disabled, the rest pin the int4 and timestamp arms).
+Two older tests that pinned goopg's unlabelled text now expect PG's
+`'3'::text` / `'a'::text`.
+
+Movement (TPC-DS SF0.25; SF1 identical):
+
+| label | PG | goopg before | goopg now |
+|---|---|---|---|
+| `::numeric` | 152 | 0 | 141 |
+| `::bpchar` | 207 | 49 | 207 |
+| `::text` | 68 | 6 | 33 |
+| `::integer` | 28 | 19 | 28 |
+| `::timestamp without time zone` | 28 | 0 | 28 |
+
+No label goopg prints is missing from PG's plan for the same query
+(per-query multiset check). CATEGORIES-EXCL-MATCH is unchanged (rendering
+12 / 15). In regress the moves are small; literal lines in partition_prune
+now match PG's `'a'::bpchar`, but their column qualification still
+differs. Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and
+ea-ratchet (10) pass.
+
+Left (ledgered): string literals that are target or union-arm output
+columns (`'store channel'::text`), LIKE patterns (`~~ 'Unknown%'::text`),
+literals inside CASE / COALESCE results (Q39, Q78 `'0'::bigint`), function
+arguments, and float or date-arithmetic operands.
+
+Side finding (filed S2 as M0146-0040, not worked): `date + integer`
+returns a timestamp-formatted value of type unknown, and errors with a
+literal date operand.
+
+Evidence: `analysis/m0146/m0146-0005/slice88/`.

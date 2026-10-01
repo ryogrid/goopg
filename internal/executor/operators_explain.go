@@ -3165,7 +3165,7 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return x.Name
 	case *optimizer.IntegerConst:
-		return fmt.Sprintf("%d", x.Value)
+		return intConstText(x.Value)
 	case *optimizer.NumericConst:
 		return x.Value
 	case *optimizer.StringConst:
@@ -3180,6 +3180,9 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.NullConst:
 		return "NULL"
 	case *optimizer.BinaryOp:
+		if l, r, ok := formatCoercedLiteralOperands(x, reg, qualify); ok {
+			return "(" + l + " " + x.Op.String() + " " + r + ")"
+		}
 		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
 	case *optimizer.UnaryOp:
 		// M0146-0005ch: negate_clause pushes NOT into a literal-list
@@ -3222,7 +3225,7 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).
-		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'::" + x.Type
+		return "'" + strings.ReplaceAll(typedLiteralValueText(x.Type, x.Value), "'", "''") + "'::" + typedLiteralTypeName(x.Type)
 	case *optimizer.IntervalLit:
 		// `interval 'N' <unit>` (Qualified) folds the unit into the
 		// literal text so the rendering stays a single typed constant.
@@ -3506,6 +3509,178 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 		return "(NOT " + s + ")"
 	}
 	return s
+}
+
+// intConstText is get_const_expr's text for an integer literal: an int4
+// Const prints bare unless negative (`'-6'::integer`), and a literal past
+// int4's range is an int8 Const, which always carries its label.
+func intConstText(v int64) string {
+	if v > math.MaxInt32 || v < math.MinInt32 {
+		return fmt.Sprintf("'%d'::bigint", v)
+	}
+	if v < 0 {
+		return fmt.Sprintf("'%d'::integer", v)
+	}
+	return strconv.FormatInt(v, 10)
+}
+
+// typedLiteralTypeName is format_type's spelling of a typed literal's type
+// where goopg's short name differs (`'…'::timestamp without time zone`).
+func typedLiteralTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "time":
+		return "time without time zone"
+	case "timetz":
+		return "time with time zone"
+	}
+	return t
+}
+
+// typedLiteralValueText is the Const's output-function text: a timestamp
+// literal is stored as a timestamp and printed by timestamp_out
+// (`'2001-07-15'::timestamp` → `2001-07-15 00:00:00`). Only the ISO forms
+// are normalised; anything else prints as written.
+func typedLiteralValueText(typ, v string) string {
+	if strings.ToLower(typ) != "timestamp" {
+		return v
+	}
+	for _, layout := range []string{"2006-01-02", "2006-01-02 15:04:05", "2006-01-02 15:04:05.999999"} {
+		if ts, err := time.Parse(layout, v); err == nil {
+			out := ts.Format("2006-01-02 15:04:05")
+			if ns := ts.Nanosecond(); ns != 0 {
+				out += strings.TrimRight(fmt.Sprintf(".%06d", ns/1000), "0")
+			}
+			return out
+		}
+	}
+	return v
+}
+
+// coercibleLiteral unwraps a literal operand: an integer, numeric or
+// string constant, or a unary minus over a number (the grammar's doNegate
+// folds `-6` into the constant itself).
+func coercibleLiteral(e optimizer.Expr) (optimizer.Expr, bool) {
+	switch x := e.(type) {
+	case *optimizer.IntegerConst, *optimizer.NumericConst, *optimizer.StringConst:
+		return e, true
+	case *optimizer.UnaryOp:
+		if x.Op != parser.OpUnaryNeg {
+			return nil, false
+		}
+		switch c := x.Operand.(type) {
+		case *optimizer.IntegerConst:
+			return &optimizer.IntegerConst{Value: -c.Value}, true
+		case *optimizer.NumericConst:
+			if strings.HasPrefix(c.Value, "-") {
+				return nil, false
+			}
+			return &optimizer.NumericConst{Value: "-" + c.Value}, true
+		}
+	}
+	return nil, false
+}
+
+// formatCoercedLiteralOperands renders a comparison or arithmetic operator
+// whose one side is a literal the way PG prints it after parse analysis
+// coerced the literal to the other side's type (make_op): `n = '6'::numeric`,
+// `c = 'TN'::bpchar`, `t = 's'::text`; a varchar operand compares as text,
+// `((f)::text = 'x'::text)`, and an integer operand against a decimal
+// literal is itself cast, `((a)::numeric > 2.5)`. ok is false when neither
+// side is a literal over a modelled type; the caller prints as before.
+func formatCoercedLiteralOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (string, string, bool) {
+	switch x.Op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe,
+		parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv:
+	default:
+		return "", "", false
+	}
+	lit, litLeft := coercibleLiteral(x.Left)
+	other := x.Right
+	if !litLeft {
+		var ok bool
+		if lit, ok = coercibleLiteral(x.Right); !ok {
+			return "", "", false
+		}
+		other = x.Left
+	} else if _, both := coercibleLiteral(x.Right); both {
+		return "", "", false
+	}
+	t, ok := optimizer.ExprResultType(other)
+	if !ok || t.IsArray {
+		return "", "", false
+	}
+	otherText, litText, ok := coerceLiteralText(lit, t)
+	if !ok {
+		return "", "", false
+	}
+	o := formatExprQual(other, reg, qualify)
+	if otherText != "" {
+		o = "(" + o + ")::" + otherText
+	}
+	if litLeft {
+		return litText, o, true
+	}
+	return o, litText, true
+}
+
+// coerceLiteralText is get_const_expr's text for lit once coerced to t, plus
+// the cast the other operand takes when the operator's input type differs
+// from t (otherCast; "" for none).
+func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text string, ok bool) {
+	name := strings.ToLower(t.Name)
+	switch name {
+	case "int", "integer", "int4", "smallint", "int2", "bigint", "int8":
+		switch c := lit.(type) {
+		case *optimizer.IntegerConst:
+			// int2/int4/int8 all have int4 cross-type operators: the
+			// literal stays int4.
+			return "", intConstText(c.Value), true
+		case *optimizer.NumericConst:
+			return "numeric", numericConstText(c.Value), true
+		}
+	case "numeric", "decimal":
+		switch c := lit.(type) {
+		case *optimizer.IntegerConst:
+			return "", "'" + strconv.FormatInt(c.Value, 10) + "'::numeric", true
+		case *optimizer.NumericConst:
+			return "", numericConstText(c.Value), true
+		}
+	case "char", "character", "bpchar":
+		if c, isStr := lit.(*optimizer.StringConst); isStr && (name == "bpchar" || len(t.Args) > 0) {
+			return "", quoteLiteral(c.Value) + "::bpchar", true
+		}
+	case "text":
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			return "", quoteLiteral(c.Value) + "::text", true
+		}
+	case "varchar", "character varying":
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			return "text", quoteLiteral(c.Value) + "::text", true
+		}
+	}
+	return "", "", false
+}
+
+// numericConstText is get_const_expr's numeric arm: a value that starts
+// with a digit and holds a decimal point prints bare, anything else (an
+// integer, a negative) is quoted and labelled. An exponent literal is
+// normalised by numeric_out first, which this does not model.
+func numericConstText(v string) string {
+	if strings.ContainsAny(v, "eE") {
+		return v
+	}
+	if v != "" && v[0] >= '0' && v[0] <= '9' && strings.Contains(v, ".") {
+		return v
+	}
+	return "'" + v + "'::numeric"
+}
+
+func quoteLiteral(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
 // inListArrayConst renders an all-literal IN list as the array Const PG
