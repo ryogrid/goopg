@@ -222,3 +222,45 @@ Left (ledgered):
   carries none of them).
 
 Evidence: `analysis/m0146/m0146-0005/slice90/`.
+
+## Slice 91: M0146-0005cl — AND / OR chains print flat
+
+PG's AND and OR are N-ary BoolExprs, and eval_const_expressions
+(simplify_and_arguments / simplify_or_arguments) flattens nested
+same-kind arms. A planned qual therefore prints
+`((a = 1) AND (b = 2) AND (c = 3))`. goopg's planner keeps binary
+BinaryOp chains, and EXPLAIN printed `(((a = 1) AND (b = 2)) AND (c = 3))`.
+This was the most frequent remaining text gap inside the TPC-DS MATCH
+plans (Q7/Q27/Q28/Q53/Q63/Q82/Q88 filters).
+
+- formatExprQual's BinaryOp arm prints an AND or OR node as one
+  parenthesised list of its arms, with `flattenBoolArms` descending into
+  nested nodes of the same operator. Arms of the other operator keep
+  their own parentheses (`((a) AND (b)) OR (c)`).
+
+Instrument: `scripts/tpcds-text-identity.py` (new) counts the fire-set
+captures whose EXPLAIN text equals PG's with costs ignored, plus the
+position-aligned identical lines. It is the measure for this text-parity
+work, which the plan-parity classifier normalises away.
+
+Test: `TestBoolChainsPrintFlat` (5 PG 18.3 oracle lines; all fail with the
+flattening disabled).
+
+Movement:
+
+- TPC-DS text-identical plans go 8 → 12 at SF0.25 (Q7, Q27, Q28, Q82) and
+  5 → 8 at SF1 (Q27, Q28, Q41). Aligned identical lines go 1891 → 1916 and
+  1871 → 1895. The classifier counts are unchanged.
+- Regress, same-order A/B over 19 cases: 58524 → 58506.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Next gaps by count in the MATCH plans:
+
+- outer references in a parameterised Index Cond / Recheck Cond print
+  unqualified (`ss_customer_sk` for PG's `store_sales.ss_customer_sk`);
+- varchar operands lack PG's `(x)::text` cast;
+- PG orders a scan's quals by cost (order_qual_clauses), which goopg does
+  not.
+
+Evidence: `analysis/m0146/m0146-0005/slice91/`.

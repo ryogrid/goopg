@@ -3417,6 +3417,18 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	case *optimizer.NullConst:
 		return "NULL"
 	case *optimizer.BinaryOp:
+		if x.Op == parser.OpAnd || x.Op == parser.OpOr {
+			// M0146-0005cl: PG's AND / OR is an N-ary BoolExpr, and
+			// eval_const_expressions (simplify_and_arguments /
+			// simplify_or_arguments) flattens nested same-kind arms, so a
+			// planned qual prints `((a) AND (b) AND (c))`, never
+			// `(((a) AND (b)) AND (c))`.
+			var parts []string
+			for _, arm := range flattenBoolArms(x, x.Op, nil) {
+				parts = append(parts, formatExprQual(arm, reg, qualify))
+			}
+			return "(" + strings.Join(parts, " "+x.Op.String()+" ") + ")"
+		}
 		if l, r, ok := formatCoercedLiteralOperands(x, reg, qualify); ok {
 			return "(" + l + " " + x.Op.String() + " " + r + ")"
 		}
@@ -3746,6 +3758,16 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 		return "(NOT " + s + ")"
 	}
 	return s
+}
+
+// flattenBoolArms lists the arms of a chain of op (AND or OR) nodes in
+// order, descending into nested nodes of the same op.
+func flattenBoolArms(e optimizer.Expr, op parser.OpCode, out []optimizer.Expr) []optimizer.Expr {
+	if b, ok := e.(*optimizer.BinaryOp); ok && b.Op == op {
+		out = flattenBoolArms(b.Left, op, out)
+		return flattenBoolArms(b.Right, op, out)
+	}
+	return append(out, e)
 }
 
 // intConstText is get_const_expr's text for an integer literal: an int4

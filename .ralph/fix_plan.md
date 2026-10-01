@@ -23858,6 +23858,23 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cl — AND / OR chains print flat**
+  \(filed and landed 2026\-10\-01 from the MATCH\-plan text census: goopg
+  printed `\(\(\(a\) AND \(b\)\) AND \(c\)\)`, PG `\(\(a\) AND \(b\) AND \(c\)\)`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-01 \(slice 91\)\.** `flattenBoolArms` in
+    formatExprQual's BinaryOp arm; new instrument
+    `scripts/tpcds\-text\-identity\.py`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 91"\.
+  - Test `TestBoolChainsPrintFlat` \(5 PG oracle lines, 5/5 fail with it
+    off\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress 19\-case same\-order A/B, ea\-ratchet PASS \(10\)\.
+  - Next by count: unqualified outer refs in parameterised Index Cond,
+    varchar `::text` casts, qual cost ordering\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS text-identical plans 8 -> 12 (SF0.25), 5 -> 8 (SF1) per scripts/tpcds-text-identity.py; regress 19-case total 58524 -> 58506
 - [x] **M0146\-0005ck — a hash join prints its Hash node**
   \(filed and landed 2026\-10\-01 from the census: goopg printed none of
   PG's 241 `\->  Hash` lines over TPC\-DS SF0\.25\)\.
