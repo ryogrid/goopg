@@ -445,3 +445,40 @@ Left (ledgered): the recursive working table's `x_1`, and the
 InitPlan result.
 
 Evidence: `analysis/m0146/m0146-0005/slice95/`.
+
+## Slice 96: M0146-0005cq — a NestLoop param names its relation by its printed label
+
+Q88 and Q90 cross-join subqueries that each scan the same table, which
+set_rtable_names prints as `web_sales`, `web_sales_1`, …. Each subquery's
+parameterised index scan keys on its own loop's outer relation:
+`Index Cond: (t_time_sk = web_sales_1.ws_sold_time_sk)`. goopg printed
+`web_sales.` in every subquery. The key is an OuterColumnRef whose binding
+id restarts per subquery, so `names().column(id)` resolved every one to the
+first level's relation.
+
+- `subPlanReg.paramInner` is set by `enterParamInner` (slice 92) while a
+  parameterised loop's inner side prints, and cleared while a sublink's
+  subtree prints. Under it, the OuterColumnRef arm first resolves the name
+  against the loop's outer input with `explainNames.resolveLabelInAncestor`.
+  That is resolveInAncestor naming each relation by its disambiguated label,
+  as get_parameter deparses a NestLoop param against the outer plan.
+
+No unit test: a reproduction needs Q88/Q90's parallel subquery shape. A
+two-subquery probe resolved correctly through binding ids and was planned
+differently by PG, so the TPC-DS captures are the evidence.
+
+Movement:
+
+- Q90's second Index Cond now names `web_sales_1`. Q61's eight Index Conds
+  equal PG's (`store_sales_1` / `customer_1`), where four printed the
+  unsuffixed name.
+- Text-identical plans go 15 → 16 at SF0.25 (Q88). Aligned identical lines
+  go 1965 → 1973 and 1943 → 1944.
+- Q14 moves too, but its plan shape differs from PG's, so its suffix
+  numbers are not comparable.
+- Regress, same-order A/B over 7 cases: flat (join.sql row-order flap
+  only).
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice96/`.

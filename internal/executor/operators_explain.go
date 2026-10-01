@@ -593,12 +593,12 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// duration (upstream's push_ancestor_plan): a correlated reference
 	// inside the sublink is deparsed against THIS node's namespace, not
 	// the relation the sublink itself scans.
-	prevAncestor := reg.ancestor
-	reg.ancestor = n
+	prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
+	reg.ancestor, reg.paramInner = n, false
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subIndent int) {
 		walkPlanFiltered(sub, subIndent, rows, opts, nil, nil, reg)
 	})
-	reg.ancestor = prevAncestor
+	reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
@@ -2912,6 +2912,10 @@ type subPlanReg struct {
 	// (an aggregate zeroes SourceTableIdx). Set by the walkers around
 	// each node's render; nil outside one.
 	ancestor optimizer.Node
+	// paramInner is set while a parameterised nested loop's inner side
+	// prints (enterParamInner): ancestor is then the loop's outer input and
+	// an OuterColumnRef is that loop's NestLoop param (M0146-0005cq).
+	paramInner bool
 	// current is the plan node whose own lines are being rendered. A plain
 	// column in its detail lines is resolved against that node's subtree
 	// first (explainNames.columnIn), the way PG deparses a Var against the
@@ -3248,9 +3252,9 @@ func (r *subPlanReg) enterParamInner(n, c optimizer.Node) func() {
 	if outer == nil {
 		return func() {}
 	}
-	prev := r.ancestor
-	r.ancestor = outer
-	return func() { r.ancestor = prev }
+	prev, prevInner := r.ancestor, r.paramInner
+	r.ancestor, r.paramInner = outer, true
+	return func() { r.ancestor, r.paramInner = prev, prevInner }
 }
 
 // indexCondAndText joins an index qual's clauses the way PG prints its
@@ -3462,6 +3466,17 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		// is what makes PG print Q30's filter as
 		// `(ctr1.ctr_state = ctr_state)` rather than the
 		// self-comparison goopg used to print.
+		// M0146-0005cq: inside a parameterised nested loop's inner side the
+		// reference is the loop's NestLoop param, which get_parameter
+		// deparses against the loop's outer plan. Resolve it there first,
+		// with that relation's set_rtable_names label: binding ids restart
+		// per query level, so `SourceTableIdx` names the first level's
+		// `web_sales` where PG prints `web_sales_1` (TPC-DS Q88/Q90).
+		if reg != nil && reg.paramInner {
+			if rel := reg.names().resolveLabelInAncestor(reg.ancestorNode(), x.Name); rel != "" {
+				return rel + "." + x.Name
+			}
+		}
 		if s := reg.names().column(x.SourceTableIdx, x.Name, true); s != x.Name {
 			return s
 		}
@@ -4626,12 +4641,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
-	prevAncestor := reg.ancestor
-	reg.ancestor = n
+	prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
+	reg.ancestor, reg.paramInner = n, false
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
 		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
-	reg.ancestor = prevAncestor
+	reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {

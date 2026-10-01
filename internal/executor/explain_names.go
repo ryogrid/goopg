@@ -575,6 +575,47 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 // Recorded limit (review F8): this keys on bare base names, unsuffixed and
 // id-free, so it can disagree with bySource's suffixed names. Safe
 // direction — ambiguous degrades to "" — but not id-keyed.
+// resolveLabelInAncestor is resolveInAncestor with each relation named by
+// its printed label — the set_rtable_names `_N` suffix when the relation's
+// name repeats — so a NestLoop param resolved against the loop's outer
+// input names the same relation its scan line prints (`web_sales_1`). ""
+// unless exactly one relation in anc exposes colName.
+func (nm *explainNames) resolveLabelInAncestor(anc optimizer.Node, colName string) string {
+	if nm == nil || anc == nil || colName == "" {
+		return ""
+	}
+	var hit string
+	n := 0
+	var walk func(optimizer.Node)
+	walk = func(node optimizer.Node) {
+		if node == nil || n > 1 {
+			return
+		}
+		if base, ok := explainRelBaseName(node); ok {
+			if d := nm.disambiguatedName(node); d != "" {
+				base = d
+			}
+			for _, c := range node.Output() {
+				if c.Name == colName {
+					if base != hit {
+						n++
+						hit = base
+					}
+					break
+				}
+			}
+		}
+		for _, c := range planChildren(node) {
+			walk(c)
+		}
+	}
+	walk(anc)
+	if n != 1 {
+		return ""
+	}
+	return hit
+}
+
 func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) string {
 	if nm == nil || anc == nil || colName == "" {
 		return ""
