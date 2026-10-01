@@ -3689,15 +3689,31 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			b.WriteString(" ")
 			b.WriteString(formatExprQual(x.Operand, reg, qualify))
 		}
+		// M0146-0005ct: a NULL result is coerced to the CASE's type, and
+		// get_const_expr labels a typed NULL Const (`ELSE NULL::numeric`);
+		// an omitted ELSE is the parser's NULL defresult, which ruleutils
+		// always prints.
+		nullLabel := ""
+		if t, ok := optimizer.ExprResultType(x); ok {
+			nullLabel = nullConstTypeLabel(t)
+		}
+		result := func(e optimizer.Expr) string {
+			if _, isNull := e.(*optimizer.NullConst); isNull && nullLabel != "" {
+				return "NULL::" + nullLabel
+			}
+			return formatExprQual(e, reg, qualify)
+		}
 		for _, w := range x.Whens {
 			b.WriteString(" WHEN ")
 			b.WriteString(formatExprQual(w.When, reg, qualify))
 			b.WriteString(" THEN ")
-			b.WriteString(formatExprQual(w.Then, reg, qualify))
+			b.WriteString(result(w.Then))
 		}
 		if x.Else != nil {
 			b.WriteString(" ELSE ")
-			b.WriteString(formatExprQual(x.Else, reg, qualify))
+			b.WriteString(result(x.Else))
+		} else if nullLabel != "" {
+			b.WriteString(" ELSE NULL::" + nullLabel)
 		}
 		b.WriteString(" END")
 		return b.String()
@@ -4127,6 +4143,34 @@ func formatTextCastOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool
 		r = "(" + r + ")::text"
 	}
 	return l, r, true
+}
+
+// nullConstTypeLabel is format_type's name for a typed NULL Const of t, or
+// "" for a type this does not model (a typmod-carrying type, whose label
+// would need the modifier).
+func nullConstTypeLabel(t catalog.Type) string {
+	if t.IsArray || len(t.Args) > 0 {
+		return ""
+	}
+	switch strings.ToLower(t.Name) {
+	case "numeric", "decimal":
+		return "numeric"
+	case "int", "int4", "integer":
+		return "integer"
+	case "int8", "bigint":
+		return "bigint"
+	case "int2", "smallint":
+		return "smallint"
+	case "text":
+		return "text"
+	case "bool", "boolean":
+		return "boolean"
+	case "float8", "double precision":
+		return "double precision"
+	case "date":
+		return "date"
+	}
+	return ""
 }
 
 // numericConstText is get_const_expr's numeric arm: a value that starts

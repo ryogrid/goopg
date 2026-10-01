@@ -23858,6 +23858,19 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005ct — a NULL CASE arm prints as a typed NULL**
+  \(filed and landed 2026\-10\-02 from the 0cs ledger row: goopg printed
+  `ELSE NULL END`, PG `ELSE NULL::numeric END`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 99\)\.** CaseExpr arm \+ `nullConstTypeLabel`
+    in operators\_explain\.go\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 99"\.
+  - Test `TestCaseNullArmIsTyped`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96 \(FORCE during the nightly\),
+    fire set, TPC\-H arm 24/24 \(after the nightly\), ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS NULL::type labels 0 -> 26/26 (SF0.25), 0 -> 19/26 (SF1); text-identical 18 -> 19 (SF0.25)
 - [x] **M0146\-0005cs — a Subquery Scan's filter names its columns by the scan's alias**
   \(filed and landed 2026\-10\-02 from the MATCH\-plan text census: Q51/Q53/
   Q63/Q89 printed bare column names, PG `tmp1\.col`\)\.

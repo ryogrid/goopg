@@ -543,3 +543,32 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice98/`.
+
+## Slice 99: M0146-0005ct — a NULL CASE arm prints as a typed NULL
+
+PG's transformCaseExpr coerces every result arm to the CASE's common type,
+so a NULL arm becomes a typed NULL Const. get_const_expr labels it
+(`ELSE NULL::numeric`). An omitted ELSE is the parser's NULL defresult,
+which ruleutils always prints (`CASE WHEN (a > 0) THEN a ELSE
+NULL::integer END`). goopg printed `ELSE NULL END` and dropped the
+implicit ELSE. Over TPC-DS SF0.25, PG prints 26 such labels and goopg 0.
+
+- The CaseExpr arm labels NullConst results with `nullConstTypeLabel`
+  (format_type's name for the CASE's ExprResultType: numeric, integer,
+  bigint, smallint, text, boolean, double precision, date). It appends
+  `ELSE NULL::type` when no ELSE was written. Typmod-carrying and
+  unmodelled types keep the old text.
+
+Test: `TestCaseNullArmIsTyped` (4 PG 18.3 oracle lines; 3 fail with the
+label disabled, the fourth has no NULL arm).
+
+Movement:
+
+- TPC-DS `NULL::type` labels go 0 → 26 of 26 at SF0.25 and 0 → 19 of 26 at
+  SF1. No label goopg prints is missing from PG's plan for the same query.
+- Text-identical plans go 18 → 19 at SF0.25 (Q43). Aligned identical lines
+  go 1977 → 1985 and 1948 → 1955.
+- Gates: units, spotcheck, sweep 96/96, fire set, arm 24/24 (run after the
+  nightly batch) and ea-ratchet (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice99/`.
