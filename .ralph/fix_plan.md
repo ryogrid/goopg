@@ -23858,6 +23858,20 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cs — a Subquery Scan's filter names its columns by the scan's alias**
+  \(filed and landed 2026\-10\-02 from the MATCH\-plan text census: Q51/Q53/
+  Q63/Q89 printed bare column names, PG `tmp1\.col`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 98\)\.** SubqueryScan arm in
+    emitNodeDetailLines\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 98"\.
+  - Test: `TestExplainDoesNotQualifyDerivedColumns` expects PG's
+    `\(t\.s1 <> t\.s2\)`\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS text-identical 17 -> 18 (SF0.25), 11 -> 12 (SF1)
 - [x] **M0146\-0005cr — a group key over a pass\-through child is parenthesised**
   \(filed and landed 2026\-10\-02 from the MATCH\-plan text census: Q62/Q99's
   Finalize GroupAggregate over Gather Merge printed `substr\(…\)` bare\)\.

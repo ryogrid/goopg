@@ -513,3 +513,33 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice97/`.
+
+## Slice 98: M0146-0005cs — a Subquery Scan's filter names its columns by the scan's alias
+
+show_scan_qual sets `useprefix = IsA(plan, SubqueryScan) || es->verbose`,
+so a Subquery Scan's quals print each column as the scan's own alias
+column: `Filter: (y.web_cumulative > y.store_cumulative)` (TPC-DS Q51),
+`(tmp1.avg_quarterly_sales > …)` (Q53/Q63/Q89). goopg's generic detail arm
+resolved the columns through binding ids. Those restart per query level, so
+the columns could not be named and printed bare.
+
+- A `*optimizer.SubqueryScan` arm in emitNodeDetailLines maps every
+  ColumnRef that is a position in the scan's output (same name) to
+  `alias.col` through `displayColumn`, then prints the Filter.
+
+Test: `TestExplainDoesNotQualifyDerivedColumns` now expects PG 18.3's
+`Filter: (t.s1 <> t.s2)` (checked on PG; it fails with the arm disabled).
+Its wrong-relation guard is kept.
+
+Movement:
+
+- Q51 becomes text-identical at both scales: 17 → 18 (SF0.25) and
+  11 → 12 (SF1).
+- Q53/Q63/Q89's filters now match PG's except `ELSE NULL::numeric`
+  (ledgered: a NULL CASE arm takes the CASE's type label).
+- Q44/Q67 print a Subquery Scan filter where PG's plan shape has none (a
+  window run condition).
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice98/`.

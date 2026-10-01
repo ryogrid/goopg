@@ -230,7 +230,10 @@ func TestExplainDoesNotQualifyDerivedColumns(t *testing.T) {
 		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id OFFSET 0) t "+
 			"WHERE t.s1 <> t.s2")
 
-	got := findLine(lines, "s1 <> s2")
+	// PG 18.3 prints the Subquery Scan's own alias here (show_scan_qual
+	// prefixes a SubqueryScan's quals): `Filter: (t.s1 <> t.s2)`
+	// (M0146-0005cs).
+	got := findLine(lines, "t.s1 <> t.s2")
 	if got == "" {
 		t.Fatalf("derived-column filter missing or wrongly qualified:\n%s", strings.Join(lines, "\n"))
 	}

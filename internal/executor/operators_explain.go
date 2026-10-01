@@ -2000,6 +2000,26 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			full, _ := sortKeyParts(p.Child, p.Keys, reg, qualify)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
 		}
+	case *optimizer.SubqueryScan:
+		// M0146-0005cs: show_scan_qual prefixes a Subquery Scan's quals
+		// (useprefix = IsA(plan, SubqueryScan)), naming each column by the
+		// scan's own alias: `Filter: (y.web_cumulative > y.store_cumulative)`
+		// (TPC-DS Q51), `(tmp1.avg_quarterly_sales > …)` (Q53/Q63).
+		if attachedFilter != nil {
+			f := attachedFilter
+			if p.Alias != "" && reg != nil {
+				out := p.Output()
+				if r, ok := optimizer.CloneExprReplacingColumnRefs(f, func(c *optimizer.ColumnRef) optimizer.Expr {
+					if c.Index < 0 || c.Index >= len(out) || out[c.Index].Name != c.Name {
+						return c
+					}
+					return displayColumn(c, p.Alias+"."+c.Name, reg)
+				}); ok {
+					f = r
+				}
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(f, reg, qualify)))})
+		}
 	case *optimizer.WindowAgg:
 		// M0146-0005cg: PG 18's `Window: w1 AS (PARTITION BY … ORDER BY …
 		// frame)` (explain.c show_window_def). The keys deparse against the
