@@ -714,3 +714,33 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice103/`.
+
+## Slice 104: M0146-0005cy — a Memoize node prints its Cache Mode
+
+show_memoize_info prints `Cache Mode: logical|binary` on the line after
+`Cache Key:`. paraminfo_get_equal_hashops sets binary mode only for a join
+operator without a hash equality, or for lateral Vars. goopg printed the
+key and no mode, so every TPC-DS plan with a Memoize lost one line against
+PG. The text-identity census put that single missing line at the end of
+seven otherwise identical MATCH plans.
+
+- The Memoize arm prints `Cache Mode: logical` after the Cache Key. goopg
+  builds a Memoize only over an equality index probe (memoizeNodeFor /
+  maybeAttachMemoize), which is hashable and has no lateral Vars, so
+  logical is PG's answer for every node goopg produces. Every Cache Mode PG
+  prints over TPC-DS is `logical` too.
+
+Test: `memoize_exec_test.go` now requires `Cache Mode: logical` right after
+the Cache Key line, and fails with the line removed.
+
+Movement:
+
+- Text-identical plans go 21 → 24 at SF0.25 (Q13, Q48, Q55). Aligned
+  identical lines go 1987 → 2211 (SF0.25) and 1957 → 2013 (SF1), since the
+  missing line had shifted every line after it.
+- Regress memoize.sql has no goopg Memoize nodes for these queries; its
+  Cache Mode lines are PG-only either way.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice104/`.

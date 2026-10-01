@@ -80,6 +80,18 @@ func TestMemoizeExplainAndResults(t *testing.T) {
 	if !strings.Contains(plan, "Memoize") || !strings.Contains(plan, "Cache Key:") {
 		t.Fatalf("expected Memoize node with Cache Key line:\n%s", plan)
 	}
+	// PG 18.3's show_memoize_info prints the comparison mode on the line
+	// after the key; an equality-probe cache is `logical` (M0146-0005cy).
+	if ls := strings.Split(plan, "\n"); !func() bool {
+		for i, l := range ls {
+			if strings.Contains(l, "Cache Key:") {
+				return i+1 < len(ls) && strings.TrimSpace(ls[i+1]) == "Cache Mode: logical"
+			}
+		}
+		return false
+	}() {
+		t.Fatalf("expected `Cache Mode: logical` right after Cache Key:\n%s", plan)
+	}
 
 	withMemo, err := runQueryWithErr(ctx, memoizeJoinSQL)
 	if err != nil {

@@ -23868,6 +23868,19 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005cy — a Memoize node prints its Cache Mode**
+  \(filed and landed 2026\-10\-02 from the text\-identity census: seven
+  MATCH plans differed from PG by the one missing `Cache Mode:` line\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 104\)\.** Memoize arm prints `Cache Mode:
+    logical`\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-6.md`
+    § "Slice 104"\.
+  - Test: `memoize\_exec\_test\.go` requires the line after Cache Key\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set,
+    regress A/B, ea\-ratchet PASS \(10\)\.
+  Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15); TPC-DS text-identical 21 -> 24 (SF0.25), aligned lines 1987 -> 2211
 - [x] **M0146\-0005cx — an expression key over a join chases its columns into the aggregates**
   \(filed and landed 2026\-10\-02 from the 0cw ledger row: Q90 printed
   `amc`/`pmc`, PG `\(count\(\*\)\)`\)\.

@@ -2332,6 +2332,12 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				parts = append(parts, formatExprQual(ke, reg, qualify))
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
+			// M0146-0005cy: show_memoize_info prints the comparison mode
+			// right after the key. goopg builds a Memoize only over an
+			// equality index probe, whose operators are hashable and carry
+			// no lateral Vars, so paraminfo_get_equal_hashops leaves
+			// binary_mode false: `logical`.
+			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Mode: logical")})
 		}
 	case *optimizer.SeqScan:
 		// TABLESAMPLE's `Sampling:` line (explain.c show_tablesample,
