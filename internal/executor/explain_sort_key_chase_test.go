@@ -226,3 +226,25 @@ func TestSortKeyOverGroupingSetsDeparsesGroupExprs(t *testing.T) {
 		t.Fatalf("got %q, want PG's grouping-expression deparse `('a chan'…), (('x' || ra.id))`", sortKey)
 	}
 }
+
+// TestSortKeyOverCrossJoinOfAggregates pins M0146-0005ce against PG 18.3: a
+// key naming a scalar aggregate subquery's output reaches the aggregate
+// through the cross join even though the join's output column carries no
+// relation (it is an aggregate result) — TPC-DS Q61. PG on this fixture:
+//
+//	Sort Key: (sum(sp.v)), (sum(sp_1.v))
+//
+// goopg does not yet suffix the second reference `_1` (ledgered); both
+// aggregate expansions are what this pins.
+func TestSortKeyOverCrossJoinOfAggregates(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE sp (p int, v int)")
+	runSQL(t, ctx, "INSERT INTO sp SELECT i % 3, i FROM generate_series(1,300) i")
+	runSQL(t, ctx, "ANALYZE sp")
+	got := explainLine(t, ctx, "EXPLAIN (COSTS OFF) SELECT promotions, total FROM (SELECT sum(v) promotions FROM sp WHERE p = 1) a, "+
+		"(SELECT sum(v) total FROM sp) b ORDER BY promotions, total", "Sort Key:")
+	if !strings.HasPrefix(got, "Sort Key: (sum(sp.v)), (sum(sp") {
+		t.Fatalf("got %q, want PG's `(sum(sp.v)), (sum(sp_1.v))`", got)
+	}
+}

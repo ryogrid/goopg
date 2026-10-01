@@ -650,3 +650,43 @@ Movement:
   (10) pass.
 
 Evidence: `analysis/m0146/m0146-0005/slice83/`.
+
+## Slice 84: M0146-0005ce — the key chase crosses Gather and aggregate-result joins
+
+Two declines remained in `resolveKeySource`, each traced with an env-gated
+trace on the probe server.
+
+- **Gather / Gather Merge.** `childNodeOf` returned nil for them. That arm
+  was left dead in slice 79, because enabling it let a Finalize group key
+  read through the Partial Aggregate below and print `sum(CASE …)` (Q59).
+  The real defect was the transport layout. Gather and Gather Merge now
+  pass through, and the Aggregate arm declines any non-Simple (partial or
+  finalize) aggregate, so Q59's keys stay correct. TPC-DS Q66's keys now
+  reach `warehouse.*` through a Parallel Append. goopg prints
+  `warehouse_1.*` because its Parallel Append orders the catalog arm
+  first, where PG chose a plain Append in query order; that is
+  plan-shape-induced.
+- **Aggregate-result join columns.** The join arm declined whenever the key
+  named a relation (Q61's `promotions` names subquery binding 1) and the
+  join output column did not carry that relation. Here the column is an
+  aggregate result, relation 0. The check now fires only when both
+  relations are non-zero. relMismatch and the Project arm's own check still
+  keep partition\_join's same-named mislabel out, and the regress A/B
+  confirms partition\_join is unchanged. Q61 now prints PG's
+  `(sum(store_sales.ss_ext_sales_price)), (sum(store_sales_1.ss_ext_sales_price))`.
+
+Test: `TestSortKeyOverCrossJoinOfAggregates`, with the PG 18.3 oracle
+`Sort Key: (sum(sp.v)), (sum(sp_1.v))`; goopg's `_1` suffix is not pinned
+(ledgered). It fails with the strict check restored.
+
+Movement:
+
+- CATEGORIES-EXCL-MATCH rendering goes SF0.25 14 → 12 and SF1 17 → 15
+  (Q14, Q61), with no new rendering divergence.
+- Regress groupingsets.sql goes 1921 → 1920: its hashed-grouping keys now
+  reach `tenk1.unique1` through the Gather. The other cases are unchanged
+  apart from join.sql's flap.
+- Gates: units, spotcheck, sweep 96/96, arm 24/24, fire set and ea-ratchet
+  (10) pass.
+
+Evidence: `analysis/m0146/m0146-0005/slice84/`.

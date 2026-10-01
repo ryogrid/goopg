@@ -984,7 +984,13 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 			// with SourceTableIdx across a FULL join's merged columns
 			// (regress partition_join's `t2.b`), and the relation id is the
 			// rendering's truth, so a disagreement declines.
-			if col.SourceTableIdx != 0 && nout[idx].SourceTableIdx != col.SourceTableIdx {
+			// A table-0 output column (an aggregate's result, a computed
+			// target) carries no relation to compare (TPC-DS Q61's
+			// `promotions` over a cross join of two aggregate subqueries,
+			// M0146-0005ce); relMismatch and the Project arm's own check
+			// still keep a same-named column of another relation out.
+			if col.SourceTableIdx != 0 && nout[idx].SourceTableIdx != 0 &&
+				nout[idx].SourceTableIdx != col.SourceTableIdx {
 				return nil, false
 			}
 			if relMismatch(nout[idx].Name, nout[idx].SourceTableIdx) {
@@ -1246,7 +1252,14 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 		case *optimizer.Aggregate:
 			// Grouping sets keep the group-prefix layout too (see
 			// sortGroupKeySource, M0146-0005cd); a mask position declines
-			// below.
+			// below. A partial or finalize aggregate does not: its rows are
+			// the transport layout, whose positions a key from above does not
+			// address (a Finalize key read through the Partial below printed
+			// `sum(CASE …)` for TPC-DS Q59's group key), so the split pair
+			// declines (M0146-0005ce, now that Gather passes through).
+			if n.Mode != optimizer.AggModeSimple {
+				return nil, false
+			}
 			col, ok := cur.(*optimizer.ColumnRef)
 			if !ok {
 				return nil, false
@@ -1407,6 +1420,10 @@ func childNodeOf(n optimizer.Node) optimizer.Node {
 	case *optimizer.Filter:
 		return t.Child
 	case *optimizer.SubqueryScan:
+		return t.Child
+	case *optimizer.Gather:
+		return t.Child
+	case *optimizer.GatherMerge:
 		return t.Child
 	}
 	return nil

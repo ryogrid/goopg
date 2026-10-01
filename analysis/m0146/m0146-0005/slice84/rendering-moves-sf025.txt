@@ -1,0 +1,4 @@
+1d0
+< Q14     Sort rendering: Sort Key text differs
+13d11
+< Q61     Sort rendering: Sort Key text differs
