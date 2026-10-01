@@ -4159,9 +4159,12 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 			return "", quoteLiteral(c.Value) + "::text", true
 		}
 	case "date":
-		// date_in's canonical ISO text prints unchanged (M0146-0005cw).
-		if c, isStr := lit.(*optimizer.StringConst); isStr && isCanonicalISODate(c.Value) {
-			return "", quoteLiteral(c.Value) + "::date", true
+		// date_in's value prints as date_out's ISO text (M0146-0005cw,
+		// M0146-0005da: '2002-5-01' -> '2002-05-01'::date).
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			if d, ok := canonicalISODateText(c.Value); ok {
+				return "", quoteLiteral(d) + "::date", true
+			}
 		}
 	case "varchar", "character varying":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
@@ -4378,9 +4381,11 @@ func castLiteralConstText(lit optimizer.Expr, target string, typmod int64, typ s
 		}
 		return quoteLiteral(v) + "::" + typ, true
 	case "date":
-		if !isCanonicalISODate(v) {
+		d, ok := canonicalISODateText(v)
+		if !ok {
 			return "", false
 		}
+		v = d
 	case "bool", "boolean":
 		return "", false
 	}
@@ -4564,10 +4569,14 @@ func inListArrayConst(lt catalog.Type, list []optimizer.Expr) (cast, lit string,
 	case "date":
 		for i, e := range list {
 			sc, isStr := e.(*optimizer.StringConst)
-			if !isStr || !isCanonicalISODate(sc.Value) {
+			if !isStr {
 				return "", "", false
 			}
-			elems[i] = sc.Value
+			d, ok := canonicalISODateText(sc.Value)
+			if !ok {
+				return "", "", false
+			}
+			elems[i] = d
 		}
 		typ = "date"
 	default:
@@ -4602,6 +4611,25 @@ func arrayOutElem(v string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// canonicalISODateText is date_out's ISO text for a date literal written
+// year-first with a four-digit year and one- or two-digit month and day
+// ('2002-5-01' -> '2002-05-01'). That form reads the same under every
+// DateStyle field order, so the folded Const's text does not depend on the
+// session; any other spelling declines and keeps the caller's text.
+func canonicalISODateText(v string) (string, bool) {
+	if isCanonicalISODate(v) {
+		return v, true
+	}
+	if len(v) < 8 || len(v) > 10 || v[4] != '-' {
+		return "", false
+	}
+	t, err := time.Parse("2006-1-2", v)
+	if err != nil {
+		return "", false
+	}
+	return t.Format("2006-01-02"), true
 }
 
 // isCanonicalISODate reports whether v is already date_out's ISO text

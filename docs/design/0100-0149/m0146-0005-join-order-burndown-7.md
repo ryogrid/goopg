@@ -45,3 +45,41 @@ Movement:
   and ea-ratchet (10).
 
 Evidence: `analysis/m0146/m0146-0005/slice105/`.
+
+## Slice 106: M0146-0005da — a non-canonical date literal prints as date_out's text
+
+make_op coerces `d_date >= '2002-5-01'` to a date Const, and get_const_expr
+prints that value with date_out: `'2002-05-01'::date`. goopg printed the
+coerced literal only when its text was already ISO (`YYYY-MM-DD`), so
+TPC-DS Q16, Q94 and Q95 (`'2002-5-01'`, `'2001-4-01'`) kept the bare
+`'2002-5-01'` at both scales.
+
+- `canonicalISODateText` returns the ISO text for a four-digit-year
+  `Y-M-D` literal with one- or two-digit month and day. That form reads
+  the same under every DateStyle field order, so the printed text does not
+  depend on the session. Every other spelling declines, as before.
+- It replaces the ISO-only check at all three date sites: a comparison
+  operand (coerceLiteralText), an explicit cast (castLiteralConstText)
+  and an IN-list array element (inListArrayConst).
+- Side finding, filed and not worked: numeric literal arithmetic folds
+  through float64 (Q21's `2.0/3.0` → `0.6666666666666666`), filed as
+  M0146-0041 (S2). The `cast(... as date) + 60` bound in Q94 is
+  M0146-0040's `date + integer` defect (S2), which this slice does not
+  touch.
+
+Test: `explain_coerced_literal_test.go` adds three date cases and
+`explain_in_list_array_test.go` adds a date IN list, all with PG 18.3's
+output. Three of them fail without the fix.
+
+Movement:
+
+- Uncoerced date literals in the TPC-DS captures go 3 → 0 at both
+  scales.
+- Text-identical plans go 25 → 26 at SF0.25 and 14 → 15 at SF1 (Q94).
+- CATEGORIES-EXCL-MATCH is unchanged (rendering 12 / 15).
+- Regress A/B is not applicable: no regress EXPLAIN uses a non-canonical
+  date literal.
+- Gates pass: units, spotcheck, sweep 96/96, arm, fire set (Q16 Q94 Q95)
+  and ea-ratchet (10).
+
+Evidence: `analysis/m0146/m0146-0005/slice106/`.

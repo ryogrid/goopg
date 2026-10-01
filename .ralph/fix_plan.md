@@ -23868,6 +23868,20 @@ M0146-0001 re-baseline census on the new default arm.
     \(7 fires\), regress 12 cases \(groupingsets 1921 → 1920,
     partition\_join unchanged\), ea\-ratchet PASS \(10\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 14 -> 12, SF1 17 -> 15
+- [x] **M0146\-0005da — a non\-canonical date literal prints as date\_out\'s text**
+  \(filed and landed 2026\-10\-02 from the text\-identity census: Q16/Q94/Q95
+  printed `d\_date >= '2002\-5\-01'` where PG prints `'2002\-05\-01'::date`\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - **DONE 2026\-10\-02 \(slice 106\)\.** `canonicalISODateText` replaces the
+    ISO\-only check at the comparison, cast and IN\-list date sites\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Slice 106"\.
+  - Side finding: numeric constant folding through float64, filed as
+    M0146\-0041 \(S2, escalated, not worked\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(Q16 Q94
+    Q95\), ea\-ratchet PASS \(10\); regress A/B not applicable\.
+  Movement: yes — TPC-DS text-identical 25 -> 26 (SF0.25), 14 -> 15 (SF1); uncoerced date literals 3 -> 0; CATEGORIES-EXCL-MATCH unchanged (rendering 12 / 15)
 - [x] **M0146\-0005cz — an IN list over a text\-only function folds to an array Const**
   \(filed and landed 2026\-10\-02 from the text\-identity census: Q8, Q15 and
   Q45 printed `= ANY \('85669', …\)` where PG prints `'\{…\}'::text\[\]`\)\.
@@ -24233,6 +24247,31 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0041 — WRONG RESULTS: numeric literal arithmetic is folded
+  through float64** \(filed 2026\-10\-02 by the M0146\-0005 text\-identity
+  census, TPC\-DS Q21's `0\.6666666666666666` vs PG\'s
+  `0\.66666666666666666667`; REPRODUCED on the private :5533 probe
+  cluster, S2 escalation: wrong results\)\.
+  `SELECT 0\.1\+0\.2, 1\.1\*1\.1, 12345678901234567890\.5 \+ 1, 1\.50 \+ 1,
+  1\.0/3, 2\.0/3\.0\*3` returns `0\.30000000000000004 \| 1\.2100000000000002 \|
+  12345678901234567000 \| 2\.5 \| 0\.3333333333333333 \| 2`; PG 18\.3 returns
+  `0\.3 \| 1\.21 \| 12345678901234567891\.5 \| 2\.50 \| 0\.33333333333333333333
+  \| 2\.00000000000000000001`\. Division over numeric COLUMNS and
+  `2::numeric/3` are correct; only planner constant folding is wrong\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-02 \(S2\) — wrong results from numeric constant folding
+  > Filed by M0146\-0005 slice 106's census, not worked\. Owner: place
+  > M0146\-0041 in the banner\.
+  - Not worked \(S2: the owner places it\)\. Root cause:
+    `internal/optimizer/foldconst\.go` `evalArith` parses both operands
+    with `strconv\.ParseFloat` and formats the result with
+    `FormatFloat\(…, 'f', \-1, 64\)` whenever either side is a
+    NumericConst\.
+  - First step: fold with the executor\'s numeric arithmetic \(PG
+    numeric\_add/sub/mul/div: add\_var/sub\_var/mul\_var/div\_var with
+    `select_div_scale`, numeric\.c\), or decline to fold a numeric
+    operand so the executor computes it\.
 - [ ] **M0146\-0040 — `date \+ integer` returns a timestamp\-formatted
   value of type unknown** \(filed 2026\-10\-01 by slice 88; REPRODUCED on
   the private :5533 probe cluster, S2 escalation: wrong results\)\.

@@ -31,6 +31,7 @@ func TestInListPrintsFoldedArrayConst(t *testing.T) {
 		{"a IN (1, 2.5)", "Filter: ((a)::numeric = ANY ('{1,2.5}'::numeric[]))"},
 		{"f IN ('a','b')", "Filter: ((f)::text = ANY ('{a,b}'::text[]))"},
 		{"g IN ('2001-01-01','2001-02-01')", "Filter: (g = ANY ('{2001-01-01,2001-02-01}'::date[]))"},
+		{"g IN ('2001-1-2','2001-02-03')", "Filter: (g = ANY ('{2001-01-02,2001-02-03}'::date[]))"},
 		{"a NOT IN (1,2)", "Filter: (a <> ALL ('{1,2}'::integer[]))"},
 		{"NOT (b IN (3,4))", "Filter: (b <> ALL ('{3,4}'::bigint[]))"},
 		{"a <> ANY (ARRAY[1,2])", "Filter: (a <> ANY ('{1,2}'::integer[]))"},
