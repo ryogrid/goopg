@@ -8552,6 +8552,21 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 	}
 
+	// M0146-0005dm: stack the WindowAggs in select_active_windows order —
+	// the window with the stronger (and larger-ref) sort lowest — and name
+	// them after sorting, as grouping_planner does.
+	if len(groups) > 1 {
+		defs := make([]*parser.WindowDef, len(groups))
+		for i, g := range groups {
+			defs[i] = g.calls[0].Over
+		}
+		perm := orderWindowDefsLikePG(s, defs)
+		sorted := make([]*specGroup, len(groups))
+		for i, j := range perm {
+			sorted[i] = groups[j]
+		}
+		groups = sorted
+	}
 	groupNames := make([]string, len(groups))
 	for i, g := range groups {
 		groupNames[i] = windowClauseName(s, g.calls)

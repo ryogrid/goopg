@@ -24327,11 +24327,21 @@ M0146-0001 re-baseline census on the new default arm.
     - Found: M0146\-0047 \(S2, filed\) — whole\-row of a null\-extended row
       is not NULL\.
     Movement: none — match 39/28 flat; CATEGORIES\-EXCL\-MATCH flat at SF0\.25, SF1 qual\-placement 7→8 \(Q72 tag on a still\-divergent tree\)
-- [ ] **M0146\-0005dm — stacked WindowAggs run in select\_active\_windows order** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dm — stacked WindowAggs run in select\_active\_windows order** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q47, Q57, Q49: goopg evaluates the partition\-only window lower; PG puts the ORDER BY window first \(common\_prefix\_cmp\)\. Cost\-neutral but shape\-visible\.
   Kind: impl
   Parent: M0146\-0005
   - First step: compare goopg\'s window ordering \(M0146\-0017 sharing\) with select\_active\_windows / common\_prefix\_cmp \(planner\.c\)\.
+  - **LANDED 2026\-10\-03\.** `orderWindowDefsLikePG` \(window\_order\.go\)
+    sorts the spec groups by common\_prefix\_cmp over PG\'s tleSortGroupRef
+    order \(ORDER BY, GROUP BY, DISTINCT, then each window ORDER BY before
+    PARTITION BY\); `buildWindowStage` names them afterwards\. Design
+    `docs/design/0100\-0149/m0146\-0005dm\-window\-stack\-order\.md`\.
+    - Probes: 5 window shapes EXPLAIN\-identical to PG; regress `window`
+      4447→4348\.
+    - TPC\-DS: Q47/Q49/Q57 fire, values PASS; rendering 11→10 / 14→13\.
+    - Found: M0146\-0048 \(S2, filed\) — NULLS FIRST/LAST windows merged\.
+    Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 11→10 \(SF0\.25\) and 14→13 \(SF1\); match flat 39/28
 - [ ] **M0146\-0005dn — a rank\-bounded subquery filter becomes a WindowAgg Run Condition** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q44, Q67: goopg keeps `Subquery Scan \+ Filter \(rk \<= 100\)`; PG pushes it into the WindowAgg as `Run Condition: \(rank\(\) OVER \.\.\. \<= 100\)` and drops the Subquery Scan\. goopg prints no Run Condition in the whole capture \(M0146\-0005i fixed only the selectivity\)\.
   Kind: impl
@@ -24835,6 +24845,23 @@ M0146-0001 re-baseline census on the new default arm.
   > ## ESCALATION 2026\-10\-03 \(S2\) — whole\-row value of a null\-extended row is not NULL
   > Filed by the M0146\-0005dl probe, not worked\. Owner: place
   > M0146\-0047 in the banner\.
+- [ ] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
+  FIRST/LAST share one WindowAgg** \(filed 2026\-10\-03 by the M0146\-0005dm
+  probe; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
+  results\)\. `SELECT x, rank\(\) OVER \(ORDER BY x NULLS FIRST\) r1, rank\(\)
+  OVER \(ORDER BY x\) r2 FROM \(VALUES \(1\),\(NULL\),\(2\)\) v\(x\)`: PG 18\.3
+  gives r2 = 1, 2 for x = 1, 2; goopg gives 2, 3 — both calls are computed
+  under the NULLS FIRST order\. `windowSpecKey` \(planner\.go\) keys an ORDER
+  BY item on its expression and ASC/DESC only, so the NULLS ordering is lost
+  and the two specs collapse into one group; PG keeps them as two windows
+  \(EXPLAIN shows two WindowAggs and two Sorts\)\. Pre\-existing — not
+  introduced by M0146\-0005dm\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-03 \(S2\) — NULLS FIRST/LAST windows merged into one WindowAgg
+  > Filed by the M0146\-0005dm probe, not worked\. Owner: place
+  > M0146\-0048 in the banner\. Resume point: add the nulls ordering
+  > \(`sortByNullsFirst`\) to `windowSpecKey`'s ORDER BY items\.
   - Not worked \(S2: the owner places it\)\. First step: find how the
     IndexScan / IndexOnlyScan executor arms fill the system\-column slot
     \(the SeqScan and BitmapHeapScan arms do\), and whether the planner
