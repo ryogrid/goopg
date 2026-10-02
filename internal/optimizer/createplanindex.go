@@ -450,11 +450,11 @@ func createIndexScanPlan(p *Path) Node {
 	case p.IndexSkipPrefix < 0 || p.IndexSkipPrefix+len(p.IndexClauses) > ncols:
 		panic(fmt.Sprintf("createPlan: PathIndexScan on %s skips %d columns then binds %d clauses on a %d-column index",
 			p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses), ncols))
-	case p.IndexSkipPrefix > 0 && p.RequiredOuter == 0:
-		// The only producer of a skip path this slice is the
-		// parameterised one; a skip would also work for a constant probe
-		// but its planner arm is deliberately unbuilt (M0146-0005v).
-		panic(fmt.Sprintf("createPlan: unparameterised skip PathIndexScan on %s has no producer", p.IndexInfo.Name))
+	case p.IndexSkipPrefix > 0 && p.RequiredOuter == 0 && !indexClausesAllLocal(p.IndexClauses):
+		// An unparameterised skip probe (M0146-0005dg) binds the relation's
+		// own `col = const` restrictions; a clause with no local conjunct
+		// would be a join clause with no outer to bind it.
+		panic(fmt.Sprintf("createPlan: unparameterised skip PathIndexScan on %s binds a non-local clause", p.IndexInfo.Name))
 	}
 
 	is := &IndexScan{
@@ -709,4 +709,16 @@ func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
 		out = &Filter{pos: w.pos, Child: out, Predicate: pred, LeafLocal: w.LeafLocal}
 	}
 	return out
+}
+
+// indexClausesAllLocal reports whether every clause came from the
+// relation's own restrictions (a local conjunct the lowering drops from the
+// reinstated Filter).
+func indexClausesAllLocal(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if c.local == nil {
+			return false
+		}
+	}
+	return true
 }

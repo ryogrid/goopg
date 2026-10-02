@@ -24139,7 +24139,7 @@ M0146-0001 re-baseline census on the new default arm.
     SF1 Q17/Q25/Q29\), M0146\-0042b \(EC clauses after the other join
     quals\); ledger row for the unmodelled paths\.
   Movement: none — instrument artefact: CATEGORIES-EXCL-MATCH normalises qual text (rendering 11 / 14 unchanged); text-identity moved SF0.25 29→34 (Q50, Q53, Q63, Q74, Q91), SF1 18→20
-- [ ] **M0146\-0005dg — a non\-leading\-column equality on a constant gets
+- [x] **M0146\-0005dg — a non\-leading\-column equality on a constant gets
   PG 18\'s skip scan** \(filed 2026\-10\-02 by the slice\-112 diagnosis\)\.
   `select \* from inventory where inv\_item\_sk = 100` \(inventory\_pkey is
   `\(inv\_date\_sk, inv\_item\_sk, inv\_warehouse\_sk\)`\): PG 18\.3 plans
@@ -24152,6 +24152,19 @@ M0146-0001 re-baseline census on the new default arm.
     \(`pathindexrestrict\.go`\) the same `pickIndexSkipRun` /
     `skipScanDescents` arm the parameterised producer uses, with its
     NOT\-NULL guards\.
+  - **DONE 2026\-10\-02 \(slice 113\)\.** `restrictionSkipRun` builds the
+    unparameterised skip probe \(priced by `skipScanDescents`\); the lowering
+    accepts an all\-local skip probe; `tryPromoteIndexOnlyScan` declines skip
+    probes \(it dropped SkipPrefix and returned 0 rows\)\. Design
+    `docs/design/0100\-0149/m0146\-0005dg\-restriction\-skip\-scan\.md`\.
+  - Test `TestRestrictionSkipScanMatchesPG` \(fails without the arm; 0 rows
+    without the guard\)\. Probe values match PG on the SF0\.25 clone\.
+  - Gates: units, spotcheck, sf025 96/96, arm, fire set \(no TPC\-DS plan
+    changed\), ea\-ratchet; regress btree\_index Index Cond lines now match,
+    7 other cases unchanged\.
+  - Ledgered: covering skip probe stays Index Scan \(PG Index Only Scan\);
+    no backward skip scan; costs through the known index\-cost families\.
+  Movement: none — no TPC-DS plan changed (no constant-driven skip probe in the corpus); regress btree_index Index Cond lines 2 fixed
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints

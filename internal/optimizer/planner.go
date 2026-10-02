@@ -18059,6 +18059,13 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if len(idxScan.RangePrefix) > 0 {
 		return proj
 	}
+	// M0146-0005dg: likewise a skip probe. Copying Keys without SkipPrefix
+	// re-aims `inv_item_sk = 100` at the leading `inv_date_sk` (measured),
+	// and the promotion's re-costing has no num_sa_scans. PG 18 does make
+	// this an Index Only Scan — ledgered; declining is the safe half.
+	if idxScan.SkipPrefix > 0 {
+		return proj
+	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
 	// because indexOnlyScanOp called the inclusive RangeScan and copied no
 	// LowOp/HighOp, so with the part-5 Filter drop the boundary value leaked
