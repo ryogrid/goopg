@@ -9035,6 +9035,15 @@ func windowSpecKey(w *parser.WindowDef) string {
 		} else {
 			b.WriteString(":asc")
 		}
+		// M0146-0048: the effective NULLS ordering is part of the window's
+		// sort (PG keeps `ORDER BY x NULLS FIRST` and `ORDER BY x` as two
+		// windows); keying on it normalises an explicit default (`ASC NULLS
+		// LAST`) to the implicit one.
+		if sortByNullsFirst(o) {
+			b.WriteString(":nf")
+		} else {
+			b.WriteString(":nl")
+		}
 		b.WriteString("|")
 	}
 	b.WriteString("f:")
