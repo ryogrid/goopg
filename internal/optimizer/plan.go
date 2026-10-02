@@ -3291,6 +3291,13 @@ type DistinctOn struct {
 	// executor's attach* walks (parallel_scan.go), which all refuse the
 	// unmarked kind.
 	PartialUnique bool
+	// Hashed is PG's UNIQUE_PATH_HASH for a unique-ified semijoin RHS
+	// (create_unique_plan's AGG_HASHED Agg, EXPLAIN `HashAggregate` /
+	// `Group Key:`): the input is unsorted and the first row of each key is
+	// kept, the other columns passing through. Those columns are never read
+	// above a semijoin RHS — only the uniq exprs are — so which duplicate
+	// survives is immaterial (M0146-0005dk).
+	Hashed bool
 }
 
 func (n *DistinctOn) Pos() int       { return n.pos }

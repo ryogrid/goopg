@@ -363,6 +363,17 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// nested-loop candidate for the pair reads them. `jt` is already
 	// demoted to INNER when a side is unique-ified, as in PG.
 	semi := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
+	// M0146-0005dk: add_paths_to_joinrel's JOIN_UNIQUE_INNER arm —
+	// `extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
+	// outerrel->relids)`: the unique-ified RHS is unique relative to an LHS
+	// that covers the semijoin's whole min_lefthand, and only then. Its
+	// factors are the semijoin's own (compute_semi_anti_join_factors under
+	// JOIN_SEMI, over the un-unique-ified inner rel's rows).
+	uniqInnerUnique := uniq == uniqueSideInner && sjinfo != nil &&
+		relsSubset(sjinfo.MinLefthand, outer.Relids)
+	if uniqInnerUnique {
+		semi = s.semiAntiJoinFactorsFor(outer, inner, parser.JoinSemi, clauses)
+	}
 	// M0146-0005f: final_cost_nestloop takes the same early-exit branch for
 	// an INNER pair whose inner rel is proven unique (extra->inner_unique),
 	// with the inner-join factors (outer_match_frac = the clause selectivity,
@@ -436,7 +447,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// merge whose every join clause is a merge clause then never
 				// rewinds its inner (skip_mark_restore).
 				innerUnique := jt != parser.JoinSemi && jt != parser.JoinAnti &&
-					(uniq == uniqueSideInner || s.innerRelProvenUnique(outer, inner, clauses, true))
+					(uniqInnerUnique || (uniq != uniqueSideInner && s.innerRelProvenUnique(outer, inner, clauses, true)))
 				// mergejointuples: what the merge operator emits, before the
 				// residual filters it to joinrel.Rows. Computed ONCE here, where
 				// the searchCtx (and so the selectivity model) is in scope, and
@@ -501,6 +512,11 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
 		if len(keys) > 0 {
 			final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, clauses)
+			if uniqInnerUnique && semi.apply {
+				final.innerUnique = true
+				final.outerMatchFrac, final.matchCount = semi.outerMatchFrac, semi.matchCount
+			}
+			final.uniquePathInner = uniq == uniqueSideInner
 			// take2 P2-11: the inner side is the BUILD side here, so the
 			// bucket fraction is measured on its keys. Computed at this site
 			// because the searchCtx — and so the statistics — is in scope,

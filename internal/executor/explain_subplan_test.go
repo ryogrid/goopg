@@ -267,15 +267,25 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	ctx, cleanup := explainSubPlanFixture(t)
 	defer cleanup()
 
-	// A top-level correlated IN unnests to a semi join today; the
-	// label must name the join type rather than rendering `(?)`.
+	// A top-level correlated IN whose correlation is not an equality
+	// cannot be unique-ified (compute_semijoin_info leaves semi_can_* off),
+	// so it stays a semi join — PG 18.3 plans `Hash Semi Join` with a
+	// `Join Filter` here. The label must name the join type rather than
+	// rendering `(?)`.
 	semi, _ := joinedPlan(t, ctx,
-		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.a = t1.a)")
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.b > t1.b)")
 	if strings.Contains(semi, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", semi)
 	}
 	if !strings.Contains(semi, "Semi Join") {
 		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
+	}
+	// An all-equality correlated IN is unique-ified instead (M0146-0005dk):
+	// PG 18.3 plans `Hash Join` over `HashAggregate` / `Group Key: t2.a`.
+	uniq, _ := joinedPlan(t, ctx,
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.a = t1.a)")
+	if !strings.Contains(uniq, "HashAggregate") || !strings.Contains(uniq, "Group Key: t2.a") {
+		t.Errorf("all-equality correlated IN was not unique-ified as PG does:\n%s", uniq)
 	}
 
 	// NOT EXISTS pulls up to an anti join (PG's pull_up_sublinks converts

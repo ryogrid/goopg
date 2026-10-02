@@ -257,6 +257,14 @@ type Path struct {
 	// `PathPrebuilt` today). `createUniquePlan` passes it straight to the
 	// emitted `*DistinctOn.KeyCols`. nil for every other kind.
 	UniqueKeyCols []int
+	// UniqueHashed selects create_unique_path's UNIQUE_PATH_HASH: Children[0]
+	// is the unsorted subpath and the lowering emits a hashed *DistinctOn.
+	UniqueHashed bool
+	// UniqueExprs, when set, are the uniq exprs in problem-space (binding)
+	// coordinates — a pulled base-relation RHS (M0146-0005dk). The lowering
+	// resolves them through the built child's layout into the DistinctOn's
+	// key positions, and UniqueKeyCols is then ignored.
+	UniqueExprs []Expr
 
 	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
 	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,

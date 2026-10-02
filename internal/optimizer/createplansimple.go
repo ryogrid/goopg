@@ -376,19 +376,42 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 
 // createUniquePlan is the PathUnique arm (M0142-0008c-1): emit a
 // `*DistinctOn` keyed by `p.UniqueKeyCols` over the built child — always
-// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice),
-// because `createUniquePath` never builds the HASHED candidate (see its own
-// doc comment for why). The child is `p.Children[0]`, the Sort
-// `createUniquePath` stacked over the SEMI RHS's cheapest-total path.
+// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice):
+// the dedup keys are a subset of the row. The child is `p.Children[0]` —
+// the Sort `createUniquePath` stacked over the SEMI RHS's cheapest-total
+// path, or for UNIQUE_PATH_HASH (`p.UniqueHashed`) the unsorted subpath
+// itself, deduplicated by a hashed DistinctOn (M0146-0005dk).
 func createUniquePlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathUnique with %d children, want exactly 1", len(p.Children)))
 	}
-	child, _ := createPlanNode(p.Children[0])
+	child, lay := createPlanNode(p.Children[0])
 	if child == nil {
 		panic("createPlan: PathUnique over a child path that built no node")
 	}
-	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: p.UniqueKeyCols, schema: child.Output()}, nil
+	// The dedup keeps whole child rows, so it publishes the child's columns
+	// in the child's coordinates: a join above re-bases its quals through
+	// this layout (M0146-0005dk — a base-relation RHS has one, where the
+	// prebuilt subquery leaf had none to pass on).
+	keyCols := p.UniqueKeyCols
+	if len(p.UniqueExprs) > 0 {
+		// Problem-space uniq exprs (a pulled base-relation RHS): their
+		// positions are wherever the built child placed those columns.
+		if lay == nil {
+			panic("createPlan: PathUnique with problem-space uniq exprs over a child with no layout")
+		}
+		idx := lay.bindingIndex()
+		keyCols = make([]int, len(p.UniqueExprs))
+		for i, e := range p.UniqueExprs {
+			cr, ok := e.(*ColumnRef)
+			pos, found := idx[cr.Index]
+			if !ok || !found {
+				panic(fmt.Sprintf("createPlan: PathUnique uniq expr %v is not among its child's output columns", e))
+			}
+			keyCols[i] = pos
+		}
+	}
+	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: keyCols, schema: child.Output(), Hashed: p.UniqueHashed}, lay
 }
 
 // createWindowPlan is the PathWindow arm (C-18): emit the path's window

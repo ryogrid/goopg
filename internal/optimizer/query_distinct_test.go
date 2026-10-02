@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -58,10 +59,12 @@ func TestQueryIsDistinctForFirstColumn(t *testing.T) {
 	}
 }
 
-// TestCreatePulledUniquePathNoop pins the NOOP arm: a pulled RHS proven
-// distinct unique-ifies to its own path (PG's UNIQUE_PATH_NOOP — same rows,
-// same cost), and every other pulled RHS declines rather than electing a paid
-// Sort+Unique PG would not build.
+// TestCreatePulledUniquePathNoop pins create_unique_path for a pulled RHS:
+// one proven distinct unique-ifies to its own path (PG's UNIQUE_PATH_NOOP —
+// same rows, same cost); a non-distinct base relation pays for the cheaper
+// of sort+unique and hashed aggregation, hashing refused when the groups do
+// not fit the hash memory (M0146-0005dk); a uniq expr that does not name the
+// leaf's column declines.
 func TestCreatePulledUniquePathNoop(t *testing.T) {
 	leaf := &SeqScan{schema: Schema{{Name: "k"}}}
 	mk := func() (*RelOptInfo, *Path) {
@@ -69,6 +72,7 @@ func TestCreatePulledUniquePathNoop(t *testing.T) {
 		rel.baseLeaf = leaf
 		rel.baseOffset = 5
 		p := newPrebuiltPath(rel, leaf)
+		p.Cost = Cost{Startup: 0, Total: 10}
 		rel.CheapestTotal = p
 		return rel, p
 	}
@@ -77,19 +81,35 @@ func TestCreatePulledUniquePathNoop(t *testing.T) {
 		SemiRhsExprs:        []Expr{&ColumnRef{Index: 5, Name: "k"}},
 		SemiRhsProblemSpace: true,
 	}
+	cp := costParams{cpuOperatorCost: 0.0025, cpuTupleCost: 0.01, seqPageCost: 1, randomPageCost: 4}
+	// No hash memory: the groups cannot fit, so only sort+unique is left.
 	rel, p := mk()
-	if got := createUniquePath(rel, p, sj, costParams{}); got != nil {
-		t.Fatalf("non-distinct pulled RHS unique-ified to %v; only the NOOP arm is ported", got.Kind)
+	got := createUniquePath(rel, p, sj, cp)
+	if got == nil || got.Kind != PathUnique || got.UniqueHashed || len(got.Children) != 1 || got.Children[0] == p {
+		t.Fatalf("non-distinct base RHS without hash memory: got %+v, want a sort+unique over a Sort", got)
+	}
+	if fmt.Sprint(got.UniqueKeyCols) != "[0]" {
+		t.Fatalf("unique key %v, want the leaf-local column [0]", got.UniqueKeyCols)
+	}
+	// Ample hash memory: hashing 100 rows beats sorting them.
+	cp.workMem = 4 << 20
+	rel, p = mk()
+	if got := createUniquePath(rel, p, sj, cp); got == nil || !got.UniqueHashed || got.Children[0] != p {
+		t.Fatalf("non-distinct base RHS with hash memory: got %+v, want the hashed unique over the subpath", got)
 	}
 	sj.SemiRhsDistinct = true
 	rel, p = mk()
-	if got := createUniquePath(rel, p, sj, costParams{}); got != p {
+	if got := createUniquePath(rel, p, sj, cp); got != p {
 		t.Fatalf("distinct pulled RHS: got %v, want the subpath itself (UNIQUE_PATH_NOOP)", got)
 	}
-	// A uniq expr that does not name the leaf's column is a desync.
+	// A uniq expr that does not name the leaf's column is a desync, under
+	// both arms.
 	sj.SemiRhsExprs = []Expr{&ColumnRef{Index: 4, Name: "k"}}
-	rel, p = mk()
-	if got := createUniquePath(rel, p, sj, costParams{}); got != nil {
-		t.Fatalf("uniq expr outside the leaf still unique-ified")
+	for _, distinct := range []bool{true, false} {
+		sj.SemiRhsDistinct = distinct
+		rel, p = mk()
+		if got := createUniquePath(rel, p, sj, cp); got != nil {
+			t.Fatalf("uniq expr outside the leaf still unique-ified (distinct=%v)", distinct)
+		}
 	}
 }

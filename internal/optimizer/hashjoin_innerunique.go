@@ -21,10 +21,15 @@ type hashJoinFinalCostInput struct {
 	// its first match, so the bucket walk is priced with the semi factors as
 	// for an inner-unique join. anti makes hashjointuples the unmatched outer
 	// rows (M0146-0005dj).
-	earlyExit      bool
-	anti           bool
-	outerMatchFrac float64
-	matchCount     float64
+	earlyExit bool
+	anti      bool
+	// uniquePathInner is final_cost_hashjoin's `IsA(inner_path, UniquePath)`
+	// arm: a unique-ified inner (JOIN_UNIQUE_INNER, NOOP included) has
+	// distinct keys, so its bucket fraction is 1 / virtualbuckets rather
+	// than the per-clause statistics' estimate (M0146-0005dk).
+	uniquePathInner bool
+	outerMatchFrac  float64
+	matchCount      float64
 	// hashClauseSel is approx_tuple_count's selectivity: the product of the
 	// hash clauses' plain inner-join selectivities.  PG's non-unique arm
 	// charges cpu_tuple_cost on sel * outer path rows * inner path rows, not

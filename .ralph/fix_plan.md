@@ -24287,11 +24287,28 @@ M0146-0001 re-baseline census on the new default arm.
       commuted pair, FULL joins outside the search \(join\_hash\'s two
       Parallel Hash Full Joins\)\.
     Movement: none — match 39/28, CATEGORIES\-EXCL\-MATCH and text\-identity flat; aligned PG plan lines rose at both SFs
-- [ ] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q83: PG Hash Semi Join over Hash Join\(dd4, HashAggregate\(dd5\)\); goopg keeps nested semi joins under a Gather \(7626 vs 7155 per arm\)\. Q23: HashAggregate unique\-ify of the frequent\_ss\_items CTE\.
   Kind: impl
   Parent: M0146\-0005
   - First step: check why create\_unique\_path\'s analogue \(M0142\-0008c lineage\) does not offer the unique\-ified inner here\.
+  - **LANDED 2026\-10\-03\.** Root cause: on the jointree pipeline every
+    pulled RHS reaches `createPulledUniquePath`, which ported only the NOOP
+    arm, so a plain relation could never be unique\-ified\. Added
+    `createPulledBaseUniquePath` \(PG\'s SORT vs HASH choice\), a hashed
+    `DistinctOn` \(EXPLAIN `HashAggregate` / `Group Key:`\), the
+    JOIN\_UNIQUE\_INNER join costing \(inner\_unique iff min\_lefthand ⊆ outer,
+    semi factors, 1/virtualbuckets bucket\) and `ParallelSafe` on unique
+    paths — without it the COSTS\_EQUAL tie\-break handed Q83 back to the
+    semi join\. Design `docs/design/0100\-0149/m0146\-0005dk\-unique\-ified\-semijoin\-inner\.md`\.
+    - Scratch probes equal PG plan and cost to the cent \(81\.27, 86\.62,
+      2927\.12 nested IN\)\.
+    - TPC\-DS: SF0\.25 Q83 subtree matches PG \(scan\-type 29→28\); SF1
+      join\-order 61→60, aligned lines 2148→2178\.
+    - Regress: 8 suites identical, no row changes; `join`\'s two stats\-less
+      tenk1 IN plans flip because regress `VACUUM ANALYZE` collects no
+      column stats on goopg — filed M0146\-0009j\.
+    Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 scan\-type 29→28, SF1 join\-order 61→60 \(match flat 39/28\)
 - [ ] **M0146\-0005dl — an unreferenced LEFT JOIN on a unique key is removed \(remove\_useless\_joins\)** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q72: goopg keeps `Nested Loop Left Join → Index Only Scan catalog\_returns\_pkey`; PG removes it \(analyzejoins\.c join\_is\_removable\)\.
   Kind: impl
@@ -25382,6 +25399,11 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: impl
   Parent: M0146\-0009
   - First step: find how the CTEScan leaf\'s rows are set \(set\_cte\_pathlist uses the CTE subplan\'s rows\) and why it diverges from the body\'s estimate\.
+- [ ] **M0146\-0009j — `VACUUM \(ANALYZE\)` collects no column statistics** \(filed 2026\-10\-03 by M0146\-0005dk\)\.
+  goopg\'s `vacuumOp` runs only the relation\-size pass \(`vacuum\.Analyze` → reltuples / relpages\); PG\'s `vacuum\(\)` calls `analyze\_rel` for every target when VACOPT\_ANALYZE is set\. Measured: after `VACUUM ANALYZE tenk1` on goopg `pg\_stats` holds 0 rows for tenk1, after `ANALYZE tenk1` 16\. Regress `test\_setup\.sql` runs `VACUUM ANALYZE` on every shared table, so every regress plan on goopg is stats\-less; with the 0005dk unique\-ify arm live, regress `join`\'s two `tenk1 a WHERE unique1 IN \(SELECT unique2 …\)` plans flip from PG\'s Hash Semi Join to a HashAggregate\-driven Nested Loop for exactly that reason \(with stats goopg matches PG\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: in `internal/executor/operators\_vacuum\.go`, when `vs\.Analyze`, run the ANALYZE operator\'s per\-table statistics path \(`operators\_analyze\.go`\) for each target with its column list, as `vacuum\(\)` → `analyze\_rel` does; then re\-run the regress A/B — expect broad plan movement\.
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready

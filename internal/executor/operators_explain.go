@@ -2174,6 +2174,24 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
+	case *optimizer.DistinctOn:
+		// M0146-0005dk: the hashed unique-ify Agg prints its uniq exprs as
+		// show_agg_keys does — `Group Key:`, chased to the source column.
+		if p.Hashed && len(p.KeyCols) > 0 {
+			out := p.Output()
+			parts := make([]string, 0, len(p.KeyCols))
+			for _, i := range p.KeyCols {
+				if i < 0 || i >= len(out) {
+					continue
+				}
+				var keyExpr optimizer.Expr = &optimizer.ColumnRef{Index: i, Name: out[i].Name, Type: out[i].Type, SourceTableIdx: out[i].SourceTableIdx}
+				if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
+					keyExpr = chased
+				}
+				parts = append(parts, formatKeyExprQual(keyExpr, reg, qualify))
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
+		}
 	case *optimizer.IncrementalSort:
 		// M0141-S7-exec-c: mirrors the *optimizer.Sort arm above (same
 		// show_sort_group_keys oracle, explain.c:2588-2593 calls it with
@@ -6156,6 +6174,11 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		// `Unique`. goopg fuses the two into one node, so the sort is not
 		// separately visible — a shape divergence the parity instrument
 		// should COUNT, which it cannot do while the label is a Go type.
+		// A hashed one is create_unique_plan's AGG_HASHED Agg for a
+		// unique-ified semijoin RHS, which PG prints as HashAggregate.
+		if p.Hashed {
+			return "HashAggregate"
+		}
 		return "Unique"
 
 	case *optimizer.RowsFrom:

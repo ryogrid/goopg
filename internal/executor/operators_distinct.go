@@ -153,6 +153,11 @@ type distinctOnOp struct {
 	// stay one key. Contiguity under that image is guaranteed by the
 	// child's pre-sort, whose keys evalSortKeyValue already trims.
 	keyTrims []bool
+	// seen is the hashed mode's key set (plan.Hashed: PG's UNIQUE_PATH_HASH
+	// for a unique-ified semijoin RHS, M0146-0005dk) — the input is
+	// unsorted, so a key is a duplicate when it was ever seen, not only
+	// when it equals the previous row's.
+	seen map[string]struct{}
 }
 
 func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
@@ -175,6 +180,10 @@ func (o *distinctOnOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.started = false
 	o.prevKey = ""
+	o.seen = nil
+	if o.plan.Hashed {
+		o.seen = make(map[string]struct{})
+	}
 	return o.child.Open(ctx)
 }
 
@@ -200,6 +209,13 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 				key += datumKey(v) + "\x00"
 			}
 		}
+		if o.seen != nil {
+			if _, dup := o.seen[key]; dup {
+				continue
+			}
+			o.seen[key] = struct{}{}
+			return SlotFromRow(o.schema, cloneRow(row)), nil
+		}
 		if !o.started || key != o.prevKey {
 			o.started = true
 			o.prevKey = key
@@ -209,6 +225,9 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 	}
 }
 
-func (o *distinctOnOp) Close() error { return o.child.Close() }
+func (o *distinctOnOp) Close() error {
+	o.seen = nil
+	return o.child.Close()
+}
 
 

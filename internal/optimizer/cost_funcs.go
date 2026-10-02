@@ -864,6 +864,12 @@ func (in hashJoinInputs) hashGeometryInputs(cp costParams) (float64, int64) {
 // as one that does not — which is the distinction that decides the plan.
 // leftdeep-joins 04 §4, 06 §5.
 func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
+	if in.final.uniquePathInner {
+		geoRows, geoMem := in.hashGeometryInputs(cp)
+		if g, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok && g.virtualBuckets > 0 {
+			in.innerBucketSize = 1.0 / float64(g.virtualBuckets)
+		}
+	}
 	// Build: read + hash every inner row, all before the first probe.
 	build := (cp.cpuOperatorCost*float64(in.numHashClauses)+cp.cpuTupleCost)*in.innerRows + in.inner.Total
 

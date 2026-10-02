@@ -68,7 +68,7 @@ func createUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, c
 		return nil
 	}
 	if sjinfo.SemiRhsProblemSpace {
-		return createPulledUniquePath(rel, subpath, sjinfo)
+		return createPulledUniquePath(rel, subpath, sjinfo, cp)
 	}
 	// See the domain note above: the only live producer of SemiRhsExprs
 	// wraps its subquery body as a PathPrebuilt, and cr.Index is only
@@ -137,6 +137,10 @@ func createUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, c
 		DisabledNodes: sortedInput.DisabledNodes,
 		UniqueKeyCols: keyCols,
 		Children:      []*Path{sortedInput},
+		// create_unique_path: parallel_safe = rel->consider_parallel &&
+		// subpath->parallel_safe; parallel_workers = subpath's.
+		ParallelSafe:    rel.ConsiderParallel && subpath.ParallelSafe,
+		ParallelWorkers: subpath.ParallelWorkers,
 	}
 	rel.CheapestUnique = uniquePath
 	return uniquePath
@@ -155,9 +159,9 @@ func createUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, c
 // (`relation_has_unique_index_for`, pathnode.c:1940) and the HASH method
 // (ledger M0142-0008c-1a), and electing a paid Sort+Unique where PG takes one
 // of those would be a divergence of goopg's own making.
-func createPulledUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo) *Path {
+func createPulledUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, cp costParams) *Path {
 	if !sjinfo.SemiRhsDistinct {
-		return nil
+		return createPulledBaseUniquePath(rel, subpath, sjinfo, cp)
 	}
 	// The RHS must be exactly one base leaf — the derived ANY_subquery — and
 	// every uniq expr must name a column of it; anything else is a desync to
@@ -178,4 +182,111 @@ func createPulledUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinI
 	}
 	rel.CheapestUnique = subpath
 	return subpath
+}
+
+// createPulledBaseUniquePath is create_unique_path's paid arm for a pulled
+// semijoin RHS that is ONE base relation (M0146-0005dk): estimate the
+// distinct uniq-expr groups, price sort+unique (cost_sort plus one
+// cpu_operator_cost per column per input row) and hashed aggregation
+// (cost_agg AGG_HASHED with no aggregates, refused when
+// (width + 64) * groups exceeds the hash memory limit), and keep the cheaper
+// — fewer disabled nodes first, then total cost (pathnode.c). TPC-DS Q83
+// unique-ifies `date_dim_8` by d_week_seq this way, and a plain
+// `x IN (SELECT y FROM t)` over a small t hashes t's y values.
+//
+// PG's NOOP arm for a relation (relation_has_unique_index_for) is
+// pre-empted: reduce_unique_semijoins (pulledSemiRhsIsUnique) already
+// deletes the SpecialJoinInfo of a single-relation RHS whose unique index
+// the equated columns cover, so no unique-ify is asked for. The proofs it
+// does not port (a key completed by a restriction constant, a cross-type
+// equality) would reach here and pay for a unique PG takes free — ledgered.
+// A multi-relation RHS still declines.
+func createPulledBaseUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, cp costParams) *Path {
+	if rel.baseLeaf == nil || subpath.RequiredOuter != 0 {
+		return nil
+	}
+	out := rel.baseLeaf.Output()
+	// local: leaf-relative refs, for estimate_num_groups over the leaf.
+	// bound: the same refs in problem space, which is what a Sort key and
+	// the lowering's layout translation are written in.
+	local := make([]Expr, 0, len(sjinfo.SemiRhsExprs))
+	bound := make([]Expr, 0, len(sjinfo.SemiRhsExprs))
+	keyCols := make([]int, 0, len(sjinfo.SemiRhsExprs))
+	seen := map[int]bool{}
+	for _, e := range sjinfo.SemiRhsExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return nil
+		}
+		i := cr.Index - rel.baseOffset
+		if i < 0 || i >= len(out) || out[i].Name != cr.Name {
+			return nil
+		}
+		if seen[i] {
+			// The same column equated twice is one sort/group column
+			// (make_pathkeys_for_sortclauses drops the redundant one).
+			continue
+		}
+		seen[i] = true
+		lc := *cr
+		lc.Index = i
+		local = append(local, &lc)
+		bound = append(bound, cr)
+		keyCols = append(keyCols, i)
+	}
+	if len(keyCols) == 0 {
+		return nil
+	}
+	numGroups := float64(estimateNumGroups(local, rel.baseLeaf, int64(rel.Rows)))
+	if numGroups < 1 {
+		numGroups = 1
+	}
+	numCols := float64(len(keyCols))
+
+	keys := make([]SortKey, len(bound))
+	for i, e := range bound {
+		keys[i] = SortKey{Expr: e}
+	}
+	sortedInput := sortPathForBounded(subpath, pathkeysForSortKeys(keys), cp, -1)
+	sortCost := sortedInput.Cost
+	sortCost.Total += cp.cpuOperatorCost * rel.Rows * numCols
+	best := &Path{
+		Kind:          PathUnique,
+		Rel:           rel,
+		Rows:          numGroups,
+		Cost:          sortCost,
+		DisabledNodes: sortedInput.DisabledNodes,
+		UniqueKeyCols: keyCols,
+		UniqueExprs:   bound,
+		Children:      []*Path{sortedInput},
+		// create_unique_path: parallel_safe = rel->consider_parallel &&
+		// subpath->parallel_safe. A parallel-unsafe unique path would make
+		// every join over it lose add_path's parallel-safety tie-break to
+		// the semi join it competes with.
+		ParallelSafe:    rel.ConsiderParallel && subpath.ParallelSafe,
+		ParallelWorkers: subpath.ParallelWorkers,
+	}
+
+	if hashEntry := float64(pathWidth(subpath) + 64); hashEntry*numGroups <= float64(cp.workMem) {
+		aggCost := costAgg(cp, AggStrategyHashed, rel.Rows, subpath.Cost.Startup, subpath.Cost.Total,
+			len(keyCols), numGroups, 0, pathNCols(subpath), pathAvgVarBytes(subpath))
+		if subpath.DisabledNodes < best.DisabledNodes ||
+			(subpath.DisabledNodes == best.DisabledNodes && aggCost.Total < best.Cost.Total) {
+			best = &Path{
+				Kind:            PathUnique,
+				Rel:             rel,
+				Rows:            numGroups,
+				Cost:            aggCost,
+				DisabledNodes:   subpath.DisabledNodes,
+				UniqueKeyCols:   keyCols,
+				UniqueExprs:     bound,
+				UniqueHashed:    true,
+				Children:        []*Path{subpath},
+				ParallelSafe:    rel.ConsiderParallel && subpath.ParallelSafe,
+				ParallelWorkers: subpath.ParallelWorkers,
+			}
+		}
+	}
+	rel.CheapestUnique = best
+	return best
 }
