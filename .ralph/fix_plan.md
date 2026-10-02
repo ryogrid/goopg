@@ -22126,6 +22126,27 @@ M0146-0001 re-baseline census on the new default arm.
   lateral census (M0146-0011's data).
   Kind: impl
   Parent: none
+  - **Slice 112 \(routing, 2026\-10\-02, HEAD `c96a5d2f9`\)\.** Q42, Q52, Q37
+    at SF0\.25 \(`join\-order` \+ `parameterisation` only\) traced against
+    `:65438` component by component; no code change\.
+    - Q42 / Q52: goopg elects `store\_sales ⋈ item` \(hash\) then a Memoize
+      date probe, 17870 vs its PG\-shape 17942; PG prices the same two
+      shapes 17981 vs 17966\. Per\-relation row estimates agree \(item 321,
+      date 31\)\. The gap is: relpages \(PG\'s bulk\-extension tail pages,
+      item \+42, date \+19 → M0146\-0009h\) and the probe\'s btree descent,
+      which omits `ceil\(log2\(index\-\>tuples\)\) \* cpu\_operator\_cost`
+      \(0\.25 vs 0\.29 per probe → the blocked B\-15 batch, ledger
+      `take3\-B\-15\-blocked\-2`\)\.
+    - Q37: goopg drives `inventory\_pkey`\'s second column from
+      catalog\_sales \(481 loops, Mackert\-Lohman pro\-rates the skip probe
+      to 87\.62\) while its own `catalog\_sales\_pkey` probe costs 180\.02 \(PG
+      0\.84 over 3140 loops\); a single plain index probe is 16\.27 vs PG
+      8\.32\. Routed to the same B\-15 batch and the owner\-gated
+      `indexProbeCostMultiplier`=2 \(M0145\-0029 slice 5\)\.
+    - Found and filed: M0146\-0046 \(S2, `ctid` NULL under index scans\),
+      M0146\-0009h \(bulk\-load relpages\), M0146\-0005dg \(plain\-restriction
+      skip scan\)\.
+    Movement: none — diagnosis and routing only, no code change
   - **Residual triage 2026\-09\-26 \(HEAD `b57acc6cd`\).** Evidence
     `analysis/m0146/m0146\-0005/residual\-triage\-20260926/`.
     - Stale `char\(n\)` data \+ probe multiplier: Q79, Q55, Q23, Q30 \(Q55:
@@ -24118,6 +24139,19 @@ M0146-0001 re-baseline census on the new default arm.
     SF1 Q17/Q25/Q29\), M0146\-0042b \(EC clauses after the other join
     quals\); ledger row for the unmodelled paths\.
   Movement: none — instrument artefact: CATEGORIES-EXCL-MATCH normalises qual text (rendering 11 / 14 unchanged); text-identity moved SF0.25 29→34 (Q50, Q53, Q63, Q74, Q91), SF1 18→20
+- [ ] **M0146\-0005dg — a non\-leading\-column equality on a constant gets
+  PG 18\'s skip scan** \(filed 2026\-10\-02 by the slice\-112 diagnosis\)\.
+  `select \* from inventory where inv\_item\_sk = 100` \(inventory\_pkey is
+  `\(inv\_date\_sk, inv\_item\_sk, inv\_warehouse\_sk\)`\): PG 18\.3 plans
+  `Index Scan using inventory\_pkey` at 1814\.67 \(209 skip descents\); goopg
+  has only the parameterised skip arm \(M0146\-0005v\) and plans a Seq Scan
+  at 42167\.50\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: give the base\-restriction index producer
+    \(`pathindexrestrict\.go`\) the same `pickIndexSkipRun` /
+    `skipScanDescents` arm the parameterised producer uses, with its
+    NOT\-NULL guards\.
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
@@ -24559,6 +24593,27 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0046 — WRONG RESULTS: `ctid` reads NULL through an Index
+  Scan or Index Only Scan** \(filed 2026\-10\-02 by the M0146\-0005 Q52
+  diagnosis; REPRODUCED on a private throwaway cluster and a fresh table,
+  S2 escalation: wrong results\)\. `create table zc\(a int primary key, b
+  int\)` with 5000 rows, then `select ctid, a from zc where a between 5 and
+  6` plans `Index Scan using zc\_pkey` and returns `ctid` NULL for both rows
+  \(PG 18\.3: `\(0,5\)`, `\(0,6\)`\)\. A Bitmap Heap Scan returns it correctly\.
+  On the TPC\-DS SF0\.25 clone, `select count\(distinct i\_item\_sk\),
+  count\(ctid\) from item` returns `18000\|0` \(PG `18000\|18000`, Index Only
+  Scan\), and `select ctid from item where i\_item\_sk = 5` returns NULL\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-02 \(S2\) — `ctid` is NULL under index scans
+  > Filed by the M0146\-0005 slice\-112 diagnosis, not worked\. Owner: place
+  > M0146\-0046 in the banner\.
+  - Not worked \(S2: the owner places it\)\. First step: find how the
+    IndexScan / IndexOnlyScan executor arms fill the system\-column slot
+    \(the SeqScan and BitmapHeapScan arms do\), and whether the planner
+    counts `ctid` as a needed column when it elects an index\-only scan \(PG
+    never does: `check\_index\_only` requires every referenced attribute,
+    and ctid is not an index column\)\.
 - [ ] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
   does not quote its elements** \(filed 2026\-10\-02 by M0146\-0033;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
@@ -25121,6 +25176,26 @@ M0146-0001 re-baseline census on the new default arm.
     build, or a private build with an elog in eqjoinsel\_semi\), print nd1,
     nd2, isdefault1/2 and the clamps for variants A and F of
     `analysis/m0146/m0146\-0009f/q23semi2\.sql`; then port the arm\.
+- [ ] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
+  packed count** \(filed 2026\-10\-02 by the M0146\-0005 Q52 diagnosis\)\.
+  The two TPC\-DS SF0\.25 loads hold the same tuples per page, but PG\'s
+  relations end in empty pre\-extended blocks: `item` 1238 data pages \+ 46
+  empty = 1284 relpages \(goopg 1242\), `date\_dim` 1405 \+ 19 = 1424 \(goopg
+  1405\), `store\_sales` 12933 \+ 3 = 12936\. Those pages are the whole of the
+  parallel seq\-scan cost gap on Q42/Q52 \(item 1416\.35 vs 1374\.35, date
+  2068\.55 vs 2049\.55\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - PG mechanism: COPY \(heap\_multi\_insert with a BulkInsertState\)
+    extends through `RelationAddBlocks` \(hio\.c\): `extend\_by\_pages` is
+    the batch\'s page need, raised to `bistate\->already\_extended\_by`
+    and capped at 64, so the last extension leaves its unused tail empty;
+    vacuum truncation needs ≥1000 or 1/16 of the pages and does not
+    reclaim it\.
+  - First step: find goopg\'s COPY insert path \(the contended
+    `batchExtendAndRegisterFSM` only fires under lock contention, 8 pages\)
+    and port the BulkInsertState ramp\. Measurable only after an owner
+    reload of the bench clusters; the loop cannot re\-load them\.
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
