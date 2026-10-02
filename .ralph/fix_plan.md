@@ -25746,7 +25746,7 @@ M0146-0001 re-baseline census on the new default arm.
     path as carrying the index scan\'s pathkeys \(Gather must publish no
     pathkeys\)\.
   - Witness 2026\-09\-29 \(M0146\-0005ba regress runner\): limit\.sql `select unique1, unique2, nextval\('testseq'\) from tenk1 order by unique2 limit 10` prints different rows on two runs of the same plan `Limit -> Gather -> Parallel Index Scan`\.
-- [ ] **M0146\-0035 — WRONG RESULTS / DATA LOSS: an online TPC\-H clone
+- [!] **M0146\-0035 — WRONG RESULTS / DATA LOSS: an online TPC\-H clone
   loses database `tpch` and role `tpch`** \(filed 2026\-09\-29 by
   M0146\-0005ap; S2\)\. `tpch\_private\_clone\_snapshot` \(pg\_basebackup of the
   live bench cluster\) produced clones whose first start lists only
@@ -25792,6 +25792,15 @@ M0146-0001 re-baseline census on the new default arm.
       `-X stream`\.
     - Side finding: `txid\_current\(\)` returns 0, filed as M0146\-0043
       \(S2\)\.
+  - Follow\-up 2026\-10\-02 \(loop \#34\): `clone\-harness\.sh` gained
+    `CHURN=pgbench` \(4 clients committing single\-row inserts, CLOG page\-0
+    churn\) and `XMODE=stream` \(`pg\_basebackup \-X stream`\)\. Both variants:
+    12/12 clone starts kept `tpch`\. Total 37 clean starts on current code\.
+  - **BLOCKED \(`\[\!\]`\) on recurrence** — not reproducible, with the
+    diagnostic WARN in place\. Unblock when a clone start logs
+    `shared catalog reload: row rejected by xmin status` \(or a decode
+    WARN\) for `pg\_database`/`pg\_authid`, or by owner direction\. Banner
+    item 2a continues with M0146\-0039\.
 
   > ## ESCALATION 2026\-09\-29 \(S2\) — online TPC\-H clones lose database `tpch`
   >

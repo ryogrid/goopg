@@ -34,3 +34,12 @@ decode errors now log a WARN with catalog, block/slot, xmin and CLOG status
 
 Side finding: txid_current() / pg_current_xact_id() return 0 on goopg (PG 18.3: an assigned
 xid, e.g. 1142) -> filed M0146-0043 (S2).
+
+Follow-up 2026-10-02 (loop #34), clone-harness.sh variants, none lost database/role tpch:
+  3. CHURN=pgbench XMODE=fetch: 4 pgbench clients committing single-row inserts back to back
+     (CLOG page-0 churn) + a checkpoint every 3 s; 6 online clones via tpch_private_clone_snapshot,
+     each started twice -> tpch present in all 12 starts.
+  4. CHURN=pgbench XMODE=stream: same churn, 6 clones via pg_basebackup -X stream, each started
+     twice -> present in all 12 starts; 45134 committed churn rows on the source.
+  Total: 37 clean clone starts on current code. The defect is parked on recurrence: the
+  shared-catalog reload WARN (372b311c8) names the xid and CLOG status the next time it happens.
