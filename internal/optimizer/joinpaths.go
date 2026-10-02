@@ -565,9 +565,9 @@ func rightSemiAntiForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo
 //   - hash only. PG builds no merge or nested loop for RIGHT_SEMI
 //     (joinpath.c), and goopg's merge executor has no RIGHT ANTI arm (PG
 //     does build a merge right anti — ledgered);
-//   - serial only. PG refuses a partial RIGHT_SEMI hash (unprotected match
-//     flags); goopg's parallel hash has no shared match flags for RIGHT ANTI
-//     either (ledgered);
+//   - RIGHT_SEMI is serial only (PG refuses a partial RIGHT_SEMI hash);
+//     RIGHT_ANTI also files a Parallel Hash partial path, whose participants
+//     merge their match bits before one of them sweeps (slice 3);
 //   - final_cost_hashjoin's generic branch: the right jointypes are neither
 //     JOIN_SEMI nor JOIN_ANTI there, and goopg proves no inner_unique for them
 //     (PG would try innerrel_is_unique — ledgered).
@@ -583,4 +583,10 @@ func addRightSemiAntiHashPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, c
 	final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, rjt, keys, clauses)
 	bucket := s.estimateHashBucketSize(keys, inner.Relids)
 	addHashJoinPath(joinrel, outer, inner, cp, rjt, keys, residual, bucket, final, uniqueSideNone, sjinfo)
+	// hash_inner_and_outer's parallel block admits JOIN_RIGHT_ANTI as a
+	// Parallel Hash (shared table) only, and never JOIN_RIGHT_SEMI; the
+	// partial producer enforces both (partialHashJoinTypeOK).
+	if rjt == parser.JoinRightAnti {
+		addPartialHashJoinPath(s, joinrel, outer, inner, cp, rjt, keys, residual, bucket, final, uniqueSideNone, sjinfo)
+	}
 }

@@ -64,6 +64,23 @@ type parallelHashBuild struct {
 	// partial (several builders, whose shares sum to the inner exactly once).
 	builders      int
 	rowsPublished int
+
+	// The probe-phase half of PG's PHJ_BATCH_PROBE → PHJ_BATCH_SCAN, for a
+	// join that fills its build side (RIGHT, FULL, RIGHT ANTI; M0146-0005dj).
+	// No one participant sees every match, so each keeps a private matched
+	// bitmap over the shared table — the same key and row position name the
+	// same build row in every participant — and ORs it in here when its probe
+	// side is exhausted. The participant whose detach brings `probers` to
+	// zero runs the unmatched sweep alone, with the merged bits; it is PG's
+	// "last participant to detach from the probe phase scans for unmatched
+	// tuples" (ExecParallelPrepHashTableForUnmatched). A participant that
+	// attaches after the sweep was claimed probes nothing: every participant
+	// that reached its probe EOF saw the shared partial scan exhausted, so
+	// there is no probe input left for it.
+	probers      int
+	sweepClaimed bool
+	mergedS      map[string][]bool
+	mergedI      map[int64][]bool
 }
 
 func newParallelHashBuild(groupDone <-chan struct{}) *parallelHashBuild {
@@ -170,6 +187,61 @@ func (ph *parallelHashBuild) wait(ctx *Context) error {
 	}
 }
 
+// probeAttach registers a participant as probing. False means the sweep has
+// already been claimed: the caller must not probe (see the probers field).
+func (ph *parallelHashBuild) probeAttach() bool {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	if ph.sweepClaimed {
+		return false
+	}
+	ph.probers++
+	return true
+}
+
+// probeDetach ORs one participant's matched bitmaps into the merged set and
+// reports whether the caller is the last prober, which then owns the sweep
+// and receives the merged bitmaps. The mutex is the publication edge: every
+// other participant's marks were made before its own detach.
+func (ph *parallelHashBuild) probeDetach(ms map[string][]bool, mi map[int64][]bool) (map[string][]bool, map[int64][]bool, bool) {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	if ph.mergedS == nil {
+		ph.mergedS = make(map[string][]bool, len(ms))
+	}
+	if ph.mergedI == nil {
+		ph.mergedI = make(map[int64][]bool, len(mi))
+	}
+	for k, bits := range ms {
+		orMatched(ph.mergedS, k, bits)
+	}
+	for k, bits := range mi {
+		orMatched(ph.mergedI, k, bits)
+	}
+	ph.probers--
+	if ph.probers > 0 || ph.sweepClaimed {
+		return nil, nil, false
+	}
+	ph.sweepClaimed = true
+	return ph.mergedS, ph.mergedI, true
+}
+
+// orMatched ORs a participant's bitmap for one bucket into the merged map. The
+// first bitmap for a bucket is copied, not adopted: the participant may still
+// hold it.
+func orMatched[K comparable](merged map[K][]bool, k K, bits []bool) {
+	m, ok := merged[k]
+	if !ok || len(m) != len(bits) {
+		merged[k] = append([]bool(nil), bits...)
+		return
+	}
+	for i, b := range bits {
+		if b {
+			m[i] = true
+		}
+	}
+}
+
 // errParallelHashAbandoned is returned to a participant whose Gather group
 // was cancelled while it waited at the build barrier — another participant
 // failed, or the Gather closed early. The group's own error is the one the
@@ -272,7 +344,34 @@ func (o *joinOp) openParallelHashJoin(ctx *Context, ph *parallelHashBuild) error
 		return err
 	}
 	o.adoptParallelHashTable(ctx, &ph.table)
+	if o.fillBuildSide() {
+		o.parallelFill = ph
+		o.parallelProbing = ph.probeAttach()
+		o.parallelSkipProbe = !o.parallelProbing
+	}
 	return o.openProbeSide(ctx, probeIsLeft)
+}
+
+// parallelFillDetach is the probe-EOF half of the shared sweep protocol: hand
+// this participant's matched bits in and, if it is the last prober, take the
+// merged ones for the sweep. It reports whether this participant sweeps the
+// shared table. Outside a parallel fill-build join every participant sweeps
+// its own table, as before.
+func (o *joinOp) parallelFillDetach() bool {
+	ph := o.parallelFill
+	if ph == nil {
+		return true
+	}
+	if !o.parallelProbing {
+		return false
+	}
+	o.parallelProbing = false
+	ms, mi, last := ph.probeDetach(o.lazyMatchedS, o.lazyMatchedI)
+	if !last {
+		return false
+	}
+	o.lazyMatchedS, o.lazyMatchedI = ms, mi
+	return true
 }
 
 // adoptParallelHashTable installs the completed shared table read-only — the

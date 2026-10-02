@@ -8,6 +8,7 @@ package executor
 // both scans stamped partial, and a Gather on top.
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -244,5 +245,105 @@ func TestParallelHashPathModelWinner(t *testing.T) {
 	}
 	if chosen == 0 {
 		t.Fatal("no shape produced a planner-chosen Parallel Hash; the arm was never exercised")
+	}
+}
+
+// TestParallelHashFillBuildIdentityWithSerial (M0146-0005dj slice 3): the
+// joins that emit unmatched BUILD rows — RIGHT, FULL, RIGHT ANTI — run as a
+// Parallel Hash only because the participants merge their match bits and the
+// last one to finish probing sweeps the shared table once. A participant that
+// swept with only its own bits would emit build rows another participant
+// matched (duplicates against serial); two sweepers would emit every
+// unmatched row twice. Parallel-vs-serial identity sees both.
+func TestParallelHashFillBuildIdentityWithSerial(t *testing.T) {
+	ctx, cleanup := parallelHashFixture(t)
+	defer cleanup()
+	// RIGHT ANTI is the planner's own election (M0146-0005dj slice 2): a
+	// distinct-keyed probe table much larger than the anti join's LHS.
+	runSQL(t, ctx, "CREATE TABLE ph_big (k int, w int)")
+	runSQL(t, ctx, "INSERT INTO ph_big SELECT g, g FROM generate_series(1, 200000) g")
+	runSQL(t, ctx, "ANALYZE ph_big")
+	runSQL(t, ctx, "ANALYZE ph_build")
+	runSQL(t, ctx, "ANALYZE ph_probe")
+	// RIGHT and FULL reuse the inner join's hash plan with the join retyped:
+	// the column layout is the same, ph_probe probes and ph_build is hashed,
+	// and the serial executor's RIGHT/FULL hash path is the reference.
+	const inner = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k"
+	for _, c := range []struct {
+		name   string
+		sql    string
+		retype optimizer.JoinType
+		typ    optimizer.JoinType
+	}{
+		{"right", inner, optimizer.JoinTypeRight, optimizer.JoinTypeRight},
+		{"full", inner, optimizer.JoinTypeFull, optimizer.JoinTypeFull},
+		{"right anti", "SELECT b.v FROM ph_build b WHERE NOT EXISTS (SELECT 1 FROM ph_big p WHERE p.k = b.k AND p.w > 1000)",
+			0, optimizer.JoinTypeRightAnti},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			plan := func() optimizer.Node {
+				n := planHashOnly(t, ctx, c.sql)
+				if c.retype != 0 {
+					c19fFindJoin(n).Type = c.retype
+				}
+				return n
+			}
+			want := c19fRun(t, ctx, plan())
+			par, j := toParallelHash(t, plan())
+			if par == nil {
+				t.Fatal("the serial plan has no hash join")
+			}
+			if j.Type != c.typ {
+				t.Fatalf("planned a %v hash join, want %v", j.Type, c.typ)
+			}
+			if s := c19fScanOf(j.Right); s == nil || s.Table == nil || s.Table.Name != "ph_build" {
+				t.Fatalf("the build side is %T, not ph_build", j.Right)
+			}
+			var ph *parallelHashBuild
+			var once sync.Once
+			ctx.parallelHashObserver = func(got *parallelHashBuild) { once.Do(func() { ph = got }) }
+			defer func() { ctx.parallelHashObserver = nil }()
+
+			got := c19fRun(t, ctx, par)
+			if len(got) != len(want) {
+				t.Fatalf("parallel hash returned %d rows, serial %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: parallel %q, serial %q", i, got[i], want[i])
+				}
+			}
+			if ph == nil {
+				t.Fatal("no participant reached the Parallel Hash build state")
+			}
+			if !ph.sweepClaimed || ph.probers != 0 {
+				t.Fatalf("sweepClaimed=%v probers=%d: the shared sweep did not run exactly once", ph.sweepClaimed, ph.probers)
+			}
+			t.Logf("builders=%d rows=%d", ph.builders, len(got))
+		})
+	}
+}
+
+// TestParallelHashProbeDetachMerges pins the detach protocol: the bits of every
+// prober reach the one that sweeps, the sweep is claimed once, and a
+// participant arriving after the claim does not probe.
+func TestParallelHashProbeDetachMerges(t *testing.T) {
+	ph := newParallelHashBuild(nil)
+	if !ph.probeAttach() || !ph.probeAttach() {
+		t.Fatal("attach refused before any detach")
+	}
+	_, _, last := ph.probeDetach(map[string][]bool{"a": {true, false}}, map[int64][]bool{7: {false, true}})
+	if last {
+		t.Fatal("the first of two probers claimed the sweep")
+	}
+	ms, mi, last := ph.probeDetach(map[string][]bool{"a": {false, true}, "b": {true}}, nil)
+	if !last {
+		t.Fatal("the last prober did not claim the sweep")
+	}
+	if fmt.Sprint(ms["a"], ms["b"], mi[7]) != "[true true] [true] [false true]" {
+		t.Fatalf("merged bits %v %v %v", ms["a"], ms["b"], mi[7])
+	}
+	if ph.probeAttach() {
+		t.Fatal("a participant attached after the sweep was claimed")
 	}
 }

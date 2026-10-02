@@ -177,6 +177,13 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	if uniq != uniqueSideInner && cp.enableParallelHash && len(inner.PartialPathlist) > 0 {
 		addParallelHashJoinPath(s, joinrel, outer, inner, o, inner.PartialPathlist[0], cp, jt, keys, residual, bucket, final)
 	}
+	// joinpath.c: "If full, right, or right-anti join, we can't use
+	// parallelism (building the hash table in each backend) because no one
+	// process has all the match bits" — only the shared table above.
+	if partialHashJoinNeedsSharedTable(jt) {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7-shared-only", "jt="+traceJoinTypeName(jt))
+		return
+	}
 
 	// `get_cheapest_parallel_safe_total_inner` (pathkeys.c:699). Upstream first
 	// tries `cheapest_total_inner` and falls back to this scan; the two are

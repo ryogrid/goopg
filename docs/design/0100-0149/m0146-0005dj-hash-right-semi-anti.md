@@ -147,11 +147,95 @@ and goopg match to the cent:
   estimated at 75 rows against PG's 818, goopg uses Parallel Hash Anti
   Joins, and it lacks the unique-ified semi inners.
 
-## Next
+## Slice 3 — Parallel Hash Right / Full / Right Anti
 
-- **Slice 3.** Parallel Hash Right / Right Semi / Right Anti (TPC-DS SF1
-  Q16's Parallel Hash Right Anti Join), which need matched flags shared
-  across workers. Merge right anti belongs here too.
-- Inner-unique proof for the right types (`innerrel_is_unique` on the
-  commuted pair) is not run, so a right join over a unique build side is
-  priced by the non-unique arm.
+### Why only a Parallel Hash
+
+A RIGHT, FULL or RIGHT ANTI join emits the build rows no probe row
+matched. Under a Gather the probe input is partitioned, so no single
+participant sees every match. PG's `hash_inner_and_outer` therefore
+files these jointypes only with a partial inner, as a shared Parallel
+Hash table, and sets `cheapest_safe_inner = NULL` for them: "no one
+process has all the match bits". JOIN_RIGHT_SEMI is excluded from the
+parallel block entirely, because its emit-once decision is taken at the
+first match, in whichever participant finds it.
+
+goopg follows the same split:
+
+- `hashJoinIsPartialCapable` admits JoinTypeRight / JoinTypeFull /
+  JoinTypeRightAnti only when `Join.ParallelHash` is set.
+- `partialHashJoinTypeOK` files the parser types, and
+  `partialHashJoinNeedsSharedTable` makes `addPartialHashJoinPath` stop
+  after the Parallel Hash variant for them.
+- `addRightSemiAntiHashPath` files the partial RIGHT_ANTI. RIGHT_SEMI
+  stays serial.
+- `TestPartialHashJoinTypeOK` pins the producer against the executor for
+  every jointype, both with and without a shared table.
+
+### The executor's match-bit reduction
+
+The Parallel Hash table (M0146-0002) is one table shared by pointer.
+Every participant names a build row by the same bucket key and row
+position, so a participant's private matched bitmap is already
+meaningful for everyone else:
+
+- After the build barrier, a fill-build join attaches its participant to
+  the probe phase (`parallelHashBuild.probeAttach`).
+- At probe EOF, `probeDetach` ORs the participant's bitmaps into the
+  merged set under the mutex. The participant whose detach brings the
+  prober count to zero claims the sweep and receives the merged bits;
+  the others end without sweeping. This is PG's "last participant to
+  detach from the probe phase scans for unmatched tuples"
+  (ExecParallelPrepHashTableForUnmatched).
+- A participant arriving after the claim probes nothing. A participant
+  reaches probe EOF only after the shared partial scan is exhausted, so
+  nothing is left for it to probe.
+- NULL-keyed build rows never match. Each participant emits the ones it
+  built itself.
+- The probe loop is unchanged. Marks stay in the private `[]bool`
+  bitmaps, so a Parallel Hash join adds no atomic operation per match.
+  The mutex at detach is the publication edge.
+- A Parallel Hash build never batches: a spilling participant fails with
+  `errParallelHashSpilled`, and the planner's PH4 veto keeps such inners
+  off the path. Per-batch sweeps therefore never arise.
+
+### Slice 3 verification
+
+- `TestParallelHashFillBuildIdentityWithSerial` runs RIGHT, FULL and the
+  planner-elected RIGHT ANTI as a 4-worker Parallel Hash and checks
+  parallel-vs-serial row identity (58782, 63951 and 4024 rows; 5
+  builders each). It also checks that the sweep was claimed exactly once.
+  Mutation check: with every participant sweeping on its own bits, all
+  three cases fail with duplicated unmatched rows (64200 / 69587 / 27780
+  rows). The real code is clean under `-race`.
+- `TestParallelHashProbeDetachMerges` pins the protocol: bits merge,
+  there is one claim, and a late attach is refused.
+- TPC-DS fire set: Q69 / Q75 fire at SF0.25, Q5 / Q75 at SF1, and all
+  values pass.
+  - SF1 Q75's three Parallel Hash Right Joins now match PG line for
+    line, including `Workers Planned: 2` (was 4).
+  - SF1 Q5 gains PG's Parallel Hash Right Join.
+  - SF0.25 Q69 now uses a Parallel Hash Right Anti Join, where PG runs
+    serial Hash Right Anti Joins above its Gathers.
+  - Aligned PG lines: SF0.25 2319→2332, SF1 2112→2148. match /
+    text-identity are flat (39/35, 28/20).
+- Regress A/B: `join_hash`, `select_parallel`, `partition_join` and
+  `subselect` are byte-identical. `join` moves by one line: a
+  no-ORDER-BY row order that also toggled in slice 2's A/B.
+- `join_hash`'s two Parallel Hash Full Join plans stay unmatched: goopg
+  plans FULL joins outside the join search (`jointypeForDirection`
+  reports FULL as not legal) as Merge Full Join. The executor now runs a
+  parallel FULL hash join, but no path reaches it (ledgered).
+- Gates: units, spotcheck, sweep 96/96, TPC-H arm, ea-ratchet, fire set.
+
+## Residuals (ledgered)
+
+- Merge right anti (PG builds one; goopg's merge executor has no
+  RIGHT ANTI arm).
+- `innerrel_is_unique` is not run on the commuted pair, so a right join
+  over a unique build side is priced by the non-unique arm.
+- FULL joins never reach the search, so neither serial nor Parallel Hash
+  FULL is elected (join\_hash's two plans).
+- Q23's Hash Right Semi and Q69's serial right anti sit under subtrees
+  goopg shapes differently (row estimates, unique-ified inners —
+  M0146-0005dk).

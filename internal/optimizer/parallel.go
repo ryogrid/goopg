@@ -1398,9 +1398,16 @@ func joinProbeSideIsLeft(p *Join) bool {
 //   - LEFT qualifies only with the outer on the PROBE side (!BuildLeft), which
 //     is the only LEFT shape the lazy-hash runtime implements anyway: its
 //     null-padding is per-probe-row and needs no cross-worker state.
-//   - FULL and RIGHT would require knowing which BUILD rows went unmatched
-//     across ALL workers — a cross-worker reduction that does not exist here.
-//     Refused rather than approximated.
+//   - FULL, RIGHT and RIGHT ANTI need to know which BUILD rows went unmatched
+//     across ALL workers. Only a Parallel Hash join has that reduction: its
+//     participants share one table and the last one to finish probing sweeps
+//     it with every participant's match bits (parallel_hash_shared.go,
+//     M0146-0005dj). A leader-prebuilt or per-worker table has no such
+//     reduction and is refused — PG's "no one process has all the match
+//     bits" (hash_inner_and_outer).
+//   - RIGHT SEMI is never partial: its emit-once decision is made at the
+//     first match, in whichever participant finds it (PG excludes
+//     JOIN_RIGHT_SEMI from the parallel block entirely).
 //
 // LATERAL is excluded because its right side is re-planned per outer row and
 // never takes the hash path at all.
@@ -1413,6 +1420,8 @@ func hashJoinIsPartialCapable(p *Join) bool {
 		return true
 	case JoinTypeLeft:
 		return !p.BuildLeft
+	case JoinTypeRight, JoinTypeFull, JoinTypeRightAnti:
+		return p.ParallelHash
 	}
 	return false
 }
@@ -1449,6 +1458,19 @@ func hashJoinIsPartialCapable(p *Join) bool {
 func partialHashJoinTypeOK(jt parser.JoinType) bool {
 	switch jt {
 	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
+	}
+	return partialHashJoinNeedsSharedTable(jt)
+}
+
+// partialHashJoinNeedsSharedTable names the jointypes a partial hash join may
+// take only as a Parallel Hash (a shared table), never with a per-worker
+// complete inner: PG's hash_inner_and_outer sets cheapest_safe_inner = NULL
+// for JOIN_FULL, JOIN_RIGHT and JOIN_RIGHT_ANTI. hashJoinIsPartialCapable
+// admits exactly these when Join.ParallelHash is set.
+func partialHashJoinNeedsSharedTable(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinRight, parser.JoinFull, parser.JoinRightAnti:
 		return true
 	}
 	return false

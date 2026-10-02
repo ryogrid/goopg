@@ -312,6 +312,15 @@ type joinOp struct {
 	lazyMatchedS   map[string][]bool
 	lazyMatchedI   map[int64][]bool
 	lazyMatchedCur []bool
+	// parallelFill is the shared build state of a Parallel Hash join that
+	// fills its build side; parallelProbing is this participant's probe
+	// attachment to it, and parallelSkipProbe marks a participant that
+	// arrived after the sweep was claimed (parallel_hash_shared.go,
+	// M0146-0005dj).
+	parallelFill      *parallelHashBuild
+	parallelProbing   bool
+	parallelSkipProbe bool
+	parallelSweeps    bool
 	fillNullBuild  []Row
 	fillNullIdx    int
 	sweepInit      bool
@@ -1775,17 +1784,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// part of its contract).
 		var probeSlot TupleSlot
 		var err error
-		if o.probeEOF {
+		if o.probeEOF || o.parallelSkipProbe {
 			err = EOF
 		} else {
 			probeSlot, err = o.lazyProbe.Next()
 		}
 		if err == EOF {
+			if !o.probeEOF {
+				// A Parallel Hash fill-build join sweeps the shared table once,
+				// in the last participant to finish probing.
+				o.parallelSweeps = o.parallelFillDetach()
+			}
 			o.probeEOF = true
 			// M0127-P4.2 (07 §3): PG's HJ_FILL_INNER_TUPLES. This batch's
 			// build side is still resident, so sweep its unmatched rows
 			// BEFORE the next batch overwrites the table (06 §2.5).
-			if o.fillBuildSide() {
+			if o.fillBuildSide() && o.parallelSweeps {
 				if s := o.fillSweepNext(); s != nil {
 					return s, nil
 				}
@@ -2051,6 +2065,10 @@ func (o *joinOp) Close() error {
 	o.fillNullBuild = nil
 	o.fillNullIdx = 0
 	o.probeEOF = false
+	o.parallelFill = nil
+	o.parallelProbing = false
+	o.parallelSkipProbe = false
+	o.parallelSweeps = false
 	o.fillSweepReset()
 	o.ctx = nil
 	errL := o.left.Close()

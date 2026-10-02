@@ -24229,7 +24229,7 @@ M0146-0001 re-baseline census on the new default arm.
     regress 5 cases unchanged\.
   - InitPlan half filed as M0146\-0005dr\.
   Movement: yes — CATEGORIES-EXCL-MATCH join-method SF0.25 29→28, SF1 28→27
-- [ ] **M0146\-0005dj — PG 18\'s Hash Right Semi / Right Anti joins and the parallel Hash Right Join** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dj — PG 18\'s Hash Right Semi / Right Anti joins and the parallel Hash Right Join** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q23 \(Hash Right Semi Join probing the CTE\), Q69 \(Hash Right Anti Join\), Q75 \(Parallel Hash Right Join\): goopg emits none of these in the corpus; PG 4 / 2 / several\.
   Kind: impl
   Parent: M0146\-0005
@@ -24269,6 +24269,24 @@ M0146-0001 re-baseline census on the new default arm.
       Q75\) with shared matched flags, merge right anti, inner\-unique proof on
       the commuted pair\.
     Movement: none — match / CATEGORIES\-EXCL\-MATCH / text\-identity flat at both SFs \(one SF0\.25 plan, Q83, moved toward PG\)
+  - **Slice 3 LANDED 2026\-10\-03 \(Parallel Hash Right / Full / Right Anti\) — task CLOSED\.**
+    RIGHT / FULL / RIGHT ANTI are partial\-capable only as a Parallel Hash
+    \(PG\'s "no one process has all the match bits"\); RIGHT SEMI stays
+    serial\. Participants OR their private match bits into the shared
+    `parallelHashBuild` at probe EOF and the last prober sweeps once
+    \(`probeAttach` / `probeDetach`\)\.
+    - Tests: `TestParallelHashFillBuildIdentityWithSerial` \(RIGHT / FULL /
+      planner\-elected RIGHT ANTI vs serial; a mutation sweeping per
+      participant fails all three\), `TestParallelHashProbeDetachMerges`,
+      rewritten `TestPartialHashJoinTypeOK`\.
+    - TPC\-DS: SF1 Q75\'s three Parallel Hash Right Joins match PG line for
+      line \(Workers Planned 4→2\); SF1 Q5 gains PG\'s Parallel Hash Right
+      Join; SF0\.25 Q69 uses a Parallel Hash Right Anti\. Aligned PG lines
+      2319→2332 \(SF0\.25\), 2112→2148 \(SF1\)\.
+    - Residuals ledgered: merge right anti, inner\-unique proof for the
+      commuted pair, FULL joins outside the search \(join\_hash\'s two
+      Parallel Hash Full Joins\)\.
+    Movement: none — match 39/28, CATEGORIES\-EXCL\-MATCH and text\-identity flat; aligned PG plan lines rose at both SFs
 - [ ] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q83: PG Hash Semi Join over Hash Join\(dd4, HashAggregate\(dd5\)\); goopg keeps nested semi joins under a Gather \(7626 vs 7155 per arm\)\. Q23: HashAggregate unique\-ify of the frequent\_ss\_items CTE\.
   Kind: impl
