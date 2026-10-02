@@ -87,14 +87,16 @@ banner at the next `## ` line).
    M0146-0015a) and the TestE2E conf-template item are all `[x]`, and
    `TestPort_RegressSuite` closed as recorded. The explicit-opclass
    index restart defect (M0146-0015e) landed 2026-09-27 (`cf7c5397b`),
-   draining the first batch. **Live members (owner decision
-   2026-10-02 — second S2 batch, head-prefixed later the same day by the
-   bare-`VACUUM` wrong-database fix; see OWNER DECISIONS 2026-10-02):
-   M0143-0011 → M0146-0035 → M0146-0039 → M0146-0041 → M0146-0040 →
-   M0146-0034 → M0146-0032 → M0146-0033**, in that order. The three isolation
+   draining the first batch. The second batch drained 2026-10-02/03:
+   **M0143-0011** and **M0146-0039, 0041, 0040, 0034, 0032, 0033** are
+   all `[x]`; **M0146-0035** is parked `[!]` on non-reproduction.
+   **Live members (owner decision 2026-10-03 — third S2 batch; see
+   OWNER DECISIONS 2026-10-03): M0146-0047 → M0146-0048 → M0146-0044 →
+   M0146-0045 → M0146-0046 → M0146-0043**, in that order. The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
-   no bump. Descendants filed under this item's tasks inherit item
+   no bump; the tuplelock-upgrade reopen keeps M-NIGHTLY order on the
+   same reasoning (a scheduling-flake signature, not wrong results). Descendants filed under this item's tasks inherit item
    2a's rank (explicit owner placement; S7's lowest-candidate tiebreak
    does not re-queue them under item 3).
 3. **M0145 jointree-first planner** (flow unification, owner decision
@@ -545,6 +547,41 @@ delegated; details in each task's entry):
   corpus state (a "successful" VACUUM in the wrong db silently
   preserves the measurement skew it was meant to remove), and the fix
   is small and fully specified by the ledger's resume point.
+
+OWNER DECISIONS 2026-10-03 (delegated; details in each task's entry):
+- **Third S2 batch → item 2a, in this order:** **M0146-0047** (a
+  null-extended LEFT JOIN row's whole-row value is not NULL —
+  `count(b)` counts 2000 where PG counts 1715; wrong aggregates on the
+  commonest join shape), **M0146-0048** (two windows differing only in
+  NULLS FIRST/LAST share one WindowAgg — wrong `rank()` output; not
+  corpus-exercised, but a silent wrong-results shape), **M0146-0044**
+  (`mod(numeric)` wrong, `numeric % numeric` unsupported — a core
+  numeric op), **M0146-0045** (`ARRAY[...]` output unquoted — breaks
+  round-trip/serialization fidelity), **M0146-0046** (`ctid` NULL
+  under index scans — silent wrong system column, narrower usage),
+  **M0146-0043** (`txid_current()`/`pg_current_xact_id()` return 0 —
+  monitoring builtin, narrowest). Same policy as the earlier batches:
+  correctness outranks plan parity.
+- **M0146-0035's `[!]` park RATIFIED.** 37 clean clone starts on
+  current code; the `:65433` source restarted 2026-10-01 and kept
+  `tpch` (the "next restart loses tpch" risk is retired — the residual
+  risk is clone-time only); and the landed `shared catalog reload`
+  WARN means any recurrence names its own cause. It stays `[!]` until
+  a clone start logs that WARN for `pg_database`/`pg_authid`, or owner
+  direction. Its ledger row's side deferral (the `backup_label.old`
+  rename) parks with it — harmless while un-triggered, per the row's
+  own rationale.
+- **`M-NIGHTLY-tuplelock-upgrade-reopen` keeps M-NIGHTLY order** — a
+  300 ms wait-timeout scheduling-flake signature, not an S2
+  wrong-results defect; same treatment as the three standing SSI
+  specs.
+- **No action on the 2026-10-02 nbtree units failure** — already filed
+  (`units/internal/access/nbtree`, AI-20261002-010412-001) and it did
+  not recur in the 10-03 run.
+- **Status note (no decision):** slice 114 routed every SF0.25
+  first-divergence record to a named task; M0146-0005's close
+  condition now reduces to SF1's 65 unrouted records, so the
+  M0141-S7 hold stays until then.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -24829,6 +24866,13 @@ M0146-0001 re-baseline census on the new default arm.
   > ## ESCALATION 2026\-10\-02 \(S2\) — `ctid` is NULL under index scans
   > Filed by the M0146\-0005 slice\-112 diagnosis, not worked\. Owner: place
   > M0146\-0046 in the banner\.
+  - Not worked \(S2: the owner places it — placed in item 2a by the
+    2026\-10\-03 owner decision\)\. First step: find how the
+    IndexScan / IndexOnlyScan executor arms fill the system\-column slot
+    \(the SeqScan and BitmapHeapScan arms do\), and whether the planner
+    counts `ctid` as a needed column when it elects an index\-only scan \(PG
+    never does: `check\_index\_only` requires every referenced attribute,
+    and ctid is not an index column\)\.
 - [ ] **M0146\-0047 — WRONG RESULTS: a null\-extended row\'s whole\-row value
   is not NULL** \(filed 2026\-10\-03 by the M0146\-0005dl edge\-case probe;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
@@ -24862,12 +24906,6 @@ M0146-0001 re-baseline census on the new default arm.
   > Filed by the M0146\-0005dm probe, not worked\. Owner: place
   > M0146\-0048 in the banner\. Resume point: add the nulls ordering
   > \(`sortByNullsFirst`\) to `windowSpecKey`'s ORDER BY items\.
-  - Not worked \(S2: the owner places it\)\. First step: find how the
-    IndexScan / IndexOnlyScan executor arms fill the system\-column slot
-    \(the SeqScan and BitmapHeapScan arms do\), and whether the planner
-    counts `ctid` as a needed column when it elects an index\-only scan \(PG
-    never does: `check\_index\_only` requires every referenced attribute,
-    and ctid is not an index column\)\.
 - [ ] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
   does not quote its elements** \(filed 2026\-10\-02 by M0146\-0033;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
