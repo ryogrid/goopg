@@ -88,9 +88,10 @@ banner at the next `## ` line).
    `TestPort_RegressSuite` closed as recorded. The explicit-opclass
    index restart defect (M0146-0015e) landed 2026-09-27 (`cf7c5397b`),
    draining the first batch. **Live members (owner decision
-   2026-10-02 — second S2 batch; see OWNER DECISIONS 2026-10-02):
-   M0146-0035 → M0146-0039 → M0146-0041 → M0146-0040 → M0146-0034 →
-   M0146-0032 → M0146-0033**, in that order. The three isolation
+   2026-10-02 — second S2 batch, head-prefixed later the same day by the
+   bare-`VACUUM` wrong-database fix; see OWNER DECISIONS 2026-10-02):
+   M0143-0011 → M0146-0035 → M0146-0039 → M0146-0041 → M0146-0040 →
+   M0146-0034 → M0146-0032 → M0146-0033**, in that order. The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump. Descendants filed under this item's tasks inherit item
@@ -491,7 +492,8 @@ delegated; details in each task's entry):
   pro-goopg measurement skew hiding Index-Only-Scan divergences.
   Owner vacuumed `:65433` (each `tpch` table explicitly — bare
   `VACUUM` only covers the default database, the documented
-  M0125-0028 deferral), `:65437` (`tpcds025`, via
+  M0125-0028 deferral — now filed for fix as **M0143-0011**, see
+  the last bullet), `:65437` (`tpcds025`, via
   `ref-clusters-ensure --only 65437` start), and `:65436` (`tpcds`,
   clean-tree binary, cgroup-wrapped; both TPC-DS lanes returned to
   their prior down state). All benchmark tables are now all-visible.
@@ -530,6 +532,19 @@ delegated; details in each task's entry):
   (PROMPT.md step 2a). A proposed `stop_*.sh --status` read exemption was
   REJECTED in review — those scripts ignore argv and stop the cluster
   anyway; the fix belongs in the scripts themselves if wanted.
+- **Bare `VACUUM` targets the wrong database — filed M0143-0011 and
+  placed at the head of item 2a** (owner decision 2026-10-02, later
+  same day). The corpus vacuum above surfaced it operationally: on
+  `:65433`, `VACUUM` with no table list connected to db `tpch` exits
+  successfully yet touches none of tpch's tables — the no-target arm
+  still enumerates `DefaultDBOid` via `im.AllTables()` deep copies,
+  the open residual in the 2026-07-30 M0125-0028 ledger row (which had
+  no unchecked owning task — a bookkeeping gap now closed). It jumps
+  the queue ahead of the S2 batch because maintenance correctness on
+  the bench corpora is a precondition for trusting the campaign's own
+  corpus state (a "successful" VACUUM in the wrong db silently
+  preserves the measurement skew it was meant to remove), and the fix
+  is small and fully specified by the ledger's resume point.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -14667,6 +14682,66 @@ reported, and the values and unit gates are the bar.
     `TestFKInsertAfterParentHotUpdate` (new, red-then-green verified via
     stash); executor package suite; the FK/upsert/unique isolation
     siblings; tpch-spotcheck; tpcds-sf025; tpch-acceptance-arm.
+
+- [ ] **M0143-0011 — bare `VACUUM` (no target list) must cover the
+  CURRENT database, not the default one** (impl; filed 2026-10-02 by
+  owner decision — the record is the open deferral in
+  `.ralph/deferral_ledger.md`'s 2026-07-30 M0125-0028 row (status `-`),
+  which until now had no unchecked owning task; this entry is that
+  owner — do not also file a fresh bug for it).
+  Kind: impl
+  Parent: M0125-0028
+  - **Defect.** `vacuumOp.expandVacuumTargets` / `vacuumTableTargets`
+    (`internal/executor/operators_vacuum.go`) resolve named targets
+    through the per-connection catalog correctly, but the no-target arm
+    still walks `im.AllTables()` — the `DefaultDBOid` namespace, as
+    **deep copies**. Two consequences: (a) connected to a non-default
+    database, bare `VACUUM` vacuums the WRONG database's tables —
+    verified live 2026-10-02 on `:65433`, where `VACUUM` in db `tpch`
+    returned success yet `pg_class.relallvisible` for tpch's tables
+    stayed 0 (the owner had to vacuum each table explicitly during the
+    corpus alignment); (b) in every database the no-target arm's
+    `UpdateRelStats`/`RelFrozenXID` writes land on throwaway copies and
+    are silently lost — db-wide VACUUM's bookkeeping has never taken
+    effect. PG semantics (`get_all_vacuum_rels`,
+    `postgres/src/backend/commands/vacuum.c`): bare VACUUM covers all
+    vacuumable relations in the *current* database.
+  - **Fix direction** (the ledger row's resume point): switch the
+    no-target arms of `expandVacuumTargets`/`vacuumTableTargets` to
+    `im.UserTableHandles(NamespaceDBOid(ctx.CurrentDatabaseOid))` — the
+    live-handle iterator M0125-0028 added for bare ANALYZE — so the
+    expansion and the stats/frozen-xid writes ride live handles like
+    the named-target path already does.
+  - **Ledger's own warning, binding here:** the live-handle switch makes
+    db-wide VACUUM's freeze/stats writes take effect for the FIRST time
+    — a freeze-bookkeeping behaviour change that deserves its own
+    verification pass, not a rider on an unrelated commit. Watch the
+    vacuum/isolation specs for newly-visible effects.
+  - **Same-row sibling residual — note only, do NOT bundle:**
+    `VACUUM <missing-table>` silently succeeds (PG raises 42P01 —
+    `expandVacuumTargets` `continue`s on failed lookup while ANALYZE
+    already has the correct 42P01 arm). If touched, it is its own task
+    with a vacuum-spec sweep, per the ledger row.
+  - **Test that fails before it (M0143 per-task discipline):** an
+    in-process two-database test — create a second db via
+    `tryHandleDatabaseDDL` (the `internal/postmaster/database_ddl_test.go`
+    / `database_oid_wiring_test.go` in-process pattern per M0143-0001's
+    scoping note), one table in each db, then bare `VACUUM` with
+    `ctx.CurrentDatabaseOid` pointed at the non-default db: assert the
+    non-default db's table was vacuumed (a stat/freeze write that lands
+    on the LIVE handle — e.g. its relstats change persists to a second
+    read through the same catalog, not a re-lookup of a copy) and the
+    default db's table was NOT touched. Both assertions are red at HEAD.
+  - **Gates:** executor package suite; `pg-regress-runner.sh` vacuum +
+    analyze cases and the vacuum-adjacent isolation specs (freeze /
+    horizons / vacuum-concurrent-drop — the freeze-bookkeeping change
+    may flip visible behaviour there, that is the verification pass);
+    `scripts/tpch-spotcheck.sh`; tpcds-sf025 gate.
+  - **Done:** the test above is green AND, on the real `:65433` cluster
+    (owner-run post-landing), bare `VACUUM` in db `tpch` flips
+    `pg_class.relallvisible` — the exact operational check that exposed
+    the bug. Owner runbook updated so ops use explicit per-table lists
+    until then (`maintenance_prompts/cluster-ops-runbook.md`).
 
 ## M0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment (filed 2026-09-20)
 
