@@ -2660,6 +2660,7 @@ heuristic stays live.)
   - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-001`\),
     again in the 2026\-09\-27 nightly \(`AI-20260927-002707-002`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-002`\).
+  - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-002`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2668,6 +2669,7 @@ heuristic stays live.)
   - Recurred in the 2026\-09\-26 nightly \(`AI-20260926-011809-002`\),
     again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-003`\).
+  - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-003`\).
 - [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
