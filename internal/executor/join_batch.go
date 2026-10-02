@@ -342,7 +342,10 @@ func (o *joinOp) joinBatchEligible() bool {
 		// build-global counters above and fire before nextLazy probes
 		// anything, so they are unaffected by how the build was partitioned.
 		return true
-	case optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull:
+	case optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull,
+		optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+		// M0146-0005dj: the right semi/anti joins keep a per-batch matched
+		// bitmap too, and RIGHT ANTI sweeps it while the batch is resident.
 		// M0127-P4.2 (07 §3): every outer-join orientation batches now. The
 		// probe-fill half was always per-row; the build-fill half is per-batch
 		// because the sweep runs while that batch's table is still resident

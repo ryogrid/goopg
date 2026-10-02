@@ -502,7 +502,8 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 		return false
 	}
 	// Rule 1: must be shareable (P8 eligibility).
-	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight {
+	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight ||
+		o.plan.Type.IsRightSemiAnti() {
 		return false
 	}
 	if o.plan.Type == optimizer.JoinTypeLeft && buildLeft {

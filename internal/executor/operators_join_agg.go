@@ -219,6 +219,9 @@ type joinOp struct {
 	lazyProbeSlot     *MaterializedSlot
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
+	// lazyBuildOnlySlot carries a right semi/anti join's emitted build row
+	// (buildOnlyEmit, M0146-0005dj).
+	lazyBuildOnlySlot *MaterializedSlot
 
 	// M0127-P1.1 (design leftdeep-joins/05 §2, stage E1; the un-deferred
 	// 0126-0004): probe-side slot chaining. nextLazy used to flatten the
@@ -418,6 +421,14 @@ func (o *joinOp) Open(ctx *Context) error {
 	// nested loop, which cannot re-bind the probe's parameter per outer row.
 	if o.plan.Lateral {
 		return o.openLateral(ctx)
+	}
+	if o.plan.Type.IsRightSemiAnti() {
+		// M0146-0005dj: PG plans JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI only as a
+		// hash join (the build side carries the match marks).
+		if o.plan.Algo != optimizer.JoinAlgoHash {
+			return fmt.Errorf("internal error: right semi/anti join requires the hash algorithm, got %d", o.plan.Algo)
+		}
+		return o.openLazyHashJoin(ctx)
 	}
 	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		switch o.plan.Algo {
@@ -681,7 +692,8 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// also defend here so a stray flag doesn't silently break the
 	// emit-once-per-probe-row invariant.
 	buildLeft := o.plan.BuildLeft
-	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti ||
+		o.plan.Type.IsRightSemiAnti() {
 		buildLeft = false
 	}
 	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
@@ -1700,6 +1712,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if !ok {
 				continue
 			}
+			// M0146-0005dj: PG's JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI arms of
+			// HJ_SCAN_BUCKET. A build row already matched is skipped; a new
+			// match is marked, and RIGHT SEMI emits the build row alone while
+			// RIGHT ANTI emits nothing (its sweep emits the unmarked rows).
+			if o.plan.Type.IsRightSemiAnti() {
+				if mi < len(o.lazyMatchedCur) {
+					if o.lazyMatchedCur[mi] {
+						continue
+					}
+					o.lazyMatchedCur[mi] = true
+				}
+				if o.plan.Type == optimizer.JoinTypeRightAnti {
+					continue
+				}
+				return o.buildOnlyEmit(m), nil
+			}
 			o.lazyProbeMatched = true
 			// M0127-P4.2 (07 §3): PG's HeapTupleHeaderSetMatch — the build
 			// tuple is marked here, AFTER the residual predicate, because a
@@ -1845,7 +1873,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P4.2: a fill-build join needs the key materialised for
 			// the same reason FOR UPDATE does — its parallel map is keyed
 			// alongside lazyHash.
-			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.fillBuildSide())
+			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.buildMatchTracked())
 			if err != nil {
 				return nil, err
 			}
@@ -1980,7 +2008,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
 		// successful match is one indexed store. A join that fills neither
 		// build side keeps lazyMatchedCur nil and pays nothing.
-		if o.fillBuildSide() {
+		if o.buildMatchTracked() {
 			if haveIntKey {
 				o.lazyMatchedCur = o.matchedIntBucket(matchIntKey, len(matches))
 			} else {

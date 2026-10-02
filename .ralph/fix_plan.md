@@ -24216,6 +24216,19 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: impl
   Parent: M0146\-0005
   - First step: compare hash\_inner\_and\_outer\'s JOIN\_RIGHT\_SEMI / JOIN\_RIGHT\_ANTI arms \(joinpath\.c\) with goopg\'s hash\-join path producer and the executor\'s right\-join support\.
+  - **Slice 1 LANDED 2026\-10\-03 \(executor substrate\)\.** JoinTypeRightSemi /
+    JoinTypeRightAnti \(Output = right/build side\); hash execution with the
+    per\-bucket matched bitmap \(emit\-once RIGHT SEMI, fill\-build sweep incl\.
+    NULL keys for RIGHT ANTI\), batching admitted, shared build declined,
+    EXPLAIN labels\. Design
+    `docs/design/0100\-0149/m0146\-0005dj\-hash\-right\-semi\-anti\.md`\.
+    - Tests: `TestHashRightSemiAntiJoinEmitsBuildRows` \(memory \+ batched\),
+      `TestHashRightSemiAntiHonourResidual`, `TestRightSemiAntiJoinLabels`\.
+    - Next: slice 2 — the search\'s swapped semi/anti hash path
+      \(make\_join\_rel JOIN\_RIGHT\_SEMI / RIGHT\_ANTI\), final\_cost\_hashjoin
+      costing, lowering with the build side\'s layout, and the optimizer
+      JoinType switch audit; slice 3 — parallel right joins\.
+    Movement: none — executor substrate, no producer yet (fire set: no plan changed)
 - [ ] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q83: PG Hash Semi Join over Hash Join\(dd4, HashAggregate\(dd5\)\); goopg keeps nested semi joins under a Gather \(7626 vs 7155 per arm\)\. Q23: HashAggregate unique\-ify of the frequent\_ss\_items CTE\.
   Kind: impl

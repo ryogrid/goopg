@@ -1191,7 +1191,24 @@ const (
 	// has NO match on the right (build). Output schema is the left
 	// side only. Produced by NOT-EXISTS-unnesting (M0061-0001).
 	JoinTypeAnti
+	// JoinTypeRightSemi is PG 18's JOIN_RIGHT_SEMI: a semi join with
+	// its sides swapped for hashing — the semi join's PRESERVED rows
+	// are the RIGHT (build, hashed) input, and each is emitted exactly
+	// once, on its first match against a left (probe) row. Output
+	// schema is the right side only. Hash join only, as upstream
+	// (nodeHashjoin.c; M0146-0005dj).
+	JoinTypeRightSemi
+	// JoinTypeRightAnti is PG's JOIN_RIGHT_ANTI: each right (build)
+	// row with NO match among the left (probe) rows is emitted once,
+	// by the post-probe sweep of the hash table. Output schema is the
+	// right side only. Hash join only (M0146-0005dj).
+	JoinTypeRightAnti
 )
+
+// IsRightSemiAnti reports whether t emits only the right (build) side.
+func (t JoinType) IsRightSemiAnti() bool {
+	return t == JoinTypeRightSemi || t == JoinTypeRightAnti
+}
 
 // JoinAlgo is the physical algorithm the executor uses for a Join.
 // v0 has three: nested-loop (the universal fallback), hash join
@@ -1405,6 +1422,9 @@ func (n *Join) Output() Schema {
 		if n.Left != nil {
 			return n.Left.Output()
 		}
+	}
+	if n.Type.IsRightSemiAnti() && n.Right != nil {
+		return n.Right.Output()
 	}
 	return n.schema
 }

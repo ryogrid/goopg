@@ -6354,6 +6354,10 @@ func joinLabel(algo string, t optimizer.JoinType) string {
 		return algo + " Semi Join"
 	case optimizer.JoinTypeAnti:
 		return algo + " Anti Join"
+	case optimizer.JoinTypeRightSemi:
+		return algo + " Right Semi Join"
+	case optimizer.JoinTypeRightAnti:
+		return algo + " Right Anti Join"
 	}
 	return "?"
 }
