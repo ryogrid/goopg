@@ -146,6 +146,64 @@ func TestVacuumNamedTargetResolvesConnectionDBOid(t *testing.T) {
 	}
 }
 
+// TestBareVacuumCoversCurrentDatabaseOnly pins M0143-0011: `VACUUM;` covers
+// every relation of the CURRENT database (get_all_vacuum_rels, vacuum.c) and
+// nothing outside it, and its per-relation bookkeeping (vac_update_relstats'
+// reltuples, the advanced relfrozenxid) lands on the live catalog handles.
+// Before the fix the no-target arm walked AllTables() — DefaultDBOid's
+// namespace, as deep copies — so in db tpch on :65433 bare VACUUM returned
+// success while every tpch table kept relallvisible = 0, and the default
+// database's tables were vacuumed instead.
+func TestBareVacuumCoversCurrentDatabaseOnly(t *testing.T) {
+	const otherDBOid = 6464
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE default_db_tbl (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE (default db): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE widgets: %v", err)
+	}
+	if err := runDMLUnderDBOid(t, ctx, "INSERT INTO widgets VALUES (1),(2)"); err != nil {
+		t.Fatalf("INSERT widgets: %v", err)
+	}
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	widgets, _ := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "widgets"}, otherDBOid)
+	if widgets == nil {
+		t.Fatal("fixture: widgets not found under otherDBOid")
+	}
+	frozenBefore := widgets.RelFrozenXID
+
+	if err := runDMLUnderDBOid(t, ctx, "VACUUM"); err != nil {
+		t.Fatalf("bare VACUUM: %v", err)
+	}
+
+	widgets, _ = ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "widgets"}, otherDBOid)
+	if widgets.Stats == nil || widgets.Stats.RowCount != 2 {
+		t.Fatalf("bare VACUUM did not publish reltuples onto the current database's live table: %+v", statsOrNil(widgets))
+	}
+	// relfrozenxid advances only past the freeze cutoff, which a young
+	// cluster reaches only under FREEZE — still the no-target arm.
+	if err := runDMLUnderDBOid(t, ctx, "VACUUM FREEZE"); err != nil {
+		t.Fatalf("bare VACUUM FREEZE: %v", err)
+	}
+	widgets, _ = ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "widgets"}, otherDBOid)
+	if widgets.RelFrozenXID <= frozenBefore {
+		t.Fatalf("bare VACUUM FREEZE did not advance relfrozenxid on the live handle: before %d after %d", frozenBefore, widgets.RelFrozenXID)
+	}
+	defTbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "default_db_tbl"})
+	if defTbl == nil {
+		t.Fatal("fixture: default_db_tbl not found under DefaultDBOid")
+	}
+	if defTbl.Stats != nil {
+		t.Fatalf("bare VACUUM in another database processed DefaultDBOid's table: %+v", defTbl.Stats)
+	}
+}
+
 // statsOrNil renders a table's Stats for failure messages without
 // nil-dereferencing when the lookup itself came back empty.
 func statsOrNil(tbl *catalog.Table) any {

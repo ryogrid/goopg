@@ -409,8 +409,8 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 	// DB-scoped catalog SELECT plans against — mirroring expandAnalyzeTargets
 	// (sibling paths change together): a raw ctx.Catalog.LookupTable keys off
 	// DefaultDBOid, so `VACUUM lineitem` in db tpch silently skipped its
-	// target. The database-wide arm below still enumerates DefaultDBOid's
-	// namespace via deep copies (deferred; see ledger M0125-0028). M0125-0028.
+	// target. The database-wide arm below enumerates the same namespace
+	// (M0143-0011). M0125-0028.
 	cat := ctxPlanCatalog(o.ctx)
 	im, _ := o.ctx.Catalog.(*catalog.InMemory)
 	nsOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
@@ -485,10 +485,14 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 		}
 		return out, parents, nil
 	}
-	// Database-wide VACUUM: every user table, none "explicitly" named, so a
-	// SKIP_LOCKED skip is silent (matches PG's autovacuum-style log suppression).
+	// Database-wide VACUUM: every user table of the CURRENT database
+	// (get_all_vacuum_rels, vacuum.c), none "explicitly" named, so a
+	// SKIP_LOCKED skip is silent (matches PG's autovacuum-style log
+	// suppression). Live handles, not AllTables' DefaultDBOid deep copies:
+	// those vacuumed the wrong database from any other one, and the
+	// relstats / relfrozenxid writes landed on throwaway copies. M0143-0011.
 	if im != nil {
-		for _, tbl := range im.AllTables() {
+		for _, tbl := range im.UserTableHandles(nsOid) {
 			if !tbl.Virtual {
 				out = append(out, vacuumTarget{tbl: tbl, explicit: false})
 			}
@@ -655,9 +659,12 @@ func (o *vacuumOp) vacuumTableTargets(vs *parser.VacuumStmt) []*catalog.Table {
 		}
 		return out
 	}
-	if im, ok := cat.(*catalog.InMemory); ok {
+	// Database-wide: the same live handles of the current database as
+	// expandVacuumTargets' no-target arm, so the RelFrozenXID updates made
+	// through this list persist (M0143-0011).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		var out []*catalog.Table
-		for _, tbl := range im.AllTables() {
+		for _, tbl := range im.UserTableHandles(catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if !tbl.Virtual {
 				out = append(out, tbl)
 			}

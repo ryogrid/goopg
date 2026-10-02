@@ -14683,7 +14683,7 @@ reported, and the values and unit gates are the bar.
     stash); executor package suite; the FK/upsert/unique isolation
     siblings; tpch-spotcheck; tpcds-sf025; tpch-acceptance-arm.
 
-- [ ] **M0143-0011 — bare `VACUUM` (no target list) must cover the
+- [x] **M0143-0011 — bare `VACUUM` (no target list) must cover the
   CURRENT database, not the default one** (impl; filed 2026-10-02 by
   owner decision — the record is the open deferral in
   `.ralph/deferral_ledger.md`'s 2026-07-30 M0125-0028 row (status `-`),
@@ -14742,6 +14742,24 @@ reported, and the values and unit gates are the bar.
     `pg_class.relallvisible` — the exact operational check that exposed
     the bug. Owner runbook updated so ops use explicit per-table lists
     until then (`maintenance_prompts/cluster-ops-runbook.md`).
+  - **DONE 2026\-10\-02** \(loop part\)\. Both no\-target arms
+    \(`expandVacuumTargets`, `vacuumTableTargets`\) iterate
+    `im\.UserTableHandles\(NamespaceDBOid\(CurrentDatabaseOid\)\)`\.
+    `vacuumTableTargets` used to type\-assert the plan catalog, which is
+    not an `\*InMemory`, so its db\-wide arm had returned nothing\. Design
+    `docs/design/0100\-0149/0125\-0028\-warm\-stats\-programme\.md`
+    § "M0143\-0011"\.
+    - Test `TestBareVacuumCoversCurrentDatabaseOnly`: reltuples and
+      relfrozenxid \(under FREEZE\) land on the live per\-DB handle, and
+      the default DB is untouched\. Red at HEAD\.
+    - Verification pass: 6 vacuum\-adjacent isolation specs PASS; regress
+      vacuum / vacuum\_parallel / stats unchanged vs a HEAD baseline;
+      units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(none\),
+      ea\-ratchet PASS\.
+    - Owner\-run check still due: bare `VACUUM` in db `tpch` on `:65433`
+      should flip `pg\_class\.relallvisible`\. The loop may not write to the
+      reference cluster\.
+  Movement: none — correctness fix — no plan instrument
 
 ## M0144 — Measurement-first parity: censuses, instrumented PG, route-order alignment (filed 2026-09-20)
 
