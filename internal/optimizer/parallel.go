@@ -195,6 +195,21 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 
 	// Find the deepest point at which the subtree below is partial-capable.
 	tgt, ok := findPartialSubtree(root, s)
+	// M0146-0005dh: a parallel-restricted expression — a correlated SubPlan
+	// (outer PARAM_EXECs, `parallel_safe` false), a non-parallel-safe
+	// function — may not run in the workers either: PG gives the rel or
+	// joinrel carrying it no partial path (set_rel_consider_parallel /
+	// build_join_rel's consider_parallel). TPC-DS Q41's `(SubPlan 1) > 0`
+	// on `item i1` ran in a Parallel Seq Scan. And
+	// "CTE tuplestores aren't shared among parallel workers,
+	// so we force all CTE scans to happen in the leader"
+	// (set_rel_consider_parallel, allpaths.c RTE_CTE). A CTE scan inside the
+	// partial subtree — TPC-DS Q2's hash build sides under a Gather Merge —
+	// would run once per worker; the statement stays serial at this level
+	// (the CTE bodies and sublinks still get their own verdicts below).
+	if ok && (partialSubtreeScansCTE(tgt.node) || !partialSubtreeExprsParallelSafe(tgt.node)) {
+		ok = false
+	}
 	if !ok {
 		// R33 (K44): no top-level target — sublinks still get their
 		// own verdicts (Q9's top is a 1-row scan; its 15 InitPlans
@@ -606,6 +621,13 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// replicated whole per worker — are unaffected, as before.
 		if drivingScan(cur) != nil && !drivingScanCrossesSort(cur) {
 			return partialTarget{node: cur}, true
+		}
+		// M0146-0005dh: a parallel-restricted Filter directly over a base
+		// scan is that relation's baserestrictinfo, so the relation gets no
+		// partial path at all (set_rel_consider_parallel) — PG scans it
+		// serially rather than gathering the bare scan under the qual.
+		if f, ok := cur.(*Filter); ok && isBaseScanNode(f.Child) && !isParallelSafeExpr(f.Predicate, nil) {
+			return partialTarget{}, false
 		}
 		kids := parallelChildren(cur)
 		if len(kids) != 1 {
@@ -2553,4 +2575,59 @@ func unstampParallelScan(n Node) Node {
 		return &c
 	}
 	return n
+}
+
+// isBaseScanNode reports whether n scans one base relation directly.
+func isBaseScanNode(n Node) bool {
+	switch n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		return true
+	}
+	return false
+}
+
+// partialSubtreeScansCTE reports whether a CTE scan sits in n's own plan
+// (the CTE body and sublink plans are other levels and are not entered).
+func partialSubtreeScansCTE(n Node) bool {
+	found := false
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || found {
+			return
+		}
+		switch x := cur.(type) {
+		case *CTEScan:
+			if !x.Inlined() {
+				found = true
+				return
+			}
+			// An inlined CTE is a subquery RTE upstream, not a tuplestore:
+			// its body is part of this level.
+			walk(x.Child)
+			return
+		case *MaterializedCTEScan:
+			found = true
+			return
+		}
+		kids, _ := planChildNodes(cur)
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(n)
+	return found
+}
+
+// partialSubtreeExprsParallelSafe reports whether every expression the
+// partial subtree evaluates is parallel-safe (isParallelSafeExpr, the same
+// predicate the search's consider_parallel flags use). Sublink bodies are
+// judged through their SubPlan, not entered as part of this level.
+func partialSubtreeExprsParallelSafe(n Node) bool {
+	safe := true
+	walkPlanExprs(n, func(e Expr) {
+		if safe && !isParallelSafeExpr(e, nil) {
+			safe = false
+		}
+	})
+	return safe
 }

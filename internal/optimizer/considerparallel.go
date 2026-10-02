@@ -80,7 +80,8 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 	for i, rel := range s.joinrels[1] {
 		rel.ConsiderParallel = false
 		if s.parallelModeOK && i < len(s.relInfos) {
-			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat)
+			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat) &&
+				heldBaseQualsParallelSafe(s.clausesAll(), rel.Relids, cat)
 			// M0145-0004: an appendrel leaf's rtekind arm is opaque to
 			// relConsiderParallel — a *SetOp leaf reads as `other` and
 			// fails closed. PG computes the appendrel's safety by walking
@@ -109,6 +110,27 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 			p.ParallelSafe = rel.ParallelSafeForPath()
 		}
 	}
+}
+
+// heldBaseQualsParallelSafe is the rest of set_rel_consider_parallel's
+// baserestrictinfo walk (allpaths.c:748). A conjunct carrying a sublink is
+// held in the search's clause list rather than pushed into the leaf's
+// Filter (partitionConjunctsForJoinPlanning), so relConsiderParallel never
+// sees it — yet in PG a qual referencing only this rel IS one of its
+// baserestrictinfo, and a correlated SubPlan in it (outer PARAM_EXECs, so
+// `subplan->parallel_safe` is false) makes the rel parallel-restricted. TPC-DS
+// Q41's `(SubPlan 1) > 0` on `item i1` ran in a Parallel Seq Scan; PG scans
+// it serially (M0146-0005dh).
+func heldBaseQualsParallelSafe(clauses []*restrictInfo, relids RelSet, cat catalog.Catalog) bool {
+	for _, ri := range clauses {
+		if ri == nil || ri.relids == 0 || !relsSubset(ri.relids, relids) {
+			continue
+		}
+		if !isParallelSafeExpr(ri.clause, cat) {
+			return false
+		}
+	}
+	return true
 }
 
 // ParallelSafeForPath is the value `create_*_path` stamps on a childless path

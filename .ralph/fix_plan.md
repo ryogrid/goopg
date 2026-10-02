@@ -24176,11 +24176,25 @@ M0146-0001 re-baseline census on the new default arm.
   - Ledgered: covering skip probe stays Index Scan \(PG Index Only Scan\);
     no backward skip scan; costs through the known index\-cost families\.
   Movement: none — no TPC-DS plan changed (no constant-driven skip probe in the corpus); regress btree_index Index Cond lines 2 fixed
-- [ ] **M0146\-0005dh — a correlated\-SubPlan qual or a CTE Scan runs under Gather where PG keeps it parallel\-restricted** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dh — a correlated\-SubPlan qual or a CTE Scan runs under Gather where PG keeps it parallel\-restricted** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q41: the correlated SubPlan filter on item runs in a Parallel Seq Scan and the SubPlan scan is priced CPU\-only \(180\.01 vs PG 4029\.00\); Q2: Gather Merge over CTE Scans\. PG marks PARAM\_EXEC\-referencing quals and CTE scans parallel\-restricted \(max\_parallel\_hazard, set\_rel\_consider\_parallel\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: find the parallel\-safety predicate that admits a leaf under Gather \(considerparallel\.go\) and add PG\'s two hazards: a qual whose SubPlan carries outer params, and a CTEScan leaf\.
+  - **DONE 2026\-10\-02 \(slice 115\)\.** The Gather post\-pass
+    \(`maybeAddGatherInner`\) refuses a partial target holding a
+    parallel\-restricted expression \(`partialSubtreeExprsParallelSafe`\) or a
+    non\-inlined CTE scan \(`partialSubtreeScansCTE`\); `findPartialSubtree`
+    stops at a restricted Filter on a base scan; the search\'s base
+    consider\_parallel also walks held single\-rel clauses\. Design
+    `docs/design/0100\-0149/m0146\-0005dh\-parallel\-restricted\-quals\.md`\.
+  - A `drivingScan`\-based first attempt panicked a search\-chosen PathGather
+    on Q75 \(caught by the sweep\); the check lives only in the post\-pass\.
+  - Test `TestGatherPostPassKeepsParallelHazardsSerial` \(each check\'s
+    removal fails its cases\)\.
+  - Gates: units, spotcheck, sf025 96/96, arm, fire set \(Q2 Q41 / Q2 Q59\),
+    ea\-ratchet; regress join 2 lines toward PG, 5 cases unchanged\.
+  Movement: yes — TPC-DS PLAN-PARITY match SF0.25 38→39 (Q41)
 - [ ] **M0146\-0005di — a SubPlan, AlternativeSubPlan or InitPlan is charged into its parent\'s cost as PG charges it** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q1, Q10, Q35: a filter with a correlated or hashed\-OR SubPlan costs nothing extra \(PG: per\-row cost, AlternativeSubPlan priced by its non\-hashed arm, cost\_qual\_eval\); Q30, Q57, Q58, Q64, Q75: InitPlan or CTE cost missing from the parent node\.
   Kind: impl
