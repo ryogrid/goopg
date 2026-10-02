@@ -1809,6 +1809,9 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// the microsecond difference is justified into whole 24h days
 		// (interval_justify_hours), while a pure date pair yields an int4
 		// day count instead of an interval.
+		if op == parser.OpSub && left.IsDate() && right.IsDate() {
+			return subDateDate(left, right, pos)
+		}
 		if op == parser.OpSub && left.Kind == KindTime && right.Kind == KindTime {
 			return subTimeTime(left, right, pos)
 		}
@@ -3803,6 +3806,17 @@ const (
 // NaN), while a single infinite operand yields the correspondingly-signed
 // infinite interval. -inf−x = -inf, +inf−x = +inf, x−(-inf) = +inf,
 // x−(+inf) = -inf. (unimplemented_feat #5(d-iv))
+// subDateDate is date_mi (date.c): the integer number of days between two
+// dates. Infinite dates have no day count — PG raises 22008 "cannot subtract
+// infinite dates". M0146-0040.
+func subDateDate(left, right Datum, pos int) (Datum, error) {
+	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
+		return Datum{}, &ExecError{Code: "22008", Pos: pos, Message: "cannot subtract infinite dates"}
+	}
+	diff := left.TimeValue().Sub(right.TimeValue())
+	return Datum{Kind: KindInt, Int: int64(diff / (24 * time.Hour))}, nil
+}
+
 func subTimeTime(left, right Datum, pos int) (Datum, error) {
 	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
 		switch {
@@ -4843,6 +4857,16 @@ func evalOr(a, b Datum) Datum {
 // see usedSession in that arm.
 func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
+		// The cache holds the instant only; the literal's type restores the
+		// datum's subtype, exactly as the uncached arms below build it — a
+		// cached date literal used to come back as a timestamp, so
+		// `date '2001-07-15' + 30` missed the date_pli arm (M0146-0040).
+		switch {
+		case x.Type == "date":
+			return NewDateDatum(x.CachedTime), nil
+		case isTimestampTZTypeName(x.Type):
+			return NewTimestampTZDatum(x.CachedTime), nil
+		}
 		return NewTimeDatum(x.CachedTime), nil
 	}
 	switch x.Type {
@@ -4971,7 +4995,10 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
-		return NewTimeDatum(x.CachedTime), nil
+		// A DATE datum (date_in), not a timestamp: date ± integer
+		// (date_pli / date_mii) and date - date (date_mi) dispatch on it.
+		// M0146-0040.
+		return NewDateDatum(x.CachedTime), nil
 	case "time":
 		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
 		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {

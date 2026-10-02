@@ -24610,7 +24610,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Found and filed: M0146\-0044 \(`mod\(numeric\)` wrong, `%` on numeric
       unsupported\)\.
   Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 12→11, SF1 15→14 (Q21 now matches PG text)
-- [ ] **M0146\-0040 — `date \+ integer` returns a timestamp\-formatted
+- [x] **M0146\-0040 — `date \+ integer` returns a timestamp\-formatted
   value of type unknown** \(filed 2026\-10\-01 by slice 88; REPRODUCED on
   the private :5533 probe cluster, S2 escalation: wrong results\)\.
   `SELECT d\_date, d\_date \+ 30, pg\_typeof\(d\_date \+ 30\) FROM date\_dim
@@ -24629,6 +24629,22 @@ M0146-0001 re-baseline census on the new default arm.
     the executor evaluator and the analyzer's operator typing; PG's
     operators are date\_pli / date\_mii / date\_mi \(pg\_operator 1100/1101/
     1099\)\.
+  - **DONE 2026\-10\-02** \(banner item 2a\)\. Four layers fixed together:
+    the executor date literal \(incl\. its cache\) and `subDateDate`; the
+    analyzer \(date cast, `current\_date`, `date ± int`, `date − date`, `int`
+    in `isIntegerLike`\); the planner `exprType`; and the constant fold
+    \(`tryFoldDateIntegerOp`\)\. Design
+    `docs/design/0100\-0149/m0146\-0040\-date\-integer\-arithmetic\.md`\.
+    - Test `TestDateIntegerArithmeticMatchesPG` \(PG 18\.3 values; fails at
+      analysis on base\); `TestTimestampSubtractionInterval` date − date
+      updated from `9 days` to PG's `9`\.
+    - Regress date 725 \-> 653 diff lines \(72 fixed, none new\); horology,
+      timestamp, timestamptz, interval and expressions unchanged\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm \(values
+      identical\), fire set \(none\), ea\-ratchet PASS\.
+    - Ledgered: int literals typed bigint \(date \+ int8 accepted\), other
+      cast typing, `IntervalLit` exprType, fold\-error cursor\.
+  Movement: none — correctness fix — no plan instrument
 - [x] **M0146\-0038 — IS NOT NULL on a NOT NULL column is dropped at
   planning time** \(filed 2026\-09\-29 by M0146\-0005bc from TPC\-DS Q51\'s
   depth\-10 record: goopg keeps `Filter: \(ws\_item\_sk IS NOT NULL\)` on the

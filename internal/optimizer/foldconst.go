@@ -279,6 +279,53 @@ func foldPlanConstantsInner(node Node) {
 // `datetime.FormatTimestamp` counts micros from (postgresEpochJDate).
 const pgEpochUnix int64 = 946684800
 
+// tryFoldDateIntegerOp folds the date day-count operators over literals
+// (M0146-0040): `date ± integer` (date_pli / date_mii) and `integer + date`
+// (integer_pl_date) to a date literal, `date - date` (date_mi) to the integer
+// day count — all four `provolatile = 'i'` on the PG 18.3 oracle, and folded
+// by its eval_const_expressions (`'2001-07-15'::date + 30` renders
+// `'2001-08-14'::date`). Same day arithmetic as the executor's
+// addDateTimeInt / subDateDate. Infinite, BC or unparseable dates decline
+// and stay for the executor.
+func tryFoldDateIntegerOp(pos int, op parser.OpCode, l, r Expr) Expr {
+	dateLit := func(e Expr) (time.Time, bool) {
+		tl, ok := e.(*TypedStringLit)
+		if !ok || !strings.EqualFold(strings.TrimSpace(tl.Type), "date") {
+			return time.Time{}, false
+		}
+		t, ok := parseTemporalLiteral(tl.Value)
+		if !ok || t.Year() < 1 || t.Year() > 9999 {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	asDate := func(t time.Time) Expr {
+		if t.Year() < 1 || t.Year() > 9999 {
+			return nil
+		}
+		return &TypedStringLit{pos: pos, Type: "date", Value: t.Format("2006-01-02")}
+	}
+	if t, ok := dateLit(l); ok {
+		if n, isInt := r.(*IntegerConst); isInt {
+			days := int(n.Value)
+			if op == parser.OpSub {
+				days = -days
+			}
+			return asDate(t.AddDate(0, 0, days))
+		}
+		if t2, ok2 := dateLit(r); ok2 && op == parser.OpSub {
+			return &IntegerConst{pos: pos, Value: int64(t.Sub(t2) / (24 * time.Hour))}
+		}
+		return nil
+	}
+	if n, isInt := l.(*IntegerConst); isInt && op == parser.OpAdd {
+		if t, ok := dateLit(r); ok {
+			return asDate(t.AddDate(0, 0, int(n.Value)))
+		}
+	}
+	return nil
+}
+
 // tryFoldTemporalBinaryOp folds `<date|timestamp literal> ± <interval literal>`
 // into a single timestamp literal — R44/K83 step B.
 //
@@ -319,6 +366,9 @@ const pgEpochUnix int64 = 946684800
 func tryFoldTemporalBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	if op != parser.OpAdd && op != parser.OpSub {
 		return nil
+	}
+	if folded := tryFoldDateIntegerOp(pos, op, l, r); folded != nil {
+		return folded
 	}
 	base, ok := l.(*TypedStringLit)
 	if !ok {

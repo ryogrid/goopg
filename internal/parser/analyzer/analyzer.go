@@ -1420,6 +1420,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
 			return catalog.Type{}, err
 		}
+		// M0146-0040: a cast to date IS a date — `'2001-07-15'::date + 30`
+		// must take the date_pli arm below and type as date, not fall into
+		// the numeric promotion as `unknown + int` (→ int8, which then failed
+		// `d <= '…'::date + 30` as "date and int8"). Other targets keep the
+		// v0 `unknown` (ledgered: general cast typing).
+		if strings.EqualFold(x.Type.Name, "date") && (x.Type.Schema == "" || strings.EqualFold(x.Type.Schema, "pg_catalog")) {
+			return catalog.Type{Name: "date"}, nil
+		}
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.UnaryOp:
 		opTyp, err := analyzeExpr(x.Operand, ctx)
@@ -1499,12 +1507,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 					return catalog.Type{}, ae
 				}
 				// Subtraction of two temporal values → interval (timestamp_mi /
-				// time_mi). goopg represents DATE internally as a timestamp, so
-				// date − date also yields an interval here rather than upstream's
-				// integer day count (date_mi) — a deliberate, documented
-				// divergence deferred to the type system (see deferral_ledger.md).
-				// Executor: subTimeTime in internal/executor/expr.go.
+				// time_mi), except date − date, which is upstream's integer day
+				// count (date_mi). Date datums carry their date subtype, so the
+				// executor can honour it (subDateDate, internal/executor/expr.go;
+				// M0146-0040 retired the interval divergence).
 				if x.Op == parser.OpSub {
+					if strings.EqualFold(leftTyp.Name, "date") && strings.EqualFold(rightTyp.Name, "date") {
+						return catalog.Type{Name: "int4"}, nil
+					}
 					return catalog.Type{Name: "interval"}, nil
 				}
 				// Addition of two temporal values is not defined in PG:
@@ -1545,10 +1555,16 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}, nil
 			}
-			// date + integer → date (date_pli).  PG treats the integer as
-			// a day count; executor: addDateTimeInt in expr.go.
-			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) && x.Op == parser.OpAdd {
+			// date ± integer → date (date_pli / date_mii).  PG treats the
+			// integer as a day count; executor: addDateTimeInt in expr.go.
+			// date - date → integer days (date_mi). M0146-0040: the `-`
+			// forms used to fall to the numeric-operand error below.
+			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return leftTyp, nil
+			}
+			if strings.EqualFold(leftTyp.Name, "date") && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int4"}, nil
 			}
 			if isIntegerLike(leftTyp) && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
 				return rightTyp, nil
@@ -1660,6 +1676,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				return catalog.Type{Name: "int8"}, nil
 			}
 			return argTyp, nil
+		case "current_date":
+			// SQLValueFunction CURRENT_DATE is a date (M0146-0040): typed
+			// `unknown`, `current_date + 1` fell into the numeric promotion
+			// as int8 and no longer compared with a `'…'::date` operand.
+			if len(x.Args) == 0 && x.Name.Schema == "" {
+				return catalog.Type{Name: "date"}, nil
+			}
+			return catalog.Type{Name: "unknown"}, nil
 		default:
 			return catalog.Type{Name: "unknown"}, nil
 		}
@@ -3259,7 +3283,9 @@ func isIntegerLike(t catalog.Type) bool {
 		return true
 	}
 	switch strings.ToLower(t.Name) {
-	case "int2", "int4", "int8", "integer", "smallint", "bigint":
+	// "int" is how a column declared `int` is spelled in the catalog
+	// (`n int` + `d date` failed `n + d` before M0146-0040).
+	case "int2", "int4", "int8", "int", "integer", "smallint", "bigint":
 		return true
 	}
 	return false

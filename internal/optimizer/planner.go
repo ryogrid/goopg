@@ -15812,6 +15812,29 @@ func exprType(e Expr) catalog.Type {
 			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}
 			}
+			// date ± integer → date (date_pli / date_mii), integer + date →
+			// date (integer_pl_date), date - date → int4 (date_mi). Twin of
+			// the analyzer's arithmetic arm; without it the result column
+			// was advertised as "unknown" and printed as a timestamp.
+			// M0146-0040.
+			if isDateTypeName(lt.Name) && isIntegerLikeType(rt.Name) && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "date"}
+			}
+			if isIntegerLikeType(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "date"}
+			}
+			if isDateTypeName(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int4"}
+			}
+			// date ± interval / interval + date → timestamp
+			// (date_pl_interval / date_mi_interval / interval_pl_date),
+			// the analyzer arm's twin.
+			if isDateTypeName(lt.Name) && strings.EqualFold(rt.Name, "interval") && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "timestamp"}
+			}
+			if strings.EqualFold(lt.Name, "interval") && isDateTypeName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "timestamp"}
+			}
 			if isFloat(lt.Name) || isFloat(rt.Name) {
 				// Wider float type wins.
 				if lt.Name == "float8" || lt.Name == "double precision" || lt.Name == "double" ||
@@ -16441,6 +16464,11 @@ func unifyValueTypes(a, b catalog.Type) catalog.Type {
 
 // isIntegerLikeType reports whether name is a fixed-width integer type
 // (int2, int4, int8) for the purpose of arithmetic type promotion.
+// isDateTypeName reports whether name spells the date type.
+func isDateTypeName(name string) bool {
+	return strings.EqualFold(name, "date")
+}
+
 func isIntegerLikeType(name string) bool {
 	switch strings.ToLower(name) {
 	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint",
