@@ -246,3 +246,57 @@ first" rule matched TPC-DS but contradicts the no-index case, so it was
 discarded. Implementing the model needs planner-side state (range-table
 order, per-relation index key columns, equivalence classes), which goopg
 lacks in one place.
+
+## Slice 110: M0146-0005df — relation suffixes follow PG's flattened range-table order
+
+EXPLAIN's set_rtable_names numbers repeated relation names (`date_dim_1`,
+`item_2`) in glob->finalrtable order. goopg claimed them in RTID order,
+which is planning first-encounter order: a FROM subquery's relations sit
+inside its parent's, and a CTE body comes before its consumer. PG
+flattens the range table in setrefs.c, in three steps:
+
+1. set_plan_references(root, top_plan) adds the top query's whole range
+   table first, including subqueries pull_up_subqueries flattened into it.
+2. Walking the top plan, each SubqueryScan PG kept recurses into its
+   subroot and adds that level's table at that point, outer input first.
+3. The subplans (CTE bodies, sublinks) follow in glob->subplans order.
+   That is post-order: a sublink inside a CTE body finishes planning, and
+   is appended, before the body.
+
+- `renumberRTIDsFlatRtableOrder` (internal/optimizer/rtid_flat_order.go)
+  rebuilds that order on the finished plan and re-stamps every scan's
+  RTID. RTID feeds only EXPLAIN naming, so no plan or result changes. It
+  runs in Plan() just before stripTrivialSubqueryScans, while the
+  SubqueryScan wrappers (FROM subqueries and wrapInlinedCTEScans'
+  inlined CTEs) still mark the levels PG keeps.
+- A level's own relations keep allocation order (rtindex order). An
+  inlined CTEScan is a subquery RTE: pulled up into the level, or a kept
+  level when wrapped. A materialized CTE body or sublink is a subplan.
+
+Test: `explain_rtable_order_test.go` uses a CTE referenced twice over the
+same table as the main query. PG prints `Seq Scan on zrt` for the main
+query and `zrt zrt_1` for the CTE body. It fails without the pass.
+
+Movement:
+
+- Alias-only diff lines (lines equal to PG's once `_N` suffixes are
+  ignored): 42 → 13 at SF0.25 and 49 → 8 at SF1.
+- Text-identical plans go 16 → 17 at SF1 (Q83, whose grouped CTE
+  subqueries take suffixes in join order). Aligned lines go 2225 → 2263
+  (SF0.25) and 2026 → 2075 (SF1).
+- No line that matched PG before differs now, at either scale.
+- Regress A/B over with, subselect, union, join, aggregates and window:
+  unchanged apart from join.sql's known row flap.
+- Gates pass: units, spotcheck, sweep 96/96, arm, fire set (12 queries)
+  and ea-ratchet (10).
+
+Left over:
+
+- 13 / 8 alias lines in Q8, Q14, Q56, Q58, Q69 and Q75.
+- The exact interleaving of a level's CTE subplans, its sublinks and the
+  subplans of its kept subqueries is ledgered. glob->subplans appends
+  them as planning reaches them.
+- Pulled-up subquery relations should follow the parent's own FROM
+  entries in rtindex order; goopg uses allocation order.
+- Seen while probing: goopg's min/max InitPlan rewrite prints
+  `Seq Scan on zrt` where the query wrote the alias `zrt z`.

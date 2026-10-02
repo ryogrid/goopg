@@ -210,6 +210,9 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// M0146-0005av: an inlined CTE reference PG could not pull up is a
 	// subquery RTE there too; wrap it before the strip decides.
 	node, wrappedCTE := wrapInlinedCTEScans(node)
+	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
+	// while the SubqueryScan wrappers still mark the levels PG keeps.
+	renumberRTIDsFlatRtableOrder(node)
 	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
 	return node, nil
 }
