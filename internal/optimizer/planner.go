@@ -756,37 +756,6 @@ func newResolveContext(bindings []rangeBinding, schema Schema, ps PlannerSetting
 	return ctx
 }
 
-// mergeResolveContexts concatenates outer and inner into a single ctx
-// whose bindings/schema are outer-then-inner. Used to thread LATERAL
-// FROM bindings into a JOIN's right side: the right SRF arg must see
-// the cross-FROM-item siblings (outer) *and* the same FROM item's
-// left side of the JOIN (inner). Either side may be nil. M0103-0008.
-func mergeResolveContexts(outer, inner *resolveContext) *resolveContext {
-	if outer == nil {
-		return inner
-	}
-	if inner == nil {
-		return outer
-	}
-	bindings := make([]rangeBinding, 0, len(outer.bindings)+len(inner.bindings))
-	bindings = append(bindings, outer.bindings...)
-	shift := len(outer.schema)
-	for _, b := range inner.bindings {
-		b.offset += shift
-		bindings = append(bindings, b)
-	}
-	schema := appendSchema(outer.schema, inner.schema)
-	merged := newResolveContext(bindings, schema, outer.settings)
-	// A-01(ii) cut 2: carry the statement scope across the merge so a
-	// sublink resolved against the merged context keeps this statement's
-	// RTIDs (same-statement merge, so either side's scope will do).
-	merged.rtScope = rtableScopeFrom(outer)
-	if merged.rtScope == nil {
-		merged.rtScope = rtableScopeFrom(inner)
-	}
-	return merged
-}
-
 func singleBindingContext(table *catalog.Table, alias string, ps PlannerSettings) *resolveContext {
 	// Single-binding scope (INSERT/UPDATE/DELETE/COPY targets,
 	// view substitution helpers): SourceTableIdx 1 because the
@@ -4405,9 +4374,20 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	leftCtx.rtScope = scope
 	for _, j := range item.Joins {
 		// LATERAL on the right side of a JOIN can reference the
-		// left side. Merge the outer lateralCtx with the current
-		// leftCtx so SRF args on the right see both. M0103-0008.
-		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		// left side, and through it the FROM items to the left of this
+		// one (lateralCtx). M0146-0032: they are two levels, not one —
+		// the join's openLateral pushes only ITS left row, while the
+		// earlier comma items' row is pushed by the enclosing comma join.
+		// Flattening both into one level (mergeResolveContexts) bound
+		// `a.q1` in `FROM a, x LEFT JOIN LATERAL (SELECT a.q1 ...)` to
+		// position 0 of x's row — x.q1. Chain them instead: the left side
+		// at level 1, the earlier items as its parent at level 2.
+		joinLateralCtx := leftCtx
+		if lateralCtx != nil {
+			chained := *leftCtx
+			chained.parent = lateralCtx
+			joinLateralCtx = &chained
+		}
 		if j.Right.Subquery != nil && !j.Right.Lateral {
 			// Non-LATERAL: same-level siblings (leftCtx/joinLateralCtx)
 			// stay invisible inside the right subquery, but outer query

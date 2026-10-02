@@ -25772,7 +25772,7 @@ M0146-0001 re-baseline census on the new default arm.
     Regress `join` and `arrays` now run to completion; the rows then exposed
     two pre\-existing wrong\-results defects, filed below\.
   Movement: none — crash fix
-- [ ] **M0146\-0032 — WRONG RESULTS: a LATERAL subquery\'s outer reference
+- [x] **M0146\-0032 — WRONG RESULTS: a LATERAL subquery\'s outer reference
   binds to a same\-named column of the wrong relation** \(filed 2026\-09\-28 by
   M0146\-0030; S2, pre\-existing — reproduces on `611c32ed3`\)\. `select \*
   from int8\_tbl a, int8\_tbl x left join lateral \(select a\.q1 from int4\_tbl
@@ -25785,6 +25785,18 @@ M0146-0001 re-baseline census on the new default arm.
     find where the lateral `OuterColumnRef a\.q1` is bound — the comma item
     `a` sits to the left of the `x LEFT JOIN LATERAL` item, and the
     reference likely resolves by name/position against `x`\'s row\.
+  - **DONE 2026\-10\-02** \(banner item 2a\)\. `planFromItem` chained the
+    JOIN LATERAL right side's context \(left input at level 1, earlier comma
+    items at level 2\) instead of flattening them with
+    `mergeResolveContexts`, which is now removed\. Design
+    `docs/design/0100\-0149/m0146\-0032\-join\-lateral\-outer\-levels\.md`\.
+    - Test `TestJoinLateralRefersToEarlierFromItem` \(PG: 57 rows / 40
+      non\-NULL z = a\.q1; the old code gets 45 rows / 10 mismatched\)\.
+    - Regress join 15100 \-> 15058 diff lines; rangefuncs and subselect
+      unchanged\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm \(values
+      identical\), fire set \(none\), ea\-ratchet PASS\.
+  Movement: none — correctness fix — no plan instrument
 - [ ] **M0146\-0033 — WRONG RESULTS: array\_agg over an array input returns
   an array of text, not a multidimensional array** \(filed 2026\-09\-28 by
   M0146\-0030; S2, pre\-existing\)\. `select array\_agg\(x\) from \(values
