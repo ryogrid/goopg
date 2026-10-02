@@ -29,6 +29,7 @@ package optimizer
 
 import (
 	"os"
+	"strings"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -201,6 +202,24 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 		return graftTop(root, s, ancGathered)
 	}
 
+	// M0146-0034: a plain Gather interleaves worker streams, so over an
+	// index scan whose order the plan above relies on (the serial plan
+	// dropped its Sort because the index already delivers the ORDER BY) it
+	// returned rows in scheduling order — `ORDER BY d_date_sk LIMIT 1` gave a
+	// different row on half the runs. PG never claims pathkeys for a Gather
+	// and orders such a partial path with Gather Merge
+	// (generate_useful_gather_paths); merging on the index key columns keeps
+	// exactly the serial plan's order. When the keys cannot be stated over
+	// the target's output, or Gather Merge is disabled, the plan stays
+	// serial: a wrong plain Gather is never the fallback.
+	if tgt.mergeKeys == nil && !tgt.splitAgg && indexOrderReliedOn(root, tgt.node) {
+		keys, ok := indexOrderKeys(tgt.node)
+		if !ok || s.DisableGatherMerge {
+			return graftTop(root, s, ancGathered)
+		}
+		tgt.orderKeys = keys
+	}
+
 	// Worker count comes from the scan, so a wrapper target (Sort, Aggregate)
 	// is sized by what it reads rather than by itself.
 	sized := tgt.node
@@ -216,6 +235,155 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	}
 
 	return rebuildWithGather(root, tgt, workers, s.LeaderParticipates)
+}
+
+// indexOrderReliedOn reports whether target is driven by an index scan whose
+// output order something above depends on. Walking root down to target: a
+// Sort re-establishes order and a hashed Aggregate or set operation discards
+// it, so either one ends the question with "no". Otherwise the order is
+// relied on when a node on the way consumes it — a sorted (Group) Aggregate,
+// a WindowAgg, DISTINCT ON — or when the scan delivers the statement's ORDER
+// BY (OrderRelied, set by markIndexOrderRelied at plan time: an index that
+// satisfies the ORDER BY leaves no Sort node to show for it). A Limit alone
+// does not: without an ORDER BY it may return any rows.
+func indexOrderReliedOn(root, target Node) bool {
+	relied := false
+	switch ds := drivingScan(target).(type) {
+	case *IndexScan:
+		relied = ds.OrderRelied
+	case *IndexOnlyScan:
+		relied = ds.OrderRelied
+	default:
+		return false
+	}
+	cur := root
+	for cur != target {
+		switch x := cur.(type) {
+		case *Sort, *SetOp, *RecursiveUnion:
+			return false
+		case *Aggregate:
+			if x.Strategy == AggStrategyHashed {
+				return false
+			}
+			relied = true
+		case *WindowAgg, *DistinctOn:
+			relied = true
+		}
+		kids := parallelChildren(cur)
+		if len(kids) != 1 {
+			return false
+		}
+		cur = kids[0]
+	}
+	return relied
+}
+
+// markIndexOrderRelied flags the index scan that delivers stmt's top-level
+// ORDER BY (M0146-0034). The search dropped the Sort because the index path's
+// pathkeys already satisfied the query's, so nothing else in the plan records
+// that the scan's order is load-bearing; the parallel post-pass, which runs
+// on the finished (and possibly cached) plan without the statement, reads
+// the flag to merge rather than interleave. The walk follows the post-pass's
+// own descent (parallelChildren / drivingScan) through order-preserving
+// nodes; a Sort, hashed Aggregate or set operation on the way means the
+// ORDER BY is not the index's to keep.
+func markIndexOrderRelied(root Node, stmt parser.Stmt) {
+	if !stmtOrdersOutput(stmt) {
+		return
+	}
+	cur := root
+	if ex, ok := cur.(*Explain); ok {
+		cur = ex.Child
+	}
+	for cur != nil {
+		switch x := cur.(type) {
+		case *Sort, *SetOp, *RecursiveUnion, *Gather, *GatherMerge:
+			return
+		case *Aggregate:
+			if x.Strategy == AggStrategyHashed {
+				return
+			}
+		}
+		kids := parallelChildren(cur)
+		if len(kids) != 1 {
+			break
+		}
+		cur = kids[0]
+	}
+	switch ds := drivingScan(cur).(type) {
+	case *IndexScan:
+		ds.OrderRelied = true
+	case *IndexOnlyScan:
+		ds.OrderRelied = true
+	}
+}
+
+// stmtOrdersOutput reports whether stmt's top-level query carries an ORDER
+// BY (EXPLAIN answers for the statement it wraps).
+func stmtOrdersOutput(stmt parser.Stmt) bool {
+	switch x := stmt.(type) {
+	case *parser.ExplainStmt:
+		return stmtOrdersOutput(x.Inner)
+	case *parser.SelectStmt:
+		return x != nil && len(x.OrderBy) > 0
+	}
+	return false
+}
+
+// indexOrderKeys states the driving index scan's order as merge keys over
+// n's output: one key per index key column, with the column's declared
+// direction and NULLS placement (ok=false when a key column is an
+// expression or not visible in n's output).
+func indexOrderKeys(n Node) ([]SortKey, bool) {
+	var idx *catalog.Index
+	ds := drivingScan(n)
+	switch x := ds.(type) {
+	case *IndexScan:
+		idx = x.Index
+	case *IndexOnlyScan:
+		idx = x.Index
+	}
+	if idx == nil || len(idx.Columns) == 0 {
+		return nil, false
+	}
+	scanOut := ds.Output()
+	out := n.Output()
+	keys := make([]SortKey, 0, len(idx.Columns))
+	for i, col := range idx.Columns {
+		if i < len(idx.ColExprs) && idx.ColExprs[i] != nil {
+			return nil, false
+		}
+		src := int16(-1)
+		for _, c := range scanOut {
+			if strings.EqualFold(c.Name, col) {
+				src = c.SourceTableIdx
+				break
+			}
+		}
+		if src < 0 {
+			return nil, false
+		}
+		pos := -1
+		for j, c := range out {
+			if strings.EqualFold(c.Name, col) && c.SourceTableIdx == src {
+				pos = j
+				break
+			}
+		}
+		if pos < 0 {
+			return nil, false
+		}
+		desc := i < len(idx.ColDescending) && idx.ColDescending[i]
+		nullsFirst := desc
+		if i < len(idx.ColNullsFirst) {
+			nullsFirst = idx.ColNullsFirst[i]
+		}
+		keys = append(keys, SortKey{
+			Expr: &ColumnRef{Index: pos, Name: out[pos].Name, Type: out[pos].Type, SourceTableIdx: out[pos].SourceTableIdx},
+			Desc: desc, NullsFirst: nullsFirst,
+		})
+	}
+	return keys, true
 }
 
 // subtreeHasGather reports whether the tree already carries a Gather or a
@@ -253,6 +421,11 @@ type partialTarget struct {
 	// splitAgg ⇒ the target is an Aggregate to split into Partial (in the
 	// workers) and Finalize (in the leader).
 	splitAgg bool
+	// orderKeys non-nil ⇒ the target is driven by an index scan whose ORDER
+	// reaches an order-dependent ancestor (an ORDER BY the index satisfied,
+	// a Limit, a sorted aggregate): the leader must merge the workers'
+	// index-ordered streams on these keys (M0146-0034).
+	orderKeys []SortKey
 }
 
 // statementIsParallelSafe applies the whole-plan refusals. Each is a case
@@ -1769,6 +1942,9 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int, leader bool) N
 		stamped := stampParallelScan(root)
 		if stamped != root {
 			perWorkerDisplayRows(stamped, getParallelDivisor(workers, leader))
+		}
+		if tgt.orderKeys != nil {
+			return NewGatherMerge(stamped.Pos(), stamped, workers, tgt.orderKeys)
 		}
 		return NewGather(stamped.Pos(), stamped, workers)
 	}

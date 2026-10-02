@@ -25796,7 +25796,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: port `array\_agg\_array\_transfn` / `array\_agg\_array\_finalfn`
     \(src/backend/utils/adt/array\_userfuncs\.c\) as the anyarray arm of
     goopg\'s array\_agg, including the dimension\-mismatch error\.
-- [ ] **M0146\-0034 — WRONG RESULTS: Limit over a plain Gather of an
+- [x] **M0146\-0034 — WRONG RESULTS: Limit over a plain Gather of an
   ordered parallel index scan returns rows in scheduling order** \(filed
   2026\-09\-29 by M0146\-0005ak; S2, pre\-existing on e379ea18b\)\.
   `select d\_date\_sk from date\_dim where d\_year = 1998 order by d\_date\_sk
@@ -25812,6 +25812,20 @@ M0146-0001 re-baseline census on the new default arm.
     path as carrying the index scan\'s pathkeys \(Gather must publish no
     pathkeys\)\.
   - Witness 2026\-09\-29 \(M0146\-0005ba regress runner\): limit\.sql `select unique1, unique2, nextval\('testseq'\) from tenk1 order by unique2 limit 10` prints different rows on two runs of the same plan `Limit -> Gather -> Parallel Index Scan`\.
+  - **DONE 2026\-10\-02** \(banner item 2a\)\. `markIndexOrderRelied`
+    \(end of `PlanWithSettings`\) flags the index scan that delivers the
+    top\-level ORDER BY \(`OrderRelied`, which survives the plan cache\)\. The
+    post\-pass \(`indexOrderReliedOn` / `indexOrderKeys`\) then builds a Gather
+    Merge on the index key columns, or stays serial, instead of a plain
+    Gather\. Design
+    `docs/design/0100\-0149/m0146\-0034\-gather\-over\-ordered\-index\-scan\.md`\.
+    - Repro: 10/10 simple and 12/12 extended \(cache hits\) runs return
+      2450815; a no\-ORDER\-BY LIMIT keeps its plain Gather\.
+    - Test `TestParallelPostPassKeepsIndexOrder` \(plain Gather on base\)\.
+    - Gates: units, regress limit/select\_parallel/write\_parallel unchanged,
+      tpch\-spotcheck, sf025 96/96, TPC\-H arm \(values identical\), fire set
+      \(no TPC\-DS plan changed\), ea\-ratchet PASS\.
+  Movement: none — correctness fix — no plan instrument
 - [!] **M0146\-0035 — WRONG RESULTS / DATA LOSS: an online TPC\-H clone
   loses database `tpch` and role `tpch`** \(filed 2026\-09\-29 by
   M0146\-0005ap; S2\)\. `tpch\_private\_clone\_snapshot` \(pg\_basebackup of the

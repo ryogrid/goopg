@@ -214,6 +214,9 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// while the SubqueryScan wrappers still mark the levels PG keeps.
 	renumberRTIDsFlatRtableOrder(node)
 	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
+	// M0146-0034: record which index scan carries the ORDER BY, for the
+	// parallel post-pass that runs on this plan without the statement.
+	markIndexOrderRelied(node, stmt)
 	return node, nil
 }
 

@@ -950,6 +950,11 @@ type IndexScan struct {
 	// Only explain_names.go will read it; value, cost, and executor
 	// paths never do.
 	RTID int32
+	// OrderRelied marks a scan whose index order delivers the statement's
+	// ORDER BY (markIndexOrderRelied, M0146-0034). Planning-only: the
+	// parallel post-pass reads it to merge workers' streams (Gather Merge)
+	// instead of interleaving them.
+	OrderRelied bool
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -1159,6 +1164,11 @@ type IndexOnlyScan struct {
 	// throughout cut 1. Only explain_names.go will read it; value,
 	// cost, and executor paths never do.
 	RTID int32
+	// OrderRelied marks a scan whose index order delivers the statement's
+	// ORDER BY (markIndexOrderRelied, M0146-0034). Planning-only: the
+	// parallel post-pass reads it to merge workers' streams (Gather Merge)
+	// instead of interleaving them.
+	OrderRelied bool
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }
