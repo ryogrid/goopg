@@ -24309,11 +24309,24 @@ M0146-0001 re-baseline census on the new default arm.
       tenk1 IN plans flip because regress `VACUUM ANALYZE` collects no
       column stats on goopg — filed M0146\-0009j\.
     Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 scan\-type 29→28, SF1 join\-order 61→60 \(match flat 39/28\)
-- [ ] **M0146\-0005dl — an unreferenced LEFT JOIN on a unique key is removed \(remove\_useless\_joins\)** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dl — an unreferenced LEFT JOIN on a unique key is removed \(remove\_useless\_joins\)** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q72: goopg keeps `Nested Loop Left Join → Index Only Scan catalog\_returns\_pkey`; PG removes it \(analyzejoins\.c join\_is\_removable\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: port join\_is\_removable for the left\-join case before join search\.
+  - **LANDED 2026\-10\-03\.** `removeUselessLeftJoins` \(remove\_useless\_joins\.go\)
+    rewrites the statement before `planFromClause`: a LEFT JOIN to a plain
+    table unique for its ON equalities and read nowhere else is dropped,
+    iterated to a fixpoint\. Design
+    `docs/design/0100\-0149/m0146\-0005dl\-remove\-useless\-left\-joins\.md`\.
+    - Probes vs PG 18\.3: 13 removed/kept cases identical; pinned by
+      `TestRemoveUselessLeftJoins`\.
+    - Regress: `join` 18573→18546, 8 suites identical, no row changes\.
+    - TPC\-DS: Q72 loses catalog\_returns as in PG; aligned lines 2332→2334 /
+      2178→2179; SF1 qual\-placement 7→8 on the reshuffled Q72 tree\.
+    - Found: M0146\-0047 \(S2, filed\) — whole\-row of a null\-extended row
+      is not NULL\.
+    Movement: none — match 39/28 flat; CATEGORIES\-EXCL\-MATCH flat at SF0\.25, SF1 qual\-placement 7→8 \(Q72 tag on a still\-divergent tree\)
 - [ ] **M0146\-0005dm — stacked WindowAggs run in select\_active\_windows order** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q47, Q57, Q49: goopg evaluates the partition\-only window lower; PG puts the ORDER BY window first \(common\_prefix\_cmp\)\. Cost\-neutral but shape\-visible\.
   Kind: impl
@@ -24806,6 +24819,22 @@ M0146-0001 re-baseline census on the new default arm.
   > ## ESCALATION 2026\-10\-02 \(S2\) — `ctid` is NULL under index scans
   > Filed by the M0146\-0005 slice\-112 diagnosis, not worked\. Owner: place
   > M0146\-0046 in the banner\.
+- [ ] **M0146\-0047 — WRONG RESULTS: a null\-extended row\'s whole\-row value
+  is not NULL** \(filed 2026\-10\-03 by the M0146\-0005dl edge\-case probe;
+  REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
+  `SELECT count\(b\) FROM rj\_a a LEFT JOIN rj\_b b ON b\.k1 = a\.k1 AND b\.k2 = a\.k2 \+ 0`
+  \(2000 outer rows, 285 unmatched\) returns 2000 on goopg, 1715 on PG 18\.3:
+  the whole\-row Var of the nullable side of an unmatched row must be NULL
+  \(ExecEvalWholeRowVar over a null\-extended slot\), so `count\(b\)` skips it\.
+  `b IS NULL` is already right on goopg \(285 on both\), so the defect is the
+  whole\-row value fed to an aggregate argument, not the null test\. Not
+  caused by M0146\-0005dl: the join above is deliberately non\-removable and
+  plans a Hash Left Join on both engines\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-03 \(S2\) — whole\-row value of a null\-extended row is not NULL
+  > Filed by the M0146\-0005dl probe, not worked\. Owner: place
+  > M0146\-0047 in the banner\.
   - Not worked \(S2: the owner places it\)\. First step: find how the
     IndexScan / IndexOnlyScan executor arms fill the system\-column slot
     \(the SeqScan and BitmapHeapScan arms do\), and whether the planner

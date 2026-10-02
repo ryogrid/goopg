@@ -1641,6 +1641,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		var err error
 		// M0146-0005bn: subquery_push_qual runs before the subquery is
 		// planned (subquerypushqual_ast.go).
+		// M0146-0005dl: remove_useless_joins — an unread LEFT JOIN to a
+		// unique-keyed table never reaches the FROM-clause planner.
+		s = removeUselessLeftJoins(s, cat)
 		s = pushWhereQualsIntoGroupedItems(s, cat)
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
