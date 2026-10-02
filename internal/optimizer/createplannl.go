@@ -500,9 +500,12 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	// (operators_bitmap.go `evalBitmapQual`), where the layout translation
 	// below is well defined; a leaf-local form is never needed.
 	//
-	// Orientation is inner-left (`kp.Right` first): PG's line reads
-	// `Recheck Cond: (ss_item_sk = item.i_item_sk)`, the same inner-first
-	// order `formatIndexCondParts` produces for the sibling `Index Cond:`.
+	// Orientation is the clause's own (M0146-0005de): PG's bitmapqualorig is
+	// the index clause's RestrictInfo as it stands (create_bitmap_subplan's
+	// `subqual = list_make1(rinfo->clause)`), not the commuted Index Cond —
+	// `Recheck Cond: (ss_item_sk = item.i_item_sk)` as written, but
+	// `(item.i_item_sk = ss_item_sk)` once the equivalence class derived
+	// the pair item-first (TPC-DS Q53).
 	probeClauses := make([]*restrictInfo, 0, len(idxPath.IndexClauses))
 	for _, c := range idxPath.IndexClauses {
 		if c.ri != nil {
@@ -518,9 +521,13 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	}
 	pairs := in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses)
 	bhs.BitmapQual = make([]Expr, 0, len(pairs))
-	for _, kp := range pairs {
+	for i, kp := range pairs {
+		first, second := kp.Right, kp.Left
+		if clauseOuterFirst(probeClauses[i], in.outerRelids) {
+			first, second = kp.Left, kp.Right
+		}
 		bhs.BitmapQual = append(bhs.BitmapQual,
-			&BinaryOp{pos: kp.Right.Pos(), Op: parser.OpEq, Left: kp.Right, Right: kp.Left})
+			&BinaryOp{pos: first.Pos(), Op: parser.OpEq, Left: first, Right: second})
 	}
 	// M0142-0005e: same stamp-loss as the index arm — the funnel stamped the
 	// outermost emitted node (a leaf-local *Filter when the leaf carried

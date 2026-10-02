@@ -691,6 +691,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
 		conjuncts = append(conjuncts, synth...)
 	}
+	// M0146-0005de: decide the operand order PG's equivalence classes
+	// derive each inner-join equality in (before the outer ON conjuncts join
+	// the list — those are not EC clauses in PG either); applied to the
+	// searched tree below.
+	ecWant := orientECJoinClauses(conjuncts, scans, spans, cat)
 	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
 	// after the equivalence-class constant inference has run, so the closure
 	// never merges a nullable-side column into a preserved-side class (that
@@ -1274,6 +1279,14 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	if residual != nil && searchedResidualHitsPad(residual, searched, ctx.neededCols) {
 		traceSeamDecline("residual-hits-pad", nrels, nprefix)
 		return node, pred, false
+	}
+	// Applied to both: the searched tree's own clause copies, and the
+	// conjuncts themselves, which the restrict infos hold by pointer and
+	// later lowering re-reads (TPC-DS Q91's Join Filter). Only now, after
+	// the search, so the search saw the written orientation.
+	applyECOrientation(searched, ecWant)
+	for _, c := range conjuncts {
+		orientECExpr(c, ecWant)
 	}
 	return searched, residual, true
 }

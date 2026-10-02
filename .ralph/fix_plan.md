@@ -24077,7 +24077,7 @@ M0146-0001 re-baseline census on the new default arm.
     queries\), ea\-ratchet PASS \(10\); regress A/B 6 cases unchanged \(join
     row flap only\); no previously\-matching TPC\-DS line regressed\.
   Movement: none — instrument artefact: CATEGORIES-EXCL-MATCH normalises relation names away (rendering 12 / 15 unchanged); text-identity moved SF1 16→17 (Q83), alias-only lines SF0.25 42→13, SF1 49→8
-- [ ] **M0146\-0005de — an inner\-join equality prints in PG\'s EC\-derived
+- [x] **M0146\-0005de — an inner\-join equality prints in PG\'s EC\-derived
   operand order** \(filed 2026\-10\-02 by slice 109; Q8, Q50, Q53, Q63, Q74,
   Q91 print the written order, PG the EC\-derived one\)\.
   Kind: impl
@@ -24096,6 +24096,28 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where goopg turns WHERE equalities into join
     predicates and whether rtable order \+ index key columns are reachable
     there\.
+  - **DONE 2026\-10\-02 \(slice 111\)\.** `orientECJoinClauses`
+    \(internal/optimizer/ec\_clause\_orient\.go\) decides each inner\-join
+    equality\'s order at the join\-search seam, after
+    `inferTransitiveEqualities`: index key rel first, the parameterising rel
+    first for an indexed rel\'s other clauses, else FROM order\. Keyed by
+    \(binding id, column\) and applied only AFTER the search, in place, to
+    the searched tree and to the conjuncts\. Flipping before the search
+    re\-chose EC pairs and kept a redundant Join Filter on Q82\.
+  - A parameterised bitmap scan\'s Recheck Cond follows its clause
+    \(PG `bitmapqualorig`\), no longer inner\-first by construction
+    \(createplannl\.go, `clauseOuterFirst`\)\.
+  - Test: `explain\_ec\_orientation\_test\.go` \(3 cases; all fail with the
+    decision disabled\)\. Design
+    `docs/design/0100\-0149/m0146\-0005\-join\-order\-burndown\-7.md`
+    § "Slice 111"\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm, fire set \(13 /
+    12 queries, all orientation\-only, none away from PG\), ea\-ratchet
+    PASS \(10\); regress A/B 7 cases, no previously matching line changed\.
+  - Residuals filed: M0146\-0042a \(EC\-reduced clause still outer\-first,
+    SF1 Q17/Q25/Q29\), M0146\-0042b \(EC clauses after the other join
+    quals\); ledger row for the unmodelled paths\.
+  Movement: none — instrument artefact: CATEGORIES-EXCL-MATCH normalises qual text (rendering 11 / 14 unchanged); text-identity moved SF0.25 29→34 (Q50, Q53, Q63, Q74, Q91), SF1 18→20
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
@@ -25989,3 +26011,28 @@ M0146-0001 re-baseline census on the new default arm.
   to need shape work route back to 0005/its named siblings, not here.
   Kind: impl
   Parent: M0146-0005
+- [ ] **M0146\-0042a — an EC\-reduced join clause prints in its derived
+  orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
+  SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
+  PG `catalog\_sales\.cs\_item\_sk = item\.i\_item\_sk`\)\.
+  Kind: impl
+  Parent: M0146\-0042
+  - `equivClassJoinClause` \(joinrestrict\.go\) returns `flipped\(ri\)` to
+    put the outer member on the left\. PG\'s create\_join\_clause instead
+    returns the existing derived clause, in its creation orientation
+    \(ec\_search\_derived\_clause\_for\_ems matches either orientation\)\.
+  - First step: find which consumers of the flipped copy need
+    `clause\.Left` to be the outer key \(`keyPairs` recomputes from relids\)\.
+    Then let the copy keep the clause orientation that
+    `orientECJoinClauses` decides, while its leftKey/leftRelids metadata
+    stays outer\-first\.
+- [ ] **M0146\-0042b — a join\'s EC\-derived clauses print after its other
+  quals** \(filed 2026\-10\-02 by M0146\-0005de\)\. PG 18\.3 prints
+  `Join Filter: \(\(j1\.x < j2\.y\) AND \(j1\.a = j2\.b\)\)`; goopg prints the
+  written conjunct order, `\(\(j1\.a = j2\.b\) AND \(j1\.x < j2\.y\)\)`\.
+  Kind: impl
+  Parent: M0146\-0042
+  - build\_joinrel\_restrictlist \(relnode\.c\) concatenates the joininfo
+    clauses, then generate\_join\_implied\_equalities\' EC clauses\. A sibling
+    of `equivalenceClausesLast` \(local\_filters\.go\), which does this for
+    scan quals, is the likely shape\.

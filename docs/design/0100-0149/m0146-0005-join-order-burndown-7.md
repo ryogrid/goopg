@@ -300,3 +300,109 @@ Left over:
   entries in rtindex order; goopg uses allocation order.
 - Seen while probing: goopg's min/max InitPlan rewrite prints
   `Seq Scan on zrt` where the query wrote the alias `zrt z`.
+
+## Slice 111: M0146-0005de — inner-join equalities print in PG's EC-derived operand order
+
+This implements the model in the M0146-0005de finding above. In PG, the
+first code path to create an equivalence-class pair fixes its operand
+order. goopg printed the written order.
+
+### Decision
+
+`orientECJoinClauses` (internal/optimizer/ec_clause_orient.go) runs at the
+join-search seam (`tryPGShapedJoinSearch`), after
+`inferTransitiveEqualities`. At that point the conjunct list holds exactly
+the inner-join quals, and the outer-join ON quals have not joined it yet
+(those are not EC clauses in PG either). The inputs are:
+
+- EC membership: a union-find over the conjuncts' same-type column
+  equalities. A class equated to a constant is skipped, because PG's
+  `ec_has_const` derives no join clause from it.
+- Range-table order: each leaf's RTID.
+- Index key columns: the leaf table's btree, non-partial indexes, as
+  `match_eclass_clauses_to_index` → `ec_member_matches_indexcol` sees
+  them.
+
+For a clause between R1 < R2 (range-table order), the first matching rule
+decides:
+
+| test | printed first |
+|---|---|
+| R1 has an index key in the clause's class (step 1, R1's `generate_implied_equalities_for_column`) | R1 |
+| R1 has an index key in a class reaching R2 (step 2, R1's parameterised path → `get_baserel_parampathinfo`) | R2 |
+| R2 has an index key in the class | R2 |
+| R2 has an index key in a class reaching R1 | R1 |
+| none (`make_join_rel`, earlier joinlist entry outer) | the earlier leaf |
+
+The result is a map from each unordered column pair, keyed by (binding id,
+column name), to the column printed first.
+
+### Applying it after the search
+
+The orientation is applied only after the search. Flipping the conjuncts
+before it changed plans: `buildRestrictInfos` reads a class's member order
+off the operands, and `equivClassJoinClause` picks the reduced pair from
+it. On Q82 that kept the redundant `item.i_item_sk = store_sales.ss_item_sk`
+as a Join Filter.
+
+After the search, two passes swap operands in place, so pointer identities
+such as `fillJoinHashKeys`' HashKeys hold:
+
+1. `applyECOrientation` walks the searched tree's clause copies: Join /
+   NLI predicates, Filters, IndexScan.Cond and BitmapHeapScan's qual
+   lists. It stops at any other level's leaf.
+2. Every conjunct is re-oriented, because the restrict infos hold the
+   conjuncts by pointer and the final lowering re-reads them (TPC-DS Q91's
+   Join Filter).
+
+A parameterised bitmap scan's Recheck Cond was built inner-first by
+construction (createplannl.go). PG's `bitmapqualorig` is the RestrictInfo
+as it stands (`create_bitmap_subplan`), so the recheck now follows the
+clause. `clauseOuterFirst` notices a clause swapped since its restrict info
+was built (Left is no longer leftKey). Q53 and Q63 at SF0.25 now print
+`Recheck Cond: (item.i_item_sk = ss_item_sk)`, while Q32's correlated
+`(cs_item_sk = item.i_item_sk)` keeps its written order.
+
+### Verification
+
+`TestJoinEqualityPrintsInECOrder` covers three of the four scratch-PG
+variants: no index (FROM order, not the written order), the FROM list
+reversed, and an index on j1.x. All three fail with the decision disabled.
+
+Instruments:
+
+- Text-identical: SF0.25 29 → 34 (Q50, Q53, Q63, Q74, Q91), SF1 18 → 20
+  (Q50, Q74).
+- Aligned lines: 2299 → 2306 and 2095 → 2103.
+- Fire set: 13 / 12 queries, all orientation-only (Q31's
+  `(ss1.ca_county)::text = (ws1.ca_county)::text` included). None moves
+  away from PG, and values are identical.
+- CATEGORIES-EXCL-MATCH: unchanged. Its classifier normalises qual text.
+- Regress A/B (join, equivclass, subselect, partition_join, with,
+  select_parallel, inherit): no previously matching line changed. The 36
+  changed lines are goopg-only lines in queries PG plans differently
+  (self-join elimination).
+- Gates: units, spotcheck, sweep 96/96, arm, ea-ratchet 10.
+
+### Left over (ledgered)
+
+- An EC-reduced join clause still prints outer-first.
+  `equivClassJoinClause`'s `flipped()` copy re-orients the chosen pair
+  outer-on-the-left. PG instead returns the derived clause in its creation
+  orientation. Examples are SF1 Q17, Q25 and Q29, which print
+  `item.i_item_sk = catalog_sales.cs_item_sk` where PG prints
+  `catalog_sales.cs_item_sk = item.i_item_sk`. Filed as M0146-0042a.
+- PG lists a join's EC-derived clauses after its other quals
+  (`build_joinrel_restrictlist` concatenates `joininfo` clauses, then
+  `generate_join_implied_equalities`). goopg prints the written conjunct
+  order: `((j1.a = j2.b) AND (j1.x < j2.y))` where PG prints
+  `((j1.x < j2.y) AND (j1.a = j2.b))`. Filed as M0146-0042b.
+- Not modelled:
+  - `reduce_unique_semijoins`' early clause creation for semi-join ECs;
+  - pulled-up subquery relations' rtindex placement (goopg uses
+    allocation order);
+  - cross-type ECs (goopg's classes are type-exact).
+- Seen while probing: after `SET enable_indexscan = off` and
+  `SET enable_bitmapscan = off`, goopg still planned a parameterised Index
+  Scan (with Memoize) for the j1/j2 query, where PG fell back to a
+  Materialize'd nested loop.
