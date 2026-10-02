@@ -3,6 +3,7 @@ package optimizer
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -736,37 +737,39 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 			return &IntegerConst{pos: pos, Value: a % b}, nil
 		}
 	}
-	// At least one numeric: promote both to decimal strings and fold.
+	// At least one numeric: promote both to decimal strings and fold with
+	// PG's numeric arithmetic (numeric_add/sub/mul/div: exact decimal, with
+	// add_var's max scale, mul_var's summed scale and div_var's
+	// select_div_scale). A float64 fold returned 0.1+0.2 as
+	// 0.30000000000000004 and 1.0/3 as 0.3333333333333333 (M0146-0041).
 	ls, rs, err := toDecimalStrings(l, r)
 	if err != nil {
 		return nil, err
 	}
-	lf, err2 := strconv.ParseFloat(ls, 64)
-	if err2 != nil {
-		return nil, err2
-	}
-	rf, err3 := strconv.ParseFloat(rs, 64)
-	if err3 != nil {
-		return nil, err3
-	}
-	var result float64
 	switch op {
-	case parser.OpAdd:
-		result = lf + rf
-	case parser.OpSub:
-		result = lf - rf
-	case parser.OpMul:
-		result = lf * rf
-	case parser.OpDiv:
-		if rf == 0 {
-			return nil, fmt.Errorf("division by zero")
-		}
-		result = lf / rf
+	case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv:
 	default:
 		return nil, fmt.Errorf("unsupported numeric op %s", op)
 	}
-	return &NumericConst{pos: pos, Value: strconv.FormatFloat(result, 'f', -1, 64)}, nil
+	if NumericArith == nil {
+		// No numeric implementation registered (an optimizer-only
+		// binary or test): leave the expression for the executor.
+		return nil, fmt.Errorf("numeric folding unavailable")
+	}
+	out, err := NumericArith(op, ls, rs)
+	if err != nil {
+		return nil, err
+	}
+	return &NumericConst{pos: pos, Value: out}, nil
 }
+
+// NumericArith evaluates `l op r` over two numeric literal texts with
+// PostgreSQL's numeric semantics and returns the result's numeric_out text.
+// The executor owns numeric arithmetic and registers it here at init (the
+// optimizer cannot import the executor); a nil hook leaves numeric constant
+// expressions unfolded. A division by zero must come back as an error whose
+// text is "division by zero", which the fold caller raises as 22012.
+var NumericArith func(op parser.OpCode, l, r string) (string, error)
 
 func toDecimalStrings(l, r literalValue) (string, string, error) {
 	toString := func(v literalValue) (string, error) {
@@ -798,11 +801,7 @@ func litCompare(l, r literalValue) (int, error) {
 			return cmpI64(l.intV, r.intV), nil
 		}
 		if r.kind == "num" {
-			lf, rf, err := parseNumericPair(strconv.FormatInt(l.intV, 10), r.numStr)
-			if err != nil {
-				return 0, err
-			}
-			return cmpF64(lf, rf), nil
+			return cmpNumericText(strconv.FormatInt(l.intV, 10), r.numStr)
 		}
 	case "num":
 		ls := l.numStr
@@ -810,11 +809,10 @@ func litCompare(l, r literalValue) (int, error) {
 		if r.kind == "int" {
 			rs = strconv.FormatInt(r.intV, 10)
 		}
-		lf, rf, err := parseNumericPair(ls, rs)
-		if err != nil {
-			return 0, err
+		if r.kind != "num" && r.kind != "int" {
+			return 0, fmt.Errorf("cannot compare numeric with %s", r.kind)
 		}
-		return cmpF64(lf, rf), nil
+		return cmpNumericText(ls, rs)
 	case "str":
 		if r.kind != "str" {
 			return 0, fmt.Errorf("cannot compare string with %s", r.kind)
@@ -839,28 +837,22 @@ func litCompare(l, r literalValue) (int, error) {
 	return 0, fmt.Errorf("cannot compare %s with %s", l.kind, r.kind)
 }
 
-func parseNumericPair(a, b string) (float64, float64, error) {
-	af, err := strconv.ParseFloat(a, 64)
-	if err != nil {
-		return 0, 0, err
+// cmpNumericText compares two numeric literal texts by exact value (PG's
+// cmp_numerics); a float64 comparison folded 1.00000000000000000001 > 1 to
+// false (M0146-0041).
+func cmpNumericText(a, b string) (int, error) {
+	ar, ok := new(big.Rat).SetString(a)
+	if !ok {
+		return 0, fmt.Errorf("invalid numeric literal %q", a)
 	}
-	bf, err := strconv.ParseFloat(b, 64)
-	if err != nil {
-		return 0, 0, err
+	br, ok := new(big.Rat).SetString(b)
+	if !ok {
+		return 0, fmt.Errorf("invalid numeric literal %q", b)
 	}
-	return af, bf, nil
+	return ar.Cmp(br), nil
 }
 
 func cmpI64(a, b int64) int {
-	if a < b {
-		return -1
-	} else if a > b {
-		return 1
-	}
-	return 0
-}
-
-func cmpF64(a, b float64) int {
 	if a < b {
 		return -1
 	} else if a > b {

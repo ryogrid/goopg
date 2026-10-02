@@ -8,8 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 var (
@@ -411,6 +412,54 @@ func parseNumeric(text string) (*big.Int, int16, error) {
 		return nil, 0, fmt.Errorf("numeric scale %d exceeds %d", scale, numericMaxDisplayScale)
 	}
 	return mantissa, int16(scale), nil
+}
+
+func init() {
+	optimizer.NumericArith = foldNumericArith
+}
+
+// foldNumericArith is the planner's numeric constant folding
+// (optimizer.NumericArith): the same numeric_add / numeric_sub /
+// numeric_mul / numeric_div the executor runs per row, so a folded
+// `0.1 + 0.2` or `1.0 / 3` carries exactly the value and display scale a
+// runtime evaluation would (eval_const_expressions calls the same
+// functions in PG). M0146-0041.
+func foldNumericArith(op parser.OpCode, l, r string) (string, error) {
+	parse := func(s string) (Datum, error) {
+		m, scale, err := parseNumeric(s)
+		if err != nil {
+			return Datum{}, err
+		}
+		return newNumeric(m, int(scale)), nil
+	}
+	a, err := parse(l)
+	if err != nil {
+		return "", err
+	}
+	b, err := parse(r)
+	if err != nil {
+		return "", err
+	}
+	var d Datum
+	switch op {
+	case parser.OpAdd:
+		d, err = numericAdd(a, b)
+	case parser.OpSub:
+		d, err = numericSub(a, b)
+	case parser.OpMul:
+		d, err = numericMul(a, b)
+	case parser.OpDiv:
+		d, err = numericDiv(a, b, 0)
+		if ee, ok := err.(*ExecError); ok && ee.Code == "22012" {
+			return "", fmt.Errorf("division by zero")
+		}
+	default:
+		return "", fmt.Errorf("unsupported numeric op %s", op)
+	}
+	if err != nil {
+		return "", err
+	}
+	return numericText(d), nil
 }
 
 // numericFromInt promotes an int64 to KindNumeric form (scale=0).
