@@ -1,0 +1,43 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/storage"
+)
+
+func main() {
+	buf, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	cols := catalog.PgDatabaseColumnsPG18()
+	fmt.Println("columns:", len(cols))
+	for off := 0; off+storage.BlockSize <= len(buf); off += storage.BlockSize {
+		page := storage.Page(buf[off : off+storage.BlockSize])
+		n, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			fmt.Println("lp count err", err)
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(n); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				fmt.Println("slot", slot, "tuple err", err)
+				continue
+			}
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil)
+			name := ""
+			if derr == nil {
+				name = d[1].StringValue()
+			}
+			fmt.Printf("slot %d xmin %d xmax %d infomask %#x natts %d datalen %d name=%q decodeErr=%v\n",
+				slot, ht.Header.Xmin, ht.Header.Xmax, ht.Header.Infomask, natts, len(ht.Data), name, derr)
+		}
+	}
+}

@@ -24501,6 +24501,22 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0043 — WRONG RESULTS: `txid\_current\(\)` and
+  `pg\_current\_xact\_id\(\)` return 0** \(filed 2026\-10\-02 by M0146\-0035\'s
+  recon; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
+  results\)\. `SELECT txid\_current\(\), pg\_current\_xact\_id\(\)` returns
+  `0 \| 0` on goopg, inside and outside an explicit transaction; PG 18\.3
+  assigns an xid \(`1142 \| 1142`, then `1143` inside BEGIN, stable
+  within the transaction\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-02 \(S2\) — `txid\_current\(\)` returns 0
+  > Filed by M0146\-0035\'s recon, not worked\. Owner: place M0146\-0043 in
+  > the banner\.
+  - Not worked \(S2: the owner places it\)\. First step: find the builtin
+    and make it call the transaction manager\'s xid assignment
+    \(GetTopTransactionId, xact\.c; txid\_current in xid8funcs\.c\)\. An
+    unassigned read\-only transaction must get an xid on first call\.
 - [ ] **M0146\-0041 — WRONG RESULTS: numeric literal arithmetic is folded
   through float64** \(filed 2026\-10\-02 by the M0146\-0005 text\-identity
   census, TPC\-DS Q21's `0\.6666666666666666` vs PG\'s
@@ -25732,6 +25748,32 @@ M0146-0001 re-baseline census on the new default arm.
     from at startup \(goopg\-private catalog WAL/replay vs the 1262 heap\) and
     why the `tpch` entry is missing from it in a clone taken after a
     checkpoint\.
+  - Recon 2026\-10\-02 \(banner item 2a\)\. Design
+    `docs/design/0100\-0149/m0146\-0035\-clone\-catalog\-loss.md`; evidence
+    `analysis/m0146/m0146\-0035/recon\-20261002\.txt`\.
+    - Store: databases and roles reload from the shared heaps through
+      `scanCatalogHeapRows`\. The only exit for a decodable, xmax\-free row
+      is `catalogRowLive` seeing xmin Aborted\. Open runs
+      `MarkUnknownAsAborted` before the reload, so an Unknown lane for
+      xid 5 would drop both rows and persist the loss\.
+    - Ruled out: decode \(a probe decodes the tpch row\), xid reuse
+      \(`XidGen\.SetNext` is monotonic\), redo start \(the shipped pg\_control
+      names the backup\-start checkpoint\), torn `pg\_xact` copy, and code
+      changes since the incident\.
+    - Not reproduced in 13 clone starts: today's arm clone ×3, and 6
+      online clones of a busy throwaway source ×2
+      \(`clone\-harness\.sh`\)\. The :65433 source restarted 2026\-10\-01
+      and kept `tpch`\.
+    - Landed: a shared\-catalog reload row that is rejected, or fails to
+      decode, now logs a WARN with catalog, slot, xmin and CLOG status
+      \(test `shared\_catalog\_reject\_log\_test\.go`\)\. The next clone
+      that loses `tpch` names its cause\.
+    - Next: search clone start logs for `shared catalog reload` WARNs.
+      Until a reproduction, re\-run `clone\-harness\.sh` with the source
+      under CLOG\-page\-0 churn \(new xids every few ms\) and with
+      `-X stream`\.
+    - Side finding: `txid\_current\(\)` returns 0, filed as M0146\-0043
+      \(S2\)\.
 
   > ## ESCALATION 2026\-09\-29 \(S2\) — online TPC\-H clones lose database `tpch`
   >
