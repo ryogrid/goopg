@@ -34,12 +34,22 @@ except Exception:
     print(""); print("?")' 2>/dev/null)"
     hook_cwd="$(printf '%s\n' "$info" | sed -n 1p)"
     subj="$(printf '%s\n' "$info" | sed -n 2p)"
+    # The "(blocked: ...)" tail of the deny reason names the protected region
+    # hit — log it so the audit line says *why*, not just *what*.
+    reason="$(printf '%s' "$out" | python3 -c 'import json,sys
+try:
+    r = json.load(sys.stdin)["hookSpecificOutput"]["permissionDecisionReason"]
+    tail = r[r.rfind("(")+1:r.rfind(")")] if "(blocked:" in r else r
+    print(tail[-120:])
+except Exception:
+    print("")' 2>/dev/null)"
     root="${CLAUDE_PROJECT_DIR:-}"
     [ -n "$root" ] || root="$(git -C "${hook_cwd:-.}" rev-parse --show-toplevel 2>/dev/null)" || true
     if [ -n "$root" ] && mkdir -p "$root/ci/logs" 2>/dev/null; then
-      printf '%s tool=%s rule=%s subject=%s\n' \
+      printf '%s tool=%s rule=%s match=%s subject=%s\n' \
         "$(date -Iseconds 2>/dev/null || echo unknown-time)" \
         "file-guard" "protected-region" \
+        "$(printf '%s' "$reason" | tr '\n\t ' '   ' | tr -s ' ' | cut -c1-120)" \
         "$(printf '%s' "$subj" | tr '\n\t' '  ' | cut -c1-200)" \
         >>"$root/ci/logs/ralph-guard-denials.log" 2>/dev/null || true
     fi

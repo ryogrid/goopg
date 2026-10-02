@@ -85,10 +85,12 @@ banner at the next `## ` line).
    The original six drained 2026-09-25/27: **M0145-0008r**, **0008s**,
    **0008m**, the freeze-WAL record, **M0146-0015** (+ its fix
    M0146-0015a) and the TestE2E conf-template item are all `[x]`, and
-   `TestPort_RegressSuite` closed as recorded. **Current live member:**
-   the explicit-opclass index restart task (wrong rows after a clean
-   restart — the newest open S2 defect, filed under the M0146 section),
-   which is item 2a's only occupant until it lands. The three isolation
+   `TestPort_RegressSuite` closed as recorded. The explicit-opclass
+   index restart defect (M0146-0015e) landed 2026-09-27 (`cf7c5397b`),
+   draining the first batch. **Live members (owner decision
+   2026-10-02 — second S2 batch; see OWNER DECISIONS 2026-10-02):
+   M0146-0035 → M0146-0039 → M0146-0041 → M0146-0040 → M0146-0034 →
+   M0146-0032 → M0146-0033**, in that order. The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump. Descendants filed under this item's tasks inherit item
@@ -154,6 +156,19 @@ banner at the next `## ` line).
    election / statistics burn-down, sequenced by M0146-0001's
    re-baseline census. The flip has landed, so M0146 is live — but item
    2a (above) ranks ahead of it until the batch drains.
+   **M0146-internal ordering (owner decision 2026-10-02 — see OWNER
+   DECISIONS 2026-10-02):** M0146-0005's scope is re-declared as
+   STRUCTURAL plan-shape burn-down (join-order, join-method, scan-type,
+   parameterisation, parallelism, sort/aggregation, qual-placement);
+   EXPLAIN text-identity / `rendering`-category slices file under
+   **M0146-0042** instead — no new `0005<x>` ids for text-only work.
+   **M0146-0009 (statistics/cardinality) subtasks are interleaveable:**
+   selectable under this item whenever the slice's first-divergence is
+   statistics-driven, without waiting for 0005 to close. M0146-0006
+   stays sequenced after 0005, but 0005 may close `[x]` once every
+   remaining first-divergence record is routed to a named task
+   (0009/0012/0019a/0042/…), the M0146-0014 "no unnamed records"
+   convention applied early.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -181,6 +196,16 @@ completion `Movement: yes — <instrument + number>` or `Movement: none`. A
 trace-only change to `internal/` or `cmd/` is `Kind: impl`, never a recon
 (AGENT.md C1). Production commits now need their gate stamps **whatever
 milestone they name**, M-NIGHTLY included.
+
+**`Movement:` standardised (owner decision 2026-10-02).** Every DONE/`[x]`
+entry ends with exactly one `Movement:` line in one of these forms:
+`Movement: yes — <instrument> <before>→<after>` (instrument = the metric
+that moved, e.g. `TPCH match 10→11`, `SF0.25 text-identical 25→26`,
+`ea-ratchet 10→9`), or `Movement: none — <one-line reason>` (`recon`,
+`test-only`, `instrument artefact — <why invisible>`, `parity held`,
+`correctness fix — no plan instrument`). Instrument-artefact `none`s name
+why the instruments cannot see the change (the LINEAGE-BASELINE pins show
+why this matters for S4's budget).
 
 FROZEN-PREFIXES:
 (the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20; see below —
@@ -442,6 +467,69 @@ delegated; details in each task's entry):
   reference resolved, but the `[!]` stands: the remaining work was
   refiled as M0146-0006 and the `[!]` is the S4 lineage-budget
   escalation, not the citation).
+
+OWNER DECISIONS 2026-10-02 (progress-report review
+`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/00-plan-party-progtess-1002.md`,
+delegated; details in each task's entry):
+- **Second S2 batch → item 2a.** All seven unplaced S2 escalations are
+  placed as item 2a's live members, in this order: **M0146-0035**
+  (clone loses db `tpch` — it can erase the bench corpus's only
+  database, highest blast radius), **M0146-0039** (temp table
+  resurrects as permanent after restart — catalog integrity),
+  **M0146-0041** (numeric literal folded through float64 — silent
+  wrong values, blocks TPC-DS Q21's match), **M0146-0040**
+  (`date + int` returns a timestamp-formatted unknown, feeds 0041's
+  Q21 evidence), **M0146-0034** (Limit over plain Gather is
+  nondeterministic — wrong *and* flaky), **M0146-0032** (LATERAL outer
+  ref binds to the wrong relation — wrong results on a niche shape),
+  **M0146-0033** (`array_agg` over arrays returns the wrong
+  representation — narrowest impact). Correctness outranks plan
+  parity; siblings 0029/0030/0031 set the precedent.
+- **Benchmark corpus VM state — aligned by owner action, EXECUTED
+  2026-10-02.** The goopg bench clusters had `relallvisible=0` while
+  the PG references were autovacuumed all-visible — a systematic
+  pro-goopg measurement skew hiding Index-Only-Scan divergences.
+  Owner vacuumed `:65433` (each `tpch` table explicitly — bare
+  `VACUUM` only covers the default database, the documented
+  M0125-0028 deferral), `:65437` (`tpcds025`, via
+  `ref-clusters-ensure --only 65437` start), and `:65436` (`tpcds`,
+  clean-tree binary, cgroup-wrapped; both TPC-DS lanes returned to
+  their prior down state). All benchmark tables are now all-visible.
+  Consequence: **M0146-0019a's "moves no plan until vacuumed" blocker
+  is lifted** — its divergences are now real planner gaps, selectable.
+- **Nightly tpch `skip(port-busy)` — standing decision: accept the
+  skip.** stage-tpch needs a quiesced `:65433` to snapshot-copy, but
+  the bench cluster is the loop's gate oracle and must stay up. The
+  nightly TPC-H lane stays dormant (spotcheck + acceptance arm cover
+  the value floor); a real fix wants a scheduled quiesce window in
+  the nightly driver, an owner-side change, not a loop task.
+- **M0141-S7 stays held until M0146-0005 closes `[x]`.** 0005's close
+  condition is now "every remaining first-divergence record routed to
+  a named task" (banner item 3), so the hold releases on that event,
+  not on match-metric exhaustion.
+- **`pg_policies` prints a Go value dump — filed as M0134-0163d**
+  (rowsecurity.sql arm; the view itself exists since M0131-S9.3e
+  bootstrapped `pg_policy`, so this is a render defect, not 0163b's
+  "does not exist").
+- **M0146-0005 scope split — EXPLAIN text-identity campaign re-homed
+  to M0146-0042.** The 0005 task entry's own scope is structural
+  plan-shape burn-down; the text-parity slices since ~0005cf consumed
+  it for `rendering`-category deltas. New text-only slices file under
+  M0146-0042 (banner item 3). In-flight 0005\<x\> ids keep their ids;
+  no renumbering.
+- **Task-selection rationale made auditable.** The baton gains
+  `Top-residual:` and `Skip-rationale:` fields (`.ralph/PROMPT.md`);
+  "why this task and not the largest divergence class" must be a
+  written line, not implicit.
+- **Harness (per the report's §5.3):** guard denials now log/echo the
+  matched token (`match=` field); the `for…do`/`DO $$`,
+  interpreter-doc-text, `\copy (SELECT) TO` and private-path false
+  positives are fixed with regression cases in
+  `scripts/ralph-bash-guard-test.sh`; `scripts/ralph-prev-loop-check.sh`
+  detects a loop that died without a `---RALPH_STATUS---` block
+  (PROMPT.md step 2a). A proposed `stop_*.sh --status` read exemption was
+  REJECTED in review — those scripts ignore argv and stop the cluster
+  anyway; the fix belongs in the scripts themselves if wanted.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -4425,6 +4513,17 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0163a — row-level security is never enforced at scan time**.
 - [ ] **M0134-0163b — `pg_policies` system view does not exist**.
 - [ ] **M0134-0163c — `CREATE POLICY … AS <bogus>` is accepted instead of erroring**.
+- [ ] **M0134-0163d — `pg_policies` prints a Go value dump for a column** (filed
+  2026-10-02, owner review of the 1002 progress report): rowsecurity.sql output
+  shows a pointer-like value (`&{64 0x…}`) where PG prints the policy's text
+  columns. The view exists since M0131-S9.3e bootstrapped `pg_policy` (0163b's
+  "does not exist" is stale), so this is a render defect in the view's
+  expression columns — same class as 0167d's `pg_get_indexdef` dump.
+  Kind: impl
+  Parent: M0134-0163
+  - First step: `select * from pg_policies` on a throwaway cluster, find which
+    column renders the Go value (likely a `pg_node_tree`/qual column needing
+    deparsed text), then route it through the deparser like 0167d did.
 - [ ] **M0134-0164 — sanity_check.sql** — regress-sql `not-tried` (PARKED).
 - [ ] **M0134-0164a — `pg_index` describes no bootstrap system-catalog index**.
 - [ ] **M0134-0165a — `client_min_messages` rejects upstream's hidden `info`/`debug` aliases**.
@@ -25023,6 +25122,9 @@ M0146-0001 re-baseline census on the new default arm.
   `addIndexOnlyPaths` / `addOneIndexOnlyPath` \(pathindexonly.go\)\.
   Moves no plan until the goopg bench clusters are vacuumed \(M0146\-0019
   finding 1\)\.
+  - **Blocker lifted 2026\-10\-02** \(owner\): all three goopg bench clusters
+    vacuumed to all\-visible — see OWNER DECISIONS 2026\-10\-02\. Index\-only
+    divergences are now real planner gaps\.
   Kind: impl
   Parent: M0146-0019
 
@@ -25589,3 +25691,18 @@ M0146-0001 re-baseline census on the new default arm.
   "no unnamed first-divergence records" is the acceptance bar.
   Kind: recon
   Parent: none
+- [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
+  decision 2026-10-02, split out of M0146-0005's scope — see banner
+  item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
+  first-divergence census toward zero: every remaining EXPLAIN text
+  difference between goopg and PG 18.3 on the TPC-H / TPC-DS corpora —
+  operator-name rendering, `Output:` list qualification, alias/dollar-tag
+  printing, `~~`/operator spelling, SubPlan/CTE labels, and any residual
+  text-identical gap that is not a plan-SHAPE difference (those stay in
+  0005 and its siblings). Owns the `text-identical` instrument
+  (`SF0.25 26/99`, `SF1 16/99` at the split point); each slice follows
+  the established slice-N convention (one divergence class, gated,
+  `Movement:` line per the standardised format). Slices that turn out
+  to need shape work route back to 0005/its named siblings, not here.
+  Kind: impl
+  Parent: M0146-0005
