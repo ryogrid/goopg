@@ -4756,6 +4756,8 @@ func inUnnestSJInfo(jt JoinType, rhsExprs []Expr, strict bool) *SpecialJoinInfo 
 		MinRighthand: synR,
 		Jointype:     pjt,
 		LhsStrict:    strict,
+		// A NOT IN anti link is the one built non-strict (effNegated).
+		NullAware: pjt == parser.JoinAnti && !strict,
 	}
 	if pjt == parser.JoinSemi && len(rhsExprs) > 0 {
 		sj.SemiCanBtree, sj.SemiCanHash = true, true

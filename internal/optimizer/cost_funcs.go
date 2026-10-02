@@ -886,7 +886,7 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// innerBucketSize == 0 means "no usable statistic"; the term is then
 	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
 	// before this change.
-	if in.final.innerUnique {
+	if in.final.innerUnique || in.final.earlyExit {
 		// PG's rint() uses round-to-even. The factor was derived once in total
 		// relation coordinates; outerRows is this serial or partial candidate's
 		// path coordinate.
@@ -898,8 +898,13 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 				outerMatched * bucketTuples * 0.5
 		}
 		// PG's hashjointuples in this branch is outer_matched_rows, not the
-		// join's result cardinality (M0146-0005e).
-		run += cp.cpuTupleCost * outerMatched
+		// join's result cardinality (M0146-0005e); for ANTI it is the
+		// unmatched rows.
+		if in.final.anti {
+			run += cp.cpuTupleCost * (in.outerRows - outerMatched)
+		} else {
+			run += cp.cpuTupleCost * outerMatched
+		}
 
 		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
 		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The

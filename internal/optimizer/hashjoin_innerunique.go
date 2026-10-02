@@ -11,12 +11,18 @@ import (
 // decided while the join clause and base-relation provenance are still in
 // scope.  Its zero value deliberately selects the old non-unique bucket walk.
 //
-// Goopg covers only the INNER case here.  A LEFT join with a unique inner
-// takes the same branch in PG (over its non-pushed-down join quals) and is
-// not ported yet.  SEMI and ANTI have their own executor and join-semantics
-// work, and remain on their existing paths.
+// Goopg covers the INNER case and SEMI / ANTI.  A LEFT join with a unique
+// inner takes the same branch in PG (over its non-pushed-down join quals) and
+// is not ported yet.
 type hashJoinFinalCostInput struct {
-	innerUnique    bool
+	innerUnique bool
+	// earlyExit is PG's `jointype == JOIN_SEMI || jointype == JOIN_ANTI` half
+	// of final_cost_hashjoin's early-exit branch: the executor stops a probe at
+	// its first match, so the bucket walk is priced with the semi factors as
+	// for an inner-unique join. anti makes hashjointuples the unmatched outer
+	// rows (M0146-0005dj).
+	earlyExit      bool
+	anti           bool
 	outerMatchFrac float64
 	matchCount     float64
 	// hashClauseSel is approx_tuple_count's selectivity: the product of the
@@ -47,8 +53,16 @@ type hashJoinFinalCostInput struct {
 // candidate path's own outer rows.
 func (s *searchCtx) hashJoinFinalCostInputFor(joinrel, outer, inner *RelOptInfo,
 	jt parser.JoinType, keys, clauses []*restrictInfo) hashJoinFinalCostInput {
-	if s == nil || jt == parser.JoinSemi || jt == parser.JoinAnti || len(keys) == 0 {
+	if s == nil || len(keys) == 0 {
 		return hashJoinFinalCostInput{}
+	}
+	if jt == parser.JoinSemi || jt == parser.JoinAnti {
+		// The pair's compute_semi_anti_join_factors, the same factors the
+		// nested-loop arm reads. JOIN_RIGHT_SEMI / RIGHT_ANTI are not in the
+		// branch: PG prices them by the generic bucket walk.
+		f := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
+		return hashJoinFinalCostInput{earlyExit: f.apply, anti: jt == parser.JoinAnti,
+			outerMatchFrac: f.outerMatchFrac, matchCount: f.matchCount}
 	}
 	approx := 1.0
 	for _, ri := range keys {

@@ -154,7 +154,9 @@ func TestEnumTraceSemiPairingIsNestloopOnly(t *testing.T) {
 		if !strings.HasPrefix(l, "DPPATH") || !strings.Contains(l, "relids={0,1}") {
 			continue
 		}
-		if !strings.Contains(l, "jointype=semi") {
+		// M0146-0005dj: the commuted direction is PG 18's JOIN_RIGHT_SEMI —
+		// the same semi join with the RHS probing a hash of the LHS.
+		if !strings.Contains(l, "jointype=semi") && !strings.Contains(l, "jointype=right_semi") {
 			t.Errorf("path over the SEMI joinrel is stamped otherwise: %q", l)
 		}
 		for p := range producersIn([]string{l}) {

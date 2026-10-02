@@ -208,14 +208,37 @@ func TestHashJoinFinalCostInputPreservesNonInnerJoinTypes(t *testing.T) {
 	if left.innerUnique || left.hashClauseSel != r90InnerJoinSelectivity(s, keys) {
 		t.Fatalf("LEFT input = %+v, want non-unique with the hash-clause selectivity", left)
 	}
+	// SEMI and ANTI take final_cost_hashjoin's early-exit branch with the
+	// pair's compute_semi_anti_join_factors (M0146-0005dj): the bucket walk
+	// shrinks to the matched rows' inner_scan_frac share, and ANTI charges
+	// cpu_tuple_cost on the unmatched rows rather than the matched ones.
+	cp := s.cp
 	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
-		if got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys); got != (hashJoinFinalCostInput{}) {
-			t.Fatalf("jointype %v input = %+v, want zero-value preservation", jt, got)
+		got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys)
+		f := s.semiAntiJoinFactorsFor(outer, inner, jt, keys)
+		if !got.earlyExit || got.innerUnique || got.anti != (jt == parser.JoinAnti) ||
+			got.outerMatchFrac != f.outerMatchFrac || got.matchCount != f.matchCount {
+			t.Fatalf("jointype %v input = %+v, want the early-exit arm with factors %+v", jt, got, f)
 		}
+		// Factors chosen so every term is visible: 40 of 100 outer rows match.
 		candidate := base
-		candidate.final = s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys)
-		if got := hashJoinCost(s.cp, candidate); got != want {
-			t.Fatalf("jointype %v final cost = %+v, want unchanged %+v", jt, got, want)
+		candidate.final = hashJoinFinalCostInput{earlyExit: true, anti: jt == parser.JoinAnti,
+			outerMatchFrac: 0.4, matchCount: 3}
+		withoutWalk := candidate
+		withoutWalk.innerBucketSize = 0
+		walk := hashJoinCost(cp, candidate).Total - hashJoinCost(cp, withoutWalk).Total
+		// 40 matched rows walk clamp(40 * 0.1 * 2/(3+1)) = 2 bucket tuples.
+		if want := cp.cpuOperatorCost * float64(len(keys)) * 40 * 2 * 0.5; math.Abs(walk-want) > 1e-9 {
+			t.Fatalf("jointype %v matched bucket walk = %.9g, want %.9g", jt, walk, want)
+		}
+		semiCand, antiCand := candidate, candidate
+		semiCand.final.anti, antiCand.final.anti = false, true
+		// ANTI's hashjointuples is the 60 unmatched rows, SEMI's the 40 matched.
+		if d := hashJoinCost(cp, antiCand).Total - hashJoinCost(cp, semiCand).Total; math.Abs(d-cp.cpuTupleCost*20) > 1e-9 {
+			t.Fatalf("anti - semi tuple charge = %.9g, want %.9g", d, cp.cpuTupleCost*20)
+		}
+		if hashJoinCost(cp, candidate) == want {
+			t.Fatalf("jointype %v final cost unchanged from the generic arm", jt)
 		}
 	}
 }

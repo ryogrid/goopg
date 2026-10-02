@@ -2055,6 +2055,22 @@ heuristic stays live.)
     heap-update-chain probing on constraint/index probes is the plausible
     causal fix in the `2b7e9705..9fb05621f` window. No code change needed;
     re-open if a future nightly reproduces on a post-0010 sha.
+- [ ] **M\-NIGHTLY\-tuplelock\-upgrade\-reopen — testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
+  \(`AI-20261003-002454-003`\)** — FAILed again \(15\.55s\) in the 2026\-10\-03
+  nightly: the tail of the schedule is shifted by two lines \(expected 253
+  lines, got 255\), with `s2\_rollback` / `s0\_rollback` / the
+  `s3\_for\_update <\.\.\. completed>` lines landing one step late\. Reopens
+  the closed Loop \#24 task above per its own "re\-open if a future nightly
+  reproduces" note\.
+  Repro: `go test \-v \-run '^TestPort\_IsolationTuplelockUpgradeNoDeadlock$'
+  \./internal/testport/`; evidence
+  `ci/logs/20261003\-002454/testport/go\-test\.log` \(L245\-255\)\.
+  Kind: impl
+  Parent: none
+  - First step: re\-run it 4× at HEAD to separate a timing flake \(the
+    isolation runner decides `<waiting>` by a 300ms timeout\) from a real
+    lock\-ordering change; compare against the 2026\-10\-02 nightly, which
+    passed it\.
 - [x] **testport/TestPort_P0E4CatalogXmaxClientKill +
   TestPort_P0E4CatalogXmaxServerImmediateStop (AI-20260920-005626-007,
   AI-20260920-005626-008)** — both FAILed with a server-wedge signature, not
@@ -2661,6 +2677,7 @@ heuristic stays live.)
     again in the 2026\-09\-27 nightly \(`AI-20260927-002707-002`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-002`\).
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-002`\).
+  - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-001`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2670,6 +2687,7 @@ heuristic stays live.)
     again in the 2026\-09\-27 nightly \(`AI-20260927-002707-003`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-003`\).
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-003`\).
+  - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-002`\).
 - [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
@@ -24229,6 +24247,28 @@ M0146-0001 re-baseline census on the new default arm.
       costing, lowering with the build side\'s layout, and the optimizer
       JoinType switch audit; slice 3 — parallel right joins\.
     Movement: none — executor substrate, no producer yet (fire set: no plan changed)
+  - **Slice 2 LANDED 2026\-10\-03 \(planner producer \+ semi/anti hash cost\)\.**
+    The commuted direction of a semi/anti special join builds the serial
+    Hash Right Semi / Right Anti path \(`rightSemiAntiForDirection`,
+    `addRightSemiAntiHashPath`; a null\-aware anti is excluded via the new
+    `SpecialJoinInfo\.NullAware`\), lowered with the build side\'s layout\.
+    SEMI / ANTI hash joins now take final\_cost\_hashjoin\'s early\-exit branch
+    with `semiAntiJoinFactorsFor`: goopg priced them by the generic bucket
+    walk, 3x PG \(958\.88 vs 312\.64\), which let a right form undercut a
+    plain semi PG keeps\. Costs are now equal to PG\'s on four probes\.
+    - Tests: `TestSearchElectsRightSemiAntiJoins`, updated
+      `TestHashJoinFinalCostInputPreservesNonInnerJoinTypes`\.
+    - Regress: `join` 18570→18554 \(4 Hash Semi/Anti \+ the tbl\_rs Right Semi
+      now match PG\), `subselect` 2784→2781, 7 suites identical, no row
+      changes\.
+    - TPC\-DS: SF0\.25 Q83 takes PG\'s Hash Semi over Nested Loop \+ Memoize;
+      match / text\-identity flat\. goopg still elects no right form in
+      TPC\-DS: Q23 / Q69\'s subtrees diverge upstream \(Q69 row estimate 75 vs
+      818, Parallel Hash Anti, no unique\-ified inner\)\.
+    - Next: slice 3 — Parallel Hash Right / Right Semi / Right Anti \(SF1 Q16,
+      Q75\) with shared matched flags, merge right anti, inner\-unique proof on
+      the commuted pair\.
+    Movement: none — match / CATEGORIES\-EXCL\-MATCH / text\-identity flat at both SFs \(one SF0\.25 plan, Q83, moved toward PG\)
 - [ ] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q83: PG Hash Semi Join over Hash Join\(dd4, HashAggregate\(dd5\)\); goopg keeps nested semi joins under a Gather \(7626 vs 7155 per arm\)\. Q23: HashAggregate unique\-ify of the frequent\_ss\_items CTE\.
   Kind: impl

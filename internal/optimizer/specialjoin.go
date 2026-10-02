@@ -34,6 +34,12 @@ type SpecialJoinInfo struct {
 	CommuteBelowR RelSet // commuting OJs in this one's RHS
 
 	LhsStrict bool // join clause is strict for some LHS rel
+	// NullAware marks an ANTI link built from `x NOT IN (subquery)`
+	// (inUnnestSJInfo): its three-valued NULL semantics live in the
+	// executor's probe-side short-circuits (Join.NullAware), so the link may
+	// only be performed with the LHS probing — never as JOIN_RIGHT_ANTI
+	// (M0146-0005dj).
+	NullAware bool
 
 	// Semi/anti fields — meaningful only for JOIN_SEMI; populated later (P1.4).
 	SemiCanBtree bool        // true if semi_operators are all btree

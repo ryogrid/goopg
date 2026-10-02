@@ -99,7 +99,10 @@ func hasSemiOrAntiOfType(node Node, want JoinType) bool {
 		}
 		switch x := n.(type) {
 		case *Join:
-			if x.Type == want {
+			// M0146-0005dj: a right semi/anti join is the same decorrelated
+			// join with its inputs swapped for hashing.
+			if x.Type == want || (want == JoinTypeSemi && x.Type == JoinTypeRightSemi) ||
+				(want == JoinTypeAnti && x.Type == JoinTypeRightAnti) {
 				found = true
 				return
 			}
@@ -146,7 +149,7 @@ func firstSemiOrAntiPredicate(node Node) Expr {
 		}
 		switch x := n.(type) {
 		case *Join:
-			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
+			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti || x.Type.IsRightSemiAnti() {
 				pred = x.Predicate
 				done = true
 				return
@@ -154,7 +157,7 @@ func firstSemiOrAntiPredicate(node Node) Expr {
 			walk(x.Left)
 			walk(x.Right)
 		case *NestedLoopIndexJoin:
-			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
+			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti || x.Type.IsRightSemiAnti() {
 				pred = x.Predicate
 				done = true
 				return
@@ -554,7 +557,7 @@ func findSemiOrAntiNLI(n Node) *NestedLoopIndexJoin {
 		}
 		switch x := cur.(type) {
 		case *NestedLoopIndexJoin:
-			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
+			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti || x.Type.IsRightSemiAnti() {
 				found = x
 				return
 			}

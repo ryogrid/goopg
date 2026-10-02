@@ -298,12 +298,20 @@ func (in joinInputs) publishedSchema(jt JoinType) Schema {
 	if jt == JoinTypeSemi || jt == JoinTypeAnti {
 		return append(Schema(nil), in.merged[:in.outerCols]...)
 	}
+	// M0146-0005dj: a right semi/anti join publishes its INNER (the hashed
+	// LHS) alone — the tail of the merged row.
+	if jt.IsRightSemiAnti() {
+		return append(Schema(nil), in.merged[in.outerCols:]...)
+	}
 	return in.merged
 }
 
 func (in joinInputs) publishedLayout(jt JoinType) outputLayout {
 	if jt == JoinTypeSemi || jt == JoinTypeAnti {
 		return in.lay[:in.outerCols:in.outerCols]
+	}
+	if jt.IsRightSemiAnti() {
+		return append(outputLayout(nil), in.lay[in.outerCols:]...)
 	}
 	return in.lay
 }
@@ -344,6 +352,10 @@ func planJoinTypeFor(p *Path, kind string) JoinType {
 		return JoinTypeSemi
 	case parser.JoinAnti:
 		return JoinTypeAnti
+	case parser.JoinRightSemi:
+		return JoinTypeRightSemi
+	case parser.JoinRightAnti:
+		return JoinTypeRightAnti
 	default:
 		var relids uint32
 		if p != nil && p.Rel != nil {

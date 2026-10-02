@@ -295,6 +295,15 @@ func addPathsToJoinrel(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses 
 
 	// C-03b — which join does THIS direction perform, and may it be performed
 	// at all. See jointypeForDirection.
+	// M0146-0005dj: PG 18's make_join_rel follows JOIN_SEMI / JOIN_ANTI
+	// with add_paths_to_joinrel(rel2, rel1, JOIN_RIGHT_SEMI / RIGHT_ANTI)
+	// (joinrels.c): the same join with the RHS probing a hash of the LHS.
+	// This is that commuted direction — which jointypeForDirection itself
+	// declines unless it can unique-ify a side — and only its serial hash
+	// path is built (see addRightSemiAntiHashPath).
+	if rjt, ok := rightSemiAntiForDirection(sjinfo, outer, inner); ok {
+		addRightSemiAntiHashPath(s, joinrel, outer, inner, clauses, cp, sjinfo, rjt)
+	}
 	jt, uniq, legal := jointypeForDirection(sjinfo, outer, inner, cp)
 	if !legal {
 		return nil
@@ -515,4 +524,63 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// GOOPG_NLI_CENSUS=1.
 	noteSemiJoinrelPaths(joinrel, jt)
 	return nil
+}
+
+// rightSemiAntiForDirection reports whether this (outer, inner) direction is
+// the commuted one of a SEMI or ANTI SpecialJoinInfo — the outer covers the
+// RHS (MinRighthand), the inner the LHS (MinLefthand) — and the PG 18
+// jointype make_join_rel performs there.
+func rightSemiAntiForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo) (parser.JoinType, bool) {
+	if sjinfo == nil || outer == nil || inner == nil {
+		return 0, false
+	}
+	var rjt parser.JoinType
+	switch sjinfo.Jointype {
+	case parser.JoinSemi:
+		rjt = parser.JoinRightSemi
+	case parser.JoinAnti:
+		// A NOT IN anti join's NULL semantics (NullAware) live in the
+		// executor's probe-side short-circuits; the right form has no such
+		// arm, and PG never plans NOT IN as an anti join at all.
+		if sjinfo.NullAware {
+			return 0, false
+		}
+		rjt = parser.JoinRightAnti
+	default:
+		return 0, false
+	}
+	if !relsSubset(sjinfo.MinRighthand, outer.Relids) || !relsSubset(sjinfo.MinLefthand, inner.Relids) {
+		return 0, false
+	}
+	return rjt, true
+}
+
+// addRightSemiAntiHashPath files the JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI hash
+// path for the commuted direction (M0146-0005dj): the LHS (`inner`) is
+// hashed, the RHS (`outer`) probes, and the executor emits LHS rows —
+// once per first match (RIGHT SEMI), or the unmatched ones from the
+// post-probe sweep (RIGHT ANTI).
+//
+// Scope against PG's hash_inner_and_outer / add_paths_to_joinrel:
+//   - hash only. PG builds no merge or nested loop for RIGHT_SEMI
+//     (joinpath.c), and goopg's merge executor has no RIGHT ANTI arm (PG
+//     does build a merge right anti — ledgered);
+//   - serial only. PG refuses a partial RIGHT_SEMI hash (unprotected match
+//     flags); goopg's parallel hash has no shared match flags for RIGHT ANTI
+//     either (ledgered);
+//   - final_cost_hashjoin's generic branch: the right jointypes are neither
+//     JOIN_SEMI nor JOIN_ANTI there, and goopg proves no inner_unique for them
+//     (PG would try innerrel_is_unique — ledgered).
+func addRightSemiAntiHashPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, clauses []*restrictInfo, cp costParams, sjinfo *SpecialJoinInfo, rjt parser.JoinType) {
+	o, i := outer.CheapestTotal, inner.CheapestTotal
+	if o == nil || i == nil || pathParamByRel(o, inner) || pathParamByRel(i, outer) {
+		return
+	}
+	keys, residual := splitJoinClauses(outer.Relids, inner.Relids, clauses)
+	if len(keys) == 0 {
+		return
+	}
+	final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, rjt, keys, clauses)
+	bucket := s.estimateHashBucketSize(keys, inner.Relids)
+	addHashJoinPath(joinrel, outer, inner, cp, rjt, keys, residual, bucket, final, uniqueSideNone, sjinfo)
 }

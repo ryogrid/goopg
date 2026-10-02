@@ -732,6 +732,12 @@ const (
 	JoinCross
 	JoinSemi  // planner-internal: SEMI join (EXISTS → JOIN_SEMI)
 	JoinAnti // planner-internal: ANTI join (NOT EXISTS → JOIN_ANTI)
+	// JoinRightSemi / JoinRightAnti are planner-internal path jointypes:
+	// PG 18's JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI, a semi/anti join performed
+	// with the SpecialJoinInfo's RHS as the outer (probe) and its LHS hashed
+	// (M0146-0005dj). Never written in SQL, never in a SpecialJoinInfo.
+	JoinRightSemi
+	JoinRightAnti
 )
 
 // JoinExpr is one JOIN clause attached to a FROM base item.

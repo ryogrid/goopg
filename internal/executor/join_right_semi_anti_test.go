@@ -121,3 +121,63 @@ func TestRightSemiAntiJoinLabels(t *testing.T) {
 		t.Errorf("right anti label %q", got)
 	}
 }
+
+// TestSearchElectsRightSemiAntiJoins drives the planner end to end
+// (M0146-0005dj slice 2): with a small LHS and a large, distinct-keyed RHS, PG
+// 18 hashes the LHS and probes with the RHS — `Hash Right Semi Join` for
+// EXISTS, `Hash Right Anti Join` for a NOT EXISTS whose RHS carries a filter
+// (both verified on PG 18.3 with the same data). The rows must be the plain
+// semi/anti join's.
+func TestSearchElectsRightSemiAntiJoins(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE rs_small (k int, v text)")
+	runSQL(t, ctx, "CREATE TABLE rs_big (k int, w int)")
+	runSQL(t, ctx, "INSERT INTO rs_small SELECT g, 'v' || g FROM generate_series(1, 200) g")
+	runSQL(t, ctx, "INSERT INTO rs_big SELECT g, g FROM generate_series(1, 300000) g")
+	runSQL(t, ctx, "ANALYZE rs_small")
+	runSQL(t, ctx, "ANALYZE rs_big")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+
+	findType := func(n optimizer.Node, want optimizer.JoinType) bool {
+		found := false
+		var walk func(optimizer.Node)
+		walk = func(n optimizer.Node) {
+			if j, ok := n.(*optimizer.Join); ok && j.Type == want {
+				found = true
+			}
+			for _, k := range planChildren(n) {
+				walk(k)
+			}
+		}
+		walk(n)
+		return found
+	}
+	for _, c := range []struct {
+		sql  string
+		typ  optimizer.JoinType
+		want string
+	}{
+		{"SELECT count(*), sum(k) FROM rs_small s WHERE EXISTS (SELECT 1 FROM rs_big b WHERE b.k = s.k)",
+			optimizer.JoinTypeRightSemi, "[200 20100]"},
+		{"SELECT count(*), sum(k) FROM rs_small s WHERE NOT EXISTS (SELECT 1 FROM rs_big b WHERE b.k = s.k AND b.w > 100)",
+			optimizer.JoinTypeRightAnti, "[100 5050]"},
+	} {
+		plan := planWithSettings(t, ctx, c.sql, ps)
+		if !findType(plan, c.typ) {
+			t.Errorf("%s: no join of type %d in the plan", c.sql, c.typ)
+		}
+		rows := drainPlanRows(t, ctx, plan)
+		if len(rows) != 1 {
+			t.Fatalf("%s: %d rows", c.sql, len(rows))
+		}
+		got := make([]int64, len(rows[0]))
+		for i, d := range rows[0] {
+			got[i] = d.Int
+		}
+		if fmt.Sprint(got) != c.want {
+			t.Errorf("%s: got %v, want %s", c.sql, got, c.want)
+		}
+	}
+}

@@ -62,7 +62,7 @@ func findSemiOrAntiJoin(n Node) *Join {
 		}
 		switch x := cur.(type) {
 		case *Join:
-			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
+			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti || x.Type.IsRightSemiAnti() {
 				found = x
 				return
 			}

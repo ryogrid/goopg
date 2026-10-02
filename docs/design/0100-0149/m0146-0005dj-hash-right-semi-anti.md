@@ -62,12 +62,96 @@ none.
   sweep's server under host-wide pressure while the nightly batch ran; the
   re-run passed.
 
+## Slice 2 — the planner producer, and PG's semi/anti hash cost
+
+### Producer
+
+`make_join_rel` adds, for a JOIN_SEMI special join, the commuted
+`add_paths_to_joinrel(rel2, rel1, JOIN_RIGHT_SEMI)`; the same holds for
+JOIN_ANTI and JOIN_RIGHT_ANTI. goopg runs the commuted direction through
+`addPathsToJoinrel`, so the hook sits there, before
+`jointypeForDirection`'s early return for that direction:
+
+- `rightSemiAntiForDirection` fires only when the outer covers the special
+  join's min_righthand and the inner covers its min_lefthand. A null-aware
+  anti (a NOT IN over a nullable operand, `SpecialJoinInfo.NullAware`,
+  set by `inUnnestSJInfo`) is excluded, as PG excludes JOIN_ANTI with
+  null-aware semantics.
+- `addRightSemiAntiHashPath` builds the serial hash path only. RIGHT SEMI
+  is hash-only in PG. Merge right anti and the parallel forms are not
+  built (see Next). Cost: `final_cost_hashjoin`'s generic bucket walk,
+  which is what PG uses for both right types.
+- Lowering: `planJoinTypeFor` maps the parser types to the plan types.
+  `publishedSchema` / `publishedLayout` publish the inner (build) side
+  only, and `narrowcostinputs` takes the output width from the inner.
+- New parser JoinType values `JoinRightSemi` / `JoinRightAnti`, planner
+  internal only.
+
+### The semi/anti hash join was priced by the generic arm
+
+`final_cost_hashjoin` sends JOIN_SEMI, JOIN_ANTI and inner-unique joins
+through its early-exit branch. A matched probe stops at its first match,
+so it walks `inner_scan_frac = 2/(match_count+1)` of its bucket. An
+unmatched probe walks the average virtual bucket at one tenth of the
+cost. hashjointuples is the matched rows (the unmatched rows for ANTI).
+goopg routed only inner-unique joins there. Semi and anti took the
+generic walk, which priced every probe at half a full bucket.
+
+Once the right forms competed, this flipped plans away from PG. On the
+`subselect` regress table (1850 default rows per side), goopg's two-key
+Hash Semi cost 958.88 against PG's 312.64. A Right Semi at 950.49, which
+equals PG's own cost for it, therefore won, and a no-ORDER-BY result came
+out in a different order.
+
+`hashJoinFinalCostInputFor` now gives SEMI / ANTI the pair's
+`semiAntiJoinFactorsFor`, the factors the nested-loop arm already reads.
+`hashJoinCost` takes the early-exit branch for them and charges
+cpu_tuple_cost on the unmatched rows for ANTI. Probes on scratch PG 18.3
+and goopg match to the cent:
+
+| shape | PG | goopg before | goopg after |
+|---|---|---|---|
+| two-key semi | 312.64 | 958.88 | 312.64 |
+| one-key semi | 116.08 | 521.81 | 116.08 |
+| two-key anti (merge off) | 321.90 | — | 321.90 |
+| filtered one-key anti | 102.98 | — | 102.98 |
+
+## Slice 2 verification
+
+- `TestSearchElectsRightSemiAntiJoins` (executor) plans an EXISTS and a
+  filtered NOT EXISTS through the search with ANALYZE stats. It asserts
+  that a Right Semi / Right Anti join is elected, as PG 18.3 does on the
+  same data, and that the rows are right.
+- `TestHashJoinFinalCostInputPreservesNonInnerJoinTypes` now pins the
+  early-exit inputs and the matched-walk and ANTI tuple terms.
+- Regress A/B against HEAD. `join` shrinks 18570→18554 lines: four of
+  PG's Hash Semi / Anti Joins now match where goopg used a Nested Loop,
+  and PG's `tbl_rs` Hash Right Semi Join now matches. `subselect` shrinks
+  2784→2781. `with`, `aggregates`, `select_distinct`, `union`,
+  `join_hash`, `partition_join` and `select_parallel` are byte-identical.
+  No result row changed. (`rowsecurity`'s `\dp` lists the tables that
+  earlier tests in the same run left behind, so its size depends on the
+  set run.)
+- Gates pass: units, spotcheck, sweep 96/96, TPC-H arm (24 MATCH),
+  ea-ratchet (10/10), fire set (Q10 Q33 Q35 Q56 Q58 Q60 Q69 Q83 fire, all
+  value-PASS).
+- The only captured plan that changed is SF0.25 Q83. Its catalog_returns
+  subtree now has PG's Hash Semi Join over Nested Loop + Memoize
+  (`date_dim_pkey`) with serial `date_dim_7`/`date_dim_8` scans; the other
+  fires moved cost only. match / text-identity are flat (SF0.25 39 / 35,
+  SF1 28 / 20). The classifier newly tags Q83 `scan-type` (28→29), even
+  though three more of its scan nodes now agree with PG; the tag is
+  positional.
+- goopg elects no right form in TPC-DS yet. PG's Q23 / Q69 right joins sit
+  over subtrees that goopg shapes differently: Q69's NOT EXISTS inputs are
+  estimated at 75 rows against PG's 818, goopg uses Parallel Hash Anti
+  Joins, and it lacks the unique-ified semi inners.
+
 ## Next
 
-- **Slice 2 (planner).** Generate the swapped semi/anti hash path in the
-  search; `make_join_rel`'s JOIN_SEMI / JOIN_ANTI arms are the model.
-  Cost it as `final_cost_hashjoin` does for JOIN_RIGHT_SEMI / RIGHT_ANTI.
-  Lower it with the output layout taken from the build side. Audit every
-  optimizer JoinType switch (about 98 Semi/Anti sites).
-- **Slice 3.** Parallel Hash Right / Right Semi / Right Anti, which need
-  matched flags shared across workers.
+- **Slice 3.** Parallel Hash Right / Right Semi / Right Anti (TPC-DS SF1
+  Q16's Parallel Hash Right Anti Join), which need matched flags shared
+  across workers. Merge right anti belongs here too.
+- Inner-unique proof for the right types (`innerrel_is_unique` on the
+  commuted pair) is not run, so a right join over a unique build side is
+  priced by the non-unique arm.

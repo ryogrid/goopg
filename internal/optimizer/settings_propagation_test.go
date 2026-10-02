@@ -605,6 +605,11 @@ func scalarInnerPlans(n Node) []Node {
 		if j, ok := m.(*Join); ok && j.Type == JoinTypeSemi {
 			add(j.Right)
 		}
+		// M0146-0005dj: a RIGHT SEMI join probes with the pulled-up sublink
+		// body and hashes the LHS, so the body is its LEFT input.
+		if j, ok := m.(*Join); ok && j.Type == JoinTypeRightSemi {
+			add(j.Left)
+		}
 		for _, ch := range legacyDisplayChildren(m) {
 			visitNode(ch)
 		}
