@@ -24535,6 +24535,24 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0044 — WRONG RESULTS: `mod\(numeric, numeric\)` returns wrong
+  values; `numeric % numeric` is unsupported** \(filed 2026\-10\-02 by
+  M0146\-0041; REPRODUCED on a private throwaway cluster, S2 escalation:
+  wrong results\)\. goopg: `mod\(10\.5::numeric, 3\)` = `0`,
+  `mod\(12345678901234567890::numeric, 123\)` = `11`,
+  `mod\(999999999999999999999::numeric, 1000000000000000000000\)` = `10`;
+  PG 18\.3: `1\.5`, `78`, `999999999999999999999`\. `999::numeric % 7`
+  raises `operator % not supported on numeric` \(PG: numeric\_mod\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-02 \(S2\) — `mod\(numeric\)` returns wrong values
+  > Filed by M0146\-0041, not worked\. Owner: place M0146\-0044 in the
+  > banner\.
+  - Not worked \(S2: the owner places it\)\. First step: route
+    `mod\(numeric, numeric\)` and the `%` operator through an exact
+    `numericMod` \(PG `mod\_var`: trunc\(x/y\) with full precision, result
+    scale max\(dscale\)\) beside numericDiv in internal/executor/numeric\.go;
+    then let `evalArith` fold `%` through `optimizer\.NumericArith` too\.
 - [ ] **M0146\-0043 — WRONG RESULTS: `txid\_current\(\)` and
   `pg\_current\_xact\_id\(\)` return 0** \(filed 2026\-10\-02 by M0146\-0035\'s
   recon; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
@@ -24551,7 +24569,7 @@ M0146-0001 re-baseline census on the new default arm.
     and make it call the transaction manager\'s xid assignment
     \(GetTopTransactionId, xact\.c; txid\_current in xid8funcs\.c\)\. An
     unassigned read\-only transaction must get an xid on first call\.
-- [ ] **M0146\-0041 — WRONG RESULTS: numeric literal arithmetic is folded
+- [x] **M0146\-0041 — WRONG RESULTS: numeric literal arithmetic is folded
   through float64** \(filed 2026\-10\-02 by the M0146\-0005 text\-identity
   census, TPC\-DS Q21's `0\.6666666666666666` vs PG\'s
   `0\.66666666666666666667`; REPRODUCED on the private :5533 probe
@@ -24576,6 +24594,22 @@ M0146-0001 re-baseline census on the new default arm.
     numeric\_add/sub/mul/div: add\_var/sub\_var/mul\_var/div\_var with
     `select_div_scale`, numeric\.c\), or decline to fold a numeric
     operand so the executor computes it\.
+  - **DONE 2026\-10\-02** \(banner item 2a, `65c0b627d`\)\. Folding calls
+    the executor's numeric operators through the `optimizer\.NumericArith`
+    hook \(`foldNumericArith`, internal/executor/numeric\.go\), and
+    `litCompare` compares numeric literals exactly \(`big\.Rat`\)\. Design
+    `docs/design/0100\-0149/m0146\-0041\-numeric\-constant\-folding\.md`\.
+    - Test `TestNumericConstantFoldMatchesPG` \(PG 18\.3 values\): 12
+      mismatches before the change\.
+    - Regress numeric 2059 \-> 2042 diff lines; case, expressions, select
+      and aggregates unchanged\.
+    - TPC\-DS Q21 text\-identical at both scales \(SF0\.25 28\->29, SF1
+      17\->18\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm \(values
+      identical\), fire set \(Q21 Q23\), ea\-ratchet PASS\.
+    - Found and filed: M0146\-0044 \(`mod\(numeric\)` wrong, `%` on numeric
+      unsupported\)\.
+  Movement: yes — CATEGORIES-EXCL-MATCH rendering SF0.25 12→11, SF1 15→14 (Q21 now matches PG text)
 - [ ] **M0146\-0040 — `date \+ integer` returns a timestamp\-formatted
   value of type unknown** \(filed 2026\-10\-01 by slice 88; REPRODUCED on
   the private :5533 probe cluster, S2 escalation: wrong results\)\.
