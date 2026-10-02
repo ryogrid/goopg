@@ -24925,7 +24925,7 @@ M0146-0001 re-baseline census on the new default arm.
     > Resume point: make `neededColumnNames` / `outputColumnNames`
     > \(pathindexonlyneed\.go\) treat an unqualified name matching a FROM alias
     > as reading every column of that relation\.
-- [ ] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
+- [x] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
   FIRST/LAST share one WindowAgg** \(filed 2026\-10\-03 by the M0146\-0005dm
   probe; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
   results\)\. `SELECT x, rank\(\) OVER \(ORDER BY x NULLS FIRST\) r1, rank\(\)
@@ -24942,6 +24942,12 @@ M0146-0001 re-baseline census on the new default arm.
   > Filed by the M0146\-0005dm probe, not worked\. Owner: place
   > M0146\-0048 in the banner\. Resume point: add the nulls ordering
   > \(`sortByNullsFirst`\) to `windowSpecKey`'s ORDER BY items\.
+  - **LANDED 2026\-10\-03 \(`69491c07b`\)\.** `windowSpecKey` keys each ORDER BY
+    item on its effective NULLS ordering \(`sortByNullsFirst`\); an explicit
+    default still shares the window\. Values identical to PG on three rank
+    pairs\. Design `docs/design/0100\-0149/m0146\-0048\-window\-nulls\-order\-key\.md`\.
+    - Test `TestWindowsDifferingInNullsOrderStayApart`; regress `window`
+      byte\-identical; sweep 96/96, fire set \(no plan changes\), TPC\-H arm PASS\.
 - [ ] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
   does not quote its elements** \(filed 2026\-10\-02 by M0146\-0033;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
