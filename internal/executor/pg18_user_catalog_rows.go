@@ -522,13 +522,18 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relfilenode = int64(tbl.OID)
 	}
 	isPartition := tbl.PartitionParentOID != 0
-	// relpersistence: 'u' for UNLOGGED tables, 'p' for permanent. pg_dump keys
-	// `CREATE UNLOGGED TABLE` off relpersistence == RELPERSISTENCE_UNLOGGED, so
-	// hardcoding 'p' silently demoted an UNLOGGED table to a logged one in the
-	// dump. (TEMP tables are session-local and never reach the on-disk catalog,
-	// so 't' is not produced here.)
+	// relpersistence: 'u' for UNLOGGED tables, 't' for TEMP, 'p' for
+	// permanent. pg_dump keys `CREATE UNLOGGED TABLE` off relpersistence ==
+	// RELPERSISTENCE_UNLOGGED, so hardcoding 'p' silently demoted an UNLOGGED
+	// table to a logged one in the dump. A TEMP table does reach this heap
+	// (execCreateTable syncs every table), and writing 'p' made it come back
+	// after a restart as a permanent table visible to every session
+	// (M0146-0039); startup skips 't' rows, as no backend owns them any more.
 	relpersistence := "p"
-	if tbl.Unlogged {
+	switch {
+	case tbl.Temp:
+		relpersistence = "t"
+	case tbl.Unlogged:
 		relpersistence = "u"
 	}
 	// relpartbound: a partition child carries its `FOR VALUES …` bound, which
@@ -606,7 +611,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 }
 
 // indexPersistence returns the relpersistence char an index inherits from its
-// owning table ('u' for an index on an UNLOGGED table, 'p' otherwise). An index
+// owning table ('t' on a TEMP table, 'u' on an UNLOGGED one, 'p' otherwise). An index
 // always shares its table's persistence in PG, so this keeps the two pg_class
 // rows consistent for a standby / pg_amcheck reading the catalog.
 // pgClassRelhasindex computes the `relhasindex` a real PG 18.3 attached to this
@@ -656,6 +661,9 @@ func pgClassRelhasindex(cat catalog.Catalog, tbl *catalog.Table) bool {
 }
 
 func indexPersistence(idx *catalog.Index) string {
+	if idx.Table != nil && idx.Table.Temp {
+		return "t"
+	}
 	if idx.Table != nil && idx.Table.Unlogged {
 		return "u"
 	}

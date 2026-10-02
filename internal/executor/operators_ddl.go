@@ -4023,7 +4023,13 @@ afterExistsCheck:
 		// nextval(...) (vs an identity column's INTERNAL 'i' ADD GENERATED form).
 		// M0110-0001 (slice 120 identity, slice 121 serial).
 		if c.IdentityColumn || isSerial {
-			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
+			// M0146-0039: the implicit sequence takes the table's persistence
+			// (generateSerialExtraStmts: seqstmt->sequence->relpersistence =
+			// the table's), so a TEMP table's serial is a TEMP sequence.
+			if tbl.Temp {
+				SetSequenceTemporary(seqName, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			}
+			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName, tbl.Temp)
 		}
 		// Restart persistence: mark which column this implicit sequence backs
 		// (the serial spelling / identity kind — replay restores the column's
@@ -20239,7 +20245,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// Create a virtual catalog table for SELECT * FROM seq_name. This also
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
-	o.createSeqCatalogTable(s.Name, name)
+	o.createSeqCatalogTable(s.Name, name, s.Temporary)
 	// CREATE UNLOGGED SEQUENCE: stamp relpersistence on the just-created
 	// catalog row. Post-hoc LookupTable+set (rather than threading unlogged
 	// through createSeqCatalogTable/CreateSequenceCatalogRelation) keeps the
@@ -20265,12 +20271,18 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // schema-qualified; SequenceRowData resolves both). Shared by the explicit
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
-func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
+func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string, temp bool) {
 	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	// B1.3b: the sequence's pg_class row is the reload's ONLY source of its
 	// name/schema (the retired kind-65 carried them before). Write it like
 	// any relation; the sequence reload re-registers the virtual relation.
 	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		// M0146-0039: a TEMP sequence's row carries relpersistence 't' so a
+		// restart does not bring it back as a permanent sequence.
+		if temp {
+			seqTbl.Temp = true
+			seqTbl.TempOwner = sessionTempOwner(o.ctx)
+		}
 		// Stamp the creating role as owner, mirroring CREATE TABLE's owner
 		// stamp (tablecmds.c DefineRelation -> heap_create_with_catalog
 		// ownerId = GetUserId(), see the CREATE TABLE call site above) — a

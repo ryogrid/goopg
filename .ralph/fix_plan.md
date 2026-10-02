@@ -24471,7 +24471,7 @@ M0146-0001 re-baseline census on the new default arm.
     \(no fires\), regress 12 cases \(groupingsets 1920 → 1916\), ea\-ratchet
     PASS \(10\)\.
   Movement: none — CATEGORIES-EXCL-MATCH unchanged (rendering SF0.25 12, SF1 15; no TPC-DS GROUPING keys); regress groupingsets 1920 -> 1916
-- [ ] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
+- [x] **M0146\-0039 — temp tables resurrect as PERMANENT public tables
   after a restart** \(filed 2026\-09\-30 by slice 74; REPRODUCED 2026\-09\-30,
   S2 escalation: wrong results \+ a durable catalog row\)\. On the
   private :5533 probe cluster \(tmp/c20a/data\-sf025\) a session created
@@ -24509,6 +24509,22 @@ M0146-0001 re-baseline census on the new default arm.
     load skip/drop `t` rows and unlink their files; or stamp the catalog
     rows' xmax and drop the files at session exit, as the DROP path does
     \(operators\_ddl.go ~8344\)\.
+  - **DONE 2026\-10\-02** \(banner item 2a\)\. Temp tables, their indexes
+    and serial sequences, and explicit `CREATE TEMP SEQUENCE` rows now say
+    relpersistence `t`\. Startup skips `t` rows in the table/sequence and
+    index loaders\. Design
+    `docs/design/0100\-0149/m0146\-0039\-temp\-relations\-restart\.md`\.
+    - Test `TestTempRelationsDoNotSurviveRestart` \(initdb\): all five temp
+      relations came back before the change; now only the permanent table
+      survives\.
+    - Reproducer updated \(`analysis/m0146/m0146\-0039/repro\.sh`\): after
+      the restart only `keep` remains and `CREATE TEMP TABLE ca` succeeds\.
+    - Gates: units, isolation inherit\-temp and temp\-schema\-cleanup PASS,
+      regress temp / sequence unchanged vs HEAD, tpch\-spotcheck, sf025
+      96/96, TPC\-H arm, fire set, ea\-ratchet PASS\.
+    - Ledgered: namespace OID \(still 2200, not `pg\_temp\_N`\), and
+      leftover rows and relfiles that are skipped rather than removed\.
+  Movement: none — correctness fix — no plan instrument
 
   > ## ESCALATION 2026\-09\-30 \(S2\) — a temp table resurrects as a permanent public table after a restart
   >

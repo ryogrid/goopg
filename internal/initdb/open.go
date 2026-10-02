@@ -3350,6 +3350,15 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// was previously skipped outright, so a foreign table vanished from the
 		// catalog across a restart. reloadForeignTablesFromHeap re-attaches the
 		// server name and options afterwards, from pg_foreign_table.
+		// M0146-0039: a TEMP relation ('t') belonged to a backend that no
+		// longer exists after a restart. PG never shows such a relation to
+		// another session (its pg_temp_N namespace is private, and
+		// RemoveTempRelations drops leftovers when the namespace is next
+		// taken), so it is not reloaded — before this it came back as a
+		// permanent public table holding the old rows.
+		if rec.row.RelPersistence == "t" {
+			continue
+		}
 		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S" || rec.row.RelKind == "f") && rec.row.OID >= catalog.FirstUserOID {
 			userTableRows = append(userTableRows, rec)
 		}
@@ -3839,7 +3848,8 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if err != nil {
 				continue
 			}
-			if row.RelKind == "i" && row.OID >= catalog.FirstUserOID {
+			// M0146-0039: an index on a leftover TEMP table goes with it.
+			if row.RelKind == "i" && row.RelPersistence != "t" && row.OID >= catalog.FirstUserOID {
 				// reloptions (attnum 33) is a varlena column past the fixed-offset
 				// prefix DecodePGClassPhysicalRow decodes, same gap
 				// loadUserTablesFromHeap works around for tables/views — re-decode
