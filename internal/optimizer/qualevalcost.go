@@ -21,8 +21,8 @@ const defaultArrayLength = 10
 // walked. An `x = ANY (list)` is a ScalarArrayOpExpr: half the list per
 // evaluation when linear, or one hash plus one comparison per evaluation with
 // the hash table built at startup once the list reaches
-// MIN_ARRAY_SIZE_FOR_HASHED_SAOP constants. A sublink costs 1 here — PG
-// charges the planned SubPlan's per-call cost, which this walk cannot see.
+// MIN_ARRAY_SIZE_FOR_HASHED_SAOP constants. A sublink is priced by
+// subPlanCostOps (cost_subplan) once its plan exists; an unplanned one costs 1.
 //
 // The walk is walkExprRefs' exhaustive one (sublink bodies are other scopes
 // and are not entered); an expression type it does not know aborts the walk
@@ -45,7 +45,15 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 		case *FuncCall, *IsDistinctFromExpr:
 			perTuple++
 		case *InExpr:
-			if n.Plan != nil || n.Subquery != nil {
+			if n.Plan != nil {
+				// The test expression's comparison, then the SubPlan.
+				perTuple++
+				s, p := subPlanCostOps(n.Plan, sublinkAnyAll)
+				startup += s
+				perTuple += p
+				return true
+			}
+			if n.Subquery != nil {
 				perTuple++
 				return true
 			}
@@ -59,8 +67,18 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 				return true
 			}
 			perTuple += 0.5 * float64(length)
-		case *SubqueryExpr, *ArraySubqueryExpr, *ExistsExpr:
-			perTuple++
+		case *SubqueryExpr:
+			s, p := subPlanCostOps(n.Plan, sublinkExpr)
+			startup += s
+			perTuple += p
+		case *ArraySubqueryExpr:
+			s, p := subPlanCostOps(n.Plan, sublinkExpr)
+			startup += s
+			perTuple += p
+		case *ExistsExpr:
+			s, p := subPlanCostOps(n.Plan, sublinkExists)
+			startup += s
+			perTuple += p
 		}
 		return true
 	}})
@@ -99,4 +117,67 @@ func indexClausesEvalOps(clauses []indexPathClause) float64 {
 		ops += p
 	}
 	return ops
+}
+
+// pgBootCPUOperatorCost is cpu_operator_cost's boot value (guc_tables.c),
+// the unit subPlanCostOps converts a subplan's absolute costs into.
+const pgBootCPUOperatorCost = 0.0025
+
+// sublink kinds cost_subplan distinguishes.
+const (
+	sublinkExpr   = iota // EXPR / ARRAY: every output tuple is fetched
+	sublinkExists        // EXISTS: one tuple is fetched
+	sublinkAnyAll        // ANY / ALL: half the output, plus a comparison per row read
+)
+
+// subPlanCostOps is cost_subplan (costsize.c) for one planned sublink, as
+// cost_qual_eval_walker adds it to the enclosing qual (M0146-0005di), in
+// cpu_operator_cost units so it sums with qualEvalOps' operator counts:
+//
+//   - each evaluation pays the share of the run cost it reads
+//     (EXPR all of it, EXISTS one tuple's, ANY/ALL half plus half the rows
+//     at cpu_operator_cost), plus the plan's startup — once when the SubPlan
+//     is uncorrelated (goopg caches the output, PG's ExecMaterializesOutput
+//     case), on every evaluation when it is correlated;
+//   - an uncorrelated EXPR / ARRAY / EXISTS sublink is an InitPlan upstream:
+//     the qual reads its output Param, which costs nothing here (the
+//     initplan's own cost is charged to the plan, not the qual);
+//   - an unplanned sublink keeps the old 1-operator charge.
+//
+// A hashable uncorrelated IN is priced like any other uncorrelated ANY, not
+// as the hashed SubPlan goopg executes (subplan_hash.go): make_subplan wraps
+// the two forms in an AlternativeSubPlan listing the plain one first, and
+// cost_qual_eval_walker "arbitrarily use[s] the first alternative plan for
+// costing" — the choice is only made later, in setrefs.
+//
+// The plan's costs are its stamped path costs, or the legacy display
+// estimate where the search did not produce it. Converting to operator units
+// uses cpu_operator_cost's boot value; a session that changes the GUC prices
+// the subplan part slightly off (ledgered).
+func subPlanCostOps(plan Node, kind int) (startup, perTuple float64) {
+	if plan == nil {
+		return 0, 1
+	}
+	correlated := planHasOuterRef(plan)
+	if !correlated && kind != sublinkAnyAll {
+		return 0, 0
+	}
+	pc := legacyDisplayCostOf(plan)
+	const op = pgBootCPUOperatorCost
+	run := pc.TotalCost - pc.StartupCost
+	var per float64
+	switch kind {
+	case sublinkExists:
+		per = run / clampRowEst(pc.PlanRows)
+	case sublinkAnyAll:
+		per = 0.5*run + 0.5*pc.PlanRows*op
+	default:
+		per = run
+	}
+	if correlated {
+		per += pc.StartupCost
+	} else {
+		startup = pc.StartupCost
+	}
+	return startup / op, per / op
 }

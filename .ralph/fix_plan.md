@@ -24195,11 +24195,22 @@ M0146-0001 re-baseline census on the new default arm.
   - Gates: units, spotcheck, sf025 96/96, arm, fire set \(Q2 Q41 / Q2 Q59\),
     ea\-ratchet; regress join 2 lines toward PG, 5 cases unchanged\.
   Movement: yes — TPC-DS PLAN-PARITY match SF0.25 38→39 (Q41)
-- [ ] **M0146\-0005di — a SubPlan, AlternativeSubPlan or InitPlan is charged into its parent\'s cost as PG charges it** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005di — a SubPlan, AlternativeSubPlan or InitPlan is charged into its parent\'s cost as PG charges it** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q1, Q10, Q35: a filter with a correlated or hashed\-OR SubPlan costs nothing extra \(PG: per\-row cost, AlternativeSubPlan priced by its non\-hashed arm, cost\_qual\_eval\); Q30, Q57, Q58, Q64, Q75: InitPlan or CTE cost missing from the parent node\.
   Kind: impl
   Parent: M0146\-0005
   - First step: find where goopg prices a qual containing a SubPlan \(cost\_qual\_eval analogue\) and how an InitPlan\'s cost reaches its parent \(SS\_charge\_for\_initplans\)\.
+  - **DONE 2026\-10\-03 \(slice 116\)** for the SubPlan / AlternativeSubPlan
+    half\. `subPlanCostOps` \(qualevalcost\.go\) is cost\_subplan inside
+    qualEvalOps; a hashable uncorrelated IN is priced as the
+    AlternativeSubPlan\'s plain first arm, as cost\_qual\_eval\_walker does\.
+    Design `docs/design/0100\-0149/m0146\-0005di\-subplan\-qual\-cost\.md`\.
+  - Test `TestQualEvalOpsChargesSubPlanCost`\.
+  - Gates: units, spotcheck, sf025 96/96, arm \(values\-only, FORCE=1 under
+    the nightly batch\), fire set \(Q1 Q6 Q14 Q30 Q54 Q58 Q81\), ea\-ratchet;
+    regress 5 cases unchanged\.
+  - InitPlan half filed as M0146\-0005dr\.
+  Movement: yes — CATEGORIES-EXCL-MATCH join-method SF0.25 29→28, SF1 28→27
 - [ ] **M0146\-0005dj — PG 18\'s Hash Right Semi / Right Anti joins and the parallel Hash Right Join** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q23 \(Hash Right Semi Join probing the CTE\), Q69 \(Hash Right Anti Join\), Q75 \(Parallel Hash Right Join\): goopg emits none of these in the corpus; PG 4 / 2 / several\.
   Kind: impl
@@ -24240,6 +24251,17 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: impl
   Parent: M0146\-0005
   - First step: check the semi\-join NL producer for CTE\-scan inners and parameterised join inners\.
+- [ ] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
+  that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
+  leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
+  0\.07 vs 13874, Q75 550 vs 64209\); PG adds it in SS\_charge\_for\_initplans
+  / SS\_attach\_initplans \(subselect\.c\)\. Also the Q10 / Q35 OR\-of\-hashed\-SubPlans
+  qual held above the search where PG evaluates it at the customer scan\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where goopg attaches CTE bodies / InitPlans to a plan
+    node and add their startup / total to that node\'s cost, as
+    SS\_charge\_for\_initplans does\.
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
