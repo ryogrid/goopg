@@ -22147,6 +22147,17 @@ M0146-0001 re-baseline census on the new default arm.
       M0146\-0009h \(bulk\-load relpages\), M0146\-0005dg \(plain\-restriction
       skip scan\)\.
     Movement: none — diagnosis and routing only, no code change
+  - **Slice 114 \(routing census, 2026\-10\-02, HEAD `ef8285523`\)\.** Every
+    SF0\.25 first\-divergence record is routed: table
+    `analysis/m0146/m0146\-0005/routing\-20261002/ROUTING\.md`\.
+    - B8 \(owner\-kept probe multiplier\) 15 records; COSTTIE 12 \(for M0146\-0014\'s
+      waived\-tie list\); SUBPLAN decorrelation 3 → M0145\-0008y; PARTIAL 7 →
+      M0146\-0027 / M0140\-0006; SORT 4 → M0146\-0006; one each to M0146\-0026,
+      M0139\-0007a \(held spill knob\), B\-15, M0146\-0009h\.
+    - New families filed as M0146\-0005dh…dq \(10 tasks, 13 records\) and
+      M0146\-0009i\.
+    - SF1 is not yet routed \(65 records; the same detectors classify 8\)\.
+    Movement: none — routing census only, no code change
   - **Residual triage 2026\-09\-26 \(HEAD `b57acc6cd`\).** Evidence
     `analysis/m0146/m0146\-0005/residual\-triage\-20260926/`.
     - Stale `char\(n\)` data \+ probe multiplier: Q79, Q55, Q23, Q30 \(Q55:
@@ -24165,6 +24176,56 @@ M0146-0001 re-baseline census on the new default arm.
   - Ledgered: covering skip probe stays Index Scan \(PG Index Only Scan\);
     no backward skip scan; costs through the known index\-cost families\.
   Movement: none — no TPC-DS plan changed (no constant-driven skip probe in the corpus); regress btree_index Index Cond lines 2 fixed
+- [ ] **M0146\-0005dh — a correlated\-SubPlan qual or a CTE Scan runs under Gather where PG keeps it parallel\-restricted** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q41: the correlated SubPlan filter on item runs in a Parallel Seq Scan and the SubPlan scan is priced CPU\-only \(180\.01 vs PG 4029\.00\); Q2: Gather Merge over CTE Scans\. PG marks PARAM\_EXEC\-referencing quals and CTE scans parallel\-restricted \(max\_parallel\_hazard, set\_rel\_consider\_parallel\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find the parallel\-safety predicate that admits a leaf under Gather \(considerparallel\.go\) and add PG\'s two hazards: a qual whose SubPlan carries outer params, and a CTEScan leaf\.
+- [ ] **M0146\-0005di — a SubPlan, AlternativeSubPlan or InitPlan is charged into its parent\'s cost as PG charges it** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q1, Q10, Q35: a filter with a correlated or hashed\-OR SubPlan costs nothing extra \(PG: per\-row cost, AlternativeSubPlan priced by its non\-hashed arm, cost\_qual\_eval\); Q30, Q57, Q58, Q64, Q75: InitPlan or CTE cost missing from the parent node\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where goopg prices a qual containing a SubPlan \(cost\_qual\_eval analogue\) and how an InitPlan\'s cost reaches its parent \(SS\_charge\_for\_initplans\)\.
+- [ ] **M0146\-0005dj — PG 18\'s Hash Right Semi / Right Anti joins and the parallel Hash Right Join** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q23 \(Hash Right Semi Join probing the CTE\), Q69 \(Hash Right Anti Join\), Q75 \(Parallel Hash Right Join\): goopg emits none of these in the corpus; PG 4 / 2 / several\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: compare hash\_inner\_and\_outer\'s JOIN\_RIGHT\_SEMI / JOIN\_RIGHT\_ANTI arms \(joinpath\.c\) with goopg\'s hash\-join path producer and the executor\'s right\-join support\.
+- [ ] **M0146\-0005dk — a semi\-join inner is unique\-ified \(JOIN\_UNIQUE\_INNER\) for a nested IN / CTE inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q83: PG Hash Semi Join over Hash Join\(dd4, HashAggregate\(dd5\)\); goopg keeps nested semi joins under a Gather \(7626 vs 7155 per arm\)\. Q23: HashAggregate unique\-ify of the frequent\_ss\_items CTE\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: check why create\_unique\_path\'s analogue \(M0142\-0008c lineage\) does not offer the unique\-ified inner here\.
+- [ ] **M0146\-0005dl — an unreferenced LEFT JOIN on a unique key is removed \(remove\_useless\_joins\)** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q72: goopg keeps `Nested Loop Left Join → Index Only Scan catalog\_returns\_pkey`; PG removes it \(analyzejoins\.c join\_is\_removable\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: port join\_is\_removable for the left\-join case before join search\.
+- [ ] **M0146\-0005dm — stacked WindowAggs run in select\_active\_windows order** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q47, Q57, Q49: goopg evaluates the partition\-only window lower; PG puts the ORDER BY window first \(common\_prefix\_cmp\)\. Cost\-neutral but shape\-visible\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: compare goopg\'s window ordering \(M0146\-0017 sharing\) with select\_active\_windows / common\_prefix\_cmp \(planner\.c\)\.
+- [ ] **M0146\-0005dn — a rank\-bounded subquery filter becomes a WindowAgg Run Condition** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q44, Q67: goopg keeps `Subquery Scan \+ Filter \(rk \<= 100\)`; PG pushes it into the WindowAgg as `Run Condition: \(rank\(\) OVER \.\.\. \<= 100\)` and drops the Subquery Scan\. goopg prints no Run Condition in the whole capture \(M0146\-0005i fixed only the selectivity\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: check window\_runcondition\.go: whether the qual is pushed into the subquery at all, and whether EXPLAIN renders Run Condition\.
+- [ ] **M0146\-0005do — an expression member joins its equivalence class** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q59: `wss\_1\.d\_week\_seq \- 52 = wss\.d\_week\_seq` and `wss\.d\_week\_seq = d\.d\_week\_seq` give PG the derived `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq`; goopg\'s classes hold only plain columns, so the clause and PG\'s join order are missing \(final rows 15 vs 1\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: extend the seam\'s union\-find \(equiv\_class\.go\) to non\-volatile expression members on one rel\.
+- [ ] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: check whether appendrel children get parameterised paths \(add\_paths\_to\_append\_rel with required\_outer\)\.
+- [ ] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  Q95: PG NL Semi Join\(CTE ws\_wh\) over NL Semi Join\(parameterised Hash Join\(ws\_wh\_1, IOS web\_returns\_pkey\)\); goopg hashes the 1\.75M\-row CTE twice \(187888 vs 141550\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: check the semi\-join NL producer for CTE\-scan inners and parameterised join inners\.
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
@@ -25209,6 +25270,11 @@ M0146-0001 re-baseline census on the new default arm.
     `batchExtendAndRegisterFSM` only fires under lock contention, 8 pages\)
     and port the BulkInsertState ramp\. Measurable only after an owner
     reload of the bench clusters; the loop cannot re\-load them\.
+- [ ] **M0146\-0009i — a CTE Scan inherits its CTE\'s row estimate** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+  TPC\-DS Q14: the cross\_items CTE estimates rows=1 on both engines, but goopg\'s CTE Scan of it reports 212, so goopg hashes it where PG unique\-ifies one row into an index\-probe chain \(statement 2 main body 18934 vs 2730 per branch\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find how the CTEScan leaf\'s rows are set \(set\_cte\_pathlist uses the CTE subplan\'s rows\) and why it diverges from the body\'s estimate\.
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
