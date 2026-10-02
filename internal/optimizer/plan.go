@@ -626,6 +626,17 @@ type RowExpr struct {
 	pos   int
 	Elems []Expr
 	Types []catalog.Type
+	// NotNullElem marks a whole-row reference to a relation (M0146-0047):
+	// 1 + the index of an element that reads one of the relation's NOT NULL
+	// columns, 0 when there is none. A NULL there can only come from an
+	// outer join's null extension, where PG's whole-row Var is NULL itself
+	// rather than a composite of NULL fields — `count(b)` over a LEFT
+	// JOIN's unmatched rows counts none of them. A real row whose fields are
+	// all NULL keeps its non-NULL composite, so the witness is a NOT NULL
+	// column, never "every field is NULL". An element position rather than
+	// a separate expression, so rewriters that remap the elements keep it
+	// valid by copying the field.
+	NotNullElem int
 }
 
 func (e *RowExpr) Pos() int { return e.pos }

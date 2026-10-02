@@ -21070,6 +21070,17 @@ func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, sl
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
 func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// M0146-0047: a whole-row reference whose NOT NULL column reads NULL is
+	// an outer join's null-extended row — PG's whole-row Var is NULL there.
+	if k := x.NotNullElem; k > 0 && k <= len(x.Elems) {
+		d, err := evalExprSlot(x.Elems[k-1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if d.IsNull() {
+			return NullDatum, nil
+		}
+	}
 	parts := make([]string, len(x.Elems))
 	allNull := true
 	for i, elem := range x.Elems {

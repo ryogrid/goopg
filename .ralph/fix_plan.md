@@ -24882,7 +24882,7 @@ M0146-0001 re-baseline census on the new default arm.
     counts `ctid` as a needed column when it elects an index\-only scan \(PG
     never does: `check\_index\_only` requires every referenced attribute,
     and ctid is not an index column\)\.
-- [ ] **M0146\-0047 — WRONG RESULTS: a null\-extended row\'s whole\-row value
+- [x] **M0146\-0047 — WRONG RESULTS: a null\-extended row\'s whole\-row value
   is not NULL** \(filed 2026\-10\-03 by the M0146\-0005dl edge\-case probe;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
   `SELECT count\(b\) FROM rj\_a a LEFT JOIN rj\_b b ON b\.k1 = a\.k1 AND b\.k2 = a\.k2 \+ 0`
@@ -24898,6 +24898,33 @@ M0146-0001 re-baseline census on the new default arm.
   > ## ESCALATION 2026\-10\-03 \(S2\) — whole\-row value of a null\-extended row is not NULL
   > Filed by the M0146\-0005dl probe, not worked\. Owner: place
   > M0146\-0047 in the banner\.
+  - **LANDED 2026\-10\-03\.** `RowExpr\.NotNullElem` \(plan\.go\): a whole\-row
+    reference records the element of its relation\'s first NOT NULL column;
+    `evalRowExpr` returns NULL when that element is NULL \(only an outer
+    join\'s null extension can do that\)\. `count\(b\)` = 2 = PG \(was 4\)\.
+    Design `docs/design/0100\-0149/m0146\-0047\-wholerow\-null\-extended\.md`\.
+    - Test `TestWholeRowOfNullExtendedRowIsNull`; regress rowtypes/join/
+      subselect/with/aggregates byte\-identical; sweep 96/96, TPC\-H arm PASS\.
+    - Residual \(ledgered\): no witness for relations without a NOT NULL
+      column or derived tables; `b\.\*` expressions\.
+  - [ ] **M0146\-0047a — WRONG RESULTS: a whole\-row reference across a join
+    loses the columns the query does not otherwise read** \(filed
+    2026\-10\-03 by the M0146\-0047 probe; REPRODUCED on HEAD before the
+    0047 fix, S2 escalation: wrong results\)\. `SELECT a\.id, b FROM wa a
+    LEFT JOIN wb b ON b\.k = a\.k` returns `\(1,,\)` for the matched row where PG
+    18\.3 returns `\(1,10,a\)`; `SELECT b FROM wb b` alone is right\. Column
+    narrowing over the join keeps only the join key: a whole\-row reference
+    \(resolved to a RowExpr over all of b\'s columns\) is not counted as
+    reading them \(the name\-based needed\-column collectors see the
+    reference `b`, not `b\.x`/`b\.y`\)\.
+    Kind: bug
+    Parent: M0146\-0047
+    > ## ESCALATION 2026\-10\-03 \(S2\) — whole\-row value narrowed across a join
+    > Filed by the M0146\-0047 probe, not worked\. As a descendant of a
+    > banner\-2a task it inherits item 2a\'s rank; owner: confirm its place\.
+    > Resume point: make `neededColumnNames` / `outputColumnNames`
+    > \(pathindexonlyneed\.go\) treat an unqualified name matching a FROM alias
+    > as reading every column of that relation\.
 - [ ] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
   FIRST/LAST share one WindowAgg** \(filed 2026\-10\-03 by the M0146\-0005dm
   probe; REPRODUCED on a private throwaway cluster, S2 escalation: wrong

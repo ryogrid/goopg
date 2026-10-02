@@ -17945,6 +17945,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		elems := make([]Expr, len(b.table.Columns))
 		types := make([]catalog.Type, len(b.table.Columns))
+		notNull := 0
 		for i, c := range b.table.Columns {
 			idx := b.offset + i
 			if level == 0 {
@@ -17953,8 +17954,11 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 				elems[i] = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
 			}
 			types[i] = c.Type
+			if notNull == 0 && c.NotNull {
+				notNull = i + 1
+			}
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types}, true, nil
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types, NotNullElem: notNull}, true, nil
 	}
 	// M0146-0028: whole-row reference to a pulled-up derived table.
 	if r := pulledDerivedAliasMatches(ctx, x.Column, ""); r != nil {
@@ -18310,7 +18314,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, el := range x.Elems {
 			elems[i] = remapColumnRefsToSchema(el, oldSchema, newIndex)
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types, NotNullElem: x.NotNullElem}
 	default:
 		return e
 	}
@@ -18564,7 +18568,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, el := range x.Elems {
 			elems[i] = shiftColumnRefsBy(el, delta)
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types, NotNullElem: x.NotNullElem}
 	default:
 		return e
 	}
