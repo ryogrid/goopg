@@ -24379,11 +24379,20 @@ M0146-0001 re-baseline census on the new default arm.
     - TPC\-DS: Q47/Q49/Q57 fire, values PASS; rendering 11→10 / 14→13\.
     - Found: M0146\-0048 \(S2, filed\) — NULLS FIRST/LAST windows merged\.
     Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 11→10 \(SF0\.25\) and 14→13 \(SF1\); match flat 39/28
-- [ ] **M0146\-0005dn — a rank\-bounded subquery filter becomes a WindowAgg Run Condition** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dn — a rank\-bounded subquery filter becomes a WindowAgg Run Condition** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q44, Q67: goopg keeps `Subquery Scan \+ Filter \(rk \<= 100\)`; PG pushes it into the WindowAgg as `Run Condition: \(rank\(\) OVER \.\.\. \<= 100\)` and drops the Subquery Scan\. goopg prints no Run Condition in the whole capture \(M0146\-0005i fixed only the selectivity\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: check window\_runcondition\.go: whether the qual is pushed into the subquery at all, and whether EXPLAIN renders Run Condition\.
+  - **LANDED 2026\-10\-03\.** `WindowAgg\.RunCondition` \+ `pushWindowRunConditions`
+    \(Plan\(\) tail, before the SubqueryScan strip\), executor stop/skip\-partition
+    in `windowOp\.Next`, EXPLAIN `Run Condition:`\. `=` keeps its qual and runs
+    as `<=`/`>=`\. Design `docs/design/0100\-0149/m0146\-0005dn\-window\-run\-condition\.md`\.
+    - Probes identical to PG \(modulo the pre\-existing `rc\.` qualifier\);
+      `TestWindowRunCondition`\.
+    - Regress `window` 4348→4275, no row changes\.
+    - TPC\-DS Q44/Q67 Run Conditions match PG; aligned \+1/\+1; categories flat\.
+    Movement: none — match 39/28 and CATEGORIES\-EXCL\-MATCH flat \(the classifier normalises Run Condition vs Filter\); aligned lines 2338→2339 / 2183→2184
 - [ ] **M0146\-0005do — an expression member joins its equivalence class** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q59: `wss\_1\.d\_week\_seq \- 52 = wss\.d\_week\_seq` and `wss\.d\_week\_seq = d\.d\_week\_seq` give PG the derived `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq`; goopg\'s classes hold only plain columns, so the clause and PG\'s join order are missing \(final rows 15 vs 1\)\.
   Kind: impl

@@ -2108,6 +2108,17 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		if p.Name != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Window: " + windowDefText(p, reg, qualify))})
 		}
+		// M0146-0005dn: show_upper_qual(runConditionOrig, "Run Condition").
+		if p.RunCondition != nil {
+			if txt, ok := windowKeyText(p.RunCondition, p, reg, qualify); ok {
+				// windowKeyText force-parenthesises a sort key; a qual is
+				// already a parenthesised operator expression.
+				if strings.HasPrefix(txt, "((") && strings.HasSuffix(txt, "))") && parenBalancedInside(txt[1:len(txt)-1]) {
+					txt = txt[1 : len(txt)-1]
+				}
+				*rows = append(*rows, Row{NewStringDatum(indent + "Run Condition: " + txt)})
+			}
+		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -6707,4 +6718,25 @@ func moveBeforeLastDetail(rows []Row, prefix string) {
 			return
 		}
 	}
+}
+
+// parenBalancedInside reports whether s is one parenthesised group whose
+// opening paren closes at its last character — `(a < 5)`, not `(a) < (5)`.
+func parenBalancedInside(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	for i, ch := range s {
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
 }

@@ -1269,12 +1269,46 @@ func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int
 }
 
 func (o *windowOp) Next() (TupleSlot, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	for {
+		if o.idx >= len(o.rows) {
+			return nil, EOF
+		}
+		row := o.rows[o.idx]
+		o.idx++
+		if o.plan.RunCondition == nil {
+			return asSlot(o.schema, row), nil
+		}
+		// M0146-0005dn: nodeWindowAgg.c's run condition on the top-level
+		// WindowAgg. A false or NULL result stays so for the rest of the
+		// partition (the function is monotonic), so without PARTITION BY
+		// the scan is done (WINDOWAGG_DONE) and with it the partition's
+		// remaining rows are skipped (WINDOWAGG_PASSTHROUGH_STRICT).
+		v, err := evalExpr(o.plan.RunCondition, row, o.ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !v.IsNull() && v.BoolValue() {
+			return asSlot(o.schema, row), nil
+		}
+		if len(o.plan.PartitionBy) == 0 {
+			o.idx = len(o.rows)
+			return nil, EOF
+		}
+		key, err := o.partitionKey(row)
+		if err != nil {
+			return nil, err
+		}
+		for o.idx < len(o.rows) {
+			k, err := o.partitionKey(o.rows[o.idx])
+			if err != nil {
+				return nil, err
+			}
+			if k != key {
+				break
+			}
+			o.idx++
+		}
 	}
-	row := o.rows[o.idx]
-	o.idx++
-	return asSlot(o.schema, row), nil
 }
 
 func (o *windowOp) Close() error {

@@ -1730,6 +1730,15 @@ func (w WindowFunc) Pos() int { return w.pos }
 type WindowAgg struct {
 	pos         int
 	Child       Node
+	// RunCondition is PG's WindowAgg runCondition (find_window_run_conditions,
+	// allpaths.c): a qual over this node's own output — a monotonic window
+	// function compared to a constant — that, once false, stays false for
+	// the rest of the partition. The executor then skips the partition's
+	// remaining rows, or ends the scan without PARTITION BY (nodeWindowAgg.c
+	// WINDOWAGG_PASSTHROUGH_STRICT / WINDOWAGG_DONE). Set only on the
+	// top-level WindowAgg of a query level, by pushWindowRunConditions
+	// (M0146-0005dn); nil otherwise.
+	RunCondition Expr
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc

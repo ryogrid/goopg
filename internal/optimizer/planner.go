@@ -209,6 +209,9 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// pass removes labelling nodes only.
 	// M0146-0005av: an inlined CTE reference PG could not pull up is a
 	// subquery RTE there too; wrap it before the strip decides.
+	// M0146-0005dn: window run conditions are a subquery_planner decision,
+	// made before setrefs strips trivial SubqueryScans.
+	node = pushWindowRunConditions(node)
 	node, wrappedCTE := wrapInlinedCTEScans(node)
 	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
 	// while the SubqueryScan wrappers still mark the levels PG keeps.
