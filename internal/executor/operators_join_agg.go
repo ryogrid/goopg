@@ -2146,6 +2146,13 @@ type aggRuntime struct {
 	// pg_get_publication_tables. M0103-0008 probe-survival.
 	arrayElems    []string
 	arrayElemNull []bool
+	// arrayOfArrays marks array_agg over an ARRAY input
+	// (array_agg_array_transfn): each arrayElems entry is a whole input
+	// array's text and the result stacks them one dimension deeper;
+	// arrayShape is the first input's dimension lengths, which every later
+	// input must match. M0146-0033.
+	arrayOfArrays bool
+	arrayShape    []int
 	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
 	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
 	arrayElemKeys [][]Datum
@@ -3917,7 +3924,32 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// SELECT would print them.
 		elemStr := ""
 		isNull := arg.IsNull()
-		if !isNull {
+		if call.InputType.IsArray || strings.HasSuffix(call.InputType.Name, "[]") {
+			// M0146-0033: array_agg(anyarray) is array_agg_array_transfn
+			// (array_userfuncs.c): every input is a sub-array of the result,
+			// one dimension deeper — `{{1},{2}}`, never the text array
+			// `{"{1}","{2}"}` the element arm produces.
+			if isNull {
+				return &ExecError{Code: "22004", Message: "cannot accumulate null arrays"}
+			}
+			text := formatDatumDateStyle(arg, o.ctx)
+			shape, ok := arrayTextShape(text)
+			if !ok {
+				return &ExecError{Code: "0A000", Message: "array_agg over arrays with non-default lower bounds is not supported"}
+			}
+			// accumArrayResultArr's order: the first input may not be
+			// empty; every later one (empty included) must match its dims.
+			if st.arrayOfArrays {
+				if !sameArrayShape(shape, st.arrayShape) {
+					return &ExecError{Code: "2202E", Message: "cannot accumulate arrays of different dimensionality"}
+				}
+			} else if len(shape) == 0 {
+				return &ExecError{Code: "2202E", Message: "cannot accumulate empty arrays"}
+			}
+			st.arrayOfArrays = true
+			st.arrayShape = shape
+			elemStr = text
+		} else if !isNull {
 			elemStr = formatDatumDateStyle(arg, o.ctx)
 		}
 		st.arrayElems = append(st.arrayElems, elemStr)
@@ -4818,6 +4850,20 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
+		}
+		if st.arrayOfArrays {
+			// array_agg_array_finalfn: the inputs, in ORDER BY order when
+			// given, become the new outermost dimension.
+			elems := st.arrayElems
+			if len(st.arrayElemKeys) == len(elems) && len(st.arrayElemKeys) > 0 {
+				idx := aggOrderBySortedIdx(st.arrayElemKeys, call.OrderBy)
+				sorted := make([]string, len(elems))
+				for i, origIdx := range idx {
+					sorted[i] = elems[origIdx]
+				}
+				elems = sorted
+			}
+			return NewStringDatum("{" + strings.Join(elems, ",") + "}")
 		}
 		// Sort elements by ORDER BY keys if present.
 		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
@@ -6003,4 +6049,82 @@ func ctxHashMemMultiplier(ctx *Context) float64 {
 		return hashsize.DefaultHashMemMultiplier
 	}
 	return f
+}
+
+// arrayTextShape returns the dimension lengths of an array in its text form
+// (`{{1,2},{3,4}}` → [2 2]; `{}` → []), following the first element down
+// each level the way array_in's dims are rectangular. ok is false for a
+// form with explicit lower bounds (`[2:3]={...}`), which carries dimension
+// metadata this text-only representation does not decode here.
+func arrayTextShape(s string) ([]int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || s[0] != '{' {
+		return nil, false
+	}
+	var shape []int
+	// counts[d] is the element count of the first array seen at depth d.
+	depth := 0
+	done := map[int]bool{}
+	count := map[int]int{}
+	inQuote, escaped := false, false
+	sawElem := map[int]bool{}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+			sawElem[depth] = true
+		case '{':
+			if depth > 0 {
+				sawElem[depth] = true
+			}
+			depth++
+		case '}':
+			if sawElem[depth] && !done[depth] {
+				count[depth]++
+				done[depth] = true
+			}
+			depth--
+		case ',':
+			if !done[depth] {
+				count[depth]++
+			}
+		default:
+			if c != ' ' {
+				sawElem[depth] = true
+			}
+		}
+	}
+	for d := 1; ; d++ {
+		n, ok := count[d]
+		if !ok || n == 0 {
+			break
+		}
+		shape = append(shape, n)
+	}
+	return shape, true
+}
+
+// sameArrayShape reports whether two dimension lists are identical.
+func sameArrayShape(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

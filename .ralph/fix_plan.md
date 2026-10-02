@@ -24535,6 +24535,25 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
+- [ ] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
+  does not quote its elements** \(filed 2026\-10\-02 by M0146\-0033;
+  REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
+  goopg: `array\['a,b','c'\]` = `\{a,b,c\}`, `array\['x y'\]::text\[\]` =
+  `\{x y\}`, `array\[''\]::text\[\]` = `\{\}`, `array\[null::text,'NULL'\]` =
+  `\{NULL,NULL\}`, `array\['a"b'\]` = `\{a"b\}`; PG 18\.3: `\{"a,b",c\}`,
+  `\{"x y"\}`, `\{""\}`, `\{NULL,"NULL"\}`, `\{"a\\"b"\}`\. The text changes
+  the array\'s cardinality and NULLness on re\-input\. An array cast from a
+  literal \(`'\{"a,b",c\}'::text\[\]`\) prints correctly\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-02 \(S2\) — ARRAY\[\] output does not quote elements
+  > Filed by M0146\-0033, not worked\. Owner: place M0146\-0045 in the
+  > banner\.
+  - Not worked \(S2: the owner places it\)\. First step: find the
+    `array\_construct` evaluator\'s text assembly and route each element
+    through array\_out\'s quoting rule \(quote when empty, `NULL`
+    case\-insensitively, or containing `\{\}",\\` or whitespace; escape `"` and
+    `\\`\), as the literal\-cast path already does\.
 - [ ] **M0146\-0044 — WRONG RESULTS: `mod\(numeric, numeric\)` returns wrong
   values; `numeric % numeric` is unsupported** \(filed 2026\-10\-02 by
   M0146\-0041; REPRODUCED on a private throwaway cluster, S2 escalation:
@@ -25797,7 +25816,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm \(values
       identical\), fire set \(none\), ea\-ratchet PASS\.
   Movement: none — correctness fix — no plan instrument
-- [ ] **M0146\-0033 — WRONG RESULTS: array\_agg over an array input returns
+- [x] **M0146\-0033 — WRONG RESULTS: array\_agg over an array input returns
   an array of text, not a multidimensional array** \(filed 2026\-09\-28 by
   M0146\-0030; S2, pre\-existing\)\. `select array\_agg\(x\) from \(values
   \(array\[1\]\),\(array\[2\]\)\) v\(x\)` returns `\{"\{1\}","\{2\}"\}`; PG
@@ -25808,6 +25827,17 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: port `array\_agg\_array\_transfn` / `array\_agg\_array\_finalfn`
     \(src/backend/utils/adt/array\_userfuncs\.c\) as the anyarray arm of
     goopg\'s array\_agg, including the dimension\-mismatch error\.
+  - **DONE 2026\-10\-02** \(banner item 2a\)\. `applyAgg`\'s array\_agg takes
+    an anyarray arm for an array input \(`IsArray` or a `\[\]`\-suffixed type
+    name\) and keeps each input whole; `finishBuiltinAgg` stacks them one
+    dimension deeper\. The null / empty\-first / different\-dimensionality
+    errors follow `accumArrayResultArr`\'s order, and both planner
+    array\_agg type sites return the input array type\. Test
+    `TestArrayAggOverArraysMatchesPG`; regress arrays 3279 → 3205 diff lines,
+    aggregates / window identical\. Design
+    `docs/design/0100\-0149/m0146\-0033\-array\-agg\-over\-arrays\.md`\.
+    Residuals ledgered \(explicit lower bounds unsupported\)\; found and
+    filed M0146\-0045 \(ARRAY\[\] output does not quote elements\)\.
 - [x] **M0146\-0034 — WRONG RESULTS: Limit over a plain Gather of an
   ordered parallel index scan returns rows in scheduling order** \(filed
   2026\-09\-29 by M0146\-0005ak; S2, pre\-existing on e379ea18b\)\.

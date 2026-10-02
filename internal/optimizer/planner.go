@@ -11324,7 +11324,11 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 		if argExpr != nil {
 			et := exprType(argExpr)
-			if et.Name != "" && et.Name != "unknown" {
+			if strings.HasSuffix(et.Name, "[]") {
+				// array_agg(anyarray) returns the input's own array type
+				// — one dimension deeper, same type. M0146-0033.
+				outType = et
+			} else if et.Name != "" && et.Name != "unknown" {
 				outType = catalog.Type{Name: et.Name + "[]"}
 			} else {
 				outType = catalog.Type{Name: "text[]"}
@@ -16045,6 +16049,10 @@ func exprType(e Expr) catalog.Type {
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {
 				et := exprType(x.Args[0])
+				if strings.HasSuffix(et.Name, "[]") {
+					// array_agg(anyarray): the input's array type. M0146-0033.
+					return et
+				}
 				if et.Name != "" && et.Name != "unknown" {
 					return catalog.Type{Name: et.Name + "[]"}
 				}
