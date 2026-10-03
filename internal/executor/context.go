@@ -361,6 +361,13 @@ type Context struct {
 	// heap insert. M0134-0175a.
 	heapFillfactorCache map[uint32]int
 
+	// bulkInsert is the BulkInsertState of the COPY FROM writing right now:
+	// set by the COPY executor around each heap write it makes and cleared
+	// after, so placeHeapTuple chooses pages and extends the relation the way
+	// PG's RelationGetBufferForTuple does with a bistate (hio.c). Only writes
+	// to bulkInsert.rel consult it. M0146-0009h.
+	bulkInsert *bulkInsertState
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.

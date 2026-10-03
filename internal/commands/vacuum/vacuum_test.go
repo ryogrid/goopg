@@ -421,6 +421,56 @@ func TestVacuumTailTruncation(t *testing.T) {
 	}
 }
 
+// TestVacuumTailTruncationThreshold pins vacuumlazy.c's
+// should_attempt_truncation: an empty tail shorter than REL_TRUNCATE_MINIMUM
+// pages and 1/REL_TRUNCATE_FRACTION of the relation stays — the unused pages
+// of a COPY's last bulk extension (M0146-0009h) are such a tail — and a
+// truncation that does happen also drops the removed blocks' FSM entries,
+// so no later insert is sent past the end of the file.
+func TestVacuumTailTruncationThreshold(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		nBlocks, filled int
+		wantBlocks      storage.BlockNumber
+	}{
+		{"short tail kept", 48, 46, 48}, // 2 < 48/16
+		{"long tail dropped", 40, 10, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, _, rel, cleanup := newRel(t)
+			defer cleanup()
+			mvccMgr := transam.NewManager()
+			tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+			xid1, _ := mvccMgr.AssignXID(tx1)
+			tx1.XID = xid1
+			mvccMgr.Commit(tx1)
+			if _, err := pool.ExtendRelationBatch(rel, tc.nBlocks); err != nil {
+				t.Fatalf("ExtendRelationBatch: %v", err)
+			}
+			fsm := storage.NewFSM()
+			for b := storage.BlockNumber(0); b < storage.BlockNumber(tc.nBlocks); b++ {
+				if int(b) < tc.filled {
+					addTuple(t, pool, rel, b, storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v")))
+				}
+				fsm.RecordFreeSpace(rel, b, 8000)
+			}
+			pool.SetLogSmgrTruncateTo(func(storage.RelFileNode, storage.BlockNumber) error { return nil })
+			if _, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{FSM: fsm, Truncate: true}); err != nil {
+				t.Fatalf("vacuum: %v", err)
+			}
+			n, _ := pool.NBlocks(rel)
+			if n != tc.wantBlocks {
+				t.Fatalf("nblocks=%d want %d", n, tc.wantBlocks)
+			}
+			for _, blk := range fsm.GetCandidates(rel, 1, tc.nBlocks) {
+				if blk >= n {
+					t.Errorf("FSM still offers block %d of a %d-block relation", blk, n)
+				}
+			}
+		})
+	}
+}
+
 // TestVacuumTailTruncationKeepsVMSkippedBlocks is the review/260831-2 NB-1
 // guard: the VM-skip branch used to `continue` without touching lastNonEmpty,
 // so a trailing run of ALL_VISIBLE blocks holding LIVE tuples looked empty to

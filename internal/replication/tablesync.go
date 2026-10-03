@@ -193,6 +193,14 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: apply row: %w", err)
 			}
 		case libpq.MsgCopyDone:
+			// A writer that buffers rows (executor.CopyFromExecutor's
+			// multi-insert batches, M0146-0009h) writes the last batch at
+			// the end of its COPY, as the wire layer's CopyDone does.
+			if f, ok := cfg.From.(interface{ Finish() error }); ok {
+				if err := f.Finish(); err != nil {
+					return cfg.From.RowsInserted(), fmt.Errorf("tablesync: apply row: %w", err)
+				}
+			}
 			// Phase 3: drain trailer (CommandComplete +
 			// ReadyForQuery) and advance to 's'. We don't strictly
 			// need to wait for ReadyForQuery to declare sync done —

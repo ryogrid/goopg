@@ -96,6 +96,9 @@ func TestCopyFromDefaultFilledForOmittedColumn(t *testing.T) {
 	if err := cf.PushLine([]byte("99")); err != nil {
 		t.Fatal(err)
 	}
+	if err := cf.Finish(); err != nil {
+		t.Fatal(err)
+	}
 
 	rows := runSQL(t, ctx, `SELECT a, b FROM copy_default_t`)
 	if len(rows) != 1 {

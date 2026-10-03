@@ -9409,7 +9409,28 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 // is preserved for INSERT / UPDATE callers that don't need the
 // location.
 func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
-	var ptr storage.ItemPointer
+	pt, err := prepareHeapTuple(ctx, rel, cols, row)
+	if err != nil {
+		return storage.ItemPointer{}, err
+	}
+	return placeHeapTuple(ctx, rel, pt)
+}
+
+// preparedHeapTuple is a row turned into its on-disk heap tuple — toasted,
+// encoded and stamped — but not yet placed on a page.
+type preparedHeapTuple struct {
+	tuple storage.HeapTuple
+	bytes []byte
+}
+
+// prepareHeapTuple is writeHeapRowReturning's first half, PG's
+// heap_prepare_insert (heapam.c): TOAST the oversized values, encode the row
+// and stamp the header. COPY's multi-insert flush prepares a whole batch
+// before placing any of it, as heap_multi_insert does, because the number of
+// pages a bulk extension asks for is computed from the prepared tuples'
+// lengths (M0146-0009h).
+func prepareHeapTuple(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (preparedHeapTuple, error) {
+	var none preparedHeapTuple
 
 	// M0093: lazily materialise the transaction's XID before any
 	// xmin stamp. ToastLargeColumnsIfNeeded may itself call
@@ -9417,14 +9438,14 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// top covers both the TOAST writes and the main-heap NewHeapTuple
 	// below.
 	if err := ctx.MaterializeWriterXID(); err != nil {
-		return ptr, err
+		return none, err
 	}
 
 	// TOAST oversized column values before encoding (M0046-0006).
 	var toastErr error
 	row, toastErr = ToastLargeColumnsIfNeeded(ctx, rel, cols, row)
 	if toastErr != nil {
-		return ptr, &ExecError{Code: "XX000", Message: toastErr.Error()}
+		return none, &ExecError{Code: "XX000", Message: toastErr.Error()}
 	}
 
 	// Always encode in PG-native physical format (M0111-0002): a single
@@ -9437,9 +9458,9 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		// so the SQLSTATE and message reach the client unchanged.
 		var ee *ExecError
 		if errors.As(encErr, &ee) {
-			return ptr, ee
+			return none, ee
 		}
-		return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
+		return none, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(row)
 	// xmin = the effective writer XID: inside an open savepoint this is the
@@ -9478,8 +9499,17 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	tuple.Header.SetCmin(ctx.GetCurrentCommandId(true))
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
-		return ptr, err
+		return none, err
 	}
+	return preparedHeapTuple{tuple: tuple, bytes: tupleBytes}, nil
+}
+
+// placeHeapTuple is writeHeapRowReturning's second half: choose a page with
+// room for the prepared tuple — PG's RelationGetBufferForTuple (hio.c) — add
+// it there and WAL-log the insert.
+func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple) (storage.ItemPointer, error) {
+	var ptr storage.ItemPointer
+	tuple, tupleBytes := pt.tuple, pt.bytes
 
 	// Emits the native RecordKindHeapInsert WAL record so the logical
 	// decoder sees the change.
@@ -9498,6 +9528,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// which upstream also exempts from the fillfactor test (hio.c:859 checks
 	// only that the tuple physically fits) — otherwise a low-fillfactor table
 	// could reject its own brand-new page and extend forever.
+	// appendedToEmpty reports whether the last successful tryAppendToBlock
+	// put the tuple on a page that held none — heap_multi_insert's
+	// starting_with_empty_page, which the bulk path's page plan reads.
+	appendedToEmpty := false
 	tryAppendToBlock := func(blk storage.BlockNumber, reserve int) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -9533,7 +9567,9 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 			ctx.Pool.Unpin(slot)
 			return false, nil
 		}
+		wasEmpty := int(storage.MustHeader(slot.Page()).Lower()) == storage.SizeOfPageHeaderData
 		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
+			appendedToEmpty = wasEmpty
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 			// Update FSM with remaining free space (M0046-0003).
 			if ctx.FSM != nil {
@@ -9573,6 +9609,14 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// The FSM stores pd_upper-pd_lower, one line pointer more than
 	// PageGetHeapFreeSpace reports, so the search threshold adds it back.
 	minFreeBytes := uint16(targetFreeSpace + 4) // 4 = itemIDSize (line pointer size)
+
+	// A COPY's bulk insert state replaces the cascade below with PG's
+	// bistate page choice: current page, the bulk extension's next free
+	// page, the FSM, then a ramped extension (M0146-0009h).
+	if bs := ctx.bulkInsert; bs != nil && bs.rel == rel {
+		err := bs.place(ctx, targetFreeSpace, tryAppendToBlock, func() bool { return appendedToEmpty })
+		return ptr, err
+	}
 	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
 		appended, err := tryAppendToBlock(fsmBlk, targetFreeSpace)
 		if err != nil {

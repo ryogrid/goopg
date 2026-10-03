@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/mb"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // IsBinaryFormat reports whether the COPY options select binary format.
@@ -261,7 +262,30 @@ type CopyFromExecutor struct {
 	// whole default/constraint sequence below rather than paying a
 	// per-row cost for work that can never fire. M0134-0005l.
 	needsConstraints bool
+
+	// PG's CopyMultiInsertBuffer and BulkInsertState (copyfrom.c,
+	// M0146-0009h). multiInsert is CopyFrom's CIM_MULTI: rows are buffered
+	// and flushed in batches of MAX_BUFFERED_TUPLES rows or MAX_BUFFERED_BYTES
+	// of input lines, each batch prepared before any of it is placed. bulk
+	// lives for the whole COPY and drives page choice and relation extension
+	// for every heap write it makes, batched or not.
+	multiInsert bool
+	batch       []Row
+	batchBytes  int
+	// lineLen is the current input record's length without its line end —
+	// the size CopyMultiInsertInfoStore counts (cstate->line_buf.len); 0 for
+	// binary input.
+	lineLen int
+	bulk    *bulkInsertState
 }
+
+// copyMaxBufferedTuples and copyMaxBufferedBytes are copyfrom.c's
+// MAX_BUFFERED_TUPLES and MAX_BUFFERED_BYTES: a multi-insert buffer is
+// flushed once it holds that many rows or that many bytes of input lines.
+const (
+	copyMaxBufferedTuples = 1000
+	copyMaxBufferedBytes  = 65535
+)
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
 // Returns an error when plan is wrong-shape, the endpoint is
@@ -366,6 +390,7 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 		missing:          missing,
 		needsConstraints: needsConstraints,
 		srcEnc:           srcEnc,
+		multiInsert:      copyUsesMultiInsert(ctx, plan.Table, cols, missing),
 	}
 }
 
@@ -393,6 +418,7 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 	if c.format.csv {
 		return c.pushCsvLine(line)
 	}
+	c.lineLen = len(trimCopyLineCR(line))
 	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
@@ -435,6 +461,7 @@ func (c *CopyFromExecutor) pushCsvLine(line []byte) error {
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("%v", err)}
 	}
+	c.lineLen = len(trimCopyLineCR(line))
 	return c.insertSourceRow(src)
 }
 
@@ -446,7 +473,7 @@ func (c *CopyFromExecutor) Finish() error {
 		c.csvPartial = c.csvPartial[:0]
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: "unterminated CSV quoted field"}
 	}
-	return nil
+	return c.flushBatch()
 }
 
 // InCsvQuotedField reports whether the reader is mid-record inside a
@@ -559,8 +586,21 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		}
 	}
 
-	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
+	if c.multiInsert {
+		// CopyMultiInsertInfoStore + CopyMultiInsertInfoIsFull.
+		c.batch = append(c.batch, row)
+		c.batchBytes += c.lineLen
+		c.rowsIn++ // accepted; written by the flush
+		if len(c.batch) >= copyMaxBufferedTuples || c.batchBytes >= copyMaxBufferedBytes {
+			return c.flushBatch()
+		}
+		return nil
+	}
+	// CIM_SINGLE: table_tuple_insert through the statement's bistate.
+	rel, bs := c.bulkState()
+	c.ctx.bulkInsert = bs
 	ptr, err := writeHeapRowReturning(c.ctx, rel, c.cols, row)
+	c.ctx.bulkInsert = nil
 	if err != nil {
 		return err
 	}
@@ -570,6 +610,60 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 	// return zero rows for COPY-loaded data.
 	maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
 	c.rowsIn++
+	return nil
+}
+
+// bulkState returns the target relation and the COPY's bulk insert state,
+// created on first use.
+func (c *CopyFromExecutor) bulkState() (storage.RelFileNode, *bulkInsertState) {
+	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
+	if c.bulk == nil || c.bulk.rel != rel {
+		c.bulk = newBulkInsertState(rel)
+	}
+	return rel, c.bulk
+}
+
+// flushBatch is CopyMultiInsertBufferFlush (copyfrom.c): heap_multi_insert
+// the buffered rows — prepare every tuple, then place them in order through
+// the bulk insert state, whose extensions are sized by what the rest of the
+// batch needs — and then insert their index entries.
+func (c *CopyFromExecutor) flushBatch() error {
+	if len(c.batch) == 0 {
+		return nil
+	}
+	batch := c.batch
+	c.batch, c.batchBytes = nil, 0
+	rel, bs := c.bulkState()
+	prepared := make([]preparedHeapTuple, len(batch))
+	lens := make([]int, len(batch))
+	for i, row := range batch {
+		pt, err := prepareHeapTuple(c.ctx, rel, c.cols, row)
+		if err != nil {
+			return err
+		}
+		prepared[i], lens[i] = pt, len(pt.bytes)
+	}
+	ff := c.ctx.heapFillfactor(rel)
+	if ff <= 0 {
+		ff = storage.HeapDefaultFillfactor
+	}
+	bs.beginBatch(lens, storage.BlockSize*(100-ff)/100)
+	c.ctx.bulkInsert = bs
+	ptrs := make([]storage.ItemPointer, len(batch))
+	var err error
+	for i := range prepared {
+		if ptrs[i], err = placeHeapTuple(c.ctx, rel, prepared[i]); err != nil {
+			break
+		}
+	}
+	c.ctx.bulkInsert = nil
+	bs.endBatch()
+	if err != nil {
+		return err
+	}
+	for i, row := range batch {
+		maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptrs[i])
+	}
 	return nil
 }
 
@@ -604,12 +698,18 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 	}
 	c.binaryBuf = c.binaryBuf[consumed:]
 
+	c.lineLen = 0
 	for _, src := range rows {
 		// Same per-row work as the text/CSV path: PG's CopyFrom() applies
 		// defaults and ExecConstraints for every format, so a binary stream
 		// must not be a way around NOT NULL / CHECK / DEFAULT (EC-4).
 		if storeErr := c.storeCopyRow(c.scatterSourceRow(src)); storeErr != nil {
 			return false, storeErr
+		}
+	}
+	if trailerFound {
+		if err := c.flushBatch(); err != nil {
+			return false, err
 		}
 	}
 	return trailerFound, nil

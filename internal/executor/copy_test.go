@@ -134,6 +134,10 @@ func TestCopyFromExecutorRoundTrip(t *testing.T) {
 	if err := cf.PushLine([]byte("20\tworld")); err != nil {
 		t.Fatal(err)
 	}
+	// CopyDone: a multi-insert COPY writes its buffered rows at the end.
+	if err := cf.Finish(); err != nil {
+		t.Fatal(err)
+	}
 	if got := cf.RowsInserted(); got != 2 {
 		t.Errorf("RowsInserted=%d want 2", got)
 	}

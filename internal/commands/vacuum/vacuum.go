@@ -364,11 +364,33 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 	// this a no-op rather than an unsafe truncate.
 	if opts.Truncate {
 		keep := lastNonEmpty + 1
-		if keep < nBlocks {
-			_ = pool.TruncateRelationTail(rel, keep)
+		if keep < nBlocks && shouldAttemptTruncation(nBlocks, keep) {
+			if err := pool.TruncateRelationTail(rel, keep); err == nil {
+				// smgrtruncate truncates the FSM with the heap
+				// (FreeSpaceMapPrepareTruncateRel): a free-space entry
+				// left for a removed block sends the next insert past EOF.
+				opts.FSM.TruncateRel(rel, keep)
+			}
 		}
 	}
 	return stats, nil
+}
+
+// relTruncateMinimum and relTruncateFraction are vacuumlazy.c's
+// REL_TRUNCATE_MINIMUM and REL_TRUNCATE_FRACTION.
+const (
+	relTruncateMinimum  = 1000
+	relTruncateFraction = 16
+)
+
+// shouldAttemptTruncation is vacuumlazy.c's should_attempt_truncation: give
+// back a relation's empty tail only when it is at least REL_TRUNCATE_MINIMUM
+// pages or 1/REL_TRUNCATE_FRACTION of the relation. A smaller tail — such as
+// the unused pages of a COPY's last bulk extension (M0146-0009h) — stays.
+func shouldAttemptTruncation(relPages, nonemptyPages storage.BlockNumber) bool {
+	possiblyFreeable := relPages - nonemptyPages
+	return possiblyFreeable > 0 &&
+		(possiblyFreeable >= relTruncateMinimum || possiblyFreeable >= relPages/relTruncateFraction)
 }
 
 // AnalyzeStats is the v0 ANALYZE output. Sampling and per-column
