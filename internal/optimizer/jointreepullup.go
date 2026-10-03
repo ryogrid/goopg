@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -534,51 +533,6 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 	return bodyCtx, leafScans, widths, onQuals, "", true
 }
 
-// pullupCTELeafEnabled gates M0145-0011 scope (c) / E2: admitting a
-// `*CTEScan` leaf into the flat splice `flattenPulledBodyTree` performs,
-// instead of declining the whole body with `body-leaf-(*optimizer.CTEScan)`.
-//
-// Default OFF. It is knob-arm measurement apparatus, not a relaxation:
-// M0145-0011 lands none, and the default arm must stay byte-identical.
-//
-// At landing it was useless on its own and had to be paired with
-// `GOOPG_DERIVED_FIREWALL=off`: a pulled ANY/EXISTS body becomes a
-// JoinSemi/JoinAnti SpecialJoinInfo, and the `outer-over-derived` firewall's
-// jointype switch covered Semi/Anti, so a body admitted here declined one
-// step later at the firewall. M0145-0018 removed that firewall, so the
-// pairing requirement is gone and this flag stands alone.
-//
-// Why a CTE leaf is the interesting case: the baseline census over TPC-DS
-// makes `any-body-leaf-(*optimizer.CTEScan)` the largest non-`(pulled)`
-// decline class (30 fires), and every one of those is an ANY sublink whose
-// body FROM is a WITH reference — a derived input with no catalog statistics,
-// which is exactly the population M0145-0011 exists to re-measure rather than
-// argue about.
-//
-// MEASURED RESULT, and it is the reason this flag must not be read as a
-// relaxation that works (E2, loop 41, TPC-DS SF0.25, both flags on):
-//
-//	pull-up census   any-body-leaf-(*optimizer.CTEScan) 30 -> 0, (pulled) 42 -> 72
-//	seam census      leaf-count -> pulled-leaf-not-scan, same statements
-//
-// Every body this gate admits is declined ONE STEP LATER by the seam's own
-// leaf-kind check (`pulled-leaf-not-scan`, joinsearchseam.go), whose comment
-// names THIS function as its guarantor. The bare-`*SeqScan` rule is a
-// TWO-SITE invariant — a producer and a consumer — so relaxing it here alone
-// cannot put a CTE leaf into the DP. What it does instead is let `pulled`
-// suppress the legacy pre-DP arm while the seam still declines, which is the
-// exact shape that cost TPC-H Q4 a 10x regression; Q14/Q23/Q95 moved plans
-// for that reason and not because the search found anything (values
-// byte-identical, runtimes flat-to-slightly-worse at 13.1->14.5 s,
-// 15.0->15.5 s, 3.0->3.2 s, against ESTIMATED costs that fell 1.4x-2.4x).
-//
-// So the resume point for scope (c) is the seam, not this line: the pulled
-// leaf binding at joinsearchseam.go needs a `rangeBinding` for a leaf with no
-// `Table`/`Alias`, plus an `estimateBaseRelInfo`/`applyRelSizeFallback` arm
-// for a statistics-less leaf. That is a real piece of work, not a gate flip —
-// filed as M0145-0013 (owner directive 2026-09-21).
-var pullupCTELeafEnabled = os.Getenv("GOOPG_PULLUP_CTE_LEAF") == "on"
-
 // flattenPulledBodyTree decomposes the body's provisional jointree into
 // its leaf scans plus the conjuncts of its inner-join ON clauses. Any
 // non-inner link, any leaf that is not a bare *SeqScan (a demoted outer
@@ -618,10 +572,13 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, string, b
 		if _, isScan := l.(*SeqScan); isScan {
 			continue
 		}
-		if pullupCTELeafEnabled {
-			if _, isCTE := l.(*CTEScan); isCTE {
-				continue
-			}
+		// A `*CTEScan` is a base rel of the pulled jointree, as PG's CTE
+		// RTE is: `seamLeafBinding` admits it and prices it from its body
+		// (M0145-0013). M0145-0011 scope (c) measured it behind a default-off
+		// knob; M0145-0008ac promoted it once the parameterised inner it
+		// needs through a join existed (M0146-0049d).
+		if _, isCTE := l.(*CTEScan); isCTE {
+			continue
 		}
 		// The leaf kind is named because it decides the remedy: a
 		// *Filter over a scan needs unwrapping, a derived item needs

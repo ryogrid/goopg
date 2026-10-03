@@ -15,7 +15,9 @@ import (
 // eqjoinsel_semi punts to 0.5; the clamp turns that into inner rows / nd1.
 // The CTE body is a grouped JOIN, TPC-DS Q23's frequent_ss_items shape, so
 // its grouping column has no statistics on either engine (PG's
-// examine_simple_variable stops at a multi-key GROUP BY).
+// examine_simple_variable stops at a multi-key GROUP BY). PG 18.3 plans it
+// Hash Join(zc, Hash(HashAggregate(CTE Scan f))) at rows=15015, and so does
+// goopg once the CTE leaf is pulled up (M0145-0008ac).
 func TestSemiJoinSizeClampedByInnerJoin(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
@@ -40,14 +42,18 @@ func TestSemiJoinSizeClampedByInnerJoin(t *testing.T) {
 		}
 		r, _ := strconv.ParseFloat(m[2], 64)
 		switch {
-		case strings.Contains(m[1], "Semi Join") && semi < 0:
+		case strings.Contains(m[1], "Join") && semi < 0:
+			// The first join printed is the IN's: a Semi Join, or — since
+			// M0145-0008ac pulls the CTE reference up as a base rel — PG's
+			// Hash Join over a unique-ified inner (JOIN_UNIQUE_INNER), both
+			// sized as the semi joinrel.
 			semi = r
 		case strings.HasPrefix(m[1], "HashAggregate") && cte < 0:
 			cte = r // the CTE body's group estimate
 		}
 	}
 	if semi < 0 || cte < 0 {
-		t.Fatalf("expected a semi join over the CTE:\n%s", strings.Join(lines, "\n"))
+		t.Fatalf("expected the IN's join over the CTE:\n%s", strings.Join(lines, "\n"))
 	}
 	// Ssemi = min(0.5 punt, N2 * 1/max(nd1, nd2)) with nd1 = 8000 measured.
 	want := 100000 * math.Min(0.5, cte/8000)

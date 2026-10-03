@@ -973,7 +973,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// a producer admitting `*CTEScan` leaves made every one of them die
 	// HERE instead, so the two sites are one invariant and are relaxed
 	// together in `seamLeafBinding` (M0145-0013): a `*CTEScan` leaf (the
-	// producer admits one only under `GOOPG_PULLUP_CTE_LEAF=on`), or a
+	// producer admits one unconditionally since M0145-0008ac), or a
 	// derived ANY body's single leaf (M0145-0008aa), binds with no catalog
 	// table and prices from its plan.
 	//

@@ -171,13 +171,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_INCREMENTAL_SORT": func(v string) string {
 		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
 	},
-	// M0145-0011 scope (c) (jointreepullup.go): admits a `*CTEScan` leaf into
-	// the pulled body's flat splice. Default OFF, and plan-SHAPING, so it is
-	// registered here rather than exempted. (It joined paired with
-	// GOOPG_DERIVED_FIREWALL=off — a pulled CTE leaf was otherwise declined
-	// by the `outer-over-derived` firewall. M0145-0018 removed the firewall,
-	// so the flag now stands alone.)
-	"GOOPG_PULLUP_CTE_LEAF": func(v string) string { return onOff(v == "on") },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -260,10 +253,9 @@ var flagProvenanceOrder = []string{
 	// (relfromjoinlist.go). Retired at M0145-0018 — see
 	// flagProvenanceRetired below.
 	"GOOPG_DERIVED_FIREWALL",
-	// Joined at M0145-0011 scope (c): admits `*CTEScan` leaves into the
-	// pulled-body splice (jointreepullup.go). Default `off`. Plan-SHAPING;
-	// it joined paired with GOOPG_DERIVED_FIREWALL=off and stands alone
-	// since M0145-0018 removed the firewall.
+	// Joined at M0145-0011 scope (c): admitted `*CTEScan` leaves into the
+	// pulled-body splice (jointreepullup.go). Retired at M0145-0008ac — see
+	// flagProvenanceRetired below.
 	"GOOPG_PULLUP_CTE_LEAF",
 	// Joined at M0145-0012: gates the goopg-only `rows<=1` CTE fallback in
 	// `initialRelRows` (joinsearch.go). Retired at M0145-0012 — see
@@ -342,6 +334,13 @@ var flagProvenanceRetired = map[string]string{
 	// arm itself for plan parity (PG's set_cte_size_estimates keeps the
 	// collapsed estimate), so nothing reads the variable.
 	"GOOPG_CTE_ROWS_FALLBACK": "M0145-0012",
+	// M0145-0011 scope (c)'s `*CTEScan` pulled-leaf admission, default off
+	// while the seam could not price the leaf (M0145-0013 built that arm)
+	// and while the pulled shape had no parameterised inner through a join
+	// (M0146-0049d built it). M0145-0008ac promoted it — PG pulls a CTE
+	// reference in a sublink body up like any other base rel — so the
+	// admission is unconditional and nothing reads the variable.
+	"GOOPG_PULLUP_CTE_LEAF": "M0145-0008ac",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a
