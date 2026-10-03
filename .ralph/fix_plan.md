@@ -18057,7 +18057,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Q20\'s `ps\_availqty > \(SubPlan\)` filter now runs above the Gather,
       unprinted; PG keeps it on the `partsupp` scan \(ledgered\).
   Movement: none — TPC-H PLAN-PARITY match 3 -> 3; join-method 11 -> 10 inside the noise band
-- [!] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
+- [ ] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
   \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
   PG pulls a CTE reference in a simple sublink body up like any base rel;
   goopg admits it only behind the default\-off knob. Promoting it moves
@@ -18093,6 +18093,12 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       preserved patch and re\-run the fire set at SF0\.25 and SF1. The
       same blocker gates M0145\-0008y, so unblocking it clears two
       items.
+  - **Blocker landed 2026\-10\-03 \(M0146\-0049d, re\-opened per the owner
+    answer above\):** parameterised inner paths through a join exist —
+    `addParameterizedHashJoinPaths` \(paramjoin\.go\) plus the executor
+    prerequisites \(0049d1 empty\-inner exit, 0049d2 CTE materialised once
+    under a LATERAL\)\. Next: re\-apply the preserved patch and re\-run the
+    fire set at SF0\.25 and SF1, as the owner answer directs\.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
@@ -24556,7 +24562,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Filed M0146\-0049 \(the missing feature\); 0005dp marked `\[\!\]` on it\.
       Design `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
     Movement: none — recon
-- [!] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [ ] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q95: PG NL Semi Join\(CTE ws\_wh\) over NL Semi Join\(parameterised Hash Join\(ws\_wh\_1, IOS web\_returns\_pkey\)\); goopg hashes the 1\.75M\-row CTE twice \(187888 vs 141550\)\.
   Kind: impl
   Parent: M0146\-0005
@@ -24570,6 +24576,10 @@ M0146-0001 re-baseline census on the new default arm.
     measured its SF1 timeout: without a parameterised inner through the
     hash join the semi inner rescans 3M rows per outer row\. Re\-select when
     M0146\-0049 lands \(and re\-apply 0008ac\'s patch with it\)\.
+  - **Unblocked 2026\-10\-03:** M0146\-0049d landed \(the parameterised hash
+    join inner and its executor prerequisites\)\. Sequenced after
+    M0145\-0008ac, whose patch supplies the CTE\-leaf pull\-up this shape
+    needs\.
 - [x] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
   that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
   leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
@@ -26844,7 +26854,7 @@ M0146-0001 re-baseline census on the new default arm.
     clauses, then generate\_join\_implied\_equalities\' EC clauses\. A sibling
     of `equivalenceClausesLast` \(local\_filters\.go\), which does this for
     scan quals, is the likely shape\.
-- [ ] **M0146\-0049 — a parameterised inner path through a non\-scan node**
+- [!] **M0146\-0049 — a parameterised inner path through a non\-scan node**
   \(filed 2026\-10\-03 by recon M0146\-0005dt\)\. PG binds a nested loop\'s
   parameters into ANY inner subtree \(`create\_nestloop\_plan` /
   `replace\_nestloop\_params`, createplan\.c:4341 / :5036; ExecReScan
@@ -26872,6 +26882,41 @@ M0146-0001 re-baseline census on the new default arm.
     right subtree probing by an `OuterColumnRef` key, rescanned per outer row
     \(the rescan\-staleness risk M0146\-0012 names\)\.
   - Design: `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
+
+  > ## ESCALATION 2026\-10\-03 \(S4\) — M0146\-0049 lineage budget exhausted, OWNER DECISION NEEDED
+  >
+  > - **Budget:** the last five completed descendants show `Movement: none`:
+  >   0049c, 0049d, 0049d1, 0049d2, 0049d3\. No further child may be filed
+  >   or selected; 0049e and 0049f stay open but unselectable under `\[\!\]`\.
+  > - **What was built / proved:** a parameterised Append over a flattened
+  >   UNION ALL leaf \(b\+c: Q54\'s `my\_customers` subtree takes PG\'s
+  >   shape, 19832 → 8561 vs PG 6537\); ExecHashJoin\'s empty\-inner exit
+  >   and outer prefetch \(d1\); an uncorrelated CTE under a LATERAL
+  >   materialised once, which also fixed a wrong result \(d2\); parameterised
+  >   hash join paths bound into a lateral nested loop \(d3: PG\'s plan, cost
+  >   and EXPLAIN ANALYZE on the reproducer\)\. Values held at every step
+  >   \(sweep 96/96, TPC\-H arm 24/24, fire set with no regression\)\.
+  > - **Why the instruments did not move:** the plan\-parity classifier
+  >   compares whole query shapes, and each witness still diverges
+  >   elsewhere — Q54 at its Parallel Seq Scan outer \(0049e\) and a bitmap
+  >   probe where PG index\-scans; Q95 is not reached on the default arm at
+  >   all, because its semi RHS is a CTE leaf only M0145\-0008ac\'s pull\-up
+  >   admits\.
+  > - **Remaining blockers:** \(1\) M0145\-0008ac, now re\-opened per the
+  >   2026\-09\-25 owner answer \(a separate lineage\) — the step most likely
+  >   to move Q95; \(2\) 0049e, a parallel\-safe parameterised Append for
+  >   Q54\'s Gather; \(3\) unfiled because of this budget: a parameterised
+  >   index\-only probe costs about twice PG\'s \(16\.27 vs 8\.30 on the d3
+  >   dataset\), which turns PG\'s index\-only/index probes into bitmap
+  >   probes \(Q54\'s web\_sales member, the d3 test\); ledgered\.
+  > - **Expected movement if unblocked:** Q95 `join\-order`/`join\-method`
+  >   at both scales via 0008ac; Q54 `parallelism` via 0049e; `scan\-type`
+  >   on the probe\-cost witnesses\.
+  > - **Size:** 0008ac is a preserved patch plus the fire\-set gate; 0049e
+  >   is one slice; the probe\-cost item is a recon then a cost fix\.
+  > - **Owner decision needed:** re\-open M0146\-0049 \(or re\-pin its
+  >   LINEAGE\-BASELINE\) to allow 0049e and the probe\-cost task, or leave
+  >   it held while 0008ac measures the through\-a\-join half on Q95\.
   - [x] **M0146\-0049a — recon: the executor substrate runs PG\'s
     parameterised Append** \(2026\-10\-03\)\.
     Kind: recon
@@ -26921,7 +26966,7 @@ M0146-0001 re-baseline census on the new default arm.
         \(no timeouts\), TPC\-H arm, ea\-ratchet 10/10, regress 9 suites
         byte\-identical\.
     Movement: none — Q54\'s categories unchanged \(serial outer vs PG\'s Parallel Seq Scan; web\_sales bitmap vs PG Index Scan\); match flat, ea\-ratchet 10/10
-  - [ ] **M0146\-0049d — a parameterised inner through a join** \(filed
+  - [x] **M0146\-0049d — a parameterised inner through a join** \(filed
     2026\-10\-03\)\. Q95: PG\'s parameterised Hash Join on the semi inner
     \(ws\_wh\_1 ⋈ IOS web\_returns\_pkey, probed by the outer\'s
     ws\_order\_number\); the unblocker of M0146\-0005dq and M0145\-0008ac\.
@@ -26941,6 +26986,10 @@ M0146-0001 re-baseline census on the new default arm.
       Semi Join over the full join\.
     - The executor had two gaps that would make that plan time out exactly
       as M0145\-0008ac did; split into slices d1–d3 below\.
+    - **DONE 2026\-10\-03** \(d1 `d2fdb535a`, d2 `cd1dbec34`, d3\)\. Q95
+      itself moves only when M0145\-0008ac re\-applies its pull\-up patch,
+      now unblocked; M0146\-0005dq likewise\.
+    Movement: none — the through\-a\-join path is reachable by default only through M0145\-0008ac\'s CTE\-leaf pull\-up
     - [x] **M0146\-0049d1 — ExecHashJoin\'s empty\-inner exit and outer
       prefetch** \(2026\-10\-03, `d2fdb535a`\)\. goopg\'s hash join always read its whole
       probe side, even over an empty hash table; PG returns without
@@ -26979,7 +27028,7 @@ M0146-0001 re-baseline census on the new default arm.
           once per outer row \(5 distinct values; PG 1\)\.
         - Side finding filed as M0146\-0050 \(S2\)\.
       Movement: none — executor re\-materialisation; plans unchanged
-    - [ ] **M0146\-0049d3 — parameterised hash join paths and their
+    - [x] **M0146\-0049d3 — parameterised hash join paths and their
       nested\-loop lowering** \(filed 2026\-10\-03\)\. The producer above,
       `get\_parameterized\_joinrel\_size` with `get\_joinrel\_parampathinfo`\'s
       moved clauses \(the EC\-derived `pjo\.k = pjbig\.ord` join filter\), and
@@ -26990,6 +27039,21 @@ M0146-0001 re-baseline census on the new default arm.
       - Expected movement \(S5\): the reproducer above; Q95 only with
         M0145\-0008ac\'s patch re\-applied \(its semi RHS is a CTE leaf the
         default pipeline does not pull up\)\.
+      - **LANDED 2026\-10\-03\.** `addParameterizedHashJoinPaths` /
+        `parameterizedJoinrelSize` / `createNestLoopParamJoinPlan`
+        \(paramjoin\.go\); the NL arm\'s probe binding is shared with 0049c
+        as `bindParamProbe` \(index and bitmap probes\)\.
+        - The reproducer now plans PG\'s NL Semi Join\(outer, Hash
+          Join\(pjbig, Hash\(Index Only Scan pjret\_pkey, `ord = pjo\.k`\)\)\),
+          cost 7279\.58 vs PG 7279\.63; EXPLAIN ANALYZE over 7 outer rows
+          matches PG node for node \(probe side read 5 times: d1\'s exit\)\.
+        - `TestParameterisedHashJoinInner` \(semi, anti, inner values\)\.
+        - Not reproduced: PG\'s EC\-regenerated `Join Filter: \(pjo\.k =
+          pjbig\.ord\)` \(hash join rows 4 vs PG 1\); Memoize over the
+          inner; non\-INNER parameterised joins \(ledgered\)\.
+        - No TPC\-DS plan moves by default \(fire set: no changed query at
+          either scale\): Q95 needs M0145\-0008ac\'s pull\-up\.
+      Movement: none — no default\-arm plan reaches it until M0145\-0008ac re\-applies its patch
   - [ ] **M0146\-0049e — a partial outer drives the parameterised Append**
     \(filed 2026\-10\-03 by 0049c\)\. PG\'s Q54 runs Gather → NL\(Parallel Seq
     Scan item, Append\(param probes\)\); goopg\'s `PathParamAppend` is not

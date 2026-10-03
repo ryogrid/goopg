@@ -1,6 +1,6 @@
 # M0146-0049 — a parameterised inner path through a non-scan node
 
-Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`), (d1) (`d2fdb535a`) and (d2) (`cd1dbec34`) landed 2026-10-03. Parent: M0146
+Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`), and (d) — d1 (`d2fdb535a`), d2 (`cd1dbec34`), d3 (`6667e4a72`) — landed 2026-10-03; (e) and (f) open. Parent: M0146
 (banner item 3: owner-named next in the structural line, the blocker of
 M0146-0005dp/dq and M0145-0008ac/0008y).
 Background: `docs/design/0100-0149/m0146-0005dt-parameterised-append-recon.md`.
@@ -236,6 +236,59 @@ correlated scalar subplan replays its first execution: goopg answers
 `2,2,2` where PG answers `2,4,6`. It predates d2 (a HEAD build gives the
 same answer). Subplan re-execution never resets `CTERowCache`.
 
+### Slice (d3) — the parameterised hash join and its nested loop (landed, `6667e4a72`)
+
+**Producer** (`addParameterizedHashJoinPaths`, paramjoin.go). This is
+`hash_inner_and_outer`'s parameterised pairing. It runs after the serial
+hash arm and handles INNER joins with no unique-ified side.
+
+- It pairs `[CheapestTotal] ++ CheapestParameterized` of the two rels,
+  skipping the all-unparameterised pair and any input parameterised by
+  the other side.
+- Every parameterised input must be a plain index probe or a bitmap heap
+  scan over one bitmap index scan, with equality clauses.
+- A pair is admitted when `calc_non_nestloop_required_outer` overlaps
+  the joinrel's `param_source_rels` (`try_hashjoin_path`).
+- Cost is `hashJoinCost` over the input paths. Rows come from
+  `parameterizedJoinrelSize`: `calcJoinrelSize` over the paths' rows, plus
+  the clauses joining a required-outer rel to the joinrel that no probe
+  applies, capped by the joinrel's rows
+  (`get_parameterized_joinrel_size`).
+- `probeEnforcedClauses` reports a parameterised hash join as enforcing
+  what its probes enforce, so the nested loop drops those clauses from its
+  residual.
+
+**Lowering** (`createNestLoopParamJoinPlan`). It emits R25's
+`Join{Algo: NestedLoop, Lateral: true}` over the hash join. The probes
+sit below the hash join, and the outer's layout is only final after
+`joinInputsFor` narrows it. So the loop hangs a sink on every
+parameterised path of the inner (`Path.paramSink`, PG's create_plan-time
+`curOuterRels`). `createPlanNode`'s index and bitmap arms record the probe
+nodes there, and `createHashJoinPlan` accepts a parameterised path only
+under such a sink. After the build, `bindParamProbe` rebinds each probe's
+keys as level-1 `OuterColumnRef`s. For a bitmap probe the recheck goes on
+the heap scan's `Cond`. `bindParamProbe` is 0049c's per-member binding,
+extracted and shared.
+
+**Effect.** The reproducer plans PG's shape and cost (7279.58 against
+PG's 7279.63), and EXPLAIN ANALYZE over 7 outer rows matches PG node for
+node. The probe side is read 5 times, because d1's empty-inner exit skips
+the other two. `TestParameterisedHashJoinInner` covers the semi, anti and
+inner forms. No TPC-DS plan moves by default, and the fire set saw no
+changed query at either scale. Q95's semi RHS reaches the search only
+through M0145-0008ac's CTE-leaf pull-up, which this unblocks.
+
+**Not reproduced (ledgered).**
+- PG's EC-regenerated `Join Filter: (pjo.k = pjbig.ord)`
+  (`get_joinrel_parampathinfo`'s dropped-EC arm). goopg's hash join
+  estimates rows=4 where PG estimates 1.
+- Memoize over a join inner.
+- Parameterised merge and nested-loop join results.
+- Non-INNER parameterised joins.
+- A parameterised index-only probe costs about twice PG's (16.27 against
+  8.30), so goopg picks a bitmap probe where PG keeps the index-only scan.
+  Filed as M0146-0049g.
+
 ## Remaining slices
 
 - **(b)** Per-member parameterised index paths for a flattened UNION ALL
@@ -248,9 +301,8 @@ same answer). Subplan re-execution never resets `CTERowCache`.
   NL path generation also needs to accept it as an inner, and it lowers
   to `Join{Lateral}` over `Append{param probes}`.
 - **(d)** The through-a-join case: Q95's parameterised Hash Join on the
-  semi inner (M0146-0049d). d1 and d2 have landed (above). Still open:
-  d3, the parameterised hash join producer, its sizer and its nested-loop
-  lowering.
+  semi inner (M0146-0049d). d1, d2 and d3 have all landed (above). Q95
+  moves with M0145-0008ac's re-applied pull-up.
 - **(e)** Parallel: a partial outer driving the parameterised Append
   (PG's Q54 Gather). `PathParamAppend` is not parallel-safe yet
   (M0146-0049e).
