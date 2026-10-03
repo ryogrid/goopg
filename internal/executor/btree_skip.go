@@ -28,6 +28,16 @@ type btreeSkipEnum struct {
 	seek      []byte // lo bound for the next group's first entry (nil = index start)
 	seekExcl  bool   // seek is exclusive (tuple pivots; blob successors are inclusive)
 	done      bool   // enumeration exhausted (or impossible — e.g. a NULL bound)
+
+	// The leaf walk's state (walkLeaf, tuple format only): the cursor, and
+	// the current prefix group's probe (prefix || bound columns) and pivot
+	// (prefix alone), with whether the walk has reached and passed the
+	// probe's range inside that group.
+	walkCur  *nbtree.ScanCursor
+	gProbe   []byte
+	gPivot   []byte
+	gReached bool
+	gPassed  bool
 }
 
 // init evaluates the bound columns ONCE per Rescan — the same eval timing
@@ -120,22 +130,9 @@ func (e *btreeSkipEnum) next(ctx *Context, tree *nbtree.BTree, idx *catalog.Inde
 			return nil, nil, false, nil
 		}
 		if e.desc != nil {
-			datums, derr := pgIndexTupleKeyDatums(e.desc, e.keyCols, first)
-			if derr != nil {
-				return nil, nil, false, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
-					"%s: skip scan on index %q could not decode a prefix entry: %v", op, idx.Name, derr)}
-			}
-			parts := make([]indexProbeKeyPart, 0, s+len(e.rest))
-			for i := 0; i < s; i++ {
-				parts = append(parts, indexProbeKeyPart{col: e.keyCols[i], val: datums[i], pos: pos})
-			}
-			probe, encErr := ctx.indexProbeKey(idx, append(parts, e.rest...))
-			if encErr != nil {
-				return nil, nil, false, encErr
-			}
-			succ, encErr := ctx.indexProbeKey(idx, parts)
-			if encErr != nil {
-				return nil, nil, false, encErr
+			probe, succ, gerr := e.groupBounds(ctx, idx, s, first, pos, op)
+			if gerr != nil {
+				return nil, nil, false, gerr
 			}
 			e.seek = succ
 			e.seekExcl = true
@@ -171,4 +168,129 @@ func (e *btreeSkipEnum) next(ctx *Context, tree *nbtree.BTree, idx *catalog.Inde
 		return loKey, hiKey, true, nil
 	}
 	return nil, nil, false, nil
+}
+
+// groupBounds builds, from one entry of a prefix group (tuple format), the
+// group's probe — the entry's skipPrefix attributes joined with the bound
+// columns, one pivot whose range [probe, probe] is the group's matches — and
+// its pivot, the prefix alone: an entry is still in the group exactly while
+// CompareHighBound(entry, pivot) <= 0, and the next group starts strictly past it.
+func (e *btreeSkipEnum) groupBounds(ctx *Context, idx *catalog.Index, s int, key []byte, pos int, op string) (probe, pivot []byte, err error) {
+	datums, derr := pgIndexTupleKeyDatums(e.desc, e.keyCols, key)
+	if derr != nil {
+		return nil, nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"%s: skip scan on index %q could not decode a prefix entry: %v", op, idx.Name, derr)}
+	}
+	parts := make([]indexProbeKeyPart, 0, s+len(e.rest))
+	for i := 0; i < s; i++ {
+		parts = append(parts, indexProbeKeyPart{col: e.keyCols[i], val: datums[i], pos: pos})
+	}
+	probe, encErr := ctx.indexProbeKey(idx, append(parts, e.rest...))
+	if encErr != nil {
+		return nil, nil, encErr
+	}
+	pivot, encErr = ctx.indexProbeKey(idx, parts)
+	if encErr != nil {
+		return nil, nil, encErr
+	}
+	return probe, pivot, nil
+}
+
+// canWalk reports whether the leaf walk applies: the tuple format, whose
+// entries the walk can compare against a group probe. The blob format keeps
+// the per-group descents of next.
+func (e *btreeSkipEnum) canWalk() bool { return e.desc != nil }
+
+// walkLeaf is the skip scan as PG 18 runs it (M0145-0008af): one leaf page
+// per call, every entry checked against the current prefix group's probe,
+// as `_bt_checkkeys` checks a skip array advanced to the entry's prefix
+// (`_bt_advance_array_keys`, nbtutils.c). Matching entries go to emit in
+// index order; emit returning false ends the walk.
+//
+// The per-group descent of next pays two root-to-leaf descents for every
+// distinct prefix value — for web_returns_pkey (wr_item_sk, wr_order_number)
+// probed on wr_order_number, 10619 prefixes over 17920 entries, that is
+// 226 ms where PG's scan reports one Index Search and takes 1 ms. PG starts a
+// new primitive index scan only when the next match lies beyond the current
+// page; the walk re-descends under the same condition, read off what one leaf
+// showed: when the whole leaf belonged to one group (no new group started on
+// it), the group may run on for many pages, so the walk descends straight to
+// the group's probe (not reached yet) or past the group (already passed)
+// instead of reading the group's remaining leaves. Otherwise it steps to the
+// sibling leaf. Dense prefixes therefore cost one sequential pass, sparse
+// ones a descent per group — the two regimes PG's runtime choice spans.
+//
+// more is false once the walk is exhausted (or emit stopped it).
+func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.Index, s, pos int, op string,
+	leafFilter func(storage.BlockNumber) bool, emit func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error)) (more bool, err error) {
+	if e.done {
+		return false, nil
+	}
+	if e.walkCur == nil {
+		cur, cerr := tree.NewScanCursor(e.seek, nil, e.seekExcl, false, leafFilter)
+		if cerr != nil {
+			return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
+		}
+		e.walkCur = cur
+	}
+	entries, newGroups := 0, 0
+	stopped := false
+	ok, nerr := e.walkCur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
+		entries++
+		if e.gPivot == nil || tree.CompareHighBound(key, e.gPivot) > 0 {
+			probe, pivot, gerr := e.groupBounds(ctx, idx, s, key, pos, op)
+			if gerr != nil {
+				return false, gerr
+			}
+			e.gProbe, e.gPivot = probe, pivot
+			e.gReached, e.gPassed = false, false
+			newGroups++
+		}
+		if e.gPassed || tree.CompareLowBound(key, e.gProbe) < 0 {
+			return true, nil
+		}
+		if tree.CompareHighBound(key, e.gProbe) > 0 {
+			e.gPassed = true
+			return true, nil
+		}
+		e.gReached = true
+		cont, eerr := emit(key, ptr, p)
+		if eerr != nil {
+			return false, eerr
+		}
+		if !cont {
+			stopped = true
+			return false, nil
+		}
+		return true, nil
+	})
+	if nerr != nil {
+		if ee, isExec := nerr.(*ExecError); isExec {
+			return false, ee
+		}
+		return false, &ExecError{Code: "XX000", Pos: pos, Message: nerr.Error()}
+	}
+	if stopped || !ok {
+		e.done = true
+		e.walkCur = nil
+		return false, nil
+	}
+	if entries > 0 && newGroups == 0 && e.gPivot != nil {
+		// The whole leaf was one group: jump instead of walking it.
+		var target []byte
+		excl := false
+		if e.gPassed {
+			target, excl = e.gPivot, true
+		} else if !e.gReached {
+			target = e.gProbe
+		}
+		if target != nil {
+			cur, cerr := tree.NewScanCursor(target, nil, excl, false, leafFilter)
+			if cerr != nil {
+				return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
+			}
+			e.walkCur = cur
+		}
+	}
+	return true, nil
 }

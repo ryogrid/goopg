@@ -452,7 +452,19 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.rangeBoundsSet {
 		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 	}
-	if skip != nil {
+	if skip != nil && skip.canWalk() {
+		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf) —
+		// the index scan's sibling walks the same groups lazily.
+		for {
+			more, err := skip.walkLeaf(ctx, tree, o.plan.Index, o.plan.SkipPrefix, o.plan.Pos(), "indexOnlyScanOp", leafFilter, scanPosFn)
+			if err != nil {
+				return err
+			}
+			if !more {
+				break
+			}
+		}
+	} else if skip != nil {
 		for {
 			lo, hi, ok, err := skip.next(ctx, tree, o.plan.Index, o.plan.SkipPrefix, o.plan.Pos(), "indexOnlyScanOp")
 			if err != nil {

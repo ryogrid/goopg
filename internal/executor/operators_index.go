@@ -1046,6 +1046,25 @@ func (o *indexScanOp) scanAppendEntry(_ []byte, ptr storage.ItemPointer, pos nbt
 // Gather-declined blocks, high-key recovery leaves, admitted leaves with
 // no in-range items — are consumed inside the loop.
 func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
+	if o.plan.SkipPrefix > 0 && o.skip.canWalk() {
+		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf),
+		// one leaf per call, matching entries appended to this batch.
+		for {
+			o.tids = o.tids[:0]
+			o.poss = o.poss[:0]
+			o.idx = 0
+			more, werr := o.skip.walkLeaf(o.ctx, o.tree, o.plan.Index, o.plan.SkipPrefix, o.plan.Pos(), "indexScanOp", nil, o.scanAppendEntry)
+			if werr != nil {
+				return false, werr
+			}
+			if len(o.tids) > 0 {
+				return true, nil
+			}
+			if !more {
+				return false, nil
+			}
+		}
+	}
 	for {
 		if o.cur == nil {
 			// Skip-scan (M0146-0005v): the active cursor is exhausted (or
