@@ -29,6 +29,7 @@ package optimizer
 import (
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -78,6 +79,122 @@ func neededColumnNamedFor(needed map[string]bool, qual, col string) bool {
 		return needed[col]
 	}
 	return needed[neededUnqualKey(col)] || needed[neededQualKey(qual, col)]
+}
+
+// expandWholeRowColumnNames widens the needed and output sets for each
+// whole-row reference (M0146-0047a). A bare name that is a FROM relation's
+// alias — `SELECT a.id, b FROM wa a JOIN wb b ...` — reads every column of
+// that relation (PG: a whole-row Var, varattno 0, which pull_varattnos /
+// build_base_rel_tlists turn into attr_needed for all of its attributes).
+// The collectors record it as an ordinary unqualified name, which matches no
+// column, so the narrowed join kept only the join key and the row came out
+// `(1,,)`. Each such relation's columns are added as qualified reads
+// (neededQualKey), plus the plain name neededKeepSet matches on.
+//
+// A bare name is a whole-row reference only when it is not a column:
+// transformColumnRef tries colNameToVar first and falls back to the relation
+// name only when no column matches. The sets themselves carry no scope, so
+// the decision is taken per scope from the names written IN that scope:
+//
+//   - the statement: its own references (the collectors do not descend into
+//     FROM subqueries; sublinks are included and see these relations), and
+//     the columns of its own FROM relations;
+//   - each pulled-up derived body: the names collected from the body alone,
+//     and the columns of the body's own FROM relations — a non-LATERAL
+//     derived table does not see its parent's FROM list.
+//
+// TPC-H Q9's outer `nation` is the derived table's column, written in the
+// outer scope; the body's `nation` relation is never named bare inside the
+// body, so it is not expanded. A relation whose output names are unknown
+// here (a function, a subquery not pulled up and without column aliases)
+// contributes none, which can only expand more — over-keeping is the safe
+// direction (file header).
+func expandWholeRowColumnNames(ctx *resolveContext, s *parser.SelectStmt, cat catalog.Catalog) {
+	if ctx == nil || s == nil || cat == nil {
+		return
+	}
+	var sets []map[string]bool
+	if ctx.neededColsKnown && ctx.neededCols != nil {
+		sets = append(sets, ctx.neededCols)
+	}
+	if ctx.outputColsKnown && ctx.outputCols != nil {
+		sets = append(sets, ctx.outputCols)
+	}
+	if len(sets) == 0 {
+		return
+	}
+	pulledNames := map[string][]string{}
+	for _, r := range ctx.pulledDerived {
+		pulledNames[strings.ToLower(r.alias)] = r.names
+	}
+	lookup := func(rv parser.RangeVar) *catalog.Table {
+		if rv.Subquery != nil || rv.TableFunc != nil || rv.Name == "" {
+			return nil
+		}
+		t, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+		if !ok {
+			return nil
+		}
+		return t
+	}
+	// expandScope expands, in every set, each relation of `from` that the
+	// scope's own references name bare while no relation of the scope has a
+	// column of that name.
+	expandScope := func(stmt *parser.SelectStmt) {
+		written := make(map[string]bool, 16)
+		written[neededMarkersKey] = true
+		if !collectStmtColumnNames(stmt, written) {
+			// Unaccounted references: assume every relation is read whole.
+			written = nil
+		}
+		visible := map[string]bool{}
+		for _, rv := range stmt.From {
+			switch {
+			case len(rv.Columns) > 0:
+				for _, c := range rv.Columns {
+					visible[strings.ToLower(c)] = true
+				}
+			case rv.Subquery != nil:
+				for _, n := range pulledNames[strings.ToLower(rv.Alias)] {
+					visible[strings.ToLower(n)] = true
+				}
+			default:
+				if t := lookup(rv); t != nil {
+					for _, c := range t.Columns {
+						visible[strings.ToLower(c.Name)] = true
+					}
+				}
+			}
+		}
+		for _, rv := range stmt.From {
+			qual := rv.Alias
+			if qual == "" {
+				qual = rv.Name
+			}
+			if written != nil && !written[neededUnqualKey(qual)] {
+				continue
+			}
+			if visible[strings.ToLower(qual)] {
+				continue
+			}
+			tbl := lookup(rv)
+			if tbl == nil {
+				continue
+			}
+			for _, set := range sets {
+				for _, c := range tbl.Columns {
+					set[c.Name] = true
+					set[neededQualKey(qual, c.Name)] = true
+				}
+			}
+		}
+	}
+	expandScope(s)
+	for _, r := range ctx.pulledDerived {
+		if r.body != nil {
+			expandScope(r.body)
+		}
+	}
 }
 
 // outputColumnNames returns every column name read ABOVE the statement's

@@ -24966,7 +24966,7 @@ M0146-0001 re-baseline census on the new default arm.
       subselect/with/aggregates byte\-identical; sweep 96/96, TPC\-H arm PASS\.
     - Residual \(ledgered\): no witness for relations without a NOT NULL
       column or derived tables; `b\.\*` expressions\.
-  - [ ] **M0146\-0047a — WRONG RESULTS: a whole\-row reference across a join
+  - [x] **M0146\-0047a — WRONG RESULTS: a whole\-row reference across a join
     loses the columns the query does not otherwise read** \(filed
     2026\-10\-03 by the M0146\-0047 probe; REPRODUCED on HEAD before the
     0047 fix, S2 escalation: wrong results\)\. `SELECT a\.id, b FROM wa a
@@ -24984,6 +24984,59 @@ M0146-0001 re-baseline census on the new default arm.
     > Resume point: make `neededColumnNames` / `outputColumnNames`
     > \(pathindexonlyneed\.go\) treat an unqualified name matching a FROM alias
     > as reading every column of that relation\.
+    - **LANDED 2026\-10\-03\.** `expandWholeRowColumnNames`
+      \(pathindexonlyneed\.go\) adds every column of a FROM relation named as
+      a bare whole\-row reference to the needed/output sets, with
+      transformColumnRef\'s column\-first precedence, decided per scope
+      from the names written in it \(statement, each pulled\-up body\)\. Design
+      `docs/design/0100\-0149/m0146\-0047a\-wholerow\-needed\-columns\.md`\.
+      - The scope\-blind first cut widened TPC\-H Q9 \(outer `nation` is the
+        derived column, the body also reads relation `nation`\);
+        `TestSlice3LiveQ9ShapeDerivation` caught it\.
+      - A second draft let a pulled body see its parent\'s FROM columns —
+        wrong: a non\-LATERAL derived table does not, and a parent column
+        `b` would under\-keep the body\'s whole\-row `b`\. Each scope now
+        decides from the names written in it\.
+      - Live probe: 15 shapes identical to PG;
+        `TestWholeRowReadAcrossJoinKeepsEveryColumn` \(9 cases\); regress
+        9 suites byte\-identical, `join` only a nondeterministic row\-order
+        flip of an unordered result \(seen both ways\); sweep 96/96, fire
+        set no plan change \(SF0\.25, SF1\), TPC\-H arm, ea\-ratchet PASS\.
+      - Residual: a null\-extended row of a relation with no NOT NULL column
+        still prints `\(,,\)` \(M0146\-0047 witness residual, ledgered\)\.
+  - [ ] **M0146\-0047c — WRONG RESULTS: a bare name resolves to a local
+    whole\-row reference before an outer\-level column** \(filed 2026\-10\-03
+    by the M0146\-0047a probe; REPRODUCED on a private throwaway cluster,
+    S2 escalation: wrong results\)\. With `wd\(b int\)` holding 7 and `wb\(k,
+    x, y\)` holding `\(1,10,a\)`: `SELECT \(SELECT b FROM wb b LIMIT 1\) FROM wd`
+    gives `\(1,10,a\)`, PG 18\.3 gives `7`; the LATERAL form `\.\.\. LEFT JOIN
+    LATERAL \(SELECT b AS r FROM wa a JOIN wb b \.\.\.\) x ON true` is wrong the
+    same way, and `\.\.\. WHERE EXISTS \(SELECT 1 FROM wb b WHERE b = 7\)`
+    errors \(`operator = has incompatible operand types`\) where PG returns
+    the row\. PG\'s transformColumnRef tries colNameToVar over EVERY visible
+    level before refnameNamespaceItem; goopg takes the local relation
+    first\. Pre\-existing, independent of narrowing\.
+    Kind: bug
+    Parent: M0146\-0047
+    > ## ESCALATION 2026\-10\-03 \(S2\) — whole\-row reference shadows an outer column
+    > Filed by the M0146\-0047a probe, not worked\. As a descendant of a
+    > banner\-2a task it inherits item 2a\'s rank; owner: confirm its place\.
+    > Resume point: the bare\-name ColumnRef resolution \(planner\.go
+    > whole\-row resolution\) must search outer query levels for a column
+    > before falling back to a whole\-row relation reference\.
+- [ ] **M0146\-0047b — composite field selection `\(expr\)\.field` is a syntax
+  error** \(filed 2026\-10\-03 by the M0146\-0047a probe; not S2: a
+  rejection, not wrong results; owner: place\)\. `SELECT \(b\)\.x FROM wb b`,
+  `SELECT \(ROW\(1,2\)\)\.f1` and `SELECT \(c\)\.p FROM \(SELECT ROW\(1,2\)::ct AS
+  c\) s` all fail `syntax error at or near`; PG reads the field \(gram\.y
+  c\_expr `\'\(\' a\_expr \'\)\' opt\_indirection`, transformIndirection →
+  ParseFuncOrColumn field selection\)\.
+  Kind: bug
+  Parent: M0146
+  - First step: add the parenthesised\-expression indirection arm to the
+    grammar \(read the goyacc playbook first\), then resolve a field name
+    against the operand\'s composite type \(whole\-row RowExpr element,
+    named composite type attribute\)\.
 - [x] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
   FIRST/LAST share one WindowAgg** \(filed 2026\-10\-03 by the M0146\-0005dm
   probe; REPRODUCED on a private throwaway cluster, S2 escalation: wrong

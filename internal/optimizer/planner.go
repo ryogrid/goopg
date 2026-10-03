@@ -1852,6 +1852,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
+		expandWholeRowColumnNames(ctx, s, cat)
 		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
 		// PG's pull_up_sublinks position, before join-order search —
 		// into leaf entries + SpecialJoinInfo on ctx.jtPullup, which
@@ -2019,6 +2020,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
+		expandWholeRowColumnNames(ctx, s, cat)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
 			node = newChild
 		} else if newChild != node {
