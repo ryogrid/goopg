@@ -208,7 +208,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// the trackers start empty — PG's note that it does not reject
 	// `inner_cheapest_total` merely for matching some shorter prefix.
 	var cheapestTotalInner, cheapestStartupInner *Path
-	if pathkeysContainedIn(innerCheapestTotal.Pathkeys, innerSortKeys) {
+	if pathkeysContainedInRel(inner, innerCheapestTotal.Pathkeys, innerSortKeys) {
 		cheapestTotalInner = innerCheapestTotal
 		cheapestStartupInner = innerCheapestTotal
 	}
@@ -496,7 +496,7 @@ func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSel
 		if matched != nil && comparePathCosts(matched, p, criterion) <= 0 {
 			continue
 		}
-		if p.RequiredOuter == 0 && pathkeysContainedIn(p.Pathkeys, keys) {
+		if p.RequiredOuter == 0 && pathkeysContainedInRel(p.Rel, p.Pathkeys, keys) {
 			matched = p
 		}
 	}

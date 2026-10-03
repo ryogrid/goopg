@@ -394,10 +394,10 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 	}
 
 	op, ip := o, i
-	if len(outerSortKeys) > 0 && !pathkeysContainedIn(o.Pathkeys, outerSortKeys) {
+	if len(outerSortKeys) > 0 && !pathkeysContainedInRel(o.Rel, o.Pathkeys, outerSortKeys) {
 		op = sortPathFor(o, outerSortKeys, cp)
 	}
-	if len(innerSortKeys) > 0 && !pathkeysContainedIn(i.Pathkeys, innerSortKeys) {
+	if len(innerSortKeys) > 0 && !pathkeysContainedInRel(i.Rel, i.Pathkeys, innerSortKeys) {
 		ip = sortPathFor(i, innerSortKeys, cp)
 	}
 
