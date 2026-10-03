@@ -27322,7 +27322,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: fire row triggers from `storeCopyRow` as INSERT does;
     CopyFrom forces CIM\_SINGLE for such tables \(already wired,
     `copyUsesMultiInsert`\)\.
-- [ ] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
+- [x] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
   WHERE li\.cat = 3`: goopg\'s Nested Loop says rows=1 \(its Append rows=1\)
@@ -27333,3 +27333,19 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find how the LATERAL Append\'s rows are derived — PG sizes
     the parameterised inner per call \(the members\' parameterised rows,
     summed\) and the NL as outer × that\.
+  - **DONE 2026\-10\-04 \(`c79dc3a42`\)\.** Two EstimateRows gaps:
+    no `\*BitmapHeapScan` arm \(every bitmap heap scan read 0\), and the
+    one\-relation scope\'s Filter repeating the probe\'s index key
+    \(`item = li\.id`\) charged a second time\. New arm takes the bitmap
+    path\'s stamped rows; `indexKeyEnforced` skips such a conjunct in
+    `filterSelectivity`, as PG keeps it only in the indexqual\.
+    - The query now: Nested Loop rows=3000 over Append rows=75, as PG\.
+    - Fire set flat \(TPC\-DS plans byte\-identical\); ea\-ratchet PASS\.
+    - Ledgered: the NL cost still omits the per\-outer\-row rescan
+      \(292\.66 vs 9430\.27\); bitmap scans render `Filter:` not `Recheck
+      Cond:`\.
+    - Test `TestLateralAppendNestedLoopRows`\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress 20 planner cases identical to HEAD\.
+    - Design `docs/design/0100\-0149/m0146\-0009m\-lateral\-append\-rows\.md`\.
+  Movement: none — fire set flat at both scales; estimate fixed outside the searched plans
