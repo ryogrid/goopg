@@ -216,6 +216,25 @@ func nestloopResidualClauses(clauses []*restrictInfo, innerPath *Path, innerReli
 // shared by the costing side and the building side, rather than two that could
 // drift into a clause charged twice or enforced never (rule #2).
 func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
+	if p != nil && p.Kind == PathParamAppend {
+		// M0146-0049: a clause is enforced by the Append when EVERY member
+		// probe enforces it — each member's clauses keep the leaf's
+		// restrictInfo, so identity matching carries across.
+		var out map[*restrictInfo]bool
+		for i, c := range p.Children {
+			e := probeEnforcedClauses(c)
+			if i == 0 {
+				out = e
+				continue
+			}
+			for ri := range out {
+				if !e[ri] {
+					delete(out, ri)
+				}
+			}
+		}
+		return out
+	}
 	if p == nil || len(p.IndexClauses) == 0 {
 		return nil
 	}

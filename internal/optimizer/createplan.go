@@ -112,6 +112,12 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathGatherMerge:
 		// The order-preserving twin, priced by cost_gather_merge.
 		return createGatherMergePlan(p)
+	case PathParamAppend:
+		// M0146-0049: the leaf's UNION ALL around its member probes; the keys
+		// are bound by the nested loop that consumes it
+		// (createNestLoopParamAppendPlan). paramappend.go.
+		n := createParamAppendNode(p)
+		return n, baseRelLayout(p.Rel, n)
 	case PathMaterial:
 		// M0146-0010: `make_material` — the plan half of the materialised
 		// inner PG's match_unsorted_outer elects. materialize.go.

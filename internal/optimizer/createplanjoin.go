@@ -409,7 +409,7 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 	// is a plan-time panic, not a narrower plan (joinleghook.go).
 	outerNode, outerLay = narrowJoinLeg(outerNode, outerLay, outerPath, false)
 	innerNode, innerLay = narrowJoinLeg(innerNode, innerLay, innerPath,
-		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)")
+		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)" || kind == "PathNestLoop(param-append)")
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}

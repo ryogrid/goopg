@@ -157,6 +157,12 @@ const (
 	// Material arm is what makes the election worth filing. Children[0]
 	// is the wrapped inner.
 	PathMaterial
+	// PathParamAppend is PG's AppendPath with a `required_outer`
+	// (create_append_path, pathnode.c:1303) over a flattened UNION ALL leaf:
+	// Children are the members' parameterised index paths, and paramAppend
+	// carries the leaf's UNION ALL the plan rebuilds around them
+	// (paramappend.go, M0146-0049).
+	PathParamAppend
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -164,6 +170,9 @@ const (
 // specific data in a narrow payload rather than a fat struct (design ch. 03 §1).
 type Path struct {
 	Kind PathKind
+
+	// paramAppend is a PathParamAppend's member carrier (paramappend.go).
+	paramAppend *paramAppendInfo
 
 	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
 	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
