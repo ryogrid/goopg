@@ -273,9 +273,11 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		}
 		// The deferred release keeps a panic in either pass from leaving the
 		// relation's VACUUM gate held.
+		vacuumed := false
 		func() {
 			defer releaseVacuum()
 			stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, relOpts)
+			vacuumed = err == nil
 			if err == nil {
 				// Publish reltuples / relpages to pg_class (vac_update_relstats).
 				// reltuples is the count of tuples visible to a FRESH snapshot — the
@@ -342,6 +344,17 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		if isNailedCatalogOID(tbl.OID) {
 			o.ctx.TxnMgr.SetRelcacheInvalPending()
 		}
+
+		// VACUUM (ANALYZE): vacuum() runs analyze_rel on each target right
+		// after vacuum_rel (vacuum.c, VACOPT_ANALYZE), so the relation gets
+		// its per-column statistics, not only the size pass above. It used
+		// to stop at reltuples/relpages, leaving pg_stats empty after
+		// regress test_setup.sql's VACUUM ANALYZE. M0146-0009j.
+		if vs.Analyze && vacuumed {
+			if err := analyzeTableStats(o.ctx, tbl); err != nil {
+				return nil, &ExecError{Code: "XX000", Pos: vs.Pos(), Message: err.Error()}
+			}
+		}
 	}
 
 	// VACUUM (ANALYZE) of a partitioned table also gathers inheritance-tree
@@ -355,6 +368,7 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		for _, parent := range parents {
 			analyzeInheritanceWait(o.ctx, parent)
 		}
+		rollupPartitionedParentStats(o.ctx, parents)
 	}
 
 	// Advance pg_database.datfrozenxid on disk to the freshly recomputed

@@ -126,20 +126,9 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			}
 			continue
 		}
-		stats, err := analyzeRelationCtx(o.ctx, tbl)
-		if err != nil {
+		if err := analyzeTableStats(o.ctx, tbl); err != nil {
 			return nil, &ExecError{Code: "XX000", Pos: o.stmt.Pos(), Message: err.Error()}
 		}
-		o.ctx.Catalog.SetTableStats(tbl, stats)
-		// M0112: persist stats to pg_statistic so they survive restart.
-		if werr := persistStatsToPGStatistic(o.ctx, tbl, stats); werr != nil {
-			// Non-fatal: stats are in memory; log and continue.
-			_ = werr
-		}
-		relStats.resetAnalyzeTriggers(tbl.OID)
-		// The shared stats entry gets the same report (pgstat_report_analyze):
-		// mod_since_analyze resets to zero.
-		relStats.reportAnalyze(tbl.OID)
 	}
 	// Inheritance-tree statistics for partitioned parents read every leaf
 	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
@@ -149,16 +138,45 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 		analyzeInheritanceWait(o.ctx, parent)
 	}
 
-	// Partitioned-parent aggregation (parity bundle F5-deferred→done-lite):
-	// roll up each partitioned parent's RowCount/Pages from its children so
-	// the planner's relsize path sees a non-stale total. Column-level stats
-	// for parents remain unset (planner falls back per column), which is
-	// strictly better than the previous no-op.
+	rollupPartitionedParentStats(o.ctx, parents)
+	return nil, EOF
+}
+
+// analyzeTableStats is analyze_rel's statistics step for one heap relation
+// (analyze.c do_analyze_rel): sample it, install the per-column statistics,
+// persist them to pg_statistic and report the analyze to the cumulative
+// statistics. ANALYZE and VACUUM (ANALYZE) both run it for every target —
+// PG's vacuum() calls analyze_rel after vacuum_rel when VACOPT_ANALYZE is
+// set (M0146-0009j).
+func analyzeTableStats(ctx *Context, tbl *catalog.Table) error {
+	stats, err := analyzeRelationCtx(ctx, tbl)
+	if err != nil {
+		return err
+	}
+	ctx.Catalog.SetTableStats(tbl, stats)
+	// M0112: persist stats to pg_statistic so they survive restart.
+	if werr := persistStatsToPGStatistic(ctx, tbl, stats); werr != nil {
+		// Non-fatal: stats are in memory; log and continue.
+		_ = werr
+	}
+	relStats.resetAnalyzeTriggers(tbl.OID)
+	// The shared stats entry gets the same report (pgstat_report_analyze):
+	// mod_since_analyze resets to zero.
+	relStats.reportAnalyze(tbl.OID)
+	return nil
+}
+
+// rollupPartitionedParentStats is the partitioned-parent aggregation
+// (parity bundle F5-deferred→done-lite): roll up each partitioned parent's
+// RowCount/Pages from its children so the planner's relsize path sees a
+// non-stale total. Column-level stats for parents remain unset (planner falls
+// back per column), which is strictly better than the previous no-op.
+func rollupPartitionedParentStats(ctx *Context, parents []*catalog.Table) {
 	for _, parent := range parents {
 		if parent == nil || parent.PartitionMethod == "" {
 			continue
 		}
-		kids := o.partitionChildren(parent)
+		kids := catalogPartitionChildren(ctx, parent)
 		if len(kids) == 0 {
 			continue
 		}
@@ -172,19 +190,22 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			pages += k.Stats.Pages
 		}
 		parent.Stats = &catalog.TableStats{RowCount: rows, Pages: pages, Analyzed: true}
-		o.ctx.Catalog.SetTableStats(parent, parent.Stats)
+		ctx.Catalog.SetTableStats(parent, parent.Stats)
 		relStats.resetAnalyzeTriggers(parent.OID)
 		relStats.reportAnalyze(parent.OID)
 	}
-	return nil, EOF
 }
 
 // partitionChildren resolves the direct leaf partitions of a partitioned
 // parent through the concrete catalog, peeling wrapper catalogs exactly like
 // expandVacuumTargets does. Returns nil when unsupported.
 func (o *analyzeOp) partitionChildren(parent *catalog.Table) []*catalog.Table {
+	return catalogPartitionChildren(o.ctx, parent)
+}
+
+func catalogPartitionChildren(ctx *Context, parent *catalog.Table) []*catalog.Table {
 	type unwrapper interface{ Unwrap() catalog.Catalog }
-	base := o.ctx.Catalog
+	base := ctx.Catalog
 	for {
 		if c, ok := base.(*catalog.InMemory); ok {
 			return c.PartitionChildren(parent.OID)
