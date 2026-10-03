@@ -18057,7 +18057,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Q20\'s `ps\_availqty > \(SubPlan\)` filter now runs above the Gather,
       unprinted; PG keeps it on the `partsupp` scan \(ledgered\).
   Movement: none — TPC-H PLAN-PARITY match 3 -> 3; join-method 11 -> 10 inside the noise band
-- [ ] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
+- [x] **M0145\-0008ac — promote the pulled `\*CTEScan` leaf admission
   \(`GOOPG\_PULLUP\_CTE\_LEAF`\)** \(filed 2026\-09\-25 by M0145\-0008aa\).
   PG pulls a CTE reference in a simple sublink body up like any base rel;
   goopg admits it only behind the default\-off knob. Promoting it moves
@@ -18099,6 +18099,35 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     prerequisites \(0049d1 empty\-inner exit, 0049d2 CTE materialised once
     under a LATERAL\)\. Next: re\-apply the preserved patch and re\-run the
     fire set at SF0\.25 and SF1, as the owner answer directs\.
+  - **LANDED 2026\-10\-03 \(`c317b037b`\)\.** The CTE half re\-applied by hand:
+    `flattenPulledBodyTree` admits `\*CTEScan` unconditionally,
+    `GOOPG\_PULLUP\_CTE\_LEAF` retired\. Design
+    `docs/design/0100\-0149/m0145\-0008ac\-cte\-leaf\-promotion\.md`\.
+    - Q95\'s semi inner is PG\'s parameterised Hash Join; cost 258193 →
+      142781 at SF0\.25 \(PG 141550\); fire set: no timeout at either scale\.
+    - ea\-ratchet: 8 new keys, all PG\-shared at the nearest scope —
+      re\-pinned under G4\'s extension with
+      `analysis/m0145/m0145\-0008ac/ea\-repin\-attribution\.md`\.
+    - Runtime regression Q14 8s → 39s, Q95 3s → 7s at SF0\.25 — filed
+      M0145\-0008af \(R3\)\.
+    - Gates: units, spotcheck, sweep 96/96, fire set ×2 \(PASS\), TPC\-H
+      arm 24/24, ea\-ratchet after re\-pin, regress 7 suites identical\.
+  Movement: yes — fire set CATEGORIES\-EXCL\-MATCH SF0\.25 join\-method 28→27, aggregation\-strategy 17→16, parallelism 35→34 \(parameterisation 27→28, rendering 11→13\); SF1 join\-method 28→27 \(qual\-placement 6→8\); match flat 38/29
+- [ ] **M0145\-0008af — REGRESSION: Q14 4\.9x and Q95 2\.3x slower at SF0\.25
+  after the CTE\-leaf promotion** \(filed 2026\-10\-03 by M0145\-0008ac\)\.
+  Q14 now runs PG\'s nested loop over HashAggregate\(cross\_items\) but probes
+  store\_sales with a Bitmap Heap Scan \(~0\.7 ms/probe × 16173\) where PG
+  index\-scans \(0\.06 ms\); Q95\'s web\_returns\_pkey probe on a non\-leading
+  column takes ~85 ms where PG\'s skip scan takes ~1 ms\. Values identical\.
+  Kind: impl
+  Parent: M0145\-0008ac
+  > ## ESCALATION 2026\-10\-03 \(R3\) — a PG\-faithful promotion regressed two runtimes
+  > Landed, not reverted \(R3\)\. Owner: confirm the order — the probe\-cost
+  > fix sits under M0146\-0049\'s S4 hold\.
+  - First step: break down cost\_index for the parameterised store\_sales
+    probe \(goopg prices index probes ~2x PG — M0146\-0049\'s escalation\)
+    and time goopg\'s skip\-scan probe against PG\'s Index Searches\.
+  - Design: `docs/design/0100\-0149/m0145\-0008ac\-cte\-leaf\-promotion\.md`\.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
@@ -24580,6 +24609,10 @@ M0146-0001 re-baseline census on the new default arm.
     join inner and its executor prerequisites\)\. Sequenced after
     M0145\-0008ac, whose patch supplies the CTE\-leaf pull\-up this shape
     needs\.
+  - 2026\-10\-03: M0145\-0008ac landed \(`c317b037b`\); Q95\'s semi inner is
+    now PG\'s parameterised hash join\. What remains of this task is the
+    outer NL Semi Join over the `ws\_wh` CTE scan \(goopg: Hash Join over
+    HashAggregate\(ws\_wh\)\)\.
 - [x] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
   that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
   leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
