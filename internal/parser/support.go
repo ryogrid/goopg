@@ -1725,6 +1725,8 @@ func intoWrap(l yyLexer, s Stmt) Stmt {
 	delete(ls.intoFor, sel)
 	ct := NewCreateTableStmt(0, tgt.name, nil, nil)
 	ct.SelectSource = sel
+	ct.Temporary = tgt.temporary
+	ct.Unlogged = tgt.unlogged
 	return ct
 }
 
@@ -1733,6 +1735,10 @@ func intoWrap(l yyLexer, s Stmt) Stmt {
 type intoTarget struct {
 	name ObjectName
 	pos  int
+	// OptTempTableName's relpersistence (gram.y): TEMP / TEMPORARY /
+	// {LOCAL|GLOBAL} TEMP[ORARY] make the target temporary, UNLOGGED
+	// unlogged.
+	temporary, unlogged bool
 }
 
 // checkStrayInto reports the SELECT ... INTO that legacy REJECTS by context.

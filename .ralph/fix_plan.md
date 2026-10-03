@@ -24836,7 +24836,7 @@ M0146-0001 re-baseline census on the new default arm.
         works; `TestCTASHonoursTempAndUnlogged`; regress temp,
         select\_into, create\_table, create\_table\_like, matview,
         create\_view byte\-identical; sweep 96/96, TPC\-H arm PASS\.
-  - [ ] **M0146\-0039b — `SELECT … INTO TEMP|TEMPORARY|UNLOGGED t` is a
+  - [x] **M0146\-0039b — `SELECT … INTO TEMP|TEMPORARY|UNLOGGED t` is a
     syntax error** \(filed 2026\-10\-03 by the M0146\-0039a probe; not
     S2: a rejection, not wrong results\)\. PG\'s `OptTempTableName`
     accepts `INTO [TEMP|TEMPORARY|LOCAL TEMP|GLOBAL TEMP|UNLOGGED] [TABLE]
@@ -24847,6 +24847,19 @@ M0146-0001 re-baseline census on the new default arm.
     - First step: extend the SELECT INTO clause in the parser to carry
       persistence onto the CTAS statement; the executor side already
       honours it \(M0146\-0039a\)\.
+    - **LANDED 2026\-10\-03\.** `into\_clause` takes gram\.y\'s
+      OptTempTableName forms \(TEMP, TEMPORARY, LOCAL/GLOBAL TEMP\[ORARY\],
+      UNLOGGED, optional TABLE\); `intoWrap` copies the persistence onto
+      the CTAS statement\. The permanent form is spelled `INTO TABLE name \|
+      INTO name` as gram\.y does, so the conflict pin stays at 60\. Design
+      `docs/design/0100\-0149/m0146\-0039b\-select\-into\-persistence\.md`\.
+      - Live probe matches PG \(relpersistence, namespace, values; `INTO
+        temp` still names a table\); `TestSelectInto` pins every form;
+        golden diff 1 flip \+ 13 pins; regress copyselect, create\_table,
+        horology, numerology, stats, temp, without\_overlaps, select\_into
+        byte\-identical; sweep 96/96, TPC\-H arm PASS\.
+      - Residual: PG\'s GLOBAL deprecation WARNING is not raised \(no parser
+        WARNING channel; CREATE GLOBAL TEMP TABLE is silent too\)\.
   - **Reproduced 2026\-09\-30** \(`analysis/m0146/m0146\-0039/repro.sh`\):
     after stop/start, pg\_class shows `ca` in namespace 2200 with
     relpersistence `p`, `SELECT \* FROM ca` returns the old row, and

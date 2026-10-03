@@ -170,9 +170,13 @@ func TestKeywordFunctionNames(t *testing.T) {
 }
 
 // TestSelectInto pins `SELECT ... INTO [TABLE] name`, which legacy turns into a
-// CreateTableStmt with the query as SelectSource. Legacy takes ONLY that form —
-// `SELECT a INTO TEMP x` is a syntax error there — so gram.y's TEMP / UNLOGGED
-// / TABLESPACE variants stay out.
+// CreateTableStmt with the query as SelectSource, and gram.y's OptTempTableName
+// persistence forms (`INTO TEMP | TEMPORARY | LOCAL TEMP[ORARY] | UNLOGGED
+// [TABLE] name`), which set the statement's Temporary / Unlogged — legacy
+// rejected those, PG accepts them (M0146-0039b). The persistence words are
+// unreserved keywords, so each still works as a bare table name. GLOBAL
+// TEMP[ORARY] is taken too, without the deprecation WARNING PG adds — the
+// parser has no channel for one, and CREATE GLOBAL TEMP TABLE is the same.
 //
 // The target is recorded against the simple_select's SelectStmt and the wrap
 // happens one level up, at the SelectStmt rule, so the captured query already
@@ -189,10 +193,43 @@ func TestSelectInto(t *testing.T) {
 		"SELECT * FROM (SELECT 1) x",
 		"SELECT a FROM t UNION SELECT b FROM u",
 		"SELECT 1",
+		"SELECT a INTO TEMP sitmp1 FROM onek",
+		"SELECT a INTO TEMP TABLE sitmp1 FROM onek",
+		"SELECT a INTO TEMPORARY sitmp1 FROM onek",
+		"SELECT a INTO LOCAL TEMP sitmp1 FROM onek",
+		"SELECT a INTO LOCAL TEMPORARY TABLE sitmp1 FROM onek",
+		"SELECT a INTO UNLOGGED sitmp1 FROM onek",
+		"SELECT a INTO UNLOGGED TABLE s.t FROM onek",
+		"SELECT a INTO temp FROM onek",
+		"SELECT a INTO unlogged FROM onek",
+		"SELECT a INTO local FROM onek",
+		"SELECT a INTO temp.x FROM onek",
+		"SELECT a INTO GLOBAL TEMP sitmp1 FROM onek",
+		"SELECT a INTO global FROM onek",
 	} {
 		assertParity(t, q)
 	}
-	assertBothReject(t, "SELECT a INTO TEMP sitmp1 FROM onek")
+	for _, c := range []struct {
+		q              string
+		temp, unlogged bool
+	}{
+		{"SELECT a INTO sitmp1 FROM onek", false, false},
+		{"SELECT a INTO TEMP sitmp1 FROM onek", true, false},
+		{"SELECT a INTO LOCAL TEMPORARY TABLE sitmp1 FROM onek", true, false},
+		{"SELECT a INTO UNLOGGED sitmp1 FROM onek", false, true},
+		{"SELECT a INTO temp FROM onek", false, false},
+		{"SELECT a INTO GLOBAL TEMPORARY sitmp1 FROM onek", true, false},
+	} {
+		stmts, err := Parse(c.q)
+		if err != nil || len(stmts) != 1 {
+			t.Fatalf("%s: %v", c.q, err)
+		}
+		ct, ok := stmts[0].(*CreateTableStmt)
+		if !ok || ct.Temporary != c.temp || ct.Unlogged != c.unlogged {
+			t.Errorf("%s: got %#v, want Temporary=%v Unlogged=%v", c.q, stmts[0], c.temp, c.unlogged)
+		}
+	}
+	assertBothReject(t, "SELECT a INTO GLOBAL sitmp1 FROM onek")
 }
 
 // TestFetchFirstParenValue pins `FETCH FIRST (NULL+1) ROWS WITH TIES`.

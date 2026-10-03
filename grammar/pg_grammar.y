@@ -1070,17 +1070,55 @@ func_name_keyword:
 	| TABLESAMPLE      { $$ = "tablesample" }
 	| VERBOSE          { $$ = "verbose" }
 
-/* into_clause — gram.y :12986. Legacy takes only `INTO [TABLE] name`; its
-   TEMP / UNLOGGED / TABLESPACE variants are NOT accepted there
-   (`SELECT a INTO TEMP x` is a syntax error), so they stay out. */
+/* into_clause — gram.y into_clause / OptTempTableName: `INTO [TEMP |
+   TEMPORARY | {LOCAL|GLOBAL} {TEMP|TEMPORARY} | UNLOGGED] [TABLE] name`, the
+   persistence riding on to the CREATE TABLE ... AS it becomes (M0146-0039b).
+   PG also raises a "GLOBAL is deprecated" WARNING for the GLOBAL forms; this
+   parser has no channel for one, so GLOBAL is taken silently — as the
+   CREATE GLOBAL TEMP TABLE path (ddl.go) already does. */
 /* The INTO token's own position rides along: an INTO in a context that
    forbids it is reported AT the INTO (select.go:223), and the check happens
    long after this rule has reduced. */
 into_clause:
 		/* empty */                      { $$ = (*intoTarget)(nil) }
-	| INTO opt_into_table qualified_name
+	/* `TABLE name | name` spelled out, as gram.y does: an empty optional
+	   TABLE before the name would have to reduce on a TEMP / UNLOGGED /
+	   LOCAL lookahead that may still be the name itself. */
+	| INTO qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($2), pos: $<p>1}
+			}
+	| INTO TABLE qualified_name
 			{
 				$$ = &intoTarget{name: objectNameFromQn($3), pos: $<p>1}
+			}
+	| INTO TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, temporary: true}
+			}
+	| INTO TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, temporary: true}
+			}
+	| INTO LOCAL TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO LOCAL TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO GLOBAL TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO GLOBAL TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO UNLOGGED opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, unlogged: true}
 			}
 
 opt_into_table:

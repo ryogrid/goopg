@@ -544,6 +544,7 @@ only two strict ones left and both are ported.
 | `CREATE TABLE t (user text)`, `(verbose text)` REJECTED | STRICTER than the old parser, matches PG | `kwlist.h:480` makes `user` RESERVED, `:491` makes `verbose` TYPE_FUNC_NAME; `ColId` reaches neither |
 | `ALTER TABLE … ADD CHECK` action position | differs from the old parser | `CHECKBODY` carries the paren offsets, not the keyword's (§12.1) |
 | `SELECT f(variadic array[…]::int[])` cast position | differs | the VARIADIC argument path anchors the cast at the array's first element |
+| `SELECT … INTO GLOBAL TEMP x` accepted SILENTLY | PG accepts it with a "GLOBAL is deprecated" WARNING (`gram.y` OptTempTableName) | the parser has no channel to raise a WARNING; `CREATE GLOBAL TEMP TABLE` (ddl.go) is silent the same way (M0146-0039b) |
 
 When you find a NEW divergence, decide it against `./postgres/`, not against
 what the code used to do — and record it here with the citation.
