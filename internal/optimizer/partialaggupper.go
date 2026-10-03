@@ -702,9 +702,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// With it, `add_path` compares the two parallel shapes against each other
 	// on the reduction ratio, which is the quantity the decision turns on
 	// (DESIGN §3.4).
-	nsGatherCost := gatherCost(cp, pseed.Cost, inputRows)
+	//
+	// M0146-0009n: the rows crossing the boundary are `compute_gather_rows`
+	// (costsize.c) of the partial input — its per-worker rows times the
+	// divisor, clamped — not the serial seed's rows. With a searched partial
+	// path the two differ, and the worker-sort Gather Merge below is sized
+	// the PG way, so a seed-sized Gather lost or won their near-ties on the
+	// difference alone (TPC-DS Q56's store_sales branch).
+	gatheredRows := clampRowEst(perWorkerRows * d)
+	nsGatherCost := gatherCost(cp, pseed.Cost, gatheredRows)
 	nsGather := &Path{
-		Kind: PathGather, Rel: grouped, Rows: inputRows, Cost: nsGatherCost,
+		Kind: PathGather, Rel: grouped, Rows: gatheredRows, Cost: nsGatherCost,
 		ParallelWorkers: workers,
 		Children:        []*Path{pseed},
 	}
@@ -754,7 +762,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			addPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &sortSpec,
 				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, inputRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
+				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
 					0, 1, nAggs, inNcols, inAvgVar),
 				Pathkeys: sortedGather.Pathkeys, Children: []*Path{sortedGather},
 			}, partialAggNoSplitProducer)
@@ -781,7 +789,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			addPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
+				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
 					0, 1, nAggs, inNcols, inAvgVar),
 				Children: []*Path{nsGather},
 			}, partialAggNoSplitProducer)
@@ -821,7 +829,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+			Cost: costAgg(cp, AggStrategySorted, gatheredRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
 			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 		}, partialAggNoSplitProducer)
@@ -863,7 +871,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: finalGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
+			Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
 				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
@@ -1002,11 +1010,10 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 //
 // Rows crossing the merge boundary: every input row — a Sort emits what it
 // reads — i.e. the per-worker count the sort was priced with (`perWorkerRows`)
-// times the divisor `d`. Spelled manually rather than via
-// `computeGatherRows`: that helper re-derives the divisor from the subpath and
-// applies `clampRowEst`, while here the count must stay exactly the pricing
-// basis above (float division round-trips: `perWorkerRows * d` recovers
-// `inputRows` — no integer truncation, `d` is float64).
+// times the divisor `d`, clamped: `compute_gather_rows` (costsize.c), the
+// count the no-split arm's Gather takes too (M0146-0009n). Spelled out rather
+// than via `computeGatherRows`, which re-derives the divisor from the subpath
+// and this sort was planned with the caller's.
 //
 // The GatherMerge is built MANUALLY rather than through `makeGatherMergePath`:
 // that constructor only wraps an already-sorted subpath
@@ -1019,7 +1026,7 @@ func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey,
 	// without this the GatherMerge build below refuses the subpath
 	// (`gatherChildPlan` panics on 0 workers).
 	workerSort.ParallelWorkers = workers
-	gmCrossedRows := perWorkerRows * d
+	gmCrossedRows := clampRowEst(perWorkerRows * d)
 	gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
 	workerGM := &Path{
 		Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,

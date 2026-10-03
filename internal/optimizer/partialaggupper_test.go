@@ -1717,3 +1717,73 @@ func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
 		t.Error("the partial-spine splice still peels a parallel-safe Filter")
 	}
 }
+
+// TestGatheredArmBoundariesShareComputeGatherRows pins M0146-0009n: with a
+// searched partial path whose per-worker rows are not the serial seed's rows
+// over the divisor, the gathered (no-split) arm's Gather and its worker-sort
+// Gather Merge both carry `compute_gather_rows` (costsize.c) of the partial
+// input — per-worker rows × divisor, clamped. The Gather used to take the
+// seed's rows, so the two shapes were charged `parallel_tuple_cost` on
+// different counts and the Gather Merge won TPC-DS Q56's near-tie PG's
+// Sort-over-Gather wins.
+func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	// Every row its own group: nothing to pre-aggregate, so the no-split
+	// shapes are the ones the rel keeps.
+	agg := sizedAggFixture(t, 100_000, 100_000, 1, 1)
+	ps := upperSplitSettings()
+	cp := ps.costParams()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	seed := newPrebuiltPath(grouped, agg.Child)
+	seed.Rows = float64(EstimateRows(agg.Child))
+	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+
+	const workers = 4
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	partial := &Path{
+		Rows:            seed.Rows / d * 0.8,
+		Cost:            parallelSeedCost(seed.Cost, d),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+	}
+	want := clampRowEst(partial.Rows * d)
+	if want == clampRowEst(seed.Rows) {
+		t.Fatalf("fixture does not separate the partial rows from the seed's: both %v", want)
+	}
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
+
+	seen := map[PathKind]int{}
+	var walk func(p *Path)
+	walk = func(p *Path) {
+		if p == nil {
+			return
+		}
+		if p.Kind == PathGather || p.Kind == PathGatherMerge {
+			sub := p.Children[0]
+			if sub.Kind == PathSort {
+				sub = sub.Children[0]
+			}
+			if sub.Kind != PathAgg { // the split arm's boundary crosses group states
+				seen[p.Kind]++
+				if p.Rows != want {
+					t.Errorf("%v over the partial input: rows=%v, want compute_gather_rows=%v (seed rows %v)",
+						p.Kind, p.Rows, want, seed.Rows)
+				}
+			}
+		}
+		for _, c := range p.Children {
+			walk(c)
+		}
+	}
+	for _, p := range grouped.Pathlist {
+		walk(p)
+	}
+	if seen[PathGather] == 0 && seen[PathGatherMerge] == 0 {
+		t.Fatalf("no gathered no-split candidate survived on the rel: %d paths", len(grouped.Pathlist))
+	}
+	t.Logf("gathered boundaries checked: %v", seen)
+}
