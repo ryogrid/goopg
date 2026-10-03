@@ -26007,7 +26007,7 @@ M0146-0001 re-baseline census on the new default arm.
       before\)\.
     - Design `docs/design/0100\-0149/m0146\-0009n\-gathered\-arm\-gather\-rows\.md`\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 30 -> 27, parallelism 34 -> 31, rendering 12 -> 11; SF1 sort-strategy 32 -> 29; match SF0.25 38 -> 39 (Q56), SF1 29 -> 30 (Q93)
-- [ ] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
+- [x] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
   packed count** \(filed 2026\-10\-02 by the M0146\-0005 Q52 diagnosis\)\.
   The two TPC\-DS SF0\.25 loads hold the same tuples per page, but PG\'s
   relations end in empty pre\-extended blocks: `item` 1238 data pages \+ 46
@@ -26027,6 +26027,27 @@ M0146-0001 re-baseline census on the new default arm.
     `batchExtendAndRegisterFSM` only fires under lock contention, 8 pages\)
     and port the BulkInsertState ramp\. Measurable only after an owner
     reload of the bench clusters; the loop cannot re\-load them\.
+  - **DONE 2026\-10\-04 \(`df1274b81`\)\.** COPY buffers
+    CopyMultiInsertBuffer batches \(1000 rows / 65535 line bytes\),
+    prepares each batch, and places it through a `bulkInsertState`
+    \(current page → next\_free → FSM → RelationAddBlocks ramp, capped at
+    64\); CIM\_SINGLE uses the same state\. Writer split into
+    `prepareHeapTuple` / `placeHeapTuple`\.
+    - Fresh loads equal PG: item 1284, date\_dim 1424, customer 2872,
+      store\_sales 12936, pgbench\_accounts 1640\.
+    - Found on the way: VACUUM truncated any empty tail \(PG:
+      should\_attempt\_truncation\) and left FSM entries for truncated
+      blocks — the pgbench load hit "short read at block"\. Both fixed in
+      the same commit\.
+    - Plan movement waits for an owner reload of the bench clusters\.
+    - Five pre\-existing wrong results found while measuring, filed S2:
+      M0146\-0051 … 0055\.
+    - Tests `TestCopyBulkExtensionMatchesPGRelpages`,
+      `TestVacuumTailTruncationThreshold`\.
+    - Gates: units, pgbench smoke, tpch\-spotcheck, sf025 96/96, TPC\-H arm
+      24/24, regress 22 cases identical to HEAD \(known flakes only\)\.
+    - Design `docs/design/0100\-0149/m0146\-0009h\-copy\-bulk\-extension\.md`\.
+  Movement: none — plan inputs move only after an owner reload of the TPC-DS bench clusters; fresh-load relpages now equal PG
 - [ ] **M0146\-0009i — a CTE Scan inherits its CTE\'s row estimate** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   TPC\-DS Q14: the cross\_items CTE estimates rows=1 on both engines, but goopg\'s CTE Scan of it reports 212, so goopg hashes it where PG unique\-ifies one row into an index\-probe chain \(statement 2 main body 18934 vs 2730 per branch\)\.
   Kind: impl
@@ -27220,6 +27241,63 @@ M0146-0001 re-baseline census on the new default arm.
     correlated sublink its own `CTERowCache` window as `bindOuter` does
     for LATERAL; correlated bodies only, since uncorrelated ones now live
     in `CTEStableCache` \(M0146\-0049d2\)\.
+- [ ] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
+  \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
+  customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
+  Sort → Parallel Seq Scan\) returns 0; PG returns 150000\. A serial plan
+  over a small table counts correctly\. Pre\-existing \(the reference
+  binary answers the same\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-04 \(S2\) — five wrong\-results defects found by M0146\-0009h
+  > M0146\-0051 \(ctid through a parallel plan\), 0052 \(`ORDER BY ctid
+  > DESC`\), 0053 \(text comparison of `\(n,n\)`\-shaped strings\), 0054
+  > \(COPY leaves a volatile default NULL\), 0055 \(COPY fires no BEFORE ROW
+  > triggers\)\. Filed, not worked\. Owner: place them in the banner\.
+  - First step: find how a parallel worker projects the ctid system
+    column into the rows it ships through Gather / Gather Merge \(the
+    rowmark ledger row of 2026\-09\-19 names the same wrappers for
+    `wireRowMarkCtidColumns`\)\.
+- [ ] **M0146\-0052 — WRONG RESULTS: `ORDER BY ctid DESC` returns ascending
+  order** \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT ctid FROM nation
+  ORDER BY ctid DESC LIMIT 2` on the TPC\-H reference cluster returns
+  `\(0,1\), \(0,2\)`; PG returns the highest ctids first\. Pre\-existing\.
+  Kind: bug
+  Parent: M0146
+  - First step: find the sort comparator for `tid` keys and how the DESC
+    flag reaches it\.
+- [ ] **M0146\-0053 — WRONG RESULTS: `\(n,n\)`\-shaped text compares wrong**
+  \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT \'\(999,9\)\'::text >
+  \'\(1241,10\)\'::text` returns f \(also with `COLLATE "C"`\); PG returns t\.
+  `\'999,9\' > \'1241,10\'` and `\'a\(999,9\)\' > \'a\(1241,10\)\'` are right,
+  so the parenthesised shape is being read as something other than text\.
+  `max\(x\)` over such values is wrong the same way\. Pre\-existing \(the
+  reference binary answers the same\)\.
+  Kind: bug
+  Parent: M0146
+  - First step: trace the comparison of two text Datums whose value
+    parses as a point/tid literal\.
+- [ ] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
+  volatile default cannot be evaluated** \(filed 2026\-10\-04 by
+  M0146\-0009h\)\. `COPY t\(a,b\)` into a table with `c float8 DEFAULT random\(\)`
+  \(or `timestamptz DEFAULT clock\_timestamp\(\)`\) stores c NULL in every
+  row; PG fills it\. `applyDefaultsForMissing` → `evalGenExpr` returns an
+  error for those calls and the row keeps NULL \(ledger row 2026\-08\-18,
+  M0134\-0005m, names the evaluator gap\)\. INSERT fills the same default\.
+  Kind: bug
+  Parent: M0146
+  - First step: evaluate a missing column\'s default in COPY through the
+    full expression evaluator INSERT uses, and fail loudly on an error\.
+- [ ] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
+  triggers** \(filed 2026\-10\-04 by M0146\-0009h\)\. A BEFORE INSERT FOR EACH
+  ROW trigger that sets `new\.b := new\.b \|\| \'\!\'` changes nothing on
+  goopg \(`x,y`\); PG stores `x\!,y\!`\. `storeCopyRow` never calls the
+  trigger machinery \(check AFTER ROW and statement triggers too\)\.
+  Kind: bug
+  Parent: M0146
+  - First step: fire row triggers from `storeCopyRow` as INSERT does;
+    CopyFrom forces CIM\_SINGLE for such tables \(already wired,
+    `copyUsesMultiInsert`\)\.
 - [ ] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
