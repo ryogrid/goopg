@@ -17792,16 +17792,22 @@ case "pg_char_to_encoding":
 	case "version":
 		return NewStringDatum("PostgreSQL 18.3 goopg compatible"), nil
 	case "pg_current_xact_id", "txid_current":
-		if ctx.Tx.XID != 0 {
-			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		// M0146-0043: GetTopTransactionId (xact.c) — assigns the top-level
+		// transaction's xid on first use, as a read-only transaction has
+		// none yet, and returns it (never a savepoint's subxact xid).
+		if top := topLevelXID(ctx); top != 0 {
+			return Datum{Kind: KindInt, Int: int64(top)}, nil
 		}
-		return Datum{Kind: KindInt, Int: 0}, nil
+		if err := ctx.MaterializeWriterXID(); err != nil {
+			return Datum{}, err
+		}
+		return Datum{Kind: KindInt, Int: int64(topLevelXID(ctx))}, nil
 	// txid_current_if_assigned() → xid8: same as pg_current_xact_id() but
 	// returns NULL instead of assigning a new xid. M0134-0080 (pg_proc OID
 	// 3348, handler pg_current_xact_id_if_assigned, xid8funcs.c).
 	case "txid_current_if_assigned":
-		if ctx.Tx.XID != 0 {
-			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		if top := topLevelXID(ctx); top != 0 {
+			return Datum{Kind: KindInt, Int: int64(top)}, nil
 		}
 		return NullDatum, nil
 	// txid_current_snapshot() → pg_snapshot: the statement's active
@@ -21807,4 +21813,20 @@ func arrayConstructElemIsArray(e optimizer.Expr, v Datum) bool {
 	// an element produces in practice.
 	txt := v.Format()
 	return strings.HasPrefix(txt, "{") && strings.HasSuffix(txt, "}")
+}
+
+// topLevelXID is the top-level transaction's xid, 0 when unassigned. Inside
+// a savepoint ctx.Tx.XID is the subtransaction's xid, so the session's
+// top-level copy is read instead (GetTopTransactionIdIfAny, xact.c).
+// M0146-0043.
+func topLevelXID(ctx *Context) storage.TransactionID {
+	if sess, ok := ctx.Session.(*BasicSession); ok && sess.inTx && sess.currentSubXid != 0 {
+		// Inside a savepoint whose parent never wrote, goopg has a subxact
+		// xid but no top-level one (the parent=0 gap); report the subxact
+		// xid rather than claim none was assigned.
+		if sess.tx.XID != storage.InvalidTransactionID {
+			return sess.tx.XID
+		}
+	}
+	return ctx.Tx.XID
 }

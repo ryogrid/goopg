@@ -25023,7 +25023,7 @@ M0146-0001 re-baseline census on the new default arm.
     `numericMod` \(PG `mod\_var`: trunc\(x/y\) with full precision, result
     scale max\(dscale\)\) beside numericDiv in internal/executor/numeric\.go;
     then let `evalArith` fold `%` through `optimizer\.NumericArith` too\.
-- [ ] **M0146\-0043 — WRONG RESULTS: `txid\_current\(\)` and
+- [x] **M0146\-0043 — WRONG RESULTS: `txid\_current\(\)` and
   `pg\_current\_xact\_id\(\)` return 0** \(filed 2026\-10\-02 by M0146\-0035\'s
   recon; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
   results\)\. `SELECT txid\_current\(\), pg\_current\_xact\_id\(\)` returns
@@ -25039,6 +25039,13 @@ M0146-0001 re-baseline census on the new default arm.
     and make it call the transaction manager\'s xid assignment
     \(GetTopTransactionId, xact\.c; txid\_current in xid8funcs\.c\)\. An
     unassigned read\-only transaction must get an xid on first call\.
+  - **LANDED 2026\-10\-03\.** `txid\_current\(\)` / `pg\_current\_xact\_id\(\)` assign
+    the top\-level xid on first use \(`MaterializeWriterXID`, PG
+    GetTopTransactionId\) and report the top\-level xid inside a savepoint;
+    `txid\_current\_if\_assigned` follows\. Design
+    `docs/design/0100\-0149/m0146\-0043\-txid\-current\.md`\.
+    - Live\-server probe matches PG; `TestTxidCurrentAssignsXid`; regress
+      txid 148→93, xid identical; sweep 96/96, fire set, TPC\-H arm PASS\.
 - [x] **M0146\-0041 — WRONG RESULTS: numeric literal arithmetic is folded
   through float64** \(filed 2026\-10\-02 by the M0146\-0005 text\-identity
   census, TPC\-DS Q21's `0\.6666666666666666` vs PG\'s
