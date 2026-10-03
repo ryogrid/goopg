@@ -2061,6 +2061,15 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 			return ty, nil
 		}
 	}
+	// Not a column at any level: a bare name may still name a relation
+	// (whole-row reference), innermost first. M0146-0047c.
+	if x.Table == "" && x.Schema == "" {
+		for cur := ctx; cur != nil; cur = cur.parent {
+			if ty, ok := wholeRowTypeAt(x, cur); ok {
+				return ty, nil
+			}
+		}
+	}
 	if x.Table != "" {
 		return catalog.Type{}, errorMissingRTE(x.Pos(), x.Schema, x.Table, ctx)
 	}
@@ -2254,22 +2263,30 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 				return catalog.Type{Name: "tid"}, true, nil
 			}
 		}
-		// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
-		for _, rel := range ctx.rels {
-			if rel.qualifiedOnly {
-				continue
-			}
-			name := rel.alias
-			if name == "" {
-				name = rel.table.Name
-			}
-			if strings.EqualFold(x.Column, name) {
-				return catalog.Type{Name: "text"}, true, nil
-			}
-		}
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil
+}
+
+// wholeRowTypeAt resolves an unqualified name as a whole-row reference to a
+// relation of one scope level — transformColumnRef's refnameNamespaceItem
+// fallback, tried only after the name failed as a column at every level
+// (colNameToVar). The planner's resolveWholeRowAt is the twin. M0146-0047c.
+func wholeRowTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool) {
+	// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
+	for _, rel := range ctx.rels {
+		if rel.qualifiedOnly {
+			continue
+		}
+		name := rel.alias
+		if name == "" {
+			name = rel.table.Name
+		}
+		if strings.EqualFold(x.Column, name) {
+			return catalog.Type{Name: "text"}, true
+		}
+	}
+	return catalog.Type{}, false
 }
 
 // errorMissingRTE mirrors postgres/src/backend/parser/parse_relation.c's

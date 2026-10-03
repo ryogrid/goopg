@@ -25004,7 +25004,7 @@ M0146-0001 re-baseline census on the new default arm.
         set no plan change \(SF0\.25, SF1\), TPC\-H arm, ea\-ratchet PASS\.
       - Residual: a null\-extended row of a relation with no NOT NULL column
         still prints `\(,,\)` \(M0146\-0047 witness residual, ledgered\)\.
-  - [ ] **M0146\-0047c — WRONG RESULTS: a bare name resolves to a local
+  - [x] **M0146\-0047c — WRONG RESULTS: a bare name resolves to a local
     whole\-row reference before an outer\-level column** \(filed 2026\-10\-03
     by the M0146\-0047a probe; REPRODUCED on a private throwaway cluster,
     S2 escalation: wrong results\)\. With `wd\(b int\)` holding 7 and `wb\(k,
@@ -25024,6 +25024,17 @@ M0146-0001 re-baseline census on the new default arm.
     > Resume point: the bare\-name ColumnRef resolution \(planner\.go
     > whole\-row resolution\) must search outer query levels for a column
     > before falling back to a whole\-row relation reference\.
+    - **LANDED 2026\-10\-03\.** `resolveColumnRef` \(planner\) and
+      `resolveColumnRefType` \(analyzer twin\) walk every level for a
+      column, then every level for a whole\-row relation
+      \(`resolveWholeRowAt` / `wholeRowTypeAt`\), as transformColumnRef does
+      \(colNameToVar, then refnameNamespaceItem\)\. Design
+      `docs/design/0100\-0149/m0146\-0047c\-bare\-name\-column\-first\.md`\.
+      - Live probe: 12 shapes identical to PG;
+        `TestBareNamePrefersOuterColumnOverLocalWholeRow` fails at HEAD;
+        regress 12 suites byte\-identical, `join` row\-order flip and
+        `plpgsql` 4366\-4369 flap both seen on HEAD too; sweep 96/96, fire
+        set no plan change, TPC\-H arm, ea\-ratchet PASS\.
 - [ ] **M0146\-0047b — composite field selection `\(expr\)\.field` is a syntax
   error** \(filed 2026\-10\-03 by the M0146\-0047a probe; not S2: a
   rejection, not wrong results; owner: place\)\. `SELECT \(b\)\.x FROM wb b`,

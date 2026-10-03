@@ -17682,6 +17682,26 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			level++
 		}
 	}
+	// A bare name that is no column at any level may name a relation: a
+	// whole-row reference, innermost level first (transformColumnRef's
+	// refnameNamespaceItem fallback, after colNameToVar). M0146-0047c.
+	if x.Table == "" && x.Schema == "" {
+		level = 0
+		for cur := ctx; cur != nil; cur = cur.parent {
+			if len(cur.bindings) > 0 {
+				ref, ok, err := resolveWholeRowAt(x, cur, level)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					return ref, nil
+				}
+			}
+			if !cur.lateralSibling {
+				level++
+			}
+		}
+	}
 	pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
 	// Unqualified miss: PG's errorMissingColumn (parse_relation.c) still
 	// scans the local FROM-clause namespace for a near-miss and hints with
@@ -17936,6 +17956,16 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found != nil {
 		return found, true, nil
 	}
+	return nil, false, nil
+}
+
+// resolveWholeRowAt resolves an unqualified name as a whole-row reference to
+// a relation of one resolveContext level — PG's refnameNamespaceItem fallback
+// in transformColumnRef. resolveColumnRef calls it only after the name has
+// failed to resolve as a COLUMN at every level (colNameToVar searches all of
+// them first), so a column of an outer query wins over a local relation of
+// the same name (M0146-0047c).
+func resolveWholeRowAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Expr, bool, error) {
 	// Whole-row variable: unqualified column name matches a binding alias → composite row.
 	// E.g. `select foo from (select 1) as foo` returns `(1)`. M0097-0020.
 	// qualifiedOnly bindings (e.g. MERGE RETURNING `old`/`new`) also match here
