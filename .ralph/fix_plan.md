@@ -25818,7 +25818,7 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: impl
   Parent: M0146\-0009
   - First step: in `internal/executor/operators\_vacuum\.go`, when `vs\.Analyze`, run the ANALYZE operator\'s per\-table statistics path \(`operators\_analyze\.go`\) for each target with its column list, as `vacuum\(\)` → `analyze\_rel` does; then re\-run the regress A/B — expect broad plan movement\.
-- [ ] **M0146\-0009k — a node above a searched join is sized by the
+- [x] **M0146\-0009k — a node above a searched join is sized by the
   pre\-search join estimator** \(filed 2026\-10\-03 by recon M0146\-0005ds\)\.
   `EstimateRows`\' `\*Join` arm returns `estimateJoin\(x\)` \(cardinality\.go\)
   and ignores the join\'s stamped `PlanCost\.PlanRows` — the joinrel size
@@ -25842,6 +25842,13 @@ M0146-0001 re-baseline census on the new default arm.
     `EstimateRows` the `stampedUpperRows` preference, then re\-run the fire
     set and ea\-ratchet; check every EstimateRows reader that plans above a
     join \(aggregate strategy, sort cost\) for the change in input count\.
+  - **LANDED 2026\-10\-03 \(`577a4a97b`\)\.** Both arms take `stampedUpperRows`
+    first\. Design `docs/design/0100\-0149/m0146\-0009k\-upper\-rows\-from\-searched\-join\.md`\.
+    - `TestUpperNodeReadsSearchedJoinRows` fails at HEAD \(21919 vs 22000\)\.
+    - Fire set: 12/14 fires on estimate text, one shape change \(SF0\.25 Q72\);
+      match and categories unchanged; ea\-ratchet 10/10; sweep 96/96; regress
+      join: three already\-divergent shapes reshuffle, no result change\.
+    Movement: none — match, CATEGORIES\-EXCL\-MATCH and ea\-ratchet unchanged
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready
