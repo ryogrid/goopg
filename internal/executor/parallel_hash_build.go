@@ -779,6 +779,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			loopErr = err
 		} else {
 			o.presizeLazyHash(ctx, o.plan.Left, o.lazyLW, true)
+			// The serial loop counts the channel's rows: the empty-inner
+			// exit applies to a cooperative build as to a serial one.
+			o.buildRowsCounted = true
 			loopErr = o.buildLoopLeft(ctx, otherWidth)
 			_ = o.left.Close()
 		}
@@ -789,6 +792,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			loopErr = err
 		} else {
 			o.presizeLazyHash(ctx, o.plan.Right, o.lazyRW, false)
+			// The serial loop counts the channel's rows: the empty-inner
+			// exit applies to a cooperative build as to a serial one.
+			o.buildRowsCounted = true
 			loopErr = o.buildLoopRight(ctx, otherWidth)
 			_ = o.right.Close()
 		}

@@ -284,6 +284,25 @@ type joinOp struct {
 	antiBuildRows     int  // total right-side rows seen during build
 	antiBuildHasNull  bool // any right-side row's join key was NULL
 
+	// M0146-0049d1: PG's `hashtable->totalTuples` for the empty-inner exit
+	// (ExecHashJoin's HJ_BUILD_HASHTABLE state, nodeHashjoin.c). buildRows
+	// counts every row the build loops drained (the serial build's and the
+	// cooperative build's, which share them); buildRowsCounted says the
+	// count is complete — the CTID and shared builds leave it false, so
+	// those builds never take the exit.
+	buildRows        int64
+	buildRowsCounted bool
+	// The outer-prefetch half of the same state (HJ_BUILD_HASHTABLE's
+	// empty-outer test). firstProbe is the probe tuple fetched before the
+	// build, handed back by pullProbe's first call. outerNotEmpty is PG's
+	// hj_OuterNotEmpty: it survives a re-Open (a rescan) on purpose, so a
+	// rescan whose previous scan found the outer non-empty skips the
+	// prefetch. prefetchCost caches the cost half of the test (0 unknown,
+	// 1 prefetch, 2 do not).
+	firstProbe    TupleSlot
+	outerNotEmpty bool
+	prefetchCost  int8
+
 	// M0118-0009 (eval-plan-qual): when a downstream LockRows (FOR UPDATE OF
 	// <rel>) needs to lock a relation that ends up on the BUILD side of a lazy
 	// hash join, the build scan is drained + closed at Open so its currentTID
@@ -615,11 +634,137 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
+	o.firstProbe = nil
+	probeOpened := false
+	if o.wantOuterPrefetch() {
+		probe := o.right
+		if !o.hashBuildIsLeft() {
+			probe = o.left
+		}
+		if err := probe.Open(ctx); err != nil {
+			return err
+		}
+		probeOpened = true
+		slot, err := probe.Next()
+		if err == EOF {
+			// An empty outer ends the join before the hash table is
+			// built. Next finds no stream and answers EOF; Close closes
+			// the opened probe and the never-Opened build side alike.
+			o.outerNotEmpty = false
+			o.lazyProbe = nil
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		o.outerNotEmpty = true
+		o.firstProbe = slot
+	}
 	probeIsLeft, err := o.buildLazyHashTable(ctx)
 	if err != nil {
 		return err
 	}
+	// "Reset OuterNotEmpty for scan" (nodeHashjoin.c): the probe loop sets
+	// it again from the first tuple it reads, the prefetched one included.
+	o.outerNotEmpty = false
+	if o.emptyBuildEndsJoin() {
+		// Without a prefetch the probe side is never opened: Next finds no
+		// stream and answers EOF, and Close on a never-Opened operator is a
+		// no-op.
+		o.firstProbe = nil
+		o.lazyProbe = nil
+		return nil
+	}
+	if probeOpened {
+		return o.adoptProbeSide(probeIsLeft)
+	}
 	return o.openProbeSide(ctx, probeIsLeft)
+}
+
+// wantOuterPrefetch is ExecHashJoin's decision to fetch the first outer tuple
+// before building the hash table (nodeHashjoin.c, HJ_BUILD_HASHTABLE): never
+// for a join that fills the inner side (the table is needed whatever the
+// outer holds); always for one that fills the outer side; otherwise when the
+// outer's startup cost is below the Hash node's total cost and the previous
+// scan did not find the outer non-empty. An empty outer then skips the build.
+//
+// Only the serial build takes it, as only PG's serial build does: the shared
+// and Parallel Hash builds return before this point, and the CTID-preserving
+// build (a downstream FOR UPDATE on the build relation) keeps its order.
+func (o *joinOp) wantOuterPrefetch() bool {
+	if o.preserveCTIDRel != nil || o.fillBuildSide() {
+		return false
+	}
+	if o.probeFillsUnmatched() {
+		return true
+	}
+	if o.outerNotEmpty {
+		return false
+	}
+	if o.prefetchCost == 0 {
+		o.prefetchCost = 2
+		probeNode, buildNode := o.plan.Left, o.plan.Right
+		if o.hashBuildIsLeft() {
+			probeNode, buildNode = buildNode, probeNode
+		}
+		if probeNode != nil && buildNode != nil {
+			// The Hash node's total cost is its child's
+			// (create_hashjoin_plan copies the inner path's costs).
+			_, probeStartup, _, _ := explainCostFields(probeNode, 0)
+			_, _, buildTotal, _ := explainCostFields(buildNode, 0)
+			if probeStartup < buildTotal {
+				o.prefetchCost = 1
+			}
+		}
+	}
+	return o.prefetchCost == 1
+}
+
+// adoptProbeSide is openProbeSide for a probe the outer prefetch already
+// opened: the build left it untouched, and pullProbe hands back the
+// prefetched tuple first.
+func (o *joinOp) adoptProbeSide(probeIsLeft bool) error {
+	probe := o.right
+	if probeIsLeft {
+		probe = o.left
+	}
+	o.lazyProbe = probe
+	o.probeEOF = false
+	o.fillSweepReset()
+	if o.batches != nil {
+		o.batches.nbatchOutstart = o.batches.nbatch
+	}
+	return nil
+}
+
+// pullProbe reads the next probe tuple: the prefetched one first, then the
+// probe operator. A tuple read sets outerNotEmpty, as
+// ExecHashJoinOuterGetTuple sets hj_OuterNotEmpty.
+func (o *joinOp) pullProbe() (TupleSlot, error) {
+	if s := o.firstProbe; s != nil {
+		o.firstProbe = nil
+		o.outerNotEmpty = true
+		return s, nil
+	}
+	s, err := o.lazyProbe.Next()
+	if err == nil {
+		o.outerNotEmpty = true
+	}
+	return s, err
+}
+
+// emptyBuildEndsJoin is ExecHashJoin's empty-inner exit (nodeHashjoin.c,
+// HJ_BUILD_HASHTABLE): when the hash table came out empty and the join does
+// not emit unmatched outer tuples (`!HJ_FILL_OUTER`), no probe row can
+// produce output, so PG returns without scanning the outer relation. A
+// nested loop that rescans a hash join per outer row — the parameterised
+// inner of TPC-DS Q95, whose build is an index probe that usually finds
+// nothing — then pays for the probe, not for the whole outer side.
+//
+// The build-fill joins need no case of their own: an empty build has no
+// unmatched build row to sweep.
+func (o *joinOp) emptyBuildEndsJoin() bool {
+	return o.buildRowsCounted && o.buildRows == 0 && !o.probeFillsUnmatched()
 }
 
 // openProbeSide opens whichever side the build did not consume.
@@ -674,6 +819,8 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.lazyRW = rightWidth
 	o.antiBuildRows = 0
 	o.antiBuildHasNull = false
+	o.buildRows = 0
+	o.buildRowsCounted = false
 	// M0127-P4.2: a re-Open that skipped Close must not inherit the previous
 	// run's matched bitmaps or its retained NULL-key build rows.
 	o.lazyMatchedS = nil
@@ -739,6 +886,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			return false, err
 		}
 		o.presizeLazyHash(ctx, o.plan.Left, leftWidth, true)
+		o.buildRowsCounted = true
 		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
@@ -773,6 +921,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		}
 	}
 	o.presizeLazyHash(ctx, o.plan.Right, rightWidth, false)
+	o.buildRowsCounted = true
 	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
@@ -947,6 +1096,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		if err != nil {
 			return err
 		}
+		o.buildRows++
 		l := slotRow(lSlot)
 		if leftWidth == 0 && len(l) > 0 {
 			leftWidth = len(l)
@@ -1016,6 +1166,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		if err != nil {
 			return err
 		}
+		o.buildRows++
 		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r)
@@ -1680,7 +1831,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			return nil, EOF
 		}
 		if o.antiBuildRows == 0 {
-			probeSlot, err := o.lazyProbe.Next()
+			probeSlot, err := o.pullProbe()
 			if err == EOF {
 				return nil, EOF
 			}
@@ -1787,7 +1938,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.probeEOF || o.parallelSkipProbe {
 			err = EOF
 		} else {
-			probeSlot, err = o.lazyProbe.Next()
+			probeSlot, err = o.pullProbe()
 		}
 		if err == EOF {
 			if !o.probeEOF {
@@ -2054,6 +2205,7 @@ func (o *joinOp) Close() error {
 	o.releaseBuildBytes()
 	o.releaseBuildCells()
 	o.lazyProbe = nil
+	o.firstProbe = nil
 	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
 	o.lazyMatchIdx = 0
