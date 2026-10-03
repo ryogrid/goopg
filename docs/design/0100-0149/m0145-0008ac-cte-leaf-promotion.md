@@ -1,7 +1,7 @@
 # M0145-0008ac — a CTE reference in a sublink body is pulled up as a base rel
 
 Status: done (2026-10-03, `c317b037b`; ea-ratchet re-pin `ralph(M0145-0008ac)`).
-Parent: M0145-0008aa. Regression filed: M0145-0008af.
+Parent: M0145-0008aa. Regression M0145-0008af: Q95 half fixed (`c92622dd1`); Q14 half held as M0145-0008ag on the owner-parked probe multiplier.
 
 ## PG behaviour
 
@@ -75,3 +75,23 @@ Q95 against PG's 2.8s. Two parts:
 - the per-probe executor cost of the bitmap and skip-scan probes.
 
 Under R3 the change stays and the regression is a task.
+
+## Follow-up: M0145-0008af (2026-10-03)
+
+The two halves of the regression have different causes.
+
+- **Q95: executor, fixed (`c92622dd1`).** goopg's skip scan descended twice
+  per distinct prefix. PG 18 walks the leaf level, checking each entry
+  against a skip array advanced to its prefix (`_bt_checkkeys` /
+  `_bt_advance_array_keys`), and starts a new primitive scan only when the
+  next match is beyond the page. `btreeSkipEnum.walkLeaf` does the same for
+  the tuple format, re-descending only when a whole leaf was one group.
+  - The web_returns probe goes 226 → 14 ms (PG 1 ms).
+  - The sweep reads Q95 7s → 3s, and Q16 13s → 1s (catalog_returns_pkey,
+    the same shape).
+- **Q14: plan choice, blocked.** goopg's bitmap and index probes each run
+  at PG's speed. PG's `cost_index`, with its loop_count caching, elects an
+  Index Scan per item; goopg elects the bitmap, because
+  `indexProbeCostMultiplier = 2` doubles the index probe's random-page
+  cost. Retiring that multiplier is owner-parked (2026-09-24), so this
+  half is held as M0145-0008ag.

@@ -18113,7 +18113,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     - Gates: units, spotcheck, sweep 96/96, fire set ×2 \(PASS\), TPC\-H
       arm 24/24, ea\-ratchet after re\-pin, regress 7 suites identical\.
   Movement: yes — fire set CATEGORIES\-EXCL\-MATCH SF0\.25 join\-method 28→27, aggregation\-strategy 17→16, parallelism 35→34 \(parameterisation 27→28, rendering 11→13\); SF1 join\-method 28→27 \(qual\-placement 6→8\); match flat 38/29
-- [ ] **M0145\-0008af — REGRESSION: Q14 4\.9x and Q95 2\.3x slower at SF0\.25
+- [x] **M0145\-0008af — REGRESSION: Q14 4\.9x and Q95 2\.3x slower at SF0\.25
   after the CTE\-leaf promotion** \(filed 2026\-10\-03 by M0145\-0008ac\)\.
   Q14 now runs PG\'s nested loop over HashAggregate\(cross\_items\) but probes
   store\_sales with a Bitmap Heap Scan \(~0\.7 ms/probe × 16173\) where PG
@@ -18128,6 +18128,37 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     probe \(goopg prices index probes ~2x PG — M0146\-0049\'s escalation\)
     and time goopg\'s skip\-scan probe against PG\'s Index Searches\.
   - Design: `docs/design/0100\-0149/m0145\-0008ac\-cte\-leaf\-promotion\.md`\.
+  - **Diagnosis 2026\-10\-03:** two separate causes\.
+    - Q14: the plan choice, not the executor\. goopg\'s bitmap probe of
+      store\_sales \(2\.5 ms cold\) is on par with PG\'s own bitmap \(1\.7 ms\),
+      its index scan on par with PG\'s \(0\.067 vs 0\.041 ms\); PG picks the
+      index scan in the loop, goopg the bitmap because
+      `indexProbeCostMultiplier = 2` doubles every index random page
+      \(16\.27 vs PG 8\.30 on the d3 dataset\)\. Retiring that multiplier is
+      owner\-parked \(OWNER DECISIONS 2026\-09\-24\) → split out as
+      M0145\-0008ag `\[\!\]`\.
+    - Q95: goopg\'s skip scan descended twice per distinct prefix
+      \(web\_returns\_pkey probe 226 ms vs PG 1 ms, one Index Search\)\.
+  - **LANDED 2026\-10\-03 \(`c92622dd1`\)** — the Q95 half: the skip scan
+    walks the leaf level and re\-descends only past a whole\-leaf group
+    \(`btreeSkipEnum\.walkLeaf`, PG 18\'s `\_bt\_advance\_array\_keys`\)\. Probe
+    226 → 14 ms; sweep Q95 7s → 3s, Q16 13s → 1s; plans unchanged\.
+    `TestSkipScanLeafWalk`\.
+  Movement: none — executor runtime only \(sweep Q95 7s→3s, Q16 13s→1s\); plans unchanged
+- [!] **M0145\-0008ag — Q14 probes store\_sales by bitmap where PG index\-scans
+  \(4\.9x slower at SF0\.25\)** \(filed 2026\-10\-03 by M0145\-0008af\)\.
+  Kind: impl
+  Parent: M0145\-0008af
+  - Blocked on the owner\-parked `indexProbeCostMultiplier` retirement
+    \(OWNER DECISIONS 2026\-09\-24, M0145\-0008 flip unblock \(a\): "retiring
+    it is the measured\-regression exit and stays parked"\)\. The multiplier
+    doubles a parameterised index probe\'s random\-page cost, so the bitmap
+    probe wins the loop where PG\'s cost\_index \(with loop\_count caching\)
+    elects an Index Scan: Q14 24\.9s vs PG 4\.8s on its first statement\.
+  - Evidence for the owner: the multiplier now costs runtime in the
+    opposite direction from the one it was calibrated for \(Q14 here, and
+    the bitmap\-for\-index swaps on Q54\'s web\_sales and the d3 dataset —
+    M0146\-0049\'s escalation\)\.
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
