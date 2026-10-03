@@ -164,6 +164,15 @@ func EstimateRows(n Node) int64 {
 	case *WindowAgg:
 		return EstimateRows(x.Child)
 	case *Join:
+		// M0146-0009k: a join the search produced carries the joinrel size
+		// it chose (stampPlanCost); every node above reads THAT count, as
+		// PG's upper paths read subpath->rows (create_sort_path ->
+		// cost_sort). estimateJoin is the pre-search estimator: above a
+		// searched join it sized TPC-DS Q59's Sort at 4811 rows over a
+		// 15-row Hash Join.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateJoin(x)
 	case *OrdinalityWrap:
 		// Pass-through wrapper: appends an ordinal column, row count
@@ -219,6 +228,10 @@ func EstimateRows(n Node) int64 {
 	case *SetOp:
 		return estimateSetOp(x)
 	case *NestedLoopIndexJoin:
+		// M0146-0009k: as *Join — the searched size wins.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateNLIndexJoin(x)
 	}
 	return 0
