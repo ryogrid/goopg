@@ -24683,7 +24683,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Gates: units, spotcheck, sweep 96/96, fire set \(23 queries per scale
       on cost text only, categories unchanged\), TPC\-H arm, ea\-ratchet 10/10\.
     Movement: none — instrument artefact: the plan\-parity classifier compares shapes, not costs; match and categories unchanged
-- [ ] **M0146\-0005du — goopg rewrites max\(\)/min\(\) into an ordered\-Limit
+- [x] **M0146\-0005du — goopg rewrites max\(\)/min\(\) into an ordered\-Limit
   InitPlan without an index; PG keeps the Aggregate** \(filed 2026\-10\-03 by
   M0146\-0005dr\)\. `SELECT b, \(SELECT max\(p\) FROM e1\) FROM e2` on an
   unindexed `e1`: goopg plans `Result → InitPlan → Limit → Sort \(21609\) →
@@ -24694,6 +24694,15 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146\-0005
   - First step: find goopg\'s S6 min/max rewrite gate and check whether it
     compares the rewritten path\'s cost with the plain aggregate\'s\.
+  - **LANDED 2026\-10\-04 \(`e625c333c`\)\.** PG\'s gate is not a cost
+    comparison first: `build\_minmax\_path` takes only a PRESORTED path
+    \(planagg\.c:443\-448\), so with no index ordering the column there is no
+    rewrite at all\. `minmaxPresortedIndexExists` declines the rewrite in
+    that case; the Aggregate stands \(verified on 6 shapes against PG\)\.
+    - Six tests that pinned the old fallback re\-checked against PG and
+      moved to PG\'s answer\.
+    - Design `docs/design/0100\-0149/m0146\-0005du\-minmax\-presorted\-path\.md`\.
+  Movement: none — no TPC\-DS/TPC\-H query takes min/max over an unindexed column \(fire set unchanged\)
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
