@@ -24964,7 +24964,7 @@ M0146-0001 re-baseline census on the new default arm.
     pairs\. Design `docs/design/0100\-0149/m0146\-0048\-window\-nulls\-order\-key\.md`\.
     - Test `TestWindowsDifferingInNullsOrderStayApart`; regress `window`
       byte\-identical; sweep 96/96, fire set \(no plan changes\), TPC\-H arm PASS\.
-- [ ] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
+- [x] **M0146\-0045 — WRONG RESULTS: an `ARRAY\[\.\.\.\]` constructor\'s output
   does not quote its elements** \(filed 2026\-10\-02 by M0146\-0033;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.
   goopg: `array\['a,b','c'\]` = `\{a,b,c\}`, `array\['x y'\]::text\[\]` =
@@ -24983,6 +24983,13 @@ M0146-0001 re-baseline census on the new default arm.
     through array\_out\'s quoting rule \(quote when empty, `NULL`
     case\-insensitively, or containing `\{\}",\\` or whitespace; escape `"` and
     `\\`\), as the literal\-cast path already does\.
+  - **LANDED 2026\-10\-03\.** `array\_construct` prints each element through its
+    output function \(`formatDatumDateStyle`\) and array\_out\'s quoting
+    \(`array\.QuoteTextElem`\); sub\-arrays splice unquoted\. Design
+    `docs/design/0100\-0149/m0146\-0045\-array\-construct\-quoting\.md`\.
+    - Probes identical to PG; `TestArrayConstructQuotesElements`\.
+    - Regress arrays 3205→3185, rowtypes 1391→1384, jsonb/json −6, no new
+      mismatches; sweep 96/96, fire set, TPC\-H arm PASS\.
 - [x] **M0146\-0044 — WRONG RESULTS: `mod\(numeric, numeric\)` returns wrong
   values; `numeric % numeric` is unsupported** \(filed 2026\-10\-02 by
   M0146\-0041; REPRODUCED on a private throwaway cluster, S2 escalation:

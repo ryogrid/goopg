@@ -12986,10 +12986,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil {
 				return NullDatum, err
 			}
-			if v.IsNull() {
+			switch {
+			case v.IsNull():
 				sb.WriteString("NULL")
-			} else {
+			case arrayConstructElemIsArray(arg, v):
+				// A sub-array (ARRAY[ARRAY[…], …]) is spliced as its own
+				// `{…}` text, never quoted.
 				sb.WriteString(v.Format())
+			default:
+				// M0146-0045: array_out's element quoting — an empty
+				// string, `NULL` (any case), or any of `{}",\` and
+				// whitespace is double-quoted with `"` and `\` escaped,
+				// so the text re-reads as the same elements.
+				sb.WriteString(quoteArrayTextElem(formatDatumDateStyle(v, ctx)))
 			}
 		}
 		sb.WriteByte('}')
@@ -21781,4 +21790,21 @@ func isTextTargetTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// arrayConstructElemIsArray reports whether an ARRAY[...] element is itself
+// an array (a nested constructor or an array-typed expression), whose text
+// is spliced into the outer array rather than quoted as one element.
+func arrayConstructElemIsArray(e optimizer.Expr, v Datum) bool {
+	if fc, ok := e.(*optimizer.FuncCall); ok && fc.Name == "array_construct" {
+		return true
+	}
+	if t, ok := optimizer.ExprResultType(e); ok {
+		return t.IsArray || strings.HasSuffix(t.Name, "[]")
+	}
+	// Untyped here (a function call ExprResultType does not resolve, e.g.
+	// string_to_array): an array-valued result is the only `{…}` text such
+	// an element produces in practice.
+	txt := v.Format()
+	return strings.HasPrefix(txt, "{") && strings.HasSuffix(txt, "}")
 }
