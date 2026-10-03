@@ -24393,11 +24393,38 @@ M0146-0001 re-baseline census on the new default arm.
     - Regress `window` 4348→4275, no row changes\.
     - TPC\-DS Q44/Q67 Run Conditions match PG; aligned \+1/\+1; categories flat\.
     Movement: none — match 39/28 and CATEGORIES\-EXCL\-MATCH flat \(the classifier normalises Run Condition vs Filter\); aligned lines 2338→2339 / 2183→2184
-- [ ] **M0146\-0005do — an expression member joins its equivalence class** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005do — an expression member joins its equivalence class** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q59: `wss\_1\.d\_week\_seq \- 52 = wss\.d\_week\_seq` and `wss\.d\_week\_seq = d\.d\_week\_seq` give PG the derived `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq`; goopg\'s classes hold only plain columns, so the clause and PG\'s join order are missing \(final rows 15 vs 1\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: extend the seam\'s union\-find \(equiv\_class\.go\) to non\-volatile expression members on one rel\.
+  - **LANDED 2026\-10\-03 \(`b060492aa`\)\.** `ecEquality` / `ecMemberIdent`
+    admit a non\-volatile single\-relation expression \(columns, constants,
+    operators, casts; walkExprRefs/scopeVeto\) into both class builders —
+    the seam closure and joinrestrict\'s class assignment; with an
+    expression member, int2/int4/int8 cross\-type is admitted
+    \(integer\_ops family; goopg types `int4 \- 52` int8\)\. Design
+    `docs/design/0100\-0149/m0146\-0005do\-ec\-expression\-members\.md`\.
+    - Probe `a = b \- 52 AND a = c`: goopg plans PG\'s tree exactly
+      \(`\(e2\.b \- 52\) = e3\.c`\); the class constant reaches `\(b \- 52\) = 7`\.
+    - Q59 fires at SF0\.25 and SF1 \(values PASS\) and uses the derived
+      clause; its join order still differs \(filed M0146\-0005ds\)\.
+    - Movement: none — SF1 join\-method \+1, parameterisation \+1,
+      qual\-placement −1 \(within ±3\), match unchanged, ea\-ratchet 10/10\.
+- [ ] **M0146\-0005ds — Q59 joins `d` early on the derived clause; PG joins it
+  late** \(filed 2026\-10\-03 by M0146\-0005do\)\. After 0005do goopg joins
+  `d` to `\{wss\_1, store\_1, d\_1\}` on `\(wss\_1\.d\_week\_seq \- 52\) =
+  d\.d\_week\_seq` \(5 rows\), then `\{wss, store\}`; PG joins `\{wss, store, d\}`
+  \(130\) to `\{wss\_1, store\_1\}` on two conditions \(9\), then `d\_1` by Nested
+  Loop over a Materialize \(1\)\. Also goopg\'s top Sort reads 4811 rows over a
+  15\-row join \(rel size vs path size from different splits — the same
+  disagreement 13 baseline queries show\)\.
+  Kind: recon
+  Parent: M0146\-0005
+  - First step: compare goopg\'s and PG\'s estimate for the
+    `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq` join \(ndv of the expression
+    member: PG examine\_variable gives an expression without stats
+    DEFAULT\_NUM\_DISTINCT\) and the joinrel size per split\.
 - [ ] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
   Kind: impl
