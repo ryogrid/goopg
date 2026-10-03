@@ -24876,7 +24876,7 @@ M0146-0001 re-baseline census on the new default arm.
   > \(wrong results, durable catalog pollution\)\. Filed and not selected ahead
   > of the banner, per S2; the owner decides its placement\.
 
-- [ ] **M0146\-0046 — WRONG RESULTS: `ctid` reads NULL through an Index
+- [x] **M0146\-0046 — WRONG RESULTS: `ctid` reads NULL through an Index
   Scan or Index Only Scan** \(filed 2026\-10\-02 by the M0146\-0005 Q52
   diagnosis; REPRODUCED on a private throwaway cluster and a fresh table,
   S2 escalation: wrong results\)\. `create table zc\(a int primary key, b
@@ -24898,6 +24898,14 @@ M0146-0001 re-baseline census on the new default arm.
     counts `ctid` as a needed column when it elects an index\-only scan \(PG
     never does: `check\_index\_only` requires every referenced attribute,
     and ctid is not an index column\)\.
+  - **LANDED 2026\-10\-03\.** `indexScanOp` stamps the HOT\-resolved live TID
+    on its slot; `neededColumnsOfRel` counts referenced heap system columns,
+    which no index covers, so a statement reading `ctid` never takes an
+    index\-only scan \(PG check\_index\_only\)\. Design
+    `docs/design/0100\-0149/m0146\-0046\-index\-scan\-ctid\.md`\.
+    - Probes identical to PG; `TestIndexScanCarriesCtid`; regress tidscan/
+      tid/tidrangescan/update identical; sweep 96/96, fire set \(no plan
+      changes\), TPC\-H arm PASS\.
 - [x] **M0146\-0047 — WRONG RESULTS: a null\-extended row\'s whole\-row value
   is not NULL** \(filed 2026\-10\-03 by the M0146\-0005dl edge\-case probe;
   REPRODUCED on a private throwaway cluster, S2 escalation: wrong results\)\.

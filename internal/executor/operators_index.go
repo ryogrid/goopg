@@ -1308,6 +1308,12 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		}
 		o.slot.schema = o.Schema()
 		o.slot.row = row
+		// M0146-0046: the heap tuple's TID rides the slot for the `ctid`
+		// system column, as seqScanOp and bitmapHeapScanOp stamp it — the
+		// HOT-resolved live version, the tuple whose columns were decoded.
+		o.slot.hasCTID = true
+		o.slot.ctidBlock = uint32(ptr.Block)
+		o.slot.ctidOff = actualSlot
 		// take2, sibling of the seqScanOp check: this operator decodes at
 		// len(o.plan.Table.Columns) while advertising o.plan.Output(), the same
 		// pairing P4-01b broke. Off unless GOOPG_ASSERT_ROW_SHAPE=1.

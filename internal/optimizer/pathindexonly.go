@@ -121,8 +121,22 @@ func (s *searchCtx) neededColumnsOfRel(rel *RelOptInfo, tbl *catalog.Table) []ca
 			out = append(out, c)
 		}
 	}
+	// M0146-0046: check_index_only's attrs_used includes system columns,
+	// which no index stores — a statement reading this relation's `ctid`
+	// (or another heap system column) can never be answered from the index.
+	// The synthetic entry is never covered, so every index-only producer
+	// declines; a column of the table cannot carry a system column's name.
+	for _, sys := range heapSystemColumnNames {
+		if neededColumnNamedFor(s.neededCols, qual, sys) {
+			out = append(out, catalog.Column{Name: sys})
+		}
+	}
 	return out
 }
+
+// heapSystemColumnNames are the system columns a heap scan supplies and an
+// index-only scan cannot (PG's SelfItemPointer through TableOid).
+var heapSystemColumnNames = []string{"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"}
 
 func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	out := make([]catalog.Column, 0, len(tbl.Columns))
