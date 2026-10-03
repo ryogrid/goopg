@@ -182,9 +182,12 @@ func TestExplainSortKeySubqueryGroupByUnchanged(t *testing.T) {
 		t.Errorf("expected byte-identical `Sort Key: max`; got:\n%s", strings.Join(rows, "\n"))
 	}
 	joined := strings.Join(rows, "\n")
-	// PG plan_id order: the MIN/MAX InitPlan inside the sublink is
-	// InitPlan 1, the sublink InitPlan 2 (PG 18.3, M0146-0005bv).
-	if !strings.Contains(joined, "Group Key: (InitPlan 2).col1") {
+	// r66q2.x has no index, so the MIN/MAX rewrite does not fire
+	// (M0146-0005du) and the sublink is InitPlan 1, as in PG 18.3. (PG
+	// drops the constant GROUP BY key and the ORDER BY over it entirely —
+	// GroupAggregate with no Group Key and no Sort; goopg keeps both,
+	// ledgered.)
+	if !strings.Contains(joined, "Group Key: (InitPlan 1).col1") {
 		t.Errorf("expected Group Key InitPlan numbering intact; got:\n%s", joined)
 	}
 	assertNoOpaqueExpr(t, joined)

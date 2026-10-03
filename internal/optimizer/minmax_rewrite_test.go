@@ -91,9 +91,11 @@ func TestRewriteMinMaxAggBareMinIndexOnlyScan(t *testing.T) {
 	}
 }
 
-// TestRewriteMinMaxAggBareMinSeqScanFallback: no index on x → the rewrite still
-// fires (PG's cheapest-sorted-path can be a SeqScan — the Limit+ORDER BY
-// subquery is still built), now as Limit → Sort → Filter(SeqScan).
+// TestRewriteMinMaxAggBareMinSeqScanFallback: no index on x, so no path is
+// presorted on x. PG's build_minmax_path takes only a presorted path
+// (get_cheapest_fractional_path_for_pathkeys, planagg.c:443) and fails
+// without one, so the plain Aggregate stands (PG 18.3: Aggregate -> Seq Scan).
+// The rewrite used to fire anyway as Limit -> Sort -> Seq Scan (M0146-0005du).
 func TestRewriteMinMaxAggBareMinSeqScanFallback(t *testing.T) {
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
@@ -106,39 +108,7 @@ func TestRewriteMinMaxAggBareMinSeqScanFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, lim, child := digMinMaxInner(t, plan)
-	// The SeqScan fallback needs a Project between the Limit and the Sort so
-	// the InitPlan emits exactly one column (SeqScan always decodes the full
-	// table row). The Project is invisible to EXPLAIN (walkPlanFiltered skips
-	// Project wrappers), so the rendered shape stays Limit -> Sort -> SeqScan.
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project", child)
-	}
-	if len(proj.Targets) != 1 {
-		t.Fatalf("Project has %d targets, want 1", len(proj.Targets))
-	}
-	if cr, ok := proj.Targets[0].(*ColumnRef); !ok || cr.Name != "x" {
-		t.Fatalf("Project target = %#v, want ColumnRef(x)", proj.Targets[0])
-	}
-	if len(proj.schema) != 1 || proj.schema[0].Name != "x" {
-		t.Fatalf("Project schema = %+v, want single column x", proj.schema)
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort", proj.Child)
-	}
-	if len(sort.Keys) != 1 || sort.Keys[0].Desc || sort.Keys[0].NullsFirst {
-		t.Fatalf("Sort keys = %+v, want [x ASC NULLS LAST]", sort.Keys)
-	}
-	f, ok := sort.Child.(*Filter)
-	if !ok {
-		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
-	}
-	if _, ok := f.Child.(*SeqScan); !ok {
-		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
-	}
-	_ = lim
+	assertMinMaxDeclined(t, plan)
 }
 
 // TestRewriteMinMaxAggBareMaxRewrites: bare `max(x)` (Slice 2's Backward
@@ -188,9 +158,9 @@ func TestRewriteMinMaxAggBareMaxIndexOnlyScan(t *testing.T) {
 	}
 }
 
-// TestRewriteMinMaxAggBareMaxSeqScanFallback: no index on x → the max rewrite
-// still fires via the SeqScan fallback, with the Sort reversed to DESC NULLS
-// FIRST (max's reverse sort clause — fetch_agg_sort_op `>`, planagg.c:163-179).
+// TestRewriteMinMaxAggBareMaxSeqScanFallback: max(x) with no index on x —
+// as for min, no presorted path exists, so PG keeps the Aggregate
+// (M0146-0005du).
 func TestRewriteMinMaxAggBareMaxSeqScanFallback(t *testing.T) {
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
@@ -203,29 +173,7 @@ func TestRewriteMinMaxAggBareMaxSeqScanFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, lim, child := digMinMaxInner(t, plan)
-	// The SeqScan fallback needs a Project between the Limit and the Sort so the
-	// InitPlan emits exactly one column (SeqScan always decodes the full table
-	// row); the Project is invisible to EXPLAIN.
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project", child)
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort", proj.Child)
-	}
-	if len(sort.Keys) != 1 || !sort.Keys[0].Desc || !sort.Keys[0].NullsFirst {
-		t.Fatalf("Sort keys = %+v, want [x DESC NULLS FIRST]", sort.Keys)
-	}
-	f, ok := sort.Child.(*Filter)
-	if !ok {
-		t.Fatalf("Sort child is %T, want *Filter", f)
-	}
-	if _, ok := f.Child.(*SeqScan); !ok {
-		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
-	}
-	_ = lim
+	assertMinMaxDeclined(t, plan)
 }
 
 // TestRewriteMinMaxAggMaxNullTrap: a table whose max column contains NULLs must
@@ -672,58 +620,28 @@ func TestRewriteMinMaxAggCompositePrefixMaxIOS(t *testing.T) {
 	}
 }
 
-// TestRewriteMinMaxAggCompositePrefixNonPrefixQualFallback — S6 Slice 3c
-// acceptance (c) first half: `min(y) WHERE z = 5` puts the equality on a
-// NON-prefix column, so neither the leading-column nor the composite branch can
-// fire and the rewrite stays on the SeqScan fallback (no IOS).
+// TestRewriteMinMaxAggCompositePrefixNonPrefixQualFallback: `min(y) WHERE z = 5`
+// over index (x, y) — x is not bound, so the index does not order y and no
+// presorted path exists: PG 18.3 keeps Aggregate -> Seq Scan (M0146-0005du).
 func TestRewriteMinMaxAggCompositePrefixNonPrefixQualFallback(t *testing.T) {
 	cat, _ := minmaxCompositeCatalog(t)
 	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE z = 5"), cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, _, child := digMinMaxInner(t, plan)
-	if _, ok := child.(*IndexOnlyScan); ok {
-		t.Fatalf("qual on non-prefix column z rewrote to IndexOnlyScan; must stay SeqScan fallback")
-	}
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
-	}
-	if _, ok := proj.Child.(*IndexOnlyScan); ok {
-		t.Fatalf("Project child is *IndexOnlyScan; must stay SeqScan fallback")
-	}
-	sort, ok := proj.Child.(*Sort)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
-	}
-	if _, ok := sort.Child.(*Filter); !ok {
-		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
-	}
+	assertMinMaxDeclined(t, plan)
 }
 
-// TestRewriteMinMaxAggCompositePrefixNoWhereFallback — S6 Slice 3c acceptance
-// (c) second half: `min(y)` with NO WHERE over only the composite [x, y] index
-// stays on the SeqScan fallback — the composite branch needs a WHERE equality
-// to bind the leading prefix, and no single-column index on y exists for the
-// leading-column branch.
+// TestRewriteMinMaxAggCompositePrefixNoWhereFallback: `min(y)` with no WHERE
+// over index (x, y) — the leading x is unbound, so no path is presorted on y:
+// PG 18.3 keeps Aggregate -> Seq Scan (M0146-0005du).
 func TestRewriteMinMaxAggCompositePrefixNoWhereFallback(t *testing.T) {
 	cat, _ := minmaxCompositeCatalog(t)
 	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t"), cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	_, _, _, child := digMinMaxInner(t, plan)
-	proj, ok := child.(*Project)
-	if !ok {
-		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
-	}
-	if _, ok := proj.Child.(*IndexOnlyScan); ok {
-		t.Fatalf("no-WHERE min(y) rewrote to IndexOnlyScan over the composite index; must stay SeqScan fallback (no leading-column index on y)")
-	}
-	if _, ok := proj.Child.(*Sort); !ok {
-		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
-	}
+	assertMinMaxDeclined(t, plan)
 }
 
 // TestRewriteMinMaxAggCompositePrefixRangeReject — S6 Slice 3c acceptance (d):
@@ -805,5 +723,36 @@ func TestRewriteMinMaxAggCompositePrefixDuplicateEqualityFallback(t *testing.T) 
 	}
 	if eq, ok := both.Right.(*BinaryOp); !ok || eq.Op != parser.OpEq {
 		t.Fatalf("Filter predicate left-right = %#v, want `x = 44`", both.Right)
+	}
+}
+
+// assertMinMaxDeclined checks that preprocess_minmax_aggregates' rewrite did
+// not fire: the root is not the childless Result whose target is the min/max
+// InitPlan, and the plain Aggregate is in the plan.
+func assertMinMaxDeclined(t *testing.T, plan Node) {
+	t.Helper()
+	if r, ok := plan.(*Result); ok && len(r.Targets) == 1 {
+		if _, isSub := r.Targets[0].(*SubqueryExpr); isSub {
+			t.Fatalf("min/max rewrote to an InitPlan with no presorted path; PG keeps the Aggregate")
+		}
+	}
+	found := false
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		if _, ok := n.(*Aggregate); ok {
+			found = true
+			return
+		}
+		kids, _ := planChildNodes(n)
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(plan)
+	if !found {
+		t.Fatalf("plan has no Aggregate; PG keeps the plain aggregate here")
 	}
 }

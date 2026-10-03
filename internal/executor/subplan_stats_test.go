@@ -142,7 +142,10 @@ func TestSubPlanStatsCorrelatedScalarRescans(t *testing.T) {
 // M0058-0001 constant-key cache still does its job and that the
 // counters describe it correctly: one miss, the remainder hits.
 func TestSubPlanStatsNonCorrelatedCachesAfterFirst(t *testing.T) {
-	ctx, cleanup := statsFixture(t)
+	// The index on t2.b gives planagg its presorted path; without one the
+	// MIN/MAX rewrite does not fire (M0146-0005du) and there is no inner
+	// InitPlan to count.
+	ctx, cleanup := statsFixture(t, "CREATE INDEX t2_b_idx ON t2 (b)")
 	defer cleanup()
 
 	runQuery(t, ctx,

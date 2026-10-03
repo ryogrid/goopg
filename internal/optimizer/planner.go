@@ -12622,6 +12622,18 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			}
 		}
 
+		if inner == nil && !minmaxPresortedIndexExists(cat, tbl, argCR.Name, wherePred) {
+			// M0146-0005du: no index can order the column. PG's
+			// build_minmax_path only takes a PRESORTED path —
+			// get_cheapest_fractional_path_for_pathkeys over the final rel's
+			// pathlist, with no explicit Sort added (planagg.c:443-448) — and
+			// returns false without one, so preprocess_minmax_aggregates adds
+			// no MinMaxAgg path and the plain Aggregate stands. Declining here
+			// keeps the Aggregate; the Sort fallback below is reached only when
+			// such an index exists but the index-only probe declined (PG would
+			// take that index path — ledgered).
+			return nil, false, nil
+		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
 			// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
@@ -12921,6 +12933,56 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // quals is the resolved restriction the scan will apply (nil when none is
 // known). It only widens which composite index is complete for the probe:
 // see the NULL-key rule below.
+// minmaxPresortedIndexExists reports whether some index yields a path
+// presorted on col — what build_minmax_path's
+// get_cheapest_fractional_path_for_pathkeys needs (planagg.c:443) for
+// `ORDER BY col LIMIT 1` under the statement's WHERE. A non-partial btree
+// index does when col is at position k and every column before it is bound
+// by an equality conjunct `column = constant` (PG's pathkeys drop the
+// equality-bound EC members, so the index order is col's order). Other
+// conjuncts may sit beside the equalities; they only filter.
+func minmaxPresortedIndexExists(cat catalog.Catalog, tbl *catalog.Table, col string, where Expr) bool {
+	if cat == nil || tbl == nil {
+		return false
+	}
+	bound := map[string]bool{}
+	var walk func(e Expr)
+	walk = func(e Expr) {
+		b, ok := e.(*BinaryOp)
+		if !ok {
+			return
+		}
+		if b.Op == parser.OpAnd {
+			walk(b.Left)
+			walk(b.Right)
+			return
+		}
+		if b.Op != parser.OpEq {
+			return
+		}
+		if c, isCol := b.Left.(*ColumnRef); isCol && isConstantExpr(b.Right) {
+			bound[strings.ToLower(c.Name)] = true
+		} else if c, isCol := b.Right.(*ColumnRef); isCol && isConstantExpr(b.Left) {
+			bound[strings.ToLower(c.Name)] = true
+		}
+	}
+	walk(where)
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if strings.ToLower(idx.Method) != "btree" || idx.HasPredicate {
+			continue
+		}
+		for _, ic := range idx.Columns {
+			if strings.EqualFold(ic, col) {
+				return true
+			}
+			if !bound[strings.ToLower(ic)] {
+				break
+			}
+		}
+	}
+	return false
+}
+
 func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause, quals Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
