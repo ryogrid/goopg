@@ -1,6 +1,6 @@
 # M0146-0049 — a parameterised inner path through a non-scan node
 
-Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`), and (d) — d1 (`d2fdb535a`), d2 (`cd1dbec34`), d3 (`6667e4a72`) — landed 2026-10-03; (e) and (f) open. Parent: M0146
+Status: held (S4 escalation 2026-10-03, owner decision needed) — slices (a) recon, (b)+(c) (`f661e6933`), and (d) — d1 (`d2fdb535a`), d2 (`cd1dbec34`), d3 (`6667e4a72`) — landed 2026-10-03; (e) and (f) open but unselectable. Parent: M0146
 (banner item 3: owner-named next in the structural line, the blocker of
 M0146-0005dp/dq and M0145-0008ac/0008y).
 Background: `docs/design/0100-0149/m0146-0005dt-parameterised-append-recon.md`.
@@ -287,7 +287,8 @@ through M0145-0008ac's CTE-leaf pull-up, which this unblocks.
 - Non-INNER parameterised joins.
 - A parameterised index-only probe costs about twice PG's (16.27 against
   8.30), so goopg picks a bitmap probe where PG keeps the index-only scan.
-  Filed as M0146-0049g.
+  This is not filed as a task: M0146-0049's S4 lineage budget is spent, so
+  it is named in the task's escalation block and ledgered.
 
 ## Remaining slices
 
