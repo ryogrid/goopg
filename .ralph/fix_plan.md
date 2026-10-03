@@ -25829,7 +25829,7 @@ M0146-0001 re-baseline census on the new default arm.
     - 1 is unexplained: the Q23 CTE semi fraction \(PG 0\.2865 =
       |CTE|/nd1, goopg 0\.5\) → filed M0146\-0009g\.
   Movement: none — ea-ratchet 10 -> 10 (recon)
-- [ ] **M0146\-0009g — Q23: PG\'s semi fraction against a grouped CTE with
+- [x] **M0146\-0009g — Q23: PG\'s semi fraction against a grouped CTE with
   HAVING** \(filed 2026\-09\-30 by M0146\-0009f\)\. PG 18\.3 gives
   `cs_item_sk IN \(SELECT item_sk FROM frequent_ss_items\)` a semi fraction
   of 4582/15993 = 0\.2865 when the 3\-key grouped CTE has a HAVING \(even
@@ -25837,12 +25837,37 @@ M0146-0001 re-baseline census on the new default arm.
   PG source read so far \(examine\_simple\_variable\'s multi\-key
   groupClause return, get\_variable\_numdistinct\'s default\) does not
   explain the split\.
-  Kind: recon
+  Kind: impl
   Parent: M0146\-0009
   - First step: on an instrumented PG 18\.3 \(M0144\-0004 OPTIMIZER\_DEBUG
     build, or a private build with an elog in eqjoinsel\_semi\), print nd1,
     nd2, isdefault1/2 and the clamps for variants A and F of
     `analysis/m0146/m0146\-0009f/q23semi2\.sql`; then port the arm\.
+  - **LANDED 2026\-10\-03 \(`d8c1d2f8a`\)\.** Re\-kinded recon → impl: the
+    instrumented trace resolved the mechanism and the port landed in the
+    same task\. An elog in a private PG 18\.3 build showed `eqjoinsel\_semi`
+    punting to 0\.5 for BOTH variants; the split is `eqjoinsel`\'s SEMI/ANTI
+    clamp `selec = Min\(selec, inner\_rel\->rows \* selec\_inner\)`
+    \(selfuncs\.c:2417\), ported in the search and plan\-side estimators\.
+    Design `docs/design/0100\-0149/m0146\-0009g\-semi\-clamp\-inner\-join\.md`\.
+    - `TestSemiJoinSizeClampedByInnerJoin`: HEAD 50000, now 15000, PG 15009\.
+    - Fire set: SF1 match 28 → 29 \(Q69\); SF0\.25 39 → 38 \(Q56 — filed
+      M0146\-0009l, kept per R3\); ea\-ratchet 10/10, sweep 96/96, TPC\-H arm\.
+    Movement: yes — TPC\-DS PLAN\-PARITY match SF1 28→29 \(Q69\); SF0\.25 39→38 \(Q56, M0146\-0009l\)
+- [ ] **M0146\-0009l — Q56 at SF0\.25 lost its match after the semi clamp**
+  \(filed 2026\-10\-03 by M0146\-0009g\)\. The 0009g clamp changes Q56\'s
+  semi\-join row estimates; in one UNION branch goopg now elects `Gather
+  Merge → Sort` where PG \(and goopg before\) has `Sort → Gather` over
+  `item\.i\_item\_id`\. A cost\-election flip downstream of a PG\-faithful
+  estimate, not a values change\.
+  Kind: recon
+  Parent: M0146\-0009
+  > ## ESCALATION 2026\-10\-03 \(R3\) — a PG\-faithful change lost one match
+  > M0146\-0009g \(eqjoinsel\'s SEMI/ANTI clamp\) moved SF1 match 28→29 \(Q69\)
+  > and SF0\.25 39→38 \(Q56\)\. Kept, not reverted \(R3\); the owner decides
+  > otherwise\. Resume point: compare the branch\'s Gather vs Gather Merge
+  > costs with PG\'s for the new row count \(cost\_gather\_merge vs
+  > cost\_sort over a Gather\)\.
 - [ ] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
   packed count** \(filed 2026\-10\-02 by the M0146\-0005 Q52 diagnosis\)\.
   The two TPC\-DS SF0\.25 loads hold the same tuples per page, but PG\'s
