@@ -848,7 +848,20 @@ func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.Joi
 	switch bo.Op {
 	case parser.OpEq:
 		v1, v2 := s.semiJoinOperands(ri, bo, outer)
-		return eqJoinSelectivitySemi(v1, v2, relRows(inner))
+		sel, isdefault := eqJoinSelectivitySemi(v1, v2, relRows(inner))
+		// M0146-0009g: eqjoinsel's SEMI/ANTI arm (selfuncs.c:2417), after
+		// eqjoinsel_semi — a semijoin cannot yield more rows than the inner
+		// join of the same inputs, N1*Ssemi <= N1*N2*Sinner, so
+		// Ssemi <= N2*Sinner, with Sinner eqjoinsel_inner over the unclamped
+		// nds (computed "in all cases" before the jointype switch). TPC-DS
+		// Q23: a HAVING shrinks the grouped CTE to 4582 rows, and PG's 0.5
+		// punt becomes 4582/15993 = 0.2865.
+		if n2 := relRows(inner); n2 > 0 {
+			if selInner, _ := eqJoinSelectivityExt(v1, v2); n2*selInner < sel {
+				sel = n2 * selInner
+			}
+		}
+		return sel, isdefault
 	case parser.OpNe:
 		v1, _ := s.semiJoinOperands(ri, bo, outer)
 		nullfrac1 := 0.0

@@ -1217,7 +1217,16 @@ func outerJoinRowFloor(j *Join, rows float64, l, r int64) float64 {
 func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
 	sel := 1.0
 	for _, p := range joinEquiPairs(j) {
-		sel *= semiPairMatchFraction(j, p, innerRows)
+		f := semiPairMatchFraction(j, p, innerRows)
+		// M0146-0009g: eqjoinsel's SEMI/ANTI arm (selfuncs.c:2417), after
+		// eqjoinsel_semi — Ssemi <= N2 * Sinner. The search-side twin is
+		// `joinClauseSelectivityForJoin`.
+		if innerRows > 0 {
+			if in := semiPairInnerSelectivity(j, p, keyColumnStats(p.Left, j.Left), rightExprStats(j, p.Right)); float64(innerRows)*in < f {
+				f = float64(innerRows) * in
+			}
+		}
+		sel *= f
 	}
 	return sel
 }
@@ -1280,6 +1289,32 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 	}
 	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
 		joinKeyTypeName(p.Left, j.Left), joinKeyTypeName(p.Right, j.Left))
+}
+
+// semiPairInnerSelectivity is `eqjoinsel_inner` for one pair, as eqjoinsel
+// computes it "in all cases" before its jointype switch: the MCV arm when
+// both sides carry lists, else (1-nullfrac1)(1-nullfrac2)/max(nd1, nd2) over
+// the UNCLAMPED nds (eqjoinsel_semi clamps only its own copy of nd2).
+func semiPairInnerSelectivity(j *Join, p JoinKeyPair, st1, st2 *catalog.ColumnStats) float64 {
+	if sel, ok := eqjoinselInnerMCV(j, p); ok {
+		return sel
+	}
+	nd1 := float64(keyNDistinct(p.Left, j.Left))
+	nd2 := float64(rightExprNDistinct(j, p.Right))
+	if nd1 <= 0 {
+		nd1 = defaultNumDistinct
+	}
+	if nd2 <= 0 {
+		nd2 = defaultNumDistinct
+	}
+	sel := 1.0
+	if st1 != nil {
+		sel *= 1 - st1.NullFrac
+	}
+	if st2 != nil {
+		sel *= 1 - st2.NullFrac
+	}
+	return sel / math.Max(nd1, nd2)
 }
 
 // eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
