@@ -1,5 +1,7 @@
 # M0146-0005 (part 7): slices 105+ — EXPLAIN text parity
 
+Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner.
+
 Continuation of [m0146-0005-join-order-burndown-6.md](m0146-0005-join-order-burndown-6.md)
 (slices 87-104), split per the design-doc size rule (D3). Same task and
 census family. Progress is measured with `scripts/tpcds-text-identity.py`:

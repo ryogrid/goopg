@@ -22172,13 +22172,52 @@ M0146-0001 re-baseline census on the new default arm.
       1/2/4 under `\-race` for the memoized fused NLI under Gather —
       the per\-shape identity pin the milestone\'s admission rule
       requires \(claim topology was already pinned\).
-- [ ] **M0146-0005 — join-order / candidate-pool divergence burn-down**
+- [!] **M0146-0005 — join-order / candidate-pool divergence burn-down**
   (impl). The largest residual category (~90 SF0.25 `join-order`
   records): work the per-family decomposition M0146-0001's census
   produces — owns Q8's `depth=3` join-order residue (M0144-0011b) and
   the Q9/Q21/half-Q10 TPC-H family. On completion: re-evaluate
   M0141-S7's S2b-9/S2b-8 (the owner hold releases here) and re-run the
   lateral census (M0146-0011's data).
+  > ## ESCALATION 2026-10-03 (S4 lineage budget) — five consecutive `Movement: none`
+  > The last five completed descendants all carry `Movement: none`, so
+  > S4 stops further selection or filing under this root until the
+  > owner decides. Each one, with what it proved:
+  >
+  > - **0005dn** (window run conditions): a real port. The classifier
+  >   normalises Run Condition vs Filter, so the instruments cannot see it.
+  > - **0005do** (expression equivalence-class members): Q59 gained PG's
+  >   derived clause. Categories moved by 1, inside the ±3 noise band.
+  > - **0005dt** (recon): Q54's parameterised Append needs a
+  >   parameterised inner through a non-scan node. Filed M0146-0049;
+  >   0005dp and 0005dq are `[!]` on it.
+  > - **0005dr** (SS_charge_for_initplans): top-node costs moved toward
+  >   PG's (Q75 550→65220 vs 64209). That is invisible to a shape
+  >   classifier — an instrument artefact.
+  > - **0005ds** (recon): Q59's order is a cost election. Its upper
+  >   nodes are sized by the pre-search join estimator; filed
+  >   M0146-0009k.
+  >
+  > **Blocker.** The remaining routed records are either blocked on
+  > M0146-0049 (parameterised inner through Append / join: Q54, Q95,
+  > and M0145-0008ac/0008y) or are cost elections downstream of
+  > cardinality work (M0146-0009k). The one open child left is 0005du
+  > (min/max rewrite without an index).
+  >
+  > **Expected movement if unblocked.**
+  > - M0146-0049: Q54/Q95 `parameterisation` / `join-method` at both
+  >   scales, plus 0008ac's Q14/Q23/Q95 first divergences.
+  > - M0146-0009k: upper-node rows on 14 SF0.25 queries, with ea-ratchet
+  >   findings and aggregation/sort-strategy elections.
+  >
+  > **Size.** 0049 is multi-slice structural work (three slices); 0009k
+  > is one estimator change with broad fire-set reach.
+  >
+  > **Owner decision needed:** re-pin the lineage baseline for this root
+  > (as was done for M0145-0001), or sequence M0146-0049 / M0146-0009k
+  > first and re-open the root after them. Until then the loop selects
+  > elsewhere: item 3's interleaveable M0146-0009 children, starting
+  > with 0009k.
   Kind: impl
   Parent: none
   - **Slice 112 \(routing, 2026\-10\-02, HEAD `c96a5d2f9`\)\.** Q42, Q52, Q37
@@ -24411,7 +24450,7 @@ M0146-0001 re-baseline census on the new default arm.
       clause; its join order still differs \(filed M0146\-0005ds\)\.
     - Movement: none — SF1 join\-method \+1, parameterisation \+1,
       qual\-placement −1 \(within ±3\), match unchanged, ea\-ratchet 10/10\.
-- [ ] **M0146\-0005ds — Q59 joins `d` early on the derived clause; PG joins it
+- [x] **M0146\-0005ds — Q59 joins `d` early on the derived clause; PG joins it
   late** \(filed 2026\-10\-03 by M0146\-0005do\)\. After 0005do goopg joins
   `d` to `\{wss\_1, store\_1, d\_1\}` on `\(wss\_1\.d\_week\_seq \- 52\) =
   d\.d\_week\_seq` \(5 rows\), then `\{wss, store\}`; PG joins `\{wss, store, d\}`
@@ -24425,6 +24464,18 @@ M0146-0001 re-baseline census on the new default arm.
     `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq` join \(ndv of the expression
     member: PG examine\_variable gives an expression without stats
     DEFAULT\_NUM\_DISTINCT\) and the joinrel size per split\.
+  - **DONE 2026\-10\-03 \(recon\)\.** Design
+    `docs/design/0100\-0149/m0146\-0005ds\-q59\-join\-order\-recon\.md`\.
+    - The clause space is now identical to PG\'s; the derived join\'s
+      eqjoinsel is the same `1/max\(nd\)` in both \(PG\'s default 200 for the
+      unstatted expression loses to `d\.d\_week\_seq`\'s ≈10k\), so the order
+      is a cost election, not a missing candidate\.
+    - The 4811\-over\-15 rows are NOT a split disagreement: join paths take
+      `joinRel\.Rows`; the legacy\-priced Sort reads its child through
+      `EstimateRows`, whose `\*Join` arm is the pre\-search `estimateJoin`
+      and ignores the join\'s stamped `PlanRows` \(14 queries\)\. Filed
+      M0146\-0009k\.
+    Movement: none — recon
 - [!] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
   Kind: impl
@@ -25767,6 +25818,30 @@ M0146-0001 re-baseline census on the new default arm.
   Kind: impl
   Parent: M0146\-0009
   - First step: in `internal/executor/operators\_vacuum\.go`, when `vs\.Analyze`, run the ANALYZE operator\'s per\-table statistics path \(`operators\_analyze\.go`\) for each target with its column list, as `vacuum\(\)` → `analyze\_rel` does; then re\-run the regress A/B — expect broad plan movement\.
+- [ ] **M0146\-0009k — a node above a searched join is sized by the
+  pre\-search join estimator** \(filed 2026\-10\-03 by recon M0146\-0005ds\)\.
+  `EstimateRows`\' `\*Join` arm returns `estimateJoin\(x\)` \(cardinality\.go\)
+  and ignores the join\'s stamped `PlanCost\.PlanRows` — the joinrel size
+  the search chose\. Every legacy\-priced upper node \(Sort, Limit,
+  Aggregate group estimates, WindowAgg\) above a searched join is therefore
+  sized and costed from a different estimator than the join itself: TPC\-DS
+  Q59\'s Sort reads 4811 rows over its 15\-row Hash Join, and 13 more
+  queries \(Q43, Q46, Q47, Q57, Q62, Q65, Q66, Q77, Q81, Q99\) show the same
+  disagreement at SF0\.25\. PG\'s upper paths read the input path\'s
+  `rows` \(`create\_sort\_path` → `cost\_sort\(…, subpath\->rows, …\)`\)\.
+  `stampedUpperRows` already does this for `\*Distinct` / `\*DistinctOn`
+  \(M0146\-0005bg\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - Expected movement \(S5\): upper\-node rows above searched joins agree
+    with the join \(14 queries at SF0\.25\); ea\-ratchet findings on those
+    upper nodes; aggregation\-/sort\-strategy elections that read the
+    legacy count may move\. Measured by ea\-ratchet, the fire set at both
+    scales, and the sweep values gate\.
+  - First step: give the `\*Join` \(and `\*NestedLoopIndexJoin`\) arm of
+    `EstimateRows` the `stampedUpperRows` preference, then re\-run the fire
+    set and ea\-ratchet; check every EstimateRows reader that plans above a
+    join \(aggregate strategy, sort cost\) for the change in input count\.
 - [x] **M0146\-0009d — ea\-ratchet can print a vacuous PASS** \(impl,
   filed 2026\-09\-28, landed 2026\-09\-28\). `scripts/estimate\-parity\-gate\.sh` ran on a
   foreign postgres already listening on EA\_PORT=5534 \(pg\_isready

@@ -1,5 +1,7 @@
 # M0146-0005 (part 3): slices 38+ — parameterized-probe qual placement
 
+Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner.
+
 Continuation of [m0146-0005-join-order-burndown-2.md](m0146-0005-join-order-burndown-2.md)
 (residual triage and slices 15-37) — split per the design-doc size rule (D3).
 Same task and census family. Slices 36 and 37 (the probe-Filter rendering these

@@ -1,5 +1,7 @@
 # M0146-0005 (part 4): slices 56+ — merge-join costing
 
+Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner.
+
 Continuation of [m0146-0005-join-order-burndown-3.md](m0146-0005-join-order-burndown-3.md)
 (slices 38-55), split per the design-doc size rule (D3). Same task and census
 family.

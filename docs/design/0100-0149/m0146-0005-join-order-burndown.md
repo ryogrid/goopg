@@ -1,6 +1,6 @@
 # M0146-0005: join-order / candidate-pool divergence burn-down
 
-Status: **IN PROGRESS**. Slice 1 landed 2026-09-25 (`23edfda2e`); slice 2 landed
+Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner. Earlier: **IN PROGRESS**. Slice 1 landed 2026-09-25 (`23edfda2e`); slice 2 landed
 2026-09-25 (`2962ae22d`). Task:
 `.ralph/fix_plan.md` M0146-0005 (Kind: impl, Parent: none). Evidence:
 `analysis/m0146/m0146-0005/`.
