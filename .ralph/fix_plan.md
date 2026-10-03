@@ -26872,3 +26872,54 @@ M0146-0001 re-baseline census on the new default arm.
     right subtree probing by an `OuterColumnRef` key, rescanned per outer row
     \(the rescan\-staleness risk M0146\-0012 names\)\.
   - Design: `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
+  - [x] **M0146\-0049a — recon: the executor substrate runs PG\'s
+    parameterised Append** \(2026\-10\-03\)\.
+    Kind: recon
+    Parent: M0146\-0049
+    - goopg\'s explicit `LATERAL \(… UNION ALL …\)` plans Nested Loop →
+      Append\(Bitmap Heap cs1, Bitmap Heap ws1\) with `Index Cond: \(item =
+      li\.id\)` — PG\'s shape — and returns PG\'s values \(3000 rows, same
+      sum\); the non\-LATERAL join of the same UNION ALL is PG\'s
+      parameterised Append there and a Hash Join over a Parallel Append in
+      goopg\.
+    - The lowering contract exists: R25\'s NLI arm emits `Join\{Lateral\}`
+      over a probe keyed by level\-1 `OuterColumnRef`s \(createplannl\.go\)\.
+    - The gap is planner\-side only: member parameterised paths, an Append
+      path kind, NL generation over a non\-index parameterised inner\.
+    - Side finding: goopg\'s NL over the LATERAL Append estimates 1 row,
+      PG 3000 — filed M0146\-0009m\.
+    - Design `docs/design/0100\-0149/m0146\-0049\-parameterised\-inner\-non\-scan\.md`\.
+    Movement: none — recon
+  - [ ] **M0146\-0049b — per\-member parameterised index paths for a
+    flattened UNION ALL leaf** \(filed 2026\-10\-03 by 0049a\)\. Members
+    that are single\-table scans get the join clause translated through
+    their output column \(`leafcol = outer` → `membercol = outer`\) and a
+    parameterised index path priced by `addOneParameterizedIndexPath`
+    \(pathparamindex\.go\), as `get\_cheapest\_parameterized\_child\_path`
+    \(allpaths\.c:2048\)\.
+    Kind: impl
+    Parent: M0146\-0049
+    - Expected movement \(S5\): none alone — the paths are unreachable until
+      0049c; measured with 0049c\.
+  - [ ] **M0146\-0049c — a parameterised Append path and its nested\-loop
+    lowering** \(filed 2026\-10\-03 by 0049a\)\. `create\_append\_path` with
+    `required\_outer` over 0049b\'s member paths \(cost and rows the sum\);
+    NL path generation accepts it as an inner; lowering emits
+    `Join\{Lateral\}` over `Append\{member probes\}` with level\-1
+    `OuterColumnRef` keys \(the R25 NLI contract\)\.
+    Kind: impl
+    Parent: M0146\-0049
+    - Expected movement \(S5\): TPC\-DS Q54 `my\_customers` subtree 19832 →
+      about 6537 \(PG\'s shape\), `parameterisation`/`join\-method` at both
+      scales; measured by the fire set and the sweep values gate\.
+- [ ] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
+  \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
+  WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
+  WHERE li\.cat = 3`: goopg\'s Nested Loop says rows=1 \(its Append rows=1\)
+  where PG says 3000 \(Append 75 per outer row\); the plan shape and values
+  match PG\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find how the LATERAL Append\'s rows are derived — PG sizes
+    the parameterised inner per call \(the members\' parameterised rows,
+    summed\) and the NL as outer × that\.
