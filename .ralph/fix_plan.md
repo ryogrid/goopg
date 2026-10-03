@@ -26048,11 +26048,22 @@ M0146-0001 re-baseline census on the new default arm.
       24/24, regress 22 cases identical to HEAD \(known flakes only\)\.
     - Design `docs/design/0100\-0149/m0146\-0009h\-copy\-bulk\-extension\.md`\.
   Movement: none — plan inputs move only after an owner reload of the TPC-DS bench clusters; fresh-load relpages now equal PG
-- [ ] **M0146\-0009i — a CTE Scan inherits its CTE\'s row estimate** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0009i — a CTE Scan inherits its CTE\'s row estimate** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   TPC\-DS Q14: the cross\_items CTE estimates rows=1 on both engines, but goopg\'s CTE Scan of it reports 212, so goopg hashes it where PG unique\-ifies one row into an index\-probe chain \(statement 2 main body 18934 vs 2730 per branch\)\.
   Kind: impl
   Parent: M0146\-0009
   - First step: find how the CTEScan leaf\'s rows are set \(set\_cte\_pathlist uses the CTE subplan\'s rows\) and why it diverges from the body\'s estimate\.
+  - **DONE 2026\-10\-04 \(verification only\)\.** Already resolved by
+    M0145\-0008ac \(`c317b037b`\): the fire set of `216da71d5` shows every
+    `CTE Scan on cross_items` at rows=1 and each IN branch unique\-ifying it
+    \(HashAggregate\) into the probe chain, as PG does, at both scales\.
+    - Cause of the old 212: the M0145\-0008z recon lists Q14\'s IN sublinks
+      as declined \(`any\-body\-leaf\-\(\*optimizer\.CTEScan\)`\); 0008ac
+      admitted CTE leaves to pull\-up\.
+    - Q14\'s remaining divergence is the probe choice held on
+      M0145\-0008ag \(owner\-parked multiplier\)\.
+    - Design `docs/design/0100\-0149/m0146\-0009i\-cte\-scan\-rows\-verified\.md`\.
+  Movement: none — already moved by M0145-0008ac
 - [ ] **M0146\-0009j — `VACUUM \(ANALYZE\)` collects no column statistics** \(filed 2026\-10\-03 by M0146\-0005dk\)\.
   goopg\'s `vacuumOp` runs only the relation\-size pass \(`vacuum\.Analyze` → reltuples / relpages\); PG\'s `vacuum\(\)` calls `analyze\_rel` for every target when VACOPT\_ANALYZE is set\. Measured: after `VACUUM ANALYZE tenk1` on goopg `pg\_stats` holds 0 rows for tenk1, after `ANALYZE tenk1` 16\. Regress `test\_setup\.sql` runs `VACUUM ANALYZE` on every shared table, so every regress plan on goopg is stats\-less; with the 0005dk unique\-ify arm live, regress `join`\'s two `tenk1 a WHERE unique1 IN \(SELECT unique2 …\)` plans flip from PG\'s Hash Semi Join to a HashAggregate\-driven Nested Loop for exactly that reason \(with stats goopg matches PG\)\.
   Kind: impl
