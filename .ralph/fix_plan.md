@@ -26955,7 +26955,7 @@ M0146-0001 re-baseline census on the new default arm.
       - EXPLAIN ANALYZE now matches PG on the probe side \(`rows=1
         loops=1` where goopg read the whole outer\)\.
       Movement: none — executor rescan cost; no plan instrument sees it
-    - [ ] **M0146\-0049d2 — a materialized CTE scanned inside a lateral is
+    - [x] **M0146\-0049d2 — a materialized CTE scanned inside a lateral is
       computed once** \(filed 2026\-10\-03\)\. `lateralJoinStream` gives each
       outer row an empty `ctx\.CTERowCache` \(join\_lateral\_stream\.go
       `m\.innerCTE = nil`\), so a statement\-level CTE scanned under a
@@ -26967,6 +26967,18 @@ M0146-0001 re-baseline census on the new default arm.
       - First step: key the per\-outer\-row cache reset on whether the CTE is
         declared inside the lateral subtree \(a correlated CTE\); a CTE
         declared above it reads the enclosing cache\.
+      - **LANDED 2026\-10\-03\.** The split is by correlation, not by
+        declaration site: PG clears a CTE\'s tuplestore on rescan only when
+        its plan has changed parameters \(ExecReScanCteScan\)\. A body with
+        no escaping outer reference \(`optimizer\.PlanHasOuterRef` false\)
+        is cached in the new `ctx\.CTEStableCache`, which the lateral swap
+        leaves alone; a correlated body keeps the per\-outer\-row
+        `CTERowCache`\. `TestCTEUnderLateralMaterialisesOnce`\.
+        - Wrong results fixed on the way: `WITH c AS MATERIALIZED \(SELECT
+          random\(\) r\) … LATERAL \(SELECT r FROM c …\)` evaluated the CTE
+          once per outer row \(5 distinct values; PG 1\)\.
+        - Side finding filed as M0146\-0050 \(S2\)\.
+      Movement: none — executor re\-materialisation; plans unchanged
     - [ ] **M0146\-0049d3 — parameterised hash join paths and their
       nested\-loop lowering** \(filed 2026\-10\-03\)\. The producer above,
       `get\_parameterized\_joinrel\_size` with `get\_joinrel\_parampathinfo`\'s
@@ -26996,6 +27008,25 @@ M0146-0001 re-baseline census on the new default arm.
     search\)\.
     Kind: recon
     Parent: M0146\-0049
+- [ ] **M0146\-0050 — WRONG RESULTS: a correlated CTE inside a correlated
+  subplan replays its first execution** \(filed 2026\-10\-03 by M0146\-0049d2\)\.
+  `SELECT g, \(SELECT k FROM \(WITH c AS MATERIALIZED \(SELECT g\*2 AS k\)
+  SELECT k FROM c\) z\) FROM generate\_series\(1,3\) g` returns `1\|2, 2\|2,
+  3\|2`; PG 18\.3 returns `1\|2, 2\|4, 3\|6`\. Pre\-existing \(same answer
+  from a HEAD build\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-03 \(S2\) — wrong results from a correlated CTE in a subplan
+  > Filed by M0146\-0049d2, not worked\. Owner: place M0146\-0050 in the banner\.
+  - Not worked \(S2: the owner places it\)\. Cause: a subplan
+    re\-execution never resets `ctx\.CTERowCache` \(only the LATERAL join
+    swaps it, join\_lateral\_stream\.go\), so the correlated body\'s first
+    materialisation is replayed for every outer row\. PG clears the
+    tuplestore when the CTE plan\'s params change \(ExecReScanCteScan\)\.
+  - First step: at the subplan evaluation site, give each execution of a
+    correlated sublink its own `CTERowCache` window as `bindOuter` does
+    for LATERAL; correlated bodies only, since uncorrelated ones now live
+    in `CTEStableCache` \(M0146\-0049d2\)\.
 - [ ] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x

@@ -1,6 +1,6 @@
 # M0146-0049 — a parameterised inner path through a non-scan node
 
-Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`) and (d1) landed 2026-10-03. Parent: M0146
+Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`), (d1) (`d2fdb535a`) and (d2) (`cd1dbec34`) landed 2026-10-03. Parent: M0146
 (banner item 3: owner-named next in the structural line, the blocker of
 M0146-0005dp/dq and M0145-0008ac/0008y).
 Background: `docs/design/0100-0149/m0146-0005dt-parameterised-append-recon.md`.
@@ -198,6 +198,44 @@ outers.
 - PG re-uses a single-batch hash table on a rescan with no changed inner
   parameter (`ExecReScanHashJoin`). goopg rebuilds on every re-Open.
 
+### Slice (d2) — an uncorrelated CTE under a LATERAL is materialised once (landed)
+
+`lateralJoinStream` swaps `ctx.CTERowCache` for every outer tuple
+(`bindOuter` / `unbindOuter`), so that a CTE body reading the outer row is
+re-materialised. It applied that swap to every CTE, so a statement-level
+CTE scanned on the lateral's right side was recomputed once per outer row.
+
+**The PG rule is correlation, not declaration site.** `ExecReScanCteScan`
+(`./postgres/src/backend/executor/nodeCtescan.c`) clears the shared
+tuplestore only when the CTE plan has changed parameters, and otherwise
+rewinds it. Two consequences follow:
+
+- an uncorrelated CTE declared inside a LATERAL subquery also runs once;
+- a CTE body may reference an enclosing query level (PG accepts
+  `EXISTS (WITH c AS (SELECT s.x) …)`), so "declared above the lateral"
+  is not the same as "uncorrelated".
+
+**Mechanism.**
+- `cteScanOp` classifies its body once, when the operator is built:
+  `optimizer.PlanHasOuterRef` (the binder-aware `planHasOuterRef`, so a
+  probe key bound by a lateral join inside the body does not count).
+- An uncorrelated body is cached in the new `ctx.CTEStableCache`, which
+  no lateral swap touches. It is reset with `CTERowCache` at statement
+  start, and parallel workers start it empty.
+- A correlated body keeps the swapped per-outer-row `CTERowCache`.
+
+**Effect.**
+- A wrong result is fixed: `WITH c AS MATERIALIZED (SELECT random() r)
+  … LATERAL (SELECT r FROM c …)` gave 5 distinct values over 5 outer rows,
+  where PG gives 1.
+- Q95's parameterised inner (d3) reads its 1.7M-row CTE once.
+- `TestCTEUnderLateralMaterialisesOnce`.
+
+**Side finding (S2, filed M0146-0050).** A correlated CTE inside a
+correlated scalar subplan replays its first execution: goopg answers
+`2,2,2` where PG answers `2,4,6`. It predates d2 (a HEAD build gives the
+same answer). Subplan re-execution never resets `CTERowCache`.
+
 ## Remaining slices
 
 - **(b)** Per-member parameterised index paths for a flattened UNION ALL
@@ -210,9 +248,8 @@ outers.
   NL path generation also needs to accept it as an inner, and it lowers
   to `Join{Lateral}` over `Append{param probes}`.
 - **(d)** The through-a-join case: Q95's parameterised Hash Join on the
-  semi inner (M0146-0049d). d1 has landed (above). Still open: d2, a
-  statement-level CTE that a lateral recomputes per outer row; and d3,
-  the parameterised hash join producer, its sizer and its nested-loop
+  semi inner (M0146-0049d). d1 and d2 have landed (above). Still open:
+  d3, the parameterised hash join producer, its sizer and its nested-loop
   lowering.
 - **(e)** Parallel: a partial outer driving the parameterised Append
   (PG's Q54 Gather). `PathParamAppend` is not parallel-safe yet
