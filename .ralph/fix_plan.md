@@ -26930,6 +26930,54 @@ M0146-0001 re-baseline census on the new default arm.
     - First step: decide the producer: a join rel\'s parameterised paths
       \(PG builds them in add\_paths\_to\_joinrel from parameterised children\)
       versus a lateral re\-plan of the semi body; measure on Q95 at SF1\.
+    - 2026\-10\-03 decision: the producer is PG\'s — `hash\_inner\_and\_outer`
+      pairs `cheapest\_parameterized\_paths`, `try\_hashjoin\_path` admits a
+      result whose `calc\_non\_nestloop\_required\_outer` overlaps
+      `param\_source\_rels`, sized by `get\_parameterized\_joinrel\_size`\.
+      Reproducer without the CTE: `pjo WHERE id = 3 AND k IN \(SELECT
+      pjret\.ord FROM pjret JOIN pjbig ON pjbig\.ord = pjret\.ord\)` — PG
+      NL Semi Join\(pjo, Hash Join\(pjbig, Hash\(IOS pjret\_pkey, `ord =
+      pjo\.k`\)\), `Join Filter: \(pjo\.k = pjbig\.ord\)`\); goopg Hash Right
+      Semi Join over the full join\.
+    - The executor had two gaps that would make that plan time out exactly
+      as M0145\-0008ac did; split into slices d1–d3 below\.
+    - [x] **M0146\-0049d1 — ExecHashJoin\'s empty\-inner exit and outer
+      prefetch** \(2026\-10\-03, `d2fdb535a`\)\. goopg\'s hash join always read its whole
+      probe side, even over an empty hash table; PG returns without
+      scanning the outer \(`totalTuples == 0 \&\& \!HJ\_FILL\_OUTER`\) and
+      prefetches the first outer tuple so an empty outer skips the build
+      \(nodeHashjoin\.c HJ\_BUILD\_HASHTABLE\)\.
+      Kind: impl
+      Parent: M0146\-0049d
+      - `emptyBuildEndsJoin` / `wantOuterPrefetch` / `pullProbe`
+        \(operators\_join\_agg\.go\); the cooperative build counts too\.
+        `TestHashJoinEmptyBuildSkipsProbe`\.
+      - EXPLAIN ANALYZE now matches PG on the probe side \(`rows=1
+        loops=1` where goopg read the whole outer\)\.
+      Movement: none — executor rescan cost; no plan instrument sees it
+    - [ ] **M0146\-0049d2 — a materialized CTE scanned inside a lateral is
+      computed once** \(filed 2026\-10\-03\)\. `lateralJoinStream` gives each
+      outer row an empty `ctx\.CTERowCache` \(join\_lateral\_stream\.go
+      `m\.innerCTE = nil`\), so a statement\-level CTE scanned under a
+      parameterised inner is re\-computed per outer row; PG\'s CTE tuplestore
+      belongs to the declaring level and a rescan only rewinds it
+      \(ExecReScanCteScan\)\.
+      Kind: impl
+      Parent: M0146\-0049d
+      - First step: key the per\-outer\-row cache reset on whether the CTE is
+        declared inside the lateral subtree \(a correlated CTE\); a CTE
+        declared above it reads the enclosing cache\.
+    - [ ] **M0146\-0049d3 — parameterised hash join paths and their
+      nested\-loop lowering** \(filed 2026\-10\-03\)\. The producer above,
+      `get\_parameterized\_joinrel\_size` with `get\_joinrel\_parampathinfo`\'s
+      moved clauses \(the EC\-derived `pjo\.k = pjbig\.ord` join filter\), and
+      `createNestLoopPlan` lowering a parameterised join inner through the
+      R25 lateral contract\.
+      Kind: impl
+      Parent: M0146\-0049d
+      - Expected movement \(S5\): the reproducer above; Q95 only with
+        M0145\-0008ac\'s patch re\-applied \(its semi RHS is a CTE leaf the
+        default pipeline does not pull up\)\.
   - [ ] **M0146\-0049e — a partial outer drives the parameterised Append**
     \(filed 2026\-10\-03 by 0049c\)\. PG\'s Q54 runs Gather → NL\(Parallel Seq
     Scan item, Append\(param probes\)\); goopg\'s `PathParamAppend` is not

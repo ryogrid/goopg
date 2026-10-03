@@ -1,6 +1,6 @@
 # M0146-0049 — a parameterised inner path through a non-scan node
 
-Status: in progress — slices (a) recon and (b)+(c) landed 2026-10-03 (`f661e6933`). Parent: M0146
+Status: in progress — slices (a) recon, (b)+(c) (`f661e6933`) and (d1) landed 2026-10-03. Parent: M0146
 (banner item 3: owner-named next in the structural line, the blocker of
 M0146-0005dp/dq and M0145-0008ac/0008y).
 Background: `docs/design/0100-0149/m0146-0005dt-parameterised-append-recon.md`.
@@ -109,6 +109,95 @@ equivclass and with are byte-identical.
 - PG probes `web_sales` by Index Scan, where goopg's bitmap is cheaper by
   its own cost.
 
+## Slice (d) — through a join: the producer, and two executor prerequisites (2026-10-03)
+
+**The producer is PG's.** `hash_inner_and_outer`
+(`./postgres/src/backend/optimizer/path/joinpath.c`) pairs the two rels'
+`cheapest_parameterized_paths`. `try_hashjoin_path` admits a result whose
+`calc_non_nestloop_required_outer` overlaps the joinrel's
+`param_source_rels`, and the path is sized by
+`get_parameterized_joinrel_size` (costsize.c) over
+`get_joinrel_parampathinfo`'s clause list. A lateral re-plan of the semi
+body was the alternative; it would be a second planner route for one
+shape.
+
+A reproducer without Q95's CTE:
+
+```
+pjo(id, k) 20 rows; pjbig(ord, x) 400k rows, no index;
+pjret(ord, item) 30k rows, primary key (ord, item)
+SELECT count(*) FROM pjo WHERE pjo.id = 3
+  AND pjo.k IN (SELECT pjret.ord FROM pjret JOIN pjbig ON pjbig.ord = pjret.ord)
+```
+
+| | plan |
+|---|---|
+| PG 18.3 | Nested Loop Semi Join(pjo, Hash Join(Seq Scan pjbig, Hash(Index Only Scan pjret_pkey, `Index Cond: (ord = pjo.k)`)), `Join Filter: (pjo.k = pjbig.ord)`) |
+| goopg | Hash Right Semi Join over the full pjbig ⋈ pjret hash join |
+
+The `Join Filter` is the EC clause `get_joinrel_parampathinfo` re-derives
+for an EC whose join clause was dropped as movable into the inner input.
+
+**Executor prerequisites.** Before d1, two executor behaviours would have
+made that plan time out, as M0145-0008ac's Q95 did at SF1:
+
+1. goopg's hash join always read its whole probe side, even over an empty
+   hash table. A parameterised build usually finds nothing, and Q95's
+   probe side is a 1.7M-row CTE scan.
+2. `lateralJoinStream` starts each outer row with an empty CTE cache
+   (`m.innerCTE = nil`), so a statement-level CTE scanned under the
+   parameterised inner is re-computed per outer row. That is slice d2.
+
+### Slice (d1) — ExecHashJoin's empty-inner exit and outer prefetch (landed)
+
+`openLazyHashJoin` (operators_join_agg.go) now follows
+`nodeHashjoin.c`'s HJ_BUILD_HASHTABLE state:
+
+- **Outer prefetch** (`wantOuterPrefetch`). It never runs for a join that
+  fills the build side. It always runs for one that fills the probe side
+  (HJ_FILL_OUTER). Otherwise it runs when the probe child's startup cost
+  is below the build child's total (the Hash node's cost is its child's)
+  and the previous scan did not find the outer non-empty. The cost answer
+  is cached per operator.
+  - The first probe tuple is fetched before the build. An empty outer ends
+    the join without building.
+  - `outerNotEmpty` is `hj_OuterNotEmpty`. It survives a re-Open, is
+    cleared after the build, and is set by `pullProbe` on every probe
+    tuple, the prefetched one included.
+- **Empty-inner exit** (`emptyBuildEndsJoin`). If the build loops drained
+  no row and the join does not emit unmatched probe rows
+  (`probeFillsUnmatched`), the probe is never opened. Next finds no
+  stream and returns EOF.
+  - `buildRows` is counted by the shared build loops, so the cooperative
+    parallel build counts too.
+  - The CTID-preserving build and the shared and Parallel Hash builds
+    leave the count incomplete and keep their old order, as PG's parallel
+    arm skips the prefetch.
+
+`TestHashJoinEmptyBuildSkipsProbe` pins the open counts and rows for
+inner, semi, right, left and anti joins, over empty builds and empty
+outers.
+
+**Effect.**
+- EXPLAIN ANALYZE matches PG on the probe side: `Seq Scan … (actual
+  rows=1 loops=1)` where goopg read the whole outer.
+- Values and plans are unchanged: SF0.25 sweep 96/96 with all 99 plan
+  shapes identical, TPC-H arm 24/24, and regress join, join_hash,
+  subselect, select, union, with, partition_join, select_parallel and
+  aggregates are byte-identical.
+- ea-ratchet passes, reporting three findings fixed (Q23 ×2, Q92). This
+  is an instrument artefact: those subtrees sit under hash joins whose
+  outer is now found empty, so they no longer execute and are not
+  scored. The baseline was not re-pinned.
+
+**Ledgered.**
+- goopg prints a never-run node as `actual rows=0.00 loops=0`; PG prints
+  `(never executed)` (explain.c).
+- The cooperative build does not record its build scan's instrumentation
+  (`Hash … loops=0`).
+- PG re-uses a single-batch hash table on a rescan with no changed inner
+  parameter (`ExecReScanHashJoin`). goopg rebuilds on every re-Open.
+
 ## Remaining slices
 
 - **(b)** Per-member parameterised index paths for a flattened UNION ALL
@@ -121,7 +210,10 @@ equivclass and with are byte-identical.
   NL path generation also needs to accept it as an inner, and it lowers
   to `Join{Lateral}` over `Append{param probes}`.
 - **(d)** The through-a-join case: Q95's parameterised Hash Join on the
-  semi inner (M0146-0049d).
+  semi inner (M0146-0049d). d1 has landed (above). Still open: d2, a
+  statement-level CTE that a lateral recomputes per outer row; and d3,
+  the parameterised hash join producer, its sizer and its nested-loop
+  lowering.
 - **(e)** Parallel: a partial outer driving the parameterised Append
   (PG's Q54 Gather). `PathParamAppend` is not parallel-safe yet
   (M0146-0049e).
