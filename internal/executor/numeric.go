@@ -453,6 +453,11 @@ func foldNumericArith(op parser.OpCode, l, r string) (string, error) {
 		if ee, ok := err.(*ExecError); ok && ee.Code == "22012" {
 			return "", fmt.Errorf("division by zero")
 		}
+	case parser.OpMod:
+		d, err = numericMod(a, b, 0)
+		if ee, ok := err.(*ExecError); ok && ee.Code == "22012" {
+			return "", fmt.Errorf("division by zero")
+		}
 	default:
 		return "", fmt.Errorf("unsupported numeric op %s", op)
 	}
@@ -794,6 +799,21 @@ func numericDivInt64Fast(a, b Datum) (Datum, bool) {
 // both operands are in the int64 lane and the shifted
 // numerator fits in int64. Covers the dominant TPC-H avg/sum
 // hot path (Q1, Q3, Q5, Q14).
+// numericMod is numeric_mod / mod_var (numeric.c): x - trunc(x / y) * y,
+// computed exactly. With both mantissas aligned to the larger display scale
+// the result is the remainder of the aligned integers — truncating division,
+// so the result takes the dividend's sign — at that scale, PG's
+// max(xdscale, ydscale). M0146-0044.
+func numericMod(a, b Datum, pos int) (Datum, error) {
+	bm := numericMant(b)
+	if bm.Sign() == 0 {
+		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+	}
+	am, bmAligned, scale := alignNumericBig(numericMant(a), a.Scale, bm, b.Scale)
+	r := new(big.Int).Rem(am, bmAligned)
+	return newNumeric(r, int(scale)), nil
+}
+
 func numericDiv(a, b Datum, pos int) (Datum, error) {
 	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
 		bmFast := b.NumericMantissaValue()

@@ -797,7 +797,7 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 		return nil, err
 	}
 	switch op {
-	case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv:
+	case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 	default:
 		return nil, fmt.Errorf("unsupported numeric op %s", op)
 	}

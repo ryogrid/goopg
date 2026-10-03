@@ -24809,6 +24809,22 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: reproduce on a throwaway cluster \(port 5534\-free range\):
     create a temp table, stop/start, list pg\_class for pg\_temp\_\* and
     retry the CREATE; then find the temp\-namespace cleanup path\.
+  - [ ] **M0146\-0039a — WRONG RESULTS: `CREATE TEMP TABLE … AS` creates a
+    PERMANENT relation** \(filed 2026\-10\-03 by the M0146\-0044 probe;
+    REPRODUCED on a private throwaway cluster, S2 escalation: wrong results
+    \+ a durable catalog row\)\. `CREATE TEMP TABLE tt AS SELECT 1 x` gives
+    `pg\_class\.relpersistence = \'p\'` and the table survives `goopg stop` \+
+    start, visible to every session; a later `CREATE TEMP TABLE tt AS …`
+    then fails with `relation "tt" does not exist` while `SELECT \* FROM tt`
+    reads the old rows\. Plain `CREATE TEMP TABLE tt \(x int\)` is correct
+    \(`t`\) — the M0146\-0039 fix covered CREATE TABLE, not CTAS\.
+    Kind: bug
+    Parent: M0146\-0039
+    > ## ESCALATION 2026\-10\-03 \(S2\) — CREATE TEMP TABLE AS is permanent
+    > Filed by the M0146\-0044 probe, not worked\. As a descendant of a
+    > banner\-2a task it inherits item 2a\'s rank; owner: confirm its place\.
+    > Resume point: the CTAS executor path must carry the TEMP persistence
+    > \(and pg\_temp namespace\) the CREATE TABLE path already sets\.
   - **Reproduced 2026\-09\-30** \(`analysis/m0146/m0146\-0039/repro.sh`\):
     after stop/start, pg\_class shows `ca` in namespace 2200 with
     relpersistence `p`, `SELECT \* FROM ca` returns the old row, and
@@ -24967,7 +24983,7 @@ M0146-0001 re-baseline census on the new default arm.
     through array\_out\'s quoting rule \(quote when empty, `NULL`
     case\-insensitively, or containing `\{\}",\\` or whitespace; escape `"` and
     `\\`\), as the literal\-cast path already does\.
-- [ ] **M0146\-0044 — WRONG RESULTS: `mod\(numeric, numeric\)` returns wrong
+- [x] **M0146\-0044 — WRONG RESULTS: `mod\(numeric, numeric\)` returns wrong
   values; `numeric % numeric` is unsupported** \(filed 2026\-10\-02 by
   M0146\-0041; REPRODUCED on a private throwaway cluster, S2 escalation:
   wrong results\)\. goopg: `mod\(10\.5::numeric, 3\)` = `0`,
@@ -24980,6 +24996,13 @@ M0146-0001 re-baseline census on the new default arm.
   > ## ESCALATION 2026\-10\-02 \(S2\) — `mod\(numeric\)` returns wrong values
   > Filed by M0146\-0041, not worked\. Owner: place M0146\-0044 in the
   > banner\.
+  - **LANDED 2026\-10\-03\.** `numericMod` \(PG mod\_var: remainder of the
+    aligned integers at max dscale, dividend\'s sign\) behind `%`, `mod\(\)` and
+    the planner\'s numeric folding; `modResultType` follows PG\'s overloads\.
+    Design `docs/design/0100\-0149/m0146\-0044\-numeric\-mod\.md`\.
+    - Probes identical to PG \(values, types, errors\); `TestNumericMod`\.
+    - Regress `numeric` 3800→3786, int2/int4/int8 identical; sweep 96/96,
+      fire set \(no plan changes\), TPC\-H arm PASS\.
   - Not worked \(S2: the owner places it\)\. First step: route
     `mod\(numeric, numeric\)` and the `%` operator through an exact
     `numericMod` \(PG `mod\_var`: trunc\(x/y\) with full precision, result

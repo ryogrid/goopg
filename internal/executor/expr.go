@@ -1895,6 +1895,8 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 				return numericMul(a, b)
 			case parser.OpDiv:
 				return numericDiv(a, b, pos)
+			case parser.OpMod:
+				return numericMod(a, b, pos)
 			}
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s not supported on numeric", op)}
 		}
@@ -16222,6 +16224,18 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || a.IsNull() || b.IsNull() {
 				return NullDatum, nil
+			}
+			// M0146-0044: mod(numeric, numeric) (PG's numeric_mod — an
+			// integer argument is promoted, as the int variants lose to the
+			// numeric one) is exact; only two integers keep the int path.
+			if a.Kind == KindNumeric || b.Kind == KindNumeric {
+				an, bn, err := promoteToNumeric(a, b, parser.OpMod, x.Pos())
+				if err != nil {
+					return Datum{}, err
+				}
+				// numeric_mod's division-by-zero error carries no
+				// cursor position, unlike the operator's.
+				return numericMod(an, bn, 0)
 			}
 			if b.Int == 0 {
 				return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}

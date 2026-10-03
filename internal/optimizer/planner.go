@@ -16054,7 +16054,12 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
-		case "gcd", "lcm", "abs", "mod", "div":
+		case "mod":
+			// M0146-0044: pg_proc's mod overloads — int2, int4, int8 and
+			// numeric — resolved as func_select_candidate does: a numeric
+			// argument wins, then the widest integer.
+			return modResultType(x.Args)
+		case "gcd", "lcm", "abs", "div":
 			// These return integer; use int8 as generic integer type. M0097-0003.
 			return catalog.Type{Name: "int8"}
 		case "char_length", "character_length", "length", "octet_length",
@@ -18885,3 +18890,40 @@ func findExprInTargets(re Expr, targets []Expr) int {
 	return -1
 }
 
+
+// modResultType is mod()'s result type over its argument types (pg_proc
+// mod(int2,int2) int2 / mod(int4,int4) int4 / mod(int8,int8) int8 /
+// mod(numeric,numeric) numeric). M0146-0044.
+func modResultType(args []Expr) catalog.Type {
+	rank := map[string]int{"int2": 1, "int4": 2, "int8": 3, "numeric": 4}
+	best := 0
+	for _, a := range args {
+		var r int
+		if ic, isInt := a.(*IntegerConst); isInt {
+			// make_const: an integer literal is int4 when it fits, int8
+			// otherwise.
+			r = 3
+			if ic.Value >= -2147483648 && ic.Value <= 2147483647 {
+				r = 2
+			}
+		} else if rr, ok := rank[exprType(a).Name]; ok {
+			r = rr
+		} else {
+			// Anything else (a decimal literal included) resolves to the
+			// numeric overload.
+			r = 4
+		}
+		if r > best {
+			best = r
+		}
+	}
+	switch best {
+	case 1:
+		return catalog.Type{Name: "int2"}
+	case 2:
+		return catalog.Type{Name: "int4"}
+	case 3:
+		return catalog.Type{Name: "int8"}
+	}
+	return catalog.Type{Name: "numeric"}
+}
