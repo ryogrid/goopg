@@ -27374,7 +27374,7 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress 20 planner cases identical to HEAD\.
     - Design `docs/design/0100\-0149/m0146\-0009m\-lateral\-append\-rows\.md`\.
   Movement: none — fire set flat at both scales; estimate fixed outside the searched plans
-- [ ] **M0146\-0005dv — a merge join over a merge\-join inner gets no
+- [x] **M0146\-0005dv — a merge join over a merge\-join inner gets no
   Materialize** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q47
   and Q57 at SF0\.25: PG puts a Materialize on the top Merge Join\'s inner,
   itself a Merge Join, because a merge join cannot mark/restore
@@ -27387,6 +27387,20 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: check what path kind the inner merge join reaches
     `mergeJoinCost` as, and why `execSupportsMarkRestore` does not force
     `materialize\_inner` for it\.
+  - **DONE 2026\-10\-04 \(`cfc8e4f56`\)\.** Cause: not the cost arm — the
+    outer merge wanted the inner ordered by `v0\.k` and the inner join was
+    ordered by `vl\.k`, one equivalence class; goopg\'s syntactic pathkey
+    check priced an \(absorbed, invisible\) Sort, so no Material\.
+    `pathkeysContainedInRel` adds the class arm \(members whose clauses lie
+    inside the rel, `pathkeyUsefulness\.equivalentWithin`\)\.
+    - Q47 and Q57 match PG at both scales\.
+    - Ledgered: the outer\-pathkey matcher, the inner trim and add\_path\'s
+      pathkey dominance still compare expressions\.
+    - Test `TestMergeJoinInnerJoinMaterialized`\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress 18 planner cases identical to HEAD\.
+    - Design `docs/design/0100\-0149/m0146\-0005dv\-merge\-inner\-ec\-pathkeys\.md`\.
+  Movement: yes — PLAN-PARITY match SF0.25 39 -> 41, SF1 30 -> 32 (Q47, Q57)
 - [ ] **M0146\-0005dw — a merge join over WindowAgg outputs claims the
   window column\'s order** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q44: `Merge Cond: \(rnk = rnk\)` over two WindowAggs sorted by
