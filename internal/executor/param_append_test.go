@@ -51,3 +51,36 @@ func TestParameterisedAppendOverUnionAll(t *testing.T) {
 		}
 	}
 }
+
+// TestLateralAppendNestedLoopRows pins M0146-0009m against PG 18.3: a nested
+// loop over a LATERAL UNION ALL of two bitmap probes keyed by the outer row is
+// sized outer × one call's rows. PG: Nested Loop rows=3000 over Seq Scan li
+// rows=40 and Append rows=75 (50 + 25). goopg said 1 and 1: EstimateRows had
+// no bitmap heap scan arm (0), and the one-relation scope's Filter that
+// repeats the probe's index key (`item = li.id`) charged its selectivity a
+// second time.
+func TestLateralAppendNestedLoopRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE li (id int primary key, cat int)",
+		"CREATE TABLE cs1 (item int, ord int, amt int, primary key (item, ord))",
+		"CREATE TABLE ws1 (item int, ord int, amt int, primary key (item, ord))",
+		"INSERT INTO li SELECT g, g%50 FROM generate_series(1,2000) g",
+		"INSERT INTO cs1 SELECT g%2000+1, g, g FROM generate_series(1,100000) g",
+		"INSERT INTO ws1 SELECT g%2000+1, g, g FROM generate_series(1,50000) g",
+		"ANALYZE li", "ANALYZE cs1", "ANALYZE ws1",
+	} {
+		runSQL(t, ctx, q)
+	}
+	lines := renderRows(runSQL(t, ctx, "EXPLAIN SELECT li.id, x.amt FROM li, LATERAL (SELECT amt FROM cs1 WHERE item = li.id UNION ALL SELECT amt FROM ws1 WHERE item = li.id) x WHERE li.cat = 3"))
+	plan := strings.Join(lines, "\n")
+	for _, want := range []string{"Nested Loop  (cost=", "rows=3000 ", "Append  (cost=", "rows=75 "} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("plan lacks %q (PG: Nested Loop rows=3000 over Append rows=75):\n%s", want, plan)
+		}
+	}
+	if !strings.HasPrefix(strings.TrimSpace(lines[0]), "Nested Loop") || !strings.Contains(lines[0], "rows=3000 ") {
+		t.Errorf("top node %q, want PG's Nested Loop rows=3000", lines[0])
+	}
+}

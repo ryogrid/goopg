@@ -227,6 +227,17 @@ func EstimateRows(n Node) int64 {
 		}
 	case *SetOp:
 		return estimateSetOp(x)
+	case *BitmapHeapScan:
+		// M0146-0009m: the bitmap path's own rows — its baserel's
+		// restricted size, or for a parameterised probe the rows of one call
+		// (ppi_rows) — which the search stamped on the node. This arm was
+		// missing, so every node sized through EstimateRows over a bitmap
+		// heap scan read 0 (a LATERAL Append of bitmap probes: Append 0, the
+		// nested loop above it 1 where PG says outer × 75).
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
+		return bitmapHeapScanRows(x)
 	case *NestedLoopIndexJoin:
 		// M0146-0009k: as *Join — the searched size wins.
 		if r, ok := stampedUpperRows(&x.PlanCost); ok {
@@ -235,6 +246,74 @@ func EstimateRows(n Node) int64 {
 		return estimateNLIndexJoin(x)
 	}
 	return 0
+}
+
+// probeIndexKeys returns the index and the bound equality keys of an index
+// or bitmap probe (Keys[i] binds Index.Columns[i]; Key binds the first
+// column); a nil index for any other node.
+func probeIndexKeys(n Node) (*catalog.Index, Expr, []Expr) {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Index, x.Key, x.Keys
+	case *IndexOnlyScan:
+		return x.Index, x.Key, x.Keys
+	case *BitmapHeapScan:
+		if bi, ok := x.Outer.(*BitmapIndexScan); ok {
+			return bi.Index, bi.Key, bi.Keys
+		}
+	}
+	return nil, nil, nil
+}
+
+// indexKeyEnforced reports whether conjunct c is `col = key` for an index
+// column the probe below already binds to that key. PG keeps such a clause
+// only as the scan's index qual — create_indexscan_plan and
+// create_bitmap_scan_plan drop it from the qpqual (createplan.c) — so its
+// selectivity is in the probe's rows once. goopg's one-relation bypass
+// leaves it in a Filter over the probe too, and charging it there again
+// squared the restriction: a LATERAL bitmap probe `item = li.id` of 50 rows
+// came out at 1 (M0146-0009m).
+func indexKeyEnforced(c Expr, idx *catalog.Index, key Expr, keys []Expr) bool {
+	if idx == nil {
+		return false
+	}
+	bound := keys
+	if len(bound) == 0 && key != nil {
+		bound = []Expr{key}
+	}
+	b, ok := c.(*BinaryOp)
+	if !ok || b.Op != parser.OpEq || len(bound) == 0 {
+		return false
+	}
+	for _, side := range [2][2]Expr{{b.Left, b.Right}, {b.Right, b.Left}} {
+		cr, ok := side[0].(*ColumnRef)
+		if !ok {
+			continue
+		}
+		for i, k := range bound {
+			if i < len(idx.Columns) && strings.EqualFold(idx.Columns[i], cr.Name) && exprEqual(k, side[1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bitmapHeapScanRows sizes an unstamped bitmap heap scan the way the index
+// scan arm sizes its probe: the bitmap index scan's bound keys (a BitmapAnd /
+// BitmapOr tree falls back to the whole relation), narrowed by the residual
+// Cond.
+func bitmapHeapScanRows(x *BitmapHeapScan) int64 {
+	var rows int64
+	if bi, ok := x.Outer.(*BitmapIndexScan); ok && bi.Index != nil {
+		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, nil, nil)
+	} else if x.Table != nil {
+		rows = seqScanRows(&SeqScan{Table: x.Table})
+	}
+	if rows <= 0 || x.Cond == nil {
+		return rows
+	}
+	return scaleByFloat(rows, clauseSelectivity(x.Cond, x))
 }
 
 // filterSelectivity prices a `*Filter`'s Predicate, skipping the conjuncts
@@ -268,13 +347,14 @@ func filterSelectivity(f *Filter) float64 {
 	if pred == nil {
 		return 1.0
 	}
-	if len(f.PushedBelow) == 0 {
+	idx, key, keys := probeIndexKeys(f.Child)
+	if len(f.PushedBelow) == 0 && idx == nil {
 		return clauseSelectivity(pred, f.Child)
 	}
 	sel := 1.0
 	kept := make([]Expr, 0, len(splitAnd(pred)))
 	for _, c := range splitAnd(pred) {
-		if f.pricedBelow(c) {
+		if f.pricedBelow(c) || indexKeyEnforced(c, idx, key, keys) {
 			continue
 		}
 		kept = append(kept, c)
