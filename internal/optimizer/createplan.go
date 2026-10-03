@@ -67,6 +67,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// rebuilt from the carrier P5.5-a/-b landed on the path and the leaf
 		// `buildInitialRels` recorded on the rel. createplanindex.go.
 		n := createIndexScanPlan(p)
+		if p.paramSink != nil {
+			*p.paramSink = append(*p.paramSink, paramProbeNode{node: n, path: p})
+		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathSeqScan:
 		// The index arm's mirror (M0127-P5.5-d): the same leaf resolver with
@@ -140,6 +143,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 			// nil plan node and a confusing error much later. A failure here is a
 			// producer bug, the same class every other createPlan arm panics on.
 			panic("createPlan: PathBitmapHeapScan: " + err.Error())
+		}
+		if p.paramSink != nil {
+			*p.paramSink = append(*p.paramSink, paramProbeNode{node: n, path: p})
 		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathBitmapIndexScan:

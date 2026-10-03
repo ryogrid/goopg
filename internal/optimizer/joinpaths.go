@@ -535,6 +535,9 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
 		}
 	}
+	// M0146-0049d3: hash_inner_and_outer's parameterised pairing
+	// (paramjoin.go), admitted by this joinrel's param_source_rels.
+	addParameterizedHashJoinPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo)
 	// M0145-0008 follow-up census (nlicensus.go): the full candidate set for a
 	// semi/anti joinrel, after every arm has filed. Off unless
 	// GOOPG_NLI_CENSUS=1.

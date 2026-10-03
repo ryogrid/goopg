@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0146-0049b/c — a parameterised Append over a flattened UNION ALL leaf.
@@ -349,61 +348,7 @@ func createNestLoopParamAppendPlan(p *Path, innerPath *Path) (Node, outputLayout
 			}
 			idxPath = child.Children[0]
 		}
-		keys := make([]Expr, 0, len(idxPath.IndexClauses))
-		for _, c := range idxPath.IndexClauses {
-			if c.key == nil {
-				panic("createPlan: param-append member probe clause with no key")
-			}
-			keys = append(keys, outerParamKey("param-append probe key", c.key, outerLay, outerIndex))
-		}
-		if len(keys) == 0 {
-			panic("createPlan: param-append member probe binds no key")
-		}
-		switch probe := probes[i].(type) {
-		case *BitmapHeapScan:
-			bis, ok := probe.Outer.(*BitmapIndexScan)
-			if !ok {
-				panic(fmt.Sprintf("createPlan: param-append bitmap member over %T", probe.Outer))
-			}
-			if len(keys) == 1 {
-				bis.Key, bis.Keys = keys[0], nil
-			} else {
-				bis.Key, bis.Keys = nil, keys
-			}
-			// The recheck (PG's bitmapqualorig): the probe's equalities over
-			// the heap row. Under the lateral join there is no merged
-			// outer++inner row for BitmapQual's coordinates, so they are
-			// kept on the scan's own Cond — the member column against the
-			// same level-1 nestloop param the index key reads.
-			out := probe.Output()
-			conds := []Expr{}
-			if probe.Cond != nil {
-				conds = append(conds, probe.Cond)
-			}
-			for k, c := range idxPath.IndexClauses {
-				if idxPath.IndexInfo == nil || c.indexCol >= len(idxPath.IndexInfo.Columns) {
-					panic("createPlan: param-append bitmap clause names no index column")
-				}
-				name := idxPath.IndexInfo.Columns[c.indexCol]
-				col := -1
-				for j, sc := range out {
-					if strings.EqualFold(sc.Name, name) {
-						col = j
-						break
-					}
-				}
-				if col < 0 {
-					panic(fmt.Sprintf("createPlan: param-append bitmap recheck column %s not in the scan", name))
-				}
-				conds = append(conds, &BinaryOp{Op: parser.OpEq,
-					Left:  &ColumnRef{Index: col, Name: out[col].Name, Type: out[col].Type},
-					Right: keys[k]})
-			}
-			probe.BitmapQual = nil
-			probe.Cond = combineAnd(conds)
-		default:
-			setNLIProbeKeys(probes[i], keys)
-		}
+		bindParamProbe("param-append", probes[i], idxPath, outerLay, outerIndex)
 	}
 	j := &Join{
 		pos:       in.outer.Pos(),

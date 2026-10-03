@@ -128,6 +128,10 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 	}
 
 	innerPath := p.Children[1]
+	if innerPath != nil && innerPath.RequiredOuter != 0 && innerPath.Kind == PathHashJoin {
+		// M0146-0049d3: a parameterised hash join inner (paramjoin.go).
+		return createNestLoopParamJoinPlan(p, innerPath)
+	}
 	if innerPath != nil && innerPath.RequiredOuter != 0 && innerPath.Kind == PathParamAppend {
 		// M0146-0049: a parameterised Append inner (paramappend.go).
 		return createNestLoopParamAppendPlan(p, innerPath)

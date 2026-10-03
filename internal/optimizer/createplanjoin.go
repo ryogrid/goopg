@@ -567,7 +567,10 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	if len(p.HashKeys) == 0 {
 		panic("createPlan: PathHashJoin with no hash keys; a hash join keys on nothing only as a nested loop")
 	}
-	if p.RequiredOuter != 0 {
+	if p.RequiredOuter != 0 && p.paramSink == nil {
+		// Under a binding nested loop (createNestLoopParamJoinPlan) the sink
+		// is set and the loop binds the probes below; anywhere else nothing
+		// would.
 		panic(fmt.Sprintf("createPlan: parameterised PathHashJoin over relset %#08x; a hash join propagates a parameter rather than binding it",
 			uint32(p.Rel.Relids)))
 	}

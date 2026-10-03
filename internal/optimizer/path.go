@@ -173,6 +173,12 @@ type Path struct {
 
 	// paramAppend is a PathParamAppend's member carrier (paramappend.go).
 	paramAppend *paramAppendInfo
+	// paramSink is set, only while a nested loop lowers a parameterised join
+	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
+	// parameterised path of that inner; createPlanNode records each
+	// parameterised index probe it builds there so the loop can bind its
+	// keys — PG's create_plan-time curOuterRels.
+	paramSink *[]paramProbeNode
 
 	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
 	// (pathnodes.h:2119: "JoinPath is used to represent all types of join

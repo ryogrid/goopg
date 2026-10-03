@@ -235,6 +235,17 @@ func probeEnforcedClauses(p *Path) map[*restrictInfo]bool {
 		}
 		return out
 	}
+	if p != nil && p.Kind == PathHashJoin && p.RequiredOuter != 0 {
+		// M0146-0049d3: a parameterised hash join enforces what its
+		// parameterised probes enforce.
+		out := map[*restrictInfo]bool{}
+		for _, c := range p.Children {
+			for ri := range probeEnforcedClauses(c) {
+				out[ri] = true
+			}
+		}
+		return out
+	}
 	if p == nil || len(p.IndexClauses) == 0 {
 		return nil
 	}
@@ -368,7 +379,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// changes nothing about which clauses the probe below it enforces, and
 			// re-deriving it per candidate would invite the two to disagree.
 			// M0127-P5.4b-ii-b-2.
-			for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp)} {
 				if in == nil {
 					continue
 				}
@@ -568,7 +579,7 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 			// machinery to mirror — and nothing to check: with `req == 0`
 			// and an unparameterised outer there is no parameterisation
 			// left to translate. Stated, not skipped silently.
-			for _, in := range []*Path{i, getMemoizePath(s, outer, o, i, cp)} {
+			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp)} {
 				if in == nil {
 					continue
 				}
@@ -718,4 +729,14 @@ func nestLoopOuterPaths(outer *RelOptInfo, uniq uniqueSide, sjinfo *SpecialJoinI
 		out = append(out, p)
 	}
 	return out
+}
+
+// nliMemoizeCandidate is getMemoizePath for the NLI arm's inner candidates,
+// except a parameterised join inner (M0146-0049d3), whose Memoize wrapper has
+// no lowering yet: createNestLoopIndexJoinPlan unwraps a Memoize to a probe.
+func nliMemoizeCandidate(s *searchCtx, outer *RelOptInfo, o, i *Path, cp costParams) *Path {
+	if i != nil && i.Kind == PathHashJoin {
+		return nil
+	}
+	return getMemoizePath(s, outer, o, i, cp)
 }
