@@ -25949,7 +25949,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Fire set: SF1 match 28 → 29 \(Q69\); SF0\.25 39 → 38 \(Q56 — filed
       M0146\-0009l, kept per R3\); ea\-ratchet 10/10, sweep 96/96, TPC\-H arm\.
     Movement: yes — TPC\-DS PLAN\-PARITY match SF1 28→29 \(Q69\); SF0\.25 39→38 \(Q56, M0146\-0009l\)
-- [ ] **M0146\-0009l — Q56 at SF0\.25 lost its match after the semi clamp**
+- [x] **M0146\-0009l — Q56 at SF0\.25 lost its match after the semi clamp**
   \(filed 2026\-10\-03 by M0146\-0009g\)\. The 0009g clamp changes Q56\'s
   semi\-join row estimates; in one UNION branch goopg now elects `Gather
   Merge → Sort` where PG \(and goopg before\) has `Sort → Gather` over
@@ -25963,6 +25963,31 @@ M0146-0001 re-baseline census on the new default arm.
   > otherwise\. Resume point: compare the branch\'s Gather vs Gather Merge
   > costs with PG\'s for the new row count \(cost\_gather\_merge vs
   > cost\_sort over a Gather\)\.
+  - **DONE 2026\-10\-04 \(recon\)\.** Not the semi clamp itself and not a
+    cost formula: in the no\-split gathered arm of the partial\-agg upper
+    producer \(partialaggupper\.go\), the Gather is sized on the serial
+    seed\'s rows \(11\) while the Gather Merge is sized on the partial
+    path\'s rows × divisor \(10\); PG sizes both by `compute\_gather\_rows`\.
+    The Gather Merge is undercharged by `parallel\_tuple\_cost × 1\.05` and
+    wins a 0\.07 near\-tie PG\'s Sort\-over\-Gather wins\.
+    - Ruled out: the LIMIT \(same plan without it\), cost\_sort vs
+      cost\_gather\_merge arithmetic, add\_path\'s tie\-break\.
+    - Fix filed as M0146\-0009n\.
+    - Design `docs/design/0100\-0149/m0146\-0009l\-q56\-gather\-rows\-recon\.md`\.
+  Movement: none — recon
+- [ ] **M0146\-0009n — the gathered arm sizes its Gather on the serial
+  seed\'s rows, its Gather Merge on the partial path\'s** \(filed 2026\-10\-04
+  by recon M0146\-0009l\)\. PG sizes every parallel boundary over a partial
+  subpath by `compute\_gather\_rows` \(subpath rows × parallel divisor\);
+  goopg\'s `nsGather` uses `inputRows`\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: in partialaggupper\.go\'s no\-split gathered arm set
+    `nsGather\.Rows = clampRowEst\(perWorkerRows × d\)` and price
+    `gatherCost` on it; check the sibling upper producers for the same
+    seed\-rows Gather\.
+  - Expected movement \(S5\): Q56 SF0\.25 back to match \(store\_sales branch
+    Sort → Gather\); fire set at both scales\.
 - [ ] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
   packed count** \(filed 2026\-10\-02 by the M0146\-0005 Q52 diagnosis\)\.
   The two TPC\-DS SF0\.25 loads hold the same tuples per page, but PG\'s
