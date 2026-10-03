@@ -218,7 +218,8 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 	}
 
 	// ec accumulates the equivalence classes across every canonical
-	// ColumnRef = ColumnRef equality, explicit and inferred alike — the whole
+	// member equality (ColumnRef = ColumnRef, or a single-relation expression
+	// member — M0146-0005do), explicit and inferred alike — the whole
 	// point of 04 §5 is that an inferred member is a full member of its class.
 	ec := newEquivClasses()
 	// order replays process_equivalence to record PG's member order;
@@ -258,8 +259,7 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 		l.all = append(l.all, ri)
 
 		var key *columnIdent
-		if lc, rc, isColEq := isColumnRefEquality(e); isColEq && ri.isEquijoin {
-			li, rid := identOf(lc), identOf(rc)
+		if li, rid, isECEq := ecEqualityIdents(e); isECEq && ri.isEquijoin {
 			ec.union(li, rid)
 			l.ecPairs[orderedPair(li, rid)] = true
 			i, lin := orderOf[li]
@@ -316,8 +316,8 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 		if _, done := l.ecMembers[ri.ecID]; done {
 			continue
 		}
-		if lc, _, ok := isColumnRefEquality(ri.clause); ok {
-			if i, in := orderOf[identOf(lc)]; in {
+		if li, _, ok := ecEqualityIdents(ri.clause); ok {
+			if i, in := orderOf[li]; in {
 				l.ecMembers[ri.ecID] = order[i]
 			}
 		}
@@ -547,12 +547,12 @@ func (l *restrictInfoList) equivClassJoinClause(id int, outer, inner RelSet, bas
 		if ri.ecID != id || !ri.isEquijoin {
 			continue
 		}
-		lc, rc, ok := isColumnRefEquality(ri.clause)
+		li, rid, ok := ecEqualityIdents(ri.clause)
 		if !ok {
 			continue
 		}
-		relOf[identOf(lc)] = ri.leftRelids
-		relOf[identOf(rc)] = ri.rightRelids
+		relOf[li] = ri.leftRelids
+		relOf[rid] = ri.rightRelids
 	}
 	var om, im []columnIdent
 	seenRel := RelSet(0)
@@ -581,11 +581,10 @@ func (l *restrictInfoList) equivClassJoinClause(id int, outer, inner RelSet, bas
 		if ri.ecID != id || !ri.isEquijoin {
 			continue
 		}
-		lc, rc, ok := isColumnRefEquality(ri.clause)
+		li, rid, ok := ecEqualityIdents(ri.clause)
 		if !ok {
 			continue
 		}
-		li, rid := identOf(lc), identOf(rc)
 		switch {
 		case li == om[0] && rid == im[0]:
 			return ri
