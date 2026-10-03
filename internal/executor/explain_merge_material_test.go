@@ -39,12 +39,17 @@ func TestExplainMergeJoinMaterializesCTEInner(t *testing.T) {
 	if got := explainTotalCost(t, lines, "Materialize"); got != 4.50 {
 		t.Errorf("Materialize total %.2f, want PG's 4.50 (the scan's 4.00 + cpu_operator_cost x 200):\n%s", got, joined)
 	}
-	// The run cost below the join's startup is PG's 11.50: outer 4.00, the
+	// The run cost above the join's startup is PG's 11.50: outer 4.00, the
 	// materialized inner 4.50, one comparison per tuple read from either
 	// side (400 x 0.0025) and cpu_tuple_cost per merged tuple (200 x 0.01).
-	// (The startup differs: goopg does not charge the CTE's initPlan there.)
-	if got := explainTotalCost(t, lines, "Merge Join"); got != 11.50 {
-		t.Errorf("Merge Join total %.2f, want the 11.50 PG's run cost adds up to:\n%s", got, joined)
+	// The startup is the CTE's initPlan cost, charged to the top node
+	// (SS_charge_for_initplans, M0146-0005dr): PG's 54.04 is its CTE body's
+	// total. goopg's body prices its HashAggregate 0.50 above PG's, so the
+	// startup is checked against goopg's own body line.
+	mj := explainTotalCost(t, lines, "Merge Join")
+	body := explainTotalCost(t, lines, "Sort")
+	if got := mj - body; got < 11.49 || got > 11.51 {
+		t.Errorf("Merge Join total %.2f minus the CTE body's %.2f = %.2f, want PG's 11.50 run cost:\n%s", mj, body, got, joined)
 	}
 }
 

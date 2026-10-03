@@ -216,6 +216,13 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
 	// while the SubqueryScan wrappers still mark the levels PG keeps.
 	renumberRTIDsFlatRtableOrder(node)
+	// M0146-0005dr: SS_charge_for_initplans — each query level's top node
+	// carries its initPlans' cost. Before the strip, while the Subquery Scan
+	// wrappers still mark the levels PG keeps; EXPLAIN's own inner
+	// statement is charged by its recursive call.
+	if _, isExplain := stmt.(*parser.ExplainStmt); !isExplain {
+		chargeInitPlans(node)
+	}
 	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
 	// M0146-0034: record which index scan carries the ORDER BY, for the
 	// parallel post-pass that runs on this plan without the statement.

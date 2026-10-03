@@ -5554,13 +5554,16 @@ func explainIndexName(i *catalog.Index) string {
 // every cost is 0.00: with all-zero, a reader knows nothing is priced; with a
 // mixture, a free node and an unpriced node look identical.
 func explainCostFields(n optimizer.Node, rows int64) (est int64, startup, total float64, width int) {
+	// M0146-0005dr: the top node of a query level also carries the cost of
+	// the initPlans (sublinks, kept CTEs) it runs — SS_charge_for_initplans.
+	ch := optimizer.InitPlanChargeOf(n)
 	if c, ok := n.(optimizer.PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return planCostRows(pc.PlanRows, rows), pc.StartupCost, pc.TotalCost, pc.PlanWidth
+			return planCostRows(pc.PlanRows, rows), pc.StartupCost + ch, pc.TotalCost + ch, pc.PlanWidth
 		}
 	}
 	d := optimizer.DeriveLegacyDisplayCost(n, rows)
-	return planCostRows(d.PlanRows, rows), d.StartupCost, d.TotalCost, d.PlanWidth
+	return planCostRows(d.PlanRows, rows), d.StartupCost + ch, d.TotalCost + ch, d.PlanWidth
 }
 
 // planCostRows converts a carrier's `PlanRows` to the integer EXPLAIN prints,

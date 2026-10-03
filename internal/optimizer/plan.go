@@ -701,6 +701,9 @@ type TableSampleSpec struct {
 func (t *TableSampleSpec) Pos() int { return t.pos }
 
 type SeqScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
@@ -847,6 +850,9 @@ func (n *IndexScan) WithSchemaForTest(schema Schema) *IndexScan {
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: see *SeqScan above (searchedtree.go).
@@ -984,6 +990,9 @@ func (n *IndexScan) Output() Schema { return n.schema }
 // inner probe yields no rows, the operator emits `outer ++
 // nullRow(innerWidth)` to preserve outer rows.
 type NestedLoopIndexJoin struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the parameterised arm of createNestLoopPlan (searchedtree.go).
@@ -1067,6 +1076,9 @@ func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
 // for initial sizing (cost_memoize_rescan analog); the executor clamps
 // by the runtime memory budget.
 type Memoize struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	pos        int
@@ -1092,6 +1104,9 @@ func (n *Memoize) Output() Schema { return n.Child.Output() }
 // The executor half is `materializeOp` (operators_material.go), which the
 // nested-loop driver reaches for only when this node is present.
 type Materialize struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	pos   int
@@ -1109,6 +1124,9 @@ func (n *Materialize) Output() Schema { return n.Child.Output() }
 // of the full table schema). When the VM bit is not set for a page the
 // executor falls back to a regular heap fetch.
 type IndexOnlyScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: a one-relation search root is a bare scan, and an
@@ -1254,6 +1272,9 @@ const (
 // Merge join sorts both sides on their keys and merges the two
 // ordered streams.
 type Join struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the usual search root — every join arm but the
@@ -1488,6 +1509,9 @@ func (a AggregateCall) Pos() int { return a.pos }
 // by the GROUP BY key (e.g. non-key cols when GROUP BY covers a primary key).
 // The executor evaluates them from the first row of each group. M0097-0003.
 type Aggregate struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the chosen path's cost and rows (plancost.go,
 	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
 	PlanCost
@@ -1739,6 +1763,9 @@ func (w WindowFunc) Pos() int { return w.pos }
 // Stage A uses one shared PARTITION BY / ORDER BY spec for all
 // funcs in the node.
 type WindowAgg struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos         int
 	Child       Node
 	// RunCondition is PG's WindowAgg runCondition (find_window_run_conditions,
@@ -1828,6 +1855,9 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go). Without
 	// this embed, stampPlanCost's `n.(planCostSetter)` assertion silently
 	// fails on a base-local-filtered leaf (buildInitialRels wraps it in
@@ -1892,6 +1922,9 @@ func (n *Filter) Output() Schema { return n.Child.Output() }
 // child scan — see rewriteMinMaxAggregates); the const-arg rewrite
 // (`SELECT max(100) FROM t`) sets both.
 type Result struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	searchedTree
 	pos int
 	// Targets: evaluated once per emitted row (childless) or once per child
@@ -1908,6 +1941,9 @@ func (n *Result) Pos() int       { return n.pos }
 func (n *Result) Output() Schema { return n.schema }
 
 type Project struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// searchedTree: the boundary node P5.5-f-i emits is a *Project, and it is
 	// the node the legacy posmap family must most carefully not walk into
 	// (searchedtree.go).
@@ -1940,6 +1976,9 @@ func (n *Project) Output() Schema { return n.schema }
 //
 // See docs/design/0016-0004-cte-observability-and-compat-tests.md.
 type CTEScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Name   string // CTE name from the WITH list
 	Alias  string // alias used at this consumer site (defaults to Name)
@@ -1987,6 +2026,9 @@ type CTEScan struct {
 // Children) stop at it, exactly as they already stop at a separately
 // planned scope. M0146-0005w.
 type SubqueryScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Alias  string
 	Child  Node
@@ -2021,6 +2063,9 @@ func (n *CTEDMLPrefix) Output() Schema { return n.Body.Output() }
 // ctx.MaterializedCTEs[Name]. Used when a DML CTE body's RETURNING rows
 // are consumed by the outer SELECT.
 type MaterializedCTEScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Name   string // CTE name (key into ctx.MaterializedCTEs)
 	Alias  string
@@ -2118,6 +2163,9 @@ type SortKey struct {
 }
 
 type Sort struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the PathSort arm's root (searchedtree.go).
@@ -2161,6 +2209,9 @@ func (n *Sort) Output() Schema { return n.Child.Output() }
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Child  Node
 	Limit  Expr // nil when no limit
@@ -2184,6 +2235,9 @@ func (n *Limit) Output() Schema { return n.Child.Output() }
 // plan cache cannot serve a stale snapshot of a dynamic view
 // (M0094-0005).
 type Values struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos           int
 	Rows          [][]Expr
 	schema        Schema
@@ -2197,6 +2251,9 @@ func (n *Values) Output() Schema { return n.schema }
 // generate_series(start, stop[, step]) in the FROM clause.
 // M0096-0006.
 type GenerateSeries struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Start  Expr
 	Stop   Expr
@@ -2250,6 +2307,9 @@ func (n *GenerateSubscripts) Output() Schema { return n.schema }
 // For multi-arg unnest: `FROM unnest(arr1, arr2, ...)`, ArrExprs holds each
 // array and the schema has one column per array (NULL-padded ZIP semantics).
 type FromUnnest struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos      int
 	ArrExpr  Expr   // single-arg form (len(ArrExprs)==0)
 	ArrExprs []Expr // multi-arg form (len>=2)
@@ -2378,6 +2438,9 @@ type UserSrfCol struct {
 }
 
 type ProjectSet struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos     int
 	Child   Node
 	SrfName string
@@ -2702,6 +2765,9 @@ type LockedRel struct {
 // Output schema is the child's schema with resjunk ctid columns
 // stripped — callers see only the user-visible columns.
 type LockRows struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos   int
 	Child Node
 	Locks []LockedRel
@@ -3078,6 +3144,9 @@ func (n *Copy) Output() Schema { return n.schema }
 // all other variants buffer and apply multiset semantics in the executor
 // (operators_setop.go). M0097-0024.
 type SetOp struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the chosen path's cost and rows (plancost.go,
 	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
 	PlanCost
@@ -3187,6 +3256,9 @@ func (n *SetOp) Output() Schema {
 // space. The risk correspondingly moves from "is the transport correct" to "is
 // the shutdown correct".
 type Gather struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	PlanCost
 	// searchedTree: C-19f. A Gather became a root `createPlanNode` can return
 	// the moment a partial JOIN path made one winnable at a search root
@@ -3230,6 +3302,9 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 //
 // P7 of docs/design/parallel-query/ (chapter 05 §4).
 type GatherMerge struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	PlanCost
 	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
 	searchedTree
@@ -3256,6 +3331,9 @@ func NewGatherMerge(pos int, child Node, nWorkers int, keys []SortKey) *GatherMe
 }
 
 type Distinct struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the chosen path's cost and rows (plancost.go,
 	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
 	PlanCost
@@ -3289,6 +3367,9 @@ func (n *Distinct) Output() Schema { return n.schema }
 // KeyCols holds the output column indices that form the DISTINCT ON key.
 // M0097-0005.
 type DistinctOn struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the chosen path's cost and rows (plancost.go,
 	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
 	PlanCost
@@ -3330,6 +3411,9 @@ func (n *DistinctOn) Output() Schema { return n.schema }
 // iteration step (UNION semantics); iteration stops when the new
 // working set contains no rows not already in the output.
 type RecursiveUnion struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos       int
 	Anchor    Node
 	Recursive Node
@@ -3344,6 +3428,9 @@ func (n *RecursiveUnion) Output() Schema { return n.schema }
 // during fixpoint iteration. Only valid inside a RecursiveUnion's
 // Recursive subtree.
 type WorkTableScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	schema Schema
 }
@@ -3377,6 +3464,9 @@ func (n *BitmapIndexScan) Output() Schema { return n.schema }
 // (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapHeapScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	pos   int

@@ -210,10 +210,10 @@ func legacyDisplayCostOf(n Node) PlanCost {
 	}
 	if c, ok := n.(PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return pc
+			return withInitPlanCharge(n, pc)
 		}
 	}
-	return DeriveLegacyDisplayCost(n, EstimateRows(n))
+	return withInitPlanCharge(n, DeriveLegacyDisplayCost(n, EstimateRows(n)))
 }
 
 func childRowsOf(n Node) float64 {
