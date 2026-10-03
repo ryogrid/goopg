@@ -602,7 +602,10 @@ remains below is filing/completion discipline, not rank.
   blocker, expected movement if unblocked with named queries/categories, size),
   mark the root `[!]`, select elsewhere. Only the owner reopens it.
   Renumbering or re-filing does not reset lineage.
-  `scripts/ralph-lineage-guard.py` enforces this at commit.
+  `scripts/ralph-lineage-guard.py` enforces this at commit. Task ids and
+  `Parent:` values are read with the markdown `\-` escape stripped —
+  `M0146-0005` and `M0146\-0005` are the same task (spell new entries
+  unescaped).
   **Owner re-pin:** a `LINEAGE-BASELINE: <root> <task-id> ...` line in the
   `## Current Priority` banner pins the listed completed descendants OUT of
   the last-5 window — the count restarts from that point while still

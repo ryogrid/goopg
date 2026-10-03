@@ -171,7 +171,11 @@ banner at the next `## ` line).
    stays sequenced after 0005, but 0005 may close `[x]` once every
    remaining first-divergence record is routed to a named task
    (0009/0012/0019a/0042/…), the M0146-0014 "no unnamed records"
-   convention applied early.
+   convention applied early. **M0146-0005's S4 escalation is resolved
+   2026-10-03 — the root is re-opened** (guard `\-`-normalisation;
+   OWNER DECISIONS 2026-10-03), and **M0146-0049 is next in this
+   item's structural line** — it is the named blocker for 0005dp/dq
+   and M0145-0008ac/0008y.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -254,6 +258,18 @@ re-home — can carry `Parent: M0144-0011c`. The pinned five are the
 M0144-0011 campaign's Movement:none tail; the campaign's only movement
 (0011a) falls back inside the window, and the campaign itself is closed —
 superseded into M0146 — not restarted.)
+
+LINEAGE-BASELINE: M0146-0009 M0146-0009c M0146-0009d M0146-0009e M0146-0009f M0146-0009k
+(owner pin 2026-10-03, delegated — resolves the exhaustion the guard's
+new `\-`-normalisation surfaces on this root: the five pinned
+completions are the instrument-artefact/recon class — 0009c and 0009f
+are ea-ratchet classification recons, 0009d hardened the ea-ratchet
+instrument itself (vacuous-PASS fix), 0009e left no Movement line, and
+0009k landed the searched-join-rows sizing with the instruments
+honestly unchanged. Same adjudication as the 2026-09-23 second
+M0145-0001 re-pin. Not a root exemption: later completions accumulate
+a fresh budget, so the interleaveable stats children still owe a real
+Movement line.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -582,6 +598,27 @@ OWNER DECISIONS 2026-10-03 (delegated; details in each task's entry):
   first-divergence record to a named task; M0146-0005's close
   condition now reduces to SF1's 65 unrouted records, so the
   M0141-S7 hold stays until then.
+- **M0146-0005's S4 lineage escalation: RESOLVED — re-opened
+  (`[!]`→`[ ]`).** Took the re-pin arm, implemented as a guard fix
+  rather than a `LINEAGE-BASELINE` line: the five named completions
+  (0005dn/do/dt/dr/ds) were filed with `Parent: M0146\-0005`, and the
+  un-stripped `\-` escape made each one self-rooted — the root's
+  mechanical last-5 window never held them (its true tail is
+  `0028f`/`0037`, both `Movement: yes`), so a literal pin would have
+  pinned ids out of a window they were never in.
+  `scripts/ralph-lineage-guard.py` now strips the `\-` markdown
+  escape from task ids, `Parent:` values and `LINEAGE-BASELINE` /
+  `FROZEN-PREFIXES` tokens (the Rule E canonicalisation extended to
+  lineage resolution); new entries should spell ids unescaped, though
+  both forms now resolve identically. The normalisation surfaces one
+  real exhaustion on **M0146-0009** (0009c/d/e/f/k, all `none`) —
+  adjudicated the same instrument-artefact/recon class and pinned on
+  its own `LINEAGE-BASELINE` line so the interleaveable stats
+  children are not stranded by the fix. M0146-0009k already landed,
+  so sequencing it first is moot; **M0146-0049 is next in item 3's
+  structural line** — its three slices are the named blocker for
+  0005dp/0005dq and M0145-0008ac/0008y, and it was never
+  budget-blocked (`Parent: M0146`, own root).
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -22172,7 +22209,7 @@ M0146-0001 re-baseline census on the new default arm.
       1/2/4 under `\-race` for the memoized fused NLI under Gather —
       the per\-shape identity pin the milestone\'s admission rule
       requires \(claim topology was already pinned\).
-- [!] **M0146-0005 — join-order / candidate-pool divergence burn-down**
+- [ ] **M0146-0005 — join-order / candidate-pool divergence burn-down**
   (impl). The largest residual category (~90 SF0.25 `join-order`
   records): work the per-family decomposition M0146-0001's census
   produces — owns Q8's `depth=3` join-order residue (M0144-0011b) and
@@ -22218,6 +22255,23 @@ M0146-0001 re-baseline census on the new default arm.
   > first and re-open the root after them. Until then the loop selects
   > elsewhere: item 3's interleaveable M0146-0009 children, starting
   > with 0009k.
+  >
+  > **RESOLVED 2026-10-03 (owner):** re-opened — root back to `[ ]`.
+  > The five are the instrument-artefact / recon class (two recons,
+  > two classifier- or cost-invisible ports, one inside the ±3 noise
+  > band) — the same adjudication as the 2026-09-23 second M0145-0001
+  > re-pin. **No `LINEAGE-BASELINE` pin was needed, and a literal one
+  > would have been a no-op:** these five were filed with
+  > `Parent: M0146\-0005` while the root's own id is unescaped, and
+  > the guard did not strip the `\-` escape — so each was self-rooted
+  > and never entered this root's last-5 window (its real resolved
+  > tail ends `0028f`/`0037`, both `Movement: yes`). The guard now
+  > normalizes `\-` on task ids, `Parent:` values and banner tokens
+  > (`scripts/ralph-lineage-guard.py`), so the escaped subtree joins
+  > the lineage accounting from now on; post-re-open completions
+  > accumulate toward a fresh budget. M0146-0009k already landed
+  > (`e6f198d6b`) — sequencing it first is moot; M0146-0049 has its
+  > own root (`Parent: M0146`) and was never budget-blocked.
   Kind: impl
   Parent: none
   - **Slice 112 \(routing, 2026\-10\-02, HEAD `c96a5d2f9`\)\.** Q42, Q52, Q37
@@ -24486,6 +24540,7 @@ M0146-0001 re-baseline census on the new default arm.
     no Append path kind, and goopg\'s only parameterised inner is the NLI\'s
     single `\*IndexScan` — no `NestLoopParam` over a general inner subtree\.
     Re\-select when M0146\-0049 lands\.
+    STALE\-OK: M0146\-0005dt \(cited as the filing recon, not the blocker\)
   - [x] **M0146\-0005dt — recon: what Q54\'s parameterised Append needs**
     \(2026\-10\-03\)\.
     Kind: recon

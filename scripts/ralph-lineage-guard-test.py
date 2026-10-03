@@ -244,6 +244,31 @@ case("E: repeating non-id title word (WRONG RESULTS) is exempt", wrbase,
      wrbase + "- [ ] **WRONG RESULTS: first defect**\n  body\n"
      + "- [ ] **WRONG RESULTS: second defect**\n  body\n", None)
 
+# --- `\-` escape normalisation ------------------------------------------------
+# The real file mixes `M0146-NNNN` and `M0146\-NNNN`. Before normalisation an
+# escaped `Parent:` never resolved — every escaped child was self-rooted and
+# escaped the Rule A budget (the M0146-0005 S4 escalation, 2026-10-03).
+ESCROOT = task("M0142-0009", "x", extra="unescaped root")
+ESCCHAIN = [task(f"M0142\\-0009a-{i}", "x",
+                 parent="M0142\\-0009" if i == 0 else f"M0142\\-0009a-{i-1}",
+                 movement="none") for i in range(5)]
+escbase = plan(ESCROOT, *ESCCHAIN)
+case("A: escaped-id children resolve to the unescaped root -> violation",
+     escbase,
+     escbase + task("M0142\\-0009a-5", " ", parent="M0142\\-0009a-4"), "A")
+case("A: unescaped Parent to an escaped-id parent resolves -> violation",
+     escbase,
+     escbase + task("M0142-0009b", " ", parent="M0142-0009a-4"), "A")
+case("A: escaped Parent: none resolves to no parent -> ok",
+     plan(ROOT), plan(ROOT) + task("M0142-0098", " ", parent="none"), None)
+ESCPIN = ("# Fix plan\n\n## Current Priority\nLINEAGE-BASELINE: "
+          "M0142\\-0009 M0142\\-0009a-0 M0142\\-0009a-1 M0142\\-0009a-2 "
+          "M0142\\-0009a-3 M0142\\-0009a-4\n1. x\n\n## M0142 — stuff\n\n")
+escpin = ESCPIN + "".join([ESCROOT] + ESCCHAIN)
+case("A: pin tokens written with escapes pin the normalised ids -> ok",
+     escpin,
+     escpin + task("M0142\\-0009a-5", " ", parent="M0142\\-0009a-4"), None)
+
 # --- Rule F fixtures (advisory, asserted separately below) --------------------
 FPLAN = (HEADER
          + "- [x] **M0145-0008 — landed blocker**\n  done\n"

@@ -74,6 +74,14 @@ Body lines (until the next checkbox task line or `#` heading), or the task's
 header line itself, may carry
   `Parent: <TASK-ID|none>` and `Movement: yes — <evidence>` / `Movement: none`.
 
+Ids and `Parent:` values are read with the markdown `\\-` escape stripped
+(`M0146-0005` and `M0146\\-0005` are the same task — the file mixes both
+spellings). Without the normalisation an escaped `Parent:` never resolved:
+every escaped child became its own Rule A root and escaped the lineage
+budget entirely (surfaced by the M0146-0005 S4 escalation, 2026-10-03).
+Rule E already compared ids escape-stripped; this extends the same
+canonicalisation to Parent resolution and the banner tokens.
+
 Modes:
   (default)                 baseline = git show HEAD:.ralph/fix_plan.md,
                             candidate = working-tree .ralph/fix_plan.md
@@ -136,6 +144,7 @@ def parse(text):
             indent = len(mt.group(1).expandtabs(4))
             status = mt.group(2).lower()
             tid = mt.group(3).rstrip(".,:;—")
+            tid = tid.replace("\\", "")
             cur = Task(tid, status, indent, n, len(order))
             if "FROZEN" in ln:
                 cur.frozen = True
@@ -168,7 +177,7 @@ def _fields(cur, ln, n, inline):
     mp = pre.search(ln) if inline else pre.match(ln)
     if mp and not cur.has_parent:
         cur.has_parent = True
-        p = mp.group(1).rstrip(".,;")
+        p = mp.group(1).rstrip(".,;").replace("\\", "")
         cur.parent = None if p.lower() == "none" else p
     mm = mre.search(ln) if inline else mre.match(ln)
     if mm and cur.movement is None:
@@ -224,7 +233,7 @@ def frozen_prefixes(text):
         if i < 0:
             continue
         for tok in ln[i + len(FROZEN_PREFIXES_TOKEN):].split():
-            tok = tok.strip("`*,;.")
+            tok = tok.strip("`*,;.").replace("\\", "")
             if tok:
                 out.append(tok)
     return out
@@ -240,7 +249,8 @@ def lineage_baselines(text):
         i = ln.find(LINEAGE_BASELINE_TOKEN)
         if i < 0:
             continue
-        toks = [t.strip("`*,;.()") for t in ln[i + len(LINEAGE_BASELINE_TOKEN):].split()]
+        toks = [t.strip("`*,;.()").replace("\\", "")
+                for t in ln[i + len(LINEAGE_BASELINE_TOKEN):].split()]
         toks = [t for t in toks if t]
         if len(toks) < 2:
             continue
