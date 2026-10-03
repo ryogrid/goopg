@@ -26890,7 +26890,7 @@ M0146-0001 re-baseline census on the new default arm.
       PG 3000 — filed M0146\-0009m\.
     - Design `docs/design/0100\-0149/m0146\-0049\-parameterised\-inner\-non\-scan\.md`\.
     Movement: none — recon
-  - [ ] **M0146\-0049b — per\-member parameterised index paths for a
+  - [x] **M0146\-0049b — per\-member parameterised index paths for a
     flattened UNION ALL leaf** \(filed 2026\-10\-03 by 0049a\)\. Members
     that are single\-table scans get the join clause translated through
     their output column \(`leafcol = outer` → `membercol = outer`\) and a
@@ -26901,7 +26901,7 @@ M0146-0001 re-baseline census on the new default arm.
     Parent: M0146\-0049
     - Expected movement \(S5\): none alone — the paths are unreachable until
       0049c; measured with 0049c\.
-  - [ ] **M0146\-0049c — a parameterised Append path and its nested\-loop
+  - [x] **M0146\-0049c — a parameterised Append path and its nested\-loop
     lowering** \(filed 2026\-10\-03 by 0049a\)\. `create\_append\_path` with
     `required\_outer` over 0049b\'s member paths \(cost and rows the sum\);
     NL path generation accepts it as an inner; lowering emits
@@ -26912,6 +26912,42 @@ M0146-0001 re-baseline census on the new default arm.
     - Expected movement \(S5\): TPC\-DS Q54 `my\_customers` subtree 19832 →
       about 6537 \(PG\'s shape\), `parameterisation`/`join\-method` at both
       scales; measured by the fire set and the sweep values gate\.
+    - **LANDED 2026\-10\-03 \(`f661e6933`\), together with 0049b** \(b alone had no
+      consumer\)\. `addParameterizedAppendPaths` / `createNestLoopParamAppendPlan`
+      \(paramappend\.go\); Q54\'s `my\_customers` subtree is now Nested Loop\(item,
+      Append\(Bitmap Heap catalog\_sales, Bitmap Heap web\_sales\)\), 19832 →
+      8561 \(PG 6537\)\.
+      - `TestParameterisedAppendOverUnionAll`; sweep 96/96, fire set Q54 only
+        \(no timeouts\), TPC\-H arm, ea\-ratchet 10/10, regress 9 suites
+        byte\-identical\.
+    Movement: none — Q54\'s categories unchanged \(serial outer vs PG\'s Parallel Seq Scan; web\_sales bitmap vs PG Index Scan\); match flat, ea\-ratchet 10/10
+  - [ ] **M0146\-0049d — a parameterised inner through a join** \(filed
+    2026\-10\-03\)\. Q95: PG\'s parameterised Hash Join on the semi inner
+    \(ws\_wh\_1 ⋈ IOS web\_returns\_pkey, probed by the outer\'s
+    ws\_order\_number\); the unblocker of M0146\-0005dq and M0145\-0008ac\.
+    Kind: impl
+    Parent: M0146\-0049
+    - First step: decide the producer: a join rel\'s parameterised paths
+      \(PG builds them in add\_paths\_to\_joinrel from parameterised children\)
+      versus a lateral re\-plan of the semi body; measure on Q95 at SF1\.
+  - [ ] **M0146\-0049e — a partial outer drives the parameterised Append**
+    \(filed 2026\-10\-03 by 0049c\)\. PG\'s Q54 runs Gather → NL\(Parallel Seq
+    Scan item, Append\(param probes\)\); goopg\'s `PathParamAppend` is not
+    parallel\-safe, so the NL stays serial\.
+    Kind: impl
+    Parent: M0146\-0049
+    - Expected movement \(S5\): Q54 `parallelism` / `join\-order` at both
+      scales; measured by the fire set\.
+    - First step: set `ParallelSafe` from the member probes and check the
+      parallel NL arm \(joinpathsnli\.go\) lowers through the lateral Join
+      under a Gather\.
+  - [ ] **M0146\-0049f — the IN/semi form probes each UNION ALL member**
+    \(filed 2026\-10\-03 by 0049c\)\. `li\.id IN \(SELECT item FROM cs1 UNION
+    ALL SELECT item FROM ws1\)`: PG probes both members, goopg does not
+    \(the sublink\'s UNION ALL is not a flattened appendrel leaf of the
+    search\)\.
+    Kind: recon
+    Parent: M0146\-0049
 - [ ] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
