@@ -572,3 +572,39 @@ regresses in the census. Evidence: `analysis/m0146/m0146-0005/slice14/`.
 **Continued in [part 2](m0146-0005-join-order-burndown-2.md)** — the
 2026-09-26 residual triage, slices 15-23, and slice 26 (Q19 seed-order
 priced-input routing) live there per the design-doc size rule (D3).
+
+## Slice 115: first-divergence routing refresh and SF1 routing (2026-10-04)
+
+Table: `analysis/m0146/m0146-0005/routing-20261004/ROUTING.md`. The capture
+is the M0146-0009m fire-set candidate (`af2c28f5f`).
+
+- **SF0.25.** The 16 records whose slice-114 targets have closed are
+  re-routed. Their fixes show in the plans:
+  - Q1's SubPlan cost is charged.
+  - Q23 and Q69 have the right semi/anti joins.
+  - Q72's unused left join is removed.
+  - Q44 and Q67 have Run Conditions.
+  - Q47, Q49 and Q57 have PG's window order.
+  - Q59 has its derived clause.
+  - Q95 has PG's nested-loop semi join.
+
+  Each record has a new, deeper first divergence.
+- **SF1.** This is the first routing at this scale. 12 of the 18 SF1-only
+  records hinge on the SF1 bench cluster's page counts. That cluster predates
+  the current on-disk format: item is 736 pages against PG's 1284, below
+  `min_parallel_table_scan_size`. These records wait on an owner reload.
+- **New families**, filed as tasks:
+  - a merge join's merge-join inner gets no Materialize (0005dv);
+  - a WindowAgg output claims the window column's order (0005dw);
+  - an uncorrelated sublink restriction is held above the search (0005dx);
+  - a multi-relation semi-join inner is not unique-ified (0005dy);
+  - a redundant outer-join clause stays a merge key (0005dz);
+  - grouping-sets row estimates (0009o);
+  - parameterised probe rows (0009p);
+  - the hashed aggregate's spill width (M0141-S2a-fix2r-a).
+- **Checked, not defects.** Q44's and Q78's merges over unsorted inputs
+  cannot return wrong values: goopg's merge executor sorts each input on
+  its merge key.
+
+Once the eight new tasks are worked or held, every record has a named target
+and the root can close (banner item 3), which releases M0146-0006.

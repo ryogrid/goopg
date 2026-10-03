@@ -22372,6 +22372,31 @@ M0146-0001 re-baseline census on the new default arm.
       M0146\-0009i\.
     - SF1 is not yet routed \(65 records; the same detectors classify 8\)\.
     Movement: none — routing census only, no code change
+  - **Slice 115 \(routing refresh \+ SF1 routing, 2026\-10\-04, HEAD
+    `af2c28f5f`\)\.** Every first\-divergence record at both scales is
+    routed: `analysis/m0146/m0146\-0005/routing\-20261004/ROUTING\.md`\.
+    - SF0\.25: the 16 records whose targets \(0005dg…dq, 0009i\) closed are
+      re\-routed; Q41 and Q75 now match\. B8 takes Q1, Q14, Q83; PARTIAL
+      \(M0146\-0027\) Q2, Q72, Q95; IOS \(M0146\-0019a\) Q23; SORT Q49; STATS
+      Q59\.
+    - SF1 \(first time\): of 18 SF1\-only records 12 hinge on the SF1 cluster\'s
+      page counts \(item 736 vs PG 1284 is below
+      `min\_parallel\_table\_scan\_size`\) — an owner reload; 5 are cost ties
+      \(M0146\-0014\); Q18 is grouping sets\. Shared records re\-checked at
+      SF1: Q4/Q11 \(HashAgg spill currency\), Q78 \(redundant outer\-join
+      clause\), Q61 \(relpages\), Q71 \(partial split\)\.
+    - New families filed: M0146\-0005dv \(merge\-join inner Materialize: Q47,
+      Q57\), 0005dw \(window\-output sort order: Q44\), 0005dx \(sublink
+      restriction held above the search: Q10, Q35\), 0005dy \(multi\-relation
+      semi\-join inner not unique\-ified: Q69\), 0005dz \(redundant outer\-join
+      clause kept as a merge key: Q78 SF1\), M0146\-0009o \(grouping\-sets
+      rows\), M0146\-0009p \(probe rows ignore the scan filter\),
+      M0141\-S2a\-fix2r\-a \(HashAgg spill priced in EntryBytes width\)\.
+    - Checked, not defects: Q44\'s and Q78\'s merges over unsorted inputs
+      return PG\'s values \(goopg\'s merge executor sorts its inputs\)\.
+    - Once these eight tasks are worked or held, every record has a named
+      target and M0146\-0005 can close \(banner item 3\), releasing M0146\-0006\.
+    Movement: none — routing census only, no code change
   - **Residual triage 2026\-09\-26 \(HEAD `b57acc6cd`\).** Evidence
     `analysis/m0146/m0146\-0005/residual\-triage\-20260926/`.
     - Stale `char\(n\)` data \+ probe multiplier: Q79, Q55, Q23, Q30 \(Q55:
@@ -27349,3 +27374,98 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress 20 planner cases identical to HEAD\.
     - Design `docs/design/0100\-0149/m0146\-0009m\-lateral\-append\-rows\.md`\.
   Movement: none — fire set flat at both scales; estimate fixed outside the searched plans
+- [ ] **M0146\-0005dv — a merge join over a merge\-join inner gets no
+  Materialize** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q47
+  and Q57 at SF0\.25: PG puts a Materialize on the top Merge Join\'s inner,
+  itself a Merge Join, because a merge join cannot mark/restore
+  \(`final\_cost\_mergejoin` materialize\_inner, costsize\.c;
+  `create\_mergejoin\_plan`, createplan\.c\)\. goopg feeds it bare, and its
+  outer merge starts at the inner\'s total \(258\.10 / 134\.71\), as if the
+  forced\-materialize arm in `mergeJoinCost` never fired\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: check what path kind the inner merge join reaches
+    `mergeJoinCost` as, and why `execSupportsMarkRestore` does not force
+    `materialize\_inner` for it\.
+- [ ] **M0146\-0005dw — a merge join over WindowAgg outputs claims the
+  window column\'s order** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
+  TPC\-DS Q44: `Merge Cond: \(rnk = rnk\)` over two WindowAggs sorted by
+  `rank\_col`, with no Sort; PG sorts each side \(a WindowAgg\'s output
+  exposes only the window\'s sort keys, `convert\_subquery\_pathkeys`\)\.
+  Reproduced with `rank\(\) OVER \(PARTITION BY p ORDER BY y\)` on both sides:
+  goopg still plans a bare Merge Join\. Values are correct \(goopg\'s merge
+  executor sorts its inputs itself\), so the gap is plan shape and cost\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find where a WindowAgg path\'s pathkeys include the window
+    function output column\.
+- [ ] **M0146\-0005dx — an uncorrelated restriction holding a sublink stays
+  above the join search** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
+  TPC\-DS Q10 and Q35: the OR of two hashed SubPlans on `c` is a
+  baserestrictinfo of `c` in PG \(`distribute\_qual\_to\_rels`, initsplan\.c\),
+  costed at the scan by the AlternativeSubPlan\'s plain arm, which makes
+  PG drive from `cd` into a customer probe; goopg holds it as a Filter
+  above the search \(on a Gather\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: trace why `partitionConjunctsForJoinPlanning` keeps a
+    sublink conjunct that references one base rel out of its restrictions;
+    compare M0146\-0012a \(the correlated\-sublink join\-clause case\)\.
+  - Q10/Q35/Q69 also need M0146\-0005dy to match\.
+- [ ] **M0146\-0005dy — a multi\-relation semi\-join inner is not
+  unique\-ified** \(filed 2026\-10\-04 by M0146\-0005 slice 115; the
+  M0146\-0005dk residual ledgered 2026\-10\-03\)\. TPC\-DS Q69 \(and below the
+  first divergence in Q10/Q35\): PG unique\-ifies `store\_sales ⋈ date\_dim`
+  on `ss\_customer\_sk` \(HashAgg\) and probes customer\_pkey; goopg runs a
+  Parallel Hash Semi Join\. PG: `populate\_joinrel\_with\_paths` JOIN\_SEMI
+  arm \(joinrels\.c\) calls `create\_unique\_path` on a rel equal to
+  `syn\_righthand` of any size\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find the 0005dk unique\-ify arm\'s single\-relation guard and
+    extend it to a joinrel equal to the semi join\'s RHS\.
+- [ ] **M0146\-0005dz — a redundant outer\-join clause stays a merge key**
+  \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q78 at SF1: the top
+  Merge Left Joins keep `ss\_sold\_year = \*\_sold\_year` as a merge key\.
+  PG\'s `reconsider\_outer\_join\_clauses` \(equivclass\.c\) derives the
+  constant on the nullable side and replaces the outer\-join clause by a
+  constant\-TRUE dummy, so PG merges on two keys\. goopg\'s
+  `deriveOuterLinkConstants` \(joinsearchseam\.go\) derives `d\_year = 1998`
+  but keeps the clause\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: in `deriveOuterLinkConstants`, drop the outer\-join clause
+    whose both sides are now pinned to the same constant, as
+    `reconsider\_outer\_join\_clauses` does\.
+- [ ] **M0146\-0009o — grouping\-sets row estimates are about a quarter of
+  PG\'s** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q18 \(SF1
+  49 vs 213, SF0\.25 12 vs 49\), Q22 \(17964 vs 71857\), Q67 \(a MixedAggregate
+  clamped to its input, 3140 vs 18531\)\. PG sums `estimate\_num\_groups`
+  over every grouping set \(`get\_number\_of\_groups`, planner\.c\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find goopg\'s grouping\-sets group count and compare it set
+    by set with `get\_number\_of\_groups`\.
+- [ ] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
+  filter** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q72: the
+  `inventory\_pkey` probe reports rows=527, three times PG\'s 176; the
+  filter `inv\_quantity\_on\_hand < cs\_quantity` \(PG\'s 1/3 default\) is not
+  applied to the path rows \(the nested loop\'s rows still agree\)\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find where a parameterised index path\'s rows are set and
+    whether its residual \(non\-index\) restriction clauses are applied,
+    as `get\_parameterized\_baserel\_size` does\.
+- [ ] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
+  in full\-row width** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
+  TPC\-DS Q4 and Q11 at SF1: in CTE `year\_total` goopg elects
+  GroupAgg←Gather Merge←Sort where PG runs a serial HashAggregate; the
+  group counts agree, but goopg prices its hashed arm at over 2\.5× PG\'s
+  \(Sort width 1206 vs PG\'s input width 213\)\. PG\'s `cost\_agg` AGG\_HASHED
+  spill tail uses `input\_width` \(costsize\.c\); goopg uses
+  `hashsize\.EntryBytes`\. A degradation of the re\-applied S2a\-fix2
+  arm, filed as its own task per the banner \(item 4\)\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r
+  - First step: compare `cost\_agg`\'s spill pages/depth for Q4\'s store arm
+    term by term with goopg\'s, on PG\'s widths\.
