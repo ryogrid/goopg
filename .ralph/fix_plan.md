@@ -24622,7 +24622,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Filed M0146\-0049 \(the missing feature\); 0005dp marked `\[\!\]` on it\.
       Design `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
     Movement: none — recon
-- [ ] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q95: PG NL Semi Join\(CTE ws\_wh\) over NL Semi Join\(parameterised Hash Join\(ws\_wh\_1, IOS web\_returns\_pkey\)\); goopg hashes the 1\.75M\-row CTE twice \(187888 vs 141550\)\.
   Kind: impl
   Parent: M0146\-0005
@@ -24644,6 +24644,18 @@ M0146-0001 re-baseline census on the new default arm.
     now PG\'s parameterised hash join\. What remains of this task is the
     outer NL Semi Join over the `ws\_wh` CTE scan \(goopg: Hash Join over
     HashAggregate\(ws\_wh\)\)\.
+  - **LANDED 2026\-10\-04 \(`ff218cc9c`, test `579b0197c`\)\.** Cause: goopg
+    resolved a CTE leaf\'s column with no statistics, so `eqjoinsel\_semi`
+    punted to 0\.5 and `rint\(0\.5\)` left Q95\'s one outer row unmatched —
+    the NL Semi Join over the CTE priced a full 1\.75M\-tuple pass \(106004 vs
+    PG 85486\)\. `derivedLeafColumnStats` ports `examine\_simple\_variable`\'s
+    RTE\_CTE / RTE\_SUBQUERY recursion through `resolveBaseColumn`\.
+    - Q95 top is PG\'s NL Semi Join over CTE Scan ws\_wh \(85340\.56 vs PG
+      85486\.28\); SF1 Q95 categories 5 → 2 \(scan\-type, qual\-placement\)\.
+    - Runtime Q95 3s → 6s at SF0\.25 on PG\'s plan \(goopg CTE rescans
+      ~2x slower per row than PG\) — ledgered\.
+    - Design `docs/design/0100\-0149/m0146\-0005dq\-cte\-leaf\-column\-stats\.md`\.
+  Movement: yes — fire set CATEGORIES\-EXCL\-MATCH SF1 join\-order 59→58, join\-method 27→26, aggregation\-strategy 23→22; SF0\.25 aggregation\-strategy 16→15, rendering 13→12 \(parameterisation 28→29\); match flat 38/29
 - [x] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
   that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
   leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
