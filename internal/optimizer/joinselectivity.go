@@ -46,6 +46,7 @@ package optimizer
 import (
 	"math"
 	"math/bits"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -186,6 +187,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 				if info.subqueryUniqueOutput || info.uniqueOutCols[cr.Name] {
 					v.isUnique = true
 				}
+				v.stats = s.derivedLeafColumnStats(j, cr.Name)
 			}
 		}
 		return v
@@ -207,7 +209,63 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 			v.isUnique = true
 		}
 	}
+	if v.stats == nil {
+		v.stats = s.derivedLeafColumnStats(i, cr.Name)
+	}
 	return v
+}
+
+// derivedLeafColumnStats is `examine_simple_variable`'s RTE_SUBQUERY /
+// RTE_CTE recursion (selfuncs.c): a column of a derived leaf — a subquery or
+// a non-recursive CTE — takes the statistics of the base column the
+// sub-select's targetlist entry is a plain Var of. vardata->rel stays the
+// derived rel, so the caller keeps the leaf's own tuples and rows; only the
+// statistics tuple comes from below.
+//
+// goopg resolves over the planned body rather than the parse tree, through
+// resolveBaseColumn — whose arm list carries upstream's punts by
+// construction: no arm for set operations or DISTINCT, a GROUP BY
+// Aggregate refused, a Project crossed only for a bare column (an
+// expression target is not a Var). TPC-DS Q95's `ws_wh.ws_order_number`
+// resolves to web_sales.ws_order_number this way; without it the semi join
+// over the CTE punted to 0.5 and priced its nested loop as scanning the
+// whole CTE per outer row (M0146-0005dq).
+func (s *searchCtx) derivedLeafColumnStats(j int, name string) *catalog.ColumnStats {
+	rels := s.levelRels(1)
+	if j < 0 || j >= len(rels) || rels[j] == nil || rels[j].baseLeaf == nil || name == "" {
+		return nil
+	}
+	leaf := rels[j].baseLeaf
+	inner := leaf
+	for {
+		if f, isF := inner.(*Filter); isF && f.Child != nil {
+			inner = f.Child
+			continue
+		}
+		break
+	}
+	switch inner.(type) {
+	case *CTEScan, *SubqueryScan:
+	default:
+		return nil
+	}
+	pos := -1
+	for k, c := range leaf.Output() {
+		if strings.EqualFold(c.Name, name) {
+			if pos >= 0 {
+				return nil // ambiguous output name
+			}
+			pos = k
+		}
+	}
+	if pos < 0 {
+		return nil
+	}
+	ref, ok := resolveBaseColumn(pos, leaf)
+	if !ok || ref.table == nil {
+		return nil
+	}
+	return columnStatsByName(ref.table, ref.col)
 }
 
 // derivedLeafUniqueCols names the leaf output columns PG's
