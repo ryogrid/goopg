@@ -24425,16 +24425,39 @@ M0146-0001 re-baseline census on the new default arm.
     `\(wss\_1\.d\_week\_seq \- 52\) = d\.d\_week\_seq` join \(ndv of the expression
     member: PG examine\_variable gives an expression without stats
     DEFAULT\_NUM\_DISTINCT\) and the joinrel size per split\.
-- [ ] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [!] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: check whether appendrel children get parameterised paths \(add\_paths\_to\_append\_rel with required\_outer\)\.
+  - **Blocked on M0146\-0049** \(recon M0146\-0005dt, 2026\-10\-03\): appendrel
+    members are not rels of the parent search \(M0145\-0004 hoist\), there is
+    no Append path kind, and goopg\'s only parameterised inner is the NLI\'s
+    single `\*IndexScan` — no `NestLoopParam` over a general inner subtree\.
+    Re\-select when M0146\-0049 lands\.
+  - [x] **M0146\-0005dt — recon: what Q54\'s parameterised Append needs**
+    \(2026\-10\-03\)\.
+    Kind: recon
+    Parent: M0146\-0005dp
+    - PG: members are child rels \(set\_append\_rel\_size\),
+      add\_paths\_to\_append\_rel builds an Append per child
+      parameterisation \(get\_cheapest\_parameterized\_child\_path\), and
+      create\_nestloop\_plan binds NestLoopParams into any inner subtree\.
+    - goopg: the appendrel is a partial\-path hoist over finished member
+      nodes; no Append PathKind; the parameterised NL inner must be an
+      `\*IndexScan`; `lateralJoinStream` already re\-executes an arbitrary
+      right subtree per outer row \(the executor substrate\)\.
+    - Filed M0146\-0049 \(the missing feature\); 0005dp marked `\[\!\]` on it\.
+      Design `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
+    Movement: none — recon
 - [ ] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q95: PG NL Semi Join\(CTE ws\_wh\) over NL Semi Join\(parameterised Hash Join\(ws\_wh\_1, IOS web\_returns\_pkey\)\); goopg hashes the 1\.75M\-row CTE twice \(187888 vs 141550\)\.
   Kind: impl
   Parent: M0146\-0005
   - First step: check the semi\-join NL producer for CTE\-scan inners and parameterised join inners\.
+  - 2026\-10\-03 \(M0146\-0005dt\): the "parameterised join on the semi
+    inner" half is M0146\-0049\'s through\-a\-join case — check whether the
+    CTE\-inner NL Semi Join half is separable before selecting\.
 - [ ] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
   that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
   leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
@@ -26626,3 +26649,31 @@ M0146-0001 re-baseline census on the new default arm.
     clauses, then generate\_join\_implied\_equalities\' EC clauses\. A sibling
     of `equivalenceClausesLast` \(local\_filters\.go\), which does this for
     scan quals, is the likely shape\.
+- [ ] **M0146\-0049 — a parameterised inner path through a non\-scan node**
+  \(filed 2026\-10\-03 by recon M0146\-0005dt\)\. PG binds a nested loop\'s
+  parameters into ANY inner subtree \(`create\_nestloop\_plan` /
+  `replace\_nestloop\_params`, createplan\.c:4341 / :5036; ExecReScan
+  propagates changed params\), so an inner can be a parameterised Append
+  \(`add\_paths\_to\_append\_rel` per child parameterisation, allpaths\.c:1321\)
+  or a parameterised join\. goopg\'s only parameterised inner is the NLI\'s
+  single `\*IndexScan`\. This is the "parameterised inner paths through a
+  join" blocker the owner sequenced first on 2026\-09\-25 \(M0145\-0008ac /
+  0008y\); no open task owned it\.
+  Kind: impl
+  Parent: M0146
+  - Expected movement \(S5\): Q54 `my\_customers` subtree 19832 → about 6537
+    \(PG\'s parameterised Append; M0146\-0005dp\), Q95\'s parameterised Hash
+    Join on the semi inner \(M0146\-0005dq, unblocks M0145\-0008ac\); measured
+    by the fire set at SF0\.25 and SF1 \(`parameterisation` / `join\-method`,
+    match\) and the sweep values gate\.
+  - Slices: \(a\) per\-member parameterised paths for a flattened UNION ALL
+    leaf whose members are single\-table scans, the join clause translated
+    through the member tlist; \(b\) a parameterised Append path kind and its
+    cost \(sum of children\); \(c\) lowering a parameterised non\-NLI inner to
+    a per\-outer\-row rescan — `lateralJoinStream` \(join\_lateral\_stream\.go\)
+    already re\-executes an arbitrary right subtree with the outer row bound
+    through `ctx\.OuterRows`\.
+  - First step: prove \(c\) on the executor — an `IndexScan` inside a lateral
+    right subtree probing by an `OuterColumnRef` key, rescanned per outer row
+    \(the rescan\-staleness risk M0146\-0012 names\)\.
+  - Design: `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
