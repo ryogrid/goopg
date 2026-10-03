@@ -1,6 +1,6 @@
 # M0146-0009l — recon: why Q56 lost its match after the semi clamp
 
-Status: done (2026-10-04, recon). Parent: M0146-0009. Fix filed: M0146-0009n.
+Status: done (2026-10-04, recon). Parent: M0146-0009. Fix: M0146-0009n, done (`9e1e56e5c`), Q56 matches again.
 
 ## Symptom
 

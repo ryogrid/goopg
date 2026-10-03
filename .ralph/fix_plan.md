@@ -25975,7 +25975,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Fix filed as M0146\-0009n\.
     - Design `docs/design/0100\-0149/m0146\-0009l\-q56\-gather\-rows\-recon\.md`\.
   Movement: none — recon
-- [ ] **M0146\-0009n — the gathered arm sizes its Gather on the serial
+- [x] **M0146\-0009n — the gathered arm sizes its Gather on the serial
   seed\'s rows, its Gather Merge on the partial path\'s** \(filed 2026\-10\-04
   by recon M0146\-0009l\)\. PG sizes every parallel boundary over a partial
   subpath by `compute\_gather\_rows` \(subpath rows × parallel divisor\);
@@ -25988,6 +25988,25 @@ M0146-0001 re-baseline census on the new default arm.
     seed\-rows Gather\.
   - Expected movement \(S5\): Q56 SF0\.25 back to match \(store\_sales branch
     Sort → Gather\); fire set at both scales\.
+  - **DONE 2026\-10\-04 \(`9e1e56e5c`\)\.** The arm computes
+    `gatheredRows := clampRowEst\(perWorkerRows × d\)` once; `nsGather`,
+    its `gatherCost` and the aggregates above it take it, and
+    `workerSortGatherMergePath` clamps the same count\.
+    - Siblings checked: partialaggpaths\.go and partialsortpaths\.go gather
+      the serial seed with no partial override \(counts already agree\);
+      gatherpaths\.go uses `computeGatherRows`\.
+    - Q56 SF0\.25 and Q93 SF1 match\. SF0\.25 Q5/Q58/Q60 and SF1 Q52/Q80
+      lose sort\-strategy or parallelism\. SF1 Q71 moves between two non\-PG
+      shapes \(PG elects the split; ledgered\)\.
+    - Gate note: SF1 Q74 timed out once on an unchanged plan \(baseline
+      already \~581 s of the 600 s cap, nightly lane running\); two
+      re\-runs PASS\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set PASS, ea\-ratchet PASS, regress 6 cases identical to HEAD\.
+    - Test `TestGatheredArmBoundariesShareComputeGatherRows` \(fails
+      before\)\.
+    - Design `docs/design/0100\-0149/m0146\-0009n\-gathered\-arm\-gather\-rows\.md`\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 30 -> 27, parallelism 34 -> 31, rendering 12 -> 11; SF1 sort-strategy 32 -> 29; match SF0.25 38 -> 39 (Q56), SF1 29 -> 30 (Q93)
 - [ ] **M0146\-0009h — a bulk load leaves PG\'s relpages, not goopg\'s
   packed count** \(filed 2026\-10\-02 by the M0146\-0005 Q52 diagnosis\)\.
   The two TPC\-DS SF0\.25 loads hold the same tuples per page, but PG\'s
