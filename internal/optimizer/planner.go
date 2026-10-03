@@ -16764,6 +16764,13 @@ func planHasOuterRef(node Node) bool {
 	return planHasEscapingOuterRef(node, 1)
 }
 
+// PlanHasOuterRef is planHasOuterRef for the executor: whether node's subtree
+// reads an outer value nothing inside it binds — PG's "this plan has
+// parameters from outside", whose changes make a rescan re-execute it.
+func PlanHasOuterRef(node Node) bool {
+	return planHasOuterRef(node)
+}
+
 // planHasEscapingOuterRef is planHasOuterRef's depth-aware worker.
 // depth is the Level value that would refer to node's own immediate
 // parent scope at the current nesting point (1 at the top call,

@@ -1126,6 +1126,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			ectx.CommandCounterIncrement()
 			ectx.CmdID = ectx.GetCurrentCommandId(true)
 		ectx.CTERowCache = nil
+		ectx.CTEStableCache = nil
 		ectx.DeadlockVictim = false
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).

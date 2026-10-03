@@ -678,6 +678,16 @@ type Context struct {
 	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
 
+	// CTEStableCache is CTERowCache for a CTE whose body reads no outer
+	// value (optimizer.PlanHasOuterRef false). A LATERAL join swaps
+	// CTERowCache per outer tuple, so that a body reading the outer row is
+	// re-materialised; a body that reads none would be recomputed for
+	// nothing. PG clears a CTE's tuplestore on rescan only when its plan
+	// has changed parameters (ExecReScanCteScan, nodeCtescan.c), so an
+	// uncorrelated body is materialised once per statement, wherever it is
+	// scanned. M0146-0049d2.
+	CTEStableCache map[string][]Row
+
 	// CmdID is this context's command id RELATIVE to the enclosing statement's
 	// `estate->es_output_cid`: 0 while the statement's own plan (its CTEs and
 	// its body alike) runs, and one higher per nested VOLATILE routine body.
