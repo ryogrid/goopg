@@ -24450,7 +24450,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Filed M0146\-0049 \(the missing feature\); 0005dp marked `\[\!\]` on it\.
       Design `docs/design/0100\-0149/m0146\-0005dt\-parameterised\-append\-recon\.md`\.
     Movement: none — recon
-- [ ] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [!] **M0146\-0005dq — an NL Semi Join over a CTE inner, with a parameterised join on the semi inner** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q95: PG NL Semi Join\(CTE ws\_wh\) over NL Semi Join\(parameterised Hash Join\(ws\_wh\_1, IOS web\_returns\_pkey\)\); goopg hashes the 1\.75M\-row CTE twice \(187888 vs 141550\)\.
   Kind: impl
   Parent: M0146\-0005
@@ -24458,7 +24458,13 @@ M0146-0001 re-baseline census on the new default arm.
   - 2026\-10\-03 \(M0146\-0005dt\): the "parameterised join on the semi
     inner" half is M0146\-0049\'s through\-a\-join case — check whether the
     CTE\-inner NL Semi Join half is separable before selecting\.
-- [ ] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
+  - **Blocked on M0146\-0049** \(2026\-10\-03\): the CTE\-inner NL Semi Join
+    half is not separable — M0145\-0008ac\'s preserved patch already builds
+    PG\'s nested\-loop\-semi shape for Q95, and the 2026\-09\-25 escalation
+    measured its SF1 timeout: without a parameterised inner through the
+    hash join the semi inner rescans 3M rows per outer row\. Re\-select when
+    M0146\-0049 lands \(and re\-apply 0008ac\'s patch with it\)\.
+- [x] **M0146\-0005dr — an InitPlan\'s and CTE\'s cost is charged to the plan
   that runs it** \(filed 2026\-10\-03 by M0146\-0005di\)\. goopg\'s top nodes
   leave CTE / InitPlan cost out \(Q30 Limit 343 vs PG 2777, Q57, Q58, Q64
   0\.07 vs 13874, Q75 550 vs 64209\); PG adds it in SS\_charge\_for\_initplans
@@ -24469,6 +24475,33 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where goopg attaches CTE bodies / InitPlans to a plan
     node and add their startup / total to that node\'s cost, as
     SS\_charge\_for\_initplans does\.
+  - **LANDED 2026\-10\-03 \(`874fbf863`\)\.** `chargeInitPlans` \(initplancharge\.go\)
+    runs at Plan\(\)\'s tail and records each query level\'s InitPlan cost
+    \(SublinkIsInitPlan sublinks; kept CTE bodies at the root\) on its top
+    printed node; `legacyDisplayCostOf` / `explainCostFields` add it\. Design
+    `docs/design/0100\-0149/m0146\-0005dr\-initplan\-cost\-charge\.md`\.
+    - Q75 Limit 550 → 65220 \(PG 64209\), Q1 2494 → 6940 \(7284\), Q30 477 →
+      3430 \(2777\), Q59 8196 → 50459 \(62385\); Q64 still 82 vs 13874 \(its
+      CTE bodies are priced low themselves\)\.
+    - The Q10 / Q35 OR\-of\-hashed\-SubPlans qual placement named in this
+      entry is NOT covered: it is a qual\-placement question \(an
+      uncorrelated, sublink\-bearing qual held above the search instead of at
+      the customer scan\), not a cost charge\. Nearest family M0146\-0012a
+      \(correlated sublink clauses\); left open here as an unrouted record\.
+    - Gates: units, spotcheck, sweep 96/96, fire set \(23 queries per scale
+      on cost text only, categories unchanged\), TPC\-H arm, ea\-ratchet 10/10\.
+    Movement: none — instrument artefact: the plan\-parity classifier compares shapes, not costs; match and categories unchanged
+- [ ] **M0146\-0005du — goopg rewrites max\(\)/min\(\) into an ordered\-Limit
+  InitPlan without an index; PG keeps the Aggregate** \(filed 2026\-10\-03 by
+  M0146\-0005dr\)\. `SELECT b, \(SELECT max\(p\) FROM e1\) FROM e2` on an
+  unindexed `e1`: goopg plans `Result → InitPlan → Limit → Sort \(21609\) →
+  Seq Scan`, PG an `Aggregate \(3385\)` over the Seq Scan\. PG\'s
+  preprocess\_minmax\_aggregates \(planagg\.c\) adds the min/max path only as a
+  candidate costed against the plain aggregate\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: find goopg\'s S6 min/max rewrite gate and check whether it
+    compares the rewritten path\'s cost with the plain aggregate\'s\.
 - [x] **M0146\-0005dd — an expression key over a kept Subquery Scan
   qualifies its columns** \(filed and landed 2026\-10\-02: Q89 printed
   `\(\(sum\_sales \- avg\_monthly\_sales\)\)` where PG prints
