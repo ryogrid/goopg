@@ -26064,11 +26064,24 @@ M0146-0001 re-baseline census on the new default arm.
       M0145\-0008ag \(owner\-parked multiplier\)\.
     - Design `docs/design/0100\-0149/m0146\-0009i\-cte\-scan\-rows\-verified\.md`\.
   Movement: none — already moved by M0145-0008ac
-- [ ] **M0146\-0009j — `VACUUM \(ANALYZE\)` collects no column statistics** \(filed 2026\-10\-03 by M0146\-0005dk\)\.
+- [x] **M0146\-0009j — `VACUUM \(ANALYZE\)` collects no column statistics** \(filed 2026\-10\-03 by M0146\-0005dk\)\.
   goopg\'s `vacuumOp` runs only the relation\-size pass \(`vacuum\.Analyze` → reltuples / relpages\); PG\'s `vacuum\(\)` calls `analyze\_rel` for every target when VACOPT\_ANALYZE is set\. Measured: after `VACUUM ANALYZE tenk1` on goopg `pg\_stats` holds 0 rows for tenk1, after `ANALYZE tenk1` 16\. Regress `test\_setup\.sql` runs `VACUUM ANALYZE` on every shared table, so every regress plan on goopg is stats\-less; with the 0005dk unique\-ify arm live, regress `join`\'s two `tenk1 a WHERE unique1 IN \(SELECT unique2 …\)` plans flip from PG\'s Hash Semi Join to a HashAggregate\-driven Nested Loop for exactly that reason \(with stats goopg matches PG\)\.
   Kind: impl
   Parent: M0146\-0009
   - First step: in `internal/executor/operators\_vacuum\.go`, when `vs\.Analyze`, run the ANALYZE operator\'s per\-table statistics path \(`operators\_analyze\.go`\) for each target with its column list, as `vacuum\(\)` → `analyze\_rel` does; then re\-run the regress A/B — expect broad plan movement\.
+  - **DONE 2026\-10\-04 \(`ac4ee94d7`\)\.** `analyzeTableStats` \(ANALYZE\'s
+    per\-table step\) is shared by analyzeOp and vacuumOp; VACUUM \(ANALYZE\)
+    runs it on every target its vacuum pass succeeded on and rolls up
+    partitioned parents\.
+    - Regress A/B \(61 pass\-required \+ 16 planner cases\): same 26
+      passing; divergent lines 21221 → 21149 \(join −58, create\_index −13,
+      misc\_functions −4; subselect \+2 and window \+1 between non\-PG
+      shapes\)\.
+    - Test `TestVacuumAnalyzeCollectsColumnStatistics`\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, six
+      vacuum/IOS isolation specs PASS, regress A/B\.
+    - Design `docs/design/0100\-0149/m0146\-0009j\-vacuum\-analyze\-stats\.md`\.
+  Movement: none — no S3 instrument moves (bench plans take stats from ANALYZE); regress divergent lines 21221 -> 21149 over 77 cases
 - [x] **M0146\-0009k — a node above a searched join is sized by the
   pre\-search join estimator** \(filed 2026\-10\-03 by recon M0146\-0005ds\)\.
   `EstimateRows`\' `\*Join` arm returns `estimateJoin\(x\)` \(cardinality\.go\)
