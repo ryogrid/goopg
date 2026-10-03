@@ -5216,10 +5216,26 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
+	// The INTO clause's relpersistence (createas.c create_ctas_internal →
+	// DefineRelation): TEMP makes a session-local relation in the backend's
+	// pg_temp namespace, UNLOGGED an unlogged one — set exactly as
+	// execCreateTable does, before the catalog sync below persists the row.
+	// M0146-0039a.
+	tbl.Unlogged = s.Unlogged
+	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
+	}
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// A temp table lives in pg_temp, never in the search_path's schema.
 	// M0097-0022.
-	if s.Name.Schema == "" {
+	if s.Name.Schema == "" && !s.Temporary {
 		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
 			tbl.Schema = ws
 		}
@@ -5228,10 +5244,9 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
 		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
-		// CTAS never sets tbl.Temp (a pre-existing gap), so gate on the
-		// statement's Temporary flag instead — the 42P16 guard at the top of this
-		// function already rejected a non-temp ON COMMIT. M0134-0072.
-		if s.OnCommit != "" && s.Temporary {
+		// The 42P16 guard at the top of this function already rejected a
+		// non-temp ON COMMIT. M0134-0072.
+		if s.OnCommit != "" && tbl.Temp {
 			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
 		}
 	}

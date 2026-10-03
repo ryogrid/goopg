@@ -24809,7 +24809,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: reproduce on a throwaway cluster \(port 5534\-free range\):
     create a temp table, stop/start, list pg\_class for pg\_temp\_\* and
     retry the CREATE; then find the temp\-namespace cleanup path\.
-  - [ ] **M0146\-0039a — WRONG RESULTS: `CREATE TEMP TABLE … AS` creates a
+  - [x] **M0146\-0039a — WRONG RESULTS: `CREATE TEMP TABLE … AS` creates a
     PERMANENT relation** \(filed 2026\-10\-03 by the M0146\-0044 probe;
     REPRODUCED on a private throwaway cluster, S2 escalation: wrong results
     \+ a durable catalog row\)\. `CREATE TEMP TABLE tt AS SELECT 1 x` gives
@@ -24825,6 +24825,28 @@ M0146-0001 re-baseline census on the new default arm.
     > banner\-2a task it inherits item 2a\'s rank; owner: confirm its place\.
     > Resume point: the CTAS executor path must carry the TEMP persistence
     > \(and pg\_temp namespace\) the CREATE TABLE path already sets\.
+    - **LANDED 2026\-10\-03\.** `execCreateTableAs` stamps the INTO
+      clause\'s persistence as `execCreateTable` does \(PG
+      create\_ctas\_internal → DefineRelation\): `Temp` \+ `TempOwner` \+ the
+      session\'s pg\_temp namespace, and `Unlogged`, before the catalog
+      sync; a temp CTAS no longer takes the search\_path schema\. Design
+      `docs/design/0100\-0149/m0146\-0039a\-ctas\-temp\-persistence\.md`\.
+      - Live probe matches PG for TEMP / pg\_temp\. / UNLOGGED / ON COMMIT
+        DROP CTAS; the temp table is gone after stop/start and re\-CREATE
+        works; `TestCTASHonoursTempAndUnlogged`; regress temp,
+        select\_into, create\_table, create\_table\_like, matview,
+        create\_view byte\-identical; sweep 96/96, TPC\-H arm PASS\.
+  - [ ] **M0146\-0039b — `SELECT … INTO TEMP|TEMPORARY|UNLOGGED t` is a
+    syntax error** \(filed 2026\-10\-03 by the M0146\-0039a probe; not
+    S2: a rejection, not wrong results\)\. PG\'s `OptTempTableName`
+    accepts `INTO [TEMP|TEMPORARY|LOCAL TEMP|GLOBAL TEMP|UNLOGGED] [TABLE]
+    name`; goopg parses only `INTO name`\. `SELECT 1 z INTO TEMP st` and
+    `… INTO TEMP TABLE st` both fail `syntax error at or near`\.
+    Kind: bug
+    Parent: M0146\-0039
+    - First step: extend the SELECT INTO clause in the parser to carry
+      persistence onto the CTAS statement; the executor side already
+      honours it \(M0146\-0039a\)\.
   - **Reproduced 2026\-09\-30** \(`analysis/m0146/m0146\-0039/repro.sh`\):
     after stop/start, pg\_class shows `ca` in namespace 2200 with
     relpersistence `p`, `SELECT \* FROM ca` returns the old row, and
