@@ -1399,7 +1399,9 @@ var pullupVolatileBuiltins = map[string]bool{
 }
 
 // exprListHasVolatileBuiltin reports whether any expression in es calls
-// a volatile builtin or a volatile registered routine — the planner-side
+// a volatile builtin (pullupVolatileBuiltins, or any name PG 18.3's
+// pg_proc.dat marks provolatile 'v' — catalog.BuiltinProcIsVolatile,
+// M0146-0007h) or a volatile registered routine — the planner-side
 // half of `contain_volatile_functions` for the pull-up gate. Registry
 // volatility uses the same fields subPlanExprVolatile reads
 // (Volatile == "v", or "" which PG treats as VOLATILE); a catalog
@@ -1413,7 +1415,7 @@ func exprListHasVolatileBuiltin(es []Expr, cat catalog.Catalog) bool {
 				return
 			}
 			name := strings.ToLower(f.Name)
-			if pullupVolatileBuiltins[name] {
+			if pullupVolatileBuiltins[name] || catalog.BuiltinProcIsVolatile(name) {
 				volatile = true
 				return
 			}

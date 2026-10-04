@@ -14892,6 +14892,42 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
 		"pg_statistics_obj_is_visible":
 		return NewBoolDatum(true), nil
+	case "pg_relation_is_publishable":
+		// pg_relation_is_publishable(regclass) → bool (pg_publication.c):
+		// is_publishable_class — an ordinary or partitioned table that is
+		// permanent and not a system relation (relid >= FirstNormalObjectId);
+		// NULL when the relation does not exist. psql's \d query calls it with
+		// a constant OID, which makes the conjunct a pseudoconstant that is
+		// evaluated even when the pg_class conjunct beside it matches no row
+		// (M0146-0007h).
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, err
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		var oid uint64
+		if arg.Kind == KindInt {
+			oid = uint64(arg.Int)
+		} else if v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32); perr == nil {
+			oid = v
+		} else if schema, rel, nameOK := splitRegQualifiedName(arg.StringValue()); nameOK {
+			if t, found := im.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); found && t != nil {
+				oid = uint64(t.OID)
+			}
+		}
+		tbl, found := im.LookupTableByOID(uint32(oid), catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+		if !found || tbl == nil {
+			return NullDatum, nil
+		}
+		kind := relkindByteForTable(tbl)
+		return NewBoolDatum((kind == 'r' || kind == 'p') && tbl.ForeignServerName == "" &&
+			!tbl.Temp && !tbl.Unlogged && tbl.OID >= 16384), nil
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":

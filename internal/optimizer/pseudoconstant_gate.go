@@ -33,7 +33,8 @@ import (
 // outer join must stay where it is.
 //
 // Admission is a fail-closed whitelist (isPseudoconstantConjunct): at least one
-// uncorrelated sublink, and otherwise only constants and pure operators.
+// uncorrelated sublink or non-volatile function call, and otherwise only
+// constants and pure operators.
 // References to an enclosing query level are excluded as well. PG treats them
 // as Params and re-evaluates the gate on rescan, and goopg's Result evaluates
 // its one-time filter at Open, so excluding them is the conservative choice
@@ -93,13 +94,21 @@ func liftPseudoconstantConjuncts(n Node, cat catalog.Catalog, gates *[]Expr) Nod
 
 // isPseudoconstantConjunct reports whether c is PG's pseudoconstant
 // (is_pseudo_constant_clause: no Vars of the current level, no volatile
-// functions) in the shape this pass admits: it contains at least one sublink,
-// every sublink is uncorrelated (sublinkIsUncorrelated, binder-aware), and
+// functions) in the shape this pass admits: it contains at least one sublink
+// or function call, every sublink is uncorrelated (sublinkIsUncorrelated,
+// binder-aware), no function is volatile (exprListHasVolatileBuiltin), and
 // every other node is a constant or a pure operator from a known set. Any
 // other node kind (a column, an outer-level reference, CTID, a whole-row
 // reference, an unrecognised expression) makes it not pseudoconstant.
+//
+// A conjunct of constants and operators alone is left alone: PG's
+// eval_const_expressions folds it, and a constant FALSE/NULL WHERE makes the
+// relation dummy (a childless `Result  One-Time Filter: false`), which this
+// pass does not model. M0146-0007h admitted the function-call arm: `now() =
+// now()` (the 0007f pull-up's substituted join clause), `CURRENT_USER = …`
+// and the like gate the scope as PG's do.
 func isPseudoconstantConjunct(c Expr, cat catalog.Catalog) bool {
-	sublinks := 0
+	sublinks, funcs := 0, 0
 	ok := true
 	// scopeIgnore visits every same-scope slot, a sublink's operand included,
 	// and does not descend into the sublink bodies, whose correlation is
@@ -122,14 +131,19 @@ func isPseudoconstantConjunct(c Expr, cat catalog.Catalog) bool {
 			if x.Plan == nil || !sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam) {
 				ok = false
 			}
+		case *FuncCall:
+			if x.Star {
+				ok = false
+			}
+			funcs++
 		case *BinaryOp, *UnaryOp, *BooleanConst, *IntegerConst, *NumericConst,
-			*StringConst, *NullConst, *CastExpr, *IsNullExpr, *IsBoolExpr:
+			*StringConst, *NullConst, *TypedStringLit, *IntervalLit, *CastExpr, *IsNullExpr, *IsBoolExpr:
 		default:
 			ok = false
 		}
 		return ok
 	}})
-	if !walked || !ok || sublinks == 0 {
+	if !walked || !ok || sublinks+funcs == 0 {
 		return false
 	}
 	return !exprListHasVolatileBuiltin([]Expr{c}, cat)
