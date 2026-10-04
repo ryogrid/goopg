@@ -26444,7 +26444,7 @@ M0146-0001 re-baseline census on the new default arm.
       plans unchanged \(99/99\) and total runtime \-10\.1%\. The fire set is
       out of scope \(executor only\)\.
   Movement: none — executor memory bound; plans unchanged \(sweep PLAN\-SHAPE 99/99 same\)
-- [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
+- [x] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
   (recon; M0145-0010's residual). Re-measure the `lateral` decline
   family on the new default arm (2 fires today — Q30/Q68, posthoc
   fallback intact). Escalates to an impl task (rel-level
@@ -26452,6 +26452,19 @@ M0146-0001 re-baseline census on the new default arm.
   admitted shape needs the machinery; otherwise record and close.
   Kind: recon
   Parent: M0145-0010
+  - **DONE 2026\-10\-05 — closed by measurement\.** Evidence
+    `analysis/m0146/m0146\-0011/census\.md`; design doc
+    `m0145\-0010\-parameterized\-path\-legality\.md` §\"Post\-cutover
+    re\-census\"\.
+    - No default\-arm SF0\.25 sweep since the cutover has recorded a
+      `lateral` seam decline\. The flow\-convergence channel reads
+      `leaf\-count=2` only; the last `lateral=1` readings are legacy `\-knob`
+      runs\.
+    - Q30 and Q68 enter the search at both scales\. Their first divergences
+      are a `customer\_pkey` probe choice \(B8, M0145\-0008ag\) or a
+      join\-method election, not a decline\.
+    - The population shrank to zero, so no impl task is filed\.
+  Movement: none — recon \(lateral decline family 2 → 0 on the default arm\)
 - [ ] **M0146-0012 — correlated restrictions as base-rel index quals**
   (impl; M0145-0027's ledger residual). PG treats an outer reference as
   a `PARAM_EXEC` and `match_clause_to_indexcol` accepts it as a
