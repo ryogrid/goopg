@@ -46,8 +46,10 @@ import (
 )
 
 // nlInnerWorkMemEnabled gates the work_mem bound on the nested loop's inner
-// Materialize. See openNestedLoop for why the default is off.
-var nlInnerWorkMemEnabled = os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") == "1"
+// Materialize: PG's tuplestore spills past work_mem, and so does this cache
+// by default since M0146-0010c. GOOPG_NL_MATERIALIZE_WORK_MEM=0 restores the
+// old unbounded cache for an A/B. See openNestedLoop for the history.
+var nlInnerWorkMemEnabled = os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") != "0"
 
 // nlBareReexec selects the STRICT bare-inner semantics (M0146-0010): when the
 // plan elects no `*optimizer.Materialize` over a nested-loop inner, the rescan
@@ -163,19 +165,17 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 			return fmt.Errorf("nested loop: plan elected Materialize over the inner but no materializeOp was built")
 		}
 		if !nlInnerWorkMemEnabled {
-			// The inner cache runs UNBOUNDED by default, which is exactly
-			// what the pre-P4.3 `drainRowsCtx` did. The bound is not declined
-			// out of caution: measured on TPC-DS SF0.5 Q54, whose plan is a
-			// nested loop over a 1.44M-row `store_sales` seq scan (~1.6 GB as
-			// `[]Datum`), the work_mem-bounded cache spills and then every
-			// outer tuple replays the whole file with full datum decoding —
-			// 144 s → >400 s, the sweep's only regression. PG never meets
-			// that wall because `cost_rescan` prices exactly this case and
-			// the planner picks another path — which is now true here too
-			// (costMaterial + materialRescanCost, optimizer/materialize.go);
-			// re-timing the default is slice 4 of the same task.
-			// `GOOPG_NL_MATERIALIZE_WORK_MEM=1` turns the bound on for the
-			// A/B, exactly as P4.2's gate does for the hash outer fill.
+			// The bound was off by default until M0146-0010c. Measured on
+			// TPC-DS SF0.5 Q54, whose plan then nest-looped over a 1.44M-row
+			// `store_sales` seq scan (~1.6 GB as `[]Datum`), the spilled cache
+			// replayed the whole file per outer tuple — 144 s → >400 s. PG
+			// never meets that wall because `cost_rescan` prices the case and
+			// the planner picks another path, and goopg's planner now does too
+			// (costMaterial + materialRescanCost, optimizer/materialize.go):
+			// Q54's plan no longer materializes store_sales, and the SF0.25
+			// sweep is unchanged with the bound on (M0146-0010b, design doc
+			// m0146-0010-materialize-node.md §7).
+			// `GOOPG_NL_MATERIALIZE_WORK_MEM=0` turns it off for an A/B.
 			mat.setUnbounded()
 		}
 		inner = rs

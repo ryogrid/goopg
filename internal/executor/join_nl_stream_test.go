@@ -21,6 +21,7 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -176,10 +177,10 @@ func TestMaterializePartialFirstPassResumesChild(t *testing.T) {
 }
 
 // withNLInnerWorkMem turns the nested loop's inner-cache work_mem bound ON for
-// the duration of a test. The bound ships OFF (see openNestedLoop: TPC-DS Q54
-// showed a spilled inner cache is unaffordable until `cost_rescan` prices the
-// replay), so the tests that assert the spill path is an identity have to ask
-// for it explicitly — otherwise they would silently assert nothing.
+// the duration of a test. The bound is the default since M0146-0010c, but an
+// A/B run with GOOPG_NL_MATERIALIZE_WORK_MEM=0 turns it off for the process,
+// and the tests that assert the spill path is an identity must not then
+// silently assert nothing.
 func withNLInnerWorkMem(t *testing.T) {
 	t.Helper()
 	prev := nlInnerWorkMemEnabled
@@ -411,4 +412,32 @@ func TestNestedLoopMaterializedPlanWithoutCacheIsRefused(t *testing.T) {
 	if err := o.Open(&Context{}); err == nil {
 		t.Fatal("open succeeded over a Materialize plan node with no materializeOp")
 	}
+}
+
+// TestNestedLoopInnerCacheSpillsByDefault pins M0146-0010c: PG's Materialize
+// tuplestore spills past work_mem, and so does the nested loop's inner cache
+// by default — no opt-in. Until 0010c the cache ran unbounded unless
+// GOOPG_NL_MATERIALIZE_WORK_MEM=1. The spilled join must equal the in-memory
+// one.
+func TestNestedLoopInnerCacheSpillsByDefault(t *testing.T) {
+	if os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") == "0" {
+		t.Skip("the bound is turned off for this process (A/B run)")
+	}
+	const outerN, innerN, lw, rw = 20, 80, 2, 2
+	run := func(workMem int64) ([]string, *materializeOp) {
+		left := &rowsOp{rows: seqRows(outerN, "l"), schema: batchSchema("l", lw)}
+		mat := newMaterializeOp(&rowsOp{rows: seqRows(innerN, "r"), schema: batchSchema("r", rw)})
+		o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, lw), left, mat)
+		if err := o.Open(&Context{WorkMem: workMem}); err != nil {
+			t.Fatalf("open join: %v", err)
+		}
+		got := readAll(t, o)
+		return got, mat
+	}
+	want, _ := run(0)
+	got, mat := run(512)
+	if mat.buf.w == nil && mat.buf.path == "" {
+		t.Fatalf("work_mem=512 bytes over %d inner rows did not spill: the inner cache is unbounded by default", innerN)
+	}
+	assertSameMultiset(t, "default-bounded inner cache", got, want)
 }
