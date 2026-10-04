@@ -25571,7 +25571,7 @@ M0146-0001 re-baseline census on the new default arm.
     \#18170 case now dropping `id IS NOT NULL` as PG\'s expected output does\)\.
   - Evidence `analysis/m0146/m0146\-0038/`\.
   Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 match 25 -> 26, qual-placement 14 -> 13; SF1 match 21 -> 22, qual-placement 11 -> 10 (Q51 now matches PG at both scales)
-- [ ] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
+- [x] **M0146-0006 — Incremental Sort election** (impl; M0141-S7's
   resume, sequenced after M0146-0005 per the owner hold). The two filed
   resume points: S2b-9 (offer an Incremental Sort over the seed itself —
   Q4's `keys=1 ncommon=1` witness) and S2b-8 (the SORTED grouping arm —
@@ -25580,6 +25580,22 @@ M0146-0001 re-baseline census on the new default arm.
   wires the candidate production the flag needs.
   Kind: impl
   Parent: M0141-S7
+  - **DONE 2026\-10\-04 \(`01739f8d1`\)\.** S2b\-9 had already landed with
+    M0146\-0005bp \(the seed\'s Incremental Sort\); Q4\'s residue is a
+    join\-order cost tie, not a missing candidate\. S2b\-8 landed:
+    `make\_ordered\_path` in the sorted grouping arm \(cheapest input and
+    partially presorted runner\-ups\)\. The third ORDER BY arm is on by
+    default \(`GOOPG\_INCREMENTAL\_SORT=off` escape hatch, honours
+    `enable\_incremental\_sort`\) and now rebuilds each candidate through
+    `searchedCandidateInput` \(it wrapped the raw searched path — a
+    wrong\-columns hazard once on\)\.
+    - Fire set flat \(Q83 cost only\); the SORT witnesses diverge upstream\.
+    - Regress aggregates 517 → 527: one case now PG\'s Incremental Sort,
+      `agg\_sort\_order` moved away on a range\-estimate defect \(M0146\-0009r\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B\.
+    - Design `docs/design/0100\-0149/m0146\-0006\-incremental\-sort\-election\.md`\.
+  Movement: none — fire set flat; regress aggregates moved both ways
 - [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
   (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
   non-recursive CTE is inlined into the jointree so its quals and
@@ -27709,3 +27725,16 @@ M0146-0001 re-baseline census on the new default arm.
     CTE body \(`cte_stats_synthesis\.go` / the CTE leaf sizing\) and what it
     reads for a Final\-mode aggregate \(the /10 is the multi\-column
     `estimate\_num\_groups` clamp, or a partial count\)\.
+- [ ] **M0146\-0009r — a range restriction is estimated differently on two
+  paths of one relation** \(filed 2026\-10\-04 by M0146\-0006\)\. Regress
+  `aggregates`\' `agg\_sort\_order` \(100 rows, `c1` pkey, `c2` unique\):
+  `WHERE c2 < 100` reads rows=33 on the `c2\_idx` path under default
+  settings and rows=99 on the same path with `enable\_seqscan = off`
+  \(and on the `pkey` path\); PG says 99 throughout\. The low count feeds
+  `cost\_incremental\_sort` 33 presorted groups and elects an Incremental
+  Sort PG does not\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find which estimator gives 33 \(DEFAULT\_INEQ\_SEL\-like
+    1/3\) — the base rel\'s restriction selectivity vs the index path\'s —
+    and why the histogram of a 100\-row ANALYZEd unique column is not used\.
