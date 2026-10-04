@@ -27478,7 +27478,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: in the search\'s restriction qual cost, add `cost\_subplan`\'s
     per\-call cost of each correlated sublink \(EXISTS: startup \+ first\-row
     run cost\) per input row; with M0146\-0005dx1\.
-- [ ] **M0146\-0005dy — a multi\-relation semi\-join inner is not
+- [x] **M0146\-0005dy — a multi\-relation semi\-join inner is not
   unique\-ified** \(filed 2026\-10\-04 by M0146\-0005 slice 115; the
   M0146\-0005dk residual ledgered 2026\-10\-03\)\. TPC\-DS Q69 \(and below the
   first divergence in Q10/Q35\): PG unique\-ifies `store\_sales ⋈ date\_dim`
@@ -27490,6 +27490,25 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146\-0005
   - First step: find the 0005dk unique\-ify arm\'s single\-relation guard and
     extend it to a joinrel equal to the semi join\'s RHS\.
+  - **DONE 2026\-10\-04 \(`a3eb07731`\)\.** `createPulledJoinUniquePath`
+    unique\-ifies a joinrel equal to the semi join\'s RHS: each problem\-space
+    key resolves to its member base rel \(`RelOptInfo\.memberRels`\), and
+    numGroups is the product of the members\' `estimate\_num\_groups`\.
+    - **Wrong results on HEAD, fixed here:** the merge arms and the partial
+      nested loop read the raw side of a unique\-ified pair \(3625 rows vs
+      PG 725 with `enable\_hashjoin = off`\)\. They now follow joinpath\.c
+      through `mergeUnique` \(:1406\-1445, :1636, :1881, :2001\-2050, :2134,
+      :2165\-2178\)\.
+    - Fire set: matches flat \(41 / 32\); SF0\.25 CATEGORIES\-EXCL\-MATCH
+      aggregation\-strategy 15 → 13, parallelism 31 → 29, join\-method
+      27 → 26, sort\-strategy 27 → 26, scan\-type 28 → 29\. Q69 is down
+      to join\-order \(43430 vs PG 43133\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B \(join moved toward PG; subselect only
+      parallel NOTICE order\)\.
+    - Test `TestUniqueifiedSemiJoinrelRows` \(fails on HEAD\)\.
+    - Design `docs/design/0100\-0149/m0146\-0005dy\-unique\-ified\-joinrel\-semi\-rhs\.md`\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 15→13, parallelism 31→29, join\-method 27→26, sort\-strategy 27→26, scan\-type 28→29
 - [ ] **M0146\-0005dz — a redundant outer\-join clause stays a merge key**
   \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q78 at SF1: the top
   Merge Left Joins keep `ss\_sold\_year = \*\_sold\_year` as a merge key\.
