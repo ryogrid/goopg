@@ -27427,7 +27427,7 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress 14 planner cases identical to HEAD\.
     - Design `docs/design/0100\-0149/m0146\-0005dw\-derived\-leaf\-initplan\-charge\.md`\.
   Movement: none — fire set flat at both scales; Q44 merge cost 48000 -> 81875 (PG 80931)
-- [ ] **M0146\-0005dx — an uncorrelated restriction holding a sublink stays
+- [x] **M0146\-0005dx — an uncorrelated restriction holding a sublink stays
   above the join search** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q10 and Q35: the OR of two hashed SubPlans on `c` is a
   baserestrictinfo of `c` in PG \(`distribute\_qual\_to\_rels`, initsplan\.c\),
@@ -27440,6 +27440,44 @@ M0146-0001 re-baseline census on the new default arm.
     sublink conjunct that references one base rel out of its restrictions;
     compare M0146\-0012a \(the correlated\-sublink join\-clause case\)\.
   - Q10/Q35/Q69 also need M0146\-0005dy to match\.
+  - **DONE 2026\-10\-04 \(recon\)\.** The sublinks are CORRELATED to `c`
+    \(the title\'s "uncorrelated" was wrong\): `conjunctLocalEligibility`
+    declines a correlated sublink at a leaf \(its plan would need
+    `remapOuterRefsInSubplan`\), so the OR stays above the search\. PG makes
+    it a baserestrictinfo of `c` and prices it per row by the PLAIN
+    correlated SubPlan \(`cost\_qual\_eval` AlternativeSubPlan → first
+    alternative, costsize\.c:5027\), which is why PG probes `c` late\.
+    - Neither half alone is PG\-faithful \(admitting without pricing keeps
+      `c` early; pricing has nothing to price\); M0146\-0015a measured a
+      Q35 timeout from an earlier sinking attempt\. Split into
+      M0146\-0005dx1 and dx2, to land together\.
+    - Design `docs/design/0100\-0149/m0146\-0005dx\-sublink\-restriction\-recon\.md`\.
+  Movement: none — recon and split, no code change
+- [ ] **M0146\-0005dx1 — a correlated sublink conjunct of one rel becomes
+  that rel\'s restriction** \(filed 2026\-10\-04 by recon M0146\-0005dx\)\.
+  `distribute\_qual\_to\_rels` \(initsplan\.c\) places a clause whose SubPlan
+  args read only `c` as a baserestrictinfo of `c`; goopg\'s
+  `conjunctLocalEligibility` keeps any correlated sublink in the residual
+  above the search\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: admit a correlated sublink conjunct whose correlation reads
+    one base rel of a multi\-relation scope; rebase its plan with
+    `remapOuterRefsInSubplan` into the leaf\'s coordinates; extend
+    `rewriteExistsToAny` to IndexScan / IndexOnlyScan / BitmapHeapScan
+    `Cond`s so a probe\-carried qual still becomes a hashed ANY\.
+  - Lands together with M0146\-0005dx2 \(alone it keeps `c` early\);
+    measure Q10/Q35 for timeouts \(M0146\-0015a\)\.
+- [ ] **M0146\-0005dx2 — a restriction holding a correlated sublink is
+  priced per row by the plain SubPlan** \(filed 2026\-10\-04 by recon
+  M0146\-0005dx\)\. `cost\_qual\_eval\_walker` prices an AlternativeSubPlan by
+  its first alternative, the plain correlated SubPlan \(costsize\.c:5027\),
+  per evaluated row — about 21123 per `customer` row in Q10\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: in the search\'s restriction qual cost, add `cost\_subplan`\'s
+    per\-call cost of each correlated sublink \(EXISTS: startup \+ first\-row
+    run cost\) per input row; with M0146\-0005dx1\.
 - [ ] **M0146\-0005dy — a multi\-relation semi\-join inner is not
   unique\-ified** \(filed 2026\-10\-04 by M0146\-0005 slice 115; the
   M0146\-0005dk residual ledgered 2026\-10\-03\)\. TPC\-DS Q69 \(and below the
