@@ -1948,36 +1948,28 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// See pushOuterQualsIntoLaterals in pushdown.go.
 		node = pushOuterQualsIntoLaterals(node)
 
-		// M0145-0008: restore the one-relation index producer on the
-		// routes that SKIP the rule-based bypass above.
+		// M0145-0008: the one-relation rule-based index producer, on a scope
+		// the search left as a bare seq-scan tree.
 		//
-		// The legacy rule-based bypass (deleted with the legacy
-		// pipeline, M0145-0008) was the ONLY producer of an index path
-		// driven by a correlated (outer-reference) restriction. Every
-		// single-relation scope now plans through this generic arm —
-		// PG-faithfully, since `make_one_rel` runs
-		// `set_base_rel_pathlists` unconditionally — but the search's
-		// base-rel pathlist has no such producer, so the scope comes
-		// out as a bare `Filter{SeqScan}`.
+		// It was restored at the cutover because the search's base-rel
+		// pathlist then had no producer for a correlated (outer-reference)
+		// key, so TPC-H Q17's correlated body came out `Filter{SeqScan}`,
+		// read as not probe-cheap (`innerPlanIsIndexProbeCheap`) and was
+		// decorrelated into a whole-table GROUP BY (1021 ms -> 11155 ms).
+		// M0146-0015a gave the search that producer, and on TPC-H and
+		// TPC-DS SF0.25 this rule no longer fires on a correlated scope.
+		// It still covers one: an outer key whose type differs from the
+		// index column only because goopg types an integer literal int8
+		// where PG types it int4 (M0146-0062) — `restrictionKeyUsable`
+		// refuses that uncast probe, the rule builds it. Retire the
+		// correlated half once M0146-0062 lands; the uncorrelated half
+		// can override a costed Seq Scan PG keeps (M0146-0060).
 		//
-		// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
-		// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
-		// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
-		// on both of those routes and `Aggregate(BitmapHeapScan(
-		// BitmapIndexScan))` on the bypass. That is not a cosmetic
-		// difference — `canUnnestSubquery`'s S6/D6.2 guard
-		// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
-		// decide whether decorrelating it is a loss, so a body that
-		// never got its probe reads as "not cheap" and is decorrelated
-		// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
-		// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
-		// on the DEFAULT arm — the defect is route-borne, not
-		// arm-borne).
-		//
-		// The rule is strictly NARROWER than the bypass it restores:
-		// it fires only when the search elected NO index path at all,
-		// so it can never displace a costed index choice — it only
-		// fills the hole where this route produces none.
+		// Its multi-conjunct twin `flattenStrandedSeqScanFilters`
+		// (M0145-0027) is deleted (M0146-0012 slice 2): the search
+		// builds Q20's probe itself, and the flatten only replaced a
+		// searched leaf with an unsearched one priced far under PG
+		// (TPC-DS Q41's correlated item scan 180 vs PG's 4029).
 		// M0146-0028b: not for a pulled-up derived table — the index
 		// producer rebuilds the scan from the statement's own WHERE alone
 		// and would drop the pulled body's quals.
@@ -1988,27 +1980,6 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				return nil, err
 			} else if ok {
 				node = idxNode
-			} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
-				// M0145-0027: the producer above only reads a WHERE that
-				// is ONE equality (Q17's body). A multi-conjunct WHERE
-				// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
-				// ps_suppkey AND l_shipdate …`) is declined there on
-				// every route; the bypass arm gets its correlated probe
-				// from the SECOND producer instead —
-				// `rewriteScanInputsWithSingleTablePredicates` below,
-				// which absorbs the equality out of `Filter{SeqScan}`.
-				// On this route that producer is shut out: the search
-				// took the constant quals into a SEARCHED leaf
-				// `Filter{SeqScan}` (a searched subtree keeps its own
-				// leaves, P5.9-b) and left the correlated conjuncts —
-				// which `conjunctIsLocalEligible` refuses as leaf quals —
-				// in a residual Filter above it. Flattening the two into
-				// the one unsearched `Filter{SeqScan}` the bypass would
-				// have built hands the tree to that producer unchanged.
-				// Same contract as the rule above: it fires only on a
-				// bare seq-scan tree (the search elected no index) and
-				// only when a correlated conjunct is stranded above it.
-				node = flat
 			}
 		}
 	} else {
@@ -11949,95 +11920,6 @@ func planIsBareSeqScanTree(n Node) bool {
 	return false
 }
 
-// flattenStrandedSeqScanFilters merges a chain of `*Filter` wrappers over a
-// single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
-// conjunct in the chain is one the search refuses as a leaf qual
-// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink) or carries a
-// correlated `OuterColumnRef` inside a searched leaf Filter (a one-relation
-// leaf qual since M0146-0015a, but still one the bypass turns into its index
-// probe).
-//
-// It exists for the one-relation route that skips the rule-based bypass
-// (M0145-0027, M0145-0008): there the search attaches the scope's plain quals
-// to a SEARCHED leaf Filter and holds the ineligible ones in a residual Filter
-// above it. PG has no such split — every one of these is a restriction clause
-// of the one base rel, evaluated in the scan's single qual list
-// (`./postgres/src/backend/optimizer/plan/createplan.c:5420`
-// `order_qual_clauses`). The split is not only cosmetic:
-//
-//   - a correlated equality above a searched leaf is invisible to
-//     `rewriteScanInputsWithSingleTablePredicates`, the producer that turns it
-//     into an index probe on the bypass arm (TPC-H Q20, M0145-0027);
-//   - a sublink conjunct above a searched leaf is charged per input row of
-//     the leaf instead of after the cheap quals, and EXPLAIN renders only
-//     one of the two Filters (TPC-DS Q41, the SF0.25 parity floor).
-//
-// Order: the merged list is sorted by source position — the WHERE's written
-// order, which is exactly the list the bypass arm builds. PG orders by
-// per-tuple cost (`order_qual_clauses`); goopg has no per-clause cost
-// evaluator, so the bypass order is the faithful baseline here (ledgered).
-// Conjuncts without a source position (derived clauses) keep their relative
-// order after the positioned ones.
-//
-// Coordinates: every Filter in the chain sits directly on the same SeqScan
-// with no Project between, so all their predicates already address the
-// SeqScan's own output — merging needs no rebase. Any other node in the chain
-// (a Project, a narrowed boundary, a second relation) declines, fail-closed,
-// as does a chain with no ineligible conjunct: then the search's own
-// election stands and nothing is overridden.
-func flattenStrandedSeqScanFilters(n Node) (Node, bool) {
-	top, ok := n.(*Filter)
-	if !ok {
-		return nil, false
-	}
-	var conjs []Expr
-	cur := Node(top)
-	for {
-		f, isF := cur.(*Filter)
-		if !isF {
-			break
-		}
-		conjs = append(conjs, splitAnd(f.Predicate)...)
-		cur = f.Child
-	}
-	ss, ok := cur.(*SeqScan)
-	if !ok {
-		return nil, false
-	}
-	if _, single := top.Child.(*SeqScan); single && !top.LeafLocal && !isSearchedTree(top) {
-		// Already the bypass shape; nothing is stranded.
-		return nil, false
-	}
-	// M0146-0015a: in a one-relation scope a correlated conjunct is an
-	// ordinary leaf qual now (partitionConjunctsForJoinPlanning admits
-	// OuterColumnRef there, as PG makes it a base restriction), so it arrives
-	// INSIDE the searched leaf Filter rather than stranded above it — and a lone searched Filter{SeqScan} is not the
-	// bypass shape either: rewriteScanInputsWithSingleTablePredicates leaves a
-	// searched leaf alone (P5.9-b). When the search elected no index for such
-	// a body (the caller checked planIsBareSeqScanTree), hand it to the
-	// bypass exactly as before, so a correlated body keeps the probe the
-	// bypass builds (TPC-H Q17/Q20) and canUnnestSubquery's shape guard keeps
-	// reading it as probe-cheap.
-	stranded := false
-	for _, c := range conjs {
-		if !conjunctIsLocalEligible(c) || exprHasOuterRef(c) {
-			stranded = true
-			break
-		}
-	}
-	if !stranded {
-		return nil, false
-	}
-	sort.SliceStable(conjs, func(i, j int) bool {
-		pi, pj := conjs[i].Pos(), conjs[j].Pos()
-		if pi <= 0 || pj <= 0 {
-			return pi > 0 && pj <= 0
-		}
-		return pi < pj
-	})
-	return &Filter{pos: top.Pos(), Child: ss, Predicate: joinPlannerAnd(conjs)}, true
-}
-
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
 // planIndexScanFromWhereShape so that EVERY shape the inner function can hand
 // back passes the session's scan toggles (review/260831-2 X-8). Filtering the
@@ -19102,3 +18984,4 @@ func modResultType(args []Expr) catalog.Type {
 	}
 	return catalog.Type{Name: "numeric"}
 }
+

@@ -117,41 +117,9 @@ func TestPlanIsBareSeqScanTreeIsFailClosed(t *testing.T) {
 	}
 }
 
-// TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe is the Q20 pin
-// (M0145-0027), in miniature: the correlated scalar body's WHERE is the
-// correlation AND a constant restriction. `planIndexScanFromWhere` declines a
-// multi-conjunct WHERE on every route; the bypass gets its probe from
-// `rewriteScanInputsWithSingleTablePredicates`, which the jointree/one-rel
-// routes could not reach because the search split the constant qual into a
-// searched leaf Filter and stranded the correlation above it.
-func TestOneRelIndexProducerKeepsMultiConjunctCorrelatedProbe(t *testing.T) {
-	cat := oneRelIndexCatalog(t)
-	const sql = `select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k and v > 3)`
-
-	// One route since the M0145-0008 legacy deletion: the rule-based bypass
-	// and the GOOPG_ONEREL_SEARCH arm both retired into the jointree
-	// pipeline's searched one-relation scope.
-	for _, tc := range []struct {
-		name string
-	}{
-		{"jointree-route"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-
-			node, err := Plan(parseOne(t, sql), cat)
-			if err != nil {
-				t.Fatalf("Plan: %v", err)
-			}
-			found := false
-			walkPlanExprs(node, func(e Expr) {
-				if _, ok := e.(*SubqueryExpr); ok {
-					found = true
-				}
-			})
-			if !found {
-				t.Fatalf("correlated scalar was decorrelated on route %s — the multi-conjunct body never reached its index probe; tree: %s",
-					tc.name, describePlanTree(node))
-			}
-		})
-	}
-}
+// The Q20 pin that lived here (correlation AND a constant) measured
+// flattenStrandedSeqScanFilters, deleted by M0146-0012 slice 2. This
+// storage-less InMemory catalog prices the body's Seq Scan below the probe;
+// through the real catalog the search builds PG's probe itself
+// (internal/executor/correlated_scalar_body_restrict_test.go,
+// TestCorrelatedOneRelBodyProbesThroughSearch).

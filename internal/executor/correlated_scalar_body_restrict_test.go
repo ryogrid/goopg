@@ -74,3 +74,37 @@ func TestCorrelatedScalarBodyRestrictsBaseRel(t *testing.T) {
 		t.Errorf("rows %q, want PG's %q\nplan:\n%s", got, want, joined)
 	}
 }
+
+// TestCorrelatedOneRelBodyProbesThroughSearch pins PG 18.3's plans for TPC-H
+// Q17 (the correlation alone) and Q20 (correlation plus a constant) in
+// miniature, on never-analyzed tables, through the real catalog. The search
+// builds both probes itself (M0146-0015a), which is what let M0146-0012 slice
+// 2 delete flattenStrandedSeqScanFilters. A lost probe would also lose the
+// SubPlan: the unnest pass decorrelates a body that is not probe-cheap.
+func TestCorrelatedOneRelBodyProbesThroughSearch(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE ori_outer (k int4, q int4)",
+		"CREATE TABLE ori_inner (k int4, v int4)",
+		"CREATE UNIQUE INDEX ori_inner_k ON ori_inner(k)",
+	} {
+		runSQL(t, ctx, q)
+	}
+	for _, c := range []struct {
+		q    string
+		want []string
+	}{
+		{`select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k)`,
+			[]string{"Filter: ((q)::numeric < (SubPlan 1))", "Index Scan using ori_inner_k on ori_inner", "Index Cond: (k = ori_outer.k)"}},
+		{`select q from ori_outer where q < (select avg(v) from ori_inner where k = ori_outer.k and v > 3)`,
+			[]string{"Filter: ((q)::numeric < (SubPlan 1))", "Index Scan using ori_inner_k on ori_inner", "Index Cond: (k = ori_outer.k)", "Filter: (v > 3)"}},
+	} {
+		plan := renderRows(runSQL(t, ctx, "EXPLAIN (COSTS OFF) "+c.q))
+		for _, w := range c.want {
+			if countLinesContaining(plan, w) != 1 {
+				t.Errorf("%s: want %q (PG 18.3):\n%s", c.q, w, strings.Join(plan, "\n"))
+			}
+		}
+	}
+}
