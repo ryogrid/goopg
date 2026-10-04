@@ -26484,6 +26484,25 @@ M0146-0001 re-baseline census on the new default arm.
     correlated scalar subquery as a SubPlan, PG\'s shape, costs 1.50 s →
     307 s until the SubPlan inner can probe `partsupp` by the outer
     parameter. Further witnesses: TPC\-H Q2, TPC\-DS Q1/Q6/Q32/Q92.
+  - **2026\-10\-05 — prerequisite established \(recon slice\)\.** Evidence
+    `analysis/m0146/m0146\-0012/prerequisite\.md`\.
+    - `classifySubPlan` Close\+Opens every join \(hash tables and NL inner
+      caches rebuilt\) and rebuilds every unmodelled node \(Materialize,
+      Memoize, CTEScan, Gather\)\. No per\-operator cache crosses an outer
+      binding\.
+    - Context caches: the sublink result caches key on the outer
+      row/params \(safe\); `CTERowCache` keys on the declaration \(stale,
+      M0146\-0050\)\.
+    - 7 SQL probes match PG except the correlated CTE \(M0146\-0050\)\.
+      Today no correlated conjunct reaches a leaf under a join, so the
+      guard test belongs in the first slice that produces one\.
+    - Next: the implementation slice\. Admit Level\-1 `OuterColumnRef`
+      equalities as base\-rel restrictions in multi\-relation scopes
+      \(`conjunctLocalEligibility`\'s `admitOuterRefs` already serves the
+      one\-relation scope\), and let the restriction index paths
+      \(`pathindexrestrict\.go`\) bind them as probe keys, as
+      `is\_pseudo\_constant\_for\_index` allows\. Then guard\-test a
+      SubPlan body whose hash build side carries the correlated leaf\.
 - [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the
