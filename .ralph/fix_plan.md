@@ -27588,7 +27588,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Test `TestGroupingSetsRowEstimateSumsSets` \(fails on HEAD\)\.
     - Design `docs/design/0100\-0149/m0146\-0009o\-grouping\-sets\-rows\-and\-rollup\-costs\.md`\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 12→11
-- [ ] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
+- [!] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
   filter** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q72: the
   `inventory\_pkey` probe reports rows=527, three times PG\'s 176; the
   filter `inv\_quantity\_on\_hand < cs\_quantity` \(PG\'s 1/3 default\) is not
@@ -27598,6 +27598,20 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find where a parameterised index path\'s rows are set and
     whether its residual \(non\-index\) restriction clauses are applied,
     as `get\_parameterized\_baserel\_size` does\.
+  - **HELD 2026\-10\-04 — blocked on M0145\-0008ag \(B8 index\-probe cost\)\.**
+    The producers multiply only the key equalities\' selectivity; the patch
+    `movableNonEquiJoinSelectivity` \(every movable non\-equijoin clause, as
+    `ppi\_clauses`\) gives PG\'s rows on a repro \(30 → 10\) and passed units,
+    spotcheck, sweep, TPC\-H arm and ea\-ratchet\.
+    - The fire set FAILED: SF1 Q72 timed out\. The cheaper item\-only
+      inventory probe now undercuts PG\'s route because goopg prices PG\'s
+      \(date, item\) probe at 10\.42 vs PG 5\.98 \(and the subtree under the
+      hash 47926 vs 44279\)\.
+    - Patch \+ test \+ Q72 plans: `analysis/m0146/m0146\-0009p/`\. Design
+      `docs/design/0100\-0149/m0146\-0009p\-param\-probe\-rows\-held\.md`\.
+    - Resume: re\-apply after the probe\-cost gap closes; re\-run the fire set
+      with SF1 Q72 as witness\.
+  Movement: none — held; the patch\'s fire set timed out SF1 Q72
 - [ ] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
   in full\-row width** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q4 and Q11 at SF1: in CTE `year\_total` goopg elects
