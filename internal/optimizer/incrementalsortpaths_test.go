@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -44,18 +43,16 @@ func incrementalSortFixture() (u *upperRels, in *searchedPricedNode, cand1, cand
 	return u, in, cand1, cand2
 }
 
-// TestAddIncrementalSortPathsOffByDefaultIsInert pins the default-off gate:
-// with GOOPG_INCREMENTAL_SORT unset, createOrderedPaths' ordered.Pathlist is
-// exactly what it was before this file existed (seed's full Sort alone) even
-// though a genuinely partial-prefix-matching search candidate is present. Run
-// end-to-end through createOrderedPaths (including its createPlanNode call)
-// because the flag being off means PathIncrementalSort can never be
-// constructed, so there is nothing unsafe about letting the winner
-// materialize here.
-func TestAddIncrementalSortPathsOffByDefaultIsInert(t *testing.T) {
-	if incrementalSortPathsMode != incrementalSortOff {
-		t.Fatalf("incrementalSortPathsMode = %v, want the package default off", incrementalSortPathsMode)
+// TestAddIncrementalSortPathsOffIsInert pins the escape hatch: with
+// GOOPG_INCREMENTAL_SORT=off, createOrderedPaths' ordered.Pathlist is exactly
+// what it was before the third arm existed (seed's full Sort alone) even
+// though a genuinely partial-prefix-matching search candidate is present.
+// Default ON since M0146-0006.
+func TestAddIncrementalSortPathsOffIsInert(t *testing.T) {
+	if incrementalSortPathsMode != incrementalSortOn {
+		t.Fatalf("incrementalSortPathsMode = %v, want the package default on (M0146-0006)", incrementalSortPathsMode)
 	}
+	withIncrementalSortMode(t, incrementalSortOff)
 	cp := defaultCostParams()
 	u, in, _, _ := incrementalSortFixture()
 
@@ -63,7 +60,7 @@ func TestAddIncrementalSortPathsOffByDefaultIsInert(t *testing.T) {
 
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	if len(ordered.Pathlist) != 1 {
-		t.Fatalf("ordered.Pathlist = %d entries, want 1 (the seed's full Sort only) — the third arm must stay off by default", len(ordered.Pathlist))
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 (the seed's full Sort only) — the third arm must stay off under the escape hatch", len(ordered.Pathlist))
 	}
 	if ordered.Pathlist[0].Kind != PathSort {
 		t.Fatalf("ordered.Pathlist[0].Kind = %d, want PathSort", ordered.Pathlist[0].Kind)
@@ -95,72 +92,36 @@ func incrementalSortOrderedFixture() (ordered *RelOptInfo, seedNode *pricedNode,
 	return ordered, seedNode, seed
 }
 
-// TestAddIncrementalSortPathsOffersAGenuinePartialPrefixCandidate is this
-// arm's positive gate: with the flag on, cand1 (partial-prefix match) gets an
-// Incremental Sort candidate offered to the ORDERED tournament, priced by
-// costIncrementalSort over cand1's own cost — while cand2 (zero shared
-// prefix) is skipped, since a zero-prefix candidate has nothing this arm
-// prices more cheaply than arm 2's Sort already does.
-func TestAddIncrementalSortPathsOffersAGenuinePartialPrefixCandidate(t *testing.T) {
+// TestAddIncrementalSortPathsDeclinesACandidateTheBoundaryCannotRebuild pins
+// M0146-0006's safety rule for the third arm: a partially presorted search
+// candidate is wrapped in an Incremental Sort only after it is rebuilt
+// through the searched boundary (`searchedCandidateInput`), the same replay
+// the presorted arm (M0146-0027) applies. A raw searched path lowers in the
+// search's inner coordinate order, so offering it would sort and emit the
+// wrong columns. Here the seed is not a searched root, so the rebuild
+// declines and no Incremental Sort may be offered — only the seed's own
+// full Sort. The positive case runs end to end in the executor's
+// TestGroupAggIncrementalSortOverPresortedInput / the fire set.
+func TestAddIncrementalSortPathsDeclinesACandidateTheBoundaryCannotRebuild(t *testing.T) {
 	withIncrementalSortMode(t, incrementalSortOn)
 	cp := defaultCostParams()
 	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
-	ordered, seedNode, seed := incrementalSortOrderedFixture()
+	ordered, _, seed := incrementalSortOrderedFixture()
 
 	vKey := PathKey{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}, SortAsc: false}
-	kKeyOnly := PathKey{Expr: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}, SortAsc: true}
 	cand1 := &Path{Kind: PathSeqScan, Rows: 500, Cost: Cost{Startup: 1, Total: 40}, Pathkeys: []PathKey{vKey}}
-	cand2 := &Path{Kind: PathSeqScan, Rows: 500, Cost: Cost{Startup: 1, Total: 50}, Pathkeys: []PathKey{kKeyOnly}}
-	ordered.SearchCandidates = []*Path{cand1, cand2}
-	ordered.SearchCandidateKeys = [][]PathKey{cand1.Pathkeys, cand2.Pathkeys}
+	ordered.SearchCandidates = []*Path{cand1}
+	ordered.SearchCandidateKeys = [][]PathKey{cand1.Pathkeys}
 
-	lines := captureTrace(t, func() {
-		addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
-	})
-	lines = dppathLines(lines)
-	var incLines []string
-	for _, l := range lines {
-		if strings.Contains(l, "producer="+upperOrderedIncrementalSortProducer+" ") {
-			incLines = append(incLines, l)
-		}
-	}
-	if len(incLines) != 1 {
-		t.Fatalf("incremental-sort trace lines = %d, want exactly 1 (one for cand1, none for cand2): %v", len(incLines), lines)
-	}
+	addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
 
-	var got *Path
 	for _, p := range ordered.Pathlist {
 		if p.Kind == PathIncrementalSort {
-			got = p
+			t.Fatalf("an un-rebuildable candidate was wrapped in an Incremental Sort: %+v", p)
 		}
 	}
-	if got == nil {
-		t.Fatalf("ordered.Pathlist has no PathIncrementalSort entry: %+v", ordered.Pathlist)
-	}
-	if len(got.Children) != 1 || got.Children[0] != cand1 {
-		t.Fatalf("PathIncrementalSort.Children = %v, want [cand1] by identity", got.Children)
-	}
-	if got.Rows != cand1.Rows {
-		t.Fatalf("PathIncrementalSort.Rows = %v, want cand1.Rows %v (a Sort projects nothing)", got.Rows, cand1.Rows)
-	}
-	if len(got.Pathkeys) != 2 {
-		t.Fatalf("PathIncrementalSort.Pathkeys = %d entries, want the full 2-key requirement", len(got.Pathkeys))
-	}
-	want := costIncrementalSort(cp, cand1.Cost, cand1.Rows,
-		float64(estimateNumGroups([]Expr{sortPathkeys[0].Expr}, seedNode, int64(cand1.Rows))),
-		pathNCols(cand1), pathAvgVarBytes(cand1), -1, pathWidth(cand1))
-	if !approx(got.Cost.Total, want.Total) || !approx(got.Cost.Startup, want.Startup) {
-		t.Fatalf("PathIncrementalSort.Cost = %+v, want costIncrementalSort's own %+v", got.Cost, want)
-	}
-	// Both candidates carry the SAME Pathkeys (sortPathkeys in full — an
-	// Incremental Sort still delivers the whole requirement, only its
-	// cost differs) and the same RequiredOuter/ParallelSafe/DisabledNodes,
-	// so add_path's dominance rule correctly prunes arm 2's full Sort here:
-	// cand1's prefix credit makes the Incremental Sort strictly cheaper on
-	// both axes. That eviction is the entire point of this arm — a real,
-	// cost-driven tournament, not a "both survive" plumbing check.
-	if len(ordered.Pathlist) != 1 || ordered.Pathlist[0].Kind != PathIncrementalSort {
-		t.Fatalf("ordered.Pathlist = %+v, want exactly the dominant PathIncrementalSort (arm 2's costlier Sort correctly pruned)", ordered.Pathlist)
+	if len(ordered.Pathlist) != 1 || ordered.Pathlist[0].Kind != PathSort {
+		t.Fatalf("ordered.Pathlist = %+v, want the seed's full Sort alone", ordered.Pathlist)
 	}
 }
 
@@ -217,13 +178,17 @@ func TestAddIncrementalSortPathsSkipsAZeroPrefixCandidate(t *testing.T) {
 	}
 }
 
-// TestIncrementalSortModeFromEnv pins the env-string contract every other
-// mode knob in this package shares: unrecognised input fails closed to off.
+// TestIncrementalSortModeFromEnv pins the env-string contract: default ON
+// since M0146-0006 (PG's enable_incremental_sort defaults on), with `off`
+// as the escape hatch.
 func TestIncrementalSortModeFromEnv(t *testing.T) {
 	cases := map[string]incrementalSortMode{
-		"":      incrementalSortOff,
+		"":      incrementalSortOn,
 		"off":   incrementalSortOff,
-		"bogus": incrementalSortOff,
+		"OFF":   incrementalSortOff,
+		"0":     incrementalSortOff,
+		"false": incrementalSortOff,
+		"bogus": incrementalSortOn,
 		"on":    incrementalSortOn,
 		"ON":    incrementalSortOn,
 		"1":     incrementalSortOn,

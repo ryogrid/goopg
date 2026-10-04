@@ -13,6 +13,9 @@ package optimizer
 // that offering the full Pathlist WITHOUT that credit cannot move a single
 // plan — this file is what makes the offer non-trivial.
 //
+// DEFAULT ON SINCE M0146-0006 (2026-10-04); the history below explains why
+// it was gated off until then.
+//
 // WHY GATED OFF BY DEFAULT. `createPlanNode` (createplan.go) and the executor
 // (`incrementalSortOp`) both got their arms in exec-a/b (M0141-S7), so a
 // winning tournament no longer panics. The flag stays off anyway: the
@@ -64,10 +67,11 @@ import (
 // incrementalSortMode is the admission rule for the third arm.
 //
 //   - off — addOrderedPaths behaves exactly as before this file (arms 1/2
-//     only). This is the default: no plan can change.
-//   - on — every OTHER surviving search candidate whose own ordering shares a
-//     genuine partial prefix with the required sort keys is also offered, as
-//     an Incremental Sort, to the ORDERED rel's tournament.
+//     only).
+//   - on (default) — every OTHER surviving search candidate whose own
+//     ordering shares a genuine partial prefix with the required sort keys
+//     is also offered, as an Incremental Sort, to the ORDERED rel's
+//     tournament.
 type incrementalSortMode int
 
 const (
@@ -80,15 +84,17 @@ const (
 // mid-statement.
 var incrementalSortPathsMode = incrementalSortModeFromEnv(os.Getenv("GOOPG_INCREMENTAL_SORT"))
 
-// incrementalSortModeFromEnv resolves the knob. Anything unrecognised is
-// `off`: fail-closed, so a typo cannot silently enable a plan shape whose
-// executor operator does not exist yet. Same shape as `partialSortModeFromEnv`.
+// incrementalSortModeFromEnv resolves the knob. Default ON since M0146-0006:
+// PG's create_ordered_paths makes this offer under enable_incremental_sort
+// (default on), the executor operator and its EXPLAIN rendering exist
+// (M0141-S7-exec-a/b), and the arm also honours the GUC itself
+// (`cp.enableIncrementalSort`). `off` is the operational escape hatch.
 func incrementalSortModeFromEnv(v string) incrementalSortMode {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "on", "paths", "true", "1":
-		return incrementalSortOn
-	default:
+	case "off", "false", "0":
 		return incrementalSortOff
+	default:
+		return incrementalSortOn
 	}
 }
 
@@ -146,7 +152,7 @@ const upperOrderedIncrementalSortProducer = "upper.ordered.incrementalsort"
 // materialized Node is a faithful stats source for a sibling candidate's own
 // prefix, not an approximation specific to the seed.
 func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
-	if incrementalSortPathsMode != incrementalSortOn {
+	if incrementalSortPathsMode != incrementalSortOn || !cp.enableIncrementalSort {
 		return
 	}
 	for i, candidate := range ordered.SearchCandidates {
@@ -161,10 +167,24 @@ func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []Pa
 		if pathTraceEnabled {
 			traceIncrementalSortCandidate(i, candidate.Kind, len(keys), contained, nCommon, candidate.Cost.Total)
 		}
-		if contained || nCommon == 0 {
+		if contained || nCommon == 0 || input == nil || input.node == nil {
 			continue
 		}
-		addPath(ordered, incrementalSortPathOver(ordered, candidate, input.node, sortPathkeys, nCommon, cp, limitTuples),
+		// M0146-0006: rebuilt through the searched boundary before it is
+		// wrapped, as the presorted arm in addOrderedPaths does
+		// (M0146-0027). A raw searched path lowers in the search's inner
+		// coordinate order, not the row the boundary committed, so stacking
+		// the Incremental Sort on it directly would sort — and emit — the
+		// wrong columns once this arm can win (the default since 0006).
+		cNode := searchedCandidateInput(input.node, candidate)
+		if cNode == nil {
+			continue
+		}
+		cs := newPrebuiltPath(ordered, cNode)
+		cs.Rows = candidate.Rows
+		cs.Cost = candidate.Cost
+		cs.Pathkeys = keys
+		addPath(ordered, incrementalSortPathOver(ordered, cs, input.node, sortPathkeys, nCommon, cp, limitTuples),
 			upperOrderedIncrementalSortProducer)
 	}
 }

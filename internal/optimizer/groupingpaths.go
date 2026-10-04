@@ -578,7 +578,25 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			}
 			if !ok && !isSorted {
 				// M0144-0003c: narrowed seed — see sortSeed above.
-				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
+				// M0146-0006: make_ordered_path (planner.c) sorts the cheapest
+				// input incrementally when its pathkeys already deliver a
+				// leading prefix of the group keys and enable_incremental_sort
+				// is on, and fully otherwise — never both. TPC-DS Q64's
+				// cross_sales CTE groups an item-ordered input:
+				// `GroupAggregate <- Incremental Sort (Presorted Key:
+				// item.i_item_sk)`.
+				groupPathkeys := pathkeysForSortKeys(keys)
+				var sortedInput *Path
+				if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
+					if _, n := pathkeysCountContainedIn(seedKeys, groupPathkeys); n > 0 {
+						incSeed := *sortSeed
+						incSeed.Pathkeys = seedKeys
+						sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
+					}
+				}
+				if sortedInput == nil {
+					sortedInput = sortPathForBounded(sortSeed, groupPathkeys, cp, -1)
+				}
 				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 				sortSpec := *aggNode
 				addPath(grouped, &Path{
@@ -593,7 +611,16 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				groupPathkeys := pathkeysForSortKeys(keys)
 				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
 				for i, cand := range sr.Pathlist {
-					if i >= len(candKeys) || !pathkeysContainedIn(candKeys[i], groupPathkeys) {
+					if i >= len(candKeys) {
+						continue
+					}
+					// make_ordered_path: a presorted runner-up feeds the
+					// aggregate as-is, a partially presorted one through an
+					// Incremental Sort (M0146-0006), and one with no
+					// presorted key is not offered (only the cheapest input
+					// is fully sorted, above).
+					contained, nCommon := pathkeysCountContainedIn(candKeys[i], groupPathkeys)
+					if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
 						continue
 					}
 					cNode := searchedCandidateInput(child, cand)
@@ -604,13 +631,17 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					cs.Rows = inputRows
 					cs.Cost = cand.Cost
 					cs.Pathkeys = candKeys[i]
+					in := cs
+					if !contained {
+						in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
+					}
 					candSpec := *aggNode
 					addPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,
-						Cost: costAgg(cp, AggStrategySorted, inputRows, cs.Cost.Startup, cs.Cost.Total,
+						Cost: costAgg(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
 							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inNcols, inAvgVar),
-						Pathkeys: groupPathkeys, Children: []*Path{cs},
+						Pathkeys: groupPathkeys, Children: []*Path{in},
 					}, groupAggSearchProducer)
 				}
 			}
