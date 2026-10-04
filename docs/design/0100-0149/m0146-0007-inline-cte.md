@@ -1,7 +1,8 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1-7 landed (the latest 2026-10-04, M0146-0007g: row marks
-and WITH queries); the items under "Still open" in each slice are ledgered.
+Status: slices 1-8 landed (the latest 2026-10-04, M0146-0007h: pseudoconstant
+function quals gate their scope); the items under "Still open" in each slice
+are ledgered.
 
 ## PG behaviour
 
@@ -367,3 +368,83 @@ Still open (ledgered 2026-10-04):
 - a nested clause that marks only CTEs still blocks inlining;
 - PG keeps `Subquery Scan on ss` over the inner LockRows;
 - EXPLAIN under LockRows prints a Merge Join without its input Sorts.
+
+## Slice 8 (M0146-0007h): a pseudoconstant function qual gates its scope
+
+Once 0007f pulls up both references of regress `subselect`'s NOT
+MATERIALIZED pair, `x.n = x2.n` reads `now() = now()`. PG puts such a
+conjunct on a gating Result (`create_gating_plan`,
+`./postgres/src/backend/optimizer/plan/createplan.c`). It is evaluated once
+as a `One-Time Filter`, and the Result emits nothing when it is false.
+
+PG's test (`is_pseudo_constant_clause`) asks only two things: no Vars of the
+current level, and no volatile function. goopg's gate (M0145-0008o)
+admitted only conjuncts holding an uncorrelated sublink. So these all stayed
+per-row Filters on the scan:
+
+- `SELECT * FROM t WHERE now() = now()`;
+- `CURRENT_USER = 'postgres'`;
+- the `now() > '2000-01-01'::timestamptz` half of a mixed WHERE.
+
+### Change
+
+- `isPseudoconstantConjunct` admits non-volatile function calls and the
+  typed literals (`TypedStringLit`, `IntervalLit`). A conjunct must still
+  contain a sublink or a function call. A conjunct of constants alone stays
+  out: PG folds it, and a constant FALSE makes the relation dummy (a
+  childless Result), which this pass does not model.
+- Volatility is PG's. `exprListHasVolatileBuiltin` also reads
+  `catalog.BuiltinProcIsVolatile`, which is generated from `pg_proc.dat` by
+  M0146-0028f. The hand-written list missed volatile builtins such as
+  `pg_try_advisory_lock` and `set_config`, and a gate would have run those
+  once instead of per row.
+
+### Found by the regress A/B: pg_relation_is_publishable
+
+psql's `\d` query ANDs `pg_catalog.pg_relation_is_publishable('<oid>')`
+beside `pc.oid = '<oid>'`.
+
+- As a per-row Filter, goopg's AND short-circuited on the first conjunct, so
+  the missing builtin was never called.
+- Gated, it is evaluated once whatever the rows hold, as in PG. `\d` then
+  failed with "function … does not exist" (47 times in `inherit`).
+
+The function is now implemented as PG's `is_publishable_class`
+(`./postgres/src/backend/catalog/pg_publication.c`). It is true for a
+permanent ordinary or partitioned table with an OID of at least 16384, and
+NULL for a missing relation.
+
+### Effect
+
+- **Probe shapes.** goopg now gates every shape PG gates, also inside
+  Aggregate, Limit and Append members:
+  - `now() = now()`;
+  - `CURRENT_USER = …`;
+  - the mixed WHERE, with `f1 > 2` left on the scan;
+  - the 0007f pull-up pair.
+- **TPC-DS and TPC-H.** Neither has a function-only pseudoconstant
+  conjunct.
+  - The fire set fired nothing.
+  - The sweep passed 96/96 and the TPC-H arm 24/24; tpch-spotcheck and
+    ea-ratchet passed.
+- **Regress A/B** over 23 cases (after the builtin): only a known `join`
+  row-order flip and `memoize` build-time noise.
+  - The `subselect` pair itself is still a Merge Join on `n = n`. Its body
+    nests a second derived table (`SELECT * FROM (SELECT f1, now() AS n …)
+    ss`), and the pull-up expands one level, so `n` stays a subquery column
+    (0007f's item (b)).
+
+Tests (both fail on HEAD):
+
+- `TestPseudoconstantFunctionQualGatesScope`: four gated shapes with their
+  rows; `random()` and `pg_try_advisory_lock()` stay per-row.
+- `TestRelationIsPublishable`: PG's values for a table, an unlogged table,
+  a temp table, a view, `pg_class` and a missing OID; the `\d`-shaped query
+  over a non-matching OID.
+
+Still open (ledgered 2026-10-04):
+
+- constant FALSE as a dummy relation;
+- folding immutable calls over constants (`length('abc') = 3`);
+- Params and enclosing-level Vars;
+- pseudoconstant join ON quals gated at their join.

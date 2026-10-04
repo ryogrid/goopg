@@ -25618,6 +25618,8 @@ M0146-0001 re-baseline census on the new default arm.
     `NOT MATERIALIZED`\); the open items are the 2026\-10\-04 ledger row\.
   - Slice 7 landed 2026\-10\-04 as M0146\-0007g \(row marks and WITH
     queries\)\.
+  - Slice 8 landed 2026\-10\-04 as M0146\-0007h \(pseudoconstant function
+    quals gate their scope\)\.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -25752,6 +25754,38 @@ M0146-0001 re-baseline census on the new default arm.
     PASS \(no query fired\), ea\-ratchet PASS, regress A/B \(10 cases\): the
     two `subselect` cases now print PG\'s plan; nothing else changed\.
   Movement: none — parity held: no TPC\-DS/TPC\-H query locks rows; regress subselect moves two plans to PG\'s
+- [x] **M0146\-0007h — a pseudoconstant function qual gates its scope**
+  \(slice 8, impl, done 2026\-10\-04; the 0007f ledger row\'s item \(d\):
+  regress `subselect`\'s NOT MATERIALIZED pair reads `now\(\) = now\(\)` once
+  pulled up\)\.
+  Kind: impl
+  Parent: M0146\-0007
+  - PG\'s is\_pseudo\_constant\_clause asks only for no current\-level Vars
+    and no volatile function; create\_gating\_plan then evaluates the
+    conjunct once as a Result\'s One\-Time Filter\. goopg gated only
+    sublink\-bearing conjuncts \(M0145\-0008o\), so `now\(\) = now\(\)`,
+    `CURRENT\_USER = …` and `now\(\) > \'2000\-01\-01\'::timestamptz` stayed
+    per\-row Filters\.
+  - `isPseudoconstantConjunct` admits non\-volatile function calls and typed
+    literals \(TypedStringLit, IntervalLit\); a pure\-constant conjunct stays
+    out \(PG folds it, and a constant FALSE makes the rel dummy\)\.
+  - Volatility is PG\'s: `exprListHasVolatileBuiltin` now also reads
+    `catalog\.BuiltinProcIsVolatile` \(pg\_proc\.dat\), which the hand list
+    missed \(`pg\_try\_advisory\_lock`, `set\_config`, …\)\.
+  - Found by the regress A/B: psql\'s `\\d` query ANDs
+    `pg\_relation\_is\_publishable\(\'<oid>\'\)` beside `pc\.oid = …`; gated,
+    it is evaluated even when no row matches, and goopg lacked the
+    function\. Implemented with PG\'s is\_publishable\_class \(NULL for a
+    missing relation\)\.
+  - Tests `TestPseudoconstantFunctionQualGatesScope`,
+    `TestRelationIsPublishable` \(both fail on HEAD\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    PASS \(no query fired\), ea\-ratchet PASS, regress A/B over 23 cases:
+    only a known `join` row\-order flip and `memoize` build\-time noise\.
+  - The regress `subselect` pair itself is still a Merge Join: its body nests
+    a second derived table, and the pull\-up expands one level \(0007f
+    ledger item \(b\)\)\.
+  Movement: none — parity held: no TPC\-DS/TPC\-H query has a function\-only pseudoconstant conjunct; fire set flat
 - [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
   them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
   `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).
