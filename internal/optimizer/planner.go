@@ -1233,7 +1233,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// A-01(ii) cut 2: CTE bodies allocate from the statement scope.
 	// EX3-03 cut 1: CTE bodies routinely contain the join tree — they plan
 	// under the statement's settings.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, plannerSet, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, s, cat, plannerSet, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -4793,6 +4793,13 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			alias := rv.Alias
 			if alias == "" {
 				alias = ce.name
+			}
+			// M0146-0007f: a multiply-referenced NOT MATERIALIZED CTE is
+			// inlined into each reference (inline_cte), planned here as an
+			// ordinary subquery. An alias list longer than the CTE's columns
+			// keeps the CTE arm and its error.
+			if ce.inlinesEachReference() && rv.TableSample == nil && len(rv.Columns) <= len(ce.schema) {
+				return planCTEReferenceAsSubquery(rv, ce, alias, cat, sourceIdx, lateralCtx, ps, scope)
 			}
 			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
 			if ce.isDML {
@@ -13698,7 +13705,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// A-01(ii) cut 2: the WITH list, the SELECT source, and every VALUES
 	// cell sublink allocate from the statement scope.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -14555,7 +14562,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -14756,7 +14763,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// A-01(ii) cut 2 (F5): same scope treatment as planUpdate (see it for
 	// the target-scan note).
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}

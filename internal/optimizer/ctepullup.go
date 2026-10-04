@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -98,8 +99,9 @@ func stampCTEReferenceCounts(s *parser.SelectStmt) {
 // cteAsDerivedItem returns `it` rewritten as the derived table PG's
 // inline_cte makes of a CTE reference, when the CTE is inline_cte's single
 // reference (inlinable's gates, with the AST reference count in place of the
-// planning-time one) and its body could be pulled up at all. The returned
-// entry is the CTE whose preplanned body the pull-up replaces.
+// planning-time one) or a multiply-referenced NOT MATERIALIZED CTE
+// (inlinesEachReference), and its body could be pulled up at all. The
+// returned entry is the CTE whose preplanned body the pull-up replaces.
 func cteAsDerivedItem(it parser.FromExpr) (parser.FromExpr, *plannedCTE, bool) {
 	rv := it.Base
 	if rv.Subquery != nil || rv.Schema != "" || rv.Name == "" || rv.Lateral ||
@@ -107,9 +109,10 @@ func cteAsDerivedItem(it parser.FromExpr) (parser.FromExpr, *plannedCTE, bool) {
 		return it, nil, false
 	}
 	e := planCTEs[strings.ToLower(rv.Name)]
-	if e == nil || e.astRefs != 1 || !e.inlineEligible || !e.selectOwned ||
-		e.materialized == "materialized" || e.volatile || e.isDML || e.query == nil ||
-		len(e.aliasColumns) > 0 {
+	singleRef := e != nil && e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
+		e.materialized != "materialized" && !e.volatile && !e.isDML
+	if e == nil || !(singleRef || e.inlinesEachReference()) || e.query == nil ||
+		len(e.aliasColumns) > 0 || !cteBodyNamesResolveAsDeclared(e) {
 		return it, nil, false
 	}
 	alias := rv.Alias
@@ -135,4 +138,120 @@ func takeBackPulledBodyRefs(e *plannedCTE) {
 			ref.refs = 0
 		}
 	}
+}
+
+// cteBodyNamesResolveAsDeclared reports whether every unqualified relation
+// name the CTE's body reads resolves, in the current CTE scope, to what it
+// resolved to where the CTE was declared (declScope). A pulled-up body plans
+// its FROM items in the referencing scope, which also sees this CTE itself, a
+// later sibling and any WITH nested around the reference; PG resolves the
+// body at the WITH's own level. A name that would rebind declines the pull-up
+// (planCTEReferenceAsSubquery then plans the body under declScope). Entries
+// without a recorded scope (built outside preplanWithClause) decline only
+// when the body reads the CTE's own name.
+func cteBodyNamesResolveAsDeclared(e *plannedCTE) bool {
+	ok := true
+	complete := walkParserRangeVarNames(e.query, func(name string) {
+		key := strings.ToLower(name)
+		var declared *plannedCTE
+		if e.declScope != nil {
+			declared = e.declScope[key]
+		} else if key == strings.ToLower(e.name) {
+			ok = false
+			return
+		} else {
+			declared = planCTEs[key]
+		}
+		if planCTEs[key] != declared {
+			ok = false
+		}
+	})
+	return ok && complete
+}
+
+// walkParserRangeVarNames calls fn with the name of every unqualified,
+// non-subquery relation reference in s (FROM lists, set-operation branches,
+// sublinks, nested WITH bodies; SelectStmt.From, the flattened copy of
+// FromExprs, is skipped). Names a nested WITH declares are reported too,
+// which only makes cteBodyNamesResolveAsDeclared stricter. It returns false
+// when the AST was too deep to walk completely.
+func walkParserRangeVarNames(s *parser.SelectStmt, fn func(string)) bool {
+	complete := true
+	var walk func(v reflect.Value, depth int)
+	walk = func(v reflect.Value, depth int) {
+		if depth > 96 {
+			complete = false
+			return
+		}
+		if !v.IsValid() {
+			return
+		}
+		switch v.Kind() {
+		case reflect.Interface, reflect.Ptr:
+			if !v.IsNil() {
+				walk(v.Elem(), depth+1)
+			}
+		case reflect.Struct:
+			if v.CanInterface() {
+				if rv, ok := v.Interface().(parser.RangeVar); ok && rv.Subquery == nil &&
+					rv.TableFunc == nil && rv.Schema == "" && rv.Name != "" {
+					fn(rv.Name)
+				}
+			}
+			skipFrom := false
+			if v.CanInterface() {
+				if sel, ok := v.Interface().(parser.SelectStmt); ok && len(sel.FromExprs) > 0 {
+					skipFrom = true
+				}
+			}
+			t := v.Type()
+			for i := 0; i < v.NumField(); i++ {
+				if skipFrom && t.Field(i).Name == "From" {
+					continue
+				}
+				if f := v.Field(i); f.CanInterface() {
+					walk(f, depth+1)
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				walk(v.Index(i), depth+1)
+			}
+		}
+	}
+	walk(reflect.ValueOf(s), 0)
+	return complete
+}
+
+// planCTEReferenceAsSubquery plans one reference to a multiply-referenced
+// NOT MATERIALIZED CTE (inlinesEachReference) as the ordinary subquery PG's
+// inline_cte makes of it: the written body, under the reference's alias, with
+// the CTE's column names (the reference's own alias list overriding a
+// prefix), planned afresh for this reference under the declaration's CTE
+// scope. A reference the FROM-list pull-up already flattened never gets
+// here. The preplanned body is dead once a reference inlines, so its own
+// references to other CTEs are taken back (takeBackPulledBodyRefs).
+// M0146-0007f.
+func planCTEReferenceAsSubquery(rv parser.RangeVar, e *plannedCTE, alias string, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
+	sub := rv
+	sub.Schema, sub.Name = "", ""
+	sub.Alias = alias
+	sub.Subquery = e.query
+	sub.Columns = nil
+	if len(e.aliasColumns) > 0 || len(rv.Columns) > 0 {
+		sub.Columns = make([]string, len(e.schema))
+		for i, c := range e.schema {
+			sub.Columns[i] = c.Name
+		}
+		copy(sub.Columns, rv.Columns)
+	}
+	saved := planCTEs
+	planCTEs = e.declScope
+	node, b, err := planSubqueryRangeVar(sub, cat, sourceIdx, lateralCtx, ps, scope)
+	planCTEs = saved
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	takeBackPulledBodyRefs(e)
+	return node, b, nil
 }

@@ -75,6 +75,16 @@ type plannedCTE struct {
 	materialized string
 	volatile     bool
 	selectOwned  bool
+	// declScope is the CTE-name scope the body was declared in: the outer
+	// statements' entries and this WITH list's earlier siblings, but not
+	// this CTE or a later sibling. A body re-planned at a reference site
+	// (inlinesEachReference) resolves its names here, as PG's body
+	// resolves them at the WITH's own level.
+	declScope map[string]*plannedCTE
+	// eachRef is inline_cte for `NOT MATERIALIZED` on a multiply-referenced
+	// CTE — see inlinesEachReference. Computed when the entry is created,
+	// so a later sibling's body already inlines its references.
+	eachRef bool
 	// declSeq orders CTEs by WITH-list declaration (left to right, and an
 	// enclosing statement's list after any list declared inside a body it
 	// planned first). EXPLAIN reads it through CTEScan.DeclSeq to print the
@@ -129,11 +139,51 @@ func (e *plannedCTE) outputStats() *cteOutputStats {
 // PG renders the subquery. Final only once the whole statement is planned
 // (refs), like pushQualsThroughSingleRefCTEs. M0146-0007.
 //
-// Not expressed: NOT MATERIALIZED on a multiply-referenced CTE (PG inlines
-// each reference; goopg shares one planned body between references).
+// NOT MATERIALIZED on a multiply-referenced CTE is inlinesEachReference.
 func (e *plannedCTE) inlinable() bool {
 	return e != nil && e.inlineEligible && e.selectOwned && e.refs == 1 &&
 		e.materialized != "materialized" && !e.volatile
+}
+
+// inlinesEachReference is SS_process_ctes' inline_cte gate for a CTE written
+// `NOT MATERIALIZED` and referenced more than once (cterefcount > 1): PG
+// copies the body into every reference, each an ordinary RTE_SUBQUERY that
+// pull_up_subqueries may flatten. The gate's other terms are the
+// single-reference ones plus contain_outer_selfref (a body reading an
+// enclosing recursive CTE's worktable stays shared). goopg also keeps a
+// correlated body shared: a reference may sit at a deeper query level than
+// the WITH, and re-planning the body there would shift its outer-reference
+// levels (PG's IncrementVarSublevelsUp). M0146-0007f.
+func (e *plannedCTE) inlinesEachReference() bool {
+	return e != nil && e.eachRef
+}
+
+// eachReferenceInlineGate computes plannedCTE.eachRef for a non-recursive
+// SELECT body as preplanWithClause registers it. owner is the SELECT that
+// owns the WITH (nil for INSERT/UPDATE/DELETE/MERGE, whose CTEs PG never
+// inlines: cmdType != CMD_SELECT).
+func eachReferenceInlineGate(owner *parser.SelectStmt, cte *parser.CommonTableExpr, body Node, volatile bool) bool {
+	if owner == nil || cte.Materialized != "not materialized" || volatile {
+		return false
+	}
+	if planHasWorkTableScan(body) || planHasOuterRef(body) {
+		return false
+	}
+	return countCTEReferences(owner, cte.Name) > 1
+}
+
+// planHasWorkTableScan is contain_outer_selfref over a non-recursive body:
+// any WorkTableScan in it reads an enclosing recursive CTE's worktable.
+// A recursive CTE nested inside the body also has one, so this over-reports,
+// which only keeps the body shared.
+func planHasWorkTableScan(n Node) bool {
+	found := false
+	forEachPlanNodeDeep(n, func(x Node) {
+		if _, ok := x.(*WorkTableScan); ok {
+			found = true
+		}
+	})
+	return found
 }
 
 // planHasVolatileExpr is contain_volatile_functions over a planned body,
@@ -196,7 +246,7 @@ var planCTEs map[string]*plannedCTE
 // EX3-03 cut 1: ps is the enclosing statement's settings. CTE bodies
 // routinely contain the join tree (the Q9 pattern), so these are the
 // highest-value conversions — every body below prices under ps.
-func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (restore func(), dmlPlans []dmlCTEPlan, err error) {
+func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (restore func(), dmlPlans []dmlCTEPlan, err error) {
 	if with == nil {
 		return func() {}, nil, nil
 	}
@@ -375,6 +425,11 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 				entry.bodyRefDeltas[e] = d
 			}
 		}
+		entry.declScope = make(map[string]*plannedCTE, len(cur))
+		for k, v := range cur {
+			entry.declScope[k] = v
+		}
+		entry.eachRef = eachReferenceInlineGate(owner, cte, body, entry.volatile)
 		cur[strings.ToLower(cte.Name)] = entry
 	}
 	return restore, dmlPlans, nil

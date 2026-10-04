@@ -376,7 +376,14 @@ func splitInnerJoinChainForPullup(it parser.FromExpr, cat catalog.Catalog) ([]pa
 		if rv.Lateral || rv.TableFunc != nil || rv.GroupedJoinUnaliased {
 			return nil, nil, false
 		}
-		if _, ok := simpleDerivedPullupBody(parser.FromExpr{Base: rv}, cat); ok {
+		item := parser.FromExpr{Base: rv}
+		// M0146-0007f: a reference to an inlinable CTE is the derived table
+		// inline_cte makes of it (cteAsDerivedItem); the pieces loop below
+		// converts it the same way.
+		if conv, _, ok := cteAsDerivedItem(item); ok {
+			item = conv
+		}
+		if _, ok := simpleDerivedPullupBody(item, cat); ok {
 			anyDerived = true
 		}
 	}

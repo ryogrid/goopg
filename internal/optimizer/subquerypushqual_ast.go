@@ -357,9 +357,13 @@ func newPushQualItem(rv parser.RangeVar, chain, pos int, nullable bool, cat cata
 					x.names[strings.ToLower(c.Name)]++
 				}
 				x.namesOK = true
-				if e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
-					e.materialized != "materialized" && !e.volatile && !e.isDML &&
-					e.query != nil && len(e.aliasColumns) == 0 && len(rv.Columns) == 0 {
+				// inline_cte's single reference, or (M0146-0007f) every
+				// reference of a multiply-referenced NOT MATERIALIZED CTE.
+				singleRef := e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
+					e.materialized != "materialized" && !e.volatile && !e.isDML
+				if (singleRef || e.inlinesEachReference()) &&
+					e.query != nil && len(e.aliasColumns) == 0 && len(rv.Columns) == 0 &&
+					cteBodyNamesResolveAsDeclared(e) {
 					x.body, x.cte = e.query, e
 				}
 				break

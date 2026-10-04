@@ -526,6 +526,21 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 	if !ok {
 		return nil, nil, nil, nil, why, false
 	}
+	// M0146-0057: the body's FROM walk may itself pull a subquery up — a
+	// reference to an inlinable CTE reads as a plain relation name to
+	// sublinkBodyIsSimple, and planFromClause then splices its body in
+	// (M0146-0007e). That body's WHERE comes back in pulledQuals, which
+	// planSelect would AND into the scope's WHERE; this splice bypasses
+	// planSelect, so the conjuncts travel with the ON quals or the pulled
+	// body's rows go unfiltered. A pulled qual that is correlated or holds a
+	// sublink was resolved against a scope this splice does not rebuild, so
+	// such a body stays a SubPlan.
+	for _, q := range bodyCtx.pulledQuals {
+		if exprHasOuterRef(q) || exprHasSublinkPlan(q) {
+			return nil, nil, nil, nil, "pulled-from-item-qual", false
+		}
+		onQuals = append(onQuals, q)
+	}
 	widths := make([]int, len(leafScans))
 	for i, l := range leafScans {
 		widths[i] = len(l.Output())
