@@ -754,8 +754,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// are then exactly the ones the closure above could see, none of which
 		// sits on a nullable side (a WHERE conjunct reaching one was held
 		// above, and the ON conjuncts are not in the list yet).
-		derived := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
-		conjuncts = append(conjuncts, onOuter...)
+		derived, redundant := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
+		for _, c := range onOuter {
+			if !redundant[c] {
+				conjuncts = append(conjuncts, c)
+			}
+		}
 		conjuncts = append(conjuncts, derived...)
 	}
 	// M0142-0008a-3i-plumbing-c5 (design doc §36, gap 5): mirrors the
@@ -1353,9 +1357,21 @@ func outerLinksHaveSJInfos(links []outerChainLink, list []*SpecialJoinInfo) bool
 //
 // Like the closure it extends it is deterministic in the link and conjunct
 // order it was given, so the synthesised list is reproducible run to run.
-func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []leafSpan) []Expr {
+//
+// The second result is the ON conjuncts the derivation made redundant
+// (M0146-0005dz). reconsider_outer_join_clauses removes an outer-join clause
+// once it has pushed `null = const` into the nullable side: every row pair
+// that can still meet has `pres = const` (the preserved leaf's restriction)
+// and `null = const` (the derived one), so `pres = null` holds for it
+// already. PG throws back a constant-TRUE clause with the removed clause's
+// required_relids only so the join is not seen as clauseless; here a clause
+// is reported redundant only when its link keeps another spanning conjunct,
+// which does that job. TPC-DS Q78's `ss_sold_year = ws_sold_year` is the
+// case: PG merges on item and customer alone, and the year no longer
+// multiplies into the join's selectivity.
+func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []leafSpan) ([]Expr, map[Expr]bool) {
 	if len(links) == 0 {
-		return nil
+		return nil, nil
 	}
 	constByIdent := make(map[columnIdent]Expr)
 	for _, c := range conjuncts {
@@ -1368,16 +1384,24 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []
 		}
 	}
 	if len(constByIdent) == 0 {
-		return nil
+		return nil, nil
 	}
 	var anyNullable RelSet
 	for _, lk := range links {
 		anyNullable |= lk.nullable
 	}
 	var out []Expr
+	redundant := make(map[Expr]bool)
 	seen := make(map[columnIdent]bool)
 	for _, lk := range links {
-		for _, c := range splitAnd(lk.pred) {
+		ons := splitAnd(lk.pred)
+		spanning := 0
+		for _, c := range ons {
+			if rs, ok := relidsOfExpr(c, spans); ok && relsOverlap(rs, lk.preserved) && relsOverlap(rs, lk.nullable) {
+				spanning++
+			}
+		}
+		for _, c := range ons {
 			a, b, ok := isColumnRefEquality(c) // same-type bare refs only
 			if !ok {
 				continue
@@ -1410,9 +1434,13 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []
 			}
 			out = append(out, d)
 			seen[identOf(null)] = true
+			if spanning > 1 {
+				redundant[c] = true
+				spanning--
+			}
 		}
 	}
-	return out
+	return out, redundant
 }
 
 // outerOnQualsOK proves, per conjunct, that every admitted outer link's `ON`

@@ -70,6 +70,10 @@ type pushQualEq struct {
 	apos, bpos int
 	acol, bcol string
 	ok         bool
+	// expr is the ON conjunct itself, and chain/join locate its JoinExpr
+	// (FromExprs[chain].Joins[join]); set for a LEFT join's ON equality.
+	expr        parser.Expr
+	chain, join int
 }
 
 func pushWhereQualsIntoGroupedItems(s *parser.SelectStmt, cat catalog.Catalog) *parser.SelectStmt {
@@ -111,7 +115,7 @@ func pushWhereQualsIntoGroupedItems(s *parser.SelectStmt, cat catalog.Catalog) *
 			}
 			for _, c := range splitParserConjuncts(j.On, nil) {
 				if a, b, ok := columnEquality(c); ok {
-					eqs = append(eqs, pushQualEq{a: a, b: b, leftNullable: nullablePos})
+					eqs = append(eqs, pushQualEq{a: a, b: b, leftNullable: nullablePos, expr: c, chain: ci, join: k})
 				}
 			}
 		}
@@ -141,9 +145,13 @@ func pushWhereQualsIntoGroupedItems(s *parser.SelectStmt, cat catalog.Catalog) *
 
 	var keep []parser.Expr
 	moved := false
+	redundant := map[parser.Expr]bool{}
 	for _, c := range conjuncts {
-		if pushGroupedItemConjunct(c, items, eqs) {
+		if used, ok := pushGroupedItemConjunct(c, items, eqs); ok {
 			moved = true
+			for _, ei := range used {
+				redundant[eqs[ei].expr] = true
+			}
 			continue
 		}
 		keep = append(keep, c)
@@ -158,6 +166,9 @@ func pushWhereQualsIntoGroupedItems(s *parser.SelectStmt, cat catalog.Catalog) *
 	for ci, it := range s.FromExprs {
 		ni := it
 		ni.Joins = append([]parser.JoinExpr(nil), it.Joins...)
+		for k := range ni.Joins {
+			ni.Joins[k].On = dropRedundantOnConjuncts(ni.Joins[k].On, redundant)
+		}
 		for _, x := range items {
 			if x.chain != ci || len(x.pushed) == 0 {
 				continue
@@ -186,33 +197,64 @@ func pushWhereQualsIntoGroupedItems(s *parser.SelectStmt, cat catalog.Catalog) *
 	return &out
 }
 
-// pushGroupedItemConjunct pushes c into the grouped items it restricts and reports
-// whether it moved. Nothing is recorded unless every target accepts.
-func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQualEq) bool {
+// dropRedundantOnConjuncts removes from a LEFT join's ON clause the
+// equalities a pushed constant has made redundant (M0146-0005dz). Once
+// `pres.y = const` is in the preserved item's body and `null.y = const` in
+// the nullable item's (the push followed this very ON equality), every pair
+// the join can form satisfies `null.y = pres.y`, so the clause tests
+// nothing: PG's reconsider_outer_join_clauses (equivclass.c) removes it and
+// throws back a constant-TRUE clause only so the join keeps a clause. Here
+// the last remaining conjunct is never dropped, which serves the same
+// purpose. TPC-DS Q78's `ws_sold_year = ss_sold_year` is the case: PG merges
+// on item and customer alone, and the year no longer multiplies into the
+// join's selectivity.
+func dropRedundantOnConjuncts(on parser.Expr, redundant map[parser.Expr]bool) parser.Expr {
+	if on == nil || len(redundant) == 0 {
+		return on
+	}
+	cs := splitParserConjuncts(on, nil)
+	var keep []parser.Expr
+	for _, c := range cs {
+		if !redundant[c] {
+			keep = append(keep, c)
+		}
+	}
+	if len(keep) == len(cs) || len(keep) == 0 {
+		return on
+	}
+	return andParserConjuncts(keep)
+}
+
+// pushGroupedItemConjunct pushes c into the grouped items it restricts and
+// reports whether it moved. Nothing is recorded unless every target accepts.
+// used lists the eqs entries (LEFT join ON equalities) through which the
+// constant reached a nullable partner; once the push is recorded each of
+// them compares two columns pinned to the same constant.
+func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQualEq) (used []int, moved bool) {
 	b, ok := c.(*parser.BinaryOp)
 	if !ok {
-		return false
+		return nil, false
 	}
 	switch b.Op {
 	case parser.OpEq, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe, parser.OpNe:
 	default:
-		return false
+		return nil, false
 	}
 	col, colLeft := b.Left.(*parser.ColumnRef)
 	cst := b.Right
 	if !colLeft {
 		col, ok = b.Right.(*parser.ColumnRef)
 		if !ok {
-			return false
+			return nil, false
 		}
 		cst = b.Left
 	}
 	if !pushQualConst(cst) {
-		return false
+		return nil, false
 	}
 	start, ok := resolvePushQualColumn(col, items)
 	if !ok || items[start].nullable {
-		return false
+		return nil, false
 	}
 	// The equality class of the column, reached through eqs.
 	type member struct {
@@ -224,7 +266,7 @@ func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQua
 	for i := 0; i < len(members); i++ {
 		m := members[i]
 		mcol := strings.ToLower(m.col.Column)
-		for _, e := range eqs {
+		for ei, e := range eqs {
 			var other *parser.ColumnRef
 			var opos int
 			switch {
@@ -232,7 +274,7 @@ func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQua
 				// An unresolved equality naming this column may be one of
 				// its partners: decline rather than lose it.
 				if e.acol == mcol || e.bcol == mcol {
-					return false
+					return nil, false
 				}
 				continue
 			case e.apos == m.pos && e.acol == mcol:
@@ -249,17 +291,20 @@ func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQua
 			if b.Op != parser.OpEq {
 				// PG derives nothing from an inequality through an
 				// equivalence class; goopg must not lose what it derives.
-				return false
+				return nil, false
 			}
 			// A partner on a LEFT join's nullable side takes the constant
 			// only through that join's own ON clause, from its preserved
 			// side (reconsider_outer_join_clauses); a nullable member
 			// passes it no further.
 			if items[m.pos].nullable || (items[opos].nullable && e.leftNullable != opos) {
-				return false
+				return nil, false
 			}
 			seen[k] = true
 			members = append(members, member{opos, other})
+			if items[opos].nullable && e.leftNullable == opos {
+				used = append(used, ei)
+			}
 		}
 	}
 	type target struct {
@@ -271,7 +316,7 @@ func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQua
 		x := items[m.pos]
 		inner, ok := groupedBodyColumn(x, m.col)
 		if !ok {
-			return false
+			return nil, false
 		}
 		var e parser.Expr
 		if colLeft {
@@ -284,7 +329,7 @@ func pushGroupedItemConjunct(c parser.Expr, items []*pushQualItem, eqs []pushQua
 	for _, t := range targets {
 		t.x.pushed = append(t.x.pushed, t.expr)
 	}
-	return true
+	return used, true
 }
 
 func pushQualKey(pos int, col string) string {
