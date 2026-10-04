@@ -25614,6 +25614,8 @@ M0146-0001 re-baseline census on the new default arm.
   - Design doc `docs/design/0100\-0149/m0146\-0007\-inline\-cte.md`.
   - Slice 1 landed 2026\-09\-26 as M0146\-0007a \(below\); 0007b and the
     ledgered items remain.
+  - Slice 6 landed 2026\-10\-04 as M0146\-0007f \(multi\-reference
+    `NOT MATERIALIZED`\); the open items are the 2026\-10\-04 ledger row\.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -25699,6 +25701,31 @@ M0146-0001 re-baseline census on the new default arm.
     - `TestExplainSublinkOnlyCTEHoistsToSection` pins it; gates:
       `analysis/m0146/m0146\-0007/slice4/gates.txt`.
   Movement: TPC\-DS Q14 first\-divergence class D6\-cte → D1\-sublink \(SF0.25 census D6\-cte 1 → 0; SF1 fires Q14, classes unchanged\)
+- [x] **M0146\-0007f — a `NOT MATERIALIZED` CTE referenced more than once
+  is inlined into every reference** \(slice 6, impl, done 2026\-10\-04; the
+  design doc\'s open item 2, witnessed by regress `subselect` and `join`\)\.
+  Kind: impl
+  Parent: M0146\-0007
+  - PG\'s inline\_cte copies such a CTE into each reference
+    \(`CTEMaterializeNever`, `cterefcount > 1`\); goopg shared one planned
+    body \(`CTE x` plus CTE Scans\)\.
+  - Gate `inlinesEachReference`, computed when the entry is created
+    \(`eachReferenceInlineGate`\): the single\-reference terms, PG\'s
+    `contain\_outer\_selfref` \(any WorkTableScan in the body\) and,
+    goopg\-only, an uncorrelated body\.
+  - Each reference plans as its own subquery under the CTE\'s declaration
+    scope \(`plannedCTE\.declScope`, `planCTEReferenceAsSubquery`\)\. The
+    FROM\-list pull\-up, the INNER JOIN chain split and the HAVING push take
+    it as they take a single reference\. `cteBodyNamesResolveAsDeclared`
+    declines a pull\-up whose body names would rebind at the reference site\.
+  - Fixed on the way: M0146\-0057\. Found and filed: M0146\-0058, M0146\-0059\.
+  - Tests `TestNotMaterializedCTEInlinesEachReference` and
+    `TestSublinkOverInlinedCTEKeepsBodyWhere` \(both fail on HEAD\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    PASS \(no TPC\-DS query changed at either scale\), ea\-ratchet PASS,
+    regress A/B over 19 planner cases: only `join` \(`ctetable`\) and
+    `subselect` \(the NOT MATERIALIZED pair\) changed, both toward PG\.
+  Movement: none — parity held: TPC\-DS/TPC\-H write no NOT MATERIALIZED CTE; regress join and subselect each move one plan toward PG
 - [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
   them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
   `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).
@@ -27717,6 +27744,70 @@ M0146-0001 re-baseline census on the new default arm.
     vs. smgr nblocks; the VACUUM FSM truncation fix and
     `goopg\_smgr\_ocreate\_recreates\_removed\_files` are the nearest prior
     cases\)\.
+- [x] **M0146\-0057 — WRONG RESULTS: a CTE read inside an IN/EXISTS sublink
+  loses its body\'s WHERE** \(filed and fixed 2026\-10\-04 by M0146\-0007f\)\.
+  `WITH x AS \(SELECT a, b FROM t WHERE b < 5\) SELECT count\(\*\) FROM u
+  WHERE u\.a IN \(SELECT a FROM x x2 WHERE x2\.a % 3 = 0\)` returned 166
+  where PG 18\.3 returns 82; the EXISTS form too\. Introduced by M0146\-0007e
+  \(2026\-09\-29\)\.
+  Kind: bug
+  Parent: M0146\-0007
+  > ## ESCALATION 2026\-10\-04 \(S2\) — a CTE body\'s WHERE dropped under a sublink pull\-up
+  > M0146\-0057 was fixed in the M0146\-0007f commit: 0007f routes more
+  > references through the defective path and could not land without the
+  > fix\. Owner: confirm the in\-slice fix or re\-place the task\.
+  - Cause: `sublinkBodyIsSimple` reads a CTE name as a plain relation\. The
+    body\'s FROM walk \(`bindPulledBodyScope` → `planFromClause`\) then pulls
+    the CTE body up, and its WHERE comes back in `pulledQuals`, which the
+    sublink splice never read\.
+  - Fix: the pulled quals travel with the body\'s ON quals\. A correlated or
+    sublink\-bearing pulled qual declines the pull\-up
+    \(`pulled\-from\-item\-qual`\)\.
+  - Test `TestSublinkOverInlinedCTEKeepsBodyWhere` \(fails on HEAD\)\.
+  Movement: none — correctness fix — no plan instrument \(no TPC\-DS or TPC\-H query reads a CTE inside a pulled sublink; fire set flat\)
+- [ ] **M0146\-0058 — WRONG RESULTS: an ANY sublink whose body the FROM
+  pull\-up flattens loses its WHERE and its target expression** \(filed
+  2026\-10\-04 by M0146\-0007f\)\. With `m7one\(a text\)` holding `x` and `y`,
+  `SELECT count\(\*\) FROM \(VALUES \(\'X\'\), \(\'Y\'\)\) v\(c\) WHERE c IN
+  \(SELECT upper\(a\) FROM m7one WHERE a <> \'x\'\)` returns 0; PG 18\.3
+  returns 1\. The plan is `Hash Right Semi Join  Hash Cond: \(a = c\)` over a
+  bare scan\. Pre\-existing \(HEAD `e4778f046`\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-04 \(S2\) — the ANY\-derived arm drops a pulled body\'s WHERE and target
+  > Filed by M0146\-0007f, not worked\. Owner: place M0146\-0058 in the banner\.
+  - Cause \(read, not yet instrumented\): `pullUpAnyDerivedBody` plans
+    `\(<body>\) AS ANY\_subquery` through `planFromClause`\. Its M0146\-0028
+    pull\-up flattens the body: `upper\(a\)` makes it non\-simple for
+    `sublinkBodyIsSimple` but not for `simpleDerivedPullupBody`\. The node is
+    then the body\'s bare FROM, its WHERE sits unread in
+    `bodyCtx\.pulledQuals`, and with a one\-column table the `len\(out\) != 1`
+    check passes, so the link binds the raw column\.
+  - First step: decline in `pullUpAnyDerivedBody` when `bodyCtx\.pulledDerived`
+    is non\-empty \(or plan the wrap with `derivedPullupOff`\), then pin the
+    query above as a test\.
+- [ ] **M0146\-0059 — WRONG RESULTS: a kept CTE\'s rows survive into the next
+  statement of a PL/pgSQL function** \(filed 2026\-10\-04 by M0146\-0007f\)\.
+  A function that runs `r1 := \(WITH x AS \(SELECT a, b FROM t WHERE b < 5\)
+  SELECT count\(\*\)::text FROM x, x x2 WHERE x\.a = x2\.a\);` and then
+  `r2 := \(WITH x AS \(SELECT b, count\(\*\) c FROM t GROUP BY b\) SELECT
+  string\_agg\(x2\.c::text, \',\' ORDER BY x\.b\) FROM x, x x2 WHERE x\.b =
+  x2\.b\);` reads the first statement\'s rows in the second: PG 18\.3 returns
+  `500/100,100,…` \(ten values\), goopg a 500\-value list `1,2,3,4,0,…`\.
+  Pre\-existing \(HEAD `e4778f046`\)\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-04 \(S2\) — the CTE row cache outlives its statement
+  > Filed by M0146\-0007f, not worked\. Owner: place M0146\-0059 in the banner\.
+  - Cause \(read\): the executor keys a kept CTE\'s rows by `CTEScan\.DeclKey`
+    \(declaration offset plus name\)\. Both statements declare `x` at the same
+    offset and run on one executor Context, so the second scan finds the
+    first\'s buffer\. Two statements on one in\-process `newDDLFixture`
+    Context show it too\. Sibling of M0146\-0050 \(the same cache is not
+    reset across subplan re\-executions\)\.
+  - First step: scope the cache to one statement execution \(clear or re\-key
+    `ctx\.CTERowCache` at the statement boundary the PL/pgSQL executor
+    crosses\), then pin the function above as a test\.
 - [ ] **M0146\-0009q — a CTE Scan over a Finalize aggregate estimates a
   tenth of its CTE\'s rows** \(filed 2026\-10\-04 by M0146\-0005 slice 116\)\.
   TPC\-DS Q59 at SF1: CTE `wss` is `Finalize HashAggregate … rows=62646`

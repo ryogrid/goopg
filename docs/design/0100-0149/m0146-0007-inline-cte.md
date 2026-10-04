@@ -1,7 +1,8 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1-3 landed 2026-09-26; multi-reference
-`NOT MATERIALIZED` and reference-site planning are open.
+Status: slices 1-6 landed (the latest 2026-10-04, M0146-0007f:
+multi-reference `NOT MATERIALIZED`); the items under "Still open" in each
+slice are ledgered.
 
 ## PG behaviour
 
@@ -132,8 +133,8 @@ leaves.
 1. The join pass (`pushSingleSideQualsIntoInnerJoinInputs`) still declines
    at a NestedLoopIndexJoin and stays placement-only across a projection;
    both openings are CTE-path only.
-2. `NOT MATERIALIZED` on a multiply-referenced CTE: PG plans each
-   reference separately; goopg shares one planned body.
+2. (Done in slice 6 below.) `NOT MATERIALIZED` on a multiply-referenced
+   CTE: PG plans each reference separately; goopg shared one planned body.
 3. (FROM-clause references: done in slice 5 below.) The inlined body is still planned once, at the WITH, not at the
    reference site. So it is not pulled up into the parent's join search
    (PG's `pull_up_simple_subquery` for simple bodies), and its
@@ -185,3 +186,127 @@ pull-up. After the pull-up, EXPLAIN qualifies the CTE body's outer key by
 the statement-wide binding table and prints `ss_item_sk` bare, where PG
 prints `store_sales.ss_item_sk`; this is the same cross-level
 SourceTableIdx collision as the M0146-0005as rendering row.
+
+## Slice 6 (M0146-0007f): `NOT MATERIALIZED` inlines every reference
+
+Open item 2 above. PG's `inline_cte` gate (`SS_process_ctes`,
+`./postgres/src/backend/optimizer/plan/subselect.c`) also inlines a CTE
+referenced more than once when it is written `NOT MATERIALIZED`, unless its
+body contains an outer self-reference (`contain_outer_selfref`). Each
+reference then gets its own copy of the body as an ordinary RTE_SUBQUERY,
+which `pull_up_subqueries` may flatten. goopg shared one planned body, and
+EXPLAIN printed `CTE x` plus one CTE Scan per reference. The witnesses are
+regress `subselect` (`with x as not materialized (...) select * from x, x x2
+where x.n = x2.n`) and `join` (`ctetable`, three references).
+
+### The gate
+
+`plannedCTE.eachRef` (`inlinesEachReference`) is computed once, when
+`preplanWithClause` registers the entry (`eachReferenceInlineGate`). That
+way a later sibling's body already inlines its references. Its terms:
+
+- the WITH belongs to a SELECT (`preplanWithClause` now receives the owning
+  statement; INSERT/UPDATE/DELETE pass nil);
+- `NOT MATERIALIZED`;
+- more than one AST reference (`countCTEReferences`, parse analysis'
+  `cterefcount`);
+- no volatile function;
+- no WorkTableScan anywhere in the body, which is `contain_outer_selfref`
+  for a non-recursive body (a recursive CTE nested inside the body
+  over-reports, which only keeps the body shared);
+- an uncorrelated body (`planHasOuterRef`). This term is goopg's own. A
+  reference may sit at a deeper query level than the WITH, and planning the
+  body there would shift its outer-reference levels. PG re-bases them
+  (`IncrementVarSublevelsUp`).
+
+### Where each reference is planned
+
+- **The FROM-list pull-up.** `cteAsDerivedItem` presents the reference as
+  `(<body>) <alias>` to the M0146-0028 pull-up, as for a single reference.
+  `splitInnerJoinChainForPullup` now converts CTE operands the same way, so
+  references inside an INNER JOIN chain are pulled up too (single-reference
+  CTEs included; this was slice 5's first ledgered gap).
+- **The HAVING push.** `newPushQualItem` takes the body, so an outer qual on
+  a grouping column moves below a grouped body's aggregate.
+- **Everything else.** The `planScanRangeVar` CTE arm plans the reference as
+  an ordinary subquery (`planCTEReferenceAsSubquery`): the written body
+  under the reference's alias, with the CTE's column names (the reference's
+  own alias list overrides a prefix).
+
+In every case the preplanned body is dead, so its own references to other
+CTEs are taken back once (`takeBackPulledBodyRefs`).
+
+### Name resolution
+
+A body planned at a reference site resolves its relation names there. That
+scope also sees the CTE itself, later siblings and any WITH nested around
+the reference. In `WITH t AS NOT MATERIALIZED (SELECT … FROM t) SELECT … FROM
+t, t t2`, the body's `t` must stay the table. So:
+
+- every entry records the CTE-name scope it was declared in
+  (`plannedCTE.declScope`: the outer statements' entries and its earlier
+  siblings);
+- `planCTEReferenceAsSubquery` plans the body under that scope;
+- `cteBodyNamesResolveAsDeclared` declines a pull-up when any unqualified
+  relation name in the body would rebind. This also covers single-reference
+  pull-ups, where until now only the overcounted `astRefs` happened to
+  prevent it.
+
+### Found on the way
+
+- **M0146-0057, fixed here (wrong results).** A single-reference CTE read
+  inside an IN or EXISTS sublink lost its body's WHERE:
+  - `sublinkBodyIsSimple` reads a CTE name as a plain relation;
+  - the body's FROM walk (`bindPulledBodyScope` → `planFromClause`) then
+    pulled the CTE body up (slice 5);
+  - its WHERE came back in `pulledQuals`, which the sublink splice never
+    read. PG 18.3 returns 82 on the test data; goopg returned 166.
+
+  Those quals now travel with the body's ON quals. A correlated or
+  sublink-bearing pulled qual declines the pull-up. Slice 6 routes more
+  references through this path, so it could not land without the fix.
+- **M0146-0058, filed.** The ANY-derived arm has a sibling loss that does not
+  involve CTEs: `pullUpAnyDerivedBody` lets the FROM pull-up flatten its
+  wrapped body and then reads neither the body's WHERE nor its target
+  expression.
+- **M0146-0059, filed.** A kept CTE's row cache is keyed by declaration
+  offset and name and outlives the statement. In a PL/pgSQL function, two
+  statements declaring `x` at the same offset share rows.
+
+### Effect
+
+The probe set covered a simple body, a grouped body, a sublink, a JOIN chain,
+nested CTEs, an alias list, the self-named body and the outer self-reference.
+
+- **Shape.** No CTE remains in any of them. The simple, sublink and
+  JOIN-chain shapes print PG's plan exactly. The grouped body pushes `x2.b =
+  3` below its aggregate as PG does; the join method above it (Hash Join vs
+  PG's Nested Loop) is a cost election.
+- **Results.** Every result equals PG's.
+- **TPC-DS and TPC-H** write no `NOT MATERIALIZED` CTE.
+  - The fire set fired no query at either scale.
+  - The sweep passed 96/96 and the TPC-H arm 24/24; tpch-spotcheck and
+    ea-ratchet passed.
+- **Regress A/B** over 19 planner cases: only `join` (`ctetable`: no CTE,
+  three Values scans) and `subselect` (the NOT MATERIALIZED pair: two pulled
+  scans, no CTE) changed, both toward PG.
+
+Tests (both fail on HEAD):
+
+- `TestNotMaterializedCTEInlinesEachReference`: the simple, grouped,
+  JOIN-chain and self-named shapes with PG's values; a CTE written without
+  the keyword and referenced twice stays one CTE.
+- `TestSublinkOverInlinedCTEKeepsBodyWhere`: M0146-0057's IN, EXISTS and
+  NOT MATERIALIZED forms return PG's 82.
+
+Still open (ledgered 2026-10-04):
+
+- an alias-list reference is planned per reference but not pulled up;
+- a CTE read inside a pulled body is not pulled further (the expansion is
+  one level deep);
+- a correlated body stays shared;
+- a qual the substitution makes variable-free (`now() = now()`) stays a
+  merge clause, where PG makes it a One-Time Filter;
+- non-recursive members of a WITH RECURSIVE list never inline;
+- a default CTE read once only inside an inlined body counts each copy's
+  references and stays shared.
