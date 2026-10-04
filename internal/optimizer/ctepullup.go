@@ -253,5 +253,51 @@ func planCTEReferenceAsSubquery(rv parser.RangeVar, e *plannedCTE, alias string,
 		return nil, rangeBinding{}, err
 	}
 	takeBackPulledBodyRefs(e)
+	b.cteRef = true
 	return node, b, nil
+}
+
+// selectTreeHasLocking is contain_dml's row-mark arm over a CTE body: any
+// query level in it (sublinks and nested WITH bodies included) carrying a
+// FOR UPDATE/SHARE clause. Such a CTE is never inlined (SS_process_ctes'
+// `!contain_dml(cte->ctequery)`), so the body runs once and locks every row
+// it returns. An AST too deep to walk reports true, which keeps the CTE.
+func selectTreeHasLocking(s *parser.SelectStmt) bool {
+	found := false
+	var walk func(v reflect.Value, depth int)
+	walk = func(v reflect.Value, depth int) {
+		if found {
+			return
+		}
+		if depth > 512 {
+			found = true
+			return
+		}
+		if !v.IsValid() {
+			return
+		}
+		switch v.Kind() {
+		case reflect.Interface, reflect.Ptr:
+			if v.IsNil() {
+				return
+			}
+			if sel, ok := v.Interface().(*parser.SelectStmt); ok && len(sel.Locking) > 0 {
+				found = true
+				return
+			}
+			walk(v.Elem(), depth+1)
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				if f := v.Field(i); f.CanInterface() {
+					walk(f, depth+1)
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				walk(v.Index(i), depth+1)
+			}
+		}
+	}
+	walk(reflect.ValueOf(s), 0)
+	return found
 }

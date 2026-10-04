@@ -408,8 +408,10 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 			declPos: cte.Pos(),
 			// Plain non-recursive SELECT body: the only shape whose Child
 			// a single-reference qual may descend into. The WITH RECURSIVE
-			// branch above and the DML branch never set this.
-			inlineEligible: true,
+			// branch above and the DML branch never set this, and neither
+			// does a body holding a locking clause (contain_dml counts
+			// row marks as DML, M0146-0007g).
+			inlineEligible: !selectTreeHasLocking(cte.Query),
 			needsScan: !subqueryChainIsSimpleUnionAll(cte.Query) &&
 				derivedSubqueryNeedsScan(cte.Query, body),
 			materialized: cte.Materialized,
@@ -429,7 +431,7 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 		for k, v := range cur {
 			entry.declScope[k] = v
 		}
-		entry.eachRef = eachReferenceInlineGate(owner, cte, body, entry.volatile)
+		entry.eachRef = entry.inlineEligible && eachReferenceInlineGate(owner, cte, body, entry.volatile)
 		cur[strings.ToLower(cte.Name)] = entry
 	}
 	return restore, dmlPlans, nil

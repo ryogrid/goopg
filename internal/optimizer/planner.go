@@ -677,6 +677,12 @@ type rangeBinding struct {
 	// … ON CONFLICT DO UPDATE (excluded is in-scope for DO UPDATE
 	// SET/WHERE but not for RETURNING).
 	notReferenceable bool
+	// cteRef marks a reference to a WITH query, kept as a CTE scan or
+	// inlined (M0146-0007f plans it as a subquery). PG's parse analysis
+	// sees it as RTE_CTE either way, inlining being a planner step, so a
+	// bare FOR UPDATE locks nothing through it and FOR UPDATE OF it is an
+	// error (transformLockingClause). M0146-0007g.
+	cteRef bool
 	// tableOidColIdx, when > 0, holds the relative offset within
 	// this binding's row of the synthetic `tableoid` column. Set
 	// by the planner-side per-leaf Project wrapping in partition
@@ -2653,18 +2659,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// Deleted by C-20b: measured over both corpora and both
 	// GOOPG_PGSHAPED_DP arms, it was reached up to 194 times and moved
 	// nothing, and the plans are byte-identical without it.
+	// M0021-0002 — wrap the SELECT plan in a LockRows node carrying the
+	// resolved per-relation locking intent; the executor consumes Locks to
+	// acquire row-level pessimistic locks before returning rows. A clause
+	// that marks no relation (every FROM item a WITH query, M0146-0007g)
+	// gets no LockRows: PG's query then has no rowMarks.
+	var locks []LockedRel
 	if len(s.Locking) > 0 {
-		// M0021-0002 — wrap the SELECT plan in a LockRows
-		// node carrying the resolved per-relation locking
-		// intent. The executor (Stage A executor lands in
-		// M0021-0003) consumes Locks to acquire row-level
-		// pessimistic locks before returning rows. Until
-		// then the executor refuses to Build a *LockRows so
-		// runtime never silently drops the locking intent.
-		locks, lerr := resolveLockedRels(s, ctx)
+		var lerr error
+		locks, lerr = resolveLockedRels(s, ctx)
 		if lerr != nil {
 			return nil, lerr
 		}
+	}
+	if len(locks) > 0 {
 		// M0129-S6 resjunk-ctid column-path re-enable: wire ctid columns
 		// into leaf scan schemas, then rebase the whole plan's expression
 		// coordinates (rebaseRowMarkPlan — the goopg analogue of PG's
@@ -3023,6 +3031,11 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
 		if len(lc.Targets) == 0 {
 			for _, b := range ctx.bindings {
+				// transformLockingClause's all-rels loop ignores RTE_CTE:
+				// a WITH query's rows are not locked. M0146-0007g.
+				if b.cteRef {
+					continue
+				}
 				emit(b, strength, policy)
 			}
 			continue
@@ -3032,6 +3045,10 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 			if !ok {
 				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
 					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
+			}
+			if b.cteRef {
+				return nil, &PlanError{Pos: lc.Pos(), Code: "0A000",
+					Message: fmt.Sprintf("%s cannot be applied to a WITH query", lockStrengthSQL(lc.Strength))}
 			}
 			emit(b, strength, policy)
 		}
@@ -3059,6 +3076,19 @@ func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 		return LockStrengthForKeyShare
 	}
 	return LockStrengthForUpdate
+}
+
+// lockStrengthSQL is LCS_asString: the clause as written, for messages.
+func lockStrengthSQL(s parser.LockStrength) string {
+	switch s {
+	case parser.LockStrengthForNoKeyUpdate:
+		return "FOR NO KEY UPDATE"
+	case parser.LockStrengthForShare:
+		return "FOR SHARE"
+	case parser.LockStrengthForKeyShare:
+		return "FOR KEY SHARE"
+	}
+	return "FOR UPDATE"
 }
 
 func lockWaitPolicyFromParser(p parser.LockWaitPolicy) LockWaitPolicy {
@@ -4801,7 +4831,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			if ce.inlinesEachReference() && rv.TableSample == nil && len(rv.Columns) <= len(ce.schema) {
 				return planCTEReferenceAsSubquery(rv, ce, alias, cat, sourceIdx, lateralCtx, ps, scope)
 			}
-			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
+			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx, cteRef: true}
 			if ce.isDML {
 				// DML CTE: rows are materialized at runtime in
 				// ctx.MaterializedCTEs; use MaterializedCTEScan.
