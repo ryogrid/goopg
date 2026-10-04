@@ -1,9 +1,9 @@
 # M0146-0010 — the `Materialize` node
 
 Status: landed 2026-09-28 (slices 1–3 of the M0144-0011c sizing). Slice 4
-was re-timed 2026-10-05 (M0146-0010b): the work_mem bound is safe, and its
-default flip is filed as M0146-0010c. The strict executor arm is still
-deferred (M0146-0010a, held). See §7.
+landed 2026-10-05: re-timed by M0146-0010b, and the work_mem bound became
+the default in M0146-0010c. The strict executor arm is still deferred
+(M0146-0010a, held). See §7.
 Spec: [m0144-0011c-materialize-sizing.md](m0144-0011c-materialize-sizing.md) §4.
 
 ## 1. What PG does
@@ -144,3 +144,18 @@ filtered inner once. Re-executing them reads the CTE's 1.19M rows per outer
 row. PG plans those joins as hash joins from its own estimates. So the
 remaining blocker is the outer-row estimate and join method of those CTE
 joins, not an executor gap. M0146-0010a stays held on it.
+
+### The flip (M0146-0010c)
+
+`nlInnerWorkMemEnabled` (`internal/executor/join_nl_stream.go`) is on unless
+`GOOPG_NL_MATERIALIZE_WORK_MEM=0`. That applies both to a plan-elected
+Materialize and to the compat cache over a bare inner. So the nested loop's
+inner cache spills past work_mem as PG's tuplestore does.
+
+- **Test.** `TestNestedLoopInnerCacheSpillsByDefault` fails on HEAD. It runs
+  a 20 × 80 inner join at work_mem = 512 bytes with no opt-in. It requires
+  the cache to spill and the rows to equal the in-memory run.
+- **Gates.** Units and tpch-spotcheck passed, and the TPC-H arm matched
+  24/24. The sweep passed 96/96 with every plan unchanged (99/99) and the
+  total runtime down 10.1% against the previous sweep (Q74's earlier 73 s
+  was the cold reading).

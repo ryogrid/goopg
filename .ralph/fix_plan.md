@@ -26423,7 +26423,7 @@ M0146-0001 re-baseline census on the new default arm.
       `store\_sales` any more \(only over the 12\-row `store`\)\.
     - The flip is filed as M0146\-0010c\.
   Movement: none — recon \(executor memory bound; no plan instrument\)
-- [ ] **M0146\-0010c — bound the nested loop\'s inner Materialize by work\_mem
+- [x] **M0146\-0010c — bound the nested loop\'s inner Materialize by work\_mem
   by default** \(filed 2026\-10\-05 by M0146\-0010b\)\. PG\'s Materialize
   tuplestore spills past work\_mem\. goopg\'s NL inner cache runs unbounded
   unless `GOOPG\_NL\_MATERIALIZE\_WORK\_MEM=1`\. M0146\-0010b measured the
@@ -26436,6 +26436,14 @@ M0146-0001 re-baseline census on the new default arm.
     Gate with the sweep and the TPC\-H arm\.
   - Expected movement: none on plan instruments \(executor memory\)\;
     measured by the sweep runtime band\.
+  - **DONE 2026\-10\-05\.** `nlInnerWorkMemEnabled` is on unless
+    `GOOPG\_NL\_MATERIALIZE\_WORK\_MEM=0`\. Design doc
+    `m0146\-0010\-materialize\-node\.md` §7 \(\"The flip\"\)\.
+    - Test `TestNestedLoopInnerCacheSpillsByDefault` \(fails on HEAD\)\.
+    - Gates: units, tpch\-spotcheck, TPC\-H arm 24/24; sf025 96/96 with
+      plans unchanged \(99/99\) and total runtime \-10\.1%\. The fire set is
+      out of scope \(executor only\)\.
+  Movement: none — executor memory bound; plans unchanged \(sweep PLAN\-SHAPE 99/99 same\)
 - [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
   (recon; M0145-0010's residual). Re-measure the `lateral` decline
   family on the new default arm (2 fires today — Q30/Q68, posthoc
