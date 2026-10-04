@@ -1743,6 +1743,18 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
+	// M0146-0009q: a Finalize aggregate emits the grouped rel's dNumGroups,
+	// which PG estimates once over the ORIGINAL input
+	// (create_partial_grouping_paths and the finalize paths in
+	// postgres/src/backend/optimizer/plan/planner.c share the grouped rel's
+	// rows). Re-estimating over the Gather of partial states sees no column
+	// statistics and falls to the default, a tenth of the input — TPC-DS
+	// Q59's `CTE Scan on wss` read 6265 of the CTE's 62646 groups. The
+	// Partial node's own estimate is exactly the original-input one.
+	if a.Mode == AggModeFinal && a.PartialSource != nil && a.PartialSource != a &&
+		a.PartialSource.Mode != AggModeFinal {
+		return estimateAggregate(a.PartialSource)
+	}
 	// R61: same searched-input sourcing as the search-rel sizing
 	// (`groupCountInputRows`, groupingpaths.go) — EXPLAIN recomputes this
 	// arm off the built tree, which carries no PlanCost stamp, so sizing
