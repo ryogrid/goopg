@@ -1,0 +1,33 @@
+HUNK 40
+--- 
++++ 
+@@ -198,6 +198,7 @@
+   QUERY PLAN
+-----------------------------------------------
+- Subquery Scan on x
++------------------------------------------------
++ CTE Scan on x
+   Filter: (f1 = 1)
+   Output: f1
++  CTE x
+   ->  LockRows
+@@ -206,3 +207,3 @@
+   Output: f1, f2, f3, ctid1
+-(7 rows)
++(8 rows)
+ -- Multiply-referenced CTEs are inlined only when requested
+HUNK 43
+--- 
++++ 
+@@ -32,8 +32,6 @@
+   QUERY PLAN
+-----------------------------------------
+- LockRows
++----------------------------------
++ Seq Scan on public.subselect_tbl
+   Output: f1, f2, f3
+-  ->  Seq Scan on public.subselect_tbl
+-  Output: f1, f2, f3
+-(4 rows)
++(2 rows)
+ -- Pull up direct-correlated ANY_SUBLINKs

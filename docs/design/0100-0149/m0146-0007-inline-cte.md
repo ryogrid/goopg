@@ -1,8 +1,7 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1-6 landed (the latest 2026-10-04, M0146-0007f:
-multi-reference `NOT MATERIALIZED`); the items under "Still open" in each
-slice are ledgered.
+Status: slices 1-7 landed (the latest 2026-10-04, M0146-0007g: row marks
+and WITH queries); the items under "Still open" in each slice are ledgered.
 
 ## PG behaviour
 
@@ -310,3 +309,61 @@ Still open (ledgered 2026-10-04):
 - non-recursive members of a WITH RECURSIVE list never inline;
 - a default CTE read once only inside an inlined body counts each copy's
   references and stays shared.
+
+## Slice 7 (M0146-0007g): row marks and WITH queries
+
+Two regress `subselect` cases sit in the CTE-inlining section: "SELECT FOR
+UPDATE cannot be inlined" and "Row marks are not pushed into CTEs". Both
+follow from PG treating a CTE reference as RTE_CTE during parse analysis;
+inlining is a later planner step.
+
+- **A bare locking clause skips WITH queries.** `transformLockingClause`
+  (`./postgres/src/backend/parser/analyze.c`) loops over the range table and
+  ignores RTE_CTE. So `WITH x AS (SELECT * FROM t) SELECT * FROM x FOR
+  UPDATE` locks nothing, and PG's plan has no LockRows.
+  - goopg emitted a lock for the CTE's synthetic relation and failed at run
+    time with `short read at block`.
+  - Naming a CTE in the OF list is the 0A000 error `FOR UPDATE cannot be
+    applied to a WITH query` (with the clause's own strength). goopg
+    accepted it.
+- **A locking body is never inlined.** `SS_process_ctes` inlines only when
+  `!contain_dml(cte->ctequery)`, and `contain_dml_walker` counts a query with
+  row marks as DML. So a CTE whose body says FOR UPDATE stays a CTE. It runs
+  once and locks every row it returns, whatever the outer query filters.
+  goopg inlined it and printed `Subquery Scan on x`.
+
+### Change
+
+- `rangeBinding.cteRef` marks every CTE reference: a kept CTE Scan, an
+  inlined one, and a reference 0007f plans as a subquery.
+- `resolveLockedRels` skips such a binding under a bare clause and raises the
+  0A000 error for an OF target. `lockStrengthSQL` is `LCS_asString`.
+- A clause that marks no relation leaves the plan without a LockRows.
+- `selectTreeHasLocking` clears `inlineEligible` for a body holding a locking
+  clause at any query level. That turns off the single-reference inlining,
+  the 0007f per-reference inlining, the pull-up and the qual descent.
+
+### Effect
+
+- `WITH x … SELECT * FROM x FOR UPDATE` returns PG's rows with PG's plan, a
+  bare Seq Scan.
+- A two-session check over `x JOIN rm_v … FOR UPDATE` matches PG:
+  - an UPDATE of the CTE's table proceeds;
+  - an UPDATE of `rm_v` waits.
+- Regress A/B over 10 cases: the two `subselect` cases print PG's plan, and
+  nothing else changed.
+- The fire set fired nothing; no TPC-DS or TPC-H query locks rows. The
+  sweep passed 96/96 and the TPC-H arm 24/24; tpch-spotcheck and ea-ratchet
+  passed.
+
+Test: `TestRowMarksAndWithQueries` fails on HEAD with the short read. It
+covers the rows, the absent LockRows, a still-locked joined table, the three
+strengths' error text, and the two locking-body CTEs staying CTEs.
+
+Still open (ledgered 2026-10-04):
+
+- the error cursor sits on `FOR`, where PG points at the OF-list name;
+- the analyzer's locking messages ignore the clause strength;
+- a nested clause that marks only CTEs still blocks inlining;
+- PG keeps `Subquery Scan on ss` over the inner LockRows;
+- EXPLAIN under LockRows prints a Merge Join without its input Sorts.

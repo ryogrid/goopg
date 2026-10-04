@@ -25616,6 +25616,8 @@ M0146-0001 re-baseline census on the new default arm.
     ledgered items remain.
   - Slice 6 landed 2026\-10\-04 as M0146\-0007f \(multi\-reference
     `NOT MATERIALIZED`\); the open items are the 2026\-10\-04 ledger row\.
+  - Slice 7 landed 2026\-10\-04 as M0146\-0007g \(row marks and WITH
+    queries\)\.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -25726,6 +25728,30 @@ M0146-0001 re-baseline census on the new default arm.
     regress A/B over 19 planner cases: only `join` \(`ctetable`\) and
     `subselect` \(the NOT MATERIALIZED pair\) changed, both toward PG\.
   Movement: none — parity held: TPC\-DS/TPC\-H write no NOT MATERIALIZED CTE; regress join and subselect each move one plan toward PG
+- [x] **M0146\-0007g — row marks and WITH queries follow PG** \(slice 7,
+  impl, done 2026\-10\-04; witnessed by regress `subselect`\'s \"SELECT FOR
+  UPDATE cannot be inlined\" and \"Row marks are not pushed into CTEs\"\)\.
+  `WITH x AS \(SELECT \* FROM t\) SELECT \* FROM x FOR UPDATE` failed with
+  `short read at block`; PG returns the rows\.
+  Kind: impl
+  Parent: M0146\-0007
+  - transformLockingClause skips RTE\_CTE under a bare locking clause and
+    raises 0A000 `FOR UPDATE cannot be applied to a WITH query` for an OF
+    target\. goopg emitted a lock on the CTE\'s synthetic relation\. Now
+    `rangeBinding\.cteRef` marks every CTE reference \(kept, inlined, or
+    planned per reference by 0007f\), `resolveLockedRels` skips it or
+    raises the error \(`lockStrengthSQL` is LCS\_asString\), and a clause
+    that marks no relation gets no LockRows\.
+  - contain\_dml counts row marks: a CTE body holding a locking clause at
+    any level \(`selectTreeHasLocking`\) is not inline\-eligible, so it stays
+    a CTE and locks every row it returns\.
+  - Two\-session check: with `FOR UPDATE` over `x JOIN rm\_v`, an UPDATE of
+    the CTE\'s table proceeds and an UPDATE of `rm\_v` waits, as in PG\.
+  - Test `TestRowMarksAndWithQueries` \(fails on HEAD with the short read\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    PASS \(no query fired\), ea\-ratchet PASS, regress A/B \(10 cases\): the
+    two `subselect` cases now print PG\'s plan; nothing else changed\.
+  Movement: none — parity held: no TPC\-DS/TPC\-H query locks rows; regress subselect moves two plans to PG\'s
 - [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
   them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
   `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).

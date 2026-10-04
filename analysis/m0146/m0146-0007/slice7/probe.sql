@@ -1,0 +1,14 @@
+drop table if exists rm_t;
+create table rm_t(f1 int, f2 int); insert into rm_t select g, g from generate_series(1,5) g;
+explain (costs off) with x as (select * from (select f1 from rm_t for update) ss) select * from x where f1 = 1;
+explain (costs off) with x as (select f1 from rm_t for update) select * from x where f1 = 1;
+explain (costs off) with x as (select * from rm_t) select * from x for update;
+explain (costs off) with x as (select * from rm_t) select * from x, rm_t r where x.f1 = r.f1 for update;
+explain (costs off) with x as (select * from rm_t) select * from x, rm_t r where x.f1 = r.f1 for update of r;
+with x as (select * from rm_t) select * from x for update of x;
+explain (costs off) with x as (select * from rm_t) select * from (select * from x) s for update;
+explain (costs off) select * from (select * from rm_t) s for update;
+with x as (select * from rm_t) select * from x for update;
+with x as (select * from rm_t) select * from x, x x2 where x.f1=x2.f1 for share of x;
+with x as not materialized (select * from rm_t) select * from x, x x2 where x.f1=x2.f1 for no key update of x2;
+with x as (select * from rm_t) select * from x, rm_t r where x.f1 = r.f1 for update of zz;
