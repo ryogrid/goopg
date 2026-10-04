@@ -515,6 +515,11 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
 	// admits — which under 03 §4.4's INNER-only pin is all of them.
 	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo, semi)
+	// The materialised inner comes after the parameterised probes, as in
+	// match_unsorted_outer's per-outer order (addMaterialNestLoopPath).
+	if !pathParamByRel(i, outer) {
+		addMaterialNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
+	}
 	// R60 (plan-parity-fix take2): PG's post-serial-arms parallel block runs
 	// `consider_parallel_nestloop` over the same pair irrespective of inner
 	// parameterisation — that is the producer's point — so it sits here

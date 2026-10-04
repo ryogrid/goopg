@@ -318,12 +318,16 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		Kind: PathMemoize,
 		// The wrapper stands for the same relation, the same rows and the same
 		// parameterisation as what it wraps — `create_memoize_path`
-		// (pathnode.c:1690-1698) copies `parent`, `param_info`, `rows` and both
-		// costs from the subpath. Only the RESCAN cost differs, and that is the
-		// number this path exists to carry.
+		// (pathnode.c) copies `parent`, `param_info` and `rows` from the
+		// subpath, and its first-scan costs are the subpath's plus one
+		// cpu_tuple_cost ("a small additional charge for caching the first
+		// entry"). The RESCAN cost is the number this path exists to carry.
+		// The extra startup is what keeps PG's plain parameterised probe,
+		// filed first, the incumbent when its Memoize twin ties it within
+		// STD_FUZZ_FACTOR (TPC-DS Q8's store probe, M0146-0005ea).
 		Rel:           innerPath.Rel,
 		Rows:          innerPath.Rows,
-		Cost:          innerPath.Cost,
+		Cost:          Cost{Startup: innerPath.Cost.Startup + cp.cpuTupleCost, Total: innerPath.Cost.Total + cp.cpuTupleCost},
 		Pathkeys:      innerPath.Pathkeys,
 		RequiredOuter: innerPath.RequiredOuter,
 		Children:      []*Path{innerPath},

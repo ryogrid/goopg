@@ -180,36 +180,54 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // `create_unique_path`'s own "can't unique-ify, return NULL" contract.
 func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	i := inner.CheapestTotal
-	var matpath *Path
 	if uniq == uniqueSideInner {
-		// JOIN_UNIQUE_INNER substitutes the unique-ified cheapest inner — and
-		// is the `if` arm PG's matpath `else if` chain excludes
-		// (joinpath.c:1883-1901): no Material over a unique'd inner.
+		// JOIN_UNIQUE_INNER substitutes the unique-ified cheapest inner.
 		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
-	} else {
-		matpath = materialInnerPathFor(i, inner, cp)
 	}
 	if i == nil {
 		return
 	}
-	// M0146-0005m: match_unsorted_outer's outer loop — every unparameterised
-	// outer path, so an ordered non-cheapest outer yields an ordered nested
-	// loop. The JOIN_UNIQUE_OUTER case keeps its single cheapest-total outer.
-	outers := []*Path{outer.CheapestTotal}
-	if uniq != uniqueSideOuter {
-		outers = nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
-	}
-	for _, o := range outers {
-		if o == nil {
-			continue
-		}
-		// PG's inner pair per outer (joinpath.c:1924-1930): the bare inner
-		// first, then its materialised form when one exists.
+	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
 		addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
-		if matpath != nil {
-			addNestLoopPathFor(joinRel, outer, inner, o, matpath, cp, jt, quals, sjinfo, semi)
-		}
 	}
+}
+
+// addMaterialNestLoopPath files the nested loop over the materialised
+// cheapest inner — match_unsorted_outer's `matpath` (joinpath.c:1883-1901,
+// built by create_material_path, gated by enable_material and
+// ExecMaterializesOutput in materialInnerPathFor). It is a separate call
+// because PG offers it LAST for each outer path, after the
+// cheapest_parameterized_paths loop that yields the bare inner AND the
+// parameterised index probes (:1924-1971): a probe that ties the matpath
+// within STD_FUZZ_FACTOR is then PG's incumbent, and add_path keeps it
+// (M0146-0005dx1: TPC-DS Q10's customer_address probe ties its
+// Materialize(Seq Scan) at a total near 2.2e7 and, under LIMIT's
+// consider_startup, the tight-fuzz comparison is COSTS_DIFFERENT, so the
+// first-filed path wins). The caller therefore runs it after addNLIPaths.
+// A unique-ified inner gets no Material — the `if` arm PG's matpath
+// `else if` chain excludes.
+func addMaterialNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
+	if uniq == uniqueSideInner {
+		return
+	}
+	matpath := materialInnerPathFor(inner.CheapestTotal, inner, cp)
+	if matpath == nil {
+		return
+	}
+	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
+		addNestLoopPathFor(joinRel, outer, inner, o, matpath, cp, jt, quals, sjinfo, semi)
+	}
+}
+
+// nestLoopPlainOuters is match_unsorted_outer's outer loop for the plain
+// nested loop (M0146-0005m): every unparameterised outer path, so an ordered
+// non-cheapest outer yields an ordered nested loop. The JOIN_UNIQUE_OUTER
+// case keeps its single cheapest-total outer.
+func nestLoopPlainOuters(outer *RelOptInfo, uniq uniqueSide, cp costParams) []*Path {
+	if uniq == uniqueSideOuter {
+		return []*Path{outer.CheapestTotal}
+	}
+	return nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
 }
 
 // addNestLoopPathFor files the plain nested loop for one (outer, inner) path

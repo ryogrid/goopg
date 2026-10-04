@@ -250,11 +250,13 @@ func TestGetMemoizePathGates(t *testing.T) {
 		if p.Kind != PathMemoize || p.MemoizeInfo == nil {
 			t.Fatalf("got kind %v, MemoizeInfo %v", p.Kind, p.MemoizeInfo)
 		}
-		// `create_memoize_path` copies the subpath's own costs (pathnode.c:1690)
-		// — the FIRST execution is a guaranteed miss and costs a full probe.
-		// Only the rescan differs.
-		if p.Cost != ip.Cost || p.Rows != ip.Rows || p.RequiredOuter != ip.RequiredOuter {
-			t.Fatalf("wrapper must carry the subpath's cost/rows/parameterisation, got %+v", p)
+		// `create_memoize_path` (pathnode.c) charges the subpath's own costs
+		// plus one cpu_tuple_cost for caching the first entry — the FIRST
+		// execution is a guaranteed miss and costs a full probe. The rescan
+		// is the cheap part (M0146-0005ea).
+		want := Cost{Startup: ip.Cost.Startup + cp.cpuTupleCost, Total: ip.Cost.Total + cp.cpuTupleCost}
+		if p.Cost != want || p.Rows != ip.Rows || p.RequiredOuter != ip.RequiredOuter {
+			t.Fatalf("wrapper must carry the subpath's cost + cpu_tuple_cost, rows and parameterisation, got %+v", p)
 		}
 		if pathRescanTotal(p) >= pathRescanTotal(ip) {
 			t.Fatalf("rescan %.4f not below the bare probe's %.4f", pathRescanTotal(p), pathRescanTotal(ip))
