@@ -1,0 +1,68 @@
+=== Q44
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=294659.64..296263.47 rows=66 width=3836)
+   ->  Nested Loop  (cost=294659.64..296263.47 rows=66 width=3836)
+         ->  Nested Loop  (cost=294651.39..295453.96 rows=66 width=1930)
+               ->  Merge Join  (cost=294643.13..294644.45 rows=66 width=24)
+                     Merge Cond: (rnk = rnk)
+                     ->  WindowAgg  (cost=147313.63..147314.95 rows=66 width=44)
+                           Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+                           Run Condition: (rank() OVER w1 < 11)
+                           ->  Sort  (cost=147313.63..147314.29 rows=66 width=36)
+                                 Sort Key: rank_col
+                                 ->  Finalize HashAggregate  (cost=147104.62..147310.98 rows=66 width=36)
+                                       Group Key: ss1.ss_item_sk
+                                       Filter: (avg(ss1.ss_net_profit) > (0.9 * (InitPlan 1).col1))
+                                       InitPlan 1
+                                         ->  Finalize GroupAggregate  (cost=69838.60..69878.25 rows=6 width=36)
+                                               Group Key: store_sales.ss_store_sk
+                                               ->  Gather Merge  (cost=70171.50..70171.62 rows=6 width=36)
+                                                     Workers Planned: 4
+                                                     ->  Partial GroupAggregate  (cost=70171.50..70171.56 rows=6 width=36)
+                                                           Group Key: store_sales.ss_store_sk
+                                                           ->  Sort  (cost=69928.03..70122.81 rows=19478 width=212)
+                                                                 Sort Key: store_sales.ss_store_sk
+                                                                 ->  Parallel Seq Scan on store_sales  (cost=0.00..68540.26 rows=4870 width=212)
+                                                                       Filter: ((ss_hdemo_sk IS NULL) AND (ss_store_sk = 4))
+                                       ->  Gather  (cost=69678.02..70007.14 rows=16456 width=36)
+                                             Workers Planned: 4
+                                             ->  Partial HashAggregate  (cost=69678.02..69842.58 rows=16456 width=36)
+                                                   Group Key: ss1.ss_item_sk
+                                                   ->  Parallel Seq Scan on store_sales ss1  (cost=0.00..68540.26 rows=113776 width=212)
+                                                         Filter: (ss_store_sk = 4)
+                     ->  WindowAgg  (cost=147313.63..147314.95 rows=66 width=44)
+                           Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+                           Run Condition: (rank() OVER w1 < 11)
+                           ->  Sort  (cost=147313.63..147314.29 rows=66 width=36)
+                                 Sort Key: rank_col DESC
+                                 ->  Finalize HashAggregate  (cost=147104.62..147310.98 rows=66 width=36)
+                                       Group Key: ss1_1.ss_item_sk
+                                       Filter: (avg(ss1_1.ss_net_profit) > (0.9 * (InitPlan 2).col1))
+                                       InitPlan 2
+                                         ->  Finalize GroupAggregate  (cost=69838.60..69878.25 rows=6 width=36)
+                                               Group Key: store_sales_1.ss_store_sk
+                                               ->  Gather Merge  (cost=70171.50..70171.62 rows=6 width=36)
+                                                     Workers Planned: 4
+                                                     ->  Partial GroupAggregate  (cost=70171.50..70171.56 rows=6 width=36)
+                                                           Group Key: store_sales_1.ss_store_sk
+                                                           ->  Sort  (cost=69928.03..70122.81 rows=19478 width=212)
+                                                                 Sort Key: store_sales_1.ss_store_sk
+                                                                 ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..68540.26 rows=4870 width=212)
+                                                                       Filter: ((ss_hdemo_sk IS NULL) AND (ss_store_sk = 4))
+                                       ->  Gather  (cost=69678.02..70007.14 rows=16456 width=36)
+                                             Workers Planned: 4
+                                             ->  Partial HashAggregate  (cost=69678.02..69842.58 rows=16456 width=36)
+                                                   Group Key: ss1_1.ss_item_sk
+                                                   ->  Parallel Seq Scan on store_sales ss1_1  (cost=0.00..68540.26 rows=113776 width=212)
+                                                         Filter: (ss_store_sk = 4)
+               ->  Bitmap Heap Scan on item i1  (cost=8.26..12.27 rows=1 width=1906)
+                     Recheck Cond: (i_item_sk = item_sk)
+                     ->  Bitmap Index Scan on item_pkey  (cost=0.25..8.26 rows=1 width=1906)
+                           Index Cond: (i_item_sk = item_sk)
+         ->  Bitmap Heap Scan on item i2  (cost=8.26..12.27 rows=1 width=1906)
+               Recheck Cond: (i_item_sk = item_sk)
+               ->  Bitmap Index Scan on item_pkey  (cost=0.25..8.26 rows=1 width=1906)
+                     Index Cond: (i_item_sk = item_sk)
+(63 rows)
+

@@ -25602,7 +25602,7 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress A/B\.
     - Design `docs/design/0100\-0149/m0146\-0006\-incremental\-sort\-election\.md`\.
   Movement: none — fire set flat; regress aggregates moved both ways
-- [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
+- [!] **M0146-0007 — `inline_cte` single-reference CTE inlining**
   (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
   non-recursive CTE is inlined into the jointree so its quals and
   statistics reach the search — divergence class D6. Operates on the
@@ -25621,6 +25621,32 @@ M0146-0001 re-baseline census on the new default arm.
   - Slice 8 landed 2026\-10\-04 as M0146\-0007h \(pseudoconstant function
     quals gate their scope\)\.
   - Slice 9 landed 2026\-10\-04 as M0146\-0007i \(nested pull\-up\)\.
+  > ## ESCALATION 2026\-10\-04 \(S4 lineage budget\) — M0146\-0007 held \[\!\]
+  > The five most recent completed descendants \(0007f, 0057, 0007g, 0007h,
+  > 0007i\) all carry `Movement: none`\. Each one was a real PG\-fidelity
+  > port with a regress witness:
+  > - 0007f: NOT MATERIALIZED inlined per reference;
+  > - 0057: a wrong\-results fix;
+  > - 0007g: row marks and WITH queries;
+  > - 0007h: pseudoconstant function gating;
+  > - 0007i: nested pull\-up\.
+  >
+  > None can move an S3 instrument\. TPC\-DS and TPC\-H write no NOT
+  > MATERIALIZED CTE, lock no rows, carry no function\-only pseudoconstant,
+  > and nest no simple subquery, so the fire set was flat for all five\.
+  > - **What each step proved:** the inline\_cte gate, its reference\-site
+  >   planning and its row\-mark rules now follow PG on every regress
+  >   witness found; the D6\-cte census record count is 0 at both scales\.
+  > - **Blocker:** no remaining residue has a TPC\-DS or TPC\-H witness\.
+  >   The open items are the 2026\-10\-04 ledger rows \(0007f–0007i\): star
+  >   targets in pulled bodies, alias\-list pull\-up, correlated per\-reference
+  >   bodies, constant\-FALSE dummy rels, immutable folding, and others\.
+  > - **Expected movement if reopened:** regress `subselect` and `with` plan
+  >   text only; no TPC\-DS category\.
+  > - **Size:** each item is a one\-loop slice\.
+  >
+  > Owner: reopen \(or re\-pin a LINEAGE\-BASELINE\) to continue regress
+  > fidelity here, or leave it held\.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -27893,7 +27919,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: scope the cache to one statement execution \(clear or re\-key
     `ctx\.CTERowCache` at the statement boundary the PL/pgSQL executor
     crosses\), then pin the function above as a test\.
-- [ ] **M0146\-0009q — a CTE Scan over a Finalize aggregate estimates a
+- [x] **M0146\-0009q — a CTE Scan over a Finalize aggregate estimates a
   tenth of its CTE\'s rows** \(filed 2026\-10\-04 by M0146\-0005 slice 116\)\.
   TPC\-DS Q59 at SF1: CTE `wss` is `Finalize HashAggregate … rows=62646`
   over Gather, yet `CTE Scan on wss` estimates rows=6265; PG reads 62640
@@ -27907,6 +27933,25 @@ M0146-0001 re-baseline census on the new default arm.
     CTE body \(`cte_stats_synthesis\.go` / the CTE leaf sizing\) and what it
     reads for a Final\-mode aggregate \(the /10 is the multi\-column
     `estimate\_num\_groups` clamp, or a partial count\)\.
+  - **DONE 2026\-10\-04.** Design doc
+    `docs/design/0100\-0149/m0146\-0009q\-finalize\-aggregate\-rows\.md`;
+    evidence `analysis/m0146/m0146\-0009q/`\.
+    - Cause: `estimateAggregate` re\-estimated a Finalize node over the
+      Gather of partial states, where the two\-key grouping finds no column
+      statistics \(default: a tenth\)\. EXPLAIN\'s Finalize line used the
+      plan\-time stamp, so only `EstimateRows` consumers \(the CTE Scan\)
+      saw 6265\.
+    - Fix: a Final\-mode aggregate answers with its `PartialSource`\'s
+      estimate, PG\'s dNumGroups over the original input\.
+    - Q59 SF1 now reads PG\'s 62646/3759; its first divergence is a
+      join\-method election at the same depth \(routed to M0146\-0014\)\.
+      Q44 SF1\'s top join is PG\'s Merge Join \(first divergence
+      join\-method → parameterisation, B8\)\.
+    - Test `TestCTEScanOverFinalizeAggregateReadsItsRows` \(fails on HEAD\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+      PASS \(Q44 Q59 fired, no timeout introduced\), ea\-ratchet PASS,
+      regress A/B 9 cases \(known `join` flip only\)\.
+  Movement: none — CATEGORIES\-EXCL\-MATCH SF1 moved within ±3 \(parameterisation 32→33, parallelism 45→44, qual\-placement 11→10, rendering 13→12\); match 33→33
 - [ ] **M0146\-0009r — a range restriction is estimated differently on two
   paths of one relation** \(filed 2026\-10\-04 by M0146\-0006\)\. Regress
   `aggregates`\' `agg\_sort\_order` \(100 rows, `c1` pkey, `c2` unique\):

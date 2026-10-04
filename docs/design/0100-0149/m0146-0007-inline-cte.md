@@ -1,7 +1,8 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1-9 landed (the latest 2026-10-04, M0146-0007i: nested
-pull-up); the items under "Still open" in each slice are ledgered.
+Status: held [!] (2026-10-04, S4 lineage budget: the last five descendants
+moved no S3 instrument). Slices 1-9 landed; the items under "Still open" in
+each slice are ledgered.
 
 ## PG behaviour
 
