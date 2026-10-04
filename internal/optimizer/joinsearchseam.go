@@ -867,6 +867,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
+	// M0146-0012a slice A: a correlated scalar sublink whose outer
+	// references name another relation makes its clause a join clause.
+	preLowerSpanningScalarSublinks(conjuncts, spans, ctx)
 	searchConjuncts, locals := partitionConjunctsForJoinPlanningScoped(conjuncts, spans, ctx.scalarSublinkBody)
 	// M0146-0005 slice 4: PG's extract_restriction_or_clauses — redundant
 	// base restrictions derived from join OR clauses, before the leaves are

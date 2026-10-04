@@ -250,7 +250,9 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 		if bin, isBin := e.(*BinaryOp); isBin && bin.Op == parser.OpEq {
 			lr, lok := relidsOfExpr(bin.Left, spans)
 			rr, rok := relidsOfExpr(bin.Right, spans)
-			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) {
+			// M0146-0012a: a sublink-bearing equality is a residual, never a
+			// hash/merge key (exprCarriesSublink).
+			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) && !exprCarriesSublink(e) {
 				ri.isEquijoin = true
 				ri.leftKey, ri.rightKey = bin.Left, bin.Right
 				ri.leftRelids, ri.rightRelids = lr, rr

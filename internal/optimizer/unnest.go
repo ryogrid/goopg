@@ -2412,8 +2412,29 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
 		return &cl
 	default:
+		// Every other kind (IS NULL, LIKE, COALESCE, row and array
+		// constructors, …) is copied through the generic driver so the
+		// clone shares no node with the original. cloneExprLeaf returns
+		// these kinds as-is, and a later in-place pass over the clone
+		// (keptRebase's ExecParamRef rewrite, M0146-0012a) then rewrote the
+		// original too: regress join's `ss.y IS NOT NULL` kept a `$-1`
+		// sentinel in the plan a declined pre-lowering left behind. No
+		// OuterColumnRef in these kinds is replaced — exactly as when they
+		// were shared — so callers' remaining-ref checks see the same refs.
+		if out, ok := cloneExprRefs(x, scopeIgnore, exprRewriter{Rewrite: cloneNestedSublinkPlan}); ok {
+			return out
+		}
 		return cloneExprLeaf(x)
 	}
+}
+
+// cloneNestedSublinkPlan gives a cloned sublink node its own copy of its
+// inner plan (cloneExprRefs aliases inner plans).
+func cloneNestedSublinkPlan(n Expr) Expr {
+	if h := handleFor(n); h != nil {
+		h.setPlan(clonePlanVerbatimOrShare(h.plan))
+	}
+	return n
 }
 
 // clonePlanVerbatimOrShare structurally clones a nested sublink's inner

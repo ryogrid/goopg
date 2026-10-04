@@ -604,7 +604,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
 			if q, _, applies := renderedParamQual(n); applies && q != nil {
+				restoreRow := reg.enterParamRow(n)
 				walkPlanFiltered(c, childIndent, rows, opts, q, c, reg)
+				restoreRow()
 				continue
 			}
 		}
@@ -747,9 +749,12 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// owner's slot merely because the statement-wide IDs happen to
 				// share a number.
 				var prevParamSources map[int]*optimizer.ColumnRef
+				var prevParamOwner optimizer.Node
 				if reg != nil {
 					prevParamSources = reg.execParamSources
 					reg.execParamSources = subPlanExecParamSources(sp.expr)
+					prevParamOwner = reg.execParamOwner
+					reg.execParamOwner = sp.paramOwner
 				}
 				// A sublink body brings its own range-table entries
 				// (Q30's `ctr2` lives only inside SubPlan 1), and they
@@ -772,6 +777,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				render(sp.plan, len(detailIndent)/2+1)
 				if reg != nil {
 					reg.execParamSources = prevParamSources
+					reg.execParamOwner = prevParamOwner
 				}
 			}
 		}
@@ -3080,6 +3086,12 @@ type subPlanReg struct {
 	// bare is resolved positionally through the child that produced it
 	// (explainNames.joinResidualColumn, M0146-0005as).
 	joinRow optimizer.Node
+	// paramRow is the parameterised nested loop whose inner side prints with
+	// its param qual rendered (walkPlanFiltered's renderedParamQual arm). A
+	// sublink in that inner's Filter evaluates its PARAM_EXEC Args against
+	// the loop's merged row (M0146-0012a), so subPlanEntry.paramOwner takes
+	// this node; nothing else reads it.
+	paramRow optimizer.Node
 	// hashMemLimit is the session's hash_mem in bytes (work_mem *
 	// hash_mem_multiplier), which decides whether a SubPlan renders as
 	// `hashed` (subPlanUsesHashTable). 0 means unknown: the defaults.
@@ -3131,6 +3143,9 @@ type subPlanReg struct {
 	// must not see their parent's slot sources. Only direct ColumnRef Args
 	// enter the map; forwarded params and every doubtful shape retain `$N`.
 	execParamSources map[int]*optimizer.ColumnRef
+	// execParamOwner, when set, is where execParamSources resolve instead of
+	// the ancestor (subPlanEntry.paramOwner); body-scoped like the map.
+	execParamOwner optimizer.Node
 }
 
 // subPlanExecParamSources extracts the PARAM_EXEC sources supplied by one
@@ -3168,6 +3183,12 @@ func subPlanExecParamSources(e optimizer.Expr) map[int]*optimizer.ColumnRef {
 			return nil
 		}
 		source, ok := args[i].(*optimizer.ColumnRef)
+		if oc, outer := args[i].(*optimizer.OuterColumnRef); outer && oc != nil && oc.Level == 1 {
+			// A parameterised nested loop's inner carries an outer-side
+			// Arg as its NestLoop param (M0146-0012a): the column is named
+			// the same way, and resolves in the loop (paramOwner).
+			source, ok = &optimizer.ColumnRef{Index: oc.Index, Name: oc.Name, Type: oc.Type, SourceTableIdx: oc.SourceTableIdx}, true
+		}
 		if !ok || source == nil {
 			return nil
 		}
@@ -3342,7 +3363,11 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 	if source == nil {
 		return fallback
 	}
-	if qualified := resolveExecParamSourceInOwner(reg.rel, reg.ancestorNode(), source); qualified != "" {
+	owner := reg.ancestorNode()
+	if reg.execParamOwner != nil {
+		owner = reg.execParamOwner
+	}
+	if qualified := resolveExecParamSourceInOwner(reg.rel, owner, source); qualified != "" {
 		return qualified
 	}
 	return fallback
@@ -3380,6 +3405,17 @@ func (r *subPlanReg) enter(n optimizer.Node) func() {
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
+// enterParamRow sets paramRow to n for the duration of the returned restore
+// (nil-receiver safe).
+func (r *subPlanReg) enterParamRow(n optimizer.Node) func() {
+	if r == nil {
+		return func() {}
+	}
+	prev := r.paramRow
+	r.paramRow = n
+	return func() { r.paramRow = prev }
+}
+
 // enterParamInner makes a parameterised nested loop's outer input the
 // ancestor while its inner side prints, and returns the restore. An outer
 // reference in the inner scan's Index Cond is PG's NestLoop param, which
@@ -3474,6 +3510,11 @@ type subPlanEntry struct {
 	n    int
 	expr optimizer.Expr
 	plan optimizer.Node
+	// paramOwner is the row its PARAM_EXEC Args were evaluated against when
+	// the sublink sits in a join's residual or a parameterised inner's
+	// Filter (M0146-0012a): the join, or the loop's outer input. The body
+	// renders after that context is gone, so it is captured at assignment.
+	paramOwner optimizer.Node
 }
 
 // assign returns the SubPlan number already given to e, or
@@ -3504,7 +3545,16 @@ func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed 
 		n = r.lastID
 	}
 	r.num[e] = n
-	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan})
+	var owner optimizer.Node
+	switch {
+	case r.paramInner:
+		owner = r.ancestor
+	case r.joinRow != nil:
+		owner = r.joinRow
+	case r.paramRow != nil:
+		owner = r.paramRow
+	}
+	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan, paramOwner: owner})
 	return n
 }
 
@@ -5201,7 +5251,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 				// The moved part's rejections are the inner scan's
 				// `Rows Removed by Filter` (M0146-0005aj).
 				removed, _ := splitParamQualRejections(n, stats[n])
+				restoreRow := reg.enterParamRow(n)
 				walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, q, c, removed, reg)
+				restoreRow()
 				continue
 			}
 		}
