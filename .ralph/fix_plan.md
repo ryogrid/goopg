@@ -22275,7 +22275,7 @@ M0146-0001 re-baseline census on the new default arm.
       1/2/4 under `\-race` for the memoized fused NLI under Gather —
       the per\-shape identity pin the milestone\'s admission rule
       requires \(claim topology was already pinned\).
-- [ ] **M0146-0005 — join-order / candidate-pool divergence burn-down**
+- [x] **M0146-0005 — join-order / candidate-pool divergence burn-down**
   (impl). The largest residual category (~90 SF0.25 `join-order`
   records): work the per-family decomposition M0146-0001's census
   produces — owns Q8's `depth=3` join-order residue (M0144-0011b) and
@@ -22495,6 +22495,22 @@ M0146-0001 re-baseline census on the new default arm.
       It makes TPC\-DS Q47 time out \(310 s\): a nested loop over `CTE Scan`
       with a 1\-row inner merge join, costed as cached, where PG
       merge\-joins over `Materialize`.
+  - **Slice 116 \(routing refresh, 2026\-10\-04, HEAD `6817d5610`\) — DONE,
+    root closes\.** `analysis/m0146/m0146\-0005/routing\-20261004b/ROUTING\.md`\.
+    - Both scales re\-captured \(SF0\.25 match 42, SF1 33\); first\-divergence
+      re\-run on slice 115\'s captures and diffed — only Q10, Q47, Q57 \(now
+      MATCH\), Q67, Q69, Q26 SF1 and Q59 SF1 moved\.
+    - Re\-routed the records of the closed/held slice\-115 families: SORT
+      → M0146\-0006 \(Q4/Q11/Q35/Q78 at SF0\.25\); B8 → M0145\-0008ag \(Q44\);
+      COSTTIE → M0146\-0014 \(Q69 SF0\.25, Q26 SF1\); STATS → M0146\-0009
+      \(Q78 SF1\); GSETS → M0146\-0020b \(Q18 SF1\); SUBQSCAN → M0146\-0026
+      \(Q67\); PARTIAL → M0146\-0027 \(Q72\); HASHSPILL → M0141\-S2a\-fix2r\-a
+      \(Q4/Q11 SF1\); RELPAGES → owner SF1 reload \(Q22 SF1\)\.
+    - New: M0146\-0009q \(Q59 SF1: a CTE Scan over a Finalize aggregate
+      estimates a tenth of its CTE\'s rows\)\.
+    - Every non\-matching record now has a named target — the banner\'s
+      closing condition; M0146\-0006 is released\.
+  Movement: none — routing census only, no code change
 - [x] **M0146\-0005a — goopg elects a cached\-inner nested loop over CTE
   scans where PG merge\-joins \(TPC\-DS Q47\)** \(filed 2026\-09\-25 by
   M0146\-0005 slice 5\): with stats\-less hash keys given PG\'s 0.1 bucket, Q47\'s
@@ -27679,3 +27695,17 @@ M0146-0001 re-baseline census on the new default arm.
     vs. smgr nblocks; the VACUUM FSM truncation fix and
     `goopg\_smgr\_ocreate\_recreates\_removed\_files` are the nearest prior
     cases\)\.
+- [ ] **M0146\-0009q — a CTE Scan over a Finalize aggregate estimates a
+  tenth of its CTE\'s rows** \(filed 2026\-10\-04 by M0146\-0005 slice 116\)\.
+  TPC\-DS Q59 at SF1: CTE `wss` is `Finalize HashAggregate … rows=62646`
+  over Gather, yet `CTE Scan on wss` estimates rows=6265; PG reads 62640
+  \(the CTE\'s rows, `set_cte_pathlist` → the subroot\'s final rel\)\. At
+  SF0\.25, where the CTE is a plain HashAggregate, the scan reads 62646\.
+  Q59 SF1\'s first divergence \(qual\-placement at the top Nested Loop\)
+  sits above it\.
+  Kind: impl
+  Parent: M0146\-0009
+  - First step: find where the CTE scan\'s row estimate is taken from the
+    CTE body \(`cte_stats_synthesis\.go` / the CTE leaf sizing\) and what it
+    reads for a Final\-mode aggregate \(the /10 is the multi\-column
+    `estimate\_num\_groups` clamp, or a partial count\)\.

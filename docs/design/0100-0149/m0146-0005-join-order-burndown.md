@@ -1,6 +1,6 @@
 # M0146-0005: join-order / candidate-pool divergence burn-down
 
-Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner. Earlier: **IN PROGRESS**. Slice 1 landed 2026-09-25 (`23edfda2e`); slice 2 landed
+Status: **DONE 2026-10-04** — the M0146-0005 root closed with slice 116: every first-divergence record at both scales routes to a named task (`analysis/m0146/m0146-0005/routing-20261004b/ROUTING.md`). Re-opened 2026-10-03 after the S4 hold (owner). Earlier: **IN PROGRESS**. Slice 1 landed 2026-09-25 (`23edfda2e`); slice 2 landed
 2026-09-25 (`2962ae22d`). Task:
 `.ralph/fix_plan.md` M0146-0005 (Kind: impl, Parent: none). Evidence:
 `analysis/m0146/m0146-0005/`.

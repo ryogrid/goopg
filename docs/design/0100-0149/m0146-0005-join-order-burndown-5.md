@@ -1,6 +1,6 @@
 # M0146-0005 (part 5): slices 71+ — index-only coverage and the needed set
 
-Status: **HELD 2026-10-03** — the M0146-0005 root is `[!]` under the S4 lineage budget (five consecutive `Movement: none`: 0005dn, do, dt, dr, ds); escalation block in `.ralph/fix_plan.md`, awaiting the owner.
+Status: **DONE 2026-10-04** — the M0146-0005 root closed with slice 116: every first-divergence record at both scales routes to a named task (`analysis/m0146/m0146-0005/routing-20261004b/ROUTING.md`). Re-opened 2026-10-03 after the S4 hold (owner).
 
 Continuation of [m0146-0005-join-order-burndown-4.md](m0146-0005-join-order-burndown-4.md)
 (slices 56-70), split per the design-doc size rule (D3). Same task and census
