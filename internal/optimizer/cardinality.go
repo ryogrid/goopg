@@ -108,12 +108,12 @@ func EstimateRows(n Node) int64 {
 		if len(keys) == 0 {
 			keys = x.RangePrefix
 		}
-		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *IndexOnlyScan:
 		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
 		// without the join search: planner.go's sort-avoidance rewrite builds
 		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
-		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *Values:
 		return int64(len(x.Rows))
 	case *Filter:
@@ -306,7 +306,7 @@ func indexKeyEnforced(c Expr, idx *catalog.Index, key Expr, keys []Expr) bool {
 func bitmapHeapScanRows(x *BitmapHeapScan) int64 {
 	var rows int64
 	if bi, ok := x.Outer.(*BitmapIndexScan); ok && bi.Index != nil {
-		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, nil, nil)
+		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, nil, nil, 0, 0)
 	} else if x.Table != nil {
 		rows = seqScanRows(&SeqScan{Table: x.Table})
 	}
@@ -803,7 +803,7 @@ func seqScanRows(x *SeqScan) int64 {
 // DEFAULT_INEQ_SEL per range bound. A unique index fully bound by equality
 // still returns 1, which is both correct and what keeps the common PK probe
 // unchanged.
-func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr, lowKey, highKey Expr) int64 {
+func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr, lowKey, highKey Expr, lowOp, highOp parser.OpCode) int64 {
 	relRows := tableRows(tbl)
 	keyed := key != nil || len(keys) > 0
 	bounded := lowKey != nil || highKey != nil
@@ -842,14 +842,16 @@ func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr
 		// its distinct count be read at all — see `variableNumDistinct`.
 		sel *= varEqNonConstSelectivity(cs, float64(relRows))
 	}
-	// PG charges DEFAULT_INEQ_SEL per unmatched inequality bound
-	// (selfuncs.h); a two-sided range therefore lands near its
-	// DEFAULT_RANGE_INEQ_SEL neighbourhood without needing histograms here.
-	if lowKey != nil {
-		sel *= defaultIneqSel
-	}
-	if highKey != nil {
-		sel *= defaultIneqSel
+	// M0146-0009r: the range bounds are index quals, and btcostestimate
+	// scores them with clauselist_selectivity — scalarineqsel over the
+	// column's histogram, the two bounds paired into one band
+	// (clausesel.c). The fixed DEFAULT_INEQ_SEL per bound read `c2 < 100`
+	// on a 100-row column as 33 rows where PG reads 99, and that count
+	// sized the grouped rel above the scan (regress aggregates'
+	// agg_sort_order). DEFAULT_INEQ_SEL stays the fallback when the bound
+	// column cannot be named.
+	if lowKey != nil || highKey != nil {
+		sel *= indexRangeBoundSelectivity(tbl, idx, nEq, lowKey, highKey, lowOp, highOp)
 	}
 	sel = clampSelectivity(sel)
 
@@ -861,6 +863,53 @@ func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr
 		return relRows
 	}
 	return rows
+}
+
+// indexRangeBoundSelectivity is clauselist_selectivity over an index scan's
+// range bounds on index column nEq (the first column after the equality
+// prefix): `col >= low` / `col > low` and `col <= high` / `col < high`
+// (LowOp/HighOp; the zero value is inclusive), scored against the base
+// relation exactly as the same conjuncts in a Filter over its seq scan.
+func indexRangeBoundSelectivity(tbl *catalog.Table, idx *catalog.Index, nEq int, lowKey, highKey Expr, lowOp, highOp parser.OpCode) float64 {
+	fallback := 1.0
+	if lowKey != nil {
+		fallback *= defaultIneqSel
+	}
+	if highKey != nil {
+		fallback *= defaultIneqSel
+	}
+	if tbl == nil || idx == nil || nEq >= len(idx.Columns) {
+		return fallback
+	}
+	colIdx := -1
+	for i, c := range tbl.Columns {
+		if strings.EqualFold(c.Name, idx.Columns[nEq]) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return fallback
+	}
+	col := tbl.Columns[colIdx]
+	ref := func() *ColumnRef { return &ColumnRef{Index: colIdx, Name: col.Name, Type: col.Type} }
+	var quals []Expr
+	if lowKey != nil {
+		op := parser.OpGe
+		if lowOp == parser.OpGt {
+			op = parser.OpGt
+		}
+		quals = append(quals, &BinaryOp{Op: op, Left: ref(), Right: lowKey})
+	}
+	if highKey != nil {
+		op := parser.OpLe
+		if highOp == parser.OpLt {
+			op = parser.OpLt
+		}
+		quals = append(quals, &BinaryOp{Op: op, Left: ref(), Right: highKey})
+	}
+	leaf := &SeqScan{Table: tbl, schema: tableSchema(tbl)}
+	return clampSelectivity(conjunctionSelectivity(quals, leaf))
 }
 
 // defaultIneqSel is PG's DEFAULT_INEQ_SEL (selfuncs.h): the selectivity charged
