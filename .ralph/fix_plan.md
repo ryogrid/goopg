@@ -26523,6 +26523,23 @@ M0146-0001 re-baseline census on the new default arm.
       \(re\-measure Q17/Q20 without them\); then multi\-relation EXISTS
       bodies, which need the EXISTS→ANY pass to read correlation from
       leaves\.
+  - **2026\-10\-05 — impl slice 2 landed \(`1db4edacc`\): the flatten is
+    deleted, the rule stays\.** Evidence
+    `analysis/m0146/m0146\-0012/impl\-slice2\.md`\.
+    - With `flattenStrandedSeqScanFilters` and the rule\'s correlated half
+      both off, all 22 TPC\-H plans are unchanged: the search builds
+      Q17/Q20\'s probes itself\. TPC\-DS SF0\.25 changes only Q6/Q41, in
+      cost, and both changes come from the flatten\.
+    - The rule\'s correlated half stays\. An outer key from an
+      integer\-literal VALUES/derived column is `int8` in goopg, so the
+      search refuses the uncast probe and only the rule builds it
+      \(regress `join`, `unique2 = v\.x`\)\. Filed S2 as M0146\-0062\.
+    - Movement: TPC\-DS Q41 18\.2 s → 10\.3/11\.9 s; Q41\'s SubPlan cost
+      180 → 3987 \(PG 4029\); plan\-parity categories neutral at both
+      scales; TPC\-H arm 24/24 MATCH\.
+    - Next: blocked on M0146\-0062 for the rule\'s correlated half;
+      multi\-relation EXISTS bodies remain \(the EXISTS→ANY pass must read
+      correlation from leaves first\)\.
 - [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the
@@ -28148,3 +28165,31 @@ M0146-0001 re-baseline census on the new default arm.
   - Expected movement: TPC\-DS scan\-type wherever PG bitmap\-scans a
     range restriction, measured by the fire set; it also unblocks
     M0146\-0060\.
+- [ ] **M0146\-0062 — WRONG RESULTS: an integer literal is typed `bigint`,
+  not `integer`, so int4 overflow never errors** \(filed 2026\-10\-05 by
+  M0146\-0012 slice 2\)\. PG 18\.3 types a literal that fits in 32 bits as
+  `int4` \(`make\_const`, `./postgres/src/backend/parser/parse\_node\.c`\)\.
+  goopg types every integer literal `int8`:
+  - `select 2147483647 \+ 1` and `select 9998 \+ 2147483647` return
+    `2147483648` / `2147493645`; PG raises `integer out of range`;
+  - `select pg\_typeof\(9998\)` prints `bigint`, PG `integer`, and a
+    VALUES or derived\-table column built from such a literal is `bigint`
+    too;
+  - through a correlated sub\-select `pg\_typeof\(v\.x\)` prints `unknown`.
+  Pre\-existing \(HEAD `a485878c2`\); ledgered earlier as a typing gap
+  \(M0134\-0043, M0134\-0156\) but never filed\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-05 \(S2\) — integer literals are typed bigint, so int4 overflow returns a value
+  > Filed by M0146\-0012 slice 2, not worked\. Owner: place M0146\-0062 in the banner\.
+  - Planner impact found while filing: an outer key from such a column
+    \(`\(values \(0,9998\)\) v\(id,x\), lateral \(… where unique2 = v\.x\)\)`,
+    regress `join`\) is `int8` against an `int4` index column\. The
+    search\'s `restrictionKeyUsable` correctly refuses that uncast probe;
+    the one\-relation rule \(`planIndexScanFromWhere`\) still builds it,
+    which is why M0146\-0012 slice 2 keeps the rule\'s correlated half\.
+  - First step: mirror `make\_const`\'s int4\-when\-fits choice at literal
+    resolution, then follow every consumer that assumed `int8` \(arithmetic
+    result types, VALUES `select\_common\_type`, the executor literal
+    cache\) and re\-run the regress A/B; large blast radius \(ledger
+    M0134\-0156\)\.

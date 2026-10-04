@@ -1,8 +1,9 @@
 # M0146-0012 — correlated restrictions as base-rel index quals
 
 Status: in progress. The prerequisite slice landed 2026-10-05
-(`c8369e384`), and so did impl slice 1 (`c21a02c93`). Still open: retiring
-`flattenStrandedSeqScanFilters` and the restoring rule, and multi-relation
+(`c8369e384`), and so did impl slice 1 (`c21a02c93`) and slice 2
+(`1db4edacc`, `flattenStrandedSeqScanFilters` deleted). Still open: the
+restoring rule's correlated half (after M0146-0062) and multi-relation
 EXISTS bodies.
 Parent: none (banner item 3, M0146 file order). Follows M0146-0015a, which
 made a one-relation scope's correlated qual a base restriction.
@@ -61,9 +62,30 @@ M0146-0050 lands.
 
 Evidence: `analysis/m0146/m0146-0012/impl-slice1.md`.
 
+## Slice 2 — delete `flattenStrandedSeqScanFilters` (landed 2026-10-05, `1db4edacc`)
+
+- The flatten (M0145-0027) merged a one-relation scope's searched leaf and
+  its stranded correlated or sublink conjuncts into one unsearched
+  `Filter{SeqScan}`, so the rule-based producers could build TPC-H Q20's
+  probe. Since M0146-0015a the search builds that probe itself.
+- With the flatten and the rule's correlated half both off, all 22 TPC-H
+  plans are unchanged. TPC-DS SF0.25 changes only Q6 and Q41, in cost:
+  Q41's correlated item scan goes 180 → 3987 (PG 4029) and its outer scan
+  180 → 1512. Q41 runs 18.2 s → 10–12 s.
+- The rule's correlated half stays. goopg types an integer literal `int8`
+  (PG `int4`, `make_const`), so an outer key from a VALUES or derived
+  literal column is `int8` against an `int4` index. `restrictionKeyUsable`
+  refuses that uncast probe, and the rule builds it (regress `join`,
+  `unique2 = v.x`). The same typing makes `2147483647 + 1` return a value
+  where PG errors: filed S2 as M0146-0062.
+
+Evidence: `analysis/m0146/m0146-0012/impl-slice2.md`.
+
 ## Open
 
-- Retire `flattenStrandedSeqScanFilters` and the restoring rule.
+- Retire the rule's correlated half once M0146-0062 lands. The rule is
+  `planIndexScanFromWhere` under `planIsBareSeqScanTree` in
+  `planSelectWithSettings`; its uncorrelated half is M0146-0060's.
 - Multi-relation EXISTS bodies: teach the EXISTS→ANY pass to read
   correlation from a leaf restriction, then admit the conjuncts there too.
 - Rendering in goopg's own decorrelated scalar shape (no PG twin): the

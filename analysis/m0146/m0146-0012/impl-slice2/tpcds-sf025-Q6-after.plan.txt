@@ -1,0 +1,43 @@
+===== Q6 =====
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=22943.47..22943.51 rows=17 width=40)
+   ->  Sort  (cost=20441.55..20441.59 rows=17 width=40)
+         Sort Key: (count(*)), a.ca_state
+         ->  GroupAggregate  (cost=20439.74..20441.37 rows=17 width=40)
+               Group Key: a.ca_state
+               Filter: (count(*) >= 10)
+               ->  Sort  (cost=20439.74..20439.97 rows=93 width=2104)
+                     Sort Key: a.ca_state
+                     ->  Hash Join  (cost=2943.10..20436.70 rows=93 width=2104)
+                           Hash Cond: (i.i_category = i_category)
+                           Filter: (i.i_current_price > (1.2 * avg))
+                           ->  Gather  (cost=2943.10..18918.04 rows=270 width=1220)
+                                 Workers Planned: 3
+                                 ->  Nested Loop  (cost=1943.10..17891.04 rows=87 width=1220)
+                                       ->  Nested Loop  (cost=1942.85..17866.74 rows=87 width=740)
+                                             ->  Nested Loop  (cost=1942.60..17835.36 rows=87 width=352)
+                                                   ->  Parallel Hash Join  (cost=1942.35..17808.14 rows=91 width=28)
+                                                         Hash Cond: (s.ss_sold_date_sk = d.d_date_sk)
+                                                         ->  Parallel Seq Scan on store_sales s  (cost=0.00..15256.18 rows=232218 width=428)
+                                                         ->  Parallel Hash  (cost=1942.12..1942.12 rows=18 width=420)
+                                                               ->  Parallel Seq Scan on date_dim d  (cost=0.00..1942.12 rows=18 width=420)
+                                                                     Filter: (d_month_seq = (InitPlan 1).col1)
+                                                                     InitPlan 1
+                                                                       ->  Unique  (cost=2501.77..2501.92 rows=30 width=4)
+                                                                             ->  Sort  (cost=2501.77..2501.85 rows=30 width=4)
+                                                                                   Sort Key: date_dim.d_month_seq
+                                                                                   ->  Seq Scan on date_dim  (cost=0.00..2500.73 rows=30 width=420)
+                                                                                         Filter: ((d_year = 2002) AND (d_moy = 3))
+                                                   ->  Index Scan using customer_pkey on customer c  (cost=0.25..0.30 rows=1 width=324)
+                                                         Index Cond: (c_customer_sk = s.ss_customer_sk)
+                                             ->  Index Scan using customer_address_pkey on customer_address a  (cost=0.25..0.36 rows=1 width=388)
+                                                   Index Cond: (ca_address_sk = c.c_current_addr_sk)
+                                       ->  Index Scan using item_pkey on item i  (cost=0.25..0.28 rows=1 width=480)
+                                             Index Cond: (i_item_sk = s.ss_item_sk)
+                           ->  Hash  (cost=1512.10..1512.10 rows=10 width=64)
+                                 ->  HashAggregate  (cost=1512.00..1512.10 rows=10 width=64)
+                                       Group Key: j.i_category
+                                       ->  Seq Scan on item j  (cost=0.00..180.00 rows=18000 width=480)
+(38 rows)
+
