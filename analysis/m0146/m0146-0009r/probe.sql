@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS agg_sort_order;
+CREATE TABLE agg_sort_order (c1 int PRIMARY KEY, c2 int);
+CREATE UNIQUE INDEX agg_sort_order_c2_idx ON agg_sort_order(c2);
+INSERT INTO agg_sort_order SELECT i, i FROM generate_series(1,100)i;
+ANALYZE agg_sort_order;
+EXPLAIN SELECT * FROM agg_sort_order WHERE c2 < 100;
+EXPLAIN SELECT * FROM agg_sort_order WHERE c2 < 50;
+EXPLAIN SELECT * FROM agg_sort_order WHERE c1 < 100;
+SET enable_seqscan = off;
+EXPLAIN SELECT * FROM agg_sort_order WHERE c2 < 100;
+EXPLAIN SELECT array_agg(c1 ORDER BY c2),c2 FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2;
+RESET enable_seqscan;
+SET enable_hashagg = off;
+EXPLAIN SELECT array_agg(c1 ORDER BY c2),c2 FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2;
+select attname, n_distinct, histogram_bounds is not null h from pg_stats where tablename='agg_sort_order';

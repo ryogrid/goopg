@@ -27952,7 +27952,7 @@ M0146-0001 re-baseline census on the new default arm.
       PASS \(Q44 Q59 fired, no timeout introduced\), ea\-ratchet PASS,
       regress A/B 9 cases \(known `join` flip only\)\.
   Movement: none — CATEGORIES\-EXCL\-MATCH SF1 moved within ±3 \(parameterisation 32→33, parallelism 45→44, qual\-placement 11→10, rendering 13→12\); match 33→33
-- [ ] **M0146\-0009r — a range restriction is estimated differently on two
+- [x] **M0146\-0009r — a range restriction is estimated differently on two
   paths of one relation** \(filed 2026\-10\-04 by M0146\-0006\)\. Regress
   `aggregates`\' `agg\_sort\_order` \(100 rows, `c1` pkey, `c2` unique\):
   `WHERE c2 < 100` reads rows=33 on the `c2\_idx` path under default
@@ -27965,3 +27965,45 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: find which estimator gives 33 \(DEFAULT\_INEQ\_SEL\-like
     1/3\) — the base rel\'s restriction selectivity vs the index path\'s —
     and why the histogram of a 100\-row ANALYZEd unique column is not used\.
+  - **DONE 2026\-10\-05.** Design doc
+    `docs/design/0100\-0149/m0146\-0009r\-index\-range\-bound\-rows\.md`;
+    evidence `analysis/m0146/m0146\-0009r/`\.
+    - Cause: `indexScanRows` \(EstimateRows of an index scan\) charged
+      DEFAULT\_INEQ\_SEL per range bound; PG\'s btcostestimate scores the
+      index quals with clauselist\_selectivity \(histogram, range pairing\)\.
+      The search\'s index path already did, so the row stamp and the node
+      estimate disagreed and the grouped rel above sized at 33\.
+    - Fix: `indexRangeBoundSelectivity` scores the bounds \(LowOp/HighOp
+      honoured\) with `conjunctionSelectivity` over the base relation\.
+    - `agg\_sort\_order` now matches PG with seq scans off \(the
+      M0146\-0006 regression is gone\); default\-settings rows read 99/48\.
+    - Tried and backed out: gating the rule\-based single\-table index
+      producer on correlation broke 11 unit tests — filed as M0146\-0060\.
+    - Test `TestRangeRestrictionRowsOnEveryPath` \(fails on HEAD\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+      PASS \(nothing fired\), ea\-ratchet PASS, regress A/B 14 cases
+      \(`aggregates` loses the agg\_sort\_order hunk; known flips\)\.
+  Movement: none — fire set flat at both scales; the fix moves regress aggregates\' agg\_sort\_order plan to PG\'s
+- [ ] **M0146\-0060 — the single\-table rule\-based index producer overrides
+  the search\'s costed seq scan for an uncorrelated restriction** \(filed
+  2026\-10\-05 by M0146\-0009r\)\. With `agg\_sort\_order` \(100 rows\),
+  `SELECT \* FROM agg\_sort\_order WHERE c2 < 100` plans PG\'s Seq Scan
+  \(cost 2\.25\) in the search, then `planIndexScanFromWhere` replaces it with
+  `Index Scan using agg\_sort\_order\_c2\_idx \(cost=0\.00\.\.0\.99\)` — a
+  heuristic cost that never competed\.
+  Kind: impl
+  Parent: M0146\-0009
+  - The rule \(planner\.go, the `isSimpleSingle && planIsBareSeqScanTree`
+    arm\) exists for correlated restrictions \(TPC\-H Q17/Q20\), which the
+    base\-rel pathlist cannot turn into a probe\. Gating it on
+    `planHasOuterRef\(node\)` keeps PG\'s Seq Scan but breaks 11 unit tests
+    that rely on it for constant keys \(btree\_array\_key\_indexonly,
+    btree\_scalar\_keys, desc\_index\_range\_scan, explain\_heap\_fetches,
+    explain\_indent, index\_scan, null\_keyed\_index\_entries, two parallel
+    index scan fixtures\)\.
+  - First step: re\-run those 11 against PG 18\.3 — each either needs its
+    fixture made selective enough that the costed search elects the index
+    \(as PG would\), or shows a search\-side index path that loses on cost
+    where PG\'s wins; then gate the rule\.
+  - Expected movement: regress `aggregates`/`select`/`create\_index`
+    scan\-type text; measure the fire set \(no TPC\-DS witness yet\)\.
