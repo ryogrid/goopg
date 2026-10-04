@@ -667,6 +667,7 @@ func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) 
 // Pricing the subtree at a floor is strictly better than pricing it at ZERO,
 // which is what the seq-scan fabrication amounted to.
 func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
+	chargeDerivedLeafLevel(leaf)
 	sub := legacyDisplayCostOf(leaf)
 	if rows < 0 {
 		rows = 0

@@ -25,6 +25,9 @@ package optimizer
 // query level. It holds that level's initPlan cost (zero elsewhere).
 type InitPlanCharge struct {
 	initPlanCharge float64
+	// levelTop marks a derived table's top that the join search priced as a
+	// query level of its own (M0146-0005dw); the tail walk charges it as one.
+	levelTop bool
 }
 
 // InitPlanChargeCost is the cost of the initPlans this node runs.
@@ -32,9 +35,34 @@ func (c *InitPlanCharge) InitPlanChargeCost() float64 { return c.initPlanCharge 
 
 func (c *InitPlanCharge) setInitPlanCharge(v float64) { c.initPlanCharge = v }
 
+func (c *InitPlanCharge) markLevelTop()    { c.levelTop = true }
+func (c *InitPlanCharge) isLevelTop() bool { return c.levelTop }
+
 type initPlanCharger interface {
 	InitPlanChargeCost() float64
 	setInitPlanCharge(float64)
+	markLevelTop()
+	isLevelTop() bool
+}
+
+// chargeDerivedLeafLevel charges a derived-table leaf of the join search as
+// the query level it is, before the search prices it (M0146-0005dw). PG plans
+// a subquery in FROM as its own level: SS_charge_for_initplans adds that
+// level's initPlans to its final rel's paths (subselect.c), and the parent's
+// SubqueryScan path costs the charged subplan, so the joins above carry the
+// initPlans' work. goopg's plan keeps no Subquery Scan over such a leaf, so
+// the tail walk filed its initPlans under the statement's top: the search
+// priced the leaf without them — TPC-DS Q44's two ranked derived tables each
+// ~16k short, so its top Merge Join started below its own inputs. The mark
+// makes the tail walk charge the leaf as a level too, not again at the top.
+func chargeDerivedLeafLevel(leaf Node) {
+	t, ok := chargeTarget(leaf).(initPlanCharger)
+	if !ok {
+		return
+	}
+	t.markLevelTop()
+	c := &initPlanChargeWalk{done: map[Node]bool{}, cteSeen: map[Node]bool{}}
+	c.level(leaf)
 }
 
 // InitPlanChargeOf returns n's initPlan charge, zero when n carries none.
@@ -100,9 +128,17 @@ func (c *initPlanChargeWalk) level(top Node) {
 	charge := 0.0
 	counted := map[Node]bool{}
 	var walk func(n Node)
+	self := chargeTarget(top)
 	walk = func(n Node) {
 		if n == nil {
 			return
+		}
+		if n != self {
+			if lt, ok := n.(initPlanCharger); ok && lt.isLevelTop() {
+				// A derived table the search priced as its own level.
+				c.level(n)
+				return
+			}
 		}
 		for _, sl := range NodeSublinks(n) {
 			if sl.Plan == nil {
