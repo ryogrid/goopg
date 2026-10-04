@@ -27536,7 +27536,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Test `TestUniqueifiedSemiJoinrelRows` \(fails on HEAD\)\.
     - Design `docs/design/0100\-0149/m0146\-0005dy\-unique\-ified\-joinrel\-semi\-rhs\.md`\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 15→13, parallelism 31→29, join\-method 27→26, sort\-strategy 27→26, scan\-type 28→29
-- [ ] **M0146\-0005dz — a redundant outer\-join clause stays a merge key**
+- [x] **M0146\-0005dz — a redundant outer\-join clause stays a merge key**
   \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q78 at SF1: the top
   Merge Left Joins keep `ss\_sold\_year = \*\_sold\_year` as a merge key\.
   PG\'s `reconsider\_outer\_join\_clauses` \(equivclass\.c\) derives the
@@ -27549,6 +27549,20 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: in `deriveOuterLinkConstants`, drop the outer\-join clause
     whose both sides are now pinned to the same constant, as
     `reconsider\_outer\_join\_clauses` does\.
+  - **DONE 2026\-10\-04 \(`6d0d4cec1`\)\.** Q78 does not take the seam route:
+    the AST push into grouped items \(M0146\-0005bn\) carries the constant
+    through the LEFT ON equality\. Both routes now drop the redundant ON
+    equality while the join keeps another conjunct \(PG\'s dummy TRUE\):
+    `pushGroupedItemConjunct` \+ `dropRedundantOnConjuncts`, and
+    `deriveOuterLinkConstants`\' redundant set\.
+    - Q78\'s Merge Left Joins key on customer and item at both scales, as
+      in PG; fire set fires Q78 only, categories flat\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B \(NOTICE order only\)\.
+    - Test `TestOuterJoinClauseRedundantAfterConstantDerivation` \(fails on
+      HEAD; both routes; PG shape on the same data\)\.
+    - Design `docs/design/0100\-0149/m0146\-0005dz\-redundant\-outer\-join\-clause\.md`\.
+  Movement: none — fire set flat; Q78\'s merge keys now match PG\'s below the category level
 - [ ] **M0146\-0009o — grouping\-sets row estimates are about a quarter of
   PG\'s** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q18 \(SF1
   49 vs 213, SF0\.25 12 vs 49\), Q22 \(17964 vs 71857\), Q67 \(a MixedAggregate
