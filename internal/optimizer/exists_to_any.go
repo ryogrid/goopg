@@ -135,6 +135,23 @@ func rewriteExistsToAnyNode(node Node) {
 		if n.Predicate != nil && n.Outer != nil && n.Inner != nil {
 			n.Predicate = rewriteExistsToAnyQual(n.Predicate, joinedRowSchema(n.Outer, n.Inner), false)
 		}
+	case *IndexScan:
+		// M0146-0005dx1: a relation's restriction rides an index probe's
+		// own Cond (its `Filter:` line) when the scan is a nested loop's
+		// inner. Cond is in the scan's output coordinates, so the scan's
+		// row is the host — PG's Q10 reads `Filter: ((ANY (c_customer_sk =
+		// (hashed SubPlan 2).col1)) OR …)` on the customer_pkey probe.
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
+	case *IndexOnlyScan:
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
+	case *BitmapHeapScan:
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
 	case *Project:
 		rewriteExistsToAnyNode(n.Child)
 	case *Aggregate:

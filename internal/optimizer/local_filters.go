@@ -373,16 +373,40 @@ func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 // ctr2 WHERE ctr1.k = ctr2.k)` on the ctr1 CTE Scan; goopg held it above the
 // whole join.
 //
-// Admitted: scalar sublinks only (the post-planning EXISTS->ANY and unnest
-// passes read EXISTS/IN off the top qual holder), every inner-plan outer
-// reference naming this scope (none reaching past it) and every such
-// reference plus every same-scope column inside ONE binding that starts at
-// offset 0. Offset 0 is the one binding whose leaf coordinates ARE the
-// FROM-cumulative ones, so neither localizeExprToLeaf nor the inner plan
-// (whose references stay unrebased — the rebase is ledgered) moves a
-// coordinate.
+// Admitted: scalar sublinks, and EXISTS sublinks that are not the conjunct
+// itself (M0146-0005dx1), every inner-plan outer reference naming this scope
+// (none reaching past it) and every such reference plus every same-scope
+// column inside ONE binding that starts at offset 0. Offset 0 is the one
+// binding whose leaf coordinates ARE the FROM-cumulative ones, so neither
+// localizeExprToLeaf nor the inner plan (whose references stay unrebased —
+// the rebase is ledgered) moves a coordinate.
+//
+// An EXISTS that IS the conjunct (or its NOT) stays above: it is the
+// post-planning unnest pass's semi/anti join. One under an OR can never
+// become a join; PG keeps TPC-DS Q10/Q35's `(EXISTS (… ws …) OR EXISTS
+// (… cs …))` on the customer scan, where cost_qual_eval prices it per row by
+// the plain correlated SubPlan (qualEvalOps' subPlanCostOps), and the
+// post-planning EXISTS->ANY pass still converts it there, reading its host
+// row off the leaf's Filter.
 func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
-	if len(spans) < 2 || spans[0].lo != 0 || anySublinkPullupCandidate(c) || tableForCol(c, spans) != 0 {
+	if len(spans) < 2 || spans[0].lo != 0 || anySublinkPullupCandidate(c) {
+		return -1
+	}
+	// The same-scope columns name binding 0 — or there are none, as in
+	// Q10's OR of two EXISTS, whose only Vars are the SubPlans' outer
+	// references, checked below.
+	if tableForCol(c, spans) != 0 {
+		sameScope := false
+		visitColumnRefsForTable(c, func(int) { sameScope = true })
+		if sameScope {
+			return -1
+		}
+	}
+	top := c
+	if u, isNot := c.(*UnaryOp); isNot && u.Op == parser.OpNot {
+		top = u.Operand
+	}
+	if _, isExists := top.(*ExistsExpr); isExists {
 		return -1
 	}
 	lo, hi := spans[0].lo, spans[0].hi
@@ -407,7 +431,13 @@ func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
 				if x.Plan != nil {
 					ok = false
 				}
-			case *ExistsExpr, *ArraySubqueryExpr, *MultiAssignSubqRow, *MultiAssignSubqElem:
+			case *ExistsExpr:
+				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
+					planEscapesBy(x.Plan, 1, outside) {
+					ok = false
+				}
+				scalar = true
+			case *ArraySubqueryExpr, *MultiAssignSubqRow, *MultiAssignSubqElem:
 				ok = false
 			}
 			return ok
