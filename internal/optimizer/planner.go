@@ -4176,8 +4176,21 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 			}
 		}
 		reduceOuterJoins(own, s.Where, cat)
+		// M0146-0007i: each body reduces only the items it owns directly;
+		// a nested body's items answer to its own WHERE.
 		for _, c := range cands {
-			reduceOuterJoins(items[c.itemLo:c.itemHi], c.body.Where, cat)
+			var direct []parser.FromExpr
+			var at []int
+			for i := c.itemLo; i < c.itemHi; i++ {
+				if pulledCandidateOwning(cands, i) == c {
+					direct = append(direct, items[i])
+					at = append(at, i)
+				}
+			}
+			reduceOuterJoins(direct, c.body.Where, cat)
+			for k, i := range at {
+				items[i] = direct[k]
+			}
 		}
 		// A pulled derived item stood in the written list as a join-free
 		// Base, so the statement's own items are what an inner-only test

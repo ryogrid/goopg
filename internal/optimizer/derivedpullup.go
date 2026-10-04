@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -81,6 +82,13 @@ type derivedPullupCandidate struct {
 	// cte is set when the item was a reference to an inlinable CTE,
 	// presented as its body (M0146-0007e, ctepullup.go).
 	cte *plannedCTE
+	// parent is the pulled body whose FROM list held this item (nil for an
+	// item of the statement's own FROM list), and depth its nesting level.
+	// pull_up_simple_subquery flattens the subquery's own simple subqueries
+	// before splicing it, so a pulled body's FROM items are expanded in
+	// turn (M0146-0007i): its items' ranges nest inside the parent's.
+	parent *derivedPullupCandidate
+	depth  int
 }
 
 // derivedPullupDisabled is the per-call fallback switch: planFromClause
@@ -138,6 +146,14 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 		return nil, false
 	}
 	for _, f := range sub.FromExprs {
+		// M0146-0007i: a join-free derived item that is itself simple is
+		// flattened with the body (pull_up_simple_subquery recursing through
+		// pull_up_subqueries first).
+		if f.Base.Subquery != nil && len(f.Joins) == 0 {
+			if _, ok := simpleDerivedPullupBody(f, cat); ok {
+				continue
+			}
+		}
 		if !pullupPlainRelation(f.Base) {
 			return nil, false
 		}
@@ -197,16 +213,32 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 	return sub, true
 }
 
-// pulledCandidateOwning returns the candidate whose expanded body items
-// include item index i, or nil.
+// pulledCandidateOwning returns the innermost candidate whose expanded body
+// items include item index i, or nil.
 func pulledCandidateOwning(cands []*derivedPullupCandidate, i int) *derivedPullupCandidate {
+	var owner *derivedPullupCandidate
 	for _, c := range cands {
-		if i >= c.itemLo && i < c.itemHi {
-			return c
+		if i >= c.itemLo && i < c.itemHi && (owner == nil || c.depth > owner.depth) {
+			owner = c
 		}
 	}
-	return nil
+	return owner
 }
+
+// pulledCandidateOwningBinding is pulledCandidateOwning over binding indices.
+func pulledCandidateOwningBinding(cands []*derivedPullupCandidate, bi int) *derivedPullupCandidate {
+	var owner *derivedPullupCandidate
+	for _, c := range cands {
+		if bi >= c.bindLo && bi < c.bindHi && (owner == nil || c.depth > owner.depth) {
+			owner = c
+		}
+	}
+	return owner
+}
+
+// maxDerivedPullupDepth bounds the nested expansion; deeper bodies stay
+// ordinary derived leaves.
+const maxDerivedPullupDepth = 8
 
 // pullupPlainRelation reports whether a body FROM item is a plain relation
 // name (a table or a CTE reference) — the only leaf kind the pull-up splices.
@@ -315,22 +347,29 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 	}
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
-	for _, it := range flat {
-		src := it
-		var cteEntry *plannedCTE
-		if conv, e, ok := cteAsDerivedItem(it); ok {
-			src, cteEntry = conv, e
+	// M0146-0007i: a pulled body's own join-free items are expanded the same
+	// way, so a simple subquery or inlinable CTE inside it is flattened too.
+	var expand func(items []parser.FromExpr, parent *derivedPullupCandidate, depth int)
+	expand = func(items []parser.FromExpr, parent *derivedPullupCandidate, depth int) {
+		for _, it := range items {
+			src := it
+			var cteEntry *plannedCTE
+			if conv, e, ok := cteAsDerivedItem(it); ok {
+				src, cteEntry = conv, e
+			}
+			body, ok := simpleDerivedPullupBody(src, cat)
+			if !ok || depth > maxDerivedPullupDepth {
+				out = append(out, it)
+				continue
+			}
+			c := &derivedPullupCandidate{alias: src.Base.Alias, body: body, itemLo: len(out),
+				cte: cteEntry, parent: parent, depth: depth}
+			cands = append(cands, c)
+			expand(body.FromExprs, c, depth+1)
+			c.itemHi = len(out)
 		}
-		body, ok := simpleDerivedPullupBody(src, cat)
-		if !ok {
-			out = append(out, it)
-			continue
-		}
-		c := &derivedPullupCandidate{alias: src.Base.Alias, body: body, itemLo: len(out), cte: cteEntry}
-		out = append(out, body.FromExprs...)
-		c.itemHi = len(out)
-		cands = append(cands, c)
 	}
+	expand(flat, nil, 0)
 	if len(cands) == 0 {
 		return s.FromExprs, nil, nil
 	}
@@ -415,16 +454,33 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 	var rels []*pulledDerivedRel
 	var quals []Expr
 	var qualCtx map[Expr]*resolveContext
-	for _, c := range cands {
+	// M0146-0007i: innermost bodies first. A body sees its own leaves and,
+	// through their aliases, its direct children's outputs (already resolved
+	// in the same parent coordinates); a grandchild's leaves stay hidden.
+	// Only the statement's own items' rels are returned for parent-level
+	// name resolution; every level's WHERE joins the scope's quals.
+	order := make([]*derivedPullupCandidate, len(cands))
+	copy(order, cands)
+	sort.SliceStable(order, func(i, j int) bool { return order[i].depth > order[j].depth })
+	relOf := make(map[*derivedPullupCandidate]*pulledDerivedRel, len(cands))
+	for _, c := range order {
 		bodyBindings := make([]rangeBinding, 0, c.bindHi-c.bindLo)
-		for _, b := range bindings[c.bindLo:c.bindHi] {
-			b.pulledHidden = false
+		for bi := c.bindLo; bi < c.bindHi; bi++ {
+			b := bindings[bi]
+			if pulledCandidateOwningBinding(cands, bi) == c {
+				b.pulledHidden = false
+			}
 			bodyBindings = append(bodyBindings, b)
 		}
 		bodyCtx := newResolveContext(bodyBindings, schema, ps)
 		bodyCtx.cat = cat
 		bodyCtx.rtScope = scope
 		bodyCtx.parent = planParent
+		for _, child := range cands {
+			if child.parent == c {
+				bodyCtx.pulledDerived = append(bodyCtx.pulledDerived, relOf[child])
+			}
+		}
 		rel := &pulledDerivedRel{alias: c.alias, firstBinding: c.bindLo, body: c.body}
 		seen := map[string]bool{}
 		for _, t := range c.body.Targets {
@@ -465,7 +521,12 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 				qualCtx[conj] = bodyCtx
 			}
 		}
-		rels = append(rels, rel)
+		relOf[c] = rel
+	}
+	for _, c := range cands {
+		if c.parent == nil {
+			rels = append(rels, relOf[c])
+		}
 	}
 	return rels, quals, qualCtx, true
 }
