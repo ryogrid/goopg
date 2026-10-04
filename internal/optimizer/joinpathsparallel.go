@@ -309,7 +309,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey,
 	mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
-	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, innerOverride *Path) {
 
 	// Same mode gate as the hash twin: the only reader of a partial path
 	// is `generateUsefulGatherPaths`, and under `off` producing buys
@@ -373,7 +373,13 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	// scan the hash twin uses: the inner is read WHOLE by every worker
 	// (no shared build exists for merge), so completeness is required and
 	// partial-ness is not.
-	i := cheapestParallelSafeTotalInner(inner.Pathlist)
+	// innerOverride is a unique-ified inner (sort_inner_and_outer's
+	// JOIN_UNIQUE_INNER, joinpath.c:1438-1444), already checked
+	// parallel-safe by the caller.
+	i := innerOverride
+	if i == nil {
+		i = cheapestParallelSafeTotalInner(inner.Pathlist)
+	}
 	if i == nil {
 		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", "jt="+traceJoinTypeName(jt))
 		return

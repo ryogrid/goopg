@@ -110,8 +110,18 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+	// "Can't do anything else if outer path needs to be unique'd"
+	// (joinpath.c:2001-2003): a unique-ified outer gets nested loops only.
+	if mu.side == uniqueSideOuter {
+		return
+	}
 	innerCheapestTotal := inner.CheapestTotal
+	// A unique-ified inner is considered only as the unique-ified cheapest
+	// total, and only sorted (:1881-1890, :1636-1638).
+	if mu.side == uniqueSideInner {
+		innerCheapestTotal = mu.path
+	}
 	if innerCheapestTotal == nil {
 		return
 	}
@@ -134,13 +144,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, j
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, jt, innerUnique, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, jt, innerUnique, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc, mu.side == uniqueSideInner)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, uniqueInner bool) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -193,6 +203,12 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
 	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+
+	// "Can't do anything else if inner path needs to be unique'd"
+	// (:1636-1638): the presorted inners below are the raw rel's paths.
+	if uniqueInner {
+		return
+	}
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -266,7 +282,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 // the full sort-key list exactly as the serial first candidate does.
 func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
-	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
 
 	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
 		sub := "mode"
@@ -287,6 +303,14 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 	// for. Each ordered partial outer gets the first candidate (the
 	// truncation search stays deferred). Unordered partial outers are
 	// skipped: `sort_inner_and_outer` serves unordered inputs.
+	// match_unsorted_outer's parallel block (joinpath.c:2017-2031) refuses a
+	// unique-ified outer, whose uniqueness a partial outer could not
+	// guarantee; a unique-ified inner is usable only if parallel-safe
+	// (:2039-2050).
+	if mu.side == uniqueSideOuter || (mu.side == uniqueSideInner && (mu.path == nil || !mu.path.ParallelSafe)) {
+		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M-uniq", "jt="+traceJoinTypeName(jt))
+		return
+	}
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", "sub=no-groups jt="+traceJoinTypeName(jt))
@@ -340,6 +364,9 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 		// worker reads its partition). resultKeys is the outer's full
 		// ordering.
 		i := cheapestParallelSafeTotalInner(inner.Pathlist)
+		if mu.side == uniqueSideInner {
+			i = mu.path
+		}
 		if i == nil {
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", cand)
 			continue

@@ -289,7 +289,7 @@ func TestLeafSpanWindow(t *testing.T) {
 // A body whose planned inner projections narrow the leaf-concat schema is
 // not flattenable — it stays one opaque RHS leaf, the pre-step-2 behaviour.
 func TestFlattenedRHSDeclinesPrunedBody(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
+	cat := analyzedUniqueThreeTablesCatalog(t)
 	node, err := Plan(parseOne(t,
 		"SELECT x FROM t1 WHERE t1.x IN (SELECT y FROM t2, t3 WHERE t2.z = t3.a)"), cat)
 	if err != nil {

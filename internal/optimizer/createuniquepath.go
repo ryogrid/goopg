@@ -202,8 +202,11 @@ func createPulledUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinI
 // equality) would reach here and pay for a unique PG takes free — ledgered.
 // A multi-relation RHS still declines.
 func createPulledBaseUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, cp costParams) *Path {
-	if rel.baseLeaf == nil || subpath.RequiredOuter != 0 {
+	if subpath.RequiredOuter != 0 {
 		return nil
+	}
+	if rel.baseLeaf == nil {
+		return createPulledJoinUniquePath(rel, subpath, sjinfo, cp)
 	}
 	out := rel.baseLeaf.Output()
 	// local: leaf-relative refs, for estimate_num_groups over the leaf.
@@ -238,6 +241,79 @@ func createPulledBaseUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJ
 		return nil
 	}
 	numGroups := float64(estimateNumGroups(local, rel.baseLeaf, int64(rel.Rows)))
+	return finishPulledUniquePath(rel, subpath, keyCols, bound, numGroups, cp)
+}
+
+// createPulledJoinUniquePath is create_unique_path for a pulled semijoin RHS
+// made of several base relations (M0146-0005dy): populate_joinrel_with_paths'
+// JOIN_SEMI arm (joinrels.c) unique-ifies any rel equal to the semijoin's
+// syn_righthand, so TPC-DS Q69's `store_sales ⋈ date_dim` is grouped on
+// ss_customer_sk and probed into customer_pkey. Each uniq expr is resolved
+// to the member base relation that produces it, and the group count is
+// estimate_num_groups' per-relation product (selfuncs.c), each relation's
+// estimate taken over its own leaf, clamped to the RHS's rows.
+func createPulledJoinUniquePath(rel *RelOptInfo, subpath *Path, sjinfo *SpecialJoinInfo, cp costParams) *Path {
+	members := rel.memberRels
+	if len(members) == 0 {
+		return nil
+	}
+	bound := make([]Expr, 0, len(sjinfo.SemiRhsExprs))
+	keyCols := make([]int, 0, len(sjinfo.SemiRhsExprs))
+	locals := map[*RelOptInfo][]Expr{}
+	var order []*RelOptInfo
+	seen := map[int]bool{}
+	for _, e := range sjinfo.SemiRhsExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return nil
+		}
+		var owner *RelOptInfo
+		local := -1
+		for _, m := range members {
+			if m == nil || m.baseLeaf == nil {
+				return nil
+			}
+			out := m.baseLeaf.Output()
+			if i := cr.Index - m.baseOffset; i >= 0 && i < len(out) && out[i].Name == cr.Name {
+				owner, local = m, i
+				break
+			}
+		}
+		if owner == nil {
+			return nil
+		}
+		if seen[cr.Index] {
+			continue
+		}
+		seen[cr.Index] = true
+		lc := *cr
+		lc.Index = local
+		if _, ok := locals[owner]; !ok {
+			order = append(order, owner)
+		}
+		locals[owner] = append(locals[owner], &lc)
+		bound = append(bound, cr)
+		keyCols = append(keyCols, cr.Index)
+	}
+	if len(keyCols) == 0 {
+		return nil
+	}
+	numGroups := 1.0
+	for _, m := range order {
+		numGroups *= float64(estimateNumGroups(locals[m], m.baseLeaf, int64(rel.Rows)))
+	}
+	if numGroups > rel.Rows {
+		numGroups = rel.Rows
+	}
+	return finishPulledUniquePath(rel, subpath, keyCols, bound, numGroups, cp)
+}
+
+// finishPulledUniquePath prices create_unique_path's two methods over a
+// pulled RHS and keeps the cheaper — sort+unique (cost_sort plus one
+// cpu_operator_cost per column per input row) or hashed aggregation
+// (cost_agg AGG_HASHED, refused when (width + 64) * groups exceeds the hash
+// memory limit), fewer disabled nodes first (pathnode.c).
+func finishPulledUniquePath(rel *RelOptInfo, subpath *Path, keyCols []int, bound []Expr, numGroups float64, cp costParams) *Path {
 	if numGroups < 1 {
 		numGroups = 1
 	}

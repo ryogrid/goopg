@@ -46,7 +46,7 @@ func TestSemiAntiOnQualsOK_DeclinesNilPredicate(t *testing.T) {
 }
 
 func TestSemiAntiLinksHaveSJInfos_MatchesRealSJInfo(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
+	cat := analyzedUniqueThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -287,7 +287,7 @@ func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t
 // synthetic leaf (no FlattenedRHS marker here), and the walk renumbers
 // its placeholder SJInfo to the real leaf-index bits.
 func TestExtractSearchLeaves_SemiJoinIsAdmitted(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
+	cat := analyzedUniqueThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
 	node, err := Plan(parseOne(t, sql), cat)

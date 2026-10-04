@@ -317,7 +317,7 @@ func TestPartialNLFilingInnerOnly(t *testing.T) {
 			joinrel.ConsiderParallel = true
 			s := &searchCtx{parallelModeOK: true}
 			clauses := []*restrictInfo{equiClause(a, b)}
-			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{})
+			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{}, mergeUnique{})
 			if jt != parser.JoinRight && jt != parser.JoinFull {
 				if len(joinrel.PartialPathlist) == 0 {
 					t.Errorf("%v partial NL must be filed", jt)

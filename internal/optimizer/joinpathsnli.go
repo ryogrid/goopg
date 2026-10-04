@@ -456,7 +456,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 // check has nothing to read — no LATERAL shape reaches path generation
 // (C-08 invariant, cited the same way the two landed partial producers
 // cite it: by comment, with no field to test).
-func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors) {
+func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors, mu mergeUnique) {
 	// V0: the reader-only gate, shared with both landed partial producers
 	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
 	// and the next level's own partial producer reads a partial path.
@@ -464,9 +464,13 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	// The dispatch gate (joinpath.c:2022-2031), minus the vacuous:
-	// UNIQUE_OUTER has no goopg jointype, so the set collapses to exactly
-	// `partialHashJoinTypeOK` ({INNER, LEFT, SEMI, ANTI}).
+	// The dispatch gate (joinpath.c:2022-2031). JOIN_UNIQUE_OUTER reaches
+	// here as INNER with mu.side set (M0146-0005dy): a partial outer cannot
+	// be unique-ified, so it is refused as in PG.
+	if mu.side == uniqueSideOuter {
+		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1-uniq-outer", "jt="+traceJoinTypeName(jt))
+		return
+	}
 	if !partialHashJoinTypeOK(jt) {
 		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V1", "jt="+traceJoinTypeName(jt))
 		return
@@ -551,8 +555,8 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		// member included (`setCheapest`, path.go:1193) — so the
 		// unparameterised inner (partial PLAIN nestloop) and the
 		// parameterised probes (partial INDEX nestloop) ride one loop, as
-		// they do in PG. UNIQUE_INNER is vacuous (no such jointype, hence no
-		// `create_unique_path` to call). The materialised-inner tail —
+		// they do in PG. Under JOIN_UNIQUE_INNER only the cheapest total
+		// is used, unique-ified (:2165-2178). The materialised-inner tail —
 		// joinpath.c:2197-2199's matpath member — is filed per outer after
 		// this loop, under PG's two extra gates (:2135-2136).
 		for _, i := range inner.CheapestParameterized {
@@ -560,6 +564,12 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				// "Can't join to an inner path that is not parallel-safe."
 				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "jt="+traceJoinTypeName(jt))
 				continue
+			}
+			if mu.side == uniqueSideInner {
+				if i != inner.CheapestTotal || mu.path == nil {
+					continue
+				}
+				i = mu.path
 			}
 			// The subset test (joinpath.c:968-990): the inner's
 			// parameterisation must be fully satisfiable by the outer. The
@@ -640,7 +650,8 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 		// parallel-safe (`inner_cheapest_total->parallel_safe`) and must
 		// not be parameterised by the outer (`PATH_PARAM_BY_REL`) — the
 		// second is `RequiredOuter == 0`, already enforced.
-		if in := materialInnerPathFor(inner.CheapestTotal, inner, cp); in != nil {
+		// PG skips it under JOIN_UNIQUE_INNER (:2134).
+		if in := materialInnerPathFor(inner.CheapestTotal, inner, cp); in != nil && mu.side != uniqueSideInner {
 			if !in.Children[0].ParallelSafe {
 				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V7", "matpath jt="+traceJoinTypeName(jt))
 				continue

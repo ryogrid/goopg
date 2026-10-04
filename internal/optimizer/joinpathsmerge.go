@@ -237,7 +237,26 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+	// "If unique-ification is requested, do it and then handle as a plain
+	// inner join" (joinpath.c:1402-1418).
+	o, i := outer.CheapestTotal, inner.CheapestTotal
+	switch mu.side {
+	case uniqueSideOuter:
+		o = mu.path
+	case uniqueSideInner:
+		i = mu.path
+	}
+	// The partial merge's inner (:1423-1445): never for a unique-ified outer,
+	// whose uniqueness a partial outer could not guarantee; for a
+	// unique-ified inner, only the unique path itself and only if it is
+	// parallel-safe. Nil asks addPartialMergeJoinPath for its own choice.
+	partialOK := mu.side != uniqueSideOuter
+	var partialInner *Path
+	if mu.side == uniqueSideInner {
+		partialOK = i != nil && i.ParallelSafe
+		partialInner = i
+	}
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		// PG's `if (extra->mergeclause_list == NIL) return` (:1372). A pair
@@ -265,13 +284,15 @@ func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costP
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, outer, inner, cp, jt, innerUnique, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		addMergeJoinPath(joinrel, o, i, outer, inner, cp, jt, innerUnique, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 		// E-20 Cut 3: PG's `sort_inner_and_outer` loop offers a partial
 		// mergejoin per ordering (`cheapest_partial_outer` +
 		// `cheapest_safe_inner`, joinpath.c:1535-1545), beside the serial
 		// offer above. The delivered ordering here IS the loop's ordering
 		// (resultKeys == outerKeys), exactly as the serial call passes.
-		addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		if partialOK {
+			addPartialMergeJoinPath(s, joinrel, outer, inner, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc, partialInner)
+		}
 	}
 }
 
@@ -315,8 +336,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
-	o, i := outer.CheapestTotal, inner.CheapestTotal
+func addMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}

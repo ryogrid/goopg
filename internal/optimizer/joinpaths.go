@@ -176,6 +176,14 @@ const (
 	uniqueSideInner
 )
 
+// mergeUnique is a unique-ified side as the arms that read the rels' path
+// lists see it: which side, and its `create_unique_path` result. The zero
+// value is a plain pair.
+type mergeUnique struct {
+	side uniqueSide
+	path *Path
+}
+
 func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo, cp costParams) (parser.JoinType, uniqueSide, bool) {
 	// No SpecialJoinInfo: a plain inner join, which is what `joinIsLegal`
 	// returns for every pair in a query with no outer/semi/anti join at all
@@ -374,6 +382,20 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	if uniqInnerUnique {
 		semi = s.semiAntiJoinFactorsFor(outer, inner, parser.JoinSemi, clauses)
 	}
+	// M0146-0005dy: the unique-ified side's path, for the arms that take
+	// their inputs from the rels' path lists rather than through
+	// nestLoopOuterPaths — the merge arms and the partial nested loop. PG
+	// replaces the side by create_unique_path before any of them builds a
+	// path (sort_inner_and_outer :1406-1418, match_unsorted_outer
+	// :1881-1890, consider_parallel_nestloop :2171-2178). Reading the raw
+	// side instead joins every duplicate of the semi join's RHS.
+	mu := mergeUnique{side: uniq}
+	switch uniq {
+	case uniqueSideOuter:
+		mu.path = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
+	case uniqueSideInner:
+		mu.path = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
+	}
 	// M0146-0005f: final_cost_nestloop takes the same early-exit branch for
 	// an INNER pair whose inner rel is proven unique (extra->inner_unique),
 	// with the inner-join factors (outer_match_frac = the clause selectivity,
@@ -465,7 +487,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
-				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 				// and arm 4 — so a merge over an already-ordered outer is offered
 				// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -473,14 +495,14 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// here; goopg's nested-loop halves (`addNestLoopPath` /
 				// `addNLIPaths` / `addPartialNestLoopPaths`) follow this block,
 				// still ahead of the hash arm (M0146-0005bk).
-				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
 				// (joinpath.c:2071-2097) beside the serial arm above — every
 				// already-ordered partial outer (the cheapest is almost never
 				// the ordered one) against the cheapest parallel-safe complete
 				// inner. First candidate per outer only; the truncation search
 				// is a follow-up the A/B can motivate.
-				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc)
+				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
 			}
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
@@ -500,7 +522,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// dispatch gate and the already-computed `paramSrc` unused (partial
 	// results must be fully unparameterised; there is no star-schema
 	// exception to test).
-	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semi)
+	addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semi, mu)
 	// M0146-0005bk: `hash_inner_and_outer` (joinpath.c:212) runs AFTER
 	// match_unsorted_outer's nested loops (:290 and consider_parallel_
 	// nestloop). addPath keeps the incumbent when two paths tie within

@@ -846,6 +846,25 @@ type rangeTblEntry struct {
 	// usefulKeys is what truncate_useless_pathkeys reads for this joinrel
 	// (M0146-0005n): set by makeJoinRel, nil elsewhere (no truncation).
 	usefulKeys *pathkeyUsefulness
+
+	// memberRels are the base relations a joinrel is made of — the level-1
+	// rels carrying baseLeaf/baseOffset — so a joinrel can resolve a
+	// problem-space column to the leaf that produces it (M0146-0005dy:
+	// create_unique_path's estimate_num_groups over a multi-relation semijoin
+	// RHS). Set by makeJoinRel; nil on base rels.
+	memberRels []*RelOptInfo
+}
+
+// baseMembers returns the base relations rel is made of: itself for a base
+// rel, its memberRels for a joinrel.
+func (r *RelOptInfo) baseMembers() []*RelOptInfo {
+	if r == nil {
+		return nil
+	}
+	if r.baseLeaf != nil {
+		return []*RelOptInfo{r}
+	}
+	return r.memberRels
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.

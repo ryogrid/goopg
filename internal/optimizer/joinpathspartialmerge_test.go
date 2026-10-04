@@ -91,7 +91,7 @@ func TestPartialMergeJoinSite1OffersPreorderedShapes(t *testing.T) {
 		mergeTuplesFor, scanSelFor := pmjClosures(s, joinrel, outer, inner)
 		addPartialMergeJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
 			[]PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(2), SortAsc: true}},
-			keys, nil, mergeTuplesFor, scanSelFor, 0)
+			keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
 
 		got := pmjPartials(joinrel.PartialPathlist)
 		if len(got) != 1 {
@@ -134,7 +134,7 @@ func TestPartialMergeJoinSite1DeclinesUnsortedOuter(t *testing.T) {
 		mergeTuplesFor, scanSelFor := pmjClosures(s, joinrel, outer, inner)
 		addPartialMergeJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
 			[]PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(2), SortAsc: true}},
-			keys, nil, mergeTuplesFor, scanSelFor, 0)
+			keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
 		if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
 			t.Fatalf("unordered partial outer filed %d paths; a sort under a partial is unmodelled", len(got))
 		}
@@ -148,7 +148,7 @@ func TestPartialMergeJoinSite2FirstCandidate(t *testing.T) {
 		s, joinrel, outer, inner, keys := pmjFixture(t)
 		mergeTuplesFor, scanSelFor := pmjClosures(s, joinrel, outer, inner)
 		matchUnsortedOuterMergePartial(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
-			keys, nil, mergeTuplesFor, scanSelFor, 0)
+			keys, nil, mergeTuplesFor, scanSelFor, 0, mergeUnique{})
 		got := pmjPartials(joinrel.PartialPathlist)
 		if len(got) != 1 {
 			t.Fatalf("site 2 filed %d partial merge paths, want 1", len(got))
@@ -171,7 +171,7 @@ func TestPartialMergeJoinSite2FirstCandidate(t *testing.T) {
 			ParallelSafe:    true,
 		}}, outer.PartialPathlist...)
 		matchUnsortedOuterMergePartial(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
-			keys, nil, mergeTuplesFor, scanSelFor, 0)
+			keys, nil, mergeTuplesFor, scanSelFor, 0, mergeUnique{})
 		if got := pmjPartials(joinrel.PartialPathlist); len(got) != 1 {
 			t.Fatalf("ordered partial at [1] filed %d paths, want 1", len(got))
 		}
@@ -181,7 +181,7 @@ func TestPartialMergeJoinSite2FirstCandidate(t *testing.T) {
 			p.Pathkeys = nil
 		}
 		matchUnsortedOuterMergePartial(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
-			keys, nil, mergeTuplesFor, scanSelFor, 0)
+			keys, nil, mergeTuplesFor, scanSelFor, 0, mergeUnique{})
 		if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
 			t.Fatalf("fully unordered partial outers filed %d paths at site 2", len(got))
 		}
@@ -204,7 +204,7 @@ func TestPartialMergeJoinRefusals(t *testing.T) {
 			ok := []PathKey{{Expr: col(1), SortAsc: true}}
 			ik := []PathKey{{Expr: col(2), SortAsc: true}}
 			addPartialMergeJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
-				ok, ok, ik, keys, nil, mergeTuplesFor, scanSelFor, 0)
+				ok, ok, ik, keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
 		}
 
 		t.Run("mode off", func(t *testing.T) {
@@ -222,7 +222,7 @@ func TestPartialMergeJoinRefusals(t *testing.T) {
 			mergeTuplesFor, scanSelFor := pmjClosures(s, joinrel, outer, inner)
 			ok := []PathKey{{Expr: col(1), SortAsc: true}}
 			addPartialMergeJoinPath(nil, joinrel, outer, inner, s.cp, parser.JoinInner, false,
-				ok, ok, []PathKey{{Expr: col(2), SortAsc: true}}, keys, nil, mergeTuplesFor, scanSelFor, 0)
+				ok, ok, []PathKey{{Expr: col(2), SortAsc: true}}, keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
 			if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
 				t.Fatalf("nil search filed %d paths", len(got))
 			}
