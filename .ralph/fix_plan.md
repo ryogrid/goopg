@@ -27984,7 +27984,7 @@ M0146-0001 re-baseline census on the new default arm.
       PASS \(nothing fired\), ea\-ratchet PASS, regress A/B 14 cases
       \(`aggregates` loses the agg\_sort\_order hunk; known flips\)\.
   Movement: none — fire set flat at both scales; the fix moves regress aggregates\' agg\_sort\_order plan to PG\'s
-- [ ] **M0146\-0060 — the single\-table rule\-based index producer overrides
+- [!] **M0146\-0060 — the single\-table rule\-based index producer overrides
   the search\'s costed seq scan for an uncorrelated restriction** \(filed
   2026\-10\-05 by M0146\-0009r\)\. With `agg\_sort\_order` \(100 rows\),
   `SELECT \* FROM agg\_sort\_order WHERE c2 < 100` plans PG\'s Seq Scan
@@ -28007,3 +28007,45 @@ M0146-0001 re-baseline census on the new default arm.
     where PG\'s wins; then gate the rule\.
   - Expected movement: regress `aggregates`/`select`/`create\_index`
     scan\-type text; measure the fire set \(no TPC\-DS witness yet\)\.
+  - **HELD 2026\-10\-05 \(recon\)\.** Evidence
+    `analysis/m0146/m0146\-0060/findings\.md`\.
+    - Gating the rule on `planHasOuterRef\(node\)`:
+      - TPC\-DS fires only Q41, cost\-only and toward PG: the costed outer
+        scan now charges the SubPlan per row, 180\.83 → 1512\.83 \(PG
+        72523824\);
+      - matches and categories are flat\.
+    - But on a 3000\-row DESC\-index fixture, PG elects a Bitmap Heap Scan
+      \(22\.50\) or an Index Only Scan \(5\.33\), and the gated goopg a Seq
+      Scan \(54\.50\)\. The search has no bitmap path for a range
+      restriction, and its index scan costs 144\.93 against PG\'s 73\.22
+      \(B8\)\. The rule masks both gaps\.
+    - The 10 unit tests that failed lean on the rule for tiny fixtures where
+      PG would seq\-scan; they would move to `enable\_seqscan = off`
+      fixtures with the gate\.
+    - Gate backed out; nothing committed under `internal/`\.
+  > ## ESCALATION 2026\-10\-05 — M0146\-0060 held on M0146\-0061 and M0145\-0008ag
+  > Unblock when the search elects PG\'s bitmap/index path for a range
+  > restriction on the `dsc` fixture\. Then re\-apply the gate and move the 10
+  > fixtures to seq\-scans\-off\.
+- [ ] **M0146\-0061 — the search builds no Bitmap Heap Scan path for a range
+  restriction** \(filed 2026\-10\-05 by M0146\-0060\)\. PG 18\.3 plans
+  `SELECT a, c FROM dsc WHERE a > 97` \(3000 rows, 60 matching, `dsc\_a` on
+  `a DESC`\) as `Bitmap Heap Scan … Recheck Cond: \(a > 97\)` over
+  `Bitmap Index Scan … Index Cond: \(a > 97\)`, cost 22\.50\. goopg\'s
+  restriction paths offer only a plain Index Scan for a range
+  \(`pathbitmap\.go` is equality only\), which costs 144\.93, so the search
+  elects a Seq Scan \(54\.50\)\. The range form of M0145\-0029\'s ledgered
+  slice 2b\.
+  Kind: impl
+  Parent: M0145\-0029
+  - First step:
+    - extend the restriction bitmap producer \(`pathbitmap\.go`\) to a range
+      bound on the leading column, priced by `cost\_bitmap\_heap\_scan`
+      with the clause selectivity `rangeIndexSelectivity` already
+      computes;
+    - lower it onto `BitmapIndexScan` low/high bounds \(check that the
+      executor probe takes a range\);
+    - re\-run the `dsc` probe from `analysis/m0146/m0146\-0060/`\.
+  - Expected movement: TPC\-DS scan\-type wherever PG bitmap\-scans a
+    range restriction, measured by the fire set; it also unblocks
+    M0146\-0060\.
