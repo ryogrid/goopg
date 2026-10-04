@@ -26381,7 +26381,7 @@ M0146-0001 re-baseline census on the new default arm.
   - Deferred \(ledgered\): strict bare\-inner re\-exec → M0146\-0010a;
     slice 4 → M0146\-0010b; T\_HashJoin rescan arm; `enable\_material`
     session wire\.
-- [ ] **M0146\-0010a — retire the legacy bare\-inner replay wrap** \(filed
+- [!] **M0146\-0010a — retire the legacy bare\-inner replay wrap** \(filed
   2026\-09\-28 by M0146\-0010\)\. PG re\-executes a bare NL inner; goopg still
   caches it unless `GOOPG\_NL\_BARE\_REEXEC=1`\. Flip the default once a
   unique\-ified CTE semi\-inner can lead the join \(M0142\-0008c\-2\) — TPC\-DS
@@ -26391,12 +26391,51 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: re\-time Q14 stmt2 with `GOOPG\_NL\_BARE\_REEXEC=1` after
     M0142\-0008c\-2 lands; if PG\'s `unique\(cross\_items\)` lead is elected,
     flip the default and run the fire set at both scales\.
-- [ ] **M0146\-0010b — re\-time the Q54\-class `nlInnerWorkMemEnabled` cliff**
+  - **Re\-timed 2026\-10\-05, held \[\!\].** M0142\-0008c\-2 has landed, but
+    the strict arm still breaks the SF0\.25 sweep\. Design doc
+    `m0146\-0010\-materialize\-node\.md` §7; evidence
+    `analysis/m0146/m0146\-0010ab/`\.
+    - Q4, Q11 and Q14 time out \(15/11/39 s → 300 s\)\.
+    - Q74 goes 32 → 157 s, and Q5, Q7 and Q31 run 2–3× slower\.
+    - Cause in Q4/Q11: a chain of Nested Loops over filtered `CTE Scan on
+      year\_total` inners, estimated at 9–29 rows\. The compat cache holds
+      each filtered inner once; strict re\-execution reads 1\.19M CTE rows
+      per outer row\. PG hash\-joins them\.
+  > ## ESCALATION 2026\-10\-05 — M0146\-0010a held on the year\_total CTE join estimates
+  > Unblock when the Q4/Q11 `year\_total` joins no longer nest\-loop over
+  > filtered CTE scans \(their outer estimate and join method; Q4/Q11 routing:
+  > SORT at SF0\.25, HASHSPILL M0141\-S2a\-fix2r\-a at SF1\), and Q14 statement
+  > 2\'s inner is PG\'s probe chain\. Then re\-run the strict sweep\.
+- [x] **M0146\-0010b — re\-time the Q54\-class `nlInnerWorkMemEnabled` cliff**
   \(filed 2026\-09\-28 by M0146\-0010; the sizing doc\'s slice 4\)\. With
   Material now priced by `cost\_material`/`cost\_rescan`, measure whether
   the unbounded\-cache exception is still needed\.
   Kind: recon
   Parent: M0146-0010
+  - **DONE 2026\-10\-05 — the exception is no longer needed\.** Design doc
+    `m0146\-0010\-materialize\-node\.md` §7; evidence
+    `analysis/m0146/m0146\-0010ab/`\.
+    - The SF0\.25 sweep with `GOOPG\_NL\_MATERIALIZE\_WORK\_MEM=1` passed
+      96/96 with no timeout\. Its slow Q5, Q74 and Q72 readings re\-timed
+      equal when alternated warm: 1552/1549, 35292/35061 and 175471/175283
+      ms \(default/bound\)\.
+    - Q54 runs 1\.1 s in both modes\. Its SF1 plan has no Materialize over
+      `store\_sales` any more \(only over the 12\-row `store`\)\.
+    - The flip is filed as M0146\-0010c\.
+  Movement: none — recon \(executor memory bound; no plan instrument\)
+- [ ] **M0146\-0010c — bound the nested loop\'s inner Materialize by work\_mem
+  by default** \(filed 2026\-10\-05 by M0146\-0010b\)\. PG\'s Materialize
+  tuplestore spills past work\_mem\. goopg\'s NL inner cache runs unbounded
+  unless `GOOPG\_NL\_MATERIALIZE\_WORK\_MEM=1`\. M0146\-0010b measured the
+  bound as regression\-free at SF0\.25\.
+  Kind: impl
+  Parent: M0146-0010
+  - First step: invert the default in `internal/executor/join\_nl\_stream\.go`
+    \(`nlInnerWorkMemEnabled` on unless the variable is `0`\)\. Add a test
+    that a Materialize past work\_mem spills and replays the same rows\.
+    Gate with the sweep and the TPC\-H arm\.
+  - Expected movement: none on plan instruments \(executor memory\)\;
+    measured by the sweep runtime band\.
 - [ ] **M0146-0011 — lateral/parameterized-path post-cutover re-census**
   (recon; M0145-0010's residual). Re-measure the `lateral` decline
   family on the new default arm (2 fires today — Q30/Q68, posthoc

@@ -1,0 +1,4 @@
+bound: Q5 (1549ms) Q74 (35061ms) 
+default: Q5 (1552ms) Q74 (35292ms) 
+q72-bound: Q72 (175283ms) 
+q72-default: Q72 (175471ms) 

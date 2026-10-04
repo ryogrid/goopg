@@ -1,7 +1,9 @@
 # M0146-0010 — the `Materialize` node
 
-Status: landed 2026-09-28 (slices 1–3 of the M0144-0011c sizing; slice 4
-and the strict executor arm deferred — see §5).
+Status: landed 2026-09-28 (slices 1–3 of the M0144-0011c sizing). Slice 4
+was re-timed 2026-10-05 (M0146-0010b): the work_mem bound is safe, and its
+default flip is filed as M0146-0010c. The strict executor arm is still
+deferred (M0146-0010a, held). See §7.
 Spec: [m0144-0011c-materialize-sizing.md](m0144-0011c-materialize-sizing.md) §4.
 
 ## 1. What PG does
@@ -95,3 +97,50 @@ Same diff tool on both arms (the tool change alone moves `missingnode`
 
 Gates: units, tpch-spotcheck (Q12=2/Q13=33), TPC-DS SF0.25 sweep, TPC-H
 acceptance arm (24/24 values), fire-set (19 fires, no introduced timeouts).
+
+## 7. Re-timing both deferred arms (2026-10-05, M0146-0010a / M0146-0010b)
+
+Evidence: `analysis/m0146/m0146-0010ab/`.
+
+### The work_mem bound (slice 4, M0146-0010b)
+
+`GOOPG_NL_MATERIALIZE_WORK_MEM=1` bounds the nested loop's inner
+Materialize cache by work_mem, as PG's tuplestore is. It was left off because
+TPC-DS Q54 at SF0.5 nested-looped over a 1.44M-row `store_sales` scan, and the
+spilled cache replayed per outer row (144 s → >400 s).
+
+- **SF0.25 sweep with the bound.** 96/96, no timeout.
+  - Its slow readings were Q5 1.3 → 4.6 s, Q74 32 → 73 s and Q72 176 → 282
+    s. Re-timed alternately in subset mode, they are cold-server noise:
+    - Q5: 1552 / 1549 ms (default / bound);
+    - Q74: 35292 / 35061 ms;
+    - Q72: 175471 / 175283 ms.
+  - The first, cold run of each pair was the slow one in either mode.
+- **Q54.** 1.1 s in both modes. At SF1 its plan no longer has the cliff
+  shape: the only Materialize sits over the 12-row `store` scan, because
+  `cost_material` and `cost_rescan` now price the big inner out, as §3
+  expected.
+- **Verdict.** The unbounded exception is no longer needed. Flipping the
+  default is an executor change, so it is filed as M0146-0010c rather than
+  made under the recon.
+
+### The strict bare-inner arm (M0146-0010a)
+
+`GOOPG_NL_BARE_REEXEC=1` re-executes a bare inner on rescan, as PG's
+ExecReScan does. Its named prerequisite, M0142-0008c-2, has landed. On the
+SF0.25 sweep, though:
+
+| query | default | strict |
+|---|---|---|
+| Q4 | 15 s | timeout (300 s) |
+| Q11 | 11 s | timeout |
+| Q14 | 39 s | timeout |
+| Q74 | 32 s | 157 s |
+| Q5, Q7, Q31 | — | 2–3× slower |
+
+Q4's plan nests five Nested Loops whose inners are filtered `CTE Scan on
+year_total`s, estimated at 9–29 rows. The compat cache materializes each
+filtered inner once. Re-executing them reads the CTE's 1.19M rows per outer
+row. PG plans those joins as hash joins from its own estimates. So the
+remaining blocker is the outer-row estimate and join method of those CTE
+joins, not an executor gap. M0146-0010a stays held on it.
