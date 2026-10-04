@@ -9017,7 +9017,7 @@ spill route is net-negative.
       vet ./internal/optimizer/` clean, `go test ./internal/optimizer/...`
       PASS, `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
       PASS (all packages). No TPC-H dependency.
-  - [ ] **M0141-S2b-9** — teach `addIncrementalSortPaths` (or its
+  - [x] **M0141-S2b-9** — teach `addIncrementalSortPaths` (or its
     `createOrderedPaths` caller) to also score the seed `input` itself
     against `sortPathkeys` and offer a `PathIncrementalSort` built over the
     seed when `0 < nCommon < len(sortPathkeys)` — today the loop only walks
@@ -9047,7 +9047,10 @@ spill route is net-negative.
     Gate: TPC-DS SF0.25 sweep (category movement, no regression) + `go test
     ./internal/optimizer/...`; re-check Q4's own plan shape specifically
     (LIMIT-sensitive) once implemented; no TPC-H dependency.
-  - [ ] **M0141-S2b-8** — `addGroupingPaths`'s SORTED arm
+    - **DONE 2026\-10\-04** — the seed\'s Incremental Sort landed with
+      M0146\-0005bp; closed by M0146\-0006 \(`01739f8d1`\)\. Q4\'s residue
+      is a join\-order cost tie \(slice 116\)\.
+  - [x] **M0141-S2b-8** — `addGroupingPaths`'s SORTED arm
     (`groupingpaths.go:441-495`) never offers an
     Incremental-Sort-over-partial-prefix-seed candidate for a plain
     `GROUP BY` with no `ORDER BY` in the query — it always calls
@@ -10235,6 +10238,9 @@ cross-layer programme that has never been scoped.
   (`min_lefthand`/`min_righthand`), not just one more `addPath` candidate.
   **Verdict: do not attempt in one sitting** (K24 precedent, same as S2b-2).
   Decomposed into:
+    - **DONE 2026\-10\-04 by M0146\-0006 \(`01739f8d1`\)** —
+      `make\_ordered\_path` in the sorted grouping arm \(cheapest input and
+      partially presorted runner\-ups\)\.
   - [x] **M0142-0008a-1** — design-only: read PG's `join_is_legal`
     (`joinrels.c:350`) and `SpecialJoinInfo` construction in
     `pull_up_sublinks`/`deconstruct_jointree` in full, and produce a
