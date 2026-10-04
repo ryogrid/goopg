@@ -27453,7 +27453,7 @@ M0146-0001 re-baseline census on the new default arm.
       M0146\-0005dx1 and dx2, to land together\.
     - Design `docs/design/0100\-0149/m0146\-0005dx\-sublink\-restriction\-recon\.md`\.
   Movement: none — recon and split, no code change
-- [ ] **M0146\-0005dx1 — a correlated sublink conjunct of one rel becomes
+- [x] **M0146\-0005dx1 — a correlated sublink conjunct of one rel becomes
   that rel\'s restriction** \(filed 2026\-10\-04 by recon M0146\-0005dx\)\.
   `distribute\_qual\_to\_rels` \(initsplan\.c\) places a clause whose SubPlan
   args read only `c` as a baserestrictinfo of `c`; goopg\'s
@@ -27468,7 +27468,27 @@ M0146-0001 re-baseline census on the new default arm.
     `Cond`s so a probe\-carried qual still becomes a hashed ANY\.
   - Lands together with M0146\-0005dx2 \(alone it keeps `c` early\);
     measure Q10/Q35 for timeouts \(M0146\-0015a\)\.
-- [ ] **M0146\-0005dx2 — a restriction holding a correlated sublink is
+  - **DONE 2026\-10\-04 \(`0d1286125`\)\.** `correlatedScalarSublinkLeaf`
+    admits a correlated EXISTS nested in a larger qual \(not the conjunct
+    itself, which stays the unnest pass\'s\) under its binding\-0 rule, and
+    attributes a conjunct with no same\-scope column by its SubPlans\' outer
+    references; `rewriteExistsToAny` now also rewrites IndexScan /
+    IndexOnlyScan / BitmapHeapScan `Cond`, so the probe\-carried OR is
+    PG\'s hashed ANY\.
+    - `remapOuterRefsInSubplan` no longer exists; only binding 0 is
+      admitted \(no rebase needed there\) — ledgered\.
+    - Q10: PG\'s join order \(cd outermost, Materialize over unique ss →
+      customer probe priced 22876 vs PG 21123\); only the `ca` join
+      differs \(Join Filter over Materialize vs PG\'s index probe\) — see
+      M0146\-0005ea\. Q10/Q35 run 1\.4 s / 0\.7 s with the oracle\'s rows\.
+    - Fire set fires Q10, Q35 only; matches flat \(41 / 32\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B \(nondeterminism only\)\.
+    - Test `TestCorrelatedExistsOrIsLeafRestriction` \(fails on HEAD;
+      checks a nullable RIGHT JOIN side keeps the qual above\)\.
+    - Design `docs/design/0100\-0149/m0146\-0005dx1\-correlated\-exists\-or\-leaf\-restriction\.md`\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 parameterisation 34→32, aggregation\-strategy 22→20, join\-order 56→55; SF0\.25 parameterisation 27→26, qual\-placement 10→12
+- [x] **M0146\-0005dx2 — a restriction holding a correlated sublink is
   priced per row by the plain SubPlan** \(filed 2026\-10\-04 by recon
   M0146\-0005dx\)\. `cost\_qual\_eval\_walker` prices an AlternativeSubPlan by
   its first alternative, the plain correlated SubPlan \(costsize\.c:5027\),
@@ -27478,6 +27498,13 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: in the search\'s restriction qual cost, add `cost\_subplan`\'s
     per\-call cost of each correlated sublink \(EXISTS: startup \+ first\-row
     run cost\) per input row; with M0146\-0005dx1\.
+  - **DONE 2026\-10\-04 with M0146\-0005dx1 \(no code\)\.** M0146\-0005di
+    had already made `qualEvalOps` price a planned sublink by
+    `cost\_subplan`, per evaluation when correlated; once dx1 placed the
+    OR at the leaf, the scan paid it: Q10\'s customer probe 0\.25\.\.22876
+    vs PG 0\.29\.\.21123\. The plain plan\'s per\-call cost is about half of
+    PG\'s on the dx1 regression fixture \(ledgered\)\.
+  Movement: none — satisfied by M0146\-0005di; measured with dx1
 - [x] **M0146\-0005dy — a multi\-relation semi\-join inner is not
   unique\-ified** \(filed 2026\-10\-04 by M0146\-0005 slice 115; the
   M0146\-0005dk residual ledgered 2026\-10\-03\)\. TPC\-DS Q69 \(and below the
@@ -27554,3 +27581,21 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0141\-S2a\-fix2r
   - First step: compare `cost\_agg`\'s spill pages/depth for Q4\'s store arm
     term by term with goopg\'s, on PG\'s widths\.
+- [ ] **M0146\-0005ea — offer the materialised\-inner nested loop after the
+  index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
+  M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
+  \(bare inner, probes, Memoize\) before the `matpath` \(joinpath\.c:1883\-1971\),
+  so a probe that ties the matpath within STD\_FUZZ\_FACTOR is PG\'s
+  incumbent; goopg\'s `addNestLoopPath` files the matpath first\. TPC\-DS
+  Q10\'s `ca` join is that tie \(about 21980879 vs 21984115, LIMIT makes the
+  tight comparison COSTS\_DIFFERENT\)\.
+  Kind: impl
+  Parent: M0146\-0005
+  - The patch `analysis/m0146/m0146\-0005dx1/matpath\-after\-nli\.wip\.patch`
+    makes Q10 match at both scales but flips Q8 \(PG\'s own hash alternative
+    28305\.93 vs chosen 28552 is the same near\-tie\) and fails ea\-ratchet on
+    `Q8:date\_dim\+store\+store\_sales` \(evidence beside the patch\)\.
+  - First step: trace the order in which Q8\'s top joinrel receives its
+    near\-tie paths in goopg vs PG \(join\_search\_one\_level pair order and
+    per\-pair arm order\), then land the reorder together with whatever
+    keeps PG\'s first\-filed winner in Q8\.

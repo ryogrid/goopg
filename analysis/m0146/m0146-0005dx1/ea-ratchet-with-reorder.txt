@@ -1,0 +1,31 @@
+[ea] building /home/ryo/work/goopg/goopg/tmp/c20a/goopg-ea
+[ea] starting goopg on 127.0.0.1:5533 (data /home/ryo/work/goopg/goopg/tmp/c20a/data-sf025, cgroup goopg-ea-ratchet)
+[ea] ANALYZE
+[ea]   relations with reltuples > 0: 56
+[ea] capture done: 7789 lines; non-zero psql rc: none
+capture:   /home/ryo/work/goopg/goopg/tmp/c20a/ea-capture.txt
+pg plans:  /home/ryo/work/goopg/goopg/bench/tpcds/plans-pg
+queries:   99   nodes scored: 247   unmatched-in-PG: 16
+bar:       qerr > max(10.0, PG_qerr * 2.0)
+FINDINGS:  10
+
+    Q       qerr    goopg est     ACTUAL     pg est    pg qerr  node                   relset
+---------------------------------------------------------------------------------------------
+  Q23   102108.0       102108          0          -          -  Nested Loop            catalog_sales+cte:frequent_ss_items
+  Q23    51539.0        51539          0          -          -  Nested Loop            cte:frequent_ss_items+web_sales
+  Q14    21135.0            1      21135          -          -  Nested Loop            cte:cross_items+date_dim+store_sales
+  Q14    15666.5           22     344663          -          -  Nested Loop            catalog_sales+cte:cross_items
+  Q14    15649.0           11     172139          -          -  Nested Loop            cte:cross_items+web_sales
+  Q14    15637.1           44     688034          -          -  Nested Loop            cte:cross_items+store_sales
+  Q14    11597.0            1      11597          -          -  Nested Loop            catalog_sales+cte:cross_items+date_dim
+  Q14     6094.0            1       6094          -          -  Nested Loop            cte:cross_items+date_dim+web_sales
+  Q78       87.7         1403     123049          -          -  Merge Left Join        date_dim+store_returns+store_sales+web_returns+web_sales
+   Q8       24.1          818      19725          -          -  Nested Loop            date_dim+store+store_sales
+
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 10   current: 10
+  FIXED    Q92:date_dim+web_sales
+  NEW      Q8:date_dim+store+store_sales
+
+EA-RATCHET: FAIL (1 new estimate finding(s))
+make: *** [Makefile:620: ea-ratchet] Error 1
