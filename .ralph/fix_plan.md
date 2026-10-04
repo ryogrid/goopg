@@ -26503,6 +26503,26 @@ M0146-0001 re-baseline census on the new default arm.
       \(`pathindexrestrict\.go`\) bind them as probe keys, as
       `is\_pseudo\_constant\_for\_index` allows\. Then guard\-test a
       SubPlan body whose hash build side carries the correlated leaf\.
+  - **2026\-10\-05 — impl slice 1 landed \(`c21a02c93`\)\.** Evidence
+    `analysis/m0146/m0146\-0012/impl\-slice1\.md`; design doc
+    `docs/design/0100\-0149/m0146\-0012\-correlated\-restrictions\.md`\.
+    - A scalar sublink body \(`planSubqueryExpr` →
+      `PlannerSettings\.scalarSublinkBody`, one scope deep\) admits its
+      correlated conjuncts as leaf restrictions in a multi\-relation
+      scope\. EXISTS bodies stay excluded \(the Q35 trap\)\.
+    - The bitmap restriction arm makes a same\-type outer\-param probe's
+      conjunct the Recheck Cond, not a Filter \(PG bitmapqualorig\);
+      `BitmapHeapScan` carries `searchedTree`; `dedupeUnnestParams`
+      collapses the triple correlation keys\.
+    - Movement: TPC\-H Q2 keeps PG\'s SubPlan with a partsupp probe,
+      1\.34 s → 0\.20 s \(arm 24/24 MATCH\); TPC\-DS Q32/Q92 SubPlans match
+      PG\'s \(265 → 18 ms, 36 → 21 ms\); fire set aggregation\-strategy
+      11 → 9 \(SF0\.25\), 19 → 17 \(SF1\), no category regresses; ea\-ratchet
+      1 fixed\.
+    - Next: retire `flattenStrandedSeqScanFilters` and the restoring rule
+      \(re\-measure Q17/Q20 without them\); then multi\-relation EXISTS
+      bodies, which need the EXISTS→ANY pass to read correlation from
+      leaves\.
 - [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the

@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS cs_o, cs_s, cs_d, cs_g;
+CREATE TABLE cs_o (k int, x int);
+CREATE TABLE cs_s (k int, dk int, v int);
+CREATE TABLE cs_d (dk int PRIMARY KEY, flag int);
+CREATE TABLE cs_g (g int, w int);
+INSERT INTO cs_o SELECT g, g % 13 FROM generate_series(1, 40) g;
+INSERT INTO cs_s SELECT g % 200, g % 50, g % 17 FROM generate_series(1, 20000) g;
+CREATE INDEX cs_s_k ON cs_s(k);
+INSERT INTO cs_d SELECT g, g % 3 FROM generate_series(0, 49) g;
+INSERT INTO cs_g SELECT g % 50, g FROM generate_series(1, 5000) g;
+ANALYZE cs_o; ANALYZE cs_s; ANALYZE cs_d; ANALYZE cs_g;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_o WHERE cs_o.x > (SELECT avg(cs_s.v) FROM cs_s, cs_d WHERE cs_s.k = cs_o.k AND cs_s.dk = cs_d.dk AND cs_d.flag = 1);
+SELECT count(*) FROM cs_o WHERE cs_o.x > (SELECT avg(cs_s.v) FROM cs_s, cs_d WHERE cs_s.k = cs_o.k AND cs_s.dk = cs_d.dk AND cs_d.flag = 1);
+SET enable_nestloop = off; SET enable_mergejoin = off;
+EXPLAIN (COSTS OFF) SELECT cs_o.k, (SELECT sum(cs_g.w) FROM cs_g, cs_d WHERE cs_g.g = cs_d.dk AND cs_d.dk = cs_o.k) FROM cs_o WHERE cs_o.k <= 6 ORDER BY 1;
+SELECT cs_o.k, (SELECT sum(cs_g.w) FROM cs_g, cs_d WHERE cs_g.g = cs_d.dk AND cs_d.dk = cs_o.k) FROM cs_o WHERE cs_o.k <= 6 ORDER BY 1;

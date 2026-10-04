@@ -1,0 +1,10 @@
+# arm=on
+# started 2026-10-05T03:00:51+09:00
+# engine-id: ade33abfbbea13733005fe7e38397bf94385ae2b 5ac3486cd9bb5bd29efa1ffe00f8ac6b83e1f7a7  diff=1f002ef11072
+# engine-binary: on-disk=2d63f0a929495cc3 (tmp/m0012-head-bin)
+# per-query cap 600s, serial, digest=1, queries=2,21,22
+# host: load2.30 2.24 2.14
+Q2: OK elapsed=1.36s colsig=98559dc0378d935e ordered=08d93c5bb42c01eb unordered=a7655104482ba6a1 rows=463
+Q21: OK elapsed=4.57s colsig=8877f45c5e0db592 ordered=a9a037de2c5773d8 unordered=8fe8611e5a8afd03 rows=412
+Q22: OK elapsed=0.30s colsig=6d31a4f5ee00a4d0 ordered=dd90b7eaba7da14c unordered=9813c26e4303edc4 rows=7
+# finished 2026-10-05T03:00:58+09:00 runner-rc=0
