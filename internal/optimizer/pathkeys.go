@@ -19,13 +19,33 @@ type PathKey struct {
 	Expr       Expr
 	SortAsc    bool
 	NullsFirst bool
+	// GroupingNulled marks a key on a grouping-sets output column: PG 18
+	// plans those as RTE_GROUP Vars nullable by the grouping step, a
+	// different equivalence-class member from the input column of the same
+	// name. A sorted rollup's group_pathkeys (create_groupingsets_path) are
+	// such keys: they let add_path keep the rollup beside an unordered
+	// hashed path, and never satisfy an ORDER BY written on the plain
+	// columns, which still gets its Sort (M0146-0009o).
+	GroupingNulled bool
 }
 
 // pathKeyEqual reports whether two pathkeys describe the same ordering on the
 // same expression. Expression identity uses the existing exprEqual
-// (planner.go:11522); direction and null placement must also match.
+// (planner.go:11522); direction, null placement and grouping nullability must
+// also match.
 func pathKeyEqual(a, b PathKey) bool {
-	return a.SortAsc == b.SortAsc && a.NullsFirst == b.NullsFirst && exprEqual(a.Expr, b.Expr)
+	return a.SortAsc == b.SortAsc && a.NullsFirst == b.NullsFirst &&
+		a.GroupingNulled == b.GroupingNulled && exprEqual(a.Expr, b.Expr)
+}
+
+// groupingNulledPathkeys returns keys marked GroupingNulled.
+func groupingNulledPathkeys(keys []PathKey) []PathKey {
+	out := make([]PathKey, len(keys))
+	for i, k := range keys {
+		k.GroupingNulled = true
+		out[i] = k
+	}
+	return out
 }
 
 // comparePathkeysDim reduces two orderings to a dominance dimension, reproducing

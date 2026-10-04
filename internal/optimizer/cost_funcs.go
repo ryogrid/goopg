@@ -516,6 +516,27 @@ func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inp
 // currency correction R120 shipped and R124 §7 deleted for measuring
 // net-neutral is reinstated permanently by owner ruling (see the tail
 // comment).
+// costAggSortedRollup is cost_agg's AGG_SORTED arm as create_groupingsets_path
+// (pathnode.c) charges it for a grouping-sets rollup (M0146-0009o). Unlike
+// costAgg it never turns an aggregate-free grouping into cost_group's Group
+// path: PG plans GROUP BY ROLLUP / GROUPING SETS through
+// create_groupingsets_path whether or not there are aggregates, so every
+// group pays its cpu_tuple_cost emit.
+func costAggSortedRollup(cp costParams, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int) Cost {
+	tuples := inputRows
+	if tuples < 0 {
+		tuples = 0
+	}
+	groups := numGroups
+	if groups < 1 {
+		groups = 1
+	}
+	per := cp.cpuOperatorCost * float64(nAggs)
+	total := inputTotal + per*tuples + cp.cpuOperatorCost*float64(numGroupCols)*tuples +
+		per*groups + cp.cpuTupleCost*groups
+	return Cost{Startup: inputStartup, Total: total}
+}
+
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {

@@ -1769,21 +1769,18 @@ func estimateAggregate(a *Aggregate) int64 {
 	// The empty set `()` — ROLLUP's grand total — contributes exactly one
 	// row, which `estimateNumGroups` already answers for an empty expression
 	// list.
+	perSet, ok := groupingSetGroupCounts(a, inputRows)
+	if !ok {
+		// Fail-safe: an out-of-range index means the set list and
+		// GroupExprs disagree, which the builder should make impossible.
+		// Price the whole aggregate the old way rather than silently
+		// dropping a dimension, since dropping one under-states further in
+		// the same direction.
+		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+	}
 	var total int64
-	for _, set := range a.GroupingSets {
-		exprs := make([]Expr, 0, len(set))
-		for _, idx := range set {
-			if idx < 0 || idx >= len(a.GroupExprs) {
-				// Fail-safe: an out-of-range index means the set list and
-				// GroupExprs disagree, which the builder should make
-				// impossible. Price the whole aggregate the old way rather
-				// than silently dropping a dimension, since dropping one
-				// under-states further in the same direction.
-				return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
-			}
-			exprs = append(exprs, a.GroupExprs[idx])
-		}
-		total += estimateNumGroups(exprs, a.Child, inputRows)
+	for _, g := range perSet {
+		total += g
 	}
 	if total < 1 {
 		return 1
@@ -1810,6 +1807,25 @@ func estimateAggregate(a *Aggregate) int64 {
 		}
 	}
 	return total
+}
+
+// groupingSetGroupCounts is get_number_of_groups' per-set loop
+// (planner.c): estimate_num_groups over each grouping set's own expressions,
+// in a.GroupingSets order. The empty set `()` counts one group. ok is false
+// when a set index does not name a group expression.
+func groupingSetGroupCounts(a *Aggregate, inputRows int64) ([]int64, bool) {
+	out := make([]int64, 0, len(a.GroupingSets))
+	for _, set := range a.GroupingSets {
+		exprs := make([]Expr, 0, len(set))
+		for _, idx := range set {
+			if idx < 0 || idx >= len(a.GroupExprs) {
+				return nil, false
+			}
+			exprs = append(exprs, a.GroupExprs[idx])
+		}
+		out = append(out, estimateNumGroups(exprs, a.Child, inputRows))
+	}
+	return out, true
 }
 
 // estimateNumGroups is `estimate_num_groups` (selfuncs.c:3449): the number of
