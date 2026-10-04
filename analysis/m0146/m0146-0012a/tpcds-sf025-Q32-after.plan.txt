@@ -1,0 +1,33 @@
+===== Q32 =====
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=2768.58..2768.59 rows=1 width=32)
+   ->  Aggregate  (cost=2768.58..2768.59 rows=1 width=32)
+         ->  Gather  (cost=1008.74..2768.58 rows=1 width=1456)
+               Workers Planned: 1
+               ->  Nested Loop  (cost=8.74..3000.28 rows=1 width=984)
+                     ->  Nested Loop  (cost=8.49..2967.67 rows=107 width=564)
+                           ->  Parallel Seq Scan on item  (cost=0.00..1467.00 rows=16 width=480)
+                                 Filter: (i_manufact_id = 722)
+                           ->  Bitmap Heap Scan on catalog_sales  (cost=8.49..93.51 rows=22 width=556)
+                                 Recheck Cond: (cs_item_sk = item.i_item_sk)
+                                 Filter: (cs_ext_discount_amt > (SubPlan 1))
+                                 SubPlan 1
+                                   ->  Aggregate  (cost=363.60..363.62 rows=1 width=32)
+                                         ->  Nested Loop  (cost=16.75..363.60 rows=1 width=460)
+                                               ->  Bitmap Heap Scan on catalog_sales catalog_sales_1  (cost=8.49..93.57 rows=22 width=556)
+                                                     Recheck Cond: (cs_item_sk = $0)
+                                                     ->  Bitmap Index Scan on catalog_sales_pkey  (cost=0.38..8.49 rows=22 width=556)
+                                                           Index Cond: (cs_item_sk = $0)
+                                               ->  Bitmap Heap Scan on date_dim date_dim_1  (cost=8.26..12.27 rows=1 width=420)
+                                                     Recheck Cond: (d_date_sk = catalog_sales_1.cs_sold_date_sk)
+                                                     Filter: ((d_date >= '2001-03-09'::date) AND (d_date <= '2001-06-07 00:00:00'::timestamp without time zone))
+                                                     ->  Bitmap Index Scan on date_dim_pkey  (cost=0.25..8.26 rows=1 width=420)
+                                                           Index Cond: (d_date_sk = catalog_sales_1.cs_sold_date_sk)
+                                 ->  Bitmap Index Scan on catalog_sales_pkey  (cost=0.38..8.49 rows=22 width=556)
+                                       Index Cond: (cs_item_sk = item.i_item_sk)
+                     ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.30 rows=1 width=420)
+                           Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                           Filter: ((d_date >= '2001-03-09'::date) AND (d_date <= '2001-06-07 00:00:00'::timestamp without time zone))
+(28 rows)
+

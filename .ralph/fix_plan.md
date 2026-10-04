@@ -26622,6 +26622,28 @@ M0146-0001 re-baseline census on the new default arm.
     to the post\-planning unnest pass, and keeping scalar subqueries as
     SubPlans without M0146\-0012\'s parameterized index probes regressed
     TPC\-H Q2 1\.5 s → 307 s \(M0145\-0008y\)\.
+  - **2026\-10\-05 — slice A \(placement\) landed\.** Design
+    `docs/design/0100\-0149/m0146\-0012a\-sublink\-join\-clause\.md`, evidence
+    `analysis/m0146/m0146\-0012a/`\.
+    - A conjunct holding only correlated scalar sublinks is pre\-lowered
+      before the partition \(`sublinkjoinclause\.go`, M0146\-0015c\'s
+      kept\-subplan rebase with no pulled body\)\. Its PARAM\_EXEC Args count
+      toward relids, so the clause is placed at the join\.
+    - Declined: EXISTS/IN, a sublink the unnest pass would decorrelate,
+      pulled\-up scopes, and Args not naming a base relation\. A
+      sublink\-bearing equality is never a hash/merge key\.
+    - Fixed on the way: `cloneExprReplacingOuter` shared IS NULL/LIKE/…
+      nodes with the original, so a declined rebase wrote `$\-1` into regress
+      join\'s placeholder query\.
+    - EXPLAIN names the PARAM\_EXEC source in Join Filters and
+      parameterised inners \(`pk = p\.pk`, not `$0`\)\.
+    - Movement: none — instrument artefact: TPC\-H Q17 and TPC\-DS Q32/Q92
+      now evaluate the SubPlan at the join \(parameterised inner scan\), but
+      the elected join method still differs from PG\'s until slice B prices
+      the SubPlan\.
+    - Next: slice B — land `subplan\-qual\-cost\.wip\.patch` and port the
+      inner\-unique `outer\_match\_frac` \(`hashJoinFinalCostInputFor`\);
+      witness Q17 Hash Join with Join Filter\.
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort
