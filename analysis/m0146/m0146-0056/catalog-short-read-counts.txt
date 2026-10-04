@@ -1,0 +1,15 @@
+/tmp/rb-go-new/create_index.diff:26
+/tmp/rb-go-new/equivclass.diff:5
+/tmp/rb-go-new/groupingsets.diff:7
+/tmp/rb-go-new/inherit.diff:110
+/tmp/rb-go-new/limit.diff:5
+/tmp/rb-go-new/merge.diff:35
+/tmp/rb-go-new/misc_functions.diff:1
+/tmp/rb-go-new/partition_join.diff:36
+/tmp/rb-go-new/select.diff:3
+/tmp/rb-go-new/select_distinct.diff:6
+/tmp/rb-go-new/select_parallel.diff:1
+/tmp/rb-go-new/stats.diff:20
+/tmp/rb-go-new/union.diff:6
+/tmp/rb-go-new/window.diff:4
+/tmp/rb-go-new/with.diff:17

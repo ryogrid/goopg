@@ -27563,7 +27563,7 @@ M0146-0001 re-baseline census on the new default arm.
       HEAD; both routes; PG shape on the same data\)\.
     - Design `docs/design/0100\-0149/m0146\-0005dz\-redundant\-outer\-join\-clause\.md`\.
   Movement: none — fire set flat; Q78\'s merge keys now match PG\'s below the category level
-- [ ] **M0146\-0009o — grouping\-sets row estimates are about a quarter of
+- [x] **M0146\-0009o — grouping\-sets row estimates are about a quarter of
   PG\'s** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q18 \(SF1
   49 vs 213, SF0\.25 12 vs 49\), Q22 \(17964 vs 71857\), Q67 \(a MixedAggregate
   clamped to its input, 3140 vs 18531\)\. PG sums `estimate\_num\_groups`
@@ -27572,6 +27572,22 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146\-0009
   - First step: find goopg\'s grouping\-sets group count and compare it set
     by set with `get\_number\_of\_groups`\.
+  - **DONE 2026\-10\-04 \(`8830b5335`\)\.** The EXPLAIN\-side `estimateAggregate`
+    already summed the sets; the path search sized the grouped rel from the
+    sets\' union \(`sizeGroupingRelFromAgg`\), so the plan\'s own top line was
+    one set\'s estimate\.
+    - The real counts exposed the pricing: `groupingSetsHashedCost`
+      \(rollup by rollup, AGG\_MIXED for the empty sets\),
+      `costAggSortedRollup` \(no `cost\_group` shortcut\), and the sorted
+      rollup\'s `group\_pathkeys` marked `PathKey\.GroupingNulled` \(RTE\_GROUP
+      nullability: kept by add\_path, never satisfying an ORDER BY\)\.
+    - Fire set: matches flat \(41 / 32\); aggregation\-strategy SF0\.25
+      12 → 11 \(Q67\); Q18/Q80/Q27/Q22 estimates now PG\'s\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B \(groupingsets 1000 → 993\)\.
+    - Test `TestGroupingSetsRowEstimateSumsSets` \(fails on HEAD\)\.
+    - Design `docs/design/0100\-0149/m0146\-0009o\-grouping\-sets\-rows\-and\-rollup\-costs\.md`\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 12→11
 - [ ] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
   filter** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q72: the
   `inventory\_pkey` probe reports rows=527, three times PG\'s 176; the
@@ -27613,3 +27629,25 @@ M0146-0001 re-baseline census on the new default arm.
     near\-tie paths in goopg vs PG \(join\_search\_one\_level pair order and
     per\-pair arm order\), then land the reorder together with whatever
     keeps PG\'s first\-filed winner in Q8\.
+- [ ] **M0146\-0056 — CORRUPTION: a system catalog index reads short at a
+  leaf it references** \(filed 2026\-10\-04 by M0146\-0009o\)\. One
+  pg\-regress\-runner run \(18 planner cases, fresh `tmp/regress\-goopg\-data`\)
+  failed `CREATE TABLE dupindexcols AS …` in `create\_index` with `DDL catalog
+  sync: pg\_class\_relname\_nsp\_index: insert leaf blk 22 sys btree 2663: pin
+  leaf blk 22: short read at block`; every later CREATE in the run failed the
+  same way \(`with`, `stats`, `inherit`, `merge`, `partition\_join`, …\)\. Two
+  reruns of the same binary did not reproduce it\. The cluster was
+  re\-initialised by the rerun; the diffs and runner log are in
+  `analysis/m0146/m0146\-0056/`\.
+  Kind: bug
+  Parent: M0146
+  > ## ESCALATION 2026\-10\-04 \(S2\) — catalog index 2663 short read wedges all DDL
+  > M0146\-0056: a nondeterministic short read on `pg\_class\_relname\_nsp\_index`
+  > leaf block 22 during a catalog\-sync insert; once hit, the cluster can no
+  > longer create relations\. Filed, not worked\. Owner: place it in the banner\.
+  - First step: rerun the 18\-case regress set in a loop with the server log
+    kept \(`tmp/regress\-goopg\.log`\) until it reproduces; then compare the
+    index file size with the block the split allocated \(sys btree extension
+    vs. smgr nblocks; the VACUUM FSM truncation fix and
+    `goopg\_smgr\_ocreate\_recreates\_removed\_files` are the nearest prior
+    cases\)\.
