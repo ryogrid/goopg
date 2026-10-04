@@ -27401,7 +27401,7 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress 18 planner cases identical to HEAD\.
     - Design `docs/design/0100\-0149/m0146\-0005dv\-merge\-inner\-ec\-pathkeys\.md`\.
   Movement: yes — PLAN-PARITY match SF0.25 39 -> 41, SF1 30 -> 32 (Q47, Q57)
-- [ ] **M0146\-0005dw — a merge join over WindowAgg outputs claims the
+- [x] **M0146\-0005dw — a merge join over WindowAgg outputs claims the
   window column\'s order** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q44: `Merge Cond: \(rnk = rnk\)` over two WindowAggs sorted by
   `rank\_col`, with no Sort; PG sorts each side \(a WindowAgg\'s output
@@ -27413,6 +27413,20 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0146\-0005
   - First step: find where a WindowAgg path\'s pathkeys include the window
     function output column\.
+  - **DONE 2026\-10\-04 \(`3dc614ac7`\)\.** Premise refuted: goopg prices
+    the sorts \(absorbed into the merge plan, never printed — ledgered with
+    0005bd\)\. Q44\'s real gap was the derived tables\' initPlans: no
+    Subquery Scan marks the level, so the search priced each derived leaf
+    without them\. `chargeDerivedLeafLevel` \(in `costSubplanLeaf`\) charges
+    the leaf as its own level and marks it for the tail walk\.
+    - Q44 Merge Join 48000\.02 → 81874\.61 \(PG 80931\.41\); fire set flat\.
+    - Ledgered: absorbed merge sorts \(6 queries at SF0\.25\), the WindowAgg
+      line\'s display, InitPlan placement\.
+    - Test `TestDerivedLeafChargesItsInitPlans`\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress 14 planner cases identical to HEAD\.
+    - Design `docs/design/0100\-0149/m0146\-0005dw\-derived\-leaf\-initplan\-charge\.md`\.
+  Movement: none — fire set flat at both scales; Q44 merge cost 48000 -> 81875 (PG 80931)
 - [ ] **M0146\-0005dx — an uncorrelated restriction holding a sublink stays
   above the join search** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q10 and Q35: the OR of two hashed SubPlans on `c` is a

@@ -92,7 +92,8 @@ its own recursive call.
 
 ## Residuals (ledgered)
 
-- **Search time is unchanged.** The charge is applied after the search.
+- **Search time is unchanged** (a derived-table leaf's own initPlans are
+  charged before the search since M0146-0005dw). The charge is applied after the search.
   PG adds it to final-rel paths before `set_cheapest`, which is the same
   increment for all of a level's paths, but a parent level's SubqueryScan
   path then prices a charged child. goopg's searched ancestors (stamped
