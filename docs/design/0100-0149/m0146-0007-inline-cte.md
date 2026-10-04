@@ -1,8 +1,7 @@
 # M0146-0007: single-reference CTE inlining (`inline_cte`)
 
-Status: slices 1-8 landed (the latest 2026-10-04, M0146-0007h: pseudoconstant
-function quals gate their scope); the items under "Still open" in each slice
-are ledgered.
+Status: slices 1-9 landed (the latest 2026-10-04, M0146-0007i: nested
+pull-up); the items under "Still open" in each slice are ledgered.
 
 ## PG behaviour
 
@@ -448,3 +447,61 @@ Still open (ledgered 2026-10-04):
 - folding immutable calls over constants (`length('abc') = 3`);
 - Params and enclosing-level Vars;
 - pseudoconstant join ON quals gated at their join.
+
+## Slice 9 (M0146-0007i): nested simple subqueries are pulled up too
+
+PG's `pull_up_simple_subquery` (`./postgres/src/backend/optimizer/prep/prepjointree.c`)
+runs `pull_up_subqueries` on the subquery before splicing it into the
+parent, so every nesting level flattens. goopg's pull-up (M0146-0028, and
+0007e/f for CTE references) expanded one level. A derived table, or a NOT
+MATERIALIZED CTE reference, inside a pulled body stayed a subquery. In
+`SELECT … FROM (SELECT … FROM (SELECT a, b FROM n_t WHERE b < 5) s, n_u …)
+q WHERE q.b = 1`, PG filters `n_t` by `(b < 5) AND (b = 1)`. goopg kept
+`Filter: (n_t.b = 1)` above the Hash Join (0007f's ledgered item (b)).
+
+### Change
+
+- **Expansion.** `expandDerivedPullups` recurses into each pulled body's
+  join-free items. CTE references convert through `cteAsDerivedItem` as at
+  the top. Each candidate records its `parent` and `depth`, and its expanded
+  item range nests inside the parent's. The depth is bounded at 8.
+- **Gate.** `simpleDerivedPullupBody` admits a join-free derived FROM item
+  that is itself simple.
+- **Resolution.** `resolvePulledDerived` resolves innermost bodies first,
+  all in the same parent coordinates.
+  - A body context sees its own leaves (`pulledHidden` cleared only for the
+    bindings it owns directly) and its direct children through their alias
+    name views.
+  - Only the statement's own items' views are returned for parent-level
+    names.
+  - Every level's WHERE joins the scope's quals.
+- **Ownership.** `pulledCandidateOwning` and `pulledCandidateOwningBinding`
+  return the innermost owning body. Outer-join demotion reads that body's
+  WHERE, and each body reduces only the outer joins of items it owns
+  directly. The reduced items are written back by index, because
+  `applyDemotion` may rewrite the FromExpr itself.
+
+### Effect
+
+- **Probe.** The two-level derived query prints PG's plan. The
+  three-level one carries PG's qual order. The NOT MATERIALIZED CTE read
+  inside another one's body is pulled with it. Every result equals PG's.
+- **Regress A/B** over 22 cases: noise only (a known `join` row-order flip,
+  `memoize` build times).
+- **Gates.**
+  - The fire set fired nothing; no TPC-DS or TPC-H query nests a simple
+    subquery inside a pulled one.
+  - The sweep passed 96/96 and the TPC-H arm 24/24; tpch-spotcheck and
+    ea-ratchet passed.
+
+Test: `TestNestedSimpleSubqueriesPullUp` (fails on HEAD). It checks the
+two-level and three-level derived queries, with PG's filter text and no
+Subquery Scan, and the nested NOT MATERIALIZED CTEs, with PG's rows.
+
+Still open (ledgered 2026-10-04):
+
+- a `SELECT *` body is not pulled up at any level. This is why regress
+  `subselect`'s NOT MATERIALIZED pair still differs;
+- a derived item that is a join operand inside a pulled body;
+- the EC member printed in a pulled join clause;
+- the pre-existing LEFT JOIN qual placement.

@@ -25620,6 +25620,7 @@ M0146-0001 re-baseline census on the new default arm.
     queries\)\.
   - Slice 8 landed 2026\-10\-04 as M0146\-0007h \(pseudoconstant function
     quals gate their scope\)\.
+  - Slice 9 landed 2026\-10\-04 as M0146\-0007i \(nested pull\-up\)\.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -25786,6 +25787,30 @@ M0146-0001 re-baseline census on the new default arm.
     a second derived table, and the pull\-up expands one level \(0007f
     ledger item \(b\)\)\.
   Movement: none — parity held: no TPC\-DS/TPC\-H query has a function\-only pseudoconstant conjunct; fire set flat
+- [x] **M0146\-0007i — a pulled body\'s own simple subqueries and inlinable
+  CTEs are pulled up too** \(slice 9, impl, done 2026\-10\-04; the 0007f
+  ledger row\'s item \(b\)\)\.
+  Kind: impl
+  Parent: M0146\-0007
+  - PG\'s pull\_up\_simple\_subquery runs pull\_up\_subqueries on the
+    subquery first, so every nesting level flattens\. goopg expanded one
+    level: a derived table or NOT MATERIALIZED CTE inside a pulled body
+    stayed a subquery, and the outer qual stayed above the join
+    \(`Filter: \(n\_t\.b = 1\)` over a Hash Join\)\.
+  - `expandDerivedPullups` recurses into a pulled body\'s join\-free items
+    \(`derivedPullupCandidate\.parent`/`depth`, bound 8\);
+    `simpleDerivedPullupBody` admits a join\-free simple derived FROM item;
+    `resolvePulledDerived` resolves innermost bodies first, each body seeing
+    its own leaves plus its direct children\'s name views; ownership
+    \(`pulledCandidateOwning`, `pulledCandidateOwningBinding`\) is the
+    innermost body, and each body reduces only its own outer joins\.
+  - Test `TestNestedSimpleSubqueriesPullUp` \(fails on HEAD\)\.
+  - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire set
+    PASS \(no TPC\-DS query changed\), ea\-ratchet PASS, regress A/B 22 cases
+    \(noise only\)\.
+  - Not reached: regress `subselect`\'s NOT MATERIALIZED pair, whose body
+    writes `SELECT \*` \(star targets still decline the pull\-up\)\.
+  Movement: none — parity held: no TPC\-DS/TPC\-H query nests a simple subquery inside a pulled one; fire set flat
 - [x] **M0146\-0021 — CTE consumer columns render qualified, as PG prints
   them** \(filed and done 2026\-09\-26 from the census: Q74/Q31
   `customer_id = customer_id`, Q77/Q97 `s_store_sk = s_store_sk`\).
