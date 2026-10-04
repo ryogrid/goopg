@@ -1,10 +1,10 @@
 # M0146-0012 — correlated restrictions as base-rel index quals
 
-Status: in progress. The prerequisite slice landed 2026-10-05
-(`c8369e384`), and so did impl slice 1 (`c21a02c93`) and slice 2
-(`1db4edacc`, `flattenStrandedSeqScanFilters` deleted). Still open: the
-restoring rule's correlated half (after M0146-0062) and multi-relation
-EXISTS bodies.
+Status: done 2026-10-05. The prerequisite (`c8369e384`), slice 1
+(`c21a02c93`) and slice 2 (`1db4edacc`, `flattenStrandedSeqScanFilters`
+deleted) landed. The residuals are filed as children: M0146-0012b
+(multi-relation EXISTS bodies, which need AlternativeSubPlan) and
+M0146-0012c (the rule's correlated half, after M0146-0062).
 Parent: none (banner item 3, M0146 file order). Follows M0146-0015a, which
 made a one-relation scope's correlated qual a base restriction.
 
@@ -81,13 +81,28 @@ Evidence: `analysis/m0146/m0146-0012/impl-slice1.md`.
 
 Evidence: `analysis/m0146/m0146-0012/impl-slice2.md`.
 
-## Open
+## Closure (2026-10-05)
 
-- Retire the rule's correlated half once M0146-0062 lands. The rule is
-  `planIndexScanFromWhere` under `planIsBareSeqScanTree` in
-  `planSelectWithSettings`; its uncorrelated half is M0146-0060's.
-- Multi-relation EXISTS bodies: teach the EXISTS→ANY pass to read
-  correlation from a leaf restriction, then admit the conjuncts there too.
-- Rendering in goopg's own decorrelated scalar shape (no PG twin): the
-  group key and the inner Hash Cond lose their qualifier once the
+- Multi-relation EXISTS bodies have no witness. In PG 18.3's TPC-H and
+  TPC-DS plans every multi-relation EXISTS is pulled up to a semi join or
+  hashed (Q10/Q35/Q45), and goopg hashes the same set. Regress
+  `subselect`/`join` show no per-row EXISTS over a join with a correlated
+  leaf probe.
+- PG keeps one per row only when `make_subplan`'s AlternativeSubPlan prices
+  the correlated plan under the hashed one (`subselect.c`, chosen in
+  `setrefs.c`). goopg has no AlternativeSubPlan, and its EXISTS→ANY pass
+  runs after planning, so this becomes M0146-0012b.
+
+Evidence: `analysis/m0146/m0146-0012/closure.md`.
+
+## Open (children)
+
+- **M0146-0012c**: retire the rule's correlated half once M0146-0062
+  lands. The rule is `planIndexScanFromWhere` under
+  `planIsBareSeqScanTree` in `planSelectWithSettings`; its uncorrelated
+  half is M0146-0060's.
+- **M0146-0012b**: multi-relation EXISTS bodies, via a parse-level
+  EXISTS→ANY rewrite and an AlternativeSubPlan choice.
+- Rendering in goopg's own decorrelated scalar shape (no PG twin, ledgered):
+  the group key and the inner Hash Cond lose their qualifier once the
   correlated conjunct sits at a leaf.

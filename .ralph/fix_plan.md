@@ -26465,7 +26465,7 @@ M0146-0001 re-baseline census on the new default arm.
       join\-method election, not a decline\.
     - The population shrank to zero, so no impl task is filed\.
   Movement: none — recon \(lateral decline family 2 → 0 on the default arm\)
-- [ ] **M0146-0012 — correlated restrictions as base-rel index quals**
+- [x] **M0146-0012 — correlated restrictions as base-rel index quals**
   (impl; M0145-0027's ledger residual). PG treats an outer reference as
   a `PARAM_EXEC` and `match_clause_to_indexcol` accepts it as a
   pseudo-constant (`is_pseudo_constant_for_index`, indxpath.c:4596), so
@@ -26540,6 +26540,56 @@ M0146-0001 re-baseline census on the new default arm.
     - Next: blocked on M0146\-0062 for the rule\'s correlated half;
       multi\-relation EXISTS bodies remain \(the EXISTS→ANY pass must read
       correlation from leaves first\)\.
+  - **2026\-10\-05 — closed by measurement; residuals filed as
+    M0146\-0012b and M0146\-0012c\.** Evidence
+    `analysis/m0146/m0146\-0012/closure\.md`\.
+    - Multi\-relation EXISTS bodies have no witness\. In PG 18\.3\'s
+      TPC\-H/TPC\-DS plans every multi\-relation EXISTS is either pulled up
+      to a semi join or hashed \(TPC\-DS Q10/Q35/Q45\)\. goopg\'s plans hash
+      the same set\. Regress `subselect`/`join` show no per\-row EXISTS
+      over a join with a correlated leaf probe either\.
+    - PG keeps a per\-row EXISTS only when its AlternativeSubPlan prices the
+      correlated plan under the hashed one; goopg has no
+      AlternativeSubPlan, so the remaining work is M0146\-0012b\.
+    - The rule\'s correlated half waits on M0146\-0062: M0146\-0012c\.
+    - Movement: none this slice \(closure\)\. The task\'s movement landed in
+      slices 1–2: TPC\-H Q2 1\.34 s → 0\.20 s; TPC\-DS Q32/Q92 SubPlans
+      match PG\'s; aggregation\-strategy −2 at both scales; Q41 18\.2 s →
+      10–12 s\.
+- [ ] **M0146\-0012b — a multi\-relation EXISTS body\'s correlated
+  conjunct is a leaf restriction, with PG\'s AlternativeSubPlan choice**
+  \(filed 2026\-10\-05 by M0146\-0012\)\. PG plans an EXISTS sublink twice
+  in `make\_subplan` \(`./postgres/src/backend/optimizer/plan/subselect\.c`\):
+  - as the correlated EXISTS, where `col = $n` is a base restriction and
+    may drive an index probe;
+  - as `convert\_EXISTS\_to\_ANY`\'s hashed ANY, built from the parse tree
+    before planning;
+  - and `setrefs\.c` keeps the cheaper for the expected number of calls.
+  goopg runs EXISTS→ANY after planning, reading the correlation off the
+  body\'s top quals \(`exists\_to\_any\.go`\), so slice 1 keeps EXISTS
+  bodies\' correlated conjuncts above the join \(TPC\-DS Q35 lost its hashed
+  ANY when they sank\)\.
+  Kind: impl
+  Parent: M0146\-0012
+  - No witness today: TPC\-H, TPC\-DS and regress `subselect`/`join` have
+    no per\-row multi\-relation EXISTS in PG\'s plans \(closure census\)\.
+    Select it when a corpus query or regress case shows one\.
+  - First step: move the EXISTS→ANY rewrite ahead of body planning \(the
+    parse\-level form PG uses\), plan both bodies, and keep the cheaper
+    per expected calls; then admit the correlated conjuncts as leaf
+    restrictions in the EXISTS body \(`scalarSublinkBody`\'s twin\)\.
+- [ ] **M0146\-0012c — retire the one\-relation rule\'s correlated half**
+  \(filed 2026\-10\-05 by M0146\-0012\)\. `planIndexScanFromWhere` under
+  the `planIsBareSeqScanTree` arm of `planSelectWithSettings` still builds
+  a correlated probe the search refuses. The outer key is an int8\-typed
+  literal column against an int4 index \(regress `join`, `unique2 =
+  v\.x`\)\.
+  Kind: impl
+  Parent: M0146\-0012
+  - Blocked on M0146\-0062 \(integer literals typed bigint\)\.
+  - First step after M0146\-0062: skip the rule when the bare tree\'s
+    Filters read an outer level, then A/B regress `join` and the TPC
+    plans \(slice\-2 method, `impl\-slice2\.md`\)\.
 - [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the
