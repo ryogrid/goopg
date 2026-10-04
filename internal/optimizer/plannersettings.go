@@ -220,6 +220,19 @@ type PlannerSettings struct {
 	// the member's own nested subqueries plan exactly as they did.
 	// Unexported like the scope it describes: not a session boundary.
 	appendrelMember bool
+
+	// scalarSublinkBody marks the settings handed to a scalar sublink's
+	// body (planSubqueryExpr), M0146-0012: PG makes a correlated outer
+	// reference a PARAM_EXEC Param with no relids, so `col = outer.x`
+	// in the body is a base restriction of col's relation
+	// (distribute_qual_to_rels) and match_clause_to_indexcol binds it as
+	// an index key (is_pseudo_constant_for_index, indxpath.c). A
+	// multi-relation scope otherwise keeps correlated conjuncts above the
+	// search, because the post-planning EXISTS→ANY pass reads the
+	// correlation off the body's top quals; a scalar body has no such
+	// consumer. Read once by planSelectWithSettings and cleared, so the
+	// body's own nested scopes plan as before.
+	scalarSublinkBody bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no

@@ -867,7 +867,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
-	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, spans)
+	searchConjuncts, locals := partitionConjunctsForJoinPlanningScoped(conjuncts, spans, ctx.scalarSublinkBody)
 	// M0146-0005 slice 4: PG's extract_restriction_or_clauses — redundant
 	// base restrictions derived from join OR clauses, before the leaves are
 	// sized below (orclauses.go).

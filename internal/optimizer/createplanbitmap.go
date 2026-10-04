@@ -39,6 +39,24 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 		bitmapQual = append(bitmapQual, partialPreds...)
 	}
 
+	// A restriction probe's index quals came out of the leaf's own Filter:
+	// they are the recheck list, and the reinstated Filter drops them (PG's
+	// bitmapqualorig vs qpqual, createplan.c create_bitmap_scan_plan) — the
+	// index-scan arm's rule (createIndexScanPlan). Their ColumnRefs are
+	// leaf-local, the scan row the recheck evaluates against.
+	var drop map[Expr]bool
+	if child := p.Children[0]; child.Kind == PathBitmapIndexScan {
+		for _, c := range child.IndexClauses {
+			if c.ri == nil && c.local != nil {
+				if drop == nil {
+					drop = map[Expr]bool{}
+				}
+				drop[c.local] = true
+				bitmapQual = append(bitmapQual, c.local)
+			}
+		}
+	}
+
 	bhs := &BitmapHeapScan{
 		pos:   id.pos,
 		Table: id.table,
@@ -49,6 +67,9 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 		BitmapQual: bitmapQual,
 		Outer:      outer,
 		schema:     id.schema,
+	}
+	if drop != nil {
+		return rewrapLeafDropping(p.Rel.baseLeaf, bhs, drop), nil
 	}
 	return rewrap(bhs), nil
 }

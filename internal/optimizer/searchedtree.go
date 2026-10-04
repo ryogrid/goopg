@@ -275,9 +275,9 @@ func searchedJoinInputRelOf(n Node) *RelOptInfo {
 //
 // The panic is deliberate — see the file header. The carrier set is the set of
 // node kinds `createPlanNode` can return at the root: the join arms' `*Join` and
-// `*NestedLoopIndexJoin`, the scan arms' `*SeqScan` / `*IndexScan` and the
-// `*Filter` their leaf rewrapper can restore around one, `*Sort` from the
-// pathkey arm, and `*Project` from the boundary itself.
+// `*NestedLoopIndexJoin`, the scan arms' `*SeqScan` / `*IndexScan` /
+// `*BitmapHeapScan` and the `*Filter` their leaf rewrapper can restore around
+// one, `*Sort` from the pathkey arm, and `*Project` from the boundary itself.
 func markSearchedTree(n Node) Node {
 	if n == nil {
 		panic("createPlan: asked to tag a nil search root")

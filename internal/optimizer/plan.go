@@ -513,6 +513,9 @@ func (*OuterColumnRef) exprNode()  {}
 type unnestParam struct {
 	OuterRef *OuterColumnRef
 	SubCol   *ColumnRef
+	// Aliases are further occurrences of the same correlation pair
+	// (dedupeUnnestParams): the clone replaces them like OuterRef.
+	Aliases []*OuterColumnRef
 }
 
 // ParamRef passes through a bind-parameter placeholder. The executor
@@ -3469,6 +3472,10 @@ type BitmapHeapScan struct {
 
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
+	// searchedTree: a restriction probe whose index quals were the leaf's
+	// whole Filter leaves a bare bitmap scan at a one-relation search root
+	// (M0146-0012; see *SeqScan above, searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	Alias string

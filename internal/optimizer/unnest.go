@@ -767,7 +767,7 @@ func collectUnnestParams(node Node) []unnestParam {
 	if !allAccounted {
 		return nil
 	}
-	return params
+	return dedupeUnnestParams(params)
 }
 
 // harvestIndexKeyParams finds correlation equijoins that the inner
@@ -1431,6 +1431,9 @@ func buildUnnestedSubquery(sub *SubqueryExpr, params []unnestParam) (Node, Schem
 	groupExprs := make([]Expr, len(params))
 	for i, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 		gk := resolveSubColInSchema(childSchema, p.SubCol)
 		if gk == nil {
 			return nil, nil, nil
@@ -2966,6 +2969,9 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerRaw, err := clonePlanReplacingOuter(agg.Child, replace)
 	if err != nil {
@@ -3419,6 +3425,9 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerPlan, err := clonePlanReplacingOuter(in.Plan, replace)
 	if err != nil {
@@ -4312,7 +4321,44 @@ func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 	if !allAccounted {
 		return nil
 	}
-	return &existsUnnestPlan{Params: params, Residuals: residuals}
+	return &existsUnnestPlan{Params: dedupeUnnestParams(params), Residuals: residuals}
+}
+
+// dedupeUnnestParams drops repeated correlation pairs. One correlation can
+// reach the collectors several times: a correlated restriction sunk to its
+// relation (M0146-0012) sits both in the leaf's Filter and as the index
+// probe key, and harvestIndexKeyParams reads a single-column probe from Key
+// and Keys[0] alike. Each copy became its own GROUP BY and hash key, the
+// same column three times over. A copy that is a distinct *OuterColumnRef
+// is kept as an alias, so the clone still replaces every occurrence.
+func dedupeUnnestParams(params []unnestParam) []unnestParam {
+	type pairKey struct {
+		level, outerIdx, subIdx int
+		name                    string
+	}
+	seen := make(map[pairKey]int, len(params))
+	out := params[:0:0]
+	for _, p := range params {
+		k := pairKey{p.OuterRef.Level, p.OuterRef.Index, p.SubCol.Index, strings.ToLower(p.SubCol.Name)}
+		i, dup := seen[k]
+		if !dup {
+			seen[k] = len(out)
+			out = append(out, p)
+			continue
+		}
+		kept := &out[i]
+		if p.OuterRef == kept.OuterRef {
+			continue
+		}
+		known := false
+		for _, a := range kept.Aliases {
+			known = known || a == p.OuterRef
+		}
+		if !known {
+			kept.Aliases = append(kept.Aliases, p.OuterRef)
+		}
+	}
+	return out
 }
 
 // canUnnestExistsExpr accepts a correlated EXISTS subquery whose
@@ -4894,6 +4940,9 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerPlan, err := clonePlanReplacingOuter(ex.Plan, replace)
 	if err != nil {

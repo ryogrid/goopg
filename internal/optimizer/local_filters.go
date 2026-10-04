@@ -68,6 +68,18 @@ func partitionConjunctsForJoinPlanning(
 	conjuncts []Expr,
 	spans []leafSpan,
 ) (joinConjuncts []Expr, locals relationLocalFilters) {
+	return partitionConjunctsForJoinPlanningScoped(conjuncts, spans, false)
+}
+
+// partitionConjunctsForJoinPlanningScoped is partitionConjunctsForJoinPlanning
+// with the scope's kind: scalarBody (M0146-0012) admits correlated conjuncts
+// as base-rel restrictions in a multi-relation scalar sublink body too, as PG
+// distributes a qual over a PARAM_EXEC Param to the one relation it reads.
+func partitionConjunctsForJoinPlanningScoped(
+	conjuncts []Expr,
+	spans []leafSpan,
+	scalarBody bool,
+) (joinConjuncts []Expr, locals relationLocalFilters) {
 	locals = relationLocalFilters{byBinding: make(map[int][]Expr)}
 	for _, c := range conjuncts {
 		// Conjuncts with subquery / outer-ref content can never be
@@ -87,7 +99,7 @@ func partitionConjunctsForJoinPlanning(
 		// top qual holder, and a qual sunk to a leaf under the body's join
 		// is invisible to them (TPC-DS Q35 lost its hashed ANY to a
 		// per-row SubPlan) — ledgered.
-		if !conjunctLocalEligibility(c, len(spans) == 1) {
+		if !conjunctLocalEligibility(c, len(spans) == 1 || scalarBody) {
 			if b := correlatedScalarSublinkLeaf(c, spans); b >= 0 {
 				locals.byBinding[b] = append(locals.byBinding[b], c)
 				continue

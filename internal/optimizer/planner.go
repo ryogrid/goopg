@@ -537,6 +537,13 @@ type resolveContext struct {
 	// deeper scopes by the same one-level bound.
 	appendrelMember bool
 
+	// scalarSublinkBody marks this resolveContext as a scalar sublink's
+	// body scope (M0146-0012, PlannerSettings.scalarSublinkBody): the seam
+	// admits correlated conjuncts as base-rel restrictions here even when
+	// the scope joins several relations. Set only inside
+	// planSelectWithSettings for a scope that arrived carrying the flag.
+	scalarSublinkBody bool
+
 	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
 	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
 	// transplanted in this statement (R40/K69). Those conjuncts must not
@@ -1618,6 +1625,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// flag reaches member scopes intact.
 	appendrelMember := plannerSet.appendrelMember
 	plannerSet.appendrelMember = false
+	// M0146-0012: same one-scope bound for the scalar-sublink-body mark.
+	scalarSublinkBody := plannerSet.scalarSublinkBody
+	plannerSet.scalarSublinkBody = false
 
 	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): the
 	// one-relation scope is a searched problem like any other —
@@ -1674,6 +1684,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// inherit it.
 		if appendrelMember && ctx != nil {
 			ctx.appendrelMember = true
+		}
+		if scalarSublinkBody && ctx != nil {
+			ctx.scalarSublinkBody = true
 		}
 	}
 	// Make the catalog reachable from every resolveExpr call in
@@ -16668,7 +16681,11 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	// channel — so the inner join search prices under the session's
 	// GUCs. Unstamped hosts carry the zero value, which
 	// planSelectWithParent folds back to the defaults.
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings, rtableScopeFrom(parent))
+	// M0146-0012: the body is a scalar sublink's, so its correlated
+	// conjuncts may sink to the relation they restrict.
+	ps := parent.settings
+	ps.scalarSublinkBody = true
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, ps, rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}

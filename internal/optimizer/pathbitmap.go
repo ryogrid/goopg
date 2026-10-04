@@ -326,11 +326,17 @@ func matchBitmapIndexQuals(
 			}
 			// An outer-level key must carry the column's own type: the probe
 			// encodes its Datum against the btree byte key uncast.
+			var local Expr
 			if t, isOuter := outerParamKeyType(val); isOuter {
 				ct := tbl.Columns[cr.Index].Type
 				if t.Name != ct.Name || t.IsArray != ct.IsArray {
 					continue
 				}
+				// M0146-0012: that same-type probe is exact, so the conjunct
+				// is the heap scan's recheck rather than a Filter beside it
+				// (createBitmapHeapScanPlan). A literal key keeps its Filter:
+				// this arm does not run restrictionKeyUsable's cast checks.
+				local = conj
 			}
 			// Found an equality conjunct matching this index column.
 			stats := columnStatsByName(tbl, colName)
@@ -346,12 +352,13 @@ func matchBitmapIndexQuals(
 			// ri is nil: local quals have no restrictInfo. The Key/Keys
 			// fields (from c.key) are still used by createBitmapIndexScanPlan
 			// to set the index probe bounds. bitmapQualExprs skips entries
-			// with nil ri — local equality conjuncts don't need recheck
-			// because exact B-tree lookup is always correct.
+			// with nil ri; createBitmapHeapScanPlan moves a set `local`
+			// into the recheck list instead.
 			clauses = append(clauses, indexPathClause{
 				ri:       nil,
 				indexCol: pos,
 				key:      val,
+				local:    local,
 			})
 			break // first wins per column
 		}
