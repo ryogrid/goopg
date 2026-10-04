@@ -1,0 +1,605 @@
+PLANCAND add rel=(b 1) cand={k=339 rows=43267 cost=1..2137 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=339 rows=43267 cost=1..2137 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND padd rel=(b 1) cand={k=339 rows=25451 cost=1..1725.24 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b 1) cand={k=339 rows=25451 cost=1..1725.24 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND win rel=(b 1) npath=1 npart=1 total={k=339 rows=43267 cost=1..2137 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=43267 cost=1..2137 dis=0 par=- pk=0 pw=0 psafe=1} param={k=339 rows=43267 cost=1..2137 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1) cand={k=368 rows=43267 cost=1001..7179.19 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=368 rows=43267 cost=1001..7179.19 dis=0 par=- pk=0 pw=0 psafe=0} by={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=369 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1) cand={k=369 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b 1) npath=2 npart=1 total={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} param={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b) cand={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b) cand={k=369 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=369 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND padd rel=(b) cand={k=331 rows=25451 cost=1..1852.49 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b) cand={k=331 rows=25451 cost=1..1852.49 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND win rel=(b) npath=2 npart=1 total={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} param={k=331 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1) cand={k=339 rows=50000 cost=0..1636 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=339 rows=50000 cost=0..1636 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND padd rel=(b 1) cand={k=339 rows=29412 cost=0..1430.12 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b 1) cand={k=339 rows=29412 cost=0..1430.12 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND padd rel=(b 1) cand={k=341 rows=29412 cost=0.29..2239.41 dis=0 par=- pk=1 pw=1 psafe=1}
+PLANCAND pok rel=(b 1) cand={k=341 rows=29412 cost=0.29..2239.41 dis=0 par=- pk=1 pw=1 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=341 rows=50000 cost=0.29..2445.29 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=341 rows=50000 cost=0.29..2445.29 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=341 rows=1 cost=0.29..0.415466 dis=0 par=(b 2) pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=341 rows=1 cost=0.29..0.415466 dis=0 par=(b 2) pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=344 rows=1 cost=0.30952..4.32202 dis=0 par=(b 2) pk=0 pw=0 psafe=1}
+PLANCAND rej rel=(b 1) cand={k=344 rows=1 cost=0.30952..4.32202 dis=0 par=(b 2) pk=0 pw=0 psafe=1} by={k=341 rows=1 cost=0.29..0.415466 dis=0 par=(b 2) pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=368 rows=50000 cost=1000..7430.12 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=368 rows=50000 cost=1000..7430.12 dis=0 par=- pk=0 pw=0 psafe=0} by={k=339 rows=50000 cost=0..1636 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=369 rows=50000 cost=1000.3..8864.42 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=369 rows=50000 cost=1000.3..8864.42 dis=0 par=- pk=1 pw=0 psafe=0} by={k=341 rows=50000 cost=0.29..2445.29 dis=0 par=- pk=1 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=369 rows=50000 cost=4613.1..10311.6 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1) cand={k=369 rows=50000 cost=4613.1..10311.6 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b 1) npath=4 npart=2 total={k=339 rows=50000 cost=0..1636 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=50000 cost=0..1636 dis=0 par=- pk=0 pw=0 psafe=1} param={k=341 rows=1 cost=0.29..0.415466 dis=0 par=(b 2) pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 2) cand={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND padd rel=(b 2) cand={k=339 rows=27786 cost=0..3607.29 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b 2) cand={k=339 rows=27786 cost=0..3607.29 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND add rel=(b 2) cand={k=368 rows=47237 cost=1000..9330.99 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 2) cand={k=368 rows=47237 cost=1000..9330.99 dis=0 par=- pk=0 pw=0 psafe=0} by={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 2) npath=1 npart=1 total={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1} param={k=339 rows=47237 cost=0..4122 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1 2) cand={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND padd rel=(b 1 2) cand={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0..2.06102e+08 pk=0 par=- by={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0..5.9105e+06 pk=0 par=- by={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0.29..2.06102e+08 pk=0 par=- by={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0.29..5.91131e+06 pk=0 par=- by={k=358 rows=47237 cost=13327.8..14286.3 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 2) cand={k=358 rows=47237 cost=7789.71..11068.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=358 rows=47237 cost=7789.71..11068.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2) cand={k=356 rows=47237 cost=4613.1..2.35633e+08 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=47237 cost=4613.1..2.35633e+08 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2) cand={k=356 rows=47237 cost=4613.1..3.54423e+07 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=47237 cost=4613.1..3.54423e+07 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=1.21238e+08..1.21238e+08 pk=0 par=- by={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=3.47901e+06..3.47901e+06 pk=0 par=- by={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=1.21239e+08..1.21239e+08 pk=0 par=- by={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=3.47982e+06..3.47982e+06 pk=0 par=- by={k=358 rows=27786 cost=11402.5..12063.6 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND padd rel=(b 1 2) cand={k=358 rows=27786 cost=7789.71..10616.4 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=358 rows=27786 cost=7789.71..10616.4 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2) cand={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND padd rel=(b 1 2) cand={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=6216.11..6216.11 pk=0 par=- by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=13327.8..13570.9 pk=0 par=- by={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=11391.1..11391.1 pk=0 par=- by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 2) cand={k=356 rows=47237 cost=0..1.06805e+08 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=47237 cost=0..1.06805e+08 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0.29..17820.7 pk=0 par=- by={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0.3..13358.9 pk=0 par=- by={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 2) cand={k=356 rows=47237 cost=0..3.54329e+07 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=47237 cost=0..3.54329e+07 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=359 rows=47237 cost=4712.46..8383.33 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=27786 cost=0..6.28255e+07 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=27786 cost=0..6.28255e+07 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=11665.2..11665.2 pk=0 par=- by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=11943.1..11943.1 pk=0 par=- by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=27786 cost=0..2.08441e+07 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=27786 cost=0..2.08441e+07 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=359 rows=27786 cost=3954.62..6136.43 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND add rel=(b 1 2) cand={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND ok rel=(b 1 2) cand={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} removed=1
+PLANCAND padd rel=(b 1 2) cand={k=359 rows=27786 cost=1797.77..5478.01 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND pok rel=(b 1 2) cand={k=359 rows=27786 cost=1797.77..5478.01 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)} removed=1
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=5937.76..5937.76 pk=0 par=- by={k=359 rows=27786 cost=1797.77..5478.01 dis=0 par=- pk=0 pw=1 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND win rel=(b 1 2) npath=2 npart=1 total={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} startup={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} param={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND add rel=(b 1 2) cand={k=368 rows=47237 cost=2797.77..11201.7 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1 2) cand={k=368 rows=47237 cost=2797.77..11201.7 dis=0 par=- pk=0 pw=0 psafe=0} by={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2) cand={k=369 rows=47237 cost=8528.92..13912.5 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 2) cand={k=369 rows=47237 cost=8528.92..13912.5 dis=0 par=- pk=1 pw=0 psafe=0} removed=1
+PLANCAND win rel=(b 1 2) npath=2 npart=1 total={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} startup={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} param={k=359 rows=47237 cost=2261..6507.01 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND padd rel=(b) cand={k=365 rows=3185 cost=7528.91..7769.15 dis=0 par=- pk=1 pw=1 psafe=1}
+PLANCAND pok rel=(b) cand={k=365 rows=3185 cost=7528.91..7769.15 dis=0 par=- pk=1 pw=1 psafe=1} removed=0
+PLANCAND padd rel=(b) cand={k=365 rows=3185 cost=5616.94..5648.79 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b) cand={k=365 rows=3185 cost=5616.94..5648.79 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND add rel=(b) cand={k=368 rows=5414 cost=6616.94..7190.19 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=368 rows=5414 cost=6616.94..7190.19 dis=0 par=- pk=0 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=369 rows=5414 cost=8528.92..9378.24 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=369 rows=5414 cost=8528.92..9378.24 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=369 rows=5414 cost=6834.12..7451.16 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=369 rows=5414 cost=6834.12..7451.16 dis=0 par=- pk=1 pw=0 psafe=0} removed=1
+PLANCAND add rel=(b) cand={k=369 rows=5414 cost=6834.12..7451.16 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND rej rel=(b) cand={k=369 rows=5414 cost=6834.12..7451.16 dis=0 par=- pk=1 pw=0 psafe=0} by={k=369 rows=5414 cost=6834.12..7451.16 dis=0 par=- pk=1 pw=0 psafe=0} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND win rel=(b) npath=2 npart=2 total={k=368 rows=5414 cost=6616.94..7190.19 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=368 rows=5414 cost=6616.94..7190.19 dis=0 par=- pk=0 pw=0 psafe=0} param={k=368 rows=5414 cost=6616.94..7190.19 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=10174.4..10573.8 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=10174.4..10573.8 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=8528.92..14193.9 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND rej rel=(b) cand={k=365 rows=1062 cost=8528.92..14193.9 dis=0 par=- pk=1 pw=0 psafe=0} by={k=365 rows=1062 cost=10174.4..10573.8 dis=0 par=- pk=1 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=7525.93..7611.65 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=7525.93..7611.65 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=6834.12..7523.35 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=6834.12..7523.35 dis=0 par=- pk=1 pw=0 psafe=0} removed=1
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=7217.26..7262.38 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b) cand={k=365 rows=1062 cost=7217.26..7262.38 dis=0 par=- pk=0 pw=0 psafe=0} by={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b) npath=3 npart=0 total={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} param={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=6834.12..7523.35 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=6834.12..7523.35 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=1062 cost=10174.4..10573.8 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=365 rows=1062 cost=10174.4..10573.8 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND win rel=(b) npath=3 npart=0 total={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1} param={k=365 rows=1062 cost=6743.19..6788.32 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=347 rows=1062 cost=6834.12..7533.97 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=347 rows=1062 cost=6834.12..7533.97 dis=0 par=- pk=0 pw=0 psafe=0} by={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=347 rows=1062 cost=10174.4..10584.4 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND rej rel=(b 1) cand={k=347 rows=1062 cost=10174.4..10584.4 dis=0 par=- pk=0 pw=0 psafe=1} by={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 1) npath=1 npart=0 total={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} param={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND win rel=(b 1) npath=1 npart=0 total={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} param={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND win rel=(b) npath=1 npart=0 total={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} param={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1) cand={k=347 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=347 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=347 rows=43267 cost=5685.11..5793.27 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=347 rows=43267 cost=5685.11..5793.27 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=347 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=347 rows=43267 cost=4714.93..9646.1 dis=0 par=- pk=1 pw=0 psafe=0} by={k=347 rows=43267 cost=5685.11..5793.27 dis=0 par=- pk=1 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND padd rel=(b 1) cand={k=347 rows=25451 cost=1..1852.49 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b 1) cand={k=347 rows=25451 cost=1..1852.49 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND win rel=(b 1) npath=2 npart=1 total={k=347 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=347 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1} param={k=347 rows=43267 cost=1..2353.34 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 2) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 2) cand={k=347 rows=1062 cost=6852.31..6854.97 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=347 rows=1062 cost=6852.31..6854.97 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND win rel=(b 2) npath=2 npart=0 total={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1} param={k=347 rows=1062 cost=6743.19..6798.94 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 1 2) cand={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 2) cand={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b 1 2) cand={k=371 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 2) cand={k=371 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b 1 2) npath=2 npart=0 total={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} param={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b) cand={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=371 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=371 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b) npath=2 npart=0 total={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} param={k=371 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b 6) cand={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b 6) cand={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b 6) cand={k=347 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 6) cand={k=347 rows=200 cost=12537.4..12759.6 dis=0 par=- pk=0 pw=0 psafe=0} by={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1) cand={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 1) cand={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND padd rel=(b 1) cand={k=339 rows=232218 cost=0..15258.2 dis=0 par=- pk=0 pw=3 psafe=1}
+PLANCAND pok rel=(b 1) cand={k=339 rows=232218 cost=0..15258.2 dis=0 par=- pk=0 pw=3 psafe=1} removed=0
+PLANCAND add rel=(b 1) cand={k=368 rows=719876 cost=1000..88245.8 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1) cand={k=368 rows=719876 cost=1000..88245.8 dis=0 par=- pk=0 pw=0 psafe=0} by={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 1) npath=1 npart=1 total={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1} param={k=339 rows=719876 cost=0..20134.8 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 2) cand={k=339 rows=90 cost=0..2519.73 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=339 rows=90 cost=0..2519.73 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND padd rel=(b 2) cand={k=339 rows=53 cost=0..2068.55 dis=0 par=- pk=0 pw=1 psafe=1}
+PLANCAND pok rel=(b 2) cand={k=339 rows=53 cost=0..2068.55 dis=0 par=- pk=0 pw=1 psafe=1} removed=0
+PLANCAND padd rel=(b 2) cand={k=341 rows=53 cost=0.2925..3245.09 dis=0 par=- pk=1 pw=1 psafe=1}
+PLANCAND pok rel=(b 2) cand={k=341 rows=53 cost=0.2925..3245.09 dis=0 par=- pk=1 pw=1 psafe=1} removed=0
+PLANCAND add rel=(b 2) cand={k=341 rows=90 cost=0.2925..3696.27 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=341 rows=90 cost=0.2925..3696.27 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 2) cand={k=341 rows=1 cost=0.2925..0.324035 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 2) cand={k=341 rows=1 cost=0.2925..0.324035 dis=0 par=(b 1) pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 2) cand={k=344 rows=1 cost=0.301372..4.31887 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND rej rel=(b 2) cand={k=344 rows=1 cost=0.301372..4.31887 dis=0 par=(b 1) pk=0 pw=0 psafe=1} by={k=341 rows=1 cost=0.2925..0.324035 dis=0 par=(b 1) pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 2) cand={k=368 rows=90 cost=1000..3077.55 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 2) cand={k=368 rows=90 cost=1000..3077.55 dis=0 par=- pk=0 pw=0 psafe=0} by={k=339 rows=90 cost=0..2519.73 dis=0 par=- pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 2) cand={k=369 rows=90 cost=1000.3..4255.22 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND rej rel=(b 2) cand={k=369 rows=90 cost=1000.3..4255.22 dis=0 par=- pk=1 pw=0 psafe=0} by={k=341 rows=90 cost=0.2925..3696.27 dis=0 par=- pk=1 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 2) npath=3 npart=2 total={k=339 rows=90 cost=0..2519.73 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=90 cost=0..2519.73 dis=0 par=- pk=0 pw=0 psafe=1} param={k=341 rows=1 cost=0.2925..0.324035 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND add rel=(b 3) cand={k=339 rows=12 cost=0..1.12 dis=0 par=- pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 3) cand={k=339 rows=12 cost=0..1.12 dis=0 par=- pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 3) cand={k=341 rows=12 cost=0.135..12.315 dis=0 par=- pk=1 pw=0 psafe=1}
+PLANCAND ok rel=(b 3) cand={k=341 rows=12 cost=0.135..12.315 dis=0 par=- pk=1 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 3) cand={k=341 rows=1 cost=0.135..0.152517 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND ok rel=(b 3) cand={k=341 rows=1 cost=0.135..0.152517 dis=0 par=(b 1) pk=0 pw=0 psafe=1} removed=0
+PLANCAND add rel=(b 3) cand={k=344 rows=1 cost=0.142761..4.15526 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND rej rel=(b 3) cand={k=344 rows=1 cost=0.142761..4.15526 dis=0 par=(b 1) pk=0 pw=0 psafe=1} by={k=341 rows=1 cost=0.135..0.152517 dis=0 par=(b 1) pk=0 pw=0 psafe=1} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 3) npath=3 npart=0 total={k=339 rows=12 cost=0..1.12 dis=0 par=- pk=0 pw=0 psafe=1} startup={k=339 rows=12 cost=0..1.12 dis=0 par=- pk=0 pw=0 psafe=1} param={k=341 rows=1 cost=0.135..0.152517 dis=0 par=(b 1) pk=0 pw=0 psafe=1}
+PLANCAND win rel=(b 6) npath=1 npart=0 total={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0} param={k=347 rows=200 cost=9263.09..9263.59 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b 1 2) cand={k=358 rows=848 cost=104998..108606 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=358 rows=848 cost=104998..108606 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND padd rel=(b 1 2) cand={k=358 rows=274 cost=42446.6..43610.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=358 rows=274 cost=42446.6..43610.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0..1.8147e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=848 cost=0..1.8147e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0.2925..253399 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=848 cost=0.2925..253399 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0.3025..38722.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=848 cost=0.3025..38722.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=274 cost=0..5.85397e+08 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=274 cost=0..5.85397e+08 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=358 rows=274 cost=42446.6..43610.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=83181.9..83181.9 pk=0 par=- by={k=358 rows=274 cost=42446.6..43610.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=274 cost=0.3025..21654.3 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=356 rows=274 cost=0.3025..21654.3 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=274 cost=0..331268 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=274 cost=0..331268 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=356 rows=274 cost=0.3025..21654.3 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND add rel=(b 1 2) cand={k=359 rows=848 cost=2520.86..24545.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=359 rows=848 cost=2520.86..24545.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=0
+PLANCAND padd rel=(b 1 2) cand={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=18359.6..18359.6 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=104998..106798 pk=0 par=- by={k=359 rows=848 cost=2520.86..24545.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=106345..106345 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0..2.62451e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=848 cost=0..2.62451e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0..1.31273e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=848 cost=0..1.31273e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0.2925..1.81582e+06 pk=0 par=- by={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 2) cand={k=356 rows=848 cost=0.2925..1.3139e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=848 cost=0.2925..1.3139e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 2) in=(b 1)} by={k=356 rows=848 cost=0.2925..253399 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2) dis=0 cost=104283..106164 pk=0 par=- by={k=359 rows=848 cost=2520.86..24545.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=1.06921e+06..1.06921e+06 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=305735..305735 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=1.07039e+06..1.07039e+06 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=306911..306911 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=105928..105928 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=32649.2..38687.2 pk=0 par=- by={k=359 rows=848 cost=2520.86..24545.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=22499.6..22499.6 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=38235.9..38235.9 pk=0 par=- by={k=359 rows=274 cost=2069.21..17937 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND add rel=(b 1 3) cand={k=358 rows=687338 cost=102477..112949 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=358 rows=687338 cost=102477..112949 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=0
+PLANCAND padd rel=(b 1 3) cand={k=358 rows=221722 cost=39925.1..43303.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND pok rel=(b 1 3) cand={k=358 rows=221722 cost=39925.1..43303.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0..872825 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=356 rows=687338 cost=0..872825 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0.135..129167 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=356 rows=687338 cost=0.135..129167 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0.145..37405.7 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=356 rows=687338 cost=0.145..37405.7 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=1
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=1
+PLANCAND padd rel=(b 1 3) cand={k=356 rows=221722 cost=0..290319 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND prej rel=(b 1 3) cand={k=356 rows=221722 cost=0..290319 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} by={k=358 rows=221722 cost=39925.1..43303.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 3) dis=0 cost=46607.6..46607.6 pk=0 par=- by={k=358 rows=221722 cost=39925.1..43303.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND padd rel=(b 1 3) cand={k=356 rows=221722 cost=0.145..20830.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND pok rel=(b 1 3) cand={k=356 rows=221722 cost=0.145..20830.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=1
+PLANCAND padd rel=(b 1 3) cand={k=356 rows=221722 cost=0..54244.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND prej rel=(b 1 3) cand={k=356 rows=221722 cost=0..54244.4 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} by={k=356 rows=221722 cost=0.145..20830.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=keys:EQ
+PLANCAND add rel=(b 1 3) cand={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND ok rel=(b 1 3) cand={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=0
+PLANCAND padd rel=(b 1 3) cand={k=359 rows=221722 cost=1.27..16074.6 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND pok rel=(b 1 3) cand={k=359 rows=221722 cost=1.27..16074.6 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1) in=(b 3)} removed=1
+PLANCAND preskip rel=(b 1 3) dis=0 cost=102477..104276 pk=0 par=- by={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0..349600 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)}
+PLANCAND rej rel=(b 1 3) cand={k=356 rows=687338 cost=0..349600 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)} by={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0..193705 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)}
+PLANCAND rej rel=(b 1 3) cand={k=356 rows=687338 cost=0..193705 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)} by={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 3) dis=0 cost=0.135..241629 pk=0 par=- by={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND add rel=(b 1 3) cand={k=356 rows=687338 cost=0.135..193716 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)}
+PLANCAND rej rel=(b 1 3) cand={k=356 rows=687338 cost=0.135..193716 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 3) in=(b 1)} by={k=356 rows=687338 cost=0.135..129167 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 3) dis=0 cost=102475..104285 pk=0 par=- by={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND preskip rel=(b 1 3) dis=0 cost=32649.2..36168.4 pk=0 par=- by={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND add rel=(b 3 6) cand={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND ok rel=(b 3 6) cand={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..111212 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND rej rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..111212 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} by={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9319.21 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND rej rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9319.21 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} by={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.23..111223 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND ok rel=(b 3 6) cand={k=356 rows=12 cost=9263.23..111223 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND ok rel=(b 3 6) cand={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} removed=2
+PLANCAND add rel=(b 3 6) cand={k=359 rows=12 cost=9266.09..9268.56 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND rej rel=(b 3 6) cand={k=359 rows=12 cost=9266.09..9268.56 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} by={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=keys cmp=cost:EQ keys:B2 outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)}
+PLANCAND rej rel=(b 3 6) cand={k=358 rows=12 cost=9272.57..9275.34 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)} by={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=keys cmp=cost:EQ keys:B2 outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9535.59 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)}
+PLANCAND rej rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9535.59 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)} by={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=cost cmp=cost:B2 keys:B2 outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9318.74 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)}
+PLANCAND rej rel=(b 3 6) cand={k=356 rows=12 cost=9263.09..9318.74 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)} by={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=keys cmp=cost:EQ keys:B2 outer:EQ
+PLANCAND add rel=(b 3 6) cand={k=359 rows=12 cost=9264.36..9266.48 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)}
+PLANCAND rej rel=(b 3 6) cand={k=359 rows=12 cost=9264.36..9266.48 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 3)} by={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} via=keys cmp=cost:EQ keys:B2 outer:EQ
+PLANCAND add rel=(b 1 2) cand={k=368 rows=848 cost=3069.21..19021.8 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 2) cand={k=368 rows=848 cost=3069.21..19021.8 dis=0 par=- pk=0 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b 1 2) npath=5 npart=1 total={k=368 rows=848 cost=3069.21..19021.8 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=356 rows=848 cost=0..994475 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} param={k=368 rows=848 cost=3069.21..19021.8 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b 1 3) cand={k=368 rows=687338 cost=1001.27..85808.4 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1 3) cand={k=368 rows=687338 cost=1001.27..85808.4 dis=0 par=- pk=0 pw=0 psafe=0} by={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3) cand={k=369 rows=687338 cost=42067.8..123384 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 3) cand={k=369 rows=687338 cost=42067.8..123384 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b 1 3) npath=5 npart=1 total={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} startup={k=356 rows=687338 cost=0..140990 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)} param={k=359 rows=687338 cost=1.27..22662.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 3)}
+PLANCAND win rel=(b 3 6) npath=1 npart=0 total={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} startup={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)} param={k=356 rows=12 cost=9263.23..9330.41 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 3) in=(b 6)}
+PLANCAND add rel=(b 1 2 3) cand={k=358 rows=810 cost=19064.4..19076.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=358 rows=810 cost=19064.4..19076.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND padd rel=(b 1 2 3) cand={k=358 rows=261 cost=17949.4..17953.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND pok rel=(b 1 2 3) cand={k=358 rows=261 cost=17949.4..17953.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..20026.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..20026.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} removed=2
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.36..19043.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.36..19043.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..19165.4 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..19165.4 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.86..25550.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.86..25550.4 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=1
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=2521..24566.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=2521..24566.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.86..24689 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=2520.86..24689 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..39727.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..39727.2 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.4375..38850.7 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.4375..38850.7 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.4475..38743.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.4475..38743.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=0.4375..38850.7 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=2
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..254404 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..254404 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4275..253514 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4375..253409 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..253543 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..253543 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=1
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0..995480 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0..995480 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..994604 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..994604 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=0..995480 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..994497 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..994497 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=0..995480 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=1
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.21..18261.3 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND prej rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.21..18261.3 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=358 rows=261 cost=17949.4..17953.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=keys:EQ
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.35..17978.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND prej rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.35..17978.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=358 rows=261 cost=17949.4..17953.5 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=keys:EQ
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.36..17944.6 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND pok rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.36..17944.6 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=1
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.21..17984.1 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND prej rel=(b 1 2 3) cand={k=356 rows=261 cost=2069.21..17984.1 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=261 cost=2069.36..17944.6 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=keys:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.27..994479 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=359 rows=810 cost=3070.48..19026 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND rej rel=(b 1 2 3) cand={k=359 rows=810 cost=3070.48..19026 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND padd rel=(b 1 2 3) cand={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND pok rel=(b 1 2 3) cand={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} removed=1
+PLANCAND add rel=(b 1 2 3) cand={k=358 rows=810 cost=19064.4..19076.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=358 rows=810 cost=19064.4..19076.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=3069.21..228263 pk=0 par=- by={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..19177.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.21..19177.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=3069.35..228274 pk=0 par=- by={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.35..19188.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=3069.35..19188.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=358 rows=810 cost=19063.2..19085.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=358 rows=810 cost=19063.2..19085.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=359 rows=810 cost=19032.4..19043.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=359 rows=810 cost=19032.4..19043.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3) in=(b 1 2)} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=108272..109990 pk=0 par=- by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=44144.8..44144.8 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=1.27..1.73268e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=1.27..1.73268e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.5625..223709 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=1.5725..40436.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=1.5725..40436.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=1.27..953077 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=1.27..953077 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..1.7327e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..1.7327e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4375..238452 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4475..44812.3 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..967820 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=0.145..967820 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=42067.8..1.73278e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=42067.8..1.73278e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)} removed=0
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=42068..346105 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=42068..346105 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=42068.1..141158 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND ok rel=(b 1 2 3) cand={k=356 rows=810 cost=42068.1..141158 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=42067.8..1.0538e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=42067.8..1.0538e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=42068.1..141158 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..1.73279e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..1.73279e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4275..330213 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=0.4375..136574 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..1.05958e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.135..1.05958e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0..1.7328e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0..1.7328e+09 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..363711 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.2925..363711 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0.2925..253543 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..158764 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0.3025..158764 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=356 rows=810 cost=0..1.0714e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=356 rows=810 cost=0..1.0714e+06 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=1.27..5.58939e+08 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND prej rel=(b 1 2 3) cand={k=356 rows=261 cost=1.27..5.58939e+08 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=80928.3..80928.3 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=18825..18825 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND padd rel=(b 1 2 3) cand={k=356 rows=261 cost=1.27..317915 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND prej rel=(b 1 2 3) cand={k=356 rows=261 cost=1.27..317915 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=keys:EQ
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=2520.86..145229 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 2 3) cand={k=359 rows=810 cost=2522.13..26988.1 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3) cand={k=359 rows=810 cost=2522.13..26988.1 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 3) in=(b 2)} by={k=356 rows=810 cost=2520.99..24673.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=18698.1..18698.1 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=19149.7..19149.7 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=108272..109990 pk=0 par=- by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=109538..109538 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.27..2.04207e+06 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.27..604462 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.5625..2.04325e+06 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=1.5625..605639 pk=0 par=- by={k=356 rows=810 cost=0.3025..38865.8 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=107556..109357 pk=0 par=- by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=1.20314e+06..1.20314e+06 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=366569..366569 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=1.20431e+06..1.20431e+06 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=367746..367746 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=109121..109121 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND preskip rel=(b 1 2 3) dis=0 cost=35953.6..43174.6 pk=0 par=- by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=23948.8..23948.8 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND ppreskip rel=(b 1 2 3) dis=0 cost=42723.3..42723.3 pk=0 par=- by={k=359 rows=261 cost=2070.48..17939.2 dis=0 par=- pk=0 pw=3 psafe=1 jt=0 out=(b 1 2) in=(b 3)}
+PLANCAND add rel=(b 1 3 6) cand={k=358 rows=687338 cost=115020..139077 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=358 rows=687338 cost=115020..139077 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..6.36999e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..6.36999e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.24..6.37001e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.24..6.37001e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.24..3.13969e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.24..3.13969e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=51330.8..6.37009e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=356 rows=687338 cost=51330.8..6.37009e+09 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=51330.8..3.22567e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=356 rows=687338 cost=51330.8..3.22567e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..6.3701e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..6.3701e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..3.23145e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..3.23145e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.09..6.37011e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.09..6.37011e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.09..3.24327e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.09..3.24327e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} by={k=356 rows=687338 cost=9264.36..3.12495e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=359 rows=687338 cost=9266.09..227581 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=359 rows=687338 cost=9266.09..227581 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 3 6) cand={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} removed=2
+PLANCAND preskip rel=(b 1 3 6) dis=0 cost=115020..116739 pk=0 par=- by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..7.29095e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..7.29095e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..4.06647e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9264.36..4.06647e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=359 rows=687338 cost=45216.7..114072 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)}
+PLANCAND rej rel=(b 1 3 6) cand={k=359 rows=687338 cost=45216.7..114072 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 3)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 3 6) dis=0 cost=111739..113594 pk=0 par=- by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..358929 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..358929 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..203035 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..203035 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 3 6) dis=0 cost=111739..113594 pk=0 par=- by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)}
+PLANCAND add rel=(b 1 3 6) cand={k=359 rows=687338 cost=41912.4..54214.1 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)}
+PLANCAND ok rel=(b 1 3 6) cand={k=359 rows=687338 cost=41912.4..54214.1 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)} removed=0
+PLANCAND preskip rel=(b 1 3 6) dis=0 cost=111739..113594 pk=0 par=- by={k=359 rows=687338 cost=41912.4..54214.1 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1)}
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..6.71687e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..6.71687e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..159043 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)}
+PLANCAND rej rel=(b 1 3 6) cand={k=356 rows=687338 cost=9263.23..159043 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)} by={k=359 rows=687338 cost=9267.36..109255 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 3 6) cand={k=359 rows=687338 cost=9330.56..39038.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)}
+PLANCAND ok rel=(b 1 3 6) cand={k=359 rows=687338 cost=9330.56..39038.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)} removed=2
+PLANCAND add rel=(b 1 2 3) cand={k=368 rows=810 cost=3070.48..19020.2 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b 1 2 3) cand={k=368 rows=810 cost=3070.48..19020.2 dis=0 par=- pk=0 pw=0 psafe=0} by={k=356 rows=810 cost=3069.35..19150.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3) cand={k=369 rows=810 cost=18949.7..19045.6 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b 1 2 3) cand={k=369 rows=810 cost=18949.7..19045.6 dis=0 par=- pk=1 pw=0 psafe=0} removed=1
+PLANCAND win rel=(b 1 2 3) npath=7 npart=1 total={k=369 rows=810 cost=18949.7..19045.6 dis=0 par=- pk=1 pw=0 psafe=0} startup={k=356 rows=810 cost=0..994619 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1 2) in=(b 3)} param={k=369 rows=810 cost=18949.7..19045.6 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND win rel=(b 1 3 6) npath=2 npart=0 total={k=359 rows=687338 cost=9330.56..39038.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)} startup={k=359 rows=687338 cost=9330.56..39038.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)} param={k=359 rows=687338 cost=9330.56..39038.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1) in=(b 3 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28355.9..28384.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28355.9..28384.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..7.5258e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..7.5258e+06 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..7.5259e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..7.5259e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..32059.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..32059.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..7.53142e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..7.53142e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..37582.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..37582.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.4..7.54562e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.4..7.54562e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=0
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.39..7.76029e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.39..7.76029e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.39..266452 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.39..266452 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.24..8.47457e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.24..8.47457e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.24..980729 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.24..980729 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.09..8.50137e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.09..8.50137e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.09..1.00753e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.09..1.00753e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=9266.09..1.00398e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=9266.09..1.00398e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28215.8..28402.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28215.8..28402.8 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} by={k=358 rows=810 cost=28355.9..28384.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} removed=1
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=28212.8..3.81838e+06 pk=0 par=- by={k=356 rows=810 cost=12332.4..32059.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..31956.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=28212.8..31956.2 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28318.8..28395.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28318.8..28395.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=119950..121669 pk=0 par=- by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..1.7327e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..1.7327e+09 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..261759 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..261759 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.86..56812.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.86..56812.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..969453 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..969453 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=51330.8..3.22567e+06 pk=1 par=- by={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=51331.1..3.42672e+06 pk=1 par=- by={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=51331.1..3.23308e+06 pk=1 par=- by={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=51330.8..3.22567e+06 pk=1 par=- by={k=356 rows=810 cost=28212.8..31954.7 dis=0 par=- pk=1 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=11851.4..43363.5 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=11851.4..43363.5 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 3 6) in=(b 2)} by={k=356 rows=810 cost=11784.1..37582.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=119950..121669 pk=0 par=- by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..3.4588e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..3.4588e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..1.27331e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.56..1.27331e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..3.45997e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..3.45997e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..1.27449e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9330.85..1.27449e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 2) in=(b 1 3 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=119235..121035 pk=0 par=- by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=50987..56865.9 pk=0 par=- by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28398.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28398.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=358 rows=810 cost=28355.9..28376.7 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 6) in=(b 1 2 3)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=12332.4..7.93121e+06 pk=0 par=- by={k=356 rows=810 cost=11784.1..37582.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} removed=2
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=11784.1..7.93673e+06 pk=0 par=- by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..34028.5 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=11784.1..34028.5 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.53..7.95104e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.53..7.95104e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.4..51774.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2 3) in=(b 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND ok rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} removed=1
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.52..8.16571e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.52..8.16571e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.52..262883 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.52..262883 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.23..8.90679e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.23..8.90679e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.23..1.00396e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=9263.23..1.00396e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=9330.56..1.00382e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=9330.56..1.00382e+06 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=12399.8..28363.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=12399.8..28363.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} by={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28394.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28394.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)} by={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND preskip rel=(b 1 2 3 6) dis=0 cost=12332.4..237592 pk=0 par=- by={k=356 rows=810 cost=11784.1..34028.5 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND add rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..28507 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=356 rows=810 cost=12332.4..28507 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)} by={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=tie cmp=cost:EQ keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28394.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=358 rows=810 cost=28326.3..28394.6 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)} by={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND add rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28295.6..28373.1 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)}
+PLANCAND rej rel=(b 1 2 3 6) cand={k=359 rows=810 cost=28295.6..28373.1 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 3 6) in=(b 1 2)} by={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND win rel=(b 1 2 3 6) npath=4 npart=0 total={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} startup={k=356 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)} param={k=356 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0 jt=0 out=(b 1 2) in=(b 3 6)}
+PLANCAND win rel=(b 1 2 3 6) npath=4 npart=0 total={k=331 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0} startup={k=331 rows=810 cost=9263.53..48205.3 dis=0 par=- pk=0 pw=0 psafe=0} param={k=331 rows=810 cost=12332.4..28504.9 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND add rel=(b) cand={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=8 cost=28508.9..28509 dis=0 par=- pk=0 pw=0 psafe=0}
+PLANCAND rej rel=(b) cand={k=365 rows=8 cost=28508.9..28509 dis=0 par=- pk=0 pw=0 psafe=0} by={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} via=keys cmp=cost:EQ keys:B2 outer:EQ
+PLANCAND win rel=(b) npath=2 npart=0 total={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} startup={k=365 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0} param={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND add rel=(b) cand={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=365 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=365 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=373 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=373 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND add rel=(b) cand={k=373 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0}
+PLANCAND ok rel=(b) cand={k=373 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0} removed=0
+PLANCAND win rel=(b) npath=2 npart=0 total={k=373 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0} startup={k=373 rows=8 cost=28212.8..31958.8 dis=0 par=- pk=1 pw=0 psafe=0} param={k=373 rows=8 cost=28544..28550.2 dis=0 par=- pk=1 pw=0 psafe=0}

@@ -27625,7 +27625,7 @@ M0146-0001 re-baseline census on the new default arm.
   Parent: M0141\-S2a\-fix2r
   - First step: compare `cost\_agg`\'s spill pages/depth for Q4\'s store arm
     term by term with goopg\'s, on PG\'s widths\.
-- [ ] **M0146\-0005ea — offer the materialised\-inner nested loop after the
+- [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
   \(bare inner, probes, Memoize\) before the `matpath` \(joinpath\.c:1883\-1971\),
@@ -27643,6 +27643,20 @@ M0146-0001 re-baseline census on the new default arm.
     near\-tie paths in goopg vs PG \(join\_search\_one\_level pair order and
     per\-pair arm order\), then land the reorder together with whatever
     keeps PG\'s first\-filed winner in Q8\.
+  - **DONE 2026\-10\-04 \(`655d5f908`\)\.** The instrumented PG \(M0144\-0005
+    `debug\_plan\_candidates`, :5560\) Q8 trace: PG\'s Memoize twin of the
+    plain store probe is rejected `via=tie` because `create\_memoize\_path`
+    adds one cpu\_tuple\_cost to startup; goopg\'s Memoize copied its
+    subpath exactly\. Landed with the reorder: `addMaterialNestLoopPath`
+    after `addNLIPaths`, and Memoize \+cpu\_tuple\_cost\.
+    - Fire set: matches SF0\.25 41 → 42, SF1 32 → 33 \(Q10\); Q8 holds;
+      Q35 SF1 gained 4 categories \(ledgered\)\.
+    - Gates: units, tpch\-spotcheck, sf025 96/96, TPC\-H arm 24/24, fire
+      set, ea\-ratchet, regress A/B \(noise\)\.
+    - Tests `TestMaterialNestLoopOfferedAfterIndexProbes` \(fails on HEAD\),
+      `TestGetMemoizePathGates` updated\.
+    - Design `docs/design/0100\-0149/m0146\-0005ea\-matpath\-after\-probes\-memoize\-cost\.md`\.
+  Movement: yes — PLAN\-PARITY match SF0\.25 41→42, SF1 32→33
 - [ ] **M0146\-0056 — CORRUPTION: a system catalog index reads short at a
   leaf it references** \(filed 2026\-10\-04 by M0146\-0009o\)\. One
   pg\-regress\-runner run \(18 planner cases, fresh `tmp/regress\-goopg\-data`\)
