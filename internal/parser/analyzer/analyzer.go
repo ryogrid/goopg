@@ -3156,13 +3156,18 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 		cols = append(cols, catalog.Column{Name: name, Type: typ})
 	}
 	// Validate and apply explicit column aliases (rv.Columns). M0097-0003.
+	// PG raises only when MORE aliases are given than the subquery has
+	// columns; a shorter list renames the leading columns and the rest keep
+	// their own names (buildRelationAliases, parse_relation.c). M0146-0028g.
 	if len(rv.Columns) > 0 {
-		if len(rv.Columns) != len(cols) {
-			return nil, analyzeError(rv.Pos(), "42P01",
+		if len(rv.Columns) > len(cols) {
+			// ERRCODE_INVALID_COLUMN_REFERENCE, raised with no error
+			// position (buildRelationAliases).
+			return nil, analyzeError(0, "42P10",
 				fmt.Sprintf("table %q has %d columns available but %d columns specified",
 					rv.Alias, len(cols), len(rv.Columns)))
 		}
-		for i := range cols {
+		for i := range rv.Columns {
 			cols[i].Name = rv.Columns[i]
 		}
 	}

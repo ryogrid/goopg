@@ -4887,9 +4887,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// PostgreSQL raises an error only if MORE aliases are given than there are columns.
 	// Partial alias lists (fewer aliases than columns) are allowed. M0097-0003.
 	if len(rv.Columns) > 0 && len(rv.Columns) > len(tbl.Columns) {
+		// ERRCODE_INVALID_COLUMN_REFERENCE with no error position, as
+		// buildRelationAliases raises it (M0146-0028g).
 		return nil, rangeBinding{}, &PlanError{
-			Pos:  rv.Pos(),
-			Code: "42P01",
+			Code: "42P10",
 			Message: fmt.Sprintf("table %q has %d columns available but %d columns specified",
 				rv.Alias, len(tbl.Columns), len(rv.Columns)),
 		}

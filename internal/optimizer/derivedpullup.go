@@ -73,12 +73,15 @@ type pulledDerivedRel struct {
 // derivedPullupCandidate records one derived item chosen for pull-up while
 // the FROM list is being expanded.
 type derivedPullupCandidate struct {
-	alias  string
-	body   *parser.SelectStmt
-	itemLo int // first expanded item of the body
-	itemHi int // one past the last
-	bindLo int
-	bindHi int
+	alias string
+	// columns is the item's column-alias list (`AS x(c1, c2)`), naming the
+	// first len(columns) outputs; nil when absent (M0146-0028g).
+	columns []string
+	body    *parser.SelectStmt
+	itemLo  int // first expanded item of the body
+	itemHi  int // one past the last
+	bindLo  int
+	bindHi  int
 	// cte is set when the item was a reference to an inlinable CTE,
 	// presented as its body (M0146-0007e, ctepullup.go).
 	cte *plannedCTE
@@ -133,8 +136,14 @@ func parentFromAdmitsDerivedPullup(s *parser.SelectStmt) bool {
 func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.SelectStmt, bool) {
 	rv := it.Base
 	sub := rv.Subquery
-	if sub == nil || len(it.Joins) > 0 || rv.Lateral || rv.Alias == "" || len(rv.Columns) > 0 ||
+	if sub == nil || len(it.Joins) > 0 || rv.Lateral || rv.Alias == "" ||
 		rv.TableFunc != nil || rv.TableSample != nil {
+		return nil, false
+	}
+	// M0146-0028g: a column-alias list renames the first outputs
+	// (resolvePulledDerived). More aliases than outputs is the parse-analysis
+	// error PG raises; the unpulled path reports it.
+	if len(rv.Columns) > len(sub.Targets) {
 		return nil, false
 	}
 	if sub.With != nil || sub.SetOp != nil || sub.SetOpOperand != nil ||
@@ -362,8 +371,8 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 				out = append(out, it)
 				continue
 			}
-			c := &derivedPullupCandidate{alias: src.Base.Alias, body: body, itemLo: len(out),
-				cte: cteEntry, parent: parent, depth: depth}
+			c := &derivedPullupCandidate{alias: src.Base.Alias, columns: src.Base.Columns, body: body,
+				itemLo: len(out), cte: cteEntry, parent: parent, depth: depth}
 			cands = append(cands, c)
 			expand(body.FromExprs, c, depth+1)
 			c.itemHi = len(out)
@@ -483,7 +492,7 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		}
 		rel := &pulledDerivedRel{alias: c.alias, firstBinding: c.bindLo, body: c.body}
 		seen := map[string]bool{}
-		for _, t := range c.body.Targets {
+		for ti, t := range c.body.Targets {
 			e, err := resolveExpr(t.Expr, bodyCtx)
 			if err != nil {
 				return nil, nil, nil, false
@@ -492,6 +501,11 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 				return nil, nil, nil, false
 			}
 			name, _ := targetMeta(e, t)
+			if ti < len(c.columns) {
+				// The alias list renames the output, as the RTE's eref
+				// colnames do (addRangeTableEntryForSubquery).
+				name = c.columns[ti]
+			}
 			key := strings.ToLower(name)
 			if seen[key] {
 				return nil, nil, nil, false

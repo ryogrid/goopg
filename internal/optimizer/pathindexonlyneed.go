@@ -150,6 +150,12 @@ func expandWholeRowColumnNames(ctx *resolveContext, s *parser.SelectStmt, cat ca
 		visible := map[string]bool{}
 		for _, rv := range stmt.From {
 			switch {
+			case rv.Subquery != nil && pulledNames[strings.ToLower(rv.Alias)] != nil:
+				// A pulled body's names already apply its alias list,
+				// leading columns renamed and the rest kept (M0146-0028g).
+				for _, n := range pulledNames[strings.ToLower(rv.Alias)] {
+					visible[strings.ToLower(n)] = true
+				}
 			case len(rv.Columns) > 0:
 				for _, c := range rv.Columns {
 					visible[strings.ToLower(c)] = true

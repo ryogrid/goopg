@@ -104,7 +104,6 @@ func TestDerivedPullupDeclines(t *testing.T) {
 		"SELECT * FROM (SELECT ax AS k, ay AS k FROM a) y, b",                               // duplicate output name          // grouping
 		"SELECT * FROM (SELECT DISTINCT ax FROM a) y, b",                                    // DISTINCT
 		"SELECT * FROM (SELECT ax FROM a LIMIT 1) y, b",                                     // LIMIT
-		"SELECT * FROM (SELECT ax FROM a) y (z), b",                                         // column alias list
 		"SELECT * FROM (SELECT ax FROM a JOIN c USING (ax)) y, b",                           // USING in body
 		"SELECT * FROM (SELECT ax FROM a NATURAL JOIN c) y, b",                              // NATURAL in body
 		"SELECT * FROM (SELECT ax FROM a JOIN (SELECT cx FROM c) z ON ax = cx) y, b",        // derived join leg
@@ -291,5 +290,36 @@ func TestDerivedPullupAdmitsSafeCallsAndWhereSublinks(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// M0146-0028g: a column-alias list does not stop the pull-up; it renames the
+// leading outputs, and the rest keep their own names (a list shorter than the
+// output is legal). The original output name is no longer visible.
+func TestDerivedPullupAliasList(t *testing.T) {
+	s, _, rctx := pullupPlanFrom(t, "SELECT * FROM (SELECT ax, ay FROM a WHERE ay > 1) y(c), b WHERE y.c = b.bx")
+	if len(rctx.pulledDerived) != 1 {
+		t.Fatalf("pulledDerived=%d, want the alias-listed body pulled up", len(rctx.pulledDerived))
+	}
+	if c, ok := pullupResolve(t, rctx, "y", "c").(*ColumnRef); !ok || c.Name != "ax" {
+		t.Fatalf("y.c resolved to %#v, want a.ax", c)
+	}
+	if _, ok := pullupResolve(t, rctx, "y", "ay").(*ColumnRef); !ok {
+		t.Fatal("y.ay must keep its own name past the alias list")
+	}
+	if _, err := resolveColumnRef(&parser.ColumnRef{Table: "y", Column: "ax"}, rctx); err == nil {
+		t.Fatal("y.ax resolved, but the alias list renamed it to c")
+	}
+	_, schema, err := expandStarTarget(s.Targets[0].Expr.(*parser.StarExpr), rctx)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if len(schema) != 4 || schema[0].Name != "c" || schema[1].Name != "ay" {
+		t.Fatalf("star schema %v, want [c ay bx by]", schema)
+	}
+	// A full-length list is pulled up too.
+	_, _, rctx = pullupPlanFrom(t, "SELECT 1 FROM b, (SELECT ax FROM a) y(c)")
+	if len(rctx.pulledDerived) != 1 {
+		t.Fatalf("one alias for one output: pulledDerived=%d, want 1", len(rctx.pulledDerived))
 	}
 }
