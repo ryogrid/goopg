@@ -1549,6 +1549,13 @@ type Aggregate struct {
 	// every construction site that does not set it keeps today's behaviour.
 	// M0125-0048.
 	GroupingSets [][]int
+	// Rollups is GroupingSets as preprocess_grouping_sets arranges them
+	// (ExtractGroupingRollups, M0146-0020b): chains of sets, each chain's
+	// columns ordered so that every set is a prefix. A sorted strategy
+	// computes one rollup per sorted pass, the first over the input's order
+	// and each later one over its own sort; the hashed strategies take the
+	// sets in this order. nil when there are no grouping sets.
+	Rollups []GroupingRollup
 	// GroupingMasks carries one entry per distinct GROUPING(...) call in the
 	// query, in the order the columns are appended to the output schema:
 	// output column len(GroupExprs)+len(Aggs)+i holds

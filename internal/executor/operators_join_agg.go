@@ -2791,9 +2791,30 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// does: along the rollup order, each group closes when its prefix
 	// changes, so within a prefix the detail groups come first and the
 	// rolled-up group after them; the grand total is last.
-	rollupOrder, rollup := []int(nil), false
+	//
+	// M0146-0020b: with several rollups (o.plan.Rollups) AGG_SORTED runs one
+	// phase per rollup — the first over the input, each later one over its
+	// own sort — so the rows come rollup by rollup, each along its own order.
+	var rollupOf []int       // set index -> rollup index
+	var rollupOrders [][]int // rollup index -> its column order
+	rollup := false
 	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil {
-		rollupOrder, rollup = optimizer.RollupChainOrder(o.plan.GroupingSets)
+		if len(o.plan.Rollups) > 0 {
+			rollupOf = make([]int, len(o.plan.GroupingSets))
+			for ri, r := range o.plan.Rollups {
+				rollupOrders = append(rollupOrders, r.Order)
+				for _, si := range r.Sets {
+					if si >= 0 && si < len(rollupOf) {
+						rollupOf[si] = ri
+					}
+				}
+			}
+			rollup = true
+		} else if order, ok := optimizer.RollupChainOrder(o.plan.GroupingSets); ok {
+			rollupOf = make([]int, len(o.plan.GroupingSets))
+			rollupOrders = [][]int{order}
+			rollup = true
+		}
 	}
 	if nGroupCols > 0 && rollup {
 		rowSets := emitted
@@ -2811,7 +2832,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		sort.SliceStable(idxOf, func(a, b int) bool {
 			i, j := idxOf[a], idxOf[b]
 			ra, rb := o.rows[i], o.rows[j]
-			for _, c := range rollupOrder {
+			if rollupOf[rowSets[i]] != rollupOf[rowSets[j]] {
+				return rollupOf[rowSets[i]] < rollupOf[rowSets[j]]
+			}
+			for _, c := range rollupOrders[rollupOf[rowSets[i]]] {
 				aIn, bIn := inSet[rowSets[i]][c], inSet[rowSets[j]][c]
 				switch {
 				case !aIn && !bIn:

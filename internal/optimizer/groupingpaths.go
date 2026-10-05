@@ -692,7 +692,9 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 
 	// SORTED ROLLUP (M0146-0020a): consider_groupingsets_paths' is_sorted
 	// arm for a single rollup — every set contained in the next — computed
-	// in one pass over input sorted on the rollup order. Priced as
+	// in one pass over input sorted on the rollup order. M0146-0020b: with
+	// several rollups (CUBE, disjoint GROUPING SETS) the first reads the
+	// sorted input and each later one sorts it again (AGG_SORTED's chain). Priced as
 	// create_groupingsets_path prices one rollup: cost_agg(AGG_SORTED) over
 	// the longest set's columns and every set's groups. Offered first, as
 	// PG's sorted arm precedes its hashed one. The path carries the
@@ -707,14 +709,27 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	if aggNode.GroupingSets != nil && !groupingHasSpecialAgg(aggNode) {
 		if rkeys, ok := rollupSortKeys(aggNode); ok {
 			rollupPathkeys := pathkeysForSortKeys(rkeys)
+			// M0146-0020b: several rollups leave the output unordered
+			// (create_groupingsets_path keeps group_pathkeys for one).
+			var outKeys []PathKey
+			if len(aggNode.Rollups) <= 1 {
+				outKeys = groupingNulledPathkeys(rollupPathkeys)
+			}
+			// create_groupingsets_path adds each later rollup's sort to the
+			// input's disabled nodes (cost_sort counts enable_sort = off).
+			rollupSortsDisabled := 0
+			if !cp.enableSort && len(aggNode.Rollups) > 1 {
+				rollupSortsDisabled = len(aggNode.Rollups) - 1
+			}
 			sortedInput := sortPathForBounded(sortSeed, rollupPathkeys, cp, -1)
 			rSpec := *aggNode
 			addPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &rSpec,
 				Rel: grouped, Rows: numGroups,
-				Pathkeys: groupingNulledPathkeys(rollupPathkeys),
-				Cost: costAggSortedRollup(cp, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-					len(rkeys), numGroups, len(rSpec.Aggs)),
+				DisabledNodes: sortedInput.DisabledNodes + rollupSortsDisabled,
+				Pathkeys:      outKeys,
+				Cost: costSortedRollups(cp, &rSpec, sortSeed, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+					len(rkeys), numGroups),
 				Children: []*Path{sortedInput},
 			}, groupAggSortedProducer)
 			if sr := searchedJoinInputRelOf(child); sr != nil {
@@ -735,9 +750,10 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					addPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &cSpec,
 						Rel: grouped, Rows: numGroups,
-						Pathkeys: groupingNulledPathkeys(rollupPathkeys),
-						Cost: costAggSortedRollup(cp, inputRows, cs.Cost.Startup, cs.Cost.Total,
-							len(rkeys), numGroups, len(cSpec.Aggs)),
+						DisabledNodes: cand.DisabledNodes + rollupSortsDisabled,
+						Pathkeys:      outKeys,
+						Cost: costSortedRollups(cp, &cSpec, sortSeed, inputRows, cs.Cost.Startup, cs.Cost.Total,
+							len(rkeys), numGroups),
 						Children: []*Path{cs},
 					}, groupAggSearchProducer)
 				}

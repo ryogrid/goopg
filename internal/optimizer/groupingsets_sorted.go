@@ -59,12 +59,17 @@ func RollupChainOrder(sets [][]int) ([]int, bool) {
 }
 
 // rollupSortKeys is the ascending, NULLS LAST sort a sorted rollup needs on
-// its input: GroupExprs in RollupChainOrder.
+// its input: GroupExprs in the first rollup's order.
 func rollupSortKeys(aggNode *Aggregate) ([]SortKey, bool) {
 	if aggNode == nil || aggNode.GroupingSets == nil {
 		return nil, false
 	}
 	order, ok := RollupChainOrder(aggNode.GroupingSets)
+	// M0146-0020b: the first rollup's order (preprocess_grouping_sets),
+	// which follows ORDER BY for a single rollup and exists for several.
+	if len(aggNode.Rollups) > 0 {
+		order, ok = aggNode.Rollups[0].Order, len(aggNode.Rollups[0].Order) > 0
+	}
 	if !ok {
 		return nil, false
 	}
@@ -76,4 +81,36 @@ func rollupSortKeys(aggNode *Aggregate) ([]SortKey, bool) {
 		keys = append(keys, SortKey{Expr: aggNode.GroupExprs[gi]})
 	}
 	return keys, true
+}
+
+// costSortedRollups is create_groupingsets_path's AGG_SORTED pricing
+// (pathnode.c): the first rollup is cost_agg(AGG_SORTED) over the sorted
+// input; each later rollup adds a cost_sort of the input rows (no input cost
+// again) and a cost_agg(AGG_SORTED) over that sort, with its own column and
+// group counts. One rollup is the M0146-0020a single-pass price unchanged.
+func costSortedRollups(cp costParams, a *Aggregate, seed *Path, inputRows, inputStartup, inputTotal float64, firstCols int, numGroups float64) Cost {
+	nAggs := len(a.Aggs)
+	if len(a.Rollups) <= 1 {
+		return costAggSortedRollup(cp, inputRows, inputStartup, inputTotal, firstCols, numGroups, nAggs)
+	}
+	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
+	if !ok {
+		return costAggSortedRollup(cp, inputRows, inputStartup, inputTotal, firstCols, numGroups, nAggs)
+	}
+	rollupGroups := func(r GroupingRollup) float64 {
+		g := 0.0
+		for _, si := range r.Sets {
+			if si >= 0 && si < len(perSet) {
+				g += float64(perSet[si])
+			}
+		}
+		return g
+	}
+	out := costAggSortedRollup(cp, inputRows, inputStartup, inputTotal, len(a.Rollups[0].Order), rollupGroups(a.Rollups[0]), nAggs)
+	for _, r := range a.Rollups[1:] {
+		srt := costSortRunWithWidth(cp, inputRows, pathNCols(seed), pathAvgVarBytes(seed), -1, pathWidth(seed), "rollup")
+		agg := costAggSortedRollup(cp, inputRows, srt.Startup, srt.Total, len(r.Order), rollupGroups(r), nAggs)
+		out.Total += agg.Total
+	}
+	return out
 }

@@ -219,3 +219,32 @@ func transportGroupSortKeys(agg *Aggregate) ([]SortKey, bool) {
 	}
 	return keys, true
 }
+
+// groupingSetsSortSlots is parse->sortClause as reorder_grouping_sets reads
+// it: the ORDER BY items' GroupExprs slots, in ORDER BY order, up to the first
+// item that is not a grouping column (that item diverges from every set, so
+// the walk would give up there). Direction is not compared — the rollup order
+// only follows the ORDER BY's columns (M0146-0020b).
+func groupingSetsSortSlots(s *parser.SelectStmt, origIdx []int, nGroup int) []int {
+	if s == nil || len(s.OrderBy) == 0 || len(origIdx) != nGroup {
+		return nil
+	}
+	var out []int
+	for _, sb := range sortClauseItems(s) {
+		hit := -1
+		for k, oi := range origIdx {
+			if oi < 0 || oi >= len(s.GroupBy) {
+				return out
+			}
+			if parserSortExprEqual(s.GroupBy[oi], sb.expr, s) {
+				hit = k
+				break
+			}
+		}
+		if hit < 0 {
+			break
+		}
+		out = append(out, hit)
+	}
+	return out
+}

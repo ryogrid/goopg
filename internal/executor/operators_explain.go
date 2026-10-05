@@ -2463,7 +2463,62 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// largest first, its columns in the rollup's sort order, then
 			// `Group Key: ()` (show_grouping_set_keys over an AGG_SORTED
 			// rollup — TPC-DS Q27).
-			if order, ok := optimizer.RollupChainOrder(p.GroupingSets); ok && p.Strategy == optimizer.AggStrategySorted {
+			// M0146-0020b: with preprocess_grouping_sets' rollups the keys
+			// follow them. A sorted strategy prints the first rollup's sets
+			// as `Group Key:` lines and each later rollup as its `Sort Key:`
+			// with its sets' `Group Key:` lines indented under it
+			// (show_grouping_set_keys over agg->chain); the hashed ones list
+			// every set in rollup order, each set's columns a prefix of its
+			// rollup's order, and the empty sets last as `Group Key: ()`.
+			if len(p.Rollups) > 0 {
+				prefixKeys := func(order []int, n int) string {
+					parts := make([]string, 0, n)
+					for _, gi := range order[:n] {
+						if gi >= 0 && gi < len(p.GroupExprs) {
+							parts = append(parts, renderKey(gi))
+						}
+					}
+					return strings.Join(parts, ", ")
+				}
+				setLen := func(si int) int {
+					if si < 0 || si >= len(p.GroupingSets) {
+						return 0
+					}
+					return len(p.GroupingSets[si])
+				}
+				if p.Strategy == optimizer.AggStrategySorted {
+					for ri, r := range p.Rollups {
+						in := indent
+						if ri > 0 {
+							*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + prefixKeys(r.Order, len(r.Order)))})
+							in = indent + "  "
+						}
+						for _, si := range r.Sets {
+							if n := setLen(si); n > 0 && n <= len(r.Order) {
+								*rows = append(*rows, Row{NewStringDatum(in + "Group Key: " + prefixKeys(r.Order, n))})
+							} else {
+								*rows = append(*rows, Row{NewStringDatum(in + "Group Key: ()")})
+							}
+						}
+					}
+				} else {
+					empty := 0
+					for _, r := range p.Rollups {
+						for _, si := range r.Sets {
+							n := setLen(si)
+							if n == 0 || n > len(r.Order) {
+								empty++
+								continue
+							}
+							*rows = append(*rows, Row{NewStringDatum(indent + "Hash Key: " + prefixKeys(r.Order, n))})
+						}
+					}
+					for i := 0; i < empty; i++ {
+						*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: ()")})
+					}
+				}
+				sets = nil
+			} else if order, ok := optimizer.RollupChainOrder(p.GroupingSets); ok && p.Strategy == optimizer.AggStrategySorted {
 				for _, set := range sets {
 					in := map[int]bool{}
 					for _, gi := range set {
@@ -5921,6 +5976,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			// M0146-0020a: a single rollup computed in one sorted pass is
 			// AGG_SORTED, `GroupAggregate`.
 			if p.Strategy == optimizer.AggStrategySorted {
+				if len(p.Rollups) > 0 && len(p.Rollups[0].Order) > 0 {
+					return prefix + "GroupAggregate"
+				}
 				if _, ok := optimizer.RollupChainOrder(p.GroupingSets); ok {
 					return prefix + "GroupAggregate"
 				}

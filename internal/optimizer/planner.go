@@ -9851,6 +9851,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	if gsSets == nil && groupOrigIdx != nil && len(groupOrigIdx) == len(groupExprs) {
 		aggNode.GroupClause = buildGroupClause(s, groupOrigIdx)
 	}
+	// M0146-0020b: preprocess_grouping_sets' rollups, steered by ORDER BY
+	// when they form one chain.
+	if gsSets != nil {
+		aggNode.Rollups = ExtractGroupingRollups(gsSets, groupingSetsSortSlots(s, groupOrigIdx, len(groupExprs)))
+	}
 	// B-01c second cut: keys-only construction stamp (above not yet built,
 	// passthroughs not yet appended — the append sites below re-stamp to
 	// unknown). Assert-only, no plan mutation.
