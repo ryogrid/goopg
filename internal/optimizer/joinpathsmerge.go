@@ -460,7 +460,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 	// The residual is evaluated on the tuples that already matched on the
 	// merge keys — that is `mergeTuples`, which is what the comment here always
 	// said and what the code now passes.
-	cost.Total += qualEvalCost(cp, len(residual), mergeTuples)
+	cost.Total += joinQualEvalCost(cp, residual, mergeTuples)
 
 	addPath(joinrel, &Path{
 		Kind:          PathMergeJoin,

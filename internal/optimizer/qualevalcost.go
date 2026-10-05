@@ -48,7 +48,7 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 			if n.Plan != nil {
 				// The test expression's comparison, then the SubPlan.
 				perTuple++
-				s, p := subPlanCostOps(n.Plan, sublinkAnyAll)
+				s, p := subPlanCostOps(n.Plan, sublinkAnyAll, len(n.ParParam) > 0)
 				startup += s
 				perTuple += p
 				return true
@@ -68,15 +68,15 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 			}
 			perTuple += 0.5 * float64(length)
 		case *SubqueryExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExpr)
+			s, p := subPlanCostOps(n.Plan, sublinkExpr, len(n.ParParam) > 0)
 			startup += s
 			perTuple += p
 		case *ArraySubqueryExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExpr)
+			s, p := subPlanCostOps(n.Plan, sublinkExpr, false)
 			startup += s
 			perTuple += p
 		case *ExistsExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExists)
+			s, p := subPlanCostOps(n.Plan, sublinkExists, len(n.ParParam) > 0)
 			startup += s
 			perTuple += p
 		}
@@ -154,11 +154,15 @@ const (
 // estimate where the search did not produce it. Converting to operator units
 // uses cpu_operator_cost's boot value; a session that changes the GUC prices
 // the subplan part slightly off (ledgered).
-func subPlanCostOps(plan Node, kind int) (startup, perTuple float64) {
+//
+// lowered reports the sublink already carries PARAM_EXEC params (a
+// pre-lowered kept sublink, M0146-0015c / M0146-0012a): its plan reads them
+// as ExecParamRefs, not OuterColumnRefs, and is just as correlated.
+func subPlanCostOps(plan Node, kind int, lowered bool) (startup, perTuple float64) {
 	if plan == nil {
 		return 0, 1
 	}
-	correlated := planHasOuterRef(plan)
+	correlated := lowered || planHasOuterRef(plan)
 	if !correlated && kind != sublinkAnyAll {
 		return 0, 0
 	}

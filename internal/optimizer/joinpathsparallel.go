@@ -261,7 +261,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	// The residual rides the join's OUTPUT cardinality, which for a partial
 	// path is the per-worker one — the same rule addHashJoinPath applies to the
 	// serial figure.
-	cost.Total += qualEvalCost(cp, len(residual), rows)
+	cost.Total += joinQualEvalCost(cp, residual, rows)
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,
@@ -486,7 +486,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// The residual rides the join's OUTPUT cardinality, which for a partial
 	// path is the per-worker one — the same rule the serial twin and the
 	// hash twin apply.
-	cost.Total += qualEvalCost(cp, len(residual), rows)
+	cost.Total += joinQualEvalCost(cp, residual, rows)
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathMergeJoin,
@@ -612,7 +612,7 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 		innerRowsTotal:   innerTotal,
 		parallelWorkers:  o.ParallelWorkers,
 	})
-	cost.Total += qualEvalCost(cp, len(residual), rows)
+	cost.Total += joinQualEvalCost(cp, residual, rows)
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,

@@ -129,3 +129,62 @@ func matchSetByColumnName(tbl *catalog.Table, col string) int64 {
 	}
 	return 0
 }
+
+// subPlanJoinQualOps is the SubPlan part of cost_qual_eval for one join
+// qual, in cpu_operator_cost units: cost_subplan's per-evaluation charge
+// (subPlanCostOps) for every correlated sublink at this scope. M0146-0012a slice B: a
+// correlated SubPlan in a join clause re-runs per evaluation, so the nested
+// loop that evaluates TPC-H Q17's clause on every inner row pays ~5,940 calls
+// where PG's inner-unique hash join pays 10 (cost_qual_eval_walker's SubPlan
+// arm). Sublink bodies are other scopes and are not entered.
+func subPlanJoinQualOps(e Expr) float64 {
+	ops := 0.0
+	walkExprRefs(e, scopeSignal, exprVisitor{Visit: func(x Expr) bool {
+		if plans := ExprSubplans(x); len(plans) == 1 {
+			kind, lowered := sublinkExpr, false
+			if h := handleFor(x); h != nil {
+				lowered = len(h.params()) > 0
+			}
+			// Correlated sublinks only. An uncorrelated ANY is a hashed
+			// SubPlan in PG (build_subplan sets useHashTable; cost_subplan
+			// charges it once at startup, nothing per tuple), which
+			// subPlanCostOps does not model — it prices the plain form
+			// (ledgered). Charging that per joined tuple moved TPC-DS Q45's
+			// `OR i_item_id IN (…)` join above its Gather Merge.
+			if !lowered && !planHasOuterRef(plans[0]) {
+				return true
+			}
+			if _, isExists := x.(*ExistsExpr); isExists {
+				kind = sublinkExists
+			} else if in, isIn := x.(*InExpr); isIn && in.Plan != nil {
+				kind = sublinkAnyAll
+			}
+			_, p := subPlanCostOps(plans[0], kind, lowered)
+			ops += p
+		}
+		return true
+	}})
+	return ops
+}
+
+// joinQualPerTuple is `qp_qual_cost.per_tuple` for a join's residual quals:
+// goopg's flat cpu_operator_cost per conjunct plus each conjunct's SubPlan
+// per-evaluation cost (subPlanJoinQualOps).
+func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
+	per := cp.cpuOperatorCost * float64(len(quals))
+	for _, ri := range quals {
+		if ri != nil {
+			per += cp.cpuOperatorCost * subPlanJoinQualOps(ri.clause)
+		}
+	}
+	return per
+}
+
+// joinQualEvalCost is qualEvalCost for a join's residual restrictInfos,
+// including the SubPlans' per-evaluation cost.
+func joinQualEvalCost(cp costParams, quals []*restrictInfo, tuples float64) float64 {
+	if len(quals) == 0 || !(tuples > 0) {
+		return 0
+	}
+	return joinQualPerTuple(cp, quals) * tuples
+}

@@ -710,11 +710,11 @@ func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi 
 		// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch. A
 		// parameterised index probe that enforces every join clause makes an
 		// unmatched outer row an empty probe (has_indexed_join_quals).
-		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, rsTot,
-			semi, hasIndexedJoinQuals(in, residual), len(residual))
+		cost = nestloopCostSemiAntiQual(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, rsTot,
+			semi, hasIndexedJoinQuals(in, residual), joinQualPerTuple(cp, residual))
 	} else {
 		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, rsTot)
-		cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
+		cost.Total += joinQualEvalCost(cp, residual, o.Rows*in.Rows)
 	}
 	return cost
 }

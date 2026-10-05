@@ -129,7 +129,7 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				outerAvgVarBytes: pathAvgVarBytes(o),
 				innerAvgVarBytes: pathAvgVarBytes(i),
 			})
-			cost.Total += qualEvalCost(cp, len(residual), rows)
+			cost.Total += joinQualEvalCost(cp, residual, rows)
 			addPath(joinrel, &Path{
 				Kind:          PathHashJoin,
 				Jointype:      jt,

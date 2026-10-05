@@ -122,7 +122,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	// The residual is evaluated only on tuples that already matched on the
 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
 	// `hashjointuples`, costsize.c:4432).
-	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
+	cost.Total += joinQualEvalCost(cp, residual, joinRel.Rows)
 	addPath(joinRel, &Path{
 		Kind: PathHashJoin,
 		// C-03b: the join this path performs, decided by `addPathsToJoinrel`
@@ -252,10 +252,10 @@ func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costPa
 		// M0145-0008l: SEMI/ANTI stop at the first inner match
 		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
 		// is never "indexed", so an unmatched outer row scans it all.
-		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal, semi, false, len(quals))
+		cost = nestloopCostSemiAntiQual(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal, semi, false, joinQualPerTuple(cp, quals))
 	} else {
 		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal)
-		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
+		cost.Total += joinQualEvalCost(cp, quals, o.Rows*i.Rows)
 	}
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
