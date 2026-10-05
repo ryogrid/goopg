@@ -27602,6 +27602,11 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 rendering 11 → 10; text\-ide
     positionally through a UNION's dedupe before the statement\-wide name
     fallback \(TPC\-DS Q75 no longer prints the consumer's `curr\_yr`\)\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 rendering 12 → 11
+  - Slice 2026\-10\-06 \(`eef2d1762`\): a genuine set operation's branches are
+    range\-table levels of their own \(plan\_set\_operations; setrefs adds
+    each leaf at its SubqueryScan in plan\-walk order\), so EXPLAIN's `\_N`
+    suffixes follow PG's; Q8 text\-identical at both scales, Q38/Q75 closer\.
+Movement: none — instrument artefact — text\-only; text\-identical SF0\.25 39 → 40, SF1 30 → 31
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,

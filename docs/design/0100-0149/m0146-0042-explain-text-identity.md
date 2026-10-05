@@ -193,6 +193,37 @@ Not covered (ledger row 2026-10-06):
     (`((ss.np - (COALESCE(ss.ck, 0))::numeric))`).
   - Q49's `item` / `return_ratio` stay bare.
 
+## Slice — set-operation branches as range-table levels (2026-10-06, `eef2d1762`)
+
+- EXPLAIN's `_N` suffixes follow PG's flattened range table, which
+  `renumberRTIDsFlatRtableOrder` (M0146-0005df) reproduces level by level.
+- A genuine set operation is planned by `plan_set_operations` as a query
+  whose range table holds one subquery RTE per leaf. That covers an
+  INTERSECT, an EXCEPT, a UNION distinct, and a link of the UNION ALL
+  chain a UNION dedupes. setrefs.c adds each leaf's relations when the
+  plan walk reaches its SubqueryScan.
+- `collectLevel` now makes each branch a kept level, in plan-walk order;
+  nested set-operation nodes belong to the same tree.
+  - Before, the branches' relations joined the enclosing level, so Q8's
+    second INTERSECT branch was numbered ahead of the first branch's
+    grouped subquery.
+  - Plan-walk order is Parallel Append's cost order, so Q75's item
+    suffixes now follow the store, catalog and web branches.
+- A UNION ALL that may be a pulled-up appendrel (members join the parent
+  level in written order) keeps the level walk.
+- Results:
+  - Q8 is text-identical at both scales (SF0.25 39 → 40, SF1 30 → 31).
+  - Q38 and Q75 move closer to PG.
+  - Regress union.sql's INTERSECT plans equal PG's.
+- Test: `TestSetOpBranchSuffixesFollowPlanWalk`.
+- Evidence: `analysis/m0146/m0146-0042/slice-setop-branch-levels-q8.txt`.
+- Not covered (ledger 2026-10-06):
+  - A top-level UNION ALL query (not a FROM subquery) is a set operation
+    in PG too; goopg's SetOp does not record whether it was pulled up.
+  - Q75's suffixes skip numbers (`item_2`, `item_4` where PG has
+    `item_1`, `item_2`): some scan that EXPLAIN does not print claims a
+    name.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
@@ -201,5 +232,5 @@ Not covered (ledger row 2026-10-06):
 | ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
 | ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
 | a reference through an elided subquery / CTE / Append (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument open) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
-| alias suffix numbering | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
+| alias suffix numbering (Q8 done, `eef2d1762`; Q75 skipped numbers open) | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
 | a Sort Key detail | Q43 (SF1) | | |
