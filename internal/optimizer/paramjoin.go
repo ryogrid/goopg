@@ -116,7 +116,8 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 			}
 			rows := s.parameterizedJoinrelSize(joinrel, outer, inner, o, i, req, clauses, sjinfo)
 			cost := hashJoinCost(cp, hashJoinInputs{
-				outer: o.Cost, inner: i.Cost,
+				qualPerTuple: joinQualPerTuple(cp, residual),
+				outer:        o.Cost, inner: i.Cost,
 				outerRows: o.Rows, innerRows: i.Rows,
 				outputRows:       rows,
 				numHashClauses:   len(keys),
@@ -129,7 +130,6 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				outerAvgVarBytes: pathAvgVarBytes(o),
 				innerAvgVarBytes: pathAvgVarBytes(i),
 			})
-			cost.Total += joinQualEvalCost(cp, residual, rows)
 			addPath(joinrel, &Path{
 				Kind:          PathHashJoin,
 				Jointype:      jt,

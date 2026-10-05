@@ -30,24 +30,26 @@ func TestCorrelatedScalarSublinkIsJoinClause(t *testing.T) {
 	} {
 		runSQL(t, ctx, q)
 	}
-	nl := optimizer.DefaultPlannerSettings()
-	nl.EnableHashJoin = false
-	nl.EnableMergeJoin = false
+	// PG 18.3's elections on this data: with default settings a nested loop
+	// whose parameterised inner scan carries the clause as its Filter (the
+	// SubPlan costs ~30 calls there), with enable_nestloop off a Hash Join
+	// carrying it as the Join Filter (M0146-0012a slice C: charged on the
+	// matched outer rows of the inner-unique hash join).
+	hj := optimizer.DefaultPlannerSettings()
+	hj.EnableNestLoop = false
 	for _, c := range []struct {
 		name, q, rows, at string
 		ps                optimizer.PlannerSettings
 	}{
-		{"join filter", `SELECT sum(l.price), count(*) FROM l, p WHERE p.pk = l.pk AND p.brand = 7
-			AND l.qty < (SELECT 0.2 * avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk)`,
-			"NULL|0", "Join Filter: ((l.qty)::numeric < (SubPlan 1))", optimizer.DefaultPlannerSettings()},
-		{"both relations outside the sublink", `SELECT count(*) FROM p, l WHERE p.pk = l.pk AND p.brand = 3
-			AND l.qty + p.brand > (SELECT avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk)`,
-			"1500", "Join Filter: (((l.qty + p.brand))::numeric > (SubPlan 1))", optimizer.DefaultPlannerSettings()},
-		// PG's own choice for this data: the clause filters the parameterised
-		// inner scan.
 		{"parameterised inner", `SELECT sum(l.price), count(*) FROM l, p WHERE p.pk = l.pk AND p.brand = 7
 			AND l.qty < (SELECT 0.2 * avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk)`,
-			"NULL|0", "Filter: ((qty)::numeric < (SubPlan 1))", nl},
+			"NULL|0", "Filter: ((qty)::numeric < (SubPlan 1))", optimizer.DefaultPlannerSettings()},
+		{"both relations outside the sublink", `SELECT count(*) FROM p, l WHERE p.pk = l.pk AND p.brand = 3
+			AND l.qty + p.brand > (SELECT avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk)`,
+			"1500", "Filter: (((qty + p.brand))::numeric > (SubPlan 1))", optimizer.DefaultPlannerSettings()},
+		{"join filter", `SELECT sum(l.price), count(*) FROM l, p WHERE p.pk = l.pk AND p.brand = 7
+			AND l.qty < (SELECT 0.2 * avg(l2.qty) FROM l l2 WHERE l2.pk = p.pk)`,
+			"NULL|0", "Join Filter: ((l.qty)::numeric < (SubPlan 1))", hj},
 	} {
 		plan := renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, c.ps))
 		joined := strings.Join(plan, "\n")

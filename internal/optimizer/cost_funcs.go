@@ -804,6 +804,15 @@ type hashJoinInputs struct {
 	// clause is charged per input row on both sides.
 	numHashClauses int
 
+	// qualPerTuple is final_cost_hashjoin's `qp_qual_cost.per_tuple`: the
+	// join's non-hash quals (joinQualPerTuple, correlated SubPlans priced per
+	// call). PG charges it with cpu_tuple_cost on hashjointuples — the
+	// matched outer rows of an inner-unique / semi / anti join, the hash
+	// clauses' approx_tuple_count otherwise — not on the join's output rows
+	// (M0146-0012a slice C: TPC-H Q17's correlated Join Filter pays 10 calls
+	// in PG, not one per output row).
+	qualPerTuple float64
+
 	// outerCols / innerCols are the COLUMN COUNTS of the two sides' rows.
 	//
 	// PG passes `pathtarget->width` in bytes here, because a PG hash entry is a
@@ -927,10 +936,11 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		// PG's hashjointuples in this branch is outer_matched_rows, not the
 		// join's result cardinality (M0146-0005e); for ANTI it is the
 		// unmatched rows.
+		cpuPerTuple := cp.cpuTupleCost + in.qualPerTuple
 		if in.final.anti {
-			run += cp.cpuTupleCost * (in.outerRows - outerMatched)
+			run += cpuPerTuple * (in.outerRows - outerMatched)
 		} else {
-			run += cp.cpuTupleCost * outerMatched
+			run += cpuPerTuple * outerMatched
 		}
 
 		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
@@ -958,7 +968,7 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		if in.final.hashClauseSel > 0 {
 			tuples = clampRowEst(in.final.hashClauseSel * in.outerRows * in.innerRows)
 		}
-		run += cp.cpuTupleCost * tuples
+		run += (cp.cpuTupleCost + in.qualPerTuple) * tuples
 	}
 
 	// R108 is deliberately opt-in. PG decides hash-table batches using packed

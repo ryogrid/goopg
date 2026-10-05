@@ -319,11 +319,13 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 			outer: serial.Children[0].Cost, inner: serial.Children[1].Cost,
 			outerRows: serial.Children[0].Rows, innerRows: serial.Children[1].Rows,
 			outputRows: joinrel.Rows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			innerWidth: pathWidth(serial.Children[1]),
-			outerCols:  pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
+			// M0146-0012a slice C: the residual is qp_qual_cost.per_tuple,
+			// charged on hashjointuples inside hashJoinCost.
+			qualPerTuple: s.cp.cpuOperatorCost,
+			innerWidth:   pathWidth(serial.Children[1]),
+			outerCols:    pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
 			outerAvgVarBytes: pathAvgVarBytes(serial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(serial.Children[1]),
 		})
-		wantSerial.Total += qualEvalCost(s.cp, 1, joinrel.Rows)
 		if serial.Cost != wantSerial {
 			t.Fatalf("serial cost = %+v, want %+v", serial.Cost, wantSerial)
 		}
@@ -333,11 +335,11 @@ func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) 
 			outer: partial.Children[0].Cost, inner: partial.Children[1].Cost,
 			outerRows: partial.Children[0].Rows, innerRows: partial.Children[1].Rows,
 			outputRows: wantPartialRows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			innerWidth: pathWidth(partial.Children[1]),
-			outerCols:  pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
+			qualPerTuple: s.cp.cpuOperatorCost,
+			innerWidth:   pathWidth(partial.Children[1]),
+			outerCols:    pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
 			outerAvgVarBytes: pathAvgVarBytes(partial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(partial.Children[1]),
 		})
-		wantPartial.Total += qualEvalCost(s.cp, 1, wantPartialRows)
 		if partial.Cost != wantPartial {
 			t.Fatalf("partial cost = %+v, want %+v", partial.Cost, wantPartial)
 		}

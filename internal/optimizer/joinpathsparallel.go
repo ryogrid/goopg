@@ -237,6 +237,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	rows := clampRowEst(joinrel.Rows / divisor)
 
 	cost := hashJoinCost(cp, hashJoinInputs{
+		qualPerTuple: joinQualPerTuple(cp, residual),
 		// The partial outer's Rows is ALREADY the per-worker count
 		// (costParallelSeqscan divides it), so the probe terms come out
 		// per-worker with no further division. The inner's are the WHOLE
@@ -258,10 +259,8 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
 	})
 	tracePGHashTupleGeometry(o, i, cp)
-	// The residual rides the join's OUTPUT cardinality, which for a partial
-	// path is the per-worker one — the same rule addHashJoinPath applies to the
-	// serial figure.
-	cost.Total += joinQualEvalCost(cp, residual, rows)
+	// The residual is priced inside hashJoinCost (qualPerTuple, charged on
+	// hashjointuples), as for the serial figure.
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,
@@ -598,7 +597,8 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)
 	cost := hashJoinCost(cp, hashJoinInputs{
-		outer: o.Cost, inner: i.Cost,
+		qualPerTuple: joinQualPerTuple(cp, residual),
+		outer:        o.Cost, inner: i.Cost,
 		outerRows: o.Rows, innerRows: i.Rows,
 		outputRows:      rows,
 		numHashClauses:  len(keys),
@@ -612,7 +612,6 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 		innerRowsTotal:   innerTotal,
 		parallelWorkers:  o.ParallelWorkers,
 	})
-	cost.Total += joinQualEvalCost(cp, residual, rows)
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,

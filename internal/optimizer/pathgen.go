@@ -100,7 +100,8 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
 	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
 	cost := hashJoinCost(cp, hashJoinInputs{
-		outer: p.Cost, inner: b.Cost,
+		qualPerTuple: joinQualPerTuple(cp, residual),
+		outer:        p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
 		outputRows:      joinRel.Rows,
 		numHashClauses:  len(keys),
@@ -120,9 +121,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	})
 	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
-	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
-	// `hashjointuples`, costsize.c:4432).
-	cost.Total += joinQualEvalCost(cp, residual, joinRel.Rows)
+	// keys: hashJoinCost charges it (qualPerTuple) on `hashjointuples`, the
+	// matched outer rows for an inner-unique join (costsize.c
+	// final_cost_hashjoin, M0146-0012a slice C).
 	addPath(joinRel, &Path{
 		Kind: PathHashJoin,
 		// C-03b: the join this path performs, decided by `addPathsToJoinrel`
