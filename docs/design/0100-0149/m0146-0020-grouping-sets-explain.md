@@ -117,3 +117,72 @@ Not ported (M0146-0020b):
   where goopg prints `v, a, b`).
 - On one groupingsets.sql rollup under a ProjectSet, PG keeps
   MixedAggregate where goopg now elects the sorted rollup.
+
+## M0146-0020b slice 1 — PG's rollups and the multi-rollup sorted strategy (2026-10-05)
+
+PG's `preprocess_grouping_sets` (planner.c) arranges the grouping sets into
+rollups before any path is built:
+
+- `extract_rollup_sets` covers the non-empty sets with the fewest chains,
+  each set contained in the next. It removes duplicates, links each set to
+  the smaller sets it contains, and runs `BipartiteMatch` (Hopcroft-Karp,
+  `lib/bipartite_match.c`). Empty sets go to the head of the first chain.
+- `reorder_grouping_sets` orders each chain's columns so that every set is
+  a prefix of the largest. When there is a single chain it follows ORDER BY
+  until ORDER BY names a column the next set does not add.
+
+AGG\_SORTED then computes one rollup per pass. The first rollup reads the
+input sorted on its order, and each later rollup sorts the input again
+(`create_groupingsets_plan`'s `chain`). EXPLAIN prints the first rollup's
+`Group Key:` lines, then for each later rollup a `Sort Key:` line with its
+sets' `Group Key:` lines indented under it. The hashed strategies take the
+sets in rollup order.
+
+goopg:
+
+- `ExtractGroupingRollups` (groupingsets\_rollups.go) ports both functions,
+  including Hopcroft-Karp's search order, so the chains are PG's.
+  `Aggregate.Rollups` holds the result for every grouping-sets aggregate.
+  The ORDER BY slots come from `groupingSetsSortSlots`, which matches by
+  expression as `processedGroupOrder` does.
+- The sorted strategy covers several rollups.
+  - `costSortedRollups` is `create_groupingsets_path`'s AGG\_SORTED price:
+    each later rollup adds a `cost_sort` of the input rows (with no input
+    cost) and a `cost_agg`, using its own column and group counts.
+  - Several rollups carry no pathkeys.
+  - The sorted-rollup paths now count disabled nodes: the input's, plus
+    one per later rollup's sort when `enable_sort` is off. Without this,
+    regress groupingsets' `enable_sort = off` CUBE lost PG's
+    MixedAggregate.
+- The executor emits AGG\_SORTED rows rollup by rollup, each along its own
+  order. EXPLAIN prints the rollup chain and orders the hashed keys by
+  rollup.
+
+Witnesses:
+
+- `TestSortedGroupingSetsRollupsMatchPG`, with PG 18.3's plans:
+  - `GROUPING SETS ((ten), (two))` and `CUBE (ten, two, v)` with
+    hashagg off. The CUBE's three chains are `ten, two, v`, then `two, v`,
+    then `v, ten`; its 184 rows match PG's order by md5.
+  - The hashed key order.
+- `TestExtractGroupingRollups`.
+
+Movement:
+
+- regress groupingsets: 1875 → 1736 diff lines (sorted multi-rollup plans,
+  the reordering test's `Group Key: v, b, a`).
+- TPC-H and TPC-DS plans are unchanged: their grouping sets are single
+  ROLLUPs.
+
+Evidence: `analysis/m0146/m0146-0020b/`.
+
+Still open (M0146-0020b):
+
+- **The mixed strategy.** For sorted input, `consider_groupingsets_paths`
+  chooses which rollups to hash with a knapsack bounded by `hash_mem`
+  (groupingsets.sql's "test the knapsack" plans MixedAggregate). The
+  unsorted arm's `unhashed_rollup` reads coincidentally sorted input that
+  way too. goopg offers all-sorted or all-hashed only.
+- Expansion order: `expand_grouping_sets` sorts the sets with `list_sort`,
+  which is unstable from seven sets on. goopg's sort is stable, so equal-length sets
+  could pair into different chains (ledgered).

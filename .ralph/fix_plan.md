@@ -26871,6 +26871,21 @@ Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -
   - First step: port extract\_rollup\_sets and the ORDER BY reordering
     of preprocess\_grouping\_sets; witnesses groupingsets\.sql \(reordering
     test, ProjectSet rollup where PG keeps MixedAggregate\)\.
+  - **Slice 1 landed 2026\-10\-05** \(`9e75f7778`\)\. Design
+    `docs/design/0100\-0149/m0146\-0020\-grouping\-sets\-explain\.md` §
+    M0146\-0020b; evidence `analysis/m0146/m0146\-0020b/`\.
+    - `ExtractGroupingRollups` ports extract\_rollup\_sets \(Hopcroft\-Karp
+      with upstream\'s search order\) and reorder\_grouping\_sets \(ORDER BY
+      steering for one rollup\); `Aggregate\.Rollups` carries them\.
+    - The sorted strategy covers several rollups: per\-rollup sort and
+      `cost\_agg`, `Sort Key:` chain in EXPLAIN, rows rollup by rollup\.
+      Sorted\-rollup paths now count disabled nodes \(enable\_sort off\)\.
+    - Witness `TestSortedGroupingSetsRollupsMatchPG` \(PG 18\.3 plans; CUBE
+      row order by md5\)\. Regress groupingsets 1875 → 1736 diff lines;
+      TPC\-H/TPC\-DS plans unchanged\.
+  - Next: the mixed strategy — consider\_groupingsets\_paths\' hash\_mem
+    knapsack over rollups for sorted input, and the unsorted arm\'s
+    `unhashed\_rollup` \(groupingsets\.sql \"test the knapsack\"\)\.
 
 - [ ] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
   2026\-09\-27 by M0146\-0005y's residual re\-routing, the last unowned
