@@ -75,3 +75,75 @@ func TestJoinEqualityPrintsInECOrder(t *testing.T) {
 		})
 	}
 }
+
+// TestInferredJoinEqualityPrintsInECOrder pins, against PG 18.3, that an
+// equality the query never writes — derived from the equivalence class
+// (`ej1.a = ej2.b AND ej2.b = ej3.c` puts ej1.a and ej3.c in one class) — is
+// created by the same create_join_clause rules as a written one, so it prints
+// in FROM order whichever side is outer (M0146-0042a's first hypothesis; the
+// seam already orients these). The 0042a defect itself sits in the candidate
+// rebuild (searchedBoundaryRebuild), witnessed by the TPC-DS SF1 Q17/Q25/Q29
+// capture in analysis/m0146/m0146-0042a/.
+func TestInferredJoinEqualityPrintsInECOrder(t *testing.T) {
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{
+			"select * from ej3, ej1, ej2 where ej1.a = ej2.b and ej2.b = ej3.c and ej1.x < 10 and ej2.y < 20",
+			[]string{
+				"Nested Loop",
+				"Join Filter: (ej3.c = ej1.a)",
+				"->  Nested Loop",
+				"Join Filter: (ej1.a = ej2.b)",
+				"->  Seq Scan on ej2",
+				"Filter: (y < 20)",
+				"->  Materialize",
+				"->  Seq Scan on ej1",
+				"Filter: (x < 10)",
+				"->  Seq Scan on ej3",
+			},
+		},
+		{
+			"select * from ej1, ej2, ej3 where ej2.b = ej1.a and ej3.c = ej2.b and ej1.x < 10 and ej3.z < 20",
+			[]string{
+				"Nested Loop",
+				"Join Filter: (ej1.a = ej2.b)",
+				"->  Nested Loop",
+				"Join Filter: (ej1.a = ej3.c)",
+				"->  Seq Scan on ej3",
+				"Filter: (z < 20)",
+				"->  Materialize",
+				"->  Seq Scan on ej1",
+				"Filter: (x < 10)",
+				"->  Seq Scan on ej2",
+			},
+		},
+	}
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE ej1 (a int, x int)", "CREATE TABLE ej2 (b int, y int)", "CREATE TABLE ej3 (c int, z int)",
+		"INSERT INTO ej1 SELECT g, g FROM generate_series(1, 1000) g",
+		"INSERT INTO ej2 SELECT g, g FROM generate_series(1, 1000) g",
+		"INSERT INTO ej3 SELECT g, g FROM generate_series(1, 1000) g",
+		"ANALYZE ej1", "ANALYZE ej2", "ANALYZE ej3",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	ps.EnableHashJoin = false
+	ps.EnableMergeJoin = false
+	for _, c := range cases {
+		var lines []string
+		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+c.query, ps)) {
+			if len(r) > 0 && r[0].Kind == KindString {
+				lines = append(lines, strings.TrimSpace(r[0].StringValue()))
+			}
+		}
+		if strings.Join(lines, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\ngot\n%s\nwant PG's\n%s", c.query, strings.Join(lines, "\n"), strings.Join(c.want, "\n"))
+		}
+	}
+}

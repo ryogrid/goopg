@@ -1295,6 +1295,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	for _, c := range conjuncts {
 		orientECExpr(c, ecWant)
 	}
+	// M0146-0042a: a non-winning candidate of this search rebuilt later
+	// (searchedBoundaryRebuild) is lowered after this point, with clause
+	// copies the line above never saw.
+	if rel := searchedRelOf(searched); rel != nil {
+		rel.ecWant = ecWant
+	}
 	return searched, residual, true
 }
 

@@ -626,6 +626,12 @@ func searchedBoundaryRebuild(p *Path, exemplar Schema) (r Node) {
 	if r == nil || len(r.Output()) != w || !outputSchemaEqual(r.Output(), exemplar) {
 		return nil
 	}
+	// M0146-0042a: the rebuilt tree's clause copies (an EC-reduced join
+	// clause, a parameterised scan's rebased Filter) are made here, after
+	// the seam oriented the committed tree; give them the same order.
+	if p.Rel != nil {
+		applyECOrientation(r, p.Rel.ecWant)
+	}
 	return r
 }
 

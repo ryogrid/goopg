@@ -554,6 +554,12 @@ type Path struct {
 // (design ch. 05 §1) and every path over the rel reads it; costing never
 // re-estimates (design ch. 03 §1.1, invariant #2).
 type RelOptInfo struct {
+	// ecWant is the search's EXPLAIN orientation of its equivalence-class
+	// equalities (orientECJoinClauses), recorded on the search's own upper
+	// rel so a candidate rebuilt from this rel's paths after the seam
+	// (searchedBoundaryRebuild) prints its clauses as the committed tree
+	// does (M0146-0042a). nil elsewhere.
+	ecWant ecOrientation
 	Relids RelSet
 	Rows   float64
 	Width  int
