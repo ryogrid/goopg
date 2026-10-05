@@ -56,12 +56,54 @@ are done.
   noise only).
 - Evidence: `analysis/m0146/m0146-0042/slice-const-fold-q10-q69.txt`.
 
+## Slice — EC-derived restriction order and orientation (2026-10-06, `7b5892287`)
+
+- PG takes a `var = const` (or same-relation `var = var`) equality out of
+  the restriction list (`process_equivalence`). It hands it back from
+  `generate_base_implied_equalities`, which walks `root->eq_classes` in
+  order. So a relation's EC equalities come out in EC creation order, not
+  written order.
+- The EC list is built in WHERE order, as `process_equivalence` does:
+  - A new EC is appended.
+  - An item already in an EC joins it. A constant matches an equal
+    constant of the same type.
+  - When the two items sit in different ECs, the right one's EC merges
+    into the left one's and leaves the list.
+- In TPC-DS Q31, `ss2.d_year = 1999` joins the EC opened by
+  `ss1.d_year = 1999` before `ss2.d_qoy = 2` opens its own. PG filters ss2
+  on `(d_year = 1999) AND (d_qoy = 2)`; goopg kept written order.
+- `generate_base_implied_equalities_const` hands back the written clause
+  only for an EC with two members and one source. Otherwise it builds
+  `member = const` for every member, so a regenerated `3 = c` prints
+  `(c = 3)`. A two-member `2 = a` stays as written.
+- goopg (`local_filters.go`):
+  - `equivalenceClassPlaces` replays that list over the scope's
+    conjuncts.
+  - `equivalenceClausesLast` sorts a relation's EC equalities by EC
+    position and flips a regenerated `const = col`.
+  - An EC with more than one distinct constant keeps the written form.
+  - Items are keyed by `exprIdentityKey`; a constant's key carries its
+    column's type, standing in for `em_datatype`.
+- Test: `TestRestrictionQualECOrder` compares whole plans with PG 18.3's
+  for EC order, constant matching, and regress join.sql's "Don't remove
+  SJ" orientation.
+- Results:
+  - Q31 is text-identical at SF0.25 (38 → 39). At SF1 its filters match;
+    the join order inside CTE `ss` still differs (structural).
+  - The regress join.sql "Don't remove SJ" plan now equals PG's.
+- Gates: units, tpch-spotcheck, acceptance arm 24/24, sf025, fire set
+  (per-query records identical), ea-ratchet, regress A/B over 14 files.
+- Evidence: `analysis/m0146/m0146-0042/slice-ec-order-q31.txt`.
+- Not covered:
+  - Join-level clause order (the M0146-0005co ledger row's part 2).
+  - Orientation of the EC-derived join clauses.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
 |---|---|---|---|
 | ~~a BETWEEN bound is not folded~~ (done, `7eed1a031`) | Q10 (both scales), Q69 (SF1) | `(d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001)` | `(d_moy >= 3) AND (d_year = 2001) AND (d_moy <= (3 + 3))` |
-| order of two constant EC equalities | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
+| ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
 | column qualification missing | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
 | a reference through an elided subquery / CTE / Append | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
 | alias suffix numbering | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
