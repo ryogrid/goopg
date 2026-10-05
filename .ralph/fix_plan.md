@@ -27501,7 +27501,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   > decides its placement\. The loop did not touch the source cluster
   > \(reads and pg\_basebackup only\)\.
 
-- [ ] **M0146\-0036 — TPC\-DS SF1 Q74 runs 5\-9% slower on PG\'s plan shape**
+- [x] **M0146\-0036 — TPC\-DS SF1 Q74 runs 5\-9% slower on PG\'s plan shape**
   \(filed 2026\-09\-29 by M0146\-0005ap\)\. After 0005ap Q74\'s SF1 plan
   matches PG, but goopg executes it in 617\-654 s against 591\-603 s for the
   previous plan, at the fire\-set\'s 600 s limit \(one timeout, one pass\)\.
@@ -27511,6 +27511,18 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - First step: EXPLAIN ANALYZE both plans on a private SF1 clone and
     attribute the difference by node \(partial aggregation transport vs the
     join inputs\)\.
+  - **DONE 2026\-10\-05 \(recon\)\.** Evidence `analysis/m0146/m0146\-0036/`\.
+    - On a private SF1 clone goopg runs Q74 in 512 s \(EXPLAIN ANALYZE 505 s\);
+      PG 18\.3 on `:65438` takes 891 s \(933 s\)\. Outputs are identical \(md5
+      `a6418b99…`\)\.
+    - Both spend the time in the top Nested Loops' Join Filters over CTE
+      Scans estimated at rows=1 \(PG's own estimate\): 1\.44 billion
+      evaluations in the first join, with equal rows\-removed counts on both
+      engines\. goopg is about 1\.7× faster per evaluation\.
+    - No executor gap: the 5\-9% delta was against goopg's earlier non\-PG
+      plan\. The fire set's 600 s SF1 limit is below PG's own time for
+      Q74, so a timeout there is a gate artefact\.
+  Movement: none — recon (goopg 512 s vs PG 891 s on the identical plan)
 - [x] **M0146\-0037 — TPC\-DS Q10 evaluates Gather\-bodied SubPlans inside
   workers** \(filed 2026\-09\-29 by M0146\-0005aq\)\. goopg attaches Q10\'s
   `ANY \(hashed SubPlan 1\) OR ANY \(hashed SubPlan 2\)` qual \(each SubPlan
