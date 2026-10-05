@@ -90,9 +90,12 @@ banner at the next `## ` line).
    draining the first batch. The second batch drained 2026-10-02/03:
    **M0143-0011** and **M0146-0039, 0041, 0040, 0034, 0032, 0033** are
    all `[x]`; **M0146-0035** is parked `[!]` on non-reproduction.
-   **Live members (owner decision 2026-10-03 — third S2 batch; see
-   OWNER DECISIONS 2026-10-03): M0146-0047 → M0146-0048 → M0146-0044 →
-   M0146-0045 → M0146-0046 → M0146-0043**, in that order. The three isolation
+   The third batch drained 2026-10-04/05: **M0146-0047, 0048, 0044,
+   0045, 0046, 0043** are all `[x]`. **Live members (owner decision
+   2026-10-06 — fourth S2 batch; see OWNER DECISIONS 2026-10-06):
+   M0146-0056 → M0146-0058 → M0146-0050 → M0146-0059 → M0146-0062 →
+   M0146-0051 → M0146-0052 → M0146-0053 → M0146-0054 → M0146-0055 →
+   M0146-0047b**, in that order. The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump; the tuplelock-upgrade reopen keeps M-NIGHTLY order on the
@@ -168,14 +171,16 @@ banner at the next `## ` line).
    **M0146-0009 (statistics/cardinality) subtasks are interleaveable:**
    selectable under this item whenever the slice's first-divergence is
    statistics-driven, without waiting for 0005 to close. M0146-0006
-   stays sequenced after 0005, but 0005 may close `[x]` once every
-   remaining first-divergence record is routed to a named task
-   (0009/0012/0019a/0042/…), the M0146-0014 "no unnamed records"
-   convention applied early. **M0146-0005's S4 escalation is resolved
-   2026-10-03 — the root is re-opened** (guard `\-`-normalisation;
-   OWNER DECISIONS 2026-10-03), and **M0146-0049 is next in this
-   item's structural line** — it is the named blocker for 0005dp/dq
-   and M0145-0008ac/0008y.
+   stayed sequenced after 0005, and 0005 could close `[x]` once every
+   remaining first-divergence record was routed to a named task
+   (0009/0012/0019a/0042/…) — **met: 0005 closed `[x]` 2026-10-04
+   (slice 116) and 0006 (Incremental Sort election) has landed
+   (`01739f8d1`).** **M0146-0049 is re-opened by the 2026-10-06 pin
+   below** — its live children are 0049e, 0049f and the probe-cost
+   finding the budget kept unfiled. **M0146-0068 (the B8
+   `indexProbeCostMultiplier` corpus A/B) is first among new item-3
+   work** — it gates M0145-0008ag, M0146-0009p and M0146-0060
+   (0060's other blocker is M0146-0061, normal order).
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -188,6 +193,10 @@ banner at the next `## ` line).
    not even a trace inside an existing trace guard. If instrumentation is
    genuinely needed, file a separate `Kind: impl` task, run the values gates and
    report the parity numbers (this is what `073ab2748`/`c7e231ae1` got wrong).
+   **Discharged 2026-10-06** — the hold's resume task M0146-0006 landed
+   (`01739f8d1`, arm on by default; S2b-9 via M0146-0005bp) after
+   M0146-0005 closed, and M0141-S7 is closed `[x]` (OWNER DECISIONS
+   2026-10-06); its exec-d residual stays a recorded ledger deferral.
 7. **M0140-0006a → 0006b → 0006c** (partial-Append), then
    **M0140-0007** (`Parallel Hash` from a partial inner — M0137-0019
    family A's floor).
@@ -270,6 +279,20 @@ honestly unchanged. Same adjudication as the 2026-09-23 second
 M0145-0001 re-pin. Not a root exemption: later completions accumulate
 a fresh budget, so the interleaveable stats children still owe a real
 Movement line.)
+
+LINEAGE-BASELINE: M0146-0049 M0146-0049c M0146-0049d M0146-0049d1 M0146-0049d2 M0146-0049d3
+(owner pin 2026-10-06, delegated — resolves the 2026-10-03 S4
+escalation on this root. The five pinned completions each landed real
+substrate — a parameterised Append over a flattened UNION ALL leaf,
+ExecHashJoin's empty-inner exit and outer prefetch, an uncorrelated
+CTE under LATERAL materialised once (which also fixed a wrong result),
+and parameterised hash join paths bound into a lateral nested loop —
+and their instruments stayed flat only because each witness still
+diverged upstream: Q54 at its Parallel Seq Scan outer (0049e, still
+open), Q95 unreachable until M0145-0008ac's pull-up (landed
+2026-10-03, `c317b037b`). Not a root exemption: post-pin completions
+accumulate a fresh budget. Re-opening the root lets the unfiled
+probe-cost finding it names land as a child.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -619,6 +642,66 @@ OWNER DECISIONS 2026-10-03 (delegated; details in each task's entry):
   structural line** — its three slices are the named blocker for
   0005dp/0005dq and M0145-0008ac/0008y, and it was never
   budget-blocked (`Parent: M0146`, own root).
+
+OWNER DECISIONS 2026-10-06 (delegated; details in each task's entry):
+- **Fourth S2 batch → item 2a, in this order:** **M0146-0056** (catalog
+  index 2663's short read wedges ALL later DDL — cluster corruption,
+  the widest blast radius), **M0146-0058** (an ANY-derived arm drops a
+  pulled body's WHERE and target expression — silent wrong results in
+  the commonest sublink shape), **M0146-0050 → M0146-0059** (the same
+  CTERowCache scoping root cause, adjacent work), **M0146-0062** (int
+  literals typed bigint — int4 overflow is silent and every integer
+  query is a witness), **M0146-0051 → M0146-0052** (the ctid
+  subsystem pair), **M0146-0053** (text datum miscompare),
+  **M0146-0054 → M0146-0055** (the COPY-path pair), **M0146-0047b**
+  (`(expr).field` syntax rejection — a rejection, not wrong results,
+  so last). Same policy as the earlier batches: correctness outranks
+  plan parity.
+- **M0146-0049 re-opened (`[!]`→`[ ]`) with a LINEAGE-BASELINE pin**
+  — the escalation's own re-pin arm. The five `none` completions are
+  the instrument-artefact class: each landed real substrate and its
+  witnesses diverge upstream (Q54's Parallel Seq Scan outer is open
+  0049e; Q95 needed M0145-0008ac, which has since landed). Filings
+  resume — 0049e, 0049f and the probe-cost item it could not file.
+- **M0146-0007 re-opened (`[!]`→`[ ]`), no pin needed.** Under the
+  2026-10-03 normalisation its mechanical last-5 is not exhausted
+  (M0146-0021's entry sits inside the window), and the hold's premise
+  — no remaining residue with a TPC-DS/TPC-H witness — was voided by
+  M0146-0065 (TPC-DS Q2's inlined-CTE UNION ALL appendrel at both
+  scales). 0065 stays under 0007, where it was filed; this resolves
+  its "reopen or place" ask as reopen.
+- **M0141-S7 closed `[x]`.** The 2026-09-23 hold's release condition
+  is met: M0146-0005 closed `[x]` and the resume task M0146-0006
+  landed the Incremental Sort election with the arm on by default
+  (`01739f8d1`; the S2b-9 seed arm via M0146-0005bp). The task was
+  "re-adjudicate and implement" — both are done. The exec-d residual
+  stays a recorded ledger deferral (2026-09-17 row); banner item 6 is
+  discharged.
+- **M0146-0057's in-slice fix CONFIRMED.** It landed inside
+  M0146-0007f's commit because that slice routes more references
+  through the defective path and could not land red — the
+  correctness-fix-in-parent precedent, not a re-place case.
+- **M0145-0008ac's R3 order confirmed.** Its stated dependency (0049's
+  through-a-join half) resolves via the 0049 re-open above; nothing to
+  re-sequence.
+- **B8 / `indexProbeCostMultiplier`: commission the measurement, keep
+  the park.** Filed as **M0146-0068** (recon): knob A/B
+  `GOOPG_INDEX_PROBE_MULT=1` vs `2` over the SF0.25+SF1 fire set and
+  the TPC-H arm, tabulating plan-shape flips AND wall-clock per query.
+  The 2026-09-24 park stays in force pending it — mult=1 elects
+  PG-shaped NL plans that measured 2–3x slower (Q14 4.9x is the
+  standing counter-example). If the table shows no witness regresses
+  >10% wall-clock at 1 while shapes move toward PG, the retirement is
+  pre-authorised to file as impl with the standard gates; otherwise
+  the recon writes the narrowed-window proposal. This unblocks the
+  M0145-0008ag → M0146-0009p / M0146-0060 chain.
+- **Status notes (no decision):** tonight's new nightly item
+  `TestPort_IsolationEvalPlanQual` (AI-20261006-005659-001) is already
+  standing-tracked under M-NIGHTLY order. M0146-0060's second blocker
+  M0146-0061 (bitmap heap scan range restriction) is a normal item-3
+  filing, no placement needed. M0146-0063 (visibility-map persistence)
+  is filed and selectable — it guards the 2026-10-02 corpus-vacuum
+  work against unclean stops.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -8512,7 +8595,7 @@ spill route is net-negative.
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
   regardless of `Strategy`); re-measure the full corpus. Needs S5. Runs
   under M0146-0003, gated on the M0145-0008 flip.
-- [!] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
+- [x] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
   Kind: recon
 
   > ## ESCALATION 2026-09-23 (ralph2 loop \#6) — S4 lineage budget exhausted, OWNER DECISION NEEDED
@@ -8683,6 +8766,16 @@ spill route is net-negative.
   Full writeup: design doc's 2026-09-17d update. **Row 5 split into four
   loop-sized sub-tasks, filed below**; this task (M0141-S7) itself stays
   unchecked — implementation, not just scope, is still the resume point.
+  **RESOLVED 2026-10-06 (owner, delegated — supersedes the 2026-09-23
+  OPTION (b) HOLD): closed `[x]`.** The hold's release condition is met:
+  M0146-0005 closed `[x]` (slice 116) and the resume task it sequenced,
+  M0146-0006, landed the Incremental Sort election with the arm on by
+  default (`01739f8d1`; S2b-9's seed arm via M0146-0005bp, `e4778f046`).
+  "Re-adjudicate and implement" is therefore done on the implementation
+  the owner answer itself filed. M0141-S7-exec-d stays `[ ]` under its
+  2026-09-17 ledger deferral — a recorded residual, not part of this
+  close.
+  Movement: none — re-adjudication task; the implementation it ordered landed as M0146-0006 (which carries its own Movement line)
   - [x] **M0141-S7-exec-a — `IncrementalSort` optimizer Node type + the
     executor operator**, built and unit-tested STANDALONE (constructed
     directly in tests, zero `createPlanNode`/`Plan()` callers — same
@@ -24668,6 +24761,7 @@ M0146-0001 re-baseline census on the new default arm.
     single `\*IndexScan` — no `NestLoopParam` over a general inner subtree\.
     Re\-select when M0146\-0049 lands\.
     STALE\-OK: M0146\-0005dt \(cited as the filing recon, not the blocker\)
+    STALE\-OK: M0146\-0049 \(re\-opened 2026\-10\-06; the real blocker is its open child 0049e, still cited here\)
   - [x] **M0146\-0005dt — recon: what Q54\'s parameterised Append needs**
     \(2026\-10\-03\)\.
     Kind: recon
@@ -25616,7 +25710,7 @@ M0146-0001 re-baseline census on the new default arm.
       set, ea\-ratchet, regress A/B\.
     - Design `docs/design/0100\-0149/m0146\-0006\-incremental\-sort\-election\.md`\.
   Movement: none — fire set flat; regress aggregates moved both ways
-- [!] **M0146-0007 — `inline_cte` single-reference CTE inlining**
+- [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
   (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
   non-recursive CTE is inlined into the jointree so its quals and
   statistics reach the search — divergence class D6. Operates on the
@@ -25661,6 +25755,17 @@ M0146-0001 re-baseline census on the new default arm.
   >
   > Owner: reopen \(or re\-pin a LINEAGE\-BASELINE\) to continue regress
   > fidelity here, or leave it held\.
+
+  **RESOLVED 2026-10-06 (owner, delegated): re-opened `[!]`→`[ ]`, no pin
+  needed.** Two independent grounds. (1) Under the 2026-10-03 `\-`
+  normalisation the root's mechanical last-5 is NOT exhausted — the
+  window holds M0146-0021 (Parent: M0146-0007, a nonstandard non-`none`
+  Movement value), so S4 never blocked filings here mechanically.
+  (2) The hold's premise — "no remaining residue has a TPC-DS or TPC-H
+  witness" — is voided by M0146-0065 (TPC-DS Q2's inlined-CTE UNION ALL
+  appendrel at both scales), which stays filed under this root. The
+  ledgered regress-fidelity residue (0007f–0007i rows) resumes under
+  normal item-3 order.
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -27665,7 +27770,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 31 �
     - Witness `TestJoinFilterECClausesLast` \(fails without the change\);
       SF0\.25 Q64's top Join Filter now matches PG\.
   Movement: none — instrument artefact — text-only; SF0.25 Q64 Join Filter = PG
-- [!] **M0146\-0049 — a parameterised inner path through a non\-scan node**
+- [ ] **M0146\-0049 — a parameterised inner path through a non\-scan node**
   \(filed 2026\-10\-03 by recon M0146\-0005dt\)\. PG binds a nested loop\'s
   parameters into ANY inner subtree \(`create\_nestloop\_plan` /
   `replace\_nestloop\_params`, createplan\.c:4341 / :5036; ExecReScan
@@ -27728,6 +27833,15 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 31 �
   > - **Owner decision needed:** re\-open M0146\-0049 \(or re\-pin its
   >   LINEAGE\-BASELINE\) to allow 0049e and the probe\-cost task, or leave
   >   it held while 0008ac measures the through\-a\-join half on Q95\.
+
+  **RESOLVED 2026-10-06 (owner, delegated): re-opened `[!]`→`[ ]` plus a
+  LINEAGE-BASELINE pin of 0049c/0049d/0049d1/0049d2/0049d3** — the
+  re-pin arm. The five `none`s are the instrument-artefact class this
+  pin mechanism exists for: real substrate landed and each witness
+  diverged upstream (Q54's Gather is open 0049e; Q95 needed
+  M0145-0008ac's pull-up, landed `c317b037b`). Filings resume — the
+  probe-cost item the budget kept unfiled may now be filed as a child.
+  Post-pin completions accumulate a fresh budget.
   - [x] **M0146\-0049a — recon: the executor substrate runs PG\'s
     parameterised Append** \(2026\-10\-03\)\.
     Kind: recon
@@ -28303,6 +28417,10 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 31 �
   > M0146\-0057 was fixed in the M0146\-0007f commit: 0007f routes more
   > references through the defective path and could not land without the
   > fix\. Owner: confirm the in\-slice fix or re\-place the task\.
+  **CONFIRMED 2026-10-06 (owner, delegated):** the in-slice fix stands —
+  M0146-0007f routes more references through the defective path and could
+  not land red; this is the correctness-fix-in-parent precedent, not a
+  re-place case. No re-filing.
   - Cause: `sublinkBodyIsSimple` reads a CTE name as a plain relation\. The
     body\'s FROM walk \(`bindPulledBodyScope` → `planFromClause`\) then pulls
     the CTE body up, and its WHERE comes back in `pulledQuals`, which the
@@ -28605,3 +28723,26 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 31 �
     phnullingrels\) evaluated at its eval\_at level, the way
     `add\_placeholders\_to\_base\_rels` / `fix\_placeholder\_input\_needed\_levels`
     place it\.
+- [ ] **M0146\-0068 — B8 measurement: `indexProbeCostMultiplier` knob A/B
+  \(1 vs 2\) over the corpus** \(filed 2026\-10\-06 by owner decision — see
+  OWNER DECISIONS 2026\-10\-06\)\. The 2026\-09\-24 park on the B8 probe\-cost
+  chain \(mult=1 elects PG\-shaped NL plans that measured 2–3x slower; Q14
+  4\.9x is the standing counter\-example\) needs corpus evidence, not another
+  point witness\. `indexProbeCostMultiplier` \(cost\_funcs\.go:1359\) is
+  already env\-overridable via `GOOPG_INDEX_PROBE_MULT`\.
+  Kind: recon
+  Parent: M0145\-0008af
+  - Scope: run the SF0\.25 and SF1 fire sets plus the TPC\-H arm under
+    `GOOPG_INDEX_PROBE_MULT=1` and `=2` \(default\), tabulating per\-query
+    plan\-shape flips \(first\-divergence category\) AND wall\-clock; hold
+    server age constant per CLAUDE\.md timing hygiene, private\-lane or
+    ensure\-script clusters only\.
+  - Outcome: if no witness regresses >10% wall\-clock at 1 while shapes
+    move toward PG, the retirement of the multiplier is pre\-authorised to
+    file as impl with the standard gates; if regressions cluster on a
+    shape class, write the narrowed\-window proposal instead\. Either
+    outcome unblocks the M0145\-0008ag → M0146\-0009p / M0146\-0060 chain
+    \(the slice\-115/116 census counts ~15 routed B8\-class records\)\.
+  - First step: reproduce the existing single\-query numbers \(Q14 at SF1,
+    the d3 probe\-cost reproducer\) under both knob values on a private
+    lane before the corpus run\.
