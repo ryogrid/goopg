@@ -27248,6 +27248,23 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     \(join\.sql self\-join test, both EXISTS bodies now semi joins\); 6
     pulled\-vs\-fenced edge queries equal\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 3 -> 2, sort-strategy 3 -> 2, parameterisation 3 -> 2 (Q22 first divergence depth 0 -> 6)
+- [x] **M0146\-0028g — slice 7: column\-alias lists** \(impl, done
+  2026\-10\-05\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §12\.
+  Kind: impl
+  Parent: M0146-0028
+  - `simpleDerivedPullupBody` admits `\(SELECT …\) x\(c, d\)`;
+    `resolvePulledDerived` renames the leading outputs, the rest keep their
+    names \(`addRangeTableEntryForSubquery`'s eref\)\.
+  - The analyzer accepted only an exact\-length alias list; PG renames the
+    leading columns of a shorter one \(`buildRelationAliases`\)\. The
+    "columns available" error is now 42P10 with no position, as PG's\.
+  - Witnesses `TestDerivedPullupAliasList` \(fails with the old decline\),
+    `TestDerivedAliasListPullup` \(PG 18\.3 rows\)\.
+  - Gates: units, tpch\-spotcheck, arm 24/24, sf025 99/99 same, fire set
+    \(no change\), ea\-ratchet 9 \-> 9, regress A/B \(join's alias\-count
+    error now matches PG\)\.
+  Movement: none — instrument artefact — no TPC query puts an alias list on a FROM subquery; regress join diff 18497 -> 18494
 - [x] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
@@ -28437,3 +28454,23 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   > depth 2, `PG Finalize HashAggregate \| goopg HashAggregate` under the
   > CTE, at both scales\. This task inherits the hold through its parent \(S7\)\.
   > Owner: reopen M0146\-0007 or place this task\.
+- [ ] **M0146\-0066 — trivial\_subqueryscan parity: goopg keeps a Subquery
+  Scan PG strips, and strips some PG keeps** \(filed 2026\-10\-05 by
+  M0146\-0028g's census\)\. `stripTrivialSubqueryScans` \(M0146\-0005w\)
+  replicates `setrefs\.c`'s `trivial\_subqueryscan`, but at SF0\.25 the
+  Subquery Scan count differs from PG 18\.3's on Q5 \(3/4\), Q23 \(2/0\), Q44
+  \(0/4\), Q49 \(3/6\), Q67 \(0/1\), Q71 \(0/3\), Q77 \(0/1\), and at SF1 also Q78
+  \(0/1\)\.
+  - Over\-keep: the pass never runs inside a sublink body\. On
+    `where b > \(select max\(cs\) from \(select a, sum\(b\) cs … group by a\) x\)`
+    goopg keeps `Subquery Scan on x` under the InitPlan's Aggregate, where PG
+    strips it \(Q23's `max\_store\_sales`\)\.
+  - Over\-strip: PG keeps `Subquery Scan on dw1 / v1 / v11 / cr` above
+    grouped or window bodies under a Sort, WindowAgg or Materialize \(Q67,
+    Q44, Q77\); goopg prints the bare child\.
+  Kind: recon
+  Parent: M0146\-0005
+  - First step: per witness, compare the scan's tlist regime \(pathtarget
+    vs physical, `subqueryStripSpineBreaker` / `subqueryStripTlistReset`\)
+    and the consumed positions against PG's tlist; then run the strip pass
+    over sublink and InitPlan bodies\.

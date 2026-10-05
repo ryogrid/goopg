@@ -254,3 +254,36 @@ whose two EXISTS-bearing derived operands now pull up as semi joins, as in
 PG. Six pulled-versus-fenced (`OFFSET 0`) edge queries (EXISTS, NOT EXISTS,
 IN, NOT IN, scalar, function targets) return equal results. Evidence:
 `analysis/m0146/m0146-0028/slice6/`.
+
+## 12. Slice 7 (M0146-0028g, 2026-10-05): column-alias lists
+
+`is_simple_subquery` puts no condition on the RTE's alias list. An aliased
+subquery (`(SELECT …) x(c, d)`) is flattened like any other:
+`addRangeTableEntryForSubquery` has already put the alias names into the
+RTE's `eref` column names, and `pullup_replace_vars` substitutes by
+position.
+
+- `simpleDerivedPullupBody` admits an alias list up to the output's
+  length.
+- `resolvePulledDerived` names output *i* `columns[i]` while the list
+  lasts; the rest keep their written names. The original name of a renamed
+  output is no longer visible, as in PG.
+- A list shorter than the output is legal: `buildRelationAliases` renames
+  only the leading columns. goopg's analyzer required an exact count, and
+  now only rejects a longer list.
+- The "N columns available but M specified" error is
+  ERRCODE\_INVALID\_COLUMN\_REFERENCE (42P10) with no error position, in the
+  analyzer and in the planner's table path. regress join's
+  `ss(a,b,c,d)` case now matches PG.
+
+Witnesses: `TestDerivedPullupAliasList` (fails with the old decline) and
+`TestDerivedAliasListPullup` (PG 18.3 rows). TPC-H and TPC-DS are unchanged:
+no TPC query puts an alias list on a FROM subquery.
+
+Not changed (pre-existing, ledgered): after a pull-up PG still counts the
+subquery RTE in `rtable_size`, so EXPLAIN qualifies columns
+(`(al_t.b + 1)`) where goopg prints `(b + 1)`. goopg also adds a "Perhaps
+you meant…" hint for a one-letter name that PG's fuzzy match rejects.
+
+Still open in M0146-0028: LATERAL bodies and PlaceHolderVar-wrapped pull-up
+(a grouping-sets parent, or the nullable side of an outer join).
