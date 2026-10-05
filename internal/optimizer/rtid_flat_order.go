@@ -3,6 +3,8 @@ package optimizer
 import (
 	"reflect"
 	"sort"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // renumberRTIDsFlatRtableOrder re-stamps every scan's RTID so that RTID
@@ -83,6 +85,35 @@ func renumberRTIDsFlatRtableOrder(root Node) {
 					kept = append(kept, x.Child)
 					return
 				}
+			case *SetOp:
+				// A genuine set operation (M0146-0042) is a query whose
+				// range table holds one subquery RTE per leaf
+				// (plan_set_operations): each leaf branch is a level of its
+				// own, added as the walk reaches its SubqueryScan — Parallel
+				// Append's cost order, not written order (TPC-DS Q75's
+				// `item`, `item_1`, `item_2` follow store, catalog, web).
+				// Nested set-operation nodes belong to the same tree. A
+				// UNION ALL that is not a UNION's dedupe input may be an
+				// appendrel pulled into this level (pull_up_simple_union_all)
+				// and keeps the level walk.
+				if genuineSetOp(x) {
+					var branches func(op *SetOp)
+					branches = func(op *SetOp) {
+						for _, c := range []Node{op.Left, op.Right} {
+							if c == nil {
+								continue
+							}
+							if inner, ok := c.(*SetOp); ok {
+								seen[c] = true
+								branches(inner)
+								continue
+							}
+							kept = append(kept, c)
+						}
+					}
+					branches(x)
+					return
+				}
 			case *CTEScan:
 				if x.Inlined() {
 					// An inlined single-reference CTE is a subquery RTE
@@ -161,6 +192,14 @@ func renumberRTIDsFlatRtableOrder(root Node) {
 		}
 		f.SetInt(int64(nw))
 	})
+}
+
+// genuineSetOp reports whether op is a set operation PG plans through
+// plan_set_operations rather than an appendrel: an INTERSECT or EXCEPT, a
+// UNION (distinct), or a link of the UNION ALL chain a UNION dedupes.
+func genuineSetOp(op *SetOp) bool {
+	return op.Op == parser.SetOpIntersect || op.Op == parser.SetOpExcept ||
+		op.UnionDistinctInput || (op.Op == parser.SetOpUnion && !op.All)
 }
 
 // rtidField returns n's settable RTID field, or the zero Value.
