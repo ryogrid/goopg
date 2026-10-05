@@ -53,3 +53,41 @@ func TestDerivedAliasListPullup(t *testing.T) {
 		t.Errorf("too many aliases: got %v, want PG's 42P10 error", err)
 	}
 }
+
+// TestDerivedLateralPullup pins M0146-0028h against PG 18.3: a LATERAL simple
+// subquery of the FROM list is pulled up (no outer join above it), its
+// references to the items on its left becoming join quals of the parent,
+// including references to an earlier pulled-up subquery's alias. A LATERAL
+// body that is not simple (an aggregate) keeps the unpulled path.
+func TestDerivedLateralPullup(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE al_t (a int, b int)",
+		"CREATE TABLE al_u (k int PRIMARY KEY, v text)",
+		"INSERT INTO al_t SELECT g % 50, g FROM generate_series(1, 2000) g",
+		"INSERT INTO al_u SELECT g, 'v' || g FROM generate_series(0, 60) g",
+		"ANALYZE al_t",
+		"ANALYZE al_u",
+	} {
+		runSQL(t, ctx, q)
+	}
+	for _, c := range []struct{ query, rows string }{
+		{"select u.v, s.b from al_u u, lateral (select a, b from al_t where al_t.a = u.k and b < 200) s order by 2 limit 5",
+			"v1|1;v2|2;v3|3;v4|4;v5|5"},
+		{"select u.k, s.x from al_u u, lateral (select u.k * 10 + a as x from al_t where b < 3) s order by 1, 2 limit 4",
+			"0|1;0|2;1|11;1|12"},
+		// The body's own column wins over the left item's `a`.
+		{"select count(*) from al_t t, lateral (select a from al_t where a = 3 and b < 100) s where s.a = t.a", "80"},
+		{"select d.z, s.b from (select k as z from al_u where k < 3) d, lateral (select b from al_t where a = d.z and b < 120) s order by 1, 2",
+			"0|50;0|100;1|1;1|51;1|101;2|2;2|52;2|102"},
+		{"select u.k, s.c from al_u u, lateral (select count(*) c from al_t where a = u.k) s where u.k < 3 order by 1",
+			"0|40;1|40;2|40"},
+		{"select count(*) from al_u u where exists (select 1 from al_t t, lateral (select b from al_t t2 where t2.a = t.a and t2.a = u.k and t2.b < 60) s)",
+			"50"},
+	} {
+		if got := strings.Join(renderRows(runSQL(t, ctx, c.query)), ";"); got != c.rows {
+			t.Errorf("%s: rows %q, want PG's %q", c.query, got, c.rows)
+		}
+	}
+}

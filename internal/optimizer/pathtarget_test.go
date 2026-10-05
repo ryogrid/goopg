@@ -1640,7 +1640,9 @@ func TestSlice3LateralDeclinesDerivation(t *testing.T) {
 	mk("nation", 500_000, "n_nationkey", "n_name", "n_regionkey", "n_comment")
 	mk("lineitem", 6_000_000, "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment")
 	mk("orders", 1_500_000, "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment")
-	sql := `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT') dt where s_nationkey = n_nationkey`
+	// OFFSET 0 fences the LATERAL body against pull-up (M0146-0028h), so
+	// the Lateral join under test survives.
+	sql := `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT' offset 0) dt where s_nationkey = n_nationkey`
 	stmt := parseOne(t, sql)
 	if nc, known := neededColumnNames(stmt.(*parser.SelectStmt)); known || nc != nil {
 		t.Errorf("outer needed = (%v, %v); a lateral rangevar must decline the set", nc, known)

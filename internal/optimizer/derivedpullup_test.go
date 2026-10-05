@@ -108,7 +108,6 @@ func TestDerivedPullupDeclines(t *testing.T) {
 		"SELECT * FROM (SELECT ax FROM a NATURAL JOIN c) y, b",                              // NATURAL in body
 		"SELECT * FROM (SELECT ax FROM a JOIN (SELECT cx FROM c) z ON ax = cx) y, b",        // derived join leg
 		"SELECT * FROM (SELECT ax, ax FROM a) y, b",                                         // duplicate output name
-		"SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay = b.by) y",                     // LATERAL
 	} {
 		t.Run(q, func(t *testing.T) {
 			stmts, err := parser.Parse(q)
@@ -321,5 +320,34 @@ func TestDerivedPullupAliasList(t *testing.T) {
 	_, _, rctx = pullupPlanFrom(t, "SELECT 1 FROM b, (SELECT ax FROM a) y(c)")
 	if len(rctx.pulledDerived) != 1 {
 		t.Fatalf("one alias for one output: pulledDerived=%d, want 1", len(rctx.pulledDerived))
+	}
+}
+
+// M0146-0028h: a LATERAL simple subquery of the statement's FROM list is
+// pulled up when no outer join sits above it (is_simple_subquery's lateral
+// arm with lowest_outer_join NULL). Its references to the items on its left
+// become plain columns of the parent, so its WHERE becomes a join clause
+// over both relations; its own column wins over a left item's of the same
+// name (PG's namespace order).
+func TestDerivedPullupLateral(t *testing.T) {
+	_, _, rctx := pullupPlanFrom(t, "SELECT * FROM b, LATERAL (SELECT ax, bx FROM a WHERE ay = b.by) y")
+	if len(rctx.pulledDerived) != 1 || len(rctx.pulledQuals) != 1 {
+		t.Fatalf("pulledDerived=%d pulledQuals=%d, want the LATERAL body pulled up", len(rctx.pulledDerived), len(rctx.pulledQuals))
+	}
+	walkExprRefs(rctx.pulledQuals[0], scopeIgnore, exprVisitor{Visit: func(n Expr) bool {
+		if _, outer := n.(*OuterColumnRef); outer {
+			t.Fatalf("pulled LATERAL qual keeps an outer reference: %#v", rctx.pulledQuals[0])
+		}
+		return true
+	}})
+	// y.bx is the left item b's column, now a plain column of the parent.
+	if c, ok := pullupResolve(t, rctx, "y", "bx").(*ColumnRef); !ok || c.Name != "bx" {
+		t.Fatalf("y.bx resolved to %#v, want b.bx", c)
+	}
+	// A body with a sublink is not pulled up, and with it the whole
+	// statement stays unpulled.
+	_, _, rctx = pullupPlanFrom(t, "SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay IN (SELECT cx FROM c WHERE cy = b.by)) y")
+	if len(rctx.pulledDerived) != 0 {
+		t.Fatalf("pulledDerived=%d, want the sublink-bearing LATERAL body left unpulled", len(rctx.pulledDerived))
 	}
 }

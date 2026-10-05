@@ -77,6 +77,10 @@ type derivedPullupCandidate struct {
 	// columns is the item's column-alias list (`AS x(c1, c2)`), naming the
 	// first len(columns) outputs; nil when absent (M0146-0028g).
 	columns []string
+	// lateral marks a LATERAL item of the statement's own FROM list
+	// (M0146-0028h): its body resolves with the items to its left as the
+	// enclosing scope, and those references become plain columns.
+	lateral bool
 	body    *parser.SelectStmt
 	itemLo  int // first expanded item of the body
 	itemHi  int // one past the last
@@ -119,7 +123,10 @@ func parentFromAdmitsDerivedPullup(s *parser.SelectStmt) bool {
 		return false
 	}
 	for _, it := range s.FromExprs {
-		if it.Base.Lateral || it.Base.TableFunc != nil {
+		// M0146-0028h: a join-free LATERAL subquery item may itself be
+		// pulled up; expandDerivedPullups declines the whole statement
+		// when one is not.
+		if it.Base.TableFunc != nil || (it.Base.Lateral && (it.Base.Subquery == nil || len(it.Joins) > 0)) {
 			return false
 		}
 		for _, j := range it.Joins {
@@ -356,6 +363,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 	}
 	var out []parser.FromExpr
 	var cands []*derivedPullupCandidate
+	declineAll := false
 	// M0146-0007i: a pulled body's own join-free items are expanded the same
 	// way, so a simple subquery or inlinable CTE inside it is flattened too.
 	var expand func(items []parser.FromExpr, parent *derivedPullupCandidate, depth int)
@@ -366,12 +374,30 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 			if conv, e, ok := cteAsDerivedItem(it); ok {
 				src, cteEntry = conv, e
 			}
-			body, ok := simpleDerivedPullupBody(src, cat)
+			lateral := depth == 0 && src.Base.Lateral && cteEntry == nil
+			probe := src
+			if lateral {
+				probe.Base.Lateral = false
+			}
+			body, ok := simpleDerivedPullupBody(probe, cat)
+			if ok && lateral && body.Where != nil &&
+				parserExprHasNode(reflect.ValueOf(body.Where), 0, parserNodeIsSelect) {
+				// A sublink in a LATERAL body would need its own outer
+				// references re-levelled inside its plan; not carried.
+				ok = false
+			}
 			if !ok || depth > maxDerivedPullupDepth {
+				if lateral {
+					// An unpulled LATERAL item resolves its references
+					// through the plain FROM bindings, which cannot name a
+					// pulled-up alias: keep the statement unpulled.
+					declineAll = true
+					return
+				}
 				out = append(out, it)
 				continue
 			}
-			c := &derivedPullupCandidate{alias: src.Base.Alias, columns: src.Base.Columns, body: body,
+			c := &derivedPullupCandidate{alias: src.Base.Alias, columns: src.Base.Columns, lateral: lateral, body: body,
 				itemLo: len(out), cte: cteEntry, parent: parent, depth: depth}
 			cands = append(cands, c)
 			expand(body.FromExprs, c, depth+1)
@@ -379,7 +405,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 		}
 	}
 	expand(flat, nil, 0)
-	if len(cands) == 0 {
+	if len(cands) == 0 || declineAll {
 		return s.FromExprs, nil, nil
 	}
 	return out, cands, onQuals
@@ -485,6 +511,29 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		bodyCtx.cat = cat
 		bodyCtx.rtScope = scope
 		bodyCtx.parent = planParent
+		if c.lateral {
+			// The items to the left are the LATERAL body's enclosing scope,
+			// searched after its own (PG's namespace order); they share the
+			// parent's coordinates, so a reference resolved there is
+			// rewritten to a plain column below (pullup_replace_vars
+			// lowering varlevelsup).
+			left := make([]rangeBinding, c.bindLo)
+			copy(left, bindings[:c.bindLo])
+			leftCtx := newResolveContext(left, schema, ps)
+			leftCtx.cat, leftCtx.rtScope, leftCtx.parent = cat, scope, planParent
+			for _, prev := range cands {
+				if prev.parent == nil && prev.bindHi <= c.bindLo && relOf[prev] != nil {
+					leftCtx.pulledDerived = append(leftCtx.pulledDerived, relOf[prev])
+				}
+			}
+			bodyCtx.parent = leftCtx
+		}
+		lower := func(e Expr) (Expr, bool) {
+			if !c.lateral {
+				return e, true
+			}
+			return lowerLateralRefs(e)
+		}
 		for _, child := range cands {
 			if child.parent == c {
 				bodyCtx.pulledDerived = append(bodyCtx.pulledDerived, relOf[child])
@@ -500,6 +549,11 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 			if e, err = foldQualConstants(e); err != nil {
 				return nil, nil, nil, false
 			}
+			lowered, lok := lower(e)
+			if !lok {
+				return nil, nil, nil, false
+			}
+			e = lowered
 			name, _ := targetMeta(e, t)
 			if ti < len(c.columns) {
 				// The alias list renames the output, as the RTE's eref
@@ -525,6 +579,11 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 			if q, err = foldQualConstants(q); err != nil {
 				return nil, nil, nil, false
 			}
+			lowered, lok := lower(q)
+			if !lok {
+				return nil, nil, nil, false
+			}
+			q = lowered
 			quals = append(quals, q)
 			// M0146-0028f: remember the body context per conjunct for the
 			// jointree sublink pull-up (resolveContext.pulledQualCtx).
@@ -694,4 +753,34 @@ func ordinalThroughStarTargets(pos int, targets []parser.ResTarget, ctx *resolve
 		n += len(exprs)
 	}
 	return nil, false
+}
+
+// lowerLateralRefs is pullup_replace_vars' varlevelsup adjustment for a
+// pulled-up LATERAL body (M0146-0028h): the body was resolved one scope below
+// its left-hand FROM items, so a level-1 outer reference names one of them —
+// in the parent's own coordinates — and becomes a plain column, and a deeper
+// one moves one level up. A sublink inside would carry its own levels; the
+// caller has declined those bodies, and one found here declines too.
+func lowerLateralRefs(e Expr) (Expr, bool) {
+	good := true
+	out, ok := cloneExprRefs(e, scopeIgnore, exprRewriter{Rewrite: func(n Expr) Expr {
+		if len(ExprSubplans(n)) > 0 {
+			good = false
+			return n
+		}
+		o, isOuter := n.(*OuterColumnRef)
+		if !isOuter {
+			return n
+		}
+		if o.Level == 1 {
+			return &ColumnRef{pos: o.pos, Index: o.Index, Name: o.Name, Type: o.Type, SourceTableIdx: o.SourceTableIdx}
+		}
+		c := *o
+		c.Level--
+		return &c
+	}})
+	if !ok || !good {
+		return nil, false
+	}
+	return out, true
 }

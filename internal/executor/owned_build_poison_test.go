@@ -335,7 +335,10 @@ func obpLateralCatalog(t *testing.T) catalog.Catalog {
 	return c
 }
 
-const obpLateralSQL = `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT') dt where s_nationkey = n_nationkey`
+// OFFSET 0 keeps the LATERAL body a subquery: without it the body is simple
+// and is pulled up into the FROM list (M0146-0028h), as PG does, and the
+// Lateral join under test disappears.
+const obpLateralSQL = `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT' offset 0) dt where s_nationkey = n_nationkey`
 
 // obpQ9Catalog mirrors the Slice-3 Q9 fixture: leaf-local LIKE filters
 // force prebuilt leaves, over which the derivation still applies.
