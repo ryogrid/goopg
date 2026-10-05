@@ -332,3 +332,28 @@ plan. TPC-H and TPC-DS have no LATERAL.
 
 Still open in M0146-0028: PlaceHolderVar-wrapped pull-up (a grouping-sets
 parent, the nullable side of an outer join, LATERAL under a join).
+
+## 14. Closure (2026-10-05)
+
+Slices 1-8 port `pull_up_simple_subquery` for every shape goopg can express
+without PlaceHolderVars. That covers:
+
+- bare-column and expression targets;
+- the lone FROM item, and INNER, CROSS and outer joins inside the body;
+- derived operands of an inner join, and call targets;
+- body-WHERE sublinks;
+- column-alias lists;
+- join-free LATERAL bodies.
+
+What remains needs PlaceHolderVars: pull-up under a grouping-sets parent
+(`REPLACE_WRAP_ALL`), on the nullable side of an outer join, and LATERAL
+under a join. goopg has none. No TPC query is a witness:
+
+- In TPC-DS Q36/Q67/Q70/Q86 the ROLLUP is inside the subquery body.
+- In Q5/Q14/Q77/Q80 the UNION ALL under the ROLLUP is already an appendrel.
+  Q5's top matches PG node for node.
+- No TPC query puts a simple subquery on the nullable side of an outer
+  join.
+
+The PlaceHolderVar item is filed as M0146-0067, to select once a witness
+appears.

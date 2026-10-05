@@ -27136,7 +27136,7 @@ Movement: none — instrument artefact — every TPC-H/TPC-DS grouping set is a 
       path\.
 Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6); slices 1-5: TPC-DS Q7 MATCH, Q38 Q54 Q87 Q19 Q14 Q71 Q76 emit PG's partial spines
 
-- [ ] **M0146\-0028 — pull simple FROM\-clause subqueries into the parent
+- [x] **M0146\-0028 — pull simple FROM\-clause subqueries into the parent
   join search** \(impl; filed 2026\-09\-28 by M0146\-0005ad\)\. PG\'s
   `pull\_up\_subqueries` → `pull\_up\_simple\_subquery` \(prepjointree.c\)
   replaces an `is\_simple\_subquery` RTE\_SUBQUERY with its FROM items and
@@ -27152,6 +27152,16 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     for an inner\-join body, adding the by\-expression output substitution
     the M0145\-0001 contract §4\.3 describes; keep non\-simple bodies
     \(`derivedSubqueryNeedsScan`\) as opaque leaves\.
+  - **Closed 2026\-10\-05**\. Slices 1\-8 \(0028a–0028h\) port
+    `pull\_up\_simple\_subquery` for every shape goopg can express without
+    PlaceHolderVars; design §14\.
+    - PlaceHolderVar\-wrapped pull\-up \(grouping\-sets parent, nullable side
+      of an outer join, LATERAL under a join\) filed as M0146\-0067\.
+    - No TPC witness: TPC\-DS Q36/Q67/Q70/Q86 group inside the body, the
+      Q5/Q14/Q77/Q80 ROLLUP sits over a UNION ALL appendrel \(Q5's top
+      matches PG node for node\), and no TPC query puts a simple subquery on
+      an outer join's nullable side\.
+  Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-method 39 -> 38, rendering 25 -> 24 (0028a); TPC-H CATEGORIES-EXCL-MATCH aggregation-strategy 3 -> 2, sort-strategy 3 -> 2 (0028f)
 - [x] **M0146\-0028a — slice 1: bare\-column bodies over comma lists** \(impl,
   done 2026\-09\-28\)\. Design
   `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md`; evidence
@@ -28491,3 +28501,21 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     vs physical, `subqueryStripSpineBreaker` / `subqueryStripTlistReset`\)
     and the consumed positions against PG's tlist; then run the strip pass
     over sublink and InitPlan bodies\.
+- [ ] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
+  \(filed 2026\-10\-05 by M0146\-0028's closure\)\. `pull\_up\_simple\_subquery`
+  wraps substituted outputs in PlaceHolderVars when the parent uses grouping
+  sets \(`REPLACE\_WRAP\_ALL`\), when the subquery sits on the nullable side
+  of an outer join, and for LATERAL references under a join
+  \(`pullup\_replace\_vars\_callback`, prepjointree\.c\)\. goopg has no
+  PlaceHolderVar, so `parentFromAdmitsDerivedPullup` declines
+  grouping\-sets parents and `splitInnerJoinChainForPullup` declines outer
+  links\.
+  Kind: impl
+  Parent: M0146\-0028
+  - No witness today: no TPC\-H or TPC\-DS query pulls up a simple subquery
+    in these positions \(M0146\-0028 §14\)\. Select it when a corpus query or
+    regress case needs it\.
+  - First step: a PlaceHolderVar expression \(phexpr \+ phrels \+
+    phnullingrels\) evaluated at its eval\_at level, the way
+    `add\_placeholders\_to\_base\_rels` / `fix\_placeholder\_input\_needed\_levels`
+    place it\.
