@@ -27566,7 +27566,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   to need shape work route back to 0005/its named siblings, not here.
   Kind: impl
   Parent: M0146-0005
-- [ ] **M0146\-0042a — an EC\-reduced join clause prints in its derived
+- [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
   PG `catalog\_sales\.cs\_item\_sk = item\.i\_item\_sk`\)\.
@@ -27581,6 +27581,17 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     Then let the copy keep the clause orientation that
     `orientECJoinClauses` decides, while its leftKey/leftRelids metadata
     stays outer\-first\.
+  - **DONE 2026\-10\-05** \(`36487b6d1`\)\. Design
+    `docs/design/0100\-0149/m0146\-0042a\-rebuilt\-candidate\-ec\-orientation\.md`;
+    evidence `analysis/m0146/m0146\-0042a/`\.
+    - Root cause was not the flip itself: the seam orients every EC
+      equality, inferred ones included, but a search candidate rebuilt later
+      by `searchedBoundaryRebuild` \(M0146\-0027's `is\_sorted` iteration\) got
+      fresh clause copies after that\. The orientation now rides on the
+      search's upper rel \(`RelOptInfo\.ecWant`\) and is applied to the rebuild\.
+    - SF1 Q17/Q25/Q29 print PG's Join Filter and Filter; SF1
+      text\-identical 17 → 20; SF0\.25 Q64 matches too\.
+  Movement: none — instrument artefact — text-only (already structural MATCH); SF1 text-identical 17 -> 20
 - [ ] **M0146\-0042b — a join\'s EC\-derived clauses print after its other
   quals** \(filed 2026\-10\-02 by M0146\-0005de\)\. PG 18\.3 prints
   `Join Filter: \(\(j1\.x < j2\.y\) AND \(j1\.a = j2\.b\)\)`; goopg prints the

@@ -1,0 +1,43 @@
+# M0146-0042a — SF1 fire-set capture (baseline 3a8769312 vs candidate); PG 18.3 = tmp/fireset-m42a/tpcds-sf1/m42a-tpcds-sf1-candidate-pg.plans.txt
+== Q17 baseline -> candidate
+9c9
+<                            Join Filter: (item.i_item_sk = catalog_sales.cs_item_sk)
+---
+>                            Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+32c32
+<                                  Filter: (store_sales.ss_customer_sk = cs_bill_customer_sk)
+---
+>                                  Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== Q17 PG lines
+                           Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                 Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== Q25 baseline -> candidate
+9c9
+<                            Join Filter: (item.i_item_sk = catalog_sales.cs_item_sk)
+---
+>                            Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+32c32
+<                                  Filter: (store_sales.ss_customer_sk = cs_bill_customer_sk)
+---
+>                                  Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== Q25 PG lines
+                           Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                 Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== Q29 baseline -> candidate
+9c9
+<                            Join Filter: (item.i_item_sk = catalog_sales.cs_item_sk)
+---
+>                            Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+32c32
+<                                  Filter: (store_sales.ss_customer_sk = cs_bill_customer_sk)
+---
+>                                  Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== Q29 PG lines
+                           Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                 Filter: (cs_bill_customer_sk = store_sales.ss_customer_sk)
+== SF0.25 Q64 (sweep plans-20261005-174033 -> 192152)
+26c26
+<                                                                                                            Join Filter: (item.i_item_sk = store_sales.ss_item_sk)
+---
+>                                                                                                            Join Filter: (store_sales.ss_item_sk = item.i_item_sk)
+SF1 text-identical (costs stripped) vs PG: baseline 17 -> candidate 20 (Q17 Q25 Q29)
