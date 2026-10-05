@@ -461,6 +461,14 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		if err != nil {
 			return nil, "where-not-resolvable", false
 		}
+		// M0146-0042: the body WHERE gets the constant folding the
+		// statement's own WHERE gets (planSelect) — PG runs
+		// eval_const_expressions over the sublink before pull-up — so a
+		// `d_moy BETWEEN 3 AND 3+3` bound costs one operator in
+		// order_qual_clauses' sort, as PG's `(d_moy <= 6)` does.
+		if where, err = foldQualConstants(where); err != nil {
+			return nil, "where-not-resolvable", false
+		}
 	}
 	quals := append(splitAnd(where), onQuals...)
 	if nestedBodySpansScopes(quals, depth) {
@@ -1555,6 +1563,10 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		var err error
 		where, err = resolveExpr(sub.Where, bodyCtx)
 		if err != nil {
+			return nil, "any-where-not-resolvable", false
+		}
+		// M0146-0042: constant folding, as the EXISTS arm above.
+		if where, err = foldQualConstants(where); err != nil {
 			return nil, "any-where-not-resolvable", false
 		}
 	}
