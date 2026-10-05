@@ -2742,6 +2742,7 @@ heuristic stays live.)
   Parent: none
   - Recurred in the 2026\-09\-27 nightly \(`AI-20260927-002707-001`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-001`\).
+  - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-001`\).
 - [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
   (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2752,6 +2753,7 @@ heuristic stays live.)
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-002`\).
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-002`\).
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-001`\).
+  - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-002`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2762,6 +2764,7 @@ heuristic stays live.)
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-003`\).
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-003`\).
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-002`\).
+  - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-003`\).
 - [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
@@ -27594,6 +27597,11 @@ Movement: none — instrument artefact — text\-only; text\-identical SF0\.25 3
     INTERSECT/EXCEPT to a kept Subquery Scan's alias; Q46/Q79
     text\-identical at SF1 \(28 → 30\); Q8/Q14/Q23 closer at both scales\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 rendering 11 → 10; text\-identical SF1 28 → 30
+  - Slice 2026\-10\-06 \(`95c4f5581`\): COALESCE/NULLIF/GREATEST/LEAST print
+    as keywords \(get\_rule\_expr\); a CTE body's group key resolves
+    positionally through a UNION's dedupe before the statement\-wide name
+    fallback \(TPC\-DS Q75 no longer prints the consumer's `curr\_yr`\)\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 rendering 12 → 11
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,

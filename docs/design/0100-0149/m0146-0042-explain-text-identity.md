@@ -154,6 +154,45 @@ Not covered (ledger row 2026-10-06):
   prints the appendrel's first child (`sum(ss.np)`), or for Q71
   `sum("*SELECT* 3".ext_price)`.
 
+## Slice — keyword expressions and a CTE group key through a UNION (2026-10-06, `95c4f5581`)
+
+- COALESCE, NULLIF, GREATEST and LEAST are grammar keywords that parse to
+  their own nodes (`T_CoalesceExpr`, `T_NullIfExpr`, `T_MinMaxExpr`).
+  `get_rule_expr` prints them by keyword in capitals; goopg printed the
+  lowercase call spelling (TPC-DS Q67, Q75, Q78; regress join.sql).
+  `explainKeywordFuncs` maps the call names.
+- TPC-DS Q75: `all_sales` is referenced twice, so its body is a CTE. The
+  body's outer group key reads the UNION's dedupe output.
+  - goopg's scope lookup found no relation there, and the statement-wide
+    fallback (`bySrc`, first registration wins across levels) handed it
+    the consumer's alias `curr_yr`.
+  - The ColumnRef arm now tries, in order:
+    1. `columnInScope`, the level's own scopes;
+    2. the name-guarded positional walk, into a Sort's input and now an
+       Aggregate's;
+    3. the statement-wide fallback.
+  - `resolvedColumn` treats a `Distinct` (the UNION's dedupe) as
+    transparent, and crosses the SetOp a UNION (distinct) dedupes, which
+    is never an appendrel.
+  - The key now names `date_dim`/`item` (goopg's `_1` suffixes are the
+    alias-numbering class).
+- Results:
+  - CATEGORIES-EXCL-MATCH `rendering` SF1 12 → 11.
+  - Q49's sort key gains PG's `web.return_rank, web.currency_rank`.
+  - Text-identical unchanged (SF0.25 39, SF1 30).
+- Tests: `TestExplainKeywordFuncsPrintUppercase` and the Q75 case in
+  `TestExplainNamesThroughUnpulledSubquery`.
+- Gates: units, tpch-spotcheck, arm 24/24, sf025, fire set, ea-ratchet,
+  regress A/B over 14 files.
+- Evidence: `analysis/m0146/m0146-0042/slice-keyword-funcs-cte-groupkey-q75.txt`.
+- Not covered (ledger 2026-10-06):
+  - A column renamed on the way (`dd.dow yr`) stays bare: the name guard
+    declines it, where PG prints the source.
+  - A group key that reads a computed column of its input prints as
+    `(expr)`, where PG prints `((expr))` with the coercion shown
+    (`((ss.np - (COALESCE(ss.ck, 0))::numeric))`).
+  - Q49's `item` / `return_ratio` stay bare.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
@@ -161,6 +200,6 @@ Not covered (ledger row 2026-10-06):
 | ~~a BETWEEN bound is not folded~~ (done, `7eed1a031`) | Q10 (both scales), Q69 (SF1) | `(d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001)` | `(d_moy >= 3) AND (d_year = 2001) AND (d_moy <= (3 + 3))` |
 | ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
 | ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
-| a reference through an elided subquery / CTE / Append | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
+| a reference through an elided subquery / CTE / Append (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument open) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
 | alias suffix numbering | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
 | a Sort Key detail | Q43 (SF1) | | |
