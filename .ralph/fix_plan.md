@@ -26704,7 +26704,7 @@ M0146-0001 re-baseline census on the new default arm.
     - Witness `TestJoinFilterOrderedByQualCost`; TPC\-DS EXPLAIN text is
       byte\-identical, TPC\-H arm 24/24\.
   Movement: none — parity held: no corpus query carries an out\-of\-order join residual; fixture witness only
-- [ ] **M0146\-0026 — keep a Subquery Scan whose qual cannot be pushed
+- [x] **M0146\-0026 — keep a Subquery Scan whose qual cannot be pushed
   down, as PG does** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q39,
   Q53, Q89 \(both scales\): PG keeps `Subquery Scan on foo/tmp1` above a
   window or aggregate output with the outer qual on it; goopg flattens it
@@ -26715,6 +26715,19 @@ M0146-0001 re-baseline census on the new default arm.
   - First step: diff PG's `set_subquery_pathlist` / `subquery_planner`
     pushdown refusal \(`subquery_is_pushdown_safe`, window/aggregate
     output quals\) against goopg's flattening for Q53.
+  - **DONE 2026\-10\-05 \(verified resolved\)\.** At SF0\.25 \(HEAD
+    `68117c7d7`\) and in the SF1 capture of fire set m0146\-0005dy, Q39,
+    Q53 and Q89 all plan PG\'s `Subquery Scan on tmp1/foo` above the
+    WindowAgg or HashAggregate, with the unpushable qual as its `Filter`\.
+    The tops match PG node for node\. Evidence
+    `analysis/m0146/m0146\-0026/subquery\-scan\-verification\.txt`\.
+    - The kept Subquery Scan and its naming came from the M0146\-0005c\*
+      line \(`74cd5a2e8` 0005ca, `fec4fb26e` 0005cs, `a3c7dfce7` 0005dd\)\.
+    - The remaining SF1 divergences are below the subquery: Q39
+      join\-order/parallelism/rendering, Q53
+      join\-order/scan\-type/parameterisation/parallelism, Q89
+      parallelism\. They are owned by M0146\-0005 / M0146\-0027\.
+  Movement: none — recon; resolved by the M0146\-0005c\* line
 
 - [x] **M0146\-0017 — stacked WindowAggs share one sort, as PG does**
   \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q47, Q57 \(both scales\): PG
