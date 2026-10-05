@@ -1,0 +1,79 @@
+# M0146-0026 verification — Subquery Scan kept above window/aggregate outputs (2026-10-05)
+
+SF0.25 goopg capture: plans-20261005-120424.txt  (HEAD 68117c7d7)
+SF1 goopg capture: tmp/fireset-m0146-0005dy/tpcds-sf1/m0146-0005dy-tpcds-sf1-candidate.plans.txt (fire set m0146-0005dy)
+PG: bench/tpcds/plans-pg/Q{39,53,89}.txt
+
+## Q39 — goopg SF0.25 (top 10 lines)
+ Sort  (cost=27900.41..27900.42 rows=1 width=280)
+   Sort Key: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.mean, inv1.cov, inv1.d_moy, inv1.mean, inv2.cov
+   CTE inv
+     ->  Subquery Scan on foo  (cost=27430.57..27723.92 rows=3911 width=108)
+           ->  HashAggregate  (cost=27430.57..27645.70 rows=3911 width=108)
+                 Group Key: warehouse.w_warehouse_sk, item.i_item_sk, date_dim.d_moy
+                 Filter: (CASE avg(inventory.inv_quantity_on_hand) WHEN 0 THEN 0 ELSE (stddev_samp(inventory.inv_quantity_on_hand) / avg(inventory.inv_quantity_
+                 ->  Gather  (cost=3761.16..27283.89 rows=11734 width=1308)
+                       Workers Planned: 3
+                       ->  Hash Join  (cost=2761.16..25110.49 rows=3785 width=68)
+## Q39 — PG (top 10 lines)
+Sort  (cost=27909.54..27909.55 rows=1 width=152)
+  Sort Key: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.mean, inv1.cov, inv2.mean, inv2.cov
+  CTE inv
+    ->  Subquery Scan on foo  (cost=27449.39..27732.98 rows=3912 width=126)
+          ->  HashAggregate  (cost=27449.39..27713.42 rows=3912 width=94)
+                Group Key: warehouse.w_warehouse_sk, item.i_item_sk, date_dim.d_moy
+                Filter: (CASE avg(inventory.inv_quantity_on_hand) WHEN '0'::numeric THEN '0'::numeric ELSE (stddev_samp(inventory.inv_quantity_on_hand) / avg(in
+                ->  Hash Join  (cost=3720.99..27302.70 rows=11735 width=34)
+                      Hash Cond: (inventory.inv_item_sk = item.i_item_sk)
+                      ->  Gather  (cost=2964.91..26515.81 rows=11735 width=34)
+
+## Q53 — goopg SF0.25 (top 10 lines)
+ Limit  (cost=5726.23..5726.24 rows=2 width=68)
+   ->  Sort  (cost=5726.23..5726.24 rows=2 width=68)
+         Sort Key: tmp1.avg_quarterly_sales, tmp1.sum_sales, tmp1.i_manufact_id
+         ->  Subquery Scan on tmp1  (cost=5725.89..5726.22 rows=2 width=68)
+               Filter: (CASE WHEN (tmp1.avg_quarterly_sales > '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_quarterly_sales)) / tmp1.avg_quarterly_sales) E
+               ->  WindowAgg  (cost=5725.89..5726.08 rows=6 width=72)
+                     Window: w1 AS (PARTITION BY item.i_manufact_id)
+                     ->  GroupAggregate  (cost=5725.89..5726.02 rows=6 width=40)
+                           Group Key: item.i_manufact_id, date_dim.d_qoy
+                           ->  Sort  (cost=5725.89..5725.90 rows=6 width=2004)
+## Q53 — PG (top 10 lines)
+Limit  (cost=5748.40..5748.40 rows=2 width=68)
+  ->  Sort  (cost=5748.40..5748.40 rows=2 width=68)
+        Sort Key: tmp1.avg_quarterly_sales, tmp1.sum_sales, tmp1.i_manufact_id
+        ->  Subquery Scan on tmp1  (cost=5748.03..5748.39 rows=2 width=68)
+              Filter: (CASE WHEN (tmp1.avg_quarterly_sales > '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_quarterly_sales)) / tmp1.avg_quarterly_sales) EL
+              ->  WindowAgg  (cost=5748.03..5748.25 rows=6 width=72)
+                    Window: w1 AS (PARTITION BY item.i_manufact_id)
+                    ->  GroupAggregate  (cost=5748.03..5748.16 rows=6 width=40)
+                          Group Key: item.i_manufact_id, date_dim.d_qoy
+                          ->  Sort  (cost=5748.03..5748.04 rows=6 width=14)
+
+## Q89 — goopg SF0.25 (top 10 lines)
+ Limit  (cost=19079.27..19079.35 rows=30 width=228)
+   ->  Sort  (cost=19079.27..19079.35 rows=30 width=228)
+         Sort Key: ((tmp1.sum_sales - tmp1.avg_monthly_sales)), tmp1.s_store_name
+         ->  Subquery Scan on tmp1  (cost=19057.40..19078.54 rows=30 width=228)
+               Filter: (CASE WHEN (tmp1.avg_monthly_sales <> '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_monthly_sales)) / tmp1.avg_monthly_sales) ELSE N
+               ->  WindowAgg  (cost=19057.40..19076.44 rows=90 width=228)
+                     Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+                     ->  Incremental Sort  (cost=19057.40..19075.54 rows=90 width=196)
+                           Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
+                           Presorted Key: item.i_category
+## Q89 — PG (top 10 lines)
+Limit  (cost=19188.70..19188.78 rows=30 width=266)
+  ->  Sort  (cost=19188.70..19188.78 rows=30 width=266)
+        Sort Key: ((tmp1.sum_sales - tmp1.avg_monthly_sales)), tmp1.s_store_name
+        ->  Subquery Scan on tmp1  (cost=19169.22..19187.97 rows=30 width=266)
+              Filter: (CASE WHEN (tmp1.avg_monthly_sales <> '0'::numeric) THEN (abs((tmp1.sum_sales - tmp1.avg_monthly_sales)) / tmp1.avg_monthly_sales) ELSE NU
+              ->  WindowAgg  (cost=19169.22..19185.87 rows=90 width=234)
+                    Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+                    ->  Incremental Sort  (cost=19169.22..19183.84 rows=90 width=202)
+                          Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
+                          Presorted Key: item.i_category
+
+## SF1 per-query diff classes (fire set m0146-0005dy candidate)
+Q39 SHAPE-DIFF [join-order,parallelism,rendering] estimates(goopg cost=113521.27..113521.27 rows=1 width=332 | pg cost=1
+Q53 SHAPE-DIFF [join-order,scan-type,parameterisation,parallelism] estimates(goopg cost=21116.81..21116.82 rows=7 width=
+Q89 SHAPE-DIFF [parallelism] estimates(goopg cost=71901.67..71901.92 rows=100 width=898 | pg cost=64604.68..64604.93 row
