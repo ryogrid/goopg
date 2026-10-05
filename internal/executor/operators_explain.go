@@ -596,10 +596,24 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// the relation the sublink itself scans.
 	prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
 	reg.ancestor, reg.paramInner = n, false
+	deferred := reg.deferSubPlans()
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subIndent int) {
 		walkPlanFiltered(sub, subIndent, rows, opts, nil, nil, reg)
 	})
 	reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
+	// The subPlan list prints after the children (deferSubPlans).
+	defer func() {
+		if len(deferred) == 0 {
+			return
+		}
+		prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
+		reg.ancestor, reg.paramInner = n, false
+		reg.requeueSubPlans(deferred)
+		emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subIndent int) {
+			walkPlanFiltered(sub, subIndent, rows, opts, nil, nil, reg)
+		})
+		reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
+	}()
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
@@ -3646,6 +3660,38 @@ func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed 
 
 // takePending returns the sublinks assigned since the last call
 // and clears the queue.
+// deferSubPlans removes this node's pending `SubPlan N` entries from the
+// queue and returns them, leaving its InitPlans queued (M0146-0042).
+// ExplainNode prints a node's initPlan list before its children and its
+// subPlan list after them (explain.c: initPlan, lefttree, righttree, special
+// children, subPlan) — TPC-DS Q45's Join Filter SubPlan prints below the
+// join's inputs. The caller re-queues the returned entries once the children
+// are rendered; taking them out first keeps a child's own drain from
+// emitting them early.
+func (r *subPlanReg) deferSubPlans() []subPlanEntry {
+	if r == nil || len(r.pending) == 0 {
+		return nil
+	}
+	var keep, deferred []subPlanEntry
+	for _, sp := range r.pending {
+		if optimizer.SublinkIsInitPlan(sp.expr) {
+			keep = append(keep, sp)
+		} else {
+			deferred = append(deferred, sp)
+		}
+	}
+	r.pending = keep
+	return deferred
+}
+
+// requeueSubPlans puts deferred entries back on the queue.
+func (r *subPlanReg) requeueSubPlans(deferred []subPlanEntry) {
+	if r == nil || len(deferred) == 0 {
+		return
+	}
+	r.pending = append(r.pending, deferred...)
+}
+
 func (r *subPlanReg) takePending() []subPlanEntry {
 	if r == nil || len(r.pending) == 0 {
 		return nil
@@ -5376,10 +5422,24 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// through so inner nodes still report actual rows / loops.
 	prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
 	reg.ancestor, reg.paramInner = n, false
+	deferred := reg.deferSubPlans()
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
 		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
 	reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
+	// The subPlan list prints after the children (deferSubPlans).
+	defer func() {
+		if len(deferred) == 0 {
+			return
+		}
+		prevAncestor, prevParamInner := reg.ancestor, reg.paramInner
+		reg.ancestor, reg.paramInner = n, false
+		reg.requeueSubPlans(deferred)
+		emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
+			walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
+		})
+		reg.ancestor, reg.paramInner = prevAncestor, prevParamInner
+	}()
 
 	for _, c := range renderChildren(n, reg.cte) {
 		if paramInnerChild(n, c) {
