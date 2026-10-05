@@ -249,6 +249,39 @@ Not covered (ledger row 2026-10-06):
   SQL probe did not reproduce the copy.
 - Evidence: `analysis/m0146/m0146-0042/slice-cte-body-copy-labels-q75.txt`.
 
+## Slice — typmod'd CASE NULL and an ambiguous NestLoop param (2026-10-06, `2f9990d50`)
+
+Census first (`tmp/fireset-m42i`, MATCH queries not text-identical):
+- SF0.25: Q56 (aggregate argument; NestLoop param names) and Q75
+  (`((expr))` key).
+- SF1: Q43 (`ELSE NULL` label) and Q45 (SubPlan block position).
+
+Fixes:
+- `nullConstTypeLabel`: a CASE's results are coerced to the common type
+  with typmod -1 (`coerce_to_common_type`), so a `numeric(7,2)` THEN
+  column still labels its NULL `NULL::numeric`. goopg declined any type
+  with modifiers; Q43 at SF1 (a sort key over a Finalize aggregate)
+  printed `ELSE NULL END`.
+- NestLoop params: `get_parameter` deparses one against the loop's outer
+  plan, which goopg resolves by column name (`resolveLabelInAncestor`).
+  When two outer relations expose the name, `resolveLabelInAncestorSrc`
+  now narrows by the reference's binding id before the statement-wide
+  fallback.
+  - In Q56's second and third UNION branches, the outer plan holds both
+    the branch's `item` and the IN subquery's pulled-up `item`.
+  - The fallback had printed the first branch's `item.i_item_sk` instead
+    of PG's `item_2` / `item_4`.
+
+Results:
+- Q43 is text-identical at SF1 (31 → 32).
+- Q56 SF0.25 differing lines 6 → 2; the aggregate argument remains
+  (ledgered).
+- Tests: `TestCaseNullArmIsTyped` (numeric(7,2) case) and
+  `TestNestLoopParamNamesItsOwnBranch`.
+- Gates: units, tpch-spotcheck, arm 24/24, sf025, fire set, ea-ratchet,
+  regress A/B over 14 files.
+- Evidence: `analysis/m0146/m0146-0042/slice-case-null-typmod-nestloop-param-q43-q56.txt`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
@@ -258,4 +291,4 @@ Not covered (ledger row 2026-10-06):
 | ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
 | a reference through an elided subquery / CTE / Append (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument open) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
 | alias suffix numbering (Q8 done, `eef2d1762`; Q75 skipped numbers done, `f894f0c27`) | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
-| a Sort Key detail | Q43 (SF1) | | |
+| ~~a Sort Key detail~~ (typmod'd CASE NULL, done `2f9990d50`) | Q43 (SF1) | | |

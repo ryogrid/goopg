@@ -1,0 +1,63 @@
+# M0146-0042 slice: typmod'd CASE NULL label + NestLoop param binding-id narrowing (code 2f9990d50)
+# fire-set captures tmp/fireset-m42j (baseline = 2ca41ca2f, candidate = staged change)
+
+## MATCH-query text census before this slice (tmp/fireset-m42i)
+===== sf025 MATCH 42
+-- Q56 6
+    -         Sort Key: (sum(ss.total_sales)), item.i_item_id
+    +         Sort Key: (sum((sum(store_sales.ss_ext_sales_price)))), item.i_item_id
+    -                                                               Index Cond: (cs_item_sk = item.i_item_sk)
+    +                                                               Index Cond: (cs_item_sk = item_2.i_item_sk)
+    -                                                               Index Cond: (ws_item_sk = item.i_item_sk)
+    +                                                               Index Cond: (ws_item_sk = item_4.i_item_sk)
+-- Q75 2
+    -                 Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.
+    +                 Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id, ((store_sales.ss_quantity - COALESCE(store_returns
+===== sf1 MATCH 33
+-- Q43 2
+    -         Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CA
+    +         Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END))
+-- Q45 6
+    -                           SubPlan 1
+    -                             ->  Index Scan using item_pkey on item item_1
+    -                                   Index Cond: (i_item_sk = ANY ('{2,3,5,7,11,13,17,19,23,29}'::integer[]))
+    +                           SubPlan 1
+    +                             ->  Index Scan using item_pkey on item item_1
+    +                                   Index Cond: (i_item_sk = ANY ('{2,3,5,7,11,13,17,19,23,29}'::integer[]))
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+
+sf025 text-identical 40 -> 40
+  Q36 diff-lines vs PG 2 -> 2 
+  Q56 diff-lines vs PG 6 -> 2 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q86 diff-lines vs PG 2 -> 2 
+sf1 text-identical 31 -> 32
+  Q36 diff-lines vs PG 2 -> 2 
+  Q43 diff-lines vs PG 2 -> 0 IDENT
+  Q56 diff-lines vs PG 124 -> 124 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q86 diff-lines vs PG 2 -> 2 
+
+===== sf025 Q56
+-    Index Cond: (cs_item_sk = item.i_item_sk)
++ PG Index Cond: (cs_item_sk = item_2.i_item_sk)
+-    Index Cond: (ws_item_sk = item.i_item_sk)
++ PG Index Cond: (ws_item_sk = item_4.i_item_sk)
+===== sf1 Q43
+-    Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL END)), (sum(CASE WHEN (date_dim.d_day_name = 'Monday':
++ PG Sort Key: store.s_store_name, store.s_store_id, (sum(CASE WHEN (date_dim.d_day_name = 'Sunday'::bpchar) THEN store_sales.ss_sales_price ELSE NULL::numeric END)), (sum(CASE WHEN (date_dim.d_day_name = 
+===== sf1 Q56
+-    Index Cond: (cs_item_sk = item.i_item_sk)
++ PG Index Cond: (cs_item_sk = item_2.i_item_sk)
+-    Index Cond: (ws_item_sk = item.i_item_sk)
++ PG Index Cond: (ws_item_sk = item_4.i_item_sk)
