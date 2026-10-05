@@ -185,6 +185,21 @@ func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, p
 	if !prefix || nm == nil {
 		return colName
 	}
+	if q := nm.columnInScope(at, src, colName); q != "" {
+		return q
+	}
+	return nm.column(src, colName, prefix)
+}
+
+// columnInScope is columnIn without the statement-wide fallback: "" when no
+// scope from `at` up to its level's root names the column. The fallback's
+// bySrc is first-registration-wins across levels, so a CTE body's column can
+// meet the consumer's alias there (TPC-DS Q75's `curr_yr.d_year`); a caller
+// with a positional resolution tries that first (M0146-0042).
+func (nm *explainNames) columnInScope(at optimizer.Node, src int16, colName string) string {
+	if nm == nil {
+		return ""
+	}
 	for n := at; n != nil; n = nm.parent[nodePtr(n)] {
 		if rtid, ok := nm.scopeSources(n)[src]; ok {
 			if rel := nm.bySource[rtid]; rel != "" && nm.cols[rtid][colName] {
@@ -206,7 +221,7 @@ func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, p
 			break
 		}
 	}
-	return nm.column(src, colName, prefix)
+	return ""
 }
 
 // transparentCTEFor returns the inlined CTE reference a column at `at` with
@@ -763,10 +778,11 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// partition) Var deparses with the PARENT's alias
 			// (`tuplesest_parted.b`, regress inherit), which the
 			// first-branch walk cannot produce — it would print the first
-			// child relation instead. An INTERSECT or EXCEPT is never an
-			// appendrel: PG deparses through its first input
-			// (set_deparse_plan), as TPC-DS Q8's `a1.ca_zip` (M0146-0042).
-			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept {
+			// child relation instead. An INTERSECT or EXCEPT, or the input
+			// a UNION (distinct) dedupes, is never an appendrel: PG deparses
+			// through its first input (set_deparse_plan), as TPC-DS Q8's
+			// `a1.ca_zip` and Q75's `date_dim.d_year` (M0146-0042).
+			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput {
 				return ""
 			}
 			crossed = true
@@ -804,6 +820,15 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			n = p.Child
 		case *optimizer.Materialize:
 			// M0146-0010: same transparency — a buffer renames nothing.
+			n = p.Child
+		case *optimizer.Distinct:
+			// A UNION's dedupe (printed HashAggregate / Unique) republishes
+			// its input position for position; PG deparses the group key
+			// through it to the first branch (TPC-DS Q75, M0146-0042). The
+			// set-operation walk keeps its original arms.
+			if requireSetOp {
+				return ""
+			}
 			n = p.Child
 		case *optimizer.Join:
 			n, idx = concatJoinSide(p, p.Left, p.Right, idx)

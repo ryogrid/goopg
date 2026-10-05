@@ -14,7 +14,8 @@ import (
 // the parent's `cu.c_ck` (goopg met the subquery's dd first and printed
 // `c_ck`), a sort key through the subquery to `st.city` (TPC-DS Q79), and a
 // join residual through an INTERSECT to the Subquery Scan PG keeps,
-// `a1.z` (TPC-DS Q8). Each want line is PG's output for the statement.
+// `a1.z` (TPC-DS Q8), and a CTE body's group key through a UNION's dedupe to
+// `dd.dow` (TPC-DS Q75). Each want line is PG's output for the statement.
 func TestExplainNamesThroughUnpulledSubquery(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
@@ -45,6 +46,12 @@ func TestExplainNamesThroughUnpulledSubquery(t *testing.T) {
 			"having count(*) > 0) a1 intersect select city from st s3 where sk > 2) v1 " +
 			"where substr(st.city,1,2) < substr(v1.z,1,2)",
 			[]string{"Join Filter: (substr((st.city)::text, 1, 2) < substr((a1.z)::text, 1, 2))"}},
+		// TPC-DS Q75: a CTE body's group key over a UNION's dedupe resolves
+		// through the first branch (`dd.dow`), not to the consumer's alias.
+		{"with al as (select dow, sum(q) sq from (select dd.dow, ss.np - coalesce(ss.ck, 0) q from ss, dd " +
+			"where ss.dk = dd.dk union select dd.dow, ss.np from ss, dd where ss.sk = dd.dk) u group by dow) " +
+			"select c.dow, c.sq, p.sq from al c, al p where c.dow = p.dow + 1",
+			[]string{"Group Key: dd.dow"}},
 	} {
 		var lines []string
 		for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+c.query, ps)) {

@@ -1472,6 +1472,16 @@ func scanNodeTable(n optimizer.Node) *catalog.Table {
 	return nil
 }
 
+// explainKeywordFuncs maps the call spellings of the expression nodes
+// ruleutils.c deparses by keyword (T_CoalesceExpr, T_NullIfExpr,
+// T_MinMaxExpr) to the keyword it prints.
+var explainKeywordFuncs = map[string]string{
+	"coalesce": "COALESCE",
+	"nullif":   "NULLIF",
+	"greatest": "GREATEST",
+	"least":    "LEAST",
+}
+
 // pinKeyExprNames returns a copy of e whose columns render with the qualified
 // name they carry in ctx — the node e is evaluated against — instead of being
 // re-resolved from the node being printed (M0146-0005bz). A column ctx cannot
@@ -3735,25 +3745,38 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 				return s
 			}
 		}
-		q := reg.names().columnIn(reg.currentNode(), x.SourceTableIdx, x.Name, qualify)
-		// M0146-0042: a sort key indexes the Sort's input row, and PG
-		// deparses an OUTER_VAR there through the child's target list down
-		// to the scan (resolve_special_varno). A column whose binding names
-		// no relation — an unpulled subquery's output, its Subquery Scan
-		// elided — is resolved that way: TPC-DS Q79's `substr(s_city, 1,
-		// 30)` prints `(store.s_city)`. The walk's column must carry the
-		// reference's own name: a column inside an aggregate's argument
-		// indexes the aggregate's input, not the Sort's (TPC-DS Q71's
-		// `sum(ext_price)` would otherwise read as `sum(time_dim.t_hour)`).
-		if qualify && reg != nil && !strings.Contains(q, ".") {
-			switch n := reg.currentNode().(type) {
-			case *optimizer.Sort, *optimizer.IncrementalSort:
-				if s := reg.names().resolvedColumn(childNodeOf(n), x.Index, false); strings.HasSuffix(s, "."+x.Name) {
-					return s
-				}
+		if !qualify || reg == nil || reg.names() == nil {
+			return reg.names().columnIn(reg.currentNode(), x.SourceTableIdx, x.Name, qualify)
+		}
+		if q := reg.names().columnInScope(reg.currentNode(), x.SourceTableIdx, x.Name); q != "" {
+			return q
+		}
+		// M0146-0042: a sort key or an aggregate's expression indexes the
+		// node's input row, and PG deparses an OUTER_VAR there through the
+		// child's target list down to the scan (resolve_special_varno). A
+		// column its own level's scopes cannot name — an unpulled
+		// subquery's output, its Subquery Scan elided — is resolved that
+		// way before the statement-wide fallback, which can hand a CTE
+		// body's column the consumer's alias: TPC-DS Q79's `substr(s_city,
+		// 1, 30)` prints `(store.s_city)`, Q75's CTE group key
+		// `date_dim.d_year` (not `curr_yr.d_year`). The walk's column must
+		// carry the reference's own name: a column inside an aggregate's
+		// argument indexes the aggregate's input, not the Sort's (TPC-DS
+		// Q71's `sum(ext_price)` would otherwise read as
+		// `sum(time_dim.t_hour)`).
+		var input optimizer.Node
+		switch n := reg.currentNode().(type) {
+		case *optimizer.Sort, *optimizer.IncrementalSort:
+			input = childNodeOf(n)
+		case *optimizer.Aggregate:
+			input = n.Child
+		}
+		if input != nil {
+			if s := reg.names().resolvedColumn(input, x.Index, false); strings.HasSuffix(s, "."+x.Name) {
+				return s
 			}
 		}
-		return q
+		return reg.names().column(x.SourceTableIdx, x.Name, qualify)
 	case *optimizer.OuterColumnRef:
 		// A correlated reference is always prefixed, even inside a
 		// scan qual. Upstream reaches the same output through
@@ -3870,6 +3893,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		if x.Distinct {
 			return x.Name + "(DISTINCT " + strings.Join(args, ", ") + ")"
+		}
+		// M0146-0042: COALESCE, NULLIF, GREATEST and LEAST are grammar
+		// keywords that parse to their own expression nodes, which
+		// get_rule_expr prints in capitals (`COALESCE(a, 0)`), never as a
+		// function call.
+		if kw, ok := explainKeywordFuncs[strings.ToLower(x.Name)]; ok {
+			return kw + "(" + strings.Join(args, ", ") + ")"
 		}
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
 	case *optimizer.ParamRef:
