@@ -105,13 +105,15 @@ func TestHashJoinBpcharRendersHashCondOnly(t *testing.T) {
 
 	for _, tc := range []struct{ name, sql, wantHC string }{
 		{"char-base", "SELECT ka.v FROM ka JOIN kb ON ka.id = kb.id", "(ka.id = kb.id)"},
-		{"varchar-base", "SELECT va.v FROM va JOIN vb ON va.id = vb.id", "(va.id = vb.id)"},
+		{"varchar-base", "SELECT va.v FROM va JOIN vb ON va.id = vb.id", "((va.id)::text = (vb.id)::text)"},
+		// M0146-0042: a varchar key compares as text (make_op), so its
+		// Hash Cond shows the RelabelType on both sides, as PG 18.3 prints.
 		// M0146-0021: PG 18 (live capture) prints an inlined single-reference
 		// CTE's columns as the body's base columns — its subquery scan is
 		// removed — and a MATERIALIZED one's by the reference alias.
 		{"char-cte", "WITH x AS (SELECT id, v FROM ka), y AS (SELECT id, w FROM kb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(ka.id = kb.id)"},
-		{"varchar-cte", "WITH x AS (SELECT id, v FROM va), y AS (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(va.id = vb.id)"},
-		{"varchar-cte-materialized", "WITH x AS MATERIALIZED (SELECT id, v FROM va), y AS MATERIALIZED (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(x.id = y.id)"},
+		{"varchar-cte", "WITH x AS (SELECT id, v FROM va), y AS (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "((va.id)::text = (vb.id)::text)"},
+		{"varchar-cte-materialized", "WITH x AS MATERIALIZED (SELECT id, v FROM va), y AS MATERIALIZED (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "((x.id)::text = (y.id)::text)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := bpcharExplain(t, ctx, tc.sql)

@@ -71,3 +71,39 @@ func TestJoinFilterECClausesLast(t *testing.T) {
 		}
 	}
 }
+
+// TestJoinKeyCondShowsVarcharRelabel pins M0146-0042 (Merge/Hash Cond text)
+// against PG 18.3: varchar has no `=` of its own, so make_op compares two
+// varchar keys as text and EXPLAIN shows each side's RelabelType, exactly as
+// a Join Filter does; a char(n) key keeps bpchar's operator and prints bare.
+// goopg printed the key pair without the casts (TPC-DS Q47/Q57 Merge Cond).
+func TestJoinKeyCondShowsVarcharRelabel(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE vc1 (k varchar(20), c char(10), t text, v int)",
+		"CREATE TABLE vc2 (k varchar(20), c char(10), t text, v int)",
+		"INSERT INTO vc1 SELECT 'k' || g, 'c' || g, 't' || g, g FROM generate_series(1, 2000) g",
+		"INSERT INTO vc2 SELECT 'k' || g, 'c' || g, 't' || g, g FROM generate_series(1, 2000) g",
+		"ANALYZE vc1",
+		"ANALYZE vc2",
+	} {
+		runSQL(t, ctx, q)
+	}
+	merge := optimizer.DefaultPlannerSettings()
+	merge.MaxParallelWorkersPerGather = 0
+	merge.EnableNestLoop = false
+	merge.EnableHashJoin = false
+	got := strings.Join(explainLines(t, ctx, merge, "EXPLAIN (COSTS OFF) select count(*) from vc1 join vc2 on vc1.k = vc2.k and vc1.c = vc2.c"), "\n")
+	if want := "Merge Cond: (((vc1.k)::text = (vc2.k)::text) AND (vc1.c = vc2.c))"; !strings.Contains(got, want) {
+		t.Errorf("want PG's %q in:\n%s", want, got)
+	}
+	hash := optimizer.DefaultPlannerSettings()
+	hash.MaxParallelWorkersPerGather = 0
+	hash.EnableNestLoop = false
+	hash.EnableMergeJoin = false
+	got = strings.Join(explainLines(t, ctx, hash, "EXPLAIN (COSTS OFF) select count(*) from vc1 join vc2 on vc1.k = vc2.k"), "\n")
+	if !strings.Contains(got, "Hash Cond: ((vc2.k)::text = (vc1.k)::text)") && !strings.Contains(got, "Hash Cond: ((vc1.k)::text = (vc2.k)::text)") {
+		t.Errorf("want the varchar Hash Cond relabelled to text in:\n%s", got)
+	}
+}

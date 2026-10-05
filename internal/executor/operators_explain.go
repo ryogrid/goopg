@@ -2809,6 +2809,19 @@ func formatJoinKeyCond(p *optimizer.Join, reg *subPlanReg, qualify bool) string 
 				}
 			}
 		}
+		// M0146-0042: the key is an equality like any other qual, so a
+		// varchar side shows the RelabelType to text make_op gave it
+		// (`((v1.s_store_name)::text = (v2.s_store_name)::text)`, TPC-DS
+		// Q47/Q57's Merge Cond) — formatTextCastOperands' rule.
+		lk, rk := stringTypeName(k.Left), stringTypeName(k.Right)
+		if lk != "" && rk != "" && lk != "bpchar" && rk != "bpchar" && !(lk == "text" && rk == "text") {
+			if lk == "varchar" {
+				l = "(" + l + ")::text"
+			}
+			if rk == "varchar" {
+				r = "(" + r + ")::text"
+			}
+		}
 		parts = append(parts, "("+l+" = "+r+")")
 	}
 	if len(parts) == 0 {
