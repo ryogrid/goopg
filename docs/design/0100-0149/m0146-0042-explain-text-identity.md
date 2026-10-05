@@ -98,13 +98,69 @@ are done.
   - Join-level clause order (the M0146-0005co ledger row's part 2).
   - Orientation of the EC-derived join clauses.
 
+## Slice — qualification through an unpulled subquery (2026-10-06, `fa61c41a7`)
+
+Background:
+- A grouped FROM subquery is not pulled up. When its Subquery Scan is
+  trivial, PG removes it (`trivial_subqueryscan`), and so does goopg's
+  plan.
+- goopg then has no level boundary in the tree, while SourceTableIdx
+  restarts at every query level. So the subquery's relations reuse the
+  parent's source indexes, and its outputs carry a binding no scan owns.
+- PG resolves each Var through the plan instead (`resolve_special_varno`
+  → child target list → scan).
+
+Fixes:
+- `explainNames.columnIn` keeps the scope's first relation for the source
+  index. When that relation lacks the column, it tries the scope's other
+  relations for that index (`scopeLists`, walk order) and takes the first
+  that has it. Q46/Q79's `customer.c_customer_sk` had met the subquery's
+  `date_dim` first and printed bare. Relations below a SetOp stay out of
+  the list: an Append-level column names the parent, never one child
+  (regress union's `t2.ab` and partition\_prune's `part_abc_3_1.d` showed
+  the risk).
+- A Sort or Incremental Sort key column that still has no relation is
+  walked positionally into the Sort's input (`resolvedColumn`), giving
+  Q79's `(substr((store.s_city)::text, 1, 30))`.
+  - The walk must land on a column with the reference's own name: a
+    column inside an aggregate argument indexes the aggregate's input.
+  - Without that check, Q71's `sum(ext_price)` read as
+    `sum(time_dim.t_hour)`; a guard case pins it.
+- The join-residual walk (`resolvedColumn`, not the set-op mode):
+  - It follows an INTERSECT or EXCEPT through its first input
+    (`set_deparse_plan`); neither is ever an appendrel.
+  - It stops at a kept Subquery Scan with that scan's alias, as
+    `get_variable` does (`varno` is the subquery RTE). This gives Q8's
+    `substr(a1.ca_zip, 1, 2)`.
+
+Results:
+- Test: `TestExplainNamesThroughUnpulledSubquery` checks PG 18.3's lines
+  for the three shapes, plus the aggregate guard.
+- Text-identical: SF1 28 → 30 (Q46, Q79). SF0.25 stays 39; Q79 there
+  also differs in join method.
+- Q8, Q14 and Q23 move closer to PG at both scales.
+- CATEGORIES-EXCL-MATCH `rendering` 11 → 10 at SF0.25.
+- Regress: union's INTERSECT Sort Key now equals PG's, and join.sql gains
+  PG's `nt3.nt2_id`.
+- Gates: units, tpch-spotcheck, acceptance arm 24/24, sf025, fire set,
+  ea-ratchet, regress A/B over 14 files.
+- Evidence: `analysis/m0146/m0146-0042/slice-qualification-q46-q79-q8.txt`.
+
+Not covered (ledger row 2026-10-06):
+- A Hash Cond key through an INTERSECT prints bare where PG walks into the
+  scan (`s2.city`). That is the key renderer, `formatJoinKeyCond`, not the
+  join-residual walk.
+- An aggregate-argument column over an unpulled UNION ALL prints bare. PG
+  prints the appendrel's first child (`sum(ss.np)`), or for Q71
+  `sum("*SELECT* 3".ext_price)`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
 |---|---|---|---|
 | ~~a BETWEEN bound is not folded~~ (done, `7eed1a031`) | Q10 (both scales), Q69 (SF1) | `(d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001)` | `(d_moy >= 3) AND (d_year = 2001) AND (d_moy <= (3 + 3))` |
 | ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
-| column qualification missing | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
+| ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
 | a reference through an elided subquery / CTE / Append | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
 | alias suffix numbering | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
 | a Sort Key detail | Q43 (SF1) | | |

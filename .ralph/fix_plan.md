@@ -27587,6 +27587,13 @@ Movement: yes — PLAN\-PARITY match SF1 34 → 33 \(Q69 cost tie, negative\); C
     \(38 → 39\), regress join\.sql "Don't remove SJ" plan = PG\. Resolves part
     \(1\) of the M0146\-0005co ledger row\.
 Movement: none — instrument artefact — text\-only; text\-identical SF0\.25 38 → 39, SF1 28 → 28
+  - Slice 2026\-10\-06 \(`fa61c41a7`\): EXPLAIN columns qualify through an
+    unpulled subquery whose Subquery Scan is elided \(columnIn tries every
+    relation the scope binds to the source index; a sort key walks
+    positionally into the Sort's input\) and, in a join residual, through an
+    INTERSECT/EXCEPT to a kept Subquery Scan's alias; Q46/Q79
+    text\-identical at SF1 \(28 → 30\); Q8/Q14/Q23 closer at both scales\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 rendering 11 → 10; text\-identical SF1 28 → 30
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
