@@ -268,7 +268,7 @@ func createNestLoopParamJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		Lateral:   true,
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate("PathNestLoop(param-join)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(param-join)", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jt),
 		SJInfo:    p.SJInfo,
 	}

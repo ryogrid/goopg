@@ -525,7 +525,7 @@ func (in joinInputs) keyPairs(kind string, keys []*restrictInfo) []JoinKeyPair {
 // (join_hash_keys.go:193), in conjunct order, so a key that is not a conjunct
 // would be dropped from the list this arm just published — and for a merge join
 // that list is the sort order itself.
-func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []*restrictInfo) Expr {
+func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []*restrictInfo, ecLast bool) Expr {
 	conjuncts := make([]Expr, 0, len(pairs)+len(residual))
 	for _, kp := range pairs {
 		conjuncts = append(conjuncts, &BinaryOp{pos: kp.Left.Pos(), Op: parser.OpEq, Left: kp.Left, Right: kp.Right})
@@ -538,10 +538,45 @@ func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []
 	// M0146-0013: every create_*join_plan runs order_qual_clauses over its
 	// join quals, so a cheap comparison is evaluated before a SubPlan or an
 	// OR the list happens to carry first.
+	// M0146-0042b: build_joinrel_restrictlist (relnode.c) lists an inner
+	// join's joininfo clauses first and generate_join_implied_equalities'
+	// equivalence-class equalities after them; the stable cost sort keeps
+	// that order among equal-cost quals.
+	if ecLast {
+		residual = ecJoinClausesLast(residual)
+	}
 	for _, ri := range orderQualRestrictInfos(residual) {
 		conjuncts = append(conjuncts, translateToLayout("join clause", ri.clause, in.lay, in.index))
 	}
 	return combineAnd(conjuncts)
+}
+
+// ecClausesLast reports whether this join's equivalence-class equalities
+// follow its other quals, as build_joinrel_restrictlist orders them: an inner
+// or cross join. An outer join's ON clause is never an EC member in PG
+// (distribute_qual_to_rels keeps it out), so its written order stands; semi
+// and anti joins keep theirs too.
+func (p *Path) ecClausesLast() bool {
+	return p != nil && (p.Jointype == parser.JoinInner || p.Jointype == parser.JoinCross)
+}
+
+// ecJoinClausesLast moves the equivalence-class equalities after the other
+// quals, each group in its own order (M0146-0042b; the scan-qual sibling is
+// equivalenceClausesLast).
+func ecJoinClausesLast(ris []*restrictInfo) []*restrictInfo {
+	if len(ris) < 2 {
+		return ris
+	}
+	rest := make([]*restrictInfo, 0, len(ris))
+	var ec []*restrictInfo
+	for _, ri := range ris {
+		if ri != nil && ri.isEquijoin && ri.ecID != noEquivClass {
+			ec = append(ec, ri)
+		} else {
+			rest = append(rest, ri)
+		}
+	}
+	return append(rest, ec...)
 }
 
 // createHashJoinPlan is `create_hashjoin_plan` (createplan.c:4633): recurse into
@@ -616,7 +651,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		// why BuildLeft stays false rather than being re-decided here.
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual),
+		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual, p.ecClausesLast()),
 		// M0146-0002: the build side is partial and built cooperatively.
 		ParallelHash: p.ParallelHash,
 		// `HashKeys[0] IS (LeftKey, RightKey), by pointer` (plan.go:840) — the
@@ -779,7 +814,7 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		// is meaningless here and stays false.
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate("PathMergeJoin", pairs, p.Residual),
+		Predicate: in.joinPredicate("PathMergeJoin", pairs, p.Residual, p.ecClausesLast()),
 		LeftKey:   pairs[0].Left,
 		RightKey:  pairs[0].Right,
 		HashKeys:  pairs,

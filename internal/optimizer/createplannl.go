@@ -161,7 +161,7 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 		// nil when there is no clause at all — the cartesian pair, which is the
 		// one join a plain nested loop is the ONLY available path for
 		// (`Join.Predicate` is documented nil for CROSS JOIN, plan.go:812).
-		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jt),
 		SJInfo:    p.SJInfo,
 	}
@@ -374,7 +374,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		Lateral:   true,
 		Left:      in.outer,
 		Right:     is,
-		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jtNLI),
 	}
 	return j, in.publishedLayout(jtNLI)
@@ -421,7 +421,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 		Type:      jtNLI,
 		Outer:     in.outer,
 		Inner:     is,
-		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jtNLI),
 	}
 	nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
@@ -552,7 +552,7 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 		// Residual-only: the probe clauses moved onto the probe above (MOVE,
 		// not copy — R48 doctrine). In the corpus equi-probe shape Residual
 		// is nil and combineAnd(nil) is nil, so the join line vanishes.
-		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual, p.ecClausesLast()),
 		schema: in.publishedSchema(jt),
 	}, in.publishedLayout(jt)
 }

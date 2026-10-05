@@ -357,7 +357,7 @@ func createNestLoopParamAppendPlan(p *Path, innerPath *Path) (Node, outputLayout
 		Lateral:   true,
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate(kind, nil, p.Residual),
+		Predicate: in.joinPredicate(kind, nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jt),
 	}
 	return j, in.publishedLayout(jt)

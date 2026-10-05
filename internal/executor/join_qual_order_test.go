@@ -3,6 +3,8 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestJoinFilterOrderedByQualCost pins M0146-0013: every create_*join_plan
@@ -31,5 +33,41 @@ func TestJoinFilterOrderedByQualCost(t *testing.T) {
 	}
 	if got := strings.Join(renderRows(runSQL(t, ctx, q)), ";"); got != "4840" {
 		t.Errorf("rows %q, want PG's 4840", got)
+	}
+}
+
+// TestJoinFilterECClausesLast pins M0146-0042b against PG 18.3:
+// build_joinrel_restrictlist (relnode.c) lists a joinrel's joininfo clauses
+// first and generate_join_implied_equalities' equivalence-class equalities
+// after them, and order_qual_clauses' stable cost sort keeps that order among
+// equal-cost quals. So a one-operator `jb1.x < jb2.y` prints before the EC
+// equality whatever the written order, while a dearer `(x + y) > 5` still
+// sorts after it.
+func TestJoinFilterECClausesLast(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE jb1 (a int, x int)",
+		"CREATE TABLE jb2 (b int, y int)",
+		"INSERT INTO jb1 SELECT g, g FROM generate_series(1, 1000) g",
+		"INSERT INTO jb2 SELECT g, g FROM generate_series(1, 1000) g",
+		"ANALYZE jb1",
+		"ANALYZE jb2",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	ps.EnableHashJoin = false
+	ps.EnableMergeJoin = false
+	for _, c := range []struct{ query, want string }{
+		{"select * from jb1, jb2 where jb1.a = jb2.b and jb1.x < jb2.y", "Join Filter: ((jb1.x < jb2.y) AND (jb1.a = jb2.b))"},
+		{"select * from jb1, jb2 where jb1.x < jb2.y and jb1.a = jb2.b", "Join Filter: ((jb1.x < jb2.y) AND (jb1.a = jb2.b))"},
+		{"select * from jb1 join jb2 on jb1.a = jb2.b and jb1.x + jb2.y > 5", "Join Filter: ((jb1.a = jb2.b) AND ((jb1.x + jb2.y) > 5))"},
+	} {
+		got := strings.Join(explainLines(t, ctx, ps, "EXPLAIN (COSTS OFF) "+c.query), "\n")
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: want PG's %q in:\n%s", c.query, c.want, got)
+		}
 	}
 }
