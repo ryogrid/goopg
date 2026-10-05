@@ -1,0 +1,62 @@
+# TPC-H Q16, goopg HEAD d9d74ca1f (acceptance arm, tmp/arm-m8y-explain.txt)
+  Sort  (cost=8360304.00..8360343.85 rows=15940 width=152)
+    Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+    ->  GroupAggregate  (cost=8351535.52..8359191.36 rows=15940 width=152)
+          Group Key: part.p_brand, part.p_type, part.p_size
+          ->  Gather Merge  (cost=8351535.52..8358402.50 rows=58961 width=1092)
+                Workers Planned: 2
+                ->  Sort  (cost=8350535.50..8350596.92 rows=24567 width=1092)
+                      Sort Key: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+                      ->  Nested Loop  (cost=0.38..8348744.02 rows=24567 width=720)
+                            ->  Parallel Seq Scan on part  (cost=0.00..5892.33 rows=12283 width=548)
+                                  Filter: ((p_brand <> 'Brand#45'::bpchar) AND ((p_type)::text !~~ 'MEDIUM POLISHED%'::text) AND (p_size = ANY ('{49,14,23,45,19,3,36,9}'::numeric[])))
+                            ->  Index Scan using partsupp_part_fkidx on partsupp  (cost=0.38..679.20 rows=2 width=544)
+                                  Index Cond: (ps_partkey = part.p_partkey)
+                                  Filter: (NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1)))
+                                  SubPlan 1
+                                    ->  Seq Scan on supplier  (cost=0.00..337.00 rows=1 width=584)
+                                          Filter: ((s_comment)::text ~~ '%Customer%Complaints%'::text)
+
+# TPC-H Q16, goopg M0146-0019a (acceptance arm, default GOOPG_INDEX_PROBE_MULT=2)
+  Sort  (cost=38867.94..38907.79 rows=15940 width=152)
+    Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+    ->  GroupAggregate  (cost=29991.23..37755.30 rows=15940 width=152)
+          Group Key: part.p_brand, part.p_type, part.p_size
+          ->  Gather Merge  (cost=29991.23..36966.46 rows=58959 width=1092)
+                Workers Planned: 3
+                ->  Sort  (cost=28991.19..29038.73 rows=19019 width=1092)
+                      Sort Key: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+                      ->  Parallel Hash Join  (cost=6045.87..27639.40 rows=19019 width=240)
+                            Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+                            ->  Parallel Seq Scan on partsupp  (cost=0.00..21254.81 rows=129032 width=544)
+                                  Filter: (NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1)))
+                                  SubPlan 1
+                                    ->  Seq Scan on supplier  (cost=0.00..337.00 rows=1 width=584)
+                                          Filter: ((s_comment)::text ~~ '%Customer%Complaints%'::text)
+                            ->  Parallel Hash  (cost=5892.33..5892.33 rows=12283 width=548)
+                                  ->  Parallel Seq Scan on part  (cost=0.00..5892.33 rows=12283 width=548)
+                                        Filter: ((p_brand <> 'Brand#45'::bpchar) AND ((p_type)::text !~~ 'MEDIUM POLISHED%'::text) AND (p_size = ANY ('{49,14,23,45,19,3,36,9}'::numeric[])))
+
+# TPC-H Q16, PG 18.3 :65432
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=37132.51..37172.92 rows=16166 width=45)
+   Sort Key: (count(DISTINCT partsupp.ps_suppkey)) DESC, part.p_brand, part.p_type, part.p_size
+   ->  GroupAggregate  (cost=27939.69..36002.45 rows=16166 width=45)
+         Group Key: part.p_brand, part.p_type, part.p_size
+         ->  Gather Merge  (cost=27939.69..35231.77 rows=60902 width=42)
+               Workers Planned: 4
+               ->  Sort  (cost=26939.63..26977.70 rows=15226 width=42)
+                     Sort Key: part.p_brand, part.p_type, part.p_size, partsupp.ps_suppkey
+                     ->  Parallel Hash Join  (cost=6791.36..25881.86 rows=15226 width=42)
+                           Hash Cond: (partsupp.ps_partkey = part.p_partkey)
+                           ->  Parallel Index Only Scan using partsupp_pk on partsupp  (cost=350.43..19178.43 rows=100000 width=11)
+                                 Filter: (NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1)))
+                                 SubPlan 1
+                                   ->  Seq Scan on supplier  (cost=0.00..350.00 rows=1 width=5)
+                                         Filter: ((s_comment)::text ~~ '%Customer%Complaints%'::text)
+                           ->  Parallel Hash  (cost=6282.33..6282.33 rows=12688 width=43)
+                                 ->  Parallel Seq Scan on part  (cost=0.00..6282.33 rows=12688 width=43)
+                                       Filter: ((p_brand <> 'Brand#45'::bpchar) AND ((p_type)::text !~~ 'MEDIUM POLISHED%'::text) AND (p_size = ANY ('{49,14,23,45,19,3,36,9}'::numeric[])))
+(18 rows)
+

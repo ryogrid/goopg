@@ -26790,7 +26790,7 @@ M0146-0001 re-baseline census on the new default arm.
       \(`addIndexOnlyPaths`\); filed M0146\-0019a\.
     - SF1 Q9 `reason\_pkey`: not a VM case \(PG reason 0/1 all\-visible\); open\.
   Movement: none — routing recon
-- [ ] **M0146\-0019a — index\-only paths keep a residual Filter** \(filed
+- [x] **M0146\-0019a — index\-only paths keep a residual Filter** \(filed
   2026\-09\-28 by M0146\-0019\): PG builds an Index Only Scan whose
   non\-index quals stay as its Filter \(TPC\-H Q16 `partsupp\_pk` with
   `NOT \(ps\_suppkey = ANY \(hashed SubPlan\)\)`\); goopg refuses any leaf
@@ -26802,8 +26802,22 @@ M0146-0001 re-baseline census on the new default arm.
   - **Blocker lifted 2026\-10\-02** \(owner\): all three goopg bench clusters
     vacuumed to all\-visible — see OWNER DECISIONS 2026\-10\-02\. Index\-only
     divergences are now real planner gaps\.
+  - **DONE 2026\-10\-05\.** Design
+    `docs/design/0100\-0149/m0146\-0019a\-index\-only\-residual\-filter\.md`;
+    evidence `analysis/m0146/m0146\-0019a/`\.
+    - `indexOnlyLeafClauses`: unbound local quals stay as the Index Only
+      Scan\'s Filter, re\-based onto the covered columns at createPlan\.
+    - An uncorrelated hashable ANY is priced as PG\'s hashed SubPlan
+      \(`inSubPlanHashed`\); `baseRelLayout` no longer reads a permuted
+      full\-width index\-only scan as the identity \(regress
+      `onek\_with\_null` panic, found by the A/B before commit\)\.
+    - TPC\-H Q16: Nested Loop → PG\'s Parallel Hash Join; the partsupp leaf
+      waits on `indexProbeCostMultiplier` \(ledgered\)\. TPC\-DS unchanged\.
+    - Filed M0146\-0063 \(the visibility map is written only at clean
+      shutdown\)\.
   Kind: impl
   Parent: M0146-0019
+Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -> 3 (Q16 Nested Loop -> PG's Parallel Hash Join)
 
 - [x] **M0146\-0020 — grouping sets plan as PG\'s `MixedAggregate`**
   \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q22 \(both scales\), Q27
@@ -28328,3 +28342,19 @@ M0146-0001 re-baseline census on the new default arm.
     result types, VALUES `select\_common\_type`, the executor literal
     cache\) and re\-run the regress A/B; large blast radius \(ledger
     M0134\-0156\)\.
+- [ ] **M0146\-0063 — the visibility map reaches disk only at clean
+  shutdown** \(filed 2026\-10\-05 by M0146\-0019a\)\. goopg keeps the VM in
+  memory and writes `\_vm` forks only from `SaveVM` in the shutdown defer
+  \(`cmd/goopg/main.go`\)\. PG\'s VM is a WAL\-logged fork, so its bits survive
+  a crash and are on disk for any file\-level copy\.
+  - Seen on the TPC\-H arm: its online clone of the bench cluster reads
+    `relallvisible = 0` for `partsupp` while the live bench server reads
+    18029\. Neither data directory has a `\_vm` file, so every arm capture
+    prices index\-only scans with a cold map, and an unclean stop of the
+    bench server would undo the owner\'s 2026\-10\-02 vacuum\.
+  - First step: write VM pages through the buffer manager when VACUUM sets
+    the bits, as PG\'s `visibilitymap\_set` does \(the redo path is
+    ledgered under M0131\-S21a\-2\)\. Until then, a checkpoint that also
+    saves the VM would close the clone gap\.
+  Kind: impl
+  Parent: M0146
