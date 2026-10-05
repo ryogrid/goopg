@@ -27573,6 +27573,13 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     with a census of the remaining text classes \(BETWEEN folding \+ EC order
     Q10/Q69, Q31 EC order, qualification Q8/Q46/Q79, elided\-node references
     Q56/Q75, alias numbering Q8/Q56/Q58/Q75\)\.
+  - Slice 2026\-10\-05 \(`7eed1a031`\): a pulled\-up EXISTS/IN body WHERE
+    is constant\-folded \(PG's eval\_const\_expressions runs before
+    pull\_up\_sublinks\); Q10 text\-identical at both scales \(SF0\.25 37 → 38,
+    SF1 27 → 28\)\. Q69 SF1 match lost \(34 → 33\): its two anti\-joins are an
+    exact leading\-term cost tie, now decided like SF0\.25's, which is
+    already routed to M0146\-0014 as COSTTIE \(ledger row\)\.
+Movement: yes — PLAN\-PARITY match SF1 34 → 33 \(Q69 cost tie, negative\); CATEGORIES\-EXCL\-MATCH SF1 join\-order 52 → 53, SF0\.25 join\-method 24 → 25 \(Q69\); text\-identical SF0\.25 37 → 38, SF1 27 → 28
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
