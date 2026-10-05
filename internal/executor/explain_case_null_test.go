@@ -14,7 +14,7 @@ import (
 func TestCaseNullArmIsTyped(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ce (a int, n numeric, t text)")
+	runSQL(t, ctx, "CREATE TABLE ce (a int, n numeric, t text, m numeric(7,2))")
 	ps := optimizer.DefaultPlannerSettings()
 	ps.MaxParallelWorkersPerGather = 0
 	for _, c := range []struct{ where, want string }{
@@ -22,6 +22,10 @@ func TestCaseNullArmIsTyped(t *testing.T) {
 		{"CASE WHEN a > 0 THEN a END > 1", "Filter: (CASE WHEN (a > 0) THEN a ELSE NULL::integer END > 1)"},
 		{"CASE WHEN a > 0 THEN NULL ELSE t END = 'x'", "Filter: (CASE WHEN (a > 0) THEN NULL::text ELSE t END = 'x'::text)"},
 		{"CASE WHEN a > 0 THEN 1 ELSE 2 END = 1", "Filter: (CASE WHEN (a > 0) THEN 1 ELSE 2 END = 1)"},
+		// M0146-0042: the results are coerced to the common type with typmod
+		// -1, so a numeric(7,2) column's CASE labels its NULL plain numeric
+		// (TPC-DS Q43's sort key).
+		{"CASE WHEN a > 0 THEN m ELSE NULL END > 1", "Filter: (CASE WHEN (a > 0) THEN m ELSE NULL::numeric END > '1'::numeric)"},
 	} {
 		q := "SELECT * FROM ce WHERE " + c.where
 		var lines []string

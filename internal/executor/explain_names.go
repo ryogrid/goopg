@@ -616,6 +616,12 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 	return rtid, true
 }
 
+// nodeHasSrc reports whether scan node n's outputs carry binding id src.
+func nodeHasSrc(n optimizer.Node, src int16) bool {
+	s, ok := explainSingleSourceIdx(n)
+	return ok && s == src
+}
+
 // resolveInAncestor names the relation an outer (correlated) column
 // reference comes from by searching an ancestor plan subtree for the one
 // scan-like node that exposes that column name.
@@ -644,6 +650,17 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 // input names the same relation its scan line prints (`web_sales_1`). ""
 // unless exactly one relation in anc exposes colName.
 func (nm *explainNames) resolveLabelInAncestor(anc optimizer.Node, colName string) string {
+	return nm.resolveLabelInAncestorSrc(anc, colName, 0)
+}
+
+// resolveLabelInAncestorSrc is resolveLabelInAncestor counting only the
+// relations whose binding id is src (0: every relation). A caller whose
+// name lookup was ambiguous narrows it with the reference's own binding id
+// (M0146-0042): TPC-DS Q56's loop outer side holds both its own `item` and
+// the IN subquery's pulled-up `item`, and the NestLoop param names the
+// former (`item_2.i_item_sk`), where the statement-wide fallback named the
+// first UNION branch's `item`.
+func (nm *explainNames) resolveLabelInAncestorSrc(anc optimizer.Node, colName string, src int16) string {
 	if nm == nil || anc == nil || colName == "" {
 		return ""
 	}
@@ -654,7 +671,7 @@ func (nm *explainNames) resolveLabelInAncestor(anc optimizer.Node, colName strin
 		if node == nil || n > 1 {
 			return
 		}
-		if base, ok := explainRelBaseName(node); ok {
+		if base, ok := explainRelBaseName(node); ok && (src == 0 || nodeHasSrc(node, src)) {
 			if d := nm.disambiguatedName(node); d != "" {
 				base = d
 			}

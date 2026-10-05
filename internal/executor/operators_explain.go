@@ -3796,6 +3796,16 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 			if rel := reg.names().resolveLabelInAncestor(reg.ancestorNode(), x.Name); rel != "" {
 				return rel + "." + x.Name
 			}
+			// M0146-0042: an ambiguous name (two relations of the outer
+			// plan expose it) narrows by the reference's binding id before
+			// the statement-wide fallback, which can name another level's
+			// relation (TPC-DS Q56's second UNION branch printed the first
+			// branch's `item`).
+			if x.SourceTableIdx != 0 {
+				if rel := reg.names().resolveLabelInAncestorSrc(reg.ancestorNode(), x.Name, x.SourceTableIdx); rel != "" {
+					return rel + "." + x.Name
+				}
+			}
 		}
 		if s := reg.names().column(x.SourceTableIdx, x.Name, true); s != x.Name {
 			return s
@@ -4583,10 +4593,12 @@ func formatTextCastOperands(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool
 }
 
 // nullConstTypeLabel is format_type's name for a typed NULL Const of t, or
-// "" for a type this does not model (a typmod-carrying type, whose label
-// would need the modifier).
+// "" for a type this does not model. A type modifier never shows: the
+// CASE's results are coerced to the common type with typmod -1
+// (coerce_to_common_type), so a `numeric(7,2)` THEN column still labels
+// its NULL `NULL::numeric` (TPC-DS Q43, M0146-0042).
 func nullConstTypeLabel(t catalog.Type) string {
-	if t.IsArray || len(t.Args) > 0 {
+	if t.IsArray {
 		return ""
 	}
 	switch strings.ToLower(t.Name) {
