@@ -27725,6 +27725,10 @@ Movement: none — instrument artefact — text\-only; Q75 diff lines SF0\.25 6 
     an unpulled UNION ALL, Q75 `\(\(expr\)\)` computed keys, Q45 SubPlan block
     position \(SF1\)\.
 Movement: none — instrument artefact — text\-only; text\-identical SF1 31 → 32, SF0\.25 40 → 40
+  - Slice 2026\-10\-06 \(`0350d0602`\): a node's SubPlans print after its
+    children, its InitPlans before \(explain\.c ExplainNode order\); Q45
+    text\-identical at SF1 \(32 → 33\), Q6/Q32/Q92 closer\.
+Movement: none — instrument artefact — text\-only; text\-identical SF1 32 → 33, SF0\.25 40 → 40
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,

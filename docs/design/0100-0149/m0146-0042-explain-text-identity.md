@@ -282,6 +282,25 @@ Results:
   regress A/B over 14 files.
 - Evidence: `analysis/m0146/m0146-0042/slice-case-null-typmod-nestloop-param-q43-q56.txt`.
 
+## Slice — SubPlans print after the node's children (2026-10-06, `0350d0602`)
+
+- `ExplainNode` prints a node's initPlan list before its children and its
+  subPlan list after them (explain.c: initPlan, lefttree, righttree,
+  special child plans, subPlan).
+- goopg emitted both before the children, so TPC-DS Q45's Join Filter
+  `hashed SubPlan 1` printed above the join's inputs.
+- `deferSubPlans` / `requeueSubPlans` take a node's pending `SubPlan N`
+  entries off the queue after its detail lines, so a child's drain cannot
+  emit them early. They are re-queued and drained after the children;
+  InitPlans keep their place. Both renderers changed together.
+- Results:
+  - Q45 is text-identical at SF1 (32 → 33). Q6, Q32 and Q92 move closer.
+  - Regress subselect mismatch lines 1683 → 1665, join 15600 → 15596.
+- Test: `TestSubPlanPrintsAfterChildren`.
+- Evidence: `analysis/m0146/m0146-0042/slice-subplan-after-children-q45.txt`.
+- Not covered (ledger 2026-10-06): goopg's structured EXPLAIN formats
+  (JSON, `planToJSON`) carry no `Subplan Name` plans at all.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
