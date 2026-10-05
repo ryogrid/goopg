@@ -27566,6 +27566,13 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   to need shape work route back to 0005/its named siblings, not here.
   Kind: impl
   Parent: M0146-0005
+  - Slice 2026\-10\-05 \(`fb26f7dc6`\): varchar join keys print their
+    RelabelType to text in Hash/Merge Cond, as the Join Filter already did;
+    TPC\-DS Q47/Q57 text\-identical at both scales \(SF0\.25 35 → 37, SF1
+    25 → 27\)\. Design `docs/design/0100\-0149/m0146\-0042\-explain\-text\-identity\.md`,
+    with a census of the remaining text classes \(BETWEEN folding \+ EC order
+    Q10/Q69, Q31 EC order, qualification Q8/Q46/Q79, elided\-node references
+    Q56/Q75, alias numbering Q8/Q56/Q58/Q75\)\.
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
