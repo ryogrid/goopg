@@ -282,7 +282,7 @@ Results:
   regress A/B over 14 files.
 - Evidence: `analysis/m0146/m0146-0042/slice-case-null-typmod-nestloop-param-q43-q56.txt`.
 
-## Slice — SubPlans print after the node's children (2026-10-06, `0350d0602`)
+## Slice — SubPlans print after the node's children (2026-10-06, `ad7a20114`)
 
 - `ExplainNode` prints a node's initPlan list before its children and its
   subPlan list after them (explain.c: initPlan, lefttree, righttree,

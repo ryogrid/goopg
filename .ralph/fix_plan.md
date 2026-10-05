@@ -27725,7 +27725,7 @@ Movement: none — instrument artefact — text\-only; Q75 diff lines SF0\.25 6 
     an unpulled UNION ALL, Q75 `\(\(expr\)\)` computed keys, Q45 SubPlan block
     position \(SF1\)\.
 Movement: none — instrument artefact — text\-only; text\-identical SF1 31 → 32, SF0\.25 40 → 40
-  - Slice 2026\-10\-06 \(`0350d0602`\): a node's SubPlans print after its
+  - Slice 2026\-10\-06 \(`ad7a20114`\): a node's SubPlans print after its
     children, its InitPlans before \(explain\.c ExplainNode order\); Q45
     text\-identical at SF1 \(32 → 33\), Q6/Q32/Q92 closer\.
 Movement: none — instrument artefact — text\-only; text\-identical SF1 32 → 33, SF0\.25 40 → 40

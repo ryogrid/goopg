@@ -1,4 +1,4 @@
-# M0146-0042 slice: SubPlans print after children (code 0350d0602)
+# M0146-0042 slice: SubPlans print after children (code ad7a20114)
 # fire-set captures tmp/fireset-m42k (baseline = 90556f2c2, candidate = staged change)
 
 ## sf025
