@@ -26859,7 +26859,7 @@ Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -
     \(groupingsets 1047 \-> 994, plan lines only\)\.
   - Remainder filed as M0146\-0020b\.
   Movement: yes — PLAN-PARITY SF0.25 match 26 -> 27, SF1 23 -> 24 (Q27 = PG); CATEGORIES-EXCL-MATCH SF0.25 aggregation-strategy 21 -> 19, join-order 56 -> 54; SF1 aggregation-strategy 23 -> 22
-- [ ] **M0146\-0020b — multi\-rollup and mixed grouping\-sets strategies**
+- [x] **M0146\-0020b — multi\-rollup and mixed grouping\-sets strategies**
   \(filed 2026\-09\-30 by M0146\-0020a\)\. PG\'s consider\_groupingsets\_paths
   splits CUBE / disjoint GROUPING SETS into several rollups
   \(extract\_rollup\_sets\), sorts some and hashes the rest under
@@ -26883,9 +26883,22 @@ Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -
     - Witness `TestSortedGroupingSetsRollupsMatchPG` \(PG 18\.3 plans; CUBE
       row order by md5\)\. Regress groupingsets 1875 → 1736 diff lines;
       TPC\-H/TPC\-DS plans unchanged\.
-  - Next: the mixed strategy — consider\_groupingsets\_paths\' hash\_mem
-    knapsack over rollups for sorted input, and the unsorted arm\'s
-    `unhashed\_rollup` \(groupingsets\.sql \"test the knapsack\"\)\.
+  - **Slice 2 landed 2026\-10\-05** \(`a16355df1`\): the AGG\_MIXED
+    strategy\.
+    - `mixedGroupingRollups` / `discreteKnapsack`: hash\_mem knapsack over
+      the rollups after the first; `costMixedRollups` prices it\.
+    - `groupingSetsHashTooBig`: no all\-hashed path when the sets\' tables
+      exceed hash\_mem\.
+    - `Aggregate\.HashedRollups`: MixedAggregate with `Hash Key:` lines
+      ahead of the sorted chain\.
+    - Witness: groupingsets\.sql \"test the knapsack\" on a fixture,
+      PG 18\.3\'s plan exactly\.
+    - One regress plan moves away: the `enable\_sort = off` CUBE over
+      gs\_data\_1 relies on `update pg\_class set reltuples`, which goopg\'s
+      planner ignores — filed M0146\-0064\.
+    - Ledgered: the unsorted arm\'s `unhashed\_rollup`; hash\-table output
+      order\.
+Movement: none — instrument artefact — every TPC-H/TPC-DS grouping set is a single ROLLUP, so match/CATEGORIES/ea-ratchet cannot see multi-rollup or mixed plans; regress groupingsets diff 1875 -> 1680 lines
 
 - [ ] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
   2026\-09\-27 by M0146\-0005y's residual re\-routing, the last unowned
@@ -28371,5 +28384,18 @@ Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -
     the bits, as PG\'s `visibilitymap\_set` does \(the redo path is
     ledgered under M0131\-S21a\-2\)\. Until then, a checkpoint that also
     saves the VM would close the clone gap\.
+  Kind: impl
+  Parent: M0146
+- [ ] **M0146\-0064 — a direct `UPDATE pg\_class SET reltuples` does not
+  reach the planner** \(filed 2026\-10\-05 by M0146\-0020b\)\. regress
+  groupingsets sets `update pg\_class set reltuples = 10 where
+  relname=\'gs\_data\_1\'` \(and `bug\_16784`\); PG then plans with 10 rows
+  \(`estimate\_rel\_size` reads `rd\_rel\->reltuples`\), goopg with the 2000 its
+  ANALYZE measured\. The UPDATE succeeds, but the planner\'s row count comes
+  from goopg\'s own stats, so the `enable\_sort = off` CUBE over gs\_data\_1
+  plans a sorted MixedAggregate where PG hashes every set\.
+  - First step: find where a pg\_class heap UPDATE lands \(goopg\'s pg\_class
+    is virtual\) and whether `Table\.Stats` / relpages can take reltuples
+    and relpages from it, as PG\'s relcache does on invalidation\.
   Kind: impl
   Parent: M0146

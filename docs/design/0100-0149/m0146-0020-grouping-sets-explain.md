@@ -176,13 +176,53 @@ Movement:
 
 Evidence: `analysis/m0146/m0146-0020b/`.
 
-Still open (M0146-0020b):
+## M0146-0020b slice 2 — the mixed strategy (2026-10-05)
 
-- **The mixed strategy.** For sorted input, `consider_groupingsets_paths`
-  chooses which rollups to hash with a knapsack bounded by `hash_mem`
-  (groupingsets.sql's "test the knapsack" plans MixedAggregate). The
-  unsorted arm's `unhashed_rollup` reads coincidentally sorted input that
-  way too. goopg offers all-sorted or all-hashed only.
+For sorted input, `consider_groupingsets_paths` also builds an AGG\_MIXED
+path. It treats hash\_mem as a knapsack (`DiscreteKnapsack`,
+`lib/knapsack.c`):
+
+- Every rollup after the first is an item, weighing its hash table
+  (`estimate_hashagg_tablesize`) and worth one saved sort.
+- The chosen rollups' sets are hashed one set each and consed in front of
+  the sorted rollups, so they print in reverse.
+- The first remaining sorted rollup reads the input.
+
+The unsorted arm builds no all-hashed path when the sets' tables together
+exceed hash\_mem.
+
+goopg:
+
+- `mixedGroupingRollups` and `discreteKnapsack` (groupingsets\_sorted.go)
+  port the choice.
+- `costMixedRollups` is `create_groupingsets_path`'s AGG\_MIXED price, and
+  it counts the disabled nodes (per hashed rollup, per rollup sort). The
+  mixed path is offered beside every sorted rollup path.
+- `groupingSetsHashTooBig` is the fit gate on the all-hashed path.
+- `Aggregate.HashedRollups` marks the hashed sets. EXPLAIN prints them as
+  `Hash Key:` lines ahead of the sorted chain, labelled MixedAggregate.
+  The executor emits the sorted phases first, then the hashed sets
+  (`agg_retrieve_hash_table` runs last).
+
+Witness: `TestSortedGroupingSetsRollupsMatchPG`'s knapsack case — PG
+18.3's MixedAggregate (`Hash Key: two / four / ten / hundred`, `Group Key:
+unique1`, then the `twothousand` and `thousand` sorts) — and
+`TestDiscreteKnapsackCountsItems`.
+
+Movement: regress groupingsets 1736 → 1680 diff lines. TPC-H and TPC-DS are
+unchanged.
+
+One groupingsets plan moves away from PG: the `enable_sort = off` CUBE over
+`gs_data_1`. The test sets `update pg_class set reltuples = 10`; PG plans
+with 10 rows and goopg with 2000, because its planner does not read the
+update (M0146-0064). With 2000 rows PG's fit gate also refuses the
+all-hashed path.
+
+Not ported (ledgered):
+
+- The unsorted arm's `unhashed_rollup`: input already sorted on the first
+  rollup keeps it sorted and hashes the rest.
+- Hashed groups come out in key order, not hash-table order.
 - Expansion order: `expand_grouping_sets` sorts the sets with `list_sort`,
-  which is unstable from seven sets on. goopg's sort is stable, so equal-length sets
-  could pair into different chains (ledgered).
+  which is unstable from seven sets on; goopg's sort is stable.
+- Unsortable and unhashable grouping columns are not tracked.
