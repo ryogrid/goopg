@@ -224,6 +224,31 @@ Not covered (ledger row 2026-10-06):
     `item_1`, `item_2`): some scan that EXPLAIN does not print claims a
     name.
 
+## Slice — an unprinted CTE body copy claims no labels (2026-10-06, `f894f0c27`)
+
+- A CTE referenced twice can hang a separate copy of its body under each
+  reference (TPC-DS Q75's `all_sales` under `curr_yr` and `prev_yr`).
+  - An instrumented binary on the SF0.25 dataset showed every `item`
+    RTID claimed by two scan nodes, one per copy.
+  - EXPLAIN prints one `CTE <name>` section, the first reference's body
+    (`collectCTEHoist`).
+  - Column qualifiers dedupe per RTID and came out right. Node labels are
+    claimed per node pointer, so the copies took suffixes alternately:
+    the printed body read `item`, `item_2`, `item_4` beside its own
+    `item_1.i_item_sk`.
+- `explainNames.collect` now follows `collectCTEHoist`: a second
+  reference to a non-inlined CTE registers its own scan but does not
+  descend into its body.
+- The copy has no result effect: `cteScanOp` shares rows per CTE
+  declaration (`ctx.CTERowCache`, M0097-0099), so the body runs once,
+  as in PG.
+- Results:
+  - Q75 SF0.25 differing lines 6 → 2 (the `((expr))` group key remains).
+  - Q14 128 → 116 (SF0.25) and 160 → 148 (SF1).
+- Test: `TestExplainNamesSecondCTEBodyCopyClaimsNoLabel` (hermetic). A
+  SQL probe did not reproduce the copy.
+- Evidence: `analysis/m0146/m0146-0042/slice-cte-body-copy-labels-q75.txt`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
@@ -232,5 +257,5 @@ Not covered (ledger row 2026-10-06):
 | ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
 | ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
 | a reference through an elided subquery / CTE / Append (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument open) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
-| alias suffix numbering (Q8 done, `eef2d1762`; Q75 skipped numbers open) | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
+| alias suffix numbering (Q8 done, `eef2d1762`; Q75 skipped numbers done, `f894f0c27`) | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
 | a Sort Key detail | Q43 (SF1) | | |
