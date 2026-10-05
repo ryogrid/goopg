@@ -26900,7 +26900,7 @@ Movement: yes — TPC-H CATEGORIES-EXCL-MATCH join-order 9 -> 8, join-method 4 -
       order\.
 Movement: none — instrument artefact — every TPC-H/TPC-DS grouping set is a single ROLLUP, so match/CATEGORIES/ea-ratchet cannot see multi-rollup or mixed plans; regress groupingsets diff 1875 -> 1680 lines
 
-- [ ] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
+- [x] **M0146\-0027 — parallel partial\-subtree reach** \(impl; filed
   2026\-09\-27 by M0146\-0005y's residual re\-routing, the last unowned
   SF0\.25 first\-divergence family\). ~10 records: `PG Nested Loop Inner |
   goopg Sort` under `GroupAggregate` \(Q6/Q17/Q25/Q29/Q50/Q77\), `PG
@@ -27121,7 +27121,20 @@ Movement: none — instrument artefact — every TPC-H/TPC-DS grouping set is a 
       over\-eager parallel election, costing side not reach\); Q16's
       parallelism mark rides its join\-spine MISSING\-NODE
       \(pre\-existing, join\-order subsystem\)\.
-  Movement: TPC\-DS Q7 MATCH; Q17 Q25 Q29 Q50 Q77 first\-divergence moved deeper \(SF0\.25\); Q38 Q54 Q87 emit PG's partial\-DISTINCT spine \(slice 2\); Q19 emits PG's sorted\-input partial spine \(slice 3\); Q14 Q76 emit PG's single\-Gather Parallel Append shape and Q71's gather covers the join \(slice 4, oracle\-exact checksums\); Q71 emits PG's full NL\-over\-ParallelAppend\-\>per\-leg\-PHJ spine and Q76 gains per\-leg PHJs \(slice 5; all\-depth categories join\-method 46\->45, parallelism 54\->53 SF0\.25; first\-divergence record relabels only — Q76 sort\-strategy\->aggregation\-strategy\); Q28 full MATCH at both scales and Q16's agg\-input spine matches PG's \(slice 6; SF0\.25 match 11\->12 divergent 88\->87, SF1 match 13\->14 divergent 86\->85\)
+  - **Closed 2026\-10\-05** \(routing recon\)\. Evidence
+    `analysis/m0146/m0146\-0027/closure/`; design § Closure\.
+    - SF0\.25 D3\-partialpath is 17 queries, none a reach gap: every
+      partial shape PG elects is a filed candidate\.
+    - Cost ties with both shapes filed \(M0146\-0014 residuals\): Q17/Q25/Q29;
+      Q26/Q33/Q45 worker vs leader Sort \(Q26 by PG's own formulas
+      14290\.17 vs 14290\.19\); Q19/Q40/Q61 partial vs one\-phase aggregate\.
+    - Other families: Q16/Q39/Q5/Q42/Q52 join order and Gather placement;
+      Q92 parallel\-restricted SubPlan \(M0146\-0012a ledger\); Q76 per\-leg
+      join method\.
+    - Q2 filed as M0146\-0065: an inlined single\-reference CTE whose body is
+      a UNION ALL never becomes an appendrel, so its consumer has no partial
+      path\.
+Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6); slices 1-5: TPC-DS Q7 MATCH, Q38 Q54 Q87 Q19 Q14 Q71 Q76 emit PG's partial spines
 
 - [ ] **M0146\-0028 — pull simple FROM\-clause subqueries into the parent
   join search** \(impl; filed 2026\-09\-28 by M0146\-0005ad\)\. PG\'s
@@ -28399,3 +28412,28 @@ Movement: none — instrument artefact — every TPC-H/TPC-DS grouping set is a 
     and relpages from it, as PG\'s relcache does on invalidation\.
   Kind: impl
   Parent: M0146
+- [ ] **M0146\-0065 — an inlined single\-reference CTE whose body is a
+  UNION ALL is never pulled up as an appendrel** \(filed 2026\-10\-05 by
+  M0146\-0027's closure\)\. PG's `inline\_cte` turns the reference into an
+  RTE\_SUBQUERY, and `pull\_up\_subqueries` pulls it up through
+  `pull\_up\_simple\_union\_all`, so the join sees a Parallel Append\.
+  goopg joins the inlined body serially through a plain `Append`\.
+  TPC\-DS Q2's CTE `wswscs` reads the inlined `wscs` \(web\_sales UNION ALL
+  catalog\_sales\): PG plans `Finalize HashAggregate \-> Gather \-> Partial
+  HashAggregate \-> Parallel Hash Join \-> Parallel Append`, goopg a serial
+  HashAggregate\. A UNION ALL written as a FROM subquery goes parallel in
+  goopg, inside a CTE or not\.
+  Kind: impl
+  Parent: M0146\-0007
+  - Repro: `analysis/m0146/m0146\-0027/closure/q2\-inlined\-cte\-union\-all\-repro\.sql`
+    — on the inlined form the Hash Join also displays less cost than its
+    own Append input\.
+  - First step: follow the inlined CTE body from `inline\_cte`'s goopg
+    port \(M0146\-0007a\) into the jointree pull\-up, and find where it
+    misses `subqueryChainIsSimpleUnionAll` \(M0145\-0004\)\.
+  > ## ESCALATION 2026\-10\-05 — new TPC\-DS witness for held M0146\-0007
+  > M0146\-0007 is held `\[\!\]` because "no remaining residue has a TPC\-DS
+  > or TPC\-H witness"\. TPC\-DS Q2 is one now: the first divergence at
+  > depth 2, `PG Finalize HashAggregate \| goopg HashAggregate` under the
+  > CTE, at both scales\. This task inherits the hold through its parent \(S7\)\.
+  > Owner: reopen M0146\-0007 or place this task\.
