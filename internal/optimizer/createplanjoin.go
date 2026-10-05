@@ -516,6 +516,11 @@ func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []
 		if ri == nil || ri.clause == nil {
 			panic(fmt.Sprintf("createPlan: %s residual %d has no clause", kind, i))
 		}
+	}
+	// M0146-0013: every create_*join_plan runs order_qual_clauses over its
+	// join quals, so a cheap comparison is evaluated before a SubPlan or an
+	// OR the list happens to carry first.
+	for _, ri := range orderQualRestrictInfos(residual) {
 		conjuncts = append(conjuncts, translateToLayout("join clause", ri.clause, in.lay, in.index))
 	}
 	return combineAnd(conjuncts)

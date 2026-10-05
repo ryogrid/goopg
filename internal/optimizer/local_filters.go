@@ -2,7 +2,6 @@ package optimizer
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -143,16 +142,10 @@ func equivalenceClausesLast(cs []Expr) []Expr {
 			rest = append(rest, c)
 		}
 	}
-	out := append(rest, ec...)
 	// order_qual_clauses: a stable sort by per-tuple evaluation cost
 	// (qualEvalOps, cost_qual_eval's count), so a cheap equality still
 	// precedes a costlier OR or IN list.
-	cost := make(map[Expr]float64, len(out))
-	for _, c := range out {
-		_, cost[c] = qualEvalOps(c)
-	}
-	sort.SliceStable(out, func(i, j int) bool { return cost[out[i]] < cost[out[j]] })
-	return out
+	return orderQualClauses(append(rest, ec...))
 }
 
 // isEquivalenceClause reports whether c is an `=` whose two sides are a

@@ -1,6 +1,10 @@
 package optimizer
 
-import "github.com/goopg/goopg/internal/parser"
+import (
+	"sort"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // minArraySizeForHashedSAOP is clauses.c's MIN_ARRAY_SIZE_FOR_HASHED_SAOP: an
 // `x = ANY (list of constants)` of at least this many elements is evaluated
@@ -184,4 +188,37 @@ func subPlanCostOps(plan Node, kind int, lowered bool) (startup, perTuple float6
 		startup = pc.StartupCost
 	}
 	return startup / op, per / op
+}
+
+// orderQualClauses is order_qual_clauses (createplan.c): a stable sort of a
+// qual list by cost_qual_eval's per-tuple cost (qualEvalOps), so cheaper
+// clauses are evaluated first and ties keep their order. PG sorts by
+// security_level first; goopg's quals carry none (every level is 0, PG's
+// value for a query without security-barrier views or RLS — ledgered).
+func orderQualClauses(clauses []Expr) []Expr {
+	if len(clauses) < 2 {
+		return clauses
+	}
+	out := append([]Expr(nil), clauses...)
+	cost := make(map[Expr]float64, len(out))
+	for _, c := range out {
+		_, cost[c] = qualEvalOps(c)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return cost[out[i]] < cost[out[j]] })
+	return out
+}
+
+// orderQualRestrictInfos is orderQualClauses over a join's restrictInfo
+// list, keyed on each clause.
+func orderQualRestrictInfos(ris []*restrictInfo) []*restrictInfo {
+	if len(ris) < 2 {
+		return ris
+	}
+	out := append([]*restrictInfo(nil), ris...)
+	cost := make(map[*restrictInfo]float64, len(out))
+	for _, ri := range out {
+		_, cost[ri] = qualEvalOps(ri.clause)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return cost[out[i]] < cost[out[j]] })
+	return out
 }
