@@ -1,8 +1,7 @@
 # M0146-0012a — a correlated-sublink clause is a join clause
 
-Status: in progress. Slices A (placement) and B (pricing) landed on
-2026-10-05; slice C (inner-unique `outer_match_frac`) is next. Parent:
-M0146-0012.
+Status: done 2026-10-05. Slices A (placement), B (pricing) and C (the
+hash join's quals charged on hashjointuples) landed. Parent: M0146-0012.
 Evidence: `analysis/m0146/m0146-0012a/`.
 
 ## PG mechanism
@@ -104,15 +103,34 @@ Evidence: `analysis/m0146/m0146-0012a/`.
   estimates the same join at 234, so it is PG-shared and was re-pinned
   under G4 (`ea-repin-attribution.md`).
 
-## Slice C — inner-unique `outer_match_frac` (next)
+## Slice C — a hash join's quals charged on hashjointuples (landed 2026-10-05)
 
-- `hashJoinFinalCostInputFor` (`hashjoin_innerunique.go`) misses PG's
-  `/ inner.rows`: `outer_match_frac = joinrel.rows / (outer.rows ×
-  inner.rows)`.
-- `hashJoinCost` hard-codes `match_count = 1`.
-- PG charges the join filter on `outer_matched_rows`; goopg charges it on
-  the join's output rows. Q17's cost is therefore 448k against PG's 212k,
-  although the election already agrees.
+- The inner-unique factors were already PG's (M0146-0005e):
+  `outer_match_frac` is the pair's inner-join selectivity, and
+  `match_count` is the inner rows. The slice-3 README's "missing
+  `/ inner.rows`" predates that work.
+- The gap was where the residual was charged. `final_cost_hashjoin`
+  charges `cpu_tuple_cost + qp_qual_cost.per_tuple` on `hashjointuples`:
+  the matched outer rows of an inner-unique, semi or anti join, and the
+  hash clauses' `approx_tuple_count` otherwise. goopg added the residual
+  separately on the join's output rows.
+- `hashJoinInputs.qualPerTuple` now carries `joinQualPerTuple(residual)`
+  into `hashJoinCost`. The serial, parameterised, partial and Parallel Hash
+  sites drop their separate charge.
+- **TPC-H:** Q17 costs 198k (PG 212k, was 448k). All 22 plans keep their
+  shape, and the arm is 24/24 MATCH.
+- **TPC-DS:** Q32, Q65, Q92 and Q95 change cost or shape, with checksums
+  equal.
+  - Q92 now joins `web_sales` to `item` first, as PG does, and runs in
+    118 ms (was 184).
+  - That join runs under a Gather where PG's is serial: the
+    parallel-restricted SubPlan gap.
+  - Fire-set categories are unchanged.
+- **ea-ratchet:** 10 → 9. `Q92:date_dim+web_sales` is FIXED, because Q92
+  no longer forms that relation set; re-pinned in a standalone commit.
+- **Fixture witness:** `TestCorrelatedScalarSublinkIsJoinClause` now
+  elects PG 18.3's plans — the parameterised nested loop by default, and
+  the Hash Join Join Filter with `enable_nestloop` off.
 
 ## Open
 

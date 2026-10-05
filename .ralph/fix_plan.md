@@ -26590,7 +26590,7 @@ M0146-0001 re-baseline census on the new default arm.
   - First step after M0146\-0062: skip the rule when the bare tree\'s
     Filters read an outer level, then A/B regress `join` and the TPC
     plans \(slice\-2 method, `impl\-slice2\.md`\)\.
-- [ ] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
+- [x] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the
   clause\'s relids, so TPC\-H Q17\'s `l\_quantity < \(SubPlan on
@@ -26660,6 +26660,20 @@ M0146-0001 re-baseline census on the new default arm.
       `hashJoinFinalCostInputFor` \(the missing `/ inner\.rows`\) and
       `match\_count`; charge the join filter on `outer\_matched\_rows`\.
       Expect broad hash\-join cost movement; inspect the fire set\.
+  - **2026\-10\-05 — slice C landed; task done\.** A hash join\'s
+    non\-hash quals are charged with `cpu\_tuple\_cost` on
+    `hashjointuples` \(matched outer rows for inner\-unique/semi/anti\), as
+    in `final\_cost\_hashjoin`, not separately on output rows\. The
+    inner\-unique factors were already PG\'s \(M0146\-0005e\)\.
+    - TPC\-H Q17 costs 198k \(PG 212k; was 448k\); all 22 TPC\-H plans keep
+      their shape\.
+    - TPC\-DS Q92 takes PG\'s join order \(web\_sales ⋈ item first\),
+      184 → 118 ms\. ea\-ratchet 10 → 9; the FIXED key was re\-pinned
+      standalone\.
+    - Residuals are ledgered: hash keys on a sublink equality \(Q2\),
+      parallel\-restricted correlated SubPlans \(Q32/Q92 under Gather\),
+      and the hashed uncorrelated ANY cost\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 55 \-> 53, join\-method 24 \-> 22, parallelism 44 \-> 42 \(slice B; slice C neutral, ea\-ratchet 10 \-> 9\)
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort
