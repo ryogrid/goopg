@@ -17869,7 +17869,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     Movement: none — recon.
 
 
-- [!] **M0145\-0008y — keep a correlated scalar subquery as a SubPlan, as
+- [x] **M0145\-0008y — keep a correlated scalar subquery as a SubPlan, as
   PG does** \(filed 2026\-09\-25 by M0145\-0008n\). goopg\'s post\-hoc unnest
   decorrelates `x op \(SELECT agg … WHERE correlated\)` into a join; PG
   keeps it as a correlated SubPlan \(`pull\_up\_sublinks` converts only
@@ -17904,6 +17904,17 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
       substitute for M0146\-0012.
     - Resume: after M0146\-0012 lands, re\-run the prototype and the Q2
       timing.
+  - **2026\-10\-05 — UNBLOCKED and DONE\.** M0146\-0012 and M0146\-0012a
+    landed, so the hold condition was met and the task re\-opened\. Design
+    `docs/design/0100\-0149/m0145\-0008y\-scalar\-sublink\-subplan\.md`;
+    evidence `analysis/m0145/m0145\-0008y/`\.
+    - `canUnnestSubquery` refuses every scalar sublink unless
+      `GOOPG\_SCALAR\_UNNEST=on`\. The machinery stays as a rollback path,
+      and the 15 tests pinning it enable the switch\.
+    - Re\-measure: TPC\-H plans are identical to HEAD \(Q2 0\.20 s, not
+      307 s\)\. Only TPC\-DS Q6 changes: it keeps PG\'s SubPlan,
+      402 → 485 ms\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 match 33 \-> 34, join\-order 53 \-> 52, join\-method 22 \-> 21, parameterisation 33 \-> 32, aggregation\-strategy 17 \-> 15; SF0\.25 join\-method 25 \-> 24, aggregation\-strategy 9 \-> 8
 
 - [x] **M0145\-0008z — the pull\-up declines sublinks PG pulls up \(TPC\-H
   Q18, TPC\-DS Q14/Q23\)** \(filed 2026\-09\-25 by M0145\-0008n\). TPC\-H Q18\'s
