@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -115,10 +116,137 @@ func partitionConjunctsForJoinPlanningScoped(
 		}
 		locals.byBinding[bidx] = append(locals.byBinding[bidx], c)
 	}
+	places := equivalenceClassPlaces(conjuncts)
 	for b, cs := range locals.byBinding {
-		locals.byBinding[b] = equivalenceClausesLast(cs)
+		locals.byBinding[b] = equivalenceClausesLast(cs, places)
 	}
 	return joinConjuncts, locals
+}
+
+// ecPlace is where generate_base_implied_equalities puts one equality:
+// rank is its EquivalenceClass's position in root->eq_classes, and
+// regenerated says the EC is rebuilt as `member = const` clauses rather than
+// handing back the written one.
+type ecPlace struct {
+	rank        int
+	regenerated bool
+}
+
+// equivalenceClassPlaces replays process_equivalence (equivclass.c) over a
+// scope's conjuncts in order and returns, for each equality it accepts, the
+// final position of its EquivalenceClass in root->eq_classes (M0146-0042).
+// generate_base_implied_equalities walks that list in order, so a relation's
+// EC-derived restrictions come out in EC creation order, not written order:
+// in TPC-DS Q31 `ss2.d_year = 1999` joins the EC `ss1.d_year = 1999` opened
+// before `ss2.d_qoy = 2`'s, and PG filters ss2 on `(d_year = 1999) AND
+// (d_qoy = 2)`.
+//
+// The replay follows process_equivalence: a new EC is appended; an item found
+// in an EC joins it (a constant matches an equal constant of the same type,
+// so `o1.b = 2` joins the EC of an earlier `o2.b = 2`); when the two items
+// sit in different ECs, the right one's merges into the left one's and
+// leaves the list. Items are identified by exprIdentityKey; a constant's key
+// carries its column's type, standing in for em_datatype.
+//
+// generate_base_implied_equalities_const re-uses the written clause only
+// when the EC holds one `var = const` source and two members; otherwise it
+// builds `member = const` for every member, so `3 = j2.c` in an EC that also
+// holds `j1.c` prints `(c = 3)` (regress join.sql's self-join cases).
+func equivalenceClassPlaces(conjuncts []Expr) map[Expr]ecPlace {
+	type eqClass struct {
+		merged  *eqClass
+		members map[string]bool
+		consts  map[string]bool
+		sources int
+	}
+	resolve := func(ec *eqClass) *eqClass {
+		for ec.merged != nil {
+			ec = ec.merged
+		}
+		return ec
+	}
+	var list []*eqClass
+	member := map[string]*eqClass{}
+	clauseEC := map[Expr]*eqClass{}
+	itemKey := func(e, other Expr) (string, bool) {
+		k, ok := exprIdentityKey(e, scopeVeto)
+		if !ok {
+			return "", false
+		}
+		if col, isCol := other.(*ColumnRef); isCol && isPlainConstantBound(e) {
+			k += "@" + col.Type.Name
+		}
+		return k, true
+	}
+	for _, c := range conjuncts {
+		if !isEquivalenceClause(c) {
+			continue
+		}
+		b := c.(*BinaryOp)
+		k1, ok1 := itemKey(b.Left, b.Right)
+		k2, ok2 := itemKey(b.Right, b.Left)
+		if !ok1 || !ok2 || k1 == k2 {
+			continue
+		}
+		ec1, ec2 := member[k1], member[k2]
+		if ec1 != nil {
+			ec1 = resolve(ec1)
+		}
+		if ec2 != nil {
+			ec2 = resolve(ec2)
+		}
+		var ec *eqClass
+		switch {
+		case ec1 != nil && ec2 != nil:
+			ec = ec1
+			if ec2 != ec1 {
+				for k := range ec2.members {
+					ec1.members[k] = true
+				}
+				for k := range ec2.consts {
+					ec1.consts[k] = true
+				}
+				ec1.sources += ec2.sources
+				ec2.merged = ec1
+				for i, x := range list {
+					if x == ec2 {
+						list = append(list[:i], list[i+1:]...)
+						break
+					}
+				}
+			}
+		case ec1 != nil:
+			ec = ec1
+		case ec2 != nil:
+			ec = ec2
+		default:
+			ec = &eqClass{members: map[string]bool{}, consts: map[string]bool{}}
+			list = append(list, ec)
+		}
+		member[k1], member[k2] = ec, ec
+		ec.members[k1], ec.members[k2] = true, true
+		if isPlainConstantBound(b.Left) {
+			ec.consts[k1] = true
+		}
+		if isPlainConstantBound(b.Right) {
+			ec.consts[k2] = true
+		}
+		ec.sources++
+		clauseEC[c] = ec
+	}
+	pos := make(map[*eqClass]int, len(list))
+	for i, ec := range list {
+		pos[ec] = i
+	}
+	places := make(map[Expr]ecPlace, len(clauseEC))
+	for c, ec := range clauseEC {
+		ec = resolve(ec)
+		places[c] = ecPlace{
+			rank:        pos[ec],
+			regenerated: len(ec.consts) == 1 && (len(ec.members) != 2 || ec.sources != 1),
+		}
+	}
+	return places
 }
 
 // equivalenceClausesLast reorders one relation's restriction list the way
@@ -129,11 +257,12 @@ func partitionConjunctsForJoinPlanningScoped(
 // order_qual_clauses' stable cost sort leaves that order alone when the
 // costs tie. So `t_hour = 8 AND t_minute >= 30` filters as
 // `(t_minute >= 30) AND (t_hour = 8)`. The partition is stable; the cost
-// sort for unequal costs is not modelled.
-func equivalenceClausesLast(cs []Expr) []Expr {
-	if len(cs) < 2 {
-		return cs
-	}
+// sort for unequal costs is not modelled. places (equivalenceClassPlaces)
+// orders the equalities by their EC's position, as
+// generate_base_implied_equalities emits them, and turns a regenerated
+// `const = col` into PG's `col = const`; an equality with no place keeps its
+// written place after the placed ones.
+func equivalenceClausesLast(cs []Expr, places map[Expr]ecPlace) []Expr {
 	var rest, ec []Expr
 	for _, c := range cs {
 		if isEquivalenceClause(c) {
@@ -141,6 +270,23 @@ func equivalenceClausesLast(cs []Expr) []Expr {
 		} else {
 			rest = append(rest, c)
 		}
+	}
+	rank := func(c Expr) int {
+		if pl, ok := places[c]; ok {
+			return pl.rank
+		}
+		return len(places)
+	}
+	sort.SliceStable(ec, func(i, j int) bool { return rank(ec[i]) < rank(ec[j]) })
+	for i, c := range ec {
+		if b := c.(*BinaryOp); places[c].regenerated && isPlainConstantBound(b.Left) {
+			flipped := *b
+			flipped.Left, flipped.Right = b.Right, b.Left
+			ec[i] = &flipped
+		}
+	}
+	if len(rest)+len(ec) < 2 {
+		return append(rest, ec...)
 	}
 	// order_qual_clauses: a stable sort by per-tuple evaluation cost
 	// (qualEvalOps, cost_qual_eval's count), so a cheap equality still
