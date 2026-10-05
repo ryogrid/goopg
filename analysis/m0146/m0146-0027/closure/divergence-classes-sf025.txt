@@ -1,0 +1,15 @@
+DIVERGENCE-CLASSES: queries=99 match=42 divergent=57 D1-sublink=4 D2-unionall=1 D3-partialpath=17 D4-upperrel=12 D5-narrowing=0 D6-cte=0 jointree-search=20 verdict=3
+  D1-sublink       n=4   M0145-0003 pull_up_sublinks analogue
+      Q67 Q69 Q83 Q95
+  D2-unionall      n=1   M0145-0004 appendrel citizenship
+      Q66
+  D3-partialpath   n=17  executor substrate — outside M0145 flow
+      Q2 Q5 Q16 Q17 Q19 Q25 Q26 Q29 Q33 Q39 Q40 Q42 Q45 Q52 Q61 Q76 Q92
+  D4-upperrel      n=12  M0145-0006 upper-rel pathlists
+      Q4 Q6 Q11 Q35 Q38 Q49 Q54 Q60 Q64 Q72 Q78 Q87
+  D5-narrowing     n=0   closed — M0144-0003c premise refuted
+  D6-cte           n=0   deferred — CTE boundary preserved in M0145
+  jointree-search  n=20  M0145-0005 single-pass DP (no D1-D6 marker)
+      Q1 Q14 Q23 Q30 Q32 Q34 Q37 Q44 Q46 Q58 Q59 Q65 Q68 Q71 Q73 Q77 Q79 Q81 Q85 Q99
+  verdict          n=3   error/timeout/unparsed — not a plan record
+      Q36 Q70 Q86

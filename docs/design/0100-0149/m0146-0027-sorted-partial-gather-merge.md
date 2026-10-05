@@ -461,3 +461,25 @@ Evidence `analysis/m0146/m0146-0027/slice6/`.
   web/catalog/store) and PG's per-leg `Subquery Scan on "*SELECT* N"`
   wrapper — M0146-0026 territory, not branch reach.
 - `presorted > 0` incremental-sort arm: deferred to M0146-0006 as filed.
+
+## Closure (2026-10-05)
+
+After slices 1-6, the SF0.25 D3-partialpath class holds 17 queries. None
+has a parallel-reach gap: every partial shape PG elects is filed as a
+candidate. The routing is in `analysis/m0146/m0146-0027/closure/`:
+
+- **Cost ties, both shapes filed** (M0146-0014 residuals):
+  - Q17/Q25/Q29: the depth-4 Gather Merge.
+  - Q26/Q33/Q45: worker Sort under Gather Merge versus a leader Sort over
+    Gather. On Q26, PG's own formulas give 14290.17 against 14290.19.
+  - Q19/Q40/Q61: partial versus one-phase aggregation.
+- **Other families:**
+  - Q16/Q39/Q5/Q42/Q52: join order and Gather placement.
+  - Q92: the correlated SubPlan is not parallel-restricted
+    (M0146-0012a's ledger row).
+  - Q76: per-leg join method.
+- **Q2** is a different mechanism, filed as M0146-0065. Its CTE body joins
+  an inlined single-reference CTE whose body is a UNION ALL; inlining
+  never pulls that body up as an appendrel (`pull_up_simple_union_all`),
+  so the body has no partial path. A UNION ALL FROM-subquery, inside a
+  CTE or not, goes parallel as in PG.
