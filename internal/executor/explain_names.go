@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // explainNames is EXPLAIN's range-table name table: the mapping from a
@@ -97,6 +98,11 @@ type explainNames struct {
 	// statement-wide bySrc.
 	parent map[string]optimizer.Node
 	scopes map[string]map[int16]int32
+	// scopeLists is scopes with every RTID per SourceTableIdx, in walk
+	// order. An unpulled subquery whose Subquery Scan is elided leaves no
+	// level boundary in the tree, so its relations share SourceTableIdx
+	// values with the parent level's (M0146-0042).
+	scopeLists map[string]map[int16][]int32
 	// nodes maps each registered RTID to its scan node, so a column whose
 	// scope resolves to a transparent inlined CTE can be chased into the
 	// CTE body (transparentCTEFor). M0146-0021.
@@ -185,6 +191,17 @@ func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, p
 				return rel + "." + colName
 			}
 		}
+		// M0146-0042: then every other relation the scope binds to src. An
+		// unpulled subquery's relations (its Subquery Scan elided, as PG's
+		// trivial_subqueryscan removes it) reuse the parent level's
+		// SourceTableIdx values, so TPC-DS Q79's `customer.c_customer_sk`
+		// met the subquery's date_dim first and printed bare. The first
+		// relation that has the column is the one the reference names.
+		for _, rtid := range nm.scopeLists[nodePtr(n)][src] {
+			if rel := nm.bySource[rtid]; rel != "" && nm.cols[rtid][colName] {
+				return rel + "." + colName
+			}
+		}
 		if p := nm.parent[nodePtr(n)]; p != nil && explainLevelBoundary(p) {
 			break
 		}
@@ -235,9 +252,15 @@ func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
 	if nm.scopes == nil {
 		nm.scopes = map[string]map[int16]int32{}
 	}
+	if nm.scopeLists == nil {
+		nm.scopeLists = map[string]map[int16][]int32{}
+	}
 	m := map[int16]int32{}
-	var walk func(x optimizer.Node, top bool)
-	walk = func(x optimizer.Node, top bool) {
+	all := map[int16][]int32{}
+	// belowSetOp keeps an appendrel's children out of the candidate lists:
+	// an Append-level column names the parent there, never one child.
+	var walk func(x optimizer.Node, top, belowSetOp bool)
+	walk = func(x optimizer.Node, top, belowSetOp bool) {
 		if x == nil {
 			return
 		}
@@ -247,18 +270,23 @@ func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
 					if _, claimed := m[src]; !claimed {
 						m[src] = rtid
 					}
+					if !belowSetOp {
+						all[src] = append(all[src], rtid)
+					}
 				}
 			}
 		}
 		if !top && explainLevelBoundary(x) {
 			return
 		}
+		_, isSetOp := x.(*optimizer.SetOp)
 		for _, c := range planChildren(x) {
-			walk(c, false)
+			walk(c, false, belowSetOp || isSetOp)
 		}
 	}
-	walk(n, true)
+	walk(n, true, false)
 	nm.scopes[key] = m
+	nm.scopeLists[key] = all
 	return m
 }
 
@@ -735,8 +763,10 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// partition) Var deparses with the PARENT's alias
 			// (`tuplesest_parted.b`, regress inherit), which the
 			// first-branch walk cannot produce — it would print the first
-			// child relation instead.
-			if !requireSetOp {
+			// child relation instead. An INTERSECT or EXCEPT is never an
+			// appendrel: PG deparses through its first input
+			// (set_deparse_plan), as TPC-DS Q8's `a1.ca_zip` (M0146-0042).
+			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept {
 				return ""
 			}
 			crossed = true
@@ -762,6 +792,15 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// M0146-0005w: the label is position-for-position
 			// transparent — the set operation's first-branch deparse
 			// continues into the subplan exactly as it did unwrapped.
+			// A join residual stops at it: the Subquery Scan PG keeps
+			// is a scan of the subquery RTE, and get_variable prints the
+			// Var with that RTE's alias (`a1.ca_zip`, M0146-0042).
+			if !requireSetOp && p.Alias != "" {
+				if out := p.Output(); idx < len(out) {
+					return p.Alias + "." + out[idx].Name
+				}
+				return ""
+			}
 			n = p.Child
 		case *optimizer.Materialize:
 			// M0146-0010: same transparency — a buffer renames nothing.
