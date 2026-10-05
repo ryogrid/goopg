@@ -3,6 +3,7 @@ package optimizer
 import (
 	"sort"
 
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -52,6 +53,16 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 			if n.Plan != nil {
 				// The test expression's comparison, then the SubPlan.
 				perTuple++
+				// M0146-0019a: an uncorrelated hashable ANY is a hashed
+				// SubPlan (build_subplan sets useHashTable): cost_subplan
+				// charges the plan's total plus cpu_operator_cost per row
+				// once, to load the table, and nothing per evaluation beyond
+				// the comparison counted above.
+				if inSubPlanHashed(n) {
+					pc := legacyDisplayCostOf(n.Plan)
+					startup += (pc.TotalCost + pgBootCPUOperatorCost*pc.PlanRows) / pgBootCPUOperatorCost
+					return true
+				}
 				s, p := subPlanCostOps(n.Plan, sublinkAnyAll, len(n.ParParam) > 0)
 				startup += s
 				perTuple += p
@@ -221,4 +232,25 @@ func orderQualRestrictInfos(ris []*restrictInfo) []*restrictInfo {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return cost[out[i]] < cost[out[j]] })
 	return out
+}
+
+// inSubPlanHashed is subplan_is_hashable (subselect.c) plus build_subplan's
+// other conditions for an ANY sublink goopg's executor hashes
+// (evalInHashProbe; the EXPLAIN twin is executor subPlanUsesHashTable): no
+// correlation, a single-operand plain equality (never ALL, never <>), and an
+// estimated result — rows × (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader))
+// — within hash_mem. hash_mem is the boot value (work_mem 4MB × 2); a session
+// that changes either GUC is not seen here (ledgered).
+func inSubPlanHashed(x *InExpr) bool {
+	if x == nil || x.Plan == nil || x.AllOp || x.NotEqualAny || (x.AnyOp != 0 && x.AnyOp != parser.OpEq) ||
+		len(x.ParParam) > 0 || planHasOuterRef(x.Plan) {
+		return false
+	}
+	if row, isRow := x.Operand.(*RowExpr); isRow && len(row.Elems) > 1 && !x.UnknownEqFalse {
+		return false
+	}
+	pc := legacyDisplayCostOf(x.Plan)
+	maxAlign := func(n int) int { return (n + 7) &^ 7 }
+	size := pc.PlanRows * float64(maxAlign(pc.PlanWidth)+maxAlign(23))
+	return size <= float64(hashsize.HashMemLimit(0, 0))
 }

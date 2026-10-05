@@ -36,11 +36,12 @@ func TestQualEvalOpsChargesSubPlanCost(t *testing.T) {
 		{"uncorrelated scalar", gt(&SubqueryExpr{Plan: plan(false), IsNonCorrelated: true}), 0, op},
 		// EXISTS, correlated: one tuple's share of the run cost plus startup.
 		{"correlated exists", &ExistsExpr{Plan: plan(true)}, 0, 40.0/100 + 10},
-		// IN, uncorrelated plain equality: hashable, but PG prices the
-		// AlternativeSubPlan by its first (plain) alternative — half the run
-		// cost and half the rows' comparisons per call, the materialised
-		// output's startup once; plus the test comparison.
-		{"hashable uncorrelated in", &InExpr{Operand: &ColumnRef{Index: 0, Name: "a"}, Plan: plan(false), IsNonCorrelated: true}, 10, 0.5*40 + 0.5*100*op + op},
+		// IN, uncorrelated plain equality: a hashed SubPlan (build_subplan
+		// sets useHashTable; AlternativeSubPlan is a correlated EXISTS's
+		// only). cost_subplan loads the table once — the plan's total plus a
+		// cpu_operator_cost per row — and each call pays the comparison.
+		// M0146-0019a.
+		{"hashable uncorrelated in", &InExpr{Operand: &ColumnRef{Index: 0, Name: "a"}, Plan: plan(false), IsNonCorrelated: true}, 50 + 100*op, op},
 		// IN, correlated: half the run cost and half the rows' comparisons,
 		// plus startup, per call; plus the test comparison.
 		{"correlated in", &InExpr{Operand: &ColumnRef{Index: 0, Name: "a"}, Plan: plan(true)}, 0, 0.5*40 + 0.5*100*op + 10 + op},

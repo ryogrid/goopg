@@ -130,17 +130,21 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 	out := n.Output()
 	leaf := rel.baseLeaf.Output()
 	width := len(out)
-	if width == len(leaf) {
+	if width == len(leaf) && sameColumnNames(out, leaf) {
 		// The common case: the rebuilt leaf emits its table's whole column
-		// list, so output position i IS binding position i.
+		// list, so output position i IS binding position i. An index-only
+		// scan covering every column emits them in INDEX order (regress
+		// create_index's onek_with_null on (unique2, unique1)), so equal
+		// width alone is not the identity (M0146-0019a).
 		lay := make(outputLayout, width)
 		for i := range lay {
 			lay[i] = rel.baseOffset + i
 		}
 		return lay
 	}
-	// An index-only scan emits only the columns its index covers, so it is
-	// NARROWER than the recorded leaf and the identity above does not hold.
+	// An index-only scan emits only the columns its index covers, in index
+	// order, so it is NARROWER than the recorded leaf or permuted, and the
+	// identity above does not hold.
 	// Positions are recovered by NAME against the leaf's schema — the leaf is
 	// the coordinate space every clause over this rel was written in, so this
 	// is the whole of the translation. Everything above is re-based by
@@ -168,6 +172,20 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 		lay[i] = rel.baseOffset + at
 	}
 	return lay
+}
+
+// sameColumnNames reports whether a and b name the same columns position by
+// position.
+func sameColumnNames(a, b Schema) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // translateToLayout returns a NEW expression with every `ColumnRef.Index`

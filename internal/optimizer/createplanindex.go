@@ -411,15 +411,38 @@ func createIndexScanPlan(p *Path) Node {
 		default:
 			ios.Keys = ioKeys
 		}
-		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
-		// written against the FULL leaf schema; the producer admits a
-		// non-bare leaf only when its index clauses consume every local qual,
-		// so dropping them must leave nothing to reinstate.
-		if out := rewrapLeafDropping(p.Rel.baseLeaf, ios, ioDrop); out != Node(ios) {
-			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s would reinstate a leaf qual over the narrowed schema",
-				p.IndexInfo.Name))
+		// The leaf's local quals the index clauses did not consume stay as the
+		// Index Only Scan's Filter (M0146-0019a, PG's qpqual). They are
+		// written against the FULL leaf schema, so each ColumnRef is re-based
+		// onto the covered column it names; the producer admitted only
+		// residuals whose columns are covered and whose sublinks are
+		// uncorrelated (indexOnlyResidualAdmissible).
+		leafToCovered := make(map[int]int, len(schema))
+		for k, col := range schema {
+			for j := range id.schema {
+				if id.schema[j].Name == col.Name {
+					leafToCovered[j] = k
+					break
+				}
+			}
 		}
-		return ios
+		return rewrapLeafDroppingRemapped(p.Rel.baseLeaf, ios, ioDrop, func(e Expr) Expr {
+			out, ok := cloneExprRefs(e, scopeIgnore, exprRewriter{Rewrite: func(n Expr) Expr {
+				if cr, isCol := n.(*ColumnRef); isCol {
+					k, found := leafToCovered[cr.Index]
+					if !found {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s keeps a Filter on column %d (%s), which the index does not cover",
+							p.IndexInfo.Name, cr.Index, cr.Name))
+					}
+					cr.Index = k
+				}
+				return n
+			}})
+			if !ok {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: its Filter holds an expression the walker does not enumerate", p.IndexInfo.Name))
+			}
+			return out
+		})
 	}
 
 	// M0145-0029 slice 2: a range path's clauses are bounds on the leading
@@ -681,6 +704,13 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 // identity against flattenExprAnd of each wrapper's predicate — the same
 // decomposition extractFilterConjuncts gave the producer.
 func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
+	return rewrapLeafDroppingRemapped(leaf, scan, drop, nil)
+}
+
+// rewrapLeafDroppingRemapped is rewrapLeafDropping with each kept conjunct
+// passed through remap (nil = unchanged): an index-only scan's residual
+// Filter re-based onto the covered columns (M0146-0019a).
+func rewrapLeafDroppingRemapped(leaf Node, scan Node, drop map[Expr]bool, remap func(Expr) Expr) Node {
 	var wrappers []*Filter
 	for n := leaf; ; {
 		f, ok := n.(*Filter)
@@ -696,6 +726,9 @@ func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
 		var keep []Expr
 		for _, c := range flattenExprAnd(w.Predicate) {
 			if !drop[c] {
+				if remap != nil {
+					c = remap(c)
+				}
 				keep = append(keep, c)
 			}
 		}

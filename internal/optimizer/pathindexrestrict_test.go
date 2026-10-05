@@ -67,11 +67,12 @@ func TestRewrapLeafDroppingRemovesConsumedConjuncts(t *testing.T) {
 	}
 }
 
-// An index-only path over a FILTERED leaf is admitted only when its
-// equality-prefix index clauses consume every local conjunct: a residual qual
-// would have to be re-evaluated over the narrowed schema, which the lowering
-// cannot express. M0145-0029 slice 3.
-func TestConsumingIndexClausesRequiresEveryConjunct(t *testing.T) {
+// An index-only path over a FILTERED leaf keeps every local conjunct its
+// equality prefix does not bind as the scan's Filter, as build_index_paths
+// leaves non-index quals in the qpqual — provided the residual reads only
+// covered columns (M0146-0019a; M0145-0029 slice 3 required every conjunct
+// consumed).
+func TestIndexOnlyResidualReadsCoveredColumnsOnly(t *testing.T) {
 	cat := saopFixture(t)
 	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "item"})
 	if !ok {
@@ -85,22 +86,24 @@ func TestConsumingIndexClausesRequiresEveryConjunct(t *testing.T) {
 	if composite == nil || pkey == nil {
 		t.Fatal("fixture indexes missing")
 	}
+	schema := make(Schema, len(tbl.Columns))
+	for i, c := range tbl.Columns {
+		schema[i] = SchemaColumn{Name: c.Name}
+	}
 	col := func(i int) *ColumnRef { return &ColumnRef{Index: i, Name: tbl.Columns[i].Name} }
 	eqSK := &BinaryOp{Op: parser.OpEq, Left: col(0), Right: &IntegerConst{Value: 2}}
-	eqFlag := &BinaryOp{Op: parser.OpEq, Left: col(2), Right: &IntegerConst{Value: 7}}
 	gtFlag := &BinaryOp{Op: parser.OpGt, Left: col(2), Right: &IntegerConst{Value: 7}}
 
-	if got := consumingIndexClauses(cat, tbl, composite, []Expr{eqFlag, eqSK}); len(got) != 2 {
-		t.Fatalf("both conjuncts bound by the composite: want 2 clauses, got %d", len(got))
+	if got := restrictionEqualityPrefix(cat, tbl, composite, []Expr{eqSK, gtFlag}); len(got) != 1 || got[0].local != Expr(eqSK) {
+		t.Fatalf("the composite binds i_item_sk = 2 only; got %d clauses", len(got))
 	}
-	if got := consumingIndexClauses(cat, tbl, pkey, []Expr{eqSK}); len(got) != 1 {
-		t.Fatalf("the single conjunct bound by the pkey: want 1 clause, got %d", len(got))
+	both, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
+	if !indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, both) {
+		t.Fatal("i_flag > 7 reads a covered column: want it kept as the Filter")
 	}
-	if got := consumingIndexClauses(cat, tbl, pkey, []Expr{eqSK, eqFlag}); got != nil {
-		t.Fatalf("i_flag = 7 is a residual on item_pkey; want nil, got %d clauses", len(got))
-	}
-	if got := consumingIndexClauses(cat, tbl, composite, []Expr{eqSK, gtFlag}); got != nil {
-		t.Fatalf("a range conjunct is not consumed by the equality prefix; want nil, got %d clauses", len(got))
+	skOnly, _ := indexCoversColumns(pkey, []catalog.Column{tbl.Columns[0]})
+	if indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, skOnly) {
+		t.Fatal("i_flag is not in item_pkey: the residual cannot be evaluated over the narrowed row")
 	}
 }
 
@@ -132,9 +135,9 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 	rel := newRelOptInfo(1, 1000, 32)
 	rel.baseLeaf = leaf
 
-	clauses := consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf))
+	clauses := restrictionEqualityPrefix(cat, tbl, composite, extractFilterConjuncts(leaf))
 	if len(clauses) != 2 {
-		t.Fatalf("fixture: want 2 consuming clauses, got %d", len(clauses))
+		t.Fatalf("fixture: want 2 prefix clauses, got %d", len(clauses))
 	}
 	covered, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
 	p := &Path{Kind: PathIndexScan, Rel: rel, IndexInfo: composite, IndexScanDir: ForwardScanDirection,
@@ -152,8 +155,8 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 	// key column — so the lowering is fed the prefix clauses directly.
 	leaf1 := &Filter{Child: &SeqScan{Table: tbl, schema: schema}, Predicate: eqSK, LeafLocal: true}
 	rel.baseLeaf = leaf1
-	if got := consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf1)); got != nil {
-		t.Fatalf("a probe leaving nullable i_flag unbound must be declined, got %d clauses", len(got))
+	if indexUnboundKeysNotNull(tbl, composite, 1) {
+		t.Fatal("a probe leaving nullable i_flag unbound must be declined")
 	}
 	p.IndexClauses = restrictionEqualityPrefix(cat, tbl, composite, extractFilterConjuncts(leaf1))
 	if ios, ok := createIndexScanPlan(p).(*IndexOnlyScan); !ok || ios.Key == nil || ios.Keys != nil {
