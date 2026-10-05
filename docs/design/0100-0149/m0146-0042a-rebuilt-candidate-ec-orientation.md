@@ -63,3 +63,25 @@ map, was refuted: the seam already orients them.
 - No fixture reproduces the rebuild path together with an EC-reduced
   Join Filter, so the witness is the SF1 capture (ledgered).
 - M0146-0042b: a join's EC-derived clauses print after its other quals.
+
+## M0146-0042b — an inner join's EC equalities print last (2026-10-05, `b57396955`)
+
+`build_joinrel_restrictlist` (relnode.c) builds a joinrel's clause list in
+two parts: first the joininfo clauses, then the equivalence-class
+equalities from `generate_join_implied_equalities`.
+`order_qual_clauses`' stable cost sort keeps that split among equal-cost
+quals. So PG prints `Join Filter: ((jb1.x < jb2.y) AND (jb1.a = jb2.b))`
+whatever the written order, while a dearer qual such as `(x + y) > 5` still
+sorts after the equality.
+
+- goopg kept the written order. `joinPredicate` now takes `ecLast`
+  (`Path.ecClausesLast`, true for inner and cross joins) and
+  `ecJoinClausesLast` moves the residual EC equalities last before the cost
+  sort.
+- Outer, semi and anti joins keep their written order: PG never makes an
+  outer join's ON clause an EC member.
+- The scan-qual sibling `equivalenceClausesLast` already did this.
+
+Witness: `TestJoinFilterECClausesLast`, which fails without the change.
+TPC-DS SF0.25 Q64's top Join Filter now matches PG. Categories are
+unchanged (text only).

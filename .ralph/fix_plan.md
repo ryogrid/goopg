@@ -27592,7 +27592,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     - SF1 Q17/Q25/Q29 print PG's Join Filter and Filter; SF1
       text\-identical 17 → 20; SF0\.25 Q64 matches too\.
   Movement: none — instrument artefact — text-only (already structural MATCH); SF1 text-identical 17 -> 20
-- [ ] **M0146\-0042b — a join\'s EC\-derived clauses print after its other
+- [x] **M0146\-0042b — a join\'s EC\-derived clauses print after its other
   quals** \(filed 2026\-10\-02 by M0146\-0005de\)\. PG 18\.3 prints
   `Join Filter: \(\(j1\.x < j2\.y\) AND \(j1\.a = j2\.b\)\)`; goopg prints the
   written conjunct order, `\(\(j1\.a = j2\.b\) AND \(j1\.x < j2\.y\)\)`\.
@@ -27602,6 +27602,15 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     clauses, then generate\_join\_implied\_equalities\' EC clauses\. A sibling
     of `equivalenceClausesLast` \(local\_filters\.go\), which does this for
     scan quals, is the likely shape\.
+  - **DONE 2026\-10\-05** \(`b57396955`\)\. Design
+    `docs/design/0100\-0149/m0146\-0042a\-rebuilt\-candidate\-ec\-orientation\.md`
+    § M0146\-0042b\.
+    - `joinPredicate` moves an inner/cross join's residual EC equalities
+      after its other quals \(`ecJoinClausesLast`\) before the stable cost
+      sort; outer, semi and anti joins keep the written order\.
+    - Witness `TestJoinFilterECClausesLast` \(fails without the change\);
+      SF0\.25 Q64's top Join Filter now matches PG\.
+  Movement: none — instrument artefact — text-only; SF0.25 Q64 Join Filter = PG
 - [!] **M0146\-0049 — a parameterised inner path through a non\-scan node**
   \(filed 2026\-10\-03 by recon M0146\-0005dt\)\. PG binds a nested loop\'s
   parameters into ANY inner subtree \(`create\_nestloop\_plan` /
