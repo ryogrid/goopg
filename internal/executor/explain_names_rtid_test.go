@@ -199,3 +199,28 @@ func TestExplainNamesRTIDBitmapHeapScan(t *testing.T) {
 		t.Errorf("bare bySource[6] = %q, want %q", got, "customer")
 	}
 }
+
+// TestExplainNamesSecondCTEBodyCopyClaimsNoLabel pins M0146-0042: a CTE
+// referenced twice may hang a separate copy of its body under each
+// reference, but EXPLAIN prints one `CTE <name>` section — the first
+// reference's body (collectCTEHoist). The unprinted copy must not claim
+// node labels, or the printed body's second `item` reads `item_2` where PG
+// prints `item_1` (TPC-DS Q75's three UNION branches read item, item_2,
+// item_4).
+func TestExplainNamesSecondCTEBodyCopyClaimsNoLabel(t *testing.T) {
+	body := func() (optimizer.Node, *optimizer.SeqScan, *optimizer.SeqScan) {
+		a, b := rtidScan("item", "", 4), rtidScan("item", "", 8)
+		return &optimizer.Join{Left: a, Right: b}, a, b
+	}
+	b1, a1, c1 := body()
+	b2, _, _ := body()
+	curr := &optimizer.CTEScan{Name: "all_sales", Alias: "curr_yr", Child: b1, RTID: 20}
+	prev := &optimizer.CTEScan{Name: "all_sales", Alias: "prev_yr", Child: b2, RTID: 21}
+	nm := newExplainNames(&optimizer.Join{Left: curr, Right: prev})
+	if got := nm.disambiguatedName(a1); got != "" {
+		t.Errorf("printed body's first item label = %q, want bare", got)
+	}
+	if got := nm.disambiguatedName(c1); got != "item_1" {
+		t.Errorf("printed body's second item label = %q, want %q (PG)", got, "item_1")
+	}
+}

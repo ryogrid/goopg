@@ -332,10 +332,30 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		node optimizer.Node
 	}
 	var found []entry
+	cteWalked := map[string]bool{}
 	var walk func(optimizer.Node)
 	walk = func(node optimizer.Node) {
 		if node == nil {
 			return
+		}
+		// M0146-0042: a CTE referenced twice can hang a separate copy of
+		// its body under each reference, while EXPLAIN prints one
+		// `CTE <name>` section — the first reference's body
+		// (collectCTEHoist). The other copy is never printed and must
+		// not claim names: TPC-DS Q75's second all_sales copy pushed the
+		// printed `item` labels to `item_2` and `item_4`.
+		if cs, ok := node.(*optimizer.CTEScan); ok && !cs.Inlined() && !isRecursiveSelfRef(cs) {
+			key := cs.DeclKey()
+			if cteWalked[key] {
+				if base, ok := explainRelBaseName(node); ok {
+					if rtid, ok := explainNodeRTID(node); ok {
+						src, _ := explainSingleSourceIdx(node)
+						found = append(found, entry{rtid: rtid, src: src, base: base, node: node})
+					}
+				}
+				return
+			}
+			cteWalked[key] = true
 		}
 		if base, ok := explainRelBaseName(node); ok {
 			if rtid, ok := explainNodeRTID(node); ok {
