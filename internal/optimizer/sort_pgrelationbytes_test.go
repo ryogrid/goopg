@@ -158,7 +158,7 @@ func TestCostSortRunWithWidthProductionCallersAreComplete(t *testing.T) {
 	dir := filepath.Dir(thisFile)
 	wantWidthCalls := map[string]int{
 		"cost_funcs.go":          3, // definition, legacy compatibility wrapper, costIncrementalSort's per-group composition (M0141-S7 Finding 3 row 2, zero production callers itself yet)
-		"groupingsets_sorted.go": 1, // a later rollup's own sort (create_groupingsets_path, M0146-0020b): the seed path's width
+		"groupingsets_sorted.go": 2, // a later rollup's own sort under AGG_SORTED and AGG_MIXED (create_groupingsets_path, M0146-0020b): the seed path's width
 		"joinpathsmerge.go":      1,
 		"partialsortpaths.go":    2,
 		"windowsetoppaths.go":    1,

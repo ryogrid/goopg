@@ -2801,7 +2801,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil {
 		if len(o.plan.Rollups) > 0 {
 			rollupOf = make([]int, len(o.plan.GroupingSets))
-			for ri, r := range o.plan.Rollups {
+			// AGG_MIXED emits the sorted phases first and the hash
+			// tables after them (nodeAgg's agg_retrieve_direct switches
+			// to agg_retrieve_hash_table once the last sorted phase ends).
+			all := append(append([]optimizer.GroupingRollup(nil), o.plan.Rollups...), o.plan.HashedRollups...)
+			for ri, r := range all {
 				rollupOrders = append(rollupOrders, r.Order)
 				for _, si := range r.Sets {
 					if si >= 0 && si < len(rollupOf) {

@@ -1556,6 +1556,11 @@ type Aggregate struct {
 	// and each later one over its own sort; the hashed strategies take the
 	// sets in this order. nil when there are no grouping sets.
 	Rollups []GroupingRollup
+	// HashedRollups, set on an AGG_MIXED aggregate (Strategy Sorted, labelled
+	// MixedAggregate), are the grouping sets computed by hashing instead of
+	// a sorted pass, one set per entry, in create_groupingsets_plan's order;
+	// Rollups then holds only the sorted ones (M0146-0020b).
+	HashedRollups []GroupingRollup
 	// GroupingMasks carries one entry per distinct GROUPING(...) call in the
 	// query, in the order the columns are appended to the output schema:
 	// output column len(GroupExprs)+len(Aggs)+i holds

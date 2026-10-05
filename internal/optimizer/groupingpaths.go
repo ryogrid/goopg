@@ -721,7 +721,32 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			if !cp.enableSort && len(aggNode.Rollups) > 1 {
 				rollupSortsDisabled = len(aggNode.Rollups) - 1
 			}
+			// M0146-0020b: beside each sorted path, consider_groupingsets_paths'
+			// AGG_MIXED one over the same input — the knapsack-chosen
+			// rollups hashed, the rest sorted (MixedAggregate).
+			mixedHashed, mixedSorted, mixedOK := mixedGroupingRollups(cp, aggNode, sortSeed, inputRows)
+			addMixed := func(input *Path, inDisabled int, producer string) {
+				if !mixedOK {
+					return
+				}
+				mSpec := *aggNode
+				mSpec.Rollups = mixedSorted
+				mSpec.HashedRollups = mixedHashed
+				c, dis, ok := costMixedRollups(cp, &mSpec, mixedHashed, mixedSorted, sortSeed, inputRows,
+					input.Cost.Startup, input.Cost.Total, inNcols, inAvgVar, ps.EnableHashAgg)
+				if !ok {
+					return
+				}
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &mSpec,
+					Rel: grouped, Rows: numGroups,
+					DisabledNodes: inDisabled + dis,
+					Cost:          c,
+					Children:      []*Path{input},
+				}, producer)
+			}
 			sortedInput := sortPathForBounded(sortSeed, rollupPathkeys, cp, -1)
+			addMixed(sortedInput, sortedInput.DisabledNodes, groupAggSortedProducer)
 			rSpec := *aggNode
 			addPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &rSpec,
@@ -746,6 +771,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					cs.Rows = inputRows
 					cs.Cost = cand.Cost
 					cs.Pathkeys = candKeys[i]
+					addMixed(cs, cand.DisabledNodes, groupAggSearchProducer)
 					cSpec := *aggNode
 					addPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &cSpec,
@@ -765,7 +791,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
 	// Grouping sets always hash (today's fall-through; executor has one
 	// hash table per set).
-	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
+	if (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) &&
+		!groupingSetsHashTooBig(cp, aggNode, seed, numGroups) {
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
 		hashCost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
@@ -783,6 +810,23 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			Children:      []*Path{seed},
 		}, groupAggHashedProducer)
 	}
+}
+
+// groupingSetsHashTooBig is consider_groupingsets_paths' unsorted-arm check
+// (planner.c): every set hashed must fit hash_mem
+// (estimate_hashagg_tablesize over the grouped rel's rows), or no all-hashed
+// path is made and the sorted arm's sorted or mixed paths stand
+// (M0146-0020b). Only grouping sets with a sorted path to fall back on are
+// gated; PG does not gate when no set is sortable either.
+func groupingSetsHashTooBig(cp costParams, a *Aggregate, seed *Path, numGroups float64) bool {
+	if a.GroupingSets == nil || cp.workMem <= 0 || groupingHasSpecialAgg(a) {
+		return false
+	}
+	if _, ok := rollupSortKeys(a); !ok {
+		return false
+	}
+	size := hashAggEntrySize(len(a.Aggs), float64(pathWidth(seed))) * numGroups
+	return size > float64(cp.workMem)
 }
 
 // groupingSetsHashedCost prices consider_groupingsets_paths' all-hashed path

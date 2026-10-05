@@ -1,6 +1,9 @@
 package optimizer
 
-import "sort"
+import (
+	"math"
+	"sort"
+)
 
 // M0146-0020a — the sorted grouping-sets strategy for a single rollup.
 //
@@ -97,15 +100,7 @@ func costSortedRollups(cp costParams, a *Aggregate, seed *Path, inputRows, input
 	if !ok {
 		return costAggSortedRollup(cp, inputRows, inputStartup, inputTotal, firstCols, numGroups, nAggs)
 	}
-	rollupGroups := func(r GroupingRollup) float64 {
-		g := 0.0
-		for _, si := range r.Sets {
-			if si >= 0 && si < len(perSet) {
-				g += float64(perSet[si])
-			}
-		}
-		return g
-	}
+	rollupGroups := func(r GroupingRollup) float64 { return rollupGroupCount(perSet, r) }
 	out := costAggSortedRollup(cp, inputRows, inputStartup, inputTotal, len(a.Rollups[0].Order), rollupGroups(a.Rollups[0]), nAggs)
 	for _, r := range a.Rollups[1:] {
 		srt := costSortRunWithWidth(cp, inputRows, pathNCols(seed), pathAvgVarBytes(seed), -1, pathWidth(seed), "rollup")
@@ -113,4 +108,132 @@ func costSortedRollups(cp costParams, a *Aggregate, seed *Path, inputRows, input
 		out.Total += agg.Total
 	}
 	return out
+}
+
+// rollupGroupCount is a RollupData's numGroups: the sum of its sets' group
+// estimates.
+func rollupGroupCount(perSet []int64, r GroupingRollup) float64 {
+	g := 0.0
+	for _, si := range r.Sets {
+		if si >= 0 && si < len(perSet) {
+			g += float64(perSet[si])
+		}
+	}
+	return g
+}
+
+// mixedGroupingRollups is consider_groupingsets_paths' sorted-input AGG_MIXED
+// choice (planner.c): hash_mem is a knapsack, each rollup after the first (the
+// one the input's order serves) an item weighing its hash table
+// (estimate_hashagg_tablesize) and worth one saved sort. The chosen rollups'
+// sets are hashed one set each — in reverse, as PG lcons them — and the rest
+// stay sorted, the first reading the input. ok is false when nothing is
+// worth hashing (one rollup, no hash_mem, or no item fits).
+func mixedGroupingRollups(cp costParams, a *Aggregate, seed *Path, inputRows float64) (hashed, sorted []GroupingRollup, ok bool) {
+	if len(a.Rollups) <= 1 || cp.workMem <= 0 {
+		return nil, nil, false
+	}
+	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
+	if !ok {
+		return nil, nil, false
+	}
+	entry := hashAggEntrySize(len(a.Aggs), float64(pathWidth(seed)))
+	avail := float64(cp.workMem)
+	scale := math.Max(avail/(20.0*float64(len(a.Rollups))), 1.0)
+	capacity := int(math.Floor(avail / scale))
+	weights := make([]int, 0, len(a.Rollups)-1)
+	for _, r := range a.Rollups[1:] {
+		sz := entry * rollupGroupCount(perSet, r)
+		weights = append(weights, int(math.Min(math.Floor(sz/scale), float64(capacity)+1.0)))
+	}
+	items := discreteKnapsack(capacity, weights)
+	if len(items) == 0 {
+		return nil, nil, false
+	}
+	sorted = []GroupingRollup{a.Rollups[0]}
+	var hashSets []GroupingRollup
+	for i, r := range a.Rollups[1:] {
+		if !items[i] {
+			sorted = append(sorted, r)
+			continue
+		}
+		for _, si := range r.Sets {
+			n := len(a.GroupingSets[si])
+			hashSets = append(hashSets, GroupingRollup{Order: r.Order[:n:n], Sets: []int{si}})
+		}
+	}
+	for i := len(hashSets) - 1; i >= 0; i-- {
+		hashed = append(hashed, hashSets[i])
+	}
+	return hashed, sorted, true
+}
+
+// discreteKnapsack is DiscreteKnapsack (lib/knapsack.c) with every item worth
+// 1: the item indexes that fit the most items into maxWeight, found by the
+// same descending-capacity dynamic program, so ties resolve as PG's do.
+func discreteKnapsack(maxWeight int, weights []int) map[int]bool {
+	values := make([]float64, maxWeight+1)
+	sets := make([]map[int]bool, maxWeight+1)
+	for j := range sets {
+		sets[j] = map[int]bool{}
+	}
+	for i, iw := range weights {
+		for j := maxWeight; j >= iw && j >= 0; j-- {
+			ow := j - iw
+			if values[j] <= values[ow]+1 {
+				if j != ow {
+					cp := make(map[int]bool, len(sets[ow])+1)
+					for k := range sets[ow] {
+						cp[k] = true
+					}
+					sets[j] = cp
+				}
+				sets[j][i] = true
+				values[j] = values[ow] + 1
+			}
+		}
+	}
+	return sets[maxWeight]
+}
+
+// costMixedRollups is create_groupingsets_path's AGG_MIXED pricing: the first
+// hashed rollup reads the input under cost_agg(AGG_MIXED) — the sorted arm's
+// startup plus the hash spill's — every other hashed set adds
+// cost_agg(AGG_HASHED) without input cost, the first sorted rollup adds
+// cost_agg(AGG_SORTED) without input cost, and each later sorted rollup its
+// own sort and cost_agg. It also returns the disabled nodes those choices add:
+// enable_hashagg = off counts every hashed rollup, enable_sort = off every
+// rollup sort.
+func costMixedRollups(cp costParams, a *Aggregate, hashed, sorted []GroupingRollup, seed *Path,
+	inputRows, inputStartup, inputTotal float64, inNcols int, inAvgVar float64, enableHashAgg bool) (Cost, int, bool) {
+	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
+	if !ok || len(hashed) == 0 || len(sorted) == 0 {
+		return Cost{}, 0, false
+	}
+	nAggs := len(a.Aggs)
+	disabled := 0
+	if !enableHashAgg {
+		disabled += len(hashed)
+	}
+	h0 := hashed[0]
+	cost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(h0.Order),
+		rollupGroupCount(perSet, h0), nAggs, inNcols, inAvgVar)
+	blocking := inputTotal + cp.cpuOperatorCost*float64(nAggs)*inputRows +
+		cp.cpuOperatorCost*float64(len(h0.Order))*inputRows
+	cost.Startup = inputStartup + (cost.Startup - blocking)
+	for _, r := range hashed[1:] {
+		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(r.Order), rollupGroupCount(perSet, r), nAggs, inNcols, inAvgVar)
+		cost.Total += c.Total
+	}
+	c := costAggSortedRollup(cp, inputRows, 0, 0, len(sorted[0].Order), rollupGroupCount(perSet, sorted[0]), nAggs)
+	cost.Total += c.Total
+	for _, r := range sorted[1:] {
+		srt := costSortRunWithWidth(cp, inputRows, pathNCols(seed), pathAvgVarBytes(seed), -1, pathWidth(seed), "rollup")
+		agg := costAggSortedRollup(cp, inputRows, srt.Startup, srt.Total, len(r.Order), rollupGroupCount(perSet, r), nAggs)
+		cost.Total += agg.Total
+		if !cp.enableSort {
+			disabled++
+		}
+	}
+	return cost, disabled, true
 }

@@ -2487,6 +2487,14 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					return len(p.GroupingSets[si])
 				}
 				if p.Strategy == optimizer.AggStrategySorted {
+					// AGG_MIXED: the hashed sets head the chain.
+					for _, r := range p.HashedRollups {
+						for _, si := range r.Sets {
+							if n := setLen(si); n > 0 && n <= len(r.Order) {
+								*rows = append(*rows, Row{NewStringDatum(indent + "Hash Key: " + prefixKeys(r.Order, n))})
+							}
+						}
+					}
 					for ri, r := range p.Rollups {
 						in := indent
 						if ri > 0 {
@@ -5976,6 +5984,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			// M0146-0020a: a single rollup computed in one sorted pass is
 			// AGG_SORTED, `GroupAggregate`.
 			if p.Strategy == optimizer.AggStrategySorted {
+				if len(p.HashedRollups) > 0 {
+					return prefix + "MixedAggregate"
+				}
 				if len(p.Rollups) > 0 && len(p.Rollups[0].Order) > 0 {
 					return prefix + "GroupAggregate"
 				}

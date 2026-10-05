@@ -65,3 +65,18 @@ func TestExtractGroupingRollups(t *testing.T) {
 		}
 	}
 }
+
+// TestDiscreteKnapsackCountsItems pins DiscreteKnapsack's unit-value choice
+// on groupingsets.sql's knapsack test: hash_mem 64kB over 7 rollups gives
+// capacity 140; the two big tables weigh over it, so the four small ones
+// (including a zero-weight one) are taken.
+func TestDiscreteKnapsackCountsItems(t *testing.T) {
+	got := discreteKnapsack(140, []int{141, 141, 34, 3, 1, 0})
+	want := map[int]bool{2: true, 3: true, 4: true, 5: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if got := discreteKnapsack(140, []int{141}); len(got) != 0 {
+		t.Errorf("an item over capacity: got %v, want none", got)
+	}
+}
