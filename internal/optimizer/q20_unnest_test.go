@@ -16,6 +16,7 @@ import (
 // scalar HashJoin's keys, and the inner Filter's predicate
 // indices can be verified by reading the test log.
 func TestPlanQ20DumpsTree(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "supplier"}, []catalog.Column{
 		{Name: "s_suppkey", Type: catalog.Type{Name: "numeric"}},

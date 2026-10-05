@@ -1918,6 +1918,7 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 // does not, and an outer reference sealed inside a subplan does not (it
 // belongs to the body's own scope — scopeIgnore steps over it).
 func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	outer := &OuterColumnRef{Name: "p_partkey", Index: 3}
 	local := func(name string, idx int) *ColumnRef { return &ColumnRef{Name: name, Index: idx} }
 	corr := &BinaryOp{Op: parser.OpEq, Left: local("ps_partkey", 0), Right: outer}

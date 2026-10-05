@@ -77,6 +77,8 @@ func rowsKey(rows []Row) string {
 }
 
 func TestCTEScalarSublinkDecorrelatesAndAgrees(t *testing.T) {
+	optimizer.SetScalarUnnestEnabled(true)
+	t.Cleanup(func() { optimizer.SetScalarUnnestEnabled(false) })
 	// Plan shape first: with the pull-up enabled the Q30 shape must no longer
 	// carry a SubPlan. This is what the timeout hinged on.
 	ctxOn, _, cleanupOn := newDDLFixture(t)

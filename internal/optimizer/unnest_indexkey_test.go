@@ -427,6 +427,7 @@ func TestIndexKeyScalarProbeCheapStaysSubPlan(t *testing.T) {
 // 10.87 s → 3.36 s), so with the harvest on it must decorrelate to the
 // GROUP BY + INNER join.
 func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	SetIndexKeyHarvestEnabled(true)
 	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 

@@ -82,6 +82,9 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
+	// M0145-0008y: scalar-sublink decorrelation, default OFF (PG keeps the
+	// SubPlan); `=on` restores the pre-M0145-0008y unnest.
+	"GOOPG_SCALAR_UNNEST": func(v string) string { return onOff(scalarUnnestFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
@@ -265,6 +268,8 @@ var flagProvenanceOrder = []string{
 	// §"Plan-parity harness" G8). Retired at M0145-0008 — see
 	// flagProvenanceRetired below.
 	"GOOPG_JOINTREE_PIPELINE",
+	// Joined at M0145-0008y: scalar-sublink decorrelation, default OFF.
+	"GOOPG_SCALAR_UNNEST",
 }
 
 // flagProvenanceRetired names variables no code reads any more, and the

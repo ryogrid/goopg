@@ -116,6 +116,8 @@ func TestNLAntiJoinNullPredicate(t *testing.T) {
 // tag actually fired (the rewrite, not the SubPlan path, produced the
 // result).
 func TestScalarResidualDuplicateOuterOrdinality(t *testing.T) {
+	optimizer.SetScalarUnnestEnabled(true)
+	t.Cleanup(func() { optimizer.SetScalarUnnestEnabled(false) })
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 	for _, stmt := range []string{

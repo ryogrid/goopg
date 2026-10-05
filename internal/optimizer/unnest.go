@@ -36,6 +36,7 @@ func init() {
 	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
 	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
 	indexKeyHarvestOn.Store(indexKeyHarvestFromEnv(os.Getenv("GOOPG_INDEXKEY_HARVEST")))
+	scalarUnnestOn.Store(scalarUnnestFromEnv(os.Getenv("GOOPG_SCALAR_UNNEST")))
 }
 
 // indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
@@ -55,6 +56,21 @@ func SetSubqueryUnnestEnabled(on bool) {
 
 // subqueryUnnestEnabled reports whether the pull-up pass should run.
 func subqueryUnnestEnabled() bool { return subqueryUnnestOn.Load() }
+
+// scalarUnnestOn gates the post-planning decorrelation of a correlated SCALAR
+// sublink into a grouped join (canUnnestSubquery). Default OFF since
+// M0145-0008y: PG keeps every scalar sublink a SubPlan. GOOPG_SCALAR_UNNEST=on
+// at server start (or SetScalarUnnestEnabled(true) from tests) restores the
+// pre-M0145-0008y decorrelation, which the pinning tests still exercise.
+var scalarUnnestOn atomic.Bool
+
+// scalarUnnestFromEnv is the switch's polarity, factored out for the
+// provenance table (flaglabels.go).
+func scalarUnnestFromEnv(v string) bool { return v == "on" }
+
+// SetScalarUnnestEnabled flips the scalar-sublink decorrelation. Test-only
+// API; the operational switch is GOOPG_SCALAR_UNNEST.
+func SetScalarUnnestEnabled(on bool) { scalarUnnestOn.Store(on) }
 
 // --- S1a pull-up guards -----------------------------------------------
 //
@@ -631,6 +647,16 @@ func findSubqueryInExpr(e Expr) *SubqueryExpr {
 // canUnnestSubquery checks whether a SubqueryExpr is a candidate
 // for unnesting into a GROUP BY aggregate + hash join.
 func canUnnestSubquery(sub *SubqueryExpr) bool {
+	// M0145-0008y: PG never decorrelates a scalar sublink —
+	// pull_up_sublinks converts only ANY/EXISTS (subselect.c), and an
+	// EXPR_SUBLINK stays a SubPlan whose correlation is a PARAM_EXEC base
+	// restriction (M0146-0012) and, across relations, a join clause
+	// (M0146-0012a). This decorrelation was goopg's substitute for those
+	// parameterised probes (TPC-H Q2 1.50 s -> 307 s without it); with them
+	// in place it is off by default. GOOPG_SCALAR_UNNEST=on restores it.
+	if !scalarUnnestOn.Load() {
+		return false
+	}
 	plan := sub.Plan
 	// Unwrap Project wrapper — the subquery's target list produces
 	// a Project node wrapping the Aggregate.
