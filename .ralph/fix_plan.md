@@ -26644,6 +26644,22 @@ M0146-0001 re-baseline census on the new default arm.
     - Next: slice B — land `subplan\-qual\-cost\.wip\.patch` and port the
       inner\-unique `outer\_match\_frac` \(`hashJoinFinalCostInputFor`\);
       witness Q17 Hash Join with Join Filter\.
+  - **2026\-10\-05 — slice B \(pricing\) landed\.** A correlated SubPlan in
+    a join qual pays `cost\_subplan`\'s per\-call cost
+    \(`joinQualPerTuple`, built on `subPlanCostOps`\), and a pre\-lowered
+    sublink counts as correlated\. An uncorrelated hashed ANY is not
+    charged per tuple \(PG `useHashTable`; charging it broke TPC\-DS Q45\)\.
+    - TPC\-H Q17 and TPC\-DS Q32/Q92 elect PG\'s Hash Join with the SubPlan
+      as Join Filter\.
+    - ea\-ratchet key `Q92:date\_dim\+web\_sales` re\-pinned under G4: PG
+      estimates the same join at 234, goopg 232, actual 4795\.
+    - Wall time: Q17 0\.43 → 6\.2 s on PG\'s plan \(PG itself 1\.6–2\.3 s\);
+      Q32 16 → 240 ms, Q92 20 → 184 ms \(ledgered\)\.
+    Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 55 \-> 53, join\-method 24 \-> 22, parallelism 44 \-> 42; SF0\.25 join\-method 26 \-> 25, parameterisation 26 \-> 25\.
+    - Next: slice C — PG\'s inner\-unique `outer\_match\_frac` in
+      `hashJoinFinalCostInputFor` \(the missing `/ inner\.rows`\) and
+      `match\_count`; charge the join filter on `outer\_matched\_rows`\.
+      Expect broad hash\-join cost movement; inspect the fire set\.
 - [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort

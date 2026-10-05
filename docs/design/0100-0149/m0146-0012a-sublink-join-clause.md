@@ -1,7 +1,8 @@
 # M0146-0012a — a correlated-sublink clause is a join clause
 
-Status: in progress. Slice A (placement) landed 2026-10-05; slice B (costing)
-is next. Parent: M0146-0012.
+Status: in progress. Slices A (placement) and B (pricing) landed on
+2026-10-05; slice C (inner-unique `outer_match_frac`) is next. Parent:
+M0146-0012.
 Evidence: `analysis/m0146/m0146-0012a/`.
 
 ## PG mechanism
@@ -68,18 +69,50 @@ Evidence: `analysis/m0146/m0146-0012a/`.
   the placeholder case with a NULL `t2.q2`
   (`placeholder-null-probe.sql`) matches PG.
 
-## Slice B — costing (next)
+## Slice B — pricing (landed 2026-10-05)
 
-1. Land `analysis/m0146/m0146-0005/slice3/subplan-qual-cost.wip.patch`:
-   - `subPlanQualPerTuple` (`cost_subplan`'s non-hashed arm);
-   - `joinQualPerTuple` at the seven join-qual sites and in the semi/anti
-     nested-loop arm.
-2. Port the inner-unique `outer_match_frac` into
-   `hashJoinFinalCostInputFor` (`hashjoin_innerunique.go`, the missing
-   `/ inner.Rows`), and charge the join filter on `outer_matched`.
-   `hashJoinCost` hard-codes `match_count = 1`.
-3. Expected: Q17 elects PG's Hash Join with the SubPlan as Join Filter
-   (TPC-H join-method), and so do Q32/Q92 (TPC-DS join-method/join-order).
+- `subplan_cost.go` adds `joinQualPerTuple` and `joinQualEvalCost`: the flat
+  per-conjunct charge plus `subPlanCostOps`' per-call cost for every
+  correlated sublink. The saved slice-3 patch is re-based onto the existing
+  `cost_subplan` port, not added as a duplicate.
+  - It applies at the nested-loop, NLI, merge, hash, partial hash/merge,
+    parallel hash and parameterised hash join sites, and in the semi/anti
+    nested loop.
+- `subPlanCostOps` takes `lowered`: a pre-lowered sublink is correlated.
+  Before, it was priced as an InitPlan, at zero per call.
+- An uncorrelated ANY is not charged per joined tuple. PG hashes it
+  (`build_subplan` sets `useHashTable`, and `cost_subplan` charges it once at
+  startup). `subPlanCostOps` prices the plain form instead, so charging it
+  moved TPC-DS Q45's `OR i_item_id IN (…)` join above its Gather Merge
+  (ledgered).
+- Result: TPC-H Q17 and TPC-DS Q32/Q92 elect PG's Hash Join with the
+  SubPlan as Join Filter.
+
+  | fire set | before | after |
+  |---|---|---|
+  | SF1 join-order | 55 | 53 |
+  | SF1 join-method | 24 | 22 |
+  | SF1 parallelism | 44 | 42 |
+  | SF0.25 join-method | 26 | 25 |
+  | SF0.25 parameterisation | 26 | 25 |
+
+  No category regresses; the TPC-H arm is 24/24 MATCH.
+- Wall time, reported not judged (Goal): TPC-H Q17 0.43 → 6.2 s on PG's
+  plan, where PG 18.3 itself takes 1.6–2.3 s. TPC-DS SF0.25 Q32 went
+  16 → 240 ms and Q92 20 → 184 ms. Ledgered.
+- ea-ratchet has one new key, `Q92:date_dim+web_sales` (232 vs 4795). PG
+  estimates the same join at 234, so it is PG-shared and was re-pinned
+  under G4 (`ea-repin-attribution.md`).
+
+## Slice C — inner-unique `outer_match_frac` (next)
+
+- `hashJoinFinalCostInputFor` (`hashjoin_innerunique.go`) misses PG's
+  `/ inner.rows`: `outer_match_frac = joinrel.rows / (outer.rows ×
+  inner.rows)`.
+- `hashJoinCost` hard-codes `match_count = 1`.
+- PG charges the join filter on `outer_matched_rows`; goopg charges it on
+  the join's output rows. Q17's cost is therefore 448k against PG's 212k,
+  although the election already agrees.
 
 ## Open
 
@@ -89,3 +122,5 @@ Evidence: `analysis/m0146/m0146-0012a/`.
   too) and ledgered.
 - **Hash keys:** a sublink equality as a hash key (PG Q2's
   `(SubPlan 1) = ps_supplycost`).
+- **Hashed ANY:** an uncorrelated hashed ANY's cost (`cost_subplan`'s
+  `useHashTable` arm) in `subPlanCostOps`.
