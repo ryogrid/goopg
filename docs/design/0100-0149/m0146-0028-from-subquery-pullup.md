@@ -287,3 +287,48 @@ you meant…" hint for a one-letter name that PG's fuzzy match rejects.
 
 Still open in M0146-0028: LATERAL bodies and PlaceHolderVar-wrapped pull-up
 (a grouping-sets parent, or the nullable side of an outer join).
+
+## 13. Slice 8 (M0146-0028h, 2026-10-05): LATERAL bodies
+
+`is_simple_subquery` admits a LATERAL subquery. With no outer join above it
+(`lowest_outer_join` NULL) it puts no restriction on the lateral references.
+`pull_up_simple_subquery` then substitutes the body's outputs, and its
+references to the items on its left become ordinary Vars of the parent.
+
+- `expandDerivedPullups` admits a join-free LATERAL subquery item of the
+  statement's own FROM list.
+- `resolvePulledDerived` resolves the body with the left-hand items as its
+  enclosing scope, a resolve context of the bindings before it plus the
+  earlier pulled-up aliases. That keeps PG's namespace order: the body's
+  own names first. `lowerLateralRefs` then lowers `varlevelsup`:
+  - a level-1 reference names a left item in the parent's own coordinates
+    and becomes a plain column;
+  - a deeper reference moves up one level.
+- The body WHERE joins the statement's quals and is distributed as a join
+  clause.
+
+Declined, keeping the statement on its unpulled path (where LATERAL
+already works):
+
+- a LATERAL body with a sublink: the plan inside the sublink carries its
+  own levels;
+- LATERAL under an explicit JOIN: PG's restricted case, with
+  `safe_upper_varnos` under an outer join and PlaceHolderVars;
+- LATERAL CTE references.
+
+The statement as a whole stays unpulled if any top-level LATERAL item is
+not pulled, because the unpulled path cannot name a pulled alias.
+
+Witnesses: `TestDerivedPullupLateral`, which fails without the change, and
+`TestDerivedLateralPullup` (PG 18.3 rows). The Lateral-join fixtures in
+`owned_build_poison_test.go` and `pathtarget_test.go` now fence their body
+with `OFFSET 0`.
+
+In regress join, `int4_tbl x, lateral (select unique2 from tenk1 where f1 =
+unique1)` now plans like the equivalent plain join. That is PG's behaviour,
+but goopg's join-method costing elects a Hash Join there where PG
+index-probes; on a fixture the plain join and the LATERAL form give one
+plan. TPC-H and TPC-DS have no LATERAL.
+
+Still open in M0146-0028: PlaceHolderVar-wrapped pull-up (a grouping-sets
+parent, the nullable side of an outer join, LATERAL under a join).

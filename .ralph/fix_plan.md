@@ -27265,6 +27265,23 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     \(no change\), ea\-ratchet 9 \-> 9, regress A/B \(join's alias\-count
     error now matches PG\)\.
   Movement: none — instrument artefact — no TPC query puts an alias list on a FROM subquery; regress join diff 18497 -> 18494
+- [x] **M0146\-0028h — slice 8: LATERAL bodies** \(impl, done
+  2026\-10\-05\)\. Design
+  `docs/design/0100\-0149/m0146\-0028\-from\-subquery\-pullup.md` §13\.
+  Kind: impl
+  Parent: M0146-0028
+  - A join\-free LATERAL subquery item of the FROM list is pulled up when no
+    outer join sits above it; its body resolves with the left items as its
+    enclosing scope and `lowerLateralRefs` lowers varlevelsup \(level 1 →
+    plain column\)\.
+  - Declined: sublink\-bearing LATERAL bodies, LATERAL under a JOIN, LATERAL
+    CTE references; any unpulled top\-level LATERAL item keeps the whole
+    statement unpulled\.
+  - Witnesses `TestDerivedPullupLateral` \(fails without the change\),
+    `TestDerivedLateralPullup` \(PG 18\.3 rows\)\.
+  - Regress join's LATERAL\-over\-tenk1 case now plans like the plain join
+    \(Hash Join where PG index\-probes — the plain join's costing\)\.
+  Movement: none — instrument artefact — no TPC query uses LATERAL
 - [x] **M0146\-0029 — planner panic on a variable\-free join alias**
   \(filed 2026\-09\-28 by M0146\-0028a; pre\-existing, reproduces on
   `611c32ed3`\)\. Regress `join.sql:1768` \(`int4\_tbl i0 left join \(
