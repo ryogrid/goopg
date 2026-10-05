@@ -26685,7 +26685,7 @@ M0146-0001 re-baseline census on the new default arm.
       parallel\-restricted correlated SubPlans \(Q32/Q92 under Gather\),
       and the hashed uncorrelated ANY cost\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 55 \-> 53, join\-method 24 \-> 22, parallelism 44 \-> 42 \(slice B; slice C neutral, ea\-ratchet 10 \-> 9\)
-- [ ] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
+- [x] **M0146-0013 — `cost_qual_eval` per-clause qual ordering**
   (impl; M0145-0028's ledger residual). Port `cost_qual_eval`
   (costsize.c) and apply `order_qual_clauses`'s stable cost sort
   (createplan.c:5420, incl. the leakproof/security-level refinement) at
@@ -26695,6 +26695,15 @@ M0146-0001 re-baseline census on the new default arm.
   a sublink before a cheap qual.
   Kind: impl
   Parent: none
+  - **2026\-10\-05 — DONE\.** `cost\_qual\_eval` was already ported
+    \(`qualEvalOps`\) and the leaf sort existed \(M0146\-0005co\); the flatten
+    and the bypass sites no longer exist\. The join quals were unordered:
+    `joinPredicate` now applies `orderQualRestrictInfos`, PG\'s
+    `order\_qual\_clauses` stable cost sort\. Design
+    `docs/design/0100\-0149/m0146\-0013\-qual\-cost\-order\.md`\.
+    - Witness `TestJoinFilterOrderedByQualCost`; TPC\-DS EXPLAIN text is
+      byte\-identical, TPC\-H arm 24/24\.
+  Movement: none — parity held: no corpus query carries an out\-of\-order join residual; fixture witness only
 - [ ] **M0146\-0026 — keep a Subquery Scan whose qual cannot be pushed
   down, as PG does** \(filed 2026\-09\-25 by M0146\-0001\). TPC\-DS Q39,
   Q53, Q89 \(both scales\): PG keeps `Subquery Scan on foo/tmp1` above a
