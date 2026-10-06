@@ -1633,7 +1633,14 @@ func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalo
 	wrap := &parser.SelectStmt{FromExprs: []parser.FromExpr{{
 		Base: parser.RangeVar{Subquery: in.Subquery, Alias: anyDerivedAlias},
 	}}}
-	node, bodyCtx, err := planFromClause(wrap, cat, ps, parent.rtScope)
+	// M0146-0058: the wrap is planned WITHOUT the FROM-subquery pull-up.
+	// The leaf must be the body's whole plan — PG's subquery RTE. Through
+	// planFromClause, M0146-0028's pull-up flattened a body
+	// simpleDerivedPullupBody admits (`SELECT upper(a) FROM t WHERE a <> 'x'`
+	// is non-simple only to sublinkBodyIsSimple), leaving the body's bare
+	// scan as the leaf: its WHERE and target were lost and the link bound the
+	// raw column, a wrong answer.
+	node, bodyCtx, _, err := planFromClauseItems(wrap, wrap.FromExprs, nil, nil, cat, ps, parent.rtScope)
 	if err != nil || bodyCtx == nil || len(bodyCtx.bindings) != 1 {
 		return nil, "any-derived-not-plannable", false
 	}
