@@ -28338,7 +28338,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Filed M0146\-0080, M0146\-0081, M0146\-0082; ledgered transition
       tables and writable\-CTE ordering\.
 Movement: none — instrument artefact — executor trigger\-firing correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0077 — WRONG RESULTS: a trigger\'s WHEN condition is not
+- [x] **M0146\-0077 — WRONG RESULTS: a trigger\'s WHEN condition is not
   evaluated** \(filed 2026\-10\-06 by M0146\-0055\)\. `CREATE TRIGGER insert\_a
   AFTER INSERT \.\.\. FOR EACH ROW WHEN \(NEW\.a = 123\)` fires for every
   inserted row \(regress `triggers`: an extra `trigger\_func\(insert\_a\)` per
@@ -28351,6 +28351,16 @@ Movement: none — instrument artefact — executor trigger\-firing correctness,
   - First step: check whether `catalog\.Trigger` keeps the WHEN expression;
     evaluate it in `fireTriggers` against OLD/NEW before running the
     function \(`operators\_trigger\.go`\)\.
+  - Done 2026\-10\-07 \(`b86ca66b8`; design
+    `docs/design/0100\-0149/m0146\-0077\-trigger\-when\-condition\.md`\):
+    - `triggerWhenPasses` binds OLD/NEW \(col, whole\-row, `\.\*`, tableoid\)
+      into the WHEN tree via the generalised `rewriteParserExpr` and
+      evaluates it; checked for row and statement triggers on every DML
+      path including COPY\.
+    - Regress `triggers` 2714→2670, no new divergent line\.
+    - Ledgered: AFTER ROW WHEN evaluated at fire time, not queue time;
+      system columns other than tableoid\.
+Movement: none — instrument artefact — executor trigger WHEN correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0075 — WRONG RESULTS: MERGE \.\.\. WHEN NOT MATCHED THEN
   INSERT leaves an omitted column NULL** \(filed 2026\-10\-06 by
   M0146\-0054\)\. Into `mv \(a int primary key, c float8 DEFAULT random\(\),
