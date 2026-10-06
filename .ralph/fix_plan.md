@@ -28486,7 +28486,7 @@ Movement: none — instrument artefact — harness fix; no plan or estimate chan
     \(`pulled\-from\-item\-qual`\)\.
   - Test `TestSublinkOverInlinedCTEKeepsBodyWhere` \(fails on HEAD\)\.
   Movement: none — correctness fix — no plan instrument \(no TPC\-DS or TPC\-H query reads a CTE inside a pulled sublink; fire set flat\)
-- [ ] **M0146\-0058 — WRONG RESULTS: an ANY sublink whose body the FROM
+- [x] **M0146\-0058 — WRONG RESULTS: an ANY sublink whose body the FROM
   pull\-up flattens loses its WHERE and its target expression** \(filed
   2026\-10\-04 by M0146\-0007f\)\. With `m7one\(a text\)` holding `x` and `y`,
   `SELECT count\(\*\) FROM \(VALUES \(\'X\'\), \(\'Y\'\)\) v\(c\) WHERE c IN
@@ -28507,6 +28507,18 @@ Movement: none — instrument artefact — harness fix; no plan or estimate chan
   - First step: decline in `pullUpAnyDerivedBody` when `bodyCtx\.pulledDerived`
     is non\-empty \(or plan the wrap with `derivedPullupOff`\), then pin the
     query above as a test\.
+  - Done 2026\-10\-06 \(`70a86beb0`; design
+    `docs/design/0100\-0149/m0146\-0058\-any\-derived\-body\-no\-pullup\.md`\):
+    - `pullUpAnyDerivedBody` plans the `ANY\_subquery` wrap with
+      `planFromClauseItems` directly, without the FROM pull\-up\. The leaf
+      is the body's whole plan, so the WHERE and the target stay inside it\.
+    - `TestAnyDerivedBodyKeepsWhereAndTarget`: four PG\-verified queries,
+      three failing at HEAD\.
+    - No TPC plan changed\. Regress subselect identical; join\.sql's
+      full\-join IN body now takes this arm, with the same rows\.
+    - Ledgered: PG's flat pull\-up of a function\-call target, and the arm's
+      duplicate Join Filter and `upper` label\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0059 — WRONG RESULTS: a kept CTE\'s rows survive into the next
   statement of a PL/pgSQL function** \(filed 2026\-10\-04 by M0146\-0007f\)\.
   A function that runs `r1 := \(WITH x AS \(SELECT a, b FROM t WHERE b < 5\)

@@ -83,6 +83,11 @@ CREATE fails. That is the incident's signature.
   - the datadir, only after it initialised one (`OWN_DATADIR`).
 - Re-run of the experiment: B is refused by the lock, and A completes all
   18 cases with its datadir intact.
+- Follow-up (`ebfb403e5`, found by M0146-0058's regress A/B): the server
+  inherits the lock descriptor, so the lock is held until the previous
+  run's server has really exited. A back-to-back A/B pair was refused
+  while that server was still exiting, so the runner now waits up to 120s
+  (`flock -w 120`) before refusing.
 
 ## Not covered
 
