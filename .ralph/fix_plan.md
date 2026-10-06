@@ -28228,7 +28228,7 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     wire uses \(the fkValsForDetail DateStyle fix is a precedent\) and check
     timestamp/numeric/float/bytea cells too; every NOT NULL / CHECK /
     unique DETAIL site goes through formatRowForDetail\.
-- [ ] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
+- [x] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
   PL/pgSQL functions succeeds once; the second and every later run fails at
@@ -28242,6 +28242,14 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     heap insert that raises the message \(grep `freshly extended page`\)
     and why the tuple does not fit an empty page \(tuple size vs page
     free space, toasting of `prosrc`, a stale free\-space hint\)\.
+  - Done 2026\-10\-07 \(`f8062512e`; design
+    `docs/design/0100\-0149/m0146\-0078\-catalog\-update\-extend\-retry\.md`\):
+    - Root cause: updateHeapRowCanonicalPG\'s retry re\-picked the same full
+      last block; `pinNewTarget\(extend\)` now forces the extension\.
+    - Probe runs 5× clean, identical to PG; regress plpgsql/polymorphism
+      lose the error\.
+    - Ledgered: no FSM lookup before extending \(catalog bloat only\)\.
+Movement: none — instrument artefact — catalog DDL correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0073 — retire the one\-relation index rule\'s correlated
   half** \(filed 2026\-10\-06 by M0146\-0062\)\. M0146\-0012 slice 2 kept
   `planIndexScanFromWhere`\'s correlated probe because an outer key from a
