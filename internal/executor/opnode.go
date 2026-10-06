@@ -562,10 +562,9 @@ func (it *OpIterator) RowsAffected() int64 {
 // the slab-native pass-throughs (OpProject/OpFilter/OpLimit) and through an
 // OpSort's opNodeOperator bridge into its child subtree (child indices are
 // built before their parents, so the descent strictly decreases and always
-// terminates). It stops at any other kind: OpAdapter subtrees self-mark via
-// their legacy Opens (lockRowsOp/projectOp/filterOp/aggregateOp), and joins
-// and scans either consume slots row-wise or rebuild them, so a sort below
-// one has no live consumer. Slab twin of markSortWantCTIDs. EX3-05 Cut A.
+// terminates). An OpAdapter subtree is handed to markSortWantCTIDs. It stops
+// at any other kind: joins and scans either consume slots row-wise or rebuild
+// them, so a sort below one has no live consumer. Slab twin of markSortWantCTIDs. EX3-05 Cut A.
 func markSlabSorts(tree *opTreeSlab, idx int32) {
 	for idx != noChild {
 		if tree == nil || int(idx) < 0 || int(idx) >= len(tree.ops) {
@@ -588,6 +587,15 @@ func markSlabSorts(tree *opTreeSlab, idx int32) {
 			return
 		case OpProject, OpFilter, OpLimit:
 			idx = n.childA
+		case OpAdapter:
+			// The consumer above reads this adapter's tids (fillFromTupleSlot
+			// carries them), so hand the legacy subtree to the legacy marker —
+			// a Gather or Gather Merge has no consumer of its own inside it
+			// (M0146-0051).
+			if a, ok := n.state.(*opAdapterState); ok && a.op != nil {
+				markSortWantCTIDs(a.op)
+			}
+			return
 		default:
 			return
 		}

@@ -1430,11 +1430,12 @@ func (o *sortOp) sortTailWithCTIDs() {
 // single-child pass-through operators a slot's hasCTID survives — the same
 // vocabulary findScanLeaf uses (project/filter/sort/limit/distinct/
 // distinctOn/ordinality/window/projectSet/materialize, plus the
-// instrumentedOp wrapper). It stops at the first operator with any other
-// shape (joins, scans, gathers, set-ops, ...): those either consume slots
-// row-wise (CTIDExpr reads NULL there already) or rebuild them (the CTID is
-// already lost), so a sort below one has no live consumer and staying
-// disabled is observably identical. Idempotent: setting wantCTIDs twice is
+// instrumentedOp wrapper). A Gather or Gather Merge records the marker and
+// carries it into the participant trees it builds at Open. It stops at the
+// first operator with any other shape (joins, scans, set-ops, ...): those
+// either consume slots row-wise (CTIDExpr reads NULL there already) or
+// rebuild them (the CTID is already lost), so a sort below one has no live
+// consumer and staying disabled is observably identical. Idempotent: setting wantCTIDs twice is
 // the same as once. EX3-05 Cut A.
 //
 // Callers are the side-channel's consumers, each before opening its child:
@@ -1468,6 +1469,15 @@ func markSortWantCTIDs(op Operator) {
 			op = v.child
 		case *instrumentedOp:
 			op = v.inner
+		case *gatherOp:
+			// The per-participant child trees do not exist until Open; the
+			// gather re-applies the marker to each one it builds and ships
+			// worker tids beside the rows (M0146-0051).
+			v.wantCTIDs = true
+			return
+		case *gatherMergeOp:
+			v.wantCTIDs = true
+			return
 		default:
 			return
 		}
@@ -1531,13 +1541,23 @@ func isRegSortFamilyTypeName(name string) bool {
 // the two source shapes compare consistently. Any other expression shape
 // is evaluated exactly as before. M0134-0005aj (hunk 12).
 func evalSortKeyValue(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
+	var slot SlotView
+	if row != nil {
+		slot = rowSlotView(row)
+	}
+	return evalSortKeyValueSlot(e, slot, ctx)
+}
+
+// evalSortKeyValueSlot is evalSortKeyValue over a slot, so a key that reads
+// the slot's carried tid (`ctid`) sees it; over a bare Row it reads NULL.
+func evalSortKeyValueSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	if ce, ok := e.(*optimizer.CastExpr); ok && isRegSortFamilyTypeName(ce.TargetType) {
-		ov, err := evalExpr(ce.Operand, row, ctx)
+		ov, err := evalExprSlot(ce.Operand, slot, ctx)
 		if err == nil && ov.Kind == KindInt {
 			return ov, nil
 		}
 	}
-	v, err := evalExpr(e, row, ctx)
+	v, err := evalExprSlot(e, slot, ctx)
 	if err != nil {
 		return v, err
 	}
