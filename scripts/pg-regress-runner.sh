@@ -214,11 +214,14 @@ if [[ "$AUTO_START" -eq 1 ]]; then
     # port, the scope name and (within one tree) the datadir are shared. The
     # lock is taken before anything is touched, so a refused runner leaves
     # the running one alone.
+    # The server inherits the lock descriptor, so the lock is held until the
+    # previous run's server has really exited; a back-to-back invocation (an
+    # A/B pair) waits for that instead of failing.
     RUNNER_LOCK="/tmp/goopg-regress-runner-${PORT}.lock"
     exec 9>"${RUNNER_LOCK}"
-    if ! flock -n 9; then
+    if ! flock -w 120 9; then
         echo "pg-regress-runner: another pg-regress-runner holds port ${PORT} (${RUNNER_LOCK})." >&2
-        echo "  Refusing to start; wait for it to finish." >&2
+        echo "  Refusing to start after waiting 120s; wait for it to finish." >&2
         exit 2
     fi
 fi
