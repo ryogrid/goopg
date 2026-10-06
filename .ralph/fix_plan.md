@@ -28176,6 +28176,36 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: remaining guess sites, `pg\_typeof` of a VALUES row
       column\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0076 — WRONG RESULTS: DML statement\-level triggers do not
+  fire, and AFTER ROW triggers fire inline** \(filed 2026\-10\-06 by
+  M0146\-0055\)\. INSERT never fires AFTER STATEMENT triggers; regress
+  `triggers` also shows UPDATE\'s and DELETE\'s AFTER STATEMENT and DELETE\'s
+  BEFORE STATEMENT missing\. INSERT fires AFTER ROW triggers inline after
+  each row, where PG queues them to statement end \(`AfterTriggerEndQuery`\),
+  so NOTICE order and what an AFTER trigger sees differ\. COPY now does both
+  correctly \(`CopyFromExecutor\.beginStatement` / `endStatement`\)\.
+  Kind: bug
+  Parent: M0146\-0055
+  > ## ESCALATION 2026\-10\-06 \(S2\) — AFTER STATEMENT triggers never fire for INSERT/UPDATE/DELETE
+  > Filed by M0146\-0055, not worked\. Owner: place M0146\-0076 in the banner\.
+  - First step: `insertOp` in `operators\_storage\.go` fires
+    `fireStatementTriggers\(\.\.\., "before", "insert"\)` only; add the AFTER
+    STATEMENT call at the end of the row loop and queue AFTER ROW events
+    the way `CopyFromExecutor\.endStatement` does; then the UPDATE/DELETE
+    operators\.
+- [ ] **M0146\-0077 — WRONG RESULTS: a trigger\'s WHEN condition is not
+  evaluated** \(filed 2026\-10\-06 by M0146\-0055\)\. `CREATE TRIGGER insert\_a
+  AFTER INSERT \.\.\. FOR EACH ROW WHEN \(NEW\.a = 123\)` fires for every
+  inserted row \(regress `triggers`: an extra `trigger\_func\(insert\_a\)` per
+  non\-matching row, for INSERT and COPY alike\); PG fires it only when the
+  condition holds \(`TriggerEnabled`, trigger\.c\)\.
+  Kind: bug
+  Parent: M0146\-0055
+  > ## ESCALATION 2026\-10\-06 \(S2\) — triggers fire when their WHEN condition is false
+  > Filed by M0146\-0055, not worked\. Owner: place M0146\-0077 in the banner\.
+  - First step: check whether `catalog\.Trigger` keeps the WHEN expression;
+    evaluate it in `fireTriggers` against OLD/NEW before running the
+    function \(`operators\_trigger\.go`\)\.
 - [ ] **M0146\-0075 — WRONG RESULTS: MERGE \.\.\. WHEN NOT MATCHED THEN
   INSERT leaves an omitted column NULL** \(filed 2026\-10\-06 by
   M0146\-0054\)\. Into `mv \(a int primary key, c float8 DEFAULT random\(\),
@@ -28230,7 +28260,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       `parted\_si` now loads\.
     - Filed M0146\-0075 \(MERGE INSERT leaves omitted defaults NULL\)\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
+- [x] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
   triggers** \(filed 2026\-10\-04 by M0146\-0009h\)\. A BEFORE INSERT FOR EACH
   ROW trigger that sets `new\.b := new\.b \|\| \'\!\'` changes nothing on
   goopg \(`x,y`\); PG stores `x\!,y\!`\. `storeCopyRow` never calls the
@@ -28240,6 +28270,18 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: fire row triggers from `storeCopyRow` as INSERT does;
     CopyFrom forces CIM\_SINGLE for such tables \(already wired,
     `copyUsesMultiInsert`\)\.
+  - Done 2026\-10\-06 \(`bd4923c05`; design
+    `docs/design/0100\-0149/m0146\-0055\-copy\-fires\-triggers\.md`\):
+    - `beginStatement` / `endStatement` fire BEFORE / AFTER STATEMENT once
+      \(zero\-row COPY included\); BEFORE ROW runs between defaults and
+      constraints and can suppress a row; AFTER ROW events are queued and
+      fire at statement end; stored generated columns are computed\.
+    - The binary trailer ends the statement too; the stand\-alone COPY
+      Context gets `NoticeFlush`\.
+    - Test `TestCopyFromFiresTriggers` \(CSV, binary, zero rows, generated\)\.
+    - Filed M0146\-0076 \(DML statement triggers / AFTER ROW queueing\) and
+      M0146\-0077 \(trigger WHEN conditions ignored\)\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
