@@ -1968,12 +1968,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// decorrelated into a whole-table GROUP BY (1021 ms -> 11155 ms).
 		// M0146-0015a gave the search that producer, and on TPC-H and
 		// TPC-DS SF0.25 this rule no longer fires on a correlated scope.
-		// It still covers one: an outer key whose type differs from the
-		// index column only because goopg types an integer literal int8
-		// where PG types it int4 (M0146-0062) — `restrictionKeyUsable`
-		// refuses that uncast probe, the rule builds it. Retire the
-		// correlated half once M0146-0062 lands; the uncorrelated half
-		// can override a costed Seq Scan PG keeps (M0146-0060).
+		// Its correlated half (an IndexScan keyed on an outer column) is
+		// retired (M0146-0073): it last covered an outer key goopg typed
+		// int8 against an int4 index column, which M0146-0062 fixed. The
+		// uncorrelated half remains and can override a costed Seq Scan PG
+		// keeps (M0146-0060).
 		//
 		// Its multi-conjunct twin `flattenStrandedSeqScanFilters`
 		// (M0145-0027) is deleted (M0146-0012 slice 2): the search
@@ -11730,86 +11729,6 @@ func parserExprKey(e parser.Expr) string {
 // already builds (root-0026 SELECT-side twin, M0119-0004). The caller passes
 // false to preserve pre-existing behavior where a different layer already
 // handles (or is unaffected by) the child fan-out — see call sites.
-// bitmapOverCorrelatedProbe prices the two access methods for a correlated
-// single-equality probe — `WHERE inner.col = outer.col` — and returns the
-// bitmap plan when it is the cheaper one, nil to keep the plain index scan.
-//
-// The inputs are exactly the join search's: `varEqNonConstSelectivity` for the
-// unknown probe value (`var_eq_non_const`, selfuncs.c), real index geometry
-// (M0134-0183), `costIndexScan` vs `costBitmapIndexScan` +
-// `computeBitmapPages` + `costBitmapHeapScan` at loop_count 1 — PG plans a
-// subquery once, independent of how many times the outer will drive it, and
-// prices it exactly this way. No preference is expressed anywhere: an
-// un-analysed table returns nil (no row count means no honest comparison, and
-// nil is the pre-existing behaviour), and a tie keeps the index.
-//
-// The composite-prefix case needs no special handling on either side: the
-// bitmap's `lookupKey` pads the probe with `compositeUpperBound` exactly as
-// the index scan's does, and `needsRecheck` marks the prefix probe's tuples
-// for recheck against BitmapQual — which carries the very equality this probe
-// binds.
-// take2 P2-01: takes the statement's planner settings rather than calling
-// defaultCostParams(). Its caller passes ctx.settings, which covers all three
-// paths that reach it — planSelect, planUpdate and planDelete. The DML two
-// build their context with singleBindingContext, which today yields the
-// defaults; when P2-02 stamps those contexts the session's GUCs flow here with
-// no further change, which is why the value travels on the context rather than
-// as a separate parameter.
-func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings, alias string, rtid int32) Node {
-	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
-		return nil
-	}
-	cp := ps.costParams()
-	relTuples := float64(tbl.Stats.RowCount)
-	relPages := baseRelPages(tbl, relTuples)
-	T := float64(relPages)
-	if T < 1 {
-		T = 1
-	}
-	sel := varEqNonConstSelectivity(columnStatsByName(tbl, col.Name), relTuples)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	in := indexScanInputs{
-		relPages:        relPages,
-		relTuples:       relTuples,
-		indexPages:      indexPages,
-		indexTuples:     indexTuples,
-		treeHeight:      treeHeight,
-		selectivity:     sel,
-		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
-		totalTablePages: T,
-		loopCount:       1,
-	}
-	idxCost := costIndexScan(cp, in)
-	bmIdxCost := costBitmapIndexScan(cp, in)
-	tuples := clampRowEst(sel * relTuples)
-	pages, tuples := computeBitmapPages(tuples, relTuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
-	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T,
-		// Rule-based chooser: no cost competition exists here (shape match,
-		// no addPath), so the qpqual term stays 0 — R1
-		// (plan-parity-fix-take2) prices only the search's candidates.
-		// Dies with the legacy planner (P6).
-		0)
-	if bm.Total >= idxCost.Total {
-		return nil
-	}
-	return &BitmapHeapScan{
-		pos:        pos,
-		Table:      tbl,
-		Alias:      alias,
-		RTID:       rtid,
-		BitmapQual: []Expr{queryClause},
-		Outer: &BitmapIndexScan{
-			pos:    pos,
-			Table:  tbl,
-			Index:  idx,
-			Key:    key,
-			Pred:   []Expr{queryClause},
-			schema: schema,
-		},
-		schema: schema,
-	}
-}
-
 // indexLeadsRegIdentifierArray reports whether the index's leading
 // column is a reg*-identifier ARRAY (regclass[] etc.). See the R46
 // carve-out in seqWinsEqualityProbe (K100).
@@ -12022,69 +11941,15 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
 
-	// When both sides are ColumnRefs (e.g. WHERE inner.col = outer.col in a
-	// correlated subquery), check if one side resolves to an OuterColumnRef.
-	// If so, treat it as the key expression (the outer value drives the probe).
-	if lIsCol && rIsCol {
-		leftResolved, leftErr := resolveExpr(b.Left, ctx)
-		rightResolved, rightErr := resolveExpr(b.Right, ctx)
-		_, leftIsOuter := leftResolved.(*OuterColumnRef)
-		_, rightIsOuter := rightResolved.(*OuterColumnRef)
-		if leftErr == nil && rightErr == nil && (leftIsOuter || rightIsOuter) {
-			var colRef *parser.ColumnRef
-			var resolvedKey Expr
-			if rightIsOuter {
-				colRef = leftCol
-				resolvedKey = rightResolved
-			} else {
-				colRef = rightCol
-				resolvedKey = leftResolved
-			}
-			resolvedCol, err := resolveColumnRef(colRef, ctx)
-			if err != nil {
-				return nil, false, nil
-			}
-			col, ok := resolvedCol.(*ColumnRef)
-			if !ok {
-				return nil, false, nil
-			}
-			// resolvedKey is an OuterColumnRef here, never a Const, so this
-			// synthetic clause can never satisfy provePartialIndexPredicate's
-			// Var-op-Const shape — it is passed through only so the helper's
-			// (correct) refusal is by shape, not by omission.
-			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
-			if idx == nil {
-				return nil, false, nil
-			}
-			// M0134-0185: this arm used to return the index scan
-			// UNCONDITIONALLY — the one access-method decision in the planner
-			// that consulted no cost at all. PG plans a correlated subquery
-			// through the full path machinery and on TPC-H Q17's SubPlan
-			// picks a Bitmap Heap Scan over this very probe by 1% (127.62 vs
-			// 128.97). Offer the same candidate, priced by the SAME cost
-			// functions the join search uses, and let the numbers decide.
-			// Reachable only with an outer binding in scope, so the
-			// UPDATE/DELETE callers — whose executors pattern-match
-			// `*IndexScan` — never see the bitmap shape.
-			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings, ctx.alias, ctx.bindings[0].rtid); bhs != nil {
-				return bhs, true, nil
-			}
-			return &IndexScan{
-				pos:        where.Pos(),
-				Table:      tbl,
-				Alias:      ctx.alias,
-				RTID:       ctx.bindings[0].rtid,
-				Index:      idx,
-				Key:        resolvedKey,
-				schema:     ctx.schema,
-				SmallDim:   smallDimensionTag(cat, tbl),
-				UniqueKeys: uniqueKeyColumnSets(cat, tbl),
-			}, true, nil
-		}
-		return nil, false, nil
-	}
-
+	// A column-to-column equality is never this rule's probe. Its correlated
+	// form (`WHERE inner.col = outer.col` in a correlated subquery) used to
+	// build an IndexScan keyed on the OuterColumnRef — kept after the
+	// cutover only for an outer key goopg typed int8 against an int4 index
+	// column, which the search's restrictionKeyUsable refuses uncast. Since
+	// M0146-0062 such keys are int4 and the search's parameterised base-rel
+	// paths (M0146-0015a) build every correlated probe, priced against the
+	// Seq Scan and bitmap alternatives as PG's create_index_paths does; the
+	// arm and its bitmap pricing twin are retired (M0146-0073).
 	if lIsCol == rIsCol {
 		return nil, false, nil
 	}
