@@ -2662,7 +2662,10 @@ merge_action:
 	   whenever VALUES is followed by '(' (base_yylex.go), so the plain token
 	   never reaches this position. `DEFAULT VALUES` below keeps plain VALUES
 	   because no paren follows it. */
-	| INSERT merge_ins_cols VALUES_LA '(' expr_list ')'
+	/* values_item_list, as INSERT's VALUES rows: an element may be the
+	   DEFAULT placeholder (gram.y merge_values_clause takes expr_list, whose
+	   a_expr includes DEFAULT as SetToDefault). M0146-0075. */
+	| INSERT merge_ins_cols VALUES_LA '(' values_item_list ')'
 			{ $$ = &mergeAction{kind: MergeActionInsert, cols: $2, vals: $5} }
 	/* DEFAULT VALUES leaves InsertValues nil, which is how the executor tells
 	   the two apart. */

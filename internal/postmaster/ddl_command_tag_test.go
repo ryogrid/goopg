@@ -146,3 +146,19 @@ func TestCommandTagForPopulatingDDLIsSelectN(t *testing.T) {
 		t.Fatalf("non-reporting CTAS tag = %q, want CREATE TABLE AS", got)
 	}
 }
+
+type fakeRowCounter struct {
+	executor.Operator
+	n int64
+}
+
+func (f fakeRowCounter) RowsAffected() int64 { return f.n }
+
+// MERGE completes with `MERGE <n>`, the rows it inserted, updated or deleted
+// (cmdtaglist.h CMDTAG_MERGE). commandTagFor had no Merge arm, so every MERGE
+// reported `SELECT 0` (M0146-0075).
+func TestCommandTagForMergeIsMergeN(t *testing.T) {
+	if got := commandTagFor(&optimizer.Merge{}, fakeRowCounter{n: 2}, 0); got != "MERGE 2" {
+		t.Fatalf("MERGE tag = %q, want MERGE 2", got)
+	}
+}

@@ -3004,8 +3004,11 @@ type MergeWhenClause struct {
 	UpdateSet []Expr
 
 	// INSERT: InsertExprs are evaluated against the source row at runtime.
-	// InsertColIdx maps source → target column ordinals (same length).
-	// nil InsertExprs means DEFAULT VALUES.
+	// InsertColIdx maps them to target column ordinals (same length). The
+	// planner appends resolved DEFAULT expressions for DEFAULT markers and
+	// omitted columns; a column missing from InsertColIdx is filled by the
+	// executor as omitted (NULL, serial/identity nextval, generated value).
+	// M0146-0075.
 	InsertExprs  []Expr
 	InsertColIdx []int
 }

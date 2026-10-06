@@ -3969,6 +3969,10 @@ func commandTagFor(node optimizer.Node, op executor.Operator, rowCount int64) st
 		return fmt.Sprintf("UPDATE %d", rowsAffected(op))
 	case *optimizer.Delete:
 		return fmt.Sprintf("DELETE %d", rowsAffected(op))
+	case *optimizer.Merge:
+		// MERGE <n>: rows inserted, updated or deleted (cmdtaglist.h
+		// CMDTAG_MERGE; DO NOTHING rows are not counted). M0146-0075.
+		return fmt.Sprintf("MERGE %d", rowsAffected(op))
 	case *optimizer.Transaction:
 		return transactionTag(n.Verb)
 	case *optimizer.Utility:

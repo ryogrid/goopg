@@ -14857,18 +14857,79 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 			if err != nil {
 				return nil, &PlanError{Pos: wc.Pos(), Code: "42703", Message: err.Error()}
 			}
-			pc.InsertColIdx = ordinals
-			if wc.InsertValues != nil {
-				exprs := make([]Expr, len(wc.InsertValues))
-				for i, ve := range wc.InsertValues {
-					expr, err := resolveExpr(ve, sourceOnly)
+			// transformInsertRow's arity rules (parse_target.c via
+			// transformMergeStmt): more expressions than target columns is
+			// an error; fewer is an error only with an explicit column list,
+			// and without one the leading columns are filled.
+			if n := len(wc.InsertValues); wc.InsertValues != nil && n != len(ordinals) {
+				if n > len(ordinals) {
+					return nil, &PlanError{Pos: wc.InsertValues[len(ordinals)].Pos(), Code: "42601",
+						Message: "INSERT has more expressions than target columns"}
+				}
+				if len(wc.InsertColumns) > 0 {
+					return nil, &PlanError{Pos: wc.Pos(), Code: "42601",
+						Message: "INSERT has more target columns than expressions"}
+				}
+				ordinals = ordinals[:n]
+			}
+			// Every column gets an expression the way planInsert builds
+			// one (rewriteTargetListIU, rewriteHandler.c): a value, a
+			// DEFAULT marker's or an omitted column's resolved DEFAULT
+			// expression. A column whose DEFAULT is not an expression here
+			// — no default, serial/identity, generated — stays out of
+			// InsertColIdx, and the executor fills it as omitted (NULL,
+			// nextval, the generation expression). M0146-0075.
+			exprs := make([]Expr, 0, len(tbl.Columns))
+			colIdx := make([]int, 0, len(tbl.Columns))
+			present := make(map[int]bool, len(tbl.Columns))
+			defaultCtx := &resolveContext{cat: cat, settings: ps}
+			defaultCtx.rtScope = scope
+			resolveDefault := func(ord int) (Expr, bool, error) {
+				col := tbl.Columns[ord]
+				if col.GeneratedAlways || col.DefaultExpr == nil {
+					return nil, false, nil
+				}
+				pe, err := resolveExpr(col.DefaultExpr, defaultCtx)
+				return pe, err == nil, err
+			}
+			for i, ve := range wc.InsertValues {
+				ord := ordinals[i]
+				present[ord] = true
+				_, isDefault := ve.(*parser.DefaultMarker)
+				if !isDefault && tbl.Columns[ord].GeneratedAlways {
+					return nil, &PlanError{Pos: ve.Pos(), Code: "428C9",
+						Message: fmt.Sprintf("cannot insert a non-DEFAULT value into column %q", tbl.Columns[ord].Name),
+						Detail:  fmt.Sprintf("Column %q is a generated column.", tbl.Columns[ord].Name)}
+				}
+				if isDefault {
+					pe, ok, err := resolveDefault(ord)
 					if err != nil {
 						return nil, err
 					}
-					exprs[i] = expr
+					if ok {
+						exprs = append(exprs, pe)
+						colIdx = append(colIdx, ord)
+					}
+					continue
 				}
-				pc.InsertExprs = exprs
+				expr, err := resolveExpr(ve, sourceOnly)
+				if err != nil {
+					return nil, err
+				}
+				exprs = append(exprs, expr)
+				colIdx = append(colIdx, ord)
 			}
+			for _, ord := range defaultAppendableColumns(tbl, present) {
+				pe, ok, err := resolveDefault(ord)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					exprs = append(exprs, pe)
+					colIdx = append(colIdx, ord)
+				}
+			}
+			pc.InsertExprs, pc.InsertColIdx = exprs, colIdx
 		case parser.MergeActionDoNothing:
 			// DO NOTHING — no extra fields needed. M0097-0016.
 		}
@@ -14904,12 +14965,16 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.
-// When names is empty, all non-generated columns are returned in declaration order.
+// When names is empty, every live column is returned in declaration order,
+// generated ones included: PG's default target list is all attributes
+// (checkInsertTargets), and a generated column then accepts only DEFAULT.
+// M0146-0075 (generated columns used to be left out, shifting every later
+// value one column left).
 func buildInsertColIdx(tbl *catalog.Table, names []string, cat catalog.Catalog) ([]int, error) {
 	if len(names) == 0 {
 		out := make([]int, 0, len(tbl.Columns))
 		for i, c := range tbl.Columns {
-			if !c.GeneratedAlways {
+			if !c.Dropped {
 				out = append(out, i)
 			}
 		}

@@ -570,18 +570,18 @@ func (o *mergeOp) next() (TupleSlot, error) {
 			for i := range insertMissing {
 				insertMissing[i] = true
 			}
-			if clause.InsertExprs != nil {
-				for i, expr := range clause.InsertExprs {
-					if i >= len(clause.InsertColIdx) {
-						break
-					}
-					val, err := evalExpr(expr, sr.row, o.ctx)
-					if err != nil {
-						continue
-					}
-					row[clause.InsertColIdx[i]] = val
-					insertMissing[clause.InsertColIdx[i]] = false
+			// A value's evaluation error aborts the MERGE, as in PG; it
+			// used to be swallowed, leaving the column NULL (M0146-0075).
+			for i, expr := range clause.InsertExprs {
+				if i >= len(clause.InsertColIdx) {
+					break
 				}
+				val, err := evalExpr(expr, sr.row, o.ctx)
+				if err != nil {
+					return nil, err
+				}
+				row[clause.InsertColIdx[i]] = val
+				insertMissing[clause.InsertColIdx[i]] = false
 			}
 			// Parity with the plain-insert and upsert paths
 			// (operators_storage.go, operators_upsert.go:198-214): fill DEFAULT
@@ -594,6 +594,12 @@ func (o *mergeOp) next() (TupleSlot, error) {
 			// postgres/src/backend/executor/nodeModifyTable.c ExecMergeMatched).
 			applyDefaultsForMissing(tbl.Columns, row, insertMissing, ctxSeqDBOid(o.ctx))
 			autoGenerateSerialValues(o.ctx, tbl.Name, tbl.Columns, row, insertMissing)
+			// The INSERT path's coercion of the provided values to the
+			// column types (assignment coercion, range checks), before
+			// triggers and constraints see the row.
+			if err := coerceRowForConstraintChecks(tbl.Columns, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+				return nil, err
+			}
 			_ = computeGeneratedColumns(tbl.Columns, row)
 
 			// Partition routing: route the row to the correct leaf partition.
@@ -624,6 +630,15 @@ func (o *mergeOp) next() (TupleSlot, error) {
 					break // trigger returned NULL — suppress insert
 				}
 				row = newRow
+			}
+
+			// ExecConstraints (ExecInsert → ExecMergeNotMatched): NOT NULL,
+			// CHECK and domain constraints, checked against the routed leaf
+			// so a partition's error names the partition, as insertOp does.
+			// The INSERT action skipped all three (M0146-0075).
+			_ = computeGeneratedColumns(insertTbl.Columns, row)
+			if err := checkRowConstraintsForWrite(o.ctx, insertTbl, insertTbl.Columns, row); err != nil {
+				return nil, err
 			}
 
 			// Unique constraint check with wait semantics — mirrors insertOp so
@@ -982,6 +997,25 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return nil // trigger RETURN NULL — skip this row
 		}
 		newRow = retRow
+	}
+
+	// ExecConstraints on the new row, as every UPDATE write path does
+	// (checkRowConstraintsForWrite); MERGE's UPDATE action ran none
+	// (M0146-0075). A cross-partition move only knows the destination's
+	// columns, so it checks NOT NULL and domains there and skips CHECK
+	// (deferral ledger 2026-10-07).
+	if tbl != nil {
+		if destRel == rel {
+			if err := checkRowConstraintsForWrite(ctx, tbl, destCols, newRow); err != nil {
+				return err
+			}
+		} else {
+			noCheck := *tbl
+			noCheck.CheckConstraints = nil
+			if err := checkRowConstraintsForWrite(ctx, &noCheck, destCols, newRow); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Re-pin and apply the write.
