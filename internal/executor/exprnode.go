@@ -264,6 +264,17 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		if isComparisonOpCode(t.Op) && exprIsCharacterString(t.Left) && exprIsCharacterString(t.Right) {
 			(*s)[idx].payload[16] |= 4
 		}
+		// Bits 8 / 16: `||` resolved to textcat / jsonb_concat from the
+		// static operand types (M0146-0074; the interpreted twin calls
+		// concatModeOf directly).
+		if t.Op == parser.OpConcat {
+			switch concatModeOf(t.Left, t.Right) {
+			case concatText:
+				(*s)[idx].payload[16] |= 8
+			case concatJSONB:
+				(*s)[idx].payload[16] |= 16
+			}
+		}
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -469,7 +480,19 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		left, right = concatOperandsAsText(op, left, right, lbp, rbp)
 		left, right = comparisonOperandsAsBpchar(op, left, right, lbp, rbp,
 			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
-		result, err := evalBinary(op, left, right, pos, ctx)
+		var result Datum
+		if op == parser.OpConcat {
+			mode := concatGuess
+			switch {
+			case n.payload[16]&8 != 0:
+				mode = concatText
+			case n.payload[16]&16 != 0:
+				mode = concatJSONB
+			}
+			result, err = evalConcat(left, right, pos, ctx, mode)
+		} else {
+			result, err = evalBinary(op, left, right, pos, ctx)
+		}
 		if err != nil {
 			return Datum{}, err
 		}

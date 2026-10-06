@@ -174,6 +174,38 @@ func funcCallResultType(x *FuncCall) (catalog.Type, bool) {
 	if x.ReturnType != "" {
 		return catalog.Type{Name: strings.ToLower(x.ReturnType)}, true
 	}
+	// Functions whose result type pg_proc cannot key from the argument
+	// list (M0146-0074, for `||` resolution):
+	//   - COALESCE / GREATEST / LEAST: the arguments' common type (PG's
+	//     select_common_type); the first argument that is neither a NULL
+	//     nor an untyped literal decides it, and all-literal arguments
+	//     resolve to text, as an unknown literal does;
+	//   - NULLIF: its first argument's type;
+	//   - concat / concat_ws / format: text. They are VARIADIC "any".
+	switch strings.ToLower(x.Name) {
+	case "coalesce", "greatest", "least":
+		literal := false
+		for _, a := range x.Args {
+			if _, isNull := a.(*NullConst); isNull {
+				continue
+			}
+			if _, isLit := a.(*StringConst); isLit {
+				literal = true
+				continue
+			}
+			return ExprResultType(a)
+		}
+		if literal {
+			return catalog.Type{Name: "text"}, true
+		}
+		return catalog.Type{}, false
+	case "nullif":
+		if len(x.Args) == 2 {
+			return ExprResultType(x.Args[0])
+		}
+	case "concat", "concat_ws", "format":
+		return catalog.Type{Name: "text"}, true
+	}
 	if x.Star || x.Variadic {
 		// `count(*)` and VARIADIC expansion do not have a literal argument
 		// list to key the pg_proc lookup on.

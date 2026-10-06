@@ -1336,7 +1336,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		left, right = concatOperandsAsText(x.Op, left, right, lbp, rbp)
 		left, right = comparisonOperandsAsBpchar(x.Op, left, right, lbp, rbp,
 			isBareStringLit(x.Left), isBareStringLit(x.Right))
-		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
+		var result Datum
+		if x.Op == parser.OpConcat {
+			// `||` resolved from the static operand types (M0146-0074);
+			// the compiled twin reads the same mode from payload[16]
+			// bits 8 and 16.
+			result, err = evalConcat(left, right, x.Pos(), ctx, concatModeOf(x.Left, x.Right))
+		} else {
+			result, err = evalBinary(x.Op, left, right, x.Pos(), ctx)
+		}
 		if err != nil {
 			return Datum{}, err
 		}
@@ -1929,81 +1937,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		}
 		return floatTextDatum(PGFloatOut(result, 64)), nil
 	case parser.OpConcat:
-		// || requires at least one string-typed operand. When one side is text
-		// (or string-like), the other side is coerced to text. When both sides
-		// are non-string (e.g. integer || numeric), PostgreSQL raises
-		// "operator does not exist" — match that behaviour. M0097-0063.
-		if left.IsNull() || right.IsNull() {
-			return NullDatum, nil
-		}
-		leftIsStr := left.Kind == KindString || left.Kind == KindBytes
-		rightIsStr := right.Kind == KindString || right.Kind == KindBytes
-		if !leftIsStr && !rightIsStr {
-			// Neither operand is string-like → PG-compatible error.
-			return Datum{}, &ExecError{Code: "42883", Pos: pos,
-				Message: fmt.Sprintf("operator does not exist: %s || %s",
-					pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
-				Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
-		}
-		// Array concatenation: if both operands look like PostgreSQL arrays
-		// ({v1,v2,...}), merge their elements rather than text-concat.
-		// Also handles array || element and element || array (append/prepend).
-		// M0097-0065. Non-array text rendering honors the session DateStyle
-		// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
-		// matching the already-fixed SELECT/COPY/CAST output paths.
-		// byteacat (varlena.c): bytea || bytea is BYTEA, not text. The
-		// unknown-type literal in `<bytea> || '\x00'` is coerced through
-		// byteain first, exactly as PG's operator resolution would; a string
-		// that is not valid bytea input falls through to the text path below
-		// rather than failing the query. M0125-0021.
-		if left.Kind == KindBytes || right.Kind == KindBytes {
-			lb, lok := byteaOperand(left)
-			rb, rok := byteaOperand(right)
-			if lok && rok {
-				out := make([]byte, 0, len(lb)+len(rb))
-				out = append(out, lb...)
-				out = append(out, rb...)
-				return NewBytesDatum(out), nil
-			}
-		}
-		ls := formatDatumDateStyle(left, ctx)
-		rs := formatDatumDateStyle(right, ctx)
-		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
-		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
-		if lsIsArr && rsIsArr {
-			// array || array: merge inner elements.
-			leftInner := ls[1 : len(ls)-1]
-			rightInner := rs[1 : len(rs)-1]
-			var inner string
-			switch {
-			case leftInner == "" && rightInner == "":
-				inner = ""
-			case leftInner == "":
-				inner = rightInner
-			case rightInner == "":
-				inner = leftInner
-			default:
-				inner = leftInner + "," + rightInner
-			}
-			return NewStringDatum("{" + inner + "}"), nil
-		}
-		if lsIsArr && !rsIsArr {
-			// array || element: append element to array.
-			inner := ls[1 : len(ls)-1]
-			if inner == "" {
-				return NewStringDatum("{" + rs + "}"), nil
-			}
-			return NewStringDatum("{" + inner + "," + rs + "}"), nil
-		}
-		if rsIsArr && !lsIsArr {
-			// element || array: prepend element.
-			inner := rs[1 : len(rs)-1]
-			if inner == "" {
-				return NewStringDatum("{" + ls + "}"), nil
-			}
-			return NewStringDatum("{" + ls + "," + inner + "}"), nil
-		}
-		return NewStringDatum(ls + rs), nil
+		return evalConcat(left, right, pos, ctx, concatGuess)
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
 		// Geometric point operators reuse the << / >> spellings: `point << point`
 		// (strictly left of) and `point >> point` (strictly right of) compare the
@@ -21921,4 +21855,93 @@ func enterSublinkCTEWindow(ctx *Context, correlated bool) func() {
 	}
 	ctx.CTERowCache = window
 	return func() { ctx.CTERowCache = saved }
+}
+
+// evalConcat evaluates `||` (M0146-0074 split it out of evalBinary). mode is
+// the operator PG would have resolved from the static operand types
+// (concatModeOf): textcat and jsonb_concat never look at the values' shape;
+// concatGuess, for operands whose types are unknown or array-typed, keeps the
+// shape-based array handling.
+func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datum, error) {
+	// || requires at least one string-typed operand. When one side is text
+	// (or string-like), the other side is coerced to text. When both sides
+	// are non-string (e.g. integer || numeric), PostgreSQL raises
+	// "operator does not exist" — match that behaviour. M0097-0063.
+	if left.IsNull() || right.IsNull() {
+		return NullDatum, nil
+	}
+	leftIsStr := left.Kind == KindString || left.Kind == KindBytes
+	rightIsStr := right.Kind == KindString || right.Kind == KindBytes
+	if !leftIsStr && !rightIsStr {
+		// Neither operand is string-like → PG-compatible error.
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator does not exist: %s || %s",
+				pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
+			Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
+	}
+	// Array concatenation: if both operands look like PostgreSQL arrays
+	// ({v1,v2,...}), merge their elements rather than text-concat.
+	// Also handles array || element and element || array (append/prepend).
+	// M0097-0065. Non-array text rendering honors the session DateStyle
+	// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
+	// matching the already-fixed SELECT/COPY/CAST output paths.
+	// byteacat (varlena.c): bytea || bytea is BYTEA, not text. The
+	// unknown-type literal in `<bytea> || '\x00'` is coerced through
+	// byteain first, exactly as PG's operator resolution would; a string
+	// that is not valid bytea input falls through to the text path below
+	// rather than failing the query. M0125-0021.
+	if left.Kind == KindBytes || right.Kind == KindBytes {
+		lb, lok := byteaOperand(left)
+		rb, rok := byteaOperand(right)
+		if lok && rok {
+			out := make([]byte, 0, len(lb)+len(rb))
+			out = append(out, lb...)
+			out = append(out, rb...)
+			return NewBytesDatum(out), nil
+		}
+	}
+	if mode == concatJSONB {
+		return jsonbConcat(left.StringValue(), right.StringValue())
+	}
+	ls := formatDatumDateStyle(left, ctx)
+	rs := formatDatumDateStyle(right, ctx)
+	if mode == concatText {
+		return NewStringDatum(ls + rs), nil
+	}
+	lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
+	rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
+	if lsIsArr && rsIsArr {
+		// array || array: merge inner elements.
+		leftInner := ls[1 : len(ls)-1]
+		rightInner := rs[1 : len(rs)-1]
+		var inner string
+		switch {
+		case leftInner == "" && rightInner == "":
+			inner = ""
+		case leftInner == "":
+			inner = rightInner
+		case rightInner == "":
+			inner = leftInner
+		default:
+			inner = leftInner + "," + rightInner
+		}
+		return NewStringDatum("{" + inner + "}"), nil
+	}
+	if lsIsArr && !rsIsArr {
+		// array || element: append element to array.
+		inner := ls[1 : len(ls)-1]
+		if inner == "" {
+			return NewStringDatum("{" + rs + "}"), nil
+		}
+		return NewStringDatum("{" + inner + "," + rs + "}"), nil
+	}
+	if rsIsArr && !lsIsArr {
+		// element || array: prepend element.
+		inner := rs[1 : len(rs)-1]
+		if inner == "" {
+			return NewStringDatum("{" + ls + "}"), nil
+		}
+		return NewStringDatum("{" + ls + "," + inner + "}"), nil
+	}
+	return NewStringDatum(ls + rs), nil
 }

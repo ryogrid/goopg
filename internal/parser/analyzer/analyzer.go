@@ -1614,6 +1614,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if isArr(rightTyp) {
 				return rightTyp, nil
 			}
+			// jsonb || jsonb is jsonb_concat (pg_operator 3284, result jsonb);
+			// an unknown literal beside jsonb resolves to jsonb. A jsonb
+			// beside text instead resolves to anytextcat/textanycat below.
+			// M0146-0074.
+			isJSONB := func(t catalog.Type) bool { return !t.IsArray && strings.EqualFold(t.Name, "jsonb") }
+			if (isJSONB(leftTyp) && (isJSONB(rightTyp) || isUnknownType(rightTyp))) ||
+				(isJSONB(rightTyp) && isUnknownType(leftTyp)) {
+				return catalog.Type{Name: "jsonb"}, nil
+			}
 			// Require at least one string-like (or unknown) operand.
 			// When one side is non-string but the other is string-like,
 			// PostgreSQL implicitly casts the non-string side to text
