@@ -16791,6 +16791,15 @@ func PlanHasOuterRef(node Node) bool {
 	return planHasOuterRef(node)
 }
 
+// PlanReadsPastParent reports whether node's subtree reads an outer value
+// from above its immediate parent scope: a sublink plan whose correlation
+// reaches an enclosing query's row (Level >= 2 at the sublink's top), with
+// binders inside the subtree honoured. The executor's sublink result caches
+// key such a sublink on the enclosing rows as well (M0146-0079).
+func PlanReadsPastParent(node Node) bool {
+	return planHasEscapingOuterRef(node, 2)
+}
+
 // planHasEscapingOuterRef is planHasOuterRef's depth-aware worker.
 // depth is the Level value that would refer to node's own immediate
 // parent scope at the current nesting point (1 at the top call,

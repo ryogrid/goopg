@@ -1046,6 +1046,11 @@ type SubPlanSiteStats struct {
 	// hash-map path). A miss is normally followed by a Rebuild.
 	CacheHits   int64
 	CacheMisses int64
+
+	// readsPastParent caches optimizer.PlanReadsPastParent for the site's
+	// plan; scopeKnown marks it computed (scopedSublinkKey, M0146-0079).
+	readsPastParent bool
+	scopeKnown      bool
 }
 
 // SessionUserName returns the authenticated login role for this connection

@@ -222,7 +222,9 @@ func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Co
 	inBP := len(x.Plan.Output()) > 0 && bpcharCatalogType(x.Plan.Output()[0].Type)
 	opBP := declaredBpcharTypmod(x.Operand) > 0
 	opTrim := opBP || (isBareStringLit(x.Operand) && inBP)
-	key := nonCorrelatedCacheKey(x) + subPlanHashKeySuffix
+	// Same enclosing-row extension as the slice it is derived from
+	// (scopedSublinkKey, M0146-0079).
+	key := ctx.scopedSublinkKey(ctx.subPlanStat(x), x.Plan, nonCorrelatedCacheKey(x)) + subPlanHashKeySuffix
 	// The hash lives in the SCOPED store alongside the constant-key
 	// value slice it is derived from (see collectInValues: uncorrelated
 	// sublinks always use the scoped store because IsNonCorrelated is
@@ -429,7 +431,9 @@ func materializeSubPlanRowHash(x *optimizer.InExpr, width int, ctx *Context) (*s
 // first probe. served=false means "fall back to the linear path": the
 // recorded unusable sentinel or a width disagreement.
 func rowHashFor(x *optimizer.InExpr, width int, ctx *Context) (h *subPlanRowHash, err error, served bool) {
-	key := nonCorrelatedCacheKey(x) + subPlanRowHashKeySuffix
+	// Same enclosing-row extension as the slice it is derived from
+	// (scopedSublinkKey, M0146-0079).
+	key := ctx.scopedSublinkKey(ctx.subPlanStat(x), x.Plan, nonCorrelatedCacheKey(x)) + subPlanRowHashKeySuffix
 	// Scoped store, matching evalInHashProbe's reasoning: the hash
 	// shadows data whose IsNonCorrelated flag is only trustworthy until
 	// the depth changes, so it shares the scoped store's lifetime guard.

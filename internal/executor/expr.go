@@ -10739,9 +10739,9 @@ func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error
 				return nil, err
 			}
 		case x.IsNonCorrelated:
-			cacheKey = nonCorrelatedCacheKey(x)
+			cacheKey = ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 		default:
-			cacheKey = subqueryCacheKey(row)
+			cacheKey = ctx.scopedSublinkKey(stat, x.Plan, subqueryCacheKey(row))
 		}
 		// Correlated results may be cached only when the inner plan is
 		// free of volatile functions and LockRows (Stage 9 cacheability
@@ -10919,7 +10919,7 @@ func evalExistsExpr(x *optimizer.ExistsExpr, row Row, ctx *Context) (Datum, erro
 		// where lowering verified it, and a non-correlated EXISTS is
 		// never lowered (no params) — keep the historical
 		// clear-on-depth-change guard (Stage 10).
-		cacheKey := nonCorrelatedCacheKey(x)
+		cacheKey := ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 		if cached, ok := ctx.subqCacheGet(cacheKey, true); ok && len(cached) == 1 {
 			stat.CacheHits++
 			return cached[0], nil
@@ -11025,9 +11025,9 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 	case lowered:
 		cacheKey = loweredKey
 	case x.IsNonCorrelated:
-		cacheKey = nonCorrelatedCacheKey(x)
+		cacheKey = ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 	default:
-		cacheKey = fmt.Sprintf("%p|%s", x, subqueryCacheKey(row))
+		cacheKey = ctx.scopedSublinkKey(stat, x.Plan, fmt.Sprintf("%p|%s", x, subqueryCacheKey(row)))
 	}
 	// Correlated results may be served from the cache only when the
 	// inner plan is volatility/LockRows-free (Stage 9 gate, ch.07 M13);
