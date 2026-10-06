@@ -227,6 +227,18 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 			connTx.SeqLastName = ectx.LastSeqName
 		}
 	}
+	// Deliver NOTICEs as they are raised (a COPY FROM's trigger RAISE
+	// NOTICE included), as dispatch wires every other statement's context;
+	// otherwise they sat in ectx.Notices and were never sent (M0146-0055).
+	ectx.NoticeFlush = func(msg string) {
+		_ = w.WriteNoticeResponse([]libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+		_ = w.Flush()
+	}
 	streaming := false
 	defer func() {
 		if !streaming {

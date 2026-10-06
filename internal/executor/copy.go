@@ -222,6 +222,21 @@ type CopyFromExecutor struct {
 	// BeginCopyFrom prepares defexprs — so a volatile default such as
 	// random() or clock_timestamp() gets a fresh value per row (M0146-0054).
 	defaults []optimizer.Expr
+	// Trigger state (M0146-0055). PG's CopyFrom fires BEFORE STATEMENT
+	// before the first row, BEFORE ROW per row (ExecBRInsertTriggers,
+	// which may suppress the row), queues AFTER ROW events and fires them,
+	// then AFTER STATEMENT, when the statement ends (AfterTriggerEndQuery).
+	// hasRowBefore / hasRowAfter / hasStmtTriggers are computed once;
+	// stmtBegun / stmtEnded make the statement-level hooks fire exactly
+	// once whichever entry point (text, binary trailer, Finish) reaches
+	// them; afterRows holds the stored rows awaiting their AFTER ROW
+	// triggers.
+	hasRowBefore    bool
+	hasRowAfter     bool
+	hasStmtTriggers bool
+	stmtBegun       bool
+	stmtEnded       bool
+	afterRows       []Row
 	// lineNo is the 1-based physical line counter PG's CONTEXT message
 	// reports ("COPY tbl, line N", copyfromparse.c CopyFromErrorCallback).
 	// Incremented once per PushLine call, matching cur_lineno's per-line
@@ -412,11 +427,30 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor,
 		defaults[i] = pe
 	}
 
+	var hasRowBefore, hasRowAfter, hasStmtTriggers bool
+	for i := range plan.Table.Triggers {
+		tr := &plan.Table.Triggers[i]
+		if !triggerMatchesEvent(tr, "before", "insert") && !triggerMatchesEvent(tr, "after", "insert") {
+			continue
+		}
+		switch {
+		case !tr.ForEachRow:
+			hasStmtTriggers = true
+		case tr.Timing == catalog.TriggerBefore:
+			hasRowBefore = true
+		case tr.Timing == catalog.TriggerAfter:
+			hasRowAfter = true
+		}
+	}
+
 	return &CopyFromExecutor{
 		ctx:              ctx,
 		plan:             plan,
 		cols:             cols,
 		defaults:         defaults,
+		hasRowBefore:     hasRowBefore,
+		hasRowAfter:      hasRowAfter,
+		hasStmtTriggers:  hasStmtTriggers,
 		format:           format,
 		headerPending:    format.hasHeader(),
 		missing:          missing,
@@ -505,7 +539,49 @@ func (c *CopyFromExecutor) Finish() error {
 		c.csvPartial = c.csvPartial[:0]
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: "unterminated CSV quoted field"}
 	}
-	return c.flushBatch()
+	if err := c.flushBatch(); err != nil {
+		return err
+	}
+	return c.endStatement()
+}
+
+// beginStatement fires the BEFORE STATEMENT INSERT triggers once, ahead of
+// the first stored row (PG CopyFrom: ExecBSInsertTriggers before the row
+// loop).
+func (c *CopyFromExecutor) beginStatement() error {
+	if c.stmtBegun {
+		return nil
+	}
+	c.stmtBegun = true
+	if c.hasStmtTriggers {
+		return fireStatementTriggers(c.ctx, c.plan.Table, "before", "insert")
+	}
+	return nil
+}
+
+// endStatement runs once, after the last row is stored: the queued AFTER
+// ROW triggers in row order, then AFTER STATEMENT (PG: AfterTriggerEndQuery
+// fires the queued row events, ExecASInsertTriggers the statement ones). A
+// COPY that stored no rows still fires its statement triggers.
+func (c *CopyFromExecutor) endStatement() error {
+	if c.stmtEnded {
+		return nil
+	}
+	if err := c.beginStatement(); err != nil {
+		return err
+	}
+	c.stmtEnded = true
+	rows := c.afterRows
+	c.afterRows = nil
+	for _, row := range rows {
+		if _, _, err := fireTriggers(c.ctx, c.plan.Table, "after", "insert", nil, row); err != nil {
+			return err
+		}
+	}
+	if c.hasStmtTriggers {
+		return fireStatementTriggers(c.ctx, c.plan.Table, "after", "insert")
+	}
+	return nil
 }
 
 // InCsvQuotedField reports whether the reader is mid-record inside a
@@ -579,6 +655,9 @@ func (c *CopyFromExecutor) scatterSourceRow(src Row) Row {
 // inline its own write instead, skipping defaults, NOT NULL, CHECK and domain
 // constraints entirely (review/260831-2 EC-4).
 func (c *CopyFromExecutor) storeCopyRow(row Row) error {
+	if err := c.beginStatement(); err != nil {
+		return err
+	}
 	// M0134-0005l: apply the same default-filling and constraint sequence
 	// insertOp.Next runs, so COPY FROM stops silently accepting rows PG
 	// rejects and stops storing NULL where PG stores a default
@@ -594,6 +673,29 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		if err := c.fillDefaults(row); err != nil {
 			return err
 		}
+	}
+
+	// BEFORE ROW INSERT triggers see the row with its defaults and may
+	// replace or suppress it; constraints check what they return (PG
+	// CopyFrom: ExecBRInsertTriggers precedes ExecConstraints). A
+	// suppressed row is not stored and not counted (M0146-0055).
+	if c.hasRowBefore {
+		newRow, ok, err := fireTriggers(c.ctx, c.plan.Table, "before", "insert", nil, row)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		row = newRow
+	}
+	// Stored generated columns are computed after the BEFORE ROW triggers
+	// and before the constraints check them, the INSERT path's order
+	// (ExecComputeStoredGenerated in CopyFrom). COPY never computed them, so
+	// a GENERATED ALWAYS ... STORED column was stored NULL (M0146-0055).
+	_ = computeGeneratedColumns(c.cols, row)
+
+	if c.needsConstraints {
 
 		// NOT NULL constraint enforcement.
 		for i, col := range c.cols {
@@ -620,6 +722,11 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		}
 	}
 
+	// AFTER ROW INSERT events are queued and fire at statement end
+	// (endStatement), after every row is stored — PG's after-trigger queue.
+	if c.hasRowAfter {
+		c.afterRows = append(c.afterRows, row)
+	}
 	if c.multiInsert {
 		// CopyMultiInsertInfoStore + CopyMultiInsertInfoIsFull.
 		c.batch = append(c.batch, row)
@@ -743,6 +850,11 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 	}
 	if trailerFound {
 		if err := c.flushBatch(); err != nil {
+			return false, err
+		}
+		// The binary trailer ends the statement: the wire layers do not
+		// call Finish on this path (M0146-0055).
+		if err := c.endStatement(); err != nil {
 			return false, err
 		}
 	}
