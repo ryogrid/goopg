@@ -10130,12 +10130,19 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 	oldSlotBuf.Unlock()
 	ctx.Pool.Unpin(oldSlotBuf)
 
-	pinNewTarget := func() (*storage.Slot, storage.BlockNumber, error) {
+	// pinNewTarget picks the page for the new version: the relation's last
+	// block, or a freshly extended one. extend forces the extension. The
+	// retry needs it: without it the second attempt picked the same full
+	// last block again and failed "freshly extended page did not accept
+	// tuple" although no page had been extended (M0146-0078). Repeated
+	// CREATE OR REPLACE FUNCTION hit this as soon as pg_proc's last page
+	// filled up.
+	pinNewTarget := func(extend bool) (*storage.Slot, storage.BlockNumber, error) {
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			return nil, 0, err
 		}
-		if nBlocks > 0 && nBlocks-1 != oldTID.Block {
+		if !extend && nBlocks > 0 && nBlocks-1 != oldTID.Block {
 			blk := nBlocks - 1
 			s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 			if err != nil {
@@ -10150,7 +10157,7 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 		return s, blk, nil
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		newBuf, newBlk, err := pinNewTarget()
+		newBuf, newBlk, err := pinNewTarget(attempt > 0)
 		if err != nil {
 			return newTID, err
 		}
