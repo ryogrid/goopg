@@ -2837,6 +2837,7 @@ heuristic stays live.)
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-002`\).
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-001`\).
   - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-002`\).
+  - Recurred again in the 2026\-10\-07 nightly \(`AI-20261007-014030-002`\).
 - [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2848,6 +2849,40 @@ heuristic stays live.)
   - Recurred again in the 2026\-10\-02 nightly \(`AI-20261002-010412-003`\).
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-002`\).
   - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-003`\).
+  - Recurred again in the 2026\-10\-07 nightly \(`AI-20261007-014030-003`\).
+- [ ] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
+  (AI-20261007-014030-001; repro: `go test -v -run '^TestPort_IsolationAlterTable1$' ./internal/testport/`,
+  evidence `ci/logs/20261007-014030/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+  - Triage 2026\-10\-07 \(ralph2 loop\): there is one divergence,
+    `step sc1: COMMIT; <waiting ...>`, where PG prints a plain
+    `step sc1: COMMIT;`. The rest of the diff is the one\-line shift that
+    follows from it. The isolation runner decides `<waiting>` by a 300 ms
+    timeout alone \(no pg\_locks probe\), and the run overlapped this
+    loop\'s FORCE=1 SF0\.25 sweep and fire\-set gate \(02:29–02:59\). This is
+    most likely a load\-induced timing flake, not an engine defect\.
+    - Next: re\-run the repro on a quiet host. If it passes, close as stale.
+      If not, check whether a NOT VALID foreign\-key COMMIT really blocks.
+- [ ] **tpcds/stage\-startup\-20261007** — recurrence of the closed `tpcds/stage` task: nightly TPC\-DS stage failed at
+  startup: server not ready in 120 s
+  (AI-20261007-014030-004; repro: `bash ci/batch/stages/stage-tpcds.sh`,
+  evidence `ci/logs/20261007-014030/tpcds/`).
+  Kind: impl
+  Parent: none
+  - Triage 2026\-10\-07 \(ralph2 loop\): this is the class the closed
+    2026\-09\-24 entry described\. The goroutine dump shows startup in
+    `initdb/xact_recovery\.go` → `xlog/recovery_cache\.go` →
+    `xlog/reader\.go` `os\.ReadFile` of WAL segments\. The listener bound
+    at 02:37:51, five minutes after the 02:32:51 start\. The window again
+    overlapped this loop\'s FORCE=1 SF0\.25 sweep and fire\-set gate,
+    which copy multi\-GB clones\.
+    - Next: re\-run on a quiet host\. Independently, startup recovery reads
+      whole 16 MB segments with `os\.ReadFile`; a slow disk turns that into
+      minutes\. Check whether xact\_recovery needs to scan the full
+      segment range at all\.
+    - Loop lesson \(repeated\): the nightly batch runs from about 01:40\.
+      Disk\-heavy FORCE=1 gates in that window fail its stages\.
 - [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
@@ -28824,7 +28859,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       refused, A completes all 18 cases\.
     - Latent hazard filed as M0146\-0070\.
 Movement: none — instrument artefact — harness fix; no plan or estimate changes \(regress create\_index/stats short reads unchanged at 5, the M0146\-0069 class\)
-- [ ] **M0146\-0069 — the planner scans a catalog\-only \(storage\-less\) GIN
+- [x] **M0146\-0069 — the planner scans a catalog\-only \(storage\-less\) GIN
   index: `short read at block`** \(filed 2026\-10\-06 by M0146\-0056\)\. goopg
   registers gist/spgist/gin/brin indexes in the catalog only \(no physical
   storage, `operators\_ddl\.go` CREATE INDEX\), but `pathbitmap\.go`
@@ -28846,6 +28881,15 @@ Movement: none — instrument artefact — harness fix; no plan or estimate chan
     `nl\_index\_join\.go`, `paramappend\.go`\); some already filter
     \(`planner\.go:18472`, `groupingpaths\.go:996`\)\. Witness: the 3\-statement
     repro above as a unit test\.
+  - Done 2026\-10\-07 \(`a6327df08`; design
+    `docs/design/0100\-0149/m0146\-0069\-catalog\-only\-index\-never\-scanned\.md`\):
+    - `catalog\.Index\.HasStorage\(\)`; the six unguarded producer loops
+      \(bitmap ×2, param\-append, restriction, ordered, index\-only\) skip
+      storage\-less indexes\.
+    - Regress create\_index/stats/brin/spgist errors become results; the
+      remaining divergences are EXPLAIN shapes \(ledgered: no gist/gin/brin/
+      spgist storage\)\.
+Movement: none — instrument artefact — correctness, no TPC plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0070 — the catalog btree rebuild writes the metapage before
   extending the file** \(filed 2026\-10\-06 by M0146\-0056\)\.
   `rebuildSysBtreeWithNewEntry` \(`sys\_catalog\_btree\_multilevel\.go`\) overwrites
