@@ -28139,7 +28139,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: ctid keys compare as composite text, not `bttidcmp`;
       spilled ctid sort ~3x an int sort\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0053 — WRONG RESULTS: `\(n,n\)`\-shaped text compares wrong**
+- [x] **M0146\-0053 — WRONG RESULTS: `\(n,n\)`\-shaped text compares wrong**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT \'\(999,9\)\'::text >
   \'\(1241,10\)\'::text` returns f \(also with `COLLATE "C"`\); PG returns t\.
   `\'999,9\' > \'1241,10\'` and `\'a\(999,9\)\' > \'a\(1241,10\)\'` are right,
@@ -28157,6 +28157,39 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     text `\(b,o\)`; the fix must keep `ORDER BY ctid` ordered
     \(`TestSortByCTID`\), e\.g\. by typing the tid datum or by comparing
     by expression type rather than by value shape\.
+  - Done 2026\-10\-06 \(`1c612c421`; design
+    `docs/design/0100\-0149/m0146\-0053\-text\-compares\-as\-text\.md`\):
+    - A comparison of a character\-string expression compares as plain
+      text whenever the values\' shape would make `compareDatum` guess
+      \(`compareDatumTyped` / `compareDatumPlain`, `textShapeAmbiguous`\)\.
+    - Sites: BinaryOp in all three evaluators \(interpreted, compiled
+      payload bit, batched filter\), IS DISTINCT FROM, row comparison,
+      GREATEST/LEAST, the whole ordering family \(sort, incremental sort,
+      presorted, Gather Merge / Merge Append, window, distinct, merge
+      join, aggregate ORDER BY / WITHIN GROUP, grouping\-set order,
+      transport belt\), min/max and its parallel combine\.
+    - planner: `row\(\.\.\.\)` / RowExpr typed `record`, so a VALUES
+      column of rows keeps its element\-wise order\.
+    - Test `TestTextComparesAsText` \(33 statements × 2 builders; 42/66
+      fail at HEAD\); the UUID\-case test now pins PG\'s `f`\.
+    - Filed M0146\-0074 \(`||` treats `\{…\}` text as an array\)\.
+    - Ledgered: remaining guess sites, `pg\_typeof` of a VALUES row
+      column\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0074 — WRONG RESULTS: `||` treats `\{…\}`\-shaped text as an
+  array** \(filed 2026\-10\-06 by M0146\-0053\)\. `SELECT \'a\' ||
+  \'\{9\}\'::text` returns `\{a,9\}` and `\'\{1\}\'::text || \'\{2\}\'::text`
+  returns `\{1,2\}`; PG 18\.3 returns `a\{9\}` and `\{1\}\{2\}` \(textcat\)\.
+  Same root as M0146\-0053: the concatenation arm guesses array semantics
+  from the value\'s shape instead of the operand types\.
+  Kind: bug
+  Parent: M0146\-0053
+  > ## ESCALATION 2026\-10\-06 \(S2\) — text concatenation returns array results for `\{…\}` text
+  > Filed by M0146\-0053, not worked\. Owner: place M0146\-0074 in the banner\.
+  - First step: find the `||` evaluation \(`concatOperandsAsText` /
+    evalBinary `OpConcat` in `internal/executor/expr.go`, the compiled twin
+    in `exprnode.go`\) and gate the array arm on the operand types the way
+    M0146\-0053 gates comparisons \(`exprIsCharacterString`\)\.
 - [ ] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
   volatile default cannot be evaluated** \(filed 2026\-10\-04 by
   M0146\-0009h\)\. `COPY t\(a,b\)` into a table with `c float8 DEFAULT random\(\)`
