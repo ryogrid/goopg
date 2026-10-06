@@ -28176,6 +28176,21 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: remaining guess sites, `pg\_typeof` of a VALUES row
       column\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0075 — WRONG RESULTS: MERGE \.\.\. WHEN NOT MATCHED THEN
+  INSERT leaves an omitted column NULL** \(filed 2026\-10\-06 by
+  M0146\-0054\)\. Into `mv \(a int primary key, c float8 DEFAULT random\(\),
+  k text NOT NULL DEFAULT upper\(\'q\'\)\)`, `MERGE INTO mv USING src ON
+  mv\.a = src\.a WHEN NOT MATCHED THEN INSERT \(a\) VALUES \(src\.a\)` stores
+  `c` and `k` NULL \(no NOT NULL violation either\) and reports the command
+  tag `SELECT 0`; PG 18\.3 fills both defaults and reports `MERGE 2`\.
+  Kind: bug
+  Parent: M0146\-0054
+  > ## ESCALATION 2026\-10\-06 \(S2\) — MERGE INSERT stores NULL for defaulted columns and skips NOT NULL
+  > Filed by M0146\-0054, not worked\. Owner: place M0146\-0075 in the banner\.
+  - First step: `operators\_merge\.go` calls `applyDefaultsForMissing`
+    \(the weak evaluator\); resolve the INSERT action\'s omitted defaults
+    with `optimizer\.ResolveColumnDefault` as COPY now does, then check
+    why NOT NULL and the command tag are skipped on this path\.
 - [ ] **M0146\-0074 — WRONG RESULTS: `||` treats `\{…\}`\-shaped text as an
   array** \(filed 2026\-10\-06 by M0146\-0053\)\. `SELECT \'a\' ||
   \'\{9\}\'::text` returns `\{a,9\}` and `\'\{1\}\'::text || \'\{2\}\'::text`
@@ -28190,7 +28205,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     evalBinary `OpConcat` in `internal/executor/expr.go`, the compiled twin
     in `exprnode.go`\) and gate the array arm on the operand types the way
     M0146\-0053 gates comparisons \(`exprIsCharacterString`\)\.
-- [ ] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
+- [x] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
   volatile default cannot be evaluated** \(filed 2026\-10\-04 by
   M0146\-0009h\)\. `COPY t\(a,b\)` into a table with `c float8 DEFAULT random\(\)`
   \(or `timestamptz DEFAULT clock\_timestamp\(\)`\) stores c NULL in every
@@ -28201,6 +28216,20 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: M0146
   - First step: evaluate a missing column\'s default in COPY through the
     full expression evaluator INSERT uses, and fail loudly on an error\.
+  - Done 2026\-10\-06 \(`5dc730024`; design
+    `docs/design/0100\-0149/m0146\-0054\-copy\-evaluates\-defaults\.md`\):
+    - `optimizer\.ResolveColumnDefault` \+ `CopyFromExecutor\.defaults`:
+      omitted columns\' defaults are resolved once and evaluated per row
+      through `evalExprSlot`, coerced like INSERT\'s, and an evaluation
+      error fails the COPY\.
+    - `clock\_timestamp\(\)` reads the wall clock, not the statement
+      timestamp\.
+    - postmaster: the stand\-alone COPY Context shares the session\'s
+      currval map and saves lastval back when the COPY ends\.
+    - Test `TestCopyFromEvaluatesDefaultsPerRow`; regress `copy`
+      `parted\_si` now loads\.
+    - Filed M0146\-0075 \(MERGE INSERT leaves omitted defaults NULL\)\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
   triggers** \(filed 2026\-10\-04 by M0146\-0009h\)\. A BEFORE INSERT FOR EACH
   ROW trigger that sets `new\.b := new\.b \|\| \'\!\'` changes nothing on
