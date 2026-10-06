@@ -28111,6 +28111,25 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Filed M0146\-0078 \(repeated CREATE OR REPLACE FUNCTION fails a catalog
       page insert\)\.
 Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0079 — WRONG RESULTS: `= ANY \(subquery … OFFSET 0\)` inside a
+  LATERAL item returns rows PG filters out** \(filed 2026\-10\-06 by
+  M0146\-0073\)\. With `m79i\(f1\)` = \{0, 123456, \-123456\} and
+  `m79t\(unique1, unique2\)` = \{\(0,9998\), \(5,1000\), \(7,7\)\}: `select \*
+  from \(values \(0,9998\), \(1,1000\)\) v\(id,x\), lateral \(select f1 from m79i
+  where f1 = any \(select unique1 from m79t where unique2 = v\.x offset 0\)\)
+  ss` returns `0\|9998\|0` and `1\|1000\|0`; PG 18\.3 returns only
+  `0\|9998\|0`\. Without `offset 0`, and as a scalar subquery, goopg
+  matches PG\. Regress `join` shows the same query \(tenk1/int4\_tbl\)\.
+  Pre\-existing \(HEAD `890fdbfbd`\)\.
+  Kind: bug
+  Parent: M0146\-0073
+  > ## ESCALATION 2026\-10\-06 \(S2\) — a LATERAL item's correlated ANY\-sublink with OFFSET 0 returns extra rows
+  > Filed by M0146\-0073, not worked\. Owner: place M0146\-0079 in the banner\.
+  - First step: EXPLAIN \(VERBOSE\) the witness: goopg plans `Filter: \(ANY
+    \(f1 = \(SubPlan 1\)\.col1\)\)` over a `Limit` subplan reading `x`; check
+    which level `x` binds to under the lateral driver \(the pushed left row
+    vs the SubPlan\'s own outer\) and whether the Limit subplan is cached
+    across left rows \(SubqueryCache key without the correlated value\)\.
 - [ ] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
@@ -28125,7 +28144,7 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     heap insert that raises the message \(grep `freshly extended page`\)
     and why the tuple does not fit an empty page \(tuple size vs page
     free space, toasting of `prosrc`, a stale free\-space hint\)\.
-- [ ] **M0146\-0073 — retire the one\-relation index rule\'s correlated
+- [x] **M0146\-0073 — retire the one\-relation index rule\'s correlated
   half** \(filed 2026\-10\-06 by M0146\-0062\)\. M0146\-0012 slice 2 kept
   `planIndexScanFromWhere`\'s correlated probe because an outer key from a
   literal column \(`\(values \(0,9998\)\) v\(id,x\), lateral \(… where
@@ -28136,6 +28155,15 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
   Parent: M0146\-0062
   - First step: drop the correlated half, re\-run the regress `join` A/B
     and the fire set, and keep it only if a witness still needs it\.
+  - Done 2026\-10\-06 \(`5b50c57ba`; design
+    `docs/design/0100\-0149/m0146\-0073\-retire\-correlated\-index\-rule\.md`\):
+    - The column = outer\-column arm declines; `bitmapOverCorrelatedProbe`
+      deleted\. No plan changed \(sf025 99/99, fire set none, regress 8
+      files identical\)\.
+    - Filed M0146\-0079 \(S2: `= ANY \(… OFFSET 0\)` in a LATERAL item
+      returns an extra row\); ledgered the witness\'s Seq Scan where PG
+      index\-scans\.
+Movement: none — instrument artefact — dead\-rule retirement, no plan changed; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
   customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
