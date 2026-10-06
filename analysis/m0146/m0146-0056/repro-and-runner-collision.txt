@@ -1,0 +1,48 @@
+# M0146-0056 reproduction attempts and the runner-collision experiment (2026-10-06)
+
+## repro loop: 4 x the original 18-case set, fresh datadir each (binary at HEAD 0df99c775)
+iter 1 short-read-files=2 07:59
+iter 2 short-read-files=2 08:09
+iter 3 short-read-files=2 08:18
+iter 4 short-read-files=2 08:27
+done
+iter 1:       5 +ERROR:  short read at block 
+/tmp/rr56-1/create_index.diff:4 /tmp/rr56-1/stats.diff:1 
+iter 2:       5 +ERROR:  short read at block 
+/tmp/rr56-2/create_index.diff:4 /tmp/rr56-2/stats.diff:1 
+iter 3:       5 +ERROR:  short read at block 
+/tmp/rr56-3/create_index.diff:4 /tmp/rr56-3/stats.diff:1 
+iter 4:       5 +ERROR:  short read at block 
+/tmp/rr56-4/create_index.diff:4 /tmp/rr56-4/stats.diff:1 
+
+## experiment 1 (runner before the fix): runner A running, runner B started in the same tree
+B:
+pg-regress-runner: port 15435 is ALREADY in use by another server.
+  Refusing to auto-start: results would silently measure that server.
+  Reap the orphan (systemctl --user stop <scope>, or goopg stop -D <dir>)
+  or point at it deliberately with --port 15435.
+A (tail):
+      connection to server was lost
+======================================================================
+pg-regress-runner: 0/0 PASS (0% parity, 0 skipped)
+  diffs in: /tmp/rr56-A/
+pg-regress-runner: ABORTED — lost the server connection mid-run.
+  The counts above are INCOMPLETE and no case size from this run is usable.
+  Server log: /home/ryo/work/goopg/goopg/tmp/regress-goopg.log
+scripts/pg-regress-runner.sh: line 187: 2491371 Killed                  GOOPG_CG_UNIT="goopg-regress-runner" "${REPO_ROOT}/scripts/goopg-test-run.sh" "${REPO_ROOT}/bin/goopg" start -D "${GOOPG_DATADIR}" --listen "127.0.0.1:${PORT}" > "${GOOPG_LOG}" 2>&1
+
+## experiment 2 (runner after the fix): same sequence
+B:
+pg-regress-runner: another pg-regress-runner holds port 15435 (/tmp/goopg-regress-runner-15435.lock).
+  Refusing to start; wait for it to finish.
+A (tail):
+======================================================================
+pg-regress-runner: 0/18 PASS (0.0% parity, 0 skipped)
+  diffs in: /tmp/rr56-A2/
+scripts/pg-regress-runner.sh: line 197: 2494992 Killed                  GOOPG_CG_UNIT="goopg-regress-runner" "${REPO_ROOT}/scripts/goopg-test-run.sh" "${REPO_ROOT}/bin/goopg" start -D "${GOOPG_DATADIR}" --listen "127.0.0.1:${PORT}" > "${GOOPG_LOG}" 2>&1
+A short reads (GIN/BRIN class, M0146-0069):
+/tmp/rr56-A2/create_index.diff:4
+/tmp/rr56-A2/stats.diff:1
+
+## concurrent DDL stress on a throwaway server (port 5533): 2 sessions x 400 CREATE TABLE
+errors: a=0 b=0; pg_class rows 800; 14/14 regclass lookups through the name index before and after restart

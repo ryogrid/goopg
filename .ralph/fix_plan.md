@@ -28387,7 +28387,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
       `TestGetMemoizePathGates` updated\.
     - Design `docs/design/0100\-0149/m0146\-0005ea\-matpath\-after\-probes\-memoize\-cost\.md`\.
   Movement: yes — PLAN\-PARITY match SF0\.25 41→42, SF1 32→33
-- [ ] **M0146\-0056 — CORRUPTION: a system catalog index reads short at a
+- [x] **M0146\-0056 — CORRUPTION: a system catalog index reads short at a
   leaf it references** \(filed 2026\-10\-04 by M0146\-0009o\)\. One
   pg\-regress\-runner run \(18 planner cases, fresh `tmp/regress\-goopg\-data`\)
   failed `CREATE TABLE dupindexcols AS …` in `create\_index` with `DDL catalog
@@ -28409,6 +28409,58 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     vs. smgr nblocks; the VACUUM FSM truncation fix and
     `goopg\_smgr\_ocreate\_recreates\_removed\_files` are the nearest prior
     cases\)\.
+  - Done 2026\-10\-06 \(harness collision; design
+    `docs/design/0100\-0149/m0146\-0056\-regress\-runner\-datadir\-collision\.md`,
+    evidence `analysis/m0146/m0146\-0056/repro\-and\-runner\-collision\.txt`\):
+    - Four more runs of the 18\-case set with HEAD's binary: no catalog
+      wedge\. Each run shows the same five `short read` lines, which are the
+      GIN/BRIN class M0146\-0069, not the catalog index\.
+    - No catalog\-index or storage code changed after the incident\. Two
+      sessions × 400 CREATE TABLE left the name index consistent, before
+      and after a restart\.
+    - Cause: `pg\-regress\-runner\.sh`'s exit trap stopped the shared scope and
+      `rm \-rf`'d the shared datadir even when a second runner refused to
+      start\. Experiment: a refused runner B killed runner A's server
+      mid\-run\.
+    - Fix: a per\-port `flock` and ownership\-guarded cleanup\. Re\-run: B is
+      refused, A completes all 18 cases\.
+    - Latent hazard filed as M0146\-0070\.
+Movement: none — instrument artefact — harness fix; no plan or estimate changes \(regress create\_index/stats short reads unchanged at 5, the M0146\-0069 class\)
+- [ ] **M0146\-0069 — the planner scans a catalog\-only \(storage\-less\) GIN
+  index: `short read at block`** \(filed 2026\-10\-06 by M0146\-0056\)\. goopg
+  registers gist/spgist/gin/brin indexes in the catalog only \(no physical
+  storage, `operators\_ddl\.go` CREATE INDEX\), but `pathbitmap\.go`
+  buildOneBitmapPath offers a Bitmap Index Scan on any index of the table\.
+  `CREATE TABLE ge \(i int4\[\]\); CREATE INDEX ON ge USING gin \(i\); SELECT \*
+  FROM ge WHERE i = '\{47,77\}'` \(enable\_seqscan off, or whenever the bitmap
+  path wins\) fails `XX000: short read at block`; regress create\_index hits it
+  on every run \(its `array\_index\_op\_test` COPY fails on NULL array elements, so
+  the index is empty\)\. This is the create\_index "short read" the M0146\-0056
+  evidence counted, not the catalog\-index wedge\. Regress stats hits the same
+  class through BRIN \(`brin\_hot\_3\_a\_idx`: Bitmap Index Scan, then
+  `SELECT COUNT\(\*\) FROM brin\_hot\_3 WHERE a = 2` fails `short read at
+  block`\)\.
+  Kind: bug
+  Parent: M0146\-0056
+  - First step: skip `idx\.Method` other than btree \(and "" \) in every
+    planner index\-path producer \(`pathbitmap\.go`, `pathindexrestrict\.go`,
+    `pathindexonly\.go`, `pathindexordered\.go`, `pathparamindex\.go`,
+    `nl\_index\_join\.go`, `paramappend\.go`\); some already filter
+    \(`planner\.go:18472`, `groupingpaths\.go:996`\)\. Witness: the 3\-statement
+    repro above as a unit test\.
+- [ ] **M0146\-0070 — the catalog btree rebuild writes the metapage before
+  extending the file** \(filed 2026\-10\-06 by M0146\-0056\)\.
+  `rebuildSysBtreeWithNewEntry` \(`sys\_catalog\_btree\_multilevel\.go`\) overwrites
+  pages 0\.\.N\-1 in ascending order: the metapage and existing internal pages
+  first, `PinNew` for the new tail blocks after\. An error between the two
+  \(a victim\-flush failure in `PinNew`, the `PinNew returned blk` guard\)
+  leaves downlinks past EOF, the `pin leaf blk N: short read` signature\.
+  No witness reaches that path today\.
+  Kind: impl
+  Parent: M0146\-0056
+  - First step: write the new tail blocks first \(extend\), then the existing
+    pages, metapage last; a unit test that fails `PinNew` mid\-rebuild
+    \(fault hook\) and checks the old tree still reads\.
 - [x] **M0146\-0057 — WRONG RESULTS: a CTE read inside an IN/EXISTS sublink
   loses its body\'s WHERE** \(filed and fixed 2026\-10\-04 by M0146\-0007f\)\.
   `WITH x AS \(SELECT a, b FROM t WHERE b < 5\) SELECT count\(\*\) FROM u
