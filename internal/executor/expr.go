@@ -17976,7 +17976,11 @@ case "pg_char_to_encoding":
 		}
 	case "clock_timestamp":
 		// prorettype 1184 (timestamptz), like the now() family. M0119-0006.
-		return NewTimestampTZDatum(ctx.Now), nil
+		// Unlike now(), the actual current time — it advances within a
+		// statement (GetCurrentTimestamp, timestamp.c clock_timestamp), so a
+		// `DEFAULT clock_timestamp()` differs per row (M0146-0054). PG's
+		// timestamps have microsecond resolution.
+		return NewTimestampTZDatum(time.Now().Truncate(time.Microsecond)), nil
 	case "timeofday":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":

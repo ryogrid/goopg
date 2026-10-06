@@ -800,6 +800,16 @@ func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, err
 	return resolveExpr(e, singleBindingContext(table, "", DefaultPlannerSettings()))
 }
 
+// ResolveColumnDefault resolves a column's DEFAULT expression for per-row
+// evaluation by a statement that fills omitted columns outside an INSERT
+// plan — COPY FROM, whose BeginCopyFrom prepares each omitted column's
+// default once (build_column_default + ExecPrepareExpr, copyfrom.c) and
+// evaluates it per row. The resolve context is the one planInsert uses for
+// its appended defaults, so both paths compute the same value (M0146-0054).
+func ResolveColumnDefault(e parser.Expr, cat catalog.Catalog) (Expr, error) {
+	return resolveExpr(e, &resolveContext{cat: cat, settings: DefaultPlannerSettings()})
+}
+
 func appendSchema(left, right Schema) Schema {
 	out := make(Schema, 0, len(left)+len(right))
 	out = append(out, left...)

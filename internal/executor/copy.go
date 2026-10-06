@@ -216,6 +216,12 @@ type CopyFromExecutor struct {
 	plan   *optimizer.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
+	// defaults holds, per column, the resolved DEFAULT expression of a
+	// column the COPY column list omits (nil otherwise). Resolved once per
+	// statement and evaluated per row through the full evaluator, as PG's
+	// BeginCopyFrom prepares defexprs — so a volatile default such as
+	// random() or clock_timestamp() gets a fresh value per row (M0146-0054).
+	defaults []optimizer.Expr
 	// lineNo is the 1-based physical line counter PG's CONTEXT message
 	// reports ("COPY tbl, line N", copyfromparse.c CopyFromErrorCallback).
 	// Incremented once per PushLine call, matching cur_lineno's per-line
@@ -303,7 +309,7 @@ func NewCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor,
 	if ctx.Pool == nil || ctx.Catalog == nil || ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "XX000", Pos: plan.Pos(), Message: "COPY FROM requires storage handles in Context"}
 	}
-	return newCopyFromExecutor(ctx, plan), nil
+	return newCopyFromExecutor(ctx, plan)
 }
 
 // newCopyFromExecutor builds the executor without the endpoint/handle
@@ -344,7 +350,7 @@ func resolveCopyFromEncoding(opts []parser.CopyOption, getSetting func(string) (
 	return id
 }
 
-func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
+func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor, error) {
 	format := copyToFormatFromOptions(plan.Options)
 	cols := plan.Table.Columns
 
@@ -381,17 +387,43 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 		}
 	}
 
+	// The omitted columns' defaults, resolved once (copyfrom.c BeginCopyFrom:
+	// build_column_default + ExecPrepareExpr for every column not in the
+	// attribute list). GENERATED ALWAYS columns are computed later, and a
+	// serial/identity column carries no DefaultExpr (its nextval is
+	// autoGenerateSerialValues'), exactly as planInsert's
+	// defaultAppendableColumns excludes them.
+	var defaults []optimizer.Expr
+	for i, col := range cols {
+		if !missing[i] || col.DefaultExpr == nil || col.GeneratedAlways {
+			continue
+		}
+		var cat catalog.Catalog
+		if ctx != nil {
+			cat = ctx.Catalog
+		}
+		pe, err := optimizer.ResolveColumnDefault(col.DefaultExpr, cat)
+		if err != nil {
+			return nil, err
+		}
+		if defaults == nil {
+			defaults = make([]optimizer.Expr, len(cols))
+		}
+		defaults[i] = pe
+	}
+
 	return &CopyFromExecutor{
 		ctx:              ctx,
 		plan:             plan,
 		cols:             cols,
+		defaults:         defaults,
 		format:           format,
 		headerPending:    format.hasHeader(),
 		missing:          missing,
 		needsConstraints: needsConstraints,
 		srcEnc:           srcEnc,
 		multiInsert:      copyUsesMultiInsert(ctx, plan.Table, cols, missing),
-	}
+	}, nil
 }
 
 // PushLine decodes one COPY TEXT or COPY CSV row and inserts it. line
@@ -559,7 +591,9 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		// column present in the list but holding an explicit NULL is NOT
 		// "missing" — c.missing only marks columns plan.ColumnIndex never
 		// targets, matching PG's defmap.
-		applyDefaultsForMissing(c.cols, row, c.missing, ctxSeqDBOid(c.ctx))
+		if err := c.fillDefaults(row); err != nil {
+			return err
+		}
 
 		// NOT NULL constraint enforcement.
 		for i, col := range c.cols {
@@ -806,7 +840,10 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 	defer f.Close()
 
 	// Build a CopyFromExecutor directly (bypassing rejectFileEndpoint).
-	fe := newCopyFromExecutor(ctx, plan)
+	fe, err := newCopyFromExecutor(ctx, plan)
+	if err != nil {
+		return 0, err
+	}
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
@@ -827,4 +864,29 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 		return fe.rowsIn, err
 	}
 	return fe.rowsIn, nil
+}
+
+// fillDefaults evaluates each omitted column's DEFAULT for one row through
+// the full expression evaluator, then coerces the value to the column type
+// the way the INSERT path coerces its appended defaults. An evaluation
+// error fails the COPY, as PG's ExecEvalExpr does — never a silent NULL
+// (M0146-0054; the old applyDefaultsForMissing route knew only a handful
+// of functions and left anything else NULL).
+func (c *CopyFromExecutor) fillDefaults(row Row) error {
+	if c.defaults == nil {
+		return nil
+	}
+	for i, e := range c.defaults {
+		if e == nil || i >= len(row) {
+			continue
+		}
+		v, err := evalExprSlot(e, nil, c.ctx)
+		if err != nil {
+			return err
+		}
+		row[i] = v.MaterializeArena()
+	}
+	return coerceRowForConstraintChecks(c.cols, row, func(i int) bool {
+		return i < len(c.defaults) && c.defaults[i] != nil
+	}, c.ctx, c.plan.Pos())
 }
