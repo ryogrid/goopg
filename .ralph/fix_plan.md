@@ -28001,7 +28001,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     search\)\.
     Kind: recon
     Parent: M0146\-0049
-- [ ] **M0146\-0050 — WRONG RESULTS: a correlated CTE inside a correlated
+- [x] **M0146\-0050 — WRONG RESULTS: a correlated CTE inside a correlated
   subplan replays its first execution** \(filed 2026\-10\-03 by M0146\-0049d2\)\.
   `SELECT g, \(SELECT k FROM \(WITH c AS MATERIALIZED \(SELECT g\*2 AS k\)
   SELECT k FROM c\) z\) FROM generate\_series\(1,3\) g` returns `1\|2, 2\|2,
@@ -28020,6 +28020,45 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     correlated sublink its own `CTERowCache` window as `bindOuter` does
     for LATERAL; correlated bodies only, since uncorrelated ones now live
     in `CTEStableCache` \(M0146\-0049d2\)\.
+  - Done 2026\-10\-06 \(`0f7cc6d6b`; design
+    `docs/design/0100\-0149/m0146\-0050\-correlated\-sublink\-cte\-rematerialise\.md`\):
+    - `enterSublinkCTEWindow` gives each correlated sublink execution its own
+      `CTERowCache` window, seeded from the enclosing scope, at all seven
+      evaluation sites\.
+    - `walkPlanExprs` now walks every ProjectSet SRF argument\. A
+      `generate\_series\(1, g\)` body had made the sublink look uncorrelated,
+      so it ran as an InitPlan\.
+    - `TestCorrelatedSublinkCTERematerialises`: five of six cases fail at
+      HEAD\.
+    - Filed M0146\-0071 \(a twice\-read correlated CTE, lateral misbinding\)\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0071 — WRONG RESULTS: a correlated CTE read twice inside a
+  sublink binds its outer reference to the join's left row** \(filed
+  2026\-10\-06 by M0146\-0050\)\. `SELECT g, \(WITH c AS MATERIALIZED \(SELECT
+  g\*2 AS k\) SELECT c\.k \|\| '/' \|\| c2\.k FROM c, c AS c2\) FROM
+  generate\_series\(1,3\) g` returns `1\|2/4, 2\|4/8, 3\|6/12`; PG 18\.3 returns
+  `2/2, 4/4, 6/6` \(`sum\(c\.k \+ c2\.k\)` 6g where PG gives 4g\)\. Pre\-existing
+  \(same at HEAD before M0146\-0050\)\.
+  Kind: bug
+  Parent: M0146\-0050
+  > ## ESCALATION 2026\-10\-06 \(S2\) — a twice\-read correlated CTE in a sublink
+  > returns wrong rows
+  > M0146\-0071: the second reference re\-materialises the CTE body with the
+  > join's left row standing in for the outer `g`\. Filed, not worked\.
+  > Owner: place it in the banner\.
+  - Cause \(read, not instrumented\): the CTE body reads the outer row, so
+    `planHasEscapingOuterRef` sees the second CTE scan as depending on its
+    left sibling, and the join is run as a LATERAL join\.
+    `lateralJoinStream\.bindOuter` then pushes the left row onto
+    `ctx\.OuterRows` and swaps in a fresh `CTERowCache`\. The second scan
+    re\-materialises the body, and its level\-1 `g` resolves to the pushed
+    row \(`k`\)\. PG shares one tuplestore between both references
+    \(ctescan\.c, leader/reader\) and evaluates the body once per subplan
+    execution\.
+  - First step: a CTE scan's own outer references must not make the join
+    above it lateral \(they belong to the CTE's declaring scope, not to the
+    left sibling\); probe `chainCarriesLateral` / the join's `Lateral` flag
+    on this query\.
 - [ ] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
   customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
