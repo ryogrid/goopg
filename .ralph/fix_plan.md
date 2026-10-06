@@ -28059,6 +28059,19 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     above it lateral \(they belong to the CTE's declaring scope, not to the
     left sibling\); probe `chainCarriesLateral` / the join's `Lateral` flag
     on this query\.
+- [ ] **M0146\-0072 — a PL/pgSQL variable in a statement with a WITH clause
+  is not substituted** \(filed 2026\-10\-06 by M0146\-0059\)\. Inside a
+  PL/pgSQL function, `v := \(WITH x AS \(SELECT g FROM generate\_series\(10,11\)
+  g\) SELECT \(sum\(x\.g\) \* i\)::text FROM x\)` fails `42703: column "i" does
+  not exist`. A record field in the CTE body \(`r\.g`\) fails `missing
+  FROM\-clause entry for table "r"`. PG 18\.3 binds both as parameters\.
+  Kind: bug
+  Parent: M0146\-0059
+  - First step: find where the PL/pgSQL expression path substitutes
+    variables into the statement text or AST \(the M0134\-0014 synthetic
+    SELECT route, `evalExprViaSQL` / `evalScalarSubquery` in
+    `plpgsql\_runtime\.go`\), and why a `WithClause` and its CTE bodies are
+    skipped\.
 - [ ] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
   customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
@@ -28558,7 +28571,7 @@ Movement: none — instrument artefact — harness fix; no plan or estimate chan
     - Ledgered: PG's flat pull\-up of a function\-call target, and the arm's
       duplicate Join Filter and `upper` label\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0059 — WRONG RESULTS: a kept CTE\'s rows survive into the next
+- [x] **M0146\-0059 — WRONG RESULTS: a kept CTE\'s rows survive into the next
   statement of a PL/pgSQL function** \(filed 2026\-10\-04 by M0146\-0007f\)\.
   A function that runs `r1 := \(WITH x AS \(SELECT a, b FROM t WHERE b < 5\)
   SELECT count\(\*\)::text FROM x, x x2 WHERE x\.a = x2\.a\);` and then
@@ -28580,6 +28593,16 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: scope the cache to one statement execution \(clear or re\-key
     `ctx\.CTERowCache` at the statement boundary the PL/pgSQL executor
     crosses\), then pin the function above as a test\.
+  - Done 2026\-10\-06 \(`f439c26e6`; design
+    `docs/design/0100\-0149/m0146\-0059\-statement\-scoped\-cte\-cache\.md`\):
+    - `stmtCTEScopeOp` swaps a statement's own `CTERowCache` /
+      `CTEStableCache` in around each Open/Next/Close of its root operator\.
+    - Applied at all eleven routine statement sites and in
+      `executor\.Run`\.
+    - `TestCTEMaterialisationIsStatementScoped`: three of four cases fail
+      at HEAD\.
+    - Filed M0146\-0072 \(PL variables not substituted in a WITH statement\)\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0009q — a CTE Scan over a Finalize aggregate estimates a
   tenth of its CTE\'s rows** \(filed 2026\-10\-04 by M0146\-0005 slice 116\)\.
   TPC\-DS Q59 at SF1: CTE `wss` is `Finalize HashAggregate … rows=62646`
