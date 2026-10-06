@@ -28083,7 +28083,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: M0146\-0062
   - First step: drop the correlated half, re\-run the regress `join` A/B
     and the fire set, and keep it only if a witness still needs it\.
-- [ ] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
+- [x] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
   customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
   Sort → Parallel Seq Scan\) returns 0; PG returns 150000\. A serial plan
@@ -28100,6 +28100,20 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     column into the rows it ships through Gather / Gather Merge \(the
     rowmark ledger row of 2026\-09\-19 names the same wrappers for
     `wireRowMarkCtidColumns`\)\.
+  - Done 2026\-10\-06 \(`19db7a266`; design
+    `docs/design/0100\-0149/m0146\-0051\-ctid\-through\-gather\.md`\):
+    - Cause: a row\'s tid rides the slot \(`hasCTID`\), and
+      `transferRowForQueue` ships only Datums, so worker rows lost it; the
+      `wantCTIDs` marker stopped at the gather and at the slab `OpAdapter`\.
+    - `markSortWantCTIDs` marks `gatherOp` / `gatherMergeOp`, which
+      re\-apply it to every participant tree; workers send
+      `rowBatch\.tids`; Gather Merge evaluates merge keys on a tid\-bearing
+      slot \(`evalSortKeyValueSlot`\); `markSlabSorts` delegates an
+      `OpAdapter`\.
+    - Test `TestCTIDSurvivesGather` \(both builders, PG values\)\.
+    - Ledgered: PG projects ctid as a scan column; a non\-spine consumer
+      \(join qual\) above a gather still reads NULL\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0052 — WRONG RESULTS: `ORDER BY ctid DESC` returns ascending
   order** \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT ctid FROM nation
   ORDER BY ctid DESC LIMIT 2` on the TPC\-H reference cluster returns
@@ -28108,6 +28122,11 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: M0146
   - First step: find the sort comparator for `tid` keys and how the DESC
     flag reaches it\.
+  - Finding 2026\-10\-06 \(M0146\-0051\): the keys are never `tid`s at
+    all\. `sortOp\.sortKeyVals` evaluates each key on the bare Row
+    \(`evalSortKeyValue`\), where `CTIDExpr` reads NULL, so every key is
+    NULL and the sort keeps input order\. Evaluate on the materialised
+    slot with `evalSortKeyValueSlot` \(added by M0146\-0051\)\.
 - [ ] **M0146\-0053 — WRONG RESULTS: `\(n,n\)`\-shaped text compares wrong**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT \'\(999,9\)\'::text >
   \'\(1241,10\)\'::text` returns f \(also with `COLLATE "C"`\); PG returns t\.
