@@ -3,8 +3,6 @@ package executor
 import (
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestPlpgSQLSublinkExprSQLFallback pins M0134-0014c: PL/pgSQL expressions
@@ -148,17 +146,13 @@ $$`)
 	})
 }
 
-// TestPlpgSQLSublinkExprFrameVariableDeferred pins the DEFERRED limitation
-// documented in docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md
-// §"Known limitation": evalExprViaSQL (like the pre-existing
-// evalScalarSubquery) plans the raw parser expression with NO PL/pgSQL
-// frame-variable substitution, so a plpgsql variable referenced inside the
-// sublink is not visible to the planner and fails with 42703 ("column ...
-// does not exist") rather than resolving from the calling frame. A future
-// loop implementing frame-variable binding (threading frame values into
-// optimizer.Plan as bound parameters, mirroring PG's SPI paramLI) must
-// update this test deliberately when it lands.
-func TestPlpgSQLSublinkExprFrameVariableDeferred(t *testing.T) {
+// TestPlpgSQLSublinkExprFrameVariableBound pins the frame-variable binding
+// that docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md listed as a
+// known limitation: a plpgsql variable referenced inside a sublink resolves
+// from the calling frame, as PG binds it as a parameter (pl_exec.c
+// plpgsql_param_ref). Until M0146-0072 the SQL fallback planned the raw tree
+// and failed 42703 `column "i" does not exist`; PG 18.3 returns 'yes'.
+func TestPlpgSQLSublinkExprFrameVariableBound(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
@@ -180,22 +174,11 @@ $$`); err != nil {
 		t.Fatalf("create function: %v", err)
 	}
 
-	err := runQueryExpectErr(ctx, `SELECT sub_fv_ref()`)
-	if err == nil {
-		t.Fatalf("sub_fv_ref() expected an error (frame-variable binding into a sublink is deferred), got none")
+	rows, err := runQueryWithErr(ctx, `SELECT sub_fv_ref()`)
+	if err != nil {
+		t.Fatalf("sub_fv_ref(): %v (the variable inside EXISTS must bind to the frame)", err)
 	}
-	// evalExprViaSQL plans the sublink expression via optimizer.Plan directly
-	// (no frame-variable substitution), so the unresolved reference to the
-	// plpgsql variable "i" surfaces as a planner error, not the interpreter's
-	// *ExecError.
-	pe, ok := err.(*optimizer.PlanError)
-	if !ok {
-		t.Fatalf("sub_fv_ref() error = %v (%T), want *optimizer.PlanError", err, err)
-	}
-	if pe.Code != "42703" {
-		t.Errorf("sub_fv_ref() SQLSTATE = %q, want 42703 (column %q does not exist)", pe.Code, "i")
-	}
-	if !strings.Contains(pe.Message, "\"i\"") {
-		t.Errorf("sub_fv_ref() message = %q, want it to reference column \"i\"", pe.Message)
+	if got := strings.Join(renderRows(rows), ";"); got != "yes" {
+		t.Errorf("sub_fv_ref() = %s, want PG's yes", got)
 	}
 }

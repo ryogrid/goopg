@@ -1036,7 +1036,14 @@ func parseExprFromTokens(toks []parser.Token) (parser.Expr, error) {
 // executor binds the first result row to the named variable(s). M0118-0008.
 func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 	startPos := p.cur().Pos
-	isSelect := p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwSelect
+	// A WITH-led query takes the same PL/pgSQL INTO clause as a SELECT
+	// (`WITH x AS (…) SELECT count(*) INTO n FROM x`; pl_gram.y
+	// make_execsql_stmt recognises INTO in any command). Before M0146-0072
+	// only a leading SELECT did, so the INTO target was substituted as a
+	// variable and the statement failed `syntax error at or near "NULL"`.
+	first := p.cur()
+	isSelect := first.Kind == parser.TokenKeyword && (first.Keyword == parser.KwSelect || first.Keyword == parser.KwWith)
+	var prev parser.Token
 	depth := 0
 	intoByteStart := -1 // byte offset of the INTO token (once found)
 	targetsEndByte := -1
@@ -1049,7 +1056,11 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
 			depth--
 		} else if isSelect && depth == 0 && intoByteStart < 0 &&
-			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto {
+			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto &&
+			// `INSERT INTO` / `MERGE INTO` inside a WITH-led command are the
+			// main grammar's INTO, not a variables clause (make_execsql_stmt
+			// skips INTO right after INSERT or MERGE).
+			!(prev.Kind == parser.TokenKeyword && (prev.Keyword == parser.KwInsert || prev.Keyword == parser.KwMerge)) {
 			// Top-level INTO clause: capture its byte span and parse the
 			// target variable list, then resume scanning for `;` from the
 			// token that ends the list (e.g. FROM).
@@ -1098,6 +1109,7 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 			sql := strings.TrimSpace(p.src[startPos:endPos])
 			return &SQLStmt{pos: startPos, SQL: sql}, nil
 		}
+		prev = t
 		p.advance()
 	}
 	return nil, p.errAtCur("unterminated embedded SQL statement")

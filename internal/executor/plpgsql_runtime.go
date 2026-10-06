@@ -2435,9 +2435,9 @@ func wrapNeedsSQL(ee *ExecError) error {
 // zero-width row) yields a NULL Datum{}. The AST is built directly — not
 // re-parsed from generated SQL text, since an expression has no reliable
 // textual round-trip. docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md
-// §Design step 3. Known limitation: this plans e untouched, with no
-// PL/pgSQL frame-variable substitution (same limitation evalScalarSubquery
-// already has for sq.Inner) — see the design doc's §"Known limitation".
+// §Design step 3. The caller binds the frame's variables into e first
+// (bindPlpgsqlFrameVarsInExpr, M0146-0072); evalScalarSubquery's caller
+// does the same for sq.
 func evalExprViaSQL(e parser.Expr, ctx *Context) (Datum, error) {
 	stmt := &parser.SelectStmt{
 		Targets: []parser.ResTarget{{Expr: e}},
@@ -2477,6 +2477,12 @@ func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, e
 	// context as returning the first column of the first row (NULL if no row).
 	// M0118-0008 (plpgsql-toast assign2).
 	if sq, ok := e.(*parser.SubqueryExpr); ok {
+		// The subquery's variable references (a WITH clause and its CTE
+		// bodies included) bind to the frame's current values, as PG's
+		// parameters do (M0146-0072).
+		if bound, ok := bindPlpgsqlFrameVarsInExpr(sq, frame).(*parser.SubqueryExpr); ok {
+			sq = bound
+		}
 		return evalScalarSubquery(sq, ctx)
 	}
 	pe, err := lowerPLpgSQLExpr(e, frame)
@@ -2488,7 +2494,7 @@ func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, e
 		// PostgreSQL always does. docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md
 		// §Design steps 2/4, M0134-0014c.
 		if errors.Is(err, errPLpgSQLExprNeedsSQL) {
-			return evalExprViaSQL(e, ctx)
+			return evalExprViaSQL(bindPlpgsqlFrameVarsInExpr(e, frame), ctx)
 		}
 		return Datum{}, err
 	}
