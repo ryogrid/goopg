@@ -60,6 +60,10 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 		// Generate single-index bitmap paths, collecting them for AND combination.
 		var singlePaths []*Path
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, totalPages, maxEntries, rel.baseLeaf); p != nil {
 				singlePaths = append(singlePaths, p)
 			}
@@ -562,6 +566,10 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 		added := false
 		for _, req := range consideredParameterizations(cands) {
 			for _, idx := range cat.IndexesOnTable(tbl) {
+				// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+				if !idx.HasStorage() {
+					continue
+				}
 				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
 					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
 					addPath(rel, pth, "bitmap.or")

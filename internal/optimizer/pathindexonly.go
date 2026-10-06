@@ -74,6 +74,10 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			var clauses []indexPathClause
 			if !bare {
 				var ok bool

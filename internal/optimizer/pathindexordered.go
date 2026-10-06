@@ -150,6 +150,10 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if s.addOneOrderedIndexPath(rel, tbl, idx, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}

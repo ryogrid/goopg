@@ -206,6 +206,10 @@ func (s *searchCtx) paramAppendPathFor(rel *RelOptInfo, so *SetOp, members []Nod
 		}
 		maxEntries := bitmapMaxEntries(s.cp.workMem)
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if pth := s.buildOneParameterizedBitmapPath(member, tbl, idx, mcands, req,
 				relPages, relTuples, T, totalPages, maxEntries); pth != nil {
 				addPath(member, pth, "param-append.bitmap")

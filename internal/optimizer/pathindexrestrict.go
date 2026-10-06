@@ -69,6 +69,10 @@ func (s *searchCtx) addRestrictionIndexPaths(cat catalog.Catalog) {
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if s.addOneRestrictionIndexPath(cat, rel, tbl, idx, conjuncts, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}

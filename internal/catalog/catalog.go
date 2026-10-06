@@ -1574,6 +1574,15 @@ type Trigger struct {
 	Args       []string // trigger function arguments (TG_ARGV)
 }
 
+// HasStorage reports whether the index has physical storage a scan can read.
+// Only the btree access method (and `USING hash`, built on it with Method left
+// "btree") is built; gist, spgist, gin and brin indexes are registered in the
+// catalog only (operators_ddl.go CREATE INDEX), so the planner must never
+// offer a scan of one (M0146-0069).
+func (ix *Index) HasStorage() bool {
+	return ix != nil && (ix.Method == "" || strings.EqualFold(ix.Method, "btree"))
+}
+
 // triggerUpdateColAttrs renders a column-specific UPDATE trigger's column list
 // as pg_trigger.tgattr, a space-separated int2vector of 1-based attnums (the
 // same text form pg_index.indkey uses). An unresolved column name is skipped;
