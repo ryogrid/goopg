@@ -25,6 +25,7 @@ import (
 // M0096-0010.
 type mergeOp struct {
 	plan         *optimizer.Merge
+	updCols      map[string]bool // updateColumns' cache
 	ctx          *Context
 	rowsAffected int64
 	done         bool
@@ -140,7 +141,67 @@ func (o *mergeOp) collectReturningRow(action optimizer.MergeActionKind, oldRow, 
 	o.retRows = append(o.retRows, retRow)
 }
 
+// Next fires the statement-level triggers around the single processing
+// pass, for each command the WHEN clauses can perform (fireBSTriggers /
+// fireASTriggers for CMD_MERGE, nodeModifyTable.c; M0146-0076): BEFORE
+// STATEMENT in INSERT, UPDATE, DELETE order, AFTER STATEMENT in DELETE,
+// UPDATE, INSERT order.
 func (o *mergeOp) Next() (TupleSlot, error) {
+	tbl := o.plan.Target
+	if o.done || tbl == nil || len(tbl.Triggers) == 0 {
+		return o.next()
+	}
+	var has [3]bool // insert, update, delete
+	for _, c := range o.plan.Clauses {
+		switch c.Action {
+		case optimizer.MergeActionInsert:
+			has[0] = true
+		case optimizer.MergeActionUpdate:
+			has[1] = true
+		case optimizer.MergeActionDelete:
+			has[2] = true
+		}
+	}
+	events := [3]string{"insert", "update", "delete"}
+	cols := [3]map[string]bool{1: o.updateColumns()}
+	for i, ev := range events {
+		if has[i] {
+			if err := fireBeforeStatementTriggers(o.ctx, tbl, ev, cols[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if has[i] {
+			if qerr := queueAfterStatementTriggers(o.ctx, tbl, events[i], cols[i]); qerr != nil {
+				return nil, qerr
+			}
+		}
+	}
+	return slot, err
+}
+
+// updateColumns is the union of the UPDATE actions' target columns (the
+// RTE's updatedCols), which decides whether a column-specific `UPDATE OF`
+// trigger fires (M0146-0076).
+func (o *mergeOp) updateColumns() map[string]bool {
+	if o.updCols == nil {
+		var sets [][]optimizer.Expr
+		for _, c := range o.plan.Clauses {
+			if c.Action == optimizer.MergeActionUpdate {
+				sets = append(sets, c.UpdateSet)
+			}
+		}
+		o.updCols = updateTargetColumns(o.plan.Target.Columns, sets...)
+	}
+	return o.updCols
+}
+
+func (o *mergeOp) next() (TupleSlot, error) {
 	// Yield pre-collected RETURNING rows on subsequent calls.
 	if o.done {
 		if o.retIdx < len(o.retRows) {
@@ -578,6 +639,12 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			// M0125-0052: a MERGE running as a data-modifying CTE fences the
 			// rows it writes from the rest of the statement, like INSERT.
 			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
+			// AFTER INSERT triggers, queued to the end of the query (M0146-0076).
+			if len(insertTbl.Triggers) > 0 {
+				if err := queueAfterRowTriggers(o.ctx, insertTbl, "insert", nil, row, nil); err != nil {
+					return nil, err
+				}
+			}
 			o.rowsAffected++
 			o.collectReturningRow(optimizer.MergeActionInsert, nil, row)
 			break // first matching clause wins
@@ -618,7 +685,7 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		}
 		switch mod.action {
 		case optimizer.MergeActionUpdate:
-			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, o.plan.Pos())
+			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, o.plan.Pos(), o.updateColumns())
 		case optimizer.MergeActionDelete:
 			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeTgtRow, o.plan.Pos())
 		default:
@@ -844,7 +911,7 @@ func mergeClauseCondMatches(clause *optimizer.MergeWhenClause, row Row, ctx *Con
 // mergeApplyUpdate writes a MERGE MATCHED UPDATE.  destRel/destCols specify the
 // destination partition for cross-partition moves (same as rel/cols when the row
 // stays in the same partition). M0100-0007.
-func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, destRel storage.RelFileNode, destCols []catalog.Column, pos int) error {
+func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, destRel storage.RelFileNode, destCols []catalog.Column, pos int, updCols map[string]bool) error {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -907,7 +974,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 
 	// Fire BEFORE UPDATE trigger with the confirmed live row values. M0100-0005.
 	if tbl != nil && len(tbl.Triggers) > 0 {
-		retRow, ok, err := fireTriggers(ctx, tbl, "before", "update", tgtRow, newRow)
+		retRow, ok, err := fireTriggersCols(ctx, tbl, "before", "update", tgtRow, newRow, updCols)
 		if err != nil {
 			return err
 		}
@@ -976,6 +1043,10 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if cerr := stampOldCtid(ctx, rel, blk, slot, newPtr); cerr != nil {
 			return cerr
 		}
+	}
+	// AFTER UPDATE triggers, queued to the end of the query (M0146-0076).
+	if tbl != nil && len(tbl.Triggers) > 0 {
+		return queueAfterRowTriggers(ctx, tbl, "update", tgtRow, newRow, updCols)
 	}
 	return nil
 }
@@ -1081,5 +1152,9 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		return derr
 	}
 	// M0125-0053: MERGE's WHEN MATCHED THEN DELETE twin of the deleteOp reveal.
+	// AFTER DELETE triggers, queued to the end of the query (M0146-0076).
+	if tbl != nil && len(tbl.Triggers) > 0 {
+		return queueAfterRowTriggers(ctx, tbl, "delete", tgtRow, nil, nil)
+	}
 	return nil
 }

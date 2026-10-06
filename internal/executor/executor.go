@@ -860,11 +860,15 @@ func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
 // enclosing statement that is still replaying its own CTE scans keeps its
 // caches, and a statement whose operator outlives its caller (a cursor
 // fetched by later statements) never leaks its entries into them.
+//
+// It also owns the statement's AFTER trigger query level (M0146-0076),
+// swapped in the same way and fired once the root has closed cleanly.
 type stmtCTEScopeOp struct {
 	Operator
 	ctx    *Context
 	rows   map[string][]Row
 	stable map[string][]Row
+	trig   stmtAfterTriggers
 }
 
 // scopeStatementCTEs wraps op, the root of one statement's operator tree.
@@ -894,7 +898,9 @@ func (o *stmtCTEScopeOp) enter() func() {
 	}
 	savedRows, savedStable := ctx.CTERowCache, ctx.CTEStableCache
 	ctx.CTERowCache, ctx.CTEStableCache = o.rows, o.stable
+	savedTrig := o.trig.swapIn(ctx)
 	return func() {
+		o.trig.swapOut(ctx, savedTrig)
 		o.rows, o.stable = ctx.CTERowCache, ctx.CTEStableCache
 		ctx.CTERowCache, ctx.CTEStableCache = savedRows, savedStable
 	}
@@ -902,16 +908,21 @@ func (o *stmtCTEScopeOp) enter() func() {
 
 func (o *stmtCTEScopeOp) Open(ctx *Context) error {
 	o.ctx, o.rows, o.stable = ctx, nil, nil
+	o.trig = stmtAfterTriggers{}
 	defer o.enter()()
-	return o.Operator.Open(ctx)
+	err := o.Operator.Open(ctx)
+	o.trig.noteErr(err)
+	return err
 }
 
 func (o *stmtCTEScopeOp) Next() (TupleSlot, error) {
 	defer o.enter()()
-	return o.Operator.Next()
+	slot, err := o.Operator.Next()
+	o.trig.noteErr(err)
+	return slot, err
 }
 
 func (o *stmtCTEScopeOp) Close() error {
 	defer o.enter()()
-	return o.Operator.Close()
+	return o.trig.finish(o.ctx, o.Operator.Close())
 }

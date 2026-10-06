@@ -79,7 +79,7 @@ func TestMergeApplyUpdateWaitsOnForeignConflictingLock(t *testing.T) {
 	newRow := Row{NewIntDatum(1), NewStringDatum("merged")}
 	done := make(chan error, 1)
 	go func() {
-		done <- mergeApplyUpdate(s2, rel, tbl, tbl.Columns, 0, 1, newRow, nil, rel, tbl.Columns, 0)
+		done <- mergeApplyUpdate(s2, rel, tbl, tbl.Columns, 0, 1, newRow, nil, rel, tbl.Columns, 0, nil)
 	}()
 
 	select {

@@ -466,6 +466,9 @@ type OpIterator struct {
 	rootIdx int32
 	plan    optimizer.Node
 	dst     Slot
+	ctx     *Context
+	// trig is the statement's AFTER trigger query level (M0146-0076).
+	trig stmtAfterTriggers
 }
 
 // BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
@@ -480,14 +483,24 @@ func BuildFastIterator(plan optimizer.Node) (*OpIterator, error) {
 
 // Open implements Operator.
 func (it *OpIterator) Open(ctx *Context) error {
-	return opOpen(it.tree, it.rootIdx, ctx)
+	it.ctx = ctx
+	it.trig = stmtAfterTriggers{}
+	saved := it.trig.swapIn(ctx)
+	err := opOpen(it.tree, it.rootIdx, ctx)
+	it.trig.swapOut(ctx, saved)
+	it.trig.noteErr(err)
+	return err
 }
 
 // Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
 // the legacy nil-slot convention that the dispatch loop checks with schema==nil).
 func (it *OpIterator) Next() (TupleSlot, error) {
 	it.dst.Reset()
-	if err := opNext(it.tree, it.rootIdx, &it.dst); err != nil {
+	saved := it.trig.swapIn(it.ctx)
+	err := opNext(it.tree, it.rootIdx, &it.dst)
+	it.trig.swapOut(it.ctx, saved)
+	if err != nil {
+		it.trig.noteErr(err)
 		return nil, err
 	}
 	if !it.dst.HasRow {
@@ -497,7 +510,11 @@ func (it *OpIterator) Next() (TupleSlot, error) {
 }
 
 // Close implements Operator.
-func (it *OpIterator) Close() error { return opClose(it.tree, it.rootIdx) }
+func (it *OpIterator) Close() error {
+	saved := it.trig.swapIn(it.ctx)
+	defer it.trig.swapOut(it.ctx, saved)
+	return it.trig.finish(it.ctx, opClose(it.tree, it.rootIdx))
+}
 
 // Schema implements Operator. For read plans, returns plan.Output(). For DML
 // operators still in the adapter, delegates to the adapter's Schema() after

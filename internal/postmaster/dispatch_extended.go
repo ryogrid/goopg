@@ -499,6 +499,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	if err != nil {
 		return nil, newExtendedQueryError(err)
 	}
+	// The Execute's AFTER trigger query level (M0146-0076): its queued
+	// AFTER ROW / AFTER STATEMENT events fire once the plan has closed
+	// cleanly (AfterTriggerEndQuery); any error exit discards them.
+	endAfterTriggers := executor.BeginAfterTriggerQuery(ectx)
+	defer func() { _ = endAfterTriggers(false) }()
 	if err := op.Open(ectx); err != nil {
 		_ = op.Close()
 		return nil, newExtendedQueryError(err)
@@ -577,6 +582,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 	}
 	if err := op.Close(); err != nil {
+		return nil, newExtendedQueryError(err)
+	}
+	if err := endAfterTriggers(true); err != nil {
 		return nil, newExtendedQueryError(err)
 	}
 	res.NoticeFrames = executorNoticeFrames(ectx)

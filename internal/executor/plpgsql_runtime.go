@@ -3070,11 +3070,21 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 		_ = frame.add("tg_argv", arrType, NewStringDatum(arrStr))
 	}
 	// Inject OLD/NEW as composite-text row variables so RAISE NOTICE '%', OLD works.
+	// A row the event lacks is NULL, as in PG (pl_exec.c plpgsql_exec_trigger:
+	// NEW is NULL for DELETE and in statement-level triggers, OLD for INSERT
+	// and in statement-level triggers). A shared trigger function routinely
+	// names NEW in a branch a statement-level call never takes; leaving the
+	// variable undefined failed the whole statement with "column new does
+	// not exist" (M0146-0076).
 	if trig.OldRow != nil {
 		_ = frame.add("old", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.OldRow)))
+	} else {
+		_ = frame.add("old", strType, NullDatum)
 	}
 	if trig.NewRow != nil {
 		_ = frame.add("new", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.NewRow)))
+	} else {
+		_ = frame.add("new", strType, NullDatum)
 	}
 }
 

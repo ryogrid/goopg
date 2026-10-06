@@ -695,6 +695,10 @@ type Context struct {
 	// scanned. M0146-0049d2.
 	CTEStableCache map[string][]Row
 
+	// afterTrigQuery is the current query level's AFTER trigger queue
+	// (after_trigger.go, M0146-0076); nil when no statement root opened one.
+	afterTrigQuery *afterTriggerQuery
+
 	// CmdID is this context's command id RELATIVE to the enclosing statement's
 	// `estate->es_output_cid`: 0 while the statement's own plan (its CTEs and
 	// its body alike) runs, and one higher per nested VOLATILE routine body.

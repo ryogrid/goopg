@@ -62,6 +62,7 @@ import (
 //     CREATE INDEX backfill.
 type upsertOp struct {
 	plan         *optimizer.Insert
+	updCols      map[string]bool // updateColumns' cache
 	ctx          *Context
 	child        Operator
 	rowsAffected int64
@@ -164,7 +165,53 @@ func (o *upsertOp) Open(ctx *Context) error {
 
 func (o *upsertOp) Close() error { return o.child.Close() }
 
+// Next fires the statement-level triggers around the single processing
+// pass (fireBSTriggers / fireASTriggers, nodeModifyTable.c; M0146-0076):
+// BEFORE STATEMENT INSERT, then UPDATE for DO UPDATE; afterwards AFTER
+// STATEMENT UPDATE, then INSERT.
 func (o *upsertOp) Next() (TupleSlot, error) {
+	tbl := o.plan.Table
+	if o.done || len(tbl.Triggers) == 0 {
+		return o.next()
+	}
+	doUpdate := o.plan.OnConflict != nil && o.plan.OnConflict.Action == optimizer.OnConflictActionUpdate
+	var updCols map[string]bool
+	if doUpdate {
+		updCols = o.updateColumns()
+	}
+	if err := fireBeforeStatementTriggers(o.ctx, tbl, "insert", nil); err != nil {
+		return nil, err
+	}
+	if doUpdate {
+		if err := fireBeforeStatementTriggers(o.ctx, tbl, "update", updCols); err != nil {
+			return nil, err
+		}
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if doUpdate {
+		if qerr := queueAfterStatementTriggers(o.ctx, tbl, "update", updCols); qerr != nil {
+			return nil, qerr
+		}
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, tbl, "insert", nil); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+// updateColumns is the DO UPDATE action's target column set, which decides
+// whether a column-specific `UPDATE OF` trigger fires (M0146-0076).
+func (o *upsertOp) updateColumns() map[string]bool {
+	if o.updCols == nil && o.plan.OnConflict != nil {
+		o.updCols = updateTargetColumns(o.plan.Table.Columns, o.plan.OnConflict.UpdateSet)
+	}
+	return o.updCols
+}
+
+func (o *upsertOp) next() (TupleSlot, error) {
 	if o.done {
 		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
 			row := o.retRows[o.retIdx]
@@ -328,7 +375,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				conflictRow = specConflictRow
 			} else {
 				if len(writeTbl.Triggers) > 0 {
-					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+					if err := queueAfterRowTriggers(o.ctx, writeTbl, "insert", nil, insertedForLeaf, nil); err != nil {
 						return nil, err
 					}
 				}
@@ -472,7 +519,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 							continue
 						}
 						if len(writeTbl.Triggers) > 0 {
-							if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+							if err := queueAfterRowTriggers(o.ctx, writeTbl, "insert", nil, insertedForLeaf, nil); err != nil {
 								return nil, err
 							}
 						}
@@ -513,7 +560,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				}
 				// Fire BEFORE UPDATE trigger per-row before applying the update (M0100-0011).
 				if len(writeTbl.Triggers) > 0 {
-					ret, ok, err := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					ret, ok, err := fireTriggersCols(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf, o.updateColumns())
 					if err != nil {
 						return nil, err
 					}
@@ -531,7 +578,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					return nil, err
 				}
 				if len(writeTbl.Triggers) > 0 {
-					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf); err != nil {
+					if err := queueAfterRowTriggers(o.ctx, writeTbl, "update", conflictRow, updatedForLeaf, o.updateColumns()); err != nil {
 						return nil, err
 					}
 				}

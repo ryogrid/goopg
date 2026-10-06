@@ -2718,7 +2718,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			bsess.MarkTableActive(o.plan.Table.OID)
 			defer bsess.UnmarkTableActive(o.plan.Table.OID)
 		}
-		if err := fireStatementTriggers(o.ctx, o.plan.Table, "before", "insert"); err != nil {
+		if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "insert", nil); err != nil {
 			return nil, err
 		}
 	}
@@ -3011,14 +3011,20 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
-		// AFTER INSERT triggers (M0097-0140).
+		// AFTER INSERT triggers (M0097-0140), queued to the end of the
+		// query (M0146-0076).
 		if len(o.plan.Table.Triggers) > 0 {
-			if _, _, err := fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row); err != nil {
+			if err := queueAfterRowTriggers(o.ctx, o.plan.Table, "insert", nil, row, nil); err != nil {
 				return nil, err
 			}
 		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
+	}
+	if len(o.plan.Table.Triggers) > 0 {
+		if err := queueAfterStatementTriggers(o.ctx, o.plan.Table, "insert", nil); err != nil {
+			return nil, err
+		}
 	}
 	// Yield the first RETURNING row inline (subsequent rows come from the
 	// done-branch in Next()). Without RETURNING, return EOF as before so
@@ -4546,6 +4552,7 @@ func tryApplyHOTUpdate(
 // when HOT is ineligible or the page is full.
 type updateOp struct {
 	plan         *optimizer.Update
+	updCols      map[string]bool // updateColumns' cache
 	scan         *optimizer.SeqScan
 	pred         optimizer.Expr
 	ctx          *Context
@@ -5049,7 +5056,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// actually be written. M0100-0005-merge-delete-fix.
 		trigFiredViaIdx := false
 		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
-			retRow, ok, err := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -5319,7 +5326,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					trigFiredViaIdx = true
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					retRow, trigOK, trigErr := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					retRow, trigOK, trigErr := fireTriggersCols(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 					if trigErr != nil {
 						// s already unlocked/unpinned above before firing.
 						return nil, trigErr
@@ -5473,9 +5480,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			if serr := ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER UPDATE triggers (M0097-0140).
+			// AFTER UPDATE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			if len(idxTbl.Triggers) > 0 {
-				if _, _, err := fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, idxTbl, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
 					return nil, err
 				}
 			}
@@ -5493,7 +5501,38 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	return nil, EOF
 }
 
+// Next fires the statement-level triggers around the operator's single
+// processing pass: BEFORE STATEMENT ahead of it, and AFTER STATEMENT queued
+// once every row is processed (fireBSTriggers / fireASTriggers,
+// nodeModifyTable.c; M0146-0076). They fire even when no row matches.
 func (o *updateOp) Next() (TupleSlot, error) {
+	if o.done || len(o.plan.Table.Triggers) == 0 {
+		return o.next()
+	}
+	updCols := o.updateColumns()
+	if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "update", updCols); err != nil {
+		return nil, err
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, o.plan.Table, "update", updCols); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+// updateColumns is the UPDATE's target column set, which decides whether a
+// column-specific `UPDATE OF` trigger fires (M0146-0076).
+func (o *updateOp) updateColumns() map[string]bool {
+	if o.updCols == nil {
+		o.updCols = updateTargetColumns(o.plan.Table.Columns, o.plan.Set)
+	}
+	return o.updCols
+}
+
+func (o *updateOp) next() (TupleSlot, error) {
 	if o.done {
 		// Subsequent calls: iterate through RETURNING rows (M0100-0005).
 		if o.retIdx >= len(o.retRows) {
@@ -5926,7 +5965,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// Hand the scan back its own snapshot (see scanSnap above).
 				o.ctx.Snap = scanSnap
 				if len(scanTbl.Triggers) > 0 {
-					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					ret, ok, err := fireTriggersCols(o.ctx, scanTbl, "before", "update", oldRow, newRow, o.updateColumns())
 					if err != nil {
 						return err
 					}
@@ -5991,7 +6030,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			scanTblForTrig = tbl
 		}
 		if !pu.beforeFired && len(scanTblForTrig.Triggers) > 0 {
-			retRow, ok, err := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -6366,13 +6405,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER UPDATE triggers (M0097-0140).
+			// AFTER UPDATE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			scanTblForAfterTrig := pu.scanTbl
 			if scanTblForAfterTrig == nil {
 				scanTblForAfterTrig = tbl
 			}
 			if len(scanTblForAfterTrig.Triggers) > 0 {
-				if _, _, err := fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, scanTblForAfterTrig, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
 					return nil, err
 				}
 			}
@@ -6577,7 +6617,28 @@ func (o *deleteOp) Close() error {
 	return nil
 }
 
+// Next fires the statement-level triggers around the operator's single
+// processing pass: BEFORE STATEMENT ahead of it, and AFTER STATEMENT queued
+// once every row is processed (fireBSTriggers / fireASTriggers,
+// nodeModifyTable.c; M0146-0076). They fire even when no row matches.
 func (o *deleteOp) Next() (TupleSlot, error) {
+	if o.done || len(o.plan.Table.Triggers) == 0 {
+		return o.next()
+	}
+	if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "delete", nil); err != nil {
+		return nil, err
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, o.plan.Table, "delete", nil); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+func (o *deleteOp) next() (TupleSlot, error) {
 	if o.done {
 		// Subsequent calls: iterate RETURNING rows (M0100-0005).
 		if o.retIdx >= len(o.retRows) {
@@ -6959,13 +7020,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER DELETE triggers (M0097-0140).
+			// AFTER DELETE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			if len(tbl.Triggers) > 0 {
 				delRow := v.row
 				if v.retRow != nil {
 					delRow = v.retRow
 				}
-				if _, _, err := fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, tbl, "delete", delRow, nil, nil); err != nil {
 					return nil, err
 				}
 			}
@@ -7264,7 +7326,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
-			retRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -7529,6 +7591,13 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot); serr != nil {
 			return nil, serr
+		}
+		// AFTER UPDATE triggers, queued to the end of the query (M0146-0076);
+		// the same table the BEFORE triggers above fired on.
+		if len(o.plan.Table.Triggers) > 0 {
+			if err := queueAfterRowTriggers(o.ctx, o.plan.Table, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
+				return nil, err
+			}
 		}
 		o.rowsAffected++
 		// Use retNewRow for RETURNING when available (inheritance children). M0097-0078.
@@ -7882,6 +7951,12 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
+		}
+		// AFTER DELETE triggers, queued to the end of the query (M0146-0076).
+		if len(tbl.Triggers) > 0 {
+			if err := queueAfterRowTriggers(o.ctx, tbl, "delete", v.oldRow, nil, nil); err != nil {
+				return nil, err
+			}
 		}
 		// Use parent-aligned retOldRow for RETURNING when available. M0097-0078.
 		delRetRow := v.oldRow
