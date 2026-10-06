@@ -4336,6 +4336,19 @@ func nodeReferencesOuter(n Node) bool {
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
 		return nodeReferencesOuter(x.Child)
+	case *CTEScan:
+		// A CTE reference never reads a FROM sibling: its body belongs to
+		// the WITH list's own query level, where no sibling is in scope, so
+		// its outer references name ENCLOSING levels (PG makes such a CTE
+		// an initplan/subplan of the WITH owner; ctescan.c shares one
+		// tuplestore among every reference). Counting them made the join
+		// over two references of a correlated CTE lateral, and the lateral
+		// driver then pushed the left row where the body's level-1 outer
+		// reference resolves: `(WITH c AS MATERIALIZED (SELECT g*2 AS k)
+		// SELECT c.k || '/' || c2.k FROM c, c AS c2)` gave 2/4 for 2/2
+		// (M0146-0071). The enclosing level's correlation is the
+		// subplan's, tracked by planHasEscapingOuterRef, not this join's.
+		return false
 	case *ScalarFuncScan:
 		// A user-defined non-SETOF routine used as a FROM source, e.g.
 		// `FROM t, LATERAL f(t.col)`; the arg resolves to a plain
