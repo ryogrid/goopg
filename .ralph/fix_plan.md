@@ -28072,6 +28072,17 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     SELECT route, `evalExprViaSQL` / `evalScalarSubquery` in
     `plpgsql\_runtime\.go`\), and why a `WithClause` and its CTE bodies are
     skipped\.
+- [ ] **M0146\-0073 — retire the one\-relation index rule\'s correlated
+  half** \(filed 2026\-10\-06 by M0146\-0062\)\. M0146\-0012 slice 2 kept
+  `planIndexScanFromWhere`\'s correlated probe because an outer key from a
+  literal column \(`\(values \(0,9998\)\) v\(id,x\), lateral \(… where
+  unique2 = v\.x\)\)`, regress `join`\) was `int8` against an `int4` index
+  column, which the search\'s `restrictionKeyUsable` refuses\. Such keys
+  are `int4` since M0146\-0062\.
+  Kind: cleanup
+  Parent: M0146\-0062
+  - First step: drop the correlated half, re\-run the regress `join` A/B
+    and the fire set, and keep it only if a witness still needs it\.
 - [ ] **M0146\-0051 — WRONG RESULTS: ctid is lost through a parallel plan**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT count\(DISTINCT ctid\) FROM
   customer` on the TPC\-H reference cluster \(Aggregate → Gather Merge →
@@ -28733,7 +28744,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - Expected movement: TPC\-DS scan\-type wherever PG bitmap\-scans a
     range restriction, measured by the fire set; it also unblocks
     M0146\-0060\.
-- [ ] **M0146\-0062 — WRONG RESULTS: an integer literal is typed `bigint`,
+- [x] **M0146\-0062 — WRONG RESULTS: an integer literal is typed `bigint`,
   not `integer`, so int4 overflow never errors** \(filed 2026\-10\-05 by
   M0146\-0012 slice 2\)\. PG 18\.3 types a literal that fits in 32 bits as
   `int4` \(`make\_const`, `./postgres/src/backend/parser/parse\_node\.c`\)\.
@@ -28761,6 +28772,19 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     result types, VALUES `select\_common\_type`, the executor literal
     cache\) and re\-run the regress A/B; large blast radius \(ledger
     M0134\-0156\)\.
+  - Done 2026\-10\-06 \(`6fa8b77c9`, `898d5342c`; design
+    `docs/design/0100\-0149/m0146\-0062\-int4\-literal\-typing\.md`\):
+    - `IntegerConst\.Wide` \+ `IntegerConstIsInt8`: a literal that fits in
+      32 bits is `int4`; folding of two non\-int8 operands raises `22003
+      integer out of range`; negation follows doNegate\.
+    - `sum\(int2/int4\)` returns `int8` \(`sumResultType`\); the
+      hypothetical\-set error names types via `ArgTypeDisplayAlias`\.
+    - `exprType` types an `OuterColumnRef` by its column, so
+      `\(SELECT pg\_typeof\(v\.x\)\)` prints `integer`\.
+    - Ledgered: `sum\(int8\)` → `numeric`; `pg\_typeof` not evaluating its
+      argument\. Filed M0146\-0073 \(the one\-relation rule\'s correlated
+      half may now be removable\)\.
+Movement: none — instrument artefact — typing fix; fire set width\-only \(sum\(int4\) 8 bytes\); PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0063 — the visibility map reaches disk only at clean
   shutdown** \(filed 2026\-10\-05 by M0146\-0019a\)\. goopg keeps the VM in
   memory and writes `\_vm` forks only from `SaveVM` in the shutdown defer
