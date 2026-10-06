@@ -28402,7 +28402,7 @@ Movement: none — instrument artefact — executor trigger WHEN correctness, no
     - Filed M0146\-0083 \(Failing\-row DETAIL renders dates MDY\); ledgered
       caret position, cross\-partition UPDATE CHECK, identity ALWAYS\.
 Movement: none — instrument artefact — MERGE correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0074 — WRONG RESULTS: `||` treats `\{…\}`\-shaped text as an
+- [x] **M0146\-0074 — WRONG RESULTS: `||` treats `\{…\}`\-shaped text as an
   array** \(filed 2026\-10\-06 by M0146\-0053\)\. `SELECT \'a\' ||
   \'\{9\}\'::text` returns `\{a,9\}` and `\'\{1\}\'::text || \'\{2\}\'::text`
   returns `\{1,2\}`; PG 18\.3 returns `a\{9\}` and `\{1\}\{2\}` \(textcat\)\.
@@ -28416,6 +28416,18 @@ Movement: none — instrument artefact — MERGE correctness, no plan change; PL
     evalBinary `OpConcat` in `internal/executor/expr.go`, the compiled twin
     in `exprnode.go`\) and gate the array arm on the operand types the way
     M0146\-0053 gates comparisons \(`exprIsCharacterString`\)\.
+  - Done 2026\-10\-07 \(`dc75eccdc`; design
+    `docs/design/0100\-0149/m0146\-0074\-concat\-by\-static\-type\.md`\):
+    - `concatModeOf` picks textcat / jsonb\_concat / the old array guess
+      from the static operand types; both evaluator twins honour it
+      \(compiled twin: payload\[16\] bits 8/16\)\.
+    - `jsonb\_concat` implemented; the analyzer types jsonb \|\| jsonb\.
+    - ExprResultType resolves coalesce/greatest/least/nullif and
+      concat/concat\_ws/format\.
+    - Regress jsonb 6511→6345, no new divergent line\.
+    - Ledgered: no element\-type check on array \|\|; unresolved types keep
+      the guess\.
+Movement: none — instrument artefact — executor concat correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
   volatile default cannot be evaluated** \(filed 2026\-10\-04 by
   M0146\-0009h\)\. `COPY t\(a,b\)` into a table with `c float8 DEFAULT random\(\)`
