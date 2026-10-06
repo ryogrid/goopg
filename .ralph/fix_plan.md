@@ -28146,7 +28146,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Filed M0146\-0078 \(repeated CREATE OR REPLACE FUNCTION fails a catalog
       page insert\)\.
 Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0079 — WRONG RESULTS: `= ANY \(subquery … OFFSET 0\)` inside a
+- [x] **M0146\-0079 — WRONG RESULTS: `= ANY \(subquery … OFFSET 0\)` inside a
   LATERAL item returns rows PG filters out** \(filed 2026\-10\-06 by
   M0146\-0073\)\. With `m79i\(f1\)` = \{0, 123456, \-123456\} and
   `m79t\(unique1, unique2\)` = \{\(0,9998\), \(5,1000\), \(7,7\)\}: `select \*
@@ -28165,6 +28165,18 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     which level `x` binds to under the lateral driver \(the pushed left row
     vs the SubPlan\'s own outer\) and whether the Limit subplan is cached
     across left rows \(SubqueryCache key without the correlated value\)\.
+  - Done 2026\-10\-07 \(`0859cbaf4`; design
+    `docs/design/0100\-0149/m0146\-0079\-lateral\-sublink\-cache\-scope\.md`\):
+    - Root cause: the scoped sublink cache was cleared on OuterRows depth
+      change only; a LATERAL item\'s sublink reading the left row reused
+      the first left row\'s result \(ANY, NOT IN and scalar alike\)\.
+    - `scopedSublinkKey` appends the enclosing rows to the key of a sublink
+      whose plan reads past its parent \(`PlanReadsPastParent`\); a
+      clear\-the\-store variant regressed Q10/Q14/Q35/Q54 and was replaced\.
+    - Regress join/subselect improved, no new divergent line\.
+    - Ledgered: the witness is a SubPlan where PG builds a Hash Semi Join;
+      the key carries every enclosing level\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0080 — WRONG RESULTS: PL/pgSQL RAISE parameters that are
   sublinks print empty; integer subquery → text variable errors** \(filed
   2026\-10\-07 by M0146\-0076\)\. `RAISE NOTICE \'b=% c=% d=%\', \(SELECT
