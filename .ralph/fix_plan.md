@@ -28890,7 +28890,7 @@ Movement: none — instrument artefact — harness fix; no plan or estimate chan
       remaining divergences are EXPLAIN shapes \(ledgered: no gist/gin/brin/
       spgist storage\)\.
 Movement: none — instrument artefact — correctness, no TPC plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0070 — the catalog btree rebuild writes the metapage before
+- [x] **M0146\-0070 — the catalog btree rebuild writes the metapage before
   extending the file** \(filed 2026\-10\-06 by M0146\-0056\)\.
   `rebuildSysBtreeWithNewEntry` \(`sys\_catalog\_btree\_multilevel\.go`\) overwrites
   pages 0\.\.N\-1 in ascending order: the metapage and existing internal pages
@@ -28903,6 +28903,17 @@ Movement: none — instrument artefact — correctness, no TPC plan change; PLAN
   - First step: write the new tail blocks first \(extend\), then the existing
     pages, metapage last; a unit test that fails `PinNew` mid\-rebuild
     \(fault hook\) and checks the old tree still reads\.
+  - Done 2026\-10\-07 \(`968141b8d`; design
+    `docs/design/0100\-0149/m0146\-0070\-catalog\-btree\-rebuild\-write\-order\.md`\):
+    - Extend \+ write tail blocks first, existing non\-meta blocks ascending
+      \(children before parents\), metapage last; pins stay one at a time
+      \(a pin\-everything variant failed `no available buffer` on initdb\'s
+      small pool\)\.
+    - Witness: TestSysBtreeRebuildFailureLeavesOldTree \(fault seams\); the old
+      loop fails it with `short read at block`\.
+    - Ledgered: a mid\-rewrite pin failure can leave a mixed tree; no crash
+      atomicity across per\-page FPIs\.
+Movement: none — instrument artefact — storage robustness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0057 — WRONG RESULTS: a CTE read inside an IN/EXISTS sublink
   loses its body\'s WHERE** \(filed and fixed 2026\-10\-04 by M0146\-0007f\)\.
   `WITH x AS \(SELECT a, b FROM t WHERE b < 5\) SELECT count\(\*\) FROM u
