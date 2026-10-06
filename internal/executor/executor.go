@@ -561,6 +561,9 @@ func (o *utilityNoOp) Close() error             { return nil }
 // of rows, then closes. Production paths use Open/Next/Close
 // directly so they can stream into the wire-protocol encoder.
 func Run(op Operator, ctx *Context) ([]Row, error) {
+	// M0146-0059: one statement's CTE materialisations, as the wire
+	// dispatcher resets them per statement.
+	op = scopeStatementCTEs(op)
 	// M0129-S8.3: advance the command counter before executing the operator,
 	// matching PG's per-statement CommandCounterIncrement in the dispatch layer
 	// (production paths advance before calling Build — Run is exclusively a
@@ -845,4 +848,70 @@ func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// stmtCTEScopeOp gives one statement execution its own CTE materialisations
+// (M0146-0059). ctx.CTERowCache and ctx.CTEStableCache are keyed by CTE
+// declaration, and a routine body's statements run on one Context, so a
+// second statement declaring `x` at the same position replayed the first
+// statement's rows. PG starts every statement with fresh CTE tuplestores.
+// The statement's caches are swapped in around each Open, Next and Close
+// and out again afterwards, as the LATERAL join does per outer tuple: an
+// enclosing statement that is still replaying its own CTE scans keeps its
+// caches, and a statement whose operator outlives its caller (a cursor
+// fetched by later statements) never leaks its entries into them.
+type stmtCTEScopeOp struct {
+	Operator
+	ctx    *Context
+	rows   map[string][]Row
+	stable map[string][]Row
+}
+
+// scopeStatementCTEs wraps op, the root of one statement's operator tree.
+func scopeStatementCTEs(op Operator) Operator {
+	if op == nil {
+		return nil
+	}
+	if _, already := op.(*stmtCTEScopeOp); already {
+		return op
+	}
+	return &stmtCTEScopeOp{Operator: op}
+}
+
+// buildStatementScoped is Build for the root of one statement's plan.
+func buildStatementScoped(plan optimizer.Node) (Operator, error) {
+	op, err := Build(plan)
+	if err != nil {
+		return op, err
+	}
+	return scopeStatementCTEs(op), nil
+}
+
+func (o *stmtCTEScopeOp) enter() func() {
+	ctx := o.ctx
+	if ctx == nil {
+		return func() {}
+	}
+	savedRows, savedStable := ctx.CTERowCache, ctx.CTEStableCache
+	ctx.CTERowCache, ctx.CTEStableCache = o.rows, o.stable
+	return func() {
+		o.rows, o.stable = ctx.CTERowCache, ctx.CTEStableCache
+		ctx.CTERowCache, ctx.CTEStableCache = savedRows, savedStable
+	}
+}
+
+func (o *stmtCTEScopeOp) Open(ctx *Context) error {
+	o.ctx, o.rows, o.stable = ctx, nil, nil
+	defer o.enter()()
+	return o.Operator.Open(ctx)
+}
+
+func (o *stmtCTEScopeOp) Next() (TupleSlot, error) {
+	defer o.enter()()
+	return o.Operator.Next()
+}
+
+func (o *stmtCTEScopeOp) Close() error {
+	defer o.enter()()
+	return o.Operator.Close()
 }

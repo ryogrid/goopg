@@ -656,7 +656,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
-			op, err := Build(node)
+			op, err := buildStatementScoped(node)
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
@@ -695,7 +695,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
-		op, err := Build(node)
+		op, err := buildStatementScoped(node)
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -815,7 +815,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
-		op, err := Build(node)
+		op, err := buildStatementScoped(node)
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -897,7 +897,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
-		op, err := Build(node)
+		op, err := buildStatementScoped(node)
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -1824,7 +1824,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
-		op, perr := Build(plan)
+		op, perr := buildStatementScoped(plan)
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1932,7 +1932,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
-		op, perr := Build(plan)
+		op, perr := buildStatementScoped(plan)
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -2022,7 +2022,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
-		op, err := Build(plan)
+		op, err := buildStatementScoped(plan)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -2116,7 +2116,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
-		op, err := Build(plan)
+		op, err := buildStatementScoped(plan)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -2446,7 +2446,7 @@ func evalExprViaSQL(e parser.Expr, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
-	op, err := Build(plan)
+	op, err := buildStatementScoped(plan)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -2514,7 +2514,7 @@ func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
-	op, err := Build(plan)
+	op, err := buildStatementScoped(plan)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -3220,7 +3220,7 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) (int,
 		if err != nil {
 			return 0, err
 		}
-		op, err := Build(plan)
+		op, err := buildStatementScoped(plan)
 		if err != nil {
 			return 0, err
 		}
