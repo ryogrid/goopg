@@ -57,7 +57,7 @@ func ExprResultType(e Expr) (catalog.Type, bool) {
 		// PG's make_const: an integer literal that fits in int32 is int4,
 		// otherwise int8 (numeric only beyond int64, which the lexer would
 		// have produced a NumericConst for).
-		if x.Value >= -2147483648 && x.Value <= 2147483647 {
+		if !IntegerConstIsInt8(x) {
 			return catalog.Type{Name: "int4"}, true
 		}
 		return catalog.Type{Name: "int8"}, true

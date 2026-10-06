@@ -562,7 +562,11 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 		}
 	case parser.OpUnaryNeg:
 		if ic, ok := operand.(*IntegerConst); ok {
-			return &IntegerConst{pos: pos, Value: -ic.Value}
+			// A literal operand is negated in place and typed by its new
+			// value (gram.y doNegate, then make_const): `-2147483648` and
+			// even `-(2147483648)` are int4. Only a constant folded from int8
+			// arithmetic keeps int8 (int8um) (M0146-0062).
+			return &IntegerConst{pos: pos, Value: -ic.Value, Wide: ic.Wide}
 		}
 		if nc, ok := operand.(*NumericConst); ok {
 			if len(nc.Value) > 0 && nc.Value[0] == '-' {
@@ -690,6 +694,7 @@ func foldCaseExpr(x *CaseExpr) Expr {
 type literalValue struct {
 	kind   string // "int", "str", "num", "bool"
 	intV   int64
+	int8   bool // an "int" typed int8 (IntegerConstIsInt8), else int4
 	strV   string
 	boolV  bool
 	numStr string // raw decimal text for KindNumeric
@@ -700,7 +705,7 @@ type literalValue struct {
 func toLiteralValue(e Expr) (literalValue, bool) {
 	switch x := e.(type) {
 	case *IntegerConst:
-		return literalValue{kind: "int", intV: x.Value}, true
+		return literalValue{kind: "int", intV: x.Value, int8: IntegerConstIsInt8(x)}, true
 	case *StringConst:
 		return literalValue{kind: "str", strV: x.Value}, true
 	case *NumericConst:
@@ -747,6 +752,28 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 	// Promote both sides: int×int stays int; anything with num → numeric.
 	if l.kind == "int" && r.kind == "int" {
 		a, b := l.intV, r.intV
+		// M0146-0062: int4 op int4 is int4 (int4pl, int4mul, ...), which
+		// raises `integer out of range` past 32 bits; an int8 operand makes
+		// it int8, and the folded constant keeps that type (Wide).
+		wide := l.int8 || r.int8
+		out, err := evalIntArith(pos, op, a, b)
+		if err != nil || out == nil {
+			return out, err
+		}
+		if ic, ok := out.(*IntegerConst); ok {
+			if !wide && (ic.Value < -2147483648 || ic.Value > 2147483647) {
+				return nil, &PlanError{Code: "22003", Message: "integer out of range"}
+			}
+			ic.Wide = wide
+		}
+		return out, nil
+	}
+	return evalArithNumeric(pos, op, l, r)
+}
+
+// evalIntArith is evalArith's int64 arithmetic: bigint range checks only.
+func evalIntArith(pos int, op parser.OpCode, a, b int64) (Expr, error) {
+	{
 		switch op {
 		case parser.OpAdd:
 			r := a + b
@@ -787,6 +814,11 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 			return &IntegerConst{pos: pos, Value: a % b}, nil
 		}
 	}
+	return nil, nil
+}
+
+// evalArithNumeric folds arithmetic with at least one numeric operand.
+func evalArithNumeric(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 	// At least one numeric: promote both to decimal strings and fold with
 	// PG's numeric arithmetic (numeric_add/sub/mul/div: exact decimal, with
 	// add_var's max scale, mul_var's summed scale and div_var's

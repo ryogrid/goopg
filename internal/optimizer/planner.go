@@ -8933,10 +8933,7 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		case "count":
 			outTyp = catalog.Type{Name: "int8"}
 		case "sum":
-			outTyp = inputTyp
-			if strings.EqualFold(outTyp.Name, "unknown") || outTyp.Name == "" {
-				outTyp = catalog.Type{Name: "int8"}
-			}
+			outTyp = sumResultType(inputTyp)
 		case "avg":
 			if isFloatTypeName(inputTyp.Name) {
 				outTyp = catalog.Type{Name: "float8"}
@@ -11317,19 +11314,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					if t == "" || t == "unknown" {
 						t = "text"
 					}
-					// Integer literals default to "integer" (int4) in PG error messages. M0097-0122.
-					if _, isInt := arg.(*parser.IntegerConst); isInt && (t == "int8" || t == "bigint") {
-						t = "integer"
-					}
+					// format_type_be's display spelling (`integer`, not
+					// `int4`): integer literals are int4 since M0146-0062.
 					_ = i
-					sigParts = append(sigParts, t)
+					sigParts = append(sigParts, catalog.ArgTypeDisplayAlias(t))
 				}
 				for _, sk := range withinGroupKeys {
 					t := exprType(sk.Expr).Name
 					if t == "" || t == "unknown" {
 						t = "text"
 					}
-					sigParts = append(sigParts, t)
+					sigParts = append(sigParts, catalog.ArgTypeDisplayAlias(t))
 				}
 				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
 					Message: fmt.Sprintf("function %s(%s) does not exist", name, strings.Join(sigParts, ", ")),
@@ -11416,10 +11411,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			outType = catalog.Type{Name: "text[]"}
 		}
 	case "sum":
-		outType = exprType(argExpr)
-		if strings.EqualFold(outType.Name, "unknown") || outType.Name == "" {
-			outType = catalog.Type{Name: "int8"}
-		}
+		outType = sumResultType(exprType(argExpr))
 	case "avg":
 		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
 		argType := exprType(argExpr)
@@ -15762,6 +15754,25 @@ func resolvePolyAggOutputType(stype string, argExpr Expr) catalog.Type {
 // exprType returns the planner-level type tag for an expression. v0
 // only knows what ColumnRef carries; everything else gets the
 // "unknown" tag the executor coerces at runtime.
+// sumResultType is sum()'s result type for an argument of type t (both the
+// aggregate and the window sum). PG's int2_sum / int4_sum return int8
+// (pg_aggregate: sum(int2), sum(int4) -> bigint), so `sum(n)` over an int4
+// column or literal is bigint (M0146-0062: with int literals now int4, the
+// old "the argument's own type" rule made regress with.sql's
+// `CREATE TABLE sums_1_100 AS ... sum(n)` an integer column). sum(int8)
+// keeps int8 here, where PG returns numeric (ledgered).
+func sumResultType(t catalog.Type) catalog.Type {
+	switch strings.ToLower(t.Name) {
+	case "", "unknown":
+		return catalog.Type{Name: "int8"}
+	case "int2", "smallint", "int4", "integer", "int":
+		if !t.IsArray {
+			return catalog.Type{Name: "int8"}
+		}
+	}
+	return t
+}
+
 func exprType(e Expr) catalog.Type {
 	switch x := e.(type) {
 	case *ColumnRef:
@@ -15769,6 +15780,14 @@ func exprType(e Expr) catalog.Type {
 	case *NumericConst:
 		return catalog.Type{Name: "numeric"}
 	case *IntegerConst:
+		// M0146-0062: PG's make_const (parse_node.c) types an integer
+		// literal that fits in 32 bits as int4, anything wider as int8 —
+		// the rule ExprResultType already follows. int8 here made `int4 +
+		// literal` an int8 operation, so int4 overflow never raised
+		// `integer out of range` and pg_typeof(9998) said bigint.
+		if !IntegerConstIsInt8(x) {
+			return catalog.Type{Name: "int4"}
+		}
 		return catalog.Type{Name: "int8"}
 	case *TableOidExpr:
 		return catalog.Type{Name: "oid"}

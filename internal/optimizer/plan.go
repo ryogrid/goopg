@@ -63,6 +63,19 @@ type Expr interface {
 type IntegerConst struct {
 	pos   int
 	Value int64
+	// Wide types the constant int8 even though Value fits in 32 bits
+	// (M0146-0062). make_const types a literal by its value, but a constant
+	// FOLDED from int8 arithmetic keeps that type in PG:
+	// `3000000000 - 2147483647` is a bigint 852516353. (A negated literal is
+	// typed by its value: gram.y's doNegate makes `-2147483648` int4.)
+	Wide bool
+}
+
+// IntegerConstIsInt8 reports whether an integer constant is typed int8 —
+// a value outside int32 (make_const) or a Wide fold result — rather than
+// int4.
+func IntegerConstIsInt8(c *IntegerConst) bool {
+	return c.Wide || c.Value < -2147483648 || c.Value > 2147483647
 }
 
 func (e *IntegerConst) Pos() int { return e.pos }
