@@ -28130,6 +28130,54 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     which level `x` binds to under the lateral driver \(the pushed left row
     vs the SubPlan\'s own outer\) and whether the Limit subplan is cached
     across left rows \(SubqueryCache key without the correlated value\)\.
+- [ ] **M0146\-0080 — WRONG RESULTS: PL/pgSQL RAISE parameters that are
+  sublinks print empty; integer subquery → text variable errors** \(filed
+  2026\-10\-07 by M0146\-0076\)\. `RAISE NOTICE \'b=% c=% d=%\', \(SELECT
+  count\(\*\) FROM r\), \(SELECT 5\), 1 \+ \(SELECT max\(a\) FROM r\)` prints
+  `b= c= d=`; PG 18\.3 prints `b=2 c=5 d=3`\. `DECLARE v text; BEGIN v :=
+  \(SELECT count\(\*\) FROM r\);` fails `variable "v" expects type "text"
+  but got integer`; PG assigns `\'2\'` \(assignment coercion,
+  exec\_assign\_value\)\. Repro `tmp/m76\-raise\.sql`\.
+  Kind: bug
+  Parent: M0146\-0076
+  > ## ESCALATION 2026\-10\-07 \(S2\) — RAISE drops sublink parameter values; scalar\-subquery assignment rejects a coercible type
+  > Filed by M0146\-0076, not worked\. Owner: place M0146\-0080 in the banner\.
+  - First step: find the RaiseStmt arm in `plpgsql\_runtime\.go`
+    \(`case \*plpgsql\.RaiseStmt`\) and check which evaluator its params
+    take; route sublink params through `evalPLpgSQLExpr` \(the M0146\-0072
+    binder\); for the assignment, apply the variable\'s assignment cast
+    instead of `coerceDatumToType`\'s exact\-type check\.
+- [ ] **M0146\-0081 — WRONG RESULTS: a writable\-CTE INSERT reports the
+  command tag `SELECT 0`** \(filed 2026\-10\-07 by M0146\-0076\)\. `WITH d
+  AS \(DELETE FROM t WHERE a = 6 RETURNING a\) INSERT INTO t SELECT a \+ 100
+  FROM d` reports `SELECT 0`; PG 18\.3 reports `INSERT 0 1` \(the
+  top\-level statement\'s tag and row count\)\. The rows are written
+  correctly\.
+  Kind: bug
+  Parent: M0146\-0076
+  > ## ESCALATION 2026\-10\-07 \(S2\) — writable\-CTE DML reports the wrong command tag and row count
+  > Filed by M0146\-0076, not worked\. Owner: place M0146\-0081 in the banner\.
+  - First step: `commandTagFor\(node, op, rowCount\)` in
+    `internal/postmaster`: check which plan node a WITH\-led INSERT
+    produces \(likely a CTE wrapper over the Insert\) and unwrap it to the
+    top\-level DML node and its RowCounter\.
+- [ ] **M0146\-0082 — WRONG RESULTS: ALTER TABLE … DISABLE TRIGGER is not
+  honoured** \(filed 2026\-10\-07 by M0146\-0076\)\. After `alter table
+  trigtest disable trigger trigtest_b_row_tg` \(or `disable trigger user` /
+  `all`\), goopg still fires the trigger; `session\_replication\_role` is
+  an unrecognized parameter, so `ENABLE ALWAYS` / `ENABLE REPLICA` cannot
+  apply either \(regress `triggers`\)\. Row triggers always fired while
+  disabled; since M0146\-0076 the statement triggers do too\.
+  `catalog\.Trigger` has no tgenabled state\.
+  Kind: bug
+  Parent: M0146\-0076
+  > ## ESCALATION 2026\-10\-07 \(S2\) — disabled triggers still fire
+  > Filed by M0146\-0076, not worked\. Owner: place M0146\-0082 in the banner\.
+  - First step: add `Enabled byte` \(tgenabled: O/D/R/A\) to
+    `catalog\.Trigger`, set it from ALTER TABLE … ENABLE/DISABLE \[ALWAYS|
+    REPLICA\] TRIGGER, emit it in pg\_trigger, and check it in
+    `fireTriggersCols` / `fireStatementTriggersCols` against
+    `session\_replication\_role` \(trigger\.c TriggerEnabled\)\.
 - [ ] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
@@ -28257,7 +28305,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: remaining guess sites, `pg\_typeof` of a VALUES row
       column\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0076 — WRONG RESULTS: DML statement\-level triggers do not
+- [x] **M0146\-0076 — WRONG RESULTS: DML statement\-level triggers do not
   fire, and AFTER ROW triggers fire inline** \(filed 2026\-10\-06 by
   M0146\-0055\)\. INSERT never fires AFTER STATEMENT triggers; regress
   `triggers` also shows UPDATE\'s and DELETE\'s AFTER STATEMENT and DELETE\'s
@@ -28274,6 +28322,22 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     STATEMENT call at the end of the row loop and queue AFTER ROW events
     the way `CopyFromExecutor\.endStatement` does; then the UPDATE/DELETE
     operators\.
+  - Done 2026\-10\-07 \(`21fa73ee7`; design
+    `docs/design/0100\-0149/m0146\-0076\-dml\-statement\-triggers\-after\-queue\.md`\):
+    - Per\-query AFTER trigger levels \(`after\_trigger\.go`\) owned by the
+      statement roots \(stmtCTEScopeOp, OpIterator, extended Execute\);
+      BEFORE STATEMENT once per level, AFTER STATEMENT de\-duplicated to
+      the tail, AFTER ROW queued, all fired after a clean Close\.
+    - insert/update/delete/upsert/merge fire statement triggers \(MERGE
+      per action kind\); new AFTER ROW sites for MERGE, UPDATE … FROM and
+      DELETE … USING\.
+    - `UPDATE OF` column lists honoured at row and statement level; triggers
+      fire in name order; OLD/NEW are NULL where the event lacks the row\.
+    - Regress A/B: triggers 2814→2714, merge 1871→1674, with/inherit
+      improved; foreign\_key and plpgsql within their flaps\.
+    - Filed M0146\-0080, M0146\-0081, M0146\-0082; ledgered transition
+      tables and writable\-CTE ordering\.
+Movement: none — instrument artefact — executor trigger\-firing correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0077 — WRONG RESULTS: a trigger\'s WHEN condition is not
   evaluated** \(filed 2026\-10\-06 by M0146\-0055\)\. `CREATE TRIGGER insert\_a
   AFTER INSERT \.\.\. FOR EACH ROW WHEN \(NEW\.a = 123\)` fires for every
