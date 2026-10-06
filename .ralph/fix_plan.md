@@ -28085,7 +28085,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: the lateral decision is still any\-outer\-ref based, not
       LATERAL/implicit\-lateral based\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0072 — a PL/pgSQL variable in a statement with a WITH clause
+- [x] **M0146\-0072 — a PL/pgSQL variable in a statement with a WITH clause
   is not substituted** \(filed 2026\-10\-06 by M0146\-0059\)\. Inside a
   PL/pgSQL function, `v := \(WITH x AS \(SELECT g FROM generate\_series\(10,11\)
   g\) SELECT \(sum\(x\.g\) \* i\)::text FROM x\)` fails `42703: column "i" does
@@ -28098,6 +28098,33 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     SELECT route, `evalExprViaSQL` / `evalScalarSubquery` in
     `plpgsql\_runtime\.go`\), and why a `WithClause` and its CTE bodies are
     skipped\.
+  - Done 2026\-10\-06 \(`1710dabb6`; design
+    `docs/design/0100\-0149/m0146\-0072\-plpgsql\-vars\-in\-sublinks\-and\-with\.md`\):
+    - Wider than WITH: the scalar\-subquery and sublink SQL paths never
+      bound variables at all \(M0134\-0014\'s known limitation\); now an
+      AST binder \(`bindPlpgsqlFrameVarsInExpr`\) replaces variable
+      `ColumnRef`s and record fields with typed literals, copy\-on\-write\.
+    - The PL/pgSQL parser takes the INTO clause for WITH\-led commands
+      \(skipping INSERT/MERGE INTO\)\.
+    - Test `TestPlpgsqlVariablesBindInsideSublinksAndWith`; the old
+      deferred\-limitation test now pins PG\'s answer\.
+    - Filed M0146\-0078 \(repeated CREATE OR REPLACE FUNCTION fails a catalog
+      page insert\)\.
+Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
+  update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
+  by M0146\-0072\)\. Running a script that creates or replaces nine small
+  PL/pgSQL functions succeeds once; the second and every later run fails at
+  the same `CREATE OR REPLACE FUNCTION` \(a `RETURNS SETOF int` function\)\.
+  Pre\-existing: HEAD `78d367058` fails identically\. Replacing that one
+  function alone three times succeeds\. PG replaces it every time\.
+  Kind: bug
+  Parent: M0146\-0072
+  - First step: rerun `tmp/m72\-probe\.sql` \(probe script, recreate from the
+    M0146\-0072 design doc\) twice on a fresh cluster; find the catalog
+    heap insert that raises the message \(grep `freshly extended page`\)
+    and why the tuple does not fit an empty page \(tuple size vs page
+    free space, toasting of `prosrc`, a stale free\-space hint\)\.
 - [ ] **M0146\-0073 — retire the one\-relation index rule\'s correlated
   half** \(filed 2026\-10\-06 by M0146\-0062\)\. M0146\-0012 slice 2 kept
   `planIndexScanFromWhere`\'s correlated probe because an outer key from a
