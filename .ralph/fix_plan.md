@@ -28178,6 +28178,21 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     REPLICA\] TRIGGER, emit it in pg\_trigger, and check it in
     `fireTriggersCols` / `fireStatementTriggersCols` against
     `session\_replication\_role` \(trigger\.c TriggerEnabled\)\.
+- [ ] **M0146\-0083 — WRONG RESULTS: constraint\-violation DETAIL renders
+  dates in MDY order** \(filed 2026\-10\-07 by M0146\-0075\)\. `CREATE TABLE
+  dz \(a int NOT NULL, d date DEFAULT \'2020\-01\-02\'\); INSERT INTO dz \(d\)
+  VALUES \(DEFAULT\)` reports `DETAIL: Failing row contains \(null,
+  01\-02\-2020\)`; PG 18\.3 reports `\(null, 2020\-01\-02\)` \(ExecBuildSlotValueDescription
+  runs each type\'s output function under the session DateStyle\)\.
+  `formatRowForDetail` \(operators\_storage\.go\) uses `Datum\.Format`\.
+  Kind: bug
+  Parent: M0146\-0075
+  > ## ESCALATION 2026\-10\-07 \(S2\) — Failing\-row DETAIL shows dates in the wrong format
+  > Filed by M0146\-0075, not worked\. Owner: place M0146\-0083 in the banner\.
+  - First step: render each cell through the same per\-type output path the
+    wire uses \(the fkValsForDetail DateStyle fix is a precedent\) and check
+    timestamp/numeric/float/bytea cells too; every NOT NULL / CHECK /
+    unique DETAIL site goes through formatRowForDetail\.
 - [ ] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
@@ -28361,7 +28376,7 @@ Movement: none — instrument artefact — executor trigger\-firing correctness,
     - Ledgered: AFTER ROW WHEN evaluated at fire time, not queue time;
       system columns other than tableoid\.
 Movement: none — instrument artefact — executor trigger WHEN correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0075 — WRONG RESULTS: MERGE \.\.\. WHEN NOT MATCHED THEN
+- [x] **M0146\-0075 — WRONG RESULTS: MERGE \.\.\. WHEN NOT MATCHED THEN
   INSERT leaves an omitted column NULL** \(filed 2026\-10\-06 by
   M0146\-0054\)\. Into `mv \(a int primary key, c float8 DEFAULT random\(\),
   k text NOT NULL DEFAULT upper\(\'q\'\)\)`, `MERGE INTO mv USING src ON
@@ -28376,6 +28391,17 @@ Movement: none — instrument artefact — executor trigger WHEN correctness, no
     \(the weak evaluator\); resolve the INSERT action\'s omitted defaults
     with `optimizer\.ResolveColumnDefault` as COPY now does, then check
     why NOT NULL and the command tag are skipped on this path\.
+  - Done 2026\-10\-07 \(`50366b4ad`; design
+    `docs/design/0100\-0149/m0146\-0075\-merge\-insert\-defaults\-constraints\.md`\):
+    - Planner builds the INSERT action\'s full target list \(values, DEFAULT
+      markers, omitted\-column defaults; arity errors; 428C9 for generated
+      columns; generated columns in the default target list\)\.
+    - Grammar: DEFAULT allowed in MERGE VALUES\.
+    - Executor: value errors propagate; coercion; NOT NULL/CHECK/domain on
+      INSERT and UPDATE actions; `MERGE <n>` tag\.
+    - Filed M0146\-0083 \(Failing\-row DETAIL renders dates MDY\); ledgered
+      caret position, cross\-partition UPDATE CHECK, identity ALWAYS\.
+Movement: none — instrument artefact — MERGE correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0074 — WRONG RESULTS: `||` treats `\{…\}`\-shaped text as an
   array** \(filed 2026\-10\-06 by M0146\-0053\)\. `SELECT \'a\' ||
   \'\{9\}\'::text` returns `\{a,9\}` and `\'\{1\}\'::text || \'\{2\}\'::text`
