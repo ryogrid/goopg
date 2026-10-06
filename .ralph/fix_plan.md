@@ -25474,7 +25474,7 @@ M0146-0001 re-baseline census on the new default arm.
         regress 12 suites byte\-identical, `join` row\-order flip and
         `plpgsql` 4366\-4369 flap both seen on HEAD too; sweep 96/96, fire
         set no plan change, TPC\-H arm, ea\-ratchet PASS\.
-- [ ] **M0146\-0047b — composite field selection `\(expr\)\.field` is a syntax
+- [x] **M0146\-0047b — composite field selection `\(expr\)\.field` is a syntax
   error** \(filed 2026\-10\-03 by the M0146\-0047a probe; not S2: a
   rejection, not wrong results; owner: place\)\. `SELECT \(b\)\.x FROM wb b`,
   `SELECT \(ROW\(1,2\)\)\.f1` and `SELECT \(c\)\.p FROM \(SELECT ROW\(1,2\)::ct AS
@@ -25487,6 +25487,21 @@ M0146-0001 re-baseline census on the new default arm.
     grammar \(read the goyacc playbook first\), then resolve a field name
     against the operand\'s composite type \(whole\-row RowExpr element,
     named composite type attribute\)\.
+  - Done 2026\-10\-06 \(`709a5e956`; design
+    `docs/design/0100\-0149/m0146\-0047b\-composite\-field\-selection\.md`\):
+    - Grammar `field\_select\_expr` \(chained steps; conflicts stay 60\),
+      parser node `FieldSelect`\.
+    - Planner: whole\-row → the column; anonymous row → element fN; row
+      cast to a composite → cast element; other composite values →
+      `\_\_goopg\_field\_select` run\-time extraction \(record\_in tokenizer\);
+      PG\'s errors and column naming; grouped `\(b\)\.y` → `b\.y`\.
+    - Fixed a backend panic on a bare whole\-row reference in a grouped
+      query \(now PG\'s 42803\)\.
+    - Tests `TestFieldSelection`, `TestParseRecordText`, parser pins;
+      regress rowtypes 1384 → 1326\.
+    - Ledgered: expandRecordVariable records, assignment indirection,
+      subscripts after a field, DROP TYPE dependency check\.
+Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [x] **M0146\-0048 — WRONG RESULTS: two windows differing only in NULLS
   FIRST/LAST share one WindowAgg** \(filed 2026\-10\-03 by the M0146\-0005dm
   probe; REPRODUCED on a private throwaway cluster, S2 escalation: wrong
