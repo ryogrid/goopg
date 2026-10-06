@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -98,6 +99,13 @@ func walkParserColumnRefs(v reflect.Value, visit func(*parser.ColumnRef), stop f
 			return
 		case *parser.SelectStmt:
 			return
+		case *parser.FieldSelect:
+			// `(b).y` on a relation reads the column b.y (M0146-0047b); for
+			// a composite column `(c).p` the visit resolves nothing and its
+			// result is discarded, so the operand's own walk still runs.
+			if name := fieldSelectRelationRef(x.Arg); name != "" {
+				visit(parser.NewColumnRef(x.Pos(), []string{name, strings.ToLower(x.Field)}))
+			}
 		case *parser.FuncCall:
 			if isAggregateFunc(x) {
 				return

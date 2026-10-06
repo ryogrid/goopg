@@ -848,6 +848,11 @@ func SetDropCompatExtras(s *DropCompatStmt, argTypes []string, usingMethod strin
 // placeholder: RewriteIndirectionStarTargets turns it into a synthetic
 // `__irs_N`-aliased FROM entry plus a qualified star, and legacy runs that
 // rewrite at the end of parseSelect.
+// NewFieldSelect builds the `(expr).field` node (M0146-0047b).
+func NewFieldSelect(pos int, arg Expr, field string) *FieldSelect {
+	return &FieldSelect{pos: pos, Arg: arg, Field: field}
+}
+
 func NewIndirectionStar(pos int, source Expr) *IndirectionStar {
 	return &IndirectionStar{pos: pos, Source: source}
 }

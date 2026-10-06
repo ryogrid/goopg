@@ -12003,6 +12003,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 	}
 	switch name {
+	case optimizer.FieldSelectFuncName:
+		return evalFieldSelect(x, slot, ctx)
 	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
 		// range_constructor2 / range_constructor3 (rangetypes.c). goopg's
 		// pg_proc seed has carried these twelve rows since the range-type

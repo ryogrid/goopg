@@ -548,6 +548,8 @@ func targetHasBareAggregate(e parser.Expr) bool {
 		return targetHasBareAggregate(x.Operand)
 	case *parser.IndirectionStar:
 		return targetHasBareAggregate(x.Source)
+	case *parser.FieldSelect:
+		return targetHasBareAggregate(x.Arg)
 	}
 	return false
 }
@@ -1043,6 +1045,8 @@ func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) e
 		return resolveWindowRefsInExpr(x.Operand, defs)
 	case *parser.CollateExpr:
 		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.FieldSelect:
+		return resolveWindowRefsInExpr(x.Arg, defs)
 	case *parser.IsDistinctFromExpr:
 		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
 			return err
@@ -1119,6 +1123,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		return exprHasWindowFunc(x.Operand)
 	case *parser.CollateExpr:
 		return exprHasWindowFunc(x.Operand)
+	case *parser.FieldSelect:
+		return exprHasWindowFunc(x.Arg)
 	case *parser.IsDistinctFromExpr:
 		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
 	case *parser.InExpr:
@@ -1202,6 +1208,8 @@ func exprHasSRF(e parser.Expr, cat catalog.Catalog) bool {
 		return exprHasSRF(x.Operand, cat)
 	case *parser.CollateExpr:
 		return exprHasSRF(x.Operand, cat)
+	case *parser.FieldSelect:
+		return exprHasSRF(x.Arg, cat)
 	case *parser.IsDistinctFromExpr:
 		return exprHasSRF(x.Left, cat) || exprHasSRF(x.Right, cat)
 	case *parser.InExpr:
@@ -1757,6 +1765,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "record"}, nil
+	case *parser.FieldSelect:
+		// `(expr).field` — walk the operand for analysis errors and
+		// correlated references; the field's type is resolved by the planner
+		// against the operand's composite type (M0146-0047b), so it is
+		// reported as `unknown` here, which the comparability checks accept.
+		if _, err := analyzeExpr(x.Arg, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.RowExpr:
 		// Row constructor (a, b, c): validate each element and return text.
 		// Used in `(a,b) IN (VALUES ...)` expansion. M0097-0020.

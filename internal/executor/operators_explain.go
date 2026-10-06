@@ -3928,6 +3928,21 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
+		// Composite field selection's run-time form renders as the SQL it
+		// came from: ruleutils' T_FieldSelect arm parenthesises the operand
+		// (unless it is itself a field selection) and appends the quoted
+		// field name (M0146-0047b).
+		if x.Name == optimizer.FieldSelectFuncName && len(x.Args) == 3 {
+			field := ""
+			if sc, ok := x.Args[2].(*optimizer.StringConst); ok {
+				field = sc.Value
+			}
+			arg := formatExprQual(x.Args[0], reg, qualify)
+			if inner, ok := x.Args[0].(*optimizer.FuncCall); !ok || inner.Name != optimizer.FieldSelectFuncName {
+				arg = "(" + arg + ")"
+			}
+			return arg + "." + pgQuoteIdent(field)
+		}
 		// R66: renderer-synthesised Star/Distinct aggregate calls.
 		// Star fires only on aggregate-derived objects: scalar Star
 		// FuncCalls exist transiently in the planner but none survives

@@ -10159,6 +10159,8 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planSubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.ArraySubqueryExpr:
 		return planArraySubqueryExpr(x, buildHavingParentCtx(agg))
+	case *parser.FieldSelect:
+		return resolveFieldSelectAfterAggregate(x, agg)
 	case *parser.CollateExpr:
 		inner, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -10235,7 +10237,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if oc, ok := resolved.(*OuterColumnRef); ok {
 			return oc, nil
 		}
-		col := resolved.(*ColumnRef)
+		col, isCol := resolved.(*ColumnRef)
+		if !isCol {
+			// A bare relation name is a whole-row reference (a RowExpr of
+			// its columns), which no grouping column covers: PG's
+			// check_ungrouped_columns reports it as "b.*". This arm used to
+			// type-assert a ColumnRef and panic the backend
+			// (`SELECT b, count(*) FROM t b GROUP BY x`; M0146-0047b).
+			return nil, &PlanError{Pos: x.Pos(), Code: "42803",
+				Message: fmt.Sprintf("column \"%s.*\" must appear in the GROUP BY clause or be used in an aggregate function", x.Column)}
+		}
 		idx, ok := agg.groupByInputCol[col.Index]
 		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
 		// GROUP BY f1 (USING-merged) does NOT satisfy SELECT t1.f1 (qualified).
@@ -15246,6 +15257,12 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
 		return t.Alias, exprType(e)
 	}
+	// FigureColname names `(expr).field` by its last indirection step, the
+	// field name (parse_target.c FigureColnameInternal, A_Indirection) —
+	// whatever the selection resolved to (M0146-0047b).
+	if fs, ok := t.Expr.(*parser.FieldSelect); ok {
+		return strings.ToLower(fs.Field), exprType(e)
+	}
 	// FigureColname (parse_target.c) names a bare column reference by the
 	// name as WRITTEN. The resolved ref carries the column it reads, which is
 	// the same name except through a pulled-up derived table
@@ -17312,6 +17329,8 @@ func castTargetTakesStringLiteral(typeName string) bool {
 
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
+	case *parser.FieldSelect:
+		return resolveFieldSelect(x, ctx)
 	case *parser.IntegerConst:
 		return &IntegerConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.NumericConst:

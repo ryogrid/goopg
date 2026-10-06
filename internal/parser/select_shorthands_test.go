@@ -38,10 +38,22 @@ func TestSelectShorthandsAndTempViews(t *testing.T) {
 	} {
 		assertParity(t, q)
 	}
-	// Legacy rejects the non-star indirection forms outright, and TABLE takes
-	// no trailing clauses.
-	assertBothReject(t, "select (row(1, 2.0)).f1")
-	assertBothReject(t, "select (a).b from t")
+	// Field selection `(expr).field` — PG's c_expr `'(' a_expr ')'
+	// opt_indirection` with an attr_name step (M0146-0047b). Legacy rejected
+	// these; the grammar is the PG-faithful side.
+	for _, q := range []string{
+		"select (row(1, 2.0)).f1",
+		"select (a).b from t",
+		"SELECT (b).x FROM wb b",
+		"SELECT (b.*).x FROM wb b",
+		"SELECT (c).p FROM (SELECT ROW(1,2)::ct AS c) s",
+		"SELECT ((ROW(1,'z')::ct)).q",
+		"SELECT (mk()).p, (mk()).q",
+		"SELECT x FROM wb b WHERE (b).y = 'a'",
+		"SELECT f1, (q).c1, (qq.q).c1.i FROM quadtable qq",
+	} {
+		assertParity(t, q)
+	}
 	// PG ACCEPTS this: select_no_parens wraps simple_select (gram.y:12970
 	// `TABLE relation_expr`) with opt_sort_clause. Legacy rejected it; the
 	// grammar is the PG-faithful side.

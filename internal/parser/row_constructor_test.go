@@ -39,9 +39,12 @@ func TestImplicitRowConstructor(t *testing.T) {
 	} {
 		assertParity(t, q)
 	}
+	// `(a).b` is composite field selection, which PG accepts (gram.y c_expr
+	// `'(' a_expr ')' opt_indirection`); the implicit row `(a, b)` takes no
+	// indirection in PG either (implicit_row), so `(a, b).f1` stays an error.
+	assertParity(t, "SELECT (a).b FROM t")
 	for _, q := range []string{
 		"SELECT (a, b).f1 FROM t",
-		"SELECT (a).b FROM t",
 		"SELECT (a, b) OVERLAPS (c, d)",
 	} {
 		assertBothReject(t, q)

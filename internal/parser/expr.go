@@ -527,6 +527,21 @@ type IndirectionStar struct {
 func (e *IndirectionStar) Pos() int { return e.pos }
 func (*IndirectionStar) exprNode()  {}
 
+// FieldSelect is composite field selection `(expr).field` — gram.y c_expr
+// `'(' a_expr ')' opt_indirection` with one attr_name step, which
+// transformIndirection turns into a FieldSelect (ParseFuncOrColumn). Arg is
+// the parenthesised operand; Field the lower-cased field name. The position
+// is the '(' — where PG's caret points for "column ... not found in data
+// type" (M0146-0047b).
+type FieldSelect struct {
+	pos   int
+	Arg   Expr
+	Field string
+}
+
+func (e *FieldSelect) Pos() int { return e.pos }
+func (*FieldSelect) exprNode()  {}
+
 // RowExpr represents a row constructor `(a, b, c)` (shorthand for ROW(a,b,c)).
 // Emitted by parsePrimary when a comma follows the first parenthesised expression. M0097-0020.
 type RowExpr struct {

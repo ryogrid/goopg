@@ -166,7 +166,7 @@
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
-%type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
+%type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call field_select_expr
 %type <expr>	func_expr_common_subexpr
 %type <str>	sql_value_func_name unicode_normal_form
 %type <node>	cse_wl when_then filter_clause within_group_clause
@@ -2798,6 +2798,22 @@ a_expr:
 				$$ = buildBetween($<p>2, $1, $5, $7, true, true)
 			}
 
+/* `(expr).field` — composite field selection: gram.y c_expr
+   `'(' a_expr ')' opt_indirection` with `'.' attr_name` steps
+   (transformIndirection → one FieldSelect per step). Left-recursive, so
+   `(q).c1.i` selects c1 and then its field i. The planner resolves each field
+   against its operand's composite type, or, for a bare name, against the
+   relation of that name (`(b).x` = `b.x`). Position: the '(' (M0146-0047b). */
+field_select_expr:
+		'(' a_expr ')' '.' attr_name
+			{
+				$$ = NewFieldSelect($<p>1, $2, $5)
+			}
+	| field_select_expr '.' attr_name
+			{
+				$$ = NewFieldSelect($1.Pos(), $1, $3)
+			}
+
 /* c_expr — gram.y :15640ff, P1.1 subset: literals, parameters, column refs. */
 c_expr:
 	/* NOT PORTED: `tbl.*` as an EXPRESSION (whole-row expansion — VALUES(n.*),
@@ -2829,6 +2845,11 @@ c_expr:
 	| '(' a_expr ')' '.' '*'
 			{
 				$$ = NewIndirectionStar($<p>1, $2)
+			}
+	/* `(expr).field[.field…]` — composite field selection (field_select_expr). */
+	| field_select_expr
+			{
+				$$ = $1
 			}
 	/* Implicit row constructor — gram.y implicit_row (:16632), spelled with a
 	   mandatory second element so it cannot collide with grouping parens.
