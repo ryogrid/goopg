@@ -72,7 +72,7 @@ func sortPrefixEqual(a, b []Datum, keys []optimizer.SortKey, n int) bool {
 	if keys[i].Expr != nil {
 		pos = keys[i].Expr.Pos()
 	}
-		cmp, err := compareDatum(av, bv, pos)
+		cmp, err := compareDatumTyped(av, bv, pos, keys[i].Expr)
 		if err != nil {
 			// Defensive: for non-null Datums compareDatum effectively
 			// never errors (cross-kind falls back to Format-compare);

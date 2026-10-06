@@ -1307,6 +1307,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			// can format it with strconv.FormatFloat rather than big.Int decimal expansion.
 			return NewStringDatum(fs), nil
 		}
+		// Two character-string operands compare as text, whatever their
+		// values look like (M0146-0053; the compiled twin reads the same
+		// decision from payload[16] bit 2). Ahead of the pg_lsn shape test,
+		// which would otherwise claim an "X/Y"-shaped text value.
+		if isComparisonOpCode(x.Op) && textShapeAmbiguous(left, right) &&
+			exprIsCharacterString(x.Left) && exprIsCharacterString(x.Right) {
+			return binaryTextComparison(x.Op, left, right, declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right),
+				isBareStringLit(x.Left), isBareStringLit(x.Right)), nil
+		}
 		// pg_lsn arithmetic/comparison: detect KindString "X/Y" pattern.
 		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
@@ -1432,7 +1441,8 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		lv, rv = comparisonOperandsAsBpchar(parser.OpEq, lv, rv,
 			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right),
 			isBareStringLit(x.Left), isBareStringLit(x.Right))
-		return evalIsDistinctFrom(lv, rv, x.Negated)
+		plain := textShapeAmbiguous(lv, rv) && exprIsCharacterString(x.Left) && exprIsCharacterString(x.Right)
+		return evalIsDistinctFrom(lv, rv, x.Negated, plain)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -1441,14 +1451,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 //
 //	IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
 //	IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
-func evalIsDistinctFrom(lv, rv Datum, negated bool) (Datum, error) {
+//
+// plain: both operands are character strings, which compare as text
+// whatever the values look like (M0146-0053).
+func evalIsDistinctFrom(lv, rv Datum, negated bool, plain bool) (Datum, error) {
 	var equal bool
 	if lv.IsNull() && rv.IsNull() {
 		equal = true
 	} else if lv.IsNull() || rv.IsNull() {
 		equal = false
 	} else {
-		cmp, err := compareDatum(lv, rv, 0)
+		cmp, err := compareDatumPlain(lv, rv, 0, plain)
 		if err != nil {
 			equal = false
 		} else {
@@ -17665,7 +17678,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				best = v
 				continue
 			}
-			cmp, cerr := compareDatum(v, best, x.Pos())
+			cmp, cerr := compareDatumTyped(v, best, x.Pos(), arg)
 			if cerr != nil || cmp > 0 {
 				best = v
 			}
@@ -17682,7 +17695,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				best = v
 				continue
 			}
-			cmp, cerr := compareDatum(v, best, x.Pos())
+			cmp, cerr := compareDatumTyped(v, best, x.Pos(), arg)
 			if cerr != nil || cmp < 0 {
 				best = v
 			}
@@ -21118,7 +21131,8 @@ func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, sl
 		lDat, rDat = comparisonOperandsAsBpchar(parser.OpEq, lDat, rDat,
 			declaredBpcharTypmod(left.Elems[i]), declaredBpcharTypmod(right.Elems[i]),
 			isBareStringLit(left.Elems[i]), isBareStringLit(right.Elems[i]))
-		cmp, err := compareDatum(lDat, rDat, 0)
+		cmp, err := compareDatumPlain(lDat, rDat, 0, textShapeAmbiguous(lDat, rDat) &&
+			exprIsCharacterString(left.Elems[i]) && exprIsCharacterString(right.Elems[i]))
 		if err != nil {
 			return Datum{}, err
 		}

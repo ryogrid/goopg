@@ -258,6 +258,12 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		if isBareStringLit(t.Right) {
 			(*s)[idx].payload[16] |= 2
 		}
+		// Bit 2: a comparison of two character-string operands, which
+		// compares as text whatever the values look like (M0146-0053;
+		// sibling of the interpreted twin's exprIsCharacterString test).
+		if isComparisonOpCode(t.Op) && exprIsCharacterString(t.Left) && exprIsCharacterString(t.Right) {
+			(*s)[idx].payload[16] |= 4
+		}
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -442,6 +448,11 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// these three helpers raise is stamped with it on the interpreted twin.
 		// M0127-PS6.2.
 		pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
+		if n.payload[16]&4 != 0 && textShapeAmbiguous(left, right) {
+			return binaryTextComparison(op, left, right,
+				int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
+				n.payload[16]&1 != 0, n.payload[16]&2 != 0), nil
+		}
 		// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {

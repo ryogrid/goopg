@@ -147,7 +147,7 @@ func (o *incrementalSortOp) lessKeyVals(a, b []Datum) (bool, error) {
 		if k.Expr != nil {
 			pos = k.Expr.Pos()
 		}
-		cmp, err := compareDatum(av, bv, pos)
+		cmp, err := compareDatumTyped(av, bv, pos, k.Expr)
 		if err != nil {
 			return false, err
 		}

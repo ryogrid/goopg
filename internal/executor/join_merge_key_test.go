@@ -112,7 +112,7 @@ func countMergeGroups(t *testing.T, keyed []mergeStreamRow) int {
 	}
 	groups := 1
 	for i := 1; i < len(keyed); i++ {
-		cmp, err := compareMergeKeys(keyed[i-1].keys, keyed[i].keys, 0)
+		cmp, err := compareMergeKeys(keyed[i-1].keys, keyed[i].keys, 0, nil)
 		if err != nil {
 			t.Fatalf("compareMergeKeys: %v", err)
 		}

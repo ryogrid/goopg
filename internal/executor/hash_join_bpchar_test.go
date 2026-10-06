@@ -181,30 +181,28 @@ func TestHashJoinBpcharTrailingSpaceAgreement(t *testing.T) {
 	}
 }
 
-// TestHashJoinBpcharUUIDCaseMissParity pins the review-note-1 direction-1
-// class: `compareDatum` normalizes UUID case, so the scalar `=` is TRUE,
-// but the key encodings (`"s:" + raw bytes`) differ and the rows never
-// meet — the join is empty. Pre-slice the char pair met via the residual
-// (count 1); post-slice it misses (count 0). The varchar pair is the
-// status-quo control: the SAME folding was accepted for varchar at P2.2,
-// so varchar misses identically — the slice introduces no NEW behavior
-// class, only parity with the existing one. Corpus-harmless (no in-scope
-// TPC-DS values have these shapes).
+// TestHashJoinBpcharUUIDCaseMissParity pins the UUID-shaped, case-different
+// char and varchar pair against PG 18.3: the values are text, so `=` is
+// FALSE and the join is empty (PG answers f / 0 for both). The scalar `=`
+// used to say TRUE — compareDatum normalised UUID-shaped strings whatever
+// their type — so it disagreed with the join keys, which never met. Since
+// M0146-0053 a comparison of two character-string operands is plain text,
+// and the scalar and the join agree.
 func TestHashJoinBpcharUUIDCaseMissParity(t *testing.T) {
 	ctx, cleanup := bpcharJoinFixture(t)
 	defer cleanup()
 
-	if got := bpcharValues(t, ctx, "SELECT ua.id = ub.id FROM ua, ub"); got != "t" {
-		t.Fatalf("normalizer premise broken: char UUID `=` = %q, want \"t\"", got)
+	if got := bpcharValues(t, ctx, "SELECT ua.id = ub.id FROM ua, ub"); got != "f" {
+		t.Errorf("char UUID-case `=` = %q, want \"f\" (text comparison — PG 18.3)", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT xa.id = xb.id FROM xa, xb"); got != "t" {
-		t.Fatalf("normalizer premise broken: varchar UUID `=` = %q, want \"t\"", got)
+	if got := bpcharValues(t, ctx, "SELECT xa.id = xb.id FROM xa, xb"); got != "f" {
+		t.Errorf("varchar UUID-case `=` = %q, want \"f\" (text comparison — PG 18.3)", got)
 	}
 	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ua JOIN ub ON ua.id = ub.id"); got != "0" {
-		t.Errorf("char UUID-case join count = %q, want \"0\" (direction-1 miss after folding)", got)
+		t.Errorf("char UUID-case join count = %q, want \"0\" (PG 18.3)", got)
 	}
 	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM xa JOIN xb ON xa.id = xb.id"); got != "0" {
-		t.Errorf("varchar UUID-case control count = %q, want \"0\" (P2.2 status quo)", got)
+		t.Errorf("varchar UUID-case join count = %q, want \"0\" (PG 18.3)", got)
 	}
 }
 

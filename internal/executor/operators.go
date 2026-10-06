@@ -1269,7 +1269,7 @@ func (o *sortOp) lessKeyVals(a, b []Datum) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatum(av, bv, k.Expr.Pos())
+		cmp, err := compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err
@@ -1617,7 +1617,7 @@ func (o *sortOp) lessRows(a, b Row) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatum(av, bv, k.Expr.Pos())
+		cmp, err := compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err

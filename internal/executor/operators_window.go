@@ -142,7 +142,7 @@ func (o *windowOp) Open(ctx *Context) error {
 			}
 			a, b := keys[perm[x]], keys[perm[y]]
 			for j, pe := range o.plan.PartitionBy {
-				cmp, decided, err := compareSortDatums(a[j], b[j], pe.Pos(), false, false)
+				cmp, decided, err := compareSortDatums(a[j], b[j], pe.Pos(), false, false, pe)
 				if err != nil {
 					sortErr = err
 					return false
@@ -153,7 +153,7 @@ func (o *windowOp) Open(ctx *Context) error {
 			}
 			off := len(o.plan.PartitionBy)
 			for j, ok := range o.plan.OrderBy {
-				cmp, decided, err := compareSortDatums(a[off+j], b[off+j], ok.Expr.Pos(), ok.Desc, ok.NullsFirst)
+				cmp, decided, err := compareSortDatums(a[off+j], b[off+j], ok.Expr.Pos(), ok.Desc, ok.NullsFirst, ok.Expr)
 				if err != nil {
 					sortErr = err
 					return false
@@ -1221,7 +1221,7 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 		if i < len(o.obTrims) && o.obTrims[i] {
 			a, b = trimStringDatum(a), trimStringDatum(b)
 		}
-		cmp, err := compareDatum(a, b, ok.Expr.Pos())
+		cmp, err := compareDatumTyped(a, b, ok.Expr.Pos(), ok.Expr)
 		if err != nil {
 			return false, err
 		}
@@ -1242,7 +1242,7 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 // Formula for NULL vs non-null:
 //   cmp = 1  when nullsFirst == desc  (both true or both false)
 //   cmp = -1 when nullsFirst != desc
-func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int, decided bool, err error) {
+func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool, e optimizer.Expr) (cmp int, decided bool, err error) {
 	if a.IsNull() && !b.IsNull() {
 		if nullsFirst == desc {
 			return 1, true, nil
@@ -1258,7 +1258,7 @@ func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int
 	if a.IsNull() && b.IsNull() {
 		return 0, false, nil
 	}
-	c, err := compareDatum(a, b, pos)
+	c, err := compareDatumTyped(a, b, pos, e)
 	if err != nil {
 		return 0, false, err
 	}

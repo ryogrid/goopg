@@ -50,7 +50,7 @@ func aggregateIsDecomposable(call optimizer.AggregateCall) bool {
 // rule for — which should be unreachable, because the planner consults
 // aggregateIsDecomposable first, but an unreachable wrong answer is worse than
 // an unreachable error.
-func combineAggRuntime(name string, dst, src *aggRuntime) error {
+func combineAggRuntime(name string, dst, src *aggRuntime, arg optimizer.Expr) error {
 	switch normalizeAggName(name) {
 	case "count":
 		dst.count += src.count
@@ -70,11 +70,11 @@ func combineAggRuntime(name string, dst, src *aggRuntime) error {
 		}
 
 	case "min":
-		if err := combineExtremum(dst, src, true); err != nil {
+		if err := combineExtremum(dst, src, true, arg); err != nil {
 			return err
 		}
 	case "max":
-		if err := combineExtremum(dst, src, false); err != nil {
+		if err := combineExtremum(dst, src, false, arg); err != nil {
 			return err
 		}
 
@@ -189,7 +189,7 @@ func combineFloatSpecial(a, b floatSpecialKind) floatSpecialKind {
 }
 
 // combineExtremum merges min/max state.
-func combineExtremum(dst, src *aggRuntime, wantMin bool) error {
+func combineExtremum(dst, src *aggRuntime, wantMin bool, arg optimizer.Expr) error {
 	if !src.hasValue {
 		return nil
 	}
@@ -197,7 +197,7 @@ func combineExtremum(dst, src *aggRuntime, wantMin bool) error {
 		dst.value, dst.hasValue = src.value, true
 		return nil
 	}
-	cmp, err := compareDatum(src.value, dst.value, 0)
+	cmp, err := compareDatumTyped(src.value, dst.value, 0, arg)
 	if err != nil {
 		return err
 	}

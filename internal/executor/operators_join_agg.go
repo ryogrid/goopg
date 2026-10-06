@@ -171,6 +171,10 @@ type joinOp struct {
 	mergeResidualNode int32
 	mergeResidSlot    *MaterializedSlot
 	mergeCompiled     bool
+	// mergeKeyText flags key pairs whose two sides are both character
+	// strings: they order as plain text whatever the values look like
+	// (M0146-0053). Filled by compileMergeExprs.
+	mergeKeyText []bool
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
@@ -2856,7 +2860,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 					}
 					return !av.IsNull() // NULLS LAST
 				}
-				cmp, _ := compareDatum(av, bv, 0)
+				cmp, _ := compareDatumTyped(av, bv, 0, groupExprAt(o.plan, c))
 				if cmp != 0 {
 					return cmp < 0
 				}
@@ -2881,7 +2885,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 			ra, rb := o.rows[i], o.rows[j]
 			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
-				c, _ := compareDatum(ra[k], rb[k], 0)
+				c, _ := compareDatumTyped(ra[k], rb[k], 0, groupExprAt(o.plan, k))
 				if c < 0 {
 					return true
 				}
@@ -3021,7 +3025,7 @@ func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, orde
 		sort.SliceStable(o.rows, func(a, b int) bool {
 			ra, rb := o.rows[a], o.rows[b]
 			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
-				c, _ := compareDatum(ra[k], rb[k], 0)
+				c, _ := compareDatumTyped(ra[k], rb[k], 0, groupExprAt(o.plan, k))
 				if c != 0 {
 					return c < 0
 				}
@@ -3240,7 +3244,7 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 		*order = append(*order, key)
 	}
 	for i := range dr.states {
-		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i]); err != nil {
+		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
 			return err
 		}
 	}
@@ -3355,7 +3359,7 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 					if ko.pos >= len(dr.gv) || ko.pos >= len(cur.groupValues) {
 						break
 					}
-					c, cerr := compareDatumWithNullsFirst(cur.groupValues[ko.pos], dr.gv[ko.pos], ko.nullsFirst, ko.desc)
+					c, cerr := compareDatumWithNullsFirst(cur.groupValues[ko.pos], dr.gv[ko.pos], ko.nullsFirst, ko.desc, groupExprAt(o.plan, ko.pos))
 					if cerr != nil {
 						return cerr
 					}
@@ -3395,7 +3399,7 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 			curParts = dr.keyParts
 		}
 		for i := range dr.states {
-			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i]); err != nil {
+			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
 				return err
 			}
 		}
@@ -3958,7 +3962,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			return nil
 		}
-		cmp, err := compareDatum(arg, st.value, call.Pos())
+		cmp, err := compareDatumTyped(arg, st.value, call.Pos(), call.Arg)
 		if err != nil {
 			return err
 		}
@@ -3971,7 +3975,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			return nil
 		}
-		cmp, err := compareDatum(arg, st.value, call.Pos())
+		cmp, err := compareDatumTyped(arg, st.value, call.Pos(), call.Arg)
 		if err != nil {
 			return err
 		}
@@ -4458,7 +4462,7 @@ func aggOrderBySortedIdx(keys [][]Datum, orderBy []optimizer.SortKey) []int {
 			if bkNull {
 				return !nullsFirst
 			}
-			cmp, err := compareDatum(ka[ki], kb[ki], 0)
+			cmp, err := compareDatumTyped(ka[ki], kb[ki], 0, sortKeyExprAt(orderBy, ki))
 			if err != nil || cmp == 0 {
 				continue
 			}
@@ -4503,7 +4507,7 @@ func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.So
 			// direct arg is NULL: row is non-NULL, comes after NULL if nullsFirst
 			return !nullsFirst
 		}
-		cmp, err := compareDatum(ri, di, 0)
+		cmp, err := compareDatumTyped(ri, di, 0, sk.Expr)
 		if err != nil {
 			return false
 		}
@@ -4520,7 +4524,7 @@ func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.So
 
 // compareDatumWithNullsFirst compares two Datums respecting nullsFirst and desc flags.
 // Returns negative if a < b, zero if equal, positive if a > b in the sort order.
-func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool) (int, error) {
+func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool, e optimizer.Expr) (int, error) {
 	aNull, bNull := a.IsNull(), b.IsNull()
 	if aNull && bNull {
 		return 0, nil
@@ -4537,7 +4541,7 @@ func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool) (int, er
 		}
 		return -1, nil
 	}
-	cmp, err := compareDatum(a, b, 0)
+	cmp, err := compareDatumTyped(a, b, 0, e)
 	if err != nil {
 		return 0, err
 	}
@@ -4820,7 +4824,7 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 						if bNull {
 							return !nullsFirst
 						}
-						cmp, err := compareDatum(ai, bi, 0)
+						cmp, err := compareDatumTyped(ai, bi, 0, call.OrderBy[ki].Expr)
 						if err != nil || cmp == 0 {
 							continue
 						}
@@ -5795,7 +5799,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if bNull {
 				return !nullsFirst
 			}
-			cmp, err := compareDatum(ai, bi, 0)
+			cmp, err := compareDatumTyped(ai, bi, 0, sk.Expr)
 			if err != nil || cmp == 0 {
 				continue
 			}
@@ -5959,7 +5963,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 				if val.IsNull() {
 					continue
 				}
-				cmp, cerr := compareDatumWithNullsFirst(val, v, call.WithinGroupOrderBy[0].NullsFirst, call.WithinGroupOrderBy[0].Desc)
+				cmp, cerr := compareDatumWithNullsFirst(val, v, call.WithinGroupOrderBy[0].NullsFirst, call.WithinGroupOrderBy[0].Desc, call.WithinGroupOrderBy[0].Expr)
 				if cerr != nil {
 					continue
 				}
@@ -5993,7 +5997,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 				if val.IsNull() {
 					continue
 				}
-				cmp, cerr := compareDatum(val, v, 0)
+				cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 				if cerr != nil {
 					continue
 				}
@@ -6016,7 +6020,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if val.IsNull() {
 				continue
 			}
-			cmp, cerr := compareDatum(val, v, 0)
+			cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 			if cerr != nil {
 				continue
 			}
@@ -6043,7 +6047,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if val.IsNull() {
 				continue
 			}
-			cmp, cerr := compareDatum(val, v, 0)
+			cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 			if cerr != nil {
 				continue
 			}

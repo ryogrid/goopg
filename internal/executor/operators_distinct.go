@@ -27,6 +27,9 @@ type distinctOp struct {
 	// comparison run on the bcTruelen image so a char(20) 'x' and a
 	// char(5) 'x' are one row — hashbpchar/bpcharlt parity. M0146.
 	colTrims []bool
+	// colText flags character-string columns, whose output-order
+	// comparison is plain text whatever the values look like (M0146-0053).
+	colText []bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
@@ -40,7 +43,7 @@ func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
 		}
 	}
 	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk,
-		colTrims: bpcharSchemaTrims(p.Output())}
+		colTrims: bpcharSchemaTrims(p.Output()), colText: characterStringSchemaCols(p.Output())}
 }
 
 func (o *distinctOp) Schema() optimizer.Schema { return o.schema }
@@ -112,7 +115,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 			if col < len(o.colTrims) && o.colTrims[col] {
 				a, b = trimStringDatum(a), trimStringDatum(b)
 			}
-			cmp, err := compareDatum(a, b, 0)
+			cmp, err := compareDatumPlain(a, b, 0, col < len(o.colText) && o.colText[col])
 			if err != nil || cmp == 0 {
 				continue
 			}

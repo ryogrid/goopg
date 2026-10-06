@@ -454,7 +454,7 @@ func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatum(av, bv, 0)
+		cmp, err := compareDatumTyped(av, bv, 0, k.Expr)
 		if err != nil {
 			if *errp == nil {
 				*errp = err

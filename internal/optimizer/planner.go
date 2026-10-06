@@ -15809,7 +15809,7 @@ func exprType(e Expr) catalog.Type {
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
 	case *RowExpr:
-		return catalog.Type{Name: "text"} // composite displayed as text
+		return catalog.Type{Name: "record"} // PG: ROW(...) is an anonymous record (M0146-0053)
 	case *MergeActionExpr:
 		return catalog.Type{Name: "text"}
 	case *MergeWholeRowRef:
@@ -15993,6 +15993,11 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: x.ReturnType}
 		}
 		switch strings.ToLower(x.Name) {
+		case "row":
+			// `row(a, b)` reaches the planner as a call named row; PG's
+			// RowExpr is an anonymous record (M0146-0053) — a VALUES column
+			// of them is record, not the all-unknown fallback text.
+			return catalog.Type{Name: "record"}
 		// pg_typeof(expr) declares SQL return type regtype, whose wire/
 		// binary representation is the type's OID (executor/expr.go's
 		// "pg_typeof" case now returns a KindInt OID Datum, not display

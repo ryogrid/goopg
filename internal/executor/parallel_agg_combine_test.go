@@ -132,7 +132,7 @@ func (h *aggHarness) run(values []Datum, parts int) (serial, combined Datum) {
 	}
 	acc := states[0]
 	for i := 1; i < parts; i++ {
-		if err := combineAggRuntime(h.name, &acc, &states[i]); err != nil {
+		if err := combineAggRuntime(h.name, &acc, &states[i], nil); err != nil {
 			h.t.Fatalf("%s combine: %v", h.name, err)
 		}
 	}
@@ -212,7 +212,7 @@ func TestCombineVarianceEmptyPartial(t *testing.T) {
 	before := withData
 
 	// empty into populated
-	if err := combineAggRuntime("var_pop", &withData, &empty); err != nil {
+	if err := combineAggRuntime("var_pop", &withData, &empty, nil); err != nil {
 		t.Fatalf("combine empty into populated: %v", err)
 	}
 	if withData.count != before.count || math.IsNaN(withData.floatM2) {
@@ -221,7 +221,7 @@ func TestCombineVarianceEmptyPartial(t *testing.T) {
 
 	// populated into empty
 	var acc aggRuntime
-	if err := combineAggRuntime("var_pop", &acc, &before); err != nil {
+	if err := combineAggRuntime("var_pop", &acc, &before, nil); err != nil {
 		t.Fatalf("combine populated into empty: %v", err)
 	}
 	if acc.count != before.count {
@@ -289,7 +289,7 @@ func TestCombineExactIntegerLane(t *testing.T) {
 // no combine rule must error rather than return a plausible wrong answer.
 func TestCombineRejectsUnknownAggregate(t *testing.T) {
 	var a, b aggRuntime
-	if err := combineAggRuntime("array_agg", &a, &b); err == nil {
+	if err := combineAggRuntime("array_agg", &a, &b, nil); err == nil {
 		t.Error("an aggregate with no combine rule must error, not guess")
 	}
 }

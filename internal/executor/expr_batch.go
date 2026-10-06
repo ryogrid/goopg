@@ -155,7 +155,21 @@ func evalFilterBatch(pred optimizer.Expr, slots []*MaterializedSlot, ctx *Contex
 			return err
 		}
 	}
-	return evalBinaryBatch(b.Op, left, right, out[:len(slots)])
+	if err := evalBinaryBatch(b.Op, left, right, out[:len(slots)]); err != nil {
+		return err
+	}
+	// Two character-string operands compare as text whatever the values
+	// look like — the same decision both BinaryOp twins make (M0146-0053).
+	if exprIsCharacterString(b.Left) && exprIsCharacterString(b.Right) {
+		lbp, rbp := declaredBpcharTypmod(b.Left), declaredBpcharTypmod(b.Right)
+		lLit, rLit := isBareStringLit(b.Left), isBareStringLit(b.Right)
+		for i := range slots {
+			if textShapeAmbiguous(left[i], right[i]) {
+				out[i] = binaryTextComparison(b.Op, left[i], right[i], lbp, rbp, lLit, rLit)
+			}
+		}
+	}
+	return nil
 }
 
 // snapshotBatchSlot copies both the row and the slot identity. Calling
