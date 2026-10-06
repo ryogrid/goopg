@@ -15777,6 +15777,15 @@ func exprType(e Expr) catalog.Type {
 	switch x := e.(type) {
 	case *ColumnRef:
 		return x.Type
+	case *OuterColumnRef:
+		// A correlated reference has its column's type (M0146-0062): it
+		// fell to "unknown", so `(SELECT pg_typeof(v.x))` printed unknown
+		// where PG prints integer, and arithmetic on it lost its int4
+		// overflow check.
+		if x.Type.Name != "" {
+			return x.Type
+		}
+		return catalog.Type{Name: "unknown"}
 	case *NumericConst:
 		return catalog.Type{Name: "numeric"}
 	case *IntegerConst:

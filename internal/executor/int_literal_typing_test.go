@@ -23,6 +23,8 @@ func TestIntegerLiteralIsInt4WhenItFits(t *testing.T) {
 			"integer|integer|bigint|integer|bigint"},
 		{"SELECT b + 1, pg_typeof(b + 1)::text FROM t62", "32768|integer"},
 		{"SELECT pg_typeof(x)::text FROM (VALUES (1)) v(x)", "integer"},
+		// A correlated reference keeps its type.
+		{"SELECT v.id, (SELECT pg_typeof(v.x)::text) FROM (VALUES (0, 9998)) v(id, x)", "0|integer"},
 		{"SELECT 2147483647::bigint + 1, (3000000000 - 2147483647) * 3, 7 / 2, 7 % 2", "2147483648|2557549059|3|1"},
 	} {
 		if got := strings.Join(renderRows(runSQL(t, ctx, c.query)), ";"); got != c.want {
