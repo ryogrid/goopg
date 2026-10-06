@@ -28114,7 +28114,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Ledgered: PG projects ctid as a scan column; a non\-spine consumer
       \(join qual\) above a gather still reads NULL\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0052 — WRONG RESULTS: `ORDER BY ctid DESC` returns ascending
+- [x] **M0146\-0052 — WRONG RESULTS: `ORDER BY ctid DESC` returns ascending
   order** \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT ctid FROM nation
   ORDER BY ctid DESC LIMIT 2` on the TPC\-H reference cluster returns
   `\(0,1\), \(0,2\)`; PG returns the highest ctids first\. Pre\-existing\.
@@ -28127,6 +28127,18 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     \(`evalSortKeyValue`\), where `CTIDExpr` reads NULL, so every key is
     NULL and the sort keeps input order\. Evaluate on the materialised
     slot with `evalSortKeyValueSlot` \(added by M0146\-0051\)\.
+  - Done 2026\-10\-06 \(`de7f5b92b`; design
+    `docs/design/0100\-0149/m0146\-0052\-sort\-by\-ctid\.md`\):
+    - Keys evaluate on the slot in sortOp, incremental sort and the Merge
+      Append merge\.
+    - `trackCTIDs` keeps the tid through a spill \(trailing spill\-record
+      column, read back by the merge\); `ctidsDisabled` removed\.
+    - A ctid key marks the child spine, and the marker crosses the slab
+      bridge, so a Gather below ships tids\.
+    - Test `TestSortByCTID` \(72 combinations, 60 fail at HEAD\)\.
+    - Ledgered: ctid keys compare as composite text, not `bttidcmp`;
+      spilled ctid sort ~3x an int sort\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0053 — WRONG RESULTS: `\(n,n\)`\-shaped text compares wrong**
   \(filed 2026\-10\-04 by M0146\-0009h\)\. `SELECT \'\(999,9\)\'::text >
   \'\(1241,10\)\'::text` returns f \(also with `COLLATE "C"`\); PG returns t\.
@@ -28138,6 +28150,13 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: M0146
   - First step: trace the comparison of two text Datums whose value
     parses as a point/tid literal\.
+  - Finding 2026\-10\-06 \(M0146\-0052\): the culprit is `compareDatum`\'s
+    KindString arm \(`internal/executor/expr\.go`\): any two strings that
+    both start with `\(` go through `compareRowStrings` \(M0097\-0115\)\.
+    `ctid` sort keys currently RELY on it, because `CTIDExpr` yields the
+    text `\(b,o\)`; the fix must keep `ORDER BY ctid` ordered
+    \(`TestSortByCTID`\), e\.g\. by typing the tid datum or by comparing
+    by expression type rather than by value shape\.
 - [ ] **M0146\-0054 — WRONG RESULTS: COPY leaves a column NULL when its
   volatile default cannot be evaluated** \(filed 2026\-10\-04 by
   M0146\-0009h\)\. `COPY t\(a,b\)` into a table with `c float8 DEFAULT random\(\)`
