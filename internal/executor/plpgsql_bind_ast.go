@@ -32,11 +32,7 @@ func bindPlpgsqlFrameVarsInExpr(e parser.Expr, frame *plpgsqlFrame) parser.Expr 
 	if e == nil || frame == nil {
 		return e
 	}
-	nv, changed := bindFrameVarsValue(reflect.ValueOf(&e).Elem(), frame, 0)
-	if !changed {
-		return e
-	}
-	return nv.Interface().(parser.Expr)
+	return rewriteParserExpr(e, frameVarReplacer(frame))
 }
 
 // bindPlpgsqlFrameVarsInSelect returns s with the frame's variables bound.
@@ -44,16 +40,41 @@ func bindPlpgsqlFrameVarsInSelect(s *parser.SelectStmt, frame *plpgsqlFrame) *pa
 	if s == nil || frame == nil {
 		return s
 	}
-	nv, changed := bindFrameVarsValue(reflect.ValueOf(s), frame, 0)
+	nv, changed := rewriteExprValue(reflect.ValueOf(s), frameVarReplacer(frame), 0)
 	if !changed {
 		return s
 	}
 	return nv.Interface().(*parser.SelectStmt)
 }
 
+func frameVarReplacer(frame *plpgsqlFrame) func(parser.Expr) (parser.Expr, bool) {
+	return func(x parser.Expr) (parser.Expr, bool) {
+		if cr, ok := x.(*parser.ColumnRef); ok {
+			return frameVarLiteral(cr, frame)
+		}
+		return nil, false
+	}
+}
+
+// rewriteParserExpr returns a copy of e in which every expression node for
+// which repl returns (replacement, true) is replaced. The copy is
+// copy-on-write: only nodes on a path to a replacement are cloned, so e
+// itself is never modified. Used for PL/pgSQL variable binding
+// (M0146-0072) and trigger WHEN binding (M0146-0077).
+func rewriteParserExpr(e parser.Expr, repl func(parser.Expr) (parser.Expr, bool)) parser.Expr {
+	if e == nil {
+		return e
+	}
+	nv, changed := rewriteExprValue(reflect.ValueOf(&e).Elem(), repl, 0)
+	if !changed {
+		return e
+	}
+	return nv.Interface().(parser.Expr)
+}
+
 var parserExprType = reflect.TypeOf((*parser.Expr)(nil)).Elem()
 
-func bindFrameVarsValue(v reflect.Value, frame *plpgsqlFrame, depth int) (reflect.Value, bool) {
+func rewriteExprValue(v reflect.Value, repl func(parser.Expr) (parser.Expr, bool), depth int) (reflect.Value, bool) {
 	if depth > 400 || !v.IsValid() {
 		return v, false
 	}
@@ -63,16 +84,13 @@ func bindFrameVarsValue(v reflect.Value, frame *plpgsqlFrame, depth int) (reflec
 			return v, false
 		}
 		if v.Type() == parserExprType {
-			if cr, ok := v.Interface().(*parser.ColumnRef); ok {
-				if lit, ok := frameVarLiteral(cr, frame); ok {
-					nv := reflect.New(v.Type()).Elem()
-					nv.Set(reflect.ValueOf(lit))
-					return nv, true
-				}
-				return v, false
+			if lit, ok := repl(v.Interface().(parser.Expr)); ok {
+				nv := reflect.New(v.Type()).Elem()
+				nv.Set(reflect.ValueOf(lit))
+				return nv, true
 			}
 		}
-		inner, changed := bindFrameVarsValue(v.Elem(), frame, depth+1)
+		inner, changed := rewriteExprValue(v.Elem(), repl, depth+1)
 		if !changed {
 			return v, false
 		}
@@ -83,7 +101,7 @@ func bindFrameVarsValue(v reflect.Value, frame *plpgsqlFrame, depth int) (reflec
 		if v.IsNil() {
 			return v, false
 		}
-		inner, changed := bindFrameVarsValue(v.Elem(), frame, depth+1)
+		inner, changed := rewriteExprValue(v.Elem(), repl, depth+1)
 		if !changed {
 			return v, false
 		}
@@ -97,7 +115,7 @@ func bindFrameVarsValue(v reflect.Value, frame *plpgsqlFrame, depth int) (reflec
 			if !v.Type().Field(i).IsExported() {
 				continue
 			}
-			nf, ch := bindFrameVarsValue(v.Field(i), frame, depth+1)
+			nf, ch := rewriteExprValue(v.Field(i), repl, depth+1)
 			if !ch {
 				continue
 			}
@@ -119,7 +137,7 @@ func bindFrameVarsValue(v reflect.Value, frame *plpgsqlFrame, depth int) (reflec
 		var ns reflect.Value
 		changed := false
 		for i := 0; i < v.Len(); i++ {
-			ne, ch := bindFrameVarsValue(v.Index(i), frame, depth+1)
+			ne, ch := rewriteExprValue(v.Index(i), repl, depth+1)
 			if !ch {
 				continue
 			}

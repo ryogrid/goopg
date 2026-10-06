@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // fireTriggers fires all matching triggers on tbl and returns the
@@ -52,6 +53,11 @@ func fireTriggersCols(ctx *Context, tbl *catalog.Table, timing, event string, ol
 			continue // row-level only; statement-level handled by fireStatementTriggers
 		}
 		if !triggerMatchesEvent(trig, timingLow, eventLow) || !triggerColumnsMatch(trig, eventLow, updCols) {
+			continue
+		}
+		if pass, err := triggerWhenPasses(ctx, tbl, trig, oldRow, newRow); err != nil {
+			return nil, false, err
+		} else if !pass {
 			continue
 		}
 		r := lookupTriggerRoutine(ctx, trig)
@@ -123,6 +129,11 @@ func fireStatementTriggersCols(ctx *Context, tbl *catalog.Table, timing, event s
 		if trig.OldTransitionTable != "" || trig.NewTransitionTable != "" {
 			continue
 		}
+		if pass, err := triggerWhenPasses(ctx, tbl, trig, nil, nil); err != nil {
+			return err
+		} else if !pass {
+			continue
+		}
 		r := lookupTriggerRoutine(ctx, trig)
 		if r == nil {
 			continue
@@ -144,6 +155,98 @@ func fireStatementTriggersCols(ctx *Context, tbl *catalog.Table, timing, event s
 		}
 	}
 	return nil
+}
+
+// triggerWhenPasses evaluates trig's WHEN condition against the event's
+// OLD and NEW rows (TriggerEnabled, trigger.c; M0146-0077). A trigger
+// without one always passes; a NULL result does not pass. OLD.col / NEW.col
+// become literals of the column's type and OLD / OLD.* / NEW / NEW.* become
+// ROW(...) of them, the same binding a PL/pgSQL variable gets
+// (rewriteParserExpr), so the condition is planned as an ordinary
+// expression. A row the event lacks binds as NULL: CREATE TRIGGER rejects a
+// WHEN that names it, so only a statement-level WHEN, which names neither,
+// reaches here with both rows nil.
+//
+// PG checks an AFTER ROW trigger's WHEN when the event is queued
+// (AfterTriggerSaveEvent). goopg checks it when the queued event fires. The
+// rows are the same at both points, so only the timing of a volatile
+// function inside WHEN differs (deferral ledger 2026-10-07).
+func triggerWhenPasses(ctx *Context, tbl *catalog.Table, trig *catalog.Trigger, oldRow, newRow Row) (bool, error) {
+	if trig.WhenExpr == nil {
+		return true, nil
+	}
+	rowOf := func(name string) (Row, bool) {
+		switch strings.ToLower(name) {
+		case "old":
+			return oldRow, true
+		case "new":
+			return newRow, true
+		}
+		return nil, false
+	}
+	rowLiteral := func(pos int, row Row) parser.Expr {
+		var elems []parser.Expr
+		for i, col := range tbl.Columns {
+			if col.Dropped {
+				continue
+			}
+			d := NullDatum
+			if i < len(row) {
+				d = row[i]
+			}
+			elems = append(elems, typedDatumLiteral(pos, d, col.Type))
+		}
+		return parser.NewRowExpr(pos, elems)
+	}
+	bound := rewriteParserExpr(trig.WhenExpr, func(x parser.Expr) (parser.Expr, bool) {
+		switch r := x.(type) {
+		case *parser.ColumnRef:
+			if r.Schema != "" {
+				return nil, false
+			}
+			if r.Table == "" {
+				if row, ok := rowOf(r.Column); ok {
+					return rowLiteral(r.Pos(), row), true
+				}
+				return nil, false
+			}
+			row, ok := rowOf(r.Table)
+			if !ok {
+				return nil, false
+			}
+			if r.Column == "*" {
+				return rowLiteral(r.Pos(), row), true
+			}
+			// System column: tableoid is the trigger's own relation.
+			// PG also exposes ctid / xmin / … of OLD (and of NEW in an
+			// AFTER trigger), which goopg's rows do not carry; such a
+			// reference is left unbound and fails to plan (ledgered).
+			if strings.EqualFold(r.Column, "tableoid") {
+				return typedDatumLiteral(r.Pos(), NewIntDatum(int64(tbl.OID)), catalog.Type{Name: "oid"}), true
+			}
+			for i, col := range tbl.Columns {
+				if !col.Dropped && strings.EqualFold(col.Name, r.Column) {
+					d := NullDatum
+					if i < len(row) {
+						d = row[i]
+					}
+					return typedDatumLiteral(r.Pos(), d, col.Type), true
+				}
+			}
+		case *parser.StarExpr:
+			if r.Schema == "" {
+				if row, ok := rowOf(r.Table); ok {
+					return rowLiteral(r.Pos(), row), true
+				}
+			}
+		}
+		return nil, false
+	})
+	d, err := evalExprViaSQL(bound, ctx)
+	if err != nil {
+		return false, err
+	}
+	return !d.IsNull() && d.Kind == KindBool && d.BoolValue(), nil
 }
 
 // triggerFireOrder returns the indices of tbl.Triggers in name order, the
