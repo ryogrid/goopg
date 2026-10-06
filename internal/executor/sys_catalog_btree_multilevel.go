@@ -406,6 +406,26 @@ func buildBulkSysBtreeLayoutVariable(sortedTuples [][]byte, nkeyatts uint16) ([]
 	return assembleSysBtreeLevels(leaves, leafGroups, nkeyatts, "bulk layout (variable)")
 }
 
+// rangeInts returns lo, lo+1, …, hi-1.
+func rangeInts(lo, hi int) []int {
+	out := make([]int, 0, max(hi-lo, 0))
+	for i := lo; i < hi; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// sysBtreeRebuildPin and sysBtreeRebuildPinNew are the rebuild's pin calls,
+// variables only so that a test can make one fail (M0146-0070).
+var (
+	sysBtreeRebuildPin = func(ctx *Context, tag storage.BufferTag) (*storage.Slot, error) {
+		return ctx.Pool.Pin(tag)
+	}
+	sysBtreeRebuildPinNew = func(ctx *Context, rel storage.RelFileNode) (*storage.Slot, storage.BlockNumber, error) {
+		return ctx.Pool.PinNew(rel)
+	}
+)
+
 // rebuildSysBtreeWithNewEntry is the fallback when an in-place leaf insert
 // returns ErrNoSpaceInPage on a multi-level tree. It re-collects every data
 // tuple in the index, merges the new tuple in sorted order, runs the bulk-
@@ -455,31 +475,59 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		return fmt.Errorf("rebuild: nblocks: %w", err)
 	}
 
-	for blk := 0; blk < nPages; blk++ {
-		var slot *storage.Slot
-		if storage.BlockNumber(blk) < curBlocks {
-			s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: storage.BlockNumber(blk)})
-			if perr != nil {
-				return fmt.Errorf("rebuild: pin blk %d: %w", blk, perr)
-			}
-			slot = s
-		} else {
-			s, newBlk, perr := ctx.Pool.PinNew(rel)
-			if perr != nil {
-				return fmt.Errorf("rebuild: extend at blk %d: %w", blk, perr)
-			}
-			if int(newBlk) != blk {
-				ctx.Pool.Unpin(s)
-				return fmt.Errorf("rebuild: PinNew returned blk %d, expected %d", newBlk, blk)
-			}
-			slot = s
-		}
+	// Write order (M0146-0070). The old loop pinned and wrote each block in
+	// ascending order: the metapage first, then the existing pages, and the
+	// new tail blocks were extended last. A PinNew failure (a victim-flush
+	// error, or the `PinNew returned blk` guard) therefore left a rewritten
+	// metapage and internal pages whose downlinks pointed past EOF, and the
+	// next descent failed `pin leaf blk N: short read`.
+	//
+	// The order now follows nbtree's rule (_bt_split, _bt_newroot): a page is
+	// written before anything that points to it.
+	//  1. Extend the file and write the new tail blocks. Nothing reaches them
+	//     yet; if a later step fails they stay unreachable, like the
+	//     trailing blocks a shrinking rebuild leaves behind.
+	//  2. Rewrite the existing non-meta blocks in ascending order. The bulk
+	//     layout puts the leaves at blocks 1..L and each internal level
+	//     after the one below it, so this is children before parents.
+	//  3. Rewrite the metapage last.
+	//
+	// Pages are pinned one at a time, as before: holding every pin at once
+	// fails on a small buffer pool ("no available buffer"). A pin failure
+	// in step 2 can still leave a tree that mixes old and new pages; no
+	// block it references lies past EOF any more (deferral ledger
+	// 2026-10-07).
+	write := func(slot *storage.Slot, blk int) {
 		slot.Lock()
-		src := imageBytes[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
-		copy(slot.Page(), src)
+		copy(slot.Page(), imageBytes[blk*storage.BlockSize:(blk+1)*storage.BlockSize])
 		ctx.Pool.MarkDirtyForceFPI(slot)
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
+	}
+	for blk := int(curBlocks); blk < nPages; blk++ {
+		s, newBlk, perr := sysBtreeRebuildPinNew(ctx, rel)
+		if perr != nil {
+			return fmt.Errorf("rebuild: extend at blk %d: %w", blk, perr)
+		}
+		if int(newBlk) != blk {
+			ctx.Pool.Unpin(s)
+			return fmt.Errorf("rebuild: PinNew returned blk %d, expected %d", newBlk, blk)
+		}
+		write(s, blk)
+	}
+	nExisting := nPages
+	if int(curBlocks) < nExisting {
+		nExisting = int(curBlocks)
+	}
+	for _, blk := range append(rangeInts(1, nExisting), 0) {
+		if blk >= nExisting {
+			continue
+		}
+		s, perr := sysBtreeRebuildPin(ctx, storage.BufferTag{Rel: rel, Block: storage.BlockNumber(blk)})
+		if perr != nil {
+			return fmt.Errorf("rebuild: pin blk %d: %w", blk, perr)
+		}
+		write(s, blk)
 	}
 	return nil
 }
