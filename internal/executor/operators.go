@@ -983,13 +983,18 @@ type sortOp struct {
 	// ctids carries the per-row TID side-channel (hasCTID / ctidBlock /
 	// ctidOff) in lockstep with rows so a parent LockRows can stamp row locks
 	// on `ORDER BY ... FOR UPDATE` queries (PG plans `LockRows → Sort`, with
-	// ctid as a resjunk column the sort preserves). Only the fully in-memory
-	// path preserves it: once the sort spills, ctidsDisabled is set and ctids
-	// is dropped — the N-way merge can't carry it. That is rare for row-locking
-	// queries and no worse than the prior behaviour (Sort lost the TID
-	// entirely). M0118-0003.
-	ctids         []sortCTID
-	ctidsDisabled bool
+	// ctid as a resjunk column the sort preserves). M0118-0003. It covers the
+	// in-memory chunk only: a spilled chunk writes each row's tid as a
+	// trailing column of its spill record and the merge reads it back
+	// (M0146-0052; before that a spill dropped the channel).
+	ctids []sortCTID
+	// trackCTIDs maintains ctids: a consumer wants them (wantCTIDs) or a
+	// sort key reads `ctid`, which a spilled row must keep for the merge to
+	// order it (M0146-0052). Set in Open.
+	trackCTIDs bool
+	// keySlot presents a spilled row and its tid to the merge-key
+	// evaluation; scratch.
+	keySlot MaterializedSlot
 
 	// wantCTIDs gates the TID side-channel above: it is set only when a
 	// consumer above the sort needs per-row TIDs — a parent LockRows
@@ -1084,6 +1089,12 @@ func (o *sortOp) Open(ctx *Context) error {
 	o.peakBytes = 0
 	// D-06: the retention representation is chosen once per Open.
 	o.packUse = sortPackedEnabled()
+	o.trackCTIDs = o.wantCTIDs || sortKeysUseCTID(o.keys)
+	// A `ctid` key reads the child's carried tid, so the child spine must
+	// keep it (a Gather below ships it only when marked) — M0146-0052.
+	if sortKeysUseCTID(o.keys) {
+		markSortWantCTIDs(o.child)
+	}
 	if o.packUse {
 		o.desc = NewTupleDesc(o.Schema())
 		o.outSlot = NewPackedSlotForSchema(o.Schema(), o.desc, nil, array.DefaultOutputStyle())
@@ -1121,7 +1132,10 @@ func (o *sortOp) Open(ctx *Context) error {
 		// independent row. (M0071-0010 Stage B.)
 		ms := slot.Materialize()
 		row := ms.Row()
-		kv, kerr := o.sortKeyVals(row)
+		// Keys are evaluated on the slot, not the bare Row: a `ctid` key
+		// reads the slot's carried tid and would read NULL from the Row,
+		// leaving every key NULL and the input order unchanged (M0146-0052).
+		kv, kerr := o.sortKeyValsView(ms)
 		if kerr != nil {
 			return kerr
 		}
@@ -1140,10 +1154,9 @@ func (o *sortOp) Open(ctx *Context) error {
 			o.rows = append(o.rows, row)
 		}
 		o.keyvals = append(o.keyvals, kv)
-		// EX3-05 Cut A: maintain the TID side-channel only when a consumer
-		// above needs it (wantCTIDs, set by markSortWantCTIDs). Otherwise
-		// skip the per-row append entirely.
-		if o.wantCTIDs && !o.ctidsDisabled {
+		// EX3-05 Cut A: maintain the TID side-channel only when it is
+		// needed (trackCTIDs). Otherwise skip the per-row append entirely.
+		if o.trackCTIDs {
 			o.ctids = append(o.ctids, sortCTID{block: ms.ctidBlock, off: ms.ctidOff, has: ms.hasCTID})
 		}
 		chunkBytes += estimatedRowBytes(row)
@@ -1163,11 +1176,8 @@ func (o *sortOp) Open(ctx *Context) error {
 			// D-06: packed and keyvals truncate in the same statement —
 			// a packed tail that outlived a flush would offset every key.
 			o.packed = o.packed[:0]
-			// Spilling drops the TID side-channel: the N-way merge over spill
-			// files reconstructs rows without ctids. Disable it permanently so
-			// the in-memory Next() path doesn't emit stale/misaligned TIDs.
-			o.ctidsDisabled = true
-			o.ctids = nil
+			// The flushed chunk's tids went to its spill file with the rows.
+			o.ctids = o.ctids[:0]
 			chunkBytes = 0
 		}
 	}
@@ -1224,12 +1234,18 @@ func (o *sortOp) publishSortStat() {
 // evalSortKeyValue, not evalExpr: the reg*-OID family sorts by the underlying
 // OID (see isRegSortFamilyTypeName).
 func (o *sortOp) sortKeyVals(row Row) ([]Datum, error) {
+	return o.sortKeyValsView(rowSlotView(row))
+}
+
+// sortKeyValsView is sortKeyVals over a slot, so a key that reads the
+// slot's carried tid (`ctid`) sees it.
+func (o *sortOp) sortKeyValsView(view SlotView) ([]Datum, error) {
 	if len(o.keys) == 0 {
 		return nil, nil
 	}
 	kv := make([]Datum, len(o.keys))
 	for i, k := range o.keys {
-		v, err := evalSortKeyValue(k.Expr, row, o.ctx)
+		v, err := evalSortKeyValueSlot(k.Expr, view, o.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1293,7 +1309,11 @@ func (o *sortOp) sortChunk(rows []Row) {
 	sort.SliceStable(perm, func(i, j int) bool {
 		return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
 	})
-	applySortPerm(perm, rows, o.keyvals, nil)
+	var ctids []sortCTID
+	if o.trackCTIDs && len(o.ctids) == len(rows) {
+		ctids = o.ctids
+	}
+	applySortPerm(perm, rows, o.keyvals, ctids)
 }
 
 // sortPackedChunk is sortChunk over the packed retention: the permutation
@@ -1368,61 +1388,51 @@ func applySortPerm(perm []int, rows []Row, keyvals [][]Datum, ctids []sortCTID) 
 	}
 }
 
-// sortTailWithCTIDs sorts the final in-memory tail (o.rows). When the TID
-// side-channel is live (a consumer set wantCTIDs and no spill occurred), it
-// reorders o.ctids in lockstep with o.rows via a permutation so each emitted
-// row keeps its own ctid. Falls back to the plain row sort when ctids are
-// disabled/absent — and, since EX3-05 Cut A, when no consumer wants them.
+// sortTailWithCTIDs sorts the final in-memory tail. sortChunk and
+// sortPackedChunk reorder o.ctids in lockstep with the rows whenever the
+// side-channel is tracked, so each emitted row keeps its own ctid.
 func (o *sortOp) sortTailWithCTIDs() {
-	// D-06: the packed tail sorts packed+keyvals(+ctids) under one
-	// permutation; the lessRows fallback is not ported (§2.1(b)).
 	if o.packUse {
-		if !o.wantCTIDs || o.ctidsDisabled || len(o.ctids) != len(o.packed) {
-			o.sortPackedChunk()
-			return
+		o.sortPackedChunk()
+		return
+	}
+	o.sortChunk(o.rows)
+}
+
+// sortKeysUseCTID reports whether any sort key reads `ctid`.
+func sortKeysUseCTID(keys []optimizer.SortKey) bool {
+	for _, k := range keys {
+		if exprTreeUsesCTID(k.Expr) {
+			return true
 		}
-		if len(o.keyvals) != len(o.packed) {
-			if o.sortErr == nil {
-				o.sortErr = errSortKeyvalsMismatch
-			}
-			return
-		}
-		perm := make([]int, len(o.packed))
-		for i := range perm {
-			perm[i] = i
-		}
-		sort.SliceStable(perm, func(i, j int) bool {
-			return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
-		})
-		if o.sortErr != nil {
-			return
-		}
-		applySortPermPacked(perm, o.packed, o.keyvals, o.ctids)
-		return
 	}
-	if !o.wantCTIDs {
-		o.sortChunk(o.rows)
-		return
+	return false
+}
+
+// sortCTIDDatum encodes a row's tid as the trailing column of its spill
+// record: block<<16 | offset, or -1 when the row carried none.
+func sortCTIDDatum(c sortCTID) Datum {
+	if !c.has {
+		return NewIntDatum(-1)
 	}
-	if o.ctidsDisabled || len(o.ctids) != len(o.rows) {
-		o.sortChunk(o.rows)
-		return
+	return NewIntDatum(int64(c.block)<<16 | int64(c.off))
+}
+
+// sortCTIDFromDatum decodes sortCTIDDatum.
+func sortCTIDFromDatum(d Datum) sortCTID {
+	v := d.Int
+	if v < 0 {
+		return sortCTID{}
 	}
-	if len(o.keyvals) != len(o.rows) {
-		o.sortChunk(o.rows)
-		return
-	}
-	perm := make([]int, len(o.rows))
-	for i := range perm {
-		perm[i] = i
-	}
-	sort.SliceStable(perm, func(i, j int) bool {
-		return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
-	})
-	if o.sortErr != nil {
-		return
-	}
-	applySortPerm(perm, o.rows, o.keyvals, o.ctids)
+	return sortCTID{block: uint32(v >> 16), off: uint16(v & 0xFFFF), has: true}
+}
+
+// sortKeyValsTID evaluates the sort keys for a row read back from a spill
+// file, presented with its tid so a `ctid` key sees it.
+func (o *sortOp) sortKeyValsTID(row Row, c sortCTID) ([]Datum, error) {
+	o.keySlot.row = row
+	o.keySlot.ctidBlock, o.keySlot.ctidOff, o.keySlot.hasCTID = c.block, c.off, c.has
+	return o.sortKeyValsView(&o.keySlot)
 }
 
 // markSortWantCTIDs enables the TID side-channel (sortOp.wantCTIDs) on every
@@ -1477,6 +1487,11 @@ func markSortWantCTIDs(op Operator) {
 			return
 		case *gatherMergeOp:
 			v.wantCTIDs = true
+			return
+		case *opNodeOperator:
+			// A slab subtree under a legacy operator (the slab Sort's
+			// bridge): its own marker takes over.
+			markSlabSorts(v.tree, v.idx)
 			return
 		default:
 			return
@@ -1637,7 +1652,12 @@ func (o *sortOp) flushChunk() error {
 	if err != nil {
 		return err
 	}
-	for _, r := range o.rows {
+	var rec Row
+	for i, r := range o.rows {
+		if o.trackCTIDs {
+			rec = append(append(rec[:0], r...), sortCTIDDatum(o.ctids[i]))
+			r = rec
+		}
 		if werr := w.WriteRow(r); werr != nil {
 			w.Close()
 			o.ctx.removeSpillFile(w.Path())
@@ -1666,14 +1686,20 @@ func (o *sortOp) flushPackedChunk() error {
 	if err != nil {
 		return err
 	}
-	for _, pt := range o.packed {
+	var rec Row
+	for i, pt := range o.packed {
 		o.packScratch.Load(pt)
 		if serr := o.packScratch.Err(); serr != nil {
 			w.Close()
 			o.ctx.removeSpillFile(w.Path())
 			return serr
 		}
-		if werr := w.WriteRow(o.packScratch.Row()); werr != nil {
+		r := o.packScratch.Row()
+		if o.trackCTIDs {
+			rec = append(append(rec[:0], r...), sortCTIDDatum(o.ctids[i]))
+			r = rec
+		}
+		if werr := w.WriteRow(r); werr != nil {
 			w.Close()
 			o.ctx.removeSpillFile(w.Path())
 			return werr
@@ -1708,7 +1734,7 @@ func (o *sortOp) Close() error {
 	// lookup) and trips the sortChunk lessRows fallback; a surviving
 	// mergeReady skips initMerge with heap nil (nil dereference in
 	// popMerge); a surviving sortErr fails the next Open outright; a
-	// surviving ctidsDisabled permanently drops the TID side-channel.
+	// surviving trackCTIDs keeps maintaining a channel nobody reads.
 	// Latent at HEAD (no Sort rescan path exists) but squarely this
 	// row's silent wrong-answer class — three lines in the function
 	// E-01 owns. peakBytes is additionally reset in Open (EX0-03c);
@@ -1716,7 +1742,8 @@ func (o *sortOp) Close() error {
 	o.keyvals = nil
 	o.mergeReady = false
 	o.sortErr = nil
-	o.ctidsDisabled = false
+	o.trackCTIDs = false
+	o.keySlot = MaterializedSlot{}
 	o.peakBytes = 0
 	o.idx = 0
 	o.ctx = nil
@@ -1748,7 +1775,7 @@ func (o *sortOp) Next() (TupleSlot, error) {
 				return nil, EOF
 			}
 			pt := o.packed[o.idx]
-			if o.wantCTIDs && !o.ctidsDisabled && o.idx < len(o.ctids) && o.ctids[o.idx].has {
+			if o.wantCTIDs && o.idx < len(o.ctids) && o.ctids[o.idx].has {
 				c := o.ctids[o.idx]
 				o.outSlot.LoadWithTID(pt, c.block, c.off)
 			} else {
@@ -1765,7 +1792,7 @@ func (o *sortOp) Next() (TupleSlot, error) {
 		// Re-attach the per-row TID side-channel so a parent LockRows can stamp
 		// row locks (ORDER BY ... FOR UPDATE). M0118-0003. Maintained only
 		// when a consumer asked for it (EX3-05 Cut A: wantCTIDs).
-		if o.wantCTIDs && !o.ctidsDisabled && o.idx < len(o.ctids) && o.ctids[o.idx].has {
+		if o.wantCTIDs && o.idx < len(o.ctids) && o.ctids[o.idx].has {
 			slot.hasCTID = true
 			slot.ctidBlock = o.ctids[o.idx].block
 			slot.ctidOff = o.ctids[o.idx].off
@@ -1778,9 +1805,14 @@ func (o *sortOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 	}
-	row, err := o.popMerge()
+	row, tid, err := o.popMerge()
 	if err != nil {
 		return nil, err
+	}
+	if o.wantCTIDs && tid.has {
+		slot := SlotFromRow(o.Schema(), row)
+		slot.hasCTID, slot.ctidBlock, slot.ctidOff = true, tid.block, tid.off
+		return slot, nil
 	}
 	return asSlot(o.Schema(), row), nil
 }
@@ -1790,13 +1822,17 @@ func (o *sortOp) Next() (TupleSlot, error) {
 func (o *sortOp) initMerge() error {
 	// Same comparator as the in-memory tail (DESIGN §5.6): each source
 	// computes its current row's keys on advance, and the heap orders those.
-	o.heap = &sortHeap{less: o.lessKeyVals, keysOf: o.sortKeyVals}
+	o.heap = &sortHeap{less: o.lessKeyVals, keysOf: o.sortKeyValsTID}
+	var tailCTIDs []sortCTID
+	if o.trackCTIDs {
+		tailCTIDs = o.ctids
+	}
 	for _, p := range o.spillFiles {
 		r, err := newSpillReader(p)
 		if err != nil {
 			return err
 		}
-		s := &sortSource{reader: r, keysOf: o.sortKeyVals}
+		s := &sortSource{reader: r, keysOf: o.sortKeyValsTID, tidCol: o.trackCTIDs}
 		if err := s.advance(); err != nil {
 			return err
 		}
@@ -1806,7 +1842,7 @@ func (o *sortOp) initMerge() error {
 	}
 	if len(o.rows) > 0 {
 		// The tail already has its keys; hand them over rather than recompute.
-		s := &sortSource{rows: o.rows, keyvals: o.keyvals, keysOf: o.sortKeyVals}
+		s := &sortSource{rows: o.rows, keyvals: o.keyvals, ctids: tailCTIDs, keysOf: o.sortKeyValsTID}
 		if err := s.advance(); err != nil {
 			return err
 		}
@@ -1819,7 +1855,7 @@ func (o *sortOp) initMerge() error {
 	// alternating scratch slots, exactly sufficient because at most one
 	// row per source is outstanding at any instant.
 	if len(o.packed) > 0 {
-		s := &sortSource{packed: o.packed, keyvals: o.keyvals, keysOf: o.sortKeyVals, pslots: o.mergeSlots, desc: o.desc}
+		s := &sortSource{packed: o.packed, keyvals: o.keyvals, ctids: tailCTIDs, keysOf: o.sortKeyValsTID, pslots: o.mergeSlots, desc: o.desc}
 		if err := s.advance(); err != nil {
 			return err
 		}
@@ -1833,22 +1869,22 @@ func (o *sortOp) initMerge() error {
 
 // popMerge returns the smallest row across all sources, advancing
 // the source it came from.
-func (o *sortOp) popMerge() (Row, error) {
+func (o *sortOp) popMerge() (Row, sortCTID, error) {
 	if o.heap.Len() == 0 {
-		return nil, EOF
+		return nil, sortCTID{}, EOF
 	}
 	s := heap.Pop(o.heap).(*sortSource)
-	row := s.cur
+	row, tid := s.cur, s.curTID
 	if err := s.advance(); err != nil {
-		return nil, err
+		return nil, sortCTID{}, err
 	}
 	if !s.eof {
 		heap.Push(o.heap, s)
 	}
 	if o.sortErr != nil {
-		return nil, o.sortErr
+		return nil, sortCTID{}, o.sortErr
 	}
-	return row, nil
+	return row, tid, nil
 }
 
 // sortSource is a single input to the N-way merge. Either a
@@ -1870,7 +1906,14 @@ type sortSource struct {
 	// no keys of their own.
 	curKeys []Datum
 	keyvals [][]Datum
-	keysOf  func(Row) ([]Datum, error)
+	keysOf  func(Row, sortCTID) ([]Datum, error)
+
+	// curTID is cur's tid. A spill record carries it as a trailing column
+	// when tidCol is set; an in-memory tail takes it from ctids (nil when
+	// the sort does not track tids). M0146-0052.
+	curTID sortCTID
+	tidCol bool
+	ctids  []sortCTID
 
 	// D-06: the packed-tail variant. packed is the tail's tuples;
 	// pslots are the two alternating deform scratches (DESIGN §2.1(a));
@@ -1897,6 +1940,12 @@ func (s *sortSource) advance() error {
 			return err
 		}
 		s.cur = cloneRow(row) // ReadRow's buffer is reused; clone for retain
+		s.curTID = sortCTID{}
+		if s.tidCol && len(s.cur) > 0 {
+			last := len(s.cur) - 1
+			s.curTID = sortCTIDFromDatum(s.cur[last])
+			s.cur = s.cur[:last]
+		}
 		return s.loadKeys(-1)
 	}
 	// D-06: deform the packed tail through alternating scratches, so the
@@ -1920,6 +1969,10 @@ func (s *sortSource) advance() error {
 		s.cur = sl.Row()
 		i := s.pidx
 		s.pidx++
+		s.curTID = sortCTID{}
+		if i < len(s.ctids) {
+			s.curTID = s.ctids[i]
+		}
 		return s.loadKeys(i)
 	}
 	if s.idx >= len(s.rows) {
@@ -1931,6 +1984,10 @@ func (s *sortSource) advance() error {
 	s.cur = s.rows[s.idx]
 	i := s.idx
 	s.idx++
+	s.curTID = sortCTID{}
+	if i < len(s.ctids) {
+		s.curTID = s.ctids[i]
+	}
 	return s.loadKeys(i)
 }
 
@@ -1945,7 +2002,7 @@ func (s *sortSource) loadKeys(at int) error {
 		s.curKeys = s.keyvals[at]
 		return nil
 	}
-	kv, err := s.keysOf(s.cur)
+	kv, err := s.keysOf(s.cur, s.curTID)
 	if err != nil {
 		return err
 	}
@@ -1961,7 +2018,7 @@ type sortHeap struct {
 	// in-memory sort uses, so the tail and the spill files are merged under
 	// one rule (M0134-0191, DESIGN §5.6).
 	less   func(a, b []Datum) bool
-	keysOf func(Row) ([]Datum, error)
+	keysOf func(Row, sortCTID) ([]Datum, error)
 }
 
 func (h *sortHeap) Len() int { return len(h.sources) }

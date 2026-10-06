@@ -59,7 +59,10 @@ type setOp struct {
 	mergeLive [2]bool
 	mergeInit bool
 	mergeErr  error
-	ctx       *Context
+	// mergeKeySlot presents a transferred row and its input slot's tid to
+	// the merge-key evaluation (M0146-0052); scratch, reused per row.
+	mergeKeySlot MaterializedSlot
+	ctx          *Context
 
 	// sorted is the SETOP_SORTED form of INTERSECT / EXCEPT (M0146-0005q):
 	// both inputs arrive sorted on plan.MergeKeys and are merged group by
@@ -218,9 +221,15 @@ func (o *setOp) mergeAdvance(side int) error {
 		return err
 	}
 	row := transferRowForQueue(slot)
+	// The keys are evaluated on the transferred (owned) row — they are
+	// retained across the input's next Next — presented with the input
+	// slot's carried tid, so a `ctid` key does not read NULL (M0146-0052).
+	keyView := &o.mergeKeySlot
+	keyView.row = row
+	slotQueueTID(slot).stamp(keyView)
 	keys := make([]Datum, len(o.plan.MergeKeys))
 	for i, k := range o.plan.MergeKeys {
-		v, kerr := evalSortKeyValue(k.Expr, row, o.ctx)
+		v, kerr := evalSortKeyValueSlot(k.Expr, keyView, o.ctx)
 		if kerr != nil {
 			return kerr
 		}
