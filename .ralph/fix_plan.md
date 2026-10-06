@@ -28047,7 +28047,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
       HEAD\.
     - Filed M0146\-0071 \(a twice\-read correlated CTE, lateral misbinding\)\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0071 — WRONG RESULTS: a correlated CTE read twice inside a
+- [x] **M0146\-0071 — WRONG RESULTS: a correlated CTE read twice inside a
   sublink binds its outer reference to the join's left row** \(filed
   2026\-10\-06 by M0146\-0050\)\. `SELECT g, \(WITH c AS MATERIALIZED \(SELECT
   g\*2 AS k\) SELECT c\.k \|\| '/' \|\| c2\.k FROM c, c AS c2\) FROM
@@ -28074,6 +28074,17 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     above it lateral \(they belong to the CTE's declaring scope, not to the
     left sibling\); probe `chainCarriesLateral` / the join's `Lateral` flag
     on this query\.
+  - Done 2026\-10\-06 \(`6f0b02894`; design
+    `docs/design/0100\-0149/m0146\-0071\-cte\-reference\-not\-lateral\.md`\):
+    - The lateral flag came from `nodeReferencesOuter`, whose general case
+      walked into the CTE body; it now returns false for `\*CTEScan` \(a
+      CTE reference never reads a FROM sibling\)\. Enclosing\-level
+      correlation stays with `planHasEscapingOuterRef`\.
+    - Test `TestCorrelatedCTEReadTwiceInSublink` \(9 shapes, 6 fail at
+      HEAD\); derived/LATERAL neighbours unchanged\.
+    - Ledgered: the lateral decision is still any\-outer\-ref based, not
+      LATERAL/implicit\-lateral based\.
+Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0072 — a PL/pgSQL variable in a statement with a WITH clause
   is not substituted** \(filed 2026\-10\-06 by M0146\-0059\)\. Inside a
   PL/pgSQL function, `v := \(WITH x AS \(SELECT g FROM generate\_series\(10,11\)
