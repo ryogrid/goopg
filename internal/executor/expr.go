@@ -10558,6 +10558,7 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 	outerRow := slotToRow(slot)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
 	op, err := Build(x.Plan)
 	if err != nil {
@@ -10669,6 +10670,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	outerRow := slotToRow(slot)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
 
 	innerOp, err := Build(sqOp.Plan)
 	if err != nil {
@@ -10833,6 +10835,7 @@ func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error
 				}
 			}
 			defer pop()
+			defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 			op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
 			if err != nil {
 				return nil, err
@@ -10994,6 +10997,7 @@ func existsWithScope(x *optimizer.ExistsExpr, row Row, ctx *Context, lowered boo
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	return existsImpl(x, ctx)
 }
 
@@ -11114,6 +11118,7 @@ func subqueryWithScope(x *optimizer.SubqueryExpr, row Row, ctx *Context, lowered
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	return subqueryImpl(x, ctx)
 }
 
@@ -11438,6 +11443,7 @@ func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (D
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
 	op, err := Build(x.Plan)
 	if err != nil {
@@ -11488,6 +11494,7 @@ func evalMultiAssignSubqRow(x *optimizer.MultiAssignSubqRow, row Row, ctx *Conte
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	op, err := Build(x.Plan)
 	if err != nil {
 		return nil, err
@@ -21865,4 +21872,33 @@ func topLevelXID(ctx *Context) storage.TransactionID {
 		}
 	}
 	return ctx.Tx.XID
+}
+
+// enterSublinkCTEWindow gives one execution of a correlated sublink its own
+// ctx.CTERowCache window and returns the function that closes it
+// (M0146-0050). The cache is keyed by CTE declaration, so a body that
+// declares a CTE reading the outer row replayed its FIRST execution's rows
+// for every outer row (`(WITH c AS MATERIALIZED (SELECT g*2) ...)` answered
+// 2, 2, 2 for g = 1, 2, 3). PG clears a CTE's tuplestore when the plan's
+// parameters change (ExecReScanCteScan, nodeCtescan.c), which for a
+// correlated subplan is every new outer value. The window starts as a copy
+// of the enclosing scope's entries, so a CTE that scope already
+// materialised is still shared; what the execution adds is dropped when it
+// ends, as the LATERAL join does per outer tuple (join_lateral_stream.go).
+// A CTE whose body reads no outer value lives in ctx.CTEStableCache and is
+// untouched. Uncorrelated sublinks get no window.
+func enterSublinkCTEWindow(ctx *Context, correlated bool) func() {
+	if !correlated || ctx == nil {
+		return func() {}
+	}
+	saved := ctx.CTERowCache
+	var window map[string][]Row
+	if len(saved) > 0 {
+		window = make(map[string][]Row, len(saved))
+		for k, v := range saved {
+			window[k] = v
+		}
+	}
+	ctx.CTERowCache = window
+	return func() { ctx.CTERowCache = saved }
 }

@@ -1362,6 +1362,29 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, uc := range n.UnnestCols {
 			walkExprTree(uc.ArrExpr, visit)
 		}
+		// M0146-0050: every SRF's arguments, not only unnest's. They are
+		// evaluated in this scope, and a reference to the outer row in
+		// them (`SELECT generate_series(1, g)` inside a sublink) is what
+		// makes the sublink correlated: unseen, the sublink was classed an
+		// InitPlan and ran once for every outer row.
+		for _, e := range n.SrfArgs {
+			walkExprTree(e, visit)
+		}
+		for _, sc := range n.SrfCols {
+			walkExprTree(sc.Start, visit)
+			walkExprTree(sc.Stop, visit)
+			walkExprTree(sc.Step, visit)
+		}
+		for _, rc := range n.RegexpMatchesCols {
+			walkExprTree(rc.StringExpr, visit)
+			walkExprTree(rc.PatternExpr, visit)
+			walkExprTree(rc.FlagsExpr, visit)
+		}
+		for _, uc := range n.UserSrfCols {
+			for _, e := range uc.Args {
+				walkExprTree(e, visit)
+			}
+		}
 	case *LockRows:
 		walkPlanExprs(n.Child, visit)
 	}
