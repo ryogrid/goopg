@@ -1,0 +1,61 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 30000
+INSERT 0 30000
+INSERT 0 300
+ANALYZE
+ANALYZE
+ANALYZE
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+           QUERY PLAN            
+---------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Seq Scan on s1
+         ->  Hash
+               ->  Seq Scan on d
+(7 rows)
+
+                QUERY PLAN                
+------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Seq Scan on s1
+               Filter: (v > '5'::numeric)
+         ->  Seq Scan on s2
+               Filter: (v > '5'::numeric)
+(6 rows)
+
+             QUERY PLAN             
+------------------------------------
+ Aggregate
+   ->  Seq Scan on s2
+         Filter: (v > '5'::numeric)
+(3 rows)
+
+      QUERY PLAN      
+----------------------
+ Aggregate
+   ->  Seq Scan on s2
+(2 rows)
+
+ count |    sum    
+-------+-----------
+ 29995 | 450014985
+(1 row)
+

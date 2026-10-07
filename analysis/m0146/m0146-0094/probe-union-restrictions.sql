@@ -1,0 +1,13 @@
+create table s1(k int, v numeric, pad text);
+create table s2(k int, v numeric, pad text);
+create table d(k int primary key, m int);
+insert into s1 select g % 300, g, 'x' from generate_series(1, 30000) g;
+insert into s2 select g % 300, g, 'y' from generate_series(1, 30000) g;
+insert into d select g, g % 12 from generate_series(1, 300) g;
+analyze s1; analyze s2; analyze d;
+explain (costs off) select m, sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u, d where d.k = u.dk and src > 0 group by m;
+explain (costs off) select m, sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u, d where d.k = u.dk and src = 1 group by m;
+explain (costs off) select sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u where price > 5;
+explain (costs off) select sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u where src = 2 and price > 5;
+explain (costs off) select sum(price) from (select v as price, k as dk, 'a'::text as src from s1 union all select v as price, k as dk, 'b' as src from s2) u where src <> 'a';
+select count(*), sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u where src = 2 and price > 5;

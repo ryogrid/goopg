@@ -29745,13 +29745,19 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     `docs/design/0100\-0149/m0146\-0093\-appendrel\-member\-subqueryscan\.md`\.
   - Filed M0146\-0098 \(goopg parameterises a member PG keeps as a subquery\)\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 48→47, scan\-type 27→26 \(Q71\); SF1 unchanged\.
-- [ ] **M0146\-0094 — a UNION ALL member\'s constant column qual stays as a Filter on the Append** \(filed 2026\-10\-07 by M0146\-0066\)\. `… \(select v, k, 1 as src from s1 union all select v, k, 2 as src from s2\) u … where src > 0`: PG pushes the
+- [x] **M0146\-0094 — a UNION ALL member\'s constant column qual stays as a Filter on the Append** \(filed 2026\-10\-07 by M0146\-0066\)\. `… \(select v, k, 1 as src from s1 union all select v, k, 2 as src from s2\) u … where src > 0`: PG pushes the
   qual into each member \(set\_append\_rel\_size substitutes the member expression; `1 > 0` folds away\) and shows
   a bare Append; goopg keeps `Filter: \(src > 0\)` on the Append \(qual\-placement\)\.
   Kind: impl
   Parent: M0146\-0066
   - First step: trace where goopg places a restriction on an appendrel leaf whose column is a member constant, and
     push it into the members with the member expression substituted\.
+  - Done 2026\-10\-08 \(a578e5eb3\): broader than filed — goopg pushed NO restriction into members\.
+    `pushWhereQualsIntoUnionAllItems` moves a conjunct reading only the leaf into every plain member \(member
+    expressions substituted, `\*` expanded\), folds literal comparisons \(FALSE drops the member, TRUE adds
+    nothing\), guarded by tlist\_same\_datatypes and a plain\-member rule\. Regress union diff 352→343, tenk1
+    constraint\-exclusion case = PG\. Design: `docs/design/0100\-0149/m0146\-0094\-union\-all\-restriction\-pushdown\.md`\.
+  Movement: none — instrument artefact — no TPC\-DS/TPC\-H query restricts a UNION ALL leaf; regress union diff 352→343\.
 - [ ] **M0146\-0095 — a build\-filling Parallel Hash join refuses a spilled share** \(filed
   2026\-10\-07 by M0146\-0090\)\. RIGHT, FULL, RIGHT SEMI and RIGHT ANTI Parallel Hash joins still fail
   `… of a join that fills its build side is not supported` when a participant\'s share outgrows
