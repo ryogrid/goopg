@@ -29789,7 +29789,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     byte\-identical, arm values identical; regress join\_hash 322→310\. Design:
     `docs/design/0100\-0149/m0146\-0096\-parallel\-hash\-ph4\-veto\.md`\.
   Movement: none — instrument artefact — the veto decided no TPC\-H/TPC\-DS election; regress join\_hash 322→310\.
-- [ ] **M0146\-0097 — a Subquery Scan on a hash join\'s inner side is stripped where PG keeps it** \(filed
+- [x] **M0146\-0097 — a Subquery Scan on a hash join\'s inner side is stripped where PG keeps it** \(filed
   2026\-10\-07 by M0146\-0092\)\. PG\'s Hash node requests CP\_SMALL\_TLIST \(create\_hash\_plan, createplan\.c\), so a
   subquery leaf on the hashed side is in the pathtarget regime: subset consumption or a resjunk column keeps
   `Subquery Scan`\. goopg\'s strip pass treats every `Join` as a physical\-regime breaker for both children
@@ -29799,6 +29799,11 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   Parent: M0146\-0092
   - First step: in the strip walk, give a hash join\'s build child the pathtarget regime \(`Join\.Algo` hash,
     build side per `probeSideIsLeft`\'s rule\), then census the fire sets for Subquery Scan count moves\.
+  - Done 2026\-10\-08 \(5a17a7fd1\): the build child \(BuildLeft\) gets the pathtarget regime; exposed and fixed
+    derivedSubqueryNeedsScan reading nested levels \(Q44 `asceding` was wrapped; PG pulls it up\)\. Q44 SF1 = PG\'s 4;
+    SF0\.25 2 vs 4 behind a missing Sort \(filed M0146\-0099\)\. Design:
+    `docs/design/0100\-0149/m0146\-0097\-subqueryscan\-hash\-inner\.md`\.
+  Movement: none — instrument artefact — categories unchanged; Q44 Subquery Scans SF1 = PG, SF0\.25 behind M0146\-0099\.
 
 - [ ] **M0146\-0098 — a parameterised Append drives a UNION ALL member PG keeps as a subquery** \(filed 2026\-10\-08
   by M0146\-0093\)\. A member with a WHERE clause \(or a join\) is not a safe append member in PG, so it stays a subquery
@@ -29811,3 +29816,13 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - Probe: `analysis/m0146/m0146\-0093/probe\-param\-append\-where\-member\.sql`\.
   - First step: refuse the per\-member parameterised path for a member the fold stamped unsafe
     \(`SetOp\.appendMemberLeft/Right`\), then A/B the fire sets and correct the test\'s plan expectation to PG\'s\.
+- [ ] **M0146\-0099 — goopg merge\-joins on a window function\'s output without the Sort PG adds** \(filed
+  2026\-10\-08 by M0146\-0097\)\. TPC\-DS Q44 at SF0\.25: `… v11 … Merge Join … Merge Cond: \(v11\.rnk = v21\.rnk\)`\. PG
+  puts a Sort on each input \(`Sort Key: v11\.rnk`\) — `rank\(\)`\'s output carries no pathkey in PG — while goopg
+  merges on the WindowAgg directly, treating the rank as already ordered\. The Sort is also what keeps PG\'s
+  `Subquery Scan on v11/v21` \(CP\_SMALL\_TLIST\): goopg shows 2 Subquery Scans there against PG\'s 4\.
+  Kind: impl
+  Parent: M0146\-0097
+  - First step: find where goopg derives a pathkey for a window function\'s output column \(WindowAgg path
+    pathkeys / equivalence of `rnk` with the window ORDER BY\) and stop it — PG\'s window paths carry only
+    the input sort\'s pathkeys\.
