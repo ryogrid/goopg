@@ -29859,7 +29859,7 @@ Movement: none — instrument artefact — SF0\.25 qual\-placement 11\-\>10; SF1
       \(filed M0146\-0101\)\.
     - TPC\-H plans byte\-identical\. Design: `docs/design/0100\-0149/m0146\-0100\-subquery\-leaf\-pathkeys\.md`\.
 Movement: SF1 join\-order 53\-\>52, join\-method 21\-\>20, scan\-type 34\-\>33, sort\-strategy 28\-\>27, parallelism 41\-\>40; SF0\.25 join\-order 47\-\>46, join\-method 24\-\>23, sort\-strategy 26\-\>25; qual\-placement \+1/\+2 \(bare\-column rendering\)\.
-- [ ] **M0146\-0101 — goopg drops PG\'s Materialize over a merge join\'s presorted grouped inner**
+- [x] **M0146\-0101 — goopg drops PG\'s Materialize over a merge join\'s presorted grouped inner**
   \(filed 2026\-10\-08 by M0146\-0100\)\. TPC\-DS Q78 \(both scales\): PG prints `Materialize \-\>
   GroupAggregate` for the merge inner\(s\); goopg merges the GroupAggregate bare\. A GroupAggregate cannot
   mark/restore, so `final\_cost\_mergejoin` elects `materialize\_inner` unless `skip\_mark\_restore`,
@@ -29871,3 +29871,10 @@ Movement: SF1 join\-order 53\-\>52, join\-method 21\-\>20, scan\-type 34\-\>33, 
   Parent: M0146\-0100
   - First step: print `mergeInnerFor`\'s `skipMarkRestore` / innerUnique for Q78\'s two merges and diff
     goopg\'s grouped\-subquery uniqueness test against `query\_is\_distinct\_for` \(analyzejoins\.c\)\.
+  - Done 2026\-10\-08 \(7c19badd8\)\. The hypothesis held\.
+    - The Aggregate records its pruned GROUP BY inputs \(`PrunedGroupInputs`\)\.
+    - `prunedGroupKeysEquated` requires each to be equated through its Passthrough column, because
+      `rel\_is\_distinct\_for` reads the original subquery\'s `groupClause`\.
+    - Q78 now differs from PG only in the ws/cs join order and rendering\. Design:
+      `docs/design/0100\-0149/m0146\-0101\-innerunique\-original\-groupby\.md`\.
+Movement: SF1 join\-method 20\-\>19, parameterisation 30\-\>29, sort\-strategy 27\-\>26, parallelism 40\-\>39; SF0\.25 join\-method 23\-\>22, parameterisation 25\-\>24, sort\-strategy 25\-\>24, parallelism 26\-\>25\.
