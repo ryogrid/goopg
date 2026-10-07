@@ -29451,6 +29451,24 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     saves the VM would close the clone gap\.
   Kind: impl
   Parent: M0146
+  - [x] **M0146\-0063a — WRONG RESULTS after a crash: a stale visibility\-map fork made an
+    index\-only scan return deleted rows** \(filed and fixed 2026\-10\-07 while working M0146\-0063\)\.
+    VACUUM, clean restart, DELETE, `kill \-9`, restart: `count\(\*\) … WHERE a < 1000` by Index Only
+    Scan returned 500, the heap held 200 — `VMLoadForks` trusted the forks of the last clean
+    shutdown, which no WAL record keeps current\.
+    Kind: impl
+    Parent: M0146\-0063
+    - DONE \(`b80fc34a3`; design `docs/design/0100\-0149/m0146\-0063a\-vm\-crash\-discard\.md`\):
+      a crash\-recovery start removes every `\_vm` fork \(`storage\.DiscardVMForks`\); the map starts
+      empty\. A clean start loads them as before\.
+    - Fixed in\-slice rather than escalated: the defect is the selected task\'s own subject, and
+      its interim plan \(save the VM at checkpoint\) would have widened it\.
+    Movement: none — correctness fix — no plan instrument \(fire set flat\)
+  - Finding 2026\-10\-07 \(M0146\-0063a\): the interim "a checkpoint that also saves the VM" is
+    UNSAFE on its own — a fork saved at a checkpoint goes stale for every page modified after it\.
+    It must land together with the WAL\-logged clear: VACUUM emits `XLOG\_HEAP2\_VISIBLE` \(redo
+    exists\), heap DML sets `XLH\_\*\_ALL\_VISIBLE\_CLEARED` and its redo clears the fork bit\.
+    Until then every crash start, an online clone included, begins with a cold map\.
 - [ ] **M0146\-0064 — a direct `UPDATE pg\_class SET reltuples` does not
   reach the planner** \(filed 2026\-10\-05 by M0146\-0020b\)\. regress
   groupingsets sets `update pg\_class set reltuples = 10 where
