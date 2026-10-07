@@ -18609,6 +18609,10 @@ func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.T
 				// checks Xmax!=0), but runtime seq scans need this hint to
 				// reliably hide catalog rows that were re-synced.
 				storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
+				// M0146-0063b: a deleted row leaves the page not all-visible.
+				if ctx.VM != nil {
+					ctx.VM.ClearBlock(rel, blk)
+				}
 				// Use MarkDirtyForceFPI to emit a fresh full-page image of
 				// the post-stamp page. This overrides any stale FPI that
 				// was captured before the row existed (e.g. the mirror
@@ -20706,6 +20710,11 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
+			// M0146-0063b: an index-only scan over the refreshed matview
+			// must not take these deleted rows' pages as all-visible.
+			if ctx.VM != nil {
+				ctx.VM.ClearBlock(rel, blk)
+			}
 		}
 		s.Unlock()
 		ctx.Pool.Unpin(s)

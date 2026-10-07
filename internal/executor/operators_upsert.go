@@ -1169,7 +1169,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		// (tuplelock-partition).
 		_ = storage.PageSetHeapTupleKeysUpdated(pinned.Page(), oldPtr.Offset)
 	}
-	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
+	derr := markHeapDeleteDirtyAndClearVM(o.ctx, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {
@@ -1549,7 +1549,7 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 	}
 	var derr error
 	if serr == nil {
-		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
+		derr = markHeapDeleteDirtyAndClearVM(o.ctx, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
 	}
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)

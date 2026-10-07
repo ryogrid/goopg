@@ -119,6 +119,21 @@ func (v *VisibilityMap) ClearBlock(rel RelFileNode, blk BlockNumber) {
 	v.clearBits(key, blk, VMAllVisible|VMAllFrozen)
 }
 
+// ClearAllFrozen clears only the ALL_FROZEN bit for rel/blk, keeping
+// ALL_VISIBLE. A row lock stamps a locker xmax that VACUUM must later freeze
+// away, so the page is no longer all-frozen, yet every tuple stays visible to
+// all: heap_lock_tuple clears VISIBILITYMAP_ALL_FROZEN alone (heapam.c).
+// M0146-0063b.
+func (v *VisibilityMap) ClearAllFrozen(rel RelFileNode, blk BlockNumber) {
+	if v == nil {
+		return
+	}
+	key := vmKeyFor(rel)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.clearBits(key, blk, VMAllFrozen)
+}
+
 // DropRelation removes all VM entries for rel. Called on DROP TABLE / TRUNCATE
 // to prevent stale visibility bits from being returned for future relations
 // with the same OID.

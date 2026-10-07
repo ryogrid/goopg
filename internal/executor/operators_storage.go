@@ -4602,6 +4602,12 @@ func tryApplyHOTUpdate(
 	// lock, so the counts are stable.
 	storage.PageIdentityAssertEmit(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), newSlot, "hotUpdateEmit")
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
+	// M0146-0063b: heap_update clears the page's visibility-map bits when it
+	// was all-visible, HOT or not — the new version's xmin is not yet visible
+	// to all, and an all-frozen bit would let VACUUM skip freezing it.
+	if ctx.VM != nil {
+		ctx.VM.ClearBlock(rel, blk)
+	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	s321Note(s321HOTApplied)

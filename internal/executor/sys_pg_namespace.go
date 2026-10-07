@@ -174,7 +174,7 @@ func deleteSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, name string)
 		ctx.Pool.Unpin(slot)
 		return err
 	}
-	derr := markHeapDeleteDirty(ctx.Pool, slot, rel, storage.BlockNumber(tid.Block), tid.Offset, xmax, oldTuple)
+	derr := markHeapDeleteDirtyAndClearVM(ctx, slot, rel, storage.BlockNumber(tid.Block), tid.Offset, xmax, oldTuple)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	if derr != nil {
