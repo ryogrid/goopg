@@ -1,0 +1,26 @@
+M0146-0088 — parameterised index probe micro-benchmark (2026-10-07)
+
+Data: m88-setup.sql (o: 200k probe keys; i: 500k rows, pkey on k).
+Query: m88-q.sql — hashjoin/mergejoin/bitmapscan/memoize off,
+max_parallel_workers_per_gather=0; NL + Index Scan i_pkey, 200k loops.
+Both engines elect: Aggregate -> Nested Loop -> Seq Scan o, Index Scan i_pkey.
+
+Execution time (EXPLAIN ANALYZE, best of 3):
+  goopg HEAD 83fa91a27 (linear leaf walk)          ~1.70 s
+  + leafScanStart binary search                     ~0.81 s
+  + AllowDeadNoCopy item reads (descent + leaf)     ~0.74 s
+  PG 18.3 (scratch :5534, same data)                ~0.39 s
+
+goopg CPU profile after both changes (cumulative share):
+  indexScanOp.Rescan                 37.7%
+    NewScanCursor / descendToLeaf    31%
+  leafScanStart                      21%
+  findChildBlockDirect               17.6%
+  keyExceedsHighKey                   9%
+  isPostingRaw -> pgTInfo             7.5%
+  mallocgc                            9.5%
+  followHOTChainNoCopy                5.7%
+
+TPC-DS SF0.25 sweep (65437, full gate):
+  Q72: 171-176 s over five earlier sweeps -> 23.6 s; subset re-runs 23.9 s, 24.2 s
+  total 418 s -> 238 s; plan shapes 99/99 unchanged

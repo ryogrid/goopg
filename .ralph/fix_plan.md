@@ -29649,7 +29649,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   > the park\) are written up in the design doc\. Owner: pick one; the park
   > stays in force until then\.
 Movement: none — recon; no production change \(knob A/B measurement only\)
-- [ ] **M0146\-0088 — goopg\'s parameterised index probe runs ~1\.3–1\.6x slower
+- [x] **M0146\-0088 — goopg\'s parameterised index probe runs ~1\.3–1\.6x slower
   than the same PG\-shaped plan needs** \(filed 2026\-10\-07 by M0146\-0068\)\.
   With `GOOPG_INDEX_PROBE_MULT=1` goopg elects exactly PG\'s plan for TPC\-DS
   SF0\.25 Q17 \(catalog\_sales index probe in a serial NL above the Gather
@@ -29664,6 +29664,9 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     by side; profile the inner Index Scan rescan \(btree descent, heap
     fetch, slot materialisation, per\-loop executor setup\) with pprof on a
     private clone, and compare per\-loop time against PG\'s actual loop time\.
+  - Done 2026\-10\-07 \(f3509cbdd\): `scanLeafItems` starts at a binary search over the leaf \(`leafScanStart`, PG\'s `\_bt\_binsrch`\) and the descent reads items without copying\. 200k\-probe NL micro\-benchmark 1\.70 s → 0\.74 s \(PG 0\.39 s\); TPC\-DS SF0\.25 Q72 175 s → 23 s, sweep total 418 s → 238 s, plan shapes 99/99 unchanged\. Design: `docs/design/0100\-0149/m0146\-0088\-index\-probe\-leaf\-binsearch\.md`\.
+  - Movement: none — CATEGORIES\-EXCL\-MATCH unchanged \(join\-order=53\); runtime only\.
+  - Residual ~1\.9x per probe vs PG ledgered \(descent per rescan, posting checks, allocation\)\.
 - [ ] **M0146\-0089 — WRONG RESULTS: a materialized view comes back as a plain view after
   restarts** \(filed 2026\-10\-07 by M0146\-0063b\)\. `CREATE TABLE s\(a int\)` with 3000 rows,
   `CREATE MATERIALIZED VIEW mv AS SELECT a FROM s`, CHECKPOINT; `DELETE … WHERE a > 1000`,
