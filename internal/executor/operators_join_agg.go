@@ -1962,7 +1962,13 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P3.2 (06 §2.3): PG's HJ_NEED_NEW_BATCH. The probe stream
 			// ending means this batch is done, not that the join is — load
 			// the next batch's build side and replay its saved probe rows.
-			if o.batches != nil {
+			if o.batches != nil && o.parallelFill != nil && !o.parallelSweeps {
+				// M0146-0095: a Parallel Hash join that fills its build
+				// side runs its later batches in the participant that
+				// claimed the sweep, over every participant's probe rows
+				// (handed over at detach). This one has nothing left to do.
+				o.batches.close()
+			} else if o.batches != nil {
 				more, berr := o.batches.nextBatch(o)
 				if berr != nil {
 					return nil, berr

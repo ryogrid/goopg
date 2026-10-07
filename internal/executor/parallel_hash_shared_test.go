@@ -8,6 +8,7 @@ package executor
 // both scans stamped partial, and a Gather on top.
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -126,9 +127,10 @@ func TestParallelHashIdentityWithSerial(t *testing.T) {
 // TestParallelHashSpilledBuildMatchesSerial pins M0146-0090: a Parallel Hash
 // build whose shares outgrow hash_mem batches (the participants' shares are
 // merged under one batch count, mergeSpilledParts) and returns exactly the
-// serial rows. Before, the query failed. A join that fills its build side
-// still refuses a spilled share — it must fail loudly, never return a batch's
-// unmatched rows from one participant's view.
+// serial rows. Before, the query failed. M0146-0095: a join that fills its
+// build side (RIGHT, FULL) batches too — the participant that claims the
+// sweep runs every later batch over all participants' probe rows, so no
+// batch's unmatched build rows are judged from one participant's view.
 func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 	ctx, cleanup := parallelHashFixture(t)
 	defer cleanup()
@@ -136,8 +138,8 @@ func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 	wantBuildRows := renderRows(buildKeys)[0]
 
 	for _, tc := range []struct {
-		sql       string
-		mayRefuse bool
+		sql        string
+		fillsBuild bool
 	}{
 		{"SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", false},
 		{"SELECT p.w, b.v FROM ph_probe p LEFT JOIN ph_build b ON p.k = b.k", false},
@@ -146,7 +148,7 @@ func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 		{"SELECT p.w FROM ph_probe p WHERE p.k NOT IN (SELECT b.k FROM ph_build b)", false},
 		// RIGHT and FULL: the inner join's plan retyped, as in
 		// TestParallelHashFillBuildIdentityWithSerial — ph_build is hashed and
-		// the join fills it, so a spilled share must be refused.
+		// the join fills it.
 		{"right", true},
 		{"full", true},
 	} {
@@ -178,12 +180,6 @@ func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 			defer func() { ctx.WorkMem = saved; ctx.parallelHashObserver = nil }()
 
 			got, err := c19fTryRun(ctx, par)
-			if tc.mayRefuse {
-				if err == nil || !strings.Contains(err.Error(), "fills its build side") {
-					t.Fatalf("a spilled share of a build-filling join must be refused; got err=%v (%d rows, serial %d)", err, len(got), len(want))
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("spilled Parallel Hash failed: %v", err)
 			}
@@ -203,6 +199,9 @@ func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 			}
 			if got := ph.rowsPublished; renderRows([]Row{{NewIntDatum(int64(got))}})[0] != wantBuildRows {
 				t.Fatalf("participants published %d build rows, the inner holds %s non-NULL keys", got, wantBuildRows)
+			}
+			if tc.fillsBuild && (!ph.sweepClaimed || ph.probers != 0) {
+				t.Fatalf("sweepClaimed=%v probers=%d: the shared sweep did not run exactly once", ph.sweepClaimed, ph.probers)
 			}
 			t.Logf("builders=%d rowsPublished=%d nbatch=%d", ph.builders, ph.rowsPublished, ph.table.batches.nbatch)
 		})
@@ -268,9 +267,10 @@ func TestParallelHashBarrier(t *testing.T) {
 	failed := newParallelHashBuild(nil)
 	failed.attach()
 	failed.attach()
-	failed.finish(nil, nil, errParallelHashSpilled)
+	errBuild := errors.New("a participant's build failed")
+	failed.finish(nil, nil, errBuild)
 	failed.finish(&sharedHashBuild{}, nil, nil)
-	if err := failed.wait(nil); err != errParallelHashSpilled {
+	if err := failed.wait(nil); err != errBuild {
 		t.Fatalf("a participant's failure must reach every waiter; got %v", err)
 	}
 }
@@ -418,11 +418,11 @@ func TestParallelHashProbeDetachMerges(t *testing.T) {
 	if !ph.probeAttach() || !ph.probeAttach() {
 		t.Fatal("attach refused before any detach")
 	}
-	_, _, last := ph.probeDetach(map[string][]bool{"a": {true, false}}, map[int64][]bool{7: {false, true}})
+	_, _, _, last := ph.probeDetach(map[string][]bool{"a": {true, false}}, map[int64][]bool{7: {false, true}}, nil)
 	if last {
 		t.Fatal("the first of two probers claimed the sweep")
 	}
-	ms, mi, last := ph.probeDetach(map[string][]bool{"a": {false, true}, "b": {true}}, nil)
+	ms, mi, _, last := ph.probeDetach(map[string][]bool{"a": {false, true}, "b": {true}}, nil, nil)
 	if !last {
 		t.Fatal("the last prober did not claim the sweep")
 	}

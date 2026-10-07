@@ -89,6 +89,14 @@ type parallelHashBuild struct {
 	sweepClaimed bool
 	mergedS      map[string][]bool
 	mergedI      map[int64][]bool
+	// handedOuter collects, per batch, the probe-row files every detached
+	// prober wrote for batches past 0 (M0146-0095). A join that fills its
+	// build side cannot let each participant probe batch k with its own rows
+	// alone — no participant would see every match of a batch-k build row —
+	// so the participant that claims the sweep runs every later batch itself
+	// over all participants' probe rows, and its per-batch matched bits are
+	// complete.
+	handedOuter [][]*joinBatchFile
 }
 
 // parallelHashPart is one participant's published build share.
@@ -441,9 +449,18 @@ func (ph *parallelHashBuild) probeAttach() bool {
 // reports whether the caller is the last prober, which then owns the sweep
 // and receives the merged bitmaps. The mutex is the publication edge: every
 // other participant's marks were made before its own detach.
-func (ph *parallelHashBuild) probeDetach(ms map[string][]bool, mi map[int64][]bool) (map[string][]bool, map[int64][]bool, bool) {
+func (ph *parallelHashBuild) probeDetach(ms map[string][]bool, mi map[int64][]bool, outer []*joinBatchFile) (map[string][]bool, map[int64][]bool, [][]*joinBatchFile, bool) {
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
+	for b, f := range outer {
+		if f == nil {
+			continue
+		}
+		for len(ph.handedOuter) <= b {
+			ph.handedOuter = append(ph.handedOuter, nil)
+		}
+		ph.handedOuter[b] = append(ph.handedOuter[b], f)
+	}
 	if ph.mergedS == nil {
 		ph.mergedS = make(map[string][]bool, len(ms))
 	}
@@ -458,10 +475,12 @@ func (ph *parallelHashBuild) probeDetach(ms map[string][]bool, mi map[int64][]bo
 	}
 	ph.probers--
 	if ph.probers > 0 || ph.sweepClaimed {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	ph.sweepClaimed = true
-	return ph.mergedS, ph.mergedI, true
+	handed := ph.handedOuter
+	ph.handedOuter = nil
+	return ph.mergedS, ph.mergedI, handed, true
 }
 
 // orMatched ORs a participant's bitmap for one bucket into the merged map. The
@@ -489,14 +508,6 @@ var errParallelHashAbandoned = errors.New("parallel hash join: build abandoned (
 // errParallelHashUnregistered is returned by a Parallel Hash join that reaches
 // execution without the Gather-registered shared build state.
 var errParallelHashUnregistered = errors.New("parallel hash join: no shared build state is registered for this join (not under a Gather that registered it)")
-
-// errParallelHashSpilled refuses a spilled share of a join that fills its
-// build side (RIGHT, FULL, RIGHT SEMI/ANTI). Batches past 0 are probed by
-// every participant separately, each with its own probe rows, so no one
-// participant sees every match of a batch-k build row; PG's per-batch
-// barrier that merges them (PHJ_BATCH_SCAN) is not ported (M0146-0090,
-// ledgered). Other join types batch (mergeSpilledParts).
-var errParallelHashSpilled = errors.New("parallel hash join: a participant's build exceeded hash_mem and spilled; parallel hash batching of a join that fills its build side is not supported")
 
 // lookupParallelHashBuild returns the shared build state for a Parallel Hash
 // join, or nil when this execution is not under a Gather that registered one.
@@ -568,9 +579,6 @@ func (o *joinOp) openParallelHashJoin(ctx *Context, ph *parallelHashBuild) error
 			switch {
 			case o.batches.nbatch <= 1:
 				o.releaseBatches()
-			case o.fillBuildSide():
-				o.releaseBatches()
-				err = errParallelHashSpilled
 			default:
 				spilled = o.batches
 				o.batches = nil
@@ -631,20 +639,33 @@ func (o *joinOp) openParallelHashJoin(ctx *Context, ph *parallelHashBuild) error
 // merged ones for the sweep. It reports whether this participant sweeps the
 // shared table. Outside a parallel fill-build join every participant sweeps
 // its own table, as before.
+//
+// A batched table (M0146-0095): the probe-row files this participant wrote
+// for batches past 0 go to the shared state with its bits, and the last
+// prober receives every participant's as extra outer files of its own batch
+// state — it alone runs the later batches. A participant asked again (a
+// later batch's probe EOF) keeps the answer it got at batch 0.
 func (o *joinOp) parallelFillDetach() bool {
 	ph := o.parallelFill
 	if ph == nil {
 		return true
 	}
 	if !o.parallelProbing {
-		return false
+		return o.parallelSweeps
 	}
 	o.parallelProbing = false
-	ms, mi, last := ph.probeDetach(o.lazyMatchedS, o.lazyMatchedI)
+	var outer []*joinBatchFile
+	if bs := o.batches; bs != nil {
+		outer = bs.handOverOuterFiles()
+	}
+	ms, mi, handed, last := ph.probeDetach(o.lazyMatchedS, o.lazyMatchedI, outer)
 	if !last {
 		return false
 	}
 	o.lazyMatchedS, o.lazyMatchedI = ms, mi
+	if bs := o.batches; bs != nil {
+		bs.adoptHandedOuterFiles(handed)
+	}
 	return true
 }
 
