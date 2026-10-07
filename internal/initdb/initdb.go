@@ -206,7 +206,8 @@ func SampleFiles() []FileSpec {
 const goopgFeaturesFile = "global/pg_goopg_features"
 
 func defaultGoopgFeatures() []byte {
-	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n")
+	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n" +
+		storage.VMWALLoggedFeature + "\n")
 }
 
 // readGoopgFeatures returns the capability names in dataDir's marker file,
@@ -223,6 +224,50 @@ func readGoopgFeatures(dataDir string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// addGoopgFeature records capability name in dataDir's marker file, creating
+// the file for a cluster older than it. The rewrite is atomic (temp + fsync +
+// rename): a torn marker must read as "capability absent", the conservative
+// side for every capability. M0146-0063.
+func addGoopgFeature(dataDir, name string) error {
+	have := readGoopgFeatures(dataDir)
+	if have[name] {
+		return nil
+	}
+	path := filepath.Join(dataDir, goopgFeaturesFile)
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		raw = append(raw, '\n')
+	}
+	raw = append(raw, []byte(name+"\n")...)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // Options controls goopg init.

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/transam"
@@ -1967,6 +1968,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		State:       "active",
 	})
 	act.UpdateTrackIOTiming(checkpointerProcNum, opts.TrackIOTiming)
+	// M0146-0063: the visibility map exists before the checkpointer, whose
+	// flush phase saves its forks (FlushCLOGFn below). It stays empty, and a
+	// save writes nothing, until the forks are loaded after replay.
+	vm := storage.NewVisibilityMap()
+	// vmLogging is set once the map's WAL hook is installed; vmCapability
+	// once global/pg_goopg_features says the map is WAL-logged. The
+	// capability is recorded by the first checkpoint that saves the forks
+	// with logging on: from then the forks on disk are checksummed and
+	// current as of a redo pointer, which a crash start needs before it may
+	// load them (a fork an older binary's shutdown wrote is neither).
+	var vmLogging, vmCapability atomic.Bool
+	vmCapability.Store(readGoopgFeatures(abs)[storage.VMWALLoggedFeature])
 	cp := xlog.NewCheckpointer(pool, walWriter, xlog.CheckpointerConfig{
 		DataDir:             abs,
 		SegmentSize:         walCfg.SegmentSize,
@@ -2102,7 +2115,27 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			commitStampMu.Lock()
 			//lint:ignore SA2001 empty critical section is the barrier
 			commitStampMu.Unlock()
-			return clog.FlushAll()
+			if err := clog.FlushAll(); err != nil {
+				return err
+			}
+			// M0146-0063: the visibility map's forks are saved before the
+			// checkpoint record, like every other page the redo pointer
+			// covers: replay starts at the redo pointer and applies only the
+			// map changes logged after it. A failed save fails the
+			// checkpoint, which then leaves the redo pointer where it was.
+			if err := vm.VMSaveForks(abs, nil); err != nil {
+				return err
+			}
+			if vmLogging.Load() && !vmCapability.Load() {
+				if err := addGoopgFeature(abs, storage.VMWALLoggedFeature); err != nil {
+					// Without the marker a crash start discards the
+					// forks: the conservative side.
+					slog.Warn("could not record the WAL-logged visibility-map capability", "err", err)
+				} else {
+					vmCapability.Store(true)
+				}
+			}
+			return nil
 		},
 	})
 
@@ -2674,7 +2707,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Recovery:       recovery,
 		NextMultiXact:  recov.nextMulti,
 		FSM:            storage.NewFSM(),
-		VM:             storage.NewVisibilityMap(),
+		VM:             vm,
 	}
 
 	// M0130-S1: load persistent Visibility Map state from per-relation
@@ -2692,7 +2725,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// and nothing replayed since cleared the bits of pages modified after
 	// it — an index-only scan returned deleted rows. Discard them; the map
 	// starts empty, as on a fresh cluster, until VACUUM sets it again.
-	if recov.crashRecovery {
+	//
+	// M0146-0063 lifts that for a cluster whose map is WAL-logged
+	// (VMWALLoggedFeature): its forks are saved at every checkpoint and
+	// replay has just applied every change logged since, so they are loaded
+	// as after a clean shutdown. Only a cluster without the capability — its
+	// last run predates the logging — still discards after a crash.
+	if recov.crashRecovery && !vmCapability.Load() {
 		if n, err := storage.DiscardVMForks(rt.DataDir); err != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
@@ -2707,6 +2746,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: vm load: %w", err)
 	}
+	// M0146-0063: from here every change of the map is WAL-logged as a native
+	// RecordKindHeapVisible (replayHeapVisible applies it to the fork). The
+	// next checkpoint saves the forks and records the capability (FlushCLOGFn
+	// above), after which a crash start may trust them.
+	rt.VM.SetWALHook(func(rel storage.RelFileNode, blk storage.BlockNumber, flags uint8) error {
+		_, _, err := walWriter.Append(xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{
+			Rel:     rel,
+			HeapBlk: blk,
+			Flags:   flags,
+		}))
+		return err
+	})
+	vmLogging.Store(true)
 
 	// Parity bundle E3: publish relallvisible into pg_class view rows.
 	catalog.RelAllVisibleFunc = func(dbOid, relOid uint32) int32 {
