@@ -48,7 +48,7 @@ type appendRelLabel struct {
 // and exactly one FROM item that is not a join (or no FROM at all). plan is
 // the member's planned branch, read for the aggregate / window / SRF nodes
 // the AST does not flag.
-func isSafeAppendMember(s *parser.SelectStmt, plan Node) bool {
+func isSafeAppendMember(s *parser.SelectStmt, plan Node, scope *rtableScope) bool {
 	if s == nil {
 		return false
 	}
@@ -58,7 +58,9 @@ func isSafeAppendMember(s *parser.SelectStmt, plan Node) bool {
 		s.With != nil || len(s.Locking) > 0 || s.SetOpOperand != nil {
 		return false
 	}
-	if s.Where != nil {
+	// The member's own WHERE: quals pushed from the parent's restrictions
+	// (M0146-0094) arrive after PG's pull-up decided.
+	if scope.appendMemberWhere(s) != nil {
 		return false
 	}
 	switch {

@@ -1414,7 +1414,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			return nil, err
 		}
 		leftAppendMember := 0
-		if appendRel != nil && !isSafeAppendMember(s, left) {
+		if appendRel != nil && !isSafeAppendMember(s, left, scope) {
 			leftAppendMember = 1
 		}
 		// planSegment plans segment i's operand alone.
@@ -1487,7 +1487,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				if i == 0 {
 					memberLeft = leftAppendMember
 				}
-				if !isSafeAppendMember(seg.stmt, right) {
+				if !isSafeAppendMember(seg.stmt, right, scope) {
 					memberRight = i + 2
 				}
 			}
@@ -1720,6 +1720,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// unique-keyed table never reaches the FROM-clause planner.
 		s = removeUselessLeftJoins(s, cat)
 		s = pushWhereQualsIntoGroupedItems(s, cat)
+		// M0146-0094: set_append_rel_size's push of the appendrel's
+		// restrictions into its UNION ALL members.
+		s = pushWhereQualsIntoUnionAllItems(s, cat, scope)
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
@@ -3981,6 +3984,32 @@ type rtableScope struct {
 	// binding scopes (a simple subquery keeps its own column namespace),
 	// so they must be recorded just like wrapped ones. M0146-0005w.
 	derivedSubtrees []Node
+	// appendMemberOrigWhere maps a UNION ALL member that took pushed
+	// restriction quals (pushWhereQualsIntoUnionAllItems, M0146-0094) to
+	// its WHERE before the push: is_safe_append_member is decided on the
+	// member PG's pull-up saw, before set_append_rel_size pushes anything.
+	appendMemberOrigWhere map[*parser.SelectStmt]parser.Expr
+}
+
+// recordAppendMemberOrigWhere notes member m's WHERE before a push.
+func (s *rtableScope) recordAppendMemberOrigWhere(m *parser.SelectStmt, where parser.Expr) {
+	if s == nil || m == nil {
+		return
+	}
+	if s.appendMemberOrigWhere == nil {
+		s.appendMemberOrigWhere = map[*parser.SelectStmt]parser.Expr{}
+	}
+	s.appendMemberOrigWhere[m] = where
+}
+
+// appendMemberWhere is member m's own WHERE, before any pushed quals.
+func (s *rtableScope) appendMemberWhere(m *parser.SelectStmt) parser.Expr {
+	if s != nil {
+		if w, ok := s.appendMemberOrigWhere[m]; ok {
+			return w
+		}
+	}
+	return m.Where
 }
 
 // recordDerivedSubtree appends a FROM-subquery leaf subtree root to the
