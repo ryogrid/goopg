@@ -6224,7 +6224,8 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// (is_simple_union_all), so it keeps its inline path; every other
 	// non-simple leaf gets the labelling wrapper.
 	if !appendrelSubquery && derivedSubqueryNeedsScan(rv.Subquery, inner) {
-		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx}
+		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx,
+			resjunk: selectHasResjunk(rv.Subquery)}
 	} else if p, ok := inner.(*Project); ok {
 		// M0146-0029: the columns of a derived leaf "stay at 0" (above) —
 		// but an UNLABELLED leaf publishes its root's own schema, whose

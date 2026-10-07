@@ -2067,6 +2067,12 @@ type SubqueryScan struct {
 	// (stripTrivialSubqueryScans) reads it to compute which output
 	// positions the consumer actually references. M0146-0005w.
 	src int16
+	// resjunk records that PG's subquery target list carries a resjunk
+	// entry (a GROUP BY / ORDER BY / DISTINCT ON / window key the select
+	// list does not name): its subplan tlist is longer than any
+	// pathtarget-regime scan tlist, so setrefs keeps the node there.
+	// M0146-0092.
+	resjunk bool
 }
 
 func (n *SubqueryScan) Pos() int       { return n.pos }

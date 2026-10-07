@@ -61,6 +61,9 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 		// physical records whether a spine-breaking ancestor sits
 		// between the leaf and its region root — see below.
 		physical bool
+		// path is the chain from the region root to parent, which
+		// windowInputOrder reads (M0146-0092).
+		path []Node
 	}
 	var leaves []leaf
 
@@ -84,15 +87,16 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 	// `u.a` from a two-column grouped leaf keeps `Subquery Scan` at top
 	// level and under Sort/Limit/Unique, but loses it under Merge Join
 	// and under a top Aggregate.)
-	var walk func(n, region, parent Node, physical bool)
-	walk = func(n, region, parent Node, physical bool) {
+	var walk func(n, region, parent Node, physical bool, path []Node)
+	walk = func(n, region, parent Node, physical bool, path []Node) {
 		if n == nil {
 			return
 		}
 		inner := region
 		innerPhysical := physical
 		if sq, ok := n.(*SubqueryScan); ok {
-			leaves = append(leaves, leaf{region: region, parent: parent, scan: sq, physical: physical})
+			leaves = append(leaves, leaf{region: region, parent: parent, scan: sq, physical: physical,
+				path: append([]Node(nil), path...)})
 			inner = n
 			innerPhysical = false
 		} else if isDerived[n] {
@@ -123,22 +127,25 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 		for _, k := range kids {
 			r := inner
 			p := childPhysical
+			kpath := append(path, n)
 			if r != region {
 				// Region boundary — derived body, CTEScan body or
 				// SubqueryScan interior each begin their own
 				// EXACT-tlist regime.
 				p = false
+				kpath = []Node{n}
 			}
 			if _, isSetOp := n.(*SetOp); isSetOp {
 				// Each arm was planned in its own query scope; the arm
 				// subtree is the region for everything inside it.
 				r = k
 				p = false
+				kpath = nil
 			}
-			walk(k, r, n, p)
+			walk(k, r, n, p, kpath[:len(kpath):len(kpath)])
 		}
 	}
-	walk(root, root, nil, false)
+	walk(root, root, nil, false, nil)
 
 	if len(leaves) == 0 {
 		return root
@@ -151,6 +158,18 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 	trivial := make(map[*SubqueryScan]bool, len(leaves))
 	for _, l := range leaves {
 		used, clean := leafUsedPositions(l.region, l.scan, isDerived)
+		if !l.physical {
+			// M0146-0092: below a window stack the scan's tlist is the
+			// window input target, not the consumer's reference order.
+			if order, ok, applies := windowInputOrder(l.path, l.scan); applies {
+				used, clean = order, ok
+			}
+			// A resjunk entry makes the subplan tlist longer than any
+			// pathtarget tlist; the physical tlist carries it too.
+			if l.scan.resjunk {
+				continue
+			}
+		}
 		w := len(l.scan.Output())
 		identity := clean && len(used) == w
 		if identity {
@@ -513,7 +532,8 @@ func wrapInlinedCTEScans(root Node) (Node, bool) {
 			if alias == "" {
 				alias = cs.Name
 			}
-			return &SubqueryScan{pos: cs.pos, Alias: alias, Child: cs, schema: cs.Output(), src: cs.SourceIdx}, true
+			return &SubqueryScan{pos: cs.pos, Alias: alias, Child: cs, schema: cs.Output(), src: cs.SourceIdx,
+				resjunk: selectHasResjunk(cs.cte.query)}, true
 		}
 		if sq, ok := n.(*SubqueryScan); ok {
 			// Already wrapped — by a derived-table leaf, or by an inner

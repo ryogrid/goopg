@@ -300,3 +300,38 @@ func TestSubqueryScanStripsInsideSublinkBodies(t *testing.T) {
 		}
 	}
 }
+
+// TestSubqueryScanWindowAndResjunkRules pins M0146-0092 against PG 18.3's
+// verdicts (analysis/m0146/m0146-0092/). Two setrefs inputs the consumption
+// proxy cannot see:
+//   - a resjunk entry in the subquery's tlist (a GROUP BY / ORDER BY /
+//     window key the select list does not name) keeps the wrapper in the
+//     pathtarget regime; under an Agg the physical tlist carries it and the
+//     wrapper is trivial;
+//   - a leaf below a WindowAgg takes make_window_input_target's order —
+//     window keys first, then the other Vars.
+func TestSubqueryScanWindowAndResjunkRules(t *testing.T) {
+	cat := subqueryScanFixture(t)
+	const grouped = "(select a, count(b) c from t1 group by a) v"
+	for _, tc := range []struct {
+		sql  string
+		keep bool
+	}{
+		{"select * from (select count(b) s from t1 group by a) x", true},
+		{"select * from (select b from t1 order by a) x", true},
+		{"select * from (select b from t1 order by 1) x", false},
+		{"select * from (select a, rank() over (order by b) r from t1) w", true},
+		{"select * from (select a, b, rank() over (order by b) r from t1) w", false},
+		{"select count(*) from (select count(b) s from t1 group by a) x", false},
+		{"select a, c, rank() over (order by c) from " + grouped, true},
+		{"select c, a, rank() over (order by c) from " + grouped, true},
+		{"select a, c, rank() over (partition by a order by c) from " + grouped, false},
+		{"select c, rank() over (order by a) from " + grouped, false},
+		{"select rank() over (order by c), a, c from " + grouped, true},
+	} {
+		plan := planSQL(t, cat, tc.sql)
+		if got := findSubqueryScan(plan) != nil; got != tc.keep {
+			t.Errorf("%s: Subquery Scan kept=%v, PG keeps=%v", tc.sql, got, tc.keep)
+		}
+	}
+}
