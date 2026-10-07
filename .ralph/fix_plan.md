@@ -28033,7 +28033,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
         - No TPC\-DS plan moves by default \(fire set: no changed query at
           either scale\): Q95 needs M0145\-0008ac\'s pull\-up\.
       Movement: none — no default\-arm plan reaches it until M0145\-0008ac re\-applies its patch
-  - [ ] **M0146\-0049e — a partial outer drives the parameterised Append**
+  - [x] **M0146\-0049e — a partial outer drives the parameterised Append**
     \(filed 2026\-10\-03 by 0049c\)\. PG\'s Q54 runs Gather → NL\(Parallel Seq
     Scan item, Append\(param probes\)\); goopg\'s `PathParamAppend` is not
     parallel\-safe, so the NL stays serial\.
@@ -28044,6 +28044,20 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     - First step: set `ParallelSafe` from the member probes and check the
       parallel NL arm \(joinpathsnli\.go\) lowers through the lateral Join
       under a Gather\.
+    - Done 2026\-10\-07 \(`e75280c05`; design
+      `docs/design/0100\-0149/m0146\-0049e\-partial\-param\-append\.md`\):
+      - `PathParamAppend\.ParallelSafe` per create\_append\_path; member
+        rels run relConsiderParallel\.
+      - Path, node and executor twins admit an Append\-of\-probes inner;
+        the claim walks\' inner\-bitmap refusal skips this shape \(members
+        stay worker\-private\)\.
+      - Q54 SF0\.25 now plans PG\'s Gather → NL\(Parallel Seq Scan item,
+        Append\); `TestParallelParamAppendProbeIdentity` \(1/2/4 workers,
+        N\-copy guard proven non\-vacuous\)\.
+      - Categories unchanged \(Q54 diverges upstream\); SF1 elects one
+        Gather over the whole tree where PG uses two sibling Gathers
+        \(ledgered\)\.
+    Movement: none — instrument artefact — Q54\'s first divergence lies upstream of the new subtree; CATEGORIES\-EXCL\-MATCH unchanged at SF0\.25 and SF1
   - [ ] **M0146\-0049f — the IN/semi form probes each UNION ALL member**
     \(filed 2026\-10\-03 by 0049c\)\. `li\.id IN \(SELECT item FROM cs1 UNION
     ALL SELECT item FROM ws1\)`: PG probes both members, goopg does not
