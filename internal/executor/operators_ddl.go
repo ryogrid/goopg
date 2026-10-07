@@ -27327,7 +27327,11 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// No-op when the type name is unchanged — unless a USING clause is
 	// present, in which case PG still rewrites the column (the USING expr
 	// result must still be coerced to the target type).
-	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil {
+	// The type is unchanged only when its typmod is too: numeric(6,3) →
+	// numeric(5,1) rewrites the rows, rounding them to the new scale
+	// (M0146-0087).
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil &&
+		int64SlicesEqual(oldCatalogType.Args, newCatalogType.Args) {
 		return nil
 	}
 
@@ -27424,6 +27428,15 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 				// PG performs the coercion during ATRewriteTable's expression
 				// evaluation, which has no source location. pos 0.
 				converted, cErr := evalCast(src, newCatalogType.Name, 0, o.ctx)
+				if cErr == nil && !newCatalogType.IsArray {
+					if prec, scale, ok := numericColumnTypmod(newCatalogType); ok && isTypmodNumericColumn(catalog.Column{Type: newCatalogType}) {
+						converted, cErr = applyNumericTypmod(converted, prec, scale)
+						if cErr != nil {
+							convErr = cErr
+							break
+						}
+					}
+				}
 				if cErr != nil {
 					// Coercion failure: propagate deterministically BEFORE
 					// Phase 2 (catalog mutation) / Phase 3 (heap truncation)
@@ -28044,4 +28057,17 @@ func buildCallArgListStr(args []parser.FunctionArg) string {
 		parts[i] = strings.ToLower(a.Type.Name)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// int64SlicesEqual reports whether two typmod argument lists are equal.
+func int64SlicesEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

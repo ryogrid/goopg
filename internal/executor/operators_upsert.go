@@ -259,6 +259,15 @@ func (o *upsertOp) next() (TupleSlot, error) {
 		}
 		applyDefaultsForMissing(parentCols, inserted, upsertMissing, ctxSeqDBOid(o.ctx))
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
+		// Assignment coercion, as plain INSERT does: range checks, typed
+		// literals, the numeric(p,s) typmod (M0146-0087; sibling of
+		// insertOp.Next).
+		if err := coerceRowForConstraintChecks(parentCols, inserted, func(i int) bool { return !upsertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
+		if err := applyDefaultNumericTypmods(parentCols, inserted, upsertMissing, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse
 		// a prior row's keys. applyInsert repopulates it. M0100-0006b.
@@ -550,6 +559,14 @@ func (o *upsertOp) next() (TupleSlot, error) {
 				updatedForLeaf := updated
 				if partLeaf != nil {
 					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
+				}
+				// DO UPDATE SET values take the column type and typmod, as a
+				// plain UPDATE's do (M0146-0087).
+				setNames := o.updateColumns()
+				if cerr := coerceRowForConstraintChecks(parentCols, updated, func(i int) bool {
+					return i < len(parentCols) && setNames[strings.ToLower(parentCols[i].Name)]
+				}, o.ctx, o.plan.Pos()); cerr != nil {
+					return nil, cerr
 				}
 				// Check secondary unique constraints. The arbiter index is implicitly
 				// valid (already resolved above); checkUniqueIndexesForUpdate skips

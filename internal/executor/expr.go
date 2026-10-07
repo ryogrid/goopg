@@ -15991,6 +15991,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if v.Kind == KindInt && scale == 0 {
 				return v, nil
 			}
+			// numeric_round is exact decimal rounding (M0146-0087).
+			if v.Kind == KindNumeric && scale >= -1000 && scale <= 1000 {
+				return roundNumericExact(v, int(scale)), nil
+			}
 			f, ferr := strconv.ParseFloat(v.Format(), 64)
 			if ferr != nil {
 				return NullDatum, nil

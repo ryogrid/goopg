@@ -625,8 +625,9 @@ func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 	// re-coercing it would risk drift. The error propagates unwrapped (PushLine
 	// returns insertSourceRow's error as-is), so reg*in's own SQLSTATE reaches
 	// the wire rather than the 22P04 the decode path wraps.
+	// numeric(p,s) columns are admitted too, for the typmod (M0146-0087).
 	if err := coerceRowForConstraintChecks(c.cols, row, func(i int) bool {
-		return isRegIdentifierTypeName(c.cols[i].Type.Name)
+		return isRegIdentifierTypeName(c.cols[i].Type.Name) || isTypmodNumericColumn(c.cols[i])
 	}, c.ctx, c.plan.Pos()); err != nil {
 		return err
 	}

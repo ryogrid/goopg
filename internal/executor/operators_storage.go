@@ -2679,6 +2679,12 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
+			// The column's numeric(p,s) typmod rounds and pads the stored
+			// value (apply_typmod); it was never applied, so 1.26 into a
+			// numeric(4,1) stayed 1.26 (M0146-0087).
+			if prec, scale, ok := numericColumnTypmod(col.Type); ok && cerr == nil {
+				coerced, cerr = applyNumericTypmod(coerced, prec, scale)
+			}
 		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 			// M0119-0006 (reg* + cid 4-byte storage): resolve a bare quoted name
 			// literal to its OID before the heap arm stores it — a reg* name must
@@ -2695,6 +2701,20 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 		row[i] = coerced
 	}
 	return nil
+}
+
+// applyDefaultNumericTypmods applies a numeric(p,s) column's typmod to a
+// value that came from the column DEFAULT: PG coerces the default
+// expression to the column's type and typmod (build_column_default), so
+// `numeric(5,2) DEFAULT 1.5` stores 1.50. coerceRowForConstraintChecks skips
+// defaulted columns (missing[i]). M0146-0087.
+func applyDefaultNumericTypmods(cols []catalog.Column, row Row, missing []bool, ctx *Context, pos int) error {
+	return coerceRowForConstraintChecks(cols, row, func(i int) bool {
+		if i >= len(missing) || !missing[i] {
+			return false
+		}
+		return isTypmodNumericColumn(cols[i])
+	}, ctx, pos)
 }
 
 func (o *insertOp) Next() (TupleSlot, error) {
@@ -2788,6 +2808,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// construction site via coerceRowForConstraintChecks
 		// (pattern_sibling_paths_must_agree).
 		if err := coerceRowForConstraintChecks(cols, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
+		if err := applyDefaultNumericTypmods(cols, row, insertMissing, o.ctx, o.plan.Pos()); err != nil {
 			return nil, err
 		}
 

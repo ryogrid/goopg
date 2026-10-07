@@ -403,6 +403,11 @@ func (o *mergeOp) next() (TupleSlot, error) {
 							}
 							newRow[i] = val
 						}
+						// SET values take the column type and typmod (assignment coercion,
+						// numeric(p,s) rounding) before generated columns and triggers (M0146-0087).
+						if cerr := coerceRowForConstraintChecks(tbl.Columns, newRow, func(i int) bool { return i < len(clause.UpdateSet) && clause.UpdateSet[i] != nil }, o.ctx, o.plan.Pos()); cerr != nil {
+							return nil, cerr
+						}
 						_ = computeGeneratedColumns(tbl.Columns, newRow)
 						// tgtRow/newRow in parent order; applyMod remaps to child at write.
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
@@ -466,6 +471,11 @@ func (o *mergeOp) next() (TupleSlot, error) {
 							continue
 						}
 						newRow[i] = val
+					}
+					// SET values take the column type and typmod (assignment coercion,
+					// numeric(p,s) rounding) before generated columns and triggers (M0146-0087).
+					if cerr := coerceRowForConstraintChecks(tbl.Columns, newRow, func(i int) bool { return i < len(clause.UpdateSet) && clause.UpdateSet[i] != nil }, o.ctx, o.plan.Pos()); cerr != nil {
+						return nil, cerr
 					}
 					_ = computeGeneratedColumns(tbl.Columns, newRow)
 					// Store tgtRow/newRow in parent order; applyMod remaps to child for write.
@@ -598,6 +608,9 @@ func (o *mergeOp) next() (TupleSlot, error) {
 			// column types (assignment coercion, range checks), before
 			// triggers and constraints see the row.
 			if err := coerceRowForConstraintChecks(tbl.Columns, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+				return nil, err
+			}
+			if err := applyDefaultNumericTypmods(tbl.Columns, row, insertMissing, o.ctx, o.plan.Pos()); err != nil {
 				return nil, err
 			}
 			_ = computeGeneratedColumns(tbl.Columns, row)
@@ -756,6 +769,11 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 					val, _ := evalExpr(clause.UpdateSet[i], combined, o.ctx)
 					newRow[i] = val
 				}
+				// SET values take the column type and typmod (assignment coercion,
+				// numeric(p,s) rounding) before generated columns and triggers (M0146-0087).
+				if cerr := coerceRowForConstraintChecks(parentTbl.Columns, newRow, func(i int) bool { return i < len(clause.UpdateSet) && clause.UpdateSet[i] != nil }, o.ctx, o.plan.Pos()); cerr != nil {
+					return false, cerr
+				}
 				_ = computeGeneratedColumns(parentTbl.Columns, newRow)
 				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
@@ -832,6 +850,11 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 				}
 				val, _ := evalExpr(clause.UpdateSet[i], combined, o.ctx)
 				newRow[i] = val
+			}
+			// SET values take the column type and typmod (assignment coercion,
+			// numeric(p,s) rounding) before generated columns and triggers (M0146-0087).
+			if cerr := coerceRowForConstraintChecks(parentTbl.Columns, newRow, func(i int) bool { return i < len(clause.UpdateSet) && clause.UpdateSet[i] != nil }, o.ctx, o.plan.Pos()); cerr != nil {
+				return cerr
 			}
 			_ = computeGeneratedColumns(parentTbl.Columns, newRow)
 			mod := &mergePendingMod{
