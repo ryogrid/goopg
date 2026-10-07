@@ -29469,6 +29469,18 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     It must land together with the WAL\-logged clear: VACUUM emits `XLOG\_HEAP2\_VISIBLE` \(redo
     exists\), heap DML sets `XLH\_\*\_ALL\_VISIBLE\_CLEARED` and its redo clears the fork bit\.
     Until then every crash start, an online clone included, begins with a cold map\.
+  - [x] **M0146\-0063b — WRONG RESULTS: heap writers that skip the visibility\-map clear** \(filed
+    and fixed 2026\-10\-07 while working M0146\-0063\)\. No crash needed: VACUUM, then two
+    `INSERT … ON CONFLICT DO UPDATE` rewriting indexed values — `count\(\*\)` by Index Only Scan
+    returned 61, the heap held 49\.
+    Kind: impl
+    Parent: M0146\-0063
+    - DONE \(`ea45c154d`; design `docs/design/0100\-0149/m0146\-0063b\-vm\-clear\-every\-writer\.md`\):
+      upsert and speculative\-cancel deletes, logical\-apply and catalog deletes, catalog and
+      matview\-refresh xmax stamps, HOT updates and TOAST inserts clear both bits; row locks clear
+      ALL\_FROZEN only \(`VisibilityMap\.ClearAllFrozen`\), as heap\_lock\_tuple does\.
+    - Fixed in\-slice: every clear site is one the WAL\-logged clear \(M0146\-0063\) must cover\.
+    Movement: none — correctness fix — no plan instrument \(fire set flat\)
 - [ ] **M0146\-0064 — a direct `UPDATE pg\_class SET reltuples` does not
   reach the planner** \(filed 2026\-10\-05 by M0146\-0020b\)\. regress
   groupingsets sets `update pg\_class set reltuples = 10 where
@@ -29622,3 +29634,18 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     by side; profile the inner Index Scan rescan \(btree descent, heap
     fetch, slot materialisation, per\-loop executor setup\) with pprof on a
     private clone, and compare per\-loop time against PG\'s actual loop time\.
+- [ ] **M0146\-0089 — WRONG RESULTS: a materialized view comes back as a plain view after
+  restarts** \(filed 2026\-10\-07 by M0146\-0063b\)\. `CREATE TABLE s\(a int\)` with 3000 rows,
+  `CREATE MATERIALIZED VIEW mv AS SELECT a FROM s`, CHECKPOINT; `DELETE … WHERE a > 1000`,
+  `REFRESH MATERIALIZED VIEW mv`, CHECKPOINT; clean stop/start twice\. After the second restart
+  `pg\_class\.relkind` for `mv` is `v`, `SELECT count\(\*\) FROM mv` follows the base table \(live
+  data, 500 after a further delete\), and REFRESH fails with `"mv" is not a materialized view`\.
+  One restart, or no prior REFRESH, keeps `m`\. PG keeps relkind `m` and the stored rows\.
+  Kind: impl
+  Parent: none
+  - Repro data directory kept at `tmp/m63\-data\-mv\-repro` \(goopg build of `ea45c154d`\)\.
+  - First step: find where the matview flag \(`catalog\.Table\.IsMatView`\) is reloaded from the
+    catalog heap at startup, and what the REFRESH → restart path writes to pg\_class / pg\_rewrite\.
+  > \#\# ESCALATION 2026\-10\-07 \(S2\) — M0146\-0089 returns wrong results
+  > A materialized view silently becomes a live view after a REFRESH and two clean restarts\.
+  > Owner: place M0146\-0089 in the banner\.
