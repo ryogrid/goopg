@@ -5557,6 +5557,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 			}
 			o.appendUpdateRetRow(pu.newRow)
+			o.syncPgClassRelStats(pu.newRow) // M0146-0064
 			o.rowsAffected++
 		}
 	}
@@ -6492,6 +6493,7 @@ func (o *updateOp) next() (TupleSlot, error) {
 			} else {
 				o.appendUpdateRetRow(pu.newRow)
 			}
+			o.syncPgClassRelStats(pu.newRow) // M0146-0064
 			o.rowsAffected++
 		}
 	}

@@ -279,6 +279,7 @@ type BasicSession struct {
 	onCommitActions     []OnCommitAction           // ON COMMIT {DELETE ROWS|DROP} registrations (M0134-0072)
 	pendingAlterIndex   []AlterIndexUndoEntry      // ALTER TABLE ADD CONSTRAINT ... USING INDEX field mutations pending rollback (P0-E5/M0143-0008)
 	pendingNotNullAlter []NotNullUndoEntry         // PRIMARY KEY NOT-NULL synthesis pending rollback (P0-E5/M0143-0008)
+	pendingRelStats     []RelStatsUndoEntry        // pg_class reltuples/relpages UPDATEs pending rollback (M0146-0064)
 	pendingDropConstAlt []DropConstraintUndoEntry  // ALTER TABLE DROP CONSTRAINT (CHECK/FK/NOT NULL) field mutations pending rollback (M0143-0008b)
 }
 
@@ -424,6 +425,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingDDL = nil
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
+	s.pendingRelStats = nil // committed (or already restored by ROLLBACK)
 	s.savepointDDLDrops = nil
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
@@ -877,6 +879,20 @@ func (s *BasicSession) RecordNotNullUndo(e NotNullUndoEntry) {
 func (s *BasicSession) TakePendingNotNullUndos() []NotNullUndoEntry {
 	p := append([]NotNullUndoEntry(nil), s.pendingNotNullAlter...)
 	s.pendingNotNullAlter = nil
+	return p
+}
+
+// RecordRelStatsUndo records a relation's Stats before a pg_class UPDATE
+// replaced them, for ROLLBACK (M0146-0064).
+func (s *BasicSession) RecordRelStatsUndo(e RelStatsUndoEntry) {
+	s.pendingRelStats = append(s.pendingRelStats, e)
+}
+
+// TakePendingRelStatsUndos drains and returns the pending relation-stats undo
+// list (M0146-0064).
+func (s *BasicSession) TakePendingRelStatsUndos() []RelStatsUndoEntry {
+	p := s.pendingRelStats
+	s.pendingRelStats = nil
 	return p
 }
 
