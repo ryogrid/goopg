@@ -453,8 +453,9 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 		mergeInnerFor(ip, ip != i, jt, innerUnique, mergeClauses, residual))
 	if matInner && ip == i {
 		// create_mergejoin_plan's Material above the inner (createplan.c:4659).
-		// An explicitly sorted inner PG would also shield is left bare: the
-		// merge plan absorbs its Sort child (absorbMergeSort) — ledgered.
+		// An explicitly sorted inner PG would also shield (sorted and over
+		// work_mem) keeps its re-emitted Sort bare (restoreMergeSort) —
+		// ledgered.
 		ip = mergeMaterialInner(ip, cp)
 	}
 	// The residual is evaluated on the tuples that already matched on the

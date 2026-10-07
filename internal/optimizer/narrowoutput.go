@@ -83,14 +83,15 @@ func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerP
 //     comparator, join_merge_stream.go). Narrowing never touches
 //     `p.HashKeys` and the keep is ascending, so the tuple order is
 //     invariant under the cut.
-//  2. The absorbed PathSort children impose nothing further: they are
-//     stepped over, never emitted (`absorbMergeSort`), so their Pathkeys
-//     are never evaluated. Moreover they cannot name a column outside the
-//     merge clauses — the sort keys ARE clause operands (`mergeKeyGroups`
-//     builds each group's outer/inner PathKey from its first clause's
-//     operand, joinpathsmerge.go; `mergeInnerSortKeys` re-derives per
-//     clause; the ordered-outer arm sorts nothing). Dropped clauses are
-//     demoted to the residual, still inventoried.
+//  2. The PathSort children impose nothing further: they are stepped over
+//     while the side is built and narrowed (`absorbMergeSort`) and
+//     re-emitted above the narrowed node (`restoreMergeSort`), and their
+//     keys cannot name a column outside the merge clauses — the sort keys
+//     ARE clause operands (`mergeKeyGroups` builds each group's outer/inner
+//     PathKey from its first clause's operand, joinpathsmerge.go;
+//     `mergeInnerSortKeys` re-derives per clause; the ordered-outer arm
+//     sorts nothing). Dropped clauses are demoted to the residual, still
+//     inventoried.
 //  3. Hence every side's sort-key columns are that side's HashKeys-operand
 //     columns, and `collectJoinQualNames` walks every HashKeys operand —
 //     so the derived keep (out ∪ ancestors ∪ at-parent) contains every

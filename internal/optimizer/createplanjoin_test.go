@@ -509,13 +509,14 @@ func TestCreateMergeJoinPlanKeyOrderSurvivesFillJoinHashKeys(t *testing.T) {
 	}
 }
 
-// TestCreateMergeJoinPlanAbsorbsSortChildren. PG's `create_mergejoin_plan`
-// MATERIALISES a Sort from `outersortkeys`/`innersortkeys` because its executor
-// requires sorted input; goopg's `JoinAlgoMerge` operator sorts both inputs
-// itself (`openMergeJoin`). Emitting the path's explicit `PathSort` children as
-// `*Sort` nodes would therefore sort each side twice — a cost
-// `tryMergeJoinPath` never charged. The arm steps over them.
-func TestCreateMergeJoinPlanAbsorbsSortChildren(t *testing.T) {
+// TestCreateMergeJoinPlanEmitsSortChildren pins M0146-0099: PG's
+// `create_mergejoin_plan` puts a Sort from `outersortkeys`/`innersortkeys` on
+// each side that needs one (createplan.c:4580-4650), and EXPLAIN prints it.
+// The arm builds each side through its `PathSort` and re-emits the Sort above
+// it, with the sort key in the SIDE's coordinates and the join keys in the
+// merged row's — a Sort passes its child's layout through, so they land where
+// they do without one.
+func TestCreateMergeJoinPlanEmitsSortChildren(t *testing.T) {
 	a, b := cpjTwoRel()
 	key := equiClauseOn(a.Relids, b.Relids, 0, 2) // a0 = b0
 	p := cpjMergePath(
@@ -525,17 +526,24 @@ func TestCreateMergeJoinPlanAbsorbsSortChildren(t *testing.T) {
 		[]PathKey{{Expr: col(2), SortAsc: true}})
 
 	j := createPlan(p).(*Join)
-	if _, isSort := j.Left.(*Sort); isSort {
-		t.Error("outer child is a *Sort; the merge operator re-sorts it, so the node is doubled work")
+	for _, side := range []struct {
+		name string
+		n    Node
+	}{{"outer", j.Left}, {"inner", j.Right}} {
+		srt, ok := side.n.(*Sort)
+		if !ok {
+			t.Fatalf("%s child = %T, want the *Sort PG puts on a merge input that needs one", side.name, side.n)
+		}
+		if _, isScan := srt.Child.(*SeqScan); !isScan {
+			t.Fatalf("%s sort child = %T, want the *SeqScan", side.name, srt.Child)
+		}
+		if len(srt.Keys) != 1 || srt.Keys[0].Desc || srt.Keys[0].NullsFirst {
+			t.Fatalf("%s sort keys = %+v, want one ascending nulls-last key", side.name, srt.Keys)
+		}
+		if got := srt.Keys[0].Expr.(*ColumnRef).Index; got != 0 {
+			t.Errorf("%s sort key index = %d, want 0 (the side's own key column)", side.name, got)
+		}
 	}
-	if _, isSort := j.Right.(*Sort); isSort {
-		t.Error("inner child is a *Sort; the merge operator re-sorts it, so the node is doubled work")
-	}
-	if _, isScan := j.Left.(*SeqScan); !isScan {
-		t.Fatalf("outer child = %T, want the *SeqScan under the absorbed sort", j.Left)
-	}
-	// Absorbing must be coordinate-neutral: a sort passes its child's layout
-	// through, so the keys land exactly where they do without one.
 	if got := j.LeftKey.(*ColumnRef).Index; got != 0 {
 		t.Errorf("LeftKey.Index = %d, want 0 (b0)", got)
 	}
@@ -543,7 +551,18 @@ func TestCreateMergeJoinPlanAbsorbsSortChildren(t *testing.T) {
 		t.Errorf("RightKey.Index = %d, want 3 (a0)", got)
 	}
 	if names := j.Output(); len(names) != 5 || names[0].Name != "b0" || names[3].Name != "a0" {
-		t.Fatalf("merged schema is not outer++inner after absorption: %v", names)
+		t.Fatalf("merged schema is not outer++inner: %v", names)
+	}
+
+	// A presorted side (no PathSort) gets no Sort.
+	q := cpjMergePath(cpjLeafPath(b), cpjSortOver(cpjLeafPath(a), 0),
+		[]*restrictInfo{key}, nil, []PathKey{{Expr: col(2), SortAsc: true}})
+	jq := createPlan(q).(*Join)
+	if _, isSort := jq.Left.(*Sort); isSort {
+		t.Error("presorted outer got a *Sort; only a PathSort side is sorted")
+	}
+	if _, isSort := jq.Right.(*Sort); !isSort {
+		t.Errorf("inner child = %T, want *Sort", jq.Right)
 	}
 }
 

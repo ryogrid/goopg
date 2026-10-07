@@ -1201,7 +1201,17 @@ func drivingScanCrossesSort(n Node) bool {
 			return drivingScanCrossesSort(x.Left)
 		}
 		if joinProbeSideIsLeft(x) {
-			return drivingScanCrossesSort(x.Left)
+			left := x.Left
+			// M0146-0099: a merge join's own input Sort (restoreMergeSort)
+			// is consumed by the merge in each worker — every worker merges
+			// its sorted outer partition against the whole sorted inner — so
+			// it is not an ordering the boundary above has to preserve. It
+			// was absorbed into the merge node until 0099, and the verdict
+			// stays what it was then.
+			if srt, ok := left.(*Sort); ok && x.Algo == JoinAlgoMerge {
+				left = srt.Child
+			}
+			return drivingScanCrossesSort(left)
 		}
 		return drivingScanCrossesSort(x.Right)
 	case *NestedLoopIndexJoin:

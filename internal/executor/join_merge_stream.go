@@ -333,8 +333,16 @@ func (s *mergeSortedSource) less(a, b mergeStreamRow) bool {
 	return cmp < 0
 }
 
+// sortChunk orders the resident chunk. A chunk already in `less` order is left
+// as it is — the stable sort of a sorted slice is the identity — which is the
+// case under the explicit Sort a merge plan puts on an input (M0146-0099,
+// restoreMergeSort): that node does the sorting and the check costs one pass.
 func (s *mergeSortedSource) sortChunk() {
-	sort.SliceStable(s.tail, func(i, j int) bool { return s.less(s.tail[i], s.tail[j]) })
+	less := func(i, j int) bool { return s.less(s.tail[i], s.tail[j]) }
+	if sort.SliceIsSorted(s.tail, less) {
+		return
+	}
+	sort.SliceStable(s.tail, less)
 }
 
 // flushRun sorts the resident chunk, writes it to a spill run and frees it.

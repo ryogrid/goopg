@@ -290,6 +290,10 @@ type joinInputs struct {
 	// begins, and therefore the width of the left-only publication a SEMI or
 	// ANTI join makes. C-03c.
 	outerCols int
+	// outerLay / innerLay are each child's own layout — the halves `lay`
+	// concatenates. The merge arm translates a side's sort keys onto them
+	// (restoreMergeSort).
+	outerLay, innerLay outputLayout
 }
 
 // publishedSchema / publishedLayout are what the join NODE exposes upward, as
@@ -466,6 +470,8 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 		merged:      merged,
 		lay:         lay,
 		index:       lay.bindingIndex(),
+		outerLay:    outerLay,
+		innerLay:    innerLay,
 	}
 }
 
@@ -747,24 +753,28 @@ func assertParallelAwareJoinIsRunnable(p *Path, j *Join) {
 // and sorting by `(a.x, b.x)` when `a.x = b.x` already holds inside the outer is
 // the same order as sorting by `a.x`.
 //
-// # The sort children are ABSORBED, not emitted
+// # The sort children are built through, then re-emitted
 //
 // PG's `MergePath` carries `outersortkeys`/`innersortkeys` and this arm
-// MATERIALISES a `Sort` node, because PG's `nodeMergejoin` requires sorted
-// inputs and cannot produce them. goopg's `JoinAlgoMerge` operator sorts BOTH
-// inputs itself, unconditionally, into work_mem-bounded runs (`openMergeJoin`,
-// operators_join_agg.go:315) — it is a Sort⋈Sort in one node. goopg's path model
-// nevertheless makes the sorts explicit `PathSort` children (`sortPathFor`), so
-// that `addPath` can compare a candidate that needs a sort against one that does
-// not.
+// MATERIALISES a `Sort` node over each side that needs one. goopg's path model
+// makes those sorts explicit `PathSort` children (`sortPathFor`) so that
+// `addPath` can compare a candidate that needs a sort against one that does
+// not, and `tryMergeJoinPath` prices exactly one sort per side.
 //
-// Emitting those children as `*Sort` nodes would therefore sort each side TWICE:
-// once in the node the path names, once inside the join that ignores it. That is
-// not a faithful translation, it is a doubled cost the path was never charged —
-// `tryMergeJoinPath` prices exactly one sort per side. So the arm absorbs them:
-// a child `PathSort` is stepped over and ITS child is emitted, which reproduces
-// the costed plan exactly. `absorbMergeSort` states the one property that has to
-// hold for the step-over to be ordering-neutral.
+// The arm builds each side THROUGH its `PathSort` (`absorbMergeSort`), so the
+// key pairs and the merge-input narrowing see the side's own node, and then
+// puts the Sort back on top of the narrowed node (`restoreMergeSort`,
+// M0146-0099) — PG's plan shape, with the Sort as the CP_SMALL_TLIST consumer
+// that keeps a subquery's `Subquery Scan` below it. Until M0146-0099 the Sort
+// was dropped there, so every merge input that needed a sort printed without
+// one (TPC-DS Q44's `Merge Join` directly over two WindowAggs).
+//
+// goopg's `JoinAlgoMerge` operator still sorts both inputs itself into
+// work_mem-bounded runs (`openMergeJoin`); a chunk that arrives already in its
+// order is not re-sorted (`mergeSortedSource.sortChunk`), so the side is
+// sorted once, by the node the plan names. The operator still buffers the
+// side it reads, which PG's nodeMergejoin, streaming its sorted input, does
+// not — ledgered with M0146-0099.
 //
 // Preconditions, each naming the wrong answer it prevents:
 //
@@ -803,6 +813,11 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		absorbMergeSort(p.Children[0], "outer"),
 		absorbMergeSort(p.Children[1], "inner"))
 	pairs := in.keyPairs("PathMergeJoin", p.HashKeys)
+	// M0146-0099: the absorbed sorts go back on as plan nodes, over the
+	// narrowed inputs, after the key pairs were translated against them. A
+	// Sort publishes its child's schema, so `merged`/`lay` stay valid.
+	in.outer = restoreMergeSort(p.Children[0], in.outer, in.outerLay)
+	in.inner = restoreMergeSort(p.Children[1], in.inner, in.innerLay)
 
 	jt := planJoinTypeFor(p, "PathMergeJoin")
 	j := &Join{
@@ -855,12 +870,11 @@ func assertPartialMergeJoinIsRunnable(p *Path, j *Join) {
 }
 
 // absorbMergeSort steps over a merge child's explicit `PathSort`, returning the
-// path whose node should actually be emitted. See `createMergeJoinPlan`'s doc for
-// why the sort is redundant.
+// path the side's node is built from; `restoreMergeSort` puts the Sort back on
+// once that node is narrowed. See `createMergeJoinPlan`'s doc.
 //
-// The step-over is ordering-neutral only because the join re-imposes an ordering
-// on this side itself, so the one thing checked is that the absorbed sort is not
-// asking for something the join will not deliver: goopg's merge comparator is
+// The one thing checked is that the sort is not asking for something the join
+// will not deliver: goopg's merge comparator is
 // ascending, NULL-keyed rows last. A descending `PathSort` under a merge join
 // means the producer expected the sort to survive — it would not — and the
 // resulting stream would be ordered the other way with nothing to notice.
@@ -882,6 +896,39 @@ func absorbMergeSort(child *Path, side string) *Path {
 		}
 	}
 	return child.Children[0]
+}
+
+// restoreMergeSort re-emits the explicit Sort a merge path chose for one side —
+// create_mergejoin_plan's make_sort over outersortkeys / innersortkeys
+// (createplan.c:4580-4650) — as a `*Sort` over the node built from the
+// absorbed path. PG prints that Sort (`Sort Key: v11.rnk` under TPC-DS Q44's
+// Merge Join), and as a CP_SMALL_TLIST consumer it is what keeps a subquery's
+// `Subquery Scan` below it.
+//
+// The node is built after the absorbed child and its narrowing, so the keys
+// translate onto the side's final layout; narrowMergeInput's keep set
+// already covers every sort-key column (mergeKeepCoversSortKeys), and
+// translateToLayout panics on a missing one. The merge operator still sorts
+// the side itself; on an input that arrives in its order it skips the sort
+// (mergeSortedSource.sortChunk), so the Sort node is the one that does the
+// work.
+func restoreMergeSort(child *Path, node Node, lay outputLayout) Node {
+	if child == nil || child.Kind != PathSort || node == nil {
+		return node
+	}
+	index := lay.bindingIndex()
+	keys := make([]SortKey, len(child.Pathkeys))
+	for i, pk := range child.Pathkeys {
+		if pk.Expr == nil {
+			panic(fmt.Sprintf("createPlan: PathMergeJoin sort pathkey %d has no expression", i))
+		}
+		keys[i] = SortKey{
+			Expr:       translateToLayout("merge sort key", pk.Expr, lay, index),
+			Desc:       !pk.SortAsc,
+			NullsFirst: pk.NullsFirst,
+		}
+	}
+	return &Sort{pos: node.Pos(), Child: node, Keys: keys}
 }
 
 // describePathKeyOrder names a pathkey's direction for a panic message.

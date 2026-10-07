@@ -1758,6 +1758,11 @@ func slice3BuildProjectsExcept(n, skip Node) []*Project {
 		}
 		if j, ok := n.(*Join); ok {
 			for _, side := range []Node{j.Left, j.Right} {
+				// A merge input's Sort sits above the narrowed node
+				// (restoreMergeSort, M0146-0099).
+				if srt, isSort := side.(*Sort); isSort && j.Algo == JoinAlgoMerge {
+					side = srt.Child
+				}
 				if p, isProj := side.(*Project); isProj && slice3IsNarrowBuild(p) {
 					out = append(out, p)
 				}
