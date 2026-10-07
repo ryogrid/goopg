@@ -29447,7 +29447,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     and relpages from it, as PG\'s relcache does on invalidation\.
   Kind: impl
   Parent: M0146
-- [ ] **M0146\-0065 — an inlined single\-reference CTE whose body is a
+- [x] **M0146\-0065 — an inlined single\-reference CTE whose body is a
   UNION ALL is never pulled up as an appendrel** \(filed 2026\-10\-05 by
   M0146\-0027's closure\)\. PG's `inline\_cte` turns the reference into an
   RTE\_SUBQUERY, and `pull\_up\_subqueries` pulls it up through
@@ -29472,6 +29472,19 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   > depth 2, `PG Finalize HashAggregate \| goopg HashAggregate` under the
   > CTE, at both scales\. This task inherits the hold through its parent \(S7\)\.
   > Owner: reopen M0146\-0007 or place this task\.
+  - DONE 2026\-10\-07 \(`21727437d`\)\. Three gaps, each a CTE reference left a `CTE Scan` leaf the
+    search cannot mark appendrel:
+    - a body that IS the UNION ALL → `inlinesAsUnionAll` plans the reference through
+      `planCTEReferenceAsSubquery`;
+    - a body selecting FROM a UNION ALL subquery → `pullupUnionAllLeaf` admits it in
+      `simpleDerivedPullupBody`;
+    - a later sibling\'s reference → `selectOwned`/`astRefs` stamped at entry creation in
+      `preplanWithClause`\.
+  - TPC\-DS Q2\'s `CTE wswscs` subtree is node for node PG\'s at both scales; its next
+    divergence \(D6\) is the main query\'s join order over the two CTE Scans \(ledgered\)\.
+  - Design doc `docs/design/0100\-0149/m0146\-0065\-inlined\-cte\-union\-all\-appendrel\.md`\.
+  - The 2026\-10\-05 escalation above is answered by the 2026\-10\-06 owner re\-open of M0146\-0007\.
+  Movement: yes — SF0\.25 CATEGORIES\-EXCL\-MATCH parallelism 29→28, aggregation\-strategy 8→7, scan\-type 29→28; SF1 parallelism 42→41, aggregation\-strategy 15→14
 - [ ] **M0146\-0066 — trivial\_subqueryscan parity: goopg keeps a Subquery
   Scan PG strips, and strips some PG keeps** \(filed 2026\-10\-05 by
   M0146\-0028g's census\)\. `stripTrivialSubqueryScans` \(M0146\-0005w\)
