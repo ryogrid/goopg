@@ -354,6 +354,69 @@ func eachOwnExpr(n Node, visit func(Expr)) {
 	}
 }
 
+// stripSublinkBodies runs the strip over every sublink and InitPlan body
+// beneath root, each as a region of its own — M0146-0091.
+//
+// PG's setrefs walks every subplan of the statement (set_plan_references
+// over glob->subplans), so trivial_subqueryscan deletes a trivial wrapper
+// inside a sublink body exactly as it does in the main tree; each subplan
+// entered create_plan with CP_EXACT_TLIST, which is the regime a region root
+// starts in here. goopg's bodies hang off expressions, which planChildNodes
+// does not follow, so the statement-level pass never saw them: TPC-DS Q23's
+// `Subquery Scan on __sq_1a7` under the InitPlan's Aggregate survived where
+// PG renders the HashAggregate.
+//
+// A stripped body is written back through the sublink's plan slot
+// (exprChildSlots). The expressions are shared between the tree before and
+// after the statement-level rebuild — mapPlanChildren copies nodes, not
+// their expressions — so the write reaches the finished tree. A body
+// reached twice (one plan held by two sublinks) is stripped once.
+func stripSublinkBodies(root Node, derived []Node, force bool) {
+	if root == nil || (len(derived) == 0 && !force) {
+		return
+	}
+	stripped := map[Node]Node{}
+	seen := map[Node]bool{}
+	var visit func(n Node)
+	body := func(b Node) Node {
+		if nb, ok := stripped[b]; ok {
+			return nb
+		}
+		nb := stripTrivialSubqueryScans(b, derived, force)
+		stripped[b] = nb
+		stripped[nb] = nb
+		visit(nb)
+		return nb
+	}
+	visit = func(n Node) {
+		if n == nil || seen[n] {
+			return
+		}
+		seen[n] = true
+		for _, e := range nodeOwnExprs(n) {
+			walkExprTree(e, func(sub Expr) {
+				slots, ok := exprChildSlots(sub)
+				if !ok {
+					return
+				}
+				for _, sl := range slots {
+					switch {
+					case sl.kind == slotInnerPlan && sl.plan != nil && *sl.plan != nil:
+						*sl.plan = body(*sl.plan)
+					case sl.kind == slotSubqRow && sl.row != nil && *sl.row != nil && (*sl.row).Plan != nil:
+						(*sl.row).Plan = body((*sl.row).Plan)
+					}
+				}
+			})
+		}
+		kids, _ := planChildNodes(n)
+		for _, k := range kids {
+			visit(k)
+		}
+	}
+	visit(root)
+}
+
 // stripPlanRebuild returns the plan with every trivial SubqueryScan
 // replaced by its (already-rebuilt) child. Children are rebuilt first so
 // nested wrappers are stripped innermost-out; the coordinate contract is

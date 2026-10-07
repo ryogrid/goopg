@@ -224,6 +224,10 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 		chargeInitPlans(node)
 	}
 	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
+	// M0146-0091: setrefs walks every subplan too — strip inside each
+	// sublink / InitPlan body, which hang off expressions the pass above
+	// does not follow.
+	stripSublinkBodies(node, scope.derivedSubtrees, wrappedCTE)
 	// M0146-0034: record which index scan carries the ORDER BY, for the
 	// parallel post-pass that runs on this plan without the statement.
 	markIndexOrderRelied(node, stmt)

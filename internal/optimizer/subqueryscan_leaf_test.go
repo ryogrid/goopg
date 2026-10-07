@@ -244,3 +244,59 @@ func TestSubqueryScanStripsTrivialWrapper(t *testing.T) {
 		})
 	}
 }
+
+// sublinkBodies returns every sublink / InitPlan body beneath n, nested
+// bodies included.
+func sublinkBodies(n Node) []Node {
+	var out []Node
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		for _, sl := range NodeSublinks(n) {
+			out = append(out, sl.Plan)
+			walk(sl.Plan)
+		}
+		if kids, ok := planChildNodes(n); ok {
+			for _, k := range kids {
+				walk(k)
+			}
+		}
+	}
+	walk(n)
+	return out
+}
+
+// TestSubqueryScanStripsInsideSublinkBodies pins M0146-0091: setrefs strips a
+// trivial wrapper inside a sublink body as it does in the main tree. Under
+// the InitPlan's Aggregate the leaf is in the physical-tlist regime (PG 18.3
+// renders the HashAggregate directly, TPC-DS Q23's __sq_1a7); under a
+// Limit/Sort that reads one of the leaf's two columns it is a subset tlist
+// and PG keeps `Subquery Scan on x`.
+func TestSubqueryScanStripsInsideSublinkBodies(t *testing.T) {
+	cat := subqueryScanFixture(t)
+	for _, tc := range []struct {
+		sql  string
+		keep bool
+	}{
+		{"select a from t1 where b > (select max(c) from (select a, count(a) c from t1 group by a) x)", false},
+		{"select a from t1 t0 where b > (select max(c) from (select a, count(a) c from t1 where t1.a = t0.a group by a) x)", false},
+		{"select a from t1 where b > (select x.c from (select a, count(a) c from t1 group by a) x order by c limit 1)", true},
+	} {
+		plan := planSQL(t, cat, tc.sql)
+		bodies := sublinkBodies(plan)
+		if len(bodies) == 0 {
+			t.Fatalf("%s: the plan has no sublink body", tc.sql)
+		}
+		kept := false
+		for _, b := range bodies {
+			if findSubqueryScan(b) != nil {
+				kept = true
+			}
+		}
+		if kept != tc.keep {
+			t.Errorf("%s: Subquery Scan inside the sublink body kept=%v, PG keeps=%v", tc.sql, kept, tc.keep)
+		}
+	}
+}

@@ -134,6 +134,36 @@ type SublinkRef struct {
 // de-duplication. EXPLAIN's PG plan_id numbering reads the expression
 // (an EXISTS→ANY conversion takes two ids, M0146-0005bv).
 func NodeSublinks(n Node) []SublinkRef {
+	exprs := nodeOwnExprs(n)
+	if len(exprs) == 0 {
+		return nil
+	}
+	var out []SublinkRef
+	seen := map[Node]struct{}{}
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		walkExprTree(e, func(sub Expr) {
+			for _, sp := range ExprSubplans(sub) {
+				if sp == nil {
+					continue
+				}
+				if _, ok := seen[sp]; ok {
+					continue
+				}
+				seen[sp] = struct{}{}
+				out = append(out, SublinkRef{Expr: sub, Plan: sp})
+			}
+		})
+	}
+	return out
+}
+
+// nodeOwnExprs lists the expressions a plan node holds directly — the roots
+// a sublink can hang off (NodeSublinks' enumeration). nil for a kind that
+// holds none.
+func nodeOwnExprs(n Node) []Expr {
 	var exprs []Expr
 	addKeys := func(keys []SortKey) {
 		for _, k := range keys {
@@ -382,27 +412,5 @@ func NodeSublinks(n Node) []SublinkRef {
 	default:
 		return nil
 	}
-	if len(exprs) == 0 {
-		return nil
-	}
-	var out []SublinkRef
-	seen := map[Node]struct{}{}
-	for _, e := range exprs {
-		if e == nil {
-			continue
-		}
-		walkExprTree(e, func(sub Expr) {
-			for _, sp := range ExprSubplans(sub) {
-				if sp == nil {
-					continue
-				}
-				if _, ok := seen[sp]; ok {
-					continue
-				}
-				seen[sp] = struct{}{}
-				out = append(out, SublinkRef{Expr: sub, Plan: sp})
-			}
-		})
-	}
-	return out
+	return exprs
 }
