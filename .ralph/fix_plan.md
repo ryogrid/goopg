@@ -28237,7 +28237,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     - Filed M0146\-0085 \(WITH … MERGE syntax error\) and M0146\-0086
       \(`text \|\| bool` prints `t`\)\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0082 — WRONG RESULTS: ALTER TABLE … DISABLE TRIGGER is not
+- [x] **M0146\-0082 — WRONG RESULTS: ALTER TABLE … DISABLE TRIGGER is not
   honoured** \(filed 2026\-10\-07 by M0146\-0076\)\. After `alter table
   trigtest disable trigger trigtest_b_row_tg` \(or `disable trigger user` /
   `all`\), goopg still fires the trigger; `session\_replication\_role` is
@@ -28254,6 +28254,19 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     REPLICA\] TRIGGER, emit it in pg\_trigger, and check it in
     `fireTriggersCols` / `fireStatementTriggersCols` against
     `session\_replication\_role` \(trigger\.c TriggerEnabled\)\.
+  - Done 2026\-10\-07 \(`e3cba3b96`; design
+    `docs/design/0100\-0149/m0146\-0082\-trigger\-enable\-disable\.md`\):
+    - Grammar carries the fire mode and target \(name / USER / ALL\);
+      `Trigger\.Enabled` is tgenabled; `session\_replication\_role`
+      registered\.
+    - `triggerModeFires` \(TriggerEnabled\) gates row/statement/AFTER
+      firing; FK `CheckTrigEnabled` / `ActionTrigEnabled` stand in for the RI
+      triggers, so ALL stops FK checks and cascades\.
+    - Regress triggers 2570→2471, rules −2, event\_trigger −2\.
+    - Three new findings \(partition trigger clones, `regclass IN \(SELECT
+      oid\)`, trigger durability\) are held in the M0146\-0055 escalation:
+      the lineage guard refused them as descendants\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0083 — WRONG RESULTS: constraint\-violation DETAIL renders
   dates in MDY order** \(filed 2026\-10\-07 by M0146\-0075\)\. `CREATE TABLE
   dz \(a int NOT NULL, d date DEFAULT \'2020\-01\-02\'\); INSERT INTO dz \(d\)
@@ -28579,7 +28592,7 @@ Movement: none — instrument artefact — executor concat correctness, no plan 
       `parted\_si` now loads\.
     - Filed M0146\-0075 \(MERGE INSERT leaves omitted defaults NULL\)\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [x] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
+- [!] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
   triggers** \(filed 2026\-10\-04 by M0146\-0009h\)\. A BEFORE INSERT FOR EACH
   ROW trigger that sets `new\.b := new\.b \|\| \'\!\'` changes nothing on
   goopg \(`x,y`\); PG stores `x\!,y\!`\. `storeCopyRow` never calls the
@@ -28601,6 +28614,53 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Filed M0146\-0076 \(DML statement triggers / AFTER ROW queueing\) and
       M0146\-0077 \(trigger WHEN conditions ignored\)\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+
+  > ## ESCALATION 2026\-10\-07 \(ralph2 loop \#130\) — lineage budget exhausted, OWNER DECISION NEEDED
+  >
+  > The lineage guard refused three new descendants filed by M0146\-0082:
+  > the last five completed descendants of this root — M0146\-0076,
+  > M0146\-0077, M0146\-0080, M0146\-0081, M0146\-0082 — all carry
+  > `Movement: none`\. The task itself is done; it is marked `\[\!\]` only so
+  > the loop selects elsewhere until the owner answers\.
+  >
+  > - **Attempted and proved:** each step fixed a PG\-observable wrong result
+  >   in the trigger / PL/pgSQL path, every want checked against PG 18\.3,
+  >   with regress gains and no plan change:
+  >   - 0076: statement triggers and AFTER ROW queueing per query level;
+  >   - 0077: trigger WHEN conditions;
+  >   - 0080: RAISE arguments, assignment coercion, ROW\(\) comparison;
+  >   - 0081: writable\-CTE tags, FOUND / ROW\_COUNT, GET DIAGNOSTICS;
+  >   - 0082: ENABLE/DISABLE TRIGGER, session\_replication\_role, RI
+  >     stand\-ins\.
+  > - **Remaining blocker:** none technical\. These are correctness fixes
+  >   with no TPC witness, so `Movement: none` is structural: no TPC\-H /
+  >   TPC\-DS query uses triggers or PL/pgSQL\. The owner decides whether
+  >   this lineage keeps S2 rank \(re\-pin with `LINEAGE\-BASELINE:`\) or
+  >   yields to item 3\.
+  > - **Expected movement if unblocked:** none on PLAN\-PARITY; regress
+  >   parity in triggers / plpgsql / merge / foreign\_key\.
+  > - **Remaining size:**
+  >   - open descendants M0146\-0083 \(DETAIL date format\), 0084
+  >     \(testpolym lookup\), 0085 \(WITH … MERGE\), 0086 \(`text \|\|
+  >     bool`\), each about one loop;
+  >   - the three held findings below, each with a ledger row\.
+  > - **The three would\-be descendants, held here:**
+  >   - **Partition trigger clones \(S2, ~2 loops\):** FOR EACH ROW triggers
+  >     on a partitioned table are not cloned onto its partitions, so they
+  >     never fire for routed rows\. `CREATE TRIGGER tg AFTER INSERT ON
+  >     trgfire …; INSERT INTO trgfire VALUES \(1\)` fires nothing, where PG
+  >     fires \(CreateTriggerFiringOn recursion, tgparentid\)\. As a result
+  >     pg\_trigger has no child rows, and ALTER … TRIGGER on a partition
+  >     raises 42704 for the inherited trigger\. Regress `triggers` trgfire /
+  >     trigger\_parted\.
+  >   - **`regclass IN \(SELECT oid …\)` \(S2, ~1 loop\):** returns no rows,
+  >     while `tgrelid IN \(…\)` and `\'t\'::regclass = \(SELECT oid …\)`
+  >     work\. PG compares them as oids\. Regress `triggers` trgfire query\.
+  >   - **Trigger durability \(S2, ~2 loops\):** CREATE TRIGGER does not
+  >     survive a restart \(pg\_trigger empty afterwards\)\. Trigger DDL is
+  >     not transactional either: `BEGIN; ALTER TABLE … DISABLE TRIGGER tg;
+  >     ROLLBACK;` leaves tgenabled `D`\. catalog\.Table\.Triggers is mutated
+  >     in memory only\.
 - [x] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
