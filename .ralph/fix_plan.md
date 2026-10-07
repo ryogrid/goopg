@@ -29490,7 +29490,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
       ALL\_FROZEN only \(`VisibilityMap\.ClearAllFrozen`\), as heap\_lock\_tuple does\.
     - Fixed in\-slice: every clear site is one the WAL\-logged clear \(M0146\-0063\) must cover\.
     Movement: none — correctness fix — no plan instrument \(fire set flat\)
-- [ ] **M0146\-0064 — a direct `UPDATE pg\_class SET reltuples` does not
+- [x] **M0146\-0064 — a direct `UPDATE pg\_class SET reltuples` does not
   reach the planner** \(filed 2026\-10\-05 by M0146\-0020b\)\. regress
   groupingsets sets `update pg\_class set reltuples = 10 where
   relname=\'gs\_data\_1\'` \(and `bug\_16784`\); PG then plans with 10 rows
@@ -29503,6 +29503,14 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     and relpages from it, as PG\'s relcache does on invalidation\.
   Kind: impl
   Parent: M0146
+  - DONE 2026\-10\-07 \(`ac3fd5323`; design `docs/design/0100\-0149/m0146\-0064\-pg\-class\-reltuples\-update\.md`\):
+    `syncPgClassRelStats` on both update paths applies an assigned reltuples to `Table\.Stats` and the
+    relstats sidecar, invalidates the plan cache, and is undone by ROLLBACK; relpages deliberately not
+    synced \(no density scaling, ledgered\)\.
+    - Regress groupingsets section byte\-identical to PG; A/B groupingsets −34, join\_hash −66 lines\.
+    - join\_hash `bigger\_than\_it\_looks` now plans PG\'s Parallel Hash and meets the unported parallel
+      hash batching — filed M0146\-0090\.
+  Movement: none — instrument artefact — no TPC\-H/TPC\-DS query updates pg\_class; regress groupingsets section now PG\-identical
 - [x] **M0146\-0065 — an inlined single\-reference CTE whose body is a
   UNION ALL is never pulled up as an appendrel** \(filed 2026\-10\-05 by
   M0146\-0027's closure\)\. PG's `inline\_cte` turns the reference into an
@@ -29658,3 +29666,17 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   > \#\# ESCALATION 2026\-10\-07 \(S2\) — M0146\-0089 returns wrong results
   > A materialized view silently becomes a live view after a REFRESH and two clean restarts\.
   > Owner: place M0146\-0089 in the banner\.
+- [ ] **M0146\-0090 — an underestimated Parallel Hash join errors instead of growing its
+  batches** \(filed 2026\-10\-07 by M0146\-0064\)\. goopg has no parallel hash batching: a participant
+  build that outgrows hash\_mem fails the query with `parallel hash join: a participant\'s build
+  exceeded hash\_mem and spilled; parallel hash batching is not supported` \(`errParallelHashSpilled`,
+  parallel\_hash\_shared\.go\)\. The planner\'s PH4 veto keeps Parallel Hash off inners ESTIMATED to
+  spill, so the failure needs an underestimate: regress join\_hash `bigger\_than\_it\_looks` \(reltuples
+  lowered to 1000, 20000 rows\) errors since M0146\-0064 made the lie reach the planner, and a table
+  that grew since ANALYZE \(goopg does not rescale reltuples by live pages\) would too\. PG grows the
+  shared table\'s batches \(`ExecParallelHashIncreaseNumBatches`, nodeHash\.c\) and answers 20000\.
+  Kind: impl
+  Parent: M0146\-0002
+  - Ledgered since M0146\-0002 slice 1 \(deferral\_ledger 2026\-09\-24 row\); now with a witness\.
+  - First step: port the shared batch\-growth protocol, or, as an interim that keeps results
+    correct, fall back to a serial \(non\-shared\) hash join for the group when a participant spills\.
