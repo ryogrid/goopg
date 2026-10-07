@@ -28058,13 +28058,37 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
         Gather over the whole tree where PG uses two sibling Gathers
         \(ledgered\)\.
     Movement: none — instrument artefact — Q54\'s first divergence lies upstream of the new subtree; CATEGORIES\-EXCL\-MATCH unchanged at SF0\.25 and SF1
-  - [ ] **M0146\-0049f — the IN/semi form probes each UNION ALL member**
+  - [x] **M0146\-0049f — the IN/semi form probes each UNION ALL member**
     \(filed 2026\-10\-03 by 0049c\)\. `li\.id IN \(SELECT item FROM cs1 UNION
     ALL SELECT item FROM ws1\)`: PG probes both members, goopg does not
     \(the sublink\'s UNION ALL is not a flattened appendrel leaf of the
     search\)\.
     Kind: recon
     Parent: M0146\-0049
+    - Done 2026\-10\-07 \(recon; design
+      `docs/design/0100\-0149/m0146\-0049\-parameterised\-inner\-non\-scan\.md`
+      slice \(f\)\):
+      - The ANY body\'s binding IS marked appendrel; `seamLeafRelInfo`\'s
+        derived\-leaf \(`table == nil`\) branch drops `b\.appendrel`, so
+        `addParameterizedAppendPaths` skips the leaf \(trace
+        `verdict=unmarked`\)\.
+      - Measured with a temporary one\-line patch: the IN form then plans PG\'s
+        Nested Loop Semi Join over the bitmap\-probe Append, values identical
+        \(40 rows, sum 39120\)\. Reverted; filed M0146\-0049g\.
+    Movement: none — recon; no production change
+  - [ ] **M0146\-0049g — the pulled ANY leaf keeps its appendrel mark**
+    \(filed 2026\-10\-07 by 0049f\)\. `seamLeafRelInfo`
+    \(joinsearchseam\.go\) builds a derived leaf\'s `baseRelInfo` without
+    `appendrel: b\.appendrel`, so `li\.id IN \(SELECT … UNION ALL SELECT …\)`
+    never gets the parameterised Append PG\'s Nested Loop Semi Join probes\.
+    Kind: impl
+    Parent: M0146\-0049f
+    - Expected movement \(S5\): IN/EXISTS\-over\-UNION\-ALL shapes in the fire
+      set \(scan\-type / join\-method\); the flag also enables
+      `addAppendRelPartialPaths` for derived ANY leaves, so measure both\.
+    - First step: add the field \(the recon\'s measured patch\), a planner
+      test on the recon fixture asserting the semi NL over the Append, and run
+      the fire set at both scales\.
 - [x] **M0146\-0050 — WRONG RESULTS: a correlated CTE inside a correlated
   subplan replays its first execution** \(filed 2026\-10\-03 by M0146\-0049d2\)\.
   `SELECT g, \(SELECT k FROM \(WITH c AS MATERIALIZED \(SELECT g\*2 AS k\)

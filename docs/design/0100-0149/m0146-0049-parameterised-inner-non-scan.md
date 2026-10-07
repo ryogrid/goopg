@@ -309,3 +309,39 @@ through M0145-0008ac's CTE-leaf pull-up, which this unblocks.
   (M0146-0049e).
 - **(f)** The IN/semi form: `li.id IN (SELECT item FROM cs1 UNION ALL …)`
   probes in PG, not in goopg (M0146-0049f).
+
+## Slice (f) — recon: the IN/semi form (2026-10-07)
+
+Fixture: `li(id pk, cat)` with 2000 rows (`cat = 3` keeps 40),
+`cs1(item, ord) pk` with 100k rows and `ws1(item, ord) pk` with 50k rows,
+ANALYZEd.
+
+| query | PG 18.3 | goopg (HEAD `e794f9d20`) |
+|---|---|---|
+| `li WHERE cat = 3 AND id IN (SELECT item FROM cs1 UNION ALL SELECT item FROM ws1)` | Nested Loop Semi Join → Append(Bitmap Heap cs1, Bitmap Heap ws1), `Index Cond: (item = li.id)` | Hash Join over HashAggregate(Append(Seq Scan cs1, Seq Scan ws1)) |
+
+Values are identical: 40 rows, sum 39120.
+
+**Cause.** The ANY sublink pulls up as a derived body
+(`pullUpAnyDerivedBody`, M0145-0008aa): one opaque leaf holding the body's
+plan, a `*SetOp`. The FROM-clause planning of the `(<body>) AS ANY_subquery`
+wrap marks the body binding correctly (`appendrel=true`, measured with a
+temporary print). The flag is lost when the search builds the leaf's
+`baseRelInfo`:
+
+- `seamLeafRelInfo`'s `table == nil` branch (the derived-leaf branch)
+  returns a `baseRelInfo` without copying `b.appendrel`;
+- so `addParameterizedAppendPaths` skips the leaf (DP trace:
+  `appendrel rel={ANY_subquery} verdict=unmarked`);
+- no `PathParamAppend` exists for the semi join's nested-loop arm.
+
+Q54's FROM-clause leaf goes through `estimateBaseRelInfo`, which copies the
+flag, so it was unaffected.
+
+**Measured fix.** Adding `appendrel: b.appendrel` to that branch makes the
+IN form plan exactly PG's `Nested Loop Semi Join` over the bitmap-probe
+Append, with the same values. The patch was reverted; this slice is the
+recon. The implementation is M0146-0049g, which owes the standard gates and
+the fire set: the flag also turns on the Parallel Append hoist for
+derived ANY leaves (`addAppendRelPartialPaths`), which the fire set must
+cover.
