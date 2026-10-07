@@ -1,0 +1,193 @@
+CREATE TABLE
+INSERT 0 5000
+ANALYZE
+        QUERY PLAN         
+---------------------------
+ Subquery Scan on x
+   ->  HashAggregate
+         Group Key: t.a
+         ->  Seq Scan on t
+(4 rows)
+
+        QUERY PLAN         
+---------------------------
+ Subquery Scan on x
+   ->  Sort
+         Sort Key: t.a
+         ->  Seq Scan on t
+(4 rows)
+
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Subquery Scan on w
+   ->  WindowAgg
+         Window: w1 AS (ORDER BY t.b ROWS UNBOUNDED PRECEDING)
+         ->  Sort
+               Sort Key: t.b
+               ->  Seq Scan on t
+(6 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY t.b ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: t.b
+         ->  Seq Scan on t
+(5 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY t.b ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: t.b
+         ->  Seq Scan on t
+(5 rows)
+
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (PARTITION BY t.b ORDER BY t.a ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: t.b, t.a
+         ->  Seq Scan on t
+(5 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY v.c ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: v.c
+         ->  Subquery Scan on v
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY v.c ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: v.c
+         ->  Subquery Scan on v
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (PARTITION BY t.a ORDER BY (sum(t.b)) ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: t.a, (sum(t.b))
+         ->  HashAggregate
+               Group Key: t.a
+               ->  Seq Scan on t
+(7 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY v.c ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: v.c
+         ->  Subquery Scan on v
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY t.a ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: t.a
+         ->  HashAggregate
+               Group Key: t.a
+               ->  Seq Scan on t
+(7 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY v.c ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: v.c
+         ->  Subquery Scan on v
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+
+        QUERY PLAN         
+---------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: t.a
+         ->  Seq Scan on t
+(4 rows)
+
+                QUERY PLAN                 
+-------------------------------------------
+ Hash Join
+   Hash Cond: (t.b = x.s)
+   ->  Seq Scan on t
+   ->  Hash
+         ->  Subquery Scan on x
+               ->  HashAggregate
+                     Group Key: t_1.a
+                     ->  Seq Scan on t t_1
+(8 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Subquery Scan on x
+   ->  Sort
+         Sort Key: (sum(t.b))
+         ->  HashAggregate
+               Group Key: t.a
+               ->  Seq Scan on t
+(6 rows)
+
+     QUERY PLAN      
+---------------------
+ Sort
+   Sort Key: t.b
+   ->  Seq Scan on t
+(3 rows)
+
+     QUERY PLAN      
+---------------------
+ Sort
+   Sort Key: t.b
+   ->  Seq Scan on t
+(3 rows)
+
+     QUERY PLAN      
+---------------------
+ HashAggregate
+   Group Key: t.a
+   ->  Seq Scan on t
+(3 rows)
+
+         QUERY PLAN         
+----------------------------
+ Unique
+   ->  Sort
+         Sort Key: t.a, t.b
+         ->  Seq Scan on t
+(4 rows)
+
+          QUERY PLAN           
+-------------------------------
+ Subquery Scan on x
+   ->  Sort
+         Sort Key: ((t.a + 1))
+         ->  Seq Scan on t
+(4 rows)
+

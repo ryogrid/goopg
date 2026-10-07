@@ -29715,7 +29715,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     fire set and the SF0\.25 sweep\. Design: `docs/design/0100\-0149/m0146\-0091\-strip\-sublink\-bodies\.md`\.
   - Movement: none — instrument artefact — Q23 still diverges on other categories; its Subquery Scan count moved
     2→0 \(PG 0\)\.
-- [ ] **M0146\-0092 — a Subquery Scan around a WindowAgg is stripped where PG keeps it** \(filed 2026\-10\-07 by M0146\-0066\)\. `make\_window\_input\_target` \(planner\.c\) orders the window input target sort/group\-ref columns first, so a
+- [x] **M0146\-0092 — a Subquery Scan around a WindowAgg is stripped where PG keeps it** \(filed 2026\-10\-07 by M0146\-0066\)\. `make\_window\_input\_target` \(planner\.c\) orders the window input target sort/group\-ref columns first, so a
   subquery leaf below the window\'s Sort has a reordered tlist and PG keeps it \(Q44 v1/v2, Q49 in\_\*, Q67 dw1\);
   and a subquery over a window body reads fewer columns than the WindowAgg emits \(its sort keys ride along\),
   so PG keeps that one too\. goopg\'s first\-reference\-order proxy reads identity and strips both\.
@@ -29724,6 +29724,13 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - First step: in `stripTrivialSubqueryScans`, take a leaf\'s expected order under a WindowAgg from the window\'s
     partition/order keys first \(window\_input\_target\.go\), and compare a window\-body leaf\'s consumption
     against the WindowAgg\'s full output width\.
+  - Done 2026\-10\-07 \(56ad4f97a\): the second half turned out to be PG\'s resjunk rule — any GROUP BY / ORDER BY /
+    DISTINCT ON / window key the select list does not name keeps the wrapper in the pathtarget regime
+    \(`selectHasResjunk`, `SubqueryScan\.resjunk`\); the first half is `windowInputOrder`
+    \(make\_window\_input\_target\)\. Q44 0→4, Q49 3→6, Q67 0→1 Subquery Scans, PG\'s counts at both scales\.
+    Design: `docs/design/0100\-0149/m0146\-0092\-subqueryscan\-window\-resjunk\.md`\.
+  - Filed M0146\-0097 \(hash join inner side is pathtarget regime in PG\)\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 scan\-type 36→34, parameterisation 32→31, parallelism 41→40; SF0\.25 join\-order 49→48, join\-method 25→24, scan\-type 28→27, parallelism 28→27\.
 - [ ] **M0146\-0093 — UNION ALL members that are joins get no `Subquery Scan on "*SELECT* n"`** \(filed 2026\-10\-07 by M0146\-0066\)\. `pull\_up\_simple\_union\_all` keeps a non\-simple member as a subquery RTE planned on its own; PG wraps it in
   `Subquery Scan on "\*SELECT\* n"` and keeps it when the parent consumes a subset \(Q5, Q71; probe
   `probe\-appendrel\-window\.sql` case 1\)\. goopg hash\-joins the members bare under the Append\. Check Q78 at SF1\.
@@ -29759,3 +29766,13 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   Parent: M0146\-0090
   - First step: drop PH4 for non\-build\-filling join types, then A/B the SF0\.25/SF1 fire sets and the
     TPC\-H arm for plan flips and wall\-clock\.
+- [ ] **M0146\-0097 — a Subquery Scan on a hash join\'s inner side is stripped where PG keeps it** \(filed
+  2026\-10\-07 by M0146\-0092\)\. PG\'s Hash node requests CP\_SMALL\_TLIST \(create\_hash\_plan, createplan\.c\), so a
+  subquery leaf on the hashed side is in the pathtarget regime: subset consumption or a resjunk column keeps
+  `Subquery Scan`\. goopg\'s strip pass treats every `Join` as a physical\-regime breaker for both children
+  \(`subqueryStripSpineBreaker`\)\. Probe: `select \* from t, \(select sum\(b\) s from t group by a\) x where t\.b = x\.s`
+  — PG keeps `Subquery Scan on x` under the Hash, goopg strips it \(`analysis/m0146/m0146\-0092/`, query 14\)\.
+  Kind: impl
+  Parent: M0146\-0092
+  - First step: in the strip walk, give a hash join\'s build child the pathtarget regime \(`Join\.Algo` hash,
+    build side per `probeSideIsLeft`\'s rule\), then census the fire sets for Subquery Scan count moves\.
