@@ -29703,13 +29703,18 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     `docs/design/0100\-0149/m0146\-0090\-parallel\-hash\-batching\.md`\.
   - Residuals filed: M0146\-0095 \(build\-filling joins still refuse a spilled share\), M0146\-0096 \(PH4 veto\)\.
   - Movement: none — correctness fix — no plan instrument \(regress join\_hash 2 errors → PG\'s counts\)\.
-- [ ] **M0146\-0091 — the Subquery Scan strip pass never visits sublink or InitPlan bodies** \(filed 2026\-10\-07 by M0146\-0066\)\. PG\'s setrefs walks every subplan; goopg\'s `stripTrivialSubqueryScans` runs once at `Plan\(\)`\'s tail over
+- [x] **M0146\-0091 — the Subquery Scan strip pass never visits sublink or InitPlan bodies** \(filed 2026\-10\-07 by M0146\-0066\)\. PG\'s setrefs walks every subplan; goopg\'s `stripTrivialSubqueryScans` runs once at `Plan\(\)`\'s tail over
   the statement tree, so a sublink body keeps a wrapper PG strips \(TPC\-DS Q23 `Subquery Scan on
   \_\_sq\_1a7` under the InitPlan\'s Aggregate; probe `analysis/m0146/m0146\-0066/probe\-window\-sublink\.sql` case 1\)\.
   Kind: impl
   Parent: M0146\-0066
   - First step: run the pass over each sublink/InitPlan body as its own region \(each subplan enters create\_plan with
     CP\_EXACT\_TLIST\), then recount Q23\.
+  - Done 2026\-10\-07 \(b1c7d4881\): `stripSublinkBodies` strips each sublink body as its own region and writes it
+    back through the sublink\'s plan slot\. Q23 Subquery Scan count 2 → 0 \(PG 0\), the only plan change in the SF1
+    fire set and the SF0\.25 sweep\. Design: `docs/design/0100\-0149/m0146\-0091\-strip\-sublink\-bodies\.md`\.
+  - Movement: none — instrument artefact — Q23 still diverges on other categories; its Subquery Scan count moved
+    2→0 \(PG 0\)\.
 - [ ] **M0146\-0092 — a Subquery Scan around a WindowAgg is stripped where PG keeps it** \(filed 2026\-10\-07 by M0146\-0066\)\. `make\_window\_input\_target` \(planner\.c\) orders the window input target sort/group\-ref columns first, so a
   subquery leaf below the window\'s Sort has a reordered tlist and PG keeps it \(Q44 v1/v2, Q49 in\_\*, Q67 dw1\);
   and a subquery over a window body reads fewer columns than the WindowAgg emits \(its sort keys ride along\),
