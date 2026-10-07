@@ -42,6 +42,10 @@ type parallelAppendArm struct {
 	node       Node
 	path       *Path
 	nonPartial bool
+	// member is the appendrel member number the arm's link stamped for it
+	// (M0146-0093), carried so a re-ordered chain keeps the stamp with the
+	// arm.
+	member int
 }
 
 // flattensIntoParallelAppend reports whether link n is a link of the one
@@ -64,9 +68,11 @@ func collectParallelAppendArms(p *Path, n *SetOp) []parallelAppendArm {
 	if inner, ok := n.Left.(*SetOp); ok && flattensIntoParallelAppend(inner) && inner.appendArms != nil {
 		arms = append(arms, inner.appendArms...)
 	} else {
-		arms = append(arms, parallelAppendArm{node: n.Left, path: p.Children[0], nonPartial: n.LeftNonPartial})
+		arms = append(arms, parallelAppendArm{node: n.Left, path: p.Children[0], nonPartial: n.LeftNonPartial,
+			member: n.appendMemberLeft})
 	}
-	return append(arms, parallelAppendArm{node: n.Right, path: p.Children[1], nonPartial: n.RightNonPartial})
+	return append(arms, parallelAppendArm{node: n.Right, path: p.Children[1], nonPartial: n.RightNonPartial,
+		member: n.appendMemberRight})
 }
 
 // parallelAppendArmLess is create_append_path's ordering: non-partial arms
@@ -127,6 +133,11 @@ func orderParallelAppendArms(p *Path, top *SetOp) *SetOp {
 		link.Right = sorted[k].node
 		link.LeftNonPartial = k == 1 && sorted[0].nonPartial
 		link.RightNonPartial = sorted[k].nonPartial
+		link.appendMemberLeft = 0
+		if k == 1 {
+			link.appendMemberLeft = sorted[0].member
+		}
+		link.appendMemberRight = sorted[k].member
 		link.pinnedSchema = schema
 		link.appendArms = nil
 		cur = &link

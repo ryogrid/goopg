@@ -335,3 +335,53 @@ func TestSubqueryScanWindowAndResjunkRules(t *testing.T) {
 		}
 	}
 }
+
+// findSubqueryScanAlias returns the first *SubqueryScan with the given alias.
+func findSubqueryScanAlias(n Node, alias string) *SubqueryScan {
+	if n == nil {
+		return nil
+	}
+	if sq, ok := n.(*SubqueryScan); ok && sq.Alias == alias {
+		return sq
+	}
+	kids, _ := planChildNodes(n)
+	for _, k := range kids {
+		if f := findSubqueryScanAlias(k, alias); f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+// TestSubqueryScanAppendRelMembers pins M0146-0093 against PG 18.3's verdicts
+// (analysis/m0146/m0146-0093/): a UNION ALL member PG cannot pull up into the
+// appendrel (is_safe_append_member — a join, or any WHERE) keeps `Subquery
+// Scan on "*SELECT* n"` unless the parent reads its columns whole and in
+// order; a single-relation member without WHERE has none.
+func TestSubqueryScanAppendRelMembers(t *testing.T) {
+	cat := subqueryScanFixture(t)
+	const joinMember = "(select t1.a x, t1.b y from t1, t2 where t1.a = t2.a union all select a, b from t1) u"
+	const whereMember = "(select a x, b y from t1 where a > 1 union all select a, b from t1) u"
+	for _, tc := range []struct {
+		sql  string
+		keep bool
+	}{
+		{"select x, y from " + joinMember, false},
+		{"select y, x from " + joinMember, true},
+		{"select count(*) from " + joinMember + ", t2 where t2.a = u.x", true},
+		// A non-first FROM item plans through planSubqueryRangeVar's
+		// lateral-context arm (TPC-DS Q71's tmp).
+		{"select count(*) from t2, " + joinMember + " where t2.a = u.x", true},
+		{"select x from " + whereMember, true},
+		{"select x, y from " + whereMember, false},
+		{"select x from (select a x, b y from t1 union all select a, b from t1) u", false},
+	} {
+		plan := planSQL(t, cat, tc.sql)
+		if got := findSubqueryScanAlias(plan, "*SELECT* 1") != nil; got != tc.keep {
+			t.Errorf("%s: Subquery Scan on \"*SELECT* 1\" kept=%v, PG keeps=%v", tc.sql, got, tc.keep)
+		}
+		if findSubqueryScanAlias(plan, "*SELECT* 2") != nil {
+			t.Errorf("%s: the second member is a single relation without WHERE; PG pulls it up", tc.sql)
+		}
+	}
+}

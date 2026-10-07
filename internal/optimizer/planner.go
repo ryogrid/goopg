@@ -213,6 +213,10 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// made before setrefs strips trivial SubqueryScans.
 	node = pushWindowRunConditions(node)
 	node, wrappedCTE := wrapInlinedCTEScans(node)
+	// M0146-0093: an appendrel's members PG keeps as subquery RTEs get
+	// their "*SELECT* n" SubqueryScan, before the renumbering that reads
+	// the levels the wrappers mark and the strip that decides them.
+	wrapAppendRelMembers(node)
 	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
 	// while the SubqueryScan wrappers still mark the levels PG keeps.
 	renumberRTIDsFlatRtableOrder(node)
@@ -1334,6 +1338,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// chain intact). Keying on cutAt rather than on "every segment but the
 		// last" is what lets a partially-parenthesised operand be cut at its
 		// paren boundary instead of at its end. M0125-0006.
+		// M0146-0093: an appendrel's members (pull_up_simple_union_all)
+		// that PG keeps as subquery RTEs get their "*SELECT* n" wrapper.
+		// Only a flat UNION ALL chain numbers its leaves as the segments do.
+		var appendRel *appendRelLabel
+		if plannerSet.appendrelLabel {
+			appendRel = &appendRelLabel{}
+			for _, seg := range segments {
+				if seg.cutAt == nil || seg.opType != parser.SetOpUnion || !seg.opAll {
+					appendRel = nil
+					break
+				}
+			}
+		}
 		savedSetOps := make([]*parser.SetOpClause, len(segments)+1)
 		savedSetOps[0] = s.SetOp
 		s.SetOp = nil
@@ -1395,6 +1412,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		s.With = savedWith
 		if err != nil {
 			return nil, err
+		}
+		leftAppendMember := 0
+		if appendRel != nil && !isSafeAppendMember(s, left) {
+			leftAppendMember = 1
 		}
 		// planSegment plans segment i's operand alone.
 		//
@@ -1458,6 +1479,18 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// they differ. Once setOpUnifyBranches has run every branch
 			// agrees by construction, so this is the only point the
 			// question can still be asked. M0145-0004.
+			// M0146-0093: the appendrel member numbers this link's sides
+			// carry, decided on the branches as planned (before any cast
+			// Project the unification below adds).
+			memberLeft, memberRight := 0, 0
+			if appendRel != nil {
+				if i == 0 {
+					memberLeft = leftAppendMember
+				}
+				if !isSafeAppendMember(seg.stmt, right) {
+					memberRight = i + 2
+				}
+			}
 			typesDiffer := setOpBranchTypesDiffer(acc, right)
 			acc, right = setOpUnifyBranches(seg.opPos, acc, right)
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
@@ -1493,7 +1526,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			leaves := append(append([]Node(nil), leavesOf(acc)...), leavesOf(right)...)
 			if seg.opAll {
 				out, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: true,
-					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+					TlistTypesDiffer: typesDiffer, appendRel: appendRel,
+					appendMemberLeft: memberLeft, appendMemberRight: memberRight}, plannerSet, setOpTupleFraction)
 				if err == nil {
 					unionFolds[out] = unionFoldRec{leaves: leaves, all: true}
 				}
@@ -1639,6 +1673,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// flag reaches member scopes intact.
 	appendrelMember := plannerSet.appendrelMember
 	plannerSet.appendrelMember = false
+	plannerSet.appendrelLabel = false
 	// M0146-0012: same one-scope bound for the scalar-sublink-body mark.
 	scalarSublinkBody := plannerSet.scalarSublinkBody
 	plannerSet.scalarSublinkBody = false
@@ -6071,6 +6106,8 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// appendrel path.
 	appendrelSubquery := !rv.Lateral &&
 		subqueryChainIsSimpleUnionAll(rv.Subquery)
+	// M0146-0093: the member wrappers' mark, on both arms below.
+	ps.appendrelLabel = appendrelSubquery
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx
 		latCtxWithCat.cat = cat
@@ -6223,6 +6260,11 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// appendrel candidate is the one set-op shape that IS pulled up
 	// (is_simple_union_all), so it keeps its inline path; every other
 	// non-simple leaf gets the labelling wrapper.
+	if appendrelSubquery {
+		// M0146-0093: the member wrappers name their columns through the
+		// appendrel's binding.
+		recordAppendRelBinding(inner, sourceIdx, schema)
+	}
 	if !appendrelSubquery && derivedSubqueryNeedsScan(rv.Subquery, inner) {
 		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx,
 			resjunk: selectHasResjunk(rv.Subquery)}

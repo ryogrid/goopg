@@ -38,6 +38,8 @@ package optimizer
 import (
 	"reflect"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // stripTrivialSubqueryScans unwraps every trivial SubqueryScan in the
@@ -64,6 +66,9 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 		// path is the chain from the region root to parent, which
 		// windowInputOrder reads (M0146-0092).
 		path []Node
+		// appendMember marks a "*SELECT* n" wrapper directly under its
+		// UNION ALL chain, whose region is the appendrel's (M0146-0093).
+		appendMember bool
 	}
 	var leaves []leaf
 
@@ -87,14 +92,26 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 	// `u.a` from a two-column grouped leaf keeps `Subquery Scan` at top
 	// level and under Sort/Limit/Unique, but loses it under Merge Join
 	// and under a top Aggregate.)
-	var walk func(n, region, parent Node, physical bool, path []Node)
-	walk = func(n, region, parent Node, physical bool, path []Node) {
+	// outer is the region enclosing region; appendRegion, set on the arms of
+	// a UNION ALL chain, is where the appendrel's own binding is consumed
+	// (M0146-0093).
+	var walk func(n, region, outer, parent Node, physical bool, path []Node, appendRegion Node)
+	walk = func(n, region, outer, parent Node, physical bool, path []Node, appendRegion Node) {
 		if n == nil {
 			return
 		}
 		inner := region
 		innerPhysical := physical
-		if sq, ok := n.(*SubqueryScan); ok {
+		if sq, ok := n.(*SubqueryScan); ok && sq.appendRel != nil {
+			// A "*SELECT* n" member wrapper: its tlist is the appendrel's
+			// needed columns (Append children get CP_EXACT_TLIST), so its
+			// consumption is the appendrel binding's, read in the region the
+			// appendrel sits in.
+			leaves = append(leaves, leaf{region: appendRegion, parent: parent, scan: sq,
+				appendMember: appendRegion != nil})
+			inner = n
+			innerPhysical = false
+		} else if sq, ok := n.(*SubqueryScan); ok {
 			leaves = append(leaves, leaf{region: region, parent: parent, scan: sq, physical: physical,
 				path: append([]Node(nil), path...)})
 			inner = n
@@ -123,9 +140,47 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 		case subqueryStripTlistReset(n):
 			childPhysical = false
 		}
+		kidsOuter := outer
+		if inner != region {
+			kidsOuter = region
+		}
+		var armAppendRegion Node
+		switch n.(type) {
+		case *Project, *Gather, *GatherMerge:
+			// The branch's type-coercion Project (setOpUnifyBranches) — PG's
+			// appendrel member has none, its types matched — or the Gather
+			// over an inner link's partial Append: both sit between the
+			// appendrel's own links and members, so the appendrel region
+			// passes through them.
+			if _, underSetOp := parent.(*SetOp); underSetOp && appendRegion != nil {
+				armAppendRegion = appendRegion
+			}
+		}
+		if so, isSetOp := n.(*SetOp); isSetOp && so.Op == parser.SetOpUnion && so.All {
+			_, chained := parent.(*SetOp)
+			if !chained {
+				switch parent.(type) {
+				case *Gather, *GatherMerge:
+					chained = appendRegion != nil
+				}
+			}
+			if chained {
+				armAppendRegion = appendRegion
+			} else if unionAllChainTypesDiffer(so) {
+				// Differing branch types: no appendrel in PG
+				// (is_simple_union_all_recurse) — leave armAppendRegion nil.
+			} else if isDerived[inner] {
+				// The appendrel leaf's own subtree root (this SetOp or a
+				// Gather above it): its binding is referenced outside.
+				armAppendRegion = kidsOuter
+			} else {
+				armAppendRegion = inner
+			}
+		}
 		kids, _ := planChildNodes(n)
 		for _, k := range kids {
 			r := inner
+			o := kidsOuter
 			p := childPhysical
 			kpath := append(path, n)
 			if r != region {
@@ -139,13 +194,14 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 				// Each arm was planned in its own query scope; the arm
 				// subtree is the region for everything inside it.
 				r = k
+				o = inner
 				p = false
 				kpath = nil
 			}
-			walk(k, r, n, p, kpath[:len(kpath):len(kpath)])
+			walk(k, r, o, n, p, kpath[:len(kpath):len(kpath)], armAppendRegion)
 		}
 	}
-	walk(root, root, nil, false, nil)
+	walk(root, root, nil, nil, false, nil, nil)
 
 	if len(leaves) == 0 {
 		return root
@@ -157,6 +213,30 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 	// Filter.
 	trivial := make(map[*SubqueryScan]bool, len(leaves))
 	for _, l := range leaves {
+		if l.scan.appendRel != nil {
+			// M0146-0093: a member wrapper stays only where the appendrel
+			// exists in PG and its needed columns are not the member's
+			// whole output in order. Anywhere else — a cast Project over
+			// the arm, a chain whose branch types differed (no appendrel
+			// in PG), an unrecorded binding — setrefs would remove it.
+			keep := false
+			if l.appendMember {
+				used, clean := appendMemberUsedPositions(l.region, l.scan, isDerived)
+				keep = !clean || len(used) != len(l.scan.Output())
+				for i, u := range used {
+					if u != i {
+						keep = true
+					}
+				}
+				if l.scan.appendRel.src == 0 {
+					keep = false
+				}
+			}
+			if !keep {
+				trivial[l.scan] = true
+			}
+			continue
+		}
 		used, clean := leafUsedPositions(l.region, l.scan, isDerived)
 		if !l.physical {
 			// M0146-0092: below a window stack the scan's tlist is the
@@ -401,6 +481,7 @@ func stripSublinkBodies(root Node, derived []Node, force bool) {
 		if nb, ok := stripped[b]; ok {
 			return nb
 		}
+		wrapAppendRelMembers(b)
 		nb := stripTrivialSubqueryScans(b, derived, force)
 		stripped[b] = nb
 		stripped[nb] = nb

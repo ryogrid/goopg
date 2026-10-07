@@ -220,6 +220,13 @@ type PlannerSettings struct {
 	// the member's own nested subqueries plan exactly as they did.
 	// Unexported like the scope it describes: not a session boundary.
 	appendrelMember bool
+	// appendrelLabel marks the union scope of an appendrel leaf
+	// (planSubqueryRangeVar's appendrelSubquery) for the "*SELECT* n"
+	// member wrappers (M0146-0093). Unlike appendrelMember it is set on
+	// both of planSubqueryRangeVar's arms — a non-first FROM item plans
+	// through the lateral-context arm, and is the same appendrel in PG.
+	// The fold reads it; planSelectImpl clears it in every member scope.
+	appendrelLabel bool
 
 	// scalarSublinkBody marks the settings handed to a scalar sublink's
 	// body (planSubqueryExpr), M0146-0012: PG makes a correlated outer

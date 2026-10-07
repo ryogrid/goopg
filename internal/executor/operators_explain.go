@@ -6301,7 +6301,7 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			if dname := nm.disambiguatedName(n); dname != "" {
 				alias = dname
 			}
-			return "Subquery Scan on " + alias
+			return "Subquery Scan on " + pgQuoteIdent(alias)
 		}
 		// M0146-0005cp: a CTE referenced twice without aliases is two
 		// range-table entries named after the CTE, so set_rtable_names
@@ -6319,8 +6319,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		}
 		return fmt.Sprintf("CTE Scan on %s", p.Name)
 	case *optimizer.SubqueryScan:
-		// M0146-0005w: PG's "Subquery Scan on <alias>" (explain.c).
-		return "Subquery Scan on " + p.Alias
+		// M0146-0005w: PG's "Subquery Scan on <alias>" (explain.c), the
+		// alias through quote_identifier — `"*SELECT* 1"` (M0146-0093).
+		return "Subquery Scan on " + pgQuoteIdent(p.Alias)
 	case *optimizer.LockRows:
 		// Mirrors upstream's "LockRows" label; per-relation
 		// detail is too verbose for the single-line label and

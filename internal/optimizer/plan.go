@@ -2073,6 +2073,10 @@ type SubqueryScan struct {
 	// pathtarget-regime scan tlist, so setrefs keeps the node there.
 	// M0146-0092.
 	resjunk bool
+	// appendRel marks a "*SELECT* n" wrapper over a UNION ALL member PG
+	// keeps as a subquery RTE under the appendrel; the label names the
+	// appendrel binding the parent references it by. M0146-0093.
+	appendRel *appendRelLabel
 }
 
 func (n *SubqueryScan) Pos() int       { return n.pos }
@@ -3216,6 +3220,15 @@ type SetOp struct {
 	// Only the genuine set-operation site sets it, and only when the types
 	// really differ. M0145-0004.
 	TlistTypesDiffer bool
+	// appendRel / appendMemberLeft / appendMemberRight stamp a link of an
+	// appendrel's UNION ALL chain (M0146-0093): the shared label, and the
+	// 1-based member number of a side that is a member PG keeps as a
+	// subquery RTE (0 otherwise). The stamps ride every copy of the link
+	// (createSetOpPlan copies the spec) so wrapAppendRelMembers can give
+	// those members their "*SELECT* n" SubqueryScan on the finished plan.
+	appendRel         *appendRelLabel
+	appendMemberLeft  int
+	appendMemberRight int
 	// UnionDistinctInput marks a UNION ALL link of the chain a UNION
 	// (distinct) folds its branches into (M0141-S2b-4a/4b). PG plans that
 	// input inside generate_union_paths, never as an appendrel, so only the
