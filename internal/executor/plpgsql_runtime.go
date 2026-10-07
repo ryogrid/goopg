@@ -1053,7 +1053,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 				return nil, err
 			}
 		}
-		value, err = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		value, err = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1312,7 +1312,7 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 				return Datum{}, err
 			}
 		}
-		value, err = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		value, err = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -1425,7 +1425,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
-		v, err = coerceDatumToType(v, frame.types[idx], s.Pos(), fmt.Sprintf("variable %q", s.Target))
+		v, err = plpgsqlAssignCoerce(v, frame.types[idx], s.Pos(), fmt.Sprintf("variable %q", s.Target), ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -1479,6 +1479,16 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		var elems []string
 		if !arrD.IsNull() {
 			elems = parseTextArray(arrD.StringValue())
+		}
+		// PG caps an array at MaxArraySize elements (array.h:
+		// MaxAllocSize / sizeof(Datum)) and raises 54000 when an
+		// assignment would grow one past it. The padding loop below used to
+		// try to build the array, which hung the backend on regress arrays'
+		// `a[2147483647] := 42` (M0146-0080).
+		const maxArraySize = 134217727
+		if sub > maxArraySize {
+			return Datum{}, flowNone, &ExecError{Code: "54000", Pos: s.Pos(),
+				Message: fmt.Sprintf("array size exceeds the maximum allowed (%d)", maxArraySize)}
 		}
 		// Extend array if necessary.
 		for len(elems) < sub {
@@ -1753,7 +1763,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if frame.trig != nil {
 			return v, flowReturn, nil
 		}
-		v, err = coerceDatumToType(v, r.ReturnType, s.Pos(), "RETURN")
+		v, err = plpgsqlAssignCoerce(v, r.ReturnType, s.Pos(), "RETURN", ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -1871,14 +1881,17 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// RAISE EXCEPTION/ERROR: surface as an executor error.
 		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
 		// emits a NoticeResponse before the next CommandComplete. M0096-0012.
-		raiseMsgEval := func() string {
+		raiseMsgEval := func() (string, error) {
 			return evalRaiseMsg(s.Msg, frame, ctx)
 		}
 		if s.ConditionName != "" {
 			// RAISE condition_name [USING MESSAGE = 'text'] — raise named condition.
 			// Use condition name as error code for exception handler matching. M0097-0003.
 			code := conditionNameToSQLState(s.ConditionName)
-			msg := raiseMsgEval()
+			msg, err := raiseMsgEval()
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
 			if msg == "" {
 				msg = s.ConditionName
 			}
@@ -1886,10 +1899,17 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		switch strings.ToLower(s.Level) {
 		case "error", "exception":
-			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: raiseMsgEval()}
+			msg, err := raiseMsgEval()
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: msg}
 		}
 		if ctx != nil {
-			msg := raiseMsgEval()
+			msg, err := raiseMsgEval()
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
 			// RAISE WARNING surfaces at WARNING severity (vs NOTICE/INFO/LOG/DEBUG).
 			// The isolation runner echoes each message with its real protocol
 			// severity, so the level must be preserved. M0118-0009 (perm 10).
@@ -1950,9 +1970,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// Copy the INTO result datum before the next Next()/Close() so the
 		// pooled slot row is not zeroed underneath us. M0100-0005 fix.
 		var intoVal Datum
+		var intoRow Row
+		intoSchema := op.Schema()
 		rowCount := 0
 		if slot != nil && perr == nil {
 			row := slot.Row()
+			intoRow = append(Row(nil), row...)
+			if sc := slot.Schema(); len(sc) > 0 {
+				intoSchema = sc
+			}
 			if len(row) > 0 {
 				intoVal = row[0]
 			}
@@ -1980,7 +2006,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 		}
 		if s.IntoVar != "" {
-			if idx, ok := frame.lookup(s.IntoVar); ok {
+			// A record target takes the whole row with its fields
+			// (`EXECUTE '… returning *' INTO x` then `x.f1`), as SELECT …
+			// INTO does; it used to receive only the first column
+			// (M0146-0080).
+			if frame.isRecordVar(s.IntoVar) {
+				bindRecordRowComposite(s.IntoVar, intoRow, intoSchema, frame, ctx)
+			} else if idx, ok := frame.lookup(s.IntoVar); ok {
 				frame.values[idx] = intoVal
 			}
 		}
@@ -2044,8 +2076,9 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 					schema = s
 				}
 				rowCount = 1
-				// STRICT needs to know if a second row exists.
-				if s.Strict {
+				// STRICT, and DML RETURNING INTO (implicitly strict about
+				// extra rows), need to know if a second row exists.
+				if s.Strict || s.DML {
 					if s2, e2 := op.Next(); e2 == nil && s2 != nil {
 						rowCount = 2
 					} else if e2 != nil && e2 != EOF {
@@ -2058,13 +2091,12 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if nerr != nil && nerr != EOF {
 			return Datum{}, flowNone, nerr
 		}
-		if s.Strict {
-			if rowCount == 0 {
-				return Datum{}, flowNone, &ExecError{Code: "P0002", Message: "query returned no rows"}
-			}
-			if rowCount > 1 {
-				return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row"}
-			}
+		if s.Strict && rowCount == 0 {
+			return Datum{}, flowNone, &ExecError{Code: "P0002", Message: "query returned no rows"}
+		}
+		if (s.Strict || s.DML) && rowCount > 1 {
+			return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row",
+				Hint: "Make sure the query returns a single row, or use LIMIT 1."}
 		}
 		bindSelectIntoRow(s.Targets, firstRow, schema, frame, ctx)
 		return Datum{}, flowNone, nil
@@ -2233,14 +2265,23 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// Nested BEGIN...END sub-block. Execute declarations + statements.
 		// Declarations introduce new variables into the frame. M0097-0003.
 		for _, d := range s.Declarations {
-			var val Datum
+			typ := normalizeCatalogType(catalogTypeFromColumnType(d.Type))
+			val := NullDatum
 			if d.Default != nil {
-				lowered, err := lowerPLpgSQLExpr(d.Default, frame)
-				if err == nil {
-					val, _ = evalExpr(lowered, frame.values, ctx)
+				// The same evaluation and assignment coercion as an
+				// outer DECLARE (M0146-0080). The lowered-only path
+				// ignored sublink defaults and every evaluation error.
+				v, err := evalPLpgSQLExpr(d.Default, frame, ctx)
+				if err != nil {
+					return Datum{}, flowNone, err
 				}
+				val = v
 			}
-			_ = frame.add(strings.ToLower(d.Name), normalizeCatalogType(catalogTypeFromColumnType(d.Type)), val)
+			val, err := plpgsqlAssignCoerce(val, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			_ = frame.add(strings.ToLower(d.Name), typ, val)
 		}
 		_, flow, err := executePLpgSQLStmtList(s.Statements, r, frame, ctx)
 		if err != nil {
@@ -2551,6 +2592,47 @@ func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
 	return result, nil
 }
 
+// expandRecordStar expands `rec.*` inside a ROW constructor into the
+// record's fields, as PG's transformRowExpr does with a star element:
+// `row(old.*)` is ROW(old.f1, old.f2, …). It is not the composite as a
+// single value, so `row(old.*) = row(new.*)` compares field by field, and a
+// NULL field makes the comparison NULL (M0146-0080). ok is false when e is
+// not such a star or the record's fields are unknown.
+func expandRecordStar(e parser.Expr, frame *plpgsqlFrame) ([]optimizer.Expr, bool) {
+	st, ok := e.(*parser.StarExpr)
+	if !ok || st.Schema != "" || st.Table == "" {
+		return nil, false
+	}
+	rec := strings.ToLower(st.Table)
+	var names []string
+	if fields := frame.compositeVarFields[rec]; len(fields) > 0 {
+		for _, f := range fields {
+			names = append(names, f.Name)
+		}
+	} else if frame.trig != nil && (rec == "old" || rec == "new") {
+		for _, c := range frame.trig.Cols {
+			if !c.Dropped {
+				names = append(names, c.Name)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, false
+	}
+	out := make([]optimizer.Expr, 0, len(names))
+	for _, n := range names {
+		key := "_" + rec + "_" + strings.ToLower(n)
+		idx, ok := frame.lookup(key)
+		if !ok {
+			// A row the event lacks (OLD in an INSERT): its fields are NULL.
+			out = append(out, &optimizer.NullConst{})
+			continue
+		}
+		out = append(out, &optimizer.ColumnRef{Index: idx, Name: n, Type: frame.types[idx]})
+	}
+	return out, true
+}
+
 func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
@@ -2669,6 +2751,16 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 					}
 				}
 			}
+			// A record variable's field (`x.f1` after `SELECT … INTO x`),
+			// held in the frame as _x_f1, the same binding the AST
+			// binder's frameVarLiteral uses (M0146-0080: RAISE arguments
+			// now reach this path instead of printing empty).
+			if x.Schema == "" && frame.isRecordVar(x.Table) {
+				key := "_" + strings.ToLower(x.Table) + "_" + strings.ToLower(x.Column)
+				if idx, ok := frame.lookup(key); ok {
+					return &optimizer.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
+				}
+			}
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "qualified names are not supported in PL/pgSQL expressions in v0"}
 		}
 		idx, ok := frame.lookup(x.Column)
@@ -2678,10 +2770,19 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 			if strings.EqualFold(x.Column, "found") {
 				return &optimizer.BooleanConst{Value: frame.found}, nil
 			}
-			return nil, &ExecError{Code: "42703", Pos: x.Pos(), Message: fmt.Sprintf("variable %q does not exist", x.Column)}
+			// PG hands the unknown name to the SQL parser, which reports it
+			// as a column (excpt_test1: `column "sqlstate" does not exist`).
+			return nil, &ExecError{Code: "42703", Pos: x.Pos(), Message: fmt.Sprintf("column %q does not exist", x.Column)}
 		}
 		return &optimizer.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
 	case *parser.StarExpr:
+		// `rec.*` of a record variable (`NEW.*::text` in a trigger) is the
+		// record itself, as PG expands it to the whole row (M0146-0080).
+		if x.Schema == "" && x.Table != "" {
+			if idx, ok := frame.lookup(x.Table); ok {
+				return &optimizer.ColumnRef{Index: idx, Name: x.Table, Type: frame.types[idx]}, nil
+			}
+		}
 		return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: "'*' is not allowed in PL/pgSQL expression context"}
 	case *parser.UnaryOp:
 		op, err := lowerPLpgSQLExpr(x.Operand, frame)
@@ -2713,8 +2814,15 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		if x.Over != nil {
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "window function calls are not supported in PL/pgSQL expressions in v0"}
 		}
+		isRow := strings.EqualFold(x.Name.String(), "row")
 		args := make([]optimizer.Expr, 0, len(x.Args))
 		for _, a := range x.Args {
+			if isRow {
+				if fields, ok := expandRecordStar(a, frame); ok {
+					args = append(args, fields...)
+					continue
+				}
+			}
 			pa, err := lowerPLpgSQLExpr(a, frame)
 			if err != nil {
 				return nil, err
@@ -2794,13 +2902,17 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		// resolveExpr case *parser.RowExpr) — so evaluation goes through the
 		// existing evalRowExpr composite-text builder (expr.go) shared by
 		// both callers. M0134-0055 bucket B.
-		elems := make([]optimizer.Expr, len(x.Elems))
-		for i, el := range x.Elems {
+		elems := make([]optimizer.Expr, 0, len(x.Elems))
+		for _, el := range x.Elems {
+			if fields, ok := expandRecordStar(el, frame); ok {
+				elems = append(elems, fields...)
+				continue
+			}
 			le, err := lowerPLpgSQLExpr(el, frame)
 			if err != nil {
 				return nil, err
 			}
-			elems[i] = le
+			elems = append(elems, le)
 		}
 		return &optimizer.RowExpr{Elems: elems}, nil
 	default:
@@ -2809,16 +2921,86 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 }
 
 func catalogTypeFromColumnType(t parser.ColumnType) catalog.Type {
-	return catalog.Type{Name: strings.ToLower(t.Name), Args: append([]int64(nil), t.Args...)}
+	// IsArray carries `int[]`: without it an array variable was typed as its
+	// element type, so `a || 3` resolved to text concatenation ({1,2}3)
+	// and assignment coerced it as a scalar (M0146-0080).
+	return catalog.Type{Name: strings.ToLower(t.Name), Args: append([]int64(nil), t.Args...), IsArray: t.IsArray}
 }
 
 func normalizeCatalogType(t catalog.Type) catalog.Type {
-	return catalog.Type{Name: strings.ToLower(t.Name), Args: append([]int64(nil), t.Args...)}
+	// IsArray survives (M0146-0080): dropping it typed every array variable
+	// as its element type.
+	return catalog.Type{Name: strings.ToLower(t.Name), Args: append([]int64(nil), t.Args...), IsArray: t.IsArray}
+}
+
+// plpgsqlAssignCoerce is a PL/pgSQL assignment's coercion: a variable's
+// DECLARE default, `:=`, and RETURN. PG's exec_cast_value (pl_exec.c) first
+// tries the assignment cast. When the types have no cast pathway it converts
+// through text, with the source type's output function and then the target
+// type's input function (CoerceViaIO). `v text := (SELECT count(*) …)`
+// therefore stores '2' and `n int := '42'` stores 42. coerceDatumToType
+// models only the direct coercions, so its type-mismatch error falls back
+// to that text round trip here (M0146-0080). Function arguments and return
+// values still use coerceDatumToType, whose mismatch error decides overload
+// resolution.
+func plpgsqlAssignCoerce(v Datum, typ catalog.Type, pos int, subject string, ctx *Context) (Datum, error) {
+	// A string assigned to a modelled scalar type goes through that type's
+	// input function, as PG's unknown-literal and CoerceViaIO paths do.
+	// coerceDatumToType instead passes the string through for bool and
+	// interval, for overload resolution's sake, and parses date/time
+	// strings generically into a timestamp-shaped value. That made
+	// `b bool := 'true'` print true and `d date := '2020-01-02'` print a
+	// time of day.
+	//
+	// The input function's error carries no position: PG reports it against
+	// the PL/pgSQL statement's own query text, never the calling statement
+	// (cast_invoker in regress plpgsql), so pos would point into the wrong
+	// text.
+	if v.Kind == KindString && !typ.IsArray {
+		tn := strings.ToLower(typ.Name)
+		// time / timetz keep the string: their cast (and coerceDatumToType's
+		// time arm) yields a timestamp-shaped Datum that prints with a
+		// 1970-01-01 date wherever the type is not carried, as in RAISE
+		// (deferral ledger 2026-10-07).
+		timeOfDay := strings.HasPrefix(tn, "time") && !strings.HasPrefix(tn, "timestamp")
+		if timeOfDay {
+			return v, nil
+		}
+		if isIntegerTypeName(tn) || isNumericType(tn) || isBoolTypeName(tn) ||
+			(isTimeTypeName(tn) && !timeOfDay) || isIntervalTypeName(tn) {
+			return evalCast(v, typ.Name, 0, ctx)
+		}
+	}
+	out, err := coerceDatumToType(v, typ, pos, subject)
+	if err == nil {
+		return out, nil
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42804" {
+		return out, err
+	}
+	asText, terr := evalCast(v, "text", 0, ctx)
+	if terr != nil {
+		return Datum{}, err
+	}
+	if isTextTypeName(strings.ToLower(typ.Name)) && !typ.IsArray {
+		return asText, nil
+	}
+	target := typ.Name
+	if typ.IsArray {
+		target += "[]"
+	}
+	return evalCast(asText, target, 0, ctx)
 }
 
 func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datum, error) {
 	if v.IsNull() {
 		return NullDatum, nil
+	}
+	// Array types are not modelled here; the element type's arm must not
+	// judge an array value (normalizeCatalogType keeps IsArray since
+	// M0146-0080).
+	if typ.IsArray {
+		return v, nil
 	}
 	tn := strings.ToLower(typ.Name)
 	switch {
@@ -2829,13 +3011,22 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		case KindInt:
 			return v, nil
 		case KindNumeric:
-			// Truncate numeric to integer (matches PG behavior for RETURNS int functions).
+			// numeric -> integer rounds half away from zero (numeric_int4 /
+			// numeric_int8, numeric.c): `n int := 2.5` stores 3, and a
+			// RETURNS int function returning 2.5 returns 3. This used to
+			// truncate (M0146-0080).
 			mantissa := v.NumericMantissaValue()
-			// Scale away the fractional part if any.
 			scale := v.Scale
+			lastDropped := int64(0)
 			for scale > 0 {
+				lastDropped = mantissa % 10
 				mantissa /= 10
 				scale--
+			}
+			if lastDropped >= 5 {
+				mantissa++
+			} else if lastDropped <= -5 {
+				mantissa--
 			}
 			return Datum{Kind: KindInt, Int: mantissa}, nil
 		}
@@ -3116,6 +3307,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	if ctx != nil {
 		*child = *ctx
 		routineCommandCounterIncrement(child, r)
+		child.TriggerDepth = ctx.TriggerDepth + 1
 		// Clear inherited notices so the child accumulates only its own;
 		// existing ctx.Notices are propagated by the parent, not re-propagated
 		// by the child's TakeNotices loop below. M0097-0140.
@@ -3134,7 +3326,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 				return nil, false, err
 			}
 		}
-		value, _ = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		value, _ = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), child)
 		_ = frame.add(d.Name, typ, value)
 	}
 	_, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
@@ -3369,13 +3561,45 @@ func isRegtypeExpr(e optimizer.Expr) bool {
 // evalRaiseMsg evaluates a RAISE statement's message field in the plpgsql context.
 // Handles format args: `'fmt %', arg1, arg2` → evaluates each arg, substitutes
 // left-to-right into format (one % per arg; %% → literal %). M0097-0003.
-func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
+// cutRaiseUsing returns s up to its first top-level USING keyword, outside
+// quotes and parentheses and on word boundaries.
+func cutRaiseUsing(s string) string {
+	depth, inQuote := 0, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inQuote:
+			if c == '\'' {
+				inQuote = false
+			}
+		case c == '\'':
+			inQuote = true
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case depth == 0 && (c == 'u' || c == 'U') && i+5 <= len(s) && strings.EqualFold(s[i:i+5], "using"):
+			before := i == 0 || !isIdentByte(s[i-1])
+			after := i+5 == len(s) || !isIdentByte(s[i+5])
+			if before && after {
+				return strings.TrimSpace(s[:i])
+			}
+		}
+	}
+	return s
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) (string, error) {
 	rawMsg = strings.TrimSpace(rawMsg)
 	if len(rawMsg) == 0 {
-		return rawMsg
+		return rawMsg, nil
 	}
 	if rawMsg[0] != '\'' {
-		return rawMsg // no format template
+		return rawMsg, nil // no format template
 	}
 	// Find closing quote of format template.
 	end := 1
@@ -3392,9 +3616,15 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 	fmtTemplate := strings.ReplaceAll(rawMsg[1:end], "''", "'")
 	argsText := strings.TrimSpace(rawMsg[end+1:])
 	if argsText == "" || !strings.HasPrefix(argsText, ",") {
-		return fmtTemplate // no args
+		return fmtTemplate, nil // no args
 	}
 	argsText = strings.TrimSpace(argsText[1:]) // skip leading comma
+	// The argument list ends at a top-level USING (`RAISE '…', a, b USING
+	// detail = '…'`). Its options were split into the arguments and, once
+	// argument errors stopped being swallowed (M0146-0080), evaluated as
+	// expressions. The USING options are not applied (deferral ledger
+	// 2026-10-07).
+	argsText = cutRaiseUsing(argsText)
 
 	// Split into individual arg expressions on top-level commas.
 	argExprs := splitTopLevelCommas(argsText)
@@ -3409,16 +3639,17 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			argVals = append(argVals, "")
 			continue
 		}
-		lowered, err := lowerPLpgSQLExpr(parsed, frame)
+		// evalPLpgSQLExpr, not lowerPLpgSQLExpr + evalExpr: an argument
+		// holding a sublink (`(SELECT count(*) FROM r)`) cannot be lowered
+		// and runs as SQL with the frame's variables bound, like any other
+		// PL/pgSQL expression. That lowering failure, and every evaluation
+		// error, used to print as an empty string (M0146-0080). An
+		// evaluation error now aborts the RAISE, as in PG.
+		val, err := evalPLpgSQLExpr(parsed, frame, ctx)
 		if err != nil {
-			argVals = append(argVals, "")
-			continue
+			return "", err
 		}
-		val, err := evalExpr(lowered, frame.values, ctx)
-		if err != nil {
-			argVals = append(argVals, "")
-			continue
-		}
+		lowered, _ := lowerPLpgSQLExpr(parsed, frame)
 		if val.IsNull() {
 			argVals = append(argVals, "<NULL>")
 		} else if val.Kind == KindInt && isRegtypeExpr(lowered) {
@@ -3463,7 +3694,7 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			result.WriteByte('%') // no more args
 		}
 	}
-	return result.String()
+	return result.String(), nil
 }
 
 // splitTopLevelCommas splits s on commas not inside parentheses, brackets, or quotes.

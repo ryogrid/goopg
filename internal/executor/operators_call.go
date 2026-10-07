@@ -525,7 +525,7 @@ func (o *callOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 		}
-		value, err = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		value, err = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), child)
 		if err != nil {
 			return nil, err
 		}

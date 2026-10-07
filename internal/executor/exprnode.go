@@ -191,8 +191,9 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		// each RowExpr as a composite text string via evalRowExpr, then compare
 		// the strings — producing "(abs,20)" >= "(abs,)" = TRUE instead of NULL.
 		// M0097-0128.
-		if _, okL := t.Left.(*optimizer.RowExpr); okL {
-			if _, okR := t.Right.(*optimizer.RowExpr); okR {
+		// ROW(...) calls take the same path (M0146-0080).
+		if _, okL := rowCtorElems(t.Left); okL {
+			if _, okR := rowCtorElems(t.Right); okR && isRowCompareOp(t.Op) {
 				idx := int32(len(*s))
 				*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 				return idx

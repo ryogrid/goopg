@@ -16071,6 +16071,9 @@ func exprType(e Expr) catalog.Type {
 		case "ascii":
 			// ascii(text) -> int4 (pg_proc.dat:3610, varlena.c ascii). M0134-0070.
 			return catalog.Type{Name: "int4"}
+		case "pg_trigger_depth":
+			// pg_trigger_depth() -> int4 (pg_proc.dat oid 3163). M0146-0080.
+			return catalog.Type{Name: "int4"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,

@@ -1043,6 +1043,13 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 	// variable and the statement failed `syntax error at or near "NULL"`.
 	first := p.cur()
 	isSelect := first.Kind == parser.TokenKeyword && (first.Keyword == parser.KwSelect || first.Keyword == parser.KwWith)
+	// INSERT / UPDATE / DELETE / MERGE take the INTO clause after their
+	// RETURNING list (`INSERT … RETURNING * INTO x`). The statement used to
+	// run as plain SQL with the INTO left in, so x was never bound
+	// (M0146-0080).
+	isDML := first.Kind == parser.TokenKeyword && (first.Keyword == parser.KwInsert ||
+		first.Keyword == parser.KwUpdate || first.Keyword == parser.KwDelete || first.Keyword == parser.KwMerge)
+	sawReturning := false
 	var prev parser.Token
 	depth := 0
 	intoByteStart := -1 // byte offset of the INTO token (once found)
@@ -1055,7 +1062,12 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 			depth++
 		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
 			depth--
-		} else if isSelect && depth == 0 && intoByteStart < 0 &&
+		} else if isDML && depth == 0 && t.Kind == parser.TokenKeyword && t.Keyword == parser.KwReturning {
+			sawReturning = true
+			prev = t
+			p.advance()
+			continue
+		} else if (isSelect || (isDML && sawReturning)) && depth == 0 && intoByteStart < 0 &&
 			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto &&
 			// `INSERT INTO` / `MERGE INTO` inside a WITH-led command are the
 			// main grammar's INTO, not a variables clause (make_execsql_stmt
@@ -1104,7 +1116,7 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 					targetsEndByte = endPos
 				}
 				query := strings.TrimSpace(p.src[startPos:intoByteStart] + " " + p.src[targetsEndByte:endPos])
-				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict}, nil
+				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict, DML: isDML}, nil
 			}
 			sql := strings.TrimSpace(p.src[startPos:endPos])
 			return &SQLStmt{pos: startPos, SQL: sql}, nil
@@ -1308,7 +1320,9 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 	baseEndPos := endPos
 	// Array suffix: text[] — consume '[]' pairs from token stream but exclude
 	// from the source fed to the SQL type parser.
+	isArray := false
 	for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
+		isArray = true
 		p.advance() // '['
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "]" {
 			p.advance() // ']'
@@ -1326,7 +1340,13 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 	if !ok || len(ct.Columns) != 1 {
 		return parser.ColumnType{}, p.errAt(startPos, "type %q: parser produced unexpected shape", src)
 	}
-	return ct.Columns[0].Type, nil
+	typ := ct.Columns[0].Type
+	// The suffix is excluded from the parsed source, so the array-ness is
+	// recorded here. It was dropped, typing `a int[]` as int (M0146-0080).
+	if isArray {
+		typ.IsArray = true
+	}
+	return typ, nil
 }
 
 // scanExprToSemicolon scans tokens up to (but not including) the

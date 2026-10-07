@@ -1769,6 +1769,13 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 				return err
 			}
 		}
+		// The DECLARE default's assignment coercion, as in routine bodies
+		// (plpgsqlAssignCoerce, M0146-0080): `b bool := 'true'` stores a
+		// bool, `v text := 7` stores '7'.
+		value, err = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), o.ctx)
+		if err != nil {
+			return err
+		}
 		if addErr := frame.add(d.Name, typ, value); addErr != nil {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: addErr.Error()}
 		}

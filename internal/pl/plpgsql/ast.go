@@ -272,6 +272,11 @@ type SelectIntoStmt struct {
 	SQL     string   // the SELECT query with the INTO clause stripped
 	Targets []string // target variable name(s), lower-cased preserved as written
 	Strict  bool     // STRICT modifier (exactly one row required)
+	// DML marks INSERT/UPDATE/DELETE/MERGE … RETURNING … INTO. PG treats
+	// it as implicitly strict about extra rows: more than one row is an
+	// error even without STRICT, while zero rows still bind NULL
+	// (pl_exec.c exec_stmt_execsql, mod_stmt). M0146-0080.
+	DML bool
 }
 
 func (s *SelectIntoStmt) Pos() int          { return s.pos }

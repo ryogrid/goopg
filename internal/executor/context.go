@@ -143,6 +143,11 @@ type Context struct {
 	subqCacheScoped *kvcache.Cache
 	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
 
+	// TriggerDepth is pg_trigger_depth(): the number of trigger invocations
+	// on the stack. executePLpgSQLTriggerBody gives its child context one
+	// more than its caller's (M0146-0080).
+	TriggerDepth int
+
 	// ParamExec is the PARAM_EXEC analog (D4.1): one slot per
 	// plan-assigned ExecParamRef ID, filled by a lowered sublink's eval
 	// site just before its inner plan runs, and read by the inner plan

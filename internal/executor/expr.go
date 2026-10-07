@@ -1205,9 +1205,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// Row-to-row comparisons: element-wise with proper NULL propagation.
 		// (a,b) OP (c,d): compare element by element; NULL in any element → NULL.
 		// This implements SQL row-comparison semantics (ISO SQL §8.7). M0097-0023.
-		if lRow, ok := x.Left.(*optimizer.RowExpr); ok {
-			if rRow, ok := x.Right.(*optimizer.RowExpr); ok {
-				return evalRowToRowComparison(x.Op, lRow, rRow, slot, ctx)
+		// ROW(a,b) spellings are FuncCall{Name:"row"} and compare the same
+		// way. Before M0146-0080 they were compared as composite text, so
+		// ROW(1,NULL) = ROW(1,NULL) was TRUE.
+		if lElems, ok := rowCtorElems(x.Left); ok {
+			if rElems, ok := rowCtorElems(x.Right); ok && isRowCompareOp(x.Op) {
+				return evalRowToRowComparison(x.Op, lElems, rElems, slot, ctx)
 			}
 		}
 		// Special case: row-constructor comparison with multi-column scalar subquery.
@@ -12245,6 +12248,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return newVal, nil
 		}
 		return NullDatum, nil
+	case "pg_trigger_depth":
+		// pg_trigger_depth() → int4: how many trigger invocations are on the
+		// stack (trigger.c MyTriggerDepth). 0 outside any trigger; a trigger
+		// whose body fires another trigger sees 2 there. It was
+		// unimplemented; RAISE swallowed the error and printed an empty
+		// depth until M0146-0080 made RAISE errors propagate.
+		if len(x.Args) != 0 {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "function pg_trigger_depth does not exist"}
+		}
+		if ctx == nil {
+			return NewIntDatum(0), nil
+		}
+		return NewIntDatum(int64(ctx.TriggerDepth)), nil
 	case "pg_backend_pid":
 		// pg_backend_pid() → int4: the PID of the server process attached to the
 		// current session. goopg is a single OS process multiplexing connections,
@@ -21045,48 +21061,79 @@ func enumUnsafeError(label, typeName string, pos int) error {
 	}
 }
 
-// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise
-// comparison with standard SQL NULL semantics: if any compared element is NULL,
-// the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
-// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
-func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
-	n := len(left.Elems)
-	if len(right.Elems) < n {
-		n = len(right.Elems)
+// rowCtorElems returns the elements of a row constructor operand: a RowExpr
+// `(a, b)` or a ROW(a, b) call (planned as FuncCall{Name:"row"}).
+func rowCtorElems(e optimizer.Expr) ([]optimizer.Expr, bool) {
+	switch r := e.(type) {
+	case *optimizer.RowExpr:
+		return r.Elems, true
+	case *optimizer.FuncCall:
+		if !r.Star && strings.EqualFold(r.Name, "row") {
+			return r.Args, true
+		}
 	}
+	return nil, false
+}
+
+// isRowCompareOp reports whether op is one of the six comparison operators
+// that a row-to-row comparison expands element-wise.
+func isRowCompareOp(op parser.OpCode) bool {
+	switch op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return true
+	}
+	return false
+}
+
+// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) the way PG's
+// make_row_comparison_op (parse_expr.c) does. `=` is the AND of the
+// element-wise `=` results and `<>` is the OR of the element-wise `<>`
+// results, so a decided pair wins over a NULL pair: ROW(1,NULL) = ROW(2,NULL)
+// is FALSE and ROW(1,NULL) = ROW(1,NULL) is NULL. The ordering operators are a
+// RowCompareExpr: the first unequal pair decides, and a NULL pair reached
+// before that makes the result NULL. Implements ISO SQL §8.7 row comparison.
+// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
+func evalRowToRowComparison(op parser.OpCode, left, right []optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
+	n := len(left)
+	if len(right) < n {
+		n = len(right)
+	}
+	sawNull := false
 	for i := 0; i < n; i++ {
-		lDat, err := evalExprSlot(left.Elems[i], slot, ctx)
+		lDat, err := evalExprSlot(left[i], slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
-		rDat, err := evalExprSlot(right.Elems[i], slot, ctx)
+		rDat, err := evalExprSlot(right[i], slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		if lDat.IsNull() || rDat.IsNull() {
+			if op == parser.OpEq || op == parser.OpNe {
+				sawNull = true
+				continue
+			}
 			return NullDatum, nil
 		}
 		// Elementwise bpchar normalisation — ROW comparison resolves each
 		// element pair under its own type rule, exactly as scalar `=`.
 		lDat, rDat = comparisonOperandsAsBpchar(parser.OpEq, lDat, rDat,
-			declaredBpcharTypmod(left.Elems[i]), declaredBpcharTypmod(right.Elems[i]),
-			isBareStringLit(left.Elems[i]), isBareStringLit(right.Elems[i]))
+			declaredBpcharTypmod(left[i]), declaredBpcharTypmod(right[i]),
+			isBareStringLit(left[i]), isBareStringLit(right[i]))
 		cmp, err := compareDatumPlain(lDat, rDat, 0, textShapeAmbiguous(lDat, rDat) &&
-			exprIsCharacterString(left.Elems[i]) && exprIsCharacterString(right.Elems[i]))
+			exprIsCharacterString(left[i]) && exprIsCharacterString(right[i]))
 		if err != nil {
 			return Datum{}, err
 		}
-		isLast := (i == n-1)
 		if cmp < 0 {
 			return NewBoolDatum(op == parser.OpLt || op == parser.OpLe || op == parser.OpNe), nil
 		} else if cmp > 0 {
 			return NewBoolDatum(op == parser.OpGt || op == parser.OpGe || op == parser.OpNe), nil
 		}
-		// Equal — if last element, apply equality part of operator
-		if isLast {
-			return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
-		}
-		// Continue to next element
+		// Equal — continue to the next element.
+	}
+	if sawNull {
+		return NullDatum, nil
 	}
 	// All elements equal (or n=0)
 	return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
