@@ -235,6 +235,12 @@ func NodeSublinks(n Node) []SublinkRef {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		if t.LowKey != nil {
+			exprs = append(exprs, t.LowKey)
+		}
+		if t.HighKey != nil {
+			exprs = append(exprs, t.HighKey)
+		}
 		exprs = append(exprs, t.Pred...)
 	case *Aggregate:
 		exprs = append(exprs, t.GroupExprs...)

@@ -337,6 +337,14 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 	if _, isBool := val.(*BooleanConst); isBool {
 		return false
 	}
+	// M0146-0061: a numeric literal against an integer column is
+	// `(col)::numeric op const` in PG — btree integer_ops has no numeric
+	// member, so the clause is not indexable and stays a filter. Encoding
+	// the literal into the int key rounded it: `a > 198.5` probed `a > 199`
+	// and `a = 198.5` matched a = 199.
+	if _, isNum := val.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
+		return false
+	}
 	if _, isStr := val.(*StringConst); isStr {
 		if im := inMemoryCat(cat); im != nil {
 			if _, isEnum := im.LookupEnum(col.Type.Name); isEnum {

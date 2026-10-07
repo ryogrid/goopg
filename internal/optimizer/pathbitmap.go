@@ -147,6 +147,19 @@ func (s *searchCtx) buildOneBitmapPath(
 		return nil
 	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
+	// M0146-0061: with no equality on the leading column, a range bound on it
+	// is still an index clause. match_clause_to_indexcol takes any btree
+	// operator of the column's opfamily, so build_index_paths gives PG a
+	// bitmap path for `a > 97` as for `a = 97`. The bounds are priced by
+	// clauselist_selectivity over them, which pairs a lower and an upper
+	// bound into one band (rangeIndexSelectivity), as the plain index arm
+	// prices them.
+	if len(indexClauses) == 0 {
+		if rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+			indexClauses = rng
+			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
+		}
+	}
 
 	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
 	// (indxpath.c) collects into `bitindexpaths` the paths `build_index_paths`
@@ -372,6 +385,21 @@ func matchBitmapIndexQuals(
 		return nil, 1.0
 	}
 	return clauses, clampSelectivity(selectivity)
+}
+
+// bitmapLeadingRange is restrictionLeadingRange for the bitmap producer, with
+// constant bounds only. An outer-level bound would make the bitmap a
+// correlated probe, and the decorrelation clone (clonePlanReplacingOuter)
+// harvests only equality keys from a BitmapIndexScan; such a bound stays a
+// Filter, as before.
+func bitmapLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	var out []indexPathClause
+	for _, c := range restrictionLeadingRange(cat, tbl, idx, conjuncts) {
+		if isConstExpr(c.key) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // chooseBitmapAnd ports PG's choose_bitmap_and (indxpath.c:1786-1988):

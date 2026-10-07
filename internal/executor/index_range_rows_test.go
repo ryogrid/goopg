@@ -20,6 +20,13 @@ import (
 // producer overrides the search's costed choice (M0146-0060) — so only its
 // rows are pinned here.
 func TestRangeRestrictionRowsOnEveryPath(t *testing.T) {
+	// With seq scans off PG keeps the c2 Index Scan over its range bitmap.
+	// goopg's plain index probe costs indexProbeCostMultiplier (2) times
+	// PG's, so since M0146-0061 gave the search a range bitmap path the
+	// bitmap wins there at the shipped multiplier (regress aggregates shows
+	// the same hunk). Pinned under PG's costing; the multiplier is
+	// M0146-0068's owner decision.
+	defer optimizer.SetIndexProbeCostMultiplier("1")()
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
 	for _, q := range []string{

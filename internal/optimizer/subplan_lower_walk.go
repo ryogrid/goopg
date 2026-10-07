@@ -79,7 +79,7 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 		}
 		return lowerTraverseNode(x.Outer, fx)
 	case *BitmapIndexScan:
-		if !one(&x.Key) || !rewriteAll(x.Keys) {
+		if !one(&x.Key) || !rewriteAll(x.Keys) || !one(&x.LowKey) || !one(&x.HighKey) {
 			return false
 		}
 		return rewriteAll(x.Pred)

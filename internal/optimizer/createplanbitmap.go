@@ -4,7 +4,11 @@ package optimizer
 // the path kinds added in this slice back into the executor plan nodes
 // P2.3 already supports. Design: docs/design/0128-0001-bitmap-heap-scan.md §3.5.
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // createBitmapHeapScanPlan translates a PathBitmapHeapScan into a
 // *BitmapHeapScan executor plan node. It follows the same scanLeafFor
@@ -93,6 +97,42 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	var key Expr
 	var keys []Expr
 	pred := bitmapQualExprs(p)
+	// M0146-0061: a range probe's clauses are leading-column bounds (`op` set),
+	// lowered onto LowKey/HighKey with their original strictness, as
+	// createIndexScanPlan lowers them for the plain index scan.
+	var low, high Expr
+	var lowOp, highOp parser.OpCode
+	if len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown {
+		for _, c := range p.IndexClauses {
+			if c.indexCol != 0 || c.op == parser.OpUnknown || c.key == nil {
+				panic(fmt.Sprintf("createPlan: bitmap range clause of %s is not a leading-column bound", p.IndexInfo.Name))
+			}
+			switch c.op {
+			case parser.OpGt, parser.OpGe:
+				if low != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
+				}
+				low, lowOp = c.key, c.op
+			default:
+				if high != nil {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
+				}
+				high, highOp = c.key, c.op
+			}
+		}
+		return &BitmapIndexScan{
+			pos:     id.pos,
+			Table:   id.table,
+			Alias:   id.alias,
+			Index:   p.IndexInfo,
+			LowKey:  low,
+			HighKey: high,
+			LowOp:   lowOp,
+			HighOp:  highOp,
+			Pred:    pred,
+			schema:  id.schema,
+		}
+	}
 	for i, c := range p.IndexClauses {
 		if c.indexCol != i {
 			panic(fmt.Sprintf("createPlan: bitmap index clause %d of %s claims index column %d; the index-column order was lost",

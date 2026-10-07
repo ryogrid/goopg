@@ -306,7 +306,7 @@ func indexKeyEnforced(c Expr, idx *catalog.Index, key Expr, keys []Expr) bool {
 func bitmapHeapScanRows(x *BitmapHeapScan) int64 {
 	var rows int64
 	if bi, ok := x.Outer.(*BitmapIndexScan); ok && bi.Index != nil {
-		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, nil, nil, 0, 0)
+		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, bi.LowKey, bi.HighKey, bi.LowOp, bi.HighOp)
 	} else if x.Table != nil {
 		rows = seqScanRows(&SeqScan{Table: x.Table})
 	}

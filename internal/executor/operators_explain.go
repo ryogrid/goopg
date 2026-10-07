@@ -2280,10 +2280,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// carried an Index Cond. Render from keys+columns via the shared
 		// helper, the same mechanism as the NLI index probes (NOT from
 		// Pred, which is in SEARCH coordinates and risks wrong
-		// qualification). Bitmap probes are equality-only: this node has
-		// no Low/High bounds. A key-less bitmap renders nothing.
+		// qualification). A range probe (M0146-0061) renders its
+		// leading-column bounds as the index scan arm does. A key-less
+		// bitmap renders nothing.
 		if p != nil && p.Index != nil {
-			if cond := formatIndexCondParts(p.Index, p.Keys, p.Key, nil, nil, 0, 0, reg); cond != "" {
+			if cond := formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg); cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}
 		}

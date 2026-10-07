@@ -3885,6 +3885,8 @@ func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
 		for _, e := range b.Keys {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
+		rebaseExprRefsSeen(b.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(b.HighKey, outerMap, seen)
 		for _, e := range b.Pred {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
@@ -11985,6 +11987,14 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 		// numeric literal on the rhs of `=`. The executor's
 		// encodeBTreeKeyForColumn picks the right encoding from
 		// the column type.
+		//
+		// M0146-0061: not a numeric literal against an INTEGER
+		// column — PG compares `(col)::numeric = 198.5` there, which
+		// integer_ops cannot index; encoded into the int key the
+		// literal rounded and `a = 198.5` matched a = 199.
+		if _, isNum := resolvedKey.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
+			return nil, false, nil
+		}
 	case *StringConst:
 		// M0044-0005: varchar/char column indexes — probe key is
 		// a plain string literal; evaluates to KindString at
@@ -13180,6 +13190,13 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 			continue
 		}
 		if !isConstantExpr(resolvedKey) {
+			continue
+		}
+		// M0146-0061: a numeric bound on an integer column is not
+		// indexable in PG (`(col)::numeric > 198.5`); encoded into the int
+		// key it rounded, `a > 198.5` probing `a > 199`. restrictionKeyUsable
+		// is the search's twin of this rule.
+		if _, isNum := resolvedKey.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
 			continue
 		}
 		// For user-defined enum columns, wrap string literals in CastExpr

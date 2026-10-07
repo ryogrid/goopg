@@ -3,6 +3,8 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestIndexScanCarriesCtid pins M0146-0046 against PG 18.3: an Index Scan
@@ -10,6 +12,12 @@ import (
 // statement reading ctid never takes an index-only scan — no index stores a
 // system column (check_index_only's attrs_used).
 func TestIndexScanCarriesCtid(t *testing.T) {
+	// PG elects the Index Scan over its own range bitmap here. goopg prices
+	// a plain index probe at indexProbeCostMultiplier (2) times PG's, which
+	// since M0146-0061's range bitmap path hands this two-row range to the
+	// bitmap. The precondition is PG's plan under PG's costing; the shipped
+	// multiplier is M0146-0068's owner decision.
+	defer optimizer.SetIndexProbeCostMultiplier("1")()
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
 	runSQL(t, ctx, "CREATE TABLE zc (a int PRIMARY KEY, b int)")

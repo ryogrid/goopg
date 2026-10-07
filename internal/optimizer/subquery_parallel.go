@@ -553,6 +553,8 @@ func graftNodeUncached(n Node, s ParallelSettings, anc bool, st *sublinkGraftSta
 		c := *x
 		changed := gx(x.Key, func(v Expr) { c.Key = v })
 		changed = gxs(x.Keys, func(v []Expr) { c.Keys = v }) || changed
+		changed = gx(x.LowKey, func(v Expr) { c.LowKey = v }) || changed
+		changed = gx(x.HighKey, func(v Expr) { c.HighKey = v }) || changed
 		changed = gxs(x.Pred, func(v []Expr) { c.Pred = v }) || changed
 		if !changed {
 			return n

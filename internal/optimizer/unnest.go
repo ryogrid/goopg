@@ -871,7 +871,9 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 		if bhs, ok := n.(*BitmapHeapScan); ok {
 			if bis, ok := bhs.Outer.(*BitmapIndexScan); ok {
 				n = &IndexScan{pos: bis.Pos(), Table: bis.Table, Alias: bis.Alias,
-					Index: bis.Index, Key: bis.Key, Keys: bis.Keys, schema: bhs.Output()}
+					Index: bis.Index, Key: bis.Key, Keys: bis.Keys,
+					LowKey: bis.LowKey, HighKey: bis.HighKey, LowOp: bis.LowOp, HighOp: bis.HighOp,
+					schema: bhs.Output()}
 			}
 		}
 		if is, ok := n.(*IndexScan); ok {
@@ -1254,6 +1256,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		for _, k := range n.Keys {
 			walkExprTree(k, visit)
+		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
 		}
 		for _, q := range n.Pred {
 			walkExprTree(q, visit)

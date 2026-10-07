@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // addIndexOnlyPaths generates, for every base relation, the index-only paths
@@ -72,6 +73,13 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 			relTuples = 1
 		}
 		relPages := baseRelPages(tbl, relTuples)
+		// M0146-0061: the columns a useful ordering could name, for a range
+		// probe's pathkeys (the plain restriction producer's colExprs).
+		var colExprs map[string]Expr
+		if !bare && s.hasUsefulPathkeys(rel) {
+			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
+			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
 			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
@@ -91,7 +99,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 				// NULL-keyed entries would drop those rows.
 				continue
 			}
-			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
+			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -189,15 +197,26 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		return nil, false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	bound := len(clauses)
 	if !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)) {
-		return nil, false
+		// M0146-0061: with no equality on the leading column, the plain
+		// producer binds a leading range when there is no leading SAOP
+		// (addOneRestrictionIndexPath's order) — the same clauses the
+		// index-only scan carries as LowKey/HighKey.
+		rng := restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
+			return nil, false
+		}
+		clauses, bound = rng, 1
 	}
-	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
+	if !indexUnboundKeysNotNull(tbl, idx, bound) {
 		return nil, false
 	}
 	used := make(map[Expr]bool, len(clauses))
 	for _, c := range clauses {
-		used[c.local] = true
+		if c.local != nil {
+			used[c.local] = true
+		}
 	}
 	var residual []Expr
 	for _, conj := range conjuncts {
@@ -279,7 +298,7 @@ func indexOnlyResidualAdmissible(residual []Expr, leafSchema Schema, covered []c
 // `clauses` is empty for the full-index-scan shape over a bare leaf, or the
 // index quals that consume all of the leaf's local quals.
 func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
-	needed []catalog.Column, clauses []indexPathClause, relPages int64, relTuples, totalPages float64) bool {
+	needed []catalog.Column, clauses []indexPathClause, colExprs map[string]Expr, relPages int64, relTuples, totalPages float64) bool {
 	covered, ok := indexCoversColumns(idx, needed)
 	if !ok {
 		return false
@@ -288,7 +307,12 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// selectivity for an index path with no indexclauses is 1.0 ("An empty
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
-	if len(clauses) > 0 {
+	switch {
+	case len(clauses) > 0 && clauses[0].op != parser.OpUnknown:
+		// M0146-0061: leading-column bounds, priced as the plain range
+		// path prices them.
+		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
+	case len(clauses) > 0:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 	}
 	qpquals := localQualOpCount(rel.baseLeaf) - indexClausesEvalOps(clauses)
@@ -354,6 +378,13 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// list as exactly that. Non-empty: the probe, whose conjuncts
 		// createPlan drops from the leaf (they were all of them).
 		IndexClauses: clauses,
+	}
+	// M0146-0061: a range probe stands in for the plain range path, which
+	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
+	// it too — PG's build_index_paths computes one useful_pathkeys for the
+	// index whether the path is index-only or not.
+	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown && len(colExprs) > 0 && indexIsOrderable(idx) {
+		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
 	}
 	addPath(rel, serial, "indexonly")
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,

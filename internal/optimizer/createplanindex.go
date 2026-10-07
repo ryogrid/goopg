@@ -345,7 +345,37 @@ func createIndexScanPlan(p *Path) Node {
 		}
 		ioKeys := make([]Expr, 0, len(p.IndexClauses))
 		ioDrop := map[Expr]bool{}
+		// M0146-0061: a leading-column range (indexOnlyLeafClauses) lowers
+		// onto LowKey/HighKey, as the plain range scan below does; a
+		// composite index's bounds carry no `local` and stay the Filter.
+		var ioLow, ioHigh Expr
+		var ioLowOp, ioHighOp parser.OpCode
+		ioRange := len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown
 		for i, c := range p.IndexClauses {
+			if ioRange {
+				if c.indexCol != 0 || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
+						p.IndexInfo.Name, i))
+				}
+				switch c.op {
+				case parser.OpGt, parser.OpGe:
+					if ioLow != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+					}
+					ioLow, ioLowOp = c.key, c.op
+				case parser.OpLt, parser.OpLe:
+					if ioHigh != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+					}
+					ioHigh, ioHighOp = c.key, c.op
+				default:
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
+				}
+				if c.local != nil {
+					ioDrop[c.local] = true
+				}
+				continue
+			}
 			// A parameterised probe (M0146-0005bq) binds outer join clauses,
 			// which have no leaf-local conjunct; its keys are re-based onto
 			// the outer by the NLI builder. A skip probe (M0146-0005bt) binds
@@ -360,11 +390,11 @@ func createIndexScanPlan(p *Path) Node {
 			}
 		}
 		if p.IndexSkipPrefix < 0 || (p.IndexSkipPrefix > 0 && p.RequiredOuter == 0) ||
-			p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+			(!ioRange && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s skips %d columns then binds %d clauses",
 				p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses)))
 		}
-		if len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+		if !ioRange && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
 				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
@@ -402,6 +432,8 @@ func createIndexScanPlan(p *Path) Node {
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).
 		switch {
+		case ioRange:
+			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case len(ioKeys) == 0:
 		case p.IndexSkipPrefix > 0:
 			ios.SkipPrefix = p.IndexSkipPrefix

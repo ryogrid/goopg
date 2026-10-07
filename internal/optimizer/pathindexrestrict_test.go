@@ -170,6 +170,11 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 // `const op col` is flipped to canonical form) — and, on a single-column
 // index, with both bounds dropped from the reinstated Filter (PG's qpqual
 // excludes quals redundant with the index quals).
+//
+// M0146-0061: with no column statistics (default range-band selectivity, 500
+// of 100k rows on 10000 pages) PG 18.3 elects a Bitmap Heap Scan over the same
+// bounds (VACUUMed table, cost 13.42..1649.51). The default settings now give
+// that bitmap probe; the IndexScan lowering is checked with bitmap scans off.
 func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 
 	c := saopFixture(t)
@@ -189,8 +194,19 @@ func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 		{"SELECT i_item_id FROM item WHERE 5 >= i_item_sk AND 2 <= i_item_sk", parser.OpGe, parser.OpLe, 2, 5},
 		{"SELECT i_item_id FROM item WHERE i_item_sk BETWEEN 2 AND 5", parser.OpGe, parser.OpLe, 2, 5},
 	}
+	noBitmap := DefaultPlannerSettings()
+	noBitmap.EnableBitmapScan = false
 	for _, tc := range cases {
-		node, err := Plan(parseOne(t, tc.sql), c)
+		if def, err := Plan(parseOne(t, tc.sql), c); err != nil {
+			t.Fatalf("%s: Plan: %v", tc.sql, err)
+		} else if bis := findRangeBitmapIndexScan(def); bis == nil {
+			t.Fatalf("%s: want PG's range Bitmap Index Scan, got root %T", tc.sql, def)
+		} else if lo, ok := bis.LowKey.(*IntegerConst); !ok || lo.Value != tc.lowVal || bis.LowOp != tc.lowOp {
+			t.Fatalf("%s: bitmap low bound %v/%v, want %d/%v", tc.sql, bis.LowKey, bis.LowOp, tc.lowVal, tc.lowOp)
+		} else if hi, ok := bis.HighKey.(*IntegerConst); !ok || hi.Value != tc.hiVal || bis.HighOp != tc.highOp {
+			t.Fatalf("%s: bitmap high bound %v/%v, want %d/%v", tc.sql, bis.HighKey, bis.HighOp, tc.hiVal, tc.highOp)
+		}
+		node, err := PlanWithSettings(parseOne(t, tc.sql), c, noBitmap)
 		if err != nil {
 			t.Fatalf("%s: Plan: %v", tc.sql, err)
 		}
@@ -215,6 +231,31 @@ func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 			t.Fatalf("%s: a composite-index range must keep its bounds as a Filter recheck", tc.sql)
 		}
 	}
+}
+
+// findRangeBitmapIndexScan returns the range-bounded BitmapIndexScan under a
+// Bitmap Heap Scan reached through Project/Filter/Sort/Limit, or nil.
+func findRangeBitmapIndexScan(n Node) *BitmapIndexScan {
+	for n != nil {
+		switch v := n.(type) {
+		case *BitmapHeapScan:
+			if bis, ok := v.Outer.(*BitmapIndexScan); ok && (bis.LowKey != nil || bis.HighKey != nil) {
+				return bis
+			}
+			return nil
+		case *Filter:
+			n = v.Child
+		case *Project:
+			n = v.Child
+		case *Sort:
+			n = v.Child
+		case *Limit:
+			n = v.Child
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // findFilterOver returns the *Filter whose child is scan, or nil.

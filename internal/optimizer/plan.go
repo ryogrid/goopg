@@ -3482,6 +3482,14 @@ type BitmapIndexScan struct {
 	Index *catalog.Index
 	Key   Expr   // single-column equality (non-nil for equality scan)
 	Keys  []Expr // multi-column equality (Keys[i] binds Index.Columns[i])
+	// LowKey / HighKey are VALUE bounds on the LEADING index column, with
+	// the original strictness in LowOp / HighOp — IndexScan's range fields,
+	// probed through the same bound computation (M0146-0061). Never set
+	// together with Key / Keys.
+	LowKey  Expr
+	HighKey Expr
+	LowOp   parser.OpCode
+	HighOp  parser.OpCode
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr
