@@ -26747,7 +26747,7 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
     parse\-level form PG uses\), plan both bodies, and keep the cheaper
     per expected calls; then admit the correlated conjuncts as leaf
     restrictions in the EXISTS body \(`scalarSublinkBody`\'s twin\)\.
-- [ ] **M0146\-0012c — retire the one\-relation rule\'s correlated half**
+- [x] **M0146\-0012c — retire the one\-relation rule\'s correlated half**
   \(filed 2026\-10\-05 by M0146\-0012\)\. `planIndexScanFromWhere` under
   the `planIsBareSeqScanTree` arm of `planSelectWithSettings` still builds
   a correlated probe the search refuses. The outer key is an int8\-typed
@@ -26759,6 +26759,9 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
   - First step after M0146\-0062: skip the rule when the bare tree\'s
     Filters read an outer level, then A/B regress `join` and the TPC
     plans \(slice\-2 method, `impl\-slice2\.md`\)\.
+  - DISCHARGED 2026\-10\-07 by M0146\-0073 \(`5b50c57ba`\), which retired the same correlated arm
+    after M0146\-0062; this entry was its duplicate and was never worked separately\.
+Movement: none — duplicate of M0146\-0073
 - [x] **M0146\-0012a — a correlated\-sublink clause is a JOIN clause, placed
   and costed at the join** \(filed 2026\-09\-25 by M0146\-0005 slice 3\): in
   PG a SubPlan\'s `args` put the relations its correlation reads into the
@@ -29355,7 +29358,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   > Unblock when the search elects PG\'s bitmap/index path for a range
   > restriction on the `dsc` fixture\. Then re\-apply the gate and move the 10
   > fixtures to seq\-scans\-off\.
-- [ ] **M0146\-0061 — the search builds no Bitmap Heap Scan path for a range
+- [x] **M0146\-0061 — the search builds no Bitmap Heap Scan path for a range
   restriction** \(filed 2026\-10\-05 by M0146\-0060\)\. PG 18\.3 plans
   `SELECT a, c FROM dsc WHERE a > 97` \(3000 rows, 60 matching, `dsc\_a` on
   `a DESC`\) as `Bitmap Heap Scan … Recheck Cond: \(a > 97\)` over
@@ -29377,6 +29380,20 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - Expected movement: TPC\-DS scan\-type wherever PG bitmap\-scans a
     range restriction, measured by the fire set; it also unblocks
     M0146\-0060\.
+  - DONE 2026\-10\-07 \(`83d54d10b`\); design
+    `docs/design/0100\-0149/m0146\-0061\-range\-bitmap\-indexonly\.md`\.
+    - Bitmap range path: `bitmapLeadingRange` → `BitmapIndexScan\.LowKey/HighKey`, probed through
+      the shared `ctx\.indexRangeBounds` \(DESC swap, strictness, NULL stop\)\.
+    - Index\-only range path: `indexOnlyLeafClauses` admits the leading range; lowered onto
+      `IndexOnlyScan\.LowKey/HighKey` with the index ordering\.
+    - In\-slice correctness fix \(present on HEAD\): a numeric literal against an integer column
+      was encoded into the int key and rounded — `a > 198\.5` returned 0 rows \(PG 30\), `a = 198\.5`
+      the a = 199 rows \(PG 0\)\. `restrictionKeyUsable` and the rule\'s arms refuse such a key\.
+    - The dsc probe plans PG\'s five shapes; fire set flat at both scales; regress join −18,
+      create\_index −4, aggregates \+28 \(B8 hunk\)\.
+    - M0146\-0060 keeps its other blocker, M0146\-0068 \(the multiplier decision\): at the shipped
+      multiplier a tiny range elects the bitmap where PG keeps the Index Scan \(ledgered\)\.
+Movement: none — instrument artefact — no TPC\-H/TPC\-DS plan has a single\-relation range PG bitmap\-scans \(fire set flat\); regress join −18, create\_index −4, aggregates \+28
 - [x] **M0146\-0062 — WRONG RESULTS: an integer literal is typed `bigint`,
   not `integer`, so int4 overflow never errors** \(filed 2026\-10\-05 by
   M0146\-0012 slice 2\)\. PG 18\.3 types a literal that fits in 32 bits as
