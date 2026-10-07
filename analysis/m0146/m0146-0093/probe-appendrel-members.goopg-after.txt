@@ -1,0 +1,176 @@
+
+
+
+INSERT 0 30000
+INSERT 0 30000
+psql:tmp/m93-setup.sql:6: ERROR:  duplicate key value violates unique constraint "d_pkey"
+DETAIL:  Key (k)=(1) already exists.
+ANALYZE
+ANALYZE
+ANALYZE
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d.m
+               ->  Partial HashAggregate
+                     Group Key: d.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Parallel Append
+                                 ->  Subquery Scan on "*SELECT* 1"
+                                       ->  Seq Scan on s1
+                                             Filter: (k > 5)
+                                 ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d
+(17 rows)
+
+       QUERY PLAN        
+-------------------------
+ Append
+   ->  Seq Scan on s1
+         Filter: (k > 5)
+   ->  Seq Scan on s2
+(4 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Append
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Seq Scan on s1
+         ->  Hash
+               ->  Seq Scan on d
+   ->  Seq Scan on s2
+(7 rows)
+
+              QUERY PLAN               
+---------------------------------------
+ Append
+   ->  Subquery Scan on "*SELECT* 1"
+         ->  Hash Join
+               Hash Cond: (s1.k = d.k)
+               ->  Seq Scan on s1
+               ->  Hash
+                     ->  Seq Scan on d
+   ->  Seq Scan on s2
+(8 rows)
+
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (s1.k = d2.k)
+                     ->  Parallel Append
+                           ->  Subquery Scan on "*SELECT* 1"
+                                 ->  Hash Join
+                                       Hash Cond: (s1.k = d.k)
+                                       ->  Seq Scan on s1
+                                       ->  Hash
+                                             ->  Seq Scan on d
+                           ->  Seq Scan on s2
+                     ->  Hash
+                           ->  Seq Scan on d d2
+(16 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Append
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Seq Scan on s1
+         ->  Hash
+               ->  Seq Scan on d
+   ->  Seq Scan on s2
+(7 rows)
+
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d.m
+               ->  Partial HashAggregate
+                     Group Key: d.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Parallel Append
+                                 ->  Seq Scan on s1
+                                 ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d
+(15 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               Filter: (src > 0)
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(10 rows)
+
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d.m
+               ->  Partial HashAggregate
+                     Group Key: d.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Parallel Append
+                                 ->  Seq Scan on s1
+                                 ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d
+(15 rows)
+
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d2.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d2.m
+               ->  Partial HashAggregate
+                     Group Key: d2.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d2.k)
+                           ->  Parallel Append
+                                 ->  Subquery Scan on "*SELECT* 1"
+                                       ->  Hash Join
+                                             Hash Cond: (s1.k = d.k)
+                                             ->  Seq Scan on s1
+                                             ->  Hash
+                                                   ->  Seq Scan on d
+                                                         Filter: (m = 3)
+                                 ->  Subquery Scan on "*SELECT* 2"
+                                       ->  Hash Join
+                                             Hash Cond: (s2.k = d_1.k)
+                                             ->  Seq Scan on s2
+                                             ->  Hash
+                                                   ->  Seq Scan on d d_1
+                                                         Filter: (m = 3)
+                           ->  Hash
+                                 ->  Seq Scan on d d2
+(27 rows)
+

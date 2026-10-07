@@ -29731,13 +29731,20 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     Design: `docs/design/0100\-0149/m0146\-0092\-subqueryscan\-window\-resjunk\.md`\.
   - Filed M0146\-0097 \(hash join inner side is pathtarget regime in PG\)\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 scan\-type 36→34, parameterisation 32→31, parallelism 41→40; SF0\.25 join\-order 49→48, join\-method 25→24, scan\-type 28→27, parallelism 28→27\.
-- [ ] **M0146\-0093 — UNION ALL members that are joins get no `Subquery Scan on "*SELECT* n"`** \(filed 2026\-10\-07 by M0146\-0066\)\. `pull\_up\_simple\_union\_all` keeps a non\-simple member as a subquery RTE planned on its own; PG wraps it in
+- [x] **M0146\-0093 — UNION ALL members that are joins get no `Subquery Scan on "*SELECT* n"`** \(filed 2026\-10\-07 by M0146\-0066\)\. `pull\_up\_simple\_union\_all` keeps a non\-simple member as a subquery RTE planned on its own; PG wraps it in
   `Subquery Scan on "\*SELECT\* n"` and keeps it when the parent consumes a subset \(Q5, Q71; probe
   `probe\-appendrel\-window\.sql` case 1\)\. goopg hash\-joins the members bare under the Append\. Check Q78 at SF1\.
   Kind: impl
   Parent: M0146\-0066
   - First step: find where goopg plans an appendrel member that is a join and whether it records the member as a
     derived subtree; then apply the strip test to the member wrapper\.
+  - Done 2026\-10\-08 \(0fc895974\): members failing is\_safe\_append\_member \(a join or any WHERE\) are stamped on
+    their UNION ALL link and wrapped on the finished plan \(`wrapAppendRelMembers`, after path selection — pricing
+    the wrapper moved Q76\'s partial election, splicing it through the partial chain crashed Q76\)\. Subquery Scan
+    total 26→30 \(PG 32/31\); Q5 3→4, Q71 0→3 = PG\. Design:
+    `docs/design/0100\-0149/m0146\-0093\-appendrel\-member\-subqueryscan\.md`\.
+  - Filed M0146\-0098 \(goopg parameterises a member PG keeps as a subquery\)\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 48→47, scan\-type 27→26 \(Q71\); SF1 unchanged\.
 - [ ] **M0146\-0094 — a UNION ALL member\'s constant column qual stays as a Filter on the Append** \(filed 2026\-10\-07 by M0146\-0066\)\. `… \(select v, k, 1 as src from s1 union all select v, k, 2 as src from s2\) u … where src > 0`: PG pushes the
   qual into each member \(set\_append\_rel\_size substitutes the member expression; `1 > 0` folds away\) and shows
   a bare Append; goopg keeps `Filter: \(src > 0\)` on the Append \(qual\-placement\)\.
@@ -29776,3 +29783,15 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   Parent: M0146\-0092
   - First step: in the strip walk, give a hash join\'s build child the pathtarget regime \(`Join\.Algo` hash,
     build side per `probeSideIsLeft`\'s rule\), then census the fire sets for Subquery Scan count moves\.
+
+- [ ] **M0146\-0098 — a parameterised Append drives a UNION ALL member PG keeps as a subquery** \(filed 2026\-10\-08
+  by M0146\-0093\)\. A member with a WHERE clause \(or a join\) is not a safe append member in PG, so it stays a subquery
+  RTE with no parameterised path, and `SELECT li\.id, x\.amt FROM li, \(SELECT item, amt FROM cs1 WHERE amt > 5 UNION ALL
+  SELECT item, amt FROM ws1\) x WHERE x\.item = li\.id AND li\.cat = 3` hash\-joins in PG 18\.3\. goopg builds the
+  per\-member parameterised paths \(M0146\-0049b\) for it anyway and elects a Nested Loop whose inner Append probes
+  `"*SELECT* 1"` by `item = li\.id` \(TestParameterisedAppendOverUnionAll\)\.
+  Kind: impl
+  Parent: M0146\-0093
+  - Probe: `analysis/m0146/m0146\-0093/probe\-param\-append\-where\-member\.sql`\.
+  - First step: refuse the per\-member parameterised path for a member the fold stamped unsafe
+    \(`SetOp\.appendMemberLeft/Right`\), then A/B the fire sets and correct the test\'s plan expectation to PG\'s\.
