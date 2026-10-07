@@ -158,6 +158,22 @@ func (e *plannedCTE) inlinesEachReference() bool {
 	return e != nil && e.eachRef
 }
 
+// inlinesAsUnionAll is inline_cte for a single-reference CTE whose body is
+// a simple UNION ALL (M0146-0065). PG plans the reference as the subquery
+// inline_cte makes of it, which pull_up_subqueries then flattens into an
+// appendrel (pull_up_simple_union_all, prepjointree.c), so the join sees a
+// (Parallel) Append. goopg's FROM pull-up splices only a simple SELECT body,
+// so this reference is planned as the ordinary subquery instead
+// (planCTEReferenceAsSubquery), whose appendrel mark the search consumes.
+// The gates are cteAsDerivedItem's single-reference ones; a correlated body
+// stays shared for inlinesEachReference's reason.
+func (e *plannedCTE) inlinesAsUnionAll() bool {
+	return e != nil && e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
+		e.materialized != "materialized" && !e.volatile && !e.isDML &&
+		e.query != nil && len(e.aliasColumns) == 0 &&
+		subqueryChainIsSimpleUnionAll(e.query) && !planHasOuterRef(e.body)
+}
+
 // eachReferenceInlineGate computes plannedCTE.eachRef for a non-recursive
 // SELECT body as preplanWithClause registers it. owner is the SELECT that
 // owns the WITH (nil for INSERT/UPDATE/DELETE/MERGE, whose CTEs PG never
@@ -432,6 +448,16 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 			entry.declScope[k] = v
 		}
 		entry.eachRef = entry.inlineEligible && eachReferenceInlineGate(owner, cte, body, entry.volatile)
+		// M0146-0065: the single-reference gate's inputs are stamped here
+		// too, not only after the whole list is preplanned
+		// (markSelectOwnedCTEs / stampCTEReferenceCounts), so a later
+		// sibling's body already inlines its reference to this CTE — PG's
+		// inline_cte runs on the whole WITH list before any body is planned.
+		// owner is non-nil exactly when the WITH belongs to a SELECT.
+		if owner != nil {
+			entry.selectOwned = true
+			entry.astRefs = countCTEReferences(owner, cte.Name)
+		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}
 	return restore, dmlPlans, nil

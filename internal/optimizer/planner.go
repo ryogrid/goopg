@@ -4847,7 +4847,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			// inlined into each reference (inline_cte), planned here as an
 			// ordinary subquery. An alias list longer than the CTE's columns
 			// keeps the CTE arm and its error.
-			if ce.inlinesEachReference() && rv.TableSample == nil && len(rv.Columns) <= len(ce.schema) {
+			if (ce.inlinesEachReference() || ce.inlinesAsUnionAll()) &&
+				rv.TableSample == nil && len(rv.Columns) <= len(ce.schema) {
 				return planCTEReferenceAsSubquery(rv, ce, alias, cat, sourceIdx, lateralCtx, ps, scope)
 			}
 			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx, cteRef: true}

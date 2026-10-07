@@ -169,6 +169,13 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 			if _, ok := simpleDerivedPullupBody(f, cat); ok {
 				continue
 			}
+			// M0146-0065: a simple UNION ALL item is flattened into an
+			// appendrel by that same recursion (pull_up_simple_union_all),
+			// so it does not make the body unsimple. It stays a derived
+			// leaf of the parent, planned as the appendrel it is.
+			if pullupUnionAllLeaf(f.Base) {
+				continue
+			}
 		}
 		if !pullupPlainRelation(f.Base) {
 			return nil, false
@@ -261,6 +268,15 @@ const maxDerivedPullupDepth = 8
 func pullupPlainRelation(b parser.RangeVar) bool {
 	return b.Subquery == nil && b.TableFunc == nil && b.TableSample == nil && !b.Lateral &&
 		len(b.Columns) == 0 && !b.GroupedJoinUnaliased && b.Name != ""
+}
+
+// pullupUnionAllLeaf reports whether a body FROM item is a non-LATERAL
+// `(A UNION ALL B …)` subquery that is_simple_union_all admits — the item
+// the derived-FROM path plans as an appendrel (planFromSubquery's
+// appendrelSubquery mark), and so a leaf the pull-up may splice as is.
+func pullupUnionAllLeaf(b parser.RangeVar) bool {
+	return b.Subquery != nil && b.TableFunc == nil && b.TableSample == nil && !b.Lateral &&
+		len(b.Columns) == 0 && !b.GroupedJoinUnaliased && subqueryChainIsSimpleUnionAll(b.Subquery)
 }
 
 // pullupSafeTargetCall is is_simple_subquery's target-list test for one
