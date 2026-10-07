@@ -10,11 +10,13 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -431,5 +433,92 @@ func TestParallelHashProbeDetachMerges(t *testing.T) {
 	}
 	if ph.probeAttach() {
 		t.Fatal("a participant attached after the sweep was claimed")
+	}
+}
+
+// TestParallelHashMergeAcrossBucketCounts pins the M0146-0096 finding: shares
+// size their tables privately, so two can choose different bucket counts and
+// therefore read their batch bits from different hash bits. The merge
+// re-routes every row from its stored hash under one geometry: a spilled row
+// may land in the merged batch 0 (in memory), an in-memory row in a later
+// batch file. Every build row must end where the merged geometry routes it,
+// exactly once — regress join_hash's Parallel Hash, once PH4 stopped vetoing
+// it, failed with "participants chose different bucket counts".
+func TestParallelHashMergeAcrossBucketCounts(t *testing.T) {
+	ctx := NewContext()
+	defer ctx.ReleaseSpillFiles()
+	mkShare := func(nbuckets, nbatch int, keys []int64) parallelHashPart {
+		bs := newHashBatchState(ctx, nil, hashsize.Sizing{NBuckets: nbuckets, NBatch: nbatch, SpaceAllowed: 1 << 30}, false)
+		local := &sharedHashBuild{intHash: map[int64][]Row{}, hashIsInt: true}
+		for _, k := range keys {
+			h := joinBatchHashInt64(k)
+			row := Row{NewIntDatum(k)}
+			if b := bs.batchOf(h); b != 0 {
+				if err := bs.writeInner(b, h, spillIntKey(k), row); err != nil {
+					t.Fatalf("writeInner: %v", err)
+				}
+				continue
+			}
+			local.intHash[k] = append(local.intHash[k], row)
+		}
+		return parallelHashPart{local: local, bs: bs}
+	}
+	var a, b []int64
+	for k := int64(0); k < 400; k++ {
+		if k%2 == 0 {
+			a = append(a, k)
+		} else {
+			b = append(b, k)
+		}
+	}
+	ph := newParallelHashBuild(nil)
+	ph.parts = []parallelHashPart{mkShare(2048, 2, a), mkShare(4096, 4, b)}
+	if err := ph.mergeParts(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	d := ph.table.batches
+	if d == nil {
+		t.Fatal("the merged table has no batch descriptor")
+	}
+	m := &hashBatchState{nbatch: d.nbatch, bucketBits: d.bucketBits}
+	seen := map[int64]int{}
+	for k, rows := range ph.table.intHash {
+		if got := m.batchOf(joinBatchHashInt64(k)); got != 0 {
+			t.Fatalf("key %d is in memory but routes to batch %d", k, got)
+		}
+		seen[k] += len(rows)
+	}
+	for bno, f := range d.inner {
+		if f == nil {
+			continue
+		}
+		r, err := newSpillReader(f.path)
+		if err != nil {
+			t.Fatalf("open batch %d: %v", bno, err)
+		}
+		var buf Row
+		for {
+			h, k, row, err := r.ReadRowKeyedInto(buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read batch %d: %v", bno, err)
+			}
+			buf = row
+			if got := m.batchOf(h); got != bno {
+				t.Fatalf("a row of batch %d sits in file %d", got, bno)
+			}
+			seen[k.i]++
+		}
+		r.closeKeepFile()
+	}
+	if len(seen) != 400 {
+		t.Fatalf("%d distinct keys survived the merge, want 400", len(seen))
+	}
+	for k, n := range seen {
+		if n != 1 {
+			t.Fatalf("key %d appears %d times", k, n)
+		}
 	}
 }

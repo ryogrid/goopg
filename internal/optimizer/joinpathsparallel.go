@@ -78,7 +78,6 @@ package optimizer
 import "strconv"
 
 import (
-	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -561,14 +560,13 @@ func cheapestParallelSafeTotalInner(paths []*Path) *Path {
 // CPU term reads the per-participant inner rows, and only the table geometry
 // sees the total under the combined budget (hashJoinInputs.parallelHash).
 //
-// Two refusals PG does not have, both executor capacity (M0145-0010 scope (d):
-// never admit a shape the executor cannot run):
-//   - the inner must be a partial SEQ SCAN — the one build shape whose claims
-//     the executor wires (attachParallelHashBuildSides; partialPathDrivingKind
-//     refuses the rest the same way);
-//   - the build must fit ONE batch, both as a whole under the combined budget
-//     and per participant under hash_mem: parallel hash batching is not
-//     ported and the executor refuses a spilled share (ledgered).
+// One refusal PG does not have, executor capacity (M0145-0010 scope (d):
+// never admit a shape the executor cannot run): the inner must be a partial
+// SEQ SCAN — the one build shape whose claims the executor wires
+// (attachParallelHashBuildSides; partialPathDrivingKind refuses the rest the
+// same way). The former second refusal, "the build must fit one batch"
+// (PH4), is gone (M0146-0096): the executor batches a spilled share for
+// every join type (M0146-0090, M0146-0095).
 func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o, i *Path, cp costParams,
 	jt parser.JoinType, keys, residual []*restrictInfo, bucket float64, final hashJoinFinalCostInput) {
 	veto := func(code string) {
@@ -588,11 +586,11 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 	}
 	// inner_path_rows_total = inner_path_rows * get_parallel_divisor(inner_path)
 	innerTotal := i.Rows * getParallelDivisor(i.ParallelWorkers, cp.parallelLeaderParticipation)
-	if hashsize.Choose(innerTotal, pathNCols(i), pathAvgVarBytes(i), cp.workMem*int64(o.ParallelWorkers+1)).NBatch > 1 ||
-		hashsize.Choose(i.Rows, pathNCols(i), pathAvgVarBytes(i), cp.workMem).NBatch > 1 {
-		veto("PH4-batches")
-		return
-	}
+	// M0146-0096: no batch veto. PG prices a multi-batch Parallel Hash
+	// (initial_cost_hashjoin's batch I/O) and elects it like any other; the
+	// executor batches a spilled share for every join type (M0146-0090,
+	// M0146-0095), so the PH4 refusal that stood in for missing parallel
+	// batching is gone.
 
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)

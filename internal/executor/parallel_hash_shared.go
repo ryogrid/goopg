@@ -23,7 +23,6 @@ package executor
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 
@@ -215,14 +214,12 @@ func (ph *parallelHashBuild) mergeSpilledParts() error {
 		if p.bs == nil {
 			continue
 		}
+		// Shares size their tables privately and need not agree on the
+		// bucket count; every row is re-routed from its stored hash under
+		// the merged geometry (the first spilled share's), which is also
+		// the geometry every participant routes its probe rows by.
 		if ref == nil {
 			ref = p.bs
-		} else if p.bs.bucketBits != ref.bucketBits {
-			return &ExecError{
-				Code: "XX000",
-				Message: fmt.Sprintf("parallel hash join: participants chose different bucket counts (2^%d vs 2^%d)",
-					p.bs.bucketBits, ref.bucketBits),
-			}
 		}
 		if p.bs.nbatch > nbatch {
 			nbatch = p.bs.nbatch
@@ -322,7 +319,7 @@ func (m *hashBatchState) absorbParallelHashPart(p parallelHashPart) error {
 			continue
 		}
 		bs.inner[k] = nil
-		if err := m.refileParallelHashBatch(f); err != nil {
+		if err := m.refileParallelHashBatch(f, p.local); err != nil {
 			bs.dropFile(f)
 			return err
 		}
@@ -333,7 +330,11 @@ func (m *hashBatchState) absorbParallelHashPart(p parallelHashPart) error {
 }
 
 // refileParallelHashBatch copies one share batch file's rows into m's files.
-func (m *hashBatchState) refileParallelHashBatch(f *joinBatchFile) error {
+// A row the merged geometry assigns to batch 0 — possible when the share
+// chose a different bucket count, so its batch bits were taken from other
+// hash bits — goes into the share's in-memory maps instead, which merge into
+// the shared batch 0.
+func (m *hashBatchState) refileParallelHashBatch(f *joinBatchFile, local *sharedHashBuild) error {
 	if f.w != nil {
 		if err := f.w.Close(); err != nil {
 			return err
@@ -355,16 +356,57 @@ func (m *hashBatchState) refileParallelHashBatch(f *joinBatchFile) error {
 			return err
 		}
 		buf = row
-		b := m.batchOf(h)
-		if b == 0 {
-			return &ExecError{
-				Code:    "XX000",
-				Message: fmt.Sprintf("parallel hash join: a spilled build row routes to batch 0 under %d batches", m.nbatch),
+		if b := m.batchOf(h); b != 0 {
+			if err := m.writeKeyed(m.inner, b, h, k, row); err != nil {
+				return err
 			}
+			continue
 		}
-		if err := m.writeKeyed(m.inner, b, h, k, row); err != nil {
-			return err
+		if k.tag == spillKeyNone {
+			// A NULL key matches nothing; the build loop never spills one
+			// (recordBuildNullKey keeps the fill rows), so there is nothing
+			// to carry into the table.
+			continue
 		}
+		local.insertKeyed(k, cloneRow(row))
+	}
+}
+
+// insertKeyed files a reloaded row in a share's maps by its canonical key,
+// the lane rule of joinOp.lazyHashInsertKeyed: an int key in an int-lane
+// table, its canonical string otherwise; a string key demotes an int-lane
+// table first.
+func (sb *sharedHashBuild) insertKeyed(k spillRowKey, row Row) {
+	switch k.tag {
+	case spillKeyInt:
+		if sb.hashIsInt {
+			if sb.intHash == nil {
+				sb.intHash = make(map[int64][]Row)
+			}
+			sb.intHash[k.i] = append(sb.intHash[k.i], row)
+			return
+		}
+		if sb.hash == nil {
+			sb.hash = make(map[string][]Row)
+		}
+		sk := canonicalNumericKey(k.i, 0)
+		sb.hash[sk] = append(sb.hash[sk], row)
+	case spillKeyStr:
+		if sb.hashIsInt {
+			if sb.hash == nil {
+				sb.hash = make(map[string][]Row, len(sb.intHash))
+			}
+			for ik, rows := range sb.intHash {
+				sk := canonicalNumericKey(ik, 0)
+				sb.hash[sk] = append(sb.hash[sk], rows...)
+			}
+			sb.intHash = nil
+			sb.hashIsInt = false
+		}
+		if sb.hash == nil {
+			sb.hash = make(map[string][]Row)
+		}
+		sb.hash[k.s] = append(sb.hash[k.s], row)
 	}
 }
 
@@ -401,6 +443,18 @@ func (ph *parallelHashBuild) merge(local *sharedHashBuild) {
 	// and every participant's NULL keys.
 	t.antiBuildRows += local.antiBuildRows
 	t.antiBuildHasNull = t.antiBuildHasNull || local.antiBuildHasNull
+	// One lane for the whole table: a share that demoted to string keys
+	// (insertKeyed, or its own build) moves every int-lane row into the
+	// string lane, the way joinOp.demoteIntHash does, so no probe misses
+	// rows filed under the other representation.
+	if len(t.hash) > 0 && (t.hashIsInt || len(t.intHash) > 0) {
+		for ik, rows := range t.intHash {
+			sk := canonicalNumericKey(ik, 0)
+			t.hash[sk] = append(t.hash[sk], rows...)
+		}
+		t.intHash = nil
+		t.hashIsInt = false
+	}
 }
 
 // rowCount is the number of build rows a table holds, across its maps.
