@@ -703,7 +703,7 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 				return &ExecError{
 					Code:    "23502",
 					Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, c.plan.Table.Name),
-					Detail:  formatRowForDetail(c.cols, row),
+					Detail:  formatRowForDetail(c.ctx, c.cols, row),
 				}
 			}
 		}

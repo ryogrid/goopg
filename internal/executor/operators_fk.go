@@ -416,7 +416,7 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 				Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 					leafTbl.Name, cname, ref.Child.Name),
 				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-					strings.Join(refCols, ", "), fkValsForDetail(ctx, vals), ref.Child.Name),
+					strings.Join(refCols, ", "), fkValsForDetail(ctx, leafTbl, refCols, vals), ref.Child.Name),
 			}
 		}
 		child = parent
@@ -690,7 +690,7 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 			Message: fmt.Sprintf("insert or update on table %q violates foreign key constraint %q",
 				reportName, fkConstraintName(fkOwnerTbl, fk)),
 			Detail: fmt.Sprintf("Key (%s)=(%s) is not present in table %q.",
-				strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, vals), fk.RefTable),
+				strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, fkOwnerTbl, fk.Columns, vals), fk.RefTable),
 		}
 	}
 	return nil
@@ -789,9 +789,7 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 
 // fkValsForDetail renders FK column values for the PostgreSQL-style DETAIL
 // line `Key (col)=(val) is not present in table "<parent>".`
-func fkValsForDetail(ctx *Context, vals []Datum) string {
-	style, order := dateStyleFromCtx(ctx)
-	zone := timeZoneFromCtx(ctx)
+func fkValsForDetail(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) string {
 	var sb strings.Builder
 	for i, v := range vals {
 		if i > 0 {
@@ -801,8 +799,18 @@ func fkValsForDetail(ctx *Context, vals []Datum) string {
 			sb.WriteString("null")
 			continue
 		}
+		// Each key value goes through its column type's output function,
+		// as ri_ReportViolation does (M0146-0083). A column the table does
+		// not carry keeps the old DateStyle-aware time rendering.
+		if tbl != nil && i < len(colNames) {
+			if idx := fkColumnIndexes(tbl.Columns, colNames[i:i+1]); len(idx) == 1 && idx[0] >= 0 {
+				sb.WriteString(detailValueText(ctx, tbl.Columns[idx[0]].Type, v))
+				continue
+			}
+		}
 		if v.Kind == KindTime {
-			sb.WriteString(formatTimeDatumDateStyle(v, style, order, zone))
+			style, order := dateStyleFromCtx(ctx)
+			sb.WriteString(formatTimeDatumDateStyle(v, style, order, timeZoneFromCtx(ctx)))
 			continue
 		}
 		sb.WriteString(v.Format())
@@ -834,7 +842,7 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 				fk.RefTable, constraintName, childTbl.Name),
 			Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-				strings.Join(refCols, ", "), fkValsForDetail(ctx, vals), childTbl.Name),
+				strings.Join(refCols, ", "), fkValsForDetail(ctx, childTbl, fk.Columns, vals), childTbl.Name),
 		}
 	}
 	return nil
@@ -1145,7 +1153,7 @@ func detachPartitionFKRefCheck(ctx *Context, parentTbl, childTbl *catalog.Table)
 				Message: fmt.Sprintf("removing partition %q violates foreign key constraint %q",
 					childTbl.Name, cname),
 				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-					strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, violating), fkTbl.Name),
+					strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, fkTbl, fk.Columns, violating), fkTbl.Name),
 			}
 		}
 	}
@@ -2094,7 +2102,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 			return &ExecError{
 				Code:    "23514",
 				Message: msg,
-				Detail:  formatRowForDetail(tbl.Columns, row),
+				Detail:  formatRowForDetail(ctx, tbl.Columns, row),
 			}
 		}
 	}
@@ -2196,7 +2204,7 @@ func checkRowConstraintsForWrite(ctx *Context, tbl *catalog.Table, cols []catalo
 			return &ExecError{
 				Code:    "23502",
 				Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, tbl.Name),
-				Detail:  formatRowForDetail(cols, row),
+				Detail:  formatRowForDetail(ctx, cols, row),
 			}
 		}
 	}

@@ -92,7 +92,7 @@ func TestAttachPartitionFKNameCollisionRenamed(t *testing.T) {
 // same shape PG uses in `Key (col)=(val) is not present in table "X".`
 func TestFKValsForDetailFormatsInts(t *testing.T) {
 	vals := []Datum{NewIntDatum(2)}
-	got := fkValsForDetail(nil, vals)
+	got := fkValsForDetail(nil, nil, nil, vals)
 	if got != "2" {
 		t.Fatalf("fkValsForDetail([2]) = %q, want %q", got, "2")
 	}
@@ -100,7 +100,7 @@ func TestFKValsForDetailFormatsInts(t *testing.T) {
 
 func TestFKValsForDetailFormatsMixedTypes(t *testing.T) {
 	vals := []Datum{NewIntDatum(7), NewStringDatum("hello"), NullDatum}
-	got := fkValsForDetail(nil, vals)
+	got := fkValsForDetail(nil, nil, nil, vals)
 	want := "7, hello, null"
 	if got != want {
 		t.Fatalf("fkValsForDetail = %q, want %q", got, want)
@@ -122,13 +122,13 @@ func TestFKValsForDetailHonorsDateStyle(t *testing.T) {
 		}
 		return "", false
 	}}
-	got := fkValsForDetail(ctx, []Datum{NewDateDatum(when)})
+	got := fkValsForDetail(ctx, nil, nil, []Datum{NewDateDatum(when)})
 	if want := "14.07.2026"; got != want {
 		t.Fatalf("fkValsForDetail(German) = %q, want %q", got, want)
 	}
 	// A nil ctx (no session GUC reachable) falls back to ISO/MDY, matching
 	// evalCast's nil-ctx behavior.
-	got = fkValsForDetail(nil, []Datum{NewDateDatum(when)})
+	got = fkValsForDetail(nil, nil, nil, []Datum{NewDateDatum(when)})
 	if want := "2026-07-14"; got != want {
 		t.Fatalf("fkValsForDetail(nil ctx) = %q, want %q", got, want)
 	}
@@ -152,7 +152,7 @@ func TestFKViolationMessageMatchesPGShape(t *testing.T) {
 		t.Fatalf("message = %q,\nwant       %q", msg, wantMsg)
 	}
 	detail := fmt.Sprintf("Key (%s)=(%s) is not present in table %q.",
-		"a", fkValsForDetail(nil, []Datum{NewIntDatum(2)}), fk.RefTable)
+		"a", fkValsForDetail(nil, nil, nil, []Datum{NewIntDatum(2)}), fk.RefTable)
 	wantDetail := `Key (a)=(2) is not present in table "pk_noparted".`
 	if detail != wantDetail {
 		t.Fatalf("detail = %q,\nwant      %q", detail, wantDetail)

@@ -2823,7 +2823,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{
 						Code:    "23502",
 						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, o.plan.Table.Name),
-						Detail:  formatRowForDetail(cols, row),
+						Detail:  formatRowForDetail(o.ctx, cols, row),
 					}
 				}
 			}
@@ -2917,7 +2917,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{
 						Code:    "23502",
 						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, partTable.Name),
-						Detail:  formatRowForDetail(partTable.Columns, partRow),
+						Detail:  formatRowForDetail(o.ctx, partTable.Columns, partRow),
 					}
 				}
 			}
@@ -3039,16 +3039,56 @@ func (o *insertOp) Next() (TupleSlot, error) {
 
 // formatRowForDetail formats a row for NOT NULL violation DETAIL messages.
 // Produces: "Failing row contains (v1, v2, ...)."
-func formatRowForDetail(cols []catalog.Column, row Row) string {
+func formatRowForDetail(ctx *Context, cols []catalog.Column, row Row) string {
 	parts := make([]string, len(cols))
 	for i := range cols {
 		if i >= len(row) || row[i].IsNull() {
 			parts[i] = "null"
 			continue
 		}
-		parts[i] = row[i].Format()
+		parts[i] = detailValueText(ctx, cols[i].Type, row[i])
 	}
 	return "Failing row contains (" + strings.Join(parts, ", ") + ")."
+}
+
+// detailValueText renders one non-NULL value of a constraint-violation
+// DETAIL ("Failing row contains (…)", "Key (…)=(…)") with its column type's
+// output function under the session's DateStyle, TimeZone and bytea_output.
+// PG's ExecBuildSlotValueDescription and BuildIndexValueDescription call
+// OidOutputFunctionCall per value; Datum.Format rendered a date as
+// 01-02-2020, a timestamp with six fraction digits, and a time with a
+// 1970-01-01 date (M0146-0083). datumToCopyText is the typed output path
+// COPY TO uses; on an error it falls back to Format.
+func detailValueText(ctx *Context, typ catalog.Type, d Datum) string {
+	dateStyle, dateOrder := dateStyleFromCtx(ctx)
+	timeZone := timeZoneFromCtx(ctx)
+	byteaMode := "hex"
+	var cat catalog.Catalog
+	qualify := false
+	var visible func(string) bool
+	if ctx != nil {
+		if ctx.GetSetting != nil {
+			if v, ok := ctx.GetSetting("bytea_output"); ok {
+				byteaMode = v
+			}
+		}
+		cat = ctx.Catalog
+		qualify = !RegObjectSchemaVisible(ctx, "public")
+		visible = func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+	}
+	// A row rejected before storage can still hold a DEFAULT or literal as
+	// its input text ('1 day 2 hours' for an interval column). PG has
+	// already run the type's input function by then, so do the same before
+	// rendering.
+	if d.Kind == KindString && !isTextTypeName(strings.ToLower(typ.Name)) && typ.Name != "" && !typ.IsArray {
+		if cv, err := evalCast(d, typ.Name, 0, ctx); err == nil && !cv.IsNull() {
+			d = cv
+		}
+	}
+	if s, err := datumToCopyText(typ, d, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible); err == nil {
+		return s
+	}
+	return d.Format()
 }
 
 // routeToPartition finds the partition child table that matches the given row
@@ -3385,7 +3425,7 @@ func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, le
 			if sib != nil && sib.OID != cur.OID {
 				return &ExecError{Code: "23514", Pos: pos,
 					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name),
-					Detail:  formatRowForDetail(leafCols, leafRow)}
+					Detail:  formatRowForDetail(ctx, leafCols, leafRow)}
 			}
 		}
 		cur = parent
@@ -8565,7 +8605,7 @@ func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRo
 // a NULL key column as the literal `null` (PostgreSQL prints
 // `Key (a)=(null) already exists.`). Datum.Format() returns "" for KindNull, so
 // NULL columns are mapped explicitly rather than via Format(). Design 0119-0004.
-func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func nndDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -8574,7 +8614,7 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 		for i, col := range cols {
 			if strings.EqualFold(col.Name, idxCol) && i < len(row) {
 				if !row[i].IsNull() {
-					val = row[i].Format()
+					val = detailValueText(ctx, col.Type, row[i])
 				}
 				break
 			}
@@ -8812,7 +8852,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 						Code:    "23505",
 						Pos:     pos,
 						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
-						Detail:  nndDetail(idx, cols, row),
+						Detail:  nndDetail(ctx, idx, cols, row),
 					}
 				}
 			}
@@ -8825,7 +8865,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			queueDeferredUniqueCheck(ctx, tbl, idx, cols, row, key)
 			continue
 		}
-		detail := buildUniqueConstraintDetail(idx, cols, row)
+		detail := func() string { return buildUniqueConstraintDetail(ctx, idx, cols, row) }
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
@@ -8931,7 +8971,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 						Code:    "23505",
 						Pos:     pos,
 						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
-						Detail:  nndDetail(idx, cols, newRow),
+						Detail:  nndDetail(ctx, idx, cols, newRow),
 					}
 				}
 			}
@@ -8943,7 +8983,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			queueDeferredUniqueCheck(ctx, tbl, idx, cols, newRow, key)
 			continue
 		}
-		detail := buildUniqueConstraintDetail(idx, cols, newRow)
+		detail := func() string { return buildUniqueConstraintDetail(ctx, idx, cols, newRow) }
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
@@ -8982,7 +9022,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 			if err != nil || key == nil {
 				continue
 			}
-			detail := buildExclusionConstraintDetail(idx, cols, row)
+			detail := buildExclusionConstraintDetail(ctx, idx, cols, row)
 			if raiseErr := exclusionCheckOnce(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 				return raiseErr
 			}
@@ -9139,7 +9179,7 @@ func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTre
 
 // buildExclusionConstraintDetail builds the DETAIL string for a 23P01 error:
 // "Key (col1)=(val1) conflicts with existing key (col1)=(val1)."
-func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func buildExclusionConstraintDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -9147,7 +9187,9 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 		val := ""
 		for i, col := range cols {
 			if col.Name == idxCol && i < len(row) {
-				val = row[i].Format()
+				if !row[i].IsNull() {
+					val = detailValueText(ctx, col.Type, row[i])
+				}
 				break
 			}
 		}
@@ -9167,7 +9209,9 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 //
 // Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
 // produces the <waiting ...> interleaving seen in read-write-unique.spec.
-func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName, detail string, pos int) error {
+// detail renders the DETAIL only when a conflict is raised: the typed output
+// path is too costly for every insert into a unique index (M0146-0083).
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName string, detail func() string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
 	var conflictPtr storage.ItemPointer
@@ -9283,7 +9327,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 			Code:    "23505",
 			Pos:     pos,
 			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
-			Detail:  detail,
+			Detail:  detail(),
 		}
 	}
 	return nil
@@ -9291,7 +9335,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 
 // buildUniqueConstraintDetail builds the DETAIL string for a 23505 error:
 // "Key (col1, col2, ...)=(val1, val2, ...) already exists."
-func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func buildUniqueConstraintDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -9299,7 +9343,9 @@ func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row 
 		val := ""
 		for i, col := range cols {
 			if col.Name == idxCol && i < len(row) {
-				val = row[i].Format()
+				if !row[i].IsNull() {
+					val = detailValueText(ctx, col.Type, row[i])
+				}
 				break
 			}
 		}

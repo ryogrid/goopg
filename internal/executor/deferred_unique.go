@@ -125,7 +125,7 @@ func queueDeferredUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 		TableName:     tbl.Name,
 		IndexName:     idx.Name,
 		Key:           append([]byte(nil), key...),
-		Detail:        buildUniqueConstraintDetail(idx, cols, row),
+		Detail:        buildUniqueConstraintDetail(ctx, idx, cols, row),
 		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }
@@ -165,7 +165,7 @@ func queueDeferredNNDUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 		TableName:     tbl.Name,
 		IndexName:     idx.Name,
 		NNDKeyCols:    nnd,
-		Detail:        nndDetail(idx, cols, row),
+		Detail:        nndDetail(ctx, idx, cols, row),
 		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }

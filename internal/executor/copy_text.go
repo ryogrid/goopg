@@ -428,6 +428,11 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, by
 			return "f", nil
 		case KindNumeric:
 			return numericText(d), nil
+		case KindInterval:
+			// interval_out under the default 'postgres' IntervalStyle. There
+			// was no arm, so COPY TO of any interval column failed "kind 6
+			// cannot encode as interval" (M0146-0083).
+			return d.Format(), nil
 		default:
 			return "", fmt.Errorf("kind %d cannot encode as %s in COPY TEXT", d.Kind, t.Name)
 		}
