@@ -1032,6 +1032,15 @@ func sortGroupKeySource(col *optimizer.ColumnRef, agg *optimizer.Aggregate) (opt
 // A nil/false return keeps the caller's today's text; the caller
 // applies its own S18 wrap to a hit.
 func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg) (optimizer.Expr, bool) {
+	return resolveKeySourceAt(expr, node, reg, false)
+}
+
+// resolveKeySourceAt is resolveKeySource with the pinning decision preset:
+// pinned starts the chase as if it had already crossed a join, so what it
+// returns is named in the node that evaluates it (pinKeyExprNames). An
+// aggregate argument chased into the aggregate's own input needs that: it is
+// printed inside a call rendered far above the node it names.
+func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg, pinned bool) (optimizer.Expr, bool) {
 	if expr == nil || node == nil || exprHasSubplanOrOuterRef(expr) {
 		return nil, false
 	}
@@ -1046,7 +1055,7 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 	// evaluates them (pinKeyExprNames) — PG's deparse resolves each Var in
 	// the plan node that produces it (regress join.sql's
 	// `(SELECT a c1, COALESCE(a) c2 FROM group_tbl t2)` under `t1`).
-	crossedJoin := false
+	crossedJoin := pinned
 	// wantRel is the first relation the chase has seen the key name (its
 	// own SourceTableIdx, or a target's on the way down). Where the walk
 	// crosses a join or ends at a scan it must land on that same relation;
@@ -1244,12 +1253,16 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				}
 			}
 			return src, true
-		case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather, *optimizer.GatherMerge:
+		case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather, *optimizer.GatherMerge, *optimizer.Materialize:
 			// Row-order and worker boundaries pass their child's columns
 			// through unchanged (M0146-0021: Q77's sr body aggregates over
 			// a Gather Merge; M0146-0005cg: TPC-DS Q89's window keys over
-			// an Incremental Sort).
+			// an Incremental Sort). A Materialize buffers its child row for
+			// row (M0146-0042: TPC-DS Q65's materialized merge inner).
 			c := childNodeOf(n)
+			if m, ok := n.(*optimizer.Materialize); ok {
+				c = m.Child
+			}
 			if c == nil || len(n.Output()) != len(c.Output()) {
 				return nil, false
 			}
@@ -1459,7 +1472,11 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 				}
 				return nil, false
 			}
-			call, ok := synthAggCall(&n.Aggs[j-len(n.GroupExprs)])
+			agg := n.Aggs[j-len(n.GroupExprs)]
+			if chasedAgg, ok := chaseAggregateResultArgs(agg, n.Child, reg); ok {
+				agg = chasedAgg
+			}
+			call, ok := synthAggCall(&agg)
 			if ok && crossedJoin {
 				return pinKeyExprNames(call, n, reg)
 			}
@@ -1506,6 +1523,21 @@ func pinKeyExprNames(e optimizer.Expr, ctx optimizer.Node, reg *subPlanReg) (opt
 	}
 	failed := false
 	out, ok := optimizer.CloneExprReplacingColumnRefs(e, func(c *optimizer.ColumnRef) optimizer.Expr {
+		// A column already rendered as text (an aggregate argument chased
+		// below, chaseAggregateResultArgs) keeps that text. The clone has
+		// a new pointer, so the text is found again by the display
+		// column's unique name.
+		if c.SourceTableIdx == displayColumnSourceIdx {
+			for k, txt := range reg.boundaryKeyName {
+				if k.SourceTableIdx == displayColumnSourceIdx && k.Name == c.Name {
+					cp := *c
+					reg.boundaryKeyName[&cp] = txt
+					return &cp
+				}
+			}
+			failed = true
+			return c
+		}
 		cp := *c
 		q := reg.names().columnIn(ctx, c.SourceTableIdx, c.Name, true)
 		if c.SourceTableIdx == 0 || !strings.Contains(q, ".") {
@@ -1523,6 +1555,77 @@ func pinKeyExprNames(e optimizer.Expr, ctx optimizer.Node, reg *subPlanReg) (opt
 	}
 	return out, true
 }
+
+// chaseAggregateResultArgs deparses an aggregate call whose argument is
+// another aggregate's RESULT (M0146-0042). PG prints the inner Var through
+// the child Agg's target list, parenthesised as get_variable prints any
+// non-Var target: TPC-DS Q65's `avg(revenue)` over the per-item `sum` reads
+// `avg((sum(store_sales_1.ss_sales_price)))`. Each bare table-0 argument is
+// chased into child — the aggregate's input — with its columns pinned to the
+// node that evaluates them, and replaced by a display column carrying that
+// text. synthAggCall would otherwise decline the call (a table-0 operand), and
+// the whole key would print as the bare output name. Anything the chase cannot
+// resolve declines (ok=false), keeping the caller's behaviour.
+func chaseAggregateResultArgs(call optimizer.AggregateCall, child optimizer.Node, reg *subPlanReg) (optimizer.AggregateCall, bool) {
+	if reg == nil || child == nil || call.Filter != nil || len(call.OrderBy) > 0 || call.WithinGroup || call.Star {
+		return call, false
+	}
+	changed := false
+	chase := func(a optimizer.Expr) (optimizer.Expr, bool) {
+		c, isCol := a.(*optimizer.ColumnRef)
+		if !isCol {
+			return a, !exprHasTableZeroRef(a)
+		}
+		// The argument indexes the aggregate's input; one that input
+		// COMPUTES (another aggregate's result) deparses as that
+		// expression. A plain column keeps its own rendering — the caller
+		// pins it — and only an unresolvable table-0 one declines.
+		chased, hit := resolveKeySourceAt(c, child, reg, true)
+		if !hit {
+			return a, c.SourceTableIdx != 0
+		}
+		if _, isCol := chased.(*optimizer.ColumnRef); isCol {
+			return a, c.SourceTableIdx != 0
+		}
+		var txt string
+		reg.withJoinRow(nil, func() { txt = "(" + formatExprQual(chased, reg, true) + ")" })
+		// A display column names no relation of its own; a sentinel id
+		// keeps synthAggCall's table-0 guard (an unresolved operand) apart
+		// from it, and a unique name lets pinKeyExprNames find its text on
+		// a clone. Only boundaryKeyName ever renders it.
+		named := *c
+		named.Name = fmt.Sprintf("%s\x00display%d", c.Name, len(reg.boundaryKeyName))
+		named.SourceTableIdx = displayColumnSourceIdx
+		d := displayColumn(&named, txt, reg).(*optimizer.ColumnRef)
+		changed = true
+		return d, true
+	}
+	var ok bool
+	if call.Arg != nil {
+		if call.Arg, ok = chase(call.Arg); !ok {
+			return call, false
+		}
+	}
+	if call.Arg2 != nil {
+		if call.Arg2, ok = chase(call.Arg2); !ok {
+			return call, false
+		}
+	}
+	if len(call.ExtraArgs) > 0 {
+		extra := make([]optimizer.Expr, len(call.ExtraArgs))
+		for i, a := range call.ExtraArgs {
+			if extra[i], ok = chase(a); !ok {
+				return call, false
+			}
+		}
+		call.ExtraArgs = extra
+	}
+	return call, changed
+}
+
+// displayColumnSourceIdx marks a display column (chaseAggregateResultArgs):
+// rendered only through reg.boundaryKeyName, never resolved by relation.
+const displayColumnSourceIdx int16 = -32768
 
 // joinOutputIsConcat reports whether out is exactly left ++ right (left only
 // for a semi/anti join), position by position, by column name and relation.
@@ -2819,6 +2922,23 @@ func formatJoinKeyCond(p *optimizer.Join, reg *subPlanReg, qualify bool) string 
 			continue
 		}
 		l, r := formatExprQual(k.Left, reg, qualify), formatExprQual(k.Right, reg, qualify)
+		// M0146-0042: a key column the name-based rendering leaves BARE is
+		// resolved as the residual is, positionally through the child that
+		// produced it (resolve_special_varno): a key over a
+		// GroupAggregate'd subquery prints its grouped source column,
+		// TPC-DS Q65's `store_sales.ss_store_sk = store_sales_1.ss_store_sk`.
+		// Only a bare column takes the walk — a name the scopes already
+		// qualified stays (TPC-DS Q97's FULL join keys print right by name,
+		// and the positional walk misreads that join's merged columns).
+		bareKey := func(e optimizer.Expr, txt string) string {
+			if _, isCol := e.(*optimizer.ColumnRef); !isCol || !qualify || strings.Contains(txt, ".") {
+				return txt
+			}
+			out := txt
+			reg.withJoinRow(p, func() { out = formatExprQual(e, reg, qualify) })
+			return out
+		}
+		l, r = bareKey(k.Left, l), bareKey(k.Right, r)
 		// M0146-0005h: a key read from a set-operation input deparses
 		// through the set operation's first branch, as PG's does.
 		if qualify && p.Left != nil {
@@ -3790,6 +3910,23 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if qualify && reg != nil && reg.joinRow != nil {
 			if s := reg.names().joinResidualColumn(reg.joinRow, x.Index); s != "" {
 				return s
+			}
+			// M0146-0042: a column the walk cannot name because a child
+			// COMPUTES it — an aggregate result of a grouped subquery —
+			// deparses as that expression, parenthesised as get_variable
+			// prints a non-Var target (TPC-DS Q65's `(sum(...)) <= (0.1 *
+			// (avg((sum(...)))))`, where goopg printed `revenue <= (0.1 *
+			// ave)`). The chased expression indexes its own node's input,
+			// not the join row, so it renders with joinRow cleared.
+			join := reg.joinRow
+			if chased, hit := resolveKeySource(x, join, reg); hit {
+				if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
+					var out string
+					reg.withJoinRow(nil, func() {
+						out = "(" + formatExprQual(chased, reg, qualify) + ")"
+					})
+					return out
+				}
 			}
 		}
 		if !qualify || reg == nil || reg.names() == nil {
