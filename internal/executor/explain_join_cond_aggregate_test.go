@@ -41,3 +41,29 @@ func TestExplainJoinCondsThroughGroupedSubqueries(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainSortKeyAggregateOverUnionAllMembers pins the TPC-DS Q56 shape:
+// an outer aggregate over a UNION ALL of two inlined, grouped CTEs. PG
+// deparses the Sort Key's `sum(total)` through the Append's first branch to
+// that member's own aggregate, nested and parenthesised:
+// `(sum((sum(s1.v))))`. goopg printed the CTE's label column,
+// `(sum(a.total))`. Expected text is PG 18.3's for the same schema and query.
+func TestExplainSortKeyAggregateOverUnionAllMembers(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE s1 (id text, v numeric)",
+		"CREATE TABLE s2 (id text, v numeric)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	const q = "EXPLAIN (COSTS OFF) WITH a AS (SELECT id, sum(v) total FROM s1 GROUP BY id), " +
+		"b AS (SELECT id, sum(v) total FROM s2 GROUP BY id) " +
+		"SELECT id, sum(total) t FROM (SELECT * FROM a UNION ALL SELECT * FROM b) x GROUP BY id ORDER BY t, id"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	if want := "Sort Key: (sum((sum(s1.v)))), s1.id"; !strings.Contains(plan, want) {
+		t.Errorf("missing PG's %q in:\n%s", want, plan)
+	}
+}

@@ -1391,6 +1391,15 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 					(lvl || ac.SourceTableIdx == tc.SourceTableIdx) {
 					return at, true
 				}
+				// M0146-0042: across a query-level boundary the column
+				// may be COMPUTED below it — an inlined CTE body's own
+				// aggregate under a UNION ALL arm, TPC-DS Q56's
+				// `sum(store_sales.ss_ext_sales_price)` behind `ss.total_sales`.
+				// PG deparses through to that expression; the chase
+				// pinned it to the node that evaluates it.
+				if _, isCol := at.(*optimizer.ColumnRef); !isCol && lvl {
+					return at, true
+				}
 			}
 			return tc, true
 		case *optimizer.WindowAgg:
@@ -1850,6 +1859,18 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 					}
 				} else if expanded, hit := expandAggOutputRef(col, agg); hit {
 					keyExpr = expanded
+					// M0146-0042: an argument the aggregate's input
+					// computes — a UNION ALL member's own aggregate,
+					// deparsed through the Append's first branch — nests
+					// as PG prints it: TPC-DS Q56's
+					// `(sum((sum(store_sales.ss_ext_sales_price))))`.
+					if i := col.Index - len(agg.GroupExprs); i >= 0 && i < len(agg.Aggs) {
+						if chasedAgg, ok := chaseAggregateResultArgs(agg.Aggs[i], agg.Child, reg); ok {
+							if call, ok := synthAggCall(&chasedAgg); ok {
+								keyExpr = call
+							}
+						}
+					}
 				} else if g, hit := groupingMaskCall(agg, col.Index); hit {
 					// M0146-0005cf: PG's `(GROUPING(a, b))`.
 					keyExpr = g
