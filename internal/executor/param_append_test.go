@@ -27,7 +27,7 @@ func TestParameterisedAppendOverUnionAll(t *testing.T) {
 	} {
 		runSQL(t, ctx, q)
 	}
-	const q = "SELECT li.id, x.amt FROM li, (SELECT item, amt FROM cs1 WHERE amt > 5 UNION ALL SELECT item, amt FROM ws1) x WHERE x.item = li.id AND li.cat = 3"
+	const q = "SELECT li.id, x.amt FROM li, (SELECT item, amt FROM cs1 UNION ALL SELECT item, amt FROM ws1) x WHERE x.item = li.id AND li.cat = 3"
 	plan := strings.Join(renderRows(runSQL(t, ctx, "EXPLAIN (COSTS OFF) "+q)), "\n")
 	for _, want := range []string{"Nested Loop", "Append", "Index Cond: (item = li.id)"} {
 		if !strings.Contains(plan, want) {
@@ -36,6 +36,15 @@ func TestParameterisedAppendOverUnionAll(t *testing.T) {
 	}
 	if strings.Count(plan, "Index Cond: (item = li.id)") != 2 {
 		t.Errorf("want both members probed by li.id:\n%s", plan)
+	}
+	// M0146-0098: a member with a WHERE clause is not a safe append member
+	// (is_safe_append_member), so PG keeps it a subquery RTE — `Subquery
+	// Scan on "*SELECT* 1"` — and a subquery RTE gets no join-parameterised
+	// path, which abandons the parameterised Append; PG 18.3 hash-joins it.
+	const qWhere = "SELECT li.id, x.amt FROM li, (SELECT item, amt FROM cs1 WHERE amt > 5 UNION ALL SELECT item, amt FROM ws1) x WHERE x.item = li.id AND li.cat = 3"
+	planWhere := strings.Join(renderRows(runSQL(t, ctx, "EXPLAIN (COSTS OFF) "+qWhere)), "\n")
+	if !strings.Contains(planWhere, `Subquery Scan on "*SELECT* 1"`) || strings.Contains(planWhere, "Nested Loop") {
+		t.Errorf("want PG's Hash Join over Subquery Scan on \"*SELECT* 1\":\n%s", planWhere)
 	}
 
 	for _, c := range []struct{ sql, want string }{

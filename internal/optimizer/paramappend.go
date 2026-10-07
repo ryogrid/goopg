@@ -113,6 +113,15 @@ func (s *searchCtx) addParameterizedAppendPaths(cat catalog.Catalog) {
 		if len(members) < 2 {
 			continue
 		}
+		// M0146-0098: a member PG cannot pull into the appendrel (a join, any
+		// WHERE — is_safe_append_member, stamped by the set-op fold) stays a
+		// subquery RTE, whose paths are parameterised only by its own LATERAL
+		// references (set_subquery_pathlist), never by a join clause. Its
+		// get_cheapest_parameterized_child_path is NULL, which abandons the
+		// parameterisation for the whole appendrel.
+		if unionAllHasSubqueryMember(so) {
+			continue
+		}
 		cands := indexableJoinClausesFor(rel.Relids, s.clauses.all)
 		if len(cands) == 0 {
 			continue
@@ -129,6 +138,24 @@ func (s *searchCtx) addParameterizedAppendPaths(cat catalog.Catalog) {
 			setCheapest(rel)
 		}
 	}
+}
+
+// unionAllHasSubqueryMember reports whether any link of the appendrel's
+// UNION ALL chain stamped a member that stays a subquery RTE in PG
+// (SetOp.appendMemberLeft/Right, M0146-0093).
+func unionAllHasSubqueryMember(so *SetOp) bool {
+	if so == nil {
+		return false
+	}
+	if so.appendMemberLeft > 0 || so.appendMemberRight > 0 {
+		return true
+	}
+	for _, k := range []Node{so.Left, so.Right} {
+		if c, ok := k.(*SetOp); ok && c.All && c.Op == so.Op && unionAllHasSubqueryMember(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // paramAppendPathFor builds the Append for one parameterisation, or nil when
