@@ -301,6 +301,40 @@ Results:
 - Not covered (ledger 2026-10-06): goopg's structured EXPLAIN formats
   (JSON, `planToJSON`) carry no `Subplan Name` plans at all.
 
+## Slice — join conditions through a grouped subquery (2026-10-08, `1ff32da82`)
+
+- **Problem.** TPC-DS Q65 was PG's plan node for node, but its join
+  conditions over two GroupAggregate'd derived tables printed output names
+  bare: `Merge Cond: (ss_store_sk = ss_store_sk)` and
+  `Join Filter: (revenue <= (0.1 * ave))`. PG prints
+  `(store_sales.ss_store_sk = store_sales_1.ss_store_sk)` and
+  `((sum(store_sales.ss_sales_price)) <= (0.1 * (avg((sum(store_sales_1.ss_sales_price))))))`.
+  `resolve_special_varno` deparses each Var through the child plan's target
+  list. A non-Var target prints parenthesised (get_variable), and an
+  aggregate over another aggregate's result nests.
+- **Change.**
+  - **Hash/Merge Cond keys.** A key whose name-based text is bare is
+    re-rendered with the join row in scope, so the positional walk resolves
+    it through the group key. A name the scopes already qualify stays. On
+    TPC-DS Q51/Q97's FULL joins the walk misread the merged columns, and
+    the qualified names were already PG's.
+  - **Computed columns.** A join-row column a child computes is chased with
+    `resolveKeySource` and printed as `(expr)`, rendered with `joinRow`
+    cleared. `resolveKeySource` now steps through a Materialize.
+  - **Nested aggregates.** `chaseAggregateResultArgs` chases each
+    bare-column argument into the aggregate's input
+    (`resolveKeySourceAt`, pinned). It substitutes a uniquely named display
+    column whose text survives `pinKeyExprNames`' clone, which
+    `synthAggCall` had declined.
+- **Results.**
+  - Q65 is a full MATCH at both scales: PLAN-PARITY SF0.25 42 → 43, SF1
+    33 → 34, and qual-placement 12 → 11.
+  - Q44 (`v11.rnk = v21.rnk`), Q78 (`cs.cs_customer_sk`) and Q95
+    (`ws_wh_1.ws_order_number`) now print PG's text.
+  - TPC-H EXPLAIN text and ten regress files are unchanged.
+- Test: `TestExplainJoinCondsThroughGroupedSubqueries`, which reproduces
+  PG 18.3's three lines.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |

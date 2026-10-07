@@ -27782,6 +27782,13 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 31 �
     children, its InitPlans before \(explain\.c ExplainNode order\); Q45
     text\-identical at SF1 \(32 → 33\), Q6/Q32/Q92 closer\.
 Movement: none — instrument artefact — text\-only; text\-identical SF1 32 → 33, SF0\.25 40 → 40
+  - Slice 2026\-10\-08 \(`1ff32da82`\): join conditions over a GroupAggregate\'d derived table deparse
+    through the aggregate that produced each column\.
+    - A bare Hash/Merge Cond key walks the join row\.
+    - A computed column prints as `\(expr\)` via `resolveKeySource`, which now crosses a Materialize\.
+    - An aggregate over an aggregate nests \(`chaseAggregateResultArgs`\)\.
+    - TPC\-DS Q65 is a full MATCH at both scales; Q44/Q78/Q95 lines now equal PG\'s\.
+Movement: yes — PLAN\-PARITY match SF0\.25 42 → 43, SF1 33 → 34 \(Q65\); CATEGORIES\-EXCL\-MATCH qual\-placement 12 → 11 at both scales
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
