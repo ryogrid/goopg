@@ -27824,7 +27824,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     - Witness `TestJoinFilterECClausesLast` \(fails without the change\);
       SF0\.25 Q64's top Join Filter now matches PG\.
   Movement: none — instrument artefact — text-only; SF0.25 Q64 Join Filter = PG
-- [ ] **M0146\-0049 — a parameterised inner path through a non\-scan node**
+- [x] **M0146\-0049 — a parameterised inner path through a non\-scan node**
   \(filed 2026\-10\-03 by recon M0146\-0005dt\)\. PG binds a nested loop\'s
   parameters into ANY inner subtree \(`create\_nestloop\_plan` /
   `replace\_nestloop\_params`, createplan\.c:4341 / :5036; ExecReScan
@@ -27896,6 +27896,12 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
   M0145-0008ac's pull-up, landed `c317b037b`). Filings resume — the
   probe-cost item the budget kept unfiled may now be filed as a child.
   Post-pin completions accumulate a fresh budget.
+  - **Closed 2026\-10\-07:** every child is `[x]` \(0049a–g\)\. The
+    parameterised Append exists, runs under a Gather \(0049e\) and serves
+    the IN/semi form \(0049g\)\. The probe\-cost item was measured corpus\-wide
+    by M0146\-0068 and its executor half filed as M0146\-0088 \(the
+    multiplier\'s fate awaits the owner\'s 0068 decision\)\.
+  Movement: none — instrument artefact — Q54/Q95 witnesses diverge upstream of the landed subtrees; CATEGORIES\-EXCL\-MATCH unchanged
   - [x] **M0146\-0049a — recon: the executor substrate runs PG\'s
     parameterised Append** \(2026\-10\-03\)\.
     Kind: recon
@@ -28076,7 +28082,7 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
         Nested Loop Semi Join over the bitmap\-probe Append, values identical
         \(40 rows, sum 39120\)\. Reverted; filed M0146\-0049g\.
     Movement: none — recon; no production change
-  - [ ] **M0146\-0049g — the pulled ANY leaf keeps its appendrel mark**
+  - [x] **M0146\-0049g — the pulled ANY leaf keeps its appendrel mark**
     \(filed 2026\-10\-07 by 0049f\)\. `seamLeafRelInfo`
     \(joinsearchseam\.go\) builds a derived leaf\'s `baseRelInfo` without
     `appendrel: b\.appendrel`, so `li\.id IN \(SELECT … UNION ALL SELECT …\)`
@@ -28089,6 +28095,15 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     - First step: add the field \(the recon\'s measured patch\), a planner
       test on the recon fixture asserting the semi NL over the Append, and run
       the fire set at both scales\.
+    - Done 2026\-10\-07 \(`a53746cd8`; design
+      `docs/design/0100\-0149/m0146\-0049\-parameterised\-inner\-non\-scan\.md`
+      slice \(g\)\):
+      - `seamLeafRelInfo` copies `b\.appendrel` for derived leaves; the IN
+        form now plans PG\'s Nested Loop Semi Join over the probe Append
+        \(`TestInUnionAllProbesEachMember`, fails without the line\)\.
+      - Fire set flat at both scales \(no corpus query has the shape\);
+        sf025 Q30 2\.5x is an intermittent pre\-existing spike \(ledgered\)\.
+    Movement: none — instrument artefact — no TPC\-H/TPC\-DS query has IN/EXISTS over a UNION ALL subquery; fire set flat at both scales
 - [x] **M0146\-0050 — WRONG RESULTS: a correlated CTE inside a correlated
   subplan replays its first execution** \(filed 2026\-10\-03 by M0146\-0049d2\)\.
   `SELECT g, \(SELECT k FROM \(WITH c AS MATERIALIZED \(SELECT g\*2 AS k\)

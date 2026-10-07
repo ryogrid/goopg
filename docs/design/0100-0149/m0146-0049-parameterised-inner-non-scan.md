@@ -345,3 +345,25 @@ recon. The implementation is M0146-0049g, which owes the standard gates and
 the fire set: the flag also turns on the Parallel Append hoist for
 derived ANY leaves (`addAppendRelPartialPaths`), which the fire set must
 cover.
+
+## Slice (g) — the pulled ANY leaf keeps its appendrel mark (2026-10-07, `a53746cd8`)
+
+`seamLeafRelInfo`'s `table == nil` branch now copies `b.appendrel`, as
+`estimateBaseRelInfo`'s catalog branch does. The slice (f) query plans
+PG's `Nested Loop Semi Join` over Append(bitmap probes), with the same
+values (40 rows, sum 39120). `TestInUnionAllProbesEachMember` pins the
+shape and the values; it fails without the line.
+
+The fire set is flat at both scales: no TPC-H or TPC-DS query takes
+IN/EXISTS over a UNION ALL subquery. The same flag now also lets
+`addAppendRelPartialPaths` hoist Parallel Append partial paths onto a
+derived ANY leaf. No corpus plan moved through that either.
+
+**M0146-0049 closes** with slices (a)–(g):
+
+- the parameterised Append is built;
+- it runs under a Gather;
+- it serves the semi join.
+
+The index-probe cost item went to M0146-0068's corpus A/B and
+M0146-0088.
