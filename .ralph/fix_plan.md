@@ -29549,7 +29549,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   - Design doc `docs/design/0100\-0149/m0146\-0065\-inlined\-cte\-union\-all\-appendrel\.md`\.
   - The 2026\-10\-05 escalation above is answered by the 2026\-10\-06 owner re\-open of M0146\-0007\.
   Movement: yes — SF0\.25 CATEGORIES\-EXCL\-MATCH parallelism 29→28, aggregation\-strategy 8→7, scan\-type 29→28; SF1 parallelism 42→41, aggregation\-strategy 15→14
-- [ ] **M0146\-0066 — trivial\_subqueryscan parity: goopg keeps a Subquery
+- [x] **M0146\-0066 — trivial\_subqueryscan parity: goopg keeps a Subquery
   Scan PG strips, and strips some PG keeps** \(filed 2026\-10\-05 by
   M0146\-0028g's census\)\. `stripTrivialSubqueryScans` \(M0146\-0005w\)
   replicates `setrefs\.c`'s `trivial\_subqueryscan`, but at SF0\.25 the
@@ -29569,6 +29569,19 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     vs physical, `subqueryStripSpineBreaker` / `subqueryStripTlistReset`\)
     and the consumed positions against PG's tlist; then run the strip pass
     over sublink and InitPlan bodies\.
+  - DONE 2026\-10\-07 \(recon; design `docs/design/0100\-0149/m0146\-0066\-subqueryscan\-strip\-recon\.md`,
+    evidence `analysis/m0146/m0146\-0066/`\)\. The census pairs are goopg/PG\. Five classes:
+    - A over\-keep: the strip pass never visits sublink/InitPlan bodies \(Q23\) — M0146\-0091\.
+    - B over\-strip around a WindowAgg: make\_window\_input\_target puts partition/order columns first, so a
+      leaf below reads reordered \(Q44 v1/v2, Q49 in\_\*, Q67 dw1\); a subquery over a window body reads a
+      shorter tlist than the WindowAgg emits \(probe `w`\) — M0146\-0092\.
+    - C over\-strip: appendrel members that are joins keep `Subquery Scan on "\*SELECT\* n"` \(Q5, Q71\) —
+      M0146\-0093\.
+    - D upstream plan shape, not the pass: Q77 cr \(PG\'s Materialize on the NL inner\), Q44 v11/v21 \(PG\'s
+      Sort above the window\)\.
+    - Incidental: a member\-constant qual stays as a Filter on the Append \(PG folds it per member\) —
+      M0146\-0094\.
+  Movement: none — recon
 - [ ] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
   \(filed 2026\-10\-05 by M0146\-0028's closure\)\. `pull\_up\_simple\_subquery`
   wraps substituted outputs in PlaceHolderVars when the parent uses grouping
@@ -29680,3 +29693,33 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - Ledgered since M0146\-0002 slice 1 \(deferral\_ledger 2026\-09\-24 row\); now with a witness\.
   - First step: port the shared batch\-growth protocol, or, as an interim that keeps results
     correct, fall back to a serial \(non\-shared\) hash join for the group when a participant spills\.
+- [ ] **M0146\-0091 — the Subquery Scan strip pass never visits sublink or InitPlan bodies** \(filed 2026\-10\-07 by M0146\-0066\)\. PG\'s setrefs walks every subplan; goopg\'s `stripTrivialSubqueryScans` runs once at `Plan\(\)`\'s tail over
+  the statement tree, so a sublink body keeps a wrapper PG strips \(TPC\-DS Q23 `Subquery Scan on
+  \_\_sq\_1a7` under the InitPlan\'s Aggregate; probe `analysis/m0146/m0146\-0066/probe\-window\-sublink\.sql` case 1\)\.
+  Kind: impl
+  Parent: M0146\-0066
+  - First step: run the pass over each sublink/InitPlan body as its own region \(each subplan enters create\_plan with
+    CP\_EXACT\_TLIST\), then recount Q23\.
+- [ ] **M0146\-0092 — a Subquery Scan around a WindowAgg is stripped where PG keeps it** \(filed 2026\-10\-07 by M0146\-0066\)\. `make\_window\_input\_target` \(planner\.c\) orders the window input target sort/group\-ref columns first, so a
+  subquery leaf below the window\'s Sort has a reordered tlist and PG keeps it \(Q44 v1/v2, Q49 in\_\*, Q67 dw1\);
+  and a subquery over a window body reads fewer columns than the WindowAgg emits \(its sort keys ride along\),
+  so PG keeps that one too\. goopg\'s first\-reference\-order proxy reads identity and strips both\.
+  Kind: impl
+  Parent: M0146\-0066
+  - First step: in `stripTrivialSubqueryScans`, take a leaf\'s expected order under a WindowAgg from the window\'s
+    partition/order keys first \(window\_input\_target\.go\), and compare a window\-body leaf\'s consumption
+    against the WindowAgg\'s full output width\.
+- [ ] **M0146\-0093 — UNION ALL members that are joins get no `Subquery Scan on "*SELECT* n"`** \(filed 2026\-10\-07 by M0146\-0066\)\. `pull\_up\_simple\_union\_all` keeps a non\-simple member as a subquery RTE planned on its own; PG wraps it in
+  `Subquery Scan on "\*SELECT\* n"` and keeps it when the parent consumes a subset \(Q5, Q71; probe
+  `probe\-appendrel\-window\.sql` case 1\)\. goopg hash\-joins the members bare under the Append\. Check Q78 at SF1\.
+  Kind: impl
+  Parent: M0146\-0066
+  - First step: find where goopg plans an appendrel member that is a join and whether it records the member as a
+    derived subtree; then apply the strip test to the member wrapper\.
+- [ ] **M0146\-0094 — a UNION ALL member\'s constant column qual stays as a Filter on the Append** \(filed 2026\-10\-07 by M0146\-0066\)\. `… \(select v, k, 1 as src from s1 union all select v, k, 2 as src from s2\) u … where src > 0`: PG pushes the
+  qual into each member \(set\_append\_rel\_size substitutes the member expression; `1 > 0` folds away\) and shows
+  a bare Append; goopg keeps `Filter: \(src > 0\)` on the Append \(qual\-placement\)\.
+  Kind: impl
+  Parent: M0146\-0066
+  - First step: trace where goopg places a restriction on an appendrel leaf whose column is a member constant, and
+    push it into the members with the member expression substituted\.

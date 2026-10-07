@@ -1,0 +1,12 @@
+create table s1(k int, v numeric, pad text);
+create table s2(k int, v numeric, pad text);
+create table d(k int primary key, m int);
+insert into s1 select g % 300, g, 'x' from generate_series(1, 30000) g;
+insert into s2 select g % 300, g, 'y' from generate_series(1, 30000) g;
+insert into d select g, g % 12 from generate_series(1, 300) g;
+analyze s1; analyze s2; analyze d;
+explain (costs off) select m, sum(price) from (select v as price, k as dk from s1 union all select v as price, k as dk from s2) u, d where d.k = u.dk group by m;
+explain (costs off) select m, sum(price) from (select v as price, k as dk, 1 as src from s1 union all select v as price, k as dk, 2 as src from s2) u, d where d.k = u.dk and src > 0 group by m;
+explain (costs off) select m, sum(price) from (select k as dk, v as price from s1 union all select k, v from s2) u, d where d.k = u.dk group by m;
+explain (costs off) select m, sum(price) from (select s1.v as price, s1.k as dk, s1.pad as p from s1, d where d.k = s1.k and d.m = 3 union all select s2.v, s2.k, s2.pad from s2, d where d.k = s2.k and d.m = 3) u, d d2 where d2.k = u.dk group by m;
+explain (costs off) select item, rnk from (select item, rank() over (order by ratio) rnk from (select k item, sum(v)/count(*) ratio from s1 group by k) in_web) w where rnk <= 10;
