@@ -29839,7 +29839,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     - Q44 now has PG\'s 4 Subquery Scans at both scales; Q78 exposes M0146\-0100\. Design:
       `docs/design/0100\-0149/m0146\-0099\-merge\-input\-sort\.md`\.
 Movement: none — instrument artefact — SF0\.25 qual\-placement 11\-\>10; SF1 aggregation\-strategy 14\-\>13, parallelism 40\-\>41, rendering 11\-\>12 as Q44 compares past the merge\.
-- [ ] **M0146\-0100 — a derived subquery leaf publishes no pathkeys, so a merge sorts a presorted
+- [x] **M0146\-0100 — a derived subquery leaf publishes no pathkeys, so a merge sorts a presorted
   GroupAggregate** \(filed 2026\-10\-08 by M0146\-0099\)\. TPC\-DS Q78 \(both scales\): goopg prints
   `Sort \-\> Subquery Scan on ss/ws/cs \-\> GroupAggregate` on all three merge inputs; PG merges `ss` and `cs`
   presorted on their GroupAggregate order and sorts only `ws`\. PG\'s `set\_subquery\_pathlist` hands each
@@ -29851,3 +29851,23 @@ Movement: none — instrument artefact — SF0\.25 qual\-placement 11\-\>10; SF1
   - First step: seed the subquery leaf\'s `PathPrebuilt` pathkeys from `inputNodePathkeys` of its plan,
     translated as `cteScanPathkeys` does, and A/B the fire sets\. Offering a second, sorted\-grouping
     subquery path is a separate step\.
+  - Done 2026\-10\-08 \(b337c0b16\)\. `addCTEScanPathkeys` now covers every sub\-plan leaf;
+    `subqueryLeafPathkeys` converts the leaf plan\'s `inputNodePathkeys` through the shared
+    `convertLeafPathkeys`\.
+    - Q65 is PG\'s plan node for node at both scales \(bare\-column rendering only\)\.
+    - Q78 merges two GroupAggregates presorted; it still differs in ws/cs order and PG\'s Materialize
+      \(filed M0146\-0101\)\.
+    - TPC\-H plans byte\-identical\. Design: `docs/design/0100\-0149/m0146\-0100\-subquery\-leaf\-pathkeys\.md`\.
+Movement: SF1 join\-order 53\-\>52, join\-method 21\-\>20, scan\-type 34\-\>33, sort\-strategy 28\-\>27, parallelism 41\-\>40; SF0\.25 join\-order 47\-\>46, join\-method 24\-\>23, sort\-strategy 26\-\>25; qual\-placement \+1/\+2 \(bare\-column rendering\)\.
+- [ ] **M0146\-0101 — goopg drops PG\'s Materialize over a merge join\'s presorted grouped inner**
+  \(filed 2026\-10\-08 by M0146\-0100\)\. TPC\-DS Q78 \(both scales\): PG prints `Materialize \-\>
+  GroupAggregate` for the merge inner\(s\); goopg merges the GroupAggregate bare\. A GroupAggregate cannot
+  mark/restore, so `final\_cost\_mergejoin` elects `materialize\_inner` unless `skip\_mark\_restore`,
+  which needs `extra\-\>inner\_unique`\.
+  - Hypothesis: PG\'s `query\_is\_distinct\_for` needs every GROUP BY column \(`d\_year`, `\*\_item\_sk`,
+    `\*\_customer\_sk`\) among the join clauses\. `d\_year` became a constant restriction through its
+    equivalence class, so PG finds the inner not unique\. goopg\'s inner\-unique proof apparently accepts it\.
+  Kind: impl
+  Parent: M0146\-0100
+  - First step: print `mergeInnerFor`\'s `skipMarkRestore` / innerUnique for Q78\'s two merges and diff
+    goopg\'s grouped\-subquery uniqueness test against `query\_is\_distinct\_for` \(analyzejoins\.c\)\.
