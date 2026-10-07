@@ -1646,6 +1646,15 @@ type Aggregate struct {
 	// carry it (PG forces the rollup order there).
 	GroupClause []GroupClauseKey
 
+	// PrunedGroupInputs are the input-column indices of the GROUP BY items
+	// that remove_useless_groupby_columns and the redundant-pathkey filter
+	// (groupkeyconst.go) dropped from GroupExprs, ascending. The aggregate
+	// no longer groups on them, but PG's query_is_distinct_for still reads
+	// the subquery's ORIGINAL groupClause, so a uniqueness proof over this
+	// node needs them equated too (groupedLeafDistinctFor, M0146-0101). A
+	// pruned column the query reads reaches the output as a Passthrough.
+	PrunedGroupInputs []int
+
 	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
 	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
 	// child-output positions of the group-input columns (group keys ∪

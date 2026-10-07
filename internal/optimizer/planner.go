@@ -9957,6 +9957,14 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		// EXPLAIN-only: the GROUPING(...) arguments' group slots.
 		GroupingMaskSlots: groupingMaskSlots,
 	}
+	// M0146-0101: the GROUP BY items pruned above, for the uniqueness proof.
+	if len(prunedInputCols) > 0 {
+		aggNode.PrunedGroupInputs = make([]int, 0, len(prunedInputCols))
+		for k := range prunedInputCols {
+			aggNode.PrunedGroupInputs = append(aggNode.PrunedGroupInputs, k)
+		}
+		sort.Ints(aggNode.PrunedGroupInputs)
+	}
 	// M0145-0008d: processed_groupClause (groupclause.go). Grouping sets and
 	// the default order leave it nil.
 	if gsSets == nil && groupOrigIdx != nil && len(groupOrigIdx) == len(groupExprs) {

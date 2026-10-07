@@ -287,7 +287,7 @@ func groupedLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
 					return false
 				}
 			}
-			return true
+			return prunedGroupKeysEquated(x, equated)
 		case *Distinct:
 			for i := range x.Output() {
 				if !equated[i] {
@@ -303,4 +303,37 @@ func groupedLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
 		}
 	}
 	return false
+}
+
+// prunedGroupKeysEquated reports whether every GROUP BY item the planner
+// pruned from agg's keys (Aggregate.PrunedGroupInputs) is equated too.
+// query_is_distinct_for (analyzejoins.c) tests the subquery's ORIGINAL
+// groupClause — rel_is_distinct_for reads the range table's subquery, not
+// the planned copy that remove_useless_groupby_columns and
+// processed_groupClause trimmed — so a key dropped as constant-pinned (TPC-DS
+// Q78's d_year, fixed to 1998) or as functionally dependent still has to
+// appear in the join clauses. A pruned column reaches the output only as a
+// Passthrough, which the executor appends at the row's tail; a pruned column
+// the query never reads cannot be equated, and the proof fails, as in PG.
+func prunedGroupKeysEquated(agg *Aggregate, equated map[int]bool) bool {
+	if len(agg.PrunedGroupInputs) == 0 {
+		return true
+	}
+	base := len(agg.Output()) - len(agg.Passthrough)
+	if base < 0 {
+		return false
+	}
+	for _, in := range agg.PrunedGroupInputs {
+		found := false
+		for k, pe := range agg.Passthrough {
+			if cr, ok := pe.(*ColumnRef); ok && cr.Index == in && equated[base+k] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
