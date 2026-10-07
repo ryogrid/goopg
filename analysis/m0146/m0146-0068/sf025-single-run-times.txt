@@ -1,0 +1,83 @@
+fires=83 timed=82 total base=334.9s cand=335.7s ratio=1.00
+Q64   base=   1.39s mult1=   3.78s x 2.73 REGRESS
+Q17   base=   0.50s mult1=   0.85s x 1.68 REGRESS
+Q95   base=   4.65s mult1=   7.41s x 1.59 REGRESS
+Q25   base=   0.47s mult1=   0.64s x 1.37 
+Q83   base=   1.47s mult1=   1.75s x 1.19 
+Q23   base=  12.00s mult1=  14.10s x 1.17 REGRESS
+Q42   base=   0.28s mult1=   0.33s x 1.15 
+Q90   base=   0.21s mult1=   0.24s x 1.14 
+Q96   base=   0.24s mult1=   0.28s x 1.13 
+Q91   base=   0.09s mult1=   0.10s x 1.12 
+Q29   base=   0.37s mult1=   0.41s x 1.11 
+Q84   base=   0.10s mult1=   0.12s x 1.10 
+Q94   base=   0.17s mult1=   0.19s x 1.10 
+Q77   base=   0.67s mult1=   0.74s x 1.10 
+Q55   base=   0.05s mult1=   0.06s x 1.08 
+Q63   base=   0.24s mult1=   0.26s x 1.08 
+Q49   base=   0.07s mult1=   0.07s x 1.07 
+Q82   base=   0.62s mult1=   0.66s x 1.07 
+Q92   base=   0.11s mult1=   0.12s x 1.07 
+Q13   base=   0.38s mult1=   0.40s x 1.06 
+Q76   base=   0.31s mult1=   0.33s x 1.06 
+Q30   base=   1.91s mult1=   2.02s x 1.05 
+Q5    base=   1.11s mult1=   1.16s x 1.05 
+Q89   base=   0.31s mult1=   0.32s x 1.05 
+Q71   base=   0.61s mult1=   0.64s x 1.04 
+Q34   base=   0.28s mult1=   0.29s x 1.04 
+Q56   base=   0.44s mult1=   0.46s x 1.04 
+Q61   base=   0.44s mult1=   0.46s x 1.04 
+Q18   base=   0.48s mult1=   0.50s x 1.04 
+Q44   base=   0.78s mult1=   0.81s x 1.04 
+Q45   base=   0.18s mult1=   0.18s x 1.04 
+Q26   base=   0.39s mult1=   0.40s x 1.03 
+Q33   base=   0.60s mult1=   0.62s x 1.03 
+Q85   base=   0.22s mult1=   0.23s x 1.03 
+Q75   base=   1.07s mult1=   1.10s x 1.03 
+Q69   base=   0.70s mult1=   0.72s x 1.03 
+Q52   base=   0.25s mult1=   0.26s x 1.03 
+Q88   base=   1.93s mult1=   1.98s x 1.03 
+Q22   base=   1.32s mult1=   1.36s x 1.02 
+Q66   base=   1.13s mult1=   1.16s x 1.02 
+Q80   base=   0.67s mult1=   0.68s x 1.02 
+Q58   base=   1.25s mult1=   1.28s x 1.02 
+Q35   base=   0.69s mult1=   0.70s x 1.02 
+Q3    base=   0.03s mult1=   0.03s x 1.02 
+Q87   base=   1.39s mult1=   1.41s x 1.02 
+Q19   base=   0.28s mult1=   0.28s x 1.02 
+Q65   base=   0.98s mult1=   0.99s x 1.02 
+Q53   base=   0.27s mult1=   0.28s x 1.02 
+Q37   base=   0.03s mult1=   0.03s x 1.01 
+Q98   base=   0.28s mult1=   0.28s x 1.01 
+Q47   base=   2.11s mult1=   2.13s x 1.01 
+Q21   base=   0.54s mult1=   0.54s x 1.01 
+Q78   base=   2.59s mult1=   2.60s x 1.01 
+Q74   base=  35.17s mult1=  35.33s x 1.00 
+Q73   base=   0.27s mult1=   0.27s x 1.00 
+Q67   base=   4.10s mult1=   4.10s x 1.00 
+Q72   base= 174.44s mult1= 173.59s x 1.00 
+Q14   base=  38.61s mult1=  38.42s x 1.00 
+Q54   base=   1.02s mult1=   1.01s x 0.99 
+Q57   base=   1.07s mult1=   1.06s x 0.99 
+Q60   base=   0.65s mult1=   0.64s x 0.99 
+Q20   base=   0.22s mult1=   0.21s x 0.98 
+Q46   base=   0.51s mult1=   0.50s x 0.98 
+Q50   base=   0.08s mult1=   0.08s x 0.97 
+Q15   base=   0.24s mult1=   0.23s x 0.97 
+Q32   base=   0.23s mult1=   0.22s x 0.97 
+Q39   base=   2.99s mult1=   2.89s x 0.96 
+Q79   base=   0.51s mult1=   0.49s x 0.96 
+Q48   base=   0.45s mult1=   0.43s x 0.96 
+Q16   base=   0.95s mult1=   0.90s x 0.95 
+Q27   base=   0.68s mult1=   0.64s x 0.94 
+Q93   base=   0.04s mult1=   0.04s x 0.94 
+Q40   base=   0.26s mult1=   0.24s x 0.93 
+Q7    base=   0.64s mult1=   0.60s x 0.93 
+Q10   base=   1.45s mult1=   1.35s x 0.93 
+Q12   base=   0.14s mult1=   0.13s x 0.93 
+Q68   base=   0.36s mult1=   0.34s x 0.92 
+Q8    base=   2.32s mult1=   2.11s x 0.91 
+Q81   base=  11.24s mult1=   9.21s x 0.82 faster
+Q24   base=   0.12s mult1=   0.06s x 0.48 
+Q38   base=   3.77s mult1=   1.42s x 0.38 faster
+Q6    base=   2.74s mult1=   0.44s x 0.16 faster

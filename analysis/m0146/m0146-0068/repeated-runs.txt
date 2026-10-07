@@ -1,0 +1,12 @@
+# M0146-0068 repeated A/B (3 alternating rounds per arm, fresh private clone per round,
+# Q96 run first in each round to absorb warm-up; elapsed = result-file mtime deltas).
+# baseline = GOOPG_INDEX_PROBE_MULT unset (2); mult1 = GOOPG_INDEX_PROBE_MULT=1. Same engine (a914aa2a7136).
+== tpcds-sf025
+Q17: base 0.63 0.63 0.64 med 0.63s | mult1 1.11 0.99 0.95 med 0.99s | x1.56   CONFIRMED regression (PG-shaped)
+Q81: base 13.79 9.72 9.63 med 9.72s | mult1 10.65 10.53 13.69 med 10.65s | x1.10  noise band
+== tpcds-sf1
+Q32: base 1.23 1.13 1.03 med 1.13s | mult1 1.06 3.97 1.03 med 1.06s | x0.94    single-run 4.4x was noise
+Q54: base 3.73 2.38 2.01 med 2.38s | mult1 5.29 5.53 5.14 med 5.29s | x2.22    CONFIRMED regression (parallelism lost)
+Q68: base 1.43 1.39 1.41 med 1.41s | mult1 1.53 1.47 1.37 med 1.47s | x1.05    single-run 2.6x was noise
+Q71: base 1.85 1.80 1.79 med 1.80s | mult1 2.28 2.42 2.25 med 2.28s | x1.27    CONFIRMED regression (PG-shaped)
+Q18: base 5.18 2.11 5.10 med 5.10s | mult1 3.39 1.69 4.45 med 3.39s | x0.66    faster (noisy)

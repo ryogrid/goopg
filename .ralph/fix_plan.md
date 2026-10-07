@@ -29457,7 +29457,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     phnullingrels\) evaluated at its eval\_at level, the way
     `add\_placeholders\_to\_base\_rels` / `fix\_placeholder\_input\_needed\_levels`
     place it\.
-- [ ] **M0146\-0068 — B8 measurement: `indexProbeCostMultiplier` knob A/B
+- [x] **M0146\-0068 — B8 measurement: `indexProbeCostMultiplier` knob A/B
   \(1 vs 2\) over the corpus** \(filed 2026\-10\-06 by owner decision — see
   OWNER DECISIONS 2026\-10\-06\)\. The 2026\-09\-24 park on the B8 probe\-cost
   chain \(mult=1 elects PG\-shaped NL plans that measured 2–3x slower; Q14
@@ -29480,3 +29480,44 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   - First step: reproduce the existing single\-query numbers \(Q14 at SF1,
     the d3 probe\-cost reproducer\) under both knob values on a private
     lane before the corpus run\.
+  - Done 2026\-10\-07 \(recon, no code; design
+    `docs/design/0100\-0149/m0146\-0068\-index\-probe\-mult\-corpus\-ab\.md`,
+    evidence `analysis/m0146/m0146\-0068/`\):
+    - Shapes move toward PG on every corpus at mult=1: match SF0\.25
+      42→52, SF1 33→34, TPC\-H 12→14; SF1 parallelism 42→44 and sort
+      28→30 get worse\.
+    - Runtime totals flat \(SF0\.25 ×1\.00, SF1 ×1\.02, TPC\-H ×0\.94\);
+      TPC\-H value digests identical\. Single runs are noisy \(skeleton\-
+      identical fires moved up to 3x\); every skeleton\-changed mover beyond
+      ±10% was re\-run 3× per arm\.
+    - Confirmed regressions: SF0\.25 Q17 ×1\.56 and SF1 Q71 ×1\.27 \(mult=1
+      elects exactly PG\'s plan; goopg runs the parameterised probe slower\),
+      SF1 Q54 ×2\.22 \(parallelism lost — M0146\-0049e\)\. Q14 does not move\.
+    - Pre\-authorised retirement condition fails → narrowed\-window proposal
+      written \(options A/B/C in the design doc\); filed M0146\-0088 for the
+      probe\-runtime substrate\.
+  > ## ESCALATION 2026\-10\-07 \(recon outcome\) — choose the multiplier\'s fate
+  > The corpus A/B fails the pre\-authorised condition on three witnesses
+  > \(Q17, Q71, Q54\), but two of them regress because goopg runs PG\'s own
+  > plan slower, and the third is M0146\-0049e\'s missing parallel shape\.
+  > Recommended: **Option A** — retire the multiplier \(\+13 plan matches,
+  > runtime totals flat\) and work M0146\-0088 \+ 0049e for the three
+  > regressions\. Option B \(keep 2 for serial\-side probes only\) and C \(keep
+  > the park\) are written up in the design doc\. Owner: pick one; the park
+  > stays in force until then\.
+Movement: none — recon; no production change \(knob A/B measurement only\)
+- [ ] **M0146\-0088 — goopg\'s parameterised index probe runs ~1\.3–1\.6x slower
+  than the same PG\-shaped plan needs** \(filed 2026\-10\-07 by M0146\-0068\)\.
+  With `GOOPG_INDEX_PROBE_MULT=1` goopg elects exactly PG\'s plan for TPC\-DS
+  SF0\.25 Q17 \(catalog\_sales index probe in a serial NL above the Gather
+  Merge\) and SF1 Q71 \(NL \+ Index Scan item\_pkey\), and those run ×1\.56 /
+  ×1\.27 slower than the parallel / hash shapes mult=2 elects
+  \(`analysis/m0146/m0146\-0068/repeated\-runs\.txt`\)\. Per\-probe cost was
+  measured at 0\.067 ms vs PG 0\.041 ms \(M0145\-0008af\)\. This executor gap
+  is what `indexProbeCostMultiplier` was calibrated to hide\.
+  Kind: impl
+  Parent: M0146\-0068
+  - First step: EXPLAIN ANALYZE Q17 \(SF0\.25, mult=1\) on goopg and PG side
+    by side; profile the inner Index Scan rescan \(btree descent, heap
+    fetch, slot materialisation, per\-loop executor setup\) with pprof on a
+    private clone, and compare per\-loop time against PG\'s actual loop time\.
