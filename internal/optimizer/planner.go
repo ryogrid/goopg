@@ -6377,12 +6377,24 @@ func derivedSubqueryNeedsScan(s *parser.SelectStmt, inner Node) bool {
 // node matching want. Children come from planChildNodes' reflection over
 // exported Node fields, so the walk stays correct for node kinds it does
 // not name. M0146-0005w.
+//
+// M0146-0097: the walk stays at the subquery's own query level, as
+// is_simple_subquery's hasAggs / hasWindowFuncs / hasTargetSRFs do. A nested
+// FROM subquery kept as a subquery (its SubqueryScan), a CTE body and a set
+// operation's arms are levels of their own: an aggregate or window inside one
+// of them does not make this subquery non-simple. (TPC-DS Q44's `asceding`
+// selects * from a ranked derived table; PG pulls it up, and goopg wrapped it
+// because the window sat one level down.)
 func subqueryPlanContains(n Node, want func(Node) bool) bool {
 	if n == nil {
 		return false
 	}
 	if want(n) {
 		return true
+	}
+	switch n.(type) {
+	case *SubqueryScan, *CTEScan, *SetOp:
+		return false
 	}
 	kids, ok := planChildNodes(n)
 	if !ok {

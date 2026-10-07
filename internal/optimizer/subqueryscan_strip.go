@@ -182,6 +182,13 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 			r := inner
 			o := kidsOuter
 			p := childPhysical
+			if j, isJoin := n.(*Join); isJoin && j.Algo == JoinAlgoHash && k == hashJoinBuildChild(j) {
+				// M0146-0097: create_hashjoin_plan plans the hashed input
+				// with CP_SMALL_TLIST (its Hash node), so a leaf there keeps
+				// the pathtarget regime; the outer side stays physical (0)
+				// for a one-batch join.
+				p = false
+			}
 			kpath := append(path, n)
 			if r != region {
 				// Region boundary — derived body, CTEScan body or
@@ -385,6 +392,15 @@ func subqueryStripSpineBreaker(n Node) bool {
 		return true
 	}
 	return false
+}
+
+// hashJoinBuildChild is the input a hash join builds its table from — the
+// child PG plans under the Hash node (EXPLAIN's hashBuildChild rule).
+func hashJoinBuildChild(j *Join) Node {
+	if j.BuildLeft {
+		return j.Left
+	}
+	return j.Right
 }
 
 // subqueryStripTlistReset reports whether this node hands its children
