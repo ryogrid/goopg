@@ -2478,7 +2478,9 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 	// Binary search across line pointers.
 	n := count
 	idx := sort.Search(n, func(i int) bool {
-		raw, err := pgGetItemRawAllowDead(p, uint16(i+1)) // C3-S1: dead items keep ordering bytes
+		// C3-S1: dead items keep ordering bytes. NoCopy (M0146-0088): the
+		// page is latched for the whole call and the probe only compares.
+		raw, err := pgGetItemRawAllowDeadNoCopy(p, uint16(i+1))
 		if err != nil {
 			return true // will surface at the final error check
 		}
@@ -2497,7 +2499,7 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 		idx--
 	}
 	// idx==0 stays 0: first child.
-	raw, err := pgGetItemRawAllowDead(p, uint16(idx+1)) // C3-S1
+	raw, err := pgGetItemRawAllowDeadNoCopy(p, uint16(idx+1)) // C3-S1; only the child block escapes
 	if err != nil {
 		return 0, err
 	}
@@ -4194,7 +4196,7 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 		return false, nil
 	}
 	pageLSN := storage.MustHeader(slot.Page()).LSN()
-	for s := uint16(1); s <= uint16(count); s++ {
+	for s := bt.leafScanStart(slot.Page(), count, lo, loExclusive); s <= uint16(count); s++ {
 		// M0091-0002: NoCopy aliases the still-pinned
 		// page; we never retain it past `fn`'s return,
 		// and the pin is held across this whole loop.
@@ -4290,6 +4292,72 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 		}
 	}
 	return false, nil
+}
+
+// leafBinarySearch gates leafScanStart (M0146-0088); the equivalence test
+// flips it to compare the binary-search start against the linear walk.
+var leafBinarySearch = true
+
+// leafScanStartMinItems is the item count below which a linear walk from
+// slot 1 is as cheap as the binary search.
+const leafScanStartMinItems = 8
+
+// leafScanStart returns the first data slot scanLeafItems has to examine for
+// the lower bound lo — _bt_binsrch's role in _bt_first/_bt_readpage
+// (nbtsearch.c), which binary-searches the leaf for the first item >= the scan
+// key instead of comparing every item from the left (M0146-0088).
+//
+// The test is scanLeafItems' own skip predicate: compare(key, lo) < 0 for an
+// inclusive bound, compareHigh(key, lo) <= 0 for an exclusive one. Both use the
+// index's comparator, and a leaf's items are in that order, so the predicate is
+// true for a prefix of the slots and false after it. The loop starting at the
+// returned slot therefore yields exactly the entries a walk from slot 1 would.
+// An LP_DEAD item keeps its key and its place in that order and is read with
+// AllowDead for the comparison (the scan loop still skips it). Any item the
+// search cannot read or parse makes it fall back to slot 1.
+func (bt *BTree) leafScanStart(p storage.Page, count int, lo []byte, loExclusive bool) uint16 {
+	if lo == nil || !leafBinarySearch || count < leafScanStartMinItems {
+		return 1
+	}
+	f := bt.format()
+	skip := func(s int) (skipped, ok bool) {
+		r, err := pgGetItemRawAllowDeadNoCopy(p, uint16(s))
+		if err != nil {
+			return false, false
+		}
+		var key []byte
+		if isPostingRaw(r) {
+			k, _, perr := f.parsePostingRaw(r)
+			if perr != nil {
+				return false, false
+			}
+			key = k
+		} else {
+			it, perr := f.parseNoCopy(r)
+			if perr != nil {
+				return false, false
+			}
+			key = it.key
+		}
+		if loExclusive {
+			return f.compareHigh(key, lo) <= 0, true
+		}
+		return f.compare(key, lo) < 0, true
+	}
+	low, high := 1, count+1 // first slot in [low, high) that is not skipped
+	for low < high {
+		mid := int(uint(low+high) >> 1)
+		skipped, ok := skip(mid)
+		if !ok {
+			return 1
+		}
+		if skipped {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	return uint16(low)
 }
 
 // ScanCursor is a resumable, leaf-grain range scan (M0142-0005b): where
