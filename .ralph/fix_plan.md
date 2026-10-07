@@ -29758,7 +29758,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     nothing\), guarded by tlist\_same\_datatypes and a plain\-member rule\. Regress union diff 352→343, tenk1
     constraint\-exclusion case = PG\. Design: `docs/design/0100\-0149/m0146\-0094\-union\-all\-restriction\-pushdown\.md`\.
   Movement: none — instrument artefact — no TPC\-DS/TPC\-H query restricts a UNION ALL leaf; regress union diff 352→343\.
-- [ ] **M0146\-0095 — a build\-filling Parallel Hash join refuses a spilled share** \(filed
+- [x] **M0146\-0095 — a build\-filling Parallel Hash join refuses a spilled share** \(filed
   2026\-10\-07 by M0146\-0090\)\. RIGHT, FULL, RIGHT SEMI and RIGHT ANTI Parallel Hash joins still fail
   `… of a join that fills its build side is not supported` when a participant\'s share outgrows
   hash\_mem\. Batches past 0 are probed by every participant with its own probe rows, so the batch\-k
@@ -29770,6 +29770,10 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     underestimated build\-filling join\.
   - First step: extend `probeDetach`\'s merge to every batch — participants hand their batch\-k
     matched bits \(or their batch\-k probe files\) to the shared state and the last one sweeps\.
+  - Done 2026\-10\-08 \(2f2eadcee\): at batch\-0 detach every participant hands its later\-batch probe files to
+    the shared state; the sweeper replays them with its own for batches 1\.\.n\-1, so its per\-batch matched bits
+    are complete; the refusal is gone\. Design: `docs/design/0100\-0149/m0146\-0095\-parallel\-hash\-fill\-build\-batches\.md`\.
+  Movement: none — correctness fix — no plan instrument \(spilled RIGHT/FULL Parallel Hash: error → serial rows\)\.
 - [ ] **M0146\-0096 — the PH4 veto keeps Parallel Hash off inners estimated to spill** \(filed
   2026\-10\-07 by M0146\-0090\)\. `addParallelHashJoinPath` refuses a build that does not fit one
   batch \(`PH4\-batches`\); PG costs the batches and elects Parallel Hash anyway \(regress join\_hash
