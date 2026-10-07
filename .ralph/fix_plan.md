@@ -28267,7 +28267,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
       oid\)`, trigger durability\) are held in the M0146\-0055 escalation:
       the lineage guard refused them as descendants\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0083 — WRONG RESULTS: constraint\-violation DETAIL renders
+- [x] **M0146\-0083 — WRONG RESULTS: constraint\-violation DETAIL renders
   dates in MDY order** \(filed 2026\-10\-07 by M0146\-0075\)\. `CREATE TABLE
   dz \(a int NOT NULL, d date DEFAULT \'2020\-01\-02\'\); INSERT INTO dz \(d\)
   VALUES \(DEFAULT\)` reports `DETAIL: Failing row contains \(null,
@@ -28282,6 +28282,35 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     wire uses \(the fkValsForDetail DateStyle fix is a precedent\) and check
     timestamp/numeric/float/bytea cells too; every NOT NULL / CHECK /
     unique DETAIL site goes through formatRowForDetail\.
+  - Done 2026\-10\-07 \(`1e4427fab`; design
+    `docs/design/0100\-0149/m0146\-0083\-constraint\-detail\-type\-output\.md`\):
+    - `detailValueText` renders every DETAIL value through
+      `datumToCopyText` under the session DateStyle / TimeZone /
+      bytea\_output; NOT NULL, CHECK, unique, exclusion and FK builders use it\.
+    - The unique DETAIL is now built lazily \(it was built for every insert
+      into a unique index\)\.
+    - COPY TO of interval columns failed `kind 6 cannot encode as interval`;
+      fixed with the missing arm\.
+    - Filed M0146\-0087 \(numeric\(p,s\) typmod not applied on INSERT/UPDATE\)\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
+- [ ] **M0146\-0087 — WRONG RESULTS: `numeric\(p,s\)` columns do not apply their
+  typmod on INSERT/UPDATE** \(filed 2026\-10\-07 by M0146\-0083\)\. `CREATE TABLE
+  nt \(n numeric\(6,2\), m numeric\(4,1\)\); INSERT INTO nt VALUES \(2\.5, 1\.26\),
+  \(\'3\', 7\); SELECT \* FROM nt` returns `2\.5\|1\.26`, `3\|7`; PG 18\.3
+  returns `2\.50\|1\.3`, `3\.00\|7\.0` \(the column typmod rounds and pads
+  the stored value — numeric\(\) / apply\_typmod in numeric\.c, applied by the
+  INSERT/UPDATE target list coercion\)\. `UPDATE nt SET n = 1\.234` stores
+  `1\.234` \(PG `1\.23`\)\. An explicit `2\.5::numeric\(6,2\)` is correct\.
+  The constraint DETAIL inherits it \(`1\.5` vs PG `1\.50`\)\.
+  Kind: bug
+  Parent: M0146\-0083
+  > ## ESCALATION 2026\-10\-07 \(S2\) — numeric\(p,s\) columns store unrounded values
+  > Filed by M0146\-0083, not worked\. Owner: place M0146\-0087 in the banner\.
+  - First step: find where INSERT/UPDATE coerce a value to the column type
+    \(the target\-list coercion before `checkRowConstraintsForWrite`\) and
+    apply the column\'s numeric typmod as the cast path does
+    \(`resolveNumericTypmodCast`\); check DEFAULTs, COPY FROM, numeric\(p\)
+    with no scale, and the overflow error \(22003 `numeric field overflow`\)\.
 - [ ] **M0146\-0084 — WRONG RESULTS: regress polymorphism\'s `testpolym`
   lookup fails depending on session state** \(filed 2026\-10\-07 by
   M0146\-0080\)\. `select \* from testpolym\(37\)` \(polymorphism\.sql:930\)
