@@ -1541,8 +1541,55 @@ func lateralProbeIsPartialProbe(n Node) bool {
 			return false
 		}
 		return x.Key != nil || len(x.Keys) > 0
+	case *SetOp:
+		// M0146-0049e: a parameterised Append (createParamAppendNode) — a
+		// UNION ALL whose every member is a bare probe re-opened per outer
+		// row. Each worker re-opens all members for its own outer rows; the
+		// members take no claim (every claim walk descends this join's Left
+		// only) and an inner bitmap member builds its private TIDBitmap per
+		// rescan, as the fused NLI bitmap probe does (slice 27). PG's Q54
+		// runs this shape: Gather → NL(Parallel Seq Scan item, Append(…)).
+		return paramAppendIsPartialProbe(x)
 	}
 	return false
+}
+
+// paramAppendIsPartialProbe reports whether n is a UNION ALL tree whose
+// members (under their Project/Filter wrappers, paramAppendProbes) are all
+// bare index probes or bitmap probes (nliBitmapProbeIsPartialProbe).
+func paramAppendIsPartialProbe(so *SetOp) bool {
+	if so == nil || so.Op != parser.SetOpUnion || !so.All {
+		return false
+	}
+	var ok func(n Node) bool
+	ok = func(n Node) bool {
+		switch x := n.(type) {
+		case *SetOp:
+			return x.Op == parser.SetOpUnion && x.All && ok(x.Left) && ok(x.Right)
+		case *Project:
+			return ok(x.Child)
+		case *Filter:
+			return ok(x.Child)
+		case *IndexScan, *IndexOnlyScan:
+			return lateralProbeIsPartialProbe(x)
+		case *BitmapHeapScan:
+			return nliBitmapProbeIsPartialProbe(x)
+		}
+		return false
+	}
+	return ok(so)
+}
+
+// LateralParamAppendProbe reports whether j is an admitted partial lateral
+// nested loop whose inner is a parameterised Append. Its inner may hold
+// bitmap probes: they are worker-private (no claim, no shared bitmap), so the
+// executor's claim walks admit them for this shape (M0146-0049e).
+func LateralParamAppendProbe(j *Join) bool {
+	if !lateralProbeJoinIsPartialCapable(j) {
+		return false
+	}
+	_, ok := j.Right.(*SetOp)
+	return ok
 }
 
 // lateralProbeJoinIsPartialCapable states which lateral-probe nested loops

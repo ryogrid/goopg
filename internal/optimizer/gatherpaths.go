@@ -591,6 +591,22 @@ func partialProbeNestLoopJointype(t parser.JoinType) bool {
 }
 
 // refusal must be visible where it is decided, not implicit in a missing case.
+// paramProbePathIsPartialProbe is the per-member probe test of the
+// PathParamAppend arm below: a parameterised index probe carrying index
+// clauses, or a bitmap heap probe over exactly one bitmap index path.
+func paramProbePathIsPartialProbe(c *Path) bool {
+	if c == nil || len(c.IndexClauses) == 0 || c.RequiredOuter == 0 {
+		return false
+	}
+	switch c.Kind {
+	case PathIndexScan:
+		return true
+	case PathBitmapHeapScan:
+		return len(c.Children) == 1 && c.Children[0] != nil && c.Children[0].Kind == PathBitmapIndexScan
+	}
+	return false
+}
+
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
 		return PathPrebuilt
@@ -819,6 +835,26 @@ func partialPathDrivingKind(p *Path) PathKind {
 		// Memoize-wrapped bitmap stays refused: createPlan's unwrap hands
 		// the child straight to createNestLoopBitmapJoinPlan, which would
 		// drop the cache the path was priced with.
+		// M0146-0049e: a parameterised Append whose every member is one of
+		// the admitted probes below (createParamAppendNode's shape; the node
+		// twin is paramAppendIsPartialProbe). Not Memoize-wrapped.
+		if probe != nil && probe.Kind == PathParamAppend {
+			if probe != in || len(probe.Children) == 0 {
+				return PathPrebuilt
+			}
+			for _, c := range probe.Children {
+				if !paramProbePathIsPartialProbe(c) {
+					return PathPrebuilt
+				}
+			}
+			if p.OuterRelids == 0 || p.InnerRelids == 0 {
+				return PathPrebuilt
+			}
+			if req := calcNestloopRequiredOuter(p.OuterRelids, o.RequiredOuter, p.InnerRelids, in.RequiredOuter); req != 0 {
+				return PathPrebuilt
+			}
+			return partialPathDrivingKind(o)
+		}
 		if probe == nil || len(probe.IndexClauses) == 0 {
 			return PathPrebuilt
 		}

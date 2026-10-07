@@ -125,6 +125,15 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 	}
 	switch inner.(type) {
 	case *indexScanOp, *indexOnlyScanOp:
+	case *setOp:
+		// M0146-0049e: the parameterised Append (planner twin
+		// paramAppendIsPartialProbe). Every member re-opens per
+		// worker-local outer row through ctx.OuterRows, as in serial
+		// execution; no claim walk descends the join's right side, so the
+		// members' scans stay private to the worker.
+		if !optimizer.LateralParamAppendProbe(p) || !paramAppendOpsArePartialProbes(inner) {
+			return false
+		}
 	default:
 		return false
 	}
@@ -132,6 +141,26 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 		return false
 	}
 	return true
+}
+
+// paramAppendOpsArePartialProbes is the built-tree half of the
+// parameterised-Append admission: below the UNION ALL operators and their
+// row-wise wrappers every leaf is an index or bitmap probe operator.
+func paramAppendOpsArePartialProbes(op Operator) bool {
+	switch x := op.(type) {
+	case *setOp:
+		return x.left != nil && x.right != nil &&
+			paramAppendOpsArePartialProbes(x.left) && paramAppendOpsArePartialProbes(x.right)
+	case *projectOp:
+		return paramAppendOpsArePartialProbes(x.child)
+	case *filterOp:
+		return paramAppendOpsArePartialProbes(x.child)
+	case *instrumentedOp:
+		return paramAppendOpsArePartialProbes(x.inner)
+	case *indexScanOp, *indexOnlyScanOp, *bitmapHeapScanOp:
+		return true
+	}
+	return false
 }
 
 // parallelScanState is the work queue for one parallel sequential scan node.
@@ -256,7 +285,10 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelScan(x.left, st)
@@ -390,7 +422,10 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelBitmapScan(x.left, st)
@@ -568,7 +603,10 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelIndexScan(x.left, st)

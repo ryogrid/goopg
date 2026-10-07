@@ -189,6 +189,10 @@ func (s *searchCtx) paramAppendPathFor(rel *RelOptInfo, so *SetOp, members []Nod
 		}
 		member := newRelOptInfo(rel.Relids, float64(EstimateRows(base)), rel.Width)
 		member.baseLeaf = base
+		// An appendrel child gets its own set_rel_consider_parallel
+		// (allpaths.c:589), bounded by the parent's: the member probes are
+		// then parallel-safe exactly when PG's would be (M0146-0049e).
+		member.ConsiderParallel = rel.ConsiderParallel && relConsiderParallel(base, tbl, cat)
 		// A member's needed columns are its projection's, not the
 		// statement's: the statement-wide set cannot attribute them, so the
 		// index-only arm is kept out of member probes (ledgered).
@@ -236,6 +240,12 @@ func (s *searchCtx) paramAppendPathFor(rel *RelOptInfo, so *SetOp, members []Nod
 		Children:      children,
 		RequiredOuter: req,
 		paramAppend:   info,
+		// create_append_path (pathnode.c:1339, :1380): parallel-safe when the rel
+		// considers parallelism and every subpath is parallel-safe. Left
+		// false, the partial nested loop refused this inner (V7), so PG's
+		// Q54 Gather → NL(Parallel Seq Scan item, Append(probes)) could not
+		// form (M0146-0049e).
+		ParallelSafe: parallelSafeWith(rel, children...),
 	}
 	p.Cost.Startup = children[0].Cost.Startup
 	for _, c := range children {
