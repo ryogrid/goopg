@@ -28209,7 +28209,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     - Filed M0146\-0084 \(testpolym lookup depends on state\); ledgered
       the PL/pgSQL decoration, nested\-block, typmod and wire\-type gaps\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0081 — WRONG RESULTS: a writable\-CTE INSERT reports the
+- [x] **M0146\-0081 — WRONG RESULTS: a writable\-CTE INSERT reports the
   command tag `SELECT 0`** \(filed 2026\-10\-07 by M0146\-0076\)\. `WITH d
   AS \(DELETE FROM t WHERE a = 6 RETURNING a\) INSERT INTO t SELECT a \+ 100
   FROM d` reports `SELECT 0`; PG 18\.3 reports `INSERT 0 1` \(the
@@ -28223,6 +28223,20 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     `internal/postmaster`: check which plan node a WITH\-led INSERT
     produces \(likely a CTE wrapper over the Insert\) and unwrap it to the
     top\-level DML node and its RowCounter\.
+  - Done 2026\-10\-07 \(`caed28ea6`; design
+    `docs/design/0100\-0149/m0146\-0081\-writable\-cte\-tag\-and\-plpgsql\-row\-count\.md`\):
+    - `commandTagFor` takes a `CTEDMLPrefix`\'s Body tag; `cteDMLPrefixOp`
+      and `stmtCTEScopeOp` forward `RowsAffected`\.
+    - PL/pgSQL FOUND counted output rows, so DML without RETURNING left it
+      false; it now uses the processed count, SELECT INTO sets it, and the
+      frame keeps `rowCount` \(eval\_processed\)\.
+    - Added GET \[CURRENT\|STACKED\] DIAGNOSTICS \(ROW\_COUNT, PG\_ROUTINE\_OID,
+      RETURNED\_SQLSTATE, MESSAGE\_TEXT, DETAIL, HINT\); context and
+      object\-name items raise 0A000 \(ledgered\)\.
+    - Regress plpgsql 4189→4102, merge 1674→1587\.
+    - Filed M0146\-0085 \(WITH … MERGE syntax error\) and M0146\-0086
+      \(`text \|\| bool` prints `t`\)\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0082 — WRONG RESULTS: ALTER TABLE … DISABLE TRIGGER is not
   honoured** \(filed 2026\-10\-07 by M0146\-0076\)\. After `alter table
   trigtest disable trigger trigtest_b_row_tg` \(or `disable trigger user` /
@@ -28270,6 +28284,33 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     fresh clusters and diff the pg\_proc rows for testpolym \(overload set,
     proargtypes, proretset\) and the search\_path between a passing and a
     failing run\.
+- [ ] **M0146\-0085 — `WITH … MERGE` is a syntax error** \(filed 2026\-10\-07
+  by M0146\-0081\)\. `WITH s AS \(SELECT 8 AS a\) MERGE INTO t USING s ON
+  t\.a = s\.a WHEN MATCHED THEN UPDATE SET a = 80` fails `syntax error at or
+  near "merge"`; PG 18\.3 \(gram\.y MergeStmt: opt\_with\_clause\) runs it and
+  reports `MERGE 1`\. Repro `tmp/m81\.sql` line 11\.
+  Kind: bug
+  Parent: M0146\-0081
+  > ## ESCALATION 2026\-10\-07 \(S2\) — a WITH clause cannot lead MERGE
+  > Filed by M0146\-0081, not worked\. Owner: place M0146\-0085 in the banner\.
+  - First step: read `docs/design/not\_ralph/06\-goyacc\-parser\-playbook\.md`
+    §12, then add `opt\_with\_clause` to the MergeStmt rule in `grammar/`
+    and carry the CTE list into the Merge plan \(the CTEDMLPrefix / CTE
+    scope path the other DML statements use\); `make gen\-parser`\.
+- [ ] **M0146\-0086 — WRONG RESULTS: `text \|\| bool` renders the bool as
+  `t`/`f`** \(filed 2026\-10\-07 by M0146\-0081\)\. `SELECT \'x\' \|\| true`
+  returns `xt`; PG 18\.3 returns `xtrue`\. PG\'s `anytextcat` /
+  `textanycat` are SQL functions `$1::text \|\| $2`, so the non\-text operand
+  goes through its cast to text \(booltext → `true`\), not its output
+  function\. The same in PL/pgSQL \(`t := \'x\' \|\| b`\)\.
+  Kind: bug
+  Parent: M0146\-0081
+  > ## ESCALATION 2026\-10\-07 \(S2\) — text concatenation with a bool prints t/f
+  > Filed by M0146\-0081, not worked\. Owner: place M0146\-0086 in the banner\.
+  - First step: in the `\|\|` text mode \(concatModeOf, M0146\-0074\), render a
+    non\-text operand through its text cast rather than AppendValueText;
+    check every type whose cast to text differs from its output function
+    \(bool is the known one\) and the compiled twin\.
 - [x] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
