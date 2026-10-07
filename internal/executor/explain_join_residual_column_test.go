@@ -67,3 +67,39 @@ func residualCityFilter(plan string) string {
 	}
 	return filter
 }
+
+// TestMergeJoinOverPresortedSubqueryLeaf pins M0146-0100: a derived table
+// whose plan is a GroupAggregate publishes that ordering to the join search,
+// as set_subquery_pathlist's convert_subquery_pathkeys does, so the merge on
+// its leading group key reads it presorted. PG 18.3 plans this query (with
+// enable_hashagg off) as `Merge Join -> GroupAggregate` with no Sort between
+// them; without the leaf's pathkeys goopg sorted the aggregate's output again,
+// and that Sort kept `Subquery Scan on dn` above it.
+func TestMergeJoinOverPresortedSubqueryLeaf(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE jr_addr (a_sk int, a_city text)",
+		"CREATE TABLE jr_sales (s_addr int, s_cust int, s_amt int)",
+		"CREATE TABLE jr_cust (c_sk int, c_addr int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	// See explain_sortgroup_paren_test.go for why the GUC is seeded here.
+	defer hashAggSeed(false)()
+	const q = "EXPLAIN (COSTS OFF) SELECT c_sk FROM " +
+		"(SELECT s_cust, a_city AS bought_city, sum(s_amt) AS amt FROM jr_sales, jr_addr WHERE s_addr = a_sk GROUP BY s_cust, a_city) dn, " +
+		"jr_cust, jr_addr cur WHERE dn.s_cust = c_sk AND c_addr = cur.a_sk AND cur.a_city <> dn.bought_city"
+	rows := runExplainRows(t, ctx, q)
+	plan := strings.Join(rows, "\n")
+	if len(rows) < 4 || strings.TrimSpace(rows[0]) != "Merge Join" ||
+		!strings.Contains(rows[1], "Merge Cond: (jr_sales.s_cust = jr_cust.c_sk)") ||
+		strings.TrimSpace(rows[3]) != "->  GroupAggregate" {
+		t.Fatalf("want PG's Merge Join reading the GroupAggregate presorted (no Sort between them), got:\n%s", plan)
+	}
+	if strings.Contains(plan, "Subquery Scan on dn") {
+		t.Errorf("dn kept its Subquery Scan; with no Sort above it PG strips it:\n%s", plan)
+	}
+}
