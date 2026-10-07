@@ -29820,7 +29820,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     addParameterizedAppendPaths skips such a leaf; the WHERE\-member union now plans PG\'s Hash Join over
     `"*SELECT* 1"`; fire sets unchanged\. Design: `docs/design/0100\-0149/m0146\-0098\-paramappend\-subquery\-member\.md`\.
   Movement: none — instrument artefact — no TPC\-DS/TPC\-H query has a WHERE/join UNION ALL member under a parameterised join\.
-- [ ] **M0146\-0099 — goopg merge\-joins on a window function\'s output without the Sort PG adds** \(filed
+- [x] **M0146\-0099 — goopg merge\-joins on a window function\'s output without the Sort PG adds** \(filed
   2026\-10\-08 by M0146\-0097\)\. TPC\-DS Q44 at SF0\.25: `… v11 … Merge Join … Merge Cond: \(v11\.rnk = v21\.rnk\)`\. PG
   puts a Sort on each input \(`Sort Key: v11\.rnk`\) — `rank\(\)`\'s output carries no pathkey in PG — while goopg
   merges on the WindowAgg directly, treating the rank as already ordered\. The Sort is also what keeps PG\'s
@@ -29830,3 +29830,24 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - First step: find where goopg derives a pathkey for a window function\'s output column \(WindowAgg path
     pathkeys / equivalence of `rnk` with the window ORDER BY\) and stop it — PG\'s window paths carry only
     the input sort\'s pathkeys\.
+  - Done 2026\-10\-08 \(20128cc7f\)\. The hypothesis was wrong: no pathkey came from `rank\(\)`\.
+    `createMergeJoinPlan` absorbed every merge `PathSort` child, so no goopg plan ever printed a Sort under a
+    Merge Join\.
+    - `restoreMergeSort` re\-emits the Sort over the narrowed input\.
+    - `mergeSortedSource\.sortChunk` skips a presorted chunk\.
+    - `drivingScanCrossesSort` steps over a merge join\'s own outer Sort\.
+    - Q44 now has PG\'s 4 Subquery Scans at both scales; Q78 exposes M0146\-0100\. Design:
+      `docs/design/0100\-0149/m0146\-0099\-merge\-input\-sort\.md`\.
+Movement: none — instrument artefact — SF0\.25 qual\-placement 11\-\>10; SF1 aggregation\-strategy 14\-\>13, parallelism 40\-\>41, rendering 11\-\>12 as Q44 compares past the merge\.
+- [ ] **M0146\-0100 — a derived subquery leaf publishes no pathkeys, so a merge sorts a presorted
+  GroupAggregate** \(filed 2026\-10\-08 by M0146\-0099\)\. TPC\-DS Q78 \(both scales\): goopg prints
+  `Sort \-\> Subquery Scan on ss/ws/cs \-\> GroupAggregate` on all three merge inputs; PG merges `ss` and `cs`
+  presorted on their GroupAggregate order and sorts only `ws`\. PG\'s `set\_subquery\_pathlist` hands each
+  subquery path\'s ordering up through `convert\_subquery\_pathkeys`; goopg\'s `PathPrebuilt` subquery leaf has
+  none \(ledger row M0146\-0005bd\), and it offers a single subquery plan, so PG\'s sorted\-grouping
+  alternative is never seen\. Regress `join`, `aggregates` and `partition\_join` show the same pattern\.
+  Kind: impl
+  Parent: M0146\-0099
+  - First step: seed the subquery leaf\'s `PathPrebuilt` pathkeys from `inputNodePathkeys` of its plan,
+    translated as `cteScanPathkeys` does, and A/B the fire sets\. Offering a second, sorted\-grouping
+    subquery path is a separate step\.
