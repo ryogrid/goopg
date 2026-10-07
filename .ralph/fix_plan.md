@@ -29435,7 +29435,7 @@ Movement: none — instrument artefact — no TPC\-H/TPC\-DS plan has a single\-
       argument\. Filed M0146\-0073 \(the one\-relation rule\'s correlated
       half may now be removable\)\.
 Movement: none — instrument artefact — typing fix; fire set width\-only \(sum\(int4\) 8 bytes\); PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0063 — the visibility map reaches disk only at clean
+- [x] **M0146\-0063 — the visibility map reaches disk only at clean
   shutdown** \(filed 2026\-10\-05 by M0146\-0019a\)\. goopg keeps the VM in
   memory and writes `\_vm` forks only from `SaveVM` in the shutdown defer
   \(`cmd/goopg/main.go`\)\. PG\'s VM is a WAL\-logged fork, so its bits survive
@@ -29451,6 +29451,15 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     saves the VM would close the clone gap\.
   Kind: impl
   Parent: M0146
+  - DONE 2026\-10\-07 \(`de6c9b67f`; design `docs/design/0100\-0149/m0146\-0063\-wal\-logged\-visibility\-map\.md`\):
+    - the map\'s mutators WAL\-log every change \(native `RecordKindHeapVisible`, new clear\-frozen
+      and drop flags\); `replayHeapVisible` applies it to the `\_vm` fork;
+    - the checkpoint flush phase saves the forks \(checksummed, snapshot then write\) and removes a
+      dropped relation\'s fork;
+    - capability `visibility\_map\_wal\_logged` \(initdb, or the first checkpoint save with logging
+      on\) lets a crash start load the forks; without it the 0063a discard still applies\.
+    - kill \-9 after VACUUM \+ DELETE: index\-only = heap, relallvisible 19 of 23 survives\.
+  Movement: none — correctness fix — no plan instrument \(fire set flat\)
   - [x] **M0146\-0063a — WRONG RESULTS after a crash: a stale visibility\-map fork made an
     index\-only scan return deleted rows** \(filed and fixed 2026\-10\-07 while working M0146\-0063\)\.
     VACUUM, clean restart, DELETE, `kill \-9`, restart: `count\(\*\) … WHERE a < 1000` by Index Only
