@@ -119,6 +119,12 @@ func checkFKInsertForConstraints(ctx *Context, fkOwnerTbl *catalog.Table, report
 		if fk.NotEnforced {
 			continue
 		}
+		// The RI check triggers on the referencing table are disabled
+		// (ALTER TABLE … DISABLE TRIGGER ALL, or the replica
+		// session_replication_role for an 'O' trigger). M0146-0082.
+		if !triggerModeFires(ctx, fk.CheckTrigEnabled) {
+			continue
+		}
 		// Gather the FK column values.
 		vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, row)
 		if allNull {
@@ -169,6 +175,11 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 		// tablecmds.c:10920) — CASCADE/SET NULL/RESTRICT/NO ACTION are all
 		// skipped, not merely deferred. DU-002 slice 431.
 		if ref.FK.NotEnforced {
+			continue
+		}
+		// The RI action triggers on the referenced table are disabled, so
+		// no cascade and no NO ACTION/RESTRICT check runs (M0146-0082).
+		if !triggerModeFires(ctx, ref.FK.ActionTrigEnabled) {
 			continue
 		}
 		// Get the referenced column values from the deleted parent row.
@@ -339,6 +350,9 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 				continue
 			}
 			fk := ref.FK
+			if !triggerModeFires(ctx, fk.ActionTrigEnabled) {
+				continue // RI action triggers disabled (M0146-0082)
+			}
 			refCols := fk.RefColumns
 			if len(refCols) == 0 {
 				refCols = pkColumns(ctx, parent)

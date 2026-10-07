@@ -390,6 +390,7 @@
                                         # read uncommitted | read committed |
                                         # repeatable read | serializable
 #default_transaction_read_only = off
+#session_replication_role = 'origin'   # origin | replica | local
 #default_table_access_method = 'heap'   # accepted; goopg only implements heap
 #default_tablespace = ''                # accepted; goopg has no real tablespaces
 #default_toast_compression = 'pglz'     # pglz | lz4; accepted, column default not GUC-driven

@@ -1572,6 +1572,22 @@ type Trigger struct {
 	FuncName   string // function/procedure name (unschemed)
 	FuncSchema string
 	Args       []string // trigger function arguments (TG_ARGV)
+	// Enabled is pg_trigger.tgenabled: 'O' fires in origin and local
+	// session_replication_role, 'R' only in replica, 'A' always, 'D' never.
+	// 0 means 'O', the CREATE TRIGGER default. Read it through FireMode.
+	// M0146-0082.
+	Enabled byte
+}
+
+// FireMode returns the trigger's pg_trigger.tgenabled code.
+func (t *Trigger) FireMode() byte { return TriggerFireMode(t.Enabled) }
+
+// TriggerFireMode normalises a stored tgenabled code: the zero value is 'O'.
+func TriggerFireMode(code byte) byte {
+	if code == 0 {
+		return 'O'
+	}
+	return code
 }
 
 // HasStorage reports whether the index has physical storage a scan can read.
@@ -1728,6 +1744,14 @@ type ForeignKey struct {
 	// as implying NotValid too (mirrors PG's processCASbits), even though
 	// NotValid itself is kept independent here. DU-002 slice 431.
 	NotEnforced bool
+	// CheckTrigEnabled / ActionTrigEnabled stand in for the tgenabled of the
+	// RI triggers PG creates for this constraint: the RI_FKey_check_* triggers
+	// on the referencing table and the action (RI_FKey_*_del/_upd) triggers
+	// on the referenced table. ALTER TABLE … ENABLE/DISABLE TRIGGER ALL on
+	// either table sets the matching one; 0 means 'O' (TriggerFireMode).
+	// M0146-0082.
+	CheckTrigEnabled  byte
+	ActionTrigEnabled byte
 }
 
 // FKActionFromChar is FKActionChar's inverse, for the pg_constraint heap
@@ -16416,7 +16440,7 @@ func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
 			row[3] = trig.Name                        // tgname
 			row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
 			row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
-			row[6] = "O"                              // tgenabled (origin/enabled)
+			row[6] = string(trig.FireMode())          // tgenabled
 			row[7] = "f"                              // tgisinternal
 			row[8] = "0"                              // tgconstrrelid
 			row[9] = "0"                              // tgconstrindid

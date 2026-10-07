@@ -55,6 +55,9 @@ func fireTriggersCols(ctx *Context, tbl *catalog.Table, timing, event string, ol
 		if !triggerMatchesEvent(trig, timingLow, eventLow) || !triggerColumnsMatch(trig, eventLow, updCols) {
 			continue
 		}
+		if !triggerModeFires(ctx, trig.Enabled) {
+			continue
+		}
 		if pass, err := triggerWhenPasses(ctx, tbl, trig, oldRow, newRow); err != nil {
 			return nil, false, err
 		} else if !pass {
@@ -120,6 +123,9 @@ func fireStatementTriggersCols(ctx *Context, tbl *catalog.Table, timing, event s
 			continue // skip row-level triggers
 		}
 		if !triggerMatchesEvent(trig, timingLow, eventLow) || !triggerColumnsMatch(trig, eventLow, updCols) {
+			continue
+		}
+		if !triggerModeFires(ctx, trig.Enabled) {
 			continue
 		}
 		// goopg does not materialise transition tables (REFERENCING OLD /
@@ -265,6 +271,28 @@ func triggerFireOrder(tbl *catalog.Table) []int {
 }
 
 // triggerMatchesEvent reports whether trig fires for the given timing+event.
+// triggerModeFires is TriggerEnabled's tgenabled test (trigger.c): in the
+// replica session_replication_role only 'R' and 'A' triggers fire; in origin
+// and local only 'O' and 'A'; a 'D' trigger never fires. The RI checks
+// (catalog.ForeignKey.CheckTrigEnabled / ActionTrigEnabled) take the same
+// test, as PG's RI triggers do (M0146-0082).
+func triggerModeFires(ctx *Context, code byte) bool {
+	mode := catalog.TriggerFireMode(code)
+	if mode == 'D' {
+		return false
+	}
+	replica := false
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("session_replication_role"); ok {
+			replica = strings.EqualFold(v, "replica")
+		}
+	}
+	if replica {
+		return mode == 'R' || mode == 'A'
+	}
+	return mode == 'O' || mode == 'A'
+}
+
 func triggerMatchesEvent(trig *catalog.Trigger, timing, event string) bool {
 	switch strings.ToLower(timing) {
 	case "before":

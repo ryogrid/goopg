@@ -8922,7 +8922,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return err
 		}
-		return nil
+		return o.enableDisableTrigger(tbl, s)
 	}
 	// Handle OWNER TO role — record the new owning role on the in-memory table so
 	// the VACUUM/ANALYZE/CLUSTER maintenance-privilege check (a non-superuser
@@ -19821,6 +19821,58 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		}
 	}
 	tbl.Triggers = append(filtered, trig)
+	return nil
+}
+
+// enableDisableTrigger applies ALTER TABLE … ENABLE [ALWAYS | REPLICA] /
+// DISABLE TRIGGER {name | ALL | USER} (trigger.c EnableDisableTrigger):
+// it sets pg_trigger.tgenabled on the named trigger, on every user trigger
+// (USER), or on every trigger including the internal RI ones (ALL).
+// goopg enforces foreign keys without triggers, so ALL sets the stand-in
+// state on each constraint instead. That is CheckTrigEnabled for an FK
+// this table owns, and ActionTrigEnabled for an FK that references it.
+// M0146-0082.
+func (o *ddlOp) enableDisableTrigger(tbl *catalog.Table, s *parser.AlterTableStmt) error {
+	if s.TriggerFireMode == "" {
+		return nil
+	}
+	mode := s.TriggerFireMode[0]
+	switch s.TriggerTargetKind {
+	case "name":
+		for i := range tbl.Triggers {
+			if tbl.Triggers[i].Name == s.TriggerName {
+				tbl.Triggers[i].Enabled = mode
+				return nil
+			}
+		}
+		return &ExecError{Code: "42704",
+			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.TriggerName, tbl.Name)}
+	case "user", "all":
+		for i := range tbl.Triggers {
+			tbl.Triggers[i].Enabled = mode
+		}
+	}
+	if s.TriggerTargetKind != "all" {
+		return nil
+	}
+	for i := range tbl.ForeignKeys {
+		if !tbl.ForeignKeys[i].NotEnforced {
+			tbl.ForeignKeys[i].CheckTrigEnabled = mode
+		}
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, ref := range im.FindFKsReferencingTable(tbl.Name) {
+			if ref.Child == nil || ref.FK.NotEnforced {
+				continue
+			}
+			for j := range ref.Child.ForeignKeys {
+				fk := &ref.Child.ForeignKeys[j]
+				if fk.Name == ref.FK.Name && strings.EqualFold(fk.RefTable, ref.FK.RefTable) {
+					fk.ActionTrigEnabled = mode
+				}
+			}
+		}
+	}
 	return nil
 }
 

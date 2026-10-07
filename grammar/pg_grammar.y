@@ -92,6 +92,8 @@
 %type <expr>	opt_trig_when
 %type <strs>	opt_trig_args trig_arg_list drop_arg_types oper_argtypes opt_policy_to policy_role_list
 %type <str>	ext_name opt_policy_as opt_policy_for
+%type <strs>	trigger_toggle trigger_target
+%type <str>	opt_trigger_mode
 %type <nodes>	ext_opts alter_seq_opts
 %type <stmt>	copy_inner
 %type <strs>	opt_copy_cols
