@@ -29774,7 +29774,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     the shared state; the sweeper replays them with its own for batches 1\.\.n\-1, so its per\-batch matched bits
     are complete; the refusal is gone\. Design: `docs/design/0100\-0149/m0146\-0095\-parallel\-hash\-fill\-build\-batches\.md`\.
   Movement: none — correctness fix — no plan instrument \(spilled RIGHT/FULL Parallel Hash: error → serial rows\)\.
-- [ ] **M0146\-0096 — the PH4 veto keeps Parallel Hash off inners estimated to spill** \(filed
+- [x] **M0146\-0096 — the PH4 veto keeps Parallel Hash off inners estimated to spill** \(filed
   2026\-10\-07 by M0146\-0090\)\. `addParallelHashJoinPath` refuses a build that does not fit one
   batch \(`PH4\-batches`\); PG costs the batches and elects Parallel Hash anyway \(regress join\_hash
   \"parallel full multi\-batch\", the \"good\" case\)\. Since M0146\-0090 the executor batches every
@@ -29783,6 +29783,12 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   Parent: M0146\-0090
   - First step: drop PH4 for non\-build\-filling join types, then A/B the SF0\.25/SF1 fire sets and the
     TPC\-H arm for plan flips and wall\-clock\.
+  - Done 2026\-10\-08 \(0f3165f64\): veto dropped for every join type \(0095 made build\-filling joins batch\)\.
+    Lifting it exposed shares with different bucket counts \(regress join\_hash error\); the merge now re\-routes
+    every row from its stored hash under one geometry\. A/B: fire sets no change, TPC\-H plan capture
+    byte\-identical, arm values identical; regress join\_hash 322→310\. Design:
+    `docs/design/0100\-0149/m0146\-0096\-parallel\-hash\-ph4\-veto\.md`\.
+  Movement: none — instrument artefact — the veto decided no TPC\-H/TPC\-DS election; regress join\_hash 322→310\.
 - [ ] **M0146\-0097 — a Subquery Scan on a hash join\'s inner side is stripped where PG keeps it** \(filed
   2026\-10\-07 by M0146\-0092\)\. PG\'s Hash node requests CP\_SMALL\_TLIST \(create\_hash\_plan, createplan\.c\), so a
   subquery leaf on the hashed side is in the pathtarget regime: subset consumption or a resjunk column keeps
