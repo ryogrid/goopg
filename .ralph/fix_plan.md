@@ -29682,7 +29682,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   > \#\# ESCALATION 2026\-10\-07 \(S2\) — M0146\-0089 returns wrong results
   > A materialized view silently becomes a live view after a REFRESH and two clean restarts\.
   > Owner: place M0146\-0089 in the banner\.
-- [ ] **M0146\-0090 — an underestimated Parallel Hash join errors instead of growing its
+- [x] **M0146\-0090 — an underestimated Parallel Hash join errors instead of growing its
   batches** \(filed 2026\-10\-07 by M0146\-0064\)\. goopg has no parallel hash batching: a participant
   build that outgrows hash\_mem fails the query with `parallel hash join: a participant\'s build
   exceeded hash\_mem and spilled; parallel hash batching is not supported` \(`errParallelHashSpilled`,
@@ -29696,6 +29696,13 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - Ledgered since M0146\-0002 slice 1 \(deferral\_ledger 2026\-09\-24 row\); now with a witness\.
   - First step: port the shared batch\-growth protocol, or, as an interim that keeps results
     correct, fall back to a serial \(non\-shared\) hash join for the group when a participant spills\.
+  - Done 2026\-10\-07 \(1a3f12277\): the barrier\'s last arrival merges every share under the largest
+    batch count \(`mergeSpilledParts`\) into the leader prebuild\'s frozen `sharedBatchDesc`, and every
+    participant probes it through the E\-09 participant path\. Regress join\_hash: both errors gone,
+    `bigger\_than\_it\_looks` and `extremely\_skewed` answer PG\'s 20000\. Design:
+    `docs/design/0100\-0149/m0146\-0090\-parallel\-hash\-batching\.md`\.
+  - Residuals filed: M0146\-0095 \(build\-filling joins still refuse a spilled share\), M0146\-0096 \(PH4 veto\)\.
+  - Movement: none — correctness fix — no plan instrument \(regress join\_hash 2 errors → PG\'s counts\)\.
 - [ ] **M0146\-0091 — the Subquery Scan strip pass never visits sublink or InitPlan bodies** \(filed 2026\-10\-07 by M0146\-0066\)\. PG\'s setrefs walks every subplan; goopg\'s `stripTrivialSubqueryScans` runs once at `Plan\(\)`\'s tail over
   the statement tree, so a sublink body keeps a wrapper PG strips \(TPC\-DS Q23 `Subquery Scan on
   \_\_sq\_1a7` under the InitPlan\'s Aggregate; probe `analysis/m0146/m0146\-0066/probe\-window\-sublink\.sql` case 1\)\.
@@ -29726,3 +29733,24 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   Parent: M0146\-0066
   - First step: trace where goopg places a restriction on an appendrel leaf whose column is a member constant, and
     push it into the members with the member expression substituted\.
+- [ ] **M0146\-0095 — a build\-filling Parallel Hash join refuses a spilled share** \(filed
+  2026\-10\-07 by M0146\-0090\)\. RIGHT, FULL, RIGHT SEMI and RIGHT ANTI Parallel Hash joins still fail
+  `… of a join that fills its build side is not supported` when a participant\'s share outgrows
+  hash\_mem\. Batches past 0 are probed by every participant with its own probe rows, so the batch\-k
+  unmatched sweep needs every participant\'s matched bits; PG runs it in the last participant to
+  leave the batch \(`PHJ\_BATCH\_SCAN`, `ExecParallelPrepHashTableForUnmatched`, nodeHash\.c\)\.
+  Kind: impl
+  Parent: M0146\-0090
+  - No corpus witness: the PH4 veto keeps Parallel Hash off planned spills, so it takes an
+    underestimated build\-filling join\.
+  - First step: extend `probeDetach`\'s merge to every batch — participants hand their batch\-k
+    matched bits \(or their batch\-k probe files\) to the shared state and the last one sweeps\.
+- [ ] **M0146\-0096 — the PH4 veto keeps Parallel Hash off inners estimated to spill** \(filed
+  2026\-10\-07 by M0146\-0090\)\. `addParallelHashJoinPath` refuses a build that does not fit one
+  batch \(`PH4\-batches`\); PG costs the batches and elects Parallel Hash anyway \(regress join\_hash
+  \"parallel full multi\-batch\", the \"good\" case\)\. Since M0146\-0090 the executor batches every
+  join that does not fill its build side, so the veto is goopg\-only there\.
+  Kind: impl
+  Parent: M0146\-0090
+  - First step: drop PH4 for non\-build\-filling join types, then A/B the SF0\.25/SF1 fire sets and the
+    TPC\-H arm for plan flips and wall\-clock\.
