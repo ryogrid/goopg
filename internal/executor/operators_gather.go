@@ -566,7 +566,8 @@ func (o *gatherOp) Close() error {
 	o.workers, o.arenas = nil, nil
 	if o.ownsParallelHash && o.ctx != nil {
 		// Retract after the join: no participant can still be reading.
-		o.ctx.ParallelHashBuilds = nil
+		// A spilled build's batch files go with it (M0146-0090).
+		releaseParallelHashBuilds(o.ctx)
 		o.ownsParallelHash = false
 	}
 	if o.ownsSharedBuilds && o.ctx != nil {

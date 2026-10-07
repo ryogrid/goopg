@@ -9,6 +9,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -122,36 +123,121 @@ func TestParallelHashIdentityWithSerial(t *testing.T) {
 	}
 }
 
-// TestParallelHashSpillFailsLoudly: a participant whose share exceeds hash_mem
-// must fail the query, never publish its batch 0 alone.
-func TestParallelHashSpillFailsLoudly(t *testing.T) {
+// TestParallelHashSpilledBuildMatchesSerial pins M0146-0090: a Parallel Hash
+// build whose shares outgrow hash_mem batches (the participants' shares are
+// merged under one batch count, mergeSpilledParts) and returns exactly the
+// serial rows. Before, the query failed. A join that fills its build side
+// still refuses a spilled share — it must fail loudly, never return a batch's
+// unmatched rows from one participant's view.
+func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 	ctx, cleanup := parallelHashFixture(t)
 	defer cleanup()
-	sql := "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k"
-	par, _ := toParallelHash(t, planHashOnly(t, ctx, sql))
-	if par == nil {
-		t.Skip("no hash join")
+	buildKeys := runSQL(t, ctx, "SELECT count(*) FROM ph_build WHERE k IS NOT NULL")
+	wantBuildRows := renderRows(buildKeys)[0]
+
+	for _, tc := range []struct {
+		sql       string
+		mayRefuse bool
+	}{
+		{"SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", false},
+		{"SELECT p.w, b.v FROM ph_probe p LEFT JOIN ph_build b ON p.k = b.k", false},
+		{"SELECT p.w FROM ph_probe p WHERE EXISTS (SELECT 1 FROM ph_build b WHERE b.k = p.k)", false},
+		{"SELECT p.w FROM ph_probe p WHERE NOT EXISTS (SELECT 1 FROM ph_build b WHERE b.k = p.k)", false},
+		{"SELECT p.w FROM ph_probe p WHERE p.k NOT IN (SELECT b.k FROM ph_build b)", false},
+		// RIGHT and FULL: the inner join's plan retyped, as in
+		// TestParallelHashFillBuildIdentityWithSerial — ph_build is hashed and
+		// the join fills it, so a spilled share must be refused.
+		{"right", true},
+		{"full", true},
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			sql, retype := tc.sql, optimizer.JoinType(0)
+			switch tc.sql {
+			case "right":
+				sql, retype = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", optimizer.JoinTypeRight
+			case "full":
+				sql, retype = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", optimizer.JoinTypeFull
+			}
+			plan := func() optimizer.Node {
+				n := planHashOnly(t, ctx, sql)
+				if retype != 0 {
+					c19fFindJoin(n).Type = retype
+				}
+				return n
+			}
+			want := c19fRun(t, ctx, plan())
+			par, _ := toParallelHash(t, plan())
+			if par == nil {
+				t.Skip("the serial plan has no hash join; nothing to parallelise")
+			}
+			var ph *parallelHashBuild
+			var once sync.Once
+			ctx.parallelHashObserver = func(got *parallelHashBuild) { once.Do(func() { ph = got }) }
+			saved := ctx.WorkMem
+			ctx.WorkMem = 16 << 10
+			defer func() { ctx.WorkMem = saved; ctx.parallelHashObserver = nil }()
+
+			got, err := c19fTryRun(ctx, par)
+			if tc.mayRefuse {
+				if err == nil || !strings.Contains(err.Error(), "fills its build side") {
+					t.Fatalf("a spilled share of a build-filling join must be refused; got err=%v (%d rows, serial %d)", err, len(got), len(want))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("spilled Parallel Hash failed: %v", err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("parallel hash returned %d rows, serial %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: parallel %q, serial %q", i, got[i], want[i])
+				}
+			}
+			if ph == nil {
+				t.Fatal("no participant reached the Parallel Hash build state")
+			}
+			if ph.table.batches == nil || ph.table.batches.nbatch < 2 {
+				t.Fatal("the build did not batch; lower the fixture's work_mem — this test proved nothing")
+			}
+			if got := ph.rowsPublished; renderRows([]Row{{NewIntDatum(int64(got))}})[0] != wantBuildRows {
+				t.Fatalf("participants published %d build rows, the inner holds %s non-NULL keys", got, wantBuildRows)
+			}
+			t.Logf("builders=%d rowsPublished=%d nbatch=%d", ph.builders, ph.rowsPublished, ph.table.batches.nbatch)
+		})
 	}
-	saved := ctx.WorkMem
-	ctx.WorkMem = 8 << 10
-	defer func() { ctx.WorkMem = saved }()
+	if left := ctx.ReleaseSpillFiles(); left != 0 {
+		t.Fatalf("%d spill files were still registered after every Gather closed", left)
+	}
+}
+
+// c19fTryRun is c19fRun returning the execution error instead of failing.
+func c19fTryRun(ctx *Context, node optimizer.Node) ([]string, error) {
 	ctx.MaxParallelWorkers = 8
 	ctx.ParallelLeaderParticipation = true
-	op, err := Build(par)
+	op, err := Build(node)
 	if err != nil {
-		t.Fatalf("build: %v", err)
+		return nil, err
 	}
 	err = op.Open(ctx)
+	var out []string
 	for err == nil {
-		_, err = op.Next()
+		var slot TupleSlot
+		slot, err = op.Next()
+		if err == nil {
+			out = append(out, renderRows([]Row{slot.Row()})...)
+		}
 	}
-	_ = op.Close()
-	if err == EOF {
-		t.Fatal("a spilling Parallel Hash build returned rows; it must fail")
+	cerr := op.Close()
+	if err != EOF {
+		return nil, err
 	}
-	if !strings.Contains(err.Error(), "parallel hash") {
-		t.Fatalf("unexpected error: %v", err)
+	if cerr != nil {
+		return nil, cerr
 	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // TestParallelHashBarrier pins the barrier protocol itself: no waiter returns
@@ -162,13 +248,13 @@ func TestParallelHashBarrier(t *testing.T) {
 	if !ph.attach() || !ph.attach() {
 		t.Fatal("participants attaching before completion must build")
 	}
-	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(1)}}}}, nil)
+	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(1)}}}}, nil, nil)
 	select {
 	case <-ph.done:
 		t.Fatal("the barrier released with one of two participants still building")
 	default:
 	}
-	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(2)}}, 2: {{NewIntDatum(3)}}}}, nil)
+	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(2)}}, 2: {{NewIntDatum(3)}}}}, nil, nil)
 	if err := ph.wait(nil); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -182,8 +268,8 @@ func TestParallelHashBarrier(t *testing.T) {
 	failed := newParallelHashBuild(nil)
 	failed.attach()
 	failed.attach()
-	failed.finish(nil, errParallelHashSpilled)
-	failed.finish(&sharedHashBuild{}, nil)
+	failed.finish(nil, nil, errParallelHashSpilled)
+	failed.finish(&sharedHashBuild{}, nil, nil)
 	if err := failed.wait(nil); err != errParallelHashSpilled {
 		t.Fatalf("a participant's failure must reach every waiter; got %v", err)
 	}
