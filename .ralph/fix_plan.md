@@ -29805,7 +29805,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
     `docs/design/0100\-0149/m0146\-0097\-subqueryscan\-hash\-inner\.md`\.
   Movement: none — instrument artefact — categories unchanged; Q44 Subquery Scans SF1 = PG, SF0\.25 behind M0146\-0099\.
 
-- [ ] **M0146\-0098 — a parameterised Append drives a UNION ALL member PG keeps as a subquery** \(filed 2026\-10\-08
+- [x] **M0146\-0098 — a parameterised Append drives a UNION ALL member PG keeps as a subquery** \(filed 2026\-10\-08
   by M0146\-0093\)\. A member with a WHERE clause \(or a join\) is not a safe append member in PG, so it stays a subquery
   RTE with no parameterised path, and `SELECT li\.id, x\.amt FROM li, \(SELECT item, amt FROM cs1 WHERE amt > 5 UNION ALL
   SELECT item, amt FROM ws1\) x WHERE x\.item = li\.id AND li\.cat = 3` hash\-joins in PG 18\.3\. goopg builds the
@@ -29816,6 +29816,10 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - Probe: `analysis/m0146/m0146\-0093/probe\-param\-append\-where\-member\.sql`\.
   - First step: refuse the per\-member parameterised path for a member the fold stamped unsafe
     \(`SetOp\.appendMemberLeft/Right`\), then A/B the fire sets and correct the test\'s plan expectation to PG\'s\.
+  - Done 2026\-10\-08 \(f636d7a75\): `unionAllHasSubqueryMember` reads the fold\'s stamps and
+    addParameterizedAppendPaths skips such a leaf; the WHERE\-member union now plans PG\'s Hash Join over
+    `"*SELECT* 1"`; fire sets unchanged\. Design: `docs/design/0100\-0149/m0146\-0098\-paramappend\-subquery\-member\.md`\.
+  Movement: none — instrument artefact — no TPC\-DS/TPC\-H query has a WHERE/join UNION ALL member under a parameterised join\.
 - [ ] **M0146\-0099 — goopg merge\-joins on a window function\'s output without the Sort PG adds** \(filed
   2026\-10\-08 by M0146\-0097\)\. TPC\-DS Q44 at SF0\.25: `… v11 … Merge Join … Merge Cond: \(v11\.rnk = v21\.rnk\)`\. PG
   puts a Sort on each input \(`Sort Key: v11\.rnk`\) — `rank\(\)`\'s output carries no pathkey in PG — while goopg
