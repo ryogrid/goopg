@@ -2686,7 +2686,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// CORRECT semantically — a cleared VM bit is a conservative
 	// "must check heap" — but would degrade index-only-scan
 	// performance until the next VACUUM rebuilt the bits).
-	if err := rt.VM.VMLoadForks(rt.DataDir); err != nil {
+	//
+	// M0146-0063: after a crash (or from an online copy, which starts in
+	// crash recovery too) the forks are those of the last CLEAN shutdown,
+	// and nothing replayed since cleared the bits of pages modified after
+	// it — an index-only scan returned deleted rows. Discard them; the map
+	// starts empty, as on a fresh cluster, until VACUUM sets it again.
+	if recov.crashRecovery {
+		if n, err := storage.DiscardVMForks(rt.DataDir); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: vm discard after crash recovery: %w", err)
+		} else if n > 0 {
+			slog.Info("discarded visibility-map forks after crash recovery", "forks", n)
+		}
+	} else if err := rt.VM.VMLoadForks(rt.DataDir); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()

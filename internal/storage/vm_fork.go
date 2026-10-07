@@ -232,6 +232,65 @@ func (v *VisibilityMap) VMRelations() map[vmKey]bool {
 	return keys
 }
 
+// DiscardVMForks removes every _vm fork file under dataDir (base/<db>/ and
+// global/) and returns how many it removed.
+//
+// M0146-0063: goopg's map is not crash-safe. Its bits reach disk only from
+// the clean-shutdown SaveVM, and no WAL record clears them, whereas PG's
+// visibilitymap_clear is redone from every heap record carrying
+// *_ALL_VISIBLE_CLEARED. After a crash the forks therefore describe the
+// LAST CLEAN SHUTDOWN: a page modified since then can still read
+// all-visible, and an index-only scan would return its deleted rows. The
+// only safe map after crash recovery is an empty one: a cleared bit just
+// means "check the heap". Removing the files, not merely skipping them,
+// matters too: a later clean shutdown rewrites only the relations whose
+// bits were set again, and a stale fork left beside them would be loaded on
+// the following clean start.
+func DiscardVMForks(dataDir string) (int, error) {
+	removed := 0
+	scanDir := func(dir string) error {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		for _, file := range files {
+			name := file.Name()
+			if !strings.HasSuffix(name, "_vm") {
+				continue
+			}
+			if _, err := parseUint32(name[:len(name)-3]); err != nil {
+				continue
+			}
+			if err := DeleteVMFork(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	}
+	baseDir := filepath.Join(dataDir, "base")
+	if baseEntries, err := os.ReadDir(baseDir); err == nil {
+		for _, entry := range baseEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			if _, err := parseUint32(entry.Name()); err != nil {
+				continue
+			}
+			if err := scanDir(filepath.Join(baseDir, entry.Name())); err != nil {
+				return removed, err
+			}
+		}
+	}
+	if err := scanDir(filepath.Join(dataDir, "global")); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
 // VMLoadForks scans dataDir for _vm fork files and loads them into the VM.
 func (v *VisibilityMap) VMLoadForks(dataDir string) error {
 	if v == nil {
