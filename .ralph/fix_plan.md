@@ -28293,7 +28293,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
       fixed with the missing arm\.
     - Filed M0146\-0087 \(numeric\(p,s\) typmod not applied on INSERT/UPDATE\)\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0087 — WRONG RESULTS: `numeric\(p,s\)` columns do not apply their
+- [x] **M0146\-0087 — WRONG RESULTS: `numeric\(p,s\)` columns do not apply their
   typmod on INSERT/UPDATE** \(filed 2026\-10\-07 by M0146\-0083\)\. `CREATE TABLE
   nt \(n numeric\(6,2\), m numeric\(4,1\)\); INSERT INTO nt VALUES \(2\.5, 1\.26\),
   \(\'3\', 7\); SELECT \* FROM nt` returns `2\.5\|1\.26`, `3\|7`; PG 18\.3
@@ -28311,6 +28311,16 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     apply the column\'s numeric typmod as the cast path does
     \(`resolveNumericTypmodCast`\); check DEFAULTs, COPY FROM, numeric\(p\)
     with no scale, and the overflow error \(22003 `numeric field overflow`\)\.
+  - Done 2026\-10\-07 \(`7e1d110da`; design
+    `docs/design/0100\-0149/m0146\-0087\-numeric\-column\-typmod\.md`\):
+    - `applyNumericTypmod` ports apply\_typmod \(round half away, display
+      scale, 22003 overflow with PG\'s DETAIL\) on INSERT, UPDATE, DEFAULT,
+      MERGE, ON CONFLICT, COPY FROM and ALTER COLUMN TYPE\.
+    - MERGE UPDATE SET and ON CONFLICT did no coercion at all; now they do\.
+    - ALTER COLUMN TYPE between typmods of one type was a no\-op; fixed\.
+    - `round\(numeric, s\)` was float\-based; now exact\.
+    - Regress numeric 3806→3690; the other 7 files identical\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0084 — WRONG RESULTS: regress polymorphism\'s `testpolym`
   lookup fails depending on session state** \(filed 2026\-10\-07 by
   M0146\-0080\)\. `select \* from testpolym\(37\)` \(polymorphism\.sql:930\)
