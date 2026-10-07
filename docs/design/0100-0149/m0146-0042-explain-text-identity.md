@@ -335,6 +335,26 @@ Results:
 - Test: `TestExplainJoinCondsThroughGroupedSubqueries`, which reproduces
   PG 18.3's three lines.
 
+## Slice — a Sort Key aggregate over a UNION ALL of grouped CTEs (2026-10-08, `3b9456d12`)
+
+- **Problem.** TPC-DS Q33/Q56/Q60 sort on `sum(total_sales)` over a UNION ALL
+  of three inlined, grouped CTEs. PG follows the argument through the
+  Append's first branch into that member's aggregate and prints
+  `(sum((sum(store_sales.ss_ext_sales_price))))`. goopg printed the CTE
+  label column, `(sum(ss.total_sales))`.
+- **Change.**
+  - `sortKeyParts` chases the expanded call's arguments with
+    `chaseAggregateResultArgs`.
+  - `resolveKeySource`'s Project arm also takes a COMPUTED nested result
+    when the nested chase crossed a query-level boundary (an inlined CTE
+    body or a UNION arm). Before, it fell back to the label column.
+- **Results.**
+  - Every changed line in Q33/Q56/Q60 equals PG's, and Q56 is
+    text-identical at SF0.25.
+  - The rendering category drops SF0.25 10 → 9 and SF1 11 → 9.
+  - TPC-H text and ten regress files are unchanged.
+- Test: `TestExplainSortKeyAggregateOverUnionAllMembers`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
@@ -342,6 +362,6 @@ Results:
 | ~~a BETWEEN bound is not folded~~ (done, `7eed1a031`) | Q10 (both scales), Q69 (SF1) | `(d_moy >= 3) AND (d_moy <= 6) AND (d_year = 2001)` | `(d_moy >= 3) AND (d_year = 2001) AND (d_moy <= (3 + 3))` |
 | ~~order of two constant EC equalities~~ (done, `7b5892287`) | Q31 | `(d_year = 1999) AND (d_qoy = 3)` | reversed |
 | ~~column qualification missing~~ (done, `fa61c41a7`; Q8 keeps alias numbering) | Q8 (both), Q46, Q79 (SF1) | `a1.ca_zip`, `customer.c_customer_sk`, `store.s_city` | bare |
-| a reference through an elided subquery / CTE / Append (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument open) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
+| ~~a reference through an elided subquery / CTE / Append~~ (Q75's CTE group key done, `95c4f5581`; Q56's aggregate argument done, `3b9456d12`) | Q56, Q75 | `sum((sum(store_sales.ss_ext_sales_price)))`, `date_dim.d_year` | `sum(ss.total_sales)`, `curr_yr.d_year` |
 | alias suffix numbering (Q8 done, `eef2d1762`; Q75 skipped numbers done, `f894f0c27`) | Q8, Q56, Q58, Q75 | numbered over the final flattened range table (`set_rtable_names`) | numbered in RTID allocation order |
 | ~~a Sort Key detail~~ (typmod'd CASE NULL, done `2f9990d50`) | Q43 (SF1) | | |

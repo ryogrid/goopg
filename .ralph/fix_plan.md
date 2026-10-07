@@ -27789,6 +27789,13 @@ Movement: none — instrument artefact — text\-only; text\-identical SF1 32 �
     - An aggregate over an aggregate nests \(`chaseAggregateResultArgs`\)\.
     - TPC\-DS Q65 is a full MATCH at both scales; Q44/Q78/Q95 lines now equal PG\'s\.
 Movement: yes — PLAN\-PARITY match SF0\.25 42 → 43, SF1 33 → 34 \(Q65\); CATEGORIES\-EXCL\-MATCH qual\-placement 12 → 11 at both scales
+  - Slice 2026\-10\-08 \(`3b9456d12`\): a Sort Key aggregate over a UNION ALL of grouped CTEs deparses its argument
+    through the member\'s own aggregate\.
+    - `sortKeyParts` chases the call\'s arguments\.
+    - `resolveKeySource`\'s Project arm takes a computed result across a query\-level boundary\.
+    - Q33/Q56/Q60 lines now equal PG\'s, and Q56 is text\-identical at SF0\.25\.
+    - Remaining MATCH text residue at SF0\.25: Q75\'s computed group key needs PG\'s double parentheses\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH rendering SF0\.25 10 → 9, SF1 11 → 9
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
