@@ -2919,6 +2919,13 @@ func seamLeafRelInfo(i int, b rangeBinding, scan Node, local Expr, cat catalog.C
 		bindingIdx:   i,
 		baseRows:     baseRows,
 		filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+		// M0146-0049g: a derived leaf whose body is a simple UNION ALL
+		// (a pulled ANY sublink's `(<body>) AS ANY_subquery`) keeps its
+		// appendrel mark, as estimateBaseRelInfo's catalog branch does.
+		// Without it addParameterizedAppendPaths skipped the leaf, and
+		// `x IN (SELECT … UNION ALL SELECT …)` never got the
+		// parameterised Append PG's Nested Loop Semi Join probes.
+		appendrel: b.appendrel,
 	}
 }
 
