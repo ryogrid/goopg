@@ -123,6 +123,14 @@ type plpgsqlFrame struct {
 	// whether the underlying query produced at least one row, and read via a
 	// bare `FOUND` reference. M0118-0009 (design 0118-0097).
 	found bool
+	// rowCount is PG's estate->eval_processed: the rows the last SQL
+	// statement, PERFORM or dynamic EXECUTE processed, read by GET
+	// DIAGNOSTICS … = ROW_COUNT (M0146-0081).
+	rowCount int64
+	// caughtErr is the error an active exception handler is handling
+	// (estate->cur_error), read by GET STACKED DIAGNOSTICS; nil outside a
+	// handler.
+	caughtErr *ExecError
 	// outParamNames lists the OUT / INOUT / RETURNS TABLE parameter names of
 	// this routine. They are registered as ordinary NULL frame variables (see
 	// the ArgModes loop in the frame builder), which makes them indistinguishable
@@ -1668,6 +1676,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				return Datum{}, flowNone, err
 			}
 			frame.found = true
+			frame.rowCount = 1
 			return Datum{}, flowNone, nil
 		}
 		// Query form (FROM/WHERE/…): run as SELECT and set FOUND from row count.
@@ -1676,6 +1685,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, err
 		}
 		frame.found = n > 0
+		frame.rowCount = int64(n)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.NullStmt:
@@ -1993,9 +2003,31 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				}
 			}
 		}
+		// Without INTO, the statement runs to completion and every row counts
+		// (SPI_execute with tcount 0).
+		if s.IntoVar == "" && slot != nil && perr == nil {
+			for {
+				s2, e2 := op.Next()
+				if e2 == EOF || (e2 == nil && s2 == nil) {
+					break
+				}
+				if e2 != nil {
+					perr = e2
+					break
+				}
+				rowCount++
+			}
+		}
 		op.Close()
 		if perr != nil && perr != EOF {
 			return Datum{}, flowNone, addExecCtx(perr)
+		}
+		// exec_stmt_dynexecute sets eval_processed (ROW_COUNT) but not FOUND.
+		frame.rowCount = int64(rowCount)
+		if planIsDMLStatement(plan) {
+			if rc, ok := op.(RowCounter); ok {
+				frame.rowCount = rc.RowsAffected()
+			}
 		}
 		if s.Strict {
 			if rowCount == 0 {
@@ -2027,6 +2059,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// PostgreSQL sets FOUND after a SQL statement to whether it produced /
 		// affected at least one row. M0118-0009 (design 0118-0097).
 		frame.found = n > 0
+		frame.rowCount = int64(n)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.SelectIntoStmt:
@@ -2099,6 +2132,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				Hint: "Make sure the query returns a single row, or use LIMIT 1."}
 		}
 		bindSelectIntoRow(s.Targets, firstRow, schema, frame, ctx)
+		// exec_stmt_execsql sets FOUND and eval_processed for an INTO
+		// statement too (M0146-0081).
+		frame.found = rowCount > 0
+		frame.rowCount = int64(rowCount)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.ForSelectStmt:
@@ -2289,6 +2326,52 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flow, nil
 
+	case *plpgsql.GetDiagStmt:
+		// GET [CURRENT | STACKED] DIAGNOSTICS (pl_exec.c exec_stmt_getdiag).
+		// M0146-0081.
+		if s.Stacked && frame.caughtErr == nil {
+			return Datum{}, flowNone, &ExecError{Code: "0Z002", Message: "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"}
+		}
+		for _, it := range s.Items {
+			idx, ok := frame.lookup(it.Target)
+			if !ok {
+				return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("%q is not a scalar variable", it.Target)}
+			}
+			var v Datum
+			switch it.Item {
+			case "ROW_COUNT":
+				v = NewIntDatum(frame.rowCount)
+			case "PG_ROUTINE_OID":
+				if r == nil {
+					v = NewIntDatum(0)
+				} else {
+					v = NewIntDatum(int64(r.OID))
+				}
+			case "RETURNED_SQLSTATE":
+				v = NewStringDatum(frame.caughtErr.Code)
+			case "MESSAGE_TEXT":
+				v = NewStringDatum(frame.caughtErr.Message)
+			case "PG_EXCEPTION_DETAIL":
+				v = NewStringDatum(frame.caughtErr.Detail)
+			case "PG_EXCEPTION_HINT":
+				v = NewStringDatum(frame.caughtErr.Hint)
+			default:
+				// PG_CONTEXT / PG_EXCEPTION_CONTEXT need the PL/pgSQL error
+				// context stack, and COLUMN_NAME / CONSTRAINT_NAME /
+				// PG_DATATYPE_NAME / TABLE_NAME / SCHEMA_NAME the error's
+				// object-name fields (edata); ExecError carries neither, and an
+				// empty string would be a wrong value for, e.g., a unique
+				// violation (ledgered).
+				return Datum{}, flowNone, &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("GET DIAGNOSTICS %s is not supported", it.Item)}
+			}
+			cv, err := plpgsqlAssignCoerce(v, frame.types[idx], s.Pos(), fmt.Sprintf("variable %q", it.Target), ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			frame.values[idx] = cv
+		}
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ExceptionBlock:
 		// BEGIN...EXCEPTION...END — try/catch block. M0097-0012.
 		// Execute TryBody; if it errors, try matching handlers.
@@ -2314,7 +2397,14 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				// M0118-0009 (intra-grant-inplace perm 10, design 0118-0117).
 				setPlpgsqlFrameVar(frame, "sqlerrm", NewStringDatum(errMsg))
 				setPlpgsqlFrameVar(frame, "sqlstate", NewStringDatum(sqlstate))
+				caught, _ := err.(*ExecError)
+				if caught == nil {
+					caught = &ExecError{Code: sqlstate, Message: errMsg}
+				}
+				savedCaught := frame.caughtErr
+				frame.caughtErr = caught
 				hv, hflow, herr := executePLpgSQLStmtList(h.Body, r, frame, ctx)
+				frame.caughtErr = savedCaught
 				if herr != nil {
 					return Datum{}, flowNone, herr
 				}
@@ -3450,8 +3540,30 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) (int,
 			rows++
 		}
 		op.Close()
+		// A DML statement's count is the rows it processed, not the rows
+		// it returned: PG's SPI_processed (FOUND, ROW_COUNT) is es_processed,
+		// the same count as the command tag, so `INSERT …` without
+		// RETURNING sets FOUND, and `WITH d AS (DELETE …) INSERT …` counts
+		// only the top-level INSERT (M0146-0081).
+		if planIsDMLStatement(plan) {
+			if rc, ok := op.(RowCounter); ok {
+				rows = int(rc.RowsAffected())
+			}
+		}
 	}
 	return rows, nil
+}
+
+// planIsDMLStatement reports whether plan is an INSERT, UPDATE, DELETE or
+// MERGE statement, including one led by data-modifying WITH queries.
+func planIsDMLStatement(plan optimizer.Node) bool {
+	switch p := plan.(type) {
+	case *optimizer.Insert, *optimizer.Update, *optimizer.Delete, *optimizer.Merge:
+		return true
+	case *optimizer.CTEDMLPrefix:
+		return planIsDMLStatement(p.Body)
+	}
+	return false
 }
 
 // substituteTriggerRefs replaces OLD.* / NEW.* / OLD.colname / NEW.colname

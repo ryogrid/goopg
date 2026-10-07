@@ -115,6 +115,17 @@ func (o *cteDMLPrefixOp) buildUnderScope(n optimizer.Node) (Operator, error) {
 
 func (o *cteDMLPrefixOp) Schema() optimizer.Schema { return o.plan.Body.Output() }
 
+// RowsAffected reports the top-level statement's count, which is what the
+// CommandComplete tag carries: the data-modifying CTEs' rows are not counted
+// (PG's es_processed is advanced only by the top-level ModifyTable, see
+// ExecModifyTable's canSetTag). M0146-0081.
+func (o *cteDMLPrefixOp) RowsAffected() int64 {
+	if rc, ok := o.inner.(RowCounter); ok {
+		return rc.RowsAffected()
+	}
+	return 0
+}
+
 func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	o.ctx = ctx
 

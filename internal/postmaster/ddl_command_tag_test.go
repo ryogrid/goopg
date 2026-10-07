@@ -162,3 +162,22 @@ func TestCommandTagForMergeIsMergeN(t *testing.T) {
 		t.Fatalf("MERGE tag = %q, want MERGE 2", got)
 	}
 }
+
+// A statement led by data-modifying WITH queries completes with its
+// top-level statement's tag and count; it reported `SELECT 0` (M0146-0081).
+func TestCommandTagForWritableCTEUsesTopLevelTag(t *testing.T) {
+	for _, c := range []struct {
+		body optimizer.Node
+		want string
+	}{
+		{&optimizer.Insert{}, "INSERT 0 1"},
+		{&optimizer.Update{}, "UPDATE 1"},
+		{&optimizer.Delete{}, "DELETE 1"},
+		{&optimizer.Merge{}, "MERGE 1"},
+	} {
+		node := &optimizer.CTEDMLPrefix{Body: c.body}
+		if got := commandTagFor(node, fakeRowCounter{n: 1}, 0); got != c.want {
+			t.Errorf("WITH … %T tag = %q, want %s", c.body, got, c.want)
+		}
+	}
+}

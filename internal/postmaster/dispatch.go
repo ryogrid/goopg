@@ -3973,6 +3973,14 @@ func commandTagFor(node optimizer.Node, op executor.Operator, rowCount int64) st
 		// MERGE <n>: rows inserted, updated or deleted (cmdtaglist.h
 		// CMDTAG_MERGE; DO NOTHING rows are not counted). M0146-0075.
 		return fmt.Sprintf("MERGE %d", rowsAffected(op))
+	case *optimizer.CTEDMLPrefix:
+		// A statement with data-modifying WITH queries completes with its
+		// top-level statement's tag and row count, never the CTEs'
+		// (`WITH d AS (DELETE …) INSERT …` is `INSERT 0 n`; PG takes the tag
+		// from the top-level Query's commandType and es_processed counts only
+		// the top-level ModifyTable). The prefix operator forwards
+		// RowsAffected to the body. M0146-0081.
+		return commandTagFor(n.Body, op, rowCount)
 	case *optimizer.Transaction:
 		return transactionTag(n.Verb)
 	case *optimizer.Utility:

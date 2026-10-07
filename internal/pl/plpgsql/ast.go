@@ -203,6 +203,24 @@ type NullStmt struct {
 func (n *NullStmt) Pos() int         { return n.pos }
 func (n *NullStmt) plpgsqlStmtNode() {}
 
+// GetDiagStmt is `GET [CURRENT | STACKED] DIAGNOSTICS target = item [, …]`
+// (pl_gram.y stmt_getdiag). Item is the upper-case item name, e.g.
+// ROW_COUNT or MESSAGE_TEXT. M0146-0081.
+type GetDiagStmt struct {
+	pos     int
+	Stacked bool
+	Items   []GetDiagItem
+}
+
+// GetDiagItem is one `target = item` pair of a GET DIAGNOSTICS statement.
+type GetDiagItem struct {
+	Target string
+	Item   string
+}
+
+func (g *GetDiagStmt) Pos() int         { return g.pos }
+func (g *GetDiagStmt) plpgsqlStmtNode() {}
+
 // TxControlStmt is a PL/pgSQL transaction-control statement: `COMMIT;` or
 // `ROLLBACK;`. Permitted only in a non-atomic execution context (a top-level
 // DO block or a procedure invoked outside an explicit transaction block); in

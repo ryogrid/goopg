@@ -368,6 +368,10 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 	// same embedded-SQL path as GRANT/REVOKE above. M0134-0046.
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwSet:
 		return p.parseSQLStmt()
+	// GET [CURRENT | STACKED] DIAGNOSTICS … (pl_gram.y stmt_getdiag).
+	// M0146-0081.
+	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "get") && !p.identStartsAssignment():
+		return p.parseGetDiag()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start.
 		// Handle: ident := value (assignment)
@@ -639,6 +643,80 @@ func (p *bodyParser) parsePerform() (*PerformStmt, error) {
 	// as SQL by the runtime via Query.
 	if expr, perr := parser.ParseExpr(raw); perr == nil {
 		stmt.Expr = expr
+	}
+	return stmt, nil
+}
+
+// getDiagItems lists the GET DIAGNOSTICS items (pl_gram.y getdiag_item) and
+// whether each is a stacked-only (true) or current-only (false) item.
+// PG_CONTEXT is valid in both forms and is listed separately.
+var getDiagItems = map[string]bool{
+	"ROW_COUNT":            false,
+	"PG_ROUTINE_OID":       false,
+	"PG_EXCEPTION_CONTEXT": true,
+	"PG_EXCEPTION_DETAIL":  true,
+	"PG_EXCEPTION_HINT":    true,
+	"RETURNED_SQLSTATE":    true,
+	"COLUMN_NAME":          true,
+	"CONSTRAINT_NAME":      true,
+	"PG_DATATYPE_NAME":     true,
+	"MESSAGE_TEXT":         true,
+	"TABLE_NAME":           true,
+	"SCHEMA_NAME":          true,
+}
+
+// parseGetDiag parses `GET [CURRENT | STACKED] DIAGNOSTICS target {= | :=}
+// item [, …] ;` and checks each item against the area, as pl_gram.y's
+// stmt_getdiag does. M0146-0081.
+func (p *bodyParser) parseGetDiag() (*GetDiagStmt, error) {
+	getTok := p.advance() // consume GET
+	stmt := &GetDiagStmt{pos: getTok.Pos}
+	if t := p.cur(); t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword {
+		switch strings.ToLower(t.Value) {
+		case "current":
+			p.advance()
+		case "stacked":
+			stmt.Stacked = true
+			p.advance()
+		}
+	}
+	if t := p.cur(); !strings.EqualFold(t.Value, "diagnostics") {
+		return nil, p.errAtCur("syntax error at or near %q", t.Value)
+	}
+	p.advance() // consume DIAGNOSTICS
+	for {
+		target := p.cur()
+		if target.Kind != parser.TokenIdent && target.Kind != parser.TokenKeyword {
+			return nil, p.errAtCur("syntax error at or near %q", target.Value)
+		}
+		p.advance()
+		if op := p.cur(); op.Value != "=" && op.Value != ":=" {
+			return nil, p.errAtCur("syntax error at or near %q", op.Value)
+		}
+		p.advance()
+		itemTok := p.cur()
+		item := strings.ToUpper(itemTok.Value)
+		stackedOnly, known := getDiagItems[item]
+		if item != "PG_CONTEXT" {
+			if !known || (itemTok.Kind != parser.TokenIdent && itemTok.Kind != parser.TokenKeyword) {
+				return nil, p.errAtCur("unrecognized GET DIAGNOSTICS item")
+			}
+			if stackedOnly && !stmt.Stacked {
+				return nil, p.errAt(getTok.Pos, "diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS", item)
+			}
+			if !stackedOnly && stmt.Stacked {
+				return nil, p.errAt(getTok.Pos, "diagnostics item %s is not allowed in GET STACKED DIAGNOSTICS", item)
+			}
+		}
+		p.advance()
+		stmt.Items = append(stmt.Items, GetDiagItem{Target: target.Value, Item: item})
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("syntax error at or near %q", p.cur().Value)
 	}
 	return stmt, nil
 }

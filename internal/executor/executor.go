@@ -926,3 +926,12 @@ func (o *stmtCTEScopeOp) Close() error {
 	defer o.enter()()
 	return o.trig.finish(o.ctx, o.Operator.Close())
 }
+
+// RowsAffected forwards the root's DML count, which the embedded Operator
+// interface does not promote (M0146-0081).
+func (o *stmtCTEScopeOp) RowsAffected() int64 {
+	if rc, ok := o.Operator.(RowCounter); ok {
+		return rc.RowsAffected()
+	}
+	return 0
+}
