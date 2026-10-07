@@ -28177,7 +28177,7 @@ Movement: none — instrument artefact — PL/pgSQL binding fix with no TPC witn
     - Ledgered: the witness is a SubPlan where PG builds a Hash Semi Join;
       the key carries every enclosing level\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0080 — WRONG RESULTS: PL/pgSQL RAISE parameters that are
+- [x] **M0146\-0080 — WRONG RESULTS: PL/pgSQL RAISE parameters that are
   sublinks print empty; integer subquery → text variable errors** \(filed
   2026\-10\-07 by M0146\-0076\)\. `RAISE NOTICE \'b=% c=% d=%\', \(SELECT
   count\(\*\) FROM r\), \(SELECT 5\), 1 \+ \(SELECT max\(a\) FROM r\)` prints
@@ -28194,6 +28194,21 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     take; route sublink params through `evalPLpgSQLExpr` \(the M0146\-0072
     binder\); for the assignment, apply the variable\'s assignment cast
     instead of `coerceDatumToType`\'s exact\-type check\.
+  - Done 2026\-10\-07 \(`f7f5b1f31`; design
+    `docs/design/0100\-0149/m0146\-0080\-plpgsql\-raise\-args\-assign\-coercion\.md`\):
+    - RAISE arguments go through `evalPLpgSQLExpr` and propagate errors;
+      `plpgsqlAssignCoerce` gives DECLARE/`:=`/RETURN PG\'s assignment
+      coercion \(input function for strings, text I/O fallback\)\.
+    - Errors the swallowing hid, fixed: `int\[\]` typed as scalar,
+      pg\_trigger\_depth, `rec\.\*`/`rec\.field`, DML RETURNING INTO,
+      EXECUTE INTO record, USING cut, MaxArraySize guard\.
+    - `ROW\(rec\.\*\)` expands; `ROW\(\)` calls compare element\-wise
+      \(`ROW\(1,NULL\) = ROW\(1,NULL\)` was TRUE, PG NULL\)\.
+    - Regress plpgsql 4359→4188, triggers 2670→2570, arrays 3179→3171;
+      domain \+6 \(typmod gap, ledgered\)\.
+    - Filed M0146\-0084 \(testpolym lookup depends on state\); ledgered
+      the PL/pgSQL decoration, nested\-block, typmod and wire\-type gaps\.
+Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
 - [ ] **M0146\-0081 — WRONG RESULTS: a writable\-CTE INSERT reports the
   command tag `SELECT 0`** \(filed 2026\-10\-07 by M0146\-0076\)\. `WITH d
   AS \(DELETE FROM t WHERE a = 6 RETURNING a\) INSERT INTO t SELECT a \+ 100
@@ -28240,6 +28255,21 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     wire uses \(the fkValsForDetail DateStyle fix is a precedent\) and check
     timestamp/numeric/float/bytea cells too; every NOT NULL / CHECK /
     unique DETAIL site goes through formatRowForDetail\.
+- [ ] **M0146\-0084 — WRONG RESULTS: regress polymorphism\'s `testpolym`
+  lookup fails depending on session state** \(filed 2026\-10\-07 by
+  M0146\-0080\)\. `select \* from testpolym\(37\)` \(polymorphism\.sql:930\)
+  fails `function testpolym does not exist` in some runs of the same binary
+  on a fresh cluster and passes in others \(regress A/B diff 2272 vs 2277
+  lines\); HEAD fails too when the file runs without test\_setup\. PG 18\.3
+  returns `37`\.
+  Kind: bug
+  Parent: M0146\-0080
+  > ## ESCALATION 2026\-10\-07 \(S2\) — function lookup depends on prior session state
+  > Filed by M0146\-0080, not worked\. Owner: place M0146\-0084 in the banner\.
+  - First step: rerun polymorphism\.sql to the failing statement twice on
+    fresh clusters and diff the pg\_proc rows for testpolym \(overload set,
+    proargtypes, proretset\) and the search\_path between a passing and a
+    failing run\.
 - [x] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
