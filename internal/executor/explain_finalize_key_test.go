@@ -45,3 +45,53 @@ func TestFinalizeGroupKeyOverGatherMergeIsParenthesised(t *testing.T) {
 		t.Fatalf("want the Finalize key parenthesised:\n%s", joined)
 	}
 }
+
+// TestFinalizeGroupKeyOverUnionAllPrintsPartialText pins the M0146-0042
+// slice for TPC-DS Q76's shape: a Finalize aggregate's keys index the
+// Partial's transport row, and PG deparses them through the Gather into the
+// Partial's target list, so both print the same text. PG 18.3 (same
+// settings):
+//
+//	Finalize GroupAggregate
+//	  Group Key: ('x'::text), zu1.a
+//	  ->  Gather Merge
+//	        ->  Partial GroupAggregate
+//	              Group Key: ('x'::text), zu1.a
+//
+// goopg printed the Finalize's output names bare (`ch, a`).
+func TestFinalizeGroupKeyOverUnionAllPrintsPartialText(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE zu1 (a int, b int)")
+	runSQL(t, ctx, "CREATE TABLE zu2 (a int, b int)")
+	runSQL(t, ctx, "INSERT INTO zu1 SELECT i % 50, i FROM generate_series(1,20000) i")
+	runSQL(t, ctx, "INSERT INTO zu2 SELECT i % 50, i FROM generate_series(1,20000) i")
+	runSQL(t, ctx, "ANALYZE zu1")
+	runSQL(t, ctx, "ANALYZE zu2")
+	ps := optimizer.DefaultPlannerSettings()
+	ps.MaxParallelWorkersPerGather = 2
+	ps.ParallelSetupCost = 0
+	ps.ParallelTupleCost = 0
+	ps.MinParallelTableScanSize = 0
+	ps.EnableHashAgg = false
+	const q = "SELECT ch, a, count(*) FROM (SELECT 'x' AS ch, a FROM zu1 UNION ALL SELECT 'y', a FROM zu2) s GROUP BY ch, a"
+	var lines []string
+	for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)) {
+		if len(r) > 0 && r[0].Kind == KindString {
+			lines = append(lines, strings.TrimSpace(r[0].StringValue()))
+		}
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Finalize GroupAggregate") || !strings.Contains(joined, "Partial GroupAggregate") {
+		t.Fatalf("the shape under test is gone (want Finalize over Partial GroupAggregate):\n%s", joined)
+	}
+	var keys []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "Group Key: ") {
+			keys = append(keys, l)
+		}
+	}
+	if len(keys) != 2 || keys[0] != keys[1] || keys[0] != "Group Key: ('x'::text), zu1.a" {
+		t.Fatalf("want PG's `Group Key: ('x'::text), zu1.a` on both aggregates, got %q:\n%s", keys, joined)
+	}
+}

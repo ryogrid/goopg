@@ -1632,6 +1632,68 @@ func chaseAggregateResultArgs(call optimizer.AggregateCall, child optimizer.Node
 	return call, changed
 }
 
+// aggGroupKeyText renders group key gi of agg as its Group Key line does
+// (show_agg_keys): a ColumnRef key chased to the source PG prints, and a
+// non-Var key parenthesised when the aggregate reads it through its input's
+// target list (keyChildPassesThrough).
+//
+// A Finalize aggregate's keys index the Partial's transport row, which
+// resolveKeySource refuses to read (M0146-0005ce). PG deparses them through
+// the Gather into the Partial's own target list, so the two print the same
+// text: TPC-DS Q76's `Group Key: ('store'::text), ('ss_customer_sk'::text),
+// date_dim.d_year, …` on both, where goopg printed the Finalize's output
+// names bare (M0146-0042). A group position of the Partial renders as the
+// Partial's key there.
+func aggGroupKeyText(p *optimizer.Aggregate, gi int, reg *subPlanReg, qualify bool) string {
+	keyExpr := p.GroupExprs[gi]
+	if p.Mode == optimizer.AggModeFinal {
+		if cr, ok := keyExpr.(*optimizer.ColumnRef); ok {
+			if partial := partialAggregateBelow(p.Child); partial != nil && partial.GroupingSets == nil &&
+				cr.Index >= 0 && cr.Index < len(partial.GroupExprs) {
+				return aggGroupKeyText(partial, cr.Index, reg, qualify)
+			}
+		}
+	}
+	if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
+		if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
+			keyExpr = chased
+		}
+	}
+	s := formatKeyExprQual(keyExpr, reg, qualify)
+	if keyChildPassesThrough(p.Child) {
+		if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
+			s = forceParen(s)
+		}
+	}
+	return s
+}
+
+// partialAggregateBelow finds the Partial aggregate a Finalize combines,
+// looking through the Gather / Gather Merge and the Sort that feed it — the
+// printed node, not the construction-time PartialSource copy.
+func partialAggregateBelow(n optimizer.Node) *optimizer.Aggregate {
+	for n != nil {
+		switch x := n.(type) {
+		case *optimizer.Aggregate:
+			if x.Mode == optimizer.AggModePartial {
+				return x
+			}
+			return nil
+		case *optimizer.Gather:
+			n = x.Child
+		case *optimizer.GatherMerge:
+			n = x.Child
+		case *optimizer.Sort:
+			n = x.Child
+		case *optimizer.IncrementalSort:
+			n = x.Child
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 // inputIsSetOp reports whether n is a set operation, looking through the
 // row-transport wrappers that publish their child's columns unchanged
 // (Gather, Gather Merge, Sort, Materialize): TPC-DS Q75's UNION dedupe reads
@@ -2791,27 +2853,14 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			// equally a Gather Merge under a Finalize GroupAggregate (TPC-DS
 			// Q62's `(substr(…))`): show_agg_keys deparses the key against the
 			// child's targetlist, which there is an OUTER_VAR.
-			groupAgg := keyChildPassesThrough(p.Child)
 			parts := make([]string, 0, len(order))
 			for _, gi := range order {
 				// R66 Slice 2: a ColumnRef group key chases past
 				// republishing layers to the source PG prints (Q7
 				// `supp_nation` → `n1.n_name`); a miss keeps today's
-				// text. Non-ColumnRef group keys already render
-				// source and never enter the chase.
-				keyExpr := p.GroupExprs[gi]
-				if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
-					if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
-						keyExpr = chased
-					}
-				}
-				s := formatKeyExprQual(keyExpr, reg, qualify)
-				if groupAgg {
-					if _, isVar := keyExpr.(*optimizer.ColumnRef); !isVar {
-						s = forceParen(s)
-					}
-				}
-				parts = append(parts, s)
+				// text. aggGroupKeyText also renders a Finalize key
+				// through its Partial (M0146-0042).
+				parts = append(parts, aggGroupKeyText(p, gi, reg, qualify))
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
 		}
