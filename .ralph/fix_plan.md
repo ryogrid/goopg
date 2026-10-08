@@ -29922,7 +29922,7 @@ Movement: SF1 join\-order 53\-\>52, join\-method 21\-\>20, scan\-type 34\-\>33, 
     - Q78 now differs from PG only in the ws/cs join order and rendering\. Design:
       `docs/design/0100\-0149/m0146\-0101\-innerunique\-original\-groupby\.md`\.
 Movement: SF1 join\-method 20\-\>19, parameterisation 30\-\>29, sort\-strategy 27\-\>26, parallelism 40\-\>39; SF0\.25 join\-method 23\-\>22, parameterisation 25\-\>24, sort\-strategy 25\-\>24, parallelism 26\-\>25\.
-- [ ] **M0146\-0102 — a GROUP BY whose every key is constant\-pinned runs PG\'s keyless grouped aggregate**
+- [x] **M0146\-0102 — a GROUP BY whose every key is constant\-pinned runs PG\'s keyless grouped aggregate**
   \(filed 2026\-10\-08 while reviewing the M0146\-0042 rendering census\)\. TPC\-DS Q44\'s InitPlan groups
   `\.\.\. WHERE ss\_store\_sk = 4 GROUP BY ss\_store\_sk`\.
   - PG prunes the pinned key \(processed\_groupClause empty\) and plans `Finalize GroupAggregate \-\> Gather \-\>
@@ -29933,3 +29933,9 @@ Movement: SF1 join\-method 20\-\>19, parameterisation 30\-\>29, sort\-strategy 2
   Parent: M0146\-0005
   - First step: allow full pruning, mark the node grouped\-without\-keys, and keep the executor from pre\-creating
     the empty group for it \(serial and Partial/Finalize\)\.
+  - Done 2026\-10\-08 \(6483d380b\)\.
+    - `redundantConstGroupKeys` may prune every key, and the node is marked `Aggregate\.GroupedNoKeys`\.
+    - `aggregateOp\.Open` skips the pre\-created empty group for it; the Partial/Finalize split copies the flag\.
+    - EXPLAIN labels it GroupAggregate / Group\.
+    - Q44 is a full MATCH at SF1\. Design: `docs/design/0100\-0149/m0146\-0102\-keyless\-grouped\-aggregate\.md`\.
+Movement: yes — PLAN\-PARITY match SF1 34 → 35 \(Q44\); SF0\.25 sort\-strategy 24 → 23, parallelism 25 → 24, rendering 3 → 2
