@@ -1738,6 +1738,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// M0146-0005dl: remove_useless_joins — an unread LEFT JOIN to a
 		// unique-keyed table never reaches the FROM-clause planner.
 		s = removeUselessLeftJoins(s, cat)
+		// M0146-0115: remove_useless_self_joins — an inner self-join on a
+		// unique key keeps one of the two scans.
+		s = removeUselessSelfJoins(s, cat)
 		s = pushWhereQualsIntoGroupedItems(s, cat)
 		// M0146-0094: set_append_rel_size's push of the appendrel's
 		// restrictions into its UNION ALL members.
