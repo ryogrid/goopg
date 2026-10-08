@@ -1931,7 +1931,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				whereQual = nil
 			} else {
 				if len(pulledQuals) > 0 {
-					pred = combineAnd(append([]Expr{pred}, pulledQuals...))
+					// M0146-0116: the pulled bodies' quals first — PG
+					// distributes a FromExpr's items before its own quals
+					// (deconstruct_recurse), and that order is the
+					// equivalence classes' member order.
+					pred = combineAnd(append(append([]Expr{}, pulledQuals...), pred))
 				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}

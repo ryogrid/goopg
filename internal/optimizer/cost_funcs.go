@@ -804,6 +804,13 @@ type hashJoinInputs struct {
 	// clause is charged per input row on both sides.
 	numHashClauses int
 
+	// hashQualCost is final_cost_hashjoin's `hash_qual_cost.per_tuple`:
+	// cost_qual_eval over the hash clauses (hashClausesPerTuple), which the
+	// bucket walk pays per comparison. A key that is an expression
+	// (`(a - 53) = b`) costs its operators too (M0146-0116). Zero falls back
+	// to one cpu_operator_cost per clause.
+	hashQualCost float64
+
 	// qualPerTuple is final_cost_hashjoin's `qp_qual_cost.per_tuple`: the
 	// join's non-hash quals (joinQualPerTuple, correlated SubPlans priced per
 	// call). PG charges it with cpu_tuple_cost on hashjointuples — the
@@ -908,6 +915,11 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	run := (in.outer.Total - in.outer.Startup) +
 		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows
 
+	hashQual := in.hashQualCost
+	if hashQual == 0 {
+		hashQual = cp.cpuOperatorCost * float64(in.numHashClauses)
+	}
+
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
 	// take2 P2-11: the bucket walk. PG charges
@@ -930,8 +942,7 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		if in.innerBucketSize > 0 {
 			innerScanFrac := 2.0 / (math.Max(1.0, in.final.matchCount) + 1.0)
 			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
-			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-				outerMatched * bucketTuples * 0.5
+			run += hashQual * outerMatched * bucketTuples * 0.5
 		}
 		// PG's hashjointuples in this branch is outer_matched_rows, not the
 		// join's result cardinality (M0146-0005e); for ANTI it is the
@@ -945,22 +956,19 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 
 		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
 		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
-		// existing cpuOperatorCost*numHashClauses remains this model's surrogate
-		// for hash_qual_cost.per_tuple; no general QualCost model is implied.
+		// bucket walk pays hash_qual_cost.per_tuple (hashQual).
 		geoRows, geoMem := in.hashGeometryInputs(cp)
 		if geometry, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok {
 			unmatched := in.outerRows - outerMatched
 			if unmatched > 0 {
 				bucketTuples := clampRowEst(in.innerRows / float64(geometry.virtualBuckets))
-				run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-					unmatched * bucketTuples * 0.05
+				run += hashQual * unmatched * bucketTuples * 0.05
 			}
 		}
 	} else {
 		if in.innerBucketSize > 0 {
 			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
-			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-				in.outerRows * bucketTuples * 0.5
+			run += hashQual * in.outerRows * bucketTuples * 0.5
 		}
 		// PG's hashjointuples here is approx_tuple_count over the hash
 		// clauses and the two paths' own rows (M0146-0005e).

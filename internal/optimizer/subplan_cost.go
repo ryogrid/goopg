@@ -180,6 +180,20 @@ func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
 	return per
 }
 
+// hashClausesPerTuple is final_cost_hashjoin's `hash_qual_cost.per_tuple`:
+// cost_qual_eval (qualEvalOps) over the hash clauses. A plain `a = b` costs
+// one cpu_operator_cost; an expression key adds its own operators.
+func hashClausesPerTuple(cp costParams, keys []*restrictInfo) float64 {
+	per := 0.0
+	for _, ri := range keys {
+		if ri != nil {
+			_, p := qualEvalOps(ri.clause)
+			per += p
+		}
+	}
+	return cp.cpuOperatorCost * per
+}
+
 // joinQualEvalCost is qualEvalCost for a join's residual restrictInfos,
 // including the SubPlans' per-evaluation cost.
 func joinQualEvalCost(cp costParams, quals []*restrictInfo, tuples float64) float64 {

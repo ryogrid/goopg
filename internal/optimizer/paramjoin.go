@@ -121,6 +121,7 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				outerRows: o.Rows, innerRows: i.Rows,
 				outputRows:       rows,
 				numHashClauses:   len(keys),
+				hashQualCost:     hashClausesPerTuple(cp, keys),
 				innerBucketSize:  bucket,
 				final:            *final,
 				outerWidth:       pathWidth(o),

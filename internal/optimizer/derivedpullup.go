@@ -514,6 +514,7 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 	copy(order, cands)
 	sort.SliceStable(order, func(i, j int) bool { return order[i].depth > order[j].depth })
 	relOf := make(map[*derivedPullupCandidate]*pulledDerivedRel, len(cands))
+	qualOf := make(map[*derivedPullupCandidate]Expr, len(cands))
 	for _, c := range order {
 		bodyBindings := make([]rangeBinding, 0, c.bindHi-c.bindLo)
 		for bi := c.bindLo; bi < c.bindHi; bi++ {
@@ -600,7 +601,7 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 				return nil, nil, nil, false
 			}
 			q = lowered
-			quals = append(quals, q)
+			qualOf[c] = q
 			// M0146-0028f: remember the body context per conjunct for the
 			// jointree sublink pull-up (resolveContext.pulledQualCtx).
 			if qualCtx == nil {
@@ -617,6 +618,29 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 			rels = append(rels, relOf[c])
 		}
 	}
+	// M0146-0116: the quals come back in deconstruct_jointree's order
+	// (initsplan.c deconstruct_recurse): a FromExpr's items are processed
+	// left to right before its own quals, so a pulled body's WHERE follows
+	// its children's and precedes its right-hand siblings'. The order is
+	// the equivalence classes' member order, which picks the members a
+	// join clause equates (generate_join_implied_equalities_normal).
+	var emit func(parent *derivedPullupCandidate)
+	emit = func(parent *derivedPullupCandidate) {
+		var kids []*derivedPullupCandidate
+		for _, c := range cands {
+			if c.parent == parent {
+				kids = append(kids, c)
+			}
+		}
+		sort.SliceStable(kids, func(i, j int) bool { return kids[i].itemLo < kids[j].itemLo })
+		for _, c := range kids {
+			emit(c)
+			if q := qualOf[c]; q != nil {
+				quals = append(quals, q)
+			}
+		}
+	}
+	emit(nil)
 	return rels, quals, qualCtx, true
 }
 

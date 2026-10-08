@@ -105,6 +105,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		outerRows: p.Rows, innerRows: b.Rows,
 		outputRows:      joinRel.Rows,
 		numHashClauses:  len(keys),
+		hashQualCost:    hashClausesPerTuple(cp, keys),
 		innerBucketSize: innerBucketSize,
 		final:           final,
 		outerWidth:      pathWidth(p),
