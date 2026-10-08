@@ -30187,3 +30187,15 @@ Movement: yes — TPC\-DS Q59 full MATCH at SF0\.25 \(match 45 → 46, join\-ord
     - Design: `docs/design/0100\-0149/m0146\-0118\-join\-residual\-qual\-cost\.md`\.
     - Ledgered: qp\_qual\_cost\.startup at join startup; casts priced 0\.
 Movement: yes — TPC\-DS Q11 full MATCH at SF0\.25 \(match 46 → 47, join\-order 44 → 43, qual\-placement 10 → 9\); SF1 categories unchanged
+- [x] **M0146\-0119 — a pulled\-up body whose targets are `\*` / `alias\.\*` is pulled up**
+  \(filed 2026\-10\-09 from the M0146\-0007i ledger row, part \(1\)\)\. Regress subselect\'s NOT MATERIALIZED pair merge\-joined on
+  `\(now\(\)\)` where PG gates the nested loop with `One\-Time Filter: \(now\(\) = now\(\)\)`\.
+  Kind: impl
+  Parent: M0146-0007
+  - First step: expand star targets of a pulled body before the is\_simple\_subquery gate\.
+  - Done 2026\-10\-09 \(532e61d73\)\.
+    - `expandPullupBodyStars` \(derivedpullup\.go\); fail\-closed on unnamed outputs, NATURAL/USING, non\-inlined CTEs\.
+    - Regress with 3014 → 2997 \(one ERROR fixed\), subselect 2694 → 2686\. Design:
+      `docs/design/0100\-0149/m0146\-0119\-pulled\-star\-body\.md`\.
+    - Ledgered: VERBOSE Output lists of pulled bodies; duplicate output names; unnamed expression outputs\.
+Movement: none — instrument artefact: no TPC query pulls up a star body; regress with 3014 → 2997 \(one ERROR fixed\)
