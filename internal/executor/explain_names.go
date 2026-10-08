@@ -797,6 +797,23 @@ func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
 // a relation still prints qualified (`current_addr.ca_city`). "" when the
 // walk does not reach a named scan through plain column references.
 func (nm *explainNames) joinResidualColumn(join optimizer.Node, idx int) string {
+	// M0146-0107: a semi or anti join publishes one side only, but its keys
+	// and residual still index both inputs side by side, so the walk's
+	// output-row arm (concatJoinSide) declined at the join itself and a
+	// key over the inner side printed bare. TPC-DS Q23's `IN (select
+	// c_customer_sk from best_ss_customer)` prints PG's
+	// `best_ss_customer.c_customer_sk` once the first step maps the
+	// position onto the input that holds it.
+	if j, ok := join.(*optimizer.Join); ok && j.Left != nil && j.Right != nil {
+		switch j.Type {
+		case optimizer.JoinTypeSemi, optimizer.JoinTypeAnti, optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+			lw := len(j.Left.Output())
+			if idx < lw {
+				return nm.resolvedColumn(j.Left, idx, false)
+			}
+			return nm.resolvedColumn(j.Right, idx-lw, false)
+		}
+	}
 	return nm.resolvedColumn(join, idx, false)
 }
 
@@ -857,6 +874,15 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			n = p.Child
 		case *optimizer.Materialize:
 			// M0146-0010: same transparency — a buffer renames nothing.
+			n = p.Child
+		case *optimizer.DistinctOn:
+			// M0146-0107: a semi join's unique-ified inner (printed
+			// HashAggregate / Unique) republishes its input position for
+			// position; a key over it deparses to the column below, as
+			// `(m107s.k = c.k)` over a unique-ified CTE scan.
+			if requireSetOp || p.Child == nil || len(p.Output()) != len(p.Child.Output()) {
+				return ""
+			}
 			n = p.Child
 		case *optimizer.Distinct:
 			// A UNION's dedupe (printed HashAggregate / Unique) republishes

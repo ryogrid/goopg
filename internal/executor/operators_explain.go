@@ -1182,6 +1182,31 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			// and a recursive self-reference has no body to enter: both
 			// keep today's text.
 			col, ok := cur.(*optimizer.ColumnRef)
+			if ok && !n.Inlined() && col.Index >= 0 && reg != nil {
+				// M0146-0107: a kept CTE scan is a relation of its own in
+				// PG's range table, and get_variable names its column with
+				// the scan's set_rtable_names label, as for a base relation:
+				// a semi join's NestLoop param over a unique-ified CTE
+				// prints `cross_items.ss_item_sk` (TPC-DS Q14).
+				out := n.Output()
+				if col.Index >= len(out) || out[col.Index].Name != col.Name {
+					return nil, false
+				}
+				lbl := reg.names().disambiguatedName(n)
+				if lbl == "" {
+					lbl, _ = explainRelBaseName(n)
+				}
+				if lbl == "" {
+					return nil, false
+				}
+				at := &optimizer.ColumnRef{Index: col.Index, Name: out[col.Index].Name,
+					Type: out[col.Index].Type, SourceTableIdx: out[col.Index].SourceTableIdx}
+				if reg.boundaryKeyName == nil {
+					reg.boundaryKeyName = map[*optimizer.ColumnRef]string{}
+				}
+				reg.boundaryKeyName[at] = pgQuoteIdent(lbl) + "." + pgQuoteIdent(at.Name)
+				return at, true
+			}
 			if !ok || !n.Inlined() || n.Child == nil || col.Index < 0 {
 				return nil, false
 			}
@@ -1445,6 +1470,16 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 				// `item.i_manufact_id`).
 				if ac, isCol := at.(*optimizer.ColumnRef); isCol && ac.Name == tc.Name &&
 					(lvl || ac.SourceTableIdx == tc.SourceTableIdx) {
+					return at, true
+				}
+				// M0146-0107: the walk stopped at a kept Subquery Scan
+				// (boundaryKeyName) at the position the target names. That
+				// scan's output is the target's own column under the
+				// subquery's alias: PG's NestLoop param in TPC-DS Q44 prints
+				// `v11.item_sk`. The scan numbers its columns at its own
+				// query level, so the relation ids cannot be compared.
+				if ac, isCol := at.(*optimizer.ColumnRef); isCol && ac.Name == tc.Name &&
+					reg != nil && reg.boundaryKeyName[ac] != "" {
 					return at, true
 				}
 				// M0146-0042: across a query-level boundary the column
@@ -3435,11 +3470,22 @@ func formatIndexCondKey(e optimizer.Expr, reg *subPlanReg) string {
 		qualify = reg.names().qualify()
 	}
 	if oc, ok := e.(*optimizer.OuterColumnRef); ok && qualify {
-		if t, ok := nestLoopParamThroughOuter(oc, reg); ok {
+		if t, ok := nestLoopParamThroughOuter(oc, reg, false); ok {
 			return t
 		}
 	}
-	return formatExprQual(e, reg, qualify)
+	s := formatExprQual(e, reg, qualify)
+	// M0146-0107: a probe key built as a plain ColumnRef into the loop's
+	// outer row (the unique-ified inner of a semi join over a kept CTE
+	// scan) prints bare when its binding id belongs to the sublink's level;
+	// it is the same NestLoop param, deparsed through the outer plan
+	// (`(k = c.k)`, TPC-DS Q14's `cross_items.ss_item_sk`).
+	if c, ok := e.(*optimizer.ColumnRef); ok && qualify && !strings.Contains(s, ".") {
+		if t, ok := nestLoopParamThroughOuter(&optimizer.OuterColumnRef{Index: c.Index, Name: c.Name, Type: c.Type}, reg, true); ok {
+			return t
+		}
+	}
+	return s
 }
 
 // nestLoopParamThroughOuter deparses an index probe's outer key the way
@@ -3452,8 +3498,10 @@ func formatIndexCondKey(e optimizer.Expr, reg *subPlanReg) string {
 // Q71's `(i_item_sk = "*SELECT* 3".sold_item_sk)`), or to the aggregate
 // that computes it (regress join's `(thousand = (sum(i4b.f1)))`, wrapped as
 // PG wraps a non-Var referent). The key indexes the outer input's row, so
-// the position must hold the key's own column.
-func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg) (string, bool) {
+// the position must hold the key's own column. With useLabel (a ColumnRef
+// key, which has no OuterColumnRef arm to print the label) a relation of the
+// outer plan that exposes the name answers first.
+func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg, useLabel bool) (string, bool) {
 	if reg == nil || !reg.paramInner || x.Index < 0 {
 		return "", false
 	}
@@ -3461,7 +3509,10 @@ func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg) (st
 	if anc == nil {
 		return "", false
 	}
-	if reg.names().resolveLabelInAncestor(anc, x.Name) != "" {
+	if rel := reg.names().resolveLabelInAncestor(anc, x.Name); rel != "" {
+		if useLabel {
+			return rel + "." + x.Name, true
+		}
 		return "", false
 	}
 	if x.SourceTableIdx != 0 && reg.names().resolveLabelInAncestorSrc(anc, x.Name, x.SourceTableIdx) != "" {
@@ -4047,6 +4098,14 @@ func qualifyForeignColumns(e optimizer.Expr, n optimizer.Node, reg *subPlanReg) 
 		q := formatExprQual(c, reg, true)
 		if !strings.Contains(q, ".") {
 			q = reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
+		}
+		if !strings.Contains(q, ".") {
+			// M0146-0107: the Recheck's copy of the probe key, deparsed
+			// through the loop's outer plan as its Index Cond sibling is
+			// (formatIndexCondKey): `(k = c.k)` over a unique-ified CTE.
+			if t, ok := nestLoopParamThroughOuter(&optimizer.OuterColumnRef{Index: c.Index, Name: c.Name, Type: c.Type}, reg, true); ok {
+				q = t
+			}
 		}
 		if !strings.Contains(q, ".") {
 			return c
