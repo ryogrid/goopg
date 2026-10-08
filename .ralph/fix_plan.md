@@ -30087,3 +30087,14 @@ Movement: none — instrument artefact: no TPC query or regress EXPLAIN has a du
       `docs/design/0100\-0149/m0146\-0113\-distinct\-pinned\-limit\-one\.md`\.
     - Ledgered: partially pinned keys and the parallel partial Limit\.
 Movement: none — instrument artefact: no TPC query has a DISTINCT over pinned keys; regress select\_distinct 117 → 100
+- [x] **M0146\-0114 — the min/max rewrite also fires in a correlated subquery \(InitPlan with outer params\)**
+  \(filed 2026\-10\-08 from the regress census\)\. PG rewrites `\(select min\(unique1\) from tenk1 where unique1 > f1\)` into
+  `SubPlan 2 \-> Result / InitPlan 1 \-> Limit \-> Index Only Scan`; goopg declined any correlated WHERE\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: accept a correlated WHERE with its outer refs one level deeper and keep the InitPlan correlated\.
+  - Done 2026\-10\-08 \(e8341472c\)\.
+    - `deepenOuterRefs`; `SubqueryExpr\.ParamInitPlan`; `wherePredSafeForIOS` admits outer refs\.
+    - Regress aggregates 396 → 386, join 14874 → 14870\. Design:
+      `docs/design/0100\-0149/m0146\-0114\-correlated\-minmax\-initplan\.md`\.
+Movement: none — instrument artefact: no TPC query has a correlated min/max subquery; regress aggregates 396 → 386
