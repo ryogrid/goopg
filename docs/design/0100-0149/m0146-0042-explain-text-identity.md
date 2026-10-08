@@ -430,6 +430,36 @@ Results:
 - **Results.** The rendering category drops 7 → 6 at both scales (Q77).
 - Test: `TestSortKeyThroughFinalizeGroupKey`.
 
+## Slice — a key chase stops at a Subquery Scan PG keeps (2026-10-08, `666a5a87a`)
+
+- **Problem.** A Subquery Scan still in goopg's printed plan is one PG
+  keeps (the strip pass mirrors `trivial_subqueryscan`), and PG deparses an
+  upper Var to that scan's alias-qualified column. `resolveKeySource`
+  stepped through every Subquery Scan, so goopg printed:
+  - TPC-DS Q71: `sum(ext_price)`, where PG prints `sum("*SELECT* 3".ext_price)`;
+  - Q44: `rank_col`, where PG prints `v1.rank_col`;
+  - Q49: `return_ratio`, where PG prints `in_web.return_ratio`;
+  - Q67: `item.i_category`, where PG prints `dw1.i_category`.
+- **Change.**
+  - The chase stops at a Subquery Scan with an alias and names the column
+    `alias.column`, quoting both parts.
+  - `chaseAggregateResultArgs` keeps such a named argument.
+  - A pinned chase skips the relation-identity check, because an aggregate
+    argument's id belongs to its input's numbering.
+  - The Join arm compares ids only when the join's own output carries the
+    reference's numbering.
+- **Results.**
+  - Every changed line equals a line of PG's plan. The exception is SF1
+    Q78's `cs.cs_customer_sk`, which follows from the ws/cs join-order
+    difference.
+  - The rendering category drops 6 → 4 at both scales.
+  - TPC-H text and eleven regress files are unchanged.
+- Test: `TestExplainAggregateArgThroughUnionMemberWrapper`. The transitive
+  group-key test now follows PG's kept-scan rule.
+- Not covered (ledger): goopg names an anonymous subquery `__sq_<pos>`
+  where PG says `unnamed_subquery`. A join key over a UNION ALL member
+  wrapper prints its name-based `m1.a` where PG prints `"*SELECT* 1".b`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |

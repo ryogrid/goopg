@@ -27814,6 +27814,10 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 8 → 7 at both scales \(Q66
     \(`finalizeGroupPairs`, positional\)\.
     - Q77\'s `ss\.s\_store\_sk` now prints `store\.s\_store\_sk`, and its Merge Cond equals PG\'s\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 7 → 6 at both scales \(Q77\)
+  - Slice 2026\-10\-08 \(`666a5a87a`\): a key chase stops at a Subquery Scan PG keeps \(alias\-qualified, quoted\)\.
+    - Q71 `sum\(\"\*SELECT\* 3\".ext\_price\)`; Q44/Q49/Q67 window and sort keys now equal PG\'s\.
+    - Pinned chases skip the relation\-identity check; the Join arm compares ids only within one numbering\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 6 → 4 at both scales \(Q71, Q67\)
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,
