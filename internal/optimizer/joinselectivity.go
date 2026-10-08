@@ -306,6 +306,13 @@ func derivedLeafUniqueCols(scan Node) map[string]bool {
 		// M0146-0010: transparent wrapper — analyse the child.
 		body = x.Child
 		out = x.Output()
+	case *Project:
+		// M0146-0120: a derived leaf whose trivial Subquery Scan was
+		// stripped reaches the search as the sub-select's own top Project;
+		// its output is the leaf's output, position for position. Over a
+		// base scan the walk below finds no grouping and answers nil.
+		body = x
+		out = x.Output()
 	default:
 		return nil
 	}
@@ -319,6 +326,19 @@ func derivedLeafUniqueCols(scan Node) map[string]bool {
 		}
 	} else {
 		uniq = loneKeyPositions(body, len(out))
+		// M0146-0120: examine_simple_variable recurses through a
+		// sub-select level that neither groups nor de-duplicates, into the
+		// sub-select its target Var reads, and marks isunique at the first
+		// level that has a lone GROUP BY / DISTINCT key on it (TPC-DS Q44:
+		// `asceding.item_sk` → v11 (a window) → v1's `GROUP BY ss_item_sk`).
+		for i := range out {
+			if !uniq[i] && derivedColumnIsUnique(i, body, 0) {
+				if uniq == nil {
+					uniq = map[int]bool{}
+				}
+				uniq[i] = true
+			}
+		}
 	}
 	if len(uniq) == 0 {
 		return nil
@@ -333,6 +353,82 @@ func derivedLeafUniqueCols(scan Node) map[string]bool {
 		return nil
 	}
 	return names
+}
+
+// derivedColumnIsUnique is `examine_simple_variable`'s recursion for the
+// isunique flag (selfuncs.c, RTE_SUBQUERY arm), over the planned body: the
+// column at output position idx of n is unique when the walk reaches a lone
+// GROUP BY key or the only DISTINCT / DISTINCT ON column. The walk crosses
+// what PG's recursion crosses — a level with no grouping and no DISTINCT,
+// whose target is a plain Var of a lower relation (a bare-column Project
+// target, the pass-through region of a WindowAgg, filters, sorts, limits,
+// gathers and scan wrappers, and either side of a join, as
+// resolveBaseColumn's coordinate rule maps it) — and stops, false, at
+// whatever PG stops at: any other grouping or DISTINCT, a set operation, an
+// expression target, or a base relation (a base column is never isunique
+// here: the recursion leaves the flag unset above a plain table).
+func derivedColumnIsUnique(idx int, n Node, depth int) bool {
+	if n == nil || idx < 0 || depth > 64 {
+		return false
+	}
+	switch x := n.(type) {
+	case *Aggregate:
+		return x.Mode != AggModePartial && len(x.GroupingSets) == 0 &&
+			len(x.GroupExprs) == 1 && idx == 0
+	case *Distinct:
+		return idx == 0 && len(x.Output()) == 1
+	case *DistinctOn:
+		return len(x.KeyCols) == 1 && idx == x.KeyCols[0]
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return derivedColumnIsUnique(cr.Index, x.Child, depth+1)
+			}
+		}
+		return false
+	case *WindowAgg:
+		if x.Child == nil || idx >= len(x.Child.Output()) {
+			return false
+		}
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Filter:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Sort:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Limit:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Gather:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Materialize:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *SubqueryScan:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *CTEScan:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return false
+		}
+		lw := len(x.Left.Output())
+		if idx >= lw {
+			return derivedColumnIsUnique(idx-lw, x.Right, depth+1)
+		}
+		return derivedColumnIsUnique(idx, x.Left, depth+1)
+	case *NestedLoopIndexJoin:
+		if x.Outer == nil {
+			return false
+		}
+		ow := len(x.Outer.Output())
+		if idx >= ow {
+			return derivedColumnIsUnique(idx-ow, x.Inner, depth+1)
+		}
+		return derivedColumnIsUnique(idx, x.Outer, depth+1)
+	}
+	return false
 }
 
 // resolveJoinVarColumn is the operand-RESOLUTION half of `examine_variable`:
