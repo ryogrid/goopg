@@ -29989,3 +29989,16 @@ Movement: none — classifier categories flat at both scales; InitPlan placement
     - Ledgered: an EXISTS pulled up into a semi join numbers its inner sublink first; `LIMIT \(select …\)` is
       rejected\.
 Movement: none — classifier categories flat; SubPlan/InitPlan label sets differing from PG 1 → 0 at SF0\.25 and SF1 \(Q6\)
+- [x] **M0146\-0106 — a NestLoop index\-probe param over a UNION ALL or aggregate output deparses through the loop\'s outer plan**
+  \(filed 2026\-10\-08 from the qual\-placement census, witness TPC\-DS Q71 at SF0\.25\)\. Q71\'s only difference from PG
+  was `Index Cond: \(i\_item\_sk = sold\_item\_sk\)` where PG prints `"\*SELECT\* 3"\.sold\_item\_sk`\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: chase an unnamed OuterColumnRef probe key through the loop\'s outer input as `get\_parameter` does\.
+  - Done 2026\-10\-08 \(0dec89dd0\)\.
+    - `nestLoopParamThroughOuter` \(Index Cond keys only\) chases the key with `resolveKeySource` when both label
+      lookups fail, and wraps a non\-Var referent as PG does\.
+    - A general OuterColumnRef\-arm attempt broke a lateral Filter in regress partition\_prune \(`t2\.a = t2\.b`\), so
+      the chase is scoped to index probes\.
+    - Q71 is a full MATCH at SF0\.25\. Design: `docs/design/0100\-0149/m0146\-0106\-nestloop\-param\-through\-outer\.md`\.
+Movement: yes — PLAN\-PARITY match SF0\.25 43 → 44 \(Q71\); qual\-placement 11 → 10 at SF0\.25 and SF1
