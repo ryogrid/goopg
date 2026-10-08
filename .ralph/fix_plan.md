@@ -27802,6 +27802,10 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering SF0\.25 10 → 9, SF1 11 →
     - Q75 is text\-identical at SF0\.25 \(1 → 0 lines\), one line closer at SF1\.
     - Every SF0\.25 MATCH query is now text\-identical\.
 Movement: none — instrument artefact — text\-only; Q75 text\-identical at SF0\.25, categories unchanged
+  - Slice 2026\-10\-08 \(`6340c1671`\): a Finalize aggregate\'s Group Key prints its Partial\'s text
+    \(`aggGroupKeyText`, `partialAggregateBelow`\); Q76\.
+    - Rendering class census, recorded in the design doc: Q39, Q54, Q66, Q67, Q71, Q77\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 9 → 8 at both scales \(Q76\)
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,

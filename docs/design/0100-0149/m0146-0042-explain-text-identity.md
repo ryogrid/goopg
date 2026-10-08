@@ -372,6 +372,32 @@ Results:
 - Not covered (ledger): the same wrap for Aggregate/Sort keys read through
   an Append.
 
+## Slice — a Finalize aggregate's Group Key (2026-10-08, `6340c1671`)
+
+- **Problem.** A Finalize aggregate's keys index the Partial's transport
+  row, which `resolveKeySource` refuses to read (M0146-0005ce). TPC-DS
+  Q76's Finalize printed `Group Key: channel, col_name, d_year, …` bare.
+  PG's `show_agg_keys` deparses them through the Gather into the Partial's
+  target list, so both nodes print the same text.
+- **Change.** `aggGroupKeyText` (factored out of the Group Key loop)
+  renders a Finalize key that names a Partial group position as the
+  Partial's own key. `partialAggregateBelow` finds the printed Partial
+  through Gather, Gather Merge, Sort and Incremental Sort.
+- **Results.** The rendering category drops 9 → 8 at both scales (Q76).
+  Q76's remaining key difference is the Append's branch order, which is a
+  shape difference.
+- Test: `TestFinalizeGroupKeyOverUnionAllPrintsPartialText`.
+- **Census of the rendering class, 2026-10-08**, SHAPE-DIFF queries at
+  SF0.25:
+  - Q39's Sort Key labels `inv2.mean` as `inv1.mean` and keeps a
+    `d_moy` key that PG drops;
+  - Q54/Q67 chase past a Subquery Scan that PG keeps (`my_revenue.revenue`,
+    `dw1.*`);
+  - Q66's `year` prints bare where PG prints `date_dim.d_year`;
+  - Q71's appendrel member label `"*SELECT* 3".ext_price` is missing;
+  - Q77 prints `ss.s_store_sk` where PG prints `store.s_store_sk`.
+- Not covered (ledger): an explicit `'x'::text` literal prints `('x')`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
