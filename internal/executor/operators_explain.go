@@ -3434,7 +3434,56 @@ func formatIndexCondKey(e optimizer.Expr, reg *subPlanReg) string {
 	if reg != nil {
 		qualify = reg.names().qualify()
 	}
+	if oc, ok := e.(*optimizer.OuterColumnRef); ok && qualify {
+		if t, ok := nestLoopParamThroughOuter(oc, reg); ok {
+			return t
+		}
+	}
 	return formatExprQual(e, reg, qualify)
+}
+
+// nestLoopParamThroughOuter deparses an index probe's outer key the way
+// get_parameter does a NestLoop param: against the loop's outer plan, always
+// prefixed (M0146-0106). It applies only where no relation of the outer
+// plan exposes the name — a UNION ALL subquery's output column, or an
+// aggregate's — which the label lookups of the OuterColumnRef arm cannot
+// name: the column chases through the outer input with the Sort Key's key
+// chase, through the Append's first member to its kept wrapper (TPC-DS
+// Q71's `(i_item_sk = "*SELECT* 3".sold_item_sk)`), or to the aggregate
+// that computes it (regress join's `(thousand = (sum(i4b.f1)))`, wrapped as
+// PG wraps a non-Var referent). The key indexes the outer input's row, so
+// the position must hold the key's own column.
+func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg) (string, bool) {
+	if reg == nil || !reg.paramInner || x.Index < 0 {
+		return "", false
+	}
+	anc := reg.ancestorNode()
+	if anc == nil {
+		return "", false
+	}
+	if reg.names().resolveLabelInAncestor(anc, x.Name) != "" {
+		return "", false
+	}
+	if x.SourceTableIdx != 0 && reg.names().resolveLabelInAncestorSrc(anc, x.Name, x.SourceTableIdx) != "" {
+		return "", false
+	}
+	out := anc.Output()
+	if x.Index >= len(out) || out[x.Index].Name != x.Name {
+		return "", false
+	}
+	col := &optimizer.ColumnRef{Index: x.Index, Name: x.Name, Type: x.Type, SourceTableIdx: out[x.Index].SourceTableIdx}
+	chased, ok := resolveKeySource(col, anc, reg)
+	if !ok {
+		return "", false
+	}
+	t := formatKeyExprQual(chased, reg, true)
+	if !strings.Contains(t, ".") {
+		return "", false
+	}
+	if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
+		t = "(" + t + ")"
+	}
+	return t, true
 }
 
 // formatIndexCondParts is the shared body of formatIndexCond /
