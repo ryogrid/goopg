@@ -30166,3 +30166,14 @@ Movement: none — instrument artefact: no TPC query has a unique\-key self\-joi
     - Design: `docs/design/0100\-0149/m0146\-0116\-pulled\-qual\-order\-hash\-qual\-cost\.md`\.
     - Ledgered: residual join quals still cost one operator per conjunct; split\-chain ON clause order\.
 Movement: yes — TPC\-DS Q2 full MATCH at SF0\.25 \(match 44 → 45, join\-order 46 → 45, D6\-cte 1 → 0\) and SF1 \(match 35 → 36, join\-order 51 → 50\)
+- [x] **M0146\-0117 — a joinrel is sized with the generated equivalence\-class clause, not the written one \(TPC\-DS Q59\)**
+  \(filed 2026\-10\-09 from Q59\'s first divergence, a cardinality estimate: the top join 15 rows vs PG\'s 1\)\. Filed under
+  M0146\-0009 per the banner\'s interleave rule for statistics\-driven first divergences\. The mechanism was ledgered as part
+  \(1\) of the 2026\-09\-26 M0146\-0022 row; M0146\-0022\'s root M0146\-0005 is S4\-held, and this task does not reopen it\.
+  Kind: impl
+  Parent: M0146-0009
+  - First step: compare the clause each engine sizes Q59\'s top join with\.
+  - Done 2026\-10\-09 \(ff8607922\)\.
+    - `makeJoinRel` passes the reduced restrict list to `sizeJoinRel`; `joinRelSizingClauses` and `sizingOnly` removed\.
+    - Design: `docs/design/0100\-0149/m0146\-0117\-joinrel\-sizing\-generated\-clause\.md`\.
+Movement: yes — TPC\-DS Q59 full MATCH at SF0\.25 \(match 45 → 46, join\-order 45 → 44\) and SF1 \(match 36 → 37, join\-order 50 → 49\)
