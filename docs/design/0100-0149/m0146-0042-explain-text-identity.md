@@ -398,6 +398,19 @@ Results:
   - Q77 prints `ss.s_store_sk` where PG prints `store.s_store_sk`.
 - Not covered (ledger): an explicit `'x'::text` literal prints `('x')`.
 
+## Slice — a key through a pruned GROUP BY column (2026-10-08, `c7063a0a3`)
+
+- **Problem.** A grouped UNION ALL member whose `d_year` key is pinned by a
+  WHERE constant has it pruned from its group keys. goopg publishes the
+  column as an Aggregate Passthrough; PG keeps it as a plain Var in the
+  Agg's target list and deparses an upper key through it. TPC-DS Q66
+  printed the alias `year` where PG prints `date_dim.d_year`.
+- **Change.** `resolveKeySource`'s Aggregate arm treats a passthrough
+  position (the output's tail, outside grouping sets) like a group key.
+- **Results.** The rendering category drops 8 → 7 at both scales (Q66).
+  TPC-H text and eleven regress files are unchanged.
+- Test: `TestExplainKeyThroughPrunedGroupColumn`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
