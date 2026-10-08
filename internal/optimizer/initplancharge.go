@@ -28,6 +28,10 @@ type InitPlanCharge struct {
 	// levelTop marks a derived table's top that the join search priced as a
 	// query level of its own (M0146-0005dw); the tail walk charges it as one.
 	levelTop bool
+	// queryLevelTop marks the top node of a query level (M0146-0104):
+	// SS_attach_initplans hangs the level's initPlans there, where EXPLAIN
+	// prints them, not on the node whose expression reads them.
+	queryLevelTop bool
 }
 
 // InitPlanChargeCost is the cost of the initPlans this node runs.
@@ -38,11 +42,60 @@ func (c *InitPlanCharge) setInitPlanCharge(v float64) { c.initPlanCharge = v }
 func (c *InitPlanCharge) markLevelTop()    { c.levelTop = true }
 func (c *InitPlanCharge) isLevelTop() bool { return c.levelTop }
 
+func (c *InitPlanCharge) markQueryLevelTop()    { c.queryLevelTop = true }
+func (c *InitPlanCharge) isQueryLevelTop() bool { return c.queryLevelTop }
+
+// LevelInitPlansOf returns the initPlans of the query level whose top node
+// is n — what PG's SS_attach_initplans attaches to that node — or nil when
+// n is not a level's top. They are read from the plan as it stands, not
+// recorded when the charge walk ran: later passes (stripSublinkBodies)
+// replace sublink expressions and bodies, and EXPLAIN numbers the final
+// ones. The walk covers the level's own nodes: it stops at another level's
+// top, a Subquery Scan's or CTE scan's body, and never enters a sublink's
+// plan.
+func LevelInitPlansOf(n Node) []SublinkRef {
+	top, ok := n.(initPlanCharger)
+	if !ok || !top.isQueryLevelTop() {
+		return nil
+	}
+	var out []SublinkRef
+	seen := map[Node]bool{}
+	var walk func(x Node)
+	walk = func(x Node) {
+		if x == nil {
+			return
+		}
+		if x != n {
+			if lt, ok := x.(initPlanCharger); ok && lt.isQueryLevelTop() {
+				return
+			}
+		}
+		for _, sl := range NodeSublinks(x) {
+			if sl.Plan != nil && SublinkIsInitPlan(sl.Expr) && !seen[sl.Plan] {
+				seen[sl.Plan] = true
+				out = append(out, sl)
+			}
+		}
+		switch x.(type) {
+		case *SubqueryScan, *CTEScan:
+			return
+		}
+		kids, _ := planChildNodes(x)
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(n)
+	return out
+}
+
 type initPlanCharger interface {
 	InitPlanChargeCost() float64
 	setInitPlanCharge(float64)
 	markLevelTop()
 	isLevelTop() bool
+	markQueryLevelTop()
+	isQueryLevelTop() bool
 }
 
 // chargeDerivedLeafLevel charges a derived-table leaf of the join search as
@@ -173,6 +226,7 @@ func (c *initPlanChargeWalk) level(top Node) {
 	walk(top)
 	if ch, ok := chargeTarget(top).(initPlanCharger); ok {
 		ch.setInitPlanCharge(charge)
+		ch.markQueryLevelTop()
 	}
 }
 

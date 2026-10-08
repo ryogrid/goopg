@@ -588,6 +588,11 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		walkPlanFiltered(body, bodyIndent, rows, opts, nil, nil, reg)
 	})
 
+	// M0146-0104: a query level's initPlans print on its top node
+	// (SS_attach_initplans), queued here before any node below references
+	// them.
+	reg.claimLevelInitPlans(n, attachedFilterNode)
+
 	// Sublinks referenced by this node's detail lines print their
 	// inner plan as an indented `SubPlan N` subtree, as upstream's
 	// ExplainSubPlans does. n becomes the ancestor plan node for the
@@ -3564,6 +3569,10 @@ func forceParen(s string) string {
 type subPlanReg struct {
 	num     map[optimizer.Expr]int
 	pending []subPlanEntry
+
+	// initPlanQueued holds the initPlans already queued for printing
+	// (M0146-0104): one plan, one `InitPlan N` section.
+	initPlanQueued map[optimizer.Node]bool
 	// rel is the render's range-table name table (M0125-0039). It lives
 	// here rather than in its own parameter because subPlanReg is already
 	// the one piece of per-EXPLAIN state threaded through every walker and
@@ -4060,6 +4069,19 @@ func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed 
 		n = r.lastID
 	}
 	r.num[e] = n
+	// M0146-0104: an initPlan is one plan with one reserved number, however
+	// many expression copies reach it — the level top queues it from the
+	// node's own expressions (claimLevelInitPlans), and a rendered copy (a
+	// HAVING qual) must not queue it a second time.
+	if ok && optimizer.SublinkIsInitPlan(e) {
+		if r.initPlanQueued[plan] {
+			return n
+		}
+		if r.initPlanQueued == nil {
+			r.initPlanQueued = map[optimizer.Node]bool{}
+		}
+		r.initPlanQueued[plan] = true
+	}
 	var owner optimizer.Node
 	switch {
 	case r.paramInner:
@@ -4097,6 +4119,46 @@ func (r *subPlanReg) deferSubPlans() []subPlanEntry {
 	}
 	r.pending = keep
 	return deferred
+}
+
+// claimLevelInitPlans queues the initPlans of every query level whose top
+// is one of nodes (the rendered node, and the Filter wrapper collapsed into
+// it) — PG's SS_attach_initplans hangs a level's whole initPlan list on its
+// top plan node, so TPC-DS Q58's `InitPlan 1` prints on the derived table's
+// GroupAggregate, not on the date_dim scan under the Gather that reads it
+// (M0146-0104). assign dedupes, so the reading node prints nothing again.
+// The node's initPlan list prints in list order, which is plan_id order:
+// the queued initPlans are re-sorted by number.
+func (r *subPlanReg) claimLevelInitPlans(nodes ...optimizer.Node) {
+	if r == nil {
+		return
+	}
+	claimed := false
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		for _, sl := range optimizer.LevelInitPlansOf(n) {
+			if sl.Plan == nil || !optimizer.SublinkIsInitPlan(sl.Expr) {
+				continue
+			}
+			r.assign(sl.Expr, sl.Plan)
+			claimed = true
+		}
+	}
+	if !claimed {
+		return
+	}
+	sort.SliceStable(r.pending, func(i, j int) bool {
+		// InitPlans first, by number; SubPlans keep their order behind
+		// them (deferSubPlans moves those after the children anyway).
+		ii := optimizer.SublinkIsInitPlan(r.pending[i].expr)
+		ij := optimizer.SublinkIsInitPlan(r.pending[j].expr)
+		if ii != ij {
+			return ii
+		}
+		return ii && r.pending[i].n < r.pending[j].n
+	})
 }
 
 // requeueSubPlans puts deferred entries back on the queue.
@@ -5864,6 +5926,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
 		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 	})
+
+	// M0146-0104: the level's initPlans, as in walkPlanFiltered.
+	reg.claimLevelInitPlans(n, attachedFilterNode)
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
