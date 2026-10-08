@@ -154,3 +154,27 @@ func orderItemPinnedByWhere(item parser.Expr, s *parser.SelectStmt) bool {
 	}
 	return false
 }
+
+// distinctKeysAllPinned reports whether every SELECT DISTINCT target is
+// redundant as a distinct key: a constant, or a column a top-level WHERE
+// `col = const` pins (M0146-0113). PG's distinct_pathkeys is then empty and
+// create_final_distinct_paths plans the DISTINCT as a LIMIT 1 over its input
+// — every input row has the same distinct key, so the first one is the answer
+// (`SELECT DISTINCT four, 1 FROM tenk1 WHERE four = 0` → `Limit -> Seq Scan`).
+// Grouped, windowed and set-operation queries keep the distinct step.
+func distinctKeysAllPinned(s *parser.SelectStmt) bool {
+	if s == nil || !s.Distinct || len(s.DistinctOn) > 0 || len(s.Targets) == 0 ||
+		len(s.GroupBy) > 0 || s.GroupingSets != nil || s.Having != nil ||
+		s.SetOp != nil || s.SetOpOperand != nil {
+		return false
+	}
+	for _, t := range s.Targets {
+		if parserPseudoConstant(t.Expr) {
+			continue
+		}
+		if !orderItemPinnedByWhere(t.Expr, s) {
+			return false
+		}
+	}
+	return true
+}

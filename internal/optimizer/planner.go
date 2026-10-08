@@ -2878,7 +2878,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// sorting so ORDER BY is respected. M0097-0005. Gated on empty
 	// DistinctOn (defense-in-depth: both parsers leave Distinct=false for
 	// DISTINCT ON today, but the ast.go contract claims otherwise).
-	if s.Distinct && len(s.DistinctOn) == 0 {
+	if s.Distinct && len(s.DistinctOn) == 0 && agg == nil && win == nil && selectSrfPending == nil && distinctKeysAllPinned(s) {
+		// M0146-0113: every distinct key is constant or WHERE-pinned, so
+		// PG's distinct_pathkeys is empty and the DISTINCT is a LIMIT 1
+		// (create_final_distinct_paths).
+		out = &Limit{pos: s.Pos(), Child: out, Limit: &IntegerConst{pos: s.Pos(), Value: 1}}
+	} else if s.Distinct && len(s.DistinctOn) == 0 {
 		// The ORDER BY keys are resolved against the DISTINCT output first
 		// (DISTINCT keeps its input's schema, so out.Output() is it).
 		var outerKeys []SortKey
