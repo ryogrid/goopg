@@ -29939,3 +29939,19 @@ Movement: SF1 join\-method 20\-\>19, parameterisation 30\-\>29, sort\-strategy 2
     - EXPLAIN labels it GroupAggregate / Group\.
     - Q44 is a full MATCH at SF1\. Design: `docs/design/0100\-0149/m0146\-0102\-keyless\-grouped\-aggregate\.md`\.
 Movement: yes — PLAN\-PARITY match SF1 34 → 35 \(Q44\); SF0\.25 sort\-strategy 24 → 23, parallelism 25 → 24, rendering 3 → 2
+- [x] **M0146\-0103 — each CTE reference publishes its own relation id, and an operator over literals pins an ORDER BY item**
+  \(filed 2026\-10\-08 from the M0146\-0042 rendering census\)\. TPC\-DS Q39 printed `Sort Key: \.\.\., inv1\.d\_moy,
+  inv1\.mean, inv2\.cov` where PG prints `\.\.\., inv2\.mean, inv2\.cov`\.
+  - Labels: a CTE Scan published the body\'s relation ids, so two references to one CTE shared them, and a key over
+    `inv2` rendered with `inv1`\'s alias\.
+  - Pin: `inv2\.d\_moy = 1\+1` is not a literal, so `orderItemPinnedByWhere` kept the item; PG folds it first\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: stamp the CTE Scan schema with the reference\'s id and let `parserPseudoConstant` accept an operator
+    over literals\.
+  - Done 2026\-10\-08 \(6da04bc86\)\.
+    - `cteRefSchema` stamps each CTE reference\'s columns with its own range\-table id\.
+    - `parserPseudoConstant` accepts a unary or binary operator over pseudo\-constants \(ORDER BY pin and GROUP BY
+      pruning\)\.
+    - Q39\'s Sort Key matches PG at both scales\. Design: `docs/design/0100\-0149/m0146\-0103\-cte\-reference\-ids\-and\-folded\-pins\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 2 → 1 at SF1 and SF0\.25 \(Q39\)
