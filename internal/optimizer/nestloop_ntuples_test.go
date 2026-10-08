@@ -42,7 +42,7 @@ func nlCollapsedPair(t *testing.T, innerRows float64) *RelOptInfo {
 	inner := relWithScanCost(RelSet(0b10), innerRows, 226.93)
 	// The collapsed estimate: four independent equalities on stats-less inputs.
 	joinRel := newRelOptInfo(RelSet(0b11), 1, 80)
-	keys := []*restrictInfo{{}, {}, {}, {}}
+	keys := []*restrictInfo{{clause: oneOpClause()}, {clause: oneOpClause()}, {clause: oneOpClause()}, {clause: oneOpClause()}}
 	generateHashJoinPaths(joinRel, outer, inner, cp, parser.JoinInner, keys, nil, nil)
 	addNestLoopPath(joinRel, outer, inner, cp, parser.JoinInner, keys, uniqueSideNone, nil, semiAntiJoinFactors{})
 	setCheapest(joinRel)

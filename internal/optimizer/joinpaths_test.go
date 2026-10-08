@@ -14,7 +14,11 @@ package optimizer
 // Both are checked structurally rather than by example, so a mutation that
 // narrows either one is caught rather than merely re-costed.
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // relsetOf builds a relset from base-relation indices, matching the
 // `RelSet(1)<<i` convention buildInitialRels uses.
@@ -56,7 +60,13 @@ func equiClauseOn(left, right RelSet, leftCol, rightCol int) *restrictInfo {
 // plainClause is a join qual with no two-sided operand split: an inequality, or
 // an equality one of whose operands straddles both sides.
 func plainClause(relids RelSet) *restrictInfo {
-	return &restrictInfo{relids: relids, ecID: noEquivClass}
+	return &restrictInfo{clause: oneOpClause(), relids: relids, ecID: noEquivClass}
+}
+
+// oneOpClause is a fixture qual that cost_qual_eval prices at exactly one
+// operator (joinQualPerTuple counts operators, M0146-0118).
+func oneOpClause() Expr {
+	return &BinaryOp{Op: parser.OpLt, Left: &ColumnRef{Index: 0}, Right: &ColumnRef{Index: 1}}
 }
 
 // scanRel is an initial rel with one costed seq-scan path, ready to be an input

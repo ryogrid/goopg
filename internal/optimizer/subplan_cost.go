@@ -168,13 +168,15 @@ func subPlanJoinQualOps(e Expr) float64 {
 }
 
 // joinQualPerTuple is `qp_qual_cost.per_tuple` for a join's residual quals:
-// goopg's flat cpu_operator_cost per conjunct plus each conjunct's SubPlan
-// per-evaluation cost (subPlanJoinQualOps).
+// cost_qual_eval over each conjunct — every operator and function it
+// evaluates (qualEvalOpsPriced), not one per conjunct (M0146-0118) — plus
+// each conjunct's SubPlan per-evaluation cost (subPlanJoinQualOps).
 func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
-	per := cp.cpuOperatorCost * float64(len(quals))
+	per := 0.0
 	for _, ri := range quals {
 		if ri != nil {
-			per += cp.cpuOperatorCost * subPlanJoinQualOps(ri.clause)
+			_, ops := qualEvalOpsPriced(ri.clause, false)
+			per += cp.cpuOperatorCost * (ops + subPlanJoinQualOps(ri.clause))
 		}
 	}
 	return per

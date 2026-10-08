@@ -403,9 +403,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// key decline to cross a computing Project, the conservative answer.
 	// Added by M0146-0005ba. qualEvalOps charges cost_qual_eval's per-node
 	// cost inside walkExprRefs (which owns the recursion and fails closed on
-	// an unknown type); allConstExprs classifies one flat list.
-	"qualevalcost.go:qualEvalOps":   nonRecursiveClassifier,
-	"qualevalcost.go:allConstExprs": nonRecursiveClassifier,
+	// an unknown type); allConstExprs classifies one flat list. M0146-0118
+	// moved the walk into qualEvalOpsPriced (qualEvalOps wraps it).
+	"qualevalcost.go:qualEvalOpsPriced": nonRecursiveClassifier,
+	"qualevalcost.go:allConstExprs":     nonRecursiveClassifier,
 	"upperorderedinput.go:orderPreservingExpr": nonRecursiveClassifier,
 	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
 	// cloneExprRefs (which carries both the recursion and the

@@ -37,6 +37,14 @@ const defaultArrayLength = 10
 // RelabelType, a cast function (1) or a CoerceViaIO (2); the free reading is
 // the common one for the text-family casts TPC-DS filters carry.
 func qualEvalOps(e Expr) (startup, perTuple float64) {
+	return qualEvalOpsPriced(e, true)
+}
+
+// qualEvalOpsPriced is qualEvalOps with the sublinks' own plan costs left
+// out when priceSublinks is false: the comparison an IN sublink performs
+// still counts, but the SubPlan's per-call cost is the caller's to charge
+// (joinQualPerTuple prices correlated SubPlans through subPlanJoinQualOps).
+func qualEvalOpsPriced(e Expr, priceSublinks bool) (startup, perTuple float64) {
 	walkExprRefs(e, scopeSignal, exprVisitor{Visit: func(x Expr) bool {
 		switch n := x.(type) {
 		case *BinaryOp:
@@ -53,6 +61,9 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 			if n.Plan != nil {
 				// The test expression's comparison, then the SubPlan.
 				perTuple++
+				if !priceSublinks {
+					return true
+				}
 				// M0146-0019a: an uncorrelated hashable ANY is a hashed
 				// SubPlan (build_subplan sets useHashTable): cost_subplan
 				// charges the plan's total plus cpu_operator_cost per row
@@ -83,17 +94,23 @@ func qualEvalOps(e Expr) (startup, perTuple float64) {
 			}
 			perTuple += 0.5 * float64(length)
 		case *SubqueryExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExpr, len(n.ParParam) > 0)
-			startup += s
-			perTuple += p
+			if priceSublinks {
+				s, p := subPlanCostOps(n.Plan, sublinkExpr, len(n.ParParam) > 0)
+				startup += s
+				perTuple += p
+			}
 		case *ArraySubqueryExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExpr, false)
-			startup += s
-			perTuple += p
+			if priceSublinks {
+				s, p := subPlanCostOps(n.Plan, sublinkExpr, false)
+				startup += s
+				perTuple += p
+			}
 		case *ExistsExpr:
-			s, p := subPlanCostOps(n.Plan, sublinkExists, len(n.ParParam) > 0)
-			startup += s
-			perTuple += p
+			if priceSublinks {
+				s, p := subPlanCostOps(n.Plan, sublinkExists, len(n.ParParam) > 0)
+				startup += s
+				perTuple += p
+			}
 		}
 		return true
 	}})
