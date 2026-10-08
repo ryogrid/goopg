@@ -67,3 +67,33 @@ func TestExplainSortKeyAggregateOverUnionAllMembers(t *testing.T) {
 		t.Errorf("missing PG's %q in:\n%s", want, plan)
 	}
 }
+
+// TestExplainUnionDedupeComputedKeyParens pins the TPC-DS Q75 shape: a
+// UNION's dedupe groups on the Append's output, whose target entries are
+// Vars of the first branch. show_agg_keys deparses that Var and get_variable
+// wraps the branch's computed target in parentheses of its own, so PG 18.3
+// prints `((u1.q - COALESCE(u1.r, 0)))`. A DISTINCT over a plain scan reads
+// the expression from its input's own target list and keeps one pair.
+func TestExplainUnionDedupeComputedKeyParens(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE u1 (a int, q int, r int)",
+		"CREATE TABLE u2 (a int, q int, r int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	for _, tc := range []struct{ sql, want string }{
+		{"EXPLAIN (COSTS OFF) SELECT a, sum(x) FROM (SELECT a, q - COALESCE(r, 0) AS x FROM u1 UNION SELECT a, q - COALESCE(r, 0) AS x FROM u2) s GROUP BY a",
+			"Group Key: u1.a, ((u1.q - COALESCE(u1.r, 0)))"},
+		{"EXPLAIN (COSTS OFF) SELECT DISTINCT a, q - COALESCE(r, 0) FROM u1",
+			"Group Key: a, (q - COALESCE(r, 0))"},
+	} {
+		plan := strings.Join(runExplainRows(t, ctx, tc.sql), "\n")
+		if !strings.Contains(plan, tc.want) {
+			t.Errorf("missing PG's %q in:\n%s", tc.want, plan)
+		}
+	}
+}

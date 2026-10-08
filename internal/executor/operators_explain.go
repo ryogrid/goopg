@@ -1632,6 +1632,30 @@ func chaseAggregateResultArgs(call optimizer.AggregateCall, child optimizer.Node
 	return call, changed
 }
 
+// inputIsSetOp reports whether n is a set operation, looking through the
+// row-transport wrappers that publish their child's columns unchanged
+// (Gather, Gather Merge, Sort, Materialize): TPC-DS Q75's UNION dedupe reads
+// its Append through a Gather.
+func inputIsSetOp(n optimizer.Node) bool {
+	for n != nil {
+		switch x := n.(type) {
+		case *optimizer.SetOp:
+			return true
+		case *optimizer.Gather:
+			n = x.Child
+		case *optimizer.GatherMerge:
+			n = x.Child
+		case *optimizer.Sort:
+			n = x.Child
+		case *optimizer.Materialize:
+			n = x.Child
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // displayColumnSourceIdx marks a display column (chaseAggregateResultArgs):
 // rendered only through reg.boundaryKeyName, never resolved by relation.
 const displayColumnSourceIdx int16 = -32768
@@ -2322,12 +2346,31 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			seen := make(map[string]bool, len(keys))
 			for _, k := range keys {
 				keyExpr := k.Expr
+				// M0146-0042: a UNION's dedupe groups on the Append's
+				// output, whose target entries are Vars of its first
+				// branch. show_agg_keys deparses that Var, and get_variable
+				// wraps the branch's non-Var target in parentheses of its
+				// own: TPC-DS Q75's `((store_sales.ss_quantity -
+				// COALESCE(...)))`. A key computed below the hash's own
+				// input (no set operation crossed) keeps one pair.
+				crossedSetOp := false
 				if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
+					prev := reg != nil && reg.chaseCrossedLevel
+					if reg != nil {
+						reg.chaseCrossedLevel = false
+					}
 					if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
 						keyExpr = chased
+						crossedSetOp = inputIsSetOp(p.Child) && reg != nil && reg.chaseCrossedLevel
+					}
+					if reg != nil {
+						reg.chaseCrossedLevel = prev
 					}
 				}
 				str := formatKeyExprQual(keyExpr, reg, qualify)
+				if _, isCol := keyExpr.(*optimizer.ColumnRef); crossedSetOp && !isCol {
+					str = "(" + str + ")"
+				}
 				if seen[str] {
 					continue
 				}
