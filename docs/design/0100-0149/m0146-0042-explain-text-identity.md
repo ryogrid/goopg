@@ -411,6 +411,25 @@ Results:
   TPC-H text and eleven regress files are unchanged.
 - Test: `TestExplainKeyThroughPrunedGroupColumn`.
 
+## Slice — a key chase through a Finalize aggregate (2026-10-08, `413c69918`)
+
+- **Problem.** TPC-DS Q77's key `ss.s_store_sk` comes from a UNION ALL
+  branch over a LEFT JOIN of two grouped, inlined CTEs, each split into
+  Finalize over Partial. PG deparses through the Finalize and the Gather
+  into the Partial's group key and prints `store.s_store_sk`; its Merge
+  Cond is `(store.s_store_sk = store_1.s_store_sk)`. goopg's
+  `resolveKeySource` declined Finalize group positions outright.
+- **Change.** Finalize group position j continues as the Partial's group
+  key j (`finalizeGroupPairs`), checking only that the output names agree
+  at j. A Finalize's own key expression can index the pre-split input row
+  (Q77's CTE body: Index 51), so the previous slice's `aggGroupKeyText`
+  now uses the same positional pairing.
+- **Measured and dropped.** Continuing past a CTE-qualified Project target,
+  and a positional fallback in `pinKeyExprNames`. An A/B on a private
+  SF0.25 clone showed neither changes Q77.
+- **Results.** The rendering category drops 7 → 6 at both scales (Q77).
+- Test: `TestSortKeyThroughFinalizeGroupKey`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
