@@ -1745,6 +1745,13 @@ func aggGroupKeyText(p *optimizer.Aggregate, gi int, reg *subPlanReg, qualify bo
 		if chased, hit := resolveKeySource(keyExpr, p.Child, reg); hit {
 			keyExpr = chased
 		}
+	} else if ch, ok := chaseKeyExprColumns(keyExpr, p.Child, reg, qualify); ok && keyExprReachesKeptScan(ch, reg) {
+		// M0146-0042: a computed key's columns index the input; one that
+		// reaches a kept Subquery Scan prints as that scan's column, not
+		// through an inlined CTE's body (TPC-DS Q54's
+		// `(my_revenue.revenue / 50)::int`, where goopg expanded `revenue`
+		// into the CTE's `sum(...)`).
+		keyExpr = ch
 	}
 	s := formatKeyExprQual(keyExpr, reg, qualify)
 	if keyChildPassesThrough(p.Child) {
@@ -2042,6 +2049,16 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 				if src, hit := sortGroupKeySource(col, agg); hit {
 					if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
 						keyExpr = chased
+					} else if _, isCol := src.(*optimizer.ColumnRef); !isCol {
+						// M0146-0042: a computed group key (TPC-DS Q54's
+						// `(revenue / 50)::int`) indexes the aggregate's
+						// input; its columns deparse there, through a kept
+						// Subquery Scan to `my_revenue.revenue`, as the
+						// Group Key line itself prints them.
+						keyExpr = src
+						if chased, ok := chaseKeyExprColumns(src, agg.Child, reg, qualify); ok {
+							keyExpr = chased
+						}
 					} else {
 						keyExpr = src
 					}
@@ -2092,6 +2109,13 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 		if _, isCol := keyExpr.(*optimizer.ColumnRef); !isCol {
 			if chased, ok := chaseJoinKeyExprColumns(keyExpr, child, reg, qualify); ok {
 				keyExpr = chased
+			} else if _, isProj := child.(*optimizer.Project); isProj {
+				// M0146-0042: a computed key over goopg's unprinted Project
+				// whose columns reach a kept Subquery Scan (TPC-DS Q54's
+				// inner `Sort Key: (((my_revenue.revenue / ...`).
+				if ch, ok := chaseKeyExprColumns(keyExpr, child, reg, qualify); ok && keyExprReachesKeptScan(ch, reg) {
+					keyExpr = ch
+				}
 			}
 		}
 		s := formatKeyExprQual(keyExpr, reg, qualify)
@@ -2176,7 +2200,36 @@ func chaseJoinKeyExprColumns(key optimizer.Expr, child optimizer.Node, reg *subP
 	default:
 		return nil, false
 	}
-	if reg == nil {
+	return chaseKeyExprColumns(key, child, reg, qualify)
+}
+
+// keyExprReachesKeptScan reports whether e holds a column the chase named at
+// a kept Subquery Scan (a boundaryKeyName entry). The Project arm takes the
+// column-wise chase only then, so every other computed target keeps its
+// established rendering.
+func keyExprReachesKeptScan(e optimizer.Expr, reg *subPlanReg) bool {
+	if reg == nil || len(reg.boundaryKeyName) == 0 {
+		return false
+	}
+	found := false
+	optimizer.WalkExprTree(e, func(sub optimizer.Expr) {
+		if c, ok := sub.(*optimizer.ColumnRef); ok && !found {
+			// A kept-scan stop names `alias.column`; a display column
+			// for a computed referent carries `(expr)` and does not count.
+			if txt, named := reg.boundaryKeyName[c]; named && !strings.HasPrefix(txt, "(") {
+				found = true
+			}
+		}
+	})
+	return found
+}
+
+// chaseKeyExprColumns rewrites each column inside an expression key by
+// chasing it into child (resolveKeySource): a column that reaches a relation
+// or a kept Subquery Scan takes that name, and a computed referent prints
+// parenthesised. ok is false when nothing resolves.
+func chaseKeyExprColumns(key optimizer.Expr, child optimizer.Node, reg *subPlanReg, qualify bool) (optimizer.Expr, bool) {
+	if reg == nil || key == nil || child == nil {
 		return nil, false
 	}
 	changed := false

@@ -159,3 +159,37 @@ func TestExplainAggregateArgThroughUnionMemberWrapper(t *testing.T) {
 		t.Errorf("missing PG's %q in:\n%s", want, plan)
 	}
 }
+
+// TestExplainComputedGroupKeyThroughKeptSubqueryScan pins the TPC-DS Q54
+// shape: an outer GROUP BY on a computed expression over a grouped derived
+// table that keeps its Subquery Scan. The Sort above the outer aggregate
+// names the computed group key, whose columns index the aggregate's input;
+// PG 18.3 deparses them to the kept scan's column:
+// `Sort Key: (((my_revenue.rev / '50'::numeric))::integer), (count(*))`.
+// goopg printed the column bare (`rev`). (PG elects an Incremental Sort
+// there; the test pins only the key text.)
+func TestExplainComputedGroupKeyThroughKeptSubqueryScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE rv (c int, v numeric)",
+		"CREATE TABLE rw (c int, k int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	defer hashAggSeed(false)()
+	const q = "EXPLAIN (COSTS OFF) SELECT (rev/50)::int AS seg, count(*) FROM (" +
+		"SELECT rv.c, sum(v) AS rev FROM rv, rw WHERE rv.c = rw.c GROUP BY rv.c) my_revenue " +
+		"GROUP BY seg ORDER BY seg, count(*)"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	for _, want := range []string{
+		"Sort Key: (((my_revenue.rev / '50'::numeric))::integer), (count(*))",
+		"Group Key: (((my_revenue.rev / '50'::numeric))::integer)",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("missing PG's %q in:\n%s", want, plan)
+		}
+	}
+}
