@@ -86,8 +86,12 @@ func redundantConstGroupKeys(groupExprs []Expr, s *parser.SelectStmt, ctx *resol
 	return keep, pruned
 }
 
-// parserPseudoConstant reports whether e is a literal (possibly cast) — the
-// constant member an equivalence class needs for pathkey_is_redundant.
+// parserPseudoConstant reports whether e is a literal (possibly cast), or
+// an operator over such literals — the constant member an equivalence class
+// needs for pathkey_is_redundant. PG builds its equivalence classes after
+// eval_const_expressions has folded `1+1` to `2` (TPC-DS Q39's
+// `inv2.d_moy = 1+1`); a built-in operator is never volatile, so the
+// unfolded form is as constant as the folded one.
 func parserPseudoConstant(e parser.Expr) bool {
 	switch x := e.(type) {
 	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
@@ -95,6 +99,10 @@ func parserPseudoConstant(e parser.Expr) bool {
 		return true
 	case *parser.CastExpr:
 		return parserPseudoConstant(x.Operand)
+	case *parser.UnaryOp:
+		return parserPseudoConstant(x.Operand)
+	case *parser.BinaryOp:
+		return parserPseudoConstant(x.Left) && parserPseudoConstant(x.Right)
 	}
 	return false
 }

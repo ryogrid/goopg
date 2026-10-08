@@ -768,6 +768,20 @@ func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
 	return out
 }
 
+// cteRefSchema is a CTE reference's published row: the body's columns,
+// each stamped with the reference's own range-table id. The body's ids
+// number another query level, so two references to one CTE (TPC-DS Q39's
+// `inv inv1, inv inv2`) would otherwise publish the same ids, and a
+// column of the second would deparse as the first's.
+func cteRefSchema(body Schema, sourceIdx int16) Schema {
+	out := make(Schema, len(body))
+	for i, c := range body {
+		c.SourceTableIdx = sourceIdx
+		out[i] = c
+	}
+	return out
+}
+
 func newResolveContext(bindings []rangeBinding, schema Schema, ps PlannerSettings) *resolveContext {
 	// settings starts at the DEFAULTS, never at the zero value. A zero
 	// PlannerSettings would price every page and tuple at 0.0, so a context
@@ -4947,7 +4961,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Name:   ce.name,
 				Alias:  alias,
 				Child:  ce.body,
-				schema:    ce.schema,
+				schema:    cteRefSchema(ce.schema, sourceIdx),
 				cte:       ce,
 				RTID:      rtid,
 				SourceIdx: sourceIdx,
