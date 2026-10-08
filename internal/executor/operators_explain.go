@@ -3509,6 +3509,42 @@ func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg, use
 	if anc == nil {
 		return "", false
 	}
+	// The chase, when the key's position holds its own column.
+	var chased optimizer.Expr
+	crossed := false
+	if out := anc.Output(); x.Index < len(out) && out[x.Index].Name == x.Name {
+		col := &optimizer.ColumnRef{Index: x.Index, Name: x.Name, Type: x.Type, SourceTableIdx: out[x.Index].SourceTableIdx}
+		prev := reg.chaseCrossedLevel
+		reg.chaseCrossedLevel = false
+		if c, ok := resolveKeySource(col, anc, reg); ok {
+			chased = c
+		}
+		crossed = reg.chaseCrossedLevel
+		reg.chaseCrossedLevel = prev
+	}
+	text := func() (string, bool) {
+		if chased == nil {
+			return "", false
+		}
+		t := formatKeyExprQual(chased, reg, true)
+		if !strings.Contains(t, ".") {
+			return "", false
+		}
+		if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
+			t = "(" + t + ")"
+		}
+		return t, true
+	}
+	// M0146-0108: a chase that crossed into an inlined CTE's body or a
+	// UNION's first arm answers before the label lookups. PG flattens the
+	// inlined CTE and strips its trivial Subquery Scan, so the param
+	// deparses into the body (TPC-DS Q64's `catalog_sales.cs_item_sk`,
+	// where the binding id named the inlined scan `cs_ui`).
+	if crossed {
+		if t, ok := text(); ok {
+			return t, true
+		}
+	}
 	if rel := reg.names().resolveLabelInAncestor(anc, x.Name); rel != "" {
 		if useLabel {
 			return rel + "." + x.Name, true
@@ -3518,23 +3554,7 @@ func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg, use
 	if x.SourceTableIdx != 0 && reg.names().resolveLabelInAncestorSrc(anc, x.Name, x.SourceTableIdx) != "" {
 		return "", false
 	}
-	out := anc.Output()
-	if x.Index >= len(out) || out[x.Index].Name != x.Name {
-		return "", false
-	}
-	col := &optimizer.ColumnRef{Index: x.Index, Name: x.Name, Type: x.Type, SourceTableIdx: out[x.Index].SourceTableIdx}
-	chased, ok := resolveKeySource(col, anc, reg)
-	if !ok {
-		return "", false
-	}
-	t := formatKeyExprQual(chased, reg, true)
-	if !strings.Contains(t, ".") {
-		return "", false
-	}
-	if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
-		t = "(" + t + ")"
-	}
-	return t, true
+	return text()
 }
 
 // formatIndexCondParts is the shared body of formatIndexCond /
