@@ -30002,3 +30002,15 @@ Movement: none — classifier categories flat; SubPlan/InitPlan label sets diffe
       the chase is scoped to index probes\.
     - Q71 is a full MATCH at SF0\.25\. Design: `docs/design/0100\-0149/m0146\-0106\-nestloop\-param\-through\-outer\.md`\.
 Movement: yes — PLAN\-PARITY match SF0\.25 43 → 44 \(Q71\); qual\-placement 11 → 10 at SF0\.25 and SF1
+- [x] **M0146\-0107 — kept CTE and Subquery Scans name their columns in join, probe and group keys**
+  \(filed 2026\-10\-08 from the qualifier\-only census\)\. goopg printed keys over a kept CTE scan or kept Subquery
+  Scan bare: Q14\'s `Index Cond: \(ss\_item\_sk = ss\_item\_sk\)`, Q23\'s Hash Cond, Q95\'s Join Filter, Q44\'s probe\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: make a kept CTE scan a key\-chase boundary named by its range\-table label\.
+  - Done 2026\-10\-08 \(2d685acc0\)\.
+    - CTEScan boundary; Project arm accepts a boundary hit; semi/anti join keys map onto both inputs; DistinctOn
+      walked; ColumnRef probe and Recheck keys go through the outer plan\.
+    - Qualifier\-only Cond/Filter/Key lines differing from PG: SF0\.25 50 → 30, SF1 40 → 24\. Design:
+      `docs/design/0100\-0149/m0146\-0107\-kept\-scan\-key\-qualification\.md`\.
+Movement: none — classifier categories flat; qualifier\-only lines differing from PG SF0\.25 50 → 30, SF1 40 → 24
