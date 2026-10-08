@@ -30014,3 +30014,13 @@ Movement: yes — PLAN\-PARITY match SF0\.25 43 → 44 \(Q71\); qual\-placement 
     - Qualifier\-only Cond/Filter/Key lines differing from PG: SF0\.25 50 → 30, SF1 40 → 24\. Design:
       `docs/design/0100\-0149/m0146\-0107\-kept\-scan\-key\-qualification\.md`\.
 Movement: none — classifier categories flat; qualifier\-only lines differing from PG SF0\.25 50 → 30, SF1 40 → 24
+- [x] **M0146\-0108 — a NestLoop param over an inlined CTE deparses into the CTE\'s body**
+  \(filed 2026\-10\-08 from the M0146\-0107 ledger row, witness TPC\-DS Q64\)\. Q64 printed `cs\_ui\.cs\_item\_sk` where PG
+  prints `catalog\_sales\.cs\_item\_sk`: the binding\-id label lookup named the inlined CTE scan before the chase ran\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: trace which lookup named `cs\_ui` \(the key\'s id names the CTE reference since M0146\-0103\)\.
+  - Done 2026\-10\-08 \(8b1e04c2b\)\.
+    - `nestLoopParamThroughOuter` runs the chase first; a level\-crossing chase wins over the label lookups\.
+    - Q64\'s SF0\.25 probe line matches PG\. Design: `docs/design/0100\-0149/m0146\-0108\-nestloop\-param\-inlined\-cte\.md`\.
+Movement: none — classifier categories flat; qualifier\-only lines differing from PG SF0\.25 30 → 29 \(Q64\)
