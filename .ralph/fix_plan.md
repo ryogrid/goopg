@@ -29955,3 +29955,20 @@ Movement: yes — PLAN\-PARITY match SF1 34 → 35 \(Q44\); SF0\.25 sort\-strate
       pruning\)\.
     - Q39\'s Sort Key matches PG at both scales\. Design: `docs/design/0100\-0149/m0146\-0103\-cte\-reference\-ids\-and\-folded\-pins\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 2 → 1 at SF1 and SF0\.25 \(Q39\)
+- [x] **M0146\-0104 — a query level\'s InitPlans print on its top node, as `SS\_attach\_initplans` hangs them**
+  \(filed 2026\-10\-08 from the 0005dw ledger row, witness TPC\-DS Q58\)\. goopg printed each `InitPlan N` under
+  the node whose expression reads it; PG prints a level\'s whole initPlan list on the level\'s top plan node\.
+  - Q58: under the date\_dim scan below each derived table\'s Gather, where PG prints it on the GroupAggregate\.
+  - Q54, Q6, Q14: on a Hash Join, a Parallel Seq Scan and Nested Loops instead of the level\'s top\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: mark each level\'s top in the charge walk and queue its InitPlans when EXPLAIN renders that node\.
+  - Done 2026\-10\-08 \(b348cc254\)\.
+    - `chargeInitPlans` marks each level\'s top \(`queryLevelTop`\)\.
+    - `LevelInitPlansOf` reads the InitPlans from the final plan, because `stripSublinkBodies` replaces sublinks after
+      the walk, and an early snapshot printed a stale `InitPlan 4` in Q23\.
+    - EXPLAIN queues them at the top \(`claimLevelInitPlans`\), once per plan \(`initPlanQueued`\)\.
+    - InitPlan placements differing from PG: SF0\.25 4 → 0, SF1 5 → 0\. Design:
+      `docs/design/0100\-0149/m0146\-0104\-initplans\-on\-level\-top\.md`\.
+    - Ledgered: a flattened subquery\'s or inlined CTE\'s InitPlans still print on the scan\.
+Movement: none — classifier categories flat at both scales; InitPlan placements differing from PG 4 → 0 \(SF0\.25\), 5 → 0 \(SF1\)
