@@ -30177,3 +30177,13 @@ Movement: yes — TPC\-DS Q2 full MATCH at SF0\.25 \(match 44 → 45, join\-orde
     - `makeJoinRel` passes the reduced restrict list to `sizeJoinRel`; `joinRelSizingClauses` and `sizingOnly` removed\.
     - Design: `docs/design/0100\-0149/m0146\-0117\-joinrel\-sizing\-generated\-clause\.md`\.
 Movement: yes — TPC\-DS Q59 full MATCH at SF0\.25 \(match 45 → 46, join\-order 45 → 44\) and SF1 \(match 36 → 37, join\-order 50 → 49\)
+- [x] **M0146\-0118 — a join\'s residual quals are priced by cost\_qual\_eval, not one operator per conjunct**
+  \(filed 2026\-10\-09 from the M0146\-0116 ledger row, part \(a\)\)\. TPC\-DS Q4/Q11\'s CASE\-ratio Join Filters were priced below PG\.
+  Kind: impl
+  Parent: M0146-0116
+  - First step: count operators per residual conjunct with the qualEvalOps walk, keeping SubPlan pricing as is\.
+  - Done 2026\-10\-09 \(4451864d2\)\.
+    - `qualEvalOpsPriced` \(sublink plan costs optional\); `joinQualPerTuple` sums it per conjunct\.
+    - Design: `docs/design/0100\-0149/m0146\-0118\-join\-residual\-qual\-cost\.md`\.
+    - Ledgered: qp\_qual\_cost\.startup at join startup; casts priced 0\.
+Movement: yes — TPC\-DS Q11 full MATCH at SF0\.25 \(match 46 → 47, join\-order 44 → 43, qual\-placement 10 → 9\); SF1 categories unchanged
