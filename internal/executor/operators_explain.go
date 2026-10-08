@@ -1266,6 +1266,23 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 				}
 			}
 			return src, true
+		case *optimizer.Distinct, *optimizer.DistinctOn:
+			// M0146-0042: a DISTINCT's dedupe (printed Unique / HashAggregate)
+			// republishes its input's columns position for position; PG
+			// deparses an upper Var through it to the relation (TPC-DS
+			// Q54's inlined `my_customers` body: `customer.c_customer_sk`,
+			// where goopg stopped at the CTE name).
+			var c optimizer.Node
+			if d, ok := n.(*optimizer.Distinct); ok {
+				c = d.Child
+			} else {
+				c = n.(*optimizer.DistinctOn).Child
+			}
+			if c == nil || len(n.Output()) != len(c.Output()) {
+				return nil, false
+			}
+			node = c
+			continue
 		case *optimizer.Sort, *optimizer.IncrementalSort, *optimizer.Gather, *optimizer.GatherMerge, *optimizer.Materialize:
 			// Row-order and worker boundaries pass their child's columns
 			// through unchanged (M0146-0021: Q77's sr body aggregates over
@@ -3963,7 +3980,16 @@ func qualifyForeignColumns(e optimizer.Expr, n optimizer.Node, reg *subPlanReg) 
 		if c.SourceTableIdx == 0 || own[int16(c.SourceTableIdx)] {
 			return c
 		}
-		q := reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
+		// M0146-0042: render the param exactly as its sibling, the bitmap
+		// index scan's Index Cond key (formatIndexCondKey), does — the
+		// full column path, which deparses through an inlined CTE's body
+		// (TPC-DS Q54's `customer.c_current_addr_sk`, where the name lookup
+		// alone printed the CTE label `my_customers`). The bare name
+		// lookup stays the fallback.
+		q := formatExprQual(c, reg, true)
+		if !strings.Contains(q, ".") {
+			q = reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
+		}
 		if !strings.Contains(q, ".") {
 			return c
 		}

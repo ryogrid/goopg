@@ -193,3 +193,28 @@ func TestExplainComputedGroupKeyThroughKeptSubqueryScan(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainSortKeyThroughUnionDedupe pins the TPC-DS Q49 shape: an ORDER
+// BY over a UNION (distinct) of constant-tagged branches. The key chase
+// passes through the UNION's dedupe (goopg's Distinct, printed HashAggregate;
+// PG's Unique), which republishes its input position for position, into the
+// Append's first branch: PG 18.3 prints `Sort Key: ('w'::text), u1.a`.
+// goopg printed the output names (`ch, a`).
+func TestExplainSortKeyThroughUnionDedupe(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE u1 (a int, b int)",
+		"CREATE TABLE u2 (a int, b int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	const q = "EXPLAIN (COSTS OFF) SELECT ch, a FROM (SELECT 'w' AS ch, a FROM u1 WHERE b > 1 " +
+		"UNION SELECT 'c', a FROM u2 WHERE b > 1) x ORDER BY ch, a"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	if want := "Sort Key: ('w'::text), u1.a"; !strings.Contains(plan, want) {
+		t.Errorf("missing PG's %q in:\n%s", want, plan)
+	}
+}
