@@ -1,5 +1,9 @@
 # M0146-0042 — EXPLAIN text-identity burn-down
 
+Status: held `[!]` 2026-10-09 by the S4 lineage escalation in M0146-0005
+(its last five completed descendants, M0146-0111 to 0115, all carry
+`Movement: none`). Only the owner reopens it.
+
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
 plans equal to PG's line for line once costs are stripped. Children 0042a

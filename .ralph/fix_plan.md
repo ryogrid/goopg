@@ -22486,6 +22486,49 @@ M0146-0001 re-baseline census on the new default arm.
   > accumulate toward a fresh budget. M0146-0009k already landed
   > (`e6f198d6b`) — sequencing it first is moot; M0146-0049 has its
   > own root (`Parent: M0146`) and was never budget-blocked.
+  > ## ESCALATION 2026\-10\-09 \(S4 lineage budget\) — five consecutive `Movement: none` again
+  > The last five completed descendants of this root \(M0146\-0111, 0112,
+  > 0113, 0114, 0115; 0100\-0110 before them are also `none`\) all carry
+  > `Movement: none`\. They were filed directly as `\[x\]`, and the guard\'s
+  > Rule A checks only NEW OPEN tasks, so nothing stopped the run — a
+  > loop\-discipline miss, recorded here\. S4 now stops selection or filing
+  > under this root\. The root is already `\[x\]`, so the hold is expressed
+  > on its open descendants: **M0146\-0042 and M0146\-0067 are held `\[\!\]`**
+  > until the owner decides\. Each one, with what it proved:
+  >
+  > - **0111** \(constant\-FALSE WHERE → childless `Result`\): PG\'s
+  >   pseudoconstant gate; regress witness only\.
+  > - **0112** \(dummy UNION ALL members pruned\): regress witness only\.
+  > - **0113** \(DISTINCT over pinned keys → `Limit 1`\): regress
+  >   select\_distinct 117 → 100\.
+  > - **0114** \(min/max rewrite in a correlated subquery\): regress
+  >   aggregates 396 → 386\.
+  > - **0115** \(remove\_useless\_self\_joins\): regress join 14868 → 14730,
+  >   equivclass 280 → 264\.
+  >
+  > Each is a PG\-faithful port with an exact regress witness\. None can
+  > move an S3 instrument: no TPC\-H or TPC\-DS query has a constant\-false
+  > WHERE, a pinned DISTINCT, a correlated min/max or a unique\-key
+  > self\-join, so the fire set was flat for all five\.
+  >
+  > **Blocker.** The remaining TPC residue under this root is join\-order
+  > \(51 at SF1, 46 at SF0\.25\), whose lever \(the index\-probe multiplier\)
+  > awaits the owner\'s M0146\-0068 option decision\. The remaining regress
+  > residue \(PlaceHolderVar pull\-up 0067, self\-join residuals, partially
+  > pinned DISTINCT keys, dummy propagation\) has no TPC witness\.
+  >
+  > **Expected movement if unblocked.** M0146\-0068 option A/B/C: the
+  > join\-order and parameterisation categories on the queries its corpus
+  > A/B named\. The regress residue: regress plan text only, no TPC
+  > category\.
+  >
+  > **Size.** Each regress item is a one\-loop slice; 0068 is one
+  > constant change plus its corpus A/B\.
+  >
+  > **Owner decision needed:** re\-pin a LINEAGE\-BASELINE for this root
+  > \(the five are the instrument\-artefact class, as adjudicated
+  > 2026\-10\-03\), or decide M0146\-0068 first\. Until then the loop selects
+  > elsewhere in item 3, starting with M0146\-0007\'s ledgered residue\.
   Kind: impl
   Parent: none
   - **Slice 112 \(routing, 2026\-10\-02, HEAD `c96a5d2f9`\)\.** Q42, Q52, Q37
@@ -27712,7 +27755,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   "no unnamed first-divergence records" is the acceptance bar.
   Kind: recon
   Parent: none
-- [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
+- [!] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
   first-divergence census toward zero: every remaining EXPLAIN text
@@ -27727,6 +27770,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   to need shape work route back to 0005/its named siblings, not here.
   Kind: impl
   Parent: M0146-0005
+  - **Held `\[\!\]` 2026\-10\-09** by the S4 lineage escalation in M0146\-0005 \(its last five completed descendants, 0111–0115, all carry `Movement: none`\)\. Only the owner reopens it\.
   - Slice 2026\-10\-05 \(`fb26f7dc6`\): varchar join keys print their
     RelabelType to text in Hash/Merge Cond, as the Join Filter already did;
     TPC\-DS Q47/Q57 text\-identical at both scales \(SF0\.25 35 → 37, SF1
@@ -29626,7 +29670,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     - Incidental: a member\-constant qual stays as a Filter on the Append \(PG folds it per member\) —
       M0146\-0094\.
   Movement: none — recon
-- [ ] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
+- [!] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
   \(filed 2026\-10\-05 by M0146\-0028's closure\)\. `pull\_up\_simple\_subquery`
   wraps substituted outputs in PlaceHolderVars when the parent uses grouping
   sets \(`REPLACE\_WRAP\_ALL`\), when the subquery sits on the nullable side
@@ -29637,6 +29681,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   links\.
   Kind: impl
   Parent: M0146\-0028
+  - **Held `\[\!\]` 2026\-10\-09** by the S4 lineage escalation in M0146\-0005 \(its last five completed descendants, 0111–0115, all carry `Movement: none`\)\. Only the owner reopens it\.
   - No witness today: no TPC\-H or TPC\-DS query pulls up a simple subquery
     in these positions \(M0146\-0028 §14\)\. Select it when a corpus query or
     regress case needs it\.
@@ -30110,3 +30155,14 @@ Movement: none — instrument artefact: no TPC query has a correlated min/max su
       `docs/design/0100\-0149/m0146\-0115\-self\-join\-removal\.md`\.
     - Ledgered: semi\-join SJE, EC\-proved self\-joins, deeper nesting, unqualified\-column declines, subplan One\-Time Filter\.
 Movement: none — instrument artefact: no TPC query has a unique\-key self\-join; regress join 14868 → 14730
+- [x] **M0146\-0116 — TPC\-DS Q2\'s main\-query join order: pulled\-up quals precede the parent\'s, and hash\_qual\_cost prices expression keys**
+  \(filed 2026\-10\-09 from the M0146\-0065 ledger row, part \(1\)\)\. Q2 was the only D6\-cte record at both scales\.
+  Kind: impl
+  Parent: M0146-0065
+  - First step: cost goopg\'s Q2 order on PG; trace the equivalence\-class member order of the middle join\.
+  - Done 2026\-10\-09 \(d2bbb8b73\)\.
+    - `resolvePulledDerived` returns body quals in deconstruct\_recurse post\-order; the planner puts them before the parent\'s WHERE\.
+    - `hashClausesPerTuple` \(qualEvalOps over the hash clauses\) feeds final\_cost\_hashjoin\'s bucket walk\.
+    - Design: `docs/design/0100\-0149/m0146\-0116\-pulled\-qual\-order\-hash\-qual\-cost\.md`\.
+    - Ledgered: residual join quals still cost one operator per conjunct; split\-chain ON clause order\.
+Movement: yes — TPC\-DS Q2 full MATCH at SF0\.25 \(match 44 → 45, join\-order 46 → 45, D6\-cte 1 → 0\) and SF1 \(match 35 → 36, join\-order 51 → 50\)
