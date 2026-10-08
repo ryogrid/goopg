@@ -97,3 +97,32 @@ func TestExplainUnionDedupeComputedKeyParens(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainKeyThroughPrunedGroupColumn pins the TPC-DS Q66 shape: a
+// grouped UNION ALL member whose `d_year` key is pinned by `d_year = 2001`
+// and pruned from its group keys still publishes d_year — goopg as a
+// Passthrough column, PG as a plain Var in the Agg's target list. PG 18.3
+// deparses the outer key through it to `f1.d_year`; goopg printed the
+// subquery alias `yr`.
+func TestExplainKeyThroughPrunedGroupColumn(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE f1 (w text, d_year int, v int)",
+		"CREATE TABLE f2 (w text, d_year int, v int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	defer hashAggSeed(false)()
+	const q = "EXPLAIN (COSTS OFF) SELECT w, yr, sum(s) FROM (" +
+		"SELECT w, d_year AS yr, sum(v) s FROM f1 WHERE d_year = 2001 GROUP BY w, d_year UNION ALL " +
+		"SELECT w, d_year AS yr, sum(v) s FROM f2 WHERE d_year = 2001 GROUP BY w, d_year) x GROUP BY w, yr"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	for _, want := range []string{"Group Key: f1.w, f1.d_year", "Sort Key: f1.w, f1.d_year"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("missing PG's %q in:\n%s", want, plan)
+		}
+	}
+}

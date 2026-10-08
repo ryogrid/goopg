@@ -1445,8 +1445,23 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			if n.Mode != optimizer.AggModeSimple {
 				return nil, false
 			}
-			if j < len(n.GroupExprs) {
-				g := n.GroupExprs[j]
+			// M0146-0042: a GROUP BY key the planner pruned (constant-
+			// pinned or functionally dependent) still reaches the output as
+			// a Passthrough column at the row's tail. PG keeps it in the
+			// Agg's target list as a plain Var and deparses through it
+			// like a group key — TPC-DS Q66's `date_dim.d_year` behind
+			// the subquery's `year`, where goopg printed `year`.
+			var passthrough optimizer.Expr
+			if np := len(n.Passthrough); np > 0 && n.GroupingSets == nil {
+				if k := j - (len(n.Output()) - np); k >= 0 && k < np {
+					passthrough = n.Passthrough[k]
+				}
+			}
+			if j < len(n.GroupExprs) || passthrough != nil {
+				g := passthrough
+				if g == nil {
+					g = n.GroupExprs[j]
+				}
 				if g == nil || exprHasSubplanOrOuterRef(g) {
 					return nil, false
 				}
