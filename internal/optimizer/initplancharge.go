@@ -45,6 +45,14 @@ func (c *InitPlanCharge) isLevelTop() bool { return c.levelTop }
 func (c *InitPlanCharge) markQueryLevelTop()    { c.queryLevelTop = true }
 func (c *InitPlanCharge) isQueryLevelTop() bool { return c.queryLevelTop }
 
+// IsQueryLevelTop reports whether n is the top node of a query level as the
+// charge walk found it (the statement, a sublink plan, a kept subquery or CTE
+// body, a derived table the search priced as a level).
+func IsQueryLevelTop(n Node) bool {
+	c, ok := n.(initPlanCharger)
+	return ok && c.isQueryLevelTop()
+}
+
 // LevelInitPlansOf returns the initPlans of the query level whose top node
 // is n — what PG's SS_attach_initplans attaches to that node — or nil when
 // n is not a level's top. They are read from the plan as it stands, not
@@ -206,6 +214,21 @@ func (c *initPlanChargeWalk) level(top Node) {
 		switch x := n.(type) {
 		case *SubqueryScan:
 			c.level(x.Child)
+			return
+		case *SetOp:
+			// Each arm of a set operation is a query level of its own
+			// (recurse_set_operations plans it as a subquery, and an
+			// appendrel member keeps its own init_plans too): PG prints
+			// `w = (select 2)`'s InitPlan on that arm's scan, not on the
+			// Append (M0146-0105). A nested link of the same chain is not
+			// an arm.
+			for _, arm := range []Node{x.Left, x.Right} {
+				if _, link := arm.(*SetOp); link {
+					walk(arm)
+				} else {
+					c.level(arm)
+				}
+			}
 			return
 		case *CTEScan:
 			if x.Child == nil {
