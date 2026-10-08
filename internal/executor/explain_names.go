@@ -332,6 +332,9 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		node optimizer.Node
 	}
 	var found []entry
+	// M0146-0109: multi-row VALUES nodes, in walk order, for their
+	// `"*VALUES*"` label numbering.
+	var valuesNodes []optimizer.Node
 	cteWalked := map[string]bool{}
 	var walk func(optimizer.Node)
 	walk = func(node optimizer.Node) {
@@ -356,6 +359,9 @@ func (nm *explainNames) collect(n optimizer.Node) {
 				return
 			}
 			cteWalked[key] = true
+		}
+		if v, ok := node.(*optimizer.Values); ok && len(v.Rows) > 1 {
+			valuesNodes = append(valuesNodes, node)
 		}
 		if base, ok := explainRelBaseName(node); ok {
 			if rtid, ok := explainNodeRTID(node); ok {
@@ -439,6 +445,19 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			continue
 		}
 		if name := claimName(labelTaken, e.base); name != e.base {
+			nm.nodeLabels[ptr] = name
+		}
+	}
+	// M0146-0109: every multi-row VALUES is an RTE named "*VALUES*";
+	// set_rtable_names numbers the repeats (`"*VALUES*_1"`). goopg's Values
+	// node carries no RTID, so walk order stands in for range-table order.
+	for _, v := range valuesNodes {
+		ptr := nodePtr(v)
+		if labelSeen[ptr] {
+			continue
+		}
+		labelSeen[ptr] = true
+		if name := claimName(labelTaken, "*VALUES*"); name != "*VALUES*" {
 			nm.nodeLabels[ptr] = name
 		}
 	}

@@ -3087,6 +3087,22 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			filt := expandAggOutputRefsInFilter(attachedFilter, p)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(filt, reg, qualify)))})
 		}
+	case *optimizer.Values:
+		// M0146-0109: a WHERE over a one-row VALUES / FROM-less SELECT is a
+		// pseudo-constant qual — PG's Result prints it as `One-Time Filter:`
+		// (`select 1 where false` → `One-Time Filter: false`). A multi-row
+		// Values Scan prints its scan qual as `Filter:`.
+		if attachedFilter != nil {
+			if len(p.Rows) <= 1 {
+				otf := formatExprQual(attachedFilter, reg, qualify)
+				if !isLiteralOneTimeFilterConst(attachedFilter) {
+					otf = wrapParen(otf)
+				}
+				*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + otf)})
+			} else {
+				*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			}
+		}
 	default:
 		// Non-scan nodes keep an attached Filter alive — render it
 		// here so the predicate is not silently dropped when our
@@ -6692,7 +6708,19 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		// emits a bare `Result` label (explain.c, T_Result arm).
 		return "Result"
 	case *optimizer.Values:
-		return fmt.Sprintf("Values (%d rows)", len(p.Rows))
+		// M0146-0109: PG plans a FROM-less SELECT and a one-row VALUES as a
+		// Result (create_valuesscan_plan is reached only for a VALUES RTE
+		// with several rows; a single row is a plain targetlist), and a
+		// multi-row VALUES as `Values Scan on "*VALUES*"`, the RTE's name
+		// as set_rtable_names numbers it (`"*VALUES*_1"` for the next).
+		if len(p.Rows) <= 1 {
+			return "Result"
+		}
+		name := "*VALUES*"
+		if d := nm.disambiguatedName(p); d != "" {
+			name = d
+		}
+		return "Values Scan on " + pgQuoteIdent(name)
 	case *optimizer.Join:
 		// S3 (0134-0001 P2, class 7a): PG interpolates the join type
 		// into the node name (explain.c jointype switch 1712-1763, text
