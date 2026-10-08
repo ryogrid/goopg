@@ -25,17 +25,20 @@ import (
 //   - the equivalence is a top-level WHERE conjunct `col = const` (either
 //     order) over a bare column; equalities reached transitively through
 //     other columns (a = b AND b = 5) are not derived here;
-//   - at least one key must remain. With every key redundant PG runs a
-//     KEYLESS sorted aggregate that still returns no row on empty input,
-//     which goopg's zero-key aggregate (one row on empty input) cannot
-//     express;
+//   - every key may go (M0146-0102). PG then runs a KEYLESS sorted
+//     aggregate — `GroupAggregate` / `Group` with no Group Key and no Sort —
+//     that still returns no row on empty input, because the query is
+//     grouped (parse->groupClause is set) even though processed_groupClause
+//     is empty. The caller marks such a node Aggregate.GroupedNoKeys, which
+//     keeps the executor from emitting the ungrouped aggregate's empty-input
+//     row;
 //   - grouping sets and GROUPING() calls never prune (the caller's gate).
 
 // redundantConstGroupKeys returns keep[i] == false for each group expression
 // equated to a constant by a top-level WHERE conjunct, plus the input-schema
 // indices of those columns; (nil, nil) when nothing can be dropped.
 func redundantConstGroupKeys(groupExprs []Expr, s *parser.SelectStmt, ctx *resolveContext) ([]bool, map[int]bool) {
-	if s == nil || s.Where == nil || ctx == nil || len(groupExprs) < 2 {
+	if s == nil || s.Where == nil || ctx == nil || len(groupExprs) < 1 {
 		return nil, nil
 	}
 	constInput := map[int]bool{}
@@ -77,7 +80,7 @@ func redundantConstGroupKeys(groupExprs []Expr, s *parser.SelectStmt, ctx *resol
 			pruned[cr.Index] = true
 		}
 	}
-	if len(pruned) == 0 || len(pruned) >= len(groupExprs) {
+	if len(pruned) == 0 {
 		return nil, nil
 	}
 	return keep, pruned

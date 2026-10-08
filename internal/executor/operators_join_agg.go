@@ -2578,7 +2578,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// grand-total level of a ROLLUP — produces exactly one output row even
 	// over zero input rows, so its group is created before the drain.
 	for si, set := range sets {
-		if len(set) > 0 {
+		// M0146-0102: a keyless GROUPED aggregate (every GROUP BY key pruned
+		// as constant-pinned) is PG's AGG_SORTED with zero columns, not
+		// AGG_PLAIN: it forms its single group only from input rows and
+		// returns nothing over empty input.
+		if len(set) > 0 || o.plan.GroupedNoKeys {
 			continue
 		}
 		var ptVals Row

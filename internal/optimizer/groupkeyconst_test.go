@@ -78,9 +78,12 @@ func TestRedundantConstGroupKeyIsPruned(t *testing.T) {
 		t.Error("pinned key must stay addressable as a passthrough column")
 	}
 
+	// M0146-0102: with every key pinned, PG prunes them all and runs a
+	// keyless GROUPED aggregate (no row over empty input), which goopg marks
+	// GroupedNoKeys.
 	all := findAggregateGK(planSQL(t, cat, "SELECT ax, ay, count(*) FROM a WHERE ax = 1 AND ay = 2 GROUP BY ax, ay"))
-	if all == nil || len(all.GroupExprs) != 2 {
-		t.Error("with every key pinned no key may be pruned (keyless-group semantics)")
+	if all == nil || len(all.GroupExprs) != 0 || !all.GroupedNoKeys {
+		t.Error("with every key pinned all keys are pruned and the aggregate stays grouped (GroupedNoKeys)")
 	}
 
 	or := findAggregateGK(planSQL(t, cat, "SELECT ax, ay, count(*) FROM a WHERE ax = 1 OR ay = 2 GROUP BY ax, ay"))

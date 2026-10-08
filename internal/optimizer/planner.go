@@ -2625,7 +2625,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				innerAgg = a
 			}
 		}
-		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 {
+		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 && !innerAgg.GroupedNoKeys {
 			allConst := true
 			for _, t := range targets {
 				if !isConstantPlanExpr(t) {
@@ -9956,6 +9956,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		GroupingMasks: groupingMasks,
 		// EXPLAIN-only: the GROUPING(...) arguments' group slots.
 		GroupingMaskSlots: groupingMaskSlots,
+	}
+	// M0146-0102: every GROUP BY key was constant-pinned and pruned — PG's
+	// keyless grouped aggregate, which emits no row over empty input.
+	if len(groupExprs) == 0 && len(s.GroupBy) > 0 && gsSets == nil && len(prunedInputCols) > 0 {
+		aggNode.GroupedNoKeys = true
 	}
 	// M0146-0101: the GROUP BY items pruned above, for the uniqueness proof.
 	if len(prunedInputCols) > 0 {

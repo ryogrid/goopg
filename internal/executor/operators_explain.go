@@ -6580,6 +6580,15 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			return prefix + "HashAggregate"
 		}
 		if len(p.GroupExprs) == 0 {
+			// M0146-0102: a keyless GROUPED aggregate is PG's AGG_SORTED
+			// with zero columns — "GroupAggregate", or the Group node when
+			// it computes no aggregate (create_group_path).
+			if p.GroupedNoKeys && p.GroupingSets == nil {
+				if len(p.Aggs) == 0 {
+					return "Group"
+				}
+				return prefix + "GroupAggregate"
+			}
 			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
 			// regardless of strategy, so this one is already faithful.
 			return prefix + "Aggregate"

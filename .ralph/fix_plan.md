@@ -29922,3 +29922,14 @@ Movement: SF1 join\-order 53\-\>52, join\-method 21\-\>20, scan\-type 34\-\>33, 
     - Q78 now differs from PG only in the ws/cs join order and rendering\. Design:
       `docs/design/0100\-0149/m0146\-0101\-innerunique\-original\-groupby\.md`\.
 Movement: SF1 join\-method 20\-\>19, parameterisation 30\-\>29, sort\-strategy 27\-\>26, parallelism 40\-\>39; SF0\.25 join\-method 23\-\>22, parameterisation 25\-\>24, sort\-strategy 25\-\>24, parallelism 26\-\>25\.
+- [ ] **M0146\-0102 — a GROUP BY whose every key is constant\-pinned runs PG\'s keyless grouped aggregate**
+  \(filed 2026\-10\-08 while reviewing the M0146\-0042 rendering census\)\. TPC\-DS Q44\'s InitPlan groups
+  `\.\.\. WHERE ss\_store\_sk = 4 GROUP BY ss\_store\_sk`\.
+  - PG prunes the pinned key \(processed\_groupClause empty\) and plans `Finalize GroupAggregate \-\> Gather \-\>
+    Partial GroupAggregate` with no Group Key and no Sort\.
+  - goopg kept the key: `redundantConstGroupKeys` refused to prune the last one, because goopg\'s zero\-key aggregate
+    returns one row over empty input, where PG\'s grouped AGG\_SORTED returns none\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: allow full pruning, mark the node grouped\-without\-keys, and keep the executor from pre\-creating
+    the empty group for it \(serial and Partial/Finalize\)\.

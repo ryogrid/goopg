@@ -1655,6 +1655,15 @@ type Aggregate struct {
 	// pruned column the query reads reaches the output as a Passthrough.
 	PrunedGroupInputs []int
 
+	// GroupedNoKeys marks a GROUP BY aggregate whose every key was pruned as
+	// constant-pinned (groupkeyconst.go, M0146-0102). It has no GroupExprs,
+	// like an ungrouped aggregate, but it is still grouped: PG's AGG_SORTED
+	// with zero columns (parse->groupClause set, processed_groupClause
+	// empty) returns NO row over empty input, where an ungrouped
+	// aggregate (AGG_PLAIN) returns one. EXPLAIN labels it GroupAggregate
+	// (Group without aggregates) with no Group Key line.
+	GroupedNoKeys bool
+
 	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
 	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
 	// child-output positions of the group-input columns (group keys ∪
