@@ -30053,3 +30053,14 @@ Movement: none — instrument artefact: the TPC corpora contain no Values nodes;
       `docs/design/0100\-0149/m0146\-0110\-limit\-needed\.md`\.
     - Ledgered: `LIMIT ALL` is a goopg syntax error\.
 Movement: none — instrument artefact: no TPC query has OFFSET 0 / LIMIT NULL; regress join 14931 → 14911
+- [x] **M0146\-0111 — a constant\-false WHERE makes the scope\'s relation dummy \(childless `Result  One\-Time Filter: false`\)**
+  \(filed 2026\-10\-08 from regress join\'s `… offset 0\) ss where false`\)\. goopg scanned and joined everything under
+  `Filter: \(false\)`; PG plans a dummy rel as a childless Result\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: detect a constant FALSE/NULL conjunct in the scope\'s WHERE residual and plan the dummy Result\.
+  - Done 2026\-10\-08 \(831e03903\)\.
+    - `gatePseudoconstantQuals` → `hasConstantFalseConjunct`; upper stages stay above the Result\.
+    - Regress join 14911 → 14876 diff lines\. Design: `docs/design/0100\-0149/m0146\-0111\-constant\-false\-dummy\-rel\.md`\.
+    - Ledgered: dummy propagation for LEFT JOIN ON false, IN over a dummy subquery, a dummy UNION ALL arm\.
+Movement: none — instrument artefact: no TPC query has a constant\-false WHERE; regress join 14911 → 14876
