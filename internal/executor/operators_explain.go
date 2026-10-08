@@ -1072,7 +1072,12 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 	// relation, which is exactly the mislabel it guards against.
 	var wantRel int16
 	wantName := ""
-	if c, ok := expr.(*optimizer.ColumnRef); ok {
+	if c, ok := expr.(*optimizer.ColumnRef); ok && !pinned {
+		// A pinned chase starts from an aggregate's argument, whose
+		// relation id belongs to the aggregate's input numbering, not to
+		// the nodes the walk crosses (TPC-DS Q71's `ext_price`: 2 at the
+		// aggregate, 1 on the Project below). The identity check would
+		// compare unrelated ids, so only the name checks apply there.
 		wantRel, wantName = c.SourceTableIdx, c.Name
 	}
 	relMismatch := func(name string, rel int16) bool {
@@ -1141,11 +1146,19 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			// `promotions` over a cross join of two aggregate subqueries,
 			// M0146-0005ce); relMismatch and the Project arm's own check
 			// still keep a same-named column of another relation out.
-			if col.SourceTableIdx != 0 && nout[idx].SourceTableIdx != 0 &&
+			// M0146-0042: the comparison is meaningful only when the join's
+			// own output numbers that position as the reference does. A
+			// searched join can republish every column under one id (TPC-DS
+			// Q71's join over a UNION ALL: all 1, the aggregate argument 2);
+			// the ids then belong to different numberings and the name
+			// check above is the only one that applies.
+			jout := n.Output()
+			idsComparable := col.Index < len(jout) && jout[col.Index].SourceTableIdx == col.SourceTableIdx
+			if idsComparable && col.SourceTableIdx != 0 && nout[idx].SourceTableIdx != 0 &&
 				nout[idx].SourceTableIdx != col.SourceTableIdx {
 				return nil, false
 			}
-			if relMismatch(nout[idx].Name, nout[idx].SourceTableIdx) {
+			if idsComparable && relMismatch(nout[idx].Name, nout[idx].SourceTableIdx) {
 				return nil, false
 			}
 			moved := *col
@@ -1269,6 +1282,27 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			node = c
 			continue
 		case *optimizer.SubqueryScan:
+			// M0146-0042: a Subquery Scan that survives into the printed
+			// plan is one PG keeps (the strip pass removes the trivial
+			// ones, as setrefs.c's trivial_subqueryscan does), and an upper
+			// OUTER_VAR deparses to that scan's own column, qualified by its
+			// alias (get_variable on the subquery RTE): TPC-DS Q71's
+			// `sum("*SELECT* 3".ext_price)` over a UNION ALL member's
+			// "*SELECT* n" wrapper. The chase stops here, as the kept-
+			// Filter arm below does for a scan with quals.
+			if col, ok := cur.(*optimizer.ColumnRef); ok && n.Alias != "" && reg != nil {
+				out := n.Output()
+				if col.Index < 0 || col.Index >= len(out) || out[col.Index].Name != col.Name {
+					return nil, false
+				}
+				at := &optimizer.ColumnRef{Index: col.Index, Name: out[col.Index].Name,
+					Type: out[col.Index].Type, SourceTableIdx: out[col.Index].SourceTableIdx}
+				if reg.boundaryKeyName == nil {
+					reg.boundaryKeyName = map[*optimizer.ColumnRef]string{}
+				}
+				reg.boundaryKeyName[at] = pgQuoteIdent(n.Alias) + "." + pgQuoteIdent(at.Name)
+				return at, true
+			}
 			// M0146-0005w: the label publishes no republishing layer of
 			// its own — same positions, alias-renamed names only — so it
 			// steps through without consuming chase depth (a nested
@@ -1638,7 +1672,18 @@ func chaseAggregateResultArgs(call optimizer.AggregateCall, child optimizer.Node
 		if !hit {
 			return a, c.SourceTableIdx != 0
 		}
-		if _, isCol := chased.(*optimizer.ColumnRef); isCol {
+		if cc, isCol := chased.(*optimizer.ColumnRef); isCol {
+			// A column the chase stopped at a kept Subquery Scan carries
+			// that scan's alias as its text (boundaryKeyName): TPC-DS Q71's
+			// `sum("*SELECT* 3".ext_price)` (M0146-0042). Keep it, renamed
+			// as a display column so synthAggCall accepts it.
+			if txt, named := reg.boundaryKeyName[cc]; named {
+				dn := *c
+				dn.Name = fmt.Sprintf("%s\x00display%d", c.Name, len(reg.boundaryKeyName))
+				dn.SourceTableIdx = displayColumnSourceIdx
+				changed = true
+				return displayColumn(&dn, txt, reg), true
+			}
 			return a, c.SourceTableIdx != 0
 		}
 		var txt string

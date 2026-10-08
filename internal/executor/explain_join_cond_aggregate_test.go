@@ -126,3 +126,36 @@ func TestExplainKeyThroughPrunedGroupColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainAggregateArgThroughUnionMemberWrapper pins the TPC-DS Q71
+// shape: an aggregate over a join with a UNION ALL whose join members keep
+// their "*SELECT* n" Subquery Scans. PG 18.3 deparses the aggregate's
+// argument through the Append's first branch and stops at that kept scan:
+// `Sort Key: (sum("*SELECT* 1".v)) DESC, it.n`. goopg printed `sum(v)`: the
+// key chase stepped through the wrapper, and the join's relation-id check
+// compared ids from two different numberings.
+func TestExplainAggregateArgThroughUnionMemberWrapper(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, d := range []string{
+		"CREATE TABLE m1 (a int, v int, x int)",
+		"CREATE TABLE m2 (a int, v int, x int)",
+		"CREATE TABLE d (k int, y int)",
+		"CREATE TABLE it (k int, n int)",
+	} {
+		if err := runDDL(t, ctx, d); err != nil {
+			t.Fatalf("%s: %v", d, err)
+		}
+	}
+	const q = "EXPLAIN (COSTS OFF) SELECT it.n, sum(v) AS s FROM it, (" +
+		"SELECT m1.a AS b, m1.v FROM m1, d WHERE m1.x = d.k AND d.y = 2002 UNION ALL " +
+		"SELECT m2.a, m2.v FROM m2, d WHERE m2.x = d.k AND d.y = 2002) u " +
+		"WHERE u.b = it.k GROUP BY it.n ORDER BY s DESC, it.n"
+	plan := strings.Join(runExplainRows(t, ctx, q), "\n")
+	if !strings.Contains(plan, `Subquery Scan on "*SELECT* 1"`) {
+		t.Fatalf("the shape under test is gone (want the member wrappers kept):\n%s", plan)
+	}
+	if want := `Sort Key: (sum("*SELECT* 1".v)) DESC, it.n`; !strings.Contains(plan, want) {
+		t.Errorf("missing PG's %q in:\n%s", want, plan)
+	}
+}

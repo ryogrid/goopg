@@ -144,11 +144,30 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 			groupLine = t2 // the top agg; deeper aggs are not this pin
 		}
 	}
-	if sortLine != "Sort Key: (count(x)) DESC" {
-		t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
+	// M0146-0042: when the derived table keeps its Subquery Scan — PG
+	// 18.3 does here (`Subquery Scan on unnamed_subquery` under the Sort)
+	// and so does goopg — an upper key deparses to that scan's own column,
+	// `unnamed_subquery.c`, not through it. Only a stripped wrapper lets the
+	// transitive `count(x)` form through. goopg names the anonymous
+	// subquery `__sq_<pos>` where PG says `unnamed_subquery` (ledgered), so
+	// the alias is read off the plan rather than pinned.
+	alias := ""
+	for _, r := range rows {
+		if t2 := strings.TrimSpace(r); strings.Contains(t2, "Subquery Scan on ") {
+			alias = strings.TrimSpace(t2[strings.Index(t2, "Subquery Scan on ")+len("Subquery Scan on "):])
+		}
 	}
-	if groupLine != "Group Key: count(x)" && groupLine != "Group Key: (count(x))" {
-		t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
+	if alias != "" {
+		if sortLine != "Sort Key: "+alias+".c DESC" || groupLine != "Group Key: "+alias+".c" {
+			t.Errorf("want the keys qualified by the kept Subquery Scan %q; got:\n%s", alias, strings.Join(rows, "\n"))
+		}
+	} else {
+		if sortLine != "Sort Key: (count(x)) DESC" {
+			t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
+		}
+		if groupLine != "Group Key: count(x)" && groupLine != "Group Key: (count(x))" {
+			t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
+		}
 	}
 	assertNoOpaqueExpr(t, strings.Join(rows, "\n"))
 }
