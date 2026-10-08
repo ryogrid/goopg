@@ -30098,3 +30098,15 @@ Movement: none — instrument artefact: no TPC query has a DISTINCT over pinned 
     - Regress aggregates 396 → 386, join 14874 → 14870\. Design:
       `docs/design/0100\-0149/m0146\-0114\-correlated\-minmax\-initplan\.md`\.
 Movement: none — instrument artefact: no TPC query has a correlated min/max subquery; regress aggregates 396 → 386
+- [x] **M0146\-0115 — an inner self\-join on a unique key keeps one scan \(remove\_useless\_self\_joins\)**
+  \(filed 2026\-10\-09 from the regress census\)\. PG 18 plans `select p\.\* from sj p, sj q where q\.a = p\.a and q\.b = q\.a \- 1`
+  as `Seq Scan on sj q  Filter: \(\(a IS NOT NULL\) AND \(b = \(a \- 1\)\)\)`; goopg joined sj to itself\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: remove the earlier reference when same\-column equalities cover a unique index, renaming it to the later one\.
+  - Done 2026\-10\-09 \(dff8d5999\)\.
+    - `removeUselessSelfJoins` \(remove\_self\_joins\.go\), called after `removeUselessLeftJoins`\.
+    - Regress join 14868 → 14730, equivclass 280 → 264\. Design:
+      `docs/design/0100\-0149/m0146\-0115\-self\-join\-removal\.md`\.
+    - Ledgered: semi\-join SJE, EC\-proved self\-joins, deeper nesting, unqualified\-column declines, subplan One\-Time Filter\.
+Movement: none — instrument artefact: no TPC query has a unique\-key self\-join; regress join 14868 → 14730
