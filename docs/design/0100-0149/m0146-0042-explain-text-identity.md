@@ -460,6 +460,31 @@ Results:
   where PG says `unnamed_subquery`. A join key over a UNION ALL member
   wrapper prints its name-based `m1.a` where PG prints `"*SELECT* 1".b`.
 
+## Slice — a computed group key through a kept Subquery Scan (2026-10-08, `d20998581`)
+
+- **Problem.** TPC-DS Q54 groups on `cast(revenue/50 as int)` over the
+  grouped CTE `my_revenue`, which PG keeps as a Subquery Scan. PG prints
+  `(((my_revenue.revenue / '50'::numeric))::integer)` on the Sort, Group
+  and inner Sort keys. goopg expanded `revenue` through the inlined CTE's
+  body into `sum(...)`.
+- **Change.**
+  - `chaseKeyExprColumns` (factored out of `chaseJoinKeyExprColumns`)
+    chases each column of an expression key.
+  - The Group Key line (`aggGroupKeyText`) and `sortKeyParts` take that
+    chase for a computed key only when it reaches a kept scan
+    (`keyExprReachesKeptScan`). This covers the Sort over the aggregate's
+    named group key and the Sort over goopg's unprinted Project.
+- **Measured and dropped.** A column-wise chase in `resolveKeySource`'s
+  Project arm, and a Subquery Scan case in `chaseJoinKeyExprColumns`.
+  Neither changes Q54.
+- **Results.** Q54's three key lines equal PG's at both scales. Its
+  rendering record remains on `my_customers.c_customer_sk` (PG
+  `customer.c_customer_sk`, another inlined CTE).
+- Test: `TestExplainComputedGroupKeyThroughKeptSubqueryScan`.
+- Not covered (ledger): goopg leaves a plan unqualified when the only
+  extra range-table entry is a subquery. PG's `rtable_size > 1` counts the
+  subquery RTE, so `rev` prints as `my_revenue.rev`.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
