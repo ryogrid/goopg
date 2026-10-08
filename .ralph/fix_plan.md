@@ -27796,6 +27796,12 @@ Movement: yes — PLAN\-PARITY match SF0\.25 42 → 43, SF1 33 → 34 \(Q65\); C
     - Q33/Q56/Q60 lines now equal PG\'s, and Q56 is text\-identical at SF0\.25\.
     - Remaining MATCH text residue at SF0\.25: Q75\'s computed group key needs PG\'s double parentheses\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH rendering SF0\.25 10 → 9, SF1 11 → 9
+  - Slice 2026\-10\-08 \(`bce8f29c0`\): a UNION dedupe\'s computed group key prints get\_variable\'s extra
+    parentheses \(`\(\(expr\)\)`\)\.
+    - The Distinct arm wraps a key whose chase crossed the set operation; `inputIsSetOp` looks through Gather\.
+    - Q75 is text\-identical at SF0\.25 \(1 → 0 lines\), one line closer at SF1\.
+    - Every SF0\.25 MATCH query is now text\-identical\.
+Movement: none — instrument artefact — text\-only; Q75 text\-identical at SF0\.25, categories unchanged
 - [x] **M0146\-0042a — an EC\-reduced join clause prints in its derived
   orientation, not outer\-first** \(filed 2026\-10\-02 by M0146\-0005de;
   SF1 Q17, Q25, Q29 print `item\.i\_item\_sk = catalog\_sales\.cs\_item\_sk`,

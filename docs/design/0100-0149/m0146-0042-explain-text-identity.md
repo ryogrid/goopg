@@ -355,6 +355,23 @@ Results:
   - TPC-H text and ten regress files are unchanged.
 - Test: `TestExplainSortKeyAggregateOverUnionAllMembers`.
 
+## Slice — a UNION dedupe's computed group key (2026-10-08, `bce8f29c0`)
+
+- **Problem.** A UNION's dedupe groups on the Append's output, and the
+  Append's target entries are Vars of its first branch. `show_agg_keys`
+  therefore deparses a Var, and `get_variable` wraps the branch's computed
+  target in parentheses of its own. TPC-DS Q75's CTE prints
+  `((store_sales.ss_quantity - COALESCE(...)))`; goopg printed one pair.
+- **Change.** The Distinct arm adds that pair when the key's chase crossed
+  a set operation and the dedupe's input is a SetOp. `inputIsSetOp` looks
+  through Gather, Gather Merge, Sort and Materialize. A DISTINCT over a
+  plain scan keeps one pair, as in PG.
+- **Results.** Q75 is text-identical at SF0.25 (1 line → 0) and one line
+  closer at SF1. TPC-H text and ten regress files are unchanged.
+- Test: `TestExplainUnionDedupeComputedKeyParens`.
+- Not covered (ledger): the same wrap for Aggregate/Sort keys read through
+  an Append.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
