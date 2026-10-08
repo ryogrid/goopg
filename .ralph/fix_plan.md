@@ -30024,3 +30024,26 @@ Movement: none — classifier categories flat; qualifier\-only lines differing f
     - `nestLoopParamThroughOuter` runs the chase first; a level\-crossing chase wins over the label lookups\.
     - Q64\'s SF0\.25 probe line matches PG\. Design: `docs/design/0100\-0149/m0146\-0108\-nestloop\-param\-inlined\-cte\.md`\.
 Movement: none — classifier categories flat; qualifier\-only lines differing from PG SF0\.25 30 → 29 \(Q64\)
+- [x] **M0146\-0109 — a FROM\-less SELECT or one\-row VALUES prints as Result, a multi\-row VALUES as Values Scan on "\*VALUES\*"**
+  \(filed 2026\-10\-08 while looking for a M0146\-0067 witness in regress join\)\. goopg labelled every Values node
+  `Values \(N rows\)`, a label PG never prints; it appeared in every `\(select 1\)` InitPlan and VALUES list of the
+  regress suite\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: label one\-row Values `Result` \(WHERE as `One\-Time Filter:`\) and multi\-row `Values Scan on "\*VALUES\*"`\.
+  - Done 2026\-10\-08 \(658ec94ad\)\.
+    - `describePlanMode` label, `explainNames\.collect` `\*VALUES\*\_N` numbering, One\-Time Filter arm\.
+    - Regress diff lines fall across 10 files \(union 347 → 259, subselect 1470 → 1394, join 14997 → 14931\)\.
+    - Ledgered: VALUES column names \(`"\*VALUES\*"\.column1`\) and walk\-order numbering\. Design:
+      `docs/design/0100\-0149/m0146\-0109\-values\-result\-labels\.md`\.
+Movement: none — instrument artefact: the TPC corpora contain no Values nodes; regress diff lines fall across 10 files
+- [ ] **M0146\-0110 — a Limit with OFFSET 0 and no LIMIT is not planned \(`limit\_needed`\)**
+  \(filed 2026\-10\-08 by M0146\-0109\)\. PG\'s `limit\_needed` \(planner\.c\) skips the Limit node when OFFSET is a
+  non\-null constant 0 and there is no LIMIT \(or LIMIT is a constant NULL\); goopg keeps it: `select 1 offset 0` prints
+  `Limit \-> Result` where PG prints `Result`, and every `\(… offset 0\)` subquery fence in regress join/subselect
+  carries a goopg\-only Limit\.
+  Kind: impl
+  Parent: M0146\-0005
+  - Witness: regress join \(`select 1 as x offset 0`, the lateral PlaceHolderVar cases\) and subselect\.
+  - First step: find where goopg builds the Limit node for a SELECT and skip it under `limit\_needed`\'s rules,
+    keeping the subquery un\-pulled \(OFFSET still fences pull\-up in PG\)\.
