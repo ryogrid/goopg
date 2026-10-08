@@ -485,6 +485,29 @@ Results:
   extra range-table entry is a subquery. PG's `rtable_size > 1` counts the
   subquery RTE, so `rev` prints as `my_revenue.rev`.
 
+## Slice — key chases through a DISTINCT dedupe; Recheck params as Index Cond (2026-10-08, `1745ad42f`)
+
+- **Problem.**
+  - The key chase had no arm for a DISTINCT's dedupe (goopg's `Distinct`
+    / `DistinctOn`), so TPC-DS Q54's inlined DISTINCT CTE `my_customers`
+    printed as `my_customers.*` on five lines, where PG prints
+    `customer.*`. Q49's sort key over the UNION's dedupe printed
+    `channel`, where PG prints `('web'::text)`.
+  - A bitmap scan's Recheck Cond qualified its NestLoop param by name
+    lookup, while its sibling Index Cond used the full column path, so
+    the two disagreed.
+- **Change.**
+  - `resolveKeySource` passes through `Distinct` / `DistinctOn`, which
+    republish their input position for position.
+  - `qualifyForeignColumns` renders a param through `formatExprQual`, the
+    path the Index Cond key uses, and falls back to the name lookup.
+- **Results.** The rendering category drops 4 → 3 at both scales. Q49's
+  first key and Q54's `customer.*` lines now follow PG.
+- Test: `TestExplainSortKeyThroughUnionDedupe`.
+- Not covered (ledger): on a hash join's hashed side PG keeps `Subquery
+  Scan` over an inlined DISTINCT CTE, and goopg strips it. That is a
+  shape gap in the strip pass for inlined CTE leaves.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |
