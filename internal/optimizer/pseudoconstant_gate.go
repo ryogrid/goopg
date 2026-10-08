@@ -43,6 +43,22 @@ func gatePseudoconstantQuals(node Node, cat catalog.Catalog) Node {
 	if node == nil {
 		return node
 	}
+	// M0146-0111: a constant FALSE or NULL WHERE conjunct makes the scope's
+	// relation dummy (PG: relation_excluded_by_constraints for a base rel,
+	// and a dummy input makes every inner join above it dummy —
+	// set_dummy_rel_pathlist / is_dummy_rel). A dummy rel plans as a
+	// childless Result whose resconstantqual is false: `Result  One-Time
+	// Filter: false`, with nothing scanned or joined beneath it. The NOT
+	// NULL reduction builds the same node for its always-false case.
+	if hasConstantFalseConjunct(node) {
+		schema := node.Output()
+		return &Result{
+			pos:           node.Pos(),
+			Targets:       identityResultTargets(schema),
+			OneTimeFilter: &BooleanConst{pos: node.Pos(), Value: false},
+			schema:        schema,
+		}
+	}
 	var gates []Expr
 	rewritten := liftPseudoconstantConjuncts(node, cat, &gates)
 	if len(gates) == 0 {
@@ -162,4 +178,34 @@ func SublinkIsInitPlan(e Expr) bool {
 		return sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam)
 	}
 	return false
+}
+
+// hasConstantFalseConjunct reports whether the Filter chain at the top of n
+// (the scope's WHERE residual) holds a conjunct that is a constant FALSE or
+// NULL — PG's eval_const_expressions folds such a WHERE to a constant, and
+// a constant-false restriction empties the relation. A cast of either
+// (`null::boolean`) is the same constant.
+func hasConstantFalseConjunct(n Node) bool {
+	for {
+		f, ok := n.(*Filter)
+		if !ok {
+			return false
+		}
+		for _, c := range splitAnd(f.Predicate) {
+			for {
+				cast, isCast := c.(*CastExpr)
+				if !isCast {
+					break
+				}
+				c = cast.Operand
+			}
+			if b, ok := c.(*BooleanConst); ok && !b.Value {
+				return true
+			}
+			if _, ok := c.(*NullConst); ok {
+				return true
+			}
+		}
+		n = f.Child
+	}
 }
