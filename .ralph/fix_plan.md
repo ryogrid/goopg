@@ -30075,3 +30075,15 @@ Movement: none — instrument artefact: no TPC query has a constant\-false WHERE
     - Fixture witness only \(no TPC query or regress EXPLAIN has a dummy member\)\. Design:
       `docs/design/0100\-0149/m0146\-0112\-dummy\-union\-member\.md`\.
 Movement: none — instrument artefact: no TPC query or regress EXPLAIN has a dummy UNION ALL member \(fixture witness\)
+- [x] **M0146\-0113 — SELECT DISTINCT over constant or WHERE\-pinned keys plans as LIMIT 1**
+  \(filed 2026\-10\-08 from the regress select\_distinct census\)\. PG\'s distinct\_pathkeys is empty when every key is
+  redundant, and create\_final\_distinct\_paths plans a LIMIT 1; goopg built a HashAggregate / Unique\.
+  Kind: impl
+  Parent: M0146\-0005
+  - First step: detect all\-pinned distinct targets and plan Limit 1 over the input\.
+  - Done 2026\-10\-08 \(518c91ff3\)\.
+    - `distinctKeysAllPinned` \(groupkeyconst\.go\); the planner\'s DISTINCT stage builds `Limit\{1\}`\.
+    - Regress select\_distinct 117 → 100 diff lines\. Design:
+      `docs/design/0100\-0149/m0146\-0113\-distinct\-pinned\-limit\-one\.md`\.
+    - Ledgered: partially pinned keys and the parallel partial Limit\.
+Movement: none — instrument artefact: no TPC query has a DISTINCT over pinned keys; regress select\_distinct 117 → 100
