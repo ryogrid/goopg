@@ -30064,3 +30064,14 @@ Movement: none — instrument artefact: no TPC query has OFFSET 0 / LIMIT NULL; 
     - Regress join 14911 → 14876 diff lines\. Design: `docs/design/0100\-0149/m0146\-0111\-constant\-false\-dummy\-rel\.md`\.
     - Ledgered: dummy propagation for LEFT JOIN ON false, IN over a dummy subquery, a dummy UNION ALL arm\.
 Movement: none — instrument artefact: no TPC query has a constant\-false WHERE; regress join 14911 → 14876
+- [x] **M0146\-0112 — a dummy UNION ALL member is dropped from the Append**
+  \(filed 2026\-10\-08 from the M0146\-0111 ledger row\)\. A constant\-false UNION ALL member stayed under the Append;
+  PG skips dummy members, elides a single\-member Append, and plans an all\-dummy set operation as a dummy Result\.
+  Kind: impl
+  Parent: M0146\-0111
+  - First step: prune dummy members from UNION ALL links after the set\-operation fold\.
+  - Done 2026\-10\-08 \(4987641e3\)\.
+    - `pruneDummyUnionAllArms` / `isDummyRelNode` / `renameSetOpMember` \(dummy\_setop\.go\); UNION distinct untouched\.
+    - Fixture witness only \(no TPC query or regress EXPLAIN has a dummy member\)\. Design:
+      `docs/design/0100\-0149/m0146\-0112\-dummy\-union\-member\.md`\.
+Movement: none — instrument artefact: no TPC query or regress EXPLAIN has a dummy UNION ALL member \(fixture witness\)
