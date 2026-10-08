@@ -616,7 +616,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// later comparison (joinsearchlevel.go:43) (P5.9-l-ii).
 	s.trace.offer(s.tracePhase, rel1.Relids, rel2.Relids, joinrel == nil)
 	if joinrel == nil {
-		rows, width := s.builder.sizeJoinRel(rel1, rel2, s.clauses.joinRelSizingClauses(rel1.Relids, rel2.Relids, sjinfo), sjinfo)
+		// M0146-0117: set_joinrel_size_estimates sizes the joinrel with the
+		// restrictlist build_joinrel_restrictlist made for this first pair —
+		// one generated clause per equivalence class, not the written one.
+		rows, width := s.builder.sizeJoinRel(rel1, rel2, clauses, sjinfo)
 		// The same floor buildInitialRels applies (joinsearch.go:220-240):
 		// a zero-row rel would make every join above it free and the level
 		// above would order itself on noise.

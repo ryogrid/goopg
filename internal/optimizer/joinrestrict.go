@@ -173,22 +173,6 @@ type restrictInfoList struct {
 	// clauses written inner = outer, so a clause keeps one identity
 	// across the joinrel pairs that choose it (PG's ec_derives reuse).
 	flips map[*restrictInfo]*restrictInfo
-	// sizingOnly suspends the reduction for joinRelSizingClauses.
-	sizingOnly bool
-}
-
-// joinRelSizingClauses is buildJoinRelRestrictList before the
-// equivalence-class reduction: the join size still charges the class's
-// selectivity through oneClausePerEquivClass' explicit-first choice, not
-// through the clause the reduction evaluates (M0146-0022 keeps estimates
-// unchanged; PG estimates with the generated clause — ledgered).
-func (l *restrictInfoList) joinRelSizingClauses(outer, inner RelSet, sjinfo *SpecialJoinInfo) []*restrictInfo {
-	if l == nil {
-		return nil
-	}
-	l.sizingOnly = true
-	defer func() { l.sizingOnly = false }()
-	return l.buildJoinRelRestrictList(outer, inner, sjinfo)
 }
 
 // relsOverlap reports whether two relsets share a base relation (bms_overlap).
@@ -453,7 +437,7 @@ func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo 
 	base := l.clausesFor(outer, inner)
 	if sjinfo == nil {
 		// inner join — clausesFor, with one clause per equivalence class
-		if l != nil && !l.sizingOnly {
+		if l != nil {
 			return l.reduceEquivClassJoinClauses(outer, inner, base)
 		}
 		return base

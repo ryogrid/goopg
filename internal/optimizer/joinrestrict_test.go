@@ -362,10 +362,6 @@ func TestInnerJoinAppliesOneClausePerEquivClass(t *testing.T) {
 	if again := l.buildJoinRelRestrictList(0b1100, 0b0011, nil); again[0] != got[0] {
 		t.Error("the flipped clause must keep one identity across calls")
 	}
-	// Sizing still sees every applicable clause.
-	if n := len(l.joinRelSizingClauses(0b0011, 0b1100, nil)); n != 4 {
-		t.Errorf("sizing clauses = %d, want 4", n)
-	}
 	// Off (a problem with special joins): every clause stays.
 	l.ecReduce = false
 	if n := len(l.buildJoinRelRestrictList(0b0011, 0b1100, nil)); n != 4 {
