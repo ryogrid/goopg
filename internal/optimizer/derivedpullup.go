@@ -147,12 +147,6 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 		rv.TableFunc != nil || rv.TableSample != nil {
 		return nil, false
 	}
-	// M0146-0028g: a column-alias list renames the first outputs
-	// (resolvePulledDerived). More aliases than outputs is the parse-analysis
-	// error PG raises; the unpulled path reports it.
-	if len(rv.Columns) > len(sub.Targets) {
-		return nil, false
-	}
 	if sub.With != nil || sub.SetOp != nil || sub.SetOpOperand != nil ||
 		len(sub.GroupBy) > 0 || sub.GroupingSets != nil || sub.Having != nil ||
 		sub.Distinct || len(sub.DistinctOn) > 0 || len(sub.OrderBy) > 0 ||
@@ -203,6 +197,22 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 			}
 		}
 	}
+	// M0146-0119: `*` and `alias.*` stand for the columns parse analysis
+	// expands them to (transformTargetList / ExpandColumnRefStar), so the
+	// body PG pulls up has no star left in it.
+	if expanded, ok := expandPullupBodyStars(sub, cat); !ok {
+		return nil, false
+	} else if expanded != nil {
+		cp := *sub
+		cp.Targets = expanded
+		sub = &cp
+	}
+	// M0146-0028g: a column-alias list renames the first outputs
+	// (resolvePulledDerived). More aliases than outputs is the parse-analysis
+	// error PG raises; the unpulled path reports it.
+	if len(rv.Columns) > len(sub.Targets) {
+		return nil, false
+	}
 	for _, t := range sub.Targets {
 		if t.Expr == nil {
 			return nil, false
@@ -234,6 +244,143 @@ func simpleDerivedPullupBody(it parser.FromExpr, cat catalog.Catalog) (*parser.S
 	// addPulledBodyColumnNames, turns the needed-column set unknown (no
 	// index-only pruning) when collectStmtColumnNames cannot enumerate it.
 	return sub, true
+}
+
+// expandPullupBodyStars replaces each `*` / `alias.*` target of a pulled
+// body with qualified column references to the FROM items it stands for, in
+// FROM order: a table's live columns from the catalog, a derived item's (or
+// an inlinable CTE reference's) output names. It returns nil, true when the
+// body has no star, and false — the body stays unpulled — when an item's
+// columns cannot be named without resolving it: an unaliased or unpullable
+// derived item, an output that is neither aliased nor a plain column, a
+// NATURAL / USING join (they merge columns), or an unknown relation.
+func expandPullupBodyStars(sub *parser.SelectStmt, cat catalog.Catalog) ([]parser.ResTarget, bool) {
+	hasStar := false
+	for _, t := range sub.Targets {
+		if isPullupStarTarget(t.Expr) {
+			hasStar = true
+		}
+	}
+	if !hasStar {
+		return nil, true
+	}
+	if cat == nil {
+		return nil, false
+	}
+	type fromItem struct {
+		qual string
+		cols []string
+	}
+	var items []fromItem
+	add := func(rv parser.RangeVar) bool {
+		item := parser.FromExpr{Base: rv}
+		if conv, _, ok := cteAsDerivedItem(item); ok {
+			item = conv
+		} else if rv.Subquery == nil && rv.Schema == "" && planCTEs[strings.ToLower(rv.Name)] != nil {
+			// A CTE that is not inlined here: its output names are the
+			// CTE's, which this AST pass does not resolve.
+			return false
+		}
+		b := item.Base
+		qual := b.Alias
+		if b.Subquery != nil {
+			body, ok := simpleDerivedPullupBody(item, cat)
+			if !ok || qual == "" {
+				return false
+			}
+			var cols []string
+			for i, t := range body.Targets {
+				switch {
+				case i < len(b.Columns):
+					cols = append(cols, b.Columns[i])
+				case t.Alias != "":
+					cols = append(cols, t.Alias)
+				default:
+					cr, ok := t.Expr.(*parser.ColumnRef)
+					if !ok || cr.Column == "" || cr.Column == "*" {
+						return false
+					}
+					cols = append(cols, cr.Column)
+				}
+			}
+			items = append(items, fromItem{qual: qual, cols: cols})
+			return true
+		}
+		if !pullupPlainRelation(b) {
+			return false
+		}
+		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: b.Schema, Name: b.Name})
+		if !ok || tbl == nil {
+			return false
+		}
+		if qual == "" {
+			qual = b.Name
+		}
+		var cols []string
+		for _, c := range tbl.Columns {
+			if !c.Dropped {
+				cols = append(cols, c.Name)
+			}
+		}
+		items = append(items, fromItem{qual: qual, cols: cols})
+		return true
+	}
+	for _, f := range sub.FromExprs {
+		if !add(f.Base) {
+			return nil, false
+		}
+		for _, j := range f.Joins {
+			if j.Natural || len(j.Using) > 0 || !add(j.Right) {
+				return nil, false
+			}
+		}
+	}
+	var out []parser.ResTarget
+	for _, t := range sub.Targets {
+		if !isPullupStarTarget(t.Expr) {
+			out = append(out, t)
+			continue
+		}
+		want := pullupStarQualifier(t.Expr)
+		matched := false
+		for _, it := range items {
+			if want != "" && !strings.EqualFold(it.qual, want) {
+				continue
+			}
+			matched = true
+			for _, c := range it.cols {
+				out = append(out, parser.ResTarget{Expr: &parser.ColumnRef{Table: it.qual, Column: c}})
+			}
+		}
+		if !matched {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// isPullupStarTarget reports whether a target is `*` or `alias.*` (a schema-
+// qualified star is not expanded here).
+func isPullupStarTarget(e parser.Expr) bool {
+	switch x := e.(type) {
+	case *parser.StarExpr:
+		return x.Schema == ""
+	case *parser.ColumnRef:
+		return x.Column == "*" && x.Schema == ""
+	}
+	return false
+}
+
+// pullupStarQualifier is the alias a star target is restricted to, "" for a
+// bare `*`.
+func pullupStarQualifier(e parser.Expr) string {
+	switch x := e.(type) {
+	case *parser.StarExpr:
+		return x.Table
+	case *parser.ColumnRef:
+		return x.Table
+	}
+	return ""
 }
 
 // pulledCandidateOwning returns the innermost candidate whose expanded body
