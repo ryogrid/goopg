@@ -1442,6 +1442,36 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 				}
 				return call, ok
 			}
+			// M0146-0042: a Finalize's group position names the Partial's
+			// group key; PG deparses it through the Gather into the
+			// Partial's target list, as the Group Key line does
+			// (aggGroupKeyText). TPC-DS Q77's `store.s_store_sk` behind the
+			// CTE `ss`, where goopg stopped at `ss.s_store_sk`.
+			if n.Mode == optimizer.AggModeFinal && n.GroupingSets == nil && j < len(n.GroupExprs) {
+				partial := partialAggregateBelow(n.Child)
+				if !finalizeGroupPairs(n, partial, j) {
+					return nil, false
+				}
+				g := partial.GroupExprs[j]
+				if g == nil || exprHasSubplanOrOuterRef(g) {
+					return nil, false
+				}
+				if gc, isCol := g.(*optimizer.ColumnRef); isCol && gc.SourceTableIdx != 0 {
+					if qualifierNamesCTE(reg, gc, cteNames) {
+						return nil, false
+					}
+					if crossedJoin && relMismatch(gc.Name, gc.SourceTableIdx) {
+						return nil, false
+					}
+					if crossedJoin {
+						return pinKeyExprNames(gc, partial, reg)
+					}
+					return gc, true
+				}
+				cur = g
+				node = partial.Child
+				continue
+			}
 			if n.Mode != optimizer.AggModeSimple {
 				return nil, false
 			}
@@ -1662,11 +1692,8 @@ func chaseAggregateResultArgs(call optimizer.AggregateCall, child optimizer.Node
 func aggGroupKeyText(p *optimizer.Aggregate, gi int, reg *subPlanReg, qualify bool) string {
 	keyExpr := p.GroupExprs[gi]
 	if p.Mode == optimizer.AggModeFinal {
-		if cr, ok := keyExpr.(*optimizer.ColumnRef); ok {
-			if partial := partialAggregateBelow(p.Child); partial != nil && partial.GroupingSets == nil &&
-				cr.Index >= 0 && cr.Index < len(partial.GroupExprs) {
-				return aggGroupKeyText(partial, cr.Index, reg, qualify)
-			}
+		if partial := partialAggregateBelow(p.Child); finalizeGroupPairs(p, partial, gi) {
+			return aggGroupKeyText(partial, gi, reg, qualify)
 		}
 	}
 	if _, ok := keyExpr.(*optimizer.ColumnRef); ok {
@@ -1681,6 +1708,21 @@ func aggGroupKeyText(p *optimizer.Aggregate, gi int, reg *subPlanReg, qualify bo
 		}
 	}
 	return s
+}
+
+// finalizeGroupPairs reports whether group position j of a Finalize pairs
+// with group position j of its Partial: the Partial publishes its group keys
+// first, in the Finalize's order, so the positions correspond. The output
+// names must agree at j (a check, not the mapping: a Finalize's own key
+// expression may still index the pre-split input row).
+func finalizeGroupPairs(final, partial *optimizer.Aggregate, j int) bool {
+	if final == nil || partial == nil || partial.GroupingSets != nil || final.GroupingSets != nil ||
+		j < 0 || j >= len(final.GroupExprs) || j >= len(partial.GroupExprs) ||
+		len(final.GroupExprs) != len(partial.GroupExprs) {
+		return false
+	}
+	fo, po := final.Output(), partial.Output()
+	return j < len(fo) && j < len(po) && fo[j].Name == po[j].Name
 }
 
 // partialAggregateBelow finds the Partial aggregate a Finalize combines,
