@@ -12416,19 +12416,32 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// reject the whole rewrite regardless of index availability, because the
 	// non-correlated SubqueryExpr cannot carry a parameterised inner plan.
 	var wherePred Expr
+	correlated := false
 	if s.Where != nil {
 		wherePred, err = resolveExpr(s.Where, ctx)
 		if err != nil {
 			return nil, false, err
 		}
-		hasOuter := false
 		walkExprTree(wherePred, func(e Expr) {
 			if _, ok := e.(*OuterColumnRef); ok {
-				hasOuter = true
+				correlated = true
 			}
 		})
-		if hasOuter {
-			return nil, false, nil
+		if correlated {
+			// M0146-0114: PG still builds the min/max InitPlan when the WHERE
+			// reads an enclosing query level (build_minmax_path inside a
+			// correlated SubPlan; regress aggregates' `select f1, (select
+			// min(unique1) from tenk1 where unique1 > f1)`): the InitPlan
+			// takes the outer value as a param and re-runs when it changes.
+			// The inner query sits one sublink deeper than this level, so its
+			// outer references move one level up the scope stack. A sublink
+			// inside the WHERE keeps the old decline: the shift does not
+			// descend into nested plans.
+			deeper, ok := deepenOuterRefs(wherePred)
+			if !ok {
+				return nil, false, nil
+			}
+			wherePred = deeper
 		}
 	}
 
@@ -12674,7 +12687,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// exactly one column (the min) and at most one row. evalSubquery's
 	// constant-key cache IS upstream's InitPlan-once-per-statement semantics
 	// (executor/expr.go evalSubquery; subplan.go header).
-	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: true}
+	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: !correlated, ParamInitPlan: correlated}
 
 	// The childless Result top node (T_Result, nodeResult.c): one row whose
 	// single target is the InitPlan value.
@@ -12866,7 +12879,10 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 				cr.SourceTableIdx == argCR.SourceTableIdx
 		}
 		if _, ok := e.(*OuterColumnRef); ok {
-			return false
+			// M0146-0114: an enclosing level's value is a param of the
+			// min/max InitPlan, read from the scope stack or a PARAM_EXEC
+			// slot, never from the 1-wide index row.
+			return true
 		}
 		slots, ok := exprChildSlots(e)
 		if !ok {

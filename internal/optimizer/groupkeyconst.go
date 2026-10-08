@@ -178,3 +178,30 @@ func distinctKeysAllPinned(s *parser.SelectStmt) bool {
 	}
 	return true
 }
+
+// deepenOuterRefs returns e with every outer reference one query level
+// further out (M0146-0114): the min/max rewrite moves a WHERE into a new
+// sublink nested inside this level, so a reference to the enclosing level
+// must now skip this one. It declines (false) when e holds a sublink, whose
+// inner plan the shift does not reach.
+func deepenOuterRefs(e Expr) (Expr, bool) {
+	hasSublink := false
+	walkExprTree(e, func(x Expr) {
+		if len(ExprSubplans(x)) > 0 {
+			hasSublink = true
+		}
+	})
+	if hasSublink {
+		return nil, false
+	}
+	return cloneExprRefs(e, scopeIgnore, exprRewriter{
+		Rewrite: func(n Expr) Expr {
+			if o, ok := n.(*OuterColumnRef); ok {
+				cp := *o
+				cp.Level++
+				return &cp
+			}
+			return n
+		},
+	})
+}

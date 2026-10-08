@@ -4657,7 +4657,7 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		// ExistsExpr/InExpr/array-subquery testexpr arms below, which
 		// are untouched.
 		name := subPlanName(reg, x, x.Plan)
-		if x.IsNonCorrelated && strings.HasPrefix(name, "InitPlan") {
+		if (x.IsNonCorrelated || x.ParamInitPlan) && strings.HasPrefix(name, "InitPlan") {
 			return "(" + name + ").col1"
 		}
 		return "(" + name + ")"

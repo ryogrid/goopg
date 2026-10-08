@@ -173,7 +173,7 @@ func isPseudoconstantConjunct(c Expr, cat catalog.Catalog) bool {
 func SublinkIsInitPlan(e Expr) bool {
 	switch x := e.(type) {
 	case *SubqueryExpr:
-		return x.IsNonCorrelated
+		return x.IsNonCorrelated || x.ParamInitPlan
 	case *ExistsExpr:
 		return sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam)
 	}

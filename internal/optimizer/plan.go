@@ -388,6 +388,13 @@ type SubqueryExpr struct {
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
 	Args     []Expr
+	// ParamInitPlan marks a sublink PG plans as an InitPlan whose params
+	// come from an enclosing query level (M0146-0114): the min/max rewrite
+	// of a correlated `(select min(c) … where c > outer.x)` builds its
+	// `Limit -> Index Only Scan` as such an InitPlan, re-evaluated when the
+	// param changes. goopg runs it as a correlated sublink; EXPLAIN labels
+	// it `InitPlan N`.
+	ParamInitPlan bool
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
