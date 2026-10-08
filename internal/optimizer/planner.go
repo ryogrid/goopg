@@ -943,8 +943,10 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps
 				tiesKeys = append(tiesKeys, k.Expr)
 			}
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
-			WithTies: s.WithTies, TiesKeys: tiesKeys}
+		if limitNeeded(lim, off) {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+				WithTies: s.WithTies, TiesKeys: tiesKeys}
+		}
 	}
 	return node, nil
 }
@@ -2593,7 +2595,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// expansion, non-constant bounds) keeps today's order:
 			// the decline is fail-closed.
 			deferredLim, deferredOff = lim, off
-		} else {
+		} else if limitNeeded(lim, off) {
 			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
 				WithTies: s.WithTies, TiesKeys: tiesKeys}
 		}
@@ -2969,7 +2971,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 	}
 	// R83: deferred LIMIT above DISTINCT (see the LIMIT stage above).
-	if deferredLim != nil || deferredOff != nil {
+	if limitNeeded(deferredLim, deferredOff) {
 		out = &Limit{pos: s.Pos(), Child: out, Limit: deferredLim, Offset: deferredOff}
 	}
 	// B-01c Slice 1: finalized above-aware re-stamp of the ORDER BY Sort
@@ -5966,7 +5968,9 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
 			}
 			off = e
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		if limitNeeded(lim, off) {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		}
 	}
 	return node, nil
 }
