@@ -30199,3 +30199,14 @@ Movement: yes — TPC\-DS Q11 full MATCH at SF0\.25 \(match 46 → 47, join\-ord
       `docs/design/0100\-0149/m0146\-0119\-pulled\-star\-body\.md`\.
     - Ledgered: VERBOSE Output lists of pulled bodies; duplicate output names; unnamed expression outputs\.
 Movement: none — instrument artefact: no TPC query pulls up a star body; regress with 3014 → 2997 \(one ERROR fixed\)
+- [x] **M0146\-0120 — isunique recurses through sub\-select levels \(TPC\-DS Q44\'s Memoize probes\)**
+  \(filed 2026\-10\-09 from the SF0\.25 jointree\-search triage: Q44\'s first divergence is a Memoize cache key priced with the
+  200\-distinct default, a statistics\-driven divergence — M0146\-0009 per the banner\'s interleave rule\)\.
+  Kind: impl
+  Parent: M0146-0009
+  - First step: trace getMemoizePath\'s ndistinct for Q44\'s item probes\.
+  - Done 2026\-10\-09 \(e61861b70\)\.
+    - `derivedColumnIsUnique` \(examine\_simple\_variable recursion\); `derivedLeafUniqueCols` accepts a Project leaf\.
+    - Design: `docs/design/0100\-0149/m0146\-0120\-isunique\-recursion\.md`\.
+    - Ledgered: security\_barrier stop not modelled\.
+Movement: yes — TPC\-DS Q44 full MATCH at SF0\.25 \(match 47 → 48, join\-order 43 → 42, parameterisation 23 → 22\); SF1 unchanged
