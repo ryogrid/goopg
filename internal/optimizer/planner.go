@@ -1626,6 +1626,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
 			return nil, err
 		}
+		// M0146-0112: a UNION ALL member that is a dummy rel (a constant-false
+		// WHERE) is dropped, as PG's Append skips it.
+		left = pruneDummyUnionAllArms(left)
 		// Restore final ORDER BY / LIMIT / OFFSET.
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
