@@ -29972,3 +29972,20 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 2 → 1 at SF1 and SF0\.25 \
       `docs/design/0100\-0149/m0146\-0104\-initplans\-on\-level\-top\.md`\.
     - Ledgered: a flattened subquery\'s or inlined CTE\'s InitPlans still print on the scan\.
 Movement: none — classifier categories flat at both scales; InitPlan placements differing from PG 4 → 0 \(SF0\.25\), 5 → 0 \(SF1\)
+- [x] **M0146\-0105 — SubPlan/InitPlan numbers follow PG\'s preprocess order per query level; set\-operation arms are levels**
+  \(filed 2026\-10\-08 from the M0146\-0104 census, witness TPC\-DS Q6\)\. goopg reserved numbers in plan pre\-order, so Q6
+  printed `InitPlan 2` / `SubPlan 1` where PG prints `InitPlan 1` / `SubPlan 2`\.
+  - PG numbers a level\'s sublinks as `preprocess\_expression` reaches them: targetlist, quals, HAVING, LIMIT, each
+    in source order; FROM subqueries that stay levels come after\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: number per query level \(the M0146\-0104 marks\), ordered by preprocess part then source position\.
+  - Done 2026\-10\-08 \(29526f12d\)\.
+    - `reservePGPlanIDs` numbers one level at a time, ordered by `preprocessRank` then position\.
+    - Set\-operation arms are query levels in the charge walk, which corrects M0146\-0104\'s hoisting of UNION ALL
+      arm InitPlans to the Append\.
+    - Label sets differing from PG: 1 → 0 at both scales\. Design:
+      `docs/design/0100\-0149/m0146\-0105\-sublink\-numbering\-preprocess\-order\.md`\.
+    - Ledgered: an EXISTS pulled up into a semi join numbers its inner sublink first; `LIMIT \(select …\)` is
+      rejected\.
+Movement: none — classifier categories flat; SubPlan/InitPlan label sets differing from PG 1 → 0 at SF0\.25 and SF1 \(Q6\)

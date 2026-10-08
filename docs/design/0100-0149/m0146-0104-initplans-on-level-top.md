@@ -105,3 +105,10 @@ filtered scan, PG at the level's top (SS_attach_initplans)".
   goopg still treats such a body as its own level: the charge walk's
   CTE-scan arm, and the derived-table wrapper present at charge time. So
   it prints the InitPlan on the scan, as HEAD did.
+
+## Correction (M0146-0105)
+
+The charge walk did not treat the arms of a set operation as query
+levels, so this change hoisted a UNION ALL's arm InitPlans to the Append.
+PG prints them on each arm. M0146-0105 (29526f12d) makes each `SetOp` arm
+a level of its own.
