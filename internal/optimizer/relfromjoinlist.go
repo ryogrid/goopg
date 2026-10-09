@@ -72,6 +72,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // joinlistProblem is everything one statement's joinlist recursion reads. It is
@@ -621,8 +622,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
 	// M0146-0022: one clause per equivalence class at an inner join, only
-	// where no special join can null-extend a class member.
-	s.clauses.ecReduce = len(sjis) == 0
+	// where no special join can null-extend a class member. M0146-0128: a
+	// SEMI join null-extends nothing (PG's distribute_qual_to_rels makes its
+	// qual an ordinary class member), so a problem whose special joins are
+	// all SEMI reduces too.
+	s.clauses.ecReduce = onlySemiJoins(sjis)
 	s.orClauseSelDivisor = prob.orClauseSelDivisor
 	// M0146-0127: a clause derived through a semijoin's qual reads the RHS's
 	// columns, which exist only where the RHS is a whole join input.
@@ -804,4 +808,15 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// RelOptInfo, which used to end here.
 		rel: p.Rel,
 	}, nil
+}
+
+// onlySemiJoins reports whether every special join is a SEMI join — none can
+// null-extend an equivalence-class member (M0146-0128).
+func onlySemiJoins(sjis []*SpecialJoinInfo) bool {
+	for _, sj := range sjis {
+		if sj == nil || sj.Jointype != parser.JoinSemi {
+			return false
+		}
+	}
+	return true
 }
