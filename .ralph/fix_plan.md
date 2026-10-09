@@ -30308,3 +30308,16 @@ Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0\.25 21 → 20, SF1 
     - Design: `docs/design/0100\-0149/m0146\-0128\-semi\-only\-ec\-reduce\.md`\.
     - The item\_pkey Bitmap\-vs\-Index part is B8 \(`indexProbeCostMultiplier`: a one\-row lookup is 16\.27 vs PG 8\.30\) — gated on M0146\-0068, not touched\.
 Movement: yes — CATEGORIES-EXCL-MATCH qual\-placement SF0\.25 9 → 8, SF1 10 → 9 \(TPC\-DS Q14\)
+- [x] **M0146\-0129 — a constant\-FALSE outer\-join qual makes the nullable side a dummy rel \(`left join ... on false`\)**
+  \(filed 2026\-10\-09 from M0146\-0123\'s ledger row: goopg planned the nullable side of `t LEFT JOIN u ON false`; regress join\.sql
+  missed 19 `One\-Time Filter: false` lines\)\.
+  Kind: impl
+  Parent: M0146-0123
+  - First step: port populate\_joinrel\_with\_paths\' JOIN\_LEFT constant\-false arm as a post\-search pass over each scope\.
+  - Done 2026\-10\-09 \(f54d6219a\)\.
+    - `dummyConstantFalseOuterJoinSides`, `constantOutputExprs`; EXPLAIN: childless\-Result key\-source arm, bare constant Join Filter, `NULL::type`\.
+    - Design: `docs/design/0100\-0149/m0146\-0129\-outer\-join\-constant\-false\-dummy\.md`\.
+    - Ledgered: RIGHT/FULL orientation, constant\-TRUE join quals kept, contradictory class constants, dummy propagation\.
+  - Triage this loop \(SF0\.25\): Q78 is a near\-tie \(PG prices both left\-join orders 0\.06 apart\); Q42/Q52 route to B\-15 \(btcostestimate
+    log2 descent term, blocked\); Q26 Gather\-vs\-Gather Merge is a sub\-unit tie; Q4 EC member choice is the held M0146\-0022 family\.
+Movement: none — parity held: no TPC query has a constant\-false outer\-join qual; regress join 14699 → 14679, subselect 1367 → 1354 diff lines
