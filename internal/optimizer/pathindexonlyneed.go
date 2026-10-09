@@ -394,7 +394,7 @@ func collectSublinkOuterNames(e parser.Expr, dst map[string]bool) bool {
 	case *parser.ExistsExpr:
 		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
-		return collectStmtColumnNames(x.Inner, dst)
+		return collectStmtColumnNames(scalarBodyForColumns(x.Inner), dst)
 	default:
 		return false
 	}
@@ -584,7 +584,7 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 	case *parser.ExistsExpr:
 		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
-		return collectStmtColumnNames(x.Inner, dst)
+		return collectStmtColumnNames(scalarBodyForColumns(x.Inner), dst)
 	default:
 		// `StarExpr`, `IndirectionStar`, `RowExpr`, the array forms, and any
 		// node added after this file was written. Declining is the only answer
@@ -629,5 +629,35 @@ func existsBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
 	}
 	cp := *sub
 	cp.Targets = nil
+	return &cp
+}
+
+// scalarBodyForColumns drops a scalar sublink's unqualified `*` targets before
+// the walk (M0146-0122). transformExpr expands such a star over the sublink's
+// OWN FROM list (ExpandColumnRefStar: the current level's namespace only), so
+// every Var it makes has varlevelsup 0 and none is an outer relation's column.
+// The sublink is planned by its own planSelect, which computes its own needed
+// set, and an EXPR sublink is never pulled up into the outer join tree
+// (pull_up_sublinks converts only ANY / EXISTS). TPC-DS Q23's
+// `HAVING sum(...) > 0.95 * (SELECT * FROM max_store_sales)` had voided the
+// whole set, so best_ss_customer's `customer` got no index-only path. A
+// qualified star (`t.*`) may name an outer relation and is still walked —
+// which declines.
+func scalarBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
+	if sub == nil || len(sub.Targets) == 0 {
+		return sub
+	}
+	keep := make([]parser.ResTarget, 0, len(sub.Targets))
+	for _, t := range sub.Targets {
+		if st, ok := t.Expr.(*parser.StarExpr); ok && st.Schema == "" && st.Table == "" {
+			continue
+		}
+		keep = append(keep, t)
+	}
+	if len(keep) == len(sub.Targets) {
+		return sub
+	}
+	cp := *sub
+	cp.Targets = keep
 	return &cp
 }
