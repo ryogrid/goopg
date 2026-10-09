@@ -77,6 +77,9 @@ statement, which is correct). It was in the generated query files.
 ## Not covered (ledgered)
 
 - **Q70's engine gap** (M0146-0143).
-- **`bench/tpcds/plans-pg/` Q36/Q70/Q86** are still `SKIP_QUERYGEN` stubs.
-  Recapturing them adds three queries to the estimate-parity ratchet's
-  corpus, so they wait for the next ea-ratchet re-pin.
+- **`bench/tpcds/plans-pg/` Q36/Q70/Q86** were left as `SKIP_QUERYGEN`
+  stubs, on the reasoning that recapturing them would move the
+  estimate-parity ratchet. That was backwards: as stubs they made the
+  ratchet report Q36/Q86 as NEW findings, because it had no PG reference
+  to score them against. M0146-0141 recaptured the three files
+  (a4f6b8c48), and the ratchet is back to 1 finding.
