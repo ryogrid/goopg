@@ -30233,3 +30233,14 @@ Movement: yes — TPC\-DS Q23 at SF0\.25 down to scan\-type only \(join\-order 4
     - Design: `docs/design/0100\-0149/m0146\-0122\-scalar\-sublink\-star\-needed\.md`\.
     - Ledgered: qualified\-star and ARRAY\-sublink stars still void the set\.
 Movement: yes — TPC\-DS Q23 full MATCH at SF0\.25 \(match 48 → 49, scan\-type 24 → 23\); SF1 unchanged
+- [x] **M0146\-0123 — fold an immutable built\-in over constant arguments at plan time \(evaluate\_function\)**
+  \(filed 2026\-10\-09 from M0146\-0007h\'s ledger row, item \(2\): goopg printed `abs\(\'\-1\'::integer\)` / `length\(\'abc\'\)` /
+  `upper\(\'x\'\)` where PG prints the folded constant; item \(1\), constant FALSE quals, was found already resolved\)\.
+  Kind: impl
+  Parent: M0146-0007h
+  - First step: probe constant folding of function calls on a scratch goopg vs a scratch PG 18\.3\.
+  - Done 2026\-10\-09 \(157eaf6d8\)\.
+    - `pgProcFoldableOIDs` \(generator parses prokind\), `catalog.ProcIsFoldable`, `tryFoldFuncCall`, executor hook `optimizer.EvalConstFunc`\.
+    - Design: `docs/design/0100\-0149/m0146\-0123\-const\-func\-folding\.md`\.
+    - Ledgered: float/date result types, strict NULL folding and plan\-time errors, qualified names, COALESCE family, estimate mode, LEFT JOIN ON false\.
+Movement: none — parity held: no TPC query or covered regress EXPLAIN applies an immutable built\-in to constants; scratch probe matches PG
