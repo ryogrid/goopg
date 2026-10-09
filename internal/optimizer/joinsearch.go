@@ -115,6 +115,12 @@ type searchCtx struct {
 	// every search ran in before M0127-P5.7-b.
 	tupleFraction float64
 
+	// rootCheapestTotal makes finalPath (and GEQO's root) hand up the final
+	// rel's CheapestTotal instead of the fractional pick: an aggregate stage
+	// above consumes every row, and PG applies the fraction only at
+	// final_rel (M0146-0150; resolveContext.rootCheapestTotal).
+	rootCheapestTotal bool
+
 	// relInfos is the per-initial-rel estimate `buildInitialRels` was handed,
 	// kept because the parameterised index paths of P5.4b-ii-a need each base
 	// rel's `catalog.Table` and cannot be built until the clause list exists
@@ -316,7 +322,7 @@ func (s *searchCtx) finalPath() (*Path, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
+	p := s.rootPathOf(rel)
 	if p == nil {
 		// setCheapest leaves every slot nil only for an empty pathlist, which
 		// joinSearch already rejects per level; reaching here means the final
@@ -324,6 +330,20 @@ func (s *searchCtx) finalPath() (*Path, error) {
 		return nil, fmt.Errorf("join search: final rel %#08x has no cheapest path", uint32(rel.Relids))
 	}
 	return p, nil
+}
+
+// rootPathOf is the path the search root hands up from its final rel — the
+// one choice finalPath and GEQO's root share. With an aggregate stage above
+// (rootCheapestTotal) it is CheapestTotal: PG applies the tuple fraction only
+// at final_rel, above grouping, and create_grouping_paths reads the scan/join
+// rel's cheapest_total_path (TPC-DS Q70: the LIMIT fraction had elected an
+// ordered nested loop over the cheaper Hash Semi Join, M0146-0150).
+// Otherwise it is the fractional pick getCheapestFractionalPathOrdered makes.
+func (s *searchCtx) rootPathOf(rel *RelOptInfo) *Path {
+	if s.rootCheapestTotal && rel.CheapestTotal != nil {
+		return rel.CheapestTotal
+	}
+	return getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
 }
 
 // buildInitialRels populates level 1: one RelOptInfo per FROM item, each with

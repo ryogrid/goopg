@@ -586,6 +586,15 @@ type resolveContext struct {
 	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
 	tupleFraction float64
 
+	// rootCheapestTotal is set when an aggregate stage sits between the join
+	// search and the final rel (M0146-0150). PG applies the tuple fraction
+	// only at final_rel (get_cheapest_fractional_path, planner.c): the
+	// grouping step consumes the scan/join rel through its
+	// cheapest_total_path (create_grouping_paths' hashed and plain arms) and
+	// each presorted path (its sorted arm). So the search root hands up
+	// CheapestTotal there, while the fraction still drives ConsiderStartup.
+	rootCheapestTotal bool
+
 	// queryPathkeys is `PlannerInfo.query_pathkeys`: the ordering the
 	// statement itself wants from the scan/join level, in this context's
 	// binding coordinates (C-07/P3-06, querypathkeys.go). Derived by
@@ -1816,6 +1825,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the same pure `searchTupleFraction` call, just earlier and
 		// unconditional.
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+		ctx.rootCheapestTotal = needsAggregateStage(s, cat)
 	}
 
 	// M0146-0028: a pulled-up FROM subquery's WHERE is part of this scope's

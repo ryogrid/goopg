@@ -203,6 +203,11 @@ func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error)
 	}
 	setCheapest(joinrel)
 	p := getCheapestFractionalPath(joinrel, s.tupleFraction)
+	if s.rootCheapestTotal && joinrel.CheapestTotal != nil {
+		// M0146-0150: as finalPath (searchCtx.rootPathOf). GEQO keeps its
+		// unordered fractional pick otherwise.
+		p = joinrel.CheapestTotal
+	}
 	if p == nil {
 		return nil, fmt.Errorf("geqo: final joinrel has no cheapest path")
 	}

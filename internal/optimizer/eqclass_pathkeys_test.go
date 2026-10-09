@@ -155,3 +155,28 @@ func TestIncrementalSortRowsAreTheClampedInput(t *testing.T) {
 		t.Errorf("IncrementalSort node over 37 rows: EstimateRows = %d, want 37", got)
 	}
 }
+
+// TestSearchRootHandsUpCheapestTotalUnderAnAggregate pins M0146-0150: PG
+// applies the tuple fraction only at final_rel, above the grouping step, and
+// create_grouping_paths reads the scan/join rel's cheapest_total_path. With a
+// LIMIT fraction and an ordering the statement wants, the search root's
+// fractional pick can elect a fast-start ordered path (TPC-DS Q70's ordered
+// nested loop over its Hash Semi Join); with an aggregate stage above
+// (rootCheapestTotal) the root hands up CheapestTotal instead.
+func TestSearchRootHandsUpCheapestTotalUnderAnAggregate(t *testing.T) {
+	key := PathKey{Expr: &ColumnRef{Index: 0, Name: "s_state", Type: catalog.Type{Name: "text"}}, SortAsc: true}
+	rel := &RelOptInfo{Rows: 3902, ConsiderStartup: true}
+	hashSemi := &Path{Kind: PathHashJoin, Rel: rel, Rows: 3902, Cost: Cost{Startup: 22053.29, Total: 38367.56}}
+	orderedNL := &Path{Kind: PathNestLoop, Rel: rel, Rows: 3902, Cost: Cost{Startup: 21000, Total: 38440.70},
+		Pathkeys: []PathKey{key}}
+	rel.Pathlist = []*Path{hashSemi, orderedNL}
+	rel.CheapestTotal = hashSemi
+	s := &searchCtx{tupleFraction: 100, queryPathkeys: []PathKey{key}}
+	if got := s.rootPathOf(rel); got != orderedNL {
+		t.Fatalf("fractional root pick = %v, want the fast-start ordered path (the fixture must exercise the fraction)", got.Kind)
+	}
+	s.rootCheapestTotal = true
+	if got := s.rootPathOf(rel); got != hashSemi {
+		t.Errorf("under an aggregate stage the root picked %v, want CheapestTotal (the hash semi join)", got.Kind)
+	}
+}

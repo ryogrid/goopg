@@ -1230,6 +1230,8 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// M0146-0150: an aggregate stage above takes the cheapest-total path.
+		rootCheapestTotal: ctx.rootCheapestTotal,
 		// C-07: `root->query_pathkeys`, derived by `standard_qp_callback`
 		// (deriveQueryPathkeys) at the same point in `planSelect` the
 		// fraction is, and in the SAME binding coordinates the conjuncts

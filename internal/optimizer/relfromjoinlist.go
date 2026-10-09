@@ -133,6 +133,10 @@ type joinlistProblem struct {
 	// TOP-level problem only (see makeRelFromJoinlist).
 	tupleFraction float64
 
+	// rootCheapestTotal: the top-level search root hands up CheapestTotal
+	// rather than the fractional pick (resolveContext.rootCheapestTotal).
+	rootCheapestTotal bool
+
 	// neededCols / neededColsKnown carry the statement's needed-column set to
 	// `searchCtx` (pathindexonlyneed.go) and to the boundary hole-filler.
 	// Every sub-problem of one statement shares it: the set is a property of
@@ -621,6 +625,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	s.rootCheapestTotal = prob.rootCheapestTotal
 	// C-08: publish the item run beside the clause list — the
 	// param_source_rels derivation remaps statement-global SJI hands
 	// through it (see paramSourceRelsForProblem's frame rule).
