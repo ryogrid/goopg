@@ -332,6 +332,14 @@ type ExistsExpr struct {
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
 	Args     []Expr
+	// OuterRowPad is the FROM-cumulative offset of the leaf a correlated
+	// sublink's host conjunct was localized to (M0146-0130). The inner
+	// plan's references to this scope keep their FROM-cumulative indices,
+	// so the sublink runs against the leaf row shifted right by this many
+	// columns: the executor pushes the leaf row padded with OuterRowPad
+	// leading NULLs, and PARAM_EXEC lowering subtracts it from the host
+	// arguments it builds. 0 everywhere else.
+	OuterRowPad int
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -395,6 +403,8 @@ type SubqueryExpr struct {
 	// param changes. goopg runs it as a correlated sublink; EXPLAIN labels
 	// it `InitPlan N`.
 	ParamInitPlan bool
+	// OuterRowPad: see ExistsExpr.OuterRowPad (M0146-0130).
+	OuterRowPad int
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the

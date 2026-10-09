@@ -264,7 +264,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// aborts it (fail-closed: the conjunct stays a join residual), and the
 	// inner plan is judged by planEscapesBy. The census sees the five-arm
 	// admission dispatch inside the Visit closure.
-	"local_filters.go:correlatedScalarSublinkLeaf": nonRecursiveClassifier,
+	"local_filters.go:correlatedScalarSublinkBinding": nonRecursiveClassifier,
 	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
 	// recursion and the exhaustiveness — sublinks and unenumerated
 	// kinds abort the walk, fail-closed); what the census sees is the

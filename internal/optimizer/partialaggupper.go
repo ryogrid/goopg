@@ -494,7 +494,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// unwrap above there is no Gather left, and on the post-pass route there
 	// never was one. Two Gathers would have every worker read the whole
 	// relation and return N+1 copies of every row.
-	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child) || subtreeHasParallelRestrictedQual(child), subtreeHasGather(child), drivingScan(child) == nil
 	if unsafe || gathered || noScan {
 		// M0146-0025's second route: the PARTIAL-GROUP arm alone retries on
 		// a child whose Gather is spliced out along the driving spine (the
@@ -507,7 +507,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// checks — unsafe, gathered, no-driving-scan — verbatim.
 		if ps.ParallelStatementOK && len(aggNode.Aggs) == 0 && aggNode.GroupingSets == nil && len(aggNode.GroupExprs) > 0 {
 			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
-				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				!subtreeHasUnsafeNode(gc) && !subtreeHasParallelRestrictedQual(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
 				return addPartialGroupOnlyPath(u, grouped, seed, aggNode, gc, cp, ps)
 			}
 		}

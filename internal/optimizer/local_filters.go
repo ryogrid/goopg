@@ -501,6 +501,17 @@ func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 			if cr, isCol := n.(*ColumnRef); isCol {
 				cr.Index -= binding.offset
 			}
+			// M0146-0130: a host-level sublink keeps its inner plan's
+			// FROM-cumulative references and runs against the leaf row
+			// padded back to them (OuterRowPad).
+			if binding.offset > 0 {
+				if sq, isSq := n.(*SubqueryExpr); isSq && sq.Plan != nil {
+					sq.OuterRowPad += binding.offset
+				}
+				if ex, isEx := n.(*ExistsExpr); isEx && ex.Plan != nil {
+					ex.OuterRowPad += binding.offset
+				}
+			}
 			return n
 		},
 	})
@@ -540,13 +551,44 @@ func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 // post-planning EXISTS->ANY pass still converts it there, reading its host
 // row off the leaf's Filter.
 func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
-	if len(spans) < 2 || spans[0].lo != 0 || anySublinkPullupCandidate(c) {
+	if len(spans) < 2 || anySublinkPullupCandidate(c) {
 		return -1
 	}
-	// The same-scope columns name binding 0 — or there are none, as in
+	if b := correlatedScalarSublinkBinding(c, spans, 0); b == 0 {
+		return 0
+	}
+	// M0146-0130: any other binding, whose leaf coordinates are offset —
+	// localizeExprToLeaf pads the sublink's host row back to the inner
+	// plan's FROM-cumulative references (OuterRowPad), so the inner plan is
+	// not rebased. TPC-DS Q6's `i.i_current_price > 1.2 * (SELECT avg(...)
+	// FROM item j WHERE j.i_category = i.i_category)` restricts `item i`,
+	// the fifth FROM item.
+	//
+	// The conjunct must read a column of that binding itself, outside the
+	// sublink: the seam's outer-join guard attributes a conjunct by its own
+	// columns (relidsOfExpr), so only then does it see — and hold above the
+	// join — a qual on an outer join's nullable side. A conjunct whose only
+	// Vars are the sublink's outer references keeps the first-binding rule,
+	// whose relation is never nullable (regress join's `1 = (SELECT 1 …
+	// WHERE ss.y IS NOT NULL)` over `t1 LEFT JOIN ss` must stay above the
+	// join).
+	b := tableForCol(c, spans)
+	if b <= 0 {
+		return -1
+	}
+	if correlatedScalarSublinkBinding(c, spans, b) == b {
+		return b
+	}
+	return -1
+}
+
+// correlatedScalarSublinkBinding is correlatedScalarSublinkLeaf's test for
+// one candidate binding b: b, or -1.
+func correlatedScalarSublinkBinding(c Expr, spans []leafSpan, b int) int {
+	// The same-scope columns name binding b — or there are none, as in
 	// Q10's OR of two EXISTS, whose only Vars are the SubPlans' outer
 	// references, checked below.
-	if tableForCol(c, spans) != 0 {
+	if tableForCol(c, spans) != b {
 		sameScope := false
 		visitColumnRefsForTable(c, func(int) { sameScope = true })
 		if sameScope {
@@ -560,7 +602,7 @@ func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
 	if _, isExists := top.(*ExistsExpr); isExists {
 		return -1
 	}
-	lo, hi := spans[0].lo, spans[0].hi
+	lo, hi := spans[b].lo, spans[b].hi
 	// planEscapesBy's walk: a reference past this scope escapes as ever, and
 	// one naming this scope escapes the leaf unless binding 0 holds it.
 	outside := func(o *OuterColumnRef, depth int) bool {
@@ -583,8 +625,11 @@ func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
 					ok = false
 				}
 			case *ExistsExpr:
+				// An offset binding admits scalar sublinks only: the
+				// EXISTS→ANY pass rewrites an EXISTS into an InExpr, which
+				// carries no OuterRowPad (M0146-0130, ledgered).
 				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
-					planEscapesBy(x.Plan, 1, outside) {
+					planEscapesBy(x.Plan, 1, outside) || b > 0 {
 					ok = false
 				}
 				scalar = true
@@ -597,5 +642,5 @@ func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
 	if !walked || !ok || !scalar {
 		return -1
 	}
-	return 0
+	return b
 }

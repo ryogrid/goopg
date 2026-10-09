@@ -58,6 +58,10 @@ type sublinkHandle struct {
 	setParams func(parParam []int, args []Expr)
 	nonCorr   func() bool
 	setNC     func(bool)
+	// pad is the sublink's OuterRowPad: its host row is a localized leaf
+	// row, so an immediate-host argument indexes it pad columns lower
+	// than the inner plan's FROM-cumulative reference (M0146-0130).
+	pad int
 }
 
 // handleFor returns a lowering handle for e, or nil when e is not a
@@ -76,6 +80,7 @@ func handleFor(e Expr) *sublinkHandle {
 			setParams: func(pp []int, a []Expr) { x.ParParam, x.Args = pp, a },
 			nonCorr:   func() bool { return x.IsNonCorrelated },
 			setNC:     func(b bool) { x.IsNonCorrelated = b },
+			pad:       x.OuterRowPad,
 		}
 	case *ExistsExpr:
 		if x.Plan == nil {
@@ -88,6 +93,7 @@ func handleFor(e Expr) *sublinkHandle {
 			setParams: func(pp []int, a []Expr) { x.ParParam, x.Args = pp, a },
 			nonCorr:   func() bool { return x.IsNonCorrelated },
 			setNC:     func(b bool) { x.IsNonCorrelated = b },
+			pad:       x.OuterRowPad,
 		}
 	case *InExpr:
 		if x.Plan == nil {
@@ -404,7 +410,7 @@ func slotFor(chain []*lowerScope, k int, ref *OuterColumnRef, dist int, a *param
 		// row OuterColumnRef{Level:1} used to resolve to.
 		sc.args = append(sc.args, &ColumnRef{
 			pos:            ref.pos,
-			Index:          ref.Index,
+			Index:          ref.Index - sc.h.pad,
 			Name:           ref.Name,
 			Type:           ref.Type,
 			SourceTableIdx: ref.SourceTableIdx,

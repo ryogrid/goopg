@@ -545,7 +545,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// aggregate to produce four groups, and measurement shows that serial
 		// tail pinning the query at ~7.1 s no matter how many workers run.
 		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
-			drivingScan(agg.Child) != nil {
+			drivingScan(agg.Child) != nil && !subtreeHasParallelRestrictedQual(agg.Child) {
 			// The gate has to run HERE, not after the walk. Refusing must let
 			// the loop fall through terminatesPartial(*Aggregate) and place
 			// the Gather BELOW the aggregate — and that fallback is precisely
@@ -2709,4 +2709,42 @@ func partialSubtreeExprsParallelSafe(n Node) bool {
 		}
 	})
 	return safe
+}
+
+// subtreeHasParallelRestrictedQual reports whether a qual inside n — a
+// Filter, a join's residual, an index nested loop's residual — is not
+// parallel-safe: a correlated SubPlan (PARAM_EXEC args, so
+// subplan->parallel_safe is false), a PARAM_EXEC Param, a restricted
+// function (M0146-0130). PG never builds a partial path for a rel holding
+// such a qual (set_rel_consider_parallel, max_parallel_hazard_walker), so a
+// producer that runs ALL of n inside the workers — a partial aggregate or
+// distinct over n — must refuse. A Gather placed somewhere BELOW such a qual
+// is fine, which is why this is not part of subtreeHasUnsafeNode: TPC-DS
+// Q32's correlated Join Filter sits above PG's Gather.
+func subtreeHasParallelRestrictedQual(n Node) bool {
+	restricted := false
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || restricted {
+			return
+		}
+		var pred Expr
+		switch x := cur.(type) {
+		case *Filter:
+			pred = x.Predicate
+		case *Join:
+			pred = x.Predicate
+		case *NestedLoopIndexJoin:
+			pred = x.Predicate
+		}
+		if pred != nil && !isParallelSafeExpr(pred, nil) {
+			restricted = true
+			return
+		}
+		for _, c := range parallelChildren(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return restricted
 }

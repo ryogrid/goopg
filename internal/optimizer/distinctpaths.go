@@ -388,11 +388,11 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// the identical second route when the only refusal is a Gather on the
 	// driving spine (spliceGatherOnPartialSpine; TPC-DS Q38's input is
 	// exactly `Sort{Gather{NL…}}` before the strip above).
-	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child) || subtreeHasParallelRestrictedQual(child), subtreeHasGather(child), drivingScan(child) == nil
 	if unsafe || gathered || noScan {
 		if ps.ParallelStatementOK {
 			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
-				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				!subtreeHasUnsafeNode(gc) && !subtreeHasParallelRestrictedQual(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
 				child = gc
 				unsafe, gathered, noScan = false, false, false
 			}

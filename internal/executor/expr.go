@@ -10617,7 +10617,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	}
 
 	// Push outer row for correlated subquery resolution.
-	outerRow := slotToRow(slot)
+	outerRow := padOuterRow(slotToRow(slot), sqOp.OuterRowPad)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
@@ -10944,7 +10944,7 @@ func evalExistsExpr(x *optimizer.ExistsExpr, row Row, ctx *Context) (Datum, erro
 // cache operations always run at the host depth.
 func existsWithScope(x *optimizer.ExistsExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
-		ctx.OuterRows = append(ctx.OuterRows, row)
+		ctx.OuterRows = append(ctx.OuterRows, padOuterRow(row, x.OuterRowPad))
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
@@ -11065,7 +11065,7 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 // operations always run at the host depth.
 func subqueryWithScope(x *optimizer.SubqueryExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
-		ctx.OuterRows = append(ctx.OuterRows, row)
+		ctx.OuterRows = append(ctx.OuterRows, padOuterRow(row, x.OuterRowPad))
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
@@ -21995,4 +21995,22 @@ func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datu
 		return NewStringDatum("{" + ls + "," + inner + "}"), nil
 	}
 	return NewStringDatum(ls + rs), nil
+}
+
+// padOuterRow is the host row a sublink's inner plan resolves its outer
+// references against. A sublink whose host conjunct was localized to a leaf
+// at FROM-cumulative offset pad (optimizer OuterRowPad, M0146-0130) still
+// addresses that leaf's columns at their FROM-cumulative indices, so the
+// leaf row is shifted right by pad NULL columns; the inner plan never reads
+// the padding, which stands for the scope's other relations.
+func padOuterRow(row Row, pad int) Row {
+	if pad <= 0 {
+		return row
+	}
+	out := make(Row, pad+len(row))
+	for i := 0; i < pad; i++ {
+		out[i] = NullDatum
+	}
+	copy(out[pad:], row)
+	return out
 }
