@@ -30404,11 +30404,20 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-m
     - Q95 SF1 → \[scan\-type\] only; results identical at both scales\.
     - Design: `docs/design/0100\-0149/m0146\-0135\-param\-hashjoin\-ec\-filter\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH qual\-placement SF1 10 → 9 \(TPC\-DS Q95\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0136 — recon: missing candidates in TPC\-DS Q72 \(SF1\) and Q95 \(SF0\.25\)**
+- [x] **M0146\-0136 — recon: missing candidates in TPC\-DS Q72 \(SF1\) and Q95 \(SF0\.25\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q72 SF1 hash\-joins `d3` \(\+3229, 548 rows vs PG 2\) where a 5\-probe nested loop would cost \~61; Q95 SF0\.25 stays serial \(8450\) while its own parallel estimate is \~7\.7k \(it goes parallel at SF1\)\. Both look like candidates never generated\.
   Kind: recon
   Parent: M0146-0014a
   - First step: DP\-trace both on private clones \(addPath records for the d3 parameterised probe and the partial leaf\)\.
+  - Done 2026\-10\-09 \(recon, no code\): both traced; evidence `analysis/m0146/m0146\-0136/`\.
+    - Q72 SF1: the `d3` probe and its nested loop ARE generated; the join\_collapse\_limit sub\-problem leaf `?0` enters the upper
+      search with rows=1623 \(initialRelRows re\-estimates the built tree\) instead of its searched rel\'s 5, so the loop prices
+      71221\.82 vs hash 64211\.41\. Filed M0146\-0141\.
+    - Q95 SF0\.25: the serial pick is a faithful fuzzy tie \(84297\.99 vs 85104\.24, better startup wins\); PG\'s winner is a
+      Gather Merge sorted for `count\(DISTINCT ws\_order\_number\)`, which needs the ordered\-aggregate query\_pathkeys goopg
+      never derives \(adjust\_group\_pathkeys\_for\_groupagg\)\. Filed M0146\-0142\.
+    - Design: `docs/design/0100\-0149/m0146\-0136\-missing\-candidates\-q72\-q95\.md`\.
+Movement: none — recon: two mechanisms located and filed \(M0146\-0141, M0146\-0142\); no plan changed
 - [ ] **M0146\-0137 — Parallel Append prices a non\-partial member at per\-worker cost \(TPC\-DS Q66\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg puts two serial GroupAggregate branches under a Parallel Append and prices them at per\-worker scale \(`Seq Scan catalog\_sales` 10521\.57 vs its serial 12962\.97\), 13758\.93 vs PG\'s 20447\.03; PG cannot build this \(the grouped child\'s only input is a non\-parallel\-safe Gather\) — add\_paths\_to\_append\_rel\.
   Kind: impl
@@ -30429,3 +30438,22 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH qual\-placement SF1 10 → 9 \(TPC\-DS
   Kind: impl
   Parent: M0146-0014a
   - First step: read the wrapper the fire set uses \(scripts/jointree\-parity\-capture\.sh / tpcds\-fireset\-gate\.sh\) and strip the statement\'s trailing `;` before wrapping it\.
+- [ ] **M0146\-0141 — a searched sub\-problem leaf enters the enclosing search with its searched rel\'s rows \(TPC\-DS Q72 SF1\)**
+  \(filed 2026\-10\-09 by M0146\-0136\)\. join\_collapse\_limit splits Q72\'s JOIN chain; the 8\-rel sub\-problem\'s result leaf `?0`
+  enters the upper problem with rows=1623 from `initialRelRows`\' EstimateRows over the built tree, while its searched rel \(the
+  Gather EXPLAIN prints\) has 5 — PG carries the lower joinrel\'s own size up\. The `d3` probe loop then prices 71221\.82 vs the hash
+  join\'s 64211\.41; at 5 rows it costs \~61046 and wins, as in PG \(548 vs 2 rows downstream\)\.
+  Kind: impl
+  Parent: M0146-0136
+  - First step: in joinsearch\.go initialRelRows\' default arm, read `searchedJoinInputRelOf\(leaf\)\.Rows` when the leaf is a searched
+    tree; fire set at both scales \(every split chain and searched subquery leaf moves\)\.
+- [ ] **M0146\-0142 — query\_pathkeys from ordered aggregates \(adjust\_group\_pathkeys\_for\_groupagg\) \(TPC\-DS Q95 SF0\.25\)**
+  \(filed 2026\-10\-09 by M0146\-0136\)\. standard\_qp\_callback builds group\_pathkeys from an ordered/DISTINCT aggregate and makes them
+  query\_pathkeys, so generate\_useful\_gather\_paths sorts partial paths on them — Q95\'s `Gather Merge \(Sort ws1\.ws\_order\_number\)`
+  feeds `count\(DISTINCT ws1\.ws\_order\_number\)` with no Sort\. goopg\'s deriveQueryPathkeys has no ordered\-aggregate arm \(empty
+  without GROUP BY\), so the search files no sorted Gather Merge; the grouping step\'s presorted handling \(M0146\-0027/0005ag\) is
+  downstream of it\.
+  Kind: impl
+  Parent: M0146-0136
+  - First step: add the arm to querypathkeys\.go deriveQueryPathkeySets reusing presortedAggKeysOrAbsent\'s DISTINCT/ORDER BY key
+    choice \(PG: adjust\_group\_pathkeys\_for\_groupagg, planner\.c\)\.

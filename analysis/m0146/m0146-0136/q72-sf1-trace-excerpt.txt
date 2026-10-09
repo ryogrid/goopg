@@ -1,0 +1,8 @@
+# Q72 SF1 (private clone of bench/tpcds/runtime_goopg/data, HEAD 55883889e, DP trace)
+23636:DPTRACE problem nrels=8 rels=catalog_sales,inventory,warehouse,item,customer_demographics,household_demographics,d1,d2
+30483:DPTRACE problem nrels=3 rels=?0,d3,promotion
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=1623 startup=48928.42877326456 total=61015.38124696194 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=3754 inputtotal=-1
+DPPATH path producer=index.parameterised relids={1} kind=2 reqouter={0} rows=1 startup=0.25 total=6.2736260012322855 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=268 inputtotal=-1
+DPPATH path producer=nestloop.index relids={0,1} kind=5 reqouter=- rows=541 startup=48928.67877326456 total=71221.82124696193 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=4022 inputtotal=61015.38124696194
+DPPATH path producer=join.hash relids={0,1} kind=3 reqouter=- rows=541 startup=52094.03127326456 total=64211.41499696194 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=4022 inputtotal=61015.38124696194
+DPTRACE cost lev=2 rel={?0+d3} rows=541 npaths=3 cheapest=hash reqouter={} total=64211.41499696194 second=nli secondtotal=71221.82124696193
