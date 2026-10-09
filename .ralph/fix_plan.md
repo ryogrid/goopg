@@ -30467,7 +30467,7 @@ Movement: none — premise refuted: work\_mem 512MB means no batching in either 
     - SF0\.25 sweep PASS 96 → 98, SKIP 3 → 1\. plans\-pg stubs wait for the next ea\-ratchet re\-pin \(ledgered\)\.
     - Design: `docs/design/0100\-0149/m0146\-0140\-tpcds\-loch\-query\-wrapper\.md`\.
 Movement: none — harness fix \(1419b3106\): Q36/Q86 now produce plan records on both engines, so the next census counts them; no plan changed
-- [ ] **M0146\-0141 — a searched sub\-problem leaf enters the enclosing search with its searched rel\'s rows \(TPC\-DS Q72 SF1\)**
+- [x] **M0146\-0141 — a searched sub\-problem leaf enters the enclosing search with its searched rel\'s rows \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-09 by M0146\-0136\)\. join\_collapse\_limit splits Q72\'s JOIN chain; the 8\-rel sub\-problem\'s result leaf `?0`
   enters the upper problem with rows=1623 from `initialRelRows`\' EstimateRows over the built tree, while its searched rel \(the
   Gather EXPLAIN prints\) has 5 — PG carries the lower joinrel\'s own size up\. The `d3` probe loop then prices 71221\.82 vs the hash
@@ -30476,6 +30476,13 @@ Movement: none — harness fix \(1419b3106\): Q36/Q86 now produce plan records o
   Parent: M0146-0136
   - First step: in joinsearch\.go initialRelRows\' default arm, read `searchedJoinInputRelOf\(leaf\)\.Rows` when the leaf is a searched
     tree; fire set at both scales \(every split chain and searched subquery leaf moves\)\.
+  - Done 2026\-10\-09 \(a4f6b8c48\): initialRelRows\' default arm returns `searchedJoinInputRelOf\(leaf\)\.Rows` \(row\-preserving
+    wrappers only; an Aggregate/Limit/Filter keeps the subtree estimate\)\.
+    - Fire set: SF0\.25 none; SF1 Q72 only — d3 becomes the nested\-loop probe \(548 → 2 rows\), total 64487 → 61205 \(PG 53219\)\.
+    - Q72 now shows a Nested Loop Right Join PG never builds \(nestjoinOK=false for JOIN\_RIGHT\) → filed M0146\-0144\.
+    - Restored the ea\-ratchet M0146\-0140 broke: plans\-pg Q36/Q70/Q86 stubs recaptured from :65438 \(2 NEW → back to 1\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0141\-searched\-leaf\-rows\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 10 → 9; SF0\.25 unchanged; match SF0\.25 53, SF1 39 unchanged; ea\-ratchet 1 \(restored from 3\)
 - [ ] **M0146\-0142 — query\_pathkeys from ordered aggregates \(adjust\_group\_pathkeys\_for\_groupagg\) \(TPC\-DS Q95 SF0\.25\)**
   \(filed 2026\-10\-09 by M0146\-0136\)\. standard\_qp\_callback builds group\_pathkeys from an ordered/DISTINCT aggregate and makes them
   query\_pathkeys, so generate\_useful\_gather\_paths sorts partial paths on them — Q95\'s `Gather Merge \(Sort ws1\.ws\_order\_number\)`
@@ -30495,3 +30502,13 @@ Movement: none — harness fix \(1419b3106\): Q36/Q86 now produce plan records o
   Parent: M0146-0140
   - First step: make walkExpr descend CaseExpr, the window spec \(PARTITION BY/ORDER BY, named WINDOW\) and FILTER, never a
     subquery; regress A/B \(window, aggregates, groupingsets\); then flip oracle row 70 to OK and drop it from ENGINE\_GAP\.
+- [ ] **M0146\-0144 — no plain nested loop for JOIN\_RIGHT \(TPC\-DS Q72 SF1\)**
+  \(filed 2026\-10\-09 by M0146\-0141\)\. PG\'s match\_unsorted\_outer sets `nestjoinOK = false` for JOIN\_RIGHT, JOIN\_RIGHT\_ANTI and
+  JOIN\_FULL \(joinpath\.c\), so a LEFT join is never run as a nested loop with the nullable side outer\. goopg\'s addNestLoopPath
+  and addMaterialNestLoopPath admit Right on purpose \(joinpathsnli\.go R64 comment\)\. Q72 SF1 now joins promotion as a
+  `Nested Loop Right Join` \(promotion outer, Materialize of the 2\-row join inner\) where PG has the LEFT nested loop with a
+  Materialized promotion inner — the only occurrence in either corpus\'s goopg plans\.
+  Kind: impl
+  Parent: M0146-0141
+  - First step: gate the plain and materialised nested\-loop arms \(and addPartialNestLoopPaths\) on PG\'s nestjoinOK jointype set;
+    fire set at both scales; check no RIGHT/FULL join is left without a path \(merge/hash must cover them, as in PG\)\.
