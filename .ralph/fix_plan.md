@@ -25803,7 +25803,7 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
       set, ea\-ratchet, regress A/B\.
     - Design `docs/design/0100\-0149/m0146\-0006\-incremental\-sort\-election\.md`\.
   Movement: none — fire set flat; regress aggregates moved both ways
-- [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
+- [!] **M0146-0007 — `inline_cte` single-reference CTE inlining**
   (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
   non-recursive CTE is inlined into the jointree so its quals and
   statistics reach the search — divergence class D6. Operates on the
@@ -25859,6 +25859,24 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
   appendrel at both scales), which stays filed under this root. The
   ledgered regress-fidelity residue (0007f–0007i rows) resumes under
   normal item-3 order.
+  > ## ESCALATION 2026\-10\-10 \(S4 lineage budget\) — M0146\-0007 held \[\!\] again
+  > The five most recent completed descendants \(0119, 0123, 0124, 0129, 0145\) all carry `Movement: none`\.
+  > M0146\-0145 \(this loop, 04e2eee04\) spent the last slot\.
+  > - **What was tried / proved:** each was a regress\-witnessed PG\-fidelity port of inline\_cte / pull\-up behaviour\.
+  >   0145 makes a pulled body\'s `\*` over a shared/MATERIALIZED CTE or the recursive worktable expand to the CTE\'s
+  >   planned columns, so regress subselect\'s recursive `z` filters the WorkTable Scan as PG \(−2 diff lines\)\.
+  > - **Blocker:** none of the remaining residue has a TPC\-DS or TPC\-H witness; the fire set was flat for all five, so
+  >   no S3 instrument can move\.
+  > - **Remaining residue** \(ledger rows 2026\-10\-04 for 0007f\-0007i, 2026\-10\-10 for 0145\): column\-alias lists on a
+  >   reference in the star pass; correlated per\-reference bodies; non\-recursive members of a WITH RECURSIVE list;
+  >   var\-free join quals after pull\-up as One\-Time Filters; join\-operand derived items inside a pulled body; EC member
+  >   order in pulled join clauses; LEFT JOIN qual placement in pulled bodies\.
+  > - **Expected movement if reopened:** regress `subselect` / `with` / `join` plan text only; no TPC\-DS or TPC\-H
+  >   category\.
+  > - **Size:** one loop per residue item\.
+  >
+  > Owner: reopen \(or re\-pin a LINEAGE\-BASELINE\) to continue regress fidelity here, or leave it held\.
+
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
   Parent: M0146\-0007
@@ -30534,3 +30552,15 @@ Movement: none — Q70 turns from a capture error into a counted shape\-diff \(c
     - Regress A/B: rangefuncs −116, join −53 diff lines, no case regressed\.
     - Design: `docs/design/0100\-0149/m0146\-0144\-no\-nestloop\-for\-right\-join\.md`\.
 Movement: none — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 9 → 10 \(alignment artifact\); all else unchanged; the elected Q72 join is now PG\'s LEFT nested loop
+- [x] **M0146\-0145 — a pulled body\'s `\*` over a shared CTE or the recursive worktable** \(filed and done 2026\-10\-10 from
+  the M0146\-0007i ledger residue: regress subselect\'s `with z as not materialized \(select \* from x\)` inside a recursive term
+  kept `Subquery Scan on z`; PG filters the WorkTable Scan\)\.
+  Kind: impl
+  Parent: M0146-0007
+  - Done 2026\-10\-10 \(04e2eee04\): expandPullupBodyStars expands a non\-inlined CTE reference \(shared, MATERIALIZED, or the
+    worktable\) to plannedCTE\.table\'s columns \(PG: expandRTE RTE\_CTE arm, parse\_relation\.c:3040\); a reference alias list
+    still declines\.
+    - Regress subselect −2 diff lines \(the witness takes PG\'s shape\); probes vs PG 18\.3 return PG\'s rows; fire set flat\.
+    - Spent root M0146\-0007\'s last S4 slot — escalation block written, root held \[\!\]\.
+    - Design: `docs/design/0100\-0149/m0146\-0007\-inline\-cte\.md` §Slice 10\.
+Movement: none — no TPC\-DS/TPC\-H query has this shape \(fire set flat\); regress subselect witness fixed
