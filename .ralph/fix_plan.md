@@ -30222,3 +30222,14 @@ Movement: yes — TPC\-DS Q44 full MATCH at SF0\.25 \(match 47 → 48, join\-ord
     - Design: `docs/design/0100\-0149/m0146\-0121\-semijoin\-loop\-count\.md`\.
     - Ledgered: a multi\-relation semijoin RHS \(approximate\_joinrel\_size\) stays unadjusted\.
 Movement: yes — TPC\-DS Q23 at SF0\.25 down to scan\-type only \(join\-order 42 → 41, join\-method 20 → 19, parameterisation 22 → 21, parallelism 24 → 23\); `ea-ratchet` findings 9 → 7
+- [x] **M0146\-0122 — a scalar sublink\'s unqualified star no longer voids the needed\-column set \(TPC\-DS Q23\'s index\-only customer scan\)**
+  \(filed 2026\-10\-09 from the SF0\.25 jointree\-search triage: after M0146\-0121, Q23\'s only divergence was `Seq Scan on customer`
+  where PG reads `customer\_pkey` index\-only — the M0146\-0019 family\)\.
+  Kind: impl
+  Parent: M0146-0019
+  - First step: find why no index\-only path was offered for best\_ss\_customer\'s `customer` \(width 324 = needed set unknown\)\.
+  - Done 2026\-10\-09 \(7bbbe52de\)\.
+    - `scalarBodyForColumns` drops a scalar sublink\'s unqualified `\*` targets before the walk \(the HAVING `\(SELECT \* FROM max\_store\_sales\)`\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0122\-scalar\-sublink\-star\-needed\.md`\.
+    - Ledgered: qualified\-star and ARRAY\-sublink stars still void the set\.
+Movement: yes — TPC\-DS Q23 full MATCH at SF0\.25 \(match 48 → 49, scan\-type 24 → 23\); SF1 unchanged
