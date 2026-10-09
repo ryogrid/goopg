@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"math"
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -10,13 +11,32 @@ import (
 // decided while the join clause and base-relation provenance are still in
 // scope.  Its zero value deliberately selects the old non-unique bucket walk.
 //
-// Goopg can prove only the INNER case here.  In particular, a LEFT join's
-// joinrel.Rows includes unmatched outer rows, so it cannot supply PG's
-// semifactors.outer_match_frac by division.  SEMI and ANTI have their own
-// executor and join-semantics work, and remain on their existing paths.
+// Goopg covers the INNER case and SEMI / ANTI.  A LEFT join with a unique
+// inner takes the same branch in PG (over its non-pushed-down join quals) and
+// is not ported yet.
 type hashJoinFinalCostInput struct {
-	innerUnique    bool
-	outerMatchFrac float64
+	innerUnique bool
+	// earlyExit is PG's `jointype == JOIN_SEMI || jointype == JOIN_ANTI` half
+	// of final_cost_hashjoin's early-exit branch: the executor stops a probe at
+	// its first match, so the bucket walk is priced with the semi factors as
+	// for an inner-unique join. anti makes hashjointuples the unmatched outer
+	// rows (M0146-0005dj).
+	earlyExit bool
+	anti      bool
+	// uniquePathInner is final_cost_hashjoin's `IsA(inner_path, UniquePath)`
+	// arm: a unique-ified inner (JOIN_UNIQUE_INNER, NOOP included) has
+	// distinct keys, so its bucket fraction is 1 / virtualbuckets rather
+	// than the per-clause statistics' estimate (M0146-0005dk).
+	uniquePathInner bool
+	outerMatchFrac  float64
+	matchCount      float64
+	// hashClauseSel is approx_tuple_count's selectivity: the product of the
+	// hash clauses' plain inner-join selectivities.  PG's non-unique arm
+	// charges cpu_tuple_cost on sel * outer path rows * inner path rows, not
+	// on the joinrel's rows, so a Parallel Hash candidate (whose inner path
+	// rows are per worker too) is charged far fewer tuples (M0146-0005e).
+	// Zero means unknown and falls back to the join's output rows.
+	hashClauseSel float64
 }
 
 // hashJoinFinalCostInputFor returns the fail-closed Inner Unique evidence for
@@ -26,39 +46,294 @@ type hashJoinFinalCostInput struct {
 // rejects partial indexes; retaining its `fromFK` distinction is essential:
 // an FK can establish selectivity but does not make this build side unique.
 //
-// The match fraction lives in total relation coordinates, like PG's
-// compute_semi_anti_join_factors result.  Serial and partial candidates share
-// it; hashJoinCost applies it to each candidate path's own outer rows.
+// The factors are PG's compute_semi_anti_join_factors for an INNER join, over
+// the pair's whole restriction list (`clauses`), not just the hash keys.  For
+// an inner join PG passes JOIN_SEMI but an INNER SpecialJoinInfo, and eqjoinsel
+// switches on sjinfo->jointype, so jselec is the plain inner-join selectivity:
+// outer_match_frac is that selectivity (not joinrel rows / outer rows), and
+// match_count = nselec * inner rows / jselec is the inner rel's row count.
+// PG 18.3's final_cost_hashjoin trace on TPC-DS Q31 (web_sales ⋈ date_dim,
+// hashjointuples = 2 of 179956 outer rows) shows it (M0146-0005e).  Serial
+// and partial candidates share the factors; hashJoinCost applies them to each
+// candidate path's own outer rows.
 func (s *searchCtx) hashJoinFinalCostInputFor(joinrel, outer, inner *RelOptInfo,
-	jt parser.JoinType, keys []*restrictInfo) hashJoinFinalCostInput {
-	if s == nil || s.cat == nil || jt != parser.JoinInner || joinrel == nil ||
-		outer == nil || inner == nil || len(keys) == 0 || relLevel(inner.Relids) != 1 ||
-		inner.CheapestTotal == nil || inner.CheapestTotal.RequiredOuter != 0 ||
-		outer.Rows <= 0 {
+	jt parser.JoinType, keys, clauses []*restrictInfo) hashJoinFinalCostInput {
+	if s == nil || len(keys) == 0 {
 		return hashJoinFinalCostInput{}
 	}
+	if jt == parser.JoinSemi || jt == parser.JoinAnti {
+		// The pair's compute_semi_anti_join_factors, the same factors the
+		// nested-loop arm reads. JOIN_RIGHT_SEMI / RIGHT_ANTI are not in the
+		// branch: PG prices them by the generic bucket walk.
+		f := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
+		return hashJoinFinalCostInput{earlyExit: f.apply, anti: jt == parser.JoinAnti,
+			outerMatchFrac: f.outerMatchFrac, matchCount: f.matchCount}
+	}
+	approx := 1.0
+	for _, ri := range keys {
+		cs, _ := s.joinClauseSelectivityExt(ri)
+		approx *= cs
+	}
+	base := hashJoinFinalCostInput{hashClauseSel: clampSelectivity(approx)}
+	if jt != parser.JoinInner || joinrel == nil || outer == nil || outer.Rows <= 0 ||
+		!s.innerRelProvenUnique(outer, inner, keys, false) {
+		return base
+	}
+	base.innerUnique = true
+	base.outerMatchFrac, base.matchCount = s.innerUniqueMatchFactors(inner, clauses)
+	return base
+}
 
+// innerRelProvenUnique is the fail-closed half of PG's innerrel_is_unique
+// that goopg can prove: the inner-side columns of `keys` collectively cover
+// one complete non-partial bare unique index of a sole, complete base
+// relation.  `provableKeys` already implements that coverage and rejects
+// partial indexes; retaining its `fromFK` distinction is essential: an FK can
+// establish selectivity but does not make the inner side unique.  A
+// set-operation subquery leaf is proven by setOpLeafDistinctFor.  With
+// `skipNonKeys` a clause that is not an outer=inner equi-pair is ignored (a
+// nested loop's whole restriction list); otherwise it declines (a hash
+// join's key list).
+func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restrictInfo, skipNonKeys bool) bool {
+	if s == nil || s.cat == nil || outer == nil || inner == nil || len(keys) == 0 ||
+		relLevel(inner.Relids) != 1 ||
+		inner.CheapestTotal == nil || inner.CheapestTotal.RequiredOuter != 0 {
+		return false
+	}
 	innerRel := bits.TrailingZeros32(uint32(inner.Relids))
 	if innerRel < 0 || innerRel >= len(s.relInfos) || inner.Relids != RelSet(1)<<uint(innerRel) {
-		return hashJoinFinalCostInput{}
+		return false
 	}
-
-	pairs := make([]joinKeyPair, len(keys))
-	for i, ri := range keys {
+	pairs := make([]joinKeyPair, 0, len(keys))
+	for _, ri := range keys {
 		pair, ok := s.joinKeyPairOf(ri, outer.Relids, inner.Relids)
 		if !ok {
-			return hashJoinFinalCostInput{}
+			if skipNonKeys {
+				continue
+			}
+			return false
 		}
-		pairs[i] = pair
+		pairs = append(pairs, pair)
+	}
+	if len(pairs) == 0 {
+		return false
 	}
 	for _, key := range s.provableKeys(s.cat, pairs, make([]bool, len(pairs)),
 		func(key provenKey) bool { return !key.fromFK && key.keyRel == innerRel }) {
 		if !key.fromFK {
-			return hashJoinFinalCostInput{
-				innerUnique:    true,
-				outerMatchFrac: clampSelectivity(joinrel.Rows / outer.Rows),
+			return true
+		}
+	}
+	return setOpLeafDistinctFor(inner.baseLeaf, innerRel, pairs) ||
+		groupedLeafDistinctFor(inner.baseLeaf, innerRel, pairs)
+}
+
+// setOpLeafDistinctFor is the set-operation arm of PG's rel_is_distinct_for
+// → query_is_distinct_for (postgres/src/backend/optimizer/plan/
+// analyzejoins.c) for a subquery leaf: when the TOP set operation is not ALL,
+// its output rows are distinct, so the leaf is unique for any clause set that
+// equates every output column. TPC-DS Q14's cross_items joins item to an
+// INTERSECT on all three of its columns, and PG costs that hash join as
+// inner-unique (M0146-0005g).
+//
+// The DISTINCT and GROUP BY arms are groupedLeafDistinctFor. The proof only
+// moves costs: goopg's executor does not stop at the first match on
+// inner_unique.
+func setOpLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
+	so, ok := leafBaseScan(leaf).(*SetOp)
+	if !ok || so.All {
+		return false
+	}
+	equated := make(map[string]bool)
+	for _, p := range pairs {
+		for k := 0; k < 2; k++ {
+			if p.rel[k] == innerRel {
+				equated[p.col[k]] = true
 			}
 		}
 	}
-	return hashJoinFinalCostInput{}
+	out := so.Output()
+	if len(out) == 0 {
+		return false
+	}
+	seen := make(map[string]bool, len(out))
+	for _, c := range out {
+		// A repeated output name could not tell which column a clause
+		// equates; refuse rather than guess.
+		if c.Name == "" || seen[c.Name] || !equated[c.Name] {
+			return false
+		}
+		seen[c.Name] = true
+	}
+	return true
+}
+
+// innerUniqueMatchFactors is compute_semi_anti_join_factors for an INNER
+// pair with a unique inner: outer_match_frac is the inner-join selectivity of
+// the pair's restriction list (one clause per EC) and match_count is the
+// inner rel's row count (nselec * rows / jselec with jselec == nselec).
+func (s *searchCtx) innerUniqueMatchFactors(inner *RelOptInfo, clauses []*restrictInfo) (float64, float64) {
+	sel := 1.0
+	for _, ri := range oneClausePerEquivClass(clauses) {
+		if ri == nil {
+			continue
+		}
+		cs, _ := s.joinClauseSelectivityExt(ri)
+		sel *= cs
+	}
+	sel = clampSelectivity(sel)
+	matchCount := 1.0
+	if sel > 0 {
+		matchCount = math.Max(1.0, inner.Rows)
+	}
+	return sel, matchCount
+}
+
+// groupedLeafDistinctFor is the DISTINCT / GROUP BY arm of PG's
+// query_is_distinct_for (analyzejoins.c) for a subquery leaf: a grouped
+// body emits one row per group, so the leaf is unique for any clause set
+// that equates every grouping column; an aggregate with no GROUP BY emits
+// one row; a DISTINCT emits distinct rows over its whole target list.
+// TPC-DS Q83's per-channel `GROUP BY i_item_id` CTEs join on item_id, and PG
+// costs those merge joins as inner-unique — skip_mark_restore, so no
+// Material above the inner (M0146-0005bd).
+//
+// The equated columns are tracked by output position from the leaf's top
+// down to the grouping node: wrappers that keep rows and positions
+// (Filter, Sort, Limit, Materialize, subquery and inlined CTE scans, a
+// WindowAgg's input columns) pass them through, and a Project maps a bare
+// column reference to its input position. Anything else declines.
+func groupedLeafDistinctFor(leaf Node, innerRel int, pairs []joinKeyPair) bool {
+	if leaf == nil {
+		return false
+	}
+	names := make(map[string]bool)
+	for _, p := range pairs {
+		for k := 0; k < 2; k++ {
+			if p.rel[k] == innerRel {
+				names[p.col[k]] = true
+			}
+		}
+	}
+	top := leaf.Output()
+	equated := make(map[int]bool)
+	seen := make(map[string]bool, len(top))
+	for i, c := range top {
+		if seen[c.Name] {
+			// A repeated name could not tell which column a clause equates.
+			if names[c.Name] {
+				return false
+			}
+			continue
+		}
+		seen[c.Name] = true
+		if c.Name != "" && names[c.Name] {
+			equated[i] = true
+		}
+	}
+	if len(equated) == 0 {
+		return false
+	}
+	n := leaf
+	for depth := 0; depth < 32 && n != nil; depth++ {
+		switch x := n.(type) {
+		case *Filter:
+			n = x.Child
+		case *Sort:
+			n = x.Child
+		case *Limit:
+			n = x.Child
+		case *Materialize:
+			n = x.Child
+		case *SubqueryScan:
+			if x.Child == nil || len(x.Child.Output()) != len(x.Output()) {
+				return false
+			}
+			n = x.Child
+		case *CTEScan:
+			if !x.Inlined() || x.Child == nil || len(x.Child.Output()) != len(x.Output()) {
+				return false
+			}
+			n = x.Child
+		case *WindowAgg:
+			if x.Child == nil {
+				return false
+			}
+			w := len(x.Child.Output())
+			for i := range equated {
+				if i >= w {
+					delete(equated, i)
+				}
+			}
+			n = x.Child
+		case *Project:
+			next := make(map[int]bool, len(equated))
+			for i := range equated {
+				if i >= len(x.Targets) {
+					continue
+				}
+				if cr, ok := x.Targets[i].(*ColumnRef); ok && cr.Index >= 0 {
+					next[cr.Index] = true
+				}
+			}
+			equated = next
+			n = x.Child
+		case *Aggregate:
+			if x.GroupingSets != nil || x.Mode == AggModePartial {
+				return false
+			}
+			for i := range x.GroupExprs {
+				if !equated[i] {
+					return false
+				}
+			}
+			return prunedGroupKeysEquated(x, equated)
+		case *Distinct:
+			for i := range x.Output() {
+				if !equated[i] {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+		if len(equated) == 0 {
+			return false
+		}
+	}
+	return false
+}
+
+// prunedGroupKeysEquated reports whether every GROUP BY item the planner
+// pruned from agg's keys (Aggregate.PrunedGroupInputs) is equated too.
+// query_is_distinct_for (analyzejoins.c) tests the subquery's ORIGINAL
+// groupClause — rel_is_distinct_for reads the range table's subquery, not
+// the planned copy that remove_useless_groupby_columns and
+// processed_groupClause trimmed — so a key dropped as constant-pinned (TPC-DS
+// Q78's d_year, fixed to 1998) or as functionally dependent still has to
+// appear in the join clauses. A pruned column reaches the output only as a
+// Passthrough, which the executor appends at the row's tail; a pruned column
+// the query never reads cannot be equated, and the proof fails, as in PG.
+func prunedGroupKeysEquated(agg *Aggregate, equated map[int]bool) bool {
+	if len(agg.PrunedGroupInputs) == 0 {
+		return true
+	}
+	base := len(agg.Output()) - len(agg.Passthrough)
+	if base < 0 {
+		return false
+	}
+	for _, in := range agg.PrunedGroupInputs {
+		found := false
+		for k, pe := range agg.Passthrough {
+			if cr, ok := pe.(*ColumnRef); ok && cr.Index == in && equated[base+k] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }

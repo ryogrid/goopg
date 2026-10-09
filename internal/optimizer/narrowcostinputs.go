@@ -325,6 +325,13 @@ func narrowJoinWidths(p *Path) {
 		p.OutputWidth = pathWidth(outer)
 		return
 	}
+	// M0146-0005dj: the right forms publish the INNER (the hashed LHS).
+	if p.Jointype == parser.JoinRightSemi || p.Jointype == parser.JoinRightAnti {
+		p.NCols = pathNCols(inner)
+		p.AvgVarBytes = pathAvgVarBytes(inner)
+		p.OutputWidth = pathWidth(inner)
+		return
+	}
 
 	// Rule 2: all three together. Hash cost reads pathWidth AND
 	// pathNCols/pathAvgVarBytes off the same path, so a triple narrowed in one

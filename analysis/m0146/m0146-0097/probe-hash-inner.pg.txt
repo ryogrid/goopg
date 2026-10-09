@@ -1,0 +1,66 @@
+CREATE TABLE
+INSERT 0 5000
+CREATE TABLE
+INSERT 0 200000
+ANALYZE
+ANALYZE
+              QUERY PLAN               
+---------------------------------------
+ Hash Join
+   Hash Cond: (big.k = x.a)
+   ->  Seq Scan on big
+   ->  Hash
+         ->  Subquery Scan on x
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Hash Join
+   Hash Cond: (big.k = t.a)
+   ->  Seq Scan on big
+   ->  Hash
+         ->  HashAggregate
+               Group Key: t.a
+               ->  Seq Scan on t
+(7 rows)
+
+                 QUERY PLAN                 
+--------------------------------------------
+ Hash Join
+   Hash Cond: (big.k = x.a)
+   ->  Seq Scan on big
+   ->  Hash
+         ->  Subquery Scan on x
+               ->  HashAggregate
+                     Group Key: t.a
+                     Filter: (sum(t.b) > 0)
+                     ->  Seq Scan on t
+(9 rows)
+
+               QUERY PLAN                
+-----------------------------------------
+ Hash Join
+   Hash Cond: (t.a = x.a)
+   ->  Seq Scan on t
+   ->  Hash
+         ->  Subquery Scan on x
+               ->  HashAggregate
+                     Group Key: big.k
+                     ->  Seq Scan on big
+(8 rows)
+
+              QUERY PLAN               
+---------------------------------------
+ Hash Join
+   Hash Cond: (big.v = x.s)
+   ->  Seq Scan on big
+   ->  Hash
+         ->  Subquery Scan on x
+               ->  HashAggregate
+                     Group Key: t.a
+                     ->  Seq Scan on t
+(8 rows)
+

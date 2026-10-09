@@ -8,10 +8,15 @@ package executor
 // both scans stamped partial, and a Gather on top.
 
 import (
+	"errors"
+	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -121,36 +126,119 @@ func TestParallelHashIdentityWithSerial(t *testing.T) {
 	}
 }
 
-// TestParallelHashSpillFailsLoudly: a participant whose share exceeds hash_mem
-// must fail the query, never publish its batch 0 alone.
-func TestParallelHashSpillFailsLoudly(t *testing.T) {
+// TestParallelHashSpilledBuildMatchesSerial pins M0146-0090: a Parallel Hash
+// build whose shares outgrow hash_mem batches (the participants' shares are
+// merged under one batch count, mergeSpilledParts) and returns exactly the
+// serial rows. Before, the query failed. M0146-0095: a join that fills its
+// build side (RIGHT, FULL) batches too — the participant that claims the
+// sweep runs every later batch over all participants' probe rows, so no
+// batch's unmatched build rows are judged from one participant's view.
+func TestParallelHashSpilledBuildMatchesSerial(t *testing.T) {
 	ctx, cleanup := parallelHashFixture(t)
 	defer cleanup()
-	sql := "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k"
-	par, _ := toParallelHash(t, planHashOnly(t, ctx, sql))
-	if par == nil {
-		t.Skip("no hash join")
+	buildKeys := runSQL(t, ctx, "SELECT count(*) FROM ph_build WHERE k IS NOT NULL")
+	wantBuildRows := renderRows(buildKeys)[0]
+
+	for _, tc := range []struct {
+		sql        string
+		fillsBuild bool
+	}{
+		{"SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", false},
+		{"SELECT p.w, b.v FROM ph_probe p LEFT JOIN ph_build b ON p.k = b.k", false},
+		{"SELECT p.w FROM ph_probe p WHERE EXISTS (SELECT 1 FROM ph_build b WHERE b.k = p.k)", false},
+		{"SELECT p.w FROM ph_probe p WHERE NOT EXISTS (SELECT 1 FROM ph_build b WHERE b.k = p.k)", false},
+		{"SELECT p.w FROM ph_probe p WHERE p.k NOT IN (SELECT b.k FROM ph_build b)", false},
+		// RIGHT and FULL: the inner join's plan retyped, as in
+		// TestParallelHashFillBuildIdentityWithSerial — ph_build is hashed and
+		// the join fills it.
+		{"right", true},
+		{"full", true},
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			sql, retype := tc.sql, optimizer.JoinType(0)
+			switch tc.sql {
+			case "right":
+				sql, retype = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", optimizer.JoinTypeRight
+			case "full":
+				sql, retype = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k", optimizer.JoinTypeFull
+			}
+			plan := func() optimizer.Node {
+				n := planHashOnly(t, ctx, sql)
+				if retype != 0 {
+					c19fFindJoin(n).Type = retype
+				}
+				return n
+			}
+			want := c19fRun(t, ctx, plan())
+			par, _ := toParallelHash(t, plan())
+			if par == nil {
+				t.Skip("the serial plan has no hash join; nothing to parallelise")
+			}
+			var ph *parallelHashBuild
+			var once sync.Once
+			ctx.parallelHashObserver = func(got *parallelHashBuild) { once.Do(func() { ph = got }) }
+			saved := ctx.WorkMem
+			ctx.WorkMem = 16 << 10
+			defer func() { ctx.WorkMem = saved; ctx.parallelHashObserver = nil }()
+
+			got, err := c19fTryRun(ctx, par)
+			if err != nil {
+				t.Fatalf("spilled Parallel Hash failed: %v", err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("parallel hash returned %d rows, serial %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: parallel %q, serial %q", i, got[i], want[i])
+				}
+			}
+			if ph == nil {
+				t.Fatal("no participant reached the Parallel Hash build state")
+			}
+			if ph.table.batches == nil || ph.table.batches.nbatch < 2 {
+				t.Fatal("the build did not batch; lower the fixture's work_mem — this test proved nothing")
+			}
+			if got := ph.rowsPublished; renderRows([]Row{{NewIntDatum(int64(got))}})[0] != wantBuildRows {
+				t.Fatalf("participants published %d build rows, the inner holds %s non-NULL keys", got, wantBuildRows)
+			}
+			if tc.fillsBuild && (!ph.sweepClaimed || ph.probers != 0) {
+				t.Fatalf("sweepClaimed=%v probers=%d: the shared sweep did not run exactly once", ph.sweepClaimed, ph.probers)
+			}
+			t.Logf("builders=%d rowsPublished=%d nbatch=%d", ph.builders, ph.rowsPublished, ph.table.batches.nbatch)
+		})
 	}
-	saved := ctx.WorkMem
-	ctx.WorkMem = 8 << 10
-	defer func() { ctx.WorkMem = saved }()
+	if left := ctx.ReleaseSpillFiles(); left != 0 {
+		t.Fatalf("%d spill files were still registered after every Gather closed", left)
+	}
+}
+
+// c19fTryRun is c19fRun returning the execution error instead of failing.
+func c19fTryRun(ctx *Context, node optimizer.Node) ([]string, error) {
 	ctx.MaxParallelWorkers = 8
 	ctx.ParallelLeaderParticipation = true
-	op, err := Build(par)
+	op, err := Build(node)
 	if err != nil {
-		t.Fatalf("build: %v", err)
+		return nil, err
 	}
 	err = op.Open(ctx)
+	var out []string
 	for err == nil {
-		_, err = op.Next()
+		var slot TupleSlot
+		slot, err = op.Next()
+		if err == nil {
+			out = append(out, renderRows([]Row{slot.Row()})...)
+		}
 	}
-	_ = op.Close()
-	if err == EOF {
-		t.Fatal("a spilling Parallel Hash build returned rows; it must fail")
+	cerr := op.Close()
+	if err != EOF {
+		return nil, err
 	}
-	if !strings.Contains(err.Error(), "parallel hash") {
-		t.Fatalf("unexpected error: %v", err)
+	if cerr != nil {
+		return nil, cerr
 	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // TestParallelHashBarrier pins the barrier protocol itself: no waiter returns
@@ -161,13 +249,13 @@ func TestParallelHashBarrier(t *testing.T) {
 	if !ph.attach() || !ph.attach() {
 		t.Fatal("participants attaching before completion must build")
 	}
-	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(1)}}}}, nil)
+	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(1)}}}}, nil, nil)
 	select {
 	case <-ph.done:
 		t.Fatal("the barrier released with one of two participants still building")
 	default:
 	}
-	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(2)}}, 2: {{NewIntDatum(3)}}}}, nil)
+	ph.finish(&sharedHashBuild{intHash: map[int64][]Row{1: {{NewIntDatum(2)}}, 2: {{NewIntDatum(3)}}}}, nil, nil)
 	if err := ph.wait(nil); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -181,9 +269,10 @@ func TestParallelHashBarrier(t *testing.T) {
 	failed := newParallelHashBuild(nil)
 	failed.attach()
 	failed.attach()
-	failed.finish(nil, errParallelHashSpilled)
-	failed.finish(&sharedHashBuild{}, nil)
-	if err := failed.wait(nil); err != errParallelHashSpilled {
+	errBuild := errors.New("a participant's build failed")
+	failed.finish(nil, nil, errBuild)
+	failed.finish(&sharedHashBuild{}, nil, nil)
+	if err := failed.wait(nil); err != errBuild {
 		t.Fatalf("a participant's failure must reach every waiter; got %v", err)
 	}
 }
@@ -244,5 +333,192 @@ func TestParallelHashPathModelWinner(t *testing.T) {
 	}
 	if chosen == 0 {
 		t.Fatal("no shape produced a planner-chosen Parallel Hash; the arm was never exercised")
+	}
+}
+
+// TestParallelHashFillBuildIdentityWithSerial (M0146-0005dj slice 3): the
+// joins that emit unmatched BUILD rows — RIGHT, FULL, RIGHT ANTI — run as a
+// Parallel Hash only because the participants merge their match bits and the
+// last one to finish probing sweeps the shared table once. A participant that
+// swept with only its own bits would emit build rows another participant
+// matched (duplicates against serial); two sweepers would emit every
+// unmatched row twice. Parallel-vs-serial identity sees both.
+func TestParallelHashFillBuildIdentityWithSerial(t *testing.T) {
+	ctx, cleanup := parallelHashFixture(t)
+	defer cleanup()
+	// RIGHT ANTI is the planner's own election (M0146-0005dj slice 2): a
+	// distinct-keyed probe table much larger than the anti join's LHS.
+	runSQL(t, ctx, "CREATE TABLE ph_big (k int, w int)")
+	runSQL(t, ctx, "INSERT INTO ph_big SELECT g, g FROM generate_series(1, 200000) g")
+	runSQL(t, ctx, "ANALYZE ph_big")
+	runSQL(t, ctx, "ANALYZE ph_build")
+	runSQL(t, ctx, "ANALYZE ph_probe")
+	// RIGHT and FULL reuse the inner join's hash plan with the join retyped:
+	// the column layout is the same, ph_probe probes and ph_build is hashed,
+	// and the serial executor's RIGHT/FULL hash path is the reference.
+	const inner = "SELECT p.w, b.v FROM ph_probe p JOIN ph_build b ON p.k = b.k"
+	for _, c := range []struct {
+		name   string
+		sql    string
+		retype optimizer.JoinType
+		typ    optimizer.JoinType
+	}{
+		{"right", inner, optimizer.JoinTypeRight, optimizer.JoinTypeRight},
+		{"full", inner, optimizer.JoinTypeFull, optimizer.JoinTypeFull},
+		{"right anti", "SELECT b.v FROM ph_build b WHERE NOT EXISTS (SELECT 1 FROM ph_big p WHERE p.k = b.k AND p.w > 1000)",
+			0, optimizer.JoinTypeRightAnti},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			plan := func() optimizer.Node {
+				n := planHashOnly(t, ctx, c.sql)
+				if c.retype != 0 {
+					c19fFindJoin(n).Type = c.retype
+				}
+				return n
+			}
+			want := c19fRun(t, ctx, plan())
+			par, j := toParallelHash(t, plan())
+			if par == nil {
+				t.Fatal("the serial plan has no hash join")
+			}
+			if j.Type != c.typ {
+				t.Fatalf("planned a %v hash join, want %v", j.Type, c.typ)
+			}
+			if s := c19fScanOf(j.Right); s == nil || s.Table == nil || s.Table.Name != "ph_build" {
+				t.Fatalf("the build side is %T, not ph_build", j.Right)
+			}
+			var ph *parallelHashBuild
+			var once sync.Once
+			ctx.parallelHashObserver = func(got *parallelHashBuild) { once.Do(func() { ph = got }) }
+			defer func() { ctx.parallelHashObserver = nil }()
+
+			got := c19fRun(t, ctx, par)
+			if len(got) != len(want) {
+				t.Fatalf("parallel hash returned %d rows, serial %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("row %d differs: parallel %q, serial %q", i, got[i], want[i])
+				}
+			}
+			if ph == nil {
+				t.Fatal("no participant reached the Parallel Hash build state")
+			}
+			if !ph.sweepClaimed || ph.probers != 0 {
+				t.Fatalf("sweepClaimed=%v probers=%d: the shared sweep did not run exactly once", ph.sweepClaimed, ph.probers)
+			}
+			t.Logf("builders=%d rows=%d", ph.builders, len(got))
+		})
+	}
+}
+
+// TestParallelHashProbeDetachMerges pins the detach protocol: the bits of every
+// prober reach the one that sweeps, the sweep is claimed once, and a
+// participant arriving after the claim does not probe.
+func TestParallelHashProbeDetachMerges(t *testing.T) {
+	ph := newParallelHashBuild(nil)
+	if !ph.probeAttach() || !ph.probeAttach() {
+		t.Fatal("attach refused before any detach")
+	}
+	_, _, _, last := ph.probeDetach(map[string][]bool{"a": {true, false}}, map[int64][]bool{7: {false, true}}, nil)
+	if last {
+		t.Fatal("the first of two probers claimed the sweep")
+	}
+	ms, mi, _, last := ph.probeDetach(map[string][]bool{"a": {false, true}, "b": {true}}, nil, nil)
+	if !last {
+		t.Fatal("the last prober did not claim the sweep")
+	}
+	if fmt.Sprint(ms["a"], ms["b"], mi[7]) != "[true true] [true] [false true]" {
+		t.Fatalf("merged bits %v %v %v", ms["a"], ms["b"], mi[7])
+	}
+	if ph.probeAttach() {
+		t.Fatal("a participant attached after the sweep was claimed")
+	}
+}
+
+// TestParallelHashMergeAcrossBucketCounts pins the M0146-0096 finding: shares
+// size their tables privately, so two can choose different bucket counts and
+// therefore read their batch bits from different hash bits. The merge
+// re-routes every row from its stored hash under one geometry: a spilled row
+// may land in the merged batch 0 (in memory), an in-memory row in a later
+// batch file. Every build row must end where the merged geometry routes it,
+// exactly once — regress join_hash's Parallel Hash, once PH4 stopped vetoing
+// it, failed with "participants chose different bucket counts".
+func TestParallelHashMergeAcrossBucketCounts(t *testing.T) {
+	ctx := NewContext()
+	defer ctx.ReleaseSpillFiles()
+	mkShare := func(nbuckets, nbatch int, keys []int64) parallelHashPart {
+		bs := newHashBatchState(ctx, nil, hashsize.Sizing{NBuckets: nbuckets, NBatch: nbatch, SpaceAllowed: 1 << 30}, false)
+		local := &sharedHashBuild{intHash: map[int64][]Row{}, hashIsInt: true}
+		for _, k := range keys {
+			h := joinBatchHashInt64(k)
+			row := Row{NewIntDatum(k)}
+			if b := bs.batchOf(h); b != 0 {
+				if err := bs.writeInner(b, h, spillIntKey(k), row); err != nil {
+					t.Fatalf("writeInner: %v", err)
+				}
+				continue
+			}
+			local.intHash[k] = append(local.intHash[k], row)
+		}
+		return parallelHashPart{local: local, bs: bs}
+	}
+	var a, b []int64
+	for k := int64(0); k < 400; k++ {
+		if k%2 == 0 {
+			a = append(a, k)
+		} else {
+			b = append(b, k)
+		}
+	}
+	ph := newParallelHashBuild(nil)
+	ph.parts = []parallelHashPart{mkShare(2048, 2, a), mkShare(4096, 4, b)}
+	if err := ph.mergeParts(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	d := ph.table.batches
+	if d == nil {
+		t.Fatal("the merged table has no batch descriptor")
+	}
+	m := &hashBatchState{nbatch: d.nbatch, bucketBits: d.bucketBits}
+	seen := map[int64]int{}
+	for k, rows := range ph.table.intHash {
+		if got := m.batchOf(joinBatchHashInt64(k)); got != 0 {
+			t.Fatalf("key %d is in memory but routes to batch %d", k, got)
+		}
+		seen[k] += len(rows)
+	}
+	for bno, f := range d.inner {
+		if f == nil {
+			continue
+		}
+		r, err := newSpillReader(f.path)
+		if err != nil {
+			t.Fatalf("open batch %d: %v", bno, err)
+		}
+		var buf Row
+		for {
+			h, k, row, err := r.ReadRowKeyedInto(buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read batch %d: %v", bno, err)
+			}
+			buf = row
+			if got := m.batchOf(h); got != bno {
+				t.Fatalf("a row of batch %d sits in file %d", got, bno)
+			}
+			seen[k.i]++
+		}
+		r.closeKeepFile()
+	}
+	if len(seen) != 400 {
+		t.Fatalf("%d distinct keys survived the merge, want 400", len(seen))
+	}
+	for k, n := range seen {
+		if n != 1 {
+			t.Fatalf("key %d appears %d times", k, n)
+		}
 	}
 }

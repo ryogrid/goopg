@@ -2397,6 +2397,37 @@ func PageGetItemRawAllowDead(p Page, slot uint16) ([]byte, error) {
 	return append([]byte(nil), p[off:off+ln]...), nil
 }
 
+// PageGetItemRawAllowDeadNoCopy is PageGetItemRawAllowDead returning a slice
+// that ALIASES the page instead of a copy (M0146-0088). The caller must hold
+// the page pinned and latched for as long as it reads the bytes and must not
+// retain them: the btree descent and leaf binary search compare and drop.
+func PageGetItemRawAllowDeadNoCopy(p Page, slot uint16) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return nil, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return nil, err
+	}
+	if item.Flags != ItemIDNormal && item.Flags != ItemIDDead {
+		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return p[off : off+ln : off+ln], nil
+}
+
 func readItemID(p Page, idx int) (ItemID, error) {
 	off := SizeOfPageHeaderData + idx*itemIDSize
 	if off < 0 || off+itemIDSize > len(p) {

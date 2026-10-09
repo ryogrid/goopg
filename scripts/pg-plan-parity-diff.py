@@ -77,9 +77,12 @@ Declared normalisation policy (applied before comparison, printed with
      Left for the same preserved side; Q13 is the witness).
 
 MISSING-NODE rule: a normalised PG tree containing a node kind goopg's
-EXPLAIN renderer cannot emit -- `Materialize`, `Incremental Sort` (grounded:
-no such arms in internal/executor/operators_explain.go) -- or any unknown
-kind. `Hash` is explicitly NOT in this set (see N2).
+EXPLAIN renderer cannot emit (GOOPG_UNEMITTABLE; empty since
+`Incremental Sort` gained its producer at M0146-0005bp) -- or any unknown
+kind. `Hash` is
+explicitly NOT in this set (see N2). `Materialize` was in this set until
+M0146-0010 gave the renderer an arm; it now compares positionally and by
+kind presence like every other emittable node.
 
 Usage:
   pg-plan-parity-diff.py GOOPG_PLANS PG [--verbose] [--self-test]
@@ -110,12 +113,15 @@ CATEGORIES = (
 
 VERDICTS = ("MATCH", "SHAPE-DIFF", "UNPARSED", "MISSING-NODE", "ERROR", "TIMEOUT")
 
-# Node kinds goopg's EXPLAIN renderer cannot emit (grounded in
-# internal/executor/operators_explain.go, which has no such arms; goopg's
-# executor does have a Materialize operator, but nothing renders it).
-# A PG plan containing one forces MISSING-NODE. Standalone `Hash` is
-# deliberately absent here: it is stripped by normalisation N2.
-GOOPG_UNEMITTABLE = ("Materialize", "Incremental Sort")
+# Node kinds goopg's EXPLAIN renderer cannot emit on this corpus (grounded in
+# internal/executor/operators_explain.go and the planner's producers). A PG
+# plan containing one forces MISSING-NODE. Empty since M0146-0005bp:
+# `Materialize` left the set at M0146-0010 and `Incremental Sort` at
+# M0146-0005bp (create_ordered_paths now files it for a partially presorted
+# input) — both are produced and rendered, so a one-sided one is a
+# positional/presence divergence, not an unemittable kind. Standalone `Hash`
+# is deliberately absent: it is stripped by normalisation N2.
+GOOPG_UNEMITTABLE = ()
 
 SECTION_RE = re.compile(r"^===\s*(\S+)\s*$")
 COST_RE = re.compile(r"\(cost=([0-9.]+)\.\.([0-9.]+)\s+rows=([0-9]+)\s+width=([0-9]+)\)")
@@ -1000,8 +1006,10 @@ def extra_category(n):
         return "aggregation-strategy"
     if n.kind in AGG_KINDS:
         return "aggregation-strategy"
-    if n.kind in ("Materialize",):
-        return None  # covered by the MISSING-NODE verdict
+    if n.kind == "Materialize":
+        # M0146-0010: emittable now — an NL-inner rescan-cache decision,
+        # the same family as Memoize.
+        return "parameterisation"
     if n.kind in ("Gather", "Gather Merge"):
         return "parallelism"
     return "join-order"
@@ -1041,11 +1049,11 @@ def presence_category(kind):
         return "sort-strategy"
     if kind == "Limit":
         return "sort-strategy"
-    if kind in ("SubPlan", "InitPlan", "Memoize"):
+    if kind in ("SubPlan", "InitPlan", "Memoize", "Materialize"):
         return "parameterisation"
     if kind in ("Gather", "Gather Merge"):
         return "parallelism"
-    return None  # Materialize/Incremental Sort (verdict covers), Hash
+    return None  # Incremental Sort (verdict covers), Hash
     # (stripped), Result/Append/... (positional walk covers)
 
 
@@ -1354,7 +1362,10 @@ SELF_TESTS = [
         "cats": {"join-method", "parameterisation"},
     },
     {
-        "name": "MISSING-NODE PG Materialize",
+        # M0146-0010: Materialize is emittable — a PG-only Materialize is
+        # a positional/presence divergence (parameterisation), not
+        # MISSING-NODE.
+        "name": "SHAPE-DIFF PG-only Materialize",
         "goopg": [
             "Nested Loop  (cost=1.00..5.00 rows=2 width=10)",
             "  Join Filter: (n_regionkey = r_regionkey)",
@@ -1368,7 +1379,24 @@ SELF_TESTS = [
             "  ->  Materialize  (cost=0.00..1.00 rows=5 width=10)",
             "        ->  Seq Scan on region  (cost=0.00..1.00 rows=5 width=10)",
         ],
-        "verdict": "MISSING-NODE",
+        "verdict": "SHAPE-DIFF",
+        "cats": {"parameterisation"},
+    },
+    {
+        "name": "MATCH both-side Materialize",
+        "goopg": [
+            "Nested Loop  (cost=1.00..5.00 rows=2 width=10)",
+            "  ->  Seq Scan on nation  (cost=0.00..1.00 rows=25 width=10)",
+            "  ->  Materialize  (cost=0.00..1.00 rows=5 width=10)",
+            "        ->  Seq Scan on region  (cost=0.00..1.00 rows=5 width=10)",
+        ],
+        "pg": [
+            "Nested Loop  (cost=1.00..5.00 rows=2 width=10)",
+            "  ->  Seq Scan on nation  (cost=0.00..1.00 rows=25 width=10)",
+            "  ->  Materialize  (cost=0.00..1.00 rows=5 width=10)",
+            "        ->  Seq Scan on region  (cost=0.00..1.00 rows=5 width=10)",
+        ],
+        "verdict": "MATCH",
         "cats": set(),
     },
     {

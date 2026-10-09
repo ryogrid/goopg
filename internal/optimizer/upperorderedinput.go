@@ -346,6 +346,38 @@ func inputNodePathkeys(input Node) []PathKey {
 			return deliver(mergeJoinEmissionPathkeys(t))
 		case *Project:
 			if !projectIsPositionalIdentity(t) {
+				// M0146-0005ax: convert_subquery_pathkeys. A Project that
+				// computes its columns still passes its child's rows through
+				// in order; a child ordering survives as the target that
+				// computes the same expression — TPC-DS Q51's
+				// `item_sk = CASE WHEN web.item_sk IS NOT NULL …`, the very
+				// expression its WindowAgg's input was sorted on.
+				if t.IsolatedScope || !agrees(t.Output()) {
+					return nil
+				}
+				return deliver(projectEmissionPathkeys(t))
+			}
+			renamed = true
+			n = t.Child
+		case *CTEScan:
+			// M0146-0005bw: set_cte_pathlist (allpaths.c) gives a CTE scan
+			// the body's own pathkeys through convert_subquery_pathkeys
+			// (PG 17+): the body is materialised once, in the order it
+			// emits, and every scan replays that buffer front to back. The
+			// scan publishes the body's columns position for position, so
+			// it is a positional-identity step like SubqueryScan below. A
+			// recursive self-reference wraps a WorkTableScan, which the walk
+			// refuses one step down.
+			if t.Child == nil || len(t.Child.Output()) != limit {
+				return nil
+			}
+			renamed = true
+			n = t.Child
+		case *SubqueryScan:
+			// M0146-0005ax: the labelling wrapper publishes its subplan's
+			// rows position for position under the reference's own column
+			// names — a positional-identity step, like the Project above.
+			if t.Child == nil || len(t.Child.Output()) != limit {
 				return nil
 			}
 			renamed = true
@@ -424,22 +456,86 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	if agg == nil {
 		return nil
 	}
+	// M0146-0003 S6: a row-transport Finalize consumes the Gather
+	// Merge's already-grouped state stream. The merge keys ARE
+	// positional references into the transport row — and transport
+	// position k.Pos is exactly the output position of group key
+	// clause[j], so the positional check validates the merge contract
+	// AND lands the claim in output coordinates with no translation at
+	// all (the Simple-mode arm below must translate input coords).
+	if agg.Mode == AggModeFinal {
+		if !agg.PartialEmit || agg.Strategy != AggStrategySorted ||
+			agg.GroupingSets != nil || len(agg.GroupExprs) == 0 ||
+			agg.GroupKeyOrder != nil {
+			return nil
+		}
+		gm, ok := agg.Child.(*GatherMerge)
+		if !ok || len(gm.Keys) < len(agg.GroupExprs) {
+			return nil
+		}
+		out := agg.Output()
+		if len(out) < len(agg.GroupExprs) {
+			return nil
+		}
+		clause := groupClauseKeys(agg)
+		emitted := make([]PathKey, len(clause))
+		for j, k := range clause {
+			cr, ok := gm.Keys[j].Expr.(*ColumnRef)
+			if !ok || cr.Index != k.Pos {
+				return nil
+			}
+			emitted[j] = PathKey{
+				Expr:       &ColumnRef{Index: k.Pos, Name: out[k.Pos].Name, Type: out[k.Pos].Type},
+				SortAsc:    !gm.Keys[j].Desc,
+				NullsFirst: gm.Keys[j].NullsFirst,
+			}
+		}
+		return emitted
+	}
 	if agg.Strategy != AggStrategySorted || agg.Mode != AggModeSimple ||
 		agg.GroupingSets != nil || len(agg.GroupExprs) == 0 ||
 		agg.GroupKeyOrder != nil {
 		return nil
 	}
 	var childKeys []SortKey
+	var childPathkeys []PathKey
 	switch c := agg.Child.(type) {
 	case *Sort:
 		childKeys = c.Keys
 	case *GatherMerge:
 		childKeys = c.Keys
 	default:
-		return nil
+		// M0146-0027: a third ordered-input shape — a searched subtree root
+		// whose WINNING searched path claimed the group ordering itself
+		// (`searchedPathkeys`, validated against the published schema at the
+		// boundary). The grouping stage can now elect a searched candidate
+		// with no Sort node on top (addGroupingPaths' searchcand arm), and
+		// the sorted aggregate over it still emits in group-key order.
+		if keys := searchedTreePathkeys(c); len(keys) > 0 {
+			childPathkeys = keys
+		} else if keys := inputNodePathkeys(c); len(keys) > 0 {
+			// M0146-0005bw: any other ordered input the walk can derive —
+			// the is_sorted grouping arm (addGroupingPaths) now elects an
+			// AGG_SORTED over a presorted CTE scan or sorted aggregate
+			// with no Sort between, and the emission follows that input's
+			// order exactly as create_agg_path copies subpath->pathkeys.
+			childPathkeys = keys
+		} else {
+			return nil
+		}
+	}
+	childKeyAt := func(j int) (e Expr, desc, nullsFirst bool) {
+		if childPathkeys != nil {
+			return childPathkeys[j].Expr, !childPathkeys[j].SortAsc, childPathkeys[j].NullsFirst
+		}
+		return childKeys[j].Expr, childKeys[j].Desc, childKeys[j].NullsFirst
+	}
+	nChildKeys := len(childKeys)
+	if childPathkeys != nil {
+		nChildKeys = len(childPathkeys)
 	}
 	groups := agg.GroupExprs
-	if len(childKeys) < len(groups) {
+	if nChildKeys < len(groups) {
 		return nil
 	}
 	out := agg.Output()
@@ -452,14 +548,22 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	clause := groupClauseKeys(agg)
 	for j, k := range clause {
 		g := groups[k.Pos]
-		// Bare group keys only: the output side names positions, and only a
-		// column has a name. Both sides are input-coordinate here, so
-		// `exprEqual`'s positional `Index` equality is the match.
-		if _, ok := g.(*ColumnRef); !ok {
+		// Both sides are input-coordinate here, so `exprEqual`'s positional
+		// `Index` equality (names are not part of its key) is the match —
+		// for a bare column and for an expression key alike.
+		keyExpr, _, _ := childKeyAt(j)
+		if !exprEqual(keyExpr, g) {
 			return nil
 		}
-		if !exprEqual(childKeys[j].Expr, g) {
-			return nil
+		if _, ok := g.(*ColumnRef); !ok {
+			// M0146-0005ae: an EXPRESSION group key (`GROUP BY
+			// EXTRACT(year FROM l_shipdate)`) is emitted at output
+			// position k.Pos exactly as a column key is — the aggregate's
+			// output there IS the key's value — and the claim below names
+			// that position by Index, which is all the ORDERED step's
+			// exprEqual reads. PG's pathkey is the key's EquivalenceClass
+			// either way (TPC-H Q7/Q8: no Sort above the GroupAggregate).
+			continue
 		}
 		// An empty name is a column nobody can address by name, so the claim
 		// cannot be confirmed and stops there.
@@ -469,10 +573,11 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 	}
 	emitted := make([]PathKey, len(clause))
 	for j, k := range clause {
+		_, desc, nullsFirst := childKeyAt(j)
 		emitted[j] = PathKey{
 			Expr:       &ColumnRef{Index: k.Pos, Name: out[k.Pos].Name, Type: out[k.Pos].Type},
-			SortAsc:    !childKeys[j].Desc,
-			NullsFirst: childKeys[j].NullsFirst,
+			SortAsc:    !desc,
+			NullsFirst: nullsFirst,
 		}
 	}
 	return emitted
@@ -647,4 +752,61 @@ func relabelPathkeysTo(keys []PathKey, out Schema) []PathKey {
 		return nil
 	}
 	return kept
+}
+
+// projectEmissionPathkeys is convert_subquery_pathkeys (pathkeys.c) for a
+// computing Project: the child's ordering, key by key, expressed as the
+// output position of the target that computes the same expression. The
+// translation stops at the first key no target carries — an ordering prefix
+// is still an ordering, a gapped one is not. A key whose expression could be
+// volatile or holds a sublink is not carried: re-evaluated in the Project it
+// need not reproduce the value the rows were sorted on.
+func projectEmissionPathkeys(p *Project) []PathKey {
+	if p == nil || p.Child == nil {
+		return nil
+	}
+	below := inputNodePathkeys(p.Child)
+	out := p.Output()
+	var keys []PathKey
+	for _, bk := range below {
+		if !orderPreservingExpr(bk.Expr) {
+			break
+		}
+		pos := -1
+		for j, t := range p.Targets {
+			if j < len(out) && exprEqual(t, bk.Expr) {
+				pos = j
+				break
+			}
+		}
+		if pos < 0 {
+			break
+		}
+		c := out[pos]
+		keys = append(keys, PathKey{
+			Expr:       &ColumnRef{Index: pos, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx},
+			SortAsc:    bk.SortAsc,
+			NullsFirst: bk.NullsFirst,
+		})
+	}
+	return keys
+}
+
+// orderPreservingExpr reports whether e is built only from nodes whose value
+// is a deterministic function of the row: column references, constants, CASE,
+// NULL/boolean/distinctness tests, casts, collations and operators. Function
+// calls (whose volatility this package cannot always see) and sublinks are
+// refused.
+func orderPreservingExpr(e Expr) bool {
+	ok := true
+	walkExprTree(e, func(x Expr) {
+		switch x.(type) {
+		case *ColumnRef, *IntegerConst, *StringConst, *NumericConst, *BooleanConst,
+			*NullConst, *TypedStringLit, *CaseExpr, *IsNullExpr, *IsBoolExpr,
+			*IsDistinctFromExpr, *CastExpr, *CollateExpr, *BinaryOp, *UnaryOp:
+		default:
+			ok = false
+		}
+	})
+	return ok
 }

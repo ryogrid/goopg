@@ -115,6 +115,13 @@ func createPlanAtSearchRootRange(p *Path, base, width int, fill func(int) (Schem
 	if base < 0 {
 		panic(fmt.Sprintf("createPlan: search root asked to publish binding coordinates from %d", base))
 	}
+	// M0146-0027: carry the boundary's hole-filler onto the rel so a
+	// searched-path rebuild (`searchedBoundaryRebuild`) can replay the same
+	// license — the committed subtree published under it, so a candidate the
+	// rebuild cannot pad would be declined for a hole the winner also had.
+	if fill != nil && p.Rel != nil {
+		p.Rel.BoundaryFill = fill
+	}
 	// Take2 P4-01 Slice 3: derive per-joinrel keep-sets over the chosen tree
 	// before the recursion builds nodes. A no-op wherever the sets are
 	// unknown (ineligible problems, hand-built test trees): the Slice-2 arms
@@ -458,6 +465,12 @@ func boundaryWalkChildren(n Node) []Node {
 	case *Gather:
 		return []Node{x.Child}
 	case *GatherMerge:
+		return []Node{x.Child}
+	case *SubqueryScan:
+		// M0146-0005w: single-child labelling pass-through.
+		return []Node{x.Child}
+	case *Materialize:
+		// M0146-0010: single-child transparent wrapper — same rule.
 		return []Node{x.Child}
 	case *Join:
 		return []Node{x.Left, x.Right}

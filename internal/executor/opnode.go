@@ -33,6 +33,8 @@
 package executor
 
 import (
+	"fmt"
+
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -412,6 +414,21 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 func (w *opNodeOperator) Close() error           { return opClose(w.tree, w.idx) }
 func (w *opNodeOperator) Schema() optimizer.Schema { return w.schema }
 
+// Rescan forwards the rescannable contract into the slab (M0146-0010): a
+// nested loop's materialised inner reaches the join as an OpAdapter fronting
+// a *materializeOp under the BuildFast path, and the join's Rescan must reach
+// it. Same forwarder shape as BindLateralOuter below.
+func (w *opNodeOperator) Rescan() error {
+	if w.tree != nil && int(w.idx) >= 0 && int(w.idx) < len(w.tree.ops) {
+		if s, ok := w.tree.ops[w.idx].state.(*opAdapterState); ok {
+			if r, ok := s.op.(rescannable); ok {
+				return r.Rescan()
+			}
+		}
+	}
+	return fmt.Errorf("opNodeOperator: slab node %d (%v) is not rescannable", w.idx, w.tree.ops[w.idx].Kind)
+}
+
 // BindLateralOuter forwards the lateral outer-row binding to the wrapped
 // underlying operator when this opNodeOperator fronts a FROM-clause SRF
 // (e.g. verify_heapam / pg_get_publication_tables) that implements
@@ -449,6 +466,9 @@ type OpIterator struct {
 	rootIdx int32
 	plan    optimizer.Node
 	dst     Slot
+	ctx     *Context
+	// trig is the statement's AFTER trigger query level (M0146-0076).
+	trig stmtAfterTriggers
 }
 
 // BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
@@ -463,14 +483,24 @@ func BuildFastIterator(plan optimizer.Node) (*OpIterator, error) {
 
 // Open implements Operator.
 func (it *OpIterator) Open(ctx *Context) error {
-	return opOpen(it.tree, it.rootIdx, ctx)
+	it.ctx = ctx
+	it.trig = stmtAfterTriggers{}
+	saved := it.trig.swapIn(ctx)
+	err := opOpen(it.tree, it.rootIdx, ctx)
+	it.trig.swapOut(ctx, saved)
+	it.trig.noteErr(err)
+	return err
 }
 
 // Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
 // the legacy nil-slot convention that the dispatch loop checks with schema==nil).
 func (it *OpIterator) Next() (TupleSlot, error) {
 	it.dst.Reset()
-	if err := opNext(it.tree, it.rootIdx, &it.dst); err != nil {
+	saved := it.trig.swapIn(it.ctx)
+	err := opNext(it.tree, it.rootIdx, &it.dst)
+	it.trig.swapOut(it.ctx, saved)
+	if err != nil {
+		it.trig.noteErr(err)
 		return nil, err
 	}
 	if !it.dst.HasRow {
@@ -480,7 +510,11 @@ func (it *OpIterator) Next() (TupleSlot, error) {
 }
 
 // Close implements Operator.
-func (it *OpIterator) Close() error { return opClose(it.tree, it.rootIdx) }
+func (it *OpIterator) Close() error {
+	saved := it.trig.swapIn(it.ctx)
+	defer it.trig.swapOut(it.ctx, saved)
+	return it.trig.finish(it.ctx, opClose(it.tree, it.rootIdx))
+}
 
 // Schema implements Operator. For read plans, returns plan.Output(). For DML
 // operators still in the adapter, delegates to the adapter's Schema() after
@@ -545,10 +579,9 @@ func (it *OpIterator) RowsAffected() int64 {
 // the slab-native pass-throughs (OpProject/OpFilter/OpLimit) and through an
 // OpSort's opNodeOperator bridge into its child subtree (child indices are
 // built before their parents, so the descent strictly decreases and always
-// terminates). It stops at any other kind: OpAdapter subtrees self-mark via
-// their legacy Opens (lockRowsOp/projectOp/filterOp/aggregateOp), and joins
-// and scans either consume slots row-wise or rebuild them, so a sort below
-// one has no live consumer. Slab twin of markSortWantCTIDs. EX3-05 Cut A.
+// terminates). An OpAdapter subtree is handed to markSortWantCTIDs. It stops
+// at any other kind: joins and scans either consume slots row-wise or rebuild
+// them, so a sort below one has no live consumer. Slab twin of markSortWantCTIDs. EX3-05 Cut A.
 func markSlabSorts(tree *opTreeSlab, idx int32) {
 	for idx != noChild {
 		if tree == nil || int(idx) < 0 || int(idx) >= len(tree.ops) {
@@ -571,6 +604,15 @@ func markSlabSorts(tree *opTreeSlab, idx int32) {
 			return
 		case OpProject, OpFilter, OpLimit:
 			idx = n.childA
+		case OpAdapter:
+			// The consumer above reads this adapter's tids (fillFromTupleSlot
+			// carries them), so hand the legacy subtree to the legacy marker —
+			// a Gather or Gather Merge has no consumer of its own inside it
+			// (M0146-0051).
+			if a, ok := n.state.(*opAdapterState); ok && a.op != nil {
+				markSortWantCTIDs(a.op)
+			}
+			return
 		default:
 			return
 		}

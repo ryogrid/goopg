@@ -211,6 +211,31 @@ env-overridable defaults to every goopg ref lane: `GOGC=100`,
 `GOMEMLIMIT=12GiB`, `GOOPG_ANALYZE_SEED=20260905`,
 `GOOPG_OOM_SCORE_ADJ=0`.
 
+### Maintenance on a non-default database (`:65433` db `tpch`)
+
+Named targets resolve per-connection-database since M0125-0028, but the
+no-target arms are not symmetric: bare `ANALYZE` covers the current
+database, while **bare `VACUUM` still enumerates the default `postgres`
+db** via `im.AllTables()` deep copies. Connected to `tpch` it returns
+`VACUUM` successfully yet touches none of tpch's tables — and in *every*
+db the no-target arm's stats/freeze writes land on throwaway copies and
+are silently lost (open residual; fix filed as `M0143-0011`, ledger
+2026-07-30 M0125-0028 row).
+
+**Rule until M0143-0011 lands: always vacuum non-default-db tables by
+explicit name, then confirm.** For the TPC-H corpus:
+
+    psql -h 127.0.0.1 -p 65433 -U postgres -d tpch -c 'VACUUM customer'
+    # … per table; then verify:
+    psql -h 127.0.0.1 -p 65433 -U postgres -d tpch -t -A -c \
+      "SELECT relname FROM pg_class WHERE relkind='r' AND relallvisible=0"
+
+A `VACUUM` that exits 0 is not evidence the target tables were vacuumed —
+check `relallvisible`. (The TPC-DS lanes `:65436`/`:65437` load into the
+default `postgres` db, where the bare-VACUUM arm does cover the tables —
+but its stats/freeze writes are still dropped on the copies, so per-table
+lists plus verification are the safe habit everywhere.)
+
 ### HOLD recovery (`:65433`)
 
 ```
@@ -231,7 +256,9 @@ Two important notes captured while producing it (details in `MANIFEST.md`):
 
 - **goopg `COPY ... TO` is broken on the `tpch` db** — `COPY t TO STDOUT`
   and `COPY (SELECT * FROM t) TO STDOUT` both fail "relation does not
-  exist" (same per-DB scoping gap as ANALYZE). The dump used `psql --csv`
+  exist" (same per-DB scoping *class* as the ANALYZE/VACUUM named-target
+  gap — that instance closed under M0125-0028; COPY's remains open).
+  The dump used `psql --csv`
   SELECT output instead. Treat this as a known goopg defect.
 - The PG `:65432` `tpch` dataset is **not** row-identical to goopg's
   (lineitem: PG 5,998,835 vs goopg 6,001,255 vs canonical dbgen 6,001,215),

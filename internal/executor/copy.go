@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/mb"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // IsBinaryFormat reports whether the COPY options select binary format.
@@ -215,6 +216,27 @@ type CopyFromExecutor struct {
 	plan   *optimizer.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
+	// defaults holds, per column, the resolved DEFAULT expression of a
+	// column the COPY column list omits (nil otherwise). Resolved once per
+	// statement and evaluated per row through the full evaluator, as PG's
+	// BeginCopyFrom prepares defexprs — so a volatile default such as
+	// random() or clock_timestamp() gets a fresh value per row (M0146-0054).
+	defaults []optimizer.Expr
+	// Trigger state (M0146-0055). PG's CopyFrom fires BEFORE STATEMENT
+	// before the first row, BEFORE ROW per row (ExecBRInsertTriggers,
+	// which may suppress the row), queues AFTER ROW events and fires them,
+	// then AFTER STATEMENT, when the statement ends (AfterTriggerEndQuery).
+	// hasRowBefore / hasRowAfter / hasStmtTriggers are computed once;
+	// stmtBegun / stmtEnded make the statement-level hooks fire exactly
+	// once whichever entry point (text, binary trailer, Finish) reaches
+	// them; afterRows holds the stored rows awaiting their AFTER ROW
+	// triggers.
+	hasRowBefore    bool
+	hasRowAfter     bool
+	hasStmtTriggers bool
+	stmtBegun       bool
+	stmtEnded       bool
+	afterRows       []Row
 	// lineNo is the 1-based physical line counter PG's CONTEXT message
 	// reports ("COPY tbl, line N", copyfromparse.c CopyFromErrorCallback).
 	// Incremented once per PushLine call, matching cur_lineno's per-line
@@ -261,7 +283,30 @@ type CopyFromExecutor struct {
 	// whole default/constraint sequence below rather than paying a
 	// per-row cost for work that can never fire. M0134-0005l.
 	needsConstraints bool
+
+	// PG's CopyMultiInsertBuffer and BulkInsertState (copyfrom.c,
+	// M0146-0009h). multiInsert is CopyFrom's CIM_MULTI: rows are buffered
+	// and flushed in batches of MAX_BUFFERED_TUPLES rows or MAX_BUFFERED_BYTES
+	// of input lines, each batch prepared before any of it is placed. bulk
+	// lives for the whole COPY and drives page choice and relation extension
+	// for every heap write it makes, batched or not.
+	multiInsert bool
+	batch       []Row
+	batchBytes  int
+	// lineLen is the current input record's length without its line end —
+	// the size CopyMultiInsertInfoStore counts (cstate->line_buf.len); 0 for
+	// binary input.
+	lineLen int
+	bulk    *bulkInsertState
 }
+
+// copyMaxBufferedTuples and copyMaxBufferedBytes are copyfrom.c's
+// MAX_BUFFERED_TUPLES and MAX_BUFFERED_BYTES: a multi-insert buffer is
+// flushed once it holds that many rows or that many bytes of input lines.
+const (
+	copyMaxBufferedTuples = 1000
+	copyMaxBufferedBytes  = 65535
+)
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
 // Returns an error when plan is wrong-shape, the endpoint is
@@ -279,7 +324,7 @@ func NewCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor,
 	if ctx.Pool == nil || ctx.Catalog == nil || ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "XX000", Pos: plan.Pos(), Message: "COPY FROM requires storage handles in Context"}
 	}
-	return newCopyFromExecutor(ctx, plan), nil
+	return newCopyFromExecutor(ctx, plan)
 }
 
 // newCopyFromExecutor builds the executor without the endpoint/handle
@@ -320,7 +365,7 @@ func resolveCopyFromEncoding(opts []parser.CopyOption, getSetting func(string) (
 	return id
 }
 
-func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
+func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor, error) {
 	format := copyToFormatFromOptions(plan.Options)
 	cols := plan.Table.Columns
 
@@ -357,16 +402,62 @@ func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 		}
 	}
 
+	// The omitted columns' defaults, resolved once (copyfrom.c BeginCopyFrom:
+	// build_column_default + ExecPrepareExpr for every column not in the
+	// attribute list). GENERATED ALWAYS columns are computed later, and a
+	// serial/identity column carries no DefaultExpr (its nextval is
+	// autoGenerateSerialValues'), exactly as planInsert's
+	// defaultAppendableColumns excludes them.
+	var defaults []optimizer.Expr
+	for i, col := range cols {
+		if !missing[i] || col.DefaultExpr == nil || col.GeneratedAlways {
+			continue
+		}
+		var cat catalog.Catalog
+		if ctx != nil {
+			cat = ctx.Catalog
+		}
+		pe, err := optimizer.ResolveColumnDefault(col.DefaultExpr, cat)
+		if err != nil {
+			return nil, err
+		}
+		if defaults == nil {
+			defaults = make([]optimizer.Expr, len(cols))
+		}
+		defaults[i] = pe
+	}
+
+	var hasRowBefore, hasRowAfter, hasStmtTriggers bool
+	for i := range plan.Table.Triggers {
+		tr := &plan.Table.Triggers[i]
+		if !triggerMatchesEvent(tr, "before", "insert") && !triggerMatchesEvent(tr, "after", "insert") {
+			continue
+		}
+		switch {
+		case !tr.ForEachRow:
+			hasStmtTriggers = true
+		case tr.Timing == catalog.TriggerBefore:
+			hasRowBefore = true
+		case tr.Timing == catalog.TriggerAfter:
+			hasRowAfter = true
+		}
+	}
+
 	return &CopyFromExecutor{
 		ctx:              ctx,
 		plan:             plan,
 		cols:             cols,
+		defaults:         defaults,
+		hasRowBefore:     hasRowBefore,
+		hasRowAfter:      hasRowAfter,
+		hasStmtTriggers:  hasStmtTriggers,
 		format:           format,
 		headerPending:    format.hasHeader(),
 		missing:          missing,
 		needsConstraints: needsConstraints,
 		srcEnc:           srcEnc,
-	}
+		multiInsert:      copyUsesMultiInsert(ctx, plan.Table, cols, missing),
+	}, nil
 }
 
 // PushLine decodes one COPY TEXT or COPY CSV row and inserts it. line
@@ -393,6 +484,7 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 	if c.format.csv {
 		return c.pushCsvLine(line)
 	}
+	c.lineLen = len(trimCopyLineCR(line))
 	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err), Context: c.copyContext()}
@@ -435,6 +527,7 @@ func (c *CopyFromExecutor) pushCsvLine(line []byte) error {
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("%v", err)}
 	}
+	c.lineLen = len(trimCopyLineCR(line))
 	return c.insertSourceRow(src)
 }
 
@@ -445,6 +538,48 @@ func (c *CopyFromExecutor) Finish() error {
 	if len(c.csvPartial) > 0 {
 		c.csvPartial = c.csvPartial[:0]
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: "unterminated CSV quoted field"}
+	}
+	if err := c.flushBatch(); err != nil {
+		return err
+	}
+	return c.endStatement()
+}
+
+// beginStatement fires the BEFORE STATEMENT INSERT triggers once, ahead of
+// the first stored row (PG CopyFrom: ExecBSInsertTriggers before the row
+// loop).
+func (c *CopyFromExecutor) beginStatement() error {
+	if c.stmtBegun {
+		return nil
+	}
+	c.stmtBegun = true
+	if c.hasStmtTriggers {
+		return fireStatementTriggers(c.ctx, c.plan.Table, "before", "insert")
+	}
+	return nil
+}
+
+// endStatement runs once, after the last row is stored: the queued AFTER
+// ROW triggers in row order, then AFTER STATEMENT (PG: AfterTriggerEndQuery
+// fires the queued row events, ExecASInsertTriggers the statement ones). A
+// COPY that stored no rows still fires its statement triggers.
+func (c *CopyFromExecutor) endStatement() error {
+	if c.stmtEnded {
+		return nil
+	}
+	if err := c.beginStatement(); err != nil {
+		return err
+	}
+	c.stmtEnded = true
+	rows := c.afterRows
+	c.afterRows = nil
+	for _, row := range rows {
+		if _, _, err := fireTriggers(c.ctx, c.plan.Table, "after", "insert", nil, row); err != nil {
+			return err
+		}
+	}
+	if c.hasStmtTriggers {
+		return fireStatementTriggers(c.ctx, c.plan.Table, "after", "insert")
 	}
 	return nil
 }
@@ -490,8 +625,9 @@ func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 	// re-coercing it would risk drift. The error propagates unwrapped (PushLine
 	// returns insertSourceRow's error as-is), so reg*in's own SQLSTATE reaches
 	// the wire rather than the 22P04 the decode path wraps.
+	// numeric(p,s) columns are admitted too, for the typmod (M0146-0087).
 	if err := coerceRowForConstraintChecks(c.cols, row, func(i int) bool {
-		return isRegIdentifierTypeName(c.cols[i].Type.Name)
+		return isRegIdentifierTypeName(c.cols[i].Type.Name) || isTypmodNumericColumn(c.cols[i])
 	}, c.ctx, c.plan.Pos()); err != nil {
 		return err
 	}
@@ -520,6 +656,9 @@ func (c *CopyFromExecutor) scatterSourceRow(src Row) Row {
 // inline its own write instead, skipping defaults, NOT NULL, CHECK and domain
 // constraints entirely (review/260831-2 EC-4).
 func (c *CopyFromExecutor) storeCopyRow(row Row) error {
+	if err := c.beginStatement(); err != nil {
+		return err
+	}
 	// M0134-0005l: apply the same default-filling and constraint sequence
 	// insertOp.Next runs, so COPY FROM stops silently accepting rows PG
 	// rejects and stops storing NULL where PG stores a default
@@ -532,7 +671,32 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		// column present in the list but holding an explicit NULL is NOT
 		// "missing" — c.missing only marks columns plan.ColumnIndex never
 		// targets, matching PG's defmap.
-		applyDefaultsForMissing(c.cols, row, c.missing, ctxSeqDBOid(c.ctx))
+		if err := c.fillDefaults(row); err != nil {
+			return err
+		}
+	}
+
+	// BEFORE ROW INSERT triggers see the row with its defaults and may
+	// replace or suppress it; constraints check what they return (PG
+	// CopyFrom: ExecBRInsertTriggers precedes ExecConstraints). A
+	// suppressed row is not stored and not counted (M0146-0055).
+	if c.hasRowBefore {
+		newRow, ok, err := fireTriggers(c.ctx, c.plan.Table, "before", "insert", nil, row)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		row = newRow
+	}
+	// Stored generated columns are computed after the BEFORE ROW triggers
+	// and before the constraints check them, the INSERT path's order
+	// (ExecComputeStoredGenerated in CopyFrom). COPY never computed them, so
+	// a GENERATED ALWAYS ... STORED column was stored NULL (M0146-0055).
+	_ = computeGeneratedColumns(c.cols, row)
+
+	if c.needsConstraints {
 
 		// NOT NULL constraint enforcement.
 		for i, col := range c.cols {
@@ -540,7 +704,7 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 				return &ExecError{
 					Code:    "23502",
 					Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, c.plan.Table.Name),
-					Detail:  formatRowForDetail(c.cols, row),
+					Detail:  formatRowForDetail(c.ctx, c.cols, row),
 				}
 			}
 		}
@@ -559,8 +723,26 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 		}
 	}
 
-	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
+	// AFTER ROW INSERT events are queued and fire at statement end
+	// (endStatement), after every row is stored — PG's after-trigger queue.
+	if c.hasRowAfter {
+		c.afterRows = append(c.afterRows, row)
+	}
+	if c.multiInsert {
+		// CopyMultiInsertInfoStore + CopyMultiInsertInfoIsFull.
+		c.batch = append(c.batch, row)
+		c.batchBytes += c.lineLen
+		c.rowsIn++ // accepted; written by the flush
+		if len(c.batch) >= copyMaxBufferedTuples || c.batchBytes >= copyMaxBufferedBytes {
+			return c.flushBatch()
+		}
+		return nil
+	}
+	// CIM_SINGLE: table_tuple_insert through the statement's bistate.
+	rel, bs := c.bulkState()
+	c.ctx.bulkInsert = bs
 	ptr, err := writeHeapRowReturning(c.ctx, rel, c.cols, row)
+	c.ctx.bulkInsert = nil
 	if err != nil {
 		return err
 	}
@@ -570,6 +752,60 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 	// return zero rows for COPY-loaded data.
 	maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
 	c.rowsIn++
+	return nil
+}
+
+// bulkState returns the target relation and the COPY's bulk insert state,
+// created on first use.
+func (c *CopyFromExecutor) bulkState() (storage.RelFileNode, *bulkInsertState) {
+	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
+	if c.bulk == nil || c.bulk.rel != rel {
+		c.bulk = newBulkInsertState(rel)
+	}
+	return rel, c.bulk
+}
+
+// flushBatch is CopyMultiInsertBufferFlush (copyfrom.c): heap_multi_insert
+// the buffered rows — prepare every tuple, then place them in order through
+// the bulk insert state, whose extensions are sized by what the rest of the
+// batch needs — and then insert their index entries.
+func (c *CopyFromExecutor) flushBatch() error {
+	if len(c.batch) == 0 {
+		return nil
+	}
+	batch := c.batch
+	c.batch, c.batchBytes = nil, 0
+	rel, bs := c.bulkState()
+	prepared := make([]preparedHeapTuple, len(batch))
+	lens := make([]int, len(batch))
+	for i, row := range batch {
+		pt, err := prepareHeapTuple(c.ctx, rel, c.cols, row)
+		if err != nil {
+			return err
+		}
+		prepared[i], lens[i] = pt, len(pt.bytes)
+	}
+	ff := c.ctx.heapFillfactor(rel)
+	if ff <= 0 {
+		ff = storage.HeapDefaultFillfactor
+	}
+	bs.beginBatch(lens, storage.BlockSize*(100-ff)/100)
+	c.ctx.bulkInsert = bs
+	ptrs := make([]storage.ItemPointer, len(batch))
+	var err error
+	for i := range prepared {
+		if ptrs[i], err = placeHeapTuple(c.ctx, rel, prepared[i]); err != nil {
+			break
+		}
+	}
+	c.ctx.bulkInsert = nil
+	bs.endBatch()
+	if err != nil {
+		return err
+	}
+	for i, row := range batch {
+		maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptrs[i])
+	}
 	return nil
 }
 
@@ -604,12 +840,23 @@ func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
 	}
 	c.binaryBuf = c.binaryBuf[consumed:]
 
+	c.lineLen = 0
 	for _, src := range rows {
 		// Same per-row work as the text/CSV path: PG's CopyFrom() applies
 		// defaults and ExecConstraints for every format, so a binary stream
 		// must not be a way around NOT NULL / CHECK / DEFAULT (EC-4).
 		if storeErr := c.storeCopyRow(c.scatterSourceRow(src)); storeErr != nil {
 			return false, storeErr
+		}
+	}
+	if trailerFound {
+		if err := c.flushBatch(); err != nil {
+			return false, err
+		}
+		// The binary trailer ends the statement: the wire layers do not
+		// call Finish on this path (M0146-0055).
+		if err := c.endStatement(); err != nil {
+			return false, err
 		}
 	}
 	return trailerFound, nil
@@ -706,7 +953,10 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 	defer f.Close()
 
 	// Build a CopyFromExecutor directly (bypassing rejectFileEndpoint).
-	fe := newCopyFromExecutor(ctx, plan)
+	fe, err := newCopyFromExecutor(ctx, plan)
+	if err != nil {
+		return 0, err
+	}
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
@@ -727,4 +977,29 @@ func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
 		return fe.rowsIn, err
 	}
 	return fe.rowsIn, nil
+}
+
+// fillDefaults evaluates each omitted column's DEFAULT for one row through
+// the full expression evaluator, then coerces the value to the column type
+// the way the INSERT path coerces its appended defaults. An evaluation
+// error fails the COPY, as PG's ExecEvalExpr does — never a silent NULL
+// (M0146-0054; the old applyDefaultsForMissing route knew only a handful
+// of functions and left anything else NULL).
+func (c *CopyFromExecutor) fillDefaults(row Row) error {
+	if c.defaults == nil {
+		return nil
+	}
+	for i, e := range c.defaults {
+		if e == nil || i >= len(row) {
+			continue
+		}
+		v, err := evalExprSlot(e, nil, c.ctx)
+		if err != nil {
+			return err
+		}
+		row[i] = v.MaterializeArena()
+	}
+	return coerceRowForConstraintChecks(c.cols, row, func(i int) bool {
+		return i < len(c.defaults) && c.defaults[i] != nil
+	}, c.ctx, c.plan.Pos())
 }

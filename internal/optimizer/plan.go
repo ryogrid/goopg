@@ -63,6 +63,19 @@ type Expr interface {
 type IntegerConst struct {
 	pos   int
 	Value int64
+	// Wide types the constant int8 even though Value fits in 32 bits
+	// (M0146-0062). make_const types a literal by its value, but a constant
+	// FOLDED from int8 arithmetic keeps that type in PG:
+	// `3000000000 - 2147483647` is a bigint 852516353. (A negated literal is
+	// typed by its value: gram.y's doNegate makes `-2147483648` int4.)
+	Wide bool
+}
+
+// IntegerConstIsInt8 reports whether an integer constant is typed int8 —
+// a value outside int32 (make_const) or a Wide fold result — rather than
+// int4.
+func IntegerConstIsInt8(c *IntegerConst) bool {
+	return c.Wide || c.Value < -2147483648 || c.Value > 2147483647
 }
 
 func (e *IntegerConst) Pos() int { return e.pos }
@@ -258,6 +271,15 @@ type InExpr struct {
 	Subquery        *parser.SelectStmt
 	List            []Expr
 	IsNonCorrelated bool
+	// UnknownEqFalse is subplan->unknownEqFalse (subselect.c
+	// build_subplan): the ANY was produced from a two-valued EXISTS, so a
+	// probe that cannot match may answer FALSE where a parser-written IN
+	// would owe NULL. Set only by the EXISTS→ANY conversions, which fire
+	// exclusively for exprs standing in qual positions — where NULL and
+	// FALSE filter identically — and which never convert a negated or
+	// operand-distinguishing site. It is what lets the row-operand probe
+	// answer without PG's partial-match table (M0146-0015c slice 3).
+	UnknownEqFalse bool
 	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
 	// Args[i] is evaluated against the current outer row and written to
 	// ParamExec slot ParParam[i] before Plan runs; Plan then reads the
@@ -366,6 +388,13 @@ type SubqueryExpr struct {
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
 	Args     []Expr
+	// ParamInitPlan marks a sublink PG plans as an InitPlan whose params
+	// come from an enclosing query level (M0146-0114): the min/max rewrite
+	// of a correlated `(select min(c) … where c > outer.x)` builds its
+	// `Limit -> Index Only Scan` as such an InitPlan, re-evaluated when the
+	// param changes. goopg runs it as a correlated sublink; EXPLAIN labels
+	// it `InitPlan N`.
+	ParamInitPlan bool
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
@@ -504,6 +533,9 @@ func (*OuterColumnRef) exprNode()  {}
 type unnestParam struct {
 	OuterRef *OuterColumnRef
 	SubCol   *ColumnRef
+	// Aliases are further occurrences of the same correlation pair
+	// (dedupeUnnestParams): the clone replaces them like OuterRef.
+	Aliases []*OuterColumnRef
 }
 
 // ParamRef passes through a bind-parameter placeholder. The executor
@@ -581,6 +613,11 @@ type CastExpr struct {
 	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
 	SourceType string // operand's declared type — used by executor to pick rounding mode. M0097-0003.
 	Typmod     int64  // optional precision/scale modifier (e.g., 4 for ::timetz(4)); 0 means no typmod.
+	// Explicit marks a cast written in the query (`x::t`, `CAST(x AS t)`),
+	// as opposed to one the planner inserted (set-operation column
+	// coercion, index-key alignment). EXPLAIN shows only explicit casts
+	// (ruleutils' COERCE_EXPLICIT_CAST) — M0146-0005cw.
+	Explicit bool
 }
 
 func (e *CastExpr) Pos() int { return e.pos }
@@ -601,6 +638,7 @@ func NewCastExprFromParser(x *parser.CastExpr, operand Expr) *CastExpr {
 		TargetType: typeName,
 		SourceType: exprType(operand).Name,
 		Typmod:     encodeTypmod(typeName, x.Typmods),
+		Explicit:   true,
 	}
 }
 
@@ -611,6 +649,17 @@ type RowExpr struct {
 	pos   int
 	Elems []Expr
 	Types []catalog.Type
+	// NotNullElem marks a whole-row reference to a relation (M0146-0047):
+	// 1 + the index of an element that reads one of the relation's NOT NULL
+	// columns, 0 when there is none. A NULL there can only come from an
+	// outer join's null extension, where PG's whole-row Var is NULL itself
+	// rather than a composite of NULL fields — `count(b)` over a LEFT
+	// JOIN's unmatched rows counts none of them. A real row whose fields are
+	// all NULL keeps its non-NULL composite, so the witness is a NOT NULL
+	// column, never "every field is NULL". An element position rather than
+	// a separate expression, so rewriters that remap the elements keep it
+	// valid by copying the field.
+	NotNullElem int
 }
 
 func (e *RowExpr) Pos() int { return e.pos }
@@ -675,6 +724,9 @@ type TableSampleSpec struct {
 func (t *TableSampleSpec) Pos() int { return t.pos }
 
 type SeqScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: a one-relation search root is a bare scan (searchedtree.go).
@@ -798,6 +850,20 @@ type SeqScan struct {
 func (n *SeqScan) Pos() int       { return n.pos }
 func (n *SeqScan) Output() Schema { return n.schema }
 
+// SeqScanWithSchemaForTest builds a SeqScan whose Output() is the given
+// schema, for tests in other packages that need a node of known width (the
+// executor's EXPLAIN placement tests, M0146-0005aj).
+func SeqScanWithSchemaForTest(t *catalog.Table, schema Schema) *SeqScan {
+	return &SeqScan{Table: t, schema: schema}
+}
+
+// WithSchemaForTest stamps n's output schema, for executor-package tests
+// that need a probe's output columns to carry source ids.
+func (n *IndexScan) WithSchemaForTest(schema Schema) *IndexScan {
+	n.schema = schema
+	return n
+}
+
 // IndexScan probes a single-column B-tree index with an equality key
 // or a range of keys.
 //
@@ -807,6 +873,9 @@ func (n *SeqScan) Output() Schema { return n.schema }
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: see *SeqScan above (searchedtree.go).
@@ -825,6 +894,18 @@ type IndexScan struct {
 	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
 	// probe (no suffix padding); a shorter prefix is rejected by the planner
 	// to keep the executor probe path purely equality-shaped.
+	// SkipPrefix, when non-zero, re-bases Keys: Keys[i] binds
+	// Index.Columns[SkipPrefix+i], and the first SkipPrefix key columns are
+	// NOT bound by any clause. The executor then runs PG18's btree skip-scan
+	// (M0146-0005v, the `_bt_skiparray` mechanism of nbtpreprocesskeys.c):
+	// it enumerates the distinct values the index stores in the skipped
+	// prefix and performs one bounded descent per value, so a qual on a
+	// non-leading column can drive the index rather than filter after it.
+	// Legal only with Keys set — equality skips are the whole scope of the
+	// slice; combining it with Key/SAOPKeys/LowKey/HighKey/RangePrefix is a
+	// planner bug the executor reports rather than interprets. 0 keeps the
+	// positional binding every existing caller relies on.
+	SkipPrefix int
 	// SAOPKeys holds one probe expression per element of a ScalarArrayOp
 	// (`col = ANY (consts)`, i.e. `col IN (consts)`) over the index's LEADING
 	// column — PG's `match_saopclause_to_indexcol` shape
@@ -909,6 +990,11 @@ type IndexScan struct {
 	// Only explain_names.go will read it; value, cost, and executor
 	// paths never do.
 	RTID int32
+	// OrderRelied marks a scan whose index order delivers the statement's
+	// ORDER BY (markIndexOrderRelied, M0146-0034). Planning-only: the
+	// parallel post-pass reads it to merge workers' streams (Gather Merge)
+	// instead of interleaving them.
+	OrderRelied bool
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -927,6 +1013,9 @@ func (n *IndexScan) Output() Schema { return n.schema }
 // inner probe yields no rows, the operator emits `outer ++
 // nullRow(innerWidth)` to preserve outer rows.
 type NestedLoopIndexJoin struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the parameterised arm of createNestLoopPlan (searchedtree.go).
@@ -1003,16 +1092,20 @@ func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
 //
 // KeyExprs are the probe-key expressions (they reference OUTER columns
 // and are evaluated against the bound outer slot — the same expressions
-// the aliased Child IndexScan consumes as Key/Keys). SingleRow marks a
+// the aliased Child probe — an *IndexScan or, since M0146-0005bq, an
+// *IndexOnlyScan — consumes as Key/Keys). SingleRow marks a
 // provably-unique probe (entries complete after the first row, PG's
 // `singlerow`). EstEntries is the planner's cache-population estimate
 // for initial sizing (cost_memoize_rescan analog); the executor clamps
 // by the runtime memory budget.
 type Memoize struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	pos        int
-	Child      *IndexScan
+	Child      Node
 	KeyExprs   []Expr
 	SingleRow  bool
 	EstEntries int64
@@ -1020,6 +1113,31 @@ type Memoize struct {
 
 func (n *Memoize) Pos() int       { return n.pos }
 func (n *Memoize) Output() Schema { return n.Child.Output() }
+
+// Materialize is PG's `Material` node (createplan.c's make_material feeding
+// nodeMaterial.c): a transparent single-child wrapper that buffers the
+// child's output on first pull and replays it on every rescan. It is emitted
+// only by createPlan's PathMaterial arm — the path PG's match_unsorted_outer
+// files beside the bare inner (joinpath.c:1890-1901) when the cheapest inner
+// does not already materialize its output (execAmi.c's
+// ExecMaterializesOutput) and enable_material is on.
+//
+// Like PG's, the node carries no state of its own: same rows, same width,
+// same pathkeys as its child — its only content is "rescanning me is cheap".
+// The executor half is `materializeOp` (operators_material.go), which the
+// nested-loop driver reaches for only when this node is present.
+type Materialize struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	// PlanCost carries the search's cost for this node (plancost.go).
+	PlanCost
+	pos   int
+	Child Node
+}
+
+func (n *Materialize) Pos() int       { return n.pos }
+func (n *Materialize) Output() Schema { return n.Child.Output() }
 
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
@@ -1029,6 +1147,9 @@ func (n *Memoize) Output() Schema { return n.Child.Output() }
 // of the full table schema). When the VM bit is not set for a page the
 // executor falls back to a regular heap fetch.
 type IndexOnlyScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: a one-relation search root is a bare scan, and an
@@ -1064,6 +1185,10 @@ type IndexOnlyScan struct {
 	HighOp  parser.OpCode
 	// Covered is the slice of catalog.Column entries that the output schema
 	// contains (a subset of Index.Columns, in projection order).
+	// SkipPrefix is IndexScan.SkipPrefix for the index-only probe
+	// (M0146-0005bt): Keys[i] binds Index.Columns[SkipPrefix+i] and the
+	// first SkipPrefix key columns are enumerated by the executor.
+	SkipPrefix int
 	Covered []catalog.Column
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
@@ -1091,6 +1216,11 @@ type IndexOnlyScan struct {
 	// throughout cut 1. Only explain_names.go will read it; value,
 	// cost, and executor paths never do.
 	RTID int32
+	// OrderRelied marks a scan whose index order delivers the statement's
+	// ORDER BY (markIndexOrderRelied, M0146-0034). Planning-only: the
+	// parallel post-pass reads it to merge workers' streams (Gather Merge)
+	// instead of interleaving them.
+	OrderRelied bool
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }
@@ -1113,7 +1243,24 @@ const (
 	// has NO match on the right (build). Output schema is the left
 	// side only. Produced by NOT-EXISTS-unnesting (M0061-0001).
 	JoinTypeAnti
+	// JoinTypeRightSemi is PG 18's JOIN_RIGHT_SEMI: a semi join with
+	// its sides swapped for hashing — the semi join's PRESERVED rows
+	// are the RIGHT (build, hashed) input, and each is emitted exactly
+	// once, on its first match against a left (probe) row. Output
+	// schema is the right side only. Hash join only, as upstream
+	// (nodeHashjoin.c; M0146-0005dj).
+	JoinTypeRightSemi
+	// JoinTypeRightAnti is PG's JOIN_RIGHT_ANTI: each right (build)
+	// row with NO match among the left (probe) rows is emitted once,
+	// by the post-probe sweep of the hash table. Output schema is the
+	// right side only. Hash join only (M0146-0005dj).
+	JoinTypeRightAnti
 )
+
+// IsRightSemiAnti reports whether t emits only the right (build) side.
+func (t JoinType) IsRightSemiAnti() bool {
+	return t == JoinTypeRightSemi || t == JoinTypeRightAnti
+}
 
 // JoinAlgo is the physical algorithm the executor uses for a Join.
 // v0 has three: nested-loop (the universal fallback), hash join
@@ -1148,6 +1295,9 @@ const (
 // Merge join sorts both sides on their keys and merges the two
 // ordered streams.
 type Join struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the usual search root — every join arm but the
@@ -1186,6 +1336,13 @@ type Join struct {
 	// means "no list available" and every consumer must fall back to the
 	// single pair. M0127-P2.1; design leftdeep-joins/05 §5.
 	HashKeys  []JoinKeyPair
+	// MergeKeyCount is the length of the merge path's mergeclauses list
+	// (M0146-0005be), 0 when unknown. A merge path uses only the clauses its
+	// inputs' ordering serves (find_mergeclauses_for_outer_pathkeys, and the
+	// truncation search), leaving the other equalities in joinqual; the
+	// predicate lists the merge pairs first, so fillJoinHashKeys keeps this
+	// prefix and the rest stay residual — `Join Filter:` as in PG.
+	MergeKeyCount int
 	BuildLeft bool // hash join: build on left input instead of right
 	// ParallelHash marks PG's `parallel_hash = true` hash join
 	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a
@@ -1321,6 +1478,9 @@ func (n *Join) Output() Schema {
 			return n.Left.Output()
 		}
 	}
+	if n.Type.IsRightSemiAnti() && n.Right != nil {
+		return n.Right.Output()
+	}
 	return n.schema
 }
 
@@ -1372,6 +1532,12 @@ func (a AggregateCall) Pos() int { return a.pos }
 // by the GROUP BY key (e.g. non-key cols when GROUP BY covers a primary key).
 // The executor evaluates them from the first row of each group. M0097-0003.
 type Aggregate struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
+	PlanCost
 	pos         int
 	Child       Node
 	GroupExprs  []Expr
@@ -1403,6 +1569,18 @@ type Aggregate struct {
 	// every construction site that does not set it keeps today's behaviour.
 	// M0125-0048.
 	GroupingSets [][]int
+	// Rollups is GroupingSets as preprocess_grouping_sets arranges them
+	// (ExtractGroupingRollups, M0146-0020b): chains of sets, each chain's
+	// columns ordered so that every set is a prefix. A sorted strategy
+	// computes one rollup per sorted pass, the first over the input's order
+	// and each later one over its own sort; the hashed strategies take the
+	// sets in this order. nil when there are no grouping sets.
+	Rollups []GroupingRollup
+	// HashedRollups, set on an AGG_MIXED aggregate (Strategy Sorted, labelled
+	// MixedAggregate), are the grouping sets computed by hashing instead of
+	// a sorted pass, one set per entry, in create_groupingsets_plan's order;
+	// Rollups then holds only the sorted ones (M0146-0020b).
+	HashedRollups []GroupingRollup
 	// GroupingMasks carries one entry per distinct GROUPING(...) call in the
 	// query, in the order the columns are appended to the output schema:
 	// output column len(GroupExprs)+len(Aggs)+i holds
@@ -1418,6 +1596,12 @@ type Aggregate struct {
 	// determined column discovered during target resolution never displaces
 	// a grouping column. M0125-0048.
 	GroupingMasks [][]int64
+	// GroupingMaskSlots holds, per GroupingMasks entry, the GroupExprs
+	// index of each GROUPING(...) argument, in argument order. It exists
+	// so EXPLAIN can deparse a mask column the way PG does,
+	// `(GROUPING(a, b))`, instead of printing its output label `grouping`
+	// (M0146-0005cf). Read by EXPLAIN only; nil where no producer set it.
+	GroupingMaskSlots [][]int
 
 	// Strategy selects hashed vs sorted aggregation. The zero value is
 	// AggStrategyHashed, so every existing construction site and test
@@ -1469,6 +1653,24 @@ type Aggregate struct {
 	// carry it (PG forces the rollup order there).
 	GroupClause []GroupClauseKey
 
+	// PrunedGroupInputs are the input-column indices of the GROUP BY items
+	// that remove_useless_groupby_columns and the redundant-pathkey filter
+	// (groupkeyconst.go) dropped from GroupExprs, ascending. The aggregate
+	// no longer groups on them, but PG's query_is_distinct_for still reads
+	// the subquery's ORIGINAL groupClause, so a uniqueness proof over this
+	// node needs them equated too (groupedLeafDistinctFor, M0146-0101). A
+	// pruned column the query reads reaches the output as a Passthrough.
+	PrunedGroupInputs []int
+
+	// GroupedNoKeys marks a GROUP BY aggregate whose every key was pruned as
+	// constant-pinned (groupkeyconst.go, M0146-0102). It has no GroupExprs,
+	// like an ungrouped aggregate, but it is still grouped: PG's AGG_SORTED
+	// with zero columns (parse->groupClause set, processed_groupClause
+	// empty) returns NO row over empty input, where an ungrouped
+	// aggregate (AGG_PLAIN) returns one. EXPLAIN labels it GroupAggregate
+	// (Group without aggregates) with no Group Key line.
+	GroupedNoKeys bool
+
 	// InputTarget / InputTargetKnown is the aggregate's input-column keep list —
 	// B-01c second cut (COMPUTE-ONLY group_input_target): the ascending
 	// child-output positions of the group-input columns (group keys ∪
@@ -1491,6 +1693,59 @@ type Aggregate struct {
 	// clone that drops the stamp reads as unknown, the safe direction).
 	InputTarget      []int
 	InputTargetKnown bool
+
+	// PartialGroup marks the per-worker dedup node of the parallel
+	// `Group -> Gather Merge -> Group` shape (M0146-0025): an
+	// aggregate-free GROUP BY split where each worker dedups its own
+	// partition and the leader-side final Group re-dedups the merge —
+	// PostgreSQL's `create_group_path` inside
+	// `create_partial_grouping_paths` (planner.c:7570), which the
+	// zero-row Partial/Finalize model cannot express (a group-only node
+	// has no transition state to merge).
+	//
+	// The flag is what lets the driving-scan walks descend THROUGH this
+	// node to the scan below: a marked node promises a leader-side
+	// re-grouping consumes its output, so partitioning its input is the
+	// intended semantics — not the `count(*) over (SELECT DISTINCT …)`
+	// over-count an UNMARKED dedup would produce if the same walks
+	// descended through it inside a candidate partial subtree. The
+	// planner emits it only from addPartialAggSplitPath's group-only
+	// arm; the executor runs it as the ordinary AggModeSimple sorted
+	// dedup it is, and EXPLAIN prints `Group`.
+	//
+	// Read ONLY by drivingScan / stampParallelScan /
+	// unstampParallelScan / drivingScanCrossesSort (parallel.go).
+	PartialGroup bool
+
+	// PartialEmit marks a row-transport partial/finalize pair
+	// (M0146-0003b): on a Partial node it makes the aggregate emit
+	// (group key values, passthrough values, one serialized transition
+	// state per aggregate) as ordinary rows — PostgreSQL's
+	// aggserialfn-shaped transport (nodeAgg.c's serialised
+	// aggref->aggtranstype internal column) — instead of merging into
+	// the zero-row shared accumulator PartialSource points at. On a
+	// Finalize node it makes the node consume those rows: deserialise
+	// each state column and combineAggRuntime it into the group, rather
+	// than reading the accumulator after draining the Gather to EOF.
+	// With Strategy == AggStrategySorted the finalize instead consumes a
+	// merge-ordered stream — PG's `Finalize GroupAggregate` over `Gather
+	// Merge -> Sort -> Partial HashAggregate` — folding same-key runs
+	// into one live group with no group map (M0146-0003 S5); an
+	// out-of-order key errors rather than emitting a group twice.
+	// The flag must be set on BOTH nodes of a pair; a PartialEmit
+	// partial under a plain finalize (or vice versa) is an
+	// internal-error construction.
+	//
+	// Unlike PartialSource's side channel this shape survives any
+	// row-moving node between the pair — a Sort (PG's
+	// `Sort -> Partial HashAggregate` under `Gather Merge`), a
+	// GatherMerge, or another pass-through — which is what the
+	// `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
+	// HashAggregate` stack (planner.c:7704-7724's
+	// gather_grouping_paths) needs. Read ONLY by the executor
+	// (operators_join_agg.go); no plan producer emits it yet, so a
+	// node carrying it can appear only in directly-constructed plans.
+	PartialEmit bool
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output
@@ -1561,8 +1816,20 @@ func (w WindowFunc) Pos() int { return w.pos }
 // Stage A uses one shared PARTITION BY / ORDER BY spec for all
 // funcs in the node.
 type WindowAgg struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos         int
 	Child       Node
+	// RunCondition is PG's WindowAgg runCondition (find_window_run_conditions,
+	// allpaths.c): a qual over this node's own output — a monotonic window
+	// function compared to a constant — that, once false, stays false for
+	// the rest of the partition. The executor then skips the partition's
+	// remaining rows, or ends the scan without PARTITION BY (nodeWindowAgg.c
+	// WINDOWAGG_PASSTHROUGH_STRICT / WINDOWAGG_DONE). Set only on the
+	// top-level WindowAgg of a query level, by pushWindowRunConditions
+	// (M0146-0005dn); nil otherwise.
+	RunCondition Expr
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
@@ -1588,6 +1855,10 @@ type WindowAgg struct {
 	// by the time a Frame reaches the planner it is a well-formed
 	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
+	// Name is the window's EXPLAIN name — the WINDOW clause's own name, or
+	// the "wN" planner.c's name_active_windows makes up for an unnamed
+	// one (numbered per query level, bottom-up). EXPLAIN-only.
+	Name   string
 	schema Schema
 
 	// InputTarget / InputTargetKnown is the window's input-column keep list —
@@ -1627,6 +1898,9 @@ type WindowFrame struct {
 	EndKind     parser.FrameBoundKind
 	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
 	Exclusion   parser.FrameExclusion
+	// HasBetween is FRAMEOPTION_BETWEEN: EXPLAIN's Window line spells the
+	// frame the way it was written (`ROWS BETWEEN … AND …` vs `ROWS …`).
+	HasBetween bool
 }
 
 func (n *WindowAgg) Pos() int       { return n.pos }
@@ -1634,6 +1908,9 @@ func (n *WindowAgg) Output() Schema { return n.schema }
 
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go). Without
 	// this embed, stampPlanCost's `n.(planCostSetter)` assertion silently
 	// fails on a base-local-filtered leaf (buildInitialRels wraps it in
@@ -1698,6 +1975,9 @@ func (n *Filter) Output() Schema { return n.Child.Output() }
 // child scan — see rewriteMinMaxAggregates); the const-arg rewrite
 // (`SELECT max(100) FROM t`) sets both.
 type Result struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	searchedTree
 	pos int
 	// Targets: evaluated once per emitted row (childless) or once per child
@@ -1714,6 +1994,9 @@ func (n *Result) Pos() int       { return n.pos }
 func (n *Result) Output() Schema { return n.schema }
 
 type Project struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// searchedTree: the boundary node P5.5-f-i emits is a *Project, and it is
 	// the node the legacy posmap family must most carefully not walk into
 	// (searchedtree.go).
@@ -1746,6 +2029,9 @@ func (n *Project) Output() Schema { return n.schema }
 //
 // See docs/design/0016-0004-cte-observability-and-compat-tests.md.
 type CTEScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Name   string // CTE name from the WITH list
 	Alias  string // alias used at this consumer site (defaults to Name)
@@ -1766,7 +2052,60 @@ type CTEScan struct {
 	// threaded) and keeps today's rendering. Only explain_names.go will
 	// read this field (a later cut); value and executor paths never do.
 	RTID int32
+	// SourceIdx is the consumer binding's per-level SourceTableIdx — the
+	// value the query's ColumnRefs over this reference carry. The output
+	// schema is the CTE body's and holds the body's own indexes (or none,
+	// after a column-alias rename), so EXPLAIN reads this field to name the
+	// reference's columns by its alias, as PG does (`t_s_firstyear.customer_id`,
+	// M0146-0021). 0 = unknown.
+	SourceIdx int16
 }
+
+// SubqueryScan labels a derived-table leaf whose subquery PG could not
+// pull up (is_simple_subquery, prepjointree.c): set operations, grouping
+// or aggregation, window functions, target SRFs, ORDER BY / DISTINCT /
+// LIMIT, WITH, or row locking keep the subquery an RTE_SUBQUERY, which
+// PG's planner renders as `Subquery Scan on <alias>`. goopg used to hand
+// the inner subtree to the join leaf set directly, so a set-operation
+// arm read as its innermost relations (TPC-DS Q8's `customer` /
+// `customer_address` pair) instead of the one scan leaf PG reports.
+//
+// Like CTEScan, the wrap is purely a labelling artifact: the executor's
+// Build switch unwraps it to Child, so no new operator type exists and
+// no runtime semantics change. The schema is the binding's (alias-
+// renamed) output — same column positions as the child's, so every
+// single-child plan walk treats it as a transparent pass-through and
+// only scope-aware readers (reconcileNLILayoutBody, execParamOwner-
+// Children) stop at it, exactly as they already stop at a separately
+// planned scope. M0146-0005w.
+type SubqueryScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	pos    int
+	Alias  string
+	Child  Node
+	schema Schema
+	// src is the leaf binding's per-FROM-clause sourceIdx — the
+	// coordinate the enclosing scope's ColumnRefs use to name this
+	// leaf's columns. The setrefs-style triviality pass
+	// (stripTrivialSubqueryScans) reads it to compute which output
+	// positions the consumer actually references. M0146-0005w.
+	src int16
+	// resjunk records that PG's subquery target list carries a resjunk
+	// entry (a GROUP BY / ORDER BY / DISTINCT ON / window key the select
+	// list does not name): its subplan tlist is longer than any
+	// pathtarget-regime scan tlist, so setrefs keeps the node there.
+	// M0146-0092.
+	resjunk bool
+	// appendRel marks a "*SELECT* n" wrapper over a UNION ALL member PG
+	// keeps as a subquery RTE under the appendrel; the label names the
+	// appendrel binding the parent references it by. M0146-0093.
+	appendRel *appendRelLabel
+}
+
+func (n *SubqueryScan) Pos() int       { return n.pos }
+func (n *SubqueryScan) Output() Schema { return n.schema }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
 // before the outer query. DMls are executed in order; each plan's RETURNING
@@ -1787,6 +2126,9 @@ func (n *CTEDMLPrefix) Output() Schema { return n.Body.Output() }
 // ctx.MaterializedCTEs[Name]. Used when a DML CTE body's RETURNING rows
 // are consumed by the outer SELECT.
 type MaterializedCTEScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Name   string // CTE name (key into ctx.MaterializedCTEs)
 	Alias  string
@@ -1797,11 +2139,24 @@ type MaterializedCTEScan struct {
 	// threaded) and keeps today's rendering. Only explain_names.go will
 	// read this field (a later cut); value and executor paths never do.
 	RTID int32
+	// SourceIdx is the consumer binding's per-level SourceTableIdx — the
+	// value the query's ColumnRefs over this reference carry. The output
+	// schema is the CTE body's and holds the body's own indexes (or none,
+	// after a column-alias rename), so EXPLAIN reads this field to name the
+	// reference's columns by its alias, as PG does (`t_s_firstyear.customer_id`,
+	// M0146-0021). 0 = unknown.
+	SourceIdx int16
 }
 
 func (n *MaterializedCTEScan) Pos() int       { return n.pos }
 func (n *MaterializedCTEScan) nodeTag()       {}
 func (n *MaterializedCTEScan) Output() Schema { return n.schema }
+
+// Inlined reports whether PG would have inlined this reference's CTE into
+// an ordinary subquery (plannedCTE.inlinable). The executor then streams
+// the body instead of materialising it, and EXPLAIN renders it in place of
+// a `CTE <name>` section. Meaningful once planning has finished.
+func (n *CTEScan) Inlined() bool { return n != nil && n.cte.inlinable() }
 
 func (n *CTEScan) Pos() int       { return n.pos }
 func (n *CTEScan) Output() Schema { return n.schema }
@@ -1871,6 +2226,9 @@ type SortKey struct {
 }
 
 type Sort struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: the PathSort arm's root (searchedtree.go).
@@ -1914,6 +2272,9 @@ func (n *Sort) Output() Schema { return n.Child.Output() }
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Child  Node
 	Limit  Expr // nil when no limit
@@ -1937,6 +2298,9 @@ func (n *Limit) Output() Schema { return n.Child.Output() }
 // plan cache cannot serve a stale snapshot of a dynamic view
 // (M0094-0005).
 type Values struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos           int
 	Rows          [][]Expr
 	schema        Schema
@@ -1950,6 +2314,9 @@ func (n *Values) Output() Schema { return n.schema }
 // generate_series(start, stop[, step]) in the FROM clause.
 // M0096-0006.
 type GenerateSeries struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	Start  Expr
 	Stop   Expr
@@ -2003,6 +2370,9 @@ func (n *GenerateSubscripts) Output() Schema { return n.schema }
 // For multi-arg unnest: `FROM unnest(arr1, arr2, ...)`, ArrExprs holds each
 // array and the schema has one column per array (NULL-padded ZIP semantics).
 type FromUnnest struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos      int
 	ArrExpr  Expr   // single-arg form (len(ArrExprs)==0)
 	ArrExprs []Expr // multi-arg form (len>=2)
@@ -2131,6 +2501,9 @@ type UserSrfCol struct {
 }
 
 type ProjectSet struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos     int
 	Child   Node
 	SrfName string
@@ -2455,6 +2828,9 @@ type LockedRel struct {
 // Output schema is the child's schema with resjunk ctid columns
 // stripped — callers see only the user-visible columns.
 type LockRows struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos   int
 	Child Node
 	Locks []LockedRel
@@ -2663,8 +3039,11 @@ type MergeWhenClause struct {
 	UpdateSet []Expr
 
 	// INSERT: InsertExprs are evaluated against the source row at runtime.
-	// InsertColIdx maps source → target column ordinals (same length).
-	// nil InsertExprs means DEFAULT VALUES.
+	// InsertColIdx maps them to target column ordinals (same length). The
+	// planner appends resolved DEFAULT expressions for DEFAULT markers and
+	// omitted columns; a column missing from InsertColIdx is filled by the
+	// executor as omitted (NULL, serial/identity nextval, generated value).
+	// M0146-0075.
 	InsertExprs  []Expr
 	InsertColIdx []int
 }
@@ -2831,6 +3210,12 @@ func (n *Copy) Output() Schema { return n.schema }
 // all other variants buffer and apply multiset semantics in the executor
 // (operators_setop.go). M0097-0024.
 type SetOp struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bj), so EXPLAIN prints them instead of the legacy estimate.
+	PlanCost
 	// setOpBranchTag: M0144-0003b-1 — set when this node is what
 	// `createSetOpPaths` returned for a set operation, so the next link of a
 	// left-deep UNION ALL chain can reach that link's SETOP rel
@@ -2839,6 +3224,11 @@ type SetOp struct {
 	pos   int
 	Left  Node
 	Right Node
+	// pinnedSchema is the written first arm's output, kept when
+	// createSetOpPaths swaps an INTERSECT's inputs (M0146-0005r): the set
+	// operation's column names come from the leftmost SELECT whichever
+	// input runs on the left. nil means "Left's output".
+	pinnedSchema Schema
 	// TlistTypesDiffer records that this link's two branches did NOT have
 	// identical output types BEFORE setOpUnifyBranches coerced them —
 	// upstream's `tlist_same_datatypes` (tlist.c:257) answered false, which
@@ -2855,6 +3245,15 @@ type SetOp struct {
 	// Only the genuine set-operation site sets it, and only when the types
 	// really differ. M0145-0004.
 	TlistTypesDiffer bool
+	// appendRel / appendMemberLeft / appendMemberRight stamp a link of an
+	// appendrel's UNION ALL chain (M0146-0093): the shared label, and the
+	// 1-based member number of a side that is a member PG keeps as a
+	// subquery RTE (0 otherwise). The stamps ride every copy of the link
+	// (createSetOpPlan copies the spec) so wrapAppendRelMembers can give
+	// those members their "*SELECT* n" SubqueryScan on the finished plan.
+	appendRel         *appendRelLabel
+	appendMemberLeft  int
+	appendMemberRight int
 	// UnionDistinctInput marks a UNION ALL link of the chain a UNION
 	// (distinct) folds its branches into (M0141-S2b-4a/4b). PG plans that
 	// input inside generate_union_paths, never as an appendrel, so only the
@@ -2900,10 +3299,20 @@ type SetOp struct {
 	// above it would claim a parallelism the executor will not run.
 	// M0145-0004a.
 	ParallelAware bool
+	// appendArms is plan-construction scratch (M0146-0005ac): the flattened,
+	// already-ordered arms of the parallel Append this link tops, each with
+	// the path that built it, so the next link up can order its whole chain
+	// (parallelappendorder.go). nil on every other node.
+	appendArms []parallelAppendArm
 }
 
 func (n *SetOp) Pos() int       { return n.pos }
-func (n *SetOp) Output() Schema { return n.Left.Output() }
+func (n *SetOp) Output() Schema {
+	if n.pinnedSchema != nil {
+		return n.pinnedSchema
+	}
+	return n.Left.Output()
+}
 
 // Distinct eliminates duplicate rows from its child, implementing
 // SELECT DISTINCT. Deduplication uses the same rowKey hash as the
@@ -2922,6 +3331,9 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // space. The risk correspondingly moves from "is the transport correct" to "is
 // the shutdown correct".
 type Gather struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	PlanCost
 	// searchedTree: C-19f. A Gather became a root `createPlanNode` can return
 	// the moment a partial JOIN path made one winnable at a search root
@@ -2965,6 +3377,9 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 //
 // P7 of docs/design/parallel-query/ (chapter 05 §4).
 type GatherMerge struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	PlanCost
 	// searchedTree: see *Gather. C-19e/C-19f make this reachable too.
 	searchedTree
@@ -2991,6 +3406,12 @@ func NewGatherMerge(pos int, child Node, nWorkers int, keys []SortKey) *GatherMe
 }
 
 type Distinct struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
+	PlanCost
 	pos    int
 	Child  Node
 	schema Schema
@@ -3002,6 +3423,14 @@ type Distinct struct {
 	// candidate's `Group Key:` in it. nil means every column ascending, in
 	// output order.
 	SortKeys []SortKey
+	// PartialUnique marks this spec's UNIQUE candidate as the per-worker
+	// dedup of the parallel `Unique -> Gather Merge -> Unique -> Sort`
+	// shape (M0146-0027 slice 2): PostgreSQL's `create_upper_unique_path`
+	// inside `create_partial_distinct_paths` (planner.c:4973), where each
+	// worker dedups its own partition and a leader-side Unique re-dedups
+	// the merge. The emitted *DistinctOn carries the flag; see its comment
+	// for the walk contract.
+	PartialUnique bool
 }
 
 func (n *Distinct) Pos() int       { return n.pos }
@@ -3013,10 +3442,38 @@ func (n *Distinct) Output() Schema { return n.schema }
 // KeyCols holds the output column indices that form the DISTINCT ON key.
 // M0097-0005.
 type DistinctOn struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
+	// PlanCost carries the chosen path's cost and rows (plancost.go,
+	// M0146-0005bg): EXPLAIN prints them and EstimateRows reads the rows.
+	PlanCost
 	pos     int
 	Child   Node
 	KeyCols []int // indices into the output schema for DISTINCT ON keys
 	schema  Schema
+	// PartialUnique marks the per-worker dedup node of the parallel
+	// `Unique -> Gather Merge -> Unique` distinct shape (M0146-0027 slice
+	// 2) — the `*Aggregate.PartialGroup` counterpart. A marked node
+	// promises a leader-side Unique re-dedups what the merge returns, so
+	// partitioning its input is the intended semantics — not the
+	// `count(*) FROM (SELECT DISTINCT …)` over-count an UNMARKED dedup
+	// would emit once per worker.
+	//
+	// The flag is what lets the driving-scan walks descend THROUGH this
+	// node to the scan below, exactly as PartialGroup does for the
+	// aggregate dedup. Read ONLY by drivingScan / stampParallelScan /
+	// unstampParallelScan / drivingScanCrossesSort (parallel.go) and the
+	// executor's attach* walks (parallel_scan.go), which all refuse the
+	// unmarked kind.
+	PartialUnique bool
+	// Hashed is PG's UNIQUE_PATH_HASH for a unique-ified semijoin RHS
+	// (create_unique_plan's AGG_HASHED Agg, EXPLAIN `HashAggregate` /
+	// `Group Key:`): the input is unsorted and the first row of each key is
+	// kept, the other columns passing through. Those columns are never read
+	// above a semijoin RHS — only the uniq exprs are — so which duplicate
+	// survives is immaterial (M0146-0005dk).
+	Hashed bool
 }
 
 func (n *DistinctOn) Pos() int       { return n.pos }
@@ -3029,6 +3486,9 @@ func (n *DistinctOn) Output() Schema { return n.schema }
 // iteration step (UNION semantics); iteration stops when the new
 // working set contains no rows not already in the output.
 type RecursiveUnion struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos       int
 	Anchor    Node
 	Recursive Node
@@ -3043,6 +3503,9 @@ func (n *RecursiveUnion) Output() Schema { return n.schema }
 // during fixpoint iteration. Only valid inside a RecursiveUnion's
 // Recursive subtree.
 type WorkTableScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	pos    int
 	schema Schema
 }
@@ -3063,6 +3526,14 @@ type BitmapIndexScan struct {
 	Index *catalog.Index
 	Key   Expr   // single-column equality (non-nil for equality scan)
 	Keys  []Expr // multi-column equality (Keys[i] binds Index.Columns[i])
+	// LowKey / HighKey are VALUE bounds on the LEADING index column, with
+	// the original strictness in LowOp / HighOp — IndexScan's range fields,
+	// probed through the same bound computation (M0146-0061). Never set
+	// together with Key / Keys.
+	LowKey  Expr
+	HighKey Expr
+	LowOp   parser.OpCode
+	HighOp  parser.OpCode
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr
@@ -3076,8 +3547,15 @@ func (n *BitmapIndexScan) Output() Schema { return n.schema }
 // (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
 // (M0128-P2.3: P2.2 design doc §3.2)
 type BitmapHeapScan struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
+	// searchedTree: a restriction probe whose index quals were the leaf's
+	// whole Filter leaves a bare bitmap scan at a one-relation search root
+	// (M0146-0012; see *SeqScan above, searchedtree.go).
+	searchedTree
 	pos   int
 	Table *catalog.Table
 	Alias string

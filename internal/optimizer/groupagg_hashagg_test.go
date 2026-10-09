@@ -84,10 +84,11 @@ func TestEnableHashAggSkipsAlreadySorted(t *testing.T) {
 	assertSortKeys(t, a, []string{"ten", "two"})
 }
 
-// TestEnableHashAggSkipsGroupingSets: GROUPING SETS always hash in goopg's
-// executor (one hash table per set) and PG's cost_agg has no SORTED arm for
-// them, so the rule must leave the node Hashed with no Sort child even with
-// the GUC off.
+// TestEnableHashAggSkipsGroupingSets: with enable_hashagg off, two disjoint
+// grouping sets are two rollups computed by AGG_SORTED — the first over the
+// input sorted on `ten`, the second over its own sort on `two` — as PG 18.3
+// plans them (`GroupAggregate / Group Key: ten / Sort Key: two / Group Key:
+// two` over `Sort Key: ten`). Before M0146-0020b goopg always hashed them.
 func TestEnableHashAggSkipsGroupingSets(t *testing.T) {
 	cat := presortedAggCatalog(t)
 	stmt := parseOne(t, "select sum(unique1) from tenk1 group by grouping sets ((ten), (two))")
@@ -96,12 +97,13 @@ func TestEnableHashAggSkipsGroupingSets(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := presortedAggPlan(t, node)
-	if a.Strategy != AggStrategyHashed {
-		t.Fatalf("Strategy = %d, want AggStrategyHashed (grouping sets always hash)", a.Strategy)
+	if a.Strategy != AggStrategySorted {
+		t.Fatalf("Strategy = %d, want AggStrategySorted (two sorted rollups)", a.Strategy)
 	}
-	if _, ok := a.Child.(*Sort); ok {
-		t.Fatalf("rule fired on grouping sets: Aggregate.Child is *Sort")
+	if len(a.Rollups) != 2 {
+		t.Fatalf("Rollups = %+v, want two", a.Rollups)
 	}
+	assertSortKeys(t, a, []string{"ten"})
 }
 
 // TestEnableHashAggSkipsUngrouped: with no GROUP BY (len(GroupExprs)==0) the

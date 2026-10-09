@@ -128,6 +128,13 @@ func pgGetItemRawAllowDead(p storage.Page, slot uint16) ([]byte, error) {
 	return storage.PageGetItemRawAllowDead(p, pgDataSlot(p, slot))
 }
 
+// pgGetItemRawAllowDeadNoCopy aliases the page (see
+// storage.PageGetItemRawAllowDeadNoCopy): only for comparisons made while the
+// page stays pinned and latched.
+func pgGetItemRawAllowDeadNoCopy(p storage.Page, slot uint16) ([]byte, error) {
+	return storage.PageGetItemRawAllowDeadNoCopy(p, pgDataSlot(p, slot))
+}
+
 func pgItemIsDead(p storage.Page, slot uint16) (bool, error) {
 	return storage.PageItemIsDead(p, pgDataSlot(p, slot))
 }

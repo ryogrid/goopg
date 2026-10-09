@@ -1,0 +1,20 @@
+PG 18.3 (private instrumented build, temp table gd(g int, h int, x int)):
+
+explain (costs off) select g, count(*) from gd group by g having g > 1 and count(*) > 2
+ HashAggregate
+   Group Key: g
+   Filter: (count(*) > 2)
+   ->  Seq Scan on gd
+         Filter: (g > 1)
+
+explain (costs off) select g from gd where h = 1 group by g having g > 1 and random() > 0.5
+ Group
+   Group Key: g
+   Filter: (random() > '0.5'::double precision)
+   ->  Sort
+         Sort Key: g
+         ->  Seq Scan on gd
+               Filter: ((g > 1) AND (h = 1))
+
+select g from gd group by g having x > 1
+ERROR:  column "gd.x" must appear in the GROUP BY clause or be used in an aggregate function

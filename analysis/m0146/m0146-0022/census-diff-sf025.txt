@@ -1,0 +1,28 @@
+24c24
+< Q24 depth=4 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q24 depth=6 [qual-placement] under Gather: PG Nested Loop Inner | goopg Nested Loop Inner
+31c31
+< Q31 depth=1 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q31 MATCH (no structural divergence)
+74c74
+< Q74 depth=2 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q74 MATCH (no structural divergence)
+100,101c100,101
+< FIRST-DIVERGENCE: queries=99 divergent=89 match=10
+< CATEGORY-ROLLUP: sort-strategy=32 qual-placement=14 aggregation-strategy=13 join-method=8 parallelism=7 scan-type=6 join-order=3 parameterisation=3 error=3
+---
+> FIRST-DIVERGENCE: queries=99 divergent=87 match=12
+> CATEGORY-ROLLUP: sort-strategy=32 aggregation-strategy=13 qual-placement=12 join-method=8 parallelism=7 scan-type=6 join-order=3 parameterisation=3 error=3
+107d106
+<     3  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+119a119
+>     2  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+132c132
+<     1  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=4
+---
+>     1  qual-placement   under Gather           PG Nested Loop Inner            goopg Nested Loop Inner            depth=6
+135d134
+<     1  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=1

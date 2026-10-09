@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -124,6 +123,20 @@ type jtPulledBody struct {
 	// NOT arm :836-845). Each child's conjunct has been REMOVED from
 	// `quals`: its semantics now live in the child's own semi/anti link.
 	children []*jtPulledBody
+	// largChildren are nested sublinks pulled out of THIS body's quals
+	// through PG's OTHER insertion point — `&j->larg` under
+	// `available_rels1`, the scope THIS body converted into
+	// (prepjointree.c:749-754 recurses the moved quals with both links).
+	// A nested body whose correlation names only enclosing-scope rels
+	// binds Level-1 there — e.g. `EXISTS (... c ... AND NOT EXISTS
+	// (... a ...))` where `a` belongs to the scope the outer sublink
+	// sat in — and converts as an anti/semi join stacked below this
+	// body's own join. flattenPulledBodies emits them before their
+	// parent carrying the parent's OWN `parent` link (their Level-1
+	// refs name the scope the parent converted into, not the parent's
+	// columns), and classifyPulledQuals widens the parent's sjLeft by
+	// their leaf range.
+	largChildren []*jtPulledBody
 	// srcOffset is added to every SourceTableIdx the body's leaves and
 	// rebased refs carry (M0145-0030). The body's scope numbers its tables
 	// from 1 like the outer query does, so without it a self-correlated
@@ -188,13 +201,22 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	var pu *jtPullup
 	for _, c := range splitAnd(pred) {
+		// M0146-0028f: a conjunct of a pulled-up FROM subquery's WHERE binds
+		// its sublinks against the body's context, whose relations the
+		// statement's own lookup hides (pull_up_simple_subquery runs
+		// pull_up_sublinks on the subquery first). Same coordinates: the
+		// body context is built over this scope's schema.
+		bindCtx := ctx
+		if bc, ok := ctx.pulledQualCtx[c]; ok {
+			bindCtx = bc
+		}
 		// M0145-0003 ANY arm: `x IN (SELECT y FROM …)` is the other half
 		// of PG's pull-up scope (`pull_up_sublinks_qual_recurse` converts
 		// ANY_SUBLINK at prepjointree.c:665 and EXISTS_SUBLINK at :731).
 		// The decline census measured it as 34 of the 45 unpulled sublink
 		// conjuncts on TPC-DS SF0.25 — the dominant miss.
 		if in, okIn := anyPullupConjunct(c); okIn {
-			body, reason, okBody := pullUpAnyBody(in, ctx, cat, ps, 0)
+			body, reason, okBody := pullUpAnyBody(in, bindCtx, cat, ps, 0)
 			if !okBody {
 				notePullupDecline(reason)
 				continue
@@ -222,7 +244,7 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 			}
 			continue
 		}
-		body, reason, ok := pullUpExistsBody(ex, negated, ctx, cat, ps, 0)
+		body, reason, ok := pullUpExistsBody(ex, negated, bindCtx, cat, ps, 0)
 		if !ok {
 			notePullupDecline(reason)
 			continue
@@ -342,6 +364,13 @@ func flattenPulledBodies(bodies []*jtPulledBody, parent *jtPulledBody) []*jtPull
 		pb.parent = parent
 		kids := pb.children
 		pb.children = nil
+		// A body's larg children splice BELOW it against the scope the
+		// body converted into — their Level-1 refs name the parent's own
+		// parent (the enclosing problem for a top-level body), so they
+		// flatten with THIS `parent` link and emit before `pb`. They
+		// are left on `pb.largChildren` afterwards: classifyPulledQuals
+		// needs the list to widen the parent's sjLeft.
+		out = append(out, flattenPulledBodies(pb.largChildren, parent)...)
 		out = append(out, pb)
 		sub := flattenPulledBodies(kids, pb)
 		pb.subtreeLeaves = len(pb.leafScans)
@@ -432,10 +461,21 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		if err != nil {
 			return nil, "where-not-resolvable", false
 		}
+		// M0146-0042: the body WHERE gets the constant folding the
+		// statement's own WHERE gets (planSelect) — PG runs
+		// eval_const_expressions over the sublink before pull-up — so a
+		// `d_moy BETWEEN 3 AND 3+3` bound costs one operator in
+		// order_qual_clauses' sort, as PG's `(d_moy <= 6)` does.
+		if where, err = foldQualConstants(where); err != nil {
+			return nil, "where-not-resolvable", false
+		}
 	}
 	quals := append(splitAnd(where), onQuals...)
-	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
-	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
+	if nestedBodySpansScopes(quals, depth) {
+		return nil, "nested-spans-scopes", false
+	}
+	quals, children, largChildren := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, why, false
 	}
 	if exprListHasVolatileBuiltin(quals, cat) {
@@ -468,6 +508,7 @@ func pullUpExistsBody(ex *ExistsExpr, negated bool, parent *resolveContext, cat 
 		bodyBindings: bodyCtx.bindings,
 		quals:        quals,
 		children:     children,
+		largChildren: largChildren,
 	}, "", true
 }
 
@@ -493,57 +534,27 @@ func bindPulledBodyScope(sub *parser.SelectStmt, parent *resolveContext, cat cat
 	if !ok {
 		return nil, nil, nil, nil, why, false
 	}
+	// M0146-0057: the body's FROM walk may itself pull a subquery up — a
+	// reference to an inlinable CTE reads as a plain relation name to
+	// sublinkBodyIsSimple, and planFromClause then splices its body in
+	// (M0146-0007e). That body's WHERE comes back in pulledQuals, which
+	// planSelect would AND into the scope's WHERE; this splice bypasses
+	// planSelect, so the conjuncts travel with the ON quals or the pulled
+	// body's rows go unfiltered. A pulled qual that is correlated or holds a
+	// sublink was resolved against a scope this splice does not rebuild, so
+	// such a body stays a SubPlan.
+	for _, q := range bodyCtx.pulledQuals {
+		if exprHasOuterRef(q) || exprHasSublinkPlan(q) {
+			return nil, nil, nil, nil, "pulled-from-item-qual", false
+		}
+		onQuals = append(onQuals, q)
+	}
 	widths := make([]int, len(leafScans))
 	for i, l := range leafScans {
 		widths[i] = len(l.Output())
 	}
 	return bodyCtx, leafScans, widths, onQuals, "", true
 }
-
-// pullupCTELeafEnabled gates M0145-0011 scope (c) / E2: admitting a
-// `*CTEScan` leaf into the flat splice `flattenPulledBodyTree` performs,
-// instead of declining the whole body with `body-leaf-(*optimizer.CTEScan)`.
-//
-// Default OFF. It is knob-arm measurement apparatus, not a relaxation:
-// M0145-0011 lands none, and the default arm must stay byte-identical.
-//
-// At landing it was useless on its own and had to be paired with
-// `GOOPG_DERIVED_FIREWALL=off`: a pulled ANY/EXISTS body becomes a
-// JoinSemi/JoinAnti SpecialJoinInfo, and the `outer-over-derived` firewall's
-// jointype switch covered Semi/Anti, so a body admitted here declined one
-// step later at the firewall. M0145-0018 removed that firewall, so the
-// pairing requirement is gone and this flag stands alone.
-//
-// Why a CTE leaf is the interesting case: the baseline census over TPC-DS
-// makes `any-body-leaf-(*optimizer.CTEScan)` the largest non-`(pulled)`
-// decline class (30 fires), and every one of those is an ANY sublink whose
-// body FROM is a WITH reference — a derived input with no catalog statistics,
-// which is exactly the population M0145-0011 exists to re-measure rather than
-// argue about.
-//
-// MEASURED RESULT, and it is the reason this flag must not be read as a
-// relaxation that works (E2, loop 41, TPC-DS SF0.25, both flags on):
-//
-//	pull-up census   any-body-leaf-(*optimizer.CTEScan) 30 -> 0, (pulled) 42 -> 72
-//	seam census      leaf-count -> pulled-leaf-not-scan, same statements
-//
-// Every body this gate admits is declined ONE STEP LATER by the seam's own
-// leaf-kind check (`pulled-leaf-not-scan`, joinsearchseam.go), whose comment
-// names THIS function as its guarantor. The bare-`*SeqScan` rule is a
-// TWO-SITE invariant — a producer and a consumer — so relaxing it here alone
-// cannot put a CTE leaf into the DP. What it does instead is let `pulled`
-// suppress the legacy pre-DP arm while the seam still declines, which is the
-// exact shape that cost TPC-H Q4 a 10x regression; Q14/Q23/Q95 moved plans
-// for that reason and not because the search found anything (values
-// byte-identical, runtimes flat-to-slightly-worse at 13.1->14.5 s,
-// 15.0->15.5 s, 3.0->3.2 s, against ESTIMATED costs that fell 1.4x-2.4x).
-//
-// So the resume point for scope (c) is the seam, not this line: the pulled
-// leaf binding at joinsearchseam.go needs a `rangeBinding` for a leaf with no
-// `Table`/`Alias`, plus an `estimateBaseRelInfo`/`applyRelSizeFallback` arm
-// for a statistics-less leaf. That is a real piece of work, not a gate flip —
-// filed as M0145-0013 (owner directive 2026-09-21).
-var pullupCTELeafEnabled = os.Getenv("GOOPG_PULLUP_CTE_LEAF") == "on"
 
 // flattenPulledBodyTree decomposes the body's provisional jointree into
 // its leaf scans plus the conjuncts of its inner-join ON clauses. Any
@@ -584,10 +595,13 @@ func flattenPulledBodyTree(node Node, wantLeaves int) ([]Node, []Expr, string, b
 		if _, isScan := l.(*SeqScan); isScan {
 			continue
 		}
-		if pullupCTELeafEnabled {
-			if _, isCTE := l.(*CTEScan); isCTE {
-				continue
-			}
+		// A `*CTEScan` is a base rel of the pulled jointree, as PG's CTE
+		// RTE is: `seamLeafBinding` admits it and prices it from its body
+		// (M0145-0013). M0145-0011 scope (c) measured it behind a default-off
+		// knob; M0145-0008ac promoted it once the parameterised inner it
+		// needs through a join existed (M0146-0049d).
+		if _, isCTE := l.(*CTEScan); isCTE {
+			continue
 		}
 		// The leaf kind is named because it decides the remedy: a
 		// *Filter over a scan needs unwrapping, a derived item needs
@@ -760,6 +774,21 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 				return false
 			}
 			leftBits |= leafRangeRelSet(ab, ab+an)
+		}
+		// A larg child splices below this body in ITS larg subtree — its
+		// leaves join this body's syn_lefthand (prepjointree.c:749-754:
+		// the jtlink1 insert takes the current spine as its own larg,
+		// so the new join's syn left scope includes everything already
+		// stacked there). Larg children emit before their parent in flat
+		// order, so their slots are already numbered; subtreeLeaves
+		// covers their own descendants the way sjRhs does.
+		for _, lc := range pb.largChildren {
+			lb, okA := bodyBase[lc]
+			if !okA {
+				notePullupClassify("larg-child-not-numbered")
+				return false
+			}
+			leftBits |= leafRangeRelSet(lb, lb+lc.subtreeLeaves)
 		}
 		var spanning []Expr
 		for _, q := range pb.quals {
@@ -951,19 +980,16 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 	// qual fail with `rebase-failed` one step after `bodyQualsAdmitSublinks`
 	// let it through — a decline that merely moved.
 	//
-	// `scopeSignal` reports the crossing and does not descend, which is the
-	// correct treatment: the subplan's own refs live in the subplan's scope
-	// and are not the body-local coordinates this rebase re-stamps. The one
-	// case that would be wrong is a subplan CORRELATED to the body, whose
-	// outer refs do point at coordinates moving underneath it — OnScope
-	// declines those rather than guessing.
+	// `scopeSignal` reports the crossing and does not descend. The subplan's
+	// own refs are not body-local coordinates — this rewrite does not
+	// re-stamp them — but a kept sublink CORRELATED to the body (or beyond)
+	// does point at coordinates moving underneath it, and M0146-0015c's
+	// post-pass (`rebaseQualKeptSubplans`, below) re-bases exactly those:
+	// the kept plan is cloned and its escaping refs become pre-lowered
+	// PARAM_EXEC args in problem space. An excluded eval-site sublink still
+	// cannot ride — that refusal moved into the post-pass, which checks it
+	// per sublink instead of declining on the first plan boundary crossed.
 	out, ok := cloneExprRefs(q, scopeSignal, exprRewriter{
-		OnScope: func(n Node) {
-			if planHasOuterRef(n) {
-				noteRebaseFail("subplan-correlated")
-				failed = true
-			}
-		},
 		OnUnknown: func(x Expr) {
 			// M0145-0014: name the node the rewrite aborted on. Without it
 			// `rebase-failed` is one string for three different causes and
@@ -991,8 +1017,10 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 				// emitting scope, which is what Level 1 always meant for a
 				// top-level body.
 				anc := pb
-				for i := 0; i < r.Level && anc != nil; i++ {
+				hops := 0
+				for hops < r.Level && anc != nil {
 					anc = anc.parent
+					hops++
 				}
 				if anc != nil {
 					base, okBase := bodyBase(anc)
@@ -1011,8 +1039,34 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 						Name: r.Name, Type: r.Type, SourceTableIdx: src,
 					}
 				}
-				if r.Level > 1 {
-					r.Level--
+				// Off the top after `hops` steps: the emitting scope sits
+				// one hop above the topmost body, i.e. `hops` hops from pb
+				// (M0146-0015a). Whatever remains points above the
+				// emitting statement and stays an outer reference, re-
+				// levelled relative to it. Decrementing by ONE, as this
+				// did, is right only for a top-level body (hops == 1): a
+				// nested body's grandparent reference (Level 2 from a
+				// depth-1 body) stayed `OuterColumnRef{Level:1}` instead of
+				// becoming an emitting-scope column — invisible while the
+				// qual stayed in the join residual (the statement fell back
+				// to SubPlans), an "out of range (depth=0)" execution error
+				// once it reached a leaf.
+				if rem := r.Level - hops; rem > 0 {
+					r.Level = rem
+					return x
+				}
+				// A NESTED body (hops > 1) reading the emitting scope makes
+				// the qual a join clause between an emitting rel and a rel
+				// inside the parent body's semi/anti RHS. PG plans that (the
+				// clause joins across the nested semi join), but goopg's
+				// search cannot place it — createPlan panics re-basing it
+				// ("join clause references binding column … not among the
+				// output columns"). Decline, so the statement keeps the
+				// SubPlans it always got for this shape (ledgered as
+				// M0146-0015c).
+				if hops > 1 {
+					noteRebaseFail("nested-body-emitting-ref")
+					failed = true
 					return x
 				}
 				if r.Index < 0 || r.Index >= emittingTotal {
@@ -1037,6 +1091,20 @@ func rebasePulledQual(q Expr, pb *jtPulledBody, pullSpans []leafSpan, emittingTo
 		}
 		return nil, false
 	}
+	// M0146-0015c slice 2: re-base every kept sublink's plan the clone
+	// carries. An escaping OuterColumnRef inside it points at coordinates
+	// this qual just vacated; the post-pass turns each into a pre-lowered
+	// PARAM_EXEC arg in problem space (renumbered by lowerSubPlanParams),
+	// or declines — leaving the statement the SubPlans it always had.
+	if !rebaseQualKeptSubplans(out, pb, pullSpans, emittingTotal, ctx, allSpans, bodyBase) {
+		return nil, false
+	}
+	// M0146-0015c slice 3: PG's convert_EXISTS_to_ANY — a kept EXISTS
+	// whose escaping refs all pair as `innercol = sentinel` conjuncts
+	// becomes a hashed ANY over the inner columns (its ParParam/Args
+	// binding dissolves into the operand). Fail-open: an unconvertible
+	// EXISTS keeps the pre-lowered SubPlan form.
+	out = keptExistsToAnyQual(out)
 	return out, true
 }
 
@@ -1089,6 +1157,27 @@ func exprHasOuterRefAtLevel(e Expr, level int) bool {
 	return found || !ok
 }
 
+// nestedBodySpansScopes is convert_EXISTS_sublink_to_join's
+// `bms_is_subset(upper_varnos, available_rels)` test (subselect.c) for a
+// NESTED sublink (depth > 0): pull_up_sublinks_qual_recurse offers the
+// sublink either the rels above its parent body (available_rels1) or the
+// parent body's own rels (child_rels), never both. A body whose quals read
+// the parent body (Level 1) AND a scope above it (Level >= 2) fits neither,
+// so PG keeps it as a SubPlan — `a … EXISTS (b … EXISTS (c WHERE c.x = a.y
+// AND c.z = b.w))` plans as a semi join a ⋈ b with the inner EXISTS in its
+// Join Filter. M0146-0015c.
+func nestedBodySpansScopes(quals []Expr, depth int) bool {
+	if depth == 0 || !exprListHasOuterRefAtLevel(quals, 1) {
+		return false
+	}
+	for level := 2; level <= maxPulledSublinkDepth+1; level++ {
+		if exprListHasOuterRefAtLevel(quals, level) {
+			return true
+		}
+	}
+	return false
+}
+
 // exprListHasOuterRefAtLevel is exprHasOuterRefAtLevel over a slice.
 func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 	for _, e := range es {
@@ -1114,41 +1203,71 @@ func exprListHasOuterRefAtLevel(es []Expr, level int) bool {
 // that is not itself convertible simply stays a SubPlan inside the pulled-up
 // qual; it never blocks the outer conversion.
 //
-// So the population splits in two, and this function admits only the half that
-// needs no new machinery:
+// So the population splits by what the sublink needs:
 //
 //   - a NON-convertible sublink (a scalar/EXPR subquery) rides along as an
 //     ordinary body-local qual, exactly as it does in PG. TPC-DS Q58's
 //     `d_date IN (SELECT d_date … WHERE d_week_seq = (SELECT …))` is this
 //     shape: a one-leaf body whose single qual holds an uncorrelated scalar
 //     subplan.
-//   - a CONVERTIBLE nested ANY/EXISTS is still declined, because converting it
-//     is the recursion M0145-0014 is named for and that needs the nested
-//     body's leaves spliced and its link predicate rebased against the OUTER
-//     body's leaves rather than against the emitting rels. TPC-DS Q83's
+//   - a CONVERTIBLE nested ANY/EXISTS that failed its own conversion is
+//     admitted the same way since M0146-0015c slice 2: kept as a SubPlan in
+//     the pulled qual — what PG does — with its escaping correlation
+//     re-based into the qual's problem space (see the list form below for
+//     the per-sublink gates). Converting it outright is the recursion
+//     M0145-0014 is named for: that needs the nested body's leaves spliced
+//     and its link predicate rebased against the OUTER body's leaves rather
+//     than against the emitting rels. TPC-DS Q83's
 //     `d_date IN (SELECT d_date … WHERE d_week_seq IN (SELECT …))` is this
-//     shape.
-//
-// A body qual that carries BOTH a sublink and a Level-1 outer reference is
-// declined too: the correlation rebase that `rebasePulledQual` performs on the
-// way out is not defined over a subplan's own scope, and guessing there is how
-// a pull-up reads the wrong column.
-func bodyQualsAdmitSublinks(where Expr, onQuals []Expr) (string, bool) {
-	return bodyQualsAdmitSublinkList(append(splitAnd(where), onQuals...))
+//     shape — extractNestedPullups declines it first, and the kept-subplan
+//     path then carries it.
+func bodyQualsAdmitSublinks(where Expr, onQuals []Expr, depth int, cat catalog.Catalog) (string, bool) {
+	return bodyQualsAdmitSublinkList(append(splitAnd(where), onQuals...), depth, cat)
 }
 
 // bodyQualsAdmitSublinkList is the split-conjunct form, which is what both
 // arms hold once `extractNestedPullups` has rewritten the list.
-func bodyQualsAdmitSublinkList(quals []Expr) (string, bool) {
+//
+// M0146-0015c slice 2 widened what may ride: a kept SubPlan inside a pulled
+// qual is PG's shape (`pull_up_sublinks_qual_recurse` converts the OUTER
+// sublink first and leaves an un-convertible nested one in the pulled-up
+// qual — the `Hash Semi Join … Join Filter: EXISTS` plan the oracle emits
+// for `a … EXISTS (b … EXISTS (c WHERE c.x = a.y AND c.z = b.w))`). What is
+// new is that the kept plan's correlation can be re-based now: the qual-level
+// rebase clones the kept plan and rewrites its escaping OuterColumnRefs to
+// pre-lowered PARAM_EXEC slots whose Args are problem-space exprs
+// (pulledsublink.go). Admission is therefore per sublink, not per qual:
+//
+//   - a LOWERABLE sublink (scalar subquery, EXISTS, scalar-IN with a plan)
+//     must pass keptSubplanAdmissible — cloneable, no LATERAL inside, no
+//     volatile work inside, and every escaping ref landing on the body, a
+//     pulled ancestor, or the emitting scope;
+//   - an EXCLUDED eval-site kind (row-ctor IN, ARRAY subquery, multi-assign)
+//     cannot be re-based at all — it rides only while uncorrelated, exactly
+//     as before (the rebase's excluded check keeps refusing it otherwise).
+func bodyQualsAdmitSublinkList(quals []Expr, depth int, cat catalog.Catalog) (string, bool) {
 	for _, q := range quals {
 		if !exprHasSublinkPlan(q) {
 			continue
 		}
-		if exprHasConvertibleSublink(q) {
-			return "nested-sublink-convertible", false
-		}
-		if exprHasOuterRefAtLevel(q, 1) {
-			return "nested-sublink-correlated", false
+		why := ""
+		walkExprRefs(q, scopeIgnore, exprVisitor{
+			Visit: func(x Expr) bool {
+				if len(ExprSubplans(x)) == 0 {
+					return true
+				}
+				if handleFor(x) == nil {
+					return true // excluded kind — the rebase decides
+				}
+				if w, ok := keptSubplanAdmissible(x, depth, cat); !ok {
+					why = w
+					return false
+				}
+				return true
+			},
+		})
+		if why != "" {
+			return why, false
 		}
 	}
 	return "", true
@@ -1160,14 +1279,38 @@ func bodyQualsAdmitSublinkList(quals []Expr) (string, bool) {
 // from the parent's qual list, because its semantics now live in the child's
 // own semi/anti link. PG does this at prepjointree.c:682-693 (ANY), :736-747
 // (EXISTS) and :836-845 (the NOT arm).
-func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) ([]Expr, []*jtPulledBody) {
+func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Catalog, ps PlannerSettings, depth int) ([]Expr, []*jtPulledBody, []*jtPulledBody) {
 	if depth+1 >= maxPulledSublinkDepth {
-		return quals, nil
+		return quals, nil, nil
 	}
 	var kept []Expr
 	var children []*jtPulledBody
+	var largChildren []*jtPulledBody
+	// PG's recursion on a converted EXISTS's quals tries jtlink1 —
+	// `&j->larg` under `available_rels1`, the scope THIS body converted
+	// into — before jtlink2 — `&j->rarg` under `child_rels`, this
+	// body's own rels (prepjointree.c:749-754). Binding the nested body
+	// against `bodyCtx.parent` IS the available-rels test: a reference
+	// to this body's own rels cannot resolve there (the arm declines),
+	// while a reference to the enclosing scope lands as a Level-1
+	// correlation — exactly the semi/anti link the j->larg insert
+	// needs. Bounded to depth-1 children: deeper larg bindings name a
+	// pulled body's own scope rather than the emitting problem, and
+	// stay declined (M0146-0015b ledger).
+	largCtx := bodyCtx.parent
+	allowLarg := depth == 0 && largCtx != nil
 	for _, q := range quals {
 		if in, okIn := anyPullupConjunct(q); okIn {
+			// No larg arm for ANY: the operand was bound against THIS
+			// body's scope before the pull runs, and outerOperandAsLevel1
+			// re-expresses its ColumnRefs as name-based Level-1 refs —
+			// under the enclosing scope a same-named binding of a
+			// different RTE can steal the name (TPC-DS Q83's
+			// `d_week_seq IN ...` rebound onto the outer query's own
+			// date_dim leaf and panicked in translateToLayout). PG's
+			// IncrementVarSublevelsUp re-levels by varno and cannot
+			// misresolve; an EXISTS has no operand, so only its arm is
+			// safe to bind against largCtx.
 			if child, _, ok := pullUpAnyBody(in, bodyCtx, cat, ps, depth+1); ok {
 				children = append(children, child)
 				continue
@@ -1176,6 +1319,12 @@ func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Cat
 			continue
 		}
 		if ex, negated, okEx := existsPullupConjunct(q); okEx && ex.Subquery != nil {
+			if allowLarg {
+				if child, _, ok := pullUpExistsBody(ex, negated, largCtx, cat, ps, depth+1); ok {
+					largChildren = append(largChildren, child)
+					continue
+				}
+			}
 			if child, _, ok := pullUpExistsBody(ex, negated, bodyCtx, cat, ps, depth+1); ok {
 				children = append(children, child)
 				continue
@@ -1183,7 +1332,7 @@ func extractNestedPullups(quals []Expr, bodyCtx *resolveContext, cat catalog.Cat
 		}
 		kept = append(kept, q)
 	}
-	return kept, children
+	return kept, children, largChildren
 }
 
 // exprHasConvertibleSublink reports whether e carries a sublink of a kind
@@ -1258,7 +1407,9 @@ var pullupVolatileBuiltins = map[string]bool{
 }
 
 // exprListHasVolatileBuiltin reports whether any expression in es calls
-// a volatile builtin or a volatile registered routine — the planner-side
+// a volatile builtin (pullupVolatileBuiltins, or any name PG 18.3's
+// pg_proc.dat marks provolatile 'v' — catalog.BuiltinProcIsVolatile,
+// M0146-0007h) or a volatile registered routine — the planner-side
 // half of `contain_volatile_functions` for the pull-up gate. Registry
 // volatility uses the same fields subPlanExprVolatile reads
 // (Volatile == "v", or "" which PG treats as VOLATILE); a catalog
@@ -1272,7 +1423,7 @@ func exprListHasVolatileBuiltin(es []Expr, cat catalog.Catalog) bool {
 				return
 			}
 			name := strings.ToLower(f.Name)
-			if pullupVolatileBuiltins[name] {
+			if pullupVolatileBuiltins[name] || catalog.BuiltinProcIsVolatile(name) {
 				volatile = true
 				return
 			}
@@ -1414,10 +1565,17 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		if err != nil {
 			return nil, "any-where-not-resolvable", false
 		}
+		// M0146-0042: constant folding, as the EXISTS arm above.
+		if where, err = foldQualConstants(where); err != nil {
+			return nil, "any-where-not-resolvable", false
+		}
 	}
 	quals := append(splitAnd(where), onQuals...)
-	quals, children := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
-	if why, ok := bodyQualsAdmitSublinkList(quals); !ok {
+	if nestedBodySpansScopes(quals, depth) {
+		return nil, "nested-spans-scopes", false
+	}
+	quals, children, largChildren := extractNestedPullups(quals, bodyCtx, cat, ps, depth)
+	if why, ok := bodyQualsAdmitSublinkList(quals, depth, cat); !ok {
 		return nil, "any-" + why, false
 	}
 	if exprListHasVolatileBuiltin(quals, cat) {
@@ -1441,6 +1599,7 @@ func pullUpAnyBody(in *InExpr, parent *resolveContext, cat catalog.Catalog, ps P
 		bodyBindings: bodyCtx.bindings,
 		quals:        append([]Expr{link}, quals...),
 		children:     children,
+		largChildren: largChildren,
 	}, "", true
 }
 
@@ -1474,7 +1633,14 @@ func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalo
 	wrap := &parser.SelectStmt{FromExprs: []parser.FromExpr{{
 		Base: parser.RangeVar{Subquery: in.Subquery, Alias: anyDerivedAlias},
 	}}}
-	node, bodyCtx, err := planFromClause(wrap, cat, ps, parent.rtScope)
+	// M0146-0058: the wrap is planned WITHOUT the FROM-subquery pull-up.
+	// The leaf must be the body's whole plan — PG's subquery RTE. Through
+	// planFromClause, M0146-0028's pull-up flattened a body
+	// simpleDerivedPullupBody admits (`SELECT upper(a) FROM t WHERE a <> 'x'`
+	// is non-simple only to sublinkBodyIsSimple), leaving the body's bare
+	// scan as the leaf: its WHERE and target were lost and the link bound the
+	// raw column, a wrong answer.
+	node, bodyCtx, _, err := planFromClauseItems(wrap, wrap.FromExprs, nil, nil, cat, ps, parent.rtScope)
 	if err != nil || bodyCtx == nil || len(bodyCtx.bindings) != 1 {
 		return nil, "any-derived-not-plannable", false
 	}

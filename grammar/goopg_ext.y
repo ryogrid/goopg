@@ -1265,14 +1265,17 @@ alter_table_stmt:
 				st.Actions = acts
 				$$ = st
 			}
-	/* ENABLE / DISABLE [ALWAYS|REPLICA] TRIGGER — legacy records only a
-	   statement-level flag, with no action and no trigger name. */
+	/* ENABLE / DISABLE [ALWAYS|REPLICA] TRIGGER {name | ALL | USER}
+	   (gram.y alter_table_cmd AT_EnableTrig* / AT_DisableTrig*).
+	   trigger_toggle is {fire mode, target kind, trigger name}. M0146-0082. */
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star trigger_toggle
 			{
 				st := NewAlterTableStmt(0, objectNameFromQn($5))
 				st.IfExists = $3
 				st.Only = $4
 				st.EnableDisableTrigger = true
+				tt := $7
+				st.TriggerFireMode, st.TriggerTargetKind, st.TriggerName = tt[0], tt[1], tt[2]
 				$$ = st
 			}
 	| ALTER TABLE opt_if_exists_drop opt_ONLY_kw qualified_name opt_inh_star OWNER TO ColId
@@ -1857,18 +1860,20 @@ opt_inh_star:
 	| '*'             { _ = 0 }
 
 trigger_toggle:
-		ENABLE_P opt_trigger_mode TRIGGER trigger_target       { _ = 0 }
-	| DISABLE_P TRIGGER trigger_target                        { _ = 0 }
+		ENABLE_P opt_trigger_mode TRIGGER trigger_target       { $$ = []string{$2, $4[0], $4[1]} }
+	| DISABLE_P TRIGGER trigger_target                        { $$ = []string{"D", $3[0], $3[1]} }
 
+/* pg_trigger.tgenabled codes (trigger.h TRIGGER_FIRES_*): O = on origin
+   and local, A = always, R = on replica. */
 opt_trigger_mode:
-		/* empty */   { _ = 0 }
-	| ALWAYS          { _ = 0 }
-	| REPLICA         { _ = 0 }
+		/* empty */   { $$ = "O" }
+	| ALWAYS          { $$ = "A" }
+	| REPLICA         { $$ = "R" }
 
 trigger_target:
-		ColId         { _ = 0 }
-	| ALL             { _ = 0 }
-	| USER            { _ = 0 }
+		ColId         { $$ = []string{"name", $1} }
+	| ALL             { $$ = []string{"all", ""} }
+	| USER            { $$ = []string{"user", ""} }
 
 /* Identity tweaks that may follow SET GENERATED, and a bare RESTART. */
 /* relrewrite state codes, as pg_rewrite stores them. */
@@ -2662,7 +2667,10 @@ merge_action:
 	   whenever VALUES is followed by '(' (base_yylex.go), so the plain token
 	   never reaches this position. `DEFAULT VALUES` below keeps plain VALUES
 	   because no paren follows it. */
-	| INSERT merge_ins_cols VALUES_LA '(' expr_list ')'
+	/* values_item_list, as INSERT's VALUES rows: an element may be the
+	   DEFAULT placeholder (gram.y merge_values_clause takes expr_list, whose
+	   a_expr includes DEFAULT as SetToDefault). M0146-0075. */
+	| INSERT merge_ins_cols VALUES_LA '(' values_item_list ')'
 			{ $$ = &mergeAction{kind: MergeActionInsert, cols: $2, vals: $5} }
 	/* DEFAULT VALUES leaves InsertValues nil, which is how the executor tells
 	   the two apart. */

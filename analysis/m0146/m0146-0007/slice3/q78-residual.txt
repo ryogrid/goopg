@@ -1,0 +1,11 @@
+== baseline
+                                       Filter: (d_year = 1998)
+                     ->  Subquery Scan on ws
+                           Filter: (ws_sold_year = 1998)
+                                             ->  Index Scan using date_dim_pkey on date_dim
+                                 Filter: (d_year = 1998)
+== candidate
+                                       Filter: (d_year = 1998)
+                                       ->  Index Scan using date_dim_pkey on date_dim
+                                             Filter: (d_year = 1998)
+                                 Filter: (d_year = 1998)

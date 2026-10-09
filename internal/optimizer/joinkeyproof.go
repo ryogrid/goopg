@@ -171,6 +171,8 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 		return resolveBaseColumn(idx, x.Child)
 	case *Sort:
 		return resolveBaseColumn(idx, x.Child)
+	case *IncrementalSort:
+		return resolveBaseColumn(idx, x.Child)
 
 	// M0125-0038 (C5): a join input is routinely Project-wrapped, and this
 	// lookup returning nothing through the wrapper is what made every such
@@ -206,6 +208,14 @@ func resolveBaseColumn(idx int, child Node) (baseColumnRef, bool) {
 	case *CTEScan:
 		// The scan's schema is the body's output schema, position for
 		// position.
+		return resolveBaseColumn(idx, x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: same position-for-position contract — the
+		// wrapper's schema is the subplan's output, alias-renamed.
+		return resolveBaseColumn(idx, x.Child)
+	case *Materialize:
+		// M0146-0010: same pass-through — buffering changes neither the
+		// child's row shape nor the values in a tuple.
 		return resolveBaseColumn(idx, x.Child)
 
 	// M0127-P5.6-e-iii added this arm to the ndistinct lookup (P5.6-e-ii to
@@ -416,6 +426,14 @@ func resolvesToGroupUniqueColumn(idx int, child Node) bool {
 	case *GatherMerge:
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	case *CTEScan:
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: same contract as CTEScan — a coordinate crossing
+		// the label must cross here exactly as it does in
+		// resolveBaseColumn, or the pair describe different columns.
+		return resolvesToGroupUniqueColumn(idx, x.Child)
+	case *Materialize:
+		// M0146-0010: transparent — same contract.
 		return resolvesToGroupUniqueColumn(idx, x.Child)
 	// The `*WindowAgg` twin of `resolveBaseColumn`'s arm. This function's own
 	// contract says the two walkers must agree about which node a coordinate

@@ -106,7 +106,14 @@ func TestAddOneBitmapPath_SkipsUniqueSingleRow(t *testing.T) {
 	}
 }
 
-func TestBuildOneBitmapPath_ResolvesPartialIndexPredicate(t *testing.T) {
+// TestBuildOneBitmapPath_PartialIndexNeedsProvenPredicate pins M0145-0008r.
+// A partial index has no entry for a row its predicate excludes, so scanning it
+// for a query that does not imply the predicate silently drops rows — no heap
+// recheck can restore a row the bitmap never produced (regress `portals_p2`:
+// `onek2 WHERE unique1 = 50` over a partial index returned 0 rows). PG builds
+// the path only when `check_index_predicates` proves the predicate (`predOK`);
+// the bitmap arm must decline an unproven one and keep building a proven one.
+func TestBuildOneBitmapPath_PartialIndexNeedsProvenPredicate(t *testing.T) {
 	_, tbl, idx := testCatWithIdx(t)
 	idx.HasPredicate = true
 	idx.Predicate = &parser.BinaryOp{
@@ -123,29 +130,34 @@ func TestBuildOneBitmapPath_ResolvesPartialIndexPredicate(t *testing.T) {
 		T = 1
 	}
 
-	// S5.4: partial indexes are no longer declined for bitmap scans.
-	// The predicate is resolved and stored on the path for recheck.
-	p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), 0, rel.baseLeaf)
+	// Unproven: the bare leaf carries no restriction at all.
+	if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), 0, rel.baseLeaf); p != nil {
+		t.Fatal("an unproven partial index produced a bitmap path; it would drop the rows its predicate excludes")
+	}
+	// Unproven: a restriction on the index column that does not imply `a > 0`.
+	other := &Filter{Child: rel.baseLeaf, Predicate: &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}},
+		Right: &IntegerConst{Value: -5}}}
+	if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), 0, other); p != nil {
+		t.Fatal("`a = -5` does not imply `a > 0`, yet the partial index was used")
+	}
+
+	// Proven: the query's own restriction is the index predicate.
+	proven := &Filter{Child: rel.baseLeaf, Predicate: &BinaryOp{Op: parser.OpGt,
+		Left:  &ColumnRef{Index: 0, Name: "a", Type: catalog.Type{Name: "int4"}},
+		Right: &IntegerConst{Value: 0}}}
+	p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, s.totalTablePages(), 0, proven)
 	if p == nil {
-		t.Fatal("buildOneBitmapPath should build a path for partial index (predicate recheck covers correctness)")
+		t.Fatal("a partial index whose predicate the query proves must still get a bitmap path")
 	}
 	if p.Kind != PathBitmapHeapScan {
 		t.Fatalf("expected PathBitmapHeapScan, got kind=%d", p.Kind)
 	}
-	if len(p.Children) != 1 {
-		t.Fatalf("expected 1 child, got %d", len(p.Children))
+	if len(p.Children) != 1 || p.Children[0].Kind != PathBitmapIndexScan {
+		t.Fatalf("expected one PathBitmapIndexScan child, got %+v", p.Children)
 	}
-	idxPath := p.Children[0]
-	if idxPath.Kind != PathBitmapIndexScan {
-		t.Fatalf("expected child PathBitmapIndexScan, got kind=%d", idxPath.Kind)
-	}
-	if idxPath.PartialPredicate == nil {
-		t.Error("partial index predicate should be resolved and stored on the bitmap index path")
-	}
-	// Also verify the bitmap heap scan itself doesn't carry the predicate
-	// (it's on the child index scan path).
-	if p.PartialPredicate != nil {
-		t.Error("PartialPredicate should be nil on the heap scan path (only on index scan leaves)")
+	if p.Children[0].PartialPredicate == nil {
+		t.Error("the resolved predicate should be stored on the bitmap index path")
 	}
 }
 

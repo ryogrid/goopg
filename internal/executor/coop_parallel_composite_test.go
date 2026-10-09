@@ -47,6 +47,11 @@ func pqCompositeFixture(t *testing.T) (*Context, func()) {
 			fail(err, "insert fact")
 		}
 	}
+	// What ANALYZE would record (M0146-0005c): an unmeasured join key is
+	// priced at PG's default 0.1 hash bucket and the composite build is not
+	// planned.
+	setFixtureStats(t, ctx, "pc_dim", 40, map[string]int64{"k1": 5, "k2": 8})
+	setFixtureStats(t, ctx, "pc_fact", 400, map[string]int64{"fid": 400, "k1": 10, "k2": 8})
 	return ctx, cleanup
 }
 

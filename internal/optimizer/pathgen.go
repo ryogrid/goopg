@@ -31,7 +31,7 @@ package optimizer
 import "github.com/goopg/goopg/internal/parser"
 
 func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOps, parallelWorkers int, leaderParticipates bool) {
-	seqCost := costSeqscan(cp, relPages, rel.Rows, numQualOps)
+	seqCost := costSeqscan(cp, relPages, rel.Rows, float64(numQualOps))
 	// B-17d: `cost_seqscan`'s own flag (costsize.c:295). The producer always
 	// runs; a disabled seqscan is counted, not skipped.
 	seqDisabled := disabledNodesFor(!cp.enableSeqScan)
@@ -57,7 +57,7 @@ func generateScanPaths(rel *RelOptInfo, cp costParams, relPages int64, numQualOp
 		// stamped here, AFTER the serial path, whose parallel_safe stays
 		// whatever the rel said before.
 		rel.ConsiderParallel = true
-		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, numQualOps, parallelWorkers)
+		addPartialSeqScanPath(rel, cp, relPages, rel.Rows, float64(numQualOps), parallelWorkers)
 	}
 }
 
@@ -100,10 +100,12 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
 	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
 	cost := hashJoinCost(cp, hashJoinInputs{
-		outer: p.Cost, inner: b.Cost,
+		qualPerTuple: joinQualPerTuple(cp, residual),
+		outer:        p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
 		outputRows:      joinRel.Rows,
 		numHashClauses:  len(keys),
+		hashQualCost:    hashClausesPerTuple(cp, keys),
 		innerBucketSize: innerBucketSize,
 		final:           final,
 		outerWidth:      pathWidth(p),
@@ -120,9 +122,9 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	})
 	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
-	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
-	// `hashjointuples`, costsize.c:4432).
-	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
+	// keys: hashJoinCost charges it (qualPerTuple) on `hashjointuples`, the
+	// matched outer rows for an inner-unique join (costsize.c
+	// final_cost_hashjoin, M0146-0012a slice C).
 	addPath(joinRel, &Path{
 		Kind: PathHashJoin,
 		// C-03b: the join this path performs, decided by `addPathsToJoinrel`
@@ -156,11 +158,16 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // which is what makes this path correctly ruinous for two large inputs and the
 // only available path for a cartesian pair.
 //
-// The inner rescan cost is the inner path's own total: no `Material` is
-// interposed, because Material is a plan node placed by `cost_rescan` and is
-// P5.7's (leftdeep-joins 04 §4 / the P4.3 ledger row). Until it lands this
-// over-charges a rescan of a cheap inner, which biases against nested loops —
-// the safe direction.
+// M0146-0010: the inner side is filed TWICE where PG files twice —
+// match_unsorted_outer's bare `inner_cheapest_total` AND the materialised
+// form `create_material_path` builds over it (joinpath.c:1890-1901), the
+// latter gated by `enable_material` and `ExecMaterializesOutput`
+// (materialize.go). The bare candidate pays true re-execution per rescan
+// (cost_rescan's default arm); the matpath pays cost_material once and the
+// T_Material replay per rescan — `addPath` then elects on cost, which is the
+// whole point of pricing both. Before this, `nestLoopInnerRescanCost` fused
+// the materialised price into EVERY inner: PG-shaped by accident of having
+// only one candidate, wrong the moment the election exists.
 //
 // M0142-0008c-3b: `uniq == uniqueSideInner` is PG's separate, narrower
 // `JOIN_UNIQUE_INNER` branch of `match_unsorted_outer` (joinpath.c, design
@@ -174,31 +181,84 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 // domain. A nil substitution declines the whole path, matching
 // `create_unique_path`'s own "can't unique-ify, return NULL" contract.
 func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
-	o, i := outer.CheapestTotal, inner.CheapestTotal
+	i := inner.CheapestTotal
 	if uniq == uniqueSideInner {
+		// JOIN_UNIQUE_INNER substitutes the unique-ified cheapest inner.
 		i = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
 	}
-	if o == nil || i == nil {
+	if i == nil {
 		return
 	}
+	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
+		addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
+	}
+}
+
+// addMaterialNestLoopPath files the nested loop over the materialised
+// cheapest inner — match_unsorted_outer's `matpath` (joinpath.c:1883-1901,
+// built by create_material_path, gated by enable_material and
+// ExecMaterializesOutput in materialInnerPathFor). It is a separate call
+// because PG offers it LAST for each outer path, after the
+// cheapest_parameterized_paths loop that yields the bare inner AND the
+// parameterised index probes (:1924-1971): a probe that ties the matpath
+// within STD_FUZZ_FACTOR is then PG's incumbent, and add_path keeps it
+// (M0146-0005dx1: TPC-DS Q10's customer_address probe ties its
+// Materialize(Seq Scan) at a total near 2.2e7 and, under LIMIT's
+// consider_startup, the tight-fuzz comparison is COSTS_DIFFERENT, so the
+// first-filed path wins). The caller therefore runs it after addNLIPaths.
+// A unique-ified inner gets no Material — the `if` arm PG's matpath
+// `else if` chain excludes.
+func addMaterialNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, quals []*restrictInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
+	if uniq == uniqueSideInner {
+		return
+	}
+	matpath := materialInnerPathFor(inner.CheapestTotal, inner, cp)
+	if matpath == nil {
+		return
+	}
+	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
+		addNestLoopPathFor(joinRel, outer, inner, o, matpath, cp, jt, quals, sjinfo, semi)
+	}
+}
+
+// nestLoopPlainOuters is match_unsorted_outer's outer loop for the plain
+// nested loop (M0146-0005m): every unparameterised outer path, so an ordered
+// non-cheapest outer yields an ordered nested loop. The JOIN_UNIQUE_OUTER
+// case keeps its single cheapest-total outer.
+func nestLoopPlainOuters(outer *RelOptInfo, uniq uniqueSide, cp costParams) []*Path {
+	if uniq == uniqueSideOuter {
+		return []*Path{outer.CheapestTotal}
+	}
+	return nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
+}
+
+// addNestLoopPathFor files the plain nested loop for one (outer, inner) path
+// pair.
+func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costParams, jt parser.JoinType, quals []*restrictInfo, sjinfo *SpecialJoinInfo, semi semiAntiJoinFactors) {
 	// Child-path row counts, per 03 §9 rule 3 (see addHashJoinPath). The cross
 	// product a plain nested loop evaluates its quals on is therefore
 	// `o.Rows * i.Rows`, which for a parameterised inner is the per-outer-row
 	// count — exactly PG's cost_nestloop (costsize.c:3355-3356).
-	// take2 P2-06: goopg's nested loop always materialises its inner, so the
-	// rescan is a cache replay and the build is paid once.
-	matBuild, matRescan := nestLoopInnerRescanCost(i, cp)
+	//
+	// M0146-0010: the rescan is `cost_rescan` of whatever inner THIS candidate
+	// carries (joinpathsmemoize.go): a bare scan re-executes (default arm —
+	// startup re-paid, full total per outer row); a PathMaterial replays the
+	// buffer (T_Material arm — no startup, cpu_operator_cost per tuple). A
+	// PathMaterial's build overhead is inside i.Cost already
+	// (cost_material, materialize.go), so nothing is added here — this is the
+	// separation PG draws between inner_path->total_cost (one scan + fill)
+	// and rescan cost (replays 2..N).
+	rsStart, rsTotal := pathRescanCost(i, cp)
 	var cost Cost
 	if semi.apply {
 		// M0145-0008l: SEMI/ANTI stop at the first inner match
 		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
 		// is never "indexed", so an unmatched outer row scans it all.
-		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, len(quals))
+		cost = nestloopCostSemiAntiQual(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal, semi, false, joinQualPerTuple(cp, quals))
 	} else {
-		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
-		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
+		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, rsStart, rsTotal)
+		cost.Total += joinQualEvalCost(cp, quals, o.Rows*i.Rows)
 	}
-	cost.Total += matBuild
 	addPath(joinRel, &Path{
 		Kind:          PathNestLoop,
 		Jointype:      jt, // C-03b; see addHashJoinPath.
@@ -212,6 +272,10 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 		OuterRelids: outer.Relids,
 		InnerRelids: inner.Relids,
 		Residual:    quals,
+		// match_unsorted_outer (joinpath.c): a nested loop streams its outer
+		// row by row, so it delivers build_join_pathkeys of the outer path's
+		// ordering (M0146-0005l).
+		Pathkeys: buildJoinPathkeysFor(joinRel, jt, o.Pathkeys),
 		// A nested loop DISCHARGES an inner parameterised by the outer, so
 		// this is a subtraction, not a union (pathnode.c:2592).
 		RequiredOuter: calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter),

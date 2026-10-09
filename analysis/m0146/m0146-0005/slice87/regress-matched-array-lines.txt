@@ -1,0 +1,5 @@
+   Index Cond: ((thousand = ANY ('{182,183}'::integer[])) AND (tenthous > 7550))
+   Index Cond: (hundred = ANY ('{47,48,72,82}'::integer[]))
+   Index Cond: (hundred = ANY ('{47,48,72,82}'::integer[]))
+   Index Cond: (unique1 = ANY ('{1,42,7}'::integer[]))
+   Index Cond: (id = ANY ('{2,3}'::integer[]))

@@ -207,6 +207,14 @@ func BuildDefaultRegistry() *Registry {
 		Name: "lc_messages", Type: TypeString, BootVal: "",
 		Context: ContextSuset, Scope: ScopeSession | ScopeTransaction,
 	}))
+	// session_replication_role decides which triggers fire (trigger.c
+	// TriggerEnabled): 'O' triggers fire in origin and local, 'R' only in
+	// replica, 'A' always (guc_tables.c, PGC_SUSET). M0146-0082.
+	r.MustRegister(NewVariable(Variable{
+		Name: "session_replication_role", Type: TypeEnum, BootVal: "origin",
+		EnumOptions: []string{"origin", "replica", "local"},
+		Context:     ContextSuset, Scope: ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "lc_monetary", Type: TypeString, BootVal: "C",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,

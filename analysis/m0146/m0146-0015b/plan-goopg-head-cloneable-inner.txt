@@ -1,0 +1,14 @@
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Merge Join  (cost=4286.58..5586.58 rows=125000 width=32)
+   Merge Cond: (b.thousand = a.thousand)
+   ->  Nested Loop Semi Join  (cost=0.25..3202.19 rows=5000 width=16)
+         ->  Seq Scan on tenk1 b  (cost=0.00..445.00 rows=10000 width=244)
+         ->  Index Scan using tenk1_hundred on tenk1 c  (cost=0.25..1.29 rows=50 width=244)
+               Index Cond: (hundred = b.hundred)
+   ->  Seq Scan on tenk1 a  (cost=0.00..470.00 rows=5000 width=244)
+         Filter: (NOT (ANY (odd = (hashed SubPlan 1).col1)))
+         SubPlan 1
+           ->  Seq Scan on tenk1 d  (cost=0.00..100.00 rows=10000 width=244)
+(10 rows)
+

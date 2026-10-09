@@ -1,0 +1,10 @@
+create table t(a int, b int);
+insert into t select g % 50, g from generate_series(1, 5000) g;
+analyze t;
+select count(*) from t where b > (select max(cs) from (select a, sum(b) cs from t group by a) x);
+explain (costs off) select * from t where b > (select x.cs from (select a, sum(b) cs from t group by a) x order by cs limit 1);
+select count(*) from t where b > (select x.cs from (select a, sum(b) cs from t group by a) x order by cs limit 1);
+explain (costs off) select * from t t0 where b > (select max(cs) from (select a, sum(b) cs from t where t.a = t0.a group by a) x);
+select count(*) from t t0 where b > (select max(cs) from (select a, sum(b) cs from t where t.a = t0.a group by a) x);
+explain (costs off) select array(select a from (select a, sum(b) cs from t group by a) x order by a) ;
+explain (costs off) select * from t where b > (select max(cs) from (select a, sum(b) cs from t group by a) x where cs > 10);

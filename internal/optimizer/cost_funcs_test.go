@@ -447,3 +447,20 @@ func TestHashAggEntrySizeAndLimits(t *testing.T) {
 		t.Fatalf("ngroups limit must be at least 1, got %v", ng)
 	}
 }
+
+// TestCostAggSortedWithoutAggregatesIsCostGroup pins M0146-0023: a sorted
+// grouping with no aggregate is priced by PG's cost_group — the input plus
+// cpu_operator_cost per grouping column per input tuple, with no per-group
+// cpu_tuple_cost that cost_agg's AGG_SORTED arm charges.
+func TestCostAggSortedWithoutAggregatesIsCostGroup(t *testing.T) {
+	cp := defaultCostParams()
+	got := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 0, 0, 0)
+	want := Cost{Startup: 5, Total: 100 + cp.cpuOperatorCost*2*1000}
+	if got != want {
+		t.Errorf("no aggregates: got %+v want %+v", got, want)
+	}
+	withAgg := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 1, 0, 0)
+	if withAgg.Total <= got.Total {
+		t.Errorf("an aggregating sorted path must cost more: %+v vs %+v", withAgg, got)
+	}
+}

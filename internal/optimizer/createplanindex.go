@@ -345,15 +345,56 @@ func createIndexScanPlan(p *Path) Node {
 		}
 		ioKeys := make([]Expr, 0, len(p.IndexClauses))
 		ioDrop := map[Expr]bool{}
+		// M0146-0061: a leading-column range (indexOnlyLeafClauses) lowers
+		// onto LowKey/HighKey, as the plain range scan below does; a
+		// composite index's bounds carry no `local` and stay the Filter.
+		var ioLow, ioHigh Expr
+		var ioLowOp, ioHighOp parser.OpCode
+		ioRange := len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown
 		for i, c := range p.IndexClauses {
-			if c.indexCol != i || c.key == nil || c.local == nil {
+			if ioRange {
+				if c.indexCol != 0 || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
+						p.IndexInfo.Name, i))
+				}
+				switch c.op {
+				case parser.OpGt, parser.OpGe:
+					if ioLow != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+					}
+					ioLow, ioLowOp = c.key, c.op
+				case parser.OpLt, parser.OpLe:
+					if ioHigh != nil {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+					}
+					ioHigh, ioHighOp = c.key, c.op
+				default:
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
+				}
+				if c.local != nil {
+					ioDrop[c.local] = true
+				}
+				continue
+			}
+			// A parameterised probe (M0146-0005bq) binds outer join clauses,
+			// which have no leaf-local conjunct; its keys are re-based onto
+			// the outer by the NLI builder. A skip probe (M0146-0005bt) binds
+			// Columns[IndexSkipPrefix+i].
+			if c.indexCol != p.IndexSkipPrefix+i || c.key == nil || (c.local == nil && p.RequiredOuter == 0) {
 				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a local equality-prefix clause",
 					p.IndexInfo.Name, i))
 			}
 			ioKeys = append(ioKeys, c.key)
-			ioDrop[c.local] = true
+			if c.local != nil {
+				ioDrop[c.local] = true
+			}
 		}
-		if len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+		if p.IndexSkipPrefix < 0 || (p.IndexSkipPrefix > 0 && p.RequiredOuter == 0) ||
+			(!ioRange && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
+			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s skips %d columns then binds %d clauses",
+				p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses)))
+		}
+		if !ioRange && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
 				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
@@ -390,22 +431,50 @@ func createIndexScanPlan(p *Path) Node {
 		}
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).
-		switch len(ioKeys) {
-		case 0:
-		case 1:
+		switch {
+		case ioRange:
+			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
+		case len(ioKeys) == 0:
+		case p.IndexSkipPrefix > 0:
+			ios.SkipPrefix = p.IndexSkipPrefix
+			ios.Keys = ioKeys
+		case len(ioKeys) == 1:
 			ios.Key = ioKeys[0]
 		default:
 			ios.Keys = ioKeys
 		}
-		// `rewrap` would reinstate a leaf-local `*Filter` whose ColumnRefs are
-		// written against the FULL leaf schema; the producer admits a
-		// non-bare leaf only when its index clauses consume every local qual,
-		// so dropping them must leave nothing to reinstate.
-		if out := rewrapLeafDropping(p.Rel.baseLeaf, ios, ioDrop); out != Node(ios) {
-			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s would reinstate a leaf qual over the narrowed schema",
-				p.IndexInfo.Name))
+		// The leaf's local quals the index clauses did not consume stay as the
+		// Index Only Scan's Filter (M0146-0019a, PG's qpqual). They are
+		// written against the FULL leaf schema, so each ColumnRef is re-based
+		// onto the covered column it names; the producer admitted only
+		// residuals whose columns are covered and whose sublinks are
+		// uncorrelated (indexOnlyResidualAdmissible).
+		leafToCovered := make(map[int]int, len(schema))
+		for k, col := range schema {
+			for j := range id.schema {
+				if id.schema[j].Name == col.Name {
+					leafToCovered[j] = k
+					break
+				}
+			}
 		}
-		return ios
+		return rewrapLeafDroppingRemapped(p.Rel.baseLeaf, ios, ioDrop, func(e Expr) Expr {
+			out, ok := cloneExprRefs(e, scopeIgnore, exprRewriter{Rewrite: func(n Expr) Expr {
+				if cr, isCol := n.(*ColumnRef); isCol {
+					k, found := leafToCovered[cr.Index]
+					if !found {
+						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s keeps a Filter on column %d (%s), which the index does not cover",
+							p.IndexInfo.Name, cr.Index, cr.Name))
+					}
+					cr.Index = k
+				}
+				return n
+			}})
+			if !ok {
+				panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: its Filter holds an expression the walker does not enumerate", p.IndexInfo.Name))
+			}
+			return out
+		})
 	}
 
 	// M0145-0029 slice 2: a range path's clauses are bounds on the leading
@@ -433,6 +502,14 @@ func createIndexScanPlan(p *Path) Node {
 	case len(p.IndexClauses) > ncols:
 		panic(fmt.Sprintf("createPlan: PathIndexScan on %s binds %d clauses to a %d-column index",
 			p.IndexInfo.Name, len(p.IndexClauses), ncols))
+	case p.IndexSkipPrefix < 0 || p.IndexSkipPrefix+len(p.IndexClauses) > ncols:
+		panic(fmt.Sprintf("createPlan: PathIndexScan on %s skips %d columns then binds %d clauses on a %d-column index",
+			p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses), ncols))
+	case p.IndexSkipPrefix > 0 && p.RequiredOuter == 0 && !indexClausesAllLocal(p.IndexClauses):
+		// An unparameterised skip probe (M0146-0005dg) binds the relation's
+		// own `col = const` restrictions; a clause with no local conjunct
+		// would be a join clause with no outer to bind it.
+		panic(fmt.Sprintf("createPlan: unparameterised skip PathIndexScan on %s binds a non-local clause", p.IndexInfo.Name))
 	}
 
 	is := &IndexScan{
@@ -461,7 +538,11 @@ func createIndexScanPlan(p *Path) Node {
 	// columns and returns wrong rows rather than failing.
 	keys := make([]Expr, 0, len(p.IndexClauses))
 	for i, c := range p.IndexClauses {
-		if c.indexCol != i {
+		// With `IndexSkipPrefix` the bound run starts that many key
+		// columns in: slot i binds `Columns[IndexSkipPrefix+i]`, the same
+		// positional contract `IndexScan.SkipPrefix` documents
+		// (M0146-0005v).
+		if c.indexCol != p.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: index clause %d of %s claims index column %d; the index-column order was lost",
 				i, p.IndexInfo.Name, c.indexCol))
 		}
@@ -489,6 +570,15 @@ func createIndexScanPlan(p *Path) Node {
 	case 1:
 		is.Key = keys[0]
 	default:
+		is.Keys = keys
+	}
+	// A skip probe binds `Columns[SkipPrefix+i]`, not `Columns[i]` — a
+	// single bound column there is still `Keys` (and never the col-0
+	// `Key`), and `SkipPrefix` names how many leading columns the executor
+	// enumerates instead.
+	if p.IndexSkipPrefix > 0 {
+		is.SkipPrefix = p.IndexSkipPrefix
+		is.Key = nil
 		is.Keys = keys
 	}
 	// A restriction path's index quals came out of the leaf's own Filter:
@@ -646,6 +736,13 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 // identity against flattenExprAnd of each wrapper's predicate — the same
 // decomposition extractFilterConjuncts gave the producer.
 func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
+	return rewrapLeafDroppingRemapped(leaf, scan, drop, nil)
+}
+
+// rewrapLeafDroppingRemapped is rewrapLeafDropping with each kept conjunct
+// passed through remap (nil = unchanged): an index-only scan's residual
+// Filter re-based onto the covered columns (M0146-0019a).
+func rewrapLeafDroppingRemapped(leaf Node, scan Node, drop map[Expr]bool, remap func(Expr) Expr) Node {
 	var wrappers []*Filter
 	for n := leaf; ; {
 		f, ok := n.(*Filter)
@@ -661,6 +758,9 @@ func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
 		var keep []Expr
 		for _, c := range flattenExprAnd(w.Predicate) {
 			if !drop[c] {
+				if remap != nil {
+					c = remap(c)
+				}
 				keep = append(keep, c)
 			}
 		}
@@ -674,4 +774,16 @@ func rewrapLeafDropping(leaf Node, scan Node, drop map[Expr]bool) Node {
 		out = &Filter{pos: w.pos, Child: out, Predicate: pred, LeafLocal: w.LeafLocal}
 	}
 	return out
+}
+
+// indexClausesAllLocal reports whether every clause came from the
+// relation's own restrictions (a local conjunct the lowering drops from the
+// reinstated Filter).
+func indexClausesAllLocal(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if c.local == nil {
+			return false
+		}
+	}
+	return true
 }

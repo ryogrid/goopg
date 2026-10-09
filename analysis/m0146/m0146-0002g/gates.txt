@@ -1,0 +1,5 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H census identical to HEAD
+regress 41 WITH/plan pass-required cases: diffs identical to a HEAD (ef4efe61c) worktree
+regress subselect (not pass-required): diff 2799 -> 2792 lines; new SubPlan lines follow PG's (ANY (x = (hashed SubPlan N).col1)) form

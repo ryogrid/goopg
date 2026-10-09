@@ -1,0 +1,97 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 30000
+INSERT 0 30000
+INSERT 0 300
+ANALYZE
+ANALYZE
+ANALYZE
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d.m
+               ->  Partial HashAggregate
+                     Group Key: d.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Parallel Append
+                                 ->  Seq Scan on s1
+                                 ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d
+(15 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               Filter: (src > 0)
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(10 rows)
+
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.m
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: d.m
+               ->  Partial HashAggregate
+                     Group Key: d.m
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Parallel Append
+                                 ->  Seq Scan on s1
+                                 ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d
+(15 rows)
+
+SET
+                   QUERY PLAN                    
+-------------------------------------------------
+ HashAggregate
+   Group Key: d2.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d2.k)
+         ->  Append
+               ->  Hash Join
+                     Hash Cond: (s1.k = d.k)
+                     ->  Seq Scan on s1
+                     ->  Hash
+                           ->  Seq Scan on d
+                                 Filter: (m = 3)
+               ->  Hash Join
+                     Hash Cond: (s2.k = d_1.k)
+                     ->  Seq Scan on s2
+                     ->  Hash
+                           ->  Seq Scan on d d_1
+                                 Filter: (m = 3)
+         ->  Hash
+               ->  Seq Scan on d d2
+(19 rows)
+
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY ratio ROWS UNBOUNDED PRECEDING)
+   Run Condition: (rank() OVER w1 <= 10)
+   ->  Sort
+         Sort Key: ratio
+         ->  HashAggregate
+               Group Key: k
+               ->  Seq Scan on s1
+(8 rows)
+

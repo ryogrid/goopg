@@ -169,8 +169,8 @@ func TestGroupingSetsRejectFunctionalDependency(t *testing.T) {
 
 // TestGroupingSetsPlanIsOneAggregateOverOneScan is the shape assertion: the
 // whole point of M0125-0048 is that a ROLLUP no longer builds one branch per
-// set. PG's plan for this query is a single MixedAggregate over a single Seq
-// Scan; goopg's is a single HashAggregate over a single Seq Scan.
+// set. PG's plan for this query, and goopg's since M0146-0020, is a single
+// MixedAggregate over a single Seq Scan.
 func TestGroupingSetsPlanIsOneAggregateOverOneScan(t *testing.T) {
 	ctx, cleanup := gsFixture(t)
 	defer cleanup()
@@ -182,8 +182,9 @@ func TestGroupingSetsPlanIsOneAggregateOverOneScan(t *testing.T) {
 	if strings.Contains(plan, "Append") || strings.Contains(plan, "CTE") {
 		t.Fatalf("plan still carries the retired UNION ALL / shared-source shape:\n%s", plan)
 	}
-	if !strings.Contains(plan, "3 grouping sets") {
-		t.Fatalf("plan does not name the grouping sets:\n%s", plan)
+	if !strings.Contains(plan, "MixedAggregate") || strings.Count(plan, "Hash Key:") != 2 ||
+		!strings.Contains(plan, "Group Key: ()") {
+		t.Fatalf("plan does not show PG's MixedAggregate with one key line per set:\n%s", plan)
 	}
 }
 

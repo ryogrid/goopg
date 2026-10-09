@@ -919,3 +919,54 @@ func TestResolveAnalyzeColumns(t *testing.T) {
 		t.Errorf("dropped message = %q", drop.Message)
 	}
 }
+
+// TestAnalyzeSeesOwnUncommittedInserts pins PG's own-transaction ANALYZE
+// visibility: tuples the calling transaction inserted at an earlier command
+// count, as PG's HeapTupleSatisfiesMVCC own-xmin arm shows them, so
+// `BEGIN; INSERT …; ANALYZE;` records the row count rather than 0. Before
+// the ownXID credit, analyzeRelationWith compared every tuple's xmin against
+// the nested analyze transaction's XID — which writes nothing — so own rows
+// fell through to the snapshot and hid; this is the engine divergence behind
+// the executor fixture's "ANALYZE records RowCount 0" report (M0146-0005
+// recon item).
+func TestAnalyzeSeesOwnUncommittedInserts(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	advanceStmtCounter(ctx)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	rows := make([][]optimizer.Expr, 25)
+	for i := range rows {
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i)},
+			&optimizer.StringConst{Value: "x"},
+		}
+	}
+	insertPlan := &optimizer.Insert{
+		Table:       tbl,
+		Source:      &optimizer.Values{Rows: rows},
+		ColumnIndex: []int{0, 1},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+
+	// No commit: ANALYZE runs at a later command of the same transaction,
+	// mirroring the wire path's per-statement CommandCounterIncrement.
+	advanceStmtCounter(ctx)
+	stats, err := analyzeRelationCtx(ctx, tbl)
+	if err != nil {
+		t.Fatalf("analyzeRelationCtx: %v", err)
+	}
+	if stats.RowCount != 25 {
+		t.Errorf("RowCount=%d want 25 (own uncommitted inserts count)", stats.RowCount)
+	}
+}

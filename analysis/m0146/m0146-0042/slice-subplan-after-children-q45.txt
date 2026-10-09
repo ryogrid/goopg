@@ -1,0 +1,37 @@
+# M0146-0042 slice: SubPlans print after children (code ad7a20114)
+# fire-set captures tmp/fireset-m42k (baseline = 90556f2c2, candidate = staged change)
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+
+sf025 text-identical 40 -> 40
+  Q6 diff-lines vs PG 36 -> 30 
+  Q32 diff-lines vs PG 22 -> 6 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q45 diff-lines vs PG 14 -> 8 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q86 diff-lines vs PG 2 -> 2 
+  Q92 diff-lines vs PG 46 -> 46 
+sf1 text-identical 32 -> 33
+  Q6 diff-lines vs PG 36 -> 30 
+  Q32 diff-lines vs PG 25 -> 9 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q45 diff-lines vs PG 6 -> 0 IDENT
+  Q70 diff-lines vs PG 2 -> 2 
+  Q86 diff-lines vs PG 2 -> 2 
+  Q92 diff-lines vs PG 25 -> 9 
+
+## regress mismatch-line counts (+/- lines), HEAD -> change
+join.diff 15600 15596 
+subselect.diff 1683 1665 
+with.diff 1833 1833 
+aggregates.diff 595 595 
+select_parallel.diff 1079 1079 

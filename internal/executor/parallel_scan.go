@@ -104,7 +104,16 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 	if p == nil || p.Algo != optimizer.JoinAlgoNestedLoop || !p.Lateral {
 		return false
 	}
-	if p.Type != optimizer.JoinTypeInner {
+	// M0146-0002i/j, M0146-0005ao: the jointype set mirrors the planner
+	// twin's `partialProbeNestLoopJoinType` — {INNER, LEFT, SEMI, ANTI} —
+	// widened together, the discipline the 2026-09-21 ordinary-SEMI wrong
+	// answer teaches. Every verdict is per-outer-row and worker-local: one
+	// qualifying probe row decides a SEMI/ANTI outer row and the probe breaks
+	// (`finishOuter`, join_nl_stream.go); LEFT null-pads an outer row no probe
+	// row qualified for.
+	switch p.Type {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
+	default:
 		return false
 	}
 	if p.Left == nil || p.Right == nil || right == nil {
@@ -116,6 +125,15 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 	}
 	switch inner.(type) {
 	case *indexScanOp, *indexOnlyScanOp:
+	case *setOp:
+		// M0146-0049e: the parameterised Append (planner twin
+		// paramAppendIsPartialProbe). Every member re-opens per
+		// worker-local outer row through ctx.OuterRows, as in serial
+		// execution; no claim walk descends the join's right side, so the
+		// members' scans stay private to the worker.
+		if !optimizer.LateralParamAppendProbe(p) || !paramAppendOpsArePartialProbes(inner) {
+			return false
+		}
 	default:
 		return false
 	}
@@ -123,6 +141,26 @@ func lateralProbeJoinPartial(p *optimizer.Join, right Operator) bool {
 		return false
 	}
 	return true
+}
+
+// paramAppendOpsArePartialProbes is the built-tree half of the
+// parameterised-Append admission: below the UNION ALL operators and their
+// row-wise wrappers every leaf is an index or bitmap probe operator.
+func paramAppendOpsArePartialProbes(op Operator) bool {
+	switch x := op.(type) {
+	case *setOp:
+		return x.left != nil && x.right != nil &&
+			paramAppendOpsArePartialProbes(x.left) && paramAppendOpsArePartialProbes(x.right)
+	case *projectOp:
+		return paramAppendOpsArePartialProbes(x.child)
+	case *filterOp:
+		return paramAppendOpsArePartialProbes(x.child)
+	case *instrumentedOp:
+		return paramAppendOpsArePartialProbes(x.inner)
+	case *indexScanOp, *indexOnlyScanOp, *bitmapHeapScanOp:
+		return true
+	}
+	return false
 }
 
 // parallelScanState is the work queue for one parallel sequential scan node.
@@ -247,7 +285,10 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelScan(x.left, st)
@@ -305,6 +346,17 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// every worker aggregates the WHOLE relation, and the Finalize node
 		// combines N full results into an N-times overcount — arithmetically
 		// plausible output with nothing to flag it.
+		return attachParallelScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: the `Unique -> Gather Merge -> Unique` shape's
+		// per-worker dedup — each worker dedups its own partition and the
+		// leader-side Unique re-dedups the merge. Only the producer-marked
+		// node may be descended: an unmarked Unique under a Gather would
+		// emit each cross-partition duplicate once per worker, the same
+		// over-count the planner's drivingScan arm refuses on.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
 		return attachParallelScan(x.child, st)
 	case *sortOp:
 		// P7. A Sort inside the partial subtree is legal ONLY under Gather
@@ -370,7 +422,10 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelBitmapScan(x.left, st)
@@ -399,6 +454,14 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 		return attachParallelBitmapScan(x.right, st)
 	case *aggregateOp:
 		// P9: Partial aggregate must read only its worker's partition.
+		return attachParallelBitmapScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: same producer-marked gate as the sequential
+		// sibling — the per-worker Unique of `Unique -> Gather Merge ->
+		// Unique`; an unmarked dedup refuses.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
 		return attachParallelBitmapScan(x.child, st)
 	case *sortOp:
 		// P7: per-worker Sort under Gather Merge.
@@ -540,7 +603,10 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 			if !ordinaryInnerNestedLoopPartial(x.plan) && !lateralProbeJoinPartial(x.plan, x.right) {
 				return false
 			}
-			if optimizer.HasBitmapScan(x.plan.Right) {
+			// M0146-0049e: a parameterised Append's bitmap probes are
+			// worker-private (no claim, no shared bitmap), so only the
+			// other inner shapes keep the refusal.
+			if optimizer.HasBitmapScan(x.plan.Right) && !optimizer.LateralParamAppendProbe(x.plan) {
 				return false
 			}
 			return attachParallelIndexScan(x.left, st)
@@ -566,6 +632,14 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		}
 		return attachParallelIndexScan(x.right, st)
 	case *aggregateOp:
+		return attachParallelIndexScan(x.child, st)
+	case *distinctOnOp:
+		// M0146-0027 slice 2: same producer-marked gate as the sequential
+		// sibling — the per-worker Unique of `Unique -> Gather Merge ->
+		// Unique`; an unmarked dedup refuses.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
 		return attachParallelIndexScan(x.child, st)
 	case *sortOp:
 		return attachParallelIndexScan(x.child, st)
@@ -895,7 +969,18 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 		} else {
 			right = cs.setOpBranch(true).attachAll(so.right)
 		}
-		return left || right
+		// M0146-0027 slice 4: when unwrapToSetOp reached the setOp THROUGH a
+		// Parallel Hash join's probe side (Q71's elected shape: Gather →
+		// Parallel Hash → Parallel Append), the branch wiring above claims
+		// only what is INSIDE the setOp. The join's own build side lives
+		// outside it and still needs its hashBuildBranch claim set —
+		// without it every participant scans the whole build relation into
+		// the shared table and the join returns (participants) copies of
+		// every match. The walk descends the same probe path and stops at
+		// the setOp (no arm), so a non-join wrapper chain is a harmless
+		// no-op here.
+		builds := cs.attachParallelHashBuildSides(op)
+		return left || right || builds
 	}
 	attached := attachParallelScan(op, cs.pscan)
 	attached = attachParallelBitmapScan(op, cs.pbm) || attached

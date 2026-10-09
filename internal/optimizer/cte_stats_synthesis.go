@@ -44,6 +44,11 @@ const (
 type cteOutputColStats struct {
 	kind      cteColKind
 	ndistinct float64
+	// unique marks the column PG's `examine_simple_variable` would call
+	// isunique for this leaf output: the body top query's lone GROUP BY or
+	// DISTINCT(ON) key (selfuncs.c:5865-5883). The join-selectivity side
+	// reads it to set joinVarStats.isUnique (M0146-0009e).
+	unique bool
 }
 
 // cteOutputStats is the per-CTE synthesis: the body row estimate plus one
@@ -73,7 +78,84 @@ func synthesizeCTEStats(entry *plannedCTE) *cteOutputStats {
 	synthAggregateOutputs(out, entry)
 	synthWindowOutputs(out, entry)
 	synthUnionLiterals(out, entry)
+	for i := range loneKeyPositions(entry.body, n) {
+		out.cols[i].unique = true
+	}
 	return out
+}
+
+// loneKeyPositions returns the leaf-output positions PG's
+// `examine_simple_variable` marks isunique for a derived input: the top
+// query's lone GROUP BY key (selfuncs.c:5876-5883) or lone DISTINCT /
+// DISTINCT ON key (:5865-5871). Everything else — set operations,
+// grouping sets, multi-key grouping, unkeyed bodies — punts, exactly as
+// upstream's early exits do.
+//
+// `width` is the leaf's output width; a body whose top is a *Project
+// remaps leaf positions onto the projected child's positions via bare
+// ColumnRef targets (the M0145-0009 constructor guarantees that shape).
+// The map is keyed on LEAF position so callers index their own output
+// schema.
+func loneKeyPositions(body Node, width int) map[int]bool {
+	n := body
+	for {
+		n = peelCTEBody(n)
+		// A pushed-qual *SubqueryScan is a labeling wrapper over the same
+		// subplan top (leafBaseScan strips it for the same reason); peel it
+		// too so classification sees the body, not the label. A column-alias
+		// list renames but never reorders, so positions still line up.
+		if ss, ok := n.(*SubqueryScan); ok && ss != nil && ss.Child != nil {
+			n = ss.Child
+			continue
+		}
+		break
+	}
+	posMap := make(map[int]int, width)
+	if p, ok := n.(*Project); ok && p != nil {
+		for i, t := range p.Targets {
+			if cr, ok := t.(*ColumnRef); ok && cr != nil {
+				posMap[i] = cr.Index
+			}
+		}
+		n = peelCTEBody(p.Child)
+	} else if n != nil {
+		for i := 0; i < width && i < len(n.Output()); i++ {
+			posMap[i] = i
+		}
+	}
+	mappedTo := func(childPos int) map[int]bool {
+		out := map[int]bool{}
+		for i, cp := range posMap {
+			if cp == childPos && i < width {
+				out[i] = true
+			}
+		}
+		return out
+	}
+	switch x := n.(type) {
+	case *Aggregate:
+		if x == nil || len(x.GroupingSets) > 0 || len(x.GroupExprs) != 1 {
+			return nil
+		}
+		// Lone groupClause: the single GroupExpr output position (0) is
+		// unique over the body's rows.
+		return mappedTo(0)
+	case *Distinct:
+		if x == nil {
+			return nil
+		}
+		// Plain DISTINCT's distinctClause covers every output column, so it
+		// is a lone key only when the body emits exactly one column.
+		if width == 1 {
+			return map[int]bool{0: true}
+		}
+	case *DistinctOn:
+		if x == nil || len(x.KeyCols) != 1 {
+			return nil
+		}
+		return mappedTo(x.KeyCols[0])
+	}
+	return nil
 }
 
 // synthAggregateOutputs fills group-key / agg-output records when the body

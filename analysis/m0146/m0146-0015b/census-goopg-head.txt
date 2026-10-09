@@ -1,0 +1,21 @@
+GOOPG_NLI_CENSUS=1 stderr lines, throwaway :5533, HEAD 12143918a
+
+== canonical (inner NOT EXISTS on indexed cols; d's plan = BitmapHeapScan) ==
+PULLUPCENSUS decline=no-level1-correlation       <- inner NOT EXISTS pull attempt inside c's own problem (refs only Level-2 'a', no Level-1 to c's scope)
+SUBLINKCENSUS route=jointree-posthoc
+PULLUPCENSUS decline=nested-sublink-uncloneable  <- outer EXISTS pull aborted: kept inner subplan fails planCloneSupported (no BitmapHeapScan arm)
+SUBLINKCENSUS route=jointree-posthoc
+
+== cloneable-inner variant (inner NOT EXISTS on unindexed cols; d = SeqScan) ==
+PULLUPCENSUS decline=no-level1-correlation       <- inner pull still declines (Level-2-only correlation)
+SUBLINKCENSUS route=jointree-posthoc
+PULLUPCENSUS decline=(pulled)                    <- outer EXISTS pulls; kept inner -> NOT (ANY (odd = (hashed SubPlan 1).col1)) placed on the a scan
+SUBLINKCENSUS route=jointree-pullup
+
+== plain-EXISTS variant (inner EXISTS on unindexed cols) ==
+PULLUPCENSUS decline=no-level1-correlation
+SUBLINKCENSUS route=jointree-posthoc
+PULLUPCENSUS decline=(pulled)
+SUBLINKCENSUS route=jointree-pullup
+(elected plan keeps Filter: EXISTS(SubPlan 1) over Nested Loop — the pulled
+semi join lost the election; the pulled conjunct stays available as residual)

@@ -75,22 +75,31 @@ func TestExplainGroupedAggregateHavingOrder(t *testing.T) {
 	}
 }
 
-// TestExplainGroupingSetsSuffixUntouched pins that the grouping-sets branch is
-// byte-identical to before: the `(N keys, N grouping sets)` suffix remains and
-// no `Group Key:` detail line appears (the per-set key lines are a separate
-// M0125-0048 shape, out of S5 scope).
-func TestExplainGroupingSetsSuffixUntouched(t *testing.T) {
+// TestExplainGroupingSetsRendersPGKeys pins M0146-0020: a grouping-sets
+// aggregate prints as PG 18 does (live capture, private PG 18.3). With an
+// empty set it is a MixedAggregate — one `Hash Key:` line per non-empty set
+// in rollup order, then `Group Key: ()`; without one it is a HashAggregate
+// with `Hash Key:` lines only.
+func TestExplainGroupingSetsRendersPGKeys(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
-	if err := runDDL(t, ctx, "CREATE TABLE t (a int, b int)"); err != nil {
+	if err := runDDL(t, ctx, "CREATE TABLE t (dept text, region text, amount int)"); err != nil {
 		t.Fatal(err)
 	}
-
-	joined := strings.Join(runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a), ())"), "\n")
-	if !strings.Contains(joined, "HashAggregate (1 keys, 2 grouping sets)") {
-		t.Errorf("grouping-sets suffix must be preserved; got:\n%s", joined)
+	cases := map[string][]string{
+		"SELECT dept, region, sum(amount) FROM t GROUP BY ROLLUP(dept, region)": {
+			"MixedAggregate", "  Hash Key: dept, region", "  Hash Key: dept", "  Group Key: ()", "  ->  Seq Scan on t"},
+		"SELECT dept, region, sum(amount) FROM t GROUP BY GROUPING SETS ((dept), (region))": {
+			"HashAggregate", "  Hash Key: dept", "  Hash Key: region", "  ->  Seq Scan on t"},
+		"SELECT dept, sum(amount) FROM t GROUP BY ROLLUP(dept)": {
+			"MixedAggregate", "  Hash Key: dept", "  Group Key: ()", "  ->  Seq Scan on t"},
+		"SELECT dept, region, sum(amount) FROM t GROUP BY CUBE(dept, region)": {
+			"MixedAggregate", "  Hash Key: dept, region", "  Hash Key: dept", "  Hash Key: region", "  Group Key: ()", "  ->  Seq Scan on t"},
 	}
-	if strings.Contains(joined, "Group Key:") {
-		t.Errorf("grouping-sets aggregate must not emit a Group Key line; got:\n%s", joined)
+	for q, want := range cases {
+		got := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+q)
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("%s:\n got:\n%s\nwant:\n%s", q, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
 	}
 }

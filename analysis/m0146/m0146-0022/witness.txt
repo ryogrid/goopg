@@ -1,0 +1,6 @@
+## Q74 SF0.25 baseline: first Join Filter over the CTE references
+               Join Filter: ((((((t_s_firstyear.customer_id = t_w_firstyear.customer_id) AND (CASE WHEN (t_c_firstyear.year_total > 0) THEN (t_c_secyear.year_total / t_c_firstyear.year_total) ELSE NULL END > CASE WHEN (t_w_firstyear.year_total > 0) THEN (t_w_s
+## Q74 SF0.25 candidate: first Join Filter over the CTE references
+               Join Filter: ((t_s_secyear.customer_id = t_w_firstyear.customer_id) AND (CASE WHEN (t_c_firstyear.year_total > 0) THEN (t_c_secyear.year_total / t_c_firstyear.year_total) ELSE NULL END > CASE WHEN (t_w_firstyear.year_total > 0) THEN (t_w_secyear
+## Q74 SF0.25 candidate-pg: first Join Filter over the CTE references
+               Join Filter: ((t_s_secyear.customer_id = t_w_firstyear.customer_id) AND (CASE WHEN (t_c_firstyear.year_total > '0'::numeric) THEN (t_c_secyear.year_total / t_c_firstyear.year_total) ELSE NULL::numeric END > CASE WHEN (t_w_firstyear.year_total > 

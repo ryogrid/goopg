@@ -1,0 +1,67 @@
+2026-09-27 — M0146-0005x gates (staged index; commit hash recorded in
+working_set closeout)
+
+Unit (package) tests
+  go test ./internal/optimizer/ ./internal/executor/
+    -> ok / ok
+    New pins:
+      optimizer: TestSubqueryQualPushdown* (admit/decline matrix —
+        grouped-leaf push, missing/invalid schema, computed project
+        target decline, volatile decline, correlated/OuterColumnRef
+        decline, planned-sublink decline, LEFT-join-degenerate admit,
+        FULL-join nullable-side decline, set-op leaf decline)
+      optimizer: TestSubqueryScanStripsTrivialWrapper regime matrix —
+        pathtarget keeps (top-level subset/out-of-order, under Sort,
+        under Limit, under Distinct) + physical strips (under join,
+        under top Aggregate, subset set-op leaf under join)
+      executor: TestExplainSubqueryScanLabelOnSetOpArm re-pinned to a
+        top-level subset-consumption set-op (the join-arm keep pin
+        encoded the pre-regime model; PG strips under a join)
+
+Live probes (goopg :5533, tmp/m0146-0005v-data-tpcds-sf025 clone)
+  Q34: Nested Loop -> GroupAggregate, Filter: ((count(*) >= 15) AND
+       (count(*) <= 20)), NO Subquery Scan label; 87 rows = oracle
+  Q73: same shape (count(*) >= 1 AND <= 5), no label; 0 rows = oracle
+  Q8:  Subquery Scan on a1 retained (nontrivial INTERSECT arm) — 1 label
+  PG 18.3 :65438 probes (read-only) pinning the tlist regime:
+       subset u.c keeps at top level / under Sort / under Limit /
+       under DISTINCT; strips under NL and under top Aggregate;
+       subset set-op leaf under join strips; computed select list
+       (u.c+1) keeps — projection-capable scan carries the expr
+
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+  -> all packages ok (44 pkgs; optimizer/executor re-ran uncached)
+
+scripts/tpch-spotcheck.sh
+  -> Q12 PASS rows=2, Q13 PASS rows=33; RESULT=PASS
+  gate-stamp: tpch-spotcheck PASS
+
+scripts/tpcds-sf025-regression.sh sweep
+  -> PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  plan channel vs pre-slice baseline (first capture): changed={Q2 Q21
+    Q34 Q38 Q39 Q44 Q46 Q59 Q65 Q68 Q73 Q79 Q87} — the label-strip +
+    pushdown set; rolling re-capture then shows same=99
+  gate-stamp: tpcds-sf025 PASS
+
+ACCEPT_BASELINE=bench/tpch/baseline-digests.txt \
+  scripts/tpch-acceptance-arm.sh on tmp/arm-on-m0146-0005x.txt
+  -> SUMMARY: 24 MATCH; VERDICT: PASS
+  gate-stamp: tpch-acceptance-arm PASS
+
+scripts/tpcds-fireset-gate.sh m0146-0005x tmp/fireset-m0146-0005x
+  (artifacts copied to analysis/m0146/m0146-0005/slice25/fireset/)
+  SF0.25: baseline match=14, candidate match=14; fires={Q2 Q21 Q34 Q38
+          Q39 Q44 Q46 Q59 Q65 Q68 Q73 Q79 Q87}, introduced=none,
+          executions PASS both arms
+  SF1:    baseline match=12, candidate match=12; same fire set,
+          introduced=none, executions PASS both arms
+  gate-stamp: tpcds-fireset PASS (see stamp note in working_set)
+
+Movement: yes — Q34/Q73 lose the Subquery Scan label and gain the
+aggregate-level count(*) filter (PG's shape); 11 more queries lose
+qual-free leaf labels under physical-tlist ancestors. Match counts
+unchanged (the residual diffs are other categories); category deltas at
+SF0.25: parallelism 65->60, scan-type 51->46, parameterisation 34->30,
+join-order 74->72, D2-unionall 4->2; SF1: parallelism 72->70,
+jointree-search 18->17, qual-placement 19->21 (pushed quals now visible
+as a placement class rather than a label diff).

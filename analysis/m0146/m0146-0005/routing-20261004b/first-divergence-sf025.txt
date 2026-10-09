@@ -1,0 +1,145 @@
+Q1 depth=3 [scan-type] under Nested Loop: PG Index Scan customer_pkey on customer | goopg Bitmap Heap Scan on customer
+Q2 depth=2 [aggregation-strategy] under CTE: PG Finalize HashAggregate | goopg HashAggregate
+Q3 MATCH (no structural divergence)
+Q4 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q5 depth=9 [join-order] under Nested Loop: PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+Q6 depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q7 MATCH (no structural divergence)
+Q8 MATCH (no structural divergence)
+Q9 MATCH (no structural divergence)
+Q10 MATCH (no structural divergence)
+Q11 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q12 MATCH (no structural divergence)
+Q13 MATCH (no structural divergence)
+Q14 depth=6 [parameterisation] under Nested Loop: PG Nested Loop Inner | goopg Nested Loop Inner
+Q15 MATCH (no structural divergence)
+Q16 depth=4 [parallelism] under Sort: PG Nested Loop Inner | goopg Gather
+Q17 depth=4 [parallelism] under Nested Loop: PG Nested Loop Inner | goopg Gather Merge
+Q18 MATCH (no structural divergence)
+Q19 depth=2 [aggregation-strategy] under Sort: PG Finalize GroupAggregate | goopg GroupAggregate
+Q20 MATCH (no structural divergence)
+Q21 MATCH (no structural divergence)
+Q22 MATCH (no structural divergence)
+Q23 depth=4 [scan-type] under Hash Join: PG Index Only Scan customer_pkey on customer customer_3 | goopg Seq Scan on customer customer_3
+Q24 MATCH (no structural divergence)
+Q25 depth=4 [parallelism] under Nested Loop: PG Nested Loop Inner | goopg Gather Merge
+Q26 depth=2 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+Q27 MATCH (no structural divergence)
+Q28 MATCH (no structural divergence)
+Q29 depth=4 [parallelism] under Nested Loop: PG Nested Loop Inner | goopg Gather Merge
+Q30 depth=5 [join-method] under Nested Loop: PG Nested Loop Inner | goopg Hash Join Inner
+Q31 MATCH (no structural divergence)
+Q32 depth=2 [parameterisation] under Aggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q33 depth=5 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+Q34 depth=2 [scan-type] under Nested Loop: PG Index Scan customer_pkey on customer | goopg Bitmap Heap Scan on customer
+Q35 depth=2 [sort-strategy] under GroupAggregate: PG Incremental Sort | goopg Sort
+Q36 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q37 depth=6 [join-order] under Nested Loop: PG Nested Loop Inner | goopg Nested Loop Inner
+Q38 depth=5 [sort-strategy] under Gather Merge: PG Unique | goopg Sort
+Q39 depth=4 [parallelism] under HashAggregate: PG Hash Join Inner | goopg Gather
+Q40 depth=1 [aggregation-strategy] under Limit: PG Finalize GroupAggregate | goopg GroupAggregate
+Q41 MATCH (no structural divergence)
+Q42 depth=6 [join-order] under Nested Loop: PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+Q43 MATCH (no structural divergence)
+Q44 depth=1 [parameterisation] under Limit: PG Nested Loop Inner | goopg Nested Loop Inner
+Q45 depth=2 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+Q46 depth=3 [join-method] under Nested Loop: PG Nested Loop Inner | goopg Hash Join Inner
+Q47 MATCH (no structural divergence)
+Q48 MATCH (no structural divergence)
+Q49 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q50 MATCH (no structural divergence)
+Q51 MATCH (no structural divergence)
+Q52 depth=6 [join-order] under Nested Loop: PG Parallel Hash Join Inner | goopg Parallel Hash Join Inner
+Q53 MATCH (no structural divergence)
+Q54 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q55 MATCH (no structural divergence)
+Q56 MATCH (no structural divergence)
+Q57 MATCH (no structural divergence)
+Q58 depth=2 [qual-placement] under Incremental Sort: PG Merge Join Inner | goopg Merge Join Inner
+Q59 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q60 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q61 depth=3 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+Q62 MATCH (no structural divergence)
+Q63 MATCH (no structural divergence)
+Q64 depth=3 [sort-strategy] under GroupAggregate: PG Incremental Sort | goopg Sort
+Q65 depth=3 [join-method] under Nested Loop: PG Merge Join Inner | goopg Hash Join Inner
+Q66 depth=3 [parallelism] under Sort: PG Append | goopg Gather
+Q67 depth=4 [scan-type] under Sort: PG Subquery Scan on dw1 | goopg GroupAggregate
+Q68 depth=4 [scan-type] under Nested Loop: PG Index Scan customer_pkey on customer | goopg Bitmap Heap Scan on customer
+Q69 depth=3 [join-order] under Sort: PG Hash Join Left Anti | goopg Hash Join Left Anti
+Q70 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q71 depth=4 [join-order] under Gather: PG Nested Loop Inner | goopg Nested Loop Inner
+Q72 depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Left | goopg Sort
+Q73 depth=2 [scan-type] under Nested Loop: PG Index Scan customer_pkey on customer | goopg Bitmap Heap Scan on customer
+Q74 MATCH (no structural divergence)
+Q75 MATCH (no structural divergence)
+Q76 depth=6 [join-method] under Append: PG Parallel Hash Join Inner | goopg Nested Loop Inner
+Q77 depth=4 [join-order] under Append: PG Merge Join Left | goopg Merge Join Left
+Q78 depth=1 [sort-strategy] under Limit: PG Sort | goopg Incremental Sort
+Q79 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q80 MATCH (no structural divergence)
+Q81 depth=4 [scan-type] under Nested Loop: PG Index Scan customer_pkey on customer | goopg Bitmap Heap Scan on customer
+Q82 MATCH (no structural divergence)
+Q83 depth=7 [join-method] under Nested Loop: PG Hash Join Left Semi | goopg Hash Join Inner
+Q84 MATCH (no structural divergence)
+Q85 depth=7 [join-order] under Nested Loop: PG Nested Loop Inner | goopg Nested Loop Inner
+Q86 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q87 depth=5 [sort-strategy] under Gather Merge: PG Unique | goopg Sort
+Q88 MATCH (no structural divergence)
+Q89 MATCH (no structural divergence)
+Q90 MATCH (no structural divergence)
+Q91 MATCH (no structural divergence)
+Q92 depth=3 [join-method] under Aggregate: PG Nested Loop Inner | goopg Hash Join Inner
+Q93 MATCH (no structural divergence)
+Q94 MATCH (no structural divergence)
+Q95 depth=3 [sort-strategy] under Aggregate: PG Nested Loop Left Semi | goopg Sort
+Q96 MATCH (no structural divergence)
+Q97 MATCH (no structural divergence)
+Q98 MATCH (no structural divergence)
+Q99 depth=6 [join-order] under Hash Join: PG Hash Join Inner | goopg Hash Join Inner
+FIRST-DIVERGENCE: queries=99 divergent=57 match=42
+CATEGORY-ROLLUP: sort-strategy=16 join-order=9 join-method=8 scan-type=7 parallelism=6 aggregation-strategy=4 parameterisation=3 error=3 qual-placement=1
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):
+    5  sort-strategy    under Limit            PG Incremental Sort             goopg Sort                         depth=1
+    3  parallelism      under Nested Loop      PG Nested Loop Inner            goopg Gather Merge                 depth=4
+    3  error            under -                PG -                            goopg -                            depth=0
+    2  sort-strategy    under GroupAggregate   PG Sort                         goopg Gather Merge                 depth=2
+    2  scan-type        under Nested Loop      PG Index Scan customer_pkey on customer goopg Bitmap Heap Scan on customer depth=2
+    2  sort-strategy    under Gather Merge     PG Unique                       goopg Sort                         depth=5
+    2  join-order       under Nested Loop      PG Parallel Hash Join Inner     goopg Parallel Hash Join Inner     depth=6
+    2  join-method      under Sort             PG Nested Loop Inner            goopg Hash Join Inner              depth=2
+    2  scan-type        under Nested Loop      PG Index Scan customer_pkey on customer goopg Bitmap Heap Scan on customer depth=4
+    1  scan-type        under Nested Loop      PG Index Scan customer_pkey on customer goopg Bitmap Heap Scan on customer depth=3
+    1  aggregation-strategy under CTE              PG Finalize HashAggregate       goopg HashAggregate                depth=2
+    1  join-order       under Nested Loop      PG Parallel Hash Join Inner     goopg Parallel Hash Join Inner     depth=9
+    1  sort-strategy    under GroupAggregate   PG Nested Loop Inner            goopg Sort                         depth=3
+    1  parameterisation under Nested Loop      PG Nested Loop Inner            goopg Nested Loop Inner            depth=6
+    1  parallelism      under Sort             PG Nested Loop Inner            goopg Gather                       depth=4
+    1  aggregation-strategy under Sort             PG Finalize GroupAggregate      goopg GroupAggregate               depth=2
+    1  scan-type        under Hash Join        PG Index Only Scan customer_pkey on customer customer_3 goopg Seq Scan on customer customer_3 depth=4
+    1  join-method      under Nested Loop      PG Nested Loop Inner            goopg Hash Join Inner              depth=5
+    1  parameterisation under Aggregate        PG Hash Join Inner              goopg Hash Join Inner              depth=2
+    1  sort-strategy    under GroupAggregate   PG Sort                         goopg Gather Merge                 depth=5
+    1  sort-strategy    under GroupAggregate   PG Incremental Sort             goopg Sort                         depth=2
+    1  join-order       under Nested Loop      PG Nested Loop Inner            goopg Nested Loop Inner            depth=6
+    1  parallelism      under HashAggregate    PG Hash Join Inner              goopg Gather                       depth=4
+    1  aggregation-strategy under Limit            PG Finalize GroupAggregate      goopg GroupAggregate               depth=1
+    1  parameterisation under Limit            PG Nested Loop Inner            goopg Nested Loop Inner            depth=1
+    1  join-method      under Nested Loop      PG Nested Loop Inner            goopg Hash Join Inner              depth=3
+    1  qual-placement   under Incremental Sort PG Merge Join Inner             goopg Merge Join Inner             depth=2
+    1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+    1  sort-strategy    under GroupAggregate   PG Incremental Sort             goopg Sort                         depth=3
+    1  join-method      under Nested Loop      PG Merge Join Inner             goopg Hash Join Inner              depth=3
+    1  parallelism      under Sort             PG Append                       goopg Gather                       depth=3
+    1  scan-type        under Sort             PG Subquery Scan on dw1         goopg GroupAggregate               depth=4
+    1  join-order       under Sort             PG Hash Join Left Anti          goopg Hash Join Left Anti          depth=3
+    1  join-order       under Gather           PG Nested Loop Inner            goopg Nested Loop Inner            depth=4
+    1  sort-strategy    under GroupAggregate   PG Nested Loop Left             goopg Sort                         depth=3
+    1  join-method      under Append           PG Parallel Hash Join Inner     goopg Nested Loop Inner            depth=6
+    1  join-order       under Append           PG Merge Join Left              goopg Merge Join Left              depth=4
+    1  sort-strategy    under Limit            PG Sort                         goopg Incremental Sort             depth=1
+    1  join-method      under Nested Loop      PG Hash Join Left Semi          goopg Hash Join Inner              depth=7
+    1  join-order       under Nested Loop      PG Nested Loop Inner            goopg Nested Loop Inner            depth=7
+    1  join-method      under Aggregate        PG Nested Loop Inner            goopg Hash Join Inner              depth=3
+    1  sort-strategy    under Aggregate        PG Nested Loop Left Semi        goopg Sort                         depth=3
+    1  join-order       under Hash Join        PG Hash Join Inner              goopg Hash Join Inner              depth=6

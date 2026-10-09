@@ -1,0 +1,72 @@
+Limit  (cost=19554.65..19554.69 rows=2 width=160) (actual rows=100.00 loops=1)
+  ->  GroupAggregate  (cost=19554.65..19554.67 rows=2 width=160) (actual rows=100.00 loops=1)
+        Group Key: item.i_item_id
+        ->  Gather Merge  (cost=19554.39..19554.63 rows=2 width=820) (actual rows=1904.00 loops=1)
+              Workers Planned: 3
+              Workers Launched: 3
+              ->  Sort  (cost=18554.35..18554.36 rows=1 width=820)
+                    Sort Key: item.i_item_id
+                    Worker 0:  actual time=0.000..0.000 rows=511.00 loops=1
+                    Worker 1:  actual time=0.000..0.000 rows=442.00 loops=1
+                    Worker 2:  actual time=0.000..0.000 rows=453.00 loops=1
+                    Worker 3:  actual time=0.000..0.000 rows=498.00 loops=1
+                    Sort Method: quicksort  Memory: 1261kB
+                    Worker 0:  Sort Method: quicksort  Memory: 1292kB
+                    Worker 1:  Sort Method: quicksort  Memory: 1121kB
+                    Worker 2:  Sort Method: quicksort  Memory: 1146kB
+                    ->  Nested Loop  (cost=1960.92..18554.34 rows=1 width=820)
+                          Worker 0:  actual time=0.000..0.000 rows=511.00 loops=1
+                          Worker 1:  actual time=0.000..0.000 rows=442.00 loops=1
+                          Worker 2:  actual time=0.000..0.000 rows=453.00 loops=1
+                          Worker 3:  actual time=0.000..0.000 rows=498.00 loops=1
+                          ->  Nested Loop  (cost=1960.67..18554.06 rows=1 width=340)
+                                Worker 0:  actual time=0.000..0.000 rows=511.00 loops=1
+                                Worker 1:  actual time=0.000..0.000 rows=442.00 loops=1
+                                Worker 2:  actual time=0.000..0.000 rows=453.00 loops=1
+                                Worker 3:  actual time=0.000..0.000 rows=498.00 loops=1
+                                ->  Hash Join  (cost=1960.30..17829.03 rows=1056 width=192)
+                                      Hash Cond: (store_sales.ss_promo_sk = promotion.p_promo_sk)
+                                      Worker 0:  actual time=0.000..0.000 rows=33514.00 loops=1
+                                      Worker 1:  actual time=0.000..0.000 rows=33654.00 loops=1
+                                      Worker 2:  actual time=0.000..0.000 rows=33897.00 loops=1
+                                      Worker 3:  actual time=0.000..0.000 rows=32236.00 loops=1
+                                      Buckets: 1024  Batches: 1  Memory Usage: 98kB  Build Time: 0.510 ms
+                                      ->  Parallel Hash Join  (cost=1944.80..17810.59 rows=1104 width=124)
+                                            Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                            Worker 0:  actual time=0.000..0.000 rows=34455.00 loops=1
+                                            Worker 1:  actual time=0.000..0.000 rows=34552.00 loops=1
+                                            Worker 2:  actual time=0.000..0.000 rows=34790.00 loops=1
+                                            Worker 3:  actual time=0.000..0.000 rows=33033.00 loops=1
+                                            Buckets: 1024  Batches: 1  Memory Usage: 63kB  Build Time: 13.968 ms
+                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                                  Worker 0:  actual time=0.000..0.000 rows=183825.00 loops=1
+                                                  Worker 1:  actual time=0.000..0.000 rows=181736.00 loops=1
+                                                  Worker 2:  actual time=0.000..0.000 rows=185947.00 loops=1
+                                                  Worker 3:  actual time=0.000..0.000 rows=168368.00 loops=1
+                                            ->  Parallel Seq Scan on date_dim  (cost=0.00..1942.12 rows=214 width=420)
+                                                  Filter: (d_year = 2001)
+                                                  Worker 0:  actual time=0.000..0.000 rows=52.00 loops=1
+                                                  Worker 1:  actual time=0.000..0.000 rows=83.00 loops=1
+                                                  Worker 2:  actual time=0.000..0.000 rows=126.00 loops=1
+                                                  Worker 3:  actual time=0.000..0.000 rows=104.00 loops=1
+                                      ->  Seq Scan on promotion  (cost=0.00..11.75 rows=300 width=468)
+                                            Filter: ((p_channel_email = 'N') OR (p_channel_event = 'N'))
+                                            Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                            Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                            Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                            Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.38..0.69 rows=1 width=148)
+                                      Index Cond: (cd_demo_sk = store_sales.ss_cdemo_sk)
+                                      Filter: (((cd_gender = 'F') AND (cd_marital_status = 'W')) AND (cd_education_status = 'College'))
+                                      Worker 0:  actual time=0.000..0.000 rows=0.02 loops=33514
+                                      Worker 1:  actual time=0.000..0.000 rows=0.01 loops=33654
+                                      Worker 2:  actual time=0.000..0.000 rows=0.01 loops=33897
+                                      Worker 3:  actual time=0.000..0.000 rows=0.02 loops=32236
+                          ->  Index Scan using item_pkey on item  (cost=0.25..0.28 rows=1 width=480)
+                                Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                                Worker 0:  actual time=0.000..0.000 rows=1.00 loops=511
+                                Worker 1:  actual time=0.000..0.000 rows=1.00 loops=442
+                                Worker 2:  actual time=0.000..0.000 rows=1.00 loops=453
+                                Worker 3:  actual time=0.000..0.000 rows=1.00 loops=498
+Planning Time: 0.008 ms
+Execution Time: 631.765 ms

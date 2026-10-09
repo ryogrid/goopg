@@ -288,7 +288,7 @@ func TestIndexOnlyPathTargetMatchesWidth(t *testing.T) {
 	if len(needed) != 2 {
 		t.Fatalf("neededColumnsOf = %v, want [k v]", needed)
 	}
-	if !s.addOneIndexOnlyPath(c, rel, tbl, idxs[0], needed, nil, 10000, 100000, 10000) {
+	if !s.addOneIndexOnlyPath(c, rel, tbl, idxs[0], needed, nil, nil, 10000, 100000, 10000) {
 		t.Fatal("addOneIndexOnlyPath declined a covered index; the fixture is wrong")
 	}
 	p := rel.Pathlist[len(rel.Pathlist)-1]
@@ -1193,6 +1193,14 @@ func TestSlice3WitnessModelArithmetic(t *testing.T) {
 // slice3Q9Catalog builds the six TPC-H relations at realistic widths with
 // analyzed stats (no indexes — the live Q9 baseline is all seq scans), so
 // the 6-way comma join plans as hash joins the derivation can narrow.
+// slice3Q9KeyNDistinct is the TPC-H SF1 key cardinality the Q9 fixture's
+// ANALYZE would record.
+var slice3Q9KeyNDistinct = map[string]int64{
+	"p_partkey": 200_000, "s_suppkey": 10_000, "o_orderkey": 1_500_000, "n_nationkey": 25,
+	"l_partkey": 200_000, "l_suppkey": 10_000, "l_orderkey": 1_500_000,
+	"ps_partkey": 200_000, "ps_suppkey": 10_000, "s_nationkey": 25, "o_custkey": 100_000,
+}
+
 func slice3Q9Catalog(t *testing.T) catalog.Catalog {
 	t.Helper()
 	c := catalog.NewInMemory()
@@ -1215,7 +1223,17 @@ func slice3Q9Catalog(t *testing.T) catalog.Catalog {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true})
+		// Key columns carry what ANALYZE would measure: a primary key is
+		// distinct per row, a foreign key has its parent's row count. Without
+		// them every hash key is a default-ndistinct key, which PG prices at a
+		// 0.1 bucket (estimate_hash_bucket_stats, M0146-0005 slice 5).
+		colStats := make([]catalog.ColumnStats, len(cols))
+		for i, cn := range cols {
+			if nd, ok := slice3Q9KeyNDistinct[cn]; ok {
+				colStats[i] = catalog.ColumnStats{NDistinct: nd}
+			}
+		}
+		c.SetTableStats(tbl, &catalog.TableStats{RowCount: rows[name], Pages: int(rows[name] / 100), Analyzed: true, Columns: colStats})
 	}
 	mk("part", "p_partkey", "p_name", "p_mfgr", "p_brand", "p_type", "p_size", "p_container", "p_retailprice", "p_comment")
 	mk("supplier", "s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment")
@@ -1622,7 +1640,9 @@ func TestSlice3LateralDeclinesDerivation(t *testing.T) {
 	mk("nation", 500_000, "n_nationkey", "n_name", "n_regionkey", "n_comment")
 	mk("lineitem", 6_000_000, "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment")
 	mk("orders", 1_500_000, "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment")
-	sql := `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT') dt where s_nationkey = n_nationkey`
+	// OFFSET 0 fences the LATERAL body against pull-up (M0146-0028h), so
+	// the Lateral join under test survives.
+	sql := `select s_name, n_name, dt.o, dt.od from supplier s, nation n, lateral (select l_orderkey as o, o_orderdate as od from lineitem l, orders o where l_orderkey = o_orderkey and l_suppkey = s.s_suppkey and o_orderpriority = '1-URGENT' offset 0) dt where s_nationkey = n_nationkey`
 	stmt := parseOne(t, sql)
 	if nc, known := neededColumnNames(stmt.(*parser.SelectStmt)); known || nc != nil {
 		t.Errorf("outer needed = (%v, %v); a lateral rangevar must decline the set", nc, known)
@@ -1738,6 +1758,11 @@ func slice3BuildProjectsExcept(n, skip Node) []*Project {
 		}
 		if j, ok := n.(*Join); ok {
 			for _, side := range []Node{j.Left, j.Right} {
+				// A merge input's Sort sits above the narrowed node
+				// (restoreMergeSort, M0146-0099).
+				if srt, isSort := side.(*Sort); isSort && j.Algo == JoinAlgoMerge {
+					side = srt.Child
+				}
 				if p, isProj := side.(*Project); isProj && slice3IsNarrowBuild(p) {
 					out = append(out, p)
 				}
@@ -1900,6 +1925,7 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 // does not, and an outer reference sealed inside a subplan does not (it
 // belongs to the body's own scope — scopeIgnore steps over it).
 func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	outer := &OuterColumnRef{Name: "p_partkey", Index: 3}
 	local := func(name string, idx int) *ColumnRef { return &ColumnRef{Name: name, Index: idx} }
 	corr := &BinaryOp{Op: parser.OpEq, Left: local("ps_partkey", 0), Right: outer}

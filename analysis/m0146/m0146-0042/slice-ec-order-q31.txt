@@ -1,0 +1,75 @@
+# M0146-0042 slice: EC-derived restriction order + member = const orientation (code 7b5892287)
+# fire-set captures tmp/fireset-m42e (baseline = e8804d2e1, candidate = staged change)
+
+## text-identical (costs stripped)
+sf025 baseline 38
+sf025 candidate 39
+sf1 baseline 28
+sf1 candidate 28
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=11
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=12
+
+## Q31 SF0.25 baseline vs PG (costs stripped; candidate now equals PG)
+42c42
+<                                        Filter: ((d_qoy = 3) AND (d_year = 1999))
+---
+>                                        Filter: ((d_year = 1999) AND (d_qoy = 3))
+46c46
+<                            Filter: ((d_qoy = 2) AND (d_year = 1999))
+---
+>                            Filter: ((d_year = 1999) AND (d_qoy = 2))
+48c48
+<                      Filter: ((d_qoy = 3) AND (d_year = 1999))
+---
+>                      Filter: ((d_year = 1999) AND (d_qoy = 3))
+50c50
+<                Filter: ((d_qoy = 2) AND (d_year = 1999))
+---
+>                Filter: ((d_year = 1999) AND (d_qoy = 2))
+
+## Q31 SF1 candidate vs PG (join order inside CTE ss only)
+9c9
+<                  Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+---
+>                  Hash Cond: (store_sales.ss_addr_sk = customer_address.ca_address_sk)
+11c11
+<                        Hash Cond: (store_sales.ss_addr_sk = customer_address.ca_address_sk)
+---
+>                        Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+14c14
+<                              ->  Seq Scan on customer_address
+---
+>                              ->  Seq Scan on date_dim
+16c16
+<                        ->  Seq Scan on date_dim
+---
+>                        ->  Seq Scan on customer_address
+
+## regress join.diff, HEAD vs change (14-file suite)
+5142c5142
+< +  Filter: (1 = a)
+---
+> +  Filter: (a = 1)
+5261c5261
+< +  Filter: ((a = 2) AND (3 = c))
+---
+> +  Filter: ((a = 2) AND (c = 3))
+5268,5280d5267
+< @@ -7011,11 +6543,11 @@
+<   Nested Loop
+<    Join Filter: (j1.b = j2.b)
+<    ->  Seq Scan on sj j1
+<    Filter: ((2 = a) AND (c = 3))
+<    ->  Seq Scan on sj j2
+< -  Filter: ((c = 3) AND (a = 1))
+< +  Filter: ((a = 1) AND (3 = c))
+<  (6 rows)
+<  CREATE UNIQUE INDEX sj_temp_idx ON sj(a,b);
+<  -- Don't remove SJ
+<  EXPLAIN (COSTS OFF)
+<  SELECT * FROM sj j1, sj j2 WHERE j1.b = j2.b AND j1.a = 2;

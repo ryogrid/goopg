@@ -1,0 +1,28 @@
+28c28
+< Q28 depth=7 [sort-strategy] under Aggregate: PG Gather Merge | goopg Sort
+---
+> Q28 depth=7 [parallelism] under Aggregate: PG Gather Merge | goopg Gather
+88c88
+< Q88 depth=7 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+---
+> Q88 MATCH (no structural divergence)
+90c90
+< Q90 depth=3 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+---
+> Q90 MATCH (no structural divergence)
+100,101c100,101
+< FIRST-DIVERGENCE: queries=99 divergent=91 match=8
+< CATEGORY-ROLLUP: sort-strategy=33 aggregation-strategy=14 qual-placement=14 join-method=8 scan-type=6 parallelism=6 join-order=4 parameterisation=3 error=3
+---
+> FIRST-DIVERGENCE: queries=99 divergent=89 match=10
+> CATEGORY-ROLLUP: sort-strategy=32 qual-placement=14 aggregation-strategy=12 join-method=8 parallelism=7 scan-type=6 join-order=4 parameterisation=3 error=3
+122d121
+<     2  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+134c133
+<     1  sort-strategy    under Aggregate        PG Gather Merge                 goopg Sort                         depth=7
+---
+>     1  parallelism      under Aggregate        PG Gather Merge                 goopg Gather                       depth=7
+145a145
+>     1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+156d155
+<     1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=7

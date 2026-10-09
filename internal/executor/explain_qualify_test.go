@@ -190,9 +190,9 @@ func TestExplainLeavesSingleRelationQualsBare(t *testing.T) {
 	lines := qualifyExplainLines(t, "EXPLAIN SELECT id FROM eq_r WHERE st = 'a'")
 
 	got := findLine(lines, "Filter:")
-	if got != "Filter: (st = 'a')" {
+	if got != "Filter: (st = 'a'::text)" {
 		t.Errorf("single-relation filter should stay unqualified:\n got %q\nwant %q\nplan:\n%s",
-			got, "Filter: (st = 'a')", strings.Join(lines, "\n"))
+			got, "Filter: (st = 'a'::text)", strings.Join(lines, "\n"))
 	}
 }
 
@@ -224,16 +224,31 @@ func TestExplainLeavesScanQualBare(t *testing.T) {
 // confident, wrong relation name — worse than the bare name it replaced.
 // The column-membership guard degrades those refs back to unqualified.
 func TestExplainDoesNotQualifyDerivedColumns(t *testing.T) {
+	// OFFSET 0 keeps the subquery a separate scope (PG's pull-up fence),
+	// which is the shape the hazard lives in.
 	lines := qualifyExplainLines(t,
-		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id) t "+
+		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id OFFSET 0) t "+
 			"WHERE t.s1 <> t.s2")
 
-	got := findLine(lines, "s1 <> s2")
+	// PG 18.3 prints the Subquery Scan's own alias here (show_scan_qual
+	// prefixes a SubqueryScan's quals): `Filter: (t.s1 <> t.s2)`
+	// (M0146-0005cs).
+	got := findLine(lines, "t.s1 <> t.s2")
 	if got == "" {
 		t.Fatalf("derived-column filter missing or wrongly qualified:\n%s", strings.Join(lines, "\n"))
 	}
 	if strings.Contains(got, "a.s2") || strings.Contains(got, "b.s1") {
 		t.Errorf("derived column attributed to the wrong relation: %q", got)
+	}
+
+	// Without the fence the subquery is pulled up (M0146-0028b,
+	// pull_up_simple_subquery): the qual is over the base columns it
+	// renames and renders as PG prints it.
+	pulled := qualifyExplainLines(t,
+		"EXPLAIN SELECT t.s1 FROM (SELECT a.st AS s1, b.st AS s2 FROM eq_r a, eq_r b WHERE a.id = b.id) t "+
+			"WHERE t.s1 <> t.s2")
+	if findLine(pulled, "a.st <> b.st") == "" {
+		t.Errorf("pulled-up qual not rendered over its base columns:\n%s", strings.Join(pulled, "\n"))
 	}
 }
 
@@ -270,7 +285,9 @@ func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
 		if strings.HasPrefix(trimmed, "->  ") {
 			trimmed = trimmed[4:]
 		}
-		if strings.HasPrefix(trimmed, "Seq Scan on eq_r_1") {
+		// PG's ExplainTargetRel prints the relation, then the
+		// disambiguated range-table name: `eq_r eq_r_1`.
+		if strings.HasPrefix(trimmed, "Seq Scan on eq_r eq_r_1") {
 			hasDisambiguated = true
 		} else if strings.HasPrefix(trimmed, "Seq Scan on eq_r") {
 			hasBare = true
@@ -281,7 +298,7 @@ func TestExplainNodeLabelDisambiguatesRepeatedTable(t *testing.T) {
 			strings.Join(lines, "\n"))
 	}
 	if !hasDisambiguated {
-		t.Errorf("expected one Seq Scan on eq_r_1 (disambiguated) line\nplan:\n%s",
+		t.Errorf("expected one Seq Scan on eq_r eq_r_1 (disambiguated) line\nplan:\n%s",
 			strings.Join(lines, "\n"))
 	}
 }
@@ -464,5 +481,32 @@ func TestJSONCollapsesProjectFilterWrappersLikeText(t *testing.T) {
 	}
 	if len(filters) != 1 || filters[0] != "(a = 42)" {
 		t.Errorf("JSON Filter properties = %v, want [(a = 42)]", filters)
+	}
+}
+
+// TestExplainCTEBodyJoinQualifiesOwnLevel pins M0146-0005t: SourceTableIdx
+// restarts at 1 in every query level, so a statement-wide lookup handed the
+// CTE body's join columns the OUTER query's relations. PG deparses a Var
+// through the plan node's own children (set_deparse_plan), so the body's
+// join prints its own aliases, as TPC-DS Q14's cross_items prints
+// `d1.d_date_sk`.
+func TestExplainCTEBodyJoinQualifiesOwnLevel(t *testing.T) {
+	lines := qualifyExplainLines(t,
+		"EXPLAIN (COSTS OFF) WITH c AS MATERIALIZED (SELECT a.id FROM eq_r a JOIN eq_r b ON a.st = b.st) "+
+			"SELECT eq_r.id FROM eq_r JOIN eq_r y ON eq_r.st = y.st JOIN c ON c.id = eq_r.id")
+	t.Logf("plan:\n%s", strings.Join(lines, "\n"))
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "Cond:") && strings.Contains(l, ".st = ") {
+			if strings.Contains(l, "a.st") || strings.Contains(l, "b.st") {
+				found = true
+				if strings.Contains(l, "eq_r.") || strings.Contains(l, "y.") {
+					t.Errorf("CTE body join mixes the outer level's names: %q", l)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("CTE body join condition not qualified with its own aliases a/b:\n%s", strings.Join(lines, "\n"))
 	}
 }

@@ -1,0 +1,1 @@
+               Join Filter: ((current_addr.ca_city)::text <> (customer_address.ca_city)::text)

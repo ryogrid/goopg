@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -189,21 +190,33 @@ func TestAggregateInputTargetUnknownOnFilter(t *testing.T) {
 	assertAggregateInputTargetCoversKeys(a)
 }
 
-// TestAggregateInputTargetUnknownOnPassthrough: any Passthrough present
-// declines — walkPlanExprs' Aggregate arm never walks Passthrough either.
-func TestAggregateInputTargetUnknownOnPassthrough(t *testing.T) {
-	a := gitAgg([]string{"a", "b"},
+// TestAggregateInputTargetKeepsPassthrough (M0146-0005ah): a Passthrough
+// column is an input-row read like a group key, so the keep covers it and
+// drops only what nothing reads. It used to decline, which priced every
+// functionally-reduced grouping (TPC-H Q18) on its full input row. An
+// unenumerable passthrough still declines.
+func TestAggregateInputTargetKeepsPassthrough(t *testing.T) {
+	a := gitAgg([]string{"a", "b", "c", "d"},
 		[]Expr{gitCol("a", 0)},
 		[]AggregateCall{{Name: "sum", Arg: gitCol("b", 1)}})
-	a.Passthrough = []Expr{gitCol("b", 1)}
-	if _, ok := deriveAggregateInputKeep(a, nil); ok {
-		t.Fatal("passthrough aggregate derived known; want unknown")
+	a.Passthrough = []Expr{gitCol("c", 2)}
+	keep, ok := deriveAggregateInputKeep(a, nil)
+	if !ok {
+		t.Fatal("passthrough aggregate derived unknown; want known")
+	}
+	if fmt.Sprint(keep) != "[0 1 2]" {
+		t.Fatalf("keep = %v; want [0 1 2] (d dropped, passthrough c kept)", keep)
 	}
 	stampAggregateInputTarget(a, nil)
-	if a.InputTargetKnown || a.InputTarget != nil {
-		t.Fatalf("stamp = (%v, %v); want (nil, false)", a.InputTarget, a.InputTargetKnown)
+	if !a.InputTargetKnown {
+		t.Fatal("stamp declined a passthrough aggregate")
 	}
 	assertAggregateInputTargetCoversKeys(a)
+
+	a.Passthrough = []Expr{&OuterColumnRef{Level: 1, Index: 0, Name: "c"}}
+	if _, ok := deriveAggregateInputKeep(a, nil); ok {
+		t.Fatal("outer-ref passthrough derived known; want unknown")
+	}
 }
 
 // TestAggregateInputTargetUnknownOnOuterRefKey: a group key reading another
@@ -316,7 +329,11 @@ func TestAggregateAssertFiresOnUncoveredKey(t *testing.T) {
 			t.Fatalf("panic %q does not name the dropped key", msg)
 		}
 	}()
-	stampAggregateInputTarget(a, nil)
+	// M0146-0030: the derivation now DECLINES a key naming no input
+	// column (an alias list renames the binding, not the input), so the
+	// known-but-uncovering stamp is hand-built to exercise the assert.
+	a.InputTarget, a.InputTargetKnown = []int{0}, true
+	assertAggregateInputTargetCoversKeys(a)
 }
 
 // TestAssertFiresOnHandBuiltUncoveringStamp: the assert also fires when the

@@ -83,7 +83,10 @@ package optimizer
 // production trees DO carry the tag and all three skips are reachable on real
 // plans — the same correction enclosingtree.go's header already carries.
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // searchedTree is the tag. It is embedded (not a named field) so that every
 // carrier gets the same two methods, and so that `isSearchedTree` can ask for
@@ -248,6 +251,11 @@ func searchedJoinInputRelOf(n Node) *RelOptInfo {
 				return nil
 			}
 			n = x.Child
+		case *Materialize:
+			if x.Child == nil {
+				return nil
+			}
+			n = x.Child
 		case *OrdinalityWrap:
 			n = x.Child
 		case *LockRows:
@@ -267,9 +275,9 @@ func searchedJoinInputRelOf(n Node) *RelOptInfo {
 //
 // The panic is deliberate — see the file header. The carrier set is the set of
 // node kinds `createPlanNode` can return at the root: the join arms' `*Join` and
-// `*NestedLoopIndexJoin`, the scan arms' `*SeqScan` / `*IndexScan` and the
-// `*Filter` their leaf rewrapper can restore around one, `*Sort` from the
-// pathkey arm, and `*Project` from the boundary itself.
+// `*NestedLoopIndexJoin`, the scan arms' `*SeqScan` / `*IndexScan` /
+// `*BitmapHeapScan` and the `*Filter` their leaf rewrapper can restore around
+// one, `*Sort` from the pathkey arm, and `*Project` from the boundary itself.
 func markSearchedTree(n Node) Node {
 	if n == nil {
 		panic("createPlan: asked to tag a nil search root")
@@ -399,4 +407,253 @@ func snapshotColumnRefIndices(n Node) ([]*ColumnRef, []int) {
 		}
 	})
 	return refs, idx
+}
+
+// searchedCheapestTotalInput rebuilds the searched subtree inside `child`
+// over its rel's CheapestTotal path — the `input_rel->cheapest_total_path`
+// upstream's upper stages price every input-consuming arm over
+// (planner.c:7122, :5047, :5314) — and returns the wrapper chain with the
+// rebuilt root spliced back, plus the path it was rebuilt over.
+//
+// Why. `planJoinlistSearch` collapses the search to `finalPath` — the
+// `get_cheapest_fractional_path` pick — because one node is all the seam
+// can return. Under a LIMIT the fractional pick is a startup-optimal
+// subtree whose total is NOT the rel's cheapest: TPC-DS Q22's `LIMIT 100`
+// elects a memoized NLI chain for {inventory,date_dim,item} while the
+// rel's cheapest-total path is the costed Gather over the partial
+// nested-loop/parallel-hash subtree. PG never makes this choice twice:
+// the boundary does not exist there, and `add_paths_to_grouping_rel`
+// reads `input_rel->cheapest_total_path` from the live rel regardless of
+// which path the final fraction favours. This is the goopg equivalent of
+// that read: the subtree the cheapest-total path would have produced had
+// the boundary committed to it.
+//
+// nil whenever the rebuild cannot promise the same row the committed
+// subtree publishes:
+//
+//   - no searched subtree reachable through the *Project/*Sort wrapper
+//     chain — the measured shapes above a searched aggregate input. Every
+//     other kind (Gather, Memoize, LockRows, joins, set ops) ends the
+//     walk: a Gather above the searched root means parallelism was
+//     already decided, and a row-shaping wrapper means the spliced
+//     subtree is not the input the arms are priced on;
+//   - the rel is missing or carries no cheapest-total path, or that path
+//     is not strictly cheaper than the committed subtree's own cost —
+//     the guard that makes the no-divergence case a no-op rather than a
+//     second identical candidate;
+//   - the path's emission cannot reproduce the boundary row
+//     (searchedBoundaryRebuild).
+func searchedCheapestTotalInput(n Node) (Node, *Path) {
+	if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+		rel := s.searchedRel()
+		if rel == nil || rel.CheapestTotal == nil {
+			return nil, nil
+		}
+		p := rel.CheapestTotal
+		if pc := legacyDisplayCostOf(n); !(p.Cost.Total < pc.TotalCost) {
+			return nil, nil
+		}
+		r := searchedBoundaryRebuild(p, s.Output())
+		if r == nil {
+			return nil, nil
+		}
+		return r, p
+	}
+	switch x := n.(type) {
+	case *Project:
+		if c, p := searchedCheapestTotalInput(x.Child); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	case *Sort:
+		if c, p := searchedCheapestTotalInput(x.Child); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	}
+	return nil, nil
+}
+
+// searchedCheapestPartialInput is the partial-aggregate split's input:
+// upstream's create_partial_grouping_paths builds the partial aggregate on
+// `input_rel->cheapest_partial_path` (planner.c:7435-7470), priced at that
+// path's own per-worker cost. It returns the searched rel's cheapest partial
+// path rebuilt under a Gather through the same boundary as
+// searchedCheapestTotalInput (the split producer unwraps that Gather), plus the
+// partial path itself; nil when the searched input is unreachable, the search
+// built no partial path, or the path cannot be run or rebuilt under a Gather.
+func searchedCheapestPartialInput(n Node, cp costParams) (Node, *Path) {
+	if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+		rel := s.searchedRel()
+		if rel == nil || len(rel.PartialPathlist) == 0 || rel.PartialPathlist[0] == nil {
+			return nil, nil
+		}
+		pp := rel.PartialPathlist[0]
+		g := makeGatherPath(rel, pp, cp, false)
+		if g == nil {
+			return nil, nil
+		}
+		r := searchedBoundaryRebuild(g, s.Output())
+		if r == nil {
+			return nil, nil
+		}
+		return r, pp
+	}
+	switch x := n.(type) {
+	case *Project:
+		if c, p := searchedCheapestPartialInput(x.Child, cp); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	case *Sort:
+		if c, p := searchedCheapestPartialInput(x.Child, cp); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc, p
+		}
+	}
+	return nil, nil
+}
+
+// searchedCandidateInput is `searchedCheapestTotalInput` parameterized on the
+// path: rebuild `p` through the boundary at the searched root, then re-wrap
+// the same *Project/*Sort pass-through chain `n` carries above it. It is the
+// input-position half of upstream's `foreach(lc, input_rel->pathlist)` — PG's
+// upper stages (add_paths_to_grouping_rel, create_ordered_paths) offer every
+// surviving input path, not only cheapest_total_path, so an ordered runner-up
+// reaches the sorted-aggregate contest. nil on exactly the refusals
+// searchedCheapestTotalInput makes, minus the cheapest-total gate (the caller
+// chooses the path).
+func searchedCandidateInput(n Node, p *Path) Node {
+	if p == nil {
+		return nil
+	}
+	if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+		return searchedBoundaryRebuild(p, s.Output())
+	}
+	switch x := n.(type) {
+	case *Project:
+		if c := searchedCandidateInput(x.Child, p); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc
+		}
+	case *Sort:
+		if c := searchedCandidateInput(x.Child, p); c != nil {
+			cc := *x
+			cc.Child = c
+			return &cc
+		}
+	}
+	return nil
+}
+
+// searchedBoundaryRebuild builds the node `createPlanAtSearchRootRange`
+// would have published for `p` at the statement boundary — the same
+// binding-order row `exemplar` (the committed searched root's Output)
+// carries — or nil when p's emission cannot reproduce it.
+//
+// The pre-check is what keeps the call fail-closed rather than loud:
+// `boundaryMap` inside the rebuild PANICS on a layout that is not a
+// permutation of the window, and two legitimate cases hit it — a
+// sub-problem's rel, whose global binding coordinates lie outside
+// [0, width), and a path that publishes fewer columns than the boundary
+// emitted (a leaf narrowed differently). Both decline here. With coverage
+// proven the nil filler is sound: no hole exists for it to license.
+//
+// The schema compare at the end is belt over the boundary's own
+// `assertBoundaryColumnIdentity`, which already proves column identity
+// per coordinate against the range table; it costs one row comparison to
+// also catch a column that is the right coordinate carrying a different
+// type than the committed subtree published.
+func searchedBoundaryRebuild(p *Path, exemplar Schema) (r Node) {
+	defer func() {
+		// The lowering the committed subtree survived can still decline
+		// loudly for this path — boundaryMap's hole panic, or
+		// assertSearchedTreeNeedsNoReconcile disagreeing with a producer
+		// the search never committed to. The committed plan stands on its
+		// own, so an unreconstructable alternative input declines rather
+		// than turning a plannable query into a crash; the assert's
+		// signal is not lost because the same path stays priced and the
+		// producer bug it names is still reachable through the search.
+		if rec := recover(); rec != nil {
+			if dpTraceEnabled() {
+				fmt.Fprintf(os.Stderr, "DPPATH boundaryrebuild declined: %v\n", rec)
+			}
+			r = nil
+		}
+	}()
+	w := len(exemplar)
+	if w == 0 {
+		return nil
+	}
+	n, lay := createPlanNode(p)
+	if n == nil || lay == nil || len(lay) != len(n.Output()) {
+		return nil
+	}
+	// M0146-0027: replay the boundary's own hole-filler. The committed
+	// subtree published under this license — a narrowed leaf that dropped a
+	// below-only join key gets a padded NULL slot, not a declined rebuild —
+	// so a non-winning candidate carrying the same kind of hole must be
+	// judged by the same rule. A hole the filler declines (a column the
+	// statement does read) still fails closed, here rather than in
+	// boundaryMap's panic below.
+	var fill func(int) (SchemaColumn, bool)
+	if p.Rel != nil {
+		fill = p.Rel.BoundaryFill
+	}
+	seen := make([]bool, w)
+	for _, bind := range lay {
+		if bind < 0 || bind >= w || seen[bind] {
+			return nil
+		}
+		seen[bind] = true
+	}
+	for i := range seen {
+		if !seen[i] {
+			if fill == nil {
+				return nil
+			}
+			if _, ok := fill(i); !ok {
+				return nil
+			}
+		}
+	}
+	r = createPlanAtSearchRootRange(p, 0, w, fill)
+	if r == nil || len(r.Output()) != w || !outputSchemaEqual(r.Output(), exemplar) {
+		return nil
+	}
+	// M0146-0042a: the rebuilt tree's clause copies (an EC-reduced join
+	// clause, a parameterised scan's rebased Filter) are made here, after
+	// the seam oriented the committed tree; give them the same order.
+	if p.Rel != nil {
+		applyECOrientation(r, p.Rel.ecWant)
+	}
+	return r
+}
+
+// outputSchemaEqual reports whether two schemas carry the same column at
+// every position — Name, Type, SourceTableIdx and Resjunk — the full
+// identity a positional consumer reads.
+func outputSchemaEqual(a, b Schema) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ac, bc := a[i], b[i]
+		if ac.Name != bc.Name || ac.SourceTableIdx != bc.SourceTableIdx || ac.Resjunk != bc.Resjunk ||
+			ac.Type.Name != bc.Type.Name || ac.Type.IsArray != bc.Type.IsArray ||
+			len(ac.Type.Args) != len(bc.Type.Args) {
+			return false
+		}
+		for j := range ac.Type.Args {
+			if ac.Type.Args[j] != bc.Type.Args[j] {
+				return false
+			}
+		}
+	}
+	return true
 }

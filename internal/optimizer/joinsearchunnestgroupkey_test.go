@@ -146,6 +146,7 @@ func jsgDecorrelatedAgg(n Node) *Aggregate {
 // FROM. With the bug the key was 0 and named `r_regionkey`; the assertion
 // below fails on exactly that, at whatever offset a future search produces.
 func TestQ2DecorrelatedGroupKeyResolvesInAggregateInput(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	for _, on := range []bool{false, true} {
 		name := "pgshaped=false"
 		if on {

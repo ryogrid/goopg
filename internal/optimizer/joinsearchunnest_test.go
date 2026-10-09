@@ -176,6 +176,7 @@ func jsuColRefIndex(t *testing.T, e Expr, name string) int {
 // because both defects were flag-visible only and the flag must not change
 // where a column lives.
 func TestQ17DecorrelatedAggregateCoordinates(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	const (
 		outerWidth = 25 // lineitem(16) ++ part(9)
 		mergedWide = 27 // ++ the aggregate's (l_partkey, avg)

@@ -1,0 +1,12 @@
+45c45
+< Q45 depth=4 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q45 MATCH (no structural divergence)
+100,101c100,101
+< FIRST-DIVERGENCE: queries=99 divergent=90 match=9
+< CATEGORY-ROLLUP: sort-strategy=31 aggregation-strategy=23 parallelism=8 qual-placement=7 parameterisation=6 join-method=5 scan-type=5 error=3 join-order=2
+---
+> FIRST-DIVERGENCE: queries=99 divergent=89 match=10
+> CATEGORY-ROLLUP: sort-strategy=31 aggregation-strategy=23 parallelism=8 qual-placement=7 join-method=5 scan-type=5 parameterisation=5 error=3 join-order=2
+139d138
+<     1  parameterisation under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=4

@@ -67,6 +67,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 		// rebuilt from the carrier P5.5-a/-b landed on the path and the leaf
 		// `buildInitialRels` recorded on the rel. createplanindex.go.
 		n := createIndexScanPlan(p)
+		if p.paramSink != nil {
+			*p.paramSink = append(*p.paramSink, paramProbeNode{node: n, path: p})
+		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathSeqScan:
 		// The index arm's mirror (M0127-P5.5-d): the same leaf resolver with
@@ -112,6 +115,16 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 	case PathGatherMerge:
 		// The order-preserving twin, priced by cost_gather_merge.
 		return createGatherMergePlan(p)
+	case PathParamAppend:
+		// M0146-0049: the leaf's UNION ALL around its member probes; the keys
+		// are bound by the nested loop that consumes it
+		// (createNestLoopParamAppendPlan). paramappend.go.
+		n := createParamAppendNode(p)
+		return n, baseRelLayout(p.Rel, n)
+	case PathMaterial:
+		// M0146-0010: `make_material` — the plan half of the materialised
+		// inner PG's match_unsorted_outer elects. materialize.go.
+		return createMaterialPlan(p)
 	case PathMemoize:
 		// A Memoize path has NO arm here, deliberately (M0127-P5.4b-ii-b-2).
 		// goopg's executor expresses the cache as `NestedLoopIndexJoin.InnerMemo`
@@ -130,6 +143,9 @@ func createPlanNodeUnpriced(p *Path) (Node, outputLayout) {
 			// nil plan node and a confusing error much later. A failure here is a
 			// producer bug, the same class every other createPlan arm panics on.
 			panic("createPlan: PathBitmapHeapScan: " + err.Error())
+		}
+		if p.paramSink != nil {
+			*p.paramSink = append(*p.paramSink, paramProbeNode{node: n, path: p})
 		}
 		return n, baseRelLayout(p.Rel, n)
 	case PathBitmapIndexScan:

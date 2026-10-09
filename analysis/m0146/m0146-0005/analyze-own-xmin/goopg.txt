@@ -1,0 +1,23 @@
+=== goopg :5542 (post-fix binary) ===
+BEGIN
+CREATE TABLE
+INSERT 0 100
+ANALYZE
+ reltuples 
+-----------
+       100
+(1 row)
+
+DELETE 50
+ANALYZE
+ reltuples 
+-----------
+        50
+(1 row)
+
+COMMIT
+ reltuples 
+-----------
+        50
+(1 row)
+

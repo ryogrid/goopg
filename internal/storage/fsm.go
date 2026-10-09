@@ -265,6 +265,28 @@ func (f *FSM) RecordFreeSpaceForPage(rel RelFileNode, blk BlockNumber, p Page) {
 	f.RecordFreeSpace(rel, blk, uint16(free))
 }
 
+// TruncateRel forgets the entries for blocks at or beyond nblocks, as
+// FreeSpaceMapPrepareTruncateRel does when a heap is truncated: a later
+// lookup must not hand out a block that no longer exists. Nil-safe.
+func (f *FSM) TruncateRel(rel RelFileNode, nblocks BlockNumber) {
+	if f == nil {
+		return
+	}
+	key := fsmKeyFor(rel)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pages := f.pages[key]
+	if int(nblocks) >= len(pages) {
+		return
+	}
+	f.pages[key] = pages[:nblocks]
+	if int(nblocks) <= fsmChunkBlocks {
+		delete(f.chunkMax, key)
+		return
+	}
+	f.chunkMax[key] = buildChunkMax(f.pages[key])
+}
+
 // DropRelation removes all FSM entries for rel. Called on DROP TABLE /
 // TRUNCATE to prevent stale entries from directing inserts to non-existent
 // pages.

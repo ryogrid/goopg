@@ -1,0 +1,3 @@
+groupingsets 1880 -> 1880
+aggregates 1032 -> 1032
+select_parallel 1532 -> 1532

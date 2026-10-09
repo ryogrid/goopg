@@ -149,16 +149,16 @@ func TestExplainAnalyzeIndentDeepNesting(t *testing.T) {
 // InitPlan/SubPlan label bumps `es->indent` by only 1, not the 3
 // (2-for-arrow + 1-for-name) an ordinary child level adds. Shape verified
 // against postgres/src/test/regress/expected/aggregates.out:939-947
-// (`Result -> InitPlan 1 -> Limit -> ...`); goopg's plan (no index on `a`)
-// carries one extra Sort level below the Limit, giving InitPlan / Limit /
-// Sort / Seq Scan at depths 1/2/3/4 instead of PG's InitPlan / Limit /
-// Index Only Scan at 1/2/3 — still exercises the same plan_name-then-arrow
-// transition this test targets.
+// (`Result -> InitPlan 1 -> Limit -> Index Only Scan`). The index on `a` is
+// what makes it an InitPlan at all: without one PG keeps the plain
+// Aggregate (no presorted path for planagg, M0146-0005du).
 func TestExplainIndentInitPlanBranch(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
-	if err := runDDL(t, ctx, "CREATE TABLE t (a int, b int)"); err != nil {
-		t.Fatal(err)
+	for _, ddl := range []string{"CREATE TABLE t (a int, b int)", "CREATE INDEX t_a ON t (a)"} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
 	}
 	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT min(a) FROM t")
 
@@ -168,13 +168,10 @@ func TestExplainIndentInitPlanBranch(t *testing.T) {
 	if got := leadingSpaces(findIndentLine(t, lines, "->  Limit")); got != 4 {
 		t.Errorf("InitPlan body's own arrow: want 4 leading spaces (label childIndent+1, not label+2), got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "->  Sort")); got != 10 {
-		t.Errorf("nested Sort under Limit: want 10 leading spaces, got %d", got)
+	if got := leadingSpaces(findIndentLine(t, lines, "->  Index Only Scan")); got != 10 {
+		t.Errorf("nested Index Only Scan under Limit: want 10 leading spaces, got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "Sort Key: a")); got != 16 {
-		t.Errorf("Sort's own detail line: want 16 leading spaces, got %d", got)
-	}
-	if got := leadingSpaces(findIndentLine(t, lines, "Filter: (a IS NOT NULL)")); got != 22 {
-		t.Errorf("Seq Scan's Filter detail: want 22 leading spaces, got %d", got)
+	if got := leadingSpaces(findIndentLine(t, lines, "Index Cond: (a IS NOT NULL)")); got != 16 {
+		t.Errorf("Index Only Scan's Index Cond detail: want 16 leading spaces, got %d", got)
 	}
 }

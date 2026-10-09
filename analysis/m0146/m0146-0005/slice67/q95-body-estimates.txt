@@ -1,0 +1,8 @@
+TPC-DS SF0.25, max_parallel_workers_per_gather=0 (tmp/q95body.sql)
+query                                   PG 18.3 (:65438)   goopg before   goopg after
+ws1 x ws2 on order_number, wh <> wh        1752341           2168680        1759792
+ws1 x ws2 on order_number                  2190115           2179577        2199264
+ws1 x ws2 on order_number, wh = wh          437774            435799         439472
+Fixture w(o,h) 1000 rows, o 200 distinct, h 5 distinct (scratch PG 18.3 :5534):
+a.o = b.o AND a.h <> b.h  inner          4000                4975           4000
+EXISTS(... a.o=b.o AND a.h<>b.h) semi    1000                1000           1000

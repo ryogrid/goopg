@@ -1,0 +1,4 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H first-divergence census: identical to M0146-0005t
+regress: 41 pass-required cases using WITH or showing plans, candidate vs HEAD worktree: 13/41 both, every diff identical

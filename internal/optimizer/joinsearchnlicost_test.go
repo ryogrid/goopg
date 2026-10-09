@@ -84,8 +84,13 @@ func TestPGShapedSearchPicksHashJoinOnCost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cat.SetTableStats(a, &catalog.TableStats{RowCount: 500_000, Pages: 5_000, Analyzed: true})
-	cat.SetTableStats(b, &catalog.TableStats{RowCount: 400_000, Pages: 4_000, Analyzed: true})
+	// The join keys carry ANALYZE-like distinct counts (unique keys). A
+	// stats-less key is priced by PG at a 0.1 hash bucket
+	// (estimate_hash_bucket_stats), which is not the shape this test pins.
+	cat.SetTableStats(a, &catalog.TableStats{RowCount: 500_000, Pages: 5_000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 500_000}, {}}})
+	cat.SetTableStats(b, &catalog.TableStats{RowCount: 400_000, Pages: 4_000, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 400_000}, {}}})
 
 	stmt := parseOne(t, `SELECT av, bv FROM a, b WHERE x = y`)
 	node, err := Plan(stmt, cat)

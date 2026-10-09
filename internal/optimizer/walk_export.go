@@ -13,6 +13,18 @@ func WalkPlanExprs(n Node, fn func(Expr)) { walkPlanExprs(n, fn) }
 // Same sublink caveat as WalkPlanExprs.
 func WalkExprTree(e Expr, fn func(Expr)) { walkExprTree(e, fn) }
 
+// WalkExprHostScope invokes fn on e and every sub-expression evaluated in
+// e's own scope, enumerating every expression kind exprChildSlots knows —
+// an IN / = ANY list's operand and elements included, which WalkExprTree
+// treats as a leaf. Inner plans are stepped over. It returns false when e
+// holds a kind the enumeration does not cover; a caller classifying the
+// expression must then treat it as unknown (fail-closed).
+func WalkExprHostScope(e Expr, fn func(Expr)) bool {
+	return walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(x Expr) bool { fn(x); return true },
+	})
+}
+
 // CloneExprReplacingColumnRefs returns a CLONE of e with every ColumnRef
 // for which replace returns non-nil substituted by that replacement.
 //
@@ -99,6 +111,59 @@ func ExprSubplans(e Expr) []Node {
 // sublinks it can hang — never to a wrong qualifier — so extend this
 // switch when a node type gains expression fields.
 func NodeSubplans(n Node) []Node {
+	refs := NodeSublinks(n)
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]Node, len(refs))
+	for i, r := range refs {
+		out[i] = r.Plan
+	}
+	return out
+}
+
+// SublinkRef is one sublink hung off a plan node's own expressions: the
+// sublink expression and its inner plan root.
+type SublinkRef struct {
+	Expr Expr
+	Plan Node
+}
+
+// NodeSublinks is NodeSubplans with each subplan root paired with the
+// sublink expression holding it, in the same order and with the same
+// de-duplication. EXPLAIN's PG plan_id numbering reads the expression
+// (an EXISTS→ANY conversion takes two ids, M0146-0005bv).
+func NodeSublinks(n Node) []SublinkRef {
+	exprs := nodeOwnExprs(n)
+	if len(exprs) == 0 {
+		return nil
+	}
+	var out []SublinkRef
+	seen := map[Node]struct{}{}
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		walkExprTree(e, func(sub Expr) {
+			for _, sp := range ExprSubplans(sub) {
+				if sp == nil {
+					continue
+				}
+				if _, ok := seen[sp]; ok {
+					continue
+				}
+				seen[sp] = struct{}{}
+				out = append(out, SublinkRef{Expr: sub, Plan: sp})
+			}
+		})
+	}
+	return out
+}
+
+// nodeOwnExprs lists the expressions a plan node holds directly — the roots
+// a sublink can hang off (NodeSublinks' enumeration). nil for a kind that
+// holds none.
+func nodeOwnExprs(n Node) []Expr {
 	var exprs []Expr
 	addKeys := func(keys []SortKey) {
 		for _, k := range keys {
@@ -200,6 +265,12 @@ func NodeSubplans(n Node) []Node {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		if t.LowKey != nil {
+			exprs = append(exprs, t.LowKey)
+		}
+		if t.HighKey != nil {
+			exprs = append(exprs, t.HighKey)
+		}
 		exprs = append(exprs, t.Pred...)
 	case *Aggregate:
 		exprs = append(exprs, t.GroupExprs...)
@@ -341,27 +412,5 @@ func NodeSubplans(n Node) []Node {
 	default:
 		return nil
 	}
-	if len(exprs) == 0 {
-		return nil
-	}
-	var out []Node
-	seen := map[Node]struct{}{}
-	for _, e := range exprs {
-		if e == nil {
-			continue
-		}
-		walkExprTree(e, func(sub Expr) {
-			for _, sp := range ExprSubplans(sub) {
-				if sp == nil {
-					continue
-				}
-				if _, ok := seen[sp]; ok {
-					continue
-				}
-				seen[sp] = struct{}{}
-				out = append(out, sp)
-			}
-		})
-	}
-	return out
+	return exprs
 }

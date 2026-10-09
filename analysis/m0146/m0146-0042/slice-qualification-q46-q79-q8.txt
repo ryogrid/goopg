@@ -1,0 +1,195 @@
+# M0146-0042 slice: qualification through an unpulled subquery / INTERSECT (code fa61c41a7)
+# fire-set captures tmp/fireset-m42f (baseline = f0752473e, candidate = staged change)
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=12
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=12
+
+## text distance to PG per changed query (/tmp/textcmp-f.py)
+sf025 text-identical 39 -> 39
+  Q8 diff-lines vs PG 10 -> 8 
+  Q14 diff-lines vs PG 136 -> 128 
+  Q23 diff-lines vs PG 152 -> 150 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q46 diff-lines vs PG 7 -> 7 
+  Q65 diff-lines vs PG 67 -> 67 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q79 diff-lines vs PG 9 -> 7 
+  Q86 diff-lines vs PG 2 -> 2 
+sf1 text-identical 28 -> 30
+  Q8 diff-lines vs PG 10 -> 8 
+  Q14 diff-lines vs PG 168 -> 160 
+  Q23 diff-lines vs PG 242 -> 240 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q46 diff-lines vs PG 2 -> 0 IDENT
+  Q65 diff-lines vs PG 67 -> 67 
+  Q68 diff-lines vs PG 22 -> 22 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q79 diff-lines vs PG 4 -> 0 IDENT
+  Q86 diff-lines vs PG 2 -> 2 
+
+## changed lines (PG = line present in PG's plan)
+===== sf025 Q8
+-    Join Filter: (substr((store.s_zip)::text, 1, 2) = substr(ca_zip, 1, 2))
++ PG Join Filter: (substr((store.s_zip)::text, 1, 2) = substr(a1.ca_zip, 1, 2))
+===== sf025 Q14
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 3).col1)
++ PG Filter: (sum(((store_sales.ss_quantity)::numeric * store_sales.ss_list_price)) > (InitPlan 3).col1)
+-    Filter: (sum(((cs_quantity)::numeric * cs_list_price)) > (InitPlan 4).col1)
++ PG Filter: (sum(((catalog_sales.cs_quantity)::numeric * catalog_sales.cs_list_price)) > (InitPlan 4).col1)
+-    Filter: (sum(((ws_quantity)::numeric * ws_list_price)) > (InitPlan 5).col1)
++ PG Filter: (sum(((web_sales.ws_quantity)::numeric * web_sales.ws_list_price)) > (InitPlan 5).col1)
+-    Sort Key: ('store'::text), i_brand_id, i_class_id, i_category_id
++ PG Sort Key: ('store'::text), item.i_brand_id, item.i_class_id, item.i_category_id
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 3).col1)
++ PG Filter: (sum(((store_sales.ss_quantity)::numeric * store_sales.ss_list_price)) > (InitPlan 3).col1)
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 5).col1)
++    Filter: (sum(((store_sales_1.ss_quantity)::numeric * store_sales_1.ss_list_price)) > (InitPlan 5).col1)
+===== sf025 Q23
+-    Hash Cond: (c_customer_sk = cs_bill_customer_sk)
++    Hash Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+-    Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+-    Hash Cond: (c_customer_sk = ws_bill_customer_sk)
++    Hash Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+-    Cache Key: ws_sold_date_sk
++    Cache Key: web_sales.ws_sold_date_sk
+-    Index Cond: (d_date_sk = ws_sold_date_sk)
++    Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+-    Sort Key: customer.c_last_name, customer.c_first_name, sales
++ PG Sort Key: customer.c_last_name, customer.c_first_name, (sum(((catalog_sales.cs_quantity)::numeric * catalog_sales.cs_list_price)))
+-    Hash Cond: (c_customer_sk = cs_bill_customer_sk)
++    Hash Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+-    Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+-    Hash Cond: (c_customer_sk = ws_bill_customer_sk)
++    Hash Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+-    Cache Key: ws_sold_date_sk
++    Cache Key: web_sales.ws_sold_date_sk
+-    Index Cond: (d_date_sk = ws_sold_date_sk)
++    Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+===== sf025 Q46
+-    Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
++    Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+===== sf025 Q65
+-    Hash Cond: (ss_store_sk = s_store_sk)
++    Hash Cond: (ss_store_sk = store.s_store_sk)
+===== sf025 Q79
+-    Sort Key: customer.c_last_name, customer.c_first_name, (substr((s_city)::text, 1, 30)), (sum(store_sales.ss_net_profit))
++ PG Sort Key: customer.c_last_name, customer.c_first_name, (substr((store.s_city)::text, 1, 30)), (sum(store_sales.ss_net_profit))
+-    Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
++    Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+===== sf1 Q8
+-    Join Filter: (substr((store.s_zip)::text, 1, 2) = substr(ca_zip, 1, 2))
++ PG Join Filter: (substr((store.s_zip)::text, 1, 2) = substr(a1.ca_zip, 1, 2))
+===== sf1 Q14
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 3).col1)
++ PG Filter: (sum(((store_sales.ss_quantity)::numeric * store_sales.ss_list_price)) > (InitPlan 3).col1)
+-    Filter: (sum(((cs_quantity)::numeric * cs_list_price)) > (InitPlan 4).col1)
++ PG Filter: (sum(((catalog_sales.cs_quantity)::numeric * catalog_sales.cs_list_price)) > (InitPlan 4).col1)
+-    Filter: (sum(((ws_quantity)::numeric * ws_list_price)) > (InitPlan 5).col1)
++ PG Filter: (sum(((web_sales.ws_quantity)::numeric * web_sales.ws_list_price)) > (InitPlan 5).col1)
+-    Sort Key: ('store'::text), i_brand_id, i_class_id, i_category_id
++ PG Sort Key: ('store'::text), item.i_brand_id, item.i_class_id, item.i_category_id
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 3).col1)
++ PG Filter: (sum(((store_sales.ss_quantity)::numeric * store_sales.ss_list_price)) > (InitPlan 3).col1)
+-    Filter: (sum(((ss_quantity)::numeric * ss_list_price)) > (InitPlan 5).col1)
++    Filter: (sum(((store_sales_1.ss_quantity)::numeric * store_sales_1.ss_list_price)) > (InitPlan 5).col1)
+===== sf1 Q23
+-    Hash Cond: (c_customer_sk = cs_bill_customer_sk)
++    Hash Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+-    Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+-    Hash Cond: (c_customer_sk = ws_bill_customer_sk)
++    Hash Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+-    Hash Cond: (ws_sold_date_sk = date_dim_1.d_date_sk)
++ PG Hash Cond: (web_sales.ws_sold_date_sk = date_dim_1.d_date_sk)
+-    Sort Key: customer.c_last_name, customer.c_first_name, sales
++ PG Sort Key: customer.c_last_name, customer.c_first_name, (sum(((catalog_sales.cs_quantity)::numeric * catalog_sales.cs_list_price)))
+-    Hash Cond: (c_customer_sk = cs_bill_customer_sk)
++    Hash Cond: (c_customer_sk = catalog_sales.cs_bill_customer_sk)
+-    Hash Cond: (cs_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+-    Hash Cond: (c_customer_sk = ws_bill_customer_sk)
++    Hash Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+-    Hash Cond: (ws_sold_date_sk = date_dim_1.d_date_sk)
++ PG Hash Cond: (web_sales.ws_sold_date_sk = date_dim_1.d_date_sk)
+===== sf1 Q46
+-    Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
++ PG Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+===== sf1 Q65
+-    Hash Cond: (ss_store_sk = s_store_sk)
++    Hash Cond: (ss_store_sk = store.s_store_sk)
+===== sf1 Q68
+-    Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
++    Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+===== sf1 Q79
+-    Sort Key: customer.c_last_name, customer.c_first_name, (substr((s_city)::text, 1, 30)), (sum(store_sales.ss_net_profit))
++ PG Sort Key: customer.c_last_name, customer.c_first_name, (substr((store.s_city)::text, 1, 30)), (sum(store_sales.ss_net_profit))
+-    Hash Cond: (store_sales.ss_customer_sk = c_customer_sk)
++ PG Hash Cond: (store_sales.ss_customer_sk = customer.c_customer_sk)
+
+## regress A/B (14 files), HEAD vs change: union + join hunks
+### union.diff
+33,45d32
+< @@ -364,11 +366,11 @@
+<  explain (costs off)
+<  select * from int8_tbl intersect select q2, q1 from int8_tbl order by 1, 2;
+<    QUERY PLAN
+<  ---------------------------------------------
+<   Sort
+< -  Sort Key: int8_tbl.q1, int8_tbl.q2
+< +  Sort Key: q1, q2
+<    ->  HashSetOp Intersect
+<    ->  Seq Scan on int8_tbl
+<    ->  Seq Scan on int8_tbl int8_tbl_1
+<  (5 rows)
+<  select * from int8_tbl intersect select q2, q1 from int8_tbl order by 1, 2;
+### join.diff
+1318c1318
+< +  Hash Cond: (id = nt2_id)
+---
+> +  Hash Cond: (id = nt3.nt2_id)
+2301c2301
+< +  Hash Cond: (id = nt2_id)
+---
+> +  Hash Cond: (id = nt3.nt2_id)
+4243,4246c4243,4246
+< - 1 |  123 |  456 |  123
+< - 1 |  123 |  4567890123456789 |  123
+<   1 | 4567890123456789 |  123 |  42
+< + 1 |  123 |  4567890123456789 |  123
+---
+> + 1 | 4567890123456789 |  123 |  42
+>   1 |  123 |  456 |  123
+>   1 |  123 |  4567890123456789 |  123
+> - 1 | 4567890123456789 |  123 |  42
+4249d4248
+< + 1 |  123 |  456 |  123
+4362c4361
+< +  Hash Cond: (case1 = f1)
+---
+> +  Hash Cond: (case1 = t0.f1)
+4451,4457d4449
+< +  ->  Hash
+< +  ->  Index Scan using t_a_key on public.t t4
+< +  Index Cond: (a = 1)
+< +  Output: a, b
+< +  ->  Index Only Scan using t_a_key on public.t t3
+< +  Index Cond: (a = t5.a)
+< +  Output: a
+4466a4459,4465
+> +  ->  Index Scan using t_a_key on public.t t4
+> +  Index Cond: (a = 1)
+> +  Output: a, b
+> +  ->  Index Only Scan using t_a_key on public.t t3
+> +  Index Cond: (a = t5.a)
+> +  Output: a
+> +  ->  Hash

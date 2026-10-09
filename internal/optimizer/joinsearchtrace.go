@@ -276,6 +276,8 @@ func tracePathKind(p *Path) string {
 		return "gathermerge"
 	case PathSort:
 		return "sort"
+	case PathMaterial:
+		return "material"
 	case PathAgg:
 		return "agg"
 	default:
@@ -532,6 +534,10 @@ func traceJoinTypeName(jt parser.JoinType) string {
 		return "SEMI"
 	case parser.JoinAnti:
 		return "ANTI"
+	case parser.JoinRightSemi:
+		return "RIGHT_SEMI"
+	case parser.JoinRightAnti:
+		return "RIGHT_ANTI"
 	default:
 		return "other"
 	}

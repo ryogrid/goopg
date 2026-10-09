@@ -31,17 +31,17 @@ package executor
 //	   ->  Hash
 //	         ->  CTE Scan on x p
 //
-// Two divergences from upstream are deliberate and recorded in the deferral
-// ledger, both stemming from goopg having no plan-level marker for "this query
+// One divergence from upstream is deliberate and recorded in the deferral
+// ledger, stemming from goopg having no plan-level marker for "this query
 // level declared this WITH list":
 //
 //  1. Sections are hoisted to the root of the rendered plan. PG attaches them
 //     to the top node of the DECLARING query level, so a WITH nested inside a
 //     CTE body prints its section inside that body; goopg lifts it to the top.
-//  2. A CTE referenced ONLY from inside a sublink is not collected (the
-//     collector walks the plan spine, not expression trees) and still renders
-//     its body inline under its `CTE Scan`. It is printed once either way —
-//     one reference is the only way to reach that case.
+//
+// A second former divergence — a CTE referenced ONLY from inside a sublink
+// never collected, so its body rendered inline under the `CTE Scan` — is
+// closed by M0146-0007d's NodeSubplans pass in collectCTEHoist.
 //
 // See docs/design/0125-0049-explain-shared-cte-section.md.
 
@@ -112,6 +112,13 @@ func collectCTEHoist(root optimizer.Node) *cteHoist {
 				// its own; claiming one here prints `CTE <name>` twice.
 				return
 			}
+			if scan.Inlined() {
+				// PG inlined it: the body renders in place, with no
+				// `CTE <name>` section. Its own CTE references still
+				// need theirs. M0146-0007.
+				walk(scan.Child)
+				return
+			}
 			key := scan.DeclKey()
 			if _, claimed := h.byDecl[key]; claimed {
 				// A second reference to an already-claimed name. Do NOT
@@ -130,6 +137,20 @@ func collectCTEHoist(root optimizer.Node) *cteHoist {
 		}
 		for _, c := range planChildren(n) {
 			walk(c)
+		}
+		// M0146-0007d: sublink bodies hang off EXPRESSION fields
+		// (SubqueryExpr.Plan et al.), not the plan spine, so the child
+		// walk above never reaches them. A CTE referenced only from
+		// InitPlan/SubPlan bodies — TPC-DS Q14's `avg_sales`, probed by
+		// three InitPlans — would otherwise render its full body inline
+		// at EVERY reference while PG hoists it to one `CTE <name>`
+		// section like any other multiply-referenced CTE. Walk each
+		// hanging subplan root too: NodeSubplans covers the five
+		// sublink kinds (walk_export.go keeps it in lockstep with
+		// walkPlanExprs), and nested sublinks inside those bodies
+		// recurse through this same walk.
+		for _, sp := range optimizer.NodeSubplans(n) {
+			walk(sp)
 		}
 	}
 	walk(root)

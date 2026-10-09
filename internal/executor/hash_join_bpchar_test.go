@@ -38,6 +38,14 @@ func bpcharJoinFixture(t *testing.T) (*Context, func()) {
 		"CREATE TABLE tb (id bpchar)",
 		"INSERT INTO ta VALUES ('ab')",
 		"INSERT INTO tb VALUES ('ab ')",
+		// Cross-width bpchar pair: 'a' pads to 16 vs 24 — byte-distinct
+		// images that bpchareq calls equal (bcTruelen). The join only
+		// matches when the key normalises the padding; byte-exact keys
+		// silently return 0. M0146.
+		"CREATE TABLE wa (id char(16), v int)",
+		"CREATE TABLE wb (id char(24), w int)",
+		"INSERT INTO wa VALUES ('a', 1), ('b', 2)",
+		"INSERT INTO wb VALUES ('a', 10), ('c', 30)",
 		// UUID case variants: compareDatum normalizes both sides, so `=`
 		// is true while the key encodings differ.
 		"CREATE TABLE ua (id char(36), v int)",
@@ -97,12 +105,15 @@ func TestHashJoinBpcharRendersHashCondOnly(t *testing.T) {
 
 	for _, tc := range []struct{ name, sql, wantHC string }{
 		{"char-base", "SELECT ka.v FROM ka JOIN kb ON ka.id = kb.id", "(ka.id = kb.id)"},
-		{"varchar-base", "SELECT va.v FROM va JOIN vb ON va.id = vb.id", "(va.id = vb.id)"},
-		// CTE arms render the right side bare (`(x.id = id)`) — a
-		// pre-existing CTE-scan render quirk, not this slice's business.
-		// What matters here is HC-only on both CTE shapes.
-		{"char-cte", "WITH x AS (SELECT id, v FROM ka), y AS (SELECT id, w FROM kb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(x.id = id)"},
-		{"varchar-cte", "WITH x AS (SELECT id, v FROM va), y AS (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(x.id = id)"},
+		{"varchar-base", "SELECT va.v FROM va JOIN vb ON va.id = vb.id", "((va.id)::text = (vb.id)::text)"},
+		// M0146-0042: a varchar key compares as text (make_op), so its
+		// Hash Cond shows the RelabelType on both sides, as PG 18.3 prints.
+		// M0146-0021: PG 18 (live capture) prints an inlined single-reference
+		// CTE's columns as the body's base columns — its subquery scan is
+		// removed — and a MATERIALIZED one's by the reference alias.
+		{"char-cte", "WITH x AS (SELECT id, v FROM ka), y AS (SELECT id, w FROM kb) SELECT x.v FROM x JOIN y ON x.id = y.id", "(ka.id = kb.id)"},
+		{"varchar-cte", "WITH x AS (SELECT id, v FROM va), y AS (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "((va.id)::text = (vb.id)::text)"},
+		{"varchar-cte-materialized", "WITH x AS MATERIALIZED (SELECT id, v FROM va), y AS MATERIALIZED (SELECT id, w FROM vb) SELECT x.v FROM x JOIN y ON x.id = y.id", "((x.id)::text = (y.id)::text)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := bpcharExplain(t, ctx, tc.sql)
@@ -134,16 +145,24 @@ func TestHashJoinBpcharValues(t *testing.T) {
 	if got := bpcharValues(t, ctx, "SELECT va.v FROM va JOIN vb ON va.id = vb.id ORDER BY va.v"); got != "1" {
 		t.Errorf("varchar control join returned %q, want \"1\"", got)
 	}
+	// Cross-width char(16)=char(24): the stored images differ ('a'+15
+	// blanks vs 'a'+23) but bpchareq calls them equal — PG returns 1.
+	// Byte-exact keys would silently miss here.
+	if got := bpcharValues(t, ctx, "SELECT wa.v FROM wa JOIN wb ON wa.id = wb.id ORDER BY wa.v"); got != "1" {
+		t.Errorf("cross-width char join returned %q, want \"1\"", got)
+	}
 }
 
-// TestHashJoinBpcharTrailingSpaceAgreement documents the verbatim-storage
-// corner: unbounded bpchar keeps 'ab ' byte-distinct (octet_length 3 vs
-// 2), goopg's `=` is byte-exact on strings so the scalar equality is
-// FALSE, and the join is empty. Keys and `=` agree — both miss — so
-// folding changes nothing here: residual-false ⟺ no emit pre-slice,
-// no-meet ⟺ no emit post-slice. (PG would match under bpchareq's
-// trailing-space rule; goopg misses either way — UNCHANGED by this
-// slice, values work if ever.)
+// TestHashJoinBpcharTrailingSpaceAgreement pins the verbatim-storage
+// corner under bpchar semantics (M0146): unbounded bpchar keeps 'ab '
+// byte-distinct in storage (octet_length 3 vs 2), but PG's bpchareq
+// compares under bcTruelen — trailing blanks ignored — so the scalar
+// `=` is TRUE and the join must emit the match too. The join keys are
+// normalised by buildKeyTrim/probeKeyTrim (hash) and keyTrims (merge),
+// the same normalisation upstream's hashbpchar opclass applies, so keys
+// and `=` agree — both hit — and folding the conjunct stays exact.
+// Pre-M0146 this test pinned the byte-exact miss (scalar `f`, join 0);
+// both flips are intentional and PG-verified on 18.3.
 func TestHashJoinBpcharTrailingSpaceAgreement(t *testing.T) {
 	ctx, cleanup := bpcharJoinFixture(t)
 	defer cleanup()
@@ -154,38 +173,36 @@ func TestHashJoinBpcharTrailingSpaceAgreement(t *testing.T) {
 	if got := bpcharValues(t, ctx, "SELECT octet_length(id) FROM tb"); got != "3" {
 		t.Errorf("verbatim premise broken: tb octet_length = %q, want \"3\"", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT ta.id = tb.id FROM ta, tb"); got != "f" {
-		t.Errorf("scalar `=` = %q, want \"f\" (byte-exact strings); if this flips, the agreement argument below must be re-derived", got)
+	if got := bpcharValues(t, ctx, "SELECT ta.id = tb.id FROM ta, tb"); got != "t" {
+		t.Errorf("scalar `=` = %q, want \"t\" (bpchareq ignores trailing blanks — PG 18.3)", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ta JOIN tb ON ta.id = tb.id"); got != "0" {
-		t.Errorf("trailing-space join count = %q, want \"0\"", got)
+	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ta JOIN tb ON ta.id = tb.id"); got != "1" {
+		t.Errorf("trailing-space join count = %q, want \"1\" (hash keys hash the trimmed image)", got)
 	}
 }
 
-// TestHashJoinBpcharUUIDCaseMissParity pins the review-note-1 direction-1
-// class: `compareDatum` normalizes UUID case, so the scalar `=` is TRUE,
-// but the key encodings (`"s:" + raw bytes`) differ and the rows never
-// meet — the join is empty. Pre-slice the char pair met via the residual
-// (count 1); post-slice it misses (count 0). The varchar pair is the
-// status-quo control: the SAME folding was accepted for varchar at P2.2,
-// so varchar misses identically — the slice introduces no NEW behavior
-// class, only parity with the existing one. Corpus-harmless (no in-scope
-// TPC-DS values have these shapes).
+// TestHashJoinBpcharUUIDCaseMissParity pins the UUID-shaped, case-different
+// char and varchar pair against PG 18.3: the values are text, so `=` is
+// FALSE and the join is empty (PG answers f / 0 for both). The scalar `=`
+// used to say TRUE — compareDatum normalised UUID-shaped strings whatever
+// their type — so it disagreed with the join keys, which never met. Since
+// M0146-0053 a comparison of two character-string operands is plain text,
+// and the scalar and the join agree.
 func TestHashJoinBpcharUUIDCaseMissParity(t *testing.T) {
 	ctx, cleanup := bpcharJoinFixture(t)
 	defer cleanup()
 
-	if got := bpcharValues(t, ctx, "SELECT ua.id = ub.id FROM ua, ub"); got != "t" {
-		t.Fatalf("normalizer premise broken: char UUID `=` = %q, want \"t\"", got)
+	if got := bpcharValues(t, ctx, "SELECT ua.id = ub.id FROM ua, ub"); got != "f" {
+		t.Errorf("char UUID-case `=` = %q, want \"f\" (text comparison — PG 18.3)", got)
 	}
-	if got := bpcharValues(t, ctx, "SELECT xa.id = xb.id FROM xa, xb"); got != "t" {
-		t.Fatalf("normalizer premise broken: varchar UUID `=` = %q, want \"t\"", got)
+	if got := bpcharValues(t, ctx, "SELECT xa.id = xb.id FROM xa, xb"); got != "f" {
+		t.Errorf("varchar UUID-case `=` = %q, want \"f\" (text comparison — PG 18.3)", got)
 	}
 	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM ua JOIN ub ON ua.id = ub.id"); got != "0" {
-		t.Errorf("char UUID-case join count = %q, want \"0\" (direction-1 miss after folding)", got)
+		t.Errorf("char UUID-case join count = %q, want \"0\" (PG 18.3)", got)
 	}
 	if got := bpcharValues(t, ctx, "SELECT COUNT(*) FROM xa JOIN xb ON xa.id = xb.id"); got != "0" {
-		t.Errorf("varchar UUID-case control count = %q, want \"0\" (P2.2 status quo)", got)
+		t.Errorf("varchar UUID-case join count = %q, want \"0\" (PG 18.3)", got)
 	}
 }
 

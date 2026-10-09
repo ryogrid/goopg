@@ -1,0 +1,21 @@
+4515a4516,4522
+> 	if (debug_plan_candidates)
+> 	{
+> 		fprintf(stdout, "HJCOST outer=%g inner=%g hashjointuples=%g qp_per_tuple=%g qp_startup=%g hash_per_tuple=%g nrestrict=%d\n",
+> 				outer_path_rows, inner_path_rows, hashjointuples, qp_qual_cost.per_tuple, qp_qual_cost.startup, hash_qual_cost.per_tuple,
+> 				list_length(path->jpath.joinrestrictinfo));
+> 		fflush(stdout);
+> 	}
+5324a5332,5337
+> 		if (debug_plan_candidates && IsA(qual, RestrictInfo))
+> 		{
+> 			fprintf(stdout, "APXQUAL cached_norm=%g outer_selec=%g\n",
+> 					((RestrictInfo *) qual)->norm_selec, ((RestrictInfo *) qual)->outer_selec);
+> 			fflush(stdout);
+> 		}
+5325a5339,5343
+> 		if (debug_plan_candidates)
+> 		{
+> 			fprintf(stdout, "APXQUAL selec_now=%g outer_rows=%g inner_rows=%g\n", selec, outer_tuples, inner_tuples);
+> 			fflush(stdout);
+> 		}

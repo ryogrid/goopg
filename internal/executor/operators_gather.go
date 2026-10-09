@@ -41,8 +41,31 @@ const gatherChanDepth = 2
 // rowBatch is one worker's unit of transfer. Rows in it are fully materialised
 // — see the ownership contract in parallel_runtime.go.
 type rowBatch struct {
-	rows   []Row
+	rows []Row
+	// tids carries each row's self-tid, index-aligned with rows, when the
+	// sending Gather was asked for them (wantCTIDs); nil otherwise. A row's
+	// tid is a slot property, not a column, so transferRowForQueue cannot
+	// carry it and a worker row would otherwise reach the leader with
+	// `ctid` reading NULL (M0146-0051).
+	tids   []queueTID
 	worker int
+}
+
+// queueTID is one row's carried self-tid crossing a Gather queue.
+type queueTID struct {
+	block uint32
+	off   uint16
+	ok    bool
+}
+
+func slotQueueTID(slot TupleSlot) queueTID {
+	b, off, ok := slot.TID()
+	return queueTID{block: b, off: off, ok: ok}
+}
+
+// stamp sets s's carried tid to t (clearing it when t is not valid).
+func (t queueTID) stamp(s *MaterializedSlot) {
+	s.ctidBlock, s.ctidOff, s.hasCTID = t.block, t.off, t.ok
 }
 
 // gatherOp implements planner.Gather.
@@ -60,10 +83,18 @@ type gatherOp struct {
 	workers []*Context
 	arenas  []*mmgr.Context
 
-	// cur is the batch being drained into Next()'s return values.
-	cur    []Row
-	curIdx int
-	slot   MaterializedSlot
+	// cur is the batch being drained into Next()'s return values; curTIDs
+	// is its tid side-channel (nil unless wantCTIDs).
+	cur     []Row
+	curTIDs []queueTID
+	curIdx  int
+	slot    MaterializedSlot
+
+	// wantCTIDs is set by markSortWantCTIDs when a consumer above evaluates
+	// `ctid` against this node's rows. The child trees are built only at
+	// Open, so the marker is re-applied to each of them there, and worker
+	// rows ship their tids in rowBatch.tids (M0146-0051).
+	wantCTIDs bool
 
 	closed   bool
 	drainErr error
@@ -315,6 +346,9 @@ func (o *gatherOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		if o.wantCTIDs {
+			markSortWantCTIDs(child)
+		}
 		// The leader takes blocks from the same allocator as the workers —
 		// it is a peer, not an extra full scan.
 		o.attachAll(child)
@@ -356,6 +390,9 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	if err != nil {
 		return err
 	}
+	if o.wantCTIDs {
+		markSortWantCTIDs(child)
+	}
 	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
@@ -363,13 +400,20 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	}
 
 	batch := make([]Row, 0, gatherBatchRows)
+	var tids []queueTID
+	if o.wantCTIDs {
+		tids = make([]queueTID, 0, gatherBatchRows)
+	}
 	flush := func() bool {
 		if len(batch) == 0 {
 			return true
 		}
 		select {
-		case o.ch <- rowBatch{rows: batch, worker: idx}:
+		case o.ch <- rowBatch{rows: batch, tids: tids, worker: idx}:
 			batch = make([]Row, 0, gatherBatchRows)
+			if o.wantCTIDs {
+				tids = make([]queueTID, 0, gatherBatchRows)
+			}
 			return true
 		case <-wctx.Ctx.Done():
 			return false
@@ -393,6 +437,9 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		// The ownership boundary. Transfer — never cloneRow, never
 		// Slot.CopyTo — because both are shallow, preserve ArenaID, and are
 		// silently wrong exactly here while passing every serial test.
+		if o.wantCTIDs {
+			tids = append(tids, slotQueueTID(slot))
+		}
 		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
@@ -408,6 +455,9 @@ func (o *gatherOp) Next() (TupleSlot, error) {
 	for {
 		if o.curIdx < len(o.cur) {
 			row := o.cur[o.curIdx]
+			if o.curTIDs != nil {
+				o.curTIDs[o.curIdx].stamp(&o.slot)
+			}
 			o.curIdx++
 			o.slot.row = row
 			return &o.slot, nil
@@ -431,7 +481,7 @@ func (o *gatherOp) Next() (TupleSlot, error) {
 			select {
 			case batch, ok := <-o.ch:
 				if ok {
-					o.cur, o.curIdx = batch.rows, 0
+					o.cur, o.curTIDs, o.curIdx = batch.rows, batch.tids, 0
 					continue
 				}
 				// Channel closed: keep taking local rows until exhausted.
@@ -461,7 +511,7 @@ func (o *gatherOp) Next() (TupleSlot, error) {
 			}
 			return nil, EOF
 		}
-		o.cur, o.curIdx = batch.rows, 0
+		o.cur, o.curTIDs, o.curIdx = batch.rows, batch.tids, 0
 	}
 }
 
@@ -516,7 +566,8 @@ func (o *gatherOp) Close() error {
 	o.workers, o.arenas = nil, nil
 	if o.ownsParallelHash && o.ctx != nil {
 		// Retract after the join: no participant can still be reading.
-		o.ctx.ParallelHashBuilds = nil
+		// A spilled build's batch files go with it (M0146-0090).
+		releaseParallelHashBuilds(o.ctx)
 		o.ownsParallelHash = false
 	}
 	if o.ownsSharedBuilds && o.ctx != nil {

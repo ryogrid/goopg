@@ -1,0 +1,35 @@
+===== Q92 =====
+                                                                       QUERY PLAN                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10370.99..10370.99 rows=1 width=32)
+   ->  Sort  (cost=10370.99..10370.99 rows=1 width=32)
+         Sort Key: (sum(web_sales.ws_ext_discount_amt))
+         ->  Aggregate  (cost=10370.96..10370.98 rows=1 width=32)
+               ->  Hash Join  (cost=4517.44..10370.96 rows=1 width=56)
+                     Hash Cond: (web_sales.ws_item_sk = item.i_item_sk)
+                     Join Filter: (web_sales.ws_ext_discount_amt > (SubPlan 1))
+                     SubPlan 1
+                       ->  Aggregate  (cost=186.03..186.05 rows=1 width=32)
+                             ->  Nested Loop  (cost=16.69..186.03 rows=1 width=460)
+                                   ->  Bitmap Heap Scan on web_sales web_sales_1  (cost=8.43..50.97 rows=11 width=556)
+                                         Recheck Cond: (ws_item_sk = item.i_item_sk)
+                                         ->  Bitmap Index Scan on web_sales_pkey  (cost=0.38..8.43 rows=11 width=556)
+                                               Index Cond: (ws_item_sk = item.i_item_sk)
+                                   ->  Bitmap Heap Scan on date_dim date_dim_1  (cost=8.26..12.27 rows=1 width=420)
+                                         Recheck Cond: (d_date_sk = web_sales_1.ws_sold_date_sk)
+                                         Filter: ((d_date >= '2000-02-01'::date) AND (d_date <= '2000-05-01 00:00:00'::timestamp without time zone))
+                                         ->  Bitmap Index Scan on date_dim_pkey  (cost=0.25..8.26 rows=1 width=420)
+                                               Index Cond: (d_date_sk = web_sales_1.ws_sold_date_sk)
+                     ->  Gather  (cost=3050.24..8717.09 rows=232 width=48)
+                           Workers Planned: 2
+                           ->  Parallel Hash Join  (cost=2050.24..7693.89 rows=97 width=48)
+                                 Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+                                 ->  Parallel Seq Scan on web_sales  (cost=0.00..5446.82 rows=74982 width=556)
+                                 ->  Parallel Hash  (cost=2049.55..2049.55 rows=55 width=420)
+                                       ->  Parallel Seq Scan on date_dim  (cost=0.00..2049.55 rows=55 width=420)
+                                             Filter: ((d_date >= '2000-02-01'::date) AND (d_date <= '2000-05-01 00:00:00'::timestamp without time zone))
+                     ->  Hash  (cost=1467.00..1467.00 rows=16 width=480)
+                           ->  Seq Scan on item  (cost=0.00..1467.00 rows=16 width=480)
+                                 Filter: (i_manufact_id = 714)
+(30 rows)
+

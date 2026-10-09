@@ -1,0 +1,7 @@
+Structural plan changes (cost/rows ignored), baseline e6a175fee vs candidate:
+SF0.25: Q21 Q36 Q64 Q70 Q85 Q86
+SF1:    Q36 Q40 Q70 Q77 Q85 Q86
+(Q36/Q70/Q86 are SKIP_QUERYGEN.) First-divergence census unchanged at both scales (91 / 90 divergent).
+Q21 SF0.25: inventory x date_dim becomes a Parallel Hash Join with a nested loop into item_pkey above it, the subtree PG plans.
+Q85: the cd1/cd2 join filter moves up one nested-loop level; the join order is unchanged.
+Sweep: Q2 2s->5s with a plan identical to the previous sweep (read 3 s in the 0005e sweep): runtime noise.

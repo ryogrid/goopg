@@ -1,0 +1,30 @@
+Private PG 18.3, temp tables ta(y,k), tb(k,w), tc(x,z), EXPLAIN (COSTS OFF):
+
+select * from ta a where exists (select 1 from tb b where b.k = a.k
+  and exists (select 1 from tc c where c.x = a.y and c.z = b.w))
+ Hash Semi Join
+   Hash Cond: (a.k = b.k)
+   Join Filter: (ANY ((a.y = (hashed SubPlan 2).col1) AND (b.w = (hashed SubPlan 2).col2)))
+   ->  Seq Scan on ta a
+   ->  Hash
+         ->  Seq Scan on tb b
+   SubPlan 2
+     ->  Seq Scan on tc c
+
+(NOT EXISTS: same shape, Join Filter: (NOT (ANY (...))))
+
+goopg (HEAD and this slice): both sublinks stay nested SubPlans
+ Seq Scan on ta a
+   Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Seq Scan on tb b
+           Filter: ((k = a.k) AND EXISTS(SubPlan 2))
+           SubPlan 2
+             ->  Seq Scan on tc c
+                   Filter: ((x = $1) AND (z = $3))
+
+Decline trace (GOOPG_NLI_CENSUS=1) after this slice's gate:
+ inner EXISTS -> nested-spans-scopes (PG keeps it a SubPlan)
+ outer EXISTS -> nested-sublink-convertible: the kept inner sublink's plan
+   still holds raw OuterColumnRefs at pull-up time (planHasOuterRef = true;
+   PARAM_EXEC lowering runs later), and nothing re-bases them.

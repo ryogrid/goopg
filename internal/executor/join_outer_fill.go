@@ -34,10 +34,19 @@ import "github.com/goopg/goopg/internal/optimizer"
 // fill decision taken from the raw flag would disagree with the table that got
 // built.
 func (o *joinOp) hashBuildIsLeft() bool {
-	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti ||
+		o.plan.Type.IsRightSemiAnti() {
 		return false
 	}
 	return o.plan.BuildLeft
+}
+
+// buildMatchTracked reports whether probing must mark the build rows it
+// matches: the fill-build joins (their sweep reads the marks) and RIGHT SEMI,
+// which uses the mark to emit each build row once (PG's
+// HeapTupleHeaderSetMatch / HasMatch under JOIN_RIGHT_SEMI).
+func (o *joinOp) buildMatchTracked() bool {
+	return o.fillBuildSide() || o.plan.Type == optimizer.JoinTypeRightSemi
 }
 
 // fillProbeSide reports whether an unmatched probe row still emits.
@@ -62,6 +71,10 @@ func (o *joinOp) fillBuildSide() bool {
 	case optimizer.JoinTypeRight:
 		return !o.hashBuildIsLeft()
 	case optimizer.JoinTypeFull:
+		return true
+	case optimizer.JoinTypeRightAnti:
+		// M0146-0005dj: the sweep IS the output — PG's HJ_FILL_INNER under
+		// JOIN_RIGHT_ANTI.
 		return true
 	}
 	return false
@@ -199,6 +212,9 @@ func (o *joinOp) fillNullKeyNext() TupleSlot { //nolint:ireturn
 // column order (which BuildLeft decides — ensureLazyVirtual) cannot drift
 // between the two.
 func (o *joinOp) emitBuildFill(row Row) TupleSlot { //nolint:ireturn
+	if o.plan.Type.IsRightSemiAnti() {
+		return o.buildOnlyEmit(row)
+	}
 	buildIsLeft := o.hashBuildIsLeft()
 	nullProbe := o.lazyNullLeft
 	if buildIsLeft {
@@ -219,4 +235,14 @@ func (o *joinOp) emitBuildFill(row Row) TupleSlot { //nolint:ireturn
 		return ms
 	}
 	return o.lazyVirtualOut
+}
+
+// buildOnlyEmit returns a build row as the whole output tuple — the right
+// semi/anti joins publish the build (right) side only (M0146-0005dj).
+func (o *joinOp) buildOnlyEmit(row Row) TupleSlot { //nolint:ireturn
+	if o.lazyBuildOnlySlot == nil {
+		o.lazyBuildOnlySlot = SlotFromRow(o.schema, nil)
+	}
+	o.lazyBuildOnlySlot.row = row
+	return o.lazyBuildOnlySlot
 }

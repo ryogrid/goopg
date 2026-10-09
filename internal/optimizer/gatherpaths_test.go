@@ -555,3 +555,136 @@ func TestMaybeAddGatherDeclinesOnATreeThatAlreadyGathers(t *testing.T) {
 		t.Error("EXPLAIN must render exactly the plan the query would run")
 	}
 }
+
+// (7) M0146-0027 — generate_useful_gather_paths' sorted-partial arm
+// (allpaths.c:3255-3341). For each useful ordering the cheapest partial path
+// does not already deliver, the search offers `Gather Merge -> Sort ->
+// <partial>` — the only producer of the worker-side sort PG elects on TPC-DS
+// Q17, which the post-pass cannot reach once any path-model Gather exists.
+//
+// The pins, against upstream's own gates:
+//
+//   - the arm fires only when `get_useful_pathkeys_for_relation` yields an
+//     ordering — no query_pathkeys, or a leading key the rel cannot sort
+//     early, means no candidate;
+//   - the filed path is Gather Merge over a Sort over the PARTIAL path,
+//     carrying the useful ordering and the subpath's worker count
+//     (create_sort_path's `parallel_workers = subpath->parallel_workers`);
+//   - a subpath already sorted on the useful keys is not re-sorted (the
+//     `is_sorted` continue — the bare Gather Merge loop filed it instead).
+func TestGenerateUsefulGatherPathsSortedPartialArm(t *testing.T) {
+	withParallelOn(t, func() {
+		spans := []leafSpan{{lo: 0, hi: 4}, {lo: 4, hi: 8}}
+		// A useful key: column 1 reads item 0 — inside a rel covering both.
+		useful := []PathKey{{Expr: &ColumnRef{Index: 1, Name: "x"}, SortAsc: true}}
+
+		newCtx := func(qpk []PathKey) (*searchCtx, *RelOptInfo, *Path) {
+			s, err := newSearchCtx(2, defaultCostParams(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.parallelModeOK = true
+			s.queryPathkeys = qpk
+			s.itemSpans = spans
+			rel := newRelOptInfo(relsetOf(0, 1), 1000, 32)
+			rel.ConsiderParallel = true
+			sub := gpPartialSeqPath(rel, 500, 2)
+			rel.PartialPathlist = []*Path{sub}
+			return s, rel, sub
+		}
+
+		// Happy path: the ordering is sortable early here, so the arm files
+		// Gather Merge -> Sort -> partial seq.
+		s, rel, sub := newCtx(useful)
+		defer setGatherPathsModeForTest(gatherPathsAll)()
+		s.generateUsefulGatherPaths(rel, false)
+		var gm *Path
+		for _, p := range rel.Pathlist {
+			if p.Kind == PathGatherMerge {
+				gm = p
+			}
+		}
+		if gm == nil {
+			t.Fatal("sorted-partial arm filed no Gather Merge for a sortable-early ordering")
+		}
+		if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
+			t.Fatalf("Gather Merge child kind = %v, want PathSort (worker-side sort)", gm.Children[0].Kind)
+		}
+		srt := gm.Children[0]
+		if len(srt.Children) != 1 || srt.Children[0] != sub {
+			t.Fatal("the Sort must wrap the cheapest partial path, not a new input")
+		}
+		if !pathkeysContainedIn(srt.Pathkeys, useful) || !pathkeysContainedIn(gm.Pathkeys, useful) {
+			t.Error("Sort and Gather Merge must carry the useful ordering so the keys survive upward")
+		}
+		if srt.ParallelWorkers != sub.ParallelWorkers {
+			t.Errorf("Sort path workers = %d, want the subpath's %d", srt.ParallelWorkers, sub.ParallelWorkers)
+		}
+		if srt.Rows != sub.Rows {
+			t.Errorf("worker-side Sort is priced on the subpath's per-worker rows %v, got %v", sub.Rows, srt.Rows)
+		}
+
+		// No ordering wanted: the arm files nothing (the bare Gather still
+		// stands — it is generate_gather_paths' own candidate).
+		s2, rel2, _ := newCtx(nil)
+		s2.generateUsefulGatherPaths(rel2, false)
+		for _, p := range rel2.Pathlist {
+			if p.Kind == PathGatherMerge {
+				t.Error("a rel with no useful ordering must not get a Gather Merge")
+			}
+		}
+
+		// A leading key the rel cannot sort early (item 2 is outside rel)
+		// truncates the prefix to nothing — upstream's `break`.
+		outside := []PathKey{{Expr: &ColumnRef{Index: 9, Name: "y"}, SortAsc: true}}
+		s3, rel3, _ := newCtx(outside)
+		s3.generateUsefulGatherPaths(rel3, false)
+		for _, p := range rel3.Pathlist {
+			if p.Kind == PathGatherMerge {
+				t.Error("a pathkey outside the rel's rels is not sortable early — no Gather Merge")
+			}
+		}
+		// Prefix truncation: [outside, inside] keeps nothing; [inside,
+		// outside] keeps the one-key prefix.
+		mixed := []PathKey{useful[0], outside[0]}
+		rel4 := newRelOptInfo(relsetOf(0, 1), 1000, 32)
+		rel4.ConsiderParallel = true
+		sub4 := gpPartialSeqPath(rel4, 500, 2)
+		rel4.PartialPathlist = []*Path{sub4}
+		s4, _ := newSearchCtx(2, defaultCostParams(), nil)
+		s4.parallelModeOK = true
+		s4.queryPathkeys = mixed
+		s4.itemSpans = spans
+		s4.generateUsefulGatherPaths(rel4, false)
+		var gm4 *Path
+		for _, p := range rel4.Pathlist {
+			if p.Kind == PathGatherMerge {
+				gm4 = p
+			}
+		}
+		if gm4 == nil {
+			t.Fatal("truncation must keep the sortable-early prefix, not drop the ordering")
+		}
+		if len(gm4.Pathkeys) != 1 {
+			t.Errorf("truncated ordering should carry 1 pathkey, got %d", len(gm4.Pathkeys))
+		}
+
+		// Already-sorted subpath: the `is_sorted` continue — the bare arm
+		// covers it and no Sort is inserted between.
+		s5, rel5, sub5 := newCtx(useful)
+		sub5.Pathkeys = useful
+		s5.generateUsefulGatherPaths(rel5, false)
+		gmN := 0
+		for _, p := range rel5.Pathlist {
+			if p.Kind == PathGatherMerge {
+				gmN++
+				if p.Children[0].Kind == PathSort {
+					t.Error("a subpath already delivering the ordering must not be re-sorted")
+				}
+			}
+		}
+		if gmN != 1 {
+			t.Errorf("want exactly the bare-arm Gather Merge over the sorted subpath, got %d", gmN)
+		}
+	})
+}

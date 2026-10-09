@@ -98,6 +98,13 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newFromRegexpMatchesOp(p), scope), nil
 	case *optimizer.FromRegexpSplitToTable:
 		return maybeInstrument(p, newFromRegexpSplitToTableOp(p), scope), nil
+	case *optimizer.SubqueryScan:
+		// M0146-0005w: a labelling wrapper, not an operator — PG's
+		// SubqueryScan node forwards tuples unchanged, which the child
+		// op already does when it is built directly. The bound threads
+		// through unchanged: the wrapper's output columns are the
+		// child's own columns at identical positions.
+		return buildNode(p.Child, deformBoundBelow(p, bound), scope)
 	case *optimizer.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls
@@ -113,6 +120,17 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newCTEDMLPrefixOp(p), scope), nil
 	case *optimizer.MaterializedCTEScan:
 		return maybeInstrument(p, newMaterializedCTEScanOp(p), scope), nil
+	case *optimizer.Materialize:
+		// M0146-0010: PG's Material node — build the child, wrap it in the
+		// replay cache. Under a nested loop this op surfaces as joinOp's
+		// o.right and the join drives it through `rescannable` instead of
+		// wrapping a second cache (join_nl_stream.go); anywhere else it is a
+		// standalone rescannable subtree the parent pulls once.
+		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newMaterializeOp(child), scope), nil
 	case *optimizer.Project:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
 		if err != nil {
@@ -273,11 +291,16 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 			return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 				Message: fmt.Sprintf("NestedLoopIndexJoin inner is a %T, which is not a re-probeable scan", p.Inner)}
 		}
-		// The memoize cache (S7) wraps only a plain index probe: `Memoize.Child`
-		// is typed `*IndexScan`, and the optimizer declines to build the cache
-		// for any other inner kind, so this assertion cannot fire.
+		// The memoize cache (S7) wraps an index probe — plain or, since
+		// M0146-0005bq, index-only; the optimizer builds it over no other
+		// inner kind.
 		if p.InnerMemo != nil {
-			innerScan = newMemoizeOp(p.InnerMemo, innerScan.(*indexScanOp))
+			probe, ok := innerScan.(memoProbe)
+			if !ok {
+				return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
+					Message: fmt.Sprintf("NestedLoopIndexJoin memoizes a %T, which is not an index probe", innerScan)}
+			}
+			innerScan = newMemoizeOp(p.InnerMemo, probe)
 		}
 		// M0071-0013 Stage D-1: NLI now composes outer + inner via
 		// a persistent VirtualSlot. outerMS.row is overwritten per
@@ -538,6 +561,9 @@ func (o *utilityNoOp) Close() error             { return nil }
 // of rows, then closes. Production paths use Open/Next/Close
 // directly so they can stream into the wire-protocol encoder.
 func Run(op Operator, ctx *Context) ([]Row, error) {
+	// M0146-0059: one statement's CTE materialisations, as the wire
+	// dispatcher resets them per statement.
+	op = scopeStatementCTEs(op)
 	// M0129-S8.3: advance the command counter before executing the operator,
 	// matching PG's per-statement CommandCounterIncrement in the dispatch layer
 	// (production paths advance before calling Build — Run is exclusively a
@@ -822,4 +848,90 @@ func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// stmtCTEScopeOp gives one statement execution its own CTE materialisations
+// (M0146-0059). ctx.CTERowCache and ctx.CTEStableCache are keyed by CTE
+// declaration, and a routine body's statements run on one Context, so a
+// second statement declaring `x` at the same position replayed the first
+// statement's rows. PG starts every statement with fresh CTE tuplestores.
+// The statement's caches are swapped in around each Open, Next and Close
+// and out again afterwards, as the LATERAL join does per outer tuple: an
+// enclosing statement that is still replaying its own CTE scans keeps its
+// caches, and a statement whose operator outlives its caller (a cursor
+// fetched by later statements) never leaks its entries into them.
+//
+// It also owns the statement's AFTER trigger query level (M0146-0076),
+// swapped in the same way and fired once the root has closed cleanly.
+type stmtCTEScopeOp struct {
+	Operator
+	ctx    *Context
+	rows   map[string][]Row
+	stable map[string][]Row
+	trig   stmtAfterTriggers
+}
+
+// scopeStatementCTEs wraps op, the root of one statement's operator tree.
+func scopeStatementCTEs(op Operator) Operator {
+	if op == nil {
+		return nil
+	}
+	if _, already := op.(*stmtCTEScopeOp); already {
+		return op
+	}
+	return &stmtCTEScopeOp{Operator: op}
+}
+
+// buildStatementScoped is Build for the root of one statement's plan.
+func buildStatementScoped(plan optimizer.Node) (Operator, error) {
+	op, err := Build(plan)
+	if err != nil {
+		return op, err
+	}
+	return scopeStatementCTEs(op), nil
+}
+
+func (o *stmtCTEScopeOp) enter() func() {
+	ctx := o.ctx
+	if ctx == nil {
+		return func() {}
+	}
+	savedRows, savedStable := ctx.CTERowCache, ctx.CTEStableCache
+	ctx.CTERowCache, ctx.CTEStableCache = o.rows, o.stable
+	savedTrig := o.trig.swapIn(ctx)
+	return func() {
+		o.trig.swapOut(ctx, savedTrig)
+		o.rows, o.stable = ctx.CTERowCache, ctx.CTEStableCache
+		ctx.CTERowCache, ctx.CTEStableCache = savedRows, savedStable
+	}
+}
+
+func (o *stmtCTEScopeOp) Open(ctx *Context) error {
+	o.ctx, o.rows, o.stable = ctx, nil, nil
+	o.trig = stmtAfterTriggers{}
+	defer o.enter()()
+	err := o.Operator.Open(ctx)
+	o.trig.noteErr(err)
+	return err
+}
+
+func (o *stmtCTEScopeOp) Next() (TupleSlot, error) {
+	defer o.enter()()
+	slot, err := o.Operator.Next()
+	o.trig.noteErr(err)
+	return slot, err
+}
+
+func (o *stmtCTEScopeOp) Close() error {
+	defer o.enter()()
+	return o.trig.finish(o.ctx, o.Operator.Close())
+}
+
+// RowsAffected forwards the root's DML count, which the embedded Operator
+// interface does not promote (M0146-0081).
+func (o *stmtCTEScopeOp) RowsAffected() int64 {
+	if rc, ok := o.Operator.(RowCounter); ok {
+		return rc.RowsAffected()
+	}
+	return 0
 }

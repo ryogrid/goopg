@@ -1,0 +1,6 @@
+# plan-diff: tmp/fireset-m0146-0005x/tpcds-sf025/m0146-0005x-tpcds-sf025-baseline.plans.txt -> tmp/fireset-m0146-0005x/tpcds-sf025/m0146-0005x-tpcds-sf025-candidate.plans.txt
+#   old: provenance not stamped
+#   new: provenance not stamped
+changed (13): Q2 Q21 Q34 Q38 Q39 Q44 Q46 Q59 Q65 Q68 Q73 Q79 Q87
+=== PLAN-SHAPE: queries=99 same=86 changed=13 added=0 removed=0 ===
+=== JOIN-METHOD-ELECTION: moved=0 into-nestloop=0 ===

@@ -1,0 +1,4 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H census identical
+regress 41 WITH/plan pass-required cases: identical to a HEAD (1b453ba9e) worktree; groupingsets (not pass-required) diff 2009 -> 1991 lines

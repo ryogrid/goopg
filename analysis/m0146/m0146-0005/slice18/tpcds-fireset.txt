@@ -1,0 +1,10 @@
+PLAN-PARITY: queries=99 match=8 shapediff=63 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=78 join-method=49 scan-type=55 parameterisation=32 aggregation-strategy=39 sort-strategy=61 parallelism=71 qual-placement=23 rendering=27
+PLAN-PARITY: queries=99 match=8 shapediff=63 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=78 join-method=49 scan-type=55 parameterisation=32 aggregation-strategy=39 sort-strategy=61 parallelism=71 qual-placement=23 rendering=27
+FIRE-SET-TIMEOUTS: fires=Q5 Q12 Q13 Q14 Q15 Q20 Q21 Q22 Q28 Q32 Q37 Q38 Q40 Q41 Q48 Q51 Q59 Q62 Q64 Q65 Q67 Q77 Q80 Q82 Q84 Q85 Q87 Q90 Q92 Q97 Q98 Q99 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=9 shapediff=65 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=81 join-method=57 scan-type=60 parameterisation=45 aggregation-strategy=45 sort-strategy=65 parallelism=75 qual-placement=24 rendering=26
+PLAN-PARITY: queries=99 match=9 shapediff=65 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=81 join-method=56 scan-type=59 parameterisation=45 aggregation-strategy=45 sort-strategy=65 parallelism=75 qual-placement=25 rendering=28
+FIRE-SET-TIMEOUTS: fires=Q5 Q12 Q13 Q14 Q15 Q16 Q20 Q21 Q22 Q28 Q32 Q37 Q38 Q40 Q41 Q48 Q51 Q59 Q62 Q64 Q65 Q66 Q67 Q77 Q80 Q82 Q84 Q85 Q87 Q90 Q92 Q95 Q97 Q98 Q99 introduced=none unchanged=none missing=none

@@ -1,0 +1,43 @@
+=== Q59
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=127296.42..127296.43 rows=1 width=584)
+   CTE wss
+     ->  Finalize HashAggregate  (cost=120015.45..121738.21 rows=62646 width=106)
+           Group Key: date_dim.d_week_seq, store_sales.ss_store_sk
+           ->  Gather  (cost=146784.27..148037.19 rows=62646 width=106)
+                 Workers Planned: 4
+                 ->  Partial HashAggregate  (cost=146784.27..147410.73 rows=62646 width=106)
+                       Group Key: date_dim.d_week_seq, store_sales.ss_store_sk
+                       ->  Parallel Hash Join  (cost=2488.82..71119.20 rows=687864 width=70)
+                             Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                             ->  Parallel Seq Scan on store_sales  (cost=0.00..66740.01 rows=720101 width=212)
+                             ->  Parallel Hash  (cost=1951.70..1951.70 rows=42970 width=268)
+                                   ->  Parallel Seq Scan on date_dim  (cost=0.00..1951.70 rows=42970 width=268)
+   ->  Sort  (cost=5558.21..5558.22 rows=1 width=4372)
+         Sort Key: store.s_store_name, store.s_store_id, wss.d_week_seq
+         ->  Nested Loop  (cost=2771.69..5558.19 rows=1 width=4372)
+               Join Filter: ((store.s_store_id = store_1.s_store_id) AND (wss.d_week_seq = (wss_1.d_week_seq - 52)))
+               ->  Hash Join  (cost=2770.42..5407.31 rows=1 width=2454)
+                     Hash Cond: (wss_1.d_week_seq = d_1.d_week_seq)
+                     ->  Hash Join  (cost=148.06..2784.79 rows=14 width=2186)
+                           Hash Cond: (d.d_week_seq = (wss_1.d_week_seq - 52))
+                           ->  Seq Scan on date_dim d  (cost=0.00..2617.73 rows=377 width=268)
+                                 Filter: ((d_month_seq >= 1195) AND (d_month_seq <= 1206))
+                           ->  Hash  (cost=143.36..143.36 rows=376 width=1918)
+                                 ->  Hash Join  (cost=1.27..143.36 rows=376 width=1918)
+                                       Hash Cond: (wss_1.ss_store_sk = store_1.s_store_sk)
+                                       ->  CTE Scan on wss wss_1  (cost=0.00..125.30 rows=6265 width=106)
+                                       ->  Hash  (cost=1.12..1.12 rows=12 width=1812)
+                                             ->  Seq Scan on store store_1  (cost=0.00..1.12 rows=12 width=1812)
+                     ->  Hash  (cost=2617.73..2617.73 rows=370 width=268)
+                           ->  Seq Scan on date_dim d_1  (cost=0.00..2617.73 rows=370 width=268)
+                                 Filter: ((d_month_seq >= 1207) AND (d_month_seq <= 1218))
+               ->  Materialize  (cost=1.27..145.24 rows=376 width=1918)
+                     ->  Hash Join  (cost=1.27..143.36 rows=376 width=1918)
+                           Hash Cond: (wss.ss_store_sk = store.s_store_sk)
+                           ->  CTE Scan on wss  (cost=0.00..125.30 rows=6265 width=106)
+                           ->  Hash  (cost=1.12..1.12 rows=12 width=1812)
+                                 ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=1812)
+(38 rows)
+

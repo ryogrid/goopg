@@ -28,6 +28,14 @@ loop.
    subject has no open M-NIGHTLY task in fix_plan.md, add them there. **Filing is
    unconditional; selecting them is not.** Which milestone you then WORK is
    decided per the two-authority model in "Current Task" below.
+2a. PREV-LOOP ANOMALY CHECK (added 2026-10-02, owner): run
+   `scripts/ralph-prev-loop-check.sh` (read-only, advisory). It checks the
+   newest *settled* `.ralph/logs/claude_output_*.log` for a closing
+   `---RALPH_STATUS---` block — a loop killed mid-turn (usage cap, crash,
+   timeout) leaves none, and its in-flight state may never have reached the
+   baton. On `ANOMALY`, add an `Anomaly:` line to your working_set rewrite and
+   mention it in your status block; treat the baton's `In-flight:` as possibly
+   stale and re-verify before resuming.
 3. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
 4. Read the `## Current Priority` section at the head of `.ralph/fix_plan.md` —
    EVERY loop, even when the baton names a next step. It carries both the rank
@@ -64,6 +72,12 @@ loop.
 - Update .ralph/fix_plan.md with your learnings
 - Commit working changes with descriptive messages
 - A loop that changes a non-trivial subsystem is not complete unless its design doc is created/updated and indexed
+- Guard denials are durable, not transient: a denied operation (the bash,
+  file, and devin-adapter guards log to `ci/logs/ralph-guard-denials.log`)
+  denies the same class every time, so re-attempting it in a later loop is a
+  wasted turn. When planning cluster-lifecycle, reference-cluster, or
+  protected-file work, skim the denials log tail first; an operation already
+  denied there needs an escalation, not another attempt.
 
 ## Working Set Carry (read first / write last — EVERY loop)
 `.ralph/working_set.md` is the baton between loops. Loops are frequently cut off by
@@ -93,6 +107,14 @@ wasted turns).
   - `Key symbols:` functions/types central to the change
   - `Hypothesis/Findings:` current diagnosis state, ruled-out causes
   - `Next step:` the single concrete next action
+  - `Top-residual:` the largest still-open residual class for the active
+    campaign per the latest census (one line, e.g. `join-order=53 at SF0.25`),
+    or `n/a` when the campaign has no census
+  - `Skip-rationale:` when `Next step:` does not attack `Top-residual`, one
+    line naming why not (blocking task id, S2 awaiting owner placement,
+    sequence rule, measured non-improvement); `n/a` when the next step IS the
+    top residual. Added 2026-10-02 (owner): "why not the biggest category"
+    must be auditable, not implicit.
   - `Gates run:` which verification gates passed/failed this loop
   - `In-flight:` any gate/process you had to abandon: exact command, log/output
     path, PID state when killed, and what result was still needed (write `none`

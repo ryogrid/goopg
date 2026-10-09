@@ -35,6 +35,9 @@ type copyInState struct {
 	tx          transam.Transaction
 	mgr         *transam.Manager
 	asyncCommit bool
+	// onDone saves the COPY's session state (sequence currval/lastval) back
+	// to the connection once the CopyIn stream ends, however it ends.
+	onDone func()
 }
 
 // commitCopyTx commits tx through mgr, honoring the session-effective
@@ -200,11 +203,48 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 	// twin): without this, `COPY (SELECT current_user) TO STDOUT` reported the
 	// hardcoded/login default instead of the connection's actual SET ROLE /
 	// SET SESSION AUTHORIZATION state that plain SELECT already honoured.
+	saveSeqState := func() {}
 	if connTx != nil {
 		ectx.SessionUser = connTx.SessionUser
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
 		ectx.SetRoleIsActive = connTx.SetRoleIsActive
+		// Per-connection sequence state, as dispatch wires it for every
+		// other statement: a COPY FROM filling an omitted column with
+		// `DEFAULT nextval(...)` sets currval/lastval for the session, as in
+		// PG (M0146-0054). The map is shared; the lastval scalars are saved
+		// back when the COPY ends (deferred below for the synchronous
+		// paths, copyInState.onDone for a CopyIn stream).
+		if connTx.SeqCurrVals == nil {
+			connTx.SeqCurrVals = map[string]int64{}
+		}
+		ectx.CurrSeqVals = connTx.SeqCurrVals
+		ectx.LastSeqVal = connTx.SeqLastVal
+		ectx.LastSeqSet = connTx.SeqLastSet
+		ectx.LastSeqName = connTx.SeqLastName
+		saveSeqState = func() {
+			connTx.SeqLastVal = ectx.LastSeqVal
+			connTx.SeqLastSet = ectx.LastSeqSet
+			connTx.SeqLastName = ectx.LastSeqName
+		}
 	}
+	// Deliver NOTICEs as they are raised (a COPY FROM's trigger RAISE
+	// NOTICE included), as dispatch wires every other statement's context;
+	// otherwise they sat in ectx.Notices and were never sent (M0146-0055).
+	ectx.NoticeFlush = func(msg string) {
+		_ = w.WriteNoticeResponse([]libpq.ErrorField{
+			{Code: libpq.FieldSeverity, Value: "NOTICE"},
+			{Code: libpq.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: libpq.FieldSQLState, Value: "00000"},
+			{Code: libpq.FieldMessage, Value: msg},
+		})
+		_ = w.Flush()
+	}
+	streaming := false
+	defer func() {
+		if !streaming {
+			saveSeqState()
+		}
+	}()
 	// A standalone `COPY ... TO STDOUT` built its executor context by hand and
 	// never attached the session GUC hooks, so it was the one COPY path that
 	// could not see `SET datestyle` / `SET timezone` — RunCopyTo's lookups all
@@ -310,11 +350,13 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			return nil, err
 		}
+		streaming = true
 		return &copyInState{
 			fromExec:    from,
 			tx:          tx,
 			mgr:         s.cfg.TxnMgr,
 			asyncCommit: asyncCommit,
+			onDone:      saveSeqState,
 		}, nil
 	}
 	_ = s.cfg.TxnMgr.Rollback(tx)

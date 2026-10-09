@@ -1,0 +1,6 @@
+# simple (no GROUP BY/HAVING/DISTINCT/LIMIT/set-op/ORDER BY/window/aggregate)
+# FROM-clause subqueries whose own FROM has >1 relation, TPC-DS queries
+query2.sql 2 [' wswscs,date_dim ', ' wswscs ,date_dim ']
+query51.sql 1 [' web_v1 web full outer join store_v1 store on ']
+query59.sql 2 [' wss,store,date_dim d ', ' wss,store,date_dim d ']
+query93.sql 1 [' store_sales left outer join store_returns on ,reason ']

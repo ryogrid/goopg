@@ -31,6 +31,7 @@ func cipScan(refs int, eligible bool) (*CTEScan, *SeqScan) {
 		schema:         Schema{ijCol("y"), ijCol("cnt")},
 		refs:           refs,
 		inlineEligible: eligible,
+		selectOwned:    eligible,
 	}
 	return &CTEScan{Name: "s", Alias: "s", Child: body, schema: ce.schema, cte: ce}, body
 }
@@ -90,8 +91,11 @@ func TestCTEBodyPushSingleRef(t *testing.T) {
 	if got := columnRefIndexes(bf.Predicate); len(got) != 1 || got[0] != 0 {
 		t.Errorf("pushed predicate refs = %v, want [0]", got)
 	}
-	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	// M0146-0007b: the placement over a base-relation leaf is exact, so the
+	// qual MOVES — the residual keeps only the transparent true wrapper,
+	// as PG's subquery_push_qual leaves no copy above the subquery.
+	if !isTrueConst(f.Predicate) {
+		t.Errorf("residual Filter is %v, want the true wrapper — a proven push must move", f.Predicate)
 	}
 	if bf.Predicate == f.Predicate {
 		t.Errorf("pushed predicate aliases the residual conjunct; the remap must produce a fresh tree")
@@ -133,6 +137,7 @@ func TestCTEBodyPushCrossesGatherMerge(t *testing.T) {
 		schema:         Schema{ijCol("y"), ijCol("total")},
 		refs:           1,
 		inlineEligible: true,
+		selectOwned:    true,
 	}
 	scan := &CTEScan{Name: "s", Alias: "s", Child: agg, schema: ce.schema, cte: ce}
 	f := &Filter{Child: scan, Predicate: ijEq(0, "y", 1998)}
@@ -164,8 +169,10 @@ func TestCTEBodyPushCrossesGatherMerge(t *testing.T) {
 	if got := columnRefIndexes(lf.Predicate); len(got) != 1 || got[0] != 0 {
 		t.Errorf("pushed predicate refs = %v, want [0] (sales.y)", got)
 	}
-	if got := len(splitAnd(f.Predicate)); got != 1 {
-		t.Errorf("residual Filter has %d conjuncts, want 1 — the pass must DUPLICATE, not move", got)
+	// Aggregate (grouping key), GatherMerge and Sort are exact hops: the
+	// qual moves (M0146-0007b).
+	if !isTrueConst(f.Predicate) {
+		t.Errorf("residual Filter is %v, want the true wrapper — a proven push must move", f.Predicate)
 	}
 
 	// Freshness pin on the shared finder: planChildren must see
@@ -405,11 +412,15 @@ func TestCTEBodyPushEndToEndGroupKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	scan := cipFindCTEScan(plan)
-	if scan == nil {
-		t.Fatalf("no CTE reference in plan:\n%s", plan)
+	// M0146-0005bn: the single reference is now planned as the derived
+	// table inline_cte makes of it, with the qual in its HAVING before
+	// planning (subquerypushqual_ast.go) — so there may be no CTEScan, and
+	// the qual reaches the leaf either way.
+	var root Node = plan
+	if scan := cipFindCTEScan(plan); scan != nil {
+		root = scan.Child
 	}
-	lf := cipBodyLeafFilters(scan.Child)
+	lf := cipBodyLeafFilters(root)
 	if len(lf) != 1 {
 		t.Fatalf("body has %d leaf Filters, want 1 (the pushed group-key qual):\n%s", len(lf), plan)
 	}
@@ -455,5 +466,179 @@ func TestCTEBodyPushEndToEndDeclinesAggOutput(t *testing.T) {
 	}
 	if lf := cipBodyLeafFilters(scan.Child); len(lf) != 0 {
 		t.Errorf("aggregate-output qual crossed below the aggregate (%d body Filter(s)):\n%s", len(lf), plan)
+	}
+}
+
+// TestCTEInlinableFollowsInlineCTEGate pins M0146-0007: plannedCTE.inlinable
+// is SS_process_ctes' inline_cte gate — one reference, a plain SELECT body
+// owned by a SELECT, not MATERIALIZED, no volatile function. Each decline
+// keeps the CTE as a materialised CTE Scan (and keeps quals out of its
+// body), as PG does.
+func TestCTEInlinableFollowsInlineCTEGate(t *testing.T) {
+	base := func() *plannedCTE {
+		return &plannedCTE{name: "s", refs: 1, inlineEligible: true, selectOwned: true}
+	}
+	if !base().inlinable() {
+		t.Fatal("a single-reference plain SELECT CTE must inline")
+	}
+	cases := map[string]func(*plannedCTE){
+		"two references":     func(e *plannedCTE) { e.refs = 2 },
+		"MATERIALIZED":       func(e *plannedCTE) { e.materialized = "materialized" },
+		"volatile body":      func(e *plannedCTE) { e.volatile = true },
+		"DML-owned WITH":     func(e *plannedCTE) { e.selectOwned = false },
+		"recursive/DML body": func(e *plannedCTE) { e.inlineEligible = false },
+	}
+	for name, mut := range cases {
+		e := base()
+		mut(e)
+		if e.inlinable() {
+			t.Errorf("%s: must not inline", name)
+		}
+	}
+	e := base()
+	e.materialized = "not materialized"
+	if !e.inlinable() {
+		t.Error("NOT MATERIALIZED with one reference must inline")
+	}
+	var nilScan *CTEScan
+	if nilScan.Inlined() || (&CTEScan{}).Inlined() {
+		t.Error("a scan without a WITH-list entry is never inlined")
+	}
+}
+
+// isTrueConst reports whether e is the literal TRUE the pass leaves behind
+// when every conjunct moved.
+func isTrueConst(e Expr) bool {
+	b, ok := e.(*BooleanConst)
+	return ok && b.Value
+}
+
+// TestCTEBodyPushGroupingSetsKeepsCopy pins M0146-0007b's grouping-sets
+// exception: a grouping-sets aggregate emits rollup rows whose key is NULL,
+// which only the residual copy rejects, so crossing it plants the qual
+// below but must keep the copy above.
+func TestCTEBodyPushGroupingSetsKeepsCopy(t *testing.T) {
+	leaf := &SeqScan{Table: &catalog.Table{Name: "sales"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+	agg := &Aggregate{
+		Child:        leaf,
+		GroupExprs:   []Expr{&ColumnRef{Index: 0, Name: "y", Type: catalog.Type{Name: "int4"}}},
+		Aggs:         []AggregateCall{{Name: "sum", Arg: &ColumnRef{Index: 1, Name: "cnt", Type: catalog.Type{Name: "int4"}}}},
+		GroupingSets: [][]int{{0}, {}},
+		schema:       Schema{ijCol("y"), ijCol("total")},
+	}
+	ce := &plannedCTE{name: "s", body: agg, schema: Schema{ijCol("y"), ijCol("total")},
+		refs: 1, inlineEligible: true, selectOwned: true}
+	scan := &CTEScan{Name: "s", Alias: "s", Child: agg, schema: ce.schema, cte: ce}
+	f := &Filter{Child: scan, Predicate: ijEq(0, "y", 1998)}
+	pushQualsThroughSingleRefCTEs(f)
+	if _, ok := agg.Child.(*Filter); !ok {
+		t.Fatalf("aggregate child is %T, want the planted *Filter", agg.Child)
+	}
+	if isTrueConst(f.Predicate) || len(splitAnd(f.Predicate)) != 1 {
+		t.Errorf("residual Filter is %v, want the original conjunct kept (copy, not move)", f.Predicate)
+	}
+}
+
+// TestPushConjunctProjectArmCTEMoveProof pins M0146-0007b's narrow opening
+// of pushConjunctTraced's *Project arm: a descent from a CTE residual
+// (cteMove) keeps the move proof across a projection when every ColumnRef
+// is named — the positional name check then ran on both hops. The join
+// pass (cteMove unset) and an unnamed ref both stay placement-only.
+func TestPushConjunctProjectArmCTEMoveProof(t *testing.T) {
+	build := func() *Project {
+		leaf := &SeqScan{Table: &catalog.Table{Name: "t"}, schema: Schema{ijCol("y"), ijCol("cnt")}}
+		return &Project{Child: leaf,
+			Targets: []Expr{&ColumnRef{Index: 0, Name: "y", Type: catalog.Type{Name: "int4"}}},
+			schema:  Schema{ijCol("y")}}
+	}
+	cases := []struct {
+		name       string
+		cteMove    bool
+		unnamed    bool
+		wantProven bool
+	}{
+		{"CTE path, named refs", true, false, true},
+		{"join pass", false, false, false},
+		{"CTE path, unnamed ref", true, true, false},
+	}
+	for _, tc := range cases {
+		c := ijEq(0, "y", 1998)
+		if tc.unnamed {
+			walkExprTree(c, func(e Expr) {
+				if cr, ok := e.(*ColumnRef); ok {
+					cr.Name = ""
+				}
+			})
+		}
+		st := &pushTrace{proven: true, cteMove: tc.cteMove}
+		if _, ok := pushConjunctTraced(build(), c, st); !ok {
+			t.Fatalf("%s: the push itself must succeed", tc.name)
+		}
+		if st.proven != tc.wantProven {
+			t.Errorf("%s: proven = %v, want %v", tc.name, st.proven, tc.wantProven)
+		}
+	}
+}
+
+// nliFixture builds INNER NestedLoopIndexJoin(outer ws(ws_item, ws_date),
+// inner IndexScan dd(d_date, d_year)) with source identities 1 and 2 — the
+// reduced shape of TPC-DS Q78's `ws` CTE body.
+func nliFixture(jt JoinType) (*NestedLoopIndexJoin, *SeqScan, *IndexScan) {
+	src := func(name string, idx int16) SchemaColumn {
+		return SchemaColumn{Name: name, Type: catalog.Type{Name: "int4"}, SourceTableIdx: idx}
+	}
+	outer := &SeqScan{Table: &catalog.Table{Name: "ws"}, schema: Schema{src("ws_item", 1), src("ws_date", 1)}}
+	inner := &IndexScan{Table: &catalog.Table{Name: "dd"}, schema: Schema{src("d_date", 2), src("d_year", 2)}}
+	schema := append(append(Schema{}, outer.schema...), inner.schema...)
+	return &NestedLoopIndexJoin{Type: jt, Outer: outer, Inner: inner, schema: schema}, outer, inner
+}
+
+func nliRef(idx int, name string, srcIdx int16) Expr {
+	return &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: idx, Name: name, Type: catalog.Type{Name: "int4"}, SourceTableIdx: srcIdx},
+		Right: &IntegerConst{Value: 1998}}
+}
+
+// TestPushConjunctIntoNLI pins M0146-0007c: on a CTE-path descent an
+// inner-only conjunct of an INNER NestedLoopIndexJoin joins the probe's
+// Cond (PG's `Filter:` on the inner Index Scan) with the move proof intact,
+// an outer-only one descends into Outer, and a mixed reference, an inner
+// reference under LEFT, or a join-pass descent (cteMove unset) declines.
+func TestPushConjunctIntoNLI(t *testing.T) {
+	j, _, inner := nliFixture(JoinTypeInner)
+	st := &pushTrace{proven: true, cteMove: true}
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), st); !ok {
+		t.Fatal("inner-only conjunct must place")
+	}
+	if inner.Cond == nil || !st.proven {
+		t.Fatalf("inner probe Cond = %v, proven = %v; want the conjunct and a kept proof", inner.Cond, st.proven)
+	}
+	if got := columnRefIndexes(inner.Cond); len(got) != 1 || got[0] != 1 {
+		t.Errorf("probe Cond refs = %v, want [1] (scan-local d_year)", got)
+	}
+
+	j, outer, _ := nliFixture(JoinTypeInner)
+	st = &pushTrace{proven: true, cteMove: true}
+	if _, ok := pushConjunctTraced(j, nliRef(0, "ws_item", 1), st); !ok || !st.proven {
+		t.Fatalf("outer-only conjunct: ok=%v proven=%v", ok, st.proven)
+	}
+	if f, isF := j.Outer.(*Filter); !isF || f.Child != Node(outer) {
+		t.Errorf("outer side is %T, want a Filter over the outer scan", j.Outer)
+	}
+
+	mixed := &BinaryOp{Op: parser.OpEq,
+		Left:  &ColumnRef{Index: 0, Name: "ws_item", SourceTableIdx: 1},
+		Right: &ColumnRef{Index: 3, Name: "d_year", SourceTableIdx: 2}}
+	j, _, _ = nliFixture(JoinTypeInner)
+	if _, ok := pushConjunctTraced(j, mixed, &pushTrace{proven: true, cteMove: true}); ok {
+		t.Error("a conjunct spanning both sides must decline")
+	}
+	j, _, _ = nliFixture(JoinTypeLeft)
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), &pushTrace{proven: true, cteMove: true}); ok {
+		t.Error("an inner reference under LEFT (nullable side) must decline")
+	}
+	j, _, _ = nliFixture(JoinTypeInner)
+	if _, ok := pushConjunctTraced(j, nliRef(3, "d_year", 2), &pushTrace{proven: true}); ok {
+		t.Error("the join pass (cteMove unset) keeps its NLI decline")
 	}
 }

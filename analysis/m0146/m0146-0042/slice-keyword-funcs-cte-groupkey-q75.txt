@@ -1,0 +1,90 @@
+# M0146-0042 slice: keyword expression spelling + CTE group key through a UNION dedupe (code 95c4f5581)
+# fire-set captures tmp/fireset-m42g (baseline = f6ba90d16, candidate = staged change)
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=12
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+
+sf025 text-identical 39 -> 39
+  Q36 diff-lines vs PG 2 -> 2 
+  Q49 diff-lines vs PG 118 -> 118 
+  Q67 diff-lines vs PG 61 -> 61 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 18 -> 18 
+  Q78 diff-lines vs PG 47 -> 47 
+  Q86 diff-lines vs PG 2 -> 2 
+sf1 text-identical 30 -> 30
+  Q36 diff-lines vs PG 2 -> 2 
+  Q49 diff-lines vs PG 130 -> 130 
+  Q67 diff-lines vs PG 61 -> 61 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 30 -> 30 
+  Q78 diff-lines vs PG 106 -> 106 
+  Q86 diff-lines vs PG 2 -> 2 
+
+===== sf025 Q49
+-    Sort Key: ('web'::text), item, return_ratio, return_rank, currency_rank
++    Sort Key: ('web'::text), item, return_ratio, web.return_rank, web.currency_rank
+===== sf025 Q67
+-    Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(coalesce((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) ROWS UNBOUNDED PRECEDING)
++    Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(COALESCE((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) ROWS UNBOUNDED PRECEDING)
+-    Sort Key: item.i_category, (sum(coalesce((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) DESC
++    Sort Key: item.i_category, (sum(COALESCE((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) DESC
+===== sf025 Q75
+-    Group Key: curr_yr.d_year, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id
++    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - coalesce(store_returns.sr_return_quantity, 0)), (store_sales.
++    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.
+===== sf025 Q78
+-    Sort Key: store_sales.ss_customer_sk, (sum(store_sales.ss_quantity)) DESC, (sum(store_sales.ss_wholesale_cost)) DESC, (sum(store_sales.ss_sales_price)) DESC, ((coalesce(ws_qty, 0) + coalesce(cs_qty, 0
++    Sort Key: store_sales.ss_customer_sk, (sum(store_sales.ss_quantity)) DESC, (sum(store_sales.ss_wholesale_cost)) DESC, (sum(store_sales.ss_sales_price)) DESC, ((COALESCE(ws_qty, 0) + COALESCE(cs_qty, 0
+-    Filter: ((coalesce(ws_qty, 0) > 0) OR (coalesce(cs_qty, 0) > 0))
++    Filter: ((COALESCE(ws_qty, 0) > 0) OR (COALESCE(cs_qty, 0) > 0))
+===== sf1 Q49
+-    Sort Key: ('web'::text), item, return_ratio, return_rank, currency_rank
++    Sort Key: ('web'::text), item, return_ratio, web.return_rank, web.currency_rank
+===== sf1 Q67
+-    Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(coalesce((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) ROWS UNBOUNDED PRECEDING)
++    Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(COALESCE((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) ROWS UNBOUNDED PRECEDING)
+-    Sort Key: item.i_category, (sum(coalesce((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) DESC
++    Sort Key: item.i_category, (sum(COALESCE((store_sales.ss_sales_price * (store_sales.ss_quantity)::numeric), 0))) DESC
+===== sf1 Q75
+-    Group Key: curr_yr.d_year, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id
++    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - coalesce(store_returns.sr_return_quantity, 0)), (store_sales.
++    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.
+===== sf1 Q78
+-    Sort Key: store_sales.ss_customer_sk, (sum(store_sales.ss_quantity)) DESC, (sum(store_sales.ss_wholesale_cost)) DESC, (sum(store_sales.ss_sales_price)) DESC, ((coalesce(ws_qty, 0) + coalesce(cs_qty, 0
++    Sort Key: store_sales.ss_customer_sk, (sum(store_sales.ss_quantity)) DESC, (sum(store_sales.ss_wholesale_cost)) DESC, (sum(store_sales.ss_sales_price)) DESC, ((COALESCE(ws_qty, 0) + COALESCE(cs_qty, 0
+-    Filter: ((coalesce(ws_qty, 0) > 0) OR (coalesce(cs_qty, 0) > 0))
++    Filter: ((COALESCE(ws_qty, 0) > 0) OR (COALESCE(cs_qty, 0) > 0))
+
+## regress join.diff, HEAD vs change (14-file suite)
+< -  Filter: (COALESCE(c.f1, 0) = 0)
+< +  Filter: (coalesce(c.f1, 0) = 0)
+>    Filter: (COALESCE(c.f1, 0) = 0)
+< +  Filter: (coalesce(f1, 0) = 0)
+> +  Filter: (COALESCE(f1, 0) = 0)
+< +  Hash Cond: ((coalesce(b.thousand, 123) = a.q1) AND (coalesce(b.hundred, 123) = a.q1) AND (b.unique2 = a.q1))
+> +  Hash Cond: ((COALESCE(b.thousand, 123) = a.q1) AND (COALESCE(b.hundred, 123) = a.q1) AND (b.unique2 = a.q1))
+< +  Hash Cond: (c.unique2 = coalesce(b.twothousand, a.twothousand))
+> +  Hash Cond: (c.unique2 = COALESCE(b.twothousand, a.twothousand))
+< +  Join Filter: (coalesce(b.twothousand, a.twothousand) = 44)
+> +  Join Filter: (COALESCE(b.twothousand, a.twothousand) = 44)
+< +  Merge Cond: (a.q2 = coalesce(b.q1, 1))
+> +  Merge Cond: (a.q2 = COALESCE(b.q1, 1))
+< +  Filter: (coalesce(q1, 1) > 0)
+> +  Filter: (COALESCE(q1, 1) > 0)
+< +  Filter: (coalesce(dat1, 0) = int8_tbl.q1)
+> +  Filter: (COALESCE(dat1, 0) = int8_tbl.q1)
+< +  Group Key: t2.a, (coalesce(t2.a))
+> +  Group Key: t2.a, (COALESCE(t2.a))
+< +  Sort Key: t2.a, (coalesce(t2.a))
+> +  Sort Key: t2.a, (COALESCE(t2.a))

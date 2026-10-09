@@ -424,6 +424,19 @@ func reconcileNLILayoutBody(node Node) {
 	case *Aggregate:
 		reconcileNLILayout(n.Child)
 		cs := n.Child.Output()
+		// A Finalize aggregate is a copy of the original: its keys and
+		// arguments still address the PARTIAL aggregate's input row
+		// (PartialSource), which the executor resolves through, not its own
+		// child — the Gather over the partial-state row. Resolving them
+		// against that child moved TPC-H Q15's `l_suppkey` from the input's
+		// column 4 to the partial row's column 0 once the view's split
+		// aggregate sat inside the outer join search (M0146-0005ap).
+		if n.Mode == AggModeFinal {
+			if n.PartialSource == nil || n.PartialSource.Child == nil {
+				break
+			}
+			cs = n.PartialSource.Child.Output()
+		}
 		for i := range n.GroupExprs {
 			reresolveExprByName(n.GroupExprs[i], cs)
 		}

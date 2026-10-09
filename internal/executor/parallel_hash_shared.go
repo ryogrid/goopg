@@ -23,6 +23,7 @@ package executor
 
 import (
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/goopg/goopg/internal/optimizer"
@@ -52,11 +53,17 @@ type parallelHashBuild struct {
 
 	// The merged table. Written only under mu, only before `complete`;
 	// read unlocked after `done` is closed (the close is the publication
-	// edge).
+	// edge). When any participant's build spilled, `table.batches` is the
+	// merged batch descriptor and the maps hold batch 0 only (M0146-0090).
 	table sharedHashBuild
 	// seeded records that `table` has taken its first participant's maps
-	// (the first finisher's maps are adopted whole; later ones are merged in).
+	// (the first contribution's maps are adopted whole; later ones are merged
+	// in).
 	seeded bool
+	// parts are the published contributions, merged when the last attached
+	// participant arrives: only then is the batch count every one of them
+	// must be routed under known.
+	parts []parallelHashPart
 
 	// builders / rowsPublished are witnesses, not control: how many
 	// participants published a share and how many build rows they published
@@ -64,6 +71,41 @@ type parallelHashBuild struct {
 	// partial (several builders, whose shares sum to the inner exactly once).
 	builders      int
 	rowsPublished int
+
+	// The probe-phase half of PG's PHJ_BATCH_PROBE → PHJ_BATCH_SCAN, for a
+	// join that fills its build side (RIGHT, FULL, RIGHT ANTI; M0146-0005dj).
+	// No one participant sees every match, so each keeps a private matched
+	// bitmap over the shared table — the same key and row position name the
+	// same build row in every participant — and ORs it in here when its probe
+	// side is exhausted. The participant whose detach brings `probers` to
+	// zero runs the unmatched sweep alone, with the merged bits; it is PG's
+	// "last participant to detach from the probe phase scans for unmatched
+	// tuples" (ExecParallelPrepHashTableForUnmatched). A participant that
+	// attaches after the sweep was claimed probes nothing: every participant
+	// that reached its probe EOF saw the shared partial scan exhausted, so
+	// there is no probe input left for it.
+	probers      int
+	sweepClaimed bool
+	mergedS      map[string][]bool
+	mergedI      map[int64][]bool
+	// handedOuter collects, per batch, the probe-row files every detached
+	// prober wrote for batches past 0 (M0146-0095). A join that fills its
+	// build side cannot let each participant probe batch k with its own rows
+	// alone — no participant would see every match of a batch-k build row —
+	// so the participant that claims the sweep runs every later batch itself
+	// over all participants' probe rows, and its per-batch matched bits are
+	// complete.
+	handedOuter [][]*joinBatchFile
+}
+
+// parallelHashPart is one participant's published build share.
+type parallelHashPart struct {
+	local *sharedHashBuild
+	// bs is the participant's batch state when its build grew past one batch:
+	// detached from the operator, its maps hold the share's batch 0 and its
+	// inner files the share's other batches, routed under bs.nbatch. nil for a
+	// share that fit in memory.
+	bs *hashBatchState
 }
 
 func newParallelHashBuild(groupDone <-chan struct{}) *parallelHashBuild {
@@ -84,24 +126,287 @@ func (ph *parallelHashBuild) attach() (mustBuild bool) {
 }
 
 // finish publishes one participant's private build (nil when it failed) and
-// arrives at the barrier. The first error wins and is returned to every
-// participant by wait.
-func (ph *parallelHashBuild) finish(local *sharedHashBuild, err error) {
+// arrives at the barrier. spilled is the share's batch state when its build
+// grew past one batch, nil otherwise. The first error wins and is returned to
+// every participant by wait.
+//
+// The participant whose arrival completes the build merges every share,
+// still under mu: the others are parked on `done` and a late attacher on mu,
+// so nothing can read the table while it is assembled.
+func (ph *parallelHashBuild) finish(local *sharedHashBuild, spilled *hashBatchState, err error) {
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
 	if err != nil {
 		if ph.err == nil {
 			ph.err = err
 		}
+		if spilled != nil {
+			spilled.close()
+		}
 	} else if local != nil {
 		ph.builders++
 		ph.rowsPublished += local.rowCount()
-		ph.merge(local)
+		if spilled != nil {
+			ph.rowsPublished += int(spilled.innerSpilled)
+		}
+		ph.parts = append(ph.parts, parallelHashPart{local: local, bs: spilled})
 	}
 	ph.finished++
 	if ph.finished == ph.attached && !ph.complete {
+		if ph.err == nil {
+			if merr := ph.mergeParts(); merr != nil {
+				ph.err = merr
+			}
+		}
+		if ph.err != nil {
+			for _, p := range ph.parts {
+				if p.bs != nil {
+					p.bs.close()
+				}
+			}
+			ph.table.release(nil)
+		}
+		ph.parts = nil
 		ph.complete = true
 		close(ph.done)
+	}
+}
+
+// mergeParts assembles the shared table from every published share. Shares
+// that all fit are folded map by map, as before. When any share spilled, the
+// table becomes a batched one (mergeSpilledParts).
+func (ph *parallelHashBuild) mergeParts() error {
+	for _, p := range ph.parts {
+		if p.bs != nil {
+			return ph.mergeSpilledParts()
+		}
+	}
+	for _, p := range ph.parts {
+		ph.merge(p.local)
+	}
+	return nil
+}
+
+// mergeSpilledParts is PG's shared batch growth reduced to its outcome
+// (ExecParallelHashIncreaseNumBatches, nodeHash.c): every participant ends up
+// routing under ONE batch count, the largest any share grew to, and the
+// table's other batches are files every participant can reload.
+//
+// PG grows the shared table's batch count while the build runs and
+// repartitions cooperatively. goopg's shares build privately, each under its
+// own growth, so the repartitioning happens here, once, after the last share
+// arrived. It is legal for the same reason a serial doubling is (the
+// join_batch.go header): batch numbers are the low bits of `hash >>
+// bucketBits`, so under a larger power-of-two count a row of a share's batch
+// k lands in a batch congruent to k. Batch-0 rows may move to any batch; a
+// row of batch k != 0 can never move to batch 0.
+//
+// Every row that leaves memory or is re-filed is written with its hash and
+// canonical key (the E-14 keyed frame), so no build key expression is
+// evaluated here. The result is a settled, frozen descriptor — exactly what
+// the leader prebuild publishes (freezeForSharing) — and the participants
+// probe it through the same E-09 path: a private batch state per participant
+// over the shared inner files.
+func (ph *parallelHashBuild) mergeSpilledParts() error {
+	var ref *hashBatchState
+	nbatch := 1
+	for _, p := range ph.parts {
+		if p.bs == nil {
+			continue
+		}
+		// Shares size their tables privately and need not agree on the
+		// bucket count; every row is re-routed from its stored hash under
+		// the merged geometry (the first spilled share's), which is also
+		// the geometry every participant routes its probe rows by.
+		if ref == nil {
+			ref = p.bs
+		}
+		if p.bs.nbatch > nbatch {
+			nbatch = p.bs.nbatch
+		}
+	}
+	m := &hashBatchState{
+		nbatch:         nbatch,
+		origNBatch:     ref.origNBatch,
+		nbatchOutstart: nbatch,
+		bucketBits:     ref.bucketBits,
+		spaceAllowed:   ref.spaceAllowed,
+		buildIsLeft:    ref.buildIsLeft,
+		ctx:            ref.ctx,
+		nbuckets:       ref.nbuckets,
+		inner:          make([]*joinBatchFile, nbatch),
+	}
+	dropMerged := func() {
+		for _, f := range m.inner {
+			if f != nil {
+				m.dropFile(f)
+			}
+		}
+	}
+	for _, p := range ph.parts {
+		if err := m.absorbParallelHashPart(p); err != nil {
+			dropMerged()
+			return err
+		}
+		ph.merge(p.local)
+	}
+	for b, f := range m.inner {
+		if f == nil {
+			continue
+		}
+		if err := f.w.Close(); err != nil {
+			dropMerged()
+			return err
+		}
+		f.w = nil
+		if f.rows == 0 {
+			m.ctx.removeSpillFile(f.path)
+			m.inner[b] = nil
+		}
+	}
+	ph.table.batches = &sharedBatchDesc{
+		nbatch:       m.nbatch,
+		origNBatch:   m.origNBatch,
+		nbuckets:     m.nbuckets,
+		bucketBits:   m.bucketBits,
+		spaceAllowed: m.spaceAllowed,
+		buildIsLeft:  m.buildIsLeft,
+		inner:        m.inner,
+		loads:        make([]*sharedBatchLoad, m.nbatch),
+	}
+	return nil
+}
+
+// absorbParallelHashPart moves one share into the merged batch state m: its
+// in-memory rows that m routes past batch 0 are written to m's inner files
+// and deleted from the share's maps (the maps are then folded into the shared
+// batch 0 by merge), and every row of the share's own inner files is re-filed
+// under m's batch count. The share's files are unlinked once copied.
+func (m *hashBatchState) absorbParallelHashPart(p parallelHashPart) error {
+	local := p.local
+	for ik, rows := range local.intHash {
+		h := joinBatchHashInt64(ik)
+		b := m.batchOf(h)
+		if b == 0 {
+			continue
+		}
+		for _, r := range rows {
+			if err := m.writeKeyed(m.inner, b, h, spillIntKey(ik), r); err != nil {
+				return err
+			}
+		}
+		delete(local.intHash, ik)
+	}
+	for sk, rows := range local.hash {
+		h := hashKeyString(sk)
+		b := m.batchOf(h)
+		if b == 0 {
+			continue
+		}
+		for _, r := range rows {
+			if err := m.writeKeyed(m.inner, b, h, spillStrKey(sk), r); err != nil {
+				return err
+			}
+		}
+		delete(local.hash, sk)
+	}
+	bs := p.bs
+	if bs == nil {
+		return nil
+	}
+	for k, f := range bs.inner {
+		if f == nil {
+			continue
+		}
+		bs.inner[k] = nil
+		if err := m.refileParallelHashBatch(f, p.local); err != nil {
+			bs.dropFile(f)
+			return err
+		}
+		bs.dropFile(f)
+	}
+	bs.close()
+	return nil
+}
+
+// refileParallelHashBatch copies one share batch file's rows into m's files.
+// A row the merged geometry assigns to batch 0 — possible when the share
+// chose a different bucket count, so its batch bits were taken from other
+// hash bits — goes into the share's in-memory maps instead, which merge into
+// the shared batch 0.
+func (m *hashBatchState) refileParallelHashBatch(f *joinBatchFile, local *sharedHashBuild) error {
+	if f.w != nil {
+		if err := f.w.Close(); err != nil {
+			return err
+		}
+		f.w = nil
+	}
+	r, err := newSpillReader(f.path)
+	if err != nil {
+		return err
+	}
+	defer r.closeKeepFile()
+	var buf Row
+	for {
+		h, k, row, err := r.ReadRowKeyedInto(buf)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		buf = row
+		if b := m.batchOf(h); b != 0 {
+			if err := m.writeKeyed(m.inner, b, h, k, row); err != nil {
+				return err
+			}
+			continue
+		}
+		if k.tag == spillKeyNone {
+			// A NULL key matches nothing; the build loop never spills one
+			// (recordBuildNullKey keeps the fill rows), so there is nothing
+			// to carry into the table.
+			continue
+		}
+		local.insertKeyed(k, cloneRow(row))
+	}
+}
+
+// insertKeyed files a reloaded row in a share's maps by its canonical key,
+// the lane rule of joinOp.lazyHashInsertKeyed: an int key in an int-lane
+// table, its canonical string otherwise; a string key demotes an int-lane
+// table first.
+func (sb *sharedHashBuild) insertKeyed(k spillRowKey, row Row) {
+	switch k.tag {
+	case spillKeyInt:
+		if sb.hashIsInt {
+			if sb.intHash == nil {
+				sb.intHash = make(map[int64][]Row)
+			}
+			sb.intHash[k.i] = append(sb.intHash[k.i], row)
+			return
+		}
+		if sb.hash == nil {
+			sb.hash = make(map[string][]Row)
+		}
+		sk := canonicalNumericKey(k.i, 0)
+		sb.hash[sk] = append(sb.hash[sk], row)
+	case spillKeyStr:
+		if sb.hashIsInt {
+			if sb.hash == nil {
+				sb.hash = make(map[string][]Row, len(sb.intHash))
+			}
+			for ik, rows := range sb.intHash {
+				sk := canonicalNumericKey(ik, 0)
+				sb.hash[sk] = append(sb.hash[sk], rows...)
+			}
+			sb.intHash = nil
+			sb.hashIsInt = false
+		}
+		if sb.hash == nil {
+			sb.hash = make(map[string][]Row)
+		}
+		sb.hash[k.s] = append(sb.hash[k.s], row)
 	}
 }
 
@@ -138,6 +443,18 @@ func (ph *parallelHashBuild) merge(local *sharedHashBuild) {
 	// and every participant's NULL keys.
 	t.antiBuildRows += local.antiBuildRows
 	t.antiBuildHasNull = t.antiBuildHasNull || local.antiBuildHasNull
+	// One lane for the whole table: a share that demoted to string keys
+	// (insertKeyed, or its own build) moves every int-lane row into the
+	// string lane, the way joinOp.demoteIntHash does, so no probe misses
+	// rows filed under the other representation.
+	if len(t.hash) > 0 && (t.hashIsInt || len(t.intHash) > 0) {
+		for ik, rows := range t.intHash {
+			sk := canonicalNumericKey(ik, 0)
+			t.hash[sk] = append(t.hash[sk], rows...)
+		}
+		t.intHash = nil
+		t.hashIsInt = false
+	}
 }
 
 // rowCount is the number of build rows a table holds, across its maps.
@@ -170,6 +487,72 @@ func (ph *parallelHashBuild) wait(ctx *Context) error {
 	}
 }
 
+// probeAttach registers a participant as probing. False means the sweep has
+// already been claimed: the caller must not probe (see the probers field).
+func (ph *parallelHashBuild) probeAttach() bool {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	if ph.sweepClaimed {
+		return false
+	}
+	ph.probers++
+	return true
+}
+
+// probeDetach ORs one participant's matched bitmaps into the merged set and
+// reports whether the caller is the last prober, which then owns the sweep
+// and receives the merged bitmaps. The mutex is the publication edge: every
+// other participant's marks were made before its own detach.
+func (ph *parallelHashBuild) probeDetach(ms map[string][]bool, mi map[int64][]bool, outer []*joinBatchFile) (map[string][]bool, map[int64][]bool, [][]*joinBatchFile, bool) {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	for b, f := range outer {
+		if f == nil {
+			continue
+		}
+		for len(ph.handedOuter) <= b {
+			ph.handedOuter = append(ph.handedOuter, nil)
+		}
+		ph.handedOuter[b] = append(ph.handedOuter[b], f)
+	}
+	if ph.mergedS == nil {
+		ph.mergedS = make(map[string][]bool, len(ms))
+	}
+	if ph.mergedI == nil {
+		ph.mergedI = make(map[int64][]bool, len(mi))
+	}
+	for k, bits := range ms {
+		orMatched(ph.mergedS, k, bits)
+	}
+	for k, bits := range mi {
+		orMatched(ph.mergedI, k, bits)
+	}
+	ph.probers--
+	if ph.probers > 0 || ph.sweepClaimed {
+		return nil, nil, nil, false
+	}
+	ph.sweepClaimed = true
+	handed := ph.handedOuter
+	ph.handedOuter = nil
+	return ph.mergedS, ph.mergedI, handed, true
+}
+
+// orMatched ORs a participant's bitmap for one bucket into the merged map. The
+// first bitmap for a bucket is copied, not adopted: the participant may still
+// hold it.
+func orMatched[K comparable](merged map[K][]bool, k K, bits []bool) {
+	m, ok := merged[k]
+	if !ok || len(m) != len(bits) {
+		merged[k] = append([]bool(nil), bits...)
+		return
+	}
+	for i, b := range bits {
+		if b {
+			m[i] = true
+		}
+	}
+}
+
 // errParallelHashAbandoned is returned to a participant whose Gather group
 // was cancelled while it waited at the build barrier — another participant
 // failed, or the Gather closed early. The group's own error is the one the
@@ -180,11 +563,6 @@ var errParallelHashAbandoned = errors.New("parallel hash join: build abandoned (
 // execution without the Gather-registered shared build state.
 var errParallelHashUnregistered = errors.New("parallel hash join: no shared build state is registered for this join (not under a Gather that registered it)")
 
-// errParallelHashSpilled refuses a participant build that ended in batches.
-// PG's parallel hash batches (ExecParallelHashIncreaseNumBatches) are not
-// ported; keeping a spilled participant table would publish only its batch 0.
-var errParallelHashSpilled = errors.New("parallel hash join: a participant's build exceeded hash_mem and spilled; parallel hash batching is not supported")
-
 // lookupParallelHashBuild returns the shared build state for a Parallel Hash
 // join, or nil when this execution is not under a Gather that registered one.
 func lookupParallelHashBuild(ctx *Context, p *optimizer.Join) *parallelHashBuild {
@@ -192,6 +570,20 @@ func lookupParallelHashBuild(ctx *Context, p *optimizer.Join) *parallelHashBuild
 		return nil
 	}
 	return ctx.ParallelHashBuilds[p]
+}
+
+// releaseParallelHashBuilds retracts a Gather's Parallel Hash states and
+// unlinks the batch files a spilled build published. Called from Gather /
+// GatherMerge Close after the fan-out has joined — no participant can still
+// be reading.
+func releaseParallelHashBuilds(ctx *Context) {
+	if ctx == nil {
+		return
+	}
+	for _, ph := range ctx.ParallelHashBuilds {
+		ph.table.release(ctx)
+	}
+	ctx.ParallelHashBuilds = nil
 }
 
 // registerParallelHashBuilds creates one shared state per Parallel Hash join
@@ -226,24 +618,32 @@ func (o *joinOp) openParallelHashJoin(ctx *Context, ph *parallelHashBuild) error
 		arrived := false
 		defer func() {
 			if !arrived {
-				ph.finish(nil, errParallelHashAbandoned)
+				ph.finish(nil, nil, errParallelHashAbandoned)
 			}
 		}()
 		gotProbeLeft, err := o.buildLazyHashTable(ctx)
 		// The batch state is installed even for a one-batch build (P3.2: the
 		// memory bound is real only if growth can fire), so "spilled" is
 		// nbatch > 1. A single batch is wholly in the maps and its state
-		// carries nothing to publish.
+		// carries nothing to publish. A spilled share is published with its
+		// batch state detached from the operator: the merge owns its files
+		// from here (M0146-0090).
+		var spilled *hashBatchState
 		if err == nil && o.batches != nil {
-			spilled := o.batches.nbatch > 1
-			o.releaseBatches()
-			if spilled {
-				err = errParallelHashSpilled
+			switch {
+			case o.batches.nbatch <= 1:
+				o.releaseBatches()
+			default:
+				spilled = o.batches
+				o.batches = nil
+				// The share's own growth is reported now; the merged count
+				// reaches EXPLAIN through the participant state below.
+				spilled.publish()
 			}
 		}
 		arrived = true
 		if err != nil {
-			ph.finish(nil, err)
+			ph.finish(nil, nil, err)
 		} else {
 			probeIsLeft = gotProbeLeft
 			local := &sharedHashBuild{
@@ -265,14 +665,62 @@ func (o *joinOp) openParallelHashJoin(ctx *Context, ph *parallelHashBuild) error
 			// fan-out has joined).
 			o.buildBytesShared = true
 			o.buildCellsShared = true
-			ph.finish(local, nil)
+			ph.finish(local, spilled, nil)
 		}
 	}
 	if err := ph.wait(ctx); err != nil {
 		return err
 	}
 	o.adoptParallelHashTable(ctx, &ph.table)
+	if ph.table.batches != nil {
+		// A batched shared table: batch 0 is in the maps just adopted and
+		// every other batch is a shared inner file. Each participant routes
+		// its own probe rows and reloads batch k through the descriptor's
+		// load slots — the leader prebuild's E-09 participant path.
+		o.releaseBatches()
+		o.batches = newParticipantBatchState(ctx, o.plan, ph.table.batches)
+	}
+	if o.fillBuildSide() {
+		o.parallelFill = ph
+		o.parallelProbing = ph.probeAttach()
+		o.parallelSkipProbe = !o.parallelProbing
+	}
 	return o.openProbeSide(ctx, probeIsLeft)
+}
+
+// parallelFillDetach is the probe-EOF half of the shared sweep protocol: hand
+// this participant's matched bits in and, if it is the last prober, take the
+// merged ones for the sweep. It reports whether this participant sweeps the
+// shared table. Outside a parallel fill-build join every participant sweeps
+// its own table, as before.
+//
+// A batched table (M0146-0095): the probe-row files this participant wrote
+// for batches past 0 go to the shared state with its bits, and the last
+// prober receives every participant's as extra outer files of its own batch
+// state — it alone runs the later batches. A participant asked again (a
+// later batch's probe EOF) keeps the answer it got at batch 0.
+func (o *joinOp) parallelFillDetach() bool {
+	ph := o.parallelFill
+	if ph == nil {
+		return true
+	}
+	if !o.parallelProbing {
+		return o.parallelSweeps
+	}
+	o.parallelProbing = false
+	var outer []*joinBatchFile
+	if bs := o.batches; bs != nil {
+		outer = bs.handOverOuterFiles()
+	}
+	ms, mi, handed, last := ph.probeDetach(o.lazyMatchedS, o.lazyMatchedI, outer)
+	if !last {
+		return false
+	}
+	o.lazyMatchedS, o.lazyMatchedI = ms, mi
+	if bs := o.batches; bs != nil {
+		bs.adoptHandedOuterFiles(handed)
+	}
+	return true
 }
 
 // adoptParallelHashTable installs the completed shared table read-only — the

@@ -548,6 +548,8 @@ func targetHasBareAggregate(e parser.Expr) bool {
 		return targetHasBareAggregate(x.Operand)
 	case *parser.IndirectionStar:
 		return targetHasBareAggregate(x.Source)
+	case *parser.FieldSelect:
+		return targetHasBareAggregate(x.Arg)
 	}
 	return false
 }
@@ -1043,6 +1045,8 @@ func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) e
 		return resolveWindowRefsInExpr(x.Operand, defs)
 	case *parser.CollateExpr:
 		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.FieldSelect:
+		return resolveWindowRefsInExpr(x.Arg, defs)
 	case *parser.IsDistinctFromExpr:
 		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
 			return err
@@ -1119,6 +1123,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		return exprHasWindowFunc(x.Operand)
 	case *parser.CollateExpr:
 		return exprHasWindowFunc(x.Operand)
+	case *parser.FieldSelect:
+		return exprHasWindowFunc(x.Arg)
 	case *parser.IsDistinctFromExpr:
 		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
 	case *parser.InExpr:
@@ -1202,6 +1208,8 @@ func exprHasSRF(e parser.Expr, cat catalog.Catalog) bool {
 		return exprHasSRF(x.Operand, cat)
 	case *parser.CollateExpr:
 		return exprHasSRF(x.Operand, cat)
+	case *parser.FieldSelect:
+		return exprHasSRF(x.Arg, cat)
 	case *parser.IsDistinctFromExpr:
 		return exprHasSRF(x.Left, cat) || exprHasSRF(x.Right, cat)
 	case *parser.InExpr:
@@ -1420,6 +1428,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
 			return catalog.Type{}, err
 		}
+		// M0146-0040: a cast to date IS a date — `'2001-07-15'::date + 30`
+		// must take the date_pli arm below and type as date, not fall into
+		// the numeric promotion as `unknown + int` (→ int8, which then failed
+		// `d <= '…'::date + 30` as "date and int8"). Other targets keep the
+		// v0 `unknown` (ledgered: general cast typing).
+		if strings.EqualFold(x.Type.Name, "date") && (x.Type.Schema == "" || strings.EqualFold(x.Type.Schema, "pg_catalog")) {
+			return catalog.Type{Name: "date"}, nil
+		}
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.UnaryOp:
 		opTyp, err := analyzeExpr(x.Operand, ctx)
@@ -1499,12 +1515,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 					return catalog.Type{}, ae
 				}
 				// Subtraction of two temporal values → interval (timestamp_mi /
-				// time_mi). goopg represents DATE internally as a timestamp, so
-				// date − date also yields an interval here rather than upstream's
-				// integer day count (date_mi) — a deliberate, documented
-				// divergence deferred to the type system (see deferral_ledger.md).
-				// Executor: subTimeTime in internal/executor/expr.go.
+				// time_mi), except date − date, which is upstream's integer day
+				// count (date_mi). Date datums carry their date subtype, so the
+				// executor can honour it (subDateDate, internal/executor/expr.go;
+				// M0146-0040 retired the interval divergence).
 				if x.Op == parser.OpSub {
+					if strings.EqualFold(leftTyp.Name, "date") && strings.EqualFold(rightTyp.Name, "date") {
+						return catalog.Type{Name: "int4"}, nil
+					}
 					return catalog.Type{Name: "interval"}, nil
 				}
 				// Addition of two temporal values is not defined in PG:
@@ -1545,10 +1563,16 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}, nil
 			}
-			// date + integer → date (date_pli).  PG treats the integer as
-			// a day count; executor: addDateTimeInt in expr.go.
-			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) && x.Op == parser.OpAdd {
+			// date ± integer → date (date_pli / date_mii).  PG treats the
+			// integer as a day count; executor: addDateTimeInt in expr.go.
+			// date - date → integer days (date_mi). M0146-0040: the `-`
+			// forms used to fall to the numeric-operand error below.
+			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return leftTyp, nil
+			}
+			if strings.EqualFold(leftTyp.Name, "date") && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int4"}, nil
 			}
 			if isIntegerLike(leftTyp) && strings.EqualFold(rightTyp.Name, "date") && x.Op == parser.OpAdd {
 				return rightTyp, nil
@@ -1589,6 +1613,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			if isArr(rightTyp) {
 				return rightTyp, nil
+			}
+			// jsonb || jsonb is jsonb_concat (pg_operator 3284, result jsonb);
+			// an unknown literal beside jsonb resolves to jsonb. A jsonb
+			// beside text instead resolves to anytextcat/textanycat below.
+			// M0146-0074.
+			isJSONB := func(t catalog.Type) bool { return !t.IsArray && strings.EqualFold(t.Name, "jsonb") }
+			if (isJSONB(leftTyp) && (isJSONB(rightTyp) || isUnknownType(rightTyp))) ||
+				(isJSONB(rightTyp) && isUnknownType(leftTyp)) {
+				return catalog.Type{Name: "jsonb"}, nil
 			}
 			// Require at least one string-like (or unknown) operand.
 			// When one side is non-string but the other is string-like,
@@ -1660,6 +1693,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				return catalog.Type{Name: "int8"}, nil
 			}
 			return argTyp, nil
+		case "current_date":
+			// SQLValueFunction CURRENT_DATE is a date (M0146-0040): typed
+			// `unknown`, `current_date + 1` fell into the numeric promotion
+			// as int8 and no longer compared with a `'…'::date` operand.
+			if len(x.Args) == 0 && x.Name.Schema == "" {
+				return catalog.Type{Name: "date"}, nil
+			}
+			return catalog.Type{Name: "unknown"}, nil
 		default:
 			return catalog.Type{Name: "unknown"}, nil
 		}
@@ -1733,6 +1774,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "record"}, nil
+	case *parser.FieldSelect:
+		// `(expr).field` — walk the operand for analysis errors and
+		// correlated references; the field's type is resolved by the planner
+		// against the operand's composite type (M0146-0047b), so it is
+		// reported as `unknown` here, which the comparability checks accept.
+		if _, err := analyzeExpr(x.Arg, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.RowExpr:
 		// Row constructor (a, b, c): validate each element and return text.
 		// Used in `(a,b) IN (VALUES ...)` expansion. M0097-0020.
@@ -2037,6 +2087,15 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 			return ty, nil
 		}
 	}
+	// Not a column at any level: a bare name may still name a relation
+	// (whole-row reference), innermost first. M0146-0047c.
+	if x.Table == "" && x.Schema == "" {
+		for cur := ctx; cur != nil; cur = cur.parent {
+			if ty, ok := wholeRowTypeAt(x, cur); ok {
+				return ty, nil
+			}
+		}
+	}
 	if x.Table != "" {
 		return catalog.Type{}, errorMissingRTE(x.Pos(), x.Schema, x.Table, ctx)
 	}
@@ -2230,22 +2289,30 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 				return catalog.Type{Name: "tid"}, true, nil
 			}
 		}
-		// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
-		for _, rel := range ctx.rels {
-			if rel.qualifiedOnly {
-				continue
-			}
-			name := rel.alias
-			if name == "" {
-				name = rel.table.Name
-			}
-			if strings.EqualFold(x.Column, name) {
-				return catalog.Type{Name: "text"}, true, nil
-			}
-		}
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil
+}
+
+// wholeRowTypeAt resolves an unqualified name as a whole-row reference to a
+// relation of one scope level — transformColumnRef's refnameNamespaceItem
+// fallback, tried only after the name failed as a column at every level
+// (colNameToVar). The planner's resolveWholeRowAt is the twin. M0146-0047c.
+func wholeRowTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool) {
+	// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
+	for _, rel := range ctx.rels {
+		if rel.qualifiedOnly {
+			continue
+		}
+		name := rel.alias
+		if name == "" {
+			name = rel.table.Name
+		}
+		if strings.EqualFold(x.Column, name) {
+			return catalog.Type{Name: "text"}, true
+		}
+	}
+	return catalog.Type{}, false
 }
 
 // errorMissingRTE mirrors postgres/src/backend/parser/parse_relation.c's
@@ -3115,13 +3182,18 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 		cols = append(cols, catalog.Column{Name: name, Type: typ})
 	}
 	// Validate and apply explicit column aliases (rv.Columns). M0097-0003.
+	// PG raises only when MORE aliases are given than the subquery has
+	// columns; a shorter list renames the leading columns and the rest keep
+	// their own names (buildRelationAliases, parse_relation.c). M0146-0028g.
 	if len(rv.Columns) > 0 {
-		if len(rv.Columns) != len(cols) {
-			return nil, analyzeError(rv.Pos(), "42P01",
+		if len(rv.Columns) > len(cols) {
+			// ERRCODE_INVALID_COLUMN_REFERENCE, raised with no error
+			// position (buildRelationAliases).
+			return nil, analyzeError(0, "42P10",
 				fmt.Sprintf("table %q has %d columns available but %d columns specified",
 					rv.Alias, len(cols), len(rv.Columns)))
 		}
-		for i := range cols {
+		for i := range rv.Columns {
 			cols[i].Name = rv.Columns[i]
 		}
 	}
@@ -3259,7 +3331,9 @@ func isIntegerLike(t catalog.Type) bool {
 		return true
 	}
 	switch strings.ToLower(t.Name) {
-	case "int2", "int4", "int8", "integer", "smallint", "bigint":
+	// "int" is how a column declared `int` is spelled in the catalog
+	// (`n int` + `d date` failed `n + d` before M0146-0040).
+	case "int2", "int4", "int8", "int", "integer", "smallint", "bigint":
 		return true
 	}
 	return false

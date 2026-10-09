@@ -1,0 +1,24 @@
+--- select count(*) from tk o, (select x.u1 from tk x where x.h = o.h) s
+ERROR:  column "h" does not exist
+LINE 1: ...ount(*) from tk o, (select x.u1 from tk x where x.h = o.h) s
+                                                                 ^
+--- select count(*) from tk o, lateral (select x.u1 from tk x where x.h = o.h) s
+  1000
+
+--- select count(*) from tk o, (values (o.h)) v
+ERROR:  column "h" does not exist
+LINE 1: select count(*) from tk o, (values (o.h)) v
+                                            ^
+--- select count(*) from tk o, (values (o.*)) v
+ERROR:  SELECT * with no FROM clause
+LINE 1: select count(*) from tk o, (values (o.*)) v
+                                            ^
+--- select a.u1, (select count(*) from tk o, (select x.u1 from tk x where x.h = a.h) s) from tk a where a.u1 < 3 order by a.u1
+  0 |  1000
+  1 |  1000
+  2 |  1000
+
+--- select (select count(*) from tk o, (select x.u1 from tk x where x.h = o.h) s) from tk z limit 1
+ERROR:  column "h" does not exist
+LINE 1: ...(*) from tk o, (select x.u1 from tk x where x.h = o.h) s) fr...
+                                                             ^

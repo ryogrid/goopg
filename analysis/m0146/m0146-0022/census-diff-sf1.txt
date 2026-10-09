@@ -1,0 +1,12 @@
+24c24
+< Q24 depth=4 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q24 depth=7 [parallelism] under Nested Loop: PG Parallel Hash Join Inner | goopg Hash Join Inner
+101c101
+< CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 parallelism=9 join-method=7 scan-type=7 qual-placement=7 parameterisation=5 error=3 join-order=1
+---
+> CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=18 parallelism=10 join-method=7 scan-type=7 qual-placement=6 parameterisation=5 error=3 join-order=1
+130c130
+<     1  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=4
+---
+>     1  parallelism      under Nested Loop      PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=7

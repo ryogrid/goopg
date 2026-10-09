@@ -7,6 +7,7 @@ package executor
 // See docs/design/0018-0003-explain-analyze-instrumentation.md.
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -43,6 +44,14 @@ type nodeStats struct {
 	// residual qual. Mirrors upstream's Instrumentation.nfiltered1 for join
 	// nodes, surfaced by EXPLAIN ANALYZE as "Rows Removed by Join Filter".
 	joinFilterRejected int64
+
+	// probeFilterRejected is the share of joinFilterRejected a
+	// parameterized nested loop attributes to the part of its residual
+	// EXPLAIN renders as the inner scan's Filter (PG's ppi_clauses): a
+	// rejected row whose moved part fails counts here, as PG's scan qual
+	// would have rejected it before the join qual ran. Set only when the
+	// residual splits across both lines (probeFilterAttributor).
+	probeFilterRejected int64
 
 	// bufHit / bufRead / bufDirtied / bufWritten are the cumulative
 	// shared-buffer hit/read/dirtied/written counts EXPLAIN (ANALYZE,
@@ -218,6 +227,18 @@ func (o *instrumentedOp) Close() error {
 	return err
 }
 
+// Rescan forwards the rescannable contract to the wrapped operator
+// (M0146-0010): under EXPLAIN ANALYZE a nested loop's materialised inner
+// arrives instrumented, and the join's per-outer-row Rescan must reach the
+// materializeOp inside or the inner would replay wrongly — while rows keep
+// flowing through Next() so the Materialize node's counters stay live.
+func (o *instrumentedOp) Rescan() error {
+	if r, ok := o.inner.(rescannable); ok {
+		return r.Rescan()
+	}
+	return fmt.Errorf("instrumentedOp: wrapped operator %T is not rescannable", o.inner)
+}
+
 // RowsAffected delegates so wrapped DML operators continue to
 // report their RowsAffected through the wire layer's
 // CommandComplete tag.
@@ -266,6 +287,16 @@ type filterRemoveCounter interface {
 // as "Rows Removed by Join Filter".
 type joinFilterRemoveCounter interface {
 	setJoinFilterRemoveCounter(*int64)
+}
+
+// probeFilterAttributor is implemented by the parameterized nested-loop
+// operators. When EXPLAIN splits a residual between the inner scan's Filter
+// and the join line (paramQualPlacement), maybeInstrument hands the operator
+// the moved part (join-row coordinates) and a counter: on each rejection the
+// operator re-evaluates that part and counts the row there when it fails.
+// Only rejected rows pay the extra evaluation, and only under ANALYZE.
+type probeFilterAttributor interface {
+	setProbeFilterAttribution(probe optimizer.Expr, counter *int64)
 }
 
 // nodeStatsTable maps a planner.Node back to its instrumentation
@@ -410,6 +441,11 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	}
 	if jf, ok := op.(joinFilterRemoveCounter); ok {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
+	}
+	if pa, ok := op.(probeFilterAttributor); ok {
+		if probe, join, applies := paramQualPlacement(plan); applies && probe != nil && join != nil {
+			pa.setProbeFilterAttribution(probe, &stats.probeFilterRejected)
+		}
 	}
 	if sc, ok := op.(instrumentScopeCarrier); ok {
 		sc.setInstrumentScope(scope)

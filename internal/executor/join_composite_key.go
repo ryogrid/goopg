@@ -110,15 +110,38 @@ func (o *joinOp) compileExecExprs() {
 		o.buildKeyNodes = make([]int32, len(o.buildKeyExprs))
 	}
 	o.buildKeyNodes = o.buildKeyNodes[:len(o.buildKeyExprs)]
-	for i, e := range o.buildKeyExprs {
-		o.buildKeyNodes[i] = o.execExprs.buildExpr(e)
+	if cap(o.buildKeyTrim) < len(o.buildKeyExprs) {
+		o.buildKeyTrim = make([]bool, len(o.buildKeyExprs))
 	}
+	o.buildKeyTrim = o.buildKeyTrim[:len(o.buildKeyExprs)]
 	if cap(o.probeKeyNodes) < len(o.probeKeyExprs) {
 		o.probeKeyNodes = make([]int32, len(o.probeKeyExprs))
 	}
 	o.probeKeyNodes = o.probeKeyNodes[:len(o.probeKeyExprs)]
-	for i, e := range o.probeKeyExprs {
-		o.probeKeyNodes[i] = o.execExprs.buildExpr(e)
+	if cap(o.probeKeyTrim) < len(o.probeKeyExprs) {
+		o.probeKeyTrim = make([]bool, len(o.probeKeyExprs))
+	}
+	o.probeKeyTrim = o.probeKeyTrim[:len(o.probeKeyExprs)]
+	for i := range o.buildKeyExprs {
+		o.buildKeyNodes[i] = o.execExprs.buildExpr(o.buildKeyExprs[i])
+		// The literal-coercion arm needs the OTHER side's declared type;
+		// hand-built joinOps (unit tests) may carry only one side, so the
+		// pair lookup is length-guarded rather than assumed symmetric.
+		var otherBP int64
+		if i < len(o.probeKeyExprs) {
+			otherBP = declaredBpcharTypmod(o.probeKeyExprs[i])
+		}
+		o.buildKeyTrim[i] = declaredBpcharTypmod(o.buildKeyExprs[i]) > 0 ||
+			(isBareStringLit(o.buildKeyExprs[i]) && otherBP > 0)
+	}
+	for i := range o.probeKeyExprs {
+		o.probeKeyNodes[i] = o.execExprs.buildExpr(o.probeKeyExprs[i])
+		var otherBP int64
+		if i < len(o.buildKeyExprs) {
+			otherBP = declaredBpcharTypmod(o.buildKeyExprs[i])
+		}
+		o.probeKeyTrim[i] = declaredBpcharTypmod(o.probeKeyExprs[i]) > 0 ||
+			(isBareStringLit(o.probeKeyExprs[i]) && otherBP > 0)
 	}
 	o.execResidualNode = o.execExprs.buildExpr(o.execResidual)
 	o.execCompiled = true
@@ -164,9 +187,9 @@ func (o *joinOp) multiKey() bool { return len(o.execKeys) > 1 }
 // o.probeKeyNodes), evaluated with evalFastExpr. A multi-column key is the
 // shape that evaluates the MOST expressions per row, so it is the one that
 // gains most from losing the per-column type switch.
-func (o *joinOp) encodeCompositeKey(nodes []int32, slot SlotView) (ok bool, packMiss bool, err error) {
+func (o *joinOp) encodeCompositeKey(nodes []int32, trims []bool, slot SlotView) (ok bool, packMiss bool, err error) {
 	o.execKeyBuf = o.execKeyBuf[:0]
-	for _, node := range nodes {
+	for i, node := range nodes {
 		if node == noExpr {
 			return false, false, errNilHashKey
 		}
@@ -176,6 +199,9 @@ func (o *joinOp) encodeCompositeKey(nodes []int32, slot SlotView) (ok bool, pack
 		}
 		if v.IsNull() {
 			return false, false, nil
+		}
+		if i < len(trims) && trims[i] {
+			v = trimStringDatum(v)
 		}
 		if o.execKeyPackInt {
 			ik, iok := datumToInt64Key(v)
@@ -206,7 +232,7 @@ func (o *joinOp) encodeBuildCompositeKey(slot SlotView) (ok bool, err error) {
 	// degeneracy this file exists to prevent, with wrong rows instead of
 	// slow ones.
 	o.ensureExecKeys()
-	keyOK, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
+	keyOK, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, o.buildKeyTrim, slot)
 	if err != nil {
 		return false, err
 	}
@@ -219,7 +245,7 @@ func (o *joinOp) encodeBuildCompositeKey(slot SlotView) (ok bool, err error) {
 		// row filed before the demotion lands under the identical key as one
 		// filed after it.
 		o.demoteCompositeIntKeys()
-		keyOK, packMiss, err = o.encodeCompositeKey(o.buildKeyNodes, slot)
+		keyOK, packMiss, err = o.encodeCompositeKey(o.buildKeyNodes, o.buildKeyTrim, slot)
 		if err != nil {
 			return false, err
 		}
@@ -280,7 +306,7 @@ func (o *joinOp) compositeProbeMatches(slot SlotView, wantKey bool) (matches []R
 	// See encodeBuildCompositeKey: the probe half must not be able to run on
 	// an uncompiled node list either, or it looks up the empty key.
 	o.ensureExecKeys()
-	keyOK, packMiss, err := o.encodeCompositeKey(o.probeKeyNodes, slot)
+	keyOK, packMiss, err := o.encodeCompositeKey(o.probeKeyNodes, o.probeKeyTrim, slot)
 	if err != nil {
 		return nil, "", false, err
 	}

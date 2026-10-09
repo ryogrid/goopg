@@ -1,0 +1,17 @@
+# M0146-0007e census (tmp/fireset-0007e)
+sf025 baseline match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=33 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=13 rendering=21
+sf025 candidate match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=33 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=15 rendering=21
+< Q47 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+> Q47 depth=2 [qual-placement] under Sort: PG Merge Join Inner | goopg Merge Join Inner
+< Q57 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+> Q57 depth=2 [qual-placement] under Sort: PG Merge Join Inner | goopg Merge Join Inner
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=36 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=12 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=36 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=14 rendering=19
+< Q47 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+> Q47 depth=2 [qual-placement] under Sort: PG Merge Join Inner | goopg Merge Join Inner
+< Q57 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+> Q57 depth=2 [qual-placement] under Sort: PG Merge Join Inner | goopg Merge Join Inner
+FIRE-SET-TIMEOUTS: fires=Q47 Q54 Q57 introduced=none unchanged=none missing=none
+Q47/Q57 result md5 (private SF0.25 clone) = PG: c5ac33783986120e3951f86dabca94f0 / 46b2fb98b8ba6172b963e1581fd4186a
+Residual at Q47/Q57 depth 2: goopg merges on (rn + 1) = rn as a merge key; PG merges on the four name columns and keeps v1.rn = (v1_lead.rn - 1) as a Join Filter.
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; TPC-H census class-identical; regress (with subselect union join aggregates select_distinct window rowsecurity) no semantic delta (join.sql row-order flap, rowsecurity pointer addresses)

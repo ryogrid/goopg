@@ -1,0 +1,8 @@
+38c38
+< Q38 depth=2 [join-order] under Aggregate: PG SetOp Intersect | goopg HashSetOp Intersect
+---
+> Q38 depth=3 [aggregation-strategy] under SetOp: PG Unique | goopg SetOp Intersect
+87c87
+< Q87 depth=1 [join-order] under Aggregate: PG SetOp Except | goopg HashSetOp Except
+---
+> Q87 depth=4 [sort-strategy] under Unique: PG Gather Merge | goopg Sort

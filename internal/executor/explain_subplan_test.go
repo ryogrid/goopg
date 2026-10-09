@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -165,12 +166,25 @@ func TestFormatInExprSubPlanForms(t *testing.T) {
 		{
 			name: "in subquery",
 			expr: &optimizer.InExpr{Operand: operand, Plan: inner},
-			want: "(b = ANY (SubPlan 1))",
+			want: "(ANY (b = (SubPlan 1).col1))",
 		},
 		{
 			name: "not in subquery",
 			expr: &optimizer.InExpr{Operand: operand, Plan: inner, Negated: true},
-			want: "(NOT (b = ANY (SubPlan 1)))",
+			want: "(NOT (ANY (b = (SubPlan 1).col1)))",
+		},
+		// M0146-0002g: an uncorrelated plain-equality ANY sublink whose
+		// result fits hash_mem is PG's hashed SubPlan (TPC-H Q16's
+		// `NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1))`).
+		{
+			name: "hashed not in subquery",
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner, Negated: true, IsNonCorrelated: true},
+			want: "(NOT (ANY (b = (hashed SubPlan 1).col1)))",
+		},
+		{
+			name: "ALL sublink is never hashed",
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner, AllOp: true, AnyOp: parser.OpLt, IsNonCorrelated: true},
+			want: "(ALL (b < (SubPlan 1).col1))",
 		},
 		{
 			name: "literal list",
@@ -225,18 +239,21 @@ func TestExplainSubPlanNumbering(t *testing.T) {
 	defer cleanup()
 
 	// Two independent sublinks in one predicate get distinct numbers
-	// and distinct subtrees.
+	// and distinct subtrees. Each EXISTS is planned twice by PG (the
+	// EXISTS SubPlan, then the hashed ANY alternative), so the hashed
+	// forms print PG 18.3's `hashed SubPlan 2` and `hashed SubPlan 4`
+	// (M0146-0005bv).
 	plan, lines := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE t1.a = 1 "+
 			"OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) "+
 			"OR EXISTS (SELECT 1 FROM t2 WHERE t2.b = t1.b)")
 
-	if !strings.Contains(plan, "SubPlan 1") || !strings.Contains(plan, "SubPlan 2") {
+	if !strings.Contains(plan, "hashed SubPlan 2") || !strings.Contains(plan, "hashed SubPlan 4") {
 		t.Errorf("want two numbered sublinks:\n%s", plan)
 	}
 	headers := 0
 	for _, l := range lines {
-		if s := strings.TrimSpace(l); s == "SubPlan 1" || s == "SubPlan 2" {
+		if s := strings.TrimSpace(l); s == "SubPlan 2" || s == "SubPlan 4" {
 			headers++
 		}
 	}
@@ -250,15 +267,25 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	ctx, cleanup := explainSubPlanFixture(t)
 	defer cleanup()
 
-	// A top-level correlated IN unnests to a semi join today; the
-	// label must name the join type rather than rendering `(?)`.
+	// A top-level correlated IN whose correlation is not an equality
+	// cannot be unique-ified (compute_semijoin_info leaves semi_can_* off),
+	// so it stays a semi join — PG 18.3 plans `Hash Semi Join` with a
+	// `Join Filter` here. The label must name the join type rather than
+	// rendering `(?)`.
 	semi, _ := joinedPlan(t, ctx,
-		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.a = t1.a)")
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.b > t1.b)")
 	if strings.Contains(semi, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", semi)
 	}
 	if !strings.Contains(semi, "Semi Join") {
 		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
+	}
+	// An all-equality correlated IN is unique-ified instead (M0146-0005dk):
+	// PG 18.3 plans `Hash Join` over `HashAggregate` / `Group Key: t2.a`.
+	uniq, _ := joinedPlan(t, ctx,
+		"EXPLAIN SELECT * FROM t1 WHERE t1.a IN (SELECT t2.a FROM t2 WHERE t2.a = t1.a)")
+	if !strings.Contains(uniq, "HashAggregate") || !strings.Contains(uniq, "Group Key: t2.a") {
+		t.Errorf("all-equality correlated IN was not unique-ified as PG does:\n%s", uniq)
 	}
 
 	// NOT EXISTS pulls up to an anti join (PG's pull_up_sublinks converts
@@ -427,5 +454,37 @@ func TestNLIResidualPredicateRendered(t *testing.T) {
 		t.Logf("shape took hash semi, NLI residual display not exercised:\n%s", out)
 	} else {
 		t.Logf("shape stayed SubPlan, NLI residual display not exercised:\n%s", out)
+	}
+}
+
+// TestNestedExistsSpanningScopesResults pins the answers for M0146-0015c's
+// shape — a nested [NOT] EXISTS whose body reads both its parent body and
+// the outermost query. PG plans the outer EXISTS as a semi join and keeps
+// the inner one as a SubPlan; goopg keeps both as SubPlans for now (the
+// correlated SubPlan cannot yet ride a pulled-up qual). Either way the rows
+// must be PG's: 1 for EXISTS, 2 and 3 for NOT EXISTS.
+func TestNestedExistsSpanningScopesResults(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	for _, s := range []string{
+		"create table ta(y int, k int)", "create table tb(k int, w int)", "create table tc(x int, z int)",
+		"insert into ta values (1,1),(2,2),(3,3)", "insert into tb values (1,10),(2,20),(3,30)",
+		"insert into tc values (1,10),(3,99)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q, want := range map[string]string{
+		"select a.y from ta a where exists (select 1 from tb b where b.k = a.k and exists (select 1 from tc c where c.x = a.y and c.z = b.w)) order by 1":     "[1]",
+		"select a.y from ta a where exists (select 1 from tb b where b.k = a.k and not exists (select 1 from tc c where c.x = a.y and c.z = b.w)) order by 1": "[2 3]",
+	} {
+		rows, err := runQueryWithErr(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := fmt.Sprint(renderRows(rows)); got != want {
+			t.Errorf("%s: got %s, want %s", q, got, want)
+		}
 	}
 }

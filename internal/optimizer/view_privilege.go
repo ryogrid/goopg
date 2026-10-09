@@ -51,6 +51,13 @@ func tagViewOwnerScans(n Node, owner string) {
 		tagViewOwnerScans(p.Child, owner)
 	case *CTEScan:
 		tagViewOwnerScans(p.Child, owner)
+	case *SubqueryScan:
+		// M0146-0005w: the derived table's inner scans need the same
+		// privilege tag the unwrapped subtree got.
+		tagViewOwnerScans(p.Child, owner)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — tag the buffered child.
+		tagViewOwnerScans(p.Child, owner)
 	case *LockRows:
 		tagViewOwnerScans(p.Child, owner)
 	case *Join:

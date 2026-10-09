@@ -51,6 +51,11 @@ type bitmapIndexScanOp struct {
 	// case, where the planner guarantees those reduce to constants.
 	outerSlot  SlotView
 	outerWidth int
+
+	// rangeLoExcl / rangeHiExcl: the INDEX-ORDER exclusivity of a range
+	// probe's bounds (M0146-0061), set by lookupBounds as indexRangeBounds
+	// returns them (a DESC column swaps the plan's operators).
+	rangeLoExcl, rangeHiExcl bool
 }
 
 func newBitmapIndexScanOp(p *optimizer.BitmapIndexScan) *bitmapIndexScanOp {
@@ -164,7 +169,7 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		tbm.addOne(ptr.Block, ptr.Offset, recheck)
 		return true, nil
 	}
-	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, false, false, scanFn); err != nil {
+	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.rangeLoExcl, o.rangeHiExcl, scanFn); err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
@@ -185,9 +190,10 @@ func (o *bitmapIndexScanOp) needsRecheck() bool {
 	if len(o.plan.Keys) > 0 {
 		return len(o.plan.Keys) < len(o.plan.Index.Columns)
 	}
-	// Single-column equality on composite index — recheck needed if
-	// there are more columns beyond the leading one.
-	if o.plan.Key != nil && len(o.plan.Index.Columns) > 1 {
+	// Single-column equality (or a leading-column range, M0146-0061) on a
+	// composite index — recheck needed if there are more columns beyond
+	// the leading one.
+	if (o.plan.Key != nil || o.plan.LowKey != nil || o.plan.HighKey != nil) && len(o.plan.Index.Columns) > 1 {
 		return true
 	}
 	return false
@@ -208,6 +214,26 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey boo
 		o.scanRow = acquireRow(len(o.plan.Table.Columns))
 	}
 
+	o.rangeLoExcl, o.rangeHiExcl = false, false
+	if o.plan.LowKey != nil || o.plan.HighKey != nil {
+		// M0146-0061: a leading-column range probe, bounded exactly as the
+		// plain index scan bounds it (DESC swap, strictness, the NULL-keyed
+		// entries an open end must not run into).
+		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
+			table: o.plan.Table, index: o.plan.Index,
+			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
+			pos: o.plan.Pos(),
+		}, o.outerSlot)
+		if rerr != nil {
+			return nil, nil, false, rerr
+		}
+		if !ok {
+			// A NULL bound: `col op NULL` matches nothing.
+			return nil, nil, true, nil
+		}
+		o.rangeLoExcl, o.rangeHiExcl = loExcl, hiExcl
+		return lo, hi, false, nil
+	}
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality: encode all keys.
 		return o.lookupKeys(col)

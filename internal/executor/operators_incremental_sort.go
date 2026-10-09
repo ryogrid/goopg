@@ -46,6 +46,10 @@ func (o *incrementalSortOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.groups = nil
 	o.gi, o.ri = 0, 0
+	// A `ctid` key reads the child's carried tid (M0146-0052).
+	if sortKeysUseCTID(o.keys) {
+		markSortWantCTIDs(o.child)
+	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -83,8 +87,10 @@ func (o *incrementalSortOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		row := slot.Materialize().Row()
-		kv, kerr := o.sortKeyVals(row)
+		ms := slot.Materialize()
+		row := ms.Row()
+		// On the slot, so a `ctid` key sees the carried tid (M0146-0052).
+		kv, kerr := o.sortKeyVals(ms)
 		if kerr != nil {
 			return kerr
 		}
@@ -105,13 +111,13 @@ func (o *incrementalSortOp) Open(ctx *Context) error {
 // sortKeyVals evaluates every ORDER BY key for one row, once — same shape as
 // sortOp.sortKeyVals (operators.go), duplicated rather than shared because
 // exec-a is deliberately standalone (no sortOp dependency).
-func (o *incrementalSortOp) sortKeyVals(row Row) ([]Datum, error) {
+func (o *incrementalSortOp) sortKeyVals(view SlotView) ([]Datum, error) {
 	if len(o.keys) == 0 {
 		return nil, nil
 	}
 	kv := make([]Datum, len(o.keys))
 	for i, k := range o.keys {
-		v, err := evalSortKeyValue(k.Expr, row, o.ctx)
+		v, err := evalSortKeyValueSlot(k.Expr, view, o.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +147,7 @@ func (o *incrementalSortOp) lessKeyVals(a, b []Datum) (bool, error) {
 		if k.Expr != nil {
 			pos = k.Expr.Pos()
 		}
-		cmp, err := compareDatum(av, bv, pos)
+		cmp, err := compareDatumTyped(av, bv, pos, k.Expr)
 		if err != nil {
 			return false, err
 		}

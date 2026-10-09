@@ -1,0 +1,4 @@
+8c8
+< Q8 depth=3 [join-order] under Sort: PG Hash Join Inner | goopg Hash Join Inner
+---
+> Q8 depth=3 [join-method] under Sort: PG Hash Join Inner | goopg Nested Loop Inner

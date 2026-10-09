@@ -153,22 +153,23 @@ func inferEqualitiesClosure(conjuncts []Expr, emitTransitive bool) []Expr {
 
 	ec := newEquivClasses()
 	seenPairs := make(map[[2]columnIdent]bool)
-	columnRefByIdent := make(map[columnIdent]*ColumnRef)
+	columnRefByIdent := make(map[columnIdent]Expr)
 	// take2 P1-20: constants seen against a class member, and the members a
 	// constant has already been stated for. See constant propagation below.
 	constByIdent := make(map[columnIdent]Expr)
 	seenConst := make(map[columnIdent]bool)
 
-	// Pass 1: build equivalence classes from explicit
-	// `ColumnRef = ColumnRef` predicates; record explicit
-	// pairs to avoid re-synthesising them.
+	// Pass 1: build equivalence classes from explicit member equalities —
+	// `ColumnRef = ColumnRef`, and since M0146-0005do a single-relation
+	// expression member on either side (ecEquality); record explicit pairs
+	// to avoid re-synthesising them.
 	for _, c := range conjuncts {
-		la, lb, ok := isColumnRefEquality(c)
+		la, lb, ok := ecEquality(c)
 		if !ok {
 			continue
 		}
-		ia := identOf(la)
-		ib := identOf(lb)
+		ia, _ := ecMemberIdent(la)
+		ib, _ := ecMemberIdent(lb)
 		if ia == ib {
 			continue
 		}
@@ -511,6 +512,126 @@ func isColumnRefEquality(e Expr) (*ColumnRef, *ColumnRef, bool) {
 		return nil, nil, false
 	}
 	return l, r, true
+}
+
+// ecEquality is isColumnRefEquality widened to the members PG's
+// equivalence classes take (M0146-0005do). process_equivalence
+// (equivclass.c) accepts any non-volatile expression on either side of a
+// mergejoinable equality, so in TPC-DS Q59
+// `wss.d_week_seq = wss_1.d_week_seq - 52` puts the expression
+// `wss_1.d_week_seq - 52` in wss.d_week_seq's class, and
+// generate_join_implied_equalities derives
+// `(wss_1.d_week_seq - 52) = d.d_week_seq` from it.
+//
+// A side is a member when ecMemberIdent accepts it. Both sides have the
+// same type, or — with an expression member — two integer types of one
+// btree family.
+func ecEquality(e Expr) (Expr, Expr, bool) {
+	bo, ok := e.(*BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return nil, nil, false
+	}
+	if _, ok := ecMemberIdent(bo.Left); !ok {
+		return nil, nil, false
+	}
+	if _, ok := ecMemberIdent(bo.Right); !ok {
+		return nil, nil, false
+	}
+	lt, rt := ecMemberType(bo.Left), ecMemberType(bo.Right)
+	if lt == "" || rt == "" {
+		return nil, nil, false
+	}
+	if lt != rt {
+		// process_equivalence takes members of different types when the
+		// operator belongs to one btree family: int2/int4/int8 share
+		// integer_ops. goopg types an integer literal int8, so Q59's
+		// `wss.d_week_seq = wss_1.d_week_seq - 52` is int4 = int8 here
+		// (int4 = int4 in PG); the family rule admits it either way. Only
+		// for an expression member: a cross-type COLUMN pair stays out,
+		// as isColumnRefEquality keeps it (ledgered).
+		_, lcol := bo.Left.(*ColumnRef)
+		_, rcol := bo.Right.(*ColumnRef)
+		if (lcol && rcol) || !isIntegerLikeType(lt) || !isIntegerLikeType(rt) {
+			return nil, nil, false
+		}
+	}
+	return bo.Left, bo.Right, true
+}
+
+// ecMemberType is a member's type: a column's own, or the type the
+// resolver stamped on an operator's result (BinaryOp.ResultType), else
+// exprType's.
+func ecMemberType(e Expr) string {
+	if bo, ok := e.(*BinaryOp); ok && bo.ResultType != "" {
+		return bo.ResultType
+	}
+	return exprType(e).Name
+}
+
+// ecEqualityIdents is ecEquality returning the two members' keys.
+func ecEqualityIdents(e Expr) (columnIdent, columnIdent, bool) {
+	l, r, ok := ecEquality(e)
+	if !ok {
+		return columnIdent{}, columnIdent{}, false
+	}
+	li, _ := ecMemberIdent(l)
+	ri, _ := ecMemberIdent(r)
+	return li, ri, true
+}
+
+// ecMemberIdent keys an equivalence-class member. A ColumnRef keys as
+// identOf does. Any other expression is a member only when it is built
+// from this level's columns of ONE relation, constants, operators and
+// casts — no function call (whose volatility the planner cannot always
+// resolve), no sublink, no outer reference — and reads at least one
+// column (a column-free expression is a constant, which the class takes
+// through its const arm instead). It keys on its identity key.
+func ecMemberIdent(e Expr) (columnIdent, bool) {
+	if cr, ok := e.(*ColumnRef); ok {
+		return identOf(cr), true
+	}
+	src := int16(0)
+	cols := 0
+	ok := true
+	// The recursion is walkExprRefs's (scopeVeto: a sublink aborts it);
+	// the closure only classifies each node.
+	walked := walkExprRefs(e, scopeVeto, exprVisitor{
+		Visit: func(x Expr) bool {
+			if !ok {
+				return false
+			}
+			switch v := x.(type) {
+			case *ColumnRef:
+				if v.SourceTableIdx == 0 || (src != 0 && v.SourceTableIdx != src) {
+					ok = false
+					return false
+				}
+				src = v.SourceTableIdx
+				cols++
+			case *BinaryOp, *UnaryOp, *CastExpr:
+			default:
+				if !isConstExpr(x) {
+					ok = false
+					return false
+				}
+			}
+			return true
+		},
+	})
+	ok = ok && walked
+	if !ok || cols == 0 {
+		return columnIdent{}, false
+	}
+	key, keyed := exprIdentityKey(e, scopeVeto)
+	if !keyed {
+		return columnIdent{}, false
+	}
+	return columnIdent{
+		name:           "\x00expr\x00" + key,
+		sourceTableIdx: src,
+		schemaIndex:    -1,
+		typeName:       ecMemberType(e),
+	}, true
 }
 
 // identOf builds a stable columnIdent key from a

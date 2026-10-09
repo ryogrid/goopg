@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -42,6 +43,56 @@ const (
 // Estimates flow bottom-up: SeqScan reads the catalog's
 // TableStats; Filter/Limit/Join/Aggregate/Project/Sort scale
 // their children; Values is exact.
+// stampedUpperRows is the row count the path search chose for an upper node
+// it built (M0146-0005bg): create_distinct_paths sizes the DISTINCT rel with
+// estimate_num_groups over its input rel once, and every later reader of
+// that node — the set operation above a DISTINCT branch, EXPLAIN — sees that
+// number. Re-estimating the lowered node instead groups over whatever the
+// lowering put beneath it (a Gather Merge over a per-worker Unique), where
+// the variables no longer resolve and the default takes over (TPC-DS Q87:
+// 355 and 200 where PG keeps 3260). A per-worker figure is not a whole-node
+// count and is not used.
+func stampedUpperRows(pc *PlanCost) (int64, bool) {
+	c, set := pc.PlanCostInfo()
+	if !set || c.PerWorker || c.PlanRows <= 0 {
+		return 0, false
+	}
+	if c.PlanRows < 1 {
+		return 1, true
+	}
+	return int64(c.PlanRows + 0.5), true
+}
+
+// limitInputPath is the path a Limit reads, as create_limit_path sees it:
+// the first node under child that carries its path's cost, looking through
+// goopg's Project wrappers (PG projects on the input path's own tlist, so
+// there is no node between them). ok is false when that node is unstamped or
+// per-worker.
+func limitInputPath(child Node) (PlanCost, bool) {
+	for {
+		p, isProj := child.(*Project)
+		if !isProj || p.Child == nil {
+			break
+		}
+		child = p.Child
+	}
+	if c, ok := child.(PlanCostCarrier); ok {
+		if pc, set := c.PlanCostInfo(); set && !pc.PerWorker && pc.PlanRows > 0 {
+			return pc, true
+		}
+	}
+	return PlanCost{}, false
+}
+
+// limitInputRows is the row count a Limit reads: its input path's rows
+// (the count create_limit_path adjusts), else the legacy estimate.
+func limitInputRows(child Node) int64 {
+	if pc, ok := limitInputPath(child); ok {
+		return int64(clampRowEst(pc.PlanRows))
+	}
+	return EstimateRows(child)
+}
+
 func EstimateRows(n Node) int64 {
 	switch x := n.(type) {
 	case *SeqScan:
@@ -57,12 +108,12 @@ func EstimateRows(n Node) int64 {
 		if len(keys) == 0 {
 			keys = x.RangePrefix
 		}
-		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *IndexOnlyScan:
 		// Same two shapes as *IndexScan, and the full-range one is REACHABLE
 		// without the join search: planner.go's sort-avoidance rewrite builds
 		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
-		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey)
+		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *Values:
 		return int64(len(x.Rows))
 	case *Filter:
@@ -72,14 +123,20 @@ func EstimateRows(n Node) int64 {
 		}
 		return scaleByFloat(child, filterSelectivity(x))
 	case *Limit:
-		child := EstimateRows(x.Child)
-		if lim, ok := constInt(x.Limit); ok {
-			if child <= 0 || lim < child {
+		child := limitInputRows(x.Child)
+		if child <= 0 {
+			if lim, ok := constInt(x.Limit); ok {
 				return lim
 			}
+			return child
 		}
-		return child
+		// adjust_limit_rows_costs (M0146-0005bm): OFFSET and an
+		// unestimatable LIMIT shape the count too, as in create_limit_path.
+		rows, _, _ := adjustLimitRowsCosts(float64(child), 0, 0, limitEstimatesOf(x))
+		return int64(rows)
 	case *Sort:
+		return EstimateRows(x.Child)
+	case *IncrementalSort:
 		return EstimateRows(x.Child)
 	case *Project:
 		return EstimateRows(x.Child)
@@ -90,6 +147,9 @@ func EstimateRows(n Node) int64 {
 		// goopg passed the child's row count straight through, so a DISTINCT
 		// that collapses a million rows to a hundred was costed, and every
 		// node above it sized, as if it collapsed nothing.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateDistinctRows(x.schema, x.Child)
 	case *DistinctOn:
 		// M0127-P5.6-g-ii: another of the pass-through wrappers whose absence
@@ -97,14 +157,34 @@ func EstimateRows(n Node) int64 {
 		// below). Neither this nor `*Distinct` is SIZED — upstream runs
 		// `estimate_num_groups` over the DISTINCT clause and goopg does not —
 		// which is a ledgered gap, not this arm's business.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateDistinctOnRows(x, x.Child)
 	case *WindowAgg:
 		return EstimateRows(x.Child)
 	case *Join:
+		// M0146-0009k: a join the search produced carries the joinrel size
+		// it chose (stampPlanCost); every node above reads THAT count, as
+		// PG's upper paths read subpath->rows (create_sort_path ->
+		// cost_sort). estimateJoin is the pre-search estimator: above a
+		// searched join it sized TPC-DS Q59's Sort at 4811 rows over a
+		// 15-row Hash Join.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateJoin(x)
 	case *OrdinalityWrap:
 		// Pass-through wrapper: appends an ordinal column, row count
 		// unchanged (S4a scalar residual rewrite reuses it).
+		return EstimateRows(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — same row count as the
+		// subplan it wraps; without this arm every estimate above it
+		// zeroed (the M0125-0038 class).
+		return EstimateRows(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same rows as the child.
 		return EstimateRows(x.Child)
 	case *Aggregate:
 		return estimateAggregate(x)
@@ -147,10 +227,93 @@ func EstimateRows(n Node) int64 {
 		}
 	case *SetOp:
 		return estimateSetOp(x)
+	case *BitmapHeapScan:
+		// M0146-0009m: the bitmap path's own rows — its baserel's
+		// restricted size, or for a parameterised probe the rows of one call
+		// (ppi_rows) — which the search stamped on the node. This arm was
+		// missing, so every node sized through EstimateRows over a bitmap
+		// heap scan read 0 (a LATERAL Append of bitmap probes: Append 0, the
+		// nested loop above it 1 where PG says outer × 75).
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
+		return bitmapHeapScanRows(x)
 	case *NestedLoopIndexJoin:
+		// M0146-0009k: as *Join — the searched size wins.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return estimateNLIndexJoin(x)
 	}
 	return 0
+}
+
+// probeIndexKeys returns the index and the bound equality keys of an index
+// or bitmap probe (Keys[i] binds Index.Columns[i]; Key binds the first
+// column); a nil index for any other node.
+func probeIndexKeys(n Node) (*catalog.Index, Expr, []Expr) {
+	switch x := n.(type) {
+	case *IndexScan:
+		return x.Index, x.Key, x.Keys
+	case *IndexOnlyScan:
+		return x.Index, x.Key, x.Keys
+	case *BitmapHeapScan:
+		if bi, ok := x.Outer.(*BitmapIndexScan); ok {
+			return bi.Index, bi.Key, bi.Keys
+		}
+	}
+	return nil, nil, nil
+}
+
+// indexKeyEnforced reports whether conjunct c is `col = key` for an index
+// column the probe below already binds to that key. PG keeps such a clause
+// only as the scan's index qual — create_indexscan_plan and
+// create_bitmap_scan_plan drop it from the qpqual (createplan.c) — so its
+// selectivity is in the probe's rows once. goopg's one-relation bypass
+// leaves it in a Filter over the probe too, and charging it there again
+// squared the restriction: a LATERAL bitmap probe `item = li.id` of 50 rows
+// came out at 1 (M0146-0009m).
+func indexKeyEnforced(c Expr, idx *catalog.Index, key Expr, keys []Expr) bool {
+	if idx == nil {
+		return false
+	}
+	bound := keys
+	if len(bound) == 0 && key != nil {
+		bound = []Expr{key}
+	}
+	b, ok := c.(*BinaryOp)
+	if !ok || b.Op != parser.OpEq || len(bound) == 0 {
+		return false
+	}
+	for _, side := range [2][2]Expr{{b.Left, b.Right}, {b.Right, b.Left}} {
+		cr, ok := side[0].(*ColumnRef)
+		if !ok {
+			continue
+		}
+		for i, k := range bound {
+			if i < len(idx.Columns) && strings.EqualFold(idx.Columns[i], cr.Name) && exprEqual(k, side[1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bitmapHeapScanRows sizes an unstamped bitmap heap scan the way the index
+// scan arm sizes its probe: the bitmap index scan's bound keys (a BitmapAnd /
+// BitmapOr tree falls back to the whole relation), narrowed by the residual
+// Cond.
+func bitmapHeapScanRows(x *BitmapHeapScan) int64 {
+	var rows int64
+	if bi, ok := x.Outer.(*BitmapIndexScan); ok && bi.Index != nil {
+		rows = indexScanRows(bi.Table, bi.Index, bi.Key, bi.Keys, bi.LowKey, bi.HighKey, bi.LowOp, bi.HighOp)
+	} else if x.Table != nil {
+		rows = seqScanRows(&SeqScan{Table: x.Table})
+	}
+	if rows <= 0 || x.Cond == nil {
+		return rows
+	}
+	return scaleByFloat(rows, clauseSelectivity(x.Cond, x))
 }
 
 // filterSelectivity prices a `*Filter`'s Predicate, skipping the conjuncts
@@ -178,13 +341,20 @@ func filterSelectivity(f *Filter) float64 {
 	if f == nil || f.Predicate == nil {
 		return 1.0
 	}
-	if len(f.PushedBelow) == 0 {
-		return clauseSelectivity(f.Predicate, f.Child)
+	// M0146-0005i: a qual PG turns into a WindowAgg run condition leaves the
+	// rel's restrictions and carries no selectivity.
+	pred := dropWindowRunConditions(f.Predicate, f.Child)
+	if pred == nil {
+		return 1.0
+	}
+	idx, key, keys := probeIndexKeys(f.Child)
+	if len(f.PushedBelow) == 0 && idx == nil {
+		return clauseSelectivity(pred, f.Child)
 	}
 	sel := 1.0
-	kept := make([]Expr, 0, len(splitAnd(f.Predicate)))
-	for _, c := range splitAnd(f.Predicate) {
-		if f.pricedBelow(c) {
+	kept := make([]Expr, 0, len(splitAnd(pred)))
+	for _, c := range splitAnd(pred) {
+		if f.pricedBelow(c) || indexKeyEnforced(c, idx, key, keys) {
 			continue
 		}
 		kept = append(kept, c)
@@ -209,40 +379,39 @@ func filterSelectivity(f *Filter) float64 {
 	return sel
 }
 
-// estimateSetOp mirrors upstream's output-row rules
-// (prepunion.c:1146-1151): EXCEPT keeps the left input's count,
-// INTERSECT the smaller input's, UNION ALL the sum. For the
-// non-ALL forms upstream runs estimate_num_groups on the input
-// (prepunion.c `estimate_size`), and the dedup here is still
-// approximated as /2.
-//
-// M0127-P5.6-f-vii built that estimator — `estimateNumGroups`
-// below — but wiring it here needs the set-op's output columns
-// expressed as grouping expressions over EACH input, which this
-// node does not carry. Ledgered as `estimate-num-groups setop-dedup`
-// rather than folded in: the sweep that measures the aggregate
-// change must not also be measuring a set-op change.
+// estimateSetOp mirrors upstream's output-row rules (prepunion.c):
+// UNION, ALL or not, keeps the whole input (generate_union_paths' "worst
+// case" group count); INTERSECT and EXCEPT follow generate_nonunion_paths'
+// per-arm group counts (setOpArmGroups).
 func estimateSetOp(s *SetOp) int64 {
 	l := EstimateRows(s.Left)
 	r := EstimateRows(s.Right)
 	if l <= 0 || r <= 0 {
 		return 0
 	}
-	var out int64
-	switch s.Op {
-	case parser.SetOpIntersect:
-		out = l
-		if r < out {
-			out = r
+	// M0146-0005o: INTERSECT / EXCEPT follow generate_nonunion_paths
+	// (prepunion.c): each arm contributes its group count — its own rows
+	// when the arm is itself grouped, distinct or a set operation
+	// (build_setop_child_paths), else estimate_num_groups over its output
+	// columns — and the result is the smaller arm's groups for INTERSECT,
+	// the left arm's for EXCEPT. The ALL forms emit rows, not groups.
+	if s.Op == parser.SetOpIntersect || s.Op == parser.SetOpExcept {
+		if s.All {
+			if s.Op == parser.SetOpExcept || l < r {
+				return l
+			}
+			return r
 		}
-	case parser.SetOpExcept:
-		out = l
-	default: // UNION
-		out = l + r
+		lg, rg := setOpArmGroups(s.Left, l), setOpArmGroups(s.Right, r)
+		if s.Op == parser.SetOpExcept || lg < rg {
+			return lg
+		}
+		return rg
 	}
-	if !s.All {
-		out /= 2
-	}
+	// UNION: generate_union_paths takes "the number of distinct groups as
+	// equal to the total input size, i.e., the worst case" for the non-ALL
+	// form too (M0146-0005p; goopg used to halve it).
+	out := l + r
 	if out < 1 {
 		return 1
 	}
@@ -397,7 +566,8 @@ func nliSemiMatchFraction(j *NestedLoopIndexJoin) float64 {
 			nd2 = float64(innerRows)
 			nd2Known = true
 		}
-		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+			cr.Type.Name, tbl.Columns[colPos].Type.Name)
 	}
 	return sel
 }
@@ -537,7 +707,12 @@ func lateralNLIMatchFraction(j *Join) float64 {
 			nd2 = float64(innerRows)
 			nd2Known = true
 		}
-		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+		outerType := ""
+		if outerOK {
+			outerType = columnTypeByName(outerRef.table, outerRef.col)
+		}
+		sel *= eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+			outerType, tbl.Columns[colPos].Type.Name)
 	}
 	return sel
 }
@@ -628,7 +803,7 @@ func seqScanRows(x *SeqScan) int64 {
 // DEFAULT_INEQ_SEL per range bound. A unique index fully bound by equality
 // still returns 1, which is both correct and what keeps the common PK probe
 // unchanged.
-func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr, lowKey, highKey Expr) int64 {
+func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr, lowKey, highKey Expr, lowOp, highOp parser.OpCode) int64 {
 	relRows := tableRows(tbl)
 	keyed := key != nil || len(keys) > 0
 	bounded := lowKey != nil || highKey != nil
@@ -667,14 +842,16 @@ func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr
 		// its distinct count be read at all — see `variableNumDistinct`.
 		sel *= varEqNonConstSelectivity(cs, float64(relRows))
 	}
-	// PG charges DEFAULT_INEQ_SEL per unmatched inequality bound
-	// (selfuncs.h); a two-sided range therefore lands near its
-	// DEFAULT_RANGE_INEQ_SEL neighbourhood without needing histograms here.
-	if lowKey != nil {
-		sel *= defaultIneqSel
-	}
-	if highKey != nil {
-		sel *= defaultIneqSel
+	// M0146-0009r: the range bounds are index quals, and btcostestimate
+	// scores them with clauselist_selectivity — scalarineqsel over the
+	// column's histogram, the two bounds paired into one band
+	// (clausesel.c). The fixed DEFAULT_INEQ_SEL per bound read `c2 < 100`
+	// on a 100-row column as 33 rows where PG reads 99, and that count
+	// sized the grouped rel above the scan (regress aggregates'
+	// agg_sort_order). DEFAULT_INEQ_SEL stays the fallback when the bound
+	// column cannot be named.
+	if lowKey != nil || highKey != nil {
+		sel *= indexRangeBoundSelectivity(tbl, idx, nEq, lowKey, highKey, lowOp, highOp)
 	}
 	sel = clampSelectivity(sel)
 
@@ -686,6 +863,53 @@ func indexScanRows(tbl *catalog.Table, idx *catalog.Index, key Expr, keys []Expr
 		return relRows
 	}
 	return rows
+}
+
+// indexRangeBoundSelectivity is clauselist_selectivity over an index scan's
+// range bounds on index column nEq (the first column after the equality
+// prefix): `col >= low` / `col > low` and `col <= high` / `col < high`
+// (LowOp/HighOp; the zero value is inclusive), scored against the base
+// relation exactly as the same conjuncts in a Filter over its seq scan.
+func indexRangeBoundSelectivity(tbl *catalog.Table, idx *catalog.Index, nEq int, lowKey, highKey Expr, lowOp, highOp parser.OpCode) float64 {
+	fallback := 1.0
+	if lowKey != nil {
+		fallback *= defaultIneqSel
+	}
+	if highKey != nil {
+		fallback *= defaultIneqSel
+	}
+	if tbl == nil || idx == nil || nEq >= len(idx.Columns) {
+		return fallback
+	}
+	colIdx := -1
+	for i, c := range tbl.Columns {
+		if strings.EqualFold(c.Name, idx.Columns[nEq]) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return fallback
+	}
+	col := tbl.Columns[colIdx]
+	ref := func() *ColumnRef { return &ColumnRef{Index: colIdx, Name: col.Name, Type: col.Type} }
+	var quals []Expr
+	if lowKey != nil {
+		op := parser.OpGe
+		if lowOp == parser.OpGt {
+			op = parser.OpGt
+		}
+		quals = append(quals, &BinaryOp{Op: op, Left: ref(), Right: lowKey})
+	}
+	if highKey != nil {
+		op := parser.OpLe
+		if highOp == parser.OpLt {
+			op = parser.OpLt
+		}
+		quals = append(quals, &BinaryOp{Op: op, Left: ref(), Right: highKey})
+	}
+	leaf := &SeqScan{Table: tbl, schema: tableSchema(tbl)}
+	return clampSelectivity(conjunctionSelectivity(quals, leaf))
 }
 
 // defaultIneqSel is PG's DEFAULT_INEQ_SEL (selfuncs.h): the selectivity charged
@@ -745,6 +969,23 @@ type baseRelInfo struct {
 	// leaf has no catalog table, so this is the whole of its column
 	// statistics — `examineJoinVar` reads it (M0145-0008ab).
 	subqueryUniqueOutput bool
+	// leafTuples/leafRows carry a DERIVED input leaf's own row estimates —
+	// EstimateRows over its subtree before and after leaf-local quals —
+	// for the FROM-clause leaf shapes isSubplanLeaf accepts (CTE scan,
+	// subquery scan, set-op, VALUES, …). PG's examine_variable assigns
+	// vardata->rel = the leaf rel unconditionally for a Var operand
+	// (selfuncs.c:5331), so join-var examination must see these rows even
+	// though the leaf's binding table is a synthetic catalog.Table whose
+	// baseRows is 0. Zero for base relations, where the catalog-statistics
+	// path already supplies both. M0146-0009e.
+	leafTuples float64
+	leafRows   float64
+	// uniqueOutCols names the leaf output columns PG marks isunique — the
+	// leaf body's lone GROUP BY or DISTINCT(ON) key (selfuncs.c:5865-5883),
+	// the RTE_SUBQUERY/RTE_CTE arm generalized to per-column form. nil for
+	// base relations and derived leaves whose top query has no lone key.
+	// M0146-0009e.
+	uniqueOutCols map[string]bool
 }
 
 // estimateBaseRelInfo computes a `baseRelInfo` for one FROM
@@ -816,8 +1057,17 @@ func applyLocalFilterSelectivity(baseRows int64, binding rangeBinding, scan Node
 	if local == nil || scan == nil || baseRows <= 0 {
 		return baseRows
 	}
-	localized := localizeExprToLeaf(local, binding)
-	rows := scaleByFloat(baseRows, clauseSelectivity(localized, scan))
+	localized := dropWindowRunConditions(localizeExprToLeaf(local, binding), scan)
+	if localized == nil {
+		return baseRows
+	}
+	// PG's set_baserel_size_estimates: rel->rows = clamp_row_est(tuples *
+	// selectivity), and clamp_row_est ROUNDS (rint) with a floor of 1 — it
+	// does not truncate. Truncating sized TPC-H Q7's `n_name = 'FRANCE' OR
+	// n_name = 'GERMANY'` nation (25 x 0.0784 = 1.96) at 1 row where PG says 2,
+	// quartering the join estimate once M0146-0005 slice 4 derived that
+	// restriction on both nation scans.
+	rows := int64(math.RoundToEven(float64(baseRows) * clauseSelectivity(localized, scan)))
 	if rows < 1 {
 		// Preserve the bushy DP's "no zero-row singletons"
 		// invariant — without this guard the planner would
@@ -855,6 +1105,8 @@ func IsSmallDimensionSide(n Node) bool {
 	case *Project:
 		return IsSmallDimensionSide(x.Child)
 	case *Sort:
+		return IsSmallDimensionSide(x.Child)
+	case *IncrementalSort:
 		return IsSmallDimensionSide(x.Child)
 	}
 	return false
@@ -1094,7 +1346,16 @@ func outerJoinRowFloor(j *Join, rows float64, l, r int64) float64 {
 func semiJoinMatchFraction(j *Join, innerRows int64) float64 {
 	sel := 1.0
 	for _, p := range joinEquiPairs(j) {
-		sel *= semiPairMatchFraction(j, p, innerRows)
+		f := semiPairMatchFraction(j, p, innerRows)
+		// M0146-0009g: eqjoinsel's SEMI/ANTI arm (selfuncs.c:2417), after
+		// eqjoinsel_semi — Ssemi <= N2 * Sinner. The search-side twin is
+		// `joinClauseSelectivityForJoin`.
+		if innerRows > 0 {
+			if in := semiPairInnerSelectivity(j, p, keyColumnStats(p.Left, j.Left), rightExprStats(j, p.Right)); float64(innerRows)*in < f {
+				f = float64(innerRows) * in
+			}
+		}
+		sel *= f
 	}
 	return sel
 }
@@ -1155,7 +1416,34 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 		nd2 = float64(innerRows)
 		nd2Known = true
 	}
-	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1)
+	return eqjoinselSemiCore(st1, st2, nd1, nd2, nd1Known, nd2Known, nullfrac1,
+		joinKeyTypeName(p.Left, j.Left), joinKeyTypeName(p.Right, j.Left))
+}
+
+// semiPairInnerSelectivity is `eqjoinsel_inner` for one pair, as eqjoinsel
+// computes it "in all cases" before its jointype switch: the MCV arm when
+// both sides carry lists, else (1-nullfrac1)(1-nullfrac2)/max(nd1, nd2) over
+// the UNCLAMPED nds (eqjoinsel_semi clamps only its own copy of nd2).
+func semiPairInnerSelectivity(j *Join, p JoinKeyPair, st1, st2 *catalog.ColumnStats) float64 {
+	if sel, ok := eqjoinselInnerMCV(j, p); ok {
+		return sel
+	}
+	nd1 := float64(keyNDistinct(p.Left, j.Left))
+	nd2 := float64(rightExprNDistinct(j, p.Right))
+	if nd1 <= 0 {
+		nd1 = defaultNumDistinct
+	}
+	if nd2 <= 0 {
+		nd2 = defaultNumDistinct
+	}
+	sel := 1.0
+	if st1 != nil {
+		sel *= 1 - st1.NullFrac
+	}
+	if st2 != nil {
+		sel *= 1 - st2.NullFrac
+	}
+	return sel / math.Max(nd1, nd2)
 }
 
 // eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
@@ -1170,8 +1458,38 @@ func semiPairMatchFraction(j *Join, p JoinKeyPair, innerRows int64) float64 {
 // `nd1Known`/`nd2Known` are the complements of upstream's `isdefault1/2`: a
 // clamped nd2 counts as known, because an inner relation smaller than
 // DEFAULT_NUM_DISTINCT bounds its own distinct count exactly.
-func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64) float64 {
+// joinKeyTypeName resolves a join-key expression's declared type name for
+// the MCV-MCV pairing's bpchar check ("" when the key is not a plain column
+// reference or the type is unknown). `bpchar = bpchar` resolves to bpchareq
+// (varchar.c:743), so a char(N) list joined to a char(M) list pairs on
+// truelen values — byte-equal pairing of the padded stamped forms would
+// miss whenever the widths differ (M0146-0009b).
+func joinKeyTypeName(e Expr, side Node) string {
+	switch k := e.(type) {
+	case *ColumnRef:
+		return k.Type.Name
+	case *OuterColumnRef:
+		if ref, ok := resolveBaseColumn(k.Index, side); ok {
+			return columnTypeByName(ref.table, ref.col)
+		}
+	}
+	return ""
+}
+
+// eqjoinselSemiCore is `eqjoinsel_semi`'s body AFTER the nd2 clamps
+// (selfuncs.c): the caller supplies the already-clamped distinct counts and
+// flags. `type1`/`type2` are the join columns' catalog type names — MCV
+// pairing needs them because a `bpchar = bpchar` join compares on truelen
+// values (bpchareq, varchar.c:743) while every other type pairs byte-equal.
+func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known, nd2Known bool, nullfrac1 float64, type1, type2 string) float64 {
 	if st1 != nil && st2 != nil && len(st1.MCV) > 0 && len(st2.MCV) > 0 {
+		bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
+		mcvKey := func(v string) string {
+			if bp {
+				return strings.TrimRight(v, " ")
+			}
+			return v
+		}
 		// "The clamping above could have resulted in nd2 being less than
 		// sslot2->nvalues; in which case, we assume that precisely the nd2 most
 		// common values in the relation will appear in the join input"
@@ -1189,12 +1507,12 @@ func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known
 		// unused index for a value is exactly what the inner scan did.
 		firstByValue := make(map[string]int, clamped2)
 		for k := clamped2 - 1; k >= 0; k-- {
-			firstByValue[st2.MCV[k].Value] = k // lowest index wins
+			firstByValue[mcvKey(st2.MCV[k].Value)] = k // lowest index wins
 		}
 		matched2 := make([]bool, clamped2)
 		matchFreq1, nmatches := 0.0, 0
 		for i := range st1.MCV {
-			k, ok := firstByValue[st1.MCV[i].Value]
+			k, ok := firstByValue[mcvKey(st1.MCV[i].Value)]
 			if !ok {
 				continue
 			}
@@ -1202,10 +1520,10 @@ func eqjoinselSemiCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, nd1Known
 			// the forward scan only runs if one ever holds duplicates, and it
 			// then picks the same "lowest still-unused index" the old nested
 			// loop did.
-			for k < clamped2 && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+			for k < clamped2 && matched2[k] && mcvKey(st2.MCV[k].Value) == mcvKey(st1.MCV[i].Value) {
 				k++
 			}
-			if k >= clamped2 || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+			if k >= clamped2 || matched2[k] || mcvKey(st2.MCV[k].Value) != mcvKey(st1.MCV[i].Value) {
 				continue
 			}
 			matched2[k] = true
@@ -1474,6 +1792,18 @@ type groupVarInfo struct {
 // grouped scan of 6 surviving rows claim its column's whole-table 18 000
 // distinct values.
 func estimateAggregate(a *Aggregate) int64 {
+	// M0146-0009q: a Finalize aggregate emits the grouped rel's dNumGroups,
+	// which PG estimates once over the ORIGINAL input
+	// (create_partial_grouping_paths and the finalize paths in
+	// postgres/src/backend/optimizer/plan/planner.c share the grouped rel's
+	// rows). Re-estimating over the Gather of partial states sees no column
+	// statistics and falls to the default, a tenth of the input — TPC-DS
+	// Q59's `CTE Scan on wss` read 6265 of the CTE's 62646 groups. The
+	// Partial node's own estimate is exactly the original-input one.
+	if a.Mode == AggModeFinal && a.PartialSource != nil && a.PartialSource != a &&
+		a.PartialSource.Mode != AggModeFinal {
+		return estimateAggregate(a.PartialSource)
+	}
 	// R61: same searched-input sourcing as the search-rel sizing
 	// (`groupCountInputRows`, groupingpaths.go) — EXPLAIN recomputes this
 	// arm off the built tree, which carries no PlanCost stamp, so sizing
@@ -1500,21 +1830,18 @@ func estimateAggregate(a *Aggregate) int64 {
 	// The empty set `()` — ROLLUP's grand total — contributes exactly one
 	// row, which `estimateNumGroups` already answers for an empty expression
 	// list.
+	perSet, ok := groupingSetGroupCounts(a, inputRows)
+	if !ok {
+		// Fail-safe: an out-of-range index means the set list and
+		// GroupExprs disagree, which the builder should make impossible.
+		// Price the whole aggregate the old way rather than silently
+		// dropping a dimension, since dropping one under-states further in
+		// the same direction.
+		return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
+	}
 	var total int64
-	for _, set := range a.GroupingSets {
-		exprs := make([]Expr, 0, len(set))
-		for _, idx := range set {
-			if idx < 0 || idx >= len(a.GroupExprs) {
-				// Fail-safe: an out-of-range index means the set list and
-				// GroupExprs disagree, which the builder should make
-				// impossible. Price the whole aggregate the old way rather
-				// than silently dropping a dimension, since dropping one
-				// under-states further in the same direction.
-				return estimateNumGroups(a.GroupExprs, a.Child, inputRows)
-			}
-			exprs = append(exprs, a.GroupExprs[idx])
-		}
-		total += estimateNumGroups(exprs, a.Child, inputRows)
+	for _, g := range perSet {
+		total += g
 	}
 	if total < 1 {
 		return 1
@@ -1541,6 +1868,25 @@ func estimateAggregate(a *Aggregate) int64 {
 		}
 	}
 	return total
+}
+
+// groupingSetGroupCounts is get_number_of_groups' per-set loop
+// (planner.c): estimate_num_groups over each grouping set's own expressions,
+// in a.GroupingSets order. The empty set `()` counts one group. ok is false
+// when a set index does not name a group expression.
+func groupingSetGroupCounts(a *Aggregate, inputRows int64) ([]int64, bool) {
+	out := make([]int64, 0, len(a.GroupingSets))
+	for _, set := range a.GroupingSets {
+		exprs := make([]Expr, 0, len(set))
+		for _, idx := range set {
+			if idx < 0 || idx >= len(a.GroupExprs) {
+				return nil, false
+			}
+			exprs = append(exprs, a.GroupExprs[idx])
+		}
+		out = append(out, estimateNumGroups(exprs, a.Child, inputRows))
+	}
+	return out, true
 }
 
 // estimateNumGroups is `estimate_num_groups` (selfuncs.c:3449): the number of
@@ -1753,8 +2099,141 @@ func examineGroupVar(cr *ColumnRef, child Node) (groupVarKey, groupVarInfo) {
 		}
 	}
 	info := groupVarInfo{ndistinct: defaultNumDistinct}
+	// M0146-0005bb: examine_variable still knows WHICH relation a
+	// statistics-less variable belongs to — a subquery or CTE RTE whose
+	// output PG cannot drill into (a set operation, a grouped body) — and
+	// estimate_num_groups clamps per relation: at most rel->tuples, a tenth
+	// of it when several variables come from that relation. Without the
+	// relation, TPC-DS Q75's five grouping columns over its UNION subquery
+	// multiplied freely up to the input rows (124831 groups; PG 12155 =
+	// 121550 / 10).
+	if src := groupVarSourceNode(cr.Index, child, 0); src != nil {
+		info.rel = src
+		info.rawRows = float64(EstimateRows(src))
+		traceGroupVar(cr, baseColumnRef{}, info, "default-rel")
+		return groupVarKey{rel: src, idx: cr.Index}, info
+	}
 	traceGroupVar(cr, baseColumnRef{}, info, "default")
 	return groupVarKey{idx: cr.Index}, info
+}
+
+// groupVarSourceNode finds the relation-level node that produces output
+// column idx of child — the node PG would name as the variable's RTE when it
+// has no statistics for it. It walks the same row-preserving wrappers and
+// join sides resolveBaseColumn does and stops at the first node that is
+// neither: a set operation, an aggregate, a CTE or subquery scan, a VALUES
+// list. Base scans are resolveBaseColumn's business and return nil here, as
+// does an index that cannot be followed; nil keeps the relation-less
+// default.
+func groupVarSourceNode(idx int, child Node, depth int) Node {
+	if child == nil || idx < 0 || depth > 64 {
+		return nil
+	}
+	switch x := child.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		return nil
+	case *Filter:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Sort:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Limit:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *LockRows:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Gather:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Memoize:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Materialize:
+		return groupVarSourceNode(idx, x.Child, depth+1)
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return groupVarSourceNode(cr.Index, x.Child, depth+1)
+			}
+		}
+		// A computed column is the subquery's own output: the Project is
+		// the relation.
+		return x
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return nil
+		}
+		lw := len(x.Left.Output())
+		if idx >= lw {
+			return groupVarSourceNode(idx-lw, x.Right, depth+1)
+		}
+		return groupVarSourceNode(idx, x.Left, depth+1)
+	case *NestedLoopIndexJoin:
+		if x.Outer == nil {
+			return nil
+		}
+		ow := len(x.Outer.Output())
+		if idx >= ow {
+			return groupVarSourceNode(idx-ow, x.Inner, depth+1)
+		}
+		return groupVarSourceNode(idx, x.Outer, depth+1)
+	case *SetOp:
+		// A partitioned or inherited table expands to a UNION ALL of its
+		// members, but it is ONE relation to PG, whose variables read the
+		// parent's inherited statistics (pg_statistic stainherit), not the
+		// statistics-less subquery default. Leave those to the existing
+		// path rather than clamp them as a subquery.
+		if setOpExpandsTableHierarchy(x) {
+			return nil
+		}
+	}
+	return child
+}
+
+// setOpExpandsTableHierarchy reports whether a UNION ALL is a partitioned or
+// inherited table's expansion: some member scans a partition or an
+// inheritance child.
+func setOpExpandsTableHierarchy(so *SetOp) bool {
+	// Members are collected across every UNION ALL link, parallel-aware or
+	// merging ones included (unionAllMembers declines those), since a
+	// partition Append is routinely parallel.
+	var members []Node
+	var collect func(n Node, depth int)
+	collect = func(n Node, depth int) {
+		if l, ok := n.(*SetOp); ok && l.Op == parser.SetOpUnion && l.All && depth < 64 {
+			collect(l.Left, depth+1)
+			collect(l.Right, depth+1)
+			return
+		}
+		members = append(members, n)
+	}
+	collect(so, 0)
+	for _, m := range members {
+		// Each member is the child scan, often under the appendrel's
+		// column-translation Project.
+		for {
+			if pr, ok := m.(*Project); ok && pr.Child != nil {
+				m = pr.Child
+				continue
+			}
+			break
+		}
+		var tbl *catalog.Table
+		switch sc := leafBaseScan(m).(type) {
+		case *SeqScan:
+			tbl = sc.Table
+		case *IndexScan:
+			tbl = sc.Table
+		case *IndexOnlyScan:
+			tbl = sc.Table
+		case *BitmapHeapScan:
+			tbl = sc.Table
+		}
+		if tbl != nil && (tbl.PartitionParentOID != 0 || len(tbl.InheritsParentOIDs) > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // traceGroupVar writes the evidence estimateNumGroups consumes for one GROUP
@@ -1886,6 +2365,14 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		if is, ok := n.(*IndexScan); ok && indexProbeHasOuterRef(is) {
 			return 0, false, false
 		}
+		// M0146-0005bq: the index-only twin — since a parameterised probe can
+		// be index-only, the same per-probe rows must be declined for it
+		// (TPC-DS Q39's `item` probe otherwise read as filtered to 1 row and
+		// collapsed the grouping estimate 3911 -> 60).
+		if ios, ok := n.(*IndexOnlyScan); ok && ios != nil &&
+			(exprHasOuterRef(ios.Key) || exprHasOuterRefList(ios.Keys)) {
+			return 0, false, false
+		}
 		return float64(EstimateRows(n)), true, false
 	}
 	// passthrough: n still describes a single relation if its child does.
@@ -1916,7 +2403,17 @@ func relFilteredRowsWalk(n, rel Node) (rows float64, found, sealed bool) {
 		return passthrough(x.Child)
 	case *Sort:
 		return passthrough(x.Child)
+	case *IncrementalSort:
+		return passthrough(x.Child)
 	case *Limit:
+		return passthrough(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: the wrapper's schema is the subplan's own output,
+		// so a coordinate crossing it crosses here exactly as it does in
+		// resolveBaseColumn — the resolver twins must agree.
+		return passthrough(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent — same rule as SubqueryScan.
 		return passthrough(x.Child)
 	case *LockRows:
 		return passthrough(x.Child)
@@ -2130,22 +2627,33 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 	// Pair the two lists, each entry consumed at most once. Indexed rather
 	// than nested-loop for the reason recorded on the semi arm (review/260831
 	// OP1-2): a nested loop is statistics_target^2 comparisons per estimate.
+	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
+	// char(N) list joined to a char(M) list still matches (M0146-0009b).
+	type1 := joinKeyTypeName(p.Left, j.Left)
+	type2 := joinKeyTypeName(p.Right, j.Left)
+	bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
+	mcvKey := func(v string) string {
+		if bp {
+			return strings.TrimRight(v, " ")
+		}
+		return v
+	}
 	firstByValue := make(map[string]int, len(st2.MCV))
 	for k := len(st2.MCV) - 1; k >= 0; k-- {
-		firstByValue[st2.MCV[k].Value] = k
+		firstByValue[mcvKey(st2.MCV[k].Value)] = k
 	}
 	matched1 := make([]bool, len(st1.MCV))
 	matched2 := make([]bool, len(st2.MCV))
 	matchprodfreq, nmatches := 0.0, 0
 	for i := range st1.MCV {
-		k, ok := firstByValue[st1.MCV[i].Value]
+		k, ok := firstByValue[mcvKey(st1.MCV[i].Value)]
 		if !ok {
 			continue
 		}
-		for k < len(st2.MCV) && matched2[k] && st2.MCV[k].Value == st1.MCV[i].Value {
+		for k < len(st2.MCV) && matched2[k] && mcvKey(st2.MCV[k].Value) == mcvKey(st1.MCV[i].Value) {
 			k++
 		}
-		if k >= len(st2.MCV) || matched2[k] || st2.MCV[k].Value != st1.MCV[i].Value {
+		if k >= len(st2.MCV) || matched2[k] || mcvKey(st2.MCV[k].Value) != mcvKey(st1.MCV[i].Value) {
 			continue
 		}
 		matched1[i], matched2[k] = true, true
@@ -2204,4 +2712,72 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 		return 0, false
 	}
 	return clampProbability(sel), true
+}
+
+// setOpArmGroups is build_setop_child_paths' *pNumGroups for one set-operation
+// arm: the arm's rows when its own query level groups (GROUP BY, aggregates,
+// HAVING, DISTINCT) or is itself a set operation, else estimate_num_groups
+// over the arm's output columns. A dropping Project on top marks a new query
+// level (`SELECT a FROM (grouped subquery)`), which PG estimates rather than
+// counts.
+func setOpArmGroups(arm Node, rows int64) int64 {
+	top := arm
+	for {
+		switch x := top.(type) {
+		case *Filter:
+			top = x.Child
+			continue
+		case *Sort:
+			top = x.Child
+			continue
+		case *IncrementalSort:
+			top = x.Child
+			continue
+		case *Gather:
+			top = x.Child
+			continue
+		case *SubqueryScan:
+			// M0146-0005w: labelling wrapper — strip to the arm's own
+			// top so a contained SetOp/Aggregate still reads as
+			// already-grouped.
+			top = x.Child
+			continue
+		case *Materialize:
+			// M0146-0010: transparent — same strip rule.
+			top = x.Child
+			continue
+		}
+		break
+	}
+	switch top.(type) {
+	case *Aggregate, *Distinct, *DistinctOn, *SetOp:
+		return rows
+	}
+	// build_setop_child_paths estimates over the arm's target-list
+	// EXPRESSIONS (get_tlist_exprs), so a computed column such as TPC-DS
+	// Q8's `substr(ca_zip, 1, 5)` reduces to its variable `ca_zip` and its
+	// statistics (estimate_num_groups step 2). A reference to the Project's
+	// output column is opaque to examineGroupVar and fell to the 200
+	// default, which kept Q8's INTERSECT from putting the 200-group arm on
+	// the hashed side as PG does (3203 vs 200 groups).
+	if pr, ok := top.(*Project); ok && pr.Child != nil && len(pr.Targets) > 0 {
+		g := estimateNumGroups(pr.Targets, pr.Child, rows)
+		if g < 1 {
+			return 1
+		}
+		return g
+	}
+	out := arm.Output()
+	if len(out) == 0 {
+		return rows
+	}
+	exprs := make([]Expr, len(out))
+	for i, c := range out {
+		exprs[i] = &ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	}
+	g := estimateNumGroups(exprs, arm, rows)
+	if g < 1 {
+		return 1
+	}
+	return g
 }

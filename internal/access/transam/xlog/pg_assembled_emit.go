@@ -560,11 +560,12 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 	var blockData []byte
 	blockData = binary.LittleEndian.AppendUint16(blockData, 1) // nplans
 	blockData = binary.LittleEndian.AppendUint16(blockData, 0) // pad2
-	// one xlhp_freeze_plan (sizeOfXLHPFreezePlan = 11): xmax, infomask2, infomask, frzflags, ntuples.
+	// one xlhp_freeze_plan (sizeOfXLHPFreezePlan = 12): xmax, infomask2,
+	// infomask, frzflags, the C struct's alignment pad byte, ntuples.
 	blockData = binary.LittleEndian.AppendUint32(blockData, 0)                        // xmax
 	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask2
 	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask
-	blockData = append(blockData, 0)                                                 // frzflags
+	blockData = append(blockData, 0, 0)                                               // frzflags, pad
 	blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(frozenSlots))) // ntuples
 	// trailing offset array = the frozen slots.
 	for _, s := range frozenSlots {

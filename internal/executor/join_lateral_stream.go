@@ -93,6 +93,8 @@ type lateralJoinStream struct {
 	// again, so the enclosing query's cache never sees the lateral's entries
 	// and vice versa. Cleared when a new outer tuple arrives — that clearing is
 	// the whole point (a CTE whose body reads the outer row must recompute).
+	// A body that reads no outer value is not cached here at all: it lives in
+	// ctx.CTEStableCache, which this swap leaves alone (M0146-0049d2).
 	innerCTE map[string][]Row
 	savedCTE map[string][]Row
 

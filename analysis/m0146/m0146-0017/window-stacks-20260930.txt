@@ -1,0 +1,64 @@
+===== sf025 Q47 pg =====
+   CTE v1
+     ->  WindowAgg  (cost=19719.48..20492.59 rows=3850 width=195)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+           ->  WindowAgg  (cost=19719.48..20396.34 rows=3850 width=163)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=19719.48..20290.46 rows=3850 width=155)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=19719.48..20174.96 rows=3850 width=129)
+===== sf025 Q47 goopg =====
+   CTE v1
+     ->  WindowAgg  (cost=20115.95..20230.64 rows=3823 width=208)
+           ->  WindowAgg  (cost=20115.95..20192.41 rows=3823 width=200)
+                 ->  GroupAggregate  (cost=20115.95..20154.18 rows=3823 width=168)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=19654.19..20106.39 rows=3822 width=2004)
+===== sf025 Q57 pg =====
+   CTE v1
+     ->  WindowAgg  (cost=14528.78..14931.83 rows=2085 width=194)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+           ->  WindowAgg  (cost=14528.78..14884.92 rows=2085 width=162)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=14528.78..14832.79 rows=2085 width=154)
+                       Group Key: item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=14528.78..14775.45 rows=2085 width=128)
+===== sf025 Q57 goopg =====
+   CTE v1
+     ->  WindowAgg  (cost=14683.43..14745.59 rows=2072 width=176)
+           ->  WindowAgg  (cost=14683.43..14724.87 rows=2072 width=168)
+                 ->  GroupAggregate  (cost=14683.43..14704.15 rows=2072 width=136)
+                       Group Key: item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=14433.26..14678.25 rows=2071 width=2168)
+===== sf1 Q47 pg =====
+   CTE v1
+     ->  WindowAgg  (cost=65706.17..68846.07 rows=15526 width=195)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+           ->  WindowAgg  (cost=65706.17..68457.92 rows=15526 width=163)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=65706.17..68030.95 rows=15526 width=155)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=65706.17..67565.17 rows=15526 width=129)
+===== sf1 Q47 goopg =====
+   CTE v1
+     ->  WindowAgg  (cost=75256.99..75716.02 rows=15301 width=706)
+           ->  WindowAgg  (cost=75256.99..75563.01 rows=15301 width=698)
+                 ->  GroupAggregate  (cost=75256.99..75410.00 rows=15301 width=666)
+                       Group Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=73386.80..75218.74 rows=15300 width=4198)
+===== sf1 Q57 pg =====
+   CTE v1
+     ->  WindowAgg  (cost=46276.80..48139.27 rows=9565 width=194)
+           Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+           ->  WindowAgg  (cost=46276.80..47924.05 rows=9565 width=162)
+                 Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+                 ->  GroupAggregate  (cost=46276.63..47684.93 rows=9565 width=154)
+                       Group Key: item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=46276.63..47421.89 rows=9565 width=128)
+===== sf1 Q57 goopg =====
+   CTE v1
+     ->  WindowAgg  (cost=50890.78..51139.87 rows=8303 width=588)
+           ->  WindowAgg  (cost=50890.78..51056.84 rows=8303 width=580)
+                 ->  GroupAggregate  (cost=50890.78..50973.81 rows=8303 width=548)
+                       Group Key: item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year, date_dim.d_moy
+                       ->  Gather Merge  (cost=49792.84..50786.99 rows=8303 width=4472)

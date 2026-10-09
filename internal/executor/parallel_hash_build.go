@@ -502,7 +502,8 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 		return false
 	}
 	// Rule 1: must be shareable (P8 eligibility).
-	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight {
+	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight ||
+		o.plan.Type.IsRightSemiAnti() {
 		return false
 	}
 	if o.plan.Type == optimizer.JoinTypeLeft && buildLeft {
@@ -778,6 +779,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			loopErr = err
 		} else {
 			o.presizeLazyHash(ctx, o.plan.Left, o.lazyLW, true)
+			// The serial loop counts the channel's rows: the empty-inner
+			// exit applies to a cooperative build as to a serial one.
+			o.buildRowsCounted = true
 			loopErr = o.buildLoopLeft(ctx, otherWidth)
 			_ = o.left.Close()
 		}
@@ -788,6 +792,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			loopErr = err
 		} else {
 			o.presizeLazyHash(ctx, o.plan.Right, o.lazyRW, false)
+			// The serial loop counts the channel's rows: the empty-inner
+			// exit applies to a cooperative build as to a serial one.
+			o.buildRowsCounted = true
 			loopErr = o.buildLoopRight(ctx, otherWidth)
 			_ = o.right.Close()
 		}

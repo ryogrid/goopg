@@ -1,0 +1,16 @@
+2c2
+< Q2 depth=0 [sort-strategy] under -: PG Sort | goopg Gather Merge
+---
+> Q2 depth=2 [join-order] under CTE: PG Finalize HashAggregate | goopg Append
+14c14
+< Q14 depth=2 [join-order] under CTE: PG Hash Join Inner | goopg Hash Join Inner
+---
+> Q14 depth=2 [join-method] under CTE: PG Hash Join Inner | goopg Merge Join Inner
+30c30
+< Q30 depth=1 [sort-strategy] under Limit: PG Sort | goopg Gather Merge
+---
+> Q30 depth=2 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+81c81
+< Q81 depth=1 [sort-strategy] under Limit: PG Sort | goopg Gather Merge
+---
+> Q81 depth=2 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner

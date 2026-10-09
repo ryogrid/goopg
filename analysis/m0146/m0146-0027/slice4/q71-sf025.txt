@@ -1,0 +1,37 @@
+=== Q71
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=33219.70..33219.71 rows=1 width=76)
+   Sort Key: (sum(ext_price)) DESC, item.i_brand_id
+   ->  GroupAggregate  (cost=33219.67..33219.68 rows=1 width=76)
+         Group Key: item.i_brand, item.i_brand_id, time_dim.t_hour, time_dim.t_minute
+         ->  Sort  (cost=33219.66..33219.67 rows=1 width=704)
+               Sort Key: item.i_brand, item.i_brand_id, time_dim.t_hour, time_dim.t_minute
+               ->  Gather  (cost=4426.74..33219.65 rows=1 width=268)
+                     Workers Planned: 2
+                     ->  Nested Loop  (cost=3426.74..32219.55 rows=1 width=268)
+                           ->  Parallel Hash Join  (cost=3426.49..32179.80 rows=4 width=88)
+                                 Hash Cond: (web_sales.ws_item_sk = item.i_item_sk)
+                                 ->  Parallel Append  (cost=2049.78..38503.38 rows=519 width=44)
+                                       ->  Hash Join  (cost=2049.78..7693.43 rows=32 width=56)
+                                             Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Seq Scan on web_sales  (cost=0.00..5446.82 rows=74982 width=556)
+                                             ->  Seq Scan on date_dim  (cost=0.00..2049.55 rows=18 width=420)
+                                                   Filter: ((d_moy = 12) AND (d_year = 2002))
+                                       ->  Hash Join  (cost=2049.78..12876.54 rows=49 width=56)
+                                             Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_1.d_date_sk)
+                                             ->  Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=116257 width=556)
+                                             ->  Seq Scan on date_dim date_dim_1  (cost=0.00..2049.55 rows=18 width=420)
+                                                   Filter: ((d_moy = 12) AND (d_year = 2002))
+                                       ->  Hash Join  (cost=2049.78..17915.56 rows=94 width=56)
+                                             Hash Cond: (store_sales.ss_sold_date_sk = date_dim_2.d_date_sk)
+                                             ->  Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                             ->  Seq Scan on date_dim date_dim_2  (cost=0.00..2049.55 rows=18 width=420)
+                                                   Filter: ((d_moy = 12) AND (d_year = 2002))
+                                 ->  Parallel Seq Scan on item  (cost=0.00..1374.35 rows=189 width=480)
+                                       Filter: (i_manager_id = 1)
+                           ->  Index Scan using time_dim_pkey on time_dim  (cost=0.25..9.93 rows=1 width=180)
+                                 Index Cond: (t_time_sk = time_sk)
+                                 Filter: ((t_meal_time = 'breakfast') OR (t_meal_time = 'dinner'))
+(32 rows)
+

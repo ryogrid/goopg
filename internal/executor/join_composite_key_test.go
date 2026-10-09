@@ -100,7 +100,7 @@ func TestCompositeKeyEncodingIsInjective(t *testing.T) {
 	encode := func(a, b string) string {
 		t.Helper()
 		slot := SlotFromRow(nil, Row{NewStringDatum(a), NewStringDatum(b)})
-		ok, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
+		ok, packMiss, err := o.encodeCompositeKey(o.buildKeyNodes, o.buildKeyTrim, slot)
 		if err != nil || !ok || packMiss {
 			t.Fatalf("encode(%q,%q): ok=%v packMiss=%v err=%v", a, b, ok, packMiss, err)
 		}
@@ -127,7 +127,7 @@ func TestCompositeKeyNullColumnMatchesNothing(t *testing.T) {
 	}
 	o.compileExecExprs()
 	slot := SlotFromRow(nil, Row{NewIntDatum(1), NullDatum})
-	ok, _, err := o.encodeCompositeKey(o.buildKeyNodes, slot)
+	ok, _, err := o.encodeCompositeKey(o.buildKeyNodes, o.buildKeyTrim, slot)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}

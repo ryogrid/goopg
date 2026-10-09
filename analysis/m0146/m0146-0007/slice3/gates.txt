@@ -1,0 +1,5 @@
+tpch-spotcheck: RESULT=PASS
+SUMMARY: 24 MATCH
+TPC-H census identical to M0146-0007b
+regress 41 WITH/plan pass-required cases: 13/41 on both, diffs identical to a HEAD (3b90ab893) worktree
+Q95 3s->6s in the sweep is timing noise: its plan is unchanged (PLAN-SHAPE changed=0, fire set fires Q78 only)

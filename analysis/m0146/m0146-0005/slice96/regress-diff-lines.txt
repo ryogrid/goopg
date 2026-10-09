@@ -1,0 +1,7 @@
+join 18650 -> 18651
+subselect 2785 -> 2785
+aggregates 1032 -> 1032
+partition_join 6290 -> 6290
+inherit 3214 -> 3214
+select_parallel 1532 -> 1532
+join_hash 899 -> 899

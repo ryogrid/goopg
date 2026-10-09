@@ -1,0 +1,40 @@
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Hash Join  (cost=570.00..1273.33 rows=3333 width=488)
+   Hash Cond: (a.thousand = b.thousand)
+   Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Index Scan using tenk1_hundred on tenk1 c  (cost=0.00..0.83 rows=33 width=244)
+           Index Cond: (hundred = b.hundred)
+           Filter: (NOT EXISTS(SubPlan 2))
+           SubPlan 2
+             ->  Bitmap Heap Scan on tenk1 d  (cost=0.00..0.01 rows=1 width=244)
+                   Recheck Cond: (thousand = $0)
+                   ->  Bitmap Index Scan on tenk1_thous_tenthous  (cost=0.00..0.01 rows=1 width=244)
+                         Index Cond: (thousand = $0)
+   ->  Seq Scan on tenk1 a  (cost=0.00..445.00 rows=10000 width=244)
+   ->  Seq Scan on tenk1 b  (cost=0.00..445.00 rows=10000 width=244)
+(14 rows)
+
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Seq Scan on tenk1 a
+   SubPlan 1
+     ->  Aggregate
+           ->  Bitmap Heap Scan on tenk1 d
+                 Recheck Cond: (thousand = a.thousand)
+                 ->  Bitmap Index Scan on tenk1_thous_tenthous
+                       Index Cond: (thousand = a.thousand)
+(7 rows)
+
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Seq Scan on tenk1 a
+   SubPlan 1
+     ->  Aggregate
+           ->  Bitmap Heap Scan on tenk1 d
+                 Recheck Cond: (thousand = a.thousand)
+                 ->  Bitmap Index Scan on tenk1_thous_tenthous
+                       Index Cond: (thousand = a.thousand)
+(7 rows)
+

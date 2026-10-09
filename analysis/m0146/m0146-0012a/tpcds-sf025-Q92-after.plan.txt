@@ -1,0 +1,33 @@
+===== Q92 =====
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=2302.44..2302.44 rows=1 width=32)
+   ->  Sort  (cost=2302.44..2302.44 rows=1 width=32)
+         Sort Key: (sum(web_sales.ws_ext_discount_amt))
+         ->  Aggregate  (cost=2302.42..2302.43 rows=1 width=32)
+               ->  Nested Loop  (cost=8.68..2302.41 rows=1 width=984)
+                     ->  Nested Loop  (cost=8.43..2284.41 rows=53 width=564)
+                           ->  Seq Scan on item  (cost=0.00..1467.00 rows=16 width=480)
+                                 Filter: (i_manufact_id = 714)
+                           ->  Bitmap Heap Scan on web_sales  (cost=8.43..50.95 rows=11 width=556)
+                                 Recheck Cond: (ws_item_sk = item.i_item_sk)
+                                 Filter: (ws_ext_discount_amt > (SubPlan 1))
+                                 SubPlan 1
+                                   ->  Aggregate  (cost=186.03..186.05 rows=1 width=32)
+                                         ->  Nested Loop  (cost=16.69..186.03 rows=1 width=460)
+                                               ->  Bitmap Heap Scan on web_sales web_sales_1  (cost=8.43..50.97 rows=11 width=556)
+                                                     Recheck Cond: (ws_item_sk = $0)
+                                                     ->  Bitmap Index Scan on web_sales_pkey  (cost=0.38..8.43 rows=11 width=556)
+                                                           Index Cond: (ws_item_sk = $0)
+                                               ->  Bitmap Heap Scan on date_dim date_dim_1  (cost=8.26..12.27 rows=1 width=420)
+                                                     Recheck Cond: (d_date_sk = web_sales_1.ws_sold_date_sk)
+                                                     Filter: ((d_date >= '2000-02-01'::date) AND (d_date <= '2000-05-01 00:00:00'::timestamp without time zone))
+                                                     ->  Bitmap Index Scan on date_dim_pkey  (cost=0.25..8.26 rows=1 width=420)
+                                                           Index Cond: (d_date_sk = web_sales_1.ws_sold_date_sk)
+                                 ->  Bitmap Index Scan on web_sales_pkey  (cost=0.38..8.43 rows=11 width=556)
+                                       Index Cond: (ws_item_sk = item.i_item_sk)
+                     ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.34 rows=1 width=420)
+                           Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+                           Filter: ((d_date >= '2000-02-01'::date) AND (d_date <= '2000-05-01 00:00:00'::timestamp without time zone))
+(28 rows)
+

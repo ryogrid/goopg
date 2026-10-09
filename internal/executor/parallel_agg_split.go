@@ -94,7 +94,7 @@ func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states
 		if i >= len(dst.states) || i >= len(states) {
 			break
 		}
-		if err := combineAggRuntime(aggs[i].Name, &dst.states[i], &states[i]); err != nil {
+		if err := combineAggRuntime(aggs[i].Name, &dst.states[i], &states[i], aggs[i].Arg); err != nil {
 			return err
 		}
 	}

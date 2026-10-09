@@ -1,0 +1,24 @@
+Q53 baseline: Sort Key: avg_quarterly_sales, sum_sales, item.i_manufact_id
+Q53 baseline: Sort Key: item.i_manufact_id, date_dim.d_qoy
+Q53 candidate: Sort Key: tmp1.avg_quarterly_sales, tmp1.sum_sales, tmp1.i_manufact_id
+Q53 candidate: Sort Key: item.i_manufact_id, date_dim.d_qoy
+Q53 candidate-pg: Sort Key: tmp1.avg_quarterly_sales, tmp1.sum_sales, tmp1.i_manufact_id
+Q53 candidate-pg: Sort Key: item.i_manufact_id, date_dim.d_qoy
+Q63 baseline: Sort Key: item.i_manager_id, avg_monthly_sales, sum_sales
+Q63 baseline: Sort Key: item.i_manager_id, date_dim.d_moy
+Q63 candidate: Sort Key: tmp1.i_manager_id, tmp1.avg_monthly_sales, tmp1.sum_sales
+Q63 candidate: Sort Key: item.i_manager_id, date_dim.d_moy
+Q63 candidate-pg: Sort Key: tmp1.i_manager_id, tmp1.avg_monthly_sales, tmp1.sum_sales
+Q63 candidate-pg: Sort Key: item.i_manager_id, date_dim.d_moy
+Q67 baseline: Sort Key: i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+Q67 baseline: Sort Key: i_category, sumsales DESC
+Q67 candidate: Sort Key: dw2.i_category, dw2.i_class, dw2.i_brand, dw2.i_product_name, dw2.d_year, dw2.d_qoy, dw2.d_moy, dw2.s_store_id, dw2.sumsales, dw2.rk
+Q67 candidate: Sort Key: i_category, sumsales DESC
+Q67 candidate-pg: Sort Key: dw1.i_category, dw1.i_class, dw1.i_brand, dw1.i_product_name, dw1.d_year, dw1.d_qoy, dw1.d_moy, dw1.s_store_id, dw1.sumsales, (rank() OVER w1)
+Q67 candidate-pg: Sort Key: dw1.i_category, dw1.sumsales DESC
+Q89 baseline: Sort Key: ((sum_sales - avg_monthly_sales)), s_store_name
+Q89 baseline: Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
+Q89 candidate: Sort Key: ((sum_sales - avg_monthly_sales)), tmp1.s_store_name
+Q89 candidate: Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name
+Q89 candidate-pg: Sort Key: ((tmp1.sum_sales - tmp1.avg_monthly_sales)), tmp1.s_store_name
+Q89 candidate-pg: Sort Key: item.i_category, item.i_brand, store.s_store_name, store.s_company_name

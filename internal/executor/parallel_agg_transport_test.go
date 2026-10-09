@@ -1,0 +1,731 @@
+package executor
+
+// M0146-0003b (M0141-S3/S4, adopted by M0146-0003): row-transport partial
+// aggregates. The Partial node emits [group key values | passthrough
+// values | serialized transition states] as ordinary rows — PG's
+// aggserialfn-shaped transport — and the Finalize node deserialises and
+// combineAggRuntime's them per group. Unlike the zero-row accumulator
+// model (parallel_agg_split.go) the pair survives any row-moving node
+// between them: a Sort under Gather Merge (PG's
+// `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
+// HashAggregate`) or a plain Gather.
+//
+// The failure this file exists to catch is the same one
+// TestPartialFinalizeIdentity names: an N-times overcount when every
+// worker aggregates the whole relation because the parallel scan never
+// claimed it — plausible output, nothing flags it. Comparing against
+// serial execution finds it.
+
+import (
+	"math"
+	"math/big"
+	"strings"
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
+)
+
+// runTransportSplit plans sql, clones its aggregate into a
+// PartialEmit partial/finalize pair, and runs it under a Gather (or a
+// Sort->GatherMerge composition when merged is true). Returns the
+// rendered rows.
+func runTransportSplit(t *testing.T, ctx *Context, sql string, workers int, merged bool, sortedFinal bool) []string {
+	t.Helper()
+	node := planForTest(t, ctx, sql)
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatalf("plan for %q has no aggregate to clone", sql)
+	}
+	if spec.Mode != optimizer.AggModeSimple || spec.GroupingSets != nil || len(spec.Aggs) == 0 {
+		t.Fatalf("plan for %q: aggregate not a plain splittable spec", sql)
+	}
+
+	partial := *spec
+	partial.Mode = optimizer.AggModePartial
+	partial.PartialEmit = true
+
+	var transport optimizer.Node = &partial
+	if merged {
+		// PG's `Gather Merge -> Sort -> Partial HashAggregate`: the sort
+		// orders the partial's OUTPUT (positions 0..nGroupCols-1 are the
+		// group key values), the merge interleaves the worker streams.
+		var keys []optimizer.SortKey
+		for i, ge := range spec.GroupExprs {
+			typ := catalog.Type{Name: "int4"}
+			if cr, ok := ge.(*optimizer.ColumnRef); ok && cr.Type.Name != "" {
+				typ = cr.Type
+			}
+			keys = append(keys, optimizer.SortKey{
+				Expr: &optimizer.ColumnRef{Index: i, Name: "gk", Type: typ},
+			})
+		}
+		sorted := &optimizer.Sort{Child: transport, Keys: keys}
+		transport = optimizer.NewGatherMerge(0, sorted, workers, keys)
+	} else {
+		transport = optimizer.NewGather(0, &partial, workers)
+	}
+
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.PartialSource = nil
+	if sortedFinal {
+		// M0146-0003 S5: `Finalize GroupAggregate` — the finalize
+		// consumes the merge-ordered state stream one live group at a
+		// time rather than absorbing every row into a group map.
+		final.Strategy = optimizer.AggStrategySorted
+	}
+	final.Child = transport
+
+	advanceStmtCounter(ctx)
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+	op, err := Build(&final)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, renderRows([]Row{slot.Row()})...)
+	}
+	if err := op.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return out
+}
+
+func checkTransportIdentity(t *testing.T, ctx *Context, sql string, merged bool, sortedFinal bool) {
+	t.Helper()
+	serialRows, err := runQueryWithErr(ctx, sql)
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	want := renderRows(serialRows)
+	sortStrings := func(s []string) {
+		for i := 1; i < len(s); i++ {
+			for j := i; j > 0 && s[j] < s[j-1]; j-- {
+				s[j], s[j-1] = s[j-1], s[j]
+			}
+		}
+	}
+	for _, workers := range []int{1, 2, 4} {
+		got := runTransportSplit(t, ctx, sql, workers, merged, sortedFinal)
+		if len(got) != len(want) {
+			t.Fatalf("merged=%v workers=%d: got %d rows, want %d\n got=%v\nwant=%v",
+				merged, workers, len(got), len(want), got, want)
+		}
+		if !merged {
+			// A plain Gather delivers rows in worker-completion order;
+			// compare as a multiset. The GatherMerge case is positionally
+			// ordered by construction.
+			sortStrings(got)
+			sortStrings(want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("merged=%v workers=%d: row %d differs:\n got %q\nwant %q",
+					merged, workers, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestPartialEmitIdentity is the gate for the transport pair, over both
+// Gather and Sort->GatherMerge shapes, at 1/2/4 workers.
+func TestPartialEmitIdentity(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name   string
+		sql    string
+		merged bool
+	}{
+		// Ungrouped — every worker emits exactly one state row; the
+		// finalize folds N partial states into the pre-seeded group.
+		{"ungrouped", "SELECT count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg", false},
+		// Grouped over plain Gather.
+		{"grouped-gather", "SELECT grp, count(*), sum(v) FROM pq_agg GROUP BY grp ORDER BY grp", false},
+		{"grouped-gather-aggmix", "SELECT grp, avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", false},
+		// Float lane — floatSpecial and hasValue must round-trip.
+		{"grouped-float", "SELECT grp, sum(f), avg(f) FROM pq_agg GROUP BY grp ORDER BY grp", false},
+		// Groups absent from some workers (the filter takes whole grp
+		// values below most workers' share) — a worker's empty partial
+		// must not poison the combine.
+		{"grouped-sparse", "SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp", false},
+		// The PG stack: Sort under Gather Merge.
+		{"grouped-gathermerge", "SELECT grp, count(*), sum(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"grouped-gathermerge-aggmix", "SELECT grp, avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"grouped-gathermerge-float", "SELECT grp, sum(f), avg(f) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkTransportIdentity(t, ctx, tc.sql, tc.merged, false)
+		})
+	}
+}
+
+// TestAggRuntimeSerialization round-trips every family the decomposable
+// whitelist admits, including the pointer fields the flat scalars can't
+// express — int/numeric exact-variance sums, numericSum, Datum values,
+// NaN/Inf float specials. A field silently dropped here is a wrong final
+// answer on real data.
+func TestAggRuntimeSerialization(t *testing.T) {
+	mkDatum := func() Datum { return NewIntDatum(42) }
+	cases := []struct {
+		label string
+		name  string
+		st    aggRuntime
+	}{
+		{"count", "count", aggRuntime{count: 991}},
+		{"sum", "sum", aggRuntime{hasValue: true, sum: -7, count: 3, floatSpecial: floatSpecialPosInf}},
+		{"sum-numeric", "sum", aggRuntime{hasValue: true, count: 2,
+			numericSum: Datum{Kind: KindNumeric, Int: 12345, Scale: 2}}},
+		{"avg-floatnan", "avg", aggRuntime{hasValue: true, count: 5, floatSpecial: floatSpecialNaN}},
+		{"min", "min", aggRuntime{hasValue: true, value: mkDatum()}},
+		{"max-empty", "max", aggRuntime{}},
+		{"bool_and", "bool_and", aggRuntime{hasValue: true, boolResult: true}},
+		{"bool_or", "bool_or", aggRuntime{hasValue: true}},
+		{"bit_and", "bit_and", aggRuntime{hasValue: true, intResult: -255, strResult: "32"}},
+		{"any_value", "any_value", aggRuntime{hasValue: true, value: NewStringDatum("picked")}},
+		{"var_samp-int", "var_samp", func() aggRuntime {
+			st := aggRuntime{hasValue: true, intExact: true, count: 4}
+			st.intSx = big.NewInt(300)
+			st.intSxx = big.NewInt(25000)
+			return st
+		}()},
+		{"var_pop-numeric", "var_pop", func() aggRuntime {
+			st := aggRuntime{hasValue: true, numericExact: true, count: 2}
+			st.numericSx = big.NewRat(7, 2)
+			st.numericSxx = big.NewRat(99, 8)
+			return st
+		}()},
+		{"stddev-float", "stddev", aggRuntime{hasValue: true, count: 9,
+			floatSx: 12.5, floatM2: math.Float64frombits(math.Float64bits(3.25))}},
+		{"stddev-nan", "stddev", aggRuntime{hasValue: true, count: 1, floatSx: 1, floatM2: math.NaN()}},
+		{"regr_slope", "regr_slope", aggRuntime{regrN: 7, regrSumX: 2.5, regrSumY: -3.5,
+			regrSumXX: 9.25, regrSumXY: -8.125, regrSumYY: 17.75}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			d, err := serializeAggRuntime(tc.name, &tc.st)
+			if err != nil {
+				t.Fatalf("serialize: %v", err)
+			}
+			if d.Kind != KindBytes {
+				t.Fatalf("state column kind %v, want KindBytes", d.Kind)
+			}
+			got, err := deserializeAggRuntime(tc.name, d.BytesValue())
+			if err != nil {
+				t.Fatalf("deserialize: %v", err)
+			}
+			if !aggRuntimeStateEqual(tc.name, tc.st, got) {
+				t.Fatalf("round trip dropped a field:\n in=%+v\nout=%+v", tc.st, got)
+			}
+		})
+	}
+}
+
+// aggRuntimeStateEqual compares the serialisable surface field-by-field
+// for the named family.
+func aggRuntimeStateEqual(name string, a, b aggRuntime) bool {
+	switch name {
+	case "count":
+		return a.count == b.count
+	case "sum", "avg":
+		return a.hasValue == b.hasValue && a.sum == b.sum && a.count == b.count &&
+			a.floatSpecial == b.floatSpecial &&
+			a.numericSum.Kind == b.numericSum.Kind && a.numericSum.Int == b.numericSum.Int &&
+			a.numericSum.Scale == b.numericSum.Scale
+	case "min", "max", "any_value":
+		return a.hasValue == b.hasValue &&
+			a.value.Kind == b.value.Kind && a.value.Int == b.value.Int &&
+			string(a.value.Buf) == string(b.value.Buf)
+	case "bool_and", "every", "bool_or":
+		return a.hasValue == b.hasValue && a.boolResult == b.boolResult
+	case "bit_and", "bit_or", "bit_xor":
+		return a.hasValue == b.hasValue && a.intResult == b.intResult && a.strResult == b.strResult
+	case "var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev":
+		if a.hasValue != b.hasValue || a.intExact != b.intExact || a.numericExact != b.numericExact ||
+			a.count != b.count || a.floatSx != b.floatSx {
+			return false
+		}
+		if !(math.IsNaN(a.floatM2) && math.IsNaN(b.floatM2)) && a.floatM2 != b.floatM2 {
+			return false
+		}
+		bigEq := func(x, y *big.Int) bool {
+			if x == nil || y == nil {
+				return x == y
+			}
+			return x.Cmp(y) == 0
+		}
+		ratEq := func(x, y *big.Rat) bool {
+			if x == nil || y == nil {
+				return x == y
+			}
+			return x.Cmp(y) == 0
+		}
+		return bigEq(a.intSx, b.intSx) && bigEq(a.intSxx, b.intSxx) &&
+			ratEq(a.numericSx, b.numericSx) && ratEq(a.numericSxx, b.numericSxx)
+	default: // regr family
+		return a.regrN == b.regrN && a.regrSumX == b.regrSumX && a.regrSumY == b.regrSumY &&
+			a.regrSumXX == b.regrSumXX && a.regrSumXY == b.regrSumXY && a.regrSumYY == b.regrSumYY
+	}
+}
+
+// TestAggRuntimeSerializationRefusals pins the fail-closed edges: a
+// state outside the whitelist's surface errors rather than silently
+// dropping fields, a non-whitelist name has no rule, and a truncated or
+// padded frame is a corruption error, not a partial decode.
+func TestAggRuntimeSerializationRefusals(t *testing.T) {
+	if _, err := serializeAggRuntime("array_agg", &aggRuntime{}); err == nil {
+		t.Error("array_agg serialised — the whitelist and the codec disagree")
+	}
+	if _, err := serializeAggRuntime("count", &aggRuntime{distinct: map[string]struct{}{"x": {}}}); err == nil {
+		t.Error("a DISTINCT-carrying state serialised — the field belt is open")
+	}
+	if _, err := serializeAggRuntime("sum", &aggRuntime{strAccum: []byte("ab")}); err == nil {
+		t.Error("a string_agg accumulator serialised through the sum arm")
+	}
+	if _, err := deserializeAggRuntime("array_agg", []byte{1}); err == nil {
+		t.Error("array_agg deserialised")
+	}
+	if _, err := deserializeAggRuntime("count", []byte{1, 2}); err == nil {
+		t.Error("a truncated count frame decoded")
+	}
+	full, err := serializeAggRuntime("count", &aggRuntime{count: 1})
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	padded := append(full.BytesValue(), 0xAA)
+	if _, err := deserializeAggRuntime("count", padded); err == nil {
+		t.Error("a padded count frame decoded — trailing bytes must error")
+	}
+}
+
+// TestPartialEmitPairingErrors: a transport pair is only honest when
+// BOTH ends carry the flag. A non-emitting partial under a transport
+// finalize delivers zero state rows, and a transport partial under an
+// accumulator finalize leaves the accumulator unregistered — both must
+// error rather than answer with what arrived.
+func TestPartialEmitPairingErrors(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	// Transport finalize over a NON-emitting partial: the partial
+	// refuses first (no accumulator registered), which is the loud
+	// failure — pinned so a quiet empty result can never stand in.
+	node := planForTest(t, ctx, "SELECT grp, count(*) FROM pq_agg GROUP BY grp")
+	spec := findGroupAgg(node)
+	partial := *spec
+	partial.Mode = optimizer.AggModePartial // no PartialEmit
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.PartialSource = nil
+	final.Child = optimizer.NewGather(0, &partial, 1)
+
+	advanceStmtCounter(ctx)
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+	op, err := Build(&final)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	err = op.Open(ctx)
+	if err == nil {
+		// Open may succeed while the error arrives on first Next — drain.
+		_, err = op.Next()
+	}
+	if err == nil {
+		t.Fatal("mismatched pair produced no error")
+	}
+	if !strings.Contains(err.Error(), "partial aggregate") &&
+		!strings.Contains(err.Error(), "partial-state") {
+		t.Fatalf("mismatched pair errored, but not the pairing failure: %v", err)
+	}
+	_ = op.Close()
+}
+
+// TestPartialEmitSortedIdentity pins the GatherMerge-fed Finalize-Sorted
+// arm (M0146-0003 S5): Strategy=AggStrategySorted on the transport
+// finalize, which folds same-key state rows into ONE live group instead
+// of absorbing every row into a group map — PG's `Finalize
+// GroupAggregate -> Gather Merge -> Sort -> Partial HashAggregate`.
+// The merged splice supplies the order contract; the comparison is
+// positional (sorted output, not a multiset) because ORDER BY grp's
+// serial result defines the merge order.
+func TestPartialEmitSortedIdentity(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	for _, tc := range []struct {
+		name   string
+		sql    string
+		merged bool
+	}{
+		// Ungrouped — no merge needed: every transported row carries the
+		// same (empty) key, so the fold is a single group over a plain
+		// Gather.
+		{"ungrouped", "SELECT count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg", false},
+		// The PG stack: Finalize GroupAggregate over Gather Merge.
+		{"sorted-gathermerge", "SELECT grp, count(*), sum(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"sorted-gathermerge-aggmix", "SELECT grp, avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		{"sorted-gathermerge-float", "SELECT grp, sum(f), avg(f) FROM pq_agg GROUP BY grp ORDER BY grp", true},
+		// Groups absent from some workers: an empty worker contributes no
+		// state row, so its key's run is simply shorter.
+		{"sorted-gathermerge-sparse", "SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp", true},
+		// Two-column key — the merge order and the boundary test both
+		// walk every key column.
+		{"sorted-gathermerge-twokey", "SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s", true},
+		// M0146-0016: a non-column group key — the merge key is the
+		// transport position, not a named column.
+		{"sorted-gathermerge-exprkey", "SELECT substr(s,1,1), count(*) FROM pq_agg GROUP BY substr(s,1,1) ORDER BY 1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkTransportIdentity(t, ctx, tc.sql, tc.merged, true)
+		})
+	}
+}
+
+// TestPartialEmitSortedRejectsUnsorted pins the order belt: a sorted
+// row-transport finalize fed a stream whose keys descend must error,
+// never emit a group twice. Without the belt a key recurring after a
+// higher key produces two output rows for one group — a silently wrong
+// result.
+func TestPartialEmitSortedRejectsUnsorted(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	node := planForTest(t, ctx, "SELECT grp, count(*) FROM pq_agg GROUP BY grp")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+
+	mk := func(grp, cnt int64) Row {
+		d, err := serializeAggRuntime("count", &aggRuntime{count: cnt})
+		if err != nil {
+			t.Fatalf("serialize: %v", err)
+		}
+		return Row{NewIntDatum(grp), d}
+	}
+
+	// Ascending then descending: the 2->1 boundary must trip the belt.
+	op := &aggregateOp{plan: &final, child: &rowsOp{rows: []Row{mk(1, 3), mk(2, 5), mk(1, 7)}}, schema: final.Output()}
+	err := op.Open(ctx)
+	if err == nil {
+		t.Fatal("unsorted partial-state stream produced no error")
+	}
+	if !strings.Contains(err.Error(), "not ordered by group key") {
+		t.Fatalf("unsorted stream errored, but not the order belt: %v", err)
+	}
+	_ = op.Close()
+
+	// And the sanity arm: the same stream WITHOUT the out-of-order tail
+	// is accepted and produces one row per key run.
+	op2 := &aggregateOp{plan: &final, child: &rowsOp{rows: []Row{mk(1, 3), mk(2, 5)}}, schema: final.Output()}
+	if err := op2.Open(ctx); err != nil {
+		t.Fatalf("sorted stream rejected: %v", err)
+	}
+	var n int
+	for {
+		_, err := op2.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("sorted stream emitted %d rows, want 2", n)
+	}
+	_ = op2.Close()
+}
+
+// sortedTransportFinalSpec clones the pq_agg GROUP BY spec into a
+// sorted transport Finalize carrying the given group clause — the same
+// shape the M0146-0003 S6 producer stamps.
+func sortedTransportFinalSpec(t *testing.T, ctx *Context, clause []optimizer.GroupClauseKey) *optimizer.Aggregate {
+	t.Helper()
+	node := planForTest(t, ctx, "SELECT grp, count(*) FROM pq_agg GROUP BY grp")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+	final.GroupClause = clause
+	return &final
+}
+
+func mkStateRow(t *testing.T, grp Datum, cnt int64) Row {
+	t.Helper()
+	d, err := serializeAggRuntime("count", &aggRuntime{count: cnt})
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	return Row{grp, d}
+}
+
+// TestPartialEmitSortedHonoursClauseOrder pins the belt against the
+// declared merge order rather than a fixed ascending comparator: under
+// GROUP BY ... DESC an ascending stream is the disorder, and under
+// NULLS FIRST the null group must lead. A belt that ignored the clause
+// (a bare compareDatum has no NULL arm at all) would misorder or crash
+// on exactly the cases PG's Gather Merge contract makes routine.
+func TestPartialEmitSortedHonoursClauseOrder(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	nullDatum := Datum{Kind: KindNull}
+	one := NewIntDatum(1)
+	two := NewIntDatum(2)
+
+	type arm struct {
+		name    string
+		clause  []optimizer.GroupClauseKey
+		rows    []Row
+		wantErr bool
+	}
+	run := func(a arm) {
+		final := sortedTransportFinalSpec(t, ctx, a.clause)
+		op := &aggregateOp{plan: final, child: &rowsOp{rows: a.rows}, schema: final.Output()}
+		err := op.Open(ctx)
+		if a.wantErr {
+			if err == nil {
+				t.Fatalf("%s: disordered stream produced no error", a.name)
+			}
+			if !strings.Contains(err.Error(), "not ordered by group key") {
+				t.Fatalf("%s: errored, but not the order belt: %v", a.name, err)
+			}
+			_ = op.Close()
+			return
+		}
+		if err != nil {
+			t.Fatalf("%s: ordered stream rejected: %v", a.name, err)
+		}
+		_ = op.Close()
+	}
+
+	// DESC: a descending stream is the contract; ascending must trip.
+	run(arm{"desc-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0, Desc: true}},
+		[]Row{mkStateRow(t, two, 5), mkStateRow(t, one, 3)}, false})
+	run(arm{"desc-rejects-ascending",
+		[]optimizer.GroupClauseKey{{Pos: 0, Desc: true}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, two, 5)}, true})
+
+	// NULLS LAST (the ASC default): the null group rides at the end.
+	run(arm{"nulls-last-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, two, 5), mkStateRow(t, nullDatum, 7)}, false})
+	run(arm{"nulls-last-rejects-leading-null",
+		[]optimizer.GroupClauseKey{{Pos: 0}},
+		[]Row{mkStateRow(t, nullDatum, 7), mkStateRow(t, one, 3)}, true})
+
+	// NULLS FIRST: the null group must lead.
+	run(arm{"nulls-first-ordered",
+		[]optimizer.GroupClauseKey{{Pos: 0, NullsFirst: true}},
+		[]Row{mkStateRow(t, nullDatum, 7), mkStateRow(t, one, 3)}, false})
+	run(arm{"nulls-first-rejects-trailing-null",
+		[]optimizer.GroupClauseKey{{Pos: 0, NullsFirst: true}},
+		[]Row{mkStateRow(t, one, 3), mkStateRow(t, nullDatum, 7)}, true})
+
+	// Consecutive NULL keys fold into one group, not one row each.
+	final := sortedTransportFinalSpec(t, ctx, []optimizer.GroupClauseKey{{Pos: 0}})
+	op := &aggregateOp{plan: final, schema: final.Output(),
+		child: &rowsOp{rows: []Row{
+			mkStateRow(t, nullDatum, 2),
+			mkStateRow(t, nullDatum, 3),
+		}}}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, renderRows([]Row{slot.Row()})...)
+	}
+	if len(out) != 1 || !strings.Contains(out[0], "5") {
+		t.Fatalf("two null-key state rows emitted %v, want one folded group with count 5", out)
+	}
+	_ = op.Close()
+}
+
+// runTransportSplitSortedInput plans sql and runs the M0146-0027
+// slice-3 shape end to end — `Finalize Aggregate(Sorted) -> Gather
+// Merge -> Partial Aggregate(Sorted, PartialEmit) -> Sort(input
+// keys)` — PG's `Finalize GroupAggregate -> Gather Merge -> Partial
+// GroupAggregate -> Sort`, where the per-worker Sort orders the
+// aggregate's INPUT rows (upstream's `make_ordered_path` arm of
+// create_partial_grouping_paths, planner.c:7518-7560). Distinct from
+// the presorted sibling this file's runTransportSplit builds: there the
+// Sort sits ABOVE the partial and orders the emitted state rows; here
+// the partial itself streams a sorted partition and emits each group's
+// state row as the key boundary passes.
+func runTransportSplitSortedInput(t *testing.T, ctx *Context, sql string, workers int) []string {
+	t.Helper()
+	node := planForTest(t, ctx, sql)
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatalf("plan for %q has no aggregate to clone", sql)
+	}
+	if spec.Mode != optimizer.AggModeSimple || spec.GroupingSets != nil || len(spec.Aggs) == 0 {
+		t.Fatalf("plan for %q: aggregate not a plain splittable spec", sql)
+	}
+
+	// Worker sort: the INPUT-space group exprs evaluated against the
+	// input rows — `groupKeysSortKeys`, not transport positions.
+	var inKeys []optimizer.SortKey
+	for _, ge := range spec.GroupExprs {
+		inKeys = append(inKeys, optimizer.SortKey{Expr: ge})
+	}
+	inputSort := &optimizer.Sort{Child: spec.Child, Keys: inKeys}
+
+	partial := *spec
+	partial.Mode = optimizer.AggModePartial
+	partial.PartialEmit = true
+	partial.Strategy = optimizer.AggStrategySorted
+	partial.Child = inputSort
+
+	// Merge keys name the transport positions: the partial emits
+	// [group values | passthrough | serialized state] in group-key
+	// order — that ordering IS the merge order.
+	var mergeKeys []optimizer.SortKey
+	for i, ge := range spec.GroupExprs {
+		typ := catalog.Type{Name: "int4"}
+		if cr, ok := ge.(*optimizer.ColumnRef); ok && cr.Type.Name != "" {
+			typ = cr.Type
+		}
+		mergeKeys = append(mergeKeys, optimizer.SortKey{
+			Expr: &optimizer.ColumnRef{Index: i, Name: "gk", Type: typ},
+		})
+	}
+	transport := optimizer.NewGatherMerge(0, &partial, workers, mergeKeys)
+
+	final := *spec
+	final.Mode = optimizer.AggModeFinal
+	final.PartialEmit = true
+	final.Strategy = optimizer.AggStrategySorted
+	final.PartialSource = nil
+	final.Child = transport
+
+	advanceStmtCounter(ctx)
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+	op, err := Build(&final)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		out = append(out, renderRows([]Row{slot.Row()})...)
+	}
+	if err := op.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return out
+}
+
+// TestPartialEmitSortedInputIdentity pins the sorted-input transport
+// end to end — the executor's openSortedPartialEmit over a real
+// GatherMerge, at 1/2/4 workers, compared positionally against serial
+// execution. The failure it exists to catch is the same one every
+// transport test in this file names: an N-times overcount when a
+// worker aggregates rows outside its partition, or a group emitted
+// twice when the boundary detection misreads a sorted stream.
+func TestPartialEmitSortedInputIdentity(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+
+	serialRows, err := runQueryWithErr(ctx,
+		"SELECT grp, count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	want := renderRows(serialRows)
+	aggMixRows, err := runQueryWithErr(ctx,
+		"SELECT grp, avg(f), count(f) FROM pq_agg GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial aggmix: %v", err)
+	}
+	wantMix := renderRows(aggMixRows)
+	twoKeyRows, err := runQueryWithErr(ctx,
+		"SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s")
+	if err != nil {
+		t.Fatalf("serial twokey: %v", err)
+	}
+	wantTwoKey := renderRows(twoKeyRows)
+	sparseRows, err := runQueryWithErr(ctx,
+		"SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("serial sparse: %v", err)
+	}
+	wantSparse := renderRows(sparseRows)
+
+	for _, workers := range []int{1, 2, 4} {
+		for _, tc := range []struct {
+			name string
+			sql  string
+			want []string
+		}{
+			{"grouped", "SELECT grp, count(*), sum(v), avg(v), min(v), max(v) FROM pq_agg GROUP BY grp ORDER BY grp", want},
+			{"aggmix-float", "SELECT grp, avg(f), count(f) FROM pq_agg GROUP BY grp ORDER BY grp", wantMix},
+			// Two-column key: the boundary test and the merge order both
+			// walk every key column.
+			{"twokey", "SELECT grp, s, count(*) FROM pq_agg GROUP BY grp, s ORDER BY grp, s", wantTwoKey},
+			// Groups absent from some workers: an empty worker's stream
+			// simply contributes no state row for the key.
+			{"sparse", "SELECT grp, count(*) FROM pq_agg WHERE id < 20 GROUP BY grp ORDER BY grp", wantSparse},
+		} {
+			got := runTransportSplitSortedInput(t, ctx, tc.sql, workers)
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s workers=%d: got %d rows, want %d\n got=%v\nwant=%v",
+					tc.name, workers, len(got), len(tc.want), got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("%s workers=%d: row %d differs:\n got %q\nwant %q",
+						tc.name, workers, i, got[i], tc.want[i])
+				}
+			}
+		}
+	}
+}

@@ -96,6 +96,11 @@ func createSeqScanPlan(p *Path) Node {
 		// every clause of the search was resolved against these coordinates
 		// (createplanindex.go's file header, loss #1).
 		schema:                id.schema,
+		// The leaf's statement-unique range-table identity, as the index
+		// and bitmap arms carry it (createplanindex.go). Without it EXPLAIN
+		// cannot name this scan's columns and falls back to another level's
+		// relation (M0146-0005t).
+		RTID:                  id.rtid,
 		EstRelRows:            id.estRelRows,
 		SmallDim:              id.smallDim,
 		UniqueKeys:            id.uniqueKeys,
@@ -198,8 +203,16 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	if p.ParallelWorkers <= 0 {
 		panic(fmt.Sprintf("createPlan: PathFinalizeAgg planning %d workers", p.ParallelWorkers))
 	}
-	// Finalize -> Gather -> Partial -> input.
-	if len(p.Children) != 1 || p.Children[0] == nil || p.Children[0].Kind != PathGather {
+	// Finalize -> Gather -> Partial -> input, or (M0146-0003 S6) the
+	// presorted split Finalize -> GatherMerge -> Sort -> Partial ->
+	// input. The child path kind names which.
+	if len(p.Children) != 1 || p.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg without a boundary child")
+	}
+	if p.Children[0].Kind == PathGatherMerge {
+		return createFinalizeAggSortedPlan(p)
+	}
+	if p.Children[0].Kind != PathGather {
 		panic("createPlan: PathFinalizeAgg without a PathGather child")
 	}
 	gather := p.Children[0]
@@ -238,6 +251,94 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	return built, layout
 }
 
+// createFinalizeAggSortedPlan is the PathFinalizeAgg arm for the
+// M0146-0003 S6 presorted split: `Finalize GroupAggregate ->
+// GatherMerge -> Sort -> Partial HashAggregate`. Like the hashed arm
+// above it does NOT recurse through its own boundary/sort/partial
+// children — the Partial node's `PartialEmit` flag and the Finalize's
+// `PartialSource` pairing are one construction, so the arm walks to the
+// bottom of the chain, builds the ONE input subtree, and hands the
+// shape to `splitAggregateTransportSorted` (parallel.go).
+//
+// M0146-0027 slice 3 adds the sibling sorted-INPUT shape — `Finalize
+// GroupAggregate -> GatherMerge -> Partial GroupAggregate -> Sort ->
+// input`, upstream's `create_agg_path(… AGG_SORTED,
+// AGGSPLIT_INITIAL_SERIAL …)` arm (planner.c:7518-7560) — dispatched on
+// the GatherMerge child's kind: a PathSort child is the presorted arm,
+// a PathAgg child is the sorted-input arm (its own child is the
+// worker-side Sort). The builders differ only in where the Sort node
+// and the strategy marking sit; both feed the same merge keys and the
+// same `openSortedPartialTransport` finalize.
+//
+// Every refusal is a panic, per createplan.go's contract: a path
+// reaching here in one of these shapes is a producer bug.
+func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
+	gm := p.Children[0]
+	if len(gm.Children) != 1 || gm.Children[0] == nil {
+		panic("createPlan: PathFinalizeAgg's GatherMerge without a child")
+	}
+	sub := gm.Children[0]
+
+	var input *Path
+	sortedInput := sub.Kind == PathAgg
+	switch {
+	case sub.Kind == PathSort:
+		// Presorted arm: Finalize -> GatherMerge -> Sort -> Partial -> input.
+		srt := sub
+		if len(srt.Children) != 1 || srt.Children[0] == nil || srt.Children[0].Kind != PathAgg {
+			panic("createPlan: PathFinalizeAgg's worker Sort without a partial PathAgg child")
+		}
+		partial := srt.Children[0]
+		if len(partial.Children) != 1 || partial.Children[0] == nil {
+			panic("createPlan: PathFinalizeAgg's partial aggregate without an input")
+		}
+		input = partial.Children[0]
+	case sortedInput:
+		// Sorted-input arm: Finalize -> GatherMerge -> Partial -> Sort -> input.
+		partial := sub
+		if len(partial.Children) != 1 || partial.Children[0] == nil || partial.Children[0].Kind != PathSort {
+			panic("createPlan: PathFinalizeAgg's sorted partial without a PathSort input")
+		}
+		srt := partial.Children[0]
+		if len(srt.Children) != 1 || srt.Children[0] == nil {
+			panic("createPlan: PathFinalizeAgg's sorted-partial Sort without an input")
+		}
+		input = srt.Children[0]
+	default:
+		panic("createPlan: PathFinalizeAgg's GatherMerge over neither Sort nor sorted partial")
+	}
+
+	child, layout := createPlanNode(input)
+	if child == nil {
+		panic("createPlan: PathFinalizeAgg over a child path that built no node")
+	}
+	simple := *p.Agg
+	simple.Child = child
+	keys, ok := transportGroupSortKeys(&simple)
+	if !ok {
+		panic("createPlan: PathFinalizeAgg's sorted arm over a group key no merge key can name")
+	}
+	var built *Aggregate
+	if sortedInput {
+		built = splitAggregateTransportSortedInput(&simple, p.ParallelWorkers, keys, groupKeysSortKeys(&simple))
+	} else {
+		built = splitAggregateTransportSorted(&simple, p.ParallelWorkers, keys)
+	}
+	if built.PartialSource == nil || drivingScan(built.PartialSource.Child) == nil {
+		panic("createPlan: PathFinalizeAgg over a subtree with no driving scan; every worker would read the whole relation")
+	}
+	// M0141-S2b-16, same rule as the hashed arm: the prebuilt serial
+	// subtree's driving scan still carries serial rows; give it the
+	// per-worker figure with the divisor the merge boundary was priced
+	// with. `sub` is the merge's own child path in both shapes — its
+	// Rows are the per-worker partial output, so gatherPathDivisor
+	// recovers exactly the divisor the crossing count was priced with.
+	if built.PartialSource.Child != child {
+		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gm, sub))
+	}
+	return built, layout
+}
+
 // createDistinctPlan is the PathDistinct arm (C-16): emit the path's
 // DISTINCT spec over the built input — `*Distinct` (hash dedup), or
 // `DistinctOn` with all-output-columns keys when the path is Unique
@@ -263,26 +364,54 @@ func createDistinctPlan(p *Path) (Node, outputLayout) {
 		panic("createPlan: PathDistinct over a child path that built no node")
 	}
 	if p.Unique {
-		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema}, nil
+		return &DistinctOn{pos: p.Distinct.pos, Child: child, KeyCols: distinctAllKeyCols(child), schema: p.Distinct.schema,
+			// M0146-0027 slice 2: the per-worker dedup marker — true only
+			// on the `Unique -> Gather Merge -> Unique` shape's inner node,
+			// where a leader-side Unique re-dedups the merge. The parallel
+			// walks descend only a marked node (plan.go PartialUnique).
+			PartialUnique: p.Distinct.PartialUnique}, nil
 	}
 	return &Distinct{pos: p.Distinct.pos, Child: child, schema: p.Distinct.schema, SortKeys: p.Distinct.SortKeys}, nil
 }
 
 // createUniquePlan is the PathUnique arm (M0142-0008c-1): emit a
 // `*DistinctOn` keyed by `p.UniqueKeyCols` over the built child — always
-// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice),
-// because `createUniquePath` never builds the HASHED candidate (see its own
-// doc comment for why). The child is `p.Children[0]`, the Sort
-// `createUniquePath` stacked over the SEMI RHS's cheapest-total path.
+// `DistinctOn`, never `*Distinct` (unlike PathDistinct's two-shape choice):
+// the dedup keys are a subset of the row. The child is `p.Children[0]` —
+// the Sort `createUniquePath` stacked over the SEMI RHS's cheapest-total
+// path, or for UNIQUE_PATH_HASH (`p.UniqueHashed`) the unsorted subpath
+// itself, deduplicated by a hashed DistinctOn (M0146-0005dk).
 func createUniquePlan(p *Path) (Node, outputLayout) {
 	if len(p.Children) != 1 {
 		panic(fmt.Sprintf("createPlan: PathUnique with %d children, want exactly 1", len(p.Children)))
 	}
-	child, _ := createPlanNode(p.Children[0])
+	child, lay := createPlanNode(p.Children[0])
 	if child == nil {
 		panic("createPlan: PathUnique over a child path that built no node")
 	}
-	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: p.UniqueKeyCols, schema: child.Output()}, nil
+	// The dedup keeps whole child rows, so it publishes the child's columns
+	// in the child's coordinates: a join above re-bases its quals through
+	// this layout (M0146-0005dk — a base-relation RHS has one, where the
+	// prebuilt subquery leaf had none to pass on).
+	keyCols := p.UniqueKeyCols
+	if len(p.UniqueExprs) > 0 {
+		// Problem-space uniq exprs (a pulled base-relation RHS): their
+		// positions are wherever the built child placed those columns.
+		if lay == nil {
+			panic("createPlan: PathUnique with problem-space uniq exprs over a child with no layout")
+		}
+		idx := lay.bindingIndex()
+		keyCols = make([]int, len(p.UniqueExprs))
+		for i, e := range p.UniqueExprs {
+			cr, ok := e.(*ColumnRef)
+			pos, found := idx[cr.Index]
+			if !ok || !found {
+				panic(fmt.Sprintf("createPlan: PathUnique uniq expr %v is not among its child's output columns", e))
+			}
+			keyCols[i] = pos
+		}
+	}
+	return &DistinctOn{pos: child.Pos(), Child: child, KeyCols: keyCols, schema: child.Output(), Hashed: p.UniqueHashed}, lay
 }
 
 // createWindowPlan is the PathWindow arm (C-18): emit the path's window
@@ -333,6 +462,14 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 			// lower WindowAgg emits its input's order untouched, so a second
 			// sort would be both a wasted node and a plan PG never prints.
 			out.Presorted = true
+		} else if n := p.PresortedCount; n > 0 && n < len(keys) &&
+			pathkeysContainedIn(inputNodePathkeys(child), pathkeysForSortKeys(keys[:n])) {
+			// M0146-0005bx: addWindowPaths priced a partially presorted
+			// input as create_one_window_path's Incremental Sort. The
+			// prefix claim is re-checked against the built child, so a
+			// child that lost its order degrades to the full Sort.
+			child = &IncrementalSort{pos: child.Pos(), Child: child, Keys: keys, PresortedCount: n}
+			out.Presorted = true
 		} else {
 			child = &Sort{Child: child, Keys: keys}
 			out.Presorted = true
@@ -364,12 +501,20 @@ func createWindowPlan(p *Path) (Node, outputLayout) {
 func childDeliversSortKeys(child Node, keys []SortKey) bool {
 	switch c := child.(type) {
 	case *Sort:
-		return sortKeysEqual(c.Keys, keys)
+		if sortKeysEqual(c.Keys, keys) {
+			return true
+		}
 	case *WindowAgg:
 		// Only if the lower window is itself known-ordered on those keys.
-		return c.Presorted && sortKeysEqual(windowSortKeys(c), keys)
+		if c.Presorted && sortKeysEqual(windowSortKeys(c), keys) {
+			return true
+		}
 	}
-	return false
+	// M0146-0005ay: pathkeys_contained_in against whatever ordering the
+	// child is known to emit — a sorted GroupAggregate's group keys, a
+	// merge join's keys, an ordering carried through a Project — the test
+	// create_one_window_path applies, and the one addWindowPaths priced.
+	return pathkeysContainedIn(inputNodePathkeys(child), pathkeysForSortKeys(keys))
 }
 
 // sortKeysEqual compares two key lists by expression identity and direction.
@@ -474,7 +619,9 @@ func createSetOpPlan(p *Path) (Node, outputLayout) {
 	// Append, and the label is what the plan-parity walk reads. Only a
 	// partial PathSetOp carries it; the serial path leaves it false.
 	out.ParallelAware = p.ParallelAware
-	return &out, baseRelLayout(p.Rel, &out)
+	// M0146-0005ac: create_append_path's arm sort over the flattened chain.
+	top := orderParallelAppendArms(p, &out)
+	return top, baseRelLayout(p.Rel, top)
 }
 
 // spliceBranchEmission rebuilds `branch` with the searched emission swapped

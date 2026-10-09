@@ -71,7 +71,13 @@ func runBatchJoin(t *testing.T, plan *optimizer.Join, probeRows, buildRows []Row
 	t.Helper()
 	left := &rowsOp{rows: probeRows, schema: batchSchema("l", lw)}
 	right := &rowsOp{rows: buildRows, schema: batchSchema("r", rw)}
-	o := newJoinOp(plan, left, right)
+	var rightOp Operator = right
+	if _, ok := plan.Right.(*optimizer.Materialize); ok {
+		// buildNode's Materialize arm, mirrored for direct construction:
+		// when the plan elects the cache the inner op IS a materializeOp.
+		rightOp = newMaterializeOp(right)
+	}
+	o := newJoinOp(plan, left, rightOp)
 	ctx := &Context{WorkMem: workMem}
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("open join: %v", err)

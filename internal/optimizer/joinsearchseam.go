@@ -175,6 +175,9 @@ package optimizer
 // ran the old subset-bitmask DP instead; that enumerator is deleted, 08 §4.)
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -688,6 +691,11 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
 		conjuncts = append(conjuncts, synth...)
 	}
+	// M0146-0005de: decide the operand order PG's equivalence classes
+	// derive each inner-join equality in (before the outer ON conjuncts join
+	// the list — those are not EC clauses in PG either); applied to the
+	// searched tree below.
+	ecWant := orientECJoinClauses(conjuncts, scans, spans, cat)
 	// C-04a: an admitted outer link's `ON` conjuncts join the list only HERE,
 	// after the equivalence-class constant inference has run, so the closure
 	// never merges a nullable-side column into a preserved-side class (that
@@ -746,8 +754,12 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// are then exactly the ones the closure above could see, none of which
 		// sits on a nullable side (a WHERE conjunct reaching one was held
 		// above, and the ON conjuncts are not in the list yet).
-		derived := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
-		conjuncts = append(conjuncts, onOuter...)
+		derived, redundant := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
+		for _, c := range onOuter {
+			if !redundant[c] {
+				conjuncts = append(conjuncts, c)
+			}
+		}
 		conjuncts = append(conjuncts, derived...)
 	}
 	// M0142-0008a-3i-plumbing-c5 (design doc §36, gap 5): mirrors the
@@ -855,7 +867,14 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
-	searchConjuncts, locals := partitionConjunctsForJoinPlanning(conjuncts, spans)
+	// M0146-0012a slice A: a correlated scalar sublink whose outer
+	// references name another relation makes its clause a join clause.
+	preLowerSpanningScalarSublinks(conjuncts, spans, ctx)
+	searchConjuncts, locals := partitionConjunctsForJoinPlanningScoped(conjuncts, spans, ctx.scalarSublinkBody)
+	// M0146-0005 slice 4: PG's extract_restriction_or_clauses — redundant
+	// base restrictions derived from join OR clauses, before the leaves are
+	// sized below (orclauses.go).
+	orClauseSelDivisor := extractRestrictionOrClauses(searchConjuncts, spans, ctx.bindings[:nReal], scans[:nReal], &locals, cat)
 	// M0142-0008a-3i-plumbing-c2 (design doc §36, gaps 2-3): `leaves`/
 	// `relInfos`/the bindings handed to the search all grow from `nprefix` to
 	// `nprefix+len(semiAnti)` — one extra slot per synthetic Semi/Anti RHS
@@ -875,12 +894,48 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		leaves[i] = scans[i]
 		var local Expr
 		if preds := locals.byBinding[i]; len(preds) > 0 {
-			local = combineAnd(preds)
-			localized := make([]Expr, 0, len(preds))
-			for _, p := range preds {
-				localized = append(localized, localizeExprToLeaf(p, b))
+			// M0146-0005x — the HAVING arm of PG's subquery_push_qual
+			// (allpaths.c): restriction conjuncts on a derived-table leaf
+			// sink below the SubqueryScan label into a Filter on its
+			// aggregate, so a fully-pushed leaf renders the bare aggregate
+			// (the M0146-0005w strip then applies) instead of
+			// `Subquery Scan on <alias> + Filter` (TPC-DS Q34/Q73). Leaves
+			// under an outer link's nullable side are declined: their leaf
+			// locals can be ON-qual-derived, which upstream keeps in
+			// joininfo, never in baserestrictinfo. Whatever does not push
+			// keeps the ordinary leaf Filter — nothing is dropped.
+			if ss, isSub := scans[i].(*SubqueryScan); isSub {
+				nullable := false
+				for _, lk := range outerLinks {
+					if relsSubset(leafRangeRelSet(i, i+1), lk.nullable) {
+						nullable = true
+						break
+					}
+				}
+				if !nullable {
+					if wrapped, kept, pushed := pushQualsIntoSubqueryLeaf(ss, preds, b, cat); pushed {
+						if dpTraceEnabled() {
+							fmt.Fprintf(os.Stderr, "%s subqpush leaf=%d pushed=%d kept=%d\n", traceTag, i, len(preds)-len(kept), len(kept))
+						}
+						scans[i] = wrapped
+						leaves[i] = wrapped
+						preds = kept
+						if len(kept) == 0 {
+							delete(locals.byBinding, i)
+						} else {
+							locals.byBinding[i] = kept
+						}
+					}
+				}
 			}
-			leaves[i] = &Filter{Child: scans[i], Predicate: combineAnd(localized), LeafLocal: true}
+			if len(preds) > 0 {
+				local = combineAnd(preds)
+				localized := make([]Expr, 0, len(preds))
+				for _, p := range preds {
+					localized = append(localized, localizeExprToLeaf(p, b))
+				}
+				leaves[i] = &Filter{Child: scans[i], Predicate: combineAnd(localized), LeafLocal: true}
+			}
 		}
 		relInfos[i] = estimateBaseRelInfo(b, scans[i], local)
 		relInfos[i].bindingIdx = i
@@ -894,6 +949,22 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// "scaling a fallback invents precision" concern is enforced by the
 		// gate rather than by refusing to scale. See `applyRelSizeFallback`.
 		applyRelSizeFallback(&relInfos[i], b, scans[i], local, cat)
+		// M0146-0009e: a DERIVED leaf (CTE scan, subquery scan, set-op, …)
+		// still gets `vardata->rel = find_base_rel(varno)` upstream
+		// (selfuncs.c:5331), so a Var operand on it reads the leaf's own row
+		// estimate — the binding's synthetic catalog.Table leaves baseRows
+		// at 0 — and a lone GROUP BY / DISTINCT output column is marked
+		// isunique (:5865-5883). leafBaseScan strips a leaf-local *Filter
+		// wrapper without touching the classification.
+		if isSubplanLeaf(scans[i]) {
+			if t := EstimateRows(scans[i]); t > 0 {
+				relInfos[i].leafTuples = float64(t)
+				if r := EstimateRows(leaves[i]); r > 0 {
+					relInfos[i].leafRows = float64(r)
+				}
+			}
+			relInfos[i].uniqueOutCols = derivedLeafUniqueCols(scans[i])
+		}
 	}
 	// M0145-0005 slice 2: the pulled leaves at [nReal, nprefix) are REAL
 	// joinlist items — numbered in binding order by the pull-up — but
@@ -909,7 +980,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// a producer admitting `*CTEScan` leaves made every one of them die
 	// HERE instead, so the two sites are one invariant and are relaxed
 	// together in `seamLeafBinding` (M0145-0013): a `*CTEScan` leaf (the
-	// producer admits one only under `GOOPG_PULLUP_CTE_LEAF=on`), or a
+	// producer admits one unconditionally since M0145-0008ac), or a
 	// derived ANY body's single leaf (M0145-0008aa), binds with no catalog
 	// table and prices from its plan.
 	//
@@ -1119,6 +1190,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		scans:     leaves,
 		relInfos:  relInfos,
 		conjuncts: searchConjuncts,
+		// M0146-0005 slice 4: PG's norm_selec compensation for the join OR
+		// clauses extractRestrictionOrClauses derived restrictions from.
+		orClauseSelDivisor: orClauseSelDivisor,
 		// P0-H11: the problem carries the leaf spans THEMSELVES, not a
 		// cumulative boundary array — a synthetic leaf's out-of-band span
 		// survives the hand-off (a cumulative boundary array flattened it
@@ -1213,6 +1287,20 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("residual-hits-pad", nrels, nprefix)
 		return node, pred, false
 	}
+	// Applied to both: the searched tree's own clause copies, and the
+	// conjuncts themselves, which the restrict infos hold by pointer and
+	// later lowering re-reads (TPC-DS Q91's Join Filter). Only now, after
+	// the search, so the search saw the written orientation.
+	applyECOrientation(searched, ecWant)
+	for _, c := range conjuncts {
+		orientECExpr(c, ecWant)
+	}
+	// M0146-0042a: a non-winning candidate of this search rebuilt later
+	// (searchedBoundaryRebuild) is lowered after this point, with clause
+	// copies the line above never saw.
+	if rel := searchedRelOf(searched); rel != nil {
+		rel.ecWant = ecWant
+	}
 	return searched, residual, true
 }
 
@@ -1278,9 +1366,21 @@ func outerLinksHaveSJInfos(links []outerChainLink, list []*SpecialJoinInfo) bool
 //
 // Like the closure it extends it is deterministic in the link and conjunct
 // order it was given, so the synthesised list is reproducible run to run.
-func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []leafSpan) []Expr {
+//
+// The second result is the ON conjuncts the derivation made redundant
+// (M0146-0005dz). reconsider_outer_join_clauses removes an outer-join clause
+// once it has pushed `null = const` into the nullable side: every row pair
+// that can still meet has `pres = const` (the preserved leaf's restriction)
+// and `null = const` (the derived one), so `pres = null` holds for it
+// already. PG throws back a constant-TRUE clause with the removed clause's
+// required_relids only so the join is not seen as clauseless; here a clause
+// is reported redundant only when its link keeps another spanning conjunct,
+// which does that job. TPC-DS Q78's `ss_sold_year = ws_sold_year` is the
+// case: PG merges on item and customer alone, and the year no longer
+// multiplies into the join's selectivity.
+func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []leafSpan) ([]Expr, map[Expr]bool) {
 	if len(links) == 0 {
-		return nil
+		return nil, nil
 	}
 	constByIdent := make(map[columnIdent]Expr)
 	for _, c := range conjuncts {
@@ -1293,16 +1393,24 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []
 		}
 	}
 	if len(constByIdent) == 0 {
-		return nil
+		return nil, nil
 	}
 	var anyNullable RelSet
 	for _, lk := range links {
 		anyNullable |= lk.nullable
 	}
 	var out []Expr
+	redundant := make(map[Expr]bool)
 	seen := make(map[columnIdent]bool)
 	for _, lk := range links {
-		for _, c := range splitAnd(lk.pred) {
+		ons := splitAnd(lk.pred)
+		spanning := 0
+		for _, c := range ons {
+			if rs, ok := relidsOfExpr(c, spans); ok && relsOverlap(rs, lk.preserved) && relsOverlap(rs, lk.nullable) {
+				spanning++
+			}
+		}
+		for _, c := range ons {
 			a, b, ok := isColumnRefEquality(c) // same-type bare refs only
 			if !ok {
 				continue
@@ -1335,9 +1443,13 @@ func deriveOuterLinkConstants(links []outerChainLink, conjuncts []Expr, spans []
 			}
 			out = append(out, d)
 			seen[identOf(null)] = true
+			if spanning > 1 {
+				redundant[c] = true
+				spanning--
+			}
 		}
 	}
-	return out
+	return out, redundant
 }
 
 // outerOnQualsOK proves, per conjunct, that every admitted outer link's `ON`
@@ -2807,6 +2919,13 @@ func seamLeafRelInfo(i int, b rangeBinding, scan Node, local Expr, cat catalog.C
 		bindingIdx:   i,
 		baseRows:     baseRows,
 		filteredRows: applyLocalFilterSelectivity(baseRows, b, scan, local),
+		// M0146-0049g: a derived leaf whose body is a simple UNION ALL
+		// (a pulled ANY sublink's `(<body>) AS ANY_subquery`) keeps its
+		// appendrel mark, as estimateBaseRelInfo's catalog branch does.
+		// Without it addParameterizedAppendPaths skipped the leaf, and
+		// `x IN (SELECT … UNION ALL SELECT …)` never got the
+		// parameterised Append PG's Nested Loop Semi Join probes.
+		appendrel: b.appendrel,
 	}
 }
 

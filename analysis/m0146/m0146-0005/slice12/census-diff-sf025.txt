@@ -1,0 +1,8 @@
+31c31
+< Q31 depth=1 [join-method] under Sort: PG Nested Loop Inner | goopg Merge Join Inner
+---
+> Q31 depth=1 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+44c44
+< Q44 depth=1 [join-method] under Limit: PG Nested Loop Inner | goopg Merge Join Inner
+---
+> Q44 depth=1 [parameterisation] under Limit: PG Nested Loop Inner | goopg Nested Loop Inner

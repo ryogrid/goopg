@@ -126,20 +126,9 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			}
 			continue
 		}
-		stats, err := analyzeRelationCtx(o.ctx, tbl)
-		if err != nil {
+		if err := analyzeTableStats(o.ctx, tbl); err != nil {
 			return nil, &ExecError{Code: "XX000", Pos: o.stmt.Pos(), Message: err.Error()}
 		}
-		o.ctx.Catalog.SetTableStats(tbl, stats)
-		// M0112: persist stats to pg_statistic so they survive restart.
-		if werr := persistStatsToPGStatistic(o.ctx, tbl, stats); werr != nil {
-			// Non-fatal: stats are in memory; log and continue.
-			_ = werr
-		}
-		relStats.resetAnalyzeTriggers(tbl.OID)
-		// The shared stats entry gets the same report (pgstat_report_analyze):
-		// mod_since_analyze resets to zero.
-		relStats.reportAnalyze(tbl.OID)
 	}
 	// Inheritance-tree statistics for partitioned parents read every leaf
 	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
@@ -149,16 +138,45 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 		analyzeInheritanceWait(o.ctx, parent)
 	}
 
-	// Partitioned-parent aggregation (parity bundle F5-deferred→done-lite):
-	// roll up each partitioned parent's RowCount/Pages from its children so
-	// the planner's relsize path sees a non-stale total. Column-level stats
-	// for parents remain unset (planner falls back per column), which is
-	// strictly better than the previous no-op.
+	rollupPartitionedParentStats(o.ctx, parents)
+	return nil, EOF
+}
+
+// analyzeTableStats is analyze_rel's statistics step for one heap relation
+// (analyze.c do_analyze_rel): sample it, install the per-column statistics,
+// persist them to pg_statistic and report the analyze to the cumulative
+// statistics. ANALYZE and VACUUM (ANALYZE) both run it for every target —
+// PG's vacuum() calls analyze_rel after vacuum_rel when VACOPT_ANALYZE is
+// set (M0146-0009j).
+func analyzeTableStats(ctx *Context, tbl *catalog.Table) error {
+	stats, err := analyzeRelationCtx(ctx, tbl)
+	if err != nil {
+		return err
+	}
+	ctx.Catalog.SetTableStats(tbl, stats)
+	// M0112: persist stats to pg_statistic so they survive restart.
+	if werr := persistStatsToPGStatistic(ctx, tbl, stats); werr != nil {
+		// Non-fatal: stats are in memory; log and continue.
+		_ = werr
+	}
+	relStats.resetAnalyzeTriggers(tbl.OID)
+	// The shared stats entry gets the same report (pgstat_report_analyze):
+	// mod_since_analyze resets to zero.
+	relStats.reportAnalyze(tbl.OID)
+	return nil
+}
+
+// rollupPartitionedParentStats is the partitioned-parent aggregation
+// (parity bundle F5-deferred→done-lite): roll up each partitioned parent's
+// RowCount/Pages from its children so the planner's relsize path sees a
+// non-stale total. Column-level stats for parents remain unset (planner falls
+// back per column), which is strictly better than the previous no-op.
+func rollupPartitionedParentStats(ctx *Context, parents []*catalog.Table) {
 	for _, parent := range parents {
 		if parent == nil || parent.PartitionMethod == "" {
 			continue
 		}
-		kids := o.partitionChildren(parent)
+		kids := catalogPartitionChildren(ctx, parent)
 		if len(kids) == 0 {
 			continue
 		}
@@ -172,19 +190,22 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			pages += k.Stats.Pages
 		}
 		parent.Stats = &catalog.TableStats{RowCount: rows, Pages: pages, Analyzed: true}
-		o.ctx.Catalog.SetTableStats(parent, parent.Stats)
+		ctx.Catalog.SetTableStats(parent, parent.Stats)
 		relStats.resetAnalyzeTriggers(parent.OID)
 		relStats.reportAnalyze(parent.OID)
 	}
-	return nil, EOF
 }
 
 // partitionChildren resolves the direct leaf partitions of a partitioned
 // parent through the concrete catalog, peeling wrapper catalogs exactly like
 // expandVacuumTargets does. Returns nil when unsupported.
 func (o *analyzeOp) partitionChildren(parent *catalog.Table) []*catalog.Table {
+	return catalogPartitionChildren(o.ctx, parent)
+}
+
+func catalogPartitionChildren(ctx *Context, parent *catalog.Table) []*catalog.Table {
 	type unwrapper interface{ Unwrap() catalog.Catalog }
-	base := o.ctx.Catalog
+	base := ctx.Catalog
 	for {
 		if c, ok := base.(*catalog.InMemory); ok {
 			return c.PartitionChildren(parent.OID)
@@ -811,6 +832,28 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 	if err != nil {
 		return nil, err
 	}
+	// ownXID is the transaction whose uncommitted tuples this scan must see.
+	// The SQL ANALYZE path runs inside the session transaction, so its
+	// own-inserted rows (xmin = ctx.Tx.XID) count, as PG's ANALYZE counts
+	// tuples its own transaction inserted (HeapTupleSatisfiesMVCC's own-xmin
+	// arm); the cmin/curcid ordering still hides tuples stamped by the
+	// current command. Without this, `BEGIN; INSERT …; ANALYZE;` recorded
+	// RowCount 0 where PG records the row count — the divergence behind the
+	// executor fixture's "ANALYZE sees nothing" report (M0146-0005 task:
+	// fixture ANALYZE RowCount 0). The nested tx above exists only to mint
+	// the snapshot, so its own XID can never appear on a tuple; when no
+	// session context exists (autovacuum's AnalyzeRelationSampled and the
+	// test-only analyzeRelation wrapper, dsCtx == nil) ownXID stays the
+	// nested tx's, preserving the scan-only-committed behaviour PG's
+	// autovacuum worker exhibits in its own transaction.
+	// IsXIDActive mirrors PG's TransactionIdIsCurrentTransactionId: the
+	// credit applies only while the session transaction is still open —
+	// a committed (fixture commit-then-analyze) or aborted caller XID
+	// must fall through to the snapshot check like any other xid.
+	ownXID := tx.XID
+	if dsCtx != nil && mgr.IsXIDActive(dsCtx.Tx.XID) {
+		ownXID = dsCtx.Tx.XID
+	}
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
 		return nil, err
@@ -898,7 +941,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.C
 				curcid = dsCtx.CmdID
 				combo = dsCtx.comboStore()
 			}
-			if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
+			if !transam.TupleVisible(t.Header, snap, ownXID, curcid, combo, mxs) {
 				continue
 			}
 			totalBytes += int64(int(t.Header.Hoff) + len(t.Data))
@@ -1293,7 +1336,15 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 		}
 		nonNull++
 		totalPayloadWidth += int64(datumVariablePayloadWidth(d))
-		key := datumKey(d)
+		kd := d
+		if bpcharCatalogType(colType) {
+			// n_distinct/MCV bucketing on bpchar runs over the bcTruelen
+			// image — hashbpchar ignores trailing blanks, so unbounded
+			// 'x' and 'x  ' are one value. The stored datum itself keeps
+			// its padding (avg width and the MCV representative).
+			kd = trimStringDatum(kd)
+		}
+		key := datumKey(kd)
 		if b, ok := freq[key]; ok {
 			b.count++
 		} else {

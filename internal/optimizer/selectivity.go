@@ -84,11 +84,16 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
 		}
+	case *ExistsExpr:
+		return subPlanClauseSelectivity
 	case *InExpr:
-		// Only the value-list form matches the column-IN-(consts)
-		// shape selfuncs handles. The subquery form is handled by
-		// the join / subplan estimator.
-		if e.Plan != nil || len(e.List) == 0 {
+		// The subquery form is a SubPlan clause (subPlanClauseSelectivity);
+		// only the value-list form matches the column-IN-(consts) shape
+		// selfuncs handles.
+		if e.Plan != nil {
+			return subPlanClauseSelectivity
+		}
+		if len(e.List) == 0 {
 			return defaultGenericSelectivity
 		}
 		cr, ok := e.Operand.(*ColumnRef)
@@ -114,6 +119,16 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	}
 	return defaultGenericSelectivity
 }
+
+// subPlanClauseSelectivity is PG's estimate for a SubPlan clause — an
+// `x [NOT] IN (subquery)` or `[NOT] EXISTS (subquery)` that stayed a
+// SubPlan rather than becoming a semi/anti join. clause_selectivity_ext
+// (postgres/src/backend/optimizer/path/clausesel.c) has no SubPlan arm, so
+// the clause reaches its final `boolvarsel` call, whose no-statistics
+// default is 0.5 (selfuncs.c); a NOT above it gives 1 - 0.5. The value is
+// the same either way, which is why Negated is not consulted. TPC-DS Q16's
+// `NOT IN` partsupp restriction is the witness (M0146-0002h).
+const subPlanClauseSelectivity = 0.5
 
 // inListSelectivity estimates `operand <op> ANY|ALL (elements)` by
 // applying the element operator's own estimator per element and merging
@@ -203,7 +218,7 @@ func inListElementSelectivity(e *InExpr, cr *ColumnRef, elem Expr, stats *catalo
 		if sel, ok := uniqueEqSelectivity(cr, elem, child); ok {
 			return sel
 		}
-		return eqSelectivityForColumn(stats, elem, tuples)
+		return eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 	}
 	if e.NotEqualAny {
 		// OR of `<>`: one minus the equality mass per element.
@@ -352,13 +367,48 @@ func eqOpSelectivity(left, right Expr, child Node) float64 {
 		return defaultEqSelectivity
 	}
 	stats := columnStatsForChild(col.Index, child)
-	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child))
+	return eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child), col.Type.Name)
+}
+
+// isBpcharTypeName reports whether typeName is in PG's bpchar family —
+// `char`, `bpchar`, `character`. The trio is the same one the hash-key
+// admission check names (join_exec_keys.go).
+func isBpcharTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// statLiteralEqual compares a statistics-stamped value — an MCV entry,
+// rendered from the sampled datum by formatDatumDateStyle — with a query
+// literal rendered by formatExprConstant. For the bpchar family the stamped
+// form is blank-PADDED to the column width ("College             ") while
+// the literal is not ("College"), so a byte-equal probe never matches and
+// the clause falls to defaultEqSelectivity — M0146-0009a measured the
+// 28.4x under-estimate this produces on `cd_education_status = 'College'`
+// (est 9,604 vs MCV-implied ~272,000), cascading through join math to the
+// EA finding on Q7/Q27's four-rel joinrel.
+//
+// The fix applies PG's own comparison semantics rather than padding the
+// literal: bpchareq (postgres/src/backend/utils/adt/varchar.c:743) compares
+// via bpchartruelen (:675), i.e. trailing blanks are insignificant, so both
+// sides are stripped before the byte compare. That also covers the reverse
+// case (a literal carrying trailing blanks, which PG likewise ignores).
+func statLiteralEqual(stamped, literal, typeName string) bool {
+	if isBpcharTypeName(typeName) {
+		return strings.TrimRight(stamped, " ") == strings.TrimRight(literal, " ")
+	}
+	return stamped == literal
 }
 
 // eqSelectivityForColumn prices `col = const`. `tuples` is the relation's RAW
 // tuple count, needed only to resolve the relative ndistinct form; pass 0 when
-// it is unknown and the absolute form will still be used.
-func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64) float64 {
+// it is unknown and the absolute form will still be used. `typeName` is the
+// column's catalog type name — needed for the MCV probe's bpchar handling
+// (statLiteralEqual).
+func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64, typeName string) float64 {
 	literal, ok := formatExprConstant(val)
 	if !ok {
 		return defaultEqSelectivity
@@ -367,7 +417,7 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr, tuples float64
 		return defaultEqSelectivity
 	}
 	for _, mcv := range stats.MCV {
-		if mcv.Value == literal {
+		if statLiteralEqual(mcv.Value, literal, typeName) {
 			return mcv.Frequency
 		}
 	}
@@ -410,7 +460,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 		op = swapInequalityOp(op)
 	}
 	stats := columnStatsForChild(col.Index, child)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, columnRawRowsForChild(col.Index, child)); measured {
 		return sel
 	}
 	return defaultIneqSelectivity
@@ -427,7 +477,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 // ok=false when the shape carries no measurement (no statistics, a
 // short histogram, or a non-constant) and the caller keeps its own
 // default.
-func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats) (float64, bool) {
+func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats, tuples float64) (float64, bool) {
 	// M0142-0009: a column whose distinct values all fit the MCV list
 	// (analyze.c's `nmultiple == ndistinct` case, `computeColumnStats`
 	// mirrors it at operators_analyze.go:1441) legitimately stores NO
@@ -469,7 +519,7 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	if nonMCVMass < 0 {
 		nonMCVMass = 0
 	}
-	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name)
+	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name, histogramEqSel(stats, tuples))
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
 		return 0, true
@@ -480,54 +530,102 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	return sel, true
 }
 
-// histogramOpSelectivity returns the fraction of the histogram's
-// mass (treated as 1.0 across the boundaries) that satisfies op
-// for the given literal. Boundaries are sorted ascending.
-func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string) float64 {
+// histogramOpSelectivity is PG's ineq_histogram_selectivity
+// (postgres/src/backend/utils/adt/selfuncs.c) over a sorted histogram: the
+// fraction of the histogram's mass satisfying `x <op> literal`. eqSel is the
+// function's eq_selec, the selectivity of `x = literal` among the non-MCV
+// values (histogramEqSel).
+//
+// PG first estimates `x <= literal` (histfrac): the bin holding the literal
+// is found by counting the bounds that satisfy the probe (`bound < literal`
+// for `<`/`>=`, `bound <= literal` for `<=`/`>`), and the literal's place
+// inside it is interpolated. The first bin is narrower than the rest by
+// eq_selec, so it is rescaled to make `x <= first bound` come out as eq_selec;
+// `<` and `>=` then subtract eq_selec, and `>`/`>=` flip the result. Without
+// the eq_selec step goopg scored `>=` like `>` and `<=` like `<`: TPC-DS's
+// `d_year BETWEEN 1999 AND 2001` lost two eq_selec (705 rows where PG
+// estimates 1049; M0146-0005s).
+//
+// Not ported: the cutoff clamp to a hundredth of the histogram resolution
+// and get_actual_variable_range's endpoint refresh.
+func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string, eqSel float64) float64 {
 	k := len(bounds) - 1 // bucket count
 	if k < 1 {
 		return defaultIneqSelectivity
 	}
-	// Find the first boundary >= literal.
-	idx := -1
-	for i, b := range bounds {
-		if histCmp(b, literal, typeName) >= 0 {
-			idx = i
-			break
-		}
-	}
+	var isgt, iseq bool
 	switch op {
-	case parser.OpLt, parser.OpLe:
-		if idx <= 0 {
-			// literal <= bounds[0]: nothing to the left.
-			if idx == 0 && op == parser.OpLe && histCmp(bounds[0], literal, typeName) == 0 {
-				// literal == low boundary; <= keeps a sliver of
-				// the first bucket. Approximate as 1/k.
-				return 1.0 / float64(k)
-			}
-			return 0.0
-		}
-		if idx == -1 {
-			// literal greater than every boundary.
-			return 1.0
-		}
-		whole := float64(idx-1) / float64(k)
-		frac := bucketFraction(bounds[idx-1], bounds[idx], literal, typeName)
-		return whole + frac/float64(k)
-	case parser.OpGt, parser.OpGe:
-		// Symmetric: 1 - sel(<) for >=, 1 - sel(<=) for >.
-		flip := parser.OpLe
-		if op == parser.OpGe {
-			flip = parser.OpLt
-		}
-		return 1.0 - histogramOpSelectivity(flip, bounds, literal, typeName)
+	case parser.OpLt:
+	case parser.OpLe:
+		iseq = true
+	case parser.OpGt:
+		isgt = true
+	case parser.OpGe:
+		isgt, iseq = true, true
+	default:
+		return defaultIneqSelectivity
 	}
-	return defaultIneqSelectivity
+	strict := isgt == iseq // `<` and `>=` probe with `bound < literal`
+	lobound := 0
+	for _, b := range bounds {
+		c := histCmp(b, literal, typeName)
+		if c < 0 || (c == 0 && !strict) {
+			lobound++
+			continue
+		}
+		break
+	}
+	var histfrac float64
+	switch {
+	case lobound == 0:
+		histfrac = 0
+	case lobound > k:
+		histfrac = 1
+	default:
+		i := lobound
+		binfrac := bucketFraction(bounds[i-1], bounds[i], literal, typeName)
+		histfrac = (float64(i-1) + binfrac) / float64(k)
+		if i == 1 {
+			histfrac += eqSel * (1.0 - binfrac)
+		}
+		if strict {
+			histfrac -= eqSel
+		}
+		histfrac = clampSelectivity(histfrac)
+	}
+	if isgt {
+		return 1.0 - histfrac
+	}
+	return histfrac
+}
+
+// histogramEqSel is ineq_histogram_selectivity's eq_selec: every non-MCV
+// distinct value is assumed equally common, 1/(ndistinct - #MCV), and 0 when
+// that count is not above 1. `tuples` resolves a relative ndistinct; with 0
+// only the absolute form is used.
+func histogramEqSel(stats *catalog.ColumnStats, tuples float64) float64 {
+	if stats == nil {
+		return 0
+	}
+	other := stats.ResolvedNDistinct(tuples) - float64(len(stats.MCV))
+	if other > 1 {
+		return 1.0 / other
+	}
+	return 0
 }
 
 // bucketFraction returns the fraction of a single histogram
 // bucket [lo, hi] that lies below `lit`. Always in [0, 1].
 func bucketFraction(lo, hi, lit, typeName string) float64 {
+	// bpchar histogram bounds are blank-padded; the literal is not.
+	// Truelen-strip all three before scalarising so interpolation agrees
+	// with the truelen ordering histCmp just used to place the literal
+	// (bpcharcmp, varchar.c:909; M0146-0009a).
+	if isBpcharTypeName(typeName) {
+		lo = strings.TrimRight(lo, " ")
+		hi = strings.TrimRight(hi, " ")
+		lit = strings.TrimRight(lit, " ")
+	}
 	if isStringScalarType(typeName) {
 		// take2 B-08: `convert_string_to_scalar` (selfuncs.c:4787-4906).
 		// The three scalings share one adaptive range and one
@@ -587,6 +685,16 @@ func rangeOpMatches(op parser.OpCode, cmp int) bool {
 // path (same function); anything else falls back to byte-wise
 // compare.
 func histCmp(a, b, typeName string) int {
+	// bpchar ordering is truelen ordering (bpcharcmp, varchar.c:909):
+	// the stats-stamped bound is blank-padded and the literal is not,
+	// so trailing blanks must be stripped on both sides before any
+	// compare — `'College' < 'College             '` under a byte
+	// compare where PG treats them as equal. Same miss class as
+	// statLiteralEqual (M0146-0009a).
+	if isBpcharTypeName(typeName) {
+		a = strings.TrimRight(a, " ")
+		b = strings.TrimRight(b, " ")
+	}
 	if an, ok := numericValue(a, typeName); ok {
 		if bn, ok := numericValue(b, typeName); ok {
 			switch {
@@ -1057,8 +1165,13 @@ func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
 			sub := clauseSelectivityWithSource(e.Operand, child)
 			return selectivityEstimate{value: 1 - sub.value, reliable: sub.reliable}
 		}
+	case *ExistsExpr:
+		return selectivityEstimate{value: subPlanClauseSelectivity, reliable: false}
 	case *InExpr:
-		if e.Plan != nil || len(e.List) == 0 {
+		if e.Plan != nil {
+			return selectivityEstimate{value: subPlanClauseSelectivity, reliable: false}
+		}
+		if len(e.List) == 0 {
 			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
 		}
 		cr, ok := e.Operand.(*ColumnRef)
@@ -1122,7 +1235,7 @@ func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate
 	if stats == nil {
 		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
 	}
-	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child)), reliable: true}
+	return selectivityEstimate{value: eqSelectivityForColumn(stats, val, columnRawRowsForChild(col.Index, child), col.Type.Name), reliable: true}
 }
 
 // rangeOpSelectivityWithSource is the reliability-tracking twin

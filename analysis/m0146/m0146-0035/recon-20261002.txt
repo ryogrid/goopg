@@ -1,0 +1,45 @@
+M0146-0035 recon, 2026-10-02 (current HEAD; reads of :65433 limited to /proc and the private arm clone)
+
+Reproduction attempts, none lost database/role tpch:
+  1. tmp/goopg-acceptance-arm-tpch-data (today's online clone of :65433, never started) copied to
+     tmp/m0035-repro: start (crash recovery from the backup) -> tpch present; clean stop + restart ->
+     present; Q-style reads in db tpch + clean stop + restart -> present.
+  2. clone-harness.sh: fresh throwaway source (port 5535) with role+db tpch, a continuous insert
+     workload and a checkpoint every 3 s; 6 online clones via tpch_private_clone_snapshot
+     (pg_basebackup -X fetch), each started, stopped and restarted -> tpch present in all 12 starts;
+     source restart -> present.
+  The :65433 source itself restarted 2026-10-01 08:25 (/proc/1799 start time) and still serves tpch,
+  so the feared "next restart loses tpch" did not happen.
+
+Ruled out:
+  - decode: probe_1262.go.txt decodes all four global/1262 rows (incl. tpch, xmin 5, natts 18)
+    without error from both the arm clone and the source's on-disk file.
+  - nextXid regression: XidGen.SetNext is monotonic (replay cannot move it back and reuse xid 5).
+  - backup start point: BASE_BACKUP ships a pg_control patched to the backup-start checkpoint, so
+    goopg's redo starts there although startup never reads backup_label (PG renames it to
+    backup_label.old after recovery; goopg leaves it in place).
+  - torn pg_xact copy: the SLRU writes pages in place (WriteAt + fsync); a torn read mixes old and
+    new content, and the old content of xid 5's lane is already committed.
+  - None of the startup-reload / CLOG files changed between the 2026-09-29 incident and today.
+
+Remaining hypotheses (the only path that drops a decodable, xmax-free shared row):
+  catalogRowLive -> clog.GetStatus(xmin) == Aborted at reload time, i.e. xid 5's lane read Unknown
+  and MarkUnknownAsAborted (open.go, run before every catalog reload) stamped it Aborted; or the
+  reload ran against another data dir / binary. The 2026-09-29 evidence does not record the lane
+  bits of the failing clone AFTER its first start.
+
+Landed: shared-catalog reload rows that decode but are rejected (no xmax) and shared-catalog
+decode errors now log a WARN with catalog, block/slot, xmin and CLOG status
+(scanCatalogHeapRows), so the next occurrence names its cause.
+
+Side finding: txid_current() / pg_current_xact_id() return 0 on goopg (PG 18.3: an assigned
+xid, e.g. 1142) -> filed M0146-0043 (S2).
+
+Follow-up 2026-10-02 (loop #34), clone-harness.sh variants, none lost database/role tpch:
+  3. CHURN=pgbench XMODE=fetch: 4 pgbench clients committing single-row inserts back to back
+     (CLOG page-0 churn) + a checkpoint every 3 s; 6 online clones via tpch_private_clone_snapshot,
+     each started twice -> tpch present in all 12 starts.
+  4. CHURN=pgbench XMODE=stream: same churn, 6 clones via pg_basebackup -X stream, each started
+     twice -> present in all 12 starts; 45134 committed churn rows on the source.
+  Total: 37 clean clone starts on current code. The defect is parked on recurrence: the
+  shared-catalog reload WARN (372b311c8) names the xid and CLOG status the next time it happens.

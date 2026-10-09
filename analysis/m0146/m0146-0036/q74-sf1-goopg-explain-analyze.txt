@@ -1,0 +1,69 @@
+                                                                                                                                                                            QUERY PLAN                                                                                                                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=109034.65..109034.66 rows=1 width=1104) (actual time=504553.041..504553.087 rows=100.00 loops=1)
+   CTE year_total
+     ->  Append  (cost=76500.04..105531.80 rows=33360 width=326)
+           ->  HashAggregate  (cost=76500.04..76827.59 rows=26204 width=294)
+                 Group Key: customer.c_customer_id, customer.c_first_name, customer.c_last_name, date_dim.d_year
+                 ->  Gather  (cost=3064.72..76172.49 rows=26204 width=756)
+                       Workers Planned: 4
+                       Workers Launched: 4
+                       ->  Nested Loop  (cost=2064.72..72552.09 rows=6551 width=756)
+                             ->  Parallel Hash Join  (cost=2064.47..70694.85 rows=6846 width=30)
+                                   Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..66740.01 rows=720101 width=212)
+                                   ->  Parallel Hash  (cost=2059.12..2059.12 rows=428 width=268)
+                                         Buckets: 1024  Batches: 1  Memory Usage: 67kB  Build Time: 21.583 ms
+                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2059.12 rows=428 width=268)
+                                               Filter: (d_year = ANY ('{1999,2000}'::integer[]))
+                             ->  Index Scan using customer_pkey on customer  (cost=0.25..0.27 rows=1 width=726)
+                                   Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+           ->  GroupAggregate  (cost=27345.25..28370.62 rows=7156 width=294)
+                 Group Key: customer_1.c_customer_id, customer_1.c_first_name, customer_1.c_last_name, date_dim_1.d_year
+                 ->  Gather Merge  (cost=27345.25..28191.73 rows=7155 width=1280)
+                       Workers Planned: 3
+                       Workers Launched: 3
+                       ->  Sort  (cost=26345.21..26350.98 rows=2308 width=1280)
+                             Sort Key: customer_1.c_customer_id, customer_1.c_first_name, customer_1.c_last_name, date_dim_1.d_year
+                             Sort Method: quicksort  Memory: 266087kB
+                             Worker 0:  Sort Method: quicksort  Memory: 275095kB
+                             Worker 1:  Sort Method: quicksort  Memory: 273510kB
+                             Worker 2:  Sort Method: quicksort  Memory: 274481kB
+                             ->  Nested Loop  (cost=2064.72..26216.28 rows=2308 width=756)
+                                   ->  Parallel Hash Join  (cost=2064.47..25546.26 rows=2309 width=30)
+                                         Hash Cond: (web_sales.ws_sold_date_sk = date_dim_1.d_date_sk)
+                                         ->  Parallel Seq Scan on web_sales  (cost=0.00..22872.59 rows=232059 width=286)
+                                         ->  Parallel Hash  (cost=2059.12..2059.12 rows=428 width=268)
+                                               Buckets: 1024  Batches: 1  Memory Usage: 71kB  Build Time: 25.684 ms
+                                               ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2059.12 rows=428 width=268)
+                                                     Filter: (d_year = ANY ('{1999,2000}'::integer[]))
+                                   ->  Index Scan using customer_pkey on customer customer_1  (cost=0.25..0.29 rows=1 width=726)
+                                         Index Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+   ->  Sort  (cost=3502.85..3502.86 rows=1 width=1304) (actual time=504553.041..504553.086 rows=100.00 loops=1)
+         Sort Key: t_s_secyear.customer_id, t_s_secyear.customer_last_name, t_s_secyear.customer_first_name
+         Sort Method: quicksort  Memory: 71kB
+         ->  Nested Loop  (cost=0.00..3502.84 rows=1 width=1304) (actual time=12758.136..501896.985 rows=105.00 loops=1)
+               Join Filter: ((t_s_secyear.customer_id = t_w_secyear.customer_id) AND (CASE WHEN (t_w_firstyear.year_total > '0'::numeric) THEN (t_w_secyear.year_total / t_w_firstyear.year_total) ELSE NULL::numeric END > CASE WHEN (t_s_firstyear.year_total > '0'::numeric) THEN (t_s_secyear.year_total / t_s_firstyear.year_total) ELSE NULL::numeric END))
+               Rows Removed by Join Filter: 17677400
+               ->  Nested Loop  (cost=0.00..2668.83 rows=1 width=978) (actual time=8190.481..504192.294 rows=1585.00 loops=1)
+                     Join Filter: (t_s_secyear.customer_id = t_w_firstyear.customer_id)
+                     Rows Removed by Join Filter: 163266695
+                     ->  Nested Loop  (cost=0.00..1751.41 rows=1 width=652) (actual time=7887.044..504527.171 rows=14505.00 loops=1)
+                           Join Filter: (t_s_firstyear.customer_id = t_s_secyear.customer_id)
+                           Rows Removed by Join Filter: 1442391911
+                           ->  CTE Scan on year_total t_s_firstyear  (cost=0.00..917.40 rows=1 width=326) (actual time=7749.688..504531.346 rows=37708.00 loops=1)
+                                 Filter: ((year_total > '0'::numeric) AND (sale_type = 's'::text) AND (year = 1999))
+                                 Rows Removed by Filter: 60661
+                           ->  CTE Scan on year_total t_s_secyear  (cost=0.00..834.00 rows=1 width=326) (actual time=0.035..51.888 rows=38252.00 loops=1)
+                                 Filter: ((sale_type = 's'::text) AND (year = 2000))
+                                 Rows Removed by Filter: 60117
+                     ->  CTE Scan on year_total t_w_firstyear  (cost=0.00..917.40 rows=1 width=326) (actual time=167.196..185.465 rows=11256.00 loops=1)
+                           Filter: ((year_total > '0'::numeric) AND (sale_type = 'w'::text) AND (year = 1999))
+                           Rows Removed by Filter: 87113
+               ->  CTE Scan on year_total t_w_secyear  (cost=0.00..834.00 rows=1 width=326) (actual time=458.304..473.455 rows=11153.00 loops=1)
+                     Filter: ((sale_type = 'w'::text) AND (year = 2000))
+                     Rows Removed by Filter: 87216
+ Planning Time: 0.093 ms
+ Execution Time: 504553.091 ms
+(65 rows)
+

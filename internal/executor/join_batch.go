@@ -128,6 +128,10 @@ type hashBatchState struct {
 
 	inner []*joinBatchFile
 	outer []*joinBatchFile
+	// extraOuter holds, per batch, probe-row files other participants of a
+	// Parallel Hash join that fills its build side handed to this one, the
+	// sweeper, which replays them after its own (M0146-0095).
+	extraOuter [][]*joinBatchFile
 
 	// buildIsLeft is the build orientation, needed to re-evaluate the build
 	// key of a row reloaded from an inner batch file. The two widths that
@@ -342,7 +346,10 @@ func (o *joinOp) joinBatchEligible() bool {
 		// build-global counters above and fire before nextLazy probes
 		// anything, so they are unaffected by how the build was partitioned.
 		return true
-	case optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull:
+	case optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull,
+		optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+		// M0146-0005dj: the right semi/anti joins keep a per-batch matched
+		// bitmap too, and RIGHT ANTI sweeps it while the batch is resident.
 		// M0127-P4.2 (07 §3): every outer-join orientation batches now. The
 		// probe-fill half was always per-row; the build-fill half is per-batch
 		// because the sweep runs while that batch's table is still resident
@@ -650,7 +657,7 @@ func (bs *hashBatchState) freezeGrowth(why string) {
 // Rules 2 and 3 are what make "empty on one side" insufficient on its own:
 // dropping such a file unread loses its rows silently.
 func (bs *hashBatchState) batchSkippable(o *joinOp, b int) bool {
-	hasInner, hasOuter := bs.inner[b] != nil, bs.outer[b] != nil
+	hasInner, hasOuter := bs.inner[b] != nil, bs.outer[b] != nil || bs.hasExtraOuter(b)
 	if hasInner && hasOuter {
 		return false
 	}
@@ -696,15 +703,34 @@ func (bs *hashBatchState) nextBatch(o *joinOp) (bool, error) {
 	if err := bs.loadInnerBatch(o); err != nil {
 		return false, err
 	}
-	var r *spillReader
+	var readers []*spillReader
 	if bs.outer[bs.curBatch] != nil {
-		var err error
-		r, err = bs.openReader(bs.outer, bs.curBatch)
+		r, err := bs.openReader(bs.outer, bs.curBatch)
 		if err != nil {
 			return false, err
 		}
+		readers = append(readers, r)
 	}
-	bs.replayOp = &batchReplayOp{r: r, bs: bs}
+	if bs.curBatch < len(bs.extraOuter) {
+		for _, f := range bs.extraOuter[bs.curBatch] {
+			if f.w != nil {
+				if err := f.w.Close(); err != nil {
+					return false, err
+				}
+				f.w = nil
+			}
+			r, err := newSpillReader(f.path)
+			if err != nil {
+				for _, rr := range readers {
+					rr.Close()
+				}
+				return false, err
+			}
+			readers = append(readers, r)
+		}
+		bs.extraOuter[bs.curBatch] = nil
+	}
+	bs.replayOp = &batchReplayOp{readers: readers, bs: bs}
 	bs.replaying = true
 	o.lazyProbe = bs.replayOp
 	return true, nil
@@ -825,6 +851,52 @@ func (bs *hashBatchState) discard(b int) {
 	if f := bs.outer[b]; f != nil {
 		bs.dropFile(f)
 		bs.outer[b] = nil
+	}
+	if b < len(bs.extraOuter) {
+		for _, f := range bs.extraOuter[b] {
+			bs.dropFile(f)
+		}
+		bs.extraOuter[b] = nil
+	}
+}
+
+// hasExtraOuter reports whether another participant handed probe rows for
+// batch b to this state.
+func (bs *hashBatchState) hasExtraOuter(b int) bool {
+	return b < len(bs.extraOuter) && len(bs.extraOuter[b]) > 0
+}
+
+// handOverOuterFiles detaches this state's probe-row files for batches past
+// the current one, writers closed, for another participant to replay
+// (M0146-0095). The state keeps no reference: its close must not unlink
+// them.
+func (bs *hashBatchState) handOverOuterFiles() []*joinBatchFile {
+	out := make([]*joinBatchFile, len(bs.outer))
+	for b, f := range bs.outer {
+		if f == nil || b <= bs.curBatch {
+			continue
+		}
+		if f.w != nil {
+			_ = f.w.Close()
+			f.w = nil
+		}
+		out[b] = f
+		bs.outer[b] = nil
+	}
+	return out
+}
+
+// adoptHandedOuterFiles installs other participants' probe-row files as this
+// state's extra outer files, replayed batch by batch after its own.
+func (bs *hashBatchState) adoptHandedOuterFiles(handed [][]*joinBatchFile) {
+	for b, fs := range handed {
+		if len(fs) == 0 {
+			continue
+		}
+		for len(bs.extraOuter) <= b {
+			bs.extraOuter = append(bs.extraOuter, nil)
+		}
+		bs.extraOuter[b] = append(bs.extraOuter[b], fs...)
 	}
 }
 
@@ -1429,27 +1501,37 @@ func newParticipantBatchState(ctx *Context, plan *optimizer.Join, d *sharedBatch
 // re-route a row that a later doubling pushed past the current batch without
 // evaluating its key (PG's replayed-tuple rule 3).
 type batchReplayOp struct {
-	r   *spillReader
-	bs  *hashBatchState
-	out Row
+	// readers are the batch's probe-row files, replayed in order: this
+	// state's own, then any handed over by other participants (M0146-0095).
+	readers []*spillReader
+	bs      *hashBatchState
+	out     Row
 }
 
 func (op *batchReplayOp) Open(*Context) error    { return nil }
 func (op *batchReplayOp) Schema() optimizer.Schema { return nil }
 
 func (op *batchReplayOp) Next() (TupleSlot, error) {
-	if op.r == nil {
-		// A batch whose outer side is empty still has to be entered when a
-		// doubling means its inner file needs reassigning (rule 2); there is
-		// simply nothing to probe with.
-		return nil, EOF
-	}
-	h, row, err := op.r.ReadRowHashedInto(op.out)
-	if err == io.EOF {
-		return nil, EOF
-	}
-	if err != nil {
-		return nil, err
+	var h uint32
+	var row Row
+	for {
+		if len(op.readers) == 0 {
+			// A batch whose outer side is empty still has to be entered
+			// when a doubling means its inner file needs reassigning (rule
+			// 2); there is simply nothing to probe with.
+			return nil, EOF
+		}
+		var err error
+		h, row, err = op.readers[0].ReadRowHashedInto(op.out)
+		if err == io.EOF {
+			op.readers[0].Close()
+			op.readers = op.readers[1:]
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	op.out = row
 	op.bs.replayHash = h
@@ -1459,10 +1541,10 @@ func (op *batchReplayOp) Next() (TupleSlot, error) {
 }
 
 func (op *batchReplayOp) Close() error {
-	if op.r != nil {
-		op.r.Close()
-		op.r = nil
+	for _, r := range op.readers {
+		r.Close()
 	}
+	op.readers = nil
 	return nil
 }
 

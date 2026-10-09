@@ -1,0 +1,136 @@
+sf025 Q12 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf025 Q12 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf025 Q20 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf025 Q20 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf025 Q44 candidate:
+  Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+sf025 Q44 candidate-pg:
+  Window: w1 AS (ORDER BY v1.rank_col ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY v2.rank_col ROWS UNBOUNDED PRECEDING)
+sf025 Q47 candidate:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+sf025 Q47 candidate-pg:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+sf025 Q49 candidate:
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+sf025 Q49 candidate-pg:
+  Window: w2 AS (ORDER BY in_web.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_web.currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY in_cat.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_cat.currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY in_store.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_store.currency_ratio ROWS UNBOUNDED PRECEDING)
+sf025 Q51 candidate:
+  Window: w1 AS (PARTITION BY (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END) ORDER BY (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY web_sales.ws_item_sk ORDER BY date_dim.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY store_sales.ss_item_sk ORDER BY date_dim_1.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+sf025 Q51 candidate-pg:
+  Window: w1 AS (PARTITION BY (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END) ORDER BY (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY web_sales.ws_item_sk ORDER BY date_dim.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY store_sales.ss_item_sk ORDER BY date_dim_1.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+sf025 Q53 candidate:
+  Window: w1 AS (PARTITION BY item.i_manufact_id)
+sf025 Q53 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_manufact_id)
+sf025 Q57 candidate:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+sf025 Q57 candidate-pg:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+sf025 Q63 candidate:
+  Window: w1 AS (PARTITION BY item.i_manager_id)
+sf025 Q63 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_manager_id)
+sf025 Q67 candidate:
+  Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(coalesce((store_sales.ss_sales_price * store_sales.ss_quantity), 0))) ROWS UNBOUNDED PRECEDING)
+sf025 Q67 candidate-pg:
+  Window: w1 AS (PARTITION BY dw1.i_category ORDER BY dw1.sumsales ROWS UNBOUNDED PRECEDING)
+sf025 Q89 candidate:
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+sf025 Q89 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+sf025 Q98 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf025 Q98 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q12 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q12 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q20 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q20 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q44 candidate:
+  Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY rank_col ROWS UNBOUNDED PRECEDING)
+sf1 Q44 candidate-pg:
+  Window: w1 AS (ORDER BY v1.rank_col ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY v2.rank_col ROWS UNBOUNDED PRECEDING)
+sf1 Q47 candidate:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+sf1 Q47 candidate-pg:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name, date_dim.d_year)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+sf1 Q49 candidate:
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY return_ratio ROWS UNBOUNDED PRECEDING)
+sf1 Q49 candidate-pg:
+  Window: w2 AS (ORDER BY in_web.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_web.currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY in_cat.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_cat.currency_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w2 AS (ORDER BY in_store.return_ratio ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (ORDER BY in_store.currency_ratio ROWS UNBOUNDED PRECEDING)
+sf1 Q51 candidate:
+  Window: w1 AS (PARTITION BY (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END) ORDER BY (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY web_sales.ws_item_sk ORDER BY date_dim.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY store_sales.ss_item_sk ORDER BY date_dim_1.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+sf1 Q51 candidate-pg:
+  Window: w1 AS (PARTITION BY (CASE WHEN (web_sales.ws_item_sk IS NOT NULL) THEN web_sales.ws_item_sk ELSE store_sales.ss_item_sk END) ORDER BY (CASE WHEN (date_dim.d_date IS NOT NULL) THEN date_dim.d_date ELSE date_dim_1.d_date END) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY web_sales.ws_item_sk ORDER BY date_dim.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Window: w1 AS (PARTITION BY store_sales.ss_item_sk ORDER BY date_dim_1.d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+sf1 Q53 candidate:
+  Window: w1 AS (PARTITION BY item.i_manufact_id)
+sf1 Q53 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_manufact_id)
+sf1 Q57 candidate:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+sf1 Q57 candidate-pg:
+  Window: w2 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name, date_dim.d_year)
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, call_center.cc_name ORDER BY date_dim.d_year, date_dim.d_moy ROWS UNBOUNDED PRECEDING)
+sf1 Q63 candidate:
+  Window: w1 AS (PARTITION BY item.i_manager_id)
+sf1 Q63 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_manager_id)
+sf1 Q67 candidate:
+  Window: w1 AS (PARTITION BY item.i_category ORDER BY (sum(coalesce((store_sales.ss_sales_price * store_sales.ss_quantity), 0))) ROWS UNBOUNDED PRECEDING)
+sf1 Q67 candidate-pg:
+  Window: w1 AS (PARTITION BY dw1.i_category ORDER BY dw1.sumsales ROWS UNBOUNDED PRECEDING)
+sf1 Q89 candidate:
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+sf1 Q89 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_category, item.i_brand, store.s_store_name, store.s_company_name)
+sf1 Q98 candidate:
+  Window: w1 AS (PARTITION BY item.i_class)
+sf1 Q98 candidate-pg:
+  Window: w1 AS (PARTITION BY item.i_class)

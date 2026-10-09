@@ -36,6 +36,7 @@ func init() {
 	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
 	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
 	indexKeyHarvestOn.Store(indexKeyHarvestFromEnv(os.Getenv("GOOPG_INDEXKEY_HARVEST")))
+	scalarUnnestOn.Store(scalarUnnestFromEnv(os.Getenv("GOOPG_SCALAR_UNNEST")))
 }
 
 // indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
@@ -55,6 +56,21 @@ func SetSubqueryUnnestEnabled(on bool) {
 
 // subqueryUnnestEnabled reports whether the pull-up pass should run.
 func subqueryUnnestEnabled() bool { return subqueryUnnestOn.Load() }
+
+// scalarUnnestOn gates the post-planning decorrelation of a correlated SCALAR
+// sublink into a grouped join (canUnnestSubquery). Default OFF since
+// M0145-0008y: PG keeps every scalar sublink a SubPlan. GOOPG_SCALAR_UNNEST=on
+// at server start (or SetScalarUnnestEnabled(true) from tests) restores the
+// pre-M0145-0008y decorrelation, which the pinning tests still exercise.
+var scalarUnnestOn atomic.Bool
+
+// scalarUnnestFromEnv is the switch's polarity, factored out for the
+// provenance table (flaglabels.go).
+func scalarUnnestFromEnv(v string) bool { return v == "on" }
+
+// SetScalarUnnestEnabled flips the scalar-sublink decorrelation. Test-only
+// API; the operational switch is GOOPG_SCALAR_UNNEST.
+func SetScalarUnnestEnabled(on bool) { scalarUnnestOn.Store(on) }
 
 // --- S1a pull-up guards -----------------------------------------------
 //
@@ -496,8 +512,8 @@ func unnestSubqueriesInPlan(node Node) Node {
 		// EXISTS) must stay visible to the driver loops above.
 		pushConjunctsBelowSemiAnti(n)
 	case *Join:
-		n.Left = unnestSubqueriesInPlan(n.Left)
-		n.Right = unnestSubqueriesInPlan(n.Right)
+		n.Left = unnestKeepingWidth(n.Left)
+		n.Right = unnestKeepingWidth(n.Right)
 	case *Project:
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	case *Aggregate:
@@ -508,6 +524,37 @@ func unnestSubqueriesInPlan(node Node) Node {
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	}
 	return node
+}
+
+// unnestKeepingWidth is unnestSubqueriesInPlan for a join input, whose width
+// is part of the join's coordinate space: every column of the right input
+// sits at an offset of the left one's width. A decorrelated scalar sublink
+// joins its aggregate onto the host and APPENDS the inner columns, which is
+// harmless above the joins (the upper Project reads the host's columns by
+// position) but shifts every coordinate past a join input. Since
+// M0146-0005bu places a correlated scalar sublink on a join's base relation
+// (correlatedScalarSublinkLeaf), such a host can be a join input, so the
+// original columns are projected back out. A rewrite that does not keep them
+// as a prefix returns unchanged — the join above would misread it either way,
+// and no rewrite reaches that shape today.
+func unnestKeepingWidth(child Node) Node {
+	if child == nil {
+		return nil
+	}
+	before := append(Schema(nil), child.Output()...)
+	out := unnestSubqueriesInPlan(child)
+	got := out.Output()
+	if len(got) <= len(before) {
+		return out
+	}
+	m := make([]int, len(before))
+	for i := range before {
+		if !strings.EqualFold(got[i].Name, before[i].Name) {
+			return out
+		}
+		m[i] = i
+	}
+	return projectToBindingOrder(out, m, nil)
 }
 
 // walkSubqueryPlansInExpr walks an expression tree and recursively
@@ -600,6 +647,16 @@ func findSubqueryInExpr(e Expr) *SubqueryExpr {
 // canUnnestSubquery checks whether a SubqueryExpr is a candidate
 // for unnesting into a GROUP BY aggregate + hash join.
 func canUnnestSubquery(sub *SubqueryExpr) bool {
+	// M0145-0008y: PG never decorrelates a scalar sublink —
+	// pull_up_sublinks converts only ANY/EXISTS (subselect.c), and an
+	// EXPR_SUBLINK stays a SubPlan whose correlation is a PARAM_EXEC base
+	// restriction (M0146-0012) and, across relations, a join clause
+	// (M0146-0012a). This decorrelation was goopg's substitute for those
+	// parameterised probes (TPC-H Q2 1.50 s -> 307 s without it); with them
+	// in place it is off by default. GOOPG_SCALAR_UNNEST=on restores it.
+	if !scalarUnnestOn.Load() {
+		return false
+	}
 	plan := sub.Plan
 	// Unwrap Project wrapper — the subquery's target list produces
 	// a Project node wrapping the Aggregate.
@@ -695,6 +752,9 @@ func innerPlanIsIndexProbeCheap(n Node) bool {
 }
 
 func collectUnnestParams(node Node) []unnestParam {
+	if correlationOnUnliftableJoinSide(node) {
+		return nil
+	}
 	var params []unnestParam
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
 	walkPlanExprs(node, func(e Expr) {
@@ -733,7 +793,7 @@ func collectUnnestParams(node Node) []unnestParam {
 	if !allAccounted {
 		return nil
 	}
-	return params
+	return dedupeUnnestParams(params)
 }
 
 // harvestIndexKeyParams finds correlation equijoins that the inner
@@ -811,7 +871,9 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 		if bhs, ok := n.(*BitmapHeapScan); ok {
 			if bis, ok := bhs.Outer.(*BitmapIndexScan); ok {
 				n = &IndexScan{pos: bis.Pos(), Table: bis.Table, Alias: bis.Alias,
-					Index: bis.Index, Key: bis.Key, Keys: bis.Keys, schema: bhs.Output()}
+					Index: bis.Index, Key: bis.Key, Keys: bis.Keys,
+					LowKey: bis.LowKey, HighKey: bis.HighKey, LowOp: bis.LowOp, HighOp: bis.HighOp,
+					schema: bhs.Output()}
 			}
 		}
 		if is, ok := n.(*IndexScan); ok {
@@ -855,7 +917,7 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 				harvestKey(is.Key, 0)
 			}
 			for i, k := range is.Keys {
-				harvestKey(k, i)
+				harvestKey(k, is.SkipPrefix+i)
 			}
 		}
 		// Recurse through the single/dual-child plan nodes an inner
@@ -1054,6 +1116,15 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *OrdinalityWrap:
 		walkPlanExprs(n.Child, visit)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through — the subplan's
+		// expressions stay visible to every reader of this walker
+		// (lowerNodeChildren descends it too; the two must stay in
+		// lockstep per planContainsLateralJoin's contract).
+		walkPlanExprs(n.Child, visit)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same visibility rule.
+		walkPlanExprs(n.Child, visit)
 	case *Gather:
 		// C-19g's upper-rel-resident half: a Gather can now appear in the
 		// tree BEFORE `Plan()`'s tail passes run, where previously the only
@@ -1186,6 +1257,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, k := range n.Keys {
 			walkExprTree(k, visit)
 		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
+		}
 		for _, q := range n.Pred {
 			walkExprTree(q, visit)
 		}
@@ -1293,6 +1370,29 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, uc := range n.UnnestCols {
 			walkExprTree(uc.ArrExpr, visit)
 		}
+		// M0146-0050: every SRF's arguments, not only unnest's. They are
+		// evaluated in this scope, and a reference to the outer row in
+		// them (`SELECT generate_series(1, g)` inside a sublink) is what
+		// makes the sublink correlated: unseen, the sublink was classed an
+		// InitPlan and ran once for every outer row.
+		for _, e := range n.SrfArgs {
+			walkExprTree(e, visit)
+		}
+		for _, sc := range n.SrfCols {
+			walkExprTree(sc.Start, visit)
+			walkExprTree(sc.Stop, visit)
+			walkExprTree(sc.Step, visit)
+		}
+		for _, rc := range n.RegexpMatchesCols {
+			walkExprTree(rc.StringExpr, visit)
+			walkExprTree(rc.PatternExpr, visit)
+			walkExprTree(rc.FlagsExpr, visit)
+		}
+		for _, uc := range n.UserSrfCols {
+			for _, e := range uc.Args {
+				walkExprTree(e, visit)
+			}
+		}
 	case *LockRows:
 		walkPlanExprs(n.Child, visit)
 	}
@@ -1388,6 +1488,9 @@ func buildUnnestedSubquery(sub *SubqueryExpr, params []unnestParam) (Node, Schem
 	groupExprs := make([]Expr, len(params))
 	for i, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 		gk := resolveSubColInSchema(childSchema, p.SubCol)
 		if gk == nil {
 			return nil, nil, nil
@@ -1636,6 +1739,27 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			}
 		}
 		return &a, nil
+	case *SubqueryScan:
+		// M0146-0005w: a derived-table leaf inside a decorrelating
+		// sublink plan must clone like every other wrapper — unlisted,
+		// the cloner errored and the driver silently kept the sublink
+		// correlated (the NLI-arm comment's own defect class).
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		c := *n
+		c.Child = child
+		return &c, nil
+	case *Materialize:
+		// M0146-0010: transparent wrapper — clone through.
+		child, err := clonePlanReplacingOuter(n.Child, replace)
+		if err != nil {
+			return nil, err
+		}
+		c := *n
+		c.Child = child
+		return &c, nil
 	case *Sort:
 		child, err := clonePlanReplacingOuter(n.Child, replace)
 		if err != nil {
@@ -2313,7 +2437,7 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprReplacingOuter(x.Source, replace)
@@ -2345,8 +2469,29 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
 		return &cl
 	default:
+		// Every other kind (IS NULL, LIKE, COALESCE, row and array
+		// constructors, …) is copied through the generic driver so the
+		// clone shares no node with the original. cloneExprLeaf returns
+		// these kinds as-is, and a later in-place pass over the clone
+		// (keptRebase's ExecParamRef rewrite, M0146-0012a) then rewrote the
+		// original too: regress join's `ss.y IS NOT NULL` kept a `$-1`
+		// sentinel in the plan a declined pre-lowering left behind. No
+		// OuterColumnRef in these kinds is replaced — exactly as when they
+		// were shared — so callers' remaining-ref checks see the same refs.
+		if out, ok := cloneExprRefs(x, scopeIgnore, exprRewriter{Rewrite: cloneNestedSublinkPlan}); ok {
+			return out
+		}
 		return cloneExprLeaf(x)
 	}
+}
+
+// cloneNestedSublinkPlan gives a cloned sublink node its own copy of its
+// inner plan (cloneExprRefs aliases inner plans).
+func cloneNestedSublinkPlan(n Expr) Expr {
+	if h := handleFor(n); h != nil {
+		h.setPlan(clonePlanVerbatimOrShare(h.plan))
+	}
+	return n
 }
 
 // clonePlanVerbatimOrShare structurally clones a nested sublink's inner
@@ -2437,7 +2582,7 @@ func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprSubstituteAggIdx0(x.Source, aggColRef)
@@ -2902,6 +3047,9 @@ func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eu
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerRaw, err := clonePlanReplacingOuter(agg.Child, replace)
 	if err != nil {
@@ -3355,6 +3503,9 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerPlan, err := clonePlanReplacingOuter(in.Plan, replace)
 	if err != nil {
@@ -4122,6 +4273,9 @@ func residualExprLiftable(e Expr) bool {
 // one and the same for all three — the difference between the
 // loops is only how the resulting join is keyed and typed.
 func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
+	if correlationOnUnliftableJoinSide(node) {
+		return nil
+	}
 	var params []unnestParam
 	var residuals []Expr
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
@@ -4245,7 +4399,44 @@ func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 	if !allAccounted {
 		return nil
 	}
-	return &existsUnnestPlan{Params: params, Residuals: residuals}
+	return &existsUnnestPlan{Params: dedupeUnnestParams(params), Residuals: residuals}
+}
+
+// dedupeUnnestParams drops repeated correlation pairs. One correlation can
+// reach the collectors several times: a correlated restriction sunk to its
+// relation (M0146-0012) sits both in the leaf's Filter and as the index
+// probe key, and harvestIndexKeyParams reads a single-column probe from Key
+// and Keys[0] alike. Each copy became its own GROUP BY and hash key, the
+// same column three times over. A copy that is a distinct *OuterColumnRef
+// is kept as an alias, so the clone still replaces every occurrence.
+func dedupeUnnestParams(params []unnestParam) []unnestParam {
+	type pairKey struct {
+		level, outerIdx, subIdx int
+		name                    string
+	}
+	seen := make(map[pairKey]int, len(params))
+	out := params[:0:0]
+	for _, p := range params {
+		k := pairKey{p.OuterRef.Level, p.OuterRef.Index, p.SubCol.Index, strings.ToLower(p.SubCol.Name)}
+		i, dup := seen[k]
+		if !dup {
+			seen[k] = len(out)
+			out = append(out, p)
+			continue
+		}
+		kept := &out[i]
+		if p.OuterRef == kept.OuterRef {
+			continue
+		}
+		known := false
+		for _, a := range kept.Aliases {
+			known = known || a == p.OuterRef
+		}
+		if !known {
+			kept.Aliases = append(kept.Aliases, p.OuterRef)
+		}
+	}
+	return out
 }
 
 // canUnnestExistsExpr accepts a correlated EXISTS subquery whose
@@ -4689,6 +4880,8 @@ func inUnnestSJInfo(jt JoinType, rhsExprs []Expr, strict bool) *SpecialJoinInfo 
 		MinRighthand: synR,
 		Jointype:     pjt,
 		LhsStrict:    strict,
+		// A NOT IN anti link is the one built non-strict (effNegated).
+		NullAware: pjt == parser.JoinAnti && !strict,
 	}
 	if pjt == parser.JoinSemi && len(rhsExprs) > 0 {
 		sj.SemiCanBtree, sj.SemiCanHash = true, true
@@ -4825,6 +5018,9 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
+		for _, a := range p.Aliases {
+			replace[a] = p.SubCol
+		}
 	}
 	innerPlan, err := clonePlanReplacingOuter(ex.Plan, replace)
 	if err != nil {
@@ -5113,4 +5309,90 @@ func findFilterContainingExistsExpr(node Node, target *ExistsExpr) (*Filter, Exp
 		return findFilterContainingExistsExpr(n.Child, target)
 	}
 	return nil, nil
+}
+
+// correlationOnUnliftableJoinSide reports whether the inner plan carries a
+// correlated outer reference on a join side whose conjuncts cannot be lifted
+// above that join: the RHS of a semi/anti join (its columns are not in the
+// join's output, and moving a qual out of an existential changes its
+// meaning), the nullable side of a left/right join, either side of a full
+// join, or the ON predicate of any non-inner join. Both collectors walk into
+// every join and lift what they find to the unnested join's keys and
+// residuals, so such a reference must make them decline — the sublink then
+// stays a SubPlan, which is always correct.
+//
+// Found by M0146-0015a: while one of its drafts admitted correlated
+// conjuncts as base restrictions in every scope, a nested EXISTS pulled up
+// inside a body left one on the leaf under the body's own semi join, and the
+// collector hoisted it into the outer join's hash key, where it read the
+// semi join's LEFT column at that position: wrong rows. The landed change
+// admits them only in one-relation scopes (no join to sink under), so this
+// guard is defensive — the collectors' soundness must not depend on where
+// the search chose to place a qual.
+func correlationOnUnliftableJoinSide(node Node) bool {
+	found := false
+	predHasOuter := func(e Expr) bool {
+		has := false
+		walkExprTree(e, func(x Expr) {
+			if _, ok := x.(*OuterColumnRef); ok {
+				has = true
+			}
+		})
+		return has
+	}
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		switch x := n.(type) {
+		case *Filter:
+			walk(x.Child)
+		case *Project:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		case *OrdinalityWrap:
+			walk(x.Child)
+		case *Join:
+			if x.Type != JoinTypeInner && x.Type != JoinTypeCross && predHasOuter(x.Predicate) {
+				found = true
+				return
+			}
+			switch x.Type {
+			case JoinTypeSemi, JoinTypeAnti, JoinTypeLeft:
+				if planSubtreeHasOuterRefDeep(x.Right) {
+					found = true
+					return
+				}
+				walk(x.Left)
+			case JoinTypeRight:
+				if planSubtreeHasOuterRefDeep(x.Left) {
+					found = true
+					return
+				}
+				walk(x.Right)
+			case JoinTypeFull:
+				if planSubtreeHasOuterRefDeep(x.Left) || planSubtreeHasOuterRefDeep(x.Right) {
+					found = true
+					return
+				}
+			default:
+				walk(x.Left)
+				walk(x.Right)
+			}
+		case *NestedLoopIndexJoin:
+			if x.Type != JoinTypeInner && x.Type != JoinTypeCross && planSubtreeHasOuterRefDeep(x.Inner) {
+				found = true
+				return
+			}
+			walk(x.Outer)
+		}
+	}
+	walk(node)
+	return found
 }

@@ -136,16 +136,17 @@ func TestSAOPExplainRendersAnyCond(t *testing.T) {
 	ctx, cleanup := setupSAOPFixture(t)
 	defer cleanup()
 
-	// The Q45 gate's `= ANY` cond, at unit scale.
+	// The Q45 gate's `= ANY` cond, at unit scale, as PG prints it: the
+	// folded array Const (M0146-0005ch).
 	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT id FROM items WHERE id IN (2, 4)")
 	found := false
 	for _, ln := range lines {
-		if strings.Contains(ln, "Index Cond: (id = ANY (2, 4))") {
+		if strings.Contains(ln, "Index Cond: (id = ANY ('{2,4}'::integer[]))") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("EXPLAIN missing `Index Cond: (id = ANY (2, 4))`, got:\n%s", strings.Join(lines, "\n"))
+		t.Fatalf("EXPLAIN missing `Index Cond: (id = ANY ('{2,4}'::integer[]))`, got:\n%s", strings.Join(lines, "\n"))
 	}
 }
 

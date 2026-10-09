@@ -260,3 +260,15 @@ func (bt *BTree) KeyDesc() *PGIndexKeyDesc { return bt.keyFmt.desc }
 // BTree assembled by a path that forgot to set it still uses the blob format"
 // case explicit instead of accidental.
 func (bt *BTree) format() indexFormat { return bt.keyFmt }
+
+// CompareLowBound and CompareHighBound are the two bound comparisons a range
+// scan applies to each leaf entry (scanLeafItems): an inclusive low bound
+// admits `CompareLowBound(key, lo) >= 0`, an inclusive high bound admits
+// `CompareHighBound(key, hi) <= 0`. They are exported for the executor's
+// skip-scan leaf walk (M0145-0008af), which checks each entry against its
+// current prefix group's probe the way `_bt_checkkeys` checks an advanced
+// skip array, instead of opening a cursor bounded by that probe.
+func (bt *BTree) CompareLowBound(key, lo []byte) int { return bt.format().compare(key, lo) }
+
+// CompareHighBound — see CompareLowBound.
+func (bt *BTree) CompareHighBound(key, hi []byte) int { return bt.format().compareHigh(key, hi) }

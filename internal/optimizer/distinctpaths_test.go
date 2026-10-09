@@ -8,8 +8,12 @@ package optimizer
 // gate (producer never fires there), and the C-10c Sort arm one node up.
 
 import (
+	"math"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // distinctTestSpec builds a minimal DISTINCT spec over a priced child.
@@ -213,7 +217,7 @@ func TestCreateDistinctPathsNilSpec(t *testing.T) {
 
 // TestDistinctCostSharedInput pins the pricing shape: hashed vs unique
 // differ only in input price (seed vs Sort) — the dedup terms are shared,
-// pinned as numbers (unique == distinctCost over its Sort input exactly),
+// pinned as numbers (unique == uniquePathCost over its Sort input exactly),
 // and unique prices strictly above hashed (the Sort costs something).
 func TestDistinctCostSharedInput(t *testing.T) {
 	cp := defaultCostParams()
@@ -239,9 +243,9 @@ func TestDistinctCostSharedInput(t *testing.T) {
 		t.Fatalf("unique has %d children, want the 1 Sort input", len(unique.Children))
 	}
 	sortIn := unique.Children[0]
-	want := distinctCost(sortIn.Cost.Startup, sortIn.Cost.Total, 1000, rel.Rows, cp)
+	want := uniquePathCost(sortIn.Cost.Startup, sortIn.Cost.Total, 1000, len(unique.Pathkeys), cp)
 	if unique.Cost != want {
-		t.Fatalf("unique %+v != distinctCost over its Sort input %+v", unique.Cost, want)
+		t.Fatalf("unique %+v != uniquePathCost over its Sort input %+v", unique.Cost, want)
 	}
 	for _, p := range rel.Pathlist {
 		if p.Unique {
@@ -250,5 +254,354 @@ func TestDistinctCostSharedInput(t *testing.T) {
 		if !(unique.Cost.Total > p.Cost.Total) {
 			t.Fatalf("unique %+v not above hashed %+v: the Sort must cost something", unique.Cost, p.Cost)
 		}
+	}
+}
+
+// ── M0146-0027 slice 2 — the partial-DISTINCT arm ──────────────────────────
+//
+// `addPartialDistinctPaths` is `create_partial_distinct_paths`'s sorted arm
+// (planner.c:4852): `Unique -> Gather Merge -> Unique -> Sort -> <partial>`.
+// Pinned: the candidate is generated and priced, the `PartialUnique` marker
+// flows spec -> emitted node, the four walk siblings admit only the marked
+// node, and every gate refuses fail-closed.
+
+// sizedDistinctFixture mirrors sizedAggFixture's catalog-backed scan under a
+// DISTINCT spec instead of an aggregate.
+func sizedDistinctFixture(t *testing.T, rows int64, ndistinct float64) *Distinct {
+	t.Helper()
+	cat := catalog.NewInMemory()
+	cols := []catalog.Column{
+		{Name: "g0", Type: catalog.Type{Name: "int4"}},
+		{Name: "g1", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "int4"}},
+	}
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "distinct_sized_t"}, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	colStats := make([]catalog.ColumnStats, len(cols))
+	for i := range colStats {
+		colStats[i].NDistinct = int64(ndistinct)
+		colStats[i].NDistinctFrac = ndistinct / float64(rows)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: rows, Columns: colStats}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "g0"}, {Name: "g1"}, {Name: "v"}}}
+	return &Distinct{Child: scan, schema: scan.Output()}
+}
+
+// addPartialDistinctFor runs the producer the way createDistinctPaths does and
+// returns the DISTINCT rel plus the partial arm's final path (nil when the
+// producer declined).
+func addPartialDistinctFor(t *testing.T, d *Distinct, ps PlannerSettings) (*RelOptInfo, *Path) {
+	t.Helper()
+	cp := ps.costParams()
+	u := newUpperRels()
+	dr := fetchUpperRel(u, UpperDistinct, 0, 0)
+	sizeDistinctRelFromNode(dr, d)
+	child := d.Child
+	seed := newPrebuiltPath(dr, child)
+	seed.Rows = float64(EstimateRows(child))
+	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+	}
+	if seed.Cost.Total <= 0 {
+		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+	}
+	addPartialDistinctPaths(u, dr, seed, d, child, cp, ps, nil)
+	for _, p := range dr.Pathlist {
+		if p != nil && p.Kind == PathDistinct && p.Unique &&
+			len(p.Children) == 1 && p.Children[0].Kind == PathGatherMerge {
+			return dr, p
+		}
+	}
+	return dr, nil
+}
+
+// sortedArmSettings is upperSplitSettings with enable_hashagg off, so the
+// partial HASHED arm carries a disabled node and the sorted Unique arm the
+// tests below inspect is the one add_path keeps (M0146-0005bf).
+func sortedArmSettings() PlannerSettings {
+	ps := upperSplitSettings()
+	ps.EnableHashAgg = false
+	return ps
+}
+
+// TestPartialDistinctHashedArmLowers pins the hashed arm of
+// create_partial_distinct_paths (planner.c:4983, M0146-0005bf): PG 18.3's
+// select_distinct.sql `SELECT DISTINCT four FROM tenk1` plan is
+// `Unique -> Gather Merge -> Sort -> HashAggregate -> Parallel Seq Scan`.
+// The per-worker node is a group-only hashed Aggregate carrying the
+// PartialGroup mark the driving-scan walks descend through.
+func TestPartialDistinctHashedArmLowers(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	d := sizedDistinctFixture(t, 5_900_000, 4)
+	_, final := addPartialDistinctFor(t, d, upperSplitSettings())
+	if final == nil {
+		t.Fatal("producer filed no candidate")
+	}
+	node, _ := createPlanNode(final)
+	leader, ok := node.(*DistinctOn)
+	if !ok || leader.PartialUnique {
+		t.Fatalf("final path lowered to %T (marked=%v), want an unmarked *DistinctOn", node, ok && leader.PartialUnique)
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("merge child is %T, want the worker *Sort", gm.Child)
+	}
+	agg, ok := srt.Child.(*Aggregate)
+	if !ok || !agg.PartialGroup || agg.Strategy != AggStrategyHashed || len(agg.Aggs) != 0 {
+		t.Fatalf("worker sort child is %T, want a PartialGroup hashed group-only *Aggregate", srt.Child)
+	}
+	if len(agg.GroupExprs) != len(agg.Output()) {
+		t.Fatalf("the dedup must group on all %d output columns, got %d", len(agg.Output()), len(agg.GroupExprs))
+	}
+	scan, ok := agg.Child.(*SeqScan)
+	if !ok || !scan.Parallel {
+		t.Fatalf("the hashed dedup's input is %T, want a Parallel *SeqScan", agg.Child)
+	}
+}
+
+// partialDistinctChain unwraps the candidate's `Unique -> Gather Merge ->
+// Unique -> Sort -> partial` spine, or nils when the shape differs.
+func partialDistinctChain(final *Path) (gm, partial, workerSort *Path) {
+	if final == nil || len(final.Children) != 1 {
+		return nil, nil, nil
+	}
+	gm = final.Children[0]
+	if gm.Kind != PathGatherMerge || len(gm.Children) != 1 {
+		return nil, nil, nil
+	}
+	partial = gm.Children[0]
+	if partial.Kind != PathDistinct || !partial.Unique || len(partial.Children) != 1 {
+		return gm, nil, nil
+	}
+	workerSort = partial.Children[0]
+	if workerSort.Kind != PathSort {
+		return gm, partial, nil
+	}
+	return gm, partial, workerSort
+}
+
+func TestPartialDistinctArmFilesThePGShape(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	d := sizedDistinctFixture(t, 5_900_000, 4)
+	dr, final := addPartialDistinctFor(t, d, sortedArmSettings())
+	if final == nil {
+		t.Fatal("no `Unique -> Gather Merge -> Unique` candidate was filed")
+	}
+	gm, partial, workerSort := partialDistinctChain(final)
+	if partial == nil || workerSort == nil {
+		t.Fatal("candidate is not Unique -> Gather Merge -> Unique -> Sort")
+	}
+	if partial.Distinct == nil || !partial.Distinct.PartialUnique {
+		t.Fatal("the partial Unique's spec does not carry the PartialUnique mark")
+	}
+	if final.Distinct == nil || final.Distinct.PartialUnique {
+		t.Fatal("the leader Unique's spec must NOT carry the mark — it runs above the merge")
+	}
+	if partial.ParallelWorkers <= 0 || workerSort.ParallelWorkers <= 0 {
+		t.Fatal("worker-side Unique/Sort carry no planned workers")
+	}
+	if len(gm.Pathkeys) == 0 || len(partial.Pathkeys) == 0 || len(final.Pathkeys) == 0 {
+		t.Fatal("the merge carries no pathkeys; the boundary is not ordered")
+	}
+	// The merge keys are the full-column dedup ordering: every output
+	// position, in order.
+	for i, pk := range gm.Pathkeys {
+		cr, ok := pk.Expr.(*ColumnRef)
+		if !ok || cr.Index != i {
+			t.Fatalf("merge key %d = %#v, want ColumnRef at output position %d", i, pk.Expr, i)
+		}
+	}
+	if len(dr.Pathlist) == 0 {
+		t.Fatal("no path filed on the DISTINCT rel")
+	}
+}
+
+// TestPartialDistinctArmLowers drives the filed path through createPlanNode:
+// the emitted node chain must be DistinctOn -> GatherMerge ->
+// DistinctOn{PartialUnique} -> Sort -> driving scan stamped Parallel — the
+// marker is what lets gatherChildPlan's drivingScan assertion reach the scan.
+func TestPartialDistinctArmLowers(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	d := sizedDistinctFixture(t, 5_900_000, 4)
+	_, final := addPartialDistinctFor(t, d, sortedArmSettings())
+	if final == nil {
+		t.Fatal("producer filed no candidate")
+	}
+	node, _ := createPlanNode(final)
+	leader, ok := node.(*DistinctOn)
+	if !ok {
+		t.Fatalf("final path lowered to %T, want *DistinctOn", node)
+	}
+	if leader.PartialUnique {
+		t.Fatal("the leader Unique must be unmarked — it runs above the merge")
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	worker, ok := gm.Child.(*DistinctOn)
+	if !ok {
+		t.Fatalf("merge child is %T, want *DistinctOn", gm.Child)
+	}
+	if !worker.PartialUnique {
+		t.Fatal("the per-worker Unique lost its PartialUnique mark")
+	}
+	srt, ok := worker.Child.(*Sort)
+	if !ok {
+		t.Fatalf("worker Unique child is %T, want *Sort", worker.Child)
+	}
+	scan, ok := srt.Child.(*SeqScan)
+	if !ok {
+		t.Fatalf("worker sort child is %T, want *SeqScan", srt.Child)
+	}
+	if !scan.Parallel {
+		t.Fatal("the driving scan under the partial subtree is not stamped Parallel")
+	}
+}
+
+// TestPartialDistinctArmUnwrapsGather is the Q38/Q87 route: a DISTINCT input
+// already carrying `Sort -> Gather -> <subtree>` — the leader Sort is
+// replaced by the worker-side one and the Gather spliced out, so the partial
+// subtree runs the join/scan itself once per worker.
+func TestPartialDistinctArmUnwrapsGather(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	d := sizedDistinctFixture(t, 5_900_000, 4)
+	gathered := &Gather{Child: d.Child, WorkersPlanned: 2, schema: d.Child.Output()}
+	d.Child = &Sort{Child: gathered, Keys: distinctAllColKeys(gathered)}
+
+	_, final := addPartialDistinctFor(t, d, upperSplitSettings())
+	if final == nil {
+		t.Fatal("a Gather-bearing DISTINCT input produced no candidate")
+	}
+	node, _ := createPlanNode(final)
+	leader, ok := node.(*DistinctOn)
+	if !ok {
+		t.Fatalf("final path lowered to %T, want *DistinctOn", node)
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	// No second Gather may survive inside the partial subtree — every
+	// worker would read the whole relation.
+	if subtreeHasGather(gm.Child) {
+		t.Fatal("a Gather survived inside the partial subtree")
+	}
+	if drivingScan(gm.Child) == nil {
+		t.Fatal("the partial subtree has no driving scan")
+	}
+}
+
+// TestPartialDistinctArmRefusals pins the fail-closed gates: a nested-scope
+// input that does not already carry a Gather, and the parallelism kill
+// switch, each decline rather than building the shape.
+func TestPartialDistinctArmRefusals(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	t.Run("nested scope without existing gather", func(t *testing.T) {
+		ps := upperSplitSettings()
+		ps.ParallelStatementOK = false
+		d := sizedDistinctFixture(t, 5_900_000, 4)
+		if _, final := addPartialDistinctFor(t, d, ps); final != nil {
+			t.Fatal("a nested-scope input with no Gather must not introduce one")
+		}
+	})
+	t.Run("nested scope with existing gather", func(t *testing.T) {
+		ps := upperSplitSettings()
+		ps.ParallelStatementOK = false
+		d := sizedDistinctFixture(t, 5_900_000, 4)
+		d.Child = &Gather{Child: d.Child, WorkersPlanned: 2, schema: d.Child.Output()}
+		if _, final := addPartialDistinctFor(t, d, ps); final == nil {
+			t.Fatal("a nested-scope input already under a Gather keeps the arm")
+		}
+	})
+	t.Run("workers disabled", func(t *testing.T) {
+		ps := upperSplitSettings()
+		ps.MaxParallelWorkersPerGather = 0
+		d := sizedDistinctFixture(t, 5_900_000, 4)
+		if _, final := addPartialDistinctFor(t, d, ps); final != nil {
+			t.Fatal("max_parallel_workers_per_gather=0 must refuse the arm")
+		}
+	})
+	t.Run("parallel off", func(t *testing.T) {
+		parallelOn.Store(false)
+		defer parallelOn.Store(true)
+		d := sizedDistinctFixture(t, 5_900_000, 4)
+		if _, final := addPartialDistinctFor(t, d, upperSplitSettings()); final != nil {
+			t.Fatal("the parallel kill switch must refuse the arm")
+		}
+	})
+}
+
+// TestPartialDistinctWalkAgreement pins the sibling contract for
+// *DistinctOn — the same four-walk agreement TestPartialGroupWalkAgreement
+// pins for *Aggregate: the marked node is transparent to the stamp/driving
+// walks and the unmarked node is a wall.
+func TestPartialDistinctWalkAgreement(t *testing.T) {
+	scan := sizedDistinctFixture(t, 100, 4).Child
+	marked := &DistinctOn{Child: scan, PartialUnique: true}
+	unmarked := &DistinctOn{Child: scan}
+
+	if got := drivingScan(marked); got != Node(scan) {
+		t.Fatalf("drivingScan(marked) = %#v, want the scan", got)
+	}
+	if got := drivingScan(unmarked); got != nil {
+		t.Fatalf("drivingScan(unmarked) = %#v, want nil — an ordinary dedup is a wall", got)
+	}
+
+	stamped := stampParallelScan(marked)
+	st, ok := stamped.(*DistinctOn)
+	if !ok {
+		t.Fatalf("stampParallelScan returned %T, want *DistinctOn", stamped)
+	}
+	if s, ok := st.Child.(*SeqScan); !ok || !s.Parallel {
+		t.Fatal("stampParallelScan did not reach the scan under the marked partial Unique")
+	}
+	if got := stampParallelScan(unmarked); got != Node(unmarked) {
+		t.Fatal("stampParallelScan descended through an unmarked dedup")
+	}
+
+	unstamped := unstampParallelScan(st)
+	ut := unstamped.(*DistinctOn)
+	if s, ok := ut.Child.(*SeqScan); !ok || s.Parallel {
+		t.Fatal("unstampParallelScan did not strip the label under the marked partial Unique")
+	}
+	if !drivingScanCrossesSort(&DistinctOn{PartialUnique: true, Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort must see the Sort under the marked partial Unique")
+	}
+	if drivingScanCrossesSort(&DistinctOn{Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort descended through an unmarked dedup")
+	}
+}
+
+// TestUniquePathCostIsCreateUpperUniquePath pins M0146-0005bi against PG
+// 18.3's create_upper_unique_path on TPC-DS Q87's leader Unique: the input's
+// startup unchanged, and 0.0025 per compared column per input row on top of
+// its total (`Gather Merge (cost=19352.41..19738.09 rows=3260)` ->
+// `Unique (cost=19352.41..19762.54)` over three columns).
+func TestUniquePathCostIsCreateUpperUniquePath(t *testing.T) {
+	got := uniquePathCost(19352.41, 19738.09, 3260, 3, defaultCostParams())
+	if got.Startup != 19352.41 || math.Abs(got.Total-19762.54) > 0.005 {
+		t.Fatalf("Unique cost %+v, want PG's 19352.41..19762.54", got)
 	}
 }

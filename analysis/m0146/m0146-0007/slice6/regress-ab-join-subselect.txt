@@ -1,0 +1,70 @@
+== join
+< +-------------------------------------------
+> +-----------------------------------
+< +  Hash Cond: (c1.f1 = f1)
+> +  Hash Cond: (f1 = f1)
+1934d1933
+< +  CTE ctetable
+1936,1937d1934
+< +  ->  CTE Scan on ctetable c1
+< +  Output: f1
+< +  ->  CTE Scan on ctetable c2
+< +  Output: f1
+< +  ->  CTE Scan on ctetable c3
+< +  Output: f1
+< +(15 rows)
+> +  ->  Values (1 rows)
+> +  ->  Values (1 rows)
+> +(10 rows)
+2511d2505
+< -  ->  Nested Loop
+2513a2508
+> -  ->  Nested Loop
+2557d2551
+< -  ->  Nested Loop
+2559a2554
+> -  ->  Nested Loop
+4375,4381d4369
+< +  ->  Hash
+< +  ->  Index Scan using t_a_key on public.t t4
+< +  Index Cond: (a = 1)
+< +  Output: a, b
+< +  ->  Index Only Scan using t_a_key on public.t t3
+< +  Index Cond: (a = t5.a)
+< +  Output: a
+4390a4379,4385
+> +  ->  Index Scan using t_a_key on public.t t4
+> +  Index Cond: (a = 1)
+> +  Output: a, b
+> +  ->  Index Only Scan using t_a_key on public.t t3
+> +  Index Cond: (a = t5.a)
+> +  Output: a
+> +  ->  Hash
+<    ->  Nested Loop Left Join
+< -  Output: i8.q1, i8.q2, (i4.f1 + 1)
+> +  ->  Nested Loop Left Join
+< +  ->  Nested Loop Left Join
+>    ->  Nested Loop Left Join
+> -  Output: i8.q1, i8.q2, (i4.f1 + 1)
+< +  ->  Materialize
+>    ->  Materialize
+> -  Output: t3.c, t3.b
+<    ->  Materialize
+< -  Output: t3.c, t3.b
+> +  ->  Materialize
+== subselect
+< +------------------------------------------
+> +--------------------------------------------------------
+< +  Merge Cond: (x.n = x2.n)
+> +  Merge Cond: (n = n)
+2036d2035
+< +  CTE x
+< -  ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+> +  Output: f1, f2, f3
+>    ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+< +  ->  CTE Scan on x
+< +  Output: f1, n
+< +  ->  CTE Scan on x x2
+< +  Output: f1, n
+< +(10 rows)
+> +(7 rows)

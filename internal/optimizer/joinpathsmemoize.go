@@ -318,12 +318,16 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		Kind: PathMemoize,
 		// The wrapper stands for the same relation, the same rows and the same
 		// parameterisation as what it wraps — `create_memoize_path`
-		// (pathnode.c:1690-1698) copies `parent`, `param_info`, `rows` and both
-		// costs from the subpath. Only the RESCAN cost differs, and that is the
-		// number this path exists to carry.
+		// (pathnode.c) copies `parent`, `param_info` and `rows` from the
+		// subpath, and its first-scan costs are the subpath's plus one
+		// cpu_tuple_cost ("a small additional charge for caching the first
+		// entry"). The RESCAN cost is the number this path exists to carry.
+		// The extra startup is what keeps PG's plain parameterised probe,
+		// filed first, the incumbent when its Memoize twin ties it within
+		// STD_FUZZ_FACTOR (TPC-DS Q8's store probe, M0146-0005ea).
 		Rel:           innerPath.Rel,
 		Rows:          innerPath.Rows,
-		Cost:          innerPath.Cost,
+		Cost:          Cost{Startup: innerPath.Cost.Startup + cp.cpuTupleCost, Total: innerPath.Cost.Total + cp.cpuTupleCost},
 		Pathkeys:      innerPath.Pathkeys,
 		RequiredOuter: innerPath.RequiredOuter,
 		Children:      []*Path{innerPath},
@@ -502,17 +506,41 @@ func pathRescanCost(p *Path, cp costParams) (startup, total float64) {
 	switch {
 	case p.Kind == PathMemoize && p.MemoizeInfo != nil:
 		return p.MemoizeInfo.rescan.Startup, p.MemoizeInfo.rescan.Total
-	case p.Kind == PathSort:
-		run := cp.cpuOperatorCost * p.Rows
-		// The spill arm: a sort that did not fit work_mem must be re-read from
-		// disk, so the rescan pays for the pages too (costsize.c:4718-4726).
-		if nbytes := relationByteSize(p.Rows, pathAvgVarBytes(p), pathNCols(p)); nbytes > float64(cp.workMem) {
-			run += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
-		}
-		return 0, run
-	default:
-		return p.Cost.Startup, p.Cost.Total
+	case p.Kind == PathSort, p.Kind == PathMaterial:
+		// cost_rescan's shared T_Material/T_Sort arm (costsize.c:4703-4729):
+		// `cpu_operator_cost` per tuple, no startup, plus a re-read charge
+		// when the buffer spilled. materialRescanCost holds the expression so
+		// the two kinds cannot drift.
+		return 0, materialRescanCost(cp, p.Rows, pathAvgVarBytes(p), pathNCols(p))
 	}
+	switch leaf := pathLeafNode(p); {
+	case isTuplestoreScanNode(leaf):
+		// T_CteScan / T_WorkTableScan (costsize.c:4678-4700): the result sits
+		// in a tuplestore after the first pass, so a rescan re-reads it at
+		// cpu_tuple_cost per tuple (not cpu_operator_cost — unlike Material,
+		// the scan still filters and projects), plus a re-read charge when
+		// the store spilled.
+		return 0, tuplestoreRescanCost(cp, p.Rows, pathAvgVarBytes(p), pathNCols(p))
+	case isFunctionScanNode(leaf):
+		// T_FunctionScan (costsize.c:4647-4658): the function runs to
+		// completion into a tuplestore on the first pass, so its eval cost —
+		// all startup — is not paid again; the run cost is.
+		return 0, p.Cost.Total - p.Cost.Startup
+	}
+	// default — including PG's single-batch T_HashJoin arm, which needs the
+	// path's batch count that goopg's hash-join Path does not carry
+	// (deferral ledger, M0146-0010).
+	return p.Cost.Startup, p.Cost.Total
+}
+
+// tuplestoreRescanCost is cost_rescan's T_CteScan/T_WorkTableScan expression
+// (costsize.c:4684-4697) — materialRescanCost's shape at cpu_tuple_cost.
+func tuplestoreRescanCost(cp costParams, rows, avgVarBytes float64, ncols int) float64 {
+	run := cp.cpuTupleCost * rows
+	if nbytes := relationByteSize(rows, avgVarBytes, ncols); nbytes > float64(cp.workMem) {
+		run += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
+	}
+	return run
 }
 
 // relationByteSize is `relation_byte_size` (costsize.c): rows x per-tuple
@@ -528,81 +556,12 @@ func relationByteSize(rows, avgVarBytes float64, ncols int) float64 {
 	return rows * w
 }
 
-// nestLoopInnerRescanCost prices a rescan of a nested loop's inner side the way
-// goopg's EXECUTOR actually performs it. take2 P2-06.
-//
-// PG chooses per plan whether to interpose a Material node, pays cost_material
-// for it, and then gets cheap rescans (cost_rescan's T_Material arm). goopg's
-// nested loop does not choose: openNestedLoop ALWAYS wraps the inner in
-// newMaterializeOp (join_nl_stream.go:108), unbounded by default. So the
-// executor is permanently in PG's materialised case, and the cost model was
-// pricing the un-materialised one — charging a full re-execution per outer row
-// for a replay that reads a cache.
-//
-// A `PathMaterial` kind is deliberately NOT introduced. The same reasoning
-// already recorded for the merge arm applies (joinpathsmergeouter.go:52-72): the
-// executor materialises unconditionally, so a path-level Material node would
-// buffer the inner twice.
-//
-// The two halves of cost_material (costsize.c:2485-2507) both land here:
-//
-//	build  — 2 * cpu_operator_cost * tuples, the write-then-read pass, charged
-//	         ONCE, plus a spill charge when the cache exceeds work_mem.
-//	rescan — cpu_operator_cost * tuples, the replay (cost_rescan's T_Material
-//	         arm, costsize.c:4703-4712), charged per additional outer row.
-// nestLoopInnerRescanStartup — R69 slice (a): PG's `cost_rescan`
-// STARTUP arm for the nestloop join (`initial_cost_nestloop` charges
-// `(outer−1) × rescan_startup`; all three nestloop call sites passed
-// literal 0). A parameterised inner re-pays its startup (index
-// descent) per rescan (default arm); a Memoize inner pays its modeled
-// rescan startup; a materialised/plain inner pays 0 (`T_Material`
-// arm). Only the first case changes behaviour; the others return
-// exactly what the literal did, by construction.
-func nestLoopInnerRescanStartup(inner *Path) float64 {
-	if inner == nil {
-		return 0
-	}
-	if inner.Kind == PathMemoize && inner.MemoizeInfo != nil {
-		return inner.MemoizeInfo.rescan.Startup
-	}
-	if inner.RequiredOuter != 0 {
-		return inner.Cost.Startup
-	}
-	return 0
-}
-
-func nestLoopInnerRescanCost(inner *Path, cp costParams) (build, rescan float64) {
-	if inner == nil {
-		return 0, 0
-	}
-	// A Memoize inner already models its own reuse; do not charge it twice.
-	if inner.Kind == PathMemoize && inner.MemoizeInfo != nil {
-		return 0, inner.MemoizeInfo.rescan.Total - inner.MemoizeInfo.rescan.Startup
-	}
-	// A PARAMETERISED inner cannot be materialised: every outer row supplies
-	// different parameters, so the "cache" would be wrong, and PG's
-	// create_material_path is likewise only reached for unparameterised inners.
-	// Such an inner really is re-executed per outer row, which is the default
-	// cost_rescan arm.
-	if inner.RequiredOuter != 0 {
-		st, tot := pathRescanCost(inner, cp)
-		return 0, tot - st
-	}
-	rows := inner.Rows
-	if rows < 1 {
-		rows = 1
-	}
-	build = 2 * cp.cpuOperatorCost * rows
-	rescan = cp.cpuOperatorCost * rows
-	// The spill arm. goopg's cache runs UNBOUNDED by default
-	// (inner.setUnbounded, join_nl_stream.go:110-124), which is why this is
-	// charged on the work_mem the planner is solving for rather than on a
-	// bound the executor may not apply: the point of the term is to stop the
-	// planner choosing a shape whose cache does not fit, which is the Q54
-	// cliff recorded at that call site.
-	if nbytes := relationByteSize(rows, pathAvgVarBytes(inner), pathNCols(inner)); nbytes > float64(cp.workMem) {
-		build += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
-		rescan += cp.seqPageCost * math.Ceil(nbytes/blockSizeBytes)
-	}
-	return build, rescan
-}
+// M0146-0010 retired the two helpers that used to sit here
+// (`nestLoopInnerRescanCost` / `nestLoopInnerRescanStartup`, take2 P2-06 and
+// R69 slice (a)): they fused PG's materialise-election into the pricing of
+// EVERY inner, which was right only while the executor materialised
+// unconditionally and no PathMaterial existed. Both call sites now read
+// `pathRescanCost` directly — `cost_rescan` per candidate, with the
+// PathMaterial arm answering the replay price for the materialised form —
+// and the build half moved into the PathMaterial's own Cost via
+// costMaterial (materialize.go), where PG keeps it (costsize.c:2485).

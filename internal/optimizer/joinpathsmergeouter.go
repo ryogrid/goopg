@@ -49,28 +49,20 @@ package optimizer
 //     why `tryMergeJoinPath` takes the result ordering separately from the sort
 //     keys.
 //
-// **The materialize-inner decision, and why goopg does not make it.** PG's
-// mergejoin executor rewinds the inner side with mark/restore, so
-// `final_cost_mergejoin` (costsize.c:3986-4040) must decide whether to interpose a
-// Material node: mandatorily when the inner is used unsorted and its node type
-// cannot mark/restore (a nestloop or merge below it cannot), and opportunistically
-// when re-fetching looks dearer than buffering. goopg's merge executor does not
-// rewind at all — `mergeJoinStream.bufferGroup` (internal/executor/join_merge_stream.go:616)
-// consumes each inner equal-key group into memory, spilling past `work_mem` to an
-// overflow file, and replays it from there. The materialisation PG chooses per PLAN
-// is therefore already made per GROUP, unconditionally, in goopg's executor. Two
-// consequences, both load-bearing:
-//
-//   - The correctness-mandatory arm (:3998-4014) has no goopg analogue. Any
-//     presorted inner path is consumable here regardless of its kind, so this arm
-//     may take a merge or nested-loop path as its inner where PG would first have
-//     to wrap it. No `PathMaterial` kind is introduced, and one would be wrong:
-//     it would buffer the inner twice.
-//   - The COST of that buffering is not charged. `mergeJoinCost` prices one pass
-//     over each input (`cost_funcs.go`), with no `rescanratio` term for duplicate
-//     inner groups and no charge for the group file. PG's model has both. Ledgered
-//     against the cost work, not approximated here — inventing a rescan factor
-//     without `mergejoinscansel`'s duplicate estimate would move plans on a guess.
+// **The materialize-inner decision (M0146-0005bd).** PG's mergejoin executor
+// rewinds the inner side with mark/restore, so `final_cost_mergejoin`
+// (costsize.c:3986-4040) decides whether to interpose a Material node:
+// mandatorily when the inner is used unsorted and its node type cannot
+// mark/restore, opportunistically when re-fetching duplicate groups looks dearer
+// than buffering, and for an explicitly sorted inner larger than work_mem.
+// `mergeJoinCost` (cost_funcs.go) ports the election and its prices, and the
+// merge candidate wraps an elected presorted inner in a PathMaterial so EXPLAIN
+// shows `Materialize` where PG does. goopg's merge executor also buffers each
+// inner equal-key group itself (`mergeJoinStream.bufferGroup`,
+// internal/executor/join_merge_stream.go), so a Material inner is buffered
+// twice at run time — the plan and its price are PG's, the executor's extra
+// buffer is not charged. An elected Material above an explicitly SORTED inner
+// is priced but not emitted (the merge plan absorbs that Sort child) — ledgered.
 //
 // **What this arm deliberately does not carry.** PG's `match_unsorted_outer` opens
 // with a jointype gauntlet (`nestjoinOK` / `useallclauses`, joinpath.c:1833-1852):
@@ -118,8 +110,18 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+	// "Can't do anything else if outer path needs to be unique'd"
+	// (joinpath.c:2001-2003): a unique-ified outer gets nested loops only.
+	if mu.side == uniqueSideOuter {
+		return
+	}
 	innerCheapestTotal := inner.CheapestTotal
+	// A unique-ified inner is considered only as the unique-ified cheapest
+	// total, and only sorted (:1881-1890, :1636-1638).
+	if mu.side == uniqueSideInner {
+		innerCheapestTotal = mu.path
+	}
 	if innerCheapestTotal == nil {
 		return
 	}
@@ -142,13 +144,13 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, j
 		if pathParamByRel(op, inner) {
 			continue
 		}
-		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, jt, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		generateMergeJoinPaths(joinrel, inner, op, innerCheapestTotal, cp, jt, innerUnique, groups, outer.Relids, residual, mergeTuplesFor, scanSelFor, paramSrc, mu.side == uniqueSideInner)
 	}
 }
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, uniqueInner bool) {
 	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
 	if len(matched) == 0 {
 		return
@@ -200,7 +202,13 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// evaluated nowhere — the truncation demotion only ever re-adds clauses cut
 	// from the ALREADY-trimmed list.
 	fullResidual := demoteUnmatchedGroupClauses(residual, groups, mergeClauses)
-	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, outerPath, innerCheapestTotal, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, innerSortKeys, mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
+
+	// "Can't do anything else if inner path needs to be unique'd"
+	// (:1636-1638): the presorted inners below are the raw rel's paths.
+	if uniqueInner {
+		return
+	}
 
 	// The truncation search (:1685-1782). `cheapestTotalInner` /
 	// `cheapestStartupInner` carry the best inner found SO FAR, and a candidate
@@ -216,7 +224,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 	// the trackers start empty — PG's note that it does not reject
 	// `inner_cheapest_total` merely for matching some shorter prefix.
 	var cheapestTotalInner, cheapestStartupInner *Path
-	if pathkeysContainedIn(innerCheapestTotal.Pathkeys, innerSortKeys) {
+	if pathkeysContainedInRel(inner, innerCheapestTotal.Pathkeys, innerSortKeys) {
 		cheapestTotalInner = innerCheapestTotal
 		cheapestStartupInner = innerCheapestTotal
 	}
@@ -234,7 +242,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 				// Both sort-key lists are nil: the outer is ordered by
 				// construction and this inner was SELECTED for already being
 				// ordered, so neither side is sorted here.
-				tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, resultKeys, nil, nil,
+				tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, nil,
 					newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 			}
 			cheapestTotalInner = ip
@@ -251,7 +259,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 					newClauses = trimmedMergeClauses(mergeClauses, trial, cnt, numSortKeys, outerRelids)
 				}
 				if len(newClauses) > 0 {
-					tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, resultKeys, nil, nil,
+					tryMergeJoinPath(joinrel, outerPath, ip, outerRelids, inner.Relids, cp, jt, innerUnique, resultKeys, nil, nil,
 						newClauses, demoteDroppedMergeClauses(fullResidual, mergeClauses, newClauses), mergeTuplesFor, scanSelFor, paramSrc)
 				}
 			}
@@ -273,8 +281,8 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 // the merge keys); the outer needs no sort by construction; the inner takes
 // the full sort-key list exactly as the serial first candidate does.
 func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
-	jt parser.JoinType, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
-	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+	jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
+	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
 
 	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
 		sub := "mode"
@@ -295,6 +303,14 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 	// for. Each ordered partial outer gets the first candidate (the
 	// truncation search stays deferred). Unordered partial outers are
 	// skipped: `sort_inner_and_outer` serves unordered inputs.
+	// match_unsorted_outer's parallel block (joinpath.c:2017-2031) refuses a
+	// unique-ified outer, whose uniqueness a partial outer could not
+	// guarantee; a unique-ified inner is usable only if parallel-safe
+	// (:2039-2050).
+	if mu.side == uniqueSideOuter || (mu.side == uniqueSideInner && (mu.path == nil || !mu.path.ParallelSafe)) {
+		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M-uniq", "jt="+traceJoinTypeName(jt))
+		return
+	}
 	groups := mergeKeyGroups(keys, outer.Relids)
 	if len(groups) == 0 {
 		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", "sub=no-groups jt="+traceJoinTypeName(jt))
@@ -348,11 +364,14 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 		// worker reads its partition). resultKeys is the outer's full
 		// ordering.
 		i := cheapestParallelSafeTotalInner(inner.Pathlist)
+		if mu.side == uniqueSideInner {
+			i = mu.path
+		}
 		if i == nil {
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M5", cand)
 			continue
 		}
-		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, "mergeu", op.Pathkeys, nil, innerSortKeys,
+		tryPartialMergeJoinPath(s, joinrel, op, i, outer.Relids, inner.Relids, cp, jt, innerUnique, "mergeu", op.Pathkeys, nil, innerSortKeys,
 			mergeClauses, fullResidual, mergeTuplesFor, scanSelFor, paramSrc)
 	}
 }
@@ -504,7 +523,7 @@ func getCheapestPathForPathkeys(paths []*Path, keys []PathKey, criterion costSel
 		if matched != nil && comparePathCosts(matched, p, criterion) <= 0 {
 			continue
 		}
-		if p.RequiredOuter == 0 && pathkeysContainedIn(p.Pathkeys, keys) {
+		if p.RequiredOuter == 0 && pathkeysContainedInRel(p.Rel, p.Pathkeys, keys) {
 			matched = p
 		}
 	}

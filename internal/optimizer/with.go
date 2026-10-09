@@ -43,6 +43,48 @@ type plannedCTE struct {
 	// (side effects run once, rows replayed) and recursive bodies
 	// (WorkTableScan protocol) never qualify.
 	inlineEligible bool
+	// needsScan: once inlined, is the body a subquery PG's pull-up
+	// refuses (is_simple_subquery false and not a simple UNION ALL)? Such
+	// a reference stays an RTE_SUBQUERY and plans as a SubqueryScan
+	// (wrapInlinedCTEScans), which setrefs keeps unless trivial.
+	needsScan bool
+	// astRefs is parse analysis' cterefcount: how many times the statement
+	// that owns the WITH names this CTE as a relation, counted from the AST
+	// before planning (countCTEReferences; shadowing declines — only an
+	// overcount). refs above is final only after planning, and the
+	// reference-site pull-up (M0146-0007e) must decide while the FROM list
+	// is being planned.
+	astRefs int
+	// bodyRefDeltas records how many references to OTHER CTEs planning this
+	// body at the WITH added. When the reference site pulls the body up
+	// (M0146-0007e), the preplanned body is never run and the parent
+	// re-plans those references, so the deltas are taken back once
+	// (pulledUp) — otherwise a CTE the body read once would look doubly
+	// referenced and lose its own inlining.
+	bodyRefDeltas map[*plannedCTE]int
+	pulledUp      bool
+	// query and aliasColumns are the CTE's written body and column-alias
+	// list, kept for the reference-site pull-up (cteAsDerivedItem).
+	query        *parser.SelectStmt
+	aliasColumns []string
+	// materialized is the declaration's MATERIALIZED / NOT MATERIALIZED
+	// keyword ("" when absent), volatile whether the planned body calls a
+	// volatile function, and selectOwned whether the WITH belongs to a
+	// SELECT (PG's cmdType == CMD_SELECT). Together with refs they are
+	// SS_process_ctes' inline_cte gate — see inlinable. M0146-0007.
+	materialized string
+	volatile     bool
+	selectOwned  bool
+	// declScope is the CTE-name scope the body was declared in: the outer
+	// statements' entries and this WITH list's earlier siblings, but not
+	// this CTE or a later sibling. A body re-planned at a reference site
+	// (inlinesEachReference) resolves its names here, as PG's body
+	// resolves them at the WITH's own level.
+	declScope map[string]*plannedCTE
+	// eachRef is inline_cte for `NOT MATERIALIZED` on a multiply-referenced
+	// CTE — see inlinesEachReference. Computed when the entry is created,
+	// so a later sibling's body already inlines its references.
+	eachRef bool
 	// declSeq orders CTEs by WITH-list declaration (left to right, and an
 	// enclosing statement's list after any list declared inside a body it
 	// planned first). EXPLAIN reads it through CTEScan.DeclSeq to print the
@@ -87,6 +129,101 @@ func (e *plannedCTE) outputStats() *cteOutputStats {
 	return e.synth
 }
 
+// inlinable is SS_process_ctes' inline_cte gate (postgres/src/backend/
+// optimizer/plan/subselect.c) for the cases goopg can express: a plain
+// non-recursive SELECT body, owned by a SELECT, referenced exactly once,
+// not written MATERIALIZED, with no volatile function. PG then plans the
+// reference as an ordinary subquery. goopg keeps the CTEScan so the body's
+// single consumer can take pushed-down quals, but runs it without the
+// materialisation fence (the executor streams it) and EXPLAIN renders it as
+// PG renders the subquery. Final only once the whole statement is planned
+// (refs), like pushQualsThroughSingleRefCTEs. M0146-0007.
+//
+// NOT MATERIALIZED on a multiply-referenced CTE is inlinesEachReference.
+func (e *plannedCTE) inlinable() bool {
+	return e != nil && e.inlineEligible && e.selectOwned && e.refs == 1 &&
+		e.materialized != "materialized" && !e.volatile
+}
+
+// inlinesEachReference is SS_process_ctes' inline_cte gate for a CTE written
+// `NOT MATERIALIZED` and referenced more than once (cterefcount > 1): PG
+// copies the body into every reference, each an ordinary RTE_SUBQUERY that
+// pull_up_subqueries may flatten. The gate's other terms are the
+// single-reference ones plus contain_outer_selfref (a body reading an
+// enclosing recursive CTE's worktable stays shared). goopg also keeps a
+// correlated body shared: a reference may sit at a deeper query level than
+// the WITH, and re-planning the body there would shift its outer-reference
+// levels (PG's IncrementVarSublevelsUp). M0146-0007f.
+func (e *plannedCTE) inlinesEachReference() bool {
+	return e != nil && e.eachRef
+}
+
+// inlinesAsUnionAll is inline_cte for a single-reference CTE whose body is
+// a simple UNION ALL (M0146-0065). PG plans the reference as the subquery
+// inline_cte makes of it, which pull_up_subqueries then flattens into an
+// appendrel (pull_up_simple_union_all, prepjointree.c), so the join sees a
+// (Parallel) Append. goopg's FROM pull-up splices only a simple SELECT body,
+// so this reference is planned as the ordinary subquery instead
+// (planCTEReferenceAsSubquery), whose appendrel mark the search consumes.
+// The gates are cteAsDerivedItem's single-reference ones; a correlated body
+// stays shared for inlinesEachReference's reason.
+func (e *plannedCTE) inlinesAsUnionAll() bool {
+	return e != nil && e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
+		e.materialized != "materialized" && !e.volatile && !e.isDML &&
+		e.query != nil && len(e.aliasColumns) == 0 &&
+		subqueryChainIsSimpleUnionAll(e.query) && !planHasOuterRef(e.body)
+}
+
+// eachReferenceInlineGate computes plannedCTE.eachRef for a non-recursive
+// SELECT body as preplanWithClause registers it. owner is the SELECT that
+// owns the WITH (nil for INSERT/UPDATE/DELETE/MERGE, whose CTEs PG never
+// inlines: cmdType != CMD_SELECT).
+func eachReferenceInlineGate(owner *parser.SelectStmt, cte *parser.CommonTableExpr, body Node, volatile bool) bool {
+	if owner == nil || cte.Materialized != "not materialized" || volatile {
+		return false
+	}
+	if planHasWorkTableScan(body) || planHasOuterRef(body) {
+		return false
+	}
+	return countCTEReferences(owner, cte.Name) > 1
+}
+
+// planHasWorkTableScan is contain_outer_selfref over a non-recursive body:
+// any WorkTableScan in it reads an enclosing recursive CTE's worktable.
+// A recursive CTE nested inside the body also has one, so this over-reports,
+// which only keeps the body shared.
+func planHasWorkTableScan(n Node) bool {
+	found := false
+	forEachPlanNodeDeep(n, func(x Node) {
+		if _, ok := x.(*WorkTableScan); ok {
+			found = true
+		}
+	})
+	return found
+}
+
+// planHasVolatileExpr is contain_volatile_functions over a planned body,
+// sublinks included, using the pull-up gate's builtin list and routine
+// lookup (exprListHasVolatileBuiltin).
+func planHasVolatileExpr(n Node, cat catalog.Catalog) bool {
+	var exprs []Expr
+	walkPlanExprsDeep(n, 0, func(e Expr, _ int) { exprs = append(exprs, e) })
+	return exprListHasVolatileBuiltin(exprs, cat)
+}
+
+// markSelectOwnedCTEs flags the entries `with` declared as owned by a
+// SELECT, after preplanWithClause registered them.
+func markSelectOwnedCTEs(with *parser.WithClause) {
+	if with == nil || with.Recursive {
+		return
+	}
+	for _, cte := range with.CTEs {
+		if e := planCTEs[strings.ToLower(cte.Name)]; e != nil && e.declPos == cte.Pos() {
+			e.selectOwned = true
+		}
+	}
+}
+
 // cteDeclSeq stamps plannedCTE.declSeq. Package-global and unsynchronised,
 // exactly like planCTEs above (planning is single-goroutine per statement);
 // only the relative order within one plan tree is ever read, so the counter
@@ -125,7 +262,7 @@ var planCTEs map[string]*plannedCTE
 // EX3-03 cut 1: ps is the enclosing statement's settings. CTE bodies
 // routinely contain the join tree (the Q9 pattern), so these are the
 // highest-value conversions — every body below prices under ps.
-func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (restore func(), dmlPlans []dmlCTEPlan, err error) {
+func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (restore func(), dmlPlans []dmlCTEPlan, err error) {
 	if with == nil {
 		return func() {}, nil, nil
 	}
@@ -242,6 +379,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 		// to a later one.
 		// A-01(ii) cut 2: the body shares the statement scope.
 		// EX3-03 cut 1: under ps — the CTE body holds the join tree.
+		refsBefore := make(map[*plannedCTE]int, len(cur))
+		for _, e := range cur {
+			refsBefore[e] = e.refs
+		}
 		body, err := planSelectWithSettings(cte.Query, cat, ps, scope)
 		if err != nil {
 			restore()
@@ -283,8 +424,39 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog, ps PlannerS
 			declPos: cte.Pos(),
 			// Plain non-recursive SELECT body: the only shape whose Child
 			// a single-reference qual may descend into. The WITH RECURSIVE
-			// branch above and the DML branch never set this.
-			inlineEligible: true,
+			// branch above and the DML branch never set this, and neither
+			// does a body holding a locking clause (contain_dml counts
+			// row marks as DML, M0146-0007g).
+			inlineEligible: !selectTreeHasLocking(cte.Query),
+			needsScan: !subqueryChainIsSimpleUnionAll(cte.Query) &&
+				derivedSubqueryNeedsScan(cte.Query, body),
+			materialized: cte.Materialized,
+			volatile:     planHasVolatileExpr(body, cat),
+			query:        cte.Query,
+			aliasColumns: cte.Columns,
+		}
+		for e, before := range refsBefore {
+			if d := e.refs - before; d > 0 {
+				if entry.bodyRefDeltas == nil {
+					entry.bodyRefDeltas = map[*plannedCTE]int{}
+				}
+				entry.bodyRefDeltas[e] = d
+			}
+		}
+		entry.declScope = make(map[string]*plannedCTE, len(cur))
+		for k, v := range cur {
+			entry.declScope[k] = v
+		}
+		entry.eachRef = entry.inlineEligible && eachReferenceInlineGate(owner, cte, body, entry.volatile)
+		// M0146-0065: the single-reference gate's inputs are stamped here
+		// too, not only after the whole list is preplanned
+		// (markSelectOwnedCTEs / stampCTEReferenceCounts), so a later
+		// sibling's body already inlines its reference to this CTE — PG's
+		// inline_cte runs on the whole WITH list before any body is planned.
+		// owner is non-nil exactly when the WITH belongs to a SELECT.
+		if owner != nil {
+			entry.selectOwned = true
+			entry.astRefs = countCTEReferences(owner, cte.Name)
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}

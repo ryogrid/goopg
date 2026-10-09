@@ -1769,6 +1769,13 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 				return err
 			}
 		}
+		// The DECLARE default's assignment coercion, as in routine bodies
+		// (plpgsqlAssignCoerce, M0146-0080): `b bool := 'true'` stores a
+		// bool, `v text := 7` stores '7'.
+		value, err = plpgsqlAssignCoerce(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name), o.ctx)
+		if err != nil {
+			return err
+		}
 		if addErr := frame.add(d.Name, typ, value); addErr != nil {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: addErr.Error()}
 		}
@@ -4023,7 +4030,13 @@ afterExistsCheck:
 		// nextval(...) (vs an identity column's INTERNAL 'i' ADD GENERATED form).
 		// M0110-0001 (slice 120 identity, slice 121 serial).
 		if c.IdentityColumn || isSerial {
-			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
+			// M0146-0039: the implicit sequence takes the table's persistence
+			// (generateSerialExtraStmts: seqstmt->sequence->relpersistence =
+			// the table's), so a TEMP table's serial is a TEMP sequence.
+			if tbl.Temp {
+				SetSequenceTemporary(seqName, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			}
+			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName, tbl.Temp)
 		}
 		// Restart persistence: mark which column this implicit sequence backs
 		// (the serial spelling / identity kind — replay restores the column's
@@ -5210,10 +5223,26 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
+	// The INTO clause's relpersistence (createas.c create_ctas_internal →
+	// DefineRelation): TEMP makes a session-local relation in the backend's
+	// pg_temp namespace, UNLOGGED an unlogged one — set exactly as
+	// execCreateTable does, before the catalog sync below persists the row.
+	// M0146-0039a.
+	tbl.Unlogged = s.Unlogged
+	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
+	}
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// A temp table lives in pg_temp, never in the search_path's schema.
 	// M0097-0022.
-	if s.Name.Schema == "" {
+	if s.Name.Schema == "" && !s.Temporary {
 		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
 			tbl.Schema = ws
 		}
@@ -5222,10 +5251,9 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
 		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
-		// CTAS never sets tbl.Temp (a pre-existing gap), so gate on the
-		// statement's Temporary flag instead — the 42P16 guard at the top of this
-		// function already rejected a non-temp ON COMMIT. M0134-0072.
-		if s.OnCommit != "" && s.Temporary {
+		// The 42P16 guard at the top of this function already rejected a
+		// non-temp ON COMMIT. M0134-0072.
+		if s.OnCommit != "" && tbl.Temp {
 			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
 		}
 	}
@@ -8894,7 +8922,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return err
 		}
-		return nil
+		return o.enableDisableTrigger(tbl, s)
 	}
 	// Handle OWNER TO role — record the new owning role on the in-memory table so
 	// the VACUUM/ANALYZE/CLUSTER maintenance-privilege check (a non-superuser
@@ -14720,6 +14748,39 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			idx.ExclusionOp = xp.ExclusionOp
 		}
 	}
+	// M0146-0015a (banner item 2a): an explicit opclass that resolves to the
+	// column type's OWN default is the default — pg_index.indclass records
+	// the same OID either way and pg_get_indexdef does not print it — so the
+	// checkpoint-restart path (loadUserIndexesFromHeap →
+	// ResolveIndexColumnOpclassName) can only ever reconstruct it as "".
+	// Keeping the spelling here made ColOpClasses[i] differ across a clean
+	// restart, which flips buildPGIndexKeyDesc's on-disk-format decision
+	// (non-empty opclass → refuse → goopg blob keys; "" → PG per-datum
+	// tuple keys): probes then encode under a different format than the
+	// index was built with and a clean restart silently returns wrong
+	// rows. Normalise the name away at CREATE time so both construction
+	// paths produce the same catalog entry — must run BEFORE
+	// bulkBuildBTreeFull, which encodes under whatever descriptor the
+	// normalised catalog entry yields, and before the WAL/catalog-heap
+	// emission that replays/persists it. A name resolving to a non-default
+	// OID (text_pattern_ops, or a user opclass shadowing a builtin name)
+	// keeps its spelling and keeps refusing the tuple format — equally
+	// consistent across restart, since indclass preserves its OID and the
+	// reverse-resolver returns the name back.
+	for i, opName := range idx.ColOpClasses {
+		if opName == "" {
+			continue
+		}
+		var typeName string
+		if i < len(cols) && cols[i] != nil {
+			typeName = cols[i].Type.Name
+		}
+		methodOID := catalog.AccessMethodOIDByName(idx.Method)
+		if named := o.ctx.Catalog.ResolveIndexColumnOpclassOID(opName, typeName, methodOID); named != 0 &&
+			named == o.ctx.Catalog.ResolveIndexColumnOpclassOID("", typeName, methodOID) {
+			idx.ColOpClasses[i] = ""
+		}
+	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {
@@ -18548,6 +18609,10 @@ func stampCatalogRowsTuple(ctx *Context, rel storage.RelFileNode, xmax storage.T
 				// checks Xmax!=0), but runtime seq scans need this hint to
 				// reliably hide catalog rows that were re-synced.
 				storage.PageSetHeapTupleXmaxCommitted(page, lineNo)
+				// M0146-0063b: a deleted row leaves the page not all-visible.
+				if ctx.VM != nil {
+					ctx.VM.ClearBlock(rel, blk)
+				}
 				// Use MarkDirtyForceFPI to emit a fresh full-page image of
 				// the post-stamp page. This overrides any stale FPI that
 				// was captured before the row existed (e.g. the mirror
@@ -19763,6 +19828,58 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	return nil
 }
 
+// enableDisableTrigger applies ALTER TABLE … ENABLE [ALWAYS | REPLICA] /
+// DISABLE TRIGGER {name | ALL | USER} (trigger.c EnableDisableTrigger):
+// it sets pg_trigger.tgenabled on the named trigger, on every user trigger
+// (USER), or on every trigger including the internal RI ones (ALL).
+// goopg enforces foreign keys without triggers, so ALL sets the stand-in
+// state on each constraint instead. That is CheckTrigEnabled for an FK
+// this table owns, and ActionTrigEnabled for an FK that references it.
+// M0146-0082.
+func (o *ddlOp) enableDisableTrigger(tbl *catalog.Table, s *parser.AlterTableStmt) error {
+	if s.TriggerFireMode == "" {
+		return nil
+	}
+	mode := s.TriggerFireMode[0]
+	switch s.TriggerTargetKind {
+	case "name":
+		for i := range tbl.Triggers {
+			if tbl.Triggers[i].Name == s.TriggerName {
+				tbl.Triggers[i].Enabled = mode
+				return nil
+			}
+		}
+		return &ExecError{Code: "42704",
+			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.TriggerName, tbl.Name)}
+	case "user", "all":
+		for i := range tbl.Triggers {
+			tbl.Triggers[i].Enabled = mode
+		}
+	}
+	if s.TriggerTargetKind != "all" {
+		return nil
+	}
+	for i := range tbl.ForeignKeys {
+		if !tbl.ForeignKeys[i].NotEnforced {
+			tbl.ForeignKeys[i].CheckTrigEnabled = mode
+		}
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, ref := range im.FindFKsReferencingTable(tbl.Name) {
+			if ref.Child == nil || ref.FK.NotEnforced {
+				continue
+			}
+			for j := range ref.Child.ForeignKeys {
+				fk := &ref.Child.ForeignKeys[j]
+				if fk.Name == ref.FK.Name && strings.EqualFold(fk.RefTable, ref.FK.RefTable) {
+					fk.ActionTrigEnabled = mode
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // execCreatePolicy records a row-level security policy on its table so it
 // round-trips through pg_dump (pg_policy → dumpPolicy). goopg does NOT enforce
 // row-level security — this is schema fidelity only, mirroring the RLS ENABLE
@@ -20206,7 +20323,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// Create a virtual catalog table for SELECT * FROM seq_name. This also
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
-	o.createSeqCatalogTable(s.Name, name)
+	o.createSeqCatalogTable(s.Name, name, s.Temporary)
 	// CREATE UNLOGGED SEQUENCE: stamp relpersistence on the just-created
 	// catalog row. Post-hoc LookupTable+set (rather than threading unlogged
 	// through createSeqCatalogTable/CreateSequenceCatalogRelation) keeps the
@@ -20232,12 +20349,18 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // schema-qualified; SequenceRowData resolves both). Shared by the explicit
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
-func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
+func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string, temp bool) {
 	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	// B1.3b: the sequence's pg_class row is the reload's ONLY source of its
 	// name/schema (the retired kind-65 carried them before). Write it like
 	// any relation; the sequence reload re-registers the virtual relation.
 	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		// M0146-0039: a TEMP sequence's row carries relpersistence 't' so a
+		// restart does not bring it back as a permanent sequence.
+		if temp {
+			seqTbl.Temp = true
+			seqTbl.TempOwner = sessionTempOwner(o.ctx)
+		}
 		// Stamp the creating role as owner, mirroring CREATE TABLE's owner
 		// stamp (tablecmds.c DefineRelation -> heap_create_with_catalog
 		// ownerId = GetUserId(), see the CREATE TABLE call site above) — a
@@ -20587,6 +20710,11 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
+			// M0146-0063b: an index-only scan over the refreshed matview
+			// must not take these deleted rows' pages as all-visible.
+			if ctx.VM != nil {
+				ctx.VM.ClearBlock(rel, blk)
+			}
 		}
 		s.Unlock()
 		ctx.Pool.Unpin(s)
@@ -27208,7 +27336,11 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// No-op when the type name is unchanged — unless a USING clause is
 	// present, in which case PG still rewrites the column (the USING expr
 	// result must still be coerced to the target type).
-	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil {
+	// The type is unchanged only when its typmod is too: numeric(6,3) →
+	// numeric(5,1) rewrites the rows, rounding them to the new scale
+	// (M0146-0087).
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil &&
+		int64SlicesEqual(oldCatalogType.Args, newCatalogType.Args) {
 		return nil
 	}
 
@@ -27305,6 +27437,15 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 				// PG performs the coercion during ATRewriteTable's expression
 				// evaluation, which has no source location. pos 0.
 				converted, cErr := evalCast(src, newCatalogType.Name, 0, o.ctx)
+				if cErr == nil && !newCatalogType.IsArray {
+					if prec, scale, ok := numericColumnTypmod(newCatalogType); ok && isTypmodNumericColumn(catalog.Column{Type: newCatalogType}) {
+						converted, cErr = applyNumericTypmod(converted, prec, scale)
+						if cErr != nil {
+							convErr = cErr
+							break
+						}
+					}
+				}
 				if cErr != nil {
 					// Coercion failure: propagate deterministically BEFORE
 					// Phase 2 (catalog mutation) / Phase 3 (heap truncation)
@@ -27925,4 +28066,17 @@ func buildCallArgListStr(args []parser.FunctionArg) string {
 		parts[i] = strings.ToLower(a.Type.Name)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// int64SlicesEqual reports whether two typmod argument lists are equal.
+func int64SlicesEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -1,0 +1,5 @@
+Largest per-query runtime deltas (ms, previous sweep -> this sweep):
+Q4 6712 -> 10161 (plan changed: CTE-join order; both orders differ from PG, census record unchanged)
+Q23 9713 -> 11878 (plan unchanged)
+Q58 1237 -> 3054 (plan unchanged)
+Plans changed: Q4 Q11 Q31 Q44 Q64

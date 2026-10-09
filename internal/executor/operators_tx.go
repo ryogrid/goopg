@@ -435,6 +435,15 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	// Restore NOT NULL state PRIMARY KEY synthesis mutated in place, on the
 	// ALTER's target table and any inheritance/partition child the cascade
 	// touched (P0-E5/M0143-0008).
+	// Restore relation statistics a pg_class UPDATE replaced, newest first so
+	// a relation updated twice ends at its pre-transaction Stats (M0146-0064).
+	relStats := sess.TakePendingRelStatsUndos()
+	for i := len(relStats) - 1; i >= 0; i-- {
+		relStats[i].Table.Stats = relStats[i].Stats
+	}
+	if len(relStats) > 0 && ctx.OnCommitDDL != nil {
+		ctx.OnCommitDDL() // plans cached under the rolled-back stats
+	}
 	for _, e := range sess.TakePendingNotNullUndos() {
 		for i, wasNotNull := range e.ColNotNull {
 			if i >= 0 && i < len(e.Table.Columns) {

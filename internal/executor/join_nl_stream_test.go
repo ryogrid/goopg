@@ -21,6 +21,7 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -176,10 +177,10 @@ func TestMaterializePartialFirstPassResumesChild(t *testing.T) {
 }
 
 // withNLInnerWorkMem turns the nested loop's inner-cache work_mem bound ON for
-// the duration of a test. The bound ships OFF (see openNestedLoop: TPC-DS Q54
-// showed a spilled inner cache is unaffordable until `cost_rescan` prices the
-// replay), so the tests that assert the spill path is an identity have to ask
-// for it explicitly — otherwise they would silently assert nothing.
+// the duration of a test. The bound is the default since M0146-0010c, but an
+// A/B run with GOOPG_NL_MATERIALIZE_WORK_MEM=0 turns it off for the process,
+// and the tests that assert the spill path is an identity must not then
+// silently assert nothing.
 func withNLInnerWorkMem(t *testing.T) {
 	t.Helper()
 	prev := nlInnerWorkMemEnabled
@@ -187,8 +188,12 @@ func withNLInnerWorkMem(t *testing.T) {
 	t.Cleanup(func() { nlInnerWorkMemEnabled = prev })
 }
 
-// nlJoinPlan is a nested-loop join of the given type on (l0 = r0). The
-// equality lives in Predicate because that is all a nested loop evaluates.
+// nlJoinPlan is a nested-loop join of the given type on (l0 = r0) over a
+// MATERIALISED inner — what every test in this file pins (read-once replay,
+// spill identity, resume rule). Since M0146-0010 the executor materialises
+// the inner only when the plan carries the node, so the fixture declares it,
+// and runBatchJoin mirrors buildNode by wrapping the right op when it sees
+// one. The bare-inner arm gets its own test below.
 func nlJoinPlan(jt optimizer.JoinType, leftWidth int) *optimizer.Join {
 	col := func(idx int) *optimizer.ColumnRef {
 		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
@@ -198,7 +203,7 @@ func nlJoinPlan(jt optimizer.JoinType, leftWidth int) *optimizer.Join {
 		Algo:      optimizer.JoinAlgoNestedLoop,
 		Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
 		Left:      valuesNode(0),
-		Right:     valuesNode(0),
+		Right:     &optimizer.Materialize{Child: valuesNode(0)},
 	}
 }
 
@@ -209,7 +214,9 @@ func TestNestedLoopStreamsOuterAndReadsInnerOnce(t *testing.T) {
 	const outerN, innerN = 40, 60
 	outer := newCountingOp(seqRows(outerN, "l"), batchSchema("l", 2))
 	inner := newCountingOp(seqRows(innerN, "r"), batchSchema("r", 2))
-	o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, 2), outer, inner)
+	// The plan elects Materialize, so the inner op IS the cache — the same
+	// pair buildNode's Materialize arm produces in production.
+	o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, 2), outer, newMaterializeOp(inner))
 	if err := o.Open(&Context{}); err != nil {
 		t.Fatalf("open join: %v", err)
 	}
@@ -303,4 +310,134 @@ func TestNestedLoopKeylessSemiAntiEarlyOut(t *testing.T) {
 			}
 		})
 	}
+}
+
+// reopenableRowsOp is a rowsOp whose Close does not destroy the row source —
+// the lifecycle shape every real scan operator has, which is what the
+// bare-inner rescan (rescanByReexec: Close then Open) drives once per outer
+// tuple. rowsOp itself cannot serve: its Close drops the rows.
+type reopenableRowsOp struct {
+	rows   []Row
+	idx    int
+	schema optimizer.Schema
+	opens  int
+}
+
+func (o *reopenableRowsOp) Open(*Context) error { o.idx = 0; o.opens++; return nil }
+func (o *reopenableRowsOp) Schema() optimizer.Schema { return o.schema }
+func (o *reopenableRowsOp) Next() (TupleSlot, error) { //nolint:ireturn
+	if o.idx >= len(o.rows) {
+		return nil, EOF
+	}
+	r := o.rows[o.idx]
+	o.idx++
+	return asSlot(o.schema, r), nil
+}
+func (o *reopenableRowsOp) Close() error { return nil }
+
+// TestNestedLoopBareInnerReexecutes pins the strict half of the M0146-0010
+// plan/executor contract: under GOOPG_NL_BARE_REEXEC a plan carrying NO
+// Materialize node re-EXECUTES the inner per outer tuple (PG's cost_rescan
+// default arm), not silently replayed from a cache the plan never mentioned.
+// The flag's default compat arm is pinned by TestNestedLoopBareInnerCached
+// below.
+func TestNestedLoopBareInnerReexecutes(t *testing.T) {
+	old := nlBareReexec
+	nlBareReexec = true
+	t.Cleanup(func() { nlBareReexec = old })
+	const outerN, innerN = 8, 12
+	outer := &reopenableRowsOp{rows: seqRows(outerN, "l"), schema: batchSchema("l", 2)}
+	inner := &reopenableRowsOp{rows: seqRows(innerN, "r"), schema: batchSchema("r", 2)}
+	plan := nlJoinPlan(optimizer.JoinTypeInner, 2)
+	plan.Right = plan.Right.(*optimizer.Materialize).Child // declare the bare inner
+	o := newJoinOp(plan, outer, inner)
+	if err := o.Open(&Context{}); err != nil {
+		t.Fatalf("open join: %v", err)
+	}
+	got := readAll(t, o)
+	if len(got) != outerN {
+		t.Fatalf("%d joined rows, want %d", len(got), outerN)
+	}
+	// One initial Open plus a Close/Open per outer tuple AFTER the first —
+	// rescanByReexec skips the rescan on an inner that was never read, so
+	// the first outer tuple does not pay a redundant rebuild.
+	if inner.opens != outerN {
+		t.Errorf("inner opened %d times, want %d — one initial Open plus a rescan-reopen per outer tuple after the first",
+			inner.opens, outerN)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestNestedLoopBareInnerCached pins the default arm: with a bare inner and
+// GOOPG_NL_BARE_REEXEC unset, the inner is opened ONCE and replayed from the
+// attach-time compat cache — the pre-M0146-0010 semantics retained while the
+// strict flip waits on the Q14 join-order blocker (see nlBareReexec).
+func TestNestedLoopBareInnerCached(t *testing.T) {
+	old := nlBareReexec
+	nlBareReexec = false
+	t.Cleanup(func() { nlBareReexec = old })
+	const outerN, innerN = 8, 12
+	outer := &reopenableRowsOp{rows: seqRows(outerN, "l"), schema: batchSchema("l", 2)}
+	inner := &reopenableRowsOp{rows: seqRows(innerN, "r"), schema: batchSchema("r", 2)}
+	plan := nlJoinPlan(optimizer.JoinTypeInner, 2)
+	plan.Right = plan.Right.(*optimizer.Materialize).Child // declare the bare inner
+	o := newJoinOp(plan, outer, inner)
+	if err := o.Open(&Context{}); err != nil {
+		t.Fatalf("open join: %v", err)
+	}
+	got := readAll(t, o)
+	if len(got) != outerN {
+		t.Fatalf("%d joined rows, want %d", len(got), outerN)
+	}
+	if inner.opens != 1 {
+		t.Errorf("inner opened %d times, want 1 — cached inner is opened once and replayed", inner.opens)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestNestedLoopMaterializedPlanWithoutCacheIsRefused is the fail-closed half:
+// a plan electing Materialize over an inner that built no materializeOp is a
+// producer/executor disagreement, and Open must error rather than invent a
+// second buffer (which would double the memory the planner priced).
+func TestNestedLoopMaterializedPlanWithoutCacheIsRefused(t *testing.T) {
+	outer := &reopenableRowsOp{rows: seqRows(4, "l"), schema: batchSchema("l", 2)}
+	inner := &reopenableRowsOp{rows: seqRows(4, "r"), schema: batchSchema("r", 2)}
+	// plan.Right says Materialize but the op handed in is bare — the
+	// disagreement openNestedLoop must refuse.
+	o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, 2), outer, inner)
+	if err := o.Open(&Context{}); err == nil {
+		t.Fatal("open succeeded over a Materialize plan node with no materializeOp")
+	}
+}
+
+// TestNestedLoopInnerCacheSpillsByDefault pins M0146-0010c: PG's Materialize
+// tuplestore spills past work_mem, and so does the nested loop's inner cache
+// by default — no opt-in. Until 0010c the cache ran unbounded unless
+// GOOPG_NL_MATERIALIZE_WORK_MEM=1. The spilled join must equal the in-memory
+// one.
+func TestNestedLoopInnerCacheSpillsByDefault(t *testing.T) {
+	if os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") == "0" {
+		t.Skip("the bound is turned off for this process (A/B run)")
+	}
+	const outerN, innerN, lw, rw = 20, 80, 2, 2
+	run := func(workMem int64) ([]string, *materializeOp) {
+		left := &rowsOp{rows: seqRows(outerN, "l"), schema: batchSchema("l", lw)}
+		mat := newMaterializeOp(&rowsOp{rows: seqRows(innerN, "r"), schema: batchSchema("r", rw)})
+		o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, lw), left, mat)
+		if err := o.Open(&Context{WorkMem: workMem}); err != nil {
+			t.Fatalf("open join: %v", err)
+		}
+		got := readAll(t, o)
+		return got, mat
+	}
+	want, _ := run(0)
+	got, mat := run(512)
+	if mat.buf.w == nil && mat.buf.path == "" {
+		t.Fatalf("work_mem=512 bytes over %d inner rows did not spill: the inner cache is unbounded by default", innerN)
+	}
+	assertSameMultiset(t, "default-bounded inner cache", got, want)
 }

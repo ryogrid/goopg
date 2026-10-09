@@ -446,3 +446,47 @@ Consequences, all of which bind the rest of M0125:
   and the restart-durability acceptance above (durable-path testing rules
   apply — no `--no-sync`/fsync-off cluster for the restart probe).
 - The tree carries a concurrent Ralph loop's WIP; stage by explicit pathspec.
+
+## M0143-0011 (landed 2026-10-02): bare VACUUM covers the current database
+
+M0125-0028 moved named targets and bare `ANALYZE` onto the connection's
+database. It deferred VACUUM's no-target arm, which kept walking
+`im.AllTables()`: the `DefaultDBOid` namespace, as deep copies. That had
+two effects:
+
+- In any other database, bare `VACUUM` vacuumed the default database's
+  tables. On `:65433`, `VACUUM` in db `tpch` returned success while every
+  tpch table kept `relallvisible = 0`; the owner had to vacuum table by
+  table during the 2026-10-02 corpus alignment.
+- In every database, the no-target arm's relstats and `relfrozenxid`
+  writes landed on throwaway copies. Db-wide VACUUM's bookkeeping had
+  never taken effect.
+
+PG's `get_all_vacuum_rels` (vacuum.c) scans the current database's
+pg_class. Both no-target arms now iterate
+`im.UserTableHandles(NamespaceDBOid(CurrentDatabaseOid))`, the live-handle
+iterator bare ANALYZE uses:
+
+- `expandVacuumTargets` builds the processing list from it.
+- `vacuumTableTargets` builds the relfrozenxid list from it. It used to
+  type-assert the per-connection plan catalog, which is not an
+  `*InMemory`, so its db-wide arm had returned nothing at all.
+
+Test: `TestBareVacuumCoversCurrentDatabaseOnly` (executor). In a
+non-default database, bare `VACUUM` publishes reltuples onto the live
+table, bare `VACUUM FREEZE` advances its `relfrozenxid`, and the default
+database's table is untouched. Red at HEAD.
+
+Freeze-bookkeeping verification, as the ledger asked:
+
+- The vacuum-adjacent isolation specs pass: freeze-the-dead, horizons,
+  vacuum-concurrent-drop, vacuum-conflict, vacuum-no-cleanup-lock and
+  vacuum-skip-locked.
+- The regress cases `vacuum`, `vacuum_parallel` and `stats` are unchanged
+  against a HEAD baseline.
+
+Still open (ledgered):
+
+- `VACUUM <missing-table>` succeeds silently (PG: 42P01).
+- The db-wide arm still processes other sessions' temp tables, which PG
+  skips silently in vacuum_rel.

@@ -1,0 +1,10 @@
+DPTRACE pveto site=nestloop rel={l1+l3} dir={l1}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l3+supplier} dir={l1+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l3+orders} dir={l1+orders}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l2+l3} dir={l1+l2}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l3+orders+supplier} dir={l1+orders+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l3+nation+supplier} dir={l1+nation+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l2+l3+supplier} dir={l1+l2+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l2+l3+orders} dir={l1+l2+orders}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l3+nation+orders+supplier} dir={l1+nation+orders+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI
+DPTRACE pveto site=nestloop rel={l1+l2+l3+orders+supplier} dir={l1+l2+orders+supplier}+{l3} veto=V1-nl-inner detail=jt=ANTI

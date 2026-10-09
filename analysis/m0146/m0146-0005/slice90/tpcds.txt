@@ -1,0 +1,9 @@
+PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=15
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+sf025 hash lines pg=241 goopg=270 baseline=0
+PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=16
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+sf1 hash lines pg=290 goopg=312 baseline=0
+text-identical (costs ignored): SF0.25 1 -> 8 (Q9 Q12 Q18 Q20 Q22 Q84 Q97 Q98); SF1 1 -> 5 (Q9 Q12 Q20 Q97 Q98)

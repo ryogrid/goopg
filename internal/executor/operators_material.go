@@ -306,3 +306,72 @@ func (o *materializeOp) Close() error {
 // Callers use it when the replay cost of a spilled cache is not yet priced by
 // the planner — see joinOp.openNestedLoop.
 func (o *materializeOp) setUnbounded() { o.buf.limit = 0 }
+
+// rescanByReexec is the bare-inner rescan strategy (M0146-0010): the nested
+// loop's inner when the plan carries NO `*optimizer.Materialize` node —
+// `cost_rescan`'s default arm, where re-running the path re-pays startup and
+// total, is what the planner costed, so re-execution is what the executor
+// does. PG's ExecReScan on a plain scan rewinds it and re-reads; goopg's
+// Operator contract has no finer-grained reset than Close+Open, which is the
+// same thing for an unparameterised (and therefore deterministic) subtree.
+//
+// The wrapper owns NOTHING — joinOp owns o.right's lifecycle and closes it;
+// the wrapper only borrows. Rescan leaves the op open (Close then Open), so
+// the join's single Close at the end still sees a live child.
+type rescanByReexec struct {
+	op  Operator
+	ctx *Context
+	// started is set by the first Next since the last Open/Rescan. A Rescan
+	// on a never-started inner is a no-op: PG's ExecReScan there only rewinds
+	// state, but goopg's Close+Open can rebuild an expensive subtree (a hash
+	// join build, an aggregate) wholesale, and skipping the redundant cycle
+	// is the same answer at re-exec price zero.
+	started bool
+}
+
+var _ rescannable = (*rescanByReexec)(nil)
+
+func (r *rescanByReexec) Open(ctx *Context) error { r.ctx = ctx; return nil }
+func (r *rescanByReexec) Next() (TupleSlot, error) {
+	r.started = true
+	return r.op.Next()
+}
+func (r *rescanByReexec) Schema() optimizer.Schema { return r.op.Schema() }
+func (r *rescanByReexec) Close() error             { return nil }
+func (r *rescanByReexec) Rescan() error {
+	if !r.started {
+		return nil
+	}
+	r.started = false
+	if err := r.op.Close(); err != nil {
+		return err
+	}
+	return r.op.Open(r.ctx)
+}
+
+// planMaterializeOp digs the materializeOp a `*optimizer.Materialize` plan
+// node produced out of whichever build path ran: buildNode returns it
+// directly (possibly under an instrumentedOp for EXPLAIN ANALYZE); the
+// op-tree slab path fronts it as an opNodeOperator over an OpAdapter.
+func planMaterializeOp(op Operator) *materializeOp {
+	switch t := op.(type) {
+	case *materializeOp:
+		return t
+	case *instrumentedOp:
+		return planMaterializeOp(t.underlying())
+	case *opNodeOperator:
+		if t.tree == nil || t.idx < 0 || int(t.idx) >= len(t.tree.ops) {
+			return nil
+		}
+		n := t.tree.ops[t.idx]
+		if n.Kind != OpAdapter {
+			return nil
+		}
+		st, ok := n.state.(*opAdapterState)
+		if !ok {
+			return nil
+		}
+		return planMaterializeOp(st.op)
+	}
+	return nil
+}

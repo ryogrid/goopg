@@ -1,0 +1,35 @@
+# goopg DPPATH excerpts — TPC-DS Q17 SF0.25, private clone :5590
+# HEAD 718a61c60 (post-slice27), GOOPG_PGSHAPED_DP_TRACE=1
+
+## 3-rel fork: {sr,d2} partial outer + probe inner
+## relids: ss=0 sr=1 cs=2 d1=3 d2=4 d3=5 store=6 item=7
+
+# {sr,cs,d2}={1,2,4}: cs probe wins 3839.84
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.25 total=976066.6606233061 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,4} inner={2} width=1308 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.625 total=3839.8355815432933 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1,4} inner={2} width=1308 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.625 total=3842.100581543293 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,4} inner={2} width=1308 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.5 total=986365.2745299943 disabled=0 pathkeys=2 verdict=dominated jointype=inner outer={1,4} inner={2} width=1308 inputtotal=13845.292029994229
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.875 total=14138.449488231703 disabled=0 pathkeys=2 verdict=accepted jointype=inner outer={1,4} inner={2} width=1308 inputtotal=13845.292029994229
+DPPATH partial producer=join.nestloop.partial relids={1,2,4} kind=5 reqouter=- rows=1 startup=0.875 total=14140.714488231704 disabled=0 pathkeys=2 verdict=dominated jointype=inner outer={1,4} inner={2} width=1308 inputtotal=13845.292029994229
+
+# {sr,d2,ss}={0,1,4}: ss probe loses at 3860.95
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.25 total=2.213902168123306e+06 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,4} inner={0} width=1180 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.625 total=3860.95222565528 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1,4} inner={0} width=1180 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.625 total=3863.2172256552803 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,4} inner={0} width=1180 inputtotal=3546.6781233058186
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.5 total=2.2242007820299943e+06 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer={1,4} inner={0} width=1180 inputtotal=13845.292029994229
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.875 total=14159.56613234369 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer={1,4} inner={0} width=1180 inputtotal=13845.292029994229
+DPPATH partial producer=join.nestloop.partial relids={0,1,4} kind=5 reqouter=- rows=1 startup=0.875 total=14161.83113234369 disabled=0 pathkeys=1 verdict=dominated jointype=inner outer={1,4} inner={0} width=1180 inputtotal=13845.292029994229
+
+# per-probe param costs bound to sr={1}
+
+# per-probe param costs bound to sr={1} (index.parameterised)
+DPPATH path producer=index.parameterised relids={0} kind=2 reqouter={1} rows=1 startup=0.375 total=2.0550927786148776 disabled=0 pathkeys=2 verdict=accepted jointype=inner outer=- inner=- width=428 inputtotal=-1
+DPPATH path producer=index.parameterised relids={2} kind=2 reqouter={1} rows=1 startup=0.375 total=1.9161674884044366 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=556 inputtotal=-1
+
+# 6-rel adjudication {0,1,2,4,6,7}: GM6 4841.90 beats NL(5rel,cs) 4862.38
+DPPATH path producer=gather relids={0,1,2,4,6,7} kind=11 reqouter=- rows=1 startup=1001.375 total=4841.86104295597 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer=- inner=- width=2892 inputtotal=3841.7610429559695
+DPPATH path producer=gather.merge.sort relids={0,1,2,4,6,7} kind=12 reqouter=- rows=1 startup=4841.7810429559695 total=4841.898542955969 disabled=0 pathkeys=3 verdict=accepted jointype=inner outer=- inner=- width=2892 inputtotal=3841.7760429559694
+DPPATH path producer=nestloop.index relids={0,1,2,4,6,7} kind=5 reqouter=- rows=1 startup=97260.31841705437 total=100703.33957195742 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1,4,6,7} inner={2} width=2892 inputtotal=100701.40840446901
+DPPATH path producer=nestloop.index relids={0,1,2,4,6,7} kind=5 reqouter=- rows=1 startup=97260.31841705437 total=100703.33958454279 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1,4,6,7} inner={2} width=2892 inputtotal=100701.40841705438
+DPPATH path producer=nestloop.index relids={0,1,2,4,6,7} kind=5 reqouter=- rows=1 startup=0.875 total=130473.75264680722 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1,4,6,7} inner={2} width=2892 inputtotal=130471.82147931881
+DPPATH path producer=nestloop.index relids={0,1,2,4,6,7} kind=5 reqouter=- rows=1 startup=4433.780108159496 total=136739.89057772682 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1,4,6,7} inner={2} width=2892 inputtotal=136737.9594102384

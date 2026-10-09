@@ -1,0 +1,159 @@
+Q1 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q2 depth=2 [aggregation-strategy] under CTE: PG Finalize HashAggregate | goopg HashAggregate
+Q3 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q4 depth=3 [aggregation-strategy] under Append: PG HashAggregate | goopg GroupAggregate
+Q5 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+Q6 depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q7 MATCH (no structural divergence)
+Q8 depth=3 [join-method] under Sort: PG Hash Join Inner | goopg Nested Loop Inner
+Q9 depth=0 [scan-type] under -: PG Index Only Scan reason_pkey on reason | goopg Seq Scan on reason
+Q10 depth=2 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q11 depth=3 [aggregation-strategy] under Append: PG HashAggregate | goopg GroupAggregate
+Q12 MATCH (no structural divergence)
+Q13 depth=0 [aggregation-strategy] under -: PG Finalize Aggregate | goopg Aggregate
+Q14 depth=6 [parallelism] under Gather: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q15 MATCH (no structural divergence)
+Q16 depth=3 [sort-strategy] under Aggregate: PG Sort | goopg Gather
+Q17 depth=2 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q18 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg MixedAggregate
+Q19 depth=2 [aggregation-strategy] under Sort: PG Finalize GroupAggregate | goopg GroupAggregate
+Q20 MATCH (no structural divergence)
+Q21 depth=1 [qual-placement] under Limit: PG GroupAggregate | goopg GroupAggregate
+Q22 depth=4 [join-method] under Gather: PG Parallel Hash Join Inner | goopg Nested Loop Inner
+Q23 depth=4 [parallelism] under Gather: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q24 depth=7 [parallelism] under Nested Loop: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q25 depth=2 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q26 depth=2 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+Q27 MATCH (no structural divergence)
+Q28 depth=7 [parallelism] under Aggregate: PG Gather Merge | goopg Gather
+Q29 depth=2 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q30 depth=2 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+Q31 depth=3 [join-order] under HashAggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q32 depth=2 [parameterisation] under Aggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q33 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+Q34 depth=2 [qual-placement] under Nested Loop: PG GroupAggregate | goopg GroupAggregate
+Q35 depth=2 [sort-strategy] under GroupAggregate: PG Incremental Sort | goopg Gather Merge
+Q36 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q37 depth=2 [sort-strategy] under Group: PG Nested Loop Inner | goopg Sort
+Q38 depth=4 [sort-strategy] under Unique: PG Gather Merge | goopg Sort
+Q39 depth=2 [scan-type] under CTE: PG Subquery Scan on foo | goopg HashAggregate
+Q40 depth=1 [aggregation-strategy] under Limit: PG Finalize GroupAggregate | goopg GroupAggregate
+Q41 MATCH (no structural divergence)
+Q42 depth=6 [parallelism] under Nested Loop: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q43 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q44 depth=1 [parameterisation] under Limit: PG Merge Join Inner | goopg Merge Join Inner
+Q45 MATCH (no structural divergence)
+Q46 depth=2 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+Q47 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+Q48 depth=2 [qual-placement] under Gather: PG Nested Loop Inner | goopg Nested Loop Inner
+Q49 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q50 depth=2 [sort-strategy] under GroupAggregate: PG Nested Loop Inner | goopg Sort
+Q51 depth=1 [scan-type] under Limit: PG Subquery Scan on y | goopg WindowAgg
+Q52 depth=6 [parallelism] under Nested Loop: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q53 depth=2 [scan-type] under Sort: PG Subquery Scan on tmp1 | goopg WindowAgg
+Q54 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q55 depth=6 [join-method] under Nested Loop: PG Nested Loop Inner | goopg Hash Join Inner
+Q56 depth=2 [aggregation-strategy] under Sort: PG GroupAggregate | goopg HashAggregate
+Q57 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+Q58 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q59 depth=5 [parallelism] under Partial HashAggregate: PG Parallel Hash Join Inner | goopg Hash Join Inner
+Q60 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q61 depth=3 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+Q62 depth=1 [sort-strategy] under Limit: PG Finalize GroupAggregate | goopg Sort
+Q63 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q64 depth=3 [sort-strategy] under GroupAggregate: PG Incremental Sort | goopg Sort
+Q65 depth=3 [join-method] under Nested Loop: PG Merge Join Inner | goopg Hash Join Inner
+Q66 depth=3 [parallelism] under Sort: PG Append | goopg Gather
+Q67 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q68 depth=2 [qual-placement] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+Q69 depth=2 [parallelism] under GroupAggregate: PG Nested Loop Left Anti | goopg Gather Merge
+Q70 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q71 depth=1 [aggregation-strategy] under Sort: PG Finalize GroupAggregate | goopg GroupAggregate
+Q72 depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Left | goopg Sort
+Q73 depth=2 [aggregation-strategy] under Nested Loop: PG Finalize GroupAggregate | goopg GroupAggregate
+Q74 depth=3 [aggregation-strategy] under Append: PG GroupAggregate | goopg HashAggregate
+Q75 depth=4 [parallelism] under HashAggregate: PG Gather | goopg Append
+Q76 depth=1 [sort-strategy] under Limit: PG Finalize GroupAggregate | goopg Sort
+Q77 depth=5 [aggregation-strategy] under Merge Join: PG Finalize GroupAggregate | goopg GroupAggregate
+Q78 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q79 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Hash Join Inner
+Q80 depth=4 [scan-type] under Append: PG Subquery Scan on ssr | goopg GroupAggregate
+Q81 depth=2 [parameterisation] under Sort: PG Nested Loop Inner | goopg Nested Loop Inner
+Q82 depth=2 [sort-strategy] under Group: PG Nested Loop Inner | goopg Sort
+Q83 depth=1 [sort-strategy] under Limit: PG Incremental Sort | goopg Sort
+Q84 depth=1 [sort-strategy] under Limit: PG Nested Loop Inner | goopg Sort
+Q85 depth=2 [aggregation-strategy] under Sort: PG Finalize GroupAggregate | goopg GroupAggregate
+Q86 depth=0 [error] under -: PG - | goopg -  -- error marker in both block
+Q87 depth=4 [sort-strategy] under Unique: PG Gather Merge | goopg Sort
+Q88 depth=10 [join-method] under Partial Aggregate: PG Nested Loop Inner | goopg Hash Join Inner
+Q89 depth=2 [scan-type] under Sort: PG Subquery Scan on tmp1 | goopg WindowAgg
+Q90 MATCH (no structural divergence)
+Q91 MATCH (no structural divergence)
+Q92 depth=3 [parameterisation] under Aggregate: PG Hash Join Inner | goopg Hash Join Inner
+Q93 MATCH (no structural divergence)
+Q94 depth=3 [sort-strategy] under Aggregate: PG Sort | goopg Gather
+Q95 depth=2 [qual-placement] under CTE: PG Hash Join Inner | goopg Hash Join Inner
+Q96 MATCH (no structural divergence)
+Q97 depth=3 [aggregation-strategy] under Merge Join: PG Group | goopg HashAggregate
+Q98 MATCH (no structural divergence)
+Q99 depth=1 [sort-strategy] under Limit: PG Finalize GroupAggregate | goopg Sort
+FIRST-DIVERGENCE: queries=99 divergent=87 match=12
+CATEGORY-ROLLUP: sort-strategy=32 aggregation-strategy=16 parallelism=10 join-method=7 scan-type=7 qual-placement=6 parameterisation=5 error=3 join-order=1
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):
+   10  sort-strategy    under Limit            PG Incremental Sort             goopg Sort                         depth=1
+    5  sort-strategy    under GroupAggregate   PG Nested Loop Inner            goopg Sort                         depth=2
+    3  error            under -                PG -                            goopg -                            depth=0
+    3  sort-strategy    under Limit            PG Finalize GroupAggregate      goopg Sort                         depth=1
+    2  join-method      under Sort             PG Nested Loop Inner            goopg Hash Join Inner              depth=2
+    2  aggregation-strategy under Append           PG HashAggregate                goopg GroupAggregate               depth=3
+    2  scan-type        under Append           PG Subquery Scan on ssr         goopg GroupAggregate               depth=4
+    2  sort-strategy    under Aggregate        PG Sort                         goopg Gather                       depth=3
+    2  aggregation-strategy under Sort             PG Finalize GroupAggregate      goopg GroupAggregate               depth=2
+    2  parameterisation under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+    2  aggregation-strategy under Sort             PG GroupAggregate               goopg HashAggregate                depth=2
+    2  sort-strategy    under Group            PG Nested Loop Inner            goopg Sort                         depth=2
+    2  sort-strategy    under Unique           PG Gather Merge                 goopg Sort                         depth=4
+    2  parallelism      under Nested Loop      PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=6
+    2  qual-placement   under Sort             PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+    2  sort-strategy    under WindowAgg        PG WindowAgg                    goopg Sort                         depth=3
+    2  scan-type        under Sort             PG Subquery Scan on tmp1        goopg WindowAgg                    depth=2
+    1  aggregation-strategy under CTE              PG Finalize HashAggregate       goopg HashAggregate                depth=2
+    1  sort-strategy    under GroupAggregate   PG Nested Loop Inner            goopg Sort                         depth=3
+    1  join-method      under Sort             PG Hash Join Inner              goopg Nested Loop Inner            depth=3
+    1  scan-type        under -                PG Index Only Scan reason_pkey on reason goopg Seq Scan on reason           depth=0
+    1  aggregation-strategy under -                PG Finalize Aggregate           goopg Aggregate                    depth=0
+    1  parallelism      under Gather           PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=6
+    1  aggregation-strategy under Sort             PG GroupAggregate               goopg MixedAggregate               depth=2
+    1  qual-placement   under Limit            PG GroupAggregate               goopg GroupAggregate               depth=1
+    1  join-method      under Gather           PG Parallel Hash Join Inner     goopg Nested Loop Inner            depth=4
+    1  parallelism      under Gather           PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=4
+    1  parallelism      under Nested Loop      PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=7
+    1  sort-strategy    under GroupAggregate   PG Sort                         goopg Gather Merge                 depth=2
+    1  parallelism      under Aggregate        PG Gather Merge                 goopg Gather                       depth=7
+    1  join-order       under HashAggregate    PG Hash Join Inner              goopg Hash Join Inner              depth=3
+    1  parameterisation under Aggregate        PG Hash Join Inner              goopg Hash Join Inner              depth=2
+    1  qual-placement   under Nested Loop      PG GroupAggregate               goopg GroupAggregate               depth=2
+    1  sort-strategy    under GroupAggregate   PG Incremental Sort             goopg Gather Merge                 depth=2
+    1  scan-type        under CTE              PG Subquery Scan on foo         goopg HashAggregate                depth=2
+    1  aggregation-strategy under Limit            PG Finalize GroupAggregate      goopg GroupAggregate               depth=1
+    1  parameterisation under Limit            PG Merge Join Inner             goopg Merge Join Inner             depth=1
+    1  qual-placement   under Gather           PG Nested Loop Inner            goopg Nested Loop Inner            depth=2
+    1  scan-type        under Limit            PG Subquery Scan on y           goopg WindowAgg                    depth=1
+    1  join-method      under Nested Loop      PG Nested Loop Inner            goopg Hash Join Inner              depth=6
+    1  parallelism      under Partial HashAggregate PG Parallel Hash Join Inner     goopg Hash Join Inner              depth=5
+    1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+    1  sort-strategy    under GroupAggregate   PG Incremental Sort             goopg Sort                         depth=3
+    1  join-method      under Nested Loop      PG Merge Join Inner             goopg Hash Join Inner              depth=3
+    1  parallelism      under Sort             PG Append                       goopg Gather                       depth=3
+    1  parallelism      under GroupAggregate   PG Nested Loop Left Anti        goopg Gather Merge                 depth=2
+    1  aggregation-strategy under Sort             PG Finalize GroupAggregate      goopg GroupAggregate               depth=1
+    1  sort-strategy    under GroupAggregate   PG Nested Loop Left             goopg Sort                         depth=3
+    1  aggregation-strategy under Nested Loop      PG Finalize GroupAggregate      goopg GroupAggregate               depth=2
+    1  aggregation-strategy under Append           PG GroupAggregate               goopg HashAggregate                depth=3
+    1  parallelism      under HashAggregate    PG Gather                       goopg Append                       depth=4
+    1  aggregation-strategy under Merge Join       PG Finalize GroupAggregate      goopg GroupAggregate               depth=5
+    1  sort-strategy    under Limit            PG Nested Loop Inner            goopg Sort                         depth=1
+    1  join-method      under Partial Aggregate PG Nested Loop Inner            goopg Hash Join Inner              depth=10
+    1  parameterisation under Aggregate        PG Hash Join Inner              goopg Hash Join Inner              depth=3
+    1  qual-placement   under CTE              PG Hash Join Inner              goopg Hash Join Inner              depth=2
+    1  aggregation-strategy under Merge Join       PG Group                        goopg HashAggregate                depth=3

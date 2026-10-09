@@ -89,6 +89,10 @@ func (o *joinOp) ensureMergeExprs() {
 // residual slot is (re)created here so the per-pair path never allocates.
 func (o *joinOp) compileMergeExprs() {
 	o.mergeExprs = o.mergeExprs[:0]
+	o.mergeKeyText = o.mergeKeyText[:0]
+	for _, k := range o.mergeKeys {
+		o.mergeKeyText = append(o.mergeKeyText, exprIsCharacterString(k.Left) && exprIsCharacterString(k.Right))
+	}
 	left := o.mergeSideKeyExprs(true)
 	if cap(o.mergeKeyNodesL) < len(left) {
 		o.mergeKeyNodesL = make([]int32, len(left))
@@ -132,9 +136,11 @@ func (o *joinOp) mergeSideKeyExprs(isLeft bool) []optimizer.Expr {
 // columns in plan order, PG's `MJCompare` shape. Both the sort and the
 // group-boundary test go through it, so the ordering the sides are merged on
 // and the equality that closes a group cannot disagree.
-func compareMergeKeys(a, b []Datum, pos int) (int, error) {
+//
+// text flags the key pairs that compare as plain text (joinOp.mergeKeyText).
+func compareMergeKeys(a, b []Datum, pos int, text []bool) (int, error) {
 	for i := range a {
-		cmp, err := compareDatum(a[i], b[i], pos)
+		cmp, err := compareDatumPlain(a[i], b[i], pos, i < len(text) && text[i])
 		if err != nil {
 			return 0, err
 		}

@@ -35,8 +35,19 @@ func TestGoopgFeaturesMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, spec.Path), spec.Build(), spec.Mode); err != nil {
 		t.Fatal(err)
 	}
-	if got := readGoopgFeatures(dir); !got[catalog.NullKeyedIndexEntriesFeature] || !got[storage.HeapLinePointerLifecycleFeature] || len(got) != 2 {
-		t.Fatalf("written marker: features %v, want exactly %s and %s", got,
-			catalog.NullKeyedIndexEntriesFeature, storage.HeapLinePointerLifecycleFeature)
+	if got := readGoopgFeatures(dir); !got[catalog.NullKeyedIndexEntriesFeature] || !got[storage.HeapLinePointerLifecycleFeature] ||
+		!got[storage.VMWALLoggedFeature] || len(got) != 3 {
+		t.Fatalf("written marker: features %v, want exactly %s, %s and %s", got,
+			catalog.NullKeyedIndexEntriesFeature, storage.HeapLinePointerLifecycleFeature, storage.VMWALLoggedFeature)
+	}
+	// addGoopgFeature (M0146-0063) appends once and keeps the others.
+	if err := addGoopgFeature(dir, "probe_feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := addGoopgFeature(dir, "probe_feature"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readGoopgFeatures(dir); !got["probe_feature"] || !got[storage.VMWALLoggedFeature] || len(got) != 4 {
+		t.Fatalf("after addGoopgFeature: features %v, want the three plus probe_feature", got)
 	}
 }

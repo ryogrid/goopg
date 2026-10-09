@@ -124,6 +124,40 @@ func limitBoundMovable(e Expr) bool {
 	return ok
 }
 
+// limitNeeded is PG's limit_needed (planner.c): a Limit node is planned only
+// when LIMIT is non-constant or a non-null constant, or OFFSET is non-constant
+// or a non-null constant other than 0 (M0146-0110). `OFFSET 0` with no LIMIT
+// — the classic subquery fence — and LIMIT NULL / LIMIT ALL plan no node; the
+// subquery keeps its fence, which is decided on the query, not on the plan.
+func limitNeeded(lim, off Expr) bool {
+	if lim != nil {
+		if _, isNull := unwrapLimitConst(lim).(*NullConst); !isNull {
+			return true
+		}
+	}
+	if off != nil {
+		v := unwrapLimitConst(off)
+		if _, isNull := v.(*NullConst); !isNull {
+			if c, isInt := v.(*IntegerConst); !isInt || c.Value != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// unwrapLimitConst looks through casts to the literal a LIMIT/OFFSET bound
+// folds to (`offset 0::bigint`), as eval_const_expressions would have.
+func unwrapLimitConst(e Expr) Expr {
+	for {
+		c, ok := e.(*CastExpr)
+		if !ok {
+			return e
+		}
+		e = c.Operand
+	}
+}
+
 func preprocessLimit(lim *Limit, tupleFraction float64) (float64, limitEstimates) {
 	est := limitEstimates{}
 	if lim == nil {
@@ -457,4 +491,57 @@ func getCheapestFractionalPathOrdered(rel *RelOptInfo, tupleFraction float64, qu
 		best = path
 	}
 	return best
+}
+
+// limitEstimatesOf is preprocess_limit's (count_est, offset_est) pair for a
+// Limit node, without the tuple-fraction fold.
+func limitEstimatesOf(lim *Limit) limitEstimates {
+	return limitEstimates{
+		count:  limitClauseEstimate(lim.Limit, true),
+		offset: limitClauseEstimate(lim.Offset, false),
+	}
+}
+
+// adjustLimitRowsCosts is `adjust_limit_rows_costs` (pathnode.c): a Limit
+// emits at most count rows after skipping offset rows, never more than its
+// input has, and its costs are the input's interpolated over the fraction of
+// the input it reads. An unestimatable clause (-1) is 10% of the input.
+// M0146-0005bm: goopg's Limit printed `rows=<count>` and a total above its
+// input's whenever the count exceeded the input (TPC-DS Q84: rows=100 over
+// a Gather Merge of 11; PG 10).
+func adjustLimitRowsCosts(rows, startup, total float64, est limitEstimates) (float64, float64, float64) {
+	inRows, inStartup, inTotal := rows, startup, total
+	if est.offset != 0 {
+		offRows := float64(est.offset)
+		if est.offset < 0 {
+			offRows = clampRowEst(inRows * unestimatableLimitFraction)
+		}
+		if offRows > rows {
+			offRows = rows
+		}
+		if inRows > 0 {
+			startup += (inTotal - inStartup) * offRows / inRows
+		}
+		rows -= offRows
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	if est.count != 0 {
+		countRows := float64(est.count)
+		if est.count < 0 {
+			countRows = clampRowEst(inRows * unestimatableLimitFraction)
+		}
+		if countRows > rows {
+			countRows = rows
+		}
+		if inRows > 0 {
+			total = startup + (inTotal-inStartup)*countRows/inRows
+		}
+		rows = countRows
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	return rows, startup, total
 }

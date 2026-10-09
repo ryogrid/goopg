@@ -226,3 +226,23 @@ Re-scope or close M0145-0010. Concretely, one of:
 The loop does not choose among these. What it can say is that starting the
 refactor as filed would be building for consumers that measurement says are not
 there.
+
+## Post-cutover re-census (M0146-0011, 2026-10-05)
+
+The owner close left scope (a)'s consumer, the `lateral` seam-decline family,
+with a re-census trigger after the M0145-0008 cutover. It had 2 fires,
+TPC-DS Q30 and Q68.
+
+- **Census.** No default-arm (jointree) SF0.25 sweep since the cutover
+  (`sweep-20260924-221958` onward) has recorded a `lateral` decline. The
+  flow-convergence channel reads `leaf-count=2` and nothing else. The last
+  `lateral=1` readings are all legacy `-knob` runs on 2026-09-24.
+- **Q30 and Q68** now enter the join search at both scales. Their first
+  divergences are a probe choice inside a Nested Loop: `customer_pkey` Index
+  Scan against goopg's Bitmap Heap Scan (B8, M0145-0008ag) or a
+  join-method election. Neither is a lateral decline.
+- **Conclusion.** The family shrank to zero, so the rel-level
+  `param_info` / `lateral_relids` machinery has no consumer. Recorded and
+  closed, as this task's escalation rule directs.
+
+Evidence: `analysis/m0146/m0146-0011/census.md`.

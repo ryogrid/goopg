@@ -1,51 +1,87 @@
 package executor
 
-import "testing"
+import (
+	"strings"
+	"testing"
 
-// TestIndexOnlyScanResidualFilterColumnRemap is a regression test for
-// M0121-0002: a residual Filter surviving IndexOnlyScan promotion
-// (tryPromoteIndexOnlyScan, internal/planner/planner.go) kept its
-// predicate's ColumnRef.Index pinned to the pre-promotion (full-row)
-// schema position. Once the scan narrowed to the covered columns, the
-// stale index panicked `Slot.Get` (opnode.go:99) from evalFastExpr's
-// ExprColumnRef case via filterOpNext — this crashed the goopg backend
-// connection whenever WordPress's wp_set_object_terms ran
-// `SELECT term_taxonomy_id FROM wp_term_relationships WHERE object_id = ?
-// AND term_taxonomy_id = ?` over the table's composite PK
-// (object_id, term_taxonomy_id) and object_id actually matched a row.
-//
-// Reproduces the same shape with a minimal 3-column table: a composite
-// PK (a, b) probed by its leading column (a), leaving a residual filter
-// on b — the covered/projected column — after IndexOnlyScan promotion
-// narrows the scan's output to just b.
-func TestIndexOnlyScanResidualFilterColumnRemap(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
+	"github.com/goopg/goopg/internal/optimizer"
+)
+
+// TestIndexOnlyScanKeepsResidualFilter pins M0146-0019a: build_index_paths
+// builds an index-only path whenever check_index_only holds, and a
+// restriction the index cannot bind stays as the scan's Filter (TPC-H Q16's
+// `partsupp_pk` with `NOT (ps_suppkey = ANY (hashed SubPlan))`). goopg refused
+// any index-only leaf with a residual qual. The uncorrelated NOT IN is a
+// hashed SubPlan, priced once at startup (cost_subplan's useHashTable arm),
+// not per row. Plans and values are PG 18.3's.
+func TestIndexOnlyScanKeepsResidualFilter(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
-	if err := runDDL(t, ctx, `CREATE TABLE ios_remap_t (a bigint NOT NULL, b bigint NOT NULL, c integer NOT NULL, PRIMARY KEY (a, b))`); err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-	runSQL(t, ctx, `INSERT INTO ios_remap_t VALUES (11, 1, 0)`)
-	runSQL(t, ctx, `INSERT INTO ios_remap_t VALUES (22, 2, 0)`)
 
-	// object_id (a) matches an existing row, so the scan actually yields a
-	// row and filterOpNext must evaluate the residual `b = 1` predicate
-	// against it — this is exactly what panicked pre-fix.
-	rows := runSQL(t, ctx, `SELECT b FROM ios_remap_t WHERE a = 11 AND b = 1`)
-	if len(rows) != 1 || rows[0][0].Int != 1 {
-		t.Fatalf("SELECT b WHERE a=11 AND b=1: want [[1]], got %v", rows)
-	}
+	runComposite(t, ctx,
+		"CREATE TABLE ios_r (a int NOT NULL, b int NOT NULL, pad text)",
+		"CREATE TABLE ios_s (k int)",
+		"INSERT INTO ios_r SELECT g, g % 97, repeat('x', 400) FROM generate_series(1, 4000) g",
+		"INSERT INTO ios_s SELECT g * 3 FROM generate_series(1, 20) g",
+		"CREATE INDEX ios_r_ab ON ios_r (a, b)",
+		"CREATE TABLE ios_p (u1 int NOT NULL, u2 int NOT NULL)",
+		"INSERT INTO ios_p SELECT g, (g * 7) % 1000 FROM generate_series(0, 999) g",
+		"CREATE UNIQUE INDEX ios_p_21 ON ios_p (u2, u1)",
+	)
+	vacuumThen(t, ctx, "ios_r")
+	vacuumThen(t, ctx, "ios_p")
+	runComposite(t, ctx, "ANALYZE ios_r", "ANALYZE ios_s", "ANALYZE ios_p")
 
-	// a matches but b doesn't: the residual filter must correctly reject
-	// the row (proves the remapped ColumnRef reads the right column,
-	// rather than merely avoiding a panic).
-	rows = runSQL(t, ctx, `SELECT b FROM ios_remap_t WHERE a = 11 AND b = 2`)
-	if len(rows) != 0 {
-		t.Fatalf("SELECT b WHERE a=11 AND b=2: want 0 rows, got %v", rows)
+	seqOff := optimizer.DefaultPlannerSettings()
+	seqOff.EnableSeqScan = false
+	cases := []struct {
+		ps    optimizer.PlannerSettings
+		query string
+		plan  []string
+		rows  string
+	}{
+		{
+			optimizer.DefaultPlannerSettings(),
+			"SELECT count(*), sum(a) FROM ios_r WHERE b NOT IN (SELECT k FROM ios_s)",
+			[]string{
+				"Index Only Scan using ios_r_ab on ios_r",
+				"Filter: (NOT (ANY (b = (hashed SubPlan 1).col1)))",
+			},
+			"3173|6357447",
+		},
+		{
+			optimizer.DefaultPlannerSettings(),
+			"SELECT sum(a) FROM ios_r WHERE b % 5 = 1",
+			[]string{
+				"Index Only Scan using ios_r_ab on ios_r",
+				"Filter: ((b % 5) = 1)",
+			},
+			"1650510",
+		},
+		{
+			// Every column covered, in index order (u2, u1): the scan is as
+			// wide as the table but permuted (regress create_index's
+			// onek_with_null shape). enable_seqscan = off, as PG needs it to
+			// prefer the index on so narrow a table.
+			seqOff,
+			"SELECT sum(u1), sum(u2) FROM ios_p WHERE u1 % 3 = 1",
+			[]string{
+				"Index Only Scan using ios_p_21 on ios_p",
+				"Filter: ((u1 % 3) = 1)",
+			},
+			"166167|166169",
+		},
 	}
-
-	// Sanity check the other row still resolves independently.
-	rows = runSQL(t, ctx, `SELECT b FROM ios_remap_t WHERE a = 22 AND b = 2`)
-	if len(rows) != 1 || rows[0][0].Int != 2 {
-		t.Fatalf("SELECT b WHERE a=22 AND b=2: want [[2]], got %v", rows)
+	for _, c := range cases {
+		plan := strings.Join(explainLines(t, ctx, c.ps, "EXPLAIN (COSTS OFF) "+c.query), "\n")
+		for _, want := range c.plan {
+			if !strings.Contains(plan, want) {
+				t.Errorf("%s: plan lacks %q:\n%s", c.query, want, plan)
+			}
+		}
+		got := strings.Join(renderRows(drainPlanRows(t, ctx, planWithSettings(t, ctx, c.query, c.ps))), ";")
+		if got != c.rows {
+			t.Errorf("%s: rows %q, want PG's %q", c.query, got, c.rows)
+		}
 	}
 }

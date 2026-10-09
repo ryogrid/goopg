@@ -210,7 +210,7 @@ func dropSequenceCatalogHeapRow(ctx *Context, name string, dbOid uint32) {
 		ctx.Pool.Unpin(slot)
 		return
 	}
-	_ = markHeapDeleteDirty(ctx.Pool, slot, rel, storage.BlockNumber(e.tid.Block), e.tid.Offset, xmax, oldTuple)
+	_ = markHeapDeleteDirtyAndClearVM(ctx, slot, rel, storage.BlockNumber(e.tid.Block), e.tid.Offset, xmax, oldTuple)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	seqHeapTIDs.Delete(key)

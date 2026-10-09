@@ -1,0 +1,75 @@
+===== Q34 =====
+Sort  (cost=18228.99..18229.03 rows=15 width=340) (actual rows=87.00 loops=1)
+  Sort Key: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag DESC, store_sales.ss_ticket_number
+  Sort Method: quicksort  Memory: 30kB
+  ->  Nested Loop  (cost=18033.50..18228.69 rows=15 width=340) (actual rows=87.00 loops=1)
+        ->  GroupAggregate  (cost=18025.24..18044.27 rows=15 width=16) (actual rows=87.00 loops=1)
+              Group Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk
+              Filter: ((count(*) >= 15) AND (count(*) <= 20))
+              Rows Removed by Filter: 884
+              ->  Gather Merge  (cost=18025.24..18041.38 rows=136 width=1572) (actual rows=9969.00 loops=1)
+                    Workers Planned: 3
+                    Workers Launched: 3
+                    ->  Sort  (cost=17025.20..17025.31 rows=44 width=1572)
+                          Sort Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk
+                          Worker 0:  actual time=0.000..0.000 rows=2355.00 loops=1
+                          Worker 1:  actual time=0.000..0.000 rows=2733.00 loops=1
+                          Worker 2:  actual time=0.000..0.000 rows=2503.00 loops=1
+                          Worker 3:  actual time=0.000..0.000 rows=2378.00 loops=1
+                          Sort Method: quicksort  Memory: 9640kB
+                          Worker 0:  Sort Method: quicksort  Memory: 9547kB
+                          Worker 1:  Sort Method: quicksort  Memory: 11079kB
+                          Worker 2:  Sort Method: quicksort  Memory: 10147kB
+                          ->  Hash Join  (cost=240.75..17024.00 rows=44 width=520)
+                                Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                Worker 0:  actual time=0.000..0.000 rows=2355.00 loops=1
+                                Worker 1:  actual time=0.000..0.000 rows=2733.00 loops=1
+                                Worker 2:  actual time=0.000..0.000 rows=2503.00 loops=1
+                                Worker 3:  actual time=0.000..0.000 rows=2378.00 loops=1
+                                Buckets: 1024  Batches: 1  Memory Usage: 50kB  Build Time: 0.073 ms
+                                ->  Nested Loop  (cost=239.36..17022.45 rows=46 width=484)
+                                      Worker 0:  actual time=0.000..0.000 rows=2376.00 loops=1
+                                      Worker 1:  actual time=0.000..0.000 rows=2773.00 loops=1
+                                      Worker 2:  actual time=0.000..0.000 rows=2528.00 loops=1
+                                      Worker 3:  actual time=0.000..0.000 rows=2405.00 loops=1
+                                      ->  Hash Join  (cost=239.11..16105.21 rows=15085 width=64)
+                                            Hash Cond: (store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk)
+                                            Worker 0:  actual time=0.000..0.000 rows=19014.00 loops=1
+                                            Worker 1:  actual time=0.000..0.000 rows=19445.00 loops=1
+                                            Worker 2:  actual time=0.000..0.000 rows=18554.00 loops=1
+                                            Worker 3:  actual time=0.000..0.000 rows=18411.00 loops=1
+                                            Buckets: 1024  Batches: 1  Memory Usage: 229kB  Build Time: 5.868 ms
+                                            ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=428)
+                                                  Worker 0:  actual time=0.000..0.000 rows=182127.00 loops=1
+                                                  Worker 1:  actual time=0.000..0.000 rows=179765.00 loops=1
+                                                  Worker 2:  actual time=0.000..0.000 rows=180924.00 loops=1
+                                                  Worker 3:  actual time=0.000..0.000 rows=177060.00 loops=1
+                                            ->  Seq Scan on household_demographics  (cost=0.00..233.00 rows=489 width=48)
+                                                  Filter: ((((hd_buy_potential = '1001-5000') OR (hd_buy_potential = '0-500')) AND (hd_vehicle_count > 0)) AND (CASE WHEN (hd_vehicle_count > 0) THEN (hd_dep_count / hd_vehicle_count) ELSE NULL END > 1.2))
+                                                  Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                                  Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                                  Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                                  Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      ->  Memoize  (cost=0.25..0.30 rows=1 width=420)
+                                            Cache Key: store_sales.ss_sold_date_sk
+                                            Hits: 17322  Misses: 1089  Evictions: 0  Overflows: 0
+                                            ->  Index Scan using date_dim_pkey on date_dim  (cost=0.25..0.30 rows=1 width=420)
+                                                  Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                                  Filter: ((((d_dom >= 1) AND (d_dom <= 3)) OR ((d_dom >= 25) AND (d_dom <= 28))) AND (d_year = ANY (2000, 2001, 2002)))
+                                ->  Seq Scan on store  (cost=0.00..1.24 rows=12 width=676)
+                                      Filter: (s_county = ANY ('Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County'))
+                                      Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 2:  actual time=0.000..0.000 rows=0.00 loops=0
+                                      Worker 3:  actual time=0.000..0.000 rows=0.00 loops=0
+        ->  Bitmap Heap Scan on customer  (cost=8.26..12.27 rows=1 width=324)
+              Recheck Cond: (c_customer_sk = ss_customer_sk)
+              ->  Bitmap Index Scan on customer_pkey  (cost=0.25..8.26 rows=1 width=324)
+                    Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+Planning Time: 0.011 ms
+Execution Time: 282.991 ms
+===== Q35 =====
+Limit  (cost=27247.16..27396.96 rows=100 width=320) (actual rows=100.00 loops=1)
+  ->  GroupAggregate  (cost=27247.16..27395.96 rows=1920 width=320) (actual rows=100.00 loops=1)
+        Group Key: ca.ca_state, customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_dep_count, customer_demographics.cd_dep_employed_count, customer_demographics.cd_dep_college_count
+        ->  Sort  (cost=27247.16..27251.96 rows=1920 width=1708) (actual rows=328.00 loops=1)

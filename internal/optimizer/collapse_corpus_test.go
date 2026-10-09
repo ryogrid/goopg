@@ -520,10 +520,12 @@ func TestExplicitJoinChainReachesTheSearch(t *testing.T) {
 		t.Fatal("the seam declined an explicit-JOIN chain — the P5.9-r walk has regressed")
 	}
 	got := seamEqualities(out)
-	for _, want := range []string{"a0=b0", "b0=c0"} {
-		if !got[want] {
-			t.Fatalf("the searched tree does not enforce %s (enforces %v)", want, got)
-		}
+	// a0, b0 and c0 form one equivalence class, so a join applies one
+	// clause per class (M0146-0022, generate_join_implied_equalities):
+	// c0 may be equated to a0 (PG's first outer member) or b0 — either
+	// closes the class together with a0=b0.
+	if !got["a0=b0"] || !(got["b0=c0"] || got["a0=c0"]) {
+		t.Fatalf("the searched tree does not equate a0, b0 and c0 (enforces %v)", got)
 	}
 }
 

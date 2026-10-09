@@ -1,0 +1,48 @@
+=== Q28
+                                                                                                                                                                          QUERY PLAN                                                                                                                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=132911.43..132911.54 rows=1 width=288)
+   ->  Nested Loop  (cost=132911.43..132911.54 rows=1 width=288)
+         ->  Nested Loop  (cost=110805.18..110805.27 rows=1 width=240)
+               ->  Nested Loop  (cost=88675.08..88675.15 rows=1 width=192)
+                     ->  Nested Loop  (cost=66523.84..66523.89 rows=1 width=144)
+                           ->  Nested Loop  (cost=44362.62..44362.65 rows=1 width=96)
+                                 ->  Aggregate  (cost=22121.77..22121.78 rows=1 width=48)
+                                       ->  Gather Merge  (cost=21058.20..22058.36 rows=8454 width=6)
+                                             Workers Planned: 3
+                                             ->  Sort  (cost=20058.16..20064.98 rows=2727 width=6)
+                                                   Sort Key: store_sales.ss_list_price
+                                                   ->  Parallel Seq Scan on store_sales  (cost=0.00..19902.54 rows=2727 width=6)
+                                                         Filter: ((ss_quantity >= 0) AND (ss_quantity <= 5) AND (((ss_list_price >= '107'::numeric) AND (ss_list_price <= '117'::numeric)) OR ((ss_coupon_amt >= '1319'::numeric) AND (ss_coupon_amt <= '2319'::numeric)) OR ((ss_wholesale_cost >= '60'::numeric) AND (ss_wholesale_cost <= '80'::numeric))))
+                                 ->  Aggregate  (cost=22240.85..22240.86 rows=1 width=48)
+                                       ->  Gather Merge  (cost=21075.13..22171.36 rows=9266 width=6)
+                                             Workers Planned: 3
+                                             ->  Sort  (cost=20075.09..20082.56 rows=2989 width=6)
+                                                   Sort Key: store_sales_1.ss_list_price
+                                                   ->  Parallel Seq Scan on store_sales store_sales_1  (cost=0.00..19902.54 rows=2989 width=6)
+                                                         Filter: ((ss_quantity >= 6) AND (ss_quantity <= 10) AND (((ss_list_price >= '23'::numeric) AND (ss_list_price <= '33'::numeric)) OR ((ss_coupon_amt >= '825'::numeric) AND (ss_coupon_amt <= '1825'::numeric)) OR ((ss_wholesale_cost >= '43'::numeric) AND (ss_wholesale_cost <= '63'::numeric))))
+                           ->  Aggregate  (cost=22161.21..22161.22 rows=1 width=48)
+                                 ->  Gather Merge  (cost=21063.80..22095.79 rows=8723 width=6)
+                                       Workers Planned: 3
+                                       ->  Sort  (cost=20063.76..20070.80 rows=2814 width=6)
+                                             Sort Key: store_sales_2.ss_list_price
+                                             ->  Parallel Seq Scan on store_sales store_sales_2  (cost=0.00..19902.54 rows=2814 width=6)
+                                                   Filter: ((ss_quantity >= 11) AND (ss_quantity <= 15) AND (((ss_list_price >= '74'::numeric) AND (ss_list_price <= '84'::numeric)) OR ((ss_coupon_amt >= '4381'::numeric) AND (ss_coupon_amt <= '5381'::numeric)) OR ((ss_wholesale_cost >= '57'::numeric) AND (ss_wholesale_cost <= '77'::numeric))))
+                     ->  Aggregate  (cost=22151.24..22151.25 rows=1 width=48)
+                           ->  Gather Merge  (cost=21062.38..22086.33 rows=8655 width=6)
+                                 Workers Planned: 3
+                                 ->  Sort  (cost=20062.34..20069.32 rows=2792 width=6)
+                                       Sort Key: store_sales_3.ss_list_price
+                                       ->  Parallel Seq Scan on store_sales store_sales_3  (cost=0.00..19902.54 rows=2792 width=6)
+                                             Filter: ((ss_quantity >= 16) AND (ss_quantity <= 20) AND (((ss_list_price >= '89'::numeric) AND (ss_list_price <= '99'::numeric)) OR ((ss_coupon_amt >= '3117'::numeric) AND (ss_coupon_amt <= '4117'::numeric)) OR ((ss_wholesale_cost >= '68'::numeric) AND (ss_wholesale_cost <= '88'::numeric))))
+               ->  Aggregate  (cost=22130.10..22130.11 rows=1 width=48)
+                     ->  Gather Merge  (cost=21059.36..22066.26 rows=8511 width=6)
+                           Workers Planned: 3
+                           ->  Sort  (cost=20059.32..20066.18 rows=2745 width=6)
+                                 Sort Key: store_sales_4.ss_list_price
+                                 ->  Parallel Seq Scan on store_sales store_sales_4  (cost=0.00..19902.54 rows=2745 width=6)
+                                       Filter: ((ss_quantity >= 21) AND (ss_quantity <= 25) AND (((ss_list_price >= '58'::numeric) AND (ss_list_price <= '68'::numeric)) OR ((ss_coupon_amt >= '9402'::numeric) AND (ss_coupon_amt <= '10402'::numeric)) OR ((ss_wholesale_cost >= '38'::numeric) AND (ss_wholesale_cost <= '58'::numeric))))
+         ->  Aggregate  (cost=22106.25..22106.26 rows=1 width=48)
+               ->  Gather Merge  (cost=21056.02..22043.64 rows=8348 width=6)
+                     Workers Planned: 3
+                     ->  Sort  (cost=20055.98..20062.71 rows=2693 width=6)

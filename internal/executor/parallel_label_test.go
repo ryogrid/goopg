@@ -60,7 +60,7 @@ func renderPlanText(n optimizer.Node) string {
 func renderPlanTextOpts(n optimizer.Node, opts parser.ExplainOptions) string {
 	var rows []Row
 	var b strings.Builder
-	walkPlan(&b, n, 0, &rows, opts)
+	walkPlan(&b, n, 0, &rows, opts, 0)
 	lines := make([]string, 0, len(rows))
 	for _, r := range rows {
 		if len(r) > 0 && r[0].Kind == KindString {

@@ -1,0 +1,106 @@
+## aggregates
+HUNK 32
+--- 
++++ 
+@@ -1,21 +1,16 @@
+-ANALYZE agg_sort_order;
+-EXPLAIN (COSTS OFF)
+-SELECT array_agg(c1 ORDER BY c2),c2
+-FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2;
++ALTER TABLE tenk1 set (parallel_workers = 4);
++SET LOCAL parallel_setup_cost=0;
++SET LOCAL max_parallel_workers_per_gather=4;
++EXPLAIN (COSTS OFF) SELECT balk(hundred) FROM tenk1;
+   QUERY PLAN
+---------------------------------------------------------------------------
+- Sort
+-  Sort Key: c2
+-  ->  GroupAggregate
+-  Group Key: c1
+-  ->  Incremental Sort
+-  Sort Key: c1, c2
+-  Presorted Key: c1
+-  ->  Index Scan using agg_sort_order_pkey on agg_sort_order
+-  Filter: (c2 < 100)
+-(9 rows)
+-DROP TABLE agg_sort_order CASCADE;
+-DROP TABLE btg;
+-RESET enable_hashagg;
+-RESET enable_seqscan;
+--- Secondly test the case of a parallel aggregate combiner function
++----------------------------------------
++ Aggregate
++  ->  Gather
++  Workers Planned: 4
++  ->  Parallel Seq Scan on tenk1
++(4 rows)
++SELECT balk(hundred) FROM tenk1;
++ balk
++------
++(1 row)
++ROLLBACK;
+HUNK 33
+--- 
++++ 
+@@ -1,16 +1,29 @@
+-ALTER TABLE tenk1 set (parallel_workers = 4);
+-SET LOCAL parallel_setup_cost=0;
+-SET LOCAL max_parallel_workers_per_gather=4;
+-EXPLAIN (COSTS OFF) SELECT balk(hundred) FROM tenk1;
++FROM (SELECT * FROM tenk1
++  UNION ALL SELECT * FROM tenk1
++  UNION ALL SELECT * FROM tenk1
++  UNION ALL SELECT * FROM tenk1) u;
+   QUERY PLAN
+-----------------------------------------
+- Aggregate
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ Finalize Aggregate
++  Output: variance, sum, regr_count
+   ->  Gather
+   Workers Planned: 4
+## subselect
+HUNK 33
+--- 
++++ 
+@@ -42,3 +42,6 @@
+   where ss.v;
++NOTICE:  x = 3, y = 2
+ NOTICE:  x = 3, y = 1
++NOTICE:  x = 3, y = 0
++NOTICE:  x = 3, y = 2
+ NOTICE:  x = 3, y = 0
+@@ -48,5 +51,2 @@
+ NOTICE:  x = 3, y = 1
+-NOTICE:  x = 3, y = 0
+-NOTICE:  x = 3, y = 2
+-NOTICE:  x = 3, y = 2
+  v | count
+HUNK 34
+--- 
++++ 
+@@ -24,3 +24,2 @@
+ NOTICE:  x = 3, y = 1
+-NOTICE:  x = 3, y = 0
+ NOTICE:  x = 3, y = 1
+@@ -32,2 +31,3 @@
+ NOTICE:  x = 3, y = 2
++NOTICE:  x = 3, y = 0
+  v | count
+@@ -36,2 +36 @@
+ (1 row)
+-drop function tattle(x int, y int);
+## join
+HUNK 76
+--- 
++++ 
+@@ -6,3 +6,2 @@
+  1 | 4567890123456789 |  123 |  42
+- 1 | 4567890123456789 | -4567890123456789 | 4567890123456789
+  1 |  123 |  456 |  123
+@@ -10,2 +9,3 @@
+  1 | 4567890123456789 |  4567890123456789 | 4567890123456789
++ 1 | 4567890123456789 | -4567890123456789 | 4567890123456789
+ (5 rows)
+tmp/m0009r-regress-base/aggregates.diff:5
+tmp/m0009r-regress-new/aggregates.diff:0

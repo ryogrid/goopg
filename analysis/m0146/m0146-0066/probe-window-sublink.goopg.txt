@@ -1,0 +1,59 @@
+CREATE TABLE
+INSERT 0 5000
+ANALYZE
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on t
+   Filter: (b > (InitPlan 1).col1)
+   InitPlan 1
+     ->  Aggregate
+           ->  Subquery Scan on x
+                 ->  HashAggregate
+                       Group Key: t_1.a
+                       ->  Seq Scan on t t_1
+(8 rows)
+
+        QUERY PLAN         
+---------------------------
+ Sort
+   Sort Key: (sum(b))
+   ->  HashAggregate
+         Group Key: a
+         ->  Seq Scan on t
+(5 rows)
+
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY (sum(b)) ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: (sum(b))
+         ->  HashAggregate
+               Group Key: a
+               ->  Seq Scan on t
+(7 rows)
+
+             QUERY PLAN              
+-------------------------------------
+ Hash Join
+   Hash Cond: (t.a = a)
+   Join Filter: (s > m)
+   ->  HashAggregate
+         Group Key: t.a
+         ->  Seq Scan on t
+   ->  Hash
+         ->  HashAggregate
+               Group Key: t_1.a
+               ->  Seq Scan on t t_1
+(10 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (PARTITION BY a ORDER BY b ROWS UNBOUNDED PRECEDING)
+   Run Condition: (rank() OVER w1 < 3)
+   ->  Sort
+         Sort Key: a, b
+         ->  Seq Scan on t
+(6 rows)
+

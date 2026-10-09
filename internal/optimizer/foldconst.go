@@ -3,10 +3,12 @@ package optimizer
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
@@ -43,7 +45,7 @@ func FoldConstants(e Expr) Expr {
 	// ── Cast expression ────────────────────────────────────────────────
 	case *CastExpr:
 		operand := FoldConstants(x.Operand)
-		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 
 	// ── Unary operator ─────────────────────────────────────────────────
 	case *UnaryOp:
@@ -69,7 +71,7 @@ func FoldConstants(e Expr) Expr {
 		// Subquery rides alongside Plan: this arm REBUILDS the node, so a
 		// field it forgets is a field the rest of the planner never sees
 		// (M0142-0008a-3i-route-a — the retention test caught exactly this).
-		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, Subquery: x.Subquery, List: folded, IsNonCorrelated: x.IsNonCorrelated}
+		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, Plan: x.Plan, Subquery: x.Subquery, List: folded, IsNonCorrelated: x.IsNonCorrelated, ParParam: x.ParParam, Args: x.Args, UnknownEqFalse: x.UnknownEqFalse}
 
 	case *FuncCall:
 		foldedArgs := make([]Expr, len(x.Args))
@@ -81,7 +83,11 @@ func FoldConstants(e Expr) Expr {
 		// it silently re-types the node as unknown downstream. M0119-0006.
 		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
 		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		if lit := tryFoldFuncCall(folded); lit != nil {
+			return lit
+		}
+		return folded
 
 	// ── Non-foldable: return unchanged ─────────────────────────────────
 	default:
@@ -278,6 +284,53 @@ func foldPlanConstantsInner(node Node) {
 // `datetime.FormatTimestamp` counts micros from (postgresEpochJDate).
 const pgEpochUnix int64 = 946684800
 
+// tryFoldDateIntegerOp folds the date day-count operators over literals
+// (M0146-0040): `date ± integer` (date_pli / date_mii) and `integer + date`
+// (integer_pl_date) to a date literal, `date - date` (date_mi) to the integer
+// day count — all four `provolatile = 'i'` on the PG 18.3 oracle, and folded
+// by its eval_const_expressions (`'2001-07-15'::date + 30` renders
+// `'2001-08-14'::date`). Same day arithmetic as the executor's
+// addDateTimeInt / subDateDate. Infinite, BC or unparseable dates decline
+// and stay for the executor.
+func tryFoldDateIntegerOp(pos int, op parser.OpCode, l, r Expr) Expr {
+	dateLit := func(e Expr) (time.Time, bool) {
+		tl, ok := e.(*TypedStringLit)
+		if !ok || !strings.EqualFold(strings.TrimSpace(tl.Type), "date") {
+			return time.Time{}, false
+		}
+		t, ok := parseTemporalLiteral(tl.Value)
+		if !ok || t.Year() < 1 || t.Year() > 9999 {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+	asDate := func(t time.Time) Expr {
+		if t.Year() < 1 || t.Year() > 9999 {
+			return nil
+		}
+		return &TypedStringLit{pos: pos, Type: "date", Value: t.Format("2006-01-02")}
+	}
+	if t, ok := dateLit(l); ok {
+		if n, isInt := r.(*IntegerConst); isInt {
+			days := int(n.Value)
+			if op == parser.OpSub {
+				days = -days
+			}
+			return asDate(t.AddDate(0, 0, days))
+		}
+		if t2, ok2 := dateLit(r); ok2 && op == parser.OpSub {
+			return &IntegerConst{pos: pos, Value: int64(t.Sub(t2) / (24 * time.Hour))}
+		}
+		return nil
+	}
+	if n, isInt := l.(*IntegerConst); isInt && op == parser.OpAdd {
+		if t, ok := dateLit(r); ok {
+			return asDate(t.AddDate(0, 0, int(n.Value)))
+		}
+	}
+	return nil
+}
+
 // tryFoldTemporalBinaryOp folds `<date|timestamp literal> ± <interval literal>`
 // into a single timestamp literal — R44/K83 step B.
 //
@@ -318,6 +371,9 @@ const pgEpochUnix int64 = 946684800
 func tryFoldTemporalBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	if op != parser.OpAdd && op != parser.OpSub {
 		return nil
+	}
+	if folded := tryFoldDateIntegerOp(pos, op, l, r); folded != nil {
+		return folded
 	}
 	base, ok := l.(*TypedStringLit)
 	if !ok {
@@ -511,7 +567,11 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 		}
 	case parser.OpUnaryNeg:
 		if ic, ok := operand.(*IntegerConst); ok {
-			return &IntegerConst{pos: pos, Value: -ic.Value}
+			// A literal operand is negated in place and typed by its new
+			// value (gram.y doNegate, then make_const): `-2147483648` and
+			// even `-(2147483648)` are int4. Only a constant folded from int8
+			// arithmetic keeps int8 (int8um) (M0146-0062).
+			return &IntegerConst{pos: pos, Value: -ic.Value, Wide: ic.Wide}
 		}
 		if nc, ok := operand.(*NumericConst); ok {
 			if len(nc.Value) > 0 && nc.Value[0] == '-' {
@@ -639,6 +699,7 @@ func foldCaseExpr(x *CaseExpr) Expr {
 type literalValue struct {
 	kind   string // "int", "str", "num", "bool"
 	intV   int64
+	int8   bool // an "int" typed int8 (IntegerConstIsInt8), else int4
 	strV   string
 	boolV  bool
 	numStr string // raw decimal text for KindNumeric
@@ -649,7 +710,7 @@ type literalValue struct {
 func toLiteralValue(e Expr) (literalValue, bool) {
 	switch x := e.(type) {
 	case *IntegerConst:
-		return literalValue{kind: "int", intV: x.Value}, true
+		return literalValue{kind: "int", intV: x.Value, int8: IntegerConstIsInt8(x)}, true
 	case *StringConst:
 		return literalValue{kind: "str", strV: x.Value}, true
 	case *NumericConst:
@@ -696,6 +757,28 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 	// Promote both sides: int×int stays int; anything with num → numeric.
 	if l.kind == "int" && r.kind == "int" {
 		a, b := l.intV, r.intV
+		// M0146-0062: int4 op int4 is int4 (int4pl, int4mul, ...), which
+		// raises `integer out of range` past 32 bits; an int8 operand makes
+		// it int8, and the folded constant keeps that type (Wide).
+		wide := l.int8 || r.int8
+		out, err := evalIntArith(pos, op, a, b)
+		if err != nil || out == nil {
+			return out, err
+		}
+		if ic, ok := out.(*IntegerConst); ok {
+			if !wide && (ic.Value < -2147483648 || ic.Value > 2147483647) {
+				return nil, &PlanError{Code: "22003", Message: "integer out of range"}
+			}
+			ic.Wide = wide
+		}
+		return out, nil
+	}
+	return evalArithNumeric(pos, op, l, r)
+}
+
+// evalIntArith is evalArith's int64 arithmetic: bigint range checks only.
+func evalIntArith(pos int, op parser.OpCode, a, b int64) (Expr, error) {
+	{
 		switch op {
 		case parser.OpAdd:
 			r := a + b
@@ -736,37 +819,44 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 			return &IntegerConst{pos: pos, Value: a % b}, nil
 		}
 	}
-	// At least one numeric: promote both to decimal strings and fold.
+	return nil, nil
+}
+
+// evalArithNumeric folds arithmetic with at least one numeric operand.
+func evalArithNumeric(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
+	// At least one numeric: promote both to decimal strings and fold with
+	// PG's numeric arithmetic (numeric_add/sub/mul/div: exact decimal, with
+	// add_var's max scale, mul_var's summed scale and div_var's
+	// select_div_scale). A float64 fold returned 0.1+0.2 as
+	// 0.30000000000000004 and 1.0/3 as 0.3333333333333333 (M0146-0041).
 	ls, rs, err := toDecimalStrings(l, r)
 	if err != nil {
 		return nil, err
 	}
-	lf, err2 := strconv.ParseFloat(ls, 64)
-	if err2 != nil {
-		return nil, err2
-	}
-	rf, err3 := strconv.ParseFloat(rs, 64)
-	if err3 != nil {
-		return nil, err3
-	}
-	var result float64
 	switch op {
-	case parser.OpAdd:
-		result = lf + rf
-	case parser.OpSub:
-		result = lf - rf
-	case parser.OpMul:
-		result = lf * rf
-	case parser.OpDiv:
-		if rf == 0 {
-			return nil, fmt.Errorf("division by zero")
-		}
-		result = lf / rf
+	case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 	default:
 		return nil, fmt.Errorf("unsupported numeric op %s", op)
 	}
-	return &NumericConst{pos: pos, Value: strconv.FormatFloat(result, 'f', -1, 64)}, nil
+	if NumericArith == nil {
+		// No numeric implementation registered (an optimizer-only
+		// binary or test): leave the expression for the executor.
+		return nil, fmt.Errorf("numeric folding unavailable")
+	}
+	out, err := NumericArith(op, ls, rs)
+	if err != nil {
+		return nil, err
+	}
+	return &NumericConst{pos: pos, Value: out}, nil
 }
+
+// NumericArith evaluates `l op r` over two numeric literal texts with
+// PostgreSQL's numeric semantics and returns the result's numeric_out text.
+// The executor owns numeric arithmetic and registers it here at init (the
+// optimizer cannot import the executor); a nil hook leaves numeric constant
+// expressions unfolded. A division by zero must come back as an error whose
+// text is "division by zero", which the fold caller raises as 22012.
+var NumericArith func(op parser.OpCode, l, r string) (string, error)
 
 func toDecimalStrings(l, r literalValue) (string, string, error) {
 	toString := func(v literalValue) (string, error) {
@@ -798,11 +888,7 @@ func litCompare(l, r literalValue) (int, error) {
 			return cmpI64(l.intV, r.intV), nil
 		}
 		if r.kind == "num" {
-			lf, rf, err := parseNumericPair(strconv.FormatInt(l.intV, 10), r.numStr)
-			if err != nil {
-				return 0, err
-			}
-			return cmpF64(lf, rf), nil
+			return cmpNumericText(strconv.FormatInt(l.intV, 10), r.numStr)
 		}
 	case "num":
 		ls := l.numStr
@@ -810,11 +896,10 @@ func litCompare(l, r literalValue) (int, error) {
 		if r.kind == "int" {
 			rs = strconv.FormatInt(r.intV, 10)
 		}
-		lf, rf, err := parseNumericPair(ls, rs)
-		if err != nil {
-			return 0, err
+		if r.kind != "num" && r.kind != "int" {
+			return 0, fmt.Errorf("cannot compare numeric with %s", r.kind)
 		}
-		return cmpF64(lf, rf), nil
+		return cmpNumericText(ls, rs)
 	case "str":
 		if r.kind != "str" {
 			return 0, fmt.Errorf("cannot compare string with %s", r.kind)
@@ -839,28 +924,22 @@ func litCompare(l, r literalValue) (int, error) {
 	return 0, fmt.Errorf("cannot compare %s with %s", l.kind, r.kind)
 }
 
-func parseNumericPair(a, b string) (float64, float64, error) {
-	af, err := strconv.ParseFloat(a, 64)
-	if err != nil {
-		return 0, 0, err
+// cmpNumericText compares two numeric literal texts by exact value (PG's
+// cmp_numerics); a float64 comparison folded 1.00000000000000000001 > 1 to
+// false (M0146-0041).
+func cmpNumericText(a, b string) (int, error) {
+	ar, ok := new(big.Rat).SetString(a)
+	if !ok {
+		return 0, fmt.Errorf("invalid numeric literal %q", a)
 	}
-	bf, err := strconv.ParseFloat(b, 64)
-	if err != nil {
-		return 0, 0, err
+	br, ok := new(big.Rat).SetString(b)
+	if !ok {
+		return 0, fmt.Errorf("invalid numeric literal %q", b)
 	}
-	return af, bf, nil
+	return ar.Cmp(br), nil
 }
 
 func cmpI64(a, b int64) int {
-	if a < b {
-		return -1
-	} else if a > b {
-		return 1
-	}
-	return 0
-}
-
-func cmpF64(a, b float64) int {
 	if a < b {
 		return -1
 	} else if a > b {
@@ -885,4 +964,81 @@ func cmpResult(op parser.OpCode, cmp int) bool {
 		return cmp >= 0
 	}
 	return false
+}
+
+// EvalConstFunc evaluates a built-in function call whose arguments are all
+// literals and returns the result's output text under resultType, or false
+// when it cannot (an evaluation error, a NULL result, a Datum that does not
+// round-trip as resultType's literal). The executor owns function evaluation
+// and registers it at init (the optimizer cannot import the executor); a nil
+// hook leaves every call unfolded. M0146-0123.
+var EvalConstFunc func(fc *FuncCall, resultType string) (string, bool)
+
+// tryFoldFuncCall is the evaluate_function half of eval_const_expressions'
+// simplify_function (clauses.c): a call of an IMMUTABLE, non-set-returning
+// plain function whose arguments are all non-null constants is replaced by a
+// Const holding its result — `abs(-1)` plans as `1`, `upper('x')` as
+// `'X'::text`, `length('abc') = 3` as `true`. The overload is the one the
+// arguments' exact types select from the PG 18.3 pg_proc seed
+// (LookupProcForNode), and its own provolatile / proretset / prokind decide
+// (ProcIsFoldable) — `length(text)` folds although `length(bytea, name)` is
+// stable.
+//
+// Bounds of this slice (deferral ledger M0146-0123): the result must be an
+// integer, numeric, bool or text type — the types whose goopg Datum
+// round-trips exactly through the literal node, so folding cannot change a
+// query's result; an evaluation error or a NULL result leaves the call for
+// run time (PG raises the error at plan time and folds a strict call over a
+// NULL argument to a NULL Const).
+func tryFoldFuncCall(x *FuncCall) Expr {
+	if EvalConstFunc == nil || x.Star || x.Variadic || x.Distinct || x.ReturnType != "" ||
+		strings.Contains(x.Name, ".") || x.Name == FieldSelectFuncName {
+		return nil
+	}
+	argOIDs := make([]uint32, 0, len(x.Args))
+	for _, a := range x.Args {
+		if _, param := a.(*ParamRef); param || !isPlainConstantBound(a) {
+			return nil
+		}
+		at, ok := ExprResultType(a)
+		if !ok {
+			return nil
+		}
+		oid, ok := exactTypeOID(at)
+		if !ok {
+			return nil
+		}
+		argOIDs = append(argOIDs, oid)
+	}
+	funcid, ok := catalog.LookupProcForNode(strings.ToLower(x.Name), argOIDs)
+	if !ok || !catalog.ProcIsFoldable(funcid) {
+		return nil
+	}
+	retOID, ok := catalog.ProcResultType(funcid)
+	if !ok {
+		return nil
+	}
+	ret := catalog.OIDToTypeName(retOID)
+	switch ret {
+	case "int2", "int4", "int8", "numeric", "bool", "text", "varchar":
+	default:
+		return nil
+	}
+	text, ok := EvalConstFunc(x, ret)
+	if !ok {
+		return nil
+	}
+	switch ret {
+	case "int4", "int8":
+		n, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return nil
+		}
+		return &IntegerConst{pos: x.pos, Value: n, Wide: ret == "int8"}
+	case "numeric":
+		return &NumericConst{pos: x.pos, Value: text}
+	case "bool":
+		return &BooleanConst{pos: x.pos, Value: text == "true"}
+	}
+	return &TypedStringLit{pos: x.pos, Type: ret, Value: text}
 }

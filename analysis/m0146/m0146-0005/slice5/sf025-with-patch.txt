@@ -1,0 +1,6 @@
+Q47  TIMEOUT   310s (309052ms) (oracle 100 rows)
+=== SUMMARY: PASS=95 (60 ck-verified, 35 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=1 SKIP=3 ===
+TIMEOUT    +Q47
+=== STATUS-DELTA: compared=99 verdict-changes=yes runtime-moves=0 total-delta=+4.5% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+=== PLAN-SHAPE: queries=99 same=80 changed=19 added=0 removed=0 ===
+gate-stamp: tpcds-sf025: unstaged code changes: gate built a tree that is not the index (gate verdict was FAIL-TIMEOUT) — stamping FAIL

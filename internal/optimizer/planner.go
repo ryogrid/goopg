@@ -139,7 +139,8 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 		plannerSet.ParallelStatementOK = false
 	}
 	// A-01(ii) cut 1: one RTID scope per top-level statement (F1).
-	node, err := planStmtWithSettings(stmt, cat, plannerSet, newRtableScope())
+	scope := newRtableScope()
+	node, err := planStmtWithSettings(stmt, cat, plannerSet, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +202,39 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// the passes that turned out to be able to rewrite the map; this one runs
 	// after all of them. A no-op boolean test with `GOOPG_PGSHAPED_DP` off.
 	assertSearchedBoundariesIntact(node)
+	// M0146-0005w: upstream's setrefs cleans up trivial SubqueryScan nodes
+	// LAST (clean_up_removed_plan_level) — a label survives only when the
+	// leaf's consumption is non-trivial. Runs after the boundary assert on
+	// purpose: the assert verifies the as-planned coordinate map, and this
+	// pass removes labelling nodes only.
+	// M0146-0005av: an inlined CTE reference PG could not pull up is a
+	// subquery RTE there too; wrap it before the strip decides.
+	// M0146-0005dn: window run conditions are a subquery_planner decision,
+	// made before setrefs strips trivial SubqueryScans.
+	node = pushWindowRunConditions(node)
+	node, wrappedCTE := wrapInlinedCTEScans(node)
+	// M0146-0093: an appendrel's members PG keeps as subquery RTEs get
+	// their "*SELECT* n" SubqueryScan, before the renumbering that reads
+	// the levels the wrappers mark and the strip that decides them.
+	wrapAppendRelMembers(node)
+	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
+	// while the SubqueryScan wrappers still mark the levels PG keeps.
+	renumberRTIDsFlatRtableOrder(node)
+	// M0146-0005dr: SS_charge_for_initplans — each query level's top node
+	// carries its initPlans' cost. Before the strip, while the Subquery Scan
+	// wrappers still mark the levels PG keeps; EXPLAIN's own inner
+	// statement is charged by its recursive call.
+	if _, isExplain := stmt.(*parser.ExplainStmt); !isExplain {
+		chargeInitPlans(node)
+	}
+	node = stripTrivialSubqueryScans(node, scope.derivedSubtrees, wrappedCTE)
+	// M0146-0091: setrefs walks every subplan too — strip inside each
+	// sublink / InitPlan body, which hang off expressions the pass above
+	// does not follow.
+	stripSublinkBodies(node, scope.derivedSubtrees, wrappedCTE)
+	// M0146-0034: record which index scan carries the ORDER BY, for the
+	// parallel post-pass that runs on this plan without the statement.
+	markIndexOrderRelied(node, stmt)
 	return node, nil
 }
 
@@ -405,6 +439,19 @@ type resolveContext struct {
 	schema Schema // schema produced by the input scan
 	// bindings keeps every FROM-clause relation in output-column order.
 	bindings []rangeBinding
+	// pulledDerived / pulledQuals: the FROM-clause subqueries pulled up into
+	// this scope's join search (derivedpullup.go, M0146-0028) — the name view
+	// of each (its alias and output columns, resolved to the body columns
+	// they rename) and the bodies' resolved WHERE conjuncts, ANDed into this
+	// scope's WHERE by planSelect.
+	pulledDerived []*pulledDerivedRel
+	pulledQuals   []Expr
+	// pulledQualCtx maps each top-level conjunct of a pulled body's WHERE
+	// to the body context it was resolved in (M0146-0028f). The jointree
+	// sublink pull-up binds a sublink in that conjunct against it — PG runs
+	// pull_up_sublinks on the subquery before splicing it — because the
+	// body's relations are hidden from the statement's own name lookup.
+	pulledQualCtx map[Expr]*resolveContext
 	// cat threads the catalog through so subexpression rewrites
 	// (currently subquery planning) can recurse into Plan() without
 	// every helper taking it as a separate argument. Populated by
@@ -498,6 +545,13 @@ type resolveContext struct {
 	// deeper scopes by the same one-level bound.
 	appendrelMember bool
 
+	// scalarSublinkBody marks this resolveContext as a scalar sublink's
+	// body scope (M0146-0012, PlannerSettings.scalarSublinkBody): the seam
+	// admits correlated conjuncts as base-rel restrictions here even when
+	// the scope joins several relations. Set only inside
+	// planSelectWithSettings for a scope that arrived carrying the flag.
+	scalarSublinkBody bool
+
 	// antiForcedNullCols: the "table\x00column" keys whose IS NULL conjunct
 	// forced a LEFT->ANTI conversion demotedForPlan (reduce_outer_joins.go)
 	// transplanted in this statement (R40/K69). Those conjuncts must not
@@ -510,6 +564,11 @@ type resolveContext struct {
 	// every context that is not a top-level FROM clause, same convention
 	// as joinlist/joinInfoList above.
 	antiForcedNullCols map[string]bool
+	// reducedFrom is the statement's FROM list with reduce_outer_joins'
+	// verdicts applied (planFromClauseItems), for readers that need the
+	// joins as the deconstruction sees them. The AST keeps the written
+	// types (M0146-0005bn); nil when the FROM walk did not run.
+	reducedFrom []parser.FromExpr
 
 	// tupleFraction is `PlannerInfo.tuple_fraction`: how much of the result
 	// will actually be fetched, which decides whether a fast-start path may
@@ -633,6 +692,12 @@ type rangeBinding struct {
 	// … ON CONFLICT DO UPDATE (excluded is in-scope for DO UPDATE
 	// SET/WHERE but not for RETURNING).
 	notReferenceable bool
+	// cteRef marks a reference to a WITH query, kept as a CTE scan or
+	// inlined (M0146-0007f plans it as a subquery). PG's parse analysis
+	// sees it as RTE_CTE either way, inlining being a planner step, so a
+	// bare FOR UPDATE locks nothing through it and FOR UPDATE OF it is an
+	// error (transformLockingClause). M0146-0007g.
+	cteRef bool
 	// tableOidColIdx, when > 0, holds the relative offset within
 	// this binding's row of the synthetic `tableoid` column. Set
 	// by the planner-side per-leaf Project wrapping in partition
@@ -652,6 +717,12 @@ type rangeBinding struct {
 	// leaf rel (M0145-0004). Never set on the legacy pipeline, so the
 	// flag is the arm gate as well as the admissibility record.
 	appendrel bool
+	// pulledHidden marks a leaf binding that came from a pulled-up
+	// FROM-clause subquery's body (derivedpullup.go, M0146-0028): a real
+	// leaf of this scope's search, but — like PG's pulled-up RTEs — not
+	// reachable by name from the parent query. Name resolution skips it;
+	// the derived alias resolves through resolveContext.pulledDerived.
+	pulledHidden bool
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -697,6 +768,20 @@ func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
 	return out
 }
 
+// cteRefSchema is a CTE reference's published row: the body's columns,
+// each stamped with the reference's own range-table id. The body's ids
+// number another query level, so two references to one CTE (TPC-DS Q39's
+// `inv inv1, inv inv2`) would otherwise publish the same ids, and a
+// column of the second would deparse as the first's.
+func cteRefSchema(body Schema, sourceIdx int16) Schema {
+	out := make(Schema, len(body))
+	for i, c := range body {
+		c.SourceTableIdx = sourceIdx
+		out[i] = c
+	}
+	return out
+}
+
 func newResolveContext(bindings []rangeBinding, schema Schema, ps PlannerSettings) *resolveContext {
 	// settings starts at the DEFAULTS, never at the zero value. A zero
 	// PlannerSettings would price every page and tuple at 0.0, so a context
@@ -714,37 +799,6 @@ func newResolveContext(bindings []rangeBinding, schema Schema, ps PlannerSetting
 		ctx.alias = ctx.bindings[0].alias
 	}
 	return ctx
-}
-
-// mergeResolveContexts concatenates outer and inner into a single ctx
-// whose bindings/schema are outer-then-inner. Used to thread LATERAL
-// FROM bindings into a JOIN's right side: the right SRF arg must see
-// the cross-FROM-item siblings (outer) *and* the same FROM item's
-// left side of the JOIN (inner). Either side may be nil. M0103-0008.
-func mergeResolveContexts(outer, inner *resolveContext) *resolveContext {
-	if outer == nil {
-		return inner
-	}
-	if inner == nil {
-		return outer
-	}
-	bindings := make([]rangeBinding, 0, len(outer.bindings)+len(inner.bindings))
-	bindings = append(bindings, outer.bindings...)
-	shift := len(outer.schema)
-	for _, b := range inner.bindings {
-		b.offset += shift
-		bindings = append(bindings, b)
-	}
-	schema := appendSchema(outer.schema, inner.schema)
-	merged := newResolveContext(bindings, schema, outer.settings)
-	// A-01(ii) cut 2: carry the statement scope across the merge so a
-	// sublink resolved against the merged context keeps this statement's
-	// RTIDs (same-statement merge, so either side's scope will do).
-	merged.rtScope = rtableScopeFrom(outer)
-	if merged.rtScope == nil {
-		merged.rtScope = rtableScopeFrom(inner)
-	}
-	return merged
 }
 
 func singleBindingContext(table *catalog.Table, alias string, ps PlannerSettings) *resolveContext {
@@ -766,6 +820,16 @@ func singleBindingContext(table *catalog.Table, alias string, ps PlannerSettings
 func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, error) {
 	// As ResolveIndexPredicate above: expression resolution only.
 	return resolveExpr(e, singleBindingContext(table, "", DefaultPlannerSettings()))
+}
+
+// ResolveColumnDefault resolves a column's DEFAULT expression for per-row
+// evaluation by a statement that fills omitted columns outside an INSERT
+// plan — COPY FROM, whose BeginCopyFrom prepares each omitted column's
+// default once (build_column_default + ExecPrepareExpr, copyfrom.c) and
+// evaluates it per row. The resolve context is the one planInsert uses for
+// its appended defaults, so both paths compute the same value (M0146-0054).
+func ResolveColumnDefault(e parser.Expr, cat catalog.Catalog) (Expr, error) {
+	return resolveExpr(e, &resolveContext{cat: cat, settings: DefaultPlannerSettings()})
 }
 
 func appendSchema(left, right Schema) Schema {
@@ -879,8 +943,10 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog, ps
 				tiesKeys = append(tiesKeys, k.Expr)
 			}
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
-			WithTies: s.WithTies, TiesKeys: tiesKeys}
+		if limitNeeded(lim, off) {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+				WithTies: s.WithTies, TiesKeys: tiesKeys}
+		}
 	}
 	return node, nil
 }
@@ -1197,6 +1263,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// groupingsets.go. Recursive planSelect calls (nested subqueries, the
 	// set-op chain's head operand) reach this same idempotent check.
 	prepareGroupingSets(s)
+	// M0146-0024: subquery_planner moves aggregate-free HAVING conjuncts
+	// into WHERE (a copy of s; the parse tree is not mutated).
+	s = moveHavingToWhere(s, cat)
 
 	// C-11: this scope's upper-rel registry. One per invocation — a
 	// subquery, a CTE body and a view body each plan through their own
@@ -1211,11 +1280,15 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// A-01(ii) cut 2: CTE bodies allocate from the statement scope.
 	// EX3-03 cut 1: CTE bodies routinely contain the join tree — they plan
 	// under the statement's settings.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, plannerSet, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, s, cat, plannerSet, scope)
 	if err != nil {
 		return nil, err
 	}
 	defer restore()
+	markSelectOwnedCTEs(s.With)
+	// M0146-0007e: parse analysis' cterefcount, for the reference-site
+	// pull-up that must decide before planning finishes counting.
+	stampCTEReferenceCounts(s)
 
 	if s.SetOp != nil {
 		// Flatten the right-associative parse tree into a flat list of
@@ -1281,6 +1354,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// chain intact). Keying on cutAt rather than on "every segment but the
 		// last" is what lets a partially-parenthesised operand be cut at its
 		// paren boundary instead of at its end. M0125-0006.
+		// M0146-0093: an appendrel's members (pull_up_simple_union_all)
+		// that PG keeps as subquery RTEs get their "*SELECT* n" wrapper.
+		// Only a flat UNION ALL chain numbers its leaves as the segments do.
+		var appendRel *appendRelLabel
+		if plannerSet.appendrelLabel {
+			appendRel = &appendRelLabel{}
+			for _, seg := range segments {
+				if seg.cutAt == nil || seg.opType != parser.SetOpUnion || !seg.opAll {
+					appendRel = nil
+					break
+				}
+			}
+		}
 		savedSetOps := make([]*parser.SetOpClause, len(segments)+1)
 		savedSetOps[0] = s.SetOp
 		s.SetOp = nil
@@ -1310,6 +1396,14 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		s.OrderBy = nil
 		s.Limit = nil
 		s.Offset = nil
+		// The WITH list also belongs to the whole chain and was preplanned
+		// above. Left attached, the leftmost branch would preplan it again
+		// into a scope of its own, so every branch counted its references
+		// against a different plannedCTE and a CTE read by two branches
+		// looked single-reference to each (inlined twice where PG keeps one
+		// `CTE <name>` with two CTE Scans).
+		savedWith := s.With
+		s.With = nil
 		// Plan the leftmost branch: s without its SetOp chain and without the
 		// whole chain's sort/limit. When s is a grouping node this recursion
 		// lands on the SetOpOperand branch below and plans the parenthesised
@@ -1331,8 +1425,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
 		s.Offset = savedOffset
+		s.With = savedWith
 		if err != nil {
 			return nil, err
+		}
+		leftAppendMember := 0
+		if appendRel != nil && !isSafeAppendMember(s, left, scope) {
+			leftAppendMember = 1
 		}
 		// planSegment plans segment i's operand alone.
 		//
@@ -1396,6 +1495,18 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// they differ. Once setOpUnifyBranches has run every branch
 			// agrees by construction, so this is the only point the
 			// question can still be asked. M0145-0004.
+			// M0146-0093: the appendrel member numbers this link's sides
+			// carry, decided on the branches as planned (before any cast
+			// Project the unification below adds).
+			memberLeft, memberRight := 0, 0
+			if appendRel != nil {
+				if i == 0 {
+					memberLeft = leftAppendMember
+				}
+				if !isSafeAppendMember(seg.stmt, right, scope) {
+					memberRight = i + 2
+				}
+			}
 			typesDiffer := setOpBranchTypesDiffer(acc, right)
 			acc, right = setOpUnifyBranches(seg.opPos, acc, right)
 			right = wrapSetOpBranchWithCasts(seg.opPos, acc.Output(), right)
@@ -1431,7 +1542,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			leaves := append(append([]Node(nil), leavesOf(acc)...), leavesOf(right)...)
 			if seg.opAll {
 				out, err := createSetOpPaths(upper, &SetOp{pos: s.Pos(), Left: acc, Right: right, Op: seg.opType, All: true,
-					TlistTypesDiffer: typesDiffer}, plannerSet, setOpTupleFraction)
+					TlistTypesDiffer: typesDiffer, appendRel: appendRel,
+					appendMemberLeft: memberLeft, appendMemberRight: memberRight}, plannerSet, setOpTupleFraction)
 				if err == nil {
 					unionFolds[out] = unionFoldRec{leaves: leaves, all: true}
 				}
@@ -1514,6 +1626,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		if left, err = foldSetOpRange(left, 0, len(segments)); err != nil {
 			return nil, err
 		}
+		// M0146-0112: a UNION ALL member that is a dummy rel (a constant-false
+		// WHERE) is dropped, as PG's Append skips it.
+		left = pruneDummyUnionAllArms(left)
 		// Restore final ORDER BY / LIMIT / OFFSET.
 		s.OrderBy = savedOrderBy
 		s.Limit = savedLimit
@@ -1522,7 +1637,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
-		return wrapSetOpSortLimit(s, left, cat, plannerSet, scope, upper, setOpTupleFraction)
+		// The chain's data-modifying CTEs run once, ahead of the whole set
+		// operation — the branches no longer preplan the WITH list.
+		out, err := wrapSetOpSortLimit(s, left, cat, plannerSet, scope, upper, setOpTupleFraction)
+		if err != nil {
+			return nil, err
+		}
+		return wrapDMLCTEPrefix(out, dmlPlans), nil
 	}
 	// A grouping node stands for a parenthesised set-op operand with nothing
 	// left of its own chain to fold — `(A UNION B) ORDER BY 1 LIMIT 2`, or the
@@ -1541,7 +1662,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 		// C-17: a grouping node's own trailing sort/limit belongs to the
 		// parenthesised operand it wraps; its fraction is this statement's.
-		return wrapSetOpSortLimit(s, operand, cat, plannerSet, scope, upper, searchTupleFraction(s.Limit, s.Offset))
+		out, err := wrapSetOpSortLimit(s, operand, cat, plannerSet, scope, upper, searchTupleFraction(s.Limit, s.Offset))
+		if err != nil {
+			return nil, err
+		}
+		return wrapDMLCTEPrefix(out, dmlPlans), nil
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -1567,6 +1692,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// flag reaches member scopes intact.
 	appendrelMember := plannerSet.appendrelMember
 	plannerSet.appendrelMember = false
+	plannerSet.appendrelLabel = false
+	// M0146-0012: same one-scope bound for the scalar-sublink-body mark.
+	scalarSublinkBody := plannerSet.scalarSublinkBody
+	plannerSet.scalarSublinkBody = false
 
 	// M0145-0005 slice 4 (m0145-0005 design doc §"Slice 4"): the
 	// one-relation scope is a searched problem like any other —
@@ -1604,6 +1733,18 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// permuted on a different rule. The search chooses join order
 		// on cost; a greedy pre-pass can only take that choice away.
 		var err error
+		// M0146-0005bn: subquery_push_qual runs before the subquery is
+		// planned (subquerypushqual_ast.go).
+		// M0146-0005dl: remove_useless_joins — an unread LEFT JOIN to a
+		// unique-keyed table never reaches the FROM-clause planner.
+		s = removeUselessLeftJoins(s, cat)
+		// M0146-0115: remove_useless_self_joins — an inner self-join on a
+		// unique key keeps one of the two scans.
+		s = removeUselessSelfJoins(s, cat)
+		s = pushWhereQualsIntoGroupedItems(s, cat)
+		// M0146-0094: set_append_rel_size's push of the appendrel's
+		// restrictions into its UNION ALL members.
+		s = pushWhereQualsIntoUnionAllItems(s, cat, scope)
 		node, ctx, err = planFromClause(s, cat, plannerSet, scope)
 		if err != nil {
 			return nil, err
@@ -1617,6 +1758,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// inherit it.
 		if appendrelMember && ctx != nil {
 			ctx.appendrelMember = true
+		}
+		if scalarSublinkBody && ctx != nil {
+			ctx.scalarSublinkBody = true
 		}
 	}
 	// Make the catalog reachable from every resolveExpr call in
@@ -1663,12 +1807,19 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
 	}
 
-	if s.Where != nil {
+	// M0146-0028: a pulled-up FROM subquery's WHERE is part of this scope's
+	// qual (pull_up_simple_subquery appends the subquery's quals to the
+	// parent's), so a WHERE-less statement with pulled bodies takes this arm.
+	var pulledQuals []Expr
+	if ctx != nil {
+		pulledQuals = ctx.pulledQuals
+	}
+	if s.Where != nil || len(pulledQuals) > 0 {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
 		// Exception: correlated outer-scope aggregates (all column refs reference
 		// tables NOT in the current FROM clause) are allowed — PG permits
 		// `WHERE sum(outer.col) = inner.col` inside EXISTS subqueries. M0097-0035.
-		if exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
+		if s.Where != nil && exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
 			return nil, &PlanError{Pos: firstAggregatePos(s.Where), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
@@ -1694,10 +1845,13 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// calculations"). `whereClause` is a local rewrite; `s.Where` is
 		// untouched, same as `whereQual` below.
 		whereClause := s.Where
-		if len(ctx.antiForcedNullCols) > 0 {
+		if whereClause != nil && len(ctx.antiForcedNullCols) > 0 {
 			whereClause = stripForcingNullQuals(s.Where, ctx.antiForcedNullCols, buildTableMap(s.FromExprs, cat), cat)
 		}
-		whereQual := canonicalizeQual(whereClause)
+		var whereQual parser.Expr
+		if whereClause != nil {
+			whereQual = canonicalizeQual(whereClause)
+		}
 		// R40/K69: whereQual can be nil here when a demotedForPlan
 		// ANTI transplant's forcing conjunct was the ENTIRE WHERE
 		// clause (stripForcingNullQuals above) — mirror the
@@ -1728,6 +1882,25 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// only; widening it to multi-relation scopes is a separate,
 			// corpus-visible change — ledgered, not smuggled in.
 			reduced := false
+			if len(ctx.bindings) > 1 && len(pulledQuals) == 0 && len(ctx.pulledDerived) == 0 &&
+				fromJoinsInnerOnly(ctx.reducedFromOr(s.FromExprs)) {
+				// M0146-0038: the same reduction for a scope of several
+				// relations joined without outer joins — no Var of this
+				// WHERE is nulled by a join, so `expr_is_nonnullable`'s
+				// varnullingrels test passes for all of them (TPC-DS Q51's
+				// `ws_item_sk IS NOT NULL` beside `ws_sold_date_sk =
+				// d_date_sk`). Only always-true conjuncts are dropped; an
+				// always-false one keeps the predicate as written, since
+				// PG's constant-FALSE baserestrictinfo empties one
+				// relation of a join goopg would otherwise still plan.
+				if rewritten, alwaysFalse := reduceNotNullQualsWith(pred, scopeNonNullable(ctx.bindings)); !alwaysFalse {
+					if rewritten == nil {
+						reduced = true
+					} else {
+						pred = rewritten
+					}
+				}
+			}
 			if len(ctx.bindings) == 1 {
 				rewritten, alwaysFalse := reduceNotNullQuals(pred,
 					ctx.bindings[0].table, int(ctx.bindings[0].sourceIdx))
@@ -1757,8 +1930,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				// spent here.
 				whereQual = nil
 			} else {
+				if len(pulledQuals) > 0 {
+					// M0146-0116: the pulled bodies' quals first — PG
+					// distributes a FromExpr's items before its own quals
+					// (deconstruct_recurse), and that order is the
+					// equivalence classes' member order.
+					pred = combineAnd(append(append([]Expr{}, pulledQuals...), pred))
+				}
 				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 			}
+		}
+		if whereQual == nil && len(pulledQuals) > 0 {
+			// M0146-0028: no parent WHERE (or a fully stripped one) — the
+			// pulled bodies' quals are the whole Filter.
+			node = &Filter{pos: s.Pos(), Child: node, Predicate: combineAnd(pulledQuals)}
 		}
 		// M0127-P5.9-b's `root->tuple_fraction` assignment lived HERE,
 		// inside the WHERE arm, until C-17 (P4-08) moved it to the
@@ -1770,6 +1955,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		addPulledBodyColumnNames(ctx)
+		expandWholeRowColumnNames(ctx, s, cat)
 		// M0145-0003: the WHERE-clause sublinks are pulled up HERE —
 		// PG's pull_up_sublinks position, before join-order search —
 		// into leaf entries + SpecialJoinInfo on ctx.jtPullup, which
@@ -1839,64 +2026,37 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// See pushOuterQualsIntoLaterals in pushdown.go.
 		node = pushOuterQualsIntoLaterals(node)
 
-		// M0145-0008: restore the one-relation index producer on the
-		// routes that SKIP the rule-based bypass above.
+		// M0145-0008: the one-relation rule-based index producer, on a scope
+		// the search left as a bare seq-scan tree.
 		//
-		// The legacy rule-based bypass (deleted with the legacy
-		// pipeline, M0145-0008) was the ONLY producer of an index path
-		// driven by a correlated (outer-reference) restriction. Every
-		// single-relation scope now plans through this generic arm —
-		// PG-faithfully, since `make_one_rel` runs
-		// `set_base_rel_pathlists` unconditionally — but the search's
-		// base-rel pathlist has no such producer, so the scope comes
-		// out as a bare `Filter{SeqScan}`.
+		// It was restored at the cutover because the search's base-rel
+		// pathlist then had no producer for a correlated (outer-reference)
+		// key, so TPC-H Q17's correlated body came out `Filter{SeqScan}`,
+		// read as not probe-cheap (`innerPlanIsIndexProbeCheap`) and was
+		// decorrelated into a whole-table GROUP BY (1021 ms -> 11155 ms).
+		// M0146-0015a gave the search that producer, and on TPC-H and
+		// TPC-DS SF0.25 this rule no longer fires on a correlated scope.
+		// Its correlated half (an IndexScan keyed on an outer column) is
+		// retired (M0146-0073): it last covered an outer key goopg typed
+		// int8 against an int4 index column, which M0146-0062 fixed. The
+		// uncorrelated half remains and can override a costed Seq Scan PG
+		// keeps (M0146-0060).
 		//
-		// Measured 2026-09-21 on TPC-H Q17's correlated scalar body
-		// (`SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE
-		// l_partkey = p_partkey`): the body was BORN `Filter(SeqScan)`
-		// on both of those routes and `Aggregate(BitmapHeapScan(
-		// BitmapIndexScan))` on the bypass. That is not a cosmetic
-		// difference — `canUnnestSubquery`'s S6/D6.2 guard
-		// (`innerPlanIsIndexProbeCheap`) reads the body's SHAPE to
-		// decide whether decorrelating it is a loss, so a body that
-		// never got its probe reads as "not cheap" and is decorrelated
-		// into a whole-table GROUP BY. Q17 went 1021 ms -> 11155 ms
-		// (jointree) and 1021 ms -> 10625 ms (GOOPG_ONEREL_SEARCH=on
-		// on the DEFAULT arm — the defect is route-borne, not
-		// arm-borne).
-		//
-		// The rule is strictly NARROWER than the bypass it restores:
-		// it fires only when the search elected NO index path at all,
-		// so it can never displace a costed index choice — it only
-		// fills the hole where this route produces none.
-		if isSimpleSingle && whereQual != nil && planIsBareSeqScanTree(node) {
+		// Its multi-conjunct twin `flattenStrandedSeqScanFilters`
+		// (M0145-0027) is deleted (M0146-0012 slice 2): the search
+		// builds Q20's probe itself, and the flatten only replaced a
+		// searched leaf with an unsearched one priced far under PG
+		// (TPC-DS Q41's correlated item scan 180 vs PG's 4029).
+		// M0146-0028b: not for a pulled-up derived table — the index
+		// producer rebuilds the scan from the statement's own WHERE alone
+		// and would drop the pulled body's quals.
+		if isSimpleSingle && whereQual != nil && len(ctx.pulledDerived) == 0 && planIsBareSeqScanTree(node) {
 			onlyFrom := len(s.From) == 1 && s.From[0].Only
 			whereForIndex := injectLikeRangePredicates(whereQual)
 			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
-			} else if flat, ok := flattenStrandedSeqScanFilters(node); ok {
-				// M0145-0027: the producer above only reads a WHERE that
-				// is ONE equality (Q17's body). A multi-conjunct WHERE
-				// (TPC-H Q20's `l_partkey = ps_partkey AND l_suppkey =
-				// ps_suppkey AND l_shipdate …`) is declined there on
-				// every route; the bypass arm gets its correlated probe
-				// from the SECOND producer instead —
-				// `rewriteScanInputsWithSingleTablePredicates` below,
-				// which absorbs the equality out of `Filter{SeqScan}`.
-				// On this route that producer is shut out: the search
-				// took the constant quals into a SEARCHED leaf
-				// `Filter{SeqScan}` (a searched subtree keeps its own
-				// leaves, P5.9-b) and left the correlated conjuncts —
-				// which `conjunctIsLocalEligible` refuses as leaf quals —
-				// in a residual Filter above it. Flattening the two into
-				// the one unsearched `Filter{SeqScan}` the bypass would
-				// have built hands the tree to that producer unchanged.
-				// Same contract as the rule above: it fires only on a
-				// bare seq-scan tree (the search elected no index) and
-				// only when a correlated conjunct is stranded above it.
-				node = flat
 			}
 		}
 	} else {
@@ -1933,6 +2093,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
+		addPulledBodyColumnNames(ctx)
+		expandWholeRowColumnNames(ctx, s, cat)
 		if newChild, newPred := tryJoinSearch(node, nil, ctx, cat); newPred == nil {
 			node = newChild
 		} else if newChild != node {
@@ -2087,6 +2249,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// Same spec, winning strategy, priced input. The producer writes the
 		// winner back onto agg.node in place (the rules mutated in place,
 		// so node, the HAVING filter, and agg.node alias it).
+		// M0145-0008m: every functionally-dependent column read above the
+		// aggregate joins the Passthrough list BEFORE the election, so no
+		// candidate that narrows the aggregate's input can omit it.
+		prefetchFuncDepPassthroughs(s, agg)
 		if _, gerr := createGroupingPaths(upper, agg.node, cat, plannerSet, orderTupleFraction); gerr != nil {
 			return nil, gerr
 		}
@@ -2241,6 +2407,11 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// aggregate stage's target. TPC-H Q3, Q5, Q9, Q10,
 			// Q21 all use ORDER BY <alias> shapes.
 			expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+			// M0146-0005ak: an item a WHERE constant pins sorts nothing
+			// (PG's redundant sort pathkey, groupkeyconst.go).
+			if orderItemPinnedByWhere(expr, s) {
+				continue
+			}
 			var e Expr
 			var err error
 			// If resolveOrderBySubstitution returned the original IntegerConst
@@ -2248,9 +2419,21 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// 1-based positional reference against the output schema.  This
 			// matches wrapSetOpSortLimit and the SRF post-sort path.
 			if ic, ok := expr.(*parser.IntegerConst); ok {
+				// The ordinal counts OUTPUT columns, and a star's output is
+				// its expansion, not the input schema: a pulled-up derived
+				// table (M0146-0028) hides its body's other columns, and a
+				// JOIN USING hides the right-side copy. Walk the target list
+				// through the expansions first; the input-schema index is
+				// right only when every star expands to its bindings'
+				// contiguous columns, which stays the fallback.
+				if agg == nil && win == nil {
+					if se, ok := ordinalThroughStarTargets(int(ic.Value), s.Targets, sortCtx); ok {
+						e = se
+					}
+				}
 				outSchema := sortCtx.schema
 				idx := int(ic.Value) - 1
-				if idx >= 0 && idx < len(outSchema) {
+				if e == nil && idx >= 0 && idx < len(outSchema) {
 					sc := outSchema[idx]
 					e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
 				}
@@ -2422,7 +2605,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			// expansion, non-constant bounds) keeps today's order:
 			// the decline is fail-closed.
 			deferredLim, deferredOff = lim, off
-		} else {
+		} else if limitNeeded(lim, off) {
 			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
 				WithTies: s.WithTies, TiesKeys: tiesKeys}
 		}
@@ -2468,7 +2651,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 				innerAgg = a
 			}
 		}
-		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 {
+		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 && !innerAgg.GroupedNoKeys {
 			allConst := true
 			for _, t := range targets {
 				if !isConstantPlanExpr(t) {
@@ -2537,18 +2720,20 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// Deleted by C-20b: measured over both corpora and both
 	// GOOPG_PGSHAPED_DP arms, it was reached up to 194 times and moved
 	// nothing, and the plans are byte-identical without it.
+	// M0021-0002 — wrap the SELECT plan in a LockRows node carrying the
+	// resolved per-relation locking intent; the executor consumes Locks to
+	// acquire row-level pessimistic locks before returning rows. A clause
+	// that marks no relation (every FROM item a WITH query, M0146-0007g)
+	// gets no LockRows: PG's query then has no rowMarks.
+	var locks []LockedRel
 	if len(s.Locking) > 0 {
-		// M0021-0002 — wrap the SELECT plan in a LockRows
-		// node carrying the resolved per-relation locking
-		// intent. The executor (Stage A executor lands in
-		// M0021-0003) consumes Locks to acquire row-level
-		// pessimistic locks before returning rows. Until
-		// then the executor refuses to Build a *LockRows so
-		// runtime never silently drops the locking intent.
-		locks, lerr := resolveLockedRels(s, ctx)
+		var lerr error
+		locks, lerr = resolveLockedRels(s, ctx)
 		if lerr != nil {
 			return nil, lerr
 		}
+	}
+	if len(locks) > 0 {
 		// M0129-S6 resjunk-ctid column-path re-enable: wire ctid columns
 		// into leaf scan schemas, then rebase the whole plan's expression
 		// coordinates (rebaseRowMarkPlan — the goopg analogue of PG's
@@ -2700,7 +2885,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// sorting so ORDER BY is respected. M0097-0005. Gated on empty
 	// DistinctOn (defense-in-depth: both parsers leave Distinct=false for
 	// DISTINCT ON today, but the ast.go contract claims otherwise).
-	if s.Distinct && len(s.DistinctOn) == 0 {
+	if s.Distinct && len(s.DistinctOn) == 0 && agg == nil && win == nil && selectSrfPending == nil && distinctKeysAllPinned(s) {
+		// M0146-0113: every distinct key is constant or WHERE-pinned, so
+		// PG's distinct_pathkeys is empty and the DISTINCT is a LIMIT 1
+		// (create_final_distinct_paths).
+		out = &Limit{pos: s.Pos(), Child: out, Limit: &IntegerConst{pos: s.Pos(), Value: 1}}
+	} else if s.Distinct && len(s.DistinctOn) == 0 {
 		// The ORDER BY keys are resolved against the DISTINCT output first
 		// (DISTINCT keeps its input's schema, so out.Output() is it).
 		var outerKeys []SortKey
@@ -2796,7 +2986,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		}
 	}
 	// R83: deferred LIMIT above DISTINCT (see the LIMIT stage above).
-	if deferredLim != nil || deferredOff != nil {
+	if limitNeeded(deferredLim, deferredOff) {
 		out = &Limit{pos: s.Pos(), Child: out, Limit: deferredLim, Offset: deferredOff}
 	}
 	// B-01c Slice 1: finalized above-aware re-stamp of the ORDER BY Sort
@@ -2907,6 +3097,11 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
 		if len(lc.Targets) == 0 {
 			for _, b := range ctx.bindings {
+				// transformLockingClause's all-rels loop ignores RTE_CTE:
+				// a WITH query's rows are not locked. M0146-0007g.
+				if b.cteRef {
+					continue
+				}
 				emit(b, strength, policy)
 			}
 			continue
@@ -2916,6 +3111,10 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 			if !ok {
 				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
 					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
+			}
+			if b.cteRef {
+				return nil, &PlanError{Pos: lc.Pos(), Code: "0A000",
+					Message: fmt.Sprintf("%s cannot be applied to a WITH query", lockStrengthSQL(lc.Strength))}
 			}
 			emit(b, strength, policy)
 		}
@@ -2943,6 +3142,19 @@ func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 		return LockStrengthForKeyShare
 	}
 	return LockStrengthForUpdate
+}
+
+// lockStrengthSQL is LCS_asString: the clause as written, for messages.
+func lockStrengthSQL(s parser.LockStrength) string {
+	switch s {
+	case parser.LockStrengthForNoKeyUpdate:
+		return "FOR NO KEY UPDATE"
+	case parser.LockStrengthForShare:
+		return "FOR SHARE"
+	case parser.LockStrengthForKeyShare:
+		return "FOR KEY SHARE"
+	}
+	return "FOR UPDATE"
 }
 
 func lockWaitPolicyFromParser(p parser.LockWaitPolicy) LockWaitPolicy {
@@ -3070,6 +3282,8 @@ func wireRowMarkCtidColumns(root Node, locks []LockedRel) (int, map[Node]int) {
 		case *WindowAgg:
 			walk(s.Child)
 		case *Memoize:
+			walk(s.Child)
+		case *Materialize:
 			walk(s.Child)
 		case *LockRows:
 			walk(s.Child)
@@ -3289,6 +3503,9 @@ func rebaseRowMarkPlan(root Node, oldW map[Node]int) {
 				rebaseExprRefsSeen(e, cm, seen)
 			}
 			return cm
+		case *Materialize:
+			// M0146-0010: transparent — no exprs of its own to rebase.
+			return walk(v.Child)
 		case *LockRows:
 			cm := walk(v.Child)
 			rebaseExprRefsSeen(v.LimitCount, cm, seen)
@@ -3741,6 +3958,8 @@ func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
 		for _, e := range b.Keys {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
+		rebaseExprRefsSeen(b.LowKey, outerMap, seen)
+		rebaseExprRefsSeen(b.HighKey, outerMap, seen)
 		for _, e := range b.Pred {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
@@ -3789,6 +4008,50 @@ func rebaseBitmapProbeKeys(n Node, outerMap []int, seen map[*ColumnRef]bool) {
 // consumes its own RTID; see planScanRangeVar.
 type rtableScope struct {
 	next int32
+	// derivedSubtrees registers every FROM-subquery leaf's subtree root —
+	// wrapped in a SubqueryScan or not — so Plan()'s tail can bound each
+	// derived scope for the setrefs-style triviality pass
+	// (stripTrivialSubqueryScans). Unwrapped subtrees are still separate
+	// binding scopes (a simple subquery keeps its own column namespace),
+	// so they must be recorded just like wrapped ones. M0146-0005w.
+	derivedSubtrees []Node
+	// appendMemberOrigWhere maps a UNION ALL member that took pushed
+	// restriction quals (pushWhereQualsIntoUnionAllItems, M0146-0094) to
+	// its WHERE before the push: is_safe_append_member is decided on the
+	// member PG's pull-up saw, before set_append_rel_size pushes anything.
+	appendMemberOrigWhere map[*parser.SelectStmt]parser.Expr
+}
+
+// recordAppendMemberOrigWhere notes member m's WHERE before a push.
+func (s *rtableScope) recordAppendMemberOrigWhere(m *parser.SelectStmt, where parser.Expr) {
+	if s == nil || m == nil {
+		return
+	}
+	if s.appendMemberOrigWhere == nil {
+		s.appendMemberOrigWhere = map[*parser.SelectStmt]parser.Expr{}
+	}
+	s.appendMemberOrigWhere[m] = where
+}
+
+// appendMemberWhere is member m's own WHERE, before any pushed quals.
+func (s *rtableScope) appendMemberWhere(m *parser.SelectStmt) parser.Expr {
+	if s != nil {
+		if w, ok := s.appendMemberOrigWhere[m]; ok {
+			return w
+		}
+	}
+	return m.Where
+}
+
+// recordDerivedSubtree appends a FROM-subquery leaf subtree root to the
+// scope's registry. Nil-receiver safe, matching Alloc: callers on the
+// unthreaded utility paths simply record nothing (the triviality pass
+// then under-bounds, which only ever over-keeps a label). M0146-0005w.
+func (s *rtableScope) recordDerivedSubtree(n Node) {
+	if s == nil || n == nil {
+		return
+	}
+	s.derivedSubtrees = append(s.derivedSubtrees, n)
 }
 
 func newRtableScope() *rtableScope { return &rtableScope{next: 1} }
@@ -3826,6 +4089,37 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	if len(s.FromExprs) == 0 {
 		return planFromRangeVars(s.From, cat, ps, scope)
 	}
+	// M0146-0028: pull simple FROM-clause subqueries into this scope's join
+	// search (derivedpullup.go). A pull-up attempt that fails to resolve
+	// leaves no trace — the scope's RTID counter and derived-subtree registry
+	// are restored — and the FROM clause is planned exactly as before.
+	if items, cands, onQuals := expandDerivedPullups(s, derivedPullupOn, cat); cands != nil {
+		var next int32
+		var nDerived int
+		if scope != nil {
+			next, nDerived = scope.next, len(scope.derivedSubtrees)
+		}
+		node, rctx, ok, err := planFromClauseItems(s, items, cands, onQuals, cat, ps, scope)
+		if err == nil && ok {
+			for _, c := range cands {
+				takeBackPulledBodyRefs(c.cte)
+			}
+			return node, rctx, nil
+		}
+		if scope != nil {
+			scope.next = next
+			scope.derivedSubtrees = scope.derivedSubtrees[:nDerived]
+		}
+	}
+	node, rctx, _, err := planFromClauseItems(s, s.FromExprs, nil, nil, cat, ps, scope)
+	return node, rctx, err
+}
+
+// planFromClauseItems is planFromClause's FROM walk over `items` — the
+// statement's FROM list, or its expansion with pulled-up subquery bodies
+// (M0146-0028) described by `cands`. ok=false reports a pull-up that did not
+// resolve; the caller then re-plans without it.
+func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []*derivedPullupCandidate, onQuals []parser.Expr, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, bool, error) {
 	var root Node
 	var bindings []rangeBinding
 	// M0145-0005 slice 3: the accumulated leaf/link table — each item's
@@ -3842,12 +4136,26 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// Counter starts at 1; zero is reserved as the "unknown /
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
-	for _, rawItem := range s.FromExprs {
+	for itemIdx, rawItem := range items {
 		// R27 §4a / K28: plan from a copy carrying the outer-join demotions
 		// that `reduceOuterJoins` (below, unchanged) computes, so the PLAN and
 		// `root->join_info_list` agree on join TYPE. See `demotedForPlan` for
 		// why the call below cannot simply be moved up here instead.
-		item, itemAntiCols := demotedForPlan(rawItem, s.Where, cat)
+		// M0146-0028d: an item of a pulled-up body is demoted against the
+		// BODY's WHERE — the quals that stood above its outer joins before
+		// the pull-up — never the statement's.
+		demoteWhere := s.Where
+		owner := pulledCandidateOwning(cands, itemIdx)
+		if owner != nil {
+			demoteWhere = owner.body.Where
+		}
+		item, itemAntiCols := demotedForPlan(rawItem, demoteWhere, cat)
+		if owner != nil && len(itemAntiCols) > 0 {
+			// A LEFT->ANTI demotion drops the nullable side's columns from
+			// the join's output, which a body target may still name; the
+			// body stays an ordinary derived leaf.
+			return nil, nil, false, nil
+		}
 		for key := range itemAntiCols {
 			if antiForcedNullCols == nil {
 				antiForcedNullCols = make(map[string]bool)
@@ -3866,9 +4174,24 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		}
 		itemNode, itemBindings, itemScope, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx, ps, scope)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		jtTab.appendTable(itemScope)
+		// M0146-0028: a pulled-up body's leaves are this scope's leaves but
+		// not nameable from it; record where each body's bindings land.
+		for _, c := range cands {
+			if itemIdx == c.itemLo {
+				c.bindLo = len(bindings)
+			}
+			if itemIdx >= c.itemLo && itemIdx < c.itemHi {
+				for i := range itemBindings {
+					itemBindings[i].pulledHidden = true
+				}
+			}
+			if itemIdx == c.itemHi-1 {
+				c.bindHi = len(bindings) + len(itemBindings)
+			}
+		}
 		if root == nil {
 			root = itemNode
 			bindings = itemBindings
@@ -3891,11 +4214,34 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 		bindings = append(bindings, shifted...)
 	}
 	if root == nil {
-		return nil, nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
+		return nil, nil, false, &PlanError{Pos: s.Pos(), Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
 	rctx := newResolveContext(bindings, root.Output(), ps)
 	// A-01(ii) cut 2: carry the statement scope (see lateralCtx above).
 	rctx.rtScope = scope
+	if len(cands) > 0 {
+		rels, quals, qualCtx, ok := resolvePulledDerived(cands, bindings, root.Output(), cat, ps, scope)
+		if !ok {
+			return nil, nil, false, nil
+		}
+		rctx.pulledDerived, rctx.pulledQuals, rctx.pulledQualCtx = rels, quals, qualCtx
+		// M0146-0028e: the ON clauses of a split inner join chain resolve
+		// at the statement's level, where every operand (and a pulled
+		// derived operand's alias) is in scope.
+		if len(onQuals) > 0 {
+			rctx.cat, rctx.parent = cat, planParent
+			for _, on := range onQuals {
+				q, err := resolveExpr(canonicalizeQual(on), rctx)
+				if err != nil {
+					return nil, nil, false, nil
+				}
+				if q, err = foldQualConstants(q); err != nil {
+					return nil, nil, false, nil
+				}
+				rctx.pulledQuals = append(rctx.pulledQuals, q)
+			}
+		}
+	}
 	// R40/K69: see antiForcedNullCols' declaration above.
 	rctx.antiForcedNullCols = antiForcedNullCols
 	// M0127-P5.8: decide what enters one search problem HERE, where the FROM
@@ -3903,7 +4249,51 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// Inert until P5.9 — nothing reads `joinlist` yet.
 	// M0128-P4.1: reduce outer joins before deconstruction so that
 	// demoted joins enter the joinlist as plain INNER joins.
-	reduceOuterJoins(s.FromExprs, s.Where, cat)
+	// M0146-0028d: the statement's WHERE reduces the statement's own outer
+	// joins; each pulled body's WHERE reduces the body's (the Joins slices
+	// are shared between `items` and the partitions below, so reducing the
+	// partitions reduces `items`).
+	// M0146-0005bn: on a private copy — the verdicts are the deconstruction's
+	// alone, and writing them through into the statement's AST made a second
+	// planning of the same SELECT (a CTE body re-planned as a derived table)
+	// see LEFT joins already turned ANTI with their forcing IS NULL still in
+	// its WHERE.
+	items = cloneFromJoins(items)
+	if len(cands) == 0 {
+		reduceOuterJoins(items, s.Where, cat)
+		rctx.reducedFrom = items
+	} else {
+		var own []parser.FromExpr
+		for i, it := range items {
+			if pulledCandidateOwning(cands, i) == nil {
+				own = append(own, it)
+			}
+		}
+		reduceOuterJoins(own, s.Where, cat)
+		// M0146-0007i: each body reduces only the items it owns directly;
+		// a nested body's items answer to its own WHERE.
+		for _, c := range cands {
+			var direct []parser.FromExpr
+			var at []int
+			for i := c.itemLo; i < c.itemHi; i++ {
+				if pulledCandidateOwning(cands, i) == c {
+					direct = append(direct, items[i])
+					at = append(at, i)
+				}
+			}
+			reduceOuterJoins(direct, c.body.Where, cat)
+			for k, i := range at {
+				items[i] = direct[k]
+			}
+		}
+		// A pulled derived item stood in the written list as a join-free
+		// Base, so the statement's own items are what an inner-only test
+		// over the written list would have seen reduced.
+		rctx.reducedFrom = own
+		if rctx.reducedFrom == nil {
+			rctx.reducedFrom = []parser.FromExpr{}
+		}
+	}
 	// C-01 P3-01: thread the name → leaf scope so SpecialJoinInfo
 	// Min/LhsStrict population can resolve ON-clause names (syn fallback
 	// on any uncertainty — never an underestimate).
@@ -3912,14 +4302,14 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSetting
 	// pin has no item to carry one, and losing its ordering constraint would
 	// let the search reorder across the outer join. See
 	// `deconstructJointreeScopedSJI`.
-	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(s.FromExprs, defaultCollapseLimits(), newSjiScope(s.FromExprs, cat))
+	rctx.joinlist, rctx.joinInfoList = deconstructJointreeScopedSJI(items, defaultCollapseLimits(), newSjiScope(items, cat))
 	// M0145-0005 slice 3: pin the table to the exact chain it was built
 	// beside — the seam consumes it only while `jtScope.root == chain`,
 	// so a pre-search rewrite that grafts a different root (the S5a
 	// post-unnest Phase B chain) falls back to the node walk.
 	jtTab.root = root
 	rctx.jtScope = jtTab
-	return root, rctx, nil
+	return root, rctx, true, nil
 }
 
 func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, error) {
@@ -4046,6 +4436,19 @@ func nodeReferencesOuter(n Node) bool {
 		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
 		// correlated argument is still detected under the wrapper.
 		return nodeReferencesOuter(x.Child)
+	case *CTEScan:
+		// A CTE reference never reads a FROM sibling: its body belongs to
+		// the WITH list's own query level, where no sibling is in scope, so
+		// its outer references name ENCLOSING levels (PG makes such a CTE
+		// an initplan/subplan of the WITH owner; ctescan.c shares one
+		// tuplestore among every reference). Counting them made the join
+		// over two references of a correlated CTE lateral, and the lateral
+		// driver then pushed the left row where the body's level-1 outer
+		// reference resolves: `(WITH c AS MATERIALIZED (SELECT g*2 AS k)
+		// SELECT c.k || '/' || c2.k FROM c, c AS c2)` gave 2/4 for 2/2
+		// (M0146-0071). The enclosing level's correlation is the
+		// subplan's, tracked by planHasEscapingOuterRef, not this join's.
+		return false
 	case *ScalarFuncScan:
 		// A user-defined non-SETOF routine used as a FROM source, e.g.
 		// `FROM t, LATERAL f(t.col)`; the arg resolves to a plain
@@ -4136,11 +4539,30 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	leftCtx.rtScope = scope
 	for _, j := range item.Joins {
 		// LATERAL on the right side of a JOIN can reference the
-		// left side. Merge the outer lateralCtx with the current
-		// leftCtx so SRF args on the right see both. M0103-0008.
-		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		// left side, and through it the FROM items to the left of this
+		// one (lateralCtx). M0146-0032: they are two levels, not one —
+		// the join's openLateral pushes only ITS left row, while the
+		// earlier comma items' row is pushed by the enclosing comma join.
+		// Flattening both into one level (mergeResolveContexts) bound
+		// `a.q1` in `FROM a, x LEFT JOIN LATERAL (SELECT a.q1 ...)` to
+		// position 0 of x's row — x.q1. Chain them instead: the left side
+		// at level 1, the earlier items as its parent at level 2.
+		joinLateralCtx := leftCtx
+		if lateralCtx != nil {
+			chained := *leftCtx
+			chained.parent = lateralCtx
+			joinLateralCtx = &chained
+		}
 		if j.Right.Subquery != nil && !j.Right.Lateral {
-			joinLateralCtx = nil
+			// Non-LATERAL: same-level siblings (leftCtx/joinLateralCtx)
+			// stay invisible inside the right subquery, but outer query
+			// levels do not — PG links the parent ParseState regardless
+			// of rte->lateral. A binding-free link to planParent does
+			// both jobs at once: sibling names still miss, and a
+			// correlated ref counts the extra level openLateral's
+			// left-row push adds at runtime (the Join flips Lateral on
+			// the resolved OuterColumnRef). M0146-0015h.
+			joinLateralCtx = &resolveContext{parent: planParent}
 		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
@@ -4522,7 +4944,15 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			if alias == "" {
 				alias = ce.name
 			}
-			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
+			// M0146-0007f: a multiply-referenced NOT MATERIALIZED CTE is
+			// inlined into each reference (inline_cte), planned here as an
+			// ordinary subquery. An alias list longer than the CTE's columns
+			// keeps the CTE arm and its error.
+			if (ce.inlinesEachReference() || ce.inlinesAsUnionAll()) &&
+				rv.TableSample == nil && len(rv.Columns) <= len(ce.schema) {
+				return planCTEReferenceAsSubquery(rv, ce, alias, cat, sourceIdx, lateralCtx, ps, scope)
+			}
+			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx, cteRef: true}
 			if ce.isDML {
 				// DML CTE: rows are materialized at runtime in
 				// ctx.MaterializedCTEs; use MaterializedCTEScan.
@@ -4530,8 +4960,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					pos:    rv.Pos(),
 					Name:   ce.name,
 					Alias:  alias,
-					schema: ce.schema,
-					RTID:   rtid,
+					schema:    ce.schema,
+					RTID:      rtid,
+					SourceIdx: sourceIdx,
 				}
 				return scan, b, nil
 			}
@@ -4547,9 +4978,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Name:   ce.name,
 				Alias:  alias,
 				Child:  ce.body,
-				schema: ce.schema,
-				cte:    ce,
-				RTID:   rtid,
+				schema:    cteRefSchema(ce.schema, sourceIdx),
+				cte:       ce,
+				RTID:      rtid,
+				SourceIdx: sourceIdx,
 			}
 			return scan, b, nil
 		}
@@ -4579,9 +5011,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// PostgreSQL raises an error only if MORE aliases are given than there are columns.
 	// Partial alias lists (fewer aliases than columns) are allowed. M0097-0003.
 	if len(rv.Columns) > 0 && len(rv.Columns) > len(tbl.Columns) {
+		// ERRCODE_INVALID_COLUMN_REFERENCE with no error position, as
+		// buildRelationAliases raises it (M0146-0028g).
 		return nil, rangeBinding{}, &PlanError{
-			Pos:  rv.Pos(),
-			Code: "42P01",
+			Code: "42P10",
 			Message: fmt.Sprintf("table %q has %d columns available but %d columns specified",
 				rv.Alias, len(tbl.Columns), len(rv.Columns)),
 		}
@@ -4989,6 +5422,12 @@ func containsSetOp(n Node) bool {
 	}
 	if l, ok := n.(*Limit); ok {
 		return containsSetOp(l.Child)
+	}
+	if sq, ok := n.(*SubqueryScan); ok {
+		// M0146-0005w: the wrapper labels a set-operation arm, so the
+		// guard below it must still see the SetOp inside — same answer
+		// the unwrapped subtree gave.
+		return containsSetOp(sq.Child)
 	}
 	return false
 }
@@ -5544,7 +5983,9 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog, ps Pl
 			}
 			off = e
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		if limitNeeded(lim, off) {
+			node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		}
 	}
 	return node, nil
 }
@@ -5567,6 +6008,10 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 	ctx := &resolveContext{cat: cat, settings: ps}
 	if lateralCtx != nil {
 		ctx.parent = lateralCtx
+	} else {
+		// M0146-0015h: same wiring as planSubqueryRangeVar's nil arm —
+		// non-LATERAL closes same-level siblings, not outer levels.
+		ctx.parent = planParent
 	}
 	// A-01(ii) cut 2: VALUES cells may hang scalar subqueries (F6 records
 	// the RTE consumption at the planScanRangeVar level); they allocate
@@ -5675,6 +6120,31 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 // Never parent.settings / lateralCtx.settings — see
 // planSelectWithParent's wrong-scope note.
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, rangeBinding, error) {
+	// M0146-0015i: PG limits sibling FROM-item visibility to explicitly
+	// LATERAL items (and implicitly-lateral table functions); a non-LATERAL
+	// derived table or VALUES reached past earlier comma items gets a
+	// sibling-bearing lateralCtx anyway because the FROM planner builds it
+	// unconditionally for SRF/table-function arguments. Strip the bindings
+	// here so sibling names stop resolving (42P01, matching PG), while the
+	// context still costs one outer level — a comma-item join flips
+	// Join.Lateral on a resolved OuterColumnRef and openLateral pushes the
+	// left row, so the single parent hop keeps OuterColumnRef.Level
+	// consistent with the executor's OuterRows stack. For a join right side
+	// the incoming ctx is already the binding-free marker M0146-0015h
+	// built, so the strip is a no-op there.
+	if !rv.Lateral && lateralCtx != nil {
+		stripped := *lateralCtx
+		stripped.bindings = nil
+		stripped.schema = nil
+		stripped.table = nil
+		stripped.alias = ""
+		stripped.lateralSibling = false
+		stripped.joinlist = nil
+		if stripped.parent == nil {
+			stripped.parent = planParent
+		}
+		lateralCtx = &stripped
+	}
 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
 	// M0097-0003. Pass lateralCtx so qualified star (n.*) can be expanded. M0097-0020.
 	if len(rv.Subquery.ValuesRows) > 0 {
@@ -5698,6 +6168,8 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// appendrel path.
 	appendrelSubquery := !rv.Lateral &&
 		subqueryChainIsSimpleUnionAll(rv.Subquery)
+	// M0146-0093: the member wrappers' mark, on both arms below.
+	ps.appendrelLabel = appendrelSubquery
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx
 		latCtxWithCat.cat = cat
@@ -5755,7 +6227,16 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// is consumed and cleared inside each member scope, so nothing
 		// deeper inherits it (plannersettings.go).
 		ps.appendrelMember = appendrelSubquery
-		inner, err = planSelectWithParent(rv.Subquery, cat, nil, ps, scope)
+		// M0146-0015h: non-LATERAL hides same-level FROM siblings, not
+		// outer query levels — PG links the parent ParseState for every
+		// subquery-in-FROM regardless of rte->lateral, so a correlated
+		// ref inside the derived body (WHERE/ON/targets) must reach the
+		// enclosing scope. planParent is that enclosing statement's ctx;
+		// its bindings never include this statement's own FROM items, so
+		// sibling visibility stays closed while level-1 outer refs land
+		// on the pushed subplan-boundary row (no openLateral hop exists
+		// on this arm).
+		inner, err = planSelectWithParent(rv.Subquery, cat, planParent, ps, scope)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
@@ -5836,7 +6317,128 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// candidate onto the search leaf rel; the flag is unset on the
 	// legacy arm, so off-knob behaviour is unchanged by construction.
 	b.appendrel = appendrelSubquery
+	// M0146-0005w: a subquery PG's is_simple_subquery could not pull up
+	// stays an RTE_SUBQUERY and renders `Subquery Scan on <alias>`. The
+	// appendrel candidate is the one set-op shape that IS pulled up
+	// (is_simple_union_all), so it keeps its inline path; every other
+	// non-simple leaf gets the labelling wrapper.
+	if appendrelSubquery {
+		// M0146-0093: the member wrappers name their columns through the
+		// appendrel's binding.
+		recordAppendRelBinding(inner, sourceIdx, schema)
+	}
+	if !appendrelSubquery && derivedSubqueryNeedsScan(rv.Subquery, inner) {
+		inner = &SubqueryScan{pos: rv.Pos(), Alias: rv.Alias, Child: inner, schema: schema, src: sourceIdx,
+			resjunk: selectHasResjunk(rv.Subquery)}
+	} else if p, ok := inner.(*Project); ok {
+		// M0146-0029: the columns of a derived leaf "stay at 0" (above) —
+		// but an UNLABELLED leaf publishes its root's own schema, whose
+		// SourceTableIdx values are the INNER scope's numbering (restarted
+		// at 1 per query level). An outer reference to `ss1.x` carries the
+		// OUTER binding's id, which can equal an inner id of a sibling
+		// leg's column of the same name; every by-(Name, SourceTableIdx)
+		// re-resolver (reconcileNLILayout, reresolveJoinByName) then binds
+		// it to the wrong leg — regress join.sql's variable-free join alias
+		// panicked in assertSearchedTreeNeedsNoReconcile ("moves x from
+		// column 1 to 3"). Publish the root's columns at 0, as the labelled
+		// form already does, so resolution falls back to names and abstains
+		// on a genuine ambiguity. A copy, because the planned root can be
+		// shared.
+		inner = projectWithUnknownSources(p)
+	}
+	// Register the leaf subtree root whether or not it got the label —
+	// the triviality pass needs every derived scope's boundary to bound
+	// column-consumption per scope (setrefs.c trivial_subqueryscan).
+	scope.recordDerivedSubtree(inner)
 	return inner, b, nil
+}
+
+// projectWithUnknownSources returns p itself when none of its output
+// columns carries a SourceTableIdx, else a shallow copy whose schema has
+// every SourceTableIdx reset to 0 ("unknown / derived", plan.go). M0146-0029.
+func projectWithUnknownSources(p *Project) Node {
+	needs := false
+	for _, c := range p.schema {
+		if c.SourceTableIdx != 0 {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return p
+	}
+	c := *p
+	c.schema = make(Schema, len(p.schema))
+	for i, col := range p.schema {
+		col.SourceTableIdx = 0
+		c.schema[i] = col
+	}
+	return &c
+}
+
+// derivedSubqueryNeedsScan reports whether a FROM-clause subquery must keep
+// a SubqueryScan leaf in the finished plan — the inverse of PG's
+// is_simple_subquery (postgres/src/backend/optimizer/prep/prepjointree.c),
+// which pulls a range-table subquery into an appendrel only for a bare
+// SELECT. Every clause-level refusal there maps to a field here; the
+// target-level properties (hasAggs, windowFuncs, hasTargetSRFs) are read
+// off the PLANNED subtree's shape — Aggregate, WindowAgg and ProjectSet
+// are the resolved form of the same properties, which also covers
+// user-defined aggregates and SETOF routines no name list would catch.
+// M0146-0005w.
+func derivedSubqueryNeedsScan(s *parser.SelectStmt, inner Node) bool {
+	if s == nil {
+		return false
+	}
+	if s.SetOp != nil || s.SetOpOperand != nil ||
+		len(s.GroupBy) > 0 || s.GroupingSets != nil || s.Having != nil ||
+		len(s.OrderBy) > 0 || s.Distinct || len(s.DistinctOn) > 0 ||
+		s.Limit != nil || s.Offset != nil || s.WithTies ||
+		s.With != nil || len(s.Locking) > 0 {
+		return true
+	}
+	return subqueryPlanContains(inner, func(n Node) bool {
+		switch n.(type) {
+		case *Aggregate, *WindowAgg, *ProjectSet:
+			return true
+		}
+		return false
+	})
+}
+
+// subqueryPlanContains reports whether the subtree rooted at n holds a
+// node matching want. Children come from planChildNodes' reflection over
+// exported Node fields, so the walk stays correct for node kinds it does
+// not name. M0146-0005w.
+//
+// M0146-0097: the walk stays at the subquery's own query level, as
+// is_simple_subquery's hasAggs / hasWindowFuncs / hasTargetSRFs do. A nested
+// FROM subquery kept as a subquery (its SubqueryScan), a CTE body and a set
+// operation's arms are levels of their own: an aggregate or window inside one
+// of them does not make this subquery non-simple. (TPC-DS Q44's `asceding`
+// selects * from a ranked derived table; PG pulls it up, and goopg wrapped it
+// because the window sat one level down.)
+func subqueryPlanContains(n Node, want func(Node) bool) bool {
+	if n == nil {
+		return false
+	}
+	if want(n) {
+		return true
+	}
+	switch n.(type) {
+	case *SubqueryScan, *CTEScan, *SetOp:
+		return false
+	}
+	kids, ok := planChildNodes(n)
+	if !ok {
+		return false
+	}
+	for _, k := range kids {
+		if subqueryPlanContains(k, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteIndirectionStarTargets is a thin adapter that delegates to the
@@ -5943,7 +6545,7 @@ func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: replaceExprNode(x.Operand, target, repl)}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *CollateExpr:
 		return &CollateExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), CollationName: x.CollationName}
 	case *CaseExpr:
@@ -7581,7 +8183,22 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		// route than WHERE (planJoinPredicate -> chainOnQual ->
 		// joinsearchseam), so they must be folded here too or the round is
 		// WHERE-only (K86).
-		onPred, onErr := resolveExpr(join.On, mergedCtx)
+		//
+		// Outer references in an ON clause (`e.hundred = a.hundred` inside a
+		// correlated subquery) resolve one level up, exactly as WHERE-clause
+		// outer references do — PG's parse_expr walks the parent ParseState
+		// chain from every jointree level (parse_relation.c's p_parentParseState
+		// hand-off). planFromItem builds mergedCtx as a sibling of the
+		// statement ctx, which only receives `parent = planParent` after the
+		// whole FROM clause returns, so ON resolution saw no parent and the
+		// ref died 42703 "column does not exist" (regress subselect shape:
+		// `... left join e on ... and e.hundred = a.hundred`). Stamp the
+		// parent on a copy: mergedCtx itself stays parent-free so the
+		// USING/NATURAL name lookups below and the next iteration's
+		// `leftCtx = mergedCtx` keep their local-only behaviour.
+		onCtx := *mergedCtx
+		onCtx.parent = planParent
+		onPred, onErr := resolveExpr(join.On, &onCtx)
 		if onErr != nil {
 			return nil, onErr
 		}
@@ -8128,6 +8745,27 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 	}
 
+	// M0146-0005dm: stack the WindowAggs in select_active_windows order —
+	// the window with the stronger (and larger-ref) sort lowest — and name
+	// them after sorting, as grouping_planner does.
+	if len(groups) > 1 {
+		defs := make([]*parser.WindowDef, len(groups))
+		for i, g := range groups {
+			defs[i] = g.calls[0].Over
+		}
+		perm := orderWindowDefsLikePG(s, defs)
+		sorted := make([]*specGroup, len(groups))
+		for i, j := range perm {
+			sorted[i] = groups[j]
+		}
+		groups = sorted
+	}
+	groupNames := make([]string, len(groups))
+	for i, g := range groups {
+		groupNames[i] = windowClauseName(s, g.calls)
+	}
+	nameUnnamedWindows(groupNames)
+
 	currentChild := child
 	currentCtx := inputCtx
 	combinedByKey := make(map[string]windowBinding)
@@ -8136,7 +8774,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 	// single stack of paths.
 	var windowChain []*WindowAgg
 
-	for _, g := range groups {
+	for gi, g := range groups {
 		partition := make([]Expr, 0, len(g.calls[0].Over.PartitionBy))
 		for _, p := range g.calls[0].Over.PartitionBy {
 			r, err := resolveExprForWindowInput(p, currentCtx, agg)
@@ -8179,6 +8817,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 
 		windowNode := &WindowAgg{
 			pos:         s.Pos(),
+			Name:        groupNames[gi],
 			Child:       currentChild,
 			PartitionBy: partition,
 			OrderBy:     order,
@@ -8242,6 +8881,60 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 
 	surface := &windowSurface{input: inputCtx, agg: agg, output: currentCtx, windowByKey: combinedByKey}
 	return currentChild, currentCtx, surface, nil
+}
+
+// windowClauseName is the WINDOW-clause name a spec group's WindowAgg
+// carries, or "" for an unnamed window. It mirrors where parse_agg.c's
+// transformWindowFuncCall points a call's winref: a bare `OVER name` names
+// that clause; any other OVER clause reuses the first p_windowdefs entry it
+// equals — the WINDOW clause's own entries come first, and an entry matches
+// only when both or neither carry the same refname.
+func windowClauseName(s *parser.SelectStmt, calls []*parser.FuncCall) string {
+	for _, fc := range calls {
+		if fc.Over == nil {
+			continue
+		}
+		if fc.Over.IsBareRef {
+			return strings.ToLower(fc.Over.RefName)
+		}
+		key := windowSpecKey(fc.Over)
+		for _, nw := range s.WindowClause {
+			if nw.Def == nil || !strings.EqualFold(nw.Def.RefName, fc.Over.RefName) {
+				continue
+			}
+			if windowSpecKey(nw.Def) == key {
+				return strings.ToLower(nw.Name)
+			}
+		}
+	}
+	return ""
+}
+
+// nameUnnamedWindows is planner.c's name_active_windows: every unnamed
+// window, in activeWindows order (the chain's bottom-up order), takes the
+// first "wN" not already used by a named window of the same query level.
+func nameUnnamedWindows(names []string) {
+	next := 1
+	for i := range names {
+		if names[i] != "" {
+			continue
+		}
+		for {
+			cand := fmt.Sprintf("w%d", next)
+			next++
+			taken := false
+			for _, n := range names {
+				if n == cand {
+					taken = true
+					break
+				}
+			}
+			if !taken {
+				names[i] = cand
+				break
+			}
+		}
+	}
 }
 
 func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
@@ -8309,7 +9002,7 @@ func resolveWindowFrame(fr *parser.WindowFrame, inputCtx *resolveContext, agg *a
 	if fr == nil {
 		return nil, nil
 	}
-	out := &WindowFrame{Mode: fr.Mode, StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
+	out := &WindowFrame{Mode: fr.Mode, StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion, HasBetween: fr.HasBetween}
 	if fr.StartOffset != nil {
 		r, err := resolveExprForWindowInput(fr.StartOffset, inputCtx, agg)
 		if err != nil {
@@ -8386,10 +9079,7 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		case "count":
 			outTyp = catalog.Type{Name: "int8"}
 		case "sum":
-			outTyp = inputTyp
-			if strings.EqualFold(outTyp.Name, "unknown") || outTyp.Name == "" {
-				outTyp = catalog.Type{Name: "int8"}
-			}
+			outTyp = sumResultType(inputTyp)
 		case "avg":
 			if isFloatTypeName(inputTyp.Name) {
 				outTyp = catalog.Type{Name: "float8"}
@@ -8531,6 +9221,15 @@ func windowSpecKey(w *parser.WindowDef) string {
 			b.WriteString(":desc")
 		} else {
 			b.WriteString(":asc")
+		}
+		// M0146-0048: the effective NULLS ordering is part of the window's
+		// sort (PG keeps `ORDER BY x NULLS FIRST` and `ORDER BY x` as two
+		// windows); keying on it normalises an explicit default (`ASC NULLS
+		// LAST`) to the implicit one.
+		if sortByNullsFirst(o) {
+			b.WriteString(":nf")
+		} else {
+			b.WriteString(":nl")
 		}
 		b.WriteString("|")
 	}
@@ -8845,8 +9544,15 @@ func groupByNameIsInputColumn(name string, ctx *resolveContext) bool {
 		}
 		return false
 	}
+	for _, r := range ctx.pulledDerived {
+		for _, n := range r.names {
+			if strings.EqualFold(n, name) {
+				return true
+			}
+		}
+	}
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		for _, c := range b.table.Columns {
@@ -8985,62 +9691,76 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// GROUPING(...) calls and grouping sets both depend on the full column set,
 	// so neither can coexist with pruning (initsplan.c:426).
 	if s.GroupingSets == nil && len(collectGroupingCalls(s)) == 0 {
-		keep, pruned := pruneUselessGroupByColumns(groupExprs, inputCtx, cat)
-		if keep != nil {
-			// Remap slot indices: kept item i moves to slot oldToNew[i]. PG
-			// keeps the ORIGINAL group order with the surplus removed
-			// (initsplan.c:610-625). Aggregate and grouping-mask output columns
-			// are appended AFTER the group columns, so compacting the prefix
-			// shifts their indices automatically.
-			oldToNew := make([]int, len(groupExprs))
-			newIdx := 0
-			for i := range groupExprs {
-				if keep[i] {
-					oldToNew[i] = newIdx
-					newIdx++
-				} else {
-					oldToNew[i] = -1
-				}
+		// M0146-0005ak: two prunings, in PG's order —
+		// remove_useless_groupby_columns (initsplan.c, query_planner time),
+		// then the redundant-pathkey filter standard_qp_callback applies
+		// to what remains (groupkeyconst.go).
+		for pass := 0; pass < 2; pass++ {
+			var keep []bool
+			var pruned map[int]bool
+			if pass == 0 {
+				keep, pruned = pruneUselessGroupByColumns(groupExprs, inputCtx, cat)
+			} else {
+				keep, pruned = redundantConstGroupKeys(groupExprs, s, inputCtx)
 			}
-			newGroupExprs := make([]Expr, 0, newIdx)
-			newSchema := make(Schema, 0, newIdx)
-			var newOrigIdx []int
-			for i := range groupExprs {
-				if keep[i] {
-					newGroupExprs = append(newGroupExprs, groupExprs[i])
-					newSchema = append(newSchema, outputSchema[i])
-					if groupOrigIdx != nil {
-						newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+			if keep != nil {
+				// Remap slot indices: kept item i moves to slot oldToNew[i]. PG
+				// keeps the ORIGINAL group order with the surplus removed
+				// (initsplan.c:610-625). Aggregate and grouping-mask output columns
+				// are appended AFTER the group columns, so compacting the prefix
+				// shifts their indices automatically.
+				oldToNew := make([]int, len(groupExprs))
+				newIdx := 0
+				for i := range groupExprs {
+					if keep[i] {
+						oldToNew[i] = newIdx
+						newIdx++
+					} else {
+						oldToNew[i] = -1
 					}
 				}
-			}
-			groupExprs = newGroupExprs
-			if groupOrigIdx != nil {
-				groupOrigIdx = newOrigIdx
-			}
-			outputSchema = newSchema
-			for key, old := range groupByExpr {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByExpr[key] = oldToNew[old]
-				} else {
-					delete(groupByExpr, key)
+				newGroupExprs := make([]Expr, 0, newIdx)
+				newSchema := make(Schema, 0, newIdx)
+				var newOrigIdx []int
+				for i := range groupExprs {
+					if keep[i] {
+						newGroupExprs = append(newGroupExprs, groupExprs[i])
+						newSchema = append(newSchema, outputSchema[i])
+						if groupOrigIdx != nil {
+							newOrigIdx = append(newOrigIdx, groupOrigIdx[i])
+						}
+					}
+				}
+				groupExprs = newGroupExprs
+				if groupOrigIdx != nil {
+					groupOrigIdx = newOrigIdx
+				}
+				outputSchema = newSchema
+				for key, old := range groupByExpr {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByExpr[key] = oldToNew[old]
+					} else {
+						delete(groupByExpr, key)
+					}
+				}
+				for key, old := range groupByExprQual {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByExprQual[key] = oldToNew[old]
+					} else {
+						delete(groupByExprQual, key)
+					}
+				}
+				for inputIdx, old := range groupByInputCol {
+					if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+						groupByInputCol[inputIdx] = oldToNew[old]
+					} else {
+						delete(groupByInputCol, inputIdx)
+					}
+				}
+				for k := range pruned {
+					prunedInputCols[k] = true
 				}
 			}
-			for key, old := range groupByExprQual {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByExprQual[key] = oldToNew[old]
-				} else {
-					delete(groupByExprQual, key)
-				}
-			}
-			for inputIdx, old := range groupByInputCol {
-				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
-					groupByInputCol[inputIdx] = oldToNew[old]
-				} else {
-					delete(groupByInputCol, inputIdx)
-				}
-			}
-			prunedInputCols = pruned
 		}
 	}
 
@@ -9223,6 +9943,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// in that fixed order.
 	var gsSets [][]int
 	var groupingMasks [][]int64
+	var groupingMaskSlots [][]int
 	var groupCommonSlots map[int]bool
 	groupingCallCol := map[string]int{}
 	if s.GroupingSets != nil {
@@ -9245,12 +9966,13 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 			maskSets = [][]int{all}
 		}
 		for _, gc := range calls {
-			masks, mErr := groupingCallMasks(gc, maskSets, s.Targets, groupByExpr, groupByExprQual)
+			masks, slots, mErr := groupingCallMasksSlots(gc, maskSets, s.Targets, groupByExpr, groupByExprQual)
 			if mErr != nil {
 				return nil, nil, nil, nil, mErr
 			}
 			groupingCallCol[groupingCallKey(gc)] = len(outputSchema)
 			groupingMasks = append(groupingMasks, masks)
+			groupingMaskSlots = append(groupingMaskSlots, slots)
 			// PostgreSQL names the column "grouping" (GroupingFunc's
 			// FigureColname case in parse_target.c).
 			outputSchema = append(outputSchema, SchemaColumn{Name: "grouping", Type: catalog.Type{Name: "int4"}})
@@ -9265,11 +9987,31 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		schema:        outputSchema,
 		GroupingSets:  gsSets,
 		GroupingMasks: groupingMasks,
+		// EXPLAIN-only: the GROUPING(...) arguments' group slots.
+		GroupingMaskSlots: groupingMaskSlots,
+	}
+	// M0146-0102: every GROUP BY key was constant-pinned and pruned — PG's
+	// keyless grouped aggregate, which emits no row over empty input.
+	if len(groupExprs) == 0 && len(s.GroupBy) > 0 && gsSets == nil && len(prunedInputCols) > 0 {
+		aggNode.GroupedNoKeys = true
+	}
+	// M0146-0101: the GROUP BY items pruned above, for the uniqueness proof.
+	if len(prunedInputCols) > 0 {
+		aggNode.PrunedGroupInputs = make([]int, 0, len(prunedInputCols))
+		for k := range prunedInputCols {
+			aggNode.PrunedGroupInputs = append(aggNode.PrunedGroupInputs, k)
+		}
+		sort.Ints(aggNode.PrunedGroupInputs)
 	}
 	// M0145-0008d: processed_groupClause (groupclause.go). Grouping sets and
 	// the default order leave it nil.
 	if gsSets == nil && groupOrigIdx != nil && len(groupOrigIdx) == len(groupExprs) {
 		aggNode.GroupClause = buildGroupClause(s, groupOrigIdx)
+	}
+	// M0146-0020b: preprocess_grouping_sets' rollups, steered by ORDER BY
+	// when they form one chain.
+	if gsSets != nil {
+		aggNode.Rollups = ExtractGroupingRollups(gsSets, groupingSetsSortSlots(s, groupOrigIdx, len(groupExprs)))
 	}
 	// B-01c second cut: keys-only construction stamp (above not yet built,
 	// passthroughs not yet appended — the append sites below re-stamp to
@@ -9430,13 +10172,16 @@ func groupExprName(e Expr) string {
 // the outer row for HAVING subqueries. M0097-0035.
 func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
 	return &resolveContext{
-		table:     agg.input.table,
-		alias:     agg.input.alias,
-		schema:    agg.input.schema,
-		bindings:  agg.input.bindings,
-		cat:       agg.input.cat,
-		parent:    agg.input.parent,
-		havingAgg: agg,
+		table:    agg.input.table,
+		alias:    agg.input.alias,
+		schema:   agg.input.schema,
+		bindings: agg.input.bindings,
+		// M0146-0028: pulled-up derived tables stay nameable from HAVING
+		// sublinks exactly as the bindings do.
+		pulledDerived: agg.input.pulledDerived,
+		cat:           agg.input.cat,
+		parent:        agg.input.parent,
+		havingAgg:     agg,
 		// EX3-03 cut 1 (F5 audit): this parent carries HAVING subqueries,
 		// so it inherits the scope's settings — a zero here would price
 		// the subquery's search at 0.0 instead of the statement's budget.
@@ -9563,6 +10308,8 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planSubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.ArraySubqueryExpr:
 		return planArraySubqueryExpr(x, buildHavingParentCtx(agg))
+	case *parser.FieldSelect:
+		return resolveFieldSelectAfterAggregate(x, agg)
 	case *parser.CollateExpr:
 		inner, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -9639,7 +10386,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if oc, ok := resolved.(*OuterColumnRef); ok {
 			return oc, nil
 		}
-		col := resolved.(*ColumnRef)
+		col, isCol := resolved.(*ColumnRef)
+		if !isCol {
+			// A bare relation name is a whole-row reference (a RowExpr of
+			// its columns), which no grouping column covers: PG's
+			// check_ungrouped_columns reports it as "b.*". This arm used to
+			// type-assert a ColumnRef and panic the backend
+			// (`SELECT b, count(*) FROM t b GROUP BY x`; M0146-0047b).
+			return nil, &PlanError{Pos: x.Pos(), Code: "42803",
+				Message: fmt.Sprintf("column \"%s.*\" must appear in the GROUP BY clause or be used in an aggregate function", x.Column)}
+		}
 		idx, ok := agg.groupByInputCol[col.Index]
 		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
 		// GROUP BY f1 (USING-merged) does NOT satisfy SELECT t1.f1 (qualified).
@@ -9728,7 +10484,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		typmod := encodeTypmod(typeName, x.Typmods)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod, Explicit: true}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
@@ -9932,7 +10688,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		typmod := encodeTypmod(typeName, x.Typmods)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod, Explicit: true}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
 		if err != nil {
@@ -9986,6 +10742,9 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
 	case *parser.InExpr:
+		if cmp, ok := oneElementInAsComparison(x); ok {
+			return resolveExprAfterWindow(cmp, win)
+		}
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
 			return nil, err
@@ -10326,6 +11085,9 @@ func exprAllAggregatesAreOuterRef(e parser.Expr, ctx *resolveContext) bool {
 		if b.table != nil {
 			currentTables[strings.ToLower(b.table.Name)] = true
 		}
+	}
+	for _, r := range ctx.pulledDerived {
+		currentTables[strings.ToLower(r.alias)] = true
 	}
 	// collectColRefs collects all ColumnRef table names from an expression (non-recursive
 	// through function calls — only looks at direct args).
@@ -10722,19 +11484,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					if t == "" || t == "unknown" {
 						t = "text"
 					}
-					// Integer literals default to "integer" (int4) in PG error messages. M0097-0122.
-					if _, isInt := arg.(*parser.IntegerConst); isInt && (t == "int8" || t == "bigint") {
-						t = "integer"
-					}
+					// format_type_be's display spelling (`integer`, not
+					// `int4`): integer literals are int4 since M0146-0062.
 					_ = i
-					sigParts = append(sigParts, t)
+					sigParts = append(sigParts, catalog.ArgTypeDisplayAlias(t))
 				}
 				for _, sk := range withinGroupKeys {
 					t := exprType(sk.Expr).Name
 					if t == "" || t == "unknown" {
 						t = "text"
 					}
-					sigParts = append(sigParts, t)
+					sigParts = append(sigParts, catalog.ArgTypeDisplayAlias(t))
 				}
 				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
 					Message: fmt.Sprintf("function %s(%s) does not exist", name, strings.Join(sigParts, ", ")),
@@ -10808,7 +11568,11 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 		if argExpr != nil {
 			et := exprType(argExpr)
-			if et.Name != "" && et.Name != "unknown" {
+			if strings.HasSuffix(et.Name, "[]") {
+				// array_agg(anyarray) returns the input's own array type
+				// — one dimension deeper, same type. M0146-0033.
+				outType = et
+			} else if et.Name != "" && et.Name != "unknown" {
 				outType = catalog.Type{Name: et.Name + "[]"}
 			} else {
 				outType = catalog.Type{Name: "text[]"}
@@ -10817,10 +11581,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			outType = catalog.Type{Name: "text[]"}
 		}
 	case "sum":
-		outType = exprType(argExpr)
-		if strings.EqualFold(outType.Name, "unknown") || outType.Name == "" {
-			outType = catalog.Type{Name: "int8"}
-		}
+		outType = sumResultType(exprType(argExpr))
 	case "avg":
 		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
 		argType := exprType(argExpr)
@@ -11105,86 +11866,6 @@ func parserExprKey(e parser.Expr) string {
 // already builds (root-0026 SELECT-side twin, M0119-0004). The caller passes
 // false to preserve pre-existing behavior where a different layer already
 // handles (or is unaffected by) the child fan-out — see call sites.
-// bitmapOverCorrelatedProbe prices the two access methods for a correlated
-// single-equality probe — `WHERE inner.col = outer.col` — and returns the
-// bitmap plan when it is the cheaper one, nil to keep the plain index scan.
-//
-// The inputs are exactly the join search's: `varEqNonConstSelectivity` for the
-// unknown probe value (`var_eq_non_const`, selfuncs.c), real index geometry
-// (M0134-0183), `costIndexScan` vs `costBitmapIndexScan` +
-// `computeBitmapPages` + `costBitmapHeapScan` at loop_count 1 — PG plans a
-// subquery once, independent of how many times the outer will drive it, and
-// prices it exactly this way. No preference is expressed anywhere: an
-// un-analysed table returns nil (no row count means no honest comparison, and
-// nil is the pre-existing behaviour), and a tie keeps the index.
-//
-// The composite-prefix case needs no special handling on either side: the
-// bitmap's `lookupKey` pads the probe with `compositeUpperBound` exactly as
-// the index scan's does, and `needsRecheck` marks the prefix probe's tuples
-// for recheck against BitmapQual — which carries the very equality this probe
-// binds.
-// take2 P2-01: takes the statement's planner settings rather than calling
-// defaultCostParams(). Its caller passes ctx.settings, which covers all three
-// paths that reach it — planSelect, planUpdate and planDelete. The DML two
-// build their context with singleBindingContext, which today yields the
-// defaults; when P2-02 stamps those contexts the session's GUCs flow here with
-// no further change, which is why the value travels on the context rather than
-// as a separate parameter.
-func bitmapOverCorrelatedProbe(tbl *catalog.Table, idx *catalog.Index, col *ColumnRef, key, queryClause Expr, schema Schema, pos int, ps PlannerSettings, alias string, rtid int32) Node {
-	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
-		return nil
-	}
-	cp := ps.costParams()
-	relTuples := float64(tbl.Stats.RowCount)
-	relPages := baseRelPages(tbl, relTuples)
-	T := float64(relPages)
-	if T < 1 {
-		T = 1
-	}
-	sel := varEqNonConstSelectivity(columnStatsByName(tbl, col.Name), relTuples)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	in := indexScanInputs{
-		relPages:        relPages,
-		relTuples:       relTuples,
-		indexPages:      indexPages,
-		indexTuples:     indexTuples,
-		treeHeight:      treeHeight,
-		selectivity:     sel,
-		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
-		totalTablePages: T,
-		loopCount:       1,
-	}
-	idxCost := costIndexScan(cp, in)
-	bmIdxCost := costBitmapIndexScan(cp, in)
-	tuples := clampRowEst(sel * relTuples)
-	pages, tuples := computeBitmapPages(tuples, relTuples, T, indexPages, T, cp.effectiveCacheSize, bitmapMaxEntries(cp.workMem))
-	bm := costBitmapHeapScan(cp, bmIdxCost, pages, tuples, T,
-		// Rule-based chooser: no cost competition exists here (shape match,
-		// no addPath), so the qpqual term stays 0 — R1
-		// (plan-parity-fix-take2) prices only the search's candidates.
-		// Dies with the legacy planner (P6).
-		0)
-	if bm.Total >= idxCost.Total {
-		return nil
-	}
-	return &BitmapHeapScan{
-		pos:        pos,
-		Table:      tbl,
-		Alias:      alias,
-		RTID:       rtid,
-		BitmapQual: []Expr{queryClause},
-		Outer: &BitmapIndexScan{
-			pos:    pos,
-			Table:  tbl,
-			Index:  idx,
-			Key:    key,
-			Pred:   []Expr{queryClause},
-			schema: schema,
-		},
-		schema: schema,
-	}
-}
-
 // indexLeadsRegIdentifierArray reports whether the index's leading
 // column is a reg*-identifier ARRAY (regclass[] etc.). See the R46
 // carve-out in seqWinsEqualityProbe (K100).
@@ -11327,82 +12008,6 @@ func planIsBareSeqScanTree(n Node) bool {
 	return false
 }
 
-// flattenStrandedSeqScanFilters merges a chain of `*Filter` wrappers over a
-// single `*SeqScan` into ONE unsearched `Filter{SeqScan}`, but only when some
-// conjunct in the chain is one the search refuses as a leaf qual
-// (`conjunctIsLocalEligible`: an `OuterColumnRef` or a sublink).
-//
-// It exists for the one-relation route that skips the rule-based bypass
-// (M0145-0027, M0145-0008): there the search attaches the scope's plain quals
-// to a SEARCHED leaf Filter and holds the ineligible ones in a residual Filter
-// above it. PG has no such split — every one of these is a restriction clause
-// of the one base rel, evaluated in the scan's single qual list
-// (`./postgres/src/backend/optimizer/plan/createplan.c:5420`
-// `order_qual_clauses`). The split is not only cosmetic:
-//
-//   - a correlated equality above a searched leaf is invisible to
-//     `rewriteScanInputsWithSingleTablePredicates`, the producer that turns it
-//     into an index probe on the bypass arm (TPC-H Q20, M0145-0027);
-//   - a sublink conjunct above a searched leaf is charged per input row of
-//     the leaf instead of after the cheap quals, and EXPLAIN renders only
-//     one of the two Filters (TPC-DS Q41, the SF0.25 parity floor).
-//
-// Order: the merged list is sorted by source position — the WHERE's written
-// order, which is exactly the list the bypass arm builds. PG orders by
-// per-tuple cost (`order_qual_clauses`); goopg has no per-clause cost
-// evaluator, so the bypass order is the faithful baseline here (ledgered).
-// Conjuncts without a source position (derived clauses) keep their relative
-// order after the positioned ones.
-//
-// Coordinates: every Filter in the chain sits directly on the same SeqScan
-// with no Project between, so all their predicates already address the
-// SeqScan's own output — merging needs no rebase. Any other node in the chain
-// (a Project, a narrowed boundary, a second relation) declines, fail-closed,
-// as does a chain with no ineligible conjunct: then the search's own
-// election stands and nothing is overridden.
-func flattenStrandedSeqScanFilters(n Node) (Node, bool) {
-	top, ok := n.(*Filter)
-	if !ok {
-		return nil, false
-	}
-	var conjs []Expr
-	cur := Node(top)
-	for {
-		f, isF := cur.(*Filter)
-		if !isF {
-			break
-		}
-		conjs = append(conjs, splitAnd(f.Predicate)...)
-		cur = f.Child
-	}
-	ss, ok := cur.(*SeqScan)
-	if !ok {
-		return nil, false
-	}
-	if _, single := top.Child.(*SeqScan); single {
-		// Already the bypass shape; nothing is stranded.
-		return nil, false
-	}
-	stranded := false
-	for _, c := range conjs {
-		if !conjunctIsLocalEligible(c) {
-			stranded = true
-			break
-		}
-	}
-	if !stranded {
-		return nil, false
-	}
-	sort.SliceStable(conjs, func(i, j int) bool {
-		pi, pj := conjs[i].Pos(), conjs[j].Pos()
-		if pi <= 0 || pj <= 0 {
-			return pi > 0 && pj <= 0
-		}
-		return pi < pj
-	})
-	return &Filter{pos: top.Pos(), Child: ss, Predicate: joinPlannerAnd(conjs)}, true
-}
-
 // planIndexScanFromWhere is the rule-based WHERE -> index producer; it wraps
 // planIndexScanFromWhereShape so that EVERY shape the inner function can hand
 // back passes the session's scan toggles (review/260831-2 X-8). Filtering the
@@ -11473,69 +12078,15 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
 
-	// When both sides are ColumnRefs (e.g. WHERE inner.col = outer.col in a
-	// correlated subquery), check if one side resolves to an OuterColumnRef.
-	// If so, treat it as the key expression (the outer value drives the probe).
-	if lIsCol && rIsCol {
-		leftResolved, leftErr := resolveExpr(b.Left, ctx)
-		rightResolved, rightErr := resolveExpr(b.Right, ctx)
-		_, leftIsOuter := leftResolved.(*OuterColumnRef)
-		_, rightIsOuter := rightResolved.(*OuterColumnRef)
-		if leftErr == nil && rightErr == nil && (leftIsOuter || rightIsOuter) {
-			var colRef *parser.ColumnRef
-			var resolvedKey Expr
-			if rightIsOuter {
-				colRef = leftCol
-				resolvedKey = rightResolved
-			} else {
-				colRef = rightCol
-				resolvedKey = leftResolved
-			}
-			resolvedCol, err := resolveColumnRef(colRef, ctx)
-			if err != nil {
-				return nil, false, nil
-			}
-			col, ok := resolvedCol.(*ColumnRef)
-			if !ok {
-				return nil, false, nil
-			}
-			// resolvedKey is an OuterColumnRef here, never a Const, so this
-			// synthetic clause can never satisfy provePartialIndexPredicate's
-			// Var-op-Const shape — it is passed through only so the helper's
-			// (correct) refusal is by shape, not by omission.
-			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause, queryClause)
-			if idx == nil {
-				return nil, false, nil
-			}
-			// M0134-0185: this arm used to return the index scan
-			// UNCONDITIONALLY — the one access-method decision in the planner
-			// that consulted no cost at all. PG plans a correlated subquery
-			// through the full path machinery and on TPC-H Q17's SubPlan
-			// picks a Bitmap Heap Scan over this very probe by 1% (127.62 vs
-			// 128.97). Offer the same candidate, priced by the SAME cost
-			// functions the join search uses, and let the numbers decide.
-			// Reachable only with an outer binding in scope, so the
-			// UPDATE/DELETE callers — whose executors pattern-match
-			// `*IndexScan` — never see the bitmap shape.
-			if bhs := bitmapOverCorrelatedProbe(tbl, idx, col, resolvedKey, queryClause, ctx.schema, where.Pos(), ctx.settings, ctx.alias, ctx.bindings[0].rtid); bhs != nil {
-				return bhs, true, nil
-			}
-			return &IndexScan{
-				pos:        where.Pos(),
-				Table:      tbl,
-				Alias:      ctx.alias,
-				RTID:       ctx.bindings[0].rtid,
-				Index:      idx,
-				Key:        resolvedKey,
-				schema:     ctx.schema,
-				SmallDim:   smallDimensionTag(cat, tbl),
-				UniqueKeys: uniqueKeyColumnSets(cat, tbl),
-			}, true, nil
-		}
-		return nil, false, nil
-	}
-
+	// A column-to-column equality is never this rule's probe. Its correlated
+	// form (`WHERE inner.col = outer.col` in a correlated subquery) used to
+	// build an IndexScan keyed on the OuterColumnRef — kept after the
+	// cutover only for an outer key goopg typed int8 against an int4 index
+	// column, which the search's restrictionKeyUsable refuses uncast. Since
+	// M0146-0062 such keys are int4 and the search's parameterised base-rel
+	// paths (M0146-0015a) build every correlated probe, priced against the
+	// Seq Scan and bitmap alternatives as PG's create_index_paths does; the
+	// arm and its bitmap pricing twin are retired (M0146-0073).
 	if lIsCol == rIsCol {
 		return nil, false, nil
 	}
@@ -11570,6 +12121,14 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 		// numeric literal on the rhs of `=`. The executor's
 		// encodeBTreeKeyForColumn picks the right encoding from
 		// the column type.
+		//
+		// M0146-0061: not a numeric literal against an INTEGER
+		// column — PG compares `(col)::numeric = 198.5` there, which
+		// integer_ops cannot index; encoded into the int key the
+		// literal rounded and `a = 198.5` matched a = 199.
+		if _, isNum := resolvedKey.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
+			return nil, false, nil
+		}
 	case *StringConst:
 		// M0044-0005: varchar/char column indexes — probe key is
 		// a plain string literal; evaluates to KindString at
@@ -11864,19 +12423,32 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// reject the whole rewrite regardless of index availability, because the
 	// non-correlated SubqueryExpr cannot carry a parameterised inner plan.
 	var wherePred Expr
+	correlated := false
 	if s.Where != nil {
 		wherePred, err = resolveExpr(s.Where, ctx)
 		if err != nil {
 			return nil, false, err
 		}
-		hasOuter := false
 		walkExprTree(wherePred, func(e Expr) {
 			if _, ok := e.(*OuterColumnRef); ok {
-				hasOuter = true
+				correlated = true
 			}
 		})
-		if hasOuter {
-			return nil, false, nil
+		if correlated {
+			// M0146-0114: PG still builds the min/max InitPlan when the WHERE
+			// reads an enclosing query level (build_minmax_path inside a
+			// correlated SubPlan; regress aggregates' `select f1, (select
+			// min(unique1) from tenk1 where unique1 > f1)`): the InitPlan
+			// takes the outer value as a param and re-runs when it changes.
+			// The inner query sits one sublink deeper than this level, so its
+			// outer references move one level up the scope stack. A sublink
+			// inside the WHERE keeps the old decline: the shift does not
+			// descend into nested plans.
+			deeper, ok := deepenOuterRefs(wherePred)
+			if !ok {
+				return nil, false, nil
+			}
+			wherePred = deeper
 		}
 	}
 
@@ -12050,6 +12622,18 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			}
 		}
 
+		if inner == nil && !minmaxPresortedIndexExists(cat, tbl, argCR.Name, wherePred) {
+			// M0146-0005du: no index can order the column. PG's
+			// build_minmax_path only takes a PRESORTED path —
+			// get_cheapest_fractional_path_for_pathkeys over the final rel's
+			// pathlist, with no explicit Sort added (planagg.c:443-448) — and
+			// returns false without one, so preprocess_minmax_aggregates adds
+			// no MinMaxAgg path and the plain Aggregate stands. Declining here
+			// keeps the Aggregate; the Sort fallback below is reached only when
+			// such an index exists but the index-only probe declined (PG would
+			// take that index path — ledgered).
+			return nil, false, nil
+		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
 			// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
@@ -12110,7 +12694,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// exactly one column (the min) and at most one row. evalSubquery's
 	// constant-key cache IS upstream's InitPlan-once-per-statement semantics
 	// (executor/expr.go evalSubquery; subplan.go header).
-	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: true}
+	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: !correlated, ParamInitPlan: correlated}
 
 	// The childless Result top node (T_Result, nodeResult.c): one row whose
 	// single target is the InitPlan value.
@@ -12302,7 +12886,10 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 				cr.SourceTableIdx == argCR.SourceTableIdx
 		}
 		if _, ok := e.(*OuterColumnRef); ok {
-			return false
+			// M0146-0114: an enclosing level's value is a param of the
+			// min/max InitPlan, read from the scope stack or a PARAM_EXEC
+			// slot, never from the 1-wide index row.
+			return true
 		}
 		slots, ok := exprChildSlots(e)
 		if !ok {
@@ -12349,6 +12936,56 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // quals is the resolved restriction the scan will apply (nil when none is
 // known). It only widens which composite index is complete for the probe:
 // see the NULL-key rule below.
+// minmaxPresortedIndexExists reports whether some index yields a path
+// presorted on col — what build_minmax_path's
+// get_cheapest_fractional_path_for_pathkeys needs (planagg.c:443) for
+// `ORDER BY col LIMIT 1` under the statement's WHERE. A non-partial btree
+// index does when col is at position k and every column before it is bound
+// by an equality conjunct `column = constant` (PG's pathkeys drop the
+// equality-bound EC members, so the index order is col's order). Other
+// conjuncts may sit beside the equalities; they only filter.
+func minmaxPresortedIndexExists(cat catalog.Catalog, tbl *catalog.Table, col string, where Expr) bool {
+	if cat == nil || tbl == nil {
+		return false
+	}
+	bound := map[string]bool{}
+	var walk func(e Expr)
+	walk = func(e Expr) {
+		b, ok := e.(*BinaryOp)
+		if !ok {
+			return
+		}
+		if b.Op == parser.OpAnd {
+			walk(b.Left)
+			walk(b.Right)
+			return
+		}
+		if b.Op != parser.OpEq {
+			return
+		}
+		if c, isCol := b.Left.(*ColumnRef); isCol && isConstantExpr(b.Right) {
+			bound[strings.ToLower(c.Name)] = true
+		} else if c, isCol := b.Right.(*ColumnRef); isCol && isConstantExpr(b.Left) {
+			bound[strings.ToLower(c.Name)] = true
+		}
+	}
+	walk(where)
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if strings.ToLower(idx.Method) != "btree" || idx.HasPredicate {
+			continue
+		}
+		for _, ic := range idx.Columns {
+			if strings.EqualFold(ic, col) {
+				return true
+			}
+			if !bound[strings.ToLower(ic)] {
+				break
+			}
+		}
+	}
+	return false
+}
+
 func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause, quals Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
@@ -12703,6 +13340,13 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 			continue
 		}
 		if !isConstantExpr(resolvedKey) {
+			continue
+		}
+		// M0146-0061: a numeric bound on an integer column is not
+		// indexable in PG (`(col)::numeric > 198.5`); encoded into the int
+		// key it rounded, `a > 198.5` probing `a > 199`. restrictionKeyUsable
+		// is the search's twin of this rule.
+		if _, isNum := resolvedKey.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
 			continue
 		}
 		// For user-defined enum columns, wrap string literals in CastExpr
@@ -13064,7 +13708,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// A-01(ii) cut 2: the WITH list, the SELECT source, and every VALUES
 	// cell sublink allocate from the statement scope.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -13921,7 +14565,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 	// A-01(ii) cut 2 (F5): the WITH list, the FROM list, the target
 	// scan, and every SET / WHERE / RETURNING sublink allocate from
 	// the statement scope.
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -14122,7 +14766,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog, ps PlannerSettings, s
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
 	// A-01(ii) cut 2 (F5): same scope treatment as planUpdate (see it for
 	// the target-scan note).
-	restore, dmlPlans, err := preplanWithClause(s.With, cat, ps, scope)
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -14381,18 +15025,79 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 			if err != nil {
 				return nil, &PlanError{Pos: wc.Pos(), Code: "42703", Message: err.Error()}
 			}
-			pc.InsertColIdx = ordinals
-			if wc.InsertValues != nil {
-				exprs := make([]Expr, len(wc.InsertValues))
-				for i, ve := range wc.InsertValues {
-					expr, err := resolveExpr(ve, sourceOnly)
+			// transformInsertRow's arity rules (parse_target.c via
+			// transformMergeStmt): more expressions than target columns is
+			// an error; fewer is an error only with an explicit column list,
+			// and without one the leading columns are filled.
+			if n := len(wc.InsertValues); wc.InsertValues != nil && n != len(ordinals) {
+				if n > len(ordinals) {
+					return nil, &PlanError{Pos: wc.InsertValues[len(ordinals)].Pos(), Code: "42601",
+						Message: "INSERT has more expressions than target columns"}
+				}
+				if len(wc.InsertColumns) > 0 {
+					return nil, &PlanError{Pos: wc.Pos(), Code: "42601",
+						Message: "INSERT has more target columns than expressions"}
+				}
+				ordinals = ordinals[:n]
+			}
+			// Every column gets an expression the way planInsert builds
+			// one (rewriteTargetListIU, rewriteHandler.c): a value, a
+			// DEFAULT marker's or an omitted column's resolved DEFAULT
+			// expression. A column whose DEFAULT is not an expression here
+			// — no default, serial/identity, generated — stays out of
+			// InsertColIdx, and the executor fills it as omitted (NULL,
+			// nextval, the generation expression). M0146-0075.
+			exprs := make([]Expr, 0, len(tbl.Columns))
+			colIdx := make([]int, 0, len(tbl.Columns))
+			present := make(map[int]bool, len(tbl.Columns))
+			defaultCtx := &resolveContext{cat: cat, settings: ps}
+			defaultCtx.rtScope = scope
+			resolveDefault := func(ord int) (Expr, bool, error) {
+				col := tbl.Columns[ord]
+				if col.GeneratedAlways || col.DefaultExpr == nil {
+					return nil, false, nil
+				}
+				pe, err := resolveExpr(col.DefaultExpr, defaultCtx)
+				return pe, err == nil, err
+			}
+			for i, ve := range wc.InsertValues {
+				ord := ordinals[i]
+				present[ord] = true
+				_, isDefault := ve.(*parser.DefaultMarker)
+				if !isDefault && tbl.Columns[ord].GeneratedAlways {
+					return nil, &PlanError{Pos: ve.Pos(), Code: "428C9",
+						Message: fmt.Sprintf("cannot insert a non-DEFAULT value into column %q", tbl.Columns[ord].Name),
+						Detail:  fmt.Sprintf("Column %q is a generated column.", tbl.Columns[ord].Name)}
+				}
+				if isDefault {
+					pe, ok, err := resolveDefault(ord)
 					if err != nil {
 						return nil, err
 					}
-					exprs[i] = expr
+					if ok {
+						exprs = append(exprs, pe)
+						colIdx = append(colIdx, ord)
+					}
+					continue
 				}
-				pc.InsertExprs = exprs
+				expr, err := resolveExpr(ve, sourceOnly)
+				if err != nil {
+					return nil, err
+				}
+				exprs = append(exprs, expr)
+				colIdx = append(colIdx, ord)
 			}
+			for _, ord := range defaultAppendableColumns(tbl, present) {
+				pe, ok, err := resolveDefault(ord)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					exprs = append(exprs, pe)
+					colIdx = append(colIdx, ord)
+				}
+			}
+			pc.InsertExprs, pc.InsertColIdx = exprs, colIdx
 		case parser.MergeActionDoNothing:
 			// DO NOTHING — no extra fields needed. M0097-0016.
 		}
@@ -14428,12 +15133,16 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.
-// When names is empty, all non-generated columns are returned in declaration order.
+// When names is empty, every live column is returned in declaration order,
+// generated ones included: PG's default target list is all attributes
+// (checkInsertTargets), and a generated column then accepts only DEFAULT.
+// M0146-0075 (generated columns used to be left out, shifting every later
+// value one column left).
 func buildInsertColIdx(tbl *catalog.Table, names []string, cat catalog.Catalog) ([]int, error) {
 	if len(names) == 0 {
 		out := make([]int, 0, len(tbl.Columns))
 		for i, c := range tbl.Columns {
-			if !c.GeneratedAlways {
+			if !c.Dropped {
 				out = append(out, i)
 			}
 		}
@@ -14510,12 +15219,23 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	// (e.g. the `excluded` pseudo-table in ON CONFLICT DO UPDATE and the
 	// diagnostic-only `excluded` added to the RETURNING scope).
 	var bset []rangeBinding
-	for _, b := range ctx.bindings {
-		if !b.qualifiedOnly && !b.notReferenceable {
+	// M0146-0028: a pulled-up derived table's columns expand where the
+	// derived item stood in FROM — before the first of its body's (hidden)
+	// leaf bindings. bsetPulled[k] lists the derived tables emitted before
+	// bset[k]; the entry at len(bset) catches a table whose body leaves are
+	// the last bindings.
+	bsetPulled := map[int][]*pulledDerivedRel{}
+	for i, b := range ctx.bindings {
+		for _, r := range ctx.pulledDerived {
+			if r.firstBinding == i {
+				bsetPulled[len(bset)] = append(bsetPulled[len(bset)], r)
+			}
+		}
+		if !b.qualifiedOnly && !b.notReferenceable && !b.pulledHidden {
 			bset = append(bset, b)
 		}
 	}
-	if len(bset) == 0 {
+	if len(bset) == 0 && len(ctx.pulledDerived) == 0 {
 		bset = ctx.bindings // fallback: shouldn't happen, but avoid empty expansion
 	}
 	// A table-qualified star (`t.*`) expands to ALL of that table's
@@ -14527,12 +15247,24 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	if qualified {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
-			if b.notReferenceable {
+			if b.notReferenceable || b.pulledHidden {
 				continue // diagnostic-only binding — not a real FROM-clause entry
 			}
 			if bindingMatchesRelation(b, star.Table, star.Schema) {
 				matches = append(matches, b)
 			}
+		}
+		if r := pulledDerivedAliasMatches(ctx, star.Table, star.Schema); r != nil {
+			if len(matches) > 0 {
+				return nil, nil, &PlanError{Pos: star.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", star.Table)}
+			}
+			outExpr := make([]Expr, 0, len(r.cols))
+			outSchema := make(Schema, 0, len(r.cols))
+			for i, e := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(e, star.Pos(), 0))
+				outSchema = append(outSchema, pulledDerivedSchemaColumn(r.names[i], e))
+			}
+			return outExpr, outSchema, nil
 		}
 		if len(matches) == 0 {
 			return nil, nil, errorMissingRTEPlan(star.Pos(), star.Schema, star.Table, ctx)
@@ -14544,7 +15276,19 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	}
 	outExpr := make([]Expr, 0)
 	outSchema := make(Schema, 0)
-	for _, b := range bset {
+	emitPulled := func(k int) {
+		if qualified {
+			return
+		}
+		for _, r := range bsetPulled[k] {
+			for i, e := range r.cols {
+				outExpr = append(outExpr, pulledDerivedRef(e, star.Pos(), 0))
+				outSchema = append(outSchema, pulledDerivedSchemaColumn(r.names[i], e))
+			}
+		}
+	}
+	for k, b := range bset {
+		emitPulled(k)
 		for i, c := range b.table.Columns {
 			// For an unqualified `SELECT *` over a JOIN USING / NATURAL
 			// join, the right-side copy of each merged column is hidden:
@@ -14572,6 +15316,7 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
 	}
+	emitPulled(len(bset))
 	// M0097-0061: PostgreSQL places USING columns first in SELECT * output:
 	// "using-cols, left-rest, right-rest". Without explicit reordering the
 	// left table's natural column order is preserved, which is wrong when the
@@ -14622,6 +15367,37 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
 		return t.Alias, exprType(e)
+	}
+	// FigureColname names `(expr).field` by its last indirection step, the
+	// field name (parse_target.c FigureColnameInternal, A_Indirection) —
+	// whatever the selection resolved to (M0146-0047b).
+	if fs, ok := t.Expr.(*parser.FieldSelect); ok {
+		return strings.ToLower(fs.Field), exprType(e)
+	}
+	// FigureColname (parse_target.c) names a bare column reference by the
+	// name as WRITTEN. The resolved ref carries the column it reads, which is
+	// the same name except through a pulled-up derived table
+	// (derivedpullup.go, M0146-0028): `y.s_store_name1` reads the body's
+	// `s_store_name`, and the output is still `s_store_name1`.
+	if w, ok := t.Expr.(*parser.ColumnRef); ok && w.Column != "" && w.Column != "*" {
+		if r, ok := e.(*ColumnRef); ok && !strings.EqualFold(r.Name, w.Column) {
+			return w.Column, r.Type
+		}
+		if r, ok := e.(*OuterColumnRef); ok && !strings.EqualFold(r.Name, w.Column) {
+			return w.Column, r.Type
+		}
+		// A bare column that resolved to an expression — an expression
+		// output of a pulled-up derived table — is still named as
+		// written. (Whole-row, ctid and tableoid references keep their
+		// own arms below; they are named as written too.)
+		_, isCol := e.(*ColumnRef)
+		_, isOuter := e.(*OuterColumnRef)
+		_, isRow := e.(*RowExpr)
+		_, isCtid := e.(*CTIDExpr)
+		_, isOid := e.(*TableOidExpr)
+		if !isCol && !isOuter && !isRow && !isCtid && !isOid {
+			return w.Column, exprType(e)
+		}
 	}
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
@@ -15116,13 +15892,49 @@ func resolvePolyAggOutputType(stype string, argExpr Expr) catalog.Type {
 // exprType returns the planner-level type tag for an expression. v0
 // only knows what ColumnRef carries; everything else gets the
 // "unknown" tag the executor coerces at runtime.
+// sumResultType is sum()'s result type for an argument of type t (both the
+// aggregate and the window sum). PG's int2_sum / int4_sum return int8
+// (pg_aggregate: sum(int2), sum(int4) -> bigint), so `sum(n)` over an int4
+// column or literal is bigint (M0146-0062: with int literals now int4, the
+// old "the argument's own type" rule made regress with.sql's
+// `CREATE TABLE sums_1_100 AS ... sum(n)` an integer column). sum(int8)
+// keeps int8 here, where PG returns numeric (ledgered).
+func sumResultType(t catalog.Type) catalog.Type {
+	switch strings.ToLower(t.Name) {
+	case "", "unknown":
+		return catalog.Type{Name: "int8"}
+	case "int2", "smallint", "int4", "integer", "int":
+		if !t.IsArray {
+			return catalog.Type{Name: "int8"}
+		}
+	}
+	return t
+}
+
 func exprType(e Expr) catalog.Type {
 	switch x := e.(type) {
 	case *ColumnRef:
 		return x.Type
+	case *OuterColumnRef:
+		// A correlated reference has its column's type (M0146-0062): it
+		// fell to "unknown", so `(SELECT pg_typeof(v.x))` printed unknown
+		// where PG prints integer, and arithmetic on it lost its int4
+		// overflow check.
+		if x.Type.Name != "" {
+			return x.Type
+		}
+		return catalog.Type{Name: "unknown"}
 	case *NumericConst:
 		return catalog.Type{Name: "numeric"}
 	case *IntegerConst:
+		// M0146-0062: PG's make_const (parse_node.c) types an integer
+		// literal that fits in 32 bits as int4, anything wider as int8 —
+		// the rule ExprResultType already follows. int8 here made `int4 +
+		// literal` an int8 operation, so int4 overflow never raised
+		// `integer out of range` and pg_typeof(9998) said bigint.
+		if !IntegerConstIsInt8(x) {
+			return catalog.Type{Name: "int4"}
+		}
 		return catalog.Type{Name: "int8"}
 	case *TableOidExpr:
 		return catalog.Type{Name: "oid"}
@@ -15135,7 +15947,7 @@ func exprType(e Expr) catalog.Type {
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
 	case *RowExpr:
-		return catalog.Type{Name: "text"} // composite displayed as text
+		return catalog.Type{Name: "record"} // PG: ROW(...) is an anonymous record (M0146-0053)
 	case *MergeActionExpr:
 		return catalog.Type{Name: "text"}
 	case *MergeWholeRowRef:
@@ -15204,6 +16016,29 @@ func exprType(e Expr) catalog.Type {
 			// interval text in psql instead of left-aligning it). M0134-0035.
 			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
 				return catalog.Type{Name: "interval"}
+			}
+			// date ± integer → date (date_pli / date_mii), integer + date →
+			// date (integer_pl_date), date - date → int4 (date_mi). Twin of
+			// the analyzer's arithmetic arm; without it the result column
+			// was advertised as "unknown" and printed as a timestamp.
+			// M0146-0040.
+			if isDateTypeName(lt.Name) && isIntegerLikeType(rt.Name) && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "date"}
+			}
+			if isIntegerLikeType(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "date"}
+			}
+			if isDateTypeName(lt.Name) && isDateTypeName(rt.Name) && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int4"}
+			}
+			// date ± interval / interval + date → timestamp
+			// (date_pl_interval / date_mi_interval / interval_pl_date),
+			// the analyzer arm's twin.
+			if isDateTypeName(lt.Name) && strings.EqualFold(rt.Name, "interval") && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "timestamp"}
+			}
+			if strings.EqualFold(lt.Name, "interval") && isDateTypeName(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "timestamp"}
 			}
 			if isFloat(lt.Name) || isFloat(rt.Name) {
 				// Wider float type wins.
@@ -15296,6 +16131,11 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: x.ReturnType}
 		}
 		switch strings.ToLower(x.Name) {
+		case "row":
+			// `row(a, b)` reaches the planner as a call named row; PG's
+			// RowExpr is an anonymous record (M0146-0053) — a VALUES column
+			// of them is record, not the all-unknown fallback text.
+			return catalog.Type{Name: "record"}
 		// pg_typeof(expr) declares SQL return type regtype, whose wire/
 		// binary representation is the type's OID (executor/expr.go's
 		// "pg_typeof" case now returns a KindInt OID Datum, not display
@@ -15399,6 +16239,9 @@ func exprType(e Expr) catalog.Type {
 		case "ascii":
 			// ascii(text) -> int4 (pg_proc.dat:3610, varlena.c ascii). M0134-0070.
 			return catalog.Type{Name: "int4"}
+		case "pg_trigger_depth":
+			// pg_trigger_depth() -> int4 (pg_proc.dat oid 3163). M0146-0080.
+			return catalog.Type{Name: "int4"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,
@@ -15407,7 +16250,12 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
-		case "gcd", "lcm", "abs", "mod", "div":
+		case "mod":
+			// M0146-0044: pg_proc's mod overloads — int2, int4, int8 and
+			// numeric — resolved as func_select_candidate does: a numeric
+			// argument wins, then the widest integer.
+			return modResultType(x.Args)
+		case "gcd", "lcm", "abs", "div":
 			// These return integer; use int8 as generic integer type. M0097-0003.
 			return catalog.Type{Name: "int8"}
 		case "char_length", "character_length", "length", "octet_length",
@@ -15432,6 +16280,10 @@ func exprType(e Expr) catalog.Type {
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {
 				et := exprType(x.Args[0])
+				if strings.HasSuffix(et.Name, "[]") {
+					// array_agg(anyarray): the input's array type. M0146-0033.
+					return et
+				}
 				if et.Name != "" && et.Name != "unknown" {
 					return catalog.Type{Name: et.Name + "[]"}
 				}
@@ -15834,6 +16686,11 @@ func unifyValueTypes(a, b catalog.Type) catalog.Type {
 
 // isIntegerLikeType reports whether name is a fixed-width integer type
 // (int2, int4, int8) for the purpose of arithmetic type promotion.
+// isDateTypeName reports whether name spells the date type.
+func isDateTypeName(name string) bool {
+	return strings.EqualFold(name, "date")
+}
+
 func isIntegerLikeType(name string) bool {
 	switch strings.ToLower(name) {
 	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint",
@@ -15886,7 +16743,11 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	// channel — so the inner join search prices under the session's
 	// GUCs. Unstamped hosts carry the zero value, which
 	// planSelectWithParent folds back to the defaults.
-	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, parent.settings, rtableScopeFrom(parent))
+	// M0146-0012: the body is a scalar sublink's, so its correlated
+	// conjuncts may sink to the relation they restrict.
+	ps := parent.settings
+	ps.scalarSublinkBody = true
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent, ps, rtableScopeFrom(parent))
 	if err != nil {
 		return nil, err
 	}
@@ -15969,6 +16830,9 @@ func planRowExprIn(row *parser.RowExpr, valuesRows [][]parser.Expr, negated bool
 // references) or recursively resolves the value list,
 // depending on which the parser produced.
 func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
+	if cmp, ok := oneElementInAsComparison(x); ok {
+		return resolveExpr(cmp, ctx)
+	}
 	// Row constructor IN (VALUES ...): expand to OR(AND(a=v1,b=v1b), ...) at plan time.
 	// M0097-0020.
 	if rowExpr, ok := x.Operand.(*parser.RowExpr); ok && x.Subquery != nil && len(x.Subquery.ValuesRows) > 0 {
@@ -16005,6 +16869,36 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 		}
 	}
 	return out, nil
+}
+
+// oneElementInAsComparison is transformAExprIn's (parse_expr.c) one-element
+// case: a ScalarArrayOpExpr is built only for two or more non-Var list items,
+// and any other item is compared on its own with the IN's operator — `=` for
+// IN, `<>` for NOT IN — so `x IN (c)` is exactly `x = c`. TPC-DS Q89's
+// `d_year IN (2001)` prints `Filter: (d_year = 2001)` in PG 18.3 and is
+// estimated by eqsel, not scalararraysel (M0146-0005by).
+//
+// Only the IN (val_list) syntax qualifies: `= ANY (ARRAY[c])` desugars to the
+// same parser shape but is PG's AEXPR_OP_ANY, which stays an array
+// comparison (parser.InExpr.Quantified). A row operand or row item keeps the
+// IN form: PG builds make_row_comparison_op there, which goopg's `=` on rows
+// does not reproduce (ledgered).
+func oneElementInAsComparison(x *parser.InExpr) (parser.Expr, bool) {
+	if x == nil || x.Subquery != nil || x.Quantified || x.AnyOp != 0 || x.AllOp ||
+		x.NotEqualAny || len(x.List) != 1 {
+		return nil, false
+	}
+	if _, row := x.Operand.(*parser.RowExpr); row {
+		return nil, false
+	}
+	if _, row := x.List[0].(*parser.RowExpr); row {
+		return nil, false
+	}
+	op := parser.OpEq
+	if x.Negated {
+		op = parser.OpNe
+	}
+	return parser.NewBinaryOp(x.Pos(), op, x.Operand, x.List[0]), true
 }
 
 // planExistsExpr plans the inner subquery and wraps in an
@@ -16061,6 +16955,22 @@ func planHasOuterRef(node Node) bool {
 	return planHasEscapingOuterRef(node, 1)
 }
 
+// PlanHasOuterRef is planHasOuterRef for the executor: whether node's subtree
+// reads an outer value nothing inside it binds — PG's "this plan has
+// parameters from outside", whose changes make a rescan re-execute it.
+func PlanHasOuterRef(node Node) bool {
+	return planHasOuterRef(node)
+}
+
+// PlanReadsPastParent reports whether node's subtree reads an outer value
+// from above its immediate parent scope: a sublink plan whose correlation
+// reaches an enclosing query's row (Level >= 2 at the sublink's top), with
+// binders inside the subtree honoured. The executor's sublink result caches
+// key such a sublink on the enclosing rows as well (M0146-0079).
+func PlanReadsPastParent(node Node) bool {
+	return planHasEscapingOuterRef(node, 2)
+}
+
 // planHasEscapingOuterRef is planHasOuterRef's depth-aware worker.
 // depth is the Level value that would refer to node's own immediate
 // parent scope at the current nesting point (1 at the top call,
@@ -16111,6 +17021,15 @@ func planHasOuterRef(node Node) bool {
 // unrecognised node declines exactly as it did before this change; the
 // change can only ever REMOVE false declines, never add one.
 func planHasEscapingOuterRef(node Node, depth int) bool {
+	return planEscapesBy(node, depth, outerRefReachesPast)
+}
+
+// planEscapesBy is planHasEscapingOuterRef with the escape rule for one
+// reference supplied: esc judges an OuterColumnRef met where `depth` is the
+// Level naming the walk root's parent scope (outerRefReachesPast is the
+// historical rule; correlatedScalarSublinkLeaf also rejects a reference to
+// this scope outside one binding, M0146-0005bu).
+func planEscapesBy(node Node, depth int, esc outerRefPred) bool {
 	if node == nil {
 		return false
 	}
@@ -16125,16 +17044,16 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 		if n.Lateral {
 			right++
 		}
-		return planHasEscapingOuterRef(n.Left, depth) ||
-			planHasEscapingOuterRef(n.Right, right) ||
-			exprsHaveEscapingOuterRef(depth, n.Predicate, n.LeftKey, n.RightKey)
+		return planEscapesBy(n.Left, depth, esc) ||
+			planEscapesBy(n.Right, right, esc) ||
+			exprsHaveEscapingOuterRef(depth, esc, n.Predicate, n.LeftKey, n.RightKey)
 	case *NestedLoopIndexJoin:
 		// The fused NLI is a binder by construction: it binds its inner
 		// probe's keys from the outer row (R25 decomposes it into the
 		// `Join{Lateral}` arm above; until then both spellings must agree).
-		return planHasEscapingOuterRef(n.Outer, depth) ||
-			planHasEscapingOuterRef(n.Inner, depth+1) ||
-			exprsHaveEscapingOuterRef(depth, n.Predicate)
+		return planEscapesBy(n.Outer, depth, esc) ||
+			planEscapesBy(n.Inner, depth+1, esc) ||
+			exprsHaveEscapingOuterRef(depth, esc, n.Predicate)
 	}
 	// Everything else is a pass-through for scoping purposes: its children
 	// are evaluated in this scope, so they are walked at `depth` unchanged.
@@ -16149,14 +17068,14 @@ func planHasEscapingOuterRef(node Node, depth int) bool {
 	// TPC-DS `lateral` decline count went 1 -> 4).
 	kids, ok := planChildNodes(node)
 	if !ok {
-		return planHasEscapingOuterRefFlat(node, depth)
+		return planHasEscapingOuterRefFlat(node, depth, esc)
 	}
 	for _, k := range kids {
-		if planHasEscapingOuterRef(k, depth) {
+		if planEscapesBy(k, depth, esc) {
 			return true
 		}
 	}
-	return nodeOwnExprsHaveEscapingOuterRef(node, depth)
+	return nodeOwnExprsHaveEscapingOuterRef(node, depth, esc)
 }
 
 // emptyPlanStub stands in for a child link while a node's OWN expressions
@@ -16208,7 +17127,7 @@ var (
 // COPY whose child links are stubbed out, so the expression inventory comes
 // from `walkPlanExprs` -- the same switch every other reader uses -- instead
 // of a second hand-written list that could drift from it.
-func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
+func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int, esc outerRefPred) bool {
 	v := reflect.ValueOf(node)
 	cp := reflect.New(v.Elem().Type())
 	cp.Elem().Set(v.Elem())
@@ -16229,15 +17148,15 @@ func nodeOwnExprsHaveEscapingOuterRef(node Node, depth int) bool {
 	}
 	stub, ok := cp.Interface().(Node)
 	if !ok {
-		return planHasEscapingOuterRefFlat(node, depth)
+		return planHasEscapingOuterRefFlat(node, depth, esc)
 	}
-	return planHasEscapingOuterRefFlat(stub, depth)
+	return planHasEscapingOuterRefFlat(stub, depth, esc)
 }
 
 // exprsHaveEscapingOuterRef is the expression half of the structural walk:
 // the references a node carries in its OWN expressions, which are evaluated
 // in that node's scope and so are judged at `depth` directly.
-func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
+func exprsHaveEscapingOuterRef(depth int, esc outerRefPred, exprs ...Expr) bool {
 	found := false
 	for _, e := range exprs {
 		if e == nil || found {
@@ -16247,7 +17166,7 @@ func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
 			if found {
 				return
 			}
-			if outerRefEscapes(inner, depth) {
+			if outerRefEscapes(inner, depth, esc) {
 				found = true
 			}
 		})
@@ -16258,20 +17177,20 @@ func exprsHaveEscapingOuterRef(depth int, exprs ...Expr) bool {
 // outerRefEscapes judges ONE expression node, and is the single place the
 // level rule and the sublink recursion live so the structural walk and the
 // flat fallback cannot drift apart (the sibling-paths hazard).
-func outerRefEscapes(inner Expr, depth int) bool {
+func outerRefEscapes(inner Expr, depth int, esc outerRefPred) bool {
 	switch x := inner.(type) {
 	case *OuterColumnRef:
-		return x.Level >= depth
+		return esc(x, depth)
 	case *SubqueryExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *ArraySubqueryExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *MultiAssignSubqRow:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *InExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	case *ExistsExpr:
-		return x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1)
+		return x.Plan != nil && planEscapesBy(x.Plan, depth+1, esc)
 	}
 	return false
 }
@@ -16282,20 +17201,27 @@ func outerRefEscapes(inner Expr, depth int) bool {
 // binds it. It is what every node kind `planHasEscapingOuterRef` does
 // not enumerate still gets, so an unknown node declines exactly as it
 // did before R29 (fail-closed).
-func planHasEscapingOuterRefFlat(node Node, depth int) bool {
+func planHasEscapingOuterRefFlat(node Node, depth int, esc outerRefPred) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
 			return
 		}
 		walkExprTree(e, func(inner Expr) {
-			if !found && outerRefEscapes(inner, depth) {
+			if !found && outerRefEscapes(inner, depth, esc) {
 				found = true
 			}
 		})
 	})
 	return found
 }
+
+// outerRefPred judges one OuterColumnRef met at `depth` (see planEscapesBy).
+type outerRefPred func(o *OuterColumnRef, depth int) bool
+
+// outerRefReachesPast is the historical escape rule: the reference names the
+// walk root's parent scope or one above it.
+func outerRefReachesPast(o *OuterColumnRef, depth int) bool { return o.Level >= depth }
 
 // planSelectWithParent plans an inner SELECT with the supplied
 // resolveContext as the lexical-scope parent. Used by
@@ -16402,7 +17328,15 @@ func buildAnalyzerOuterScope(ctx *resolveContext) *analyzer.OuterScope {
 	parent := buildAnalyzerOuterScope(ctx.parent)
 	rels := make([]analyzer.OuterRelation, 0, len(ctx.bindings))
 	for _, b := range ctx.bindings {
+		if b.pulledHidden {
+			continue
+		}
 		rels = append(rels, analyzer.OuterRelation{Table: b.table, Alias: b.alias})
+	}
+	// M0146-0028: a pulled-up derived table is still an outer relation by
+	// name for the sublinks below this scope.
+	for _, r := range ctx.pulledDerived {
+		rels = append(rels, analyzer.OuterRelation{Table: pulledDerivedTable(r), Alias: r.alias})
 	}
 	return analyzer.NewOuterScope(ctx.cat, rels, parent)
 }
@@ -16518,6 +17452,8 @@ func castTargetTakesStringLiteral(typeName string) bool {
 
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
+	case *parser.FieldSelect:
+		return resolveFieldSelect(x, ctx)
 	case *parser.IntegerConst:
 		return &IntegerConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.NumericConst:
@@ -16847,7 +17783,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				return &TypedStringLit{pos: x.Pos(), Type: typeName, Value: lit.Value}, nil
 			}
 		}
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod, Explicit: true}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -16962,6 +17898,26 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			level++
 		}
 	}
+	// A bare name that is no column at any level may name a relation: a
+	// whole-row reference, innermost level first (transformColumnRef's
+	// refnameNamespaceItem fallback, after colNameToVar). M0146-0047c.
+	if x.Table == "" && x.Schema == "" {
+		level = 0
+		for cur := ctx; cur != nil; cur = cur.parent {
+			if len(cur.bindings) > 0 {
+				ref, ok, err := resolveWholeRowAt(x, cur, level)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					return ref, nil
+				}
+			}
+			if !cur.lateralSibling {
+				level++
+			}
+		}
+	}
 	pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
 	// Unqualified miss: PG's errorMissingColumn (parse_relation.c) still
 	// scans the local FROM-clause namespace for a near-miss and hints with
@@ -16983,7 +17939,7 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 // when nothing close enough is found. M0134-0120.
 func suggestColumnHintAllBindings(ctx *resolveContext, want string) string {
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		qualifier := b.alias
@@ -17026,6 +17982,9 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		matches := make([]rangeBinding, 0, 1)
 		var deferredBlockErr *PlanError
 		for _, b := range ctx.bindings {
+			if b.pulledHidden {
+				continue
+			}
 			if b.qualifiedOnly {
 				// Pseudo-tables (e.g. ON CONFLICT's `excluded`) reach name
 				// resolution only via their alias.
@@ -17056,6 +18015,20 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)
 			}
+		}
+		// M0146-0028: a pulled-up derived table answers to its alias.
+		if r := pulledDerivedAliasMatches(ctx, x.Table, x.Schema); r != nil {
+			if len(matches) > 0 {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", x.Table)}
+			}
+			if refs := resolvePulledDerivedColumn(x, ctx, level); len(refs) == 1 {
+				return refs[0], true, nil
+			}
+			pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %s.%s does not exist", r.alias, x.Column)}
+			if hint := suggestColumnHint(pulledDerivedTable(r).Columns, r.alias, x.Column); hint != "" {
+				pe.Hint = hint
+			}
+			return nil, false, pe
 		}
 		if len(matches) == 0 {
 			if deferredBlockErr != nil {
@@ -17121,7 +18094,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 
 	var found Expr
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.qualifiedOnly || b.pulledHidden {
 			continue
 		}
 		for i, c := range b.table.Columns {
@@ -17152,6 +18125,15 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			}
 		}
 	}
+	// M0146-0028: the outputs of pulled-up derived tables are unqualified
+	// names of this level too, ambiguous with each other and with the
+	// bindings' own columns exactly as the derived leaves were.
+	if refs := resolvePulledDerivedColumn(x, ctx, level); len(refs) > 0 {
+		if found != nil || len(refs) > 1 {
+			return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+		}
+		found = refs[0]
+	}
 	// Unqualified `tableoid` system-column resolution. PG raises
 	// "column reference is ambiguous" when more than one binding
 	// could supply it; for a single-binding scope it resolves to
@@ -17159,7 +18141,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found == nil && strings.EqualFold(x.Column, "tableoid") {
 		var matchB *rangeBinding
 		for i := range ctx.bindings {
-			if ctx.bindings[i].qualifiedOnly {
+			if ctx.bindings[i].qualifiedOnly || ctx.bindings[i].pulledHidden {
 				continue
 			}
 			if matchB != nil {
@@ -17175,7 +18157,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found == nil && strings.EqualFold(x.Column, "ctid") {
 		var matchB *rangeBinding
 		for i := range ctx.bindings {
-			if ctx.bindings[i].qualifiedOnly {
+			if ctx.bindings[i].qualifiedOnly || ctx.bindings[i].pulledHidden {
 				continue
 			}
 			if matchB != nil {
@@ -17190,12 +18172,22 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if found != nil {
 		return found, true, nil
 	}
+	return nil, false, nil
+}
+
+// resolveWholeRowAt resolves an unqualified name as a whole-row reference to
+// a relation of one resolveContext level — PG's refnameNamespaceItem fallback
+// in transformColumnRef. resolveColumnRef calls it only after the name has
+// failed to resolve as a COLUMN at every level (colNameToVar searches all of
+// them first), so a column of an outer query wins over a local relation of
+// the same name (M0146-0047c).
+func resolveWholeRowAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Expr, bool, error) {
 	// Whole-row variable: unqualified column name matches a binding alias → composite row.
 	// E.g. `select foo from (select 1) as foo` returns `(1)`. M0097-0020.
 	// qualifiedOnly bindings (e.g. MERGE RETURNING `old`/`new`) also match here
 	// by alias so that bare `old`/`new` produce a composite row value. M0100-0007.
 	for _, b := range ctx.bindings {
-		if b.notReferenceable {
+		if b.notReferenceable || b.pulledHidden {
 			continue
 		}
 		name := b.alias
@@ -17215,6 +18207,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		elems := make([]Expr, len(b.table.Columns))
 		types := make([]catalog.Type, len(b.table.Columns))
+		notNull := 0
 		for i, c := range b.table.Columns {
 			idx := b.offset + i
 			if level == 0 {
@@ -17223,8 +18216,15 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 				elems[i] = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
 			}
 			types[i] = c.Type
+			if notNull == 0 && c.NotNull {
+				notNull = i + 1
+			}
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types}, true, nil
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types, NotNullElem: notNull}, true, nil
+	}
+	// M0146-0028: whole-row reference to a pulled-up derived table.
+	if r := pulledDerivedAliasMatches(ctx, x.Column, ""); r != nil {
+		return pulledDerivedWholeRow(r, x.Pos(), level), true, nil
 	}
 	return nil, false, nil
 }
@@ -17268,7 +18268,7 @@ func errorMissingRTEPlan(pos int, schema, table string, ctx *resolveContext) *Pl
 			// qualifiedOnly = the ON CONFLICT `excluded` pseudo-table
 			// (a keyword, not a user-chosen rename); notReferenceable =
 			// present for diagnostics only, never a real FROM entry.
-			if b.qualifiedOnly || b.notReferenceable || b.alias == "" || b.table == nil {
+			if b.qualifiedOnly || b.notReferenceable || b.pulledHidden || b.alias == "" || b.table == nil {
 				continue
 			}
 			if schema != "" && !strings.EqualFold(schema, b.table.Schema) {
@@ -17344,6 +18344,13 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	// RangePrefix, so copying LowKey/HighKey would re-aim the bound at the
 	// LEADING column and return wrong rows (measured: 9476 rows for PG's 2).
 	if len(idxScan.RangePrefix) > 0 {
+		return proj
+	}
+	// M0146-0005dg: likewise a skip probe. Copying Keys without SkipPrefix
+	// re-aims `inv_item_sk = 100` at the leading `inv_date_sk` (measured),
+	// and the promotion's re-costing has no num_sa_scans. PG 18 does make
+	// this an Index Only Scan — ledgered; declining is the safe half.
+	if idxScan.SkipPrefix > 0 {
 		return proj
 	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
@@ -17512,7 +18519,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			ResultType: x.ResultType,
 		}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex)}
 	case *FuncCall:
@@ -17569,7 +18576,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 		for i, el := range x.Elems {
 			elems[i] = remapColumnRefsToSchema(el, oldSchema, newIndex)
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types, NotNullElem: x.NotNullElem}
 	default:
 		return e
 	}
@@ -17746,7 +18753,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			ResultType: x.ResultType,
 		}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod, Explicit: x.Explicit}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
 	case *FuncCall:
@@ -17823,7 +18830,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, el := range x.Elems {
 			elems[i] = shiftColumnRefsBy(el, delta)
 		}
-		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types, NotNullElem: x.NotNullElem}
 	default:
 		return e
 	}
@@ -18129,5 +19136,43 @@ func findExprInTargets(re Expr, targets []Expr) int {
 		}
 	}
 	return -1
+}
+
+
+// modResultType is mod()'s result type over its argument types (pg_proc
+// mod(int2,int2) int2 / mod(int4,int4) int4 / mod(int8,int8) int8 /
+// mod(numeric,numeric) numeric). M0146-0044.
+func modResultType(args []Expr) catalog.Type {
+	rank := map[string]int{"int2": 1, "int4": 2, "int8": 3, "numeric": 4}
+	best := 0
+	for _, a := range args {
+		var r int
+		if ic, isInt := a.(*IntegerConst); isInt {
+			// make_const: an integer literal is int4 when it fits, int8
+			// otherwise.
+			r = 3
+			if ic.Value >= -2147483648 && ic.Value <= 2147483647 {
+				r = 2
+			}
+		} else if rr, ok := rank[exprType(a).Name]; ok {
+			r = rr
+		} else {
+			// Anything else (a decimal literal included) resolves to the
+			// numeric overload.
+			r = 4
+		}
+		if r > best {
+			best = r
+		}
+	}
+	switch best {
+	case 1:
+		return catalog.Type{Name: "int2"}
+	case 2:
+		return catalog.Type{Name: "int4"}
+	case 3:
+		return catalog.Type{Name: "int8"}
+	}
+	return catalog.Type{Name: "numeric"}
 }
 

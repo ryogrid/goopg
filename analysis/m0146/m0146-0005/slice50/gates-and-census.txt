@@ -1,0 +1,17 @@
+# M0146-0005ax census (tmp/fireset-0005ax)
+sf025 baseline match=22 CATEGORIES-EXCL-MATCH: join-order=62 join-method=37 scan-type=41 parameterisation=33 aggregation-strategy=23 sort-strategy=44 parallelism=42 qual-placement=12 rendering=20
+sf025 candidate match=23 CATEGORIES-EXCL-MATCH: join-order=61 join-method=37 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=43 parallelism=41 qual-placement=12 rendering=21
+< Q21 depth=1 [sort-strategy] under Limit: PG GroupAggregate | goopg Sort
+> Q21 MATCH (no structural divergence)
+< Q51 depth=1 [sort-strategy] under Limit: PG Subquery Scan on y | goopg Sort
+> Q51 depth=4 [join-order] under Sort: PG Merge Join Full | goopg Merge Join Full
+sf1 baseline match=20 CATEGORIES-EXCL-MATCH: join-order=63 join-method=38 scan-type=45 parameterisation=40 aggregation-strategy=25 sort-strategy=47 parallelism=52 qual-placement=13 rendering=18
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=62 join-method=38 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=46 parallelism=51 qual-placement=13 rendering=19
+< Q21 depth=1 [sort-strategy] under Limit: PG GroupAggregate | goopg Sort
+> Q21 MATCH (no structural divergence)
+< Q51 depth=1 [sort-strategy] under Limit: PG Subquery Scan on y | goopg Sort
+> Q51 depth=4 [join-order] under Sort: PG Merge Join Full | goopg Merge Join Full
+FIRE-SET-TIMEOUTS: fires=Q21 Q51 Q64 introduced=none unchanged=none missing=none
+Q64: final join over the cross_sales CTE scans is now a Merge Join without Sort (the body GroupAggregate is keyed item_sk, store_name, zip, ...: the claim is true); PG plans that body differently and nest-loops; Q64 first divergence unchanged.
+Q51 result (100 rows, ordered, LIMIT) md5 goopg = PG = 1add13d92c90def33e6468df116ac9a7 on a private SF0.25 clone
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; TPC-H census class-identical; regress (window with subselect union aggregates select_distinct join limit groupingsets) no semantic delta (join.sql known flap)

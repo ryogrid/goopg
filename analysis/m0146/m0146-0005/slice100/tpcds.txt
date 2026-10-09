@@ -1,0 +1,14 @@
+== sf025
+PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=15
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+baseline: text-identical 19/99 aligned-lines 1985  Q3 Q7 Q9 Q12 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q51 Q62 Q82 Q84 Q88 Q96 Q97 Q98
+candidate: text-identical 20/99 aligned-lines 1986  Q3 Q7 Q9 Q12 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q51 Q62 Q82 Q84 Q88 Q93 Q96 Q97 Q98
+::numeric casts on non-literals: pg 18 goopg 15 base 3
+== sf1
+PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=16
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+baseline: text-identical 12/99 aligned-lines 1955  Q9 Q12 Q20 Q27 Q28 Q41 Q51 Q87 Q88 Q96 Q97 Q98
+candidate: text-identical 12/99 aligned-lines 1956  Q9 Q12 Q20 Q27 Q28 Q41 Q51 Q87 Q88 Q96 Q97 Q98
+::numeric casts on non-literals: pg 18 goopg 15 base 3

@@ -1,0 +1,15 @@
+=== Q12
+Sort  (cost=184617.49..184617.51 rows=7 width=60)
+  Sort Key: lineitem.l_shipmode
+  ->  Finalize HashAggregate  (cost=184617.32..184617.39 rows=7 width=60)
+        Group Key: lineitem.l_shipmode
+        ->  Gather  (cost=184617.15..184617.29 rows=7 width=60)
+              Workers Planned: 3
+              ->  Partial HashAggregate  (cost=184617.15..184617.22 rows=7 width=60)
+                    Group Key: lineitem.l_shipmode
+                    ->  Parallel Hash Join  (cost=149145.01..184181.19 rows=9375 width=196)
+                          Hash Cond: (orders.o_orderkey = lineitem.l_orderkey)
+                          ->  Parallel Seq Scan on orders  (cost=0.00..31383.71 rows=483871 width=448)
+                          ->  Parallel Seq Scan on lineitem  (cost=0.00..149054.18 rows=7266 width=550)
+                                Filter: (((((l_shipmode = ANY ('MAIL', 'SHIP')) AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= '1994-01-01'::date)) AND (l_receiptdate < '1995-01-01 00:00:00'::timestamp))
+

@@ -1,0 +1,7 @@
+FIRE-SET: baseline=25a8ec7e5beb60f20e219df695fe9b9f13708db8 (00e12a59ad7b) candidate=worktree (95d222cb3455)
+PLAN-PARITY: queries=99 match=7 shapediff=64 unparsed=0 missingnode=25 error=3 timeout=0
+PLAN-PARITY: queries=99 match=7 shapediff=64 unparsed=0 missingnode=25 error=3 timeout=0
+FIRE-SET-TIMEOUTS: fires=Q6 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=8 shapediff=66 unparsed=0 missingnode=22 error=3 timeout=0
+PLAN-PARITY: queries=99 match=8 shapediff=66 unparsed=0 missingnode=22 error=3 timeout=0
+FIRE-SET-TIMEOUTS: fires=Q6 introduced=none unchanged=none missing=none

@@ -23,6 +23,13 @@ type distinctOp struct {
 	// dedup key — a unique ctid datum would otherwise make every row
 	// distinct. M0143-0009.
 	junkPos map[int]bool
+	// colTrims flags bpchar-typed columns: dedup keys and the output-order
+	// comparison run on the bcTruelen image so a char(20) 'x' and a
+	// char(5) 'x' are one row — hashbpchar/bpcharlt parity. M0146.
+	colTrims []bool
+	// colText flags character-string columns, whose output-order
+	// comparison is plain text whatever the values look like (M0146-0053).
+	colText []bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
@@ -35,7 +42,8 @@ func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
 			junk[i] = true
 		}
 	}
-	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk}
+	return &distinctOp{plan: p, child: child, schema: p.Output(), junkPos: junk,
+		colTrims: bpcharSchemaTrims(p.Output()), colText: characterStringSchemaCols(p.Output())}
 }
 
 func (o *distinctOp) Schema() optimizer.Schema { return o.schema }
@@ -82,7 +90,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 		row := slot.Row()
 		// Clone the row so we own the data (child slot is reused).
 		ownedRow := cloneRow(row)
-		k := rowKeyExcluding(ownedRow, o.junkPos)
+		k := rowKeyTrimmed(ownedRow, o.junkPos, o.colTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -104,7 +112,10 @@ func (o *distinctOp) Open(ctx *Context) error {
 			if b.IsNull() {
 				return true
 			}
-			cmp, err := compareDatum(a, b, 0)
+			if col < len(o.colTrims) && o.colTrims[col] {
+				a, b = trimStringDatum(a), trimStringDatum(b)
+			}
+			cmp, err := compareDatumPlain(a, b, 0, col < len(o.colText) && o.colText[col])
 			if err != nil || cmp == 0 {
 				continue
 			}
@@ -140,10 +151,30 @@ type distinctOnOp struct {
 	schema  optimizer.Schema
 	prevKey string
 	started bool
+	// keyTrims[i] marks a bpchar-typed DISTINCT-ON key column: its key
+	// image is the bcTruelen form so padding-width variants of one value
+	// stay one key. Contiguity under that image is guaranteed by the
+	// child's pre-sort, whose keys evalSortKeyValue already trims.
+	keyTrims []bool
+	// seen is the hashed mode's key set (plan.Hashed: PG's UNIQUE_PATH_HASH
+	// for a unique-ified semijoin RHS, M0146-0005dk) — the input is
+	// unsorted, so a key is a duplicate when it was ever seen, not only
+	// when it equals the previous row's.
+	seen map[string]struct{}
 }
 
 func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
-	return &distinctOnOp{plan: p, child: child, schema: p.Output()}
+	var trims []bool
+	cs := child.Schema()
+	for i, idx := range p.KeyCols {
+		if idx >= 0 && idx < len(cs) && bpcharCatalogType(cs[idx].Type) {
+			if trims == nil {
+				trims = make([]bool, len(p.KeyCols))
+			}
+			trims[i] = true
+		}
+	}
+	return &distinctOnOp{plan: p, child: child, schema: p.Output(), keyTrims: trims}
 }
 
 func (o *distinctOnOp) Schema() optimizer.Schema { return o.schema }
@@ -152,6 +183,10 @@ func (o *distinctOnOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.started = false
 	o.prevKey = ""
+	o.seen = nil
+	if o.plan.Hashed {
+		o.seen = make(map[string]struct{})
+	}
 	return o.child.Open(ctx)
 }
 
@@ -168,10 +203,21 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 		row := slot.Row()
 		// Build a key from the DISTINCT ON columns.
 		var key string
-		for _, idx := range keyCols {
+		for ki, idx := range keyCols {
 			if idx >= 0 && idx < len(row) {
-				key += datumKey(row[idx]) + "\x00"
+				v := row[idx]
+				if ki < len(o.keyTrims) && o.keyTrims[ki] {
+					v = trimStringDatum(v)
+				}
+				key += datumKey(v) + "\x00"
 			}
+		}
+		if o.seen != nil {
+			if _, dup := o.seen[key]; dup {
+				continue
+			}
+			o.seen[key] = struct{}{}
+			return SlotFromRow(o.schema, cloneRow(row)), nil
 		}
 		if !o.started || key != o.prevKey {
 			o.started = true
@@ -182,6 +228,9 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 	}
 }
 
-func (o *distinctOnOp) Close() error { return o.child.Close() }
+func (o *distinctOnOp) Close() error {
+	o.seen = nil
+	return o.child.Close()
+}
 
 

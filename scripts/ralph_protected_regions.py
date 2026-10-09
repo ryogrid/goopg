@@ -74,6 +74,7 @@ HARNESS_SUFFIXES = (
     "scripts/lib/ref-clusters.sh",
     "scripts/tpch-ref-recover.sh",
     "scripts/lib/gate-stamp.sh",
+    "scripts/ralph-prev-loop-check.sh",
     ".git/config",
 )
 

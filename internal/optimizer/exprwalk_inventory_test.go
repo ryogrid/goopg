@@ -143,6 +143,11 @@ var exprSwitchInventory = map[string]walkerRole{
 	"pseudoconstant_gate.go:SublinkIsInitPlan":        nonRecursiveClassifier, // M0145-0008o: sublink kind -> InitPlan or SubPlan, no recursion
 	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
 
+	// M0146-0005do: equivalence-class member test — a walkExprRefs Visit
+	// callback (scopeVeto); the switch only classifies a node as column /
+	// operator / constant, the recursion is the driver's.
+	"equiv_class.go:ecMemberIdent": nonRecursiveClassifier,
+
 	"pathindexrestrict.go:qualsRejectNull": nonRecursiveClassifier,
 	// `joinlayout.go:remapPosMapAfterRewrite` (walkerPending, 8 of 32 arms)
 	// was deleted by C-20b: the walker mutated nothing — its posMap parameter
@@ -228,6 +233,10 @@ var exprSwitchInventory = map[string]walkerRole{
 	// false and the position stays unknown. Same demoted shape as the
 	// CTE entries above.
 	"cte_stats_synthesis.go:branchLiteralAt": nonRecursiveClassifier,
+	// M0146-0009b: top-node-only accessor — reads a join key's declared type
+	// name for the MCV-MCV bpchar check; unenumerated types answer "", which
+	// keeps the pairing on byte-equal (fail-closed, no recursion).
+	"cardinality.go:joinKeyTypeName": nonRecursiveClassifier,
 	// Added by M0125-0036. See boundedQualSpine's comment: the arm set is
 	// the transformation's NULL-semantics invariant, not an omission.
 	"exists_to_any.go:rewriteExistsToAnyQual": boundedQualSpine,
@@ -249,7 +258,13 @@ var exprSwitchInventory = map[string]walkerRole{
 	// localizeExprToLeaf, its consumer, was DELETED from this map in the
 	// same commit — cloneExprRefs left it with a *ColumnRef type
 	// assertion and no switch at all.
-	"local_filters.go:conjunctIsLocalEligible": nonRecursiveClassifier,
+	"local_filters.go:conjunctLocalEligibility": nonRecursiveClassifier,
+	// Added by M0146-0005bu, the same shape: walkExprRefs (scopeSignal)
+	// carries the recursion and the exhaustiveness, an unenumerated kind
+	// aborts it (fail-closed: the conjunct stays a join residual), and the
+	// inner plan is judged by planEscapesBy. The census sees the five-arm
+	// admission dispatch inside the Visit closure.
+	"local_filters.go:correlatedScalarSublinkLeaf": nonRecursiveClassifier,
 	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
 	// recursion and the exhaustiveness — sublinks and unenumerated
 	// kinds abort the walk, fail-closed); what the census sees is the
@@ -337,6 +352,17 @@ var exprSwitchInventory = map[string]walkerRole{
 	"selectivity.go:clauseSelectivityWithSource": walkerPending, // 4 of 32 arms
 	"selectivity.go:formatExprConstant":          nonRecursiveClassifier,
 	"selectivity.go:isConstExpr":                 nonRecursiveClassifier,
+	// M0146-0015c slice 2. The kept-subplan rebase/renumber walkers:
+	// their dispatch tracks sublink-scope DEPTH (linkDepth decides which
+	// OuterColumnRef levels escape the kept plan), a path property no
+	// slot-driven walker models — the same reason analyzeSublink and
+	// lowerTraverseExpr stay hand-written. All four bail on an
+	// unenumerated type (the enclosing pull-up declines, fail-closed).
+	"pulledsublink.go:(keptRebase).rebaseNode":    walkerPending, // 7 of 32 arms
+	"pulledsublink.go:descendSublinkParams":       walkerPending, // 4 of 32 arms
+	"pulledsublink.go:keptExistsToAnyQual":        nonRecursiveClassifier, // M0146-0015c s3: a lowerTraverseExpr Visit callback; descent is the driver's, and an unenumerated type keeps the EXISTS form (fail-open)
+	"pulledsublink.go:keptPlanRefsAdmissible":     walkerPending, // 6 of 32 arms
+	"pulledsublink.go:renumberDeep":               walkerPending, // 6 of 32 arms
 	"subplan_lower.go:analyzeSublink":            walkerPending, // 7 of 32 arms
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
@@ -372,6 +398,16 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:subqueryANDReachable":            walkerPending, // 2 of 32 arms
 	"unnest.go:walkExprTree":                    walkerPending, // 8 of 32 arms
 	"unnest.go:walkSubqueryPlansInExpr":         walkerPending, // 9 of 32 arms
+	// Added by M0146-0005ax. A per-node whitelist evaluated inside
+	// walkExprTree (which owns the recursion): any unlisted type makes the
+	// key decline to cross a computing Project, the conservative answer.
+	// Added by M0146-0005ba. qualEvalOps charges cost_qual_eval's per-node
+	// cost inside walkExprRefs (which owns the recursion and fails closed on
+	// an unknown type); allConstExprs classifies one flat list. M0146-0118
+	// moved the walk into qualEvalOpsPriced (qualEvalOps wraps it).
+	"qualevalcost.go:qualEvalOpsPriced": nonRecursiveClassifier,
+	"qualevalcost.go:allConstExprs":     nonRecursiveClassifier,
+	"upperorderedinput.go:orderPreservingExpr": nonRecursiveClassifier,
 	// Added by B-01c APPLYING half slice (a), 2026-09-07. Built on
 	// cloneExprRefs (which carries both the recursion and the
 	// exhaustiveness); what the census sees is the four-arm dispatch

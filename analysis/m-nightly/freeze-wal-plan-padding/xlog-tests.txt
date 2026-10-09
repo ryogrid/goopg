@@ -1,0 +1,10 @@
+--- PASS: TestEncodeHeapFreezePGRoundTripAndReplay (0.00s)
+--- PASS: TestEncodeHeapFreezePGPlanLayout (0.00s)
+--- PASS: TestDecodeXLogHeapPruneLegacyFreezePlan (0.00s)
+--- PASS: TestPGWaldumpReadsFreezePlan (0.03s)
+--- PASS: TestEncodeHeapFreezeRoundTrip (0.00s)
+--- PASS: TestDecodeHeapFreezeRejectsTruncated (0.00s)
+--- PASS: TestDecodeHeapFreezeRejectsWrongKind (0.00s)
+--- PASS: TestHeapFreezeKindByteAssignment (0.00s)
+--- PASS: TestBuildCatalogSnapshotFreezesShape (0.00s)
+ok  	github.com/goopg/goopg/internal/access/transam/xlog	0.040s

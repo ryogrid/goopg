@@ -190,7 +190,7 @@ func patternSelectivity(col *ColumnRef, pattern string, icase, negate bool, chil
 	// Exact (wildcard-free) pattern: estimate as `=` (patternsel_common's
 	// Pattern_Prefix_Exact arm delegates to var_eq_const).
 	if _, exact, ok := ExtractLikePrefix(pattern); ok && exact {
-		return eqSelectivityForColumn(stats, &StringConst{Value: pattern}, tuples)
+		return eqSelectivityForColumn(stats, &StringConst{Value: pattern}, tuples, col.Type.Name)
 	}
 	nullfrac := stats.NullFrac
 	// MCV arm: exact pattern match per entry (MCVs are not in the
@@ -245,7 +245,7 @@ func patternSelectivity(col *ColumnRef, pattern string, icase, negate bool, chil
 			// the maximum is probably off the histogram's end, so the >=
 			// half is already tiny and still needs the clamp.
 			if hasPrefix && prefix != "" {
-				if eqSel := eqSelectivityForColumn(stats, &StringConst{Value: prefix}, tuples); eqSel > prefixsel {
+				if eqSel := eqSelectivityForColumn(stats, &StringConst{Value: prefix}, tuples, col.Type.Name); eqSel > prefixsel {
 					prefixsel = eqSel
 				}
 			}

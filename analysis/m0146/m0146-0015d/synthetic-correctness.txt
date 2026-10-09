@@ -1,0 +1,21 @@
+-- base (d={2}): expect k=1
+ k 
+---
+ 1
+(1 row)
+
+-- d={1,2}: expect 0 rows
+INSERT 0 1
+ k 
+---
+(0 rows)
+
+-- d empty + c gains w=200: expect k=1,2
+DELETE 2
+INSERT 0 1
+ k 
+---
+ 1
+ 2
+(2 rows)
+

@@ -1,0 +1,4 @@
+10c10
+< Q10 MATCH (no structural divergence)
+---
+> Q10 depth=5 [join-order] under Hash Join: PG <Seq Scan , Hash Join> | goopg <Hash Join , Seq Scan>  -- swapped children

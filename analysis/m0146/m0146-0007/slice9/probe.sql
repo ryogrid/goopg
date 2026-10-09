@@ -1,0 +1,16 @@
+drop table if exists n_t, n_u;
+create table n_t(a int, b int); insert into n_t select g, g%10 from generate_series(1,1000) g;
+create table n_u(a int, b int); insert into n_u select g, g%7 from generate_series(1,500) g;
+analyze n_t; analyze n_u;
+explain (costs off) select * from (select s.a, s.b, n_u.b ub from (select a, b from n_t where b < 5) s, n_u where s.a = n_u.a) q where q.b = 1;
+select count(*), sum(q.a) from (select s.a, s.b, n_u.b ub from (select a, b from n_t where b < 5) s, n_u where s.a = n_u.a) q where q.b = 1;
+explain (costs off) with y as not materialized (select a, b from n_u), x as not materialized (select y.a, y.b from y, n_t where y.a = n_t.a) select * from x, x x2, y where x.a = x2.a and y.a = x.a and x2.b = 3;
+with y as not materialized (select a, b from n_u), x as not materialized (select y.a, y.b from y, n_t where y.a = n_t.a) select count(*) from x, x x2, y where x.a = x2.a and y.a = x.a and x2.b = 3;
+explain (costs off) select * from (select s.a from (select a from n_t where b = 2) s where s.a > 900) q;
+select count(*) from (select s.a from (select a from n_t where b = 2) s where s.a > 900) q;
+explain (costs off) select * from (select s.a, s.k from (select a, b + 1 as k from n_t) s left join n_u u on u.a = s.a where u.b is null) q where q.k = 3;
+select count(*) from (select s.a, s.k from (select a, b + 1 as k from n_t) s left join n_u u on u.a = s.a where u.b is null) q where q.k = 3;
+explain (costs off) select * from (select s.a from (select n_t.a from n_t left join n_u on n_t.a = n_u.a where n_u.b is null) s) q;
+select count(*) from (select s.a from (select n_t.a from n_t left join n_u on n_t.a = n_u.a where n_u.b is null) s) q;
+select count(*) from (select a from (select a from (select a from n_t where b = 1) s1 where a > 100) s2 where a < 900) s3;
+explain (costs off) select count(*) from (select a from (select a from (select a from n_t where b = 1) s1 where a > 100) s2 where a < 900) s3;

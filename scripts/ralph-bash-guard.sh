@@ -65,15 +65,25 @@ fi
 # loop does not report in its task body is still visible to an audit. RULE is
 # set per rule section below. Logging NEVER fails the hook.
 RULE="unknown"
+# MATCHED — set before a deny() to record which token/pattern actually
+# matched; it lands in the denial log (`match=`) and in the deny reason so a
+# false positive can be diagnosed from the denial itself (added 2026-10-02 —
+# the denial log previously held rule+line only, which made heuristic false
+# positives indistinguishable from real ones).
+MATCHED=""
+first_hit() { # <ERE> <text> — first 3 matches of the pattern, space-joined
+  printf '%s' "$2" | grep -oiE "$1" 2>/dev/null | head -3 | tr '\n' ' '
+}
 guard_log() { # <tool> <rule> <subject>
-  local root logf
+  local root logf mf=""
   root="${CLAUDE_PROJECT_DIR:-}"
   [ -n "$root" ] || root="$(git -C "${hook_cwd:-.}" rev-parse --show-toplevel 2>/dev/null)" || true
   [ -n "$root" ] || return 0
   logf="$root/ci/logs/ralph-guard-denials.log"
   mkdir -p "$root/ci/logs" 2>/dev/null || return 0
-  printf '%s tool=%s rule=%s subject=%s\n' \
-    "$(date -Iseconds 2>/dev/null || echo unknown-time)" "$1" "$2" \
+  [ -n "$MATCHED" ] && mf=" match=$(printf '%s' "$MATCHED" | tr '\n\t' '  ' | cut -c1-80)"
+  printf '%s tool=%s rule=%s%s subject=%s\n' \
+    "$(date -Iseconds 2>/dev/null || echo unknown-time)" "$1" "$2" "$mf" \
     "$(printf '%s' "$3" | tr '\n\t' '  ' | cut -c1-200)" \
     >>"$logf" 2>/dev/null || true
   return 0
@@ -82,7 +92,7 @@ guard_log() { # <tool> <rule> <subject>
 deny() {
   local reason="$1" esc
   guard_log Bash "${RULE}:${BASH_LINENO[0]:-0}" "$cmd" || true
-  esc="$(printf '%s' "RALPH_LOOP guard: $reason" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
+  esc="$(printf '%s' "RALPH_LOOP guard: $reason${MATCHED:+ (matched: $MATCHED)}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$esc"
   exit 0
 }
@@ -114,6 +124,68 @@ nomsg="$(printf '%s' "$norm" | perl -0777 -pe '
     $tail =~ s/((?:\s-[A-Za-z]*m|\s--message)(?:=|\s*))("(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27|[^\s;&|]+)/$1""/gs;
     $_ = $head . $tail;
   }')"
+
+# nomsgd — nomsg with path tokens under PRIVATE scratch/doc roots neutralised.
+# A private clone or mirror checkout under tmp/ legitimately ends in
+# bench/tpch/runtime_goopg/data (and `ln -sfn $PWD/bench/.../data
+# /tmp/mirror/bench/.../data` is a write into a private path, not into the
+# reference cluster). Only the reference-data-dir checks (rule 2) scan this
+# variant (added 2026-10-02). The token stops at any shell metachar
+# (incl. & < >) so `tmp/x&rm -rf bench/...` cannot glue a write onto a
+# private path, and a token containing `..` is never neutralised — it can
+# traverse out of the private root back into bench/.
+nomsgd="$(printf '%s' "$nomsg" | perl -pe '
+  s{(^|[\s;&|<>()"`'"'"'])(?:/tmp/|\.?/?tmp/|\.?/?analysis/|\.?/?docs/|\.?/?ci/logs/)([^\s;&|<>()"`'"'"']*)}{
+    my ($b, $t, $whole) = ($1, $2, $&);
+    $t =~ m{(?:^|/)\.\.(?:/|$)} ? $whole : "${b}PRIVPATH"
+  }ge')"
+
+# strip_writer_heredocs — drop heredoc bodies whose CONSUMING command is a
+# pure file-writer (`cat >f`, `cat <<EOF >f`, `tee f`, `dd of=f`). Those
+# bodies are file content — evidence/README/design text — not SQL; SQL
+# keywords in them used to deny
+# `cat > analysis/.../README.md <<EOF ... psql -p 65432 ... ANALYZE ... EOF`.
+# The test is the command, not the presence of `>` — `psql <<EOF > out`
+# and `bash <<EOF > log` feed the body to a live program and must NOT be
+# stripped (a `>` on the opener would otherwise be a deterministic bypass:
+# 2026-10-02 review). `cat <<EOF` with no file target (stdout, maybe piped
+# to psql) is kept too.
+strip_writer_heredocs() {
+  perl -0777 -pe '
+    my $src = $_; my $out = ""; my $pos = 0;
+    while ($src =~ /<<-?[ \t]*(["\x27]?)([A-Za-z_]\w*)\1/g) {
+      # Capture the tag NOW — every $seg/$w regex below rewrites $1/$2.
+      my ($hs, $tag) = ($-[0], $2);
+      my $nl = index($src, "\n", $hs);
+      last if $nl < 0;
+      my $opener = substr($src, rindex($src, "\n", $hs) + 1, $nl - rindex($src, "\n", $hs) - 1);
+      # The command that consumes the heredoc is the segment holding the
+      # `<<` — the opener line can be `psql ...; cat >f <<EOF`, so take the
+      # first word of the segment containing the heredoc token, not of the
+      # whole line.
+      my $seg = substr($opener, 0, $hs - rindex($src, "\n", $hs) - 1);
+      $seg =~ s{^.*[;&|()]}{};
+      my ($w) = $seg =~ /^[\s({]*([^\s;&|(<>`]+)/;
+      $w = "" unless defined $w; $w =~ s{.*/}{};
+      my $writer =
+        ($w eq "cat" && $opener =~ />>?/) ||
+        ($w eq "tee" && $opener =~ /(?:^|\s)tee\s+\S/) ||
+        ($w eq "dd"  && $opener =~ /\bof=/);
+      next unless $writer;
+      my $body_end = index($src, "\n$tag\n", $nl);
+      # Terminator as the last line without a trailing newline (index() is
+      # literal — \z would never match there).
+      my $term_at_end = substr($src, $nl) =~ /\n\Q$tag\E[ \t]*\z/;
+      my $skip_to;
+      if    ($body_end >= 0) { $skip_to = $body_end + 1 + length($tag) + 1 }
+      elsif ($term_at_end)   { $skip_to = length($src) }
+      else                   { $skip_to = $nl + 1 }
+      $out .= substr($src, $pos, $nl + 1 - $pos);
+      $pos = $skip_to;
+      pos($src) = $skip_to;
+    }
+    $_ = $out . substr($src, $pos);' <<<"$1"
+}
 
 REF_ESCAPE="Anything that writes goes to a PRIVATE CLONE on a 55xx port (see CLAUDE.md, Running a server manually). If a reference cluster is broken or a task truly needs this, write an escalation block into the task and mark it [!] — do not repair it yourself."
 
@@ -220,19 +292,51 @@ fi
 # ---------------------------------------------------------------------------
 RULE=ref-cluster-write
 if [ "$REFPORT" -eq 1 ]; then
-  client='(^|[^A-Za-z0-9_-])(psql|pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore|python3?|perl|ruby|node|PGPORT=|DATABASE_URL=)'
-  if m "$client" "$nomsg"; then
-    if m '(^|[^A-Za-z0-9_-])(pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore)([^A-Za-z0-9_-]|$)' "$nomsg"; then
+  # Client detection runs on nomsgd (quotes and non-writer heredoc bodies
+  # retained): `psql` inside `bash -c '…'`/`eval "…"`/a bash heredoc is a
+  # real invocation, not doc text (2026-10-02 review — detecting only on
+  # the unquoted skeleton let every quoted psql through). The doc-text
+  # false positives that motivated unq are instead handled by
+  # strip_writer_heredocs below (writer openers) and by the kw scan still
+  # needing a write keyword. Interpreters count as clients only with a
+  # connect marker — a python heredoc editing a file that mentions a port
+  # or a SQL keyword in its strings is not driving a connection; DB-driving
+  # code always carries one of these tokens (2026-10-02).
+  client='(^|[^A-Za-z0-9_-])(psql|pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore|PGPORT=|DATABASE_URL=)'
+  interp='(^|[^A-Za-z0-9_-])(python3?|perl|ruby|node)([^A-Za-z0-9_-]|$)'
+  conmark='psycopg|pg8000|asyncpg|DBD::Pg|DBI[-:>]|pg_connect|node-postgres|postgres://|postgresql://|\.connect\(|connect\(.*(5432|6543[0-9])|psql|pg_ctl|pg_dump|pg_basebackup|require.{0,4}pg|new[[:space:]]+(Client|Pool)\b|PG::Connection|subprocess'
+  # nomsgd_s: nomsgd minus writer-heredoc bodies — client detection sees
+  # quoted/wrapped invocations but not doc text being written to files.
+  nomsgd_s="$(strip_writer_heredocs "$nomsgd")"
+  if m "$client" "$nomsgd_s" || { m "$interp" "$unq" && m "$conmark" "$nomsg"; }; then
+    if m '(^|[^A-Za-z0-9_-])(pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore)([^A-Za-z0-9_-]|$)' "$nomsgd_s"; then
+      MATCHED="client:$(first_hit 'pgbench|vacuumdb|reindexdb|clusterdb|createdb|dropdb|createuser|dropuser|pg_restore' "$nomsgd_s")"
       deny "a write-capable client tool (pgbench/vacuumdb/createdb/dropdb/pg_restore/...) targets a READ-ONLY reference cluster (:65432/:65433/:65438). $REF_ESCAPE"
     fi
     # Neutralise EXPLAIN ANALYZE / EXPLAIN (ANALYZE, ...) — read-only unless the
-    # explained statement itself is a write (caught below).
+    # explained statement itself is a write (caught below). Heredoc bodies
+    # feeding a file-writer are doc text, not SQL (strip_writer_heredocs).
     sql="$(printf '%s' "$nomsg" | perl -pe 's/\bexplain\s*\([^)]*\)/EXPLAIN/gi; s/\bexplain\s+analy[sz]e\b/EXPLAIN/gi')"
+    sql="$(strip_writer_heredocs "$sql")"
     kw='(alter|create|drop|insert|update|delete|truncate|analy[sz]e|vacuum|grant|revoke|reindex|cluster|pg_terminate_backend|pg_cancel_backend|checkpoint|pg_reload_conf|lock|comment[[:space:]]+on|security[[:space:]]+label|refresh[[:space:]]+materialized|merge[[:space:]]+into|call[[:space:]]+[a-z_]+|nextval|setval|pg_switch_wal|pg_stat_reset[a-z_]*|lo_import|lo_unlink|import[[:space:]]+foreign)'
-    if m "${L}${kw}${R}" "$sql" || m "${L}do[[:space:]]+(\\\\?\\\$|'|language${R})" "$sql"; then
+    if m "${L}${kw}${R}" "$sql"; then
+      MATCHED="kw:$(first_hit "$kw" "$sql")"
       deny "DDL/DML/ANALYZE/VACUUM/GRANT/DO/CHECKPOINT/LOCK/COMMENT/backend-kill against a READ-ONLY reference cluster (:65432/:65433/:65438). Only SELECT/EXPLAIN/pg_basebackup are allowed there. $REF_ESCAPE"
     fi
-    if m "${L}copy${R}.*${L}from${R}" "$sql"; then
+    # DO needs a dollar-quote tag or a quoted/language body — a bare `do $VAR`
+    # in a for loop (the bash keyword) used to trip `do \$` (2026-10-02).
+    # `[$]` not `\$`: inside double quotes `\$` becomes a bare mid-pattern `$`
+    # (an anchor) to grep -E. The tag may arrive shell-escaped as `\$`.
+    if m "${L}do[[:space:]]+('|[\\\\]?[$][A-Za-z0-9_]*[\\\\]?[$]|language${R})" "$sql"; then
+      MATCHED="do-block"
+      deny "DO anonymous block against a READ-ONLY reference cluster (:65432/:65433/:65438). $REF_ESCAPE"
+    fi
+    # COPY/\copy: only `<target> FROM` is a write — `\copy (select ...) to`
+    # has `from` inside the parenthesised query and is a read. The R boundary
+    # already consumed the space after `copy`, so the target starts at once;
+    # an optional ` (col, ...)` list may sit between it and FROM (2026-10-02).
+    if m "${L}copy${R}[^[:space:]]+([[:space:]]*\([^)]*\))?[[:space:]]+from${R}" "$sql"; then
+      MATCHED="copy-from"
       deny "COPY/\\copy ... FROM (a write) against a READ-ONLY reference cluster. $REF_ESCAPE"
     fi
   fi
@@ -240,6 +344,7 @@ if [ "$REFPORT" -eq 1 ]; then
   while IFS= read -r seg; do
     if mc "$REFPORT_RE" "$seg" || { [ "$REFENV" -eq 1 ] && m 'PORT|fuser|lsof' "$seg"; }; then
       if m "${LC}(kill|pkill|killall)${R}" "$seg" || m "${LC}fuser${R}[^;&|]*-[A-Za-z]*k" "$seg"; then
+        MATCHED="kill-pipe"
         deny "kill / fuser -k / lsof -t kill pipeline aimed at a reference cluster port (:65432/:65433/:65438). $REF_ESCAPE"
       fi
     fi
@@ -252,13 +357,18 @@ fi
 RULE=ref-cluster-lifecycle
 REFDIR='bench/tpch/runtime_goopg/data([^A-Za-z0-9_.-]|$)|bench/tpch/runtime/pgdata|bench/tpcds/runtime/pgdata|bench/tpch/runtime_goopg/preloss-clone-'
 while IFS= read -r seg; do
+  # No --status exemption: stop_goopg.sh / stop_pg.sh ignore argv and stop
+  # the cluster unconditionally (verified 2026-10-02).
   if m "${LC}(stop_goopg|stop_pg)\.sh" "$seg" && ! is_reader "$seg"; then
+    MATCHED="stop-script"
     deny "stop_goopg.sh / stop_pg.sh stop a shared reference cluster. Reference clusters are started only via scripts/ref-clusters-ensure.sh and never stopped by the loop. $REF_ESCAPE"
   fi
   if m "${LC}tpch-ref-recover\.sh" "$seg" && ! is_reader "$seg"; then
+    MATCHED="recover-script"
     deny "scripts/tpch-ref-recover.sh is owner-only (reference-cluster recovery). Write an escalation block into the task and mark it [!]."
   fi
   if m "${LC}tpch-estimate-audit-arm\.sh" "$seg" && ! is_reader "$seg"; then
+    MATCHED="audit-arm"
     root="${CLAUDE_PROJECT_DIR:-}"
     [ -n "$root" ] || root="$(git -C "${hook_cwd:-.}" rev-parse --show-toplevel 2>/dev/null)"
     if [ -n "$root" ] && [ -e "$root/bench/tpch/runtime_goopg/data.HOLD" ]; then
@@ -267,15 +377,22 @@ while IFS= read -r seg; do
   fi
 done < <(segs "$nomsg")
 if m "(setup_goopg|setup_pg)\.sh[^;&|]*--reset" "$nomsg"; then
+  MATCHED="setup-reset"
   deny "setup_*.sh --reset wipes a shared reference cluster. $REF_ESCAPE"
 fi
 if m '(^|[^A-Za-z0-9_-])server\.sh[[:space:]]+(stop|restart)' "$nomsg"; then
+  MATCHED="server-stop"
   deny "bench/tpcds/server.sh stop/restart stops shared TPC-DS clusters (incl. the :65438 PG reference). Use scripts/ref-clusters-ensure.sh to START servers; never stop them. $REF_ESCAPE"
 fi
 # Per command segment (split on ; & | newline) so a harmless `ls <refdir>`
-# next to an unrelated `rm tmp/x` does not trip the rule.
+# next to an unrelated `rm tmp/x` does not trip the rule. REFDIR checks run
+# on nomsgd: paths under private roots (tmp/, /tmp/, analysis/, docs/,
+# ci/logs/) are neutralised there, so e.g. `rm -rf /tmp/mirror/bench/...`
+# or `ln -sfn ... /tmp/x/bench/tpch/runtime_goopg/data` is private work, not
+# a reference-cluster write (2026-10-02).
 while IFS= read -r seg; do
   m "$REFDIR" "$seg" || continue
+  MATCHED="refdir:$(first_hit "$REFDIR" "$seg")"
   if m "${LC}(goopg|pg_ctl)${R}" "$seg" && m "${L}(stop|restart|kill)${R}" "$seg"; then
     deny "goopg stop / pg_ctl stop|restart|kill on a reference cluster data dir. $REF_ESCAPE"
   fi
@@ -288,18 +405,23 @@ while IFS= read -r seg; do
   if m '(^|[[:space:](])(rm|mv)[[:space:]]' "$seg"; then
     deny "rm/mv on a reference cluster data dir. $REF_ESCAPE"
   fi
-done < <(segs "$nomsg")
-if writes_to "$REFDIR" "$nomsg"; then
+done < <(segs "$nomsgd")
+MATCHED=""
+if writes_to "$REFDIR" "$nomsgd"; then
+  MATCHED="refdir:$(first_hit "$REFDIR" "$nomsgd")"
   deny "write/copy-over/remove/chmod into a reference cluster data dir or a preloss clone (read-only copies FROM it are fine). $REF_ESCAPE"
 fi
-if writes_to "\.HOLD([\"'[:space:];&|)/]|$)" "$nomsg"; then
+if writes_to "\.HOLD([\"'[:space:];&|)/]|$)" "$nomsgd"; then
+  MATCHED="hold-file"
   deny "rm/mv/cp-over/truncate/redirect of a *.HOLD file: HOLD markers are placed and cleared by the owner only. $REF_ESCAPE"
 fi
-if m "$REFDIR" "$nomsg" && m "${LC}kill${R}" "$nomsg" && m 'postmaster\.pid' "$nomsg"; then
+if m "$REFDIR" "$nomsgd" && m "${LC}kill${R}" "$nomsg" && m 'postmaster\.pid' "$nomsg"; then
+  MATCHED="pid-kill"
   deny "kill of a reference cluster postmaster (PID from its postmaster.pid). $REF_ESCAPE"
 fi
 # rm/mv of an ancestor of a reference data dir.
-if m '(^|[[:space:];&|(])(rm|mv)[[:space:]][^;&|]*(^|[[:space:]"'"'"'/])bench(/tpch(/runtime(_goopg)?)?|/tpcds(/runtime)?)?/?(["'"'"'[:space:];&|)]|$)' "$nomsg"; then
+if m '(^|[[:space:];&|(])(rm|mv)[[:space:]][^;&|]*(^|[[:space:]"'"'"'/])bench(/tpch(/runtime(_goopg)?)?|/tpcds(/runtime)?)?/?(["'"'"'[:space:];&|)]|$)' "$nomsgd"; then
+  MATCHED="refdir-ancestor"
   deny "rm/mv of a directory containing a reference cluster data dir. $REF_ESCAPE"
 fi
 

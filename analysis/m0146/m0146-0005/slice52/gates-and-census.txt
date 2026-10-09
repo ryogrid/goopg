@@ -1,0 +1,24 @@
+# M0146-0005az census (tmp/fireset-0005az)
+sf025 baseline match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=33 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=15 rendering=21
+sf025 candidate match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=35 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=14 rendering=21
+< Q11 MISSING-NODE [join-order,sort-strategy,qual-placement]
+> Q11 MISSING-NODE [join-order,join-method,sort-strategy,qual-placement]
+< Q39 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,qual-placement,rendering]
+< Q4 MISSING-NODE [join-order,sort-strategy,qual-placement]
+> Q39 SHAPE-DIFF [join-order,join-method,scan-type,parallelism,rendering]
+> Q4 MISSING-NODE [join-order,join-method,sort-strategy,qual-placement]
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=36 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=14 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=34 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=11 rendering=19
+< Q11 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement]
+> Q11 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism]
+< Q39 SHAPE-DIFF [join-order,scan-type,parallelism,qual-placement,rendering]
+< Q4 SHAPE-DIFF [join-order,join-method,scan-type,aggregation-strategy,sort-strategy,parallelism,qual-placement]
+> Q39 SHAPE-DIFF [join-order,scan-type,parallelism,rendering]
+> Q4 SHAPE-DIFF [join-order,scan-type,aggregation-strategy,sort-strategy,parallelism]
+first-divergence records: unchanged at both scales
+FIRE-SET-TIMEOUTS: fires=Q1 Q2 Q4 Q11 Q14 Q23 Q24 Q30 Q31 Q39 Q47 Q57 Q59 Q64 Q74 Q75 Q81 Q95 introduced=none unchanged=none missing=none
+SF1 Q74: TIMEOUT on the first candidate run with a byte-identical plan to baseline (M0146-0036 run-time flake); re-executed via FIRESET_RESUME=1 -> PASS (first-run status kept as sf1-candidate-status-first-run.txt)
+SF0.25 Q4 moved AWAY from PG's CTE-scan join order (baseline shared PG's Merge Join base); SF1 Q4/Q11 moved toward (join-method, qual-placement records dropped)
+units: TestSharedSpillingBuildLoadsOncePerBatch failed once under the full gate, 5/5 PASS in isolation, gate re-run PASS
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; TPC-H census class-identical; regress (with subselect union join aggregates window) 0-line delta
+fire-set re-run on the committed staged tree (tmp/fireset-0005az-2): FIRE-SET-TIMEOUTS: fires=Q1 Q2 Q4 Q11 Q14 Q23 Q24 Q30 Q31 Q39 Q47 Q57 Q59 Q64 Q74 Q75 Q81 Q95 introduced=none unchanged=none missing=none — clean PASS incl. Q74

@@ -732,6 +732,12 @@ const (
 	JoinCross
 	JoinSemi  // planner-internal: SEMI join (EXISTS → JOIN_SEMI)
 	JoinAnti // planner-internal: ANTI join (NOT EXISTS → JOIN_ANTI)
+	// JoinRightSemi / JoinRightAnti are planner-internal path jointypes:
+	// PG 18's JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI, a semi/anti join performed
+	// with the SpecialJoinInfo's RHS as the outer (probe) and its LHS hashed
+	// (M0146-0005dj). Never written in SQL, never in a SpecialJoinInfo.
+	JoinRightSemi
+	JoinRightAnti
 )
 
 // JoinExpr is one JOIN clause attached to a FROM base item.
@@ -3607,6 +3613,14 @@ type AlterTableStmt struct {
 	// statement takes a transaction-scoped ShareRowExclusiveLock in PostgreSQL,
 	// which the executor must acquire (alter-table-3 isolation spec, M0118-0008).
 	EnableDisableTrigger bool
+	// TriggerFireMode is the new pg_trigger.tgenabled code: "O" for ENABLE,
+	// "A" for ENABLE ALWAYS, "R" for ENABLE REPLICA, "D" for DISABLE.
+	// TriggerTargetKind is "name" (TriggerName names one trigger), "all"
+	// (every trigger, internal ones included) or "user" (every non-internal
+	// trigger). M0146-0082.
+	TriggerFireMode   string
+	TriggerTargetKind string
+	TriggerName       string
 	// OwnerTo holds the target role name for ALTER TABLE ... OWNER TO role. Empty
 	// means no OWNER TO action. The executor records it as the table's owning
 	// role so the VACUUM/ANALYZE/CLUSTER maintenance-privilege check can tell

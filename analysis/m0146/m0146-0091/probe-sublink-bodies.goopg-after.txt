@@ -1,0 +1,68 @@
+CREATE TABLE
+INSERT 0 5000
+ANALYZE
+ count 
+-------
+     0
+(1 row)
+
+                    QUERY PLAN                     
+---------------------------------------------------
+ Seq Scan on t
+   Filter: (b > (InitPlan 1).col1)
+   InitPlan 1
+     ->  Limit
+           ->  Sort
+                 Sort Key: (sum(t_1.b))
+                 ->  Subquery Scan on x
+                       ->  HashAggregate
+                             Group Key: t_1.a
+                             ->  Seq Scan on t t_1
+(10 rows)
+
+ count 
+-------
+     0
+(1 row)
+
+                QUERY PLAN                
+------------------------------------------
+ Seq Scan on t t0
+   Filter: (b > (SubPlan 1))
+   SubPlan 1
+     ->  Aggregate
+           ->  HashAggregate
+                 Group Key: t.a
+                 ->  Seq Scan on t
+                       Filter: (a = t0.a)
+(8 rows)
+
+ count 
+-------
+     0
+(1 row)
+
+               QUERY PLAN                
+-----------------------------------------
+ Values (1 rows)
+   SubPlan 1
+     ->  Sort
+           Sort Key: a
+           ->  Subquery Scan on x
+                 ->  HashAggregate
+                       Group Key: a
+                       ->  Seq Scan on t
+(8 rows)
+
+                QUERY PLAN                 
+-------------------------------------------
+ Seq Scan on t
+   Filter: (b > (InitPlan 1).col1)
+   InitPlan 1
+     ->  Aggregate
+           ->  HashAggregate
+                 Group Key: t_1.a
+                 Filter: (sum(t_1.b) > 10)
+                 ->  Seq Scan on t t_1
+(8 rows)
+

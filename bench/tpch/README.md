@@ -160,6 +160,11 @@ Logs accumulate in `bench/tpch/logs/`; delete them at will.
   anchors afterwards if it changes the data. One consequence: with autovacuum
   off nothing sets visibility-map bits, and the index-only cost path reads
   `allvisfrac` from them — run a manual `VACUUM` once after each fresh load.
+  **The VACUUM must name its tables** (`VACUUM region`, …): bare `VACUUM`
+  resolves against the default `postgres` db, so in db `tpch` it returns
+  `VACUUM` while touching none of tpch's tables — the open M0125-0028
+  residual filed as `M0143-0011`. Confirm `pg_class.relallvisible`
+  afterwards; a successful exit in the wrong db is not evidence.
   See `docs/design/planner-gate-reproducibility/DESIGN.md`.
 
 ## Cross-engine fairness — the settings both clusters must share
@@ -219,4 +224,6 @@ that arm; do not re-disable autovacuum for every measurement.
 One side effect returns with it, and it is a benefit: autovacuum sets
 visibility-map bits again, so index-only paths stop being priced
 pessimistically and the "run one manual VACUUM after a fresh load" workaround
-is no longer needed.
+is no longer needed. (If it ever is needed again, remember the VACUUM must
+name its tables — bare `VACUUM` in db `tpch` hits the wrong database,
+`M0143-0011`.)

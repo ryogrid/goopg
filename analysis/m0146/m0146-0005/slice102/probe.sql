@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS cx; CREATE TABLE cx (a int, n numeric, d date, t text, v varchar(10));
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE cast(a as decimal(15,4)) / cast(n as decimal(15,4)) > 1;
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE (n / 50)::integer = 3;
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE cast(d as date) = '2000-01-01';
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE a::text = t;
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE n > cast(5 as numeric(10,2));
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE cast(t as varchar(5)) = v;
+DROP TABLE cx;
+CREATE TABLE cx (a int, n numeric, d date, t text, v varchar(10));
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE a > cast(5 as integer);
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE n > cast(2.5 as numeric);
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE n > cast(7 as bigint);
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE t = cast('x' as text);
+EXPLAIN (COSTS OFF) SELECT * FROM cx WHERE n > cast(2.555 as numeric(10,2));
+DROP TABLE cx;

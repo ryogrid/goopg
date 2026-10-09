@@ -8,6 +8,7 @@ import (
 )
 
 func TestCanUnnestSubqueryBasic(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	// Directly construct an unnestable SubqueryExpr.
 	outerCol := &OuterColumnRef{pos: 0, Level: 1, Index: 0, Name: "p_partkey", Type: catalog.Type{Name: "int8"}}
 	subCol := &ColumnRef{pos: 0, Index: 0, Name: "ps_partkey", Type: catalog.Type{Name: "int8"}}
@@ -43,6 +44,7 @@ func TestCanUnnestSubqueryBasic(t *testing.T) {
 }
 
 func TestCanUnnestSubqueryWithExtraOuterRef(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	// Subquery with an OuterColumnRef in a non-equijoin context.
 	outerEq := &OuterColumnRef{pos: 0, Level: 1, Index: 0, Name: "p_partkey", Type: catalog.Type{Name: "int8"}}
 	subCol := &ColumnRef{pos: 0, Index: 0, Name: "ps_partkey", Type: catalog.Type{Name: "int8"}}
@@ -100,6 +102,7 @@ func TestCanUnnestSubqueryWithExtraOuterRef(t *testing.T) {
 }
 
 func TestCanUnnestQ2Subquery(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	q2 := `select s_acctbal, s_name, n_name, p_partkey, p_mfgr
 from part, supplier, partsupp, nation, region
 where p_partkey = ps_partkey
@@ -306,6 +309,7 @@ where s_suppkey = (
 // the IN's inner plan). Q20-like structure: the lineitem aggregate inside
 // the partsupp filter should become a HashJoin(b ⋈ Agg(c GROUP BY c_b_key)).
 func TestRecursiveUnnestInsideNonUnnestableIN(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	// a(a_id int), b(b_id int, b_val numeric, b_key int), c(c_id int, c_b_key int, c_qty numeric)
 	cat := catalog.NewInMemory()
 	if _, err := cat.CreateTable(parser.ObjectName{Name: "a"}, []catalog.Column{
@@ -460,6 +464,7 @@ func TestNotInResidualStaysSubPlan(t *testing.T) {
 // must be dropped at clone time — Q20's decorrelated plan carried a
 // visible `l_suppkey = l_suppkey` residue before the strip.
 func TestScalarTwoKeyCorrelationStripsTautology(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	cat := catalog.NewInMemory()
 	if _, err := cat.CreateTable(parser.ObjectName{Name: "o"}, []catalog.Column{
 		{Name: "o_k1", Type: catalog.Type{Name: "int8"}},

@@ -148,6 +148,11 @@ func planChildren(n Node) []Node {
 		return []Node{x.Child}
 	case *GatherMerge:
 		return []Node{x.Child}
+	case *SubqueryScan:
+		// M0146-0005w: same transparent-label class as the parallel
+		// wrappers above — without this arm the walk counts zero on any
+		// wrapped derived table and the pin reads as a passing decline.
+		return []Node{x.Child}
 	}
 	return nil
 }

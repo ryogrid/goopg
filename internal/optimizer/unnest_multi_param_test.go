@@ -15,6 +15,7 @@ import (
 // the first pair (the prior-implementation bug that would have
 // caused incorrect sums for Q20).
 func TestUnnestMultiParamCorrelation(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	cat := catalog.NewInMemory()
 	if _, err := cat.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
 		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},

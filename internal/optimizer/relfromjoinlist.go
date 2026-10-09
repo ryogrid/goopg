@@ -92,6 +92,12 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
+	// orClauseSelDivisor is PG's consider_new_or_clause compensation: for a
+	// join OR clause from which extractRestrictionOrClauses derived redundant
+	// base restrictions, the product of their selectivities, by which the
+	// clause's own join selectivity is divided (M0146-0005 slice 4).
+	orClauseSelDivisor map[Expr]float64
+
 	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
 	// the coordinate space `relidsOfExpr` and `baseOffset` are both
 	// written in. One entry per FROM item: the leaf's own span, not an
@@ -601,13 +607,23 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// param_source_rels derivation remaps statement-global SJI hands
 	// through it (see paramSourceRelsForProblem's frame rule).
 	s.problemItems = items
+	// M0146-0027: the same item-coordinate windows, published for
+	// `usefulPathkeysForRelation`'s relidsOfExpr attribution.
+	s.itemSpans = itemSpans
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
 	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
+	// M0146-0022: one clause per equivalence class at an inner join, only
+	// where no special join can null-extend a class member.
+	s.clauses.ecReduce = len(sjis) == 0
+	s.orClauseSelDivisor = prob.orClauseSelDivisor
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
+	// M0146-0005b: set_cte_pathlist's converted pathkeys on the CTE-scan
+	// leaves, now that the clause list and query pathkeys it reads exist.
+	s.addCTEScanPathkeys()
 	s.neededCols, s.neededColsKnown = prob.neededCols, prob.neededColsKnown
 	s.outputCols, s.outputColsKnown = prob.outputCols, prob.outputColsKnown
 	// Take2 P4-01 Slice 3: parent-aware narrowing is eligible only for the
@@ -734,13 +750,24 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 				if !prob.neededColsKnown {
 					return SchemaColumn{}, false
 				}
+				// M0146-0005bq-b: attributed to this leaf's alias, the same
+				// rule the index-only producer used to prune it — another
+				// alias of the same table reading the name by qualified
+				// reference does not read THIS leaf's column.
+				qual := ""
+				if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
+					qual = id.alias
+					if qual == "" && id.table != nil {
+						qual = id.table.Name
+					}
+				}
 				if prob.outputColsKnown && prob.outputCols != nil {
-					if prob.outputCols[col.Name] {
+					if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
 						return SchemaColumn{}, false
 					}
 					return col, true
 				}
-				if prob.neededCols[col.Name] {
+				if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
 					return SchemaColumn{}, false
 				}
 				return col, true

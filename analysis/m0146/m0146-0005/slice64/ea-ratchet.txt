@@ -1,0 +1,6 @@
+FINDINGS:  11
+  FIXED    Q34:customer+date_dim+household_demographics+store+store_sales
+  FIXED    Q40:catalog_sales+date_dim+item+warehouse
+  FIXED    Q85:customer_demographics+reason+web_page+web_returns+web_sales
+  FIXED    Q85:reason+web_page+web_returns+web_sales
+  FIXED    Q85:reason+web_returns+web_sales

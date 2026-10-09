@@ -1,0 +1,6 @@
+== baseline
+           Hash Cond: ((i_brand_id = brand_id) AND (i_class_id = class_id) AND (i_category_id = category_id))
+== candidate
+           Hash Cond: ((i_brand_id = iss.i_brand_id) AND (i_class_id = iss.i_class_id) AND (i_category_id = iss.i_category_id))
+== candidate-pg
+           Hash Cond: ((item_3.i_brand_id = iss.i_brand_id) AND (item_3.i_class_id = iss.i_class_id) AND (item_3.i_category_id = iss.i_category_id))

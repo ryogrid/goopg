@@ -144,6 +144,30 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 
 	perRow := cp.cpuTupleCost * float64(rows)
 	switch x := n.(type) {
+	case *CTEScan:
+		if !x.Inlined() {
+			// cost_ctescan (M0146-0005az): cpu_tuple_cost per tuple for the
+			// tuplestore and again for the scan; the referenced query is an
+			// initPlan and stays out. (An inlined reference takes the
+			// default arm over its body — legacyDisplayChildren.)
+			out.StartupCost = 0
+			out.TotalCost = 2 * perRow
+			return out
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
+	case *IncrementalSort:
+		// M0146-0005bx: cost_incremental_sort over the child's costs, with
+		// the presorted prefix's group count — the node the window path
+		// stacks (createWindowPlan) is built without a path stamp.
+		groupExprs := make([]Expr, 0, x.PresortedCount)
+		for j := 0; j < x.PresortedCount && j < len(x.Keys); j++ {
+			groupExprs = append(groupExprs, x.Keys[j].Expr)
+		}
+		groups := estimateNumGroups(groupExprs, x.Child, rows)
+		c := costIncrementalSort(cp, Cost{Startup: childStartup, Total: childTotal}, float64(rows), float64(groups),
+			len(x.Child.Output()), 0, -1, out.PlanWidth)
+		out.StartupCost, out.TotalCost = c.Startup, c.Total+perRow
 	case *Sort:
 		// PG's cost_sort charges a comparison term and is BLOCKING: nothing
 		// emerges until the input is consumed, so startup is the child's
@@ -158,8 +182,20 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		// blocking reading — the conservative one for a startup column.
 		out.StartupCost = childTotal + cp.cpuOperatorCost*float64(len(x.Aggs))*childRowsOf(n)
 		out.TotalCost = out.StartupCost + perRow
+	case *Limit:
+		// create_limit_path (M0146-0005bm): the input's costs and rows put
+		// through adjust_limit_rows_costs; a Limit charges no CPU of its own.
+		in, ok := limitInputPath(x.Child)
+		if !ok {
+			in = legacyDisplayCostOf(x.Child)
+		}
+		inRows := in.PlanRows
+		if in.PerWorker || inRows <= 0 {
+			inRows = float64(EstimateRows(x.Child))
+		}
+		out.PlanRows, out.StartupCost, out.TotalCost = adjustLimitRowsCosts(inRows, in.StartupCost, in.TotalCost, limitEstimatesOf(x))
 	default:
-		// Pass-through wrappers: Project, Filter, Limit, Distinct, Result,
+		// Pass-through wrappers: Project, Filter, Distinct, Result,
 		// SetOp, WindowAgg, LockRows and the rest. They stream, so startup is
 		// the child's startup.
 		out.StartupCost = childStartup
@@ -174,10 +210,10 @@ func legacyDisplayCostOf(n Node) PlanCost {
 	}
 	if c, ok := n.(PlanCostCarrier); ok {
 		if pc, set := c.PlanCostInfo(); set {
-			return pc
+			return withInitPlanCharge(n, pc)
 		}
 	}
-	return DeriveLegacyDisplayCost(n, EstimateRows(n))
+	return withInitPlanCharge(n, DeriveLegacyDisplayCost(n, EstimateRows(n)))
 }
 
 func childRowsOf(n Node) float64 {
@@ -216,6 +252,8 @@ func legacyDisplayChildren(n Node) []Node {
 		return []Node{p.Child}
 	case *Sort:
 		return []Node{p.Child}
+	case *IncrementalSort:
+		return []Node{p.Child}
 	case *Limit:
 		return []Node{p.Child}
 	case *Distinct:
@@ -234,6 +272,8 @@ func legacyDisplayChildren(n Node) []Node {
 		return []Node{p.Child}
 	case *Memoize:
 		return []Node{p.Child}
+	case *Materialize:
+		return []Node{p.Child}
 	case *Result:
 		if p.Child == nil {
 			return nil
@@ -245,6 +285,19 @@ func legacyDisplayChildren(n Node) []Node {
 		return []Node{p.Anchor, p.Recursive}
 	case *SetOp:
 		return []Node{p.Left, p.Right}
+	case *SubqueryScan:
+		// M0146-0005w: the subplan must be priced beneath the label.
+		return []Node{p.Child}
+	case *CTEScan:
+		// A reference PG would inline is an ordinary subquery there, priced
+		// by cost_subqueryscan over its body (costsize.c:1491-1493). A kept
+		// CTE's body is an initPlan and stays out of the scan's cost, as in
+		// cost_ctescan. The reference count is final only once the whole
+		// statement is planned: a read taken before a later set-op branch
+		// adds the second reference still sees one, and prices the body in.
+		if p.Inlined() && p.Child != nil {
+			return []Node{p.Child}
+		}
 	}
 	return nil
 }

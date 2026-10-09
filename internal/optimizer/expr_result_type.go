@@ -57,7 +57,7 @@ func ExprResultType(e Expr) (catalog.Type, bool) {
 		// PG's make_const: an integer literal that fits in int32 is int4,
 		// otherwise int8 (numeric only beyond int64, which the lexer would
 		// have produced a NumericConst for).
-		if x.Value >= -2147483648 && x.Value <= 2147483647 {
+		if !IntegerConstIsInt8(x) {
 			return catalog.Type{Name: "int4"}, true
 		}
 		return catalog.Type{Name: "int8"}, true
@@ -76,6 +76,18 @@ func ExprResultType(e Expr) (catalog.Type, bool) {
 		return catalog.Type{Name: strings.ToLower(x.Type)}, true
 	case *IntervalLit:
 		return catalog.Type{Name: "interval"}, true
+	case *SubqueryExpr:
+		// A scalar sublink's value is its subplan's single output column
+		// (exprType of a SubLink / Param is the first target's type), e.g.
+		// the bigint of `(SELECT sum(int_col) …)` — M0146-0005cv.
+		if x.Plan == nil {
+			return catalog.Type{}, false
+		}
+		out := x.Plan.Output()
+		if len(out) != 1 || out[0].Type.Name == "" {
+			return catalog.Type{}, false
+		}
+		return out[0].Type, true
 	case *ExtractExpr:
 		// PG 14+ returns numeric from EXTRACT (float8 before that).
 		return catalog.Type{Name: "numeric"}, true
@@ -161,6 +173,38 @@ func binaryOpResultType(x *BinaryOp) (catalog.Type, bool) {
 func funcCallResultType(x *FuncCall) (catalog.Type, bool) {
 	if x.ReturnType != "" {
 		return catalog.Type{Name: strings.ToLower(x.ReturnType)}, true
+	}
+	// Functions whose result type pg_proc cannot key from the argument
+	// list (M0146-0074, for `||` resolution):
+	//   - COALESCE / GREATEST / LEAST: the arguments' common type (PG's
+	//     select_common_type); the first argument that is neither a NULL
+	//     nor an untyped literal decides it, and all-literal arguments
+	//     resolve to text, as an unknown literal does;
+	//   - NULLIF: its first argument's type;
+	//   - concat / concat_ws / format: text. They are VARIADIC "any".
+	switch strings.ToLower(x.Name) {
+	case "coalesce", "greatest", "least":
+		literal := false
+		for _, a := range x.Args {
+			if _, isNull := a.(*NullConst); isNull {
+				continue
+			}
+			if _, isLit := a.(*StringConst); isLit {
+				literal = true
+				continue
+			}
+			return ExprResultType(a)
+		}
+		if literal {
+			return catalog.Type{Name: "text"}, true
+		}
+		return catalog.Type{}, false
+	case "nullif":
+		if len(x.Args) == 2 {
+			return ExprResultType(x.Args[0])
+		}
+	case "concat", "concat_ws", "format":
+		return catalog.Type{Name: "text"}, true
 	}
 	if x.Star || x.Variadic {
 		// `count(*)` and VARIADIC expansion do not have a literal argument

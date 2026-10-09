@@ -166,11 +166,18 @@ func sortIntsAscending(a []int) {
 // PostgreSQL rejects an argument that is not a grouping expression of this
 // query level with 42803; so does this.
 func groupingCallMasks(gc *parser.GroupingCall, sets [][]int, targets []parser.ResTarget, byExpr, byQual map[string]int) ([]int64, error) {
+	masks, _, err := groupingCallMasksSlots(gc, sets, targets, byExpr, byQual)
+	return masks, err
+}
+
+// groupingCallMasksSlots is groupingCallMasks that also returns each
+// argument's GroupExprs index (Aggregate.GroupingMaskSlots, M0146-0005cf).
+func groupingCallMasksSlots(gc *parser.GroupingCall, sets [][]int, targets []parser.ResTarget, byExpr, byQual map[string]int) ([]int64, []int, error) {
 	slots := make([]int, len(gc.Args))
 	for i, a := range gc.Args {
 		idx, ok := groupExprSlot(a, targets, byExpr, byQual)
 		if !ok {
-			return nil, &PlanError{
+			return nil, nil, &PlanError{
 				Pos:     a.Pos(),
 				Code:    "42803",
 				Message: "arguments to GROUPING must be grouping expressions of the associated query level",
@@ -193,7 +200,7 @@ func groupingCallMasks(gc *parser.GroupingCall, sets [][]int, targets []parser.R
 		}
 		masks[si] = mask
 	}
-	return masks, nil
+	return masks, slots, nil
 }
 
 // collectGroupingCalls returns the distinct GROUPING(...) calls written

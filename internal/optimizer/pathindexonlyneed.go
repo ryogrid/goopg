@@ -26,7 +26,12 @@ package optimizer
 // with the opposite default — correct for its own conservative question and a
 // wrong-answer bug if reused here (rule #2).
 
-import "github.com/goopg/goopg/internal/parser"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // neededColumnNames returns every column name the statement reads, and whether
 // the answer is TRUSTWORTHY. A false second return means "assume every column
@@ -36,10 +41,166 @@ func neededColumnNames(s *parser.SelectStmt) (map[string]bool, bool) {
 		return nil, false
 	}
 	dst := make(map[string]bool, 16)
+	dst[neededMarkersKey] = true
 	if !collectStmtColumnNames(s, dst) {
 		return nil, false
 	}
 	return dst, true
+}
+
+// M0146-0005bq-b — per-relation attribution for the qualified references.
+//
+// The name set over-states on purpose (file header), but for a table read
+// under two aliases it over-states by a whole relation: TPC-DS Q18 reads
+// `cd1.cd_gender` and `cd2.cd_demo_sk`, so `cd_gender` counted as needed for
+// cd2 too and PG's `Index Only Scan ... cd2` probe was refused. Alongside the
+// plain names the collector records, per reference, the qualifier it was
+// written with (or that it had none), in marker keys no column name can
+// collide with. A relation read as alias A then needs a column only when some
+// reference is UNQUALIFIED (it may be A's) or is qualified by A. An
+// unqualified reference still counts for every relation, so the attribution
+// narrows only what another alias's qualified reads added — never below what
+// the relation itself reads. A qualifier that names some other scope's
+// relation by the same alias still counts for A: over-stating, never under.
+const neededMarkersKey = "\x00markers"
+
+func neededUnqualKey(col string) string { return "\x00u\x00" + strings.ToLower(col) }
+
+func neededQualKey(qual, col string) string {
+	return "\x00q\x00" + strings.ToLower(qual) + "\x00" + strings.ToLower(col)
+}
+
+// neededColumnNamedFor reports whether column col of the relation read under
+// qualifier qual is needed. Without the markers (a set built by an older
+// path), or without a qualifier to attribute by, it falls back to the name
+// alone.
+func neededColumnNamedFor(needed map[string]bool, qual, col string) bool {
+	if qual == "" || !needed[neededMarkersKey] {
+		return needed[col]
+	}
+	return needed[neededUnqualKey(col)] || needed[neededQualKey(qual, col)]
+}
+
+// expandWholeRowColumnNames widens the needed and output sets for each
+// whole-row reference (M0146-0047a). A bare name that is a FROM relation's
+// alias — `SELECT a.id, b FROM wa a JOIN wb b ...` — reads every column of
+// that relation (PG: a whole-row Var, varattno 0, which pull_varattnos /
+// build_base_rel_tlists turn into attr_needed for all of its attributes).
+// The collectors record it as an ordinary unqualified name, which matches no
+// column, so the narrowed join kept only the join key and the row came out
+// `(1,,)`. Each such relation's columns are added as qualified reads
+// (neededQualKey), plus the plain name neededKeepSet matches on.
+//
+// A bare name is a whole-row reference only when it is not a column:
+// transformColumnRef tries colNameToVar first and falls back to the relation
+// name only when no column matches. The sets themselves carry no scope, so
+// the decision is taken per scope from the names written IN that scope:
+//
+//   - the statement: its own references (the collectors do not descend into
+//     FROM subqueries; sublinks are included and see these relations), and
+//     the columns of its own FROM relations;
+//   - each pulled-up derived body: the names collected from the body alone,
+//     and the columns of the body's own FROM relations — a non-LATERAL
+//     derived table does not see its parent's FROM list.
+//
+// TPC-H Q9's outer `nation` is the derived table's column, written in the
+// outer scope; the body's `nation` relation is never named bare inside the
+// body, so it is not expanded. A relation whose output names are unknown
+// here (a function, a subquery not pulled up and without column aliases)
+// contributes none, which can only expand more — over-keeping is the safe
+// direction (file header).
+func expandWholeRowColumnNames(ctx *resolveContext, s *parser.SelectStmt, cat catalog.Catalog) {
+	if ctx == nil || s == nil || cat == nil {
+		return
+	}
+	var sets []map[string]bool
+	if ctx.neededColsKnown && ctx.neededCols != nil {
+		sets = append(sets, ctx.neededCols)
+	}
+	if ctx.outputColsKnown && ctx.outputCols != nil {
+		sets = append(sets, ctx.outputCols)
+	}
+	if len(sets) == 0 {
+		return
+	}
+	pulledNames := map[string][]string{}
+	for _, r := range ctx.pulledDerived {
+		pulledNames[strings.ToLower(r.alias)] = r.names
+	}
+	lookup := func(rv parser.RangeVar) *catalog.Table {
+		if rv.Subquery != nil || rv.TableFunc != nil || rv.Name == "" {
+			return nil
+		}
+		t, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+		if !ok {
+			return nil
+		}
+		return t
+	}
+	// expandScope expands, in every set, each relation of `from` that the
+	// scope's own references name bare while no relation of the scope has a
+	// column of that name.
+	expandScope := func(stmt *parser.SelectStmt) {
+		written := make(map[string]bool, 16)
+		written[neededMarkersKey] = true
+		if !collectStmtColumnNames(stmt, written) {
+			// Unaccounted references: assume every relation is read whole.
+			written = nil
+		}
+		visible := map[string]bool{}
+		for _, rv := range stmt.From {
+			switch {
+			case rv.Subquery != nil && pulledNames[strings.ToLower(rv.Alias)] != nil:
+				// A pulled body's names already apply its alias list,
+				// leading columns renamed and the rest kept (M0146-0028g).
+				for _, n := range pulledNames[strings.ToLower(rv.Alias)] {
+					visible[strings.ToLower(n)] = true
+				}
+			case len(rv.Columns) > 0:
+				for _, c := range rv.Columns {
+					visible[strings.ToLower(c)] = true
+				}
+			case rv.Subquery != nil:
+				for _, n := range pulledNames[strings.ToLower(rv.Alias)] {
+					visible[strings.ToLower(n)] = true
+				}
+			default:
+				if t := lookup(rv); t != nil {
+					for _, c := range t.Columns {
+						visible[strings.ToLower(c.Name)] = true
+					}
+				}
+			}
+		}
+		for _, rv := range stmt.From {
+			qual := rv.Alias
+			if qual == "" {
+				qual = rv.Name
+			}
+			if written != nil && !written[neededUnqualKey(qual)] {
+				continue
+			}
+			if visible[strings.ToLower(qual)] {
+				continue
+			}
+			tbl := lookup(rv)
+			if tbl == nil {
+				continue
+			}
+			for _, set := range sets {
+				for _, c := range tbl.Columns {
+					set[c.Name] = true
+					set[neededQualKey(qual, c.Name)] = true
+				}
+			}
+		}
+	}
+	expandScope(s)
+	for _, r := range ctx.pulledDerived {
+		if r.body != nil {
+			expandScope(r.body)
+		}
+	}
 }
 
 // outputColumnNames returns every column name read ABOVE the statement's
@@ -74,6 +235,7 @@ func outputColumnNames(s *parser.SelectStmt) (map[string]bool, bool) {
 		return nil, false
 	}
 	dst := make(map[string]bool, 16)
+	dst[neededMarkersKey] = true
 	if !collectOutputColumnNames(s, dst) {
 		return nil, false
 	}
@@ -91,8 +253,15 @@ func collectOutputColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// reference is a dropped column, so they decline as a group. Mirrors
 	// collectStmtColumnNames.
 	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
-		len(s.ValuesRows) != 0 || s.GroupingSets != nil ||
+		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its
+	// sets list (ROLLUP/CUBE/GROUPING SETS expand to them), so walking every
+	// set's expressions accounts for it — TPC-DS Q18's ROLLUP had made the
+	// whole needed set unknown and every index-only path unofferable.
+	if !collectGroupingSetColumnNames(s.GroupingSets, dst) {
 		return false
 	}
 	for _, t := range s.Targets {
@@ -223,9 +392,9 @@ func collectSublinkOuterNames(e parser.Expr, dst map[string]bool) bool {
 	case *parser.ExtractExpr:
 		return collectSublinkOuterNames(x.Source, dst)
 	case *parser.ExistsExpr:
-		return collectStmtColumnNames(x.Subquery, dst)
+		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
-		return collectStmtColumnNames(x.Inner, dst)
+		return collectStmtColumnNames(scalarBodyForColumns(x.Inner), dst)
 	default:
 		return false
 	}
@@ -241,8 +410,15 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// Shapes whose column usage this walker does not model; an unaccounted
 	// reference is a dropped column, so they decline as a group.
 	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
-		len(s.ValuesRows) != 0 || s.GroupingSets != nil ||
+		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its
+	// sets list (ROLLUP/CUBE/GROUPING SETS expand to them), so walking every
+	// set's expressions accounts for it — TPC-DS Q18's ROLLUP had made the
+	// whole needed set unknown and every index-only path unofferable.
+	if !collectGroupingSetColumnNames(s.GroupingSets, dst) {
 		return false
 	}
 	for _, t := range s.Targets {
@@ -285,6 +461,7 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 			}
 			for _, u := range jn.Using {
 				dst[u] = true
+				dst[neededUnqualKey(u)] = true
 			}
 			if !collectExprColumnNames(jn.On, dst) {
 				return false
@@ -318,6 +495,13 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 	switch x := e.(type) {
 	case *parser.ColumnRef:
 		dst[x.Column] = true
+		// M0146-0005bq-b: which relation the name was read FROM, as far as
+		// the text says — see neededQualKey.
+		if x.Table == "" {
+			dst[neededUnqualKey(x.Column)] = true
+		} else {
+			dst[neededQualKey(x.Table, x.Column)] = true
+		}
 		return true
 
 	// Leaves that provably carry no column reference.
@@ -398,9 +582,9 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		// exactly the plan take2 P4-01 is justified by.
 		return collectExprColumnNames(x.Source, dst)
 	case *parser.ExistsExpr:
-		return collectStmtColumnNames(x.Subquery, dst)
+		return collectStmtColumnNames(existsBodyForColumns(x.Subquery), dst)
 	case *parser.SubqueryExpr:
-		return collectStmtColumnNames(x.Inner, dst)
+		return collectStmtColumnNames(scalarBodyForColumns(x.Inner), dst)
 	default:
 		// `StarExpr`, `IndirectionStar`, `RowExpr`, the array forms, and any
 		// node added after this file was written. Declining is the only answer
@@ -408,4 +592,72 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		// and is now handled above — it was declining TPC-H Q7/Q8/Q9.)
 		return false
 	}
+}
+
+// collectGroupingSetColumnNames adds every column the grouping sets name.
+func collectGroupingSetColumnNames(gs *parser.GroupingSetsSpec, dst map[string]bool) bool {
+	if gs == nil {
+		return true
+	}
+	for _, set := range gs.Sets {
+		for _, e := range set {
+			if !collectExprColumnNames(e, dst) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// existsBodyForColumns is simplify_EXISTS_query's target-list discard
+// (subselect.c) as the column collector sees it: an EXISTS reads no column
+// through its SELECT list, so `EXISTS (SELECT * FROM wr1 WHERE ...)` — TPC-DS
+// Q94's anti-join probe — must not void the statement's needed set with its
+// star. Only a list of stars and constants is dropped; any other target is
+// still walked, which can only over-state (M0146-0005bs).
+func existsBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
+	if sub == nil || len(sub.Targets) == 0 {
+		return sub
+	}
+	for _, t := range sub.Targets {
+		switch t.Expr.(type) {
+		case *parser.StarExpr, *parser.IntegerConst, *parser.StringConst,
+			*parser.NumericConst, *parser.BooleanConst, *parser.NullConst:
+		default:
+			return sub
+		}
+	}
+	cp := *sub
+	cp.Targets = nil
+	return &cp
+}
+
+// scalarBodyForColumns drops a scalar sublink's unqualified `*` targets before
+// the walk (M0146-0122). transformExpr expands such a star over the sublink's
+// OWN FROM list (ExpandColumnRefStar: the current level's namespace only), so
+// every Var it makes has varlevelsup 0 and none is an outer relation's column.
+// The sublink is planned by its own planSelect, which computes its own needed
+// set, and an EXPR sublink is never pulled up into the outer join tree
+// (pull_up_sublinks converts only ANY / EXISTS). TPC-DS Q23's
+// `HAVING sum(...) > 0.95 * (SELECT * FROM max_store_sales)` had voided the
+// whole set, so best_ss_customer's `customer` got no index-only path. A
+// qualified star (`t.*`) may name an outer relation and is still walked —
+// which declines.
+func scalarBodyForColumns(sub *parser.SelectStmt) *parser.SelectStmt {
+	if sub == nil || len(sub.Targets) == 0 {
+		return sub
+	}
+	keep := make([]parser.ResTarget, 0, len(sub.Targets))
+	for _, t := range sub.Targets {
+		if st, ok := t.Expr.(*parser.StarExpr); ok && st.Schema == "" && st.Table == "" {
+			continue
+		}
+		keep = append(keep, t)
+	}
+	if len(keep) == len(sub.Targets) {
+		return sub
+	}
+	cp := *sub
+	cp.Targets = keep
+	return &cp
 }

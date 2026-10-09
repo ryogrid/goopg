@@ -1,0 +1,49 @@
+2026-09-27 — M0146-0005u gates (tree 3a5fbe5bd + slice21 diff, stamped
+against the staged index after the recover arm landed)
+
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+  -> PASS (all packages ok; internal/optimizer re-run after the recover
+     arm landed — ok)
+
+scripts/tpch-spotcheck.sh
+  -> RESULT=PASS (Q12 rows=2, Q13 rows=33)
+  gate-stamp: tpch-spotcheck PASS
+
+scripts/tpcds-sf025-regression.sh sweep  (:65437, staged binary)
+  -> PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  gate-stamp: tpcds-sf025 PASS
+  NOTE: the first stamped run died mid-sweep — its :65437 scope was
+  OOM-killed while three heavy gates ran concurrently (aggregate
+  goopg-workloads slice budget). Re-run alone: clean PASS. Q73
+  executes fine on :65437 (PASS, 0 rows) — the private-clone panic is
+  stats-state-specific, not binary-specific; see README.
+
+ACCEPT_BASELINE=tmp/m0145-0008m/arm-on.txt \
+  scripts/tpch-acceptance-arm.sh m0146-0005u tmp/arm-on-m0146-0005u.txt
+  -> SUMMARY: 24 MATCH — values identical to baseline
+  gate-stamp: tpch-acceptance-arm PASS
+
+scripts/tpcds-fireset-gate.sh m0146-0005u analysis/m0146/m0146-0005/slice21/fireset
+  -> fire sets SF0.25 {Q22 Q53 Q63} all PASS, SF1 {Q22 Q49} all PASS;
+     FIRE-SET-TIMEOUTS introduced=none
+  gate-stamp: tpcds-fireset PASS
+  - SF0.25: fires are this slice's moved queries (Q22 = this change;
+    Q53/Q63 = 892570089's sorted-split residue already in HEAD's delta
+    vs the previous baseline capture — see census; both execute PASS)
+  - SF1: Q22 is a shape move toward PG (Gather -> Hash Join(item) ->
+    Parallel Hash Join(inventory,date_dim); PG files Parallel Hash Join
+    outer) — divergent category drops join-method/scan-type/
+    parameterisation by one each, match count unchanged at 12. Q49 is
+    cost-digits-only drift (29497.16 -> .15), shape identical.
+  - Baseline-vs-candidate census delta (fireset captures, SF0.25):
+    match 13 -> 14, join-method 9 -> 8, all else identical.
+
+Census (first-divergence, vs PG SF0.25 baseline):
+  census-sf025.txt -> census-sf025-after.txt: Q22 -> MATCH; symmetric
+  same-clone arm census-sf025-prev-arm.txt confirms the ONLY record
+  change is Q22 (join-method 9 -> 8; Q73 unparsed on BOTH arms =
+  symmetric noise from the drifted clone).
+
+Self-diffs (goopg-vs-goopg, same private clones, same stats):
+  sf025-selfdiff.txt: match=94 shapediff=1 (Q22 only)
+  tpch-selfdiff.txt:  match=22 shapediff=0

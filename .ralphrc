@@ -74,10 +74,10 @@ export BASH_MAX_TIMEOUT_MS=3600000       # 60 min ceiling (race-gate + spotcheck
 # Non-default backends reuse the core loop via adapters in ralph_loop.sh
 # (build_agent_command + normalize_agent_output). Environment variable
 # AGENT_BACKEND overrides this file.
-export AGENT_BACKEND="claude"
-# export AGENT_BACKEND="codex"
+#export AGENT_BACKEND="claude"
+#export AGENT_BACKEND="codex"
 #export AGENT_BACKEND="opencode"
-#export AGENT_BACKEND="devin"
+export AGENT_BACKEND="devin"
 # OpenCode backend settings (used only when AGENT_BACKEND=opencode).
 # Model in provider/model format; empty = CLI default.
 #OPENCODE_MODEL=""

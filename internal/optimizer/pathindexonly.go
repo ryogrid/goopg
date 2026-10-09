@@ -16,13 +16,13 @@ package optimizer
 //
 // Two narrowings, stated as refusals:
 //
-//   - Only a BARE leaf, or a leaf whose local quals are ALL consumed as index
-//     quals (M0145-0029 slice 3: `restrictionEqualityPrefix`, PG's
-//     `build_index_paths` with `index_clauses` and `indexonly = true`). A
-//     residual local qual has a predicate whose `ColumnRef.Index` values are
-//     written against the FULL leaf schema; narrowing the scan under it would
-//     re-point them, so a leaf that would keep one is still refused (ledgered:
-//     PG keeps such quals as the Index Only Scan's Filter).
+//   - A leaf's local quals are either consumed as index quals (M0145-0029
+//     slice 3: `restrictionEqualityPrefix`, PG's `build_index_paths` with
+//     `index_clauses` and `indexonly = true`) or kept as the Index Only
+//     Scan's Filter (M0146-0019a), re-based by createPlan from the full leaf
+//     schema onto the covered columns. A residual that reads an uncovered
+//     column or holds a correlated sublink is refused
+//     (indexOnlyResidualAdmissible).
 //   - Only when the needed set is KNOWN (`neededColumnNames`): an index-only
 //     scan that drops a column the query reads returns wrong rows.
 
@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // addIndexOnlyPaths generates, for every base relation, the index-only paths
@@ -47,8 +48,8 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		if tbl == nil {
 			continue
 		}
-		// A leaf with local quals is refused unless an index consumes all of
-		// them — see the file header.
+		// A leaf's local quals are index quals or the scan's Filter — see the
+		// file header.
 		bare := scanLeafIsBare(rel.baseLeaf)
 		var conjuncts []Expr
 		if !bare {
@@ -60,7 +61,7 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 				continue
 			}
 		}
-		needed := s.neededColumnsOf(tbl)
+		needed := s.neededColumnsOfRel(rel, tbl)
 		if len(needed) == 0 {
 			// Nothing read from this relation at all — the walker and the
 			// plan disagree about what this rel is for; a scan emitting no
@@ -72,21 +73,33 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 			relTuples = 1
 		}
 		relPages := baseRelPages(tbl, relTuples)
+		// M0146-0061: the columns a useful ordering could name, for a range
+		// probe's pathkeys (the plain restriction producer's colExprs).
+		var colExprs map[string]Expr
+		if !bare && s.hasUsefulPathkeys(rel) {
+			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
+			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
+		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			var clauses []indexPathClause
 			if !bare {
-				clauses = consumingIndexClauses(cat, tbl, idx, conjuncts)
-				if clauses == nil {
+				var ok bool
+				clauses, ok = s.indexOnlyLeafClauses(cat, rel, tbl, idx, needed, conjuncts)
+				if !ok {
 					continue
 				}
 			} else if !indexUnboundKeysNotNull(tbl, idx, 0) {
 				// A full scan leaves every key column unbound, so it needs the
-				// same NULL-key rule as consumingIndexClauses: an index without
+				// same NULL-key rule as indexOnlyLeafClauses: an index without
 				// NULL-keyed entries would drop those rows.
 				continue
 			}
-			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, relPages, relTuples, totalPages) {
+			if s.addOneIndexOnlyPath(cat, rel, tbl, idx, needed, clauses, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}
 		}
@@ -102,6 +115,42 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 // which of THIS table's columns does the statement read? Name-matched against
 // the statement-wide set, which over-states rather than under-states — see
 // pathindexonlyneed.go.
+// neededColumnsOfRel is neededColumnsOf for the relation `rel` reads
+// `tbl` as: a column only another alias of the same table reads by
+// qualified name is not needed here (M0146-0005bq-b, pathindexonlyneed.go).
+func (s *searchCtx) neededColumnsOfRel(rel *RelOptInfo, tbl *catalog.Table) []catalog.Column {
+	qual := ""
+	if rel != nil {
+		if id, _, ok := scanLeafFor(rel.baseLeaf); ok && id != nil {
+			qual = id.alias
+			if qual == "" {
+				qual = tbl.Name
+			}
+		}
+	}
+	out := make([]catalog.Column, 0, len(tbl.Columns))
+	for _, c := range tbl.Columns {
+		if neededColumnNamedFor(s.neededCols, qual, c.Name) {
+			out = append(out, c)
+		}
+	}
+	// M0146-0046: check_index_only's attrs_used includes system columns,
+	// which no index stores — a statement reading this relation's `ctid`
+	// (or another heap system column) can never be answered from the index.
+	// The synthetic entry is never covered, so every index-only producer
+	// declines; a column of the table cannot carry a system column's name.
+	for _, sys := range heapSystemColumnNames {
+		if neededColumnNamedFor(s.neededCols, qual, sys) {
+			out = append(out, catalog.Column{Name: sys})
+		}
+	}
+	return out
+}
+
+// heapSystemColumnNames are the system columns a heap scan supplies and an
+// index-only scan cannot (PG's SelfItemPointer through TableOid).
+var heapSystemColumnNames = []string{"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"}
+
 func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	out := make([]catalog.Column, 0, len(tbl.Columns))
 	for _, c := range tbl.Columns {
@@ -112,63 +161,144 @@ func (s *searchCtx) neededColumnsOf(tbl *catalog.Table) []catalog.Column {
 	return out
 }
 
-// consumingIndexClauses returns the equality-prefix index clauses of `idx`
-// when they consume EVERY local conjunct of the leaf, else nil. A partial
-// index declines, as in the plain restriction producer.
-func consumingIndexClauses(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
-	if idx == nil || idx.HasPredicate {
-		return nil
-	}
-	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
-	if len(clauses) == 0 || len(clauses) != len(conjuncts) {
-		return nil
-	}
-	// Same NULL-key rule as the plain restriction producer: entries with a
-	// NULL key column are absent from the byte-key btree.
-	if !indexUnboundKeysNotNull(tbl, idx, len(clauses)) {
-		return nil
-	}
-	// Each clause names a distinct conjunct (one per index column), so equal
-	// counts mean every conjunct is consumed — unless one conjunct bound two
-	// columns, which restrictionEqualityPrefix cannot do (one column per
-	// `col = const`); checked anyway, since a missed residual is wrong rows.
-	used := make(map[Expr]bool, len(clauses))
-	for _, c := range clauses {
-		used[c.local] = true
-	}
-	for _, conj := range conjuncts {
-		if !used[conj] {
-			return nil
-		}
-	}
-	return clauses
-}
-
 // restrictionPathIsIndexOnly reports whether addIndexOnlyPaths builds the
 // index-only path over `idx` with the equality-prefix clauses of the leaf's
 // `conjuncts` — the same three conditions it applies (enable_indexonlyscan,
 // a covering index, every local qual consumed). The plain restriction
 // producer asks it so that exactly one of the two builds the path, as
 // build_index_paths' single `index_only_scan` flag does.
-func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
 	if !s.neededColsKnown || indexOnlyHardDisabled(cat) {
 		return false
 	}
-	needed := s.neededColumnsOf(tbl)
+	needed := s.neededColumnsOfRel(rel, tbl)
 	if len(needed) == 0 {
 		return false
 	}
-	if _, ok := indexCoversColumns(idx, needed); !ok {
+	_, ok := s.indexOnlyLeafClauses(cat, rel, tbl, idx, needed, conjuncts)
+	return ok
+}
+
+// indexOnlyLeafClauses is build_index_paths' index-only arm for a leaf with
+// local quals (M0146-0019a): the equality-prefix index clauses `idx` can bind
+// (possibly none — a full index-only scan), with every other local qual kept
+// as the Index Only Scan's Filter, as PG keeps them in the scan's qpqual. It
+// declines when the index does not cover what the statement reads, when an
+// unbound key column may hold NULLs (those entries are absent), or when a
+// residual qual cannot be evaluated over the narrowed row
+// (indexOnlyResidualAdmissible).
+func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	needed []catalog.Column, conjuncts []Expr) ([]indexPathClause, bool) {
+	if idx == nil || idx.HasPredicate {
+		return nil, false
+	}
+	covered, ok := indexCoversColumns(idx, needed)
+	if !ok {
+		return nil, false
+	}
+	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	bound := len(clauses)
+	if !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)) {
+		// M0146-0061: with no equality on the leading column, the plain
+		// producer binds a leading range when there is no leading SAOP
+		// (addOneRestrictionIndexPath's order) — the same clauses the
+		// index-only scan carries as LowKey/HighKey.
+		rng := restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
+			return nil, false
+		}
+		clauses, bound = rng, 1
+	}
+	if !indexUnboundKeysNotNull(tbl, idx, bound) {
+		return nil, false
+	}
+	used := make(map[Expr]bool, len(clauses))
+	for _, c := range clauses {
+		if c.local != nil {
+			used[c.local] = true
+		}
+	}
+	var residual []Expr
+	for _, conj := range conjuncts {
+		if !used[conj] {
+			residual = append(residual, conj)
+		}
+	}
+	if len(residual) > 0 {
+		id, _, ok := scanLeafFor(rel.baseLeaf)
+		if !ok || !indexOnlyResidualAdmissible(residual, id.schema, covered) {
+			return nil, false
+		}
+	}
+	return clauses, true
+}
+
+// plainRestrictionBindsOnlyPrefix reports whether the plain restriction
+// producer (addOneRestrictionIndexPath) would bind exactly the leaf's
+// equality prefix of length n on idx — none when n is 0. PG builds ONE path
+// per index with one clause set and makes it index-only when it can
+// (build_index_paths), so the index-only path may stand in for the plain one
+// only when their clauses agree. A prefix followed by a range on the next
+// column, a leading SAOP or range, or a skip run are clauses the index-only
+// lowering does not carry yet (ledgered); the plain path keeps those.
+func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, n int) bool {
+	if n > 0 {
+		return n >= len(idx.Columns) || len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0
+	}
+	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 {
 		return false
 	}
-	return consumingIndexClauses(cat, tbl, idx, conjuncts) != nil
+	skipClauses, _ := restrictionSkipRun(cat, tbl, idx, conjuncts)
+	return len(skipClauses) == 0
+}
+
+// indexOnlyResidualAdmissible reports whether every residual qual can stay as
+// an Index Only Scan Filter over the covered columns: each column it reads
+// (in the leaf's own schema) is covered, and no sublink in it is correlated —
+// a correlated sublink's PARAM_EXEC args address the leaf row, which the
+// narrowed scan no longer emits. Uncorrelated sublinks (TPC-H Q16's hashed
+// `NOT (ps_suppkey = ANY (SubPlan))`) read only their operand.
+func indexOnlyResidualAdmissible(residual []Expr, leafSchema Schema, covered []catalog.Column) bool {
+	in := make(map[string]bool, len(covered))
+	for _, c := range covered {
+		in[c.Name] = true
+	}
+	good := true
+	for _, e := range residual {
+		walked := walkExprRefs(e, scopeIgnore, exprVisitor{
+			Visit: func(n Expr) bool {
+				if cr, isCol := n.(*ColumnRef); isCol {
+					if cr.Index < 0 || cr.Index >= len(leafSchema) || !in[leafSchema[cr.Index].Name] {
+						good = false
+					}
+				}
+				if plans := ExprSubplans(n); len(plans) > 0 {
+					h := handleFor(n)
+					if h == nil || len(h.params()) > 0 {
+						good = false
+					}
+					for _, p := range plans {
+						if planHasOuterRef(p) {
+							good = false
+						}
+					}
+				}
+				return good
+			},
+			OnUnknown: func(Expr) { good = false },
+		})
+		if !walked || !good {
+			return false
+		}
+	}
+	return true
 }
 
 // addOneIndexOnlyPath builds the index-only path for one index, or declines.
 // `clauses` is empty for the full-index-scan shape over a bare leaf, or the
 // index quals that consume all of the leaf's local quals.
 func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
-	needed []catalog.Column, clauses []indexPathClause, relPages int64, relTuples, totalPages float64) bool {
+	needed []catalog.Column, clauses []indexPathClause, colExprs map[string]Expr, relPages int64, relTuples, totalPages float64) bool {
 	covered, ok := indexCoversColumns(idx, needed)
 	if !ok {
 		return false
@@ -177,10 +307,15 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// selectivity for an index path with no indexclauses is 1.0 ("An empty
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
-	if len(clauses) > 0 {
+	switch {
+	case len(clauses) > 0 && clauses[0].op != parser.OpUnknown:
+		// M0146-0061: leading-column bounds, priced as the plain range
+		// path prices them.
+		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
+	case len(clauses) > 0:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
 	}
-	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	qpquals := localQualOpCount(rel.baseLeaf) - indexClausesEvalOps(clauses)
 	if qpquals < 0 {
 		qpquals = 0
 	}
@@ -243,6 +378,13 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// list as exactly that. Non-empty: the probe, whose conjuncts
 		// createPlan drops from the leaf (they were all of them).
 		IndexClauses: clauses,
+	}
+	// M0146-0061: a range probe stands in for the plain range path, which
+	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
+	// it too — PG's build_index_paths computes one useful_pathkeys for the
+	// index whether the path is index-only or not.
+	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown && len(colExprs) > 0 && indexIsOrderable(idx) {
+		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
 	}
 	addPath(rel, serial, "indexonly")
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,

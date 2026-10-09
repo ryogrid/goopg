@@ -227,7 +227,28 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.hashProbeFingerprint = nil
 	var loBytes, hiBytes []byte
 	o.rangeBoundsSet = false
+	// M0146-0005bt: an index-only skip probe — the shared btree skip
+	// enumeration (btree_skip.go), one bounded range scan per distinct
+	// value of the skipped key prefix, all materialised here as every
+	// other shape is.
+	var skip *btreeSkipEnum
 	switch {
+	case o.plan.SkipPrefix > 0:
+		sp := o.plan.SkipPrefix
+		if isHashIdx || len(o.plan.Keys) == 0 || o.plan.Key != nil || o.plan.LowKey != nil ||
+			o.plan.HighKey != nil || sp+len(o.plan.Keys) > len(o.plan.Index.Columns) {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: skip scan on index %q carries an incompatible probe shape (SkipPrefix=%d, Keys=%d, columns=%d)",
+				o.plan.Index.Name, sp, len(o.plan.Keys), len(o.plan.Index.Columns))}
+		}
+		skip = &btreeSkipEnum{}
+		empty, err := skip.init(ctx, o.plan.Index, sp, o.plan.Keys, o.outerSlot, o.plan.Pos(), "indexOnlyScanOp")
+		if err != nil {
+			return err
+		}
+		if empty {
+			return nil
+		}
 	case len(o.plan.Keys) > 0:
 		// Multi-column equality probe (M0054-0006 composite), preserved
 		// through IOS promotion by M0116-0003.
@@ -431,7 +452,32 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.rangeBoundsSet {
 		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 	}
-	if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, loExcl, hiExcl, leafFilter, scanPosFn); err != nil {
+	if skip != nil && skip.canWalk() {
+		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf) —
+		// the index scan's sibling walks the same groups lazily.
+		for {
+			more, err := skip.walkLeaf(ctx, tree, o.plan.Index, o.plan.SkipPrefix, o.plan.Pos(), "indexOnlyScanOp", leafFilter, scanPosFn)
+			if err != nil {
+				return err
+			}
+			if !more {
+				break
+			}
+		}
+	} else if skip != nil {
+		for {
+			lo, hi, ok, err := skip.next(ctx, tree, o.plan.Index, o.plan.SkipPrefix, o.plan.Pos(), "indexOnlyScanOp")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			if err := tree.RangeScanWithPosLeafFilter(lo, hi, false, false, leafFilter, scanPosFn); err != nil {
+				return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+			}
+		}
+	} else if err := tree.RangeScanWithPosLeafFilter(loBytes, hiBytes, loExcl, hiExcl, leafFilter, scanPosFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 

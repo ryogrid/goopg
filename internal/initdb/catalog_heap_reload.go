@@ -126,9 +126,35 @@ func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *tr
 			// xmax liveness now; decode only needs a real (xmin-valid) tuple.
 			row, requireCommitted, derr := decode(ht, storage.ItemPointer{Block: blk, Offset: slot})
 			if derr != nil {
+				if rel.DBOid == 0 {
+					slog.Warn("shared catalog reload: undecodable row skipped",
+						"catalog", name, "block", blk, "slot", slot, "xmin", ht.Header.Xmin, "err", derr)
+				}
 				continue
 			}
 			if !catalogRowLive(clog, ht, requireCommitted) {
+				// M0146-0035: a shared-catalog row with no deleter that is
+				// still rejected lost its inserting transaction's status
+				// (aborted, or a CLOG lane read as Unknown and swept). A
+				// clone that came up without database/role `tpch` left no
+				// trace of which; this names the xid and its CLOG status.
+				if rel.DBOid == 0 && ht.Header.Xmax == storage.InvalidTransactionID {
+					st := "no-clog"
+					if clog != nil {
+						switch clog.GetStatus(ht.Header.Xmin) {
+						case transam.TxnStatusAborted:
+							st = "aborted"
+						case transam.TxnStatusCommitted:
+							st = "committed"
+						case transam.TxnStatusSubCommitted:
+							st = "sub-committed"
+						default:
+							st = "unknown"
+						}
+					}
+					slog.Warn("shared catalog reload: row rejected by xmin status",
+						"catalog", name, "block", blk, "slot", slot, "xmin", ht.Header.Xmin, "clog", st)
+				}
 				continue
 			}
 			rows = append(rows, row)

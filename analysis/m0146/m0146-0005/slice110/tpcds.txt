@@ -1,0 +1,19 @@
+== sf025 (fire set Q2 Q10 Q14 Q23 Q30 Q35 Q54 Q58 Q65 Q81 Q83 Q95)
+0df-tpcds-sf025-baseline.plans.txt alias-only lines 42 {'Q2': 1, 'Q8': 2, 'Q14': 19, 'Q23': 1, 'Q30': 2, 'Q56': 2, 'Q58': 2, 'Q75': 2, 'Q81': 3, 'Q83': 4, 'Q95': 4}
+0df-tpcds-sf025-candidate.plans.txt alias-only lines 13 {'Q8': 2, 'Q14': 5, 'Q56': 2, 'Q58': 2, 'Q75': 2}
+baseline: text-identical 28/99 aligned-lines 2225  Q3 Q7 Q9 Q12 Q13 Q15 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q48 Q51 Q55 Q62 Q80 Q82 Q84 Q88 Q89 Q90 Q93 Q94 Q96 Q97 Q98
+candidate: text-identical 28/99 aligned-lines 2263  Q3 Q7 Q9 Q12 Q13 Q15 Q18 Q20 Q22 Q24 Q27 Q28 Q43 Q48 Q51 Q55 Q62 Q80 Q82 Q84 Q88 Q89 Q90 Q93 Q94 Q96 Q97 Q98
+lines identical on baseline but not candidate: 0
+== sf1 (fire set Q2 Q10 Q14 Q23 Q30 Q35 Q54 Q58 Q65 Q81 Q83 Q95)
+0df-tpcds-sf1-baseline.plans.txt alias-only lines 49 {'Q2': 1, 'Q8': 2, 'Q14': 12, 'Q23': 1, 'Q30': 2, 'Q58': 2, 'Q69': 2, 'Q81': 3, 'Q83': 19, 'Q95': 5}
+0df-tpcds-sf1-candidate.plans.txt alias-only lines 8 {'Q8': 2, 'Q14': 2, 'Q58': 2, 'Q69': 2}
+baseline: text-identical 16/99 aligned-lines 2026  Q9 Q12 Q15 Q20 Q27 Q28 Q41 Q51 Q87 Q88 Q90 Q91 Q94 Q96 Q97 Q98
+candidate: text-identical 17/99 aligned-lines 2075  Q9 Q12 Q15 Q20 Q27 Q28 Q41 Q51 Q83 Q87 Q88 Q90 Q91 Q94 Q96 Q97 Q98
+lines identical on baseline but not candidate: 0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=11
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=30 scan-type=28 parameterisation=30 aggregation-strategy=17 sort-strategy=31 parallelism=35 qual-placement=10 rendering=12
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=6 rendering=14
+CATEGORIES-EXCL-MATCH: join-order=61 join-method=28 scan-type=35 parameterisation=36 aggregation-strategy=23 sort-strategy=34 parallelism=47 qual-placement=7 rendering=15
+PLAN-PARITY: queries=99 match=28 shapediff=68 unparsed=0 missingnode=0 error=3 timeout=0
+PLAN-PARITY: queries=99 match=38 shapediff=58 unparsed=0 missingnode=0 error=3 timeout=0
+== regress A/B (with subselect union join aggregates window): unchanged except join.sql known row flap / line reorder

@@ -55,7 +55,7 @@ decision point:
 | M0146-0007 inline_cte | 0 | 8 | 7 | **15** |
 | M0146-0009 statistics (grouping election) | 1 | 4 | 4 | 9 |
 | M0146-0011 lateral / parameterised | 1 | 2 | 2 | 5 |
-| **new** M0146-0016 Subquery Scan retention | 0 | 3 | 3 | 6 |
+| **new** M0146-0016 Subquery Scan retention (renumbered M0146-0026 — the presorted-split task landed under 0016 first) | 0 | 3 | 3 | 6 |
 | **new** M0146-0017 WindowAgg sort sharing | 0 | 2 | 2 | 4 |
 | **new** M0146-0018 Group node | 0 | 2 | 2 | 4 |
 | **new** M0146-0019 index-only scan where goopg seq-scans | 1 | 1 | 1 | 3 |

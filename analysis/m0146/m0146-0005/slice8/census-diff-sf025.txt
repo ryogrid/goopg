@@ -1,0 +1,4 @@
+12c12
+< Q14 depth=2 [join-method] under CTE: PG Hash Join Inner | goopg Merge Join Inner
+---
+> Q14 depth=2 [join-order] under CTE: PG Hash Join Inner | goopg Hash Join Inner

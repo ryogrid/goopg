@@ -80,7 +80,8 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 	for i, rel := range s.joinrels[1] {
 		rel.ConsiderParallel = false
 		if s.parallelModeOK && i < len(s.relInfos) {
-			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat)
+			rel.ConsiderParallel = relConsiderParallel(rel.baseLeaf, s.relInfos[i].table, cat) &&
+				heldBaseQualsParallelSafe(s.clausesAll(), rel.Relids, cat)
 			// M0145-0004: an appendrel leaf's rtekind arm is opaque to
 			// relConsiderParallel — a *SetOp leaf reads as `other` and
 			// fails closed. PG computes the appendrel's safety by walking
@@ -109,6 +110,27 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 			p.ParallelSafe = rel.ParallelSafeForPath()
 		}
 	}
+}
+
+// heldBaseQualsParallelSafe is the rest of set_rel_consider_parallel's
+// baserestrictinfo walk (allpaths.c:748). A conjunct carrying a sublink is
+// held in the search's clause list rather than pushed into the leaf's
+// Filter (partitionConjunctsForJoinPlanning), so relConsiderParallel never
+// sees it — yet in PG a qual referencing only this rel IS one of its
+// baserestrictinfo, and a correlated SubPlan in it (outer PARAM_EXECs, so
+// `subplan->parallel_safe` is false) makes the rel parallel-restricted. TPC-DS
+// Q41's `(SubPlan 1) > 0` on `item i1` ran in a Parallel Seq Scan; PG scans
+// it serially (M0146-0005dh).
+func heldBaseQualsParallelSafe(clauses []*restrictInfo, relids RelSet, cat catalog.Catalog) bool {
+	for _, ri := range clauses {
+		if ri == nil || ri.relids == 0 || !relsSubset(ri.relids, relids) {
+			continue
+		}
+		if !isParallelSafeExpr(ri.clause, cat) {
+			return false
+		}
+	}
+	return true
 }
 
 // ParallelSafeForPath is the value `create_*_path` stamps on a childless path
@@ -441,7 +463,7 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 		return true
 	}
 	safe := true
-	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+	ok := walkExprRefs(e, scopeSignal, exprVisitor{
 		Visit: func(x Expr) bool {
 			if !safe {
 				return false
@@ -454,14 +476,12 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 			case *OuterColumnRef, *ExecParamRef:
 				safe = false
 			}
-			// A SubPlan in any of its forms: an expression that owns an
-			// inner-scope plan slot. Decided by the slot table rather than
-			// a type list so a sublink form added later is restricted by
-			// construction (the veto below is the walker's own backstop).
+			// A multi-assignment row subquery stays restricted: only the
+			// plain SubPlan forms are judged by their plan (OnScope below).
 			if safe {
 				if slots, ok := exprChildSlots(x); ok {
 					for _, sl := range slots {
-						if sl.kind == slotInnerPlan || sl.kind == slotSubqRow {
+						if sl.kind == slotSubqRow {
 							safe = false
 							break
 						}
@@ -470,9 +490,110 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 			}
 			return safe
 		},
+		// max_parallel_hazard_walker's SubPlan arm (clauses.c): a SubPlan
+		// is restricted unless its plan is parallel_safe; the test
+		// expression (the operand) is walked as usual by the Visit above.
+		// M0146-0002f.
+		OnScope: func(p Node) {
+			if safe && !subPlanParallelSafe(p, cat) {
+				safe = false
+			}
+		},
 		OnUnknown: func(Expr) { safe = false },
 	})
 	return ok && safe
+}
+
+// gatherPushableConjunct reports whether a restriction may be moved below a
+// Gather, i.e. evaluated inside the workers. PG only ever places a qual there
+// when it is parallel-safe: a rel whose restrictinfo is not is_parallel_safe
+// gets consider_parallel = false (set_rel_consider_parallel, allpaths.c), so
+// no partial path — and no Gather — ever sits beneath it. The qual pushdown
+// passes run without a catalog, so this is isParallelSafeExpr with a nil
+// catalog plus a fail-closed rule for the one thing a nil catalog cannot
+// judge: a function that is not a builtin (a user routine's proparallel is
+// unknown here) keeps the conjunct above the Gather. A SubPlan whose body
+// holds its own Gather is caught by isParallelSafeExpr (TPC-DS Q10's
+// EXISTS-over-Parallel-Hash-Join quals were planted under the statement's
+// Gather, nesting parallel plans inside workers — M0146-0005aq).
+func gatherPushableConjunct(c Expr) bool {
+	if !isParallelSafeExpr(c, nil) {
+		return false
+	}
+	builtinOnly := true
+	enumerated := WalkExprHostScope(c, func(x Expr) {
+		fc, ok := x.(*FuncCall)
+		if !ok {
+			return
+		}
+		bare := fc.Name
+		if i := strings.LastIndexByte(bare, '.'); i >= 0 {
+			bare = bare[i+1:]
+		}
+		if !catalog.IsBuiltinProcName(bare) {
+			builtinOnly = false
+		}
+	})
+	return enumerated && builtinOnly
+}
+
+// subPlanParallelSafe is make_subplan's `splan->parallel_safe`: the
+// subquery's plan is parallel-safe as a whole. A correlated body is not —
+// its outer references are PARAM_EXEC Params, parallel-restricted unless
+// an initplan supplies them — and neither is a body holding a Gather, a CTE
+// or worktable scan, a row lock, a temp or virtual relation, or any
+// parallel-restricted expression (nested SubPlans recurse through
+// isParallelSafeExpr). Unenumerated node kinds fail closed.
+//
+// The executor evaluates such a SubPlan inside the worker: sublink result
+// caches and hashed probe sets live on the worker's own Context
+// (NewWorkerContext creates them empty), and the plan itself is read-only.
+func subPlanParallelSafe(n Node, cat catalog.Catalog) bool {
+	if n == nil || subtreeHasUnsafeNode(n) {
+		return false
+	}
+	ok := true
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || !ok {
+			return
+		}
+		switch x := cur.(type) {
+		case *SeqScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *IndexScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *IndexOnlyScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *BitmapHeapScan:
+			ok = !tableIsUnsafeForParallel(x.Table)
+		case *Project, *Filter, *Join, *NestedLoopIndexJoin, *Aggregate, *Sort,
+			*Distinct, *DistinctOn, *Limit, *Values:
+		default:
+			ok = false
+		}
+		if !ok {
+			return
+		}
+		kids, known := planChildNodes(cur)
+		if !known {
+			ok = false
+			return
+		}
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(n)
+	if !ok {
+		return false
+	}
+	walkPlanExprs(n, func(e Expr) {
+		if ok && !isParallelSafeExpr(e, cat) {
+			ok = false
+		}
+	})
+	return ok
 }
 
 // funcCallIsParallelSafe resolves one call: a user routine by name through the
@@ -715,7 +836,7 @@ func parallelWorkerLadder(pages float64, minBlocks int64) int {
 // serial scan's shape with `parallel_workers > 0`, priced by cost_seqscan's
 // parallel arm. A partial path is always parallel-safe (`parallel_safe =
 // rel->consider_parallel`, and the caller has checked the rel).
-func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTuples float64, numQualOps, workers int) {
+func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTuples, numQualOps float64, workers int) {
 	cost, rows := costParallelSeqscan(cp, relPages, relTuples, rel.Rows, numQualOps, workers)
 	tgt, tgtKnown := scanPathTarget(rel)
 	addPartialPath(rel, &Path{

@@ -7,18 +7,12 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestFlattenPulledBodyTreeCTELeafGate pins M0145-0011 scope (c): the pulled
-// body's flat splice declines a `*CTEScan` leaf by default and admits it only
-// under `GOOPG_PULLUP_CTE_LEAF=on`.
-//
-// The DEFAULT arm is what this test mainly protects. The scope-(c) relaxation
-// is knob-arm measurement apparatus — M0145-0011 lands no relaxation — so a
-// future edit that makes the admission unconditional has to fail a test rather
-// than merely change a plan somewhere in a sweep. The decline REASON is pinned
-// too, because the census counts the reason string: the loop-41 baseline read
-// `any-body-leaf-(*optimizer.CTEScan)` 30 times over TPC-DS, and a silent
-// rename of that string would report the relaxation as a no-op.
-func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
+// TestFlattenPulledBodyTreeAdmitsCTELeaf pins M0145-0008ac's promotion of
+// M0145-0011 scope (c): the pulled body's flat splice admits a `*CTEScan` leaf
+// unconditionally, as PG treats a CTE reference in a sublink body as a base rel
+// of the pulled-up jointree. The splice must carry the CTE leaf itself, not a
+// substitute: the seam binds and prices it from its plan (M0145-0013).
+func TestFlattenPulledBodyTreeAdmitsCTELeaf(t *testing.T) {
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "pcl_t"}, []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
@@ -31,20 +25,9 @@ func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
 	cte := &CTEScan{Name: "c", Alias: "c", Child: cteBody, schema: tableSchema(tbl)}
 	body := &Join{Type: JoinTypeInner, Left: scan, Right: cte}
 
-	restore := pullupCTELeafEnabled
-	defer func() { pullupCTELeafEnabled = restore }()
-
-	pullupCTELeafEnabled = false
-	if _, _, why, ok := flattenPulledBodyTree(body, 2); ok {
-		t.Fatalf("default arm admitted a *CTEScan leaf; GOOPG_PULLUP_CTE_LEAF defaults off and the gate must decline")
-	} else if why != "body-leaf-(*optimizer.CTEScan)" {
-		t.Fatalf("decline reason = %q, want body-leaf-(*optimizer.CTEScan) — the census counts this string", why)
-	}
-
-	pullupCTELeafEnabled = true
 	leaves, _, why, ok := flattenPulledBodyTree(body, 2)
 	if !ok {
-		t.Fatalf("knob arm declined a *CTEScan leaf: why=%q", why)
+		t.Fatalf("flat splice declined a *CTEScan leaf: why=%q", why)
 	}
 	if len(leaves) != 2 {
 		t.Fatalf("leaves = %d, want 2", len(leaves))
@@ -55,9 +38,9 @@ func TestFlattenPulledBodyTreeCTELeafGate(t *testing.T) {
 }
 
 // TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines pins the NARROWNESS of
-// scope (c): the flag admits `*CTEScan` and nothing else. A `*Filter` over a
-// scan (the "needs unwrapping" case the decline comment names) must still
-// decline even with the knob on, because the splice's qual rebase assumes the
+// the flat splice: it admits `*SeqScan` and `*CTEScan` and nothing else. A
+// `*Filter` over a scan (the "needs unwrapping" case the decline comment
+// names) must still decline, because the splice's qual rebase assumes the
 // leaf emits exactly its own Output() and a Filter changes the row count
 // without changing the schema.
 func TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines(t *testing.T) {
@@ -72,12 +55,8 @@ func TestFlattenPulledBodyTreeNonCTEDerivedStillDeclines(t *testing.T) {
 	filtered := &Filter{Child: &SeqScan{Table: tbl, schema: tableSchema(tbl)}}
 	body := &Join{Type: JoinTypeInner, Left: scan, Right: filtered}
 
-	restore := pullupCTELeafEnabled
-	defer func() { pullupCTELeafEnabled = restore }()
-	pullupCTELeafEnabled = true
-
 	if _, _, why, ok := flattenPulledBodyTree(body, 2); ok {
-		t.Fatalf("knob arm admitted a *Filter leaf; scope (c) covers *CTEScan only")
+		t.Fatalf("flat splice admitted a *Filter leaf; only *SeqScan and *CTEScan are leaves")
 	} else if why != "body-leaf-(*optimizer.Filter)" {
 		t.Fatalf("decline reason = %q, want body-leaf-(*optimizer.Filter)", why)
 	}

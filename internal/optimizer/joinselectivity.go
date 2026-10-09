@@ -46,6 +46,7 @@ package optimizer
 import (
 	"math"
 	"math/bits"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -168,10 +169,25 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 		// so `tuples`/`rows` are the leaf's own.
 		if cr != nil && relids != 0 && relids&(relids-1) == 0 {
 			j := bits.TrailingZeros32(uint32(relids))
-			if j < len(s.relInfos) && s.relInfos[j].subqueryUniqueOutput {
-				v.isUnique = true
-				v.tuples = float64(s.relInfos[j].baseRows)
-				v.rows = float64(s.relInfos[j].filteredRows)
+			if j < len(s.relInfos) {
+				info := &s.relInfos[j]
+				// M0146-0009e: vardata->rel = find_base_rel(varno) is
+				// unconditional for a Var operand, so the leaf's own row
+				// estimates stand in even when no column statistics
+				// resolve — prefix derived leaves carry them in
+				// leafTuples/leafRows, pulled/synthetic derived leaves
+				// (table == nil) already carry EstimateRows in baseRows.
+				if info.leafTuples > 0 {
+					v.tuples = info.leafTuples
+					v.rows = info.leafRows
+				} else if info.table == nil {
+					v.tuples = float64(info.baseRows)
+					v.rows = float64(info.filteredRows)
+				}
+				if info.subqueryUniqueOutput || info.uniqueOutCols[cr.Name] {
+					v.isUnique = true
+				}
+				v.stats = s.derivedLeafColumnStats(j, cr.Name)
 			}
 		}
 		return v
@@ -180,7 +196,239 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	v.tuples = float64(info.baseRows)
 	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
+	// M0146-0009e: a derived leaf resolves `ok` through its binding's
+	// synthetic catalog.Table, but that table carries no statistics —
+	// columnStatsByName already returns nil for it. What the catalog path
+	// cannot supply is vardata->rel: PG's leaf is the derived rel itself,
+	// so its tuples are the leaf's own estimate, and the body's lone
+	// GROUP BY / DISTINCT key is isunique.
+	if info.leafTuples > 0 {
+		v.tuples = info.leafTuples
+		v.rows = info.leafRows
+		if info.uniqueOutCols[cr.Name] {
+			v.isUnique = true
+		}
+	}
+	if v.stats == nil {
+		v.stats = s.derivedLeafColumnStats(i, cr.Name)
+	}
 	return v
+}
+
+// derivedLeafColumnStats is `examine_simple_variable`'s RTE_SUBQUERY /
+// RTE_CTE recursion (selfuncs.c): a column of a derived leaf — a subquery or
+// a non-recursive CTE — takes the statistics of the base column the
+// sub-select's targetlist entry is a plain Var of. vardata->rel stays the
+// derived rel, so the caller keeps the leaf's own tuples and rows; only the
+// statistics tuple comes from below.
+//
+// goopg resolves over the planned body rather than the parse tree, through
+// resolveBaseColumn — whose arm list carries upstream's punts by
+// construction: no arm for set operations or DISTINCT, a GROUP BY
+// Aggregate refused, a Project crossed only for a bare column (an
+// expression target is not a Var). TPC-DS Q95's `ws_wh.ws_order_number`
+// resolves to web_sales.ws_order_number this way; without it the semi join
+// over the CTE punted to 0.5 and priced its nested loop as scanning the
+// whole CTE per outer row (M0146-0005dq).
+func (s *searchCtx) derivedLeafColumnStats(j int, name string) *catalog.ColumnStats {
+	rels := s.levelRels(1)
+	if j < 0 || j >= len(rels) || rels[j] == nil || rels[j].baseLeaf == nil || name == "" {
+		return nil
+	}
+	leaf := rels[j].baseLeaf
+	inner := leaf
+	for {
+		if f, isF := inner.(*Filter); isF && f.Child != nil {
+			inner = f.Child
+			continue
+		}
+		break
+	}
+	switch inner.(type) {
+	case *CTEScan, *SubqueryScan:
+	default:
+		return nil
+	}
+	pos := -1
+	for k, c := range leaf.Output() {
+		if strings.EqualFold(c.Name, name) {
+			if pos >= 0 {
+				return nil // ambiguous output name
+			}
+			pos = k
+		}
+	}
+	if pos < 0 {
+		return nil
+	}
+	ref, ok := resolveBaseColumn(pos, leaf)
+	if !ok || ref.table == nil {
+		return nil
+	}
+	return columnStatsByName(ref.table, ref.col)
+}
+
+// derivedLeafUniqueCols names the leaf output columns PG's
+// `examine_simple_variable` marks isunique for a FROM-clause derived leaf:
+// the leaf body's lone GROUP BY or DISTINCT(ON) key (selfuncs.c:5865-5883),
+// generalized to per-column form (M0146-0009e). Column names are read in the
+// leaf's own output schema so they match the probed ColumnRef.Name. Every
+// other shape — base scans, VALUES, function scans, set-ops, multi-key or
+// unkeyed bodies — returns nil, upstream's punting behavior.
+func derivedLeafUniqueCols(scan Node) map[string]bool {
+	// leaf-local *Filter wrappers do not reach uniqueness classification
+	// (a filter shrinks the leaf's rows but cannot change which of its
+	// output columns are unique). *SubqueryScan is deliberately NOT
+	// stripped here — it is a labeling wrapper whose schema carries the
+	// leaf's output names, which is the naming space the probed
+	// ColumnRef.Name lives in.
+	for {
+		if f, ok := scan.(*Filter); ok && f.Child != nil {
+			scan = f.Child
+			continue
+		}
+		break
+	}
+	var body Node
+	var out Schema
+	var st *cteOutputStats
+	switch x := scan.(type) {
+	case *CTEScan:
+		if x.cte == nil {
+			return nil
+		}
+		st = x.cte.outputStats()
+		out = x.Output()
+	case *SubqueryScan:
+		body = x.Child
+		out = x.Output()
+	case *Materialize:
+		// M0146-0010: transparent wrapper — analyse the child.
+		body = x.Child
+		out = x.Output()
+	case *Project:
+		// M0146-0120: a derived leaf whose trivial Subquery Scan was
+		// stripped reaches the search as the sub-select's own top Project;
+		// its output is the leaf's output, position for position. Over a
+		// base scan the walk below finds no grouping and answers nil.
+		body = x
+		out = x.Output()
+	default:
+		return nil
+	}
+	var uniq map[int]bool
+	if st != nil {
+		uniq = make(map[int]bool)
+		for i := range st.cols {
+			if st.cols[i].unique {
+				uniq[i] = true
+			}
+		}
+	} else {
+		uniq = loneKeyPositions(body, len(out))
+		// M0146-0120: examine_simple_variable recurses through a
+		// sub-select level that neither groups nor de-duplicates, into the
+		// sub-select its target Var reads, and marks isunique at the first
+		// level that has a lone GROUP BY / DISTINCT key on it (TPC-DS Q44:
+		// `asceding.item_sk` → v11 (a window) → v1's `GROUP BY ss_item_sk`).
+		for i := range out {
+			if !uniq[i] && derivedColumnIsUnique(i, body, 0) {
+				if uniq == nil {
+					uniq = map[int]bool{}
+				}
+				uniq[i] = true
+			}
+		}
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(uniq))
+	for i := range uniq {
+		if i < len(out) && out[i].Name != "" {
+			names[out[i].Name] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// derivedColumnIsUnique is `examine_simple_variable`'s recursion for the
+// isunique flag (selfuncs.c, RTE_SUBQUERY arm), over the planned body: the
+// column at output position idx of n is unique when the walk reaches a lone
+// GROUP BY key or the only DISTINCT / DISTINCT ON column. The walk crosses
+// what PG's recursion crosses — a level with no grouping and no DISTINCT,
+// whose target is a plain Var of a lower relation (a bare-column Project
+// target, the pass-through region of a WindowAgg, filters, sorts, limits,
+// gathers and scan wrappers, and either side of a join, as
+// resolveBaseColumn's coordinate rule maps it) — and stops, false, at
+// whatever PG stops at: any other grouping or DISTINCT, a set operation, an
+// expression target, or a base relation (a base column is never isunique
+// here: the recursion leaves the flag unset above a plain table).
+func derivedColumnIsUnique(idx int, n Node, depth int) bool {
+	if n == nil || idx < 0 || depth > 64 {
+		return false
+	}
+	switch x := n.(type) {
+	case *Aggregate:
+		return x.Mode != AggModePartial && len(x.GroupingSets) == 0 &&
+			len(x.GroupExprs) == 1 && idx == 0
+	case *Distinct:
+		return idx == 0 && len(x.Output()) == 1
+	case *DistinctOn:
+		return len(x.KeyCols) == 1 && idx == x.KeyCols[0]
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return derivedColumnIsUnique(cr.Index, x.Child, depth+1)
+			}
+		}
+		return false
+	case *WindowAgg:
+		if x.Child == nil || idx >= len(x.Child.Output()) {
+			return false
+		}
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Filter:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Sort:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Limit:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Gather:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Materialize:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *SubqueryScan:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *CTEScan:
+		return derivedColumnIsUnique(idx, x.Child, depth+1)
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return false
+		}
+		lw := len(x.Left.Output())
+		if idx >= lw {
+			return derivedColumnIsUnique(idx-lw, x.Right, depth+1)
+		}
+		return derivedColumnIsUnique(idx, x.Left, depth+1)
+	case *NestedLoopIndexJoin:
+		if x.Outer == nil {
+			return false
+		}
+		ow := len(x.Outer.Output())
+		if idx >= ow {
+			return derivedColumnIsUnique(idx-ow, x.Inner, depth+1)
+		}
+		return derivedColumnIsUnique(idx, x.Outer, depth+1)
+	}
+	return false
 }
 
 // resolveJoinVarColumn is the operand-RESOLUTION half of `examine_variable`:
@@ -399,6 +647,17 @@ func (s *searchCtx) joinClauseSelectivityExt(ri *restrictInfo) (float64, bool) {
 		return ri.normSelec, ri.normSelecDefault
 	}
 	sel, isdefault := s.joinClauseSelectivityExtUncached(ri)
+	// M0146-0005 slice 4: consider_new_or_clause's "hack cached selectivity
+	// so join size remains the same" — the redundant restrictions derived from
+	// this OR clause already reduced its relations' rows.
+	if ri != nil && s != nil && s.orClauseSelDivisor != nil {
+		if d, ok := s.orClauseSelDivisor[ri.clause]; ok && d > 0 {
+			sel /= d
+			if sel > 1 {
+				sel = 1
+			}
+		}
+	}
 	if ri != nil && s != nil {
 		ri.normSelec, ri.normSelecDefault, ri.normSelecValid = sel, isdefault, true
 	}
@@ -540,7 +799,7 @@ func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
 		return defaultUnhandledClauseSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows))
+	sel := eqSelectivityForColumn(stats, val, float64(s.relInfos[i].baseRows), col.Type.Name)
 	if bo.Op == parser.OpNe {
 		// `1 - eq` inherits the equality's flag, as the `OpNe` arm of
 		// `joinClauseSelectivityExtUncached` does for the join form.
@@ -573,7 +832,7 @@ func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 		return defaultUnhandledClauseSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows)); measured {
 		return sel, false
 	}
 	return defaultUnhandledClauseSel, true
@@ -626,10 +885,10 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 		}
 		var s2 float64
 		if isEquality {
-			s2 = eqSelectivityForColumn(stats, elem, tuples)
+			s2 = eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 		} else {
 			var measured bool
-			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats); !measured {
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples); !measured {
 				return decline()
 			}
 		}
@@ -686,6 +945,14 @@ func (s *searchCtx) joinClauseOperands(ri *restrictInfo, bo *BinaryOp) (joinVarS
 	if ri.isEquijoin {
 		return s.examineJoinVar(ri.leftKey, ri.leftRelids), s.examineJoinVar(ri.rightKey, ri.rightRelids)
 	}
+	if bo == ri.clause {
+		// M0146-0005bo: get_join_variables examines each operand against its
+		// own relation for every operator, so `a.x <> b.y` (neqjoinsel) reads
+		// both columns' statistics as `a.x = b.y` would. Before this the
+		// non-equijoin operands resolved to no relation and `<>` came out as
+		// 1 - DEFAULT_EQ_SEL (TPC-DS Q95's ws_wh: 0.995 where PG has 0.8).
+		return s.examineJoinVar(bo.Left, ri.opLeftRelids), s.examineJoinVar(bo.Right, ri.opRightRelids)
+	}
 	return s.examineJoinVar(bo.Left, 0), s.examineJoinVar(bo.Right, 0)
 }
 
@@ -735,7 +1002,20 @@ func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.Joi
 	switch bo.Op {
 	case parser.OpEq:
 		v1, v2 := s.semiJoinOperands(ri, bo, outer)
-		return eqJoinSelectivitySemi(v1, v2, relRows(inner))
+		sel, isdefault := eqJoinSelectivitySemi(v1, v2, relRows(inner))
+		// M0146-0009g: eqjoinsel's SEMI/ANTI arm (selfuncs.c:2417), after
+		// eqjoinsel_semi — a semijoin cannot yield more rows than the inner
+		// join of the same inputs, N1*Ssemi <= N1*N2*Sinner, so
+		// Ssemi <= N2*Sinner, with Sinner eqjoinsel_inner over the unclamped
+		// nds (computed "in all cases" before the jointype switch). TPC-DS
+		// Q23: a HAVING shrinks the grouped CTE to 4582 rows, and PG's 0.5
+		// punt becomes 4582/15993 = 0.2865.
+		if n2 := relRows(inner); n2 > 0 {
+			if selInner, _ := eqJoinSelectivityExt(v1, v2); n2*selInner < sel {
+				sel = n2 * selInner
+			}
+		}
+		return sel, isdefault
 	case parser.OpNe:
 		v1, _ := s.semiJoinOperands(ri, bo, outer)
 		nullfrac1 := 0.0
@@ -756,6 +1036,10 @@ func (s *searchCtx) joinClauseSelectivityForJoin(ri *restrictInfo, jt parser.Joi
 func (s *searchCtx) semiJoinOperands(ri *restrictInfo, bo *BinaryOp, outer *RelOptInfo) (joinVarStats, joinVarStats) {
 	v1, v2 := s.joinClauseOperands(ri, bo)
 	if ri.isEquijoin && outer != nil && !relsSubset(ri.leftRelids, outer.Relids) && relsSubset(ri.rightRelids, outer.Relids) {
+		return v2, v1
+	}
+	if !ri.isEquijoin && bo == ri.clause && outer != nil && ri.opLeftRelids != 0 && ri.opRightRelids != 0 &&
+		!relsSubset(ri.opLeftRelids, outer.Relids) && relsSubset(ri.opRightRelids, outer.Relids) {
 		return v2, v1
 	}
 	return v1, v2
@@ -806,7 +1090,7 @@ func eqJoinSelectivitySemi(v1, v2 joinVarStats, innerRows float64) (float64, boo
 	if v1.stats != nil {
 		nullfrac1 = v1.stats.NullFrac
 	}
-	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1)
+	sel := eqjoinselSemiCore(v1.stats, v2.stats, nd1, nd2, !isdefault1, !isdefault2, nullfrac1, v1.typeName, v2.typeName)
 	// The nd arms are a guess when EITHER nd was (upstream's
 	// `!isdefault1 && !isdefault2` gate picks the 0.5 branch otherwise); the
 	// MCV arm is a measurement whatever the nds were, because the matched
@@ -857,30 +1141,23 @@ func (s *searchCtx) residualSelectivity(residual []*restrictInfo) float64 {
 }
 
 // mergeJoinTuples is `final_cost_mergejoin`'s `mergejointuples`
-// (costsize.c:3960-4045): the number of tuples the merge operator actually
-// emits, before the non-merge quals filter them down to the joinrel's row
-// count.
+// (costsize.c:3960): `approx_tuple_count` over the path's MERGE clauses — the
+// cross product of the two input paths' rows times each merge clause's
+// selectivity, taken independently with inner-join semantics
+// (costsize.c:5300-5340). It is what the merge operator emits before the
+// residual quals filter it.
 //
-// Returns joinrelRows unchanged when there is no residual — the overwhelmingly
-// common case, and the one where the old code was already right.
-func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInfo, outerRows, innerRows float64) float64 {
-	if len(residual) == 0 || joinrelRows <= 0 {
-		return joinrelRows
+// It is computed from the clauses, not recovered from the joinrel's row
+// count: that count is clamped to at least one row, so dividing a clamped
+// estimate by the residual's selectivity inflated a one-row join's merge
+// output to 1/sel (TPC-DS Q47's `v1_lag ⋈ v1`: 200 where PG counts 1),
+// which then priced 199 phantom inner rescans (M0146-0005bd).
+func (s *searchCtx) mergeJoinTuples(mergeClauses []*restrictInfo, outerRows, innerRows float64) float64 {
+	sel := 1.0
+	for _, ri := range mergeClauses {
+		sel *= s.joinClauseSelectivity(ri)
 	}
-	sel := s.residualSelectivity(residual)
-	if sel <= 0 {
-		return joinrelRows
-	}
-	tuples := joinrelRows / sel
-	// The merge can never emit more pairs than the cross product; the clamp
-	// mirrors the one calcJoinrelSize applies to its own estimate.
-	if cross := math.Max(outerRows, 1) * math.Max(innerRows, 1); tuples > cross {
-		tuples = cross
-	}
-	if tuples < joinrelRows {
-		return joinrelRows
-	}
-	return tuples
+	return clampRowEst(outerRows * innerRows * sel)
 }
 
 // estimateHashBucketSize is `estimate_hash_bucket_stats` (selfuncs.c:4060)
@@ -905,11 +1182,15 @@ func (s *searchCtx) mergeJoinTuples(joinrelRows float64, residual []*restrictInf
 // cost the same — the degeneracy `reselectDegenerateHashKeys` was written to
 // work around (Q78's collapsed bucket, M0125-0035b).
 //
-// Returns 0 when no operand resolves to a statistic. 0 means "no information"
-// and the caller must skip the term entirely rather than substitute a guess:
-// inventing a bucket size without stats would move plans on nothing, which is
-// the failure this bundle keeps recording.
+// Returns 0 only when no hash clause has an inner-side operand. A key
+// without statistics is NOT skipped: like PG it gets the default ndistinct
+// and the 0.1 bucket (M0146-0005 slice 5).
 func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids RelSet) float64 {
+	// No search context (a hand-built unit-test pair) has no planner state
+	// to examine a key against: report "no information", as before.
+	if s == nil {
+		return 0
+	}
 	// PG takes the SMALLEST bucketsize over the hash clauses: "we use the
 	// smallest bucketsize estimated for any individual hashclause", because the
 	// most selective key is the one that spreads the table.
@@ -928,9 +1209,15 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 			continue
 		}
 		v := s.examineJoinVar(key, relids)
-		if v.stats == nil && !v.isBool {
-			continue
-		}
+		// M0146-0005 slice 5: no `continue` for a key without statistics.
+		// PG's estimate_hash_bucket_stats calls get_variable_numdistinct for
+		// every hash key; a stats-less key (a derived relation's GROUP BY
+		// output, an expression) comes back isdefault on a relation of 200+
+		// rows and takes the Max(0.1, mcv_freq) arm below — ten entries per
+		// bucket. Skipping it priced TPC-DS Q79's hash of a 1131-row
+		// aggregated subquery with no bucket walk at all (goopg 22509 vs
+		// PG's 37599 for the same join), so the hash join beat PG's
+		// nested loop into customer_pkey.
 		// `mcv_freq`: the first MCV entry is the most common value
 		// (ColumnStats.MCV is stored Frequency-desc, catalog.go:1809).
 		mcvFreq := 0.0
@@ -1083,5 +1370,5 @@ func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
 		// numeric column. Refuse rather than guess.
 		return 1
 	}
-	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName)
+	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName, histogramEqSel(cs, 0))
 }

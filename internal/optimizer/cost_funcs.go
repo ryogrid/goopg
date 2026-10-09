@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // envFloatDefault reads a float from the environment, returning def when unset
@@ -91,7 +92,16 @@ type costParams struct {
 	// enableSort is `enable_sort` (B-17a): cost_sort's own flag on top of the
 	// input's count (costsize.c:2144). The Sort producer is sortPathFor.
 	enableSort   bool
+	// enableIncrementalSort is `enable_incremental_sort`: create_ordered_paths
+	// gives a partially presorted input an Incremental Sort only when on
+	// (planner.c). M0146-0005bp.
+	enableIncrementalSort bool
 	enableMemoize bool
+	// enableMaterial is `enable_material`, a GENERATION gate in PG: the
+	// matpath is never created when it is off (joinpath.c:1897, :2135 —
+	// unlike the counted toggles above, the producer skips, and cost_material
+	// counts the disabled node only for paths admitted another way).
+	enableMaterial bool
 	// enableSeqScan / enableIndexScan / enableBitmapScan are `enable_seqscan`
 	// / `enable_indexscan` / `enable_bitmapscan` (B-17d): cost_seqscan's,
 	// cost_index's and cost_bitmap_heap_scan's own flags (costsize.c:295, 560,
@@ -150,11 +160,13 @@ func defaultCostParams() costParams {
 		enableMergeJoin: true,
 		enableNestLoop:  true,
 		enableSort:      true,
+		enableIncrementalSort: true,
 		enableSeqScan:   true,
 		enableIndexScan: true,
 		enableBitmapScan: true,
 		enableGatherMerge: true,
 		enableMemoize:   true,
+		enableMaterial:  true,
 		geqo:            GeqoEnabled(),
 		geqoThreshold:   GeqoThreshold(),
 		geqoEffort:      5,
@@ -193,9 +205,9 @@ func getParallelDivisor(workers int, leaderParticipates bool) float64 {
 // costSeqscan reproduces cost_seqscan (costsize.c:295): sequential page reads
 // plus per-tuple CPU. numQualOps is the number of operator evaluations per tuple
 // from the scan's restriction qual. The parallel arm is costParallelSeqscan.
-func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps int) Cost {
+func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps float64) Cost {
 	run := cp.seqPageCost*float64(relPages) +
-		(cp.cpuTupleCost+cp.cpuOperatorCost*float64(numQualOps))*relTuples
+		(cp.cpuTupleCost+cp.cpuOperatorCost*numQualOps)*relTuples
 	return Cost{Startup: 0, Total: run}
 }
 
@@ -211,10 +223,10 @@ func costSeqscan(cp costParams, relPages int64, relTuples float64, numQualOps in
 // is clamp_row_est(rows / divisor), "the number of tuples processed per
 // worker". C-19b (take3 08 §8): this is what makes a partial scan a REAL path
 // with a real cost rather than the post-pass's size rule.
-func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows float64, numQualOps, workers int) (Cost, float64) {
+func costParallelSeqscan(cp costParams, relPages int64, relTuples, rows, numQualOps float64, workers int) (Cost, float64) {
 	d := getParallelDivisor(workers, cp.parallelLeaderParticipation)
 	disk := cp.seqPageCost * float64(relPages)
-	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQualOps)) * relTuples / d
+	cpu := (cp.cpuTupleCost + cp.cpuOperatorCost*numQualOps) * relTuples / d
 	return Cost{Startup: 0, Total: disk + cpu}, clampRowEst(rows / d)
 }
 
@@ -504,6 +516,27 @@ func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inp
 // currency correction R120 shipped and R124 §7 deleted for measuring
 // net-neutral is reinstated permanently by owner ruling (see the tail
 // comment).
+// costAggSortedRollup is cost_agg's AGG_SORTED arm as create_groupingsets_path
+// (pathnode.c) charges it for a grouping-sets rollup (M0146-0009o). Unlike
+// costAgg it never turns an aggregate-free grouping into cost_group's Group
+// path: PG plans GROUP BY ROLLUP / GROUPING SETS through
+// create_groupingsets_path whether or not there are aggregates, so every
+// group pays its cpu_tuple_cost emit.
+func costAggSortedRollup(cp costParams, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int) Cost {
+	tuples := inputRows
+	if tuples < 0 {
+		tuples = 0
+	}
+	groups := numGroups
+	if groups < 1 {
+		groups = 1
+	}
+	per := cp.cpuOperatorCost * float64(nAggs)
+	total := inputTotal + per*tuples + cp.cpuOperatorCost*float64(numGroupCols)*tuples +
+		per*groups + cp.cpuTupleCost*groups
+	return Cost{Startup: inputStartup, Total: total}
+}
+
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
 	tuples := inputRows
 	if tuples < 0 {
@@ -517,6 +550,14 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	finalPerGroup := cp.cpuOperatorCost * float64(nAggs)
 	groupCmpPerTuple := cp.cpuOperatorCost * float64(numGroupCols)
 
+	if strategy == AggStrategySorted && nAggs == 0 && numGroupCols > 0 {
+		// M0146-0023: GROUP BY without aggregates is PG's Group path,
+		// priced by cost_group (costsize.c): the input plus one
+		// comparison per grouping column per input tuple — no per-group
+		// emit charge, unlike cost_agg's AGG_SORTED arm below.
+		return Cost{Startup: inputStartup,
+			Total: inputTotal + groupCmpPerTuple*tuples}
+	}
 	if strategy == AggStrategySorted {
 		// Streams: startup is the input's; total adds trans + grouping
 		// comparisons per input tuple, final + emit per group.
@@ -763,6 +804,22 @@ type hashJoinInputs struct {
 	// clause is charged per input row on both sides.
 	numHashClauses int
 
+	// hashQualCost is final_cost_hashjoin's `hash_qual_cost.per_tuple`:
+	// cost_qual_eval over the hash clauses (hashClausesPerTuple), which the
+	// bucket walk pays per comparison. A key that is an expression
+	// (`(a - 53) = b`) costs its operators too (M0146-0116). Zero falls back
+	// to one cpu_operator_cost per clause.
+	hashQualCost float64
+
+	// qualPerTuple is final_cost_hashjoin's `qp_qual_cost.per_tuple`: the
+	// join's non-hash quals (joinQualPerTuple, correlated SubPlans priced per
+	// call). PG charges it with cpu_tuple_cost on hashjointuples — the
+	// matched outer rows of an inner-unique / semi / anti join, the hash
+	// clauses' approx_tuple_count otherwise — not on the join's output rows
+	// (M0146-0012a slice C: TPC-H Q17's correlated Join Filter pays 10 calls
+	// in PG, not one per output row).
+	qualPerTuple float64
+
 	// outerCols / innerCols are the COLUMN COUNTS of the two sides' rows.
 	//
 	// PG passes `pathtarget->width` in bytes here, because a PG hash entry is a
@@ -844,14 +901,24 @@ func (in hashJoinInputs) hashGeometryInputs(cp costParams) (float64, int64) {
 // as one that does not — which is the distinction that decides the plan.
 // leftdeep-joins 04 §4, 06 §5.
 func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
+	if in.final.uniquePathInner {
+		geoRows, geoMem := in.hashGeometryInputs(cp)
+		if g, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok && g.virtualBuckets > 0 {
+			in.innerBucketSize = 1.0 / float64(g.virtualBuckets)
+		}
+	}
 	// Build: read + hash every inner row, all before the first probe.
 	build := (cp.cpuOperatorCost*float64(in.numHashClauses)+cp.cpuTupleCost)*in.innerRows + in.inner.Total
 
 	startup := in.outer.Startup + build
 	// Probe: hash each outer key and walk its bucket; emit each match.
 	run := (in.outer.Total - in.outer.Startup) +
-		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows +
-		cp.cpuTupleCost*in.outputRows
+		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows
+
+	hashQual := in.hashQualCost
+	if hashQual == 0 {
+		hashQual = cp.cpuOperatorCost * float64(in.numHashClauses)
+	}
 
 	// The geometry the executor will pick for this build. Skew buckets and the
 	// parallel combined budget are absent on both sides alike (06 §6).
@@ -867,35 +934,49 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	// innerBucketSize == 0 means "no usable statistic"; the term is then
 	// SKIPPED rather than guessed, so a stats-less plan costs exactly as it did
 	// before this change.
-	if in.final.innerUnique {
+	if in.final.innerUnique || in.final.earlyExit {
 		// PG's rint() uses round-to-even. The factor was derived once in total
 		// relation coordinates; outerRows is this serial or partial candidate's
 		// path coordinate.
 		outerMatched := math.RoundToEven(in.outerRows * in.final.outerMatchFrac)
 		if in.innerBucketSize > 0 {
-			innerScanFrac := 2.0 / (1.0 + 1.0) // match_count is one for a unique inner.
+			innerScanFrac := 2.0 / (math.Max(1.0, in.final.matchCount) + 1.0)
 			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize * innerScanFrac)
-			run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-				outerMatched * bucketTuples * 0.5
+			run += hashQual * outerMatched * bucketTuples * 0.5
+		}
+		// PG's hashjointuples in this branch is outer_matched_rows, not the
+		// join's result cardinality (M0146-0005e); for ANTI it is the
+		// unmatched rows.
+		cpuPerTuple := cp.cpuTupleCost + in.qualPerTuple
+		if in.final.anti {
+			run += cpuPerTuple * (in.outerRows - outerMatched)
+		} else {
+			run += cpuPerTuple * outerMatched
 		}
 
 		// R91: final_cost_hashjoin prices unmatched inner-unique probes against
 		// PG's packed-tuple virtual buckets, not Goopg's map capacity. The
-		// existing cpuOperatorCost*numHashClauses remains this model's surrogate
-		// for hash_qual_cost.per_tuple; no general QualCost model is implied.
+		// bucket walk pays hash_qual_cost.per_tuple (hashQual).
 		geoRows, geoMem := in.hashGeometryInputs(cp)
 		if geometry, ok := pgHashGeometry(geoRows, in.innerWidth, geoMem); ok {
 			unmatched := in.outerRows - outerMatched
 			if unmatched > 0 {
 				bucketTuples := clampRowEst(in.innerRows / float64(geometry.virtualBuckets))
-				run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-					unmatched * bucketTuples * 0.05
+				run += hashQual * unmatched * bucketTuples * 0.05
 			}
 		}
-	} else if in.innerBucketSize > 0 {
-		bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
-		run += cp.cpuOperatorCost * float64(in.numHashClauses) *
-			in.outerRows * bucketTuples * 0.5
+	} else {
+		if in.innerBucketSize > 0 {
+			bucketTuples := clampRowEst(in.innerRows * in.innerBucketSize)
+			run += hashQual * in.outerRows * bucketTuples * 0.5
+		}
+		// PG's hashjointuples here is approx_tuple_count over the hash
+		// clauses and the two paths' own rows (M0146-0005e).
+		tuples := in.outputRows
+		if in.final.hashClauseSel > 0 {
+			tuples = clampRowEst(in.final.hashClauseSel * in.outerRows * in.innerRows)
+		}
+		run += (cp.cpuTupleCost + in.qualPerTuple) * tuples
 	}
 
 	// R108 is deliberately opt-in. PG decides hash-table batches using packed
@@ -1008,34 +1089,154 @@ func nestloopCost(cp costParams, outer, inner Cost, outerRows, innerRows, innerR
 	return Cost{Startup: startup, Total: startup + run}
 }
 
-// mergeJoinCost reproduces final_cost_mergejoin (costsize.c:3837) at milestone
-// fidelity: merge two already-costed (and sorted) inputs, charging a per-row
-// merge. A cost_sort on an unsorted input is added by the caller when the input's
-// pathkeys do not satisfy the merge clause (design ch. 06 §3.2) — the whole
-// reason pathkeys exist.
-func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64) Cost {
+// mergeInner describes the inner input of a merge join to mergeJoinCost:
+// what final_cost_mergejoin (costsize.c:3837) reads off the MergePath beyond
+// the two input costs.
+type mergeInner struct {
+	// qualOps is cost_qual_eval over the merge clauses, in units of
+	// cpu_operator_cost per comparison.
+	qualOps float64
+	// sorted: the merge sorts the inner explicitly (innersortkeys != NIL).
+	sorted bool
+	// markRestore is ExecSupportsMarkRestore on the inner path.
+	markRestore bool
+	// skipMarkRestore: a SEMI/ANTI (or unique-inner) merge whose every join
+	// clause is a merge clause never rewinds the inner (costsize.c:3895).
+	skipMarkRestore bool
+	// bytes is relation_byte_size of the inner path.
+	bytes float64
+}
+
+// mergeJoinCost is final_cost_mergejoin (costsize.c:3837) over two
+// already-costed inputs; a cost_sort on an unsorted input is the caller's
+// (it is part of `inner`/`outer` here, as initial_cost_mergejoin folds it
+// in). It returns the cost and PG's materialize_inner election.
+//
+//   - mergejoinscansel (take2 P2-12): the merge stops once one side passes
+//     the other's maximum key, so only that fraction of each input's run
+//     cost and rows is paid. 1 means "no information" and charges the full
+//     pass; the scaling can only reduce cost, so an unknown must not.
+//   - Rescans: every inner tuple matched more than once is re-fetched,
+//     `rescannedtuples = mergejointuples - inner_path_rows`, scaling the
+//     inner's run cost by `rescanratio`.
+//   - materialize_inner: a Material node above the inner costs
+//     cpu_operator_cost per (re)fetched tuple instead of re-running the
+//     inner. PG elects it when that is cheaper, when a presorted inner
+//     cannot mark/restore, or when an explicitly sorted inner exceeds
+//     work_mem.
+//   - The merge clauses cost their operators on every tuple read from
+//     either side (cost_qual_eval, not one comparison per row), and each
+//     merged tuple pays cpu_tuple_cost; the caller adds the residual quals.
+func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64, mi mergeInner) (Cost, bool) {
 	startup := outer.Startup + inner.Startup
-	// take2 P2-12, `mergejoinscansel` applied as final_cost_mergejoin does
-	// (costsize.c:3686-3745): a merge join stops once one side passes the
-	// other's maximum key, so only that FRACTION of each input's RUN cost is
-	// paid. Both branches of PG's sort/no-sort split scale the same way — the
-	// sort's own startup, which is where the full input read lives, is charged
-	// UNSCALED, and only the read-out portion scales. goopg's sortPathFor has
-	// that same shape, so applying the scaling to (Total - Startup) is correct
-	// whether or not the input needed sorting.
-	//
-	// 1 means "no information" and charges the full pass, i.e. the behaviour
-	// before this term. The scaling can only ever REDUCE cost, so an unknown
-	// must not be allowed to.
 	if outerEndSel <= 0 || outerEndSel > 1 {
 		outerEndSel = 1
 	}
 	if innerEndSel <= 0 || innerEndSel > 1 {
 		innerEndSel = 1
 	}
-	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel +
-		cp.cpuOperatorCost*(outerRows*outerEndSel+innerRows*innerEndSel) + cp.cpuTupleCost*outputRows
-	return Cost{Startup: startup, Total: startup + run}
+	innerPathRows := innerRows
+	if innerPathRows <= 0 {
+		innerPathRows = 1
+	}
+	outerScanRows := clampRowEst(outerRows * outerEndSel)
+	innerScanRows := clampRowEst(innerRows * innerEndSel)
+	innerRun := (inner.Total - inner.Startup) * innerEndSel
+	run := (outer.Total - outer.Startup) * outerEndSel
+
+	rescanned := 0.0
+	if !mi.skipMarkRestore {
+		rescanned = math.Max(outputRows-innerPathRows, 0)
+	}
+	rescanRatio := 1.0 + rescanned/innerScanRows
+	bare := innerRun * rescanRatio
+	mat := innerRun + cp.cpuOperatorCost*innerScanRows*rescanRatio
+	materialize := false
+	switch {
+	case mi.skipMarkRestore:
+	case cp.enableMaterial && mat < bare:
+		materialize = true
+	case !mi.sorted && !mi.markRestore:
+		materialize = true
+	case cp.enableMaterial && mi.sorted && mi.bytes > float64(cp.workMem):
+		materialize = true
+	}
+	if materialize {
+		run += mat
+	} else {
+		run += bare
+	}
+	run += cp.cpuOperatorCost * mi.qualOps * (outerScanRows + innerScanRows*rescanRatio)
+	run += cp.cpuTupleCost * outputRows
+	return Cost{Startup: startup, Total: startup + run}, materialize
+}
+
+// mergeInnerFor assembles mergeInner for a merge candidate whose (possibly
+// sorted) inner path is ip; sorted says the merge added the Sort, and
+// innerUnique is the pair's extra->inner_unique.
+func mergeInnerFor(ip *Path, sorted bool, jt parser.JoinType, innerUnique bool, mergeClauses, residual []*restrictInfo) mergeInner {
+	return mergeInner{
+		qualOps:         mergeClauseOps(mergeClauses),
+		sorted:          sorted,
+		markRestore:     execSupportsMarkRestore(ip),
+		skipMarkRestore: (jt == parser.JoinSemi || jt == parser.JoinAnti || innerUnique) && len(residual) == 0,
+		bytes:           relationByteSize(ip.Rows, pathAvgVarBytes(ip), pathNCols(ip)),
+	}
+}
+
+// mergeClauseOps is cost_qual_eval's per-tuple operator count over a merge
+// clause list.
+func mergeClauseOps(clauses []*restrictInfo) float64 {
+	var ops float64
+	for _, c := range clauses {
+		if c == nil || c.clause == nil {
+			ops++
+			continue
+		}
+		_, p := qualEvalOps(c.clause)
+		ops += p
+	}
+	return ops
+}
+
+// execSupportsMarkRestore is ExecSupportsMarkRestore (execAmi.c) on a path:
+// btree index scans, Material and Sort can rewind to a mark; nothing else
+// goopg plans can.
+func execSupportsMarkRestore(p *Path) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Kind {
+	case PathIndexScan, PathMaterial, PathSort:
+		return true
+	case PathPrebuilt:
+		switch leafBaseScan(p.node).(type) {
+		case *IndexScan, *IndexOnlyScan:
+			return true
+		}
+	}
+	return false
+}
+
+// mergeMaterialInner is the Material create_mergejoin_plan puts above an
+// inner PG's final_cost_mergejoin elected to materialize: the inner's own
+// cost plus cpu_operator_cost per tuple, "assum[ing] the materialize will
+// not spill to disk" (createplan.c:4663-4669).
+func mergeMaterialInner(sub *Path, cp costParams) *Path {
+	return &Path{
+		Kind:          PathMaterial,
+		Rel:           sub.Rel,
+		Rows:          sub.Rows,
+		Pathkeys:      sub.Pathkeys,
+		NCols:         sub.NCols,
+		AvgVarBytes:   sub.AvgVarBytes,
+		OutputWidth:   sub.OutputWidth,
+		Cost:          Cost{Startup: sub.Cost.Startup, Total: sub.Cost.Total + cp.cpuOperatorCost*sub.Rows},
+		ParallelSafe:  sub.ParallelSafe,
+		RequiredOuter: sub.RequiredOuter,
+		Children:      []*Path{sub},
+		DisabledNodes: sub.DisabledNodes,
+	}
 }
 
 // gatherCost reproduces cost_gather (costsize.c:446): a flat parallel_setup_cost

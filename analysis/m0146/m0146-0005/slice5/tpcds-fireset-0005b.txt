@@ -1,0 +1,11 @@
+FIRE-SET: baseline=cf721475f7d798bbd63f9e78be4175f18d0ac9e9 (4948f7ff34f6) candidate=worktree (71c8801a7997)
+PLAN-PARITY: queries=99 match=7 shapediff=64 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=83 join-method=55 scan-type=55 parameterisation=36 aggregation-strategy=40 sort-strategy=63 parallelism=73 qual-placement=25 rendering=23
+PLAN-PARITY: queries=99 match=7 shapediff=64 unparsed=0 missingnode=25 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=83 join-method=54 scan-type=57 parameterisation=36 aggregation-strategy=40 sort-strategy=63 parallelism=73 qual-placement=25 rendering=23
+FIRE-SET-TIMEOUTS: fires=Q47 Q57 Q64 Q77 Q83 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=8 shapediff=66 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=84 join-method=60 scan-type=58 parameterisation=41 aggregation-strategy=44 sort-strategy=68 parallelism=79 qual-placement=21 rendering=23
+PLAN-PARITY: queries=99 match=8 shapediff=66 unparsed=0 missingnode=22 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=84 join-method=58 scan-type=60 parameterisation=41 aggregation-strategy=44 sort-strategy=68 parallelism=79 qual-placement=21 rendering=23
+FIRE-SET-TIMEOUTS: fires=Q47 Q57 Q64 Q77 Q83 introduced=none unchanged=none missing=none

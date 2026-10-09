@@ -93,7 +93,11 @@ func TestGatherOverSetOpPlannerWinnerIdentity(t *testing.T) {
 	// real row count).
 	for _, name := range []string{"pq_setop_a", "pq_setop_b", "pq_setop_c"} {
 		if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: name}); ok {
-			tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 40000, Analyzed: true}
+			// The single column is the join key, measured unique
+			// (M0146-0005c: an unmeasured key is priced at PG's default
+			// 0.1 hash bucket and the partial hash joins are not chosen).
+			tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 40000, Analyzed: true,
+				Columns: []catalog.ColumnStats{{NDistinct: 100000}}}
 		}
 	}
 

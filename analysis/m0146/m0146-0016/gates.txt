@@ -1,0 +1,55 @@
+2026-09-27 — M0146-0016 gates (tree 2a32fb36d + this diff, staged index
+code_tree f78f78f5520997e75725f2228f99df1d5ef4775ea98b31f832b7712ae2209b25)
+
+Unit (package) tests
+  go test ./internal/optimizer/ ./internal/executor/
+    -> ok / ok
+    New pins:
+      optimizer: TestUpperSplitSortedTransportArmExprKey
+        (named literal group key files the sorted arm; worker-Sort
+        pathkeys are positional refs)
+      optimizer: TestUpperSplitSortedTransportArmRefusals re-pinned —
+        non-column key with NO output schema still declines
+        (fail-closed), DISTINCT-agg refusal unchanged
+      executor: TestSortKeyTransportExprKeyRendersSource
+        (`Sort Key: (substr(w_name, 1, 20))` — group expr via Arm S)
+      executor: TestPartialEmitSortedIdentity +sorted-gathermerge-exprkey
+        (serial-vs-merged identity, workers 1/2/4)
+
+Live probes (goopg :5533, tmp/m0146-0005v-data-tpcds-sf025 clone)
+  Q62: Finalize GroupAggregate -> Gather Merge -> Sort ->
+       Partial HashAggregate; Sort Key: (substr(warehouse.w_warehouse_name,
+       1, 20)), ship_mode.sm_type, web_site.web_name; 100 rows = oracle
+  Q99: same family; 90 rows = oracle
+  Q76: unchanged (column keys were always admissible; hashed split won)
+
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh
+  -> all packages ok (go test cache warm; initdb ran cold, 157s)
+
+scripts/tpch-spotcheck.sh
+  -> Q12 PASS rows=2, Q13 PASS rows=33; RESULT=PASS
+  gate-stamp: tpch-spotcheck PASS
+
+scripts/tpcds-sf025-regression.sh sweep
+  -> PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3
+  status-delta vs previous sweep: verdict-changes=none
+    runtime SLOWER Q75/Q74/Q39/Q67 (non-blocking channel; S-cold noise)
+  gate-stamp: tpcds-sf025 PASS
+
+ACCEPT_BASELINE=bench/tpch/baseline-digests.txt \
+  scripts/tpch-acceptance-arm.sh on tmp/arm-on-m0146-0016.txt
+  -> SUMMARY: 24 MATCH; VERDICT: PASS
+  gate-stamp: tpch-acceptance-arm PASS
+
+scripts/tpcds-fireset-gate.sh m0146-0016 tmp/fireset-m0146-0016
+  (artifacts copied to analysis/m0146/m0146-0016/fireset/)
+  SF0.25: baseline match=14, candidate match=14; parallelism 67->65;
+          fires=Q62 Q99, introduced=none, executions PASS
+  SF1:    baseline match=12, candidate match=12; parallelism 74->72;
+          fires=Q62 Q99, introduced=none, executions PASS
+  gate-stamp: tpcds-fireset PASS
+
+Movement: yes — the fireset channel: Q62 and Q99's plan-diff category
+sets dropped `parallelism` at both scales (the presorted arm now files
+where PG uses a parallel sorted transport). Match counts unchanged —
+the residual is the sorted-input partial variant (sort-strategy).

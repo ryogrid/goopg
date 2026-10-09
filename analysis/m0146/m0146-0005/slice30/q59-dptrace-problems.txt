@@ -1,0 +1,10 @@
+DPTRACE problem nrels=2 rels=store_sales,date_dim
+DPTRACE end top={date_dim+store_sales} pairs=1 declined=0 costs=1 status=ok
+DPTRACE problem nrels=3 rels=wss,store,d
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={d} | {store}
+DPTRACE end top={d+store+wss} pairs=4 declined=1 costs=3 status=ok
+DPTRACE problem nrels=3 rels=wss,store,d
+DPTRACE decline phase=1 lev=2 reason=no-join-clause pair={d} | {store}
+DPTRACE end top={d+store+wss} pairs=4 declined=1 costs=3 status=ok
+DPTRACE problem nrels=2 rels=y,x
+DPTRACE end top={x+y} pairs=1 declined=0 costs=1 status=ok

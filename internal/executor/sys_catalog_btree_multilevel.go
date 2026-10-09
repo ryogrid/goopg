@@ -96,17 +96,20 @@ func descendSysBtreeToLeaf(ctx *Context, rel storage.RelFileNode, rootBlk uint32
 			ctx.Pool.Unpin(slot)
 			return 0, fmt.Errorf("line ptr count blk %d: %w", cur, cerr)
 		}
-		// Slot 1 holds the minus-infinity downlink; its child is the
-		// leftmost candidate. Subsequent slots hold real (key, child)
+		// The first data slot holds the minus-infinity downlink; its
+		// child is the leftmost candidate. It is slot 1 on a rightmost
+		// page and slot 2 on a non-rightmost one, whose slot 1 is the
+		// high key (P_HIKEY). Subsequent slots hold real (key, child)
 		// pairs; pick the last slot whose key is ≤ newKey.
-		raw1, err := storage.PageGetItemRawNoCopy(page, 1)
+		first := firstDataSlot(page)
+		raw1, err := storage.PageGetItemRawNoCopy(page, first)
 		if err != nil {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
-			return 0, fmt.Errorf("read slot 1 of blk %d: %w", cur, err)
+			return 0, fmt.Errorf("read slot %d of blk %d: %w", first, cur, err)
 		}
 		next := decodeChildFromTID(raw1)
-		for i := uint16(2); i <= uint16(count); i++ {
+		for i := first + 1; i <= uint16(count); i++ {
 			raw, err := storage.PageGetItemRawNoCopy(page, i)
 			if err != nil {
 				slot.Unlock()
@@ -145,11 +148,14 @@ func collectAllLeafTuples(ctx *Context, rel storage.RelFileNode, rootBlk uint32,
 		}
 		slot.Lock()
 		page := slot.Page()
-		raw, err := storage.PageGetItemRawNoCopy(page, 1)
+		// The leftmost page of a level is not rightmost once the level
+		// has siblings: its slot 1 is then the high key.
+		first := firstDataSlot(page)
+		raw, err := storage.PageGetItemRawNoCopy(page, first)
 		if err != nil {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
-			return nil, fmt.Errorf("read slot 1 of blk %d: %w", cur, err)
+			return nil, fmt.Errorf("read slot %d of blk %d: %w", first, cur, err)
 		}
 		next := decodeChildFromTID(raw)
 		slot.Unlock()
@@ -271,26 +277,37 @@ func buildBulkSysBtreeLayout(sortedTuples [][]byte, tupleSize int, nkeyatts uint
 		}
 		leaves[li] = page
 	}
-	downlinks := make([][]byte, nLeaves)
-	downlinks[0] = buildSysBtreeMinusInfDownlink(1)
-	for li := 1; li < nLeaves; li++ {
-		downlinks[li] = buildSysBtreeInternalDownlink(leafGroups[li][0], uint32(li+1), nkeyatts)
+	return assembleSysBtreeLevels(leaves, leafGroups, nkeyatts, "bulk layout")
+}
+
+// assembleSysBtreeLevels stacks the internal levels over the leaves
+// (layoutSysBtreeInternalLevels — any height) and returns the whole file
+// image: meta(0), leaves(1..nLeaves), then the internal pages level by level.
+func assembleSysBtreeLevels(leaves [][]byte, leafGroups [][][]byte, nkeyatts uint16, what string) ([]byte, error) {
+	nLeaves := len(leaves)
+	children := make([]sysBtreeLevelChild, nLeaves)
+	for li := range leaves {
+		children[li] = sysBtreeLevelChild{block: uint32(li + 1)}
+		if li > 0 {
+			children[li].lowKey = leafGroups[li][0]
+		}
 	}
-	root, err := buildSysBtreeInternalRootPage(downlinks)
+	internal, rootBlock, level, err := layoutSysBtreeInternalLevels(children, uint32(nLeaves+1), nkeyatts)
 	if err != nil {
-		return nil, fmt.Errorf("bulk layout: internal root: %w", err)
+		return nil, fmt.Errorf("%s: internal levels: %w", what, err)
 	}
-	rootBlock := uint32(nLeaves + 1)
 	meta := make([]byte, storage.BlockSize)
-	if err := writeSysBtreeMetapageInPlace(meta, rootBlock, 1); err != nil {
-		return nil, fmt.Errorf("bulk layout: meta (multi): %w", err)
+	if err := writeSysBtreeMetapageInPlace(meta, rootBlock, level); err != nil {
+		return nil, fmt.Errorf("%s: meta (multi): %w", what, err)
 	}
-	out := make([]byte, 0, (nLeaves+2)*storage.BlockSize)
+	out := make([]byte, 0, (1+nLeaves+len(internal))*storage.BlockSize)
 	out = append(out, meta...)
 	for _, leaf := range leaves {
 		out = append(out, leaf...)
 	}
-	out = append(out, root...)
+	for _, pg := range internal {
+		out = append(out, pg...)
+	}
 	return out, nil
 }
 
@@ -386,34 +403,28 @@ func buildBulkSysBtreeLayoutVariable(sortedTuples [][]byte, nkeyatts uint16) ([]
 		leaves[li] = page
 	}
 
-	downlinks := make([][]byte, nLeaves)
-	downlinks[0] = buildSysBtreeMinusInfDownlink(1)
-	rootNeeded := len(downlinks[0]) + 4
-	for li := 1; li < nLeaves; li++ {
-		downlinks[li] = buildSysBtreeInternalDownlink(leafGroups[li][0], uint32(li+1), nkeyatts)
-		rootNeeded += len(downlinks[li]) + 4
-	}
-	if rootNeeded > leafPayload {
-		return nil, fmt.Errorf("bulk layout (variable): %d downlinks (%d bytes) exceed single internal root capacity (%d)",
-			len(downlinks), rootNeeded, leafPayload)
-	}
-	root, err := buildSysBtreeInternalRootPage(downlinks)
-	if err != nil {
-		return nil, fmt.Errorf("bulk layout (variable): internal root: %w", err)
-	}
-	rootBlock := uint32(nLeaves + 1)
-	meta := make([]byte, storage.BlockSize)
-	if err := writeSysBtreeMetapageInPlace(meta, rootBlock, 1); err != nil {
-		return nil, fmt.Errorf("bulk layout (variable): meta (multi): %w", err)
-	}
-	out := make([]byte, 0, (nLeaves+2)*storage.BlockSize)
-	out = append(out, meta...)
-	for _, leaf := range leaves {
-		out = append(out, leaf...)
-	}
-	out = append(out, root...)
-	return out, nil
+	return assembleSysBtreeLevels(leaves, leafGroups, nkeyatts, "bulk layout (variable)")
 }
+
+// rangeInts returns lo, lo+1, …, hi-1.
+func rangeInts(lo, hi int) []int {
+	out := make([]int, 0, max(hi-lo, 0))
+	for i := lo; i < hi; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// sysBtreeRebuildPin and sysBtreeRebuildPinNew are the rebuild's pin calls,
+// variables only so that a test can make one fail (M0146-0070).
+var (
+	sysBtreeRebuildPin = func(ctx *Context, tag storage.BufferTag) (*storage.Slot, error) {
+		return ctx.Pool.Pin(tag)
+	}
+	sysBtreeRebuildPinNew = func(ctx *Context, rel storage.RelFileNode) (*storage.Slot, storage.BlockNumber, error) {
+		return ctx.Pool.PinNew(rel)
+	}
+)
 
 // rebuildSysBtreeWithNewEntry is the fallback when an in-place leaf insert
 // returns ErrNoSpaceInPage on a multi-level tree. It re-collects every data
@@ -464,31 +475,59 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		return fmt.Errorf("rebuild: nblocks: %w", err)
 	}
 
-	for blk := 0; blk < nPages; blk++ {
-		var slot *storage.Slot
-		if storage.BlockNumber(blk) < curBlocks {
-			s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: storage.BlockNumber(blk)})
-			if perr != nil {
-				return fmt.Errorf("rebuild: pin blk %d: %w", blk, perr)
-			}
-			slot = s
-		} else {
-			s, newBlk, perr := ctx.Pool.PinNew(rel)
-			if perr != nil {
-				return fmt.Errorf("rebuild: extend at blk %d: %w", blk, perr)
-			}
-			if int(newBlk) != blk {
-				ctx.Pool.Unpin(s)
-				return fmt.Errorf("rebuild: PinNew returned blk %d, expected %d", newBlk, blk)
-			}
-			slot = s
-		}
+	// Write order (M0146-0070). The old loop pinned and wrote each block in
+	// ascending order: the metapage first, then the existing pages, and the
+	// new tail blocks were extended last. A PinNew failure (a victim-flush
+	// error, or the `PinNew returned blk` guard) therefore left a rewritten
+	// metapage and internal pages whose downlinks pointed past EOF, and the
+	// next descent failed `pin leaf blk N: short read`.
+	//
+	// The order now follows nbtree's rule (_bt_split, _bt_newroot): a page is
+	// written before anything that points to it.
+	//  1. Extend the file and write the new tail blocks. Nothing reaches them
+	//     yet; if a later step fails they stay unreachable, like the
+	//     trailing blocks a shrinking rebuild leaves behind.
+	//  2. Rewrite the existing non-meta blocks in ascending order. The bulk
+	//     layout puts the leaves at blocks 1..L and each internal level
+	//     after the one below it, so this is children before parents.
+	//  3. Rewrite the metapage last.
+	//
+	// Pages are pinned one at a time, as before: holding every pin at once
+	// fails on a small buffer pool ("no available buffer"). A pin failure
+	// in step 2 can still leave a tree that mixes old and new pages; no
+	// block it references lies past EOF any more (deferral ledger
+	// 2026-10-07).
+	write := func(slot *storage.Slot, blk int) {
 		slot.Lock()
-		src := imageBytes[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
-		copy(slot.Page(), src)
+		copy(slot.Page(), imageBytes[blk*storage.BlockSize:(blk+1)*storage.BlockSize])
 		ctx.Pool.MarkDirtyForceFPI(slot)
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
+	}
+	for blk := int(curBlocks); blk < nPages; blk++ {
+		s, newBlk, perr := sysBtreeRebuildPinNew(ctx, rel)
+		if perr != nil {
+			return fmt.Errorf("rebuild: extend at blk %d: %w", blk, perr)
+		}
+		if int(newBlk) != blk {
+			ctx.Pool.Unpin(s)
+			return fmt.Errorf("rebuild: PinNew returned blk %d, expected %d", newBlk, blk)
+		}
+		write(s, blk)
+	}
+	nExisting := nPages
+	if int(curBlocks) < nExisting {
+		nExisting = int(curBlocks)
+	}
+	for _, blk := range append(rangeInts(1, nExisting), 0) {
+		if blk >= nExisting {
+			continue
+		}
+		s, perr := sysBtreeRebuildPin(ctx, storage.BufferTag{Rel: rel, Block: storage.BlockNumber(blk)})
+		if perr != nil {
+			return fmt.Errorf("rebuild: pin blk %d: %w", blk, perr)
+		}
+		write(s, blk)
 	}
 	return nil
 }

@@ -1,0 +1,16 @@
+13c13
+< Q13 depth=4 [qual-placement] under Nested Loop: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q13 depth=1 [join-method] under Aggregate: PG Nested Loop Inner | goopg Merge Join Inner
+16c16
+< Q16 depth=3 [sort-strategy] under Aggregate: PG Sort | goopg Gather
+---
+> Q16 depth=4 [join-method] under Sort: PG Nested Loop Inner | goopg Merge Join Inner
+26c26
+< Q26 depth=2 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge
+---
+> Q26 depth=3 [parallelism] under Sort: PG Gather | goopg Merge Join Inner
+48c48
+< Q48 depth=2 [qual-placement] under Gather: PG Nested Loop Inner | goopg Nested Loop Inner
+---
+> Q48 depth=1 [parallelism] under Aggregate: PG Gather | goopg Merge Join Inner

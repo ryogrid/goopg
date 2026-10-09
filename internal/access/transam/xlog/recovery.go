@@ -1790,6 +1790,12 @@ type HeapVisiblePayload struct {
 const (
 	HeapVisibleSetAllVisible uint8 = 0x01
 	HeapVisibleSetAllFrozen  uint8 = 0x02
+	// HeapVisibleClearFrozenOnly clears ALL_FROZEN and keeps ALL_VISIBLE (a
+	// row lock); HeapVisibleDropRelation forgets the relation's whole map
+	// (TRUNCATE / DROP). A record with no flag clears both bits. The values
+	// are storage.VMWAL*, which the runtime map's WAL hook writes. M0146-0063.
+	HeapVisibleClearFrozenOnly uint8 = 0x04
+	HeapVisibleDropRelation    uint8 = 0x08
 )
 
 // EncodeHeapVisible encodes the M0080-0003 visibility-map
@@ -2298,15 +2304,21 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
-	case RecordKindHeapVisible, RecordKindBtreeReusePage, RecordKindBtreeMetaCleanup:
-		// Catalog/metadata-only records (M0080-0003 / M0080-0004).
-		// VM updates, page-recycle notifications, and metapage
-		// cleanup-XID advances do not require a physical replay
-		// step in goopg's current design — VM is recomputed by
-		// VACUUM after a crash and the cleanup-XID is informational
-		// (no producer site relies on its exact value across a
-		// crash). Records are recognised so a future hot-standby
-		// or VM-backed visibility path can consume them.
+	case RecordKindHeapVisible:
+		// M0146-0063: goopg's own visibility-map change record, written
+		// by the runtime map's WAL hook for every set and clear. Redo
+		// applies it to the _vm fork, which the server loads after
+		// replay, so the map survives a crash as PG's does.
+		if err := replayHeapVisible(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindBtreeReusePage, RecordKindBtreeMetaCleanup:
+		// Catalog/metadata-only records (M0080-0004). Page-recycle
+		// notifications and metapage cleanup-XID advances do not
+		// require a physical replay step in goopg's current design —
+		// the cleanup-XID is informational (no producer site relies on
+		// its exact value across a crash).
 		return false, nil
 	case RecordKindCheckpoint:
 		return false, nil
@@ -2889,9 +2901,8 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// M0131-S21a-2 part 3: every VACUUM page it marks all-visible, plus
 			// the freeze an INSERT does on a page it filled itself. goopg emits
 			// its own VM updates as the native RecordKindHeapVisible (payload[0]
-			// = 29), whose ApplyRecord arm is a documented no-op, so this arm is
-			// reached only by a real-PG record — and unlike the native one it
-			// really writes the visibility-map fork.
+			// = 29, replayHeapVisible since M0146-0063), so this arm is reached
+			// only by a real-PG record.
 			if err := replayDecodedXLogHeap2Visible(mgr, r, xlog); err != nil {
 				return false, err
 			}
@@ -4204,6 +4215,90 @@ func replayDecodedXLogHeap2Visible(mgr *storage.Manager, r Record, xlog *XLogDec
 	return mgr.WriteBlock(vmRef.Rel, vmRef.Block, vmPage)
 }
 
+// replayHeapVisible applies one native RecordKindHeapVisible record to the
+// relation's _vm fork (M0146-0063): visibilitymap_set's OR for a set record,
+// visibilitymap_clear for a clear, and an emptied fork for a dropped relation.
+// A clear or drop on a fork that does not exist has nothing to do; the fork is
+// not created for it (smgr's O_CREATE would materialise an empty one).
+func replayHeapVisible(mgr *storage.Manager, r Record) error {
+	p, err := DecodeHeapVisible(r.Payload)
+	if err != nil {
+		return err
+	}
+	heapRel := storage.RelFileNode{DBOid: p.Rel.DBOid, RelOid: p.Rel.RelOid}
+	vmRel := heapRel
+	vmRel.Fork = storage.VisibilityMapFork
+	if p.Flags&HeapVisibleDropRelation == 0 {
+		if err := zeroUnverifiableVMPage(mgr, vmRel, storage.VMBlockForHeapBlock(p.HeapBlk)); err != nil {
+			return err
+		}
+	}
+	switch {
+	case p.Flags&HeapVisibleDropRelation != 0:
+		if !mgr.Exists(vmRel) {
+			return nil
+		}
+		return mgr.TruncateRelationTo(vmRel, 0)
+	case p.Flags&HeapVisibleSetAllVisible != 0:
+		bits := uint8(storage.VMAllVisible)
+		if p.Flags&HeapVisibleSetAllFrozen != 0 {
+			bits |= storage.VMAllFrozen
+		}
+		ref := XLogBlockRef{Rel: vmRel, Block: storage.VMBlockForHeapBlock(p.HeapBlk)}
+		page, skip, err := redoVMPageForBlock(mgr, ref, storage.LSN(r.EndLSN))
+		if err != nil {
+			return fmt.Errorf("wal: heap-visible vm page: %w", err)
+		}
+		if skip {
+			return nil
+		}
+		changed, err := storage.VMPageSetBits(page, p.HeapBlk, bits)
+		if err != nil {
+			return fmt.Errorf("wal: heap-visible vm apply: %w", err)
+		}
+		if !changed {
+			return nil
+		}
+		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+		return mgr.WriteBlock(ref.Rel, ref.Block, page)
+	default:
+		if !mgr.Exists(vmRel) {
+			return nil
+		}
+		bits := uint8(storage.VMAllVisible | storage.VMAllFrozen)
+		if p.Flags&HeapVisibleClearFrozenOnly != 0 {
+			bits = storage.VMAllFrozen
+		}
+		return redoClearVMBitsForHeapBlock(mgr, heapRel, p.HeapBlk, bits)
+	}
+}
+
+// zeroUnverifiableVMPage is RBM_ZERO_ON_ERROR for a visibility-map page in
+// replayHeapVisible: a vm page that fails checksum verification is replaced by
+// an initialised (all-clear) one rather than failing recovery, as upstream's
+// redo reads the vm buffer (heap_xlog_visible). Clearing is the safe
+// direction: a cleared bit only costs a heap fetch. It covers a fork an older
+// binary's shutdown wrote without checksums. M0146-0063.
+func zeroUnverifiableVMPage(mgr *storage.Manager, vmRel storage.RelFileNode, vmBlk storage.BlockNumber) error {
+	if !mgr.Exists(vmRel) {
+		return nil
+	}
+	nblocks, err := mgr.NBlocks(vmRel)
+	if err != nil || vmBlk >= nblocks {
+		return err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	err = mgr.ReadBlock(vmRel, vmBlk, page)
+	var cerr *storage.ChecksumError
+	if !errors.As(err, &cerr) {
+		return err
+	}
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	return mgr.WriteBlock(vmRel, vmBlk, page)
+}
+
 // redoVMPageForBlock is the visibility-map counterpart of
 // redoHeapPageForBlock/redoExistingHeapPageForBlock: upstream reads the vm
 // buffer with RBM_ZERO_ON_ERROR and PageInits it when it comes back new
@@ -5287,9 +5382,18 @@ func replayExistingXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN st
 	return mgr.WriteBlock(block.Rel, block.Block, page)
 }
 
-// sizeOfXLHPFreezePlan is one xlhp_freeze_plan: xmax(4) + t_infomask2(2) +
-// t_infomask(2) + frzflags(1) + ntuples(2).
-const sizeOfXLHPFreezePlan = 11
+// sizeOfXLHPFreezePlan is sizeof(xlhp_freeze_plan) (heapam_xlog.h): xmax(4) +
+// t_infomask2(2) + t_infomask(2) + frzflags(1) + one byte of alignment padding
+// + ntuples(2). Both PG's emitter (log_heap_prune_and_freeze registers
+// `sizeof(xlhp_freeze_plan) * nplans`) and its redo / heapdesc.c (which cast
+// the block data to the struct array) use the padded size, so ntuples sits at
+// offset 10.
+const sizeOfXLHPFreezePlan = 12
+
+// sizeOfLegacyXLHPFreezePlan is the unpadded 11-byte plan goopg wrote before
+// M-NIGHTLY freeze-WAL (ntuples at offset 9). Replay still reads it so WAL
+// written by an older build recovers; see decodeXLogHeapPrune.
+const sizeOfLegacyXLHPFreezePlan = 11
 
 // decodeXLogHeapPrune parses a PG xl_heap_prune record's main data + block-0
 // sub-records into goopg's page-mutation inputs: the HOT redirect pairs, the
@@ -5321,13 +5425,21 @@ func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, dea
 		if _, e = read16(); e != nil { // pad2
 			return nil, nil, nil, nil, e
 		}
+		// Every field of a PG-layout block-0 payload is a multiple of two
+		// bytes, so its length is always even. The legacy goopg layout (one
+		// unpadded 11-byte plan, the only shape goopg ever wrote) is always
+		// odd: an odd length identifies it unambiguously.
+		planSize, ntuplesAt := sizeOfXLHPFreezePlan, 10
+		if len(blockData)%2 == 1 {
+			planSize, ntuplesAt = sizeOfLegacyXLHPFreezePlan, 9
+		}
 		for i := 0; i < int(nplans); i++ {
-			if off+sizeOfXLHPFreezePlan > len(blockData) {
+			if off+planSize > len(blockData) {
 				return nil, nil, nil, nil, fmt.Errorf("wal: truncated xlog heap-prune freeze plan")
 			}
-			ntuples := binary.LittleEndian.Uint16(blockData[off+9 : off+11])
+			ntuples := binary.LittleEndian.Uint16(blockData[off+ntuplesAt : off+ntuplesAt+2])
 			nFreezeTuples += int(ntuples)
-			off += sizeOfXLHPFreezePlan
+			off += planSize
 		}
 	}
 	if flags&xlhpHasRedirections != 0 {

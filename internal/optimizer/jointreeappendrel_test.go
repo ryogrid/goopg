@@ -93,6 +93,27 @@ func findSetOpLeaf(n Node) *SetOp {
 	return nil
 }
 
+// setOpLeafUnderGather reports whether the SetOp leaf sits below a Gather:
+// the partial Parallel Append candidate was not only filed but elected. The
+// elected partial SetOp is built from the path and carries no SETOP rel, so
+// a filing pin reads the election itself instead (M0146-0005e: PG's
+// approx_tuple_count made the fixture's parallel hash join the cheaper one).
+func setOpLeafUnderGather(n Node, under bool) bool {
+	if n == nil {
+		return false
+	}
+	if _, ok := n.(*SetOp); ok {
+		return under
+	}
+	_, isGather := n.(*Gather)
+	for _, k := range boundaryWalkChildren(n) {
+		if setOpLeafUnderGather(k, under || isGather) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSubqueryChainIsSimpleUnionAll pins the is_simple_union_all port:
 // every link UNION ALL, no ORDER BY / LIMIT / OFFSET / locking / WITH on
 // the chain head, no SetOpOperand grouping nodes, and a parenthesised
@@ -202,6 +223,11 @@ func TestAppendrelMemberScopeEngagesSearch(t *testing.T) {
 			t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
 		}
 		sr := carrier.setOpBranchRel()
+		if sr == nil && setOpLeafUnderGather(node, false) {
+			// The Parallel Append candidate won the election, which needs
+			// the member-scope forcing: legacy members file no partial.
+			return
+		}
 		if sr == nil {
 			t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
 		}
@@ -535,11 +561,11 @@ func TestWholeChainPartialPathIsGatherable(t *testing.T) {
 // serial Append-of-Gathers shape (TPC-DS Q71).
 //
 // The pin is at the PATH level, not the elected plan: on this fixture's
-// equal members the whole-chain Gather legitimately loses add_path's
-// cost-fuzz margin to a serial outer link over member-scope Gathers —
-// election is a cost verdict, and the corpus witness (Q71) elects it on
-// real stats on both arms. What must hold unconditionally is that the
-// candidate is FILED and RUNNABLE.
+// equal members the whole-chain Gather sits within add_path's cost-fuzz
+// margin of a serial outer link over member-scope Gathers, and election is
+// a cost verdict (since M0146-0005e the Gather wins here, as the corpus
+// witness Q71 does on real stats). What must hold unconditionally is that
+// the candidate is FILED and RUNNABLE.
 func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
 	withParallelOn(t, func() {
 		cat := appendrelTestCat(t)
@@ -555,6 +581,16 @@ func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
 			t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
 		}
 		sr := carrier.setOpBranchRel()
+		if sr == nil && setOpLeafUnderGather(node, false) {
+			// The whole-chain partial was elected and gathered, so it was
+			// filed and runnable; it must still be the stacked chain.
+			_, leftNested := leaf.Left.(*SetOp)
+			_, rightNested := leaf.Right.(*SetOp)
+			if !leftNested && !rightNested {
+				t.Fatalf("gathered chain leaf has no nested SetOp — children %T/%T", leaf.Left, leaf.Right)
+			}
+			return
+		}
 		if sr == nil {
 			t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
 		}

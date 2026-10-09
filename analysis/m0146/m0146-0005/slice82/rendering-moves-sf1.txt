@@ -1,0 +1,6 @@
+2d1
+< Q33     GroupAggregate rendering: Group Key text differs
+16d14
+< Q56     GroupAggregate rendering: Group Key text differs
+18d15
+< Q60     GroupAggregate rendering: Group Key text differs

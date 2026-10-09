@@ -1,0 +1,12 @@
+                    Table "public.inventory"
+        Column        |  Type   | Collation | Nullable | Default 
+----------------------+---------+-----------+----------+---------
+ inv_date_sk          | integer |           | not null | 
+ inv_item_sk          | integer |           | not null | 
+ inv_warehouse_sk     | integer |           | not null | 
+ inv_quantity_on_hand | integer |           |          | 
+Indexes:
+    "inventory_pkey" PRIMARY KEY, btree (inv_date_sk, inv_item_sk, inv_warehouse_sk)
+
+inv_date_sk|209
+inv_item_sk|4480

@@ -30,6 +30,8 @@ const (
 	groupAggSortedProducer    = "upper.groupagg.sort"
 	groupAggPlainProducer     = "upper.groupagg.plain"
 	groupAggSortedIdxProducer = "upper.groupagg.sortedidx"
+	groupAggSearchProducer    = "upper.groupagg.searchcand"
+	groupAggMergeProducer     = "upper.groupagg.mergeappend"
 )
 
 // createGroupingPaths is `create_grouping_paths` for the one aggregate
@@ -89,6 +91,27 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 		seed.Rows = sr.Rows
 	}
 
+	// M0146-0005u: `input_rel->cheapest_total_path` (planner.c:7122 — the
+	// same read the sorted arms make at :7460 and the hashed arm at :7584).
+	// The seam commits `child` to `finalPath`'s tuple_fraction pick, so
+	// under a LIMIT every arm above is priced over a startup-optimal
+	// subtree upstream's live input rel never offers — TPC-DS Q22's
+	// memoized NLI chain, where the rel's cheapest-total path is the
+	// costed Gather over the partial NL/PHJ subtree. When the searched
+	// input is reachable and that path can be rebuilt through the same
+	// boundary, the arms stand on it instead — the candidate set PG
+	// actually compares. The split producer keeps the committed child:
+	// its partial-agg costing is seeded from the serial subtree, and the
+	// new input's Gather arm already covers the case it would re-derive.
+	splitSeed, splitChild := seed, child
+	if c2, p := searchedCheapestTotalInput(child); c2 != nil {
+		ct := newPrebuiltPath(grouped, c2)
+		ct.Rows = p.Rows
+		ct.Cost = p.Cost
+		seed = ct
+		child = c2
+	}
+
 	addGroupingPaths(grouped, seed, aggNode, child, cat, cp, ps)
 	// C-19g's remainder (that design's §8): the PARALLEL candidate —
 	// `Finalize -> Gather -> Partial` — filed on this same rel and adjudicated
@@ -96,7 +119,17 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// stamped onto the finished tree by the `MaybeAddGather` post-pass.
 	// Declines to nothing under the default knob and under every fail-closed
 	// refusal in partialaggupper.go.
-	addPartialAggSplitPath(u, grouped, seed, aggNode, child, cp, ps)
+	//
+	// M0146-0005ap: the split stands on `input_rel->cheapest_partial_path`
+	// (planner.c:7435) when the search built one — the partial subtree PG
+	// aggregates per worker, priced at its own per-worker cost. Only when
+	// there is none does it fall back to the committed serial child, seeded
+	// by parallelSeedCost (M0146-0005u's route).
+	var splitPartial *Path
+	if c2, pp := searchedCheapestPartialInput(splitChild, cp); c2 != nil {
+		splitChild, splitPartial = c2, pp
+	}
+	addPartialAggSplitPath(u, grouped, splitSeed, aggNode, splitChild, cp, ps, splitPartial)
 	setCheapest(grouped)
 
 	best := getCheapestFractionalPath(grouped, tupleFraction)
@@ -126,7 +159,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 
 // sizeGroupingRelFromAgg is the §3.4 duty: a fresh GROUP_AGG rel prices a
 // spilling hash as an in-memory one unless its Rows/Width/NCols say
-// otherwise. Rows come from the PG-faithful `estimateNumGroups` (never
+// otherwise. Rows come from the PG-faithful `estimateAggregate` (never
 // below 1 — it divides by zero upstream otherwise); Width/NCols/AvgVarBytes
 // describe the aggregate OUTPUT, exactly as `sizeUpperRelFromNode` does for
 // sorts. (The spill arm reads INPUT width from the seed's child — §3.3 —
@@ -136,7 +169,14 @@ func sizeGroupingRelFromAgg(rel *RelOptInfo, aggNode *Aggregate) {
 		return
 	}
 	cols := aggNode.Output()
-	rel.Rows = float64(estimateNumGroups(aggNode.GroupExprs, aggNode.Child, groupCountInputRows(aggNode.Child)))
+	// estimateAggregate is get_number_of_groups (planner.c): plain GROUP BY
+	// estimates the group expressions once; GROUPING SETS / ROLLUP / CUBE
+	// add up estimate_num_groups over every set (M0146-0009o). Sizing the
+	// rel from the deduplicated union of the sets' expressions instead
+	// priced an N-set aggregate as one set — TPC-DS Q22's MixedAggregate
+	// at its input's 12154 rows where PG's four sets plus the grand total
+	// sum to 46681.
+	rel.Rows = float64(estimateAggregate(aggNode))
 	if rel.Rows < 1 {
 		rel.Rows = 1
 	}
@@ -438,11 +478,20 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		// to file the shared aggNode pointer, so the winner
 		// copy-back (`*aggNode = *built`) rewrote losers underneath
 		// future readers. Content-identical; behavior change: none.
+		// cost_agg reads the INPUT PATH's cost (costsize.c cost_agg), so a
+		// presorted plain aggregate pays for its Sort: charging the unsorted
+		// seed priced TPC-DS Q28's `Aggregate -> Sort -> Gather` below its
+		// own Sort and let it beat PG's per-worker `Sort` under a Gather
+		// Merge (M0146-0005ap).
+		plainStartup, plainTotal := inputStartup, inputTotal
+		if presorted {
+			plainStartup, plainTotal = input.Cost.Startup, input.Cost.Total
+		}
 		plainSpec := *aggNode
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+			Cost: costAgg(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
 				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
@@ -482,7 +531,136 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			}
 		}
 		if haveSortedCandidate {
-			if idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat); ok {
+			// M0146-0027: upstream's sorted arm iterates ALL of
+			// input_rel->pathlist (add_paths_to_grouping_rel,
+			// planner.c:7134) and make_ordered_path offers each input
+			// already sorted for the needed group ordering WITHOUT a
+			// Sort. The seed arms below price only cheapest_total_path,
+			// which is precisely the path that cannot carry the ordering
+			// when a runner-up can — TPC-DS Q17's searched pathlist holds
+			// a pathkeys=3 ordered nested loop (and a gather.merge.sort)
+			// covering the group keys exactly, and the GroupAggregate's
+			// Sort only disappears when that path reaches this contest.
+			// Each candidate's ordering claim is re-earned against the
+			// input node's published schema (validatedSearchCandidateKeys)
+			// and its emission re-proven through the boundary
+			// (searchedCandidateInput declines on any shape the seam
+			// cannot reproduce) — nothing here can elect a path whose
+			// ordering or row the committed input would not have carried.
+			// M0146-0005ap: the Sort over cheapest_total_path is filed FIRST.
+			// Upstream walks input_rel->pathlist in ascending total-cost
+			// order (add_path keeps it sorted), so the cheapest-total input —
+			// sorted here — is offered before any presorted runner-up, and a
+			// runner-up within STD_FUZZ_FACTOR of it loses the tie (TPC-DS
+			// Q93: PG's `Sort -> Gather` beats a per-worker Sort under a
+			// Gather Merge by 0.03).
+			idxChild, idxSpec, ok := indexOrderedAggInput(aggNode, child, cat)
+			// M0146-0005bw: add_paths_to_grouping_rel's is_sorted test
+			// (planner.c) — an input path whose pathkeys already contain the
+			// group pathkeys feeds AGG_SORTED with no Sort. The finished child
+			// carries its ordering only as a derivation (inputNodePathkeys:
+			// a CTE scan over a sorted body, a sorted aggregate, a Sort); the
+			// searched-input candidates below cover the join-search case.
+			isSorted := false
+			if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
+				pathkeysContainedIn(seedKeys, pathkeysForSortKeys(keys)) {
+				sorted := *seed
+				sorted.Pathkeys = seedKeys
+				presortedSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
+						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sorted.Pathkeys, Children: []*Path{&sorted},
+				}, groupAggSortedProducer)
+				isSorted = true // upstream offers no Sort over this same path
+			}
+			if !ok && !isSorted {
+				// M0144-0003c: narrowed seed — see sortSeed above.
+				// M0146-0006: make_ordered_path (planner.c) sorts the cheapest
+				// input incrementally when its pathkeys already deliver a
+				// leading prefix of the group keys and enable_incremental_sort
+				// is on, and fully otherwise — never both. TPC-DS Q64's
+				// cross_sales CTE groups an item-ordered input:
+				// `GroupAggregate <- Incremental Sort (Presorted Key:
+				// item.i_item_sk)`.
+				groupPathkeys := pathkeysForSortKeys(keys)
+				var sortedInput *Path
+				if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
+					if _, n := pathkeysCountContainedIn(seedKeys, groupPathkeys); n > 0 {
+						incSeed := *sortSeed
+						incSeed.Pathkeys = seedKeys
+						sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
+					}
+				}
+				if sortedInput == nil {
+					sortedInput = sortPathForBounded(sortSeed, groupPathkeys, cp, -1)
+				}
+				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+				sortSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+					Rel: grouped, Rows: numGroups,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+				}, groupAggSortedProducer)
+			}
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				groupPathkeys := pathkeysForSortKeys(keys)
+				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+				for i, cand := range sr.Pathlist {
+					if i >= len(candKeys) {
+						continue
+					}
+					// make_ordered_path: a presorted runner-up feeds the
+					// aggregate as-is, a partially presorted one through an
+					// Incremental Sort (M0146-0006), and one with no
+					// presorted key is not offered (only the cheapest input
+					// is fully sorted, above).
+					contained, nCommon := pathkeysCountContainedIn(candKeys[i], groupPathkeys)
+					if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
+						continue
+					}
+					cNode := searchedCandidateInput(child, cand)
+					if cNode == nil {
+						continue
+					}
+					cs := newPrebuiltPath(grouped, cNode)
+					cs.Rows = inputRows
+					cs.Cost = cand.Cost
+					cs.Pathkeys = candKeys[i]
+					in := cs
+					if !contained {
+						in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
+					}
+					candSpec := *aggNode
+					addPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
+						Rel: grouped, Rows: numGroups,
+						Cost: costAgg(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
+							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inNcols, inAvgVar),
+						Pathkeys: groupPathkeys, Children: []*Path{in},
+					}, groupAggSearchProducer)
+				}
+			}
+			// M0146-0005au: a UNION ALL input whose members already emit
+			// the group ordering is merged rather than sorted — the Merge
+			// Append generate_orderedappend_paths files on the appendrel,
+			// which add_paths_to_grouping_rel then takes as presorted input.
+			if _, ma := orderedAppendInput(seed.Rel, child, keys, cp); ma != nil {
+				maSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &maSpec,
+					Rel: grouped, Rows: numGroups,
+					DisabledNodes: ma.DisabledNodes,
+					Cost: costAgg(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
+						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inNcols, inAvgVar),
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{ma},
+				}, groupAggMergeProducer)
+			}
+			if ok {
 				// The index-driven variant: no Sort, narrowed spec. The spec
 				// is the builder's clone (remapped to narrowed positions);
 				// the input price is the index child's own.
@@ -508,18 +686,103 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
-			} else {
-				// M0144-0003c: narrowed seed — see sortSeed above.
-				sortedInput := sortPathForBounded(sortSeed, pathkeysForSortKeys(keys), cp, -1)
-				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
-				sortSpec := *aggNode
+			}
+		}
+	}
+
+	// SORTED ROLLUP (M0146-0020a): consider_groupingsets_paths' is_sorted
+	// arm for a single rollup — every set contained in the next — computed
+	// in one pass over input sorted on the rollup order. M0146-0020b: with
+	// several rollups (CUBE, disjoint GROUPING SETS) the first reads the
+	// sorted input and each later one sorts it again (AGG_SORTED's chain). Priced as
+	// create_groupingsets_path prices one rollup: cost_agg(AGG_SORTED) over
+	// the longest set's columns and every set's groups. Offered first, as
+	// PG's sorted arm precedes its hashed one. The path carries the
+	// rollup's group_pathkeys, as create_groupingsets_path gives a single
+	// sorted rollup, but marked GroupingNulled: PG 18's grouped outputs are
+	// RTE_GROUP expressions nullable by the grouping step, so those keys
+	// never satisfy an ORDER BY over them and a Sort stays above (TPC-DS
+	// Q27: `Sort -> GroupAggregate`). They still make add_path keep the
+	// rollup beside a hashed MixedAggregate with a better startup, so the
+	// Sort above elects between the two on total cost (TPC-DS Q18,
+	// M0146-0009o).
+	if aggNode.GroupingSets != nil && !groupingHasSpecialAgg(aggNode) {
+		if rkeys, ok := rollupSortKeys(aggNode); ok {
+			rollupPathkeys := pathkeysForSortKeys(rkeys)
+			// M0146-0020b: several rollups leave the output unordered
+			// (create_groupingsets_path keeps group_pathkeys for one).
+			var outKeys []PathKey
+			if len(aggNode.Rollups) <= 1 {
+				outKeys = groupingNulledPathkeys(rollupPathkeys)
+			}
+			// create_groupingsets_path adds each later rollup's sort to the
+			// input's disabled nodes (cost_sort counts enable_sort = off).
+			rollupSortsDisabled := 0
+			if !cp.enableSort && len(aggNode.Rollups) > 1 {
+				rollupSortsDisabled = len(aggNode.Rollups) - 1
+			}
+			// M0146-0020b: beside each sorted path, consider_groupingsets_paths'
+			// AGG_MIXED one over the same input — the knapsack-chosen
+			// rollups hashed, the rest sorted (MixedAggregate).
+			mixedHashed, mixedSorted, mixedOK := mixedGroupingRollups(cp, aggNode, sortSeed, inputRows)
+			addMixed := func(input *Path, inDisabled int, producer string) {
+				if !mixedOK {
+					return
+				}
+				mSpec := *aggNode
+				mSpec.Rollups = mixedSorted
+				mSpec.HashedRollups = mixedHashed
+				c, dis, ok := costMixedRollups(cp, &mSpec, mixedHashed, mixedSorted, sortSeed, inputRows,
+					input.Cost.Startup, input.Cost.Total, inNcols, inAvgVar, ps.EnableHashAgg)
+				if !ok {
+					return
+				}
 				addPath(grouped, &Path{
-					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &mSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
-					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-				}, groupAggSortedProducer)
+					DisabledNodes: inDisabled + dis,
+					Cost:          c,
+					Children:      []*Path{input},
+				}, producer)
+			}
+			sortedInput := sortPathForBounded(sortSeed, rollupPathkeys, cp, -1)
+			addMixed(sortedInput, sortedInput.DisabledNodes, groupAggSortedProducer)
+			rSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &rSpec,
+				Rel: grouped, Rows: numGroups,
+				DisabledNodes: sortedInput.DisabledNodes + rollupSortsDisabled,
+				Pathkeys:      outKeys,
+				Cost: costSortedRollups(cp, &rSpec, sortSeed, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+					len(rkeys), numGroups),
+				Children: []*Path{sortedInput},
+			}, groupAggSortedProducer)
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+				for i, cand := range sr.Pathlist {
+					if i >= len(candKeys) || !pathkeysContainedIn(candKeys[i], rollupPathkeys) {
+						continue
+					}
+					cNode := searchedCandidateInput(child, cand)
+					if cNode == nil {
+						continue
+					}
+					cs := newPrebuiltPath(grouped, cNode)
+					cs.Rows = inputRows
+					cs.Cost = cand.Cost
+					cs.Pathkeys = candKeys[i]
+					addMixed(cs, cand.DisabledNodes, groupAggSearchProducer)
+					cSpec := *aggNode
+					addPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &cSpec,
+						Rel: grouped, Rows: numGroups,
+						DisabledNodes: cand.DisabledNodes + rollupSortsDisabled,
+						Pathkeys:      outKeys,
+						Cost: costSortedRollups(cp, &cSpec, sortSeed, inputRows, cs.Cost.Startup, cs.Cost.Total,
+							len(rkeys), numGroups),
+						Children: []*Path{cs},
+					}, groupAggSearchProducer)
+				}
 			}
 		}
 	}
@@ -528,18 +791,108 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
 	// Grouping sets always hash (today's fall-through; executor has one
 	// hash table per set).
-	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
+	if (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) &&
+		!groupingSetsHashTooBig(cp, aggNode, seed, numGroups) {
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
+		hashCost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar)
+		if aggNode.GroupingSets != nil {
+			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inNcols, inAvgVar); ok {
+				hashCost = c
+			}
+		}
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: numGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-				len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar),
-			Children: []*Path{seed},
+			Cost:          hashCost,
+			Children:      []*Path{seed},
 		}, groupAggHashedProducer)
 	}
+}
+
+// groupingSetsHashTooBig is consider_groupingsets_paths' unsorted-arm check
+// (planner.c): every set hashed must fit hash_mem
+// (estimate_hashagg_tablesize over the grouped rel's rows), or no all-hashed
+// path is made and the sorted arm's sorted or mixed paths stand
+// (M0146-0020b). Only grouping sets with a sorted path to fall back on are
+// gated; PG does not gate when no set is sortable either.
+func groupingSetsHashTooBig(cp costParams, a *Aggregate, seed *Path, numGroups float64) bool {
+	if a.GroupingSets == nil || cp.workMem <= 0 || groupingHasSpecialAgg(a) {
+		return false
+	}
+	if _, ok := rollupSortKeys(a); !ok {
+		return false
+	}
+	size := hashAggEntrySize(len(a.Aggs), float64(pathWidth(seed))) * numGroups
+	return size > float64(cp.workMem)
+}
+
+// groupingSetsHashedCost prices consider_groupingsets_paths' all-hashed path
+// the way create_groupingsets_path (pathnode.c) prices its rollups
+// (M0146-0009o): one hashed rollup per non-empty grouping set, each with its
+// own column count and group count, and the empty sets `()` as one
+// non-hashed rollup of their own, which makes the strategy AGG_MIXED.
+//
+//   - The first rollup reads the input: cost_agg over the input's costs.
+//     Under AGG_MIXED cost_agg's CPU arm is the sorted one (output on the
+//     fly, startup = the input's startup) while the hash spill tail still
+//     applies, so its startup is the input's plus the spill writes.
+//   - Every later hashed rollup adds cost_agg(AGG_HASHED) with no input
+//     cost; the empty-set rollup adds cost_agg(AGG_SORTED) over zero
+//     columns, likewise without input cost.
+//
+// Pricing the whole aggregate as one hash over the union of the sets'
+// columns, with the summed group count, charged every set's groups to one
+// table and lost the regress `groupingsets` cases' MixedAggregate to a
+// Sort-fed GroupAggregate once the summed count reached the input.
+func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup, inputTotal float64, inNcols int, inAvgVar float64) (Cost, bool) {
+	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
+	if !ok {
+		return Cost{}, false
+	}
+	nAggs := len(a.Aggs)
+	empty := 0
+	for _, set := range a.GroupingSets {
+		if len(set) == 0 {
+			empty++
+		}
+	}
+	mixed := empty > 0
+	first := true
+	var cost Cost
+	for i, set := range a.GroupingSets {
+		if len(set) == 0 {
+			continue
+		}
+		g := float64(perSet[i])
+		if first {
+			cost = costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(set), g, nAggs, inNcols, inAvgVar)
+			if mixed {
+				// cost_agg AGG_MIXED: the sorted arm's startup plus the
+				// spill tail's startup share (the hashed arm's startup less
+				// its blocking CPU part).
+				blocking := inputTotal + cp.cpuOperatorCost*float64(nAggs)*inputRows +
+					cp.cpuOperatorCost*float64(len(set))*inputRows
+				cost.Startup = inputStartup + (cost.Startup - blocking)
+			}
+			first = false
+			continue
+		}
+		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(set), g, nAggs, inNcols, inAvgVar)
+		cost.Total += c.Total
+	}
+	if first {
+		// Only empty sets: not a hashed path (consider_groupingsets_paths
+		// returns when new_rollups is NIL).
+		return Cost{}, false
+	}
+	if empty > 0 {
+		c := costAggSortedRollup(cp, inputRows, 0, 0, 0, float64(empty), nAggs)
+		cost.Total += c.Total
+	}
+	return cost, true
 }
 
 // indexOrderedAggInput is the surviving half of

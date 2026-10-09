@@ -411,9 +411,12 @@ def main():
 
     findings, scored, unmatched = [], 0, 0
     queries = []
+    errored = 0
     for i in range(1, len(blocks), 2):
         q = int(blocks[i])
         queries.append(q)
+        if re.search(r'ERROR:|FATAL:', blocks[i + 1]):
+            errored += 1
         goopg = collect(parse(blocks[i + 1]), want_actual=True)
         pgq = pg.get(q, {})
         for key, rec in goopg.items():
@@ -456,6 +459,21 @@ def main():
     print('bar:       qerr > max(%.1f, PG_qerr * %.1f)' % (args.floor, args.tol))
     print('FINDINGS:  %d' % len(findings))
     print()
+
+    # M0146-0009d: a vacuous capture must never reach the findings table, a
+    # baseline write, or a ratchet verdict. Observed live 2026-09-28: a
+    # foreign postgres squatting on EA_PORT answered every query with
+    # `relation "x" does not exist`, `nodes scored: 0`, and the ratchet
+    # printed `PASS (52 fixed)` — and a repin then wrote a 0-entry baseline
+    # over the pinned one. Exit 2 = infrastructure failure, distinct from
+    # the ratchet's exit-1 FAIL.
+    if not queries or scored == 0:
+        why = ('every captured query returned an ERROR'
+               if queries and errored == len(queries)
+               else 'the capture contains no scorable plan nodes')
+        print('EA PARITY: FAIL — %s; refusing to score a vacuous capture'
+              % why)
+        return 2
     hdr = ('%5s %10s %12s %10s %10s %10s  %-22s %s'
            % ('Q', 'qerr', 'goopg est', 'ACTUAL', 'pg est', 'pg qerr', 'node', 'relset'))
     print(hdr)

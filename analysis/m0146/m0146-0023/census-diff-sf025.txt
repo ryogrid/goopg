@@ -1,0 +1,24 @@
+37c37
+< Q37 depth=1 [aggregation-strategy] under Limit: PG Group | goopg GroupAggregate
+---
+> Q37 depth=2 [sort-strategy] under Group: PG Gather Merge | goopg Sort
+82c82
+< Q82 depth=1 [aggregation-strategy] under Limit: PG Group | goopg GroupAggregate
+---
+> Q82 depth=2 [sort-strategy] under Group: PG Gather Merge | goopg Sort
+97c97
+< Q97 depth=3 [aggregation-strategy] under Merge Join: PG Group | goopg HashAggregate
+---
+> Q97 MATCH (no structural divergence)
+100,101c100,101
+< FIRST-DIVERGENCE: queries=99 divergent=87 match=12
+< CATEGORY-ROLLUP: sort-strategy=32 aggregation-strategy=13 qual-placement=12 join-method=8 parallelism=7 scan-type=6 join-order=3 parameterisation=3 error=3
+---
+> FIRST-DIVERGENCE: queries=99 divergent=86 match=13
+> CATEGORY-ROLLUP: sort-strategy=34 qual-placement=12 aggregation-strategy=10 join-method=8 parallelism=7 scan-type=6 join-order=3 parameterisation=3 error=3
+116c116
+<     2  aggregation-strategy under Limit            PG Group                        goopg GroupAggregate               depth=1
+---
+>     2  sort-strategy    under Group            PG Gather Merge                 goopg Sort                         depth=2
+158d157
+<     1  aggregation-strategy under Merge Join       PG Group                        goopg HashAggregate                depth=3

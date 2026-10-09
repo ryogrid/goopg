@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // explainNames is EXPLAIN's range-table name table: the mapping from a
@@ -90,6 +91,22 @@ type explainNames struct {
 	// for node labels — the existing bySource/taken/seen serve column
 	// qualification, which has different collision rules.
 	nodeLabels map[string]string
+	// parent maps each plan node (nodePtr) to the node it was first
+	// reached from in collect's walk, and scopes caches each node's
+	// subtree SourceTableIdx → RTID map. Together they let columnIn
+	// resolve a column against the rendered node's own level before the
+	// statement-wide bySrc.
+	parent map[string]optimizer.Node
+	scopes map[string]map[int16]int32
+	// scopeLists is scopes with every RTID per SourceTableIdx, in walk
+	// order. An unpulled subquery whose Subquery Scan is elided leaves no
+	// level boundary in the tree, so its relations share SourceTableIdx
+	// values with the parent level's (M0146-0042).
+	scopeLists map[string]map[int16][]int32
+	// nodes maps each registered RTID to its scan node, so a column whose
+	// scope resolves to a transparent inlined CTE can be chased into the
+	// CTE body (transparentCTEFor). M0146-0021.
+	nodes map[int32]optimizer.Node
 }
 
 // nodePtr returns a unique string id for a plan node.
@@ -104,6 +121,8 @@ func newExplainNames(n optimizer.Node) *explainNames {
 		cols:       map[int32]map[string]bool{},
 		bySrc:      map[int16]int32{},
 		nodeLabels: map[string]string{},
+		parent:     map[string]optimizer.Node{},
+		scopes:     map[string]map[int16]int32{},
 	}
 	nm.collect(n)
 	return nm
@@ -149,6 +168,154 @@ func (nm *explainNames) column(src int16, colName string, prefix bool) string {
 	return rel + "." + colName
 }
 
+// columnIn is column resolved against the node being rendered, the way
+// PG's ruleutils deparses a Var through the plan node's own namespace
+// (set_deparse_plan: the node's outer and inner children). The planner's
+// SourceTableIdx restarts at 1 in every query level, so the statement-wide
+// bySrc can hand a CTE body's column the consumer query's relation: TPC-DS
+// Q14's cross_items printed `store_sales.ss_sold_date_sk =
+// date_dim.d_date_sk` (the outer query's date_dim) where PG prints
+// `d1.d_date_sk` (M0146-0005t).
+//
+// The lookup tries the scans under `at`, then under each ancestor in turn
+// (a parameterised inner scan names its outer side from the join above
+// it), and stops at a CTE body's root. It falls back to column when no
+// scope names the column.
+func (nm *explainNames) columnIn(at optimizer.Node, src int16, colName string, prefix bool) string {
+	if !prefix || nm == nil {
+		return colName
+	}
+	if q := nm.columnInScope(at, src, colName); q != "" {
+		return q
+	}
+	return nm.column(src, colName, prefix)
+}
+
+// columnInScope is columnIn without the statement-wide fallback: "" when no
+// scope from `at` up to its level's root names the column. The fallback's
+// bySrc is first-registration-wins across levels, so a CTE body's column can
+// meet the consumer's alias there (TPC-DS Q75's `curr_yr.d_year`); a caller
+// with a positional resolution tries that first (M0146-0042).
+func (nm *explainNames) columnInScope(at optimizer.Node, src int16, colName string) string {
+	if nm == nil {
+		return ""
+	}
+	for n := at; n != nil; n = nm.parent[nodePtr(n)] {
+		if rtid, ok := nm.scopeSources(n)[src]; ok {
+			if rel := nm.bySource[rtid]; rel != "" && nm.cols[rtid][colName] {
+				return rel + "." + colName
+			}
+		}
+		// M0146-0042: then every other relation the scope binds to src. An
+		// unpulled subquery's relations (its Subquery Scan elided, as PG's
+		// trivial_subqueryscan removes it) reuse the parent level's
+		// SourceTableIdx values, so TPC-DS Q79's `customer.c_customer_sk`
+		// met the subquery's date_dim first and printed bare. The first
+		// relation that has the column is the one the reference names.
+		for _, rtid := range nm.scopeLists[nodePtr(n)][src] {
+			if rel := nm.bySource[rtid]; rel != "" && nm.cols[rtid][colName] {
+				return rel + "." + colName
+			}
+		}
+		if p := nm.parent[nodePtr(n)]; p != nil && explainLevelBoundary(p) {
+			break
+		}
+	}
+	return ""
+}
+
+// transparentCTEFor returns the inlined CTE reference a column at `at` with
+// source index `src` resolves to, when that reference prints transparently —
+// PG removed the subquery scan (no qual on it, trivial_subqueryscan) — so
+// the column must print as its source inside the body. It returns nil when
+// the column resolves to anything else or to a reference kept as a
+// `Subquery Scan` (a Filter above it). M0146-0021.
+func (nm *explainNames) transparentCTEFor(at optimizer.Node, src int16) *optimizer.CTEScan {
+	if nm == nil || src == 0 {
+		return nil
+	}
+	for n := at; n != nil; n = nm.parent[nodePtr(n)] {
+		rtid, ok := nm.scopeSources(n)[src]
+		if !ok {
+			if p := nm.parent[nodePtr(n)]; p != nil && explainLevelBoundary(p) {
+				return nil
+			}
+			continue
+		}
+		cs, isCTE := nm.nodes[rtid].(*optimizer.CTEScan)
+		if !isCTE || !cs.Inlined() {
+			return nil
+		}
+		if f, isFilter := nm.parent[nodePtr(cs)].(*optimizer.Filter); isFilter {
+			if b, isTrue := f.Predicate.(*optimizer.BooleanConst); !isTrue || !b.Value {
+				return nil
+			}
+		}
+		return cs
+	}
+	return nil
+}
+
+// scopeSources maps SourceTableIdx → RTID for the scans in n's subtree,
+// first in walk order, without descending below a query-level boundary
+// (explainLevelBoundary) other than n itself.
+func (nm *explainNames) scopeSources(n optimizer.Node) map[int16]int32 {
+	key := nodePtr(n)
+	if m, ok := nm.scopes[key]; ok {
+		return m
+	}
+	if nm.scopes == nil {
+		nm.scopes = map[string]map[int16]int32{}
+	}
+	if nm.scopeLists == nil {
+		nm.scopeLists = map[string]map[int16][]int32{}
+	}
+	m := map[int16]int32{}
+	all := map[int16][]int32{}
+	// belowSetOp keeps an appendrel's children out of the candidate lists:
+	// an Append-level column names the parent there, never one child.
+	var walk func(x optimizer.Node, top, belowSetOp bool)
+	walk = func(x optimizer.Node, top, belowSetOp bool) {
+		if x == nil {
+			return
+		}
+		if _, ok := explainRelBaseName(x); ok {
+			if rtid, ok := explainNodeRTID(x); ok {
+				if src, ok := explainSingleSourceIdx(x); ok && src != 0 {
+					if _, claimed := m[src]; !claimed {
+						m[src] = rtid
+					}
+					if !belowSetOp {
+						all[src] = append(all[src], rtid)
+					}
+				}
+			}
+		}
+		if !top && explainLevelBoundary(x) {
+			return
+		}
+		_, isSetOp := x.(*optimizer.SetOp)
+		for _, c := range planChildren(x) {
+			walk(c, false, belowSetOp || isSetOp)
+		}
+	}
+	walk(n, true, false)
+	nm.scopes[key] = m
+	nm.scopeLists[key] = all
+	return m
+}
+
+// explainLevelBoundary reports whether n's children belong to another query
+// level: a CTE reference (its child is the CTE body) or a set operation
+// (each arm is its own SELECT).
+func explainLevelBoundary(n optimizer.Node) bool {
+	switch n.(type) {
+	case *optimizer.CTEScan, *optimizer.MaterializedCTEScan, *optimizer.SetOp:
+		return true
+	}
+	return false
+}
+
 // collect walks the plan subtree rooted at n and registers every scan-like
 // node's relation name. Registration is ordered by RTID (the statement-wide
 // allocation order, ≈ FROM order across query levels) rather than by tree
@@ -165,10 +332,36 @@ func (nm *explainNames) collect(n optimizer.Node) {
 		node optimizer.Node
 	}
 	var found []entry
+	// M0146-0109: multi-row VALUES nodes, in walk order, for their
+	// `"*VALUES*"` label numbering.
+	var valuesNodes []optimizer.Node
+	cteWalked := map[string]bool{}
 	var walk func(optimizer.Node)
 	walk = func(node optimizer.Node) {
 		if node == nil {
 			return
+		}
+		// M0146-0042: a CTE referenced twice can hang a separate copy of
+		// its body under each reference, while EXPLAIN prints one
+		// `CTE <name>` section — the first reference's body
+		// (collectCTEHoist). The other copy is never printed and must
+		// not claim names: TPC-DS Q75's second all_sales copy pushed the
+		// printed `item` labels to `item_2` and `item_4`.
+		if cs, ok := node.(*optimizer.CTEScan); ok && !cs.Inlined() && !isRecursiveSelfRef(cs) {
+			key := cs.DeclKey()
+			if cteWalked[key] {
+				if base, ok := explainRelBaseName(node); ok {
+					if rtid, ok := explainNodeRTID(node); ok {
+						src, _ := explainSingleSourceIdx(node)
+						found = append(found, entry{rtid: rtid, src: src, base: base, node: node})
+					}
+				}
+				return
+			}
+			cteWalked[key] = true
+		}
+		if v, ok := node.(*optimizer.Values); ok && len(v.Rows) > 1 {
+			valuesNodes = append(valuesNodes, node)
 		}
 		if base, ok := explainRelBaseName(node); ok {
 			if rtid, ok := explainNodeRTID(node); ok {
@@ -182,6 +375,11 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			}
 		}
 		for _, c := range planChildren(node) {
+			if c != nil {
+				if _, ok := nm.parent[nodePtr(c)]; !ok {
+					nm.parent[nodePtr(c)] = node
+				}
+			}
 			walk(c)
 		}
 		// A-01(ii) cut 2 (F3): sublink bodies hang off Expr fields
@@ -238,7 +436,28 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			continue
 		}
 		labelSeen[ptr] = true
+		// A recursive CTE's self-reference sits in the CTE body, which goopg
+		// numbers before the outer query; PG names the outer reference first
+		// (`CTE Scan on x`, then `WorkTable Scan on x x_1`). Letting the
+		// working table claim first would suffix the outer scan instead, so
+		// it claims nothing here (M0146-0005cp; its own `_1` is ledgered).
+		if cs, ok := e.node.(*optimizer.CTEScan); ok && isRecursiveSelfRef(cs) {
+			continue
+		}
 		if name := claimName(labelTaken, e.base); name != e.base {
+			nm.nodeLabels[ptr] = name
+		}
+	}
+	// M0146-0109: every multi-row VALUES is an RTE named "*VALUES*";
+	// set_rtable_names numbers the repeats (`"*VALUES*_1"`). goopg's Values
+	// node carries no RTID, so walk order stands in for range-table order.
+	for _, v := range valuesNodes {
+		ptr := nodePtr(v)
+		if labelSeen[ptr] {
+			continue
+		}
+		labelSeen[ptr] = true
+		if name := claimName(labelTaken, "*VALUES*"); name != "*VALUES*" {
 			nm.nodeLabels[ptr] = name
 		}
 	}
@@ -296,6 +515,10 @@ func (nm *explainNames) register(rtid int32, base string, node optimizer.Node) {
 		cols[c.Name] = true
 	}
 	nm.cols[rtid] = cols
+	if nm.nodes == nil {
+		nm.nodes = map[int32]optimizer.Node{}
+	}
+	nm.nodes[rtid] = node
 	nm.bySource[rtid] = claimName(nm.taken, base)
 }
 
@@ -353,6 +576,18 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 // SourceTableIdx, and collect records this value in the bySrc translation
 // alongside the RTID-keyed registration.
 func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
+	// A CTE reference's output schema is the body's; the consumer's own
+	// binding index rides on the node (M0146-0021).
+	switch x := n.(type) {
+	case *optimizer.CTEScan:
+		if x.SourceIdx != 0 {
+			return x.SourceIdx, true
+		}
+	case *optimizer.MaterializedCTEScan:
+		if x.SourceIdx != 0 {
+			return x.SourceIdx, true
+		}
+	}
 	var src int16
 	for _, c := range n.Output() {
 		if c.SourceTableIdx == 0 {
@@ -400,6 +635,12 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 	return rtid, true
 }
 
+// nodeHasSrc reports whether scan node n's outputs carry binding id src.
+func nodeHasSrc(n optimizer.Node, src int16) bool {
+	s, ok := explainSingleSourceIdx(n)
+	return ok && s == src
+}
+
 // resolveInAncestor names the relation an outer (correlated) column
 // reference comes from by searching an ancestor plan subtree for the one
 // scan-like node that exposes that column name.
@@ -422,6 +663,58 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 // Recorded limit (review F8): this keys on bare base names, unsuffixed and
 // id-free, so it can disagree with bySource's suffixed names. Safe
 // direction — ambiguous degrades to "" — but not id-keyed.
+// resolveLabelInAncestor is resolveInAncestor with each relation named by
+// its printed label — the set_rtable_names `_N` suffix when the relation's
+// name repeats — so a NestLoop param resolved against the loop's outer
+// input names the same relation its scan line prints (`web_sales_1`). ""
+// unless exactly one relation in anc exposes colName.
+func (nm *explainNames) resolveLabelInAncestor(anc optimizer.Node, colName string) string {
+	return nm.resolveLabelInAncestorSrc(anc, colName, 0)
+}
+
+// resolveLabelInAncestorSrc is resolveLabelInAncestor counting only the
+// relations whose binding id is src (0: every relation). A caller whose
+// name lookup was ambiguous narrows it with the reference's own binding id
+// (M0146-0042): TPC-DS Q56's loop outer side holds both its own `item` and
+// the IN subquery's pulled-up `item`, and the NestLoop param names the
+// former (`item_2.i_item_sk`), where the statement-wide fallback named the
+// first UNION branch's `item`.
+func (nm *explainNames) resolveLabelInAncestorSrc(anc optimizer.Node, colName string, src int16) string {
+	if nm == nil || anc == nil || colName == "" {
+		return ""
+	}
+	var hit string
+	n := 0
+	var walk func(optimizer.Node)
+	walk = func(node optimizer.Node) {
+		if node == nil || n > 1 {
+			return
+		}
+		if base, ok := explainRelBaseName(node); ok && (src == 0 || nodeHasSrc(node, src)) {
+			if d := nm.disambiguatedName(node); d != "" {
+				base = d
+			}
+			for _, c := range node.Output() {
+				if c.Name == colName {
+					if base != hit {
+						n++
+						hit = base
+					}
+					break
+				}
+			}
+		}
+		for _, c := range planChildren(node) {
+			walk(c)
+		}
+	}
+	walk(anc)
+	if n != 1 {
+		return ""
+	}
+	return hit
+}
+
 func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) string {
 	if nm == nil || anc == nil || colName == "" {
 		return ""
@@ -494,4 +787,190 @@ func explainIsScanNode(n optimizer.Node) bool {
 		return true
 	}
 	return false
+}
+
+// setOpResolvedColumn is ruleutils.c's resolve_special_varno for a column
+// that leaves a set operation (M0146-0005h). PG deparses an OUTER/INNER Var
+// by following it into the child plan's target list, and a SetOp or Append
+// deparses through its FIRST child (set_deparse_plan), so a join key read
+// from a set-operation subquery prints as the leftmost branch's column —
+// TPC-DS Q14's `iss.i_brand_id`, where goopg printed the subquery's own
+// column name `brand_id`.
+//
+// It walks output column idx of n down through set operations (first
+// input), identity Project columns and schema-preserving wrappers, and
+// returns "<relation>.<column>" once it reaches a named scan. It returns ""
+// unless the walk crossed a set operation, so every other column keeps its
+// existing rendering, and "" whenever a step is not a plain column reference
+// (PG would deparse the expression; goopg keeps the bare name).
+func (nm *explainNames) setOpResolvedColumn(n optimizer.Node, idx int) string {
+	return nm.resolvedColumn(n, idx, true)
+}
+
+// joinResidualColumn is resolve_special_varno for a column of a join's
+// residual (M0146-0005as). The residual indexes the join's concatenated input
+// row, and PG deparses such a Var by following it into the child plan that
+// produced it, down to the scan — so a column a grouped subquery republishes
+// under an alias prints as its source (TPC-DS Q46/Q68's `bought_city` →
+// `customer_address.ca_city`), and a column whose binding id no longer names
+// a relation still prints qualified (`current_addr.ca_city`). "" when the
+// walk does not reach a named scan through plain column references.
+func (nm *explainNames) joinResidualColumn(join optimizer.Node, idx int) string {
+	// M0146-0107: a semi or anti join publishes one side only, but its keys
+	// and residual still index both inputs side by side, so the walk's
+	// output-row arm (concatJoinSide) declined at the join itself and a
+	// key over the inner side printed bare. TPC-DS Q23's `IN (select
+	// c_customer_sk from best_ss_customer)` prints PG's
+	// `best_ss_customer.c_customer_sk` once the first step maps the
+	// position onto the input that holds it.
+	if j, ok := join.(*optimizer.Join); ok && j.Left != nil && j.Right != nil {
+		switch j.Type {
+		case optimizer.JoinTypeSemi, optimizer.JoinTypeAnti, optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+			lw := len(j.Left.Output())
+			if idx < lw {
+				return nm.resolvedColumn(j.Left, idx, false)
+			}
+			return nm.resolvedColumn(j.Right, idx-lw, false)
+		}
+	}
+	return nm.resolvedColumn(join, idx, false)
+}
+
+// resolvedColumn walks output column idx of n down to a named scan and returns
+// "<relation>.<column>". With requireSetOp it answers only for walks that
+// crossed a set operation (setOpResolvedColumn's contract).
+func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp bool) string {
+	if nm == nil {
+		return ""
+	}
+	crossed := !requireSetOp
+	for n != nil && idx >= 0 {
+		switch p := n.(type) {
+		case *optimizer.SetOp:
+			// A join residual stops here: an appendrel (inheritance or
+			// partition) Var deparses with the PARENT's alias
+			// (`tuplesest_parted.b`, regress inherit), which the
+			// first-branch walk cannot produce — it would print the first
+			// child relation instead. An INTERSECT or EXCEPT, or the input
+			// a UNION (distinct) dedupes, is never an appendrel: PG deparses
+			// through its first input (set_deparse_plan), as TPC-DS Q8's
+			// `a1.ca_zip` and Q75's `date_dim.d_year` (M0146-0042).
+			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput {
+				return ""
+			}
+			crossed = true
+			n = p.Left
+		case *optimizer.Project:
+			if idx >= len(p.Targets) {
+				return ""
+			}
+			cr, ok := p.Targets[idx].(*optimizer.ColumnRef)
+			if !ok {
+				return ""
+			}
+			n, idx = p.Child, cr.Index
+		case *optimizer.Filter:
+			n = p.Child
+		case *optimizer.Sort:
+			n = p.Child
+		case *optimizer.Gather:
+			n = p.Child
+		case *optimizer.GatherMerge:
+			n = p.Child
+		case *optimizer.SubqueryScan:
+			// M0146-0005w: the label is position-for-position
+			// transparent — the set operation's first-branch deparse
+			// continues into the subplan exactly as it did unwrapped.
+			// A join residual stops at it: the Subquery Scan PG keeps
+			// is a scan of the subquery RTE, and get_variable prints the
+			// Var with that RTE's alias (`a1.ca_zip`, M0146-0042).
+			if !requireSetOp && p.Alias != "" {
+				if out := p.Output(); idx < len(out) {
+					return p.Alias + "." + out[idx].Name
+				}
+				return ""
+			}
+			n = p.Child
+		case *optimizer.Materialize:
+			// M0146-0010: same transparency — a buffer renames nothing.
+			n = p.Child
+		case *optimizer.DistinctOn:
+			// M0146-0107: a semi join's unique-ified inner (printed
+			// HashAggregate / Unique) republishes its input position for
+			// position; a key over it deparses to the column below, as
+			// `(m107s.k = c.k)` over a unique-ified CTE scan.
+			if requireSetOp || p.Child == nil || len(p.Output()) != len(p.Child.Output()) {
+				return ""
+			}
+			n = p.Child
+		case *optimizer.Distinct:
+			// A UNION's dedupe (printed HashAggregate / Unique) republishes
+			// its input position for position; PG deparses the group key
+			// through it to the first branch (TPC-DS Q75, M0146-0042). The
+			// set-operation walk keeps its original arms.
+			if requireSetOp {
+				return ""
+			}
+			n = p.Child
+		case *optimizer.Join:
+			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
+		case *optimizer.NestedLoopIndexJoin:
+			n, idx = concatJoinSide(p, p.Outer, p.Inner, idx)
+		case *optimizer.Memoize:
+			if requireSetOp {
+				return ""
+			}
+			n = p.Child
+		case *optimizer.Aggregate:
+			// A group key is republished as-is: PG deparses the Var through
+			// the Agg's target list to the grouped column. Anything else
+			// (an aggregate result, grouping sets) ends the walk. The
+			// set-operation walk keeps its original arms (an aggregate
+			// there ends it: past one, an appendrel's Var prints with the
+			// parent's alias, not the first branch's — regress inherit).
+			if requireSetOp || p.GroupingSets != nil || idx >= len(p.GroupExprs) {
+				return ""
+			}
+			cr, ok := p.GroupExprs[idx].(*optimizer.ColumnRef)
+			if !ok {
+				return ""
+			}
+			n, idx = p.Child, cr.Index
+		default:
+			if !crossed {
+				return ""
+			}
+			rtid, ok := explainNodeRTID(n)
+			if !ok {
+				return ""
+			}
+			out := n.Output()
+			if idx >= len(out) {
+				return ""
+			}
+			rel, col := nm.bySource[rtid], out[idx].Name
+			if rel == "" || !nm.cols[rtid][col] {
+				return ""
+			}
+			return rel + "." + col
+		}
+	}
+	return ""
+}
+
+// concatJoinSide maps output column idx of a join whose output is exactly
+// its two inputs' columns side by side onto the input that produced it. Any
+// other output shape answers nil, which ends the walk.
+func concatJoinSide(j, left, right optimizer.Node, idx int) (optimizer.Node, int) {
+	if left == nil || right == nil {
+		return nil, -1
+	}
+	lw, rw := len(left.Output()), len(right.Output())
+	if len(j.Output()) != lw+rw {
+		return nil, -1
+	}
+	if idx < lw {
+		return left, idx
+	}
+	return right, idx - lw
 }

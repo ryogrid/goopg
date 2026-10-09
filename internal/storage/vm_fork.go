@@ -131,7 +131,12 @@ func WriteVMFork(path string, masks []uint8) error {
 		}
 	}()
 
-	for _, pg := range pages {
+	for i, pg := range pages {
+		// M0146-0063: redo reads these pages back through smgr, which
+		// verifies the data-page checksum when the cluster has them. A
+		// cluster without checksums ignores pd_checksum, so the pages are
+		// stamped either way, as smgr's own writes are when they are on.
+		pg = PageSetChecksumCopy(pg, BlockNumber(i))
 		if _, err := tmp.Write(pg); err != nil {
 			return fmt.Errorf("vm fork: write page: %w", err)
 		}
@@ -186,14 +191,41 @@ func DeleteVMFork(path string) error {
 
 // VMSaveForks writes per-relation VM fork files for all tracked relations
 // under dataDir. Also removes stale fork files for relations no longer tracked.
+//
+// M0146-0063: it runs at every checkpoint, not only at shutdown, so the map is
+// snapshotted under the lock and written outside it: an insert's ClearBlock
+// must not wait for the forks' fsyncs. The snapshot is a state at or after the
+// checkpoint's redo pointer; every later change is in the WAL replay applies
+// to the files.
 func (v *VisibilityMap) VMSaveForks(dataDir string, prevKeys map[vmKey]bool) error {
 	if v == nil {
 		return nil
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-
+	v.mu.Lock()
+	snap := make(map[vmKey][]uint8, len(v.pages))
 	for key, pages := range v.pages {
+		snap[key] = append([]uint8(nil), pages...)
+	}
+	dropped := v.dropped
+	v.dropped = nil
+	v.mu.Unlock()
+
+	// A relation DropRelation forgot loses its fork file. A TRUNCATE keeps
+	// the relfilenode, and a fork left behind would hand the relation's new
+	// rows the old bits at the next load. A relation tracked again since
+	// (VACUUM set new bits) is rewritten below instead.
+	for key := range dropped {
+		if _, ok := snap[key]; ok {
+			continue
+		}
+		rfn := RelFileNode{DBOid: key.DBOid, RelOid: key.RelOid, Fork: VisibilityMapFork}
+		if err := DeleteVMFork(RelForkPath(dataDir, rfn)); err != nil {
+			v.redrop(dropped)
+			return fmt.Errorf("vm: delete dropped fork for %d/%d: %w", key.DBOid, key.RelOid, err)
+		}
+	}
+
+	for key, pages := range snap {
 		rfn := RelFileNode{DBOid: key.DBOid, RelOid: key.RelOid, Fork: VisibilityMapFork}
 		path := RelForkPath(dataDir, rfn)
 		if err := WriteVMFork(path, pages); err != nil {
@@ -204,7 +236,7 @@ func (v *VisibilityMap) VMSaveForks(dataDir string, prevKeys map[vmKey]bool) err
 	// Remove stale fork files for relations no longer tracked.
 	if prevKeys != nil {
 		for key := range prevKeys {
-			if _, ok := v.pages[key]; ok {
+			if _, ok := snap[key]; ok {
 				continue
 			}
 			rfn := RelFileNode{DBOid: key.DBOid, RelOid: key.RelOid, Fork: VisibilityMapFork}
@@ -216,6 +248,18 @@ func (v *VisibilityMap) VMSaveForks(dataDir string, prevKeys map[vmKey]bool) err
 	}
 
 	return nil
+}
+
+// redrop puts back dropped-relation keys a failed save did not get to remove.
+func (v *VisibilityMap) redrop(keys map[vmKey]bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.dropped == nil {
+		v.dropped = make(map[vmKey]bool, len(keys))
+	}
+	for k := range keys {
+		v.dropped[k] = true
+	}
 }
 
 // VMRelations returns the set of relation keys currently tracked by the VM.
@@ -230,6 +274,65 @@ func (v *VisibilityMap) VMRelations() map[vmKey]bool {
 		keys[k] = true
 	}
 	return keys
+}
+
+// DiscardVMForks removes every _vm fork file under dataDir (base/<db>/ and
+// global/) and returns how many it removed.
+//
+// M0146-0063: goopg's map is not crash-safe. Its bits reach disk only from
+// the clean-shutdown SaveVM, and no WAL record clears them, whereas PG's
+// visibilitymap_clear is redone from every heap record carrying
+// *_ALL_VISIBLE_CLEARED. After a crash the forks therefore describe the
+// LAST CLEAN SHUTDOWN: a page modified since then can still read
+// all-visible, and an index-only scan would return its deleted rows. The
+// only safe map after crash recovery is an empty one: a cleared bit just
+// means "check the heap". Removing the files, not merely skipping them,
+// matters too: a later clean shutdown rewrites only the relations whose
+// bits were set again, and a stale fork left beside them would be loaded on
+// the following clean start.
+func DiscardVMForks(dataDir string) (int, error) {
+	removed := 0
+	scanDir := func(dir string) error {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		for _, file := range files {
+			name := file.Name()
+			if !strings.HasSuffix(name, "_vm") {
+				continue
+			}
+			if _, err := parseUint32(name[:len(name)-3]); err != nil {
+				continue
+			}
+			if err := DeleteVMFork(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	}
+	baseDir := filepath.Join(dataDir, "base")
+	if baseEntries, err := os.ReadDir(baseDir); err == nil {
+		for _, entry := range baseEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			if _, err := parseUint32(entry.Name()); err != nil {
+				continue
+			}
+			if err := scanDir(filepath.Join(baseDir, entry.Name())); err != nil {
+				return removed, err
+			}
+		}
+	}
+	if err := scanDir(filepath.Join(dataDir, "global")); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // VMLoadForks scans dataDir for _vm fork files and loads them into the VM.

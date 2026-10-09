@@ -1,0 +1,3 @@
+FLOW-CONVERGENCE: label=sweep-20260930-172826.txt pinned-spine=0 jointree-pullup=23 pinned-per-pullup=0.00 seam-classes=2 seam-declines=4
+# flow-convergence: seam-decline reason=leaf-count count=2
+# flow-convergence: seam-decline reason=residual-hits-pad count=2

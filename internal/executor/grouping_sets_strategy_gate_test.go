@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -81,7 +82,26 @@ func rollupWant() []rollupRow {
 
 func checkRollup(t *testing.T, got []Row) {
 	t.Helper()
-	want := rollupWant()
+	checkRollupRows(t, got, rollupWant())
+}
+
+// rollupWantSorted is the same answer in AGG_SORTED's one-pass order
+// (M0146-0020a): along the rollup (k1, k2) each group closes when its prefix
+// changes, so each k1's detail groups precede its (k1) group, and the grand
+// total is last — the order PG 18.3 emits `GROUP BY ROLLUP(k1, k2)` in.
+func rollupWantSorted() []rollupRow {
+	return []rollupRow{
+		{i64(1), i64(1), 2, 30},
+		{i64(1), i64(2), 1, 5},
+		{i64(1), nil, 3, 35},
+		{i64(2), i64(1), 1, 7},
+		{i64(2), nil, 1, 7},
+		{nil, nil, 4, 42},
+	}
+}
+
+func checkRollupRows(t *testing.T, got []Row, want []rollupRow) {
+	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("rows=%d want %d: %+v", len(got), len(want), got)
 	}
@@ -117,43 +137,35 @@ func TestC10aGroupingSetsHashedBaseline(t *testing.T) {
 	checkRollup(t, runAgg(t, rollupAggPlan(optimizer.AggStrategyHashed, rollupInput())))
 }
 
-// TestC10aGroupingSetsIgnoreSortedStrategy is the pin. A grouping-sets node
-// stamped AggStrategySorted — what retiring the four planner declines would
-// leave behind — must still compute every level, because Open's second gate
-// refuses to route it to openSorted. openSorted keeps exactly one current
-// group with setIdx 0, so had it been reached this would return one level's
-// worth of rows instead of three.
-func TestC10aGroupingSetsIgnoreSortedStrategy(t *testing.T) {
-	checkRollup(t, runAgg(t, rollupAggPlan(optimizer.AggStrategySorted, rollupInput())))
+// TestC10aGroupingSetsSortedRollupComputesEveryLevel is the pin, restated
+// for M0146-0020a. A grouping-sets node stamped AggStrategySorted must still
+// compute every level: Open's second gate keeps it off openSorted (which
+// holds one current group with setIdx 0 and would return one level). It now
+// emits the levels in AGG_SORTED's rollup order rather than per set.
+func TestC10aGroupingSetsSortedRollupComputesEveryLevel(t *testing.T) {
+	checkRollupRows(t, runAgg(t, rollupAggPlan(optimizer.AggStrategySorted, rollupInput())), rollupWantSorted())
 }
 
-// TestC10aGroupingSetsStrategyStampIsInert states the consequence positively:
-// for a grouping-sets node the Strategy field is inert — the two stamps
-// produce identical rows. That is what makes "pin grouping sets to AGG_HASHED"
-// a plan-label decision rather than an execution one.
-func TestC10aGroupingSetsStrategyStampIsInert(t *testing.T) {
+// TestC10aGroupingSetsStrategiesAgreeOnRows states the consequence
+// positively: the two strategies compute the same rows; only their emission
+// order differs (per set for the hashed node, rollup order for the sorted).
+func TestC10aGroupingSetsStrategiesAgreeOnRows(t *testing.T) {
 	hashed := runAgg(t, rollupAggPlan(optimizer.AggStrategyHashed, rollupInput()))
 	sorted := runAgg(t, rollupAggPlan(optimizer.AggStrategySorted, rollupInput()))
 	if len(hashed) != len(sorted) {
 		t.Fatalf("hashed=%d rows, sorted=%d rows", len(hashed), len(sorted))
 	}
-	for i := range hashed {
-		if len(hashed[i]) != len(sorted[i]) {
-			t.Fatalf("row[%d]: hashed width %d, sorted width %d", i, len(hashed[i]), len(sorted[i]))
-		}
-		for c := range hashed[i] {
-			h, s := hashed[i][c], sorted[i][c]
-			if h.Kind != s.Kind {
-				t.Errorf("row[%d] col%d: hashed kind %v, sorted kind %v", i, c, h.Kind, s.Kind)
-				continue
-			}
-			if h.Kind == KindNull {
-				continue
-			}
-			eq, err := compareDatum(h, s, 0)
-			if err != nil || eq != 0 {
-				t.Errorf("row[%d] col%d: hashed=%+v sorted=%+v (err=%v)", i, c, h, s, err)
-			}
+	key := func(r Row) string { return fmt.Sprint(r) }
+	seen := map[string]int{}
+	for _, r := range hashed {
+		seen[key(r)]++
+	}
+	for _, r := range sorted {
+		seen[key(r)]--
+	}
+	for k, n := range seen {
+		if n != 0 {
+			t.Errorf("row %s: hashed and sorted multiplicities differ by %d", k, n)
 		}
 	}
 }

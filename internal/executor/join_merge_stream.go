@@ -85,6 +85,12 @@ type mergeSortedSource struct {
 	child    Operator
 	isLeft   bool
 	keyExprs []optimizer.Expr
+	// keyTrims[i] flags a bpchar-typed key expression on this side: the
+	// merge's equality (compareMergeKeys on the evaluated key datums)
+	// must see the same bcTruelen image the scalar `=` sees, or a
+	// char(10) = char(20) merge pair can never meet — the merge-join
+	// sibling of the hash buildKeyTrim/probeKeyTrim flags. M0146.
+	keyTrims []bool
 	nkeys    int
 
 	// Widths of the merged column space this side's key expressions are
@@ -142,11 +148,21 @@ func newMergeSortedSource(o *joinOp, child Operator, isLeft bool) (*mergeSortedS
 	// keyRow) — same split, same moment as keyExprs, so the two can
 	// never disagree.
 	o.ensureMergeExprs()
+	other := o.mergeSideKeyExprs(!isLeft)
+	keyTrims := make([]bool, len(keyExprs))
+	for i, e := range keyExprs {
+		otherBP := int64(0)
+		if i < len(other) {
+			otherBP = declaredBpcharTypmod(other[i])
+		}
+		keyTrims[i] = declaredBpcharTypmod(e) > 0 || (isBareStringLit(e) && otherBP > 0)
+	}
 	s := &mergeSortedSource{
 		o:        o,
 		child:    child,
 		isLeft:   isLeft,
 		keyExprs: keyExprs,
+		keyTrims: keyTrims,
 		nkeys:    len(keyExprs),
 		rowSlot:  SlotFromRow(child.Schema(), nil),
 	}
@@ -288,6 +304,9 @@ func (s *mergeSortedSource) keyRow(row Row) ([]Datum, bool, error) {
 			// stays in the stream and sorts behind every real key.
 			return keys, true, nil
 		}
+		if i < len(s.keyTrims) && s.keyTrims[i] {
+			v = trimStringDatum(v)
+		}
 		keys[i] = v
 	}
 	return keys, false, nil
@@ -304,7 +323,7 @@ func (s *mergeSortedSource) less(a, b mergeStreamRow) bool {
 	if a.nullKey {
 		return false
 	}
-	cmp, err := compareMergeKeys(a.keys, b.keys, s.o.plan.Pos())
+	cmp, err := compareMergeKeys(a.keys, b.keys, s.o.plan.Pos(), s.o.mergeKeyText)
 	if err != nil {
 		if s.sortErr == nil {
 			s.sortErr = err
@@ -314,8 +333,16 @@ func (s *mergeSortedSource) less(a, b mergeStreamRow) bool {
 	return cmp < 0
 }
 
+// sortChunk orders the resident chunk. A chunk already in `less` order is left
+// as it is — the stable sort of a sorted slice is the identity — which is the
+// case under the explicit Sort a merge plan puts on an input (M0146-0099,
+// restoreMergeSort): that node does the sorting and the check costs one pass.
 func (s *mergeSortedSource) sortChunk() {
-	sort.SliceStable(s.tail, func(i, j int) bool { return s.less(s.tail[i], s.tail[j]) })
+	less := func(i, j int) bool { return s.less(s.tail[i], s.tail[j]) }
+	if sort.SliceIsSorted(s.tail, less) {
+		return
+	}
+	sort.SliceStable(s.tail, less)
 }
 
 // flushRun sorts the resident chunk, writes it to a spill run and frees it.
@@ -601,7 +628,7 @@ func (m *mergeJoinStream) stepMerge() (Row, bool, error) {
 		m.phase = mjPhaseTailLeftReal
 		return nil, false, nil
 	}
-	cmp, err := compareMergeKeys(m.lr.keys, m.rr.keys, m.o.plan.Pos())
+	cmp, err := compareMergeKeys(m.lr.keys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText)
 	if err != nil {
 		return nil, false, err
 	}
@@ -649,7 +676,7 @@ func (m *mergeJoinStream) bufferGroup() error {
 		if !m.haveR || m.rr.nullKey {
 			break
 		}
-		cmp, err := compareMergeKeys(m.groupKeys, m.rr.keys, m.o.plan.Pos())
+		cmp, err := compareMergeKeys(m.groupKeys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText)
 		if err != nil {
 			return err
 		}
@@ -785,7 +812,7 @@ func (m *mergeJoinStream) advanceOuterInGroup() error {
 		return err
 	}
 	if m.haveL && !m.lr.nullKey {
-		cmp, err := compareMergeKeys(m.lr.keys, m.groupKeys, m.o.plan.Pos())
+		cmp, err := compareMergeKeys(m.lr.keys, m.groupKeys, m.o.plan.Pos(), m.o.mergeKeyText)
 		if err != nil {
 			return err
 		}

@@ -62,6 +62,7 @@ import (
 //     CREATE INDEX backfill.
 type upsertOp struct {
 	plan         *optimizer.Insert
+	updCols      map[string]bool // updateColumns' cache
 	ctx          *Context
 	child        Operator
 	rowsAffected int64
@@ -164,7 +165,53 @@ func (o *upsertOp) Open(ctx *Context) error {
 
 func (o *upsertOp) Close() error { return o.child.Close() }
 
+// Next fires the statement-level triggers around the single processing
+// pass (fireBSTriggers / fireASTriggers, nodeModifyTable.c; M0146-0076):
+// BEFORE STATEMENT INSERT, then UPDATE for DO UPDATE; afterwards AFTER
+// STATEMENT UPDATE, then INSERT.
 func (o *upsertOp) Next() (TupleSlot, error) {
+	tbl := o.plan.Table
+	if o.done || len(tbl.Triggers) == 0 {
+		return o.next()
+	}
+	doUpdate := o.plan.OnConflict != nil && o.plan.OnConflict.Action == optimizer.OnConflictActionUpdate
+	var updCols map[string]bool
+	if doUpdate {
+		updCols = o.updateColumns()
+	}
+	if err := fireBeforeStatementTriggers(o.ctx, tbl, "insert", nil); err != nil {
+		return nil, err
+	}
+	if doUpdate {
+		if err := fireBeforeStatementTriggers(o.ctx, tbl, "update", updCols); err != nil {
+			return nil, err
+		}
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if doUpdate {
+		if qerr := queueAfterStatementTriggers(o.ctx, tbl, "update", updCols); qerr != nil {
+			return nil, qerr
+		}
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, tbl, "insert", nil); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+// updateColumns is the DO UPDATE action's target column set, which decides
+// whether a column-specific `UPDATE OF` trigger fires (M0146-0076).
+func (o *upsertOp) updateColumns() map[string]bool {
+	if o.updCols == nil && o.plan.OnConflict != nil {
+		o.updCols = updateTargetColumns(o.plan.Table.Columns, o.plan.OnConflict.UpdateSet)
+	}
+	return o.updCols
+}
+
+func (o *upsertOp) next() (TupleSlot, error) {
 	if o.done {
 		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
 			row := o.retRows[o.retIdx]
@@ -212,6 +259,15 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		}
 		applyDefaultsForMissing(parentCols, inserted, upsertMissing, ctxSeqDBOid(o.ctx))
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
+		// Assignment coercion, as plain INSERT does: range checks, typed
+		// literals, the numeric(p,s) typmod (M0146-0087; sibling of
+		// insertOp.Next).
+		if err := coerceRowForConstraintChecks(parentCols, inserted, func(i int) bool { return !upsertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
+		if err := applyDefaultNumericTypmods(parentCols, inserted, upsertMissing, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse
 		// a prior row's keys. applyInsert repopulates it. M0100-0006b.
@@ -328,7 +384,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				conflictRow = specConflictRow
 			} else {
 				if len(writeTbl.Triggers) > 0 {
-					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+					if err := queueAfterRowTriggers(o.ctx, writeTbl, "insert", nil, insertedForLeaf, nil); err != nil {
 						return nil, err
 					}
 				}
@@ -472,7 +528,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 							continue
 						}
 						if len(writeTbl.Triggers) > 0 {
-							if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+							if err := queueAfterRowTriggers(o.ctx, writeTbl, "insert", nil, insertedForLeaf, nil); err != nil {
 								return nil, err
 							}
 						}
@@ -504,6 +560,14 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if partLeaf != nil {
 					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
 				}
+				// DO UPDATE SET values take the column type and typmod, as a
+				// plain UPDATE's do (M0146-0087).
+				setNames := o.updateColumns()
+				if cerr := coerceRowForConstraintChecks(parentCols, updated, func(i int) bool {
+					return i < len(parentCols) && setNames[strings.ToLower(parentCols[i].Name)]
+				}, o.ctx, o.plan.Pos()); cerr != nil {
+					return nil, cerr
+				}
 				// Check secondary unique constraints. The arbiter index is implicitly
 				// valid (already resolved above); checkUniqueIndexesForUpdate skips
 				// indexes whose key columns are unchanged, so the arbiter is normally
@@ -513,7 +577,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				}
 				// Fire BEFORE UPDATE trigger per-row before applying the update (M0100-0011).
 				if len(writeTbl.Triggers) > 0 {
-					ret, ok, err := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					ret, ok, err := fireTriggersCols(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf, o.updateColumns())
 					if err != nil {
 						return nil, err
 					}
@@ -531,7 +595,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					return nil, err
 				}
 				if len(writeTbl.Triggers) > 0 {
-					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf); err != nil {
+					if err := queueAfterRowTriggers(o.ctx, writeTbl, "update", conflictRow, updatedForLeaf, o.updateColumns()); err != nil {
 						return nil, err
 					}
 				}
@@ -1105,7 +1169,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		// (tuplelock-partition).
 		_ = storage.PageSetHeapTupleKeysUpdated(pinned.Page(), oldPtr.Offset)
 	}
-	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
+	derr := markHeapDeleteDirtyAndClearVM(o.ctx, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {
@@ -1485,7 +1549,7 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 	}
 	var derr error
 	if serr == nil {
-		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
+		derr = markHeapDeleteDirtyAndClearVM(o.ctx, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
 	}
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)

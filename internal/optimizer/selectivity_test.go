@@ -78,9 +78,54 @@ func TestSelectivityEqualityFallsThroughMCV(t *testing.T) {
 	}
 }
 
+// TestSelectivityEqualityBpcharTrimsPadding: MCV values for char(N)
+// are stored blank-padded, so a literal without padding must still hit
+// the MCV (PostgreSQL bpchareq semantics, varchar.c) instead of
+// falling through to the residual/default-eq arm. M0146-0009b.
+func TestSelectivityEqualityBpcharTrimsPadding(t *testing.T) {
+	mk := func(colType catalog.Type, mcvValue string) (Node, Expr) {
+		tbl := makeStatsTable(&catalog.TableStats{
+			RowCount: 1000,
+			Columns: []catalog.ColumnStats{
+				{NDistinct: 4, NullFrac: 0,
+					MCV: []catalog.MCVEntry{
+						{Value: mcvValue, Frequency: 0.4},
+						{Value: "X", Frequency: 0.3},
+					}},
+			},
+		}, []catalog.Column{{Name: "label", Type: colType, Ordinal: 0}})
+		pred := &BinaryOp{
+			Op: parser.OpEq,
+			Left:  &ColumnRef{Index: 0, Name: "label", Type: colType},
+			Right: &StringConst{Value: "Y"},
+		}
+		return &SeqScan{Table: tbl}, pred
+	}
+
+	// char(8): padded MCV vs unpadded literal — must hit freq 0.4.
+	plan, pred := mk(catalog.Type{Name: "char", Args: []int64{8}}, "Y       ")
+	if got := clauseSelectivity(pred, plan); math.Abs(got-0.4) > 1e-9 {
+		t.Errorf("bpchar: clauseSelectivity(label='Y')=%v want 0.4", got)
+	}
+	// char(8): literal carrying trailing blanks still hits (bpchar
+	// equality ignores trailing blanks on both sides).
+	plan, pred = mk(catalog.Type{Name: "char", Args: []int64{8}}, "Y")
+	pred.(*BinaryOp).Right.(*StringConst).Value = "Y   "
+	if got := clauseSelectivity(pred, plan); math.Abs(got-0.4) > 1e-9 {
+		t.Errorf("bpchar: clauseSelectivity(label='Y   ')=%v want 0.4", got)
+	}
+	// varchar: byte equality preserved — padded MCV does not match.
+	plan, pred = mk(catalog.Type{Name: "varchar"}, "Y       ")
+	want := (1.0 - 0.7) / 2.0 // non-MCV mass over non-MCV distinct
+	if got := clauseSelectivity(pred, plan); math.Abs(got-want) > 1e-9 {
+		t.Errorf("varchar: clauseSelectivity(label='Y')=%v want %v", got, want)
+	}
+}
+
 // TestSelectivityRangeUsesHistogram: a numeric column with
 // boundaries [1, 100, 200, 300, 400, 500] (5 buckets) and `id <
-// 200` should land at bucket 2 / 5 = 0.4. With no MCV, the whole
+// 200` should land at bucket 2 / 5 = 0.4, less PG's eq_selec (1/500) for
+// `<` (ineq_histogram_selectivity, M0146-0005s). With no MCV, the whole
 // non-MCV mass = 1 and the histogram drives the answer.
 func TestSelectivityRangeUsesHistogram(t *testing.T) {
 	tbl := makeStatsTable(&catalog.TableStats{
@@ -98,8 +143,8 @@ func TestSelectivityRangeUsesHistogram(t *testing.T) {
 		Right: &IntegerConst{Value: 200},
 	}
 	got := clauseSelectivity(pred, scan)
-	if math.Abs(got-0.4) > 1e-9 {
-		t.Errorf("clauseSelectivity(id<200)=%v want 0.4", got)
+	if want := 0.4 - 1.0/500; math.Abs(got-want) > 1e-9 {
+		t.Errorf("clauseSelectivity(id<200)=%v want %v", got, want)
 	}
 }
 
@@ -134,7 +179,7 @@ func TestSelectivityAndProductRule(t *testing.T) {
 		},
 	}
 	got := clauseSelectivity(pred, scan)
-	want := 0.8 * 0.4
+	want := 0.8 * (0.4 - 1.0/500)
 	if math.Abs(got-want) > 1e-9 {
 		t.Errorf("clauseSelectivity(F AND <200)=%v want %v", got, want)
 	}

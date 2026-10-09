@@ -1,6 +1,11 @@
 package optimizer
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // M0077-0001 (Slice A): relation-local predicate
 // partition + leaf-local rebasing.
@@ -63,13 +68,42 @@ func partitionConjunctsForJoinPlanning(
 	conjuncts []Expr,
 	spans []leafSpan,
 ) (joinConjuncts []Expr, locals relationLocalFilters) {
+	return partitionConjunctsForJoinPlanningScoped(conjuncts, spans, false)
+}
+
+// partitionConjunctsForJoinPlanningScoped is partitionConjunctsForJoinPlanning
+// with the scope's kind: scalarBody (M0146-0012) admits correlated conjuncts
+// as base-rel restrictions in a multi-relation scalar sublink body too, as PG
+// distributes a qual over a PARAM_EXEC Param to the one relation it reads.
+func partitionConjunctsForJoinPlanningScoped(
+	conjuncts []Expr,
+	spans []leafSpan,
+	scalarBody bool,
+) (joinConjuncts []Expr, locals relationLocalFilters) {
 	locals = relationLocalFilters{byBinding: make(map[int][]Expr)}
 	for _, c := range conjuncts {
 		// Conjuncts with subquery / outer-ref content can never be
 		// safely pushed below a join boundary at this layer; the
 		// existing planner stages own that work. Keep them in the
 		// join-residual set.
-		if !conjunctIsLocalEligible(c) {
+		//
+		// M0146-0015a: in a ONE-relation scope a correlated outer reference
+		// does not disqualify. PG makes `x = outer.y` a base restriction
+		// (the outer Var is a PARAM_EXEC Param with no relids —
+		// distribute_qual_to_rels, initsplan.c), which is what lets
+		// match_clause_to_indexcol bind it as the SubPlan's index key;
+		// held above the search, a correlated SubPlan scanned its whole
+		// relation per outer row (the regress `subselect` >1 h hang). A
+		// multi-relation scope keeps the decline: the post-planning
+		// EXISTS→ANY and unnest passes read the correlation off the body's
+		// top qual holder, and a qual sunk to a leaf under the body's join
+		// is invisible to them (TPC-DS Q35 lost its hashed ANY to a
+		// per-row SubPlan) — ledgered.
+		if !conjunctLocalEligibility(c, len(spans) == 1 || scalarBody) {
+			if b := correlatedScalarSublinkLeaf(c, spans); b >= 0 {
+				locals.byBinding[b] = append(locals.byBinding[b], c)
+				continue
+			}
 			joinConjuncts = append(joinConjuncts, c)
 			continue
 		}
@@ -82,7 +116,197 @@ func partitionConjunctsForJoinPlanning(
 		}
 		locals.byBinding[bidx] = append(locals.byBinding[bidx], c)
 	}
+	places := equivalenceClassPlaces(conjuncts)
+	for b, cs := range locals.byBinding {
+		locals.byBinding[b] = equivalenceClausesLast(cs, places)
+	}
 	return joinConjuncts, locals
+}
+
+// ecPlace is where generate_base_implied_equalities puts one equality:
+// rank is its EquivalenceClass's position in root->eq_classes, and
+// regenerated says the EC is rebuilt as `member = const` clauses rather than
+// handing back the written one.
+type ecPlace struct {
+	rank        int
+	regenerated bool
+}
+
+// equivalenceClassPlaces replays process_equivalence (equivclass.c) over a
+// scope's conjuncts in order and returns, for each equality it accepts, the
+// final position of its EquivalenceClass in root->eq_classes (M0146-0042).
+// generate_base_implied_equalities walks that list in order, so a relation's
+// EC-derived restrictions come out in EC creation order, not written order:
+// in TPC-DS Q31 `ss2.d_year = 1999` joins the EC `ss1.d_year = 1999` opened
+// before `ss2.d_qoy = 2`'s, and PG filters ss2 on `(d_year = 1999) AND
+// (d_qoy = 2)`.
+//
+// The replay follows process_equivalence: a new EC is appended; an item found
+// in an EC joins it (a constant matches an equal constant of the same type,
+// so `o1.b = 2` joins the EC of an earlier `o2.b = 2`); when the two items
+// sit in different ECs, the right one's merges into the left one's and
+// leaves the list. Items are identified by exprIdentityKey; a constant's key
+// carries its column's type, standing in for em_datatype.
+//
+// generate_base_implied_equalities_const re-uses the written clause only
+// when the EC holds one `var = const` source and two members; otherwise it
+// builds `member = const` for every member, so `3 = j2.c` in an EC that also
+// holds `j1.c` prints `(c = 3)` (regress join.sql's self-join cases).
+func equivalenceClassPlaces(conjuncts []Expr) map[Expr]ecPlace {
+	type eqClass struct {
+		merged  *eqClass
+		members map[string]bool
+		consts  map[string]bool
+		sources int
+	}
+	resolve := func(ec *eqClass) *eqClass {
+		for ec.merged != nil {
+			ec = ec.merged
+		}
+		return ec
+	}
+	var list []*eqClass
+	member := map[string]*eqClass{}
+	clauseEC := map[Expr]*eqClass{}
+	itemKey := func(e, other Expr) (string, bool) {
+		k, ok := exprIdentityKey(e, scopeVeto)
+		if !ok {
+			return "", false
+		}
+		if col, isCol := other.(*ColumnRef); isCol && isPlainConstantBound(e) {
+			k += "@" + col.Type.Name
+		}
+		return k, true
+	}
+	for _, c := range conjuncts {
+		if !isEquivalenceClause(c) {
+			continue
+		}
+		b := c.(*BinaryOp)
+		k1, ok1 := itemKey(b.Left, b.Right)
+		k2, ok2 := itemKey(b.Right, b.Left)
+		if !ok1 || !ok2 || k1 == k2 {
+			continue
+		}
+		ec1, ec2 := member[k1], member[k2]
+		if ec1 != nil {
+			ec1 = resolve(ec1)
+		}
+		if ec2 != nil {
+			ec2 = resolve(ec2)
+		}
+		var ec *eqClass
+		switch {
+		case ec1 != nil && ec2 != nil:
+			ec = ec1
+			if ec2 != ec1 {
+				for k := range ec2.members {
+					ec1.members[k] = true
+				}
+				for k := range ec2.consts {
+					ec1.consts[k] = true
+				}
+				ec1.sources += ec2.sources
+				ec2.merged = ec1
+				for i, x := range list {
+					if x == ec2 {
+						list = append(list[:i], list[i+1:]...)
+						break
+					}
+				}
+			}
+		case ec1 != nil:
+			ec = ec1
+		case ec2 != nil:
+			ec = ec2
+		default:
+			ec = &eqClass{members: map[string]bool{}, consts: map[string]bool{}}
+			list = append(list, ec)
+		}
+		member[k1], member[k2] = ec, ec
+		ec.members[k1], ec.members[k2] = true, true
+		if isPlainConstantBound(b.Left) {
+			ec.consts[k1] = true
+		}
+		if isPlainConstantBound(b.Right) {
+			ec.consts[k2] = true
+		}
+		ec.sources++
+		clauseEC[c] = ec
+	}
+	pos := make(map[*eqClass]int, len(list))
+	for i, ec := range list {
+		pos[ec] = i
+	}
+	places := make(map[Expr]ecPlace, len(clauseEC))
+	for c, ec := range clauseEC {
+		ec = resolve(ec)
+		places[c] = ecPlace{
+			rank:        pos[ec],
+			regenerated: len(ec.consts) == 1 && (len(ec.members) != 2 || ec.sources != 1),
+		}
+	}
+	return places
+}
+
+// equivalenceClausesLast reorders one relation's restriction list the way
+// PG's baserestrictinfo comes out (M0146-0005co). distribute_qual_to_rels
+// keeps an equality that process_equivalence accepts (`t_hour = 8`, or two
+// columns of the relation equated) out of the list, and
+// generate_base_implied_equalities appends it back after every other qual;
+// order_qual_clauses' stable cost sort leaves that order alone when the
+// costs tie. So `t_hour = 8 AND t_minute >= 30` filters as
+// `(t_minute >= 30) AND (t_hour = 8)`. The partition is stable; the cost
+// sort for unequal costs is not modelled. places (equivalenceClassPlaces)
+// orders the equalities by their EC's position, as
+// generate_base_implied_equalities emits them, and turns a regenerated
+// `const = col` into PG's `col = const`; an equality with no place keeps its
+// written place after the placed ones.
+func equivalenceClausesLast(cs []Expr, places map[Expr]ecPlace) []Expr {
+	var rest, ec []Expr
+	for _, c := range cs {
+		if isEquivalenceClause(c) {
+			ec = append(ec, c)
+		} else {
+			rest = append(rest, c)
+		}
+	}
+	rank := func(c Expr) int {
+		if pl, ok := places[c]; ok {
+			return pl.rank
+		}
+		return len(places)
+	}
+	sort.SliceStable(ec, func(i, j int) bool { return rank(ec[i]) < rank(ec[j]) })
+	for i, c := range ec {
+		if b := c.(*BinaryOp); places[c].regenerated && isPlainConstantBound(b.Left) {
+			flipped := *b
+			flipped.Left, flipped.Right = b.Right, b.Left
+			ec[i] = &flipped
+		}
+	}
+	if len(rest)+len(ec) < 2 {
+		return append(rest, ec...)
+	}
+	// order_qual_clauses: a stable sort by per-tuple evaluation cost
+	// (qualEvalOps, cost_qual_eval's count), so a cheap equality still
+	// precedes a costlier OR or IN list.
+	return orderQualClauses(append(rest, ec...))
+}
+
+// isEquivalenceClause reports whether c is an `=` whose two sides are a
+// column and a constant, or two columns — the shape process_equivalence
+// turns into an EquivalenceClass member pair. Written as type assertions
+// (no new Expr switch site for the walker census).
+func isEquivalenceClause(c Expr) bool {
+	b, ok := c.(*BinaryOp)
+	if !ok || b.Op != parser.OpEq {
+		return false
+	}
+	lc, rc := isPlainConstantBound(b.Left), isPlainConstantBound(b.Right)
+	_, lcol := b.Left.(*ColumnRef)
+	_, rcol := b.Right.(*ColumnRef)
+	return (lcol && (rc || rcol)) || (rcol && lc)
 }
 
 // conjunctIsLocalEligible reports whether the expression
@@ -119,6 +343,17 @@ func partitionConjunctsForJoinPlanning(
 //
 // (M0077-0001.)
 func conjunctIsLocalEligible(e Expr) bool {
+	return conjunctLocalEligibility(e, false)
+}
+
+// conjunctLocalEligibility is conjunctIsLocalEligible with the OuterColumnRef
+// decline switchable: admitOuterRefs admits a correlated outer reference
+// (partitionConjunctsForJoinPlanning's one-relation scope, M0146-0015a).
+// Every other decline is unchanged. localizeExprToLeaf leaves an
+// OuterColumnRef untouched (it names a scope above), tableForCol ignores it,
+// and isParallelSafeExpr keeps a leaf carrying one off partial paths — as
+// PG's parallel-restricted Param does.
+func conjunctLocalEligibility(e Expr, admitOuterRefs bool) bool {
 	if anySublinkPullupCandidate(e) {
 		return false
 	}
@@ -135,6 +370,9 @@ func conjunctIsLocalEligible(e Expr) bool {
 				// for it, so scopeVeto can never fire on its behalf
 				// and the decline has to be explicit. Same shape as
 				// commit 5's exprSide veto.
+				if admitOuterRefs {
+					return true
+				}
 				eligible = false
 				return false
 			case *InExpr:
@@ -274,4 +512,90 @@ func localizeExprToLeaf(e Expr, binding rangeBinding) Expr {
 			"here leaves FROM-cumulative indices on a leaf-local Filter", e))
 	}
 	return out
+}
+
+// correlatedScalarSublinkLeaf returns the binding a conjunct holding a
+// correlated scalar sublink restricts, or -1 (M0146-0005bu). PG distributes
+// a qual by the relids of its Vars, and a correlated SubPlan's Vars are its
+// testexpr's plus the outer Vars its parameters carry
+// (distribute_qual_to_rels over pull_varnos, initsplan.c): when all of them
+// name one relation the whole clause is that relation's base restriction.
+// TPC-DS Q1/Q30/Q81 filter `ctr1.ctr_total_return > (SELECT avg(...) FROM
+// ctr2 WHERE ctr1.k = ctr2.k)` on the ctr1 CTE Scan; goopg held it above the
+// whole join.
+//
+// Admitted: scalar sublinks, and EXISTS sublinks that are not the conjunct
+// itself (M0146-0005dx1), every inner-plan outer reference naming this scope
+// (none reaching past it) and every such reference plus every same-scope
+// column inside ONE binding that starts at offset 0. Offset 0 is the one
+// binding whose leaf coordinates ARE the FROM-cumulative ones, so neither
+// localizeExprToLeaf nor the inner plan (whose references stay unrebased —
+// the rebase is ledgered) moves a coordinate.
+//
+// An EXISTS that IS the conjunct (or its NOT) stays above: it is the
+// post-planning unnest pass's semi/anti join. One under an OR can never
+// become a join; PG keeps TPC-DS Q10/Q35's `(EXISTS (… ws …) OR EXISTS
+// (… cs …))` on the customer scan, where cost_qual_eval prices it per row by
+// the plain correlated SubPlan (qualEvalOps' subPlanCostOps), and the
+// post-planning EXISTS->ANY pass still converts it there, reading its host
+// row off the leaf's Filter.
+func correlatedScalarSublinkLeaf(c Expr, spans []leafSpan) int {
+	if len(spans) < 2 || spans[0].lo != 0 || anySublinkPullupCandidate(c) {
+		return -1
+	}
+	// The same-scope columns name binding 0 — or there are none, as in
+	// Q10's OR of two EXISTS, whose only Vars are the SubPlans' outer
+	// references, checked below.
+	if tableForCol(c, spans) != 0 {
+		sameScope := false
+		visitColumnRefsForTable(c, func(int) { sameScope = true })
+		if sameScope {
+			return -1
+		}
+	}
+	top := c
+	if u, isNot := c.(*UnaryOp); isNot && u.Op == parser.OpNot {
+		top = u.Operand
+	}
+	if _, isExists := top.(*ExistsExpr); isExists {
+		return -1
+	}
+	lo, hi := spans[0].lo, spans[0].hi
+	// planEscapesBy's walk: a reference past this scope escapes as ever, and
+	// one naming this scope escapes the leaf unless binding 0 holds it.
+	outside := func(o *OuterColumnRef, depth int) bool {
+		return o.Level > depth || (o.Level == depth && (o.Index < lo || o.Index >= hi))
+	}
+	scalar, ok := false, true
+	walked := walkExprRefs(c, scopeSignal, exprVisitor{
+		Visit: func(n Expr) bool {
+			switch x := n.(type) {
+			case *OuterColumnRef:
+				ok = false
+			case *SubqueryExpr:
+				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
+					planEscapesBy(x.Plan, 1, outside) {
+					ok = false
+				}
+				scalar = true
+			case *InExpr:
+				if x.Plan != nil {
+					ok = false
+				}
+			case *ExistsExpr:
+				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
+					planEscapesBy(x.Plan, 1, outside) {
+					ok = false
+				}
+				scalar = true
+			case *ArraySubqueryExpr, *MultiAssignSubqRow, *MultiAssignSubqElem:
+				ok = false
+			}
+			return ok
+		},
+	})
+	if !walked || !ok || !scalar {
+		return -1
+	}
+	return 0
 }

@@ -68,6 +68,14 @@ type restrictInfo struct {
 	// why the split is stored as relsets rather than as two FROM positions.
 	isEquijoin bool
 
+	// opLeftRelids / opRightRelids are the relids of a comparison clause's two
+	// operands whatever its operator — what `get_join_variables`
+	// (selfuncs.c) hands examine_variable for `neqjoinsel` and friends. For
+	// an equijoin they equal leftRelids/rightRelids; zero when the clause is
+	// not a binary comparison or an operand's relids do not resolve.
+	// M0146-0005bo.
+	opLeftRelids, opRightRelids RelSet
+
 	// inferred marks a clause synthesised by `inferAnchoredEqualities`
 	// (equiv_class.go:236) rather than written by the user. Per 04 §5 this is
 	// NOT an admissibility penalty — an inferred clause connects its two rels
@@ -146,6 +154,25 @@ type restrictInfoList struct {
 	// nclasses is the number of equivalence classes discovered; ecIDs are
 	// dense in [0, nclasses).
 	nclasses int
+
+	// ecMembers is each class's `ec_members` list in PG's order: the
+	// order `process_equivalence` (equivclass.c) adds members while it
+	// walks the equalities in qual order — a new pair opens a class, a
+	// new member appends, and a merge appends the right operand's class
+	// after the left's. `generate_join_implied_equalities_normal` picks
+	// its clause by this order (M0146-0022).
+	ecMembers map[int][]columnIdent
+	// ecPairs holds every member pair some clause in the list equates.
+	ecPairs map[[2]columnIdent]bool
+	// ecReduce enables reduceEquivClassJoinClauses. The search sets it
+	// only for a problem with no special joins: an outer join's nullable
+	// member is not equal to its class-mates once null-extended, so
+	// "each side's members are already equal" does not hold there.
+	ecReduce bool
+	// flips caches reduceEquivClassJoinClauses' outer = inner copies of
+	// clauses written inner = outer, so a clause keeps one identity
+	// across the joinrel pairs that choose it (PG's ec_derives reuse).
+	flips map[*restrictInfo]*restrictInfo
 }
 
 // relsOverlap reports whether two relsets share a base relation (bms_overlap).
@@ -175,9 +202,15 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 	}
 
 	// ec accumulates the equivalence classes across every canonical
-	// ColumnRef = ColumnRef equality, explicit and inferred alike — the whole
+	// member equality (ColumnRef = ColumnRef, or a single-relation expression
+	// member — M0146-0005do), explicit and inferred alike — the whole
 	// point of 04 §5 is that an inferred member is a full member of its class.
 	ec := newEquivClasses()
+	// order replays process_equivalence to record PG's member order;
+	// orderOf maps a member to its list in `order`.
+	var order [][]columnIdent
+	orderOf := map[columnIdent]int{}
+	l.ecPairs = map[[2]columnIdent]bool{}
 	// classKey remembers, per clause, the ident to look the class up by after
 	// all unions are done (a root chosen mid-build can be superseded).
 	classKey := make([]*columnIdent, 0, len(conjuncts))
@@ -188,10 +221,22 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 			return
 		}
 		ri := &restrictInfo{clause: e, relids: relids, inferred: inferred, ecID: noEquivClass}
+		if bin, isBin := e.(*BinaryOp); isBin {
+			switch bin.Op {
+			case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+				lr, lok := relidsOfExpr(bin.Left, spans)
+				rr, rok := relidsOfExpr(bin.Right, spans)
+				if lok && rok {
+					ri.opLeftRelids, ri.opRightRelids = lr, rr
+				}
+			}
+		}
 		if bin, isBin := e.(*BinaryOp); isBin && bin.Op == parser.OpEq {
 			lr, lok := relidsOfExpr(bin.Left, spans)
 			rr, rok := relidsOfExpr(bin.Right, spans)
-			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) {
+			// M0146-0012a: a sublink-bearing equality is a residual, never a
+			// hash/merge key (exprCarriesSublink).
+			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) && !exprCarriesSublink(e) {
 				ri.isEquijoin = true
 				ri.leftKey, ri.rightKey = bin.Left, bin.Right
 				ri.leftRelids, ri.rightRelids = lr, rr
@@ -200,9 +245,28 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 		l.all = append(l.all, ri)
 
 		var key *columnIdent
-		if lc, rc, isColEq := isColumnRefEquality(e); isColEq && ri.isEquijoin {
-			li, rid := identOf(lc), identOf(rc)
+		if li, rid, isECEq := ecEqualityIdents(e); isECEq && ri.isEquijoin {
 			ec.union(li, rid)
+			l.ecPairs[orderedPair(li, rid)] = true
+			i, lin := orderOf[li]
+			j, rin := orderOf[rid]
+			switch {
+			case !lin && !rin:
+				orderOf[li], orderOf[rid] = len(order), len(order)
+				order = append(order, []columnIdent{li, rid})
+			case lin && !rin:
+				orderOf[rid] = i
+				order[i] = append(order[i], rid)
+			case !lin && rin:
+				orderOf[li] = j
+				order[j] = append(order[j], li)
+			case i != j:
+				for _, m := range order[j] {
+					orderOf[m] = i
+				}
+				order[i] = append(order[i], order[j]...)
+				order[j] = nil
+			}
 			k := li
 			key = &k
 		}
@@ -230,6 +294,20 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 	}
 
 	l.assignEquivClasses(ec, classKey)
+	l.ecMembers = map[int][]columnIdent{}
+	for _, ri := range l.all {
+		if ri.ecID == noEquivClass {
+			continue
+		}
+		if _, done := l.ecMembers[ri.ecID]; done {
+			continue
+		}
+		if li, _, ok := ecEqualityIdents(ri.clause); ok {
+			if i, in := orderOf[li]; in {
+				l.ecMembers[ri.ecID] = order[i]
+			}
+		}
+	}
 	return l
 }
 
@@ -358,7 +436,11 @@ func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo 
 	// Core set: clauses computable here that touch both sides.
 	base := l.clausesFor(outer, inner)
 	if sjinfo == nil {
-		return base // inner join — clausesFor is exactly right
+		// inner join — clausesFor, with one clause per equivalence class
+		if l != nil {
+			return l.reduceEquivClassJoinClauses(outer, inner, base)
+		}
+		return base
 	}
 
 	// For outer joins, also admit clauses on the nullable side as filter
@@ -382,6 +464,163 @@ func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo 
 	}
 
 	return dedupRestrictInfoPtrs(append(base, extra...))
+}
+
+// reduceEquivClassJoinClauses is `generate_join_implied_equalities_normal`
+// (equivclass.c) for an inner join (M0146-0022): of an equivalence class's
+// clauses applicable at this join, PG applies ONE, equating the first
+// outer member to the first inner member in `ec_members` order, written
+// outer = inner. The others are redundant because the members within
+// each side are already equal. goopg applied every written and inferred
+// clause (TPC-DS Q74's Join Filter carried three equalities where PG's
+// has one).
+//
+// Fail-closed: a class keeps all its clauses unless every member on
+// each side comes from a distinct input rel, every pair of same-side
+// members is equated by some clause in the list (so a lower join already
+// applied it; the seam's transitive closure supplies these), and a
+// clause for the chosen pair exists. Classes with a single applicable
+// clause are left as written.
+func (l *restrictInfoList) reduceEquivClassJoinClauses(outer, inner RelSet, base []*restrictInfo) []*restrictInfo {
+	if !l.ecReduce || len(base) < 2 {
+		return base
+	}
+	count := map[int]int{}
+	for _, ri := range base {
+		if ri.ecID != noEquivClass && ri.isEquijoin {
+			count[ri.ecID]++
+		}
+	}
+	chosen := map[int]*restrictInfo{}
+	for id, n := range count {
+		if n < 2 {
+			continue
+		}
+		if ri := l.equivClassJoinClause(id, outer, inner, base); ri != nil {
+			chosen[id] = ri
+		}
+	}
+	if len(chosen) == 0 {
+		return base
+	}
+	out := make([]*restrictInfo, 0, len(base))
+	emitted := map[int]bool{}
+	for _, ri := range base {
+		c, reduced := chosen[ri.ecID]
+		if ri.ecID == noEquivClass || !reduced {
+			out = append(out, ri)
+			continue
+		}
+		if !emitted[ri.ecID] {
+			emitted[ri.ecID] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// equivClassJoinClause returns the class's clause for this (outer, inner)
+// split in PG's choice and orientation, or nil when the reduction is not
+// provably safe (see reduceEquivClassJoinClauses).
+func (l *restrictInfoList) equivClassJoinClause(id int, outer, inner RelSet, base []*restrictInfo) *restrictInfo {
+	members := l.ecMembers[id]
+	if len(members) == 0 {
+		return nil
+	}
+	// Each member's input rel, read off the class's clauses.
+	relOf := map[columnIdent]RelSet{}
+	for _, ri := range l.all {
+		if ri.ecID != id || !ri.isEquijoin {
+			continue
+		}
+		li, rid, ok := ecEqualityIdents(ri.clause)
+		if !ok {
+			continue
+		}
+		relOf[li] = ri.leftRelids
+		relOf[rid] = ri.rightRelids
+	}
+	var om, im []columnIdent
+	seenRel := RelSet(0)
+	for _, m := range members {
+		r, ok := relOf[m]
+		if !ok || relLevel(r) != 1 {
+			return nil
+		}
+		if !relsSubset(r, outer|inner) {
+			continue
+		}
+		if relsOverlap(r, seenRel) {
+			return nil
+		}
+		seenRel |= r
+		if relsSubset(r, outer) {
+			om = append(om, m)
+		} else {
+			im = append(im, m)
+		}
+	}
+	if len(om) == 0 || len(im) == 0 || !l.allEquated(om) || !l.allEquated(im) {
+		return nil
+	}
+	for _, ri := range base {
+		if ri.ecID != id || !ri.isEquijoin {
+			continue
+		}
+		li, rid, ok := ecEqualityIdents(ri.clause)
+		if !ok {
+			continue
+		}
+		switch {
+		case li == om[0] && rid == im[0]:
+			return ri
+		case li == im[0] && rid == om[0]:
+			return l.flipped(ri)
+		}
+	}
+	return nil
+}
+
+// allEquated reports whether every pair of ms is equated by a clause.
+func (l *restrictInfoList) allEquated(ms []columnIdent) bool {
+	for i := range ms {
+		for j := i + 1; j < len(ms); j++ {
+			if !l.ecPairs[orderedPair(ms[i], ms[j])] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// flipped returns ri written the other way round (`r = l`), cached so the
+// copy keeps one identity. Equality over one type is symmetric, so the
+// operator is unchanged.
+func (l *restrictInfoList) flipped(ri *restrictInfo) *restrictInfo {
+	if f, ok := l.flips[ri]; ok {
+		return f
+	}
+	bin := ri.clause.(*BinaryOp)
+	nb := *bin
+	nb.Left, nb.Right = bin.Right, bin.Left
+	f := &restrictInfo{
+		clause:      &nb,
+		relids:      ri.relids,
+		isEquijoin:  true,
+		leftKey:     ri.rightKey,
+		rightKey:    ri.leftKey,
+		leftRelids:    ri.rightRelids,
+		rightRelids:   ri.leftRelids,
+		opLeftRelids:  ri.opRightRelids,
+		opRightRelids: ri.opLeftRelids,
+		inferred:    ri.inferred,
+		ecID:        ri.ecID,
+	}
+	if l.flips == nil {
+		l.flips = map[*restrictInfo]*restrictInfo{}
+	}
+	l.flips[ri] = f
+	return f
 }
 
 // isOuterJoinFilterClause reports whether a clause whose relids are a subset of

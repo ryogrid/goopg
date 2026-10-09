@@ -1,0 +1,147 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 30000
+INSERT 0 30000
+INSERT 0 300
+ANALYZE
+ANALYZE
+ANALYZE
+                   QUERY PLAN                    
+-------------------------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: ("*SELECT* 1".dk = d.k)
+         ->  Append
+               ->  Subquery Scan on "*SELECT* 1"
+                     ->  Seq Scan on s1
+                           Filter: (k > 5)
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(11 rows)
+
+       QUERY PLAN        
+-------------------------
+ Append
+   ->  Seq Scan on s1
+         Filter: (k > 5)
+   ->  Seq Scan on s2
+(4 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Append
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Seq Scan on s1
+         ->  Hash
+               ->  Seq Scan on d
+   ->  Seq Scan on s2
+(7 rows)
+
+              QUERY PLAN               
+---------------------------------------
+ Append
+   ->  Subquery Scan on "*SELECT* 1"
+         ->  Hash Join
+               Hash Cond: (s1.k = d.k)
+               ->  Seq Scan on s1
+               ->  Hash
+                     ->  Seq Scan on d
+   ->  Seq Scan on s2
+(8 rows)
+
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Hash Join
+         Hash Cond: ("*SELECT* 1".dk = d2.k)
+         ->  Append
+               ->  Subquery Scan on "*SELECT* 1"
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Seq Scan on s1
+                           ->  Hash
+                                 ->  Seq Scan on d
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d d2
+(13 rows)
+
+           QUERY PLAN            
+---------------------------------
+ Append
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Seq Scan on s1
+         ->  Hash
+               ->  Seq Scan on d
+   ->  Seq Scan on s2
+(7 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+                      QUERY PLAN                       
+-------------------------------------------------------
+ HashAggregate
+   Group Key: d2.m
+   ->  Hash Join
+         Hash Cond: ("*SELECT* 1".dk = d2.k)
+         ->  Append
+               ->  Subquery Scan on "*SELECT* 1"
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Seq Scan on s1
+                           ->  Hash
+                                 ->  Seq Scan on d
+                                       Filter: (m = 3)
+               ->  Subquery Scan on "*SELECT* 2"
+                     ->  Hash Join
+                           Hash Cond: (s2.k = d_1.k)
+                           ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d d_1
+                                       Filter: (m = 3)
+         ->  Hash
+               ->  Seq Scan on d d2
+(21 rows)
+

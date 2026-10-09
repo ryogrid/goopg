@@ -553,12 +553,32 @@ func graftNodeUncached(n Node, s ParallelSettings, anc bool, st *sublinkGraftSta
 		c := *x
 		changed := gx(x.Key, func(v Expr) { c.Key = v })
 		changed = gxs(x.Keys, func(v []Expr) { c.Keys = v }) || changed
+		changed = gx(x.LowKey, func(v Expr) { c.LowKey = v }) || changed
+		changed = gx(x.HighKey, func(v Expr) { c.HighKey = v }) || changed
 		changed = gxs(x.Pred, func(v []Expr) { c.Pred = v }) || changed
 		if !changed {
 			return n
 		}
 		return &c
 	case *Distinct:
+		c := *x
+		if nc := gc(x.Child); nc != x.Child {
+			c.Child = nc
+			return &c
+		}
+		return n
+	case *SubqueryScan:
+		// M0146-0005w: the labelling wrapper carries no expressions;
+		// graft descends the subplan like every other pass-through so
+		// a graftable Gather inside it is not missed.
+		c := *x
+		if nc := gc(x.Child); nc != x.Child {
+			c.Child = nc
+			return &c
+		}
+		return n
+	case *Materialize:
+		// M0146-0010: transparent wrapper — same graft rule.
 		c := *x
 		if nc := gc(x.Child); nc != x.Child {
 			c.Child = nc

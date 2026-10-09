@@ -1,0 +1,4 @@
+Q74 SF1, same clone copy of bench/tpcds/runtime_goopg/data, fresh server per arm, identical plan text modulo cost
+baseline (d2dbbf774) 894 s
+candidate 863 s
+fire-set at FIRESET_TIMEOUT=600: baseline PASS, candidate TIMEOUT; re-run both arms at 1200 s (FIRESET_RESUME=1): PASS/PASS

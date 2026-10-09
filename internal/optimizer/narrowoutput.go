@@ -83,14 +83,15 @@ func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerP
 //     comparator, join_merge_stream.go). Narrowing never touches
 //     `p.HashKeys` and the keep is ascending, so the tuple order is
 //     invariant under the cut.
-//  2. The absorbed PathSort children impose nothing further: they are
-//     stepped over, never emitted (`absorbMergeSort`), so their Pathkeys
-//     are never evaluated. Moreover they cannot name a column outside the
-//     merge clauses — the sort keys ARE clause operands (`mergeKeyGroups`
-//     builds each group's outer/inner PathKey from its first clause's
-//     operand, joinpathsmerge.go; `mergeInnerSortKeys` re-derives per
-//     clause; the ordered-outer arm sorts nothing). Dropped clauses are
-//     demoted to the residual, still inventoried.
+//  2. The PathSort children impose nothing further: they are stepped over
+//     while the side is built and narrowed (`absorbMergeSort`) and
+//     re-emitted above the narrowed node (`restoreMergeSort`), and their
+//     keys cannot name a column outside the merge clauses — the sort keys
+//     ARE clause operands (`mergeKeyGroups` builds each group's outer/inner
+//     PathKey from its first clause's operand, joinpathsmerge.go;
+//     `mergeInnerSortKeys` re-derives per clause; the ordered-outer arm
+//     sorts nothing). Dropped clauses are demoted to the residual, still
+//     inventoried.
 //  3. Hence every side's sort-key columns are that side's HashKeys-operand
 //     columns, and `collectJoinQualNames` walks every HashKeys operand —
 //     so the derived keep (out ∪ ancestors ∪ at-parent) contains every
@@ -343,7 +344,7 @@ func deriveJoinKeepsAt(p *Path, out map[string]bool, anc map[string]bool, poison
 		}
 		deriveJoinKeepsAt(outer, out, childAnc, childPoison)
 		deriveJoinKeepsAt(inner, out, childAnc, childPoison)
-	case PathNestLoop, PathMemoize, PathPrebuilt,
+	case PathNestLoop, PathMemoize, PathMaterial, PathPrebuilt,
 		PathBitmapHeapScan, PathBitmapIndexScan, PathBitmapAnd, PathBitmapOr,
 		PathAgg, PathGather, PathGatherMerge, PathFinalizeAgg:
 		// F3-conservative, B-01a NL policy (decline): a nested-loop
@@ -596,12 +597,37 @@ func searchedResidualHitsPad(residual Expr, searched Node, needed map[string]boo
 // customer-orders-lineitem tree and hashed 6M lineitem rows instead of the
 // 1.5M-row customer ⋈ orders join the search had priced cheapest.
 //
-// A correlated inner plan still makes the walk partial: its OuterColumnRefs
-// name this scope's columns by index, and this name-keyed check cannot see
-// them.
+// A correlated inner plan reads this scope's row only through its outer
+// references, and those carry the column's name (M0146-0005bs): every
+// OuterColumnRef in the plan, nested sublinks included, whose level reaches
+// this scope or beyond is reported by name — over-reporting a reference a
+// binder inside the plan satisfies, or one aimed further out, only errs
+// toward the fallback. A nameless outer reference still makes the walk
+// partial. TPC-DS Q35's `exists(...) or exists(...)` residual reads only
+// `c.c_customer_sk`; the partial walk had fallen back on any needed column
+// padded anywhere (slice 70 pads per alias, so date_dim's d_year padded on
+// one alias while needed on another tripped it).
 func residualColumnRefsByName(e Expr, fn func(string)) bool {
 	return walkColumnRefsByName(e, fn, func(plan Node) bool {
-		return plan != nil && !planHasOuterRef(plan)
+		if plan == nil {
+			return false
+		}
+		if !planHasOuterRef(plan) {
+			return true
+		}
+		named := true
+		walkPlanExprsDeep(plan, 1, func(x Expr, depth int) {
+			o, ok := x.(*OuterColumnRef)
+			if !ok || o.Level < depth {
+				return
+			}
+			if o.Name == "" {
+				named = false
+				return
+			}
+			fn(o.Name)
+		})
+		return named
 	})
 }
 

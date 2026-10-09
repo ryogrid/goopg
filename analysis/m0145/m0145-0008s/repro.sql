@@ -1,0 +1,11 @@
+create table tw(unique1 int, fivethous int, pad text);
+insert into tw select g, g % 5000, repeat('x', 900) from generate_series(0,9999) g;
+analyze tw;
+select pg_relation_size('tw')/8192 as pages;
+explain (costs off) select count(*) from (select unique1 from tw intersect select fivethous from tw) ss;
+select count(*) from (select unique1 from tw intersect select fivethous from tw) ss;
+select count(*) from (select unique1 from tw intersect select fivethous from tw) ss;
+select count(*) from (select unique1 from tw except select fivethous from tw) ss;
+select count(*) from (select unique1 from tw union select fivethous from tw) ss;
+explain (costs off) select count(*) from (select unique1 from tw union all select fivethous from tw) ss;
+select count(*) from (select unique1 from tw union all select fivethous from tw) ss;

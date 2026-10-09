@@ -1,0 +1,16 @@
+962c962
+<   Sort Key: t2.q1, t2.q2
+---
+>   Sort Key: t1.q1, t1.q2
+1892c1892
+<   Sort Key: i1.f1, x
+---
+>   Sort Key: i0.f1, x
+15295c15295
+<   Group Key: c1, c2
+---
+>   Group Key: t2.a, (coalesce(t2.a))
+15297c15297
+<   Sort Key: c1, c2
+---
+>   Sort Key: t2.a, (coalesce(t2.a))

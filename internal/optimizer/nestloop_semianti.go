@@ -37,9 +37,9 @@ type semiAntiJoinFactors struct {
 // for INNER), so the two numbers agree with the joinrel size. PG applies no
 // foreign-key selectivity in this function, and neither does this.
 //
-// Only SEMI and ANTI are handled. PG also takes this branch for an inner join
-// whose inner rel is proven unique (`extra->inner_unique`); goopg's nested loop
-// does not yet (ledgered with M0145-0008l).
+// Only SEMI and ANTI are handled here. PG also takes this branch for an inner
+// join whose inner rel is proven unique (`extra->inner_unique`); the caller
+// builds those factors with innerUniqueMatchFactors (M0146-0005f).
 func (s *searchCtx) semiAntiJoinFactorsFor(outer, inner *RelOptInfo, jt parser.JoinType, clauses []*restrictInfo) semiAntiJoinFactors {
 	if s == nil || outer == nil || inner == nil || (jt != parser.JoinSemi && jt != parser.JoinAnti) {
 		return semiAntiJoinFactors{}
@@ -92,6 +92,17 @@ func (s *searchCtx) semiAntiJoinFactorsFor(outer, inner *RelOptInfo, jt parser.J
 // top: this function charges it. The Material build (`matBuild`) stays the
 // caller's, exactly as around `nestloopCost`.
 func nestloopCostSemiAnti(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64, f semiAntiJoinFactors, indexed bool, numQuals int) Cost {
+	if numQuals < 0 {
+		numQuals = 0
+	}
+	return nestloopCostSemiAntiQual(cp, outer, inner, outerRows, innerRows, innerRescanStartup, innerRescanTotal, f, indexed,
+		cp.cpuOperatorCost*float64(numQuals))
+}
+
+// nestloopCostSemiAntiQual is nestloopCostSemiAnti with the join quals' cost
+// given per tuple — PG's qp_qual_cost.per_tuple — so a correlated SubPlan in a
+// qual is charged at its per-evaluation cost (joinQualPerTuple, M0146-0005).
+func nestloopCostSemiAntiQual(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64, f semiAntiJoinFactors, indexed bool, qualPerTuple float64) Cost {
 	startup := outer.Startup + inner.Startup
 	run := outer.Total - outer.Startup
 	// initial_cost_nestloop charges the rescan STARTUP for every rescan
@@ -129,10 +140,10 @@ func nestloopCostSemiAnti(cp costParams, outer, inner Cost, outerRows, innerRows
 			run += unmatched * innerRescanRun
 		}
 	}
-	if numQuals < 0 {
-		numQuals = 0
+	if qualPerTuple < 0 {
+		qualPerTuple = 0
 	}
-	run += (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQuals)) * ntuples
+	run += (cp.cpuTupleCost + qualPerTuple) * ntuples
 	return Cost{Startup: startup, Total: startup + run}
 }
 

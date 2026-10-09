@@ -69,6 +69,10 @@ func (s *searchCtx) addRestrictionIndexPaths(cat catalog.Catalog) {
 		}
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if s.addOneRestrictionIndexPath(cat, rel, tbl, idx, conjuncts, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}
@@ -85,35 +89,88 @@ func (s *searchCtx) addRestrictionIndexPaths(cat catalog.Catalog) {
 // index qual (PG's btree `amoptionalkey` handling in `build_index_paths`).
 func restrictionEqualityPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
 	var clauses []indexPathClause
-	for pos, colName := range idx.Columns {
-		var found *indexPathClause
-		for _, conj := range conjuncts {
-			bin, ok := conj.(*BinaryOp)
-			if !ok || bin.Op != parser.OpEq {
-				continue
-			}
-			cr, val, ok := normalizeColumnConst(bin.Left, bin.Right)
-			if !ok {
-				continue
-			}
-			// For a rebuildable base leaf the output positions are the table's
-			// column positions — the same assumption the bitmap arm's
-			// matchBitmapIndexQuals relies on.
-			if cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName {
-				continue
-			}
-			if !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
-				continue
-			}
-			found = &indexPathClause{indexCol: pos, key: val, local: conj}
-			break
-		}
+	for pos := range idx.Columns {
+		found := restrictionEqualityOn(cat, tbl, idx, pos, conjuncts)
 		if found == nil {
 			break
 		}
 		clauses = append(clauses, *found)
 	}
 	return clauses
+}
+
+// restrictionEqualityOn is the first local `col = const` conjunct binding
+// index column pos, as an index clause, or nil.
+func restrictionEqualityOn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) *indexPathClause {
+	colName := idx.Columns[pos]
+	for _, conj := range conjuncts {
+		bin, ok := conj.(*BinaryOp)
+		if !ok || bin.Op != parser.OpEq {
+			continue
+		}
+		cr, val, _, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
+		if !ok {
+			continue
+		}
+		// For a rebuildable base leaf the output positions are the table's
+		// column positions — the same assumption the bitmap arm's
+		// matchBitmapIndexQuals relies on.
+		if cr.Index < 0 || cr.Index >= len(tbl.Columns) || tbl.Columns[cr.Index].Name != colName {
+			continue
+		}
+		if !restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+			continue
+		}
+		return &indexPathClause{indexCol: pos, key: val, local: conj}
+	}
+	return nil
+}
+
+// restrictionSkipRun is the unparameterised twin of pickIndexSkipRun
+// (M0146-0005dg): PG 18 binds `col = const` on a NON-leading btree column
+// as an index qual and fills the unbound leading columns with skip arrays
+// (nbtpreprocesskeys.c `_bt_skiparray`), so `inv_item_sk = 100` on
+// `(inv_date_sk, inv_item_sk, inv_warehouse_sk)` drives an Index Scan
+// instead of a Seq Scan. It returns the contiguous equality run starting at
+// the first bound column `skip` (>= 1), or nil when the leading column is
+// itself bound (the prefix arm's domain) or the shape is one the executor's
+// enumeration does not take: an expression or DESC column in the skipped
+// prefix, or an unbound key column that may hold NULLs (the byte-key btree
+// keeps no NULL-keyed entry — indexSkipNullSafe).
+func restrictionSkipRun(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) ([]indexPathClause, int) {
+	if !isBTreeIndex(idx) || len(idx.Columns) < 2 {
+		return nil, 0
+	}
+	if restrictionEqualityOn(cat, tbl, idx, 0, conjuncts) != nil {
+		return nil, 0
+	}
+	skip := -1
+	var clauses []indexPathClause
+	for pos := 1; pos < len(idx.Columns); pos++ {
+		c := restrictionEqualityOn(cat, tbl, idx, pos, conjuncts)
+		if c == nil {
+			if skip > 0 {
+				break
+			}
+			continue
+		}
+		if skip < 0 {
+			skip = pos
+		}
+		clauses = append(clauses, *c)
+	}
+	if skip < 1 {
+		return nil, 0
+	}
+	for i := 0; i < skip; i++ {
+		if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
+			return nil, 0
+		}
+	}
+	if !indexSkipNullSafe(tbl, idx, skip, len(clauses)) {
+		return nil, 0
+	}
+	return clauses, skip
 }
 
 // restrictionLeadingRange binds the index's LEADING column to the first local
@@ -155,7 +212,7 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 		default:
 			continue
 		}
-		cr, val, colOnRight, ok := normalizeColumnConstRange(bin.Left, bin.Right)
+		cr, val, colOnRight, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 		if !ok {
 			continue
 		}
@@ -268,10 +325,24 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 // admitted) rather than a second Expr type switch, so the literal-kind list
 // lives in one place.
 func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) bool {
+	if t, isOuter := outerParamKeyType(val); isOuter {
+		// The probe encodes the key's runtime Datum against the column's
+		// btree byte key with no cast in between, so an outer key must carry
+		// the column's own type; a cross-type comparison stays a filter.
+		return t.Name == col.Type.Name && t.IsArray == col.Type.IsArray
+	}
 	if !isConstExpr(val) {
 		return false
 	}
 	if _, isBool := val.(*BooleanConst); isBool {
+		return false
+	}
+	// M0146-0061: a numeric literal against an integer column is
+	// `(col)::numeric op const` in PG — btree integer_ops has no numeric
+	// member, so the clause is not indexable and stays a filter. Encoding
+	// the literal into the int key rounded it: `a > 198.5` probed `a > 199`
+	// and `a = 198.5` matched a = 199.
+	if _, isNum := val.(*NumericConst); isNum && isIntegerLikeType(col.Type.Name) {
 		return false
 	}
 	if _, isStr := val.(*StringConst); isStr {
@@ -297,7 +368,7 @@ func restrictionIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, clauses
 	sel := 1.0
 	for _, c := range clauses {
 		stats := columnStatsByName(tbl, idx.Columns[c.indexCol])
-		sel *= eqSelectivityForColumn(stats, c.key, rawRows)
+		sel *= indexKeyEqSelectivity(stats, c.key, rawRows, columnTypeByName(tbl, idx.Columns[c.indexCol]))
 	}
 	unique := idx.Unique && len(clauses) == len(idx.Columns)
 	if unique && relTuples > 0 {
@@ -346,6 +417,13 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
 		isRange = true
 	}
+	// M0146-0005dg: nothing binds the leading column — an equality run on a
+	// later column still drives a btree skip scan.
+	skip := 0
+	if len(clauses) == 0 {
+		clauses, skip = restrictionSkipRun(cat, tbl, idx, conjuncts)
+		isRange = false
+	}
 	if len(clauses) == 0 {
 		return false
 	}
@@ -354,7 +432,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// addIndexOnlyPaths will build that index-only path with these same
 	// clauses, a plain twin here would tie it on cost and — filed first —
 	// win add_path's tie, electing the heap-fetching shape PG never builds.
-	if s.restrictionPathIsIndexOnly(cat, tbl, idx, conjuncts) {
+	if s.restrictionPathIsIndexOnly(cat, rel, tbl, idx, conjuncts) {
 		return false
 	}
 	// The byte-key btree stores NO entry whose key has a NULL column
@@ -363,7 +441,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// matching row with a NULL there (measured: `a IN (7, 8) AND b > 90` on
 	// (a, b, c) lost the (7, 92, NULL) row). Bound columns are safe — a NULL
 	// there fails the qual anyway. PG stores NULL keys and has no such rule.
-	if !indexUnboundKeysNotNull(tbl, idx, boundIndexColumns(clauses)) {
+	if skip == 0 && !indexUnboundKeysNotNull(tbl, idx, boundIndexColumns(clauses)) {
 		return false
 	}
 	var sel float64
@@ -402,7 +480,18 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 
 	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
-	qpquals := localQualOpCount(rel.baseLeaf) - float64(len(clauses))
+	// A skip probe descends once per distinct skipped prefix
+	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
+	// side over the whole index (skipScanDescents, boundSelectivity 1).
+	boundSel := 0.0
+	if skip > 0 {
+		var boundCounted bool
+		numSAScans, boundCounted = skipScanDescents(tbl, idx, skip, relTuples, indexPages)
+		if !boundCounted {
+			boundSel = 1
+		}
+	}
+	qpquals := localQualOpCount(rel.baseLeaf) - indexClausesEvalOps(clauses)
 	if qpquals < 0 {
 		qpquals = 0
 	}
@@ -418,8 +507,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		totalTablePages:         totalPages,
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
-		numQualOps: qpquals,
-		numSAScans: numSAScans,
+		numQualOps:       qpquals,
+		numSAScans:       numSAScans,
+		boundSelectivity: boundSel,
 	}
 	cost := costIndexScan(s.cp, in)
 	tgt, tgtKnown := scanPathTarget(rel)
@@ -438,6 +528,8 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		RequiredOuter: 0,
 		Target:        tgt,
 		TargetKnown:   tgtKnown,
+		// M0146-0005dg: clause i probes Columns[skip+i].
+		IndexSkipPrefix: skip,
 	}, "index.restrict")
 	return true
 }
@@ -561,3 +653,57 @@ func indexUnboundKeysNotNull(tbl *catalog.Table, idx *catalog.Index, bound int) 
 	return true
 }
 
+
+// normalizeColumnIndexKey recognises a clause the index producers can bind:
+// a column of this relation compared with a PSEUDO-CONSTANT operand — a
+// literal, or a value fixed for the whole scan though unknown at plan time (a
+// correlated outer-level reference, `OuterColumnRef` / `ExecParamRef`).
+// colOnRight reports that the column was the right operand, so a range
+// operator must be flipped. This is the operand half of PG's
+// `match_clause_to_indexcol` (indxpath.c): the other side may be anything that
+// references none of the index's own relation's columns and is not volatile,
+// and an outer-level Var is a PARAM_EXEC Param there (M0146-0015a). The
+// shared `normalizeColumnConst` keeps its literal-only contract: the
+// selectivity code reads MCVs and histograms through it.
+func normalizeColumnIndexKey(l, r Expr) (*ColumnRef, Expr, bool, bool) {
+	if cr, ok := l.(*ColumnRef); ok && isIndexKeyOperand(r) {
+		return cr, r, false, true
+	}
+	if cr, ok := r.(*ColumnRef); ok && isIndexKeyOperand(l) {
+		return cr, l, true, true
+	}
+	return nil, nil, false, false
+}
+
+// isIndexKeyOperand is the pseudo-constant set normalizeColumnIndexKey admits.
+func isIndexKeyOperand(e Expr) bool {
+	if isConstExpr(e) {
+		return true
+	}
+	_, isOuter := outerParamKeyType(e)
+	return isOuter
+}
+
+// outerParamKeyType reports whether e is a correlated outer-level reference —
+// constant for one execution of the scan, re-evaluated when the enclosing
+// SubPlan re-runs it — and returns its type.
+func outerParamKeyType(e Expr) (catalog.Type, bool) {
+	if o, ok := e.(*OuterColumnRef); ok {
+		return o.Type, true
+	}
+	if p, ok := e.(*ExecParamRef); ok {
+		return p.Type, true
+	}
+	return catalog.Type{}, false
+}
+
+// indexKeyEqSelectivity is the selectivity of `col = key` for an index
+// clause. A literal reads the column's MCVs/histogram (eqSelectivityForColumn);
+// a key unknown at plan time takes PG's `var_eq_non_const` average, which is
+// what `eqsel` computes when the other operand is a Param.
+func indexKeyEqSelectivity(stats *catalog.ColumnStats, key Expr, rawRows float64, typeName string) float64 {
+	if _, isOuter := outerParamKeyType(key); isOuter {
+		return varEqNonConstSelectivity(stats, rawRows)
+	}
+	return eqSelectivityForColumn(stats, key, rawRows, typeName)
+}

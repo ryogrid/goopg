@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS agg_sort_order;
+CREATE TABLE agg_sort_order (c1 int PRIMARY KEY, c2 int);
+CREATE UNIQUE INDEX agg_sort_order_c2_idx ON agg_sort_order(c2);
+INSERT INTO agg_sort_order SELECT i, i FROM generate_series(1,100)i;
+ANALYZE agg_sort_order;
+EXPLAIN (COSTS OFF) SELECT array_agg(c1 ORDER BY c2),c2 FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2;
+SELECT array_agg(c1 ORDER BY c2),c2 FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2 LIMIT 5;
+SELECT array_agg(c1 ORDER BY c2),c2 FROM agg_sort_order WHERE c2 < 100 GROUP BY c1 ORDER BY 2 DESC LIMIT 5;
+SELECT sum(c1), c2 FROM agg_sort_order GROUP BY c1 ORDER BY c2 DESC LIMIT 3;
+SELECT count(*), c2 FROM agg_sort_order WHERE c1 > 95 GROUP BY c1 ORDER BY 2;
+SELECT c2, count(*) FROM agg_sort_order WHERE c1 > 97 GROUP BY c1 ORDER BY c1;
+EXPLAIN (COSTS OFF) SELECT sum(c1), c2 FROM agg_sort_order GROUP BY c1;
+SELECT sum(c1), c2 FROM agg_sort_order GROUP BY c1 ORDER BY 1 LIMIT 3;

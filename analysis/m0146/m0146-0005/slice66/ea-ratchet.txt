@@ -1,0 +1,19 @@
+FINDINGS:  10
+
+    Q       qerr    goopg est     ACTUAL     pg est    pg qerr  node                   relset
+---------------------------------------------------------------------------------------------
+  Q78       87.7         1403     123049          -          -  Merge Left Join        date_dim+store_returns+store_sales+web_returns+web_sales
+  Q14       82.6           74       6116          -          -  Gather                 date_dim+item+web_sales
+  Q14       79.3          147      11662          -          -  Gather                 catalog_sales+date_dim+item
+  Q23       76.0           76          0          -          -  Hash Semi Join         catalog_sales+cte:frequent_ss_items+customer+date_dim
+  Q14       75.4          282      21264          -          -  Gather                 date_dim+item+store_sales
+  Q23       38.0           38          0          -          -  Hash Semi Join         cte:frequent_ss_items+customer+date_dim+web_sales
+  Q23       22.9          151       3464          -          -  Gather                 catalog_sales+customer+date_dim
+  Q95       22.0            1         22          -          -  Hash Semi Join         cte:ws_wh+customer_address+date_dim+web_sales+web_site
+  Q92       20.7          232       4795          -          -  Gather                 date_dim+web_sales
+  Q23       18.6           76       1411          -          -  Gather                 customer+date_dim+web_sales
+
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 10   current: 10
+
+EA-RATCHET: PASS

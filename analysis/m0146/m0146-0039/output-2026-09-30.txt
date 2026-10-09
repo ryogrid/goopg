@@ -1,0 +1,15 @@
+# repro.sh at 50582d155 (goopg), after restart:
+ relname | relnamespace | relpersistence
+---------+--------------+----------------
+ ca      | 2200         | p
+(1 row)
+ k
+---
+ 1
+(1 row)
+ERROR:  relation "ca" does not exist        <- CREATE TEMP TABLE ca
+# PG 18.3: pg_temp_N rows linger invisibly (relpersistence 't') and are
+# removed by the next backend using that temp namespace
+# (RemoveTempRelations / InitTempTableNamespace) or autovacuum's orphan
+# temp cleanup; `ca` is never visible from a new session.
+# Without a restart goopg is correct: a second session does not see `ca`.

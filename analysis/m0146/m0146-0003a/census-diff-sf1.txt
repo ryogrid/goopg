@@ -1,0 +1,30 @@
+28c28
+< Q28 depth=7 [sort-strategy] under Aggregate: PG Gather Merge | goopg Sort
+---
+> Q28 depth=7 [parallelism] under Aggregate: PG Gather Merge | goopg Gather
+88c88
+< Q88 depth=7 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+---
+> Q88 depth=10 [join-method] under Partial Aggregate: PG Nested Loop Inner | goopg Hash Join Inner
+90c90
+< Q90 depth=3 [aggregation-strategy] under Nested Loop: PG Finalize Aggregate | goopg Aggregate
+---
+> Q90 MATCH (no structural divergence)
+100,101c100,101
+< FIRST-DIVERGENCE: queries=99 divergent=88 match=11
+< CATEGORY-ROLLUP: sort-strategy=31 aggregation-strategy=19 parallelism=8 scan-type=7 qual-placement=7 join-method=6 parameterisation=5 error=3 join-order=2
+---
+> FIRST-DIVERGENCE: queries=99 divergent=87 match=12
+> CATEGORY-ROLLUP: sort-strategy=30 aggregation-strategy=17 parallelism=9 join-method=7 scan-type=7 qual-placement=7 parameterisation=5 error=3 join-order=2
+120d119
+<     2  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+133c132
+<     1  sort-strategy    under Aggregate        PG Gather Merge                 goopg Sort                         depth=7
+---
+>     1  parallelism      under Aggregate        PG Gather Merge                 goopg Gather                       depth=7
+144a144
+>     1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=3
+156c156
+<     1  aggregation-strategy under Nested Loop      PG Finalize Aggregate           goopg Aggregate                    depth=7
+---
+>     1  join-method      under Partial Aggregate PG Nested Loop Inner            goopg Hash Join Inner              depth=10

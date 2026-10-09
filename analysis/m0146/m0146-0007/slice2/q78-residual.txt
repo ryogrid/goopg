@@ -1,0 +1,14 @@
+== baseline
+                     ->  Subquery Scan on ss
+                           Filter: (ss_sold_year = 1998)
+                                             Filter: (d_year = 1998)
+                     ->  Subquery Scan on ws
+                           Filter: (ws_sold_year = 1998)
+               ->  Subquery Scan on cs
+                     Filter: (cs_sold_year = 1998)
+                                       Filter: (d_year = 1998)
+== candidate
+                                       Filter: (d_year = 1998)
+                     ->  Subquery Scan on ws
+                           Filter: (ws_sold_year = 1998)
+                                 Filter: (d_year = 1998)

@@ -1,0 +1,6 @@
+TPC-DS SF1 Q74, fire-set execution times (from result-file mtimes; include per-query clone restart overhead; limit 600 s):
+  run 0 (variant without reorder, 09:0x): baseline 593 s PASS, candidate 617 s PASS
+  run 1 (final tree, 10:0x):              baseline 603 s PASS, candidate ~654 s TIMEOUT (gate FAIL)
+  run 2 (final tree, re-run):             baseline 591 s PASS, candidate 642 s PASS (gate PASS)
+The baseline itself sits at the limit; the candidate plan (now = PG's plan shape) runs ~5-9% slower in goopg.
+Filed as M0146-0036.

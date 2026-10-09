@@ -60,6 +60,10 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 		// Generate single-index bitmap paths, collecting them for AND combination.
 		var singlePaths []*Path
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if p := s.buildOneBitmapPath(rel, tbl, idx, relPages, relTuples, T, totalPages, maxEntries, rel.baseLeaf); p != nil {
 				singlePaths = append(singlePaths, p)
 			}
@@ -107,18 +111,21 @@ func (s *searchCtx) buildOneBitmapPath(
 	if idx == nil {
 		return nil
 	}
-	// Partial index — resolve the predicate for recheck at execution time.
-	// Without a predicate-implication prover (same gap as the ordered scan
-	// path), goopg relies on the bitmap's recheck mechanism: the resolved
-	// predicate is appended to BitmapQual and evaluated against every heap
-	// tuple, so correctness is guaranteed even for lossy pages. The cost
-	// model still penalises irrelevant partial indexes through high
-	// selectivity, so they lose to seq scan in add_path when the query
-	// quals don't match (M0129-S5.4).
+	// Partial index. PG builds index paths only for a partial index whose
+	// predicate the query's restriction clauses PROVE (`check_index_predicates`
+	// sets `index->predOK`; `create_index_paths` skips an unproven one,
+	// postgres/src/backend/optimizer/path/indxpath.c). M0145-0008r: this arm
+	// used to admit any partial index on the premise that appending the
+	// predicate to the heap recheck keeps it correct. It does not — a row the
+	// predicate excludes has no index entry, so no recheck can bring it back
+	// (`onek2 WHERE unique1 = 50` over `onek2_u1_prtl ... WHERE stringu1 < 'B'`
+	// returned 0 rows, regress `portals_p2`). The proof is the narrow
+	// `Var op Const` prover the other producers use (M0134-0017b), checked
+	// against each of the leaf's conjuncts below.
 	var partialPredicate Expr
 	if idx.HasPredicate {
 		resolved, err := ResolveIndexPredicate(idx.Predicate, tbl)
-		if err != nil {
+		if err != nil || resolved == nil {
 			// Predicate resolution failed — skip this index.
 			return nil
 		}
@@ -136,7 +143,23 @@ func (s *searchCtx) buildOneBitmapPath(
 	// selectivity replaces the full-scan default of 1.0.
 	id, _, _ := scanLeafFor(leaf)
 	conjuncts := extractFilterConjuncts(leaf)
+	if partialPredicate != nil && !partialPredicateProvenBy(partialPredicate, conjuncts) {
+		return nil
+	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
+	// M0146-0061: with no equality on the leading column, a range bound on it
+	// is still an index clause. match_clause_to_indexcol takes any btree
+	// operator of the column's opfamily, so build_index_paths gives PG a
+	// bitmap path for `a > 97` as for `a = 97`. The bounds are priced by
+	// clauselist_selectivity over them, which pairs a lower and an upper
+	// bound into one band (rangeIndexSelectivity), as the plain index arm
+	// prices them.
+	if len(indexClauses) == 0 {
+		if rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+			indexClauses = rng
+			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
+		}
+	}
 
 	// PG builds a bitmap path only FROM index clauses: `get_index_paths`
 	// (indxpath.c) collects into `bitindexpaths` the paths `build_index_paths`
@@ -306,7 +329,7 @@ func matchBitmapIndexQuals(
 			if !ok || bin.Op != parser.OpEq {
 				continue
 			}
-			cr, val, ok := normalizeColumnConst(bin.Left, bin.Right)
+			cr, val, _, ok := normalizeColumnIndexKey(bin.Left, bin.Right)
 			if !ok {
 				continue
 			}
@@ -318,6 +341,20 @@ func matchBitmapIndexQuals(
 			if tbl.Columns[cr.Index].Name != colName {
 				continue
 			}
+			// An outer-level key must carry the column's own type: the probe
+			// encodes its Datum against the btree byte key uncast.
+			var local Expr
+			if t, isOuter := outerParamKeyType(val); isOuter {
+				ct := tbl.Columns[cr.Index].Type
+				if t.Name != ct.Name || t.IsArray != ct.IsArray {
+					continue
+				}
+				// M0146-0012: that same-type probe is exact, so the conjunct
+				// is the heap scan's recheck rather than a Filter beside it
+				// (createBitmapHeapScanPlan). A literal key keeps its Filter:
+				// this arm does not run restrictionKeyUsable's cast checks.
+				local = conj
+			}
 			// Found an equality conjunct matching this index column.
 			stats := columnStatsByName(tbl, colName)
 			// take2 P2-09: the relation's raw tuple count resolves the
@@ -326,18 +363,19 @@ func matchBitmapIndexQuals(
 			if tbl.Stats != nil {
 				rawRows = float64(tbl.Stats.RowCount)
 			}
-			colSel := eqSelectivityForColumn(stats, val, rawRows)
+			colSel := indexKeyEqSelectivity(stats, val, rawRows, columnTypeByName(tbl, colName))
 			selectivity *= colSel
 
 			// ri is nil: local quals have no restrictInfo. The Key/Keys
 			// fields (from c.key) are still used by createBitmapIndexScanPlan
 			// to set the index probe bounds. bitmapQualExprs skips entries
-			// with nil ri — local equality conjuncts don't need recheck
-			// because exact B-tree lookup is always correct.
+			// with nil ri; createBitmapHeapScanPlan moves a set `local`
+			// into the recheck list instead.
 			clauses = append(clauses, indexPathClause{
 				ri:       nil,
 				indexCol: pos,
 				key:      val,
+				local:    local,
 			})
 			break // first wins per column
 		}
@@ -347,6 +385,21 @@ func matchBitmapIndexQuals(
 		return nil, 1.0
 	}
 	return clauses, clampSelectivity(selectivity)
+}
+
+// bitmapLeadingRange is restrictionLeadingRange for the bitmap producer, with
+// constant bounds only. An outer-level bound would make the bitmap a
+// correlated probe, and the decorrelation clone (clonePlanReplacingOuter)
+// harvests only equality keys from a BitmapIndexScan; such a bound stays a
+// Filter, as before.
+func bitmapLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
+	var out []indexPathClause
+	for _, c := range restrictionLeadingRange(cat, tbl, idx, conjuncts) {
+		if isConstExpr(c.key) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // chooseBitmapAnd ports PG's choose_bitmap_and (indxpath.c:1786-1988):
@@ -541,6 +594,10 @@ func (s *searchCtx) addParameterizedBitmapPaths(cat catalog.Catalog) {
 		added := false
 		for _, req := range consideredParameterizations(cands) {
 			for _, idx := range cat.IndexesOnTable(tbl) {
+				// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+				if !idx.HasStorage() {
+					continue
+				}
 				if pth := s.buildOneParameterizedBitmapPath(rel, tbl, idx, cands, req,
 					relPages, relTuples, T, totalPages, maxEntries); pth != nil {
 					addPath(rel, pth, "bitmap.or")
@@ -611,7 +668,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
-		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(rel, req))
 	child := &Path{
 		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
@@ -639,4 +696,18 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		Children:     []*Path{child},
 		ParallelSafe: parallelSafeWith(rel, child),
 	}
+}
+
+// partialPredicateProvenBy reports whether some restriction conjunct proves a
+// partial index's predicate — PG's `predOK` (`check_index_predicates`,
+// indxpath.c) at the narrow `provePartialIndexPredicate` fidelity. An unproven
+// partial index may not be scanned at all: its missing entries are rows the
+// query can still return.
+func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
+	for _, c := range conjuncts {
+		if provePartialIndexPredicate(predicate, c) {
+			return true
+		}
+	}
+	return false
 }

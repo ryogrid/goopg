@@ -1,0 +1,2 @@
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count

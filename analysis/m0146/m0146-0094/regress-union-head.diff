@@ -1,0 +1,910 @@
+--- /tmp/tmp.ueD659q6Qi	2026-10-08 00:55:51.525994416 +0900
++++ /tmp/tmp.bMLFCqb7D6	2026-10-08 00:55:51.522068687 +0900
+@@ -284,10 +284,12 @@
+  4567890123456789
+  4567890123456789
+ (3 rows)
+ SELECT q1 FROM int8_tbl EXCEPT ALL SELECT q1 FROM int8_tbl FOR NO KEY UPDATE;
+ ERROR:  FOR NO KEY UPDATE is not allowed with UNION/INTERSECT/EXCEPT
++LINE 1: ... FROM int8_tbl EXCEPT ALL SELECT q1 FROM int8_tbl FOR NO KEY...
++  ^
+ -- nested cases
+ (SELECT 1,2,3 UNION SELECT 4,5,6) INTERSECT SELECT 4,5,6;
+  ?column? | ?column? | ?column?
+ ----------+----------+----------
+   4 |  5 |  6
+@@ -388,20 +390,22 @@
+ set enable_hashagg to off;
+ explain (costs off)
+ select count(*) from
+   ( select unique1 from tenk1 union select fivethous from tenk1 ) ss;
+   QUERY PLAN
+-----------------------------------------------------------------
++----------------------------------------------------------------------
+  Aggregate
+   ->  Unique
+   ->  Merge Append
+   Sort Key: tenk1.unique1
++  ->  Sort
++  Sort Key: tenk1.unique1
+   ->  Index Only Scan using tenk1_unique1 on tenk1
+   ->  Sort
+   Sort Key: tenk1_1.fivethous
+   ->  Seq Scan on tenk1 tenk1_1
+-(8 rows)
++(10 rows)
+ select count(*) from
+   ( select unique1 from tenk1 union select fivethous from tenk1 ) ss;
+  count
+ -------
+  10000
+@@ -410,27 +414,25 @@
+ select count(*) from
+   ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
+   QUERY PLAN
+ ------------------------------------------------------------------
+  Aggregate
+-  ->  SetOp Intersect
+-  ->  Sort
+-  Sort Key: tenk1.fivethous
++  ->  HashSetOp Intersect
+   ->  Seq Scan on tenk1
+   ->  Index Only Scan using tenk1_unique1 on tenk1 tenk1_1
+-(6 rows)
++(4 rows)
+ select count(*) from
+   ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
+  count
+ -------
+   5000
+ (1 row)
+ explain (costs off)
+ select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
+   QUERY PLAN
+ ------------------------------------------------------------
+- SetOp Except
++ HashSetOp Except
+   ->  Index Only Scan using tenk1_unique1 on tenk1
+   ->  Index Only Scan using tenk1_unique2 on tenk1 tenk1_1
+   Filter: (unique2 <> 10)
+ (4 rows)
+ select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
+@@ -440,103 +442,105 @@
+ (1 row)
+ explain (costs off)
+ select f1 from int4_tbl union all
+   (select unique1 from tenk1 union select unique2 from tenk1);
+   QUERY PLAN
+-------------------------------------------------------------------------
++------------------------------------------------------------------------------
+  Append
+   ->  Seq Scan on int4_tbl
+   ->  Unique
+   ->  Merge Append
+   Sort Key: tenk1.unique1
++  ->  Sort
++  Sort Key: tenk1.unique1
+   ->  Index Only Scan using tenk1_unique1 on tenk1
++  ->  Sort
++  Sort Key: tenk1_1.unique2
+   ->  Index Only Scan using tenk1_unique2 on tenk1 tenk1_1
+-(7 rows)
++(11 rows)
+ reset enable_hashagg;
+ -- non-hashable type
+ set enable_hashagg to on;
+ explain (costs off)
+ select x from (values ('11'::varbit), ('10'::varbit)) _(x) union select x from (values ('11'::varbit), ('10'::varbit)) _(x);
+   QUERY PLAN
+------------------------------------------------
+- Unique
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
++-----------------------------
++ HashAggregate
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(5 rows)
+ set enable_hashagg to off;
+ explain (costs off)
+ select x from (values ('11'::varbit), ('10'::varbit)) _(x) union select x from (values ('11'::varbit), ('10'::varbit)) _(x);
+   QUERY PLAN
+------------------------------------------------
++-----------------------------------
+  Unique
+   ->  Sort
+-  Sort Key: "*VALUES*".column1
++  Sort Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (6 rows)
+ reset enable_hashagg;
+ -- arrays
+ set enable_hashagg to on;
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) union select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------------
++-----------------------------
+  HashAggregate
+-  Group Key: "*VALUES*".column1
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (5 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) union select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+- {1,4}
+  {1,2}
+  {1,3}
++ {1,4}
+ (3 rows)
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) intersect select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------
++-----------------------
+  HashSetOp Intersect
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (3 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) intersect select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+  {1,2}
+ (1 row)
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) except select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------
++-----------------------
+  HashSetOp Except
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (3 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) except select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+  {1,3}
+ (1 row)
+ -- non-hashable type
+ explain (costs off)
+ select x from (values (array['10'::varbit]), (array['11'::varbit])) _(x) union select x from (values (array['10'::varbit]), (array['01'::varbit])) _(x);
+   QUERY PLAN
+------------------------------------------------
+- Unique
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
++-----------------------------
++ HashAggregate
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(5 rows)
+ select x from (values (array['10'::varbit]), (array['11'::varbit])) _(x) union select x from (values (array['10'::varbit]), (array['01'::varbit])) _(x);
+   x
+ ------
+  {01}
+  {10}
+@@ -544,17 +548,17 @@
+ (3 rows)
+ set enable_hashagg to off;
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) union select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------------------
++-----------------------------------
+  Unique
+   ->  Sort
+-  Sort Key: "*VALUES*".column1
++  Sort Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (6 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) union select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+  {1,2}
+@@ -562,36 +566,28 @@
+  {1,4}
+ (3 rows)
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) intersect select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Intersect
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Intersect
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) intersect select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+  {1,2}
+ (1 row)
+ explain (costs off)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) except select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Except
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Except
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (array[1, 2]), (array[1, 3])) _(x) except select x from (values (array[1, 2]), (array[1, 4])) _(x);
+   x
+ -------
+  {1,3}
+ (1 row)
+@@ -599,54 +595,45 @@
+ -- records
+ set enable_hashagg to on;
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------------
+- Unique
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
++-----------------------------
++ HashAggregate
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(5 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,2)
+  (1,3)
+  (1,4)
+ (3 rows)
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Intersect
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Intersect
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,2)
+ (1 row)
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Except
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Except
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,3)
+ (1 row)
+@@ -654,18 +641,17 @@
+ -- With an anonymous row type, the typcache does not report that the
+ -- type is hashable.  (Otherwise, this would fail at execution time.)
+ explain (costs off)
+ select x from (values (row('10'::varbit)), (row('11'::varbit))) _(x) union select x from (values (row('10'::varbit)), (row('01'::varbit))) _(x);
+   QUERY PLAN
+------------------------------------------------
+- Unique
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
++-----------------------------
++ HashAggregate
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(5 rows)
+ select x from (values (row('10'::varbit)), (row('11'::varbit))) _(x) union select x from (values (row('10'::varbit)), (row('01'::varbit))) _(x);
+   x
+ ------
+  (01)
+  (10)
+@@ -675,18 +661,17 @@
+ -- for hashability.
+ create type ct1 as (f1 varbit);
+ explain (costs off)
+ select x from (values (row('10'::varbit)::ct1), (row('11'::varbit)::ct1)) _(x) union select x from (values (row('10'::varbit)::ct1), (row('01'::varbit)::ct1)) _(x);
+   QUERY PLAN
+------------------------------------------------
+- Unique
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
++-----------------------------
++ HashAggregate
++  Group Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
+-(6 rows)
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(5 rows)
+ select x from (values (row('10'::varbit)::ct1), (row('11'::varbit)::ct1)) _(x) union select x from (values (row('10'::varbit)::ct1), (row('01'::varbit)::ct1)) _(x);
+   x
+ ------
+  (01)
+  (10)
+@@ -695,17 +680,17 @@
+ drop type ct1;
+ set enable_hashagg to off;
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------------
++-----------------------------------
+  Unique
+   ->  Sort
+-  Sort Key: "*VALUES*".column1
++  Sort Key: x
+   ->  Append
+-  ->  Values Scan on "*VALUES*"
+-  ->  Values Scan on "*VALUES*_1"
++  ->  Values (2 rows)
++  ->  Values (2 rows)
+ (6 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) union select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,2)
+@@ -713,53 +698,45 @@
+  (1,4)
+ (3 rows)
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Intersect
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Intersect
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) intersect select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,2)
+ (1 row)
+ explain (costs off)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   QUERY PLAN
+------------------------------------------
+- SetOp Except
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  ->  Sort
+-  Sort Key: "*VALUES*_1".column1
+-  ->  Values Scan on "*VALUES*_1"
+-(7 rows)
++-----------------------
++ HashSetOp Except
++  ->  Values (2 rows)
++  ->  Values (2 rows)
++(3 rows)
+ select x from (values (row(1, 2)), (row(1, 3))) _(x) except select x from (values (row(1, 2)), (row(1, 4))) _(x);
+   x
+ -------
+  (1,3)
+ (1 row)
+ -- non-sortable type
+ -- Ensure we get a HashAggregate plan.  Keep enable_hashagg=off to ensure
+ -- there's no chance of a sort.
+ explain (costs off) select '123'::xid union select '123'::xid;
+   QUERY PLAN
+----------------------------
+- HashAggregate
+-  Disabled: true
+-  Group Key: ('123'::xid)
++-----------------------------------
++ Unique
++  ->  Sort
++  Sort Key: ('123')
+   ->  Append
+-  ->  Result
+-  ->  Result
++  ->  Values (1 rows)
++  ->  Values (1 rows)
+ (6 rows)
+ reset enable_hashagg;
+ --
+ -- Mixed types
+ --
+@@ -844,11 +821,10 @@
+ -- This should fail, because q2 isn't a name of an EXCEPT output column
+ SELECT q1 FROM int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1;
+ ERROR:  column "q2" does not exist
+ LINE 1: ... int8_tbl EXCEPT SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1...
+   ^
+-DETAIL:  There is a column named "q2" in table "*SELECT* 2", but it cannot be referenced from this part of the query.
+ -- But this should work:
+ SELECT q1 FROM int8_tbl EXCEPT (((SELECT q2 FROM int8_tbl ORDER BY q2 LIMIT 1))) ORDER BY 1;
+   q1
+ ------------------
+   123
+@@ -885,14 +861,14 @@
+ -- fine to make use of Unique, which is cheaper than HashAggregate and we've
+ -- no means to disable Unique.
+ explain (costs off)
+ select from generate_series(1,5) intersect select from generate_series(1,3);
+   QUERY PLAN
+-----------------------------------------------------------
+- SetOp Intersect
++----------------------------------------
++ HashSetOp Intersect
++  ->  Function Scan on generate_series
+   ->  Function Scan on generate_series
+-  ->  Function Scan on generate_series generate_series_1
+ (3 rows)
+ select from generate_series(1,5) union all select from generate_series(1,3);
+ --
+ (8 rows)
+ select from generate_series(1,5) intersect select from generate_series(1,3);
+@@ -911,23 +887,23 @@
+ set enable_hashagg = false;
+ set enable_sort = true;
+ explain (costs off)
+ select from generate_series(1,5) union select from generate_series(1,3);
+   QUERY PLAN
+-----------------------------------------------------------------
++----------------------------------------------
+  Unique
+   ->  Append
+   ->  Function Scan on generate_series
+-  ->  Function Scan on generate_series generate_series_1
++  ->  Function Scan on generate_series
+ (4 rows)
+ explain (costs off)
+ select from generate_series(1,5) intersect select from generate_series(1,3);
+   QUERY PLAN
+-----------------------------------------------------------
+- SetOp Intersect
++----------------------------------------
++ HashSetOp Intersect
++  ->  Function Scan on generate_series
+   ->  Function Scan on generate_series
+-  ->  Function Scan on generate_series generate_series_1
+ (3 rows)
+ select from generate_series(1,5) union select from generate_series(1,3);
+ --
+ (1 row)
+ select from generate_series(1,5) union all select from generate_series(1,3);
+@@ -998,32 +974,31 @@
+  (SELECT a || b AS ab FROM t1
+   UNION ALL
+   SELECT * FROM t2) t
+  WHERE ab = 'ab';
+   QUERY PLAN
+----------------------------------------------
++-----------------------------
+  Append
+-  ->  Index Scan using t1_ab_idx on t1
+-  Index Cond: ((a || b) = 'ab'::text)
+-  ->  Index Only Scan using t2_pkey on t2
+-  Index Cond: (ab = 'ab'::text)
+-(5 rows)
++  Filter: (ab = 'ab'::text)
++  ->  Seq Scan on t1
++  ->  Seq Scan on t2
++(4 rows)
+ explain (costs off)
+  SELECT * FROM
+  (SELECT a || b AS ab FROM t1
+   UNION
+   SELECT * FROM t2) t
+  WHERE ab = 'ab';
+   QUERY PLAN
+----------------------------------------------------
+- HashAggregate
+-  Group Key: ((t1.a || t1.b))
++-----------------------------------
++ Subquery Scan on t
++  Filter: (t.ab = 'ab'::text)
++  ->  HashAggregate
++  Group Key: (t1.a || t1.b)
+   ->  Append
+-  ->  Index Scan using t1_ab_idx on t1
+-  Index Cond: ((a || b) = 'ab'::text)
+-  ->  Index Only Scan using t2_pkey on t2
+-  Index Cond: (ab = 'ab'::text)
++  ->  Seq Scan on t1
++  ->  Seq Scan on t2
+ (7 rows)
+ --
+ -- Test that ORDER BY for UNION ALL can be pushed down to inheritance
+ -- children.
+ --
+@@ -1040,19 +1015,22 @@
+   (SELECT a || b AS ab FROM t1
+   UNION ALL
+   SELECT ab FROM t2) t
+   ORDER BY 1 LIMIT 8;
+   QUERY PLAN
+------------------------------------------------------
++-----------------------------------------
+  Limit
+-  ->  Merge Append
++  ->  Sort
+   Sort Key: ((t1.a || t1.b))
+-  ->  Index Scan using t1_ab_idx on t1
+-  ->  Index Scan using t1c_ab_idx on t1c t1_1
+-  ->  Index Scan using t2_pkey on t2
+-  ->  Index Scan using t2c_pkey on t2c t2_1
+-(7 rows)
++  ->  Append
++  ->  Append
++  ->  Seq Scan on t1
++  ->  Seq Scan on t1c
++  ->  Append
++  ->  Seq Scan on t2
++  ->  Seq Scan on t2c
++(10 rows)
+   SELECT * FROM
+   (SELECT a || b AS ab FROM t1
+   UNION ALL
+   SELECT ab FROM t2) t
+   ORDER BY 1 LIMIT 8;
+@@ -1080,18 +1058,18 @@
+  from (select event_id from events
+   union all
+   select event_id from other_events) ss
+  order by event_id;
+   QUERY PLAN
+-----------------------------------------------------------
+- Merge Append
++--------------------------------------------
++ Sort
+   Sort Key: events.event_id
+-  ->  Index Scan using events_pkey on events
+-  ->  Sort
+-  Sort Key: events_1.event_id
+-  ->  Seq Scan on events_child events_1
+-  ->  Index Scan using other_events_pkey on other_events
++  ->  Append
++  ->  Append
++  ->  Seq Scan on events
++  ->  Seq Scan on events_child
++  ->  Seq Scan on other_events
+ (7 rows)
+ drop table events_child, events, other_events;
+ reset enable_indexonlyscan;
+ -- Test constraint exclusion of UNION ALL subqueries
+ explain (costs off)
+@@ -1099,33 +1077,37 @@
+   (SELECT 1 AS t, * FROM tenk1 a
+   UNION ALL
+   SELECT 2 AS t, * FROM tenk1 b) c
+  WHERE t = 2;
+   QUERY PLAN
+----------------------
+- Seq Scan on tenk1 b
+-(1 row)
++---------------------------
++ Append
++  Filter: (t = 2)
++  ->  Seq Scan on tenk1 a
++  ->  Seq Scan on tenk1 b
++(4 rows)
+ -- Test that we push quals into UNION sub-selects only when it's safe
+ explain (costs off)
+ SELECT * FROM
+   (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+ WHERE x < 4
+ ORDER BY x;
+   QUERY PLAN
+---------------------------------------------------
++-----------------------------------------------
+  Sort
+-  Sort Key: (2)
++  Sort Key: ss.x
++  ->  Subquery Scan on ss
++  Filter: (ss.x < 4)
+   ->  Unique
+   ->  Sort
+   Sort Key: (1), (2)
+   ->  Append
+-  ->  Result
+-  ->  Result
+-  One-Time Filter: false
+-(9 rows)
++  ->  Values (1 rows)
++  ->  Values (1 rows)
++(10 rows)
+ SELECT * FROM
+   (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+ WHERE x < 4
+@@ -1140,21 +1122,21 @@
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+ WHERE x < 4
+ ORDER BY x;
+   QUERY PLAN
+---------------------------------------------------------
++-----------------------------------------------
+  Sort
+   Sort Key: ss.x
+   ->  Subquery Scan on ss
+   Filter: (ss.x < 4)
+   ->  HashAggregate
+-  Group Key: (1), (generate_series(1, 10))
++  Group Key: t, x
+   ->  Append
+   ->  ProjectSet
+-  ->  Result
+-  ->  Result
++  ->  Values (1 rows)
++  ->  Values (1 rows)
+ (10 rows)
+ SELECT * FROM
+   (SELECT 1 AS t, generate_series(1,10) AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+@@ -1172,21 +1154,21 @@
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+ WHERE x > 3
+ ORDER BY x;
+   QUERY PLAN
+-------------------------------------------------------------------------------------
++----------------------------------------------------------------
+  Sort
+   Sort Key: ss.x
+   ->  Subquery Scan on ss
+   Filter: (ss.x > 3)
+   ->  Unique
+   ->  Sort
+-  Sort Key: (1), (((random() * '3'::double precision))::integer)
++  Sort Key: (1), (((random() * 3))::integer)
+   ->  Append
+-  ->  Result
+-  ->  Result
++  ->  Values (1 rows)
++  ->  Values (1 rows)
+ (10 rows)
+ SELECT * FROM
+   (SELECT 1 AS t, (random()*3)::int AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+@@ -1203,27 +1185,23 @@
+   (select distinct * from int8_tbl i81
+   union all
+   select distinct * from int8_tbl i82) ss
+ where q2 = q2;
+   QUERY PLAN
+-----------------------------------------------------------
++--------------------------------------------------
+  Unique
+-  ->  Merge Append
+-  Sort Key: "*SELECT* 1".q1
+-  ->  Subquery Scan on "*SELECT* 1"
+-  ->  Unique
+   ->  Sort
+-  Sort Key: i81.q1, i81.q2
++  Sort Key: i81.q1
++  ->  Append
++  Filter: (i81.q2 = i81.q2)
++  ->  HashAggregate
++  Group Key: i81.q1, i81.q2
+   ->  Seq Scan on int8_tbl i81
+-  Filter: (q2 IS NOT NULL)
+-  ->  Subquery Scan on "*SELECT* 2"
+-  ->  Unique
+-  ->  Sort
+-  Sort Key: i82.q1, i82.q2
++  ->  HashAggregate
++  Group Key: i82.q1, i82.q2
+   ->  Seq Scan on int8_tbl i82
+-  Filter: (q2 IS NOT NULL)
+-(15 rows)
++(11 rows)
+ select distinct q1 from
+   (select distinct * from int8_tbl i81
+   union all
+   select distinct * from int8_tbl i82) ss
+ where q2 = q2;
+@@ -1237,27 +1215,23 @@
+   (select distinct * from int8_tbl i81
+   union all
+   select distinct * from int8_tbl i82) ss
+ where -q1 = q2;
+   QUERY PLAN
+---------------------------------------------------------
++--------------------------------------------------
+  Unique
+-  ->  Merge Append
+-  Sort Key: "*SELECT* 1".q1
+-  ->  Subquery Scan on "*SELECT* 1"
+-  ->  Unique
+   ->  Sort
+-  Sort Key: i81.q1, i81.q2
++  Sort Key: i81.q1
++  ->  Append
++  Filter: ((- i81.q1) = i81.q2)
++  ->  HashAggregate
++  Group Key: i81.q1, i81.q2
+   ->  Seq Scan on int8_tbl i81
+-  Filter: ((- q1) = q2)
+-  ->  Subquery Scan on "*SELECT* 2"
+-  ->  Unique
+-  ->  Sort
+-  Sort Key: i82.q1, i82.q2
++  ->  HashAggregate
++  Group Key: i82.q1, i82.q2
+   ->  Seq Scan on int8_tbl i82
+-  Filter: ((- q1) = q2)
+-(15 rows)
++(11 rows)
+ select distinct q1 from
+   (select distinct * from int8_tbl i81
+   union all
+   select distinct * from int8_tbl i82) ss
+ where -q1 = q2;
+@@ -1276,18 +1250,18 @@
+ explain (costs off)
+ select * from
+   (select * from t3 a union all select * from t3 b) ss
+   join int4_tbl on f1 = expensivefunc(x);
+   QUERY PLAN
+-------------------------------------------------------------
+- Nested Loop
+-  ->  Seq Scan on int4_tbl
++-------------------------------------------------
++ Hash Join
++  Hash Cond: (expensivefunc(a.x) = int4_tbl.f1)
+   ->  Append
+-  ->  Index Scan using t3i on t3 a
+-  Index Cond: (expensivefunc(x) = int4_tbl.f1)
+-  ->  Index Scan using t3i on t3 b
+-  Index Cond: (expensivefunc(x) = int4_tbl.f1)
++  ->  Seq Scan on t3 a
++  ->  Seq Scan on t3 b
++  ->  Hash
++  ->  Seq Scan on int4_tbl
+ (7 rows)
+ select * from
+   (select * from t3 a union all select * from t3 b) ss
+   join int4_tbl on f1 = expensivefunc(x);
+  x | f1
+@@ -1303,15 +1277,15 @@
+   (select *, 0 as x from int8_tbl a
+   union all
+   select *, 1 as x from int8_tbl b) ss
+ where (x = 0) or (q1 >= q2 and q1 <= q2);
+   QUERY PLAN
+----------------------------------------------
++------------------------------------------------------------
+  Append
++  Filter: ((x = 0) OR ((a.q1 >= a.q2) AND (a.q1 <= a.q2)))
+   ->  Seq Scan on int8_tbl a
+   ->  Seq Scan on int8_tbl b
+-  Filter: ((q1 >= q2) AND (q1 <= q2))
+ (4 rows)
+ select * from
+   (select *, 0 as x from int8_tbl a
+   union all
+   select *, 1 as x from int8_tbl b) ss
+@@ -1333,30 +1307,32 @@
+ select t1.unique1 from tenk1 t1
+ inner join tenk2 t2 on t1.tenthous = t2.tenthous and t2.thousand = 0
+   union all
+ (values(1)) limit 1;
+   QUERY PLAN
+----------------------------------------------------------------------
++------------------------------------------------------
+  Limit
+   ->  Append
+-  ->  Nested Loop
++  ->  Hash Join
++  Hash Cond: (t1.tenthous = t2.tenthous)
++  ->  Seq Scan on tenk1 t1
++  ->  Hash
+   ->  Seq Scan on tenk2 t2
+   Filter: (thousand = 0)
+-  ->  Index Scan using tenk1_thous_tenthous on tenk1 t1
+-  Index Cond: (tenthous = t2.tenthous)
+-  ->  Result
+-(8 rows)
++  ->  Values (1 rows)
++(9 rows)
+ -- Ensure there is no problem if cheapest_startup_path is NULL
+ explain (costs off)
+ select * from tenk1 t1
+ left join lateral
+   (select t1.tenthous from tenk2 t2 union all (values(1)))
+ on true limit 1;
+   QUERY PLAN
+--------------------------------------------------------------------
++----------------------------------------
+  Limit
+   ->  Nested Loop Left Join
++  Join Filter: (true)
+   ->  Seq Scan on tenk1 t1
+   ->  Append
+-  ->  Index Only Scan using tenk2_hundred on tenk2 t2
+-  ->  Result
+-(6 rows)
++  ->  Seq Scan on tenk2 t2
++  ->  Values (1 rows)
++(7 rows)

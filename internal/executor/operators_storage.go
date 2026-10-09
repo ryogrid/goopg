@@ -2679,6 +2679,12 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
+			// The column's numeric(p,s) typmod rounds and pads the stored
+			// value (apply_typmod); it was never applied, so 1.26 into a
+			// numeric(4,1) stayed 1.26 (M0146-0087).
+			if prec, scale, ok := numericColumnTypmod(col.Type); ok && cerr == nil {
+				coerced, cerr = applyNumericTypmod(coerced, prec, scale)
+			}
 		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 			// M0119-0006 (reg* + cid 4-byte storage): resolve a bare quoted name
 			// literal to its OID before the heap arm stores it — a reg* name must
@@ -2695,6 +2701,20 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 		row[i] = coerced
 	}
 	return nil
+}
+
+// applyDefaultNumericTypmods applies a numeric(p,s) column's typmod to a
+// value that came from the column DEFAULT: PG coerces the default
+// expression to the column's type and typmod (build_column_default), so
+// `numeric(5,2) DEFAULT 1.5` stores 1.50. coerceRowForConstraintChecks skips
+// defaulted columns (missing[i]). M0146-0087.
+func applyDefaultNumericTypmods(cols []catalog.Column, row Row, missing []bool, ctx *Context, pos int) error {
+	return coerceRowForConstraintChecks(cols, row, func(i int) bool {
+		if i >= len(missing) || !missing[i] {
+			return false
+		}
+		return isTypmodNumericColumn(cols[i])
+	}, ctx, pos)
 }
 
 func (o *insertOp) Next() (TupleSlot, error) {
@@ -2718,7 +2738,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			bsess.MarkTableActive(o.plan.Table.OID)
 			defer bsess.UnmarkTableActive(o.plan.Table.OID)
 		}
-		if err := fireStatementTriggers(o.ctx, o.plan.Table, "before", "insert"); err != nil {
+		if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "insert", nil); err != nil {
 			return nil, err
 		}
 	}
@@ -2790,6 +2810,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if err := coerceRowForConstraintChecks(cols, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
 			return nil, err
 		}
+		if err := applyDefaultNumericTypmods(cols, row, insertMissing, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 
 		// BEFORE INSERT triggers (M0096-0012).
 		if len(o.plan.Table.Triggers) > 0 {
@@ -2823,7 +2846,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{
 						Code:    "23502",
 						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, o.plan.Table.Name),
-						Detail:  formatRowForDetail(cols, row),
+						Detail:  formatRowForDetail(o.ctx, cols, row),
 					}
 				}
 			}
@@ -2917,7 +2940,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{
 						Code:    "23502",
 						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, partTable.Name),
-						Detail:  formatRowForDetail(partTable.Columns, partRow),
+						Detail:  formatRowForDetail(o.ctx, partTable.Columns, partRow),
 					}
 				}
 			}
@@ -3011,14 +3034,20 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
-		// AFTER INSERT triggers (M0097-0140).
+		// AFTER INSERT triggers (M0097-0140), queued to the end of the
+		// query (M0146-0076).
 		if len(o.plan.Table.Triggers) > 0 {
-			if _, _, err := fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row); err != nil {
+			if err := queueAfterRowTriggers(o.ctx, o.plan.Table, "insert", nil, row, nil); err != nil {
 				return nil, err
 			}
 		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
+	}
+	if len(o.plan.Table.Triggers) > 0 {
+		if err := queueAfterStatementTriggers(o.ctx, o.plan.Table, "insert", nil); err != nil {
+			return nil, err
+		}
 	}
 	// Yield the first RETURNING row inline (subsequent rows come from the
 	// done-branch in Next()). Without RETURNING, return EOF as before so
@@ -3033,16 +3062,56 @@ func (o *insertOp) Next() (TupleSlot, error) {
 
 // formatRowForDetail formats a row for NOT NULL violation DETAIL messages.
 // Produces: "Failing row contains (v1, v2, ...)."
-func formatRowForDetail(cols []catalog.Column, row Row) string {
+func formatRowForDetail(ctx *Context, cols []catalog.Column, row Row) string {
 	parts := make([]string, len(cols))
 	for i := range cols {
 		if i >= len(row) || row[i].IsNull() {
 			parts[i] = "null"
 			continue
 		}
-		parts[i] = row[i].Format()
+		parts[i] = detailValueText(ctx, cols[i].Type, row[i])
 	}
 	return "Failing row contains (" + strings.Join(parts, ", ") + ")."
+}
+
+// detailValueText renders one non-NULL value of a constraint-violation
+// DETAIL ("Failing row contains (…)", "Key (…)=(…)") with its column type's
+// output function under the session's DateStyle, TimeZone and bytea_output.
+// PG's ExecBuildSlotValueDescription and BuildIndexValueDescription call
+// OidOutputFunctionCall per value; Datum.Format rendered a date as
+// 01-02-2020, a timestamp with six fraction digits, and a time with a
+// 1970-01-01 date (M0146-0083). datumToCopyText is the typed output path
+// COPY TO uses; on an error it falls back to Format.
+func detailValueText(ctx *Context, typ catalog.Type, d Datum) string {
+	dateStyle, dateOrder := dateStyleFromCtx(ctx)
+	timeZone := timeZoneFromCtx(ctx)
+	byteaMode := "hex"
+	var cat catalog.Catalog
+	qualify := false
+	var visible func(string) bool
+	if ctx != nil {
+		if ctx.GetSetting != nil {
+			if v, ok := ctx.GetSetting("bytea_output"); ok {
+				byteaMode = v
+			}
+		}
+		cat = ctx.Catalog
+		qualify = !RegObjectSchemaVisible(ctx, "public")
+		visible = func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+	}
+	// A row rejected before storage can still hold a DEFAULT or literal as
+	// its input text ('1 day 2 hours' for an interval column). PG has
+	// already run the type's input function by then, so do the same before
+	// rendering.
+	if d.Kind == KindString && !isTextTypeName(strings.ToLower(typ.Name)) && typ.Name != "" && !typ.IsArray {
+		if cv, err := evalCast(d, typ.Name, 0, ctx); err == nil && !cv.IsNull() {
+			d = cv
+		}
+	}
+	if s, err := datumToCopyText(typ, d, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible); err == nil {
+		return s
+	}
+	return d.Format()
 }
 
 // routeToPartition finds the partition child table that matches the given row
@@ -3379,7 +3448,7 @@ func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, le
 			if sib != nil && sib.OID != cur.OID {
 				return &ExecError{Code: "23514", Pos: pos,
 					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name),
-					Detail:  formatRowForDetail(leafCols, leafRow)}
+					Detail:  formatRowForDetail(ctx, leafCols, leafRow)}
 			}
 		}
 		cur = parent
@@ -4533,6 +4602,12 @@ func tryApplyHOTUpdate(
 	// lock, so the counts are stable.
 	storage.PageIdentityAssertEmit(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), newSlot, "hotUpdateEmit")
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
+	// M0146-0063b: heap_update clears the page's visibility-map bits when it
+	// was all-visible, HOT or not — the new version's xmin is not yet visible
+	// to all, and an all-frozen bit would let VACUUM skip freezing it.
+	if ctx.VM != nil {
+		ctx.VM.ClearBlock(rel, blk)
+	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	s321Note(s321HOTApplied)
@@ -4546,6 +4621,7 @@ func tryApplyHOTUpdate(
 // when HOT is ineligible or the page is full.
 type updateOp struct {
 	plan         *optimizer.Update
+	updCols      map[string]bool // updateColumns' cache
 	scan         *optimizer.SeqScan
 	pred         optimizer.Expr
 	ctx          *Context
@@ -5049,7 +5125,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// actually be written. M0100-0005-merge-delete-fix.
 		trigFiredViaIdx := false
 		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
-			retRow, ok, err := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -5319,7 +5395,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					trigFiredViaIdx = true
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					retRow, trigOK, trigErr := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					retRow, trigOK, trigErr := fireTriggersCols(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 					if trigErr != nil {
 						// s already unlocked/unpinned above before firing.
 						return nil, trigErr
@@ -5473,13 +5549,15 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			if serr := ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER UPDATE triggers (M0097-0140).
+			// AFTER UPDATE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			if len(idxTbl.Triggers) > 0 {
-				if _, _, err := fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, idxTbl, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
 					return nil, err
 				}
 			}
 			o.appendUpdateRetRow(pu.newRow)
+			o.syncPgClassRelStats(pu.newRow) // M0146-0064
 			o.rowsAffected++
 		}
 	}
@@ -5493,7 +5571,38 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	return nil, EOF
 }
 
+// Next fires the statement-level triggers around the operator's single
+// processing pass: BEFORE STATEMENT ahead of it, and AFTER STATEMENT queued
+// once every row is processed (fireBSTriggers / fireASTriggers,
+// nodeModifyTable.c; M0146-0076). They fire even when no row matches.
 func (o *updateOp) Next() (TupleSlot, error) {
+	if o.done || len(o.plan.Table.Triggers) == 0 {
+		return o.next()
+	}
+	updCols := o.updateColumns()
+	if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "update", updCols); err != nil {
+		return nil, err
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, o.plan.Table, "update", updCols); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+// updateColumns is the UPDATE's target column set, which decides whether a
+// column-specific `UPDATE OF` trigger fires (M0146-0076).
+func (o *updateOp) updateColumns() map[string]bool {
+	if o.updCols == nil {
+		o.updCols = updateTargetColumns(o.plan.Table.Columns, o.plan.Set)
+	}
+	return o.updCols
+}
+
+func (o *updateOp) next() (TupleSlot, error) {
 	if o.done {
 		// Subsequent calls: iterate through RETURNING rows (M0100-0005).
 		if o.retIdx >= len(o.retRows) {
@@ -5926,7 +6035,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// Hand the scan back its own snapshot (see scanSnap above).
 				o.ctx.Snap = scanSnap
 				if len(scanTbl.Triggers) > 0 {
-					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					ret, ok, err := fireTriggersCols(o.ctx, scanTbl, "before", "update", oldRow, newRow, o.updateColumns())
 					if err != nil {
 						return err
 					}
@@ -5991,7 +6100,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			scanTblForTrig = tbl
 		}
 		if !pu.beforeFired && len(scanTblForTrig.Triggers) > 0 {
-			retRow, ok, err := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -6366,13 +6475,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER UPDATE triggers (M0097-0140).
+			// AFTER UPDATE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			scanTblForAfterTrig := pu.scanTbl
 			if scanTblForAfterTrig == nil {
 				scanTblForAfterTrig = tbl
 			}
 			if len(scanTblForAfterTrig.Triggers) > 0 {
-				if _, _, err := fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, scanTblForAfterTrig, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
 					return nil, err
 				}
 			}
@@ -6383,6 +6493,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			} else {
 				o.appendUpdateRetRow(pu.newRow)
 			}
+			o.syncPgClassRelStats(pu.newRow) // M0146-0064
 			o.rowsAffected++
 		}
 	}
@@ -6577,7 +6688,28 @@ func (o *deleteOp) Close() error {
 	return nil
 }
 
+// Next fires the statement-level triggers around the operator's single
+// processing pass: BEFORE STATEMENT ahead of it, and AFTER STATEMENT queued
+// once every row is processed (fireBSTriggers / fireASTriggers,
+// nodeModifyTable.c; M0146-0076). They fire even when no row matches.
 func (o *deleteOp) Next() (TupleSlot, error) {
+	if o.done || len(o.plan.Table.Triggers) == 0 {
+		return o.next()
+	}
+	if err := fireBeforeStatementTriggers(o.ctx, o.plan.Table, "delete", nil); err != nil {
+		return nil, err
+	}
+	slot, err := o.next()
+	if err != nil && err != EOF {
+		return slot, err
+	}
+	if qerr := queueAfterStatementTriggers(o.ctx, o.plan.Table, "delete", nil); qerr != nil {
+		return nil, qerr
+	}
+	return slot, err
+}
+
+func (o *deleteOp) next() (TupleSlot, error) {
 	if o.done {
 		// Subsequent calls: iterate RETURNING rows (M0100-0005).
 		if o.retIdx >= len(o.retRows) {
@@ -6959,13 +7091,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot); serr != nil {
 				return nil, serr
 			}
-			// AFTER DELETE triggers (M0097-0140).
+			// AFTER DELETE triggers (M0097-0140), queued to the end of the query
+			// (M0146-0076).
 			if len(tbl.Triggers) > 0 {
 				delRow := v.row
 				if v.retRow != nil {
 					delRow = v.retRow
 				}
-				if _, _, err := fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil); err != nil {
+				if err := queueAfterRowTriggers(o.ctx, tbl, "delete", delRow, nil, nil); err != nil {
 					return nil, err
 				}
 			}
@@ -7264,7 +7397,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
-			retRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggersCols(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow, o.updateColumns())
 			if err != nil {
 				return nil, err
 			}
@@ -7529,6 +7662,13 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot); serr != nil {
 			return nil, serr
+		}
+		// AFTER UPDATE triggers, queued to the end of the query (M0146-0076);
+		// the same table the BEFORE triggers above fired on.
+		if len(o.plan.Table.Triggers) > 0 {
+			if err := queueAfterRowTriggers(o.ctx, o.plan.Table, "update", pu.oldRow, pu.newRow, o.updateColumns()); err != nil {
+				return nil, err
+			}
 		}
 		o.rowsAffected++
 		// Use retNewRow for RETURNING when available (inheritance children). M0097-0078.
@@ -7882,6 +8022,12 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
+		}
+		// AFTER DELETE triggers, queued to the end of the query (M0146-0076).
+		if len(tbl.Triggers) > 0 {
+			if err := queueAfterRowTriggers(o.ctx, tbl, "delete", v.oldRow, nil, nil); err != nil {
+				return nil, err
+			}
 		}
 		// Use parent-aligned retOldRow for RETURNING when available. M0097-0078.
 		delRetRow := v.oldRow
@@ -8490,7 +8636,7 @@ func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRo
 // a NULL key column as the literal `null` (PostgreSQL prints
 // `Key (a)=(null) already exists.`). Datum.Format() returns "" for KindNull, so
 // NULL columns are mapped explicitly rather than via Format(). Design 0119-0004.
-func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func nndDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -8499,7 +8645,7 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 		for i, col := range cols {
 			if strings.EqualFold(col.Name, idxCol) && i < len(row) {
 				if !row[i].IsNull() {
-					val = row[i].Format()
+					val = detailValueText(ctx, col.Type, row[i])
 				}
 				break
 			}
@@ -8737,7 +8883,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 						Code:    "23505",
 						Pos:     pos,
 						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
-						Detail:  nndDetail(idx, cols, row),
+						Detail:  nndDetail(ctx, idx, cols, row),
 					}
 				}
 			}
@@ -8750,7 +8896,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			queueDeferredUniqueCheck(ctx, tbl, idx, cols, row, key)
 			continue
 		}
-		detail := buildUniqueConstraintDetail(idx, cols, row)
+		detail := func() string { return buildUniqueConstraintDetail(ctx, idx, cols, row) }
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
@@ -8856,7 +9002,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 						Code:    "23505",
 						Pos:     pos,
 						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
-						Detail:  nndDetail(idx, cols, newRow),
+						Detail:  nndDetail(ctx, idx, cols, newRow),
 					}
 				}
 			}
@@ -8868,7 +9014,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			queueDeferredUniqueCheck(ctx, tbl, idx, cols, newRow, key)
 			continue
 		}
-		detail := buildUniqueConstraintDetail(idx, cols, newRow)
+		detail := func() string { return buildUniqueConstraintDetail(ctx, idx, cols, newRow) }
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
@@ -8907,7 +9053,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 			if err != nil || key == nil {
 				continue
 			}
-			detail := buildExclusionConstraintDetail(idx, cols, row)
+			detail := buildExclusionConstraintDetail(ctx, idx, cols, row)
 			if raiseErr := exclusionCheckOnce(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 				return raiseErr
 			}
@@ -9064,7 +9210,7 @@ func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTre
 
 // buildExclusionConstraintDetail builds the DETAIL string for a 23P01 error:
 // "Key (col1)=(val1) conflicts with existing key (col1)=(val1)."
-func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func buildExclusionConstraintDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -9072,7 +9218,9 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 		val := ""
 		for i, col := range cols {
 			if col.Name == idxCol && i < len(row) {
-				val = row[i].Format()
+				if !row[i].IsNull() {
+					val = detailValueText(ctx, col.Type, row[i])
+				}
 				break
 			}
 		}
@@ -9092,7 +9240,9 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 //
 // Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
 // produces the <waiting ...> interleaving seen in read-write-unique.spec.
-func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName, detail string, pos int) error {
+// detail renders the DETAIL only when a conflict is raised: the typed output
+// path is too costly for every insert into a unique index (M0146-0083).
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName string, detail func() string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
 	var conflictPtr storage.ItemPointer
@@ -9208,7 +9358,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 			Code:    "23505",
 			Pos:     pos,
 			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
-			Detail:  detail,
+			Detail:  detail(),
 		}
 	}
 	return nil
@@ -9216,7 +9366,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 
 // buildUniqueConstraintDetail builds the DETAIL string for a 23505 error:
 // "Key (col1, col2, ...)=(val1, val2, ...) already exists."
-func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+func buildUniqueConstraintDetail(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row) string {
 	colNames := make([]string, 0, len(idx.Columns))
 	colVals := make([]string, 0, len(idx.Columns))
 	for _, idxCol := range idx.Columns {
@@ -9224,7 +9374,9 @@ func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row 
 		val := ""
 		for i, col := range cols {
 			if col.Name == idxCol && i < len(row) {
-				val = row[i].Format()
+				if !row[i].IsNull() {
+					val = detailValueText(ctx, col.Type, row[i])
+				}
 				break
 			}
 		}
@@ -9409,7 +9561,28 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 // is preserved for INSERT / UPDATE callers that don't need the
 // location.
 func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
-	var ptr storage.ItemPointer
+	pt, err := prepareHeapTuple(ctx, rel, cols, row)
+	if err != nil {
+		return storage.ItemPointer{}, err
+	}
+	return placeHeapTuple(ctx, rel, pt)
+}
+
+// preparedHeapTuple is a row turned into its on-disk heap tuple — toasted,
+// encoded and stamped — but not yet placed on a page.
+type preparedHeapTuple struct {
+	tuple storage.HeapTuple
+	bytes []byte
+}
+
+// prepareHeapTuple is writeHeapRowReturning's first half, PG's
+// heap_prepare_insert (heapam.c): TOAST the oversized values, encode the row
+// and stamp the header. COPY's multi-insert flush prepares a whole batch
+// before placing any of it, as heap_multi_insert does, because the number of
+// pages a bulk extension asks for is computed from the prepared tuples'
+// lengths (M0146-0009h).
+func prepareHeapTuple(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (preparedHeapTuple, error) {
+	var none preparedHeapTuple
 
 	// M0093: lazily materialise the transaction's XID before any
 	// xmin stamp. ToastLargeColumnsIfNeeded may itself call
@@ -9417,14 +9590,14 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// top covers both the TOAST writes and the main-heap NewHeapTuple
 	// below.
 	if err := ctx.MaterializeWriterXID(); err != nil {
-		return ptr, err
+		return none, err
 	}
 
 	// TOAST oversized column values before encoding (M0046-0006).
 	var toastErr error
 	row, toastErr = ToastLargeColumnsIfNeeded(ctx, rel, cols, row)
 	if toastErr != nil {
-		return ptr, &ExecError{Code: "XX000", Message: toastErr.Error()}
+		return none, &ExecError{Code: "XX000", Message: toastErr.Error()}
 	}
 
 	// Always encode in PG-native physical format (M0111-0002): a single
@@ -9437,9 +9610,9 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		// so the SQLSTATE and message reach the client unchanged.
 		var ee *ExecError
 		if errors.As(encErr, &ee) {
-			return ptr, ee
+			return none, ee
 		}
-		return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
+		return none, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(row)
 	// xmin = the effective writer XID: inside an open savepoint this is the
@@ -9478,8 +9651,17 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	tuple.Header.SetCmin(ctx.GetCurrentCommandId(true))
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
-		return ptr, err
+		return none, err
 	}
+	return preparedHeapTuple{tuple: tuple, bytes: tupleBytes}, nil
+}
+
+// placeHeapTuple is writeHeapRowReturning's second half: choose a page with
+// room for the prepared tuple — PG's RelationGetBufferForTuple (hio.c) — add
+// it there and WAL-log the insert.
+func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple) (storage.ItemPointer, error) {
+	var ptr storage.ItemPointer
+	tuple, tupleBytes := pt.tuple, pt.bytes
 
 	// Emits the native RecordKindHeapInsert WAL record so the logical
 	// decoder sees the change.
@@ -9498,6 +9680,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// which upstream also exempts from the fillfactor test (hio.c:859 checks
 	// only that the tuple physically fits) — otherwise a low-fillfactor table
 	// could reject its own brand-new page and extend forever.
+	// appendedToEmpty reports whether the last successful tryAppendToBlock
+	// put the tuple on a page that held none — heap_multi_insert's
+	// starting_with_empty_page, which the bulk path's page plan reads.
+	appendedToEmpty := false
 	tryAppendToBlock := func(blk storage.BlockNumber, reserve int) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -9533,7 +9719,9 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 			ctx.Pool.Unpin(slot)
 			return false, nil
 		}
+		wasEmpty := int(storage.MustHeader(slot.Page()).Lower()) == storage.SizeOfPageHeaderData
 		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
+			appendedToEmpty = wasEmpty
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 			// Update FSM with remaining free space (M0046-0003).
 			if ctx.FSM != nil {
@@ -9573,6 +9761,14 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// The FSM stores pd_upper-pd_lower, one line pointer more than
 	// PageGetHeapFreeSpace reports, so the search threshold adds it back.
 	minFreeBytes := uint16(targetFreeSpace + 4) // 4 = itemIDSize (line pointer size)
+
+	// A COPY's bulk insert state replaces the cascade below with PG's
+	// bistate page choice: current page, the bulk extension's next free
+	// page, the FSM, then a ramped extension (M0146-0009h).
+	if bs := ctx.bulkInsert; bs != nil && bs.rel == rel {
+		err := bs.place(ctx, targetFreeSpace, tryAppendToBlock, func() bool { return appendedToEmpty })
+		return ptr, err
+	}
 	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
 		appended, err := tryAppendToBlock(fsmBlk, targetFreeSpace)
 		if err != nil {
@@ -10011,12 +10207,19 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 	oldSlotBuf.Unlock()
 	ctx.Pool.Unpin(oldSlotBuf)
 
-	pinNewTarget := func() (*storage.Slot, storage.BlockNumber, error) {
+	// pinNewTarget picks the page for the new version: the relation's last
+	// block, or a freshly extended one. extend forces the extension. The
+	// retry needs it: without it the second attempt picked the same full
+	// last block again and failed "freshly extended page did not accept
+	// tuple" although no page had been extended (M0146-0078). Repeated
+	// CREATE OR REPLACE FUNCTION hit this as soon as pg_proc's last page
+	// filled up.
+	pinNewTarget := func(extend bool) (*storage.Slot, storage.BlockNumber, error) {
 		nBlocks, err := ctx.Pool.NBlocks(rel)
 		if err != nil {
 			return nil, 0, err
 		}
-		if nBlocks > 0 && nBlocks-1 != oldTID.Block {
+		if !extend && nBlocks > 0 && nBlocks-1 != oldTID.Block {
 			blk := nBlocks - 1
 			s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 			if err != nil {
@@ -10031,7 +10234,7 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 		return s, blk, nil
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		newBuf, newBlk, err := pinNewTarget()
+		newBuf, newBlk, err := pinNewTarget(attempt > 0)
 		if err != nil {
 			return newTID, err
 		}

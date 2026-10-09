@@ -144,6 +144,25 @@ const (
 	// progress (S2b-5/S2b-6). See
 	// docs/design/0100-0149/m0141-s7-readjudicate-and-scope-incremental-sort.md.
 	PathIncrementalSort
+
+	// PathMaterial is PG's `MaterialPath` (pathnodes.h): the
+	// materializing wrapper create_material_path (pathnode.c:1637)
+	// places over a nested loop's cheapest unparameterised inner so the
+	// loop rescans a buffered result instead of re-executing the child.
+	// It exists as a path because PG makes the election at the PATH level
+	// — match_unsorted_outer files it beside the bare inner (joinpath.c:
+	// 1890-1901) — not because any executor detail needs it. Rows and
+	// Pathkeys pass through unchanged (the buffer preserves ordering);
+	// Cost carries cost_material's build overhead, and cost_rescan's
+	// Material arm is what makes the election worth filing. Children[0]
+	// is the wrapped inner.
+	PathMaterial
+	// PathParamAppend is PG's AppendPath with a `required_outer`
+	// (create_append_path, pathnode.c:1303) over a flattened UNION ALL leaf:
+	// Children are the members' parameterised index paths, and paramAppend
+	// carries the leaf's UNION ALL the plan rebuilds around them
+	// (paramappend.go, M0146-0049).
+	PathParamAppend
 )
 
 // Path is one way to produce a relation, with a cost and an ordering. It is kept
@@ -151,6 +170,15 @@ const (
 // specific data in a narrow payload rather than a fat struct (design ch. 03 §1).
 type Path struct {
 	Kind PathKind
+
+	// paramAppend is a PathParamAppend's member carrier (paramappend.go).
+	paramAppend *paramAppendInfo
+	// paramSink is set, only while a nested loop lowers a parameterised join
+	// inner (createNestLoopParamJoinPlan, M0146-0049d3), on every
+	// parameterised path of that inner; createPlanNode records each
+	// parameterised index probe it builds there so the loop can bind its
+	// keys — PG's create_plan-time curOuterRels.
+	paramSink *[]paramProbeNode
 
 	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
 	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
@@ -244,6 +272,14 @@ type Path struct {
 	// `PathPrebuilt` today). `createUniquePlan` passes it straight to the
 	// emitted `*DistinctOn.KeyCols`. nil for every other kind.
 	UniqueKeyCols []int
+	// UniqueHashed selects create_unique_path's UNIQUE_PATH_HASH: Children[0]
+	// is the unsorted subpath and the lowering emits a hashed *DistinctOn.
+	UniqueHashed bool
+	// UniqueExprs, when set, are the uniq exprs in problem-space (binding)
+	// coordinates — a pulled base-relation RHS (M0146-0005dk). The lowering
+	// resolves them through the built child's layout into the DistinctOn's
+	// key positions, and UniqueKeyCols is then ignored.
+	UniqueExprs []Expr
 
 	// Window is the window SPEC a PathWindow evaluates — the `*WindowAgg`
 	// `buildWindowStage` built for one spec group (PartitionBy, OrderBy,
@@ -452,6 +488,13 @@ type Path struct {
 	IndexScanDir ScanDirection
 	IndexClauses []indexPathClause
 
+	// IndexSkipPrefix is the count of LEADING index columns left unbound
+	// before the run IndexClauses binds — PG18's btree skip-scan
+	// (M0146-0005v): clause i of the list probes Columns[IndexSkipPrefix+i]
+	// and the executor enumerates the skipped prefix's distinct values. 0
+	// means the list is PG's `amoptionalkey` leading prefix as before.
+	IndexSkipPrefix int
+
 	// IndexOnly marks this path as PG's T_IndexOnlyScan rather than
 	// T_IndexScan (`create_index_path`'s `indexonly` argument). PG carries the
 	// distinction on the pathtype of the SAME IndexPath struct rather than in
@@ -511,6 +554,12 @@ type Path struct {
 // (design ch. 05 §1) and every path over the rel reads it; costing never
 // re-estimates (design ch. 03 §1.1, invariant #2).
 type RelOptInfo struct {
+	// ecWant is the search's EXPLAIN orientation of its equivalence-class
+	// equalities (orientECJoinClauses), recorded on the search's own upper
+	// rel so a candidate rebuilt from this rel's paths after the seam
+	// (searchedBoundaryRebuild) prints its clauses as the committed tree
+	// does (M0146-0042a). nil elsewhere.
+	ecWant ecOrientation
 	Relids RelSet
 	Rows   float64
 	Width  int
@@ -613,14 +662,15 @@ type RelOptInfo struct {
 	// parameter down `createOrderedPaths`/`addOrderedPaths` for one list one
 	// future consumer reads).
 	//
-	// Nothing reads this yet, and that is the slice's gate. S2b-2's own
-	// scoping recon (docs/design/0100-0149/m0141-s2b-scoping-decomposition.md
-	// §"S2b-2 result") proved that OFFERING these candidates to the ORDERED
-	// tournament today cannot move a plan — every candidate of one rel
-	// shares the same (rows, width), so `costSortRun`'s constant Sort charge
-	// on top cannot change which one ranks cheapest — so this field is
-	// visibility only until M0141-S7's per-candidate Pathkeys credit
-	// (`cost_incremental_sort`) exists for S2b-2c to spend it on. nil when
+	// Read by `addOrderedPaths`' `is_sorted` arm (M0146-0027): upstream's
+	// `create_ordered_paths` offers every input_rel->pathlist path that
+	// already satisfies the ordering (planner.c:5342-5345), which is how an
+	// ordering-carrying runner-up — a merge join, a gather.merge.sort —
+	// reaches the ordered rel instead of losing to cheapest-total. The
+	// S2b-2 scoping recon's "cannot move a plan" finding held only for
+	// sort-WRAPPING every candidate (`costSortRun`'s constant charge can
+	// never reorder a contest); the already-sorted arm adds no sort and so
+	// moves plans exactly where an ordered runner-up exists. nil when
 	// `input` is not a searched-tree root, or the search published no
 	// Pathlist.
 	SearchCandidates []*Path
@@ -637,12 +687,27 @@ type RelOptInfo struct {
 	// Incremental Sort tournament needs before it can trust any non-seed
 	// candidate's ordering claim.
 	//
-	// Nothing reads this yet, same gate as SearchCandidates: computing it
-	// cannot move a plan because nothing offers these candidates to
-	// `addOrderedPaths` yet. nil when SearchCandidates is nil; an individual
-	// entry is nil when that candidate's own Pathkeys validate to nothing
-	// (no ordering claim survives, same truncation rule as the winner's).
+	// Read by `addOrderedPaths`' `is_sorted` arm (M0146-0027) — the
+	// containment test for the offer above is run on THESE keys, never on
+	// the candidate's own search-space claim. nil when SearchCandidates is
+	// nil; an individual entry is nil when that candidate's own Pathkeys
+	// validate to nothing (no ordering claim survives, same truncation rule
+	// as the winner's).
 	SearchCandidateKeys [][]PathKey
+
+	// BoundaryFill is the hole-filler closure this rel's boundary publication
+	// was stamped with (`createPlanAtSearchRootRange`'s `fill` parameter,
+	// built at relfromjoinlist.go's joinlistRel site). It answers whether a
+	// binding coordinate the searched path's emission dropped may be PADDED
+	// — a typed NULL at a slot the statement provably never reads — and is
+	// the same license the committed subtree's publication ran under.
+	// `searchedBoundaryRebuild` replays it when offering a non-winning
+	// searched path as an upper stage's input (M0146-0027): without it every
+	// candidate whose narrowed leaf dropped a below-only column declines the
+	// rebuild, while the committed winner — whose own emission ran under the
+	// license — would have carried the same hole. nil for a boundary that
+	// published with no filler.
+	BoundaryFill func(int) (SchemaColumn, bool)
 
 	// LeftBranchRel / RightBranchRel are the search's own RelOptInfo for a
 	// SETOP rel's two UNION ALL branches (`searchedRelOf(setOpNode.Left)` /
@@ -783,6 +848,29 @@ type rangeTblEntry struct {
 	// `outputLayout` (createplanjoin.go) is the per-node translation built
 	// from this field.
 	baseOffset int
+
+	// usefulKeys is what truncate_useless_pathkeys reads for this joinrel
+	// (M0146-0005n): set by makeJoinRel, nil elsewhere (no truncation).
+	usefulKeys *pathkeyUsefulness
+
+	// memberRels are the base relations a joinrel is made of — the level-1
+	// rels carrying baseLeaf/baseOffset — so a joinrel can resolve a
+	// problem-space column to the leaf that produces it (M0146-0005dy:
+	// create_unique_path's estimate_num_groups over a multi-relation semijoin
+	// RHS). Set by makeJoinRel; nil on base rels.
+	memberRels []*RelOptInfo
+}
+
+// baseMembers returns the base relations rel is made of: itself for a base
+// rel, its memberRels for a joinrel.
+func (r *RelOptInfo) baseMembers() []*RelOptInfo {
+	if r == nil {
+		return nil
+	}
+	if r.baseLeaf != nil {
+		return []*RelOptInfo{r}
+	}
+	return r.memberRels
 }
 
 // newRelOptInfo creates a rel with the given relids and (once-computed) size.

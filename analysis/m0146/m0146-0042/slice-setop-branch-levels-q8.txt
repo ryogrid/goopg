@@ -1,0 +1,161 @@
+# M0146-0042 slice: genuine set-operation branches as range-table levels (code eef2d1762)
+# fire-set captures tmp/fireset-m42h (baseline = ea2f4fcf5, candidate = staged change)
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+
+sf025 text-identical 39 -> 40
+  Q8 diff-lines vs PG 8 -> 0 IDENT
+  Q36 diff-lines vs PG 2 -> 2 
+  Q38 diff-lines vs PG 54 -> 46 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 18 -> 6 
+  Q86 diff-lines vs PG 2 -> 2 
+sf1 text-identical 30 -> 31
+  Q8 diff-lines vs PG 8 -> 0 IDENT
+  Q36 diff-lines vs PG 2 -> 2 
+  Q38 diff-lines vs PG 31 -> 23 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 30 -> 20 
+  Q86 diff-lines vs PG 2 -> 2 
+
+===== sf025 Q8
+-    Group Key: customer_address_1.ca_zip
++ PG Group Key: customer_address.ca_zip
+-    Hash Cond: (customer.c_current_addr_sk = customer_address_1.ca_address_sk)
++ PG Hash Cond: (customer.c_current_addr_sk = customer_address.ca_address_sk)
+- PG ->  Seq Scan on customer_address customer_address_1
+- PG ->  Seq Scan on customer_address
++ PG ->  Seq Scan on customer_address
++ PG ->  Seq Scan on customer_address customer_address_1
+===== sf025 Q38
+- PG Sort Key: customer_2.c_last_name, customer_2.c_first_name, date_dim_2.d_date
++ PG Sort Key: customer.c_last_name, customer.c_first_name, date_dim.d_date
+-    Hash Cond: (web_sales.ws_sold_date_sk = date_dim_2.d_date_sk)
++ PG Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+- PG ->  Parallel Seq Scan on date_dim date_dim_2
++ PG ->  Parallel Seq Scan on date_dim
+- PG ->  Index Scan using customer_pkey on customer customer_2
++ PG ->  Index Scan using customer_pkey on customer
+- PG Sort Key: customer.c_last_name, customer.c_first_name, date_dim.d_date
++ PG Sort Key: customer_2.c_last_name, customer_2.c_first_name, date_dim_2.d_date
+-    Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (store_sales.ss_sold_date_sk = date_dim_2.d_date_sk)
+- PG ->  Parallel Seq Scan on date_dim
++ PG ->  Parallel Seq Scan on date_dim date_dim_2
+- PG ->  Index Scan using customer_pkey on customer
++ PG ->  Index Scan using customer_pkey on customer customer_2
+===== sf025 Q75
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id
++ PG Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.
++    Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.ss_ext_sal
+-    Hash Cond: (store_sales.ss_item_sk = item_1.i_item_sk)
++ PG Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+- PG ->  Parallel Seq Scan on item item_2
++ PG ->  Parallel Seq Scan on item
+- PG ->  Index Scan using date_dim_pkey on date_dim date_dim_1
++ PG ->  Index Scan using date_dim_pkey on date_dim
+-    Hash Cond: (catalog_sales.cs_item_sk = item.i_item_sk)
++ PG Hash Cond: (catalog_sales.cs_item_sk = item_1.i_item_sk)
+- PG ->  Parallel Seq Scan on item
++ PG ->  Parallel Seq Scan on item item_2
+- PG ->  Index Scan using date_dim_pkey on date_dim
++ PG ->  Index Scan using date_dim_pkey on date_dim date_dim_1
+===== sf1 Q8
+-    Group Key: customer_address_1.ca_zip
++ PG Group Key: customer_address.ca_zip
+-    Hash Cond: (customer.c_current_addr_sk = customer_address_1.ca_address_sk)
++ PG Hash Cond: (customer.c_current_addr_sk = customer_address.ca_address_sk)
+- PG ->  Seq Scan on customer_address customer_address_1
+- PG ->  Seq Scan on customer_address
++ PG ->  Seq Scan on customer_address
++ PG ->  Seq Scan on customer_address customer_address_1
+===== sf1 Q38
+- PG Sort Key: customer_2.c_last_name, customer_2.c_first_name, date_dim_2.d_date
++ PG Sort Key: customer.c_last_name, customer.c_first_name, date_dim.d_date
+-    Hash Cond: (web_sales.ws_sold_date_sk = date_dim_2.d_date_sk)
++ PG Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+- PG ->  Parallel Seq Scan on date_dim date_dim_2
++ PG ->  Parallel Seq Scan on date_dim
+- PG ->  Index Scan using customer_pkey on customer customer_2
++ PG ->  Index Scan using customer_pkey on customer
+- PG Sort Key: customer.c_last_name, customer.c_first_name, date_dim.d_date
++ PG Sort Key: customer_2.c_last_name, customer_2.c_first_name, date_dim_2.d_date
+-    Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
++ PG Hash Cond: (store_sales.ss_sold_date_sk = date_dim_2.d_date_sk)
+- PG ->  Parallel Seq Scan on date_dim
++ PG ->  Parallel Seq Scan on date_dim date_dim_2
+- PG ->  Index Scan using customer_pkey on customer
++ PG ->  Index Scan using customer_pkey on customer customer_2
+===== sf1 Q75
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id
++ PG Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id
+-    Group Key: date_dim_1.d_year, item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id, item_1.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.
++    Group Key: date_dim.d_year, item.i_brand_id, item.i_class_id, item.i_category_id, item.i_manufact_id, (store_sales.ss_quantity - COALESCE(store_returns.sr_return_quantity, 0)), (store_sales.ss_ext_sal
+-    Hash Cond: (store_sales.ss_item_sk = item_1.i_item_sk)
++ PG Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+-    ->  Seq Scan on item item_2
++    ->  Seq Scan on item
+- PG ->  Index Scan using date_dim_pkey on date_dim date_dim_1
++ PG ->  Index Scan using date_dim_pkey on date_dim
+-    Hash Cond: (catalog_sales.cs_item_sk = item.i_item_sk)
++ PG Hash Cond: (catalog_sales.cs_item_sk = item_1.i_item_sk)
+-    ->  Seq Scan on item
++    ->  Seq Scan on item item_2
+- PG ->  Index Scan using date_dim_pkey on date_dim
++ PG ->  Index Scan using date_dim_pkey on date_dim date_dim_1
+
+## regress union.diff, HEAD vs change
+14,33c14
+< @@ -329,15 +331,15 @@
+<  (1 row)
+<  explain (costs off)
+<  select count(*) from
+<    ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
+<    QUERY PLAN
+< -------------------------------------------------------------------
+< +----------------------------------------------------------
+<   Aggregate
+<    ->  HashSetOp Intersect
+< -  ->  Seq Scan on tenk1
+< -  ->  Index Only Scan using tenk1_unique1 on tenk1 tenk1_1
+< +  ->  Seq Scan on tenk1 tenk1_1
+< +  ->  Index Only Scan using tenk1_unique1 on tenk1
+<  (4 rows)
+<  select count(*) from
+<    ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
+<   count
+<  -------
+< @@ -388,49 +390,49 @@
+---
+> @@ -388,20 +390,22 @@
+58,59c39
+<  (1 row)
+<  explain (costs off)
+---
+> @@ -410,27 +414,25 @@
+63,64c43
+< -------------------------------------------------------------------
+< +----------------------------------------------------------
+---
+>  ------------------------------------------------------------------
+69,71d47
+< -  ->  Seq Scan on tenk1
+< -  ->  Index Only Scan using tenk1_unique1 on tenk1 tenk1_1
+< -(6 rows)
+73,74c49,51
+< +  ->  Seq Scan on tenk1 tenk1_1
+< +  ->  Index Only Scan using tenk1_unique1 on tenk1
+---
+>    ->  Seq Scan on tenk1
+>    ->  Index Only Scan using tenk1_unique1 on tenk1 tenk1_1
+> -(6 rows)

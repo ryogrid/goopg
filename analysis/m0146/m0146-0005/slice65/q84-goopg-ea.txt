@@ -1,0 +1,56 @@
+===== Q84 =====
+Limit  (cost=8287.81..8289.06 rows=11 width=1252) (actual rows=4.00 loops=1)
+  ->  Gather Merge  (cost=8287.81..8289.06 rows=11 width=356) (actual rows=4.00 loops=1)
+        Workers Planned: 1
+        Workers Launched: 1
+        ->  Sort  (cost=7287.80..7287.82 rows=6 width=356)
+              Sort Key: customer.c_customer_id
+              Worker 0:  actual time=0.000..0.000 rows=0.00 loops=1
+              Worker 1:  actual time=0.000..0.000 rows=4.00 loops=1
+              Sort Method: quicksort  Memory: 6kB
+              Worker 0:  Sort Method: quicksort  Memory: 0kB
+              ->  Nested Loop  (cost=5063.74..7287.72 rows=6 width=356)
+                    Worker 0:  actual time=0.000..0.000 rows=0.00 loops=1
+                    Worker 1:  actual time=0.000..0.000 rows=4.00 loops=1
+                    ->  Hash Join  (cost=5063.37..6940.03 rows=140 width=208)
+                          Hash Cond: (household_demographics.hd_income_band_sk = income_band.ib_income_band_sk)
+                          Worker 0:  actual time=0.000..0.000 rows=0.00 loops=1
+                          Worker 1:  actual time=0.000..0.000 rows=4.00 loops=1
+                          Buckets: 1024  Batches: 1  Memory Usage: 49kB  Build Time: 0.045 ms
+                          ->  Nested Loop  (cost=5061.97..6937.51 rows=350 width=196)
+                                Worker 0:  actual time=0.000..0.000 rows=14.00 loops=1
+                                Worker 1:  actual time=0.000..0.000 rows=15.00 loops=1
+                                ->  Parallel Hash Join  (cost=5061.72..6839.58 rows=362 width=148)
+                                      Hash Cond: (store_returns.sr_cdemo_sk = customer.c_current_cdemo_sk)
+                                      Worker 0:  actual time=0.000..0.000 rows=14.00 loops=1
+                                      Worker 1:  actual time=0.000..0.000 rows=15.00 loops=1
+                                      Buckets: 1024  Batches: 1  Memory Usage: 252kB  Build Time: 81.321 ms
+                                      ->  Parallel Seq Scan on store_returns  (cost=0.00..1617.62 rows=42162 width=332)
+                                            Worker 0:  actual time=0.000..0.000 rows=36369.00 loops=1
+                                            Worker 1:  actual time=0.000..0.000 rows=35307.00 loops=1
+                                      ->  Parallel Hash Join  (cost=1458.78..5055.44 rows=502 width=144)
+                                            Hash Cond: (customer.c_current_addr_sk = customer_address.ca_address_sk)
+                                            Worker 0:  actual time=0.000..0.000 rows=445.00 loops=1
+                                            Worker 1:  actual time=0.000..0.000 rows=379.00 loops=1
+                                            Buckets: 1024  Batches: 1  Memory Usage: 76kB  Build Time: 13.529 ms
+                                            ->  Parallel Seq Scan on customer  (cost=0.00..3442.24 rows=58824 width=324)
+                                                  Worker 0:  actual time=0.000..0.000 rows=52224.00 loops=1
+                                                  Worker 1:  actual time=0.000..0.000 rows=47776.00 loops=1
+                                            ->  Parallel Seq Scan on customer_address  (cost=0.00..1455.65 rows=251 width=388)
+                                                  Filter: (ca_city = 'Woodland')
+                                                  Worker 0:  actual time=0.000..0.000 rows=212.00 loops=1
+                                                  Worker 1:  actual time=0.000..0.000 rows=217.00 loops=1
+                                ->  Index Scan using household_demographics_pkey on household_demographics  (cost=0.25..0.27 rows=1 width=48)
+                                      Index Cond: (hd_demo_sk = customer.c_current_hdemo_sk)
+                                      Worker 0:  actual time=0.000..0.000 rows=1.00 loops=14
+                                      Worker 1:  actual time=0.000..0.000 rows=1.00 loops=15
+                          ->  Seq Scan on income_band  (cost=0.00..1.30 rows=8 width=12)
+                                Filter: ((ib_lower_bound >= 60306) AND (ib_upper_bound <= 110306))
+                                Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                                Worker 1:  actual time=0.000..0.000 rows=0.00 loops=0
+                    ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.38..2.47 rows=1 width=148)
+                          Index Cond: (cd_demo_sk = customer.c_current_cdemo_sk)
+                          Worker 0:  actual time=0.000..0.000 rows=0.00 loops=0
+                          Worker 1:  actual time=0.000..0.000 rows=1.00 loops=4
+Planning Time: 0.007 ms
+Execution Time: 124.936 ms

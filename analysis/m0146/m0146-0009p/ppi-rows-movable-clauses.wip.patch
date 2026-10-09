@@ -1,0 +1,127 @@
+diff --git a/internal/executor/param_probe_rows_test.go b/internal/executor/param_probe_rows_test.go
+new file mode 100644
+index 000000000..8f960923a
+--- /dev/null
++++ b/internal/executor/param_probe_rows_test.go
+@@ -0,0 +1,50 @@
++package executor
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/goopg/goopg/internal/optimizer"
++)
++
++// TestParameterizedProbeRowsApplyMovableJoinClauses (M0146-0009p): a
++// parameterised index probe returns the rows get_parameterized_baserel_size
++// counts — every join clause movable into the path, not only the equalities
++// the index binds. `i.qty < c.qty` binds no key but filters each probe (PG's
++// default 1/3 for a comparison of two variables). PG 18.3 on the same data,
++// hash and merge joins off:
++//
++//	Index Scan using pr_inv_pkey on pr_inv i  (cost=0.29..5.95 rows=10)
++//	  Index Cond: (item = c.item)
++//	  Filter: (qty < c.qty)
++//
++// goopg reported rows=30 (the 30 rows per item the equality alone gives).
++func TestParameterizedProbeRowsApplyMovableJoinClauses(t *testing.T) {
++	ctx, _, cleanup := newDDLFixture(t)
++	t.Cleanup(cleanup)
++	for _, q := range []string{
++		"CREATE TABLE pr_inv (d int, item int, qty int, PRIMARY KEY (item, d))",
++		"CREATE TABLE pr_cs (id int, item int, qty int, flag int)",
++		"INSERT INTO pr_inv SELECT d, item, (d * 7 + item) % 100 FROM generate_series(1, 30) d, generate_series(1, 2000) item",
++		"INSERT INTO pr_cs SELECT g, (g * 13) % 2000 + 1, g % 100, g % 50 FROM generate_series(1, 20000) g",
++		"ANALYZE pr_inv", "ANALYZE pr_cs",
++	} {
++		runSQL(t, ctx, q)
++	}
++	ps := optimizer.DefaultPlannerSettings()
++	ps.EnableHashJoin, ps.EnableMergeJoin = false, false
++	const q = "SELECT count(*) FROM pr_cs c JOIN pr_inv i ON i.item = c.item AND i.qty < c.qty WHERE c.flag = 7"
++	lines := renderRows(runSQLWith(t, ctx, "EXPLAIN "+q, ps))
++	probe := ""
++	for _, l := range lines {
++		if strings.Contains(l, "Index Scan using pr_inv_pkey") {
++			probe = l
++		}
++	}
++	if !strings.Contains(probe, " rows=10 ") {
++		t.Fatalf("want PG's probe rows=10, got %q\nplan:\n%s", strings.TrimSpace(probe), strings.Join(lines, "\n"))
++	}
++	if got, want := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), ";"), strings.Join(renderRows(runSQL(t, ctx, q)), ";"); got != want {
++		t.Fatalf("forced probe plan returned %s, want %s", got, want)
++	}
++}
+diff --git a/internal/optimizer/pathbitmap.go b/internal/optimizer/pathbitmap.go
+index 10d91c5e7..cc1ac7643 100644
+--- a/internal/optimizer/pathbitmap.go
++++ b/internal/optimizer/pathbitmap.go
+@@ -634,7 +634,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
+ 	}
+ 	return &Path{
+ 		Kind: PathBitmapHeapScan, Rel: rel,
+-		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
++		Rows:          clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req)),
+ 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel)),
+ 		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
+ 		// top of the index child's count.
+diff --git a/internal/optimizer/pathparamindex.go b/internal/optimizer/pathparamindex.go
+index 50836f222..42e3effd0 100644
+--- a/internal/optimizer/pathparamindex.go
++++ b/internal/optimizer/pathparamindex.go
+@@ -364,7 +364,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
+ 	probed := boundPrefixClauses(bound, clauses)
+ 	fullyBound := len(clauses) == len(idx.Columns)
+ 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, fullyBound)
+-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
++	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound) *
++		s.movableNonEquiJoinSelectivity(rel, req))
+ 	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
+ 	// direction it was computed for, taken together so they cannot disagree
+ 	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
+@@ -558,7 +559,8 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
+ 	// bound, so a unique index cannot collapse the probe to one tuple, and
+ 	// PG's unique-index clamp does not apply.
+ 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, false)
+-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false)
++	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false) *
++		s.movableNonEquiJoinSelectivity(rel, req))
+ 	// The emitted stream is globally key-ordered — groups are enumerated
+ 	// in prefix order and each group's probe is suffix-ordered — so the
+ 	// index's pathkeys are as valid here as on the prefix path.
+@@ -860,6 +862,33 @@ func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64,
+ 	return rows
+ }
+ 
++// movableNonEquiJoinSelectivity is the share of
++// `get_parameterized_baserel_size`'s clauselist_selectivity over `ppi_clauses`
++// (costsize.c) that the parameterised producers' key selectivity does not
++// cover (M0146-0009p): every join clause movable into `rel` under `req`
++// (`join_clause_is_movable_into`) that is not an equijoin. The equijoins are
++// the probe-key candidates the producers already price; a comparison such as
++// TPC-DS Q72's `inv_quantity_on_hand < cs_quantity` binds no key but still
++// belongs to the parameterised path's clauses, so it filters the rows one
++// execution returns (PG: inventory_pkey probe rows=176, 1/3 of the 527 the
++// equalities alone give).
++func (s *searchCtx) movableNonEquiJoinSelectivity(rel *RelOptInfo, req RelSet) float64 {
++	if s == nil || s.clauses == nil || rel == nil {
++		return 1
++	}
++	sel := 1.0
++	for _, ri := range s.clauses.all {
++		if ri == nil || ri.isEquijoin || ri.relids == rel.Relids {
++			continue
++		}
++		if !joinClauseIsMovableInto(ri, rel.Relids, rel.Relids|req) {
++			continue
++		}
++		sel *= s.joinClauseSelectivity(ri)
++	}
++	return sel
++}
++
+ // loopCountFor is `get_loop_count` (indxpath.c:3266): how many times a scan
+ // parameterised by `req` is expected to be re-executed.
+ //

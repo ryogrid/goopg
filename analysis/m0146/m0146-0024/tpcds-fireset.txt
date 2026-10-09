@@ -1,0 +1,3 @@
+FIRE-SET: baseline=ad7fe90f47d89b3ac5dae39f5cfa9804f86835db (651af88c04cd) candidate=worktree (9fa16af889eb)
+FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+FIRE-SET: corpus=tpcds-sf1 fires=none (plan A/B had no changed query)

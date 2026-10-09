@@ -126,6 +126,10 @@ func rfjLeafCount(n Node) int {
 		return rfjLeafCount(t.Child)
 	case *GatherMerge:
 		return rfjLeafCount(t.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — the buffered subtree's leaves
+		// are the counted leaves.
+		return rfjLeafCount(t.Child)
 	default:
 		return 1
 	}
@@ -186,6 +190,10 @@ func rfjJoins(n Node) []*Join {
 		case *Gather:
 			walk(t.Child)
 		case *GatherMerge:
+			walk(t.Child)
+		case *Materialize:
+			// M0146-0010: same transparency — the joins the buffer replays
+			// are still the joins the plan performs.
 			walk(t.Child)
 		}
 	}

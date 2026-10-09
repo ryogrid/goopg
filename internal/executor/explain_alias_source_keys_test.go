@@ -126,9 +126,12 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 	// strategy: since the inner aggregate is estimated at PG's 200 groups
 	// (M0145-0008, `vardata->rel->tuples` without ANALYZE) the outer one is
 	// a HashAggregate (bare call) where it had been a GroupAggregate
-	// (parenthesised). PG 18.3 elects GroupAggregate over one Sort DESC and
-	// keeps the Subquery Scan (`Group Key: unnamed_subquery.c`); goopg does
-	// not adopt ORDER BY's direction for grouping (ledgered, own task).
+	// (parenthesised). PG 18.3 elects GroupAggregate over one Sort DESC;
+	// goopg does not adopt ORDER BY's direction for grouping (ledgered,
+	// own task). (An earlier comment claimed PG keeps `Subquery Scan`
+	// here — M0146-0005x verified on tpcds025 that it strips: the leaf
+	// sits under the outer aggregate, so the physical-tlist regime makes
+	// the wrapper trivial.)
 	rows := runExplainRows(t, ctx,
 		"EXPLAIN (COSTS OFF) SELECT c, count(*) FROM (SELECT g, count(x) AS c FROM r66t GROUP BY g) GROUP BY c ORDER BY c DESC")
 	var sortLine, groupLine string
@@ -141,11 +144,30 @@ func TestExplainTransitiveGroupKeyRendersInnerCall(t *testing.T) {
 			groupLine = t2 // the top agg; deeper aggs are not this pin
 		}
 	}
-	if sortLine != "Sort Key: (count(x)) DESC" {
-		t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
+	// M0146-0042: when the derived table keeps its Subquery Scan — PG
+	// 18.3 does here (`Subquery Scan on unnamed_subquery` under the Sort)
+	// and so does goopg — an upper key deparses to that scan's own column,
+	// `unnamed_subquery.c`, not through it. Only a stripped wrapper lets the
+	// transitive `count(x)` form through. goopg names the anonymous
+	// subquery `__sq_<pos>` where PG says `unnamed_subquery` (ledgered), so
+	// the alias is read off the plan rather than pinned.
+	alias := ""
+	for _, r := range rows {
+		if t2 := strings.TrimSpace(r); strings.Contains(t2, "Subquery Scan on ") {
+			alias = strings.TrimSpace(t2[strings.Index(t2, "Subquery Scan on ")+len("Subquery Scan on "):])
+		}
 	}
-	if groupLine != "Group Key: count(x)" && groupLine != "Group Key: (count(x))" {
-		t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
+	if alias != "" {
+		if sortLine != "Sort Key: "+alias+".c DESC" || groupLine != "Group Key: "+alias+".c" {
+			t.Errorf("want the keys qualified by the kept Subquery Scan %q; got:\n%s", alias, strings.Join(rows, "\n"))
+		}
+	} else {
+		if sortLine != "Sort Key: (count(x)) DESC" {
+			t.Errorf("expected transitive `Sort Key: (count(x)) DESC`; got:\n%s", strings.Join(rows, "\n"))
+		}
+		if groupLine != "Group Key: count(x)" && groupLine != "Group Key: (count(x))" {
+			t.Errorf("expected transitive `Group Key: count(x)`; got:\n%s", strings.Join(rows, "\n"))
+		}
 	}
 	assertNoOpaqueExpr(t, strings.Join(rows, "\n"))
 }
@@ -179,6 +201,11 @@ func TestExplainSortKeySubqueryGroupByUnchanged(t *testing.T) {
 		t.Errorf("expected byte-identical `Sort Key: max`; got:\n%s", strings.Join(rows, "\n"))
 	}
 	joined := strings.Join(rows, "\n")
+	// r66q2.x has no index, so the MIN/MAX rewrite does not fire
+	// (M0146-0005du) and the sublink is InitPlan 1, as in PG 18.3. (PG
+	// drops the constant GROUP BY key and the ORDER BY over it entirely —
+	// GroupAggregate with no Group Key and no Sort; goopg keeps both,
+	// ledgered.)
 	if !strings.Contains(joined, "Group Key: (InitPlan 1).col1") {
 		t.Errorf("expected Group Key InitPlan numbering intact; got:\n%s", joined)
 	}
@@ -292,5 +319,48 @@ func TestExprHasSubplanOrOuterRef(t *testing.T) {
 		if exprHasSubplanOrOuterRef(e) {
 			t.Errorf("plain[%d] %T: want false", i, e)
 		}
+	}
+}
+
+// TestSortKeyTransportExprKeyRendersSource — M0146-0016. The widened
+// presorted split names a non-column group key by its transport
+// position (a positional ColumnRef carrying the output slot's name);
+// PG's `show_sort_group_keys` prints the group EXPRESSION for that
+// position — `Sort Key: (substr(...))`, parenthesised because the key
+// is a non-Var referent (S18). Pin the render through sortKeyParts:
+// the positional ref resolves position→GroupExprs via Arm S, and a
+// bare-column sibling keeps its own name.
+func TestSortKeyTransportExprKeyRendersSource(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE m14616 (w_name text, sm_type text, v int)"); err != nil {
+		t.Fatal(err)
+	}
+	node := planForTest(t, ctx,
+		"SELECT substr(w_name,1,20), sm_type, count(*) FROM m14616 GROUP BY substr(w_name,1,20), sm_type")
+	spec := findGroupAgg(node)
+	if spec == nil {
+		t.Fatal("no aggregate in plan")
+	}
+	sch := spec.Output()
+	if len(sch) < 2 || sch[0].Name == "" {
+		t.Fatalf("group output slots unnamed: %+v", sch)
+	}
+	// The refs splitAggregateTransportSorted stamps: positional Index,
+	// schema-slot Name/Type (M0146-0016 arm for the expr, clone for the
+	// column — identical coordinate contract).
+	keys := []optimizer.SortKey{
+		{Expr: &optimizer.ColumnRef{Index: 0, Name: sch[0].Name, Type: sch[0].Type}},
+		{Expr: &optimizer.ColumnRef{Index: 1, Name: sch[1].Name, Type: sch[1].Type}},
+	}
+	full, _ := sortKeyParts(spec, keys, nil, false)
+	if len(full) != 2 {
+		t.Fatalf("sortKeyParts returned %v", full)
+	}
+	if full[0] != "(substr(w_name, 1, 20))" {
+		t.Errorf("expr transport key rendered %q, want `(substr(w_name, 1, 20))`", full[0])
+	}
+	if full[1] != "m14616.sm_type" && full[1] != "sm_type" {
+		t.Errorf("column transport key rendered %q, want the column's own name", full[1])
 	}
 }

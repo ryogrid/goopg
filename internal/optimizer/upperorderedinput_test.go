@@ -193,6 +193,7 @@ func TestOrderedInputArmFiresEndToEndAndRemovesTheSort(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		sql        string
+		noParallel bool
 		wantSort   bool
 		wantMarker string
 	}{
@@ -203,16 +204,28 @@ func TestOrderedInputArmFiresEndToEndAndRemovesTheSort(t *testing.T) {
 			wantMarker: upperOrderedInputProducer,
 		},
 		{
+			// M0146-0027: with parallel workers available this case no
+			// longer keeps its Sort — the `gather.merge.sort` arm of
+			// `generateUsefulGatherPaths` (allpaths.c:3304-3328) sorts the
+			// cheapest partial path per worker by the ORDER BY keys and the
+			// Gather Merge delivers that order for free, exactly as PG does.
+			// MaxParallelWorkersPerGather = 0 removes that arm so the case
+			// still pins "an ORDER BY nothing delivers keeps its Sort".
 			name:       "ORDER BY a different column: the Sort must stay",
 			sql:        "select o_orderkey, l_orderkey from orders, lineitem where o_custkey = l_orderkey order by o_orderkey",
+			noParallel: true,
 			wantSort:   true,
 			wantMarker: upperOrderedSortProducer,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			run := ps
+			if c.noParallel {
+				run.MaxParallelWorkersPerGather = 0
+			}
 			var node Node
 			lines := captureTrace(t, func() {
-				n, err := PlanWithSettings(parseOne(t, c.sql), cat, ps)
+				n, err := PlanWithSettings(parseOne(t, c.sql), cat, run)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -358,7 +371,7 @@ func TestAggregateEmissionPathkeysDeclinesTheSameShapesAsItsPathTwin(t *testing.
 				{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}},
 			}}
 		}},
-		{"a non-ColumnRef group expression cannot be named", func(a *Aggregate) {
+		{"an expression group key the child does not sort on", func(a *Aggregate) {
 			a.GroupExprs = []Expr{&BinaryOp{}}
 		}},
 		{"the output position does not carry the group key's name", func(a *Aggregate) {
@@ -391,6 +404,46 @@ func TestAggregateEmissionPathkeysReadsAGatherMergeChild(t *testing.T) {
 
 	if got := inputNodePathkeys(agg); len(got) != 1 {
 		t.Fatalf("a Gather Merge child delivers its merged order: got %d keys, want 1", len(got))
+	}
+}
+
+// TestAggregateEmissionPathkeysReadsASearchedRootChild is M0146-0027: the
+// grouping stage's `upper.groupagg.searchcand` arm can elect a searched
+// candidate as the sorted aggregate's input directly — no `*Sort` node —
+// because that path already delivers the group ordering. The rebuilt searched
+// root carries the WINNING searched path's validated pathkeys
+// (`stampSearchPathkeys`), so `inputNodePathkeys` must read that stamped claim
+// through the `*Aggregate` exactly as it reads a `*Sort` child's `Keys`.
+func TestAggregateEmissionPathkeysReadsASearchedRootChild(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	group := agg.GroupExprs[0]
+	root := &searchedPricedNode{pricedNode: pricedNode{sch: Schema{
+		{Name: "k", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	}}}
+	root.markFromJoinSearch()
+	// A DESC/NULLS-FIRST claim — direction must survive the round trip.
+	root.setSearchPathkeys([]PathKey{{Expr: group, SortAsc: false, NullsFirst: true}})
+	agg.Child = root
+
+	got := inputNodePathkeys(agg)
+	if len(got) != 1 {
+		t.Fatalf("a searched root carrying the group order delivers it to the sorted aggregate: got %d keys, want 1", len(got))
+	}
+	if got[0].SortAsc || !got[0].NullsFirst {
+		t.Fatalf("the searched path's direction must be carried, got %+v", got[0])
+	}
+
+	// A searched root that does NOT satisfy the group order claims nothing.
+	root.setSearchPathkeys([]PathKey{{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}}})
+	if got := inputNodePathkeys(agg); got != nil {
+		t.Fatalf("a searched root sorted on a non-group column is not a sorted input, got %d keys", len(got))
+	}
+	// Neither does an untagged node — the stamped claim is what the walk
+	// trusts, not "this might have come from a search".
+	root.fromJoinSearch = false
+	if got := inputNodePathkeys(agg); got != nil {
+		t.Fatalf("an unmarked node carries no searched ordering claim, got %d keys", len(got))
 	}
 }
 
@@ -456,25 +509,30 @@ func TestInputNodePathkeysCrossesAPositionalIdentityProject(t *testing.T) {
 func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
 	agg := upperOrderedSortedAgg()
 
+	// wantAt is the output position the child's group-key ordering must be
+	// claimed at once the Project is crossed by convert_subquery_pathkeys
+	// (M0146-0005ax: a permutation or a narrowing still carries the column
+	// that holds the key), or -1 when no claim may survive.
 	cases := []struct {
 		name   string
 		mutate func(*Project)
+		wantAt int
 	}{
-		{"a permutation needs a position map", func(p *Project) {
+		{"a permutation moves the key to its new position", func(p *Project) {
 			p.Targets[0] = &ColumnRef{Index: 1, Name: "count"}
 			p.Targets[1] = &ColumnRef{Index: 0, Name: "k"}
-		}},
+		}, 1},
 		{"a computed column is a new value", func(p *Project) {
 			p.Targets[0] = &BinaryOp{}
-		}},
+		}, -1},
 		{"an isolated scope indexes its targets in another space", func(p *Project) {
 			p.IsolatedScope = true
-		}},
-		{"a narrowing projection is not yet expressible", func(p *Project) {
+		}, -1},
+		{"a narrowing projection keeps the key column", func(p *Project) {
 			p.Targets = p.Targets[:1]
 			p.schema = p.schema[:1]
-		}},
-		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }},
+		}, 0},
+		{"no stated targets is no evidence", func(p *Project) { p.Targets = nil }, -1},
 	}
 	for _, c := range cases {
 		p := identityProject(agg, "renamed_k", "n")
@@ -482,8 +540,18 @@ func TestProjectIsPositionalIdentityRefusesEverythingElse(t *testing.T) {
 		if projectIsPositionalIdentity(p) {
 			t.Fatalf("%s: admitted, want refused", c.name)
 		}
-		if got := inputNodePathkeys(p); got != nil {
-			t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+		got := inputNodePathkeys(p)
+		if c.wantAt < 0 {
+			if got != nil {
+				t.Fatalf("%s: the walk must stop, got %d keys", c.name, len(got))
+			}
+			continue
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s: want one key at position %d, got %v", c.name, c.wantAt, got)
+		}
+		if cr, ok := got[0].Expr.(*ColumnRef); !ok || cr.Index != c.wantAt {
+			t.Fatalf("%s: want the key at position %d, got %#v", c.name, c.wantAt, got[0].Expr)
 		}
 	}
 }
@@ -507,5 +575,25 @@ func TestRelabelPathkeysToTruncatesRatherThanGuessing(t *testing.T) {
 	}
 	if got := relabelPathkeysTo(nil, out); got != nil {
 		t.Fatal("no claim must stay no claim")
+	}
+}
+
+// TestAggregateEmissionPathkeysClaimsAnExpressionGroupKey is M0146-0005ae: a
+// sorted aggregate over an EXPRESSION group key (TPC-H Q7/Q8's `EXTRACT(year
+// FROM …)`) emits in that key's order exactly as over a column key, so the
+// ORDER BY on it needs no second Sort — PG's pathkey is the key's
+// EquivalenceClass either way. The claim names the output position.
+func TestAggregateEmissionPathkeysClaimsAnExpressionGroupKey(t *testing.T) {
+	agg := upperOrderedSortedAgg()
+	expr := &BinaryOp{Op: parser.OpMod, Left: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}, Right: &IntegerConst{Value: 3}}
+	agg.GroupExprs = []Expr{expr}
+	agg.Child.(*Sort).Keys = []SortKey{{Expr: expr}}
+	agg.schema[0].Name = "?column?"
+	got := inputNodePathkeys(agg)
+	if len(got) != 1 {
+		t.Fatalf("an expression group key sorted by its child is an emission order: got %d keys", len(got))
+	}
+	if cr, ok := got[0].Expr.(*ColumnRef); !ok || cr.Index != 0 || !got[0].SortAsc {
+		t.Fatalf("claim must be output position 0 ascending, got %+v", got[0])
 	}
 }

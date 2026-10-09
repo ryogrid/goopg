@@ -1,0 +1,24 @@
+HUNK 76
+--- 
++++ 
+@@ -6,2 +6,3 @@
+  1 | 4567890123456789 |  123 |  42
++ 1 |  123 |  456 |  123
+  1 |  123 |  4567890123456789 |  123
+@@ -9,3 +10,2 @@
+  1 | 4567890123456789 | -4567890123456789 | 4567890123456789
+- 1 |  123 |  456 |  123
+ (5 rows)
+HUNK 9
+--- 
++++ 
+@@ -12,3 +12,3 @@
+   ->  Hash (actual rows=8.00 loops=N)
+-  Buckets: 1024  Batches: 1  Memory Usage: NkB  Build Time: 0.048 ms
++  Buckets: 1024  Batches: 1  Memory Usage: NkB  Build Time: 0.018 ms
+   ->  Append (actual rows=8.00 loops=N)
+@@ -31,3 +31,3 @@
+   ->  Hash (actual rows=4.00 loops=N)
+-  Buckets: 1024  Batches: 1  Memory Usage: NkB  Build Time: 0.009 ms
++  Buckets: 1024  Batches: 1  Memory Usage: NkB  Build Time: 0.006 ms
+   ->  Seq Scan on prt_p1 t1 (actual rows=4.00 loops=N)

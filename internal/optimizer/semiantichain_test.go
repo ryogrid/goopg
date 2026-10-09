@@ -46,7 +46,7 @@ func TestSemiAntiOnQualsOK_DeclinesNilPredicate(t *testing.T) {
 }
 
 func TestSemiAntiLinksHaveSJInfos_MatchesRealSJInfo(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
+	cat := analyzedUniqueThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -221,8 +221,12 @@ func TestExtractSearchLeaves_AdmitSemiAnti_NarrowsMinLefthandToCorrelatedRelatio
 // throwaway Q69 instrumentation measured.
 func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t *testing.T) {
 	cat := analyzedThreeTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x) " +
-		"AND EXISTS (SELECT 1 FROM t3 WHERE t3.a = t1.x)"
+	// Each link carries a cross non-equality so neither RHS can be
+	// unique-ified into an inner join (compute_semijoin_info): the two
+	// links must stay chained semi joins for this test to see them
+	// (M0146-0005dk).
+	sql := "SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.z = t1.x AND t2.y < t1.x) " +
+		"AND EXISTS (SELECT 1 FROM t3 WHERE t3.a = t1.x AND t3.b < t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +287,7 @@ func TestExtractSearchLeaves_AdmitSemiAnti_ChainedLinksRebaseInnerKeyCorrectly(t
 // synthetic leaf (no FlattenedRHS marker here), and the walk renumbers
 // its placeholder SJInfo to the real leaf-index bits.
 func TestExtractSearchLeaves_SemiJoinIsAdmitted(t *testing.T) {
-	cat := analyzedThreeTablesCatalog(t)
+	cat := analyzedUniqueThreeTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE EXISTS (" +
 		"SELECT 1 FROM t2, t3 WHERE t2.z = t1.x AND t2.y = t3.a)"
 	node, err := Plan(parseOne(t, sql), cat)

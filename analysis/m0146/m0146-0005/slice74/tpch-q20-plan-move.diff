@@ -1,0 +1,28 @@
+402,415c402,413
+<         ->  Gather  ()
+<               Filter: (partsupp.ps_availqty > (SubPlan 1))
+<               Workers Planned: 2
+<               SubPlan 1
+<                 ->  Aggregate  ()
+<                       ->  Bitmap Heap Scan on lineitem  ()
+<                             Filter: ((((l_partkey = partsupp.ps_partkey) AND (l_suppkey = partsupp.ps_suppkey)) AND (l_shipdate >= '1994-01-01'::date)) AND (l_shipdate < '1995-01-01 00:00:00'::timestamp))
+<                             ->  Bitmap Index Scan on lineitem_part_supp_fkidx  ()
+<                                   Index Cond: (l_partkey = partsupp.ps_partkey AND l_suppkey = partsupp.ps_suppkey)
+<               ->  Nested Loop  ()
+<                     ->  Parallel Seq Scan on part  ()
+<                           Filter: (p_name LIKE 'forest%')
+<                     ->  Index Scan using partsupp_part_fkidx on partsupp  ()
+<                           Index Cond: (ps_partkey = p_partkey)
+---
+>         ->  Nested Loop  ()
+>               ->  Seq Scan on part  ()
+>                     Filter: (p_name LIKE 'forest%')
+>               ->  Index Scan using partsupp_part_fkidx on partsupp  ()
+>                     Index Cond: (ps_partkey = p_partkey)
+>                     Filter: (ps_availqty > (SubPlan 1))
+>                     SubPlan 1
+>                       ->  Aggregate  ()
+>                             ->  Bitmap Heap Scan on lineitem  ()
+>                                   Filter: ((((l_partkey = partsupp.ps_partkey) AND (l_suppkey = partsupp.ps_suppkey)) AND (l_shipdate >= '1994-01-01'::date)) AND (l_shipdate < '1995-01-01 00:00:00'::timestamp))
+>                                   ->  Bitmap Index Scan on lineitem_part_supp_fkidx  ()
+>                                         Index Cond: (l_partkey = partsupp.ps_partkey AND l_suppkey = partsupp.ps_suppkey)

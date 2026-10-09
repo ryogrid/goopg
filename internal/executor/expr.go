@@ -1205,9 +1205,12 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// Row-to-row comparisons: element-wise with proper NULL propagation.
 		// (a,b) OP (c,d): compare element by element; NULL in any element → NULL.
 		// This implements SQL row-comparison semantics (ISO SQL §8.7). M0097-0023.
-		if lRow, ok := x.Left.(*optimizer.RowExpr); ok {
-			if rRow, ok := x.Right.(*optimizer.RowExpr); ok {
-				return evalRowToRowComparison(x.Op, lRow, rRow, slot, ctx)
+		// ROW(a,b) spellings are FuncCall{Name:"row"} and compare the same
+		// way. Before M0146-0080 they were compared as composite text, so
+		// ROW(1,NULL) = ROW(1,NULL) was TRUE.
+		if lElems, ok := rowCtorElems(x.Left); ok {
+			if rElems, ok := rowCtorElems(x.Right); ok && isRowCompareOp(x.Op) {
+				return evalRowToRowComparison(x.Op, lElems, rElems, slot, ctx)
 			}
 		}
 		// Special case: row-constructor comparison with multi-column scalar subquery.
@@ -1307,6 +1310,15 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			// can format it with strconv.FormatFloat rather than big.Int decimal expansion.
 			return NewStringDatum(fs), nil
 		}
+		// Two character-string operands compare as text, whatever their
+		// values look like (M0146-0053; the compiled twin reads the same
+		// decision from payload[16] bit 2). Ahead of the pg_lsn shape test,
+		// which would otherwise claim an "X/Y"-shaped text value.
+		if isComparisonOpCode(x.Op) && textShapeAmbiguous(left, right) &&
+			exprIsCharacterString(x.Left) && exprIsCharacterString(x.Right) {
+			return binaryTextComparison(x.Op, left, right, declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right),
+				isBareStringLit(x.Left), isBareStringLit(x.Right)), nil
+		}
 		// pg_lsn arithmetic/comparison: detect KindString "X/Y" pattern.
 		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
@@ -1322,10 +1334,20 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		// The interpreted twin reads the declared widths straight off the
 		// operand expressions. Its compiled twin cannot (the expression is
 		// gone by then) and reads them from the node payload instead — see
-		// exprnode.go's ExprBinaryOp arm. Both then apply the same helper.
-		left, right = concatOperandsAsText(x.Op, left, right,
-			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right))
-		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
+		// exprnode.go's ExprBinaryOp arm. Both then apply the same helpers.
+		lbp, rbp := declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right)
+		left, right = concatOperandsAsText(x.Op, left, right, lbp, rbp)
+		left, right = comparisonOperandsAsBpchar(x.Op, left, right, lbp, rbp,
+			isBareStringLit(x.Left), isBareStringLit(x.Right))
+		var result Datum
+		if x.Op == parser.OpConcat {
+			// `||` resolved from the static operand types (M0146-0074);
+			// the compiled twin reads the same mode from payload[16]
+			// bits 8 and 16.
+			result, err = evalConcat(left, right, x.Pos(), ctx, concatModeOf(x.Left, x.Right))
+		} else {
+			result, err = evalBinary(x.Op, left, right, x.Pos(), ctx)
+		}
 		if err != nil {
 			return Datum{}, err
 		}
@@ -1424,7 +1446,14 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalIsDistinctFrom(lv, rv, x.Negated)
+		// The equality half resolves under the operands' declared types —
+		// PG's null-safe `=` is the same bpchareq, so bpchar operands
+		// compare on their bcTruelen images here too.
+		lv, rv = comparisonOperandsAsBpchar(parser.OpEq, lv, rv,
+			declaredBpcharTypmod(x.Left), declaredBpcharTypmod(x.Right),
+			isBareStringLit(x.Left), isBareStringLit(x.Right))
+		plain := textShapeAmbiguous(lv, rv) && exprIsCharacterString(x.Left) && exprIsCharacterString(x.Right)
+		return evalIsDistinctFrom(lv, rv, x.Negated, plain)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -1433,14 +1462,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 //
 //	IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
 //	IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
-func evalIsDistinctFrom(lv, rv Datum, negated bool) (Datum, error) {
+//
+// plain: both operands are character strings, which compare as text
+// whatever the values look like (M0146-0053).
+func evalIsDistinctFrom(lv, rv Datum, negated bool, plain bool) (Datum, error) {
 	var equal bool
 	if lv.IsNull() && rv.IsNull() {
 		equal = true
 	} else if lv.IsNull() || rv.IsNull() {
 		equal = false
 	} else {
-		cmp, err := compareDatum(lv, rv, 0)
+		cmp, err := compareDatumPlain(lv, rv, 0, plain)
 		if err != nil {
 			equal = false
 		} else {
@@ -1801,6 +1833,9 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// the microsecond difference is justified into whole 24h days
 		// (interval_justify_hours), while a pure date pair yields an int4
 		// day count instead of an interval.
+		if op == parser.OpSub && left.IsDate() && right.IsDate() {
+			return subDateDate(left, right, pos)
+		}
 		if op == parser.OpSub && left.Kind == KindTime && right.Kind == KindTime {
 			return subTimeTime(left, right, pos)
 		}
@@ -1884,6 +1919,8 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 				return numericMul(a, b)
 			case parser.OpDiv:
 				return numericDiv(a, b, pos)
+			case parser.OpMod:
+				return numericMod(a, b, pos)
 			}
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s not supported on numeric", op)}
 		}
@@ -1903,81 +1940,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		}
 		return floatTextDatum(PGFloatOut(result, 64)), nil
 	case parser.OpConcat:
-		// || requires at least one string-typed operand. When one side is text
-		// (or string-like), the other side is coerced to text. When both sides
-		// are non-string (e.g. integer || numeric), PostgreSQL raises
-		// "operator does not exist" — match that behaviour. M0097-0063.
-		if left.IsNull() || right.IsNull() {
-			return NullDatum, nil
-		}
-		leftIsStr := left.Kind == KindString || left.Kind == KindBytes
-		rightIsStr := right.Kind == KindString || right.Kind == KindBytes
-		if !leftIsStr && !rightIsStr {
-			// Neither operand is string-like → PG-compatible error.
-			return Datum{}, &ExecError{Code: "42883", Pos: pos,
-				Message: fmt.Sprintf("operator does not exist: %s || %s",
-					pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
-				Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
-		}
-		// Array concatenation: if both operands look like PostgreSQL arrays
-		// ({v1,v2,...}), merge their elements rather than text-concat.
-		// Also handles array || element and element || array (append/prepend).
-		// M0097-0065. Non-array text rendering honors the session DateStyle
-		// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
-		// matching the already-fixed SELECT/COPY/CAST output paths.
-		// byteacat (varlena.c): bytea || bytea is BYTEA, not text. The
-		// unknown-type literal in `<bytea> || '\x00'` is coerced through
-		// byteain first, exactly as PG's operator resolution would; a string
-		// that is not valid bytea input falls through to the text path below
-		// rather than failing the query. M0125-0021.
-		if left.Kind == KindBytes || right.Kind == KindBytes {
-			lb, lok := byteaOperand(left)
-			rb, rok := byteaOperand(right)
-			if lok && rok {
-				out := make([]byte, 0, len(lb)+len(rb))
-				out = append(out, lb...)
-				out = append(out, rb...)
-				return NewBytesDatum(out), nil
-			}
-		}
-		ls := formatDatumDateStyle(left, ctx)
-		rs := formatDatumDateStyle(right, ctx)
-		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
-		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
-		if lsIsArr && rsIsArr {
-			// array || array: merge inner elements.
-			leftInner := ls[1 : len(ls)-1]
-			rightInner := rs[1 : len(rs)-1]
-			var inner string
-			switch {
-			case leftInner == "" && rightInner == "":
-				inner = ""
-			case leftInner == "":
-				inner = rightInner
-			case rightInner == "":
-				inner = leftInner
-			default:
-				inner = leftInner + "," + rightInner
-			}
-			return NewStringDatum("{" + inner + "}"), nil
-		}
-		if lsIsArr && !rsIsArr {
-			// array || element: append element to array.
-			inner := ls[1 : len(ls)-1]
-			if inner == "" {
-				return NewStringDatum("{" + rs + "}"), nil
-			}
-			return NewStringDatum("{" + inner + "," + rs + "}"), nil
-		}
-		if rsIsArr && !lsIsArr {
-			// element || array: prepend element.
-			inner := rs[1 : len(rs)-1]
-			if inner == "" {
-				return NewStringDatum("{" + ls + "}"), nil
-			}
-			return NewStringDatum("{" + ls + "," + inner + "}"), nil
-		}
-		return NewStringDatum(ls + rs), nil
+		return evalConcat(left, right, pos, ctx, concatGuess)
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
 		// Geometric point operators reuse the << / >> spellings: `point << point`
 		// (strictly left of) and `point >> point` (strictly right of) compare the
@@ -3795,6 +3758,17 @@ const (
 // NaN), while a single infinite operand yields the correspondingly-signed
 // infinite interval. -inf−x = -inf, +inf−x = +inf, x−(-inf) = +inf,
 // x−(+inf) = -inf. (unimplemented_feat #5(d-iv))
+// subDateDate is date_mi (date.c): the integer number of days between two
+// dates. Infinite dates have no day count — PG raises 22008 "cannot subtract
+// infinite dates". M0146-0040.
+func subDateDate(left, right Datum, pos int) (Datum, error) {
+	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
+		return Datum{}, &ExecError{Code: "22008", Pos: pos, Message: "cannot subtract infinite dates"}
+	}
+	diff := left.TimeValue().Sub(right.TimeValue())
+	return Datum{Kind: KindInt, Int: int64(diff / (24 * time.Hour))}, nil
+}
+
 func subTimeTime(left, right Datum, pos int) (Datum, error) {
 	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
 		switch {
@@ -4835,6 +4809,16 @@ func evalOr(a, b Datum) Datum {
 // see usedSession in that arm.
 func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
+		// The cache holds the instant only; the literal's type restores the
+		// datum's subtype, exactly as the uncached arms below build it — a
+		// cached date literal used to come back as a timestamp, so
+		// `date '2001-07-15' + 30` missed the date_pli arm (M0146-0040).
+		switch {
+		case x.Type == "date":
+			return NewDateDatum(x.CachedTime), nil
+		case isTimestampTZTypeName(x.Type):
+			return NewTimestampTZDatum(x.CachedTime), nil
+		}
 		return NewTimeDatum(x.CachedTime), nil
 	}
 	switch x.Type {
@@ -4963,7 +4947,10 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
-		return NewTimeDatum(x.CachedTime), nil
+		// A DATE datum (date_in), not a timestamp: date ± integer
+		// (date_pli / date_mii) and date - date (date_mi) dispatch on it.
+		// M0146-0040.
+		return NewDateDatum(x.CachedTime), nil
 	case "time":
 		// 'now' is the only RESERV token DecodeTimeOnly accepts (#5(d-iv), M0134-0182).
 		if inf, ok := parseTimeSpecialLiteral(x.Value, nowFromCtx(ctx)); ok {
@@ -10308,9 +10295,30 @@ func roundIntervalMicrosToPrec(micros int64, p int) int64 {
 // Multi-column subqueries raise 42601 unless the operand is a RowExpr,
 // in which case element-wise tuple comparison is used (row-constructor IN).
 func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	d, err := evalInExprScalarRow(x, slot, ctx)
+	// M0146-0015c slice 3: an EXISTS→ANY conversion product is two-valued —
+	// PG's subplan->unknownEqFalse. Three-valued IN owes NULL where EXISTS
+	// reports FALSE (unmatched over a NULL-bearing set, a NULL operand
+	// against a non-empty set), and the difference is observable through a
+	// NOT above the link even though a bare qual cannot tell them apart.
+	// Collapse it once at this boundary so the tuple hash, the value hash
+	// and both linear fallbacks agree.
+	if err == nil && x.UnknownEqFalse && d.IsNull() {
+		d = NewBoolDatum(x.Negated)
+	}
+	return d, err
+}
+
+func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// Row-constructor IN/NOT IN subquery: (a, b) IN (SELECT x, y FROM ...).
 	// Route to element-wise tuple comparison. M0097-0020.
 	if rowOp, ok := x.Operand.(*optimizer.RowExpr); ok && x.Plan != nil {
+		// M0146-0015c slice 3: an EXISTS→ANY conversion product serves
+		// from the tuple hash when UnknownEqFalse licenses it; every
+		// other row-IN keeps the NULL-precise linear path.
+		if d, err, served := evalRowHashProbe(x, rowOp, slot, ctx); served {
+			return d, err
+		}
 		return evalRowConstructorInExpr(x, rowOp, slot, ctx)
 	}
 	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
@@ -10333,6 +10341,43 @@ func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error)
 	if err != nil {
 		return Datum{}, err
 	}
+	// bpchar comparison semantics for `operand = item` (M0146): each
+	// element comparison resolves under the same rules
+	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
+	// side compares blank-insensitively (bcTruelen), an untyped literal
+	// opposite a bpchar is coerced to bpchar, and an explicitly
+	// text-typed side keeps its padding byte-exact. The DECLARED types
+	// decide, never the datum, so the item metadata is captured here
+	// while the expressions/plan are still visible:
+	//   - a literal list (x.List) exposes each item's expression;
+	//   - a subquery list's items all share the inner plan's first
+	//     output column type;
+	//   - a single-element array-literal expansion gives every element
+	//     the source expression's classification.
+	opBP := declaredBpcharTypmod(x.Operand)
+	opLit := isBareStringLit(x.Operand)
+	itemBP := make([]int64, len(values))
+	itemLit := make([]bool, len(values))
+	switch {
+	case x.Plan != nil:
+		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
+			for i := range itemBP {
+				itemBP[i] = 1
+			}
+		}
+	case len(values) == len(x.List):
+		for i, e := range x.List {
+			itemBP[i] = declaredBpcharTypmod(e)
+			itemLit[i] = isBareStringLit(e)
+		}
+	case len(x.List) == 1:
+		bp := declaredBpcharTypmod(x.List[0])
+		lit := isBareStringLit(x.List[0])
+		for i := range itemBP {
+			itemBP[i] = bp
+			itemLit[i] = lit
+		}
+	}
 	if operandNull {
 		if len(values) == 0 {
 			// Vacuous quantification over an empty list.
@@ -10353,11 +10398,13 @@ func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error)
 	// as the ANY branch below, not full three-valued NULL propagation).
 	// M0122-0004.
 	if x.AnyOp != 0 && x.AllOp {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
+			o, vv := comparisonOperandsAsBpchar(x.AnyOp, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			res, err := evalBinary(x.AnyOp, o, vv, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10371,11 +10418,13 @@ func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error)
 	// (left op elem) for each element. Used for non-equality operators like
 	// `col ~ ANY(ARRAY[...])`. M0097-0068.
 	if x.AnyOp != 0 {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
+			o, vv := comparisonOperandsAsBpchar(x.AnyOp, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			res, err := evalBinary(x.AnyOp, o, vv, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10388,11 +10437,13 @@ func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error)
 	// != ANY semantics: return true if operand != at least one element (OR
 	// of inequality comparisons). M0097-0067.
 	if x.NotEqualAny {
-		for _, v := range values {
+		for i, v := range values {
 			if v.IsNull() {
 				continue // skip nulls in the list
 			}
-			eq, err := compareEq(operand, v)
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
+				opBP, itemBP[i], opLit, itemLit[i])
+			eq, err := compareEq(o, vv)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -10413,12 +10464,14 @@ func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error)
 		return res, nil
 	}
 	sawNull := false
-	for _, v := range values {
+	for i, v := range values {
 		if v.IsNull() {
 			sawNull = true
 			continue
 		}
-		eq, err := compareEq(operand, v)
+		o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
+			opBP, itemBP[i], opLit, itemLit[i])
+		eq, err := compareEq(o, vv)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -10455,6 +10508,7 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 	outerRow := slotToRow(slot)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
 	op, err := Build(x.Plan)
 	if err != nil {
@@ -10465,6 +10519,22 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
+
+	// bpchar metadata per column (M0146): the operand element's declared
+	// type from the row constructor, the inner column's from the subplan
+	// output schema — the same declared-type rule comparisonOperandsAsBpchar
+	// applies to scalar `=`.
+	var innerBP []bool
+	if out := x.Plan.Output(); len(out) == nCols {
+		for i, c := range out {
+			if bpcharCatalogType(c.Type) {
+				if innerBP == nil {
+					innerBP = make([]bool, nCols)
+				}
+				innerBP[i] = true
+			}
+		}
+	}
 
 	sawNullRow := false
 	for {
@@ -10495,6 +10565,13 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 				rowNull = true
 				continue
 			}
+			var rbp int64
+			if i < len(innerBP) && innerBP[i] {
+				rbp = 1
+			}
+			left, right = comparisonOperandsAsBpchar(parser.OpEq, left, right,
+				declaredBpcharTypmod(rowOp.Elems[i]), rbp,
+				isBareStringLit(rowOp.Elems[i]), false)
 			eq, err := compareEq(left, right)
 			if err != nil {
 				return Datum{}, err
@@ -10543,6 +10620,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	outerRow := slotToRow(slot)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
 
 	innerOp, err := Build(sqOp.Plan)
 	if err != nil {
@@ -10664,9 +10742,9 @@ func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error
 				return nil, err
 			}
 		case x.IsNonCorrelated:
-			cacheKey = nonCorrelatedCacheKey(x)
+			cacheKey = ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 		default:
-			cacheKey = subqueryCacheKey(row)
+			cacheKey = ctx.scopedSublinkKey(stat, x.Plan, subqueryCacheKey(row))
 		}
 		// Correlated results may be cached only when the inner plan is
 		// free of volatile functions and LockRows (Stage 9 cacheability
@@ -10707,6 +10785,7 @@ func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error
 				}
 			}
 			defer pop()
+			defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 			op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
 			if err != nil {
 				return nil, err
@@ -10843,7 +10922,7 @@ func evalExistsExpr(x *optimizer.ExistsExpr, row Row, ctx *Context) (Datum, erro
 		// where lowering verified it, and a non-correlated EXISTS is
 		// never lowered (no params) — keep the historical
 		// clear-on-depth-change guard (Stage 10).
-		cacheKey := nonCorrelatedCacheKey(x)
+		cacheKey := ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 		if cached, ok := ctx.subqCacheGet(cacheKey, true); ok && len(cached) == 1 {
 			stat.CacheHits++
 			return cached[0], nil
@@ -10868,6 +10947,7 @@ func existsWithScope(x *optimizer.ExistsExpr, row Row, ctx *Context, lowered boo
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	return existsImpl(x, ctx)
 }
 
@@ -10948,9 +11028,9 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 	case lowered:
 		cacheKey = loweredKey
 	case x.IsNonCorrelated:
-		cacheKey = nonCorrelatedCacheKey(x)
+		cacheKey = ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
 	default:
-		cacheKey = fmt.Sprintf("%p|%s", x, subqueryCacheKey(row))
+		cacheKey = ctx.scopedSublinkKey(stat, x.Plan, fmt.Sprintf("%p|%s", x, subqueryCacheKey(row)))
 	}
 	// Correlated results may be served from the cache only when the
 	// inner plan is volatility/LockRows-free (Stage 9 gate, ch.07 M13);
@@ -10988,6 +11068,7 @@ func subqueryWithScope(x *optimizer.SubqueryExpr, row Row, ctx *Context, lowered
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	return subqueryImpl(x, ctx)
 }
 
@@ -11098,6 +11179,9 @@ func subqueryImpl(x *optimizer.SubqueryExpr, ctx *Context) (Datum, error) {
 			if outerVal.IsNull() {
 				return NullDatum, nil
 			}
+			if info.outerBP {
+				outerVal = trimStringDatum(outerVal)
+			}
 			result, found := hm[datumKey(outerVal)]
 			if !found {
 				return NullDatum, nil
@@ -11157,6 +11241,13 @@ type corrSubqHashInfo struct {
 	scanColIdx int                     // index of the join key column in SeqScan output
 	outerRef   optimizer.Expr // outer join-key value: OuterColumnRef or (lowered) ExecParamRef
 	projExpr   optimizer.Expr            // project expression to evaluate for result
+	// innerBP / outerBP mark bpchar-typed join keys: the map hashes the
+	// bcTruelen image and the probe trims identically, the same
+	// normalisation hash-join buildKeyTrim/probeKeyTrim applies —
+	// without it a char(20) outer value and a char(5) inner column never
+	// meet. M0146 bpchar hash parity.
+	innerBP bool
+	outerBP bool
 }
 
 // extractCorrSubqHashInfo detects the pattern
@@ -11213,11 +11304,18 @@ func extractCorrSubqHashInfo(n optimizer.Node) (corrSubqHashInfo, bool) {
 	if innerCol == nil || outerRef == nil {
 		return corrSubqHashInfo{}, false
 	}
+	innerBP := bpcharCatalogType(innerCol.Type)
 	return corrSubqHashInfo{
 		scan:       scan,
 		scanColIdx: innerCol.Index,
 		outerRef:   outerRef,
 		projExpr:   projectTarget,
+		innerBP:    innerBP,
+		// PG's rule for the probe side mirrors comparisonOperandsAsBpchar:
+		// a bpchar outer value trims under bpchareq; a text outer value
+		// does not (bpchar=text routes through the rtrim1 cast on the
+		// INNER side only — which innerBP already applies at build).
+		outerBP: declaredBpcharTypmod(outerRef) > 0,
 	}, true
 }
 
@@ -11247,6 +11345,9 @@ func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum
 			continue
 		}
 		keyDatum := row[info.scanColIdx]
+		if info.innerBP {
+			keyDatum = trimStringDatum(keyDatum)
+		}
 		valDatum, verr := evalExprSlot(info.projExpr, slot, ctx)
 		if verr != nil {
 			return nil, verr
@@ -11292,6 +11393,7 @@ func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (D
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
 	op, err := Build(x.Plan)
 	if err != nil {
@@ -11342,6 +11444,7 @@ func evalMultiAssignSubqRow(x *optimizer.MultiAssignSubqRow, row Row, ctx *Conte
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 	op, err := Build(x.Plan)
 	if err != nil {
 		return nil, err
@@ -11417,6 +11520,16 @@ func evalCaseExpr(x *optimizer.CaseExpr, row Row, ctx *Context) (Datum, error) {
 		}
 		operand = v
 	}
+	// bpchar semantics for the simple-CASE operand's implicit `=` per
+	// WHEN: the same rule comparisonOperandsAsBpchar gives a BinaryOp —
+	// `CASE c WHEN 'Javier'` on a char(n) column resolves the literal to
+	// bpchar and must match. M0146.
+	opBP := int64(0)
+	opLit := false
+	if hasOperand {
+		opBP = declaredBpcharTypmod(x.Operand)
+		opLit = isBareStringLit(x.Operand)
+	}
 	for _, w := range x.Whens {
 		whenVal, err := evalExpr(w.When, row, ctx)
 		if err != nil {
@@ -11424,7 +11537,9 @@ func evalCaseExpr(x *optimizer.CaseExpr, row Row, ctx *Context) (Datum, error) {
 		}
 		var matched bool
 		if hasOperand {
-			eq, err := compareEq(operand, whenVal)
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, whenVal,
+				opBP, declaredBpcharTypmod(w.When), opLit, isBareStringLit(w.When))
+			eq, err := compareEq(o, vv)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11582,6 +11697,111 @@ func concatOperandsAsText(op parser.OpCode, left, right Datum, lbp, rbp int64) (
 	return left, right
 }
 
+// comparisonOperandsAsBpchar applies PostgreSQL's blank-insensitive bpchar
+// comparison semantics to the operands of a comparison operator before
+// compareDatum sees them — the scalar-evaluator twin of the btree's
+// PGCompareBpcharC (varchar.c's bcTruelen).
+//
+// The rules, measured on PG 18.3:
+//   - bpchar vs bpchar: bpchareq/bpcharlt compare both sides under
+//     bcTruelen — 'Javier   ' = 'Javier' is TRUE.
+//   - bpchar vs a bare string literal: the unknown literal resolves to the
+//     bpchar operand's type (coerce_type picks the typed side), so the
+//     comparison is bpchar=bpchar and the literal strips trailing blanks
+//     too — c = 'Javier   ' is TRUE when c is char(n).
+//   - bpchar vs text/varchar: text is the string category's preferred
+//     type, so the comparison is text=text and only the bpchar side is
+//     routed through the implicit bpchar->text cast (rtrim1). The text
+//     operand keeps its trailing blanks byte-exact — 'Javier'::char(10) =
+//     'Javier   '::text is FALSE, and the asymmetry matters.
+//
+// The DECLARED type decides, never the datum: a blank-padded image is
+// indistinguishable from a text value that genuinely ends in spaces.
+// lbp/rbp are each side's declaredBpcharTypmod (0 when not bpchar) — the
+// same words concatOperandsAsText already receives, so both evaluator
+// twins share one plumbing path. lLit/rLit report "operand is an untyped
+// string literal" (isBareStringLit), which plays PG's unknown-type role.
+func comparisonOperandsAsBpchar(op parser.OpCode, left, right Datum, lbp, rbp int64, lLit, rLit bool) (Datum, Datum) {
+	switch op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+	default:
+		return left, right
+	}
+	if lbp <= 0 && rbp <= 0 {
+		return left, right
+	}
+	if (lbp > 0 || lLit) && left.Kind == KindString {
+		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+			left = NewStringDatum(t)
+		}
+	}
+	if (rbp > 0 || rLit) && right.Kind == KindString {
+		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+			right = NewStringDatum(t)
+		}
+	}
+	return left, right
+}
+
+// isBareStringLit reports whether e is an untyped string literal — the
+// node an un-cast 'x' parses into (optimizer.StringConst). It plays the
+// role of PostgreSQL's unknown-type literal in comparisonOperandsAsBpchar:
+// PG coerces the unknown side to the bpchar operand's type, so a bare
+// literal opposite a bpchar compares blank-insensitively. An explicitly
+// typed literal lands on CastExpr or TypedStringLit instead and is handled
+// by the declared-type arm.
+func isBareStringLit(e optimizer.Expr) bool {
+	_, ok := e.(*optimizer.StringConst)
+	return ok
+}
+
+// bpcharCatalogType reports whether a catalog.Type names the bpchar
+// family — the plan-schema twin of declaredBpcharTypmod's name check,
+// used where only a plan output column (no expression) remains, e.g.
+// the inner column of `operand IN (SELECT ...)`. Only the name matters
+// for comparison semantics: bcTruelen trimming is width-independent.
+func bpcharCatalogType(t catalog.Type) bool {
+	if t.IsArray {
+		return false
+	}
+	switch strings.ToLower(t.Name) {
+	case "char", "bpchar", "character":
+		return true
+	}
+	return false
+}
+
+// bpcharSchemaTrims returns per-column trim flags for a schema — the
+// whole-row twin of declaredBpcharTypmod for dedup paths that see only
+// datums (DISTINCT, SetOp, recursive-CTE dedup). nil when no column is
+// bpchar-typed so every caller keeps its zero-cost fast path.
+func bpcharSchemaTrims(s optimizer.Schema) []bool {
+	var trims []bool
+	for i, c := range s {
+		if bpcharCatalogType(c.Type) {
+			if trims == nil {
+				trims = make([]bool, len(s))
+			}
+			trims[i] = true
+		}
+	}
+	return trims
+}
+
+// trimStringDatum returns d with trailing ASCII spaces stripped when it
+// is a KindString — the Datum-level bcTruelen. Shared by
+// comparisonOperandsAsBpchar and the subplan hash probe's key
+// normalisation so both spell "strip the padding" identically.
+func trimStringDatum(d Datum) Datum {
+	if d.Kind != KindString {
+		return d
+	}
+	if t := strings.TrimRight(d.StringValue(), " "); t != d.StringValue() {
+		return NewStringDatum(t)
+	}
+	return d
+}
+
 // coerceBpcharArgDatum applies upstream's bpchar->text coercion to a whole
 // Datum, for a TEXT-declared function whose body reads its argument in more
 // than one place. It is the Datum-level twin of bpcharArgAsText: normalising
@@ -11644,9 +11864,31 @@ func declaredBpcharTypmod(e optimizer.Expr) int64 {
 		if len(n.Type.Args) > 0 {
 			typmod = n.Type.Args[0]
 		}
+	case *optimizer.OuterColumnRef:
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
+	case *optimizer.ExecParamRef:
+		// subplan_lower rewrites OuterColumnRefs to PARAM_EXEC slots and
+		// preserves the declared type — the same bpchar predicate applies.
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
 	case *optimizer.CastExpr:
 		name = n.TargetType
 		typmod = n.Typmod
+	case *optimizer.TypedStringLit:
+		// `char(10) 'x'` — the literal carries the type name but no typmod
+		// field; typmod stays 0 and normalises to the bare-char default 1.
+		name = n.Type
 	case *optimizer.FuncCall:
 		// coalesce/greatest/least/nullif take the first argument's type
 		// (planner.exprType), so octet_length(coalesce(charcol, '')) still sees
@@ -11698,6 +11940,8 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 	}
 	switch name {
+	case optimizer.FieldSelectFuncName:
+		return evalFieldSelect(x, slot, ctx)
 	case "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange":
 		// range_constructor2 / range_constructor3 (rangetypes.c). goopg's
 		// pg_proc seed has carried these twelve rows since the range-type
@@ -12004,6 +12248,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return newVal, nil
 		}
 		return NullDatum, nil
+	case "pg_trigger_depth":
+		// pg_trigger_depth() → int4: how many trigger invocations are on the
+		// stack (trigger.c MyTriggerDepth). 0 outside any trigger; a trigger
+		// whose body fires another trigger sees 2 there. It was
+		// unimplemented; RAISE swallowed the error and printed an empty
+		// depth until M0146-0080 made RAISE errors propagate.
+		if len(x.Args) != 0 {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "function pg_trigger_depth does not exist"}
+		}
+		if ctx == nil {
+			return NewIntDatum(0), nil
+		}
+		return NewIntDatum(int64(ctx.TriggerDepth)), nil
 	case "pg_backend_pid":
 		// pg_backend_pid() → int4: the PID of the server process attached to the
 		// current session. goopg is a single OS process multiplexing connections,
@@ -12701,10 +12958,19 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if err != nil {
 				return NullDatum, err
 			}
-			if v.IsNull() {
+			switch {
+			case v.IsNull():
 				sb.WriteString("NULL")
-			} else {
+			case arrayConstructElemIsArray(arg, v):
+				// A sub-array (ARRAY[ARRAY[…], …]) is spliced as its own
+				// `{…}` text, never quoted.
 				sb.WriteString(v.Format())
+			default:
+				// M0146-0045: array_out's element quoting — an empty
+				// string, `NULL` (any case), or any of `{}",\` and
+				// whitespace is double-quoted with `"` and `\` escaped,
+				// so the text re-reads as the same elements.
+				sb.WriteString(quoteArrayTextElem(formatDatumDateStyle(v, ctx)))
 			}
 		}
 		sb.WriteByte('}')
@@ -14598,6 +14864,42 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
 		"pg_statistics_obj_is_visible":
 		return NewBoolDatum(true), nil
+	case "pg_relation_is_publishable":
+		// pg_relation_is_publishable(regclass) → bool (pg_publication.c):
+		// is_publishable_class — an ordinary or partitioned table that is
+		// permanent and not a system relation (relid >= FirstNormalObjectId);
+		// NULL when the relation does not exist. psql's \d query calls it with
+		// a constant OID, which makes the conjunct a pseudoconstant that is
+		// evaluated even when the pg_class conjunct beside it matches no row
+		// (M0146-0007h).
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, err
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		var oid uint64
+		if arg.Kind == KindInt {
+			oid = uint64(arg.Int)
+		} else if v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32); perr == nil {
+			oid = v
+		} else if schema, rel, nameOK := splitRegQualifiedName(arg.StringValue()); nameOK {
+			if t, found := im.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); found && t != nil {
+				oid = uint64(t.OID)
+			}
+		}
+		tbl, found := im.LookupTableByOID(uint32(oid), catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+		if !found || tbl == nil {
+			return NullDatum, nil
+		}
+		kind := relkindByteForTable(tbl)
+		return NewBoolDatum((kind == 'r' || kind == 'p') && tbl.ForeignServerName == "" &&
+			!tbl.Temp && !tbl.Unlogged && tbl.OID >= 16384), nil
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
@@ -15689,6 +15991,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if v.Kind == KindInt && scale == 0 {
 				return v, nil
 			}
+			// numeric_round is exact decimal rounding (M0146-0087).
+			if v.Kind == KindNumeric && scale >= -1000 && scale <= 1000 {
+				return roundNumericExact(v, int(scale)), nil
+			}
 			f, ferr := strconv.ParseFloat(v.Format(), 64)
 			if ferr != nil {
 				return NullDatum, nil
@@ -15939,6 +16245,18 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || a.IsNull() || b.IsNull() {
 				return NullDatum, nil
+			}
+			// M0146-0044: mod(numeric, numeric) (PG's numeric_mod — an
+			// integer argument is promoted, as the int variants lose to the
+			// numeric one) is exact; only two integers keep the int path.
+			if a.Kind == KindNumeric || b.Kind == KindNumeric {
+				an, bn, err := promoteToNumeric(a, b, parser.OpMod, x.Pos())
+				if err != nil {
+					return Datum{}, err
+				}
+				// numeric_mod's division-by-zero error carries no
+				// cursor position, unlike the operator's.
+				return numericMod(an, bn, 0)
 			}
 			if b.Int == 0 {
 				return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
@@ -17316,7 +17634,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				best = v
 				continue
 			}
-			cmp, cerr := compareDatum(v, best, x.Pos())
+			cmp, cerr := compareDatumTyped(v, best, x.Pos(), arg)
 			if cerr != nil || cmp > 0 {
 				best = v
 			}
@@ -17333,7 +17651,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				best = v
 				continue
 			}
-			cmp, cerr := compareDatum(v, best, x.Pos())
+			cmp, cerr := compareDatumTyped(v, best, x.Pos(), arg)
 			if cerr != nil || cmp < 0 {
 				best = v
 			}
@@ -17486,16 +17804,22 @@ case "pg_char_to_encoding":
 	case "version":
 		return NewStringDatum("PostgreSQL 18.3 goopg compatible"), nil
 	case "pg_current_xact_id", "txid_current":
-		if ctx.Tx.XID != 0 {
-			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		// M0146-0043: GetTopTransactionId (xact.c) — assigns the top-level
+		// transaction's xid on first use, as a read-only transaction has
+		// none yet, and returns it (never a savepoint's subxact xid).
+		if top := topLevelXID(ctx); top != 0 {
+			return Datum{Kind: KindInt, Int: int64(top)}, nil
 		}
-		return Datum{Kind: KindInt, Int: 0}, nil
+		if err := ctx.MaterializeWriterXID(); err != nil {
+			return Datum{}, err
+		}
+		return Datum{Kind: KindInt, Int: int64(topLevelXID(ctx))}, nil
 	// txid_current_if_assigned() → xid8: same as pg_current_xact_id() but
 	// returns NULL instead of assigning a new xid. M0134-0080 (pg_proc OID
 	// 3348, handler pg_current_xact_id_if_assigned, xid8funcs.c).
 	case "txid_current_if_assigned":
-		if ctx.Tx.XID != 0 {
-			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		if top := topLevelXID(ctx); top != 0 {
+			return Datum{Kind: KindInt, Int: int64(top)}, nil
 		}
 		return NullDatum, nil
 	// txid_current_snapshot() → pg_snapshot: the statement's active
@@ -17608,7 +17932,11 @@ case "pg_char_to_encoding":
 		}
 	case "clock_timestamp":
 		// prorettype 1184 (timestamptz), like the now() family. M0119-0006.
-		return NewTimestampTZDatum(ctx.Now), nil
+		// Unlike now(), the actual current time — it advances within a
+		// statement (GetCurrentTimestamp, timestamp.c clock_timestamp), so a
+		// `DEFAULT clock_timestamp()` differs per row (M0146-0054). PG's
+		// timestamps have microsecond resolution.
+		return NewTimestampTZDatum(time.Now().Truncate(time.Microsecond)), nil
 	case "timeofday":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
@@ -20737,42 +21065,79 @@ func enumUnsafeError(label, typeName string, pos int) error {
 	}
 }
 
-// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise
-// comparison with standard SQL NULL semantics: if any compared element is NULL,
-// the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
-// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
-func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
-	n := len(left.Elems)
-	if len(right.Elems) < n {
-		n = len(right.Elems)
+// rowCtorElems returns the elements of a row constructor operand: a RowExpr
+// `(a, b)` or a ROW(a, b) call (planned as FuncCall{Name:"row"}).
+func rowCtorElems(e optimizer.Expr) ([]optimizer.Expr, bool) {
+	switch r := e.(type) {
+	case *optimizer.RowExpr:
+		return r.Elems, true
+	case *optimizer.FuncCall:
+		if !r.Star && strings.EqualFold(r.Name, "row") {
+			return r.Args, true
+		}
 	}
+	return nil, false
+}
+
+// isRowCompareOp reports whether op is one of the six comparison operators
+// that a row-to-row comparison expands element-wise.
+func isRowCompareOp(op parser.OpCode) bool {
+	switch op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return true
+	}
+	return false
+}
+
+// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) the way PG's
+// make_row_comparison_op (parse_expr.c) does. `=` is the AND of the
+// element-wise `=` results and `<>` is the OR of the element-wise `<>`
+// results, so a decided pair wins over a NULL pair: ROW(1,NULL) = ROW(2,NULL)
+// is FALSE and ROW(1,NULL) = ROW(1,NULL) is NULL. The ordering operators are a
+// RowCompareExpr: the first unequal pair decides, and a NULL pair reached
+// before that makes the result NULL. Implements ISO SQL §8.7 row comparison.
+// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
+func evalRowToRowComparison(op parser.OpCode, left, right []optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
+	n := len(left)
+	if len(right) < n {
+		n = len(right)
+	}
+	sawNull := false
 	for i := 0; i < n; i++ {
-		lDat, err := evalExprSlot(left.Elems[i], slot, ctx)
+		lDat, err := evalExprSlot(left[i], slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
-		rDat, err := evalExprSlot(right.Elems[i], slot, ctx)
+		rDat, err := evalExprSlot(right[i], slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		if lDat.IsNull() || rDat.IsNull() {
+			if op == parser.OpEq || op == parser.OpNe {
+				sawNull = true
+				continue
+			}
 			return NullDatum, nil
 		}
-		cmp, err := compareDatum(lDat, rDat, 0)
+		// Elementwise bpchar normalisation — ROW comparison resolves each
+		// element pair under its own type rule, exactly as scalar `=`.
+		lDat, rDat = comparisonOperandsAsBpchar(parser.OpEq, lDat, rDat,
+			declaredBpcharTypmod(left[i]), declaredBpcharTypmod(right[i]),
+			isBareStringLit(left[i]), isBareStringLit(right[i]))
+		cmp, err := compareDatumPlain(lDat, rDat, 0, textShapeAmbiguous(lDat, rDat) &&
+			exprIsCharacterString(left[i]) && exprIsCharacterString(right[i]))
 		if err != nil {
 			return Datum{}, err
 		}
-		isLast := (i == n-1)
 		if cmp < 0 {
 			return NewBoolDatum(op == parser.OpLt || op == parser.OpLe || op == parser.OpNe), nil
 		} else if cmp > 0 {
 			return NewBoolDatum(op == parser.OpGt || op == parser.OpGe || op == parser.OpNe), nil
 		}
-		// Equal — if last element, apply equality part of operator
-		if isLast {
-			return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
-		}
-		// Continue to next element
+		// Equal — continue to the next element.
+	}
+	if sawNull {
+		return NullDatum, nil
 	}
 	// All elements equal (or n=0)
 	return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
@@ -20782,6 +21147,17 @@ func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, sl
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
 func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// M0146-0047: a whole-row reference whose NOT NULL column reads NULL is
+	// an outer join's null-extended row — PG's whole-row Var is NULL there.
+	if k := x.NotNullElem; k > 0 && k <= len(x.Elems) {
+		d, err := evalExprSlot(x.Elems[k-1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if d.IsNull() {
+			return NullDatum, nil
+		}
+	}
 	parts := make([]string, len(x.Elems))
 	allNull := true
 	for i, elem := range x.Elems {
@@ -21468,4 +21844,155 @@ func isTextTargetTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// arrayConstructElemIsArray reports whether an ARRAY[...] element is itself
+// an array (a nested constructor or an array-typed expression), whose text
+// is spliced into the outer array rather than quoted as one element.
+func arrayConstructElemIsArray(e optimizer.Expr, v Datum) bool {
+	if fc, ok := e.(*optimizer.FuncCall); ok && fc.Name == "array_construct" {
+		return true
+	}
+	if t, ok := optimizer.ExprResultType(e); ok {
+		return t.IsArray || strings.HasSuffix(t.Name, "[]")
+	}
+	// Untyped here (a function call ExprResultType does not resolve, e.g.
+	// string_to_array): an array-valued result is the only `{…}` text such
+	// an element produces in practice.
+	txt := v.Format()
+	return strings.HasPrefix(txt, "{") && strings.HasSuffix(txt, "}")
+}
+
+// topLevelXID is the top-level transaction's xid, 0 when unassigned. Inside
+// a savepoint ctx.Tx.XID is the subtransaction's xid, so the session's
+// top-level copy is read instead (GetTopTransactionIdIfAny, xact.c).
+// M0146-0043.
+func topLevelXID(ctx *Context) storage.TransactionID {
+	if sess, ok := ctx.Session.(*BasicSession); ok && sess.inTx && sess.currentSubXid != 0 {
+		// Inside a savepoint whose parent never wrote, goopg has a subxact
+		// xid but no top-level one (the parent=0 gap); report the subxact
+		// xid rather than claim none was assigned.
+		if sess.tx.XID != storage.InvalidTransactionID {
+			return sess.tx.XID
+		}
+	}
+	return ctx.Tx.XID
+}
+
+// enterSublinkCTEWindow gives one execution of a correlated sublink its own
+// ctx.CTERowCache window and returns the function that closes it
+// (M0146-0050). The cache is keyed by CTE declaration, so a body that
+// declares a CTE reading the outer row replayed its FIRST execution's rows
+// for every outer row (`(WITH c AS MATERIALIZED (SELECT g*2) ...)` answered
+// 2, 2, 2 for g = 1, 2, 3). PG clears a CTE's tuplestore when the plan's
+// parameters change (ExecReScanCteScan, nodeCtescan.c), which for a
+// correlated subplan is every new outer value. The window starts as a copy
+// of the enclosing scope's entries, so a CTE that scope already
+// materialised is still shared; what the execution adds is dropped when it
+// ends, as the LATERAL join does per outer tuple (join_lateral_stream.go).
+// A CTE whose body reads no outer value lives in ctx.CTEStableCache and is
+// untouched. Uncorrelated sublinks get no window.
+func enterSublinkCTEWindow(ctx *Context, correlated bool) func() {
+	if !correlated || ctx == nil {
+		return func() {}
+	}
+	saved := ctx.CTERowCache
+	var window map[string][]Row
+	if len(saved) > 0 {
+		window = make(map[string][]Row, len(saved))
+		for k, v := range saved {
+			window[k] = v
+		}
+	}
+	ctx.CTERowCache = window
+	return func() { ctx.CTERowCache = saved }
+}
+
+// evalConcat evaluates `||` (M0146-0074 split it out of evalBinary). mode is
+// the operator PG would have resolved from the static operand types
+// (concatModeOf): textcat and jsonb_concat never look at the values' shape;
+// concatGuess, for operands whose types are unknown or array-typed, keeps the
+// shape-based array handling.
+func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datum, error) {
+	// || requires at least one string-typed operand. When one side is text
+	// (or string-like), the other side is coerced to text. When both sides
+	// are non-string (e.g. integer || numeric), PostgreSQL raises
+	// "operator does not exist" — match that behaviour. M0097-0063.
+	if left.IsNull() || right.IsNull() {
+		return NullDatum, nil
+	}
+	leftIsStr := left.Kind == KindString || left.Kind == KindBytes
+	rightIsStr := right.Kind == KindString || right.Kind == KindBytes
+	if !leftIsStr && !rightIsStr {
+		// Neither operand is string-like → PG-compatible error.
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator does not exist: %s || %s",
+				pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
+			Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
+	}
+	// Array concatenation: if both operands look like PostgreSQL arrays
+	// ({v1,v2,...}), merge their elements rather than text-concat.
+	// Also handles array || element and element || array (append/prepend).
+	// M0097-0065. Non-array text rendering honors the session DateStyle
+	// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
+	// matching the already-fixed SELECT/COPY/CAST output paths.
+	// byteacat (varlena.c): bytea || bytea is BYTEA, not text. The
+	// unknown-type literal in `<bytea> || '\x00'` is coerced through
+	// byteain first, exactly as PG's operator resolution would; a string
+	// that is not valid bytea input falls through to the text path below
+	// rather than failing the query. M0125-0021.
+	if left.Kind == KindBytes || right.Kind == KindBytes {
+		lb, lok := byteaOperand(left)
+		rb, rok := byteaOperand(right)
+		if lok && rok {
+			out := make([]byte, 0, len(lb)+len(rb))
+			out = append(out, lb...)
+			out = append(out, rb...)
+			return NewBytesDatum(out), nil
+		}
+	}
+	if mode == concatJSONB {
+		return jsonbConcat(left.StringValue(), right.StringValue())
+	}
+	ls := formatDatumDateStyle(left, ctx)
+	rs := formatDatumDateStyle(right, ctx)
+	if mode == concatText {
+		return NewStringDatum(ls + rs), nil
+	}
+	lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
+	rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
+	if lsIsArr && rsIsArr {
+		// array || array: merge inner elements.
+		leftInner := ls[1 : len(ls)-1]
+		rightInner := rs[1 : len(rs)-1]
+		var inner string
+		switch {
+		case leftInner == "" && rightInner == "":
+			inner = ""
+		case leftInner == "":
+			inner = rightInner
+		case rightInner == "":
+			inner = leftInner
+		default:
+			inner = leftInner + "," + rightInner
+		}
+		return NewStringDatum("{" + inner + "}"), nil
+	}
+	if lsIsArr && !rsIsArr {
+		// array || element: append element to array.
+		inner := ls[1 : len(ls)-1]
+		if inner == "" {
+			return NewStringDatum("{" + rs + "}"), nil
+		}
+		return NewStringDatum("{" + inner + "," + rs + "}"), nil
+	}
+	if rsIsArr && !lsIsArr {
+		// element || array: prepend element.
+		inner := rs[1 : len(rs)-1]
+		if inner == "" {
+			return NewStringDatum("{" + ls + "}"), nil
+		}
+		return NewStringDatum("{" + ls + "," + inner + "}"), nil
+	}
+	return NewStringDatum(ls + rs), nil
 }

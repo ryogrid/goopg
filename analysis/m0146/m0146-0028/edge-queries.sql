@@ -1,0 +1,18 @@
+select * from (select s_store_sk, s_store_name from store where s_store_sk < 4) y, (select r_reason_sk k from reason where r_reason_sk < 3) x order by 1,3;
+select y.*, x.k from (select s_store_sk, s_store_name from store where s_store_sk < 4) y, (select r_reason_sk k from reason where r_reason_sk < 3) x order by 1,3;
+select y, x.k from (select s_store_sk, s_store_name from store where s_store_sk < 3) y, (select r_reason_sk k from reason where r_reason_sk < 3) x order by 2,1;
+select n, count(*) from (select s_store_name n, s_store_sk from store) y, reason where r_reason_sk = s_store_sk group by n order by n;
+select s_store_sk from (select s_store_sk from store) y, (select s_store_sk from store) z order by 1 limit 3;
+select y.s_store_sk from (select s_store_sk from store where s_store_sk<3) y, (select s_store_sk from store where s_store_sk<3) z where y.s_store_sk = z.s_store_sk order by 1;
+select s_store_name from (select s_store_sk k from store) y, reason where k = r_reason_sk order by 1 limit 2;
+select store.s_store_sk from (select s_store_sk from store) y, reason limit 1;
+select k, (select count(*) from reason r2 where r2.r_reason_sk = y.k) from (select r_reason_sk k from reason) y, (select s_store_sk from store where s_store_sk = 1) z order by 1 limit 4;
+select a.k from (select r_reason_sk k from reason, store where r_reason_sk = s_store_sk) a, (select d_date_sk from date_dim where d_date_sk = 2415022) b order by 1;
+select k, s from (select r_reason_sk k, r_reason_desc s from reason where r_reason_sk in (1,2)) y, store where s_store_sk = k order by 1;
+select y.k2 from (select r_reason_sk as k2, r_reason_id from reason) y, (select 1 as one) z where y.k2 <= 2 order by 1;
+select * from (select s_store_sk, s_store_name from store where s_store_sk < 4) y, reason x where x.r_reason_sk < 4 order by 3 desc, 1;
+select * from (select s_store_sk, s_store_name from store where s_store_sk < 4) y, (select r_reason_sk k from reason where r_reason_sk < 4) x order by 3 desc, 1;
+select distinct * from (select s_store_name n from store) y, (select r_reason_sk k from reason where r_reason_sk < 3) x order by 2 desc, 1;
+select n, count(*) from (select s_store_name n, s_store_sk from store) y, (select r_reason_sk k from reason) x where k = s_store_sk group by 1 order by 1;
+select * from (select r_reason_sk, r_reason_desc from reason where r_reason_sk < 3) y join reason z using (r_reason_sk), store where s_store_sk = 1 order by 1;
+select count(*) from (select ss_item_sk i, ss_ticket_number t from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year = 2000) y, item where i = i_item_sk and i_category = 'Music';

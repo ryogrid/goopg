@@ -1,0 +1,22 @@
+# M0146-0005ay census (tmp/fireset-0005ay)
+sf025 baseline match=23 CATEGORIES-EXCL-MATCH: join-order=61 join-method=37 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=43 parallelism=41 qual-placement=12 rendering=21
+sf025 candidate match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=33 scan-type=40 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=13 rendering=21
+< Q47 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+> Q47 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+< Q53 depth=4 [sort-strategy] under WindowAgg: PG GroupAggregate | goopg Sort
+> Q53 MATCH (no structural divergence)
+< Q57 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+> Q57 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=62 join-method=38 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=46 parallelism=51 qual-placement=13 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=36 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=12 rendering=19
+< Q47 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+> Q47 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+< Q53 depth=4 [sort-strategy] under WindowAgg: PG GroupAggregate | goopg Sort
+> Q53 depth=6 [parallelism] under Sort: PG Gather | goopg Nested Loop Inner
+< Q57 depth=3 [sort-strategy] under WindowAgg: PG WindowAgg | goopg Sort
+> Q57 depth=2 [join-order] under Sort: PG Merge Join Inner | goopg Subquery Scan on v2
+FIRE-SET-TIMEOUTS: fires=Q47 Q51 Q53 Q57 Q63 introduced=none unchanged=none missing=none
+Q47/Q57: CTE v1 body now = PG (WindowAgg -> WindowAgg -> GroupAggregate, no Sorts); the first-divergence tool now reports the pre-existing main-query record (Subquery Scan on v2 kept) — main query plan text is identical to baseline.
+Q51 ordered result md5 = PG 1add13d92c90def33e6468df116ac9a7
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; TPC-H census class-identical
+regress (window aggregates groupingsets with subselect select_distinct join partition_aggregate) vs HEAD worktree: only window.sql moves — three 'COUNT(*) OVER (ORDER BY t1.unique1) ... Nested Loop' plans drop the Sort PG never had (outer Index Scan on tenk1_unique1 already orders the rows); results unchanged

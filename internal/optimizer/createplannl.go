@@ -128,6 +128,14 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 	}
 
 	innerPath := p.Children[1]
+	if innerPath != nil && innerPath.RequiredOuter != 0 && innerPath.Kind == PathHashJoin {
+		// M0146-0049d3: a parameterised hash join inner (paramjoin.go).
+		return createNestLoopParamJoinPlan(p, innerPath)
+	}
+	if innerPath != nil && innerPath.RequiredOuter != 0 && innerPath.Kind == PathParamAppend {
+		// M0146-0049: a parameterised Append inner (paramappend.go).
+		return createNestLoopParamAppendPlan(p, innerPath)
+	}
 	if innerPath != nil && innerPath.RequiredOuter != 0 {
 		return createNestLoopIndexJoinPlan(p, innerPath)
 	}
@@ -153,7 +161,7 @@ func createNestLoopPlan(p *Path) (Node, outputLayout) {
 		// nil when there is no clause at all — the cartesian pair, which is the
 		// one join a plain nested loop is the ONLY available path for
 		// (`Join.Predicate` is documented nil for CROSS JOIN, plan.go:812).
-		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jt),
 		SJInfo:    p.SJInfo,
 	}
@@ -293,16 +301,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// against the scan's own row would read the wrong columns.
 		panic(fmt.Sprintf("createPlan: NLI inner %T carries wrappers that are not leaf-local; IndexScan.Cond cannot evaluate them in the scan's coordinates", in.inner))
 	}
-	is, bare := innerBase.(*IndexScan)
-	if !bare {
-		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan", innerBase))
-	}
-	if leafCond != nil {
-		// The probe rebuilt by `createIndexScanPlan` is a fresh node this arm
-		// owns (`scanLeafFor` never mutates the leaf), so setting Cond here
-		// cannot disturb the leaf the search still references by pointer.
-		is.Cond = leafCond
-	}
+	is := nliProbeWithCond(innerBase, leafCond)
 
 	// The probe keys are re-based onto the OUTER alone — see the file header.
 	// The outer occupies merged positions [0, outerWidth), so its layout is the
@@ -316,8 +315,9 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		// The same order assertion `createIndexScanPlan` makes, restated because
 		// this arm REPLACES the key list that function built: a silently
 		// reordered list binds the right values to the wrong index columns and
-		// returns wrong rows rather than failing.
-		if c.indexCol != i {
+		// returns wrong rows rather than failing. `IndexSkipPrefix` shifts the
+		// run — slot i binds `Columns[IndexSkipPrefix+i]`.
+		if c.indexCol != innerPath.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s claims index column %d; the index-column order was lost",
 				i, innerPath.IndexInfo.Name, c.indexCol))
 		}
@@ -344,12 +344,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 	// no outer to re-base onto and only its consumer knows what the bound slot
 	// will hold. `translateToLayout` clones, so the path's own clause
 	// expressions — which the search still owns — are untouched.
-	is.Key, is.Keys = nil, nil
-	if len(keys) == 1 {
-		is.Key = keys[0]
-	} else {
-		is.Keys = keys
-	}
+	setNLIProbeKeys(is, keys)
 	// M0142-0005e: re-stamp the probe's own path cost onto the unwrapped
 	// *IndexScan. `createPlanNode(innerPath)` did stamp, but onto the
 	// OUTERMOST emitted node — the leaf-local *Filter the absorbableLeafCond
@@ -379,7 +374,7 @@ func createNestLoopIndexJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 		Lateral:   true,
 		Left:      in.outer,
 		Right:     is,
-		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jtNLI),
 	}
 	return j, in.publishedLayout(jtNLI)
@@ -396,18 +391,12 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 	if !absorbable {
 		panic(fmt.Sprintf("createPlan: NLI inner %T carries wrappers that are not leaf-local; IndexScan.Cond cannot evaluate them in the scan's coordinates", in.inner))
 	}
-	is, bare := innerBase.(*IndexScan)
-	if !bare {
-		panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but NestedLoopIndexJoin.Inner is an *IndexScan", innerBase))
-	}
-	if leafCond != nil {
-		is.Cond = leafCond
-	}
+	is := nliProbeWithCond(innerBase, leafCond)
 	outerLay := in.lay[:len(in.outer.Output())]
 	outerIndex := outerLay.bindingIndex()
 	keys := make([]Expr, 0, len(innerPath.IndexClauses))
 	for i, c := range innerPath.IndexClauses {
-		if c.indexCol != i {
+		if c.indexCol != innerPath.IndexSkipPrefix+i {
 			panic(fmt.Sprintf("createPlan: NLI index clause %d of %s claims index column %d; the index-column order was lost",
 				i, innerPath.IndexInfo.Name, c.indexCol))
 		}
@@ -419,12 +408,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 	if len(keys) == 0 {
 		panic(fmt.Sprintf("createPlan: NLI inner %s binds no probe key; the parameter would never be applied", innerPath.IndexInfo.Name))
 	}
-	is.Key, is.Keys = nil, nil
-	if len(keys) == 1 {
-		is.Key = keys[0]
-	} else {
-		is.Keys = keys
-	}
+	setNLIProbeKeys(is, keys)
 	// M0142-0005e: stamp the probe's own path cost onto the unwrapped
 	// *IndexScan (the funnel's stamp landed on the absorbed leaf-local
 	// *Filter, not on `is`), and the memoized path's cost onto the Memoize —
@@ -437,7 +421,7 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 		Type:      jtNLI,
 		Outer:     in.outer,
 		Inner:     is,
-		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI)", nil, p.Residual, p.ecClausesLast()),
 		schema:    in.publishedSchema(jtNLI),
 	}
 	nli.InnerMemo = memoizeNodeFor(memoPath, is, keys)
@@ -462,8 +446,9 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 // ever whether a cache pays. It is the same test `maybeAttachMemoize` applies
 // (memoize.go:134-136), shared in intent so the legacy and searched arms cannot
 // mark the same probe differently.
-func memoizeNodeFor(memoPath *Path, is *IndexScan, keys []Expr) *Memoize {
-	singleRow := is.Index != nil && is.Index.Unique && len(keys) == len(is.Index.Columns)
+func memoizeNodeFor(memoPath *Path, is Node, keys []Expr) *Memoize {
+	idx, _, _, _ := nliInnerProbe(is)
+	singleRow := idx != nil && idx.Unique && len(keys) == len(idx.Columns)
 	return &Memoize{
 		pos:        is.Pos(),
 		Child:      is,
@@ -523,9 +508,12 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	// (operators_bitmap.go `evalBitmapQual`), where the layout translation
 	// below is well defined; a leaf-local form is never needed.
 	//
-	// Orientation is inner-left (`kp.Right` first): PG's line reads
-	// `Recheck Cond: (ss_item_sk = item.i_item_sk)`, the same inner-first
-	// order `formatIndexCondParts` produces for the sibling `Index Cond:`.
+	// Orientation is the clause's own (M0146-0005de): PG's bitmapqualorig is
+	// the index clause's RestrictInfo as it stands (create_bitmap_subplan's
+	// `subqual = list_make1(rinfo->clause)`), not the commuted Index Cond —
+	// `Recheck Cond: (ss_item_sk = item.i_item_sk)` as written, but
+	// `(item.i_item_sk = ss_item_sk)` once the equivalence class derived
+	// the pair item-first (TPC-DS Q53).
 	probeClauses := make([]*restrictInfo, 0, len(idxPath.IndexClauses))
 	for _, c := range idxPath.IndexClauses {
 		if c.ri != nil {
@@ -541,9 +529,13 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 	}
 	pairs := in.keyPairs("PathNestLoop(NLI-bitmap)", probeClauses)
 	bhs.BitmapQual = make([]Expr, 0, len(pairs))
-	for _, kp := range pairs {
+	for i, kp := range pairs {
+		first, second := kp.Right, kp.Left
+		if clauseOuterFirst(probeClauses[i], in.outerRelids) {
+			first, second = kp.Left, kp.Right
+		}
 		bhs.BitmapQual = append(bhs.BitmapQual,
-			&BinaryOp{pos: kp.Right.Pos(), Op: parser.OpEq, Left: kp.Right, Right: kp.Left})
+			&BinaryOp{pos: first.Pos(), Op: parser.OpEq, Left: first, Right: second})
 	}
 	// M0142-0005e: same stamp-loss as the index arm — the funnel stamped the
 	// outermost emitted node (a leaf-local *Filter when the leaf carried
@@ -560,7 +552,52 @@ func createNestLoopBitmapJoinPlan(p *Path, innerPath *Path) (Node, outputLayout)
 		// Residual-only: the probe clauses moved onto the probe above (MOVE,
 		// not copy — R48 doctrine). In the corpus equi-probe shape Residual
 		// is nil and combineAnd(nil) is nil, so the join line vanishes.
-		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual),
+		Predicate: in.joinPredicate("PathNestLoop(NLI-bitmap)", nil, p.Residual, p.ecClausesLast()),
 		schema: in.publishedSchema(jt),
 	}, in.publishedLayout(jt)
+}
+
+// nliProbeWithCond is the NLI inner probe `createIndexScanPlan` built for the
+// parameterised path — an *IndexScan, or an *IndexOnlyScan when the path is
+// index-only (M0146-0005bq) — with the leaf's absorbed local quals as its
+// Cond. The probe is a fresh node this arm owns (`scanLeafFor` never mutates
+// the leaf), so setting Cond cannot disturb the leaf the search references.
+// An index-only probe is produced only over a bare leaf, so it never has a
+// Cond to take: its covered schema could not evaluate the leaf's quals.
+func nliProbeWithCond(n Node, leafCond Expr) Node {
+	switch x := n.(type) {
+	case *IndexScan:
+		if leafCond != nil {
+			x.Cond = leafCond
+		}
+		return x
+	case *IndexOnlyScan:
+		if leafCond != nil {
+			panic(fmt.Sprintf("createPlan: NLI index-only probe on %s would absorb a leaf qual over its covered schema", x.Index.Name))
+		}
+		return x
+	}
+	panic(fmt.Sprintf("createPlan: NLI inner emitted a %T, but a parameterised probe is an *IndexScan or *IndexOnlyScan", n))
+}
+
+// setNLIProbeKeys replaces the probe's keys with the outer-rebased ones: Key
+// for a single-column probe, Keys otherwise (and always Keys under a skip
+// prefix, which binds Columns[SkipPrefix+i]).
+func setNLIProbeKeys(n Node, keys []Expr) {
+	switch x := n.(type) {
+	case *IndexScan:
+		x.Key, x.Keys = nil, nil
+		if len(keys) == 1 && x.SkipPrefix == 0 {
+			x.Key = keys[0]
+		} else {
+			x.Keys = keys
+		}
+	case *IndexOnlyScan:
+		x.Key, x.Keys = nil, nil
+		if len(keys) == 1 && x.SkipPrefix == 0 {
+			x.Key = keys[0]
+		} else {
+			x.Keys = keys
+		}
+	}
 }

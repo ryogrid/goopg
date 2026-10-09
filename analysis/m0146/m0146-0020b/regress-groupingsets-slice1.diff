@@ -1,0 +1,1736 @@
+--- /tmp/tmp.USjdkAIcu5	2026-10-05 14:48:52.401612793 +0900
++++ /tmp/tmp.EBfMAbEJ2G	2026-10-05 14:48:52.397661399 +0900
+@@ -89,16 +89,16 @@
+ ---+---+----------+-----+-------+-----
+   |  |  3 | 145 |  10 |  19
+  1 |  |  1 |  60 |  5 |  14
+  1 | 1 |  0 |  21 |  2 |  11
+  2 |  |  1 |  15 |  1 |  15
+- 3 |  |  1 |  33 |  2 |  17
+  1 | 2 |  0 |  25 |  2 |  13
++ 3 |  |  1 |  33 |  2 |  17
+  1 | 3 |  0 |  14 |  1 |  14
+  4 |  |  1 |  37 |  2 |  19
+- 4 | 1 |  0 |  37 |  2 |  19
+  2 | 3 |  0 |  15 |  1 |  15
++ 4 | 1 |  0 |  37 |  2 |  19
+  3 | 3 |  0 |  16 |  1 |  16
+  3 | 4 |  0 |  17 |  1 |  17
+ (12 rows)
+ -- various types of ordered aggs
+ select a, b, grouping(a,b),
+@@ -130,11 +130,11 @@
+  group by rollup (a) order by a;
+  grouping | a |  array_agg  | rank | rank
+ ----------+---+-------------+------+------
+   0 | 1 | {1,4,5}  |  1 |  1
+   0 | 3 | {1,2}  |  3 |  3
+-  1 |  | {1,4,5,1,2} |  1 |  6
++  1 |  | {1,4,5,1,2} |  1 |  1
+ (3 rows)
+ -- nesting with window functions
+ select a, b, sum(c), sum(sum(c)) over (order by a,b) as rsum
+   from gstest2 group by rollup (a,b) order by rsum, a, b;
+  a | b | sum | rsum
+@@ -148,118 +148,61 @@
+ (6 rows)
+ -- nesting with grouping sets
+ select sum(c) from gstest2
+   group by grouping sets((), grouping sets((), grouping sets(())))
+   order by 1 desc;
+- sum
+------
+-  12
+-  12
+-  12
+-(3 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets((), grouping sets((), grouping sets...
++  ^
+ select sum(c) from gstest2
+   group by grouping sets((), grouping sets((), grouping sets(((a, b)))))
+   order by 1 desc;
+- sum
+------
+-  12
+-  12
+-  8
+-  2
+-  2
+-(5 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets((), grouping sets((), grouping sets...
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(grouping sets(rollup(c), grouping sets(cube(c))))
+   order by 1 desc;
+- sum
+------
+-  12
+-  12
+-  6
+-  6
+-  6
+-  6
+-(6 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(grouping sets(rollup(c), grouping s...
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(a, grouping sets(a, cube(b)))
+   order by 1 desc;
+- sum
+------
+-  12
+-  10
+-  10
+-  8
+-  4
+-  2
+-  2
+-(7 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(a, grouping sets(a, cube(b)))
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(grouping sets((a, (b))))
+   order by 1 desc;
+- sum
+------
+-  8
+-  2
+-  2
+-(3 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(grouping sets((a, (b))))
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(grouping sets((a, b)))
+   order by 1 desc;
+- sum
+------
+-  8
+-  2
+-  2
+-(3 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(grouping sets((a, b)))
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(grouping sets(a, grouping sets(a), a))
+   order by 1 desc;
+- sum
+------
+-  10
+-  10
+-  10
+-  2
+-  2
+-  2
+-(6 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(grouping sets(a, grouping sets(a), ...
++  ^
+ select sum(c) from gstest2
+   group by grouping sets(grouping sets(a, grouping sets(a, grouping sets(a), ((a)), a, grouping sets(a), (a)), a))
+   order by 1 desc;
+- sum
+------
+-  10
+-  10
+-  10
+-  10
+-  10
+-  10
+-  10
+-  10
+-  2
+-  2
+-  2
+-  2
+-  2
+-  2
+-  2
+-  2
+-(16 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets(grouping sets(a, grouping sets(a, g...
++  ^
+ select sum(c) from gstest2
+   group by grouping sets((a,(a,b)), grouping sets((a,(a,b)),a))
+   order by 1 desc;
+- sum
+------
+-  10
+-  8
+-  8
+-  2
+-  2
+-  2
+-  2
+-  2
+-(8 rows)
++ERROR:  syntax error at or near "sets"
++LINE 2:  group by grouping sets((a,(a,b)), grouping sets((a,(a,b)),...
++  ^
+ -- empty input: first is 0 rows, second 1, third 3 etc.
+ select a, b, sum(v), count(*) from gstest_empty group by grouping sets ((a,b),a);
+  a | b | sum | count
+ ---+---+-----+-------
+ (0 rows)
+@@ -342,11 +285,11 @@
+   from generate_series(1,3) g
+  group by alias1, rollup(alias2);
+   QUERY PLAN
+ ------------------------------------------------
+  GroupAggregate
+-  Group Key: g, g
++  Group Key: g
+   Group Key: g
+   ->  Sort
+   Sort Key: g
+   ->  Function Scan on generate_series g
+ (6 rows)
+@@ -354,15 +297,15 @@
+   from generate_series(1,3) g
+  group by alias1, rollup(alias2);
+  alias1 | alias2
+ --------+--------
+   1 |  1
+-  1 |
++  1 |  1
++  2 |  2
+   2 |  2
+-  2 |
+   3 |  3
+-  3 |
++  3 |  3
+ (6 rows)
+ -- check that pulled-up subquery outputs still go to null when appropriate
+ select four, x
+   from (select four, ten, 'foo'::text as x from tenk1) as t
+   group by grouping sets (four, x)
+@@ -438,20 +381,22 @@
+   from (select unique1 as x, unique2 as y from tenk1) as t
+   where x = 1
+   group by grouping sets (x, y)
+   order by 1, 2;
+   QUERY PLAN
+------------------------------------------------------
++-------------------------------------
+  Sort
+-  Sort Key: tenk1.unique1, tenk1.unique2
++  Sort Key: unique1, unique2
+   ->  GroupAggregate
+-  Group Key: tenk1.unique1
+-  Sort Key: tenk1.unique2
+-  Group Key: tenk1.unique2
+-  ->  Index Scan using tenk1_unique1 on tenk1
+-  Index Cond: (unique1 = 1)
+-(8 rows)
++  Group Key: unique1
++  Sort Key: unique2
++  Group Key: unique2
++  ->  Sort
++  Sort Key: unique1
++  ->  Seq Scan on tenk1
++  Filter: (x = 1)
++(10 rows)
+ select x, y
+   from (select unique1 as x, unique2 as y from tenk1) as t
+   where x = 1
+   group by grouping sets (x, y)
+   order by 1, 2;
+@@ -465,21 +410,21 @@
+   from (select unique1::oid as x, unique2 as y from tenk1) as t
+   where x::integer = 1
+   group by grouping sets (x, y)
+   order by 1, 2;
+   QUERY PLAN
+------------------------------------------------------------------
++------------------------------------------------
+  Sort
+-  Sort Key: ((tenk1.unique1)::oid), tenk1.unique2
++  Sort Key: (unique1), unique2
+   ->  GroupAggregate
+-  Group Key: ((tenk1.unique1)::oid)
+-  Sort Key: tenk1.unique2
+-  Group Key: tenk1.unique2
++  Group Key: (unique1)
++  Sort Key: unique2
++  Group Key: unique2
+   ->  Sort
+-  Sort Key: ((tenk1.unique1)::oid)
+-  ->  Index Scan using tenk1_unique1 on tenk1
+-  Index Cond: (((unique1)::oid)::integer = 1)
++  Sort Key: (unique1)
++  ->  Seq Scan on tenk1
++  Filter: ((x)::integer = 1)
+ (10 rows)
+ select x, y
+   from (select unique1::oid as x, unique2 as y from tenk1) as t
+   where x::integer = 1
+   group by grouping sets (x, y)
+@@ -494,22 +439,25 @@
+   from (select t1.unique1 as x, t1.unique2 as y from tenk1 t1, tenk1 t2) as t
+   where x = 1
+   group by grouping sets (x, y)
+   order by 1, 2;
+   QUERY PLAN
+--------------------------------------------------------------------
++----------------------------------------------------
+  Sort
+   Sort Key: t1.unique1, t1.unique2
+   ->  GroupAggregate
+   Group Key: t1.unique1
+   Sort Key: t1.unique2
+   Group Key: t1.unique2
++  ->  Sort
++  Sort Key: t1.unique1
+   ->  Nested Loop
+-  ->  Index Scan using tenk1_unique1 on tenk1 t1
+-  Index Cond: (unique1 = 1)
+-  ->  Index Only Scan using tenk1_hundred on tenk1 t2
+-(10 rows)
++  Filter: (x = 1)
++  ->  Seq Scan on tenk1 t1
++  ->  Materialize
++  ->  Seq Scan on tenk1 t2
++(13 rows)
+ select x, y
+   from (select t1.unique1 as x, t1.unique2 as y from tenk1 t1, tenk1 t2) as t
+   where x = 1
+   group by grouping sets (x, y)
+   order by 1, 2;
+@@ -525,159 +473,108 @@
+   select 1 as x, q1, sum(q2)
+   from int8_tbl i1
+   group by grouping sets(1, 2)
+ ) ss
+ where x = 1 and q1 = 123;
+-  QUERY PLAN
+---------------------------------------------------
+- Subquery Scan on ss
+-  Output: ss.x, ss.q1, ss.sum
+-  Filter: ((ss.x = 1) AND (ss.q1 = 123))
+-  ->  GroupAggregate
+-  Output: (1), i1.q1, sum(i1.q2)
+-  Group Key: (1)
+-  Sort Key: i1.q1
+-  Group Key: i1.q1
+-  ->  Sort
+-  Output: (1), i1.q1, i1.q2
+-  Sort Key: (1)
+-  ->  Seq Scan on public.int8_tbl i1
+-  Output: 1, i1.q1, i1.q2
+-(13 rows)
++ERROR:  GROUP BY position 1 is not in select list
++LINE 3:  select 1 as x, q1, sum(q2)
++  ^
+ select * from (
+   select 1 as x, q1, sum(q2)
+   from int8_tbl i1
+   group by grouping sets(1, 2)
+ ) ss
+ where x = 1 and q1 = 123;
+- x | q1 | sum
+----+----+-----
+-(0 rows)
++ERROR:  GROUP BY position 1 is not in select list
++LINE 2:  select 1 as x, q1, sum(q2)
++  ^
+ -- check handling of pulled-up SubPlan in GROUPING() argument (bug #17479)
+ explain (verbose, costs off)
+ select grouping(ss.x)
+ from int8_tbl i1
+ cross join lateral (select (select i1.q1) as x) ss
+ group by ss.x;
+   QUERY PLAN
+-------------------------------------------------
+- GroupAggregate
+-  Output: GROUPING((SubPlan 1)), ((SubPlan 2))
+-  Group Key: ((SubPlan 2))
++--------------------------------------------------
++ Group
++  Group Key: x
++  Output: x, grouping
+   ->  Sort
+-  Output: ((SubPlan 2)), i1.q1
+-  Sort Key: ((SubPlan 2))
++  Sort Key: x
++  Output: x
++  ->  Nested Loop
++  Output: q1, q2, x
+   ->  Seq Scan on public.int8_tbl i1
+-  Output: (SubPlan 2), i1.q1
+-  SubPlan 2
+-  ->  Result
+-  Output: i1.q1
+-(11 rows)
++  Output: q1, q2
++  ->  Values (1 rows)
++  SubPlan 1
++  ->  Values (1 rows)
++(13 rows)
+ select grouping(ss.x)
+ from int8_tbl i1
+ cross join lateral (select (select i1.q1) as x) ss
+ group by ss.x;
+  grouping
+ ----------
+   0
+-  0
+-(2 rows)
++(1 row)
+ explain (verbose, costs off)
+ select (select grouping(ss.x))
+ from int8_tbl i1
+ cross join lateral (select (select i1.q1) as x) ss
+ group by ss.x;
+-  QUERY PLAN
+---------------------------------------------
+- GroupAggregate
+-  Output: (SubPlan 2), ((SubPlan 3))
+-  Group Key: ((SubPlan 3))
+-  ->  Sort
+-  Output: ((SubPlan 3)), i1.q1
+-  Sort Key: ((SubPlan 3))
+-  ->  Seq Scan on public.int8_tbl i1
+-  Output: (SubPlan 3), i1.q1
+-  SubPlan 3
+-  ->  Result
+-  Output: i1.q1
+-  SubPlan 2
+-  ->  Result
+-  Output: GROUPING((SubPlan 1))
+-(14 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 2: select (select grouping(ss.x))
++  ^
+ select (select grouping(ss.x))
+ from int8_tbl i1
+ cross join lateral (select (select i1.q1) as x) ss
+ group by ss.x;
+- grouping
+-----------
+-  0
+-  0
+-(2 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select (select grouping(ss.x))
++  ^
+ -- simple rescan tests
+ select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+  group by rollup (a,b);
+- a | b | sum
+----+---+-----
+- 1 | 1 |  1
+- 1 | 2 |  1
+- 1 | 3 |  1
+- 1 |  |  3
+- 2 | 1 |  2
+- 2 | 2 |  2
+- 2 | 3 |  2
+- 2 |  |  6
+-  |  |  9
+-(9 rows)
++ERROR:  column "a" does not exist
++LINE 1: select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ select *
+   from (values (1),(2)) v(x),
+   lateral (select a, b, sum(v.x) from gstest_data(v.x) group by rollup (a,b)) s;
+-ERROR:  aggregate functions are not allowed in FROM clause of their own query level
++ERROR:  column "a" does not exist
+ LINE 3:  lateral (select a, b, sum(v.x) from gstest_data(v.x) ...
+   ^
+ -- min max optimization should still work with GROUP BY ()
+ explain (costs off)
+   select min(unique1) from tenk1 GROUP BY ();
+   QUERY PLAN
+-------------------------------------------------------------
+- Result
+-  InitPlan 1
+-  ->  Limit
++----------------------------------------------------
++ MixedAggregate
++  Group Key: ()
+   ->  Index Only Scan using tenk1_unique1 on tenk1
+-  Index Cond: (unique1 IS NOT NULL)
+-(5 rows)
++(3 rows)
+ -- Views with GROUPING SET queries
+ CREATE VIEW gstest_view AS select a, b, grouping(a,b), sum(c), count(*), max(c)
+   from gstest2 group by rollup ((a,b,c),(c,d));
+-NOTICE:  view "gstest_view" will be a temporary view
+ select pg_get_viewdef('gstest_view'::regclass, true);
+   pg_get_viewdef
+----------------------------------------
+-  SELECT a,  +
+-  b,  +
+-  GROUPING(a, b) AS "grouping",  +
+-  sum(c) AS sum,  +
+-  count(*) AS count,  +
+-  max(c) AS max  +
+-  FROM gstest2  +
+-  GROUP BY ROLLUP((a, b, c), (c, d));
++------------------------------------------------------
++ select a, b, grouping(a,b), sum(c), count(*), max(c)+
++  from gstest2 group by rollup ((a,b,c),(c,d));
+ (1 row)
+ -- Nested queries with 3 or more levels of nesting
+ select(select (select grouping(a,b) from (values (1)) v2(c)) from (values (1,2)) v1(a,b) group by (a,b)) from (values(6,7)) v3(e,f) GROUP BY ROLLUP(e,f);
+- grouping
+-----------
+-  0
+-  0
+-  0
+-(3 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select(select (select grouping(a,b) from (values (1)) v2(c))...
++  ^
+ select(select (select grouping(e,f) from (values (1)) v2(c)) from (values (1,2)) v1(a,b) group by (a,b)) from (values(6,7)) v3(e,f) GROUP BY ROLLUP(e,f);
+- grouping
+-----------
+-  0
+-  1
+-  3
+-(3 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select(select (select grouping(e,f) from (values (1)) v2(c))...
++  ^
+ select(select (select grouping(c) from (values (1)) v2(c) GROUP BY c) from (values (1,2)) v1(a,b) group by (a,b)) from (values(6,7)) v3(e,f) GROUP BY ROLLUP(e,f);
+  grouping
+ ----------
+   0
+   0
+@@ -738,24 +635,17 @@
+   |  |  3 |  17 |  1 |  17
+   |  |  3 |  37 |  2 |  19
+   |  |  3 |  37 |  2 |  19
+ (21 rows)
+ select(select (select grouping(a,b) from (values (1)) v2(c)) from (values (1,2)) v1(a,b) group by (a,b)) from (values(6,7)) v3(e,f) GROUP BY ROLLUP((e+1),(f+1));
+- grouping
+-----------
+-  0
+-  0
+-  0
+-(3 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select(select (select grouping(a,b) from (values (1)) v2(c))...
++  ^
+ select(select (select grouping(a,b) from (values (1)) v2(c)) from (values (1,2)) v1(a,b) group by (a,b)) from (values(6,7)) v3(e,f) GROUP BY CUBE((e+1),(f+1)) ORDER BY (e+1),(f+1);
+- grouping
+-----------
+-  0
+-  0
+-  0
+-  0
+-(4 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select(select (select grouping(a,b) from (values (1)) v2(c))...
++  ^
+ select a, b, sum(c), sum(sum(c)) over (order by a,b) as rsum
+   from gstest2 group by cube (a,b) order by rsum, a, b;
+  a | b | sum | rsum
+ ---+---+-----+------
+  1 | 1 |  8 |  8
+@@ -784,43 +674,31 @@
+   |  | 145
+ (12 rows)
+ select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+  group by cube (a,b) order by a,b;
+- a | b | sum
+----+---+-----
+- 1 | 1 |  1
+- 1 | 2 |  1
+- 1 | 3 |  1
+- 1 |  |  3
+- 2 | 1 |  2
+- 2 | 2 |  2
+- 2 | 3 |  2
+- 2 |  |  6
+-  | 1 |  3
+-  | 2 |  3
+-  | 3 |  3
+-  |  |  9
+-(12 rows)
++ERROR:  column "a" does not exist
++LINE 1: select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ -- Test reordering of grouping sets
+ explain (costs off)
+ select * from gstest1 group by grouping sets((a,b,v),(v)) order by v,b,a;
+   QUERY PLAN
+-------------------------------------------------------------------------------------
+- Incremental Sort
+-  Sort Key: "*VALUES*".column3, "*VALUES*".column2, "*VALUES*".column1
+-  Presorted Key: "*VALUES*".column3
++------------------------------------
++ Sort
++  Sort Key: v, b, a
+   ->  GroupAggregate
+-  Group Key: "*VALUES*".column3, "*VALUES*".column2, "*VALUES*".column1
+-  Group Key: "*VALUES*".column3
++  Group Key: v, b, a
++  Group Key: v
+   ->  Sort
+-  Sort Key: "*VALUES*".column3, "*VALUES*".column2, "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-(9 rows)
++  Sort Key: v, b, a
++  ->  Values (10 rows)
++(8 rows)
+ -- Agg level check. This query should error out.
+ select (select grouping(a,b) from gstest2) from gstest2 group by a,b;
+-ERROR:  arguments to GROUPING must be grouping expressions of the associated query level
++ERROR:  unsupported expression *parser.GroupingCall
+ LINE 1: select (select grouping(a,b) from gstest2) from gstest2 grou...
+   ^
+ --Nested queries
+ select a, b, sum(c), count(*) from gstest2 group by grouping sets (rollup(a,b),a);
+  a | b | sum | count
+@@ -840,33 +718,33 @@
+ having exists (select 1 from onek b where sum(distinct a.four) = b.four);
+  ten | sum
+ -----+-----
+   0 |  0
+   0 |  2
+-  0 |  2
+   1 |  1
+   1 |  3
+   2 |  0
+   2 |  2
+-  2 |  2
+   3 |  1
+   3 |  3
+   4 |  0
+   4 |  2
+-  4 |  2
+   5 |  1
+   5 |  3
+   6 |  0
+   6 |  2
+-  6 |  2
+   7 |  1
+   7 |  3
+   8 |  0
+   8 |  2
+-  8 |  2
+   9 |  1
+   9 |  3
++  0 |  2
++  2 |  2
++  4 |  2
++  6 |  2
++  8 |  2
+ (25 rows)
+ -- Tests around pushdown of HAVING clauses, partially testing against previous bugs
+ select a,count(*) from gstest2 group by rollup(a) order by a;
+  a | count
+ ---+-------
+@@ -903,37 +781,34 @@
+ (2 rows)
+ explain (costs off)
+   select v.c, (select count(*) from gstest2 group by () having v.c)
+   from (values (false),(true)) v(c) order by v.c;
+   QUERY PLAN
+------------------------------------------------------------
++-----------------------------------
+  Sort
+-  Sort Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
++  Sort Key: c
+   SubPlan 1
+-  ->  Aggregate
++  ->  MixedAggregate
+   Group Key: ()
+-  Filter: "*VALUES*".column1
+-  ->  Result
+-  One-Time Filter: "*VALUES*".column1
++  Filter: ($0)
+   ->  Seq Scan on gstest2
+-(10 rows)
++  ->  Values (2 rows)
++(8 rows)
+ -- test pushdown of non-degenerate HAVING clause that does not reference any
+ -- columns that are nullable by grouping sets
+ explain (costs off)
+ select a, b, count(*) from gstest2 group by grouping sets ((a, b), (a)) having a > 1 and b > 1;
+   QUERY PLAN
+ ---------------------------------
+  GroupAggregate
+   Group Key: a, b
+   Group Key: a
+-  Filter: (b > 1)
++  Filter: ((a > 1) AND (b > 1))
+   ->  Sort
+   Sort Key: a, b
+   ->  Seq Scan on gstest2
+-  Filter: (a > 1)
+-(8 rows)
++(7 rows)
+ select a, b, count(*) from gstest2 group by grouping sets ((a, b), (a)) having a > 1 and b > 1;
+  a | b | count
+ ---+---+-------
+  2 | 2 |  1
+ (1 row)
+@@ -942,14 +817,14 @@
+   QUERY PLAN
+ ---------------------------------
+  GroupAggregate
+   Group Key: b, a
+   Group Key: b
++  Filter: (b > 1)
+   ->  Sort
+   Sort Key: b, a
+   ->  Seq Scan on gstest2
+-  Filter: (b > 1)
+ (7 rows)
+ select a, b, count(*) from gstest2 group by rollup(a), b having b > 1;
+  a | b | count
+ ---+---+-------
+  1 | 2 |  1
+@@ -958,50 +833,48 @@
+ (3 rows)
+ -- test pushdown of degenerate HAVING clause
+ explain (costs off)
+ select count(*) from gstest2 group by grouping sets (()) having false;
+   QUERY PLAN
+---------------------------------
+- Aggregate
++---------------------------
++ MixedAggregate
+   Group Key: ()
+-  Filter: false
+-  ->  Result
+-  One-Time Filter: false
+-(5 rows)
++  Filter: (false)
++  ->  Seq Scan on gstest2
++(4 rows)
+ select count(*) from gstest2 group by grouping sets (()) having false;
+  count
+ -------
+ (0 rows)
+ explain (costs off)
+ select a, count(*) from gstest2 group by grouping sets ((a), ()) having false;
+   QUERY PLAN
+---------------------------------------
++---------------------------------
+  GroupAggregate
+   Group Key: a
+   Group Key: ()
+-  Filter: false
++  Filter: (false)
+   ->  Sort
+   Sort Key: a
+-  ->  Result
+-  One-Time Filter: false
+-(8 rows)
++  ->  Seq Scan on gstest2
++(7 rows)
+ select a, count(*) from gstest2 group by grouping sets ((a), ()) having false;
+  a | count
+ ---+-------
+ (0 rows)
+ explain (costs off)
+ select a, b, count(*) from gstest2 group by grouping sets ((a), (b)) having false;
+   QUERY PLAN
+---------------------------------------
++---------------------------------
+  GroupAggregate
+   Group Key: a
+   Sort Key: b
+   Group Key: b
++  Filter: (false)
+   ->  Sort
+   Sort Key: a
+-  ->  Result
+-  One-Time Filter: false
++  ->  Seq Scan on gstest2
+ (8 rows)
+ select a, b, count(*) from gstest2 group by grouping sets ((a), (b)) having false;
+  a | b | count
+ ---+---+-------
+ (0 rows)
+@@ -1154,13 +1027,13 @@
+  2 | 2 |  |  9 |  100
+  2 | 2 |  |  |  1000
+ (70 rows)
+ select array(select row(v.a,s1.*) from (select two,four, count(*) from onek group by cube(two,four) order by two,four) s1) from (values (1),(2)) v(a);
+   array
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+- {"(1,0,0,250)","(1,0,2,250)","(1,0,,500)","(1,1,1,250)","(1,1,3,250)","(1,1,,500)","(1,,0,250)","(1,,1,250)","(1,,2,250)","(1,,3,250)","(1,,,1000)"}
+- {"(2,0,0,250)","(2,0,2,250)","(2,0,,500)","(2,1,1,250)","(2,1,3,250)","(2,1,,500)","(2,,0,250)","(2,,1,250)","(2,,2,250)","(2,,3,250)","(2,,,1000)"}
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ {"(1,\"(0,0,250)\")","(1,\"(0,2,250)\")","(1,\"(0,,500)\")","(1,\"(1,1,250)\")","(1,\"(1,3,250)\")","(1,\"(1,,500)\")","(1,\"(,0,250)\")","(1,\"(,1,250)\")","(1,\"(,2,250)\")","(1,\"(,3,250)\")","(1,\"(,,1000)\")"}
++ {"(2,\"(0,0,250)\")","(2,\"(0,2,250)\")","(2,\"(0,,500)\")","(2,\"(1,1,250)\")","(2,\"(1,3,250)\")","(2,\"(1,,500)\")","(2,\"(,0,250)\")","(2,\"(,1,250)\")","(2,\"(,2,250)\")","(2,\"(,3,250)\")","(2,\"(,,1000)\")"}
+ (2 rows)
+ -- Grouping on text columns
+ select sum(ten) from onek group by two, rollup(four::text) order by 1;
+  sum
+ ------
+@@ -1183,15 +1056,46 @@
+ (6 rows)
+ -- hashing support
+ set enable_hashagg = true;
+ -- failure cases
+ select count(*) from gstest4 group by rollup(unhashable_col,unsortable_col);
+-ERROR:  could not implement GROUP BY
+-DETAIL:  Some of the datatypes only support hashing, while others only support sorting.
++ count
++-------
++  1
++  1
++  1
++  1
++  1
++  1
++  1
++  1
++  2
++  2
++  2
++  2
++  8
++(13 rows)
+ select array_agg(v order by v) from gstest4 group by grouping sets ((id,unsortable_col),(id));
+-ERROR:  could not implement GROUP BY
+-DETAIL:  Some of the datatypes only support hashing, while others only support sorting.
++ array_agg
++-----------
++ {1}
++ {2}
++ {4}
++ {8}
++ {16}
++ {32}
++ {64}
++ {128}
++ {1}
++ {2}
++ {4}
++ {8}
++ {16}
++ {32}
++ {64}
++ {128}
++(16 rows)
+ -- simple cases
+ select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by grouping sets ((a),(b)) order by 3,1,2;
+  a | b | grouping | sum | count | max
+ ---+---+----------+-----+-------+-----
+@@ -1205,17 +1109,17 @@
+   | 4 |  2 |  17 |  1 |  17
+ (8 rows)
+ explain (costs off) select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by grouping sets ((a),(b)) order by 3,1,2;
+   QUERY PLAN
+---------------------------------------------------------------------------------------------------------
++------------------------------------
+  Sort
+-  Sort Key: (GROUPING("*VALUES*".column1, "*VALUES*".column2)), "*VALUES*".column1, "*VALUES*".column2
++  Sort Key: (GROUPING(a, b)), a, b
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1
+-  Hash Key: "*VALUES*".column2
+-  ->  Values Scan on "*VALUES*"
++  Hash Key: a
++  Hash Key: b
++  ->  Values (10 rows)
+ (6 rows)
+ select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by cube(a,b) order by 3,1,2;
+  a | b | grouping | sum | count | max
+ ---+---+----------+-----+-------+-----
+@@ -1237,46 +1141,43 @@
+   |  |  3 | 145 |  10 |  19
+ (16 rows)
+ explain (costs off) select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by cube(a,b) order by 3,1,2;
+   QUERY PLAN
+---------------------------------------------------------------------------------------------------------
++------------------------------------
+  Sort
+-  Sort Key: (GROUPING("*VALUES*".column1, "*VALUES*".column2)), "*VALUES*".column1, "*VALUES*".column2
++  Sort Key: (GROUPING(a, b)), a, b
+   ->  MixedAggregate
+-  Hash Key: "*VALUES*".column1, "*VALUES*".column2
+-  Hash Key: "*VALUES*".column1
+-  Hash Key: "*VALUES*".column2
++  Hash Key: a, b
++  Hash Key: a
++  Hash Key: b
+   Group Key: ()
+-  ->  Values Scan on "*VALUES*"
++  ->  Values (10 rows)
+ (8 rows)
+ -- shouldn't try and hash
+ explain (costs off)
+   select a, b, grouping(a,b), array_agg(v order by v)
+   from gstest1 group by cube(a,b);
+   QUERY PLAN
+-----------------------------------------------------------
+- GroupAggregate
+-  Group Key: "*VALUES*".column1, "*VALUES*".column2
+-  Group Key: "*VALUES*".column1
++------------------------
++ MixedAggregate
++  Hash Key: a, b
++  Hash Key: a
++  Hash Key: b
+   Group Key: ()
+-  Sort Key: "*VALUES*".column2
+-  Group Key: "*VALUES*".column2
+-  ->  Sort
+-  Sort Key: "*VALUES*".column1, "*VALUES*".column2
+-  ->  Values Scan on "*VALUES*"
+-(9 rows)
++  ->  Values (10 rows)
++(6 rows)
+ -- unsortable cases
+ select unsortable_col, count(*)
+   from gstest4 group by grouping sets ((unsortable_col),(unsortable_col))
+   order by unsortable_col::text;
+  unsortable_col | count
+ ----------------+-------
+-  1 |  4
+-  1 |  4
+-  2 |  4
+-  2 |  4
++ 1  |  4
++ 1  |  4
++ 2  |  4
++ 2  |  4
+ (4 rows)
+ -- mixed hashable/sortable cases
+ select unhashable_col, unsortable_col,
+   grouping(unhashable_col, unsortable_col),
+   count(*), sum(v)
+@@ -1286,12 +1187,12 @@
+ ----------------+----------------+----------+-------+-----
+  0000  |  |  1 |  2 |  17
+  0001  |  |  1 |  2 |  34
+  0010  |  |  1 |  2 |  68
+  0011  |  |  1 |  2 | 136
+-  |  2 |  2 |  4 |  60
+-  |  1 |  2 |  4 | 195
++  | 2  |  2 |  4 |  60
++  | 1  |  2 |  4 | 195
+ (6 rows)
+ explain (costs off)
+   select unhashable_col, unsortable_col,
+   grouping(unhashable_col, unsortable_col),
+   count(*), sum(v)
+@@ -1299,17 +1200,15 @@
+   order by 3,5;
+   QUERY PLAN
+ ------------------------------------------------------------------
+  Sort
+   Sort Key: (GROUPING(unhashable_col, unsortable_col)), (sum(v))
+-  ->  MixedAggregate
++  ->  HashAggregate
++  Hash Key: unhashable_col
+   Hash Key: unsortable_col
+-  Group Key: unhashable_col
+-  ->  Sort
+-  Sort Key: unhashable_col
+   ->  Seq Scan on gstest4
+-(8 rows)
++(6 rows)
+ select unhashable_col, unsortable_col,
+   grouping(unhashable_col, unsortable_col),
+   count(*), sum(v)
+   from gstest4 group by grouping sets ((v,unhashable_col),(v,unsortable_col))
+  order by 3,5;
+@@ -1321,18 +1220,18 @@
+  0011  |  |  1 |  1 |  8
+  0000  |  |  1 |  1 |  16
+  0001  |  |  1 |  1 |  32
+  0010  |  |  1 |  1 |  64
+  0011  |  |  1 |  1 | 128
+-  |  1 |  2 |  1 |  1
+-  |  1 |  2 |  1 |  2
+-  |  2 |  2 |  1 |  4
+-  |  2 |  2 |  1 |  8
+-  |  2 |  2 |  1 |  16
+-  |  2 |  2 |  1 |  32
+-  |  1 |  2 |  1 |  64
+-  |  1 |  2 |  1 | 128
++  | 1  |  2 |  1 |  1
++  | 1  |  2 |  1 |  2
++  | 2  |  2 |  1 |  4
++  | 2  |  2 |  1 |  8
++  | 2  |  2 |  1 |  16
++  | 2  |  2 |  1 |  32
++  | 1  |  2 |  1 |  64
++  | 1  |  2 |  1 | 128
+ (16 rows)
+ explain (costs off)
+   select unhashable_col, unsortable_col,
+   grouping(unhashable_col, unsortable_col),
+   count(*), sum(v)
+@@ -1340,17 +1239,15 @@
+   order by 3,5;
+   QUERY PLAN
+ ------------------------------------------------------------------
+  Sort
+   Sort Key: (GROUPING(unhashable_col, unsortable_col)), (sum(v))
+-  ->  MixedAggregate
++  ->  HashAggregate
++  Hash Key: v, unhashable_col
+   Hash Key: v, unsortable_col
+-  Group Key: v, unhashable_col
+-  ->  Sort
+-  Sort Key: v, unhashable_col
+   ->  Seq Scan on gstest4
+-(8 rows)
++(6 rows)
+ -- empty input: first is 0 rows, second 1, third 3 etc.
+ select a, b, sum(v), count(*) from gstest_empty group by grouping sets ((a,b),a);
+  a | b | sum | count
+ ---+---+-----+-------
+ (0 rows)
+@@ -1395,11 +1292,11 @@
+ (3 rows)
+ explain (costs off)
+   select sum(v), count(*) from gstest_empty group by grouping sets ((),(),());
+   QUERY PLAN
+ --------------------------------
+- Aggregate
++ MixedAggregate
+   Group Key: ()
+   Group Key: ()
+   Group Key: ()
+   ->  Seq Scan on gstest_empty
+ (5 rows)
+@@ -1428,45 +1325,34 @@
+ -- simple rescan tests
+ select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+  group by grouping sets (a,b)
+  order by 1, 2, 3;
+- a | b | sum
+----+---+-----
+- 1 |  |  3
+- 2 |  |  6
+-  | 1 |  3
+-  | 2 |  3
+-  | 3 |  3
+-(5 rows)
++ERROR:  column "a" does not exist
++LINE 1: select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ explain (costs off)
+   select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+   group by grouping sets (a,b)
+   order by 3, 1, 2;
+-  QUERY PLAN
+----------------------------------------------------------------------
+- Sort
+-  Sort Key: (sum("*VALUES*".column1)), gstest_data.a, gstest_data.b
+-  ->  HashAggregate
+-  Hash Key: gstest_data.a
+-  Hash Key: gstest_data.b
+-  ->  Nested Loop
+-  ->  Values Scan on "*VALUES*"
+-  ->  Function Scan on gstest_data
+-(8 rows)
++ERROR:  column "a" does not exist
++LINE 2:  select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ select *
+   from (values (1),(2)) v(x),
+   lateral (select a, b, sum(v.x) from gstest_data(v.x) group by grouping sets (a,b)) s;
+-ERROR:  aggregate functions are not allowed in FROM clause of their own query level
++ERROR:  column "a" does not exist
+ LINE 3:  lateral (select a, b, sum(v.x) from gstest_data(v.x) ...
+   ^
+ explain (costs off)
+   select *
+   from (values (1),(2)) v(x),
+   lateral (select a, b, sum(v.x) from gstest_data(v.x) group by grouping sets (a,b)) s;
+-ERROR:  aggregate functions are not allowed in FROM clause of their own query level
++ERROR:  column "a" does not exist
+ LINE 4:  lateral (select a, b, sum(v.x) from gstest_data(v.x...
+   ^
+ -- Tests for chained aggregates
+ select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by grouping sets ((a,b),(a+1,b+1),(a+2,b+2)) order by 3,6;
+@@ -1496,18 +1382,18 @@
+ (21 rows)
+ explain (costs off)
+   select a, b, grouping(a,b), sum(v), count(*), max(v)
+   from gstest1 group by grouping sets ((a,b),(a+1,b+1),(a+2,b+2)) order by 3,6;
+   QUERY PLAN
+--------------------------------------------------------------------------------------------
++----------------------------------------
+  Sort
+-  Sort Key: (GROUPING("*VALUES*".column1, "*VALUES*".column2)), (max("*VALUES*".column3))
++  Sort Key: (GROUPING(a, b)), (max(v))
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1, "*VALUES*".column2
+-  Hash Key: ("*VALUES*".column1 + 1), ("*VALUES*".column2 + 1)
+-  Hash Key: ("*VALUES*".column1 + 2), ("*VALUES*".column2 + 2)
+-  ->  Values Scan on "*VALUES*"
++  Hash Key: a, b
++  Hash Key: ((a + 1)), ((b + 1))
++  Hash Key: ((a + 2)), ((b + 2))
++  ->  Values (10 rows)
+ (7 rows)
+ select a, b, sum(c), sum(sum(c)) over (order by a,b) as rsum
+   from gstest2 group by cube (a,b) order by rsum, a, b;
+  a | b | sum | rsum
+ ---+---+-----+------
+@@ -1539,42 +1425,22 @@
+   ->  Seq Scan on gstest2
+ (12 rows)
+ select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+  group by cube (a,b) order by a,b;
+- a | b | sum
+----+---+-----
+- 1 | 1 |  1
+- 1 | 2 |  1
+- 1 | 3 |  1
+- 1 |  |  3
+- 2 | 1 |  2
+- 2 | 2 |  2
+- 2 | 3 |  2
+- 2 |  |  6
+-  | 1 |  3
+-  | 2 |  3
+-  | 3 |  3
+-  |  |  9
+-(12 rows)
++ERROR:  column "a" does not exist
++LINE 1: select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ explain (costs off)
+   select a, b, sum(v.x)
+   from (values (1),(2)) v(x), gstest_data(v.x)
+   group by cube (a,b) order by a,b;
+-  QUERY PLAN
+-------------------------------------------------
+- Sort
+-  Sort Key: gstest_data.a, gstest_data.b
+-  ->  MixedAggregate
+-  Hash Key: gstest_data.a, gstest_data.b
+-  Hash Key: gstest_data.a
+-  Hash Key: gstest_data.b
+-  Group Key: ()
+-  ->  Nested Loop
+-  ->  Values Scan on "*VALUES*"
+-  ->  Function Scan on gstest_data
+-(10 rows)
++ERROR:  column "a" does not exist
++LINE 2:  select a, b, sum(v.x)
++  ^
++HINT:  Perhaps you meant to reference the column "v.x".
+ -- Verify that we correctly handle the child node returning a
+ -- non-minimal slot, which happens if the input is pre-sorted,
+ -- e.g. due to an index scan.
+ BEGIN;
+ SET LOCAL enable_hashagg = false;
+@@ -1699,13 +1565,13 @@
+  2 | 2 |  |  9 |  100
+  2 | 2 |  |  |  1000
+ (70 rows)
+ select array(select row(v.a,s1.*) from (select two,four, count(*) from onek group by cube(two,four) order by two,four) s1) from (values (1),(2)) v(a);
+   array
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+- {"(1,0,0,250)","(1,0,2,250)","(1,0,,500)","(1,1,1,250)","(1,1,3,250)","(1,1,,500)","(1,,0,250)","(1,,1,250)","(1,,2,250)","(1,,3,250)","(1,,,1000)"}
+- {"(2,0,0,250)","(2,0,2,250)","(2,0,,500)","(2,1,1,250)","(2,1,3,250)","(2,1,,500)","(2,,0,250)","(2,,1,250)","(2,,2,250)","(2,,3,250)","(2,,,1000)"}
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ {"(1,\"(0,0,250)\")","(1,\"(0,2,250)\")","(1,\"(0,,500)\")","(1,\"(1,1,250)\")","(1,\"(1,3,250)\")","(1,\"(1,,500)\")","(1,\"(,0,250)\")","(1,\"(,1,250)\")","(1,\"(,2,250)\")","(1,\"(,3,250)\")","(1,\"(,,1000)\")"}
++ {"(2,\"(0,0,250)\")","(2,\"(0,2,250)\")","(2,\"(0,,500)\")","(2,\"(1,1,250)\")","(2,\"(1,3,250)\")","(2,\"(1,,500)\")","(2,\"(,0,250)\")","(2,\"(,1,250)\")","(2,\"(,2,250)\")","(2,\"(,3,250)\")","(2,\"(,,1000)\")"}
+ (2 rows)
+ -- Rescan logic changes when there are no empty grouping sets, so test
+ -- that too:
+ select * from (values (1),(2)) v(a) left join lateral (select v.a, four, ten, count(*) from onek group by grouping sets(four,ten)) s on true order by v.a,four,ten;
+  a | a | four | ten | count
+@@ -1739,13 +1605,13 @@
+  2 | 2 |  |  8 |  100
+  2 | 2 |  |  9 |  100
+ (28 rows)
+ select array(select row(v.a,s1.*) from (select two,four, count(*) from onek group by grouping sets(two,four) order by two,four) s1) from (values (1),(2)) v(a);
+   array
+----------------------------------------------------------------------------------
+- {"(1,0,,500)","(1,1,,500)","(1,,0,250)","(1,,1,250)","(1,,2,250)","(1,,3,250)"}
+- {"(2,0,,500)","(2,1,,500)","(2,,0,250)","(2,,1,250)","(2,,2,250)","(2,,3,250)"}
++---------------------------------------------------------------------------------------------------------------------
++ {"(1,\"(0,,500)\")","(1,\"(1,,500)\")","(1,\"(,0,250)\")","(1,\"(,1,250)\")","(1,\"(,2,250)\")","(1,\"(,3,250)\")"}
++ {"(2,\"(0,,500)\")","(2,\"(1,,500)\")","(2,\"(,0,250)\")","(2,\"(,1,250)\")","(2,\"(,2,250)\")","(2,\"(,3,250)\")"}
+ (2 rows)
+ -- test the knapsack
+ set enable_indexscan = false;
+ set hash_mem_multiplier = 1.0;
+ set work_mem = '64kB';
+@@ -1755,64 +1621,63 @@
+   count(hundred), count(thousand), count(twothousand),
+   count(*)
+   from tenk1 group by grouping sets (unique1,twothousand,thousand,hundred,ten,four,two);
+   QUERY PLAN
+ -------------------------------
+- MixedAggregate
+-  Hash Key: two
+-  Hash Key: four
+-  Hash Key: ten
+-  Hash Key: hundred
++ GroupAggregate
+   Group Key: unique1
+   Sort Key: twothousand
+   Group Key: twothousand
+   Sort Key: thousand
+   Group Key: thousand
++  Sort Key: hundred
++  Group Key: hundred
++  Sort Key: ten
++  Group Key: ten
++  Sort Key: four
++  Group Key: four
++  Sort Key: two
++  Group Key: two
+   ->  Sort
+   Sort Key: unique1
+   ->  Seq Scan on tenk1
+-(13 rows)
++(17 rows)
+ explain (costs off)
+   select unique1,
+   count(two), count(four), count(ten),
+   count(hundred), count(thousand), count(twothousand),
+   count(*)
+   from tenk1 group by grouping sets (unique1,hundred,ten,four,two);
+   QUERY PLAN
+--------------------------------
+- MixedAggregate
+-  Hash Key: two
+-  Hash Key: four
+-  Hash Key: ten
++-------------------------
++ HashAggregate
++  Hash Key: unique1
+   Hash Key: hundred
+-  Group Key: unique1
+-  ->  Sort
+-  Sort Key: unique1
++  Hash Key: ten
++  Hash Key: four
++  Hash Key: two
+   ->  Seq Scan on tenk1
+-(9 rows)
++(7 rows)
+ set work_mem = '384kB';
+ explain (costs off)
+   select unique1,
+   count(two), count(four), count(ten),
+   count(hundred), count(thousand), count(twothousand),
+   count(*)
+   from tenk1 group by grouping sets (unique1,twothousand,thousand,hundred,ten,four,two);
+   QUERY PLAN
+--------------------------------
+- MixedAggregate
+-  Hash Key: two
+-  Hash Key: four
+-  Hash Key: ten
+-  Hash Key: hundred
++-------------------------
++ HashAggregate
++  Hash Key: unique1
++  Hash Key: twothousand
+   Hash Key: thousand
+-  Group Key: unique1
+-  Sort Key: twothousand
+-  Group Key: twothousand
+-  ->  Sort
+-  Sort Key: unique1
++  Hash Key: hundred
++  Hash Key: ten
++  Hash Key: four
++  Hash Key: two
+   ->  Seq Scan on tenk1
+-(12 rows)
++(9 rows)
+ -- check collation-sensitive matching between grouping expressions
+ -- (similar to a check for aggregates, but there are additional code
+ -- paths for GROUPING, so check again here)
+ select v||'a', case grouping(v||'a') when 1 then 1 else 0 end, count(*)
+   from unnest(array[1,1], array['a','b']) u(i,v)
+@@ -2099,38 +1964,13 @@
+ -- "normal" behavior...
+ select a, b, c
+ from (values (1, 2, 3), (4, null, 6), (7, 8, 9)) as t (a, b, c)
+ group by all rollup(a, b), rollup(a, c)
+ order by a, b, c;
+- a | b | c
+----+---+---
+- 1 | 2 | 3
+- 1 | 2 |
+- 1 | 2 |
+- 1 |  | 3
+- 1 |  | 3
+- 1 |  |
+- 1 |  |
+- 1 |  |
+- 4 |  | 6
+- 4 |  | 6
+- 4 |  | 6
+- 4 |  |
+- 4 |  |
+- 4 |  |
+- 4 |  |
+- 4 |  |
+- 7 | 8 | 9
+- 7 | 8 |
+- 7 | 8 |
+- 7 |  | 9
+- 7 |  | 9
+- 7 |  |
+- 7 |  |
+- 7 |  |
+-  |  |
+-(25 rows)
++ERROR:  syntax error at or near "all"
++LINE 3: group by all rollup(a, b), rollup(a, c)
++  ^
+ -- ...which is also the default
+ select a, b, c
+ from (values (1, 2, 3), (4, null, 6), (7, 8, 9)) as t (a, b, c)
+ group by rollup(a, b), rollup(a, c)
+ order by a, b, c;
+@@ -2165,26 +2005,13 @@
+ -- "group by distinct" behavior...
+ select a, b, c
+ from (values (1, 2, 3), (4, null, 6), (7, 8, 9)) as t (a, b, c)
+ group by distinct rollup(a, b), rollup(a, c)
+ order by a, b, c;
+- a | b | c
+----+---+---
+- 1 | 2 | 3
+- 1 | 2 |
+- 1 |  | 3
+- 1 |  |
+- 4 |  | 6
+- 4 |  | 6
+- 4 |  |
+- 4 |  |
+- 7 | 8 | 9
+- 7 | 8 |
+- 7 |  | 9
+- 7 |  |
+-  |  |
+-(13 rows)
++ERROR:  syntax error at or near "distinct"
++LINE 3: group by distinct rollup(a, b), rollup(a, c)
++  ^
+ -- ...which is not the same as "select distinct"
+ select distinct a, b, c
+ from (values (1, 2, 3), (4, null, 6), (7, 8, 9)) as t (a, b, c)
+ group by rollup(a, b), rollup(a, c)
+ order by a, b, c;
+@@ -2203,47 +2030,26 @@
+   |  |
+ (11 rows)
+ -- test handling of outer GroupingFunc within subqueries
+ explain (costs off)
+ select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
+-  QUERY PLAN
+--------------------------------
+- MixedAggregate
+-  Hash Key: (InitPlan 3).col1
+-  Group Key: ()
+-  InitPlan 1
+-  ->  Result
+-  InitPlan 3
+-  ->  Result
+-  ->  Result
+-  SubPlan 2
+-  ->  Result
+-(10 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 2: select (select grouping(v1)) from (values ((select 1))) v(v1...
++  ^
+ select (select grouping(v1)) from (values ((select 1))) v(v1) group by cube(v1);
+- grouping
+-----------
+-  1
+-  0
+-(2 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select (select grouping(v1)) from (values ((select 1))) v(v1...
++  ^
+ explain (costs off)
+ select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
+-  QUERY PLAN
+-----------------
+- GroupAggregate
+-  InitPlan 1
+-  ->  Result
+-  InitPlan 3
+-  ->  Result
+-  ->  Result
+-  SubPlan 2
+-  ->  Result
+-(8 rows)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 2: select (select grouping(v1)) from (values ((select 1))) v(v1...
++  ^
+ select (select grouping(v1)) from (values ((select 1))) v(v1) group by v1;
+- grouping
+-----------
+-  0
+-(1 row)
++ERROR:  unsupported expression *parser.GroupingCall
++LINE 1: select (select grouping(v1)) from (values ((select 1))) v(v1...
++  ^
+ -- test handling of subqueries in grouping sets
+ create temp table gstest5(id integer primary key, v integer);
+ insert into gstest5 select i, i from generate_series(1,5)i;
+ explain (verbose, costs off)
+ select grouping((select t1.v from gstest5 t2 where id = t1.id)),
+@@ -2253,27 +2059,28 @@
+ order by case when grouping((select t1.v from gstest5 t2 where id = t1.id)) = 0
+   then (select t1.v from gstest5 t2 where id = t1.id)
+   else null end
+   nulls first;
+   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------
++----------------------------------------------------------------------------------
+  Sort
+-  Output: (GROUPING((SubPlan 1))), ((SubPlan 3)), (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END), t1.v
+-  Sort Key: (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END) NULLS FIRST
++  Sort Key: (CASE WHEN (grouping = 0) THEN v ELSE NULL::integer END) NULLS FIRST
++  Output: v, v, grouping
+   ->  HashAggregate
+-  Output: GROUPING((SubPlan 1)), ((SubPlan 3)), CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END, t1.v
+   Hash Key: t1.v
+-  Hash Key: (SubPlan 3)
+-  ->  Seq Scan on pg_temp.gstest5 t1
+-  Output: (SubPlan 3), t1.v, t1.id
+-  SubPlan 3
+-  ->  Bitmap Heap Scan on pg_temp.gstest5 t2
+-  Output: t1.v
+-  Recheck Cond: (t2.id = t1.id)
++  Hash Key: ((SubPlan 1))
++  Output: v, v, grouping
++  SubPlan 1
++  ->  Bitmap Heap Scan on gstest5 t2
++  Recheck Cond: (id = t1.id)
++  Output: id, v
+   ->  Bitmap Index Scan on gstest5_pkey
+-  Index Cond: (t2.id = t1.id)
+-(15 rows)
++  Index Cond: (id = t1.id)
++  Output: id, v
++  ->  Seq Scan on public.gstest5 t1
++  Output: id, v
++(16 rows)
+ select grouping((select t1.v from gstest5 t2 where id = t1.id)),
+   (select t1.v from gstest5 t2 where id = t1.id) as s
+ from gstest5 t1
+ group by grouping sets(v, s)
+ order by case when grouping((select t1.v from gstest5 t2 where id = t1.id)) = 0
+@@ -2301,27 +2108,28 @@
+   else null end as o
+ from gstest5 t1
+ group by grouping sets(v, s)
+ order by o nulls first;
+   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------
++----------------------------------------------------------------------------------
+  Sort
+-  Output: (GROUPING((SubPlan 1))), ((SubPlan 3)), (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END), t1.v
+-  Sort Key: (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END) NULLS FIRST
++  Sort Key: (CASE WHEN (grouping = 0) THEN v ELSE NULL::integer END) NULLS FIRST
++  Output: v, v, grouping
+   ->  HashAggregate
+-  Output: GROUPING((SubPlan 1)), ((SubPlan 3)), CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END, t1.v
+   Hash Key: t1.v
+-  Hash Key: (SubPlan 3)
+-  ->  Seq Scan on pg_temp.gstest5 t1
+-  Output: (SubPlan 3), t1.v, t1.id
+-  SubPlan 3
+-  ->  Bitmap Heap Scan on pg_temp.gstest5 t2
+-  Output: t1.v
+-  Recheck Cond: (t2.id = t1.id)
++  Hash Key: ((SubPlan 1))
++  Output: v, v, grouping
++  SubPlan 1
++  ->  Bitmap Heap Scan on gstest5 t2
++  Recheck Cond: (id = t1.id)
++  Output: id, v
+   ->  Bitmap Index Scan on gstest5_pkey
+-  Index Cond: (t2.id = t1.id)
+-(15 rows)
++  Index Cond: (id = t1.id)
++  Output: id, v
++  ->  Seq Scan on public.gstest5 t1
++  Output: id, v
++(16 rows)
+ select grouping((select t1.v from gstest5 t2 where id = t1.id)),
+   (select t1.v from gstest5 t2 where id = t1.id) as s,
+   case when grouping((select t1.v from gstest5 t2 where id = t1.id)) = 0
+   then (select t1.v from gstest5 t2 where id = t1.id)
+   else null end as o
+@@ -2343,31 +2151,31 @@
+ (10 rows)
+ -- test handling of expressions that should match lower target items
+ explain (costs off)
+ select a < b and b < 3 from (values (1, 2)) t(a, b) group by rollup(a < b and b < 3) having a < b and b < 3;
+   QUERY PLAN
+------------------------------------
++-------------------------------------
+  MixedAggregate
+-  Hash Key: ((1 < 2) AND (2 < 3))
++  Hash Key: (((a < b) AND (b < 3)))
+   Group Key: ()
+-  Filter: (((1 < 2) AND (2 < 3)))
+-  ->  Result
++  Filter: (?column?)
++  ->  Values (1 rows)
+ (5 rows)
+ select a < b and b < 3 from (values (1, 2)) t(a, b) group by rollup(a < b and b < 3) having a < b and b < 3;
+  ?column?
+ ----------
+  t
+ (1 row)
+ explain (costs off)
+ select not a from (values(true)) t(a) group by rollup(not a) having not not a;
+   QUERY PLAN
+-------------------------------
++--------------------------
+  MixedAggregate
+-  Hash Key: (NOT true)
++  Hash Key: ((NOT a))
+   Group Key: ()
+-  Filter: (NOT ((NOT true)))
+-  ->  Result
++  Filter: (NOT ?column?)
++  ->  Values (1 rows)
+ (5 rows)
+ select not a from (values(true)) t(a) group by rollup(not a) having not not a;
+  ?column?
+ ----------
+  f
+@@ -2377,19 +2185,19 @@
+ select distinct on (a, b) a, b
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a))
+ order by a, b;
+   QUERY PLAN
+-----------------------------------------------------------------
++-------------------------------------
+  Unique
+   ->  Sort
+-  Sort Key: "*VALUES*".column1, "*VALUES*".column2
++  Sort Key: a, b
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1, "*VALUES*".column2
+-  Hash Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  Filter: (column1 = column2)
++  Hash Key: a, b
++  Hash Key: a
++  ->  Values (2 rows)
++  Filter: (a = b)
+ (8 rows)
+ select distinct on (a, b) a, b
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a))
+ order by a, b;
+@@ -2404,19 +2212,19 @@
+ select distinct on (a, b+1) a, b+1
+ from (values (1, 0), (2, 1)) as t (a, b) where a = b+1
+ group by grouping sets((a, b+1), (a))
+ order by a, b+1;
+   QUERY PLAN
+-----------------------------------------------------------------------
++-------------------------------------------
+  Unique
+   ->  Sort
+-  Sort Key: "*VALUES*".column1, (("*VALUES*".column2 + 1))
++  Sort Key: a, ((b + 1))
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1, ("*VALUES*".column2 + 1)
+-  Hash Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  Filter: (column1 = (column2 + 1))
++  Hash Key: a, ((b + 1))
++  Hash Key: a
++  ->  Values (2 rows)
++  Filter: (a = (b + 1))
+ (8 rows)
+ select distinct on (a, b+1) a, b+1
+ from (values (1, 0), (2, 1)) as t (a, b) where a = b+1
+ group by grouping sets((a, b+1), (a))
+ order by a, b+1;
+@@ -2431,18 +2239,18 @@
+ select a, b
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a))
+ order by a, b nulls first;
+   QUERY PLAN
+-----------------------------------------------------------------
++-------------------------------
+  Sort
+-  Sort Key: "*VALUES*".column1, "*VALUES*".column2 NULLS FIRST
++  Sort Key: a, b NULLS FIRST
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1, "*VALUES*".column2
+-  Hash Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  Filter: (column1 = column2)
++  Hash Key: a, b
++  Hash Key: a
++  ->  Values (2 rows)
++  Filter: (a = b)
+ (7 rows)
+ select a, b
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a))
+ order by a, b nulls first;
+@@ -2453,39 +2261,32 @@
+  2 |
+  2 | 2
+ (4 rows)
+ explain (costs off)
+ select 1 as one group by rollup(one) order by one nulls first;
+-  QUERY PLAN
+------------------------------
+- Sort
+-  Sort Key: (1) NULLS FIRST
+-  ->  MixedAggregate
+-  Hash Key: 1
+-  Group Key: ()
+-  ->  Result
+-(6 rows)
++ERROR:  GROUP BY position 1 is not in select list
++LINE 2: select 1 as one group by rollup(one) order by one nulls firs...
++  ^
+ select 1 as one group by rollup(one) order by one nulls first;
+- one
+------
+-  1
+-(2 rows)
++ERROR:  GROUP BY position 1 is not in select list
++LINE 1: select 1 as one group by rollup(one) order by one nulls firs...
++  ^
+ explain (costs off)
+ select a, b, row_number() over (order by a, b nulls first)
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a));
+   QUERY PLAN
+---------------------------------------------------------------------------------------------
++----------------------------------------------------------
+  WindowAgg
+-  Window: w1 AS (ORDER BY "*VALUES*".column1, "*VALUES*".column2 ROWS UNBOUNDED PRECEDING)
++  Window: w1 AS (ORDER BY a, b ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+-  Sort Key: "*VALUES*".column1, "*VALUES*".column2 NULLS FIRST
++  Sort Key: a, b NULLS FIRST
+   ->  HashAggregate
+-  Hash Key: "*VALUES*".column1, "*VALUES*".column2
+-  Hash Key: "*VALUES*".column1
+-  ->  Values Scan on "*VALUES*"
+-  Filter: (column1 = column2)
++  Hash Key: a, b
++  Hash Key: a
++  ->  Values (2 rows)
++  Filter: (a = b)
+ (9 rows)
+ select a, b, row_number() over (order by a, b nulls first)
+ from (values (1, 1), (2, 2)) as t (a, b) where a = b
+ group by grouping sets((a, b), (a));
+  a | b | row_number
+@@ -2499,62 +2300,49 @@
+ explain (verbose, costs off)
+ select generate_series(1, a) as g
+ from (values (1, 1), (2, 2)) as t (a, b)
+ group by rollup(g)
+ order by 1;
+-  QUERY PLAN
+---------------------------------------------------------------
+- Sort
+-  Output: (generate_series(1, "*VALUES*".column1))
+-  Sort Key: (generate_series(1, "*VALUES*".column1))
+-  ->  MixedAggregate
+-  Output: (generate_series(1, "*VALUES*".column1))
+-  Hash Key: generate_series(1, "*VALUES*".column1)
+-  Group Key: ()
+-  ->  ProjectSet
+-  Output: generate_series(1, "*VALUES*".column1)
+-  ->  Values Scan on "*VALUES*"
+-  Output: "*VALUES*".column1
+-(11 rows)
++ERROR:  column "a" does not exist
++LINE 2: select generate_series(1, a) as g
++  ^
+ select generate_series(1, a) as g
+ from (values (1, 1), (2, 2)) as t (a, b)
+ group by rollup(g)
+ order by 1;
+- g
+----
+- 1
+- 2
+-(3 rows)
++ERROR:  column "a" does not exist
++LINE 1: select generate_series(1, a) as g
++  ^
+ explain (verbose, costs off)
+ select generate_series(1, a) as g, a+b as ab
+ from (values (1, 1), (2, 2)) as t (a, b)
+ group by rollup(a, ab)
+ order by 1, 2;
+   QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------
+- Sort
+-  Output: (generate_series(1, "*VALUES*".column1)), (("*VALUES*".column1 + "*VALUES*".column2)), "*VALUES*".column1
+-  Sort Key: (generate_series(1, "*VALUES*".column1)), (("*VALUES*".column1 + "*VALUES*".column2))
+-  ->  ProjectSet
+-  Output: generate_series(1, "*VALUES*".column1), (("*VALUES*".column1 + "*VALUES*".column2)), "*VALUES*".column1
++------------------------------------------------------
++ ProjectSet
++  Output: g, ab
++  ->  Sort
++  Sort Key: (generate_series(1, a)), ((a + b))
++  Output: a, ?column?
+   ->  MixedAggregate
+-  Output: "*VALUES*".column1, (("*VALUES*".column1 + "*VALUES*".column2))
+-  Hash Key: "*VALUES*".column1, ("*VALUES*".column1 + "*VALUES*".column2)
+-  Hash Key: "*VALUES*".column1
++  Hash Key: a, ((a + b))
++  Hash Key: a
+   Group Key: ()
+-  ->  Values Scan on "*VALUES*"
+-  Output: ("*VALUES*".column1 + "*VALUES*".column2), "*VALUES*".column1
++  Output: a, ?column?
++  ->  Values (2 rows)
++  Output: a, b
+ (12 rows)
+ select generate_series(1, a) as g, a+b as ab
+ from (values (1, 1), (2, 2)) as t (a, b)
+ group by rollup(a, ab)
+ order by 1, 2;
+  g | ab
+ ---+----
+  1 |  2
+  1 |  4
++ 2 |  4
+  1 |
+  1 |
+- 2 |  4
+  2 |
+ (6 rows)
+ -- end

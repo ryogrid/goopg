@@ -1,0 +1,41 @@
+PLANCAND add rel=(b 1 2) cand={k=356 rows=179914 cost=0.3025..11667.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=356 rows=179914 cost=0.3025..11667.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND add rel=(b 1 2) cand={k=356 rows=179914 cost=0..1.97191e+08 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND rej rel=(b 1 2) cand={k=356 rows=179914 cost=0..1.97191e+08 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=356 rows=179914 cost=0.3025..11667.9 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=cost:B2 keys:EQ outer:EQ
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=74964 cost=0..2.30017e+08 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=74964 cost=0..2.30017e+08 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=358 rows=74964 cost=19800.2..20933.7 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=27426.1..27426.1 pk=0 par=- by={k=358 rows=74964 cost=19800.2..20933.7 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND pok rel=(b 1 2) cand={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+PLANCAND padd rel=(b 1 2) cand={k=356 rows=74964 cost=0..8.21671e+07 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND prej rel=(b 1 2) cand={k=356 rows=74964 cost=0..8.21671e+07 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+HJCOST outer=179956 inner=73049 hashjointuples=2 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+PLANCAND add rel=(b 1 2) cand={k=359 rows=179914 cost=3067.6..10083.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ok rel=(b 1 2) cand={k=359 rows=179914 cost=3067.6..10083.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)} removed=1
+HJCOST outer=74982 inner=42970 hashjointuples=1 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+PLANCAND padd rel=(b 1 2) cand={k=359 rows=74964 cost=2390.82..8081.48 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND prej rel=(b 1 2) cand={k=359 rows=74964 cost=2390.82..8081.48 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} by={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)} via=cost cmp=keys:EQ
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=8748.87..8748.87 pk=0 par=- by={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=33473.1..33927.4 pk=0 par=- by={k=359 rows=179914 cost=3067.6..10083.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND ppreskip rel=(b 1 2) dis=0 cost=30993.5..30993.5 pk=0 par=- by={k=356 rows=74964 cost=0.3025..7993.82 dis=0 par=- pk=0 pw=2 psafe=1 jt=0 out=(b 1) in=(b 2)}
+PLANCAND preskip rel=(b 1 2) dis=0 cost=0..4.78003e+08 pk=0 par=- by={k=359 rows=179914 cost=3067.6..10083.6 dis=0 par=- pk=0 pw=0 psafe=1 jt=0 out=(b 1) in=(b 2)}
+APXQUAL cached_norm=1.36862e-05 outer_selec=1.36862e-05
+APXQUAL selec_now=1.36862e-05 outer_rows=179956 inner_rows=73049
+APXQUAL cached_norm=1.36862e-05 outer_selec=1.36862e-05
+APXQUAL selec_now=1.36862e-05 outer_rows=74982 inner_rows=73049
+HJCOST outer=179956 inner=73049 hashjointuples=2 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+HJCOST outer=74982 inner=42970 hashjointuples=1 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+APXQUAL cached_norm=1.99987e-05 outer_selec=1.99987e-05
+APXQUAL selec_now=1.99987e-05 outer_rows=179956 inner_rows=50000
+APXQUAL cached_norm=1.99987e-05 outer_selec=1.99987e-05
+APXQUAL selec_now=1.99987e-05 outer_rows=74982 inner_rows=50000
+HJCOST outer=179956 inner=50000 hashjointuples=4 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+HJCOST outer=74982 inner=29412 hashjointuples=1 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+APXQUAL cached_norm=1.99987e-05 outer_selec=1.99987e-05
+APXQUAL selec_now=1.99987e-05 outer_rows=179914 inner_rows=50000
+APXQUAL cached_norm=1.99987e-05 outer_selec=1.99987e-05
+APXQUAL selec_now=1.99987e-05 outer_rows=74964 inner_rows=50000
+HJCOST outer=179914 inner=50000 hashjointuples=4 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+HJCOST outer=74964 inner=29412 hashjointuples=1 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+HJCOST outer=179944 inner=73049 hashjointuples=2 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1
+HJCOST outer=74977 inner=42970 hashjointuples=1 qp_per_tuple=0 qp_startup=0 hash_per_tuple=0.0025 nrestrict=1

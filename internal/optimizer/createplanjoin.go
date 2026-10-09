@@ -130,17 +130,21 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 	out := n.Output()
 	leaf := rel.baseLeaf.Output()
 	width := len(out)
-	if width == len(leaf) {
+	if width == len(leaf) && sameColumnNames(out, leaf) {
 		// The common case: the rebuilt leaf emits its table's whole column
-		// list, so output position i IS binding position i.
+		// list, so output position i IS binding position i. An index-only
+		// scan covering every column emits them in INDEX order (regress
+		// create_index's onek_with_null on (unique2, unique1)), so equal
+		// width alone is not the identity (M0146-0019a).
 		lay := make(outputLayout, width)
 		for i := range lay {
 			lay[i] = rel.baseOffset + i
 		}
 		return lay
 	}
-	// An index-only scan emits only the columns its index covers, so it is
-	// NARROWER than the recorded leaf and the identity above does not hold.
+	// An index-only scan emits only the columns its index covers, in index
+	// order, so it is NARROWER than the recorded leaf or permuted, and the
+	// identity above does not hold.
 	// Positions are recovered by NAME against the leaf's schema — the leaf is
 	// the coordinate space every clause over this rel was written in, so this
 	// is the whole of the translation. Everything above is re-based by
@@ -170,6 +174,20 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 	return lay
 }
 
+// sameColumnNames reports whether a and b name the same columns position by
+// position.
+func sameColumnNames(a, b Schema) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
 // translateToLayout returns a NEW expression with every `ColumnRef.Index`
 // rewritten from the binding coordinate it was written in into the position that
 // column occupies in `lay`. The original is left untouched — the search still
@@ -191,14 +209,20 @@ func baseRelLayout(rel *RelOptInfo, n Node) outputLayout {
 //     the same policy, so a translation with a different notion of "a reference
 //     belonging to this scope" would be translating a different clause than the
 //     one that was placed (rule #2 — sibling paths must agree).
-//   - An `*OuterColumnRef` or a `*CTIDExpr` at this level is refused. Neither
-//     is positional, so both would survive the rewrite unchanged and silently
-//     mean something else: an OuterColumnRef is a correlation into a scope the
-//     flat merged row cannot supply, and a CTIDExpr is injected by the SCAN into
+//   - A `*CTIDExpr` at this level is refused. It is injected by the SCAN into
 //     its own row's slot (`MaterializedSlot.hasCTID`), so hoisting it onto the
-//     join re-points it at whichever side the merged row starts with. The same
-//     two are refused by `cloneExprShiftIdx` (nl_index_join.go:802-811) for the
-//     same reasons.
+//     join re-points it at whichever side the merged row starts with. An
+//     `*OuterColumnRef` is NOT refused: it is a correlation bound through the
+//     enclosing scope chain, not a positional column, so it needs no
+//     renumbering — it rides the clause exactly as it already does in leaf
+//     filters and project targets inside correlated SubPlans (PG likewise
+//     leaves the outer Var in the join qual of a correlated subplan). The
+//     resolver can only produce an OuterColumnRef below a parent scope, so
+//     any that reaches createPlan is inside a subquery plan by construction;
+//     `lowerSubPlanParams` then binds it into a PARAM_EXEC. The hoisting
+//     boundary is different and stays refused: `cloneExprShiftIdx`
+//     (nl_index_join.go) MOVES a conjunct one scope level outward, where the
+//     same Level 1 would silently name a different scope.
 //
 // `what` names the thing being translated ("join clause", "sort key") purely so
 // a panic says which producer to look at; every caller is a `createPlan` arm.
@@ -224,7 +248,7 @@ func translateToLayout(what string, e Expr, lay outputLayout, index map[int]int)
 					return n
 				}
 				x.Index = local
-			case *OuterColumnRef, *CTIDExpr:
+			case *CTIDExpr:
 				if refused == nil {
 					refused = n
 				}
@@ -266,6 +290,10 @@ type joinInputs struct {
 	// begins, and therefore the width of the left-only publication a SEMI or
 	// ANTI join makes. C-03c.
 	outerCols int
+	// outerLay / innerLay are each child's own layout — the halves `lay`
+	// concatenates. The merge arm translates a side's sort keys onto them
+	// (restoreMergeSort).
+	outerLay, innerLay outputLayout
 }
 
 // publishedSchema / publishedLayout are what the join NODE exposes upward, as
@@ -292,12 +320,20 @@ func (in joinInputs) publishedSchema(jt JoinType) Schema {
 	if jt == JoinTypeSemi || jt == JoinTypeAnti {
 		return append(Schema(nil), in.merged[:in.outerCols]...)
 	}
+	// M0146-0005dj: a right semi/anti join publishes its INNER (the hashed
+	// LHS) alone — the tail of the merged row.
+	if jt.IsRightSemiAnti() {
+		return append(Schema(nil), in.merged[in.outerCols:]...)
+	}
 	return in.merged
 }
 
 func (in joinInputs) publishedLayout(jt JoinType) outputLayout {
 	if jt == JoinTypeSemi || jt == JoinTypeAnti {
 		return in.lay[:in.outerCols:in.outerCols]
+	}
+	if jt.IsRightSemiAnti() {
+		return append(outputLayout(nil), in.lay[in.outerCols:]...)
 	}
 	return in.lay
 }
@@ -338,6 +374,10 @@ func planJoinTypeFor(p *Path, kind string) JoinType {
 		return JoinTypeSemi
 	case parser.JoinAnti:
 		return JoinTypeAnti
+	case parser.JoinRightSemi:
+		return JoinTypeRightSemi
+	case parser.JoinRightAnti:
+		return JoinTypeRightAnti
 	default:
 		var relids uint32
 		if p != nil && p.Rel != nil {
@@ -391,7 +431,7 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 	// is a plan-time panic, not a narrower plan (joinleghook.go).
 	outerNode, outerLay = narrowJoinLeg(outerNode, outerLay, outerPath, false)
 	innerNode, innerLay = narrowJoinLeg(innerNode, innerLay, innerPath,
-		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)")
+		kind == "PathNestLoop(NLI)" || kind == "PathNestLoop(NLI-bitmap)" || kind == "PathNestLoop(param-append)")
 	if outerNode == nil || innerNode == nil {
 		panic(fmt.Sprintf("createPlan: %s over a child path that built no node", kind))
 	}
@@ -430,6 +470,8 @@ func joinInputsFor(p *Path, kind string, outerPath, innerPath *Path) joinInputs 
 		merged:      merged,
 		lay:         lay,
 		index:       lay.bindingIndex(),
+		outerLay:    outerLay,
+		innerLay:    innerLay,
 	}
 }
 
@@ -489,7 +531,7 @@ func (in joinInputs) keyPairs(kind string, keys []*restrictInfo) []JoinKeyPair {
 // (join_hash_keys.go:193), in conjunct order, so a key that is not a conjunct
 // would be dropped from the list this arm just published — and for a merge join
 // that list is the sort order itself.
-func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []*restrictInfo) Expr {
+func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []*restrictInfo, ecLast bool) Expr {
 	conjuncts := make([]Expr, 0, len(pairs)+len(residual))
 	for _, kp := range pairs {
 		conjuncts = append(conjuncts, &BinaryOp{pos: kp.Left.Pos(), Op: parser.OpEq, Left: kp.Left, Right: kp.Right})
@@ -498,9 +540,49 @@ func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []
 		if ri == nil || ri.clause == nil {
 			panic(fmt.Sprintf("createPlan: %s residual %d has no clause", kind, i))
 		}
+	}
+	// M0146-0013: every create_*join_plan runs order_qual_clauses over its
+	// join quals, so a cheap comparison is evaluated before a SubPlan or an
+	// OR the list happens to carry first.
+	// M0146-0042b: build_joinrel_restrictlist (relnode.c) lists an inner
+	// join's joininfo clauses first and generate_join_implied_equalities'
+	// equivalence-class equalities after them; the stable cost sort keeps
+	// that order among equal-cost quals.
+	if ecLast {
+		residual = ecJoinClausesLast(residual)
+	}
+	for _, ri := range orderQualRestrictInfos(residual) {
 		conjuncts = append(conjuncts, translateToLayout("join clause", ri.clause, in.lay, in.index))
 	}
 	return combineAnd(conjuncts)
+}
+
+// ecClausesLast reports whether this join's equivalence-class equalities
+// follow its other quals, as build_joinrel_restrictlist orders them: an inner
+// or cross join. An outer join's ON clause is never an EC member in PG
+// (distribute_qual_to_rels keeps it out), so its written order stands; semi
+// and anti joins keep theirs too.
+func (p *Path) ecClausesLast() bool {
+	return p != nil && (p.Jointype == parser.JoinInner || p.Jointype == parser.JoinCross)
+}
+
+// ecJoinClausesLast moves the equivalence-class equalities after the other
+// quals, each group in its own order (M0146-0042b; the scan-qual sibling is
+// equivalenceClausesLast).
+func ecJoinClausesLast(ris []*restrictInfo) []*restrictInfo {
+	if len(ris) < 2 {
+		return ris
+	}
+	rest := make([]*restrictInfo, 0, len(ris))
+	var ec []*restrictInfo
+	for _, ri := range ris {
+		if ri != nil && ri.isEquijoin && ri.ecID != noEquivClass {
+			ec = append(ec, ri)
+		} else {
+			rest = append(rest, ri)
+		}
+	}
+	return append(rest, ec...)
 }
 
 // createHashJoinPlan is `create_hashjoin_plan` (createplan.c:4633): recurse into
@@ -549,7 +631,10 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	if len(p.HashKeys) == 0 {
 		panic("createPlan: PathHashJoin with no hash keys; a hash join keys on nothing only as a nested loop")
 	}
-	if p.RequiredOuter != 0 {
+	if p.RequiredOuter != 0 && p.paramSink == nil {
+		// Under a binding nested loop (createNestLoopParamJoinPlan) the sink
+		// is set and the loop binds the probes below; anywhere else nothing
+		// would.
 		panic(fmt.Sprintf("createPlan: parameterised PathHashJoin over relset %#08x; a hash join propagates a parameter rather than binding it",
 			uint32(p.Rel.Relids)))
 	}
@@ -572,7 +657,7 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 		// why BuildLeft stays false rather than being re-decided here.
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual),
+		Predicate: in.joinPredicate("PathHashJoin", pairs, p.Residual, p.ecClausesLast()),
 		// M0146-0002: the build side is partial and built cooperatively.
 		ParallelHash: p.ParallelHash,
 		// `HashKeys[0] IS (LeftKey, RightKey), by pointer` (plan.go:840) — the
@@ -668,24 +753,28 @@ func assertParallelAwareJoinIsRunnable(p *Path, j *Join) {
 // and sorting by `(a.x, b.x)` when `a.x = b.x` already holds inside the outer is
 // the same order as sorting by `a.x`.
 //
-// # The sort children are ABSORBED, not emitted
+// # The sort children are built through, then re-emitted
 //
 // PG's `MergePath` carries `outersortkeys`/`innersortkeys` and this arm
-// MATERIALISES a `Sort` node, because PG's `nodeMergejoin` requires sorted
-// inputs and cannot produce them. goopg's `JoinAlgoMerge` operator sorts BOTH
-// inputs itself, unconditionally, into work_mem-bounded runs (`openMergeJoin`,
-// operators_join_agg.go:315) — it is a Sort⋈Sort in one node. goopg's path model
-// nevertheless makes the sorts explicit `PathSort` children (`sortPathFor`), so
-// that `addPath` can compare a candidate that needs a sort against one that does
-// not.
+// MATERIALISES a `Sort` node over each side that needs one. goopg's path model
+// makes those sorts explicit `PathSort` children (`sortPathFor`) so that
+// `addPath` can compare a candidate that needs a sort against one that does
+// not, and `tryMergeJoinPath` prices exactly one sort per side.
 //
-// Emitting those children as `*Sort` nodes would therefore sort each side TWICE:
-// once in the node the path names, once inside the join that ignores it. That is
-// not a faithful translation, it is a doubled cost the path was never charged —
-// `tryMergeJoinPath` prices exactly one sort per side. So the arm absorbs them:
-// a child `PathSort` is stepped over and ITS child is emitted, which reproduces
-// the costed plan exactly. `absorbMergeSort` states the one property that has to
-// hold for the step-over to be ordering-neutral.
+// The arm builds each side THROUGH its `PathSort` (`absorbMergeSort`), so the
+// key pairs and the merge-input narrowing see the side's own node, and then
+// puts the Sort back on top of the narrowed node (`restoreMergeSort`,
+// M0146-0099) — PG's plan shape, with the Sort as the CP_SMALL_TLIST consumer
+// that keeps a subquery's `Subquery Scan` below it. Until M0146-0099 the Sort
+// was dropped there, so every merge input that needed a sort printed without
+// one (TPC-DS Q44's `Merge Join` directly over two WindowAggs).
+//
+// goopg's `JoinAlgoMerge` operator still sorts both inputs itself into
+// work_mem-bounded runs (`openMergeJoin`); a chunk that arrives already in its
+// order is not re-sorted (`mergeSortedSource.sortChunk`), so the side is
+// sorted once, by the node the plan names. The operator still buffers the
+// side it reads, which PG's nodeMergejoin, streaming its sorted input, does
+// not — ledgered with M0146-0099.
 //
 // Preconditions, each naming the wrong answer it prevents:
 //
@@ -724,6 +813,11 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		absorbMergeSort(p.Children[0], "outer"),
 		absorbMergeSort(p.Children[1], "inner"))
 	pairs := in.keyPairs("PathMergeJoin", p.HashKeys)
+	// M0146-0099: the absorbed sorts go back on as plan nodes, over the
+	// narrowed inputs, after the key pairs were translated against them. A
+	// Sort publishes its child's schema, so `merged`/`lay` stay valid.
+	in.outer = restoreMergeSort(p.Children[0], in.outer, in.outerLay)
+	in.inner = restoreMergeSort(p.Children[1], in.inner, in.innerLay)
 
 	jt := planJoinTypeFor(p, "PathMergeJoin")
 	j := &Join{
@@ -735,11 +829,13 @@ func createMergeJoinPlan(p *Path) (Node, outputLayout) {
 		// is meaningless here and stays false.
 		Left:      in.outer,
 		Right:     in.inner,
-		Predicate: in.joinPredicate("PathMergeJoin", pairs, p.Residual),
+		Predicate: in.joinPredicate("PathMergeJoin", pairs, p.Residual, p.ecClausesLast()),
 		LeftKey:   pairs[0].Left,
 		RightKey:  pairs[0].Right,
 		HashKeys:  pairs,
 		schema:    in.publishedSchema(jt),
+		// The path's mergeclauses — its other equalities are joinqual.
+		MergeKeyCount: len(pairs),
 	}
 	assertPartialMergeJoinIsRunnable(p, j)
 	return j, in.publishedLayout(jt)
@@ -774,12 +870,11 @@ func assertPartialMergeJoinIsRunnable(p *Path, j *Join) {
 }
 
 // absorbMergeSort steps over a merge child's explicit `PathSort`, returning the
-// path whose node should actually be emitted. See `createMergeJoinPlan`'s doc for
-// why the sort is redundant.
+// path the side's node is built from; `restoreMergeSort` puts the Sort back on
+// once that node is narrowed. See `createMergeJoinPlan`'s doc.
 //
-// The step-over is ordering-neutral only because the join re-imposes an ordering
-// on this side itself, so the one thing checked is that the absorbed sort is not
-// asking for something the join will not deliver: goopg's merge comparator is
+// The one thing checked is that the sort is not asking for something the join
+// will not deliver: goopg's merge comparator is
 // ascending, NULL-keyed rows last. A descending `PathSort` under a merge join
 // means the producer expected the sort to survive — it would not — and the
 // resulting stream would be ordered the other way with nothing to notice.
@@ -801,6 +896,39 @@ func absorbMergeSort(child *Path, side string) *Path {
 		}
 	}
 	return child.Children[0]
+}
+
+// restoreMergeSort re-emits the explicit Sort a merge path chose for one side —
+// create_mergejoin_plan's make_sort over outersortkeys / innersortkeys
+// (createplan.c:4580-4650) — as a `*Sort` over the node built from the
+// absorbed path. PG prints that Sort (`Sort Key: v11.rnk` under TPC-DS Q44's
+// Merge Join), and as a CP_SMALL_TLIST consumer it is what keeps a subquery's
+// `Subquery Scan` below it.
+//
+// The node is built after the absorbed child and its narrowing, so the keys
+// translate onto the side's final layout; narrowMergeInput's keep set
+// already covers every sort-key column (mergeKeepCoversSortKeys), and
+// translateToLayout panics on a missing one. The merge operator still sorts
+// the side itself; on an input that arrives in its order it skips the sort
+// (mergeSortedSource.sortChunk), so the Sort node is the one that does the
+// work.
+func restoreMergeSort(child *Path, node Node, lay outputLayout) Node {
+	if child == nil || child.Kind != PathSort || node == nil {
+		return node
+	}
+	index := lay.bindingIndex()
+	keys := make([]SortKey, len(child.Pathkeys))
+	for i, pk := range child.Pathkeys {
+		if pk.Expr == nil {
+			panic(fmt.Sprintf("createPlan: PathMergeJoin sort pathkey %d has no expression", i))
+		}
+		keys[i] = SortKey{
+			Expr:       translateToLayout("merge sort key", pk.Expr, lay, index),
+			Desc:       !pk.SortAsc,
+			NullsFirst: pk.NullsFirst,
+		}
+	}
+	return &Sort{pos: node.Pos(), Child: node, Keys: keys}
 }
 
 // describePathKeyOrder names a pathkey's direction for a panic message.

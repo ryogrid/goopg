@@ -368,6 +368,10 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 	// same embedded-SQL path as GRANT/REVOKE above. M0134-0046.
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwSet:
 		return p.parseSQLStmt()
+	// GET [CURRENT | STACKED] DIAGNOSTICS … (pl_gram.y stmt_getdiag).
+	// M0146-0081.
+	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "get") && !p.identStartsAssignment():
+		return p.parseGetDiag()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start.
 		// Handle: ident := value (assignment)
@@ -639,6 +643,80 @@ func (p *bodyParser) parsePerform() (*PerformStmt, error) {
 	// as SQL by the runtime via Query.
 	if expr, perr := parser.ParseExpr(raw); perr == nil {
 		stmt.Expr = expr
+	}
+	return stmt, nil
+}
+
+// getDiagItems lists the GET DIAGNOSTICS items (pl_gram.y getdiag_item) and
+// whether each is a stacked-only (true) or current-only (false) item.
+// PG_CONTEXT is valid in both forms and is listed separately.
+var getDiagItems = map[string]bool{
+	"ROW_COUNT":            false,
+	"PG_ROUTINE_OID":       false,
+	"PG_EXCEPTION_CONTEXT": true,
+	"PG_EXCEPTION_DETAIL":  true,
+	"PG_EXCEPTION_HINT":    true,
+	"RETURNED_SQLSTATE":    true,
+	"COLUMN_NAME":          true,
+	"CONSTRAINT_NAME":      true,
+	"PG_DATATYPE_NAME":     true,
+	"MESSAGE_TEXT":         true,
+	"TABLE_NAME":           true,
+	"SCHEMA_NAME":          true,
+}
+
+// parseGetDiag parses `GET [CURRENT | STACKED] DIAGNOSTICS target {= | :=}
+// item [, …] ;` and checks each item against the area, as pl_gram.y's
+// stmt_getdiag does. M0146-0081.
+func (p *bodyParser) parseGetDiag() (*GetDiagStmt, error) {
+	getTok := p.advance() // consume GET
+	stmt := &GetDiagStmt{pos: getTok.Pos}
+	if t := p.cur(); t.Kind == parser.TokenIdent || t.Kind == parser.TokenKeyword {
+		switch strings.ToLower(t.Value) {
+		case "current":
+			p.advance()
+		case "stacked":
+			stmt.Stacked = true
+			p.advance()
+		}
+	}
+	if t := p.cur(); !strings.EqualFold(t.Value, "diagnostics") {
+		return nil, p.errAtCur("syntax error at or near %q", t.Value)
+	}
+	p.advance() // consume DIAGNOSTICS
+	for {
+		target := p.cur()
+		if target.Kind != parser.TokenIdent && target.Kind != parser.TokenKeyword {
+			return nil, p.errAtCur("syntax error at or near %q", target.Value)
+		}
+		p.advance()
+		if op := p.cur(); op.Value != "=" && op.Value != ":=" {
+			return nil, p.errAtCur("syntax error at or near %q", op.Value)
+		}
+		p.advance()
+		itemTok := p.cur()
+		item := strings.ToUpper(itemTok.Value)
+		stackedOnly, known := getDiagItems[item]
+		if item != "PG_CONTEXT" {
+			if !known || (itemTok.Kind != parser.TokenIdent && itemTok.Kind != parser.TokenKeyword) {
+				return nil, p.errAtCur("unrecognized GET DIAGNOSTICS item")
+			}
+			if stackedOnly && !stmt.Stacked {
+				return nil, p.errAt(getTok.Pos, "diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS", item)
+			}
+			if !stackedOnly && stmt.Stacked {
+				return nil, p.errAt(getTok.Pos, "diagnostics item %s is not allowed in GET STACKED DIAGNOSTICS", item)
+			}
+		}
+		p.advance()
+		stmt.Items = append(stmt.Items, GetDiagItem{Target: target.Value, Item: item})
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("syntax error at or near %q", p.cur().Value)
 	}
 	return stmt, nil
 }
@@ -1036,7 +1114,21 @@ func parseExprFromTokens(toks []parser.Token) (parser.Expr, error) {
 // executor binds the first result row to the named variable(s). M0118-0008.
 func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 	startPos := p.cur().Pos
-	isSelect := p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwSelect
+	// A WITH-led query takes the same PL/pgSQL INTO clause as a SELECT
+	// (`WITH x AS (…) SELECT count(*) INTO n FROM x`; pl_gram.y
+	// make_execsql_stmt recognises INTO in any command). Before M0146-0072
+	// only a leading SELECT did, so the INTO target was substituted as a
+	// variable and the statement failed `syntax error at or near "NULL"`.
+	first := p.cur()
+	isSelect := first.Kind == parser.TokenKeyword && (first.Keyword == parser.KwSelect || first.Keyword == parser.KwWith)
+	// INSERT / UPDATE / DELETE / MERGE take the INTO clause after their
+	// RETURNING list (`INSERT … RETURNING * INTO x`). The statement used to
+	// run as plain SQL with the INTO left in, so x was never bound
+	// (M0146-0080).
+	isDML := first.Kind == parser.TokenKeyword && (first.Keyword == parser.KwInsert ||
+		first.Keyword == parser.KwUpdate || first.Keyword == parser.KwDelete || first.Keyword == parser.KwMerge)
+	sawReturning := false
+	var prev parser.Token
 	depth := 0
 	intoByteStart := -1 // byte offset of the INTO token (once found)
 	targetsEndByte := -1
@@ -1048,8 +1140,17 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 			depth++
 		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
 			depth--
-		} else if isSelect && depth == 0 && intoByteStart < 0 &&
-			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto {
+		} else if isDML && depth == 0 && t.Kind == parser.TokenKeyword && t.Keyword == parser.KwReturning {
+			sawReturning = true
+			prev = t
+			p.advance()
+			continue
+		} else if (isSelect || (isDML && sawReturning)) && depth == 0 && intoByteStart < 0 &&
+			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto &&
+			// `INSERT INTO` / `MERGE INTO` inside a WITH-led command are the
+			// main grammar's INTO, not a variables clause (make_execsql_stmt
+			// skips INTO right after INSERT or MERGE).
+			!(prev.Kind == parser.TokenKeyword && (prev.Keyword == parser.KwInsert || prev.Keyword == parser.KwMerge)) {
 			// Top-level INTO clause: capture its byte span and parse the
 			// target variable list, then resume scanning for `;` from the
 			// token that ends the list (e.g. FROM).
@@ -1093,11 +1194,12 @@ func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 					targetsEndByte = endPos
 				}
 				query := strings.TrimSpace(p.src[startPos:intoByteStart] + " " + p.src[targetsEndByte:endPos])
-				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict}, nil
+				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict, DML: isDML}, nil
 			}
 			sql := strings.TrimSpace(p.src[startPos:endPos])
 			return &SQLStmt{pos: startPos, SQL: sql}, nil
 		}
+		prev = t
 		p.advance()
 	}
 	return nil, p.errAtCur("unterminated embedded SQL statement")
@@ -1296,7 +1398,9 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 	baseEndPos := endPos
 	// Array suffix: text[] — consume '[]' pairs from token stream but exclude
 	// from the source fed to the SQL type parser.
+	isArray := false
 	for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
+		isArray = true
 		p.advance() // '['
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "]" {
 			p.advance() // ']'
@@ -1314,7 +1418,13 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 	if !ok || len(ct.Columns) != 1 {
 		return parser.ColumnType{}, p.errAt(startPos, "type %q: parser produced unexpected shape", src)
 	}
-	return ct.Columns[0].Type, nil
+	typ := ct.Columns[0].Type
+	// The suffix is excluded from the parsed source, so the array-ness is
+	// recorded here. It was dropped, typing `a int[]` as int (M0146-0080).
+	if isArray {
+		typ.IsArray = true
+	}
+	return typ, nil
 }
 
 // scanExprToSemicolon scans tokens up to (but not including) the

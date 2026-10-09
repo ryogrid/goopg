@@ -1,0 +1,7 @@
+2d1
+< Q23     Sort rendering: Sort Key text differs
+13d11
+< Q49     Sort rendering: Sort Key text differs
+25,26d22
+< Q76     Partial HashAggregate rendering: Group Key text differs
+< Q76     Sort rendering: Sort Key text differs

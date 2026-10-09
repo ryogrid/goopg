@@ -1,0 +1,30 @@
+=== baseline Q5 (head)
+ Limit  (cost=14.23..15.73 rows=100 width=160)
+   ->  Sort  (cost=14.23..14.73 rows=199 width=160)
+         Sort Key: channel, id
+         ->  MixedAggregate  (cost=4.64..6.63 rows=199 width=160)
+               Hash Key: channel, id
+               Hash Key: channel
+               Group Key: ()
+               ->  Append  (cost=0.00..3.90 rows=99 width=160)
+                     ->  GroupAggregate  (cost=21874.66..21874.72 rows=6 width=160)
+=== candidate Q5 (head)
+ Limit  (cost=59251.63..59253.13 rows=100 width=160)
+   ->  Sort  (cost=59251.63..59252.13 rows=199 width=160)
+         Sort Key: channel, id
+         ->  MixedAggregate  (cost=59242.04..59244.03 rows=199 width=160)
+               Hash Key: channel, id
+               Hash Key: channel
+               Group Key: ()
+               ->  Append  (cost=21874.66..59241.30 rows=99 width=160)
+                     ->  GroupAggregate  (cost=21874.66..21874.72 rows=6 width=160)
+=== PG Q5 (head)
+ Limit  (cost=55166.85..55167.10 rows=100 width=160)
+   ->  Sort  (cost=55166.85..55167.35 rows=199 width=160)
+         Sort Key: ('store channel'::text), (('store'::text || (ssr.s_store_id)::text))
+         ->  MixedAggregate  (cost=21930.04..55159.25 rows=199 width=160)
+               Hash Key: ('store channel'::text), (('store'::text || (ssr.s_store_id)::text))
+               Hash Key: ('store channel'::text)
+               Group Key: ()
+               ->  Append  (cost=21930.04..55152.80 rows=99 width=160)
+                     ->  Subquery Scan on ssr  (cost=21930.04..21930.42 rows=6 width=160)

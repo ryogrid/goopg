@@ -67,11 +67,12 @@ func TestRewrapLeafDroppingRemovesConsumedConjuncts(t *testing.T) {
 	}
 }
 
-// An index-only path over a FILTERED leaf is admitted only when its
-// equality-prefix index clauses consume every local conjunct: a residual qual
-// would have to be re-evaluated over the narrowed schema, which the lowering
-// cannot express. M0145-0029 slice 3.
-func TestConsumingIndexClausesRequiresEveryConjunct(t *testing.T) {
+// An index-only path over a FILTERED leaf keeps every local conjunct its
+// equality prefix does not bind as the scan's Filter, as build_index_paths
+// leaves non-index quals in the qpqual — provided the residual reads only
+// covered columns (M0146-0019a; M0145-0029 slice 3 required every conjunct
+// consumed).
+func TestIndexOnlyResidualReadsCoveredColumnsOnly(t *testing.T) {
 	cat := saopFixture(t)
 	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "item"})
 	if !ok {
@@ -85,22 +86,24 @@ func TestConsumingIndexClausesRequiresEveryConjunct(t *testing.T) {
 	if composite == nil || pkey == nil {
 		t.Fatal("fixture indexes missing")
 	}
+	schema := make(Schema, len(tbl.Columns))
+	for i, c := range tbl.Columns {
+		schema[i] = SchemaColumn{Name: c.Name}
+	}
 	col := func(i int) *ColumnRef { return &ColumnRef{Index: i, Name: tbl.Columns[i].Name} }
 	eqSK := &BinaryOp{Op: parser.OpEq, Left: col(0), Right: &IntegerConst{Value: 2}}
-	eqFlag := &BinaryOp{Op: parser.OpEq, Left: col(2), Right: &IntegerConst{Value: 7}}
 	gtFlag := &BinaryOp{Op: parser.OpGt, Left: col(2), Right: &IntegerConst{Value: 7}}
 
-	if got := consumingIndexClauses(cat, tbl, composite, []Expr{eqFlag, eqSK}); len(got) != 2 {
-		t.Fatalf("both conjuncts bound by the composite: want 2 clauses, got %d", len(got))
+	if got := restrictionEqualityPrefix(cat, tbl, composite, []Expr{eqSK, gtFlag}); len(got) != 1 || got[0].local != Expr(eqSK) {
+		t.Fatalf("the composite binds i_item_sk = 2 only; got %d clauses", len(got))
 	}
-	if got := consumingIndexClauses(cat, tbl, pkey, []Expr{eqSK}); len(got) != 1 {
-		t.Fatalf("the single conjunct bound by the pkey: want 1 clause, got %d", len(got))
+	both, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
+	if !indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, both) {
+		t.Fatal("i_flag > 7 reads a covered column: want it kept as the Filter")
 	}
-	if got := consumingIndexClauses(cat, tbl, pkey, []Expr{eqSK, eqFlag}); got != nil {
-		t.Fatalf("i_flag = 7 is a residual on item_pkey; want nil, got %d clauses", len(got))
-	}
-	if got := consumingIndexClauses(cat, tbl, composite, []Expr{eqSK, gtFlag}); got != nil {
-		t.Fatalf("a range conjunct is not consumed by the equality prefix; want nil, got %d clauses", len(got))
+	skOnly, _ := indexCoversColumns(pkey, []catalog.Column{tbl.Columns[0]})
+	if indexOnlyResidualAdmissible([]Expr{gtFlag}, schema, skOnly) {
+		t.Fatal("i_flag is not in item_pkey: the residual cannot be evaluated over the narrowed row")
 	}
 }
 
@@ -132,9 +135,9 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 	rel := newRelOptInfo(1, 1000, 32)
 	rel.baseLeaf = leaf
 
-	clauses := consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf))
+	clauses := restrictionEqualityPrefix(cat, tbl, composite, extractFilterConjuncts(leaf))
 	if len(clauses) != 2 {
-		t.Fatalf("fixture: want 2 consuming clauses, got %d", len(clauses))
+		t.Fatalf("fixture: want 2 prefix clauses, got %d", len(clauses))
 	}
 	covered, _ := indexCoversColumns(composite, []catalog.Column{tbl.Columns[0], tbl.Columns[2]})
 	p := &Path{Kind: PathIndexScan, Rel: rel, IndexInfo: composite, IndexScanDir: ForwardScanDirection,
@@ -152,8 +155,8 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 	// key column — so the lowering is fed the prefix clauses directly.
 	leaf1 := &Filter{Child: &SeqScan{Table: tbl, schema: schema}, Predicate: eqSK, LeafLocal: true}
 	rel.baseLeaf = leaf1
-	if got := consumingIndexClauses(cat, tbl, composite, extractFilterConjuncts(leaf1)); got != nil {
-		t.Fatalf("a probe leaving nullable i_flag unbound must be declined, got %d clauses", len(got))
+	if indexUnboundKeysNotNull(tbl, composite, 1) {
+		t.Fatal("a probe leaving nullable i_flag unbound must be declined")
 	}
 	p.IndexClauses = restrictionEqualityPrefix(cat, tbl, composite, extractFilterConjuncts(leaf1))
 	if ios, ok := createIndexScanPlan(p).(*IndexOnlyScan); !ok || ios.Key == nil || ios.Keys != nil {
@@ -167,6 +170,11 @@ func TestIndexOnlyScanPlanCarriesIndexQuals(t *testing.T) {
 // `const op col` is flipped to canonical form) — and, on a single-column
 // index, with both bounds dropped from the reinstated Filter (PG's qpqual
 // excludes quals redundant with the index quals).
+//
+// M0146-0061: with no column statistics (default range-band selectivity, 500
+// of 100k rows on 10000 pages) PG 18.3 elects a Bitmap Heap Scan over the same
+// bounds (VACUUMed table, cost 13.42..1649.51). The default settings now give
+// that bitmap probe; the IndexScan lowering is checked with bitmap scans off.
 func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 
 	c := saopFixture(t)
@@ -186,8 +194,19 @@ func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 		{"SELECT i_item_id FROM item WHERE 5 >= i_item_sk AND 2 <= i_item_sk", parser.OpGe, parser.OpLe, 2, 5},
 		{"SELECT i_item_id FROM item WHERE i_item_sk BETWEEN 2 AND 5", parser.OpGe, parser.OpLe, 2, 5},
 	}
+	noBitmap := DefaultPlannerSettings()
+	noBitmap.EnableBitmapScan = false
 	for _, tc := range cases {
-		node, err := Plan(parseOne(t, tc.sql), c)
+		if def, err := Plan(parseOne(t, tc.sql), c); err != nil {
+			t.Fatalf("%s: Plan: %v", tc.sql, err)
+		} else if bis := findRangeBitmapIndexScan(def); bis == nil {
+			t.Fatalf("%s: want PG's range Bitmap Index Scan, got root %T", tc.sql, def)
+		} else if lo, ok := bis.LowKey.(*IntegerConst); !ok || lo.Value != tc.lowVal || bis.LowOp != tc.lowOp {
+			t.Fatalf("%s: bitmap low bound %v/%v, want %d/%v", tc.sql, bis.LowKey, bis.LowOp, tc.lowVal, tc.lowOp)
+		} else if hi, ok := bis.HighKey.(*IntegerConst); !ok || hi.Value != tc.hiVal || bis.HighOp != tc.highOp {
+			t.Fatalf("%s: bitmap high bound %v/%v, want %d/%v", tc.sql, bis.HighKey, bis.HighOp, tc.hiVal, tc.highOp)
+		}
+		node, err := PlanWithSettings(parseOne(t, tc.sql), c, noBitmap)
 		if err != nil {
 			t.Fatalf("%s: Plan: %v", tc.sql, err)
 		}
@@ -212,6 +231,31 @@ func TestRestrictionRangeIndexScanOnJointreePipeline(t *testing.T) {
 			t.Fatalf("%s: a composite-index range must keep its bounds as a Filter recheck", tc.sql)
 		}
 	}
+}
+
+// findRangeBitmapIndexScan returns the range-bounded BitmapIndexScan under a
+// Bitmap Heap Scan reached through Project/Filter/Sort/Limit, or nil.
+func findRangeBitmapIndexScan(n Node) *BitmapIndexScan {
+	for n != nil {
+		switch v := n.(type) {
+		case *BitmapHeapScan:
+			if bis, ok := v.Outer.(*BitmapIndexScan); ok && (bis.LowKey != nil || bis.HighKey != nil) {
+				return bis
+			}
+			return nil
+		case *Filter:
+			n = v.Child
+		case *Project:
+			n = v.Child
+		case *Sort:
+			n = v.Child
+		case *Limit:
+			n = v.Child
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // findFilterOver returns the *Filter whose child is scan, or nil.

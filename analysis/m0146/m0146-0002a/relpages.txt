@@ -1,0 +1,17 @@
+== goopg (:5533 clone of :65433) ==
+ customer |     3575 |       150000
+ lineitem |   115293 | 6.001988e+06
+ orders   |    26545 |      1.5e+06
+ part     |     3809 |       200000
+ partsupp |    18029 |       800000
+ supplier |      212 |        10000
+
+
+== PG 18.3 (:65432) ==
+ customer |     3662 |      150000
+ lineitem |   129346 | 5.99899e+06
+ orders   |    27814 |     1.5e+06
+ part     |     4199 |      200000
+ partsupp |    18047 |      800000
+ supplier |      225 |       10000
+

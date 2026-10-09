@@ -1,0 +1,88 @@
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 30000
+INSERT 0 30000
+INSERT 0 300
+ANALYZE
+ANALYZE
+ANALYZE
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+            QUERY PLAN            
+----------------------------------
+ HashAggregate
+   Group Key: d.m
+   ->  Hash Join
+         Hash Cond: (s1.k = d.k)
+         ->  Append
+               ->  Seq Scan on s1
+               ->  Seq Scan on s2
+         ->  Hash
+               ->  Seq Scan on d
+(9 rows)
+
+SET
+                      QUERY PLAN                       
+-------------------------------------------------------
+ HashAggregate
+   Group Key: d2.m
+   ->  Hash Join
+         Hash Cond: ("*SELECT* 1".dk = d2.k)
+         ->  Append
+               ->  Subquery Scan on "*SELECT* 1"
+                     ->  Hash Join
+                           Hash Cond: (s1.k = d.k)
+                           ->  Seq Scan on s1
+                           ->  Hash
+                                 ->  Seq Scan on d
+                                       Filter: (m = 3)
+               ->  Subquery Scan on "*SELECT* 2"
+                     ->  Hash Join
+                           Hash Cond: (s2.k = d_1.k)
+                           ->  Seq Scan on s2
+                           ->  Hash
+                                 ->  Seq Scan on d d_1
+                                       Filter: (m = 3)
+         ->  Hash
+               ->  Seq Scan on d d2
+(21 rows)
+
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Subquery Scan on w
+   ->  WindowAgg
+         Window: w1 AS (ORDER BY in_web.ratio ROWS UNBOUNDED PRECEDING)
+         Run Condition: (rank() OVER w1 <= 10)
+         ->  Sort
+               Sort Key: in_web.ratio
+               ->  Subquery Scan on in_web
+                     ->  HashAggregate
+                           Group Key: s1.k
+                           ->  Seq Scan on s1
+(10 rows)
+

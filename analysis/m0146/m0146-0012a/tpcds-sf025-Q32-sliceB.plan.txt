@@ -1,0 +1,33 @@
+===== Q32 =====
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=15752.54..15752.56 rows=1 width=32)
+   ->  Aggregate  (cost=15752.54..15752.56 rows=1 width=32)
+         ->  Hash Join  (cost=4517.40..15752.54 rows=1 width=56)
+               Hash Cond: (catalog_sales.cs_item_sk = item.i_item_sk)
+               Join Filter: (catalog_sales.cs_ext_discount_amt > (SubPlan 1))
+               SubPlan 1
+                 ->  Aggregate  (cost=363.60..363.62 rows=1 width=32)
+                       ->  Nested Loop  (cost=16.75..363.60 rows=1 width=460)
+                             ->  Bitmap Heap Scan on catalog_sales catalog_sales_1  (cost=8.49..93.57 rows=22 width=556)
+                                   Recheck Cond: (cs_item_sk = item.i_item_sk)
+                                   ->  Bitmap Index Scan on catalog_sales_pkey  (cost=0.38..8.49 rows=22 width=556)
+                                         Index Cond: (cs_item_sk = item.i_item_sk)
+                             ->  Bitmap Heap Scan on date_dim date_dim_1  (cost=8.26..12.27 rows=1 width=420)
+                                   Recheck Cond: (d_date_sk = catalog_sales_1.cs_sold_date_sk)
+                                   Filter: ((d_date >= '2001-03-09'::date) AND (d_date <= '2001-06-07 00:00:00'::timestamp without time zone))
+                                   ->  Bitmap Index Scan on date_dim_pkey  (cost=0.25..8.26 rows=1 width=420)
+                                         Index Cond: (d_date_sk = catalog_sales_1.cs_sold_date_sk)
+               ->  Gather  (cost=3050.20..13920.57 rows=436 width=48)
+                     Workers Planned: 3
+                     ->  Parallel Hash Join  (cost=2050.20..12876.97 rows=141 width=48)
+                           Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                           ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=116257 width=556)
+                           ->  Parallel Hash  (cost=2049.55..2049.55 rows=52 width=420)
+                                 ->  Parallel Seq Scan on date_dim  (cost=0.00..2049.55 rows=52 width=420)
+                                       Filter: ((d_date >= '2001-03-09'::date) AND (d_date <= '2001-06-07 00:00:00'::timestamp without time zone))
+               ->  Hash  (cost=1467.00..1467.00 rows=16 width=480)
+                     ->  Seq Scan on item  (cost=0.00..1467.00 rows=16 width=480)
+                           Filter: (i_manufact_id = 722)
+(28 rows)
+

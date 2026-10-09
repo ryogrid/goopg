@@ -1,0 +1,17 @@
+Q10  base=  1.90 mult1=  0.74 x0.39 faster
+Q11  base=  0.15 mult1=  0.25 x1.67 
+Q12  base=  2.47 mult1=  1.96 x0.79 faster
+Q17  base=  6.84 mult1=  7.89 x1.15 REGRESS
+Q18  base=  4.78 mult1=  4.80 x1.00 
+Q19  base=  0.11 mult1=  0.11 x1.00 
+Q2   base=  0.19 mult1=  0.18 x0.95 
+Q20  base=  0.41 mult1=  0.12 x0.29 
+Q21  base=  1.88 mult1=  2.09 x1.11 
+Q22  base=  0.21 mult1=  0.23 x1.10 
+Q3   base=  3.10 mult1=  2.56 x0.83 faster
+Q4   base=  0.57 mult1=  0.52 x0.91 
+Q5   base=  0.98 mult1=  0.86 x0.88 
+Q7   base=  1.44 mult1=  1.35 x0.94 
+Q8   base=  0.60 mult1=  0.58 x0.97 
+Q9   base=  1.59 mult1=  1.23 x0.77 faster
+total base=27.22 mult1=25.47

@@ -80,7 +80,7 @@ func queueDeferredExclusionCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 			IndexName:   idx.Name,
 			ExclusionOp: "=",
 			Key:         append([]byte(nil), key...),
-			Detail:      buildExclusionConstraintDetail(idx, cols, row),
+			Detail:      buildExclusionConstraintDetail(ctx, idx, cols, row),
 		})
 	case "&&":
 		boxStr, ok := exclusionBoxValue(idx, cols, row)

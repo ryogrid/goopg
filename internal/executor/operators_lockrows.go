@@ -1748,6 +1748,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, false, err
 	}
+	clearVMAllFrozenForLock(o.ctx, slot)
 	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
@@ -1809,6 +1810,7 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, err
 	}
+	clearVMAllFrozenForLock(o.ctx, slot)
 	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
@@ -2251,6 +2253,7 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 	// multixact state is transient — the holders' transactions do not survive a
 	// crash — so losing it on recovery is correct. WAL persistence of multixact
 	// members is deferred (see docs/design/0118-0002). M0118-0003.
+	clearVMAllFrozenForLock(o.ctx, slot)
 	o.ctx.Pool.MarkDirtyUnlogged(slot, "multixact lock stamp: transient in-memory membership, no WAL record (0118-0002)")
 	return ptr, true, nil
 }
@@ -2334,6 +2337,7 @@ func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemP
 	// process-shared state, marked dirty without a logical heap-lock record (the
 	// record carries a single xid + strength and cannot describe a multi). WAL
 	// persistence of multixact members is deferred (docs/design/0118-0002).
+	clearVMAllFrozenForLock(o.ctx, slot)
 	o.ctx.Pool.MarkDirtyUnlogged(slot, "multixact lock stamp: transient in-memory membership, no WAL record (0118-0002)")
 	return ptr, true, nil
 }
@@ -2591,7 +2595,21 @@ func (o *lockRowsOp) lockSuccessorVersion(slot *storage.Slot, rel storage.RelFil
 	if err := storage.PageSetHeapTupleLockKeysUpdated(slot.Page(), ptr.Offset, o.lockKeysUpdated); err != nil {
 		return err
 	}
+	clearVMAllFrozenForLock(o.ctx, slot)
 	return markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
+}
+
+// clearVMAllFrozenForLock is heap_lock_tuple's visibility-map step: a row lock
+// stamps a locker xmax VACUUM must later freeze away, so the page loses
+// ALL_FROZEN; it stays ALL_VISIBLE, since every tuple on it is still visible to
+// all (heapam.c clears VISIBILITYMAP_ALL_FROZEN alone). Without it, VACUUM's
+// all-frozen skip passes over the locker xmax. M0146-0063b.
+func clearVMAllFrozenForLock(ctx *Context, slot *storage.Slot) {
+	if ctx == nil || ctx.VM == nil || slot == nil {
+		return
+	}
+	tag := slot.Tag()
+	ctx.VM.ClearAllFrozen(tag.Rel, tag.Block)
 }
 
 // markHeapLockDirty centralises the choice between

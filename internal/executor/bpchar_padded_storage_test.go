@@ -383,3 +383,152 @@ func TestBpcharConcatOperatorStripsOnBothEvaluators(t *testing.T) {
 		})
 	}
 }
+
+// TestBpcharComparisonOperandsMatchPG pins the blank-insensitive bpchar
+// comparison rule on BOTH evaluator twins (interpreted evalExprSlot and
+// compiled evalFastExpr) — the scalar-evaluator twin of the btree's
+// PGCompareBpcharC. Before this fix, the M0143-0007b padded-storage flip
+// left goopg byte-comparing the padding, so `c = 'Javier'` on a char(10)
+// column silently returned 0 rows — the defect that made the TPC-DS
+// SF0.25 sweep run red on every `char(n) = <literal>` filter.
+//
+// Measured on PG 18.3 (TPC-DS reference cluster):
+//
+//	char(10) = 'Javier'          t   literal resolves to bpchar
+//	char(10) = 'Javier   '       t   bare literal coerced, blanks ignored
+//	char(20) = 'Javier'::text    t   bpchar->text rtrim1, then texteq
+//	char(10) = 'Javier   '::text f   the TEXT side keeps its padding
+//	text     = 'Javier   '       f   no bpchar operand → byte-exact
+//	'Javier   '::text = char(10) f   asymmetry survives the swap
+//	char(10) < 'Javier1'         t   ordering uses the same bcTruelen
+//	char(10) IN ('Javier','X')   t   element equality, same rule
+//	char(10) IN ('Javier   ')    t   bare literal item → bpchar
+//	char(10) IN ('Javier   '::text) f
+//	CASE c WHEN 'Javier' …       hit simple-CASE operand equality
+func TestBpcharComparisonOperandsMatchPG(t *testing.T) {
+	bpcharCol := &optimizer.ColumnRef{
+		Index: 0, Name: "c",
+		Type: catalog.Type{Name: "char", Args: []int64{10}},
+	}
+	textCol := &optimizer.ColumnRef{
+		Index: 1, Name: "t",
+		Type: catalog.Type{Name: "text"},
+	}
+	char20Lit := &optimizer.CastExpr{
+		Operand:    &optimizer.StringConst{Value: "Javier"},
+		TargetType: "char", Typmod: 20,
+	}
+	// c = a padded char(10) 'Javier'; t = a text value that genuinely
+	// ends in three spaces.
+	row := Row{NewStringDatum("Javier   "), NewStringDatum("Javier   ")}
+
+	cases := []struct {
+		name string
+		expr optimizer.Expr
+		want bool
+	}{
+		{"bpchar col = bare literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: bpcharCol,
+			Right: &optimizer.StringConst{Value: "Javier"}}, true},
+		{"bpchar col = padded bare literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: bpcharCol,
+			Right: &optimizer.StringConst{Value: "Javier   "}}, true},
+		{"bpchar col = text cast literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: bpcharCol,
+			Right: &optimizer.CastExpr{Operand: &optimizer.StringConst{Value: "Javier"}, TargetType: "text"}}, true},
+		{"bpchar col = padded text cast literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: bpcharCol,
+			Right: &optimizer.CastExpr{Operand: &optimizer.StringConst{Value: "Javier   "}, TargetType: "text"}}, false},
+		{"text col = padded literal keeps spaces", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: textCol,
+			Right: &optimizer.StringConst{Value: "Javier   "}}, true},
+		{"text col = trimmed literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: textCol,
+			Right: &optimizer.StringConst{Value: "Javier"}}, false},
+		{"padded text = bpchar col (asymmetry)", &optimizer.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &optimizer.CastExpr{Operand: &optimizer.StringConst{Value: "Javier   "}, TargetType: "text"},
+			Right: bpcharCol}, false},
+		{"bpchar cast literal = bare literal", &optimizer.BinaryOp{
+			Op: parser.OpEq, Left: char20Lit,
+			Right: &optimizer.StringConst{Value: "Javier"}}, true},
+		{"bpchar ordering", &optimizer.BinaryOp{
+			Op: parser.OpLt, Left: bpcharCol,
+			Right: &optimizer.StringConst{Value: "Javier1"}}, true},
+		{"bpchar col <> bare literal", &optimizer.BinaryOp{
+			Op: parser.OpNe, Left: bpcharCol,
+			Right: &optimizer.StringConst{Value: "Javier"}}, false},
+		{"bpchar col >= bare literal", &optimizer.BinaryOp{
+			Op: parser.OpGe, Left: bpcharCol,
+			Right: &optimizer.StringConst{Value: "Javier"}}, true},
+		{"bpchar IN bare literals", &optimizer.InExpr{
+			Operand: bpcharCol,
+			List: []optimizer.Expr{
+				&optimizer.StringConst{Value: "Javier"},
+				&optimizer.StringConst{Value: "X"}}}, true},
+		{"bpchar IN padded bare literal", &optimizer.InExpr{
+			Operand: bpcharCol,
+			List:    []optimizer.Expr{&optimizer.StringConst{Value: "Javier   "}}}, true},
+		{"bpchar IN padded text literal", &optimizer.InExpr{
+			Operand: bpcharCol,
+			List: []optimizer.Expr{
+				&optimizer.CastExpr{Operand: &optimizer.StringConst{Value: "Javier   "}, TargetType: "text"}}}, false},
+		{"bpchar NOT IN misses", &optimizer.InExpr{
+			Operand: bpcharCol, Negated: true,
+			List: []optimizer.Expr{
+				&optimizer.StringConst{Value: "Ana"},
+				&optimizer.StringConst{Value: "X"}}}, true},
+		{"simple CASE on bpchar operand", &optimizer.CaseExpr{
+			Operand: bpcharCol,
+			Whens: []optimizer.CaseWhen{{
+				When: &optimizer.StringConst{Value: "Javier"},
+				Then: &optimizer.IntegerConst{Value: 1}}},
+			Else: &optimizer.IntegerConst{Value: 0}}, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			slot := SlotFromRow(nil, row)
+			got, err := evalExprSlot(c.expr, slot, nil)
+			if err != nil {
+				t.Fatalf("interpreted: %v", err)
+			}
+			// The CASE case returns the THEN/ELSE integer rather than a
+			// bool — normalise both to the bool expectation.
+			var gotBool bool
+			switch got.Kind {
+			case KindBool:
+				gotBool = got.BoolValue()
+			case KindInt:
+				gotBool = got.Int != 0
+			default:
+				t.Fatalf("interpreted kind %v, want bool/int", got.Kind)
+			}
+			if gotBool != c.want {
+				t.Errorf("interpreted = %v, want %v (PG 18.3)", gotBool, c.want)
+			}
+
+			var slab exprTreeSlab
+			idx := slab.buildExpr(c.expr)
+			fast, err := evalFastExpr(slab, idx, slot, nil)
+			if err != nil {
+				t.Fatalf("compiled: %v", err)
+			}
+			var fastBool bool
+			switch fast.Kind {
+			case KindBool:
+				fastBool = fast.BoolValue()
+			case KindInt:
+				fastBool = fast.Int != 0
+			default:
+				t.Fatalf("compiled kind %v, want bool/int", fast.Kind)
+			}
+			if fastBool != c.want {
+				t.Errorf("compiled = %v, want %v (PG 18.3) — the compiled twin "+
+					"reads the declared width and literal flag from the node "+
+					"payload; if only this half fails, they were not compiled in",
+					fastBool, c.want)
+			}
+		})
+	}
+}

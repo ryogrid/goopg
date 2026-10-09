@@ -64,10 +64,14 @@ func TestExplainHavingFilterExpandsAggOutput(t *testing.T) {
 	// Arm A (both halves) + Arm B compose in one Filter line. The
 	// binary-op arg carries its own parens from the BinaryOp arm, so the
 	// expansion is byte-identical to PG's `sum((…))` shape.
-	if !strings.Contains(joined, "Filter: (sum((r65h.supplycost * r65h.availqty)) > (InitPlan 1).col1)") {
+	// PG 18.3 coerces the int operand to numeric and shows it
+	// (`(r65h.availqty)::numeric`, M0146-0005cu), and casts the bigint
+	// InitPlan result the same way (`((InitPlan 1).col1)::numeric`,
+	// M0146-0005cv).
+	if !strings.Contains(joined, "Filter: (sum((r65h.supplycost * (r65h.availqty)::numeric)) > ((InitPlan 1).col1)::numeric)") {
 		t.Errorf("expected expanded Filter with .col1; got:\n%s", joined)
 	}
-	if !strings.Contains(joined, "Sort Key: (sum((r65h.supplycost * r65h.availqty))) DESC") {
+	if !strings.Contains(joined, "Sort Key: (sum((r65h.supplycost * (r65h.availqty)::numeric))) DESC") {
 		t.Errorf("expected expanded Sort Key; got:\n%s", joined)
 	}
 	assertNoOpaqueExpr(t, joined)
@@ -77,6 +81,10 @@ func TestExplainInitPlanValueRendersCol1(t *testing.T) {
 	ctx, cleanup := explainSubPlanFixture(t)
 	defer cleanup()
 
+	// t2.b has no index, so planagg's MIN/MAX rewrite has no presorted
+	// path and does not fire (M0146-0005du): the sublink is the only
+	// InitPlan. PG 18.3 prints exactly `Filter: (b > (InitPlan 1).col1)`
+	// over `InitPlan 1 -> Aggregate -> Seq Scan on t2`.
 	plan, _ := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE t1.b > (SELECT max(t2.b) FROM t2)")
 	if !strings.Contains(plan, "(InitPlan 1).col1") {

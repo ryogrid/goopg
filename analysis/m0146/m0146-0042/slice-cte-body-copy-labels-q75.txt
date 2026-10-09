@@ -1,0 +1,66 @@
+# M0146-0042 slice: unprinted CTE body copy claims no labels (code f894f0c27)
+# fire-set captures tmp/fireset-m42i (baseline = 070dc92e4, candidate = staged change)
+
+## diagnosis: instrumented binary on the SF0.25 dataset (private port 5533), Q75 label claims per item RTID
+rtid=4/8/12 each claimed by TWO SeqScan nodes: walk paths ...>CTEScan(curr_yr)>body copy 1 and ...>CTEScan(prev_yr)>body copy 2
+
+## sf025
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=25 scan-type=29 parameterisation=26 aggregation-strategy=8 sort-strategy=26 parallelism=29 qual-placement=11 rendering=10
+## sf1
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=53 join-method=21 scan-type=36 parameterisation=32 aggregation-strategy=15 sort-strategy=28 parallelism=42 qual-placement=11 rendering=11
+
+sf025 text-identical 40 -> 40
+  Q14 diff-lines vs PG 128 -> 116 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 6 -> 2 
+  Q86 diff-lines vs PG 2 -> 2 
+sf1 text-identical 31 -> 31
+  Q14 diff-lines vs PG 160 -> 148 
+  Q36 diff-lines vs PG 2 -> 2 
+  Q70 diff-lines vs PG 2 -> 2 
+  Q75 diff-lines vs PG 20 -> 20 
+  Q86 diff-lines vs PG 2 -> 2 
+
+===== sf025 Q14
+-    ->  Parallel Seq Scan on store_sales store_sales_4
++ PG ->  Parallel Seq Scan on store_sales store_sales_2
+-    ->  Parallel Seq Scan on catalog_sales catalog_sales_4
++ PG ->  Parallel Seq Scan on catalog_sales catalog_sales_2
+-    ->  Parallel Seq Scan on web_sales web_sales_4
++ PG ->  Parallel Seq Scan on web_sales web_sales_2
+-    ->  Parallel Seq Scan on store_sales store_sales_4
++ PG ->  Parallel Seq Scan on store_sales store_sales_3
+- PG ->  Parallel Seq Scan on catalog_sales catalog_sales_2
++ PG ->  Parallel Seq Scan on catalog_sales catalog_sales_1
+- PG ->  Parallel Seq Scan on web_sales web_sales_2
++ PG ->  Parallel Seq Scan on web_sales web_sales_1
+===== sf025 Q75
+- PG ->  Parallel Seq Scan on item item_2
++ PG ->  Parallel Seq Scan on item item_1
+-    ->  Parallel Seq Scan on item item_4
++ PG ->  Parallel Seq Scan on item item_2
+===== sf1 Q14
+-    ->  Parallel Seq Scan on store_sales store_sales_4
++ PG ->  Parallel Seq Scan on store_sales store_sales_2
+-    ->  Parallel Seq Scan on catalog_sales catalog_sales_4
++ PG ->  Parallel Seq Scan on catalog_sales catalog_sales_2
+-    ->  Parallel Seq Scan on web_sales web_sales_4
++ PG ->  Parallel Seq Scan on web_sales web_sales_2
+-    ->  Parallel Seq Scan on store_sales store_sales_4
++ PG ->  Parallel Seq Scan on store_sales store_sales_3
+- PG ->  Parallel Seq Scan on catalog_sales catalog_sales_2
++ PG ->  Parallel Seq Scan on catalog_sales catalog_sales_1
+- PG ->  Parallel Seq Scan on web_sales web_sales_2
++ PG ->  Parallel Seq Scan on web_sales web_sales_1
+===== sf1 Q75
+-    ->  Seq Scan on item item_2
++    ->  Seq Scan on item item_1
+-    ->  Seq Scan on item item_4
++    ->  Seq Scan on item item_2

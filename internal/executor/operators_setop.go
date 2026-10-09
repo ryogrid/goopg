@@ -59,7 +59,26 @@ type setOp struct {
 	mergeLive [2]bool
 	mergeInit bool
 	mergeErr  error
-	ctx       *Context
+	// mergeKeySlot presents a transferred row and its input slot's tid to
+	// the merge-key evaluation (M0146-0052); scratch, reused per row.
+	mergeKeySlot MaterializedSlot
+	ctx          *Context
+
+	// sorted is the SETOP_SORTED form of INTERSECT / EXCEPT (M0146-0005q):
+	// both inputs arrive sorted on plan.MergeKeys and are merged group by
+	// group. pendingRow / pendingN are the current group's output copies.
+	sorted     bool
+	pendingRow Row
+	pendingN   int
+
+	// lTrims / rTrims mark bpchar columns on each input's rows: dedup keys
+	// (rowKeyTrimmed) must hash the bcTruelen image so a char(20) 'x' from
+	// one arm and a char(5) 'x' from the other are the same row — PG's
+	// set-op dedup runs under the result column's hashbpchar. A column is
+	// trimmed when either the arm's declared type or the set-op output
+	// type is bpchar. M0146 bpchar hash parity.
+	lTrims []bool
+	rTrims []bool
 }
 
 func newSetOp(p *optimizer.SetOp, left, right Operator) *setOp {
@@ -91,7 +110,15 @@ func (o *setOp) Open(ctx *Context) error {
 		return err
 	}
 	o.opened = true
+	o.ctx = ctx
 	if o.streaming {
+		return nil
+	}
+	o.sorted = len(o.plan.MergeKeys) > 0 &&
+		(o.plan.Op == parser.SetOpIntersect || o.plan.Op == parser.SetOpExcept)
+	if o.sorted {
+		o.mergeInit = false
+		o.pendingN = 0
 		return nil
 	}
 	if err := o.computeBuffered(); err != nil {
@@ -120,6 +147,9 @@ func (o *setOp) Next() (TupleSlot, error) {
 	}
 	if o.streaming {
 		return o.nextStreaming()
+	}
+	if o.sorted {
+		return o.nextSorted()
 	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -191,9 +221,15 @@ func (o *setOp) mergeAdvance(side int) error {
 		return err
 	}
 	row := transferRowForQueue(slot)
+	// The keys are evaluated on the transferred (owned) row — they are
+	// retained across the input's next Next — presented with the input
+	// slot's carried tid, so a `ctid` key does not read NULL (M0146-0052).
+	keyView := &o.mergeKeySlot
+	keyView.row = row
+	slotQueueTID(slot).stamp(keyView)
 	keys := make([]Datum, len(o.plan.MergeKeys))
 	for i, k := range o.plan.MergeKeys {
-		v, kerr := evalSortKeyValue(k.Expr, row, o.ctx)
+		v, kerr := evalSortKeyValueSlot(k.Expr, keyView, o.ctx)
 		if kerr != nil {
 			return kerr
 		}
@@ -260,11 +296,31 @@ func (o *setOp) nextStreaming() (TupleSlot, error) {
 // computeBuffered drains both children and materialises the output rows for
 // every non-UNION-ALL variant.
 func (o *setOp) computeBuffered() error {
-	leftRows, _, err := drainSetOpInput(o.left)
+	o.lTrims = bpcharSchemaTrims(o.left.Schema())
+	o.rTrims = bpcharSchemaTrims(o.right.Schema())
+	// The result column type decides too: when the resolved output is
+	// bpchar, every arm's column dedups under bpchareq regardless of the
+	// arm's own declared type.
+	if out := bpcharSchemaTrims(o.plan.Output()); out != nil {
+		merge := func(t []bool) []bool {
+			if len(t) < len(out) {
+				nt := make([]bool, len(out))
+				copy(nt, t)
+				t = nt
+			}
+			for i, b := range out {
+				t[i] = t[i] || b
+			}
+			return t
+		}
+		o.lTrims = merge(o.lTrims)
+		o.rTrims = merge(o.rTrims)
+	}
+	leftRows, _, err := drainSetOpInput(o.left, o.lTrims)
 	if err != nil {
 		return err
 	}
-	rightRows, rightCount, err := drainSetOpInput(o.right)
+	rightRows, rightCount, err := drainSetOpInput(o.right, o.rTrims)
 	if err != nil {
 		return err
 	}
@@ -285,7 +341,7 @@ func (o *setOp) computeBuffered() error {
 func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 	seen := make(map[string]struct{})
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -293,7 +349,7 @@ func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 		o.rows = append(o.rows, r)
 	}
 	for _, r := range rightRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.rTrims)
 		if _, dup := seen[k]; dup {
 			continue
 		}
@@ -307,7 +363,7 @@ func (o *setOp) computeUnionDistinct(leftRows, rightRows []Row) {
 func (o *setOp) computeIntersect(leftRows []Row, rightCount map[string]int) {
 	emitted := make(map[string]int)
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		rc := rightCount[k]
 		if rc == 0 {
 			continue
@@ -330,7 +386,7 @@ func (o *setOp) computeIntersect(leftRows []Row, rightCount map[string]int) {
 func (o *setOp) computeExcept(leftRows []Row, rightCount map[string]int) {
 	emitted := make(map[string]int)
 	for _, r := range leftRows {
-		k := rowKey(r)
+		k := rowKeyTrimmed(r, nil, o.lTrims)
 		rc := rightCount[k]
 		if o.plan.All {
 			// Each of the first rc left occurrences is cancelled.
@@ -355,7 +411,7 @@ func (o *setOp) computeExcept(leftRows []Row, rightCount map[string]int) {
 
 // drainSetOpInput fully consumes an operator, returning the cloned rows in
 // order plus a multiset count keyed by rowKey.
-func drainSetOpInput(op Operator) ([]Row, map[string]int, error) {
+func drainSetOpInput(op Operator, trims []bool) ([]Row, map[string]int, error) {
 	var rows []Row
 	counts := make(map[string]int)
 	for {
@@ -371,7 +427,7 @@ func drainSetOpInput(op Operator) ([]Row, map[string]int, error) {
 		}
 		owned := cloneRow(slot.Row())
 		rows = append(rows, owned)
-		counts[rowKey(owned)]++
+		counts[rowKeyTrimmed(owned, nil, trims)]++
 	}
 	return rows, counts, nil
 }
@@ -394,4 +450,79 @@ func (o *setOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
 		return src.currentTID()
 	}
 	return storage.RelFileNode{}, storage.ItemPointer{}, false
+}
+
+// nextSorted is nodeSetOp.c's sorted mode for INTERSECT / EXCEPT: both inputs
+// are sorted on plan.MergeKeys (every column), so each distinct left row is a
+// run of equal left rows; the matching right run is found by advancing the
+// right side past smaller keys. The group then emits, per SetOpCmd:
+//
+//	INTERSECT      1 if both runs are non-empty
+//	INTERSECT ALL  min(nLeft, nRight)
+//	EXCEPT         1 if the right run is empty
+//	EXCEPT ALL     max(nLeft - nRight, 0)
+//
+// Right-only groups never emit. NULLs compare equal, as set operations
+// require, because mergeKeysLess orders two NULLs as equal.
+func (o *setOp) nextSorted() (TupleSlot, error) {
+	if !o.mergeInit {
+		o.mergeInit = true
+		for side := 0; side < 2; side++ {
+			if err := o.mergeAdvance(side); err != nil {
+				return nil, err
+			}
+		}
+	}
+	keys := o.plan.MergeKeys
+	less := func(a, b []Datum) bool {
+		return mergeKeysLess(keys, a, b, &o.mergeErr)
+	}
+	for {
+		if o.pendingN > 0 {
+			o.pendingN--
+			return SlotFromRow(o.plan.Output(), o.pendingRow), nil
+		}
+		if !o.mergeLive[0] {
+			return nil, EOF
+		}
+		row, gkeys := o.mergeCur[0], o.mergeKeys[0]
+		nLeft := 0
+		for o.mergeLive[0] && !less(gkeys, o.mergeKeys[0]) && !less(o.mergeKeys[0], gkeys) {
+			nLeft++
+			if err := o.mergeAdvance(0); err != nil {
+				return nil, err
+			}
+		}
+		for o.mergeLive[1] && less(o.mergeKeys[1], gkeys) {
+			if err := o.mergeAdvance(1); err != nil {
+				return nil, err
+			}
+		}
+		nRight := 0
+		for o.mergeLive[1] && !less(gkeys, o.mergeKeys[1]) && !less(o.mergeKeys[1], gkeys) {
+			nRight++
+			if err := o.mergeAdvance(1); err != nil {
+				return nil, err
+			}
+		}
+		if o.mergeErr != nil {
+			return nil, o.mergeErr
+		}
+		n := 0
+		switch {
+		case o.plan.Op == parser.SetOpIntersect && o.plan.All:
+			n = min(nLeft, nRight)
+		case o.plan.Op == parser.SetOpIntersect:
+			if nLeft > 0 && nRight > 0 {
+				n = 1
+			}
+		case o.plan.All:
+			n = max(nLeft-nRight, 0)
+		default:
+			if nRight == 0 {
+				n = 1
+			}
+		}
+		o.pendingRow, o.pendingN = row, n
+	}
 }

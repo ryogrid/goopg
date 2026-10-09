@@ -108,6 +108,12 @@ into a result or into a different error; it cannot alter a successful evaluation
 
 ### Known limitation (deferred, see the ledger)
 
+> **Resolved for expressions by M0146-0072 (2026-10-06):** both SQL paths now
+> bind the frame's variables into the parser tree before planning
+> (`bindPlpgsqlFrameVarsInExpr`, expression positions only, typed literals).
+> See `m0146-0072-plpgsql-vars-in-sublinks-and-with.md`. Embedded statements
+> still use the text substitution described in §"The second root cause".
+
 `evalExprViaSQL` plans the raw parser expression with **no PL/pgSQL frame-variable
 substitution** — exactly the pre-existing limitation of `evalScalarSubquery`, which
 also plans `sq.Inner` untouched. So `IF EXISTS(SELECT … WHERE key > i)` where `i`

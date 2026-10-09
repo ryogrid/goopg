@@ -1,0 +1,16 @@
+# M0146-0005bb census (tmp/fireset-0005bb)
+sf025 baseline match=24 CATEGORIES-EXCL-MATCH: join-order=59 join-method=35 scan-type=39 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=36 qual-placement=14 rendering=21
+sf025 candidate match=25 CATEGORIES-EXCL-MATCH: join-order=58 join-method=34 scan-type=39 parameterisation=33 aggregation-strategy=23 sort-strategy=39 parallelism=37 qual-placement=14 rendering=20
+< Q75 depth=2 [join-method] under Sort: PG Hash Join Inner | goopg Merge Join Inner
+< Q76 depth=1 [aggregation-strategy] under Limit: PG Finalize GroupAggregate | goopg GroupAggregate
+> Q75 MATCH (no structural divergence)
+> Q76 depth=6 [join-method] under Append: PG Parallel Hash Join Inner | goopg Nested Loop Inner
+sf1 baseline match=21 CATEGORIES-EXCL-MATCH: join-order=65 join-method=34 scan-type=44 parameterisation=40 aggregation-strategy=25 sort-strategy=42 parallelism=48 qual-placement=11 rendering=19
+sf1 candidate match=21 CATEGORIES-EXCL-MATCH: join-order=64 join-method=32 scan-type=44 parameterisation=40 aggregation-strategy=24 sort-strategy=42 parallelism=49 qual-placement=11 rendering=19
+< Q76 depth=1 [aggregation-strategy] under Limit: PG Finalize GroupAggregate | goopg GroupAggregate
+> Q76 depth=6 [join-method] under Append: PG Parallel Hash Join Inner | goopg Nested Loop Inner
+FIRE-SET-TIMEOUTS: fires=Q38 Q75 Q76 Q87 introduced=none unchanged=none missing=none
+TPC-H census: DIVERGENCE-CLASSES: queries=22 match=11 divergent=11 D1-sublink=1 D2-unionall=0 D3-partialpath=5 D4-upperrel=0 D5-narrowing=0 D6-cte=0 jointree-search=5 verdict=0 (class-identical to 0005ba)
+Q75 all_sales group estimate: before 124831 (goopg) vs PG 12155; the per-relation clamp gives rows/10
+first attempt also clamped partition expansions (partition_aggregate.sql moved 2 plans); fixed by setOpExpandsTableHierarchy (members under the appendrel Project) -> partition_aggregate 0-line delta
+sweep 96/96; acceptance 24 MATCH; spotcheck PASS; regress (aggregates groupingsets union subselect with join partition_aggregate inherit): join.sql 4-worker-Gather row-order flap only

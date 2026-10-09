@@ -1,0 +1,16 @@
+TPC-DS Q87 arm 1 (select distinct c_last_name, c_first_name, d_date ...
+d_month_seq between 1202 and 1213), goopg DISTINCT candidates (debug trace,
+scratch build, not committed):
+
+eq_selec off (HEAD): in=3256 hashed=19598.37..19630.93 unique=19772.06..19812.76
+  -> totals 0.93% apart, inside add_path's 1% fuzz; the Unique survives on
+     pathkeys and is elected, so the sorted SetOp saw two presorted arms.
+eq_selec on:         in=3548 hashed=19659.86..19695.34 unique=19851.33..19895.68
+  -> 1.02% apart; hashed dominates, the arm elects HashAggregate and the
+     sorted SetOp was no longer offered (Q38/Q87 fell to HashSetOp).
+
+PG keeps both arm paths (the Unique for its pathkeys) and
+generate_nonunion_paths takes get_cheapest_path_for_pathkeys for the sorted
+SetOp. sortedSetOpArm rebuilds that Unique for a hashed DISTINCT arm; the
+sorted SetOp then ties the hashed one on total within the fuzz and dominates
+it on startup and pathkeys, as in PG.

@@ -64,8 +64,14 @@ func estimateSubplanCostPerCall(n Node) int64 {
 	case *NestedLoopIndexJoin:
 		l := estimateSubplanCostPerCall(x.Outer)
 		var r int64
-		if is, ok := x.Inner.(*IndexScan); ok {
+		switch is := x.Inner.(type) {
+		case *IndexScan:
 			r = indexProbeMatchSet(is)
+		case *IndexOnlyScan:
+			// M0146-0005bq: a parameterised probe may be index-only.
+			if is != nil && is.Table != nil && is.Index != nil {
+				r = matchSetByColumnName(is.Table, firstIndexColumn(is.Index))
+			}
 		}
 		if l <= 0 || r <= 0 {
 			return 0
@@ -122,4 +128,79 @@ func matchSetByColumnName(tbl *catalog.Table, col string) int64 {
 		return ms
 	}
 	return 0
+}
+
+// subPlanJoinQualOps is the SubPlan part of cost_qual_eval for one join
+// qual, in cpu_operator_cost units: cost_subplan's per-evaluation charge
+// (subPlanCostOps) for every correlated sublink at this scope. M0146-0012a slice B: a
+// correlated SubPlan in a join clause re-runs per evaluation, so the nested
+// loop that evaluates TPC-H Q17's clause on every inner row pays ~5,940 calls
+// where PG's inner-unique hash join pays 10 (cost_qual_eval_walker's SubPlan
+// arm). Sublink bodies are other scopes and are not entered.
+func subPlanJoinQualOps(e Expr) float64 {
+	ops := 0.0
+	walkExprRefs(e, scopeSignal, exprVisitor{Visit: func(x Expr) bool {
+		if plans := ExprSubplans(x); len(plans) == 1 {
+			kind, lowered := sublinkExpr, false
+			if h := handleFor(x); h != nil {
+				lowered = len(h.params()) > 0
+			}
+			// Correlated sublinks only. An uncorrelated ANY is a hashed
+			// SubPlan in PG (build_subplan sets useHashTable; cost_subplan
+			// charges it once at startup, nothing per tuple), which
+			// subPlanCostOps does not model — it prices the plain form
+			// (ledgered). Charging that per joined tuple moved TPC-DS Q45's
+			// `OR i_item_id IN (…)` join above its Gather Merge.
+			if !lowered && !planHasOuterRef(plans[0]) {
+				return true
+			}
+			if _, isExists := x.(*ExistsExpr); isExists {
+				kind = sublinkExists
+			} else if in, isIn := x.(*InExpr); isIn && in.Plan != nil {
+				kind = sublinkAnyAll
+			}
+			_, p := subPlanCostOps(plans[0], kind, lowered)
+			ops += p
+		}
+		return true
+	}})
+	return ops
+}
+
+// joinQualPerTuple is `qp_qual_cost.per_tuple` for a join's residual quals:
+// cost_qual_eval over each conjunct — every operator and function it
+// evaluates (qualEvalOpsPriced), not one per conjunct (M0146-0118) — plus
+// each conjunct's SubPlan per-evaluation cost (subPlanJoinQualOps).
+func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
+	per := 0.0
+	for _, ri := range quals {
+		if ri != nil {
+			_, ops := qualEvalOpsPriced(ri.clause, false)
+			per += cp.cpuOperatorCost * (ops + subPlanJoinQualOps(ri.clause))
+		}
+	}
+	return per
+}
+
+// hashClausesPerTuple is final_cost_hashjoin's `hash_qual_cost.per_tuple`:
+// cost_qual_eval (qualEvalOps) over the hash clauses. A plain `a = b` costs
+// one cpu_operator_cost; an expression key adds its own operators.
+func hashClausesPerTuple(cp costParams, keys []*restrictInfo) float64 {
+	per := 0.0
+	for _, ri := range keys {
+		if ri != nil {
+			_, p := qualEvalOps(ri.clause)
+			per += p
+		}
+	}
+	return cp.cpuOperatorCost * per
+}
+
+// joinQualEvalCost is qualEvalCost for a join's residual restrictInfos,
+// including the SubPlans' per-evaluation cost.
+func joinQualEvalCost(cp costParams, quals []*restrictInfo, tuples float64) float64 {
+	if len(quals) == 0 || !(tuples > 0) {
+		return 0
+	}
+	return joinQualPerTuple(cp, quals) * tuples
 }

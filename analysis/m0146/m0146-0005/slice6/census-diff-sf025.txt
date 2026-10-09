@@ -1,0 +1,10 @@
+27c27
+< Q31 depth=3 [join-method] under HashAggregate: PG Hash Join Inner | goopg Nested Loop Inner
+---
+> Q31 depth=1 [join-method] under Sort: PG Nested Loop Inner | goopg Merge Join Inner
+43c43
+< Q48 depth=1 [parallelism] under Aggregate: PG Gather | goopg Nested Loop Inner
+---
+> Q48 depth=2 [qual-placement] under Gather: PG Nested Loop Inner | goopg Nested Loop Inner
+90d89
+< Q96 depth=6 [join-order] under Nested Loop: PG Hash Join Inner | goopg Hash Join Inner

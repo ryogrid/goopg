@@ -119,6 +119,7 @@ func TestGuardScalarUnderORStaysSubPlan(t *testing.T) {
 }
 
 func TestGuardTopLevelScalarStillUnnests(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x > (SELECT sum(z) FROM t2 WHERE y = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)
@@ -168,6 +169,7 @@ func TestGuardCoalescedAggregateStaysSubPlan(t *testing.T) {
 // depends on: `0.5 * sum(...)` stays NULL when sum is NULL, so the Project
 // wrapper must not block the rewrite.
 func TestGuardArithmeticOverAggregateStillUnnests(t *testing.T) {
+	enableScalarUnnestForTest(t)
 	cat := twoTablesCatalog(t)
 	sql := "SELECT x FROM t1 WHERE x > (SELECT 2 * sum(z) FROM t2 WHERE y = t1.x)"
 	node, err := Plan(parseOne(t, sql), cat)

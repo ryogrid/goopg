@@ -1,0 +1,56 @@
+M0146-0015c slice 4 — translateToLayout pass-through for surviving OuterColumnRefs
+Measured on a throwaway cluster 127.0.0.1:5533 (goopg-s4 scope), goopg built from the
+staged index; schema jtp_o(k,tag) jtp_i(j,v) jtp_i2(j2,w).
+Data: jtp_o {(1,one),(2,two),(3,three),(7,seven)}; jtp_i {(1,10),(1,20),(2,30),(9,90)};
+jtp_i2 {(1,10),(1,11),(2,20),(3,30),(11,99)}.
+
+== composite escaping ref (was: createPlan panic, pre-slice-4) ==
+explain select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k
+  and exists (select 1 from jtp_i2 b where b.j2 = a.v + k));
+ Hash Semi Join  (cost=60.85..449.48 rows=318 width=36)
+   Hash Cond: (jtp_o.k = a.j)
+   Join Filter: (EXISTS(SubPlan 1))
+   SubPlan 1
+     ->  Seq Scan on jtp_i2 b  (cost=0.00..22.71 rows=11 width=8)
+           Filter: (j2 = (a.v + jtp_o.k))
+   ->  Seq Scan on jtp_o  (cost=0.00..22.70 rows=1270 width=36)
+   ->  Seq Scan on jtp_i a  (cost=0.00..32.60 rows=2260 width=8)
+rows: tag=one  (k=1: a.v+k = 11 matches j2=11)  [correct]
+
+== emitting-scope-only inner EXISTS — PG's j->larg stacking ==
+explain select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k
+  and exists (select 1 from jtp_i2 b where b.j2 = k));
+ Hash Semi Join  (cost=60.85..529.17 rows=317 width=44)
+   Hash Cond: (jtp_o.k = j2)
+   ->  Hash Semi Join  (cost=60.85..451.85 rows=635 width=36)
+         Hash Cond: (jtp_o.k = a.j)
+         ->  Seq Scan on jtp_o  (cost=0.00..22.70 rows=1270 width=36)
+         ->  Seq Scan on jtp_i a  (cost=0.00..32.60 rows=2260 width=8)
+   ->  Seq Scan on jtp_i2 b  (cost=0.00..22.60 rows=2260 width=8)
+rows: tag={one,two}  (k=1: a.j=1 and j2=1 exist; k=2: a.j=2 and j2=2 exist)  [correct]
+
+== parent-body-only inner EXISTS — PG's j->rarg nesting ==
+explain select tag from jtp_o where exists (select 1 from jtp_i a where a.j = k
+  and exists (select 1 from jtp_i2 b where b.j2 = a.v));
+ Hash Semi Join  (cost=762.98..974.59 rows=635 width=36)
+   Hash Cond: (jtp_o.k = a.j)
+   ->  Seq Scan on jtp_o  (cost=0.00..22.70 rows=1270 width=36)
+   ->  Hash Semi Join  (cost=60.85..748.85 rows=1130 width=8)
+         Hash Cond: (a.v = b.j2)
+         ->  Seq Scan on jtp_i a  (cost=0.00..32.60 rows=2260 width=8)
+         ->  Seq Scan on jtp_i2 b  (cost=0.00..22.60 rows=2260 width=8)
+rows: {}  (no a.v in {10,20,30,90} equals any j2)  [correct]
+
+== correlated scalar subplan with outer ref in a two-leaf join clause ==
+explain select k, (select a.j + b.j2 from jtp_i a, jtp_i2 b where a.j = b.j2 + k) from jtp_o;
+ Seq Scan on jtp_o  (cost=0.00..22.70 rows=1270 width=36)
+   SubPlan 1
+     ->  Merge Join  (cost=317.01..594.99 rows=25538 width=8)
+           Merge Cond: (a.j = (b.j2 + jtp_o.k))
+           Join Filter: (a.j = (b.j2 + jtp_o.k))
+           ->  Seq Scan on jtp_i a  (cost=0.00..32.60 rows=2260 width=8)
+           ->  Seq Scan on jtp_i2 b  (cost=0.00..32.60 rows=2260 width=8)
+rows: k=7 -> 11  (a.j=9, b.j2=2 -> 9+2)  [correct]
+      k=3 -> NULL (no match -> scalar subquery NULL)  [correct]
+      multi-match case -> ERROR: more than one row returned by a subquery used as an
+      expression  [PG-identical semantics]

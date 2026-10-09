@@ -1,0 +1,160 @@
+ s_store_sk | s_store_name | k 
+------------+--------------+---
+          1 | ought        | 1
+          1 | ought        | 2
+          2 | able         | 1
+          2 | able         | 2
+          3 | able         | 1
+          3 | able         | 2
+(6 rows)
+
+ s_store_sk | s_store_name | k 
+------------+--------------+---
+          1 | ought        | 1
+          1 | ought        | 2
+          2 | able         | 1
+          2 | able         | 2
+          3 | able         | 1
+          3 | able         | 2
+(6 rows)
+
+     y     | k 
+-----------+---
+ (1,ought) | 1
+ (2,able)  | 1
+ (1,ought) | 2
+ (2,able)  | 2
+(4 rows)
+
+   n   | count 
+-------+-------
+ able  |     2
+ anti  |     1
+ ation |     1
+ bar   |     1
+ cally |     1
+ eing  |     2
+ ese   |     1
+ ought |     3
+(8 rows)
+
+psql:tmp/m0028-edge.sql:5: ERROR:  column reference "s_store_sk" is ambiguous
+LINE 1: select s_store_sk from (select s_store_sk from store) y, (se...
+               ^
+ s_store_sk 
+------------
+          1
+          2
+(2 rows)
+
+psql:tmp/m0028-edge.sql:7: ERROR:  column "s_store_name" does not exist
+LINE 1: select s_store_name from (select s_store_sk k from store) y,...
+               ^
+psql:tmp/m0028-edge.sql:8: ERROR:  missing FROM-clause entry for table "store"
+LINE 1: select store.s_store_sk from (select s_store_sk from store) ...
+               ^
+ k | count 
+---+-------
+ 1 |     1
+ 2 |     1
+ 3 |     1
+ 4 |     1
+(4 rows)
+
+ k  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+ 11
+ 12
+(12 rows)
+
+ k |                                                  s                                                   
+---+------------------------------------------------------------------------------------------------------
+ 1 | Package was damaged                                                                                 
+ 2 | Stopped working                                                                                     
+(2 rows)
+
+ k2 
+----
+  1
+  2
+(2 rows)
+
+ s_store_sk | s_store_name | r_reason_sk |   r_reason_id    |                                            r_reason_desc                                             
+------------+--------------+-------------+------------------+------------------------------------------------------------------------------------------------------
+          1 | ought        |           3 | AAAAAAAADAAAAAAA | Did not get it on time                                                                              
+          2 | able         |           3 | AAAAAAAADAAAAAAA | Did not get it on time                                                                              
+          3 | able         |           3 | AAAAAAAADAAAAAAA | Did not get it on time                                                                              
+          1 | ought        |           2 | AAAAAAAACAAAAAAA | Stopped working                                                                                     
+          2 | able         |           2 | AAAAAAAACAAAAAAA | Stopped working                                                                                     
+          3 | able         |           2 | AAAAAAAACAAAAAAA | Stopped working                                                                                     
+          1 | ought        |           1 | AAAAAAAABAAAAAAA | Package was damaged                                                                                 
+          2 | able         |           1 | AAAAAAAABAAAAAAA | Package was damaged                                                                                 
+          3 | able         |           1 | AAAAAAAABAAAAAAA | Package was damaged                                                                                 
+(9 rows)
+
+ s_store_sk | s_store_name | k 
+------------+--------------+---
+          1 | ought        | 3
+          2 | able         | 3
+          3 | able         | 3
+          1 | ought        | 2
+          2 | able         | 2
+          3 | able         | 2
+          1 | ought        | 1
+          2 | able         | 1
+          3 | able         | 1
+(9 rows)
+
+   n   | k 
+-------+---
+ able  | 2
+ anti  | 2
+ ation | 2
+ bar   | 2
+ cally | 2
+ eing  | 2
+ ese   | 2
+ ought | 2
+ able  | 1
+ anti  | 1
+ ation | 1
+ bar   | 1
+ cally | 1
+ eing  | 1
+ ese   | 1
+ ought | 1
+(16 rows)
+
+   n   | count 
+-------+-------
+ able  |     2
+ anti  |     1
+ ation |     1
+ bar   |     1
+ cally |     1
+ eing  |     2
+ ese   |     1
+ ought |     3
+(8 rows)
+
+ r_reason_sk |                                            r_reason_desc                                             |   r_reason_id    |                                            r_reason_desc                                             | s_store_sk |    s_store_id    | s_rec_start_date | s_rec_end_date | s_closed_date_sk | s_store_name | s_number_employees | s_floor_space |       s_hours        |  s_manager   | s_market_id | s_geography_class |                      s_market_desc                       | s_market_manager | s_division_id | s_division_name | s_company_id | s_company_name | s_street_number | s_street_name |  s_street_type  | s_suite_number | s_city |     s_county      | s_state |   s_zip    |   s_country   | s_gmt_offset | s_tax_precentage 
+-------------+------------------------------------------------------------------------------------------------------+------------------+------------------------------------------------------------------------------------------------------+------------+------------------+------------------+----------------+------------------+--------------+--------------------+---------------+----------------------+--------------+-------------+-------------------+----------------------------------------------------------+------------------+---------------+-----------------+--------------+----------------+-----------------+---------------+-----------------+----------------+--------+-------------------+---------+------------+---------------+--------------+------------------
+           1 | Package was damaged                                                                                  | AAAAAAAABAAAAAAA | Package was damaged                                                                                  |          1 | AAAAAAAABAAAAAAA | 1997-03-13       |                |          2451189 | ought        |                245 |       5250760 | 8AM-4PM              | William Ward |           2 | Unknown           | Enough high areas stop expectations. Elaborate, local is | Charles Bartley  |             1 | Unknown         |            1 | Unknown        | 767             | Spring        | Wy              | Suite 250      | Midway | Williamson County | TN      | 31904      | United States |        -5.00 |             0.03
+           2 | Stopped working                                                                                      | AAAAAAAACAAAAAAA | Stopped working                                                                                      |          1 | AAAAAAAABAAAAAAA | 1997-03-13       |                |          2451189 | ought        |                245 |       5250760 | 8AM-4PM              | William Ward |           2 | Unknown           | Enough high areas stop expectations. Elaborate, local is | Charles Bartley  |             1 | Unknown         |            1 | Unknown        | 767             | Spring        | Wy              | Suite 250      | Midway | Williamson County | TN      | 31904      | United States |        -5.00 |             0.03
+(2 rows)
+
+ count 
+-------
+ 14495
+(1 row)
+

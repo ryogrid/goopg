@@ -1,0 +1,229 @@
+diff --git a/internal/optimizer/joinpathsmerge.go b/internal/optimizer/joinpathsmerge.go
+index e07f5ee1c..d98209e73 100644
+--- a/internal/optimizer/joinpathsmerge.go
++++ b/internal/optimizer/joinpathsmerge.go
+@@ -419,7 +419,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids
+ 	// The residual is evaluated on the tuples that already matched on the
+ 	// merge keys — that is `mergeTuples`, which is what the comment here always
+ 	// said and what the code now passes.
+-	cost.Total += qualEvalCost(cp, len(residual), mergeTuples)
++	cost.Total += joinQualEvalCost(cp, residual, mergeTuples)
+ 
+ 	addPath(joinrel, &Path{
+ 		Kind:          PathMergeJoin,
+diff --git a/internal/optimizer/joinpathsnli.go b/internal/optimizer/joinpathsnli.go
+index 94b6c03e7..64e9690ad 100644
+--- a/internal/optimizer/joinpathsnli.go
++++ b/internal/optimizer/joinpathsnli.go
+@@ -602,11 +602,11 @@ func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi
+ 		// M0145-0008l: final_cost_nestloop's SEMI/ANTI branch. A
+ 		// parameterised index probe that enforces every join clause makes an
+ 		// unmatched outer row an empty probe (has_indexed_join_quals).
+-		cost = nestloopCostSemiAnti(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
+-			semi, hasIndexedJoinQuals(in, residual), len(residual))
++		cost = nestloopCostSemiAntiQual(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart,
++			semi, hasIndexedJoinQuals(in, residual), joinQualPerTuple(cp, residual))
+ 	} else {
+ 		cost = nestloopCost(cp, o.Cost, in.Cost, o.Rows, in.Rows, rsStart, matRescan+rsStart)
+-		cost.Total += qualEvalCost(cp, len(residual), o.Rows*in.Rows)
++		cost.Total += joinQualEvalCost(cp, residual, o.Rows*in.Rows)
+ 	}
+ 	cost.Total += matBuild
+ 	return cost
+diff --git a/internal/optimizer/joinpathsparallel.go b/internal/optimizer/joinpathsparallel.go
+index ba1fc2b46..e9b381ce8 100644
+--- a/internal/optimizer/joinpathsparallel.go
++++ b/internal/optimizer/joinpathsparallel.go
+@@ -256,7 +256,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
+ 	// The residual rides the join's OUTPUT cardinality, which for a partial
+ 	// path is the per-worker one — the same rule addHashJoinPath applies to the
+ 	// serial figure.
+-	cost.Total += qualEvalCost(cp, len(residual), rows)
++	cost.Total += joinQualEvalCost(cp, residual, rows)
+ 
+ 	addPartialPath(joinrel, &Path{
+ 		Kind:          PathHashJoin,
+@@ -471,7 +471,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
+ 	// The residual rides the join's OUTPUT cardinality, which for a partial
+ 	// path is the per-worker one — the same rule the serial twin and the
+ 	// hash twin apply.
+-	cost.Total += qualEvalCost(cp, len(residual), rows)
++	cost.Total += joinQualEvalCost(cp, residual, rows)
+ 
+ 	addPartialPath(joinrel, &Path{
+ 		Kind:          PathMergeJoin,
+@@ -597,7 +597,7 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
+ 		innerRowsTotal:   innerTotal,
+ 		parallelWorkers:  o.ParallelWorkers,
+ 	})
+-	cost.Total += qualEvalCost(cp, len(residual), rows)
++	cost.Total += joinQualEvalCost(cp, residual, rows)
+ 
+ 	addPartialPath(joinrel, &Path{
+ 		Kind:          PathHashJoin,
+diff --git a/internal/optimizer/nestloop_semianti.go b/internal/optimizer/nestloop_semianti.go
+index deee75f39..b5d909939 100644
+--- a/internal/optimizer/nestloop_semianti.go
++++ b/internal/optimizer/nestloop_semianti.go
+@@ -92,6 +92,17 @@ func (s *searchCtx) semiAntiJoinFactorsFor(outer, inner *RelOptInfo, jt parser.J
+ // top: this function charges it. The Material build (`matBuild`) stays the
+ // caller's, exactly as around `nestloopCost`.
+ func nestloopCostSemiAnti(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64, f semiAntiJoinFactors, indexed bool, numQuals int) Cost {
++	if numQuals < 0 {
++		numQuals = 0
++	}
++	return nestloopCostSemiAntiQual(cp, outer, inner, outerRows, innerRows, innerRescanStartup, innerRescanTotal, f, indexed,
++		cp.cpuOperatorCost*float64(numQuals))
++}
++
++// nestloopCostSemiAntiQual is nestloopCostSemiAnti with the join quals' cost
++// given per tuple — PG's qp_qual_cost.per_tuple — so a correlated SubPlan in a
++// qual is charged at its per-evaluation cost (joinQualPerTuple, M0146-0005).
++func nestloopCostSemiAntiQual(cp costParams, outer, inner Cost, outerRows, innerRows, innerRescanStartup, innerRescanTotal float64, f semiAntiJoinFactors, indexed bool, qualPerTuple float64) Cost {
+ 	startup := outer.Startup + inner.Startup
+ 	run := outer.Total - outer.Startup
+ 	// initial_cost_nestloop charges the rescan STARTUP for every rescan
+@@ -129,10 +140,10 @@ func nestloopCostSemiAnti(cp costParams, outer, inner Cost, outerRows, innerRows
+ 			run += unmatched * innerRescanRun
+ 		}
+ 	}
+-	if numQuals < 0 {
+-		numQuals = 0
++	if qualPerTuple < 0 {
++		qualPerTuple = 0
+ 	}
+-	run += (cp.cpuTupleCost + cp.cpuOperatorCost*float64(numQuals)) * ntuples
++	run += (cp.cpuTupleCost + qualPerTuple) * ntuples
+ 	return Cost{Startup: startup, Total: startup + run}
+ }
+ 
+diff --git a/internal/optimizer/pathgen.go b/internal/optimizer/pathgen.go
+index ba4cfabef..ce70ed143 100644
+--- a/internal/optimizer/pathgen.go
++++ b/internal/optimizer/pathgen.go
+@@ -122,7 +122,7 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
+ 	// The residual is evaluated only on tuples that already matched on the
+ 	// keys, so it rides the join's OUTPUT cardinality (PG charges qpqual on
+ 	// `hashjointuples`, costsize.c:4432).
+-	cost.Total += qualEvalCost(cp, len(residual), joinRel.Rows)
++	cost.Total += joinQualEvalCost(cp, residual, joinRel.Rows)
+ 	addPath(joinRel, &Path{
+ 		Kind: PathHashJoin,
+ 		// C-03b: the join this path performs, decided by `addPathsToJoinrel`
+@@ -193,10 +193,10 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
+ 		// M0145-0008l: SEMI/ANTI stop at the first inner match
+ 		// (final_cost_nestloop's semi/anti branch). An unparameterised inner
+ 		// is never "indexed", so an unmatched outer row scans it all.
+-		cost = nestloopCostSemiAnti(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, len(quals))
++		cost = nestloopCostSemiAntiQual(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan, semi, false, joinQualPerTuple(cp, quals))
+ 	} else {
+ 		cost = nestloopCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, 0, matRescan)
+-		cost.Total += qualEvalCost(cp, len(quals), o.Rows*i.Rows)
++		cost.Total += joinQualEvalCost(cp, quals, o.Rows*i.Rows)
+ 	}
+ 	cost.Total += matBuild
+ 	addPath(joinRel, &Path{
+diff --git a/internal/optimizer/subplan_cost.go b/internal/optimizer/subplan_cost.go
+index f9fca5e6c..6c3cc44c4 100644
+--- a/internal/optimizer/subplan_cost.go
++++ b/internal/optimizer/subplan_cost.go
+@@ -123,3 +123,99 @@ func matchSetByColumnName(tbl *catalog.Table, col string) int64 {
+ 	}
+ 	return 0
+ }
++
++// subPlanQualPerTuple is the per-evaluation cost `cost_qual_eval` charges for
++// the SubPlans in one qual expression (costsize.c cost_qual_eval_walker's
++// SubPlan arm, with the numbers `cost_subplan` stored on the node):
++//
++//   - a CORRELATED sublink re-runs per evaluation and re-pays its startup
++//     (its parParam is non-empty, so "pay the startup cost every time"):
++//     EXPR/ARRAY charge the plan's run cost, EXISTS the run cost for one row
++//     (run / rows), ANY/ALL half the run plus half the rows at
++//     cpu_operator_cost — each plus the plan's startup cost;
++//   - an UNCORRELATED sublink is an InitPlan (EXPR/EXISTS/ARRAY) or a hashed
++//     SubPlan (ANY/ALL) in PG: evaluated once, so nothing per tuple.
++//
++// The sublink's plan cost is read with legacyDisplayCostOf — the search's
++// numbers where the node carries them, else the same derivation EXPLAIN
++// renders — from under a non-isolated Project, which PG folds into the plan
++// below it. Nested sublinks inside the SubPlan's own plan are that plan's
++// business and are not descended into (M0146-0005 slice 3: TPC-H Q17's
++// correlated `l_quantity < (SELECT 0.2 * avg(...))` made a nested loop that
++// runs it ~5,940 times look cheaper than PG's hash join, which runs it 10).
++func subPlanQualPerTuple(cp costParams, e Expr) float64 {
++	total := 0.0
++	walkExprRefs(e, scopeSignal, exprVisitor{Visit: func(n Expr) bool {
++		if x, ok := n.(*SubqueryExpr); ok && !sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam) {
++			total += correlatedSubPlanCallCost(cp, x.Plan, sublinkExpr)
++		}
++		if x, ok := n.(*ArraySubqueryExpr); ok && x.Plan != nil && !x.IsNonCorrelated && planHasOuterRef(x.Plan) {
++			total += correlatedSubPlanCallCost(cp, x.Plan, sublinkExpr)
++		}
++		if x, ok := n.(*ExistsExpr); ok && !sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam) {
++			total += correlatedSubPlanCallCost(cp, x.Plan, sublinkExists)
++		}
++		if x, ok := n.(*InExpr); ok && x.Plan != nil && !sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam) {
++			total += correlatedSubPlanCallCost(cp, x.Plan, sublinkAnyAll)
++		}
++		return true
++	}})
++	return total
++}
++
++type sublinkCostKind int
++
++const (
++	sublinkExpr sublinkCostKind = iota
++	sublinkExists
++	sublinkAnyAll
++)
++
++// correlatedSubPlanCallCost is cost_subplan's non-hashed arm for a correlated
++// SubPlan: the per-call cost including the re-paid startup.
++func correlatedSubPlanCallCost(cp costParams, plan Node, kind sublinkCostKind) float64 {
++	if plan == nil {
++		return 0
++	}
++	if p, ok := plan.(*Project); ok && !p.IsolatedScope && p.Child != nil {
++		plan = p.Child
++	}
++	pc := legacyDisplayCostOf(plan)
++	run := pc.TotalCost - pc.StartupCost
++	if run < 0 {
++		run = 0
++	}
++	rows := clampRowEst(pc.PlanRows)
++	var perCall float64
++	switch kind {
++	case sublinkExists:
++		perCall = run / rows
++	case sublinkAnyAll:
++		perCall = 0.50*run + 0.50*pc.PlanRows*cp.cpuOperatorCost
++	default:
++		perCall = run
++	}
++	return perCall + pc.StartupCost
++}
++
++// joinQualPerTuple is `qp_qual_cost.per_tuple` for a join's residual quals:
++// goopg's flat cpu_operator_cost per conjunct plus the correlated SubPlans'
++// per-evaluation cost.
++func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
++	per := cp.cpuOperatorCost * float64(len(quals))
++	for _, ri := range quals {
++		if ri != nil {
++			per += subPlanQualPerTuple(cp, ri.clause)
++		}
++	}
++	return per
++}
++
++// joinQualEvalCost is qualEvalCost for a join's residual restrictInfos,
++// including the correlated SubPlans' per-evaluation cost.
++func joinQualEvalCost(cp costParams, quals []*restrictInfo, tuples float64) float64 {
++	if len(quals) == 0 || !(tuples > 0) {
++		return 0
++	}
++	return joinQualPerTuple(cp, quals) * tuples
++}

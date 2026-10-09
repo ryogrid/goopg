@@ -1,0 +1,4 @@
+65c65
+< Q65 depth=2 [join-method] under Sort: PG Nested Loop Inner | goopg Merge Join Inner
+---
+> Q65 depth=3 [qual-placement] under Nested Loop: PG Merge Join Inner | goopg Merge Join Inner

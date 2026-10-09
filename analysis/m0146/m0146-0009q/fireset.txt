@@ -1,0 +1,11 @@
+FIRE-SET: baseline=c9f2f1a00f7abe0d4677aff6d28c226c28a6a691 (014f39972134) candidate=worktree (109fc151c85b)
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=26 scan-type=29 parameterisation=26 aggregation-strategy=11 sort-strategy=26 parallelism=29 qual-placement=11 rendering=11
+PLAN-PARITY: queries=99 match=42 shapediff=54 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=49 join-method=26 scan-type=29 parameterisation=26 aggregation-strategy=11 sort-strategy=26 parallelism=29 qual-placement=11 rendering=11
+FIRE-SET: corpus=tpcds-sf025 fires=none (plan A/B had no changed query)
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=55 join-method=24 scan-type=36 parameterisation=32 aggregation-strategy=19 sort-strategy=28 parallelism=45 qual-placement=11 rendering=13
+PLAN-PARITY: queries=99 match=33 shapediff=63 unparsed=0 missingnode=0 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=55 join-method=24 scan-type=36 parameterisation=33 aggregation-strategy=19 sort-strategy=28 parallelism=44 qual-placement=10 rendering=12
+FIRE-SET-TIMEOUTS: fires=Q44 Q59 introduced=none unchanged=none missing=none

@@ -68,6 +68,9 @@ const maxSearchRels = 32
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.
 type searchCtx struct {
+	// orClauseSelDivisor: see joinlistProblem.orClauseSelDivisor.
+	orClauseSelDivisor map[Expr]float64
+
 	// joinrels is PG's `root->join_rel_level`: `joinrels[lev]` holds every
 	// RelOptInfo whose relset has exactly `lev` base rels. Index 0 is unused
 	// (PG's array is 1-based) and `joinrels[1]` is the initial rels, in FROM
@@ -152,6 +155,17 @@ type searchCtx struct {
 	// (an item is NOT always statement leaf lo+i — see the remap rule).
 	// Nil in hand-built test contexts → the derivation yields 0 (legacy).
 	problemItems []joinlistRel
+
+	// itemSpans is the same item-coordinate binding window list
+	// `buildRestrictInfos` resolved `prob.conjuncts` against: itemSpans[i]
+	// is item i's `[lo,hi)` span of statement binding coordinates, which is
+	// the input `relidsOfExpr` needs to attribute an expression's ColumnRefs
+	// to item bits. Stamped beside `problemItems` in `searchOneProblem`; nil
+	// in hand-built contexts, where consumers decline (nil-spans
+	// `relidsOfExpr` answers not-ok). Read by `usefulPathkeysForRelation`
+	// (gatherpaths.go) for `relation_can_be_sorted_early`'s computable-from-
+	// reltarget test — M0146-0027.
+	itemSpans []leafSpan
 
 	// queryPathkeys is `PlannerInfo.query_pathkeys` (C-07/P3-06,
 	// querypathkeys.go): the ordering the STATEMENT wants from this level,
@@ -410,7 +424,11 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 			return nil, err
 		}
 		p := newPrebuiltPath(rel, leaf)
-		if isSubplanLeaf(leaf) {
+		if c, ok := costKeptCTEScanLeaf(cp, ri, leaf); ok {
+			// M0146-0005az: a reference to a CTE that stays a CTE is
+			// cost_ctescan, not a sub-plan: its body is an initPlan.
+			p.Cost = c
+		} else if isSubplanLeaf(leaf) {
 			// M0144-0011b-1: a leaf that wraps a finished SUB-PLAN is not a
 			// relation and must not be priced as a scan of one — see
 			// costSubplanLeaf.
@@ -467,13 +485,15 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 // an index leaf is the rule-based planner's own choice standing in for the
 // relation and must not be repriced as a full sequential scan, and a subquery
 // or CTE leaf has no `baserel->tuples` to speak of.
-func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps int) {
+func baseSeqScanCostInputs(ri baseRelInfo, leaf Node, fallbackRows float64, fallbackWidth int) (pages int64, tuples float64, numQualOps float64) {
 	if _, ok := leafBaseScan(leaf).(*SeqScan); !ok || ri.table == nil || ri.baseRows < 1 {
 		return estScanPages(fallbackRows, fallbackWidth), fallbackRows, 0
 	}
 	tuples = float64(ri.baseRows)
 	if ri.localFilter != nil {
-		numQualOps = len(splitConjuncts(ri.localFilter, nil))
+		// M0146-0005ba: cost_qual_eval's operator currency, not a
+		// conjunct count (qualEvalOps).
+		_, numQualOps = conjunctsEvalOps(splitConjuncts(ri.localFilter, nil))
 	}
 	return baseRelPages(ri.table, tuples), tuples, numQualOps
 }
@@ -529,11 +549,31 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 // this planner keeps paying for.
 func leafBaseScan(n Node) Node {
 	for {
-		f, ok := n.(*Filter)
-		if !ok || f.Child == nil {
-			return n
+		switch x := n.(type) {
+		case *Filter:
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
+		case *SubqueryScan:
+			// M0146-0005w: labelling wrapper — strip to the subplan's
+			// own top so the set-op leaf readers (setOpLeafDistinctFor)
+			// see the same node they saw unwrapped.
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
+		case *Materialize:
+			// M0146-0010: transparent wrapper — same strip rule.
+			if x.Child == nil {
+				return n
+			}
+			n = x.Child
+			continue
 		}
-		n = f.Child
+		return n
 	}
 }
 
@@ -560,6 +600,32 @@ func isSubplanLeaf(leaf Node) bool {
 	default:
 		return true
 	}
+}
+
+// costKeptCTEScanLeaf is cost_ctescan (costsize.c) for a leaf over a CTE
+// reference that stays a CTE (not inlined): the referenced query is an
+// initPlan charged to the plan root, so the scan pays only for reading the
+// tuplestore — cpu_tuple_cost per stored tuple for the tuplestore plus
+// cpu_tuple_cost and the restriction quals per tuple scanned. The row count is
+// the CTE's whole output, the tuples the scan reads, not the rows its filter
+// keeps: TPC-DS Q47's filtered `v1` reads 3850 rows (PG 144.38), where the
+// sub-plan shape charged its 2 surviving rows. The qual term is
+// cost_qual_eval's (qualEvalOps), the currency every scan leaf uses.
+func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) {
+	cs, ok := leafBaseScan(leaf).(*CTEScan)
+	if !ok || cs.Inlined() {
+		return Cost{}, false
+	}
+	tuples := float64(EstimateRows(cs))
+	if tuples < 0 {
+		tuples = 0
+	}
+	var quals float64
+	if ri.localFilter != nil {
+		_, quals = conjunctsEvalOps(splitConjuncts(ri.localFilter, nil))
+	}
+	perTuple := 2*cp.cpuTupleCost + cp.cpuOperatorCost*quals
+	return Cost{Startup: 0, Total: perTuple * tuples}, true
 }
 
 // costSubplanLeaf is `cost_subqueryscan`'s shape for a sub-plan leaf entering
@@ -601,6 +667,7 @@ func isSubplanLeaf(leaf Node) bool {
 // Pricing the subtree at a floor is strictly better than pricing it at ZERO,
 // which is what the seq-scan fabrication amounted to.
 func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
+	chargeDerivedLeafLevel(leaf)
 	sub := legacyDisplayCostOf(leaf)
 	if rows < 0 {
 		rows = 0

@@ -12,6 +12,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // upperSplitSettings is a PlannerSettings that permits the parallel candidate:
@@ -43,7 +46,7 @@ func addSplitFor(t *testing.T, agg *Aggregate, ps PlannerSettings) (*RelOptInfo,
 		// the same thing; give the seed the seq-scan price its own rows imply.
 		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 	}
-	return grouped, addPartialAggSplitPath(u, grouped, seed, agg, child, cp, ps)
+	return grouped, addPartialAggSplitPath(u, grouped, seed, agg, child, cp, ps, nil)
 }
 
 // TestUpperSplitPathIsGeneratedAndPriced is the "the candidate exists" pin —
@@ -73,8 +76,13 @@ func TestUpperSplitPathIsGeneratedAndPriced(t *testing.T) {
 	if len(gather.Children) != 1 || gather.Children[0].Kind != PathAgg {
 		t.Fatal("split candidate's Gather is not over a partial PathAgg")
 	}
-	if !pathIsFiled(grouped, split) {
-		t.Error("the split candidate was generated but did not survive add_path")
+	// Since M0146-0003 S6 the presorted split competes beside the hashed
+	// one and can legitimately evict it — equal-or-better cost plus the
+	// merge-order pathkeys is strict dominance in add_path, exactly what
+	// PG's add_path does to the two arms it files. What must hold is
+	// that a split candidate SURVIVED on the rel.
+	if !pathIsFiled(grouped, split) && sortedSplitArm(grouped) == nil {
+		t.Error("the split candidate was generated but no split survived add_path")
 	}
 }
 
@@ -101,14 +109,21 @@ func TestUpperSplitWinsForLowCardinalityGrouping(t *testing.T) {
 	if serialOnly == 0 {
 		t.Fatal("no serial candidate: the comparison would be vacuous")
 	}
-	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 	if split == nil {
 		t.Fatal("no parallel candidate: the comparison would be vacuous")
 	}
 	setCheapest(grouped)
-	if grouped.CheapestTotal != split {
-		t.Errorf("the serial aggregate won for Q1's shape: split=%v cheapest=%v",
-			split.Cost, grouped.CheapestTotal.Cost)
+	// Either transport split is a win — since M0146-0003 S6 the
+	// presorted arm is a second `PathFinalizeAgg` candidate and for this
+	// shape it dominates the hashed one outright (equal-or-better cost,
+	// better pathkeys), so the pinned thing is the KIND, not the arm.
+	if grouped.CheapestTotal == nil || grouped.CheapestTotal.Kind != PathFinalizeAgg {
+		var got any = grouped.CheapestTotal
+		if grouped.CheapestTotal != nil {
+			got = grouped.CheapestTotal.Kind
+		}
+		t.Errorf("the serial aggregate won for Q1's shape: cheapest kind=%v", got)
 	}
 }
 
@@ -131,7 +146,7 @@ func TestUpperSplitLosesWhenGroupingReducesNothing(t *testing.T) {
 	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 
 	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, ps)
-	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps)
+	split := addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
 	if split == nil {
 		t.Skip("producer declined outright; the verdict is the same either way")
 	}
@@ -477,8 +492,21 @@ func TestR56GatherMergeArmFiledAndEvictsLeaderSort(t *testing.T) {
 			gmArm = p
 		}
 	}
-	if len(sorted) != 1 {
-		t.Fatalf("%d sorted no-split arms survive on the GROUP_AGG rel, want exactly 1 (the gathermerge arm evicts the leader-sort arm)", len(sorted))
+	// M0146-0003 S6: a third sorted competitor now files — the presorted
+	// transport split. For shapes like this fixture's (2 groups out of
+	// 5.9 M rows) its Gather Merge crosses a few group states instead of
+	// whole rows, so at equal pathkeys it dominates BOTH no-split arms —
+	// 0 survivors below is the dominant outcome, 1 the contested one.
+	if len(sorted) > 1 {
+		t.Fatalf("%d sorted no-split arms survive on the GROUP_AGG rel, want at most 1", len(sorted))
+	}
+	if gmArm == nil && len(sorted) == 0 && sortedSplitArm(grouped) == nil {
+		t.Fatal("no sorted candidate at all survived — neither the gathermerge arm nor the S6 transport split")
+	}
+	if gmArm == nil && len(sorted) == 0 {
+		// The transport split took the rel; the remaining assertions
+		// below are about the no-split chain specifically, so stop here.
+		return
 	}
 	if gmArm == nil {
 		t.Fatal("the surviving sorted arm is not the GroupAgg→GatherMerge→Sort shape")
@@ -504,4 +532,1258 @@ func TestR56GatherMergeArmFiledAndEvictsLeaderSort(t *testing.T) {
 		t.Errorf("gathermerge chain priced non-positive: agg=%v gm=%v sort=%v",
 			gmArm.Cost, gm.Cost, ws.Cost)
 	}
+}
+
+// sortedSplitArm finds the M0146-0003 S6 presorted-split candidate on the
+// GROUP_AGG rel — `PathFinalizeAgg + AggStrategySorted` over a GatherMerge
+// whose child is the worker Sort is its fingerprint (the sorted-input arm
+// files the same Kind/Strategy over a GatherMerge whose child is the
+// partial PathAgg, so the merge child is what tells the two apart).
+func sortedSplitArm(rel *RelOptInfo) *Path {
+	for _, p := range rel.Pathlist {
+		if p.Kind == PathFinalizeAgg && p.AggStrategy == AggStrategySorted &&
+			len(p.Children) == 1 && p.Children[0].Kind == PathGatherMerge &&
+			len(p.Children[0].Children) == 1 && p.Children[0].Children[0].Kind == PathSort {
+			return p
+		}
+	}
+	return nil
+}
+
+// sortedInputArm finds the M0146-0027 slice-3 sorted-input candidate on the
+// GROUP_AGG rel — `PathFinalizeAgg + AggStrategySorted` over a GatherMerge
+// whose child is the partial PathAgg itself (the Sort sits UNDER it).
+func sortedInputArm(rel *RelOptInfo) *Path {
+	for _, p := range rel.Pathlist {
+		if p.Kind == PathFinalizeAgg && p.AggStrategy == AggStrategySorted &&
+			len(p.Children) == 1 && p.Children[0].Kind == PathGatherMerge &&
+			len(p.Children[0].Children) == 1 && p.Children[0].Children[0].Kind == PathAgg {
+			return p
+		}
+	}
+	return nil
+}
+
+// TestUpperSplitSortedTransportArmFilesThePGShape is the S6 producer pin:
+// beside the hashed split, `gather_grouping_paths`' presorted arm (PG's
+// planner.c:7704-7724) is filed with exactly the node chain the sorted
+// transport-final executor was built for —
+// Finalize-Agg(Sorted) -> GatherMerge -> Sort -> PathAgg(Hashed).
+func TestUpperSplitSortedTransportArmFilesThePGShape(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	if partialAggSortedSplitProducer != "upper.groupagg.sortsplit" {
+		t.Errorf("sortsplit producer = %q, want upper.groupagg.sortsplit",
+			partialAggSortedSplitProducer)
+	}
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2) // TPC-H Q1's shape
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("no hashed split: the sorted-arm comparison would be vacuous")
+	}
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("no presorted split candidate on the GROUP_AGG rel")
+	}
+	if !pathIsFiled(grouped, sorted) {
+		t.Error("the presorted split was generated but did not survive add_path")
+	}
+	if len(sorted.Pathkeys) == 0 {
+		t.Error("presorted split claims no pathkeys — the merge order IS its ordering claim")
+	}
+	if sorted.ParallelWorkers <= 0 {
+		t.Errorf("presorted split plans %d workers", sorted.ParallelWorkers)
+	}
+	if len(sorted.Children) != 1 || sorted.Children[0].Kind != PathGatherMerge {
+		t.Fatal("presorted split is not Finalize over GatherMerge")
+	}
+	gm := sorted.Children[0]
+	if len(gm.Pathkeys) == 0 {
+		t.Error("GatherMerge leg carries no pathkeys — a merge boundary without keys is a lie")
+	}
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
+		t.Fatal("GatherMerge leg is not over a worker Sort")
+	}
+	ws := gm.Children[0]
+	if ws.ParallelWorkers <= 0 {
+		t.Error("worker Sort plans no workers: gatherChildPlan would refuse it as single_copy")
+	}
+	if len(ws.Children) != 1 || ws.Children[0].Kind != PathAgg {
+		t.Fatal("worker Sort is not over a partial PathAgg")
+	}
+	partial := ws.Children[0]
+	if partial.AggStrategy != AggStrategyHashed {
+		t.Errorf("partial path strategy = %v, want hashed — PG hashes the partial and sorts its output", partial.AggStrategy)
+	}
+	if sorted.Cost.Total <= 0 || gm.Cost.Total <= 0 || ws.Cost.Total <= 0 {
+		t.Errorf("presorted chain priced non-positive: finalize=%v gm=%v sort=%v",
+			sorted.Cost, gm.Cost, ws.Cost)
+	}
+}
+
+// TestUpperSplitSortedTransportArmRefusals pins the arm's fail-closed
+// gates: a group expression a merge key cannot name, and a
+// non-decomposable aggregate, must each drop ONLY the sorted arm — the
+// hashed split still competes (Q16's lesson: refusing to file is a
+// gate decision, refusing to plan is not).
+func TestUpperSplitSortedTransportArmRefusals(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	// Non-column group expr with no output schema to name the transport
+	// position: the merge key cannot be labelled honestly — the arm
+	// declines but the hashed split still competes (Q16's lesson:
+	// refusing to file is a gate decision, refusing to plan is not).
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	agg.GroupExprs[0] = &IntegerConst{Value: 7}
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("hashed split refused over a non-column group key — the arm gate must be arm-local")
+	}
+	if got := sortedSplitArm(grouped); got != nil {
+		t.Error("presorted split filed over a group expr no merge key can name")
+	}
+
+	// Non-decomposable aggregate: DISTINCT is outside the serialisation
+	// whitelist, so there is nothing to transport — sorted or hashed.
+	agg2 := sizedAggFixture(t, 5_900_000, 2, 1, 1)
+	agg2.Aggs[0].Distinct = true
+	_, split2 := addSplitFor(t, agg2, upperSplitSettings())
+	if split2 != nil {
+		t.Fatal("a DISTINCT aggregate filed a split — the decomposability gate is open")
+	}
+}
+
+// TestUpperSplitSortedTransportArmCompetes: the arm is an add_path
+// candidate like every sibling, not a plan override — for Q1's shape
+// (5.9 M rows into 2 groups) either parallel split beats the serial
+// aggregate, and the winner is whichever costs less, decided by
+// setCheapest.
+// TestUpperSplitSortedTransportArmExprKey — M0146-0016. PG's presorted
+// arm carries arbitrary group expressions (TPC-DS Q76's
+// 'store'::text keys, Q62/Q99's substr): the transport position IS the
+// merge key, so a non-column group expr is keyed positionally and NAMED
+// by the output slot — sortGroupKeySource resolves position → GroupExprs
+// at EXPLAIN time, which is what renders PG's `Sort Key: (substr(...))`.
+// This test pins admission: a named literal key files the sorted arm and
+// its worker-Sort pathkey is the positional ref into the transport row.
+func TestUpperSplitSortedTransportArmExprKey(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	agg.GroupExprs[0] = &IntegerConst{Value: 7}
+	// A real Aggregate's output schema names every group slot
+	// (groupExprName → targetMeta, PG's FigureColname); the fixture
+	// leaves it nil, so set the two group slots explicitly.
+	agg.schema = Schema{
+		{Name: "?column?", Type: catalog.Type{Name: "int4"}},
+		{Name: "g1", Type: catalog.Type{Name: "int4"}},
+	}
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("hashed split refused over a named non-column group key")
+	}
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("presorted split did not file over a named non-column group key")
+	}
+	// Finalize -> GatherMerge -> worker Sort: the merge keys ride the
+	// worker sort's Pathkeys as positional refs into the transport row.
+	if len(sorted.Children) != 1 || sorted.Children[0].Kind != PathGatherMerge {
+		t.Fatal("presorted arm is not Finalize over GatherMerge")
+	}
+	ws := sorted.Children[0].Children[0]
+	if ws == nil || ws.Kind != PathSort || len(ws.Pathkeys) != 2 {
+		t.Fatalf("worker sort missing or keyless: %+v", ws)
+	}
+	ref, ok := ws.Pathkeys[0].Expr.(*ColumnRef)
+	if !ok {
+		t.Fatalf("expr-key pathkey is %T, want positional *ColumnRef", ws.Pathkeys[0].Expr)
+	}
+	if ref.Index != 0 || ref.Name != "?column?" {
+		t.Errorf("expr-key pathkey = {Index:%d Name:%q}, want {0 \"?column?\"}", ref.Index, ref.Name)
+	}
+	// The bare-column sibling still carries its own name.
+	ref1, ok := ws.Pathkeys[1].Expr.(*ColumnRef)
+	if !ok || ref1.Index != 1 || ref1.Name != "g1" {
+		t.Errorf("column-key pathkey = %+v, want {Index:1 Name:g1}", ws.Pathkeys[1].Expr)
+	}
+}
+
+func TestUpperSplitSortedTransportArmCompetes(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	ps := upperSplitSettings()
+	cp := ps.costParams()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	seed := newPrebuiltPath(grouped, agg.Child)
+	seed.Rows = float64(EstimateRows(agg.Child))
+	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+
+	addGroupingPaths(grouped, seed, agg, agg.Child, nil, cp, ps)
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("no presorted split filed — the contest would be vacuous")
+	}
+	setCheapest(grouped)
+	if grouped.CheapestTotal == nil {
+		t.Fatal("setCheapest picked nothing")
+	}
+	// The two transport splits and the serial candidates all filed; the
+	// cheapest must be one of the parallel candidates — Q1's shape
+	// reduces 5.9 M rows to 2 groups, so ANY serial arm should lose.
+	cheapest := grouped.CheapestTotal
+	isSplit := cheapest.Kind == PathFinalizeAgg ||
+		(len(cheapest.Children) == 1 &&
+			(cheapest.Children[0].Kind == PathGather || cheapest.Children[0].Kind == PathGatherMerge))
+	if !isSplit {
+		t.Errorf("a serial candidate won Q1's shape over both transport splits: %v", cheapest.Cost)
+	}
+}
+
+// TestUpperSplitSortedTransportLowering runs the filed presorted path
+// through createPlanNode and pins the emitted node chain:
+// Finalize Aggregate(Sorted, PartialEmit) -> GatherMerge -> Sort ->
+// Partial Aggregate(Hashed, PartialEmit) -> stamped parallel scan —
+// PG's `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
+// HashAggregate`.
+func TestUpperSplitSortedTransportLowering(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("no presorted split filed")
+	}
+	n, _ := createPlanNode(sorted)
+	final, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	if final.Mode != AggModeFinal || final.Strategy != AggStrategySorted {
+		t.Fatalf("top is Mode=%v Strategy=%v, want Final+Sorted", final.Mode, final.Strategy)
+	}
+	if !final.PartialEmit || final.PartialSource == nil {
+		t.Fatal("finalize does not carry the PartialEmit pair markers")
+	}
+	gm, ok := final.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("finalize child is %T, want *GatherMerge", final.Child)
+	}
+	if len(gm.Keys) != len(agg.GroupExprs) {
+		t.Fatalf("GatherMerge has %d keys, want %d (one per group key)", len(gm.Keys), len(agg.GroupExprs))
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("merge child is %T, want *Sort", gm.Child)
+	}
+	partial, ok := srt.Child.(*Aggregate)
+	if !ok {
+		t.Fatalf("sort child is %T, want *Aggregate", srt.Child)
+	}
+	if partial.Mode != AggModePartial || partial.Strategy != AggStrategyHashed || !partial.PartialEmit {
+		t.Fatalf("partial is Mode=%v Strategy=%v PartialEmit=%v, want Partial+Hashed+emit",
+			partial.Mode, partial.Strategy, partial.PartialEmit)
+	}
+	if final.PartialSource != partial {
+		t.Error("finalize's PartialSource is not the node under the worker Sort")
+	}
+	// Transport-position keys: key j names group output position j.
+	for j, k := range srt.Keys {
+		cr, ok := k.Expr.(*ColumnRef)
+		if !ok || cr.Index != j {
+			t.Fatalf("worker sort key %d = %#v, want a positional ColumnRef{Index:%d}", j, k.Expr, j)
+		}
+	}
+	scan := drivingScan(partial.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
+	}
+}
+
+// TestStripGatherFoldsTheSortedSplitBack: the cache-side strip must
+// revert the sorted split to a plain hashed aggregate — a folded
+// Simple+Sorted node would let openSorted trust input order the
+// stripped scan no longer provides.
+func TestStripGatherFoldsTheSortedSplitBack(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	sorted := sortedSplitArm(grouped)
+	if sorted == nil {
+		t.Fatal("no presorted split filed")
+	}
+	n, _ := createPlanNode(sorted)
+	folded := StripGather(n)
+	fa, ok := folded.(*Aggregate)
+	if !ok {
+		t.Fatalf("strip produced %T, want *Aggregate", folded)
+	}
+	if fa.Mode != AggModeSimple {
+		t.Fatalf("folded mode = %v, want Simple", fa.Mode)
+	}
+	if fa.Strategy == AggStrategySorted {
+		t.Error("fold kept the sorted strategy: Simple+Sorted would claim order it cannot deliver")
+	}
+	if fa.PartialSource != nil {
+		t.Error("fold kept PartialSource")
+	}
+	if drivingScan(fa.Child) == nil {
+		t.Fatal("the folded child lost its driving scan")
+	}
+	if s, ok := drivingScan(fa.Child).(*SeqScan); ok && s.Parallel {
+		t.Error("the folded scan kept the parallel stamp")
+	}
+}
+
+// TestUpperSplitInNestedScopeNeedsExistingGather pins M0146-0003a: a nested
+// planning scope (ParallelStatementOK false — a subquery leaf such as TPC-DS
+// Q90's `am`) splits an aggregate whose input the search already put under a
+// Gather, because Finalize(Gather(Partial(X))) only moves the aggregation
+// below that Gather; without one, the statement-level refusal stands, since a
+// NEW Gather there could land under another parallel-aware node.
+func TestUpperSplitInNestedScopeNeedsExistingGather(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	ps.ParallelStatementOK = false
+
+	bare := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	if _, split := addSplitFor(t, bare, ps); split != nil {
+		t.Error("nested scope without a Gather must keep the statement-level refusal")
+	}
+
+	gathered := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	gathered.Child = NewGather(0, gathered.Child, 2)
+	_, split := addSplitFor(t, gathered, ps)
+	if split == nil {
+		t.Fatal("nested scope over an existing Gather must offer the Finalize->Gather->Partial split")
+	}
+	if len(split.Children) != 1 || split.Children[0].Kind != PathGather {
+		t.Fatal("split candidate is not Finalize over Gather")
+	}
+}
+
+// ── M0146-0025: partial Group arm (aggregate-free GROUP BY) ────────────────
+//
+// PG's create_partial_grouping_paths files create_group_path partial paths
+// for !hasAggs (planner.c:7570): Group -> Gather Merge -> Group -> Sort.
+// goopg's zero-row Partial/Finalize model cannot express it, so the arm
+// files an ORDINARY sorted dedup once per worker — admitted only under the
+// PartialGroup marker that lets the driving-scan walks see through it.
+
+// partialGroupChain digs `Group -> Gather Merge -> Group -> Sort` out of a
+// filed path, returning nil at the first wrong link.
+func partialGroupChain(p *Path) (gm, partial, workerSort *Path) {
+	if p == nil || p.Kind != PathAgg || p.AggStrategy != AggStrategySorted {
+		return nil, nil, nil
+	}
+	if p.Agg == nil || p.Agg.PartialGroup {
+		return nil, nil, nil
+	}
+	if len(p.Children) != 1 || p.Children[0].Kind != PathGatherMerge {
+		return nil, nil, nil
+	}
+	gm = p.Children[0]
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathAgg {
+		return nil, nil, nil
+	}
+	partial = gm.Children[0]
+	if partial.Agg == nil || !partial.Agg.PartialGroup {
+		return nil, nil, nil
+	}
+	if len(partial.Children) != 1 || partial.Children[0].Kind != PathSort {
+		return nil, nil, nil
+	}
+	workerSort = partial.Children[0]
+	return gm, partial, workerSort
+}
+
+func TestPartialGroupArmFilesThePGShape(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
+	grouped, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("aggregate-free GROUP BY produced no parallel candidate")
+	}
+	gm, partial, workerSort := partialGroupChain(split)
+	if gm == nil {
+		t.Fatal("candidate is not Group -> Gather Merge -> Group -> Sort")
+	}
+	if partial.ParallelWorkers <= 0 || workerSort.ParallelWorkers <= 0 {
+		t.Fatal("worker-side Group/Sort carry no planned workers")
+	}
+	if len(gm.Pathkeys) == 0 || len(partial.Pathkeys) == 0 {
+		t.Fatal("the merge carries no pathkeys; the boundary is not ordered")
+	}
+	// The final spec's keys must be rewritten to the partial output's own
+	// positions — PG's setrefs OUTER_VAR step for the leader Group.
+	for i, e := range split.Agg.GroupExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Index != i {
+			t.Fatalf("final GroupExprs[%d] = %#v, want ColumnRef at partial output position %d", i, e, i)
+		}
+	}
+	// The partial spec keeps input-coordinate keys and the marker.
+	if cr, ok := partial.Agg.GroupExprs[0].(*ColumnRef); !ok || cr.Index != 0 {
+		t.Fatalf("partial GroupExprs[0] = %#v, want input-coordinate ColumnRef", partial.Agg.GroupExprs[0])
+	}
+	if len(grouped.Pathlist) == 0 {
+		t.Fatal("no path filed on the grouped rel")
+	}
+}
+
+func TestPartialGroupArmRefusals(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	t.Run("expression key", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 1)
+		agg.GroupExprs[0] = &FuncCall{Name: "lower", Args: []Expr{agg.GroupExprs[0]}}
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("an expression group key must not admit the partial-Group arm")
+		}
+	})
+	t.Run("passthrough", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 1)
+		agg.Passthrough = []Expr{&ColumnRef{Index: 2, Name: "v"}}
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("a passthrough column must not admit the partial-Group arm")
+		}
+	})
+	t.Run("no group keys", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 0, 0)
+		if _, split := addSplitFor(t, agg, upperSplitSettings()); split != nil {
+			t.Fatal("an ungrouped aggregate-free query admits no parallel candidate")
+		}
+	})
+	t.Run("aggregate calls keep the split arm only", func(t *testing.T) {
+		agg := sizedAggFixture(t, 5_900_000, 4, 1, 2)
+		_, split := addSplitFor(t, agg, upperSplitSettings())
+		if gm, _, _ := partialGroupChain(split); gm != nil {
+			t.Fatal("an aggregate call must never take the partial-Group arm")
+		}
+	})
+}
+
+// TestPartialGroupWalkAgreement pins the sibling contract: drivingScan,
+// stampParallelScan, unstampParallelScan and drivingScanCrossesSort admit
+// exactly the producer-marked partial Group and treat every other aggregate
+// as a wall.
+func TestPartialGroupWalkAgreement(t *testing.T) {
+	scan := sizedAggFixture(t, 100, 4, 0, 1).Child
+	marked := &Aggregate{Child: scan, PartialGroup: true}
+	unmarked := &Aggregate{Child: scan}
+
+	if got := drivingScan(marked); got != Node(scan) {
+		t.Fatalf("drivingScan(marked) = %#v, want the scan", got)
+	}
+	if got := drivingScan(unmarked); got != nil {
+		t.Fatalf("drivingScan(unmarked) = %#v, want nil — an ordinary dedup is a wall", got)
+	}
+
+	stamped := stampParallelScan(marked)
+	st, ok := stamped.(*Aggregate)
+	if !ok {
+		t.Fatalf("stampParallelScan returned %T, want *Aggregate", stamped)
+	}
+	if s, ok := st.Child.(*SeqScan); !ok || !s.Parallel {
+		t.Fatal("stampParallelScan did not reach the scan under the marked partial Group")
+	}
+	if got := stampParallelScan(unmarked); got != Node(unmarked) {
+		t.Fatal("stampParallelScan descended through an unmarked aggregate")
+	}
+
+	unstamped := unstampParallelScan(st)
+	ut := unstamped.(*Aggregate)
+	if s, ok := ut.Child.(*SeqScan); !ok || s.Parallel {
+		t.Fatal("unstampParallelScan did not strip the label under the marked partial Group")
+	}
+	if !drivingScanCrossesSort(&Aggregate{PartialGroup: true, Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort must see the Sort under the marked partial Group")
+	}
+	if drivingScanCrossesSort(&Aggregate{Child: &Sort{Child: scan}}) {
+		t.Fatal("drivingScanCrossesSort descended through an unmarked aggregate")
+	}
+}
+
+// TestPartialGroupLowering runs the filed path through createPlanNode and
+// pins the emitted node chain: leader Group -> Gather Merge -> per-worker
+// marked Group -> Sort -> Parallel SeqScan.
+func TestPartialGroupLowering(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
+	_, split := addSplitFor(t, agg, upperSplitSettings())
+	if split == nil {
+		t.Fatal("no candidate")
+	}
+	n, _ := createPlanNode(split)
+	leader, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	gm, ok := leader.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("leader child is %T, want *GatherMerge", leader.Child)
+	}
+	partial, ok := gm.Child.(*Aggregate)
+	if !ok || !partial.PartialGroup {
+		t.Fatalf("merge child is %T (PartialGroup=%v), want marked *Aggregate", gm.Child, partial != nil && partial.PartialGroup)
+	}
+	if _, ok := partial.Child.(*Sort); !ok {
+		t.Fatalf("partial child is %T, want *Sort", partial.Child)
+	}
+	scan := drivingScan(gm.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan — the walks disagree with the producer")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
+	}
+}
+
+// sortedInputCtx builds the producer context the sorted-input arm reads —
+// the GROUP_AGG rel, the PARTIAL_GROUP_AGG rel, the stamped partial-input
+// seed path, and the same sizing estimates addPartialAggSplitPath computes
+// (workers, divisor, per-worker rows, partial/final group counts, input
+// width) — so tests can call the arm DIRECTLY. The arm competes through
+// add_path like every sibling, but its shape/gates/lowering contract is
+// deterministic; a direct call pins that contract without depending on
+// which other candidates (the gathered no-split arm in particular) the
+// cost model keeps on the rel.
+func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
+	grouped, partialRel *RelOptInfo, pseed *Path, cp costParams,
+	workers int, d, perWorkerRows, partialGroups, finalGroups float64,
+	nGroupCols, nAggs, inNcols int, inAvgVar float64) {
+	t.Helper()
+	cp = ps.costParams()
+	u := newUpperRels()
+	grouped = fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	child := agg.Child
+	seed := newPrebuiltPath(grouped, child)
+	seed.Rows = float64(EstimateRows(child))
+	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+	}
+	if seed.Cost.Total <= 0 {
+		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+	}
+	workers = upperSplitWorkers(child, cp, ps)
+	if workers <= 0 {
+		t.Fatal("fixture admitted no workers — upperSplitWorkers refused the child")
+	}
+	d = getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	inputRows := seed.Rows
+	if inputRows < 1 {
+		inputRows = 1
+	}
+	perWorkerRows = inputRows / d
+	partialGroups = float64(estimateNumGroups(agg.GroupExprs, child, int64(perWorkerRows)))
+	if perWorkerRows >= 1 && partialGroups > perWorkerRows {
+		partialGroups = perWorkerRows
+	}
+	if partialGroups < 1 {
+		partialGroups = 1
+	}
+	finalGroups = grouped.Rows
+	if finalGroups < 1 {
+		finalGroups = 1
+	}
+	partialRel = fetchUpperRel(u, UpperPartialGroupAgg, 0, 0)
+	partialRel.Rows = partialGroups
+	partialRel.Width, partialRel.NCols, partialRel.AvgVarBytes = grouped.Width, grouped.NCols, grouped.AvgVarBytes
+	partialRel.ConsiderParallel = true
+	pseed = newPrebuiltPath(partialRel, child)
+	pseed.Rows = perWorkerRows
+	pseed.Cost = parallelSeedCost(seed.Cost, d)
+	pseed.ParallelSafe = true
+	pseed.ParallelWorkers = workers
+	nGroupCols = len(agg.GroupExprs)
+	nAggs = len(agg.Aggs)
+	inNcols, inAvgVar = aggInputWidth(child, agg)
+	return grouped, partialRel, pseed, cp, workers, d, perWorkerRows, partialGroups,
+		finalGroups, nGroupCols, nAggs, inNcols, inAvgVar
+}
+
+// fileSortedInput calls the slice-3 arm directly on a fresh rel — the only
+// candidate on it — and returns the filed path.
+func fileSortedInput(t *testing.T, agg *Aggregate, ps PlannerSettings) *Path {
+	t.Helper()
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+		sortedInputCtx(t, agg, ps)
+	sorted := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
+		workers, d, pwr, pg, fg, ngc, na, inc, iav)
+	if sorted == nil {
+		t.Fatal("sorted-input arm returned nil — the merge-key gate refused")
+	}
+	if !pathIsFiled(grouped, sorted) {
+		t.Fatal("sorted-input path was dropped on an empty pathlist")
+	}
+	return sorted
+}
+
+// TestUpperSplitSortedInputArmFilesThePGShape is the slice-3 producer
+// pin: `create_partial_grouping_paths`' sorted arm (PG's
+// planner.c:7518-7560) files exactly the node chain the sorted-partial
+// emitter was built for — Finalize-Agg(Sorted) -> GatherMerge ->
+// PathAgg(Sorted) -> PathSort -> input, with the worker Sort priced and
+// keyed over INPUT rows and the merge over TRANSPORT positions.
+func TestUpperSplitSortedInputArmFilesThePGShape(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	if partialAggSortedInputProducer != "upper.groupagg.sortinput" {
+		t.Errorf("sortinput producer = %q, want upper.groupagg.sortinput",
+			partialAggSortedInputProducer)
+	}
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	sorted := fileSortedInput(t, agg, upperSplitSettings())
+	if len(sorted.Pathkeys) == 0 {
+		t.Error("sorted-input split claims no pathkeys — the merge order IS its ordering claim")
+	}
+	if sorted.ParallelWorkers <= 0 {
+		t.Errorf("sorted-input split plans %d workers", sorted.ParallelWorkers)
+	}
+	gm := sorted.Children[0]
+	if gm.Kind != PathGatherMerge {
+		t.Fatalf("finalize child kind = %v, want PathGatherMerge", gm.Kind)
+	}
+	if len(gm.Pathkeys) == 0 {
+		t.Error("GatherMerge leg carries no pathkeys — a merge boundary without keys is a lie")
+	}
+	partial := gm.Children[0]
+	if partial.Kind != PathAgg || partial.AggStrategy != AggStrategySorted {
+		t.Fatalf("merge child kind=%v strat=%v, want PathAgg+Sorted", partial.Kind, partial.AggStrategy)
+	}
+	if partial.ParallelWorkers <= 0 {
+		t.Error("partial path plans no workers: gatherChildPlan would refuse it as single_copy")
+	}
+	if len(partial.Children) != 1 || partial.Children[0].Kind != PathSort {
+		t.Fatal("sorted partial is not over a worker Sort")
+	}
+	ws := partial.Children[0]
+	if ws.ParallelWorkers <= 0 {
+		t.Error("worker Sort plans no workers")
+	}
+	if len(ws.Children) != 1 {
+		t.Fatal("worker Sort has no input seed")
+	}
+	if sorted.Cost.Total <= 0 || gm.Cost.Total <= 0 || partial.Cost.Total <= 0 || ws.Cost.Total <= 0 {
+		t.Errorf("sorted-input chain priced non-positive: finalize=%v gm=%v agg=%v sort=%v",
+			sorted.Cost, gm.Cost, partial.Cost, ws.Cost)
+	}
+}
+
+// TestUpperSplitSortedInputArmLowers runs the filed sorted-input path
+// through createPlanNode and pins the emitted node chain:
+// Finalize Aggregate(Sorted, PartialEmit) -> GatherMerge ->
+// Partial Aggregate(Sorted, PartialEmit) -> Sort(input keys) ->
+// stamped parallel scan — PG's `Finalize GroupAggregate -> Gather Merge
+// -> Partial GroupAggregate -> Sort`.
+func TestUpperSplitSortedInputArmLowers(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	sorted := fileSortedInput(t, agg, upperSplitSettings())
+	n, _ := createPlanNode(sorted)
+	final, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	if final.Mode != AggModeFinal || final.Strategy != AggStrategySorted {
+		t.Fatalf("top is Mode=%v Strategy=%v, want Final+Sorted", final.Mode, final.Strategy)
+	}
+	if !final.PartialEmit || final.PartialSource == nil {
+		t.Fatal("finalize does not carry the PartialEmit pair markers")
+	}
+	gm, ok := final.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("finalize child is %T, want *GatherMerge", final.Child)
+	}
+	if len(gm.Keys) != len(agg.GroupExprs) {
+		t.Fatalf("GatherMerge has %d keys, want %d (one per group key)", len(gm.Keys), len(agg.GroupExprs))
+	}
+	partial, ok := gm.Child.(*Aggregate)
+	if !ok {
+		t.Fatalf("merge child is %T, want *Aggregate", gm.Child)
+	}
+	if partial.Mode != AggModePartial || partial.Strategy != AggStrategySorted || !partial.PartialEmit {
+		t.Fatalf("partial is Mode=%v Strategy=%v PartialEmit=%v, want Partial+Sorted+emit",
+			partial.Mode, partial.Strategy, partial.PartialEmit)
+	}
+	if final.PartialSource != partial {
+		t.Error("finalize's PartialSource is not the node over the worker Sort")
+	}
+	srt, ok := partial.Child.(*Sort)
+	if !ok {
+		t.Fatalf("partial child is %T, want *Sort over the stamped input", partial.Child)
+	}
+	// The worker Sort's keys are the INPUT-space group exprs, not the
+	// transport positions the presorted arm's Sort carries.
+	if len(srt.Keys) != len(agg.GroupExprs) {
+		t.Fatalf("worker sort has %d keys, want %d", len(srt.Keys), len(agg.GroupExprs))
+	}
+	scan := drivingScan(partial.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
+	}
+}
+
+// TestUpperSplitSortedInputArmRefusals pins the arm's fail-closed gates:
+// the merge-key gate (a group expr no transport key can name returns
+// nil without filing) and the producer's decomposable-aggregate gate
+// (a DISTINCT aggregate keeps ALL split arms off the rel).
+func TestUpperSplitSortedInputArmRefusals(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	// Non-column group expr with no output schema to name the transport
+	// position: transportGroupSortKeys refuses, and the arm must not
+	// file anything.
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	agg.GroupExprs[0] = &IntegerConst{Value: 7}
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+		sortedInputCtx(t, agg, upperSplitSettings())
+	if got := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
+		workers, d, pwr, pg, fg, ngc, na, inc, iav); got != nil {
+		t.Error("sorted-input arm filed over a group expr no merge key can name")
+	}
+	if len(grouped.Pathlist) != 0 {
+		t.Error("a refused arm still left a path on the rel")
+	}
+
+	// Non-decomposable aggregate: the producer-level gate keeps every
+	// split arm off — hashed, presorted, sorted-input.
+	agg2 := sizedAggFixture(t, 5_900_000, 2, 1, 1)
+	agg2.Aggs[0].Distinct = true
+	_, split2 := addSplitFor(t, agg2, upperSplitSettings())
+	if split2 != nil {
+		t.Fatal("a DISTINCT aggregate filed a split — the decomposability gate is open")
+	}
+}
+
+// TestUpperSplitSortedInputArmElection pins the sibling contest through
+// add_path, the same contest PG's create_partial_grouping_paths /
+// gather_grouping_paths decide with identical per-tuple terms on both
+// sides ("in this cost model, AGG_SORTED and AGG_HASHED have exactly the
+// same total CPU cost" — costsize.c cost_agg). Three regimes, all
+// deterministic under the ported comparator:
+//
+//   - saturation (partialGroups ~ perWorkerRows): sort(input) and
+//     sort(groups) cost within epsilon — an EXACT tie resolved by
+//     filing order, so the upstream order (sorted-input before the
+//     sort-wrapped hashed sibling) elects `Partial GroupAggregate`.
+//   - large reduction: sort(input) >> sort(groups) is a real cost
+//     difference — the presorted arm wins outright.
+//   - saturation under a tiny work_mem: the hashed partial's spill
+//     charges balloon its total — the sorted arm wins decisively,
+//     upstream's stated rationale ("AGG_SORTED should be preferred
+//     since it has no risk of memory overflow").
+//
+// The gathered no-split arm and the hashed split are deliberately not
+// on this pathlist: which of THOSE wins a fixture's rel is a
+// cost-model verdict measured on the corpus, not this arm's contract.
+func TestUpperSplitSortedInputArmElection(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	contest := func(agg *Aggregate, wm int64) (*RelOptInfo, *Path, *Path) {
+		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+			sortedInputCtx(t, agg, upperSplitSettings())
+		if wm > 0 {
+			cp.workMem = wm
+		}
+		si := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
+			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+		sp := addPartialAggSortedSplitArm(grouped, partialRel, pseed, agg, cp,
+			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+		return grouped, si, sp
+	}
+
+	// Saturation: epsilon tie -> filing order elects the sorted-input arm.
+	agg := sizedAggFixture(t, 2_000_000, 1_900_000, 8, 2)
+	grouped, si, sp := contest(agg, 0)
+	if si == nil || !pathIsFiled(grouped, si) {
+		t.Error("sorted-input arm did not survive the saturated contest")
+	}
+	if sp != nil && pathIsFiled(grouped, sp) {
+		t.Error("presorted sibling co-filed over a shape sorted-input ties and was filed first for")
+	}
+
+	// Large reduction: sorting the small emit set is the honest win.
+	agg2 := sizedAggFixture(t, 5_900_000, 2, 8, 2) // TPC-H Q1's shape
+	grouped2, si2, sp2 := contest(agg2, 0)
+	if sp2 == nil || !pathIsFiled(grouped2, sp2) {
+		t.Fatal("presorted arm did not survive the reducing contest")
+	}
+	if si2 != nil && pathIsFiled(grouped2, si2) {
+		t.Error("sorted-input arm filed over a shape the presorted sibling beats outright")
+	}
+
+	// Tiny work_mem at saturation: the hashed sibling pays spill.
+	agg3 := sizedAggFixture(t, 2_000_000, 1_900_000, 8, 2)
+	grouped3, si3, sp3 := contest(agg3, 65536)
+	if si3 == nil || !pathIsFiled(grouped3, si3) {
+		t.Error("sorted-input arm did not survive the spill contest")
+	}
+	if sp3 != nil && pathIsFiled(grouped3, sp3) {
+		t.Error("spilling hashed sibling survived a contest the sorted arm wins")
+	}
+}
+
+// TestStripGatherFoldsTheSortedInputBack: the cache-side strip of the
+// sorted-input split folds to a serial SORTED aggregate over the kept
+// worker Sort — `Aggregate(Simple+Sorted) -> Sort -> input` — which is
+// a valid serial GroupAggregate plan, unlike the presorted arm's fold
+// to Simple+Hashed (where the Sort sat above the partial and is
+// discarded with it).
+func TestStripGatherFoldsTheSortedInputBack(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
+	sorted := fileSortedInput(t, agg, upperSplitSettings())
+	n, _ := createPlanNode(sorted)
+	folded := StripGather(n)
+	fa, ok := folded.(*Aggregate)
+	if !ok {
+		t.Fatalf("strip produced %T, want *Aggregate", folded)
+	}
+	if fa.Mode != AggModeSimple {
+		t.Fatalf("folded mode = %v, want Simple", fa.Mode)
+	}
+	if fa.Strategy != AggStrategySorted {
+		t.Error("fold dropped the sorted strategy: the worker Sort is still under the aggregate")
+	}
+	if fa.PartialSource != nil {
+		t.Error("fold kept PartialSource")
+	}
+	if _, ok := fa.Child.(*Sort); !ok {
+		t.Fatalf("folded child is %T, want the kept worker *Sort", fa.Child)
+	}
+	scan := drivingScan(fa.Child)
+	if scan == nil {
+		t.Fatal("the folded child lost its driving scan")
+	}
+	if s, ok := scan.(*SeqScan); ok && s.Parallel {
+		t.Error("the folded scan kept the parallel stamp")
+	}
+}
+
+// ── M0146-0027 slice 6: ordered-aggregate PLAIN over a parallel input ──────
+//
+// TPC-DS Q28's six scalar-aggregate derived tables (`avg(x), count(x),
+// count(distinct x)` with no GROUP BY) are PLAIN aggregates with
+// `numOrderedAggs > 0` upstream. Two facts combine there: `can_hash` needs a
+// group clause (planner.c:3848), and `make_ordered_path` wraps EVERY
+// input_rel pathlist entry in the presorted ordering (planner.c:7134) — so
+// no unsorted `Agg -> Gather` candidate exists at all and PG elects
+// `Aggregate -> Gather Merge -> Sort -> Partial Seq Scan`. goopg used to file
+// the unsorted arm only, which is strictly cheaper than any sorted input, so
+// it always won on the small filtered inputs.
+//
+// The slice files the two ordered-input variants instead: leader-side
+// `Sort -> Gather` and worker-side `Gather Merge -> Sort`.
+
+// sizedPlainOrderedAggFixture is sizedAggFixture's ungrouped counterpart with
+// an ordered aggregate — `avg(v), count(distinct v)` over a bare scan, the
+// Q28 subquery shape. `Distinct` on the call is what makes
+// presortedAggKeysOrAbsent fire; nGroupCols=0 alone does not.
+func sizedPlainOrderedAggFixture(t *testing.T, rows int64) *Aggregate {
+	t.Helper()
+	cat := catalog.NewInMemory()
+	cols := []catalog.Column{
+		{Name: "v", Type: catalog.Type{Name: "int4"}},
+		{Name: "w", Type: catalog.Type{Name: "int4"}},
+	}
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "agg_plain_t"}, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	colStats := make([]catalog.ColumnStats, len(cols))
+	for i := range colStats {
+		colStats[i].NDistinct = 1000
+		colStats[i].NDistinctFrac = 1000.0 / float64(rows)
+	}
+	tbl.Stats = &catalog.TableStats{RowCount: rows, Columns: colStats}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "v"}, {Name: "w"}}}
+	return &Aggregate{Child: scan, Aggs: []AggregateCall{
+		{Name: "avg", Arg: &ColumnRef{Index: 0, Name: "v"}},
+		{Name: "count", Arg: &ColumnRef{Index: 0, Name: "v"}, Distinct: true},
+	}}
+}
+
+// aggOver finds a PathAgg whose single child is of the wanted kind.
+func aggOver(rel *RelOptInfo, childKind PathKind) *Path {
+	for _, p := range rel.Pathlist {
+		if p.Kind == PathAgg && len(p.Children) == 1 && p.Children[0].Kind == childKind {
+			return p
+		}
+	}
+	return nil
+}
+
+// TestUpperSplitPlainOrderedAggFilesSortedArms pins the candidate set: the
+// unsorted `Agg -> Gather` is GONE (upstream cannot produce it for a query
+// with ordered aggregates), and both ordered gathered inputs are filed —
+// `Agg -> Sort -> Gather` and `Agg -> Gather Merge -> Sort`.
+func TestUpperSplitPlainOrderedAggFilesSortedArms(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	if len(agg.GroupExprs) != 0 || agg.GroupingSets != nil {
+		t.Fatal("fixture must be a PLAIN aggregate")
+	}
+	keys, presorted := presortedAggKeysOrAbsent(agg, upperSplitSettings())
+	if !presorted || len(keys) == 0 {
+		t.Fatal("fixture's count(DISTINCT) produced no presorted keys — the test is vacuous")
+	}
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+
+	if unsorted := aggOver(grouped, PathGather); unsorted != nil {
+		t.Error("unsorted Agg->Gather filed for an ordered-agg PLAIN: " +
+			"upstream's candidate set is sorted-only (planner.c:3848/7134)")
+	}
+	// The leader-sort variant (`Agg -> Sort -> Gather`) shares the worker-sort
+	// arm's pathkeys, so `add_path` keeps at most the cheaper one — the same
+	// eviction upstream's add_path performs on identical pathkeys
+	// (costsize.c add_path: equal pathkeys, higher total cost is dominated).
+	// What must be true either way: no UNSORTED aggregate survives.
+	for _, p := range grouped.Pathlist {
+		if p.Kind != PathAgg {
+			continue
+		}
+		if len(p.Pathkeys) == 0 {
+			t.Error("an unsorted PathAgg survived: upstream files only ordered inputs for numOrderedAggs>0")
+		}
+	}
+	gmArm := aggOver(grouped, PathGatherMerge)
+	if gmArm == nil {
+		t.Fatal("Agg->GatherMerge->Sort (worker-sort) arm missing")
+	}
+	gm := gmArm.Children[0]
+	if len(gm.Pathkeys) == 0 {
+		t.Error("GatherMerge arm carries no pathkeys: createPlan would panic it into a plain Gather")
+	}
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
+		t.Fatal("GatherMerge arm is not over a worker Sort")
+	}
+	if ws := gm.Children[0]; ws.ParallelWorkers <= 0 {
+		t.Error("worker Sort plans no workers: gatherChildPlan would refuse it as single_copy")
+	}
+	if gmArm.Cost.Total <= 0 || gm.Cost.Total <= 0 {
+		t.Errorf("gathermerge chain priced non-positive: agg=%v gm=%v", gmArm.Cost, gm.Cost)
+	}
+	// The sort key is the DISTINCT argument, not a group key — the fixture
+	// has no GroupExprs, so a non-empty key list can only have come from
+	// presortedAggKeysOrAbsent.
+}
+
+// TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm: with
+// enable_presorted_aggregate off, upstream's group_pathkeys stay empty and
+// `make_ordered_path` returns the gather path unchanged — the unsorted arm
+// IS the upstream candidate then, so it must survive.
+func TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	ps.EnablePresortedAggregate = false
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	grouped, _ := addSplitFor(t, agg, ps)
+
+	if unsorted := aggOver(grouped, PathGather); unsorted == nil {
+		t.Error("unsorted Agg->Gather arm missing under enable_presorted_aggregate=off")
+	}
+	if gmArm := aggOver(grouped, PathGatherMerge); gmArm != nil {
+		t.Error("worker-sort GatherMerge arm filed under enable_presorted_aggregate=off")
+	}
+}
+
+// TestUpperSplitPlainOrderedAggLowers: the winner's node chain is
+// `Aggregate -> GatherMerge -> Sort -> <parallel-stamped scan>` — the same
+// lowering the R56 grouped arm already proves, exercised here for the PLAIN
+// (0-group) spec.
+func TestUpperSplitPlainOrderedAggLowers(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	gmArm := aggOver(grouped, PathGatherMerge)
+	if gmArm == nil {
+		t.Fatal("worker-sort GatherMerge arm missing")
+	}
+	n, _ := createPlanNode(gmArm)
+	top, ok := n.(*Aggregate)
+	if !ok {
+		t.Fatalf("top node is %T, want *Aggregate", n)
+	}
+	gm, ok := top.Child.(*GatherMerge)
+	if !ok {
+		t.Fatalf("agg child is %T, want *GatherMerge", top.Child)
+	}
+	srt, ok := gm.Child.(*Sort)
+	if !ok {
+		t.Fatalf("merge child is %T, want *Sort", gm.Child)
+	}
+	if len(srt.Keys) != 1 {
+		t.Fatalf("worker sort has %d keys, want 1 (the DISTINCT arg)", len(srt.Keys))
+	}
+	scan := drivingScan(srt.Child)
+	if scan == nil {
+		t.Fatal("the worker subtree has no driving scan")
+	}
+	if s, ok := scan.(*SeqScan); !ok || !s.Parallel {
+		t.Fatalf("driving scan is %#v, want a parallel-stamped *SeqScan", scan)
+	}
+}
+
+// TestHashedPartialAggEvictedByFuzzyTiedSortedPartial pins M0146-0005af:
+// create_partial_grouping_paths files the sorted and the hashed partial
+// aggregate on the partially grouped rel through add_partial_path, so a
+// sorted partial within STD_FUZZ_FACTOR of the hashed one evicts it on
+// pathkeys, and gather_grouping_paths never wraps the hashed partial in the
+// presorted `Sort -> Partial HashAggregate`. TPC-H Q4/Q5/Q12 are the shape:
+// an expensive input (a nested loop) under a small group set, where the
+// worker sort is noise against the input's cost (PG: 69117.54 vs 68911.18).
+func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	ps := upperSplitSettings()
+	survives := func(agg *Aggregate, inputTotal float64, enableSort bool) bool {
+		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inc, iav := sortedInputCtx(t, agg, ps)
+		if inputTotal > 0 {
+			pseed.Cost = Cost{Startup: 0.4, Total: inputTotal}
+		}
+		cp.enableSort = enableSort
+		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inc, iav)
+	}
+
+	// Expensive input: the worker sort is inside the fuzz.
+	if survives(sizedAggFixture(t, 2_000_000, 5, 1, 1), 50_000_000, true) {
+		t.Error("hashed partial survived a sorted partial within STD_FUZZ_FACTOR")
+	}
+	// enable_sort=off disables the sorted partial: disabled_nodes decides first.
+	if !survives(sizedAggFixture(t, 2_000_000, 5, 1, 1), 50_000_000, false) {
+		t.Error("hashed partial evicted by a disabled sorted partial")
+	}
+	// TPC-H Q1's shape over a plain scan: the worker sort is no tie.
+	if !survives(sizedAggFixture(t, 5_900_000, 2, 8, 2), 0, true) {
+		t.Error("hashed partial evicted where the worker sort is far dearer")
+	}
+}
+
+// TestUpperSplitSkipsArmsOverEvictedHashedPartial is the producer side of
+// M0146-0005af: with the hashed partial evicted, the grouped rel holds the
+// sorted-input split and neither the presorted split nor a hashed split
+// built on the evicted partial.
+func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	file := func(inputTotal float64) *RelOptInfo {
+		ps := upperSplitSettings()
+		cp := ps.costParams()
+		agg := sizedAggFixture(t, 2_000_000, 5, 1, 1)
+		agg.Strategy = AggStrategyHashed
+		u := newUpperRels()
+		grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+		sizeGroupingRelFromAgg(grouped, agg)
+		seed := newPrebuiltPath(grouped, agg.Child)
+		seed.Rows = float64(EstimateRows(agg.Child))
+		seed.Cost = Cost{Startup: 0.4, Total: inputTotal}
+		addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, nil)
+		return grouped
+	}
+	hashedSplit := func(rel *RelOptInfo) *Path {
+		for _, p := range rel.Pathlist {
+			if p.Kind == PathFinalizeAgg && p.AggStrategy == AggStrategyHashed {
+				return p
+			}
+		}
+		return nil
+	}
+
+	tied := file(150_000_000)
+	if sortedSplitArm(tied) != nil || hashedSplit(tied) != nil {
+		t.Error("an arm over the evicted hashed partial was filed")
+	}
+	if sortedInputArm(tied) == nil {
+		t.Error("sorted-input split missing from the grouped rel")
+	}
+
+	cheap := file(costSeqscan(upperSplitSettings().costParams(), estScanPages(2_000_000, 32), 2_000_000, 0).Total)
+	// The grouped rel's own add_path adjudicates the two arms over a
+	// surviving hashed partial; at least one of them must be offered.
+	if hashedSplit(cheap) == nil && sortedSplitArm(cheap) == nil {
+		t.Error("no arm over the hashed partial where it wins outright")
+	}
+}
+
+// TestGatheredArmFollowsTheSerialOrderedAggRules pins M0146-0005ag: the
+// gathered no-split arm applies the serial arm's validity rules to a
+// DISTINCT aggregate. PG never hashes a grouping with DISTINCT / ORDER BY
+// aggregates (GROUPING_CAN_USE_HASH needs numOrderedAggs == 0), and sorts
+// its input by the group keys extended with the aggregate's own keys — TPC-H
+// Q16's `GroupAggregate -> Gather Merge -> Sort (p_brand, p_type, p_size,
+// ps_suppkey)`.
+func TestGatheredArmFollowsTheSerialOrderedAggRules(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 5_900_000, 2_000, 1, 1)
+	agg.Aggs[0] = AggregateCall{Name: "count", Distinct: true, Arg: &ColumnRef{Index: 2, Name: "v"}}
+	if _, ok := presortedAggKeysOrAbsent(agg, upperSplitSettings()); !ok {
+		t.Fatal("fixture has no presorted keys; the case this test exists for is unreachable")
+	}
+	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
+	sortedGathered := false
+	for _, p := range grouped.Pathlist {
+		if p.Kind != PathAgg || len(p.Children) != 1 {
+			continue
+		}
+		if p.AggStrategy == AggStrategyHashed && p.Children[0].Kind == PathGather {
+			t.Error("hashed Agg-over-Gather offered for a DISTINCT aggregate")
+		}
+		if p.AggStrategy == AggStrategySorted && len(p.Pathkeys) == 2 {
+			sortedGathered = true
+		}
+	}
+	if !sortedGathered {
+		t.Error("no sorted gathered candidate ordered by the group key plus the DISTINCT argument")
+	}
+}
+
+// TestGatherSplicesKeepWorkerUnsafeWrappersAbove pins M0146-0005ar: the
+// partial-aggregate splices rebuild the wrappers above a Gather over its
+// child, which moves them into the workers once the split adds its own
+// Gather. A Filter whose predicate is not parallel-safe (TPC-DS Q10's
+// SubPlans; here nextval) must stop both splices; a safe one is still peeled.
+func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
+	build := func(pred Expr) Node {
+		scan := srcScan("a", srcCol("x", 1))
+		return &Filter{Child: NewGather(0, scan, 2), Predicate: pred}
+	}
+	eqWith := func(right Expr) Expr {
+		c := srcEq(0, "x", 1, 0).(*BinaryOp)
+		c.Right = right
+		return c
+	}
+	unsafe := eqWith(&FuncCall{Name: "nextval", Args: []Expr{&StringConst{Value: "s"}}})
+	if _, ok := gatherToUnwrapForPartialAgg(build(unsafe)); ok {
+		t.Error("gatherToUnwrapForPartialAgg must not peel a parallel-unsafe Filter into the workers")
+	}
+	if _, ok := spliceGatherOnPartialSpine(build(unsafe)); ok {
+		t.Error("spliceGatherOnPartialSpine must not peel a parallel-unsafe Filter into the workers")
+	}
+	safe := srcEq(0, "x", 1, 7)
+	if got, ok := gatherToUnwrapForPartialAgg(build(safe)); !ok {
+		t.Error("a parallel-safe Filter is still peeled")
+	} else if f, isF := got.(*Filter); !isF || subtreeHasGather(f) {
+		t.Errorf("the peeled Filter must sit directly on the Gather's child, got %T", got)
+	}
+	if _, ok := spliceGatherOnPartialSpine(build(safe)); !ok {
+		t.Error("the partial-spine splice still peels a parallel-safe Filter")
+	}
+}
+
+// TestGatheredArmBoundariesShareComputeGatherRows pins M0146-0009n: with a
+// searched partial path whose per-worker rows are not the serial seed's rows
+// over the divisor, the gathered (no-split) arm's Gather and its worker-sort
+// Gather Merge both carry `compute_gather_rows` (costsize.c) of the partial
+// input — per-worker rows × divisor, clamped. The Gather used to take the
+// seed's rows, so the two shapes were charged `parallel_tuple_cost` on
+// different counts and the Gather Merge won TPC-DS Q56's near-tie PG's
+// Sort-over-Gather wins.
+func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	// Every row its own group: nothing to pre-aggregate, so the no-split
+	// shapes are the ones the rel keeps.
+	agg := sizedAggFixture(t, 100_000, 100_000, 1, 1)
+	ps := upperSplitSettings()
+	cp := ps.costParams()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	seed := newPrebuiltPath(grouped, agg.Child)
+	seed.Rows = float64(EstimateRows(agg.Child))
+	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+
+	const workers = 4
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	partial := &Path{
+		Rows:            seed.Rows / d * 0.8,
+		Cost:            parallelSeedCost(seed.Cost, d),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+	}
+	want := clampRowEst(partial.Rows * d)
+	if want == clampRowEst(seed.Rows) {
+		t.Fatalf("fixture does not separate the partial rows from the seed's: both %v", want)
+	}
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
+
+	seen := map[PathKind]int{}
+	var walk func(p *Path)
+	walk = func(p *Path) {
+		if p == nil {
+			return
+		}
+		if p.Kind == PathGather || p.Kind == PathGatherMerge {
+			sub := p.Children[0]
+			if sub.Kind == PathSort {
+				sub = sub.Children[0]
+			}
+			if sub.Kind != PathAgg { // the split arm's boundary crosses group states
+				seen[p.Kind]++
+				if p.Rows != want {
+					t.Errorf("%v over the partial input: rows=%v, want compute_gather_rows=%v (seed rows %v)",
+						p.Kind, p.Rows, want, seed.Rows)
+				}
+			}
+		}
+		for _, c := range p.Children {
+			walk(c)
+		}
+	}
+	for _, p := range grouped.Pathlist {
+		walk(p)
+	}
+	if seen[PathGather] == 0 && seen[PathGatherMerge] == 0 {
+		t.Fatalf("no gathered no-split candidate survived on the rel: %d paths", len(grouped.Pathlist))
+	}
+	t.Logf("gathered boundaries checked: %v", seen)
 }

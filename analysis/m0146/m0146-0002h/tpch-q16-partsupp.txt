@@ -1,0 +1,9 @@
+== goopg before (HEAD eee73fbd3)
+                    ->  Parallel Seq Scan on partsupp  (cost=0.00..28029.00 rows=266667 width=544)
+                          Filter: (NOT (ps_suppkey = ANY (SubPlan 1)))
+== goopg after
+                    ->  Parallel Seq Scan on partsupp  (cost=0.00..28029.00 rows=400000 width=544)
+                          Filter: (NOT (ps_suppkey = ANY (SubPlan 1)))
+== PG 18.3 (4 workers; rows are per worker)
+                          ->  Parallel Index Only Scan using partsupp_pk on partsupp  (cost=350.43..19178.43 rows=100000 width=11)
+                                Filter: (NOT (ANY (ps_suppkey = (hashed SubPlan 1).col1)))

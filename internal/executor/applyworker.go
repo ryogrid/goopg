@@ -532,7 +532,7 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 			var oldBytes []byte
 			oldBytes, _ = oldTup.MarshalBinary()
 			if err := storage.PageSetHeapTupleXmax(sw.Page(), m.slot, ctx.Tx.XID); err == nil {
-				_ = markHeapDeleteDirty(ctx.Pool, sw, rel, blk, m.slot, ctx.Tx.XID, oldBytes)
+				_ = markHeapDeleteDirtyAndClearVM(ctx, sw, rel, blk, m.slot, ctx.Tx.XID, oldBytes)
 			}
 			sw.Unlock()
 			ctx.Pool.Unpin(sw)

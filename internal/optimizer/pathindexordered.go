@@ -69,6 +69,10 @@ func (s *searchCtx) addBaseRelIndexPaths(cat catalog.Catalog) {
 	// index, and add_path keeps the cheaper one in each cost regime.
 	s.addBaseRelBitmapPaths(cat)
 	s.addParameterizedBitmapPaths(cat)
+	// M0146-0049: add_paths_to_append_rel's parameterised Appends over a
+	// flattened UNION ALL leaf, built from member probes the base-rel
+	// producers above price (paramappend.go).
+	s.addParameterizedAppendPaths(cat)
 	// M0134-0187: `create_index_path(..., indexonly=true)` for every index
 	// covering what the statement reads from the relation — generated here
 	// because it competes in the same rel's pathlist as the rest.
@@ -146,6 +150,10 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		added := false
 		for _, idx := range cat.IndexesOnTable(tbl) {
+			// A catalog-only index (gist/spgist/gin/brin) has nothing to scan (M0146-0069).
+			if !idx.HasStorage() {
+				continue
+			}
 			if s.addOneOrderedIndexPath(rel, tbl, idx, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}

@@ -138,6 +138,18 @@ type joinOp struct {
 	execResidualNode int32
 	execCompiled     bool
 
+	// buildKeyTrim/probeKeyTrim flag a bpchar-typed key expression on each
+	// side: PostgreSQL's bpchar hash opclass (hashbpchar, varchar.c) hashes
+	// the bcTruelen image, so 'ab' and 'ab   ' must land on the same bucket
+	// or the hash join misses pairs the scalar `=` calls equal. Computed
+	// once in compileExecExprs from the same expression split the loops
+	// index, mirroring how the node lists are derived. An untyped literal
+	// key trims only when the OTHER side is bpchar (PG coerces the unknown
+	// to the typed side). M0146 bpchar-join sibling of the scalar
+	// comparisonOperandsAsBpchar rule.
+	buildKeyTrim []bool
+	probeKeyTrim []bool
+
 	// M0127-P2.3 (07 §2): the same split for the MERGE algorithm, taken
 	// from planner.Join.ExecMergeKeyPlan by initMergeKeys. Deliberately
 	// NOT the execKeys/execResidual slots above: those are filled on the
@@ -159,6 +171,10 @@ type joinOp struct {
 	mergeResidualNode int32
 	mergeResidSlot    *MaterializedSlot
 	mergeCompiled     bool
+	// mergeKeyText flags key pairs whose two sides are both character
+	// strings: they order as plain text whatever the values look like
+	// (M0146-0053). Filled by compileMergeExprs.
+	mergeKeyText []bool
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
@@ -207,6 +223,9 @@ type joinOp struct {
 	lazyProbeSlot     *MaterializedSlot
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
+	// lazyBuildOnlySlot carries a right semi/anti join's emitted build row
+	// (buildOnlyEmit, M0146-0005dj).
+	lazyBuildOnlySlot *MaterializedSlot
 
 	// M0127-P1.1 (design leftdeep-joins/05 §2, stage E1; the un-deferred
 	// 0126-0004): probe-side slot chaining. nextLazy used to flatten the
@@ -269,6 +288,25 @@ type joinOp struct {
 	antiBuildRows     int  // total right-side rows seen during build
 	antiBuildHasNull  bool // any right-side row's join key was NULL
 
+	// M0146-0049d1: PG's `hashtable->totalTuples` for the empty-inner exit
+	// (ExecHashJoin's HJ_BUILD_HASHTABLE state, nodeHashjoin.c). buildRows
+	// counts every row the build loops drained (the serial build's and the
+	// cooperative build's, which share them); buildRowsCounted says the
+	// count is complete — the CTID and shared builds leave it false, so
+	// those builds never take the exit.
+	buildRows        int64
+	buildRowsCounted bool
+	// The outer-prefetch half of the same state (HJ_BUILD_HASHTABLE's
+	// empty-outer test). firstProbe is the probe tuple fetched before the
+	// build, handed back by pullProbe's first call. outerNotEmpty is PG's
+	// hj_OuterNotEmpty: it survives a re-Open (a rescan) on purpose, so a
+	// rescan whose previous scan found the outer non-empty skips the
+	// prefetch. prefetchCost caches the cost half of the test (0 unknown,
+	// 1 prefetch, 2 do not).
+	firstProbe    TupleSlot
+	outerNotEmpty bool
+	prefetchCost  int8
+
 	// M0118-0009 (eval-plan-qual): when a downstream LockRows (FOR UPDATE OF
 	// <rel>) needs to lock a relation that ends up on the BUILD side of a lazy
 	// hash join, the build scan is drained + closed at Open so its currentTID
@@ -297,6 +335,15 @@ type joinOp struct {
 	lazyMatchedS   map[string][]bool
 	lazyMatchedI   map[int64][]bool
 	lazyMatchedCur []bool
+	// parallelFill is the shared build state of a Parallel Hash join that
+	// fills its build side; parallelProbing is this participant's probe
+	// attachment to it, and parallelSkipProbe marks a participant that
+	// arrived after the sweep was claimed (parallel_hash_shared.go,
+	// M0146-0005dj).
+	parallelFill      *parallelHashBuild
+	parallelProbing   bool
+	parallelSkipProbe bool
+	parallelSweeps    bool
 	fillNullBuild  []Row
 	fillNullIdx    int
 	sweepInit      bool
@@ -324,6 +371,11 @@ type joinOp struct {
 	// maybeInstrument; nil when EXPLAIN ANALYZE is not active. Incremented
 	// each time joinPredicateMatchSlot returns false (residual reject).
 	joinFilterRemoved *int64
+
+	// probeQual / probeFilterRemoved: see nestedLoopIndexJoinOp — the
+	// Lateral nested-loop form over a parameterized probe splits the same way.
+	probeQual          optimizer.Expr
+	probeFilterRemoved *int64
 
 	// deformLeftBound / deformRightBound are the EX1-02 per-side deform
 	// bounds the tree builder used for THIS join's two children
@@ -372,6 +424,10 @@ func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
 
+func (o *joinOp) setProbeFilterAttribution(probe optimizer.Expr, counter *int64) {
+	o.probeQual, o.probeFilterRemoved = probe, counter
+}
+
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	// M0061-0001: keyed Semi / Anti joins run through the lazy hash
@@ -397,6 +453,14 @@ func (o *joinOp) Open(ctx *Context) error {
 	// nested loop, which cannot re-bind the probe's parameter per outer row.
 	if o.plan.Lateral {
 		return o.openLateral(ctx)
+	}
+	if o.plan.Type.IsRightSemiAnti() {
+		// M0146-0005dj: PG plans JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI only as a
+		// hash join (the build side carries the match marks).
+		if o.plan.Algo != optimizer.JoinAlgoHash {
+			return fmt.Errorf("internal error: right semi/anti join requires the hash algorithm, got %d", o.plan.Algo)
+		}
+		return o.openLazyHashJoin(ctx)
 	}
 	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		switch o.plan.Algo {
@@ -574,11 +638,137 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		o.applySharedBuild(ctx, sb)
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
+	o.firstProbe = nil
+	probeOpened := false
+	if o.wantOuterPrefetch() {
+		probe := o.right
+		if !o.hashBuildIsLeft() {
+			probe = o.left
+		}
+		if err := probe.Open(ctx); err != nil {
+			return err
+		}
+		probeOpened = true
+		slot, err := probe.Next()
+		if err == EOF {
+			// An empty outer ends the join before the hash table is
+			// built. Next finds no stream and answers EOF; Close closes
+			// the opened probe and the never-Opened build side alike.
+			o.outerNotEmpty = false
+			o.lazyProbe = nil
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		o.outerNotEmpty = true
+		o.firstProbe = slot
+	}
 	probeIsLeft, err := o.buildLazyHashTable(ctx)
 	if err != nil {
 		return err
 	}
+	// "Reset OuterNotEmpty for scan" (nodeHashjoin.c): the probe loop sets
+	// it again from the first tuple it reads, the prefetched one included.
+	o.outerNotEmpty = false
+	if o.emptyBuildEndsJoin() {
+		// Without a prefetch the probe side is never opened: Next finds no
+		// stream and answers EOF, and Close on a never-Opened operator is a
+		// no-op.
+		o.firstProbe = nil
+		o.lazyProbe = nil
+		return nil
+	}
+	if probeOpened {
+		return o.adoptProbeSide(probeIsLeft)
+	}
 	return o.openProbeSide(ctx, probeIsLeft)
+}
+
+// wantOuterPrefetch is ExecHashJoin's decision to fetch the first outer tuple
+// before building the hash table (nodeHashjoin.c, HJ_BUILD_HASHTABLE): never
+// for a join that fills the inner side (the table is needed whatever the
+// outer holds); always for one that fills the outer side; otherwise when the
+// outer's startup cost is below the Hash node's total cost and the previous
+// scan did not find the outer non-empty. An empty outer then skips the build.
+//
+// Only the serial build takes it, as only PG's serial build does: the shared
+// and Parallel Hash builds return before this point, and the CTID-preserving
+// build (a downstream FOR UPDATE on the build relation) keeps its order.
+func (o *joinOp) wantOuterPrefetch() bool {
+	if o.preserveCTIDRel != nil || o.fillBuildSide() {
+		return false
+	}
+	if o.probeFillsUnmatched() {
+		return true
+	}
+	if o.outerNotEmpty {
+		return false
+	}
+	if o.prefetchCost == 0 {
+		o.prefetchCost = 2
+		probeNode, buildNode := o.plan.Left, o.plan.Right
+		if o.hashBuildIsLeft() {
+			probeNode, buildNode = buildNode, probeNode
+		}
+		if probeNode != nil && buildNode != nil {
+			// The Hash node's total cost is its child's
+			// (create_hashjoin_plan copies the inner path's costs).
+			_, probeStartup, _, _ := explainCostFields(probeNode, 0)
+			_, _, buildTotal, _ := explainCostFields(buildNode, 0)
+			if probeStartup < buildTotal {
+				o.prefetchCost = 1
+			}
+		}
+	}
+	return o.prefetchCost == 1
+}
+
+// adoptProbeSide is openProbeSide for a probe the outer prefetch already
+// opened: the build left it untouched, and pullProbe hands back the
+// prefetched tuple first.
+func (o *joinOp) adoptProbeSide(probeIsLeft bool) error {
+	probe := o.right
+	if probeIsLeft {
+		probe = o.left
+	}
+	o.lazyProbe = probe
+	o.probeEOF = false
+	o.fillSweepReset()
+	if o.batches != nil {
+		o.batches.nbatchOutstart = o.batches.nbatch
+	}
+	return nil
+}
+
+// pullProbe reads the next probe tuple: the prefetched one first, then the
+// probe operator. A tuple read sets outerNotEmpty, as
+// ExecHashJoinOuterGetTuple sets hj_OuterNotEmpty.
+func (o *joinOp) pullProbe() (TupleSlot, error) {
+	if s := o.firstProbe; s != nil {
+		o.firstProbe = nil
+		o.outerNotEmpty = true
+		return s, nil
+	}
+	s, err := o.lazyProbe.Next()
+	if err == nil {
+		o.outerNotEmpty = true
+	}
+	return s, err
+}
+
+// emptyBuildEndsJoin is ExecHashJoin's empty-inner exit (nodeHashjoin.c,
+// HJ_BUILD_HASHTABLE): when the hash table came out empty and the join does
+// not emit unmatched outer tuples (`!HJ_FILL_OUTER`), no probe row can
+// produce output, so PG returns without scanning the outer relation. A
+// nested loop that rescans a hash join per outer row — the parameterised
+// inner of TPC-DS Q95, whose build is an index probe that usually finds
+// nothing — then pays for the probe, not for the whole outer side.
+//
+// The build-fill joins need no case of their own: an empty build has no
+// unmatched build row to sweep.
+func (o *joinOp) emptyBuildEndsJoin() bool {
+	return o.buildRowsCounted && o.buildRows == 0 && !o.probeFillsUnmatched()
 }
 
 // openProbeSide opens whichever side the build did not consume.
@@ -633,6 +823,8 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	o.lazyRW = rightWidth
 	o.antiBuildRows = 0
 	o.antiBuildHasNull = false
+	o.buildRows = 0
+	o.buildRowsCounted = false
 	// M0127-P4.2: a re-Open that skipped Close must not inherit the previous
 	// run's matched bitmaps or its retained NULL-key build rows.
 	o.lazyMatchedS = nil
@@ -660,7 +852,8 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// also defend here so a stray flag doesn't silently break the
 	// emit-once-per-probe-row invariant.
 	buildLeft := o.plan.BuildLeft
-	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti ||
+		o.plan.Type.IsRightSemiAnti() {
 		buildLeft = false
 	}
 	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
@@ -697,6 +890,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 			return false, err
 		}
 		o.presizeLazyHash(ctx, o.plan.Left, leftWidth, true)
+		o.buildRowsCounted = true
 		err := o.buildLoopLeft(ctx, rightWidth)
 		_ = o.left.Close()
 		if err != nil {
@@ -731,6 +925,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 		}
 	}
 	o.presizeLazyHash(ctx, o.plan.Right, rightWidth, false)
+	o.buildRowsCounted = true
 	err := o.buildLoopRight(ctx, leftWidth)
 	_ = o.right.Close()
 	if err != nil {
@@ -905,6 +1100,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 		if err != nil {
 			return err
 		}
+		o.buildRows++
 		l := slotRow(lSlot)
 		if leftWidth == 0 && len(l) > 0 {
 			leftWidth = len(l)
@@ -928,7 +1124,7 @@ func (o *joinOp) buildLoopLeft(ctx *Context, rightWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -974,6 +1170,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 		if err != nil {
 			return err
 		}
+		o.buildRows++
 		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r)
@@ -998,7 +1195,7 @@ func (o *joinOp) buildLoopRight(ctx *Context, leftWidth int) error {
 			}
 			continue
 		}
-		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], keySlot)
+		kd, ok, err := o.evalHashKeyDatumSlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 		if err != nil {
 			return err
 		}
@@ -1088,7 +1285,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 			key = string(o.execKeyBuf)
 		} else {
 			var kerr error
-			key, ok, kerr = o.evalHashKeySlot(o.buildKeyNodes[0], keySlot)
+			key, ok, kerr = o.evalHashKeySlot(o.buildKeyNodes[0], o.buildKeyTrim[0], keySlot)
 			if kerr != nil {
 				return kerr
 			}
@@ -1145,7 +1342,7 @@ func (o *joinOp) evalHashKeyDatum(keyExpr optimizer.Expr, row Row) (Datum, bool,
 // build/probe split still happens once in initExecKeys, so the two loops
 // still cannot disagree about orientation — they now index the same two
 // node lists instead of the same two expression lists.
-func (o *joinOp) evalHashKeyDatumSlot(node int32, slot SlotView) (Datum, bool, error) {
+func (o *joinOp) evalHashKeyDatumSlot(node int32, trim bool, slot SlotView) (Datum, bool, error) {
 	if node == noExpr {
 		return Datum{}, false, errNilHashKey
 	}
@@ -1156,12 +1353,15 @@ func (o *joinOp) evalHashKeyDatumSlot(node int32, slot SlotView) (Datum, bool, e
 	if v.IsNull() {
 		return Datum{}, false, nil
 	}
+	if trim {
+		v = trimStringDatum(v)
+	}
 	return v, true, nil
 }
 
 // evalHashKeySlot is the SlotView variant of evalHashKey, on the same
 // compiled node index as evalHashKeyDatumSlot.
-func (o *joinOp) evalHashKeySlot(node int32, slot SlotView) (string, bool, error) {
+func (o *joinOp) evalHashKeySlot(node int32, trim bool, slot SlotView) (string, bool, error) {
 	if node == noExpr {
 		return "", false, errNilHashKey
 	}
@@ -1171,6 +1371,9 @@ func (o *joinOp) evalHashKeySlot(node int32, slot SlotView) (string, bool, error
 	}
 	if v.IsNull() {
 		return "", false, nil
+	}
+	if trim {
+		v = trimStringDatum(v)
 	}
 	return datumKey(v), true, nil
 }
@@ -1374,6 +1577,15 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
 	if !ok && o.joinFilterRemoved != nil {
 		*o.joinFilterRemoved++
+		if o.probeQual != nil && o.probeFilterRemoved != nil {
+			pv, err := evalExpr(o.probeQual, row, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			if pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+				*o.probeFilterRemoved++
+			}
+		}
 	}
 	return ok, nil
 }
@@ -1406,6 +1618,9 @@ func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	ok := !v.IsNull() && v.Kind == KindBool && v.BoolValue()
 	if !ok && o.joinFilterRemoved != nil {
 		*o.joinFilterRemoved++
+		if err := attributeProbeReject(o.probeQual, o.probeFilterRemoved, slot, o.ctx); err != nil {
+			return false, err
+		}
 	}
 	return ok, nil
 }
@@ -1620,7 +1835,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			return nil, EOF
 		}
 		if o.antiBuildRows == 0 {
-			probeSlot, err := o.lazyProbe.Next()
+			probeSlot, err := o.pullProbe()
 			if err == EOF {
 				return nil, EOF
 			}
@@ -1660,6 +1875,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			}
 			if !ok {
 				continue
+			}
+			// M0146-0005dj: PG's JOIN_RIGHT_SEMI / JOIN_RIGHT_ANTI arms of
+			// HJ_SCAN_BUCKET. A build row already matched is skipped; a new
+			// match is marked, and RIGHT SEMI emits the build row alone while
+			// RIGHT ANTI emits nothing (its sweep emits the unmarked rows).
+			if o.plan.Type.IsRightSemiAnti() {
+				if mi < len(o.lazyMatchedCur) {
+					if o.lazyMatchedCur[mi] {
+						continue
+					}
+					o.lazyMatchedCur[mi] = true
+				}
+				if o.plan.Type == optimizer.JoinTypeRightAnti {
+					continue
+				}
+				return o.buildOnlyEmit(m), nil
 			}
 			o.lazyProbeMatched = true
 			// M0127-P4.2 (07 §3): PG's HeapTupleHeaderSetMatch — the build
@@ -1708,17 +1939,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// part of its contract).
 		var probeSlot TupleSlot
 		var err error
-		if o.probeEOF {
+		if o.probeEOF || o.parallelSkipProbe {
 			err = EOF
 		} else {
-			probeSlot, err = o.lazyProbe.Next()
+			probeSlot, err = o.pullProbe()
 		}
 		if err == EOF {
+			if !o.probeEOF {
+				// A Parallel Hash fill-build join sweeps the shared table once,
+				// in the last participant to finish probing.
+				o.parallelSweeps = o.parallelFillDetach()
+			}
 			o.probeEOF = true
 			// M0127-P4.2 (07 §3): PG's HJ_FILL_INNER_TUPLES. This batch's
 			// build side is still resident, so sweep its unmatched rows
 			// BEFORE the next batch overwrites the table (06 §2.5).
-			if o.fillBuildSide() {
+			if o.fillBuildSide() && o.parallelSweeps {
 				if s := o.fillSweepNext(); s != nil {
 					return s, nil
 				}
@@ -1726,7 +1962,13 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P3.2 (06 §2.3): PG's HJ_NEED_NEW_BATCH. The probe stream
 			// ending means this batch is done, not that the join is — load
 			// the next batch's build side and replay its saved probe rows.
-			if o.batches != nil {
+			if o.batches != nil && o.parallelFill != nil && !o.parallelSweeps {
+				// M0146-0095: a Parallel Hash join that fills its build
+				// side runs its later batches in the participant that
+				// claimed the sweep, over every participant's probe rows
+				// (handed over at detach). This one has nothing left to do.
+				o.batches.close()
+			} else if o.batches != nil {
 				more, berr := o.batches.nextBatch(o)
 				if berr != nil {
 					return nil, berr
@@ -1806,7 +2048,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P4.2: a fill-build join needs the key materialised for
 			// the same reason FOR UPDATE does — its parallel map is keyed
 			// alongside lazyHash.
-			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.fillBuildSide())
+			matches, key, ok, err = o.compositeProbeMatches(keySlot, o.preserveBuildSide || o.buildMatchTracked())
 			if err != nil {
 				return nil, err
 			}
@@ -1814,7 +2056,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, keySlot)
+			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -1843,7 +2085,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// Assign the OUTER key: the preserveBuildSide CTID lookup
 			// below reads o.lazyHashCTID[key], so a shadowing inner
 			// declaration would leave it empty for FOR UPDATE joins.
-			key, ok, err = o.evalHashKeySlot(probeKeyNode, keySlot)
+			key, ok, err = o.evalHashKeySlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
 			if err != nil {
 				return nil, err
 			}
@@ -1941,7 +2183,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
 		// successful match is one indexed store. A join that fills neither
 		// build side keeps lazyMatchedCur nil and pays nothing.
-		if o.fillBuildSide() {
+		if o.buildMatchTracked() {
 			if haveIntKey {
 				o.lazyMatchedCur = o.matchedIntBucket(matchIntKey, len(matches))
 			} else {
@@ -1973,6 +2215,7 @@ func (o *joinOp) Close() error {
 	o.releaseBuildBytes()
 	o.releaseBuildCells()
 	o.lazyProbe = nil
+	o.firstProbe = nil
 	o.lazyProbeSrc = nil
 	o.lazyMatches = nil
 	o.lazyMatchIdx = 0
@@ -1984,6 +2227,10 @@ func (o *joinOp) Close() error {
 	o.fillNullBuild = nil
 	o.fillNullIdx = 0
 	o.probeEOF = false
+	o.parallelFill = nil
+	o.parallelProbing = false
+	o.parallelSkipProbe = false
+	o.parallelSweeps = false
 	o.fillSweepReset()
 	o.ctx = nil
 	errL := o.left.Close()
@@ -2009,6 +2256,12 @@ type aggregateOp struct {
 	// previous row's key parts across rows (curParts).
 	gkVals Row
 	gkKeys []string
+	// gkTrims[i] flags a bpchar-typed grouping expression: its bcTruelen
+	// image is what the group key must hash (PG's hashbpchar ignores
+	// trailing blanks so that char(20) 'x' and char(5) 'x' land in one
+	// group). nil when no grouping column is bpchar — the common case
+	// pays nothing. M0146 bpchar hash parity.
+	gkTrims []bool
 	// slot is reused across emissions (review/260831 EO2-24).
 	slot MaterializedSlot
 
@@ -2101,6 +2354,13 @@ type aggRuntime struct {
 	// pg_get_publication_tables. M0103-0008 probe-survival.
 	arrayElems    []string
 	arrayElemNull []bool
+	// arrayOfArrays marks array_agg over an ARRAY input
+	// (array_agg_array_transfn): each arrayElems entry is a whole input
+	// array's text and the result stacks them one dimension deeper;
+	// arrayShape is the first input's dimension lengths, which every later
+	// input must match. M0146-0033.
+	arrayOfArrays bool
+	arrayShape    []int
 	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
 	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
 	arrayElemKeys [][]Datum
@@ -2161,7 +2421,16 @@ type aggRuntime struct {
 }
 
 func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
-	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
+	o := &aggregateOp{plan: plan, child: child, schema: plan.Output()}
+	for i, g := range plan.GroupExprs {
+		if declaredBpcharTypmod(g) > 0 {
+			if o.gkTrims == nil {
+				o.gkTrims = make([]bool, len(plan.GroupExprs))
+			}
+			o.gkTrims[i] = true
+		}
+	}
+	return o
 }
 
 // aggPlanUsesCTID reports whether an Aggregate plan evaluates any expression
@@ -2257,6 +2526,34 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return o.openSorted(ctx)
 	}
 
+	// M0146-0003 S5: a sorted-armed row-transport finalize consumes a
+	// merge-ordered serialized-state stream (PG's Finalize GroupAggregate
+	// over Gather Merge). Same pairing contract as the hash absorb: the
+	// flag must sit on both nodes of the pair.
+	if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit && o.plan.Strategy == optimizer.AggStrategySorted {
+		if o.plan.GroupingSets != nil {
+			return &ExecError{
+				Code:    "XX000",
+				Message: "internal error: row-transport finalize does not support grouping sets",
+			}
+		}
+		return o.openSortedPartialTransport(ctx)
+	}
+
+	// M0146-0027 slice 3: the sorted-INPUT partial — `Partial
+	// GroupAggregate` over a per-worker Sort (upstream's
+	// `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` arm,
+	// planner.c:7518-7560). Streams the worker's already-ordered
+	// partition like openSorted and emits the transport row at each
+	// group boundary; a Partial/Sorted node whose producer gate dropped
+	// (grouping sets or no keys) falls through to the hash drain, which
+	// emits the same wire shape sorted at the end — the safe direction.
+	if o.plan.Mode == optimizer.AggModePartial && o.plan.PartialEmit &&
+		o.plan.Strategy == optimizer.AggStrategySorted &&
+		o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 {
+		return o.openSortedPartialEmit(ctx)
+	}
+
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
 
@@ -2281,7 +2578,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// grand-total level of a ROLLUP — produces exactly one output row even
 	// over zero input rows, so its group is created before the drain.
 	for si, set := range sets {
-		if len(set) > 0 {
+		// M0146-0102: a keyless GROUPED aggregate (every GROUP BY key pruned
+		// as constant-pinned) is PG's AGG_SORTED with zero columns, not
+		// AGG_PLAIN: it forms its single group only from input rows and
+		// returns nothing over empty input.
+		if len(set) > 0 || o.plan.GroupedNoKeys {
 			continue
 		}
 		var ptVals Row
@@ -2312,6 +2613,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			if cerr := ctx.Ctx.Err(); cerr != nil {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
+		}
+		// M0146-0003b: a row-transport finalize's child delivers
+		// serialized-state rows, not aggregate inputs — absorb each one
+		// into the group map instead of running transitions on it.
+		if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit {
+			if err := o.absorbPartialStateRow(slot, groups, &order); err != nil {
+				return err
+			}
+			continue
 		}
 		// Every grouping column is evaluated ONCE per input row; the per-set
 		// keys below are cut out of that one vector. This is the whole point
@@ -2387,6 +2697,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 
 	switch o.plan.Mode {
 	case optimizer.AggModePartial:
+		if o.plan.PartialEmit {
+			return o.emitPartialStateRows(groups, order)
+		}
 		// Publish this worker's groups and emit NOTHING. The Finalize node
 		// supplies every output row from the accumulator, so a Partial node
 		// returning zero rows is by construction, not a failure — see the
@@ -2412,6 +2725,17 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return nil
 
 	case optimizer.AggModeFinal:
+		if o.plan.PartialEmit {
+			if o.plan.GroupingSets != nil {
+				return &ExecError{
+					Code:    "XX000",
+					Message: "internal error: row-transport finalize does not support grouping sets",
+				}
+			}
+			// groups/order were absorbed from the state rows in the drain
+			// above; nothing to adopt — fall through to the shared emit.
+			break
+		}
 		if accum == nil {
 			return &ExecError{
 				Code:    "XX000",
@@ -2477,7 +2801,88 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// rewrite. rowSets[i] is the set index of o.rows[i]; it is carried
 	// alongside rather than in the row because the set index is not an output
 	// column.
-	if nGroupCols > 0 {
+	// M0146-0020a: a SORTED single rollup emits as PG's one-pass AGG_SORTED
+	// does: along the rollup order, each group closes when its prefix
+	// changes, so within a prefix the detail groups come first and the
+	// rolled-up group after them; the grand total is last.
+	//
+	// M0146-0020b: with several rollups (o.plan.Rollups) AGG_SORTED runs one
+	// phase per rollup — the first over the input, each later one over its
+	// own sort — so the rows come rollup by rollup, each along its own order.
+	var rollupOf []int       // set index -> rollup index
+	var rollupOrders [][]int // rollup index -> its column order
+	rollup := false
+	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil {
+		if len(o.plan.Rollups) > 0 {
+			rollupOf = make([]int, len(o.plan.GroupingSets))
+			// AGG_MIXED emits the sorted phases first and the hash
+			// tables after them (nodeAgg's agg_retrieve_direct switches
+			// to agg_retrieve_hash_table once the last sorted phase ends).
+			all := append(append([]optimizer.GroupingRollup(nil), o.plan.Rollups...), o.plan.HashedRollups...)
+			for ri, r := range all {
+				rollupOrders = append(rollupOrders, r.Order)
+				for _, si := range r.Sets {
+					if si >= 0 && si < len(rollupOf) {
+						rollupOf[si] = ri
+					}
+				}
+			}
+			rollup = true
+		} else if order, ok := optimizer.RollupChainOrder(o.plan.GroupingSets); ok {
+			rollupOf = make([]int, len(o.plan.GroupingSets))
+			rollupOrders = [][]int{order}
+			rollup = true
+		}
+	}
+	if nGroupCols > 0 && rollup {
+		rowSets := emitted
+		inSet := make([]map[int]bool, len(o.plan.GroupingSets))
+		for si, set := range o.plan.GroupingSets {
+			inSet[si] = map[int]bool{}
+			for _, c := range set {
+				inSet[si][c] = true
+			}
+		}
+		idxOf := make([]int, len(o.rows))
+		for i := range idxOf {
+			idxOf[i] = i
+		}
+		sort.SliceStable(idxOf, func(a, b int) bool {
+			i, j := idxOf[a], idxOf[b]
+			ra, rb := o.rows[i], o.rows[j]
+			if rollupOf[rowSets[i]] != rollupOf[rowSets[j]] {
+				return rollupOf[rowSets[i]] < rollupOf[rowSets[j]]
+			}
+			for _, c := range rollupOrders[rollupOf[rowSets[i]]] {
+				aIn, bIn := inSet[rowSets[i]][c], inSet[rowSets[j]][c]
+				switch {
+				case !aIn && !bIn:
+					continue
+				case aIn && !bIn:
+					return true // detail group before its rolled-up group
+				case !aIn && bIn:
+					return false
+				}
+				av, bv := ra[c], rb[c]
+				if av.IsNull() || bv.IsNull() {
+					if av.IsNull() == bv.IsNull() {
+						continue
+					}
+					return !av.IsNull() // NULLS LAST
+				}
+				cmp, _ := compareDatumTyped(av, bv, 0, groupExprAt(o.plan, c))
+				if cmp != 0 {
+					return cmp < 0
+				}
+			}
+			return false
+		})
+		sorted := make([]Row, len(o.rows))
+		for pos, i := range idxOf {
+			sorted[pos] = o.rows[i]
+		}
+		o.rows = sorted
+	} else if nGroupCols > 0 {
 		rowSets := emitted
 		idxOf := make([]int, len(o.rows))
 		for i := range idxOf {
@@ -2490,7 +2895,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 			ra, rb := o.rows[i], o.rows[j]
 			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
-				c, _ := compareDatum(ra[k], rb[k], 0)
+				c, _ := compareDatumTyped(ra[k], rb[k], 0, groupExprAt(o.plan, k))
 				if c < 0 {
 					return true
 				}
@@ -2521,7 +2926,7 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 	}
 	vals := make(Row, 0, n)
 	parts := make([]string, 0, n)
-	for _, g := range o.plan.GroupExprs {
+	for i, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
 			return nil, nil, err
@@ -2534,7 +2939,11 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 		// MaterializeArena is a no-op for non-arena Datums.
 		v = v.MaterializeArena()
 		vals = append(vals, v)
-		parts = append(parts, datumKey(v))
+		kv := v
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			kv = trimStringDatum(kv)
+		}
+		parts = append(parts, datumKey(kv))
 	}
 	return vals, parts, nil
 }
@@ -2552,12 +2961,15 @@ func (o *aggregateOp) evalGroupKeysScratch(slot TupleSlot) (Row, []string, error
 	}
 	vals := o.gkVals[:0]
 	keys := o.gkKeys[:0]
-	for _, g := range o.plan.GroupExprs {
+	for i, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
 			return nil, nil, err
 		}
 		vals = append(vals, v)
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			v = trimStringDatum(v)
+		}
 		keys = append(keys, datumKey(v))
 	}
 	o.gkVals, o.gkKeys = vals, keys
@@ -2590,6 +3002,419 @@ func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet 
 		b.WriteString(allKeys[ci])
 	}
 	return b.String()
+}
+
+// emitPartialStateRows emits a PartialEmit partial's output: one row per
+// group carrying [group key values | passthrough values | serialized
+// transition state per aggregate] — the bytea-shaped transport PG's
+// aggserialfn produces (M0146-0003b). Rows leave in group-key order, the
+// same deterministic convention the shared emit tail uses; a Sort node
+// above the partial (PG's `Sort -> Partial HashAggregate`) can only
+// reorder, never change the set.
+func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, order []string) error {
+	o.rows = make([]Row, 0, len(order))
+	for _, key := range order {
+		gr := groups[key]
+		if gr == nil {
+			continue
+		}
+		row := make(Row, 0, len(gr.groupValues)+len(gr.passthroughVals)+len(gr.aggs))
+		row = append(row, gr.groupValues...)
+		row = append(row, gr.passthroughVals...)
+		for i := range gr.aggs {
+			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i])
+			if err != nil {
+				return err
+			}
+			row = append(row, d)
+		}
+		o.rows = append(o.rows, row)
+	}
+	nGroupCols := len(o.plan.GroupExprs)
+	if nGroupCols > 0 {
+		sort.SliceStable(o.rows, func(a, b int) bool {
+			ra, rb := o.rows[a], o.rows[b]
+			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
+				c, _ := compareDatumTyped(ra[k], rb[k], 0, groupExprAt(o.plan, k))
+				if c != 0 {
+					return c < 0
+				}
+			}
+			return false
+		})
+	}
+	return nil
+}
+
+// openSortedPartialEmit is the SORTED-input PartialEmit partial —
+// `Partial GroupAggregate -> Sort` per worker, upstream's
+// `create_agg_path(… AGG_SORTED, AGGSPLIT_INITIAL_SERIAL …)` arm of
+// create_partial_grouping_paths (planner.c:7518-7560), the shape PG
+// elects on TPC-DS Q19/Q62/Q99 (M0146-0027 slice 3). It runs
+// openSorted's streaming loop verbatim — the per-worker Sort under it
+// delivers the partition in group-key order, so a key change is a group
+// boundary — but flushes the emitPartialStateRows wire shape
+// ([group values | passthrough | serialized transition state]) instead
+// of a finished row. Input order IS group-key order, so unlike the hash
+// drain it needs no emit-time sort: the rows reach the Gather Merge
+// already ordered by the transport keys the merge was built with.
+//
+// The transition state is serialized exactly as emitPartialStateRows
+// does — raw, unsynced follower states included; the Finalize side's
+// own shared-state sync (the same code the hashed transport relies on)
+// does the reconciliation after the combine. GroupRuntime construction
+// (first row's passthrough, gv copy, SharedStateSlot follower skip) is
+// identical to both siblings on purpose: the transport row for a group
+// must not depend on which strategy discovered it.
+func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
+	nGroupCols := len(o.plan.GroupExprs)
+
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		row := make(Row, 0, len(cur.groupValues)+len(cur.passthroughVals)+len(cur.aggs))
+		row = append(row, cur.groupValues...)
+		row = append(row, cur.passthroughVals...)
+		for i := range cur.aggs {
+			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i])
+			if err != nil {
+				return err
+			}
+			row = append(row, d)
+		}
+		o.rows = append(o.rows, row)
+		cur = nil
+		return nil
+	}
+
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		allVals, parts, err := o.evalGroupExprs(slot)
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, parts) {
+			if err := flush(); err != nil {
+				return err
+			}
+			var ptVals Row
+			if len(o.plan.Passthrough) > 0 {
+				ptVals = make(Row, len(o.plan.Passthrough))
+				for i, expr := range o.plan.Passthrough {
+					v, err := evalExprSlot(expr, slot, o.ctx)
+					if err != nil {
+						ptVals[i] = NullDatum
+					} else {
+						ptVals[i] = v
+					}
+				}
+			}
+			var gv Row
+			if nGroupCols > 0 {
+				gv = make(Row, nGroupCols)
+				copy(gv, allVals)
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			curParts = parts
+		}
+		o.currentRowVersion++
+		for i, call := range o.plan.Aggs {
+			// SharedStateSlot followers skip sfunc exactly as the hash
+			// drain and openSorted do (M0097-0035): they are synced from
+			// the leader's combined state on the FINALIZE side.
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+				isFollower := false
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						isFollower = true
+						break
+					}
+				}
+				if isFollower {
+					continue
+				}
+			}
+			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+// partialStateRow is one decoded transport row — [group key values |
+// passthrough values | deserialized transition state per aggregate].
+// keyParts is the datumKey vector the hash absorb's map key is built
+// from and the sorted fold's boundary test compares; gv/pt reference
+// the transport row and are detached by whichever arm retains them.
+type partialStateRow struct {
+	keyParts []string
+	gv       Row
+	pt       Row
+	states   []aggRuntime
+}
+
+// decodePartialStateRow validates and splits one transported partial
+// row. Shared by the hash absorb (absorbPartialStateRow) and the sorted
+// fold (openSortedPartialTransport): a malformed row — wrong width, a
+// non-bytes state column, a truncated or overlong serialized frame —
+// errors identically on both arms, so the two consumers can never
+// disagree about what the wire shape is.
+func (o *aggregateOp) decodePartialStateRow(row Row) (*partialStateRow, error) {
+	nGroupCols := len(o.plan.GroupExprs)
+	nPass := len(o.plan.Passthrough)
+	nAggs := len(o.plan.Aggs)
+	if len(row) != nGroupCols+nPass+nAggs {
+		return nil, &ExecError{
+			Code: "XX000",
+			Message: fmt.Sprintf("internal error: partial-state row has %d columns, want %d "+
+				"(group keys + passthrough + aggregates) — a PartialEmit partial must feed "+
+				"a PartialEmit finalize", len(row), nGroupCols+nPass+nAggs),
+		}
+	}
+	dr := &partialStateRow{
+		keyParts: make([]string, nGroupCols),
+		gv:       row[:nGroupCols],
+		pt:       row[nGroupCols : nGroupCols+nPass],
+		states:   make([]aggRuntime, nAggs),
+	}
+	for i, d := range dr.gv {
+		if i < len(o.gkTrims) && o.gkTrims[i] {
+			d = trimStringDatum(d)
+		}
+		dr.keyParts[i] = datumKey(d)
+	}
+	for i := 0; i < nAggs; i++ {
+		sd := row[nGroupCols+nPass+i]
+		if sd.Kind != KindBytes {
+			return nil, &ExecError{
+				Code: "XX000",
+				Message: fmt.Sprintf("internal error: partial-state column %d has datum kind %v, "+
+					"want serialized bytes", i, sd.Kind),
+			}
+		}
+		st, err := deserializeAggRuntime(o.plan.Aggs[i].Name, sd.BytesValue())
+		if err != nil {
+			return nil, err
+		}
+		dr.states[i] = st
+	}
+	return dr, nil
+}
+
+// absorbPartialStateRow folds one transported partial row into the
+// finalize's group map (M0146-0003b): deserialised states combine
+// through the SAME combineAggRuntime rules the shared-accumulator
+// transport uses, so the two transports can never disagree about what a
+// combination means.
+func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*groupRuntime, order *[]string) error {
+	dr, err := o.decodePartialStateRow(slot.Row())
+	if err != nil {
+		return err
+	}
+	nGroupCols := len(dr.gv)
+	set := make([]int, nGroupCols)
+	for i := range set {
+		set[i] = i
+	}
+	key := o.setGroupKey(0, set, dr.keyParts, false)
+	gr, ok := groups[key]
+	if !ok {
+		// Retain the founder's key and passthrough values detached from
+		// the transport row, the same retention boundary the input drain
+		// applies (M0073-0004).
+		ngv := make(Row, nGroupCols)
+		for i := range ngv {
+			ngv[i] = dr.gv[i].MaterializeArena()
+		}
+		var npt Row
+		if len(dr.pt) > 0 {
+			npt = make(Row, len(dr.pt))
+			for i := range npt {
+				npt[i] = dr.pt[i].MaterializeArena()
+			}
+		}
+		gr = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, len(dr.states))}
+		groups[key] = gr
+		*order = append(*order, key)
+	}
+	for i := range dr.states {
+		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// transportKeyOrder is one merge-order descriptor for the sorted
+// transport-final's order belt: which group-value position to compare,
+// and in which direction/null placement.
+type transportKeyOrder struct {
+	pos        int
+	desc       bool
+	nullsFirst bool
+}
+
+// partialTransportMergeOrder derives the order a sorted transport
+// stream was merged by from the Final's own GroupClause — the same
+// clause the producer built the worker Sort and Gather Merge keys
+// from. The fallback replicates groupClauseKeys exactly (honour the
+// clause only when it is a complete permutation of the group
+// expressions, else written order ASC NULLS LAST): the belt and the
+// producer must read the same order, because a belt that checks a
+// different order than the Sort produced is a wrong-results tripwire
+// rather than a guard.
+func partialTransportMergeOrder(p *optimizer.Aggregate) []transportKeyOrder {
+	n := len(p.GroupExprs)
+	if len(p.GroupClause) == n {
+		seen := make([]bool, n)
+		ok := true
+		for _, k := range p.GroupClause {
+			if k.Pos < 0 || k.Pos >= n || seen[k.Pos] {
+				ok = false
+				break
+			}
+			seen[k.Pos] = true
+		}
+		if ok {
+			out := make([]transportKeyOrder, n)
+			for i, k := range p.GroupClause {
+				out[i] = transportKeyOrder{pos: k.Pos, desc: k.Desc, nullsFirst: k.NullsFirst}
+			}
+			return out
+		}
+	}
+	out := make([]transportKeyOrder, n)
+	for i := range out {
+		out[i] = transportKeyOrder{pos: i}
+	}
+	return out
+}
+
+// openSortedPartialTransport implements the GatherMerge-fed
+// Finalize-Sorted arm (M0141-S5, adopted by M0146-0003): the child
+// delivers serialized-state rows already ordered by group key — PG's
+// `Finalize GroupAggregate` over `Gather Merge -> Sort -> Partial
+// HashAggregate` (nodeAgg.c's sorted combine path). Runs of equal keys
+// fold through combineAggRuntime into ONE live groupRuntime; a key
+// change finalizes and emits. There is no group map: on a
+// merge-ordered stream a key cannot recur once its run ends, which is
+// the same memory contract nodeAgg.c's finalize makes.
+//
+// Order belt: a key comparing BELOW the just-emitted group means the
+// stream is not sorted — a construction error. It must fail loudly
+// rather than emit a group twice, since a duplicated group row is a
+// silently wrong result with no user-visible explanation. The belt
+// compares in the stream's declared merge order — the Final's
+// GroupClause, with the same positional ASC / NULLS-LAST default
+// groupClauseKeys falls back to — through compareDatumWithNullsFirst,
+// so NULL keys and DESC clauses check against the order the worker
+// Sort and Gather Merge actually used rather than a bare ascending
+// compareDatum (which has no NULL arm at all).
+func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		out, err := o.finalizeGroup(cur)
+		if err != nil {
+			return err
+		}
+		o.rows = append(o.rows, out)
+		cur = nil
+		return nil
+	}
+
+	mergeOrder := partialTransportMergeOrder(o.plan)
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		dr, err := o.decodePartialStateRow(slot.Row())
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, dr.keyParts) {
+			if cur != nil {
+				// Belt: merge-ordered input must not go backwards in
+				// the order the stream was merged by.
+				for _, ko := range mergeOrder {
+					if ko.pos >= len(dr.gv) || ko.pos >= len(cur.groupValues) {
+						break
+					}
+					c, cerr := compareDatumWithNullsFirst(cur.groupValues[ko.pos], dr.gv[ko.pos], ko.nullsFirst, ko.desc, groupExprAt(o.plan, ko.pos))
+					if cerr != nil {
+						return cerr
+					}
+					if c > 0 {
+						return &ExecError{
+							Code: "XX000",
+							Message: "internal error: partial-state stream is not ordered by group key — " +
+								"a sorted row-transport finalize requires a merge-ordered child",
+						}
+					}
+					if c != 0 {
+						break
+					}
+				}
+			}
+			if err := flush(); err != nil {
+				return err
+			}
+			// Retain the founder's key and passthrough values detached
+			// from the transport row (M0073-0004 retention boundary,
+			// same as the hash absorb and the input drain).
+			var ngv Row
+			if len(dr.gv) > 0 {
+				ngv = make(Row, len(dr.gv))
+				for i := range ngv {
+					ngv[i] = dr.gv[i].MaterializeArena()
+				}
+			}
+			var npt Row
+			if len(dr.pt) > 0 {
+				npt = make(Row, len(dr.pt))
+				for i := range npt {
+					npt[i] = dr.pt[i].MaterializeArena()
+				}
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: ngv, passthroughVals: npt, aggs: make([]aggRuntime, len(dr.states))}
+			curParts = dr.keyParts
+		}
+		for i := range dr.states {
+			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
 }
 
 // finalizeGroup finalizes one group's aggregates and builds its single output
@@ -3061,7 +3886,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		if st.distinct == nil {
 			st.distinct = map[string]struct{}{}
 		}
-		k := datumKey(arg)
+		ka := arg
+		if declaredBpcharTypmod(call.Arg) > 0 {
+			// COUNT(DISTINCT c) on bpchar dedups under bpchareq/
+			// hashbpchar — 'x  ' and 'x' are one value.
+			ka = trimStringDatum(ka)
+		}
+		k := datumKey(ka)
 		if _, seen := st.distinct[k]; seen {
 			return nil
 		}
@@ -3141,7 +3972,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			return nil
 		}
-		cmp, err := compareDatum(arg, st.value, call.Pos())
+		cmp, err := compareDatumTyped(arg, st.value, call.Pos(), call.Arg)
 		if err != nil {
 			return err
 		}
@@ -3154,7 +3985,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 			st.hasValue = true
 			return nil
 		}
-		cmp, err := compareDatum(arg, st.value, call.Pos())
+		cmp, err := compareDatumTyped(arg, st.value, call.Pos(), call.Arg)
 		if err != nil {
 			return err
 		}
@@ -3333,7 +4164,32 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// SELECT would print them.
 		elemStr := ""
 		isNull := arg.IsNull()
-		if !isNull {
+		if call.InputType.IsArray || strings.HasSuffix(call.InputType.Name, "[]") {
+			// M0146-0033: array_agg(anyarray) is array_agg_array_transfn
+			// (array_userfuncs.c): every input is a sub-array of the result,
+			// one dimension deeper — `{{1},{2}}`, never the text array
+			// `{"{1}","{2}"}` the element arm produces.
+			if isNull {
+				return &ExecError{Code: "22004", Message: "cannot accumulate null arrays"}
+			}
+			text := formatDatumDateStyle(arg, o.ctx)
+			shape, ok := arrayTextShape(text)
+			if !ok {
+				return &ExecError{Code: "0A000", Message: "array_agg over arrays with non-default lower bounds is not supported"}
+			}
+			// accumArrayResultArr's order: the first input may not be
+			// empty; every later one (empty included) must match its dims.
+			if st.arrayOfArrays {
+				if !sameArrayShape(shape, st.arrayShape) {
+					return &ExecError{Code: "2202E", Message: "cannot accumulate arrays of different dimensionality"}
+				}
+			} else if len(shape) == 0 {
+				return &ExecError{Code: "2202E", Message: "cannot accumulate empty arrays"}
+			}
+			st.arrayOfArrays = true
+			st.arrayShape = shape
+			elemStr = text
+		} else if !isNull {
 			elemStr = formatDatumDateStyle(arg, o.ctx)
 		}
 		st.arrayElems = append(st.arrayElems, elemStr)
@@ -3616,7 +4472,7 @@ func aggOrderBySortedIdx(keys [][]Datum, orderBy []optimizer.SortKey) []int {
 			if bkNull {
 				return !nullsFirst
 			}
-			cmp, err := compareDatum(ka[ki], kb[ki], 0)
+			cmp, err := compareDatumTyped(ka[ki], kb[ki], 0, sortKeyExprAt(orderBy, ki))
 			if err != nil || cmp == 0 {
 				continue
 			}
@@ -3661,7 +4517,7 @@ func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.So
 			// direct arg is NULL: row is non-NULL, comes after NULL if nullsFirst
 			return !nullsFirst
 		}
-		cmp, err := compareDatum(ri, di, 0)
+		cmp, err := compareDatumTyped(ri, di, 0, sk.Expr)
 		if err != nil {
 			return false
 		}
@@ -3678,7 +4534,7 @@ func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.So
 
 // compareDatumWithNullsFirst compares two Datums respecting nullsFirst and desc flags.
 // Returns negative if a < b, zero if equal, positive if a > b in the sort order.
-func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool) (int, error) {
+func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool, e optimizer.Expr) (int, error) {
 	aNull, bNull := a.IsNull(), b.IsNull()
 	if aNull && bNull {
 		return 0, nil
@@ -3695,7 +4551,7 @@ func compareDatumWithNullsFirst(a, b Datum, nullsFirst bool, desc bool) (int, er
 		}
 		return -1, nil
 	}
-	cmp, err := compareDatum(a, b, 0)
+	cmp, err := compareDatumTyped(a, b, 0, e)
 	if err != nil {
 		return 0, err
 	}
@@ -3978,7 +4834,7 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 						if bNull {
 							return !nullsFirst
 						}
-						cmp, err := compareDatum(ai, bi, 0)
+						cmp, err := compareDatumTyped(ai, bi, 0, call.OrderBy[ki].Expr)
 						if err != nil || cmp == 0 {
 							continue
 						}
@@ -4234,6 +5090,20 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
+		}
+		if st.arrayOfArrays {
+			// array_agg_array_finalfn: the inputs, in ORDER BY order when
+			// given, become the new outermost dimension.
+			elems := st.arrayElems
+			if len(st.arrayElemKeys) == len(elems) && len(st.arrayElemKeys) > 0 {
+				idx := aggOrderBySortedIdx(st.arrayElemKeys, call.OrderBy)
+				sorted := make([]string, len(elems))
+				for i, origIdx := range idx {
+					sorted[i] = elems[origIdx]
+				}
+				elems = sorted
+			}
+			return NewStringDatum("{" + strings.Join(elems, ",") + "}")
 		}
 		// Sort elements by ORDER BY keys if present.
 		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
@@ -4939,7 +5809,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if bNull {
 				return !nullsFirst
 			}
-			cmp, err := compareDatum(ai, bi, 0)
+			cmp, err := compareDatumTyped(ai, bi, 0, sk.Expr)
 			if err != nil || cmp == 0 {
 				continue
 			}
@@ -5103,7 +5973,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 				if val.IsNull() {
 					continue
 				}
-				cmp, cerr := compareDatumWithNullsFirst(val, v, call.WithinGroupOrderBy[0].NullsFirst, call.WithinGroupOrderBy[0].Desc)
+				cmp, cerr := compareDatumWithNullsFirst(val, v, call.WithinGroupOrderBy[0].NullsFirst, call.WithinGroupOrderBy[0].Desc, call.WithinGroupOrderBy[0].Expr)
 				if cerr != nil {
 					continue
 				}
@@ -5137,7 +6007,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 				if val.IsNull() {
 					continue
 				}
-				cmp, cerr := compareDatum(val, v, 0)
+				cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 				if cerr != nil {
 					continue
 				}
@@ -5160,7 +6030,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if val.IsNull() {
 				continue
 			}
-			cmp, cerr := compareDatum(val, v, 0)
+			cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 			if cerr != nil {
 				continue
 			}
@@ -5187,7 +6057,7 @@ func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Cont
 			if val.IsNull() {
 				continue
 			}
-			cmp, cerr := compareDatum(val, v, 0)
+			cmp, cerr := compareDatumTyped(val, v, 0, sortKeyExprAt(call.WithinGroupOrderBy, 0))
 			if cerr != nil {
 				continue
 			}
@@ -5419,4 +6289,82 @@ func ctxHashMemMultiplier(ctx *Context) float64 {
 		return hashsize.DefaultHashMemMultiplier
 	}
 	return f
+}
+
+// arrayTextShape returns the dimension lengths of an array in its text form
+// (`{{1,2},{3,4}}` → [2 2]; `{}` → []), following the first element down
+// each level the way array_in's dims are rectangular. ok is false for a
+// form with explicit lower bounds (`[2:3]={...}`), which carries dimension
+// metadata this text-only representation does not decode here.
+func arrayTextShape(s string) ([]int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || s[0] != '{' {
+		return nil, false
+	}
+	var shape []int
+	// counts[d] is the element count of the first array seen at depth d.
+	depth := 0
+	done := map[int]bool{}
+	count := map[int]int{}
+	inQuote, escaped := false, false
+	sawElem := map[int]bool{}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+			sawElem[depth] = true
+		case '{':
+			if depth > 0 {
+				sawElem[depth] = true
+			}
+			depth++
+		case '}':
+			if sawElem[depth] && !done[depth] {
+				count[depth]++
+				done[depth] = true
+			}
+			depth--
+		case ',':
+			if !done[depth] {
+				count[depth]++
+			}
+		default:
+			if c != ' ' {
+				sawElem[depth] = true
+			}
+		}
+	}
+	for d := 1; ; d++ {
+		n, ok := count[d]
+		if !ok || n == 0 {
+			break
+		}
+		shape = append(shape, n)
+	}
+	return shape, true
+}
+
+// sameArrayShape reports whether two dimension lists are identical.
+func sameArrayShape(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -1,0 +1,54 @@
+== union
+13,23d12
+<   ( select unique1 from tenk1 union select fivethous from tenk1 ) ss;
+<   QUERY PLAN
+< ----------------------------------------------------------------
+<  Aggregate
+<   ->  HashAggregate
+<   Group Key: unique1
+<   ->  Append
+<   ->  Index Only Scan using tenk1_unique1 on tenk1
+<   ->  Seq Scan on tenk1 tenk1_1
+< (6 rows)
+< select count(*) from
+383c372
+<   Sort Key: xid
+---
+>   Sort Key: ('123')
+457c446
+< ----------------------------------
+---
+> -----------------------------------
+461c450
+<   Group Key: ab
+---
+>   Group Key: (t1.a || t1.b)
+478c467
+<   Sort Key: ab
+---
+>   Sort Key: ((t1.a || t1.b))
+539c528
+<   Sort Key: t, x
+---
+>   Sort Key: (1), (2)
+582c571
+<   Sort Key: t, x
+---
+>   Sort Key: (1), x
+== inherit
+849c849
+<   Sort Key: thousand, tenthous
+---
+>   Sort Key: tenk1.thousand, tenk1.tenthous
+864c864
+<   Sort Key: thousand, tenthous
+---
+>   Sort Key: (tenk1.thousand), (tenk1.tenthous)
+879c879
+<   Sort Key: thousand, tenthous
+---
+>   Sort Key: tenk1.thousand, tenk1.tenthous
+927c927
+<   Sort Key: x, y
+---
+>   Sort Key: a.thousand, a.tenthous

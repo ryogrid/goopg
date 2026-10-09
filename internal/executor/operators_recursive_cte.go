@@ -63,7 +63,11 @@ type recursiveUnionOp struct {
 	working   []Row
 	output    []Row
 	// seen tracks rows already in output for UNION (non-ALL) dedup.
-	seen     map[string]bool
+	seen map[string]bool
+	// colTrims marks bpchar output columns: UNION dedup hashes the
+	// bcTruelen image so padding-width variants of one value dedup to
+	// one row (hashbpchar parity, M0146).
+	colTrims []bool
 	outIdx   int
 	initDone bool
 	done     bool
@@ -113,6 +117,9 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 	if !o.initDone {
 		if !o.plan.UnionAll {
 			o.seen = make(map[string]bool)
+			if o.colTrims == nil {
+				o.colTrims = bpcharSchemaTrims(o.plan.Output())
+			}
 		}
 		for {
 			slot, err := o.anchor.Next()
@@ -126,7 +133,7 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			r := make(Row, len(row))
 			copy(r, row)
 			if !o.plan.UnionAll {
-				key := rowKey(r)
+				key := rowKeyTrimmed(r, nil, o.colTrims)
 				if o.seen[key] {
 					continue // skip duplicates in anchor for UNION
 				}
@@ -192,7 +199,7 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			copy(r, row)
 			if !o.plan.UnionAll {
 				// UNION semantics: only keep rows not already seen.
-				key := rowKey(r)
+				key := rowKeyTrimmed(r, nil, o.colTrims)
 				if o.seen[key] {
 					continue
 				}
@@ -231,10 +238,24 @@ func rowKey(row Row) string {
 // part of the dedup key, exactly as PG dedups on the distinct clause
 // columns rather than the physical tuple. M0143-0009.
 func rowKeyExcluding(row Row, skip map[int]bool) string {
+	return rowKeyTrimmed(row, skip, nil)
+}
+
+// rowKeyTrimmed is rowKeyExcluding with per-column bpchar normalisation:
+// trims[i] marks a bpchar-typed column, whose key image is the bcTruelen
+// form — the dedup/grouping twin of hashbpchar. A char(20) 'x' and a
+// char(5) 'x' must render one key or UNION DISTINCT / INTERSECT / EXCEPT /
+// recursive-CTE dedup and hash DISTINCT silently split a group PG merges.
+// trims == nil keeps the historical byte-exact key. M0146 bpchar hash
+// parity.
+func rowKeyTrimmed(row Row, skip map[int]bool, trims []bool) string {
 	var sb strings.Builder
 	for i, d := range row {
 		if skip[i] {
 			continue
+		}
+		if i < len(trims) && trims[i] {
+			d = trimStringDatum(d)
 		}
 		if sb.Len() > 0 {
 			sb.WriteByte('|')

@@ -189,11 +189,11 @@ func (s *searchCtx) pushedDownSelectivity(clauses []*restrictInfo, joinrelids Re
 // (`outerJoinRowFloor`, cardinality.go, records the same convention for the
 // plan-node estimator); the switch has six arms where PG's has five.
 //
-// The two clamps sit on the INNER product, before the outer-join floor. They
-// are goopg's stand-ins for `fkselec` on a schema that declares no foreign
-// keys (cost-model/14 §2; the key-implied bound is structural, the
-// all-default `max(l,r)` cap is M0126-0010's heuristic on a pure guess), and
-// PG applies its own floor on top of `fkselec` in exactly that order. SEMI and
+// The key-implied clamp sits on the INNER product, before the outer-join
+// floor. It is goopg's stand-in for `fkselec` on a schema that declares no
+// foreign keys (cost-model/14 §2), and PG applies its own floor on top of
+// `fkselec` in exactly that order. (M0126-0010's all-default `max(l,r)` cap
+// was retired by M0146-0005k: PG has no such clamp.) SEMI and
 // ANTI never form the product: their bound (`rows ≤ outer`) is in the formula.
 //
 // FULL is sized although `jointypeForDirection` declines both of its
@@ -226,21 +226,14 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 	// generators must evaluate), not the selectivity subset.
 	est := s.superkeyJoinSelectivity(cat, outer, inner, oneClausePerEquivClass(clauses), jt)
 	fkselec := est.sel
-	// `allDefault` is 04 §3.3's fallback condition, and it is the residual
-	// clauses' property rather than the join's: an estimate every one of whose
-	// factors was a constant from selfuncs.h has not measured this join at all.
-	allDefault := len(est.residual) > 0
 	jselec := 1.0
 	for _, ri := range est.residual {
-		clauseSel, isdefault := s.joinClauseSelectivityForJoin(ri, jt, outer, inner)
+		clauseSel, _ := s.joinClauseSelectivityForJoin(ri, jt, outer, inner)
 		jselec *= clauseSel
-		if !isdefault {
-			allDefault = false
-		}
 	}
 	pselec := s.pushedDownSelectivity(clauses, outer.Relids|inner.Relids)
 
-	// The INNER product with its two clamps — the term every non-semi arm
+	// The INNER product with its key-implied clamp — the term every non-semi arm
 	// starts from (costsize.c:5601, :5605, :5613).
 	product := func() float64 {
 		rows := outer.Rows * inner.Rows * fkselec * jselec
@@ -250,17 +243,12 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 		if rows > est.rowsBound {
 			rows = est.rowsBound
 		}
-		// Clamp 2 — M0126-0010's `max(l,r)` cap (cardinality.go:400-406),
-		// kept for the non-key fallback and, as there, fired ONLY when the
-		// estimate was a pure guess. The condition is what keeps it from
-		// breaking honest many-to-many joins, whose blow-up is real and
-		// measured; and `len(residual) > 0` is what keeps it off a CROSS
-		// product, where |L|·|R| is not an error but the answer.
-		if !est.fired && allDefault {
-			if mx := math.Max(outer.Rows, inner.Rows); rows > mx {
-				rows = mx
-			}
-		}
+		// M0146-0005k retired M0126-0010's all-default `max(l,r)` cap here:
+		// calc_joinrel_size_estimate has no such clamp, so a join whose
+		// clauses all default to nd = 200 estimates |L|·|R|/200 as PG does
+		// (TPC-DS Q44's rank join: 147099, not 5495). The recon A/B moved
+		// no census record the wrong way (analysis/m0146/m0146-0005/
+		// recon-0005j/).
 		return rows
 	}
 

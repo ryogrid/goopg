@@ -31,6 +31,13 @@ func outerFillPlan(jt optimizer.JoinType, algo optimizer.JoinAlgo, leftWidth, es
 	col := func(idx int) *optimizer.ColumnRef {
 		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
+	right := optimizer.Node(valuesNode(estRight))
+	if algo == optimizer.JoinAlgoNestedLoop {
+		// The nested-loop oracle means the MATERIALISED inner — since
+		// M0146-0010 the plan must carry the node for the executor to
+		// buffer anything.
+		right = &optimizer.Materialize{Child: right}
+	}
 	return &optimizer.Join{
 		Type:      jt,
 		Algo:      algo,
@@ -38,7 +45,7 @@ func outerFillPlan(jt optimizer.JoinType, algo optimizer.JoinAlgo, leftWidth, es
 		RightKey:  col(leftWidth),
 		Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
 		Left:      valuesNode(estLeft),
-		Right:     valuesNode(estRight),
+		Right:     right,
 	}
 }
 

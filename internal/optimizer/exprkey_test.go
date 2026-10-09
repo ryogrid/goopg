@@ -153,6 +153,7 @@ var allExprTypes = []parser.Expr{
 	&parser.DefaultMarker{},
 	&parser.ExistsExpr{},
 	&parser.ExtractExpr{},
+	&parser.FieldSelect{},
 	&parser.FuncCall{},
 	&parser.GroupingCall{},
 	&parser.InExpr{},

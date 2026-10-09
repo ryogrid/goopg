@@ -1,0 +1,30 @@
+Gates — M0146-0007d (2026-09-28, branch plan-parity-with-pg-take2-ralph2,
+base 0377a2d1e):
+
+units (RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh)
+  PASS — all packages including internal/executor (21.003s).
+  New pin: TestExplainSublinkOnlyCTEHoistsToSection.
+
+tpch-spotcheck.sh
+  PASS — Q12 rows=2, Q13 rows=33. Stamp: tmp/gate-stamps/tpch-spotcheck.json.
+
+TPC-DS SF0.25 sweep (scripts/tpcds-sf025-regression.sh sweep)
+  PASS=96 SKIP=3 (Q36/Q70/Q86 oracle SKIP_QUERYGEN) MISMATCH=0
+  CKMISMATCH=0 ERROR=0 TIMEOUT=0
+  Sweep report: bench/tpcds/runtime_goopg/tpcds-results-sf025/sweep-20260928-060218.txt
+  plan-diff vs prior capture: changed=(1) Q14 — the only moved plan.
+  Q14 executes identically: 200 rows, verdict PASS.
+  Stamp: tmp/gate-stamps/tpcds-sf025.json.
+
+TPC-H acceptance arm (ACCEPT_BASELINE=tmp/m0145-0008m/arm-on.txt)
+  24/24 labels MATCH on values. VERDICT: PASS.
+  Output: tmp/arm-on-m0146-0007d.txt
+  Stamp: tmp/gate-stamps/tpch-acceptance-arm.json.
+
+TPC-DS fireset (scripts/tpcds-fireset-gate.sh m0146-0007d tmp)
+  SF0.25 fires=Q14; SF1 fires=Q14. Both arms execute PASS at both scales.
+  FIRE-SET-TIMEOUTS: introduced=none unchanged=none missing=none (both scales)
+  SF0.25 divergence class move: D6-cte 1 -> 0 (Q14 -> D4-upperrel).
+  Stamp: tmp/gate-stamps/tpcds-fireset.json.
+
+pgbench smoke: deferred to the commit hook (.githooks/pre-commit), per AGENT.md.

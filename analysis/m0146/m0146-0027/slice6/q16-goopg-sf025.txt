@@ -1,0 +1,33 @@
+===== Q16 =====
+                                                                                   QUERY PLAN                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8216.22..8216.24 rows=1 width=72)
+   ->  Sort  (cost=8216.22..8216.23 rows=1 width=72)
+         Sort Key: (count(DISTINCT cs1.cs_order_number))
+         ->  Aggregate  (cost=8216.20..8216.21 rows=1 width=72)
+               ->  Sort  (cost=8216.19..8216.20 rows=2 width=2992)
+                     Sort Key: cs1.cs_order_number
+                     ->  Gather  (cost=4050.99..8216.18 rows=2 width=2992)
+                           Workers Planned: 3
+                           ->  Nested Loop Semi Join  (cost=2050.99..14962.26 rows=1 width=2076)
+                                 Join Filter: (cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)
+                                 ->  Nested Loop  (cost=2050.61..13159.54 rows=1 width=2076)
+                                       ->  Nested Loop Anti Join  (cost=2050.49..13159.40 rows=1 width=1364)
+                                             ->  Nested Loop  (cost=2050.24..12904.69 rows=2 width=1364)
+                                                   ->  Parallel Hash Join  (cost=2049.99..12876.76 rows=95 width=976)
+                                                         Hash Cond: (cs1.cs_ship_date_sk = date_dim.d_date_sk)
+                                                         ->  Parallel Seq Scan on catalog_sales cs1  (cost=0.00..10521.57 rows=116257 width=556)
+                                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2049.55 rows=35 width=420)
+                                                               Filter: ((d_date >= '2002-4-01') AND (d_date <= '2002-05-31 00:00:00'::timestamp))
+                                                   ->  Index Scan using customer_address_pkey on customer_address  (cost=0.25..0.29 rows=1 width=388)
+                                                         Index Cond: (ca_address_sk = cs1.cs_ship_addr_sk)
+                                                         Filter: (ca_state = 'PA')
+                                             ->  Index Scan using catalog_returns_pkey on catalog_returns cr1  (cost=0.25..180.62 rows=2 width=360)
+                                                   Index Cond: (cr_order_number = cs1.cs_order_number)
+                                       ->  Index Scan using call_center_pkey on call_center  (cost=0.12..0.14 rows=1 width=712)
+                                             Index Cond: (cc_call_center_sk = cs1.cs_call_center_sk)
+                                             Filter: (cc_county = ANY ('Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County'))
+                                 ->  Index Scan using catalog_sales_pkey on catalog_sales cs2  (cost=0.38..1802.69 rows=10 width=556)
+                                       Index Cond: (cs_order_number = cs1.cs_order_number)
+(28 rows)
+

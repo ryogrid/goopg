@@ -1126,6 +1126,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			ectx.CommandCounterIncrement()
 			ectx.CmdID = ectx.GetCurrentCommandId(true)
 		ectx.CTERowCache = nil
+		ectx.CTEStableCache = nil
 		ectx.DeadlockVictim = false
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).
@@ -1949,6 +1950,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_indexscan", &ps.EnableIndexScan)
 	readBool("enable_bitmapscan", &ps.EnableBitmapScan)
 	readBool("enable_sort", &ps.EnableSort)
+	readBool("enable_incremental_sort", &ps.EnableIncrementalSort)
 	readBool("enable_hashjoin", &ps.EnableHashJoin)
 	readBool("enable_parallel_hash", &ps.EnableParallelHash)
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
@@ -3967,6 +3969,18 @@ func commandTagFor(node optimizer.Node, op executor.Operator, rowCount int64) st
 		return fmt.Sprintf("UPDATE %d", rowsAffected(op))
 	case *optimizer.Delete:
 		return fmt.Sprintf("DELETE %d", rowsAffected(op))
+	case *optimizer.Merge:
+		// MERGE <n>: rows inserted, updated or deleted (cmdtaglist.h
+		// CMDTAG_MERGE; DO NOTHING rows are not counted). M0146-0075.
+		return fmt.Sprintf("MERGE %d", rowsAffected(op))
+	case *optimizer.CTEDMLPrefix:
+		// A statement with data-modifying WITH queries completes with its
+		// top-level statement's tag and row count, never the CTEs'
+		// (`WITH d AS (DELETE …) INSERT …` is `INSERT 0 n`; PG takes the tag
+		// from the top-level Query's commandType and es_processed counts only
+		// the top-level ModifyTable). The prefix operator forwards
+		// RowsAffected to the body. M0146-0081.
+		return commandTagFor(n.Body, op, rowCount)
 	case *optimizer.Transaction:
 		return transactionTag(n.Verb)
 	case *optimizer.Utility:

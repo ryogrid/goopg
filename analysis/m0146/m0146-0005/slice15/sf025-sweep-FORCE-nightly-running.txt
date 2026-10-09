@@ -1,0 +1,4 @@
+=== SUMMARY: PASS=96 (60 ck-verified, 36 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=3 ===
+TOTAL      174s -> 253s (+45.4%)  <== aggregate move; no single query need cross 2.0x for this to matter
+=== STATUS-DELTA: compared=99 verdict-changes=none runtime-moves=8 total-delta=+45.4% (>=2.0x, floor 5s, total band 2.0%, TIMEOUT readings excluded) ===
+=== PLAN-SHAPE: queries=99 same=95 changed=4 added=0 removed=0 ===

@@ -1,0 +1,4 @@
+skeleton-identical (noise floor): n=59 base=138.2s mult1=141.0s  >10%slower=['Q64', 'Q95', 'Q23']  >10%faster=['Q38', 'Q6']
+skeleton-changed: n=23 base=196.7s mult1=194.7s  >10%slower=['Q17']  >10%faster=['Q81']
+skeleton-identical (noise floor): n=60 base=1109.2s mult1=1121.1s  >10%slower=['Q83', 'Q58', 'Q8', 'Q7', 'Q17', 'Q39']  >10%faster=['Q10', 'Q47', 'Q38', 'Q66', 'Q21', 'Q89']
+skeleton-changed: n=19 base=264.9s mult1=280.4s  >10%slower=['Q32', 'Q54', 'Q68', 'Q71']  >10%faster=['Q18']

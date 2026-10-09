@@ -74,9 +74,22 @@ type PlannerSettings struct {
 	// (sortPathFor) still builds the Sort path when off, so a query whose
 	// only legal plan sorts still plans.
 	//
-	// There is deliberately no EnableMaterial: goopg builds no Material path
-	// (joinpathsmemoize.go; take2 P2-06), so the flag would have no consumer.
+	// There is deliberately no EnableMaterial SESSION wire: M0146-0010 added
+	// the Material path and reads the toggle through cp.enableMaterial
+	// (materialize.go), but no registry bridge carries the GUC into
+	// PlannerSettings — the flag exists so tests can close the producer, not
+	// because a session can reach it yet. Deferred with the rest of the
+	// P2-02 remainder.
 	EnableSort bool
+
+	// EnableIncrementalSort is PG's `enable_incremental_sort` (default on).
+	EnableIncrementalSort bool
+
+	// EnableMaterial is PG's `enable_material` — a generation gate at the
+	// producer (joinpath.c:1897), not a counted flag like the methods above:
+	// the matpath is simply never created when it is off.
+	// PlannerSettings.costParams copies it; nothing sets it from the session.
+	EnableMaterial bool
 
 	// EnableSeqScan / EnableIndexScan / EnableBitmapScan are PG's
 	// `enable_seqscan` / `enable_indexscan` / `enable_bitmapscan` (B-17d):
@@ -207,6 +220,26 @@ type PlannerSettings struct {
 	// the member's own nested subqueries plan exactly as they did.
 	// Unexported like the scope it describes: not a session boundary.
 	appendrelMember bool
+	// appendrelLabel marks the union scope of an appendrel leaf
+	// (planSubqueryRangeVar's appendrelSubquery) for the "*SELECT* n"
+	// member wrappers (M0146-0093). Unlike appendrelMember it is set on
+	// both of planSubqueryRangeVar's arms — a non-first FROM item plans
+	// through the lateral-context arm, and is the same appendrel in PG.
+	// The fold reads it; planSelectImpl clears it in every member scope.
+	appendrelLabel bool
+
+	// scalarSublinkBody marks the settings handed to a scalar sublink's
+	// body (planSubqueryExpr), M0146-0012: PG makes a correlated outer
+	// reference a PARAM_EXEC Param with no relids, so `col = outer.x`
+	// in the body is a base restriction of col's relation
+	// (distribute_qual_to_rels) and match_clause_to_indexcol binds it as
+	// an index key (is_pseudo_constant_for_index, indxpath.c). A
+	// multi-relation scope otherwise keeps correlated conjuncts above the
+	// search, because the post-planning EXISTS→ANY pass reads the
+	// correlation off the body's top quals; a scalar body has no such
+	// consumer. Read once by planSelectWithSettings and cleared, so the
+	// body's own nested scopes plan as before.
+	scalarSublinkBody bool
 }
 
 // DefaultPlannerSettings returns the settings a statement plans under when no
@@ -223,11 +256,13 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableNestLoop:  true,
 		EnableParallelHash: true,
 		EnableSort:      true,
+		EnableIncrementalSort: true,
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
 		EnableBitmapScan: true,
 		EnableGatherMerge: true,
 		EnableMemoize:   true,
+		EnableMaterial:  true,
 
 		EnableHashAgg:            HashAggEnabled(),
 		EnablePresortedAggregate: PresortedAggEnabled(),
@@ -289,11 +324,13 @@ func (ps PlannerSettings) costParams() costParams {
 		enableMergeJoin: ps.EnableMergeJoin,
 		enableNestLoop:  ps.EnableNestLoop,
 		enableSort:      ps.EnableSort,
+		enableIncrementalSort: ps.EnableIncrementalSort,
 		enableSeqScan:    ps.EnableSeqScan,
 		enableIndexScan:  ps.EnableIndexScan,
 		enableBitmapScan: ps.EnableBitmapScan,
 		enableGatherMerge: ps.EnableGatherMerge,
 		enableMemoize:   ps.EnableMemoize,
+		enableMaterial:  ps.EnableMaterial,
 		geqo:            ps.Geqo,
 		geqoThreshold:   ps.GeqoThreshold,
 		geqoEffort:      ps.GeqoEffort,

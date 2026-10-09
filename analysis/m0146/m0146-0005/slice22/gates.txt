@@ -1,0 +1,19 @@
+M0146-0005 slice 22 (recon) — gates
+
+Recon slice: no production-code change, no plan/value gates owed.
+
+Evidence captures:
+  q82-pg-sf025.txt   PG 18.3 reference EXPLAIN (read-only) — NL into
+                     inventory_pkey on non-leading inv_item_sk
+  q82-goopg.txt      goopg HEAD private clone :5533 EXPLAIN — Hash Join
+                     elected
+  q82-dppath.txt     GOOPG_PGSHAPED_DP_TRACE=1 on same clone: {1}
+                     parameterised probes only for {2}, {0,2}, {2,3} —
+                     no reqouter={0}
+  q82-pkey.txt       inventory_pkey column order + pg_stats n_distinct
+                     (inv_date_sk=209)
+  q8-pg-sf025.txt    PG 18.3 reference EXPLAIN — Subquery Scan on a1
+                     leaf + Materialize x2
+
+Sanity: go build ./... clean before commit; pre-commit pgbench smoke
+runs via hook.

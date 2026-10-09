@@ -13,6 +13,7 @@ package executor
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -68,17 +69,28 @@ func spillFixtureWidth(t *testing.T, probeRows, buildRows, distinct, padBytes in
 	}
 	fill("sp_probe", probeRows)
 	fill("sp_build", buildRows)
+	// What ANALYZE would record (M0146-0005c): without a measured key the
+	// hash join these tests exercise is priced at PG's default 0.1 bucket.
+	setFixtureStats(t, ctx, "sp_probe", int64(probeRows), map[string]int64{"k": int64(distinct)})
+	setFixtureStats(t, ctx, "sp_build", int64(buildRows), map[string]int64{"k": int64(distinct)})
 	return ctx
 }
 
 const spillJoinSQL = `SELECT p.k, p.pad, b.pad FROM sp_probe p, sp_build b WHERE p.k = b.k`
 
-// The identity arm orders its output. A spilling join emits in BATCH order,
+// The identity arm compares sorted rows. A spilling join emits in BATCH order,
 // which is a different — and equally legal — permutation of the same rows for
 // a query with no ORDER BY, so comparing the raw streams would fail on a
-// correct engine. The gate's word is "byte-identical", and an ORDER BY is what
-// makes that assertion mean the multiset rather than the emission schedule.
-const spillJoinOrderedSQL = spillJoinSQL + ` ORDER BY 1, 2, 3`
+// correct engine. The gate's word is "byte-identical" over the multiset, so the
+// rendered rows are sorted in the test (sortedSpillRows) rather than by an
+// ORDER BY in the statement: since M0146-0006 an ORDER BY lets the planner
+// elect PG's merge join + Incremental Sort, which never reaches the hash
+// join this gate instruments.
+func sortedSpillRows(rows []Row) []string {
+	out := renderSpillRows(rows)
+	sort.Strings(out)
+	return out
+}
 
 // renderSpillRows flattens a result set to one string per row so two runs can be
 // compared for byte equality rather than for "the same number of rows" — the
@@ -103,7 +115,7 @@ func TestHashJoinForcedSpillMatchesDefaultWorkMemThroughSQL(t *testing.T) {
 	ctx := spillFixture(t, 1200, 4000, 400)
 
 	ctx.WorkMem = 0 // unlimited — the geometry is single-batch
-	want := renderSpillRows(runQueryRows(t, ctx, spillJoinOrderedSQL))
+	want := sortedSpillRows(runQueryRows(t, ctx, spillJoinSQL))
 	if len(want) == 0 {
 		t.Fatalf("precondition: the unbounded arm emitted no rows")
 	}
@@ -114,7 +126,7 @@ func TestHashJoinForcedSpillMatchesDefaultWorkMemThroughSQL(t *testing.T) {
 	// teaching the map to overwrite.
 	ctx.HashJoinStats = nil
 	ctx.WorkMem = 64 << 10
-	got := renderSpillRows(runQueryRows(t, ctx, spillJoinOrderedSQL))
+	got := sortedSpillRows(runQueryRows(t, ctx, spillJoinSQL))
 
 	// The counters the bounded run published are the proof the arm really
 	// spilled; without them an identity between two in-memory runs proves

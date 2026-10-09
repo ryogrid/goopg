@@ -1735,6 +1735,9 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 			if done {
+				if copyIn.onDone != nil {
+					copyIn.onDone()
+				}
 				copyIn = nil
 			}
 			if err := w.Flush(); err != nil {

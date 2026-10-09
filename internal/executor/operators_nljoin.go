@@ -48,6 +48,12 @@ type nestedLoopIndexJoinOp struct {
 	// each time evalPredicateSlot returns false (residual reject).
 	joinFilterRemoved *int64
 
+	// probeQual / probeFilterRemoved: the residual part EXPLAIN renders as
+	// the inner scan's Filter, and its rejection counter
+	// (probeFilterAttributor); nil unless ANALYZE splits the residual.
+	probeQual          optimizer.Expr
+	probeFilterRemoved *int64
+
 	// outerWidth / innerWidth are captured in Open() from the child
 	// schemas. They are constant for the operator's lifetime.
 	outerWidth int
@@ -117,7 +123,9 @@ func nliInnerIndexScan(in nliInner) *indexScanOp {
 	case *indexScanOp:
 		return x
 	case *memoizeOp:
-		return x.child
+		// An index-only child (M0146-0005bq) has no heap TID to provide.
+		is, _ := x.child.(*indexScanOp)
+		return is
 	}
 	return nil
 }
@@ -131,6 +139,28 @@ func (o *nestedLoopIndexJoinOp) Schema() optimizer.Schema {
 }
 
 func (o *nestedLoopIndexJoinOp) setJoinFilterRemoveCounter(p *int64) { o.joinFilterRemoved = p }
+
+func (o *nestedLoopIndexJoinOp) setProbeFilterAttribution(probe optimizer.Expr, counter *int64) {
+	o.probeQual, o.probeFilterRemoved = probe, counter
+}
+
+// attributeProbeReject counts a residual rejection against the probe's
+// Filter when the part EXPLAIN renders there fails on the rejected row
+// (NULL counts as failing, as a qual does). PG evaluates that part at the
+// scan, before the join qual, so a row both parts reject is the scan's.
+func attributeProbeReject(probe optimizer.Expr, counter *int64, slot SlotView, ctx *Context) error {
+	if probe == nil || counter == nil {
+		return nil
+	}
+	v, err := evalExprSlot(probe, slot, ctx)
+	if err != nil {
+		return err
+	}
+	if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+		*counter++
+	}
+	return nil
+}
 
 func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -250,6 +280,9 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				// candidate.
 				if o.joinFilterRemoved != nil {
 					*o.joinFilterRemoved++
+					if err := attributeProbeReject(o.probeQual, o.probeFilterRemoved, o.virtualOut, o.ctx); err != nil {
+						return nil, err
+					}
 				}
 				continue
 			}

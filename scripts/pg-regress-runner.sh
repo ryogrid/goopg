@@ -183,19 +183,48 @@ fi
 GOOPG_DATADIR="${REPO_ROOT}/tmp/regress-goopg-data"
 GOOPG_LOG="${REPO_ROOT}/tmp/regress-goopg.log"
 SERVER_PID=""
+# cleanup() releases only what THIS invocation created (M0146-0056). It used
+# to stop the shared `goopg-regress-runner.scope` and `rm -rf` the shared
+# datadir on every exit — including the exit-2 refusal of a second runner
+# whose port check found the first one's server. That second runner killed
+# the first run's server and deleted its datadir mid-run; with the timing
+# shifted, the surviving server reopens freshly initialised catalog files
+# under cached pages that route past their end (`pin leaf blk 22: short read
+# at block` on pg_class_relname_nsp_index 2663, and every later CREATE fails).
+OWN_DATADIR=0
+OWN_SCOPE=0
 
 cleanup() {
     [[ "$AUTO_START" -eq 0 ]] && return 0
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill -KILL "$SERVER_PID" 2>/dev/null || true
     fi
-    if command -v systemctl >/dev/null 2>&1; then
+    if [[ "$OWN_SCOPE" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl --user stop "goopg-regress-runner.scope" 2>/dev/null || true
         systemctl --user reset-failed "goopg-regress-runner.scope" 2>/dev/null || true
     fi
-    rm -rf "${GOOPG_DATADIR}"
+    if [[ "$OWN_DATADIR" -eq 1 ]]; then
+        rm -rf "${GOOPG_DATADIR}"
+    fi
 }
 trap cleanup EXIT INT TERM
+
+if [[ "$AUTO_START" -eq 1 ]]; then
+    # One auto-started runner per port at a time, across every worktree: the
+    # port, the scope name and (within one tree) the datadir are shared. The
+    # lock is taken before anything is touched, so a refused runner leaves
+    # the running one alone.
+    # The server inherits the lock descriptor, so the lock is held until the
+    # previous run's server has really exited; a back-to-back invocation (an
+    # A/B pair) waits for that instead of failing.
+    RUNNER_LOCK="/tmp/goopg-regress-runner-${PORT}.lock"
+    exec 9>"${RUNNER_LOCK}"
+    if ! flock -w 120 9; then
+        echo "pg-regress-runner: another pg-regress-runner holds port ${PORT} (${RUNNER_LOCK})." >&2
+        echo "  Refusing to start after waiting 120s; wait for it to finish." >&2
+        exit 2
+    fi
+fi
 
 if [[ "$AUTO_START" -eq 1 ]]; then
     # Guard: refuse to run if ${PORT} is already answering. Without this the
@@ -219,11 +248,13 @@ if [[ "$AUTO_START" -eq 1 ]]; then
     (cd "${REPO_ROOT}" && go build -o bin/goopg ./cmd/goopg 2>&1)
 
     echo "pg-regress-runner: initialising data dir..."
+    OWN_DATADIR=1
     rm -rf "${GOOPG_DATADIR}"
     "${REPO_ROOT}/bin/goopg" init -D "${GOOPG_DATADIR}"
 
     echo "pg-regress-runner: starting goopg on :${PORT}..."
     mkdir -p "$(dirname "${GOOPG_LOG}")"
+    OWN_SCOPE=1
     GOOPG_CG_UNIT="goopg-regress-runner" \
         "${REPO_ROOT}/scripts/goopg-test-run.sh" \
         "${REPO_ROOT}/bin/goopg" start \

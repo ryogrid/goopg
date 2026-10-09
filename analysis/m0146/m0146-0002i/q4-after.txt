@@ -1,0 +1,17 @@
+=== Q4
+Sort  (cost=76255.93..76255.95 rows=5 width=72)
+  Sort Key: orders.o_orderpriority
+  ->  Finalize HashAggregate  (cost=76255.83..76255.88 rows=5 width=72)
+        Group Key: orders.o_orderpriority
+        ->  Gather  (cost=76255.71..76255.81 rows=5 width=72)
+              Workers Planned: 3
+              ->  Partial HashAggregate  (cost=76255.71..76255.76 rows=5 width=72)
+                    Group Key: orders.o_orderpriority
+                    ->  Nested Loop Semi Join  (cost=0.38..76062.64 rows=4983 width=448)
+                          ->  Parallel Seq Scan on orders  (cost=0.00..33803.06 rows=18497 width=448)
+                                Filter: ((o_orderdate >= '1993-07-01'::date) AND (o_orderdate < '1993-10-01 00:00:00'::timestamp))
+                          ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.38..8.38 rows=5 width=550)
+                                Index Cond: (l_orderkey = orders.o_orderkey)
+                                Filter: (l_commitdate < l_receiptdate)
+
+=== Q5

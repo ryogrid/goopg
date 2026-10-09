@@ -13,6 +13,9 @@ package optimizer
 // only by this task's own unit tests and, later, exec-b's `createPlanNode`
 // arm for `PathIncrementalSort` (path.go).
 type IncrementalSort struct {
+	// M0146-0005dr: this node's query-level initPlan cost.
+	InitPlanCharge
+
 	// PlanCost carries the search's cost for this node (plancost.go).
 	PlanCost
 	// searchedTree: mirrors Sort's own embed (searchedtree.go).

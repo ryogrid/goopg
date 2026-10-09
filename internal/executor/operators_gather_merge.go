@@ -28,6 +28,8 @@ import (
 type gmSource struct {
 	// cur is the row at this source's front, valid while live.
 	cur Row
+	// curTID is cur's carried self-tid (valid only under wantCTIDs).
+	curTID queueTID
 	// curKeys holds cur's sort-key values, evaluated once when the row was
 	// pulled. review/260831 EO1-13: the heap comparator used to evaluate every
 	// key expression on both rows of every comparison, so each output row paid
@@ -36,8 +38,10 @@ type gmSource struct {
 	live    bool
 	// ch is non-nil for a worker source.
 	ch <-chan rowBatch
-	// pending holds rows already received from ch but not yet consumed.
-	pending []Row
+	// pending holds rows already received from ch but not yet consumed;
+	// pendingTIDs is its tid side-channel (nil unless wantCTIDs).
+	pending     []Row
+	pendingTIDs []queueTID
 	// local is non-nil for the leader's own share.
 	local Operator
 }
@@ -68,6 +72,12 @@ type gatherMergeOp struct {
 	sortErr  error
 	slot     MaterializedSlot
 	launched int
+
+	// wantCTIDs: see gatherOp.wantCTIDs. Here the tids also feed the merge
+	// keys — a `ctid` key evaluated on a bare Row reads NULL — so keySlot
+	// presents a row and its tid to evalSortKeyValueSlot (M0146-0051).
+	wantCTIDs bool
+	keySlot   MaterializedSlot
 
 	closed        bool
 	selfCancelled bool
@@ -127,6 +137,7 @@ func (o *gatherMergeOp) WorkersLaunched() int { return o.launched }
 func (o *gatherMergeOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.slot = MaterializedSlot{schema: o.schema}
+	o.keySlot = MaterializedSlot{schema: o.schema}
 
 	n := o.plan.WorkersPlanned
 	if n < 0 {
@@ -207,6 +218,9 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		if o.wantCTIDs {
+			markSortWantCTIDs(child)
+		}
 		o.attachAll(child)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
@@ -277,6 +291,9 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	if err != nil {
 		return err
 	}
+	if o.wantCTIDs {
+		markSortWantCTIDs(child)
+	}
 	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
@@ -284,13 +301,20 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	}
 
 	batch := make([]Row, 0, gatherBatchRows)
+	var tids []queueTID
+	if o.wantCTIDs {
+		tids = make([]queueTID, 0, gatherBatchRows)
+	}
 	flush := func() bool {
 		if len(batch) == 0 {
 			return true
 		}
 		select {
-		case o.chans[idx] <- rowBatch{rows: batch, worker: idx}:
+		case o.chans[idx] <- rowBatch{rows: batch, tids: tids, worker: idx}:
 			batch = make([]Row, 0, gatherBatchRows)
+			if o.wantCTIDs {
+				tids = make([]queueTID, 0, gatherBatchRows)
+			}
 			return true
 		case <-wctx.Ctx.Done():
 			return false
@@ -310,6 +334,9 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		}
 		if slot == nil {
 			continue
+		}
+		if o.wantCTIDs {
+			tids = append(tids, slotQueueTID(slot))
 		}
 		batch = append(batch, transferRowForQueue(slot))
 		if len(batch) >= gatherBatchRows && !flush() {
@@ -331,8 +358,14 @@ func (o *gatherMergeOp) advance(src *gmSource) (bool, error) {
 		return ok, err
 	}
 	kv := make([]Datum, len(o.keys))
+	var keyView SlotView = rowSlotView(src.cur)
+	if o.wantCTIDs {
+		o.keySlot.row = src.cur
+		src.curTID.stamp(&o.keySlot)
+		keyView = &o.keySlot
+	}
 	for i, k := range o.keys {
-		v, err := evalSortKeyValue(k.Expr, src.cur, o.ctx)
+		v, err := evalSortKeyValueSlot(k.Expr, keyView, o.ctx)
 		if err != nil {
 			return false, err
 		}
@@ -358,6 +391,9 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		// The leader's own rows do not cross a goroutine boundary, but they DO
 		// have to survive until the heap pops them — several Next() calls
 		// later — so they must be transferred like any retained row.
+		if o.wantCTIDs {
+			src.curTID = slotQueueTID(slot)
+		}
 		src.cur = transferRowForQueue(slot)
 		return true, nil
 	}
@@ -367,10 +403,14 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 			src.live = false
 			return false, nil
 		}
-		src.pending = batch.rows
+		src.pending, src.pendingTIDs = batch.rows, batch.tids
 	}
 	src.cur = src.pending[0]
 	src.pending = src.pending[1:]
+	if src.pendingTIDs != nil {
+		src.curTID = src.pendingTIDs[0]
+		src.pendingTIDs = src.pendingTIDs[1:]
+	}
 	return true, nil
 }
 
@@ -414,7 +454,7 @@ func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatum(av, bv, 0)
+		cmp, err := compareDatumTyped(av, bv, 0, k.Expr)
 		if err != nil {
 			if *errp == nil {
 				*errp = err
@@ -444,7 +484,7 @@ func (o *gatherMergeOp) Next() (TupleSlot, error) {
 	}
 
 	src := o.h.srcs[0]
-	row := src.cur
+	row, tid := src.cur, src.curTID
 
 	ok, err := o.advance(src)
 	if err != nil {
@@ -462,6 +502,9 @@ func (o *gatherMergeOp) Next() (TupleSlot, error) {
 		return nil, o.sortErr
 	}
 	o.slot.row = row
+	if o.wantCTIDs {
+		tid.stamp(&o.slot)
+	}
 	return &o.slot, nil
 }
 
@@ -510,7 +553,8 @@ func (o *gatherMergeOp) Close() error {
 	o.workers, o.arenas = nil, nil
 	if o.ownsParallelHash && o.ctx != nil {
 		// Retract after the join: no participant can still be reading.
-		o.ctx.ParallelHashBuilds = nil
+		// A spilled build's batch files go with it (M0146-0090).
+		releaseParallelHashBuilds(o.ctx)
 		o.ownsParallelHash = false
 	}
 	if o.ownsSharedBuilds && o.ctx != nil {

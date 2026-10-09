@@ -1,0 +1,16 @@
+  Aggregate  (cost=448698.39..448698.41 rows=1 width=32)
+    ->  Hash Join  (cost=6082.29..448693.31 rows=2035 width=216)
+          Hash Cond: (lineitem.l_partkey = part.p_partkey)
+          Join Filter: (lineitem.l_quantity < (SubPlan 1))
+          SubPlan 1
+            ->  Aggregate  (cost=123.58..123.60 rows=1 width=32)
+                  ->  Bitmap Heap Scan on lineitem lineitem_1  (cost=8.53..123.51 rows=29 width=550)
+                        Recheck Cond: (l_partkey = part.p_partkey)
+                        ->  Bitmap Index Scan on lineitem_part_supp_fkidx  (cost=0.38..8.53 rows=29 width=550)
+                              Index Cond: (l_partkey = part.p_partkey)
+          ->  Seq Scan on lineitem  (cost=0.00..175310.26 rows=6001726 width=550)
+          ->  Hash  (cost=6079.70..6079.70 rows=207 width=548)
+                ->  Gather  (cost=1000.00..6079.70 rows=207 width=548)
+                      Workers Planned: 2
+                      ->  Parallel Seq Scan on part  (cost=0.00..5059.00 rows=86 width=548)
+                            Filter: ((p_brand = 'Brand#23'::bpchar) AND (p_container = 'MED BOX'::bpchar))

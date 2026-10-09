@@ -84,3 +84,30 @@ func TestPushdownDescendsGatherThenJoinSpine(t *testing.T) {
 		t.Errorf("filter must land below the Gather on the `a` scan; got %T", gather.Child)
 	}
 }
+
+// TestPushdownKeepsParallelUnsafeConjunctAboveGather pins M0146-0005aq: a
+// conjunct crosses a Gather only when it is parallel-safe. Below the Gather it
+// would run inside every worker, which PG never allows for a restricted qual
+// (set_rel_consider_parallel): `nextval()` reads leader-only sequence state,
+// and a user routine's proparallel cannot be judged without a catalog, so both
+// stay above; a builtin-only safe conjunct still crosses.
+func TestPushdownKeepsParallelUnsafeConjunctAboveGather(t *testing.T) {
+	build := func() Node { return NewGather(0, srcScan("a", srcCol("x", 1)), 2) }
+	eqWith := func(right Expr) Expr {
+		c := srcEq(0, "x", 1, 0).(*BinaryOp)
+		c.Right = right
+		return c
+	}
+	for name, c := range map[string]Expr{
+		"restricted builtin": eqWith(&FuncCall{Name: "nextval", Args: []Expr{&StringConst{Value: "s"}}}),
+		"user routine":       eqWith(&FuncCall{Name: "my_udf", Args: []Expr{&IntegerConst{Value: 1}}}),
+	} {
+		if _, ok := pushConjunctIntoSubtree(build(), c); ok {
+			t.Errorf("%s: a parallel-unsafe conjunct must not cross the Gather", name)
+		}
+	}
+	safe := eqWith(&FuncCall{Name: "abs", Args: []Expr{&IntegerConst{Value: -7}}})
+	if _, ok := pushConjunctIntoSubtree(build(), safe); !ok {
+		t.Error("a builtin-only parallel-safe conjunct must still cross the Gather")
+	}
+}

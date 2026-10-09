@@ -53,6 +53,33 @@ check allow 'git commit -m "bench: document that :65433 needs ANALYZE after relo
 check allow 'grep -n 65433 CLAUDE.md | grep -i drop'
 check allow 'psql -p 5533 -c "DROP TABLE foo"'
 check allow 'pg_basebackup -p 65433 -D /tmp/clone -X stream'
+# 2026-10-02 false-positive regressions (from ci/logs/ralph-guard-denials.log):
+# a bash `for ...; do $VAR/...` body is not a SQL DO $$ block.
+check allow 'B=postgres/local_install/bin; for t in part lineitem; do $B/psql -h 127.0.0.1 -p 65432 -U tpch -d tpch -At -c "select * from $t" > tmp/$t.dat; done'
+# \copy (query) TO reads — only `<target> FROM` writes.
+check allow 'psql -p 65432 -qc "\copy (select * from lineitem) to '"'"'/tmp/li.dat'"'"'"'
+# an interpreter program that mentions a port but has no connect marker.
+check allow 'python3 - <<'"'"'PYEOF'"'"'
+import re
+s = open("docs/design/README.md").read()
+print(re.search(r"65433", s))
+PYEOF'
+# a real interpreter-driven connection is still denied.
+check deny  'python3 -c "import psycopg; psycopg.connect(port=65433).execute(\"DROP TABLE x\")"'
+check deny  'python3 - <<'"'"'PYEOF'"'"'
+import psycopg
+c = psycopg.connect("host=127.0.0.1 port=65433 dbname=tpch")
+c.execute("DELETE FROM lineitem")
+PYEOF'
+# heredoc feeding a file write is doc text, not SQL; feeding psql is not.
+check allow 'cat > analysis/x/README.md <<'"'"'EOF'"'"'
+pg at :65432 plans `CREATE INDEX` here; run ANALYZE after load.
+EOF'
+check deny  'psql -p 65433 <<'"'"'EOF'"'"'
+VACUUM lineitem
+EOF'
+# a for-do loop keyword is not `DO $$`, and $VAR is not a dollar-quote tag.
+check allow 'psql -p 65433 -c "select 1"; for i in 1 2; do echo $i; done'
 # --- reference-cluster stop / reset / delete ---------------------------------
 check deny  './bin/goopg stop -D bench/tpch/runtime_goopg/data'
 check deny  'goopg stop -mode immediate -D /home/ryo/work/goopg/goopg/bench/tpch/runtime_goopg/data/'
@@ -72,6 +99,41 @@ check allow './bin/goopg stop -D /tmp/m42clone'
 check allow 'ls bench/tpch/runtime_goopg/data; rm -rf tmp/scratch'
 check allow 'rm -rf bench/tpcds/runtime_goopg/data-sf025-clone-x'
 check allow 'scripts/tpch-spotcheck.sh'
+# private/mirror roots under tmp-like prefixes are never the reference dir
+# (2026-10-02 — a /tmp mirror ending in bench/tpch/runtime_goopg/data used to
+# trip the refdir rules).
+check allow 'ln -sfn $PWD/bench/tpch/runtime_goopg/data /tmp/mirror/bench/tpch/runtime_goopg/data'
+check allow 'rm -rf /tmp/mirror/bench/tpch/runtime_goopg/data'
+check allow 'rm -rf tmp/myclone/bench/tpch/runtime_goopg/data'
+# stop_*.sh ignore argv — `--status`/`status` still stops the cluster
+# (2026-10-02 review: the scripts have no argument handling).
+check deny  'bench/tpch/stop_goopg.sh --status'
+check deny  'bench/tpch/stop_pg.sh status'
+# review 2026-10-02: quoted/wrapped psql invocations are real, not doc text.
+check deny  'bash -c '"'"'psql -p 65433 -c "DROP TABLE x"'"'"''
+check deny  'eval "psql -p 65433 -c '"'"'DROP TABLE x'"'"'"'
+check deny  'bash <<'"'"'EOF'"'"'
+psql -p 65433 -c "DROP TABLE x"
+EOF'
+# a `>`/tee on the opener does not make a psql-heredoc body doc text.
+check deny  'psql -p 65433 <<'"'"'EOF'"'"' > /tmp/out.txt
+DROP TABLE x
+EOF'
+check deny  'psql -p 65433 <<'"'"'EOF'"'"' 2>/tmp/err.log
+DROP TABLE x
+EOF'
+# writer-heredoc stripping really does fire: a live client earlier in the
+# command still allows the doc-text body.
+check allow 'psql -p 65432 -c "select 1"; cat > docs/x.md <<'"'"'EOF'"'"'
+psql -p 65433 -c "ANALYZE lineitem"
+EOF'
+# `..` traversal and metachar glue cannot hide a refdir write behind a
+# private root (2026-10-02 review).
+check deny  'rm -rf tmp/../bench/tpch/runtime_goopg/data'
+check deny  'cat tmp/x&rm -rf bench/tpch/runtime_goopg/data'
+check deny  'rm -rf /tmp/../home/ryo/work/goopg/goopg/bench/tpch/runtime_goopg/data'
+# interpreter subprocess spawning psql counts as a client (conmark widened).
+check deny  'python3 -c "import subprocess; subprocess.run(['"'"'psql'"'"','"'"'-p'"'"','"'"'65433'"'"','"'"'-c'"'"','"'"'DROP TABLE x'"'"'])"'
 # --- gate bypass / history ---------------------------------------------------
 check deny  'git commit -n -m "x" -- internal/foo.go'
 check deny  'git commit --no-verify -m wip'
@@ -248,7 +310,7 @@ LOGROOT="$(mktemp -d)"
 ( cd "$LOGROOT" && git init -q . ) >/dev/null 2>&1
 bash_json 'psql -p 65433 -c "DROP TABLE x"' \
   | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$LOGROOT" "$GUARD" >/dev/null
-if grep -q 'tool=Bash rule=ref-cluster-write:[0-9]* subject=psql -p 65433' "$LOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
+if grep -qE 'tool=Bash rule=ref-cluster-write:[0-9]+( match=\S+)? +subject=psql -p 65433' "$LOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
 then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) bash denial not logged"; cat "$LOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null; fi
 bash_json 'git commit --no-verify -m x' \
   | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$LOGROOT" "$GUARD" >/dev/null
@@ -352,7 +414,7 @@ fcheck allow "$(sj execute_shell_command "$TD" '{"command":"ls"}')"
 # file-guard denials are logged too
 FLOGROOT="$(mktemp -d)"
 ej Edit "$TD/CLAUDE.md" claude x | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$FLOGROOT" "$FGUARD" >/dev/null
-if grep -q "tool=file-guard rule=protected-region subject=Edit $TD/CLAUDE.md" "$FLOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
+if grep -qE "tool=file-guard rule=protected-region .*subject=Edit $TD/CLAUDE.md" "$FLOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null
 then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL(log) file-guard denial not logged"; cat "$FLOGROOT/ci/logs/ralph-guard-denials.log" 2>/dev/null; fi
 ej Edit "$TD/other.md" a b | RALPH_LOOP=1 CLAUDE_PROJECT_DIR="$FLOGROOT" "$FGUARD" >/dev/null
 if [ "$(wc -l < "$FLOGROOT/ci/logs/ralph-guard-denials.log")" = 1 ]

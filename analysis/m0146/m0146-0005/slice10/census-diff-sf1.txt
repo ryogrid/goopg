@@ -1,0 +1,4 @@
+14c14
+< Q14 depth=2 [join-order] under CTE: PG Hash Join Inner | goopg Hash Join Inner
+---
+> Q14 depth=6 [parallelism] under Gather: PG Parallel Hash Join Inner | goopg Hash Join Inner

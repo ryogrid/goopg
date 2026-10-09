@@ -1,0 +1,29 @@
+=== Q40
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=12908.92..12909.28 rows=18 width=128)
+   ->  Finalize GroupAggregate  (cost=12908.92..12909.10 rows=18 width=128)
+         Group Key: warehouse.w_state, item.i_item_id
+         ->  Gather Merge  (cost=12908.47..12908.83 rows=18 width=128)
+               Workers Planned: 3
+               ->  Partial GroupAggregate  (cost=12908.47..12908.65 rows=18 width=128)
+                     Group Key: warehouse.w_state, item.i_item_id
+                     ->  Sort  (cost=12908.22..12908.39 rows=17 width=2208)
+                           Sort Key: warehouse.w_state, item.i_item_id
+                           ->  Nested Loop  (cost=2050.61..12907.70 rows=6 width=1288)
+                                 ->  Nested Loop Left Join  (cost=2050.49..12906.87 rows=6 width=896)
+                                       ->  Nested Loop  (cost=2050.24..12905.11 rows=6 width=536)
+                                             ->  Parallel Hash Join  (cost=2049.99..12876.76 rows=95 width=56)
+                                                   Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=116257 width=556)
+                                                   ->  Parallel Seq Scan on date_dim  (cost=0.00..2049.55 rows=35 width=420)
+                                                         Filter: ((d_date >= '2001-04-02 00:00:00'::timestamp) AND (d_date <= '2001-06-01 00:00:00'::timestamp))
+                                             ->  Index Scan using item_pkey on item  (cost=0.25..0.30 rows=1 width=480)
+                                                   Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                                   Filter: ((i_current_price >= 0.99) AND (i_current_price <= 1.49))
+                                       ->  Index Scan using catalog_returns_pkey on catalog_returns  (cost=0.25..0.28 rows=1 width=360)
+                                             Index Cond: (cr_item_sk = catalog_sales.cs_item_sk AND cr_order_number = catalog_sales.cs_order_number)
+                                 ->  Index Scan using warehouse_pkey on warehouse  (cost=0.12..0.14 rows=1 width=392)
+                                       Index Cond: (w_warehouse_sk = catalog_sales.cs_warehouse_sk)
+(24 rows)
+

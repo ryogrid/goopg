@@ -142,7 +142,10 @@ func TestSubPlanStatsCorrelatedScalarRescans(t *testing.T) {
 // M0058-0001 constant-key cache still does its job and that the
 // counters describe it correctly: one miss, the remainder hits.
 func TestSubPlanStatsNonCorrelatedCachesAfterFirst(t *testing.T) {
-	ctx, cleanup := statsFixture(t)
+	// The index on t2.b gives planagg its presorted path; without one the
+	// MIN/MAX rewrite does not fire (M0146-0005du) and there is no inner
+	// InitPlan to count.
+	ctx, cleanup := statsFixture(t, "CREATE INDEX t2_b_idx ON t2 (b)")
 	defer cleanup()
 
 	runQuery(t, ctx,
@@ -183,11 +186,13 @@ func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
 
+	// The EXISTS is hashed as PG's second (ANY) plan of the pair, so its
+	// line is `SubPlan 2` (PG 18.3 plan_id order, M0146-0005bv).
 	const probe = "SELECT * FROM t1 WHERE t1.a = -999 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)"
 
 	plain := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+probe), "\n")
 	for _, line := range strings.Split(plain, "\n") {
-		if strings.Contains(line, "SubPlan 1") && strings.Contains(line, "calls=") {
+		if strings.Contains(line, "SubPlan 2") && strings.Contains(line, "calls=") {
 			t.Errorf("plain EXPLAIN must not carry counters:\n%s", plain)
 		}
 	}
@@ -195,7 +200,7 @@ func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	analyzed := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE) "+probe), "\n")
 	var counterLine string
 	for _, line := range strings.Split(analyzed, "\n") {
-		if strings.Contains(line, "SubPlan 1") {
+		if strings.Contains(line, "SubPlan 2") {
 			counterLine = strings.TrimSpace(line)
 		}
 	}

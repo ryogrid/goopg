@@ -45,15 +45,21 @@ Setup / start / stop procedures:
   `tmp/METHODLOGY3_RALPH_CHECK0917/03-new-problems.md` §2) is preserved in
   `tmp/evidence-65433-20260919-unclean/`. **`preloss-clone-20260915` remains
   under `preloss-clone-20260915.HOLD`** — never start, clone, modify, move
-  or delete it; it is the only pre-loss copy. Two
-  known quirks of the rebuilt layout: HammerDB's final
-  ANALYZE step fails and `ANALYZE <table>` inside db `tpch` errors
-  "relation does not exist" (per-DB scoping gap in the ANALYZE path — see
-  the archived ledger row `bench-reorg ANALYZE-scope`, resolved 2026-07-27 by
-  M0125-0028 and since pruned from the live ledger — it survives only in
-  `analysis/deferral-ledger-summary-20260824/deferral_ledger_summary_fix.md`;
-  the gate runs S-cold
-  regardless), and heavy queries at S-cold need GC headroom — Q21 drew a
+  or delete it; it is the only pre-loss copy.
+  Maintenance caveat on this cluster: inside a non-default database,
+  **bare `VACUUM` (no table list) still resolves against the default
+  `postgres` db** — in db `tpch` it returns `VACUUM` yet touches none
+  of tpch's tables (open M0125-0028 residual, `.ralph/deferral_ledger.md`
+  2026-07-30 row; filed for fix as `M0143-0011`). Vacuum by explicit
+  per-table list and confirm `pg_class.relallvisible` afterwards — a
+  VACUUM that exits 0 in the wrong db is not evidence. The older
+  named-target gap (`ANALYZE <table>` / `VACUUM <table>` erroring
+  "relation does not exist" in `tpch`) IS resolved — `ANALYZE region`
+  verified live 2026-10-02 and tpch's tables now carry `reltuples>0`;
+  the history
+  survives in the archived `bench-reorg ANALYZE-scope` row at
+  `analysis/deferral-ledger-summary-20260824/deferral_ledger_summary_fix.md`.
+  Heavy queries at S-cold need GC headroom — Q21 drew a
   host-level OOM at `GOMEMLIMIT=18GiB` but completes at `GOGC=100` +
   `GOMEMLIMIT=12GiB`.
 - **TPC-DS**: `bench/tpcds/README.md`. Env: `bench/tpcds/env_tpcds.sh`

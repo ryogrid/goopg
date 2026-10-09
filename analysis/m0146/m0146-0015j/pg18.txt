@@ -1,0 +1,37 @@
+--- explain (costs off) select count(*) from tk d full join tk e on e.u1 = d.u2 and e.h = 0 where coalesce(d.u1, e.u1) is not null
+Aggregate
+  ->  Hash Full Join
+        Hash Cond: (d.u2 = e.u1)
+        Join Filter: (e.h = 0)
+        Filter: (COALESCE(d.u1, e.u1) IS NOT NULL)
+        ->  Seq Scan on tk d
+        ->  Hash
+              ->  Seq Scan on tk e
+--- select count(*) from tk d full join tk e on e.u1 = d.u2 and e.h = 0 where coalesce(d.u1, e.u1) is not null
+190
+--- select count(*) from tk d full join tk e on e.u1 = d.u2 and e.h = 0 where coalesce(d.u1, e.u1) is null
+0
+--- explain (costs off) select count(*) from tk d left join tk e on e.u1 = d.u2 where coalesce(e.u1, 0) is not null
+Aggregate
+  ->  Hash Left Join
+        Hash Cond: (d.u2 = e.u1)
+        Filter: (COALESCE(e.u1, 0) IS NOT NULL)
+        ->  Seq Scan on tk d
+        ->  Hash
+              ->  Seq Scan on tk e
+--- explain (costs off) select count(*) from tk d left join tk e on e.u1 = d.u2 where abs(e.u1) is not null
+Aggregate
+  ->  Hash Join
+        Hash Cond: (e.u1 = d.u2)
+        ->  Seq Scan on tk e
+              Filter: (abs(u1) IS NOT NULL)
+        ->  Hash
+              ->  Seq Scan on tk d
+--- select count(*) from tk d left join tk e on e.u1 = d.u2 where coalesce(e.u1, 0) is not null
+100
+--- select count(*) from tk d left join tk e on e.u1 = d.u2 where abs(e.u1) is not null
+100
+--- select count(*) from tk d left join tk e on e.u1 = d.u2 where e.u1 is null
+0
+--- select count(*) from tk d full join tk e on e.u1 = d.u2 where e.u1 is not null
+100

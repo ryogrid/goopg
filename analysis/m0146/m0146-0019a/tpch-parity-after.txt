@@ -1,0 +1,47 @@
+# plan-parity: tmp/m19a-tpch/after.plans.txt -> tmp/m0146-0015d/tpch/m0146-0015d-tpch-pg.plans.txt
+Q1 MATCH [] estimates(goopg cost=172069.98..172073.64 rows=6 width=248 | pg cost=200862.17..200865.99 rows=6 width=236)
+Q10 MATCH [] estimates(goopg cost=186586.67..186731.48 rows=57923 width=684 | pg cost=200773.40..200920.27 rows=58749 width=204)
+    note: normalisation: strip-pg-Hash
+Q11 MATCH [] estimates(goopg cost=15704.83..15731.49 rows=10667 width=64 | pg cost=10676.42..10703.09 rows=10667 width=38)
+Q12 SHAPE-DIFF [join-order,join-method,scan-type] estimates(goopg cost=185798.25..185894.93 rows=7 width=60 | pg cost=190868.12..191015.99 rows=7 width=27)
+    note: normalisation: strip-pg-Hash
+Q13 SHAPE-DIFF [scan-type] estimates(goopg cost=82255.14..82255.64 rows=200 width=16 | pg cost=67196.16..67196.66 rows=200 width=16)
+    note: normalisation: canonicalise-right-join,strip-pg-Hash
+Q14 MATCH [] estimates(goopg cost=144628.62..144628.64 rows=1 width=64 | pg cost=159302.97..159302.98 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q15a-VIEWBODY ERROR [] estimates(goopg n/a | pg n/a)
+    note: missing goopg section
+Q15b ERROR [] estimates(goopg n/a | pg n/a)
+    note: missing PG section
+Q16 SHAPE-DIFF [scan-type] estimates(goopg cost=38867.94..38907.79 rows=15940 width=152 | pg cost=37132.51..37172.92 rows=16166 width=45)
+    note: normalisation: strip-pg-Hash
+Q17 MATCH [] estimates(goopg cost=198388.38..198388.39 rows=1 width=32 | pg cost=212797.21..212797.22 rows=1 width=32)
+    note: normalisation: strip-pg-Hash
+Q18 SHAPE-DIFF [join-order,join-method,scan-type] estimates(goopg cost=420294.52..421641.86 rows=538935 width=204 | pg cost=403538.71..404713.55 rows=469937 width=79)
+    note: normalisation: strip-pg-Hash
+Q19 SHAPE-DIFF [join-order,scan-type] estimates(goopg cost=32611.95..32611.96 rows=1 width=32 | pg cost=32855.41..32855.42 rows=1 width=32)
+Q2 SHAPE-DIFF [join-order,scan-type,parallelism] estimates(goopg cost=10967.41..10967.42 rows=1 width=2624 | pg cost=48872.73..48872.74 rows=1 width=197)
+    note: normalisation: strip-pg-Hash
+Q20 SHAPE-DIFF [join-order,scan-type] estimates(goopg cost=132007.99..132008.26 rows=108 width=1074 | pg cost=95012.62..95012.89 rows=108 width=52)
+    note: normalisation: canonicalise-bare-semi-anti,canonicalise-right-join,strip-pg-Hash
+Q21 SHAPE-DIFF [join-order,join-method,parallelism,qual-placement] estimates(goopg cost=182067.57..182067.58 rows=1 width=112 | pg cost=269864.10..269864.10 rows=1 width=34)
+    note: normalisation: canonicalise-bare-semi-anti,strip-pg-Hash
+Q22 SHAPE-DIFF [join-order,scan-type] estimates(goopg cost=19301.62..19393.06 rows=658 width=72 | pg cost=13200.11..13290.65 rows=640 width=72)
+    note: normalisation: canonicalise-bare-semi-anti
+Q3 MATCH [] estimates(goopg cost=204952.14..205739.58 rows=314975 width=104 | pg cost=166998.77..167777.31 rows=311418 width=49)
+    note: normalisation: strip-pg-Hash
+Q4 MATCH [] estimates(goopg cost=77370.14..77409.53 rows=5 width=72 | pg cost=70092.22..70120.13 rows=5 width=24)
+    note: normalisation: canonicalise-bare-semi-anti
+Q5 MATCH [] estimates(goopg cost=131793.24..131793.30 rows=25 width=136 | pg cost=92841.13..92841.19 rows=25 width=58)
+    note: normalisation: strip-pg-Hash
+Q6 MATCH [] estimates(goopg cost=150125.26..150125.27 rows=1 width=32 | pg cost=164234.73..164234.74 rows=1 width=32)
+Q7 MATCH [] estimates(goopg cost=86797.91..87592.81 rows=2503 width=248 | pg cost=77608.53..78494.94 rows=6052 width=116)
+    note: normalisation: strip-pg-Hash
+Q8 SHAPE-DIFF [join-order,scan-type] estimates(goopg cost=75210.07..75542.88 rows=2394 width=72 | pg cost=77365.89..77751.06 rows=2405 width=64)
+    note: normalisation: strip-pg-Hash
+Q9 MATCH [] estimates(goopg cost=110452.98..110603.29 rows=60125 width=144 | pg cost=116911.94..117062.26 rows=60125 width=90)
+    note: normalisation: strip-pg-Hash
+PLAN-PARITY: queries=23 match=11 shapediff=10 unparsed=0 missingnode=0 error=2 timeout=0
+CATEGORIES: join-order=8 join-method=3 scan-type=9 parameterisation=0 aggregation-strategy=0 sort-strategy=0 parallelism=2 qual-placement=1 rendering=0
+CATEGORIES-EXCL-MATCH: join-order=8 join-method=3 scan-type=9 parameterisation=0 aggregation-strategy=0 sort-strategy=0 parallelism=2 qual-placement=1 rendering=0
+NORMALISATION: N1 estimates-to-side-column, N2 strip-PG-Hash, N3 drop-true-filter, N4 alias/suffix-canonicalisation, N5 cast/operator-rendering, N6 qual/key-signatures, N7 right-join-canonicalisation

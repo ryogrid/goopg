@@ -1,0 +1,91 @@
+          c_last_name           |     c_first_name     | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt 
+--------------------------------+----------------------+--------------+-----------------------+------------------+-----
+ Allred                         | Kathy                | Miss         | Y                     |           168636 |  16
+ Armstrong                      | Julia                | Mrs.         | Y                     |           187228 |  15
+ Austin                         | Barbara              | Miss         | N                     |            43704 |  15
+ Baker                          | Gregory              | Dr.          | N                     |            64024 |  16
+ Baker                          | John                 | Sir          | N                     |            10036 |  15
+ Baker                          | Richard              | Dr.          | N                     |           110320 |  16
+ Banks                          | Ricky                | Mr.          | N                     |           152380 |  15
+ Barnett                        | Daniel               | Sir          | N                     |           226040 |  15
+ Bennett                        | Megan                | Miss         | N                     |           133448 |  15
+ Bradshaw                       | Francis              | Dr.          | N                     |           188716 |  15
+ Broadway                       | Lucille              | Mrs.         | Y                     |           102476 |  15
+ Brown                          | Margaret             | Ms.          | N                     |           210676 |  16
+ Burke                          | Roy                  | Mr.          | Y                     |            65792 |  15
+ Burton                         | Rebecca              | Mrs.         | N                     |            77116 |  15
+ Campbell                       | Helen                | Miss         | Y                     |           187284 |  16
+ Chastain                       | Elizabeth            | Miss         | N                     |            97824 |  15
+ Collier                        | Jeff                 | Dr.          | Y                     |            38252 |  15
+ Dagostino                      | Constance            | Dr.          | Y                     |           190452 |  15
+ Davis                          | Roger                | Mr.          | N                     |           200136 |  15
+ Duong                          | Catrina              | Mrs.         | Y                     |             4440 |  16
+ Estrada                        | Amanda               | Ms.          | Y                     |            85084 |  15
+ Fitzgerald                     | Kristi               | Mrs.         | N                     |            62720 |  15
+ Foltz                          | Kenneth              | Mr.          | Y                     |           220740 |  15
+ Garcia                         | Barbara              | Miss         | Y                     |           211948 |  16
+ George                         | Issac                | Dr.          | N                     |             8448 |  16
+ Gilbert                        | Lori                 | Miss         | Y                     |            32204 |  15
+ Gilmore                        | Fawn                 | Ms.          | N                     |           219212 |  16
+ Gonzalez                       | Zachary              | Mr.          | N                     |           208344 |  15
+ Green                          | Daniel               | Dr.          | N                     |           227784 |  15
+ Haas                           | Richard              | Sir          | Y                     |            47696 |  16
+ Hall                           | William              | Sir          | Y                     |           177052 |  15
+ Harley                         | Robert               | Mr.          | N                     |           137892 |  15
+ Harms                          | Douglas              | Dr.          | N                     |           202296 |  15
+ Hernandez                      | Geraldine            | Mrs.         | Y                     |            34324 |  15
+ Herrera                        | Jonathan             | Dr.          | N                     |           205756 |  15
+ Holmes                         | Juan                 | Sir          | N                     |           203188 |  16
+ Hutchinson                     | Rosanne              | Mrs.         | N                     |            14384 |  15
+ Jacobsen                       | Walter               | Dr.          | N                     |           156140 |  16
+ Jennings                       | George               | Mr.          | N                     |           121680 |  15
+ Johnson                        | Alice                | Mrs.         | N                     |           133904 |  15
+ Johnson                        | Don                  | Dr.          | Y                     |           186376 |  15
+ Keller                         | Eric                 | Sir          | Y                     |            27156 |  15
+ Kelly                          | Thomas               | Mr.          | Y                     |           187292 |  15
+ Lemus                          | Deena                | Ms.          | Y                     |            34488 |  16
+ Lopez                          | Juan                 | Mr.          | N                     |           146832 |  15
+ Lopez                          |                      |              | Y                     |            34920 |  15
+ Marshall                       | Ann                  | Miss         | N                     |            69752 |  15
+ May                            | James                | Mr.          | Y                     |            17660 |  16
+ Mccune                         | Darrell              | Sir          | Y                     |           223904 |  15
+ Mcgrath                        | Chester              | Sir          | Y                     |           108556 |  15
+ Milligan                       | Cynthia              | Dr.          | N                     |           182496 |  16
+ Moe                            | Julia                | Dr.          | Y                     |           129452 |  15
+ Monahan                        | Dolores              | Mrs.         | Y                     |            23420 |  15
+ Muniz                          | Lisa                 | Mrs.         | Y                     |           223472 |  16
+ Nava                           | Jeanine              | Miss         | Y                     |           239824 |  15
+ Nava                           | Rachel               | Ms.          | N                     |           123420 |  15
+ Newell                         | Catherine            | Ms.          | N                     |           197352 |  16
+ Nguyen                         | James                | Sir          | N                     |           238544 |  15
+ Pacheco                        | Emma                 | Mrs.         | Y                     |            93148 |  15
+ Pina                           | Sheri                | Ms.          | Y                     |           216916 |  15
+ Plunkett                       | Ashley               | Mrs.         | N                     |           122716 |  15
+ Potter                         | Glenda               | Dr.          | N                     |           167644 |  16
+ Quinones                       | Eric                 | Sir          | Y                     |           162360 |  16
+ Salazar                        | Matt                 | Sir          | Y                     |            53540 |  15
+ Scott                          | Jeri                 | Ms.          | N                     |           184728 |  15
+ Shannon                        | Marian               | Miss         | Y                     |           144544 |  16
+ Simmons                        | Julio                | Dr.          | N                     |            29576 |  16
+ Stovall                        | Jennifer             | Dr.          | N                     |           112060 |  15
+ Thomas                         | Lucia                | Mrs.         | N                     |           228696 |  15
+ Thornton                       | Beverly              | Mrs.         | N                     |           127128 |  15
+ Thorpe                         | Thomas               | Dr.          | N                     |            14308 |  15
+ Tidwell                        | Cindy                | Mrs.         | N                     |           106964 |  15
+ Tolbert                        | Emily                | Miss         | Y                     |           180324 |  16
+ Turman                         | Jeanette             | Dr.          | Y                     |           217128 |  16
+ Turner                         | Kurt                 | Sir          | N                     |           198464 |  15
+ Valentin                       | Brenton              | Mr.          | Y                     |           188372 |  15
+ Walton                         | Alana                | Mrs.         | Y                     |             8236 |  15
+ Wertz                          | Alvin                | Dr.          | Y                     |           108396 |  16
+ Williams                       | Patrick              | Sir          | N                     |            50348 |  15
+ Wilson                         | Terrance             | Dr.          | Y                     |           175932 |  15
+ Woodard                        | Ruth                 | Mrs.         | N                     |            45584 |  16
+ Wright                         | Alice                | Mrs.         | N                     |            38248 |  16
+ Yates                          | Robert               | Dr.          | N                     |           160416 |  15
+                                | Marian               | Dr.          | N                     |             6280 |  16
+                                | Yu                   |              |                       |           238864 |  15
+                                | Zachary              |              | Y                     |            64548 |  15
+                                |                      | Mrs.         | N                     |           109196 |  16
+(87 rows)
+

@@ -135,6 +135,23 @@ func rewriteExistsToAnyNode(node Node) {
 		if n.Predicate != nil && n.Outer != nil && n.Inner != nil {
 			n.Predicate = rewriteExistsToAnyQual(n.Predicate, joinedRowSchema(n.Outer, n.Inner), false)
 		}
+	case *IndexScan:
+		// M0146-0005dx1: a relation's restriction rides an index probe's
+		// own Cond (its `Filter:` line) when the scan is a nested loop's
+		// inner. Cond is in the scan's output coordinates, so the scan's
+		// row is the host — PG's Q10 reads `Filter: ((ANY (c_customer_sk =
+		// (hashed SubPlan 2).col1)) OR …)` on the customer_pkey probe.
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
+	case *IndexOnlyScan:
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
+	case *BitmapHeapScan:
+		if n.Cond != nil {
+			n.Cond = rewriteExistsToAnyQual(n.Cond, n.Output(), false)
+		}
 	case *Project:
 		rewriteExistsToAnyNode(n.Child)
 	case *Aggregate:
@@ -160,6 +177,12 @@ func rewriteExistsToAnyNode(node Node) {
 	case *GatherMerge:
 		rewriteExistsToAnyNode(n.Child)
 	case *CTEScan:
+		rewriteExistsToAnyNode(n.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through.
+		rewriteExistsToAnyNode(n.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — descend.
 		rewriteExistsToAnyNode(n.Child)
 	case *SetOp:
 		rewriteExistsToAnyNode(n.Left)
@@ -397,6 +420,13 @@ func existsToAny(ex *ExistsExpr, hostRow Schema) *InExpr {
 		},
 		Plan:            projected,
 		IsNonCorrelated: true,
+		// M0146-0015c slice 3: the source EXISTS is two-valued, so this
+		// ANY is too — upstream stamps the same conversion's subplan
+		// unknownEqFalse. The bounded spine this pass walks already
+		// keeps the link out of NULL-distinguishing positions; the flag
+		// makes the executor enforce it (NULL collapses to FALSE) rather
+		// than rely on the placement.
+		UnknownEqFalse: true,
 	}
 }
 

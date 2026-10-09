@@ -1,0 +1,36 @@
+335c335
+< Finalize Aggregate  
+---
+> Aggregate  
+336a337
+>         Filter: (lineitem.l_quantity < (SubPlan 1))
+338,352c339,351
+<         ->  Partial Aggregate  
+<               ->  Nested Loop  
+<                     Filter: (lineitem.l_quantity < (SubPlan 1))
+<                     SubPlan 1
+<                       ->  Aggregate  
+<                             ->  Bitmap Heap Scan on lineitem lineitem_1  
+<                                   Filter: (l_partkey = part.p_partkey)
+<                                   ->  Bitmap Index Scan on lineitem_part_supp_fkidx  
+<                                         Index Cond: (l_partkey = part.p_partkey)
+<                     ->  Parallel Seq Scan on part  
+<                           Filter: ((p_brand = 'Brand#23') AND (p_container = 'MED BOX'))
+<                     ->  Bitmap Heap Scan on lineitem  
+<                           Recheck Cond: (l_partkey = p_partkey)
+<                           ->  Bitmap Index Scan on lineitem_part_supp_fkidx  
+<                                 Index Cond: (l_partkey = part.p_partkey)
+---
+>         SubPlan 1
+>           ->  Aggregate  
+>                 ->  Bitmap Heap Scan on lineitem lineitem_1  
+>                       Filter: (l_partkey = part.p_partkey)
+>                       ->  Bitmap Index Scan on lineitem_part_supp_fkidx  
+>                             Index Cond: (l_partkey = part.p_partkey)
+>         ->  Nested Loop  
+>               ->  Parallel Seq Scan on part  
+>                     Filter: ((p_brand = 'Brand#23') AND (p_container = 'MED BOX'))
+>               ->  Bitmap Heap Scan on lineitem  
+>                     Recheck Cond: (l_partkey = p_partkey)
+>                     ->  Bitmap Index Scan on lineitem_part_supp_fkidx  
+>                           Index Cond: (l_partkey = part.p_partkey)

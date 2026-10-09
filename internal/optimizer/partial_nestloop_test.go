@@ -236,17 +236,75 @@ func TestPartialPathDrivingKindNestLoop(t *testing.T) {
 	}
 }
 
+// nlProbeClassifyPath builds the R95 shape under test: a PathNestLoop over a
+// partial outer and a PARAMETERIZED index-probe inner (RequiredOuter nonzero,
+// PathIndexScan with IndexClauses) — the path addPartialNestLoopPaths files
+// for the lateral-probe arm.
+func nlProbeClassifyPath(joinrel, outer, inner *RelOptInfo, jt parser.JoinType) *Path {
+	probe := &Path{
+		Kind:          PathIndexScan,
+		Rel:           inner,
+		Rows:          5,
+		RequiredOuter: outer.Relids, // parameter satisfiable by the outer
+		IndexClauses:  []indexPathClause{{key: &ColumnRef{}}},
+	}
+	return &Path{
+		Kind: PathNestLoop, Jointype: jt, Rel: joinrel,
+		Rows: 2500, Cost: Cost{Total: 300},
+		Children:        []*Path{outer.PartialPathlist[0], probe},
+		OuterRelids:     outer.Relids,
+		InnerRelids:     inner.Relids,
+		RequiredOuter:   0,
+		ParallelSafe:    true,
+		ParallelWorkers: 2,
+	}
+}
+
+// TestPartialPathDrivingKindNestLoopProbe pins the R95 probe arm's jointype
+// set after M0146-0002i/j and M0146-0005ao: {INNER, LEFT, SEMI, ANTI}
+// admit, RIGHT and FULL refused. SEMI is TPC-H Q4's shape (Nested Loop Semi
+// Join inside the Gather probing the index per worker); ANTI is TPC-H Q21's
+// (M0146-0002j); LEFT is TPC-DS Q40's (Nested Loop Left Join probing
+// catalog_returns inside the Gather Merge, M0146-0005ao).
+func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
+	for _, jt := range []parser.JoinType{parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, jt)
+		if got := partialPathDrivingKind(p); got != PathSeqScan {
+			t.Errorf("%v probe partial NL must classify to its outer's driving kind, got %v", jt, got)
+		}
+	}
+	for _, jt := range []parser.JoinType{parser.JoinRight, parser.JoinFull} {
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, jt)
+		if got := partialPathDrivingKind(p); got != PathPrebuilt {
+			t.Errorf("%v probe partial NL must refuse, got %v", jt, got)
+		}
+	}
+	// The subset re-check still fires under SEMI: a probe parameter no outer
+	// supplies is refused even though the jointype admits.
+	{
+		jr, o, i := nlClassifyFixture()
+		p := nlProbeClassifyPath(jr, o, i, parser.JoinSemi)
+		p.Children[1].RequiredOuter = relsetOf(2) // no outer supplies bit 2
+		if got := partialPathDrivingKind(p); got != PathPrebuilt {
+			t.Errorf("SEMI probe with unsatisfiable parameter must refuse, got %v", got)
+		}
+	}
+}
+
 // TestPartialNLFilingInnerOnly pins R60's narrowed V1 gate, as widened by
-// M0137-0019b: only INNER and SEMI are filed, so a refused head can never
-// starve admittable siblings (the gather-path reader takes
-// PartialPathlist[0] only). LEFT and ANTI stay unfiled by scope.
+// M0137-0019b (SEMI), M0146-0002j (ANTI) and M0146-0005ao (LEFT): PG's full
+// dispatch set {INNER, LEFT, SEMI, ANTI} is filed and RIGHT / FULL are not,
+// so a refused head can never starve admittable siblings (the gather-path
+// reader takes PartialPathlist[0] only).
 func TestPartialNLFilingInnerOnly(t *testing.T) {
 	withParallelOn(t, func() {
 		defer setGatherPathsModeForTest(gatherPathsAll)()
 		cp := defaultCostParams()
 		a, b := relsetOf(0), relsetOf(1)
 		for _, jt := range []parser.JoinType{
-			parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti,
+			parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti, parser.JoinRight, parser.JoinFull,
 		} {
 			outer := nlPartialOuter(a)
 			// ParallelSafe is stamped at path creation: the flag must be
@@ -259,15 +317,15 @@ func TestPartialNLFilingInnerOnly(t *testing.T) {
 			joinrel.ConsiderParallel = true
 			s := &searchCtx{parallelModeOK: true}
 			clauses := []*restrictInfo{equiClause(a, b)}
-			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{})
-			if jt == parser.JoinInner || jt == parser.JoinSemi {
+			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{}, mergeUnique{})
+			if jt != parser.JoinRight && jt != parser.JoinFull {
 				if len(joinrel.PartialPathlist) == 0 {
 					t.Errorf("%v partial NL must be filed", jt)
 				}
 				continue
 			}
 			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v: partial NL outside {INNER, SEMI} must not be filed", jt)
+				t.Errorf("%v: partial NL outside {INNER, LEFT, SEMI, ANTI} must not be filed", jt)
 			}
 		}
 	})

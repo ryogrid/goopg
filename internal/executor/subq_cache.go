@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/executor/kvcache"
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -125,4 +127,42 @@ func (c *Context) corrSubqHashMapReconcile(reserved int64, hm map[string]Datum) 
 		actual += int64(len(k)) + int64(len(datumKey(v))) + perKeyOverhead
 	}
 	return c.subqBudget.Reserve(actual)
+}
+
+// scopedSublinkKey extends a scoped-store key with the enclosing outer rows
+// when the sublink's plan reads past its immediate parent row (M0146-0079).
+// A scoped key encodes the sublink's own row, or nothing for an
+// IsNonCorrelated sublink. In the example below, the ANY sublink reads v.x,
+// the left row of the LATERAL item enclosing it:
+//
+//	… v(id, x), LATERAL (SELECT f1 FROM t WHERE f1 = ANY (SELECT … WHERE b = v.x OFFSET 0))
+//
+// The lateral driver pops one left row and pushes the next, so OuterRows
+// keeps its depth and the depth-only guard never cleared the store. Every
+// left row after the first reused the first one's result.
+//
+// PG re-evaluates a SubPlan when a parameter it depends on changes, at any
+// level (nodeSubplan.c, chgParam), and only then. The key therefore gains
+// the enclosing rows only for a sublink that reads them. A sublink nested in
+// a correlated one, but independent of it, keeps its single cached result.
+// The lookup runs before the sublink pushes its own row, so OuterRows is
+// exactly the enclosing stack.
+func (c *Context) scopedSublinkKey(stat *SubPlanSiteStats, plan optimizer.Node, key string) string {
+	if c == nil || plan == nil {
+		return key
+	}
+	if !stat.scopeKnown {
+		stat.readsPastParent = optimizer.PlanReadsPastParent(plan)
+		stat.scopeKnown = true
+	}
+	if !stat.readsPastParent || len(c.OuterRows) == 0 {
+		return key
+	}
+	var sb strings.Builder
+	sb.WriteString(key)
+	for _, r := range c.OuterRows {
+		sb.WriteByte(0)
+		sb.WriteString(subqueryCacheKey(r))
+	}
+	return sb.String()
 }

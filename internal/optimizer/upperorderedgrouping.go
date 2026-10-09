@@ -119,14 +119,11 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	clause := groupClauseKeys(spec)
 	for j, k := range clause {
 		g := groups[k.Pos]
-		// Bare group keys only: the output side names positions, and
-		// only a column has a name. Both sides are input-coordinate
-		// here, so `exprEqual`'s positional `Index` equality is the
-		// match (Name/SourceTableIdx excluded, exprwalk.go:555+).
-		if _, ok := g.(*ColumnRef); !ok {
-			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-columnref(%T)", k.Pos, g), cand)
-			return nil
-		}
+		// Both sides are input-coordinate here, so `exprEqual`'s
+		// positional `Index` equality is the match (Name/SourceTableIdx
+		// excluded, exprwalk.go:555+) — for a bare column and, since
+		// M0146-0005ae, for an expression key alike (the Node twin,
+		// aggregateEmissionPathkeys, admits the same shapes).
 		if j >= len(childPK) || !exprEqual(childPK[j].Expr, g) {
 			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-leading-child-sortkey", k.Pos), cand)
 			return nil
@@ -138,6 +135,11 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 		return nil
 	}
 	for j, g := range groups {
+		if _, isCol := g.(*ColumnRef); !isCol {
+			// An expression key's output column is named by position
+			// only — the claim below reads Index, never Name.
+			continue
+		}
 		if outCols[j].Name != groupExprName(g) {
 			traceGroupDecline(fmt.Sprintf("outcol[%d]-name-mismatch(%s!=%s)", j, outCols[j].Name, groupExprName(g)), cand)
 			return nil

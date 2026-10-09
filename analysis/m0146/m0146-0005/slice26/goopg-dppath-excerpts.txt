@@ -1,0 +1,24 @@
+=== goopg DPPATH: base-rel scans ===
+DPPATH partial producer=scan.seq.partial relids={0} kind=1 reqouter=- rows=18 startup=0 total=2049.55 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={1} kind=1 reqouter=- rows=232218 startup=0 total=15256.18064516129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=428 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={2} kind=1 reqouter=- rows=172 startup=0 total=1374.3529411764705 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=480 inputtotal=-1
+
+=== goopg DPPATH: {0} parameterized indexscan (dd probe) ===
+DPPATH path producer=index.parameterised relids={0} kind=2 reqouter={1} rows=1 startup=0.25 total=0.2873918841578271 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=420 inputtotal=-1
+
+=== goopg DPPATH: {2} parameterized indexscan (item probe) ===
+DPPATH path producer=index.parameterised relids={2} kind=2 reqouter={1} rows=1 startup=0.25 total=0.281746898076891 disabled=0 pathkeys=1 verdict=accepted jointype=inner outer=- inner=- width=480 inputtotal=-1
+
+=== goopg DPPATH: {0,1} and {1,2} partial hash seeds ===
+DPPATH partial producer=join.hash.partial.parallelhash relids={0,1} kind=3 reqouter=- rows=166 startup=18158.905645161292 total=20218.523145161293 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0} inner={1} width=848 inputtotal=2049.55
+DPPATH partial producer=join.hash.partial.parallelhash relids={0,1} kind=3 reqouter=- rows=91 startup=2049.775 total=17915.56127016129 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1} inner={0} width=848 inputtotal=15256.18064516129
+DPPATH partial producer=join.hash.partial.parallelhash relids={1,2} kind=3 reqouter=- rows=3780 startup=1376.5029411764706 total=17242.400461337762 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1} inner={2} width=908 inputtotal=15256.18064516129
+DPPATH partial producer=join.hash.partial.parallelhash relids={1,2} kind=3 reqouter=- rows=6893 startup=18158.905645161292 total=19574.153586337765 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={2} inner={1} width=908 inputtotal=1374.3529411764705
+
+=== goopg DPPATH: {0,1,2} winning partial NL arms ===
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=2049.775 total=19783.23877016129 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1328 inputtotal=17915.56127016129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=2050.025 total=17941.200453851583 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={0,1} inner={2} width=1328 inputtotal=17915.56127016129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=2050.025 total=17943.46023788629 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={0,1} inner={2} width=1328 inputtotal=17915.56127016129
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=1376.5029411764706 total=21444.210461337763 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,2} inner={0} width=1328 inputtotal=17242.400461337762
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=1376.7529411764706 total=18328.744195833973 disabled=0 pathkeys=0 verdict=dominated jointype=inner outer={1,2} inner={0} width=1328 inputtotal=17242.400461337762
+DPPATH partial producer=join.nestloop.partial relids={0,1,2} kind=5 reqouter=- rows=2 startup=1376.7529411764706 total=17860.949656082692 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer={1,2} inner={0} width=1328 inputtotal=17242.400461337762

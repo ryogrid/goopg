@@ -1021,9 +1021,14 @@ section D. Recorded because the gate run is where they became visible.
 
 ## Bench-harness follow-up
 
-- [ ] `CLAUDE.md:34` is stale: it says `ANALYZE <table>` in db `tpch` errors
-      with a per-DB scoping gap, but `pg_stats` is populated on :65433 today.
-      Correct it, and the deferral-ledger row `bench-reorg ANALYZE-scope`.
+- [x] `CLAUDE.md` stale quirk corrected 2026-10-02 (owner edit): named-target
+      `ANALYZE <table>`/`VACUUM <table>` in db `tpch` was verified working —
+      the text now documents the surviving residual instead (bare `VACUUM`
+      resolves against the default `postgres` db — M0125-0028's open ledger
+      row, filed for fix as `M0143-0011`). The `bench-reorg ANALYZE-scope`
+      ledger row needs no edit: it is already pruned to
+      `analysis/deferral-ledger-summary-20260824/` marked resolved by
+      M0125-0028.
 - [ ] Decide whether the TPC-H gate should keep running S-cold. It measures a
       planner with default selectivities against a PG that has real ones. If
       that is deliberate, say so in the bench README so the next person does

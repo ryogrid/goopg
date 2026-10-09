@@ -34,7 +34,10 @@ func hasDistinct(n Node) bool {
 		if cur == nil || found {
 			return
 		}
-		if _, ok := cur.(*Distinct); ok {
+		switch cur.(type) {
+		case *Distinct, *DistinctOn:
+			// Either DISTINCT form: hashed, or the sort-based Unique that
+			// create_upper_unique_path's pricing can elect (M0146-0005bi).
 			found = true
 			return
 		}

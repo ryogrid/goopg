@@ -92,6 +92,8 @@
 %type <expr>	opt_trig_when
 %type <strs>	opt_trig_args trig_arg_list drop_arg_types oper_argtypes opt_policy_to policy_role_list
 %type <str>	ext_name opt_policy_as opt_policy_for
+%type <strs>	trigger_toggle trigger_target
+%type <str>	opt_trigger_mode
 %type <nodes>	ext_opts alter_seq_opts
 %type <stmt>	copy_inner
 %type <strs>	opt_copy_cols
@@ -166,7 +168,7 @@
 %type <exprs>	opt_func_arg_list func_arg_list
 %type <rvar>	relation_expr_opt_alias
 %type <qn>	qualified_name
-%type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call
+%type <expr>	a_expr c_expr where_clause having_clause b_expr name_or_call field_select_expr
 %type <expr>	func_expr_common_subexpr
 %type <str>	sql_value_func_name unicode_normal_form
 %type <node>	cse_wl when_then filter_clause within_group_clause
@@ -1070,17 +1072,55 @@ func_name_keyword:
 	| TABLESAMPLE      { $$ = "tablesample" }
 	| VERBOSE          { $$ = "verbose" }
 
-/* into_clause — gram.y :12986. Legacy takes only `INTO [TABLE] name`; its
-   TEMP / UNLOGGED / TABLESPACE variants are NOT accepted there
-   (`SELECT a INTO TEMP x` is a syntax error), so they stay out. */
+/* into_clause — gram.y into_clause / OptTempTableName: `INTO [TEMP |
+   TEMPORARY | {LOCAL|GLOBAL} {TEMP|TEMPORARY} | UNLOGGED] [TABLE] name`, the
+   persistence riding on to the CREATE TABLE ... AS it becomes (M0146-0039b).
+   PG also raises a "GLOBAL is deprecated" WARNING for the GLOBAL forms; this
+   parser has no channel for one, so GLOBAL is taken silently — as the
+   CREATE GLOBAL TEMP TABLE path (ddl.go) already does. */
 /* The INTO token's own position rides along: an INTO in a context that
    forbids it is reported AT the INTO (select.go:223), and the check happens
    long after this rule has reduced. */
 into_clause:
 		/* empty */                      { $$ = (*intoTarget)(nil) }
-	| INTO opt_into_table qualified_name
+	/* `TABLE name | name` spelled out, as gram.y does: an empty optional
+	   TABLE before the name would have to reduce on a TEMP / UNLOGGED /
+	   LOCAL lookahead that may still be the name itself. */
+	| INTO qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($2), pos: $<p>1}
+			}
+	| INTO TABLE qualified_name
 			{
 				$$ = &intoTarget{name: objectNameFromQn($3), pos: $<p>1}
+			}
+	| INTO TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, temporary: true}
+			}
+	| INTO TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, temporary: true}
+			}
+	| INTO LOCAL TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO LOCAL TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO GLOBAL TEMP opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO GLOBAL TEMPORARY opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($5), pos: $<p>1, temporary: true}
+			}
+	| INTO UNLOGGED opt_into_table qualified_name
+			{
+				$$ = &intoTarget{name: objectNameFromQn($4), pos: $<p>1, unlogged: true}
 			}
 
 opt_into_table:
@@ -2760,6 +2800,22 @@ a_expr:
 				$$ = buildBetween($<p>2, $1, $5, $7, true, true)
 			}
 
+/* `(expr).field` — composite field selection: gram.y c_expr
+   `'(' a_expr ')' opt_indirection` with `'.' attr_name` steps
+   (transformIndirection → one FieldSelect per step). Left-recursive, so
+   `(q).c1.i` selects c1 and then its field i. The planner resolves each field
+   against its operand's composite type, or, for a bare name, against the
+   relation of that name (`(b).x` = `b.x`). Position: the '(' (M0146-0047b). */
+field_select_expr:
+		'(' a_expr ')' '.' attr_name
+			{
+				$$ = NewFieldSelect($<p>1, $2, $5)
+			}
+	| field_select_expr '.' attr_name
+			{
+				$$ = NewFieldSelect($1.Pos(), $1, $3)
+			}
+
 /* c_expr — gram.y :15640ff, P1.1 subset: literals, parameters, column refs. */
 c_expr:
 	/* NOT PORTED: `tbl.*` as an EXPRESSION (whole-row expansion — VALUES(n.*),
@@ -2791,6 +2847,11 @@ c_expr:
 	| '(' a_expr ')' '.' '*'
 			{
 				$$ = NewIndirectionStar($<p>1, $2)
+			}
+	/* `(expr).field[.field…]` — composite field selection (field_select_expr). */
+	| field_select_expr
+			{
+				$$ = $1
 			}
 	/* Implicit row constructor — gram.y implicit_row (:16632), spelled with a
 	   mandatory second element so it cannot collide with grouping parens.

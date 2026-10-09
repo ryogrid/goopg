@@ -143,6 +143,11 @@ type Context struct {
 	subqCacheScoped *kvcache.Cache
 	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
 
+	// TriggerDepth is pg_trigger_depth(): the number of trigger invocations
+	// on the stack. executePLpgSQLTriggerBody gives its child context one
+	// more than its caller's (M0146-0080).
+	TriggerDepth int
+
 	// ParamExec is the PARAM_EXEC analog (D4.1): one slot per
 	// plan-assigned ExecParamRef ID, filled by a lowered sublink's eval
 	// site just before its inner plan runs, and read by the inner plan
@@ -360,6 +365,13 @@ type Context struct {
 	// and dropped per-OID by invalidateHeapFillfactor; nil until the first
 	// heap insert. M0134-0175a.
 	heapFillfactorCache map[uint32]int
+
+	// bulkInsert is the BulkInsertState of the COPY FROM writing right now:
+	// set by the COPY executor around each heap write it makes and cleared
+	// after, so placeHeapTuple chooses pages and extends the relation the way
+	// PG's RelationGetBufferForTuple does with a bistate (hio.c). Only writes
+	// to bulkInsert.rel consult it. M0146-0009h.
+	bulkInsert *bulkInsertState
 
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
@@ -677,6 +689,20 @@ type Context struct {
 	// the first's rows (goopg answered 1,1 where PG answers 1,2). Value is the
 	// materialized row set (nil = not yet filled).
 	CTERowCache map[string][]Row
+
+	// CTEStableCache is CTERowCache for a CTE whose body reads no outer
+	// value (optimizer.PlanHasOuterRef false). A LATERAL join swaps
+	// CTERowCache per outer tuple, so that a body reading the outer row is
+	// re-materialised; a body that reads none would be recomputed for
+	// nothing. PG clears a CTE's tuplestore on rescan only when its plan
+	// has changed parameters (ExecReScanCteScan, nodeCtescan.c), so an
+	// uncorrelated body is materialised once per statement, wherever it is
+	// scanned. M0146-0049d2.
+	CTEStableCache map[string][]Row
+
+	// afterTrigQuery is the current query level's AFTER trigger queue
+	// (after_trigger.go, M0146-0076); nil when no statement root opened one.
+	afterTrigQuery *afterTriggerQuery
 
 	// CmdID is this context's command id RELATIVE to the enclosing statement's
 	// `estate->es_output_cid`: 0 while the statement's own plan (its CTEs and
@@ -1025,6 +1051,11 @@ type SubPlanSiteStats struct {
 	// hash-map path). A miss is normally followed by a Rebuild.
 	CacheHits   int64
 	CacheMisses int64
+
+	// readsPastParent caches optimizer.PlanReadsPastParent for the site's
+	// plan; scopeKnown marks it computed (scopedSublinkKey, M0146-0079).
+	readsPastParent bool
+	scopeKnown      bool
 }
 
 // SessionUserName returns the authenticated login role for this connection

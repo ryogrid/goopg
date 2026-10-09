@@ -115,6 +115,17 @@ func (o *cteDMLPrefixOp) buildUnderScope(n optimizer.Node) (Operator, error) {
 
 func (o *cteDMLPrefixOp) Schema() optimizer.Schema { return o.plan.Body.Output() }
 
+// RowsAffected reports the top-level statement's count, which is what the
+// CommandComplete tag carries: the data-modifying CTEs' rows are not counted
+// (PG's es_processed is advanced only by the top-level ModifyTable, see
+// ExecModifyTable's canSetTag). M0146-0081.
+func (o *cteDMLPrefixOp) RowsAffected() int64 {
+	if rc, ok := o.inner.(RowCounter); ok {
+		return rc.RowsAffected()
+	}
+	return 0
+}
+
 func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	o.ctx = ctx
 
@@ -299,8 +310,11 @@ type cteScanOp struct {
 	plan      *optimizer.CTEScan
 	child     Operator
 	streaming bool // true = don't cache; stream from child
-	rows      []Row
-	idx       int
+	// stable: the body reads no outer value, so its rows live in
+	// ctx.CTEStableCache, which no LATERAL re-binding swaps (M0146-0049d2).
+	stable bool
+	rows   []Row
+	idx    int
 }
 
 func newCteScanOp(p *optimizer.CTEScan) (*cteScanOp, error) {
@@ -308,7 +322,24 @@ func newCteScanOp(p *optimizer.CTEScan) (*cteScanOp, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &cteScanOp{plan: p, child: child}, nil
+	return &cteScanOp{plan: p, child: child, stable: !optimizer.PlanHasOuterRef(p.Child)}, nil
+}
+
+// cache returns the map this scan's materialisation lives in, creating it
+// when create is set: ctx.CTEStableCache for a body that reads no outer
+// value, ctx.CTERowCache — which a LATERAL join swaps per outer tuple — for
+// one that does.
+func (o *cteScanOp) cache(ctx *Context, create bool) map[string][]Row {
+	if o.stable {
+		if ctx.CTEStableCache == nil && create {
+			ctx.CTEStableCache = make(map[string][]Row)
+		}
+		return ctx.CTEStableCache
+	}
+	if ctx.CTERowCache == nil && create {
+		ctx.CTERowCache = make(map[string][]Row)
+	}
+	return ctx.CTERowCache
 }
 
 func (o *cteScanOp) Schema() optimizer.Schema { return o.plan.Output() }
@@ -366,6 +397,14 @@ func (o *cteScanOp) Open(ctx *Context) error {
 		o.streaming = true
 		return o.child.Open(ctx)
 	}
+	// An inlined CTE (PG's inline_cte: one reference, no MATERIALIZED, no
+	// volatile function) is an ordinary subquery in PG, which runs its body
+	// in-line — there is no second reference to replay for, and a rescan
+	// re-executes it. Stream it the same way. M0146-0007.
+	if o.plan.Inlined() {
+		o.streaming = true
+		return o.child.Open(ctx)
+	}
 
 	// Key by DECLARATION, not by name: `WITH x` in two disjoint scopes is two
 	// declarations that must materialize separately, and keying by "x" made
@@ -373,8 +412,8 @@ func (o *cteScanOp) Open(ctx *Context) error {
 	// where PG answers 1,2). See planner.CTEScan.DeclKey for why the key is
 	// the declaration site rather than the plannedCTE pointer.
 	key := o.plan.DeclKey()
-	if ctx.CTERowCache != nil {
-		if cached, ok := ctx.CTERowCache[key]; ok {
+	if c := o.cache(ctx, false); c != nil {
+		if cached, ok := c[key]; ok {
 			// Replay from cache (second or later reference to this CTE).
 			o.rows = cached
 			o.idx = 0
@@ -403,10 +442,7 @@ func (o *cteScanOp) Open(ctx *Context) error {
 	}
 	o.child.Close()
 	// Store in cache so subsequent scans can replay.
-	if ctx.CTERowCache == nil {
-		ctx.CTERowCache = make(map[string][]Row)
-	}
-	ctx.CTERowCache[key] = rows
+	o.cache(ctx, true)[key] = rows
 	o.rows = rows
 	o.idx = 0
 	return nil

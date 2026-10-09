@@ -1,0 +1,4 @@
+1
+before|49
+after|49|1
+after-minmax|1|1000

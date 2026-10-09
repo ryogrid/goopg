@@ -66,10 +66,9 @@ func TestTimestampSubtractionInterval(t *testing.T) {
 		{"SELECT timestamp '2020-01-01 12:30:00' - timestamp '2020-01-01 00:00:00'", "12:30:00"},
 		{"SELECT timestamp '2020-01-02 12:00:00' - timestamp '2020-01-01 00:00:00'", "1 day 12:00:00"},
 		{"SELECT timestamp '2020-01-01 00:00:00' - timestamp '2020-01-02 12:00:00'", "-1 days -12:00:00"},
-		// NOTE: upstream date_mi returns integer 9; goopg represents DATE as a
-		// timestamp so date − date yields an interval (documented divergence,
-		// deferral_ledger.md).
-		{"SELECT date '2020-01-10' - date '2020-01-01'", "9 days"},
+		// date − date is date_mi: an integer day count (PG 18.3 prints 9).
+		// goopg used to yield an interval here; M0146-0040 retired that.
+		{"SELECT date '2020-01-10' - date '2020-01-01'", "9"},
 		{"SELECT (timestamp '2020-01-02 12:00:00' - timestamp '2020-01-01 00:00:00') + interval '1 day'", "2 days 12:00:00"},
 		{"SELECT interval '3 day' - interval '1 day'", "2 days"},
 		// timestamp + (interval carrying sub-day micros): the diff is 1 day

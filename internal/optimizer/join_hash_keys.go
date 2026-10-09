@@ -143,6 +143,12 @@ func fillJoinHashKeysNodes(n Node) {
 		fillJoinHashKeysNodes(x.Inner)
 	case *CTEScan:
 		fillJoinHashKeysNodes(x.Child)
+	case *SubqueryScan:
+		// M0146-0005w: labelling pass-through.
+		fillJoinHashKeysNodes(x.Child)
+	case *Materialize:
+		// M0146-0010: transparent wrapper — descend.
+		fillJoinHashKeysNodes(x.Child)
 	case *CTEDMLPrefix:
 		fillJoinHashKeysNodes(x.Body)
 	case *Project:
@@ -206,6 +212,12 @@ func fillOneJoinHashKeys(j *Join) {
 		pairs = append(pairs, JoinKeyPair{Left: cloneKeyExpr(l), Right: cloneKeyExpr(r)})
 		return true
 	})
+	// A merge path keys on its mergeclauses only (M0146-0005be): the
+	// predicate lists them first, so the path's count is a prefix of
+	// `pairs`, and every later equality is joinqual.
+	if j.Algo == JoinAlgoMerge && j.MergeKeyCount > 0 && len(pairs) > j.MergeKeyCount {
+		pairs = pairs[:j.MergeKeyCount]
+	}
 	j.HashKeys = pairs
 }
 

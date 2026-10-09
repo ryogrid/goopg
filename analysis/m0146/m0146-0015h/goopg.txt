@@ -1,0 +1,31 @@
+--- select (select count(*) from (select x.u1 from tk x where x.h = a.h) s) from tk a
+    10
+    10
+    10
+    10
+    10
+--- select (select count(*) from (values (a.h)) v) from tk a
+     1
+     1
+     1
+     1
+     1
+--- select (select count(*) from tk o join (select x.u1 from tk x where x.h = a.h) s on true) from tk a
+  1000
+  1000
+  1000
+  1000
+  1000
+--- select (select count(*) from tk o join (select x.u1 from tk x where x.h = o.h) s on true) from tk a
+ERROR:  missing FROM-clause entry for table "o"
+LINE 1: ...from tk o join (select x.u1 from tk x where x.h = o.h) s on ...
+                                                             ^
+--- select (select count(*) from tk o join lateral (select x.u1 from tk x where x.h = o.h) s on true) from tk a
+  1000
+  1000
+  1000
+  1000
+  1000
+--- select count(*) from tk a where exists (select 1 from (select x.u1 from tk x where x.h = a.h) s where s.u1 = a.u1)
+   100
+

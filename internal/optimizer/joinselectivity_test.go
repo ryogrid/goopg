@@ -227,14 +227,18 @@ func TestExamineJoinVarRejectsMultiRelOperand(t *testing.T) {
 
 // TestExamineJoinVarSubqueryLeafIsUnresolved: `buildInitialRels` admits every
 // FROM item, so a search relation need not have a catalog table behind it. Such
-// a rel has no per-column statistics to read, and the estimator must fall to
-// the default rather than dereference a nil table.
+// a rel has no per-column statistics to read — stats stays nil and the
+// distinct count still falls to the default — but the leaf's own row count
+// does apply: PG's examine_variable assigns `vardata->rel = find_base_rel`
+// unconditionally for a Var operand (selfuncs.c:5331), so `tuples` is the
+// leaf's estimate (M0146-0009e). Here 900 >= DEFAULT_NUM_DISTINCT, so the
+// ndistinct answer is unchanged; below the constant the leaf's size wins.
 func TestExamineJoinVarSubqueryLeafIsUnresolved(t *testing.T) {
 	s := jsCtx(t)
 	s.relInfos[1] = baseRelInfo{baseRows: 900}
 	v := s.examineJoinVar(jsCol(3, "sub_col"), relsetOf(1))
-	if v.stats != nil || v.tuples != 0 {
-		t.Fatalf("a table-less rel resolved to %+v; want the unresolved zero value", v)
+	if v.stats != nil || v.tuples != 900 {
+		t.Fatalf("a table-less rel resolved to %+v; want stats=nil tuples=900 (leaf rel->tuples)", v)
 	}
 	if nd, isDefault := getVariableNumDistinct(v); nd != defaultNumDistinct || !isDefault {
 		t.Fatalf("nd=%v isDefault=%v; want the default", nd, isDefault)
@@ -589,7 +593,7 @@ func TestOrJoinSelectivityMeasuredArms(t *testing.T) {
 		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: jsNameEq(2, 4)}}
 	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
 
-	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25, "bpchar")
 	arm := e * e
 	want := arm + arm - arm*arm
 	sel, isDefault := s.joinClauseSelectivityExt(ri)
@@ -617,7 +621,7 @@ func TestOrJoinSelectivityGuessedConjunctMarksTheOr(t *testing.T) {
 		Right: &BinaryOp{Op: parser.OpAnd, Left: jsNameEq(1, 3), Right: lost}}
 	ri := &restrictInfo{clause: or, relids: relsetOf(0) | relsetOf(1), ecID: noEquivClass}
 
-	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25)
+	e := eqSelectivityForColumn(columnStatsByName(n1, "n_name"), &IntegerConst{Value: 1}, 25, "bpchar")
 	measuredArm := e * e
 	guessedArm := e * defaultUnhandledClauseSel
 	want := measuredArm + guessedArm - measuredArm*guessedArm
@@ -675,7 +679,7 @@ func TestOrRangeSelectivityMeasured(t *testing.T) {
 	s := jsQtyCtx(t)
 	stats := columnStatsByName(s.relInfos[0].table, "q")
 	col := jsQtyGe(1, 15).Left.(*ColumnRef)
-	want, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 15}, stats)
+	want, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 15}, stats, float64(s.relInfos[0].baseRows))
 	if !measured {
 		t.Fatal("fixture carries no measurement; the test would pass vacuously")
 	}
@@ -734,7 +738,7 @@ func TestOrInListSelectivityMeasured(t *testing.T) {
 	stats := columnStatsByName(n1, "n_name")
 	var want float64
 	for _, elem := range in.List {
-		e := eqSelectivityForColumn(stats, elem, 25)
+		e := eqSelectivityForColumn(stats, elem, 25, "bpchar")
 		want += e
 	}
 	sel, isDefault := s.orConjunctSelectivity(in)

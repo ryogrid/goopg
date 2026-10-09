@@ -43,11 +43,44 @@ when the candidate:
       lose the FROZEN token. A new task may not have a frozen-prefixed id, a
       frozen-prefixed Parent / Parent-chain ancestor, or be nested by indent
       under a frozen-prefixed task.
+  Rule E (task-id uniqueness — the M0146-0016 collision): a candidate may not
+      add a task header under a structured id (`M0146-0016`, `P0-E7`,
+      `testport/...` — tokens carrying a digit or a `/`) that ANOTHER task
+      header already carries. The parser resolves Parent: references and the
+      Rule A lineage by first occurrence only, so a second task filed under an
+      already-used id is silently invisible to every check above (a `[ ]`
+      Subquery-Scan task hid behind the landed M0146-0016 presorted-split
+      task that way — the markdown `\\-` escape even made the collision
+      undetectable by eye and by the first-wins dictionary). Ids are compared
+      after stripping the `\\-` escape. Two grandfatherings keep the ledger's
+      conventions legal: (1) non-structured first words (`**WRONG RESULTS:`
+      etc.) are titles, not ids, and are exempt; (2) a structured id already
+      duplicated in the baseline is reported only when the candidate adds yet
+      another occurrence — growth is checked by per-id OCCURRENCE COUNT, not
+      line identity, so a verbatim-copied header is caught too.
+  Rule F (blocked-task staleness — ADVISORY ONLY, never fails): a `[!]` task
+      whose body names its blocker by a structured id (`blocked on M0145-XXXX`,
+      `BLOCKED ... <id>`) while that task is `[ ]` or `[x]` prints a warning —
+      the blocker has lifted but the dependant never tracked it (the template1
+      extension task sat `[!]` two days after its blocker got Option A GO).
+      Non-id prose blockers ("blocked on the template1 namespace") are not
+      caught — naming the blocker by id keeps the check honest. An
+      owner-adjudicated `[!]` that stands for a DIFFERENT reason cites
+      `STALE-OK: <id>` to acknowledge and silence the advisory for that
+      reference.
 
 Task grammar:  `<indent>- [ |x|!] **<TASK-ID>...`  (id ends at whitespace or `*`)
 Body lines (until the next checkbox task line or `#` heading), or the task's
 header line itself, may carry
   `Parent: <TASK-ID|none>` and `Movement: yes — <evidence>` / `Movement: none`.
+
+Ids and `Parent:` values are read with the markdown `\\-` escape stripped
+(`M0146-0005` and `M0146\\-0005` are the same task — the file mixes both
+spellings). Without the normalisation an escaped `Parent:` never resolved:
+every escaped child became its own Rule A root and escaped the lineage
+budget entirely (surfaced by the M0146-0005 S4 escalation, 2026-10-03).
+Rule E already compared ids escape-stripped; this extends the same
+canonicalisation to Parent resolution and the banner tokens.
 
 Modes:
   (default)                 baseline = git show HEAD:.ralph/fix_plan.md,
@@ -58,6 +91,7 @@ Exit 0 when candidate == baseline. stdlib only.
 """
 
 import argparse
+import bisect
 import re
 import subprocess
 import sys
@@ -110,6 +144,7 @@ def parse(text):
             indent = len(mt.group(1).expandtabs(4))
             status = mt.group(2).lower()
             tid = mt.group(3).rstrip(".,:;—")
+            tid = tid.replace("\\", "")
             cur = Task(tid, status, indent, n, len(order))
             if "FROZEN" in ln:
                 cur.frozen = True
@@ -142,7 +177,7 @@ def _fields(cur, ln, n, inline):
     mp = pre.search(ln) if inline else pre.match(ln)
     if mp and not cur.has_parent:
         cur.has_parent = True
-        p = mp.group(1).rstrip(".,;")
+        p = mp.group(1).rstrip(".,;").replace("\\", "")
         cur.parent = None if p.lower() == "none" else p
     mm = mre.search(ln) if inline else mre.match(ln)
     if mm and cur.movement is None:
@@ -198,7 +233,7 @@ def frozen_prefixes(text):
         if i < 0:
             continue
         for tok in ln[i + len(FROZEN_PREFIXES_TOKEN):].split():
-            tok = tok.strip("`*,;.")
+            tok = tok.strip("`*,;.").replace("\\", "")
             if tok:
                 out.append(tok)
     return out
@@ -214,7 +249,8 @@ def lineage_baselines(text):
         i = ln.find(LINEAGE_BASELINE_TOKEN)
         if i < 0:
             continue
-        toks = [t.strip("`*,;.()") for t in ln[i + len(LINEAGE_BASELINE_TOKEN):].split()]
+        toks = [t.strip("`*,;.()").replace("\\", "")
+                for t in ln[i + len(LINEAGE_BASELINE_TOKEN):].split()]
         toks = [t for t in toks if t]
         if len(toks) < 2:
             continue
@@ -359,7 +395,97 @@ def check(baseline, candidate):
                 f"(descendant counting and the lineage budget both miss it). Put the field at "
                 f"the START of its own line, or on the task's title line. "
                 f"Line: {ln.strip()[:120]}")
+
+    # Rule E — task-id uniqueness for STRUCTURED ids (tokens with a digit or
+    # a `/`; bolded first words like `WRONG`/`The`/`store-null-keys` are
+    # titles, exempt). parse() resolves ids first-occurrence-wins, so a
+    # second header under an existing id never reaches `order`/`ctasks` and
+    # escapes Rules A-D entirely; scan the raw lines instead. The `\-`
+    # markdown escape is stripped so `M0146-0016` and `M0146\-0016` collide
+    # (they did). Growth is measured by per-id OCCURRENCE COUNT — a
+    # verbatim-copied header line is caught even though it matches a
+    # baseline line, while a structured id already duplicated in the
+    # baseline stays grandfathered until the candidate adds ANOTHER one.
+    id_lines_c, id_lines_b = {}, {}
+    for text, out in ((candidate, id_lines_c), (baseline, id_lines_b)):
+        for n, ln in enumerate(text.splitlines(), 1):
+            mt = TASK_RE.match(ln)
+            if mt:
+                tid = mt.group(3).rstrip(".,:;—").replace("\\", "")
+                out.setdefault(tid, []).append(n)
+    for tid, clines in sorted(id_lines_c.items()):
+        if len(clines) <= 1:
+            continue
+        if not (re.search(r"[0-9/]", tid)):
+            continue  # not a structured id — a repeating title word
+        blines = id_lines_b.get(tid, [])
+        if len(clines) <= len(blines):
+            continue  # pre-existing duplication, unchanged
+        errs.append(
+            f"[E] task id {tid} now appears {len(clines)} times on task "
+            f"headers (lines {', '.join(map(str, clines))}; baseline had "
+            f"{len(blines)}). A second entry under an existing id is "
+            f"invisible to Parent: resolution and the lineage budget — "
+            f"renumber the new task to the next free id and record the fix.")
     return errs
+
+
+BLOCK_RE = re.compile(r"(?i)\bblock")
+UNBLOCK_RE = re.compile(
+    r"(?i)\bunblock|\bblocker\b.{0,40}(lifted|cleared|released|gone|resolved|"
+    r"landed|done|closed)|\bno longer blocked\b|\bnot blocking\b")
+IDREF_RE = re.compile(r"(M\d{4}-[\w.-]*|P0-[\w.-]+|testport/[\w.-]+)")
+# An owner-adjudicated `[!]` cites `STALE-OK: <id>` to acknowledge (and
+# silence) the advisory for that reference — used when the `[!]` stands for a
+# different reason than the resolved citation (e.g. an S4 escalation whose
+# work was refiled elsewhere).
+STALEOK_RE = re.compile(r"STALE-OK:")
+
+
+def blocker_advisories(candidate):
+    """Rule F — non-blocking warnings: a `[!]` task that names its blocker by
+    structured id while that blocker is now `[ ]`/`[x]` (stale block)."""
+    ctasks, corder = parse(candidate)
+    norm_tasks = {}
+    for tid, t in ctasks.items():
+        norm_tasks.setdefault(tid.replace("\\", ""), t)
+    lines = candidate.splitlines()
+    # a task body runs until the next task header or `#` heading
+    bounds = [n for n, ln in enumerate(lines, 1)
+              if TASK_RE.match(ln) or HEAD_RE.match(ln)]
+    warns = []
+    for t in corder:
+        if t.status != "!":
+            continue
+        i = bisect.bisect_right(bounds, t.line)
+        end = bounds[i] if i < len(bounds) else len(lines) + 1
+        seen = set()
+        stale_ok = set()
+        for n in range(t.line, end):
+            ln = lines[n - 1].replace("\\", "")
+            if STALEOK_RE.search(ln):
+                stale_ok.update(
+                    r.rstrip(".,:;—") for r in IDREF_RE.findall(ln))
+        for n in range(t.line, end):
+            ln = lines[n - 1].replace("\\", "")
+            if not BLOCK_RE.search(ln) or UNBLOCK_RE.search(ln):
+                continue
+            for ref in IDREF_RE.findall(ln):
+                tid = ref.rstrip(".,:;—")
+                bt = norm_tasks.get(tid)
+                if (bt is None or bt.status not in " x" or tid in seen
+                        or tid in stale_ok):
+                    continue
+                seen.add(tid)
+                state = ("landed" if bt.status == "x"
+                         else "been re-opened — the block may still stand")
+                warns.append(
+                    f"task {t.id} (line {t.line}) is `[!]` but its blocked-on "
+                    f"reference {tid} is now `[{bt.status}]` (line {bt.line}, "
+                    f"cited at line {n}) — the blocker has {state}; "
+                    f"re-check whether {t.id} should re-open "
+                    f"(owner-adjudicated holds may cite `STALE-OK: {tid}`).")
+    return warns
 
 
 def git_show(spec):
@@ -396,6 +522,8 @@ def main(argv=None):
         if not cand:  # file absent/deleted: nothing to police here
             return 0
     errs = check(base, cand)
+    for w in blocker_advisories(cand):
+        sys.stderr.write("ralph-lineage-guard advisory: " + w + "\n")
     if errs:
         sys.stderr.write("ralph-lineage-guard: %d violation(s) in %s\n" % (len(errs), a.path))
         for e in errs:

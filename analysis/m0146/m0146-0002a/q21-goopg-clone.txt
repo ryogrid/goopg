@@ -1,0 +1,36 @@
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=263100.00..263100.01 rows=1 width=112)
+   Sort Key: (count(*)) DESC, supplier.s_name
+   ->  GroupAggregate  (cost=263099.98..263099.99 rows=1 width=112)
+         Group Key: supplier.s_name
+         ->  Sort  (cost=263099.97..263099.98 rows=1 width=3172)
+               Sort Key: supplier.s_name
+               ->  Nested Loop Semi Join  (cost=137615.21..263099.95 rows=1 width=2072)
+                     Join Filter: (l2.l_suppkey <> l1.l_suppkey)
+                     ->  Nested Loop Anti Join  (cost=137614.84..263094.12 rows=1 width=2072)
+                           Join Filter: (l3.l_suppkey <> l1.l_suppkey)
+                           ->  Gather  (cost=137614.46..175057.80 rows=39277 width=2072)
+                                 Workers Planned: 3
+                                 ->  Parallel Hash Join  (cost=136614.46..170130.10 rows=12670 width=2072)
+                                       Hash Cond: (orders.o_orderkey = l1.l_orderkey)
+                                       ->  Parallel Seq Scan on orders  (cost=0.00..32593.39 rows=237484 width=448)
+                                             Filter: (o_orderstatus = 'F')
+                                       ->  Hash Join  (cost=239.47..136364.38 rows=20007 width=1624)
+                                             Hash Cond: (l1.l_suppkey = supplier.s_suppkey)
+                                             ->  Parallel Seq Scan on lineitem l1  (cost=0.00..134049.21 rows=500166 width=550)
+                                                   Filter: (l_receiptdate > l_commitdate)
+                                             ->  Nested Loop  (cost=10.35..234.47 rows=400 width=1074)
+                                                   ->  Seq Scan on nation  (cost=0.00..1.31 rows=1 width=490)
+                                                         Filter: (n_name = 'SAUDI ARABIA')
+                                                   ->  Bitmap Heap Scan on supplier  (cost=10.35..229.16 rows=400 width=584)
+                                                         Recheck Cond: (s_nationkey = n_nationkey)
+                                                         ->  Bitmap Index Scan on supplier_nation_fkidx  (cost=0.25..10.35 rows=400 width=584)
+                                                               Index Cond: (s_nationkey = nation.n_nationkey)
+                           ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem l3  (cost=0.38..5.84 rows=5 width=550)
+                                 Index Cond: (l_orderkey = l1.l_orderkey)
+                                 Filter: (l_receiptdate > l_commitdate)
+                     ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem l2  (cost=0.38..5.81 rows=15 width=550)
+                           Index Cond: (l_orderkey = l1.l_orderkey)
+(32 rows)
+

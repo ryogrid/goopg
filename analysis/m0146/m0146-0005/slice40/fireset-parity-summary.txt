@@ -1,0 +1,15 @@
+FIRE-SET: baseline=cfa54cd12954b26a86b2d8b4a4236d5ccef05cbe (e6cf489a1f1e) candidate=worktree (36269fea46e2)
+# diff m0146-0005an-tpcds-sf025-baseline 
+PLAN-PARITY: queries=99 match=17 shapediff=65 unparsed=0 missingnode=14 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=66 join-method=38 scan-type=43 parameterisation=35 aggregation-strategy=33 sort-strategy=48 parallelism=47 qual-placement=13 rendering=21
+# diff m0146-0005an-tpcds-sf025-candidate 
+PLAN-PARITY: queries=99 match=17 shapediff=65 unparsed=0 missingnode=14 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=66 join-method=38 scan-type=43 parameterisation=35 aggregation-strategy=33 sort-strategy=48 parallelism=47 qual-placement=12 rendering=21
+FIRE-SET-TIMEOUTS: fires=Q24 introduced=none unchanged=none missing=none
+# diff m0146-0005an-tpcds-sf1-baseline 
+PLAN-PARITY: queries=99 match=14 shapediff=68 unparsed=0 missingnode=14 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=65 join-method=42 scan-type=48 parameterisation=41 aggregation-strategy=37 sort-strategy=50 parallelism=56 qual-placement=17 rendering=17
+# diff m0146-0005an-tpcds-sf1-candidate 
+PLAN-PARITY: queries=99 match=17 shapediff=65 unparsed=0 missingnode=14 error=3 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=65 join-method=42 scan-type=48 parameterisation=41 aggregation-strategy=37 sort-strategy=50 parallelism=56 qual-placement=14 rendering=17
+FIRE-SET-TIMEOUTS: fires=Q17 Q25 Q29 introduced=none unchanged=none missing=none

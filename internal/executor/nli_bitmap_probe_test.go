@@ -134,7 +134,7 @@ func TestNLIBitmapProbeBasic(t *testing.T) {
 	}
 	plan := explainProbeQuery(ctx, t, bitmapProbeInnerJoin)
 	t.Logf("plan:\n%s", plan)
-	if !strings.Contains(plan, "Recheck Cond: (l_key = o_key)") {
+	if !strings.Contains(plan, "Recheck Cond: (l_key = ord.o_key)") {
 		t.Errorf("missing PG-orientation Recheck Cond line:\n%s", plan)
 	}
 	if !strings.Contains(plan, "Index Cond:") {
@@ -237,7 +237,7 @@ func TestNLIBitmapProbeCompositeKeys(t *testing.T) {
 	defer cleanup()
 	const q = "SELECT o_key, l_c FROM ord JOIN line ON l_key = o_key AND l_c = o_val WHERE o_key BETWEEN 1 AND 4"
 	plan := explainProbeQuery(ctx, t, q)
-	if !strings.Contains(plan, "Recheck Cond: ((l_key = o_key) AND (l_c = o_val))") {
+	if !strings.Contains(plan, "Recheck Cond: ((l_key = ord.o_key) AND (l_c = ord.o_val))") {
 		t.Errorf("missing two-pair Recheck Cond:\n%s", plan)
 	}
 	if rows := runProbeQuery(ctx, t, q); len(rows) != 1 {
@@ -284,7 +284,7 @@ func TestNLIBitmapProbeCondAndRecheck(t *testing.T) {
 	defer cleanup()
 	const q = "SELECT o_key, l_c FROM ord JOIN line ON l_key = o_key AND l_r > 0 WHERE o_key BETWEEN 1 AND 4"
 	plan := explainProbeQuery(ctx, t, q)
-	if !strings.Contains(plan, "Recheck Cond: (l_key = o_key)") {
+	if !strings.Contains(plan, "Recheck Cond: (l_key = ord.o_key)") {
 		t.Fatalf("missing Recheck Cond:\n%s", plan)
 	}
 	if !strings.Contains(plan, "Filter: (l_r > 0)") {

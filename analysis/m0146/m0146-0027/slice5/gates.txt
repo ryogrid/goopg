@@ -1,0 +1,56 @@
+M0146-0027 slice 5 — Parallel Hash join admitted as a SetOp branch
+driver (per-branch PHJ claim model audit + admission-arm widening)
+2026-09-28, private SF0.25 clone :5590 + standard gates.
+
+Gate stamps (all PASS on staged index; code_tree
+83a7af30f861c8540ef23d5fcc6896253b6e1290ffe5f0d4d920280c1c2b2a20 — see
+tmp/gate-stamps/*.json):
+
+- tpch-spotcheck        PASS  (Q12 rows=2, Q13 rows=33)
+- tpcds-sf025 sweep     PASS  PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
+                              TIMEOUT=0 SKIP=3
+                              plans vs pre-slice sweep: changed=3
+                              (Q14 Q71 Q76 — per-leg PHJs now filed
+                              inside the Parallel Append branches)
+- tpch-acceptance-arm   PASS  SUMMARY: 24 MATCH / VERDICT: PASS
+- tpcds-fireset         PASS  SF0.25 fires Q14 Q71 Q76, SF1 fires
+                              Q5 Q14 Q71 Q75 Q76 — all execute on
+                              baseline and candidate arms;
+                              FIRE-SET-TIMEOUTS: introduced=none
+- RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh — PASS
+- go test ./internal/optimizer ./internal/executor — pass, incl. new:
+    TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild
+    TestAttachAllWiresHashBuildInsideSetOpBranch
+    TestGatherOverSetOpBranchParallelHashIdentity (1/2/4 workers)
+  and updated slice-4 pins:
+    TestAddPartialSetOpPathPicksCheapestRunnableBranchPartial
+    TestSetOpBranchPickSkipsUnrunnablePartial
+    (refused fixture switched seq-build -> bitmap-build PHJ)
+
+Private-clone verification (:5590, sf025):
+
+  Q71  290 rows ck=e9f1fcd7c28a1f8f — oracle-exact, PG's shape:
+       Gather -> NL -> NL -> Parallel Append -> per-leg
+       Parallel Hash Join(sales ⋈ date_dim) -> idx item -> idx time_dim
+  Q76  100 rows — Gather Merge -> Parallel Append -> per-leg PHJ legs
+  Q14  200 rows, Q55 68 rows ck=fe343d36717a4fb5, Q6 27 rows
+       ck=87ec5bd032d11623 — all unchanged vs slice 4
+
+First-divergence census diff vs census-sf025-slice4.txt — one record:
+
+  - Q76 depth=1 [sort-strategy] under Limit:
+        PG Finalize GroupAggregate | goopg Sort
+  + Q76 depth=1 [aggregation-strategy] under Limit:
+        PG Finalize GroupAggregate | goopg GroupAggregate
+
+  CATEGORY-ROLLUP: sort-strategy 34->33, aggregation-strategy 13->14
+  (divergent 88->88, match 11->11). Q71's depth-4 join-order label is
+  unchanged but its substance moved inside the now-shared NL spine —
+  the residual is append leg ordering + the Subquery Scan wrapper
+  (M0146-0026 territory), not the join shape.
+
+Fireset baseline-vs-candidate category totals (all depths):
+  SF0.25: join-method 46->45, parallelism 54->53, sort-strategy 59->58,
+          parameterisation 34->35, rendering 27->28.
+  SF1:    join-method 42->41, sort-strategy 53->52, parallelism 58->57,
+          D3-partialpath 25->26.

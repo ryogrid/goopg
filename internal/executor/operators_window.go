@@ -38,10 +38,34 @@ type windowOp struct {
 	// FrameBoundOffsetPreceding/Following; see frameBoundsRange.
 	frameStartOffDatum Datum
 	frameEndOffDatum   Datum
+
+	// pTrims / obTrims flag bpchar-typed PARTITION BY / ORDER BY
+	// expressions: partition keys hash and peers compare under the
+	// bcTruelen image (hashbpchar / bpcharlt), so padding-width variants
+	// of one value share a partition and a peer group. M0146.
+	pTrims  []bool
+	obTrims []bool
 }
 
 func newWindowOp(plan *optimizer.WindowAgg, child Operator) *windowOp {
-	return &windowOp{plan: plan, child: child, schema: plan.Output()}
+	o := &windowOp{plan: plan, child: child, schema: plan.Output()}
+	for i, e := range plan.PartitionBy {
+		if declaredBpcharTypmod(e) > 0 {
+			if o.pTrims == nil {
+				o.pTrims = make([]bool, len(plan.PartitionBy))
+			}
+			o.pTrims[i] = true
+		}
+	}
+	for i, k := range plan.OrderBy {
+		if declaredBpcharTypmod(k.Expr) > 0 {
+			if o.obTrims == nil {
+				o.obTrims = make([]bool, len(plan.OrderBy))
+			}
+			o.obTrims[i] = true
+		}
+	}
+	return o
 }
 
 func (o *windowOp) Open(ctx *Context) error {
@@ -89,12 +113,18 @@ func (o *windowOp) Open(ctx *Context) error {
 				if err != nil {
 					return err
 				}
+				if j < len(o.pTrims) && o.pTrims[j] {
+					v = trimStringDatum(v)
+				}
 				kv[j] = v
 			}
 			for j, ok := range o.plan.OrderBy {
 				v, err := evalExpr(ok.Expr, row, ctx)
 				if err != nil {
 					return err
+				}
+				if j < len(o.obTrims) && o.obTrims[j] {
+					v = trimStringDatum(v)
 				}
 				kv[len(o.plan.PartitionBy)+j] = v
 			}
@@ -112,7 +142,7 @@ func (o *windowOp) Open(ctx *Context) error {
 			}
 			a, b := keys[perm[x]], keys[perm[y]]
 			for j, pe := range o.plan.PartitionBy {
-				cmp, decided, err := compareSortDatums(a[j], b[j], pe.Pos(), false, false)
+				cmp, decided, err := compareSortDatums(a[j], b[j], pe.Pos(), false, false, pe)
 				if err != nil {
 					sortErr = err
 					return false
@@ -123,7 +153,7 @@ func (o *windowOp) Open(ctx *Context) error {
 			}
 			off := len(o.plan.PartitionBy)
 			for j, ok := range o.plan.OrderBy {
-				cmp, decided, err := compareSortDatums(a[off+j], b[off+j], ok.Expr.Pos(), ok.Desc, ok.NullsFirst)
+				cmp, decided, err := compareSortDatums(a[off+j], b[off+j], ok.Expr.Pos(), ok.Desc, ok.NullsFirst, ok.Expr)
 				if err != nil {
 					sortErr = err
 					return false
@@ -1156,10 +1186,13 @@ func (o *windowOp) partitionKey(row Row) (string, error) {
 		return "__all__", nil
 	}
 	parts := make([]string, 0, len(o.plan.PartitionBy))
-	for _, pe := range o.plan.PartitionBy {
+	for i, pe := range o.plan.PartitionBy {
 		v, err := evalExpr(pe, row, o.ctx)
 		if err != nil {
 			return "", err
+		}
+		if i < len(o.pTrims) && o.pTrims[i] {
+			v = trimStringDatum(v)
 		}
 		parts = append(parts, datumKey(v))
 	}
@@ -1170,7 +1203,7 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 	if len(o.plan.OrderBy) == 0 {
 		return true, nil
 	}
-	for _, ok := range o.plan.OrderBy {
+	for i, ok := range o.plan.OrderBy {
 		a, err := evalExpr(ok.Expr, prev, o.ctx)
 		if err != nil {
 			return false, err
@@ -1185,7 +1218,10 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 			}
 			return false, nil
 		}
-		cmp, err := compareDatum(a, b, ok.Expr.Pos())
+		if i < len(o.obTrims) && o.obTrims[i] {
+			a, b = trimStringDatum(a), trimStringDatum(b)
+		}
+		cmp, err := compareDatumTyped(a, b, ok.Expr.Pos(), ok.Expr)
 		if err != nil {
 			return false, err
 		}
@@ -1206,7 +1242,7 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 // Formula for NULL vs non-null:
 //   cmp = 1  when nullsFirst == desc  (both true or both false)
 //   cmp = -1 when nullsFirst != desc
-func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int, decided bool, err error) {
+func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool, e optimizer.Expr) (cmp int, decided bool, err error) {
 	if a.IsNull() && !b.IsNull() {
 		if nullsFirst == desc {
 			return 1, true, nil
@@ -1222,7 +1258,7 @@ func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int
 	if a.IsNull() && b.IsNull() {
 		return 0, false, nil
 	}
-	c, err := compareDatum(a, b, pos)
+	c, err := compareDatumTyped(a, b, pos, e)
 	if err != nil {
 		return 0, false, err
 	}
@@ -1233,12 +1269,46 @@ func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int
 }
 
 func (o *windowOp) Next() (TupleSlot, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	for {
+		if o.idx >= len(o.rows) {
+			return nil, EOF
+		}
+		row := o.rows[o.idx]
+		o.idx++
+		if o.plan.RunCondition == nil {
+			return asSlot(o.schema, row), nil
+		}
+		// M0146-0005dn: nodeWindowAgg.c's run condition on the top-level
+		// WindowAgg. A false or NULL result stays so for the rest of the
+		// partition (the function is monotonic), so without PARTITION BY
+		// the scan is done (WINDOWAGG_DONE) and with it the partition's
+		// remaining rows are skipped (WINDOWAGG_PASSTHROUGH_STRICT).
+		v, err := evalExpr(o.plan.RunCondition, row, o.ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !v.IsNull() && v.BoolValue() {
+			return asSlot(o.schema, row), nil
+		}
+		if len(o.plan.PartitionBy) == 0 {
+			o.idx = len(o.rows)
+			return nil, EOF
+		}
+		key, err := o.partitionKey(row)
+		if err != nil {
+			return nil, err
+		}
+		for o.idx < len(o.rows) {
+			k, err := o.partitionKey(o.rows[o.idx])
+			if err != nil {
+				return nil, err
+			}
+			if k != key {
+				break
+			}
+			o.idx++
+		}
 	}
-	row := o.rows[o.idx]
-	o.idx++
-	return asSlot(o.schema, row), nil
 }
 
 func (o *windowOp) Close() error {

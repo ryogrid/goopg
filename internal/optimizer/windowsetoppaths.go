@@ -62,6 +62,7 @@ const (
 	windowProducer             = "upper.window.sorted"
 	setOpAppendProducer        = "upper.setop.append"
 	setOpHashedProducer        = "upper.setop.hashed"
+	setOpSortedProducer        = "upper.setop.sorted"
 	setOpMergeAppendProducer   = "upper.setop.mergeappend"
 	setOpPartialAppendProducer = "upper.setop.append.partial"
 	setOpMixedAppendProducer   = "upper.setop.append.mixed"
@@ -293,11 +294,44 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 	below := seed
 	belowNode := input
 	var top *Path
+	// M0146-0005ay: create_one_window_path sorts a level's input only when
+	// the ordering already there does not contain the level's
+	// PARTITION BY ++ ORDER BY pathkeys. The ordering starts as the input's
+	// own (a sorted GroupAggregate's group keys — TPC-DS Q51's
+	// `sum(sum(...)) OVER (PARTITION BY ws_item_sk ORDER BY d_date)` over
+	// `GROUP BY ws_item_sk, d_date`) and each WindowAgg passes its input's
+	// order through. A partial match is an Incremental Sort (M0146-0005bx).
+	have := inputNodePathkeys(input)
 	for i, w := range windows {
 		cols := belowNode.Output()
 		if i < len(chainKeep) {
 			if narrowed := narrowedWindowCols(cols, chainKeep[i]); narrowed != nil {
 				cols = narrowed
+			}
+		}
+		presortedCount := 0
+		incremental := 0
+		var presortedGroups float64
+		if required := pathkeysForSortKeys(windowSortKeys(w)); len(required) > 0 {
+			if contained, nCommon := pathkeysCountContainedIn(have, required); contained {
+				presortedCount = len(required)
+			} else {
+				// M0146-0005bx: create_one_window_path's other arm — a
+				// partially presorted input gets an Incremental Sort when
+				// enable_incremental_sort is on (TPC-DS Q89: PARTITION BY
+				// i_category, i_brand, … over a GroupAggregate sorted on
+				// i_category, i_class, …), priced from the presorted
+				// prefix's group count as cost_incremental_sort does.
+				if nCommon > 0 && cp.enableIncrementalSort {
+					presortedCount = nCommon
+					incremental = nCommon
+					groupExprs := make([]Expr, nCommon)
+					for j := range groupExprs {
+						groupExprs[j] = required[j].Expr
+					}
+					presortedGroups = float64(estimateNumGroups(groupExprs, belowNode, int64(below.Rows)))
+				}
+				have = required
 			}
 		}
 		p := &Path{
@@ -307,8 +341,11 @@ func addWindowPaths(winRel *RelOptInfo, seed *Path, windows []*WindowAgg, input 
 			Cost: costWindow(cp, below.Cost.Total, below.Rows,
 				len(w.PartitionBy), len(w.OrderBy), len(w.Funcs),
 				len(cols), nodeAvgVarBytes(cols), nodeTupleWidth(belowNode),
-				0, 0),
-			Children: []*Path{below},
+				presortedCount, presortedGroups),
+			// Read by createWindowPlan: the prefix the stacked Incremental
+			// Sort is told is already ordered (0 = a full Sort).
+			PresortedCount: incremental,
+			Children:       []*Path{below},
 		}
 		below = p
 		belowNode = w
@@ -359,6 +396,7 @@ func createSetOpPaths(u *upperRels, setOpNode *SetOp, ps PlannerSettings, tupleF
 		u = newUpperRels()
 	}
 	cp := ps.costParams()
+	setOpNode = swapIntersectInputs(setOpNode)
 	// One rel PER NODE, as PG keys its SETOP rel by the node's relids
 	// (prepunion.c:805) — see `newUpperRelForNode` for why sharing one
 	// relids-0 rel across a chain returns the wrong subtree.
@@ -555,21 +593,16 @@ func addUnionMergeAppendPath(rel *RelOptInfo, seed *Path, distinctNode *Distinct
 		chain = &SetOp{pos: distinctNode.pos, Left: chain, Right: b, Op: parser.SetOpUnion, All: true,
 			UnionDistinctInput: true, MergeKeys: keys}
 	}
-	n := float64(len(leaves))
-	logN := math.Log2(n)
-	comparison := 2.0 * cp.cpuOperatorCost
-	startup := comparison * n * logN
-	run := rows*comparison*logN + cp.cpuTupleCost*appendCPUCostMultiplier*rows
 	merge := newPrebuiltPath(rel, chain)
 	merge.Rows = rows
-	merge.Cost = Cost{Startup: startup + startupSum, Total: startup + run + totalSum}
+	merge.Cost = mergeAppendCost(cp, len(leaves), rows, startupSum, totalSum)
 	merge.Pathkeys = pathkeys
 	merge.DisabledNodes = disabled
 	addPath(rel, &Path{
 		Kind: PathDistinct, Distinct: distinctNode, Unique: true,
 		Rel: rel, Rows: rel.Rows,
 		DisabledNodes: disabled,
-		Cost:          distinctCost(merge.Cost.Startup, merge.Cost.Total, seed.Rows, rel.Rows, cp),
+		Cost:          uniquePathCost(merge.Cost.Startup, merge.Cost.Total, seed.Rows, len(keys), cp),
 		Pathkeys:      pathkeys, Children: []*Path{merge},
 	}, setOpMergeAppendProducer)
 }
@@ -663,6 +696,147 @@ func addSetOpPaths(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, c
 			setOpRel.Rows, setOpRel.NCols),
 		Children: []*Path{lseed, rseed},
 	}, producer)
+	addSortedSetOpPath(setOpRel, lseed, rseed, setOpNode, cp)
+}
+
+// addSortedSetOpPath is generate_nonunion_paths' SETOP_SORTED candidate
+// (prepunion.c) for INTERSECT / EXCEPT whose two inputs already deliver the
+// set operation's ordering — every output column ascending, which is the
+// sort-based DISTINCT arm's ordering (`setOpArmSortedAllCols`). PG prices it
+// in create_setop_path (pathnode.c): the inputs' startups as startup, and the
+// same total the hashed arm has, so over presorted inputs it wins add_path on
+// startup and carries the ordering as pathkeys (M0146-0005q).
+//
+// When an arm's elected plan is a hashed DISTINCT, PG's arm rel still holds
+// the sort-based Unique path (add_path keeps it for its pathkeys), and
+// generate_nonunion_paths takes that cheapest presorted path
+// (get_cheapest_path_for_pathkeys) for the sorted SetOp. goopg's DISTINCT
+// rel elects one plan, so sortedSetOpArm rebuilds the Unique alternative
+// with the same arithmetic. The sorted SetOp then ties the hashed one
+// fuzzily on total and dominates it on startup and pathkeys, as in PG:
+// TPC-DS Q38/Q87's first arm elects HashAggregate once the arm's date range
+// is estimated PG's way (M0146-0005s), and PG still plans SetOp over Unique.
+//
+// Not ported (ledgered): PG also offers the sorted arm over an explicitly
+// Sorted cheapest input when the arm has no presorted path; that candidate
+// only wins under a LIMIT's fractional election.
+func addSortedSetOpPath(setOpRel *RelOptInfo, lseed, rseed *Path, setOpNode *SetOp, cp costParams) {
+	if setOpNode.Op != parser.SetOpIntersect && setOpNode.Op != parser.SetOpExcept {
+		return
+	}
+	left, lpath := sortedSetOpArm(setOpRel, setOpNode.Left, lseed, cp)
+	right, rpath := sortedSetOpArm(setOpRel, setOpNode.Right, rseed, cp)
+	if lpath == nil || rpath == nil {
+		return
+	}
+	lseed, rseed = lpath, rpath
+	keys := distinctAllColKeys(left)
+	if len(keys) == 0 {
+		return
+	}
+	sorted := *setOpNode
+	sorted.Left, sorted.Right = left, right
+	sorted.MergeKeys = keys
+	numCols := float64(setOpRel.NCols)
+	startup := lseed.Cost.Startup + rseed.Cost.Startup
+	total := lseed.Cost.Total + rseed.Cost.Total +
+		cp.cpuOperatorCost*(lseed.Rows+rseed.Rows)*numCols +
+		cp.cpuOperatorCost*setOpRel.Rows
+	addPath(setOpRel, &Path{
+		Kind: PathSetOp, SetOp: &sorted,
+		Rel: setOpRel, Rows: setOpRel.Rows,
+		DisabledNodes: lseed.DisabledNodes + rseed.DisabledNodes,
+		Cost:          Cost{Startup: startup, Total: total},
+		Pathkeys:      pathkeysForSortKeys(keys),
+		Children:      []*Path{lseed, rseed},
+	}, setOpSortedProducer)
+}
+
+// sortedSetOpArm returns the arm a sorted SetOp reads and its seed path: the
+// arm itself when its plan is already sorted on every output column, or,
+// for a hashed DISTINCT arm, the Sort + Unique candidate distinctCandidates
+// prices over the same input (createDistinctPaths' seed, rebuilt). nil when
+// the arm has no sorted form.
+func sortedSetOpArm(setOpRel *RelOptInfo, arm Node, seed *Path, cp costParams) (Node, *Path) {
+	if setOpArmSortedAllCols(arm) {
+		return arm, seed
+	}
+	d, ok := arm.(*Distinct)
+	if !ok || d.Child == nil {
+		return nil, nil
+	}
+	distinctRel := &RelOptInfo{}
+	sizeDistinctRelFromNode(distinctRel, d)
+	child := seedPathForNode(distinctRel, d.Child)
+	child.Rows = math.Max(0, float64(EstimateRows(d.Child)))
+	_, unique := distinctCandidates(distinctRel, child, d, d.Child, cp, PlannerSettings{EnableHashAgg: true})
+	node, _ := createPlanNode(unique)
+	if node == nil || !setOpArmSortedAllCols(node) {
+		return nil, nil
+	}
+	return node, seedPathForNode(setOpRel, node)
+}
+
+// setOpArmSortedAllCols reports whether a set-operation arm's finished plan
+// is sorted on all of its output columns ascending (NULLS LAST): a sort-based
+// DISTINCT (a Unique — goopg's DistinctOn over every column, or Distinct —
+// over a Sort whose keys are the output columns in order), or a nested
+// sorted INTERSECT / EXCEPT, whose merge emits in that order. Anything else —
+// a hashed DISTINCT, a bare scan — answers false, so the sorted candidate is
+// simply not offered.
+func setOpArmSortedAllCols(n Node) bool {
+	ncols := len(n.Output())
+	if ncols == 0 {
+		return false
+	}
+	var child Node
+	switch x := n.(type) {
+	case *SetOp:
+		return len(x.MergeKeys) == ncols && (x.Op == parser.SetOpIntersect || x.Op == parser.SetOpExcept) &&
+			sortKeysAllColsAsc(x.MergeKeys, ncols)
+	case *DistinctOn:
+		if len(x.KeyCols) != ncols {
+			return false
+		}
+		for i, c := range x.KeyCols {
+			if c != i {
+				return false
+			}
+		}
+		child = x.Child
+	case *Distinct:
+		child = x.Child
+	default:
+		return false
+	}
+	// M0146-0005bg: a parallel DISTINCT's leader Unique reads a Gather
+	// Merge of the workers' sorted dedups, merged on every output column
+	// (create_partial_distinct_paths' `Unique -> Gather Merge`), which is
+	// as sorted as a Sort on those columns.
+	if gm, ok := child.(*GatherMerge); ok {
+		return len(gm.Output()) == ncols && sortKeysAllColsAsc(gm.Keys, ncols)
+	}
+	srt, ok := child.(*Sort)
+	if !ok || len(srt.Output()) != ncols {
+		return false
+	}
+	return sortKeysAllColsAsc(srt.Keys, ncols)
+}
+
+// sortKeysAllColsAsc reports whether keys begin with output columns
+// 0..ncols-1, each ascending with NULLS LAST.
+func sortKeysAllColsAsc(keys []SortKey, ncols int) bool {
+	if len(keys) < ncols {
+		return false
+	}
+	for i := 0; i < ncols; i++ {
+		k := keys[i]
+		cr, isCol := k.Expr.(*ColumnRef)
+		if !isCol || cr.Index != i || k.Desc || k.NullsFirst {
+			return false
+		}
+	}
+	return true
 }
 
 // addPartialSetOpPath is M0140-0006b + M0140-0006c-3: the streaming-UNION-ALL
@@ -758,9 +932,9 @@ func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams, 
 	// pure arm did not file", PG's undefined partial_rows.
 	pureRows := -1.0
 	if lChainOK && rChainOK && len(left.PartialPathlist) > 0 && len(right.PartialPathlist) > 0 {
-		lp, rp := left.PartialPathlist[0], right.PartialPathlist[0]
-		if lp != nil && rp != nil && lp.ParallelWorkers > 0 && rp.ParallelWorkers > 0 &&
-			lp.ParallelSafe && rp.ParallelSafe {
+		lp := cheapestRunnableSetOpBranchPartial(left)
+		rp := cheapestRunnableSetOpBranchPartial(right)
+		if lp != nil && rp != nil {
 			// parallel_workers: Max over the two subpaths' own worker
 			// counts (allpaths.c:1544-1550), then at least
 			// `pg_leftmost_one_pos32(2)+1 == 2` — PG's
@@ -1023,9 +1197,11 @@ func setOpBranchPartialChainOK(n Node) bool {
 // non-nil, or both nil when the branch offers neither — the caller's
 // `pa_subpaths_valid` kill.
 //
-// The partial candidate is the searched rel's PartialPathlist[0] (cheapest
-// by addToPartialPathlist's ordering), admissible only when chainOK — see
-// setOpBranchPartialChainOK. The non-partial candidate is goopg's nppath:
+// The partial candidate is the searched rel's cheapest RUNNABLE partial
+// (cheapestRunnableSetOpBranchPartial — upstream's
+// `linitial(child->partial_pathlist)` needs no runnable qualifier because
+// every partial path is runnable there), admissible only when chainOK —
+// see setOpBranchPartialChainOK. The non-partial candidate is goopg's nppath:
 // a fresh PathPrebuilt seed over the branch's own finished plan in its
 // parallel-safe serial form — the node itself, or `StripGather(node)` when
 // the branch's serial winner carried a Gather. The strip is not optional:
@@ -1043,10 +1219,8 @@ func setOpBranchPartialChainOK(n Node) bool {
 // `parallel_safe` on the child's plan.
 func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK bool) (partial, nonPartial *Path) {
 	var bp *Path
-	if chainOK && len(branch.PartialPathlist) > 0 {
-		if c := branch.PartialPathlist[0]; c != nil && c.ParallelWorkers > 0 && c.ParallelSafe {
-			bp = c
-		}
+	if chainOK {
+		bp = cheapestRunnableSetOpBranchPartial(branch)
 	}
 	var bnp *Path
 	if branchNode != nil {
@@ -1060,6 +1234,35 @@ func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK bool
 		return bp, nil
 	}
 	return nil, bnp
+}
+
+// cheapestRunnableSetOpBranchPartial is the executor-capable form of the
+// cheapest-partial pick upstream makes per Append child
+// (`linitial(child->partial_pathlist)` — allpaths.c:1544 for the pure arm,
+// allpaths.c:1408-1453's per-child pick for the `pa_subpaths` arm). Every
+// partial path upstream is runnable, so "cheapest" needs no qualifier there;
+// here a branch whose cheapest partial is a shape a SetOp branch cannot
+// drive — today only a Parallel Hash Join, whose per-join build state the
+// branch claim sets do not carry (M0146-0002 slice 2, deferral ledger
+// 2026-09-24) — would embed a child partialPathDrivingKind's PathSetOp arm
+// refuses, so the produced path could never be gathered. Pick the cheapest
+// RUNNABLE entry instead: `setOpBranchDrivingKindIsSupported` is exactly
+// the admission the gather-side check applies, so the produced path is
+// gatherable by construction. A branch with no runnable partial returns
+// nil — same verdict as an empty list.
+func cheapestRunnableSetOpBranchPartial(branch *RelOptInfo) *Path {
+	if branch == nil {
+		return nil
+	}
+	for _, p := range branch.PartialPathlist {
+		if p == nil || p.ParallelWorkers <= 0 || !p.ParallelSafe {
+			continue
+		}
+		if setOpBranchDrivingKindIsSupported(p) {
+			return p
+		}
+	}
+	return nil
 }
 
 // appendNonPartialCost is `append_nonpartial_cost` (costsize.c:2168-2243)
@@ -1094,4 +1297,26 @@ func appendNonPartialCost(npCosts []float64, workers int) float64 {
 		}
 	}
 	return max
+}
+
+// swapIntersectInputs is generate_nonunion_paths' input swap (prepunion.c):
+// "For INTERSECT, either order should give the same results, and we prefer
+// to put the smaller input first", smaller meaning fewer groups — to shrink
+// the hash table and to hit the executor's empty-left fast path. It applies
+// to INTERSECT and INTERSECT ALL alike. The swapped node keeps the written
+// first arm's output schema, since the set operation's columns are named by
+// the leftmost SELECT (M0146-0005r).
+func swapIntersectInputs(n *SetOp) *SetOp {
+	if n == nil || n.Op != parser.SetOpIntersect || n.Left == nil || n.Right == nil {
+		return n
+	}
+	lg := setOpArmGroups(n.Left, EstimateRows(n.Left))
+	rg := setOpArmGroups(n.Right, EstimateRows(n.Right))
+	if lg <= rg {
+		return n
+	}
+	sw := *n
+	sw.pinnedSchema = n.Output()
+	sw.Left, sw.Right = n.Right, n.Left
+	return &sw
 }
