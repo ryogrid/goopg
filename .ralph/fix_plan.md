@@ -30244,3 +30244,40 @@ Movement: yes — TPC\-DS Q23 full MATCH at SF0\.25 \(match 48 → 49, scan\-typ
     - Design: `docs/design/0100\-0149/m0146\-0123\-const\-func\-folding\.md`\.
     - Ledgered: float/date result types, strict NULL folding and plan\-time errors, qualified names, COALESCE family, estimate mode, LEFT JOIN ON false\.
 Movement: none — parity held: no TPC query or covered regress EXPLAIN applies an immutable built\-in to constants; scratch probe matches PG
+- [x] **M0146\-0124 — COALESCE / NULLIF / GREATEST / LEAST and NullTest / BooleanTest over constants fold \(eval\_const\_expressions\)**
+  \(filed 2026\-10\-09 from M0146\-0123\'s ledger row: PG folds `COALESCE\(NULL, 5\)` to `5`, `NULLIF\(1, 2\)` to `1`, `1 IS NULL`
+  to `false`; regress case\.sql\'s constant\-simplification block diverged at HEAD\)\.
+  Kind: impl
+  Parent: M0146-0123
+  - First step: port the CoalesceExpr / NullIfExpr / MinMaxExpr / NullTest / BooleanTest arms of eval\_const\_expressions\_mutator\.
+  - Done 2026\-10\-09 \(69bf83609\)\.
+    - `simplifyConditionalCall`, `constantNullness`, `foldBooleanTest`; folds only when non\-null arguments share one exact type\.
+    - Design: `docs/design/0100\-0149/m0146\-0124\-conditional\-const\-folding\.md`\.
+    - Found and filed \(S2\): M0146\-0125, M0146\-0126\.
+    - Ledgered: mixed\-type folding, all\-NULL COALESCE, row NullTest, strict operators over a typed NULL\.
+Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GREATEST/NullTest; regress case\.sql 15 → 0 diff lines \(100%\)
+- [ ] **M0146\-0125 — WRONG RESULTS: `array \|\| NULL` and `NULL \|\| array` return NULL**
+  \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT array\[1\] \|\| null, array\[1\] \|\| null::int, null \|\| array\[2\]` returns three
+  NULLs on goopg; PG 18\.3 returns `\{1\}`, `\{1,NULL\}`, `\{2\}`\. The same happens with column operands \(`a \|\| n` over a table\),
+  so it is the executor, not constant folding\. PG\'s array\_cat, array\_append and array\_prepend are not strict \(pg\_proc
+  proisstrict = f\): a NULL array operand is treated as empty, and a NULL element is appended as a NULL element\.
+  Kind: impl
+  Parent: none
+  - First step: find the executor\'s `\|\|` arm for array operands and the NULL short\-circuit that runs before it; also check
+    FoldConstants\' `tryFoldBinaryOp`, which turns any non\-AND/OR operator over a bare NULL into NULL\.
+  > \#\# ESCALATION 2026\-10\-09 \(S2\) — M0146\-0125 returns wrong results
+  > Array concatenation with a NULL operand returns NULL instead of the array\.
+  > Owner: place M0146\-0125 in the banner\.
+- [ ] **M0146\-0126 — WRONG RESULTS: COALESCE does not resolve its arguments\' common type**
+  \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT coalesce\(1, 2\.5\) / 3` returns `0` on goopg; PG 18\.3 returns
+  `0\.33333333333333333333`\. `pg\_typeof\(coalesce\(1, 2\.5\)\)` is `integer` on goopg, `numeric` on PG\. The same holds with a
+  column operand \(`coalesce\(a, 2\.5\) / 3`\)\. PG\'s transformCoalesceExpr \(parse\_expr\.c\) runs select\_common\_type over all
+  arguments and coerces each one; goopg\'s funcCallResultType takes the first non\-null argument\'s type\. GREATEST\(1, 2\.5\) is
+  already right\.
+  Kind: impl
+  Parent: none
+  - First step: resolve COALESCE\'s type with the same common\-type rule GREATEST/LEAST use \(they already give numeric\), and
+    coerce the arguments, in the resolver and in funcCallResultType\.
+  > \#\# ESCALATION 2026\-10\-09 \(S2\) — M0146\-0126 returns wrong results
+  > COALESCE over mixed integer/numeric arguments is typed integer, so arithmetic on it truncates\.
+  > Owner: place M0146\-0126 in the banner\.
