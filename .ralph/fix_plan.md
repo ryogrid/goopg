@@ -30369,11 +30369,15 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 40 → 39, scan\-t
     - Q5 SF0\.25: catalog\_returns → Parallel Seq Scan 933\.15 \(PG\'s figure\); remainder is the wsr web\_site join \(ledgered\)\.
     - Design: `docs/design/0100\-0149/m0146\-0132\-appendrel\-member\-parallel\-cutoff\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 parallelism 20 → 19, qual\-placement 7 → 6 \(TPC\-DS Q5\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0133 — a Unique keeps its input\'s pathkeys for the ORDER BY above \(TPC\-DS Q49\)**
+- [x] **M0146\-0133 — a Unique keeps its input\'s pathkeys for the ORDER BY above \(TPC\-DS Q49\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG\'s Unique over the UNION keeps its Sort\'s pathkeys, so the top ORDER BY becomes an Incremental Sort \(presorted `\(\'web\'::text\)`\); goopg\'s `inputNodePathkeys` \(upperorderedinput\.go\) has no Distinct/DistinctOn arm and does a full Sort\.
   Kind: impl
   Parent: M0146-0014a
   - First step: add the Distinct arm to inputNodePathkeys and check Q49 at both scales\.
+  - Done 2026\-10\-09 \(c12f5dc92\): inputNodePathkeys descends a non\-hashed \*DistinctOn \(EXPLAIN `Unique`\) to its child\.
+    - Q49 → Incremental Sort \(Presorted Key: \(\'web\'::text\)\) at both scales; Q54\'s store join moved to PG\'s NL \+ Join Filter\.
+    - Design: `docs/design/0100\-0149/m0146\-0133\-unique\-keeps\-input\-pathkeys\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH sort\-strategy SF0\.25 20 → 19, SF1 24 → 23 \(TPC\-DS Q49\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0134 — pathkeys match through equivalence classes \(TPC\-DS Q64\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q64\'s CTE input is ordered on `cs\_item\_sk`; PG\'s EC \(cs\_item\_sk = ss\_item\_sk = i\_item\_sk\) lets it satisfy the group key `i\_item\_sk` \(Incremental Sort over the NL\); goopg compares pathkeys by expression \(`pathKeyEqual`\) and sorts fully\.
   Kind: impl
