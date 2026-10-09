@@ -59,6 +59,20 @@ func FoldConstants(e Expr) Expr {
 	case *CaseExpr:
 		return foldCaseExpr(x)
 
+	// ── NullTest / BooleanTest over a constant (M0146-0124) ───────────
+	case *IsNullExpr:
+		operand := FoldConstants(x.Operand)
+		if isNull, ok := constantNullness(operand); ok {
+			return &BooleanConst{pos: x.pos, Value: isNull != x.Negated}
+		}
+		return &IsNullExpr{pos: x.pos, Operand: operand, Negated: x.Negated}
+	case *IsBoolExpr:
+		operand := FoldConstants(x.Operand)
+		if folded := foldBooleanTest(x, operand); folded != nil {
+			return folded
+		}
+		return &IsBoolExpr{pos: x.pos, Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}
+
 	// ── Expressions with sub-expressions: recurse ──────────────────────
 	case *ExtractExpr:
 		return &ExtractExpr{pos: x.pos, Field: x.Field, Source: FoldConstants(x.Source), SourceTypeName: x.SourceTypeName}
@@ -84,6 +98,9 @@ func FoldConstants(e Expr) Expr {
 		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
 		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
 		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		if out := simplifyConditionalCall(folded); out != nil {
+			return out
+		}
 		if lit := tryFoldFuncCall(folded); lit != nil {
 			return lit
 		}
@@ -1041,4 +1058,193 @@ func tryFoldFuncCall(x *FuncCall) Expr {
 		return &BooleanConst{pos: x.pos, Value: text == "true"}
 	}
 	return &TypedStringLit{pos: x.pos, Type: ret, Value: text}
+}
+
+// constantNullness reports whether e is a constant and, if so, whether it is
+// NULL. A typed NULL (`NULL::int`, a CastExpr over NullConst) is a NULL
+// Const in PG too; a ParamRef is not a constant at plan time.
+func constantNullness(e Expr) (isNull, ok bool) {
+	if isNullConstExpr(e) {
+		return true, true
+	}
+	if c, cast := e.(*CastExpr); cast && isNullConstExpr(c.Operand) {
+		return true, true
+	}
+	if _, param := e.(*ParamRef); param || !isPlainConstantBound(e) {
+		return false, false
+	}
+	return false, true
+}
+
+// foldBooleanTest is eval_const_expressions' T_BooleanTest arm (clauses.c): a
+// BooleanTest over a Const evaluates to a bool Const (`true IS NOT TRUE` is
+// false, `NULL::bool IS UNKNOWN` true). Same truth table as the executor's
+// IsBoolExpr arm.
+func foldBooleanTest(x *IsBoolExpr, operand Expr) Expr {
+	isNull, ok := constantNullness(operand)
+	if !ok {
+		return nil
+	}
+	var v bool
+	if !isNull {
+		b, isBool := operand.(*BooleanConst)
+		if !isBool {
+			return nil
+		}
+		v = b.Value
+	}
+	var result bool
+	switch {
+	case x.TestTrue:
+		result = !isNull && v
+	case x.TestFalse:
+		result = !isNull && !v
+	default:
+		result = isNull
+	}
+	if x.Negated {
+		result = !result
+	}
+	return &BooleanConst{pos: x.pos, Value: result}
+}
+
+// simplifyConditionalCall is eval_const_expressions' CoalesceExpr,
+// NullIfExpr and MinMaxExpr arms (clauses.c) for goopg's FuncCall spelling of
+// COALESCE / NULLIF / GREATEST / LEAST (M0146-0124), over already-folded
+// arguments:
+//
+//   - COALESCE drops NULL constants; a non-null constant ends the list — it
+//     IS the result when nothing precedes it, otherwise the later arguments
+//     are unreachable and dropped. `COALESCE(NULL, b, NULL, 7)` plans as
+//     `COALESCE(b, 7)`, `COALESCE(4, b)` as `4`.
+//   - NULLIF over two constants that differ is its first argument.
+//   - GREATEST / LEAST over constants is the extreme non-null one.
+//
+// PG's arguments were coerced to the expression's common type by parse
+// analysis; goopg's are not, so every arm declines unless all non-null
+// arguments carry the same exact type (no untyped string literal) — then the
+// kept argument already has the result type and folding cannot change a
+// value or a column type. Returns nil when nothing changes.
+func simplifyConditionalCall(x *FuncCall) Expr {
+	name := strings.ToLower(x.Name)
+	switch name {
+	case "coalesce", "nullif", "greatest", "least":
+	default:
+		return nil
+	}
+	if x.Star || x.Variadic || x.Distinct || len(x.Args) == 0 || !conditionalArgsShareType(x.Args) {
+		return nil
+	}
+	switch name {
+	case "coalesce":
+		var kept []Expr
+		for _, a := range x.Args {
+			isNull, isConst := constantNullness(a)
+			if isConst && isNull {
+				continue
+			}
+			if isConst {
+				if len(kept) == 0 {
+					return a
+				}
+				kept = append(kept, a)
+				break
+			}
+			kept = append(kept, a)
+		}
+		// All-NULL folds to a NULL Const of the COALESCE's type, which
+		// goopg's untyped NullConst cannot carry (ledgered).
+		if len(kept) == 0 || len(kept) == len(x.Args) {
+			return nil
+		}
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: kept, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+	case "nullif":
+		if len(x.Args) != 2 {
+			return nil
+		}
+		// An untyped NULL first argument has no type to keep.
+		if _, bare := x.Args[0].(*NullConst); bare {
+			return nil
+		}
+		allConst := true
+		for _, a := range x.Args {
+			isNull, isConst := constantNullness(a)
+			if isConst && isNull {
+				// "If either argument is NULL they can't be equal."
+				return x.Args[0]
+			}
+			allConst = allConst && isConst
+		}
+		if !allConst {
+			return nil
+		}
+		eq, ok := tryFoldBinaryOp(x.pos, parser.OpEq, x.Args[0], x.Args[1]).(*BooleanConst)
+		if !ok {
+			return nil
+		}
+		if !eq.Value {
+			return x.Args[0]
+		}
+		// Equal: a NULL of the first argument's type. A non-explicit cast
+		// over NULL is goopg's typed NULL Const.
+		t, ok := ExprResultType(x.Args[0])
+		if !ok || t.IsArray {
+			return nil
+		}
+		return &CastExpr{pos: x.pos, Operand: &NullConst{pos: x.pos}, TargetType: t.Name}
+	}
+	op := parser.OpGt
+	if name == "least" {
+		op = parser.OpLt
+	}
+	var best Expr
+	for _, a := range x.Args {
+		isNull, isConst := constantNullness(a)
+		if !isConst {
+			return nil
+		}
+		if isNull {
+			continue
+		}
+		if best == nil {
+			best = a
+			continue
+		}
+		better, ok := tryFoldBinaryOp(x.pos, op, a, best).(*BooleanConst)
+		if !ok {
+			return nil
+		}
+		if better.Value {
+			best = a
+		}
+	}
+	return best
+}
+
+// conditionalArgsShareType reports whether every argument that is not a NULL
+// constant has one exact resolved type and none is an untyped string
+// literal.
+func conditionalArgsShareType(args []Expr) bool {
+	var want catalog.Type
+	seen := false
+	for _, a := range args {
+		if isNull, isConst := constantNullness(a); isConst && isNull {
+			continue
+		}
+		if _, untyped := a.(*StringConst); untyped {
+			return false
+		}
+		t, ok := ExprResultType(a)
+		if !ok {
+			return false
+		}
+		if !seen {
+			want, seen = t, true
+			continue
+		}
+		if !strings.EqualFold(t.Name, want.Name) || t.IsArray != want.IsArray {
+			return false
+		}
+	}
+	return seen
 }
