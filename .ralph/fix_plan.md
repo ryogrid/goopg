@@ -29127,7 +29127,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Resume: re\-apply after the probe\-cost gap closes; re\-run the fire set
       with SF1 Q72 as witness\.
   Movement: none — held; the patch\'s fire set timed out SF1 Q72
-- [ ] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
+- [x] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
   in full\-row width** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
   TPC\-DS Q4 and Q11 at SF1: in CTE `year\_total` goopg elects
   GroupAgg←Gather Merge←Sort where PG runs a serial HashAggregate; the
@@ -29140,6 +29140,54 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: M0141\-S2a\-fix2r
   - First step: compare `cost\_agg`\'s spill pages/depth for Q4\'s store arm
     term by term with goopg\'s, on PG\'s widths\.
+  - **DONE 2026\-10\-10 \(`4bf11399d`\)\.** Term by term on Q4\'s store arm
+    \(2\.63M groups, hash\_mem 1 GB\): PG\'s entry ≈ 400 B on its 213 B input
+    fits; goopg\'s `EntryBytes` entry was 1256 B \(3\.3 GB\) and spilled\.
+    `costAgg` now takes one `inWidth` \(PG\'s `input\_width`\);
+    `aggInputPGWidth` sums the kept input columns as `set\_rel\_width` \(ANALYZE
+    stawidth from the searched rel\'s `ColVarBytes`, else `typeWidth`\);
+    `hashAggEntrySize` adds TupleHashEntrySize; the pages term is
+    `pgRelationByteSize`\. A type\-width\-only first attempt left the store arm
+    0\.05% over hash\_mem \(typmod\-less bpchar = 32 B each\) → fix2r\-c\.
+    - Fire set: SF1 Q4/Q11 every `year\_total` arm is PG\'s serial
+      HashAggregate; both lose aggregation\-strategy and parallelism; values
+      identical\. SF0\.25 none\.
+    - Gates: units, tpch\-spotcheck, acceptance arm 24/24, TPC\-H plans
+      identical vs m150, sf025 PASS=99, ea\-ratchet \(1\), regress A/B
+      \(aggregates −22 lines, join flap\)\.
+    - Tests `TestCostAggHashedSpillsOnPGWidthNotExecutorWidth`,
+      `TestAggInputPGWidthReadsStawidth`\.
+    - Design `docs/design/0100\-0149/m0141\-s2a\-fix2r\-a\-hashagg\-input\-width\.md`\.
+  Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 aggregation\-strategy 10→8, parallelism 35→33
+- [ ] **M0141\-S2a\-fix2r\-b — ANALYZE\'s stawidth for bpchar omits the blank
+  padding** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-a\)\. PG\'s
+  `compute\_scalar\_stats` / `compute\_distinct\_stats` average
+  `VARSIZE\_ANY` of the stored, blank\-padded value: TPC\-DS `customer`
+  `c\_first\_name char\(20\)` has stawidth 21 on :65438, `c\_last\_name` 31,
+  `c\_email\_address` 51\. goopg\'s `pg\_stats\.avg\_width` reads 6 / 6 / 27
+  \(unpadded\)\. Every stats\-based width \(`ColVarBytes`, `AvgVarBytes`, the
+  spill arm\'s `input\_width`\) is therefore smaller than PG\'s on char\(n\)
+  columns\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r
+  - First step: find where ANALYZE accumulates the width \(catalog
+    ColumnStats\.AvgWidth producer\) and compare with analyze\.c\'s
+    `total\_width \+= VARSIZE\_ANY\(DatumGetPointer\(value\)\)` on a char\(20\) column
+    holding \'ab\'; check the fire set for width\-driven plan moves\.
+- [ ] **M0141\-S2a\-fix2r\-c — plan\-schema types carry no typmod, so
+  `get\_typavgwidth`\'s fallback prices char\(n\) / varchar\(n\) / numeric\(p,s\) at
+  32 bytes** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-a\)\. `typeWidth`
+  \(relsize\.go\) honours `Type\.Args`, but the columns `Aggregate\.Child\.Output\(\)`
+  carries for TPC\-DS `customer` have empty Args \(`c\_customer\_id
+  bpchar\[\]`\) although `pg\_attribute\.atttypmod` is 20\. PG\'s Var keeps
+  `vartypmod`, so `get\_typavgwidth\(char\(16\)\)` is 20, not 32\. Q4\'s store arm
+  priced 356 B on type widths alone\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r
+  - First step: trace where a scan\'s output Schema is built from
+    `catalog\.Table\.Columns` and whether `Type\.Args` survives \(catalog load vs
+    schema projection\); a unit test on `tupleWidth\(SeqScan\.Output\(\)\)` for a
+    char\(16\) column\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
