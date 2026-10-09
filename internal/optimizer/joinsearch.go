@@ -70,6 +70,11 @@ const maxSearchRels = 32
 type searchCtx struct {
 	// orClauseSelDivisor: see joinlistProblem.orClauseSelDivisor.
 	orClauseSelDivisor map[Expr]float64
+	// semiDerivedRHS is the union of the SEMI join RHS relations (item
+	// coordinates) that M0146-0127's derived equalities read; a
+	// parameterised inner that needs one of them may sit only under an
+	// outer path that kept its columns (paramOuterKeepsRHS).
+	semiDerivedRHS RelSet
 
 	// joinrels is PG's `root->join_rel_level`: `joinrels[lev]` holds every
 	// RelOptInfo whose relset has exactly `lev` base rels. Index 0 is unused

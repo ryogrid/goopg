@@ -141,6 +141,12 @@ type restrictInfo struct {
 	// nulls_first) list, because goopg's estimate reads none of those four.
 	scanSelValid                    bool
 	scanSelLeftEnd, scanSelRightEnd float64
+
+	// onlyBesideRel, when set, is the relation (a SEMI join's RHS) this
+	// clause reads columns of that no semi/anti join above it emits: the
+	// clause applies only at a join one of whose inputs is exactly this
+	// relation (M0146-0127, semiecderive.go).
+	onlyBesideRel RelSet
 }
 
 // restrictInfoList is every join clause in one join problem, in a stable order
@@ -416,6 +422,47 @@ func (l *restrictInfoList) clausesFor(outer, inner RelSet) []*restrictInfo {
 		if !relsOverlap(ri.relids, outer) || !relsOverlap(ri.relids, inner) {
 			continue
 		}
+		if ri.onlyBesideRel != 0 && outer != ri.onlyBesideRel && inner != ri.onlyBesideRel {
+			continue
+		}
+		out = append(out, ri)
+	}
+	return dropRedundantSemiDerived(out)
+}
+
+// dropRedundantSemiDerived keeps a semijoin-derived clause (M0146-0127) only
+// where it is the one clause of its equivalence class at this join: PG's
+// generate_join_implied_equalities emits one clause per class, so at the
+// semijoin itself — where the semijoin's own qual already equates the RHS to
+// the class — the derived clause is not applied a second time (TPC-H Q21's
+// `l2.l_orderkey = orders.o_orderkey` beside `l2.l_orderkey =
+// l1.l_orderkey`).
+func dropRedundantSemiDerived(ris []*restrictInfo) []*restrictInfo {
+	tagged := false
+	for _, ri := range ris {
+		if ri.onlyBesideRel != 0 {
+			tagged = true
+			break
+		}
+	}
+	if !tagged {
+		return ris
+	}
+	explicit := map[int]bool{}
+	for _, ri := range ris {
+		if ri.onlyBesideRel == 0 && ri.ecID != noEquivClass {
+			explicit[ri.ecID] = true
+		}
+	}
+	out := ris[:0:0]
+	kept := map[int]bool{}
+	for _, ri := range ris {
+		if ri.onlyBesideRel != 0 && ri.ecID != noEquivClass {
+			if explicit[ri.ecID] || kept[ri.ecID] {
+				continue
+			}
+			kept[ri.ecID] = true
+		}
 		out = append(out, ri)
 	}
 	return out
@@ -615,6 +662,8 @@ func (l *restrictInfoList) flipped(ri *restrictInfo) *restrictInfo {
 		opRightRelids: ri.opLeftRelids,
 		inferred:    ri.inferred,
 		ecID:        ri.ecID,
+		// M0146-0127: the flipped clause reads the same RHS columns.
+		onlyBesideRel: ri.onlyBesideRel,
 	}
 	if l.flips == nil {
 		l.flips = map[*restrictInfo]*restrictInfo{}

@@ -354,6 +354,11 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				continue
 			}
 			sawParamInner = true
+			// M0146-0127: a probe keyed on a semijoin RHS's columns needs an
+			// outer path that still emits them.
+			if !s.paramOuterKeepsRHS(o, i.RequiredOuter) {
+				continue
+			}
 			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
 			// try_nestloop_path's test, verbatim (joinpath.c:882-889),
 			// over this joinrel's param_source_rels (C-08 derivation,
@@ -581,6 +586,10 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 			req := calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)
 			if req != 0 {
 				tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8", "jt="+traceJoinTypeName(jt))
+				continue
+			}
+			// M0146-0127: as the serial arm.
+			if !s.paramOuterKeepsRHS(o, i.RequiredOuter) {
 				continue
 			}
 			residual := nestloopResidualClauses(clauses, i, inner.Relids, i.RequiredOuter)

@@ -98,6 +98,12 @@ type joinlistProblem struct {
 	// clause's own join selectivity is divided (M0146-0005 slice 4).
 	orClauseSelDivisor map[Expr]float64
 
+	// semiRHSOperand maps each equality the seam derived through a SEMI
+	// join's qual (M0146-0127, semiRHSImpliedEqualities) to its RHS-side
+	// operand; the clause applies only where that operand's relation is a
+	// whole join input.
+	semiRHSOperand map[Expr]Expr
+
 	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
 	// the coordinate space `relidsOfExpr` and `baseOffset` are both
 	// written in. One entry per FROM item: the leaf's own span, not an
@@ -618,6 +624,16 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// where no special join can null-extend a class member.
 	s.clauses.ecReduce = len(sjis) == 0
 	s.orClauseSelDivisor = prob.orClauseSelDivisor
+	// M0146-0127: a clause derived through a semijoin's qual reads the RHS's
+	// columns, which exist only where the RHS is a whole join input.
+	for _, ri := range s.clauses.all {
+		if rhs, derived := prob.semiRHSOperand[ri.clause]; derived {
+			if r, ok := relidsOfExpr(rhs, itemSpans); ok && r != 0 {
+				ri.onlyBesideRel = r
+				s.semiDerivedRHS |= r
+			}
+		}
+	}
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
