@@ -30577,7 +30577,7 @@ Movement: none — no TPC\-DS/TPC\-H query has this shape \(fire set flat\); reg
     - Filed M0146\-0146, 0147, 0148\.
     - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md` §2026\-10\-10\.
 Movement: none — recon
-- [ ] **M0146\-0146 — a Subquery Scan whose target list carries a computed resjunk ORDER BY key is not trivial \(TPC\-DS Q36, Q70, Q86\)**
+- [x] **M0146\-0146 — a Subquery Scan whose target list carries a computed resjunk ORDER BY key is not trivial \(TPC\-DS Q36, Q70, Q86\)**
   \(filed 2026\-10\-10 by M0146\-0014b\)\. PG keeps `Subquery Scan on sub` above the WindowAgg: the outer ORDER BY\'s
   `CASE WHEN lochierarchy = 0 THEN i\_category END` is evaluated at the scan \(the only leaf\), so its tlist is longer than the
   subplan\'s and setrefs\.c `trivial\_subqueryscan` keeps it\. goopg\'s stripTrivialSubqueryScans only checks which positions the
@@ -30588,6 +30588,13 @@ Movement: none — recon
     fire set\.
   - First step: in subqueryscan\_strip\.go, treat a leaf whose enclosing single\-leaf scope computes a non\-Var target or resjunk
     sort key over it as non\-trivial; regress A/B \(subselect, window\) for over\-keep\.
+  - Done 2026\-10\-10 \(3e2ddfe91\): stripTrivialSubqueryScans keeps the wrapper when its parent Sort/IncrementalSort has a
+    non\-column key \(sortKeysCompute\) — the Sort twin of M0146\-0005av\'s computed\-Project rule\.
+    - Q36, Q86 → MATCH at both scales; Q70\'s first divergence moves to its s\_state IN semi join \(PG Hash Join Left Semi vs
+      goopg Nested Loop\) — next sweep\.
+    - Regress A/B 32 cases unchanged; TPC\-H plans identical\.
+    - Design: `docs/design/0100\-0149/m0146\-0146\-subqueryscan\-resjunk\-sort\-key\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH match SF0\.25 53 → 55, SF1 39 → 41; join\-order −2, join\-method −2, scan\-type −2, sort\-strategy −2, parallelism −2, rendering −2 at both scales
 - [ ] **M0146\-0147 — the needed\-column set for a statement with a WITH clause \(index\-only paths; TPC\-DS Q95\)**
   \(filed 2026\-10\-10 by M0146\-0014b\)\. `collectStmtColumnNames` \(pathindexonlyneed\.go\) declines any statement with
   `s\.With != nil`, so `neededColsKnown` is false and no index\-only path is offered; PG\'s check\_index\_only reads the attrs the
