@@ -30595,7 +30595,7 @@ Movement: none — recon
     - Regress A/B 32 cases unchanged; TPC\-H plans identical\.
     - Design: `docs/design/0100\-0149/m0146\-0146\-subqueryscan\-resjunk\-sort\-key\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH match SF0\.25 53 → 55, SF1 39 → 41; join\-order −2, join\-method −2, scan\-type −2, sort\-strategy −2, parallelism −2, rendering −2 at both scales
-- [ ] **M0146\-0147 — the needed\-column set for a statement with a WITH clause \(index\-only paths; TPC\-DS Q95\)**
+- [x] **M0146\-0147 — the needed\-column set for a statement with a WITH clause \(index\-only paths; TPC\-DS Q95\)**
   \(filed 2026\-10\-10 by M0146\-0014b\)\. `collectStmtColumnNames` \(pathindexonlyneed\.go\) declines any statement with
   `s\.With != nil`, so `neededColsKnown` is false and no index\-only path is offered; PG\'s check\_index\_only reads the attrs the
   query uses \(CTE bodies are separate query levels\)\. Q95\'s web\_returns\_pkey probe is an Index Scan where PG \(and goopg\'s own
@@ -30606,6 +30606,11 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH match SF0\.25 53 → 55, SF1 39 → 41
     \(its only category\); measured by the fire set\.
   - First step: let the walker skip the WITH list \(each CTE body is planned by its own planSelect and gets its own set\) and
     keep declining the other modelled\-out shapes; check every query that gains an index\-only path in the fire set\.
+  - Done 2026\-10\-10 \(89616dcd9\): collectWithBodyColumnNames walks every CTE body into the needed and above\-tree sets \(needed
+    mode, over\-includes safely\); a DML CTE or a recursive UNION body still declines\.
+    - Q95 → MATCH at both scales; Q2/Q59/Q78 change only in printed widths; sweep 99/99 values; regress A/B unchanged\.
+    - Design: `docs/design/0100\-0149/m0146\-0147\-with\-needed\-columns\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH scan\-type SF0\.25 23 → 22, SF1 33 → 32; match SF0\.25 55 → 56, SF1 41 → 42
 - [ ] **M0146\-0148 — a searched sub\-joinlist hands its whole pathlist up \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-10 by M0146\-0014b; the open pathlist half of ledger row M0127\-P5\.9\-a\)\. make\_rel\_from\_joinlist returns
   the sub\-problem\'s RelOptInfo, so the enclosing search sees all its paths; goopg\'s searchOneProblem/finalPath publishes only
