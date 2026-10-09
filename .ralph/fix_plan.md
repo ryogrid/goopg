@@ -30443,11 +30443,17 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 38 → 37, join\-m
     - Q67 → MATCH both scales; Q18 SF1 6 → 3 categories; the MixedAggregate per\-set hash cost / hash\_mem itself is ledgered\.
     - Design: `docs/design/0100\-0149/m0146\-0138\-grouping\-sets\-query\-pathkeys\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 sort\-strategy 16 → 15, parallelism 18 → 17, match 52 → 53; SF1 join\-order 47 → 46, join\-method 19 → 17, aggregation\-strategy 12 → 10, sort\-strategy 21 → 19, parallelism 36 → 34, qual\-placement 9 → 10, match 38 → 39; ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0139 — hash join build batching cost \(TPC\-DS Q79\)**
+- [x] **M0146\-0139 — hash join build batching cost \(TPC\-DS Q79\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg\'s customer Hash charges no batching \(startup 5104\.0\); PG\'s 100000\-row build \(\~9\.8 MB > 8 MB hash\_mem\) splits into 2 batches \(\~7100\), so PG keeps its customer\_pkey nested loop \(5248\.4\)\. B8 also pushes goopg away from the NL\.
   Kind: impl
   Parent: M0146-0014a
   - First step: re\-decide M0139\-0007a\'s held\-off spill arm \(`GOOPG\_PG\_HASH\_TUPLE\_SPILL\_COST`\) with a fire set\.
+  - Done 2026\-10\-09 \(no code — premise refuted\): both clusters run `work\_mem = 512MB` \(hash\_mem 1 GB\), so neither engine
+    batches Q79\'s 10 MB customer build \(trace: pgbatches=1\)\.
+    - Spill arm re\-measured default\-on: zero plan changes at both scales — M0139\-0007a HOLD reconfirmed\.
+    - Q79 SF1 already matches PG; Q79 SF0\.25 is B8 \(customer\_pkey probe 8\.44 vs PG 4\.63, M0146\-0068 owner\) plus a near\-tie\.
+    - Design: `docs/design/0100\-0149/m0146\-0139\-hash\-batching\-premise\-refuted\.md`\.
+Movement: none — premise refuted: work\_mem 512MB means no batching in either engine; spill arm moves no plan; Q79 SF0\.25 routes to B8
 - [ ] **M0146\-0140 — harness: the plan capture fails on TPC\-DS Q36, Q70 and Q86**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Both engines report `syntax error at or near ";"` at `limit 100;` in the capture wrapper\'s generated SQL, so these three are capture errors, not plan records, at both scales\.
   Kind: impl
