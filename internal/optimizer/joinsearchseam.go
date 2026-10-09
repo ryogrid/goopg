@@ -1223,6 +1223,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// none is safe (see resolveContext.settings).
 		cp:  ctx.settings.costParams(),
 		cat: cat,
+		// M0146-0132: the member scope's one relation is an appendrel
+		// member (RELOPT_OTHER_MEMBER_REL), not a base rel.
+		otherMemberRel: ctx.appendrelOtherMember,
 		// `root->tuple_fraction`, carried on the context because the `*Limit`
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).

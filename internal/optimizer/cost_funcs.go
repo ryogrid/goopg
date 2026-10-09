@@ -135,6 +135,13 @@ type costParams struct {
 	minParallelTableScanBlocks  int64
 	minParallelIndexScanBlocks  int64
 	parallelLeaderParticipation bool
+
+	// otherMemberRel marks the costParams of a search whose one relation is
+	// a UNION ALL appendrel member pulled up into the parent query
+	// (RELOPT_OTHER_MEMBER_REL, pull_up_simple_union_all): compute_parallel_worker
+	// applies its size cutoffs to RELOPT_BASEREL only, because a small member
+	// "may well pay off" combined with its siblings (M0146-0132).
+	otherMemberRel bool
 }
 
 func defaultCostParams() costParams {

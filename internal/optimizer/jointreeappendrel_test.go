@@ -624,3 +624,46 @@ func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
 		}
 	})
 }
+
+// TestSmallAppendrelMemberGetsPartialPath is M0146-0132:
+// compute_parallel_worker (allpaths.c) applies min_parallel_table_scan_size to
+// RELOPT_BASEREL only. A UNION ALL member PG pulls up into the parent
+// (is_simple_subquery && is_safe_append_member) is RELOPT_OTHER_MEMBER_REL, so
+// a member below the cutoff still files a partial scan — "combined with all of
+// its inheritance siblings it may well pay off" (TPC-DS Q5's catalog_returns
+// under the Parallel Append). A member with its own WHERE is not pulled up
+// (is_safe_append_member: "no place to put them in an appendrel"): it is a
+// subquery whose relation is a base rel, and the cutoff still applies.
+func TestSmallAppendrelMemberGetsPartialPath(t *testing.T) {
+	withParallelOn(t, func() {
+		cat := appendrelTestCat(t)
+		tbl, err := cat.CreateTable(parser.ObjectName{Name: "zz_small"}, []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "int4"}},
+			{Name: "v", Type: catalog.Type{Name: "int4"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 700 pages: below the 1024-page (8 MB) min_parallel_table_scan_size.
+		tbl.Stats = &catalog.TableStats{RowCount: 70_000, Pages: 700, Analyzed: true,
+			Columns: []catalog.ColumnStats{{AvgWidth: 4, NDistinct: -1}, {AvgWidth: 4, NDistinct: -1}}}
+		smallMemberPartials := func(member string) int {
+			sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL ` + member + `) u, zz_d d WHERE u.a = d.a`
+			leaf := findSetOpLeaf(planOnPipeline(t, sql, cat))
+			if leaf == nil {
+				t.Fatalf("%s: no *SetOp leaf in the plan", member)
+			}
+			br := setOpBranchRelOf(leaf.Right)
+			if br == nil {
+				t.Fatalf("%s: the small member has no searched rel", member)
+			}
+			return len(br.PartialPathlist)
+		}
+		if n := smallMemberPartials(`SELECT a, v FROM zz_small`); n == 0 {
+			t.Error("pulled-up member below min_parallel_table_scan_size has no partial path")
+		}
+		if n := smallMemberPartials(`SELECT a, v FROM zz_small WHERE v > 0`); n != 0 {
+			t.Errorf("member with its own WHERE (not pulled up) has %d partial paths, want 0", n)
+		}
+	})
+}

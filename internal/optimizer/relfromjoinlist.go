@@ -116,6 +116,12 @@ type joinlistProblem struct {
 	cp  costParams
 	cat catalog.Catalog
 
+	// otherMemberRel: this statement's FROM is one relation that PG pulls up
+	// as a UNION ALL appendrel member (resolveContext.appendrelOtherMember);
+	// its search prices partial paths without the BASEREL size cutoffs
+	// (M0146-0132).
+	otherMemberRel bool
+
 	// joinInfoList is root->join_info_list: every SpecialJoinInfo for the
 	// statement, in bottom-up order. Carried by the top-level problem so
 	// `buildInitialRels` can store it on the search context. nil for
@@ -606,7 +612,11 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
-	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
+	cp := prob.cp
+	if prob.otherMemberRel && len(prob.relInfos) == 1 && len(items) == 1 {
+		cp.otherMemberRel = true
+	}
+	s, err := buildInitialRels(bindings, scans, infos, cp, tupleFraction, sjis)
 	if err != nil {
 		return joinlistRel{}, err
 	}

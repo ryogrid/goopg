@@ -778,7 +778,8 @@ func computeParallelWorkerForRel(cp costParams, heapPages int64, reloptionWorker
 //
 // Either applicable count below its threshold — min_parallel_table_scan_size
 // for the heap, min_parallel_index_scan_size for the index — returns 0 (:4300,
-// the RELOPT_BASEREL case; goopg's search has no inheritance children). Each
+// the RELOPT_BASEREL case; an appendrel member's search sets
+// cp.otherMemberRel and skips it, M0146-0132). Each
 // applicable count then climbs its own log3 ladder and, when both apply, the
 // SMALLER of the two answers wins (:4344). C-19c.
 func computeParallelWorker(cp costParams, heapPages, indexPages float64, reloptionWorkers int) int {
@@ -787,8 +788,13 @@ func computeParallelWorker(cp costParams, heapPages, indexPages float64, relopti
 	if reloptionWorkers > 0 {
 		workers = reloptionWorkers
 	} else {
-		if (heapPages >= 0 && heapPages < float64(cp.minParallelTableScanBlocks)) ||
-			(indexPages >= 0 && indexPages < float64(cp.minParallelIndexScanBlocks)) {
+		// M0146-0132: `rel->reloptkind == RELOPT_BASEREL` — an appendrel
+		// member (RELOPT_OTHER_MEMBER_REL) skips the cutoff and climbs the
+		// ladder from one worker, so TPC-DS Q5's ~721-page catalog_returns
+		// member gets PG's Parallel Seq Scan under the Parallel Append.
+		if !cp.otherMemberRel &&
+			((heapPages >= 0 && heapPages < float64(cp.minParallelTableScanBlocks)) ||
+				(indexPages >= 0 && indexPages < float64(cp.minParallelIndexScanBlocks))) {
 			return 0
 		}
 		if heapPages >= 0 {

@@ -544,6 +544,10 @@ type resolveContext struct {
 	// that arrived carrying plannerSet.appendrelMember; cleared for
 	// deeper scopes by the same one-level bound.
 	appendrelMember bool
+	// appendrelOtherMember narrows appendrelMember to a member PG pulls up
+	// into the parent query, so its one relation is RELOPT_OTHER_MEMBER_REL
+	// and skips compute_parallel_worker's size cutoffs (M0146-0132).
+	appendrelOtherMember bool
 
 	// scalarSublinkBody marks this resolveContext as a scalar sublink's
 	// body scope (M0146-0012, PlannerSettings.scalarSublinkBody): the seam
@@ -1691,6 +1695,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// above returns before this point for the union scope itself, so the
 	// flag reaches member scopes intact.
 	appendrelMember := plannerSet.appendrelMember
+	// M0146-0132: a member PG pulls up into the parent (is_simple_subquery
+	// && is_safe_append_member) is a RELOPT_OTHER_MEMBER_REL there, and
+	// compute_parallel_worker exempts it from the parallel size cutoffs.
+	// Decided on the member's own AST, before the rewrites below.
+	appendrelOtherMember := appendrelMember && isSafeAppendMemberStmt(s, scope) &&
+		!needsAggregateStage(s, cat) && !needsWindowStage(s)
 	plannerSet.appendrelMember = false
 	plannerSet.appendrelLabel = false
 	// M0146-0012: same one-scope bound for the scalar-sublink-body mark.
@@ -1758,6 +1768,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// inherit it.
 		if appendrelMember && ctx != nil {
 			ctx.appendrelMember = true
+			ctx.appendrelOtherMember = appendrelOtherMember
 		}
 		if scalarSublinkBody && ctx != nil {
 			ctx.scalarSublinkBody = true

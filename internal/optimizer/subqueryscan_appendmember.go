@@ -49,6 +49,22 @@ type appendRelLabel struct {
 // the member's planned branch, read for the aggregate / window / SRF nodes
 // the AST does not flag.
 func isSafeAppendMember(s *parser.SelectStmt, plan Node, scope *rtableScope) bool {
+	if !isSafeAppendMemberStmt(s, scope) {
+		return false
+	}
+	return !subqueryPlanContains(plan, func(n Node) bool {
+		switch n.(type) {
+		case *Aggregate, *WindowAgg, *ProjectSet:
+			return true
+		}
+		return false
+	})
+}
+
+// isSafeAppendMemberStmt is isSafeAppendMember's AST half, answerable before
+// the member is planned (M0146-0132: the member's own search needs to know it
+// runs on a RELOPT_OTHER_MEMBER_REL).
+func isSafeAppendMemberStmt(s *parser.SelectStmt, scope *rtableScope) bool {
 	if s == nil {
 		return false
 	}
@@ -69,13 +85,7 @@ func isSafeAppendMember(s *parser.SelectStmt, plan Node, scope *rtableScope) boo
 	default:
 		return false
 	}
-	return !subqueryPlanContains(plan, func(n Node) bool {
-		switch n.(type) {
-		case *Aggregate, *WindowAgg, *ProjectSet:
-			return true
-		}
-		return false
-	})
+	return true
 }
 
 // wrapAppendRelMembers gives every stamped member arm of an appendrel's
