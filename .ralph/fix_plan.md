@@ -30500,7 +30500,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 10 → 9; SF0\.25 
     - Declines: a GROUP BY item or an ordered aggregate key that is not a searched column keeps the group keys \(ledgered\)\.
     - Design: `docs/design/0100\-0149/m0146\-0142\-ordered\-aggregate\-query\-pathkeys\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-method 18 → 17, parameterisation 17 → 16, sort\-strategy 17 → 16, parallelism 19 → 18; SF1 unchanged; match 53/39 unchanged; ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0143 — aggregates used only inside a window spec or a CASE are never collected \(TPC\-DS Q70\)**
+- [x] **M0146\-0143 — aggregates used only inside a window spec or a CASE are never collected \(TPC\-DS Q70\)**
   \(filed 2026\-10\-09 by M0146\-0140\)\. collectAggregateCalls \(planner\.go\) walks targets/HAVING/ORDER BY through walkExpr, which
   descends only BinaryOp/UnaryOp/Cast/Is\*/FuncCall args\. `rank\(\) over \(order by sum\(b\)\) \.\.\. group by a` and
   `case when sum\(b\) > 2 then 1 end \.\.\. group by a` fail `aggregate call could not be resolved`; PG returns rows\. Q70\'s IN
@@ -30509,6 +30509,14 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-m
   Parent: M0146-0140
   - First step: make walkExpr descend CaseExpr, the window spec \(PARTITION BY/ORDER BY, named WINDOW\) and FILTER, never a
     subquery; regress A/B \(window, aggregates, groupingsets\); then flip oracle row 70 to OK and drop it from ENGINE\_GAP\.
+  - Done 2026\-10\-10 \(6285285fe\): walkExpr descends CASE, IN list, EXTRACT, COLLATE, ROW/ARRAY/subscript/field and the window
+    spec \(walkWindowDef\), never a subquery, FILTER or the call\'s own ORDER BY; named WINDOW clauses visited\.
+    - Resolution twins: resolveInListAfterAggregate, resolveInSubqueryAfterAggregate \(operand through the aggregate surface\)\.
+    - Q70 runs \(PG\'s 3 rows and checksum\); oracle row 70 → OK, ENGINE\_GAP empty; SF0\.25 sweep PASS=99 SKIP=0\.
+    - Regress subselect bug \#19037 block now passes \(−23 diff lines\); array subscript after aggregate, WHERE\-CASE error text
+      and outer aggregates in a HAVING IN subquery\'s WHERE stay ledgered \(all pre\-existing\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0143\-aggregate\-collection\-walk\.md`\.
+Movement: none — Q70 turns from a capture error into a counted shape\-diff \(categories \+1 each in its six at both scales\); no plan of an already\-measured query moved; match 53/39 unchanged
 - [ ] **M0146\-0144 — no plain nested loop for JOIN\_RIGHT \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-09 by M0146\-0141\)\. PG\'s match\_unsorted\_outer sets `nestjoinOK = false` for JOIN\_RIGHT, JOIN\_RIGHT\_ANTI and
   JOIN\_FULL \(joinpath\.c\), so a LEFT join is never run as a nested loop with the nullable side outer\. goopg\'s addNestLoopPath
