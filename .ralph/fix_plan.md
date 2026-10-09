@@ -30378,11 +30378,21 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 parallelism 20 → 19, qual\-p
     - Q49 → Incremental Sort \(Presorted Key: \(\'web\'::text\)\) at both scales; Q54\'s store join moved to PG\'s NL \+ Join Filter\.
     - Design: `docs/design/0100\-0149/m0146\-0133\-unique\-keeps\-input\-pathkeys\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH sort\-strategy SF0\.25 20 → 19, SF1 24 → 23 \(TPC\-DS Q49\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0134 — pathkeys match through equivalence classes \(TPC\-DS Q64\)**
+- [x] **M0146\-0134 — pathkeys match through equivalence classes \(TPC\-DS Q64\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q64\'s CTE input is ordered on `cs\_item\_sk`; PG\'s EC \(cs\_item\_sk = ss\_item\_sk = i\_item\_sk\) lets it satisfy the group key `i\_item\_sk` \(Incremental Sort over the NL\); goopg compares pathkeys by expression \(`pathKeyEqual`\) and sorts fully\.
   Kind: impl
   Parent: M0146-0014a
   - First step: make pathkey comparison EC\-aware where the search has the classes \(pathkeys\_contained\_in over EquivalenceClass members\)\.
+  - Done 2026\-10\-09 \(dd7e9df07\): five gaps, all needed for Q64\'s `Incremental Sort \(Presorted Key: item\.i\_item\_sk\)`\.
+    - GEQO freshEvalCtx dropped queryPathkeys \(and parallelModeOK, cat, itemSpans, …\) — every tour truncated the order\.
+    - group pathkeys now drop FD columns \(pruneUselessGroupPathkeys, remove\_useless\_groupby\_columns\)\.
+    - countContainedIn through the rel\'s classes at truncation, grouping \(seed \+ search candidates\) and ORDER BY arms
+      \(RelOptInfo\.SearchCandidateClasses\)\.
+    - incremental sort group estimate clamps tuples to 2 \(cost\_incremental\_sort\)\.
+    - SF0\.25: Q4 → match, Q58/Q64 improve; SF1: Q58/Q64 improve, Q4/Q11 \+\[join\-method, qual\-placement\] \(near\-tie under SF1
+      drift, ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0134\-pathkeys\-through\-equivalence\-classes\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-method 18 → 17, sort\-strategy 19 → 17, qual\-placement 6 → 4, match 50 → 51; SF1 sort\-strategy 23 → 22, join\-method 18 → 20, qual\-placement 9 → 10 \(Q4/Q11 near\-tie\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0135 — a parameterised semijoin inner keeps the class\'s join filter \(TPC\-DS Q95\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG keeps `ws1\.ws\_order\_number = ws\_wh\_1\.ws\_order\_number` as a Join Filter on the parameterised semijoin RHS \(get\_joinrel\_parampathinfo\); goopg drops it \(hash join 167485\.02 vs PG 169714\.13 at SF1\)\.
   Kind: impl
