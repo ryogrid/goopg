@@ -668,7 +668,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
-		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(req))
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(rel, req))
 	child := &Path{
 		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,

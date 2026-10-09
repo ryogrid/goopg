@@ -30,6 +30,7 @@ import (
 	"math"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // paramIndexClause is one join clause that could drive an index probe of a base
@@ -416,7 +417,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && fullyBound,
 		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
-		loopCount:       s.loopCountFor(req),
+		loopCount:       s.loopCountFor(rel, req),
 		// R1 (plan-parity-fix-take2): qpquals are the clauses evaluated on
 		// the HEAP tuple — PG's `cost_index` takes them as
 		// `baserestrictinfo + ppi_clauses` minus the index quals
@@ -574,7 +575,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	if !boundCounted {
 		boundSel = 1
 	}
-	loopCount := s.loopCountFor(req)
+	loopCount := s.loopCountFor(rel, req)
 	if rows > maxSkipProbeRows || (loopCount > 0 && rows*loopCount > maxSkipProbeLifetimeRows) {
 		return false
 	}
@@ -867,7 +868,12 @@ func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, 
 // parameter — not the product and not the sum. Worth keeping exactly, because
 // `cost_index`'s repeated-scan arm DIVIDES by this number, so an inflated one
 // would make a parameterised inner look free.
-func (s *searchCtx) loopCountFor(req RelSet) float64 {
+//
+// M0146-0121: each outer rel's count first passes through
+// adjust_rowcount_for_semijoins — an outer rel on the inside of a semijoin the
+// probed rel is outside of can supply the parameter only once unique-ified, so
+// its unique row count stands in for its raw rows.
+func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
 	if req == 0 {
 		return 1
 	}
@@ -876,14 +882,79 @@ func (s *searchCtx) loopCountFor(req RelSet) float64 {
 		if rel == nil || rel.Relids&req == 0 || rel.Rows <= 0 {
 			continue
 		}
-		if result == 0 || rel.Rows < result {
-			result = rel.Rows
+		rowcount := s.adjustRowcountForSemijoins(cur, rel, rel.Rows)
+		if result == 0 || rowcount < result {
+			result = rowcount
 		}
 	}
 	if result > 0 {
 		return result
 	}
 	return 1
+}
+
+// adjustRowcountForSemijoins is `adjust_rowcount_for_semijoins`
+// (indxpath.c): when outer is on the inside (syn_righthand) of a JOIN_SEMI
+// whose syn_lefthand holds cur, a parameterised path on cur can only be
+// driven by outer's unique-ified rows, so the loop count is clamped to
+// estimate_num_groups(semi_rhs_exprs) over the RHS. PG sizes a multi-rel RHS
+// with approximate_joinrel_size; goopg estimates only a single-relation RHS
+// (the RHS leaf's own node resolves the uniq exprs) and leaves the others
+// unadjusted.
+func (s *searchCtx) adjustRowcountForSemijoins(cur, outer *RelOptInfo, rowcount float64) float64 {
+	if cur == nil || outer == nil {
+		return rowcount
+	}
+	for _, sj := range s.joinInfoList {
+		if sj == nil || sj.Jointype != parser.JoinSemi ||
+			cur.Relids&sj.SynLefthand == 0 || outer.Relids&sj.SynRighthand == 0 {
+			continue
+		}
+		if sj.SynRighthand != outer.Relids {
+			continue
+		}
+		if nunique, ok := semiRhsUniqueRows(sj, outer); ok && rowcount > nunique {
+			rowcount = nunique
+		}
+	}
+	return rowcount
+}
+
+// semiRhsUniqueRows is the estimate_num_groups(semi_rhs_exprs, nraw) half of
+// adjust_rowcount_for_semijoins for a one-relation RHS: the uniq exprs
+// resolved against the RHS leaf, as createPulledBaseUniquePath resolves
+// them. An RHS whose sub-select is already distinct on its one output
+// (SemiRhsDistinct) has its own rows as groups.
+func semiRhsUniqueRows(sj *SpecialJoinInfo, rhs *RelOptInfo) (float64, bool) {
+	if rhs.baseLeaf == nil || len(sj.SemiRhsExprs) == 0 {
+		return 0, false
+	}
+	if sj.SemiRhsDistinct {
+		return rhs.Rows, true
+	}
+	out := rhs.baseLeaf.Output()
+	local := make([]Expr, 0, len(sj.SemiRhsExprs))
+	for _, e := range sj.SemiRhsExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return 0, false
+		}
+		i := cr.Index
+		if sj.SemiRhsProblemSpace {
+			i -= rhs.baseOffset
+		}
+		if i < 0 || i >= len(out) || out[i].Name != cr.Name {
+			return 0, false
+		}
+		lc := *cr
+		lc.Index = i
+		local = append(local, &lc)
+	}
+	n := float64(estimateNumGroups(local, rhs.baseLeaf, int64(rhs.Rows)))
+	if n < 1 {
+		return 0, false
+	}
+	return n, true
 }
 
 // varEqNonConstSelectivity is `var_eq_non_const` (selfuncs.c) for the case this
