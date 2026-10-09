@@ -30292,7 +30292,7 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
     - Design: `docs/design/0100\-0149/m0146\-0127\-semijoin\-equivalence\-classes\.md`\.
     - Filed: M0146\-0128\. Ledgered: multi\-relation RHS, outside\-outside / inside\-inside derivations, RHS columns above a semijoin\.
 Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0\.25 21 → 20, SF1 28 → 27 \(TPC\-DS Q14\); `ea-ratchet` 7 → 1
-- [ ] **M0146\-0128 — one clause per equivalence class when every special join is a SEMI join**
+- [x] **M0146\-0128 — one clause per equivalence class when every special join is a SEMI join**
   \(filed 2026\-10\-09 by M0146\-0127\)\. TPC\-DS Q14 now joins as PG but keeps `Join Filter: \(store\_sales\.ss\_item\_sk =
   cross\_items\.ss\_item\_sk\)` at the store\_sales probe: above the unique\-ified RHS both the WHERE equality and the semijoin qual of the
   same class are applied\. PG\'s generate\_join\_implied\_equalities emits one\. goopg\'s `restrictInfoList\.ecReduce` is off whenever
@@ -30303,3 +30303,8 @@ Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0\.25 21 → 20, SF1 
   - First step: set ecReduce when every SpecialJoinInfo is JoinSemi; check the chosen member never reads a semijoin\-consumed RHS
     \(clausesFor already filters derived clauses\); fire\-set both scales\.
   - Also: Q14\'s `item\_pkey` probe is a Bitmap Heap Scan where PG uses an Index Scan \(PG cost 8\.30 for one row\)\.
+  - Done 2026\-10\-09 \(51484e842\)\.
+    - `onlySemiJoins` sets `ecReduce` for a problem whose special joins are all SEMI\.
+    - Design: `docs/design/0100\-0149/m0146\-0128\-semi\-only\-ec\-reduce\.md`\.
+    - The item\_pkey Bitmap\-vs\-Index part is B8 \(`indexProbeCostMultiplier`: a one\-row lookup is 16\.27 vs PG 8\.30\) — gated on M0146\-0068, not touched\.
+Movement: yes — CATEGORIES-EXCL-MATCH qual\-placement SF0\.25 9 → 8, SF1 10 → 9 \(TPC\-DS Q14\)
