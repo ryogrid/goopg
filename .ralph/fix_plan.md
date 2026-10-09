@@ -30281,3 +30281,25 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > \#\# ESCALATION 2026\-10\-09 \(S2\) — M0146\-0126 returns wrong results
   > COALESCE over mixed integer/numeric arguments is typed integer, so arithmetic on it truncates\.
   > Owner: place M0146\-0126 in the banner\.
+- [x] **M0146\-0127 — a semijoin\'s equality joins the equivalence classes \(TPC\-DS Q14\'s cross\_items → item spine\)**
+  \(filed 2026\-10\-09 from the SF0\.25 triage: Q14\'s join\-order record — the DP trace declined `\{cross\_items\} \| \{item\}` with
+  no join clause because the seam\'s EC closure ran before the semijoin quals joined the list; sublink\-clause family of M0146\-0012a\)\.
+  Kind: impl
+  Parent: M0146-0012a
+  - First step: DP\-trace Q14\'s first branch \(cross\_items MATERIALIZED\) on the private SF0\.25 clone\.
+  - Done 2026\-10\-09 \(4eb16d5f1\)\.
+    - `semiRHSImpliedEqualities`, `restrictInfo.onlyBesideRel`, `dropRedundantSemiDerived`, `pathKeepsRels` / `paramOuterKeepsRHS`\.
+    - Design: `docs/design/0100\-0149/m0146\-0127\-semijoin\-equivalence\-classes\.md`\.
+    - Filed: M0146\-0128\. Ledgered: multi\-relation RHS, outside\-outside / inside\-inside derivations, RHS columns above a semijoin\.
+Movement: yes — CATEGORIES-EXCL-MATCH parameterisation SF0\.25 21 → 20, SF1 28 → 27 \(TPC\-DS Q14\); `ea-ratchet` 7 → 1
+- [ ] **M0146\-0128 — one clause per equivalence class when every special join is a SEMI join**
+  \(filed 2026\-10\-09 by M0146\-0127\)\. TPC\-DS Q14 now joins as PG but keeps `Join Filter: \(store\_sales\.ss\_item\_sk =
+  cross\_items\.ss\_item\_sk\)` at the store\_sales probe: above the unique\-ified RHS both the WHERE equality and the semijoin qual of the
+  same class are applied\. PG\'s generate\_join\_implied\_equalities emits one\. goopg\'s `restrictInfoList\.ecReduce` is off whenever
+  any special join exists \(relfromjoinlist\.go\), but M0146\-0022\'s own rule is "no special join can null\-extend a class member" — a
+  SEMI join null\-extends nothing\. Regress subselect\'s VALUES\-IN EXPLAINs show the same redundant pair\.
+  Kind: impl
+  Parent: M0146-0127
+  - First step: set ecReduce when every SpecialJoinInfo is JoinSemi; check the chosen member never reads a semijoin\-consumed RHS
+    \(clausesFor already filters derived clauses\); fire\-set both scales\.
+  - Also: Q14\'s `item\_pkey` probe is a Bitmap Heap Scan where PG uses an Index Scan \(PG cost 8\.30 for one row\)\.
