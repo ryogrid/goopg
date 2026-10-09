@@ -30430,11 +30430,19 @@ Movement: none — recon: two mechanisms located and filed \(M0146\-0141, M0146\
       \(goopg\'s branch partial pick misses its store member; ledgered\)\.
     - Design: `docs/design/0100\-0149/m0146\-0137\-parallel\-append\-grouping\-member\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 38 → 37, join\-method 17 → 16, parameterisation 18 → 17, aggregation\-strategy 6 → 5, sort\-strategy 17 → 16, parallelism 19 → 18; SF1 each of the same six −1 \(TPC\-DS Q66 → match\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0138 — grouping sets: Gather Merge order, per\-set hashed cost and hash\_mem limit \(TPC\-DS Q67, Q18\)**
+- [x] **M0146\-0138 — grouping sets: Gather Merge order, per\-set hashed cost and hash\_mem limit \(TPC\-DS Q67, Q18\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q67 SF0\.25: `groupClauseItems` \(querypathkeys\.go\) returns nil for GROUPING SETS, so the worker\-Sort \+ Gather Merge rollup \(\~19628\.7, 81 cheaper\) is never filed; Q67 SF1: MixedAggregate adds a one\-table hash price \(\+1103\.0\) instead of per\-set \(\~2233\.8\) and escapes hash\_mem \(PG builds no hashed path\); Q18 SF1: the sorted rollup \(\+8\.27\) is dropped before the ORDER BY comparison\.
   Kind: impl
   Parent: M0146-0014a
   - First step: re\-check the no\-split hashed arm in partialaggupper\.go against groupingSetsHashedCost / groupingSetsHashTooBig\.
+  - Done 2026\-10\-09 \(5aab293b7\): two mechanisms\.
+    - groupingSetsClauseItems: query pathkeys = the first rollup\'s order \(standard\_qp\_callback\) → Q67\'s worker\-sorted Gather
+      Merge; FD pruning skipped for grouping sets\.
+    - electOrderedGrouping runs under a LIMIT fraction with several untranslated candidates, so the pick follows the ORDER BY
+      Sort as in PG → Q18 SF1\'s sorted rollup\.
+    - Q67 → MATCH both scales; Q18 SF1 6 → 3 categories; the MixedAggregate per\-set hash cost / hash\_mem itself is ledgered\.
+    - Design: `docs/design/0100\-0149/m0146\-0138\-grouping\-sets\-query\-pathkeys\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 sort\-strategy 16 → 15, parallelism 18 → 17, match 52 → 53; SF1 join\-order 47 → 46, join\-method 19 → 17, aggregation\-strategy 12 → 10, sort\-strategy 21 → 19, parallelism 36 → 34, qual\-placement 9 → 10, match 38 → 39; ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0139 — hash join build batching cost \(TPC\-DS Q79\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg\'s customer Hash charges no batching \(startup 5104\.0\); PG\'s 100000\-row build \(\~9\.8 MB > 8 MB hash\_mem\) splits into 2 batches \(\~7100\), so PG keeps its customer\_pkey nested loop \(5248\.4\)\. B8 also pushes goopg away from the NL\.
   Kind: impl
