@@ -30418,11 +30418,18 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH qual\-placement SF1 10 → 9 \(TPC\-DS
       never derives \(adjust\_group\_pathkeys\_for\_groupagg\)\. Filed M0146\-0142\.
     - Design: `docs/design/0100\-0149/m0146\-0136\-missing\-candidates\-q72\-q95\.md`\.
 Movement: none — recon: two mechanisms located and filed \(M0146\-0141, M0146\-0142\); no plan changed
-- [ ] **M0146\-0137 — Parallel Append prices a non\-partial member at per\-worker cost \(TPC\-DS Q66\)**
+- [x] **M0146\-0137 — Parallel Append prices a non\-partial member at per\-worker cost \(TPC\-DS Q66\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg puts two serial GroupAggregate branches under a Parallel Append and prices them at per\-worker scale \(`Seq Scan catalog\_sales` 10521\.57 vs its serial 12962\.97\), 13758\.93 vs PG\'s 20447\.03; PG cannot build this \(the grouped child\'s only input is a non\-parallel\-safe Gather\) — add\_paths\_to\_append\_rel\.
   Kind: impl
   Parent: M0146-0014a
   - First step: check the non\-partial member costing and parallel\-safety of a Gather\-fed member in goopg\'s parallel append builder\.
+  - Done 2026\-10\-09 \(e26c2f481\): setOpBranchPick gives a kept\-subquery member \(SetOp\.appendMember\*\) that aggregates over a
+    Gather no non\-partial pick — PG\'s Finalize\-over\-Gather path is never parallel\_safe and grouping leaves no partial path\.
+    - Q66 → MATCH \[rendering\] at both scales; results identical\.
+    - Bounded to aggregating members: dropping the strip for kept\-subquery JOIN members too cost Q76 its Parallel Append
+      \(goopg\'s branch partial pick misses its store member; ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0137\-parallel\-append\-grouping\-member\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 38 → 37, join\-method 17 → 16, parameterisation 18 → 17, aggregation\-strategy 6 → 5, sort\-strategy 17 → 16, parallelism 19 → 18; SF1 each of the same six −1 \(TPC\-DS Q66 → match\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0138 — grouping sets: Gather Merge order, per\-set hashed cost and hash\_mem limit \(TPC\-DS Q67, Q18\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q67 SF0\.25: `groupClauseItems` \(querypathkeys\.go\) returns nil for GROUPING SETS, so the worker\-Sort \+ Gather Merge rollup \(\~19628\.7, 81 cheaper\) is never filed; Q67 SF1: MixedAggregate adds a one\-table hash price \(\+1103\.0\) instead of per\-set \(\~2233\.8\) and escapes hash\_mem \(PG builds no hashed path\); Q18 SF1: the sorted rollup \(\+8\.27\) is dropped before the ORDER BY comparison\.
   Kind: impl
