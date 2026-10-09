@@ -79,6 +79,28 @@ records at HEAD `05897eb09`:
   - M0146-0148, a sub-joinlist hands its whole pathlist up (Q72 SF1);
     this is the open pathlist half of ledger row M0127-P5.9-a.
 
+## 2026-10-10, second refresh (M0146-0014c)
+
+`analysis/m0146/m0146-0014/routing-20261010b/ROUTING.md` covers 100
+records at HEAD `1fd148e3a`:
+
+| scale | match | divergent |
+|---|---|---|
+| SF0.25 | 56 | 43 |
+| SF1 | 42 | 57 |
+
+- **Since 0014b.** Q36, Q86 and Q95 now match at both scales
+  (M0146-0146, M0146-0147). Q72 SF1 is COSTTIE (M0146-0148's
+  measurement). Every other record carries its route unchanged.
+- **Filed: M0146-0149** (Q70 at both scales).
+  - PG's `cost_incremental_sort` clamps its input to at least 2 tuples and
+    sets the path's rows from the clamped value.
+  - That makes Q70's 1-row window subquery 2 rows, so PG hashes it in a
+    semi join, where goopg runs it as a 1-row nested-loop outer.
+- **Route counts:** B8 32, COSTTIE 30, RELPAGES 16, B-15 7,
+  RENDERING 5, PARAM-APPEND 2, GEQO-RNG 2, INCSORT-ROWS 2, and four
+  single records.
+
 ## Closing condition
 
 M0146-0014 closes when a sweep finds every record routed **and** the filed

@@ -30629,3 +30629,23 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH scan\-type SF0\.25 23 → 22, SF1 33 �
     - Fire set: no query moves; regress A/B unchanged; TPC\-H identical\.
     - Design: `docs/design/0100\-0149/m0146\-0148\-subproblem\-pathlist\.md`\.
 Movement: none — mechanism matches PG \(sub\-problem rel\'s ordered paths cross\); Q72 SF1 election is a sub\-unit near\-tie \(COSTTIE\)
+- [x] **M0146\-0014c — parity\-closure sweep: routing refresh 2026\-10\-10 \(b\)** \(HEAD `1fd148e3a`; M0146\-0014 stays open
+  as the milestone\'s exit report\)\.
+  Kind: recon
+  Parent: M0146-0014
+  - Done 2026\-10\-10: 100 first\-divergence records \(SF0\.25 43, SF1 57; match 56 / 42\) all routed —
+    `analysis/m0146/m0146\-0014/routing\-20261010b/ROUTING\.md`\.
+    - Changed since 0014b: Q36/Q86/Q95 MATCH; Q72 SF1 → COSTTIE \(M0146\-0148 measurement\); Q70 ×2 → new M0146\-0149\.
+    - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md` §2026\-10\-10 second refresh\.
+Movement: none — recon
+- [ ] **M0146\-0149 — an Incremental Sort path\'s rows are its clamped input tuples \(TPC\-DS Q70\)**
+  \(filed 2026\-10\-10 by M0146\-0014c\)\. PG\'s cost\_incremental\_sort \(costsize\.c:2025, :2121\) clamps input\_tuples to ≥ 2 and
+  sets path\->rows = input\_tuples, so an Incremental Sort over a 1\-row input carries 2 rows\. Q70\'s window subquery tmp1 is
+  therefore 2 rows in PG \(WindowAgg, Subquery Scan\) and is hashed in a Hash Semi Join; goopg\'s incremental sort keeps
+  sub\.Rows \(1\), and its unique\-ified 1\-row NL outer wins \(38257\.76 vs PG 38304\.53 at SF0\.25; SF1 same signature\)\.
+  Kind: impl
+  Parent: M0146-0014c
+  - Expected movement: Q70 first divergence `\[join\-method\] under MixedAggregate` at both scales \(2 records\); any plan with
+    an Incremental Sort over < 2 estimated rows may move — measured by the fire set\.
+  - First step: apply the clamp to the path rows in incrementalsortpaths\.go \(and every other Incremental Sort producer, e\.g\.
+    the window input in buildWindowStage, so the node\'s EXPLAIN rows agree\); fire set both scales\.
