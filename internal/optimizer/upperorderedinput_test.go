@@ -597,3 +597,22 @@ func TestAggregateEmissionPathkeysClaimsAnExpressionGroupKey(t *testing.T) {
 		t.Fatalf("claim must be output position 0 ascending, got %+v", got[0])
 	}
 }
+
+// TestInputNodePathkeysCrossesASortedUnique is M0146-0133:
+// create_upper_unique_path sets `pathkeys = subpath->pathkeys`, and
+// distinctOnOp streams the first row of each run in arrival order, so a sorted
+// Unique delivers its Sort's keys to the ORDER BY above (TPC-DS Q49's union
+// dedup under an Incremental Sort). A hashed DistinctOn (a semijoin RHS's
+// HashAggregate) emits in no order and claims none.
+func TestInputNodePathkeysCrossesASortedUnique(t *testing.T) {
+	keys := upperOrderedKeys()
+	srt := &Sort{Child: upperOrderedInput(10), Keys: keys}
+	uniq := &DistinctOn{Child: srt, KeyCols: []int{0}, schema: srt.Output()}
+	if got := inputNodePathkeys(uniq); len(got) != len(keys) {
+		t.Fatalf("a sorted Unique keeps its input's keys: got %d, want %d", len(got), len(keys))
+	}
+	hashed := &DistinctOn{Child: srt, KeyCols: []int{0}, schema: srt.Output(), Hashed: true}
+	if got := inputNodePathkeys(hashed); got != nil {
+		t.Fatalf("a hashed DistinctOn must claim no order, got %d keys", len(got))
+	}
+}
