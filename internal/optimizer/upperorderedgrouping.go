@@ -305,7 +305,14 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 			anyTranslated = true
 		}
 	}
-	if !anyTranslated {
+	// With no candidate translating, every one needs the same Sort on the
+	// same rows, so the loop could only re-price — EXCEPT under a LIMIT
+	// fraction: the grouping step already picked by fraction BEFORE the
+	// ORDER BY Sort, where a hashed candidate's early startup counts, while
+	// PG's final rel compares the candidates after it, where each Sort's
+	// startup is its total (M0146-0138: TPC-DS Q18's sorted rollup
+	// GroupAggregate lost to a MixedAggregate this way).
+	if !anyTranslated && !(tupleFraction > 0 && len(cands) > 1) {
 		return decline("anyTranslated=false")
 	}
 

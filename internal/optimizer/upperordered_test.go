@@ -903,3 +903,44 @@ func TestElectOrderedGroupingStillDeclinesAnEmptyRel(t *testing.T) {
 		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d", beforeLen, len(after.Pathlist))
 	}
 }
+
+// TestElectOrderedGroupingRunsUnderAFractionWithoutTranslation is
+// M0146-0138: with no candidate's emission order translating, every one needs
+// the same ORDER BY Sort, so the loop used to decline as a pure re-price. Under
+// a LIMIT fraction that is wrong: the grouping step picked by fraction BEFORE
+// the Sort, where a hashed candidate's early startup wins, while PG's final
+// rel compares the candidates after it, where each Sort's startup is its
+// total (TPC-DS Q18 SF1: the sorted rollup lost to a MixedAggregate). The
+// loop now runs and elects the lower-total candidate.
+func TestElectOrderedGroupingRunsUnderAFractionWithoutTranslation(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 100)
+	grouped.ConsiderStartup = true
+	mkSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	// No pathkeys on the sorted candidate's input: its emission does not
+	// translate, like a grouping-sets rollup's.
+	sorted := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 69000, Total: 70000}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	hashed := &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 50000, Total: 71000}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	addPath(grouped, sorted, "test")
+	addPath(grouped, hashed, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
+		t.Fatalf("without a fraction the untranslated loop must decline (ok=%v)", ok)
+	}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 100, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("under a LIMIT fraction the loop declined; want the post-Sort election")
+	}
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want the lower-total sorted candidate", agg.node.Strategy)
+	}
+}

@@ -164,7 +164,11 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	}
 	sets := queryPathkeySets{}
 	sets.sort = presearchPathkeys(sortClauseItems(s), s, ctx)
-	sets.group = pruneUselessGroupPathkeys(presearchPathkeys(groupClauseItems(s), s, ctx), ctx)
+	sets.group = presearchPathkeys(groupClauseItems(s), s, ctx)
+	if s.GroupingSets == nil {
+		// remove_useless_groupby_columns returns early for grouping sets.
+		sets.group = pruneUselessGroupPathkeys(sets.group, ctx)
+	}
 	sets.window = presearchPathkeys(windowClauseItems(s), s, ctx)
 	sets.distinct = presearchPathkeys(distinctClauseItems(s), s, ctx)
 	// `setop_pathkeys` is upstream's `qp_extra->setop`: the grouping order a
@@ -269,8 +273,11 @@ func sortClauseItems(s *parser.SelectStmt) []presearchSortItem {
 // question), so there is no "first rollup" to read and claiming the union's
 // ordering would over-state what any one set delivers.
 func groupClauseItems(s *parser.SelectStmt) []presearchSortItem {
-	if len(s.GroupBy) == 0 || s.GroupingSets != nil {
+	if len(s.GroupBy) == 0 {
 		return nil
+	}
+	if s.GroupingSets != nil {
+		return groupingSetsClauseItems(s)
 	}
 	// M0145-0008d: processedGroupOrder is the one derivation of the processed
 	// group clause, shared with Aggregate.GroupClause (groupclause.go). Besides
@@ -287,6 +294,62 @@ func groupClauseItems(s *parser.SelectStmt) []presearchSortItem {
 	}
 	for _, it := range order {
 		items = append(items, presearchSortItem{expr: s.GroupBy[it.idx], desc: it.desc, nullsFirst: it.nullsFirst})
+	}
+	return items
+}
+
+// groupingSetsClauseItems is standard_qp_callback's grouping-sets arm
+// (planner.c): "with grouping sets, just use the first RollupData's
+// groupClause" as group_pathkeys. The first rollup is the one the aggregate
+// builder elects (ExtractGroupingRollups over the sets as GROUP BY slots,
+// steered by ORDER BY through groupingSetsSortSlots), so the search is asked
+// for the order the sorted rollup sorts its input on. M0146-0138: TPC-DS
+// Q67's ROLLUP is fed by a worker-sorted Gather Merge in PG; without these
+// pathkeys goopg filed no sorted partial path and sorted above a Gather.
+// A set member that names no GROUP BY item, or a first rollup with no
+// columns (only the grand total), gives no pathkeys.
+func groupingSetsClauseItems(s *parser.SelectStmt) []presearchSortItem {
+	gs := s.GroupingSets
+	if gs == nil || len(gs.Sets) == 0 {
+		return nil
+	}
+	sets := make([][]int, 0, len(gs.Sets))
+	for _, set := range gs.Sets {
+		idxs := make([]int, 0, len(set))
+		seen := map[int]bool{}
+		for _, e := range set {
+			hit := -1
+			for i, g := range s.GroupBy {
+				if parserSortExprEqual(g, e, s) {
+					hit = i
+					break
+				}
+			}
+			if hit < 0 {
+				return nil
+			}
+			if !seen[hit] {
+				seen[hit] = true
+				idxs = append(idxs, hit)
+			}
+		}
+		sortIntsAscending(idxs)
+		sets = append(sets, idxs)
+	}
+	ident := make([]int, len(s.GroupBy))
+	for i := range ident {
+		ident[i] = i
+	}
+	rollups := ExtractGroupingRollups(sets, groupingSetsSortSlots(s, ident, len(s.GroupBy)))
+	if len(rollups) == 0 || len(rollups[0].Order) == 0 {
+		return nil
+	}
+	items := make([]presearchSortItem, 0, len(rollups[0].Order))
+	for _, gi := range rollups[0].Order {
+		if gi < 0 || gi >= len(s.GroupBy) {
+			return nil
+		}
+		items = append(items, defaultSortItem(s.GroupBy[gi]))
 	}
 	return items
 }

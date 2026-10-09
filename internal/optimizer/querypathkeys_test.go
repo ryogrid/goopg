@@ -261,12 +261,12 @@ func TestDeriveQueryPathkeys(t *testing.T) {
 			want: []string{"a/ASC/NL", "b/ASC/NL"},
 		},
 		{
-			// Grouping sets are declined whole: goopg has no rollup list to
-			// read a "first rollup's groupClause" from, and the flattened
-			// union over-states what any one set delivers.
-			name: "grouping sets decline",
+			// M0146-0138: grouping sets take the first rollup's groupClause
+			// (standard_qp_callback) — ExtractGroupingRollups over the sets
+			// as GROUP BY slots, the same rollup the aggregate elects.
+			name: "grouping sets use the first rollup",
 			sql:  "SELECT a, b, count(*) FROM t GROUP BY ROLLUP(a, b)",
-			want: nil,
+			want: []string{"a/ASC/NL", "b/ASC/NL"},
 		},
 		{
 			// A key naming no column of the searched relations ends the list.
@@ -509,5 +509,29 @@ func TestAddOrderedIndexPathsGateIsANoOpForTodaysProducer(t *testing.T) {
 	s.addOrderedIndexPaths(cat)
 	if got := orderedPathsOf(rel); len(got) != 0 {
 		t.Fatalf("got %d ordered index paths for a non-mergeable join clause; want 0", len(got))
+	}
+}
+
+// TestDeriveQueryPathkeysGroupingSetsUseTheFirstRollup is M0146-0138:
+// standard_qp_callback takes group_pathkeys from the first rollup's
+// groupClause when the query has grouping sets, so the search is asked for the
+// order the sorted rollup sorts its input on (TPC-DS Q67's worker-sorted
+// Gather Merge under its ROLLUP). The chain is shortest set first — GROUPING
+// SETS ((b), (a, b)) sorts on b, then a — and a lone grand total asks for
+// nothing.
+func TestDeriveQueryPathkeysGroupingSetsUseTheFirstRollup(t *testing.T) {
+	ctx := qpkCtx(t)
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{"SELECT a, b, count(*) FROM t GROUP BY ROLLUP(a, b)", []string{"a/ASC/NL", "b/ASC/NL"}},
+		{"SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((b), (a, b))", []string{"b/ASC/NL", "a/ASC/NL"}},
+		{"SELECT count(*) FROM t GROUP BY GROUPING SETS (())", nil},
+	} {
+		got := deriveQueryPathkeys(qpkParse(t, tc.sql), ctx)
+		if !qpkEqual(got, tc.want) {
+			t.Errorf("%s: query pathkeys = %v, want %v", tc.sql, qpkKeys(got), tc.want)
+		}
 	}
 }
