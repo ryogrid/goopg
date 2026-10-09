@@ -30483,7 +30483,7 @@ Movement: none — harness fix \(1419b3106\): Q36/Q86 now produce plan records o
     - Restored the ea\-ratchet M0146\-0140 broke: plans\-pg Q36/Q70/Q86 stubs recaptured from :65438 \(2 NEW → back to 1\)\.
     - Design: `docs/design/0100\-0149/m0146\-0141\-searched\-leaf\-rows\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 10 → 9; SF0\.25 unchanged; match SF0\.25 53, SF1 39 unchanged; ea\-ratchet 1 \(restored from 3\)
-- [ ] **M0146\-0142 — query\_pathkeys from ordered aggregates \(adjust\_group\_pathkeys\_for\_groupagg\) \(TPC\-DS Q95 SF0\.25\)**
+- [x] **M0146\-0142 — query\_pathkeys from ordered aggregates \(adjust\_group\_pathkeys\_for\_groupagg\) \(TPC\-DS Q95 SF0\.25\)**
   \(filed 2026\-10\-09 by M0146\-0136\)\. standard\_qp\_callback builds group\_pathkeys from an ordered/DISTINCT aggregate and makes them
   query\_pathkeys, so generate\_useful\_gather\_paths sorts partial paths on them — Q95\'s `Gather Merge \(Sort ws1\.ws\_order\_number\)`
   feeds `count\(DISTINCT ws1\.ws\_order\_number\)` with no Sort\. goopg\'s deriveQueryPathkeys has no ordered\-aggregate arm \(empty
@@ -30493,6 +30493,13 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 10 → 9; SF0\.25 
   Parent: M0146-0136
   - First step: add the arm to querypathkeys\.go deriveQueryPathkeySets reusing presortedAggKeysOrAbsent\'s DISTINCT/ORDER BY key
     choice \(PG: adjust\_group\_pathkeys\_for\_groupagg, planner\.c\)\.
+  - Done 2026\-10\-09 \(68627d4cc\): querypathkeys\.go adjustGroupPathkeysForGroupAgg \(parser\-level twin of
+    presortedAggKeysOrAbsent; shared greedy loop bestCoveringAggPathkeys\); the AGG\_PLAIN arm takes no Sort over an input
+    already ordered on the presorted keys \(make\_ordered\_path\)\.
+    - Q95 SF0\.25: 6 categories → \[scan\-type\] \(web\_returns\_pkey Index Scan vs PG Index Only Scan, also the SF1 residual\)\.
+    - Declines: a GROUP BY item or an ordered aggregate key that is not a searched column keeps the group keys \(ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0142\-ordered\-aggregate\-query\-pathkeys\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-method 18 → 17, parameterisation 17 → 16, sort\-strategy 17 → 16, parallelism 19 → 18; SF1 unchanged; match 53/39 unchanged; ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0143 — aggregates used only inside a window spec or a CASE are never collected \(TPC\-DS Q70\)**
   \(filed 2026\-10\-09 by M0146\-0140\)\. collectAggregateCalls \(planner\.go\) walks targets/HAVING/ORDER BY through walkExpr, which
   descends only BinaryOp/UnaryOp/Cast/Is\*/FuncCall args\. `rank\(\) over \(order by sum\(b\)\) \.\.\. group by a` and
