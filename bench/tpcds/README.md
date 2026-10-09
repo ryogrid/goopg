@@ -303,8 +303,15 @@ hand — including the committed baselines under `analysis/leftdeep-joins/` — 
 ## Oracle file format
 
 `tpcds-results-sf025/oracle.txt`, one line per query: `q|status|rows|ck|secs`
-where status ∈ `OK | TIMEOUT | PG_ERROR | SKIP_QUERYGEN | MISSING`. Only `OK`
-entries are compared; everything else is skipped with the reason echoed.
+where status ∈ `OK | TIMEOUT | PG_ERROR | SKIP_QUERYGEN | SKIP_ENGINE_GAP | MISSING`.
+Only `OK` entries are compared; everything else is skipped with the reason echoed.
+`SKIP_ENGINE_GAP` (the script's `ENGINE_GAP` list) keeps PG's `rows`/`ck` for a
+query goopg cannot run yet, so its fix flips the row to `OK` without a new PG
+run. `SKIP_QUERYGEN` no longer occurs: Q36/Q70/Q86 failed on PG only because
+`tpcds-setup.sh` wrapped the whole query, `limit 100;` included, in
+`select * from (...) as sub`; `scripts/tpcds_fix_loch_queries.py` now moves the
+final ORDER BY/LIMIT outside the wrapper, and the sweep re-applies it to an
+older generated tree (M0146-0140).
 Multi-statement templates (Q14/Q23/Q24/Q39) sum the per-statement top-node
 `actual rows=` — the parser matches `actual rows=` specifically because the
 same plan line carries the planner's *estimated* `rows=` first.

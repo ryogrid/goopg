@@ -144,7 +144,16 @@ CKSUM="${SCRIPT_DIR}/tpcds-result-checksum.py"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 CG_UNIT="goopg-tpcds-sf025"
 
-PG_SKIP="36 70 86"   # dsqgen artefacts; fail on upstream PG too
+# dsqgen artefacts that fail on upstream PG too. Empty since M0146-0140:
+# Q36/Q70/Q86 failed only because tpcds-setup.sh's subquery wrapper swallowed
+# their `limit 100;` (now scripts/tpcds_fix_loch_queries.py).
+PG_SKIP="${PG_SKIP:-}"
+# Queries PG answers but goopg cannot run yet. The oracle still captures PG's
+# rows and ck, under status SKIP_ENGINE_GAP, so the sweep skips them (any
+# non-OK status is a skip) and the fix flips the row to OK without a new PG
+# run. Q70: an aggregate used only inside a window's PARTITION BY/ORDER BY is
+# never collected ("aggregate call could not be resolved", M0146-0143).
+ENGINE_GAP="${ENGINE_GAP:-70}"
 
 GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${SF025_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
 PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${SF025_PG_DB}"
@@ -498,8 +507,20 @@ result_rows_ck() {
     echo "$(sed -n 's/.*rows=\([0-9]*\).*/\1/p' <<<"$out") $(sed -n 's/.*ck=\([^ ]*\).*/\1/p' <<<"$out")"
 }
 
+# The query files are generated, gitignored data (tpcds-setup.sh). A tree
+# generated before M0146-0140 still holds Q36/Q70/Q86 with `limit 100;`
+# inside the subquery wrapper, which no engine parses, while the oracle now
+# carries real rows for them. The helper is idempotent, so repairing them
+# in place here keeps an older checkout's sweep comparable.
+ensure_query_fixes() {
+    python3 -I "${SCRIPT_DIR}/tpcds_fix_loch_queries.py" \
+        "${QDIR}/query36.sql" "${QDIR}/query70.sql" "${QDIR}/query86.sql" >/dev/null \
+        || die "cannot repair Q36/Q70/Q86 under ${QDIR} (scripts/tpcds_fix_loch_queries.py)"
+}
+
 cmd_oracle() {
     guard_sf1_sweep
+    ensure_query_fixes
     # cmd_oracle TRUNCATES the fixture. A partial re-capture under QUERIES would
     # therefore delete the other 98 rows, silently turning the gate into a
     # 1-query no-op — so a subset capture must name its own output file.
@@ -561,6 +582,8 @@ cmd_oracle() {
             # with no ERROR:/FATAL: prefix — it must not be captured as an OK
             # oracle cell with the error text's "row count". Only rc==0 is OK.
             status="PG_NOCONN"; rows=0
+        elif grep -qw "$q" <<<"${ENGINE_GAP}"; then
+            status="SKIP_ENGINE_GAP"; read -r rows ck < <(result_rows_ck "$res" "$qf")
         else
             status="OK"; read -r rows ck < <(result_rows_ck "$res" "$qf")
             okc=$((okc+1)); [[ "$rows" == "0" ]] && zero=$((zero+1))
@@ -867,6 +890,7 @@ sf025_plan_channel() {
 # -------------------------------------------------------------------- sweep
 cmd_sweep() {
     guard_sf1_sweep
+    ensure_query_fixes
     [[ -s "${ORACLE}" ]] || die "run oracle first"
     [[ -d "${SF025_GOOPG_DATA}" ]] || die "run load-goopg first"
     mkdir -p "${OUTDIR}"

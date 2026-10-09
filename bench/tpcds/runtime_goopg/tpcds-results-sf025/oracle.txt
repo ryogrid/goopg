@@ -11,6 +11,8 @@
 #     the boundary tie group, so the query stays row-count-only (design D3).
 # This file is GIT-TRACKED as a pinned fixture so other machines/CI can skip
 # the ~3 min PG capture. Re-run 'oracle' only when the dataset or queries change.
+# 2026-10-09 M0146-0140: rows 36/70/86 re-captured (QUERIES=36,70,86 SF025_ORACLE=...) after the
+#     setup's query wrapper was fixed; the other 96 rows are the capture above, unchanged.
 1|OK|100|n/a|15.187
 2|OK|2513|c372ff12ff0235d9|0.176
 3|OK|30|3bb31a49b1b21bf7|0.019
@@ -46,7 +48,7 @@
 33|OK|100|n/a|0.096
 34|OK|87|9fbbae9bf5176a02|0.050
 35|OK|100|n/a|0.356
-36|SKIP_QUERYGEN|0|n/a|0
+36|OK|100|n/a|0.145
 37|OK|0|1f18d650d205d71d|0.017
 38|OK|1|77188220d949e451|0.323
 39|OK|32|9adc1bf3ad0f084c|0.761
@@ -80,7 +82,7 @@
 67|OK|100|n/a|2.037
 68|OK|100|n/a|0.071
 69|OK|100|n/a|0.078
-70|SKIP_QUERYGEN|0|n/a|0
+70|SKIP_ENGINE_GAP|3|7819093ce5c5545a|0.123
 71|OK|290|e9f1fcd7c28a1f8f|0.079
 72|OK|100|n/a|0.660
 73|OK|0|1f18d650d205d71d|0.051
@@ -96,7 +98,7 @@
 83|OK|1|9480cc8e8c967db7|0.109
 84|OK|4|0bd76cf1b8b345c1|0.033
 85|OK|0|1f18d650d205d71d|0.063
-86|SKIP_QUERYGEN|0|n/a|0
+86|OK|100|n/a|0.060
 87|OK|1|daa38faef432c025|0.319
 88|OK|1|565313322fa6dbbf|0.340
 89|OK|100|n/a|0.089
