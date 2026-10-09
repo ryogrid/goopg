@@ -30393,11 +30393,17 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH sort\-strategy SF0\.25 20 → 19, SF1 
       drift, ledgered\)\.
     - Design: `docs/design/0100\-0149/m0146\-0134\-pathkeys\-through\-equivalence\-classes\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-method 18 → 17, sort\-strategy 19 → 17, qual\-placement 6 → 4, match 50 → 51; SF1 sort\-strategy 23 → 22, join\-method 18 → 20, qual\-placement 9 → 10 \(Q4/Q11 near\-tie\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0135 — a parameterised semijoin inner keeps the class\'s join filter \(TPC\-DS Q95\)**
+- [x] **M0146\-0135 — a parameterised semijoin inner keeps the class\'s join filter \(TPC\-DS Q95\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG keeps `ws1\.ws\_order\_number = ws\_wh\_1\.ws\_order\_number` as a Join Filter on the parameterised semijoin RHS \(get\_joinrel\_parampathinfo\); goopg drops it \(hash join 167485\.02 vs PG 169714\.13 at SF1\)\.
   Kind: impl
   Parent: M0146-0014a
   - First step: compare the parameterised RHS clause set with PG\'s ppi\_clauses for Q95\.
+  - Done 2026\-10\-09 \(a6704d1d8\): paramJoinFilterClauses derives get\_joinrel\_parampathinfo\'s regenerated `Z\.Z = X\.X` clause
+    \(probe side unparameterised, hashed side\'s probe enforces the class\); Path\.ParamFilter → qual cost \+ Join Filter bound by
+    the nested loop \(paramSink bind callback\)\.
+    - Q95 SF1 → \[scan\-type\] only; results identical at both scales\.
+    - Design: `docs/design/0100\-0149/m0146\-0135\-param\-hashjoin\-ec\-filter\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH qual\-placement SF1 10 → 9 \(TPC\-DS Q95\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0136 — recon: missing candidates in TPC\-DS Q72 \(SF1\) and Q95 \(SF0\.25\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q72 SF1 hash\-joins `d3` \(\+3229, 548 rows vs PG 2\) where a 5\-probe nested loop would cost \~61; Q95 SF0\.25 stays serial \(8450\) while its own parallel estimate is \~7\.7k \(it goes parallel at SF1\)\. Both look like candidates never generated\.
   Kind: recon
