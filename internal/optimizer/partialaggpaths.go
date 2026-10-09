@@ -335,7 +335,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 
 	nAggs := len(agg.Aggs)
 	nGroupCols := len(agg.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child, agg)
+	inWidth := aggInputPGWidth(child, agg)
 	strategy := agg.Strategy
 
 	t := &partialAggTournament{
@@ -348,7 +348,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	// ── the PARTIAL arm: create_agg_path(… AGGSPLIT_INITIAL_SERIAL …),
 	// planner.c:7606. Per-worker rows in, per-worker groups out.
 	partialCost := costAgg(cp, strategy, perWorkerRows, seed.Cost.Startup, seed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+		nGroupCols, partialGroups, nAggs, inWidth)
 	partialPath := &Path{
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
@@ -389,7 +389,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, strategy, t.crossedRows, gatherAbove.Startup, gatherAbove.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, finalGroups, nAggs, inWidth),
 		Children: []*Path{gatherPath},
 	}
 	addPath(grouped, t.split, partialAggSplitProducer)
@@ -410,7 +410,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, strategy, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, finalGroups, nAggs, inWidth),
 		Children: []*Path{nsGather},
 	}
 	addPath(grouped, t.noSplit, partialAggNoSplitProducer)

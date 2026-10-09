@@ -374,11 +374,11 @@ func TestHashJoinBucketWalkIsCharged(t *testing.T) {
 func TestCostAggHashSpillInertBelowThreshold(t *testing.T) {
 	cp := defaultCostParams()
 	// 1000 groups of ~100 bytes is ~100KB against a multi-MB work_mem.
-	fits := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 8, 100)
-	// The same call with BOTH width inputs the arm keys on removed must
-	// agree: with no ncols and no payload there is nothing to size an entry
-	// with, and the arm declines (the `addDistinctPaths` opt-out).
-	blind := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 0, 0)
+	fits := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 100)
+	// The same call with no input width must agree: with no width there is
+	// nothing to size an entry with, and the arm declines (the
+	// `addDistinctPaths` opt-out).
+	blind := costAgg(cp, AggStrategyHashed, 1e6, 0, 1000, 2, 1000, 1, 0)
 	if !approxCost(fits.Total, blind.Total) || !approxCost(fits.Startup, blind.Startup) {
 		t.Fatalf("in-memory grouping was charged for spill: %+v vs unpriced %+v", fits, blind)
 	}
@@ -391,8 +391,8 @@ func TestCostAggHashSpillInertBelowThreshold(t *testing.T) {
 func TestCostAggHashSpillChargedAboveThreshold(t *testing.T) {
 	cp := defaultCostParams()
 	// 200M groups x ~120B/entry vastly exceeds any work_mem: guaranteed spill.
-	spilled := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 8, 100)
-	blind := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 0, 0)
+	spilled := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 100)
+	blind := costAgg(cp, AggStrategyHashed, 4e8, 0, 1e6, 2, 2e8, 1, 0)
 	if spilled.Total <= blind.Total {
 		t.Fatalf("spilling grouping not charged: %v <= %v", spilled.Total, blind.Total)
 	}
@@ -409,7 +409,7 @@ func TestCostAggHashSpillChargedAboveThreshold(t *testing.T) {
 	// The sorted rival must now be able to win a large grouping. Same input,
 	// but the sorted arm pays a Sort in its inputTotal — give it a generous
 	// one and it should still beat the spilling hash.
-	sorted := costAgg(cp, AggStrategySorted, 4e8, 0, 5e6, 2, 2e8, 1, 8, 100)
+	sorted := costAgg(cp, AggStrategySorted, 4e8, 0, 5e6, 2, 2e8, 1, 100)
 	if sorted.Total >= spilled.Total {
 		t.Fatalf("sorted still cannot win a spilling grouping: sorted=%v hashed=%v",
 			sorted.Total, spilled.Total)
@@ -420,13 +420,14 @@ func TestCostAggHashSpillChargedAboveThreshold(t *testing.T) {
 // formulas (nodeAgg.c:1701 hash_agg_entry_size, :1809 hash_agg_set_limits,
 // :412 hash_choose_num_partitions) on worked values.
 func TestHashAggEntrySizeAndLimits(t *testing.T) {
-	// MAXALIGN(16 + 100) = 120, plus 2 trans * 16 = 32 -> 152.
-	if got := hashAggEntrySize(2, 100); got != 152 {
-		t.Fatalf("hashAggEntrySize(2,100) = %v, want 152", got)
+	// TupleHashEntrySize 16 + MAXALIGN(16 + 100) = 120, plus 2 trans * 16
+	// = 32 -> 168.
+	if got := hashAggEntrySize(2, 100); got != 168 {
+		t.Fatalf("hashAggEntrySize(2,100) = %v, want 168", got)
 	}
-	// MAXALIGN(16 + 101) = 120 as well (117 rounds to 120).
-	if got := hashAggEntrySize(0, 101); got != 120 {
-		t.Fatalf("hashAggEntrySize(0,101) = %v, want 120", got)
+	// MAXALIGN(16 + 101) = 120 as well (117 rounds to 120) -> 136.
+	if got := hashAggEntrySize(0, 101); got != 136 {
+		t.Fatalf("hashAggEntrySize(0,101) = %v, want 136", got)
 	}
 	cp := defaultCostParams()
 	// Fits: early return hands back the whole budget and no partitions.
@@ -454,12 +455,12 @@ func TestHashAggEntrySizeAndLimits(t *testing.T) {
 // cpu_tuple_cost that cost_agg's AGG_SORTED arm charges.
 func TestCostAggSortedWithoutAggregatesIsCostGroup(t *testing.T) {
 	cp := defaultCostParams()
-	got := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 0, 0, 0)
+	got := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 0, 0)
 	want := Cost{Startup: 5, Total: 100 + cp.cpuOperatorCost*2*1000}
 	if got != want {
 		t.Errorf("no aggregates: got %+v want %+v", got, want)
 	}
-	withAgg := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 1, 0, 0)
+	withAgg := costAgg(cp, AggStrategySorted, 1000, 5, 100, 2, 10, 1, 0)
 	if withAgg.Total <= got.Total {
 		t.Errorf("an aggregating sorted path must cost more: %+v vs %+v", withAgg, got)
 	}

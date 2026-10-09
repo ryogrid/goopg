@@ -501,9 +501,8 @@ func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inp
 // per input tuple, final once, emit once. No third enum value exists, by
 // the same zero-value discipline that keeps ungrouped nodes hashed today.)
 // Inputs mirror upstream's: per-aggregate trans/final costs, group-column
-// count, group count, and the input's cost/rows. inNcols/inAvgVarBytes are
-// the OMITTED spill arm's future inputs (kept so the resume does not
-// re-plumb callers) — see the NO-spill note at the function tail.
+// count, group count, and the input's cost/rows. inWidth is the spill arm's
+// `input_width` — the aggregate input's pathtarget width (see the tail).
 //
 // AggClauseCosts (F3): goopg's catalog HAS procost but the planner never
 // reads it, so trans charges cpu_operator_cost per aggregate per input row
@@ -517,12 +516,9 @@ func costIncrementalSort(cp costParams, inputCost Cost, inputTuples float64, inp
 // A spill arm DOES exist at the function tail (added by R3). `aggregateOp`
 // still aggregates in memory with no spill path; the arm's purpose is not to
 // predict goopg I/O but to express "this hash table does not fit", which the
-// tail comment explains. Both inNcols and inAvgVarBytes are LIVE inputs
-// (M0141-S2a-fix2r): together, via `hashsize.EntryBytes`, they decide whether
-// the arm fires and price its full-row entry width — the same PG-faithful
-// currency correction R120 shipped and R124 §7 deleted for measuring
-// net-neutral is reinstated permanently by owner ruling (see the tail
-// comment).
+// tail comment explains. inWidth decides whether the arm fires and sizes
+// both its hash entry and its spilled pages, as `input_width` does in PG
+// (M0141-S2a-fix2r-a; see the tail comment).
 // costAggSortedRollup is cost_agg's AGG_SORTED arm as create_groupingsets_path
 // (pathnode.c) charges it for a grouping-sets rollup (M0146-0009o). Unlike
 // costAgg it never turns an aggregate-free grouping into cost_group's Group
@@ -544,7 +540,7 @@ func costAggSortedRollup(cp costParams, inputRows, inputStartup, inputTotal floa
 	return Cost{Startup: inputStartup, Total: total}
 }
 
-func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inNcols int, inAvgVarBytes float64) Cost {
+func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inWidth int) Cost {
 	tuples := inputRows
 	if tuples < 0 {
 		tuples = 0
@@ -612,45 +608,28 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	// Note the arm is INERT below the memory threshold: `hashAggSetLimits`
 	// returns early when the groups fit, which collapses nbatches to 1 and
 	// depth to 0, so a grouping that fits prices bit-identically to before.
-	// Byte currency of this arm (M0137-0009, reinstated M0141-S2a-fix2r):
-	// `hashAggEntrySize`'s parameter is a tuple WIDTH and the `pages` term
-	// below cites `relation_byte_size(input_tuples, input_width)`. PG hands
-	// one and the same `input_width` to both (costsize.c:2801-2802, :2824),
-	// and the SORTED rival is priced in that same currency on both sides —
-	// PG via `cost_tuplesort` (costsize.c:1903), Goopg via
-	// `hashsize.EntryBytes` (48*ncols + 24 + avgVar) in
-	// `costSortRunWithWidth`. `hashsize.EntryBytes(inNcols, inAvgVarBytes)`
-	// is that same full-row currency, substituted here so the hashed-vs-
-	// sorted spill contest is priced in ONE currency rather than the
-	// payload-only figure this arm used to hand `hashAggEntrySize` alone.
+	// Byte currency of this arm (M0141-S2a-fix2r-a): PG hands one and the
+	// same `input_width` — the input path's pathtarget width — to
+	// `hash_agg_entry_size` and to the `relation_byte_size` pages term
+	// (costsize.c:2801-2802, :2824). inWidth is that width: the
+	// `get_typavgwidth` sum over the columns the aggregate reads
+	// (`aggInputPGWidth`), so the arm fires exactly when PG's hash table
+	// outgrows hash_mem.
 	//
-	// History: R120 shipped this exact correction
-	// (`hashAggTupleWidth`/`hashsize.EntryBytes` keyed on `inNcols`) behind
-	// default-off `GOOPG_HASHAGG_WIDTH_CURRENCY`, on the hypothesis that it
-	// needed pairing with ncols narrowing (R124) to be net-positive on
-	// TPC-DS. R124 §7 ran the pair and measured it identical to R120's arm
-	// alone, so R124 deleted the flag (r124-nontable-leaf-widths/REPORT.md
-	// §7) rather than carry it another round. M0141-S2a-fix2 re-attempted the
-	// identical substitution after fix1 supplied a live-at-cost-time
-	// `inNcols` (M0141-S2a-fix1's `agg.InputTarget` preview), measured it a
-	// SECOND time (still net-neutral on TPC-H, a lateral 3-category swing on
-	// TPC-DS Q31 that exactly cancelled fix1's own gain — see
-	// m0141-s2a-fix2-hashaggentrysize-currency-attempt.md), and reverted the
-	// code pending an owner ruling on category-neutral-but-PG-faithful
-	// changes. **M0141-S2a-fix2r (owner Q4) re-applies it permanently**: a
-	// PG-faithful currency correction is not withdrawn because the category
-	// scoreboard does not move in its favour, only because it produces wrong
-	// rows (it does not — the arm only ever charges extra I/O cost, never
-	// changes which rows a plan returns). Any query whose categories worsen
-	// under this arm is tracked as its own `Parent: M0141-S2a-fix2r` task,
-	// not grounds to revert this one.
-	if strategy == AggStrategyHashed && (inNcols > 0 || inAvgVarBytes > 0) {
-		// hashAggEntrySize adds its own MAXALIGN(SizeofMinimalTupleHeader)
-		// exactly as PG's hash_agg_entry_size does (nodeAgg.c:1706-1707).
-		// The (0, 0) case (inNcols == 0 && inAvgVarBytes == 0) still declines
-		// — `addDistinctPaths` has no per-column width estimate to hand this
-		// call, and there is no PG-faithful width to substitute for "unknown".
-		width := hashsize.EntryBytes(inNcols, inAvgVarBytes)
+	// History: M0141-S2a-fix2r priced both terms in
+	// `hashsize.EntryBytes(ncols, avgVar)` (48*ncols + 24 + avgVar), goopg's
+	// executor-row footprint, reasoning that the SORTED rival is priced in
+	// that currency too. But PG prices the rival in `input_width` as well,
+	// and the executor footprint is about 5x PG's width: TPC-DS Q4's
+	// `year_total` store arm (2.6M groups) priced a 3 GB hash table, spilled,
+	// and lost to a parallel sort where PG's 213-byte rows fit in 1 GB and
+	// hash. The fix2r guard widening (a fixed-width input prices a real
+	// footprint) stands: any known width fires the arm. inWidth == 0 means
+	// "no width estimate" (`addDistinctPaths`) and still declines.
+	//
+	// The arm never changes which rows a plan returns, only its cost.
+	if strategy == AggStrategyHashed && inWidth > 0 {
+		width := float64(inWidth)
 		entry := hashAggEntrySize(nAggs, width)
 		memLimit, ngroupsLimit, numPartitions := hashAggSetLimits(cp, entry, groups)
 		nbatches := math.Max(groups*entry/memLimit, groups/ngroupsLimit)
@@ -660,9 +639,9 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 		}
 		depth := math.Ceil(math.Log(nbatches) / math.Log(float64(numPartitions)))
 		if depth > 0 {
-			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`, in
-			// the same full-row currency as `entry` above.
-			pages := tuples * width / float64(blockSizeBytes)
+			// `relation_byte_size(input_tuples, input_width) / BLCKSZ`.
+			bytes, _ := pgRelationByteSize(tuples, inWidth)
+			pages := bytes / float64(blockSizeBytes)
 			// "HashAgg has somewhat worse IO behavior than Sort on typical
 			// hardware/OS combinations" — PG's explicit generic penalty.
 			written := pages * depth * 2.0
@@ -678,13 +657,10 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 }
 
 // hashAggEntrySize is `hash_agg_entry_size` (nodeAgg.c:1701): the bytes one
-// group occupies in the aggregate's hash table.
-//
-// Known PG divergence (R120): PG also adds `TupleHashEntrySize()`
-// (`sizeof(TupleHashEntryData)`, nodeAgg.c:1726-1730, executor.h:165)
-// unconditionally. goopg omits it. That is a pre-existing UNDER-charge and is
-// immaterial beside the `48*ncols` term, but this function claims PG fidelity,
-// so the gap is recorded rather than left for the next reader to rediscover.
+// group occupies in the aggregate's hash table — `TupleHashEntrySize()`
+// (sizeof(TupleHashEntryData), 16 bytes: executor.h:165, execnodes.h:842),
+// the MAXALIGNed minimal tuple, and one AggStatePerGroupData per transition.
+// (Before M0141-S2a-fix2r-a the TupleHashEntrySize term was omitted.)
 //
 // transitionSpace is 0 — goopg
 // has no per-aggregate transition-space estimate, and PG's own expression
@@ -692,6 +668,7 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 // never invent a spill that PG would not see.
 func hashAggEntrySize(numTrans int, tupleWidth float64) float64 {
 	const (
+		tupleHashEntrySize       = 16 // sizeof(TupleHashEntryData)
 		sizeofMinimalTupleHeader = 16 // MAXALIGN(SizeofMinimalTupleHeader)
 		perGroupDataSize         = 16 // sizeof(AggStatePerGroupData)
 		maxAlign                 = 8
@@ -699,7 +676,7 @@ func hashAggEntrySize(numTrans int, tupleWidth float64) float64 {
 	tupleSize := float64(sizeofMinimalTupleHeader) + tupleWidth
 	// MAXALIGN(tupleSize)
 	tupleChunk := math.Ceil(tupleSize/maxAlign) * maxAlign
-	return tupleChunk + float64(numTrans*perGroupDataSize)
+	return tupleHashEntrySize + tupleChunk + float64(numTrans*perGroupDataSize)
 }
 
 // hashAggSetLimits is `hash_agg_set_limits` (nodeAgg.c:1809). `cp.workMem` is

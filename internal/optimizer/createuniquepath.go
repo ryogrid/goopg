@@ -345,7 +345,7 @@ func finishPulledUniquePath(rel *RelOptInfo, subpath *Path, keyCols []int, bound
 
 	if hashEntry := float64(pathWidth(subpath) + 64); hashEntry*numGroups <= float64(cp.workMem) {
 		aggCost := costAgg(cp, AggStrategyHashed, rel.Rows, subpath.Cost.Startup, subpath.Cost.Total,
-			len(keyCols), numGroups, 0, pathNCols(subpath), pathAvgVarBytes(subpath))
+			len(keyCols), numGroups, 0, pathWidth(subpath))
 		if subpath.DisabledNodes < best.DisabledNodes ||
 			(subpath.DisabledNodes == best.DisabledNodes && aggCost.Total < best.Cost.Total) {
 			best = &Path{

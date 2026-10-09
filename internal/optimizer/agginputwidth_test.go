@@ -175,3 +175,48 @@ func TestSortSeedKeepsFullWidthWhenNoNarrowingIsDerivable(t *testing.T) {
 			inNcols, len(child.Output()))
 	}
 }
+
+// TestAggInputPGWidthReadsStawidth pins M0141-S2a-fix2r-a: the spill arm's
+// `input_width` sizes each kept column as PG's `set_rel_width` sizes a Var —
+// the ANALYZE stawidth when positive, else the type's average width — over
+// the searched input rel's per-column map. Before, the arm priced goopg's
+// executor row (`hashsize.EntryBytes`, 48 bytes per column plus payload).
+func TestAggInputPGWidthReadsStawidth(t *testing.T) {
+	searched := func() Node {
+		j := &Join{
+			Left: &SeqScan{Table: statsTable("pw_a", 1000), schema: Schema{
+				{Name: "g", Type: catalog.Type{Name: "int4"}},
+				{Name: "v", Type: catalog.Type{Name: "text"}},
+			}},
+			Right: &SeqScan{Table: statsTable("pw_b", 1000), schema: Schema{
+				{Name: "junk1", Type: catalog.Type{Name: "text"}},
+				{Name: "w", Type: catalog.Type{Name: "text"}},
+			}},
+		}
+		j.schema = append(append(Schema{}, j.Left.Output()...), j.Right.Output()...)
+		markSearchedTree(j)
+		rel := newRelOptInfo(RelSet(3), 1000, 100)
+		// v has a stawidth; w has a zero one (all NULL), which
+		// get_attavgwidth ignores in favour of the type width.
+		rel.ColVarBytes = map[string]float64{"g": 4, "v": 9.7, "junk1": 50, "w": 0}
+		j.setSearchRel(rel)
+		return j
+	}
+	child := searched()
+	agg := &Aggregate{
+		Child:      child,
+		GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "g"}, &ColumnRef{Index: 3, Name: "w"}},
+		Aggs:       []AggregateCall{{Name: "sum", Arg: &ColumnRef{Index: 1, Name: "v"}}},
+		Mode:       AggModeSimple,
+	}
+	agg.InputTarget, agg.InputTargetKnown = []int{0, 1, 3}, true
+	// g 4 + v trunc(9.7)=9 + w typeWidth(text) — junk1 is not read.
+	if got, want := aggInputPGWidth(child, agg), 4+9+varlenaDefaultWidth; got != want {
+		t.Fatalf("aggInputPGWidth = %d, want %d", got, want)
+	}
+	// With no searched rel every column takes its type width.
+	plain := awChild()
+	if got, want := aggInputPGWidth(plain, nil), 4+3*varlenaDefaultWidth; got != want {
+		t.Fatalf("aggInputPGWidth(no stats) = %d, want %d", got, want)
+	}
+}

@@ -19,6 +19,8 @@ package optimizer
 // (`createAggPlan`, createplansimple.go).
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -435,6 +437,53 @@ func aggInputWidth(child Node, agg *Aggregate) (ncols int, avgVarBytes float64) 
 	return len(cols), nodeAvgVarBytes(cols)
 }
 
+// aggInputPGWidth is the PG width of the same input row aggInputWidth sizes —
+// the input path's `pathtarget->width`, the `input_width` cost_agg's spill arm
+// hands to `hash_agg_entry_size` and to `relation_byte_size`
+// (costsize.c:2801-2802, :2824; M0141-S2a-fix2r-a).
+//
+// Each column is sized as `set_rel_width` sizes a Var (costsize.c:6253):
+// `get_attavgwidth`'s ANALYZE stawidth when it is positive, else
+// `get_typavgwidth` (`typeWidth`). The stawidths are the searched input
+// rel's per-column map (`ColVarBytes`, filled from ColumnStats.AvgWidth); a
+// column it does not name falls back to its type width.
+func aggInputPGWidth(child Node, agg *Aggregate) int {
+	if child == nil {
+		return 0
+	}
+	cols := child.Output()
+	if agg != nil && agg.InputTargetKnown {
+		kept := make(Schema, 0, len(agg.InputTarget))
+		for _, idx := range agg.InputTarget {
+			if idx >= 0 && idx < len(cols) {
+				kept = append(kept, cols[idx])
+			}
+		}
+		cols = kept
+	}
+	if len(cols) == 0 {
+		return 0
+	}
+	var stawidths map[string]float64
+	if sr := searchedJoinInputRelOf(child); sr != nil {
+		stawidths = sr.ColVarBytes
+	}
+	w := 0
+	for _, c := range cols {
+		// stawidth is an int32 in pg_statistic; ANALYZE truncates its
+		// average the same way.
+		if sw := int(stawidths[strings.ToLower(c.Name)]); sw > 0 {
+			w += sw
+			continue
+		}
+		w += typeWidth(c.Type)
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
 // addGroupingPaths is the per-input body of `add_paths_to_grouping_rel`
 // (planner.c:7114) for goopg's one input: at most one hashed, one sorted
 // (Sort- or index-driven), and one plain candidate. Single candidate per
@@ -445,6 +494,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
 	numGroups := grouped.Rows
 	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	inWidth := aggInputPGWidth(child, aggNode)
 	// M0144-0003c: the Sort beneath a grouping candidate must be priced on the
 	// SAME narrowed row the aggregate above it is priced on.
 	//
@@ -531,7 +581,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAgg(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
-				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
+				0, 1, len(plainSpec.Aggs), inWidth),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
 		return
@@ -618,7 +668,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
-						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inNcols, inAvgVar),
+						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth),
 					Pathkeys: sorted.Pathkeys, Children: []*Path{&sorted},
 				}, groupAggSortedProducer)
 				isSorted = true // upstream offers no Sort over this same path
@@ -650,7 +700,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth),
 					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 				}, groupAggSortedProducer)
 			}
@@ -691,7 +741,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,
 						Cost: costAgg(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
-							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inNcols, inAvgVar),
+							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth),
 						Pathkeys: groupPathkeys, Children: []*Path{in},
 					}, groupAggSearchProducer)
 				}
@@ -707,7 +757,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Rel: grouped, Rows: numGroups,
 					DisabledNodes: ma.DisabledNodes,
 					Cost: costAgg(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
-						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inNcols, inAvgVar),
+						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inWidth),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{ma},
 				}, groupAggMergeProducer)
 			}
@@ -729,12 +779,12 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				if c, ok := searchRelIndexPathCost(child, idxChild); ok {
 					idxSeed.Cost = c
 				}
-				idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
+				idxWidth := aggInputPGWidth(idxChild, idxSpec)
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
-						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
+						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxWidth),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
 			}
@@ -784,7 +834,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				mSpec.Rollups = mixedSorted
 				mSpec.HashedRollups = mixedHashed
 				c, dis, ok := costMixedRollups(cp, &mSpec, mixedHashed, mixedSorted, sortSeed, inputRows,
-					input.Cost.Startup, input.Cost.Total, inNcols, inAvgVar, ps.EnableHashAgg)
+					input.Cost.Startup, input.Cost.Total, inWidth, ps.EnableHashAgg)
 				if !ok {
 					return
 				}
@@ -847,9 +897,9 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
 		hashCost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar)
+			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inWidth)
 		if aggNode.GroupingSets != nil {
-			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inNcols, inAvgVar); ok {
+			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inWidth); ok {
 				hashCost = c
 			}
 		}
@@ -898,7 +948,7 @@ func groupingSetsHashTooBig(cp costParams, a *Aggregate, seed *Path, numGroups f
 // columns, with the summed group count, charged every set's groups to one
 // table and lost the regress `groupingsets` cases' MixedAggregate to a
 // Sort-fed GroupAggregate once the summed count reached the input.
-func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup, inputTotal float64, inNcols int, inAvgVar float64) (Cost, bool) {
+func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup, inputTotal float64, inWidth int) (Cost, bool) {
 	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
 	if !ok {
 		return Cost{}, false
@@ -919,7 +969,7 @@ func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup
 		}
 		g := float64(perSet[i])
 		if first {
-			cost = costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(set), g, nAggs, inNcols, inAvgVar)
+			cost = costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(set), g, nAggs, inWidth)
 			if mixed {
 				// cost_agg AGG_MIXED: the sorted arm's startup plus the
 				// spill tail's startup share (the hashed arm's startup less
@@ -931,7 +981,7 @@ func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup
 			first = false
 			continue
 		}
-		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(set), g, nAggs, inNcols, inAvgVar)
+		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(set), g, nAggs, inWidth)
 		cost.Total += c.Total
 	}
 	if first {

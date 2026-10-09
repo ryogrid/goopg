@@ -281,7 +281,7 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
 		Cost: costAgg(cp, AggStrategyHashed, inputRows, seed.Cost.Startup, seed.Cost.Total,
-			len(child.Output()), numDistinct, 0, 0, 0),
+			len(child.Output()), numDistinct, 0, 0),
 		Children: []*Path{seed},
 	}
 
@@ -540,7 +540,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Rel: partialRel, Rows: partialGroups,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
 		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-			len(cols), partialGroups, 0, 0, 0),
+			len(cols), partialGroups, 0, 0),
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
 		Children:        []*Path{pseed},

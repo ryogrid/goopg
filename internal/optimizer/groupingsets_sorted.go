@@ -205,7 +205,7 @@ func discreteKnapsack(maxWeight int, weights []int) map[int]bool {
 // enable_hashagg = off counts every hashed rollup, enable_sort = off every
 // rollup sort.
 func costMixedRollups(cp costParams, a *Aggregate, hashed, sorted []GroupingRollup, seed *Path,
-	inputRows, inputStartup, inputTotal float64, inNcols int, inAvgVar float64, enableHashAgg bool) (Cost, int, bool) {
+	inputRows, inputStartup, inputTotal float64, inWidth int, enableHashAgg bool) (Cost, int, bool) {
 	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
 	if !ok || len(hashed) == 0 || len(sorted) == 0 {
 		return Cost{}, 0, false
@@ -217,12 +217,12 @@ func costMixedRollups(cp costParams, a *Aggregate, hashed, sorted []GroupingRoll
 	}
 	h0 := hashed[0]
 	cost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(h0.Order),
-		rollupGroupCount(perSet, h0), nAggs, inNcols, inAvgVar)
+		rollupGroupCount(perSet, h0), nAggs, inWidth)
 	blocking := inputTotal + cp.cpuOperatorCost*float64(nAggs)*inputRows +
 		cp.cpuOperatorCost*float64(len(h0.Order))*inputRows
 	cost.Startup = inputStartup + (cost.Startup - blocking)
 	for _, r := range hashed[1:] {
-		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(r.Order), rollupGroupCount(perSet, r), nAggs, inNcols, inAvgVar)
+		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(r.Order), rollupGroupCount(perSet, r), nAggs, inWidth)
 		cost.Total += c.Total
 	}
 	c := costAggSortedRollup(cp, inputRows, 0, 0, len(sorted[0].Order), rollupGroupCount(perSet, sorted[0]), nAggs)

@@ -415,10 +415,10 @@ func TestR56TracedDecompositionPins(t *testing.T) {
 
 	// The upper adds, isolated by pricing over a zero input.
 	sortedAdd := costAgg(cp, AggStrategySorted, leaderRows, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("sorted upper add", sortedAdd, 58.76, 0.01)
 	hashedAdd := costAgg(cp, AggStrategyHashed, leaderRows, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("hashed upper add", hashedAdd, 58.76, 0.01)
 	if sortedAdd != hashedAdd {
 		t.Errorf("sorted/hashed upper adds differ (%f vs %f): a strategy-dependent "+
@@ -427,11 +427,11 @@ func TestR56TracedDecompositionPins(t *testing.T) {
 	// The partial add prices per-worker rows into per-worker groups (no
 	// reduction at this level: 1468 groups out of 1468 rows).
 	partialAdd := costAgg(cp, AggStrategyHashed, workerRows, 0, 0,
-		nGroupCols, partialGroups, nAggs, 0, 0).Total
+		nGroupCols, partialGroups, nAggs, 0).Total
 	near("partial add", partialAdd, 33.03, 0.01)
 	// The split finalize prices the crossed group-states (1468×4=5872).
 	finalizeAdd := costAgg(cp, AggStrategyHashed, workerRows*workers, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("split finalize add", finalizeAdd, 58.75, 0.01)
 
 	// The margin itself: the leader Sort at N=5874.
@@ -1076,7 +1076,7 @@ func TestPartialGroupLowering(t *testing.T) {
 func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	grouped, partialRel *RelOptInfo, pseed *Path, cp costParams,
 	workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) {
+	nGroupCols, nAggs, inWidth int) {
 	t.Helper()
 	cp = ps.costParams()
 	u := newUpperRels()
@@ -1123,19 +1123,19 @@ func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	pseed.ParallelWorkers = workers
 	nGroupCols = len(agg.GroupExprs)
 	nAggs = len(agg.Aggs)
-	inNcols, inAvgVar = aggInputWidth(child, agg)
+	inWidth = aggInputPGWidth(child, agg)
 	return grouped, partialRel, pseed, cp, workers, d, perWorkerRows, partialGroups,
-		finalGroups, nGroupCols, nAggs, inNcols, inAvgVar
+		finalGroups, nGroupCols, nAggs, inWidth
 }
 
 // fileSortedInput calls the slice-3 arm directly on a fresh rel — the only
 // candidate on it — and returns the filed path.
 func fileSortedInput(t *testing.T, agg *Aggregate, ps PlannerSettings) *Path {
 	t.Helper()
-	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 		sortedInputCtx(t, agg, ps)
 	sorted := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-		workers, d, pwr, pg, fg, ngc, na, inc, iav)
+		workers, d, pwr, pg, fg, ngc, na, inw)
 	if sorted == nil {
 		t.Fatal("sorted-input arm returned nil — the merge-key gate refused")
 	}
@@ -1270,10 +1270,10 @@ func TestUpperSplitSortedInputArmRefusals(t *testing.T) {
 	// file anything.
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	agg.GroupExprs[0] = &IntegerConst{Value: 7}
-	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 		sortedInputCtx(t, agg, upperSplitSettings())
 	if got := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-		workers, d, pwr, pg, fg, ngc, na, inc, iav); got != nil {
+		workers, d, pwr, pg, fg, ngc, na, inw); got != nil {
 		t.Error("sorted-input arm filed over a group expr no merge key can name")
 	}
 	if len(grouped.Pathlist) != 0 {
@@ -1316,15 +1316,15 @@ func TestUpperSplitSortedInputArmElection(t *testing.T) {
 	defer restore()
 
 	contest := func(agg *Aggregate, wm int64) (*RelOptInfo, *Path, *Path) {
-		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 			sortedInputCtx(t, agg, upperSplitSettings())
 		if wm > 0 {
 			cp.workMem = wm
 		}
 		si := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+			workers, d, pwr, pg, fg, ngc, na, inw)
 		sp := addPartialAggSortedSplitArm(grouped, partialRel, pseed, agg, cp,
-			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+			workers, d, pwr, pg, fg, ngc, na, inw)
 		return grouped, si, sp
 	}
 
@@ -1582,12 +1582,12 @@ func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
 
 	ps := upperSplitSettings()
 	survives := func(agg *Aggregate, inputTotal float64, enableSort bool) bool {
-		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inc, iav := sortedInputCtx(t, agg, ps)
+		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inw := sortedInputCtx(t, agg, ps)
 		if inputTotal > 0 {
 			pseed.Cost = Cost{Startup: 0.4, Total: inputTotal}
 		}
 		cp.enableSort = enableSort
-		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inc, iav)
+		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inw)
 	}
 
 	// Expensive input: the worker sort is inside the fuzz.

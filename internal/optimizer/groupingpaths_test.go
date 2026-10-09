@@ -38,7 +38,7 @@ func TestCostAggArmsExactTerms(t *testing.T) {
 	fin := cp.cpuOperatorCost * naggs * groups
 	emit := cp.cpuTupleCost * groups
 
-	sorted := costAgg(cp, AggStrategySorted, rows, inStart, inTotal, ncols, groups, naggs, 8, 0)
+	sorted := costAgg(cp, AggStrategySorted, rows, inStart, inTotal, ncols, groups, naggs, 8)
 	if !approx(sorted.Startup, inStart) {
 		t.Fatalf("sorted startup = %v, want input startup %v (streams)", sorted.Startup, inStart)
 	}
@@ -46,7 +46,7 @@ func TestCostAggArmsExactTerms(t *testing.T) {
 		t.Fatalf("sorted total = %v, want %v", sorted.Total, want)
 	}
 
-	hashed := costAgg(cp, AggStrategyHashed, rows, inStart, inTotal, ncols, groups, naggs, 8, 0)
+	hashed := costAgg(cp, AggStrategyHashed, rows, inStart, inTotal, ncols, groups, naggs, 8)
 	if want := inTotal + trans + cmp; !approx(hashed.Startup, want) {
 		t.Fatalf("hashed startup = %v, want %v (blocking)", hashed.Startup, want)
 	}
@@ -61,8 +61,8 @@ func TestCostAggArmsExactTerms(t *testing.T) {
 // "sorted startup < hashed startup" would pass with a broken total too.
 func TestCostAggSortedHashedShareTotalCpu(t *testing.T) {
 	cp := defaultCostParams()
-	sorted := costAgg(cp, AggStrategySorted, 50000, 200, 800, 3, 500, 1, 8, 0)
-	hashed := costAgg(cp, AggStrategyHashed, 50000, 200, 800, 3, 500, 1, 8, 0)
+	sorted := costAgg(cp, AggStrategySorted, 50000, 200, 800, 3, 500, 1, 8)
+	hashed := costAgg(cp, AggStrategyHashed, 50000, 200, 800, 3, 500, 1, 8)
 	if sorted.Total != hashed.Total {
 		t.Fatalf("sorted total %v != hashed total %v: the arms must share total CPU exactly (roundoff breaks the startup-only rule)", sorted.Total, hashed.Total)
 	}
@@ -71,27 +71,22 @@ func TestCostAggSortedHashedShareTotalCpu(t *testing.T) {
 	}
 }
 
-// TestCostAggHashedFixedWidthChargesSpill pins M0141-S2a-fix2r's reinstated
-// "Arm C": a FIXED-width aggregate input (avgVarBytes == 0, ncols known and
-// > 0) has a real 48*ncols+24 footprint in PG's currency
-// (`hashsize.EntryBytes`), so a group count overflowing memory now prices a
-// real spill charge even though the payload-only figure alone is zero.
+// TestCostAggHashedFixedWidthChargesSpill pins that a known input width
+// (M0141-S2a-fix2r's guard widening) prices a spill once the groups overflow
+// hash memory. The footprint is PG's `hash_agg_entry_size` on the input's
+// PG width (M0141-S2a-fix2r-a), not goopg's executor row size.
 // `aggregateOp` still aggregates in memory with no spill path — the charge
 // prices "this hash table does not fit", not goopg I/O that happens (see the
-// arm's own comment in cost_funcs.go). Formerly this fixture priced no spill
-// at all (`TestCostAggHashedNeverChargesSpill`, pre-fix2r); the sibling
+// arm's own comment in cost_funcs.go). The sibling
 // `TestCostAggHashedUnknownWidthNeverChargesSpill` below pins the opt-out
-// that survives for callers with neither ncols nor payload.
+// that survives for callers with no width.
 func TestCostAggHashedFixedWidthChargesSpill(t *testing.T) {
 	cp := defaultCostParams()
-	const ncols = 16
-	// Group footprint 4x over budget: WOULD spill if the arm existed.
-	groups := math.Ceil(4.0 * float64(cp.workMem) / hashsize.EntryBytes(ncols, 0))
+	const ncols, width = 16, 64
+	// Group footprint 4x over budget.
+	groups := math.Ceil(4.0 * float64(cp.workMem) / hashAggEntrySize(1, width))
 	rows := groups * 10
-	if hashsize.Choose(groups, ncols, 0, cp.workMem).NBatch <= 1 {
-		t.Fatalf("fixture does not overflow memory: NBatch = 1 (test setup broken)")
-	}
-	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, ncols, groups, 1, ncols, 0)
+	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, ncols, groups, 1, width)
 	trans := cp.cpuOperatorCost * rows
 	cmp := cp.cpuOperatorCost * ncols * rows
 	fin := cp.cpuOperatorCost * groups
@@ -99,24 +94,49 @@ func TestCostAggHashedFixedWidthChargesSpill(t *testing.T) {
 	inMemoryStartup := 500 + trans + cmp
 	inMemoryTotal := inMemoryStartup + fin + emit
 	if !(got.Startup > inMemoryStartup) {
-		t.Fatalf("startup = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Startup, inMemoryStartup)
+		t.Fatalf("startup = %v, want strictly above in-memory %v (spill charge missing)", got.Startup, inMemoryStartup)
 	}
 	if !(got.Total > inMemoryTotal) {
-		t.Fatalf("total = %v, want strictly above in-memory %v (fixed-width spill charge missing)", got.Total, inMemoryTotal)
+		t.Fatalf("total = %v, want strictly above in-memory %v (spill charge missing)", got.Total, inMemoryTotal)
+	}
+}
+
+// TestCostAggHashedSpillsOnPGWidthNotExecutorWidth pins M0141-S2a-fix2r-a on
+// TPC-DS Q4's `year_total` store arm at SF1: 2.6M groups of a 213-byte input
+// fit PG's 1 GB hash_mem (512MB work_mem x hash_mem_multiplier 2), so PG
+// prices no spill. goopg's executor footprint for the same 12 columns
+// (`hashsize.EntryBytes`, ~5x larger) would overflow it; the arm must not
+// read that.
+func TestCostAggHashedSpillsOnPGWidthNotExecutorWidth(t *testing.T) {
+	cp := defaultCostParams()
+	cp.workMem = 1 << 30
+	const (
+		rows   = 2624572.0
+		groups = 2624572.0
+		ncols  = 8
+		width  = 213
+	)
+	if hashsize.EntryBytes(12, 200)*groups <= float64(cp.workMem) {
+		t.Fatalf("fixture: the executor footprint must overflow hash_mem")
+	}
+	got := costAgg(cp, AggStrategyHashed, rows, 0, 1000, ncols, groups, 1, width)
+	blind := costAgg(cp, AggStrategyHashed, rows, 0, 1000, ncols, groups, 1, 0)
+	if got != blind {
+		t.Fatalf("a hash table that fits in PG's width was charged a spill: %+v vs %+v", got, blind)
 	}
 }
 
 // TestCostAggHashedUnknownWidthNeverChargesSpill pins the ONE surviving
-// opt-out from M0141-S2a-fix2r's guard widening: with NEITHER a column count
-// nor a payload estimate (`addDistinctPaths`'s call shape — DISTINCT has no
-// per-column width wired to this call), there is no PG-faithful width to
+// opt-out from M0141-S2a-fix2r's guard widening: with no width estimate
+// (`addDistinctPaths`'s call shape — DISTINCT has no per-column width wired
+// to this call), there is no PG-faithful width to
 // substitute, so the arm must decline exactly as before, however far the
 // group count overflows memory.
 func TestCostAggHashedUnknownWidthNeverChargesSpill(t *testing.T) {
 	cp := defaultCostParams()
 	const groups = 200_000_000.0 // vastly overflows any work_mem, if the arm looked.
 	rows := groups * 10
-	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, 1, groups, 1, 0, 0)
+	got := costAgg(cp, AggStrategyHashed, rows, 100, 500, 1, groups, 1, 0)
 	trans := cp.cpuOperatorCost * rows
 	cmp := cp.cpuOperatorCost * 1 * rows
 	fin := cp.cpuOperatorCost * groups

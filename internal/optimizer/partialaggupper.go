@@ -388,10 +388,10 @@ func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggN
 		traceUpperGate("agg-upper", "refused", "gate=keys route=partialgroup")
 		return nil
 	}
-	inNcols, inAvgVar := aggInputWidth(child, &unwrapped)
+	inWidth := aggInputPGWidth(child, &unwrapped)
 	return addPartialGroupArm(grouped, partialRel, pseed, &unwrapped, keyRefs, cp,
 		workers, d, perWorkerRows, partialGroups, finalGroups,
-		len(aggNode.GroupExprs), inNcols, inAvgVar)
+		len(aggNode.GroupExprs), inWidth)
 }
 
 // partial, when non-nil, is the searched rel's cheapest partial path and
@@ -572,7 +572,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	inWidth := aggInputPGWidth(child, aggNode)
 
 	// ── the SPLIT family, offered only for a DECOMPOSABLE aggregate ─────────
 	//
@@ -603,7 +603,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		}
 		hashedPartialSurvives := !sortedEligible ||
 			hashedPartialAggSurvives(pseed, aggNode, cp, ps, perWorkerRows, partialGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar)
+				nGroupCols, nAggs, inWidth)
 		// M0146-0005ak: this arm is `Finalize -> Gather -> Partial`, and a
 		// Gather interleaves the workers' streams, so only a HASHED
 		// finalize can consume it: since the row transport (M0146-0003b)
@@ -617,7 +617,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		if hashedPartialSurvives {
 			split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar, AggStrategyHashed)
+				nGroupCols, nAggs, inWidth, AggStrategyHashed)
 		}
 
 		// M0146-0003 S6: the PRESORTED split — `gather_grouping_paths`
@@ -642,7 +642,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			// partial pathlist.
 			sortedInput := addPartialAggSortedInputArm(grouped, partialRel, pseed, aggNode, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar)
+				nGroupCols, nAggs, inWidth)
 			if split == nil {
 				split = sortedInput
 			}
@@ -652,7 +652,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			if hashedPartialSurvives {
 				addPartialAggSortedSplitArm(grouped, partialRel, pseed, aggNode, cp,
 					workers, d, perWorkerRows, partialGroups, finalGroups,
-					nGroupCols, nAggs, inNcols, inAvgVar)
+					nGroupCols, nAggs, inWidth)
 			}
 		}
 	}
@@ -681,7 +681,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		if keyRefs, ok := partialGroupKeyRefs(aggNode); ok {
 			split = addPartialGroupArm(grouped, partialRel, pseed, aggNode, keyRefs, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, inNcols, inAvgVar)
+				nGroupCols, inWidth)
 		}
 	}
 
@@ -763,7 +763,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &sortSpec,
 				Rel: grouped, Rows: 1,
 				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
+					0, 1, nAggs, inWidth),
 				Pathkeys: sortedGather.Pathkeys, Children: []*Path{sortedGather},
 			}, partialAggNoSplitProducer)
 			workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
@@ -774,7 +774,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
 				Rel: grouped, Rows: 1,
 				Cost: costAgg(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
+					0, 1, nAggs, inWidth),
 				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
 			}, partialAggGatherMergeProducer)
 		} else {
@@ -790,7 +790,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 				Rel: grouped, Rows: 1,
 				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
+					0, 1, nAggs, inWidth),
 				Children: []*Path{nsGather},
 			}, partialAggNoSplitProducer)
 		}
@@ -830,7 +830,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 			Rel: grouped, Rows: finalGroups,
 			Cost: costAgg(cp, AggStrategySorted, gatheredRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+				nGroupCols, finalGroups, nAggs, inWidth),
 			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 		}, partialAggNoSplitProducer)
 
@@ -860,7 +860,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
 			Rel: grouped, Rows: finalGroups,
 			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+				nGroupCols, finalGroups, nAggs, inWidth),
 			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
 		}, partialAggGatherMergeProducer)
 	}
@@ -872,7 +872,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			Rel: grouped, Rows: finalGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
 			Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+				nGroupCols, finalGroups, nAggs, inWidth),
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
 	}
@@ -928,7 +928,7 @@ func partialGroupKeyRefs(agg *Aggregate) ([]Expr, bool) {
 // (partialGroupKeyRefs).
 func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, keyRefs []Expr,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, inWidth int) *Path {
 
 	// The worker's own sort on the group keys — `make_ordered_path`
 	// (planner.c:7644) over the partial input, through the same
@@ -955,7 +955,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &partialSpec,
 		Rel: partialRel, Rows: partialGroups,
 		Cost: costAgg(cp, AggStrategySorted, perWorkerRows, workerSort.Cost.Startup, workerSort.Cost.Total,
-			nGroupCols, partialGroups, 0, inNcols, inAvgVar),
+			nGroupCols, partialGroups, 0, inWidth),
 		DisabledNodes:   workerSort.DisabledNodes,
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
@@ -995,7 +995,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, 0, inNcols, inAvgVar),
+			nGroupCols, finalGroups, 0, inWidth),
 		Pathkeys: gmPath.Pathkeys, Children: []*Path{gmPath},
 	}
 	addPath(grouped, finalPath, partialGroupMergeProducer)
@@ -1080,13 +1080,13 @@ func subtreeRefusalKind(unsafe, gathered, noScan bool) string {
 // no-split arm above stays reachable for an aggregate that cannot be split.
 func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64, strategy AggStrategy) *Path {
+	nGroupCols, nAggs, inWidth int, strategy AggStrategy) *Path {
 	crossedRows := partialGroups * d
 
 	// PARTIAL arm — `create_agg_path(… AGGSPLIT_INITIAL_SERIAL …)`,
 	// planner.c:7606.
 	partialCost := costAgg(cp, strategy, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+		nGroupCols, partialGroups, nAggs, inWidth)
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	partialPath := &Path{
@@ -1121,7 +1121,7 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, strategy, crossedRows, gatherAbove.Startup, gatherAbove.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, finalGroups, nAggs, inWidth),
 		ParallelWorkers: workers,
 		Children:        []*Path{gatherPath},
 	}
@@ -1153,7 +1153,7 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 // honest claim rather than a translated one.
 func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, nAggs, inWidth int) *Path {
 
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
@@ -1169,7 +1169,7 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	// `strategy` deliberately does not reach this arm — a sorted spec
 	// still hashes its partial.
 	partialCost := costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+		nGroupCols, partialGroups, nAggs, inWidth)
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	partialPath := &Path{
@@ -1213,7 +1213,7 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		Kind: PathFinalizeAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, finalGroups, nAggs, inWidth),
 		Pathkeys:        append([]PathKey(nil), mergeKeys...),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
@@ -1250,7 +1250,7 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 // merged-stream order the Finalize's sorted fold consumes.
 func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, nAggs, inWidth int) *Path {
 
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
@@ -1263,7 +1263,7 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	// WORKER SORT and PARTIAL — see sortedInputPartialAgg.
 	mergeKeys := pathkeysForSortKeys(sortKeys)
 	partialPath := sortedInputPartialAgg(partialRel, pseed, aggNode, cp, workers,
-		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, mergeKeys)
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inWidth, mergeKeys)
 	partialCost := partialPath.Cost
 
 	// BOUNDARY — `cost_gather_merge` over the ordered partial streams,
@@ -1287,7 +1287,7 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		Kind: PathFinalizeAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, finalGroups, nAggs, inWidth),
 		Pathkeys:        append([]PathKey(nil), mergeKeys...),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
@@ -1314,12 +1314,12 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 // the transport-position merge keys. It inherits the Sort's disabled count,
 // as cost_agg adds its input's.
 func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, cp costParams, workers int,
-	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64, mergeKeys []PathKey) *Path {
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inWidth int, mergeKeys []PathKey) *Path {
 	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
 	workerSort.ParallelWorkers = workers
 	partialCost := costAgg(cp, AggStrategySorted, perWorkerRows,
 		workerSort.Cost.Startup, workerSort.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+		nGroupCols, partialGroups, nAggs, inWidth)
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	return &Path{
@@ -1344,17 +1344,17 @@ func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggrega
 // addToPartialPathlist's, so the fuzz, pathkeys and disabled_nodes rules are
 // the ones every other partial rival in this package is judged by.
 func hashedPartialAggSurvives(pseed *Path, aggNode *Aggregate, cp costParams, ps PlannerSettings,
-	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64) bool {
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inWidth int) bool {
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
 		return true
 	}
 	sorted := sortedInputPartialAgg(pseed.Rel, pseed, aggNode, cp, pseed.ParallelWorkers,
-		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, pathkeysForSortKeys(sortKeys))
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inWidth, pathkeysForSortKeys(sortKeys))
 	hashed := &Path{
 		Kind: PathAgg, AggStrategy: AggStrategyHashed, Rel: pseed.Rel, Rows: partialGroups,
 		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-			nGroupCols, partialGroups, nAggs, inNcols, inAvgVar),
+			nGroupCols, partialGroups, nAggs, inWidth),
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
 		ParallelSafe:  true,
 	}
