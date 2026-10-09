@@ -30321,3 +30321,68 @@ Movement: yes — CATEGORIES-EXCL-MATCH qual\-placement SF0\.25 9 → 8, SF1 10 
   - Triage this loop \(SF0\.25\): Q78 is a near\-tie \(PG prices both left\-join orders 0\.06 apart\); Q42/Q52 route to B\-15 \(btcostestimate
     log2 descent term, blocked\); Q26 Gather\-vs\-Gather Merge is a sub\-unit tie; Q4 EC member choice is the held M0146\-0022 family\.
 Movement: none — parity held: no TPC query has a constant\-false outer\-join qual; regress join 14699 → 14679, subselect 1367 → 1354 diff lines
+- [x] **M0146\-0014a — parity\-closure sweep: routing refresh 2026\-10\-09 \(TPC\-DS SF0\.25 \+ SF1\)**
+  \(the M0146\-0014 sweep at HEAD `1e6e497f5`; M0146\-0014 stays open as the milestone\'s final exit report\)\.
+  Kind: recon
+  Parent: M0146-0014
+  - Done 2026\-10\-09: all 112 first\-divergence records \(SF0\.25 50, SF1 62; match 49 / 37\) route to a live task or a
+    named owner residual — `analysis/m0146/m0146\-0014/routing\-20261009/ROUTING\.md`\.
+    - Owner residuals: COSTTIE 31 \(near\-ties\), B8 27 \(M0145\-0008ag / M0146\-0068\), RELPAGES 15 \(SF1 reload\), B\-15 7\.
+    - Re\-analysed in three read\-only plan\-text passes \(agent\-sort/partial/probe\.md\); filed M0146\-0130 … 0140\.
+    - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md`\.
+Movement: none — recon
+- [ ] **M0146\-0130 — a correlated SubPlan makes its rel parallel\-restricted \(TPC\-DS Q6, Q92\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG\'s max\_parallel\_hazard\_walker treats a SubPlan with PARAM\_EXEC args as parallel\-restricted \(set\_rel\_consider\_parallel\), so Q6 keeps `item` with its `i\_current\_price > 1\.2 \* \(SubPlan\)` qual above the Gather Merge \(probe 1513\.82, total 427656\.80\); goopg runs it in the workers and leaves the SubPlan uncosted on a Gather Filter \(18921\.80\)\. Q92 SF0\.25 likewise \(Gather 5611\.26 vs PG serial 8959\.91\)\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: find goopg\'s parallel\-safety check for rels and joinrels and test it against a correlated SubPlan qual on Q6\'s `item`\.
+- [ ] **M0146\-0131 — the LIMIT fraction selects an ordered grouping input \(TPC\-DS Q35\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG drives Q35 from Gather Merge→Sort of `customer\_address` into a GroupAggregate over an Incremental Sort presorted on `ca\_state`; its total is higher but under LIMIT 100 it costs 4\.09M vs goopg\'s 58\.33M \(SF1 26\.88M vs 781M\) — get\_cheapest\_fractional\_path on the final rel\. goopg never offers the ordered candidate to grouping\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: trace the grouping input candidates for Q35 and compare getCheapestFractionalPathOrdered with PG\'s fractional choice\.
+- [ ] **M0146\-0132 — min\_parallel\_table\_scan\_size applies to base rels only, not appendrel members \(TPC\-DS Q5\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. compute\_parallel\_worker \(allpaths\.c\) applies the size cutoff only to RELOPT\_BASEREL; goopg\'s computeParallelWorker \(considerparallel\.go\) applies it to every relation, so Q5\'s catalog\_returns \(\~721 pages\) UNION ALL member gets no partial path \(Seq Scan 1081\.66 vs PG Parallel Seq Scan 933\.15\)\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: confirm the RELOPT\_OTHER\_MEMBER\_REL branch in compute\_parallel\_worker and the caller goopg uses for appendrel members\.
+- [ ] **M0146\-0133 — a Unique keeps its input\'s pathkeys for the ORDER BY above \(TPC\-DS Q49\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG\'s Unique over the UNION keeps its Sort\'s pathkeys, so the top ORDER BY becomes an Incremental Sort \(presorted `\(\'web\'::text\)`\); goopg\'s `inputNodePathkeys` \(upperorderedinput\.go\) has no Distinct/DistinctOn arm and does a full Sort\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: add the Distinct arm to inputNodePathkeys and check Q49 at both scales\.
+- [ ] **M0146\-0134 — pathkeys match through equivalence classes \(TPC\-DS Q64\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q64\'s CTE input is ordered on `cs\_item\_sk`; PG\'s EC \(cs\_item\_sk = ss\_item\_sk = i\_item\_sk\) lets it satisfy the group key `i\_item\_sk` \(Incremental Sort over the NL\); goopg compares pathkeys by expression \(`pathKeyEqual`\) and sorts fully\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: make pathkey comparison EC\-aware where the search has the classes \(pathkeys\_contained\_in over EquivalenceClass members\)\.
+- [ ] **M0146\-0135 — a parameterised semijoin inner keeps the class\'s join filter \(TPC\-DS Q95\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG keeps `ws1\.ws\_order\_number = ws\_wh\_1\.ws\_order\_number` as a Join Filter on the parameterised semijoin RHS \(get\_joinrel\_parampathinfo\); goopg drops it \(hash join 167485\.02 vs PG 169714\.13 at SF1\)\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: compare the parameterised RHS clause set with PG\'s ppi\_clauses for Q95\.
+- [ ] **M0146\-0136 — recon: missing candidates in TPC\-DS Q72 \(SF1\) and Q95 \(SF0\.25\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q72 SF1 hash\-joins `d3` \(\+3229, 548 rows vs PG 2\) where a 5\-probe nested loop would cost \~61; Q95 SF0\.25 stays serial \(8450\) while its own parallel estimate is \~7\.7k \(it goes parallel at SF1\)\. Both look like candidates never generated\.
+  Kind: recon
+  Parent: M0146-0014a
+  - First step: DP\-trace both on private clones \(addPath records for the d3 parameterised probe and the partial leaf\)\.
+- [ ] **M0146\-0137 — Parallel Append prices a non\-partial member at per\-worker cost \(TPC\-DS Q66\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg puts two serial GroupAggregate branches under a Parallel Append and prices them at per\-worker scale \(`Seq Scan catalog\_sales` 10521\.57 vs its serial 12962\.97\), 13758\.93 vs PG\'s 20447\.03; PG cannot build this \(the grouped child\'s only input is a non\-parallel\-safe Gather\) — add\_paths\_to\_append\_rel\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: check the non\-partial member costing and parallel\-safety of a Gather\-fed member in goopg\'s parallel append builder\.
+- [ ] **M0146\-0138 — grouping sets: Gather Merge order, per\-set hashed cost and hash\_mem limit \(TPC\-DS Q67, Q18\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Q67 SF0\.25: `groupClauseItems` \(querypathkeys\.go\) returns nil for GROUPING SETS, so the worker\-Sort \+ Gather Merge rollup \(\~19628\.7, 81 cheaper\) is never filed; Q67 SF1: MixedAggregate adds a one\-table hash price \(\+1103\.0\) instead of per\-set \(\~2233\.8\) and escapes hash\_mem \(PG builds no hashed path\); Q18 SF1: the sorted rollup \(\+8\.27\) is dropped before the ORDER BY comparison\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: re\-check the no\-split hashed arm in partialaggupper\.go against groupingSetsHashedCost / groupingSetsHashTooBig\.
+- [ ] **M0146\-0139 — hash join build batching cost \(TPC\-DS Q79\)**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. goopg\'s customer Hash charges no batching \(startup 5104\.0\); PG\'s 100000\-row build \(\~9\.8 MB > 8 MB hash\_mem\) splits into 2 batches \(\~7100\), so PG keeps its customer\_pkey nested loop \(5248\.4\)\. B8 also pushes goopg away from the NL\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: re\-decide M0139\-0007a\'s held\-off spill arm \(`GOOPG\_PG\_HASH\_TUPLE\_SPILL\_COST`\) with a fire set\.
+- [ ] **M0146\-0140 — harness: the plan capture fails on TPC\-DS Q36, Q70 and Q86**
+  \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Both engines report `syntax error at or near ";"` at `limit 100;` in the capture wrapper\'s generated SQL, so these three are capture errors, not plan records, at both scales\.
+  Kind: impl
+  Parent: M0146-0014a
+  - First step: read the wrapper the fire set uses \(scripts/jointree\-parity\-capture\.sh / tpcds\-fireset\-gate\.sh\) and strip the statement\'s trailing `;` before wrapping it\.
