@@ -2165,6 +2165,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// uncorrelated sublink conjunct becomes a Result's One-Time Filter above
 	// the scope's FROM tree instead of a per-row Filter (create_gating_plan).
 	node = gatePseudoconstantQuals(node, cat)
+	// M0146-0129: an outer join whose ON clause is constant FALSE / NULL
+	// never reads its nullable side; PG plans that side as a dummy rel
+	// (populate_joinrel_with_paths' JOIN_LEFT arm).
+	node = dummyConstantFalseOuterJoinSides(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer

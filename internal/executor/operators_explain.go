@@ -1400,6 +1400,22 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			}
 			node = c
 			continue
+		case *optimizer.Result:
+			// M0146-0129: a childless Result — a dummy rel (an outer join's
+			// constant-false nullable side) or a FROM-less projection —
+			// computes its outputs from its targets alone, so a computed
+			// target is the source text, exactly as for a Project:
+			// regress join.sql's `((1) IS NULL)` over `Result  One-Time
+			// Filter: false`.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || n.Child != nil || col.Index < 0 || col.Index >= len(n.Targets) {
+				return nil, false
+			}
+			t := n.Targets[col.Index]
+			if _, isCol := t.(*optimizer.ColumnRef); isCol || exprHasSubplanOrOuterRef(t) || exprHasTableZeroRef(t) {
+				return nil, false
+			}
+			return t, true
 		case *optimizer.Project:
 			if n.IsolatedScope {
 				return nil, false
@@ -3350,6 +3366,12 @@ func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 	if residual == nil {
 		return ""
 	}
+	// M0146-0129: a lone constant prints bare — show_qual deparses the
+	// qual as written and ruleutils never parenthesizes a Const
+	// (`Join Filter: false` over a dummy nullable side).
+	if isLiteralOneTimeFilterConst(residual) {
+		return formatExprQual(residual, reg, qualify)
+	}
 	return wrapParen(formatExprQual(residual, reg, qualify))
 }
 
@@ -3648,6 +3670,10 @@ func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
 		return !x.Negated && optimizer.SublinkIsInitPlan(x)
 	case *optimizer.SubqueryExpr:
 		return optimizer.SublinkIsInitPlan(x)
+	case *optimizer.CastExpr:
+		// M0146-0129: `NULL::boolean` is a NULL Const in PG (printed bare).
+		_, isNull := x.Operand.(*optimizer.NullConst)
+		return isNull && x.Explicit
 	}
 	return false
 }
@@ -5392,6 +5418,11 @@ func explicitCastText(x *optimizer.CastExpr, reg *subPlanReg, qualify bool) (str
 	}
 	if lit, isLit := coercibleLiteral(x.Operand); isLit {
 		return castLiteralConstText(lit, strings.ToLower(x.TargetType), x.Typmod, typ)
+	}
+	// M0146-0129: `NULL::boolean` is a NULL Const of the target type after
+	// parse analysis; get_const_expr prints it `NULL::boolean`, unwrapped.
+	if _, isNull := x.Operand.(*optimizer.NullConst); isNull {
+		return "NULL::" + typ, true
 	}
 	return "(" + formatExprQual(x.Operand, reg, qualify) + ")::" + typ, true
 }
