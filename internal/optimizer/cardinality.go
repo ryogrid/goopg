@@ -137,7 +137,13 @@ func EstimateRows(n Node) int64 {
 	case *Sort:
 		return EstimateRows(x.Child)
 	case *IncrementalSort:
-		return EstimateRows(x.Child)
+		// M0146-0149: cost_incremental_sort's path->rows is its input
+		// clamped to two (costsize.c), and the plan node's rows are the
+		// path's — the twin of incrementalSortPathOver's Rows.
+		if r := EstimateRows(x.Child); r >= 2 {
+			return r
+		}
+		return 2
 	case *Project:
 		return EstimateRows(x.Child)
 	case *Distinct:

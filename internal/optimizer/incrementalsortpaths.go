@@ -213,7 +213,12 @@ func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sor
 		// `cost_sort` upstream (costsize.c:2144).
 		DisabledNodes: disabledNodesFor(!cp.enableSort, sub),
 		Rel:           ordered,
-		Rows:          sub.Rows,
+		// M0146-0149: cost_incremental_sort sets path->rows from the
+		// CLAMPED input_tuples (costsize.c), so an Incremental Sort over a
+		// one-row input carries two rows — TPC-DS Q70's window subquery is
+		// 2 rows in PG and is hashed in a semi join for it. The node's
+		// EstimateRows arm (cardinality.go) agrees.
+		Rows: groupTuples,
 		Cost: costIncrementalSort(cp, sub.Cost, sub.Rows, float64(groups),
 			pathNCols(sub), pathAvgVarBytes(sub), limitTuples, pathWidth(sub)),
 		Pathkeys: sortPathkeys,

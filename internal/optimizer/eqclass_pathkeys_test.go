@@ -118,3 +118,40 @@ func TestIncrementalSortClampsTuplesBeforeGroupEstimate(t *testing.T) {
 			p.Cost.Startup, sub.Cost.Total)
 	}
 }
+
+// TestIncrementalSortRowsAreTheClampedInput pins M0146-0149:
+// cost_incremental_sort sets path->rows = input_tuples AFTER clamping it to
+// two (costsize.c), so an Incremental Sort over a one-row input carries two
+// rows on the path, and its plan node (EstimateRows) reports the same. TPC-DS
+// Q70's window subquery is therefore 2 rows in PG and is hashed in a semi
+// join. A larger input keeps its own count.
+func TestIncrementalSortRowsAreTheClampedInput(t *testing.T) {
+	cp := defaultCostParams()
+	keys := []PathKey{
+		{Expr: &ColumnRef{Index: 0, Name: "k1", Type: catalog.Type{Name: "int4"}}, SortAsc: true},
+		{Expr: &ColumnRef{Index: 1, Name: "k2", Type: catalog.Type{Name: "int4"}}, SortAsc: true},
+	}
+	for _, tc := range []struct{ in, want float64 }{{1, 2}, {0, 2}, {37, 37}} {
+		rel := &RelOptInfo{Rows: tc.in}
+		sub := &Path{Kind: PathPrebuilt, Rel: rel, Rows: tc.in, Cost: Cost{Startup: 100, Total: 200}}
+		if p := incrementalSortPathOver(rel, sub, nil, keys, 1, cp, -1); p == nil || p.Rows != tc.want {
+			t.Errorf("input %v rows: path rows = %v, want %v", tc.in, p.Rows, tc.want)
+		}
+	}
+	scan := func(rows int64) Node {
+		return &SeqScan{Table: statsTable("isr", rows), schema: cpjSchema("k", 2)}
+	}
+	node := &IncrementalSort{Child: scan(1), Keys: []SortKey{
+		{Expr: &ColumnRef{Index: 0, Name: "k0", Type: catalog.Type{Name: "int4"}}},
+		{Expr: &ColumnRef{Index: 1, Name: "k1", Type: catalog.Type{Name: "int4"}}},
+	}, PresortedCount: 1}
+	if base := EstimateRows(node.Child); base != 1 {
+		t.Fatalf("fixture scan estimates %d rows, want 1", base)
+	}
+	if got := EstimateRows(node); got != 2 {
+		t.Errorf("IncrementalSort node over a 1-row input: EstimateRows = %d, want 2 (the path's clamped rows)", got)
+	}
+	if got := EstimateRows(&IncrementalSort{Child: scan(37), PresortedCount: 1}); got != 37 {
+		t.Errorf("IncrementalSort node over 37 rows: EstimateRows = %d, want 37", got)
+	}
+}
