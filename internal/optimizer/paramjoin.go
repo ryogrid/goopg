@@ -39,10 +39,79 @@ import (
 
 // paramProbeNode records a parameterised index probe built under a binding
 // nested loop: the node createPlanNode returned for it and the path it came
-// from.
+// from. A parameterised hash join with ParamFilter clauses records itself
+// with bind set instead (M0146-0135): the loop calls it with its outer layout
+// to add the clauses to the join's predicate.
 type paramProbeNode struct {
 	node Node
 	path *Path
+	bind func(outerLay outputLayout, outerIndex map[int]int)
+}
+
+// paramFilterClause is one ppi clause of a parameterised hash join:
+// `reqKey = local`, reqKey a member of the class on the required-outer rel
+// and local its member on the join's probe side, both in binding coordinates.
+type paramFilterClause struct {
+	reqKey, local Expr
+	ri            *restrictInfo
+}
+
+// paramJoinFilterClauses is get_joinrel_parampathinfo's equivalence-class
+// clauses for a hash join of outer (probe side, path o) and inner (hashed,
+// path i) parameterised by req (relnode.c): for each class that links req
+// to the joinrel, generate_join_implied_equalities produces one req = member
+// clause. A clause movable into the parameterised inner is dropped and
+// regenerated against the outer input ("Z.Z = X.X"), and an unparameterised
+// outer accepts no parameterised clause, so the join keeps `req-member =
+// outer-member` — TPC-DS Q95's `ws1.ws_order_number = ws_wh_1.ws_order_number`
+// Join Filter over the semijoin RHS, whose web_returns probe enforces the
+// class against ws1 (M0146-0135).
+//
+// Only that case is derived: the inner's probe enforces the class against
+// req and the outer path is unparameterised. With a parameterised outer, PG's
+// pick depends on the class's member order (ledgered).
+func (s *searchCtx) paramJoinFilterClauses(outer *RelOptInfo, o, i *Path, req RelSet) []paramFilterClause {
+	if s == nil || s.clauses == nil || o == nil || i == nil || o.RequiredOuter != 0 || i.RequiredOuter == 0 {
+		return nil
+	}
+	var out []paramFilterClause
+	done := map[int]bool{}
+	for ri := range probeEnforcedClauses(i) {
+		if ri == nil || !ri.isEquijoin || ri.ecID == noEquivClass || done[ri.ecID] {
+			continue
+		}
+		var reqKey Expr
+		switch {
+		case ri.leftRelids != 0 && relsSubset(ri.leftRelids, req):
+			reqKey = ri.leftKey
+		case ri.rightRelids != 0 && relsSubset(ri.rightRelids, req):
+			reqKey = ri.rightKey
+		default:
+			continue
+		}
+		var local Expr
+		for _, c := range s.clauses.all {
+			if c == nil || !c.isEquijoin || c.ecID != ri.ecID {
+				continue
+			}
+			if c.leftRelids != 0 && relsSubset(c.leftRelids, outer.Relids) {
+				local = c.leftKey
+			} else if c.rightRelids != 0 && relsSubset(c.rightRelids, outer.Relids) {
+				local = c.rightKey
+			}
+			if local != nil {
+				break
+			}
+		}
+		if local == nil {
+			continue
+		}
+		done[ri.ecID] = true
+		clause := &BinaryOp{Op: parser.OpEq, Left: reqKey, Right: local}
+		out = append(out, paramFilterClause{reqKey: reqKey, local: local,
+			ri: &restrictInfo{clause: clause, ecID: ri.ecID, isEquijoin: true}})
+	}
+	return out
 }
 
 // paramJoinLeafOK reports whether p can be a parameterised input of a
@@ -115,8 +184,16 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				bucket = s.estimateHashBucketSize(keys, inner.Relids)
 			}
 			rows := s.parameterizedJoinrelSize(joinrel, outer, inner, o, i, req, clauses, sjinfo)
+			// M0146-0135: the ppi clauses join the restrict list the
+			// hash join evaluates per match (final_cost_hashjoin's
+			// qp_qual over restrict_clauses).
+			pf := s.paramJoinFilterClauses(outer, o, i, req)
+			quals := residual
+			for _, c := range pf {
+				quals = append(quals[:len(quals):len(quals)], c.ri)
+			}
 			cost := hashJoinCost(cp, hashJoinInputs{
-				qualPerTuple: joinQualPerTuple(cp, residual),
+				qualPerTuple: joinQualPerTuple(cp, quals),
 				outer:        o.Cost, inner: i.Cost,
 				outerRows: o.Rows, innerRows: i.Rows,
 				outputRows:       rows,
@@ -146,6 +223,7 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				HashKeys:      keys,
 				Residual:      residual,
 				RequiredOuter: req,
+				ParamFilter:   pf,
 				ParallelSafe:  parallelSafeWith(joinrel, o, i),
 			}, "join.hash.param")
 		}
@@ -254,12 +332,22 @@ func createNestLoopParamJoinPlan(p *Path, innerPath *Path) (Node, outputLayout) 
 			nLeaves++
 		}
 	}
-	if len(probes) != nLeaves || nLeaves == 0 {
+	nProbes := 0
+	for _, pr := range probes {
+		if pr.bind == nil {
+			nProbes++
+		}
+	}
+	if nProbes != nLeaves || nLeaves == 0 {
 		panic(fmt.Sprintf("createPlan: parameterised join inner built %d probes for %d parameterised leaves", len(probes), nLeaves))
 	}
 	outerLay := in.lay[:len(in.outer.Output())]
 	outerIndex := outerLay.bindingIndex()
 	for _, pr := range probes {
+		if pr.bind != nil {
+			pr.bind(outerLay, outerIndex)
+			continue
+		}
 		bindParamProbe("param-join", paramProbeScan(pr.node), paramProbeIndexPath(pr.path), outerLay, outerIndex)
 	}
 	j := &Join{

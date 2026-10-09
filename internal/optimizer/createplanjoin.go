@@ -686,6 +686,25 @@ func createHashJoinPlan(p *Path) (Node, outputLayout) {
 	// prefix. Before this the fact died at plan construction.
 	j.ParallelAware = p.ParallelAware
 	assertParallelAwareJoinIsRunnable(p, j)
+	if len(p.ParamFilter) > 0 {
+		// M0146-0135: the ppi clauses read the required-outer rel, which
+		// only the binding nested loop supplies; it calls bind with its
+		// outer layout (createNestLoopParamJoinPlan).
+		if p.paramSink == nil {
+			panic("createPlan: PathHashJoin with ParamFilter clauses outside a binding nested loop")
+		}
+		filters := p.ParamFilter
+		*p.paramSink = append(*p.paramSink, paramProbeNode{node: j, path: p,
+			bind: func(outerLay outputLayout, outerIndex map[int]int) {
+				conj := []Expr{j.Predicate}
+				for _, c := range filters {
+					conj = append(conj, &BinaryOp{pos: j.pos, Op: parser.OpEq,
+						Left:  outerParamKey("param-join filter", c.reqKey, outerLay, outerIndex),
+						Right: translateToLayout("param-join filter", c.local, in.lay, in.index)})
+				}
+				j.Predicate = combineAnd(conj)
+			}})
+	}
 	return j, in.publishedLayout(jt)
 }
 

@@ -179,6 +179,12 @@ type Path struct {
 	// parameterised index probe it builds there so the loop can bind its
 	// keys — PG's create_plan-time curOuterRels.
 	paramSink *[]paramProbeNode
+	// ParamFilter is a parameterised hash join's ppi clauses that no input
+	// enforces — get_joinrel_parampathinfo's equivalence-class clause between
+	// the required-outer rel and the probe side (M0146-0135). Applied as a
+	// Join Filter once the binding nested loop rebinds the required-outer
+	// operand (createNestLoopParamJoinPlan).
+	ParamFilter []paramFilterClause
 
 	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
 	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
