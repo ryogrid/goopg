@@ -385,3 +385,36 @@ func TestSubqueryScanAppendRelMembers(t *testing.T) {
 		}
 	}
 }
+
+// TestSubqueryScanKeepsUnderAComputedSortKey pins M0146-0146: a Sort directly
+// on the leaf does not project, so an ORDER BY key that is an expression is a
+// resjunk entry of the scan's own target list in PG (make_sort_input_target)
+// and setrefs' trivial_subqueryscan keeps the wrapper — TPC-DS Q36/Q70/Q86's
+// `order by …, case when lochierarchy = 0 then i_category end` print
+// `Subquery Scan on sub` under the Sort. A plain-column key keeps the full
+// in-order consumption trivial (verified on PG 18.3 with generate_series).
+func TestSubqueryScanKeepsUnderAComputedSortKey(t *testing.T) {
+	cat := subqueryScanFixture(t)
+	for _, tc := range []struct {
+		name    string
+		sql     string
+		wantNil bool
+	}{
+		{"expression sort key keeps",
+			"select * from (select a, count(a) c from t1 group by a) u order by case when a = 0 then c end", false},
+		{"expression among column keys keeps",
+			"select * from (select a, count(a) c from t1 group by a) u order by c desc, a + 1", false},
+		{"column sort key strips",
+			"select * from (select a, count(a) c from t1 group by a) u order by a", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sq := findSubqueryScan(planSQL(t, cat, tc.sql))
+			if tc.wantNil && sq != nil {
+				t.Errorf("trivial wrapper kept (alias %q) — PG's setrefs strips it", sq.Alias)
+			}
+			if !tc.wantNil && sq == nil {
+				t.Error("wrapper stripped — PG keeps it when the scan computes a resjunk sort key")
+			}
+		})
+	}
+}
