@@ -30454,11 +30454,19 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 sort\-strategy 16 → 15, para
     - Q79 SF1 already matches PG; Q79 SF0\.25 is B8 \(customer\_pkey probe 8\.44 vs PG 4\.63, M0146\-0068 owner\) plus a near\-tie\.
     - Design: `docs/design/0100\-0149/m0146\-0139\-hash\-batching\-premise\-refuted\.md`\.
 Movement: none — premise refuted: work\_mem 512MB means no batching in either engine; spill arm moves no plan; Q79 SF0\.25 routes to B8
-- [ ] **M0146\-0140 — harness: the plan capture fails on TPC\-DS Q36, Q70 and Q86**
+- [x] **M0146\-0140 — harness: the plan capture fails on TPC\-DS Q36, Q70 and Q86**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. Both engines report `syntax error at or near ";"` at `limit 100;` in the capture wrapper\'s generated SQL, so these three are capture errors, not plan records, at both scales\.
   Kind: impl
   Parent: M0146-0014a
   - First step: read the wrapper the fire set uses \(scripts/jointree\-parity\-capture\.sh / tpcds\-fireset\-gate\.sh\) and strip the statement\'s trailing `;` before wrapping it\.
+  - Done 2026\-10\-09: the capture wrapper was fine; the generated query files were broken\. tpcds\-setup\.sh wrapped the whole
+    query, `limit 100;` included, in `select \* from \(\.\.\.\) as sub`\.
+    - New scripts/tpcds\_fix\_loch\_queries\.py \(upstream split\_sqls\.py form: final ORDER BY/LIMIT outside the wrapper,
+      idempotent, repairs the broken form\); used by tpcds\-setup\.sh, tpcds\-bench\.sh and the SF0\.25 sweep\'s ensure\_query\_fixes\.
+    - Oracle rows 36/86 → OK \(goopg byte\-identical to PG\); Q70 → `SKIP\_ENGINE\_GAP` with PG\'s rows/ck, filed as M0146\-0143\.
+    - SF0\.25 sweep PASS 96 → 98, SKIP 3 → 1\. plans\-pg stubs wait for the next ea\-ratchet re\-pin \(ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0140\-tpcds\-loch\-query\-wrapper\.md`\.
+Movement: none — harness fix \(1419b3106\): Q36/Q86 now produce plan records on both engines, so the next census counts them; no plan changed
 - [ ] **M0146\-0141 — a searched sub\-problem leaf enters the enclosing search with its searched rel\'s rows \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-09 by M0146\-0136\)\. join\_collapse\_limit splits Q72\'s JOIN chain; the 8\-rel sub\-problem\'s result leaf `?0`
   enters the upper problem with rows=1623 from `initialRelRows`\' EstimateRows over the built tree, while its searched rel \(the
@@ -30478,3 +30486,12 @@ Movement: none — premise refuted: work\_mem 512MB means no batching in either 
   Parent: M0146-0136
   - First step: add the arm to querypathkeys\.go deriveQueryPathkeySets reusing presortedAggKeysOrAbsent\'s DISTINCT/ORDER BY key
     choice \(PG: adjust\_group\_pathkeys\_for\_groupagg, planner\.c\)\.
+- [ ] **M0146\-0143 — aggregates used only inside a window spec or a CASE are never collected \(TPC\-DS Q70\)**
+  \(filed 2026\-10\-09 by M0146\-0140\)\. collectAggregateCalls \(planner\.go\) walks targets/HAVING/ORDER BY through walkExpr, which
+  descends only BinaryOp/UnaryOp/Cast/Is\*/FuncCall args\. `rank\(\) over \(order by sum\(b\)\) \.\.\. group by a` and
+  `case when sum\(b\) > 2 then 1 end \.\.\. group by a` fail `aggregate call could not be resolved`; PG returns rows\. Q70\'s IN
+  subquery ranks by `sum\(ss\_net\_profit\)` only inside OVER\. Not S2: an error, not a wrong result\.
+  Kind: impl
+  Parent: M0146-0140
+  - First step: make walkExpr descend CaseExpr, the window spec \(PARTITION BY/ORDER BY, named WINDOW\) and FILTER, never a
+    subquery; regress A/B \(window, aggregates, groupingsets\); then flip oracle row 70 to OK and drop it from ENGINE\_GAP\.
