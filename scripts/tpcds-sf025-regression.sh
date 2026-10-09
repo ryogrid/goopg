@@ -151,9 +151,9 @@ PG_SKIP="${PG_SKIP:-}"
 # Queries PG answers but goopg cannot run yet. The oracle still captures PG's
 # rows and ck, under status SKIP_ENGINE_GAP, so the sweep skips them (any
 # non-OK status is a skip) and the fix flips the row to OK without a new PG
-# run. Q70: an aggregate used only inside a window's PARTITION BY/ORDER BY is
-# never collected ("aggregate call could not be resolved", M0146-0143).
-ENGINE_GAP="${ENGINE_GAP:-70}"
+# run. Empty since M0146-0143 flipped Q70 (an aggregate used only inside a
+# window's ORDER BY was never collected) to OK.
+ENGINE_GAP="${ENGINE_GAP:-}"
 
 GOOPG_PSQL="psql -h ${TPCDS_HOST} -p ${SF025_PORT} -U ${TPCDS_SUPERUSER} -d postgres"
 PG_PSQL="psql -h ${TPCDS_HOST} -p ${TPCDS_PG_PORT} -U ${TPCDS_PG_USER} -d ${SF025_PG_DB}"

@@ -8694,6 +8694,22 @@ func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 			return true
 		}
 	}
+	// M0146-0143: as collectAggregateCalls — a named window's spec.
+	for _, nw := range s.WindowClause {
+		if nw.Def == nil {
+			continue
+		}
+		for _, p := range nw.Def.PartitionBy {
+			if hasAgg(p) {
+				return true
+			}
+		}
+		for _, o := range nw.Def.OrderBy {
+			if hasAgg(o.Expr) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -10332,7 +10348,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
-		return planInExpr(x, buildHavingParentCtx(agg))
+		if x.Subquery == nil {
+			return resolveInListAfterAggregate(x, agg)
+		}
+		return resolveInSubqueryAfterAggregate(x, agg)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, buildHavingParentCtx(agg))
 	case *parser.LikeEscapePattern:
@@ -10882,6 +10901,23 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 			return nil, err
 		}
 	}
+	// M0146-0143: a named WINDOW clause's PARTITION BY / ORDER BY belongs to
+	// this query level too (`... OVER w ... WINDOW w AS (ORDER BY sum(b))`).
+	for _, nw := range s.WindowClause {
+		if nw.Def == nil {
+			continue
+		}
+		for _, p := range nw.Def.PartitionBy {
+			if err := visit(p); err != nil {
+				return nil, err
+			}
+		}
+		for _, o := range nw.Def.OrderBy {
+			if err := visit(o.Expr); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -10932,8 +10968,128 @@ func collectHavingSubqueryAggCalls(having parser.Expr, cat catalog.Catalog) []*p
 	return result
 }
 
+// resolveInListAfterAggregate is planInExpr's list form over the aggregate
+// output (M0146-0143): `sum(b) IN (3, 4)` after GROUP BY resolves its
+// operand and items through the aggregate surface, as every other
+// post-aggregate expression does. The subquery form keeps planInExpr with the
+// HAVING-parent context. The one-element rewrite is planInExpr's own
+// (transformAExprIn: `x IN (c)` is `x = c`).
+func resolveInListAfterAggregate(x *parser.InExpr, agg *aggregateSurface) (Expr, error) {
+	if cmp, ok := oneElementInAsComparison(x); ok {
+		return resolveExprAfterAggregate(cmp, agg)
+	}
+	op, err := resolveExprAfterAggregate(x.Operand, agg)
+	if err != nil {
+		return nil, err
+	}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp}
+	out.List = make([]Expr, len(x.List))
+	for i, e := range x.List {
+		r, err := resolveExprAfterAggregate(e, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.List[i] = r
+	}
+	return out, nil
+}
+
+// resolveInSubqueryAfterAggregate is planInExpr's subquery form over the
+// aggregate output (M0146-0143). The left operand belongs to THIS query level,
+// so it resolves through the aggregate surface (`sum(b) IN (SELECT ...)`,
+// regress subselect's `(1 = any(array_agg(f1))) = any (select false)`); only
+// the subquery body is planned in the HAVING-parent context, where this
+// level's grouped columns and aggregates are outer references. planInExpr
+// resolved the operand in that parent context as well, which names a level
+// that does not exist from here ("outer column ref ... out of range"). A
+// row operand over VALUES keeps planInExpr's expansion.
+func resolveInSubqueryAfterAggregate(x *parser.InExpr, agg *aggregateSurface) (Expr, error) {
+	ctx := buildHavingParentCtx(agg)
+	if _, row := x.Operand.(*parser.RowExpr); row || ctx == nil || ctx.cat == nil {
+		return planInExpr(x, ctx)
+	}
+	op, err := resolveExprAfterAggregate(x.Operand, agg)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, ctx.settings, rtableScopeFrom(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp,
+		Plan: inner, Subquery: x.Subquery, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
+// walkExpr visits every function call of ONE query level in e: it descends
+// every expression node that can hold one, but never a subquery (SubqueryExpr,
+// ExistsExpr, an IN's subquery, ARRAY(SELECT ...)), whose calls belong to
+// the inner query level.
+//
+// M0146-0143: the walk used to stop at CASE, IN lists, EXTRACT, COLLATE,
+// row/array/subscript/field expressions and the window spec, so an
+// aggregate written only there (`case when sum(b) > 2 then 1 end`, `rank()
+// over (order by sum(b))` — TPC-DS Q70) was never collected and the
+// aggregate stage failed "aggregate call could not be resolved". PG's
+// transformAggregateCall registers every Aggref at its query level wherever
+// it is written (parse_agg.c). A FuncCall's FILTER and its own ORDER BY stay
+// unwalked: an aggregate there is an error PG raises separately
+// ("aggregate functions are not allowed in FILTER", nested aggregates).
 func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
+	walkAll := func(es []parser.Expr) error {
+		for _, c := range es {
+			if err := walkExpr(c, fn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	switch x := e.(type) {
+	case *parser.CaseExpr:
+		if err := walkExpr(x.Operand, fn); err != nil {
+			return err
+		}
+		for _, w := range x.Whens {
+			if err := walkExpr(w.When, fn); err != nil {
+				return err
+			}
+			if err := walkExpr(w.Then, fn); err != nil {
+				return err
+			}
+		}
+		return walkExpr(x.Else, fn)
+	case *parser.InExpr:
+		if err := walkExpr(x.Operand, fn); err != nil {
+			return err
+		}
+		return walkAll(x.List)
+	case *parser.ExtractExpr:
+		return walkExpr(x.Source, fn)
+	case *parser.CollateExpr:
+		return walkExpr(x.Operand, fn)
+	case *parser.LikeEscapePattern:
+		if err := walkExpr(x.Pattern, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Escape, fn)
+	case *parser.SimilarToPattern:
+		if err := walkExpr(x.Left, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Pattern, fn)
+	case *parser.FieldSelect:
+		return walkExpr(x.Arg, fn)
+	case *parser.RowExpr:
+		return walkAll(x.Elems)
+	case *parser.ArraySubscriptExpr:
+		if err := walkExpr(x.Base, fn); err != nil {
+			return err
+		}
+		if err := walkExpr(x.Index, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Upper, fn)
+	case *parser.ArrayConstructorExpr:
+		return walkAll(x.Elements)
 	case *parser.BinaryOp:
 		if err := walkExpr(x.Left, fn); err != nil {
 			return err
@@ -10961,8 +11117,31 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 				return err
 			}
 		}
+		if x.Over != nil {
+			return walkWindowDef(x.Over, fn)
+		}
 	case *parser.IndirectionStar:
 		return walkExpr(x.Source, fn)
+	}
+	return nil
+}
+
+// walkWindowDef walks a window definition's PARTITION BY and ORDER BY — part
+// of the query level that owns the window (transformWindowDefinitions runs
+// in the query's own parse state, so an aggregate there is the query's).
+func walkWindowDef(w *parser.WindowDef, fn func(*parser.FuncCall) error) error {
+	if w == nil {
+		return nil
+	}
+	for _, p := range w.PartitionBy {
+		if err := walkExpr(p, fn); err != nil {
+			return err
+		}
+	}
+	for _, o := range w.OrderBy {
+		if err := walkExpr(o.Expr, fn); err != nil {
+			return err
+		}
 	}
 	return nil
 }
