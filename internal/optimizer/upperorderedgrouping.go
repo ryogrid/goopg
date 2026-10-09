@@ -104,8 +104,27 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	// query the new arm touches. The positional group-key coverage
 	// check below is unchanged, so a merge on other keys still declines
 	// exactly like a mis-sorted Sort.
-	if len(cand.Children) == 0 || cand.Children[0] == nil ||
-		(cand.Children[0].Kind != PathSort && cand.Children[0].Kind != PathGatherMerge) {
+	//
+	// M0146-0131: create_agg_path (pathnode.c) copies subpath->pathkeys for
+	// AGG_SORTED whatever the subpath is, so two more inputs translate, as
+	// the node twin (aggregateEmissionPathkeys) already admits them:
+	//   - a `PathIncrementalSort` (make_ordered_path's partially presorted
+	//     arm) delivers its FULL pathkeys, as a Sort does;
+	//   - a `PathPrebuilt` input already sorted on the group keys (the
+	//     searched-candidate and is_sorted arms of addGroupingPaths), whose
+	//     pathkeys were validated against the input schema when filed.
+	// TPC-DS Q35's GroupAggregate over an Incremental Sort (presorted on
+	// ca_state) was declined here, so ORDER BY re-sorted it and its startup
+	// advantage under LIMIT 100 was lost. The positional group-key check
+	// below still decides; an input with no pathkeys (the index variant's
+	// seed) declines there.
+	if len(cand.Children) == 0 || cand.Children[0] == nil {
+		traceGroupDecline("no-sort-or-gathermerge-child", cand)
+		return nil
+	}
+	switch cand.Children[0].Kind {
+	case PathSort, PathGatherMerge, PathIncrementalSort, PathPrebuilt:
+	default:
 		traceGroupDecline("no-sort-or-gathermerge-child", cand)
 		return nil
 	}

@@ -184,6 +184,17 @@ func rewriteExistsToAnyNode(node Node) {
 	case *Materialize:
 		// M0146-0010: transparent wrapper — descend.
 		rewriteExistsToAnyNode(n.Child)
+	case *IncrementalSort:
+		// M0146-0131: pass-through wrappers too. Without these arms an OR
+		// of EXISTS below them kept its per-row SubPlan: TPC-DS Q35's
+		// customer probe under `Incremental Sort -> Nested Loop ->
+		// Materialize` re-ran web_sales x date_dim per customer row (684 ms
+		// -> >600 s), where PG hashes it.
+		rewriteExistsToAnyNode(n.Child)
+	case *Memoize:
+		rewriteExistsToAnyNode(n.Child)
+	case *Result:
+		rewriteExistsToAnyNode(n.Child)
 	case *SetOp:
 		rewriteExistsToAnyNode(n.Left)
 		rewriteExistsToAnyNode(n.Right)

@@ -798,6 +798,42 @@ func TestGroupingEmissionTranslatesGatherMergeChild(t *testing.T) {
 	}
 }
 
+// TestGroupingEmissionTranslatesIncrementalSortAndPresortedChild is
+// M0146-0131: create_agg_path copies subpath->pathkeys for AGG_SORTED, so a
+// sorted aggregate over an Incremental Sort (make_ordered_path's partially
+// presorted arm — the Incremental Sort delivers its FULL keys) or over a
+// searched input already sorted on the group keys emits group order, as the
+// node twin aggregateEmissionPathkeys says. TPC-DS Q35's Incremental Sort
+// input was declined, so ORDER BY re-sorted it and LIMIT 100 lost its startup
+// advantage. Keys that do not lead with the group still decline.
+func TestGroupingEmissionTranslatesIncrementalSortAndPresortedChild(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	keys := []PathKey{{Expr: groupCol, SortAsc: true}}
+	cand := func(child *Path) *Path {
+		return &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+			Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+			Pathkeys: child.Pathkeys, Children: []*Path{child}}
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	for name, child := range map[string]*Path{
+		"incremental sort": {Kind: PathIncrementalSort, Pathkeys: keys, Rows: 57066, PresortedCount: 1,
+			Children: []*Path{{Kind: PathPrebuilt, Rows: 57066, node: aggNode.Child}}},
+		"presorted input": {Kind: PathPrebuilt, Pathkeys: keys, Rows: 57066, node: aggNode.Child},
+	} {
+		got := groupingEmissionPathkeys(aggNode, cand(child))
+		if len(got) != 1 || !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+			t.Errorf("%s: translated %+v, want the ORDER BY key", name, got)
+		}
+	}
+	bad := []PathKey{{Expr: other, SortAsc: true}, {Expr: groupCol, SortAsc: true}}
+	if got := groupingEmissionPathkeys(aggNode, cand(&Path{Kind: PathIncrementalSort, Pathkeys: bad,
+		Rows: 57066, PresortedCount: 1})); got != nil {
+		t.Errorf("incremental sort on other leading keys translated %d keys, want nil", len(got))
+	}
+}
+
 // TestElectOrderedGroupingOffersALoneCandidate is M0144-0011a-2: the loop's
 // candidate minimum is ONE, the way PG's is. `create_ordered_paths` iterates
 // `input_rel->pathlist` with no minimum at all

@@ -297,3 +297,44 @@ func TestRewriteExistsToAnyNodeFixesOrEdInOperandUnderFilter(t *testing.T) {
 		}
 	}
 }
+
+// TestRewriteExistsToAnyNodeDescendsPassThroughWrappers is M0146-0131: the
+// walker is fail-open per node kind, so a wrapper it does not know hides every
+// qual below it. TPC-DS Q35's customer probe sat under `Incremental Sort ->
+// Nested Loop -> Materialize` once the LIMIT fraction elected that order, and
+// its OR of EXISTS kept the per-row SubPlan (684 ms -> >600 s). The operand
+// re-resolution runs at every Filter the walk reaches, so a fixed index proves
+// the walk got there.
+func TestRewriteExistsToAnyNodeDescendsPassThroughWrappers(t *testing.T) {
+	tbl := &catalog.Table{Name: "t1", Columns: []catalog.Column{
+		{Name: "other_col", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+		{Name: "x", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+	}}
+	mkFilter := func() *Filter {
+		child := &SeqScan{Table: tbl, schema: Schema{
+			{Name: "other_col", Type: catalog.Type{Name: "text"}},
+			{Name: "x", Type: catalog.Type{Name: "int4"}},
+		}}
+		return &Filter{Child: child, Predicate: &BinaryOp{
+			Op: parser.OpOr,
+			Left: &InExpr{Operand: &ColumnRef{Name: "x", Index: 0, Type: catalog.Type{Name: "int4"}},
+				Plan: stubSubqueryPlan(t)},
+			Right: &InExpr{Operand: &ColumnRef{Name: "x", Index: 0, Type: catalog.Type{Name: "int4"}},
+				Plan: stubSubqueryPlan(t)},
+		}}
+	}
+	for name, wrap := range map[string]func(Node) Node{
+		"incremental sort": func(c Node) Node { return &IncrementalSort{Child: c} },
+		"memoize":          func(c Node) Node { return &Memoize{Child: c} },
+		"result":           func(c Node) Node { return &Result{Child: c} },
+	} {
+		filt := mkFilter()
+		rewriteExistsToAnyNode(wrap(filt))
+		bin := filt.Predicate.(*BinaryOp)
+		for _, side := range []Expr{bin.Left, bin.Right} {
+			if op := side.(*InExpr).Operand.(*ColumnRef); op.Index != 1 {
+				t.Errorf("%s: Operand.Index = %d, want 1 — the walk did not reach the Filter", name, op.Index)
+			}
+		}
+	}
+}
