@@ -114,6 +114,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// too — without re-deriving `searchedRelOf(input)`.
 	if sr := searchedRelOf(input); sr != nil {
 		ordered.SearchCandidates = sr.Pathlist
+		ordered.SearchCandidateClasses = sr.usefulKeys
 		// M0141-S2b-2b: re-earn every OTHER candidate's ordering claim
 		// against this rel's own published schema, the same rule
 		// `stampSearchPathkeys` already applies to the single WINNING path
@@ -171,7 +172,8 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 			traceOrderedGroupingCandidate(input.AggStrategy, input.Rows)
 		}
 	}
-	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
+	classes := ordered.SearchCandidateClasses
+	if contained, _ := classes.countContainedIn(input.Pathkeys, sortPathkeys); contained {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
@@ -182,7 +184,7 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 	// no presorted keys and an incremental sort when there are presorted
 	// keys"). TPC-DS Q3's ORDER BY d_year, sum DESC, brand_id over a
 	// GroupAggregate grouped by d_year first.
-	if _, presorted := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys); presorted > 0 &&
+	if _, presorted := classes.countContainedIn(input.Pathkeys, sortPathkeys); presorted > 0 &&
 		cp.enableIncrementalSort && input.node != nil {
 		addPath(ordered, incrementalSortPathOver(ordered, input, input.node, sortPathkeys, presorted, cp, limitTuples),
 			upperOrderedIncrementalSortProducer)
@@ -218,7 +220,7 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 			if cand == nil || i >= len(ordered.SearchCandidateKeys) {
 				continue
 			}
-			if !pathkeysContainedIn(ordered.SearchCandidateKeys[i], sortPathkeys) {
+			if contained, _ := classes.countContainedIn(ordered.SearchCandidateKeys[i], sortPathkeys); !contained {
 				continue
 			}
 			cNode := searchedCandidateInput(input.node, cand)

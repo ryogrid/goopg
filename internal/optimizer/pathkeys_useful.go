@@ -103,7 +103,11 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 		return keys
 	}
 	n := u.usefulForMerging(keys)
-	if _, nOrd := pathkeysCountContainedIn(keys, u.queryPathkeys); nOrd > n {
+	// pathkeys_useful_for_ordering compares canonical (equivalence-class)
+	// pathkeys: an ordering on cs_item_sk serves a query ordered on
+	// i_item_sk once the rel enforces cs_item_sk = i_item_sk (TPC-DS Q64's
+	// cross_sales, M0146-0134).
+	if _, nOrd := u.countContainedIn(keys, u.queryPathkeys); nOrd > n {
 		n = nOrd
 	}
 	switch {
@@ -171,6 +175,23 @@ func (u *pathkeyUsefulness) equivalentWithin(a, b Expr) bool {
 		}
 	}
 	return ida >= 0 && ida == idb
+}
+
+// countContainedIn is pathkeys_count_contained_in over this rel's classes:
+// the leading keys of required that keys satisfy, each by an equal key or by
+// one on another member of an equivalence class the rel enforces
+// (equivalentWithin). A nil usefulness compares syntactically.
+func (u *pathkeyUsefulness) countContainedIn(keys, required []PathKey) (contained bool, nCommon int) {
+	n := 0
+	for n < len(required) && n < len(keys) {
+		k, r := keys[n], required[n]
+		if !pathKeyEqual(k, r) && (k.SortAsc != r.SortAsc || k.NullsFirst != r.NullsFirst ||
+			k.GroupingNulled != r.GroupingNulled || !u.equivalentWithin(k.Expr, r.Expr)) {
+			break
+		}
+		n++
+	}
+	return n == len(required), n
 }
 
 // pathkeysContainedInRel is pathkeys_contained_in for a path of rel: a key is

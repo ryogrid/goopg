@@ -330,10 +330,12 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
 	savedSearchCandidates, savedSearchCandidateKeys := ordered.SearchCandidates, ordered.SearchCandidateKeys
+	savedSearchCandidateClasses := ordered.SearchCandidateClasses
 	restore := func(reason string) (Node, bool) {
 		ordered.Pathlist = savedPathlist
 		ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized = savedTotal, savedStartup, savedParam
 		ordered.SearchCandidates, ordered.SearchCandidateKeys = savedSearchCandidates, savedSearchCandidateKeys
+		ordered.SearchCandidateClasses = savedSearchCandidateClasses
 		return decline(reason)
 	}
 	// M0141-S2b-7: this rel's own candidate set for `addIncrementalSortPaths`
@@ -353,6 +355,8 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// its own `searchedRelOf(input)` is nil.
 	ordered.SearchCandidates = cands
 	ordered.SearchCandidateKeys = translated
+	// Aggregate-output coordinates: the searched rel's classes do not apply.
+	ordered.SearchCandidateClasses = nil
 
 	sortKeys := pathkeysForSortKeys(keys)
 	for i, c := range cands {

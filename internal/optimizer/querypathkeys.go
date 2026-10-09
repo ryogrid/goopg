@@ -164,7 +164,7 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	}
 	sets := queryPathkeySets{}
 	sets.sort = presearchPathkeys(sortClauseItems(s), s, ctx)
-	sets.group = presearchPathkeys(groupClauseItems(s), s, ctx)
+	sets.group = pruneUselessGroupPathkeys(presearchPathkeys(groupClauseItems(s), s, ctx), ctx)
 	sets.window = presearchPathkeys(windowClauseItems(s), s, ctx)
 	sets.distinct = presearchPathkeys(distinctClauseItems(s), s, ctx)
 	// `setop_pathkeys` is upstream's `qp_extra->setop`: the grouping order a
@@ -178,6 +178,35 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	// `chooseQueryPathkeys` still implements the arm, so the precedence is
 	// complete the day a producer exists.
 	return sets
+}
+
+// pruneUselessGroupPathkeys drops the group keys remove_useless_groupby_columns
+// (initsplan.c) removes from the processed group clause before
+// standard_qp_callback builds group_pathkeys from it: a relation's grouped
+// columns beyond one of its unique keys are functionally determined by that
+// key. M0146-0134: Q64's `GROUP BY i_product_name, i_item_sk, ...` groups on
+// `i_item_sk, ...` (item_pkey), so the query pathkeys lead with i_item_sk,
+// which an input ordered on the equated cs_item_sk delivers. The same pruning
+// shapes the aggregate's own group keys (pruneUselessGroupByColumns).
+func pruneUselessGroupPathkeys(keys []PathKey, ctx *resolveContext) []PathKey {
+	if len(keys) < 2 || ctx == nil || ctx.cat == nil {
+		return keys
+	}
+	exprs := make([]Expr, len(keys))
+	for i, k := range keys {
+		exprs[i] = k.Expr
+	}
+	keep, _ := pruneUselessGroupByColumns(exprs, ctx, ctx.cat)
+	if keep == nil {
+		return keys
+	}
+	out := make([]PathKey, 0, len(keys))
+	for i, k := range keys {
+		if keep[i] {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // presearchSortItem is one clause item on its way to a pathkey: the written

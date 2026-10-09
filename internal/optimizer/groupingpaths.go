@@ -562,8 +562,16 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// a CTE scan over a sorted body, a sorted aggregate, a Sort); the
 			// searched-input candidates below cover the join-search case.
 			isSorted := false
+			// M0146-0134: the seed's ordering is compared through the
+			// searched rel's equivalence classes, as PG's canonical pathkeys
+			// are — make_ordered_path then builds ONE ordering step for the
+			// cheapest input: none, an Incremental Sort, or a Sort.
+			var seedUseful *pathkeyUsefulness
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				seedUseful = sr.usefulKeys
+			}
 			if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
-				pathkeysContainedIn(seedKeys, pathkeysForSortKeys(keys)) {
+				func() bool { c, _ := seedUseful.countContainedIn(seedKeys, pathkeysForSortKeys(keys)); return c }() {
 				sorted := *seed
 				sorted.Pathkeys = seedKeys
 				presortedSpec := *aggNode
@@ -588,7 +596,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				groupPathkeys := pathkeysForSortKeys(keys)
 				var sortedInput *Path
 				if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
-					if _, n := pathkeysCountContainedIn(seedKeys, groupPathkeys); n > 0 {
+					if _, n := seedUseful.countContainedIn(seedKeys, groupPathkeys); n > 0 {
 						incSeed := *sortSeed
 						incSeed.Pathkeys = seedKeys
 						sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
@@ -619,7 +627,11 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					// Incremental Sort (M0146-0006), and one with no
 					// presorted key is not offered (only the cheapest input
 					// is fully sorted, above).
-					contained, nCommon := pathkeysCountContainedIn(candKeys[i], groupPathkeys)
+					// M0146-0134: through the searched rel's equivalence
+					// classes, as PG's canonical pathkeys compare — Q64's
+					// input ordered on cs_item_sk is presorted for the
+					// group key i_item_sk the join equates it with.
+					contained, nCommon := sr.usefulKeys.countContainedIn(candKeys[i], groupPathkeys)
 					if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
 						continue
 					}

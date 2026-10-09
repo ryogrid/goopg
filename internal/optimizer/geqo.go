@@ -349,6 +349,18 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 		outputCols:      s.outputCols,
 		outputColsKnown: s.outputColsKnown,
 		outputEligible:  s.outputEligible,
+		// M0146-0134: every other query-level fact the DP search reads
+		// rides along too — PG's GEQO tours share the one PlannerInfo.
+		// Without queryPathkeys a tour truncated every ordering as useless
+		// (TPC-DS Q64's cs_item_sk order, PG's Incremental Sort input);
+		// without parallelModeOK it built no partial join paths.
+		queryPathkeys:      s.queryPathkeys,
+		parallelModeOK:     s.parallelModeOK,
+		cat:                s.cat,
+		itemSpans:          s.itemSpans,
+		problemItems:       s.problemItems,
+		semiDerivedRHS:     s.semiDerivedRHS,
+		orClauseSelDivisor: s.orClauseSelDivisor,
 	}
 	// Re-register the base rels (level 1), sharing the same *RelOptInfo
 	// pointers. gimmeTree reads them by index; makeJoinRel may ADD paths to a

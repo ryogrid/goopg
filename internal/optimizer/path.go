@@ -694,6 +694,12 @@ type RelOptInfo struct {
 	// validate to nothing (no ordering claim survives, same truncation rule
 	// as the winner's).
 	SearchCandidateKeys [][]PathKey
+	// SearchCandidateClasses is the searched rel's equivalence classes
+	// (its usefulKeys), so the ORDERED rel compares SearchCandidateKeys and
+	// the seed's ordering with sortPathkeys the way PG's canonical pathkeys
+	// do (M0146-0134). nil wherever the candidates are not a searched rel's
+	// (electOrderedGrouping's aggregate candidates): syntactic comparison.
+	SearchCandidateClasses *pathkeyUsefulness
 
 	// BoundaryFill is the hole-filler closure this rel's boundary publication
 	// was stamped with (`createPlanAtSearchRootRange`'s `fill` parameter,

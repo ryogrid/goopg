@@ -163,7 +163,7 @@ func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []Pa
 		if len(keys) == 0 {
 			continue
 		}
-		contained, nCommon := pathkeysCountContainedIn(keys, sortPathkeys)
+		contained, nCommon := ordered.SearchCandidateClasses.countContainedIn(keys, sortPathkeys)
 		if pathTraceEnabled {
 			traceIncrementalSortCandidate(i, candidate.Kind, len(keys), contained, nCommon, candidate.Cost.Total)
 		}
@@ -198,7 +198,15 @@ func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sor
 	for j := 0; j < nCommon; j++ {
 		groupExprs[j] = sortPathkeys[j].Expr
 	}
-	groups := estimateNumGroups(groupExprs, statsNode, int64(sub.Rows))
+	// cost_incremental_sort clamps input_tuples to 2 BEFORE estimating the
+	// presorted groups (costsize.c), so a one-row input still counts two
+	// groups and its startup is half the input's run (M0146-0134, TPC-DS
+	// Q64's cross_sales).
+	groupTuples := sub.Rows
+	if groupTuples < 2 {
+		groupTuples = 2
+	}
+	groups := estimateNumGroups(groupExprs, statsNode, int64(groupTuples))
 	sp := &Path{
 		Kind: PathIncrementalSort,
 		// `cost_incremental_sort` folds enable_sort's flag in via
