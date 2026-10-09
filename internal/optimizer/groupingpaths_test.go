@@ -445,3 +445,37 @@ func TestCreateGroupingPathsGroupingSetsCountEnableHashAgg(t *testing.T) {
 			"enable_hashagg for AGG_MIXED as well as AGG_HASHED", hashed)
 	}
 }
+
+// TestAddGroupingPathsPlainPresortedInputTakesNoSort pins M0146-0142's
+// grouping half: add_paths_to_grouping_rel runs make_ordered_path for an
+// AGG_PLAIN aggregate with ordered aggregates as it does for AGG_SORTED, so
+// an input already ordered on the presorted-aggregate keys feeds the
+// Aggregate directly. TPC-DS Q95's count(DISTINCT ws_order_number) over a
+// Gather Merge sorted on it carried a second, redundant Sort before this.
+func TestAddGroupingPathsPlainPresortedInputTakesNoSort(t *testing.T) {
+	k := func() *ColumnRef { return &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}} }
+	plainDistinct := func(child Node) *Aggregate {
+		return &Aggregate{
+			Aggs:     []AggregateCall{{Name: "count", Arg: k(), Distinct: true}},
+			Child:    child,
+			Mode:     AggModeSimple,
+			Strategy: AggStrategyHashed,
+		}
+	}
+	inputKind := func(child Node) PathKind {
+		agg := plainDistinct(child)
+		grouped, seed := groupingTestSeed(t, agg)
+		addGroupingPaths(grouped, seed, agg, agg.Child, nil, defaultCostParams(), DefaultPlannerSettings())
+		if len(grouped.Pathlist) != 1 || len(grouped.Pathlist[0].Children) != 1 {
+			t.Fatalf("pathlist = %d paths, want one plain aggregate over one input", len(grouped.Pathlist))
+		}
+		return grouped.Pathlist[0].Children[0].Kind
+	}
+	if got := inputKind(upperOrderedInput(1000)); got != PathSort {
+		t.Errorf("unordered input: aggregate input kind = %v, want a Sort (PathSort)", got)
+	}
+	sorted := &Sort{Child: upperOrderedInput(1000), Keys: []SortKey{{Expr: k()}}}
+	if got := inputKind(sorted); got == PathSort {
+		t.Errorf("input already sorted on k: aggregate input kind = PathSort, want the input itself")
+	}
+}

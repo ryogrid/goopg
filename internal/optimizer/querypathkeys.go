@@ -168,6 +168,7 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	if s.GroupingSets == nil {
 		// remove_useless_groupby_columns returns early for grouping sets.
 		sets.group = pruneUselessGroupPathkeys(sets.group, ctx)
+		sets.group = adjustGroupPathkeysForGroupAgg(s, ctx, sets.group)
 	}
 	sets.window = presearchPathkeys(windowClauseItems(s), s, ctx)
 	sets.distinct = presearchPathkeys(distinctClauseItems(s), s, ctx)
@@ -211,6 +212,123 @@ func pruneUselessGroupPathkeys(keys []PathKey, ctx *resolveContext) []PathKey {
 		}
 	}
 	return out
+}
+
+// adjustGroupPathkeysForGroupAgg is adjust_group_pathkeys_for_groupagg
+// (planner.c), which standard_qp_callback runs whenever the query has
+// ORDER BY / DISTINCT aggregates — with or without a GROUP BY. It appends the
+// best-covering aggregate's sort keys to the group pathkeys, and those become
+// the query pathkeys, so the search files paths sorted for the aggregate.
+// M0146-0142: TPC-DS Q95's `count(DISTINCT ws1.ws_order_number)` has no
+// GROUP BY; PG feeds it from a Gather Merge sorted on ws_order_number, and
+// goopg asked the search for no order at all.
+//
+// The candidate rules are presortedAggKeysOrAbsent's (the aggregate stage's
+// twin): no ordered-set aggregates, a FILTER only over plain column/constant
+// arguments, constants dropped, and the selection is the shared
+// bestCoveringAggPathkeys. Goopg-specific declines, each leaving the group
+// pathkeys as they were rather than claiming a partial order:
+//   - a GROUP BY item that does not resolve to a searched column (the group
+//     list was truncated, so nothing may follow it);
+//   - an ordered aggregate whose sort key is neither a column nor a constant
+//     (goopg's pre-search pathkeys name columns only, and dropping that
+//     aggregate would change which set PG's selection elects).
+func adjustGroupPathkeysForGroupAgg(s *parser.SelectStmt, ctx *resolveContext, group []PathKey) []PathKey {
+	if !ctx.settings.EnablePresortedAggregate || ctx.cat == nil {
+		return group
+	}
+	for _, it := range groupClauseItems(s) {
+		if _, ok := resolvePresearchSortExpr(it.expr, s, ctx); !ok {
+			return group
+		}
+	}
+	calls, err := collectAggregateCalls(s, ctx.cat)
+	if err != nil {
+		return group
+	}
+	var candidates [][]PathKey
+	for _, fc := range calls {
+		if len(fc.WithinGroup) > 0 || (!fc.Distinct && len(fc.OrderBy) == 0) {
+			continue
+		}
+		if fc.Filter != nil && !parserArgsAllColumnOrConst(fc.Args) {
+			continue
+		}
+		pks, ok := orderedAggPresearchPathkeys(fc, s, ctx)
+		if !ok {
+			return group
+		}
+		if len(pks) > 0 {
+			candidates = append(candidates, pks)
+		}
+	}
+	if len(candidates) == 0 {
+		return group
+	}
+	if best := bestCoveringAggPathkeys(group, candidates); best != nil {
+		return best
+	}
+	return group
+}
+
+// orderedAggPresearchPathkeys is make_pathkeys_for_sortclauses over one
+// aggregate's sort list: aggdistinct for a DISTINCT aggregate (its ORDER BY
+// items, then the remaining arguments ascending, as aggregateSortlist builds
+// it), aggorder otherwise. Constant keys are dropped (pathkey_is_redundant
+// case 1); any other key that is not a searched column declines (false).
+func orderedAggPresearchPathkeys(fc *parser.FuncCall, s *parser.SelectStmt, ctx *resolveContext) ([]PathKey, bool) {
+	items := make([]presearchSortItem, 0, len(fc.OrderBy)+len(fc.Args))
+	for _, sb := range fc.OrderBy {
+		if sb.UsingOp != "" {
+			return nil, false
+		}
+		items = append(items, presearchSortItem{expr: sb.Expr, desc: sb.Desc, nullsFirst: sortByNullsFirst(sb)})
+	}
+	if fc.Distinct {
+		for _, a := range fc.Args {
+			items = append(items, defaultSortItem(a))
+		}
+	}
+	var keys []PathKey
+	for _, it := range items {
+		if parserIsPlainConst(it.expr) {
+			continue
+		}
+		col, ok := resolvePresearchSortExpr(it.expr, s, ctx)
+		if !ok {
+			return nil, false
+		}
+		pk := PathKey{Expr: col, SortAsc: !it.desc, NullsFirst: it.nullsFirst}
+		if pathkeyRedundantIn(pk, keys) {
+			continue
+		}
+		keys = append(keys, pk)
+	}
+	return keys, true
+}
+
+// parserIsPlainConst is isPlainConst on the written form: a literal.
+func parserIsPlainConst(e parser.Expr) bool {
+	switch e.(type) {
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.TypedStringLit, *parser.NullConst, *parser.BooleanConst:
+		return true
+	}
+	return false
+}
+
+// parserArgsAllColumnOrConst is aggArgsAllVarConst on the written form: PG
+// presorts a FILTERed aggregate only when every argument is a Var or a Const.
+func parserArgsAllColumnOrConst(args []parser.Expr) bool {
+	for _, a := range args {
+		if _, ok := a.(*parser.ColumnRef); ok {
+			continue
+		}
+		if !parserIsPlainConst(a) {
+			return false
+		}
+	}
+	return true
 }
 
 // presearchSortItem is one clause item on its way to a pathkey: the written

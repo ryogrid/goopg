@@ -295,6 +295,34 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		grouppathkeys = append(grouppathkeys, PathKey{Expr: aggNode.GroupExprs[k.Pos], SortAsc: !k.Desc, NullsFirst: k.NullsFirst})
 	}
 
+	cands := make([][]PathKey, len(candidates))
+	for i := range candidates {
+		cands[i] = candidates[i].pathkeys
+	}
+	bestpathkeys := bestCoveringAggPathkeys(grouppathkeys, cands)
+	if bestpathkeys == nil {
+		return nil, false
+	}
+
+	finalSortKeys := make([]SortKey, 0, len(bestpathkeys))
+	for _, pk := range bestpathkeys {
+		finalSortKeys = append(finalSortKeys, SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst})
+	}
+	return finalSortKeys, true
+}
+
+// bestCoveringAggPathkeys is adjust_group_pathkeys_for_groupagg's selection
+// loop (planner.c): take the first unprocessed aggregate's pathkeys (behind
+// the GROUP BY pathkeys), absorb every aggregate whose keys are equal, weaker
+// or stronger along the same prefix, then retry with the aggregates left over
+// while they could still cover more than the best set so far. It returns the
+// winning group-plus-aggregate pathkeys, or nil when there is no candidate.
+//
+// Shared by the aggregate stage (presortedAggKeysOrAbsent, over the built
+// Aggregate's expressions) and the pre-search query pathkeys
+// (adjustGroupPathkeysForGroupAgg, over FROM-level columns), so both read the
+// same aggregates the same way (M0146-0142).
+func bestCoveringAggPathkeys(grouppathkeys []PathKey, candidates [][]PathKey) []PathKey {
 	bestCount := 0
 	var bestpathkeys []PathKey
 	unprocessed := make([]int, len(candidates))
@@ -305,7 +333,7 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		var currpathkeys []PathKey
 		covered := make([]bool, len(candidates))
 		for _, ui := range unprocessed {
-			pk := appendPathKeys(append([]PathKey(nil), grouppathkeys...), candidates[ui].pathkeys)
+			pk := appendPathKeys(append([]PathKey(nil), grouppathkeys...), candidates[ui])
 			if currpathkeys == nil {
 				currpathkeys = pk
 				covered[ui] = true
@@ -338,15 +366,7 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 			bestpathkeys = currpathkeys
 		}
 	}
-	if bestpathkeys == nil {
-		return nil, false
-	}
-
-	finalSortKeys := make([]SortKey, 0, len(bestpathkeys))
-	for _, pk := range bestpathkeys {
-		finalSortKeys = append(finalSortKeys, SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst})
-	}
-	return finalSortKeys, true
+	return bestpathkeys
 }
 
 // groupKeysSortKeys is one SortKey per group expression, in the order and
@@ -469,9 +489,28 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		input := seed
 		producer := groupAggPlainProducer
 		if presorted {
-			// M0144-0003c: narrowed seed — both sort sites change together
-			// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
-			input = sortPathForBounded(sortSeed, pathkeysForSortKeys(presortedKeys), cp, -1)
+			// M0146-0142: add_paths_to_grouping_rel's AGG_PLAIN arm goes
+			// through make_ordered_path like AGG_SORTED does: an input whose
+			// pathkeys already contain the presorted-aggregate keys feeds the
+			// Aggregate with no Sort (TPC-DS Q95's count(DISTINCT
+			// ws_order_number) over a Gather Merge sorted on it, now that the
+			// query pathkeys ask the search for that order). Same is_sorted
+			// test as the grouped arm below.
+			wantKeys := pathkeysForSortKeys(presortedKeys)
+			var seedUseful *pathkeyUsefulness
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				seedUseful = sr.usefulKeys
+			}
+			if seedKeys := inputNodePathkeys(child); len(seedKeys) > 0 &&
+				func() bool { c, _ := seedUseful.countContainedIn(seedKeys, wantKeys); return c }() {
+				sorted := *seed
+				sorted.Pathkeys = seedKeys
+				input = &sorted
+			} else {
+				// M0144-0003c: narrowed seed — both sort sites change together
+				// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
+				input = sortPathForBounded(sortSeed, wantKeys, cp, -1)
+			}
 			producer = groupAggSortedProducer
 		}
 		// R47 slice 1: per-candidate spec clone. All arms below used
