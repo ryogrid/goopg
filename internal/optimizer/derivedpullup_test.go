@@ -3,6 +3,7 @@ package optimizer
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -349,5 +350,61 @@ func TestDerivedPullupLateral(t *testing.T) {
 	_, _, rctx = pullupPlanFrom(t, "SELECT * FROM b, LATERAL (SELECT ax FROM a WHERE ay IN (SELECT cx FROM c WHERE cy = b.by)) y")
 	if len(rctx.pulledDerived) != 0 {
 		t.Fatalf("pulledDerived=%d, want the sublink-bearing LATERAL body left unpulled", len(rctx.pulledDerived))
+	}
+}
+
+// TestExpandPullupBodyStarsOverASharedCTE pins M0146-0145: a pulled body's
+// `*` over a CTE that is NOT itself inlined — a shared or MATERIALIZED CTE,
+// or an enclosing recursive CTE's worktable — expands to that CTE's planned
+// (alias-renamed) columns, as a `*` over a CTE scan does. Declining there
+// kept regress subselect's `with z as not materialized (select * from x)`
+// inside a recursive term as `Subquery Scan on z` over the WorkTable Scan,
+// where PG pulls z up and filters the WorkTable Scan itself.
+func TestExpandPullupBodyStarsOverASharedCTE(t *testing.T) {
+	saved := planCTEs
+	defer func() { planCTEs = saved }()
+	planCTEs = map[string]*plannedCTE{
+		"x": {name: "x", table: &catalog.Table{Name: "x", Columns: []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "text"}},
+			{Name: "b", Type: catalog.Type{Name: "int4"}},
+		}}},
+	}
+	parse := func(sql string) *parser.SelectStmt {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		return stmts[0].(*parser.SelectStmt)
+	}
+	for _, tc := range []struct {
+		sql  string
+		want []string // qualified expansions; nil = declined
+	}{
+		{"select * from x", []string{"x.a", "x.b"}},
+		{"select xx.*, 1 as c from x xx", []string{"xx.a", "xx.b", "?"}},
+		// A column-alias list on the reference renames the outputs; not
+		// carried by this pass, so it declines.
+		{"select * from x xx(p, q)", nil},
+	} {
+		got, ok := expandPullupBodyStars(parse(tc.sql), catalog.NewInMemory())
+		if tc.want == nil {
+			if ok {
+				t.Errorf("%s: expanded %v, want a decline", tc.sql, got)
+			}
+			continue
+		}
+		if !ok || len(got) != len(tc.want) {
+			t.Fatalf("%s: got %v (ok=%v), want %v", tc.sql, got, ok, tc.want)
+		}
+		for i, w := range tc.want {
+			cr, isCol := got[i].Expr.(*parser.ColumnRef)
+			name := "?"
+			if isCol {
+				name = cr.Table + "." + cr.Column
+			}
+			if name != w {
+				t.Errorf("%s: target %d = %s, want %s", tc.sql, i, name, w)
+			}
+		}
 	}
 }
