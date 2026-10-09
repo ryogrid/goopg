@@ -48,6 +48,25 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// nestJoinOK is match_unsorted_outer's jointype gauntlet (joinpath.c):
+// "Nestloop only supports inner, left, semi, and anti joins". JOIN_RIGHT,
+// JOIN_RIGHT_ANTI and JOIN_FULL set nestjoinOK = false (and JOIN_RIGHT_SEMI
+// returns before any arm), so PG never runs a nested loop with the nullable
+// side outer — the LEFT orientation of the same pair carries the nested
+// loop instead. goopg's plain and materialised arms used to admit RIGHT, and
+// TPC-DS Q72 SF1 elected a `Nested Loop Right Join` (promotion outer over a
+// Materialize of the 2-row join) where PG has the LEFT nested loop with a
+// Materialized promotion inner (M0146-0144). The parameterised arm
+// (addNLIPaths) and the partial one (partialHashJoinTypeOK) already decline
+// these types.
+func nestJoinOK(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinRight, parser.JoinRightAnti, parser.JoinRightSemi, parser.JoinFull:
+		return false
+	}
+	return true
+}
+
 // splitJoinClauses divides a joinrel's restriction list into the clauses a
 // keyed operator can KEY on for this pair of input relsets, and the residual
 // the operator must evaluate per tuple.
@@ -509,7 +528,9 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		// residual: it evaluates every clause, on every pair. Passing
 		// `clauses` whole rather than `append(keys, residual...)` also keeps
 		// the input order.
-		addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
+		if nestJoinOK(jt) {
+			addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
+		}
 	}
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
@@ -517,7 +538,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo, semi)
 	// The materialised inner comes after the parameterised probes, as in
 	// match_unsorted_outer's per-outer order (addMaterialNestLoopPath).
-	if !pathParamByRel(i, outer) {
+	if !pathParamByRel(i, outer) && nestJoinOK(jt) {
 		addMaterialNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
 	}
 	// R60 (plan-parity-fix take2): PG's post-serial-arms parallel block runs
