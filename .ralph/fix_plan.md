@@ -30655,7 +30655,7 @@ Movement: none — recon
     - Fire set: Q4/Q11/Q58/Q64/Q70 move; only Q70 parameterisation \+1 at both scales; regress A/B unchanged; TPC\-H identical\.
     - Design: `docs/design/0100\-0149/m0146\-0149\-incremental\-sort\-rows\.md`\.
 Movement: none — Q70 first divergence unchanged \(join\-level choice now PG\'s; election above is M0146\-0150\); parameterisation \+1 at both scales
-- [ ] **M0146\-0150 — the grouping step hashes over the scan/join rel\'s cheapest\-total path \(TPC\-DS Q70\)**
+- [x] **M0146\-0150 — the grouping step hashes over the scan/join rel\'s cheapest\-total path \(TPC\-DS Q70\)**
   \(filed 2026\-10\-10 by M0146\-0149\)\. PG\'s create\_grouping\_paths / add\_paths\_to\_grouping\_rel hash over
   input\_rel\->cheapest\_total\_path \(and the sorted arms over every input path\)\. Q70\'s 4\-rel joinrel has PG\'s Hash Semi Join as
   its cheapest total \(38367\.56, SF0\.25 trace\), but the MixedAggregate is seeded with the ordered unique\-ified NL inner
@@ -30666,3 +30666,11 @@ Movement: none — Q70 first divergence unchanged \(join\-level choice now PG\'s
     statement whose search winner differs from its cheapest total may move — fire set\.
   - First step: trace which path finalPath / the seam hands buildAggregateStage for Q70 and why \(fraction vs pathkeys\); give
     the hashed and plain arms the rel\'s CheapestTotal \(searchedCandidateInput\) when it differs from the seed\.
+  - Done 2026\-10\-10 \(41140c552\): rootCheapestTotal \(needsAggregateStage\) makes the search root \(rootPathOf, GEQO\) hand up
+    CheapestTotal under an aggregate stage — PG applies the fraction only at final\_rel\.
+    - Q70\'s premise refuted: its LIMIT is on the outer wrapper \(tf=0 in the grouped query\); its 4\-rel joinrel is a fuzzy
+      near\-tie \(ordered unique NL inner 38326\.14 vs Hash Semi Join 38266\.63, 0\.16%, startups within fuzz\) where add\_path
+      keeps the path with pathkeys — Q70 routes to COSTTIE\.
+    - Fire set: no query moves; TPC\-H identical; regress A/B unchanged\.
+    - Design: `docs/design/0100\-0149/m0146\-0150\-grouping\-seed\-cheapest\-total\.md`\.
+Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to COSTTIE \(near\-tie\)
