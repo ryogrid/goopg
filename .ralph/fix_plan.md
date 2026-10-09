@@ -30564,3 +30564,49 @@ Movement: none — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 9 → 10 \(alignm
     - Spent root M0146\-0007\'s last S4 slot — escalation block written, root held \[\!\]\.
     - Design: `docs/design/0100\-0149/m0146\-0007\-inline\-cte\.md` §Slice 10\.
 Movement: none — no TPC\-DS/TPC\-H query has this shape \(fire set flat\); regress subselect witness fixed
+- [x] **M0146\-0014b — parity\-closure sweep: routing refresh 2026\-10\-10 \(TPC\-DS SF0\.25 \+ SF1\)**
+  \(the M0146\-0014 sweep at HEAD `05897eb09`; M0146\-0014 stays open as the milestone\'s final exit report\)\.
+  Kind: recon
+  Parent: M0146-0014
+  - Done 2026\-10\-10: all 106 first\-divergence records \(SF0\.25 46, SF1 60; match 53 / 39\) route to a live task or a named
+    owner residual — `analysis/m0146/m0146\-0014/routing\-20261010/ROUTING\.md`\.
+    - 84 carried \(first divergence and route unchanged\); 22 re\-analysed from plan text with cost numbers \(manual\-routes\.tsv,
+      agent\-joinorder\.md, agent\-sort\-ios\.md\); the two code claims behind new tasks verified against the source\.
+    - Owner residuals: B8 32, COSTTIE 29, RELPAGES 16, B\-15 7, RENDERING 5, GEQO\-RNG 2 \(new: Q64 exact probe tie settled by
+      PG\'s GEQO random stream — waive\)\.
+    - Filed M0146\-0146, 0147, 0148\.
+    - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md` §2026\-10\-10\.
+Movement: none — recon
+- [ ] **M0146\-0146 — a Subquery Scan whose target list carries a computed resjunk ORDER BY key is not trivial \(TPC\-DS Q36, Q70, Q86\)**
+  \(filed 2026\-10\-10 by M0146\-0014b\)\. PG keeps `Subquery Scan on sub` above the WindowAgg: the outer ORDER BY\'s
+  `CASE WHEN lochierarchy = 0 THEN i\_category END` is evaluated at the scan \(the only leaf\), so its tlist is longer than the
+  subplan\'s and setrefs\.c `trivial\_subqueryscan` keeps it\. goopg\'s stripTrivialSubqueryScans only checks which positions the
+  scope consumes, so it strips the wrapper\.
+  Kind: impl
+  Parent: M0146-0014b
+  - Expected movement: Q36/Q70/Q86 first divergence leaves `\[scan\-type\] under Sort` at both scales \(6 records\); measured by the
+    fire set\.
+  - First step: in subqueryscan\_strip\.go, treat a leaf whose enclosing single\-leaf scope computes a non\-Var target or resjunk
+    sort key over it as non\-trivial; regress A/B \(subselect, window\) for over\-keep\.
+- [ ] **M0146\-0147 — the needed\-column set for a statement with a WITH clause \(index\-only paths; TPC\-DS Q95\)**
+  \(filed 2026\-10\-10 by M0146\-0014b\)\. `collectStmtColumnNames` \(pathindexonlyneed\.go\) declines any statement with
+  `s\.With != nil`, so `neededColsKnown` is false and no index\-only path is offered; PG\'s check\_index\_only reads the attrs the
+  query uses \(CTE bodies are separate query levels\)\. Q95\'s web\_returns\_pkey probe is an Index Scan where PG \(and goopg\'s own
+  Q94, the same probe without WITH\) uses an Index Only Scan\.
+  Kind: impl
+  Parent: M0146-0014b
+  - Expected movement: Q95 first divergence \(`\[scan\-type\] under Hash Join`\) at both scales — Q95 SF0\.25 can reach MATCH
+    \(its only category\); measured by the fire set\.
+  - First step: let the walker skip the WITH list \(each CTE body is planned by its own planSelect and gets its own set\) and
+    keep declining the other modelled\-out shapes; check every query that gains an index\-only path in the fire set\.
+- [ ] **M0146\-0148 — a searched sub\-joinlist hands its whole pathlist up \(TPC\-DS Q72 SF1\)**
+  \(filed 2026\-10\-10 by M0146\-0014b; the open pathlist half of ledger row M0127\-P5\.9\-a\)\. make\_rel\_from\_joinlist returns
+  the sub\-problem\'s RelOptInfo, so the enclosing search sees all its paths; goopg\'s searchOneProblem/finalPath publishes only
+  CheapestTotal \(Gather 61108\.13\) and drops the sorted Gather Merge \(\~61108\.23\) PG builds Q72\'s d3/promotion nested loops
+  on, which feeds the GroupAggregate without a Sort\.
+  Kind: impl
+  Parent: M0146-0014b
+  - Expected movement: Q72 SF1 `\[sort\-strategy\]` first divergence \(and its categories\); any query with a join\_collapse\_limit
+    split may move — measured by the fire set at both scales\.
+  - First step: trace Q72 SF1\'s sub\-problem pathlist \(GOOPG\_PGSHAPED\_DP\_TRACE\) to confirm the Gather Merge candidate exists,
+    then let the enclosing problem\'s leaf rel take the sub\-problem\'s pathlist \(joinlistRel\.rel\) instead of one PathPrebuilt\.

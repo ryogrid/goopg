@@ -1,0 +1,22 @@
+sf025	Q5	COSTTIE	M0146-0014 — waived residual (COSTTIE)	wsr web_site join: goopg NL+web_site_pkey probe 19991.00 vs its hash alternative ~19991.2 (PG hashes 30 rows, +2.73); 0.001%
+sf025	Q6	RENDERING	M0146-0042 [!] (EXPLAIN text)	SubPlan correlated argument printed `$0` vs PG `i.i_category` (M0146-0130 not-covered)
+sf1	Q6	RENDERING	M0146-0042 [!] (EXPLAIN text)	same as SF0.25
+sf025	Q36	SUBQSCAN-RESJUNK	M0146-0146	PG keeps `Subquery Scan on sub`: the outer ORDER BY's CASE resjunk entry makes the scan tlist non-trivial (setrefs.c trivial_subqueryscan); goopg strips it
+sf1	Q36	SUBQSCAN-RESJUNK	M0146-0146	same
+sf025	Q70	SUBQSCAN-RESJUNK	M0146-0146	same
+sf1	Q70	SUBQSCAN-RESJUNK	M0146-0146	same
+sf025	Q86	SUBQSCAN-RESJUNK	M0146-0146	same
+sf1	Q86	SUBQSCAN-RESJUNK	M0146-0146	same
+sf025	Q49	B8	M0145-0008ag [!] (owner B8 decision, M0146-0068)	web_sales_pkey probe: goopg Bitmap Heap Scan 12.39 vs PG Index Scan 7.94
+sf1	Q49	B8	M0145-0008ag [!] (owner B8 decision, M0146-0068)	same signature at SF1 (12.39 vs 7.9x)
+sf025	Q92	B8	M0145-0008ag [!] (owner B8 decision, M0146-0068)	date_dim_pkey probe: goopg Bitmap Heap Scan 12.27 vs PG Index Scan 8.32
+sf025	Q58	RENDERING	M0146-0042 [!] (EXPLAIN text)	identical structure; InitPlan numbering differs (goopg 1/2, PG 2/1 — sublink planning order)
+sf1	Q58	RENDERING	M0146-0042 [!] (EXPLAIN text)	same
+sf025	Q79	B8	M0145-0008ag [!] (owner B8 decision, M0146-0068)	M0146-0139: customer_pkey probe 8.44 vs PG 4.63, else near-tie
+sf1	Q35	RELPAGES	owner SF1 reload	M0146-0131: customer_address ~955 pages < min_parallel_table_scan_size at SF1
+sf025	Q64	GEQO-RNG	M0146-0014 — waived residual (GEQO-RNG)	exact tie among 14 one-row probes (PG 5.45 = 5.45); PG's geqo tour (pg_prng xoroshiro128**) decides the order — agent-joinorder.md
+sf1	Q64	GEQO-RNG	M0146-0014 — waived residual (GEQO-RNG)	same exact probe tie (PG 5.31); deeper head difference is B8 — agent-joinorder.md
+sf1	Q18	B8	M0145-0008ag [!] (owner B8 decision, M0146-0068) (+B-15)	0.03% near-tie flipped by the 2x probe I/O (22 units) or the missing log2(N) descent (17 units) — agent-joinorder.md
+sf1	Q72	SUBPROB-PATHLIST	M0146-0148	sub-joinlist publishes only CheapestTotal (Gather 61108.13); PG's whole RelOptInfo keeps the sorted Gather Merge (~61108.23) it builds the NL chain on — agent-sort-ios.md
+sf025	Q95	WITH-NEEDEDCOLS	M0146-0147	collectStmtColumnNames declines statements with WITH (pathindexonlyneed.go), so web_returns_pkey is never index-only; Q94's identical probe is IOS — agent-sort-ios.md
+sf1	Q95	WITH-NEEDEDCOLS	M0146-0147	same — agent-sort-ios.md
