@@ -30517,7 +30517,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 39 → 38, join\-m
       and outer aggregates in a HAVING IN subquery\'s WHERE stay ledgered \(all pre\-existing\)\.
     - Design: `docs/design/0100\-0149/m0146\-0143\-aggregate\-collection\-walk\.md`\.
 Movement: none — Q70 turns from a capture error into a counted shape\-diff \(categories \+1 each in its six at both scales\); no plan of an already\-measured query moved; match 53/39 unchanged
-- [ ] **M0146\-0144 — no plain nested loop for JOIN\_RIGHT \(TPC\-DS Q72 SF1\)**
+- [x] **M0146\-0144 — no plain nested loop for JOIN\_RIGHT \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-09 by M0146\-0141\)\. PG\'s match\_unsorted\_outer sets `nestjoinOK = false` for JOIN\_RIGHT, JOIN\_RIGHT\_ANTI and
   JOIN\_FULL \(joinpath\.c\), so a LEFT join is never run as a nested loop with the nullable side outer\. goopg\'s addNestLoopPath
   and addMaterialNestLoopPath admit Right on purpose \(joinpathsnli\.go R64 comment\)\. Q72 SF1 now joins promotion as a
@@ -30527,3 +30527,10 @@ Movement: none — Q70 turns from a capture error into a counted shape\-diff \(c
   Parent: M0146-0141
   - First step: gate the plain and materialised nested\-loop arms \(and addPartialNestLoopPaths\) on PG\'s nestjoinOK jointype set;
     fire set at both scales; check no RIGHT/FULL join is left without a path \(merge/hash must cover them, as in PG\)\.
+  - Done 2026\-10\-10 \(0ffe3f88b\): nestJoinOK gates addNestLoopPath \+ addMaterialNestLoopPath at the addPathsToJoinrel call
+    site \(RIGHT/RIGHT\_ANTI/RIGHT\_SEMI/FULL refused; NLI and partial arms already refused them\)\.
+    - Q72 SF1: PG\'s Nested Loop Left Join over Materialize\(promotion\); qual\-placement 9 → 10 is a diff\-alignment artifact of the
+      remaining sort\-strategy divergence \(verbose diff pairs nodes one level off\)\.
+    - Regress A/B: rangefuncs −116, join −53 diff lines, no case regressed\.
+    - Design: `docs/design/0100\-0149/m0146\-0144\-no\-nestloop\-for\-right\-join\.md`\.
+Movement: none — CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 9 → 10 \(alignment artifact\); all else unchanged; the elected Q72 join is now PG\'s LEFT nested loop
