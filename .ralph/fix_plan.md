@@ -30331,11 +30331,20 @@ Movement: none — parity held: no TPC query has a constant\-false outer\-join q
     - Re\-analysed in three read\-only plan\-text passes \(agent\-sort/partial/probe\.md\); filed M0146\-0130 … 0140\.
     - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md`\.
 Movement: none — recon
-- [ ] **M0146\-0130 — a correlated SubPlan makes its rel parallel\-restricted \(TPC\-DS Q6, Q92\)**
+- [x] **M0146\-0130 — a correlated SubPlan makes its rel parallel\-restricted \(TPC\-DS Q6, Q92\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG\'s max\_parallel\_hazard\_walker treats a SubPlan with PARAM\_EXEC args as parallel\-restricted \(set\_rel\_consider\_parallel\), so Q6 keeps `item` with its `i\_current\_price > 1\.2 \* \(SubPlan\)` qual above the Gather Merge \(probe 1513\.82, total 427656\.80\); goopg runs it in the workers and leaves the SubPlan uncosted on a Gather Filter \(18921\.80\)\. Q92 SF0\.25 likewise \(Gather 5611\.26 vs PG serial 8959\.91\)\.
   Kind: impl
   Parent: M0146-0014a
   - First step: find goopg\'s parallel\-safety check for rels and joinrels and test it against a correlated SubPlan qual on Q6\'s `item`\.
+  - Done 2026\-10\-09 \(a6905e365\): two mechanisms, both needed for Q6\.
+    - A correlated scalar sublink conjunct that also reads its own leaf\'s column is filtered on that leaf at any binding, not only
+      binding 0 \(correlatedScalarSublinkLeaf / correlatedScalarSublinkBinding\); SubqueryExpr/ExistsExpr\.OuterRowPad carries the
+      binding to the executor \(padOuterRow\) and to PARAM\_EXEC lowering\.
+    - subtreeHasParallelRestrictedQual refuses a correlated SubPlan qual at the partial aggregate/distinct splits; the node\-kind
+      gate is unchanged, since a global Join/Filter hazard there lost Q32/Q92 SF1\'s Gather below the correlated Join Filter\.
+    - Q6 → \[parameterisation\] at both scales; Q92 SF0\.25 5 → 2 categories\. TPC\-H plans byte\-identical; ea\-ratchet unchanged \(1\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0130\-correlated\-sublink\-leaf\-and\-parallel\-restriction\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 49 → 48, sort\-strategy 25 → 24, parallelism 38 → 37; SF0\.25 join\-order 41 → 40, join\-method 19 → 18, parameterisation 20 → 19, sort\-strategy 22 → 21, parallelism 23 → 21 \(TPC\-DS Q6, Q92\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0131 — the LIMIT fraction selects an ordered grouping input \(TPC\-DS Q35\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG drives Q35 from Gather Merge→Sort of `customer\_address` into a GroupAggregate over an Incremental Sort presorted on `ca\_state`; its total is higher but under LIMIT 100 it costs 4\.09M vs goopg\'s 58\.33M \(SF1 26\.88M vs 781M\) — get\_cheapest\_fractional\_path on the final rel\. goopg never offers the ordered candidate to grouping\.
   Kind: impl
