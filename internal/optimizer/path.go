@@ -840,6 +840,10 @@ type rangeTblEntry struct {
 	// same `scanLeafFor` predicate, so a path is never COSTED over a leaf
 	// the builder cannot rebuild.
 	baseLeaf Node
+	// altLeaves are a searched sub-problem leaf's ordered runner-up trees
+	// (baseRelInfo.subproblemAlts), filed beside baseLeaf as further prebuilt
+	// paths by addCTEScanPathkeys (M0146-0148).
+	altLeaves []Node
 
 	// baseOffset is WHERE this base relation's columns sat before the search
 	// ran: the index, in the pre-search "binding" coordinate space, of the

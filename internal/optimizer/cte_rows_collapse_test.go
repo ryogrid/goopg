@@ -78,3 +78,35 @@ func TestInitialRelRowsSearchedLeafReadsItsRel(t *testing.T) {
 		t.Errorf("Aggregate over a searched tree: initialRelRows = %v, want the subtree estimate %v", got, est)
 	}
 }
+
+// TestSubproblemLeafPathkeysTranslateToBindingCoordinates pins M0146-0148's
+// coordinate rule: a sub-problem tree publishes the binding-order window that
+// starts at its leaf's binding offset, so the ordering it delivers at published
+// position i names coordinate off+i in the enclosing search — the coordinate
+// that problem's clauses and the query pathkeys use for that column. A key
+// that is not a column of the published row stops the translation.
+func TestSubproblemLeafPathkeysTranslateToBindingCoordinates(t *testing.T) {
+	child := upperOrderedInput(10) // k int4, v text, w numeric
+	sorted := &Sort{Child: child, Keys: []SortKey{
+		{Expr: &ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "text"}}, Desc: true, NullsFirst: true},
+		{Expr: &ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}},
+	}}
+	keys := subproblemLeafPathkeys(7, sorted)
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want 2", keys)
+	}
+	for i, want := range []struct {
+		idx  int
+		name string
+		asc  bool
+	}{{8, "v", false}, {7, "k", true}} {
+		cr, ok := keys[i].Expr.(*ColumnRef)
+		if !ok || cr.Index != want.idx || cr.Name != want.name || keys[i].SortAsc != want.asc {
+			t.Errorf("key %d = %+v (asc=%v), want coordinate %d %q asc=%v", i, keys[i].Expr, keys[i].SortAsc, want.idx, want.name, want.asc)
+		}
+	}
+	unordered := upperOrderedInput(10)
+	if got := subproblemLeafPathkeys(7, unordered); len(got) != 0 {
+		t.Errorf("an unordered tree claims %v, want none", got)
+	}
+}

@@ -418,6 +418,9 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// original leaf's identity — alias, schema, local-qual wrappers — to
 		// copy forward (createplanindex.go).
 		rel.baseLeaf = leaf
+		if relInfos[i].subproblemAlts != nil {
+			rel.altLeaves = relInfos[i].subproblemAlts()
+		}
 		// …and WHERE it sat, which is the half of 03 §10's map the leaf node
 		// itself cannot supply: a `*SeqScan` knows its own schema but not the
 		// offset at which that schema was spliced into the pre-search

@@ -37,6 +37,9 @@ func (s *searchCtx) addCTEScanPathkeys() {
 		if rel == nil || rel.baseLeaf == nil {
 			continue
 		}
+		if len(rel.altLeaves) > 0 {
+			s.addSubproblemAltPaths(rel)
+		}
 		var keys []PathKey
 		if scan, ok := leafBaseScan(rel.baseLeaf).(*CTEScan); ok {
 			if scan.Child == nil {
@@ -101,6 +104,56 @@ func (s *searchCtx) convertLeafPathkeys(rel *RelOptInfo, relIdx int, bodyKeys []
 			break
 		}
 		keys = append(keys, PathKey{Expr: e, SortAsc: bk.SortAsc, NullsFirst: bk.NullsFirst})
+	}
+	return keys
+}
+
+// addSubproblemAltPaths files a searched sub-problem leaf's ordered runner-up
+// trees (RelOptInfo.altLeaves) as further prebuilt paths on its leaf rel,
+// each priced like the winner's leaf (costSubplanLeaf) and carrying its own
+// ordering (M0146-0148). PG's enclosing search reads the sub-problem's
+// RelOptInfo, so its sorted Gather Merge competes there beside the Gather; an
+// ordered path that costs a little more survives add_path on its pathkeys and
+// lets the joins above it (and the grouping step) skip a Sort.
+func (s *searchCtx) addSubproblemAltPaths(rel *RelOptInfo) {
+	added := false
+	for _, alt := range rel.altLeaves {
+		keys := subproblemLeafPathkeys(rel.baseOffset, alt)
+		if len(keys) == 0 {
+			continue
+		}
+		p := newPrebuiltPath(rel, alt)
+		p.Cost = costSubplanLeaf(s.cp, alt, rel.Rows)
+		p.Pathkeys = keys
+		addPath(rel, p, "joinsearch.prebuilt.alt")
+		added = true
+	}
+	if added {
+		setCheapest(rel)
+	}
+}
+
+// subproblemLeafPathkeys translates a sub-problem tree's delivered ordering
+// from its published row (positions 0..width-1, inputNodePathkeys) into the
+// enclosing search's coordinates. The tree publishes the binding-order window
+// that starts at the leaf's binding offset, so position i is coordinate
+// off+i — the same coordinate the enclosing problem's clauses and the query
+// pathkeys name that column by. The translation stops at the first key that
+// is not a column of the row.
+func subproblemLeafPathkeys(off int, n Node) []PathKey {
+	out := n.Output()
+	var keys []PathKey
+	for _, bk := range inputNodePathkeys(n) {
+		cr, ok := bk.Expr.(*ColumnRef)
+		if !ok || cr.Index < 0 || cr.Index >= len(out) {
+			break
+		}
+		col := out[cr.Index]
+		keys = append(keys, PathKey{
+			Expr:       &ColumnRef{Index: off + cr.Index, Name: col.Name, Type: col.Type, SourceTableIdx: col.SourceTableIdx},
+			SortAsc:    bk.SortAsc,
+			NullsFirst: bk.NullsFirst,
+		})
 	}
 	return keys
 }

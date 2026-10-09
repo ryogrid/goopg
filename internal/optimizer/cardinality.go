@@ -957,6 +957,11 @@ type baseRelInfo struct {
 	// fillable); it also kept the retired `outer-over-derived` firewall's
 	// `leafIsDerivedInput` from reading the nil `table` as "no statistics".
 	isSemiAntiSyntheticLeaf bool
+	// subproblemAlts builds a searched sub-problem leaf's ordered runner-up
+	// trees (M0146-0148): make_rel_from_joinlist hands the enclosing search
+	// the sub-problem's whole RelOptInfo, so every path it kept is a
+	// candidate there, not only the cheapest. Nil for any other leaf.
+	subproblemAlts func() []Node
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist

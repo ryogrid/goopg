@@ -70,6 +70,7 @@ package optimizer
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -740,6 +741,63 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	fill := func(coord int) (SchemaColumn, bool) {
+		for i := range items {
+			sp := itemSpans[i]
+			if coord < sp.lo || coord >= sp.hi {
+				continue
+			}
+			leafSchema := scans[i].Output()
+			pos := coord - sp.lo
+			if pos < 0 || pos >= len(leafSchema) {
+				return SchemaColumn{}, false
+			}
+			col := leafSchema[pos]
+			if col.Name == "" {
+				return SchemaColumn{}, false
+			}
+			// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
+			// projects its RHS columns above itself, so nothing outside
+			// the search can ever reference a semiAnti synthetic leaf's
+			// own coordinate range — it is always fillable, independent
+			// of the statement's needed/output-column sets (which may
+			// even be unknown here). Checked before neededColsKnown
+			// because that gate exists for the OTHER leaf kinds, where
+			// "unknown" must fail closed.
+			if infos[i].isSemiAntiSyntheticLeaf {
+				return col, true
+			}
+			if !prob.neededColsKnown {
+				return SchemaColumn{}, false
+			}
+			// M0146-0005bq-b: attributed to this leaf's alias, the same
+			// rule the index-only producer used to prune it — another
+			// alias of the same table reading the name by qualified
+			// reference does not read THIS leaf's column.
+			qual := ""
+			if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
+				qual = id.alias
+				if qual == "" && id.table != nil {
+					qual = id.table.Name
+				}
+			}
+			if prob.outputColsKnown && prob.outputCols != nil {
+				if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
+					return SchemaColumn{}, false
+				}
+				return col, true
+			}
+			if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
+				return SchemaColumn{}, false
+			}
+			return col, true
+		}
+		return SchemaColumn{}, false
+	}
+	node := createPlanAtSearchRootRange(p, base, width, fill)
+	// M0146-0148: the sub-problem's ordered runner-up paths, rebuilt on
+	// demand by the enclosing problem (baseRelInfo.subproblemAlts).
+	alts := func() []Node { return subproblemAltTrees(p, node, base, width, fill) }
 	return joinlistRel{
 		// The hole-filler licenses a PADDED boundary slot for exactly the
 		// coordinates a narrowed leaf legitimately dropped. Take2 P4-01
@@ -751,59 +809,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// falls the search back when the above-root residual references a
 		// padded coordinate — the totality assertion stays loud for real
 		// producer bugs (M0134-0187, DESIGN §21).
-		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
-			for i := range items {
-				sp := itemSpans[i]
-				if coord < sp.lo || coord >= sp.hi {
-					continue
-				}
-				leafSchema := scans[i].Output()
-				pos := coord - sp.lo
-				if pos < 0 || pos >= len(leafSchema) {
-					return SchemaColumn{}, false
-				}
-				col := leafSchema[pos]
-				if col.Name == "" {
-					return SchemaColumn{}, false
-				}
-				// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
-				// projects its RHS columns above itself, so nothing outside
-				// the search can ever reference a semiAnti synthetic leaf's
-				// own coordinate range — it is always fillable, independent
-				// of the statement's needed/output-column sets (which may
-				// even be unknown here). Checked before neededColsKnown
-				// because that gate exists for the OTHER leaf kinds, where
-				// "unknown" must fail closed.
-				if infos[i].isSemiAntiSyntheticLeaf {
-					return col, true
-				}
-				if !prob.neededColsKnown {
-					return SchemaColumn{}, false
-				}
-				// M0146-0005bq-b: attributed to this leaf's alias, the same
-				// rule the index-only producer used to prune it — another
-				// alias of the same table reading the name by qualified
-				// reference does not read THIS leaf's column.
-				qual := ""
-				if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
-					qual = id.alias
-					if qual == "" && id.table != nil {
-						qual = id.table.Name
-					}
-				}
-				if prob.outputColsKnown && prob.outputCols != nil {
-					if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
-						return SchemaColumn{}, false
-					}
-					return col, true
-				}
-				if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
-					return SchemaColumn{}, false
-				}
-				return col, true
-			}
-			return SchemaColumn{}, false
-		}),
+		node: node,
 		// The searched tree enters the enclosing problem as a leaf at the first
 		// coordinate it publishes. Nothing else of the sub-problem crosses:
 		// `info` is deliberately table-less so that every producer that assumes
@@ -811,7 +817,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// the built node by `initialRelRows` — the pathlist-and-rows collapse
 		// this boundary performs (file header; ledgered).
 		binding: rangeBinding{offset: base},
-		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1},
+		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts},
 		lo:      lo,
 		hi:      hi,
 		// R21 slice 1: the chosen path's parent rel — the search's own
@@ -829,4 +835,61 @@ func onlySemiJoins(sjis []*SpecialJoinInfo) bool {
 		}
 	}
 	return true
+}
+
+// maxSubproblemAlts bounds how many ordered runner-up trees a sub-problem
+// hands up. PG keeps every path add_path kept; each rebuild here is a full
+// tree lowering, so the count is capped.
+const maxSubproblemAlts = 4
+
+// subproblemAltTrees rebuilds the ordered runner-up paths of a searched
+// sub-problem's rel as boundary trees, for the enclosing problem to offer
+// beside the winner (M0146-0148). make_rel_from_joinlist (allpaths.c) returns
+// the sub-problem's RelOptInfo, so the enclosing join search sees every path
+// it kept — TPC-DS Q72 SF1 builds its d3 and promotion nested loops on the
+// 8-rel sub-problem's sorted Gather Merge, which feeds the GroupAggregate with
+// no Sort, while goopg handed up only the cheaper Gather.
+//
+// Only unparameterised paths with pathkeys are rebuilt (an unordered runner-up
+// is dominated by the winner). Each is built with the winner's base, width and
+// hole-filler and kept only when it publishes the winner's exact row, so the
+// enclosing problem's coordinates hold for it; a rebuild that declines (a
+// boundary panic) is dropped, as searchedBoundaryRebuild drops one.
+func subproblemAltTrees(p *Path, winner Node, base, width int, fill func(int) (SchemaColumn, bool)) []Node {
+	if p == nil || p.Rel == nil || winner == nil {
+		return nil
+	}
+	var out []Node
+	for _, q := range p.Rel.Pathlist {
+		if q == nil || q == p || q.RequiredOuter != 0 || len(q.Pathkeys) == 0 {
+			continue
+		}
+		n := buildSubproblemAltTree(q, base, width, fill)
+		if n == nil || !outputSchemaEqual(n.Output(), winner.Output()) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) >= maxSubproblemAlts {
+			break
+		}
+	}
+	return out
+}
+
+// buildSubproblemAltTree lowers one runner-up path at the sub-problem's
+// boundary, declining (nil) where the lowering panics.
+func buildSubproblemAltTree(q *Path, base, width int, fill func(int) (SchemaColumn, bool)) (r Node) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			if dpTraceEnabled() {
+				fmt.Fprintf(os.Stderr, "DPPATH subproblem-alt declined: %v\n", rec)
+			}
+			r = nil
+		}
+	}()
+	r = createPlanAtSearchRootRange(q, base, width, fill)
+	if r != nil && q.Rel != nil {
+		applyECOrientation(r, q.Rel.ecWant)
+	}
+	return r
 }
