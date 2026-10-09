@@ -30611,7 +30611,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH match SF0\.25 53 → 55, SF1 39 → 41
     - Q95 → MATCH at both scales; Q2/Q59/Q78 change only in printed widths; sweep 99/99 values; regress A/B unchanged\.
     - Design: `docs/design/0100\-0149/m0146\-0147\-with\-needed\-columns\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH scan\-type SF0\.25 23 → 22, SF1 33 → 32; match SF0\.25 55 → 56, SF1 41 → 42
-- [ ] **M0146\-0148 — a searched sub\-joinlist hands its whole pathlist up \(TPC\-DS Q72 SF1\)**
+- [x] **M0146\-0148 — a searched sub\-joinlist hands its whole pathlist up \(TPC\-DS Q72 SF1\)**
   \(filed 2026\-10\-10 by M0146\-0014b; the open pathlist half of ledger row M0127\-P5\.9\-a\)\. make\_rel\_from\_joinlist returns
   the sub\-problem\'s RelOptInfo, so the enclosing search sees all its paths; goopg\'s searchOneProblem/finalPath publishes only
   CheapestTotal \(Gather 61108\.13\) and drops the sorted Gather Merge \(\~61108\.23\) PG builds Q72\'s d3/promotion nested loops
@@ -30622,3 +30622,10 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH scan\-type SF0\.25 23 → 22, SF1 33 �
     split may move — measured by the fire set at both scales\.
   - First step: trace Q72 SF1\'s sub\-problem pathlist \(GOOPG\_PGSHAPED\_DP\_TRACE\) to confirm the Gather Merge candidate exists,
     then let the enclosing problem\'s leaf rel take the sub\-problem\'s pathlist \(joinlistRel\.rel\) instead of one PathPrebuilt\.
+  - Done 2026\-10\-10 \(76e9d0f92\): subproblemAlts rebuilds up to 4 ordered, unparameterised runner\-ups at the sub\-problem
+    boundary; addSubproblemAltPaths files them as further leaf paths with subproblemLeafPathkeys \(offset\+i\) translation\.
+    - Trace \(private SF1 clone\): the Gather Merge alternative crosses and the ordered NL chain is built \(61228\.47\), but the
+      unordered chain \+ 2\-row Sort \(61228\.39\) is kept within STD\_FUZZ\_FACTOR — Q72 SF1 routes to COSTTIE\.
+    - Fire set: no query moves; regress A/B unchanged; TPC\-H identical\.
+    - Design: `docs/design/0100\-0149/m0146\-0148\-subproblem\-pathlist\.md`\.
+Movement: none — mechanism matches PG \(sub\-problem rel\'s ordered paths cross\); Q72 SF1 election is a sub\-unit near\-tie \(COSTTIE\)
