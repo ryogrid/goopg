@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
@@ -82,7 +83,11 @@ func FoldConstants(e Expr) Expr {
 		// it silently re-types the node as unknown downstream. M0119-0006.
 		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
 		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		folded := &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
+		if lit := tryFoldFuncCall(folded); lit != nil {
+			return lit
+		}
+		return folded
 
 	// ── Non-foldable: return unchanged ─────────────────────────────────
 	default:
@@ -959,4 +964,81 @@ func cmpResult(op parser.OpCode, cmp int) bool {
 		return cmp >= 0
 	}
 	return false
+}
+
+// EvalConstFunc evaluates a built-in function call whose arguments are all
+// literals and returns the result's output text under resultType, or false
+// when it cannot (an evaluation error, a NULL result, a Datum that does not
+// round-trip as resultType's literal). The executor owns function evaluation
+// and registers it at init (the optimizer cannot import the executor); a nil
+// hook leaves every call unfolded. M0146-0123.
+var EvalConstFunc func(fc *FuncCall, resultType string) (string, bool)
+
+// tryFoldFuncCall is the evaluate_function half of eval_const_expressions'
+// simplify_function (clauses.c): a call of an IMMUTABLE, non-set-returning
+// plain function whose arguments are all non-null constants is replaced by a
+// Const holding its result — `abs(-1)` plans as `1`, `upper('x')` as
+// `'X'::text`, `length('abc') = 3` as `true`. The overload is the one the
+// arguments' exact types select from the PG 18.3 pg_proc seed
+// (LookupProcForNode), and its own provolatile / proretset / prokind decide
+// (ProcIsFoldable) — `length(text)` folds although `length(bytea, name)` is
+// stable.
+//
+// Bounds of this slice (deferral ledger M0146-0123): the result must be an
+// integer, numeric, bool or text type — the types whose goopg Datum
+// round-trips exactly through the literal node, so folding cannot change a
+// query's result; an evaluation error or a NULL result leaves the call for
+// run time (PG raises the error at plan time and folds a strict call over a
+// NULL argument to a NULL Const).
+func tryFoldFuncCall(x *FuncCall) Expr {
+	if EvalConstFunc == nil || x.Star || x.Variadic || x.Distinct || x.ReturnType != "" ||
+		strings.Contains(x.Name, ".") || x.Name == FieldSelectFuncName {
+		return nil
+	}
+	argOIDs := make([]uint32, 0, len(x.Args))
+	for _, a := range x.Args {
+		if _, param := a.(*ParamRef); param || !isPlainConstantBound(a) {
+			return nil
+		}
+		at, ok := ExprResultType(a)
+		if !ok {
+			return nil
+		}
+		oid, ok := exactTypeOID(at)
+		if !ok {
+			return nil
+		}
+		argOIDs = append(argOIDs, oid)
+	}
+	funcid, ok := catalog.LookupProcForNode(strings.ToLower(x.Name), argOIDs)
+	if !ok || !catalog.ProcIsFoldable(funcid) {
+		return nil
+	}
+	retOID, ok := catalog.ProcResultType(funcid)
+	if !ok {
+		return nil
+	}
+	ret := catalog.OIDToTypeName(retOID)
+	switch ret {
+	case "int2", "int4", "int8", "numeric", "bool", "text", "varchar":
+	default:
+		return nil
+	}
+	text, ok := EvalConstFunc(x, ret)
+	if !ok {
+		return nil
+	}
+	switch ret {
+	case "int4", "int8":
+		n, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return nil
+		}
+		return &IntegerConst{pos: x.pos, Value: n, Wide: ret == "int8"}
+	case "numeric":
+		return &NumericConst{pos: x.pos, Value: text}
+	case "bool":
+		return &BooleanConst{pos: x.pos, Value: text == "true"}
+	}
+	return &TypedStringLit{pos: x.pos, Type: ret, Value: text}
 }

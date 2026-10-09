@@ -21565,6 +21565,15 @@ func IsStrictProc(oid uint32) bool {
 	return pgProcIsStrictByOID[oid]
 }
 
+// ProcIsFoldable reports whether a built-in function may be evaluated at plan
+// time over constant arguments — the pg_proc test evaluate_function
+// (clauses.c) applies: IMMUTABLE, not set-returning, and a plain function
+// (prokind 'f'). Returns false for unknown OIDs, including user-defined
+// functions (M0146-0123).
+func ProcIsFoldable(oid uint32) bool {
+	return pgProcFoldableOIDs[oid]
+}
+
 // ArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
 // typname, or a user Routine's stored Type.Name) to PG's format_type_be
 // display alias — the handful of base types whose internal name differs from

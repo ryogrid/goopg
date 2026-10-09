@@ -130,6 +130,7 @@ type procEntry struct {
 	Volatile     byte     // 0 means absent (default 'v')
 	Parallel     byte     // 0 means absent (default 's')
 	RetSet       bool
+	Kind         byte // prokind; 0 means absent (default 'f', a plain function)
 	NotStrict    bool // inverse of proisstrict; absent → strict (false)
 	Lang         uint32
 	HandlerName  string
@@ -291,6 +292,13 @@ func parseProcDat(path string, typeMap map[string]uint32) ([]procEntry, error) {
 		// proretset: absent = false
 		retSet := m["proretset"] == "t"
 
+		// prokind: absent = 'f' (a plain function); 'a' aggregate, 'w' window,
+		// 'p' procedure.
+		var kind byte
+		if k, ok := m["prokind"]; ok && len(k) > 0 {
+			kind = k[0]
+		}
+
 		// proisstrict: absent = 't' (strict), so NotStrict = (proisstrict == 'f')
 		notStrict := m["proisstrict"] == "f"
 
@@ -335,6 +343,7 @@ func parseProcDat(path string, typeMap map[string]uint32) ([]procEntry, error) {
 			Volatile:     vol,
 			Parallel:     parallel,
 			RetSet:       retSet,
+			Kind:         kind,
 			NotStrict:    notStrict,
 			Lang:         lang,
 			HandlerName:  handlerName,
@@ -431,6 +440,19 @@ func emitNamesOnly(entries []procEntry) {
 	fmt.Printf("var pgProcRetTypeByOID = map[uint32]uint32{\n")
 	for _, e := range entries {
 		fmt.Printf("\t%d: %d,\n", e.OID, e.RetType)
+	}
+	fmt.Printf("}\n\n")
+
+	fmt.Printf("// pgProcFoldableOIDs is the generated set of PG18 pg_proc.dat entries\n")
+	fmt.Printf("// eval_const_expressions' evaluate_function may run at plan time: IMMUTABLE\n")
+	fmt.Printf("// (provolatile absent or 'i'), not set-returning, and a plain function\n")
+	fmt.Printf("// (prokind absent or 'f' — an aggregate such as max(1) is never folded).\n")
+	fmt.Printf("// Backs ProcIsFoldable (M0146-0123).\n")
+	fmt.Printf("var pgProcFoldableOIDs = map[uint32]bool{\n")
+	for _, e := range entries {
+		if (e.Volatile == 0 || e.Volatile == 'i') && !e.RetSet && (e.Kind == 0 || e.Kind == 'f') {
+			fmt.Printf("\t%d: true,\n", e.OID)
+		}
 	}
 	fmt.Printf("}\n\n")
 
