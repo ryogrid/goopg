@@ -1,1 +1,23 @@
-SKIP (oracle: SKIP_QUERYGEN) — dsqgen artefact, fails on PG too; matches the SF=1 sweep (scripts/tpcds-sf025-regression.sh:128).
+Limit  (cost=9132.65..9132.90 rows=100 width=178)
+  ->  Sort  (cost=9132.65..9134.90 rows=902 width=178)
+        Sort Key: sub.lochierarchy DESC, (CASE WHEN (sub.lochierarchy = 0) THEN sub.i_category ELSE NULL::bpchar END), sub.rank_within_parent
+        ->  Subquery Scan on sub  (cost=9055.33..9098.17 rows=902 width=178)
+              ->  WindowAgg  (cost=9055.33..9086.90 rows=902 width=178)
+                    Window: w1 AS (PARTITION BY ((GROUPING(item.i_category) + GROUPING(item.i_class))), (CASE WHEN (GROUPING(item.i_class) = 0) THEN item.i_category ELSE NULL::bpchar END) ORDER BY (sum(web_sales.ws_net_paid)) ROWS UNBOUNDED PRECEDING)
+                    ->  Sort  (cost=9055.33..9057.58 rows=902 width=170)
+                          Sort Key: ((GROUPING(item.i_category) + GROUPING(item.i_class))), (CASE WHEN (GROUPING(item.i_class) = 0) THEN item.i_category ELSE NULL::bpchar END), (sum(web_sales.ws_net_paid)) DESC
+                          ->  MixedAggregate  (cost=3071.50..9011.06 rows=902 width=170)
+                                Hash Key: item.i_category, item.i_class
+                                Hash Key: item.i_category
+                                Group Key: ()
+                                ->  Gather  (cost=3071.50..8975.14 rows=891 width=108)
+                                      Workers Planned: 2
+                                      ->  Nested Loop  (cost=2071.50..7886.04 rows=371 width=108)
+                                            ->  Parallel Hash Join  (cost=2071.21..7761.87 rows=371 width=10)
+                                                  Hash Cond: (web_sales.ws_sold_date_sk = d1.d_date_sk)
+                                                  ->  Parallel Seq Scan on web_sales  (cost=0.00..5493.82 rows=74982 width=14)
+                                                  ->  Parallel Hash  (cost=2068.55..2068.55 rows=213 width=4)
+                                                        ->  Parallel Seq Scan on date_dim d1  (cost=0.00..2068.55 rows=213 width=4)
+                                                              Filter: ((d_month_seq >= 1186) AND (d_month_seq <= 1197))
+                                            ->  Index Scan using item_pkey on item  (cost=0.29..0.33 rows=1 width=106)
+                                                  Index Cond: (i_item_sk = web_sales.ws_item_sk)

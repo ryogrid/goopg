@@ -518,6 +518,17 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		// already-built join subtree: `filteredRows` was derived from a
 		// synthetic catalog.Table and means nothing, so read the subtree.
 		rows = EstimateRows(leaf)
+		// A searched join tree (a join_collapse_limit sub-problem, or a
+		// subquery whose plan is the search's tree under row-preserving
+		// wrappers) carries the RelOptInfo the search sized. PG's enclosing
+		// search reads that joinrel's own `rows` — make_rel_from_joinlist
+		// returns the RelOptInfo itself, and set_subquery_size_estimates
+		// reads the subquery's final rel — so do the same instead of
+		// re-estimating the built tree bottom-up, which drifts from the
+		// rel's size (TPC-DS Q72 SF1: 1623 against 5, M0146-0141).
+		if sr := searchedJoinInputRelOf(leaf); sr != nil && sr.Rows >= 1 {
+			return sr.Rows
+		}
 		// A CTE leaf keeps its own (possibly collapsed) estimate, as PG's
 		// `set_cte_size_estimates` does: the only adjustment is the
 		// `clamp_row_est` floor at 1 below

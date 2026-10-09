@@ -16,11 +16,12 @@ Provenance:
   (`127.0.0.1:65438`, user `ryo`, db `tpcds025` = SF0.25, matching the
   goopg bench corpus) with the same EXPLAIN-prefix trick as the goopg
   sweep's plan channel (`sf025_capture_plans`).
-- Q36/Q70/Q86 are `SKIP (oracle: SKIP_QUERYGEN)` stubs. They were captured
-  while the setup's subquery wrapper broke these three queries on every
-  engine. M0146-0140 fixed the wrapper, so they now run on PG; the stubs stay
-  until the next estimate-parity re-pin, because adding three plans here
-  moves the ea-ratchet baseline (`scripts/estimate-parity-gate.sh`).
+- Q36/Q70/Q86 were `SKIP (oracle: SKIP_QUERYGEN)` stubs while the setup's
+  subquery wrapper broke these three queries on every engine. M0146-0140
+  fixed the wrapper, and M0146-0141 captured the three files (2026-10-09,
+  same `psql -X -t -A` EXPLAIN as the rest). The stubs had to go: once goopg
+  could plan Q36/Q86, the estimate-parity ratchet scored their goopg
+  estimates against no PG reference and reported them as new findings.
 
 Re-capture ONLY when the queries or the dataset change (new PG version,
 new scale factor, regenerated `query*.sql`) or when the measurement

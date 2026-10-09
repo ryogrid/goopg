@@ -45,3 +45,36 @@ func TestInitialRelRowsCTEKeepsCollapsedEstimate(t *testing.T) {
 			"(PG's clamp_row_est) — no body-count substitution", got)
 	}
 }
+
+// TestInitialRelRowsSearchedLeafReadsItsRel pins M0146-0141: a searched join
+// tree entering an enclosing search as a leaf (a join_collapse_limit
+// sub-problem, or a subquery whose plan is the search's tree) is sized by the
+// RelOptInfo the search built for it, as PG's enclosing search reads the
+// lower joinrel's own `rows` (make_rel_from_joinlist returns the RelOptInfo
+// itself). Re-estimating the built tree bottom-up drifted from that size —
+// TPC-DS Q72 SF1's 8-rel sub-problem entered at 1623 rows while its rel held
+// 5, which priced the d3 probe loop out.
+//
+// The descent is searchedJoinInputRelOf's: row-preserving wrappers (here a
+// Gather) pass, anything that changes the row count (an Aggregate) stops it
+// and the leaf keeps the subtree estimate.
+func TestInitialRelRowsSearchedLeafReadsItsRel(t *testing.T) {
+	searched := func() Node {
+		j := &Join{
+			Left:  &SeqScan{Table: statsTable("srl_a", 1000), schema: cpjSchema("a", 1)},
+			Right: &SeqScan{Table: statsTable("srl_b", 1000), schema: cpjSchema("b", 1)},
+		}
+		markSearchedTree(j)
+		j.setSearchRel(newRelOptInfo(RelSet(3), 5, 8))
+		return j
+	}
+	info := baseRelInfo{filteredRows: 7}
+
+	if got := initialRelRows(&Gather{Child: searched()}, info); got != 5 {
+		t.Errorf("Gather over a searched tree: initialRelRows = %v, want the searched rel's 5", got)
+	}
+	agg := &Aggregate{Child: searched()}
+	if got, est := initialRelRows(agg, info), float64(EstimateRows(agg)); got != est || got == 5 {
+		t.Errorf("Aggregate over a searched tree: initialRelRows = %v, want the subtree estimate %v", got, est)
+	}
+}
