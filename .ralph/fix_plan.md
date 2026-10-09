@@ -30350,7 +30350,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 49 → 48, sort\-strat
   Kind: impl
   Parent: M0146-0014a
   - First step: trace the grouping input candidates for Q35 and compare getCheapestFractionalPathOrdered with PG\'s fractional choice\.
-  - Done 2026\-10\-09 \(a949c38e5\): the search and grouping already built PG\'s candidate; the ORDERED rel dropped it\.
+  - Done 2026\-10\-09 \(32c47c38e\): the search and grouping already built PG\'s candidate; the ORDERED rel dropped it\.
     - groupingEmissionPathkeys now translates a PathIncrementalSort or presorted PathPrebuilt child \(create\_agg\_path copies
       subpath\-\>pathkeys\), as the node twin aggregateEmissionPathkeys already did\.
     - rewriteExistsToAnyNode gained IncrementalSort / Memoize / Result arms: under the new shape Q35\'s OR of EXISTS stayed
@@ -30358,11 +30358,17 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 join\-order 49 → 48, sort\-strat
     - Q35 SF0\.25 → MATCH; SF1 unchanged: customer\_address \~955 pages \< min\_parallel\_table\_scan\_size \(RELPAGES route\)\.
     - Design: `docs/design/0100\-0149/m0146\-0131\-ordered\-grouping\-input\-under\-limit\.md`\.
 Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 join\-order 40 → 39, scan\-type 23 → 22, parameterisation 19 → 18, sort\-strategy 21 → 20, parallelism 21 → 20, qual\-placement 8 → 7 \(TPC\-DS Q35 → match\); ea\-ratchet unchanged \(1\)
-- [ ] **M0146\-0132 — min\_parallel\_table\_scan\_size applies to base rels only, not appendrel members \(TPC\-DS Q5\)**
+- [x] **M0146\-0132 — min\_parallel\_table\_scan\_size applies to base rels only, not appendrel members \(TPC\-DS Q5\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. compute\_parallel\_worker \(allpaths\.c\) applies the size cutoff only to RELOPT\_BASEREL; goopg\'s computeParallelWorker \(considerparallel\.go\) applies it to every relation, so Q5\'s catalog\_returns \(\~721 pages\) UNION ALL member gets no partial path \(Seq Scan 1081\.66 vs PG Parallel Seq Scan 933\.15\)\.
   Kind: impl
   Parent: M0146-0014a
   - First step: confirm the RELOPT\_OTHER\_MEMBER\_REL branch in compute\_parallel\_worker and the caller goopg uses for appendrel members\.
+  - Done 2026\-10\-09 \(f06a67a5c\): costParams\.otherMemberRel skips computeParallelWorker\'s cutoffs for a pulled\-up member\'s search\.
+    - Decided pre\-planning in planSelectImpl: isSafeAppendMemberStmt \(split from isSafeAppendMember\) \+ no aggregate / window
+      stage; carried resolveContext\.appendrelOtherMember → joinlistProblem\.otherMemberRel → the search\'s costParams copy\.
+    - Q5 SF0\.25: catalog\_returns → Parallel Seq Scan 933\.15 \(PG\'s figure\); remainder is the wsr web\_site join \(ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0132\-appendrel\-member\-parallel\-cutoff\.md`\.
+Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 parallelism 20 → 19, qual\-placement 7 → 6 \(TPC\-DS Q5\); ea\-ratchet unchanged \(1\)
 - [ ] **M0146\-0133 — a Unique keeps its input\'s pathkeys for the ORDER BY above \(TPC\-DS Q49\)**
   \(filed 2026\-10\-09 by M0146\-0014a; plan\-text finding — verify with a trace first\)\. PG\'s Unique over the UNION keeps its Sort\'s pathkeys, so the top ORDER BY becomes an Incremental Sort \(presorted `\(\'web\'::text\)`\); goopg\'s `inputNodePathkeys` \(upperorderedinput\.go\) has no Distinct/DistinctOn arm and does a full Sort\.
   Kind: impl
