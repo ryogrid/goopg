@@ -30638,7 +30638,7 @@ Movement: none — mechanism matches PG \(sub\-problem rel\'s ordered paths cros
     - Changed since 0014b: Q36/Q86/Q95 MATCH; Q72 SF1 → COSTTIE \(M0146\-0148 measurement\); Q70 ×2 → new M0146\-0149\.
     - Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md` §2026\-10\-10 second refresh\.
 Movement: none — recon
-- [ ] **M0146\-0149 — an Incremental Sort path\'s rows are its clamped input tuples \(TPC\-DS Q70\)**
+- [x] **M0146\-0149 — an Incremental Sort path\'s rows are its clamped input tuples \(TPC\-DS Q70\)**
   \(filed 2026\-10\-10 by M0146\-0014c\)\. PG\'s cost\_incremental\_sort \(costsize\.c:2025, :2121\) clamps input\_tuples to ≥ 2 and
   sets path\->rows = input\_tuples, so an Incremental Sort over a 1\-row input carries 2 rows\. Q70\'s window subquery tmp1 is
   therefore 2 rows in PG \(WindowAgg, Subquery Scan\) and is hashed in a Hash Semi Join; goopg\'s incremental sort keeps
@@ -30649,3 +30649,20 @@ Movement: none — recon
     an Incremental Sort over < 2 estimated rows may move — measured by the fire set\.
   - First step: apply the clamp to the path rows in incrementalsortpaths\.go \(and every other Incremental Sort producer, e\.g\.
     the window input in buildWindowStage, so the node\'s EXPLAIN rows agree\); fire set both scales\.
+  - Done 2026\-10\-10 \(4fb2cdd47\): incrementalSortPathOver Rows = max\(input, 2\) and its node twin \(EstimateRows IncrementalSort arm\)\.
+    - Q70: tmp1 is 2 rows; the 4\-rel joinrel\'s cheapest\-total path is PG\'s Hash Semi Join \(38367\.56\); the plan still prints
+      the ordered NL inner because the grouping step is seeded with the search\'s winner → filed M0146\-0150\.
+    - Fire set: Q4/Q11/Q58/Q64/Q70 move; only Q70 parameterisation \+1 at both scales; regress A/B unchanged; TPC\-H identical\.
+    - Design: `docs/design/0100\-0149/m0146\-0149\-incremental\-sort\-rows\.md`\.
+Movement: none — Q70 first divergence unchanged \(join\-level choice now PG\'s; election above is M0146\-0150\); parameterisation \+1 at both scales
+- [ ] **M0146\-0150 — the grouping step hashes over the scan/join rel\'s cheapest\-total path \(TPC\-DS Q70\)**
+  \(filed 2026\-10\-10 by M0146\-0149\)\. PG\'s create\_grouping\_paths / add\_paths\_to\_grouping\_rel hash over
+  input\_rel\->cheapest\_total\_path \(and the sorted arms over every input path\)\. Q70\'s 4\-rel joinrel has PG\'s Hash Semi Join as
+  its cheapest total \(38367\.56, SF0\.25 trace\), but the MixedAggregate is seeded with the ordered unique\-ified NL inner
+  \(38440\.70\) — the search\'s winner, likely chosen by the LIMIT fraction / ordering preference at the search root\.
+  Kind: impl
+  Parent: M0146-0149
+  - Expected movement: Q70 first divergence `\[join\-method\] under MixedAggregate` at both scales \(2 records\); any grouped
+    statement whose search winner differs from its cheapest total may move — fire set\.
+  - First step: trace which path finalPath / the seam hands buildAggregateStage for Q70 and why \(fraction vs pathkeys\); give
+    the hashed and plain arms the rel\'s CheapestTotal \(searchedCandidateInput\) when it differs from the seed\.
