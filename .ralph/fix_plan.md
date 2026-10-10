@@ -4185,7 +4185,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Design `docs/design/0100\-0149/0122\-0008\-alter\-system\-auto\-conf\.md`\.
   Movement: none — configuration subsystem; no plan instrument
 
-- [ ] **SET / ALTER SYSTEM drop the quoting of GUC\_LIST\_QUOTE list
+- [x] **SET / ALTER SYSTEM drop the quoting of GUC\_LIST\_QUOTE list
   elements** \(filed 2026\-10\-10 by the ALTER SYSTEM task\)\. `SET
   search\_path = \'x\'\'y\\z\', public` / `ALTER SYSTEM SET` the same: PG
   flattens the value with `quote\_identifier` per string element of a
@@ -4198,6 +4198,48 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - First step: keep the literal/identifier kind per value atom in
     `lexerState.setValueAtoms`, and quote string atoms for list\-quote GUCs
     where SET and ALTER SYSTEM flatten \(shared — sibling paths\)\.
+  - **DONE 2026\-10\-10 \(`aaf76f11e`\)\.** Five paths flattened the value
+    five different ways \(the simple\-query fast path stored the raw text\)\.
+    Now one `misc.FlattenSetArgs` \(flatten\_set\_variable\_args, with new
+    `FlagListInput` / `FlagListQuote`\) serves SET, ALTER SYSTEM, CREATE/ALTER
+    FUNCTION SET, ALTER DATABASE/ROLE SET and both wire fast paths, fed by
+    typed `var\_list` elements \(`parser.scanSetArgs` /
+    `ParseSetArgList`\)\.
+    - Downcased identifiers needed the canonical spellings PG\'s check hooks
+      store: client\_encoding \(utf8 → UTF8\) and TimeZone \(utc → UTC,
+      case\-insensitive tzdata match\)\.
+    - Live vs PG 18\.3: SHOW search\_path for 9 spellings, DateStyle,
+      "takes only one argument", proconfig, setconfig, auto\.conf identical\.
+    - Gates: units, goldens \(conflicts 60\), 31 testport, regress A/B \(join
+      flap; 8 GUC/time cases identical\), spotcheck, acceptance 24 MATCH, fire
+      set none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/0122\-0008\-set\-value\-list\-flattening\.md`\.
+  Movement: none — configuration subsystem; no plan instrument
+
+- [ ] **SET LOCAL outside a transaction block takes effect** \(found
+  2026\-10\-10 by the SET list task\)\. `SET LOCAL search\_path = \'L\',
+  public` in autocommit: PG warns `SET LOCAL can only be used in transaction
+  blocks` and leaves the value alone \(guc\_funcs\.c ExecSetVariableStmt →
+  WarnNoTransactionBlock\); goopg applies it \(SHOW gives `"L", public`\)\.
+  Kind: bug
+  Parent: M0122-0008
+
+- [ ] **proconfig / setconfig store the GUC name as typed** \(found
+  2026\-10\-10\)\. `CREATE FUNCTION g\(\) … SET datestyle = iso, mdy` stores
+  `datestyle=iso, mdy`; PG stores `DateStyle=iso, mdy` — GUCArrayAdd
+  replaces the name with `record\->name` \(guc\.c\)\. Same for ALTER
+  DATABASE/ROLE SET\.
+  Kind: bug
+  Parent: M0122-0008
+
+- [ ] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
+  `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives
+  `INTERVAL \'\+02:00\' HOUR TO MINUTE`; PG gives `<\+02>\-02`
+  \(flatten\_set\_variable\_args coerces the ConstInterval, then
+  check\_timezone turns the interval into a POSIX zone\)\.
+  Kind: bug
+  Parent: M0122-0008
+
 
 - [ ] **GUC range errors use goopg's own wording** \(measured 2026\-09\-24\):
   `SET geqo\_effort = 11` reports `value 11 out of range [1, 10]`; PG
@@ -4790,6 +4832,12 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0020 — stats.sql** — regress-sql `not-tried` (PARKED).
 - [ ] **M0134-0021 — vacuum.sql** — regress-sql `failed` (PARKED).
 - [ ] **M0134-0022 — window.sql** — regress-sql `failed` (PARKED).
+  - [ ] **`CREATE FUNCTION f\(x int = 1\)` is a syntax error** \(found
+    2026\-10\-10\)\. gram.y `func\_arg\_with\_default` accepts
+    `func\_arg \'=\' a\_expr` as a synonym for DEFAULT; goopg\'s grammar has
+    only DEFAULT \(window\.sql and polymorphism\.sql use the `=` spelling\)\.
+    Kind: bug
+    Parent: M0134-0022
 - [ ] **M0134-0023 — write_parallel.sql** — PARKED.
 - [ ] **M0134-0024 — generated_virtual.sql** — regress-sql `failed` (PARKED).
 - [ ] **M0134-0025 — groupingsets.sql** — regress-sql `failed` (PARKED).
