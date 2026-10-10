@@ -822,7 +822,7 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 // only fails to update the running configuration, matching
 // ProcessConfigFile's "log and keep the old values" behaviour.
 func (s *Server) reloadConfig() {
-	if s.cfg.ConfigPath == "" {
+	if s.cfg.ConfigPath == "" && s.cfg.DataDir == "" {
 		s.cfg.Logger.Info("control: reload requested but no config file was loaded at startup, nothing to do")
 		return
 	}
@@ -831,11 +831,24 @@ func (s *Server) reloadConfig() {
 		s.cfg.Logger.Warn("control: reload requested but no GUC registry is configured")
 		return
 	}
-	entries, err := misc.ParseConfigFile(s.cfg.ConfigPath)
+	var entries []misc.ConfigEntry
+	if s.cfg.ConfigPath != "" {
+		parsed, err := misc.ParseConfigFile(s.cfg.ConfigPath)
+		if err != nil {
+			s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
+			return
+		}
+		entries = parsed
+	}
+	// postgresql.auto.conf after postgresql.conf, as at boot: ALTER SYSTEM's
+	// values win, and one it RESET is absent here, so ApplyReloadEntries
+	// reverts it to its default.
+	autoEntries, err := misc.AutoConfEntries(s.cfg.DataDir)
 	if err != nil {
-		s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
+		s.cfg.Logger.Error("control: reload failed to parse "+misc.AutoConfFileName, "err", err)
 		return
 	}
+	entries = append(entries, autoEntries...)
 	result := registry.ApplyReloadEntries(entries)
 	for _, w := range result.Warnings {
 		s.cfg.Logger.Warn("control: reload", "issue", w)

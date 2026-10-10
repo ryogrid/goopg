@@ -9067,7 +9067,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER DOMAIN"}, nil
 	}
-	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR —
 	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
 	// its own dedicated case above, DU-002 slice 440 — "view" is
 	// intentionally not in this list; ALTER SCHEMA has its own dedicated
@@ -9076,7 +9076,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// domain follow-up.)
 	for _, objIdent := range []string{
 		"collation", "extension", "language",
-		"operator", "system",
+		"operator", // ALTER SYSTEM is routed to the grammar (M0122-0008)
 	} {
 		if p.acceptIdentKeyword(objIdent) {
 			// consume until ';' or EOF

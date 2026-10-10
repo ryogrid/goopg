@@ -1251,6 +1251,24 @@ reset_stmt:
 	| RESET SESSION AUTHORIZATION
 			{ $$ = NewResetStmt(0, false, "session_authorization") }
 
+/* alter_system_stmt — gram.y AlterSystemStmt (:11593): `ALTER SYSTEM SET
+   generic_set | ALTER SYSTEM RESET generic_reset`. generic_set is `var_name
+   {TO|=} var_list | var_name {TO|=} DEFAULT`, which set_stmt's own
+   set_guc_name / set_eq_to / set_value_list already express (the DEFAULT
+   spelling is told apart by token kind, as there); generic_reset is `var_name
+   | ALL`. Values are rebuilt from the tokens by setValueAtoms, exactly as SET
+   does. Position ZERO, like set_stmt / reset_stmt (§12.3 rule 4). M0122-0008. */
+alter_system_stmt:
+		ALTER SYSTEM_P SET set_guc_name set_eq_to set_value_list
+			{
+				l := yylex.(*lexerState)
+				$$ = NewAlterSystemStmt(0, $4, l.setValueAtoms(), l.setValueIsDefault(), false, false)
+			}
+	| ALTER SYSTEM_P RESET set_guc_name
+			{ $$ = NewAlterSystemStmt(0, $4, "", false, true, false) }
+	| ALTER SYSTEM_P RESET ALL
+			{ $$ = NewAlterSystemStmt(0, "", "", false, true, true) }
+
 /* alter_table_stmt — P4.2 v0 (gram.y AlterTableStmt subset): single action
    of ADD COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE /
    RENAME TO. Multi-action lists, DROP DEFAULT/NOT NULL, SET forms and

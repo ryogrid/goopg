@@ -12261,6 +12261,20 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NewIntDatum(0), nil
 		}
 		return NewIntDatum(int64(ctx.TriggerDepth)), nil
+	case "pg_reload_conf":
+		// pg_reload_conf() → bool (misc/signalfuncs.c): signal the postmaster
+		// to re-read the configuration files — postgresql.conf, then
+		// postgresql.auto.conf, which is how ALTER SYSTEM values take effect.
+		// EXECUTE is revoked from PUBLIC (system_functions.sql), so a
+		// non-superuser gets the function's permission error. M0122-0008.
+		if ctx != nil && ctx.NonSuperuserRole != "" {
+			return Datum{}, &ExecError{Code: "42501", Pos: x.Pos(), Message: "permission denied for function pg_reload_conf"}
+		}
+		if ctx == nil || ctx.ReloadConfig == nil {
+			return NewBoolDatum(false), nil
+		}
+		ctx.ReloadConfig()
+		return NewBoolDatum(true), nil
 	case "pg_backend_pid":
 		// pg_backend_pid() → int4: the PID of the server process attached to the
 		// current session. goopg is a single OS process multiplexing connections,

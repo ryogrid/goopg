@@ -120,6 +120,12 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			return nil, execErrorFromGUCError(stmt.Pos(), err)
 		}
 		return nil, EOF
+	case *parser.AlterSystemStmt:
+		if o.done {
+			return nil, EOF
+		}
+		o.done = true
+		return nil, o.execAlterSystem(stmt)
 	case *parser.ResetStmt:
 		if o.done {
 			return nil, EOF
@@ -301,4 +307,68 @@ func (o *utilitySettingsOp) gucShortDescriptions() map[string]string {
 		}
 	}
 	return out
+}
+
+// execAlterSystem runs ALTER SYSTEM (utility.c T_AlterSystemStmt +
+// guc.c AlterSystemSetConfigFile). PreventInTransactionBlock, then the
+// permission check — superuser, or else the ALTER SYSTEM privilege on the
+// parameter (pg_parameter_aclcheck), never for RESET ALL — then the
+// validation and file rewrite behind ctx.AlterSystem. The new value takes
+// effect on the next pg_reload_conf() or restart, as in PostgreSQL.
+func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error {
+	if o.ctx == nil || o.ctx.AlterSystem == nil {
+		return &ExecError{Code: "0A000", Message: "ALTER SYSTEM is not supported in this context"}
+	}
+	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25001", Message: "ALTER SYSTEM cannot run inside a transaction block"}
+	}
+	name := strings.ToLower(stmt.Name)
+	if role := o.ctx.NonSuperuserRole; role != "" {
+		if stmt.ResetAll {
+			return &ExecError{Code: "42501", Message: "permission denied to perform ALTER SYSTEM RESET ALL"}
+		}
+		if !parameterACLGrants(o.ctx, name, role, 'A') {
+			return &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied to set parameter %q", name)}
+		}
+	}
+	set := !stmt.Reset && !stmt.Default
+	if err := o.ctx.AlterSystem(name, stmt.Value, set, stmt.ResetAll); err != nil {
+		var aerr *misc.AlterSystemError
+		if errors.As(err, &aerr) {
+			return &ExecError{Code: aerr.Code, Message: aerr.Msg, Hint: aerr.Hint}
+		}
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	return nil
+}
+
+// parameterACLGrants reports whether the parameter's pg_parameter_acl entry
+// grants privilege (an aclitem letter, e.g. 'A' for ALTER SYSTEM) to role or
+// to PUBLIC. A parameter with no entry grants nothing to a non-superuser,
+// which is upstream's default (pg_parameter_aclmask with no row).
+func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	oid := im.ParameterACLOID(name)
+	if oid == 0 {
+		return false
+	}
+	text := strings.Trim(im.ParameterACLText(oid), "{}")
+	for _, item := range strings.Split(text, ",") {
+		eq := strings.IndexByte(item, '=')
+		if eq < 0 {
+			continue
+		}
+		grantee := strings.Trim(item[:eq], `"`)
+		privs := item[eq+1:]
+		if slash := strings.IndexByte(privs, '/'); slash >= 0 {
+			privs = privs[:slash]
+		}
+		if (grantee == "" || strings.EqualFold(grantee, role)) && strings.IndexByte(privs, privilege) >= 0 {
+			return true
+		}
+	}
+	return false
 }

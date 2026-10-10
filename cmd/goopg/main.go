@@ -422,6 +422,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.ConfigPath = *confPath
 		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
 	}
+	// postgresql.auto.conf (ALTER SYSTEM) is read after postgresql.conf so its
+	// entries win, as ProcessConfigFileInternal does. A missing file is fine.
+	if *dataDir != "" {
+		autoEntries, err := misc.AutoConfEntries(*dataDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		if len(autoEntries) > 0 {
+			if err := registry.ApplyConfigEntries(autoEntries); err != nil {
+				fmt.Fprintf(stderr, "goopg start: %v\n", err)
+				return 1
+			}
+			cfg.Registry = registry
+			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
+		}
+	}
 	var rt *initdb.Runtime
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)

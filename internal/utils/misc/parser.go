@@ -271,13 +271,15 @@ func isNameChar(b byte) bool {
 }
 
 // readSingleQuoted parses a single-quoted string starting at s[i]
-// (which must be '\”). Returns the unquoted body, the index just
+// (which must be '\''). Returns the unquoted body, the index just
 // past the closing quote, and an error.
 //
-// Inside single quotes, ” is an escaped literal single quote;
-// upstream also honours \\ and \n, but we keep the surface tight: a
-// backslash is literal, just like inside upstream's GUC string values
-// when GUC_LIST_QUOTE is not set.
+// It is guc-file.l's STRING token (`\'([^'\\\n]|\\.|\'\')*\'`) plus
+// DeescapeQuotedString: '' is one quote, and a backslash escapes the next
+// character — \b \f \n \r \t, up to three octal digits, anything else
+// (including \\ and \') stands for itself. ALTER SYSTEM writes values with
+// quotes and backslashes doubled (escape_single_quotes_ascii), so this is the
+// reader that round-trips them. M0122-0008.
 func readSingleQuoted(s string, i int) (string, int, error) {
 	if i >= len(s) || s[i] != '\'' {
 		return "", i, errors.New("expected single quote")
@@ -286,6 +288,33 @@ func readSingleQuoted(s string, i int) (string, int, error) {
 	var b strings.Builder
 	for i < len(s) {
 		c := s[i]
+		if c == '\\' && i+1 < len(s) {
+			i++
+			switch e := s[i]; e {
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				oct := 0
+				k := 0
+				for ; k < 3 && i+k < len(s) && s[i+k] >= '0' && s[i+k] <= '7'; k++ {
+					oct = oct<<3 + int(s[i+k]-'0')
+				}
+				b.WriteByte(byte(oct))
+				i += k - 1
+			default:
+				b.WriteByte(e)
+			}
+			i++
+			continue
+		}
 		if c == '\'' {
 			if i+1 < len(s) && s[i+1] == '\'' {
 				b.WriteByte('\'')

@@ -487,6 +487,9 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if _, ok := p.Stmt.(*parser.ResetStmt); ok {
 			return newUtilitySettingsOp(p), nil
 		}
+		if _, ok := p.Stmt.(*parser.AlterSystemStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
 		if _, ok := p.Stmt.(*parser.DiscardStmt); ok {
 			return newUtilitySettingsOp(p), nil
 		}

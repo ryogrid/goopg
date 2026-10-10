@@ -482,6 +482,19 @@ type Context struct {
 	ResetSetting     func(name string) error
 	ResetAllSettings func()
 
+	// AlterSystem rewrites postgresql.auto.conf for ALTER SYSTEM (guc.c
+	// AlterSystemSetConfigFile): set=false removes name's entry (SET TO
+	// DEFAULT / RESET name), resetAll empties the file. Wired by the server
+	// from SessionRegistry.AlterSystem with the cluster's data directory;
+	// nil means ALTER SYSTEM is unsupported in this context. M0122-0008.
+	AlterSystem func(name, value string, set, resetAll bool) error
+
+	// ReloadConfig re-reads the configuration files into the running server
+	// (pg_reload_conf(); upstream SIGHUPs the postmaster). Wired by the
+	// server to the same path as SIGHUP / `goopg reload`; nil makes
+	// pg_reload_conf() return false. M0122-0008.
+	ReloadConfig func()
+
 	// BeginLocalTransaction and EndLocalTransaction bracket an explicit
 	// transaction so that SET LOCAL changes are discarded on COMMIT/ROLLBACK,
 	// and plain SET changes are reverted on ROLLBACK. EndLocalTransaction's

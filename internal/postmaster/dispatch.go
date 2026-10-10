@@ -541,6 +541,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.AlterSystem = func(name, value string, set, resetAll bool) error {
+			return sess.AlterSystem(s.cfg.DataDir, name, value, set, resetAll)
+		}
+		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)
@@ -4159,6 +4163,8 @@ func utilityTag(stmt parser.Stmt) string {
 		return "SET CONSTRAINTS"
 	case *parser.ResetStmt:
 		return "RESET"
+	case *parser.AlterSystemStmt:
+		return "ALTER SYSTEM"
 	case *parser.DiscardStmt:
 		// cmdtaglist.h tags each target: DISCARD ALL / PLANS / SEQUENCES /
 		// TEMP (TEMPORARY is parsed as TEMP).

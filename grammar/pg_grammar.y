@@ -210,7 +210,7 @@
 %type <stmt>	create_event_trigger_stmt alter_event_trigger_stmt create_access_method_stmt
 %type <str>	am_type
 %type <strs>	evtrig_when evtrig_filter_list evtrig_sconst_list
-%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_system_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <telems>	opt_of_elements of_element_list
 %type <node>	of_element
@@ -433,6 +433,10 @@ explainable_stmt:
 				$$ = $1
 			}
 	| alter_table_stmt
+			{
+				$$ = $1
+			}
+	| alter_system_stmt
 			{
 				$$ = $1
 			}

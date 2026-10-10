@@ -295,6 +295,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.AlterSystem = func(name, value string, set, resetAll bool) error {
+			return sess.AlterSystem(s.cfg.DataDir, name, value, set, resetAll)
+		}
+		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)

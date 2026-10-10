@@ -577,6 +577,24 @@ type SetStmt struct {
 func (s *SetStmt) Pos() int  { return s.pos }
 func (s *SetStmt) stmtNode() {}
 
+// AlterSystemStmt — `ALTER SYSTEM SET name { TO | = } value[, ...] | DEFAULT`
+// and `ALTER SYSTEM RESET { name | ALL }` (gram.y AlterSystemStmt, whose
+// setstmt is a VariableSetStmt of kind VAR_SET_VALUE / VAR_SET_DEFAULT /
+// VAR_RESET / VAR_RESET_ALL). Value is the SET value-atom join (quotes
+// stripped, list items joined with ", "), as SetStmt.Value; it is unused when
+// Default, Reset or ResetAll is set. M0122-0008.
+type AlterSystemStmt struct {
+	pos      int
+	Name     string
+	Value    string
+	Default  bool // SET name TO DEFAULT
+	Reset    bool // RESET name
+	ResetAll bool // RESET ALL
+}
+
+func (s *AlterSystemStmt) Pos() int  { return s.pos }
+func (s *AlterSystemStmt) stmtNode() {}
+
 // SetConstraintsStmt — `SET CONSTRAINTS { ALL | name [, ...] }
 // { DEFERRED | IMMEDIATE }`. Controls the check timing of DEFERRABLE
 // constraints for the current transaction. Deferred=true → DEFERRED. When All

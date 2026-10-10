@@ -369,6 +369,11 @@ func NewSetStmt(pos int, local bool, name, value string, def bool) *SetStmt {
 	return &SetStmt{pos: pos, Local: local, Name: name, Value: value, Default: def}
 }
 
+// NewAlterSystemStmt builds ALTER SYSTEM SET/RESET (M0122-0008).
+func NewAlterSystemStmt(pos int, name, value string, def, reset, resetAll bool) *AlterSystemStmt {
+	return &AlterSystemStmt{pos: pos, Name: name, Value: value, Default: def, Reset: reset, ResetAll: resetAll}
+}
+
 // NewShowStmt builds SHOW [ALL] name.
 func NewShowStmt(pos int, all bool, name string) *ShowStmt {
 	return &ShowStmt{pos: pos, All: all, Name: name}

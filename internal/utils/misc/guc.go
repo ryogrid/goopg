@@ -626,6 +626,11 @@ func (r *Registry) ApplyConfigEntries(entries []ConfigEntry) error {
 	for _, e := range entries {
 		v, ok := r.Get(e.Name)
 		if !ok {
+			// A custom (dotted) name is a placeholder upstream — e.g. one
+			// ALTER SYSTEM wrote for an extension — not a startup failure.
+			if isCustomGUCName(e.Name) {
+				continue
+			}
 			errs = append(errs, fmt.Sprintf("%s:%d: unknown parameter %q", e.SourceFile, e.SourceLine, e.Name))
 			continue
 		}
@@ -667,9 +672,39 @@ type ReloadResult struct {
 // enable_nestloop_index) observe the new value immediately.
 func (r *Registry) ApplyReloadEntries(entries []ConfigEntry) ReloadResult {
 	var res ReloadResult
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		present[strings.ToLower(e.Name)] = true
+	}
+	// "parameter %s removed from configuration file, reset to default"
+	// (ProcessConfigFileInternal): a variable whose value came from the
+	// configuration files but no longer appears in them reverts to its boot
+	// value — how ALTER SYSTEM RESET takes effect on pg_reload_conf().
+	for _, v := range r.vars {
+		if v.Source != SourceConfigFile || present[strings.ToLower(v.Name)] {
+			continue
+		}
+		if v.Context == ContextPostmaster {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("parameter %q cannot be changed without restarting the server", v.Name))
+			continue
+		}
+		if v.Context == ContextInternal {
+			continue
+		}
+		changed := v.Value != v.BootVal
+		v.Value = v.BootVal
+		v.Source = SourceDefault
+		if changed {
+			r.invokeOnChange(v.Name, v.Value)
+			res.Changed = append(res.Changed, v.Name)
+		}
+	}
 	for _, e := range entries {
 		v, ok := r.Get(e.Name)
 		if !ok {
+			if isCustomGUCName(e.Name) {
+				continue // a placeholder upstream, not an error
+			}
 			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: unrecognized configuration parameter %q", e.SourceFile, e.SourceLine, e.Name))
 			continue
 		}

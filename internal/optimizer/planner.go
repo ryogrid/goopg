@@ -360,7 +360,7 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		return &Transaction{pos: s.Pos(), Verb: TxRollbackTo, Name: s.Name}, nil
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
-		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
+		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt, *parser.AlterSystemStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
 		*parser.SetTransactionStmt, *parser.SetConstraintsStmt,
 		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt,
