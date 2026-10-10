@@ -122,3 +122,12 @@ With stawidth the arm is 112 to 129 bytes and fits, as in PG.
   Ledgered.
 - **Transition space.** `transitionSpace` is still 0, because goopg has no
   `aggtransspace`. This under-charges; it is unchanged.
+
+## Correction (2026-10-10, M0141-S2a-fix2r-c)
+
+The "typmod-less bpchar, 356 bytes" finding above was an artifact. The
+private SF1 clone was started twice with the debug binary. The first start
+scanned the heap (662 bytes, typmods present) and wrote the M0114 JSON
+catalog cache. The second start registered tables from that cache, which
+drops typmods. The planner's schema keeps typmods; the cache is now
+retired. The stawidth-based width this task landed is unaffected.

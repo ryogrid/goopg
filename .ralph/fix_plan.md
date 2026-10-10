@@ -29190,7 +29190,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Tests `TestAnalyzeVarsizeAny`, `TestAnalyzePopulatesAvgWidth` case\.
     - Design `docs/design/0100\-0149/m0141\-s2a\-fix2r\-b\-analyze\-stawidth\-varsize\.md`\.
   Movement: none — SF0\.25 re\-ANALYZE A/B plans byte\-identical; fire set none
-- [ ] **M0141\-S2a\-fix2r\-c — plan\-schema types carry no typmod, so
+- [x] **M0141\-S2a\-fix2r\-c — plan\-schema types carry no typmod, so
   `get\_typavgwidth`\'s fallback prices char\(n\) / varchar\(n\) / numeric\(p,s\) at
   32 bytes** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-a\)\. `typeWidth`
   \(relsize\.go\) honours `Type\.Args`, but the columns `Aggregate\.Child\.Output\(\)`
@@ -29204,6 +29204,71 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     `catalog\.Table\.Columns` and whether `Type\.Args` survives \(catalog load vs
     schema projection\); a unit test on `tupleWidth\(SeqScan\.Output\(\)\)` for a
     char\(16\) column\.
+  - **DONE 2026\-10\-10 \(`17e9db192`\)\.** Cause: the typmod was lost at
+    table REGISTRATION, by the M0114 JSON fast\-start catalog cache — a
+    second restart registered user tables from it, and it kept only a
+    column\'s type NAME \(no Args, IsArray, identity, tablespace, DBOid\)\.
+    Retired: `loadUserTablesFromHeap` always runs; a leftover cache file is
+    unlinked\. Only TPC\-DS SF0\.25 carried a cache \(SF1 and TPC\-H already
+    loaded from the heap\); fix2r\-a\'s 356 B figure was itself a cache\-hit
+    artifact \(first start measured 662 B\)\.
+    - Found and fixed with it: S2 M0146\-0151 \(int4\[\] read back as a
+      scalar after a cache\-hit restart\)\. Uncovered: M0146\-0152 \(the
+      cache had masked a ghost\-table resurrection\), M0146\-0153, M0146\-0154\.
+    - Fire set: SF0\.25 all 99 re\-rendered \(widths only, shapes/categories
+      unchanged, no timeouts\); SF1 none\.
+    - Gates: units, spotcheck, acceptance arm, TPC\-H plans identical, sf025
+      PASS=99, ea\-ratchet \(1\), regress A/B \(join flap\)\.
+    - Test `TestColumnTypesSurviveRepeatedRestarts`; crash test re\-scoped\.
+    - Design `docs/design/0100\-0149/m0141\-s2a\-fix2r\-c\-retire\-catalog\-cache\.md`\.
+  Movement: none — CATEGORIES\-EXCL\-MATCH unchanged at both scales \(SF0\.25 width text only\)
+- [x] **M0146\-0151 — WRONG RESULTS: after a second restart an array column
+  reads back as a scalar \(int4\[\] `\{1,2\}` → `128`\)** \(filed 2026\-10\-10 by
+  M0141\-S2a\-fix2r\-c; S2\)\. The M0114 JSON catalog cache registered user
+  tables with type names only; `IsArray`, typmods and identity were lost\.
+  Fixed in the same commit that retired the cache \(`17e9db192`\); escalation
+  recorded in the 2026\-10\-10 baton\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r\-c
+  Movement: none — correctness fix; no TPC corpus carries an array column
+- [ ] **M0146\-0152 — WRONG RESULTS: an uncommitted CREATE TABLE survives a
+  restart when no transaction has committed since initdb** \(filed 2026\-10\-10
+  by M0141\-S2a\-fix2r\-c; S2\)\. With no xact record in the WAL and an empty
+  clog, `Open` takes the old\-cluster upgrade branch
+  \(`clog\.InitializeAsCommitted\(NextXID\)`, open\.go\), stamping the crashed
+  xid Committed; pg\_class rows in PG18 layout are filtered on Aborted only,
+  so the table reappears\. PG treats every not\-committed xid below nextXid as
+  aborted after restart\. Masked until now by the M0114 cache\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r\-c
+  - First step: distinguish an initdb\-fresh cluster from a pre\-M0030\-0007
+    one \(e\.g\. a pg\_control / capability marker\) so the upgrade branch never
+    runs on clusters this binary initialised; repro is
+    `TestCrashMidTransactionTableNotVisibleAfterRestart` without its
+    `committed\_first` statement\.
+- [ ] **M0146\-0153 — a GENERATED ALWAYS identity column accepts an explicit
+  value on plain INSERT** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-c\)\. `create
+  table g\(id int generated always as identity, t text\); insert into g\(id,t\)
+  values \(5,\'x\'\)` succeeds on goopg; PG 18\.3 raises `cannot insert a
+  non\-DEFAULT value into column "id"` \(rewriteTargetListIU,
+  rewriteHandler\.c\)\. No restart involved\. Ledger row M0134\-0029
+  \(2026\-08\-20\) states plain INSERT raises it — a regression or a
+  narrower original fix\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r\-c
+  - First step: bisect the M0134\-0029 claim \(regress `identity` case\) and
+    locate the INSERT\-path identity check\.
+- [ ] **M0146\-0154 — after a CLEAN restart an identity/serial sequence resumes
+  32 values ahead** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-c\)\. One insert,
+  clean stop/start, insert: goopg returns 34, PG 18\.3 returns 2\. PG writes
+  `last\_value`/`log\_cnt` to the sequence page and only crash recovery
+  replays the SEQ\_LOG\_VALS\-ahead WAL value; goopg restores its
+  every\-32\-nextval snapshot \(ledger M0119\-0004 root\-0020\) on every start\.
+  Kind: impl
+  Parent: M0141\-S2a\-fix2r\-c
+  - First step: persist the in\-memory counter at clean shutdown \(or keep
+    the sequence relation page current\) and restore the snapshot only on
+    crash recovery\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
