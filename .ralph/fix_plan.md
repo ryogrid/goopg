@@ -3783,7 +3783,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       is the prerequisite for scoping them together later. That scoping is the
       same M0122-0007 family as the template1 collision escalation.
 
-- [ ] **a template1 extension re-attributes to "postgres" on restart**
+- [x] **a template1 extension re-attributes to "postgres" on restart**
   (M0119-0006 bs residual). **UNBLOCKED 2026-09-27 — the recorded blocker
   (the `[!]` template1 namespace collision) got Option A GO on
   2026-09-25, so the `[!]` here was stale; re-opened.** It is a
@@ -3792,6 +3792,10 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   Kind: bug
   Parent: M0119-0006
   Movement: none
+  - **DONE 2026\-10\-10 \(with `fba181f95`\)\.** Re\-tested once the
+    collision was fixed, as this entry asked: `CREATE EXTENSION amcheck` in
+    template1, restart → `pg\_extension` template1=1, postgres=0 \(was 0 / 1\)\.
+    template1\'s extension row now lives in its own `base/2/3079`\.
   - **NEW EVIDENCE 2026\-09\-22 (loop \#23) — the collision is NOT limited to
     extensions; it breaks cross\-database isolation for ordinary USER TABLES,
     and it corrupts `pg_dumpall` output.** Recorded here because it bears
@@ -3980,7 +3984,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     `partition_aggregate`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
     acceptance arm 24/24; pgbench smoke.
 
-- [ ] **template1 shares the `postgres` catalog namespace** — **MAPPED
+- [x] **template1 shares the `postgres` catalog namespace** — **MAPPED
   2026-09-22; Option A chosen by owner decision 2026-09-25 (below).** Design:
   `docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md`.
   Kind: bug
@@ -4035,6 +4039,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     recommends. Option B \(postgres namespace 5, one oid per database at
     every layer\) remains the real fix inside M0122\-0007 slices 4b\-4e;
     this task does not pull that epic forward. Re\-opened.
+  - **DONE 2026\-10\-10 \(`fba181f95`\), Option A as decided\.**
+    `catalog.Template1NamespaceDBOid = 2` is template1\'s namespace and
+    storage oid \(`base/2`, scaffolded at startup from template0\'s image
+    when missing\); `DatabaseOid`/`ResolveDatabaseOid` return it, so every
+    per\-database reload covers template1; displayed `pg\_database.oid` stays
+    1\. pg\_database heap writers map back via `catalog.PgDatabaseRowOid`
+    \(CREATE DATABASE template\-row copy — without it a new database
+    vanished on restart —, `PersistDatConnLimit`, datacl resync\);
+    `reloadDatabaseACLsFromHeap` maps forward\.
+    - Follow\-ons: CREATE DATABASE now copies template1\'s user tables \(PG
+      behaviour; was silently empty\), and errors "not yet supported" when
+      template1 holds an index; pg\_dump of a template1 with user data hits
+      the open M0122\-0015a COPY defect\.
+    - Test `TestTemplate1HasItsOwnNamespace` \(fails on HEAD\)\.
+    - Gates: units, 77 related testport tests, regress A/B \(join flap\),
+      spotcheck, acceptance arm, fire set none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/0119\-0006bv\-template1\-namespace\-collision\.md` §8\.
+  Movement: none — catalog routing correctness; no plan instrument
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
   Kind: impl
