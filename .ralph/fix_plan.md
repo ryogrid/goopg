@@ -4160,7 +4160,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     worse than an honest gap. The task stays `[!]` until an SSL\-enabled
     PG 18.3 oracle exists to measure against; the resume point stands.
 
-- [ ] **ALTER SYSTEM is a no\-op** \(measured 2026\-09\-24\): `ALTER SYSTEM
+- [x] **ALTER SYSTEM is a no\-op** \(measured 2026\-09\-24\): `ALTER SYSTEM
   SET geqo\_effort = 11` and `ALTER SYSTEM SET ssl = on` both report
   ALTER SYSTEM, and `postgresql.auto.conf` is never written. PG validates
   the value \(parse\_and\_validate\_value\), rejects DISALLOW\_IN\_FILE and
@@ -4168,6 +4168,36 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   \(`AlterSystemSetConfigFile`, guc.c\).
   Kind: bug
   Parent: M0122-0008
+  - **DONE 2026\-10\-10 \(`27a3009c5`\)\.** Grammar \+ routing
+    \(`AlterSystemStmt`\); `misc.AlterSystemSetConfigFile` with guc.c\'s
+    checks \(55P02 / 42704 / value validation / newline\) and atomic escaped
+    rewrite; PreventInTransactionBlock and the non\-superuser parameter\-ACL
+    check in the executor; boot and reload read postgresql.auto.conf after
+    postgresql.conf, reload resets removed entries, custom names are
+    placeholders; the config lexer de\-escapes like DeescapeQuotedString;
+    `pg\_reload\_conf\(\)` added\.
+    - Live vs a scratch PG 18\.3: auto file byte\-identical; error messages
+      identical; reload applies, RESET reverts, restart keeps\.
+    - Tests: 4 misc unit tests, parser parity pins,
+      `TestPort\_AlterSystemWritesAutoConfAndSurvivesRestart`\.
+    - Gates: units, goldens, 27 GUC testport tests, regress A/B, spotcheck,
+      acceptance arm, fire set none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/0122\-0008\-alter\-system\-auto\-conf\.md`\.
+  Movement: none — configuration subsystem; no plan instrument
+
+- [ ] **SET / ALTER SYSTEM drop the quoting of GUC\_LIST\_QUOTE list
+  elements** \(filed 2026\-10\-10 by the ALTER SYSTEM task\)\. `SET
+  search\_path = \'x\'\'y\\z\', public` / `ALTER SYSTEM SET` the same: PG
+  flattens the value with `quote\_identifier` per string element of a
+  GUC\_LIST\_INPUT\|GUC\_LIST\_QUOTE variable \(`flatten\_set\_variable\_args`
+  / `ExtractSetVariableArgs`, guc\_funcs.c\), giving `"x\'y\\z", public`;
+  goopg\'s `setValueAtoms` joins decoded atoms, giving `x\'y\\z, public`
+  \(measured: PG\'s auto file line `search\_path = \'"x\'\'y\\\\z", public\'`\)\.
+  Kind: bug
+  Parent: M0122-0008
+  - First step: keep the literal/identifier kind per value atom in
+    `lexerState.setValueAtoms`, and quote string atoms for list\-quote GUCs
+    where SET and ALTER SYSTEM flatten \(shared — sibling paths\)\.
 
 - [ ] **GUC range errors use goopg's own wording** \(measured 2026\-09\-24\):
   `SET geqo\_effort = 11` reports `value 11 out of range [1, 10]`; PG
