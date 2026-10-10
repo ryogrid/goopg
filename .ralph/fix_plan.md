@@ -4249,13 +4249,52 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   Kind: bug
   Parent: M0122-0008
 
-- [ ] **proconfig / setconfig store the GUC name as typed** \(found
+- [x] **proconfig / setconfig store the GUC name as typed** \(found
   2026\-10\-10\)\. `CREATE FUNCTION g\(\) … SET datestyle = iso, mdy` stores
   `datestyle=iso, mdy`; PG stores `DateStyle=iso, mdy` — GUCArrayAdd
   replaces the name with `record\->name` \(guc\.c\)\. Same for ALTER
   DATABASE/ROLE SET\.
   Kind: bug
   Parent: M0122-0008
+  - **DONE 2026\-10\-10 \(`6502879b6`, `5d739cad7`\)\.** Wider than the
+    title: nothing was validated either\. `misc.ConfigArrayItem` =
+    validate\_option\_array\_item \+ find\_option normalisation
+    \(map\_old\_guc\_names\); 42704 / four 55P02 context messages / 22023\.
+    - `pg\_gucs\_gen.go`: the oracle\'s 407 parameter names \+ contexts \(goopg
+      registers 212\); without it `SET role` in a function \(select\_parallel\)
+      was rejected\.
+    - Callers: executor flattenFunctionConfigOps, ALTER DATABASE/ROLE apply
+      paths; text parsers downcase unquoted names\.
+    - Also fixed three internal/postmaster tests that pinned pre\-fix
+      behaviour of the two previous M0122\-0008 commits \(the package is
+      outside the units gate\)\.
+    - Live vs PG 18\.3: arrays, RESET, every rejection identical \(except the
+      open wording task\)\.
+    - Design `docs/design/0100\-0149/0122\-0008\-config\-array\-names\.md`\.
+  Movement: none — configuration subsystem; no plan instrument
+
+- [ ] **goopg\'s GUC registry diverges from PG 18\.3\'s parameter set**
+  \(measured 2026\-10\-10 against the oracle\'s pg\_settings via
+  `pg\_gucs\_gen.go`\)\.
+  Kind: bug
+  Parent: M0122-0008
+  - 191 PG parameters are not registered \(SET / SHOW reject them\)\.
+  - 7 goopg\-only names: `max\_predicate\_locks\_per\_page`,
+    `\_per\_relation`, `\_per\_xact` are misspellings of PG\'s
+    `max\_pred\_locks\_per\_\*`; `vacuum\_multixact\_freeze\_max\_age`,
+    `wal\_sender\_memory\_buffer`, `enable\_nestloop\_index`,
+    `enable\_opportunistic\_prune` do not exist in PG\.
+  - 13 context mismatches; privilege\-relevant: `commit\_delay`,
+    `compute\_query\_id`, `track\_io\_timing` are user\-settable in goopg but
+    superuser in PG\. Others: `autovacuum\_max\_workers`,
+    `autovacuum\_work\_mem`, `bgwriter\_delay`, `bgwriter\_lru\_maxpages`,
+    `io\_workers`, `restore\_command`, `wal\_writer\_delay`,
+    `wal\_writer\_flush\_after` \(goopg postmaster, PG sighup\),
+    `wal\_init\_zero` \(postmaster vs superuser\), `wal\_sender\_timeout`
+    \(sighup vs user\)\.
+  - First step: fix the three privilege\-relevant contexts and the three
+    misspelled names; check each renamed/re\-contexted variable\'s consumer
+    \(declared\-but\-unconsumed risk\)\.
 
 - [ ] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives
