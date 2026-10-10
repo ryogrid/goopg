@@ -4216,11 +4216,36 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Design `docs/design/0100\-0149/0122\-0008\-set\-value\-list\-flattening\.md`\.
   Movement: none — configuration subsystem; no plan instrument
 
-- [ ] **SET LOCAL outside a transaction block takes effect** \(found
+- [x] **SET LOCAL outside a transaction block takes effect** \(found
   2026\-10\-10 by the SET list task\)\. `SET LOCAL search\_path = \'L\',
   public` in autocommit: PG warns `SET LOCAL can only be used in transaction
   blocks` and leaves the value alone \(guc\_funcs\.c ExecSetVariableStmt →
   WarnNoTransactionBlock\); goopg applies it \(SHOW gives `"L", public`\)\.
+  Kind: bug
+  Parent: M0122-0008
+  - **DONE 2026\-10\-10 \(`1d10d426b`\)\.** Root cause wider than the title:
+    the GUC local layer was dropped only at an explicit COMMIT/ROLLBACK, so
+    SET LOCAL, set\_config\(…, true\) and SET LOCAL ROLE leaked outside
+    BEGIN, and an aborted message kept its plain SETs\.
+    - `SessionRegistry.BeginImplicitTransaction` /
+      `EndImplicitTransaction` give every autocommit message / Execute
+      AtEOXact\_GUC; a multi\-statement message is PG\'s implicit block;
+      BEGIN mid\-message promotes it\.
+    - Every SET LOCAL site warns 25P01 outside a block \(executor, simple
+      and extended fast paths, ROLE / SESSION AUTHORIZATION\)\.
+    - Live vs PG 18\.3 on one session: every SHOW and WARNING identical\.
+    - Gates: units, 22 testport, isolation 122 PASS, regress A/B \(guc
+      improved; plpgsql flap confirmed\), spotcheck, acceptance, fire set
+      none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/0122\-0008\-set\-local\-outside\-block\.md`\.
+  Movement: none — configuration subsystem; no plan instrument
+
+- [ ] **SHOW through the executor names its column in lower case** \(found
+  2026\-10\-10\)\. `SET LOCAL DateStyle = \'SQL, DMY\' \\; SHOW DateStyle`
+  \(a multi\-statement message, so the executor\'s utilitySettingsOp\.nextShow\)
+  labels the column `datestyle`; PG and goopg\'s single\-statement fast path
+  label it `DateStyle` \(GetPGVariableResultDesc uses the variable\'s own
+  name\)\.
   Kind: bug
   Parent: M0122-0008
 
