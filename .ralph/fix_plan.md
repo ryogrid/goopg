@@ -2890,7 +2890,7 @@ heuristic stays live.)
     ReadWriteUnique4 above \(SERIALIZABLE bitmap scans held no SIREAD\); PASSes
     standalone and in the isolation family with that fix\.
   Movement: none — correctness fix; no plan instrument
-- [ ] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
+- [x] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
   (AI-20261007-014030-001; repro: `go test -v -run '^TestPort_IsolationAlterTable1$' ./internal/testport/`,
   evidence `ci/logs/20261007-014030/testport/go-test.log`).
   Kind: impl
@@ -2908,6 +2908,15 @@ heuristic stays live.)
       EvalPlanQual task proved, under load, is the old runner\'s 300 ms timer;
       `2544b2c57` \(lock\-wait probe\) should resolve it — verify under the same
       load A/B before closing\.
+  - **DONE 2026\-10\-10 \(no code; structural fix is `2544b2c57`\)\.** One
+    failure in 14 nightlies \(10\-07, overlapping a FORCE=1 sweep \+ fire set\);
+    the other 13 pass\. Its only divergence is `step sc1: COMMIT; <waiting
+    ...>` — the slow\-COMMIT signature the EvalPlanQual load A/B pinned on the
+    old 300 ms runner timer\. Under the same synthetic load
+    \(`tmp/m157/load\.sh`\) neither runner reproduced it here \(old 4/4, probe
+    4/4 PASS; quiet 2/2\), so this closes on mechanism \+ history, not a
+    reproduction\.
+  Movement: none — flake; test\-runner fidelity fix already landed
 - [ ] **tpcds/stage\-startup\-20261007** — recurrence of the closed `tpcds/stage` task: nightly TPC\-DS stage failed at
   startup: server not ready in 120 s
   (AI-20261007-014030-004; repro: `bash ci/batch/stages/stage-tpcds.sh`,
