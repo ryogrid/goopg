@@ -2849,7 +2849,7 @@ heuristic stays live.)
       vs probe runner 3/3 PASS\. Quiet host: 3/3 PASS\.
     - Same signature on TestPort\_IsolationAlterTable1 \(below\)\.
   Movement: none — test\-runner fidelity; no plan instrument
-- [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
+- [x] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
   (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
@@ -2861,7 +2861,20 @@ heuristic stays live.)
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-001`\).
   - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-002`\).
   - Recurred again in the 2026\-10\-07 nightly \(`AI-20261007-014030-002`\).
-- [ ] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
+  - **DONE 2026\-10\-10 \(`0cc3055db`\)\.** Real divergence \(23505 where PG
+    raises 40001 in `r1 r2 w1 w2 c1 c2`\)\. The reads plan as a Bitmap Heap
+    Scan and `bitmapHeapScanOp` took no SSI predicate lock and made no
+    conflict\-out check — so SERIALIZABLE was unenforced for every
+    bitmap\-planned read \(S2 class, found and fixed here; escalation in the
+    baton\)\. Fix: relation\-grain SIREAD at open \+ per\-TID
+    `ssiRecordTupleRead` / `ssiRecordInvisibleTupleRead`, as `indexScanOp`\.
+    - Test `TestSSI\_BitmapHeapScanTakesPredicateLocks` \(fails on HEAD\)\.
+    - Isolation family all PASS; TemporalRangeIntegrity fixed by the same
+      change \(closed below\)\.
+    - Gates: units, spotcheck, acceptance arm, fire set none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/m\-nightly\-bitmap\-heap\-scan\-ssi\.md`\.
+  Movement: none — correctness fix; no plan instrument \(benchmarks run READ COMMITTED\)
+- [x] **testport/TestPort_IsolationTemporalRangeIntegrity** — testport TestPort\_IsolationTemporalRangeIntegrity FAILed
   (AI-20260925-002342-004; repro: `go test -v -run '^TestPort_IsolationTemporalRangeIntegrity$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
@@ -2873,6 +2886,10 @@ heuristic stays live.)
   - Recurred again in the 2026\-10\-03 nightly \(`AI-20261003-002454-002`\).
   - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-003`\).
   - Recurred again in the 2026\-10\-07 nightly \(`AI-20261007-014030-003`\).
+  - **DONE 2026\-10\-10 \(`0cc3055db`\)\.** Same root cause as
+    ReadWriteUnique4 above \(SERIALIZABLE bitmap scans held no SIREAD\); PASSes
+    standalone and in the isolation family with that fix\.
+  Movement: none — correctness fix; no plan instrument
 - [ ] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
   (AI-20261007-014030-001; repro: `go test -v -run '^TestPort_IsolationAlterTable1$' ./internal/testport/`,
   evidence `ci/logs/20261007-014030/testport/go-test.log`).
