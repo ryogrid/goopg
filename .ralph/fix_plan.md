@@ -4261,7 +4261,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     validate\_option\_array\_item \+ find\_option normalisation
     \(map\_old\_guc\_names\); 42704 / four 55P02 context messages / 22023\.
     - `pg\_gucs\_gen.go`: the oracle\'s 407 parameter names \+ contexts \(goopg
-      registers 212\); without it `SET role` in a function \(select\_parallel\)
+      registers 216\); without it `SET role` in a function \(select\_parallel\)
       was rejected\.
     - Callers: executor flattenFunctionConfigOps, ALTER DATABASE/ROLE apply
       paths; text parsers downcase unquoted names\.

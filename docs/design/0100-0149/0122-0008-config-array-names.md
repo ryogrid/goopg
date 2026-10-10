@@ -49,7 +49,7 @@ only in these cases:
 
 - **`misc.ConfigArrayItem(name, value *string)`** does the above and returns
   the name to store. Errors are `*AlterSystemError` carrying the SQLSTATE.
-- **`pg_gucs_gen.go`.** goopg registers only 212 of PG's parameters, so
+- **`pg_gucs_gen.go`.** goopg registers only 216 of PG's parameters, so
   `pg_gucs_gen.go` carries PG 18.3's built-in parameters, generated from
   `guc_tables.c`:
   - each entry has PG's own spelling and context;
@@ -108,7 +108,7 @@ only in these cases:
 ## Not covered (filed / ledgered)
 
 - **Value checks need a registration.** Values are checked only for
-  parameters goopg registers; for the other 195 PG parameters any value is
+  parameters goopg registers; for the other 191 PG parameters any value is
   stored.
 - **No permission checks.** There is no non-superuser check: a placeholder
   needs a superuser, and a `PGC_SUSET` parameter needs a superuser or the
