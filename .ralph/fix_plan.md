@@ -2917,7 +2917,7 @@ heuristic stays live.)
     4/4 PASS; quiet 2/2\), so this closes on mechanism \+ history, not a
     reproduction\.
   Movement: none — flake; test\-runner fidelity fix already landed
-- [ ] **tpcds/stage\-startup\-20261007** — recurrence of the closed `tpcds/stage` task: nightly TPC\-DS stage failed at
+- [x] **tpcds/stage\-startup\-20261007** — recurrence of the closed `tpcds/stage` task: nightly TPC\-DS stage failed at
   startup: server not ready in 120 s
   (AI-20261007-014030-004; repro: `bash ci/batch/stages/stage-tpcds.sh`,
   evidence `ci/logs/20261007-014030/tpcds/`).
@@ -2936,6 +2936,21 @@ heuristic stays live.)
       segment range at all\.
     - Loop lesson \(repeated\): the nightly batch runs from about 01:40\.
       Disk\-heavy FORCE=1 gates in that window fail its stages\.
+  - **DONE 2026\-10\-10 \(`fd694e4f2`\)\.** The stage passed in the three
+    nightlies since \(startup 7\-11 s\); the 10\-07 failure was host contention
+    amplified by the reader: `readStreamFrom` read every pg\_wal file until
+    ENOENT — on SF1 one live segment plus 70 zero\-filled preallocated ones,
+    1\.1 GB per start\. Now `lastLiveSegment` probes each first\-page header
+    \(`xlogPageValidator`, as `XLogReaderValidatePageHeader`\) and the read
+    stops after the last segment valid for its own address; holes before it
+    are still read \(`durableWALAfter` unchanged\)\.
+    - Private SF1 clone: startup HEAD 9\.4/7\.1 s → 1\.2/1\.2 s to listener\.
+    - Tests `TestReadStreamStopsAtPreallocatedTail`,
+      `TestReadStreamReadsThroughAMidStreamHole`\.
+    - Gates: units, testport restart/crash/recovery subset, spotcheck,
+      acceptance arm, fire set none, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/m\-nightly\-wal\-reader\-live\-tail\.md`\.
+  Movement: none — startup I/O fix; no plan instrument
 - [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
