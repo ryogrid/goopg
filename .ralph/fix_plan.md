@@ -3015,7 +3015,7 @@ heuristic stays live.)
   Movement: none — correctness fix; no plan instrument
 
 ### Nightly run 20260928-004845 (sha `2ddc97fddc1f`, 4 items) — filed 2026-09-28
-- [ ] **testport/TestPort_RegressSuite/limit re-fails** \(AI\-20260928\-004845\-004;
+- [x] **testport/TestPort_RegressSuite/limit re-fails** \(AI\-20260928\-004845\-004;
   repro: `go test \-v \-run '^TestPort_RegressSuite$/^limit$' ./internal/testport/`,
   evidence `ci/logs/20260928-004845/testport/go-test.log`\). New tonight: the
   must\-pass `limit` regress subtest output diverges again after the
@@ -3030,6 +3030,13 @@ heuristic stays live.)
     mismatch is a new normalization gap or a cursor/fetch regression
     \(the 2026\-09\-18 fix touched `executeFetch`'s backward\-position
     bookkeeping\).
+  - **DONE 2026\-10\-10 \(no code; resolved upstream of this task\)\.** It
+    failed only on the 09\-28 and 09\-29 nightlies and has PASSed in all 11
+    since \(09\-30 → 10\-10\), plus 5/5 fresh runs at HEAD `59a8d7f04`\. The
+    nightly log keeps no diff, and 22 executor/optimizer commits landed
+    between the last failing and first passing run, so the fixing commit is
+    not identified\.
+  Movement: none — stale nightly item
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run) — filed 2026-09-15
 - [x] **goopg\'s freeze WAL record is unreadable to real PostgreSQL:
