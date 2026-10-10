@@ -578,6 +578,59 @@ func openSegmentFile(walDir string, segNo uint64) (*os.File, error) {
 	return nil, fmt.Errorf("wal: segment %s not found in %s", FormatSegmentName(segNo), walDir)
 }
 
+// lastLiveSegment returns the highest segment at or after firstSegNo whose
+// first page carries a valid long header FOR ITS OWN ADDRESS (magic, long
+// header at the segment start, xlp_seg_size, xlp_pageaddr == segNo*segSize),
+// probing only that 40-byte header per file. Segments past it are the
+// preallocated (zero-filled) or recycled (stale) tail of pg_wal: upstream's
+// reader treats the first such page as the end of WAL
+// (XLogReaderValidatePageHeader, xlogreader.c:1250-1370), so it never reads
+// them.
+//
+// readStreamFrom used to os.ReadFile every file until ENOENT, which on a
+// cluster with max_wal_size worth of preallocated segments means 1.1 GB of
+// zeros per start (TPC-DS SF1: 1 live segment, 70 preallocated) — startup
+// took 5 min under disk contention (M-NIGHTLY tpcds/stage-startup-20261007).
+//
+// Segments up to and including the last live one are still read in full,
+// invalid ones in between included, so durableWALAfter's hole detection
+// sees exactly what it saw before. bounded is false — read until ENOENT, the
+// old behaviour — when the probe cannot judge: segments too small to hold a
+// long header (unit fixtures), or the first segment's header is itself
+// invalid.
+func lastLiveSegment(walDir string, segSize int64, firstSegNo uint64) (last uint64, bounded bool) {
+	if segSize < SizeOfXLogLongPHD {
+		return 0, false
+	}
+	hdr := make([]byte, SizeOfXLogLongPHD)
+	live := func(segNo uint64) (exists, ok bool) {
+		f, err := openSegmentFile(walDir, segNo)
+		if err != nil {
+			return false, false
+		}
+		defer f.Close()
+		if n, rerr := f.ReadAt(hdr, 0); n < len(hdr) || (rerr != nil && rerr != io.EOF) {
+			return true, false
+		}
+		v := xlogPageValidator{segSize: segSize}
+		return true, v.check(hdr, segNo*uint64(segSize)) == nil
+	}
+	if _, ok := live(firstSegNo); !ok {
+		return 0, false
+	}
+	last = firstSegNo
+	for segNo := firstSegNo + 1; ; segNo++ {
+		exists, ok := live(segNo)
+		if !exists {
+			break
+		}
+		if ok {
+			last = segNo
+		}
+	}
+	return last, true
+}
+
 // liveSegmentRunStart returns the first segment number of the longest
 // contiguous run ending at the highest entry of segNos. segNos must be sorted
 // ascending and non-empty. With no holes it returns segNos[0], so the common
@@ -603,7 +656,11 @@ func readStreamFrom(walDir string, segSize int64, firstSegNo uint64) ([]byte, er
 	// more than one, so growing from a zero-capacity slice re-copied the whole
 	// stream every time it doubled. Start at one segment.
 	stream := make([]byte, 0, segSize)
+	lastSegNo, bounded := lastLiveSegment(walDir, segSize, firstSegNo)
 	for segNo := firstSegNo; ; segNo++ {
+		if bounded && segNo > lastSegNo {
+			break // the rest is preallocated or recycled tail — never WAL
+		}
 		f, err := openSegmentFile(walDir, segNo)
 		if err != nil {
 			break // gap — no more segments match any TLI
