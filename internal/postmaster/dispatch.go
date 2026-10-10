@@ -287,6 +287,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		if err != nil {
 			return s.writeQueryError(w, errcodes.SystemError, err.Error())
 		}
+		// The GUC side of this autocommit transaction (AtStart_GUC /
+		// AtEOXact_GUC): SET LOCAL and set_config(..., true) values last
+		// until the message ends, and an aborted message undoes its plain
+		// SETs. A message of more than one statement runs in PG's implicit
+		// transaction block (exec_simple_query use_implicit_block), where SET
+		// LOCAL draws no warning. Ended before ReadyForQuery on commit (so
+		// any ParameterStatus precedes it) and in the defer below on abort.
+		sess.BeginImplicitTransaction(len(stmts) > 1)
 	}
 	// Each Query message gets a fresh BackendID for the lock
 	// manager; the youngest-backend victim policy from M0012-0002
@@ -305,6 +313,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	// catalog (M0110-0001 DU-002 slice 444 deferral, 2026-07-04).
 	var ectx *executor.Context
 	defer func() {
+		sess.EndImplicitTransaction(commit)
 		if autoCommit && !commit {
 			if ectx != nil {
 				if bs, ok := ectx.Session.(*executor.BasicSession); ok {
@@ -546,6 +555,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.InTransactionBlock = sess.InTransactionBlock
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
@@ -1372,6 +1382,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
+		sess.EndImplicitTransaction(true)
 		// Forced GC only helps after a transaction that actually wrote (a
 		// read-only SELECT produces no retained heap worth a GC round). Gate
 		// on the write-XID predicate so pgbench -S never pays even the atomic

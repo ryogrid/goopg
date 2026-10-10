@@ -551,6 +551,9 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			// instead of being applied as a garbage role name. M0134-0155.
 			return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
 		}
+		if !sess.InTransactionBlock() {
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
+		}
 		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET LOCAL ROLE rolename — must be checked before the generic "SET LOCAL "
@@ -559,6 +562,9 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	// via connTx.NonSuperuserRole) and fail with "unrecognized configuration
 	// parameter". Mirrors server/query.go's simple-query handling. M0119-0004.
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		if !sess.InTransactionBlock() {
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
+		}
 		setRoleFastPath(sess, connTx, matchable, "SET LOCAL ROLE", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET LOCAL "):
@@ -569,6 +575,15 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 		}
 		if err != nil {
 			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+		}
+		if !sess.InTransactionBlock() {
+			// An Execute outside a block is its own transaction: warn and
+			// validate only (see the simple-query handleSet).
+			if err := sess.CheckSet(name, value); err != nil {
+				msg, hint := gucSetErrorFields(err)
+				return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+			}
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
 		}
 		if err := sess.Set(name, value, true); err != nil {
 			msg, hint := gucSetErrorFields(err)

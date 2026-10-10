@@ -36,6 +36,18 @@ type SessionRegistry struct {
 	custom  map[string]*Variable
 	inTx    bool
 
+	// xactOpen marks an autocommit transaction in progress — a simple-query
+	// message or an extended-protocol Execute that runs outside an explicit
+	// block (BeginImplicitTransaction). Like an explicit transaction it
+	// journals plain SET in txPrior and drops the local layer when it ends,
+	// which is AtEOXact_GUC for transactions the client never opened.
+	xactOpen bool
+	// implicitBlock marks the implicit transaction block PostgreSQL opens for
+	// a simple-query message holding more than one statement
+	// (exec_simple_query's use_implicit_block). SET LOCAL there is no
+	// out-of-block use and draws no warning.
+	implicitBlock bool
+
 	// txPrior is the undo journal for plain SET while inTx: for each
 	// session-layer key mutated since BeginTransaction, the value that key
 	// held in s.session before the first mutation in this transaction. A
@@ -198,39 +210,21 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	if strings.EqualFold(value, "DEFAULT") {
 		return s.Reset(name)
 	}
-	v, ok := s.lookupVariable(name)
-	if !ok {
-		if !IsCustomGUCName(name) {
-			return fmt.Errorf("unrecognized configuration parameter %q", name)
-		}
-		v = NewVariable(Variable{
-			Name:    name,
-			Type:    TypeString,
-			BootVal: "",
-			Context: ContextUserset,
-			Scope:   ScopeSession | ScopeTransaction,
-			Flags:   FlagCustom | FlagDisallowInFile | FlagNotInSample,
-		})
-		s.custom[strings.ToLower(name)] = v
-	}
-	if v.Context < ContextSuset {
-		// Postmaster / SigHup / Internal contexts cannot be SET.
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
-	}
-	_, current, _ := s.Get(name)
-	canon, err := v.canonicalizeFrom(current, value)
+	v, placeholder, canon, err := s.prepareSet(name, value)
 	if err != nil {
 		return err
 	}
+	if placeholder {
+		s.custom[strings.ToLower(name)] = v
+	}
 	key := strings.ToLower(name)
 	if isLocal {
-		if !s.inTx {
-			// Postgres allows SET LOCAL outside a transaction; the
-			// value is set for the duration of the implicit
-			// transaction (which ends at the next ReadyForQuery). We
-			// model that by storing it in the local layer and then
-			// dropping it on the next ResetTransaction call.
-		}
+		// Outside any transaction block PostgreSQL still applies a local
+		// value; it lasts until the surrounding (autocommit) transaction
+		// ends, where EndImplicitTransaction drops the local layer. The
+		// "SET LOCAL can only be used in transaction blocks" warning is the
+		// SET LOCAL statement's (ExecSetVariableStmt), not set_config's, so
+		// callers raise it — see InTransactionBlock.
 		s.local[key] = canon
 	} else {
 		s.snapshotPrior(key)
@@ -250,6 +244,51 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	_, eff, _ := s.Get(name)
 	s.global.invokeOnChange(v.Name, eff)
 	return nil
+}
+
+// prepareSet resolves and validates name = value for Set: the variable
+// (a fresh placeholder when name is an unknown custom name — placeholder is
+// then true and the caller registers it), and the canonical value.
+func (s *SessionRegistry) prepareSet(name, value string) (v *Variable, placeholder bool, canon string, err error) {
+	v, ok := s.lookupVariable(name)
+	if !ok {
+		if !IsCustomGUCName(name) {
+			return nil, false, "", fmt.Errorf("unrecognized configuration parameter %q", name)
+		}
+		v = NewVariable(Variable{
+			Name:    name,
+			Type:    TypeString,
+			BootVal: "",
+			Context: ContextUserset,
+			Scope:   ScopeSession | ScopeTransaction,
+			Flags:   FlagCustom | FlagDisallowInFile | FlagNotInSample,
+		})
+		placeholder = true
+	}
+	if v.Context < ContextSuset {
+		// Postmaster / SigHup / Internal contexts cannot be SET.
+		return nil, false, "", fmt.Errorf("parameter %q cannot be changed now", v.Name)
+	}
+	_, current, _ := s.Get(name)
+	canon, err = v.canonicalizeFrom(current, value)
+	if err != nil {
+		return nil, false, "", err
+	}
+	return v, placeholder, canon, nil
+}
+
+// CheckSet validates name = value exactly as Set does without storing it.
+// It is the net effect of a single-statement SET LOCAL outside a
+// transaction block: PostgreSQL applies the value, then discards it when the
+// statement's own transaction commits (AtEOXact_GUC), so only a validation
+// error can be observed — and no ParameterStatus, since the reported value
+// never changes between ReadyForQuery messages.
+func (s *SessionRegistry) CheckSet(name, value string) error {
+	if strings.EqualFold(value, "DEFAULT") {
+		return nil
+	}
+	_, _, _, err := s.prepareSet(name, value)
+	return err
 }
 
 // SetStartup records the value the connection supplied at session start — the
@@ -373,7 +412,7 @@ func (s *SessionRegistry) Reset(name string) error {
 // no session-layer entry at all, so the eventual restore must delete rather
 // than write "". Design 0134-0001-p6-guc-transaction-rollback §Design 2.
 func (s *SessionRegistry) snapshotPrior(key string) {
-	if !s.inTx {
+	if !s.inTx && !s.xactOpen {
 		return
 	}
 	if _, already := s.txPrior[key]; already {
@@ -449,8 +488,52 @@ func (s *SessionRegistry) ResetAll() {
 // Commit/Rollback; plain SET inside a transaction is journalled and reverted
 // on Rollback (see EndTransaction).
 func (s *SessionRegistry) BeginTransaction() {
+	if !s.xactOpen || s.inTx {
+		// A BEGIN inside an autocommit message promotes that transaction
+		// into the block (BeginTransactionBlock from TBLOCK_STARTED /
+		// TBLOCK_IMPLICIT_INPROGRESS), so its journal and local values carry
+		// over; only a fresh transaction starts a fresh journal.
+		s.txPrior = map[string]*string{}
+	}
 	s.inTx = true
+}
+
+// BeginImplicitTransaction starts the GUC side of an autocommit transaction:
+// a simple-query message (implicitBlock when it holds more than one
+// statement) or an extended-protocol Execute outside an explicit block. It is
+// a no-op inside an explicit block or an already open autocommit transaction.
+func (s *SessionRegistry) BeginImplicitTransaction(implicitBlock bool) {
+	if s == nil || s.inTx || s.xactOpen {
+		return
+	}
+	s.xactOpen = true
+	s.implicitBlock = implicitBlock
 	s.txPrior = map[string]*string{}
+}
+
+// EndImplicitTransaction ends what BeginImplicitTransaction started:
+// AtEOXact_GUC — local values are dropped and, when the transaction aborted,
+// plain SETs made during it are undone. If a BEGIN promoted the transaction
+// into an explicit block that is still open, the block owns that state and
+// only the autocommit marks are cleared. Idempotent.
+func (s *SessionRegistry) EndImplicitTransaction(committed bool) {
+	if s == nil || !s.xactOpen {
+		return
+	}
+	s.xactOpen = false
+	s.implicitBlock = false
+	if s.inTx {
+		return
+	}
+	s.endXact(committed)
+}
+
+// InTransactionBlock reports whether a statement runs inside a transaction
+// block — an explicit BEGIN or a multi-statement message's implicit block —
+// i.e. whether IsTransactionBlock() would hold. SET LOCAL outside one draws
+// WarnNoTransactionBlock's 25P01 warning.
+func (s *SessionRegistry) InTransactionBlock() bool {
+	return s != nil && (s.inTx || s.implicitBlock)
 }
 
 // EndTransaction discards the local layer and, on an aborted transaction
@@ -467,6 +550,13 @@ func (s *SessionRegistry) BeginTransaction() {
 // committed's flag mirrors AtEOXact_GUC(bool isCommit, …).
 // Design 0134-0001-p6-guc-transaction-rollback.
 func (s *SessionRegistry) EndTransaction(committed bool) {
+	s.endXact(committed)
+	s.inTx = false
+}
+
+// endXact is AtEOXact_GUC: drop the local layer and, on abort, restore the
+// journalled session values.
+func (s *SessionRegistry) endXact(committed bool) {
 	for name := range s.local {
 		v, _ := s.global.Get(name)
 		delete(s.local, name)
@@ -496,7 +586,6 @@ func (s *SessionRegistry) EndTransaction(committed bool) {
 		}
 	}
 	s.txPrior = map[string]*string{}
-	s.inTx = false
 }
 
 // ReportableVariables returns every variable in the global registry

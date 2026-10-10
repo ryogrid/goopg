@@ -80,6 +80,17 @@ func noTransactionInProgressNotice() []libpq.ErrorField {
 	}
 }
 
+// setLocalOutsideBlockNotice is WarnNoTransactionBlock's 25P01 WARNING for a
+// SET LOCAL statement issued outside a transaction block.
+func setLocalOutsideBlockNotice() []libpq.ErrorField {
+	return []libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "WARNING"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+		{Code: libpq.FieldSQLState, Value: "25P01"},
+		{Code: libpq.FieldMessage, Value: executor.SetLocalOutsideBlockMessage},
+	}
+}
+
 // endExplicitBlock performs the teardown every terminal path of the arm
 // shares: optionally undo enum DDL, release the per-connection explicit state,
 // fire the EndLocalTransaction hook and clear the pending type-DDL queues. The

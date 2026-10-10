@@ -198,12 +198,19 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 	}
 	ownTx := !inBlock
+	if ownTx {
+		// The GUC side of this Execute's own transaction (see dispatch.go):
+		// set_config(..., true) values end with it, an abort undoes its plain
+		// SETs. An Execute is never an implicit block.
+		sess.BeginImplicitTransaction(false)
+	}
 	commit := false
 	var advisoryReleaseTarget any
 	defer func() {
 		// Only a transaction this Execute began is finalised here; a block's
 		// transaction outlives the Execute and is finalised by its COMMIT /
 		// ROLLBACK (or by connection teardown).
+		sess.EndImplicitTransaction(commit)
 		if ownTx && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -300,6 +307,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.InTransactionBlock = sess.InTransactionBlock
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
@@ -630,6 +638,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		s.publishPendingNotify(connTx)
 	}
 	commit = true
+	sess.EndImplicitTransaction(true)
 	s.writeBackConnTxState(ectx, connTx)
 
 	res.CommandTag = commandTagFor(node, op, rowCount)

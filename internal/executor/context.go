@@ -504,6 +504,10 @@ type Context struct {
 	// M0097-0023; committed flag added 0134-0001 P6/S15.
 	BeginLocalTransaction func()
 	EndLocalTransaction   func(committed bool)
+	// InTransactionBlock reports IsTransactionBlock(): an explicit BEGIN or
+	// a multi-statement message's implicit block. SET LOCAL outside one
+	// warns (WarnNoTransactionBlock). nil = assume inside.
+	InTransactionBlock func() bool
 
 	// PLpgSQLCommitChain commits (rollback=false) or rolls back (rollback=true)
 	// the current transaction and immediately begins a fresh one, updating

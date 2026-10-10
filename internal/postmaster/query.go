@@ -337,11 +337,19 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 				// a role name. M0134-0155.
 				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
 			}
-			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
-			role = strings.Trim(role, `"'`)
-			connTx.SnapshotLocalRoleIfNeeded(true)
-			applySetSessionAuthorization(connTx, role)
-			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			if !sess.InTransactionBlock() {
+				// Outside a block the local identity would end with the
+				// statement's own transaction: warn and change nothing.
+				if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+					return err
+				}
+			} else {
+				role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
+				role = strings.Trim(role, `"'`)
+				connTx.SnapshotLocalRoleIfNeeded(true)
+				applySetSessionAuthorization(connTx, role)
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -355,11 +363,18 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// SESSION AUTHORIZATION" case above.
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
 		if connTx != nil {
-			role := stripSetToOrEquals(matchable[len("SET LOCAL ROLE"):])
-			role = strings.Trim(role, `"'`)
-			connTx.SnapshotLocalRoleIfNeeded(true)
-			applySetRole(connTx, role)
-			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			if !sess.InTransactionBlock() {
+				// See SET LOCAL SESSION AUTHORIZATION above.
+				if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+					return err
+				}
+			} else {
+				role := stripSetToOrEquals(matchable[len("SET LOCAL ROLE"):])
+				role = strings.Trim(role, `"'`)
+				connTx.SnapshotLocalRoleIfNeeded(true)
+				applySetRole(connTx, role)
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -571,7 +586,17 @@ func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, bod
 	if err != nil {
 		return s.writeQueryError(w, errcodes.InvalidParameterValue, err.Error())
 	}
-	if err := sess.Set(name, value, isLocal); err != nil {
+	apply := sess.Set
+	if isLocal && !sess.InTransactionBlock() {
+		// A lone SET LOCAL statement outside a block: warn, then validate
+		// only — the value would be discarded with the statement's own
+		// transaction, so nothing else is observable.
+		if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+			return err
+		}
+		apply = func(name, value string, _ bool) error { return sess.CheckSet(name, value) }
+	}
+	if err := apply(name, value, isLocal); err != nil {
 		msg, hint := gucSetErrorFields(err)
 		if hint == "" {
 			return s.writeQueryError(w, errcodes.InvalidParameterValue, msg)

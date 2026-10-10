@@ -25,6 +25,11 @@ type utilitySettingsOp struct {
 
 func newUtilitySettingsOp(p *optimizer.Utility) *utilitySettingsOp { return &utilitySettingsOp{plan: p} }
 
+// SetLocalOutsideBlockMessage is WarnNoTransactionBlock's 25P01 text for SET
+// LOCAL (xact.c CheckTransactionBlock: "%s can only be used in transaction
+// blocks"); the wire fast paths raise the same warning.
+const SetLocalOutsideBlockMessage = "SET LOCAL can only be used in transaction blocks"
+
 // execErrorFromGUCError wraps a SET-time validation error for the wire
 // protocol, preserving the HINT PostgreSQL attaches to some GUC failures
 // (e.g. an enum's "Available values: ..." list) instead of collapsing it
@@ -55,6 +60,12 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		o.done = true
 		if o.ctx == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
+		}
+		// ExecSetVariableStmt: WarnNoTransactionBlock(isTopLevel, "SET
+		// LOCAL") before anything else. The value is still applied; the
+		// surrounding transaction's end discards it.
+		if stmt.Local && o.ctx.InTransactionBlock != nil && !o.ctx.InTransactionBlock() {
+			o.ctx.AddWarningWithHint("25P01", SetLocalOutsideBlockMessage, "")
 		}
 		// "role" — update non-superuser role tracking for privilege checks
 		// (e.g. TRUNCATE ownership, M0118-0008), mirroring the string-matching
