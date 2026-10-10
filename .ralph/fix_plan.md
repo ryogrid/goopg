@@ -4241,7 +4241,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   Movement: none — configuration subsystem; no plan instrument
 
 - [ ] **SHOW through the executor names its column in lower case** \(found
-  2026\-10\-10\)\. `SET LOCAL DateStyle = \'SQL, DMY\' \\; SHOW DateStyle`
+  2026\-10\-10\)\. `SET LOCAL DateStyle = \'SQL, DMY\' \; SHOW DateStyle`
   \(a multi\-statement message, so the executor\'s utilitySettingsOp\.nextShow\)
   labels the column `datestyle`; PG and goopg\'s single\-statement fast path
   label it `DateStyle` \(GetPGVariableResultDesc uses the variable\'s own
