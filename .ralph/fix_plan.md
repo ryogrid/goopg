@@ -2951,7 +2951,7 @@ heuristic stays live.)
       acceptance arm, fire set none, sf025 PASS=99\.
     - Design `docs/design/0100\-0149/m\-nightly\-wal\-reader\-live\-tail\.md`\.
   Movement: none — startup I/O fix; no plan instrument
-- [ ] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
+- [x] **units/internal/access/nbtree** — units suite failed in package internal/access/nbtree
   (AI-20261002-010412-001; repro: `go test -timeout 10m ./internal/access/nbtree/`,
   evidence `ci/logs/20261002-010412/units/go-test.log`).
   Kind: impl
@@ -2961,6 +2961,13 @@ heuristic stays live.)
     2026\-10\-02, new tonight\. Looks timing\-dependent \(the searchers may
     not overlap the inserters on a loaded host\); triage before treating as
     a regression\.
+  - **DONE 2026\-10\-10 \(`4bf9e3168`, test\-only\)\.** Test race, not a
+    B\-tree defect: readers checked `stop` before their first Search, so a
+    writer that finished first left zero searches\. Now a start barrier
+    \(writer waits for every reader\) plus search\-before\-stop\. 50x, 5x
+    `\-race`, `GOMAXPROCS=1` 100x PASS; units nightly\-green otherwise since
+    10\-03\.
+  Movement: none — test\-only
 - [x] **testport/TestPort_RegressSuite** — testport TestPort\_RegressSuite FAILed \(must\-pass subtests: portals\_p2, union; reopened: the 2026\-09\-22 task was closed\)
   (AI-20260925-002342-005; repro: `go test -v -run '^TestPort_RegressSuite$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
