@@ -2212,7 +2212,7 @@ heuristic stays live.)
     heap-update-chain probing on constraint/index probes is the plausible
     causal fix in the `2b7e9705..9fb05621f` window. No code change needed;
     re-open if a future nightly reproduces on a post-0010 sha.
-- [ ] **M\-NIGHTLY\-tuplelock\-upgrade\-reopen — testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
+- [x] **M\-NIGHTLY\-tuplelock\-upgrade\-reopen — testport/TestPort_IsolationTuplelockUpgradeNoDeadlock
   \(`AI-20261003-002454-003`\)** — FAILed again \(15\.55s\) in the 2026\-10\-03
   nightly: the tail of the schedule is shifted by two lines \(expected 253
   lines, got 255\), with `s2\_rollback` / `s0\_rollback` / the
@@ -2228,6 +2228,18 @@ heuristic stays live.)
     isolation runner decides `<waiting>` by a 300ms timeout\) from a real
     lock\-ordering change; compare against the 2026\-10\-02 nightly, which
     passed it\.
+  - **DONE 2026\-10\-10 \(`2544b2c57`\)\.** Timing flake: 4/4 fresh passes
+    and every nightly since 2026\-10\-04 \(7\) passes; the 10\-03 run was slow
+    \(15\.55 s vs \~12\.5 s\)\. Root cause is the runner\'s timing rules \(300 ms
+    → `<waiting>`, 200 ms post\-step drain\)\. Fixed as isolationtester does
+    it: `awaitStepOrBlock` probes `pg\_stat\_activity\.wait\_event\_type` for a
+    `Lock` wait at launch and in the drain, waiting on non\-blocked steps
+    \(1\.5 s fallback cap\)\.
+    - Isolation family HEAD vs candidate: strict unchanged; PreparedTransactions
+      SKIP → PASS; suite PASS 38 → 48; summed time 571 → 655 s\.
+    - Test `TestAwaitStepOrBlockAsksTheProbe`\.
+    - Design `docs/design/0100\-0149/m\-nightly\-isolation\-lock\-wait\-probe\.md`\.
+  Movement: none — test\-runner fidelity fix; no plan instrument
 - [x] **testport/TestPort_P0E4CatalogXmaxClientKill +
   TestPort_P0E4CatalogXmaxServerImmediateStop (AI-20260920-005626-007,
   AI-20260920-005626-008)** — both FAILed with a server-wedge signature, not
