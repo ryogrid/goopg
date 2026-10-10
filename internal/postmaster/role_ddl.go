@@ -869,7 +869,7 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 			}
 			return op, true
 		}
-		configName, rest, ok := splitLeadingSQLToken(rest)
+		configName, rest, ok := splitLeadingConfigName(rest)
 		if !ok || configName == "" {
 			return alterRoleConfigOp{}, false
 		}
@@ -907,7 +907,7 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 			op.resetAll = true
 			return op, true
 		}
-		configName, _, ok := splitLeadingSQLToken(rest)
+		configName, _, ok := splitLeadingConfigName(rest)
 		if !ok || configName == "" {
 			return alterRoleConfigOp{}, false
 		}
@@ -969,6 +969,13 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 	}
 	if op.valueErr != nil {
 		return true, &roleError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
+	}
+	if !op.resetAll {
+		name, code, msg := configArrayItem(op.configName, op.configValue, op.reset)
+		if code != "" {
+			return true, &roleError{code: code, msg: msg}
+		}
+		op.configName = name
 	}
 	switch {
 	case op.resetAll:

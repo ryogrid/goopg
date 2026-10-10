@@ -401,26 +401,44 @@ func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
 	return false
 }
 
-// flattenFunctionConfigOps runs each CREATE/ALTER FUNCTION SET clause's
-// value list through flatten_set_variable_args (functioncmds.c
-// compute_function_attributes -> ExtractSetVariableArgs), so proconfig holds
-// the same text PostgreSQL stores: list elements joined with ", ", string
-// elements of a GUC_LIST_QUOTE variable identifier-quoted. It returns a copy;
-// the parsed statement is left untouched.
+// flattenFunctionConfigOps prepares CREATE/ALTER FUNCTION SET / RESET
+// clauses for proconfig the way functioncmds.c update_proconfig_value does:
+// each SET value list goes through flatten_set_variable_args
+// (ExtractSetVariableArgs), and every named entry through GUCArrayAdd /
+// GUCArrayDelete's validation and name normalisation (misc.ConfigArrayItem)
+// — so proconfig holds PostgreSQL's text (`DateStyle=iso, mdy`) and a bad
+// name or value fails the statement. It returns a copy; the parsed
+// statement is left untouched.
 func flattenFunctionConfigOps(pos int, ops []parser.FunctionConfigOp) ([]parser.FunctionConfigOp, error) {
-	out := ops
-	for i, op := range ops {
-		if op.Reset || op.ResetAll || op.Args == nil {
+	if len(ops) == 0 {
+		return ops, nil
+	}
+	out := append([]parser.FunctionConfigOp(nil), ops...)
+	for i := range out {
+		op := &out[i]
+		if op.ResetAll {
 			continue
 		}
-		v, err := misc.FlattenSetArgs(op.Name, op.Args)
+		var value *string
+		if !op.Reset {
+			if op.Args != nil {
+				v, err := misc.FlattenSetArgs(op.Name, op.Args)
+				if err != nil {
+					return nil, execErrorFromGUCError(pos, err)
+				}
+				op.Value = v
+			}
+			value = &op.Value
+		}
+		name, err := misc.ConfigArrayItem(op.Name, value)
 		if err != nil {
+			var aerr *misc.AlterSystemError
+			if errors.As(err, &aerr) {
+				return nil, &ExecError{Code: aerr.Code, Pos: pos, Message: aerr.Msg, Hint: aerr.Hint}
+			}
 			return nil, execErrorFromGUCError(pos, err)
 		}
-		if &out[0] == &ops[0] {
-			out = append([]parser.FunctionConfigOp(nil), ops...)
-		}
-		out[i].Value = v
+		op.Name = name
 	}
 	return out, nil
 }

@@ -43,7 +43,7 @@ var (
 // flatten_set_variable_args treats as flags 0.
 func builtinVarFlags(name string) (VarFlag, bool) {
 	builtinFlagsOnce.Do(func() {
-		r := BuildDefaultRegistry()
+		r := builtinRegistry()
 		builtinFlags = make(map[string]VarFlag)
 		for _, v := range r.vars {
 			builtinFlags[strings.ToLower(v.Name)] = v.Flags

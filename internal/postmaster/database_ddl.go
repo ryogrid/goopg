@@ -161,7 +161,7 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 			}
 			return alterDatabaseConfigOp{dbName: dbName, configName: name, configValue: value}, true
 		}
-		configName, rest, ok := splitLeadingSQLToken(rest)
+		configName, rest, ok := splitLeadingConfigName(rest)
 		if !ok || configName == "" {
 			return alterDatabaseConfigOp{}, false
 		}
@@ -193,13 +193,45 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 		if strings.EqualFold(rest, "all") {
 			return alterDatabaseConfigOp{dbName: dbName, resetAll: true}, true
 		}
-		configName, _, ok := splitLeadingSQLToken(rest)
+		configName, _, ok := splitLeadingConfigName(rest)
 		if !ok || configName == "" {
 			return alterDatabaseConfigOp{}, false
 		}
 		return alterDatabaseConfigOp{dbName: dbName, configName: configName, reset: true}, true
 	}
 	return alterDatabaseConfigOp{}, false
+}
+
+// configArrayItem runs AlterSetting's GUCArrayAdd / GUCArrayDelete
+// validation and name normalisation (misc.ConfigArrayItem) for one ALTER
+// DATABASE / ROLE ... SET or RESET entry. It returns the name to store, or a
+// non-empty SQLSTATE and message when PostgreSQL would reject the entry.
+func configArrayItem(name, value string, reset bool) (string, errcodes.Code, string) {
+	var v *string
+	if !reset {
+		v = &value
+	}
+	canon, err := misc.ConfigArrayItem(name, v)
+	if err == nil {
+		return canon, "", ""
+	}
+	var aerr *misc.AlterSystemError
+	if errors.As(err, &aerr) {
+		return "", errcodes.Code(aerr.Code), aerr.Msg
+	}
+	return "", errcodes.InvalidParameterValue, err.Error()
+}
+
+// splitLeadingConfigName reads the configuration parameter name of a SET /
+// RESET clause: an identifier, downcased unless it was double-quoted, as the
+// grammar's var_name (ColId) delivers it.
+func splitLeadingConfigName(s string) (name, rest string, ok bool) {
+	quoted := strings.HasPrefix(strings.TrimLeft(s, " \t\r\n"), `"`)
+	name, rest, ok = splitLeadingSQLToken(s)
+	if ok && !quoted {
+		name = strings.ToLower(name)
+	}
+	return name, rest, ok
 }
 
 // splitLeadingSQLToken reads one SQL token (a double-quoted identifier, or a
@@ -2075,6 +2107,13 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 	// pg_database, so the two must agree.
 	if op.valueErr != nil {
 		return true, "", &databaseDDLError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
+	}
+	if !op.resetAll {
+		name, code, msg := configArrayItem(op.configName, op.configValue, op.reset)
+		if code != "" {
+			return true, "", &databaseDDLError{code: code, msg: msg}
+		}
+		op.configName = name
 	}
 	dbOid := catalog.FirstUserOID
 	switch {
