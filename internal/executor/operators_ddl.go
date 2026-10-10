@@ -17215,6 +17215,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
 	}
+	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
+	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
 		if s.BeginAtomic || s.IsReturnForm {
@@ -17349,7 +17353,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
-		Config:          catalog.ApplyFunctionConfigOps(nil, s.ConfigOps),
+		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}
 	// Extract dependency information for information_schema views (SQL functions only).
 	if lang == "sql" {
@@ -17821,6 +17825,10 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	if rs == nil {
 		return nil // no routine registry, silently skip
 	}
+	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
+	}
 	var argTypes []catalog.Type
 	for _, a := range s.Args {
 		argTypes = append(argTypes, catalog.Type{Name: routineArgTypeName(a.Type)})
@@ -17964,8 +17972,8 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		// RENAME/OWNER/SET SCHEMA above (those are genuinely separate
 		// top-level grammar productions, not combinable). DU-002 proconfig
 		// follow-up to M0097-0150.
-		if len(s.ConfigOps) > 0 {
-			r.Config = catalog.ApplyFunctionConfigOps(r.Config, s.ConfigOps)
+		if len(configOps) > 0 {
+			r.Config = catalog.ApplyFunctionConfigOps(r.Config, configOps)
 		}
 		// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
 		// resume point): log the full post-mutation snapshot of the four

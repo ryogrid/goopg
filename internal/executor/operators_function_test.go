@@ -484,8 +484,10 @@ func TestExecCreateFunctionSetClausePopulatesConfig(t *testing.T) {
 	if !fn.Strict {
 		t.Error("STRICT after SET clause was not applied (combinable common_func_opt_item)")
 	}
-	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
-		t.Errorf("Config = %#v, want [search_path=app,public]", fn.Config)
+	// flatten_set_variable_args joins list elements with ", " (PG 18.3
+	// proconfig: {"search_path=app, public"}).
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app, public" {
+		t.Errorf("Config = %#v, want [search_path=app, public]", fn.Config)
 	}
 }
 
@@ -519,15 +521,15 @@ func TestExecAlterFunctionSetResetConfig(t *testing.T) {
 	if fn.Volatile != "v" {
 		t.Errorf("Volatile after combined SET = %q, want v", fn.Volatile)
 	}
-	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
-		t.Fatalf("Config after SET = %#v, want [search_path=app,public]", fn.Config)
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app, public" {
+		t.Fatalf("Config after SET = %#v, want [search_path=app, public]", fn.Config)
 	}
 
 	// A second SET on a different name appends.
 	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) SET work_mem = '64MB'", cat); err != nil {
 		t.Fatalf("ALTER FUNCTION SET work_mem: %v", err)
 	}
-	if len(fn.Config) != 2 || fn.Config[0] != "search_path=app,public" || fn.Config[1] != "work_mem=64MB" {
+	if len(fn.Config) != 2 || fn.Config[0] != "search_path=app, public" || fn.Config[1] != "work_mem=64MB" {
 		t.Fatalf("Config after second SET = %#v", fn.Config)
 	}
 

@@ -563,10 +563,13 @@ func gucSetErrorFields(err error) (msg, hint string) {
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
 // the keyword: "name = value", "name TO value", or "name value".
 func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, body string, isLocal bool) error {
-	name, value, ok := splitSet(body)
+	name, value, ok, err := splitSetFlattened(body)
 	if !ok {
 		return s.writeQueryError(w, errcodes.SyntaxError,
 			fmt.Sprintf("could not parse SET statement: %q", body))
+	}
+	if err != nil {
+		return s.writeQueryError(w, errcodes.InvalidParameterValue, err.Error())
 	}
 	if err := sess.Set(name, value, isLocal); err != nil {
 		msg, hint := gucSetErrorFields(err)
@@ -624,6 +627,50 @@ func setAuthzGenericSetForm(rest string) bool {
 	}
 	return len(rest) >= 2 && strings.EqualFold(rest[:2], "to") &&
 		(len(rest) == 2 || rest[2] == ' ' || rest[2] == '\t')
+}
+
+// splitSetFlattened is splitSet for the wire fast paths (simple and
+// extended protocol), plus the flattening the grammar path applies: a value
+// that parses as a var_list goes through flatten_set_variable_args —
+// identifiers downcased, list elements joined with ", " and, for
+// GUC_LIST_QUOTE variables, identifier-quoted; more than one element for a
+// scalar variable is err. Anything else (DEFAULT, TIME ZONE's LOCAL and
+// INTERVAL forms) keeps splitSet's value.
+func splitSetFlattened(body string) (name, value string, ok bool, err error) {
+	name, value, ok = splitSet(body)
+	if !ok {
+		return name, value, false, nil
+	}
+	if args, isList := parser.ParseSetArgList(splitSetRawValue(body)); isList && !isBareSetKeyword(args, "local") {
+		value, err = misc.FlattenSetArgs(strings.ToLower(name), args)
+	}
+	return name, value, true, err
+}
+
+// isBareSetKeyword reports whether args is the single unquoted word kw.
+// ParseSetArgList cannot tell an identifier from a string literal, so the
+// raw-text callers check the text themselves when it matters; here a lone
+// "local" is only ever SET TIME ZONE LOCAL (a reset upstream), which splitSet
+// already handles.
+func isBareSetKeyword(args []misc.SetArg, kw string) bool {
+	return len(args) == 1 && args[0].Kind == misc.SetArgString && strings.EqualFold(args[0].Val, kw)
+}
+
+// splitSetRawValue returns the value text of a SET body — what follows the
+// name and its optional '=' / TO — without splitSet's quote stripping.
+func splitSetRawValue(body string) string {
+	body = strings.TrimSpace(body)
+	end := 0
+	for end < len(body) && body[end] != ' ' && body[end] != '\t' && body[end] != '=' {
+		end++
+	}
+	rest := strings.TrimSpace(body[end:])
+	rest = strings.TrimPrefix(rest, "=")
+	rest = strings.TrimSpace(rest)
+	if strings.HasPrefix(strings.ToUpper(rest), "TO ") {
+		rest = strings.TrimSpace(rest[3:])
+	}
+	return rest
 }
 
 // splitSet splits "name = value", "name TO value", or "name value" into

@@ -801,6 +801,7 @@ type alterRoleConfigOp struct {
 	dbName      string
 	configName  string // empty when resetAll
 	configValue string // meaningful only when !reset && !resetAll && !fromCurrent
+	valueErr    error  // flatten_set_variable_args failure, raised at apply time
 	reset       bool   // RESET <name>
 	resetAll    bool   // RESET ALL
 	fromCurrent bool   // SET <name> FROM CURRENT — configValue resolved at apply time
@@ -892,12 +893,13 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 			op.reset = true
 			return op, true
 		}
-		value, ok := flattenConfigValueList(rest)
+		value, ok, valueErr := flattenConfigValueList(configName, rest)
 		if !ok {
 			return alterRoleConfigOp{}, false
 		}
 		op.configName = configName
 		op.configValue = value
+		op.valueErr = valueErr
 		return op, true
 	case strings.HasPrefix(lowerRest, "reset "):
 		rest = strings.TrimSpace(rest[len("reset "):])
@@ -964,6 +966,9 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 			return true, &roleError{code: errcodes.UndefinedObject, msg: fmt.Sprintf("unrecognized configuration parameter %q", op.configName)}
 		}
 		op.configValue = val
+	}
+	if op.valueErr != nil {
+		return true, &roleError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
 	}
 	switch {
 	case op.resetAll:

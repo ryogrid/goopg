@@ -201,3 +201,36 @@ func IsReservedForQuoting(s string) bool {
 	_, ok := reservedQuoteKeywords[s]
 	return ok
 }
+
+// QuoteIdentifier is PostgreSQL's quote_identifier() (ruleutils.c) without
+// the quote_all_identifiers override: s is returned bare only when it starts
+// with a lowercase ASCII letter or underscore, continues with lowercase ASCII
+// letters, digits and underscores, and is not a non-UNRESERVED keyword;
+// otherwise it is double-quoted with embedded double quotes doubled.
+func QuoteIdentifier(s string) string {
+	safe := s != ""
+	for i := 0; i < len(s) && safe; i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			safe = false
+		}
+	}
+	if safe && IsReservedForQuoting(s) {
+		safe = false
+	}
+	if safe {
+		return s
+	}
+	var b []byte
+	b = append(b, '"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			b = append(b, '"')
+		}
+		b = append(b, s[i])
+	}
+	return string(append(b, '"'))
+}

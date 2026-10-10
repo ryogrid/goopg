@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/utils/adt/similarto"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Support helpers for grammar actions (docs/design/not_ralph/
@@ -2584,6 +2585,39 @@ func tableArgs(base []FunctionArg, cols []FunctionArg) []FunctionArg {
 // records NO config op for: `SET x FROM CURRENT` and `SET x TO DEFAULT`
 // (function.go parseFunctionConfigSetClause returns ok=false for both).
 const fnConfigUnset = "\x00\x00unset"
+
+// fnConfigVal is a function SET clause's value: the comma-joined atom text
+// legacy records plus the typed list the executor flattens with the
+// variable's flags. A nil *fnConfigVal is FROM CURRENT / TO DEFAULT.
+type fnConfigVal struct {
+	text string
+	args []misc.SetArg
+}
+
+func fnConfigOf(n any) *fnConfigVal {
+	cv, _ := n.(*fnConfigVal)
+	return cv
+}
+
+// textOrUnset is the clause text, or fnConfigUnset for FROM CURRENT / TO
+// DEFAULT (what ALTER FUNCTION ... SET SCHEMA receives for those).
+func (cv *fnConfigVal) textOrUnset() string {
+	if cv == nil {
+		return fnConfigUnset
+	}
+	return cv.text
+}
+
+// op builds the SET config op for name. A nil receiver yields an op with an
+// empty value, which callers drop.
+func (cv *fnConfigVal) op(name string) FunctionConfigOp {
+	if cv == nil {
+		return NewFunctionConfigOp(false, false, name, fnConfigUnset)
+	}
+	op := NewFunctionConfigOp(false, false, name, cv.text)
+	op.Args = cv.args
+	return op
+}
 
 // fnReturn carries the three shapes of a RETURNS clause: a plain type, SETOF
 // that type, or TABLE (cols) — which legacy folds into trailing OUT arguments.

@@ -563,9 +563,12 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		body := matchable[len("SET LOCAL "):]
-		name, value, ok := splitSet(body)
+		name, value, ok, err := splitSetFlattened(body)
 		if !ok {
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
+		}
+		if err != nil {
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
 		}
 		if err := sess.Set(name, value, true); err != nil {
 			msg, hint := gucSetErrorFields(err)
@@ -599,9 +602,12 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 		return &extendedQueryResult{CommandTag: "SET CONSTRAINTS"}, nil
 	case strings.HasPrefix(upper, "SET "):
 		body := matchable[len("SET "):]
-		name, value, ok := splitSet(body)
+		name, value, ok, err := splitSetFlattened(body)
 		if !ok {
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
+		}
+		if err != nil {
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
 		}
 		if err := sess.Set(name, value, false); err != nil {
 			msg, hint := gucSetErrorFields(err)

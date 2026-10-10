@@ -135,7 +135,8 @@
 %type <node>	at_constraint at_constr_tail fn_type fn_return fn_attrs fn_attr func_arg fn_drop_item opt_call_named_args call_named_arg_list call_named_arg
 %type <fargs>	opt_func_args func_arg_list_p
 %type <fitems>	fn_drop_extras
-%type <str>	fn_param_name fn_number fn_lang_name fn_set_values fn_body_list fn_config_name fn_config_value
+%type <str>	fn_param_name fn_number fn_lang_name fn_set_values fn_body_list fn_config_name
+%type <node>	fn_config_value
 %type <ival>	fn_arg_mode
 %type <expr>	opt_arg_default
 %type <expr>	opt_at_using

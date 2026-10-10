@@ -116,7 +116,15 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if o.ctx.SetSetting == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
-		if err := o.ctx.SetSetting(stmt.Name, stmt.Value, stmt.Local); err != nil {
+		value := stmt.Value
+		if stmt.Args != nil {
+			v, err := misc.FlattenSetArgs(stmt.Name, stmt.Args)
+			if err != nil {
+				return nil, execErrorFromGUCError(stmt.Pos(), err)
+			}
+			value = v
+		}
+		if err := o.ctx.SetSetting(stmt.Name, value, stmt.Local); err != nil {
 			return nil, execErrorFromGUCError(stmt.Pos(), err)
 		}
 		return nil, EOF
@@ -323,6 +331,15 @@ func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error 
 		return &ExecError{Code: "25001", Message: "ALTER SYSTEM cannot run inside a transaction block"}
 	}
 	name := strings.ToLower(stmt.Name)
+	// ExtractSetVariableArgs runs before the permission check upstream.
+	value := stmt.Value
+	if stmt.Args != nil && !stmt.Reset && !stmt.ResetAll {
+		v, err := misc.FlattenSetArgs(name, stmt.Args)
+		if err != nil {
+			return execErrorFromGUCError(0, err)
+		}
+		value = v
+	}
 	if role := o.ctx.NonSuperuserRole; role != "" {
 		if stmt.ResetAll {
 			return &ExecError{Code: "42501", Message: "permission denied to perform ALTER SYSTEM RESET ALL"}
@@ -332,7 +349,7 @@ func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error 
 		}
 	}
 	set := !stmt.Reset && !stmt.Default
-	if err := o.ctx.AlterSystem(name, stmt.Value, set, stmt.ResetAll); err != nil {
+	if err := o.ctx.AlterSystem(name, value, set, stmt.ResetAll); err != nil {
 		var aerr *misc.AlterSystemError
 		if errors.As(err, &aerr) {
 			return &ExecError{Code: aerr.Code, Message: aerr.Msg, Hint: aerr.Hint}
@@ -371,4 +388,28 @@ func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
 		}
 	}
 	return false
+}
+
+// flattenFunctionConfigOps runs each CREATE/ALTER FUNCTION SET clause's
+// value list through flatten_set_variable_args (functioncmds.c
+// compute_function_attributes -> ExtractSetVariableArgs), so proconfig holds
+// the same text PostgreSQL stores: list elements joined with ", ", string
+// elements of a GUC_LIST_QUOTE variable identifier-quoted. It returns a copy;
+// the parsed statement is left untouched.
+func flattenFunctionConfigOps(pos int, ops []parser.FunctionConfigOp) ([]parser.FunctionConfigOp, error) {
+	out := ops
+	for i, op := range ops {
+		if op.Reset || op.ResetAll || op.Args == nil {
+			continue
+		}
+		v, err := misc.FlattenSetArgs(op.Name, op.Args)
+		if err != nil {
+			return nil, execErrorFromGUCError(pos, err)
+		}
+		if &out[0] == &ops[0] {
+			out = append([]parser.FunctionConfigOp(nil), ops...)
+		}
+		out[i].Value = v
+	}
+	return out, nil
 }

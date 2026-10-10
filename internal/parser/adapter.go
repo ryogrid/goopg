@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // This file adapts the existing hand-written lexer's token stream
@@ -311,6 +312,38 @@ func (l *lexerState) setValueAtoms() string {
 		}
 	}
 	return strings.Join(atoms, ", ")
+}
+
+// setValueArgs is setValueAtoms' typed counterpart: the value list as
+// gram.y var_list elements, for flattening with the variable's flags
+// (misc.FlattenSetArgs). nil for the bare DEFAULT spelling.
+func (l *lexerState) setValueArgs() []misc.SetArg {
+	if l.setValueIsDefault() {
+		return nil
+	}
+	i := l.setValueStart()
+	if i < 0 {
+		return nil
+	}
+	args, _, _ := scanSetArgs(l.toks, i)
+	return args
+}
+
+// setArgsAt is setValueArgs for a value list that starts at byte position
+// pos — the function SET clause, whose statement holds other '=' / TO tokens
+// before it.
+func setArgsAt(yylex yyLexer, pos int) []misc.SetArg {
+	st, ok := yylex.(*lexerState)
+	if !ok {
+		return nil
+	}
+	for i, t := range st.toks {
+		if t.Pos == pos {
+			args, _, _ := scanSetArgs(st.toks, i)
+			return args
+		}
+	}
+	return nil
 }
 
 func eofPos(toks []Token) int {

@@ -132,6 +132,13 @@ const (
 	// FlagNoShowAll: guc.h GUC_NO_SHOW_ALL — omitted from SHOW ALL, still
 	// reachable by name.
 	FlagNoShowAll
+	// FlagListInput: guc.h GUC_LIST_INPUT — SET accepts a comma-separated
+	// list of values (flatten_set_variable_args); other variables reject
+	// more than one.
+	FlagListInput
+	// FlagListQuote: guc.h GUC_LIST_QUOTE — SET double-quotes each string
+	// element of the list unless it is a plain identifier.
+	FlagListQuote
 )
 
 // Variable is one GUC. Use NewVariable in BuildDefaultRegistry rather
@@ -319,6 +326,18 @@ func (v *Variable) canonicalizeType(current, value string) (string, error) {
 		}
 		return fStr, nil
 	case TypeString:
+		switch strings.ToLower(v.Name) {
+		case "client_encoding":
+			// check_client_encoding stores pg_encoding_to_char's spelling
+			// (`SET client_encoding = utf8` shows UTF8).
+			if canon := encodingNameToCanonical(value); canon != "" {
+				return canon, nil
+			}
+		case "timezone", "log_timezone":
+			// check_timezone / check_log_timezone keep pg_tzset's name, the
+			// tz file's own spelling (`SET timezone = utc` shows UTC).
+			return canonicalZoneName(value), nil
+		}
 		return value, nil
 	case TypeEnum:
 		for _, opt := range v.EnumOptions {

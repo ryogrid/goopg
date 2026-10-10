@@ -53,7 +53,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "DateStyle", Type: TypeString, BootVal: "ISO, MDY",
-		Context: ContextUserset, Flags: FlagReport,
+		Context: ContextUserset, Flags: FlagReport | FlagListInput,
 		Scope: ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -285,6 +285,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "listen_addresses", Type: TypeString, BootVal: "localhost",
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
+		Flags:   FlagListInput,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "port", Type: TypeInt, BootVal: "5432",
@@ -587,6 +588,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "synchronous_standby_names", Type: TypeString, BootVal: "",
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
+		Flags:   FlagListInput,
 	}))
 
 	// wal_writer_delay sets the period (in milliseconds) of the
@@ -904,7 +906,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
-		Flags:   FlagExplain,
+		Flags:   FlagExplain | FlagListInput | FlagListQuote,
 	}))
 
 	// transaction_isolation is what JDBC's getTransactionIsolation()

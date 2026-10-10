@@ -1156,7 +1156,9 @@ set_stmt:
 				// against the permissive value list below. setValueIsDefault
 				// inspects the token instead.
 				l := yylex.(*lexerState)
-				$$ = NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
+				s := NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
+				s.Args = l.setValueArgs()
+				$$ = s
 			}
 
 	/* SET [SESSION|LOCAL] AUTHORIZATION name|DEFAULT. SESSION is consumed by
@@ -1262,7 +1264,9 @@ alter_system_stmt:
 		ALTER SYSTEM_P SET set_guc_name set_eq_to set_value_list
 			{
 				l := yylex.(*lexerState)
-				$$ = NewAlterSystemStmt(0, $4, l.setValueAtoms(), l.setValueIsDefault(), false, false)
+				s := NewAlterSystemStmt(0, $4, l.setValueAtoms(), l.setValueIsDefault(), false, false)
+				s.Args = l.setValueArgs()
+				$$ = s
 			}
 	| ALTER SYSTEM_P RESET set_guc_name
 			{ $$ = NewAlterSystemStmt(0, $4, "", false, true, false) }
@@ -2220,13 +2224,13 @@ fn_attr:
 	| SUPPORT qualified_name      { $$ = func(a *fnAttrs) {} }
 	| SET fn_config_name fn_config_value
 			{
-				n, v := $2, $3
+				n, cv := $2, fnConfigOf($3)
 				$$ = func(a *fnAttrs) {
 					/* FROM CURRENT / TO DEFAULT record NO config op: goopg has
 					   no GUC snapshot to capture (function.go
 					   parseFunctionConfigSetClause returns ok=false). */
-					if v != fnConfigUnset {
-						a.configOps = append(a.configOps, NewFunctionConfigOp(false, false, n, v))
+					if cv != nil {
+						a.configOps = append(a.configOps, cv.op(n))
 					}
 				}
 			}
@@ -2256,8 +2260,15 @@ fn_config_name:
    DEFAULT, and both reduce at the same point. The keyword is recognised at the
    token instead, which also keeps `= 'default'` (a real value) distinct. */
 fn_config_value:
-		fn_eq_to fn_set_values      { if isDefaultKeywordAt(yylex, $<p>2) { $$ = fnConfigUnset } else { $$ = $2 } }
-	| FROM CURRENT_P                { $$ = fnConfigUnset }
+		fn_eq_to fn_set_values
+			{
+				if isDefaultKeywordAt(yylex, $<p>2) {
+					$$ = nil
+				} else {
+					$$ = &fnConfigVal{text: $2, args: setArgsAt(yylex, $<p>2)}
+				}
+			}
+	| FROM CURRENT_P                { $$ = nil }
 
 /* set_value_list keeps only its FIRST atom (its callers recover the rest from
    the token stream via lexerState.setValueAtoms, which scans a whole SET
@@ -3132,11 +3143,11 @@ alter_fn_action:
 	   (ddl.go peeks for the word "schema" after SET). */
 	| SET fn_config_name fn_config_value
 			{
-				n, v := $2, $3
+				n, cv := $2, fnConfigOf($3)
 				if eqFold(n, "schema") {
-					$$ = alterFnSchema(v)
+					$$ = alterFnSchema(cv.textOrUnset())
 				} else {
-					$$ = alterFnConfig(NewFunctionConfigOp(false, false, n, v), v != fnConfigUnset)
+					$$ = alterFnConfig(cv.op(n), cv != nil)
 				}
 			}
 	| RESET ALL                      { $$ = alterFnConfig(NewFunctionConfigOp(false, true, "", ""), true) }

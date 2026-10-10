@@ -1,5 +1,7 @@
 package parser
 
+import "github.com/goopg/goopg/internal/utils/misc"
+
 // Node is implemented by every AST node. Pos returns the byte offset
 // of the node's first token, used by error messages.
 type Node interface {
@@ -572,6 +574,10 @@ type SetStmt struct {
 	Name    string
 	Value   string // raw textual value; quotes stripped for string literals
 	Default bool   // TO DEFAULT (Value is unused)
+	// Args is the typed value list (gram.y var_list) the executor flattens
+	// with the variable's flags (misc.FlattenSetArgs); nil for the dedicated
+	// forms (TIME ZONE, ROLE, SESSION AUTHORIZATION), which use Value.
+	Args []misc.SetArg
 }
 
 func (s *SetStmt) Pos() int  { return s.pos }
@@ -590,6 +596,10 @@ type AlterSystemStmt struct {
 	Default  bool // SET name TO DEFAULT
 	Reset    bool // RESET name
 	ResetAll bool // RESET ALL
+	// Args is the typed value list, flattened by the executor exactly as
+	// SetStmt.Args (AlterSystemSetConfigFile calls the same
+	// flatten_set_variable_args through ExtractSetVariableArgs).
+	Args []misc.SetArg
 }
 
 func (s *AlterSystemStmt) Pos() int  { return s.pos }
@@ -3823,6 +3833,9 @@ type FunctionConfigOp struct {
 	ResetAll bool   // RESET ALL
 	Name     string // GUC name (empty when ResetAll)
 	Value    string // comma-joined flattened value(s), SET only
+	// Args is the typed SET value list; the executor flattens it with the
+	// variable's flags (ExtractSetVariableArgs) before storing proconfig.
+	Args []misc.SetArg
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`

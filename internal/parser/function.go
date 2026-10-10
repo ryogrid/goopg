@@ -1028,11 +1028,12 @@ func (p *parser) parseFunctionConfigSetClause() (FunctionConfigOp, bool, error) 
 	if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 		return FunctionConfigOp{}, false, nil
 	}
+	args, _, _ := scanSetArgs(p.tokens, p.idx)
 	values, err := p.parseSetValueAtoms()
 	if err != nil {
 		return FunctionConfigOp{}, false, err
 	}
-	return FunctionConfigOp{Name: name, Value: strings.Join(values, ",")}, true, nil
+	return FunctionConfigOp{Name: name, Value: strings.Join(values, ","), Args: args}, true, nil
 }
 
 // parseFunctionConfigResetClause parses `RESET name` / `RESET ALL`, the

@@ -61,6 +61,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -118,6 +119,7 @@ type alterDatabaseConfigOp struct {
 	dbName      string
 	configName  string // empty when resetAll
 	configValue string // meaningful only when !reset && !resetAll && !fromCurrent
+	valueErr    error  // flatten_set_variable_args failure, raised at apply time
 	reset       bool   // RESET <name>
 	resetAll    bool   // RESET ALL
 	fromCurrent bool   // SET <name> FROM CURRENT — configValue resolved at apply time
@@ -181,11 +183,11 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 		if strings.EqualFold(rest, "default") {
 			return alterDatabaseConfigOp{dbName: dbName, configName: configName, reset: true}, true
 		}
-		value, ok := flattenConfigValueList(rest)
+		value, ok, valueErr := flattenConfigValueList(configName, rest)
 		if !ok {
 			return alterDatabaseConfigOp{}, false
 		}
-		return alterDatabaseConfigOp{dbName: dbName, configName: configName, configValue: value}, true
+		return alterDatabaseConfigOp{dbName: dbName, configName: configName, configValue: value, valueErr: valueErr}, true
 	case strings.HasPrefix(lowerRest, "reset "):
 		rest = strings.TrimSpace(rest[len("reset "):])
 		if strings.EqualFold(rest, "all") {
@@ -236,15 +238,39 @@ func splitLeadingSQLToken(s string) (token, rest string, ok bool) {
 	return token, rest, true
 }
 
-// flattenConfigValueList parses the comma-separated `var_value` list after
-// `SET name TO`/`SET name =` and joins it into the raw form PG stores in
-// pg_db_role_setting.setconfig (mirrors guc.c's flatten_set_variable_args:
-// string literals are unescaped and stripped of their quotes, bare tokens
-// are kept verbatim, elements are comma-joined with no extra quoting). The
-// real pg_dump client (not goopg) re-quotes this text into a proper `SET ...
-// TO ...` clause on restore (makeAlterConfigCommand, dumputils.c), so goopg
-// only needs to reproduce the stored value, not the display form.
-func flattenConfigValueList(s string) (string, bool) {
+// flattenConfigValueList flattens the `var_list` after `SET name TO` /
+// `SET name =` into the text PG stores in pg_db_role_setting.setconfig —
+// AlterSetting calls ExtractSetVariableArgs, i.e. flatten_set_variable_args:
+// elements joined with ", ", identifiers downcased, string elements of a
+// GUC_LIST_QUOTE variable identifier-quoted, and more than one element an
+// error for a non-list variable (returned as err, raised at apply time).
+// Text that does not lex as a var_list falls back to the old text-level
+// flattening.
+func flattenConfigValueList(name, s string) (value string, ok bool, err error) {
+	if args, ok := parser.ParseSetArgList(s); ok {
+		v, err := misc.FlattenSetArgs(strings.ToLower(name), args)
+		return v, true, err
+	}
+	v, ok := flattenConfigValueListLegacy(s)
+	return v, ok, nil
+}
+
+// flattenSpecialFormValue flattens the value of one of set_rest's dedicated
+// forms (SET SCHEMA / NAMES / TIME ZONE / ROLE / SESSION AUTHORIZATION) for
+// the variable it maps to. Those forms take a single value, so a flattening
+// error is a non-match.
+func flattenSpecialFormValue(name, s string) (string, bool) {
+	v, ok, err := flattenConfigValueList(name, s)
+	if err != nil {
+		return "", false
+	}
+	return v, ok
+}
+
+// flattenConfigValueListLegacy is the text-level fallback for a value that
+// does not lex as a var_list (e.g. a bare 64MB): string literals unquoted,
+// other elements verbatim, comma-joined.
+func flattenConfigValueListLegacy(s string) (string, bool) {
 	parts, ok := splitTopLevelSQLCommas(s)
 	if !ok || len(parts) == 0 {
 		return "", false
@@ -295,14 +321,14 @@ func parseSetRestSpecialForm(rest string) (configName, configValue string, reset
 		if strings.EqualFold(val, "default") || strings.EqualFold(val, "local") {
 			return "timezone", "", true, true
 		}
-		v, ok := flattenConfigValueList(val)
+		v, ok := flattenSpecialFormValue("timezone", val)
 		if !ok {
 			return "", "", false, false
 		}
 		return "timezone", v, false, true
 	case strings.HasPrefix(lower, "schema "):
 		val := strings.TrimSpace(rest[len("schema "):])
-		v, ok := flattenConfigValueList(val)
+		v, ok := flattenSpecialFormValue("search_path", val)
 		if !ok {
 			return "", "", false, false
 		}
@@ -312,14 +338,14 @@ func parseSetRestSpecialForm(rest string) (configName, configValue string, reset
 		if val == "" || strings.EqualFold(val, "default") {
 			return "client_encoding", "", true, true
 		}
-		v, ok := flattenConfigValueList(val)
+		v, ok := flattenSpecialFormValue("client_encoding", val)
 		if !ok {
 			return "", "", false, false
 		}
 		return "client_encoding", v, false, true
 	case strings.HasPrefix(lower, "role "):
 		val := strings.TrimSpace(rest[len("role "):])
-		v, ok := flattenConfigValueList(val)
+		v, ok := flattenSpecialFormValue("role", val)
 		if !ok {
 			return "", "", false, false
 		}
@@ -329,7 +355,7 @@ func parseSetRestSpecialForm(rest string) (configName, configValue string, reset
 		if strings.EqualFold(val, "default") {
 			return "session_authorization", "", true, true
 		}
-		v, ok := flattenConfigValueList(val)
+		v, ok := flattenSpecialFormValue("session_authorization", val)
 		if !ok {
 			return "", "", false, false
 		}
@@ -2047,6 +2073,9 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 	// with no heap to resync, and pg_dump's dumpDatabaseConfig
 	// cross-references setdatabase against the oid it already read from
 	// pg_database, so the two must agree.
+	if op.valueErr != nil {
+		return true, "", &databaseDDLError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
+	}
 	dbOid := catalog.FirstUserOID
 	switch {
 	case op.resetAll:
