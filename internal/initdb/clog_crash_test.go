@@ -41,6 +41,15 @@ func TestCrashMidTransactionTableNotVisibleAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := newTxnConn(rt1, t)
+	// One committed transaction first, so the WAL holds xact history and the
+	// restart takes the crash-recovery sweep. With NO committed transaction
+	// since initdb the restart takes the old-cluster upgrade branch
+	// (clog.InitializeAsCommitted), which stamps the crashed xid Committed
+	// and resurrects the table — M0146-0152. HEAD passed this test without
+	// the commit only because the second Open registered tables from the
+	// M0114 JSON cache (written before the CREATE), retired by
+	// M0141-S2a-fix2r-c.
+	conn.run("CREATE TABLE committed_first (id int4)")
 	conn.run("BEGIN")
 	conn.run("CREATE TABLE crash_ghost (id int4, val text)")
 

@@ -1489,32 +1489,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// to reloadUserAggregatesFromHeap (after the routines reload below) —
 	// kinds 46-49 retired.
 
-	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
-	// If the JSON snapshot is present and valid, populate the catalog directly
-	// without scanning pg_class/pg_attribute pages. Falls through to the heap
-	// scan on a miss (file absent, version mismatch, or parse error).
-	cacheHit := false
-	if abs != "" {
-		var cerr error
-		if cacheHit, cerr = readCatalogCache(abs, cat.DBOID(), cat); cerr != nil {
-			slog.Warn("catalogCache: read failed, falling back to heap scan", "err", cerr)
-			cacheHit = false
-		}
-	}
-
 	// Load user tables from the pg_class/pg_attribute heap files (M0030-0003).
 	// This is the sole catalog recovery path: DDL writes rows here via
 	// syncTableToCatalogHeap, and WAL replay restores them after a crash.
 	// Safe on old clusters — skips if pg_class relfile is absent.
 	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
-	// Skipped when M0114 catalog cache provided a valid snapshot above.
-	if !cacheHit {
-		if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
-			_ = pool.Close()
-			_ = walWriter.Close()
-			_ = mgr.Close()
-			return nil, fmt.Errorf("goopg: user table heap load: %w", err)
-		}
+	//
+	// M0141-S2a-fix2r-c / M0146-0151: the M0114 JSON fast-start cache that
+	// used to pre-empt this scan is retired. It stored each column's type
+	// as a bare name, so a cache-hit restart registered every table without
+	// its typmods, array flags, identity, tablespace or database: an int4[]
+	// column read back as a scalar, char(n) lost its length, and the
+	// planner sized TPC-DS char(16) at 32 bytes. PG reads user relations
+	// from the catalogs every time (pg_internal.init caches only the nailed
+	// system relations). A cache file an older binary left is removed.
+	if abs != "" {
+		UnlinkCatalogCache(abs, cat.DBOID())
+	}
+	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
 	}
 
 	// M0106-0013: after loading user tables from heap, advance the OID
@@ -1547,15 +1543,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		if err := executor.SeedToastOIDCounter(pool, mainRels); err != nil {
 			slog.Warn("TOAST OID counter reseed failed", "err", err)
-		}
-	}
-
-	// M0114: write the catalog cache after a successful heap scan so the
-	// next startup can skip pg_class/pg_attribute scanning entirely.
-	// Non-fatal: a write failure just means a cold-start next time.
-	if abs != "" && !cacheHit {
-		if werr := writeCatalogCache(abs, cat.DBOID(), cat); werr != nil {
-			slog.Warn("catalogCache: write failed", "err", werr)
 		}
 	}
 
