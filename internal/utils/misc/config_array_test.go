@@ -57,3 +57,29 @@ func TestConfigArrayItem(t *testing.T) {
 		}
 	}
 }
+
+// TestPGGUCTable pins pg_gucs_gen.go to the oracle build's parameter set:
+// pg_settings' 401 rows plus the six GUC_NO_SHOW_ALL parameters, including
+// the DEBUG_NODE_TESTS_ENABLED ones the assert-enabled oracle compiles in and
+// excluding parameters that exist only in other debug builds. Entries whose
+// context sits on the line after the name were once missed by the
+// extraction (io_workers, max_worker_processes).
+func TestPGGUCTable(t *testing.T) {
+	if len(pgGUCs) != 407 {
+		t.Errorf("pgGUCs has %d entries, want 407", len(pgGUCs))
+	}
+	for _, n := range []string{"io_workers", "max_worker_processes", "role", "seed",
+		"session_authorization", "debug_copy_parse_plan_trees", "datestyle"} {
+		if _, ok := pgGUCs[n]; !ok {
+			t.Errorf("pgGUCs lacks %q", n)
+		}
+	}
+	for _, n := range []string{"trace_locks", "wal_debug", "debug_deadlocks", "max_predicate_locks_per_page"} {
+		if _, ok := pgGUCs[n]; ok {
+			t.Errorf("pgGUCs has %q, which the oracle build does not know", n)
+		}
+	}
+	if g := pgGUCs["io_workers"]; g.Context != ContextSigHup {
+		t.Errorf("io_workers context = %v, want sighup", g.Context)
+	}
+}
