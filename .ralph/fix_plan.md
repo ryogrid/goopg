@@ -29159,7 +29159,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       `TestAggInputPGWidthReadsStawidth`\.
     - Design `docs/design/0100\-0149/m0141\-s2a\-fix2r\-a\-hashagg\-input\-width\.md`\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF1 aggregation\-strategy 10→8, parallelism 35→33
-- [ ] **M0141\-S2a\-fix2r\-b — ANALYZE\'s stawidth for bpchar omits the blank
+- [x] **M0141\-S2a\-fix2r\-b — ANALYZE\'s stawidth for bpchar omits the blank
   padding** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-a\)\. PG\'s
   `compute\_scalar\_stats` / `compute\_distinct\_stats` average
   `VARSIZE\_ANY` of the stored, blank\-padded value: TPC\-DS `customer`
@@ -29174,6 +29174,22 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     ColumnStats\.AvgWidth producer\) and compare with analyze\.c\'s
     `total\_width \+= VARSIZE\_ANY\(DatumGetPointer\(value\)\)` on a char\(20\) column
     holding \'ab\'; check the fire set for width\-driven plan moves\.
+  - **DONE 2026\-10\-10 \(`93df279ce`\)\.** Premise half refuted: goopg pads
+    char\(n\) on INSERT and COPY \(SF0\.25 `c\_first\_name` avg\_width 20\); the SF1
+    cluster\'s `customer` rows are stored UNPADDED \(`pg\_column\_size` 6,
+    `octet\_length` 20\) — an old\-load artifact for the pending SF1 reload\.
+    The real ANALYZE gap: PG adds `VARSIZE\_ANY` \(header included\) and
+    truncates to int32 stawidth; goopg counted the body and kept a float\.
+    `analyzeVarsizeAny` adds the 1/4\-byte header; AvgWidth is truncated\.
+    - SF0\.25 re\-ANALYZE A/B \(`tmp/m152/ab\.sh`, both binaries, seed pinned\):
+      plans byte\-identical, match 56 both arms — plan widths read type
+      widths, not stawidth\.
+    - Gates: units, spotcheck, acceptance arm, TPC\-H plans identical, fire
+      set none, sf025 PASS=99, ea\-ratchet \(1\), regress A/B \(join flap\),
+      isolation family \(only the two nightly\-filed specs fail\)\.
+    - Tests `TestAnalyzeVarsizeAny`, `TestAnalyzePopulatesAvgWidth` case\.
+    - Design `docs/design/0100\-0149/m0141\-s2a\-fix2r\-b\-analyze\-stawidth\-varsize\.md`\.
+  Movement: none — SF0\.25 re\-ANALYZE A/B plans byte\-identical; fire set none
 - [ ] **M0141\-S2a\-fix2r\-c — plan\-schema types carry no typmod, so
   `get\_typavgwidth`\'s fallback prices char\(n\) / varchar\(n\) / numeric\(p,s\) at
   32 bytes** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-a\)\. `typeWidth`
