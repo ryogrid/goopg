@@ -487,6 +487,32 @@ func TestDatumVariablePayloadWidth(t *testing.T) {
 // width-0 NUMERIC column was M0138-0005's finding (HammerDB declares every
 // TPC-H key column NUMERIC, so this hits 28/61 TPC-H and 17/120 TPC-DS
 // columns corpus-wide).
+// TestAnalyzeVarsizeAny pins M0141-S2a-fix2r-b: ANALYZE's per-value width is
+// PG's VARSIZE_ANY, header included. Oracle (PG 18.3, :65438 tpcds):
+// customer.c_customer_id char(16) avg_width 17, c_first_name char(20) 21.
+func TestAnalyzeVarsizeAny(t *testing.T) {
+	tests := []struct {
+		name string
+		d    Datum
+		want int
+	}{
+		{"char(16) full", NewStringDatum("AAAAAAAABAAAAAAA"), 17},
+		{"char(20) padded", NewStringDatum("Javier              "), 21},
+		{"empty string", NewStringDatum(""), 1},
+		{"126-byte body, short header", NewStringDatum(strings.Repeat("x", 126)), 127},
+		{"127-byte body, 4-byte header", NewStringDatum(strings.Repeat("x", 127)), 131},
+		{"bytea", NewBytesDatum([]byte{1, 2, 3}), 4},
+		// numeric already measures its whole on-disk varlena.
+		{"numeric fast", NewNumericInt64Datum(12345, 0), 7},
+		{"null", NullDatum, 0},
+	}
+	for _, tc := range tests {
+		if got := analyzeVarsizeAny(tc.d); got != tc.want {
+			t.Errorf("analyzeVarsizeAny(%s) = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestNumericFastPathOnDiskWidth(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -548,6 +574,14 @@ func TestAnalyzePopulatesAvgWidth(t *testing.T) {
 	// 20 values: 10, 20, …, 200 bytes; avg = (10+200)*20/2/20 = 105.
 	if stats1.AvgWidth < 90 || stats1.AvgWidth > 120 {
 		t.Errorf("col 1 (text 10–200B): AvgWidth=%v, want ~105", stats1.AvgWidth)
+	}
+
+	// M0141-S2a-fix2r-b: VARSIZE_ANY with its 1-byte short header, and the
+	// int32 truncation of stawidth — 'ab' (3) twice and 'abcd' (5) once
+	// average 3.67, stored as 3.
+	mixed := []Row{{NewStringDatum("ab")}, {NewStringDatum("ab")}, {NewStringDatum("abcd")}}
+	if got := computeColumnStats(mixed, 0, 100, 3, textType, nil).AvgWidth; got != 3 {
+		t.Errorf("text 'ab','ab','abcd': AvgWidth=%v, want 3 (VARSIZE_ANY 3,3,5 truncated)", got)
 	}
 
 	// A sample with only nulls, fixed-width type: PG still reports typlen.

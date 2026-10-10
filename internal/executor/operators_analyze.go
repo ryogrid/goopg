@@ -1221,6 +1221,26 @@ func datumVariablePayloadWidth(d Datum) int {
 	}
 }
 
+// analyzeVarsizeAny is the per-value width compute_scalar_stats adds to
+// total_width: `VARSIZE_ANY(DatumGetPointer(value))` (analyze.c:2008, 2124,
+// 2471), the stored varlena INCLUDING its header (M0141-S2a-fix2r-b). A
+// string or bytea body of at most VARATT_SHORT_MAX - 1 bytes is stored behind
+// a 1-byte short header (heaptuple.c's VARATT_CAN_MAKE_SHORT path), a longer
+// one behind the 4-byte header, so TPC-DS `c_customer_id char(16)` measures
+// 17 as on PG, not 16. datumVariablePayloadWidth's numeric arm already
+// includes the header.
+func analyzeVarsizeAny(d Datum) int {
+	w := datumVariablePayloadWidth(d)
+	switch d.Kind {
+	case KindString, KindBytes:
+		if w <= pgVarlenaShortMaxBody {
+			return w + 1
+		}
+		return w + 4
+	}
+	return w
+}
+
 // pgVarlenaShortMaxBody is PG's VARATT_SHORT_MAX (postgres/src/include/varatt.h:257)
 // minus VARHDRSZ_SHORT (:255) — the largest varlena BODY (header excluded) that
 // still fits a 1-byte "short" varlena header. numeric_size-equivalent width
@@ -1335,7 +1355,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 			continue
 		}
 		nonNull++
-		totalPayloadWidth += int64(datumVariablePayloadWidth(d))
+		totalPayloadWidth += int64(analyzeVarsizeAny(d))
 		kd := d
 		if bpcharCatalogType(colType) {
 			// n_distinct/MCV bucketing on bpchar runs over the bcTruelen
@@ -1363,8 +1383,10 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// typlen-derived AvgWidth above and PG never overwrites it with a
 	// measured value (analyze.c's is_varwidth branch guards the
 	// total_width/nonnull_cnt division the same way).
+	// stawidth is an int32 (pg_statistic): PG assigns the double quotient
+	// to it, truncating (analyze.c:2584).
 	if !fixedWidth && nonNull > 0 {
-		stats.AvgWidth = float64(totalPayloadWidth) / float64(nonNull)
+		stats.AvgWidth = math.Trunc(float64(totalPayloadWidth) / float64(nonNull))
 	}
 
 	// Number of sampled values seen more than once — upstream's `nmultiple`
