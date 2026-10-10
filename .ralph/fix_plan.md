@@ -2987,7 +2987,7 @@ heuristic stays live.)
     \(`analysis/m0145/m0145\-0008s/regress\-suite\-result.txt`\).
 
 ### Nightly run 20260927-002707 (sha `104c2c90ba04`, 3 items) — filed 2026-09-27
-- [ ] **testport isolation SSI divergences at HEAD** \(AI\-20260927\-002707\-002
+- [x] **testport isolation SSI divergences at HEAD** \(AI\-20260927\-002707\-002
   / \-003; repro at HEAD `3f3877a88`: `go test \-v \-run
   '^TestPort_IsolationReadWriteUnique4$|^TestPort_IsolationTemporalRangeIntegrity$'
   \./internal/testport/` — both FAIL on a capped private run\).
@@ -3008,6 +3008,11 @@ heuristic stays live.)
     divergence classes are \(a\) unique violation raised before the SSI
     rw\-dependency check and \(b\) a committed read that should have
     tripped a dangerous\-structure abort\.
+  - **DONE 2026\-10\-10 \(fixed by `0cc3055db`; duplicate of the two
+    testport tasks closed there\)\.** Both divergence classes had one cause:
+    the reads plan as a Bitmap Heap Scan, which took no SSI predicate lock
+    and made no conflict\-out check\. Both specs PASS at HEAD `59a8d7f04`\.
+  Movement: none — correctness fix; no plan instrument
 
 ### Nightly run 20260928-004845 (sha `2ddc97fddc1f`, 4 items) — filed 2026-09-28
 - [ ] **testport/TestPort_RegressSuite/limit re-fails** \(AI\-20260928\-004845\-004;
