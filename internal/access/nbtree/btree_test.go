@@ -255,12 +255,20 @@ func TestConcurrentInsertSearch(t *testing.T) {
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	// The writer starts only once every reader is running, and each reader
+	// searches before it first checks stop: on a loaded host the writer
+	// could otherwise finish all its inserts before any reader was
+	// scheduled, leaving zero concurrent searches (nightly 2026-10-02).
+	const readers = 6
+	var readersUp sync.WaitGroup
+	readersUp.Add(readers)
 
 	// Writer: insert the second half, one key at a time.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(stop)
+		readersUp.Wait()
 		for i := total / 2; i < total; i++ {
 			ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
 			if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
@@ -275,17 +283,19 @@ func TestConcurrentInsertSearch(t *testing.T) {
 	// under exclusive content latches and Search descends under
 	// shared latches with right-link recovery, so a torn read or a
 	// split-induced miss would surface here.
-	const readers = 6
 	var hits atomic.Uint64
 	for r := 0; r < readers; r++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
+			readersUp.Done()
+			for first := true; ; first = false {
+				if !first {
+					select {
+					case <-stop:
+						return
+					default:
+					}
 				}
 				key := int32(uint64(hits.Load()) % (total / 2))
 				ptr, ok, err := bt.Search(EncodeInt4(key))
