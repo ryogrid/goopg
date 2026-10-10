@@ -4091,6 +4091,42 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
+// Template1NamespaceDBOid is template1's catalog-namespace AND storage oid
+// (base/2) — deliberately NOT its displayed pg_database.oid (1, rendered by
+// databaseDisplayOID). template1's real PostgreSQL oid 1 is also goopg's
+// DefaultDBOid sentinel, the namespace the postgres database reads and writes,
+// so a template1 connection used to share postgres' tables (a table created in
+// template1 was visible from postgres and vice versa, and pg_dumpall emitted
+// it under both). Owner decision 2026-09-25 (Option A): route template1 around
+// the sentinel to its own namespace; removing the sentinel (postgres at
+// namespace 5, one oid per database at every layer) is the real fix and stays
+// with M0122-0007 slices 4b-4e. 2 lies between the bootstrap oids (1, 4, 5)
+// and FirstUserOID, so no CREATE DATABASE can allocate it.
+// Design: docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md.
+const Template1NamespaceDBOid uint32 = 2
+
+// PgDatabaseRowOid maps a database's namespace/storage oid — what
+// ResolveDatabaseOid returns — to the oid of its pg_database row, which is
+// what every global/1262 heap read and write keys on. They differ only for
+// template1 (namespace Template1NamespaceDBOid, row 1).
+func PgDatabaseRowOid(nsOid uint32) uint32 {
+	if nsOid == Template1NamespaceDBOid {
+		return 1
+	}
+	return nsOid
+}
+
+// NamespaceOidForPgDatabaseRow is PgDatabaseRowOid's inverse, for startup
+// reloads that read a pg_database row and key in-memory state (datacl) by the
+// namespace oid every runtime reader resolves. Row oid 1 is template1's
+// (postgres' row is c.DBOID(), 5).
+func NamespaceOidForPgDatabaseRow(rowOid uint32) uint32 {
+	if rowOid == 1 {
+		return Template1NamespaceDBOid
+	}
+	return rowOid
+}
+
 // emptyTableNamespace is the shared, never-mutated fallback ns() returns for
 // a dbOid with no namespace yet. A package-level singleton is safe here only
 // because ns() is read-only (see its own comment) — nothing ever writes
@@ -4207,7 +4243,7 @@ func NewInMemory() *InMemory {
 		databaseConnLimit:      make(map[string]int32),
 		databaseEncoding:       make(map[string]int32),
 		databaseOwner:          make(map[string]uint32),
-		databaseOid:            make(map[string]uint32),
+		databaseOid:            map[string]uint32{"template1": Template1NamespaceDBOid},
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -5815,7 +5851,7 @@ func (c *InMemory) ResolveDatabaseOid(name string) (oid uint32, ok bool) {
 	case "postgres":
 		return c.DBOID(), true
 	case "template1":
-		return 1, true
+		return Template1NamespaceDBOid, true
 	case "template0":
 		return 4, true
 	}

@@ -1585,6 +1585,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// are skipped, as is the shared DefaultDBOid namespace and the detected
 	// mirror DBOID (both already loaded above). Runs regardless of the M0114
 	// catalog-cache fast path — the cache only snapshots cat.DBOID()'s tables.
+	// template1 owns its own catalog namespace and storage directory
+	// (catalog.Template1NamespaceDBOid, base/2) instead of sharing postgres'
+	// DefaultDBOid one (0119-0006bv, Option A). A cluster initialised before
+	// that has no base/2: lay down the same template0 catalog image a CREATE
+	// DATABASE gets. Idempotent — existing files are never overwritten.
+	if abs != "" {
+		if err := CreatePerDatabaseScaffolding(abs, catalog.Template1NamespaceDBOid); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: template1 scaffolding: %w", err)
+		}
+	}
 	for _, dbName := range cat.ListDatabases() {
 		dbOid := cat.DatabaseOid(dbName)
 		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||

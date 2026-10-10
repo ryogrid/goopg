@@ -1558,6 +1558,9 @@ func reloadDatabaseACLsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 		if !r.set {
 			continue
 		}
+		// The ACL store is keyed by the namespace oid every runtime reader
+		// resolves; the heap row by the pg_database oid (template1: 2 vs 1).
+		r.oid = catalog.NamespaceOidForPgDatabaseRow(r.oid)
 		entries, derr := executor.DecodeACLItemArray(r.acl, cat.RoleNameForOID)
 		if derr != nil {
 			return fmt.Errorf("pg_database datacl for oid %d: %w", r.oid, derr)

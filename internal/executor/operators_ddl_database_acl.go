@@ -173,7 +173,10 @@ func (o *ddlOp) resyncDatabaseACLHeapRow(im *catalog.InMemory, dbOid uint32) err
 	}
 	rel := catalog.SharedCatalogRelFileNode(catalog.PgDatabaseRelationOID)
 	cols := catalog.PgDatabaseColumnsPG18()
-	row, found, err := readLiveDatabaseRow(ctx, rel, cols, dbOid)
+	// The heap row is keyed by the pg_database row oid; the in-memory ACL by
+	// the namespace oid (they differ for template1, catalog.PgDatabaseRowOid).
+	rowOid := catalog.PgDatabaseRowOid(dbOid)
+	row, found, err := readLiveDatabaseRow(ctx, rel, cols, rowOid)
 	if err != nil || !found {
 		return err
 	}
@@ -202,7 +205,7 @@ func (o *ddlOp) resyncDatabaseACLHeapRow(im *catalog.InMemory, dbOid uint32) err
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return err
 	}
-	deleteDatabaseFromCatalogHeap(ctx, dbOid, ctx.Tx.XID)
+	deleteDatabaseFromCatalogHeap(ctx, rowOid, ctx.Tx.XID)
 	if _, err := writeHeapRowCanonical(ctx, rel, cols, row); err != nil {
 		return err
 	}

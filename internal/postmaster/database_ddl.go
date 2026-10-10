@@ -1702,7 +1702,9 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				}
 			}
 		}
-		if err := s.syncPgDatabaseHeapRow(oid, name, owner, cloneTemplateOid, dbEncodingID); err != nil && s.cfg.Logger != nil {
+		// The template's pg_database ROW oid, not its namespace oid: they
+		// differ for template1 (catalog.PgDatabaseRowOid).
+		if err := s.syncPgDatabaseHeapRow(oid, name, owner, catalog.PgDatabaseRowOid(cloneTemplateOid), dbEncodingID); err != nil && s.cfg.Logger != nil {
 			s.cfg.Logger.Warn("pg_database heap row sync failed", "database", name, "err", err)
 		}
 		// The RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record + the template0 catalog

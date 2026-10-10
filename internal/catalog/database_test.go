@@ -179,8 +179,8 @@ func TestResolveDatabaseOid(t *testing.T) {
 	if oid, ok := c.ResolveDatabaseOid("postgres"); !ok || oid != 5 {
 		t.Errorf("ResolveDatabaseOid(postgres) = (%d, %v), want (5, true)", oid, ok)
 	}
-	if oid, ok := c.ResolveDatabaseOid("template1"); !ok || oid != 1 {
-		t.Errorf("ResolveDatabaseOid(template1) = (%d, %v), want (1, true)", oid, ok)
+	if oid, ok := c.ResolveDatabaseOid("template1"); !ok || oid != Template1NamespaceDBOid {
+		t.Errorf("ResolveDatabaseOid(template1) = (%d, %v), want (%d, true) — its own namespace, not the DefaultDBOid sentinel", oid, ok, Template1NamespaceDBOid)
 	}
 	if oid, ok := c.ResolveDatabaseOid("template0"); !ok || oid != 4 {
 		t.Errorf("ResolveDatabaseOid(template0) = (%d, %v), want (4, true)", oid, ok)

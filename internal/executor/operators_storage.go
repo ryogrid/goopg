@@ -4852,7 +4852,7 @@ func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
 			// pg_database heap row (global/1262) so it survives restart.
 			// Best-effort — the in-memory registry is goopg's truth.
 			if dbOid, ok := im.ResolveDatabaseOid(datname); ok && dbOid != 0 {
-				_ = PersistDatConnLimit(o.ctx, dbOid, int32(newVal.Int))
+				_ = PersistDatConnLimit(o.ctx, catalog.PgDatabaseRowOid(dbOid), int32(newVal.Int))
 			}
 			row[connLimitOrd] = newVal
 		}
