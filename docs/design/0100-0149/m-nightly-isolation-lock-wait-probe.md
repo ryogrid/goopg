@@ -94,6 +94,21 @@ the step is still reported waiting, just later.
 - **Targeted reruns.** TuplelockUpgradeNoDeadlock passes 2/2 with the
   probe.
 
+## Follow-up evidence (2026-10-10, TestPort_IsolationEvalPlanQual)
+
+EvalPlanQual failed in five nightlies between 2026-09-28 and 2026-10-09.
+Every failure first diverged at a `COMMIT` step printed `<waiting ...>`. A
+COMMIT slows down on a loaded host (WAL flush) but never takes a lock wait.
+
+- **Load A/B.** Under synthetic load (`tmp/m155/load.sh`: 12 CPU burners
+  plus a looping fsynced 2 GB writer), runs alternated between the two
+  runners:
+  - the pre-probe runner (`2544b2c57~1`) failed 2 of 3, both times with that
+    signature;
+  - the probe runner passed 3/3.
+- **Same signature elsewhere.** `TestPort_IsolationAlterTable1` failed the
+  same way (`step sc1: COMMIT; <waiting ...>`).
+
 ## Not covered (ledgered)
 
 - **Waits that report no wait event.** These pay the 1.5 s cap per step

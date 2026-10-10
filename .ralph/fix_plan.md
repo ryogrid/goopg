@@ -2830,7 +2830,7 @@ heuristic stays live.)
       `internal/utils/misc/postgresql.conf.sample`". That sentence is now
       stale, and the loop may not edit that section.
   Movement: none
-- [ ] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
+- [x] **testport/TestPort_IsolationEvalPlanQual** — testport TestPort\_IsolationEvalPlanQual FAILed \(reopened: the 2026\-09\-22 task was closed stale\)
   (AI-20260925-002342-002; repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
   Kind: impl
@@ -2838,6 +2838,17 @@ heuristic stays live.)
   - Recurred in the 2026\-09\-27 nightly \(`AI-20260927-002707-001`\) and
     again in the 2026\-09\-28 nightly \(`AI-20260928-004845-001`\).
   - Recurred again in the 2026\-10\-06 nightly \(`AI-20261006-005659-001`\).
+  - **DONE 2026\-10\-10 \(fixed by `2544b2c57`, evidence this loop\)\.** All
+    five failing nightlies since 09\-28 \(09\-28, 09\-29, 10\-06, 10\-08, 10\-09\)
+    first diverge at a `COMMIT` step printed `<waiting ...>`: a COMMIT slowed
+    past the runner\'s old 300 ms timer, never a lock wait\. The lock\-wait
+    probe waits for such a step instead\.
+    - Under synthetic load \(12 CPU burners \+ a synced 2 GB writer,
+      `tmp/m155/load\.sh`\), interleaved: old runner \(`2544b2c57\~1`\) 1/3
+      PASS — both failures with the same `COMMIT; <waiting ...>` line —
+      vs probe runner 3/3 PASS\. Quiet host: 3/3 PASS\.
+    - Same signature on TestPort\_IsolationAlterTable1 \(below\)\.
+  Movement: none — test\-runner fidelity; no plan instrument
 - [ ] **testport/TestPort_IsolationReadWriteUnique4** — testport TestPort\_IsolationReadWriteUnique4 FAILed
   (AI-20260925-002342-003; repro: `go test -v -run '^TestPort_IsolationReadWriteUnique4$' ./internal/testport/`,
   evidence `ci/logs/20260925-002342/testport/go-test.log`).
@@ -2876,6 +2887,10 @@ heuristic stays live.)
     most likely a load\-induced timing flake, not an engine defect\.
     - Next: re\-run the repro on a quiet host. If it passes, close as stale.
       If not, check whether a NOT VALID foreign\-key COMMIT really blocks.
+    - 2026\-10\-10: same `COMMIT; <waiting ...>` signature that the
+      EvalPlanQual task proved, under load, is the old runner\'s 300 ms timer;
+      `2544b2c57` \(lock\-wait probe\) should resolve it — verify under the same
+      load A/B before closing\.
 - [ ] **tpcds/stage\-startup\-20261007** — recurrence of the closed `tpcds/stage` task: nightly TPC\-DS stage failed at
   startup: server not ready in 120 s
   (AI-20261007-014030-004; repro: `bash ci/batch/stages/stage-tpcds.sh`,
