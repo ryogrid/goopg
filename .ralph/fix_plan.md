@@ -4819,7 +4819,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     Kind: impl
     Parent: M0122-0015
     Movement: none — grammar / client-tool parity; no TPC query spells OPERATOR\(...\) ANY
-    - **DONE 2026\-10\-12\.** `subq_op` gained `\| qual\_op` \(gram\.y:16674\);
+    - **DONE 2026\-10\-12 \(`674977354`\)\.** `subq_op` gained `\| qual\_op` \(gram\.y:16674\);
       pg\_dump `\-t` / `\-T` / `\-\-filter` work\. No new conflicts; goldens \+6\.
     - Ported `005\_pg\_dump\_filterfile\.pl` as `TestPort\_PgDump005Filterfile`
       \(69 of 92 assertions; inventory row `defer` → `port`\)\. The 23 left out
