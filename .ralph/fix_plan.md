@@ -2890,6 +2890,21 @@ heuristic stays live.)
     ReadWriteUnique4 above \(SERIALIZABLE bitmap scans held no SIREAD\); PASSes
     standalone and in the isolation family with that fix\.
   Movement: none — correctness fix; no plan instrument
+- [ ] **testport/TestE2E_PGStandbyFullCycle** — testport TestE2E\_PGStandbyFullCycle FAILed
+  (AI-20261012-033252-001; repro: `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`,
+  evidence `ci/logs/20261012-033252/testport/go-test.log`).
+  Kind: impl
+  Parent: none
+  - Reproduced 2026\-10\-12 on a clean HEAD \(`9b1d866dc`\) worktree, so
+    not caused by uncommitted WIP: the goopg reverse standby exits at start
+    with `postgresql\.auto\.conf:4: unknown parameter "log\_min\_messages"`
+    and `:5: unknown parameter "log\_error\_verbosity"`\. PASSed in the
+    2026\-10\-10 nightly \(`7633ac7`\); goopg began reading the auto file
+    with ALTER SYSTEM \(`27a3009c5`\), and the PG primary\'s auto file names
+    two parameters goopg does not register\.
+  - First step: register `log\_min\_messages` / `log\_error\_verbosity`
+    \(guc\_tables\.c enums\), or check whether PG\'s own start would warn
+    rather than fail on an unknown auto\.conf entry\.
 - [x] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
   (AI-20261007-014030-001; repro: `go test -v -run '^TestPort_IsolationAlterTable1$' ./internal/testport/`,
   evidence `ci/logs/20261007-014030/testport/go-test.log`).
@@ -4058,9 +4073,40 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Design `docs/design/0100\-0149/0119\-0006bv\-template1\-namespace\-collision\.md` §8\.
   Movement: none — catalog routing correctness; no plan instrument
 
-- [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
+- [!] **M0122-0008 — Auth / roles / multi-DB isolation / encoding**.
   Kind: impl
   Parent: none
+  - **ESCALATION 2026\-10\-12 \(lineage budget, Rule A\)\.** The last five
+    completed descendants \(ALTER SYSTEM, SET value lists, SET LOCAL outside
+    a block, proconfig/setconfig names, SET TIME ZONE INTERVAL\) all carry
+    `Movement: none`, so the lineage guard refuses new children and the
+    root is parked `[!]` until the owner re\-opens it
+    \(`LINEAGE\-BASELINE: M0122\-0008 ...` in the banner\)\.
+    - What was attempted: GUC front\-end conformance — each step closed a
+      wrong\-value or wrong\-error divergence measured against PG 18\.3
+      probes and regress diffs\.
+    - What each step proved: the family is correctness work with no TPC
+      instrument by nature \(no TPC\-H/DS query sets a GUC\); `Movement:
+      none` is structural, not a sign of stalled progress\.
+    - Remaining blocker: the lineage rule itself, which this family can
+      never satisfy\. Owner call: re\-baseline, or close the family\.
+    - Expected movement if unblocked: none on match / CATEGORIES /
+      ea\-ratchet; gains show in regress diffs \(horology, guc\) and probes\.
+    - Remaining size — open children already filed: GUC range\-error
+      wording, GUC registry divergence from PG 18\.3, SHOW column case,
+      COPY in non\-default databases \(M0122\-0015a\), and others below\.
+      **Not filed** \(guard\-refused; recorded in the 2026\-10\-12 ledger
+      row\):
+      - to\_char\(timestamptz\) formats in UTC regardless of TimeZone
+        \(`evalToChar`; formatting\.c converts with the session zone\)\.
+      - SET of a SIGHUP / POSTMASTER parameter raises 22023 instead of
+        55P02 \(three `cannot be changed now` sites in guc\.go /
+        session\.go\)\.
+      - initdb writes no host time zone \(select\_default\_timezone\);
+        the TimeZone boot value is UTC where PG\'s is GMT\.
+    - The S2 wrong\-results defect this probe also found \(function SET
+      clauses never applied\) is filed as M0146\-0155 with `Parent: none`
+      for owner placement\.
   - 2026\-09\-24 \(ralph2 loop \#48\): **the `ssl\*` GUC family, as the
     oracle's no\-SSL build defines it** \(`0853825e4`\).
     Movement: none — GUC registry conformance; no planner path touched.
@@ -4296,14 +4342,29 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     misspelled names; check each renamed/re\-contexted variable\'s consumer
     \(declared\-but\-unconsumed risk\)\.
 
-- [ ] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
+- [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives
   `INTERVAL \'\+02:00\' HOUR TO MINUTE`; PG gives `<\+02>\-02`
   \(flatten\_set\_variable\_args coerces the ConstInterval, then
   check\_timezone turns the interval into a POSIX zone\)\.
   Kind: bug
   Parent: M0122-0008
-
+  - **DONE 2026\-10\-12 \(`23ad4d613`\)\.** Grammar arms flatten the interval through
+    interval\_in/out \(LOCAL is a reset; a bad qualifier is 42601\);
+    check\_timezone / check\_log\_timezone ported \(INTERVAL, hours east,
+    tz file, tzparse POSIX spec, pg\_tzset\_offset names\); POSIX zones
+    render through a synthesised TZif footer\. Both wire fast paths and
+    ALTER DATABASE / ROLE SET TIME ZONE go through the grammar; DETAIL and
+    non\-22023 SQLSTATEs reach every SET error path\.
+    - Probes `tmp/tz\.sql`, `tmp/tz2\.sql` byte\-identical to PG 18\.3
+      apart from the residuals filed below; horology regress diff
+      4258 → 4247 lines \(`SET TIME ZONE \'\-1\.5\'` now matches\), the
+      other 12 time/GUC cases unchanged\.
+    - Tests `TestSetTimeZoneIntervalFlattened`, `TestCheckTimeZone`,
+      `TestZoneLocationPOSIX`, `TestParsePOSIXTZ`,
+      `TestSetRestTimeZoneFlattened` \(\+3 more\)\.
+    - Design `docs/design/0100\-0149/0122\-0008\-check\-timezone\.md`\.
+  Movement: none — GUC correctness; no TPC query sets TimeZone
 
 - [ ] **GUC range errors use goopg's own wording** \(measured 2026\-09\-24\):
   `SET geqo\_effort = 11` reports `value 11 out of range [1, 10]`; PG
@@ -29520,6 +29581,23 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: persist the in\-memory counter at clean shutdown \(or keep
     the sequence relation page current\) and restore the snapshot only on
     crash recovery\.
+- [ ] **M0146\-0155 — WRONG RESULTS: a function\'s SET clauses are never
+  applied when it runs** \(filed 2026\-10\-12 by M0122\-0008; S2\)\.
+  `create function sp\(\) returns text language sql set search\_path = s1
+  as \$\$ select v from t \$\$` reads `public\.t` on goopg and `s1\.t` on
+  PG 18\.3; plpgsql is the same, and `SET timezone` / `SET work\_mem` on a
+  function are equally ignored\. pg\_proc\.proconfig is stored correctly;
+  nothing applies it at call time \(PG: fmgr\_security\_definer pushes a GUC
+  nest level, ProcessGUCArray, AtEOXact\_GUC on exit\)\. A security
+  definer function relying on `SET search\_path` is unsafe on goopg\.
+  Kind: impl
+  Parent: none
+  - Found by the M0122\-0008 SET TIME ZONE probe\. Filed without a
+    parent because M0122\-0008\'s lineage budget is exhausted \(see its
+    escalation block\); as an S2 defect it awaits owner placement\.
+  - First step: find the SQL and plpgsql call sites in the executor, push
+    a GUC nest level there, apply proconfig through the session registry,
+    pop on return and on error\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
