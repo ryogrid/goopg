@@ -3536,9 +3536,15 @@ within_group_clause:
 			}
 
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
-   before ANY/SOME/ALL. Char literals + named terminals. */
+   before ANY/SOME/ALL. Char literals + named terminals, plus subquery_Op's
+   `OPERATOR '(' any_operator ')'` arm (gram.y:16674) through qual_op —
+   pg_dump's -t / -T / --filter emit `relkind OPERATOR(pg_catalog.=) ANY
+   (array[...])`, which failed with a syntax error at ANY (M0122-0015b).
+   yyVAL starts as qual_op's symbol, so $<p> is the OPERATOR keyword's
+   offset, where upstream anchors the A_Expr. */
 subq_op:
 		Op        { $$ = $1 }
+	| qual_op       { $$ = qualOpName($1) }
 	| '='           { $$ = "=" }
 	| '<'           { $$ = "<" }
 	| '>'           { $$ = ">" }

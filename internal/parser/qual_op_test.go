@@ -107,3 +107,35 @@ func TestCollateAnyNameParity(t *testing.T) {
 		assertParity(t, q)
 	}
 }
+
+// TestQualifiedOperatorBeforeAnyAll — subquery_Op's `OPERATOR '('
+// any_operator ')'` arm (gram.y:16674) in front of ANY / SOME / ALL. pg_dump
+// emits `c.relkind OPERATOR(pg_catalog.=) ANY (array[...])` for every
+// pattern-based selection (-t, -T, --filter), so all three died with
+// `syntax error at or near "ANY"` while the bare `= ANY` spelling parsed
+// (M0122-0015b). The qualified spelling must fold to the bare one, as the
+// binary form above does.
+func TestQualifiedOperatorBeforeAnyAll(t *testing.T) {
+	for _, q := range []string{
+		"SELECT 1 WHERE 'r' OPERATOR(pg_catalog.=) ANY (array['r', 'v'])",
+		"SELECT 1 WHERE 1 OPERATOR(pg_catalog.<) ALL (array[2, 3])",
+		"SELECT 1 WHERE 1 OPERATOR(pg_catalog.=) SOME (SELECT 1)",
+		"SELECT 1 WHERE 1 OPERATOR(=) ANY (SELECT 1)",
+		"SELECT 1 WHERE 1 OPERATOR(pg_catalog.<>) ALL (SELECT 2)",
+		// the shape pg_dump sends for -t / -T / --filter
+		"SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relkind OPERATOR(pg_catalog.=) ANY (array['r', 'S', 'v', 'm', 'f', 'p'])",
+	} {
+		assertParity(t, q)
+	}
+	for _, pair := range [][2]string{
+		{"SELECT 1 WHERE 'r' OPERATOR(pg_catalog.=) ANY (array['r', 'v'])", "SELECT 1 WHERE 'r' = ANY (array['r', 'v'])"},
+		{"SELECT 1 WHERE 1 OPERATOR(pg_catalog.<) ALL (array[2, 3])", "SELECT 1 WHERE 1 < ALL (array[2, 3])"},
+		{"SELECT 1 WHERE 1 OPERATOR(pg_catalog.=) SOME (SELECT 1)", "SELECT 1 WHERE 1 = SOME (SELECT 1)"},
+	} {
+		qualified, bare := yaccDump(pair[0]), yaccDump(pair[1])
+		if qualified != bare {
+			t.Errorf("qualified spelling does not fold to the bare one\n %q => %s\n %q => %s",
+				pair[0], truncForLog(qualified), pair[1], truncForLog(bare))
+		}
+	}
+}
