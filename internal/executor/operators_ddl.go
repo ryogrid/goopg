@@ -108,6 +108,53 @@ func ctxPlanCatalog(ctx *Context) catalog.Catalog {
 	return ctx.Catalog
 }
 
+// checkCreationNamespace is RangeVarGetCreationNamespace /
+// QualifiedNameGetCreationNamespace (namespace.c) for the statements that
+// create a schema-qualified object: the named schema must exist in the
+// connection's database, else get_namespace_oid's 3F000 — before any other
+// check (a TEMP table in a missing schema reports the schema, not 0A000).
+// Only a plain CREATE TABLE points at the name (PG's RangeVar location reaches
+// the error there); CREATE TABLE AS / SELECT INTO and the other kinds carry
+// none. pg_temp names the session's temporary schema and is not looked up.
+// M0119-0006.
+func (o *ddlOp) checkCreationNamespace() error {
+	schema, pos := "", 0
+	switch s := o.plan.Stmt.(type) {
+	case *parser.CreateTableStmt:
+		schema = s.Name.Schema
+		if s.SelectSource == nil {
+			pos = s.Name.Pos()
+		}
+	case *parser.CreateViewStmt:
+		schema = s.Name.Schema
+	case *parser.CreateSequenceStmt:
+		schema = s.Name.Schema
+	case *parser.CreateMatViewStmt:
+		schema = s.Name.Schema
+	case *parser.CreateFunctionStmt:
+		schema = s.Name.Schema
+	case *parser.CreateProcedureStmt:
+		schema = s.Name.Schema
+	case *parser.CreateTypeStmt:
+		schema = s.Schema
+	case *parser.CreateDomainStmt:
+		schema = s.Schema
+	}
+	return o.requireSchema(schema, pos)
+}
+
+// requireSchema raises get_namespace_oid's 3F000 when schema (non-empty, not
+// the session's pg_temp) does not exist in the connection's database.
+func (o *ddlOp) requireSchema(schema string, pos int) error {
+	if schema == "" || strings.EqualFold(schema, "pg_temp") || strings.HasPrefix(strings.ToLower(schema), "pg_temp_") {
+		return nil
+	}
+	if o.ctx.Catalog.SchemaExists(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		return nil
+	}
+	return &ExecError{Code: "3F000", Pos: pos, Message: fmt.Sprintf("schema %q does not exist", schema)}
+}
+
 func (o *ddlOp) Schema() optimizer.Schema { return nil }
 func (o *ddlOp) Open(ctx *Context) error {
 	if ctx.Catalog == nil {
@@ -123,6 +170,9 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	if err := o.checkCreationNamespace(); err != nil {
+		return nil, err
+	}
 	switch s := o.plan.Stmt.(type) {
 	case *parser.CreateTableStmt:
 		return nil, o.execCreateTable(s)
@@ -8857,6 +8907,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return nil
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		// AlterTableNamespace resolves the relation first, then the target
+		// namespace (LookupCreationNamespace → get_namespace_oid's 3F000).
+		if err := o.requireSchema(s.SetSchema, 0); err != nil {
+			return err
 		}
 		oldSchema, oldBare := tbl.Schema, tbl.Name
 		tbl.Schema = s.SetSchema
@@ -23194,6 +23249,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if schemaName != "" {
+			// CreateSchemaCommand (schemacmds.c): an existing name is
+			// NamespaceCreate's 42P06, or with IF NOT EXISTS a NOTICE and
+			// nothing else. RegisterSchema used to treat it as a no-op,
+			// so a duplicate CREATE SCHEMA "succeeded". M0119-0006.
+			if im.SchemaExists(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+				if s.IfNotExists {
+					o.ctx.AddNotice(fmt.Sprintf("schema %q already exists, skipping", schemaName))
+					return nil
+				}
+				return &ExecError{Code: "42P06", Message: fmt.Sprintf("schema %q already exists", schemaName)}
+			}
 			im.RegisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream

@@ -125,3 +125,62 @@ namespace.
   - A one-object `DROP ... CASCADE` NOTICE is worded "drop cascades to 1
     other objects" with a DETAIL, where PG prints "drop cascades to table
     sa.t".
+
+## Follow-up (2026-10-12): the creation namespace must exist
+
+Probing the per-database change showed that every statement creating a
+schema-qualified object accepted a schema that does not exist, and filed the
+object under `public`'s OID. Affected: CREATE TABLE (also TEMP and IF NOT
+EXISTS), CREATE TABLE AS, SELECT INTO, VIEW, SEQUENCE, MATERIALIZED VIEW,
+TYPE, DOMAIN, FUNCTION and PROCEDURE, plus ALTER TABLE ... SET SCHEMA. In PG
+they all go through `RangeVarGetCreationNamespace` /
+`QualifiedNameGetCreationNamespace` → `get_namespace_oid`, which raises
+3F000 `schema "x" does not exist`.
+
+- **Creation check.** `ddlOp.checkCreationNamespace` runs before the
+  per-kind dispatch, so it comes before every other check. A TEMP table in a
+  missing schema therefore reports the schema, not 0A000, as PG does.
+  - It looks the schema up in the connection's database.
+  - `pg_temp` / `pg_temp_N` are skipped.
+  - Only a plain CREATE TABLE carries a position (the relation name, which is
+    PG's caret). CTAS, SELECT INTO and the other kinds carry none.
+- **ALTER TABLE ... SET SCHEMA** checks the target only after resolving the
+  relation (`AlterTableNamespace` order), so a missing table still reports
+  42P01.
+- **Quoted schema names were never registered.** Turning on the check exposed
+  this: the compat scanner for CREATE SCHEMA (`parser/ddl.go`) dropped a
+  quoted name (`"my.schema"`, `"Mixed"`), and objects created in such a
+  schema had only "worked" because nothing was checked. The scanner now:
+  - accepts a quoted identifier as the name;
+  - parses `IF NOT EXISTS`, which it used to read as a schema named `if`.
+- **Duplicates.** The executor raises NamespaceCreate's 42P06 for an
+  existing schema, or under IF NOT EXISTS the NOTICE `schema "x" already
+  exists, skipping`. `RegisterSchema` had made a duplicate a silent no-op.
+
+Verification:
+
+- `TestCreateInMissingSchemaRaises3F000` and
+  `TestCreateSchemaQuotedIfNotExistsDuplicate`.
+- The probe is byte-identical to PG 18.3 apart from the residuals below.
+- Regress A/B:
+  - namespace now matches PG on the duplicate error and the IF NOT EXISTS
+    notice, but its diff grows by 5 lines. In PG the first
+    `CREATE SCHEMA ... CREATE VIEW` fails on its sub-element. goopg does not
+    run sub-elements (M0134-0009), so it creates the schema, and the second
+    CREATE SCHEMA now correctly hits 42P06.
+  - alter_generic gains a matching line.
+  - inherit / privileges / rowsecurity show only OID and pointer noise.
+  - The other 16 cases are byte-identical.
+
+Residuals (ledgered):
+
+- `CREATE TABLE pg_catalog.x` is accepted. PG refuses it with 42501 unless
+  allow_system_table_mods is on.
+- The schema registry folds names to lower case, so `"Mixed"` shows in
+  pg_namespace as `mixed` and `"Mixed"` / `mixed` collide.
+- goopg NOTICEs carry SQLSTATE 00000. PG sends 42P06 / 42P07 on the
+  "already exists, skipping" notices.
+- An unqualified CREATE whose search_path holds no existing schema is not
+  checked. PG raises 3F000 `no schema has been selected to create in`.
+- The dispatch parse-recovery path (`schemaNameFromCreate`) lowercases a
+  quoted name.

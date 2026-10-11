@@ -2440,6 +2440,9 @@ type CompatNoopStmt struct {
 	// M0134-0115.
 	SchemaSubElementSchema string
 	SchemaHasSubElement    bool
+	// IfNotExists is CREATE SCHEMA IF NOT EXISTS (Tag == "CREATE SCHEMA"
+	// only): an existing schema is a NOTICE, not 42P06. M0119-0006.
+	IfNotExists bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
