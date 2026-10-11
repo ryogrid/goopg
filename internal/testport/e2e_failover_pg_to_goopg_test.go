@@ -299,6 +299,14 @@ func runPGBasebackup(t *testing.T, repo, bin string, primary *pgcluster.Cluster,
 	}
 }
 
+// configureGoopgStandbyFromPGBackup points a base backup taken from a PG
+// cluster at its new primary. The backup's postgresql.auto.conf is the
+// source cluster's — when that cluster was itself a standby it still names
+// the OLD primary — and the auto file overrides postgresql.conf, in goopg as
+// in PG. So the settings are appended to postgresql.auto.conf, where the
+// later occurrence wins, exactly as pg_basebackup -R does
+// (WriteRecoveryConfig); postgresql.conf gets them too, replacing PG's
+// full sample, which names parameters goopg does not register.
 func configureGoopgStandbyFromPGBackup(t *testing.T, dataDir, conninfo, slotName string) {
 	t.Helper()
 	conf := fmt.Sprintf(
@@ -306,6 +314,16 @@ func configureGoopgStandbyFromPGBackup(t *testing.T, dataDir, conninfo, slotName
 		conninfo, slotName)
 	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		t.Fatalf("write postgresql.conf: %v", err)
+	}
+	auto, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open postgresql.auto.conf: %v", err)
+	}
+	if _, err := auto.WriteString(conf); err != nil {
+		t.Fatalf("append postgresql.auto.conf: %v", err)
+	}
+	if err := auto.Close(); err != nil {
+		t.Fatalf("close postgresql.auto.conf: %v", err)
 	}
 	if err := initdb.CreateStandbySignal(dataDir); err != nil {
 		t.Fatalf("CreateStandbySignal: %v", err)

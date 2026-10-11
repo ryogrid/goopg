@@ -168,7 +168,13 @@ type Variable struct {
 	MinVal      float64 // valid for Int/Real
 	MaxVal      float64
 	EnumOptions []string            // valid for Enum
-	CheckFn     func(string) error  // optional validation of the canonical value, every type
+	// EnumHidden maps a hidden config_enum_entry name (hidden = true in
+	// guc_tables.c) to the visible option with the same value: accepted
+	// on input, stored and shown as that option, and never listed in
+	// enumvals or the error HINT (`debug` -> `debug2` for the message-level
+	// enums). Keys are lower case.
+	EnumHidden map[string]string
+	CheckFn    func(string) error // optional validation of the canonical value, every type
 }
 
 // canonicalize normalises an incoming string value into the form we
@@ -360,6 +366,12 @@ func (v *Variable) canonicalizeType(current, value string) (string, error) {
 			if strings.EqualFold(opt, value) {
 				return opt, nil
 			}
+		}
+		// config_enum_lookup_by_name matches hidden rows too; the value they
+		// carry shows as the first visible row with it
+		// (config_enum_lookup_by_value).
+		if opt, ok := v.EnumHidden[strings.ToLower(value)]; ok {
+			return opt, nil
 		}
 		// Upstream registers boolean synonyms for on/off-bearing enums as
 		// HIDDEN config_enum_entry rows (hidden = true) — see

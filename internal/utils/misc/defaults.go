@@ -783,8 +783,13 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
 		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning", "error"},
-		Context:     ContextUserset,
-		Scope:       ScopeSession | ScopeTransaction,
+		// client_message_level_options' hidden rows: debug = DEBUG2, shown
+		// as debug2; info = INFO, the only row with that level, so it
+		// shows as itself (config_enum_lookup_by_value returns the first
+		// row carrying the value, hidden or not).
+		EnumHidden: map[string]string{"debug": "debug2", "info": "info"},
+		Context:    ContextUserset,
+		Scope:      ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "statement_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
@@ -1436,6 +1441,26 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: -1, MaxVal: 2147483647,
 		Context: ContextSuset,
 		Scope:   ScopeSession,
+	}))
+	// log_min_messages / log_error_verbosity (guc_tables.c, PGC_SUSET):
+	// registered with PG's option lists so a postgresql.conf or
+	// postgresql.auto.conf naming them — a pg_basebackup of a PG cluster
+	// carries its auto file — does not stop the server at startup
+	// (ProcessConfigFileInternal treats an unknown name as fatal there, so
+	// the failure itself is PG-faithful; the gap was the missing names).
+	// goopg's server log does not filter or format by them yet.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_min_messages", Type: TypeEnum, BootVal: "warning",
+		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "info", "notice", "warning", "error", "log", "fatal", "panic"},
+		EnumHidden:  map[string]string{"debug": "debug2"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_error_verbosity", Type: TypeEnum, BootVal: "default",
+		EnumOptions: []string{"terse", "default", "verbose"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession | ScopeTransaction,
 	}))
 	// log_line_prefix: PGC_SIGHUP in upstream (guc_tables.c) — config-file
 	// only, never client-SET-able, unlike log_statement/log_min_duration_statement
