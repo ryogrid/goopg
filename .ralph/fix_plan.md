@@ -4814,10 +4814,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
 - [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
-  - [ ] **M0122-0015b — `subq_op` omits `OPERATOR(...)` before `ANY/SOME/ALL`,
+  - [x] **M0122-0015b — `subq_op` omits `OPERATOR(...)` before `ANY/SOME/ALL`,
     so `pg_dump -t` / `-T` / `--filter` all fail**
     Kind: impl
     Parent: M0122-0015
+    Movement: none — grammar / client-tool parity; no TPC query spells OPERATOR\(...\) ANY
+    - **DONE 2026\-10\-12\.** `subq_op` gained `\| qual\_op` \(gram\.y:16674\);
+      pg\_dump `\-t` / `\-T` / `\-\-filter` work\. No new conflicts; goldens \+6\.
+    - Ported `005\_pg\_dump\_filterfile\.pl` as `TestPort\_PgDump005Filterfile`
+      \(69 of 92 assertions; inventory row `defer` → `port`\)\. The 23 left out
+      sit behind M0122\-0015c and M0122\-0015a; the sourcedb fixture runs last
+      because of M0122\-0015d\.
+    - Tests `TestQualifiedOperatorBeforeAnyAll`, `TestPort\_PgDump005Filterfile`\.
+    - Design: §6 of `docs/design/0100\-0149/m0134\-0158\-qualified\-operator\-and\-collate\-any\-name\.md`\.
     Discovered 2026\-09\-22 (loop \#22) while probing
     `005_pg_dump_filterfile.pl`.
     - **Measured**: `pg_dump --table=t`, `--exclude-table=t` and `--filter`
@@ -4845,6 +4854,52 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       (`grammar/` + `internal/parser/` are outside the fire\-set scope).~~
       **Hook repaired 2026\-09\-22 — this can now be committed normally.**
       The inventory row for 005 is `defer` with this task in `deferred_to`.
+  - [ ] **M0122-0015c — a schema\-qualified type in PREPARE\'s parameter list
+    does not resolve, so pg\_dump of any database with a user function fails**
+    Kind: impl
+    Parent: M0122-0015
+    Found 2026\-10\-12 by the 005 port\.
+    - **Measured**: `PREPARE x\(pg\_catalog\.oid\) AS SELECT $1` → 42704 `type
+      "pg\_catalog\.oid" does not exist` \(also `pg\_catalog\.int4`,
+      `public\.t2`\); unqualified `PREPARE y\(oid\)` and
+      `SELECT 1::pg\_catalog\.oid` work; PG accepts all\.
+    - **Impact**: pg\_dump runs `PREPARE dumpFunc\(pg\_catalog\.oid\)` for
+      the first function it dumps, so pg\_dump / pg\_dumpall of any database
+      holding a user function exits 1\. Blocks 23 assertions of 005\.
+    - First step: find PREPARE\'s parameter\-type resolution \(parser
+      PrepareStmt arg types → executor\) and resolve qualified names the way
+      the cast path does\.
+  - [ ] **M0122-0015d — user functions are visible in every database\'s
+    pg\_proc**
+    Kind: impl
+    Parent: M0122-0015
+    Found 2026\-10\-12 by the 005 port\.
+    - **Measured**: after `CREATE FUNCTION foo1 ...` in `sourcedb`, `SELECT
+      proname FROM pg\_proc WHERE proname LIKE \'foo%\'` returns the rows in
+      postgres, template1 and any later database, yet `DROP FUNCTION foo1\(int\)`
+      there says it does not exist\. PG\'s pg\_proc is per\-database \(0 rows\)\.
+    - First step: the pg\_proc virtual rows \(initdb/pg\_proc\_view\.go\) list
+      the whole Routines registry; filter by the connection\'s database the way
+      the routine lookup already does \(design 0122\-0018 follow\-up 44\)\.
+  - [ ] **M0122-0015e — pg\_foreign\_data\_wrapper rows are visible in every
+    database**
+    Kind: impl
+    Parent: M0122-0015
+    Found 2026\-10\-12 by the 005 port\.
+    - **Measured**: FDW `dummy` created in postgres is listed in a fresh
+      database\'s pg\_foreign\_data\_wrapper, and that database\'s dump emits
+      `CREATE FOREIGN DATA WRAPPER dummy;`\. pg\_foreign\_server does not leak\.
+    - First step: scope the FDW registry by database as the foreign\-server
+      registry already is \(design 0122\-0018 follow\-up 36\)\.
+  - [ ] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
+    Kind: impl
+    Parent: M0122-0015
+    Found 2026\-10\-12 while testing M0122\-0015b\.
+    - **Measured**: `SELECT 1 = ANY \(1\)` returns `t`; PG raises 42809 `op
+      ANY/ALL \(array\) requires array on right side` \(parse\_oper\.c
+      make\_scalar\_array\_op\)\. Same for the OPERATOR\(\.\.\.\) spelling\.
+    - First step: reject a non\-array right operand in the analyzer\'s
+      ANY/ALL typing\.
   - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
