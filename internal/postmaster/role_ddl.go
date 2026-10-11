@@ -971,9 +971,9 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 		return true, &roleError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
 	}
 	if !op.resetAll {
-		name, code, msg := configArrayItem(op.configName, op.configValue, op.reset)
+		name, code, msg, detail := configArrayItem(op.configName, op.configValue, op.reset)
 		if code != "" {
-			return true, &roleError{code: code, msg: msg}
+			return true, &roleError{code: code, msg: msg, detail: detail}
 		}
 		op.configName = name
 	}

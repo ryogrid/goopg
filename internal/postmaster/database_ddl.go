@@ -205,21 +205,22 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 // configArrayItem runs AlterSetting's GUCArrayAdd / GUCArrayDelete
 // validation and name normalisation (misc.ConfigArrayItem) for one ALTER
 // DATABASE / ROLE ... SET or RESET entry. It returns the name to store, or a
-// non-empty SQLSTATE and message when PostgreSQL would reject the entry.
-func configArrayItem(name, value string, reset bool) (string, errcodes.Code, string) {
+// non-empty SQLSTATE and message (plus the check hook's DETAIL, if any) when
+// PostgreSQL would reject the entry.
+func configArrayItem(name, value string, reset bool) (string, errcodes.Code, string, string) {
 	var v *string
 	if !reset {
 		v = &value
 	}
 	canon, err := misc.ConfigArrayItem(name, v)
 	if err == nil {
-		return canon, "", ""
+		return canon, "", "", ""
 	}
 	var aerr *misc.AlterSystemError
 	if errors.As(err, &aerr) {
-		return "", errcodes.Code(aerr.Code), aerr.Msg
+		return "", errcodes.Code(aerr.Code), aerr.Msg, aerr.Detail
 	}
-	return "", errcodes.InvalidParameterValue, err.Error()
+	return "", errcodes.InvalidParameterValue, err.Error(), ""
 }
 
 // splitLeadingConfigName reads the configuration parameter name of a SET /
@@ -350,8 +351,11 @@ func parseSetRestSpecialForm(rest string) (configName, configValue string, reset
 	switch {
 	case strings.HasPrefix(lower, "time zone "):
 		val := strings.TrimSpace(rest[len("time zone "):])
-		if strings.EqualFold(val, "default") || strings.EqualFold(val, "local") {
-			return "timezone", "", true, true
+		// zone_value through the grammar, as the SET TIME ZONE statement
+		// itself goes: LOCAL / DEFAULT reset, INTERVAL 'x' [qualifier]
+		// coerced to INTERVAL '<interval_out>'.
+		if v, reset, ok, err := parser.TimeZoneSetValue(val); ok && err == nil {
+			return "timezone", v, reset, true
 		}
 		v, ok := flattenSpecialFormValue("timezone", val)
 		if !ok {
@@ -2109,7 +2113,7 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		return true, "", &databaseDDLError{code: errcodes.InvalidParameterValue, msg: op.valueErr.Error()}
 	}
 	if !op.resetAll {
-		name, code, msg := configArrayItem(op.configName, op.configValue, op.reset)
+		name, code, msg, _ := configArrayItem(op.configName, op.configValue, op.reset)
 		if code != "" {
 			return true, "", &databaseDDLError{code: code, msg: msg}
 		}

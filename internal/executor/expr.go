@@ -7870,19 +7870,12 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 }
 
 // sessionTimeZoneLocation resolves the session's TimeZone GUC to a
-// *time.Location with exactly the renderer's semantics (sessionLocation,
-// internal/utils/misc/timestamptz_out.go:37): "" → UTC, and any spelling Go's
-// tzdata does not know (POSIX-style fixed offsets like "+05:30") falls back to
-// UTC — so EXTRACT/date_part and FormatTimestampTZ always agree. M0134-0076.
+// *time.Location through the renderer's own resolver (misc.ZoneLocation: tz
+// database zones and POSIX specs such as the <+02>-02 a SET TIME ZONE
+// INTERVAL stores; "" → UTC) — so EXTRACT/date_part and FormatTimestampTZ
+// always agree. M0134-0076, M0122-0008.
 func sessionTimeZoneLocation(zone string) *time.Location {
-	if zone == "" {
-		return time.UTC
-	}
-	loc, err := time.LoadLocation(zone)
-	if err != nil {
-		return time.UTC
-	}
-	return loc
+	return misc.ZoneLocation(zone)
 }
 
 // julianNumber ports DTK_JULIAN (postgres/src/backend/utils/adt/timestamp.c:5651):

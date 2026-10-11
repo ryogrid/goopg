@@ -37,7 +37,7 @@ const SetLocalOutsideBlockMessage = "SET LOCAL can only be used in transaction b
 func execErrorFromGUCError(pos int, err error) *ExecError {
 	var verr *misc.ValidationError
 	if errors.As(err, &verr) {
-		return &ExecError{Code: "22023", Pos: pos, Message: verr.Msg, Hint: verr.Hint}
+		return &ExecError{Code: verr.SQLState(), Pos: pos, Message: verr.Msg, Hint: verr.Hint, Detail: verr.Detail}
 	}
 	return &ExecError{Code: "22023", Pos: pos, Message: err.Error()}
 }
@@ -363,7 +363,7 @@ func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error 
 	if err := o.ctx.AlterSystem(name, value, set, stmt.ResetAll); err != nil {
 		var aerr *misc.AlterSystemError
 		if errors.As(err, &aerr) {
-			return &ExecError{Code: aerr.Code, Message: aerr.Msg, Hint: aerr.Hint}
+			return &ExecError{Code: aerr.Code, Message: aerr.Msg, Hint: aerr.Hint, Detail: aerr.Detail}
 		}
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
@@ -434,7 +434,7 @@ func flattenFunctionConfigOps(pos int, ops []parser.FunctionConfigOp) ([]parser.
 		if err != nil {
 			var aerr *misc.AlterSystemError
 			if errors.As(err, &aerr) {
-				return nil, &ExecError{Code: aerr.Code, Pos: pos, Message: aerr.Msg, Hint: aerr.Hint}
+				return nil, &ExecError{Code: aerr.Code, Pos: pos, Message: aerr.Msg, Hint: aerr.Hint, Detail: aerr.Detail}
 			}
 			return nil, execErrorFromGUCError(pos, err)
 		}

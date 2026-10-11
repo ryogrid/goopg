@@ -16,9 +16,10 @@ const AutoConfFileName = "postgresql.auto.conf"
 // AlterSystemError is an ALTER SYSTEM failure carrying PostgreSQL's SQLSTATE,
 // so the executor can surface it unchanged.
 type AlterSystemError struct {
-	Code string
-	Msg  string
-	Hint string
+	Code   string
+	Msg    string
+	Hint   string
+	Detail string
 }
 
 func (e *AlterSystemError) Error() string { return e.Msg }
@@ -55,7 +56,7 @@ func (r *Registry) AlterSystemSetConfigFile(dataDir, name, value string, set, re
 					// parse_and_validate_value at ERROR level reports its own
 					// message (range, unit, enum list ...).
 					if verr, ok := err.(*ValidationError); ok {
-						return &AlterSystemError{Code: "22023", Msg: verr.Msg, Hint: verr.Hint}
+						return &AlterSystemError{Code: verr.SQLState(), Msg: verr.Msg, Hint: verr.Hint, Detail: verr.Detail}
 					}
 					return &AlterSystemError{Code: "22023", Msg: err.Error()}
 				}

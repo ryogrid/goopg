@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // zoneInfoDirs are the tzdata roots Go's time.LoadLocation reads on Unix
@@ -17,32 +18,40 @@ func zoneInfoDirs() []string {
 	return dirs
 }
 
-var canonicalZoneCache sync.Map // lower-cased name -> canonical spelling
+type zoneFileHit struct {
+	name string
+	ok   bool
+}
 
-// canonicalZoneName is pg_tzset's name resolution (pgtz.c pg_open_tzfile):
-// a zone name is matched against the tz database case-insensitively, one
-// path component at a time, and the stored name takes the file's own
+var canonicalZoneCache sync.Map // lower-cased name -> zoneFileHit
+
+// lookupZoneFile is pg_tzset's file lookup (pgtz.c pg_open_tzfile + tzload):
+// the name is matched against the tz database case-insensitively, one path
+// component at a time, and must load as a zone; the result is the file's own
 // spelling — `SET timezone = utc` (an identifier, so downcased) shows UTC.
-// A name with no match (POSIX specs such as '<+02>-02' or '+05:30') is
-// returned unchanged.
-func canonicalZoneName(name string) string {
+// ok is false when no loadable file matches (POSIX specs such as '<+02>-02',
+// unknown names, tzdata's non-zone files like zone.tab).
+func lookupZoneFile(name string) (string, bool) {
 	if name == "" || strings.ContainsAny(name, "\x00") || strings.Contains(name, "..") ||
 		strings.HasPrefix(name, "/") {
-		return name
+		return "", false
 	}
 	key := strings.ToLower(name)
 	if c, ok := canonicalZoneCache.Load(key); ok {
-		return c.(string)
+		h := c.(zoneFileHit)
+		return h.name, h.ok
 	}
-	canon := name
+	hit := zoneFileHit{}
 	for _, root := range zoneInfoDirs() {
 		if found, ok := matchZonePath(root, strings.Split(name, "/")); ok {
-			canon = found
+			if _, err := time.LoadLocation(found); err == nil {
+				hit = zoneFileHit{name: found, ok: true}
+			}
 			break
 		}
 	}
-	canonicalZoneCache.Store(key, canon)
-	return canon
+	canonicalZoneCache.Store(key, hit)
+	return hit.name, hit.ok
 }
 
 // matchZonePath resolves parts under root, each component compared without

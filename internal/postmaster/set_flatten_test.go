@@ -60,10 +60,10 @@ func TestAlterRoleConfigCanonicalName(t *testing.T) {
 			t.Errorf("splitLeadingConfigName(%q) = %q, %v; want %q", in, got, ok, want)
 		}
 	}
-	if name, code, _ := configArrayItem("datestyle", "iso", false); code != "" || name != "DateStyle" {
+	if name, code, _, _ := configArrayItem("datestyle", "iso", false); code != "" || name != "DateStyle" {
 		t.Errorf("configArrayItem(datestyle) = %q, %q", name, code)
 	}
-	if name, code, _ := configArrayItem("timezone", "", true); code != "" || name != "TimeZone" {
+	if name, code, _, _ := configArrayItem("timezone", "", true); code != "" || name != "TimeZone" {
 		t.Errorf("configArrayItem(RESET timezone) = %q, %q", name, code)
 	}
 	for _, c := range []struct{ name, value, code string }{
@@ -71,8 +71,37 @@ func TestAlterRoleConfigCanonicalName(t *testing.T) {
 		{"shared_buffers", "1GB", "55P02"},
 		{"work_mem", "bogus", "22023"},
 	} {
-		if _, code, msg := configArrayItem(c.name, c.value, false); string(code) != c.code {
+		if _, code, msg, _ := configArrayItem(c.name, c.value, false); string(code) != c.code {
 			t.Errorf("configArrayItem(%q, %q) = %q %q; want %s", c.name, c.value, code, msg, c.code)
 		}
+	}
+}
+
+// TestSetRestTimeZoneFlattened: ALTER DATABASE / ROLE ... SET TIME ZONE
+// reaches set_rest's zone_value as text; it is flattened through the grammar
+// exactly as SET TIME ZONE is, so pg_db_role_setting stores what PG 18.3's
+// ExtractSetVariableArgs stores (TimeZone=INTERVAL '02:00:00'), LOCAL is a
+// reset, and check_timezone's DETAIL reaches the client.
+func TestSetRestTimeZoneFlattened(t *testing.T) {
+	for _, c := range []struct {
+		rest, value string
+		reset       bool
+	}{
+		{"time zone INTERVAL '+02:00' HOUR TO MINUTE", "INTERVAL '02:00:00'", false},
+		{"time zone INTERVAL(2) '1:00:30.555'", "INTERVAL '01:00:30.56'", false},
+		{"time zone -7", "-7", false},
+		{"time zone 'America/New_York'", "America/New_York", false},
+		{"time zone LOCAL", "", true},
+		{"time zone default", "", true},
+	} {
+		name, value, reset, matched := parseSetRestSpecialForm(c.rest)
+		if !matched || name != "timezone" || value != c.value || reset != c.reset {
+			t.Errorf("parseSetRestSpecialForm(%q) = %q %q reset=%v matched=%v; want timezone %q reset=%v",
+				c.rest, name, value, reset, matched, c.value, c.reset)
+		}
+	}
+	_, code, msg, detail := configArrayItem("timezone", "INTERVAL '1 day'", false)
+	if code != "22023" || detail != "Cannot specify days in time zone interval." {
+		t.Errorf("configArrayItem(timezone, 1 day) = %s %q / %q", code, msg, detail)
 	}
 }

@@ -18,11 +18,23 @@ import (
 // surface a HINT (e.g. the wire protocol's ExecError.Hint) should
 // `errors.As` for this type instead.
 type ValidationError struct {
-	Msg  string
-	Hint string
+	Msg    string
+	Hint   string
+	Detail string
+	// Code is the SQLSTATE when it is not 22023 (invalid_parameter_value),
+	// e.g. interval_in's 22007 raised from inside check_timezone.
+	Code string
 }
 
 func (e *ValidationError) Error() string { return e.Msg }
+
+// SQLState is the error's SQLSTATE: Code, defaulting to 22023.
+func (e *ValidationError) SQLState() string {
+	if e.Code != "" {
+		return e.Code
+	}
+	return "22023"
+}
 
 // Type is the value type of a GUC. Mirrors guc.c's PGC_BOOL / PGC_INT /
 // PGC_REAL / PGC_STRING / PGC_ENUM.
@@ -333,10 +345,14 @@ func (v *Variable) canonicalizeType(current, value string) (string, error) {
 			if canon := encodingNameToCanonical(value); canon != "" {
 				return canon, nil
 			}
-		case "timezone", "log_timezone":
-			// check_timezone / check_log_timezone keep pg_tzset's name, the
-			// tz file's own spelling (`SET timezone = utc` shows UTC).
-			return canonicalZoneName(value), nil
+		case "timezone":
+			// check_timezone: the stored value is the name the zone shows
+			// as — the tz file's own spelling (`SET timezone = utc` shows
+			// UTC), the upper-cased POSIX spec, or the fixed-offset zone an
+			// INTERVAL / numeric offset becomes (<+02>-02).
+			return checkTimeZone(value)
+		case "log_timezone":
+			return checkLogTimeZone(value)
 		}
 		return value, nil
 	case TypeEnum:

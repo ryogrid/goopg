@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/utils/adt/similarto"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
@@ -2860,10 +2861,54 @@ func trimArrayTail(name string) (string, bool) {
 // value, exactly as the generic `SET x = DEFAULT` path has it; LOCAL is an
 // ordinary value word here, not a scope.
 func tzSetStmt(local bool, v string) Stmt {
-	if strings.EqualFold(v, "default") {
+	// zone_value's DEFAULT and LOCAL both mean "no value": reset to the
+	// default (gram.y builds a VAR_SET_DEFAULT for a NULL zone_value).
+	if strings.EqualFold(v, "default") || strings.EqualFold(v, "local") {
 		return NewSetStmt(0, local, "timezone", "", true)
 	}
 	return NewSetStmt(0, local, "timezone", v, false)
+}
+
+// tzIntervalQualOK is gram.y zone_value's check on the interval qualifier:
+// only HOUR, MINUTE and HOUR TO MINUTE are allowed, without a precision.
+func tzIntervalQualOK(q ivQual) bool {
+	if q.prec >= 0 {
+		return false
+	}
+	switch {
+	case q.lo == "" || q.lo == q.hi:
+		return q.hi == "hour" || q.hi == "minute"
+	default:
+		return q.hi == "hour" && q.lo == "minute"
+	}
+}
+
+// tzIntervalValue is flatten_set_variable_args' TypeCast branch for SET TIME
+// ZONE INTERVAL: interval_in(body, typmod), then interval_out, rendered as
+// INTERVAL '<text>' — the form check_timezone parses. q.hi == "" with a
+// precision is INTERVAL(p) 'x' (full range). A body interval_in would reject
+// is passed through unchanged; check_timezone then rejects it.
+func tzIntervalValue(body string, q ivQual) string {
+	typmod := int64(-1)
+	unit := "second"
+	if q.hi != "" || q.prec >= 0 {
+		_, col, ok := IntervalQualTypmods(q.hi, q.lo, q.prec)
+		if !ok {
+			return "INTERVAL '" + strings.ReplaceAll(body, "'", "''") + "'"
+		}
+		typmod = col
+		if q.lo != "" {
+			unit = q.lo
+		} else if q.hi != "" {
+			unit = q.hi
+		}
+	}
+	months, days, micros, ok := ParseIntervalBodyWithDefault(body, unit)
+	if !ok {
+		return "INTERVAL '" + strings.ReplaceAll(body, "'", "''") + "'"
+	}
+	months, days, micros = datetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
+	return "INTERVAL '" + datetime.FormatInterval(months, days, micros) + "'"
 }
 
 // fetchSpec carries FETCH/MOVE's direction+count before they collapse into the

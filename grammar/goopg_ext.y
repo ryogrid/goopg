@@ -1182,6 +1182,23 @@ set_stmt:
 	   and therefore a ColId, so this cannot ride set_guc_name. */
 	| SET set_scope TIME ZONE set_value_atom
 			{ $$ = tzSetStmt($2, $5) }
+	/* zone_value's ConstInterval arms (gram.y): INTERVAL 'x' [HOUR | MINUTE |
+	   HOUR TO MINUTE] and INTERVAL(p) 'x'. The value is flattened here, as
+	   flatten_set_variable_args does for the TypeCast, to INTERVAL
+	   '<interval_out>' — the form check_timezone parses. */
+	| SET set_scope TIME ZONE INTERVAL SCONST
+			{ $$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($6, ivQual{prec: -1}), false) }
+	| SET set_scope TIME ZONE INTERVAL SCONST interval_qual
+			{
+				q := $7
+				if !tzIntervalQualOK(q) {
+					yylex.(*lexerState).raise("time zone interval must be HOUR or HOUR TO MINUTE", true, $<p>7)
+					return 1
+				}
+				$$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($6, q), false)
+			}
+	| SET set_scope TIME ZONE INTERVAL '(' ICONST ')' SCONST
+			{ $$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($9, ivQual{prec: $7}), false) }
 
 /* set_guc_name — GUCs may be dotted (`SET spec.session = 1`), which plain
    ColId could not express. */

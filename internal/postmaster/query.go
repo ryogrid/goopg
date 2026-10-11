@@ -317,10 +317,21 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// round 2 (mirrors the parser-level fix in internal/parser/parser.go's
 	// parseSet — this fast path never reaches the parser for a
 	// single-statement simple-query message).
+	//
+	// zone_value has forms no text split can flatten — INTERVAL 'x' [HOUR
+	// TO MINUTE], INTERVAL(p) 'x', LOCAL — so with a storage backend the
+	// statement goes through the grammar (tz_* actions) and the executor's
+	// SET, like a multi-statement message's would. M0122-0008.
 	case strings.HasPrefix(upper, "SET LOCAL TIME ZONE "), upper == "SET LOCAL TIME ZONE":
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
 		value := strings.TrimSpace(matchable[len("SET LOCAL TIME ZONE"):])
 		return s.handleSet(w, sess, "timezone "+value, true)
 	case strings.HasPrefix(upper, "SET TIME ZONE "), upper == "SET TIME ZONE":
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
 		value := strings.TrimSpace(matchable[len("SET TIME ZONE"):])
 		return s.handleSet(w, sess, "timezone "+value, false)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
@@ -561,18 +572,18 @@ func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry)
 	return w.ReadyForQuery()
 }
 
-// gucSetErrorFields unwraps a SET-time GUC validation error, splitting the
-// ERROR message from an attached HINT (e.g. an enum GUC's "Available
-// values: ..." list — postgres/src/backend/utils/misc/guc.c's PGC_ENUM
-// branch of set_config_option attaches this as a separate errhint(), not
-// baked into the primary message). Non-ValidationError failures pass their
-// Error() text through unchanged with no extra fields.
-func gucSetErrorFields(err error) (msg, hint string) {
+// gucSetError maps a SET-time GUC validation failure to the wire error:
+// the SQLSTATE (22023 unless the check raised another, like interval_in's
+// 22007 inside check_timezone), the message, and the DETAIL / HINT that
+// PostgreSQL attaches separately (GUC_check_errdetail, an enum GUC's
+// "Available values: ..." errhint). Other failures pass their Error() text
+// through as 22023 with no extra fields.
+func gucSetError(err error) *extendedQueryError {
 	var verr *misc.ValidationError
 	if errors.As(err, &verr) {
-		return verr.Msg, verr.Hint
+		return &extendedQueryError{Code: errcodes.Code(verr.SQLState()), Message: verr.Msg, Detail: verr.Detail, Hint: verr.Hint}
 	}
-	return err.Error(), ""
+	return &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
 }
 
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
@@ -597,11 +608,15 @@ func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, bod
 		apply = func(name, value string, _ bool) error { return sess.CheckSet(name, value) }
 	}
 	if err := apply(name, value, isLocal); err != nil {
-		msg, hint := gucSetErrorFields(err)
-		if hint == "" {
-			return s.writeQueryError(w, errcodes.InvalidParameterValue, msg)
+		e := gucSetError(err)
+		var extra []libpq.ErrorField
+		if e.Detail != "" {
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldDetail, Value: e.Detail})
 		}
-		return s.writeQueryError(w, errcodes.InvalidParameterValue, msg, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
+		if e.Hint != "" {
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldHint, Value: e.Hint})
+		}
+		return s.writeQueryError(w, e.Code, e.Message, extra...)
 	}
 	if err := w.WriteCommandComplete("SET"); err != nil {
 		return err

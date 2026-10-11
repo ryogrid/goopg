@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"errors"
 	"math"
 	"strconv"
 
@@ -93,3 +94,33 @@ func ParseSetArgList(text string) ([]misc.SetArg, bool) {
 	}
 	return args, true
 }
+
+// TimeZoneSetValue flattens the zone_value of a SET TIME ZONE clause that
+// reaches the server as text (ALTER DATABASE / ROLE ... SET TIME ZONE) the way
+// the statement's own grammar does: INTERVAL 'x' [qualifier] coerced to
+// INTERVAL '<interval_out>', LOCAL / DEFAULT a reset. ok is false when the
+// text is not a zone_value; err is the grammar's error for one it rejects
+// (an interval qualifier other than HOUR / MINUTE / HOUR TO MINUTE).
+func TimeZoneSetValue(zone string) (value string, reset, ok bool, err error) {
+	stmts, perr := Parse("SET TIME ZONE " + zone)
+	if perr != nil {
+		var se *SyntaxError
+		if errors.As(perr, &se) && se.Raw {
+			return "", false, true, perr
+		}
+		return "", false, false, nil
+	}
+	if len(stmts) != 1 {
+		return "", false, false, nil
+	}
+	s, isSet := stmts[0].(*SetStmt)
+	if !isSet || s.Name != "timezone" {
+		return "", false, false, nil
+	}
+	return s.Value, s.Default, true, nil
+}
+
+// check_timezone's INTERVAL 'x' form needs interval_in, and the GUC package
+// cannot import this one (this one imports it), so hand it the shared
+// interval tokenizer — the one the ::interval cast and typed literals use.
+func init() { misc.IntervalParser = ParseIntervalBody }

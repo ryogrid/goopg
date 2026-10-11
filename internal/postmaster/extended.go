@@ -561,6 +561,11 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	// "role" (not a config.Registry variable — SET ROLE is tracked entirely
 	// via connTx.NonSuperuserRole) and fail with "unrecognized configuration
 	// parameter". Mirrors server/query.go's simple-query handling. M0119-0004.
+	// SET [LOCAL] TIME ZONE: zone_value's forms (INTERVAL qualifiers, LOCAL)
+	// need the grammar; without this case the generic "SET " split read
+	// "TIME" as the parameter name. Mirrors the simple-query path. M0122-0008.
+	case strings.HasPrefix(upper, "SET TIME ZONE "), strings.HasPrefix(upper, "SET LOCAL TIME ZONE "):
+		return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
 		if !sess.InTransactionBlock() {
 			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
@@ -580,14 +585,12 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			// An Execute outside a block is its own transaction: warn and
 			// validate only (see the simple-query handleSet).
 			if err := sess.CheckSet(name, value); err != nil {
-				msg, hint := gucSetErrorFields(err)
-				return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+				return nil, gucSetError(err)
 			}
 			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
 		}
 		if err := sess.Set(name, value, true); err != nil {
-			msg, hint := gucSetErrorFields(err)
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+			return nil, gucSetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege
@@ -625,8 +628,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
 		}
 		if err := sess.Set(name, value, false); err != nil {
-			msg, hint := gucSetErrorFields(err)
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+			return nil, gucSetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case upper == "RESET ALL":

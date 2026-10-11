@@ -29,11 +29,11 @@ import (
 // cost would land in the middle of a result-set scan.
 var zoneCache sync.Map // zone name (string) -> *time.Location
 
-// sessionLocation resolves the session's TimeZone GUC to a *time.Location,
-// falling back to UTC for the empty string and for any spelling Go's tzdata
-// does not know. Upstream accepts POSIX-style zone specifications there too
-// (`SET TimeZone='+05:30'`, note the inverted POSIX sign); Go's LoadLocation
-// does not, and those fall back to UTC — see the deferral ledger.
+// sessionLocation resolves the session's TimeZone GUC to a *time.Location
+// (ZoneLocation is the exported name): a tz database zone, else a POSIX TZ
+// specification (posixLocation — the fixed offsets SET TIME ZONE INTERVAL
+// and numeric offsets store, like <+02>-02, and full rule strings), else UTC
+// for the empty string and anything unresolvable.
 func sessionLocation(zone string) *time.Location {
 	if zone == "" {
 		return time.UTC
@@ -43,7 +43,11 @@ func sessionLocation(zone string) *time.Location {
 	}
 	loc, err := time.LoadLocation(zone)
 	if err != nil {
-		loc = time.UTC
+		if p, ok := posixLocation(zone); ok {
+			loc = p
+		} else {
+			loc = time.UTC
+		}
 	}
 	zoneCache.Store(zone, loc)
 	return loc

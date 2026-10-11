@@ -86,7 +86,7 @@ func ConfigArrayItem(name string, value *string) (string, error) {
 		// value against.
 		if _, err := v.canonicalize(*value); err != nil {
 			if verr, ok := err.(*ValidationError); ok {
-				return "", &AlterSystemError{Code: "22023", Msg: verr.Msg, Hint: verr.Hint}
+				return "", &AlterSystemError{Code: verr.SQLState(), Msg: verr.Msg, Hint: verr.Hint, Detail: verr.Detail}
 			}
 			return "", &AlterSystemError{Code: "22023", Msg: err.Error()}
 		}
