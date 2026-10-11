@@ -90,8 +90,8 @@ func SyncCompatSchemaToCatalogHeap(pool *storage.Pool, im *catalog.InMemory, cur
 	ctx.Catalog = im
 	ctx.CurrentDatabaseOid = currentDBOid
 	ctx.Tx.XID = storage.FrozenTransactionID
-	oid := im.SchemaOID(name)
-	owner := im.SchemaOwnerOID(name)
+	oid := im.SchemaOID(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	owner := im.SchemaOwnerOID(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	return syncSchemaToCatalogHeap(ctx, im, name, oid, owner)
 }
 
@@ -108,7 +108,7 @@ func syncSchemaToCatalogHeap(ctx *Context, im *catalog.InMemory, name string, oi
 	if err := insertPgNamespaceIndexEntries(ctx, name, oid, tid); err != nil {
 		return err
 	}
-	im.SetSchemaHeapTID(name, catalog.SchemaHeapTID{Block: uint32(tid.Block), Offset: tid.Offset})
+	im.SetSchemaHeapTID(name, catalog.SchemaHeapTID{Block: uint32(tid.Block), Offset: tid.Offset}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	return mirrorSchemaCatalogFiles(ctx)
 }
 
@@ -118,7 +118,7 @@ func syncSchemaToCatalogHeap(ctx *Context, im *catalog.InMemory, name string, oi
 // entries stay until vacuum). oldName locates the TID; the row is rewritten
 // with newName/owner and the TID cache re-keyed.
 func updateSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, oldName, newName string, oid, owner uint32) error {
-	tid, ok := im.SchemaHeapTID(oldName)
+	tid, ok := im.SchemaHeapTID(oldName, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if !ok {
 		// Pre-conversion data dir (no heap row known): fall back to a fresh
 		// INSERT so the heap converges on the new state.
@@ -132,7 +132,7 @@ func updateSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, oldName, new
 	if err := insertPgNamespaceIndexEntries(ctx, newName, oid, newTID); err != nil {
 		return err
 	}
-	im.RenameSchemaHeapTID(oldName, newName, catalog.SchemaHeapTID{Block: uint32(newTID.Block), Offset: newTID.Offset})
+	im.RenameSchemaHeapTID(oldName, newName, catalog.SchemaHeapTID{Block: uint32(newTID.Block), Offset: newTID.Offset}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	return mirrorSchemaCatalogFiles(ctx)
 }
 
@@ -141,7 +141,7 @@ func updateSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, oldName, new
 // entries stay until vacuum (PG semantics). Missing TID (pre-conversion
 // dir) is a no-op — there is no row to delete.
 func deleteSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, name string) error {
-	tid, ok := im.SchemaHeapTID(name)
+	tid, ok := im.SchemaHeapTID(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if !ok {
 		return nil
 	}
@@ -159,7 +159,7 @@ func deleteSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, name string)
 		// Stale TID — nothing live to delete; drop the cache entry.
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
-		im.DeleteSchemaHeapTID(name)
+		im.DeleteSchemaHeapTID(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 		return nil
 	}
 	oldTuple, err := ht.MarshalBinary()
@@ -180,6 +180,6 @@ func deleteSchemaCatalogHeapRow(ctx *Context, im *catalog.InMemory, name string)
 	if derr != nil {
 		return derr
 	}
-	im.DeleteSchemaHeapTID(name)
+	im.DeleteSchemaHeapTID(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	return mirrorSchemaCatalogFiles(ctx)
 }

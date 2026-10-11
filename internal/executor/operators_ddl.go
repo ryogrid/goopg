@@ -306,7 +306,7 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	// so it survives restart and is visible on a PG standby.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		extOID := im.ExtensionOID(s.Name, o.ctx.CurrentDatabase)
-		nsOID := im.SchemaOID(schema)
+		nsOID := im.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
 			return fmt.Errorf("pg_extension journal: %w", err)
 		}
@@ -18306,7 +18306,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		for _, a := range s.Args {
 			argTypeName := a.Type.Name
 			if a.Type.Schema != "" {
-				if !o.ctx.Catalog.SchemaExists(a.Type.Schema) {
+				if !o.ctx.Catalog.SchemaExists(a.Type.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", a.Type.Schema))
 					return nil
 				}
@@ -19056,7 +19056,7 @@ func tableCatalogDBOids(ctx *Context) []uint32 {
 // carries a relnamespace that the restart-recovery path can reverse-map back to
 // the schema name — M0110-0003). An unregistered or nil-catalog schema falls
 // back to pg_catalog, preserving the pre-M0110-0003 behaviour.
-func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
+func namespaceOIDForSchema(cat catalog.Catalog, schema string, dbOid ...uint32) uint32 {
 	if schema == "" || schema == "public" {
 		return catalog.PublicNamespaceOID
 	}
@@ -19064,7 +19064,7 @@ func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 		return catalog.PGCatalogNamespaceOID
 	}
 	if cat != nil {
-		if oid := cat.SchemaOID(schema); oid != 0 {
+		if oid := cat.SchemaOID(schema, dbOid...); oid != 0 {
 			return oid
 		}
 	}
@@ -19203,7 +19203,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
@@ -19214,7 +19214,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	if err := writeForeignTableCatalogRow(ctx, tbl); err != nil {
 		return fmt.Errorf("pg_foreign_table: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	// B0.3 (doc 02a §4): index entries route to the SAME database as the
 	// heap rows — insertCanonicalSysBtreeLeaf resolves the dbOid via
 	// tableCatalogHeapDBOid, and a distinct-dbOid database has its own
@@ -19542,11 +19542,11 @@ func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class reloptions resync for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index resync for index: %w", err)
 	}
@@ -19641,11 +19641,11 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index for index: %w", err)
 	}
@@ -21040,7 +21040,7 @@ func (o *ddlOp) dropSchemaQualifiedNotice(name parser.ObjectName) bool {
 	if name.Schema == "" {
 		return false
 	}
-	if !o.ctx.Catalog.SchemaExists(name.Schema) {
+	if !o.ctx.Catalog.SchemaExists(name.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", name.Schema))
 		return true
 	}
@@ -21081,7 +21081,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				schemaName = name.Schema + "." + name.Name
 			}
 			// Use schema registry when available. If registered → exists (even if empty).
-			schemaRegistered := o.ctx.Catalog.SchemaExists(schemaName)
+			schemaRegistered := o.ctx.Catalog.SchemaExists(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			tables := o.ctx.Catalog.TablesInSchema(schemaName)
 			if s.IfExists && !schemaRegistered {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
@@ -21101,7 +21101,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return fmt.Errorf("drop-schema catalog heap: %w", err)
 				}
 			}
-			o.ctx.Catalog.UnregisterSchema(schemaName)
+			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -21282,7 +21282,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if idx := strings.LastIndex(toType, "."); idx >= 0 {
 			toSchema = toType[:idx]
 		}
-		if fromSchema != "" && !o.ctx.Catalog.SchemaExists(fromSchema) {
+		if fromSchema != "" && !o.ctx.Catalog.SchemaExists(fromSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", fromSchema))
 				return nil
@@ -21290,7 +21290,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return &ExecError{Code: "3F000", Pos: s.Pos(),
 				Message: fmt.Sprintf("schema %q does not exist", fromSchema)}
 		}
-		if toSchema != "" && !o.ctx.Catalog.SchemaExists(toSchema) {
+		if toSchema != "" && !o.ctx.Catalog.SchemaExists(toSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", toSchema))
 				return nil
@@ -21719,7 +21719,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 		}
 		// Schema-qualified with non-existent schema.
-		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema) {
+		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", aggName.Schema))
 				return nil
@@ -21744,7 +21744,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// Check if arg type schema doesn't exist.
 				if idx := strings.LastIndex(argType, "."); idx >= 0 {
 					argSchema := argType[:idx]
-					if !o.ctx.Catalog.SchemaExists(argSchema) {
+					if !o.ctx.Catalog.SchemaExists(argSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						if s.IfExists {
 							o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", argSchema))
 							return nil
@@ -21795,7 +21795,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		rightType := s.ArgTypes[1]
 
 		// Schema-qualified operator name with non-existent schema.
-		if opNameObj.Schema != "" && !o.ctx.Catalog.SchemaExists(opNameObj.Schema) {
+		if opNameObj.Schema != "" && !o.ctx.Catalog.SchemaExists(opNameObj.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", opNameObj.Schema))
 				return nil
@@ -21808,7 +21808,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		checkTypeSchema := func(t string) (schemaErr bool) {
 			if idx := strings.LastIndex(t, "."); idx >= 0 {
 				argSchema := t[:idx]
-				if !o.ctx.Catalog.SchemaExists(argSchema) {
+				if !o.ctx.Catalog.SchemaExists(argSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					if s.IfExists {
 						o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", argSchema))
 					}
@@ -22483,7 +22483,7 @@ func (o *ddlOp) resolveOperatorRef(ref parser.ObjectName, otherLeft, otherRight,
 		otherLeft == ownLeft && otherRight == ownRight {
 		return 0, true
 	}
-	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
+	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if otherNsOID == 0 {
 		otherNsOID = ownNsOID
 	}
@@ -22934,9 +22934,9 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 
 			// OperatorValidateParams (operatorcmds.c): commutator/join
@@ -23076,9 +23076,9 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if schema == "" {
 			schema = "public"
 		}
-		nsOID := o.ctx.Catalog.SchemaOID(schema)
+		nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if nsOID == 0 {
-			nsOID = o.ctx.Catalog.SchemaOID("public")
+			nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// B2.2 slice 5 (doc 02d §1): the family journals as a real
@@ -23194,7 +23194,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if schemaName != "" {
-			im.RegisterSchema(schemaName)
+			im.RegisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream
 			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
@@ -23202,10 +23202,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// generic heap reload. Replaces the bespoke
 			// RecordKindCreateSchema record (M0110-0003, retired).
 			if o.ctx.Pool != nil {
-				oid := im.SchemaOID(schemaName)
-				owner := im.SchemaOwnerOID(schemaName)
+				oid := im.SchemaOID(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				owner := im.SchemaOwnerOID(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if err := syncSchemaToCatalogHeap(o.ctx, im, schemaName, oid, owner); err != nil {
-					im.UnregisterSchema(schemaName)
+					im.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}
@@ -24359,7 +24359,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
 		// ON SCHEMA was silently swallowed and never reached pg_description, so
 		// pg_dump could not re-emit it. DU-002 slice 145.
-		oid := im.SchemaOID(s.ObjName.Name)
+		oid := im.SchemaOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "3F000", Pos: s.Pos(),
 				Message: fmt.Sprintf("schema %q does not exist", s.ObjName.Name)}
@@ -24834,13 +24834,13 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 	}
 	switch s.Action {
 	case "rename":
-		if !im.SchemaExists(s.Name) {
+		if !im.SchemaExists(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
-		if im.SchemaExists(s.NewName) {
+		if im.SchemaExists(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "42P06", Pos: s.Pos(), Message: fmt.Sprintf("schema %q already exists", s.NewName)}
 		}
-		moved, err := im.RenameSchema(s.Name, s.NewName)
+		moved, err := im.RenameSchema(s.Name, s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -24848,8 +24848,8 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		// (xl_heap_update; nspname is indexed → fresh entries in BOTH
 		// indexes), replacing RecordKindAlterSchemaRename (retired).
 		if o.ctx.Pool != nil {
-			oid := im.SchemaOID(s.NewName)
-			owner := im.SchemaOwnerOID(s.NewName)
+			oid := im.SchemaOID(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			owner := im.SchemaOwnerOID(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.NewName, oid, owner); err != nil {
 				return fmt.Errorf("alter-schema-rename catalog heap: %w", err)
 			}
@@ -24895,13 +24895,13 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !im.SetSchemaOwner(s.Name, ownerOID) {
+		if !im.SetSchemaOwner(s.Name, ownerOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
 		// B1.1: journal the owner change as a pg_namespace heap UPDATE
 		// (xl_heap_update), replacing RecordKindAlterSchemaOwner (retired).
 		if o.ctx.Pool != nil {
-			oid := im.SchemaOID(s.Name)
+			oid := im.SchemaOID(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.Name, oid, ownerOID); err != nil {
 				return fmt.Errorf("alter-schema-owner catalog heap: %w", err)
 			}
@@ -25103,9 +25103,9 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
@@ -25207,9 +25207,9 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	inTypeOID := catalog.TypeNameToOID(s.ForType)
 	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
@@ -25629,9 +25629,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			rt.NamespaceOID = nsOID
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
@@ -25674,9 +25674,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			ct.NamespaceOID = nsOID
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
@@ -25730,9 +25730,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				if schema == "" {
 					schema = "public"
 				}
-				nsOID := o.ctx.Catalog.SchemaOID(schema)
+				nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if nsOID == 0 {
-					nsOID = o.ctx.Catalog.SchemaOID("public")
+					nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				}
 				ct.NamespaceOID = nsOID
 			}
@@ -25752,9 +25752,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	et.NamespaceOID = nsOID
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
@@ -26306,9 +26306,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	d.NamespaceOID = nsOID
 	// Resolve a user-defined enum base type's dynamically-allocated OID and

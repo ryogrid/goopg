@@ -93,3 +93,74 @@ func psqlScalarInDB(t *testing.T, c *cluster.Cluster, db, sqlText string) string
 	}
 	return strings.TrimSpace(res.Stdout)
 }
+
+// TestPort_SchemasArePerDatabase pins pg_namespace's per-database scope
+// (M0119-0006). goopg registered every user schema process-wide, so a CREATE
+// SCHEMA in one database showed in every other's pg_namespace, and a DROP
+// SCHEMA in one removed the other database's registry entry — after which
+// ALTER SCHEMA there failed "does not exist" while its tables lived on. Each
+// assertion is one of those measured symptoms, checked before and after a
+// restart (the startup reload must register a schema in its own database).
+func TestPort_SchemasArePerDatabase(t *testing.T) {
+	repo := repoRoot(t)
+	c, err := cluster.New("perdb_schema_scope", cluster.Options{
+		RepoRoot:     repo,
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		PSQLPath:     filepath.Join(repo, "postgres", "local_install", "bin", "psql"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("cluster.New: %v", err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	run := func(db, sql string) {
+		t.Helper()
+		if res, err := c.PSQL("-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql); err != nil || res.ExitCode != 0 {
+			t.Fatalf("%s: %s: err=%v exit=%d stderr=%s", db, sql, err, res.ExitCode, res.Stderr)
+		}
+	}
+	if err := runSQLSimple(t, c, `CREATE DATABASE userdb`); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	run("userdb", "CREATE SCHEMA only_user; CREATE SCHEMA shared_name; CREATE TABLE shared_name.t(a int); INSERT INTO shared_name.t VALUES (1)")
+	run("postgres", "CREATE SCHEMA shared_name; CREATE TABLE shared_name.t(a int); INSERT INTO shared_name.t VALUES (2), (3)")
+
+	check := func(phase string) {
+		t.Helper()
+		if got := psqlScalarInDB(t, c, "postgres", `select count(*) from pg_namespace where nspname = 'only_user'`); got != "0" {
+			t.Errorf("%s: userdb's schema visible in postgres' pg_namespace (count %s)", phase, got)
+		}
+		if got := psqlScalarInDB(t, c, "userdb", `select count(*) from pg_namespace where nspname in ('only_user', 'shared_name')`); got != "2" {
+			t.Errorf("%s: userdb's pg_namespace lists %s of its 2 schemas", phase, got)
+		}
+		a := psqlScalarInDB(t, c, "userdb", `select oid from pg_namespace where nspname = 'shared_name'`)
+		b := psqlScalarInDB(t, c, "postgres", `select oid from pg_namespace where nspname = 'shared_name'`)
+		if a == "" || a == b {
+			t.Errorf("%s: shared_name oids userdb=%q postgres=%q — two databases' schemas must be distinct", phase, a, b)
+		}
+		if got := psqlScalarInDB(t, c, "userdb", `select c.relnamespace = n.oid from pg_class c join pg_namespace n on n.nspname = 'shared_name' where c.relname = 't' and c.relkind = 'r'`); got != "t" {
+			t.Errorf("%s: userdb's shared_name.t relnamespace does not name userdb's schema (%q)", phase, got)
+		}
+	}
+	check("before restart")
+
+	// DROP SCHEMA in postgres must leave userdb's same-named schema alone.
+	run("postgres", "DROP SCHEMA shared_name CASCADE")
+	run("userdb", "ALTER SCHEMA shared_name RENAME TO renamed")
+	if got := psqlScalarInDB(t, c, "userdb", `select count(*) from renamed.t`); got != "1" {
+		t.Errorf("after drop in postgres + rename in userdb: renamed.t count = %q, want 1", got)
+	}
+	run("userdb", "ALTER SCHEMA renamed RENAME TO shared_name")
+	run("postgres", "CREATE SCHEMA shared_name; CREATE TABLE shared_name.t(a int)")
+
+	if err := c.Stop(cluster.ShutdownImmediate); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	check("after restart")
+}

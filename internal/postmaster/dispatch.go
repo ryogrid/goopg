@@ -2410,7 +2410,7 @@ func (s *Server) registerCompatNoopSchema(sql string, actingRole, sessionUser st
 	if schemaName == "" {
 		return nil
 	}
-	s.cfg.Catalog.RegisterSchema(schemaName)
+	s.cfg.Catalog.RegisterSchema(schemaName, catalog.NamespaceDBOid(s.currentDatabaseOidForCompat()))
 	// B1.1: persist via a real pg_namespace heap row (frozen-xid variant —
 	// this branch handles CREATE SCHEMA forms the parser rejects and runs
 	// without a live transaction). The parsed CompatNoopStmt path journals

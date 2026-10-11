@@ -258,7 +258,7 @@ func schemaExistsForReg(ctx *Context, schema string) bool {
 	if !ok {
 		return true
 	}
-	return im.SchemaExists(schema)
+	return im.SchemaExists(schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 }
 
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {

@@ -39,7 +39,7 @@ func TestTempNamespaceLifecycle(t *testing.T) {
 
 	// The namespace surfaces in pg_namespace as pg_temp_<id>.
 	c.mu.RLock()
-	schemas := c.allSchemasLocked()
+	schemas := c.allSchemasLocked(DefaultDBOid)
 	c.mu.RUnlock()
 	var found bool
 	for _, s := range schemas {

@@ -261,18 +261,8 @@ func ReloadUserDatabaseSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemo
 }
 
 // reloadUserSchemasFromHeapForDB scans base/<heapDBOid>/2615 and re-registers
-// each live user schema.
-//
-// NOTE on what this does NOT fix: `RegisterSchemaDuringRecovery` writes the
-// process-wide schema map, so a reloaded schema is visible from every
-// database — exactly as it already is at RUNTIME, where a CREATE SCHEMA in one
-// database is likewise visible from another. That cross-database visibility is
-// a separate, pre-existing divergence from PostgreSQL (pg_namespace is
-// per-database there) and is ledgered. This pass deliberately restores the
-// runtime behaviour rather than inventing scoping here: a schema that silently
-// disappears across a restart is closer to data loss than a schema that is
-// over-visible, and making the two paths agree is the prerequisite for scoping
-// them together later.
+// each live user schema in that database's own schema set — pg_namespace is
+// per-database, at runtime and across a restart alike (M0119-0006).
 func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type nsRow struct {
 		oid   uint32
@@ -299,16 +289,17 @@ func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory,
 	if err != nil {
 		return err
 	}
+	nsDB := catalog.NamespaceDBOid(heapDBOid)
 	for _, r := range rows {
 		ns := r.(nsRow)
 		if ns.oid < catalog.FirstUserOID || ns.name == "" {
 			continue
 		}
-		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid)
+		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid, nsDB)
 		if ns.owner != 0 {
-			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner)
+			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner, nsDB)
 		}
-		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset})
+		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset}, nsDB)
 	}
 	return nil
 }

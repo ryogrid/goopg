@@ -1696,6 +1696,22 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 		// (FILE_COPY semantics), so a WAL-less/embedded setup loses only the
 		// stream-parity record, not the file.
 		s.walLogRelmapForNewDatabase(oid)
+		// pg_namespace is per-database: the new database starts with the
+		// template's user schemas (createdb copies the template's catalogs),
+		// journalled as rows of its own pg_namespace heap the way CREATE
+		// SCHEMA writes them — before the relation copy, whose tables may
+		// live in those schemas. M0119-0006.
+		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+			for _, name := range im.CopyUserSchemas(srcOid, oid) {
+				if s.cfg.Pool == nil {
+					continue
+				}
+				if serr := executor.SyncCompatSchemaToCatalogHeap(s.cfg.Pool, im, oid, name); serr != nil {
+					s.rollbackTemplateCopy(oid)
+					return true, "", &databaseDDLError{code: errcodes.InternalError, msg: fmt.Sprintf("CREATE DATABASE: copy schema %q: %v", name, serr)}
+				}
+			}
+		}
 		if len(tmplTables) > 0 {
 			// M0122-0007 4e (last item): copy the template's relation files +
 			// register fresh catalog.Table entries under the new dbOid BEFORE

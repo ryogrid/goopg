@@ -20112,7 +20112,7 @@ func searchPathSchemas(ctx *Context) []string {
 		}
 		// User-created schemas: present if registered, even when empty.
 		if ctx != nil && ctx.Catalog != nil {
-			if ctx.Catalog.SchemaExists(s) {
+			if ctx.Catalog.SchemaExists(s, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 				out = append(out, s)
 			}
 		}

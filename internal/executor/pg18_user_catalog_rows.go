@@ -493,7 +493,7 @@ func relamFor(relkind string) int64 {
 // buildUserPGClassRow constructs a 34-column PG18-canonical pg_class row for
 // a user-defined table. Mirrors initdb.pgClassRow's per-column ordering and
 // default values.
-func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
+func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table, dbOid ...uint32) Row {
 	relkind := "r"
 	if tbl.IsSequence {
 		relkind = "S" // sequence (B1.3b: sequences get real pg_class rows)
@@ -573,40 +573,40 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	// gap into `index "…" contains corrupted page at block 0` (blocker #12).
 	// See pgClassRelhasindex for why it is not simply `len(indexes) > 0`.
 	return Row{
-		NewIntDatum(int64(tbl.OID)),                                // oid
-		NewStringDatum(tbl.Name),                                   // relname (name)
-		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema))), // relnamespace
-		NewIntDatum(0),                                             // reltype (no composite type seeded yet)
-		NewIntDatum(int64(tbl.OfTypeOID)),                          // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-		NewIntDatum(bootstrapSuperuserOID),                         // relowner
-		NewIntDatum(relamFor(relkind)),                             // relam (0 for sequences/views — relcache.c:1841 asserts it)
-		NewIntDatum(relfilenode),                                   // relfilenode
-		NewIntDatum(int64(tbl.Tablespace)),                         // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
-		NewIntDatum(0),                                             // relpages
-		NewIntDatum(0),                                             // reltuples (float4 here; stored 0 == 0.0)
-		NewIntDatum(0),                                             // relallvisible
-		NewIntDatum(0),                                             // relallfrozen
-		NewIntDatum(0),                                             // reltoastrelid
-		NewBoolDatum(pgClassRelhasindex(cat, tbl)),                 // relhasindex (M0130-S11.6 — see the note above)
-		NewBoolDatum(false),                                        // relisshared
-		NewStringDatum(relpersistence),                             // relpersistence
-		NewStringDatum(relkind),                                    // relkind
-		NewIntDatum(int64(len(tbl.Columns))),                       // relnatts
-		NewIntDatum(0),                                             // relchecks
-		NewBoolDatum(tbl.RuleIsCanonical),                          // relhasrules (M0123-S3: true iff a canonical pg_node_tree ev_action was written)
-		NewBoolDatum(false),                                        // relhastriggers
-		NewBoolDatum(false),                                        // relhassubclass
-		NewBoolDatum(tbl.RowSecurity),                              // relrowsecurity (DU-002 slice 322)
-		NewBoolDatum(tbl.ForceRowSecurity),                         // relforcerowsecurity (DU-002 slice 322)
-		NewBoolDatum(!tbl.IsMatView || tbl.IsPopulated),            // relispopulated (02e item A: faithful for matviews; true for all else)
-		NewStringDatum(replIdent),                                  // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
-		NewBoolDatum(isPartition),                                  // relispartition
-		NewIntDatum(0),                                             // relrewrite
-		NewIntDatum(minFrozenXID),                                  // relfrozenxid
-		NewIntDatum(minFrozenMXID),                                 // relminmxid
-		NewStringDatum("{}"),                                       // relacl (encoded as empty aclitem[] ArrayType)
-		reloptionsDatum,                                            // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
-		NewStringDatum(relpartbound),                               // relpartbound (FOR VALUES … for partition children)
+		NewIntDatum(int64(tbl.OID)), // oid
+		NewStringDatum(tbl.Name),    // relname (name)
+		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema, dbOid...))), // relnamespace
+		NewIntDatum(0),                                  // reltype (no composite type seeded yet)
+		NewIntDatum(int64(tbl.OfTypeOID)),               // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
+		NewIntDatum(bootstrapSuperuserOID),              // relowner
+		NewIntDatum(relamFor(relkind)),                  // relam (0 for sequences/views — relcache.c:1841 asserts it)
+		NewIntDatum(relfilenode),                        // relfilenode
+		NewIntDatum(int64(tbl.Tablespace)),              // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
+		NewIntDatum(0),                                  // relpages
+		NewIntDatum(0),                                  // reltuples (float4 here; stored 0 == 0.0)
+		NewIntDatum(0),                                  // relallvisible
+		NewIntDatum(0),                                  // relallfrozen
+		NewIntDatum(0),                                  // reltoastrelid
+		NewBoolDatum(pgClassRelhasindex(cat, tbl)),      // relhasindex (M0130-S11.6 — see the note above)
+		NewBoolDatum(false),                             // relisshared
+		NewStringDatum(relpersistence),                  // relpersistence
+		NewStringDatum(relkind),                         // relkind
+		NewIntDatum(int64(len(tbl.Columns))),            // relnatts
+		NewIntDatum(0),                                  // relchecks
+		NewBoolDatum(tbl.RuleIsCanonical),               // relhasrules (M0123-S3: true iff a canonical pg_node_tree ev_action was written)
+		NewBoolDatum(false),                             // relhastriggers
+		NewBoolDatum(false),                             // relhassubclass
+		NewBoolDatum(tbl.RowSecurity),                   // relrowsecurity (DU-002 slice 322)
+		NewBoolDatum(tbl.ForceRowSecurity),              // relforcerowsecurity (DU-002 slice 322)
+		NewBoolDatum(!tbl.IsMatView || tbl.IsPopulated), // relispopulated (02e item A: faithful for matviews; true for all else)
+		NewStringDatum(replIdent),                       // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
+		NewBoolDatum(isPartition),                       // relispartition
+		NewIntDatum(0),                                  // relrewrite
+		NewIntDatum(minFrozenXID),                       // relfrozenxid
+		NewIntDatum(minFrozenMXID),                      // relminmxid
+		NewStringDatum("{}"),                            // relacl (encoded as empty aclitem[] ArrayType)
+		reloptionsDatum,                                 // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
+		NewStringDatum(relpartbound),                    // relpartbound (FOR VALUES … for partition children)
 	}
 }
 
@@ -692,7 +692,7 @@ func indexRelamOID(idx *catalog.Index) int64 {
 
 // buildUserPGClassRowForIndex constructs the 34-column PG18-canonical
 // pg_class row for a user-defined index.
-func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
+func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index, dbOid ...uint32) Row {
 	natts := int64(len(idx.Columns))
 	// reloptions: shared builder with catalog.go's live VirtualRows pg_class
 	// path (catalog.IndexReloptionsElements) so an index's storage parameters
@@ -707,7 +707,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	return Row{
 		NewIntDatum(int64(idx.OID)),
 		NewStringDatum(idx.Name),
-		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema))),
+		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema, dbOid...))),
 		NewIntDatum(0),                        // reltype
 		NewIntDatum(0),                        // reloftype
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
