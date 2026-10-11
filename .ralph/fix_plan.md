@@ -3663,7 +3663,38 @@ the whole file's active task between 2026-09-01 and 2026-09-14; **since
 Priority` banner at the head of this file currently says (item 10 tail as of
 2026-09-24).**
 
-- [ ] **M0119-0006 — pg_amcheck server tier**.
+- [!] **M0119-0006 — pg_amcheck server tier**.
+  - **ESCALATION 2026\-10\-12 \(lineage budget, Rule A\)\.** The last five
+    completed descendants \(template1 namespace collision, current\_database
+    in template1, template1 extension restart, per\-database schemas,
+    creation\-namespace 3F000\) all carry `Movement: none`, so the root is
+    parked `[!]` until the owner re\-opens it \(`LINEAGE\-BASELINE:
+    M0119\-0006 ...`\)\.
+    - What was attempted: per\-database catalog scoping and DDL namespace
+      validation found while making pg\_amcheck / pg\_dump work across
+      databases — each closed a measured cross\-database leak or a lax DDL
+      path, verified against PG 18\.3 probes\.
+    - What each step proved: the family is catalog correctness with no TPC
+      instrument; `Movement: none` is structural\.
+    - Remaining blocker: the lineage rule itself\. Owner call: re\-baseline
+      or close the family\.
+    - Expected movement if unblocked: none on match / CATEGORIES /
+      ea\-ratchet; gains show in regress \(namespace, create\_schema,
+      alter\_generic\) and pg\_dump round\-trips\.
+    - Remaining size — open child already filed: the one\-object DROP CASCADE
+      NOTICE wording\. **Not filed** \(guard\-refused; recorded in the
+      2026\-10\-12 ledger rows\):
+      - `CREATE TABLE pg\_catalog\.x` is accepted; PG raises 42501
+        \(heap\_create, allow\_system\_table\_mods\)\.
+      - the schema registry folds names to lower case: `"Mixed"` renders as
+        `mixed` and collides with `mixed`\.
+      - NOTICEs carry SQLSTATE 00000 \(PG: 42P06 / 42P07 on "already
+        exists, skipping"\)\.
+      - unqualified CREATE with no existing schema on search\_path is not
+        checked \(PG 3F000 "no schema has been selected to create in"\)\.
+      - bootstrap schemas are shared across databases \(DROP SCHEMA public
+        affects all\); GRANT ON SCHEMA / pg\_proc pronamespace lookups are
+        unscoped\.
   - 2026-09-19 (bq): repaired two regressions that had every ported
     `TestPort_PgAmcheck*` skipping on an unclean healthy baseline.
     - `verify_heapam`/`pg_get_sequence_data`/`pg_sequence_parameters` reported
@@ -3996,7 +4027,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       filters on `datallowconn`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
       acceptance arm 24/24; pgbench smoke (the connection path is exactly
       what it exercises).
-- [ ] **CREATE TABLE in a nonexistent schema succeeds** \(found 2026\-10\-12
+- [x] **CREATE TABLE in a nonexistent schema succeeds** \(found 2026\-10\-12
   by the per\-database schema probe\)\. `CREATE TABLE nosuch.t\(a int\)`
   returns CREATE TABLE and stamps `relnamespace` 2200 \(public\); PG 18\.3
   raises 3F000 `schema "nosuch" does not exist` \(namespace\.c
@@ -4007,6 +4038,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     execCreateTable and the other CREATE paths \(view, sequence, index
     target\) before registering; run regress A/B, since tests may rely on
     the lax path\.
+  Movement: none — DDL namespace validation; no TPC query creates objects
+  - **DONE 2026\-10\-12 \(`c0dcb29f7`\)\.** Every creation kind was lax
+    \(table/TEMP/IF NOT EXISTS, CTAS, SELECT INTO, view, sequence, matview,
+    type, domain, function, procedure, ALTER TABLE SET SCHEMA\); one
+    `ddlOp\.checkCreationNamespace` before dispatch raises 3F000, SET SCHEMA
+    after the relation lookup\.
+    - The check exposed that `CREATE SCHEMA "quoted"` never registered the
+      schema; the compat scanner now keeps quoted names and parses IF NOT
+      EXISTS \(it registered a schema named `if`\); duplicates raise 42P06
+      or the IF NOT EXISTS NOTICE\.
+    - Tests `TestCreateInMissingSchemaRaises3F000`,
+      `TestCreateSchemaQuotedIfNotExistsDuplicate`; goldens \(4 MOVE lines\)\.
+    - Regress A/B 20 cases: namespace \+5 lines \(42P06 now cascades where
+      PG fails the first CREATE SCHEMA on its unexecuted sub\-element,
+      M0134\-0009\), alter\_generic \+1 match, rest identical/noise\.
+    - Gates: units, executor/parser/postmaster, schema/pg\_dump/amcheck
+      testport, tpch\-spotcheck, acceptance arm, sf025 PASS=99\.
 - [ ] **a one\-object DROP ... CASCADE NOTICE uses the multi\-object form**
   \(found 2026\-10\-12\)\. goopg prints `drop cascades to 1 other objects`
   plus a DETAIL; PG prints `NOTICE: drop cascades to table sa.t` with no
