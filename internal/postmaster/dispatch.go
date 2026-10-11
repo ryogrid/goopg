@@ -832,14 +832,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
 			if prepStmts != nil && ps.Name != "" && ps.Query != nil {
-				// Validate declared parameter types.
-				for _, pt := range ps.ParamTypes {
-					if !isValidSQLTypeName(pt) {
-						return s.writeQueryError(w, "42704",
-							fmt.Sprintf("type %q does not exist", pt))
+				// Resolve the declared parameter types (typenameTypeId): a
+				// schema qualifier is checked and resolved away, user and
+				// table row types are accepted. M0122-0015c.
+				var declared []string
+				if ps.ParamTypes != nil {
+					declared = make([]string, len(ps.ParamTypes))
+					for k, pt := range ps.ParamTypes {
+						resolved, rerr := executor.ResolvePrepareParamType(ectx, pt, isValidSQLTypeName)
+						if rerr != nil {
+							return s.writeQueryError(w, errcodes.Code(rerr.Code), rerr.Message)
+						}
+						declared[k] = resolved
 					}
 				}
-				if ok := prepStmts.Store(ps.Name, ps.Query, stmtSQL(sql, stmts, i), ps.ParamTypes); !ok {
+				if ok := prepStmts.Store(ps.Name, ps.Query, stmtSQL(sql, stmts, i), declared); !ok {
 					return s.writeQueryError(w, "42P05",
 						fmt.Sprintf("prepared statement %q already exists", ps.Name))
 				}
@@ -858,7 +865,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						}
 					}
 					// Infer parameter types from comparison contexts.
-					inferred := inferParamTypesFromStmt(ps.Query, ectx.Catalog, ps.ParamTypes)
+					inferred := inferParamTypesFromStmt(ps.Query, ectx.Catalog, declared)
 					if inferred != nil {
 						prepStmts.SetParamTypes(ps.Name, inferred)
 					}
