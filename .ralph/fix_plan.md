@@ -2890,7 +2890,7 @@ heuristic stays live.)
     ReadWriteUnique4 above \(SERIALIZABLE bitmap scans held no SIREAD\); PASSes
     standalone and in the isolation family with that fix\.
   Movement: none — correctness fix; no plan instrument
-- [ ] **testport/TestE2E_PGStandbyFullCycle** — testport TestE2E\_PGStandbyFullCycle FAILed
+- [x] **testport/TestE2E_PGStandbyFullCycle** — testport TestE2E\_PGStandbyFullCycle FAILed
   (AI-20261012-033252-001; repro: `go test -v -run '^TestE2E_PGStandbyFullCycle$' ./internal/testport/`,
   evidence `ci/logs/20261012-033252/testport/go-test.log`).
   Kind: impl
@@ -2905,6 +2905,19 @@ heuristic stays live.)
   - First step: register `log\_min\_messages` / `log\_error\_verbosity`
     \(guc\_tables\.c enums\), or check whether PG\'s own start would warn
     rather than fail on an unknown auto\.conf entry\.
+  - **DONE 2026\-10\-12 \(`a5a86654a`\)\.** PG\'s start fails on an unknown config name too
+    \(ProcessConfigFileInternal\), so the gap was the two missing GUCs: both
+    registered with guc\_tables\.c\'s options; new `Variable\.EnumHidden`
+    models hidden enum rows \(debug → debug2; client\_min\_messages info\)\.
+    Second cause: the copied auto file names the OLD primary and overrides
+    postgresql\.conf, so the test helper now appends the standby settings
+    to postgresql\.auto\.conf as pg\_basebackup \-R does\.
+    - Tests: TestE2E\_PGStandbyFullCycle and all 31 TestE2E\_\* PASS;
+      `TestMessageLevelGUCs`\.
+    - Gates: units, internal/postmaster, regress guc/sysviews unchanged,
+      tpch\-spotcheck, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/m\-nightly\-standby\-auto\-conf\-message\-level\-gucs\.md`\.
+  Movement: none — test\-harness / GUC registry; no plan instrument
 - [x] **testport/TestPort_IsolationAlterTable1** — testport TestPort\_IsolationAlterTable1 FAILed
   (AI-20261007-014030-001; repro: `go test -v -run '^TestPort_IsolationAlterTable1$' ./internal/testport/`,
   evidence `ci/logs/20261007-014030/testport/go-test.log`).
