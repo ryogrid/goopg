@@ -3929,10 +3929,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     §5, §7), template1 gets a heap of its own and this symptom goes with it.
     Re-test then rather than attempting it separately.
 
-- [ ] **schemas are registered process-wide, not per database** (measured
+- [x] **schemas are registered process-wide, not per database** (measured
   2026-09-22 while fixing the bw slice).
   Kind: bug
   Parent: M0119-0006
+  Movement: none — catalog scoping; no TPC query creates a schema
+  - **DONE 2026\-10\-12 \(`4ddeb6491`\)\.** Unblocked by the template1 Option A fix
+    \(`fba181f95`\)\. The probe showed more than over\-visibility: the same
+    name shared one OID across databases, and `DROP SCHEMA` in one database
+    removed the other\'s registry entry \(its `ALTER SCHEMA` then failed
+    "does not exist" while its tables lived on\)\.
+    - User schemas moved into each database\'s `tableNamespace`; bootstrap
+      schemas stay shared; owners and heap TIDs are per database\. Schema
+      methods take the trailing dbOid \(unscoped lookups keep the
+      any\-database answer\); executor, planner wrapper, pg\_namespace
+      rows, restart reload, CREATE DATABASE TEMPLATE and DROP DATABASE
+      follow\.
+    - Tests `TestSchemasArePerDatabase`, `TestPort\_SchemasArePerDatabase`
+      \(fails on HEAD three ways, passes now\)\.
+    - Gates: units, catalog/initdb/executor/postmaster, schema/amcheck/
+      pg\_dump/template testport, regress A/B 7 cases byte\-identical,
+      tpch\-spotcheck, acceptance arm, sf025 PASS=99\.
+    - Design `docs/design/0100\-0149/0119\-0006\-per\-database\-schemas\.md`\.
   - Repro: `CREATE SCHEMA scoped_probe` while connected to a
     `CREATE DATABASE`d database, then
     `select nspname from pg_namespace where nspname='scoped_probe'` from
@@ -3978,6 +3996,26 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       filters on `datallowconn`); tpch-spotcheck Q12=2/Q13=33; tpcds-sf025;
       acceptance arm 24/24; pgbench smoke (the connection path is exactly
       what it exercises).
+- [ ] **CREATE TABLE in a nonexistent schema succeeds** \(found 2026\-10\-12
+  by the per\-database schema probe\)\. `CREATE TABLE nosuch.t\(a int\)`
+  returns CREATE TABLE and stamps `relnamespace` 2200 \(public\); PG 18\.3
+  raises 3F000 `schema "nosuch" does not exist` \(namespace\.c
+  RangeVarGetCreationNamespace → get\_namespace\_oid\)\.
+  Kind: bug
+  Parent: M0119-0006
+  - First step: check the schema with `SchemaExists\(name, db\)` in
+    execCreateTable and the other CREATE paths \(view, sequence, index
+    target\) before registering; run regress A/B, since tests may rely on
+    the lax path\.
+- [ ] **a one\-object DROP ... CASCADE NOTICE uses the multi\-object form**
+  \(found 2026\-10\-12\)\. goopg prints `drop cascades to 1 other objects`
+  plus a DETAIL; PG prints `NOTICE: drop cascades to table sa.t` with no
+  DETAIL when exactly one object is reported \(dependency\.c
+  reportDependentObjects, numReportedClient == 1\)\.
+  Kind: bug
+  Parent: M0119-0006
+  - First step: find the cascade NOTICE builder in operators\_ddl\.go and
+    add the single\-object form\.
 
 - [x] **current_database() reports "postgres" when connected to template1** —
   **FIXED 2026-09-22.** The filed question was routing-vs-reporting; the
