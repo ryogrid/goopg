@@ -27,9 +27,10 @@ when the candidate:
           `Movement: none`, which is what the guard already assumes; nor a
           field on a baseline task that USED to declare it readably (the owner
           reshaping an existing entry is not the loop gaming it).
-      (2) claim `Movement: yes` without citing one of S3's three instruments on
-          the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`, or
-          `ea-ratchet` — together with a number. A non-conforming
+      (2) claim `Movement: yes` without citing one of S3's instruments on
+          the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`,
+          `ea-ratchet`, or a `regress` suite diff count — together with a
+          number. A non-conforming
           `Movement: yes` is additionally TREATED AS `none` for Rule A, so it
           cannot reset the lineage budget (three such lines in HEAD did).
       Only lines that are new in the candidate are reported, so pre-existing
@@ -108,10 +109,13 @@ PARENT_INLINE_RE = re.compile(r"(?:^|\s)Parent:\s*`?([^\s`]+)`?")
 MOVE_INLINE_RE = re.compile(r"(?:^|\s)Movement:\s*(\S+)")
 NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-5])|P0-)")
 # Rule D: `Movement: yes` must cite an instrument with a number on the SAME
-# line — a `match` count (this also covers CATEGORIES-EXCL-MATCH) or
-# `ea-ratchet`.
+# line — a `match` count (this also covers CATEGORIES-EXCL-MATCH),
+# `ea-ratchet`, or a `regress` diff count (owner decision 2026-10-12:
+# regress-suite diff lines are a real measured instrument — correctness
+# families whose work moves only regress diffs were tripping Rule A as
+# structural `none`s).
 MOVE_YES_RE = re.compile(r"(?:^|\s)Movement:\s*yes", re.I)
-INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b", re.I)
+INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b", re.I)
 NUMBER_RE = re.compile(r"[0-9]")
 
 
@@ -370,9 +374,10 @@ def check(baseline, candidate):
                 continue
             errs.append(
                 f"[D] task {t.id} (line {n}) claims `Movement: yes` without citing an "
-                f"instrument on the same line. `Movement: yes` must name one of S3's three "
+                f"instrument on the same line. `Movement: yes` must name one of S3's "
                 f"instruments WITH a number: a `match` count change, `CATEGORIES-EXCL-MATCH`, "
-                f"or `ea-ratchet` (e.g. `Movement: yes — match 539 -> 530`). Until then it "
+                f"`ea-ratchet`, or a `regress` suite diff count "
+                f"(e.g. `Movement: yes — match 539 -> 530`). Until then it "
                 f"counts as `Movement: none` and does NOT reset the lineage budget. Line: "
                 f"{ln.strip()[:120]}")
         for n, ln, field in t.midline_lines:

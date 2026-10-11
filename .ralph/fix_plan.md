@@ -91,11 +91,14 @@ banner at the next `## ` line).
    **M0143-0011** and **M0146-0039, 0041, 0040, 0034, 0032, 0033** are
    all `[x]`; **M0146-0035** is parked `[!]` on non-reproduction.
    The third batch drained 2026-10-04/05: **M0146-0047, 0048, 0044,
-   0045, 0046, 0043** are all `[x]`. **Live members (owner decision
-   2026-10-06 — fourth S2 batch; see OWNER DECISIONS 2026-10-06):
-   M0146-0056 → M0146-0058 → M0146-0050 → M0146-0059 → M0146-0062 →
-   M0146-0051 → M0146-0052 → M0146-0053 → M0146-0054 → M0146-0055 →
-   M0146-0047b**, in that order. The three isolation
+   0045, 0046, 0043** are all `[x]`. The fourth batch drained
+   2026-10-07/10: **M0146-0056, 0058, 0050, 0059, 0062, 0051, 0052,
+   0053, 0054, 0047b** are all `[x]`, and **M0146-0055** closed `[x]`
+   under OWNER DECISIONS 2026-10-12 (its open descendants — 0084/0085/
+   0086 and the three S2 findings its escalation held — inherit item
+   2a's rank through it). **Live members (owner decision 2026-10-12 —
+   fifth S2 batch; see OWNER DECISIONS 2026-10-12): M0146-0155 →
+   M0146-0089 → M0146-0126 → M0146-0125**, in that order. The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump; the tuplelock-upgrade reopen keeps M-NIGHTLY order on the
@@ -179,8 +182,11 @@ banner at the next `## ` line).
    below** — its live children are 0049e, 0049f and the probe-cost
    finding the budget kept unfiled. **M0146-0068 (the B8
    `indexProbeCostMultiplier` corpus A/B) is first among new item-3
-   work** — it gates M0145-0008ag, M0146-0009p and M0146-0060
-   (0060's other blocker is M0146-0061, normal order).
+   work** — it gated M0145-0008ag, M0146-0009p and M0146-0060.
+   **Resolved 2026-10-12 (OWNER DECISIONS): Option A — retire the
+   multiplier.** The retirement impl is first among new item-3 work;
+   it unblocks M0145-0008ag → 0009p/0060 (0060's other blocker 0061 has
+   landed). The probe-runtime residual is M0146-0088's ledgered ~1.9x.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -217,7 +223,7 @@ milestone they name**, M-NIGHTLY included.
 entry ends with exactly one `Movement:` line in one of these forms:
 `Movement: yes — <instrument> <before>→<after>` (instrument = the metric
 that moved, e.g. `TPCH match 10→11`, `SF0.25 text-identical 25→26`,
-`ea-ratchet 10→9`), or `Movement: none — <one-line reason>` (`recon`,
+`ea-ratchet 10→9`, `regress join 14868→14730`), or `Movement: none — <one-line reason>` (`recon`,
 `test-only`, `instrument artefact — <why invisible>`, `parity held`,
 `correctness fix — no plan instrument`). Instrument-artefact `none`s name
 why the instruments cannot see the change (the LINEAGE-BASELINE pins show
@@ -293,6 +299,35 @@ open), Q95 unreachable until M0145-0008ac's pull-up (landed
 2026-10-03, `c317b037b`). Not a root exemption: post-pin completions
 accumulate a fresh budget. Re-opening the root lets the unfiled
 probe-cost finding it names land as a child.)
+
+LINEAGE-BASELINE: M0146-0005 M0146-0111 M0146-0112 M0146-0113 M0146-0114 M0146-0115
+(owner pin 2026-10-12, delegated — resolves the 2026-10-09 second S4
+exhaustion on this root. The five are regress-fidelity slices
+(constant-FALSE/dummy-rel pruning, DISTINCT-over-pinned-keys, correlated
+min/max, self-join removal) — real PG-fidelity ports whose only measured
+effect is regress diff counts, which were not a recognised Movement
+instrument until today. Not a root exemption: later completions
+accumulate a fresh budget. Unholds the text-identity campaign
+M0146-0042 and M0146-0067, which the loop had parked as proxies.)
+
+LINEAGE-BASELINE: M0146-0007 M0146-0119 M0146-0123 M0146-0124 M0146-0129 M0146-0145
+(owner pin 2026-10-12, delegated — resolves the 2026-10-10 second hold
+on this root. Same instrument-artefact class: five regress-witnessed
+inline_cte/pull-up fidelity slices. The 2026-10-06 reopen was spent as
+designed — post-pin completions accumulate a fresh budget. If the next
+five are again all regress-only `none`, the family should yield rather
+than re-pin; with `regress` now a Movement instrument, honest movement
+lines should keep this from recurring.)
+
+LINEAGE-BASELINE: M0146-0055 M0146-0076 M0146-0077 M0146-0080 M0146-0081 M0146-0082
+(owner pin 2026-10-12, delegated — resolves the loop-#130 S4 exhaustion
+on this self-rooted trigger/COPY family. The five are trigger/PLpgSQL
+correctness fixes with no TPC witness — `Movement: none` is structural
+there. Pinning empties the window so the escalation's three held S2
+findings (partition trigger clones, `regclass IN (SELECT …)`, trigger
+durability) can file, and open children 0084/0085/0086 proceed under
+inherited item-2a rank. Not an exemption: later completions accumulate
+a fresh budget.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -702,6 +737,73 @@ OWNER DECISIONS 2026-10-06 (delegated; details in each task's entry):
   filing, no placement needed. M0146-0063 (visibility-map persistence)
   is filed and selectable — it guards the 2026-10-02 corpus-vacuum
   work against unclean stops.
+
+OWNER DECISIONS 2026-10-12 (delegated; details in each task's entry):
+
+- **M0146-0068 result → Option A: retire `GOOPG_INDEX_PROBE_MULT`.**
+  This is a NEW owner decision, not execution of the 2026-10-06
+  pre-authorisation — its gate ("no witness regresses >10% wall-clock")
+  FAILED on the measured table (Q17 ~x1.56, Q71 ~x1.27, Q54 ~x2.22 in
+  the reported probes). Option A is still the call: +13 plan matches is
+  the goal this plan exists to serve, the slowdowns are executor-cost
+  masking the wrong planner price (the ledgered ~1.9x probe residual,
+  M0146-0088, is the honest owner of that), and Q54's cited cause
+  (0049e's Parallel Seq Scan outer) has since landed `[x]` — re-measure
+  it during the retirement A/B rather than trusting the stale
+  attribution. The retirement impl task is first among new item-3 work
+  (banner item 3): remove the env knob and the `*2` applications under
+  `internal/optimizer` (`costindex.go` + `cost_funcs.go`), retire the
+  flag via the `flagProvenanceRetired` pattern in `flaglabels.go`, and
+  update the affected tests — with the standard corpus A/B at both
+  scales as evidence. This frees the M0145-0008ag → M0146-0009p /
+  M0146-0060 chain it gated.
+- **M0146-0005 second exhaustion: re-pinned** (LINEAGE-BASELINE
+  0111–0115 — exactly the five; the non-pinned window then leads with
+  0106's `Movement: yes`). The five are the same instrument-artefact
+  class adjudicated 2026-10-03: regress-witnessed PG-fidelity ports.
+  The proxy holds on **M0146-0042** and **M0146-0067** are lifted
+  (`[!]`→`[ ]`) — the text-identity campaign resumes.
+- **M0146-0007 second hold: re-opened + pinned** (LINEAGE-BASELINE
+  0119/0123/0124/0129/0145). Standing note on its entry: a third spend
+  yields to lower items rather than re-pinning.
+- **M0146-0055: closed `[x]` + pinned** (LINEAGE-BASELINE
+  0076/0077/0080/0081/0082) so its three held S2 findings and the open
+  0084/0085/0086 proceed — they inherit item-2a rank.
+- **Fifth S2 batch into item 2a:** `M0146-0155 → M0146-0089 →
+  M0146-0126 → M0146-0125` — function `SET` clauses never applied
+  (search_path correctness, found by the 0122-0008 probe), uncommitted
+  CREATE TABLE surviving restart, mixed integer/numeric COALESCE
+  picking the wrong type, and `||` treating NULL arrays as NULL instead
+  of empty. M0146-0084/0085/0086 are not independently placed — they
+  inherit rank via the M0146-0055 pin above.
+- **M0119-0006 and M0122-0008 stay parked `[!]`.** Their children are
+  old-format entries with no task id — the guard parses title fragments
+  as pseudo-ids (`SET`, `current_database()`, "`pg_database.datacl`"),
+  so a LINEAGE-BASELINE against them is ambiguous or impossible
+  (punctuation is normalised away; `SET` matches only the first
+  occurrence). Re-baselining would either no-op or silently pin the
+  wrong tasks. The escalations' "not filed" residues were reviewed and
+  stay ledgered deliberately; if any one is worth doing it can be
+  filed `Parent: none` with a real id and placed — the S2-class
+  `to_char`/TimeZone one under M0122-0008 is the strongest candidate,
+  deferred to a later report rather than filed now.
+- **GEQO-RNG residual: waived, recorded.** The two Q64 first-divergence
+  records are exact probe ties broken by PostgreSQL's GEQO random
+  stream — no deterministic instrument can see them. Named-waived
+  residual, not an impl task; it satisfies "no unnamed first-divergence
+  records".
+- **Harness: `regress` is now a fourth Movement instrument.** Rule D /
+  INSTRUMENT_RE / its error text, `scripts/ralph-lineage-guard-test.py`
+  cases, this file's `Movement:` paragraph, and AGENT.md §S3 updated
+  together. Rationale: this period's dominant S4-exhaustion class was
+  correctness families whose only measured movement is regress diff
+  counts (0111–0115, 0119/0123/0124/0129/0145, 0076–0082 all cite them).
+  `regress` requires a number like every other instrument.
+- **Noted, not actioned:** M0141-S2a-fix2r's children 0152/0153/0154
+  cite `Parent: M0141-S2a-fix2r-c` — an id that does not exist — so
+  they silently self-root (and inherit no item-2a rank). No owner ask
+  was pending on them; a `Parent:`-dangling warning is a candidate
+  Rule-D-style hardening for a future harness pass.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -3695,6 +3797,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - bootstrap schemas are shared across databases \(DROP SCHEMA public
         affects all\); GRANT ON SCHEMA / pg\_proc pronamespace lookups are
         unscoped\.
+    - **RESOLVED 2026\-10\-12 \(owner, delegated\): the hold STANDS — this
+      family stays parked `[!]`.** Its children are old\-format entries
+      without task ids; the guard parses title fragments as pseudo\-ids
+      \(`current\_database\(\)`, `` `pg\_database\.datacl` ``\), which
+      punctuation\-normalising pins cannot name safely\. The not\-filed
+      residues above stay ledgered deliberately; anything worth doing can
+      be re\-filed `Parent: none` with a real id and owner\-placed\.
   - 2026-09-19 (bq): repaired two regressions that had every ported
     `TestPort_PgAmcheck*` skipping on an unclean healthy baseline.
     - `verify_heapam`/`pg_get_sequence_data`/`pg_sequence_parameters` reported
@@ -4206,6 +4315,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - The S2 wrong\-results defect this probe also found \(function SET
       clauses never applied\) is filed as M0146\-0155 with `Parent: none`
       for owner placement\.
+    - **RESOLVED 2026\-10\-12 \(owner, delegated\): the hold STANDS — this
+      family stays parked `[!]`.** Same old\-format problem as M0119\-0006:
+      its children\'s parsed ids are title fragments \(`ALTER`, `SET` …\)
+      and `SET` is ambiguous under first\-occurrence matching, so a
+      LINEAGE\-BASELINE here would be fragile\. The not\-filed residues
+      stay ledgered; re\-file `Parent: none` if one is worth doing\. Its
+      S2 finding M0146\-0155 was owner\-placed into item 2a today\.
   - 2026\-09\-24 \(ralph2 loop \#48\): **the `ssl\*` GUC family, as the
     oracle's no\-SSL build defines it** \(`0853825e4`\).
     Movement: none — GUC registry conformance; no planner path touched.
@@ -22940,6 +23056,11 @@ M0146-0001 re-baseline census on the new default arm.
   > \(the five are the instrument\-artefact class, as adjudicated
   > 2026\-10\-03\), or decide M0146\-0068 first\. Until then the loop selects
   > elsewhere in item 3, starting with M0146\-0007\'s ledgered residue\.
+  > **RESOLVED 2026\-10\-12 \(owner, delegated\):** re\-pinned \(LINEAGE\-BASELINE
+  > M0146\-0005 M0146\-0111–0115 — exactly the five; the non\-pinned window
+  > then leads with 0106's `Movement: yes`\) and M0146\-0068 decided
+  > Option A in the same decision block\. The M0146\-0042 / M0146\-0067
+  > proxy holds lift with it\.
   Kind: impl
   Parent: none
   - **Slice 112 \(routing, 2026\-10\-02, HEAD `c96a5d2f9`\)\.** Q42, Q52, Q37
@@ -26214,7 +26335,7 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
       set, ea\-ratchet, regress A/B\.
     - Design `docs/design/0100\-0149/m0146\-0006\-incremental\-sort\-election\.md`\.
   Movement: none — fire set flat; regress aggregates moved both ways
-- [!] **M0146-0007 — `inline_cte` single-reference CTE inlining**
+- [ ] **M0146-0007 — `inline_cte` single-reference CTE inlining**
   (impl). Port PG's `inline_cte` (prepjointree.c): a single-ref,
   non-recursive CTE is inlined into the jointree so its quals and
   statistics reach the search — divergence class D6. Operates on the
@@ -26287,6 +26408,14 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
   > - **Size:** one loop per residue item\.
   >
   > Owner: reopen \(or re\-pin a LINEAGE\-BASELINE\) to continue regress fidelity here, or leave it held\.
+
+  **RESOLVED 2026-10-12 (owner, delegated — second hold): re-opened
+  `[!]`→`[ ]` plus a LINEAGE-BASELINE pin of 0119/0123/0124/0129/0145.**
+  Same instrument-artefact class as the 10-06 reopen — regress-witnessed
+  fidelity slices whose only instrument is now a recognised one
+  (`regress`, added today). Standing note for the next spend: if the
+  post-pin five are again all regress-only `none`, the family yields to
+  lower items rather than re-pinning a third time.
 
 - [x] **M0146\-0007a — inline a single\-reference CTE in place** \(slice 1\).
   Kind: impl
@@ -28184,7 +28313,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   "no unnamed first-divergence records" is the acceptance bar.
   Kind: recon
   Parent: none
-- [!] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
+- [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
   first-divergence census toward zero: every remaining EXPLAIN text
@@ -28200,6 +28329,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   Kind: impl
   Parent: M0146-0005
   - **Held `\[\!\]` 2026\-10\-09** by the S4 lineage escalation in M0146\-0005 \(its last five completed descendants, 0111–0115, all carry `Movement: none`\)\. Only the owner reopens it\.
+  - **RE-OPENED 2026\-10\-12 \(owner, delegated\):** M0146\-0005's pin
+    \(LINEAGE\-BASELINE 0111–0115\) resolves the exhaustion this hold
+    proxied\.
   - Slice 2026\-10\-05 \(`fb26f7dc6`\): varchar join keys print their
     RelabelType to text in Hash/Merge Cond, as the Join Filter already did;
     TPC\-DS Q47/Q57 text\-identical at both scales \(SF0\.25 35 → 37, SF1
@@ -29204,7 +29336,7 @@ Movement: none — instrument artefact — executor concat correctness, no plan 
       `parted\_si` now loads\.
     - Filed M0146\-0075 \(MERGE INSERT leaves omitted defaults NULL\)\.
 Movement: none — instrument artefact — wrong\-results fix with no TPC witness; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [!] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
+- [x] **M0146\-0055 — WRONG RESULTS: COPY FROM fires no BEFORE ROW
   triggers** \(filed 2026\-10\-04 by M0146\-0009h\)\. A BEFORE INSERT FOR EACH
   ROW trigger that sets `new\.b := new\.b \|\| \'\!\'` changes nothing on
   goopg \(`x,y`\); PG stores `x\!,y\!`\. `storeCopyRow` never calls the
@@ -29273,6 +29405,11 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   >     not transactional either: `BEGIN; ALTER TABLE … DISABLE TRIGGER tg;
   >     ROLLBACK;` leaves tgenabled `D`\. catalog\.Table\.Triggers is mutated
   >     in memory only\.
+
+  **RESOLVED 2026-10-12 (owner, delegated): closed `[x]` — the task is
+  done — plus a LINEAGE-BASELINE pin of 0076/0077/0080/0081/0082.** The
+  pin empties the window so the three held findings above can file; they
+  and the open 0084/0085/0086 inherit item-2a rank through this task.
 - [x] **M0146\-0009m — a nested loop over a LATERAL Append estimates 1 row**
   \(filed 2026\-10\-03 by M0146\-0049a\)\. `li, LATERAL \(SELECT amt FROM cs1
   WHERE item = li\.id UNION ALL SELECT amt FROM ws1 WHERE item = li\.id\) x
@@ -30245,7 +30382,7 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
     - Incidental: a member\-constant qual stays as a Filter on the Append \(PG folds it per member\) —
       M0146\-0094\.
   Movement: none — recon
-- [!] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
+- [ ] **M0146\-0067 — PlaceHolderVar\-wrapped FROM\-subquery pull\-up**
   \(filed 2026\-10\-05 by M0146\-0028's closure\)\. `pull\_up\_simple\_subquery`
   wraps substituted outputs in PlaceHolderVars when the parent uses grouping
   sets \(`REPLACE\_WRAP\_ALL`\), when the subquery sits on the nullable side
@@ -30257,6 +30394,9 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   Kind: impl
   Parent: M0146\-0028
   - **Held `\[\!\]` 2026\-10\-09** by the S4 lineage escalation in M0146\-0005 \(its last five completed descendants, 0111–0115, all carry `Movement: none`\)\. Only the owner reopens it\.
+  - **RE-OPENED 2026\-10\-12 \(owner, delegated\):** M0146\-0005's pin
+    \(LINEAGE\-BASELINE 0111–0115\) resolves the exhaustion this hold
+    proxied\.
   - No witness today: no TPC\-H or TPC\-DS query pulls up a simple subquery
     in these positions \(M0146\-0028 §14\)\. Select it when a corpus query or
     regress case needs it\.
@@ -30312,6 +30452,17 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   > regressions\. Option B \(keep 2 for serial\-side probes only\) and C \(keep
   > the park\) are written up in the design doc\. Owner: pick one; the park
   > stays in force until then\.
+  > **RESOLVED 2026\-10\-12 \(owner, delegated\) — Option A.** A NEW owner
+  > decision, not execution of the 10\-06 pre\-authorisation \(its >10%
+  > gate failed on the table above\)\. Rationale: +13 plan matches is the
+  > plan's object; the three regressions are executor/probe\-runtime cost
+  > \(M0146\-0088's ledgered ~1\.9x\) or already\-landed 0049e — re\-measure
+  > Q54 in the retirement A/B rather than trusting the stale attribution\.
+  > Retirement impl = first among new item\-3 work: drop the env knob and
+  > the `*2` applications in `internal/optimizer` \(`costindex\.go`,
+  > `cost\_funcs\.go`\), retire the flag via `flagProvenanceRetired` in
+  > `flaglabels\.go`, update its tests, corpus A/B at both scales as
+  > evidence\. M0145\-0008ag → M0146\-0009p / M0146\-0060 unblocked\.
 Movement: none — recon; no production change \(knob A/B measurement only\)
 - [x] **M0146\-0088 — goopg\'s parameterised index probe runs ~1\.3–1\.6x slower
   than the same PG\-shaped plan needs** \(filed 2026\-10\-07 by M0146\-0068\)\.

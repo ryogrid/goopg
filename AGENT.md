@@ -592,8 +592,9 @@ remains below is filing/completion discipline, not rank.
   `Movement: none`. Write each field **at the start of its own line** — a field
   buried mid-sentence does not count and the guard rejects it.
   *Movement* = PG match count changed, or a `CATEGORIES-EXCL-MATCH:` category
-  moved beyond ±3, or `make ea-ratchet` findings decreased. `Movement: yes` must
-  cite one of those three instruments **with a number** on the same line;
+  moved beyond ±3, or `make ea-ratchet` findings decreased, or a `regress`
+  suite's diff count moved (e.g. `regress join 14868 -> 14730`). `Movement: yes`
+  must cite one of those four instruments **with a number** on the same line;
   anything else (a unit test now passing, a feature now working) is
   `Movement: none` — real work, but not movement toward this goal.
 - **S4 Lineage budget.** After **5 consecutive** completed descendants of one

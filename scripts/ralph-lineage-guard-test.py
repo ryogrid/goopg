@@ -181,6 +181,10 @@ case("D: Movement: yes citing CATEGORIES-EXCL-MATCH -> ok", base,
      base + "- [x] **M0142-0052 — t**\n  Parent: M0142-0008\n  Movement: yes — CATEGORIES-EXCL-MATCH 21 -> 19\n", None)
 case("D: Movement: yes citing ea-ratchet -> ok", base,
      base + "- [x] **M0142-0053 — t**\n  Parent: M0142-0008\n  Movement: yes — ea-ratchet 140 -> 131 nodes\n", None)
+case("D: Movement: yes citing a regress diff count -> ok", base,
+     base + "- [x] **M0142-0054 — t**\n  Parent: M0142-0008\n  Movement: yes — regress join 14931 -> 14876\n", None)
+case("D: Movement: yes citing regress without a number -> violation", base,
+     base + "- [x] **M0142-0055 — t**\n  Parent: M0142-0008\n  Movement: yes — regress subselect A/B clean\n", "D")
 case("D: Movement: yes naming an instrument but no number -> violation", base,
      base + "- [x] **M0142-0054 — t**\n  Parent: M0142-0008\n  Movement: yes — the match count moved\n", "D")
 case("D: a pre-existing non-conforming Movement: yes is not re-reported",
