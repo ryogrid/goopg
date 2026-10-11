@@ -4854,10 +4854,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       (`grammar/` + `internal/parser/` are outside the fire\-set scope).~~
       **Hook repaired 2026\-09\-22 — this can now be committed normally.**
       The inventory row for 005 is `defer` with this task in `deferred_to`.
-  - [ ] **M0122-0015c — a schema\-qualified type in PREPARE\'s parameter list
+  - [x] **M0122-0015c — a schema\-qualified type in PREPARE\'s parameter list
     does not resolve, so pg\_dump of any database with a user function fails**
     Kind: impl
     Parent: M0122-0015
+    Movement: none — PREPARE type resolution; no TPC query prepares statements
+    - **DONE 2026\-10\-12 \(`db79cb4e7`\)\.** The validator was a bare built\-in
+      allowlist \(`isValidSQLTypeName`\); `executor\.ResolvePrepareParamType`
+      is typenameTypeId: qualifier resolved \(3F000\), built\-ins bare or
+      `pg\_catalog`, enums / domains / composites / ranges / row types
+      elsewhere, stored spelling without the qualifier\.
+    - pg\_dump of a database with sql \+ plpgsql functions now exits 0\. The
+      005 port\'s 23 remaining assertions still need M0122\-0015a / 0015d
+      \(they dump a CREATE DATABASE\-created database\)\.
+    - Test `TestResolvePrepareParamType`; regress A/B identical \(plpgsql
+      flap only\)\.
+    - Design `docs/design/0100\-0149/0122\-0015c\-prepare\-param\-type\-resolution\.md`\.
     Found 2026\-10\-12 by the 005 port\.
     - **Measured**: `PREPARE x\(pg\_catalog\.oid\) AS SELECT $1` → 42704 `type
       "pg\_catalog\.oid" does not exist` \(also `pg\_catalog\.int4`,
