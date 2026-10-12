@@ -822,6 +822,7 @@ func TestPgForeignTableRowsScopedToConnectionDBOid(t *testing.T) {
 	defer cleanup()
 
 	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER srv_default FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER srv_default: %v", err)
 	}
@@ -829,6 +830,7 @@ func TestPgForeignTableRowsScopedToConnectionDBOid(t *testing.T) {
 		t.Fatalf("CREATE FOREIGN TABLE ft_default: %v", err)
 	}
 	ctx.CurrentDatabaseOid = otherDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER srv_other FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER srv_other: %v", err)
 	}
@@ -888,10 +890,12 @@ func TestPgForeignServerRowsScopedToConnectionDBOid(t *testing.T) {
 	defer cleanup()
 
 	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER srv (DefaultDBOid): %v", err)
 	}
 	ctx.CurrentDatabaseOid = otherDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER srv (otherDBOid): %v", err)
 	}
@@ -935,6 +939,7 @@ func TestPgUserMappingsRowsScopedToConnectionDBOid(t *testing.T) {
 	defer cleanup()
 
 	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER um_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER um_srv (DefaultDBOid): %v", err)
 	}
@@ -942,6 +947,7 @@ func TestPgUserMappingsRowsScopedToConnectionDBOid(t *testing.T) {
 		t.Fatalf("CREATE USER MAPPING (DefaultDBOid): %v", err)
 	}
 	ctx.CurrentDatabaseOid = otherDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, "CREATE SERVER um_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("CREATE SERVER um_srv (otherDBOid): %v", err)
 	}

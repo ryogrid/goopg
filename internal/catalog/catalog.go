@@ -2459,7 +2459,7 @@ type Catalog interface {
 	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
 	// in `GRANT … ON FOREIGN DATA WRAPPER <name> TO …` to the OID-keyed ACL
 	// store key. DU-002 slice 428.
-	ForeignDataWrapperOID(name string) uint32
+	ForeignDataWrapperOID(name string, dbOid ...uint32) uint32
 	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
 	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
 	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
@@ -11696,29 +11696,10 @@ func (c *InMemory) registerSystemTables() {
 	// OPTIONS clause, so the OPTIONS clause is skipped. fdwacl materializes via
 	// ForeignDataWrapperACLText so a `GRANT … ON FOREIGN DATA WRAPPER …`
 	// round-trips (DU-002 slice 428); DU-002 slice 375.
-	pgForeignDataWrapper.VirtualRows = func() [][]string {
-		fdws := c.ListForeignDataWrappers()
-		if len(fdws) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(fdws))
-		for _, f := range fdws {
-			owner := f.Owner
-			if owner == 0 {
-				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(f.OID), 10),          // oid
-				f.Name,                                         // fdwname
-				strconv.FormatUint(uint64(owner), 10),          // fdwowner
-				strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
-				strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
-				c.ForeignDataWrapperACLText(f.OID),             // fdwacl
-				optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
-	}
+	// pg_foreign_data_wrapper is per-database: the executor asks
+	// VirtualRowsForDB with the connection's database (M0122-0015e).
+	pgForeignDataWrapper.VirtualRows = func() [][]string { return c.PGForeignDataWrapperRowsForDBOid(DefaultDBOid) }
+	pgForeignDataWrapper.VirtualRowsForDB = c.PGForeignDataWrapperRowsForDBOid
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
@@ -18847,67 +18828,84 @@ type ForeignDataWrapper struct {
 	// '-', so dumpForeignDataWrapper omits the clause. DU-002 (M0119-0004).
 	HandlerOID   uint32
 	ValidatorOID uint32
+	// DBOid is the namespace oid of the database the FDW was created in:
+	// pg_foreign_data_wrapper is per-database, so the registry is keyed by
+	// fdwKey(DBOid, Name) like the foreign-server registry (M0122-0015e; an
+	// FDW created in postgres used to show in every database and its dump).
+	DBOid uint32
 }
 
-// RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
-// sight. Idempotent: re-registering an existing name returns the existing entry
-// without changing its OID (the OPTIONS are refreshed when non-empty).
-// DU-002 slice 375 (options: slice 380).
-func (c *InMemory) RegisterForeignDataWrapper(name string, options []string) *ForeignDataWrapper {
+// fdwKey is the fdws registry key: "<dbOid>:<name>", foreignServerKey's
+// scheme. M0122-0015e.
+func fdwKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
+}
+
+// RegisterForeignDataWrapper records an FDW in dbOid's database (trailing
+// variadic, DefaultDBOid when omitted), allocating a stable OID on first
+// sight. Idempotent: re-registering an existing name returns the existing
+// entry without changing its OID (the OPTIONS are refreshed when non-empty).
+// DU-002 slice 375 (options: slice 380; per-database: M0122-0015e).
+func (c *InMemory) RegisterForeignDataWrapper(name string, options []string, dbOid ...uint32) *ForeignDataWrapper {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fdws == nil {
 		c.fdws = make(map[string]*ForeignDataWrapper)
 	}
-	if f, ok := c.fdws[name]; ok {
+	db := resolveDBOid(dbOid)
+	if f, ok := c.fdws[fdwKey(db, name)]; ok {
 		if len(options) > 0 {
 			f.Options = options
 		}
 		return f
 	}
-	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options}
-	c.fdws[name] = f
+	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options, DBOid: db}
+	c.fdws[fdwKey(db, name)] = f
 	return f
 }
 
-// DropForeignDataWrapper removes an FDW from the registry. Returns true if found.
-// DU-002 slice 375.
-func (c *InMemory) DropForeignDataWrapper(name string) bool {
+// DropForeignDataWrapper removes an FDW from dbOid's registry (DefaultDBOid
+// when omitted). Returns true if found. DU-002 slice 375.
+func (c *InMemory) DropForeignDataWrapper(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fdws == nil {
 		return false
 	}
-	if _, ok := c.fdws[name]; ok {
-		delete(c.fdws, name)
+	k := fdwKey(resolveDBOid(dbOid), name)
+	if _, ok := c.fdws[k]; ok {
+		delete(c.fdws, k)
 		return true
 	}
 	return false
 }
 
-// ListForeignDataWrappers returns all registered FDWs sorted by name.
-// DU-002 slice 375.
-func (c *InMemory) ListForeignDataWrappers() []*ForeignDataWrapper {
+// ListForeignDataWrappers returns dbOid's FDWs (DefaultDBOid when omitted)
+// sorted by name. DU-002 slice 375; per-database: M0122-0015e.
+func (c *InMemory) ListForeignDataWrappers(dbOid ...uint32) []*ForeignDataWrapper {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.fdws) == 0 {
 		return nil
 	}
+	db := resolveDBOid(dbOid)
 	out := make([]*ForeignDataWrapper, 0, len(c.fdws))
 	for _, f := range c.fdws {
-		out = append(out, f)
+		if f.DBOid == db {
+			out = append(out, f)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// ForeignDataWrapperOID returns the stable OID of the named FDW, or 0 if no such
-// FDW is registered. Used by pg_foreign_server.VirtualRows to populate srvfdw.
-// DU-002 slice 376.
-func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
+// ForeignDataWrapperOID returns the stable OID of the named FDW in dbOid's
+// database (DefaultDBOid when omitted), or 0 if no such FDW is registered.
+// Used by pg_foreign_server's rows to populate srvfdw. DU-002 slice 376.
+func (c *InMemory) ForeignDataWrapperOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if f, ok := c.fdws[name]; ok {
+	if f, ok := c.fdws[fdwKey(resolveDBOid(dbOid), name)]; ok {
 		return f.OID
 	}
 	return 0
@@ -18928,8 +18926,9 @@ func (c *InMemory) LookupForeignDataWrapperByOID(oid uint32) *ForeignDataWrapper
 }
 
 // RegisterForeignDataWrapperDuringRecovery re-registers an FDW from the
-// pg_foreign_data_wrapper heap reload with its recovered OID (B3.4 — the FDW
-// gained restart durability with this slice; it had none before). Idempotent.
+// pg_foreign_data_wrapper heap reload with its recovered OID, in the database
+// whose heap held the row (fdw.DBOid; DefaultDBOid when zero). Idempotent.
+// B3.4 (restart durability); per-database: M0122-0015e.
 func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrapper) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -18937,22 +18936,26 @@ func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrap
 		c.fdws = make(map[string]*ForeignDataWrapper)
 	}
 	out := *fdw
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
 	out.Options = append([]string(nil), fdw.Options...)
-	c.fdws[fdw.Name] = &out
+	c.fdws[fdwKey(out.DBOid, fdw.Name)] = &out
 	if fdw.OID >= c.nextOID {
 		c.nextOID = fdw.OID + 1
 	}
 }
 
-// LookupForeignDataWrapper returns the named FDW's registry entry, or
-// (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
-// (which creates-or-fetches), this is a read-only lookup — used by
-// ALTER FOREIGN DATA WRAPPER, which must error 42704 undefined_object on a
-// nonexistent name rather than silently creating one. DU-002 slice 421.
-func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, bool) {
+// LookupForeignDataWrapper returns the named FDW's registry entry in dbOid's
+// database (DefaultDBOid when omitted), or (nil, false). Unlike
+// RegisterForeignDataWrapper (which creates-or-fetches), this is a read-only
+// lookup — used by ALTER FOREIGN DATA WRAPPER, which must error 42704
+// undefined_object on a nonexistent name rather than silently creating one.
+// DU-002 slice 421; per-database: M0122-0015e.
+func (c *InMemory) LookupForeignDataWrapper(name string, dbOid ...uint32) (*ForeignDataWrapper, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	f, ok := c.fdws[name]
+	f, ok := c.fdws[fdwKey(resolveDBOid(dbOid), name)]
 	return f, ok
 }
 
@@ -19900,6 +19903,33 @@ func (c *InMemory) UnregisterForeignServerDuringRecovery(name string, dbOid ...u
 	delete(c.foreignServers, foreignServerKey(resolveDBOid(dbOid), name))
 }
 
+// PGForeignDataWrapperRowsForDBOid builds the pg_foreign_data_wrapper rows
+// of dbOid's database (a connection's real oid is normalised), mirroring
+// PGForeignServerRowsForDBOid. M0122-0015e.
+func (c *InMemory) PGForeignDataWrapperRowsForDBOid(dbOid uint32) [][]string {
+	fdws := c.ListForeignDataWrappers(NamespaceDBOid(dbOid))
+	if len(fdws) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(fdws))
+	for _, f := range fdws {
+		owner := f.Owner
+		if owner == 0 {
+			owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(f.OID), 10),          // oid
+			f.Name,                                         // fdwname
+			strconv.FormatUint(uint64(owner), 10),          // fdwowner
+			strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
+			strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
+			c.ForeignDataWrapperACLText(f.OID),             // fdwacl
+			optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
+}
+
 // PGForeignServerRowsForDBOid builds the pg_foreign_server catalog row-set
 // for dbOid's own registered servers (mirrors PGForeignTableRowsForDBOid's
 // per-connection dbOid scoping). registerSystemTables's VirtualRows closure
@@ -19923,7 +19953,7 @@ func (c *InMemory) PGForeignServerRowsForDBOid(dbOid uint32) [][]string {
 			strconv.FormatUint(uint64(s.OID), 10), // oid
 			s.Name,                                // srvname
 			strconv.FormatUint(uint64(owner), 10), // srvowner
-			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName, s.DBOid)), 10), // srvfdw
 			s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
 			s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
 			c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)

@@ -17,6 +17,7 @@ func TestCommentOnForeignTableStoresDescription(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}

@@ -74,6 +74,7 @@ func TestCreateServerRegistersForeignServerWithCapturedOID(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv1 TYPE 'prod' VERSION '9.1' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost')`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -105,10 +106,12 @@ func TestCreateServerSameNameAcrossDistinctDBOidDoesNotCollide(t *testing.T) {
 	defer cleanup()
 
 	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER shared TYPE 'a' FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER shared (DefaultDBOid): %v", err)
 	}
 	ctx.CurrentDatabaseOid = otherDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER shared TYPE 'b' FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER shared (otherDBOid): %v", err)
 	}

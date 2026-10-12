@@ -22173,10 +22173,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				fdwName := s.Names[0].String()
 				// B3.4: capture the FDW's heap-row OID before the drop.
 				var fdwOID uint32
-				if fdw, found := im.LookupForeignDataWrapper(fdwName); found && fdw != nil {
+				if fdw, found := im.LookupForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); found && fdw != nil {
 					fdwOID = fdw.OID
 				}
-				if im.DropForeignDataWrapper(fdwName) {
+				if im.DropForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
 						// M0122-0007 foreign-server registry restart-durability
@@ -22805,7 +22805,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// target FDW must already exist. DU-002 slice 421.
 	if s.Tag == "ALTER FOREIGN DATA WRAPPER" && s.ObjType == "foreign-data wrapper" {
 		fdwName := s.ObjName.String()
-		fdw, found := im.LookupForeignDataWrapper(fdwName)
+		fdw, found := im.LookupForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
@@ -22843,6 +22843,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	}
 	switch s.ObjType {
 	case "server":
+		// CreateForeignServer (foreigncmds.c) resolves the wrapper with
+		// GetForeignDataWrapperByName, which raises 42704 when it does not
+		// exist — in the connection's database, since pg_foreign_data_wrapper
+		// is per-database. goopg used to register the server against any name.
+		// M0122-0015e.
+		if s.TableName.Name != "" {
+			if _, found := im.LookupForeignDataWrapper(s.TableName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !found {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.TableName.String())}
+			}
+		}
 		// Register server so DROP SERVER can succeed.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		// If the server references a FDW, store the association for DROP FDW CASCADE.
@@ -22894,7 +22904,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create foreign-data wrapper %q", s.ObjName.String()), Hint: "Must be superuser to create a foreign-data wrapper."}
 			}
 		}
-		if _, found := im.LookupForeignDataWrapper(s.ObjName.String()); found {
+		if _, found := im.LookupForeignDataWrapper(s.ObjName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); found {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("foreign-data wrapper %q already exists", s.ObjName.String())}
 		}
 		var handlerOID, validatorOID uint32
@@ -22912,7 +22922,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 			validatorOID = oid
 		}
-		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		fdw.HandlerOID = handlerOID
 		fdw.ValidatorOID = validatorOID
 		// B3.4: the FDW gains restart durability here (it had none before) —
@@ -24469,7 +24479,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// catalogId (tableoid=pg_foreign_data_wrapper=2328) and objsubid 0, then
 		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. DU-002
 		// slice 387.
-		oid := im.ForeignDataWrapperOID(s.ObjName.Name)
+		oid := im.ForeignDataWrapperOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.ObjName.Name)}

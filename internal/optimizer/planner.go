@@ -5498,7 +5498,7 @@ func foreignTableWithoutHandler(cat catalog.Catalog, tbl *catalog.Table) (string
 	if !ok || srv == nil {
 		return "", false
 	}
-	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName)
+	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName, srv.DBOid)
 	if !ok || fdw == nil || fdw.HandlerOID != 0 {
 		return "", false
 	}
