@@ -41,6 +41,21 @@ banner at the next `## ` line).
   *(Amended 2026-09-24, owner decision — see OWNER DECISIONS 2026-09-24:
   the unamended rule ranked every unlisted task below M-NIGHTLY, which
   stranded parity-family work filed under named milestones.)*
+  *(Amended 2026-10-13, owner decision — see OWNER DECISIONS 2026-10-13:*
+  **correctness-only carve-out.** *The loop's focus is TPC-H/TPC-DS plan
+  parity. A descendant whose work is executor/catalog/session
+  correctness only — wrong results, durability, privilege,
+  client-tool or regress-suite conformance — with no plan-instrument
+  rationale (no first-divergence record, no TPC-H/TPC-DS query named,
+  expected `Movement:` on the plan instruments — match count,
+  text-identical, CATEGORIES-EXCL-MATCH, ea-ratchet — not `regress`
+  or `none`) does NOT inherit rank; it queues under the unnamed-task
+  fallback below item 10 unless the item's member list explicitly
+  names it. `regress` stays a Movement instrument — it records
+  honest movement and keeps lineages unblocked; it never confers
+  rank. Filing such findings remains required (record, don't drop);
+  placing them is owner-only. Applied immediately to M0146-0153,
+  0154 and M0146-0160 through 0166.)*
 - **Ties and exhaustion:** among tasks the banner leaves equally ranked —
   and, when every banner item is exhausted/blocked, among the unnamed
   tasks S7 then admits — take the topmost unchecked task in file order.
@@ -105,9 +120,19 @@ banner at the next `## ` line).
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump; the tuplelock-upgrade reopen keeps M-NIGHTLY order on the
-   same reasoning (a scheduling-flake signature, not wrong results). Descendants filed under this item's tasks inherit item
-   2a's rank (explicit owner placement; S7's lowest-candidate tiebreak
-   does not re-queue them under item 3).
+   same reasoning (a scheduling-flake signature, not wrong results).
+   **The fifth batch drained 2026-10-12/13 — all named members are
+   `[x]`, and item 2a is DISCHARGED (owner decision 2026-10-13 — see
+   OWNER DECISIONS 2026-10-13; the current focus is TPC-H/TPC-DS plan
+   parity, item 3 onward).** ~~Descendants filed under this item's
+   tasks inherit item 2a's rank (explicit owner placement; S7's
+   lowest-candidate tiebreak does not re-queue them under item 3).~~
+   **Rank inheritance ended 2026-10-13:** the loop-filed descendants
+   0160/0161/0162/0163/0164/0165/0166 carry no item rank — the
+   S7 correctness-carve-out below queues them under the unnamed-task
+   fallback (below item 10). New correctness findings filed under any
+   task keep being filed (record, don't drop) but take no rank without
+   explicit owner placement.
 3. **M0145 jointree-first planner** (flow unification, owner decision
    2026-09-20 — fix the medium-level route divergence documented in
    `METHODOLOGY4/plan-flow-medium-abstraction.md` at the boundary, not per
@@ -817,7 +842,9 @@ OWNER DECISIONS 2026-10-12 (delegated; details in each task's entry):
   the fix2r section, `Parent: M0141-S2a-fix2r`), so the children root
   to M0141-S2a-fix2r and inherited item-4 rank all along; no lineage
   problem and nothing to fix. 0152 is owner-placed into item 2a below
-  anyway; 0153/0154 keep item-4 rank. A `Parent:`-dangling warning is
+  anyway; ~~0153/0154 keep item-4 rank~~ **superseded 2026-10-13: the
+  S7 correctness carve-out re-queues 0153/0154 below item 10.** A
+  `Parent:`-dangling warning is
   still a candidate Rule-D-style hardening — this instance just wasn't
   dangling.
 
@@ -849,6 +876,42 @@ investigation):
   which inherit rank via the 0055 pin rather than explicit naming.
   Open `Owner: place` text on a banner-named task is the stale-belief
   class that caused the 2026-10-12 selection drift.
+
+OWNER DECISIONS 2026-10-13 (delegated; resolves the owner direction
+"focus on TPC-H/TPC-DS plan parity — the loop must not keep creating
+and consuming correctness/regress-coverage work ahead of it"):
+
+- **Item 2a discharged.** The fifth (amended) S2 batch drained
+  overnight — 0155, 0156, 0157, 0158, 0089, 0152, 0126, 0125 and the
+  inherited 0084/0085/0086 are all `[x]`. The correctness-batch lane
+  is closed; selection resumes at item 3, whose first task is
+  **M0146-0159** (retire `indexProbeCostMultiplier`), unblocking
+  M0145-0008ag → M0146-0009p/0060.
+- **S7 correctness-only carve-out** (Selection rules, amended above):
+  a descendant whose expected movement is on `regress` or `none` —
+  i.e. executor/catalog/session correctness, not a plan instrument —
+  no longer inherits its parent's item rank. It queues under the
+  unnamed-task fallback below item 10. This ends the self-sustaining
+  S2 conveyor: every landed correctness fix files 1-2 more findings,
+  and inheritance was re-promoting them to top rank each loop.
+- **The pending "owner: confirm or place" asks are resolved —
+  NOT placed.** M0146-0160, 0161, 0162, 0163, 0164, 0165, 0166 stay
+  filed (record, don't drop) and queue below item 10. Note for the
+  owner: **0162 is severity-high** (every non-superuser LOGIN runs
+  with superuser rights — a genuine RBAC hole, ledgered since
+  2026-07-09). It is deferred per the parity-first direction, but it
+  is the first candidate for the next correctness batch.
+- **0153/0154 re-queued below item 10** — they inherited item-4 rank
+  through the M0141-S2a-fix2r family; the carve-out removes it (the
+  earlier "keep item-4 rank" note is superseded in place).
+- **`regress` stays a Movement instrument** (unchanged — the owner
+  confirmed this design is correct): it records honest movement and
+  keeps lineage budgets unblocked. It never confers rank.
+- **Stale-baton caution, standing:** the 2026-10-12 evening decision
+  added the "recheck placement claims against the banner" rule to
+  `.ralph/PROMPT.md`. The same class applies here — a baton that
+  says "S2 findings pending owner placement" is a claim, not state;
+  this decision is the state.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -29255,6 +29318,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   VARIADIC position over all parameters\. Probe: `tmp/m0084/probe2\.sql`\.
   Kind: impl
   Parent: M0146\-0084
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: grammar — make RETURNS optional when an OUT/INOUT parameter exists \(gram\.y
     CreateFunctionStmt's second form; derive the result type as in interpret\_function\_parameter\_list:
     one OUT → its type, several → record\); read the parser playbook §12 first\.
@@ -29309,6 +29373,7 @@ Movement: none — instrument artefact — no TPC\-H / TPC\-DS query concatenate
   Probe: `tmp/m0086/probe3\.sql`\.
   Kind: bug
   Parent: M0146\-0086
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: an inet datum is an untyped `KindString` at run time — find the evalCast arm that
     casts to text/varchar and render an inet/cidr source through `network\_show` \(always `/bits`\) using
     the static source type; then give `concatModeOf` the operand\'s static type so `\|\|` does the same
@@ -30062,6 +30127,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   narrower original fix\.
   Kind: impl
   Parent: M0141\-S2a\-fix2r\-c
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: bisect the M0134\-0029 claim \(regress `identity` case\) and
     locate the INSERT\-path identity check\.
 - [ ] **M0146\-0154 — after a CLEAN restart an identity/serial sequence resumes
@@ -30072,6 +30138,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   every\-32\-nextval snapshot \(ledger M0119\-0004 root\-0020\) on every start\.
   Kind: impl
   Parent: M0141\-S2a\-fix2r\-c
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: persist the in\-memory counter at clean shutdown \(or keep
     the sequence relation page current\) and restore the snapshot only on
     crash recovery\.
@@ -30141,11 +30208,12 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   pg\_class column, durable\.
   Kind: impl
   Parent: M0146\-0157
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: find where GRANT ON TABLE writes relacl \(postmaster grant\_ddl\.go
     tryRecordTableGrant / the pg\_class heap row\) and whether loadUserTablesFromHeap reads the
     relacl column back; probe REVOKE \.\.\. FROM PUBLIC and column grants too\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0161 loses granted privileges on restart
-  > Filed under M0146\-0157, so it inherits item 2a\'s rank; owner: confirm or place\.
+  > Filed under M0146\-0157\. RESOLVED 2026\-10\-13 (OWNER DECISIONS 2026\-10\-13): NOT placed — queues below item 10 under the S7 correctness carve\-out\.
 - [x] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
   confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
@@ -30176,12 +30244,13 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   SET ROLE resolves to bootstrap superuser — systemic actingRole RBAC gap"\) but never filed\.
   Kind: impl
   Parent: M0146\-0158
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: at connection setup \(server\.go runPostStartupLoop, beside connTx\.SessionUser\), seed
     NonSuperuserRole with the login role when it is not a superuser \(catalog IsSuperuser\); then audit
     RESET ROLE / RESET SESSION AUTHORIZATION \(they must restore the login role, not ""\) and run the
     testport families that log in as other roles\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0162 grants superuser rights to every login role
-  > Filed under M0146\-0158, so it inherits item 2a\'s rank; owner: confirm or place\.
+  > Filed under M0146\-0158\. RESOLVED 2026\-10\-13 (OWNER DECISIONS 2026\-10\-13): NOT placed — queues below item 10 under the S7 correctness carve\-out\. Severity\-high RBAC hole; first candidate for the next correctness batch\.
 - [x] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
   database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
   by M0122\-0015d; S2; **placed in item 2a — live member #1 — by the
@@ -30221,13 +30290,14 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   PG: every per\-database catalog is that database\'s heap, durable\.
   Kind: impl
   Parent: M0146\-0156
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: per object kind, apply the `reloadUserRoutinesFromHeap` pattern \(default heap,
     then each `cat\.ListDatabases\(\)` database with the schema\-reload skip set\), stamping the
     database where the registry is per\-database \(sequences live in the per\-database table
     namespace; domains/enums carry DBOid\); start with sequences and domains \(wrong results\)\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0160 loses data
   > Sequences, domain constraints and serial defaults in any CREATE DATABASE\'d database vanish
-  > on restart\. Filed under M0146\-0156, so it inherits item 2a\'s rank; owner: confirm or place\.
+  > on restart\. Filed under M0146\-0156\. RESOLVED 2026\-10\-13 (OWNER DECISIONS 2026\-10\-13): NOT placed — queues below item 10 under the S7 correctness carve\-out\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
@@ -31434,6 +31504,7 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   time zone` on PG 18\.3 \(pg\_proc prorettype 1184\); it also skews the COALESCE mismatch error text\.
   Kind: impl
   Parent: M0146\-0126
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: find the now / current\_timestamp / transaction\_timestamp arms of exprType and
     funcCallResultType and the value they produce; probe comparisons and casts against PG\.
 - [ ] **M0146\-0164 — float8 division prints 15 significant digits** \(filed 2026\-10\-12 by
@@ -31441,6 +31512,7 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   `0\.3333333333333333` \(float8out shortest round\-trip, extra\_float\_digits=1\)\.
   Kind: impl
   Parent: M0146\-0126
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
   - First step: trace the datum the division operator produces and the output formatter it reaches
     \(PGFloatOut is the reference; a %\.15g path is suspected\)\.
 - [x] **M0146\-0127 — a semijoin\'s equality joins the equivalence classes \(TPC\-DS Q14\'s cross\_items → item spine\)**
