@@ -230,6 +230,19 @@ func (rc *keptRebase) rebaseNode(n Node, linkDepth int, sc *keptScopeArgs) bool 
 // uncorrelated kept sublink gets the clone with no params — the clone is still
 // required because the plan pointer is shared with the fallback's conjunct.
 func (rc *keptRebase) rebaseOne(x Expr, h *sublinkHandle) bool {
+	// keptSubplanAdmissible's LATERAL refusal, enforced here too: this
+	// post-pass also reaches kept sublinks the admission gate never saw. Inside
+	// a lateral join (a decomposed nested-loop index join, R25) an
+	// OuterColumnRef{Level: 1} in the right child is that join's nestloop
+	// param, read from the frame the join pushes per outer row — not a ref to
+	// the enclosing query. rebaseNode's static Level arithmetic counts it as
+	// escaping and re-binds it to the host row, which made TPC-DS Q32's
+	// correlated SubPlan read the outer catalog_sales row's columns and return
+	// NULL (M0146-0170).
+	if planContainsLateralJoin(h.plan) {
+		rc.why = "nested-sublink-lateral"
+		return false
+	}
 	cl, err := clonePlanReplacingOuter(h.plan, nil)
 	if err != nil || cl == nil {
 		rc.why = "kept-subplan-clone"

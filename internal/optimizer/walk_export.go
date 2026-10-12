@@ -231,6 +231,7 @@ func nodeOwnExprs(n Node) []Expr {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		exprs = append(exprs, t.SAOPKeys...)
 		exprs = append(exprs, t.RangePrefix...)
 		if t.LowKey != nil {
 			exprs = append(exprs, t.LowKey)

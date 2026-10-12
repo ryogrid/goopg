@@ -1187,6 +1187,19 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Key != nil {
 			walkExprTree(n.Key, visit)
 		}
+		// Keys / SAOPKeys are probe keys like Key (M0146-0170). Without them a
+		// correlated multi-column probe was invisible here, so
+		// planContainsLateralJoin missed a lateral nestloop's inner probe and
+		// lowerSubPlanParams turned its nestloop param into a SubPlan
+		// parameter bound from the host row; planHasOuterRef could misclassify
+		// the same probe as uncorrelated. The lowering walker
+		// (subplan_lower_walk.go) and NodeSubplans (walk_export.go) visit them.
+		for _, k := range n.Keys {
+			walkExprTree(k, visit)
+		}
+		for _, k := range n.SAOPKeys {
+			walkExprTree(k, visit)
+		}
 		if n.LowKey != nil {
 			walkExprTree(n.LowKey, visit)
 		}

@@ -59,8 +59,10 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 		if !one(&x.Key) || !one(&x.LowKey) || !one(&x.HighKey) || !one(&x.Cond) {
 			return false
 		}
-		// M0145-0029 slice 2b: the range probe's equality prefix.
-		return rewriteAll(x.Keys) && rewriteAll(x.RangePrefix)
+		// M0145-0029 slice 2b: the range probe's equality prefix. SAOPKeys are
+		// probe keys too; leaving them unrewritten would strand an outer ref
+		// once the eval site stops pushing OuterRows (M0146-0170).
+		return rewriteAll(x.Keys) && rewriteAll(x.SAOPKeys) && rewriteAll(x.RangePrefix)
 	case *IndexOnlyScan:
 		// Same for the IOS's residual qual. Today it is only ever a
 		// `col IS NOT NULL` the min/max rewrite attached, so this is a no-op —
