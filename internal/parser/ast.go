@@ -310,6 +310,9 @@ type MergeStmt struct {
 	// Returning holds the RETURNING target list. M0097-0016.
 	// Parsed but not executed (v0 no-op).
 	Returning []ResTarget
+	// With is a leading WITH clause (gram.y MergeStmt: opt_with_clause),
+	// whose CTEs the source, ON and WHEN clauses may reference. M0146-0085.
+	With *WithClause
 }
 
 func (s *MergeStmt) Pos() int  { return s.pos }

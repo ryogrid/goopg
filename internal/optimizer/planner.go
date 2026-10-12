@@ -15149,6 +15149,13 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, s
 // planMerge converts a MERGE INTO statement into a Merge plan node.
 // M0096-0010.
 func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// A leading WITH (M0146-0085): its CTEs are visible to the USING source,
+	// ON and WHEN clauses; data-modifying ones run first, as for DELETE.
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01",
@@ -15341,7 +15348,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 		m.Returning = exprs
 		m.ReturningSchema = schema
 	}
-	return m, nil
+	return wrapDMLCTEPrefix(m, dmlPlans), nil
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.

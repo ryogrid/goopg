@@ -50,10 +50,11 @@ func TestRoutingModifiersAndRecursive(t *testing.T) {
 			t.Errorf("unexpectedly routed: %q", q)
 		}
 	}
-	// MergeStmt carries no WITH clause (neither in the AST nor in gram.y's
-	// MergeStmt), and legacy says so outright: "WITH clause must be followed
-	// by ...". Routing MERGE must not quietly make the combination legal.
-	assertBothReject(t, "WITH c AS (SELECT 1) MERGE INTO t USING c ON true WHEN MATCHED THEN DELETE")
+	// gram.y's MergeStmt starts with opt_with_clause, so a WITH clause may
+	// lead MERGE (M0146-0085). This line used to pin the rejection the legacy
+	// parser gave ("WITH clause must be followed by ..."), which was a gap,
+	// not PostgreSQL's grammar.
+	assertParity(t, "WITH c AS (SELECT 1) MERGE INTO t USING c ON true WHEN MATCHED THEN DELETE")
 }
 
 // TestRoutingWideningGaps pins the four grammar gaps the wider routing

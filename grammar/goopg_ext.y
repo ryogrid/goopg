@@ -2675,6 +2675,14 @@ opt_nowait:
 merge_stmt:
 		MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
 			{ $$ = NewMergeStmt($<p>1, $3, $5, $7, $8, $9) }
+	/* gram.y MergeStmt: opt_with_clause MERGE INTO … (M0146-0085). Anchored at
+	   the MERGE keyword, as `with_clause DELETE_P` anchors at DELETE. */
+	| with_clause MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
+			{
+				m := NewMergeStmt($<p>2, $4, $6, $8, $9, $10)
+				m.With = $1
+				$$ = m
+			}
 
 opt_INTO_kw:
 		/* empty */   { }
