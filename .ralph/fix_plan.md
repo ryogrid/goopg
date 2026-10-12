@@ -30755,7 +30755,7 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   - Done 2026\-10\-07 \(f3509cbdd\): `scanLeafItems` starts at a binary search over the leaf \(`leafScanStart`, PG\'s `\_bt\_binsrch`\) and the descent reads items without copying\. 200k\-probe NL micro\-benchmark 1\.70 s → 0\.74 s \(PG 0\.39 s\); TPC\-DS SF0\.25 Q72 175 s → 23 s, sweep total 418 s → 238 s, plan shapes 99/99 unchanged\. Design: `docs/design/0100\-0149/m0146\-0088\-index\-probe\-leaf\-binsearch\.md`\.
   - Movement: none — CATEGORIES\-EXCL\-MATCH unchanged \(join\-order=53\); runtime only\.
   - Residual ~1\.9x per probe vs PG ledgered \(descent per rescan, posting checks, allocation\)\.
-- [ ] **M0146\-0089 — WRONG RESULTS: a materialized view comes back as a plain view after
+- [x] **M0146\-0089 — WRONG RESULTS: a materialized view comes back as a plain view after
   restarts** \(filed 2026\-10\-07 by M0146\-0063b\)\. `CREATE TABLE s\(a int\)` with 3000 rows,
   `CREATE MATERIALIZED VIEW mv AS SELECT a FROM s`, CHECKPOINT; `DELETE … WHERE a > 1000`,
   `REFRESH MATERIALIZED VIEW mv`, CHECKPOINT; clean stop/start twice\. After the second restart
@@ -30772,6 +30772,16 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   > Owner: place M0146\-0089 in the banner\.
   > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
   > amendment\)\.**
+  - Done 2026\-10\-12 \(`25039a613`\)\. The relkind m → v half was the M0114 JSON catalog cache:
+    reproduced on `ea45c154d` and on `17e9db192~1`, gone from `17e9db192` \(cache retired
+    2026\-10\-10\); pinned by `TestPort\_MatviewSurvivesRefreshAndTwoRestarts`\.
+  - The same repro without a scan of `mv` before restarting exposed a live defect: 3938 rows
+    \(pre\-REFRESH rows resurrected\), also after an immediate\-mode crash\. `truncateRelation`
+    stamped xmax without dirtying the buffer or writing WAL; it now goes through
+    `markHeapDeleteDirtyAndClearVM` \(also fixes the apply worker\'s TRUNCATE\)\.
+    Design: `docs/design/0100\-0149/m0146\-0089\-matview\-refresh\-durability\.md`\.
+  - Residual ledgered: REFRESH is an in\-place delete \+ insert, not PG\'s heap swap\.
+  Movement: none — durability fix; regress matview / create\_am / select\_into identical, no TPC witness
 - [x] **M0146\-0090 — an underestimated Parallel Hash join errors instead of growing its
   batches** \(filed 2026\-10\-07 by M0146\-0064\)\. goopg has no parallel hash batching: a participant
   build that outgrows hash\_mem fails the query with `parallel hash join: a participant\'s build
