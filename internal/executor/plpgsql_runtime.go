@@ -415,6 +415,25 @@ func enterRoutineBody(ctx *Context, pos int) (func(), error) {
 	return leave, nil
 }
 
+// enterRoutineConfig applies a routine's SET clauses (pg_proc.proconfig) for
+// the length of one call: fmgr_security_definer opens a GUC nest level,
+// ProcessGUCArray applies proconfig with GUC_ACTION_SAVE, and
+// AtEOXact_GUC(true, save_nestlevel) restores the saved values when the
+// call returns. Call the returned func via defer, so an error leaving the
+// routine restores them too (in PG the enclosing (sub)transaction abort
+// does that). A routine with no SET clause, or a context without a session
+// (PushFunctionConfig nil), runs unchanged.
+func enterRoutineConfig(r *catalog.Routine, ctx *Context, pos int) (func(), error) {
+	if r == nil || len(r.Config) == 0 || ctx == nil || ctx.PushFunctionConfig == nil {
+		return func() {}, nil
+	}
+	pop, err := ctx.PushFunctionConfig(r.Config)
+	if err != nil {
+		return func() {}, execErrorFromGUCError(pos, err)
+	}
+	return pop, nil
+}
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {
@@ -429,6 +448,11 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			return Datum{}, &ExecError{Code: "54001", Pos: pos, Message: "stack depth limit exceeded"}
 		}
 	}
+	restore, err := enterRoutineConfig(r, ctx, pos)
+	if err != nil {
+		return Datum{}, err
+	}
+	defer restore()
 	// Cumulative function statistics (pgstat). When the calling session's
 	// track_functions GUC enables it, time the call and accumulate one
 	// invocation into the session's pending stats (flushed to the shared store
@@ -779,6 +803,11 @@ func executeSQLProcedureReturning(r *catalog.Routine, args []Datum, ctx *Context
 }
 
 func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	body := r.Body
 	if len(r.ArgNames) > 0 {
 		body = rewriteSQLNamedParams(body, r.ArgNames)
@@ -864,6 +893,11 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 // []Datum (first column of each row). Used by the ProjectSet operator for
 // user-defined SETOF functions in SELECT target lists. M0097-0020.
 func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	body := r.Body
 	if len(r.ArgNames) > 0 {
 		body = rewriteSQLNamedParams(body, r.ArgNames)
@@ -1012,6 +1046,11 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			}
 		}
 	}
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
@@ -3393,6 +3432,11 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	if err != nil {
 		return nil, false, &ExecError{Code: "P0000", Message: fmt.Sprintf("invalid trigger body for %s: %v", r.QualifiedName(), err)}
 	}
+	restore, cerr := enterRoutineConfig(r, ctx, 0)
+	if cerr != nil {
+		return nil, false, cerr
+	}
+	defer restore()
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx

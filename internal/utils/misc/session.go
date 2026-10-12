@@ -57,6 +57,10 @@ type SessionRegistry struct {
 	// fidelity. Design 0134-0001-p6-guc-transaction-rollback.
 	txPrior map[string]*string
 
+	// saveLevels are the GUC nest levels open for routines with SET clauses
+	// (PushSaveLevel / PopSaveLevel), innermost last.
+	saveLevels []*gucSaveLevel
+
 	// onReportableChange, if non-nil, is called whenever a Report-flagged
 	// variable's effective value changes. The caller (the server) wires
 	// this to a ParameterStatus emitter so libpq clients see auto-tracked
@@ -229,15 +233,13 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	} else {
 		s.snapshotPrior(key)
 		s.session[key] = canon
+		s.markOverridden(key)
 		// SET (not SET LOCAL) clears any local override too — matches
 		// upstream which treats SET as "session value plus implicit
 		// reset of any LOCAL".
 		delete(s.local, key)
 	}
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.report(v, name)
 	// M0054-0006e-followup: process-global change callback. Fires
 	// AFTER the session/local layer is updated so callbacks see the
 	// post-Set effective value via .Get().
@@ -330,10 +332,7 @@ func (s *SessionRegistry) SetStartup(name, value string) error {
 	key := strings.ToLower(name)
 	s.session[key] = canon
 	s.startup[key] = canon
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.report(v, name)
 	_, eff, _ := s.Get(name)
 	s.global.invokeOnChange(v.Name, eff)
 	return nil
@@ -361,10 +360,8 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 	key := strings.ToLower(name)
 	s.session[key] = canon
 	delete(s.local, key)
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.markOverridden(key)
+	s.report(v, name)
 	_, eff, _ := s.Get(name)
 	s.global.invokeOnChange(v.Name, eff)
 	return nil
@@ -382,6 +379,7 @@ func (s *SessionRegistry) Reset(name string) error {
 	key := strings.ToLower(name)
 	s.snapshotPrior(key)
 	delete(s.local, key)
+	s.markOverridden(key)
 	if startup, ok := s.startup[key]; ok {
 		// Restore the session-start value (PG's reset_val) rather than
 		// exposing the global default — mirrors guc.c's RESET restoring
@@ -391,10 +389,7 @@ func (s *SessionRegistry) Reset(name string) error {
 	} else {
 		delete(s.session, key)
 	}
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.report(v, name)
 	// M0054-0006e-followup: invoke the process-global change callback for
 	// the post-Reset effective value (the startup value when one exists,
 	// else the global default).

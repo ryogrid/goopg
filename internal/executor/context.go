@@ -454,6 +454,13 @@ type Context struct {
 	// the same SessionRegistry as SET / SET LOCAL.
 	SetSetting func(name, value string, isLocal bool) error
 
+	// PushFunctionConfig opens a GUC nest level and applies a routine's
+	// proconfig ("name=value" entries) for the length of the call, as
+	// fmgr_security_definer does; the returned pop closes the level. Wired to
+	// SessionRegistry.PushSaveLevel / PopSaveLevel; nil means the SET clauses
+	// cannot be applied in this context (see enterRoutineConfig).
+	PushFunctionConfig func(config []string) (pop func(), err error)
+
 	// AllSettings returns the effective SHOW ALL view for this session.
 	AllSettings func() []SettingValue
 

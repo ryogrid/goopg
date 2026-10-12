@@ -3909,6 +3909,9 @@ type CreateProcedureStmt struct {
 	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT
 	Window          bool   // WINDOW attribute (invalid for procedures)
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	// ConfigOps are the procedure's SET / RESET clauses, recorded as
+	// CreateFunctionStmt's are, for pg_proc.proconfig (M0146-0155).
+	ConfigOps []FunctionConfigOp
 }
 
 func (s *CreateProcedureStmt) Pos() int  { return s.pos }

@@ -25882,15 +25882,40 @@ func (c *SearchPathCatalog) UnregisterSchema(name string, dbOid ...uint32) {
 // current search_path when the name has no explicit schema qualifier, and to
 // key the lookup off the querying connection's real database (effectiveDBOid,
 // M0122-0007 slice 4c).
+//
+// An unqualified name is RangeVarGetRelid's walk of the active search path
+// (namespace.c): the session's temporary schema and pg_catalog come first,
+// then the path's schemas in order, and the first schema holding the name
+// wins. The underlying bare-name lookup answers temp, pg_catalog and public
+// relations, so its answer stands unless a schema listed before its own
+// holds the name too — `SET search_path = s1, public` then reads s1.t, not
+// public.t (M0146-0155: a function's SET search_path depends on it). A name
+// found in no listed schema keeps the bare answer, as before.
 func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
 	dbOid = c.effectiveDBOid(dbOid)
 	tbl, ok := c.Catalog.LookupTable(name, dbOid...)
-	if !ok && name.Schema == "" && c.GetSchemas != nil {
-		for _, sc := range c.GetSchemas() {
-			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...)
-			if ok {
-				return tbl, ok
-			}
+	if name.Schema != "" || c.GetSchemas == nil {
+		return tbl, ok
+	}
+	found := ""
+	if ok {
+		if tbl.Temp {
+			return tbl, ok
+		}
+		found = strings.ToLower(tbl.Schema)
+		switch found {
+		case "pg_catalog", "information_schema":
+			return tbl, ok
+		case "":
+			found = "public"
+		}
+	}
+	for _, sc := range c.GetSchemas() {
+		if ok && strings.EqualFold(sc, found) {
+			return tbl, ok
+		}
+		if t, hit := c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...); hit {
+			return t, true
 		}
 	}
 	return tbl, ok

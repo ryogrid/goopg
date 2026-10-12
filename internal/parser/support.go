@@ -2558,17 +2558,18 @@ func applyFnAttrs(st *CreateFunctionStmt, a *fnAttrs) *CreateFunctionStmt {
 }
 
 // applyProcAttrs is the procedure's subset — CreateProcedureStmt has no
-// Leakproof / Parallel / Cost / Rows / ConfigOps fields.
+// Leakproof / Parallel / Cost / Rows fields.
 func applyProcAttrs(st *CreateProcedureStmt, a *fnAttrs) *CreateProcedureStmt {
 	// CREATE PROCEDURE's attribute loop (function.go parseCreateProcedureTail)
-	// handles LANGUAGE / AS / BEGIN ATOMIC / SET explicitly and sends every
-	// other attribute through consumeFunctionAttribute, which DROPS it — only
-	// WINDOW and STRICT are peeked at on the way past. So SECURITY DEFINER,
-	// the volatility words, COST and ROWS leave no trace on a procedure, and
-	// Volatile stays at its "v" default.
+	// handles LANGUAGE / AS / BEGIN ATOMIC / SET / RESET explicitly and sends
+	// every other attribute through consumeFunctionAttribute, which DROPS it —
+	// only WINDOW and STRICT are peeked at on the way past. So SECURITY
+	// DEFINER, the volatility words, COST and ROWS leave no trace on a
+	// procedure, and Volatile stays at its "v" default.
 	st.Language, st.Body = a.language, a.body
 	st.BeginAtomic = a.beginAtomic
 	st.Strict, st.Window = a.strict, a.window
+	st.ConfigOps = a.configOps
 	return st
 }
 

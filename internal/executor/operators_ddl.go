@@ -18093,6 +18093,10 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
 	}
+	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
+	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
 		if s.BeginAtomic {
@@ -18229,6 +18233,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		IsProcedure:     true,
 		SecurityDefiner: s.SecurityDefiner,
 		Volatile:        "v", // procedures default to volatile
+		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}
 	created, err := rs.Create(r, s.OrReplace)
 	if err != nil {

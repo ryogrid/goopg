@@ -524,6 +524,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
+		ectx.PushFunctionConfig = sessionPushFunctionConfig(sess)
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
 			out := make([]executor.SettingValue, 0, len(all))
@@ -2046,13 +2047,20 @@ const blockSizeBytesForPlanner = 8192
 // through `PlannerSettings` into the key. The inputs that are not session GUCs
 // — the transaction's isolation level, and the statement-shape refusals — are
 // enforced after the lookup by `optimizer.StripGather`.
+//
+// The search path closes the key: a cached plan has its unqualified names
+// already bound to relations, and `SET search_path = s1, public` must not be
+// served the plan another session (or this one, earlier) bound to public.t.
+// PostgreSQL's plancache replans for the same reason when
+// SearchPathMatchesCurrentEnvironment fails. M0146-0155.
 func sessionPlannerFingerprint(sess *misc.SessionRegistry) string {
 	ps := sessionPlannerSettings(sess)
 	return plannerCacheFingerprint(ps,
 		sessionScanToggleOff(sess, "enable_seqscan"),
 		sessionScanToggleOff(sess, "enable_indexscan"),
 		sessionScanToggleOff(sess, "enable_bitmapscan"),
-		sessionScanToggleOff(sess, "enable_indexonlyscan"))
+		sessionScanToggleOff(sess, "enable_indexonlyscan")) +
+		"\x1f" + strings.Join(searchPathSchemas(sess), ",")
 }
 
 // plannerCacheFingerprint formats every planner input the cache key must
@@ -2124,6 +2132,19 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(disableIndexOnlyScan),
 	}
 	return strings.Join(fields, "\x1f")
+}
+
+// sessionPushFunctionConfig is the executor's PushFunctionConfig over the
+// connection's SessionRegistry: a routine's SET clauses, applied in a GUC
+// nest level that the returned pop closes (fmgr_security_definer).
+func sessionPushFunctionConfig(sess *misc.SessionRegistry) func(config []string) (func(), error) {
+	return func(config []string) (func(), error) {
+		level, err := sess.PushSaveLevel(config)
+		if err != nil {
+			return nil, err
+		}
+		return func() { sess.PopSaveLevel(level) }, nil
+	}
 }
 
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {

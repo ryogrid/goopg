@@ -824,6 +824,19 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			stmt.Body = body
 			stmt.BeginAtomic = true
 			sawAs = true
+		// SET / RESET — FunctionSetResetClause, as in CREATE FUNCTION above.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet:
+			p.advance() // consume SET
+			op, ok, err := p.parseFunctionConfigSetClause()
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				stmt.ConfigOps = append(stmt.ConfigOps, op)
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset:
+			p.advance() // consume RESET
+			stmt.ConfigOps = append(stmt.ConfigOps, p.parseFunctionConfigResetClause())
 		case p.isFunctionAttribute():
 			// Track WINDOW and STRICT attributes for validation in executor.
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "window") {
