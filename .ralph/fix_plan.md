@@ -29957,7 +29957,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: persist the in\-memory counter at clean shutdown \(or keep
     the sequence relation page current\) and restore the snapshot only on
     crash recovery\.
-- [ ] **M0146\-0155 — WRONG RESULTS: a function\'s SET clauses are never
+- [x] **M0146\-0155 — WRONG RESULTS: a function\'s SET clauses are never
   applied when it runs** \(filed 2026\-10\-12 by M0122\-0008; S2\)\.
   `create function sp\(\) returns text language sql set search\_path = s1
   as \$\$ select v from t \$\$` reads `public\.t` on goopg and `s1\.t` on
@@ -29974,6 +29974,47 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: find the SQL and plpgsql call sites in the executor, push
     a GUC nest level there, apply proconfig through the session registry,
     pop on return and on error\.
+  - Landed 2026\-10\-12 \(`5101581a3`\): SessionRegistry save levels
+    \(PushSaveLevel / PopSaveLevel, GUC\_ACTION\_SAVE semantics\) applied via
+    enterRoutineConfig around scalar functions, both SRF paths, SQL and
+    plpgsql procedures \(SET makes a procedure atomic\) and plpgsql trigger
+    bodies\. Design `docs/design/0100\-0149/m0146\-0155\-function\-set\-clauses\.md`\.
+  - CREATE PROCEDURE \.\.\. SET was dropped by the parser \(applyProcAttrs\);
+    CreateProcedureStmt\.ConfigOps now carries it into Routine\.Config\.
+  - The repro also needed two pre\-existing fixes: SearchPathCatalog\.LookupTable
+    answered public before the search path \(top\-level `SET search\_path = s1,
+    public` read public\.t too\), and the cross\-session plan cache key ignored
+    the search path\.
+  - Residuals filed: M0146\-0157 \(SECURITY DEFINER never switches role\),
+    M0146\-0158 \(SUSET parameters settable by non\-superusers\); SET FROM
+    CURRENT, statement\-start GUC snapshots and the CREATE TEMP TABLE
+    shadow failure are ledgered\.
+  Movement: yes — regress guc 385 → 352 diff lines \(function SET section now matches PG\); probe arms 0 → all matching
+- [ ] **M0146\-0157 — WRONG RESULTS: a SECURITY DEFINER routine runs as its
+  caller** \(filed 2026\-10\-12 by M0146\-0155\)\. goopg stores prosecdef but
+  never switches the user for the call: `current\_user` inside the routine is
+  the caller, and the body\'s privilege checks use the caller\'s rights\. PG:
+  fmgr\_security\_definer saves the user id, SetUserIdAndSecContext\(proowner,
+  SECURITY\_LOCAL\_USERID\_CHANGE\) for the call, restores on exit\.
+  Kind: impl
+  Parent: M0146\-0155
+  - First step: in enterRoutineConfig\'s callers, when r\.SecurityDefiner,
+    swap ctx\.NonSuperuserRole / the current\_user source to the routine
+    owner for the call and restore it on every exit path; probe
+    current\_user and a privilege\-gated SELECT against PG 18\.3\.
+- [ ] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
+  \(filed 2026\-10\-12 by M0146\-0155\)\. `SET ROLE plain; SET
+  log\_min\_messages = debug1` succeeds on goopg; PG raises 42501 `permission
+  denied to set parameter "log\_min\_messages"` unless the role holds SET on
+  the parameter \(pg\_parameter\_acl\)\. A function\'s SET clause is subject to
+  the same check at call time \(fmgr\_security\_definer passes PGC\_USERSET for
+  a non\-superuser\)\.
+  Kind: impl
+  Parent: M0146\-0155
+  - First step: thread the caller\'s superuser\-ness into SessionRegistry\.Set
+    / PushSaveLevel \(set\_config\_option\'s context check against
+    Variable\.Context == ContextSuset\), reusing parameterACLGrants\(…, \'s\'\)
+    from execAlterSystem\.
 - [ ] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
   database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
   by M0122\-0015d; S2\)\. In a database made by `CREATE DATABASE`,
