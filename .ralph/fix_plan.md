@@ -31943,3 +31943,24 @@ Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to CO
   - First step: run the current build with `GOOPG_INDEX_PROBE_MULT=1` vs `=2`
     on the fire set to reproduce the 0068 table before touching code\.
   - Follow\-on: re\-measure M0145\-0008ag\'s Q14 premise after this lands\.
+- [x] **M0146-0169 — WRONG RESULTS: a MERGE UPDATE files no index entry for the new row version and skips the unique check** \(filed
+  2026\-10\-13 by M0146\-0159\)\. After `MERGE … WHEN MATCHED THEN UPDATE`, every index scan misses the updated row
+  \(`WHERE a = 1` returns 0 rows with `enable_seqscan = off`; a Seq Scan still sees it\), and a key change onto an
+  existing key is accepted — a duplicate primary key, where PG 18\.3 raises 23505\. `mergeApplyUpdate` wrote the new
+  version non\-HOT and linked `t_ctid` but never called the index maintenance UPDATE uses \(ExecUpdate →
+  ExecInsertIndexTuples, execIndexing\.c\) nor `checkUniqueIndexesForUpdate`\. Found because M0146\-0159's retirement
+  flips `TestDMLTriggersFireInPGOrder`'s final `SELECT … ORDER BY a` to an ordered Index Scan, which lost row 1\.
+  Probes: `tmp/m0159/bis\.sql`, `tmp/m0159/merge2\.sql`\.
+  Kind: impl
+  Parent: M0146\-0159
+  - Rank: fixed inside M0146\-0159 as its blocker \(the units gate for 0159 is red without it\)\.
+  > ## ESCALATION 2026\-10\-13 \(S2\) — MERGE UPDATE breaks index access and uniqueness
+  > Filed and fixed by M0146\-0159's loop because it blocked that task's units gate\. Every row a MERGE ever updated
+  > was invisible to index scans, and MERGE could create duplicate keys\. Owner: note for durability review —
+  > existing clusters may hold such rows \(REINDEX repairs the missing entries; duplicates need manual repair\)\.
+  - Done 2026\-10\-13 \(`7958cf698`\): `mergeApplyUpdate` runs `checkUniqueIndexesForUpdate` after stamping the old
+    version and `maintainUniqueIndexesForInsert` after the write, on the destination table \(`routeModNewRow` returns
+    it\)\. PG probe byte\-identical; isolation merge\-\* and EvalPlanQual PASS\. Design:
+    `docs/design/0100\-0149/m0146\-0169\-merge\-update\-indexes\.md`\.
+Movement: none — instrument artefact — no TPC query runs MERGE; regress merge identical \(its diffs never read a
+  MERGE\-updated row through an index\)
