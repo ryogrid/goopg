@@ -29986,7 +29986,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Kind: impl
   Parent: M0141\-S2a\-fix2r\-c
   Movement: none — correctness fix; no TPC corpus carries an array column
-- [ ] **M0146\-0152 — WRONG RESULTS: an uncommitted CREATE TABLE survives a
+- [x] **M0146\-0152 — WRONG RESULTS: an uncommitted CREATE TABLE survives a
   restart when no transaction has committed since initdb** \(filed 2026\-10\-10
   by M0141\-S2a\-fix2r\-c; S2\)\. With no xact record in the WAL and an empty
   clog, `Open` takes the old\-cluster upgrade branch
@@ -30003,6 +30003,14 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     runs on clusters this binary initialised; repro is
     `TestCrashMidTransactionTableNotVisibleAfterRestart` without its
     `committed\_first` statement\.
+  - Done 2026\-10\-12 \(`c59b7e383`\): initdb writes the `clog\-complete\-history` capability
+    \(global/pg\_goopg\_features\); Open skips the old\-cluster `InitializeAsCommitted` branch for such
+    clusters and runs the WAL clog replay \+ implicit\-abort sweep\. Pre\-marker clusters and PG
+    base\-backup standbys keep the upgrade branch\. Design:
+    `docs/design/0100\-0149/m0146\-0152\-clog\-complete\-history\.md`\.
+  - `TestCrashBeforeFirstCommitTableNotVisible` \(the repro without `committed\_first`\) is red on HEAD,
+    green now\. A live server rarely hits it: its own startup work usually commits first\.
+  Movement: none — crash\-recovery correctness; no TPC or regress witness
 - [ ] **M0146\-0153 — a GENERATED ALWAYS identity column accepts an explicit
   value on plain INSERT** \(filed 2026\-10\-10 by M0141\-S2a\-fix2r\-c\)\. `create
   table g\(id int generated always as identity, t text\); insert into g\(id,t\)
