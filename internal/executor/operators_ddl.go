@@ -1728,6 +1728,11 @@ func resolveFDWValidatorFunc(rs *catalog.Routines, funcName parser.ObjectName) (
 		}
 		return r.OID, nil
 	}
+	// The built-in postgresql_fdw_validator (pg_catalog) — not a user routine.
+	// M0122-0015g.
+	if oid, ok := builtinFDWValidatorOID(funcName); ok {
+		return oid, nil
+	}
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(text[], oid) does not exist", funcName.String())}
 }
 
@@ -2091,6 +2096,22 @@ func (o *ddlOp) touchHeapMainForkFile(tbl *catalog.Table) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
+	// CreateForeignTable / the per-column attfdwoptions: the server's
+	// wrapper validates the table options (ForeignTableRelationId) and each
+	// column's options (AttributeRelationId). M0122-0015g.
+	if s.ForeignServer != "" {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			v := fdwValidatorForServer(im, s.ForeignServer, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if verr := validateFDWOptions(v, s.ForeignOptions, fdwOptionsCatalogForeignTbl); verr != nil {
+				return verr
+			}
+			for _, c := range s.Columns {
+				if verr := validateFDWOptions(v, c.FDWOptions, fdwOptionsCatalogAttribute); verr != nil {
+					return verr
+				}
+			}
+		}
+	}
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
 	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
@@ -11201,6 +11222,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if mergeErr != nil {
 						return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
 					}
+					if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+						v := fdwValidatorForServer(im, tbl.ForeignServerName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+						if verr := validateFDWOptions(v, merged, fdwOptionsCatalogAttribute); verr != nil {
+							return verr
+						}
+					}
 					tbl.Columns[i].FDWOptions = merged
 					found = true
 					break
@@ -11235,6 +11262,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			merged, mergeErr := applyFDWOptionChanges(tbl.ForeignOptions, act.FDWOptionChanges)
 			if mergeErr != nil {
 				return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+			}
+			// AlterTableCmd's ATExecGenericOptions: the server's wrapper
+			// validates the merged table options. M0122-0015g.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				v := fdwValidatorForServer(im, tbl.ForeignServerName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				if verr := validateFDWOptions(v, merged, fdwOptionsCatalogForeignTbl); verr != nil {
+					return verr
+				}
 			}
 			tbl.ForeignOptions = merged
 		case parser.AlterTableSetDefault:
@@ -22805,6 +22840,14 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// target FDW must already exist. DU-002 slice 421.
 	if s.Tag == "ALTER FOREIGN DATA WRAPPER" && s.ObjType == "foreign-data wrapper" {
 		fdwName := s.ObjName.String()
+		// AlterForeignDataWrapper: superuser only, checked before the lookup
+		// (foreigncmds.c) — the same SUPERUSER-attribute test CREATE uses.
+		// M0122-0015g.
+		if role := o.ctx.NonSuperuserRole; role != "" {
+			if oid, ok := im.RoleOID(role); !ok || !im.IsSuperuser(oid) {
+				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to alter foreign-data wrapper %q", fdwName), Hint: "Must be superuser to alter a foreign-data wrapper."}
+			}
+		}
 		fdw, found := im.LookupForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
@@ -22816,28 +22859,41 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// def_list_append_merge OPTIONS pass). *Given false means the clause
 		// was absent — leave the existing OID unchanged; Given true with a nil
 		// Func means `NO HANDLER`/`NO VALIDATOR` — clear it.
+		handlerOID, validatorOID := fdw.HandlerOID, fdw.ValidatorOID
 		if s.FDWHandlerGiven {
 			if s.FDWHandlerFunc == nil {
-				fdw.HandlerOID = 0
+				handlerOID = 0
 			} else if oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc); rerr != nil {
 				return rerr
 			} else {
-				fdw.HandlerOID = oid
+				handlerOID = oid
 			}
 		}
 		if s.FDWValidatorGiven {
 			if s.FDWValidatorFunc == nil {
-				fdw.ValidatorOID = 0
+				validatorOID = 0
 			} else if oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc); rerr != nil {
 				return rerr
 			} else {
-				fdw.ValidatorOID = oid
+				validatorOID = oid
+				// AlterForeignDataWrapper: existing options of the wrapper
+				// and its dependents may not satisfy the new validator.
+				o.ctx.AddWarning("changing the foreign-data wrapper validator can cause the options for dependent objects to become invalid")
 			}
 		}
 		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
 		if mergeErr != nil {
 			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
 		}
+		// AlterForeignDataWrapper runs the (possibly new) validator over the
+		// merged options when an OPTIONS clause is given, before anything is
+		// stored. M0122-0015g.
+		if len(s.FDWOptionChanges) > 0 {
+			if verr := validateFDWOptions(validatorOID, merged, fdwOptionsCatalogWrapper); verr != nil {
+				return verr
+			}
+		}
+		fdw.HandlerOID, fdw.ValidatorOID = handlerOID, validatorOID
 		fdw.Options = merged
 		return nil
 	}
@@ -22849,8 +22905,14 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// is per-database. goopg used to register the server against any name.
 		// M0122-0015e.
 		if s.TableName.Name != "" {
-			if _, found := im.LookupForeignDataWrapper(s.TableName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !found {
+			fdw, found := im.LookupForeignDataWrapper(s.TableName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if !found {
 				return &ExecError{Code: "42704", Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.TableName.String())}
+			}
+			// transformGenericOptions(ForeignServerRelationId, ...,
+			// fdw->fdwvalidator). M0122-0015g.
+			if verr := validateFDWOptions(fdw.ValidatorOID, s.Options, fdwOptionsCatalogServer); verr != nil {
+				return verr
 			}
 		}
 		// Register server so DROP SERVER can succeed.
@@ -22922,6 +22984,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 			validatorOID = oid
 		}
+		// CreateForeignDataWrapper: transformGenericOptions over the wrapper's
+		// own options with its validator. M0122-0015g.
+		if verr := validateFDWOptions(validatorOID, s.Options, fdwOptionsCatalogWrapper); verr != nil {
+			return verr
+		}
 		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		fdw.HandlerOID = handlerOID
 		fdw.ValidatorOID = validatorOID
@@ -22945,6 +23012,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// (M0122-0007 4e follow-up 38) instead of round-tripping the literal
 		// keyword text.
 		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+		// CreateUserMapping validates the options with the server's wrapper's
+		// validator (UserMappingRelationId). M0122-0015g.
+		if verr := validateFDWOptions(fdwValidatorForServer(im, s.TableName.String(), umDBOid), s.Options, fdwOptionsCatalogUserMapping); verr != nil {
+			return verr
+		}
 		umUser := o.resolveUserMappingRoleName(s.ObjName.String())
 		um := im.RegisterUserMapping(umUser, s.TableName.String(), s.Options, umDBOid)
 		// B3.4: the mapping journals as a real pg_user_mapping heap row +
