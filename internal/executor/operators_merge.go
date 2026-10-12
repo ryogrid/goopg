@@ -704,16 +704,17 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		writeTgtRow := mod.tgtRow
 		destRel := rel
 		destCols := tbl.Columns
+		destTbl := tbl
 		if tbl != parentTbl {
 			writeTgtRow = remapRowForPartition(parentTbl.Columns, tbl.Columns, mod.tgtRow)
 			// Route newRow to the correct partition; for cross-partition UPDATEs
 			// (e.g. key change that moves a row to a different child), destRel/destCols
 			// will differ from rel/tbl.Columns. M0100-0007.
-			destRel, destCols, writeNewRow = o.routeModNewRow(parentTbl, tbl, rel, mod.newRow)
+			destRel, destCols, destTbl, writeNewRow = o.routeModNewRow(parentTbl, tbl, rel, mod.newRow)
 		}
 		switch mod.action {
 		case optimizer.MergeActionUpdate:
-			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, o.plan.Pos(), o.updateColumns())
+			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, destTbl, o.plan.Pos(), o.updateColumns())
 		case optimizer.MergeActionDelete:
 			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeTgtRow, o.plan.Pos())
 		default:
@@ -804,15 +805,17 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 // to a different child partition. newRowParent must be in parentTbl column order.
 // If routing is unavailable or the row stays in the same partition, scanRel/scanTbl
 // are returned unchanged. M0100-0007.
-func (o *mergeOp) routeModNewRow(parentTbl, scanTbl *catalog.Table, scanRel storage.RelFileNode, newRowParent Row) (destRel storage.RelFileNode, destCols []catalog.Column, writeNewRow Row) {
+func (o *mergeOp) routeModNewRow(parentTbl, scanTbl *catalog.Table, scanRel storage.RelFileNode, newRowParent Row) (destRel storage.RelFileNode, destCols []catalog.Column, destTbl *catalog.Table, writeNewRow Row) {
 	destRel = scanRel
 	destCols = scanTbl.Columns
+	destTbl = scanTbl
 	writeNewRow = remapRowForPartition(parentTbl.Columns, scanTbl.Columns, newRowParent)
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		dp, _ := routeToPartition(parentTbl, newRowParent, im, o.ctx)
 		if dp != nil && dp.OID != scanTbl.OID {
 			destRel = o.ctx.Catalog.RelFileNode(dp)
 			destCols = dp.Columns
+			destTbl = dp
 			writeNewRow = remapRowForPartition(parentTbl.Columns, dp.Columns, newRowParent)
 		}
 	}
@@ -949,7 +952,7 @@ func mergeClauseCondMatches(clause *optimizer.MergeWhenClause, row Row, ctx *Con
 // mergeApplyUpdate writes a MERGE MATCHED UPDATE.  destRel/destCols specify the
 // destination partition for cross-partition moves (same as rel/cols when the row
 // stays in the same partition). M0100-0007.
-func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, destRel storage.RelFileNode, destCols []catalog.Column, pos int, updCols map[string]bool) error {
+func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, destRel storage.RelFileNode, destCols []catalog.Column, destTbl *catalog.Table, pos int, updCols map[string]bool) error {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -1087,10 +1090,27 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if derr != nil {
 		return derr
 	}
+	// Unique constraints, checked after the old version is stamped dead —
+	// the UPDATE index path's order (checkUniqueIndexesForUpdate). A key
+	// change onto an existing key raises 23505 as in PG; a cross-partition
+	// move probes every unique index of the destination (M0146-0169).
+	if destTbl != nil {
+		if uerr := checkUniqueIndexesForUpdate(ctx, destTbl, destCols, tgtRow, newRow, crossPart, pos); uerr != nil {
+			return uerr
+		}
+	}
 	// Write new tuple to destination (may differ for cross-partition moves).
 	newPtr, werr := writeHeapRowReturning(ctx, destRel, destCols, newRow)
 	if werr != nil {
 		return werr
+	}
+	// The new version is written non-HOT, so every index on the destination
+	// needs an entry for it, as UPDATE's index path files one
+	// (ExecUpdate → ExecInsertIndexTuples, execIndexing.c). Without it an
+	// index scan reached only the dead old version and missed the row
+	// (M0146-0169).
+	if destTbl != nil {
+		maintainUniqueIndexesForInsert(ctx, destTbl, destCols, newRow, newPtr)
 	}
 	// M0125-0052: fence the new version like the UPDATE paths do.
 	// Link old→new via t_ctid for same-partition updates so EPQ chain
