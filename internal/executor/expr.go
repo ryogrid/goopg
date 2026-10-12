@@ -16678,21 +16678,20 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 
 	case "array_cat":
-		// array_cat(anyarray, anyarray) → anyarray
+		// array_cat(anyarray, anyarray) → anyarray. Shares `||`'s
+		// evaluator: NULL only for two NULLs, a NULL or empty operand
+		// otherwise ignored, arrays one dimension apart nested
+		// (array_userfuncs.c); argument errors propagate (M0146-0125).
 		if len(x.Args) == 2 {
 			a1, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
 			a2, e2 := evalExprSlot(x.Args[1], slot, ctx)
-			if e1 != nil || e2 != nil {
-				return NullDatum, nil
+			if e2 != nil {
+				return Datum{}, e2
 			}
-			var elems []string
-			if !a1.IsNull() {
-				elems = append(elems, parseTextArray(a1.StringValue())...)
-			}
-			if !a2.IsNull() {
-				elems = append(elems, parseTextArray(a2.StringValue())...)
-			}
-			return NewStringDatum(formatTextArray(elems)), nil
+			return evalArrayConcat(a1, a2, concatArrayCat, ctx)
 		}
 
 	case "array_remove":
@@ -21949,6 +21948,11 @@ func enterSublinkCTEWindow(ctx *Context, correlated bool) func() {
 // concatGuess, for operands whose types are unknown or array-typed, keeps the
 // shape-based array handling.
 func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datum, error) {
+	switch mode {
+	case concatArrayCat, concatArrayAppend, concatArrayPrepend:
+		// Non-strict array operators: they see NULL operands (M0146-0125).
+		return evalArrayConcat(left, right, mode, ctx)
+	}
 	// || requires at least one string-typed operand. When one side is text
 	// (or string-like), the other side is coerced to text. When both sides
 	// are non-string (e.g. integer || numeric), PostgreSQL raises

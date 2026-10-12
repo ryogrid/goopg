@@ -274,6 +274,12 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 				(*s)[idx].payload[16] |= 8
 			case concatJSONB:
 				(*s)[idx].payload[16] |= 16
+			case concatArrayCat:
+				(*s)[idx].payload[16] |= 32
+			case concatArrayAppend:
+				(*s)[idx].payload[16] |= 64
+			case concatArrayPrepend:
+				(*s)[idx].payload[16] |= 128
 			}
 		}
 		return idx
@@ -489,6 +495,12 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				mode = concatText
 			case n.payload[16]&16 != 0:
 				mode = concatJSONB
+			case n.payload[16]&32 != 0:
+				mode = concatArrayCat
+			case n.payload[16]&64 != 0:
+				mode = concatArrayAppend
+			case n.payload[16]&128 != 0:
+				mode = concatArrayPrepend
 			}
 			result, err = evalConcat(left, right, pos, ctx, mode)
 		} else {

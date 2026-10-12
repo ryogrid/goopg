@@ -540,6 +540,12 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 		}
 	}
 
+	// `||` with an array operand is array_cat / array_append /
+	// array_prepend, which are not strict: a NULL operand acts as an empty
+	// array or a NULL element (M0146-0125). Leave it to the executor.
+	if op == parser.OpConcat && (exprIsArrayTyped(l) || exprIsArrayTyped(r)) {
+		return nil
+	}
 	// If either side is NULL and it's not AND/OR, the result is NULL.
 	if _, ok := l.(*NullConst); ok {
 		return &NullConst{pos: pos}
@@ -1247,4 +1253,14 @@ func conditionalArgsShareType(args []Expr) bool {
 		}
 	}
 	return seen
+}
+
+// exprIsArrayTyped reports an operand whose resolved type is an array.
+func exprIsArrayTyped(e Expr) bool {
+	t, ok := ExprResultType(e)
+	if !ok {
+		return false
+	}
+	name := strings.ToLower(t.Name)
+	return t.IsArray || strings.HasSuffix(name, "]") || strings.HasPrefix(name, "_")
 }
