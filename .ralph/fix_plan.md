@@ -31943,6 +31943,20 @@ Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to CO
   - First step: run the current build with `GOOPG_INDEX_PROBE_MULT=1` vs `=2`
     on the fire set to reproduce the 0068 table before touching code\.
   - Follow\-on: re\-measure M0145\-0008ag\'s Q14 premise after this lands\.
+  - 2026\-10\-13 progress \(loop 24\): the retirement is implemented, STAGED and gated but NOT committed\.
+    - Change: the 6 `\* indexProbeCostMultiplier` sites in costindex\.go and indexProbeCost drop the factor; the
+      variable, env resolver, constant and `SetIndexProbeCostMultiplier` are deleted; GOOPG\_INDEX\_PROBE\_MULT
+      is retired in flaglabels \(planner\-flags\.env regenerated\); 16 tests updated, each checked against PG 18\.3\.
+    - The "reproduce the 0068 table first" step: retirement is bit\-identical to mult=1 \(x\*1\.0 is exact\), so the
+      fire\-set gate's HEAD\-vs\-staged A/B IS the mult=2\-vs\-1 A/B at today's HEAD\.
+    - Evidence `analysis/m0146/m0146\-0159/`: MATCH SF0\.25 56 → 70, SF1 42 → 45, TPC\-H 11 → 13; no confirmed
+      wall\-clock regression after 3\-round repeats \(Q54/Q71 no longer regress\); TPC\-H values identical\.
+    - Gates on the staged code: units PASS, tpch\-spotcheck PASS, acceptance arm PASS, fire\-set PASS; **sf025
+      CKMISMATCH Q32** \(NULL vs 2444\.35\) — a pre\-existing executor bug the new plan exposes, filed M0146\-0170\.
+    - Found and landed M0146\-0169 \(MERGE UPDATE index entries\) on the way — it blocked the units gate\.
+    - Patch: `tmp/m0159/0159\-full\.patch` \(backup `~/m0159\-backup\-full\.patch`\)\. Design:
+      `docs/design/0100\-0149/m0146\-0159\-retire\-index\-probe\-mult\.md`\.
+  - Blocked by: M0146\-0170\. Resume: land 0170, rerun the sf025 sweep on the staged code, commit\.
 - [x] **M0146-0169 — WRONG RESULTS: a MERGE UPDATE files no index entry for the new row version and skips the unique check** \(filed
   2026\-10\-13 by M0146\-0159\)\. After `MERGE … WHEN MATCHED THEN UPDATE`, every index scan misses the updated row
   \(`WHERE a = 1` returns 0 rows with `enable_seqscan = off`; a Seq Scan still sees it\), and a key change onto an
@@ -31964,3 +31978,21 @@ Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to CO
     `docs/design/0100\-0149/m0146\-0169\-merge\-update\-indexes\.md`\.
 Movement: none — instrument artefact — no TPC query runs MERGE; regress merge identical \(its diffs never read a
   MERGE\-updated row through an index\)
+- [ ] **M0146-0170 — WRONG RESULTS: a correlated SubPlan with a parameterised nested loop inside returns wrong rows
+  when evaluated in a join qual** \(filed 2026\-10\-13 by M0146\-0159\)\. TPC\-DS Q32 at SF0\.25 returns NULL \(PG
+  2444\.35\) once its SubPlan becomes `Aggregate → Nested Loop \(Bitmap Heap Scan catalog\_sales → Index Scan
+  date\_dim\_pkey \(d\_date\_sk = catalog\_sales\.cs\_sold\_date\_sk\)\)` inside a Hash Join's Join Filter whose other
+  side \(item\) supplies the correlation\. Reproduces on HEAD with nested loops forced:
+  `analysis/m0146/m0146\-0159/q32\-subplan\-param\-repro\.sql` → NULL, PG 26457\. Correct when the same subquery is
+  in a target list, or in a qual over a single relation\. EXPLAIN prints the inner key as `cs\.sold` even when the
+  subquery aliases the table — the nestloop param \(`outerParamKey`, `OuterColumnRef\{Level: 1\}`, read from
+  `ctx\.OuterRows`\) is the first suspect \(unconfirmed\)\.
+  Kind: impl
+  Parent: M0146\-0159
+  - Rank: blocker of M0146\-0159 \(its sf025 gate is red on Q32 without it\)\.
+  - First step: instrument the OuterRows stack at the dd Index Scan rescan in the repro \(push/pop sites of the
+    outer join qual's SubPlan evaluation vs the subplan's lateral NL\) and compare the row it reads against the
+    NL's pushed outer row\.
+  > ## ESCALATION 2026\-10\-13 \(S2\) — correlated SubPlan + inner nestloop param returns wrong rows
+  > Pre\-existing on HEAD \(forced shape\); exposed in TPC\-DS Q32 by M0146\-0159\'s retirement\. Filed as 0159\'s
+  > blocker so the parity work is not stranded; owner may re\-place\.
