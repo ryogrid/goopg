@@ -30060,7 +30060,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     CURRENT, statement\-start GUC snapshots and the CREATE TEMP TABLE
     shadow failure are ledgered\.
   Movement: yes — regress guc 385 → 352 diff lines \(function SET section now matches PG\); probe arms 0 → all matching
-- [ ] **M0146\-0157 — WRONG RESULTS: a SECURITY DEFINER routine runs as its
+- [x] **M0146\-0157 — WRONG RESULTS: a SECURITY DEFINER routine runs as its
   caller** \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
   confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
   goopg stores prosecdef but
@@ -30074,6 +30074,29 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     swap ctx\.NonSuperuserRole / the current\_user source to the routine
     owner for the call and restore it on every exit path; probe
     current\_user and a privilege\-gated SELECT against PG 18\.3\.
+  - Done 2026\-10\-12 \(`0fbe34f51`\): `enterRoutineConfig` is now the whole
+    fmgr\_security\_definer — `Context\.SecurityDefinerUser` \(current\_user\) and
+    `NonSuperuserRole` \(privileges\) switch to proowner around every routine body; SET/RESET
+    ROLE and SESSION AUTHORIZATION refused inside \(42501\)\. Design:
+    `docs/design/0100\-0149/m0146\-0157\-security\-definer\.md`\.
+  - Prerequisites fixed in the same change: CREATE FUNCTION/PROCEDURE recorded no owner
+    \(proowner = bootstrap superuser, so a switch would have escalated every definer\); OR
+    REPLACE now keeps the owner; procedures no longer drop SECURITY DEFINER at parse time\.
+  - Found: table GRANTs lost on restart — filed S2 M0146\-0161\.
+  Movement: yes — regress privileges 3879 → 3868 diff lines \(priv\_testfunc4 / dogrant\_ok run with the owner\'s rights\)
+- [ ] **M0146\-0161 — WRONG RESULTS: table GRANTs \(relacl\) are lost on restart** \(filed
+  2026\-10\-12 by M0146\-0157; S2\)\. At HEAD `0fbe34f51`'s parent: `CREATE ROLE ro; CREATE TABLE
+  sx\(v int\); GRANT SELECT ON sx TO ro` shows `relacl = \{postgres=arwdDxtm/postgres,ro=r/postgres\}`;
+  after a clean restart `relacl` is empty and `SET ROLE ro; SELECT \* FROM sx` is denied\. A
+  REVOKE from PUBLIC presumably reverts the same way \(privilege widening\)\. PG: relacl is a
+  pg\_class column, durable\.
+  Kind: impl
+  Parent: M0146\-0157
+  - First step: find where GRANT ON TABLE writes relacl \(postmaster grant\_ddl\.go
+    tryRecordTableGrant / the pg\_class heap row\) and whether loadUserTablesFromHeap reads the
+    relacl column back; probe REVOKE \.\.\. FROM PUBLIC and column grants too\.
+  > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0161 loses granted privileges on restart
+  > Filed under M0146\-0157, so it inherits item 2a\'s rank; owner: confirm or place\.
 - [ ] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
   confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
