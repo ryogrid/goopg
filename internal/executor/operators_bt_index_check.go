@@ -656,7 +656,7 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 			if allowRoutine && i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
 				if procOID, found := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
 					catalog.AccessMethodOIDByName(method), 1); found {
-					if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+					if r := routineRegistry(ctx).LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
 						kc.routine = r
 						anyRoutine = true
 					}
@@ -679,7 +679,7 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 		if i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
 			if procOID, ok := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
 				catalog.AccessMethodOIDByName(method), 1); ok {
-				if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+				if r := routineRegistry(ctx).LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
 					kc.routine = r
 					anyRoutine = true
 				}

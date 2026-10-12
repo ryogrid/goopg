@@ -270,7 +270,7 @@ func defaultExprVolatile(ctx *Context, e parser.Expr) bool {
 				return true
 			}
 			if ctx != nil && ctx.Catalog != nil {
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					for _, r := range rs.LookupByName(parser.ObjectName{Name: name}) {
 						if r.Volatile == "v" || r.Volatile == "" {
 							return true

@@ -237,7 +237,7 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 					tempTypeNames := im.SessionTempTableNames(owner)
 					im.DropSessionTempObjects(owner)
 					if len(tempTypeNames) > 0 {
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							rs.DropRoutinesReferencingTypes(tempTypeNames)
 						}
 					}

@@ -286,7 +286,7 @@ func mirrorProcCatalogFiles(ctx *Context) error {
 // a heap INSERT for a new routine, or a non-HOT heap UPDATE of the existing
 // row when OR REPLACE preserved the OID and a live row exists.
 func syncRoutineToCatalogHeap(ctx *Context, r *catalog.Routine) error {
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	if rs == nil || ctx.Pool == nil {
 		return nil
 	}
@@ -351,7 +351,7 @@ func updateRoutineCatalogHeapRow(ctx *Context, r *catalog.Routine) error {
 // deleteRoutineCatalogHeapRow journals DROP FUNCTION/PROCEDURE: a heap
 // DELETE (xl_heap_delete) of the routine's row. Missing TID is a no-op.
 func deleteRoutineCatalogHeapRow(ctx *Context, oid uint32) error {
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	if rs == nil || ctx.Pool == nil {
 		return nil
 	}

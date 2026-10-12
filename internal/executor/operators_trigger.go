@@ -40,7 +40,7 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 // known: a column-specific `UPDATE OF` trigger is skipped unless updCols
 // names one of its columns (TriggerEnabled, trigger.c; M0146-0076).
 func fireTriggersCols(ctx *Context, tbl *catalog.Table, timing, event string, oldRow, newRow Row, updCols map[string]bool) (Row, bool, error) {
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	if rs == nil {
 		return newRow, true, nil
 	}
@@ -111,7 +111,7 @@ func fireStatementTriggers(ctx *Context, tbl *catalog.Table, timing, event strin
 // target columns are known: a column-specific `UPDATE OF` trigger is skipped
 // unless updCols names one of its columns (M0146-0076).
 func fireStatementTriggersCols(ctx *Context, tbl *catalog.Table, timing, event string, updCols map[string]bool) error {
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	if rs == nil {
 		return nil
 	}
@@ -316,7 +316,7 @@ func triggerMatchesEvent(trig *catalog.Trigger, timing, event string) bool {
 
 // lookupTriggerRoutine finds the trigger function in the routine registry.
 func lookupTriggerRoutine(ctx *Context, trig *catalog.Trigger) *catalog.Routine {
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	if rs == nil {
 		return nil
 	}

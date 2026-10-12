@@ -399,7 +399,7 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		// above. Builtins resolve through the global pg_proc index below, which
 		// is not dbOid-scoped (pg_catalog is implicitly visible everywhere).
 		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
-		if rs := ctx.Catalog.Routines(); rs != nil {
+		if rs := routineRegistry(ctx); rs != nil {
 			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn}, connDBOid)
 			if len(candidates) > 0 {
 				return NewIntDatum(int64(candidates[0].OID)), nil

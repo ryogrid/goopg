@@ -197,7 +197,7 @@ func computeHashPartitionRowHash(tbl *catalog.Table, im *catalog.InMemory, ctx *
 			// Custom operator class: look up FUNCTION 2 and call it(val, seed).
 			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
 			if hasFn {
-				routines := ctx.Catalog.Routines()
+				routines := routineRegistry(ctx)
 				if routines != nil {
 					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
 					seedDatum := NewIntDatum(int64(hashPartitionSeed))

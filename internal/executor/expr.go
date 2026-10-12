@@ -663,7 +663,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if !nameOK {
 					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
 				}
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					// Thread the connection's dbOid like regIdentifierInput's
 					// regproc/regprocedure arm does — an unscoped LookupByName
 					// resolves DefaultDBOid and leaks another database's
@@ -718,7 +718,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if isProcedure {
 					var routines *catalog.Routines
 					if ctx != nil && ctx.Catalog != nil {
-						routines = ctx.Catalog.Routines()
+						routines = routineRegistry(ctx)
 					}
 					// format_procedure (regproc.c:326) qualifies only the NAME —
 					// quote_qualified_identifier(schema,name)(arglist) when the
@@ -754,7 +754,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 					return NewStringDatum(name), nil
 				}
 				if ctx != nil && ctx.Catalog != nil {
-					if r := ctx.Catalog.Routines().LookupByOID(uint32(oid)); r != nil {
+					if r := routineRegistry(ctx).LookupByOID(uint32(oid)); r != nil {
 						// Schema-qualify exactly like the regprocedure/
 						// regoperator branches below: pg_dump's own connection
 						// always runs with search_path='', so
@@ -14774,7 +14774,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if ctx == nil || ctx.Catalog == nil {
 				return NullDatum, nil
 			}
-			rs := ctx.Catalog.Routines()
+			rs := routineRegistry(ctx)
 			if rs == nil {
 				return NullDatum, nil
 			}
@@ -14839,7 +14839,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
 						// RETURNS TABLE: PG's pg_get_function_result renders the
 						// table columns (stored here as trailing OUT args) as

@@ -5665,6 +5665,12 @@ func (c *InMemory) DropDatabase(name string) error {
 			n.schemaOwners = make(map[string]uint32)
 			n.schemaHeapTIDs = make(map[string]SchemaHeapTID)
 		}
+		// Its routines too (pg_proc is per-database): LookupByOID and List
+		// span every database, so a dropped database's functions would
+		// otherwise linger. M0146-0156.
+		if db := NamespaceDBOid(oid); db != DefaultDBOid && c.routines != nil {
+			c.routines.DropAllInDB(db)
+		}
 	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
@@ -25857,6 +25863,13 @@ func (c *SearchPathCatalog) effectiveDBOid(explicit []uint32) []uint32 {
 		return explicit
 	}
 	return []uint32{NamespaceDBOid(c.DBOid)}
+}
+
+// Routines returns the routine registry bound to the querying connection's
+// database: pg_proc is per-database, so function resolution during planning
+// must see only that database's routines. M0146-0156.
+func (c *SearchPathCatalog) Routines() *Routines {
+	return c.Catalog.Routines().InDB(c.effectiveDBOid(nil)[0])
 }
 
 // SchemaExists / SchemaOID / RegisterSchema / UnregisterSchema key off the

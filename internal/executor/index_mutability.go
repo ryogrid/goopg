@@ -32,7 +32,7 @@ import (
 // sync" pattern: one of two ports of the same upstream predicate was
 // written and the other was not. Both now share exprHasNonImmutableFunction
 // below, which also fixes the partition-key path's own gap — it consulted
-// ONLY ctx.Catalog.Routines() (user-defined functions), so a bare volatile
+// ONLY routineRegistry(ctx) (user-defined functions), so a bare volatile
 // BUILT-IN such as `PARTITION BY RANGE ((a + (random()*10)::int))` slipped
 // through it too.
 //

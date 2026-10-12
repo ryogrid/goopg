@@ -1599,7 +1599,7 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
 		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create access method %q", s.Name)}
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires routine registry"}
 	}
@@ -7324,7 +7324,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 							return err
 						}
 					} else if d.kind == "function" && d.routine != nil {
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							_ = rs.DropRoutine(d.routine)
 						}
 					}
@@ -7761,7 +7761,7 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 	if len(drops) == 0 {
 		return
 	}
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	for _, d := range drops {
 		if d.Routine == nil {
 			continue
@@ -17306,7 +17306,7 @@ func argTypeOID(a parser.ColumnType) uint32 {
 // arrives in step 4+. Stage A pins LANGUAGE to plpgsql or sql;
 // other languages surface a typed diagnostic.
 func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
 	}
@@ -17916,7 +17916,7 @@ func checkBodyOperatorTypes(stmts []parser.Stmt, args []parser.FunctionArg, func
 }
 
 func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return nil // no routine registry, silently skip
 	}
@@ -18089,7 +18089,7 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 // Routines() registry (M0015 Stage B). Mirror of execCreateFunction
 // but without RETURNS — procedures use OUT/INOUT params instead.
 func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
 	}
@@ -18187,7 +18187,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	// Validate SQL body: check if a CALL targets a procedure with output args.
 	// PG rejects this at function-creation time for SQL functions.
 	if lang == "sql" && !s.BeginAtomic && s.Body != "" {
-		if rs := o.ctx.Catalog.Routines(); rs != nil {
+		if rs := routineRegistry(o.ctx); rs != nil {
 			bodyStmts, _ := parser.Parse(s.Body)
 			for _, stmt := range bodyStmts {
 				call, ok := stmt.(*parser.CallStmt)
@@ -18274,7 +18274,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if objKind == "" {
 		objKind = "procedure"
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
 	}
@@ -18421,7 +18421,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			}
 		}
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
 	}
@@ -21214,7 +21214,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
-				rs := o.ctx.Catalog.Routines()
+				rs := routineRegistry(o.ctx)
 				if rs != nil {
 					dropDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 					for _, r := range rs.List() {
@@ -21696,7 +21696,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if len(funcDeps) == 1 {
 					dn := routineCascadeDisplayName(funcDeps[0])
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
-					if rs := o.ctx.Catalog.Routines(); rs != nil {
+					if rs := routineRegistry(o.ctx); rs != nil {
 						_ = rs.DropRoutine(funcDeps[0])
 					}
 				} else if len(funcDeps) > 1 {
@@ -21704,7 +21704,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					for i, r := range funcDeps {
 						dn := routineCascadeDisplayName(r)
 						detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							_ = rs.DropRoutine(r)
 						}
 					}
@@ -25228,7 +25228,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		ffLower := strings.ToLower(s.FinalFunc)
 		found := knownBuiltinAggFinalFuncs[ffLower]
 		if !found {
-			if rs := o.ctx.Catalog.Routines(); rs != nil {
+			if rs := routineRegistry(o.ctx); rs != nil {
 				if candidates := rs.LookupByName(parser.ObjectName{Name: s.FinalFunc}); len(candidates) > 0 {
 					found = true
 				}
@@ -25256,7 +25256,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	// Check if the sfunc is STRICT by looking it up in the routine registry.
 	// A strict sfunc skips NULL inputs (the aggregate state is unchanged on NULL rows). M0097-0035.
-	if rs := o.ctx.Catalog.Routines(); rs != nil && s.SFunc != "" {
+	if rs := routineRegistry(o.ctx); rs != nil && s.SFunc != "" {
 		sfuncName := parser.ObjectName{Name: s.SFunc}
 		if candidates := rs.LookupByName(sfuncName); len(candidates) > 0 {
 			agg.SFuncStrict = candidates[0].Strict

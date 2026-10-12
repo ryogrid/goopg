@@ -188,6 +188,19 @@ func (r *Routine) Signature() string {
 // single RWMutex — routine cardinality is tiny relative to table
 // rowcounts.
 type Routines struct {
+	*routineStore
+
+	// db is the database this handle resolves calls that pass no dbOid
+	// against (0 = DefaultDBOid). pg_proc is per-database in PostgreSQL, so
+	// a connection must find only its own database's routines: InDB hands
+	// out a handle bound to the connection's database over the same store,
+	// and the planner's SearchPathCatalog and the executor's
+	// routineRegistry return such handles. M0146-0156.
+	db uint32
+}
+
+// routineStore is the registry state every database's handle shares.
+type routineStore struct {
 	mu      sync.RWMutex
 	byKey   map[string]*Routine // schema.name(argtypes) → routine
 	byName  map[string][]string // schema.name → list of overload keys
@@ -198,6 +211,29 @@ type Routines struct {
 	// INSERT and by the startup reload, refreshed by every ALTER's heap
 	// UPDATE, deleted with the routine.
 	heapTIDs map[uint32]SchemaHeapTID
+}
+
+// InDB returns a handle over the same registry whose lookups default to
+// dbOid's routines (normalised with NamespaceDBOid, so the connection's real
+// postgres OID reads the default namespace). OID-keyed calls and List are
+// unaffected: routine OIDs are cluster-unique.
+func (rs *Routines) InDB(dbOid uint32) *Routines {
+	if rs == nil {
+		return nil
+	}
+	return &Routines{routineStore: rs.routineStore, db: NamespaceDBOid(dbOid)}
+}
+
+// dbFor resolves the database a call addresses: an explicit dbOid wins, then
+// the handle's own database, then DefaultDBOid.
+func (rs *Routines) dbFor(dbOid []uint32) uint32 {
+	if len(dbOid) > 0 && dbOid[0] != 0 {
+		return dbOid[0]
+	}
+	if rs.db != 0 {
+		return rs.db
+	}
+	return DefaultDBOid
 }
 
 // HeapTID returns the live pg_proc heap TID for the routine OID.
@@ -250,11 +286,11 @@ const FirstRoutineOID uint32 = 1 << 17
 
 // NewRoutines returns an empty registry.
 func NewRoutines() *Routines {
-	return &Routines{
+	return &Routines{routineStore: &routineStore{
 		byKey:   make(map[string]*Routine),
 		byName:  make(map[string][]string),
 		nextOID: FirstRoutineOID,
-	}
+	}}
 }
 
 // routineDBPrefix folds dbOid into a registry key, mirroring domainKey's
@@ -291,7 +327,7 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
 	if clone.DBOid == 0 {
-		clone.DBOid = DefaultDBOid
+		clone.DBOid = rs.dbFor(nil)
 	}
 	signature := clone.Signature()
 	rs.mu.Lock()
@@ -345,11 +381,13 @@ func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
 	clone := *r
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
-	// WAL payloads don't carry a dbOid yet (restart-persistence follow-up
-	// above) — recovery always replays into DefaultDBOid, matching the
-	// single-database replay convention CreateSequenceCatalogRelation
-	// documents for the same reason.
-	clone.DBOid = DefaultDBOid
+	// The caller stamps the database whose pg_proc heap the row came from
+	// (reloadUserRoutinesFromHeapForDB); an unstamped routine replays into
+	// DefaultDBOid. M0146-0156: this used to force DefaultDBOid, so every
+	// database's routines collapsed into the default one on restart.
+	if clone.DBOid == 0 {
+		clone.DBOid = DefaultDBOid
+	}
 	k := routineKey(clone.DBOid, schema, clone.Name, clone.Signature())
 	if _, exists := rs.byKey[k]; !exists {
 		nk := nameKey(clone.DBOid, schema, clone.Name)
@@ -360,6 +398,26 @@ func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
 		rs.nextOID = clone.OID + 1
 	}
 	return &clone
+}
+
+// DropAllInDB removes every routine registered in dbOid's database, for
+// DROP DATABASE (the database's pg_proc heap goes with its directory).
+func (rs *Routines) DropAllInDB(dbOid uint32) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for k, r := range rs.byKey {
+		if r.DBOid != dbOid {
+			continue
+		}
+		delete(rs.byKey, k)
+		delete(rs.heapTIDs, r.OID)
+	}
+	prefix := routineDBPrefix(dbOid)
+	for nk := range rs.byName {
+		if strings.HasPrefix(nk, prefix) {
+			delete(rs.byName, nk)
+		}
+	}
 }
 
 // DropByOIDDuringRecovery is the idempotent counterpart to
@@ -454,7 +512,7 @@ func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type, dbOid ...uin
 func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, bool) {
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	sig := stub.Signature()
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
@@ -478,7 +536,7 @@ func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, 
 // When schema is empty, searches all schemas (search-path style).
 // dbOid is a trailing variadic parameter, mirroring Lookup.
 func (rs *Routines) LookupByName(name parser.ObjectName, dbOid ...uint32) []*Routine {
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
@@ -509,7 +567,7 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type, dbOid ...uint3
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
 	signature := stub.Signature()
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	// Resolve schema when not provided: try public first, then all schemas.
@@ -554,7 +612,7 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type, dbOid ...uint3
 // SQLSTATE 42725. When schema is empty, searches all schemas.
 func (rs *Routines) DropByName(name parser.ObjectName, dbOid ...uint32) error {
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	prefix := routineDBPrefix(db)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -636,7 +694,7 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 // schema is empty, searches all schemas.
 func (rs *Routines) ResolveByName(name parser.ObjectName, dbOid ...uint32) (*Routine, error) {
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
@@ -684,7 +742,7 @@ func (rs *Routines) ResolveBySigWithArgModes(name parser.ObjectName, argTypes []
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	signature := stub.Signature()
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
@@ -1015,7 +1073,7 @@ func normalizeDropType(t string) string {
 // false, any param mode at position i matches. If ModeExplicit is true,
 // only matching modes are accepted.
 func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.FunctionArg, dbOid ...uint32) []*Routine {
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	dropTypes := make([]string, len(args))
 	for i, a := range args {
 		dropTypes[i] = normalizeDropType(a.Type.Name)

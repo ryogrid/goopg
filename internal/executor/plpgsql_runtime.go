@@ -1120,11 +1120,14 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	return frame.returnNextRows, nil
 }
 
+// routineRegistry returns the routine registry bound to the connection's
+// database (pg_proc is per-database; M0146-0156). Every executor path that
+// resolves, creates or alters a routine goes through it.
 func routineRegistry(ctx *Context) *catalog.Routines {
 	if ctx == nil || ctx.Catalog == nil {
 		return nil
 	}
-	return ctx.Catalog.Routines()
+	return ctx.Catalog.Routines().InDB(ctx.CurrentDatabaseOid)
 }
 
 func parseRoutineName(name string) parser.ObjectName {
