@@ -31361,7 +31361,7 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > Owner: place M0146\-0125 in the banner\.
   > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
   > amendment\)\.**
-- [ ] **M0146\-0126 — WRONG RESULTS: COALESCE does not resolve its arguments\' common type**
+- [x] **M0146\-0126 — WRONG RESULTS: COALESCE does not resolve its arguments\' common type**
   \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT coalesce\(1, 2\.5\) / 3` returns `0` on goopg; PG 18\.3 returns
   `0\.33333333333333333333`\. `pg\_typeof\(coalesce\(1, 2\.5\)\)` is `integer` on goopg, `numeric` on PG\. The same holds with a
   column operand \(`coalesce\(a, 2\.5\) / 3`\)\. PG\'s transformCoalesceExpr \(parse\_expr\.c\) runs select\_common\_type over all
@@ -31376,6 +31376,26 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > Owner: place M0146\-0126 in the banner\.
   > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
   > amendment\)\.**
+  - Done 2026\-10\-12 \(`8cf809315`\): `coerceCommonTypeArgs` \(select\_common\_type \+
+    coerce\_to\_common\_type\) at the three FuncCall build sites; the evaluators propagate argument
+    errors\. Also fixed: CREATE TABLE AS stored coalesce\(int, numeric\) 2\.5 as 3; coalesce\(int, text\)
+    did not error\. Design: `docs/design/0100\-0149/m0146\-0126\-coalesce\-common\-type\.md`\.
+  - Filed: M0146\-0163 \(now\(\) typed timestamp\), M0146\-0164 \(float8 division digits\)\.
+  Movement: none — expression typing; regress expression cases identical, fire set empty
+- [ ] **M0146\-0163 — now\(\) is typed timestamp, not timestamptz** \(filed 2026\-10\-12 by
+  M0146\-0126\)\. `pg\_typeof\(now\(\)\)` is `timestamp without time zone` on goopg, `timestamp with
+  time zone` on PG 18\.3 \(pg\_proc prorettype 1184\); it also skews the COALESCE mismatch error text\.
+  Kind: impl
+  Parent: M0146\-0126
+  - First step: find the now / current\_timestamp / transaction\_timestamp arms of exprType and
+    funcCallResultType and the value they produce; probe comparisons and casts against PG\.
+- [ ] **M0146\-0164 — float8 division prints 15 significant digits** \(filed 2026\-10\-12 by
+  M0146\-0126\)\. `select 1::float8 / 3` prints `0\.333333333333333` on goopg; PG 18\.3 prints
+  `0\.3333333333333333` \(float8out shortest round\-trip, extra\_float\_digits=1\)\.
+  Kind: impl
+  Parent: M0146\-0126
+  - First step: trace the datum the division operator produces and the output formatter it reaches
+    \(PGFloatOut is the reference; a %\.15g path is suspected\)\.
 - [x] **M0146\-0127 — a semijoin\'s equality joins the equivalence classes \(TPC\-DS Q14\'s cross\_items → item spine\)**
   \(filed 2026\-10\-09 from the SF0\.25 triage: Q14\'s join\-order record — the DP trace declined `\{cross\_items\} \| \{item\}` with
   no join clause because the seam\'s EC closure ran before the semijoin quals joined the list; sublink\-clause family of M0146\-0012a\)\.
