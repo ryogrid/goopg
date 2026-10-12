@@ -29258,7 +29258,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   - First step: grammar — make RETURNS optional when an OUT/INOUT parameter exists \(gram\.y
     CreateFunctionStmt's second form; derive the result type as in interpret\_function\_parameter\_list:
     one OUT → its type, several → record\); read the parser playbook §12 first\.
-- [ ] **M0146\-0085 — `WITH … MERGE` is a syntax error** \(filed 2026\-10\-07
+- [x] **M0146\-0085 — `WITH … MERGE` is a syntax error** \(filed 2026\-10\-07
   by M0146\-0081\)\. `WITH s AS \(SELECT 8 AS a\) MERGE INTO t USING s ON
   t\.a = s\.a WHEN MATCHED THEN UPDATE SET a = 80` fails `syntax error at or
   near "merge"`; PG 18\.3 \(gram\.y MergeStmt: opt\_with\_clause\) runs it and
@@ -29274,6 +29274,11 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     §12, then add `opt\_with\_clause` to the MergeStmt rule in `grammar/`
     and carry the CTE list into the Merge plan \(the CTEDMLPrefix / CTE
     scope path the other DML statements use\); `make gen\-parser`\.
+  - Done 2026\-10\-12 \(`0c83c1f08`\): `MergeStmt\.With` \+ a `with\_clause MERGE …` grammar
+    alternative \(gram\.y opt\_with\_clause, anchored at MERGE\); `planMerge` pre\-plans the WITH clause
+    and wraps the Merge in the CTE DML prefix like `planDelete`\. The routing guard that pinned the
+    rejection now pins acceptance\. Design: `docs/design/0100\-0149/m0146\-0085\-with\-merge\.md`\.
+  Movement: yes — regress merge 1586 → 1572 and with 2997 → 2969 diff lines
 - [ ] **M0146\-0086 — WRONG RESULTS: `text \|\| bool` renders the bool as
   `t`/`f`** \(filed 2026\-10\-07 by M0146\-0081\)\. `SELECT \'x\' \|\| true`
   returns `xt`; PG 18\.3 returns `xtrue`\. PG\'s `anytextcat` /
