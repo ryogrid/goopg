@@ -4870,6 +4870,10 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Test `TestResolvePrepareParamType`; regress A/B identical \(plpgsql
       flap only\)\.
     - Design `docs/design/0100\-0149/0122\-0015c\-prepare\-param\-type\-resolution\.md`\.
+    - **Correction 2026\-10\-12**: this landing turned
+      `TestPort\_PgDumpConnectionSetup` red \(not run that loop\): pg\_dump now
+      succeeded, so the test\'s content checks ran and exposed two older
+      regressions\. Fixed with M0122\-0015d \(`2251d51e6`\)\.
     Found 2026\-10\-12 by the 005 port\.
     - **Measured**: `PREPARE x\(pg\_catalog\.oid\) AS SELECT $1` → 42704 `type
       "pg\_catalog\.oid" does not exist` \(also `pg\_catalog\.int4`,
@@ -4881,10 +4885,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - First step: find PREPARE\'s parameter\-type resolution \(parser
       PrepareStmt arg types → executor\) and resolve qualified names the way
       the cast path does\.
-  - [ ] **M0122-0015d — user functions are visible in every database\'s
+  - [x] **M0122-0015d — user functions are visible in every database\'s
     pg\_proc**
     Kind: impl
     Parent: M0122-0015
+    Movement: none — catalog view scoping / deparse / ACL recording; no TPC instrument
+    - **DONE 2026\-10\-12 \(`2251d51e6`\)\.** `Table\.VirtualRowsForDB` \(the
+      executor prefers it\); pg\_proc keeps built\-ins everywhere and user
+      routines only in their own database\.
+    - **Also fixed here — regressions unmasked by M0122\-0015c**:
+      `TestPort\_PgDumpConnectionSetup` had been passing vacuously \(pg\_dump
+      failed at PREPARE and the test only logged it\)\. Folded negative literals
+      deparsed bare \(`parser\.FoldedNegativeLiteralSQL`\) and owner\-side
+      GRANT/REVOKE ignored superuser\-owned relations \(`effectiveRelOwner`\)\.
+      The test now fails when pg\_dump fails\.
+    - Found and filed: S2 M0146\-0156 \(functions in a CREATE DATABASE\'d
+      database are uncallable there and vanish on restart\)\.
+    - Tests `TestPgProcViewIsPerDatabase`, `TestFoldedNegativeLiteralSQL`;
+      regress A/B 13 cases identical\.
+    - Design `docs/design/0100\-0149/0122\-0015d\-pg\-proc\-per\-database\.md`\.
     Found 2026\-10\-12 by the 005 port\.
     - **Measured**: after `CREATE FUNCTION foo1 ...` in `sourcedb`, `SELECT
       proname FROM pg\_proc WHERE proname LIKE \'foo%\'` returns the rows in
@@ -29901,6 +29920,23 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: find the SQL and plpgsql call sites in the executor, push
     a GUC nest level there, apply proconfig through the session registry,
     pop on return and on error\.
+- [ ] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
+  database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
+  by M0122\-0015d; S2\)\. In a database made by `CREATE DATABASE`,
+  `CREATE FUNCTION foo1\(int\) ...` succeeds and pg\_proc lists it, but
+  `SELECT foo1\(5\)` there raises `function foo1 does not exist`; after a
+  clean restart the function is gone from every database\'s pg\_proc\.
+  Pre\-existing at HEAD \(measured on the pre\-0015d binary\)\. PG: callable, and
+  durable \(pg\_proc is a per\-database heap\)\.
+  Kind: impl
+  Parent: none
+  - Found by the M0122\-0015d probe; filed without a parent for owner
+    placement \(S2\)\.
+  - Hypotheses to check: the call path resolves routines with the default
+    database \(no dbOid on the FuncCall lookup\); the recovery path replays
+    routines into DefaultDBOid \(routines\.go CreateDuringRecovery comment:
+    "WAL payloads don\'t carry a dbOid yet"\) and/or the pg\_proc heap reload
+    does not cover non\-default databases\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
