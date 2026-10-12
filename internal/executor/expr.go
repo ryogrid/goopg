@@ -21993,8 +21993,8 @@ func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datu
 	if mode == concatJSONB {
 		return jsonbConcat(left.StringValue(), right.StringValue())
 	}
-	ls := formatDatumDateStyle(left, ctx)
-	rs := formatDatumDateStyle(right, ctx)
+	ls := concatOperandText(left, ctx)
+	rs := concatOperandText(right, ctx)
 	if mode == concatText {
 		return NewStringDatum(ls + rs), nil
 	}
@@ -22034,6 +22034,21 @@ func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datu
 		return NewStringDatum("{" + ls + "," + inner + "}"), nil
 	}
 	return NewStringDatum(ls + rs), nil
+}
+
+// concatOperandText renders one `||` operand. PostgreSQL's anytextcat /
+// textanycat are SQL functions `$1::text || $2`, so a non-text operand goes
+// through its CAST to text, not its output function. The two differ for bool:
+// booltext gives "true" / "false" where boolout gives "t" / "f"
+// (M0146-0086). concat() and format() use the output function and keep t/f.
+func concatOperandText(d Datum, ctx *Context) string {
+	if d.Kind == KindBool {
+		if d.BoolValue() {
+			return "true"
+		}
+		return "false"
+	}
+	return formatDatumDateStyle(d, ctx)
 }
 
 // padOuterRow is the host row a sublink's inner plan resolves its outer
