@@ -4912,16 +4912,40 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - First step: the pg\_proc virtual rows \(initdb/pg\_proc\_view\.go\) list
       the whole Routines registry; filter by the connection\'s database the way
       the routine lookup already does \(design 0122\-0018 follow\-up 44\)\.
-  - [ ] **M0122-0015e — pg\_foreign\_data\_wrapper rows are visible in every
+  - [x] **M0122-0015e — pg\_foreign\_data\_wrapper rows are visible in every
     database**
     Kind: impl
     Parent: M0122-0015
+    Movement: none — FDW catalog scoping; TPC-DS fire set empty
+    - **DONE 2026\-10\-12 \(`3cf6113e7`\)\.** Registry keyed `\(dbOid, name\)`;
+      rows via `Table\.VirtualRowsForDB`; srvfdw / planner / heap sync use the
+      server\'s database; CREATE SERVER raises 42704 for a missing wrapper\.
+    - Test `TestForeignDataWrappersArePerDatabase`; executor tests that relied
+      on the lax CREATE SERVER now create the wrapper first\.
+    - Regress foreign\_data \+8 lines: the `postgresql` wrapper is never
+      created \(no `postgresql\_fdw\_validator`\) → filed M0122\-0015g\.
+    - Design `docs/design/0100\-0149/0122\-0015e\-fdw\-per\-database\.md`\.
     Found 2026\-10\-12 by the 005 port\.
     - **Measured**: FDW `dummy` created in postgres is listed in a fresh
       database\'s pg\_foreign\_data\_wrapper, and that database\'s dump emits
       `CREATE FOREIGN DATA WRAPPER dummy;`\. pg\_foreign\_server does not leak\.
     - First step: scope the FDW registry by database as the foreign\-server
       registry already is \(design 0122\-0018 follow\-up 36\)\.
+  - [ ] **M0122-0015g — the built\-in `postgresql\_fdw\_validator` does not
+    exist**
+    Kind: impl
+    Parent: M0122-0015
+    Found 2026\-10\-12 by the M0122\-0015e regress A/B\.
+    - **Measured**: `CREATE FOREIGN DATA WRAPPER postgresql VALIDATOR
+      postgresql\_fdw\_validator` → `function
+      postgresql\_fdw\_validator\(text\[\], oid\) does not exist`; PG has it
+      built in \(foreign\.c postgresql\_fdw\_validator: checks libpq
+      connection options per catalog\)\. regress `foreign\_data` builds its
+      servers on that wrapper, so every one of them now fails \(they used to
+      be silently accepted against a missing wrapper\)\.
+    - First step: register the builtin in pg\_proc \(OID 2316\) and port the
+      option check \(is\_conninfo\_option per context\) as the wrapper\'s
+      validator\.
   - [ ] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
     Kind: impl
     Parent: M0122-0015
