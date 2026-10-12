@@ -20817,11 +20817,20 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
-			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
-			// M0146-0063b: an index-only scan over the refreshed matview
-			// must not take these deleted rows' pages as all-visible.
-			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+			if serr := storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID); serr != nil {
+				continue
+			}
+			// Dirty the page and WAL-log the delete, as heap_delete does.
+			// The stamp alone left the buffer clean: no checkpoint wrote it,
+			// so after a restart every pre-REFRESH row not on a page the
+			// re-population happened to dirty came back alongside the new
+			// rows (M0146-0089). The VM clear inside keeps an index-only
+			// scan over the refreshed matview from taking these pages as
+			// all-visible (M0146-0063b).
+			if derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, nil); derr != nil {
+				s.Unlock()
+				ctx.Pool.Unpin(s)
+				return derr
 			}
 		}
 		s.Unlock()
