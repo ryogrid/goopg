@@ -17618,9 +17618,15 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
 	case "coalesce":
+		// ExecEvalCoalesce: the first non-NULL argument; an argument that
+		// fails raises its error (it used to be skipped as if NULL, so
+		// coalesce(1/0, 5) answered 5). M0146-0126.
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err == nil && !v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if !v.IsNull() {
 				return v, nil
 			}
 		}
@@ -17628,9 +17634,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "nullif":
 		if len(x.Args) == 2 {
 			a, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
 			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
-			if e1 != nil || e2 != nil {
-				return NullDatum, nil
+			if e2 != nil {
+				return Datum{}, e2
 			}
 			if !a.IsNull() && !b.IsNull() && a.Format() == b.Format() {
 				return NullDatum, nil
@@ -17641,7 +17650,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		best := NullDatum
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				continue
 			}
 			if best.IsNull() {
@@ -17658,7 +17670,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		best := NullDatum
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				continue
 			}
 			if best.IsNull() {
@@ -17675,7 +17690,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		cnt := 0
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err == nil && !v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if !v.IsNull() {
 				cnt++
 			}
 		}
@@ -17684,7 +17702,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		cnt := 0
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				cnt++
 			}
 		}

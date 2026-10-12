@@ -10600,7 +10600,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 				break
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.ArrayConstructorExpr:
 		// ARRAY[e1, e2, ...] after GROUP BY — resolve each element
 		// through the post-aggregate surface (so group-by columns
@@ -10784,7 +10788,11 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			}
 			args = append(args, pa)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.InExpr:
 		if cmp, ok := oneElementInAsComparison(x); ok {
 			return resolveExprAfterWindow(cmp, win)
@@ -17932,7 +17940,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				}
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.StarExpr:
 		// Unqualified * is not valid in expression context. A qualified t.* is a
 		// whole-row variable reference (e.g. `WHERE i.* != excluded.*`) — expand
