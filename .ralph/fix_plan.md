@@ -29221,7 +29221,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     - `round\(numeric, s\)` was float\-based; now exact\.
     - Regress numeric 3806→3690; the other 7 files identical\.
 Movement: none — instrument artefact — executor correctness, no plan change; PLAN\-PARITY match SF0\.25 42, SF1 33 unchanged
-- [ ] **M0146\-0084 — WRONG RESULTS: regress polymorphism\'s `testpolym`
+- [x] **M0146\-0084 — WRONG RESULTS: regress polymorphism\'s `testpolym`
   lookup fails depending on session state** \(filed 2026\-10\-07 by
   M0146\-0080\)\. `select \* from testpolym\(37\)` \(polymorphism\.sql:930\)
   fails `function testpolym does not exist` in some runs of the same binary
@@ -29239,6 +29239,25 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     fresh clusters and diff the pg\_proc rows for testpolym \(overload set,
     proargtypes, proretset\) and the search\_path between a passing and a
     failing run\.
+  - Done 2026\-10\-12 \(`5c8688efd`\): two causes\. \(1\) goopg accepted the "named parameters are not
+    unique" definitions PG rejects \(42P13\) — `checkDuplicateParamNames`; \(2\) no function with an OUT
+    parameter was callable \(arity compared against every parameter\) — `routineInputParams` in overload
+    resolution and the four function paths\' argument binding / \$n naming\. Design:
+    `docs/design/0100\-0149/m0146\-0084\-function\-param\-names\-and\-out\-args\.md`\.
+  - Filed M0146\-0165 \(OUT\-parameter function model\)\.
+  Movement: yes — regress polymorphism 2277/2272 → 2242 diff lines \(deterministic\), rangefuncs 2579 → 2565
+- [ ] **M0146\-0165 — functions with OUT parameters are incomplete** \(filed 2026\-10\-12 by M0146\-0084\)\.
+  Against PG 18\.3: `CREATE FUNCTION f\(a int, out b int, out c text\) AS …` \(RETURNS omitted\) is a
+  syntax error; a plpgsql function `f5\(x int, out y int\)` raises `variable "y" does not exist`
+  \(OUT variables are neither declared nor returned\); several OUT parameters do not yield a record
+  \(`f4\(3\)` → `\(3,x\)`, `SELECT \* FROM f4\(3\)` → columns b, c\); `pronargs` / `proargtypes` count
+  OUT parameters \(PG: inputs only; proallargtypes lists all\); `bundleVariadicArgs` indexes the
+  VARIADIC position over all parameters\. Probe: `tmp/m0084/probe2\.sql`\.
+  Kind: impl
+  Parent: M0146\-0084
+  - First step: grammar — make RETURNS optional when an OUT/INOUT parameter exists \(gram\.y
+    CreateFunctionStmt's second form; derive the result type as in interpret\_function\_parameter\_list:
+    one OUT → its type, several → record\); read the parser playbook §12 first\.
 - [ ] **M0146\-0085 — `WITH … MERGE` is a syntax error** \(filed 2026\-10\-07
   by M0146\-0081\)\. `WITH s AS \(SELECT 8 AS a\) MERGE INTO t USING s ON
   t\.a = s\.a WHEN MATCHED THEN UPDATE SET a = 80` fails `syntax error at or
