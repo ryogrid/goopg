@@ -19073,7 +19073,7 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     226 → 14 ms; sweep Q95 7s → 3s, Q16 13s → 1s; plans unchanged\.
     `TestSkipScanLeafWalk`\.
   Movement: none — executor runtime only \(sweep Q95 7s→3s, Q16 13s→1s\); plans unchanged
-- [ ] **M0145\-0008ag — Q14 probes store\_sales by bitmap where PG index\-scans
+- [x] **M0145\-0008ag — Q14 probes store\_sales by bitmap where PG index\-scans
   \(4\.9x slower at SF0\.25\)** \(filed 2026\-10\-03 by M0145\-0008af\)\.
   Kind: impl
   Parent: M0145\-0008af
@@ -19092,6 +19092,12 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     opposite direction from the one it was calibrated for \(Q14 here, and
     the bitmap\-for\-index swaps on Q54\'s web\_sales and the d3 dataset —
     M0146\-0049\'s escalation\)\.
+  - Done 2026\-10\-13 \(re\-measure, no code\): resolved by M0146\-0159\. Retired, Q14\'s scan inventory equals PG\'s at
+    SF0\.25 and SF1 \(Index Scans on store\_sales\_pkey / item\_pkey; x2 had 3 \+ 5 bitmap probes at SF1\); Q14 matches at
+    SF0\.25; SF1 keeps only a D3 Parallel\-Hash divergence on the item builds\. Wall\-clock SF0\.25 goopg 18\.6s vs PG
+    median 9\.75s \(×1\.9, executor side → M0146\-0171\)\. Evidence `analysis/m0145/m0145\-0008ag/`; design
+    `docs/design/0100\-0149/m0145\-0008ag\-q14\-probe\-remeasure\.md`\.
+Movement: none — instrument artefact — Q14\'s match is already counted in M0146\-0159\'s 56 → 68
 
 
 - [x] **M0145-0009 — CTE-output statistics (B-06 resume): wire the landed
@@ -29992,7 +29998,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Test `TestGroupingSetsRowEstimateSumsSets` \(fails on HEAD\)\.
     - Design `docs/design/0100\-0149/m0146\-0009o\-grouping\-sets\-rows\-and\-rollup\-costs\.md`\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 12→11
-- [!] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
+- [ ] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
   filter** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q72: the
   `inventory\_pkey` probe reports rows=527, three times PG\'s 176; the
   filter `inv\_quantity\_on\_hand < cs\_quantity` \(PG\'s 1/3 default\) is not
@@ -30018,6 +30024,9 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       `docs/design/0100\-0149/m0146\-0009p\-param\-probe\-rows\-held\.md`\.
     - Resume: re\-apply after the probe\-cost gap closes; re\-run the fire set
       with SF1 Q72 as witness\.
+  - **Hold lifted 2026\-10\-13:** the owner\-adjudicated condition \("`\[!\]` stands until 0008ag resolves"\) is met —
+    M0146\-0159 retired the x2 \(`de45f8a6f`\) and M0145\-0008ag closed on its re\-measure\. Resume as written:
+    re\-apply `analysis/m0146/m0146\-0009p/` and re\-run the fire set with SF1 Q72 as the witness\.
   Movement: none — held; the patch\'s fire set timed out SF1 Q72
 - [x] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
   in full\-row width** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
@@ -30610,7 +30619,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       PASS \(nothing fired\), ea\-ratchet PASS, regress A/B 14 cases
       \(`aggregates` loses the agg\_sort\_order hunk; known flips\)\.
   Movement: none — fire set flat at both scales; the fix moves regress aggregates\' agg\_sort\_order plan to PG\'s
-- [!] **M0146\-0060 — the single\-table rule\-based index producer overrides
+- [ ] **M0146\-0060 — the single\-table rule\-based index producer overrides
   the search\'s costed seq scan for an uncorrelated restriction** \(filed
   2026\-10\-05 by M0146\-0009r\)\. With `agg\_sort\_order` \(100 rows\),
   `SELECT \* FROM agg\_sort\_order WHERE c2 < 100` plans PG\'s Seq Scan
@@ -30653,6 +30662,9 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   > Unblock when the search elects PG\'s bitmap/index path for a range
   > restriction on the `dsc` fixture\. Then re\-apply the gate and move the 10
   > fixtures to seq\-scans\-off\.
+  - **Hold lifted 2026\-10\-13:** both named blockers are resolved — M0146\-0061 \[x\] \(range bitmap path\) and
+    M0145\-0008ag \[x\] \(closed by M0146\-0159\'s retirement, `de45f8a6f`\)\. First step: re\-apply the gate and check the
+    `dsc` fixture elects PG\'s Bitmap Heap Scan / Index Only Scan, then move the 10 fixtures to seq\-scans\-off\.
 - [x] **M0146\-0061 — the search builds no Bitmap Heap Scan path for a range
   restriction** \(filed 2026\-10\-05 by M0146\-0060\)\. PG 18\.3 plans
   `SELECT a, c FROM dsc WHERE a > 97` \(3000 rows, 60 matching, `dsc\_a` on
