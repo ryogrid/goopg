@@ -477,9 +477,16 @@ func TestParallelNLIBitmapInnerIdentity(t *testing.T) {
 	// the same knob measurement PG's own force_parallel_max regress setup
 	// uses. The serial baseline runs with defaults, so it may legitimately
 	// take a hash plan; only the row SET must agree.
+	//
+	// enable_indexscan is off too: with hash and merge join off PG 18.3
+	// probes this fixture with a plain Index Scan, and takes the bitmap inner
+	// this test drives only once index scans are disabled. goopg's x2 probe
+	// calibration used to elect the bitmap at enable_indexscan on; M0146-0159
+	// retired it.
 	nloOnly := optimizer.DefaultPlannerSettings()
 	nloOnly.EnableHashJoin = false
 	nloOnly.EnableMergeJoin = false
+	nloOnly.EnableIndexScan = false
 	stmts0, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse: %v", err)

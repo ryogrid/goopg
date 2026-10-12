@@ -871,11 +871,6 @@ func TestBitmapDeformLossyRecheckPoison(t *testing.T) {
 func TestIndexOnlyDeformColdAndVisible(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
-	// PG prices the index and bitmap paths here within 0.01 of each other;
-	// goopg's calibrated 2x probe multiplier would decide them, so the test
-	// plans with PG's constants (multiplier 1). Owner decision 2026-09-24,
-	// M0145-0008 option (c).
-	defer optimizer.SetIndexProbeCostMultiplier("1")()
 	// The live block-count reader the server installs (initdb.Open): PG
 	// sizes these never-ANALYZEd tables from RelationGetNumberOfBlocks
 	// (estimate_rel_size's 10-page floor), and without the reader the

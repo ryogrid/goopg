@@ -76,14 +76,11 @@ func TestParallelIndexScanIdentityWithRealGather(t *testing.T) {
 
 	for _, workers := range []int{1, 2, 4} {
 		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
-			stmts, err := parser.Parse(sql)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			node, err := optimizer.Plan(stmts[0], ctx.Catalog)
-			if err != nil {
-				t.Fatalf("plan: %v", err)
-			}
+			// enable_seqscan / enable_bitmapscan off: the plain range index
+			// scan is PG's plan only under those settings on this
+			// never-ANALYZEd fixture (M0146-0159 retired the x2 probe
+			// calibration that used to elect it at default settings).
+			node := planOneIndexScan(t, sql, ctx.Catalog)
 			scan := drivingIndexScan(node)
 			if scan == nil || scan.LowKey == nil || scan.Key != nil || len(scan.Keys) != 0 {
 				t.Fatalf("fixture must plan a plain RANGE index scan, got %T (%+v)", node, node)

@@ -413,16 +413,32 @@ func planUsesIndexScan(t *testing.T, rt *Runtime, sql string) bool {
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(stmts))
 	}
-	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
+	plan, err := optimizer.PlanWithSettings(stmts[0], rt.Catalog, indexProbeSettings())
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
 	return walkForIndexScan(plan)
 }
 
+// indexProbeSettings plans with enable_seqscan off. PG 18.3 seq-scans the
+// never-ANALYZEd `a < 50` fixture at default settings, and these tests need
+// the probe to go through the index, so both the premise check and the
+// counted query plan under PG's own enable_seqscan = off. They used to rely
+// on goopg's x2 index-probe calibration electing an Index Scan by default;
+// M0146-0159 retired it.
+func indexProbeSettings() optimizer.PlannerSettings {
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSeqScan = false
+	return ps
+}
+
+// walkForIndexScan reports whether the plan reads the relation through an
+// index. A Bitmap Index Scan probes the same btree with the same encoded
+// keys as an Index Scan, so it exercises the on-disk key format these tests
+// guard just as well.
 func walkForIndexScan(n optimizer.Node) bool {
 	switch nd := n.(type) {
-	case *optimizer.IndexScan, *optimizer.IndexOnlyScan:
+	case *optimizer.IndexScan, *optimizer.IndexOnlyScan, *optimizer.BitmapHeapScan:
 		return true
 	case *optimizer.Aggregate:
 		return walkForIndexScan(nd.Child)
@@ -451,7 +467,7 @@ func runCountQuery(t *testing.T, rt *Runtime, sql string) int64 {
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(stmts))
 	}
-	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
+	plan, err := optimizer.PlanWithSettings(stmts[0], rt.Catalog, indexProbeSettings())
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}

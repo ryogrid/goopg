@@ -4,7 +4,33 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
+
+// indexOnlySettings disables the Seq Scan and the Bitmap Heap Scan PG 18.3
+// itself elects on these tiny never-ANALYZEd fixtures, leaving the Index Only
+// Scan the tests exist to drive — PG's own plan under those two settings.
+// Before M0146-0159 retired the x2 index-probe calibration, goopg's costs
+// happened to elect the IOS at default settings.
+func indexOnlySettings() optimizer.PlannerSettings {
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableSeqScan = false
+	ps.EnableBitmapScan = false
+	return ps
+}
+
+// explainLinesWithSettings renders EXPLAIN output for sql under ps.
+func explainLinesWithSettings(t *testing.T, ctx *Context, sql string, ps optimizer.PlannerSettings) []string {
+	t.Helper()
+	var lines []string
+	for _, r := range drainPlanRows(t, ctx, planWithSettings(t, ctx, sql, ps)) {
+		if len(r) > 0 && r[0].Kind == KindString {
+			lines = append(lines, r[0].StringValue())
+		}
+	}
+	return lines
+}
 
 // TestRangeScanExclusiveBoundaryAndNull is the M0134-0001 S4 (class 8) row-parity
 // guard: after making the btree range scan stop at an EXCLUSIVE bound for a
@@ -43,7 +69,7 @@ func TestRangeScanExclusiveBoundaryAndNull(t *testing.T) {
 
 	// Covering single-conjunct strict range: promoted to an IndexOnlyScan that
 	// carries the exclusive bound itself (Option A).
-	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 < 100")
+	lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 < 100", indexOnlySettings())
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Index Only Scan") {
 		t.Errorf("expected Index Only Scan (exclusive bound is IOS-expressible); got:\n%s", joined)
@@ -55,7 +81,7 @@ func TestRangeScanExclusiveBoundaryAndNull(t *testing.T) {
 		t.Errorf("redundant Filter should be dropped for a single range conjunct; got:\n%s", joined)
 	}
 
-	rows := runQuery(t, ctx, "SELECT c2 FROM t WHERE c2 < 100")
+	rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT c2 FROM t WHERE c2 < 100", indexOnlySettings()))
 	if len(rows) != 99 {
 		t.Fatalf("got %d rows, want 99 (c2 1..99; boundary c2=100 and NULL excluded)", len(rows))
 	}
@@ -105,7 +131,7 @@ func TestRangeScanExclusiveUpperBoundTwin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 > 100")
+	lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT c2 FROM t WHERE c2 > 100", indexOnlySettings())
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Index Only Scan") {
 		t.Errorf("expected Index Only Scan; got:\n%s", joined)
@@ -117,7 +143,7 @@ func TestRangeScanExclusiveUpperBoundTwin(t *testing.T) {
 		t.Errorf("redundant Filter should be dropped for a single range conjunct; got:\n%s", joined)
 	}
 
-	rows := runQuery(t, ctx, "SELECT c2 FROM t WHERE c2 > 100")
+	rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT c2 FROM t WHERE c2 > 100", indexOnlySettings()))
 	if len(rows) != 10 {
 		t.Fatalf("got %d rows, want 10 (c2 101..110; boundary c2=100 and NULL excluded)", len(rows))
 	}

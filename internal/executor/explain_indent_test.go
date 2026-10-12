@@ -73,6 +73,13 @@ func findIndentLine(t *testing.T, lines []string, sub string) string {
 // restores the 4-level shape for the indent arithmetic. The upstream-exact
 // query (`GROUP BY` the primary key `ORDER BY 2`) crashes the planner
 // (M0145-0008h), so it cannot be the fixture yet.
+//
+// M0146-0159 (2026-10-13): with the x2 index-probe calibration retired, the
+// aggregate reads the unique index in b order and the inner Sort is gone —
+// PG 18.3's exact plan for this query (Sort / GroupAggregate / Index Scan).
+// The indent arithmetic is pinned on that 3-level shape: the depth-2 arrow
+// (the Index Scan) is still the first depth where the old flat model
+// diverged.
 func deepSortFixture(t *testing.T) *Context {
 	t.Helper()
 	ctx, _, cleanup := newDDLFixture(t)
@@ -89,10 +96,10 @@ func deepSortFixture(t *testing.T) *Context {
 const deepSortSQL = "SELECT array_agg(a ORDER BY b), b FROM t WHERE b < 100 GROUP BY b ORDER BY 1"
 
 // TestExplainIndentDeepNesting pins the plain-EXPLAIN twin: raw "->  "
-// columns 0/2/8/14/20 and matching detail-line columns, verified against
-// aggregates.out:3158-3165's node shape (Sort / GroupAggregate / Sort /
-// Index Scan) — the FIRST depth (2) where goopg's old flat `2*depth` model
-// (which would print 4, not 8) diverged from PG.
+// columns 0/2/8 and matching detail-line columns 8/14 on PG 18.3's plan for
+// the fixture (Sort / GroupAggregate / Index Scan) — depth 2 is the FIRST
+// depth where goopg's old flat `2*depth` model (which would print 4, not 8)
+// diverged from PG.
 func TestExplainIndentDeepNesting(t *testing.T) {
 	ctx := deepSortFixture(t)
 	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+deepSortSQL)
@@ -106,14 +113,11 @@ func TestExplainIndentDeepNesting(t *testing.T) {
 	if got := leadingSpaces(findIndentLine(t, lines, "Group Key: b")); got != 8 {
 		t.Errorf("GroupAggregate's Group Key detail: want 8 leading spaces, got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "->  Sort")); got != 8 {
+	if got := leadingSpaces(findIndentLine(t, lines, "->  Index Scan")); got != 8 {
 		t.Errorf("depth-2 arrow: want 8 leading spaces (PG-faithful, not the flat model's 4), got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "->  Index Scan")); got != 14 {
-		t.Errorf("depth-3 arrow: want 14 leading spaces, got %d", got)
-	}
-	if got := leadingSpaces(findIndentLine(t, lines, "Index Cond: (b < 100)")); got != 20 {
-		t.Errorf("Index Scan's Index Cond detail: want 20 leading spaces, got %d", got)
+	if got := leadingSpaces(findIndentLine(t, lines, "Index Cond: (b < 100)")); got != 14 {
+		t.Errorf("Index Scan's Index Cond detail: want 14 leading spaces, got %d", got)
 	}
 }
 
@@ -133,14 +137,11 @@ func TestExplainAnalyzeIndentDeepNesting(t *testing.T) {
 	if got := leadingSpaces(findIndentLine(t, lines, "Group Key: b")); got != 8 {
 		t.Errorf("GroupAggregate's Group Key detail: want 8 leading spaces, got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "->  Sort")); got != 8 {
+	if got := leadingSpaces(findIndentLine(t, lines, "->  Index Scan")); got != 8 {
 		t.Errorf("depth-2 arrow: want 8 leading spaces (PG-faithful, not the flat model's 4), got %d", got)
 	}
-	if got := leadingSpaces(findIndentLine(t, lines, "->  Index Scan")); got != 14 {
-		t.Errorf("depth-3 arrow: want 14 leading spaces, got %d", got)
-	}
-	if got := leadingSpaces(findIndentLine(t, lines, "Index Cond: (b < 100)")); got != 20 {
-		t.Errorf("Index Scan's Index Cond detail: want 20 leading spaces, got %d", got)
+	if got := leadingSpaces(findIndentLine(t, lines, "Index Cond: (b < 100)")); got != 14 {
+		t.Errorf("Index Scan's Index Cond detail: want 14 leading spaces, got %d", got)
 	}
 }
 

@@ -149,10 +149,10 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
 	if !approxCost(got.Startup, 0.25) {
 		t.Errorf("startup = %v; want 0.25 (the B-tree descent)", got.Startup)
 	}
-	// Page terms 480 (80 index + 400 heap) scale with the probe calibration;
-	// CPU terms 15.25 do not. Written as an expression so C-20d's
-	// recalibration does not turn this into a stale literal.
-	want := indexProbeMultCalibrated*480.0 + 15.25
+	// Page terms 480 (80 index + 400 heap) at random_page_cost, plus CPU
+	// terms 15.25 — PG's arithmetic (the x2 calibration was retired at
+	// M0146-0159).
+	want := 480.0 + 15.25
 	if !approxCost(got.Total, want) {
 		t.Errorf("total = %v; want %v", got.Total, want)
 	}
@@ -189,16 +189,14 @@ func TestR59ProbePinLineitem920(t *testing.T) {
 	if !approxCost(got.Startup, 0.375) {
 		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
 	}
-	// Post-cut (R59 §2 arm landed): the SCOPE §3 prediction band is
-	// [1.2, 2.0], central ≈1.3. Hand decomposition at the traced inputs:
-	// index-side ML over 1×1.5M touches caps at the 8588-page index →
-	// 8588×4×2/1.5M = 0.0458 + 5.11×0.005 cpuIndex = 0.0714; heap 0.7274
-	// and CPU 0.075 unchanged; 0.375 + 0.0714 + 0.7274 + 0.075 = 1.2488.
-	if got.Total < 1.2 || got.Total > 2.0 {
-		t.Errorf("total = %v; want the §3 band [1.2, 2.0]", got.Total)
-	}
-	if !approxCost(got.Total, 1.2487967346880979) {
-		t.Errorf("total = %v; want 1.2487967346880979", got.Total)
+	// Post-cut (R59 §2 arm landed) the SCOPE §3 band was [1.2, 2.0] and the
+	// pin 1.2488 — both priced with the x2 probe calibration. M0146-0159
+	// retired it, so every random-page term halves. Hand decomposition at the
+	// traced inputs: index-side ML over 1×1.5M touches caps at the 8588-page
+	// index → 8588×4/1.5M = 0.0229 + 5.11×0.005 cpuIndex = 0.0485; heap
+	// 0.7274/2 = 0.3637; CPU 0.075; 0.375 + 0.0485 + 0.3637 + 0.075 = 0.8622.
+	if !approxCost(got.Total, 0.862180734688098) {
+		t.Errorf("total = %v; want 0.862180734688098", got.Total)
 	}
 }
 
@@ -222,14 +220,12 @@ func TestR59ProbePinOrders1013(t *testing.T) {
 	if !approxCost(got.Startup, 0.375) {
 		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
 	}
-	// Post-cut: the §3 band is [2.0, 3.0], central ≈2.4 — the same arm with
-	// shallower pro-rating over 150k scans (residual vs PG 1.54 is the 2.0
-	// knob + width-inflated relPages, by design per §1.ii).
-	if got.Total < 2.0 || got.Total > 3.0 {
-		t.Errorf("total = %v; want the §3 band [2.0, 3.0]", got.Total)
-	}
-	if !approxCost(got.Total, 2.2051380003749999) {
-		t.Errorf("total = %v; want 2.2051380003749999", got.Total)
+	// Post-cut the §3 band was [2.0, 3.0] and the pin 2.2051 — priced with
+	// the x2 probe calibration M0146-0159 retired. Without it the random-page
+	// terms halve. PG's traced total for this probe was 1.54; the remaining
+	// gap (now below PG) is not decomposed here.
+	if !approxCost(got.Total, 1.4093780003749998) {
+		t.Errorf("total = %v; want 1.4093780003749998", got.Total)
 	}
 }
 
@@ -256,15 +252,13 @@ func TestCostIndexScanStartupIsDescentOnly(t *testing.T) {
 	}
 }
 
-// TestCostIndexScanSharesTheProbeCalibration is the 04 §1 one-currency
-// property, and the reason this file exists at all rather than the cost living
-// inside the path constructor: goopg has ONE knob recalibrating index access
-// (`indexProbeCostMultiplier`, measured because goopg materialises the whole
-// TID list per probe), and both index cost models must hang off it. If
-// `cost_index` ignored the knob, raising it would make a parameterised probe
-// expensive while leaving a full index scan untouched — two currencies inside
-// one `addPath` comparison.
-func TestCostIndexScanSharesTheProbeCalibration(t *testing.T) {
+// TestCostIndexScanRandomPagesAtRandomPageCost is the 04 §1 one-currency
+// property: the scan model and the parameterised probe price a random page
+// fetch in the same currency, PG's random_page_cost (costsize.c cost_index),
+// with no goopg-only calibration on either (M0146-0159 retired the x2
+// `indexProbeCostMultiplier` both carried). Raising random_page_cost must
+// move exactly the random-page terms and leave the CPU terms alone.
+func TestCostIndexScanRandomPagesAtRandomPageCost(t *testing.T) {
 	cp := defaultCostParams()
 	in := indexScanInputs{
 		relPages: 100, relTuples: 1000, indexPages: 20, indexTuples: 1000,
@@ -272,20 +266,19 @@ func TestCostIndexScanSharesTheProbeCalibration(t *testing.T) {
 	}
 	base := costIndexScan(cp, in)
 
-	saved := indexProbeCostMultiplier
-	indexProbeCostMultiplier = 3.0
-	scaled := costIndexScan(cp, in)
-	indexProbeCostMultiplier = saved
+	scaledCP := cp
+	scaledCP.randomPageCost = 3 * cp.randomPageCost
+	scaled := costIndexScan(scaledCP, in)
 
-	// The random-page terms (80 index + 400 heap = 480) triple; the CPU terms
-	// (5 + 0.25 + 10) do not, because the multiplier was measured against page
-	// access, not against per-tuple work.
-	// base was computed at the CALIBRATED default, so the delta is
-	// (3 - calibrated) x the page terms, not (3 - 1).
-	want := base.Total + (3.0-indexProbeMultCalibrated)*480.0
+	// The random-page terms (80 index + 400 heap = 480 at random_page_cost 4)
+	// triple; the CPU terms (5 + 0.25 + 10) do not.
+	want := base.Total + 2*480.0
 	if !approxCost(scaled.Total, want) {
-		t.Fatalf("multiplier 3 gave %v; want %v (random-page terms scaled, CPU terms not)",
+		t.Fatalf("random_page_cost x3 gave %v; want %v (random-page terms scaled, CPU terms not)",
 			scaled.Total, want)
+	}
+	if got, want := indexProbeCost(scaledCP)-indexProbeCost(cp), 2*2*cp.randomPageCost; !approxCost(got, want) {
+		t.Fatalf("indexProbeCost moved %v with random_page_cost x3; want %v (two random pages)", got, want)
 	}
 }
 
@@ -386,7 +379,7 @@ func TestBtreeUniqueIndexClampsToOneTuple(t *testing.T) {
 
 	// It must land at the single-tuple price, not merely lower: one index page
 	// plus one index tuple plus the descent.
-	want := 1*cp.randomPageCost*indexProbeCostMultiplier +
+	want := 1*cp.randomPageCost +
 		1*cp.cpuIndexTupleCost +
 		float64(in.treeHeight+1)*pageCPUMultiplier*cp.cpuOperatorCost
 	if math.Abs(clamped-want) > 1e-9 {

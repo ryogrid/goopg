@@ -1313,79 +1313,20 @@ func computeGatherRows(sub *Path, cp costParams) float64 {
 // (nestloopCost's innerRescanTotal). It is what makes NL-index cheap for a
 // selective outer side and ruinous for a large one — the Q9 lesson (ch. 07 §4.5).
 func indexProbeCost(cp costParams) float64 {
-	return indexProbeCostMultiplier * (2*cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost + cp.cpuOperatorCost)
+	return 2*cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost + cp.cpuOperatorCost
 }
 
-// indexProbeCostMultiplier scales indexProbeCost. PG's constants (multiplier 1)
-// under-cost goopg's NL-index probe. The original justification — that goopg
-// materialised the whole TID list eagerly per probe — was RETIRED by
-// M0142-0005b: the executor now streams leaf-grain batches through
-// nbtree.ScanCursor (index_getnext_tid's model), and the post-change two-arm
-// A/B reproduced B8 byte-for-byte (TPC-DS SF0.25 mult=1: scan-type 59→51,
-// join-order 91→88, qual-placement 20→24; TPC-H mult=1 still slides Q9/Q10/Q14
-// to NL+index probes where PG hashes). The residual is therefore a
-// cost-model gap — this scalar masks a real relative-pricing divergence
-// between goopg's per-probe formula and the hash-join alternative PG's
-// cost_index/cost_seqscan arithmetic produces — not executor speed. Filed as
-// M0142-0005c (recon). Overridable via GOOPG_INDEX_PROBE_MULT for measurement.
-//
-// **Calibrated to 2.0 on 2026-09-05** (C-20d). The knob had shipped at 1.0 —
-// exactly the value this comment says under-costs goopg's probes — because
-// the calibration it was created for was never run. Measured at SF=1, serial,
-// pinned-statistics regime, fresh server per arm, values 24/24 MATCH against
-// the multiplier-1 baseline on every arm:
-//
-//	        mult=1     mult=2     mult=4
-//	Q5      21.60 s     4.07 s     6.84 s
-//	Q7      15.72 s     5.86 s     6.24 s
-//	Q9      13.17 s     7.06 s     7.18 s
-//	Q3       6.25 s     2.67 s        —
-//	suite  138.58 s   100.79 s        —
-//
-// 2 and 4 pick the same plans on the probed queries, so 2 is chosen as the
-// smaller departure from PG's constants that still buys the whole win —
-// raising it further is unjustified without evidence. Every other query moved
-// within the noise band. The multiplier stays a knob rather than becoming a
-// hard-coded 2 so the M0142-0005c cost-model recon can re-measure it the same
-// way — retirement to PG's 1.0 stays the goal once the residual is understood.
-var indexProbeCostMultiplier = indexProbeMultFromEnv(os.Getenv("GOOPG_INDEX_PROBE_MULT"))
-
-// indexProbeMultFromEnv resolves GOOPG_INDEX_PROBE_MULT's raw value to the
-// multiplier the planner uses. It is a named function rather than an inline
-// envFloatDefault call so the flag-provenance table can resolve the SAME
-// default the process resolves (flaglabels.go's flagResolvedState), which is
-// what makes `unset(1)` a statement about the binary instead of a restated
-// constant. Reading it through a helper is also what hid this flag from
-// TestFlagProvenanceTableCoversPlannerEnv for an entire milestone — see that
-// test's go/ast detector.
-func indexProbeMultFromEnv(v string) float64 {
-	if v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return indexProbeMultCalibrated
-}
-
-// SetIndexProbeCostMultiplier sets indexProbeCostMultiplier from a label an
-// operator would export as GOOPG_INDEX_PROBE_MULT, resolved through the SAME
-// indexProbeMultFromEnv production uses, and returns the restore. It exists
-// for executor tests that pin PG's index-vs-bitmap election, where PG prices
-// the two within 0.01 and the calibrated 2x would decide them (owner decision
-// 2026-09-24, M0145-0008 option (c)). Process-global, like SetGatherPathsMode:
-// the caller must run the returned restore.
-func SetIndexProbeCostMultiplier(label string) (restore func()) {
-	prev := indexProbeCostMultiplier
-	indexProbeCostMultiplier = indexProbeMultFromEnv(label)
-	return func() { indexProbeCostMultiplier = prev }
-}
-
-// indexProbeMultCalibrated is the validated default (see the block comment on
-// indexProbeCostMultiplier for the measurement that set it). Named rather than
-// inlined so the flag-provenance table resolves the same default the process
-// does — `unset(2)` is then a statement about the binary, not a restated
-// constant.
-const indexProbeMultCalibrated = 2.0
+// indexProbeCostMultiplier — RETIRED at M0146-0159 (owner decision 2026-10-12,
+// Option A of the M0146-0068 corpus A/B). It scaled every random-page term of
+// a parameterised index probe by 2 (calibrated 2026-09-05, C-20d) because
+// goopg's probes ran ~2x PG's. PG prices them with random_page_cost alone
+// (costsize.c cost_index: index_pages_fetched * random_page_cost, and
+// genericcostestimate's numIndexPages * spc_random_page_cost), and the corpus
+// A/B measured the x2 electing non-PG shapes: match +10 at TPC-DS SF0.25, +1
+// at SF1, +2 at TPC-H with flat runtime totals. The executor-side probe cost
+// the multiplier hid is owned by M0146-0088; the parallelism loss it exposes
+// (Q54) by M0146-0049e. GOOPG_INDEX_PROBE_MULT is read by nothing
+// (flagProvenanceRetired).
 
 // `multiHashJoinCost` costed goopg's N-way MultiHashJoin under the
 // comparability invariant (design ch. 06 §4.1) — build every dimension hash

@@ -171,14 +171,16 @@ func TestFlagProvenanceTableCoversPlannerEnv(t *testing.T) {
 
 // TestFlagProvenanceDetectorSeesHelperWrappedReads pins the hole itself. The
 // previous detector matched only a literal os.Getenv call, so a flag read
-// through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT is
-// exactly that shape (cost_funcs.go reads it via os.Getenv into
-// indexProbeMultFromEnv, and earlier via envFloatDefault), so its presence in
-// the detector's output is the regression test for the detector.
+// through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT was
+// the flag that slipped through (read via envFloatDefault, later via
+// os.Getenv into indexProbeMultFromEnv) until M0146-0159 retired it.
+// GOOPG_INCREMENTAL_SORT has the same shape — os.Getenv handed to
+// incrementalSortModeFromEnv at package init — so its presence in the
+// detector's output is the regression test for the detector.
 func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
 	names := plannerEnvNames(t)
-	if _, ok := names["GOOPG_INDEX_PROBE_MULT"]; !ok {
-		t.Fatal("detector did not see GOOPG_INDEX_PROBE_MULT; the helper-wrapped-read hole is back")
+	if _, ok := names["GOOPG_INCREMENTAL_SORT"]; !ok {
+		t.Fatal("detector did not see GOOPG_INCREMENTAL_SORT; the helper-wrapped-read hole is back")
 	}
 }
 

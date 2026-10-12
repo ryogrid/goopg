@@ -13,13 +13,12 @@ package optimizer
 // `paramIndexScanCost` (pathparamindex.go) prices ONE bound probe off the
 // calibrated `indexProbeCost`, and it is deliberately not a scan model — 04 §1
 // forbids two independently-calibrated index cost models competing inside one
-// `addPath` comparison. This file is therefore the scan model, and it is tied
-// to the SAME calibration knob (`indexProbeCostMultiplier`) rather than to a
-// second one of its own: everywhere PG charges a RANDOM page fetch, goopg
-// charges the multiplier times that, because the multiplier exists precisely
-// because goopg's index access materialises eagerly and so runs slower than
-// `random_page_cost` predicts. Sequential fetches and CPU terms are PG-native,
-// since neither is what the multiplier was measured against.
+// `addPath` comparison. This file is therefore the scan model, and it shares
+// the probe's currency: everywhere PG charges a RANDOM page fetch, goopg
+// charges `random_page_cost`, as PG does. Until M0146-0159 both models carried
+// a goopg-only x2 calibration (`indexProbeCostMultiplier`) on their
+// random-page terms; it was retired for plan parity (owner decision
+// 2026-10-12, M0146-0068 Option A).
 //
 // BOTH `loop_count` arms are reproduced. The `loop_count > 1` arm prices a
 // parameterised path inside a nested loop and returns the cost of ONE
@@ -263,7 +262,7 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 		pagesFetched := indexPagesFetched(tuplesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		randHeapPages = pagesFetched // costsize.c:609, the partial arm's heap figure
-		maxIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		maxIOCost = (pagesFetched * cp.randomPageCost) / in.loopCount
 
 		// The correlated bound applies the same formula one level up, at PAGE
 		// rather than tuple grain: each scan touches `selectivity * relPages`
@@ -271,18 +270,18 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 		pagesFetched = math.Ceil(in.selectivity * float64(in.relPages))
 		pagesFetched = indexPagesFetched(pagesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
-		minIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		minIOCost = (pagesFetched * cp.randomPageCost) / in.loopCount
 	} else {
 		// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
 		pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		randHeapPages = pagesFetched // costsize.c:657
-		maxIOCost = pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
+		maxIOCost = pagesFetched * cp.randomPageCost
 
 		// min_IO_cost: the perfectly correlated case (csquared = 1). One random
 		// fetch, then sequential ones.
 		if correlatedPages := in.heapPagesAfterVM(math.Ceil(in.selectivity * float64(in.relPages))); correlatedPages > 0 {
-			minIOCost = cp.randomPageCost * indexProbeCostMultiplier
+			minIOCost = cp.randomPageCost
 			if correlatedPages > 1 {
 				minIOCost += (correlatedPages - 1) * cp.seqPageCost
 			}
@@ -399,8 +398,7 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	// T = index size, "as if there were one tuple per page") and pro-rates
 	// the cost back to ONE execution by num_outer_scans = loopCount — never
 	// by numScans, since ScalarArrayOp repeats are internal to the scan.
-	// Index pages are random fetches, so the pro-rated cost carries goopg's
-	// probe calibration (see the file header) exactly as the heap bounds do.
+	// Index pages are random fetches, priced like the heap bounds.
 	// Gated on numScans, not loopCount, since numSA > 1 repeats scans at
 	// loopCount 1; the numScans <= 1 branch is the pre-existing arithmetic
 	// bit-identically. R59 (plan-parity-fix-take2).
@@ -408,10 +406,10 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	var indexPageCost float64
 	if numScans > 1 {
 		pagesFetched := indexPagesFetched(numIndexPages*numScans, int64(in.indexPages), in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
-		indexPageCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		indexPageCost = (pagesFetched * cp.randomPageCost) / in.loopCount
 	} else {
 		// A single index scan: spc_random_page_cost per page touched.
-		indexPageCost = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+		indexPageCost = numIndexPages * cp.randomPageCost
 	}
 	total = indexPageCost
 	// Tuple-CPU is charged per descent — numIndexTuples is already the

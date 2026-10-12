@@ -87,68 +87,63 @@ func TestParallelParamAppendProbeIdentity(t *testing.T) {
 	const sql = `SELECT o.id, u.v FROM pa_outer o,
 		(SELECT k, v FROM pa_a UNION ALL SELECT k, v FROM pa_b) u WHERE u.k = o.k`
 
-	for _, mult := range []string{"1", "2"} {
-		t.Run("probe-mult="+mult, func(t *testing.T) {
-			defer optimizer.SetIndexProbeCostMultiplier(mult)()
-			serialRows, err := runQueryWithErr(ctx, sql)
-			if err != nil {
-				t.Fatalf("serial: %v", err)
-			}
-			want := len(serialRows)
-			if want != 180 {
-				t.Fatalf("fixture: serial returned %d rows, want 180 (120 from pa_a + 60 from pa_b)", want)
-			}
-			stmts, err := parser.Parse(sql)
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
+	serialRows, err := runQueryWithErr(ctx, sql)
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	want := len(serialRows)
+	if want != 180 {
+		t.Fatalf("fixture: serial returned %d rows, want 180 (120 from pa_a + 60 from pa_b)", want)
+	}
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	j := planHasLateralParamAppend(plan)
+	if j == nil {
+		t.Fatalf("planner no longer elects a lateral nested loop over the parameterised Append; "+
+			"the identity pin would be vacuous.\nplan: %#v", plan)
+	}
+	if !optimizer.LateralParamAppendProbe(j) {
+		t.Fatalf("the lateral parameterised Append is not partial-capable by the planner twin: %#v", j.Right)
+	}
+	for _, workers := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			stmts, _ := parser.Parse(sql)
 			plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			j := planHasLateralParamAppend(plan)
-			if j == nil {
-				t.Fatalf("planner no longer elects a lateral nested loop over the parameterised Append; "+
-					"the identity pin would be vacuous.\nplan: %#v", plan)
+			gathered := optimizer.NewGather(0, plan, workers)
+			ctx.MaxParallelWorkers = 8
+			ctx.ParallelLeaderParticipation = true
+			op, err := Build(gathered)
+			if err != nil {
+				t.Fatalf("build: %v", err)
 			}
-			if !optimizer.LateralParamAppendProbe(j) {
-				t.Fatalf("the lateral parameterised Append is not partial-capable by the planner twin: %#v", j.Right)
+			if err := op.Open(ctx); err != nil {
+				t.Fatalf("open: %v", err)
 			}
-			for _, workers := range []int{1, 2, 4} {
-				t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
-					stmts, _ := parser.Parse(sql)
-					plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
-					if err != nil {
-						t.Fatalf("plan: %v", err)
-					}
-					gathered := optimizer.NewGather(0, plan, workers)
-					ctx.MaxParallelWorkers = 8
-					ctx.ParallelLeaderParticipation = true
-					op, err := Build(gathered)
-					if err != nil {
-						t.Fatalf("build: %v", err)
-					}
-					if err := op.Open(ctx); err != nil {
-						t.Fatalf("open: %v", err)
-					}
-					n := 0
-					for {
-						_, err := op.Next()
-						if err == EOF {
-							break
-						}
-						if err != nil {
-							op.Close()
-							t.Fatalf("next: %v", err)
-						}
-						n++
-					}
+			n := 0
+			for {
+				_, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
 					op.Close()
-					if n != want {
-						t.Fatalf("workers=%d: parallel returned %d rows, want %d (serial) — "+
-							"the N-copy signature of an unattached driving scan", workers, n, want)
-					}
-				})
+					t.Fatalf("next: %v", err)
+				}
+				n++
+			}
+			op.Close()
+			if n != want {
+				t.Fatalf("workers=%d: parallel returned %d rows, want %d (serial) — "+
+					"the N-copy signature of an unattached driving scan", workers, n, want)
 			}
 		})
 	}
