@@ -29309,7 +29309,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     `docs/design/0100\-0149/m0146\-0084\-function\-param\-names\-and\-out\-args\.md`\.
   - Filed M0146\-0165 \(OUT\-parameter function model\)\.
   Movement: yes — regress polymorphism 2277/2272 → 2242 diff lines \(deterministic\), rangefuncs 2579 → 2565
-- [ ] **M0146\-0165 — functions with OUT parameters are incomplete** \(filed 2026\-10\-12 by M0146\-0084\)\.
+- [x] **M0146\-0165 — functions with OUT parameters are incomplete** \(filed 2026\-10\-12 by M0146\-0084\)\.
   Against PG 18\.3: `CREATE FUNCTION f\(a int, out b int, out c text\) AS …` \(RETURNS omitted\) is a
   syntax error; a plpgsql function `f5\(x int, out y int\)` raises `variable "y" does not exist`
   \(OUT variables are neither declared nor returned\); several OUT parameters do not yield a record
@@ -29322,6 +29322,37 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   - First step: grammar — make RETURNS optional when an OUT/INOUT parameter exists \(gram\.y
     CreateFunctionStmt's second form; derive the result type as in interpret\_function\_parameter\_list:
     one OUT → its type, several → record\); read the parser playbook §12 first\.
+  - Done 2026\-10\-13 \(`5d2895b02`\): RETURNS optional \(`fn\_attrs1` alternative \+ `resolveOutParamReturnType`,
+    PG\'s 42P13 errors\); PL/pgSQL OUT/INOUT variables returned at RETURN / end / RETURN NEXT; several outputs
+    make a record in SQL and PL/pgSQL, set and non\-set; record\_out quoting; `catalog\.RoutineResultColumns`
+    shared by planner binding and analyzer scope \(named columns of a FROM function resolve — broken on HEAD
+    even for RETURNS TABLE\); `\(f\(…\)\)\.col`; pronargs / proargtypes input\-only \(view, heap, index key\);
+    `bundleVariadicArgs` counts inputs\. Design: `docs/design/0100\-0149/m0146\-0165\-out\-parameter\-functions\.md`\.
+  - Selected under the item\-2a inheritance rule in force at loop start; the owner discharged item 2a mid\-loop
+    \(57d282e94\), and the finished, gated work was committed rather than re\-ranked\.
+  - Filed M0146\-0167 \(DEFAULT arguments\) and M0146\-0168 \(multi\-row scalar SQL function\)\.
+Movement: none — instrument artefact — no TPC\-H / TPC\-DS query defines a function \(fire\-set fires=none\); regress
+  rangefuncs 2565 → 2295, plpgsql 4086 → 4029, polymorphism 2242 → 2236
+- [ ] **M0146\-0167 — user\-function DEFAULT arguments are never applied** \(filed 2026\-10\-13 by
+  M0146\-0165\)\. `CREATE FUNCTION g\(a int, b int DEFAULT 2\) RETURNS int AS \$\$ SELECT \$1 \+ \$2 \$\$ LANGUAGE sql;
+  SELECT g\(1\)` raises `function g does not exist`; PG 18\.3 returns 3 \(plpgsql the same\)\. Overload resolution
+  \(`callArgTypesForCandidate`\) requires the exact input count and no caller fills `ArgDefaults`
+  \(func\_get\_detail / expand\_function\_arguments in parse\_func\.c / clauses\.c\)\. Probe:
+  `tmp/m0165/probe\.sql` \(f7\).
+  Kind: bug
+  Parent: M0146\-0165
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
+  - First step: let a candidate with `pronargdefaults` match `n` inputs when `n >= NumInputArgs \- ndefaults`,
+    then append the evaluated trailing defaults before binding \(both SQL and PL/pgSQL paths\)\.
+- [ ] **M0146\-0168 — a non\-SETOF SQL function whose final query returns several rows raises 21000**
+  \(filed 2026\-10\-13 by M0146\-0165\)\. `CREATE FUNCTION mr\(\) RETURNS int AS \'select generate\_series\(1,3\)\'
+  LANGUAGE sql; SELECT mr\(\)` — PG 18\.3 returns 1 \(the first row of the final query; functions\.c
+  postquel\_getnext stops after one row for a non\-set result\); goopg raises `SQL function mr returned more
+  than one row`\.
+  Kind: bug
+  Parent: M0146\-0165
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out, OWNER DECISIONS 2026\-10\-13\)\.
+  - First step: `executeSQLRoutine`\'s last\-statement loop — keep the first row and drop the second\-row check\.
 - [x] **M0146\-0085 — `WITH … MERGE` is a syntax error** \(filed 2026\-10\-07
   by M0146\-0081\)\. `WITH s AS \(SELECT 8 AS a\) MERGE INTO t USING s ON
   t\.a = s\.a WHEN MATCHED THEN UPDATE SET a = 80` fails `syntax error at or
