@@ -85,6 +85,64 @@ func pgProcOidVectorBytes(oids []uint32) []byte {
 	return buf
 }
 
+// pgProcArgOIDs returns the pg_type OID of every parameter of r, in
+// declaration order. Deferral row 1351: the CREATE-time resolved OID wins for
+// a `char` parameter (ArgTypeOIDs is char-only non-zero), so a quoted
+// `"char"` is CHAROID(18) rather than TypeNameToOID's unconditional
+// BPCHAROID(1042). The i<len guard is OOB-safe for pre-change routines.
+func pgProcArgOIDs(r *catalog.Routine) []uint32 {
+	argOIDs := make([]uint32, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
+			argOIDs[i] = r.ArgTypeOIDs[i]
+		} else {
+			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		}
+	}
+	return argOIDs
+}
+
+// pgProcInputArgOIDs is proargtypes: the input parameters only (IN, INOUT,
+// VARIADIC). OUT parameters and RETURNS TABLE columns are results and are
+// listed only in proallargtypes (M0146-0165). The heap row and the
+// (proname, proargtypes, pronamespace) index key both use it.
+func pgProcInputArgOIDs(r *catalog.Routine) []uint32 {
+	all := pgProcArgOIDs(r)
+	in := make([]uint32, 0, len(all))
+	for i, o := range all {
+		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		in = append(in, o)
+	}
+	return in
+}
+
+// pgProcNonDefaultModes returns proargmodes when some parameter is not a
+// plain IN one, and false when every parameter is IN (proargmodes NULL).
+func pgProcNonDefaultModes(r *catalog.Routine) ([]byte, bool) {
+	nonDefault := false
+	modes := make([]byte, len(r.ArgTypes))
+	for i := range r.ArgTypes {
+		modes[i] = 'i'
+		if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+			modes[i] = r.ArgModes[i][0]
+		}
+		if modes[i] != 'i' {
+			nonDefault = true
+		}
+	}
+	return modes, nonDefault
+}
+
+// pgOidArrayBytes builds an oid[] (elemtype OID=26) ArrayType blob: the
+// oidvector layout with PG's array lower bound 1.
+func pgOidArrayBytes(oids []uint32) []byte {
+	buf := pgProcOidVectorBytes(oids)
+	binary.LittleEndian.PutUint32(buf[20:24], 1)
+	return buf
+}
+
 // pgProcLangOID maps a routine's language name to pg_language's OID:
 // internal=12, c=13, sql=14, plpgsql=13627 (stock PG 18.3 initdb value,
 // matching goopg's pg_language virtual row — see pg_proc_view.go).
@@ -141,17 +199,14 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine, dbOid ...uint32) Ro
 			rows = int64(v)
 		}
 	}
-	argOIDs := make([]uint32, len(r.ArgTypes))
-	for i, t := range r.ArgTypes {
-		// Deferral row 1351: prefer the CREATE-time resolved OID for a `char`
-		// arg (ArgTypeOIDs is char-only non-zero), so a quoted `"char"` writes
-		// CHAROID(18) into proargtypes instead of TypeNameToOID's unconditional
-		// BPCHAROID(1042). The i<len guard is OOB-safe for pre-change routines.
-		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
-			argOIDs[i] = r.ArgTypeOIDs[i]
-		} else {
-			argOIDs[i] = catalog.TypeNameToOID(t.Name)
-		}
+	argOIDs := pgProcArgOIDs(r)
+	inArgOIDs := pgProcInputArgOIDs(r)
+	// proallargtypes / proargmodes list every parameter, and are non-NULL only
+	// when some parameter is not a plain IN one (interpret_function_parameter_list).
+	allArgTypes, argModes := NullDatum, NullDatum
+	if modes, ok := pgProcNonDefaultModes(r); ok {
+		allArgTypes = NewBytesDatum(pgOidArrayBytes(argOIDs))
+		argModes = NewBytesDatum(pgCharArrayBytes(modes))
 	}
 	// Deferral row 1361: prefer the CREATE-time resolved RETURN-type OID
 	// (ReturnTypeOID is char-only non-zero), so a `RETURNS "char"` writes
@@ -207,20 +262,20 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine, dbOid ...uint32) Ro
 		NewBoolDatum(r.ReturnsSet),                                         // 14 proretset
 		NewStringDatum(vol),                                                // 15 provolatile
 		NewStringDatum(par),                                                // 16 proparallel
-		NewIntDatum(int64(len(r.ArgTypes))),                                // 17 pronargs
+		NewIntDatum(int64(len(inArgOIDs))),                                 // 17 pronargs
 		NewIntDatum(int64(nargDefaults)),                                   // 18 pronargdefaults
 		NewIntDatum(int64(retTypeOID)),                                     // 19 prorettype
-		NewBytesDatum(pgProcOidVectorBytes(argOIDs)),                       // 20 proargtypes
-		NullDatum,              // 21 proallargtypes (OUT-arg metadata: follow-up)
-		NullDatum,              // 22 proargmodes (follow-up with 21)
-		argNames,               // 23 proargnames
-		argMetaDatum(r),        // 24 proargdefaults (see pgProcArgMetaJSON)
-		NullDatum,              // 25 protrftypes
-		NewStringDatum(r.Body), // 26 prosrc
-		NullDatum,              // 27 probin
-		NullDatum,              // 28 prosqlbody (NULL ⇒ PG executes prosrc)
-		proconfig,              // 29 proconfig
-		NullDatum,              // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
+		NewBytesDatum(pgProcOidVectorBytes(inArgOIDs)),                     // 20 proargtypes
+		allArgTypes,                                                        // 21 proallargtypes
+		argModes,                                                           // 22 proargmodes
+		argNames,                                                           // 23 proargnames
+		argMetaDatum(r),                                                    // 24 proargdefaults (see pgProcArgMetaJSON)
+		NullDatum,                                                          // 25 protrftypes
+		NewStringDatum(r.Body),                                             // 26 prosrc
+		NullDatum,                                                          // 27 probin
+		NullDatum,                                                          // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		proconfig,                                                          // 29 proconfig
+		NullDatum,                                                          // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
 }
 
@@ -322,17 +377,7 @@ func insertPgProcIndexEntries(ctx *Context, r *catalog.Routine, tid storage.Item
 	if err := insertPgProcOidIndexEntry(ctx, r.OID, tid); err != nil {
 		return fmt.Errorf("pg_proc_oid_index: %w", err)
 	}
-	argOIDs := make([]uint32, len(r.ArgTypes))
-	for i, t := range r.ArgTypes {
-		// Sibling of buildPGProcRow's argOIDs (deferral row 1351): prefer the
-		// stored char OID so the (proname, proargtypes, pronamespace) index key
-		// matches the heap row's proargtypes (quoted `"char"` → 18, not 1042).
-		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
-			argOIDs[i] = r.ArgTypeOIDs[i]
-		} else {
-			argOIDs[i] = catalog.TypeNameToOID(t.Name)
-		}
-	}
+	argOIDs := pgProcInputArgOIDs(r)
 	nsp := namespaceOIDForSchema(ctx.Catalog, r.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgProcPronameArgsNspIndexEntry(ctx, r.Name, argOIDs, nsp, tid); err != nil {
 		return fmt.Errorf("pg_proc_proname_args_nsp_index: %w", err)

@@ -21180,6 +21180,46 @@ func evalRowToRowComparison(op parser.OpCode, left, right []optimizer.Expr, slot
 // evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
+// recordFieldText renders one non-NULL field of a record's text form as
+// record_out does (rowtypes.c): the field's output text, double-quoted when it
+// is empty or holds a comma, parenthesis, double quote, backslash or
+// whitespace, with each quote and backslash doubled.
+func recordFieldText(d Datum) string {
+	s := string(d.AppendValueText(nil))
+	needsQuote := s == ""
+	for _, c := range s {
+		if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range s {
+		if c == '"' || c == '\\' {
+			b.WriteRune(c)
+		}
+		b.WriteRune(c)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// recordText renders fields as a record's text form "(f1,f2,…)"; a NULL
+// field is empty.
+func recordText(fields []Datum) string {
+	parts := make([]string, len(fields))
+	for i, d := range fields {
+		if !d.IsNull() {
+			parts[i] = recordFieldText(d)
+		}
+	}
+	return "(" + strings.Join(parts, ",") + ")"
+}
+
 func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// M0146-0047: a whole-row reference whose NOT NULL column reads NULL is
 	// an outer join's null-extended row — PG's whole-row Var is NULL there.
@@ -21204,34 +21244,7 @@ func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, erro
 			continue
 		}
 		allNull = false
-		s := string(d.AppendValueText(nil))
-		// Quote values that need it in composite syntax: commas, parens,
-		// double-quotes, backslashes, whitespace, or empty string.
-		needsQuote := false
-		if s == "" {
-			needsQuote = true
-		} else {
-			for _, c := range s {
-				if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
-					needsQuote = true
-					break
-				}
-			}
-		}
-		if needsQuote {
-			var b strings.Builder
-			b.WriteByte('"')
-			for _, c := range s {
-				if c == '"' || c == '\\' {
-					b.WriteByte('\\')
-				}
-				b.WriteRune(c)
-			}
-			b.WriteByte('"')
-			parts[i] = b.String()
-		} else {
-			parts[i] = s
-		}
+		parts[i] = recordFieldText(d)
 	}
 	// When all elements are NULL AND the row has zero elements, return NullDatum.
 	// For non-empty rows, even if all elements are NULL, return "()" to match
@@ -21379,25 +21392,11 @@ func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""
 	}
-	// Procedures always show mode prefixes (IN/OUT/INOUT/VARIADIC).
-	// Functions only show mode prefix when at least one param is OUT or INOUT;
-	// if all params are IN/VARIADIC, omit the prefix (PG compat).
+	// The bare IN prefix is printed for procedures only (print_function_arguments,
+	// ruleutils.c PROARGMODE_IN: "IN " when prokind is PROCEDURE, else ""), so
+	// a function with OUT parameters shows `x integer, OUT y integer`
+	// (M0146-0165).
 	showMode := r.IsProcedure
-	if !showMode {
-		for _, m := range r.ArgModes {
-			// For RETURNS TABLE the OUT-mode args are table columns; they belong to
-			// the result (rendered by pg_get_function_result), not the arg list, so
-			// they must not flip showMode on. PG's print_function_arguments excludes
-			// PROARGMODE_TABLE args entirely.
-			if r.ReturnsTable && m == "o" {
-				continue
-			}
-			if m == "o" || m == "b" {
-				showMode = true
-				break
-			}
-		}
-	}
 	parts := make([]string, 0, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
 		// Skip RETURNS TABLE columns: they are stored as trailing OUT args but

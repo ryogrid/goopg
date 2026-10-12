@@ -6676,7 +6676,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			candidates := rs.LookupByName(fc.Name)
 			for _, r := range candidates {
 				if r.ReturnsSet && (strings.EqualFold(r.Language, "sql") || strings.EqualFold(r.Language, "plpgsql")) {
-					if len(r.ArgTypes) == len(fc.Args) {
+					if r.NumInputArgs() == len(fc.Args) {
 						userSrfs = append(userSrfs, userSrfEntry{colIdx: i, fc: fc, routine: r})
 						break
 					}
@@ -7027,55 +7027,7 @@ func wrapOrdinality(node Node, b rangeBinding, rv parser.RangeVar, sourceIdx int
 // scalar column named alias — with colAliases (from rv.Columns, minus a
 // stripped WITH ORDINALITY tail) overriding names positionally. M0134-0015c.
 func userRoutineColumnSchema(cat catalog.Catalog, r *catalog.Routine, alias string, colAliases []string) []catalog.Column {
-	// If the routine has OUT parameters, expand them as separate columns
-	// (matches PostgreSQL's treatment of SETOF record functions with named
-	// OUT params).
-	var outCols []catalog.Column
-	for i, mode := range r.ArgModes {
-		if mode == "o" || mode == "b" {
-			name := ""
-			if i < len(r.ArgNames) {
-				name = r.ArgNames[i]
-			}
-			if name == "" {
-				name = fmt.Sprintf("column%d", len(outCols)+1)
-			}
-			typ := catalog.Type{Name: "text"}
-			if i < len(r.ArgTypes) {
-				typ = r.ArgTypes[i]
-			}
-			outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
-		}
-	}
-	if len(outCols) > 0 {
-		for i := range outCols {
-			if i < len(colAliases) {
-				outCols[i].Name = colAliases[i]
-			}
-		}
-		return outCols
-	}
-	retTypeName := r.ReturnType.Name
-	if retTypeName == "" {
-		retTypeName = "text"
-	}
-	// If the return type is a composite (table) type, expand its columns.
-	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
-		compositeCols := make([]catalog.Column, len(compTbl.Columns))
-		copy(compositeCols, compTbl.Columns)
-		for i := range compositeCols {
-			compositeCols[i].Ordinal = i
-			if i < len(colAliases) {
-				compositeCols[i].Name = colAliases[i]
-			}
-		}
-		return compositeCols
-	}
-	colName := alias
-	if len(colAliases) > 0 {
-		colName = colAliases[0]
-	}
-	return []catalog.Column{{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0}}
+	return catalog.RoutineResultColumns(cat, r, alias, colAliases)
 }
 
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.

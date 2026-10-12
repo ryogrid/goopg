@@ -168,6 +168,19 @@ func (r *Routine) QualifiedName() string {
 // Signature is the upstream overload key: `(arg1_type,arg2_type,…)`.
 // Stage A uses type-name comparison directly; the future overload
 // resolver will normalise via the type system.
+// NumInputArgs is pronargs: the number of input parameters (IN, INOUT,
+// VARIADIC). OUT parameters and RETURNS TABLE columns are not arguments.
+func (r *Routine) NumInputArgs() int {
+	n := 0
+	for i := range r.ArgTypes {
+		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 func (r *Routine) Signature() string {
 	var parts []string
 	for i, t := range r.ArgTypes {
@@ -1138,4 +1151,64 @@ func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.F
 		}
 	}
 	return cands
+}
+
+// RoutineResultColumns lists the columns a FROM-clause call of r produces —
+// get_expr_result_type / get_func_result_type (funcapi.c) as
+// transformRangeFunction (parse_clause.c) uses them: one column per output
+// parameter (OUT, INOUT, RETURNS TABLE column; an unnamed one is columnN),
+// else the composite return type's columns, else one column of the return
+// type named alias. colAliases rename positionally. The planner's
+// FROM-function binding and the parse analyzer's scope both use it, so the
+// two agree on the names a query may reference (M0146-0165).
+func RoutineResultColumns(cat Catalog, r *Routine, alias string, colAliases []string) []Column {
+	// If the routine has OUT parameters, expand them as separate columns
+	// (matches PostgreSQL's treatment of SETOF record functions with named
+	// OUT params).
+	var outCols []Column
+	for i, mode := range r.ArgModes {
+		if mode == "o" || mode == "b" {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			if name == "" {
+				name = fmt.Sprintf("column%d", len(outCols)+1)
+			}
+			typ := Type{Name: "text"}
+			if i < len(r.ArgTypes) {
+				typ = r.ArgTypes[i]
+			}
+			outCols = append(outCols, Column{Name: name, Type: typ, Ordinal: len(outCols)})
+		}
+	}
+	if len(outCols) > 0 {
+		for i := range outCols {
+			if i < len(colAliases) {
+				outCols[i].Name = colAliases[i]
+			}
+		}
+		return outCols
+	}
+	retTypeName := r.ReturnType.Name
+	if retTypeName == "" {
+		retTypeName = "text"
+	}
+	// If the return type is a composite (table) type, expand its columns.
+	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
+		compositeCols := make([]Column, len(compTbl.Columns))
+		copy(compositeCols, compTbl.Columns)
+		for i := range compositeCols {
+			compositeCols[i].Ordinal = i
+			if i < len(colAliases) {
+				compositeCols[i].Name = colAliases[i]
+			}
+		}
+		return compositeCols
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	return []Column{{Name: colName, Type: Type{Name: retTypeName}, Ordinal: 0}}
 }

@@ -78,6 +78,19 @@ func (o *userSrfScanOp) Next() (TupleSlot, error) {
 // decomposeCompositeText splits a PostgreSQL composite literal "(v1,v2,...)"
 // into n Datum values. Empty fields become NullDatum.
 func decomposeCompositeText(s string, n int) Row {
+	// record_in's tokenizer: quoted fields may hold commas, parentheses and
+	// doubled quotes (M0146-0165).
+	if fields, nulls, err := parseRecordText(s); err == nil {
+		row := make(Row, n)
+		for i := range row {
+			if i < len(fields) && !nulls[i] {
+				row[i] = NewStringDatum(fields[i])
+			} else {
+				row[i] = NullDatum
+			}
+		}
+		return row
+	}
 	// Strip outer parens.
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {

@@ -2095,9 +2095,21 @@ create_function_stmt:
 				}
 				$$ = applyFnAttrs(st, a)
 			}
-	/* gram.y makes RETURNS optional (inferring the type from the OUT
-	   arguments); legacy requires it — "expected keyword returns" — so there is
-	   no RETURNS-less alternative here. CREATE PROCEDURE never takes one. */
+	/* gram.y makes RETURNS optional: the executor infers the result type from
+	   the OUT / INOUT parameters (interpret_function_parameter_list's
+	   requiredResultType) and raises 42P13 when there are none (M0146-0165).
+	   The attribute list must be non-empty here: an empty fn_attrs would have
+	   to be reduced before RETURNS, which also starts the first alternative. */
+	| CREATE opt_or_replace FUNCTION qualified_name '(' opt_func_args ')' fn_attrs1
+			{
+				a := mustFnAttrs($8)
+				if msg, raw, at := fnAttrsCheck(yylex, a, "FUNCTION"); msg != "" {
+					yylex.(*lexerState).raise(msg, raw, at)
+					return 1
+				}
+				st := NewCreateFunctionStmt($<p>1, $2, objectNameFromQn($4), $6)
+				$$ = applyFnAttrs(st, a)
+			}
 	| CREATE opt_or_replace PROCEDURE qualified_name '(' opt_func_args ')' fn_attrs
 			{
 				a := mustFnAttrs($8)
@@ -2177,6 +2189,10 @@ opt_arg_default:
 fn_attrs:
 		/* empty */             { $$ = newFnAttrs() }
 	| fn_attrs fn_attr          { a := mustFnAttrs($1); $2.(func(*fnAttrs))(a); $$ = a }
+
+fn_attrs1:
+		fn_attr                 { a := newFnAttrs(); $1.(func(*fnAttrs))(a); $$ = a }
+	| fn_attrs1 fn_attr         { a := mustFnAttrs($1); $2.(func(*fnAttrs))(a); $$ = a }
 
 fn_attr:
 		LANGUAGE fn_lang_name

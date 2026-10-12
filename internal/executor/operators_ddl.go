@@ -17332,12 +17332,72 @@ func checkDuplicateParamNames(args []parser.FunctionArg) error {
 	return nil
 }
 
+// resolveOutParamReturnType applies interpret_function_parameter_list's
+// requiredResultType and CreateFunction's check of it
+// (postgres/src/backend/commands/functioncmds.c). With output parameters
+// (OUT, INOUT) the result type is the single output's type, or record for
+// several. An omitted RETURNS takes it; a RETURNS that differs is rejected.
+// Without output parameters, RETURNS is required. Both errors carry no
+// position, as in PG. RETURNS TABLE keeps its parsed SETOF record
+// (M0146-0165).
+func resolveOutParamReturnType(s *parser.CreateFunctionStmt) error {
+	if s.ReturnsTable {
+		return nil
+	}
+	var outs []parser.ColumnType
+	for _, a := range s.Args {
+		if a.Mode == parser.FuncArgOut || a.Mode == parser.FuncArgInout {
+			outs = append(outs, a.Type)
+		}
+	}
+	if len(outs) == 0 {
+		if s.ReturnType.Name == "" {
+			return &ExecError{Code: "42P13", Message: "function result type must be specified"}
+		}
+		return nil
+	}
+	required := parser.ColumnType{Name: "record"}
+	if len(outs) == 1 {
+		required = outs[0]
+	}
+	if s.ReturnType.Name == "" {
+		s.ReturnType = required
+		return nil
+	}
+	if !sameRoutineType(s.ReturnType, required) {
+		return &ExecError{Code: "42P13", Message: fmt.Sprintf(
+			"function result type must be %s because of OUT parameters",
+			canonicalTypeName(routineArgTypeName(required), charTypeOID(required)))}
+	}
+	return nil
+}
+
+// sameRoutineType reports whether two parsed type names denote the same type,
+// by pg_type OID when both resolve and by name otherwise.
+func sameRoutineType(a, b parser.ColumnType) bool {
+	an, bn := strings.ToLower(routineArgTypeName(a)), strings.ToLower(routineArgTypeName(b))
+	ao, bo := catalog.TypeNameToOID(an), catalog.TypeNameToOID(bn)
+	if co := charTypeOID(a); co != 0 {
+		ao = co
+	}
+	if co := charTypeOID(b); co != 0 {
+		bo = co
+	}
+	if ao != 0 && bo != 0 {
+		return ao == bo
+	}
+	return an == bn
+}
+
 func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
 	}
 	if err := checkDuplicateParamNames(s.Args); err != nil {
+		return err
+	}
+	if err := resolveOutParamReturnType(s); err != nil {
 		return err
 	}
 	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
@@ -17425,7 +17485,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	// Validate SQL function body when check_function_bodies=on (default).
 	if lang == "sql" && !s.BeginAtomic {
-		if err := o.validateSQLFunctionBody(s, len(s.Args)); err != nil {
+		// $n numbers the input parameters only (M0146-0165).
+		nIn := 0
+		for _, a := range s.Args {
+			if a.Mode != parser.FuncArgOut {
+				nIn++
+			}
+		}
+		if err := o.validateSQLFunctionBody(s, nIn); err != nil {
 			return err
 		}
 	}
@@ -17642,7 +17709,11 @@ func (o *ddlOp) validateSQLFunctionBody(s *parser.CreateFunctionStmt, nArgs int)
 		last := stmts[len(stmts)-1]
 		switch l := last.(type) {
 		case *parser.SelectStmt:
-			if !s.ReturnsSet {
+			// A record or composite result takes several columns
+			// (check_sql_fn_retval); only a scalar result is checked here.
+			rowResult := retTypeRaw == "record" ||
+				(o.ctx.Catalog != nil && len(o.ctx.Catalog.LookupCompositeTypeFields(retTypeRaw)) > 0)
+			if !s.ReturnsSet && !rowResult {
 				// Check column count for scalar returns.
 				nTargets := len(l.Targets)
 				if l.ValuesRows != nil && len(l.Targets) == 0 {

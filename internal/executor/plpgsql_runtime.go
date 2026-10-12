@@ -817,6 +817,11 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			if len(row) > 0 {
 				out = row[0]
 			}
+			// Several output parameters make the result a record of the final
+			// row's columns (M0146-0165).
+			if routineOutParamCount(r) > 1 {
+				out = NewStringDatum(recordText(row))
+			}
 			if _, nextErr2 := op.Next(); nextErr2 != EOF {
 				if nextErr2 != nil {
 					return Datum{}, wrapSQLFunctionContext(nextErr2, r.Name, stmtNum)
@@ -1034,6 +1039,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		// non-SETOF composite convention elsewhere in this file
 		// (rowToCompositeText). Before this fix only row[0] was kept,
 		// silently dropping every column past the first. M0134-0059.
+		nOut := routineOutParamCount(r)
 		var compositeCols []catalog.Column
 		if compTbl, ok := ctxPlanCatalog(child).LookupTable(parser.ObjectName{Name: strings.ToLower(r.ReturnType.Name)}); ok && len(compTbl.Columns) > 0 {
 			compositeCols = compTbl.Columns
@@ -1053,6 +1059,12 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			}
 			if compositeCols != nil && len(row) > 1 {
 				out = append(out, NewStringDatum(rowToCompositeText(compositeCols, row)))
+				continue
+			}
+			// Several output parameters (OUT, INOUT or RETURNS TABLE columns):
+			// each row is a record of them (M0146-0165).
+			if nOut > 1 {
+				out = append(out, NewStringDatum(recordText(row)))
 				continue
 			}
 			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
@@ -1094,6 +1106,69 @@ func datumForCompositeText(d Datum) string {
 	default:
 		return d.StringValue()
 	}
+}
+
+// declarePLpgSQLOutParams registers r's output parameters — OUT, INOUT and
+// RETURNS TABLE columns — as frame variables, as pl_comp.c do_compile does for
+// every output argument. An OUT parameter starts NULL; an INOUT one is already
+// bound to its input value, so its duplicate add is ignored.
+func declarePLpgSQLOutParams(r *catalog.Routine, frame *plpgsqlFrame) {
+	for i, mode := range r.ArgModes {
+		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			typ := catalog.Type{Name: "unknown"}
+			if i < len(r.ArgTypes) {
+				typ = normalizeCatalogType(r.ArgTypes[i])
+			}
+			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
+			frame.outParamNames = append(frame.outParamNames, r.ArgNames[i])
+		}
+	}
+}
+
+// routineHasOutParams reports whether r has an OUT or INOUT parameter.
+func routineHasOutParams(r *catalog.Routine) bool {
+	for _, m := range r.ArgModes {
+		if m == "o" || m == "b" {
+			return true
+		}
+	}
+	return false
+}
+
+// routineOutParamCount is the number of r's OUT and INOUT parameters.
+func routineOutParamCount(r *catalog.Routine) int {
+	n := 0
+	for _, m := range r.ArgModes {
+		if m == "o" || m == "b" {
+			n++
+		}
+	}
+	return n
+}
+
+// plpgsqlOutParamResult is the value a function with output parameters
+// produces at RETURN, at RETURN NEXT without an expression, or on reaching the
+// end of its body: the single output variable's value, or a record of all of
+// them in declaration order (pl_exec.c: the out-parameter row is the
+// function's result). An unnamed output is NULL.
+func plpgsqlOutParamResult(r *catalog.Routine, frame *plpgsqlFrame) Datum {
+	var vals []Datum
+	for i, mode := range r.ArgModes {
+		if mode != "o" && mode != "b" {
+			continue
+		}
+		val := NullDatum
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			if idx, ok := frame.lookup(r.ArgNames[i]); ok {
+				val = frame.values[idx]
+			}
+		}
+		vals = append(vals, val)
+	}
+	if len(vals) == 1 {
+		return vals[0]
+	}
+	return NewStringDatum(recordText(vals))
 }
 
 func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
@@ -1143,16 +1218,7 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	}
 	// Initialize OUT parameters as NULL variables (RETURNS TABLE / OUT args not
 	// passed by caller). M0097-0028.
-	for i, mode := range r.ArgModes {
-		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
-			typ := catalog.Type{Name: "unknown"}
-			if i < len(r.ArgTypes) {
-				typ = normalizeCatalogType(r.ArgTypes[i])
-			}
-			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
-			frame.outParamNames = append(frame.outParamNames, r.ArgNames[i])
-		}
-	}
+	declarePLpgSQLOutParams(r, frame)
 	for _, d := range block.Declarations {
 		typ := catalogTypeFromColumnType(d.Type)
 		value := NullDatum
@@ -1341,8 +1407,16 @@ func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) 
 // parameter, or the routine's declared VARIADIC position is beyond the
 // caller-supplied arguments.
 func bundleVariadicArgs(argModes []string, args []Datum) []Datum {
-	for vi, mode := range argModes {
+	// vi counts input positions only: an OUT parameter is not an argument, so
+	// one declared before the VARIADIC parameter must not shift it
+	// (M0146-0165).
+	vi := 0
+	for _, mode := range argModes {
+		if mode == "o" {
+			continue
+		}
 		if mode != "v" || vi > len(args) {
+			vi++
 			continue
 		}
 		bundled := make([]Datum, 0, vi+1)
@@ -1468,6 +1542,10 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 			}
 		}
 	}
+	hasOut := !r.IsProcedure && routineHasOutParams(r)
+	if hasOut {
+		declarePLpgSQLOutParams(r, frame)
+	}
 	for _, d := range block.Declarations {
 		typ := catalogTypeFromColumnType(d.Type)
 		value := NullDatum
@@ -1503,6 +1581,11 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	}
 	if flow == flowReturn {
 		return res, nil
+	}
+	// A function with output parameters returns them on reaching the end of its
+	// body; there is no "control reached end" error (M0146-0165).
+	if hasOut {
+		return plpgsqlOutParamResult(r, frame), nil
 	}
 	// VOID functions may fall off the end without an explicit RETURN. M0097-0025.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
@@ -1899,6 +1982,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if frame.trig != nil {
 				return Datum{}, flowReturnTriggerNull, nil
 			}
+			// With output parameters a bare RETURN returns them (M0146-0165).
+			if !r.IsProcedure && routineHasOutParams(r) {
+				return plpgsqlOutParamResult(r, frame), flowReturn, nil
+			}
 			if !strings.EqualFold(r.ReturnType.Name, "void") {
 				return Datum{}, flowNone, &ExecError{
 					Code:    "42601",
@@ -1922,6 +2009,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				return Datum{}, flowReturnTriggerNull, nil
 			}
 		}
+		// pl_gram.y make_return_stmt rejects this when the function is
+		// compiled; goopg compiles PL/pgSQL at the call, so it is raised here
+		// (M0146-0165).
+		if !r.IsProcedure && routineHasOutParams(r) {
+			return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(),
+				Message: "RETURN cannot have a parameter in function with OUT parameters"}
+		}
 		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
@@ -1940,33 +2034,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// RETURN NEXT — append one value to the SETOF accumulator. M0097-0073.
 		if s.Expr == nil {
 			// RETURN NEXT; (no expression) — collect current OUT param values.
-			// Used by RETURNS TABLE functions. M0097-0028.
-			var outNames []string
-			for i, mode := range r.ArgModes {
-				if (mode == "o" || mode == "b") && i < len(r.ArgNames) {
-					outNames = append(outNames, r.ArgNames[i])
-				}
-			}
-			if len(outNames) == 1 {
-				val := NullDatum
-				if idx, ok := frame.lookup(outNames[0]); ok {
-					val = frame.values[idx]
-				}
-				frame.returnNextRows = append(frame.returnNextRows, val)
-			} else if len(outNames) > 1 {
-				parts := make([]string, len(outNames))
-				for i, name := range outNames {
-					val := NullDatum
-					if idx, ok := frame.lookup(name); ok {
-						val = frame.values[idx]
-					}
-					if val.IsNull() {
-						parts[i] = ""
-					} else {
-						parts[i] = val.StringValue()
-					}
-				}
-				frame.returnNextRows = append(frame.returnNextRows, NewStringDatum("("+strings.Join(parts, ",")+")"))
+			// Used by RETURNS TABLE functions. M0097-0028. Non-string outputs
+			// render through their output function (M0146-0165).
+			if routineHasOutParams(r) {
+				frame.returnNextRows = append(frame.returnNextRows, plpgsqlOutParamResult(r, frame))
 			}
 			return Datum{}, flowNone, nil
 		}

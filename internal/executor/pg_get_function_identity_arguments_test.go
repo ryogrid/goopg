@@ -70,7 +70,9 @@ func TestPgGetFunctionIdentityArguments(t *testing.T) {
 
 // TestPgGetFunctionIdentityArgumentsOutMode pins that OUT/INOUT mode prefixes
 // survive in the identity form, matching upstream print_function_arguments
-// (which prints all non-TABLE args regardless of mode).
+// (which prints all non-TABLE args regardless of mode). The bare IN prefix is
+// printed for procedures only, so a function's input argument carries none —
+// PG 18.3 gives `x integer, OUT y integer` (M0146-0165).
 func TestPgGetFunctionIdentityArgumentsOutMode(t *testing.T) {
 	cat := catalog.NewInMemory()
 	created, err := cat.Routines().Create(&catalog.Routine{
@@ -97,7 +99,7 @@ func TestPgGetFunctionIdentityArgumentsOutMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pg_get_function_identity_arguments: %v", err)
 	}
-	const want = "IN x integer, OUT y integer"
+	const want = "x integer, OUT y integer"
 	if identity.StringValue() != want {
 		t.Errorf("identity = %q, want %q", identity.StringValue(), want)
 	}
