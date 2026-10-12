@@ -4813,7 +4813,29 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestPort_PgoutputInterop` suite against real PG; tpch\-spotcheck
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
-- [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+- [!] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - **ESCALATION 2026\-10\-12 \(lineage budget, Rule A\)\.** The last five
+    completed children \(0015b subq\_op OPERATOR, 0015c PREPARE types, 0015d
+    pg\_proc per database, 0015e FDW per database, 0015g
+    postgresql\_fdw\_validator\) all carry `Movement: none`, so the root is
+    parked `[!]` until the owner re\-opens it \(`LINEAGE\-BASELINE:
+    M0122\-0015 ...`\)\.
+    - What was attempted: making pg\_dump / pg\_restore work against goopg as
+      the 005\_pg\_dump\_filterfile port demanded — grammar, PREPARE, catalog
+      scoping and FDW option validation, each verified against PG 18\.3\.
+    - What each step proved: client\-tool parity has no TPC instrument;
+      `Movement: none` is structural\.
+    - Remaining blocker: the lineage rule\. Owner call: re\-baseline or close\.
+    - Expected movement if unblocked: none on match / CATEGORIES /
+      ea\-ratchet; gains show in pg\_dump ports and regress foreign\_data\.
+    - Remaining size — open children already filed: 0015f \(`= ANY
+      \(non\-array\)` accepted\), 0015a \(COPY in non\-default databases; also
+      unblocks the 23 unported 005 assertions\)\. **Not filed**
+      \(guard\-refused; in the 2026\-10\-12 ledger rows\): user\-defined FDW
+      validators are never invoked; ALTER SERVER / ALTER USER MAPPING OPTIONS
+      are unimplemented; a WARNING preceding an ERROR in the same statement is
+      lost; CREATE FOREIGN TABLE reports the command tag `CREATE TABLE`;
+      foreign\-catalog heaps are single\-database across restarts\.
   - [x] **M0122-0015b — `subq_op` omits `OPERATOR(...)` before `ANY/SOME/ALL`,
     so `pg_dump -t` / `-T` / `--filter` all fail**
     Kind: impl
@@ -4931,10 +4953,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `CREATE FOREIGN DATA WRAPPER dummy;`\. pg\_foreign\_server does not leak\.
     - First step: scope the FDW registry by database as the foreign\-server
       registry already is \(design 0122\-0018 follow\-up 36\)\.
-  - [ ] **M0122-0015g — the built\-in `postgresql\_fdw\_validator` does not
+  - [x] **M0122-0015g — the built\-in `postgresql\_fdw\_validator` does not
     exist**
     Kind: impl
     Parent: M0122-0015
+    Movement: none — FDW option validation; no TPC instrument
+    - **DONE 2026\-10\-12 \(`b81034bfd`\)\.** The validator resolves to the
+      built\-in and its libpq\-conninfo check runs for wrapper / server / user
+      mapping / foreign\-table options; ALTER FDW is superuser\-only, atomic,
+      and warns on a validator change\.
+    - Tests `TestPostgresqlFDWValidator`, `TestClosestMatch`; regress
+      foreign\_data 2459 → 2428 diff lines\.
+    - Design `docs/design/0100\-0149/0122\-0015g\-postgresql\-fdw\-validator\.md`\.
     Found 2026\-10\-12 by the M0122\-0015e regress A/B\.
     - **Measured**: `CREATE FOREIGN DATA WRAPPER postgresql VALIDATOR
       postgresql\_fdw\_validator` → `function
