@@ -29279,7 +29279,7 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     and wraps the Merge in the CTE DML prefix like `planDelete`\. The routing guard that pinned the
     rejection now pins acceptance\. Design: `docs/design/0100\-0149/m0146\-0085\-with\-merge\.md`\.
   Movement: yes — regress merge 1586 → 1572 and with 2997 → 2969 diff lines
-- [ ] **M0146\-0086 — WRONG RESULTS: `text \|\| bool` renders the bool as
+- [x] **M0146\-0086 — WRONG RESULTS: `text \|\| bool` renders the bool as
   `t`/`f`** \(filed 2026\-10\-07 by M0146\-0081\)\. `SELECT \'x\' \|\| true`
   returns `xt`; PG 18\.3 returns `xtrue`\. PG\'s `anytextcat` /
   `textanycat` are SQL functions `$1::text \|\| $2`, so the non\-text operand
@@ -29296,6 +29296,23 @@ Movement: none — instrument artefact — executor correctness, no plan change;
     non\-text operand through its text cast rather than AppendValueText;
     check every type whose cast to text differs from its output function
     \(bool is the known one\) and the compiled twin\.
+  - Done 2026\-10\-13 \(`78b971912`\): `concatOperandText` in `evalConcat`\'s text path renders a bool
+    operand as booltext \(`true` / `false`\); both evaluator twins reach it, `concat\(\)` keeps `t` / `f`\.
+    Type sweep \(`tmp/m0086/probe3\.sql`\): numeric, float8, json, interval, name, char\(n\) match PG;
+    inet does not — filed M0146\-0166\. Design: `docs/design/0100\-0149/m0146\-0086\-text\-concat\-bool\.md`\.
+Movement: none — instrument artefact — no TPC\-H / TPC\-DS query concatenates a bool with `\|\|`; PG 18\.3 probe
+  identical, `TestConcatBoolUsesTextCast` red on HEAD in all four arms
+- [ ] **M0146\-0166 — WRONG RESULTS: `inet::text` and `text \|\| inet` omit the mask length** \(filed
+  2026\-10\-13 by M0146\-0086\)\. PG 18\.3: `\'1\.2\.3\.4\'::inet::text` → `1\.2\.3\.4/32`, `\'::1\'::inet::text` →
+  `::1/128`, `\'x\' \|\| \'1\.2\.3\.4\'::inet` → `x1\.2\.3\.4/32` \(the text cast is `network\_show`, not
+  `inet\_out`\); goopg prints `1\.2\.3\.4` for all three\. `concat\(\'x\', i\)` correctly keeps `x1\.2\.3\.4`\.
+  Probe: `tmp/m0086/probe3\.sql`\.
+  Kind: bug
+  Parent: M0146\-0086
+  - First step: an inet datum is an untyped `KindString` at run time — find the evalCast arm that
+    casts to text/varchar and render an inet/cidr source through `network\_show` \(always `/bits`\) using
+    the static source type; then give `concatModeOf` the operand\'s static type so `\|\|` does the same
+    in both evaluator twins\.
 - [x] **M0146\-0078 — repeated CREATE OR REPLACE FUNCTION fails `catalog
   update: freshly extended page did not accept tuple`** \(filed 2026\-10\-06
   by M0146\-0072\)\. Running a script that creates or replaces nine small
