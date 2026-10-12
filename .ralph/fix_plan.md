@@ -30089,7 +30089,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     / PushSaveLevel \(set\_config\_option\'s context check against
     Variable\.Context == ContextSuset\), reusing parameterACLGrants\(…, \'s\'\)
     from execAlterSystem\.
-- [ ] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
+- [x] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
   database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
   by M0122\-0015d; S2; **placed in item 2a — live member #1 — by the
   2026\-10\-12 evening owner decision**\)\. In a database made by `CREATE DATABASE`,
@@ -30107,6 +30107,34 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     routines into DefaultDBOid \(routines\.go CreateDuringRecovery comment:
     "WAL payloads don\'t carry a dbOid yet"\) and/or the pg\_proc heap reload
     does not cover non\-default databases\.
+  - Done 2026\-10\-12 \(`7c43ca80b`\): `catalog\.Routines` split into a shared store plus
+    database\-bound handles \(`InDB`\); `SearchPathCatalog\.Routines\(\)` and the executor\'s
+    `routineRegistry` bind the connection\'s database; routines and aggregates reload from every
+    database\'s pg\_proc heap; DROP DATABASE purges its routines \(`DropAllInDB`\)\. Design:
+    `docs/design/0100\-0149/m0146\-0156\-routines\-per\-database\.md`\.
+  - Both hypotheses held: lookups defaulted to DefaultDBOid \(\~40 sites\), and the reload read only
+    the default heap with CreateDuringRecovery forcing DefaultDBOid\.
+  - Found: \~25 other catalog reloads read only the default database — filed S2 M0146\-0160\.
+  Movement: none — durability / resolution fix; regress function cases identical, no TPC witness
+- [ ] **M0146\-0160 — DATA LOSS: catalog objects other than routines in a CREATE DATABASE\'d
+  database are lost on restart** \(filed 2026\-10\-12 by M0146\-0156; S2\)\. After one clean
+  restart in `CREATE DATABASE dx`: `CREATE SEQUENCE sq` is gone \(`relation "sq" does not exist`\),
+  a domain\'s CHECK no longer applies \(`\(\-1\)::posint` succeeds\), and a serial column\'s default
+  is gone \(INSERT fails with a not\-null violation\)\. Every reload in
+  `internal/initdb/catalog\_heap\_reload\.go` that builds its RelFileNode from `cat\.DBOID\(\)` scans
+  only the default database: sequences, domains, enums, casts, operators, collations,
+  conversions, opfamilies/opclasses \+ amop/amproc, transforms, event triggers, publications,
+  FDWs / servers / user mappings / foreign tables, text\-search dicts/configs, access methods\.
+  PG: every per\-database catalog is that database\'s heap, durable\.
+  Kind: impl
+  Parent: M0146\-0156
+  - First step: per object kind, apply the `reloadUserRoutinesFromHeap` pattern \(default heap,
+    then each `cat\.ListDatabases\(\)` database with the schema\-reload skip set\), stamping the
+    database where the registry is per\-database \(sequences live in the per\-database table
+    namespace; domains/enums carry DBOid\); start with sequences and domains \(wrong results\)\.
+  > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0160 loses data
+  > Sequences, domain constraints and serial defaults in any CREATE DATABASE\'d database vanish
+  > on restart\. Filed under M0146\-0156, so it inherits item 2a\'s rank; owner: confirm or place\.
 - [x] **M0146\-0005ea — offer the materialised\-inner nested loop after the
   index probes, as `match\_unsorted\_outer` does** \(filed 2026\-10\-04 by
   M0146\-0005dx1\)\. PG offers the `cheapest\_parameterized\_paths` loop
