@@ -30097,7 +30097,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     relacl column back; probe REVOKE \.\.\. FROM PUBLIC and column grants too\.
   > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0161 loses granted privileges on restart
   > Filed under M0146\-0157, so it inherits item 2a\'s rank; owner: confirm or place\.
-- [ ] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
+- [x] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
   \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
   confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
   `SET ROLE plain; SET
@@ -30112,6 +30112,27 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     / PushSaveLevel \(set\_config\_option\'s context check against
     Variable\.Context == ContextSuset\), reusing parameterACLGrants\(…, \'s\'\)
     from execAlterSystem\.
+  - Done 2026\-10\-12 \(`e20a51f42`\): SessionRegistry privilege hook on SET / SET LOCAL / RESET /
+    set\_config / routine SET clauses, with a SECURITY DEFINER role override \(PushRole\); CREATE /
+    ALTER FUNCTION … SET validated; RESET ALL unchecked\. Design:
+    `docs/design/0100\-0149/m0146\-0158\-suset\-set\-privilege\.md`\.
+  - Found: a direct non\-superuser LOGIN runs with superuser rights — filed S2 M0146\-0162\.
+  Movement: none — privilege check; regress GUC / privilege cases identical, no TPC witness
+- [ ] **M0146\-0162 — WRONG RESULTS: a non\-superuser that logs in directly runs with superuser
+  rights** \(filed 2026\-10\-12 by M0146\-0158; S2\)\. `CREATE ROLE lu LOGIN; CREATE TABLE privt\(a
+  int\)`; connecting as `lu` \(no SET ROLE\), `SELECT count\(\*\) FROM privt` succeeds \(PG: permission
+  denied for table privt\), and SET of superuser\-only parameters is allowed\. `connTx\.NonSuperuserRole`
+  is set only by SET ROLE / SET SESSION AUTHORIZATION, and every ACL gate keys on it; `is\_superuser`
+  correctly reads off\. Ledgered since 2026\-07\-09 \(M0122\-0007 DROP DATABASE row: "plain LOGIN without
+  SET ROLE resolves to bootstrap superuser — systemic actingRole RBAC gap"\) but never filed\.
+  Kind: impl
+  Parent: M0146\-0158
+  - First step: at connection setup \(server\.go runPostStartupLoop, beside connTx\.SessionUser\), seed
+    NonSuperuserRole with the login role when it is not a superuser \(catalog IsSuperuser\); then audit
+    RESET ROLE / RESET SESSION AUTHORIZATION \(they must restore the login role, not ""\) and run the
+    testport families that log in as other roles\.
+  > \#\# ESCALATION 2026\-10\-12 \(S2\) — M0146\-0162 grants superuser rights to every login role
+  > Filed under M0146\-0158, so it inherits item 2a\'s rank; owner: confirm or place\.
 - [x] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
   database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
   by M0122\-0015d; S2; **placed in item 2a — live member #1 — by the
