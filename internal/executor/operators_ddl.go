@@ -17305,10 +17305,40 @@ func argTypeOID(a parser.ColumnType) uint32 {
 // verbatim — the PL/pgSQL parser/interpreter that executes it
 // arrives in step 4+. Stage A pins LANGUAGE to plpgsql or sql;
 // other languages surface a typed diagnostic.
+// checkDuplicateParamNames is interpret_function_parameter_list's name rule
+// (functioncmds.c): two input parameters, or two output parameters, may not
+// share a name — 42P13 "parameter name "a" used more than once", at the
+// second one. A pure input (IN / VARIADIC) and a pure output (OUT, RETURNS
+// TABLE column) may. Without it the duplicate-name definitions polymorphism.sql
+// expects to fail were created, and a later testpolym(37) call resolved
+// against them (M0146-0084).
+func checkDuplicateParamNames(args []parser.FunctionArg) error {
+	isIn := func(m parser.FuncArgMode) bool { return m == parser.FuncArgIn || m == parser.FuncArgVariadic }
+	isOut := func(m parser.FuncArgMode) bool { return m == parser.FuncArgOut }
+	for i, fp := range args {
+		if fp.Name == "" {
+			continue
+		}
+		for _, prev := range args[:i] {
+			if (isIn(fp.Mode) && isOut(prev.Mode)) || (isIn(prev.Mode) && isOut(fp.Mode)) {
+				continue
+			}
+			if prev.Name != "" && prev.Name == fp.Name {
+				return &ExecError{Code: "42P13", Pos: fp.Pos(),
+					Message: fmt.Sprintf("parameter name %q used more than once", fp.Name)}
+			}
+		}
+	}
+	return nil
+}
+
 func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
+	}
+	if err := checkDuplicateParamNames(s.Args); err != nil {
+		return err
 	}
 	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
 	if err != nil {
@@ -18093,6 +18123,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
+	}
+	if err := checkDuplicateParamNames(s.Args); err != nil {
+		return err
 	}
 	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
 	if err != nil {

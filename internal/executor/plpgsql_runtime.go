@@ -678,9 +678,12 @@ func internalArityError(name string, want, got int, pos int) error {
 }
 
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	body := r.Body
-	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+	if len(inNames) > 0 {
+		body = rewriteSQLNamedParams(body, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -707,8 +710,8 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
@@ -946,14 +949,17 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 // []Datum (first column of each row). Used by the ProjectSet operator for
 // user-defined SETOF functions in SELECT target lists. M0097-0020.
 func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	restore, cerr := enterRoutineConfig(r, ctx, pos)
 	if cerr != nil {
 		return nil, cerr
 	}
 	defer restore()
 	body := r.Body
-	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+	if len(inNames) > 0 {
+		body = rewriteSQLNamedParams(body, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -976,8 +982,8 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
@@ -1091,6 +1097,9 @@ func datumForCompositeText(d Datum) string {
 }
 
 func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	// STRICT: if any argument is NULL, return empty set without executing the body.
 	if r.Strict {
 		for _, arg := range args {
@@ -1118,16 +1127,16 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
 			return nil, err
 		}
 		child.Params[i] = coerced
-		if i < len(r.ArgNames) {
-			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+		if i < len(inNames) {
+			if err := frame.add(inNames[i], declared, coerced); err != nil {
 				return nil, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
 			}
 		}
@@ -1231,7 +1240,7 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 		// Mirrors PostgreSQL's "exact match beats implicit cast" resolution.
 		exact := make([]*catalog.Routine, 0, len(specific))
 		for _, c := range specific {
-			if routineArgsExactMatch(c.ArgTypes, args) {
+			if inTypes, _ := routineInputParams(c); routineArgsExactMatch(inTypes, args) {
 				exact = append(exact, c)
 			}
 		}
@@ -1249,25 +1258,75 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 // call-site arguments of its element type — each later collapsed into one
 // array value by bundleVariadicArgs — mirroring parse_func.c's
 // func_match_argtypes VARIADIC handling.
-func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) {
-	variadicPos := -1
-	for i, mode := range c.ArgModes {
-		if mode == "v" {
-			variadicPos = i
+// routineInputParams returns the types and names of r's input parameters —
+// IN, INOUT and VARIADIC, in declaration order. A call's arguments, $n and
+// parameter names in the body all refer to these (functioncmds.c
+// interpret_function_parameter_list counts only them in pronargs); OUT
+// parameters and RETURNS TABLE columns are results, not arguments. With
+// every parameter an input (the common case) it returns r's own slices.
+func routineInputParams(r *catalog.Routine) ([]catalog.Type, []string) {
+	hasOut := false
+	for _, m := range r.ArgModes {
+		if m == "o" {
+			hasOut = true
+			break
 		}
 	}
+	if !hasOut {
+		return r.ArgTypes, r.ArgNames
+	}
+	types := make([]catalog.Type, 0, len(r.ArgTypes))
+	var names []string
+	if len(r.ArgNames) > 0 {
+		names = make([]string, 0, len(r.ArgTypes))
+	}
+	for i, t := range r.ArgTypes {
+		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		types = append(types, t)
+		if names != nil {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			names = append(names, name)
+		}
+	}
+	return types, names
+}
+
+func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) {
+	// A call supplies the input parameters only: OUT parameters and RETURNS
+	// TABLE columns are not arguments (M0146-0084).
+	inTypes, _ := routineInputParams(c)
+	variadicPos := -1
+	in := 0
+	for i := range c.ArgTypes {
+		mode := ""
+		if i < len(c.ArgModes) {
+			mode = c.ArgModes[i]
+		}
+		if mode == "o" {
+			continue
+		}
+		if mode == "v" {
+			variadicPos = in
+		}
+		in++
+	}
 	if variadicPos < 0 {
-		if len(c.ArgTypes) != n {
+		if len(inTypes) != n {
 			return nil, false
 		}
-		return c.ArgTypes, true
+		return inTypes, true
 	}
 	if n < variadicPos {
 		return nil, false
 	}
-	elemType := catalog.Type{Name: strings.TrimSuffix(strings.ToLower(c.ArgTypes[variadicPos].Name), "[]")}
+	elemType := catalog.Type{Name: strings.TrimSuffix(strings.ToLower(inTypes[variadicPos].Name), "[]")}
 	types := make([]catalog.Type, n)
-	copy(types, c.ArgTypes[:variadicPos])
+	copy(types, inTypes[:variadicPos])
 	for i := variadicPos; i < n; i++ {
 		types[i] = elemType
 	}
@@ -1358,6 +1417,9 @@ func hasPolymorphicArgType(argTypes []catalog.Type) bool {
 }
 
 func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	if strings.ToLower(r.Language) != "plpgsql" {
 		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
 	}
@@ -1385,17 +1447,17 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
 			return Datum{}, err
 		}
 		child.Params[i] = coerced
-		if i < len(r.ArgNames) {
-			argName := strings.ToLower(r.ArgNames[i])
-			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+		if i < len(inNames) {
+			argName := strings.ToLower(inNames[i])
+			if err := frame.add(inNames[i], declared, coerced); err != nil {
 				return Datum{}, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
 			}
 			// If this argument is a composite type, record its field schema.
