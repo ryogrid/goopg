@@ -12226,6 +12226,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			if ctx != nil && ctx.SetSetting != nil {
 				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
+					// A typed GUC error keeps its SQLSTATE (42501 for a
+					// superuser-only parameter, M0146-0158) and, as
+					// set_config_by_name reports it, no position.
+					var verr *misc.ValidationError
+					if errors.As(err, &verr) {
+						return Datum{}, execErrorFromGUCError(0, err)
+					}
 					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
 				}
 				getSetting := ctx.GetSettingDisplay

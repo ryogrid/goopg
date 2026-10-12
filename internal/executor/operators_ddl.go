@@ -17310,7 +17310,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
 	}
-	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
 	if err != nil {
 		return err
 	}
@@ -17921,7 +17921,7 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	if rs == nil {
 		return nil // no routine registry, silently skip
 	}
-	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
 	if err != nil {
 		return err
 	}
@@ -18094,7 +18094,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
 	}
-	configOps, err := flattenFunctionConfigOps(s.Pos(), s.ConfigOps)
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
 	if err != nil {
 		return err
 	}

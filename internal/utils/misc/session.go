@@ -61,6 +61,12 @@ type SessionRegistry struct {
 	// (PushSaveLevel / PopSaveLevel), innermost last.
 	saveLevels []*gucSaveLevel
 
+	// currentRole / mayGrant / roleStack back the PGC_SUSET privilege check
+	// (session_set_privilege.go). M0146-0158.
+	currentRole func() string
+	mayGrant    func(role, name string) bool
+	roleStack   []string
+
 	// onReportableChange, if non-nil, is called whenever a Report-flagged
 	// variable's effective value changes. The caller (the server) wires
 	// this to a ParameterStatus emitter so libpq clients see auto-tracked
@@ -271,6 +277,9 @@ func (s *SessionRegistry) prepareSet(name, value string) (v *Variable, placehold
 		// Postmaster / SigHup / Internal contexts cannot be SET.
 		return nil, false, "", fmt.Errorf("parameter %q cannot be changed now", v.Name)
 	}
+	if perr := s.checkSetPrivilege(v); perr != nil {
+		return nil, false, "", perr
+	}
 	_, current, _ := s.Get(name)
 	canon, err = v.canonicalizeFrom(current, value)
 	if err != nil {
@@ -372,9 +381,21 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 // value is restored (PG's reset_val semantics); otherwise the variable
 // falls through to the global value exactly as before.
 func (s *SessionRegistry) Reset(name string) error {
+	return s.reset(name, true)
+}
+
+// reset is Reset; checkPrivilege false is ResetAll's path, which resets every
+// variable without the per-parameter privilege check (ResetAllOptions does not
+// go through set_config_option).
+func (s *SessionRegistry) reset(name string, checkPrivilege bool) error {
 	v, ok := s.lookupVariable(name)
 	if !ok {
 		return fmt.Errorf("unrecognized configuration parameter %q", name)
+	}
+	if checkPrivilege {
+		if perr := s.checkSetPrivilege(v); perr != nil {
+			return perr
+		}
 	}
 	key := strings.ToLower(name)
 	s.snapshotPrior(key)
@@ -471,10 +492,10 @@ func isCustomGUCName(name string) bool {
 // SET TO DEFAULT and RESET ALL both route here.
 func (s *SessionRegistry) ResetAll() {
 	for name := range s.session {
-		_ = s.Reset(name)
+		_ = s.reset(name, false)
 	}
 	for name := range s.local {
-		_ = s.Reset(name)
+		_ = s.reset(name, false)
 	}
 }
 

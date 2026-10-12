@@ -277,6 +277,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			return sess.Set(name, value, isLocal)
 		}
 		ectx.PushFunctionConfig = sessionPushFunctionConfig(sess)
+		ectx.PushSessionRole = func(role string) func() {
+			sess.PushRole(role)
+			return sess.PopRole
+		}
+		ectx.CheckSetPrivilege = sess.CheckSetPrivilege
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
 			out := make([]executor.SettingValue, 0, len(all))

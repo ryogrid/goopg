@@ -479,7 +479,8 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
 		if err := sess.Reset(name); err != nil {
-			return s.writeQueryError(w, errcodes.UndefinedObject, err.Error())
+			qe := gucResetError(err)
+			return s.writeQueryError(w, qe.Code, qe.Message)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
@@ -584,6 +585,17 @@ func gucSetError(err error) *extendedQueryError {
 		return &extendedQueryError{Code: errcodes.Code(verr.SQLState()), Message: verr.Msg, Detail: verr.Detail, Hint: verr.Hint}
 	}
 	return &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+}
+
+// gucResetError maps a RESET failure: a typed GUC error keeps its SQLSTATE
+// (42501 for a superuser-only parameter, M0146-0158), anything else is an
+// unknown parameter (42704).
+func gucResetError(err error) *extendedQueryError {
+	var verr *misc.ValidationError
+	if errors.As(err, &verr) {
+		return gucSetError(err)
+	}
+	return &extendedQueryError{Code: errcodes.UndefinedObject, Message: err.Error()}
 }
 
 // handleSet applies a SET / SET LOCAL statement. Body is the text after

@@ -461,6 +461,16 @@ type Context struct {
 	// cannot be applied in this context (see enterRoutineConfig).
 	PushFunctionConfig func(config []string) (pop func(), err error)
 
+	// PushSessionRole makes role ("" = superuser) the effective role for the
+	// session registry's PGC_SUSET privilege check while a SECURITY DEFINER
+	// routine runs; the returned func pops it. CheckSetPrivilege reports the
+	// error SET name would raise for lack of privilege (CREATE / ALTER
+	// FUNCTION ... SET validates its clauses with it). Wired to
+	// SessionRegistry.PushRole / PopRole / CheckSetPrivilege; nil means no
+	// privilege check in this context. M0146-0158.
+	PushSessionRole   func(role string) (pop func())
+	CheckSetPrivilege func(name string) error
+
 	// AllSettings returns the effective SHOW ALL view for this session.
 	AllSettings func() []SettingValue
 

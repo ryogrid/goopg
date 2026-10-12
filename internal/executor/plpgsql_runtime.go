@@ -443,7 +443,8 @@ func enterRoutineConfig(r *catalog.Routine, ctx *Context, pos int) (func(), erro
 	pop, err := ctx.PushFunctionConfig(r.Config)
 	if err != nil {
 		restoreUser()
-		return func() {}, execErrorFromGUCError(pos, err)
+		// ProcessGUCArray reports no position.
+		return func() {}, execErrorFromGUCError(0, err)
 	}
 	return func() {
 		pop()
@@ -474,7 +475,14 @@ func enterSecurityDefiner(r *catalog.Routine, ctx *Context) func() {
 	} else {
 		ctx.NonSuperuserRole = owner
 	}
+	// The session registry checks PGC_SUSET privileges (the routine's own
+	// SET clauses included) against the owner too. M0146-0158.
+	popRole := func() {}
+	if ctx.PushSessionRole != nil {
+		popRole = ctx.PushSessionRole(ctx.NonSuperuserRole)
+	}
 	return func() {
+		popRole()
 		ctx.SecurityDefinerUser, ctx.NonSuperuserRole = savedUser, savedRole
 	}
 }

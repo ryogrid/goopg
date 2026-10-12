@@ -1636,6 +1636,14 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// SESSION AUTHORIZATION. M0134-0009.
 	connTx.LoginUser = loginUser
 	connTx.SessionUser = loginUser
+	// set_config_option's PGC_SUSET check: a non-superuser role may SET /
+	// RESET a superuser-only parameter only with SET on it
+	// (pg_parameter_acl). connTx.NonSuperuserRole is "" while the effective
+	// role is a superuser; a SECURITY DEFINER call overrides it through
+	// SessionRegistry.PushRole. M0146-0158.
+	sess.SetPrivilegeHook(
+		func() string { return connTx.NonSuperuserRole },
+		func(role, name string) bool { return executor.ParameterSetAllowed(s.cfg.Catalog, role, name) })
 	// Stable per-connection lock-manager identity for transaction-scoped LOCK
 	// TABLE heavyweight locks (M0118-0003 lock-nowait). Minted once from the
 	// same monotonic counter as per-statement BackendIDs so it never collides

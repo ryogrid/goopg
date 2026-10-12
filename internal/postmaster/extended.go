@@ -653,7 +653,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
 		if err := sess.Reset(name); err != nil {
-			return nil, &extendedQueryError{Code: errcodes.UndefinedObject, Message: err.Error()}
+			return nil, gucResetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	}

@@ -389,7 +389,24 @@ func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error 
 // to PUBLIC. A parameter with no entry grants nothing to a non-superuser,
 // which is upstream's default (pg_parameter_aclmask with no row).
 func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
-	im, ok := ctx.Catalog.(*catalog.InMemory)
+	return parameterACLGrantsIn(ctx.Catalog, name, role, privilege)
+}
+
+// ParameterSetAllowed is the PGC_SUSET half of set_config_option's privilege
+// check for a non-superuser session role: role is a superuser, or holds SET on
+// the parameter (pg_parameter_aclcheck ACL_SET). The postmaster installs it as
+// the session registry's privilege hook. M0146-0158.
+func ParameterSetAllowed(cat catalog.Catalog, role, name string) bool {
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if oid, found := im.RoleOID(role); found && im.IsSuperuser(oid) {
+			return true
+		}
+	}
+	return parameterACLGrantsIn(cat, name, role, 's')
+}
+
+func parameterACLGrantsIn(cat catalog.Catalog, name, role string, privilege byte) bool {
+	im, ok := cat.(*catalog.InMemory)
 	if !ok {
 		return false
 	}
@@ -423,7 +440,11 @@ func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
 // — so proconfig holds PostgreSQL's text (`DateStyle=iso, mdy`) and a bad
 // name or value fails the statement. It returns a copy; the parsed
 // statement is left untouched.
-func flattenFunctionConfigOps(pos int, ops []parser.FunctionConfigOp) ([]parser.FunctionConfigOp, error) {
+//
+// Each named entry also passes the session's PGC_SUSET privilege check, as
+// validate_option_array_item does: a non-superuser cannot attach a
+// superuser-only parameter to a routine (M0146-0158).
+func flattenFunctionConfigOps(ctx *Context, pos int, ops []parser.FunctionConfigOp) ([]parser.FunctionConfigOp, error) {
 	if len(ops) == 0 {
 		return ops, nil
 	}
@@ -451,6 +472,11 @@ func flattenFunctionConfigOps(pos int, ops []parser.FunctionConfigOp) ([]parser.
 				return nil, &ExecError{Code: aerr.Code, Pos: pos, Message: aerr.Msg, Hint: aerr.Hint, Detail: aerr.Detail}
 			}
 			return nil, execErrorFromGUCError(pos, err)
+		}
+		if ctx != nil && ctx.CheckSetPrivilege != nil {
+			if perr := ctx.CheckSetPrivilege(name); perr != nil {
+				return nil, execErrorFromGUCError(0, perr)
+			}
 		}
 		op.Name = name
 	}
