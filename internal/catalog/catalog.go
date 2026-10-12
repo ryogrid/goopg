@@ -508,6 +508,12 @@ type Table struct {
 	// without us bootstrapping a full system catalog.
 	Virtual     bool
 	VirtualRows func() [][]string
+	// VirtualRowsForDB, when set, returns the rows a connection to dbOid
+	// sees (a per-database catalog such as pg_proc); the executor prefers
+	// it over VirtualRows at run time. VirtualRows stays the default
+	// database's answer for plan time and callers with no connection.
+	// M0122-0015d.
+	VirtualRowsForDB func(dbOid uint32) [][]string
 
 	// View, when non-nil, marks this table as a SQL view. The
 	// stored value is the parser AST of the view's defining
@@ -25235,6 +25241,11 @@ func FormatExprForAttrdef(e parser.Expr) string { return formatExprForAttrdef(e)
 func formatExprForAttrdef(e parser.Expr) string {
 	if e == nil {
 		return ""
+	}
+	// A folded negative literal deparses as PG's '-N'::type (get_const_expr).
+	// Keep in sync with the executor twin executor.defaultExprToSQL.
+	if neg := parser.FoldedNegativeLiteralSQL(e); neg != "" {
+		return neg
 	}
 	switch v := e.(type) {
 	case *parser.ColumnRef:

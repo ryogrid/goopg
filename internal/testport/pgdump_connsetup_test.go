@@ -11865,10 +11865,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		return
 	}
 
-	// Still blocked downstream on catalog-view parity. Confirm the failure is a
-	// post-setup catalog/query error, not a setup_connection failure, and log
-	// the precise next blocker so the next loop has a target.
-	t.Logf("pg_dump passes connection setup; remaining DU-002 catalog-parity gap: "+
+	// pg_dump of this fixture runs to completion, so a non-zero exit is a
+	// regression, not a known gap. This branch used to only LOG the failure —
+	// and since every content assertion above sits behind ExitCode == 0, the
+	// test passed vacuously whenever pg_dump failed. That is how a PREPARE
+	// type-resolution failure (M0122-0015c), the negative-literal deparse and
+	// the owner-side REVOKE regressions all went unseen. M0122-0015c follow-up.
+	t.Errorf("pg_dump of the connection-setup fixture failed — none of the dump-content assertions ran: "+
 		"exit=%d stderr=%q stdout(%d bytes)=%q",
 		res.ExitCode, strings.TrimSpace(res.Stderr), len(res.Stdout), res.Stdout)
 }

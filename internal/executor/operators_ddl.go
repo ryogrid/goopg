@@ -6097,6 +6097,11 @@ func defaultExprToSQL(e parser.Expr) string {
 	if e == nil {
 		return ""
 	}
+	// A folded negative literal deparses as PG's '-N'::type (get_const_expr).
+	// Keep in sync with the catalog twin catalog.formatExprForAttrdef.
+	if neg := parser.FoldedNegativeLiteralSQL(e); neg != "" {
+		return neg
+	}
 	switch v := e.(type) {
 	case *parser.IntegerConst:
 		return fmt.Sprintf("%d", v.Value)
