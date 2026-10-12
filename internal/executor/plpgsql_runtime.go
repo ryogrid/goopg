@@ -415,23 +415,68 @@ func enterRoutineBody(ctx *Context, pos int) (func(), error) {
 	return leave, nil
 }
 
-// enterRoutineConfig applies a routine's SET clauses (pg_proc.proconfig) for
-// the length of one call: fmgr_security_definer opens a GUC nest level,
-// ProcessGUCArray applies proconfig with GUC_ACTION_SAVE, and
-// AtEOXact_GUC(true, save_nestlevel) restores the saved values when the
-// call returns. Call the returned func via defer, so an error leaving the
-// routine restores them too (in PG the enclosing (sub)transaction abort
-// does that). A routine with no SET clause, or a context without a session
-// (PushFunctionConfig nil), runs unchanged.
+// enterRoutineConfig is fmgr_security_definer (fmgr.c) for one call of r: a
+// SECURITY DEFINER routine runs as its owner, and a routine's SET clauses
+// (pg_proc.proconfig) apply for the length of the call.
+//
+//   - User: GetUserIdAndSecContext / SetUserIdAndSecContext(proowner,
+//     SECURITY_LOCAL_USERID_CHANGE). current_user becomes the owner
+//     (Context.SecurityDefinerUser) and privilege checks use the owner's
+//     rights (NonSuperuserRole, "" for a superuser owner). session_user is
+//     unchanged. M0146-0157.
+//   - GUCs: a GUC nest level, ProcessGUCArray with GUC_ACTION_SAVE, and
+//     AtEOXact_GUC(true, save_nestlevel) on return. They apply after the user
+//     switch, as in PG. M0146-0155.
+//
+// Call the returned func via defer, so an error leaving the routine restores
+// both (in PG the enclosing (sub)transaction abort does that). A routine with
+// neither runs unchanged; the GUC half also needs a session
+// (PushFunctionConfig).
 func enterRoutineConfig(r *catalog.Routine, ctx *Context, pos int) (func(), error) {
-	if r == nil || len(r.Config) == 0 || ctx == nil || ctx.PushFunctionConfig == nil {
+	if r == nil || ctx == nil {
 		return func() {}, nil
+	}
+	restoreUser := enterSecurityDefiner(r, ctx)
+	if len(r.Config) == 0 || ctx.PushFunctionConfig == nil {
+		return restoreUser, nil
 	}
 	pop, err := ctx.PushFunctionConfig(r.Config)
 	if err != nil {
+		restoreUser()
 		return func() {}, execErrorFromGUCError(pos, err)
 	}
-	return pop, nil
+	return func() {
+		pop()
+		restoreUser()
+	}, nil
+}
+
+// enterSecurityDefiner switches ctx to r's owner when r is SECURITY DEFINER
+// and returns the restore. The owner is resolved through the catalog's role
+// registry; a routine whose owner cannot be named runs unchanged.
+func enterSecurityDefiner(r *catalog.Routine, ctx *Context) func() {
+	if !r.SecurityDefiner {
+		return func() {}
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || im == nil {
+		return func() {}
+	}
+	ownerOID := r.OwnerOrDefault()
+	owner, ok := im.RoleNameAtOID(ownerOID)
+	if !ok {
+		return func() {}
+	}
+	savedUser, savedRole := ctx.SecurityDefinerUser, ctx.NonSuperuserRole
+	ctx.SecurityDefinerUser = owner
+	if im.IsSuperuser(ownerOID) {
+		ctx.NonSuperuserRole = ""
+	} else {
+		ctx.NonSuperuserRole = owner
+	}
+	return func() {
+		ctx.SecurityDefinerUser, ctx.NonSuperuserRole = savedUser, savedRole
+	}
 }
 
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {

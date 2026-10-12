@@ -17447,6 +17447,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Cost:            s.Cost,
 		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
+		Owner:           o.currentDDLOwnerOID(),
 		Leakproof:       s.Leakproof,
 		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}
@@ -18232,6 +18233,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		BeginAtomic:     s.BeginAtomic,
 		IsProcedure:     true,
 		SecurityDefiner: s.SecurityDefiner,
+		Owner:           o.currentDDLOwnerOID(),
 		Volatile:        "v", // procedures default to volatile
 		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}

@@ -986,6 +986,15 @@ type Context struct {
 	// in that case, preserving pre-M0134-0009 behaviour. M0134-0009.
 	SessionUser string
 
+	// SecurityDefinerUser is the owner a SECURITY DEFINER routine runs as
+	// while its body executes (fmgr_security_definer's
+	// SetUserIdAndSecContext(proowner, SECURITY_LOCAL_USERID_CHANGE)); empty
+	// outside one. It wins over SET ROLE / the session user in
+	// EffectiveUserName, and its presence is InLocalUserIdChange(): SET ROLE
+	// and SET SESSION AUTHORIZATION are refused. NonSuperuserRole carries the
+	// owner's privileges for the same span. M0146-0157.
+	SecurityDefinerUser string
+
 	// SetSessionAuthorization, when non-nil, updates the per-connection
 	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
 	// parser path (multi-statement batches). The caller (operators_utility_settings)
@@ -1120,6 +1129,9 @@ func (c *Context) SessionUserName() string {
 func (c *Context) EffectiveUserName() string {
 	if c == nil {
 		return "postgres"
+	}
+	if c.SecurityDefinerUser != "" {
+		return c.SecurityDefinerUser
 	}
 	if c.NonSuperuserRole != "" {
 		return c.NonSuperuserRole

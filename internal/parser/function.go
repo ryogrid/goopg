@@ -838,6 +838,20 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			p.advance() // consume RESET
 			stmt.ConfigOps = append(stmt.ConfigOps, p.parseFunctionConfigResetClause())
 		case p.isFunctionAttribute():
+			// [EXTERNAL] SECURITY DEFINER / INVOKER — prosecdef, which a
+			// procedure records as a function does (M0146-0157).
+			if p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "security") || strings.EqualFold(p.cur().Value, "external")) {
+				if strings.EqualFold(p.cur().Value, "external") {
+					p.advance()
+				}
+				p.acceptIdentKeyword("security")
+				if p.acceptIdentKeyword("definer") {
+					stmt.SecurityDefiner = true
+				} else if p.acceptIdentKeyword("invoker") {
+					stmt.SecurityDefiner = false
+				}
+				continue
+			}
 			// Track WINDOW and STRICT attributes for validation in executor.
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "window") {
 				stmt.Window = true

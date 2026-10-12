@@ -105,9 +105,9 @@ type Routine struct {
 	// PROCEDURE/ROUTINE ... SET/RESET, in insertion order (mirrors
 	// InMemory's role/database-level roleSettings shape). nil renders as SQL
 	// NULL (matches upstream: a routine that never had a SET clause has no
-	// proconfig row at all). Dump-fidelity only — goopg does not push/pop
-	// these values around the routine's own execution (no per-call GUC
-	// scoping exists yet); see docs/design/0122-0007-function-set-config.md.
+	// proconfig row at all). Applied around each call by the executor's
+	// enterRoutineConfig (M0146-0155); see
+	// docs/design/0100-0149/m0146-0155-function-set-clauses.md.
 	Config []string
 
 	// Dependency tracking populated at CREATE FUNCTION time for information_schema views.
@@ -345,8 +345,10 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 		if existing.IsWindow != clone.IsWindow {
 			return nil, fmt.Errorf("%w: %s", ErrRoutineKindChange, clone.QualifiedName())
 		}
-		// CREATE OR REPLACE preserves the OID — upstream's contract.
+		// CREATE OR REPLACE preserves the OID and the owner — upstream's
+		// contract (ProcedureCreate keeps proowner when replacing).
 		clone.OID = existing.OID
+		clone.Owner = existing.Owner
 		rs.byKey[k] = &clone
 		return &clone, nil
 	}

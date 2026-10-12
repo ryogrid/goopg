@@ -67,6 +67,13 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if stmt.Local && o.ctx.InTransactionBlock != nil && !o.ctx.InTransactionBlock() {
 			o.ctx.AddWarningWithHint("25P01", SetLocalOutsideBlockMessage, "")
 		}
+		// GUC_NOT_WHILE_SEC_REST (guc.c set_config_option): role and
+		// session_authorization cannot change inside a security-definer
+		// function (InLocalUserIdChange). M0146-0157.
+		if (stmt.Name == "role" || stmt.Name == "session_authorization") && o.ctx.SecurityDefinerUser != "" {
+			return nil, &ExecError{Code: "42501",
+				Message: fmt.Sprintf("cannot set parameter %q within security-definer function", stmt.Name)}
+		}
 		// "role" — update non-superuser role tracking for privilege checks
 		// (e.g. TRUNCATE ownership, M0118-0008), mirroring the string-matching
 		// SET ROLE handling in server/query.go for statements that instead
@@ -158,6 +165,13 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 				o.ctx.ResetAllSettings()
 			}
 			return nil, EOF
+		}
+		// GUC_NOT_WHILE_SEC_REST (guc.c set_config_option): role and
+		// session_authorization cannot change inside a security-definer
+		// function (InLocalUserIdChange). M0146-0157.
+		if (stmt.Name == "role" || stmt.Name == "session_authorization") && o.ctx.SecurityDefinerUser != "" {
+			return nil, &ExecError{Code: "42501",
+				Message: fmt.Sprintf("cannot set parameter %q within security-definer function", stmt.Name)}
 		}
 		// "role" — restore superuser status (RESET ROLE). M0119-0004.
 		if stmt.Name == "role" {

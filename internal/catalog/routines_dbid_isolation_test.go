@@ -146,3 +146,21 @@ func TestRoutinesInDBHandle(t *testing.T) {
 		t.Fatalf("DropAllInDB removed the default database's routine too: %v", got)
 	}
 }
+
+// TestRoutinesReplaceKeepsOwner: CREATE OR REPLACE keeps proowner, as
+// ProcedureCreate does — a SECURITY DEFINER routine must not change whose
+// rights it runs with because another role replaced its body. M0146-0157.
+func TestRoutinesReplaceKeepsOwner(t *testing.T) {
+	rs := NewRoutines()
+	first, err := rs.Create(&Routine{Schema: "public", Name: "f", Owner: 16400}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := rs.Create(&Routine{Schema: "public", Name: "f", Owner: 16500, Body: "new"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.OID != first.OID || second.Owner != 16400 || second.Body != "new" {
+		t.Fatalf("replace = OID %d owner %d body %q, want OID %d owner 16400 body new", second.OID, second.Owner, second.Body, first.OID)
+	}
+}
