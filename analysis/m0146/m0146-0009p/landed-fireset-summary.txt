@@ -1,0 +1,22 @@
+FIRE-SET: baseline=db31b06004d03b588e43cc5e7b34be756ad59dee (9c04a7744ae7) candidate=worktree (32267c3a112f)
+PLAN-PARITY: queries=99 match=68 shapediff=31 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=24 join-method=14 scan-type=11 parameterisation=15 aggregation-strategy=5 sort-strategy=14 parallelism=15 qual-placement=3 rendering=2
+PLAN-PARITY: queries=99 match=68 shapediff=31 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=24 join-method=14 scan-type=11 parameterisation=15 aggregation-strategy=5 sort-strategy=14 parallelism=15 qual-placement=3 rendering=2
+FIRE-SET-TIMEOUTS: introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=45 shapediff=54 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=44 join-method=21 scan-type=24 parameterisation=26 aggregation-strategy=9 sort-strategy=24 parallelism=39 qual-placement=9 rendering=4
+PLAN-PARITY: queries=99 match=45 shapediff=54 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=44 join-method=21 scan-type=24 parameterisation=25 aggregation-strategy=9 sort-strategy=24 parallelism=39 qual-placement=9 rendering=4
+FIRE-SET-TIMEOUTS: introduced=none unchanged=none missing=none
+
+tpcds-sf025: common=16 total baseline=65.0s candidate=63.5s ratio=0.98
+tpcds-sf1: common=15 total baseline=192.9s candidate=405.9s ratio=2.10
+  Q72: 3.55s -> 218.98s  x61.62
+  Q53: 0.69s -> 3.45s  x4.97
+  Q82: 1.47s -> 0.43s  x0.29
+  Q64: 4.31s -> 3.18s  x0.74
+
+# repeats (2 alternating rounds per arm, fresh clones, Q96 warm-up)
+Q53: base 1.30 1.31 med 1.30s | retired 1.28 1.26 med 1.27s | x0.97
+Q72: base 3.23 3.35 med 3.29s | retired 216.01 216.28 med 216.14s | x65.64

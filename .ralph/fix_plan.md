@@ -29998,7 +29998,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     - Test `TestGroupingSetsRowEstimateSumsSets` \(fails on HEAD\)\.
     - Design `docs/design/0100\-0149/m0146\-0009o\-grouping\-sets\-rows\-and\-rollup\-costs\.md`\.
   Movement: yes — CATEGORIES\-EXCL\-MATCH SF0\.25 aggregation\-strategy 12→11
-- [ ] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
+- [x] **M0146\-0009p — a parameterised probe\'s rows ignore its scan
   filter** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\. TPC\-DS Q72: the
   `inventory\_pkey` probe reports rows=527, three times PG\'s 176; the
   filter `inv\_quantity\_on\_hand < cs\_quantity` \(PG\'s 1/3 default\) is not
@@ -30027,6 +30027,11 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - **Hold lifted 2026\-10\-13:** the owner\-adjudicated condition \("`\[!\]` stands until 0008ag resolves"\) is met —
     M0146\-0159 retired the x2 \(`de45f8a6f`\) and M0145\-0008ag closed on its re\-measure\. Resume as written:
     re\-apply `analysis/m0146/m0146\-0009p/` and re\-run the fire set with SF1 Q72 as the witness\.
+  - Done 2026\-10\-13 \(`b27c58316`\): patch re\-applied unchanged; fire set matches flat \(68 / 45\), SF1 parameterisation
+    26 → 25, no introduced timeout; sf025 PASS=99, TPC\-H arm identical, ea\-ratchet PASS\.
+    - SF1 Q72 3\.3s → 216s \(×65, 2 repeats\) — kept per AGENT\.md R3, filed M0146\-0172 \(escalated\)\.
+    - Evidence `analysis/m0146/m0146\-0009p/landed\-\*`\.
+Movement: none — instrument artefact — matches flat; SF1 parameterisation 26 → 25 is inside the ±3 band
   Movement: none — held; the patch\'s fire set timed out SF1 Q72
 - [x] **M0141\-S2a\-fix2r\-a — the hashed aggregate\'s spill tail is priced
   in full\-row width** \(filed 2026\-10\-04 by M0146\-0005 slice 115\)\.
@@ -32031,3 +32036,17 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   Parent: M0146\-0159
   - First step: profile Q17 at SF0\.25 on a private clone \(perf, the probe loop\) against PG\'s same plan to locate the
     per\-probe gap \(index descent, heap fetch, param rebinding\)\.
+- [ ] **M0146-0172 — TPC\-DS SF1 Q72 runs 65x slower since M0146\-0009p: goopg elects the item\-only inventory route**
+  \(filed 2026\-10\-13 by M0146\-0009p\)\. With PG\'s parameterised rows \(0009p\), goopg prices its item\-only route
+  \(`inventory\_pkey` probe on `inv\_item\_sk` rows=236, then the date\-dimension joins over 13819 rows\) at 54874, under its
+  own PG\-shaped route \(55265\); PG\'s route costs 52196 in PG\. The remaining gap: the \{cs, hd, d1, cd\} subtree under the
+  `d2` hash — goopg 47899 vs PG 44279 \(Parallel Hash Join 50015 vs 46297\)\. SF1 Q72 3\.3s → 216s \(2 repeats\);
+  SF0\.25 unchanged\. Plans `analysis/m0146/m0146\-0009p/landed\-q72\-sf1\-\*\.plan\.txt`\.
+  Kind: impl
+  Parent: M0146\-0009p
+  - First step: decompose the 47899 vs 44279 subtree node by node \(cs scan, hd hash, d1 hash, cd probe\) against PG\'s
+    plan; the first node whose cost differs names the cost\-model term to port\.
+  > ## ESCALATION 2026\-10\-13 — SF1 Q72 ×65 kept per R3
+  > M0146\-0009p\'s PG\-faithful row estimate makes goopg elect a non\-PG route that runs 3\.3s → 216s at SF1\. Kept
+  > \(R3: no reverts on runtime\); reverting is the owner\'s call\. The fix is a cost\-model divergence in Q72\'s
+  > subtree under the d2 hash \(this task\)\.
