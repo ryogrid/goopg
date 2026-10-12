@@ -97,8 +97,11 @@ banner at the next `## ` line).
    under OWNER DECISIONS 2026-10-12 (its open descendants — 0084/0085/
    0086 and the three S2 findings its escalation held — inherit item
    2a's rank through it). **Live members (owner decision 2026-10-12 —
-   fifth S2 batch; see OWNER DECISIONS 2026-10-12): M0146-0155 →
-   M0146-0089 → M0146-0126 → M0146-0125**, in that order. The three isolation
+   fifth S2 batch, amended 2026-10-12 evening; see OWNER DECISIONS
+   2026-10-12): M0146-0155 [x] → M0146-0156 → M0146-0157 →
+   M0146-0158 → M0146-0089 → M0146-0152 → M0146-0126 →
+   M0146-0125**, in that order. (0157/0158 also inherit rank via
+   Parent: M0146-0155; the explicit naming fixes their sequence.) The three isolation
    specs (EvalPlanQual, ReadWriteUnique4, TemporalRangeIntegrity) are
    SSI-semantics / scheduling divergences and keep M-NIGHTLY order —
    no bump; the tuplelock-upgrade reopen keeps M-NIGHTLY order on the
@@ -328,6 +331,15 @@ findings (partition trigger clones, `regclass IN (SELECT …)`, trigger
 durability) can file, and open children 0084/0085/0086 proceed under
 inherited item-2a rank. Not an exemption: later completions accumulate
 a fresh budget.)
+
+LINEAGE-BASELINE: M0122-0015 M0122-0015b M0122-0015c M0122-0015d M0122-0015e M0122-0015g
+(owner pin 2026-10-12 evening, delegated — resolves the 2026-10-12 S4
+exhaustion on this client-tool-porting family. Its children carry real
+ids, so the pin is safe (unlike M0119-0006 / M0122-0008, which stay
+parked on pseudo-id grounds). With `regress` a Movement instrument as
+of today this family can claim honest movement — 0015g itself moved
+regress foreign_data 2459→2428. Not an exemption: later completions
+accumulate a fresh budget.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -800,10 +812,43 @@ OWNER DECISIONS 2026-10-12 (delegated; details in each task's entry):
   counts (0111–0115, 0119/0123/0124/0129/0145, 0076–0082 all cite them).
   `regress` requires a number like every other instrument.
 - **Noted, not actioned:** M0141-S2a-fix2r's children 0152/0153/0154
-  cite `Parent: M0141-S2a-fix2r-c` — an id that does not exist — so
-  they silently self-root (and inherit no item-2a rank). No owner ask
-  was pending on them; a `Parent:`-dangling warning is a candidate
-  Rule-D-style hardening for a future harness pass.
+  cite `Parent: M0141-S2a-fix2r-c` — ~~an id that does not exist~~
+  **correction 2026-10-12 evening: it does exist** (a completed task at
+  the fix2r section, `Parent: M0141-S2a-fix2r`), so the children root
+  to M0141-S2a-fix2r and inherited item-4 rank all along; no lineage
+  problem and nothing to fix. 0152 is owner-placed into item 2a below
+  anyway; 0153/0154 keep item-4 rank. A `Parent:`-dangling warning is
+  still a candidate Rule-D-style hardening — this instance just wasn't
+  dangling.
+
+OWNER DECISIONS 2026-10-12 — evening (delegated; resolves the
+post-placement escalations surfaced by the M0122-0015 selection-drift
+investigation):
+
+- **Fifth S2 batch amended:** live members now `M0146-0156 →
+  M0146-0157 → M0146-0158 → M0146-0089 → M0146-0152 → M0146-0126 →
+  M0146-0125`. 0156 (DATA LOSS) takes the head by severity; 0157/0158
+  already inherited 2a rank via Parent: M0146-0155 — confirmed and
+  sequenced with the function-domain cluster; 0089/0126/0125 carry
+  over; **0152 was missed by the earlier sweep and is placed now**.
+- **M0122-0015 re-opened** `[!]`→`[ ]` with the LINEAGE-BASELINE pin
+  above — real child ids make the pin safe, and the `regress`
+  instrument now lets this family claim honest movement.
+- **M0145-0008ag re-opened** `[!]`→`[ ]` — its named blocker (the
+  owner park on `indexProbeCostMultiplier`) is resolved by the
+  Option-A decision. Re-measure after M0146-0159 lands.
+- **M0146-0159 filed** — the multiplier-retirement impl the Option-A
+  decision called "first among new item-3 work" (a direction, not a
+  selectable entry — now it is one).
+- **0152/0153/0154's Parent is NOT dangling** — `M0141-S2a-fix2r-c`
+  exists; the earlier note is corrected in place above. Nothing to
+  reparent.
+- **Placement annotations swept:** every entry the owner named now
+  carries "(placed in item 2a by the 2026-10-12 owner decision)" and
+  its `Owner: place` block is RESOLVED — including 0084/0085/0086,
+  which inherit rank via the 0055 pin rather than explicit naming.
+  Open `Owner: place` text on a banner-named task is the stale-belief
+  class that caused the 2026-10-12 selection drift.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -4813,7 +4858,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestPort_PgoutputInterop` suite against real PG; tpch\-spotcheck
       Q12=2/Q13=33; tpcds\-sf025 `PASS=96 MISMATCH=0 CKMISMATCH=0 ERROR=0
       TIMEOUT=0`; acceptance arm 24 MATCH; pgbench smoke.
-- [!] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+- [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump**.
+  - **RE-OPENED 2026-10-12 evening (owner, delegated):** `[!]`→`[ ]` plus
+    LINEAGE-BASELINE pin of 0015b/c/d/e/g in the banner. Real child ids
+    make the pin safe; `regress` is now a Movement instrument (0015g
+    itself moved foreign_data 2459→2428), so future members can write
+    honest `Movement: yes`.
   - **ESCALATION 2026\-10\-12 \(lineage budget, Rule A\)\.** The last five
     completed children \(0015b subq\_op OPERATOR, 0015c PREPARE types, 0015d
     pg\_proc per database, 0015e FDW per database, 0015g
@@ -18960,10 +19010,15 @@ Movement: none — no plan moved on TPC-DS SF0.25/SF1 or TPC-H across all four d
     226 → 14 ms; sweep Q95 7s → 3s, Q16 13s → 1s; plans unchanged\.
     `TestSkipScanLeafWalk`\.
   Movement: none — executor runtime only \(sweep Q95 7s→3s, Q16 13s→1s\); plans unchanged
-- [!] **M0145\-0008ag — Q14 probes store\_sales by bitmap where PG index\-scans
+- [ ] **M0145\-0008ag — Q14 probes store\_sales by bitmap where PG index\-scans
   \(4\.9x slower at SF0\.25\)** \(filed 2026\-10\-03 by M0145\-0008af\)\.
   Kind: impl
   Parent: M0145\-0008af
+  - **RE-OPENED 2026\-10\-12 evening \(owner, delegated\):** the owner park
+    on `indexProbeCostMultiplier` was lifted by the Option\-A decision —
+    **M0146\-0159** \(the retirement impl\) is filed and first; re\-measure
+    this task's Q14 shape after it lands, since mult=1 may change the
+    premise itself\.
   - Blocked on the owner\-parked `indexProbeCostMultiplier` retirement
     \(OWNER DECISIONS 2026\-09\-24, M0145\-0008 flip unblock \(a\): "retiring
     it is the measured\-regression exit and stays parked"\)\. The multiplier
@@ -29177,6 +29232,9 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   Parent: M0146\-0080
   > ## ESCALATION 2026\-10\-07 \(S2\) — function lookup depends on prior session state
   > Filed by M0146\-0080, not worked\. Owner: place M0146\-0084 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: item\-2a rank inherited via the
+  > M0146\-0055 pin \(OWNER DECISIONS 2026\-10\-12\) — no separate
+  > placement needed\.**
   - First step: rerun polymorphism\.sql to the failing statement twice on
     fresh clusters and diff the pg\_proc rows for testpolym \(overload set,
     proargtypes, proretset\) and the search\_path between a passing and a
@@ -29190,6 +29248,9 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   Parent: M0146\-0081
   > ## ESCALATION 2026\-10\-07 \(S2\) — a WITH clause cannot lead MERGE
   > Filed by M0146\-0081, not worked\. Owner: place M0146\-0085 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: item\-2a rank inherited via the
+  > M0146\-0055 pin \(OWNER DECISIONS 2026\-10\-12\) — no separate
+  > placement needed\.**
   - First step: read `docs/design/not\_ralph/06\-goyacc\-parser\-playbook\.md`
     §12, then add `opt\_with\_clause` to the MergeStmt rule in `grammar/`
     and carry the CTE list into the Merge plan \(the CTEDMLPrefix / CTE
@@ -29204,6 +29265,9 @@ Movement: none — instrument artefact — executor correctness, no plan change;
   Parent: M0146\-0081
   > ## ESCALATION 2026\-10\-07 \(S2\) — text concatenation with a bool prints t/f
   > Filed by M0146\-0081, not worked\. Owner: place M0146\-0086 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: item\-2a rank inherited via the
+  > M0146\-0055 pin \(OWNER DECISIONS 2026\-10\-12\) — no separate
+  > placement needed\.**
   - First step: in the `\|\|` text mode \(concatModeOf, M0146\-0074\), render a
     non\-text operand through its text cast rather than AppendValueText;
     check every type whose cast to text differs from its output function
@@ -29801,7 +29865,10 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - First step: find where a parameterised index path\'s rows are set and
     whether its residual \(non\-index\) restriction clauses are applied,
     as `get\_parameterized\_baserel\_size` does\.
-  - **HELD 2026\-10\-04 — blocked on M0145\-0008ag \(B8 index\-probe cost\)\.**
+  - **HELD 2026\-10\-04 — blocked on M0145\-0008ag \(B8 index\-probe cost\)\.
+    STALE\-OK: M0145\-0008ag** \(owner\-adjudicated 2026\-10\-12 evening: the
+    blocker is re\-opened but not landed — the chain is M0146\-0159 →
+    0008ag re\-measure → this task; the `[!]` stands until 0008ag resolves\)\.
     The producers multiply only the key equalities\' selectivity; the patch
     `movableNonEquiJoinSelectivity` \(every movable non\-equijoin clause, as
     `ppi\_clauses`\) gives PG\'s rows on a repro \(30 → 10\) and passed units,
@@ -29929,6 +29996,8 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   aborted after restart\. Masked until now by the M0114 cache\.
   Kind: impl
   Parent: M0141\-S2a\-fix2r\-c
+  - **Placed in item 2a by the 2026\-10\-12 evening owner decision**
+    \(missed by the fifth\-batch sweep; S2\)\.
   - First step: distinguish an initdb\-fresh cluster from a pre\-M0030\-0007
     one \(e\.g\. a pg\_control / capability marker\) so the upgrade branch never
     runs on clusters this binary initialised; repro is
@@ -29970,7 +30039,8 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   Parent: none
   - Found by the M0122\-0008 SET TIME ZONE probe\. Filed without a
     parent because M0122\-0008\'s lineage budget is exhausted \(see its
-    escalation block\); as an S2 defect it awaits owner placement\.
+    escalation block\); as an S2 defect it awaits owner placement\. \(placed in
+    item 2a by the 2026\-10\-12 owner decision — closed same day\)
   - First step: find the SQL and plpgsql call sites in the executor, push
     a GUC nest level there, apply proconfig through the session registry,
     pop on return and on error\.
@@ -29991,7 +30061,9 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     shadow failure are ledgered\.
   Movement: yes — regress guc 385 → 352 diff lines \(function SET section now matches PG\); probe arms 0 → all matching
 - [ ] **M0146\-0157 — WRONG RESULTS: a SECURITY DEFINER routine runs as its
-  caller** \(filed 2026\-10\-12 by M0146\-0155\)\. goopg stores prosecdef but
+  caller** \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
+  confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
+  goopg stores prosecdef but
   never switches the user for the call: `current\_user` inside the routine is
   the caller, and the body\'s privilege checks use the caller\'s rights\. PG:
   fmgr\_security\_definer saves the user id, SetUserIdAndSecContext\(proowner,
@@ -30003,7 +30075,9 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     owner for the call and restore it on every exit path; probe
     current\_user and a privilege\-gated SELECT against PG 18\.3\.
 - [ ] **M0146\-0158 — PGC\_SUSET parameters can be SET by a non\-superuser**
-  \(filed 2026\-10\-12 by M0146\-0155\)\. `SET ROLE plain; SET
+  \(filed 2026\-10\-12 by M0146\-0155; **inherits item\-2a rank —
+  confirmed and sequenced by the 2026\-10\-12 evening owner decision**\)\.
+  `SET ROLE plain; SET
   log\_min\_messages = debug1` succeeds on goopg; PG raises 42501 `permission
   denied to set parameter "log\_min\_messages"` unless the role holds SET on
   the parameter \(pg\_parameter\_acl\)\. A function\'s SET clause is subject to
@@ -30017,7 +30091,8 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
     from execAlterSystem\.
 - [ ] **M0146\-0156 — DATA LOSS: a function created in a CREATE DATABASE\'d
   database cannot be called there and vanishes on restart** \(filed 2026\-10\-12
-  by M0122\-0015d; S2\)\. In a database made by `CREATE DATABASE`,
+  by M0122\-0015d; S2; **placed in item 2a — live member #1 — by the
+  2026\-10\-12 evening owner decision**\)\. In a database made by `CREATE DATABASE`,
   `CREATE FUNCTION foo1\(int\) ...` succeeds and pg\_proc lists it, but
   `SELECT foo1\(5\)` there raises `function foo1 does not exist`; after a
   clean restart the function is gone from every database\'s pg\_proc\.
@@ -30695,6 +30770,8 @@ Movement: none — recon; no production change \(knob A/B measurement only\)
   > \#\# ESCALATION 2026\-10\-07 \(S2\) — M0146\-0089 returns wrong results
   > A materialized view silently becomes a live view after a REFRESH and two clean restarts\.
   > Owner: place M0146\-0089 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
+  > amendment\)\.**
 - [x] **M0146\-0090 — an underestimated Parallel Hash join errors instead of growing its
   batches** \(filed 2026\-10\-07 by M0146\-0064\)\. goopg has no parallel hash batching: a participant
   build that outgrows hash\_mem fails the query with `parallel hash join: a participant\'s build
@@ -31192,6 +31269,8 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > \#\# ESCALATION 2026\-10\-09 \(S2\) — M0146\-0125 returns wrong results
   > Array concatenation with a NULL operand returns NULL instead of the array\.
   > Owner: place M0146\-0125 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
+  > amendment\)\.**
 - [ ] **M0146\-0126 — WRONG RESULTS: COALESCE does not resolve its arguments\' common type**
   \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT coalesce\(1, 2\.5\) / 3` returns `0` on goopg; PG 18\.3 returns
   `0\.33333333333333333333`\. `pg\_typeof\(coalesce\(1, 2\.5\)\)` is `integer` on goopg, `numeric` on PG\. The same holds with a
@@ -31205,6 +31284,8 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > \#\# ESCALATION 2026\-10\-09 \(S2\) — M0146\-0126 returns wrong results
   > COALESCE over mixed integer/numeric arguments is typed integer, so arithmetic on it truncates\.
   > Owner: place M0146\-0126 in the banner\.
+  > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
+  > amendment\)\.**
 - [x] **M0146\-0127 — a semijoin\'s equality joins the equivalence classes \(TPC\-DS Q14\'s cross\_items → item spine\)**
   \(filed 2026\-10\-09 from the SF0\.25 triage: Q14\'s join\-order record — the DP trace declined `\{cross\_items\} \| \{item\}` with
   no join clause because the seam\'s EC closure ran before the semijoin quals joined the list; sublink\-clause family of M0146\-0012a\)\.
@@ -31580,3 +31661,25 @@ Movement: none — Q70 first divergence unchanged \(join\-level choice now PG\'s
     - Fire set: no query moves; TPC\-H identical; regress A/B unchanged\.
     - Design: `docs/design/0100\-0149/m0146\-0150\-grouping\-seed\-cheapest\-total\.md`\.
 Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to COSTTIE \(near\-tie\)
+- [ ] **M0146-0159 — retire `indexProbeCostMultiplier` and its `GOOPG_INDEX_PROBE_MULT` knob (Option A)**
+  \(filed 2026\-10\-12 evening by owner decision — OWNER DECISIONS 2026\-10\-12,
+  executing the M0146\-0068 corpus A/B outcome\)\. The x2 probe\-cost multiplier
+  makes goopg elect non\-PG shapes on ~15 routed B8 records; the A/B measured
+  \+13 plan matches at mult=1 with flat runtime totals, and the residual
+  executor probe slowdown is owned by M0146\-0088\. This is a NEW owner
+  decision — the 2026\-10\-06 pre\-authorisation gate \(no witness \>10%
+  wall\-clock\) failed on Q17/Q71/Q54\.
+  Kind: impl
+  Parent: M0146\-0068
+  - Scope: remove the `\*indexProbeCostMultiplier` applications in
+    `internal/optimizer/costindex\.go` \(six sites\) and `cost_funcs\.go`, delete
+    the env plumbing, retire the flag via `flagProvenanceRetired` in
+    `flaglabels\.go`, update the affected tests \(costindex, cost\_funcs,
+    flaglabels, and the executor probe\-identity tests\)\.
+  - Evidence required: corpus A/B at both scales and the TPC\-H arm — plan\-shape
+    deltas AND wall\-clock \(server\-age\-constant, private lane\); re\-measure
+    Q54 \(0049e landed since the stale attribution\)\. Expected: match
+    SF0\.25 ~\+10, SF1 ~\+1, TPC\-H ~\+2 per the 0068 table\.
+  - First step: run the current build with `GOOPG_INDEX_PROBE_MULT=1` vs `=2`
+    on the fire set to reproduce the 0068 table before touching code\.
+  - Follow\-on: re\-measure M0145\-0008ag\'s Q14 premise after this lands\.

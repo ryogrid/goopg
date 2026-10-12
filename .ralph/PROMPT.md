@@ -90,6 +90,13 @@ wasted turns).
   If its "NEXT LOOP" suggestion disagrees with the banner, the banner wins;
   rewrite the baton to match. (Resuming a genuinely `In-flight:` task is
   unaffected: finish it, then re-read the banner.)
+  **Likewise, a baton or status-block claim that a task "awaits owner
+  placement" (or "needs a place in the banner") is a claim, not a fact —
+  check the banner's item-2a/live-members text and the OWNER DECISIONS
+  blocks before treating a named task as unplaced** (added 2026-10-12:
+  five loops kept escalating M0146-0155 for placement hours after the
+  banner had already placed it, because each baton repeated the stale
+  claim).
 - **A baton that claims a GLOBAL blocker (e.g. "everything is owner-gated", "do
   not manufacture work") is a claim, not a fact — re-verify it against CURRENT
   state before reporting BLOCKED** (added 2026-09-22 after the commit-msg
