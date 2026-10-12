@@ -207,8 +207,19 @@ const goopgFeaturesFile = "global/pg_goopg_features"
 
 func defaultGoopgFeatures() []byte {
 	return []byte(catalog.NullKeyedIndexEntriesFeature + "\n" + storage.HeapLinePointerLifecycleFeature + "\n" +
-		storage.VMWALLoggedFeature + "\n")
+		storage.VMWALLoggedFeature + "\n" + clogCompleteHistoryFeature + "\n")
 }
+
+// clogCompleteHistoryFeature says this binary's initdb created the cluster:
+// every transaction id it ever assigned is either recorded in the commit log
+// or WAL, or never committed. Open then never takes the old-cluster upgrade
+// branch (clog.InitializeAsCommitted), which stamps every xid below NextXID
+// Committed — for a crash before the first commit since initdb that
+// resurrected the crashed transaction's rows (M0146-0152). A cluster without
+// the line (one initialised before the commit log existed, or a PostgreSQL
+// base backup attached as a goopg standby, whose goopg commit log starts
+// empty) keeps the upgrade branch.
+const clogCompleteHistoryFeature = "clog-complete-history"
 
 // readGoopgFeatures returns the capability names in dataDir's marker file,
 // or none when the file is absent (a cluster older than the marker).

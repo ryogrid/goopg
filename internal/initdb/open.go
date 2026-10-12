@@ -1325,7 +1325,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: scan wal for xact history: %w", xerr)
 	}
-	if clog.IsEmpty() && !hasXactHistory {
+	// M0146-0152: a cluster this binary initialised is never an old one, so
+	// an empty commit log with no xact record in the WAL only means nothing
+	// has committed yet — run the crash-recovery sweep, which stamps any xid
+	// that crashed in progress Aborted.
+	if clog.IsEmpty() && !hasXactHistory && !readGoopgFeatures(abs)[clogCompleteHistoryFeature] {
 		if uerr := clog.InitializeAsCommitted(txnMgr.NextXID()); uerr != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
