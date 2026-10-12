@@ -31921,7 +31921,7 @@ Movement: none — Q70 first divergence unchanged \(join\-level choice now PG\'s
     - Fire set: no query moves; TPC\-H identical; regress A/B unchanged\.
     - Design: `docs/design/0100\-0149/m0146\-0150\-grouping\-seed\-cheapest\-total\.md`\.
 Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to COSTTIE \(near\-tie\)
-- [ ] **M0146-0159 — retire `indexProbeCostMultiplier` and its `GOOPG_INDEX_PROBE_MULT` knob (Option A)**
+- [x] **M0146-0159 — retire `indexProbeCostMultiplier` and its `GOOPG_INDEX_PROBE_MULT` knob (Option A)**
   \(filed 2026\-10\-12 evening by owner decision — OWNER DECISIONS 2026\-10\-12,
   executing the M0146\-0068 corpus A/B outcome\)\. The x2 probe\-cost multiplier
   makes goopg elect non\-PG shapes on ~15 routed B8 records; the A/B measured
@@ -31957,6 +31957,13 @@ Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to CO
     - Patch: `tmp/m0159/0159\-full\.patch` \(backup `~/m0159\-backup\-full\.patch`\)\. Design:
       `docs/design/0100\-0149/m0146\-0159\-retire\-index\-probe\-mult\.md`\.
   - Blocked by: M0146\-0170\. Resume: land 0170, rerun the sf025 sweep on the staged code, commit\.
+  - Done 2026\-10\-13 \(`de45f8a6f`\), after its blockers M0146\-0169 \(`7958cf698`\) and M0146\-0170 \(`566d9721c`\)
+    landed\. Final A/B against HEAD `566d9721c` in `analysis/m0146/m0146\-0159/categories\-final\.txt`\.
+    - Totals flat \(×0\.96 / ×1\.01\); two repeat rounds left three confirmed SF0\.25 slowdowns, all now PG\-shaped:
+      Q17 ×1\.26, Q25 ×1\.26, Q83 ×1\.20 — filed M0146\-0171\.
+    - SF1 parallelism 33→39 / sort 20→24 recur as 0068 saw \(parallelism → M0146\-0049e; sort ledgered\)\.
+    - Follow\-on still owed: re\-measure M0145\-0008ag\'s Q14 premise \(its own task\)\.
+Movement: yes — PLAN\-PARITY match TPC\-DS SF0\.25 56 → 68, SF1 42 → 45, TPC\-H 11 → 13
 - [x] **M0146-0169 — WRONG RESULTS: a MERGE UPDATE files no index entry for the new row version and skips the unique check** \(filed
   2026\-10\-13 by M0146\-0159\)\. After `MERGE … WHEN MATCHED THEN UPDATE`, every index scan misses the updated row
   \(`WHERE a = 1` returns 0 rows with `enable_seqscan = off`; a Seq Scan still sees it\), and a key change onto an
@@ -31978,7 +31985,7 @@ Movement: none — PG rule landed without a corpus witness; Q70 re\-routed to CO
     `docs/design/0100\-0149/m0146\-0169\-merge\-update\-indexes\.md`\.
 Movement: none — instrument artefact — no TPC query runs MERGE; regress merge identical \(its diffs never read a
   MERGE\-updated row through an index\)
-- [ ] **M0146-0170 — WRONG RESULTS: a correlated SubPlan with a parameterised nested loop inside returns wrong rows
+- [x] **M0146-0170 — WRONG RESULTS: a correlated SubPlan with a parameterised nested loop inside returns wrong rows
   when evaluated in a join qual** \(filed 2026\-10\-13 by M0146\-0159\)\. TPC\-DS Q32 at SF0\.25 returns NULL \(PG
   2444\.35\) once its SubPlan becomes `Aggregate → Nested Loop \(Bitmap Heap Scan catalog\_sales → Index Scan
   date\_dim\_pkey \(d\_date\_sk = catalog\_sales\.cs\_sold\_date\_sk\)\)` inside a Hash Join's Join Filter whose other
@@ -31996,3 +32003,19 @@ Movement: none — instrument artefact — no TPC query runs MERGE; regress merg
   > ## ESCALATION 2026\-10\-13 \(S2\) — correlated SubPlan + inner nestloop param returns wrong rows
   > Pre\-existing on HEAD \(forced shape\); exposed in TPC\-DS Q32 by M0146\-0159\'s retirement\. Filed as 0159\'s
   > blocker so the parity work is not stranded; owner may re\-place\.
+  - Done 2026\-10\-13 \(`566d9721c`\): root cause was the sublink pull\-up post\-pass `rebaseOne`, not the executor —
+    it re\-based the lateral nested loop\'s nestloop param as an escaping correlation and bound it to the host row
+    \(instrumented: `$1` read the outer `cs\.ord`\)\. It now refuses a plan containing a lateral join, as
+    `keptSubplanAdmissible` does; walkPlanExprs / lowering walker / NodeSubplans gained IndexScan `Keys` /
+    `SAOPKeys` coverage\. Design: `docs/design/0100\-0149/m0146\-0170\-subplan\-lateral\-nestloop\-param\.md`\.
+Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; its value is TPC\-DS Q32\'s sf025 checksum
+  under M0146\-0159
+- [ ] **M0146-0171 — PG\-shaped parameterised probes run 1\.2–1\.26x slower than the x2 shapes \(TPC\-DS SF0\.25
+  Q17/Q25/Q83\)** \(filed 2026\-10\-13 by M0146\-0159\)\. After the multiplier retirement these three now match PG\'s
+  plan and run Q17 0\.80 → 1\.01s, Q25 0\.78 → 0\.98s, Q83 2\.01 → 2\.41s \(3\-round medians,
+  `analysis/m0146/m0146\-0159/repeated\-runs\.txt`\)\. The executor\-side per\-probe cost Option A accepted
+  \(M0146\-0088 halved it; the residual is ledgered\)\.
+  Kind: impl
+  Parent: M0146\-0159
+  - First step: profile Q17 at SF0\.25 on a private clone \(perf, the probe loop\) against PG\'s same plan to locate the
+    per\-probe gap \(index descent, heap fetch, param rebinding\)\.

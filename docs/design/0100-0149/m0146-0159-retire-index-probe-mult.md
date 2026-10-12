@@ -1,7 +1,7 @@
 # M0146-0159 — retire `indexProbeCostMultiplier` (Option A)
 
-Status: in progress 2026-10-13 — code staged and gated, NOT committed: blocked by M0146-0169
-(landed) and M0146-0170 (open), see "Blockers".
+Status: landed 2026-10-13 (`de45f8a6f`), after its two blockers M0146-0169 (`7958cf698`) and
+M0146-0170 (`566d9721c`).
 Parent: M0146-0068 (owner decision 2026-10-12, Option A).
 
 ## Problem
@@ -83,74 +83,70 @@ factor:
 
 ## Verification
 
-Raw artefacts: `analysis/m0146/m0146-0159/`.
+Raw artefacts: `analysis/m0146/m0146-0159/`. The `*-final*` files are the
+landed A/B; the unprefixed files are the first run, taken before M0146-0170.
 
 ### Plan shapes
 
-Fire-set gate, HEAD `bb0a8f154` (x2) vs the staged retirement; captures
-from private clones (`categories-raw.txt`).
+Fire-set gate: HEAD `566d9721c` (x2) vs the retirement, with captures from
+private clones (`categories-final.txt`).
 
 | corpus | MATCH | CATEGORIES-EXCL-MATCH (x2 → retired) |
 |---|---|---|
-| TPC-DS SF0.25 | 56 → **70** | join-order 37→22, join-method 16→12, scan-type 22→9, parameterisation 17→14, parallelism 17→14, sort 15→14, qual-placement 4→3 |
-| TPC-DS SF1 | 42 → **45** | join-order 47→44, scan-type 32→22, parameterisation 27→26, qual-placement 10→9; join-method 18→19, parallelism 33→37, sort 20→24, aggregation 8→9 |
-| TPC-H | 11 → **13** | join-order 9→7, scan-type 9→5; parameterisation 1→2, parallelism 4→5, qual-placement 1→2 |
+| TPC-DS SF0.25 | 56 → **68** | join-order 37→24, join-method 16→14, scan-type 22→11, parameterisation 17→15, parallelism 17→15, sort 15→14, qual-placement 4→3 |
+| TPC-DS SF1 | 42 → **45** | join-order 47→44, scan-type 32→24, parameterisation 27→26, qual-placement 10→9; join-method 18→21, parallelism 33→39, sort 20→24, aggregation 8→9 |
+| TPC-H | 11 → **13** | join-order 9→6, scan-type 9→5; parameterisation 1→2, qual-placement 1→2 |
 
-M0146-0068 predicted about +10, +1 and +2; today's HEAD gives +14, +3 and
-+2. The SF1 parallelism and sort losses recur, as 0068 saw.
+- **Against M0146-0068's prediction.** 0068 predicted about +10, +1 and +2.
+  The first run, before M0146-0170, measured +14 at SF0.25.
+  - Two of those matches came from SubPlans that the buggy rebase had
+    re-bound.
+  - They now keep the stack path, which is the correct value path.
+- **SF1 losses.** The parallelism and sort losses recur, as 0068 saw.
+  - The parallelism class (Q54's item-driven partial NL) is M0146-0049e's.
+  - The sort class is recorded in the deferral ledger.
 
 ### Wall-clock
 
-- **Single run, all fires** (`single-run-times.txt`):
-  - SF0.25: 164.1s → 161.9s (×0.99).
-  - SF1: 1207.5s → 1144.6s (×0.95).
-  - TPC-H: 27.5s → 27.8s.
-- **Repeats.** Every mover beyond ±10%, plus 0068's three confirmed
-  regressions, was re-run three times per arm, alternating arms, on fresh
-  clones (`repeated-runs.txt`):
-  - SF0.25 Q61 and Q21 (single-run ×6) are ×0.97 and ×0.99. Q17 is ×1.13,
-    down from 0068's ×1.56 now that M0146-0088's leaf binary search has
-    landed.
-  - SF1 Q5, Q6, Q7, Q16, Q35, Q47, Q54 and Q71 are all within ×0.93–1.03.
-    Q54 (0068: ×2.22) and Q71 (×1.27) no longer regress. Q67 is ×0.84.
-  - TPC-H Q9 is ×0.95 and Q11 is within noise.
-- **No confirmed wall-clock regression** in any corpus.
+- **Single run, all fires** (`single-run-times-final.txt`):
+  - SF0.25: 168.2s → 161.7s (×0.96).
+  - SF1: 1181.0s → 1188.6s (×1.01).
+  - TPC-H: flat.
+- **Repeats.** Every single-run mover beyond ±10% was re-run three times per
+  arm, alternating arms, on fresh clones, in two rounds
+  (`repeated-runs.txt`; the second round's raw output is in
+  `tmp/m0159/rep2`).
+  - **SF1: all noise.** Q5, Q6, Q7, Q10, Q16, Q35, Q47, Q54, Q56, Q71, Q75,
+    Q83, Q90 (single-run ×22.9), Q94 and Q96 are within ×0.93–1.04. Q67 is
+    ×0.84.
+  - **SF0.25: three confirmed slowdowns**, all of which now match PG's plan:
+    - Q17 0.80s → 1.01s (×1.26);
+    - Q25 0.78s → 0.98s (×1.26);
+    - Q83 2.01s → 2.41s (×1.20).
+
+    These are the executor-side probe cost that Option A accepted, filed as
+    M0146-0171. Q21, Q46, Q58 and Q61 are noise.
+  - **TPC-H:** Q9 is ×0.95 and Q11 is noise.
+  - 0068's confirmed regressions no longer reproduce: Q54 ×0.98 and Q71
+    ×1.01.
 
 ### Values and gates
 
-- **Values.** The TPC-H arm values are identical in both arms, and every
-  TPC-DS fire PASSes its status in both arms.
-- **Gates.**
-  - Units: PASS once M0146-0169 landed.
-  - tpch-spotcheck and the acceptance arm: PASS.
-  - Fire-set gate: PASS.
-  - **sf025 sweep: CKMISMATCH on Q32** (goopg returns NULL, PG returns
-    2444.35). See Blockers.
+TPC-H values are identical in both arms. On the committed tree:
 
-## Blockers
+- units and postmaster PASS;
+- tpch-spotcheck and the acceptance arm PASS;
+- the sf025 sweep PASS=99 (CKMISMATCH=0);
+- the TPC-DS fire-set gate PASS, with no introduced timeout.
 
-Retiring the x2 changes elections, and twice that exposed a pre-existing
-wrong-results bug. Neither bug is caused by the cost change; each is
-reproducible on HEAD with the shape forced.
+## Blockers (resolved)
 
-1. **M0146-0169 (landed).** A MERGE UPDATE filed no index entry for the new
-   row version. `TestDMLTriggersFireInPGOrder`'s final ordered read became an
-   Index Scan and lost a row. Fixed in `7958cf698` before this task's units
-   gate could pass.
-2. **M0146-0170 (open).** A correlated SubPlan whose body is a parameterised
-   nested loop returns wrong rows when the SubPlan is evaluated in a qual of a
-   join whose other side supplies the correlation value.
-   - Unconfirmed hypothesis: the nested loop's inner probe parameter
-     (`OuterColumnRef{Level: 1}`, `outerParamKey`) is resolved against the
-     wrong `ctx.OuterRows` entry. A related symptom: EXPLAIN prints the inner
-     key as `cs.sold` even when the subquery aliases the table `x`.
-   - TPC-DS Q32's SubPlan becomes that shape under the retired costs, so Q32
-     returns NULL.
-   - Repro on HEAD with nested loops forced:
-     `analysis/m0146/m0146-0159/q32-subplan-param-repro.sql` gives NULL;
-     PG gives 26457.
-   - Narrowing: the same subquery in a target list, or in a qual over a
-     single relation, is correct.
+Retiring the x2 changed elections, and twice that exposed a pre-existing
+wrong-results bug. Both were fixed before this landed.
 
-The staged code stays uncommitted until M0146-0170 lands and the sf025 sweep
-is clean (AGENT.md G5/G6).
+1. **M0146-0169.** A MERGE UPDATE filed no index entry for the new row
+   version, and skipped the unique check. `TestDMLTriggersFireInPGOrder`'s
+   ordered read became an Index Scan and lost a row.
+2. **M0146-0170.** The sublink pull-up post-pass re-bound a lateral nested
+   loop's nestloop param, inside a correlated SubPlan, to the host row.
+   TPC-DS Q32 returned NULL under the new plan.
