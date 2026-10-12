@@ -31347,7 +31347,7 @@ Movement: none — parity held: no TPC query or covered regress EXPLAIN applies 
     - Found and filed \(S2\): M0146\-0125, M0146\-0126\.
     - Ledgered: mixed\-type folding, all\-NULL COALESCE, row NullTest, strict operators over a typed NULL\.
 Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GREATEST/NullTest; regress case\.sql 15 → 0 diff lines \(100%\)
-- [ ] **M0146\-0125 — WRONG RESULTS: `array \|\| NULL` and `NULL \|\| array` return NULL**
+- [x] **M0146\-0125 — WRONG RESULTS: `array \|\| NULL` and `NULL \|\| array` return NULL**
   \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT array\[1\] \|\| null, array\[1\] \|\| null::int, null \|\| array\[2\]` returns three
   NULLs on goopg; PG 18\.3 returns `\{1\}`, `\{1,NULL\}`, `\{2\}`\. The same happens with column operands \(`a \|\| n` over a table\),
   so it is the executor, not constant folding\. PG\'s array\_cat, array\_append and array\_prepend are not strict \(pg\_proc
@@ -31361,6 +31361,12 @@ Movement: none — parity held: no TPC query folds a constant COALESCE/NULLIF/GR
   > Owner: place M0146\-0125 in the banner\.
   > **RESOLVED 2026\-10\-12 evening: placed in item 2a \(fifth S2 batch
   > amendment\)\.**
+  - Done 2026\-10\-12 \(`b5f7b8537`\): `concatModeOf` picks array\_cat / array\_append /
+    array\_prepend from static types \(ARRAY\[…\] now typed\); `evalArrayConcat` implements their
+    non\-strict NULL rules, one\-dimension\-apart nesting, 2202E / 22P02 errors and array\_out quoting in
+    both evaluator twins and `array\_cat\(\)`; `tryFoldBinaryOp` no longer folds array `\|\|` to NULL\.
+    Design: `docs/design/0100\-0149/m0146\-0125\-array\-concat\-nonstrict\.md`\.
+  Movement: yes — regress arrays 3171 → 3142 diff lines \(array\_cat / `\|\|` across dimensions\)
 - [x] **M0146\-0126 — WRONG RESULTS: COALESCE does not resolve its arguments\' common type**
   \(filed 2026\-10\-09 by M0146\-0124\)\. `SELECT coalesce\(1, 2\.5\) / 3` returns `0` on goopg; PG 18\.3 returns
   `0\.33333333333333333333`\. `pg\_typeof\(coalesce\(1, 2\.5\)\)` is `integer` on goopg, `numeric` on PG\. The same holds with a
