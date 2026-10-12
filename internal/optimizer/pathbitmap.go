@@ -677,7 +677,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
-		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
+		Rows:          clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req)),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel)),
 		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
 		// top of the index child's count.

@@ -365,7 +365,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	probed := boundPrefixClauses(bound, clauses)
 	fullyBound := len(clauses) == len(idx.Columns)
 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, fullyBound)
-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
+	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound) *
+		s.movableNonEquiJoinSelectivity(rel, req))
 	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
 	// direction it was computed for, taken together so they cannot disagree
 	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
@@ -559,7 +560,8 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	// bound, so a unique index cannot collapse the probe to one tuple, and
 	// PG's unique-index clamp does not apply.
 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, false)
-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false)
+	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false) *
+		s.movableNonEquiJoinSelectivity(rel, req))
 	// The emitted stream is globally key-ordered — groups are enumerated
 	// in prefix order and each group's probe is suffix-ordered — so the
 	// index's pathkeys are as valid here as on the prefix path.
@@ -859,6 +861,33 @@ func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, 
 		return 1
 	}
 	return rows
+}
+
+// movableNonEquiJoinSelectivity is the share of
+// `get_parameterized_baserel_size`'s clauselist_selectivity over `ppi_clauses`
+// (costsize.c) that the parameterised producers' key selectivity does not
+// cover (M0146-0009p): every join clause movable into `rel` under `req`
+// (`join_clause_is_movable_into`) that is not an equijoin. The equijoins are
+// the probe-key candidates the producers already price; a comparison such as
+// TPC-DS Q72's `inv_quantity_on_hand < cs_quantity` binds no key but still
+// belongs to the parameterised path's clauses, so it filters the rows one
+// execution returns (PG: inventory_pkey probe rows=176, 1/3 of the 527 the
+// equalities alone give).
+func (s *searchCtx) movableNonEquiJoinSelectivity(rel *RelOptInfo, req RelSet) float64 {
+	if s == nil || s.clauses == nil || rel == nil {
+		return 1
+	}
+	sel := 1.0
+	for _, ri := range s.clauses.all {
+		if ri == nil || ri.isEquijoin || ri.relids == rel.Relids {
+			continue
+		}
+		if !joinClauseIsMovableInto(ri, rel.Relids, rel.Relids|req) {
+			continue
+		}
+		sel *= s.joinClauseSelectivity(ri)
+	}
+	return sel
 }
 
 // loopCountFor is `get_loop_count` (indxpath.c:3266): how many times a scan
