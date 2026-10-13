@@ -28949,6 +28949,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     `82c287bc7`\): item 3 exhausted \(0042\'s rendering records sit under join\-order first divergences; 0007 / 0012b /
     0067 / 0175 rank below item 10\)\. Top actionable first\-divergence category: sort\-strategy \(17, 15 after COSTTIE
     waivers\)\. Filed M0146\-0190 \(TPC\-DS SF0\.25 Q26\)\.
+  - S9 replenishment pass 2026\-10\-14, second \(census `analysis/m0146/m0146\-0014/routing\-20261014b/`, capture at
+    `adaed8786`, after M0146\-0190 closed with movement\): item 3 exhausted again\. sort\-strategy 14 records, 10
+    actionable after waivers; join\-order 14, 3 actionable\. Filed M0146\-0191 \(TPC\-DS SF0\.25 Q38\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -32943,3 +32946,20 @@ Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS, regress
       A/B \(select\_parallel, aggregates, partition\_aggregate, groupingsets, write\_parallel, union\) identical\.
 Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 10 -> 7, parallelism 8 -> 7, join-method 9 -> 8, scan-type 7 -> 6, aggregation-strategy 3 -> 2; SF1 sort-strategy 17 -> 16, parallelism 18 -> 17, join-order 30 -> 29
+- [ ] **M0146-0191 — under a set operation goopg merges an un\-deduplicated worker Sort where PG runs a per\-worker Unique below the Gather Merge (TPC-DS Q38)**
+  (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014b/`).
+  sort-strategy is the top actionable first-divergence category (14 records, 10 actionable after waivers). Record:
+  TPC-DS SF0.25 Q38, verdict SHAPE-DIFF, first divergence `depth=5 [sort-strategy] under Gather Merge: PG Unique |
+  goopg Sort`. On the INTERSECT's web\_sales branch PG plans Unique (8918.69..9031.81) → Gather Merge → Unique → Sort →
+  Nested Loop, the `create_partial_distinct_paths` shape; goopg plans Unique (8859.03..8974.17) → Gather Merge → Sort
+  → Nested Loop. The catalog\_sales branch already matches, and the store\_sales branch has no worker Unique in
+  either plan. Same record at SF0.25 Q87 and SF1 Q38.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: on the PG OPTIMIZER_DEBUG build (tmp/pgdbg, db tpcds025), list the branch's final DISTINCT
+    candidates. Check whether PG builds the plain Unique-over-Gather-Merge-over-Sort at all (the scan/join rel's
+    generate_useful_gather_paths, and whether it survives there, as in M0146-0190) and at what cost against the
+    partial-distinct path. PG's worker Unique estimates no reduction (371 → 371), so it costs more than the plain
+    shape. Then compare with goopg's `addPartialDistinctPaths` (distinctpaths.go) and its election, and drive Q38 to
+    MATCH.
+  - Expected movement: TPC-DS SF0.25 match (Q38, Q87) and CATEGORIES-EXCL-MATCH sort-strategy at both scales.
