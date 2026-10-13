@@ -1582,20 +1582,25 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 				node = partial.Child
 				continue
 			}
-			if n.Mode != optimizer.AggModeSimple {
-				return nil, false
-			}
 			// M0146-0042: a GROUP BY key the planner pruned (constant-
 			// pinned or functionally dependent) still reaches the output as
 			// a Passthrough column at the row's tail. PG keeps it in the
 			// Agg's target list as a plain Var and deparses through it
 			// like a group key — TPC-DS Q66's `date_dim.d_year` behind
-			// the subquery's `year`, where goopg printed `year`.
+			// the subquery's `year`, where goopg printed `year`. A
+			// Finalize / Partial pair carries it the same way: the
+			// Finalize's passthrough reads the Partial's tail through the
+			// Gather, and the Partial's reads its input (Q66's arms are
+			// parallel), so the rule holds in every mode.
 			var passthrough optimizer.Expr
 			if np := len(n.Passthrough); np > 0 && n.GroupingSets == nil {
-				if k := j - (len(n.Output()) - np); k >= 0 && k < np {
+				if k := j - (len(n.Output()) - np); k >= 0 && k < np && j >= len(n.GroupExprs) &&
+					(col.Name == "" || n.Output()[j].Name == col.Name) {
 					passthrough = n.Passthrough[k]
 				}
+			}
+			if passthrough == nil && n.Mode != optimizer.AggModeSimple {
+				return nil, false
 			}
 			if j < len(n.GroupExprs) || passthrough != nil {
 				g := passthrough
