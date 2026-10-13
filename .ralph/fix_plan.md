@@ -27002,7 +27002,7 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
     - No production change; no admission work exists that the census can
       see.
   Movement: none
-- [ ] **M0146-0009 — statistics/cardinality burn-down** (impl). Work
+- [x] **M0146-0009 — statistics/cardinality burn-down** (impl). Work
   the 53-finding ea-ratchet baseline
   (`analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt`)
   toward zero under the standing no-NEW rule; includes the B-06
@@ -27011,6 +27011,13 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
   first; each fix is its own gated change.
   Kind: impl
   Parent: none
+  - Done 2026\-10\-13 \(M0146\-0009s\): the ea\-ratchet baseline is down from 53 to 1, and that one \(Q78\) is a
+    join\-order twin of PG\'s own estimate, routed to the waived COSTTIE residual\. No first\-divergence record in the
+    2026\-10\-13 routing refresh routes here\. The B\-06 CTE\-output residual is at parity: Q14\'s `CTE Scan on
+    cross\_items` estimates rows=1 in both engines\.
+    - Re\-open trigger: any NEW `make ea\-ratchet` finding, or a first\-divergence record whose cause is an
+      estimate\. File it as a child of this task\.
+Movement: yes — ea-ratchet 9 -> 1 (M0146-0009s re-pin; 53 -> 1 over the umbrella)
 - [x] **M0146\-0009a — the `customer\_demographics \+ date\_dim \+ item \+
   store\_sales` join is estimated at 47 rows against an actual 1944 \(TPC\-DS
   Q7 / Q27\)** \(filed 2026\-09\-25 by M0146\-0005 slice 2 as the owning task
@@ -30711,6 +30718,21 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       PASS \(nothing fired\), ea\-ratchet PASS, regress A/B 14 cases
       \(`aggregates` loses the agg\_sort\_order hunk; known flips\)\.
   Movement: none — fire set flat at both scales; the fix moves regress aggregates\' agg\_sort\_order plan to PG\'s
+- [x] **M0146\-0009s — ea\-ratchet re\-pin 9 → 1 and routing of the last finding** \(filed 2026\-10\-13 by M0146\-0009,
+  the umbrella\'s next slice after M0146\-0171\)\. A fresh `make ea\-ratchet` on HEAD scores 1 finding against the
+  9\-entry baseline \(8 FIXED\)\.
+  Kind: recon
+  Parent: M0146\-0009
+  - Done 2026\-10\-13: baseline re\-pinned to 1 entry; the re\-run passes \(baseline 1, current 1\)\. Evidence
+    `analysis/m0146/m0146\-0009s/` \(`ea\-ratchet\-run\.txt`, `findings\.txt`\)\.
+    - The 8 fixes are plan\-shape convergence on PG, not a new estimator: Q14\'s six `cte:cross\_items` joinrels no
+      longer form \(goopg unique\-ifies the CTE Scan and probes `item` as PG — M0146\-0127/0128\); Q23\'s two
+      `cte:frequent\_ss\_items` joins estimate 43 against PG\'s 42 \(M0146\-0121, M0146\-0009q\)\.
+    - The last finding, Q78\'s Merge Left Join at `date\_dim\+store\_returns\+store\_sales\+web\_returns\+web\_sales`
+      \(1403 vs actual 123049\), has no PG twin only because PG joins `catalog\_sales`\' aggregate first\. PG\'s left
+      join at its own relset estimates 1381 — both engines take the outer GroupAggregate\'s group count\. The swap is
+      Q78\'s COSTTIE record \(waived under M0146\-0014\); it is not statistics\-driven\.
+Movement: yes — ea-ratchet 9 -> 1 (baseline re-pin; the fixes landed in M0146-0121/0127/0128/0009q)
 - [x] **M0146\-0060 — the single\-table rule\-based index producer overrides
   the search\'s costed seq scan for an uncorrelated restriction** \(filed
   2026\-10\-05 by M0146\-0009r\)\. With `agg\_sort\_order` \(100 rows\),
