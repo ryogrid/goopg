@@ -28750,7 +28750,11 @@ Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54
     evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
     probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
 Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
-  - Routed 2026\-10\-13 by M0146\-0014d \(next slices\): TPC\-DS Q5 — a Var above an Append resolves at its first child
+  - Slice 2026\-10\-13 \(`d2b0ba67d`\): a key above a UNION ALL appendrel deparses through the Append\'s first child
+    and stops at a kept `"\*SELECT\* n"` member \(set\_deparse\_plan / get\_variable\); TPC\-DS Q5 text\-identical at both
+    scales \(SF0\.25 65 → 66, SF1 41 → 42\); Q14 10 → 2 differing lines\.
+Movement: yes — PLAN\-PARITY match SF0\.25 71→72, SF1 45→46; CATEGORIES\-EXCL\-MATCH join\-order SF0\.25 22→21, SF1 44→43; text\-identical SF0\.25 65→66, SF1 41→42
+  - Routed 2026\-10\-13 by M0146\-0014d \(next slices\): TPC\-DS Q5 \(done, `d2b0ba67d`\) — a Var above an Append resolves at its first child
     \(`Subquery Scan on "\*SELECT\* 2"`, ruleutils\.c set\_deparse\_plan / get\_variable\), where goopg descends into the
     subquery; Q6 \(done, `b5bf2cfec`\) — a SubPlan\'s PARAM\_EXEC prints its referent \(`i\.i\_category`, find\_param\_referent\) where goopg
     prints `$0`\. Both scales; `analysis/m0146/m0146\-0014/routing\-20261013/agent\-groupB\.md`\.

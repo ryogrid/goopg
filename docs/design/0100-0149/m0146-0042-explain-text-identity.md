@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`b5bf2cfec`, TPC-DS Q6).
+2026-10-13 (`d2b0ba67d`, TPC-DS Q5).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -539,6 +539,35 @@ Results:
   - Q6's values are identical, and the fire set is Q6 only.
   - `TestExplainSubPlanParamReferentOnParameterisedInner` (postmaster) fails
     on HEAD.
+
+## Slice — a key above a UNION ALL appendrel stops at a kept member (2026-10-13, `d2b0ba67d`)
+
+- **Witness.** TPC-DS Q5's wsr arm at both scales.
+  - The UNION ALL in FROM is an appendrel. Its join member stays a subquery
+    RTE, `Subquery Scan on "*SELECT* 2"`, which the Parallel Append puts
+    first.
+  - PG prints the Hash Conds above it as `"*SELECT* 2".wsr_web_site_sk`;
+    goopg printed `web_sales_1.ws_web_site_sk`.
+- **PG.** `set_deparse_plan` (ruleutils.c) makes an Append's outer_plan its
+  first child, and `get_variable` prints a Var of a kept subquery scan with
+  its alias, quoted by `quote_identifier`.
+- **Change.**
+  - `SubqueryScan.IsAppendRelMember` (the M0146-0093 label) stops the
+    set-operation key walk at a kept member. A branch scan PG's
+    trivial\_subqueryscan removes stays transparent (M0146-0005w).
+  - `SetOp.IsUnionAllAppendRel` lets the join-residual walk continue through
+    such an appendrel's first child. Inheritance and partition fan-outs keep
+    the parent-alias stop.
+  - The alias and column print through `pgQuoteIdent`.
+- **Result.**
+  - Q5 is text-identical at both scales: SF0.25 65 → 66, SF1 41 → 42.
+  - PLAN-PARITY match SF0.25 71 → 72, SF1 45 → 46.
+  - Q14's keys above its UNION ALL print `item.i_brand_id` (10 → 2 differing
+    lines).
+  - Values are identical, and the regress A/B over 27 cases is flat.
+  - TPC-H Q18's key now prints the quoted `"ANY_subquery"`. PG prints
+    `lineitem_1.l_orderkey` there; that divergence is pre-existing and in the
+    ledger.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
